@@ -1151,6 +1151,17 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
 
+    def test_a_cd_counts_only_for_what_runs_after_it(self):
+        # A real command: tidy a dir, then `cd /` at the very end.
+        self.assertAllowed("cd /tmp/x && chmod -R go-w . && rm -rf build; cd /")
+        self.assertAllowed("rm -rf ./*; cd ~")
+        # ...unless the earlier text can run again after it.
+        for cmd in ("for i in 1 2; do rm -rf *; cd /; done",
+                    "while true; do rm -rf *; cd /; done",
+                    "f() { rm -rf *; }; cd /; f", "trap 'rm -rf *' EXIT; cd /"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
     def test_printf_renders_like_printf(self):
         for cmd in ("printf -v x -- 'rm -rf /'; $x", "printf -v x '%.2s -rf /' rmxx; $x",
                     "printf -v x '%*s -rf /' 0 rm; $x", "printf -v x 'rm\\x20-rf\\x20/'; $x",
@@ -1160,10 +1171,38 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
 
+    def test_printf_edge_cases_fail_closed(self):
+        for cmd in (
+            # Arguments past the format-repeat bound are kept, not dropped.
+            "rm -rf $(printf '%s ' a b c d e f g h /etc)",
+            "x=$(printf '%s ' rm -rf a b c d e f /); $x",
+            "rm -rf $(printf '%s ' " + "a " * 100 + "/etc)",
+            # %c, width padding and \c are text printf produces.
+            "printf -v x '%c%c -rf /' rx mx; $x", "printf -v x 'rm%1s-rf%1s/' '' ''; $x",
+            "printf -v x 'rm -rf /\\cjunk'; $x", "printf -v x '%b' 'rm -rf /\\cjunk'; $x",
+            "printf -v a[0] 'rm -rf /'; $a", "builtin printf -v x 'rm -rf /'; $x",
+            "x=$(echo -e 'rm\\x20-rf\\x20/'); $x",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("printf -v x '%99999999s' a; echo $x")
+
+    def test_a_quoted_or_escaped_cd_still_moves(self):
+        for cmd in ('"cd" / && rm -rf *', "'cd' / && rm -rf *", "\\cd / && rm -rf *",
+                    "cd / && chmod -R 777 *", "cd / && chown -R x *", "cd / && find . -delete",
+                    "cd ~ && rm -rf .ssh", "rm -rf ~/.ssh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("cd /tmp/x && find . -delete")
+        self.assertAllowed("cd /repos/x && chmod -R u+w build")
+
     def test_assignment_values_nest_and_glue(self):
         for cmd in ("x=$(echo $(echo rm) -rf /); $x", "x=$(echo 'rm -rf / (x)'); $x",
                     "x=$(echo 'rm -rf')' /'; $x", "declare x='rm -rf /'; $x",
-                    "local x='rm -rf /'; $x", "readonly x='rm -rf /'; $x"):
+                    "local x='rm -rf /'; $x", "readonly x='rm -rf /'; $x",
+                    "x=$(echo $(echo $(echo $(echo rm))) -rf /); $x",
+                    "declare a=1 x='rm -rf /'; $x", "declare -- x='rm -rf /'; $x",
+                    "export a=1 x='rm -rf /'; $x", "x=rm; x+=' -rf /'; $x"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
 

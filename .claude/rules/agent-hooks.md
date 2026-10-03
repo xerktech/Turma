@@ -126,12 +126,16 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     runs `rm`. A standalone one stays the placeholder — an empty word reads as the root.
   - **A variable a producer filled holds that producer's OUTPUT** (XERK-1549): an assignment
     value is read whole (quoted runs, nested `$(…)`), and `printf -v x FMT ARGS` binds the
-    rendered text (`_render_printf`: escapes, precision, `*`, `%b`). `_produced_text` stores
+    rendered text (`_render_printf`: escapes, `\c`, precision, width, `*`, `%b`, `%c`; out of
+    repeat passes it KEEPS the leftover args — dropping them hid a 9th `/etc`). `_produced_text` stores
     what the substitution PRINTS, never its `$(…)` text — inlining that re-classified it at
     every `$x` and a long line took minutes, past the hook timeout, which fails OPEN.
-  - **`cd` targets are ORDER- and SCOPE-blind** (`_cd_targets`, inherited into recursion): a
-    later `cd` never clears an earlier one, since it may fail, sit in a subshell/pipe, or be
-    `cd -`; resetting let `cd /; (cd /tmp); rm -rf *` through.
+  - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
+    never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
+    clearing let `cd /; (cd /tmp); rm -rf *` through.
+    - Order counts, except in text that can re-run (loop/function body, trap, a group after
+      one, `_REPLAYS_RE`): fully order-blind refused a real `chmod -R go-w .; …; cd /`.
+    - Joining covers `rm`/`unlink`/`chmod`/`chown` and `find` roots.
     - Inside an exact protected root/home every relative `rm` operand is joined (`cd /; rm -rf *`
       is `/*`); deeper, only `..`-climbing ones are. Joining all there would refuse ordinary
       `cd /usr/src/app && rm -rf build` — do not widen it.

@@ -80,7 +80,7 @@ _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
 # (a destructive command is destructive with or without `sudo`).
 _PREFIX_WORDS = {
     "sudo", "doas", "runas", "command", "nohup", "time", "exec", "env",
-    "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer",
+    "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer", "builtin",
 }
 
 # Options of those wrappers that consume the NEXT token as their value, so
@@ -436,7 +436,11 @@ def _printed_text(command: str) -> str | None:
         name, rest = _printf_args(toks)
         return _render_printf(rest[0], rest[1:]) if name is None and rest else ""
     if prog in _ECHO_PROGS:
-        return " ".join(toks[1:])
+        args, flags = toks[1:], ""
+        while args and re.match(r"^-[neE]+$", args[0]):
+            flags += args.pop(0)
+        text = " ".join(args)
+        return _printf_unescape(text).split(_PRINTF_STOP, 1)[0] if "e" in flags else text
     return None
 
 
@@ -495,20 +499,27 @@ _BRACE_RE = re.compile(r"\{([^{}\s]+,[^{}\s]*)\}")
 # inlined as `eval 'rm` (XERK-1256).
 # A value is read WHOLE, quoted runs and substitutions included: cut at its
 # first blank, `x='rm -rf /'; eval $x` inlined as `eval 'rm` (XERK-1256), and
-# `x=$(echo 'rm -rf /'); $x` as `$(echo` (XERK-1549). `declare`/`local`/
-# `readonly`/`typeset` assign exactly as `export` does.
-_ASSIGN_SUBST = r"\$\((?:[^()]|\([^()]*\))*\)|`[^`]*`"
+# `x=$(echo 'rm -rf /'); $x` as `$(echo` (XERK-1549). Any word starting a
+# blank-separated `NAME=`/`NAME+=` counts: `declare a=1 x=…`, `local -- x=…`,
+# and an env prefix all assign, and reading one too many only resolves more.
+_ASSIGN_NEST = r"[^()]*"
+for _ in range(8):  # parentheses nested this deep inside one `$(…)`
+    _ASSIGN_NEST = r"(?:[^()]|\(" + _ASSIGN_NEST + r"\))*"
+_ASSIGN_SUBST = r"\$\(" + _ASSIGN_NEST + r"\)|`[^`]*`"
 _ASSIGN_SUBST_RE = re.compile(_ASSIGN_SUBST)
 _VAR_ASSIGN_RE = re.compile(
-    r"(?:^|[;\n&|]|\b(?:export|declare|local|readonly|typeset)(?:\s+-[A-Za-z]+)*\s+)"
-    r"\s*([A-Za-z_][A-Za-z0-9_]*)="
+    r"(?:^|[;\n&|\s])"
+    r"\s*([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\s]*\])?\+?="
     r"((?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])+)"
 )
 # printf's conversions — flags, `*`/digit width, `.`/`.*`/digit precision —
 # and the backslash escapes it decodes in a format (and in a `%b` argument).
 _PRINTF_SPEC_RE = re.compile(r"%(%|[-+ #0']*(\*|\d+)?(?:\.(\*|\d*))?[hlLqjzt]*([a-zA-Z]))")
 _PRINTF_ESC_RE = re.compile(r"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|0?[0-7]{1,3}|.)", re.S)
-_PRINTF_ESCAPES = {"n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b",
+# `\c` ends printf's output, there and then.
+_PRINTF_STOP = "\x00turma-printf-stop"
+_PRINTF_MAX_WIDTH = 256
+_PRINTF_ESCAPES = {"c": _PRINTF_STOP, "n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b",
                    "f": "\f", "v": "\v", "\\": "\\", "'": "'", '"': '"'}
 _FOR_IN_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)")
 # `$NAME`, `${NAME}`, and the operator forms — `${d%/}`, `${d#x}`, `${d:0:4}`,
@@ -669,7 +680,7 @@ def _produced_text(value: str) -> str:
     Claude Code's hook timeout, which lets the command through. Innermost
     first, so `$(echo $(echo rm) …)` resolves too; bounded like the braces.
     """
-    for _ in range(4):
+    for _ in range(9):
         new = _SUBST_RE.sub(_subst_text, value)
         if new == value:
             break
@@ -718,21 +729,32 @@ def _render_printf(fmt: str, args: list[str]) -> str:
         if prec == "*":
             prec = take()
         arg = take()
-        if m.group(4) == "b":
+        kind = m.group(4)
+        if kind == "b":
             arg = _printf_unescape(arg)
-        if prec is not None and m.group(4) in "sb":
+        elif kind == "c":
+            arg = arg[:1]
+        if prec is not None and kind in "sb":
             try:
                 arg = arg[:max(int(prec or 0), 0)]
             except ValueError:
                 pass
+        if m.group(2) and m.group(2).isdigit():
+            # Padding is text too: `rm%1s-rf` with an empty argument is `rm -rf`.
+            width = min(int(m.group(2)), _PRINTF_MAX_WIDTH)
+            arg = arg.ljust(width) if "-" in m.group(1) else arg.rjust(width)
         return arg
 
-    for _ in range(8):  # bounded: a format with no conversion consumes nothing
+    for _ in range(64):  # bounded: a format with no conversion consumes nothing
         before = len(rest)
         out.append(_PRINTF_SPEC_RE.sub(conv, fmt))
         if not rest or len(rest) == before:
             break
-    return "".join(out)
+    else:
+        # Out of passes with arguments left: bash would print every one, and
+        # dropping them hid `/etc` as the ninth (XERK-1549). Keep them as text.
+        out.append(" " + " ".join(rest))
+    return "".join(out).split(_PRINTF_STOP, 1)[0]
 
 
 def _printf_args(tokens: list[str]) -> tuple[str | None, list[str]]:
@@ -758,9 +780,10 @@ def _printf_v(tokens: list[str]) -> tuple[str, str] | None:
     if not tokens or _basename(tokens[0]) != "printf":
         return None
     name, rest = _printf_args(tokens)
-    if not name or not rest or not re.match(r"^[A-Za-z_][A-Za-z0-9_]*$", name):
-        return None
-    return name, _render_printf(rest[0], rest[1:])
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?$", name or "")
+    if not m or not rest:
+        return None  # `a[0]` is `$a` too
+    return m.group(1), _render_printf(rest[0], rest[1:])
 
 
 def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
@@ -1223,11 +1246,14 @@ def _expand_segments(command: str, depth: int = 0,
     # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
     raw_commands, heredocs = _split_heredocs(command)
     raw_vals = _var_values(raw_commands)
-    # Every directory a `cd` on this line (or an enclosing one) may have moved
-    # into. Read ORDER- and SCOPE-blind on purpose: a later `cd` can fail, sit
-    # in a subshell or pipe, or be `cd -`, and resetting on one let `cd /;
-    # (cd /tmp); rm -rf *` through (XERK-1549).
-    cwds = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(raw_commands)), cwds)
+    # Every directory a `cd` before a command (on this line or an enclosing
+    # one) may have moved it into. SCOPE-blind on purpose — a later `cd` never
+    # clears one: it can fail, sit in a subshell or pipe, or be `cd -`, and
+    # clearing let `cd /; (cd /tmp); rm -rf *` through (XERK-1549). Order
+    # counts only outside text that can run AGAIN: a trailing `cd /` must not
+    # turn an earlier `chmod -R go-w .` into `/.`, but a loop body, function
+    # body or trap handler can run after it, so those see every `cd`.
+    every_cd = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(raw_commands)), cwds)
     bodies, suspect = _balanced_groups(raw_commands)
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
@@ -1235,7 +1261,7 @@ def _expand_segments(command: str, depth: int = 0,
         # anything else stay data (see _destructive_database for the psql case).
         owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
         if owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."}):
-            out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, cwds))
+            out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, every_cd))
         elif not quoted:
             # ...but data behind an UNQUOTED delimiter is expanded first, so its
             # `$(…)` and backticks run whoever reads it: `cat <<EOF` / `$(rm -rf
@@ -1250,7 +1276,13 @@ def _expand_segments(command: str, depth: int = 0,
     for body in bodies:
         if _ARITH_BODY_RE.match(body):
             continue
-        out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, cwds))
+        before = cwds
+        if every_cd != cwds:
+            # The `cd`s written before the group are the ones it runs after.
+            head = raw_commands[:max(raw_commands.find(body), 0)]
+            before = every_cd if _REPLAYS_RE.search(head) else _cd_targets(
+                _SUBST_RE.sub(_subst_text, _prenormalise(head)), cwds)
+        out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, before))
     command = _prenormalise(raw_commands)
     segments = _split_segments(command)
     # `xargs` takes its operands from the PIPE, not its own argv, so
@@ -1262,7 +1294,19 @@ def _expand_segments(command: str, depth: int = 0,
         for tok in _tokenize(raw):
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
+    replay: list[bool] = []  # open `do`/function/`{` bodies: True = can re-run
+    seen = cwds
     for raw in segments:
+        if every_cd != cwds:
+            seen = _cd_targets(_SUBST_RE.sub(_subst_text, raw), seen)
+            head = raw.strip()
+            if _REPLAY_OPEN_RE.match(head):
+                replay.append(True)
+            elif head.startswith("{"):
+                replay.append(False)
+        cwds = every_cd if any(replay) else seen
+        if replay and _REPLAY_CLOSE_RE.match(raw.strip()):
+            replay.pop()
         if suspect:
             # The group scan lost track, so a body it should have found may
             # sit here split in half (see _balanced_groups): classify the
@@ -1293,7 +1337,7 @@ def _expand_segments(command: str, depth: int = 0,
         out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
-        if prog in ("rm", "unlink"):
+        if prog in ("rm", "unlink", "chmod", "chown"):
             # `cd /; rm -rf *` deletes `/*`, which `rm` alone never names.
             for cwd in cwds:
                 joined = [_under_cwd(t, cwd) for t in rest]
@@ -1332,6 +1376,7 @@ def _expand_segments(command: str, depth: int = 0,
                 if inner[0].strip() and re.search(r"\s", inner[0]):
                     out.extend(_expand_segments(inner[0], depth + 1, cwds))
         elif prog == "trap" and rest:
+            cwds = every_cd  # a handler runs after whatever `cd` comes later
             # `trap 'rm -rf /etc' EXIT` runs its handler on the way out. Scan
             # every non-flag argument, not just the first: `trap -- '<cmd>' EXIT`
             # displaces the handler by one and hid it completely.
@@ -1403,6 +1448,9 @@ def _expand_segments(command: str, depth: int = 0,
                 out.append((_strip_prefixes(expanded + piped_operands), seg))
         elif prog == "find":
             roots = _find_roots(tokens) or ["."]
+            # Relative roots from inside a protected cwd: `cd /; find . -delete`.
+            roots += [j for cwd in cwds for r in roots
+                      if (j := _under_cwd(r, cwd)) != r][:_MAX_CWDS]
             if "-delete" in rest:
                 # Equivalent to a recursive delete of everything it walks.
                 out.append((["rm", "-r", *roots], seg))
@@ -1426,9 +1474,16 @@ def _expand_segments(command: str, depth: int = 0,
 # --- dangerous-path detection (for rm / chmod / chown) -------------------
 
 # `cd`/`pushd` (bare or behind `builtin`/`command`) and the words after it.
-_CD_RE = re.compile(r"(?:^|[\s;&|({`])(?:(?:builtin|command)\s+)?(?:cd|pushd)(?=$|[\s;&|)`])"
+_CD_RE = re.compile(r"(?:^|[\s;&|({`])(?:(?:builtin|command)\s+)?\\?([\"']?)(?:cd|pushd)\1"
+                    r"(?=$|[\s;&|)`])"
                     r"([^;&|\n)`]*)")
 _MAX_CWDS = 8
+# Text that can run AGAIN after a later `cd`: a loop body, a function, a trap
+# or an alias. A group written after one sees every `cd` on the line; a plain
+# segment does while inside an open `do`/function body (`_REPLAY_OPEN_RE`).
+_REPLAYS_RE = re.compile(r"\b(?:do|function|trap|alias)\b|\(\)\s*\{")
+_REPLAY_OPEN_RE = re.compile(r"(?:do\b|function\b|[A-Za-z_][\w-]*\s*\(\)\s*\{?)")
+_REPLAY_CLOSE_RE = re.compile(r"(?:done\b|\})")
 _HOME_USER_RE = re.compile(r"^~[a-z0-9_][a-z0-9_.-]*$")
 
 
@@ -1441,9 +1496,9 @@ def _cd_targets(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
     found = list(inherited)
     for m in _CD_RE.finditer(text):
         try:
-            args = shlex.split(m.group(1))
+            args = shlex.split(m.group(2))
         except ValueError:
-            args = m.group(1).split()
+            args = m.group(2).split()
         ops = [a for a in args if not (a.startswith("-") and len(a) > 1)]
         target = _norm_path(ops[0]) if ops else "~"  # a bare `cd` goes home
         low = target.lower()
@@ -1564,7 +1619,7 @@ def _is_dangerous_path(tok: str) -> bool:
     # A glob straight under a home directory that can match its dotfiles
     # (`~/*`, `~/.*`, `~/.[!.]*`) takes `.ssh` and the rest with it.
     parent, _, leaf = low.rpartition("/")
-    if (_GLOB_CHARS.search(leaf) and (parent in _HOME_TOKENS or _HOME_USER_RE.match(parent))
+    if ((parent in _HOME_TOKENS or _HOME_USER_RE.match(parent))
             and fnmatch.fnmatch(".ssh", leaf)):
         return True
     # `~root` / `~someuser` expand to that account's home, and `/root` is itself
