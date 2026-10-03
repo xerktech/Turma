@@ -2724,7 +2724,11 @@ test("http: /alive keeps a host whose beat build is stalled online, and nothing 
   agents["alive-host"].lastSeen = Date.now() - 2 * 60 * 1000;
   agents["alive-host"].commands = [{ cmdId: "c1", type: "noop" }];
   assert.equal((await recOf()).online, false);
-  const before = JSON.stringify({ ...agents["alive-host"], lastSeen: 0 });
+  // The offline sweep alerted; the keepalive must close that edge like a beat
+  // does, or the sweep would skip this host's next real outage.
+  agents["alive-host"].alerts = { ...(agents["alive-host"].alerts || {}), offlineAt: Date.now() - 60000 };
+  const before = JSON.stringify({ ...agents["alive-host"], lastSeen: 0,
+    alerts: { ...agents["alive-host"].alerts, offlineAt: undefined } });
   const ok = await request("POST", "/api/agents/alive-host/alive",
     { body: { sessions: [], ackedCommands: ["c1"] }, headers: agentHeaders });
   assert.equal(ok.status, 200);
@@ -2733,6 +2737,7 @@ test("http: /alive keeps a host whose beat build is stalled online, and nothing 
   assert.equal((await recOf()).online, true);
   assert.equal(JSON.stringify({ ...agents["alive-host"], lastSeen: 0 }), before);
   assert.equal(agents["alive-host"].commands.length, 1);
+  assert.equal(agents["alive-host"].alerts.offlineAt, undefined, "offlineAt left set");
 });
 
 // ---- archive: agent-push ingest + heartbeat cursors + search/browse/view -------

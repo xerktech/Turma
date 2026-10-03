@@ -11175,20 +11175,28 @@ function recordSpendStage(alerts, id, stage) {
 // Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
 // bookkeeping carried across beats (and persisted, so hub restarts don't
 // re-fire or drop edges).
+// Recovery from an alerted offline period: the one "back online" edge, shared by
+// a full beat and a slow-build keepalive (XERK-1266) — a keepalive that brought a
+// host back without clearing `offlineAt` would make the offline sweep skip the
+// host's NEXT real outage. Returns whether it fired.
+function alertRecovered(key, rec, now) {
+  const alerts = rec.alerts;
+  if (!alerts || !alerts.offlineAt) return false;
+  const where = rec.device ? ` on ${rec.device}` : "";
+  notify(`${key} back online`, `Was offline ${fmtDur(now - alerts.offlineAt)}${where}`, {
+    tags: "green_circle",
+    route: { host: key },
+  });
+  delete alerts.offlineAt;
+  return true;
+}
+
 function heartbeatAlerts(key, prev, next) {
   const now = next.lastSeen;
   const alerts = next.alerts;
   const where = next.device ? ` on ${next.device}` : "";
 
-  // Recovery from an alerted offline period.
-  const recovered = !!alerts.offlineAt;
-  if (recovered) {
-    notify(`${key} back online`, `Was offline ${fmtDur(now - alerts.offlineAt)}${where}`, {
-      tags: "green_circle",
-      route: { host: key },
-    });
-    delete alerts.offlineAt;
-  }
+  const recovered = alertRecovered(key, next, now);
 
   // Crash loop: several distinct container boots in a short window (the
   // container restarting itself, e.g. on repeated crashes).
@@ -16323,6 +16331,7 @@ const server = http.createServer(async (req, res) => {
       if (!a) return json(res, 404, { error: "unknown host" });
       await readBody(req);
       a.lastSeen = Date.now();
+      alertRecovered(key, a, a.lastSeen);
       scheduleSave();
       publishAgent(key);
       return json(res, 200, { ok: true });
