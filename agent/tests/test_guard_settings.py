@@ -608,6 +608,21 @@ class TestEnsureGuardSettingsWrite(unittest.TestCase):
             self.assertEqual(json.load(fh), {"previous": True})
         self.assertEqual(os.listdir(self.tmp), ["guard-settings.json"])
 
+    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "needs O_NOFOLLOW")
+    def test_a_symlink_planted_at_the_tmp_name_is_refused(self):
+        # A planted link would otherwise redirect the write, and the rename would
+        # leave guard-settings.json a symlink to a file nothing denies editing.
+        outside = tempfile.mkdtemp()
+        self.addCleanup(lambda: __import__("shutil").rmtree(outside, True))
+        target = os.path.join(outside, "elsewhere.json")
+        with open(target, "w", encoding="utf-8") as fh:
+            fh.write("untouched")
+        os.symlink(target, f"{self.path}.tmp.{os.getpid()}")
+        self.assertIsNone(self.sm._ensure_guard_settings())
+        with open(target, encoding="utf-8") as fh:
+            self.assertEqual(fh.read(), "untouched")
+        self.assertFalse(os.path.lexists(self.path))
+
 
 class TestLimitsSettings(unittest.TestCase):
     """The separate --settings file the subscription-limits probe launches with

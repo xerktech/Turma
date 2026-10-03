@@ -4608,9 +4608,12 @@ SANDBOX_DOMAIN_FLOOR = (
 )
 # Narrow `Bash(<cmd>:*)` allow rules skip auto mode's classifier: the routine
 # branch/PR/test steps an operator would always approve. The safety guard is a
-# PreToolUse hook and runs BEFORE these, so a guard-denied form (a force push, a
-# push to a protected branch it refuses) stays denied. `TURMA_TOOL_ALLOW` (CSV)
-# REPLACES the list when set non-blank. Distinct from `TURMA_TOOL_GRANTS`, which
+# PreToolUse hook and runs BEFORE these, but it refuses a push only when the
+# target is main/master (`_is_protected_ref`, any spelling, forced or not). So a
+# FORCE push to any other branch (`+feat`, `--force`, `-f`) matches
+# `git push origin:*` and runs unprompted, and so does a push to a repo whose
+# default branch has another name (develop, trunk): accepted residuals of this
+# floor. `TURMA_TOOL_ALLOW` (CSV) REPLACES the list when set non-blank. Distinct from `TURMA_TOOL_GRANTS`, which
 # only exempts the guard's destructive category at hook run time and is never
 # written here. The session-CLI rule is XERK-1564's, not this list's.
 TOOL_ALLOW_FLOOR = (
@@ -4652,7 +4655,8 @@ def auto_mode_host_block(device=None, repos=None):
     """The per-host `autoMode.environment` entry: the facts auto mode's
     classifier needs so this host is not "unknown infrastructure" to it. The
     operator's own settings keep the org-wide block; this one is generated per
-    host so it never goes stale against what the host actually holds.
+    host. It is a snapshot: `_ensure_guard_settings` writes it once per manager,
+    so a repo cloned after that is missing until the manager restarts.
 
     `repos` defaults to `scan_repos()` (one listdir); `device` to `$DEVICE_NAME`
     — the manager passes its own resolved name, since `device_name()` may probe."""
@@ -18813,11 +18817,13 @@ class SessionManager:
         """Write (once per manager) the Claude ``--settings`` file that wires
         the PreToolUse safety guard, returning its path — or None if it couldn't
         be written, in which case the session launches without the guard layer
-        rather than failing to start. The content is identical for every session
-        on the host (guard path + interpreter are fixed), so it's written once
-        to ``REGISTRY_DIR/guard-settings.json`` and reused. The operator's
-        ~/.claude/settings.local.json permissions are snapshotted into it at this
-        first write; restart the manager to pick up later edits to that file."""
+        rather than failing to start. The content is the same for every session
+        on the host, so it's written once to ``REGISTRY_DIR/guard-settings.json``
+        and reused for the manager's lifetime. It is a SNAPSHOT taken at this
+        first write: the operator's ~/.claude/settings.local.json permissions and
+        the autoMode host block (scanned repos included, XERK-1565) — a repo
+        cloned later, or a later edit to that file, is picked up only when the
+        manager restarts."""
         cached = getattr(self, "_guard_settings_path", None)
         if cached and os.path.exists(cached):
             return cached
@@ -18826,10 +18832,14 @@ class SessionManager:
         # start rewrites this file while sessions an earlier manager launched
         # still point at it, so a truncate-in-place write (or one cut short by a
         # full disk) could hand a reader a half file — no guard, no floors.
+        # O_NOFOLLOW like the other per-pid tmp writers here: a symlink already
+        # at that name is an attempt to redirect this write elsewhere, so refuse it.
         tmp = f"{path}.tmp.{os.getpid()}"
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
-            with open(tmp, "w", encoding="utf-8") as fh:
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                         | getattr(os, "O_NOFOLLOW", 0), 0o666)
+            with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(build_guard_settings(device=getattr(self, "device", None)),
                           fh, indent=2)
             os.replace(tmp, path)

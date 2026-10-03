@@ -37,14 +37,19 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     REPLACES it when non-blank.
   - `permissions.allow` gains `TOOL_ALLOW_FLOOR` (narrow `Bash(<cmd>:*)` branch/PR/test rules, which
     skip auto mode's classifier) after `_GUARD_ALLOW_PATH_RULES`, before the operator's;
-    `TURMA_TOOL_ALLOW` (CSV) REPLACES it. The guard hook still runs first, so a force push or a
-    push to `main` stays denied. Not `TURMA_TOOL_GRANTS`, which is a hook-time destructive exemption
-    and never written here.
+    `TURMA_TOOL_ALLOW` (CSV) REPLACES it. Not `TURMA_TOOL_GRANTS`, which is a hook-time
+    destructive exemption and never written here.
+  - The guard hook runs first but refuses a push ONLY to main/master (`_is_protected_ref`). A FORCE
+    push to any other branch (`+feat`, `--force`), and a push to a default branch named otherwise
+    (develop, trunk), match `git push origin:*` and run unprompted — accepted residuals. Never write
+    that the guard denies force pushes; it does not.
   - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
     repos (capped), `GH_CLONE_OWNERS`, tracker org/site, `TURMA_URL` minus userinfo, the worktree/PR/
-    default-branch facts. The operator file keeps the org-wide block.
+    default-branch facts. The operator file keeps the org-wide block. A SNAPSHOT at the manager's
+    first launch (the file is cached per process): a repo cloned later is missing until restart.
   - dsh/qwen read only `permissions`, and only its `Read()`/`Edit()` rules, so none of this leaks
-    there. `_ensure_guard_settings` writes tmp + `os.replace` (no half file for a reader).
+    there. `_ensure_guard_settings` writes an `O_NOFOLLOW` per-pid tmp + `os.replace` (no half file
+    for a reader, no planted-symlink redirect).
   - Real-host spike (sandboxed floor vs off-floor domain, merged environment, push + `gh pr create`
     unprompted) NOT yet run — record the answers here. Tests: `TestFleetPolicy`,
     `TestEnsureGuardSettingsWrite`.
