@@ -47,6 +47,12 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
 - **Anything unrecognised is `work`** — that is the pre-XERK-1570 reading, so a classifier miss
   costs nothing new; the reverse miss (work read as waiting) would hide a busy session. Every rule
   errs toward `work`; nested timeouts/loops classify as work rather than recurse on the beat.
+- **The classifier runs on the BEAT, so it is bounded in TIME, not just guarded** (XERK-395): a
+  command over 4096 chars or with a word over 256 is `work` before tokenizing, and no rule is a
+  backtracking regex (the old `tail -f` regex took ~48s on one 128 KB `-fff…!` word). Py regexes use
+  `re.ASCII` + `\Z` so `\d`/`$` mean what JS's do. `kubectl` waits only at the SUBCOMMAND position.
+- `startedAt`/`eta` come from `_ts_ms`/`tsMs` (strict ISO, no offset = UTC) — never `Date.parse`,
+  which reads an offset-less stamp as LOCAL time.
 - `startedAt` is the Bash CALL's timestamp, else the launch record's (a shell moved to the
   background on its timeout launches minutes after it started). Agent/workflow rows carry no `kind`.
 - **The py/js classifiers read ONE vector file** (`agent/tests/shell_kind_vectors.json`, asserted by

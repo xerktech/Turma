@@ -1499,6 +1499,46 @@ test("shellKind: the shared vectors (keep in step with TestShellKind)", () => {
   }
 });
 
+// XERK-1570: the old tail-follow regex backtracked quadratically on `-fff…!`,
+// blocking the tunnel's event loop. Bounded input + a linear check (TestShellKind twin).
+test("shellKind: a hostile command classifies in bounded time", () => {
+  const { shellKind, shellTailFollow } = require("../tunnel-agent.js");
+  const hostile = "-" + "f".repeat(200000) + "!";
+  for (const cmd of ["tail " + hostile, `tail ${hostile} ${hostile}`,
+                     "sleep 5 " + "x".repeat(1 << 20), "a b ".repeat(300000)]) {
+    const t0 = Date.now();
+    assert.deepEqual(shellKind(cmd), ["work", null]);
+    assert.ok(Date.now() - t0 < 500, cmd.slice(0, 20));
+  }
+  const t0 = Date.now();
+  assert.equal(shellTailFollow(hostile), false);
+  assert.equal(shellTailFollow("-" + "q".repeat(200000) + "f"), true);
+  assert.ok(Date.now() - t0 < 500);
+});
+
+// XERK-1570: tsMs is a mirror of _ts_ms — strict ISO, no offset = UTC (never
+// Date.parse, which reads that as LOCAL and accepts non-ISO). Same table as
+// TestTsMs in test_hub_agent.py.
+test("tsMs: strict ISO, UTC by default (keep in step with TestTsMs)", () => {
+  const { tsMs } = require("../tunnel-agent.js");
+  const table = [
+    ["2026-10-03T12:00:00Z", 1791028800000],
+    ["2026-10-03T12:00:00", 1791028800000],
+    ["2026-10-03T12:00:00.5+02:00", 1791021600500],
+    ["2026-10-03T12:00:00.123456789-0130", 1791034200123],
+    [" 2026-10-03T12:00:00.000Z\n", 1791028800000],
+    ["Oct 3 2026", null],
+    ["2026-02-30T00:00:00Z", null],
+    ["2026-10-03T24:00:00Z", null],
+    ["2026-10-03T12:00:60Z", null],
+    ["0000-01-01T00:00:00Z", null],
+    ["2026-10-03T12:00:00Zjunk", null],
+    ["٢٠٢٦-10-03T12:00:00Z", null],
+    [7, null],
+  ];
+  for (const [ts, ms] of table) assert.equal(tsMs(ts), ms, String(ts));
+});
+
 // XERK-1570: a shell row carries the kind of its COMMAND (never its description),
 // startedAt = the call's timestamp, and eta = startedAt + N for a timed wait.
 test("scanAgentEntry: a shell row carries kind, startedAt and eta (keep in step with TestLiveAgentsScan)", () => {

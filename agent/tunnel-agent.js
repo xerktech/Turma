@@ -1002,7 +1002,36 @@ const SHELL_DURATION_UNIT = { "": 1, s: 1, m: 60, h: 3600, d: 86400 };
 const SHELL_DURATION_MAX = 1e9;   // ~31 years: past it, "no literal"
 const SHELL_ENV_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
 const SHELL_REDIR_RE = /^(\d+|&)?(>>?|<<?<?)(&?)(.*)$/;
-const SHELL_TAIL_FOLLOW_RE = /^-[A-Za-z]*[fF][A-Za-z0-9]*$/;
+// Bounded INPUT, like _SHELL_KIND_MAX_CHARS/_WORD: past either it is `work`.
+const SHELL_KIND_MAX_CHARS = 4096;
+const SHELL_KIND_MAX_WORD = 256;
+const KUBECTL_VALUE_FLAGS = new Set(["-n", "--namespace", "--context", "--kubeconfig",
+  "--cluster", "--user", "-s", "--server", "--as", "--token", "--request-timeout"]);
+
+// tail's follow flag — mirror of _shell_tail_follow. A linear scan, never a
+// regex: `^-[A-Za-z]*[fF][A-Za-z0-9]*$` backtracks quadratically on `-fff…!`.
+function shellTailFollow(arg) {
+  if (arg.startsWith("--follow")) return true;
+  const body = arg.slice(1);
+  if (!arg.startsWith("-") || !/^[A-Za-z0-9]+$/.test(body)) return false;
+  for (const ch of body) {
+    if (ch === "f" || ch === "F") return true;
+    if (!/[A-Za-z]/.test(ch)) return false;
+  }
+  return false;
+}
+
+// kubectl's non-flag words — mirror of _kubectl_positionals.
+function kubectlPositionals(args) {
+  const out = [];
+  let skip = false;
+  for (const a of args) {
+    if (skip) skip = false;
+    else if (a.startsWith("-")) skip = KUBECTL_VALUE_FLAGS.has(a);
+    else out.push(a);
+  }
+  return out;
+}
 
 // Segments (`;` `&&` `||` `&` newline) of pipeline stages (`|`) of words.
 function shellSegments(command) {
@@ -1104,12 +1133,15 @@ function shellCmdKind(words, depth = 0) {
   if (SHELL_NEUTRAL_CMDS.has(cmd)) return ["neutral", null];
   if (cmd === "gh" && ((sameWords(args.slice(0, 2), ["pr", "checks"]) && args.includes("--watch"))
                        || sameWords(args.slice(0, 2), ["run", "watch"]))) return ["external", null];
-  if (cmd === "kubectl" && (args.includes("wait")
-      || args.some((a, k) => a === "rollout" && args[k + 1] === "status"))) return ["external", null];
+  if (cmd === "kubectl") {
+    // The SUBCOMMAND, not any word: `kubectl delete pod wait` is work.
+    const sub = kubectlPositionals(args).slice(0, 2);
+    if (sub[0] === "wait" || sameWords(sub, ["rollout", "status"])) return ["external", null];
+  }
   if (cmd === "docker" && args.includes("logs") && (args.includes("-f") || args.includes("--follow"))) {
     return ["external", null];
   }
-  if (cmd === "tail" && args.some((a) => SHELL_TAIL_FOLLOW_RE.test(a) || a.startsWith("--follow"))) {
+  if (cmd === "tail" && args.some(shellTailFollow)) {
     return ["external", null];
   }
   if (cmd === "watch") return ["external", null];
@@ -1153,7 +1185,11 @@ function shellLoop(segs, i) {
 }
 
 function shellKind(command) {
+  if (typeof command !== "string" || command.length > SHELL_KIND_MAX_CHARS) return ["work", null];
   const segs = shellSegments(command);
+  if (segs.some((seg) => seg.some((st) => st.some((w) => w.length > SHELL_KIND_MAX_WORD)))) {
+    return ["work", null];
+  }
   let timed = false, external = false, total = 0;
   for (let i = 0; i < segs.length;) {
     const head = shellWords(segs[i][0]);
@@ -1180,11 +1216,28 @@ function shellKind(command) {
   return ["work", null];
 }
 
-// Epoch ms of a transcript `timestamp`, or null — mirror of _ts_ms.
+// Epoch ms of a transcript `timestamp`, or null — mirror of _ts_ms and its
+// _ISO_INSTANT_RE. Strict ISO only, and no offset reads as UTC: never
+// Date.parse, which takes non-ISO strings and reads an offset-less one as LOCAL.
+const ISO_INSTANT_RE = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?(Z|[+-]\d{2}:?\d{2})?$/;
 function tsMs(ts) {
   if (typeof ts !== "string") return null;
-  const ms = Date.parse(ts.trim());
-  return Number.isFinite(ms) ? ms : null;
+  const m = ISO_INSTANT_RE.exec(ts.trim());
+  if (!m) return null;
+  const [y, mo, d, h, mi, s] = m.slice(1, 7).map(Number);
+  const dt = new Date(0);
+  dt.setUTCFullYear(y, mo - 1, d);
+  dt.setUTCHours(h, mi, s, 0);
+  // An out-of-range field rolls over in JS; python's datetime() refuses it.
+  if (y < 1 || dt.getUTCFullYear() !== y || dt.getUTCMonth() !== mo - 1 || dt.getUTCDate() !== d
+      || dt.getUTCHours() !== h || dt.getUTCMinutes() !== mi || dt.getUTCSeconds() !== s) return null;
+  let ms = dt.getTime() + Number((m[7] || "0").slice(0, 3).padEnd(3, "0"));
+  const tz = m[8];
+  if (tz && tz !== "Z") {
+    const sign = tz[0] === "-" ? -1 : 1;
+    ms -= sign * (Number(tz.slice(1, 3)) * 60 + Number(tz.slice(-2))) * 60000;
+  }
+  return ms;
 }
 
 // `{id, type, label}` iff this entry is a BACKGROUND WORK launch. Mirror of
@@ -2430,7 +2483,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, shellKind, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

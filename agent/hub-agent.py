@@ -5853,7 +5853,7 @@ class _UsageAcc:
 
 _ISO_INSTANT_RE = re.compile(
     r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?"
-    r"(Z|[+-]\d{2}:?\d{2})?$")
+    r"(Z|[+-]\d{2}:?\d{2})?$", re.ASCII)   # ASCII digits, like tsMs in tunnel-agent.js
 
 
 def _ts_ms(ts):
@@ -8541,12 +8541,23 @@ _SHELL_FILTER_CMDS = frozenset({"grep", "egrep", "fgrep", "head", "tail", "sed",
                                 "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"})
 # Wrappers that run the rest of the line unchanged.
 _SHELL_PREFIX_CMDS = frozenset({"nohup", "exec", "command"})
-_SHELL_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?|\.\d+)([smhd]?)$")
+# re.ASCII + \Z, never `$`: Python's `\d` takes Unicode digits and `$` matches
+# before a final newline, where the JS mirror (and bash's `sleep`) do neither.
+_SHELL_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?|\.\d+)([smhd]?)\Z", re.ASCII)
 _SHELL_DURATION_UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
 _SHELL_DURATION_MAX = 10 ** 9   # ~31 years: past it, "no literal"
-_SHELL_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SHELL_REDIR_RE = re.compile(r"^(\d+|&)?(>>?|<<?<?)(&?)(.*)$")
-_SHELL_TAIL_FOLLOW_RE = re.compile(r"^-[A-Za-z]*[fF][A-Za-z0-9]*$")
+_SHELL_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=", re.ASCII)
+_SHELL_REDIR_RE = re.compile(r"^(\d+|&)?(>>?|<<?<?)(&?)(.*)\Z", re.ASCII)
+# The classifier runs on the BEAT (XERK-395), so its INPUT is bounded, not just
+# guarded against raising: a command longer than this, or with any word longer
+# than _SHELL_KIND_MAX_WORD, is `work` before any rule looks at it. A real wait
+# is a short line, and `work` is today's reading.
+_SHELL_KIND_MAX_CHARS = 4096
+_SHELL_KIND_MAX_WORD = 256
+# kubectl global flags that take a SEPARATE value, skipped to find the subcommand.
+_KUBECTL_VALUE_FLAGS = frozenset({"-n", "--namespace", "--context", "--kubeconfig",
+                                  "--cluster", "--user", "-s", "--server", "--as",
+                                  "--token", "--request-timeout"})
 
 
 def _shell_segments(command):
@@ -8667,6 +8678,37 @@ def _shell_words(words):
     return out
 
 
+def _shell_tail_follow(arg):
+    """`tail`'s follow flag: `--follow…`, or a short-option cluster with letters
+    up to the first f/F and ASCII alphanumerics after (`-f`, `-F`, `-qf`, `-f5`).
+    A linear scan, never a regex: `^-[A-Za-z]*[fF][A-Za-z0-9]*$` backtracks
+    quadratically on a long `-fff…!` word, and this runs on the beat."""
+    if arg.startswith("--follow"):
+        return True
+    body = arg[1:]
+    if not arg.startswith("-") or not body or not body.isascii() or not body.isalnum():
+        return False
+    for ch in body:
+        if ch in "fF":
+            return True
+        if not ch.isalpha():
+            return False
+    return False
+
+
+def _kubectl_positionals(args):
+    """kubectl's non-flag words, skipping a known global flag's separate value."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a.startswith("-"):
+            skip = a in _KUBECTL_VALUE_FLAGS
+        else:
+            out.append(a)
+    return out
+
+
 def _shell_duration(arg):
     """`sleep`/`timeout` duration as seconds, or None when it is not a literal."""
     m = _SHELL_DURATION_RE.match(arg or "")
@@ -8705,13 +8747,14 @@ def _shell_cmd_kind(words, depth=0):
     if cmd == "gh" and ((args[:2] == ["pr", "checks"] and "--watch" in args)
                         or args[:2] == ["run", "watch"]):
         return "external", None
-    if cmd == "kubectl" and ("wait" in args or any(
-            args[k:k + 2] == ["rollout", "status"] for k in range(len(args)))):
-        return "external", None
+    if cmd == "kubectl":
+        # The SUBCOMMAND, not any word: `kubectl delete pod wait` is work.
+        sub = _kubectl_positionals(args)[:2]
+        if sub[:1] == ["wait"] or sub == ["rollout", "status"]:
+            return "external", None
     if cmd == "docker" and "logs" in args and ("-f" in args or "--follow" in args):
         return "external", None
-    if cmd == "tail" and any(_SHELL_TAIL_FOLLOW_RE.match(a) or a.startswith("--follow")
-                             for a in args):
+    if cmd == "tail" and any(_shell_tail_follow(a) for a in args):
         return "external", None
     if cmd == "watch":
         return "external", None
@@ -8760,7 +8803,11 @@ def _shell_loop(segs, i):
 
 def _shell_kind(command):
     """(kind, seconds-or-None) of a background shell's command — see above."""
+    if not isinstance(command, str) or len(command) > _SHELL_KIND_MAX_CHARS:
+        return SHELL_KIND_WORK, None
     segs = _shell_segments(command)
+    if any(len(w) > _SHELL_KIND_MAX_WORD for seg in segs for st in seg for w in st):
+        return SHELL_KIND_WORK, None
     timed = external = False
     total = 0.0
     i = 0

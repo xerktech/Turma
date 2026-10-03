@@ -49,6 +49,18 @@
     ["sleep 10 | xargs echo", "work", null],
     ["tail -n 20 build.log", "work", null],
     ["gh pr checks 12", "work", null],
-    ["sleep 99999999999999999999999999999999999999999999999999d", "wait-timed", null]
+    ["sleep 99999999999999999999999999999999999999999999999999d", "wait-timed", null],
+    ["sleep ١٢", "wait-timed", null],
+    ["sleep \"5\n\"", "wait-timed", null],
+    ["sleep 5 >\"out\n\"", "wait-timed", null],
+    ["kubectl delete pod wait", "work", null],
+    ["kubectl logs rollout status", "work", null],
+    ["kubectl --context prod -n ai wait --for=delete pod/x", "wait-external", null],
+    ["kubectl --namespace=ai rollout status deploy/x", "wait-external", null],
+    ["tail -qf a.log", "wait-external", null],
+    ["tail \"-f\n\" a.log", "work", null],
+    ["tail -n5f a.log", "work", null],
+    ["tail -fé a.log", "work", null],
+    ["sleep 5 xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx", "work", null]
   ]
 }

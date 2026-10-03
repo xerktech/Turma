@@ -3840,6 +3840,40 @@ class TestShellKind(unittest.TestCase):
                 kind, _ = ha._shell_kind(cmd)
                 self.assertIn(kind, ("wait-timed", "wait-external", "work"))
 
+    def test_a_hostile_command_classifies_in_bounded_time(self):
+        # A try/except catches exceptions, never TIME (XERK-395): the old tail
+        # regex backtracked quadratically, ~48s for one 128 KB `-fff…!` word.
+        hostile = "-" + "f" * 200000 + "!"
+        for cmd in ("tail " + hostile, "tail " + hostile + " " + hostile,
+                    "sleep 5 " + "x" * (1 << 20), "a b " * 300000):
+            with self.subTest(cmd=cmd[:20]):
+                t0 = time.monotonic()
+                self.assertEqual(ha._shell_kind(cmd), ("work", None))
+                self.assertLess(time.monotonic() - t0, 0.5)
+        # The follow check itself is linear too, past the input caps.
+        t0 = time.monotonic()
+        self.assertFalse(ha._shell_tail_follow(hostile))
+        self.assertTrue(ha._shell_tail_follow("-" + "q" * 200000 + "f"))
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+
+class TestTsMs(unittest.TestCase):
+    """_ts_ms — the same table as the `tsMs` case in tunnel-agent.test.js, so a
+    shell row's startedAt/eta agree across the two mirrors."""
+
+    def test_the_shared_table(self):
+        for ts, ms in (("2026-10-03T12:00:00Z", 1791028800000),
+                       ("2026-10-03T12:00:00", 1791028800000),
+                       ("2026-10-03T12:00:00.5+02:00", 1791021600500),
+                       ("2026-10-03T12:00:00.123456789-0130", 1791034200123),
+                       (" 2026-10-03T12:00:00.000Z\n", 1791028800000),
+                       ("Oct 3 2026", None), ("2026-02-30T00:00:00Z", None),
+                       ("2026-10-03T24:00:00Z", None), ("2026-10-03T12:00:60Z", None),
+                       ("0000-01-01T00:00:00Z", None), ("2026-10-03T12:00:00Zjunk", None),
+                       ("٢٠٢٦-10-03T12:00:00Z", None), (7, None)):
+            with self.subTest(ts=ts):
+                self.assertEqual(ha._ts_ms(ts), ms)
+
 
 class TestLiveAgentsScan(unittest.TestCase):
     """_scan_agent_entry — which background agents are in flight, off the

@@ -1062,7 +1062,7 @@
   //  - **Live background agents do NOT qualify**, however busy the session is.
   //    The main turn has ENDED (that is the whole point of XERK-245), so the
   //    pane emits `text:""`/`status:null` and `liveAgentsReport` carries only
-  //    `{type,label}` with nothing that ticks — the agent's frame key never
+  //    static fields (`type,label,kind,startedAt,eta`), nothing that ticks — the agent's frame key never
   //    changes and it correctly sends nothing for minutes. Counting that as
   //    "must be emitting" declared every healthy delegating session dead, polled
   //    /history around it and tore the socket down every cooldown — and each
