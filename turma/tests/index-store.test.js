@@ -954,3 +954,34 @@ test("XERK-1364 pg mode: neither sidecar nor Postgres describes the file — low
     assert.equal(archive.sessionRow("t-nei").msgCount, 3);
   } finally { pgTeardown(); }
 });
+
+test("XERK-1364 pg mode: backfill from a stale sidecar de-dups; a repeated key is not a re-send", async () => {
+  const mem = pgSetup();
+  try {
+    // pr-link rows share one id by design; a new one in a re-send is still new.
+    const pr = (ts) => ({ uuid: "pr-link:https://x/pr/1", role: "assistant", ts, text: "PR #1" });
+    const b1 = [ent("p0", "user", "one"), pr("2026-07-10T00:01:00Z")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    archive.ingestChunk("nas", "t-bf", META, 0, len1, b1, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-bf").filePath);
+    const staleMeta = fs.readFileSync(jsonl + ".meta");
+    const b2 = [ent("p1", "assistant", "two")];
+    const len2 = len1 + Buffer.byteLength(JSON.stringify(b2));
+    archive.ingestChunk("nas", "t-bf", META, len1, len2, b2, "acme");
+    fs.writeFileSync(jsonl + ".meta", staleMeta);
+    mem.sessions.clear(); mem.entries.clear();       // Postgres wiped (XERK-797)
+
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    assert.equal(archive.backfillPgIndexFromFiles(), 1);
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-bf" }], "acme")["t-bf"], len1);
+    const b3 = [...b2, pr("2026-07-10T00:05:00Z")];
+    archive.ingestChunk("nas", "t-bf", META, len1, len1 + 999, b3, "acme");
+    const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+    assert.deepEqual(uuids, ["p0", "pr-link:https://x/pr/1", "p1", "pr-link:https://x/pr/1"]);
+    assert.equal(archive.sessionRow("t-bf").msgCount, 4);
+    assert.equal(mem.entries.get("t-bf").size, 4);
+  } finally { pgTeardown(); }
+});

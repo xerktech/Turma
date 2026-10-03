@@ -176,9 +176,14 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
   material) reachable. Any OTHER read error stays null — a transient EIO must not read as empty.
 - **The cursor is the ONLY duplicate guard on the rendered `.jsonl` (XERK-1364)** — an append at a
   cursor behind the file repeats lines (prod: whole transcripts doubled, meta counting them once).
-  - `ingestChunk` de-dups a chunk (by uuid, else whole line) against the file when it is LARGER than
-    the row's `archiveBytes`, or the id is in `unverifiedCursors`; it stays suspect until a chunk
-    carries a NEW entry, since a re-send from a stale cursor spans several chunks.
+  - `ingestChunk` de-dups a chunk against the file when it is LARGER than the row's `archiveBytes`,
+    or the id is in `unverifiedCursors`; suspect until a chunk carries a NEW entry, since a re-send
+    from a stale cursor spans several chunks.
+  - While suspect, `archiveBytes` stays at its LAGGING value on row + sidecar: that mismatch is what
+    re-derives the suspicion after a restart (the Set is in memory). Never write the file size there.
+  - Keys are a MULTISET (pr-link rows share an id); uuid'd entries key on uuid+role+ts, not text.
+  - Entering suspicion re-seats the transcript's FTS/PG entries from the file (an orphan's held
+    entries were never indexed).
   - A sidecar's `bytesStored` is trusted only when its `archiveBytes` equals the file size
     (`reconcileHydratedCursors`, `rebuildIndex`, backfill): hydrate keeps a same-size STALE `.meta`
     beside a re-downloaded `.jsonl`. Neither sidecar nor row matches → lower cursor + suspect.

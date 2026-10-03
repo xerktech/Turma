@@ -720,28 +720,50 @@ function readSidecar(metaPath) {
 // until one carries a new entry. In memory — every boot re-derives it.
 const unverifiedCursors = new Set();
 
-// What identifies an entry across a re-send: its uuid, else its whole line.
+// What identifies an entry across a re-send. Not `blocks`: the budget may have
+// shed their payloads from the stored line. A uuid'd entry keys on uuid+role+ts
+// (its rendered text may change between agent versions); one without, on its text.
 function entryKey(e) {
-  if (e && e.uuid) return "u:" + e.uuid;
-  return "l:" + JSON.stringify({ uuid: null, role: (e && e.role) || null,
-    ts: (e && e.ts) || null, text: String((e && e.text) || "") });
+  const o = e && typeof e === "object" ? e : {};
+  return JSON.stringify(o.uuid
+    ? [o.uuid, o.role || null, o.ts || null]
+    : [null, o.role || null, o.ts || null, String(o.text || "")]);
 }
 
-// The entry keys a `.jsonl` already holds, and its entry count (one per line, as
-// msgCount counts them). Read only for a transcript whose cursor is suspect.
-function heldEntryKeys(jsonl) {
-  const keys = new Set();
-  let count = 0;
+// The entries a `.jsonl` already holds (as parseEntries reads them — a torn line
+// is no entry) and a count per entry key. Read only for a suspect cursor.
+function heldEntries(jsonl) {
   let raw = "";
   try { raw = fs.readFileSync(jsonl, "utf8"); } catch { /* absent: nothing held */ }
+  const entries = [];
+  const keys = new Map();
   for (const line of raw.split("\n")) {
-    if (!line.trim()) continue;
-    count++;
-    let e = null;
-    try { e = JSON.parse(line); } catch { /* unparseable: counted, never matched */ }
-    if (e && typeof e === "object") keys.add(entryKey(e));
+    const t = line.trim();
+    if (!t) continue;
+    let e;
+    try { e = JSON.parse(t); } catch { continue; }
+    if (!e || typeof e !== "object") continue;
+    entries.push(e);
+    const k = entryKey(e);
+    keys.set(k, (keys.get(k) || 0) + 1);
   }
-  return { keys, count };
+  return { entries, keys };
+}
+
+// Re-seat a transcript's search entries from what its file holds: the local FTS
+// in sqlite mode, the Postgres of-record (by ordinal) in both.
+function reindexHeld(transcriptId, entries) {
+  if (!isPgMode()) {
+    tx(() => {
+      db.prepare("DELETE FROM entries_fts WHERE transcriptId=?").run(transcriptId);
+      const ins = db.prepare(
+        "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)");
+      for (const e of entries) {
+        ins.run(String(e.text || ""), transcriptId, e.uuid || null, e.role || null, e.ts || null);
+      }
+    });
+  }
+  mirrorReplace(transcriptId, entries);
 }
 
 function writeSidecar(metaPath, obj) {
@@ -1312,25 +1334,39 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   try { fileSize = fs.statSync(paths.jsonl).size; } catch { /* absent: 0 */ }
   let prevCount = row ? (row.msgCount || 0) : 0;
   let archiveBytes = (row && row.archiveBytes) || 0;
-  if (unverifiedCursors.has(transcriptId) || fileSize > archiveBytes) {
-    const held = heldEntryKeys(paths.jsonl);
+  const wasSuspect = unverifiedCursors.has(transcriptId);
+  if (wasSuspect || fileSize > archiveBytes) {
+    const held = heldEntries(paths.jsonl);
+    // Entering suspicion here means the index never saw some of what the file
+    // holds (an orphan under a missing row): re-seat the transcript's search
+    // entries from the file once, or they stay unsearchable for good.
+    if (!wasSuspect) reindexHeld(transcriptId, held.entries);
+    // A multiset, consumed one per match: entries can legitimately repeat a key
+    // (pr-link rows share an id), and a re-send repeats each held one ONCE.
     const fresh = list.filter((e) => {
       const k = entryKey(e);
-      if (held.keys.has(k)) return false;
-      held.keys.add(k);
-      return true;
+      const n = held.keys.get(k) || 0;
+      if (!n) return true;
+      held.keys.set(k, n - 1);
+      return false;
     });
     if (fresh.length < list.length) {
       console.error(`archive: ${transcriptId}: skipped ${list.length - fresh.length} ` +
         `re-sent entr(ies) its .jsonl already holds (cursor behind the file; XERK-1364)`);
     }
-    // Still suspect until a chunk carries something new: the agent re-sends in
-    // order, so the first new entry means it has caught up with the file.
-    if (fresh.length) unverifiedCursors.delete(transcriptId);
-    else unverifiedCursors.add(transcriptId);
     list = fresh;
-    prevCount = held.count;
-    archiveBytes = fileSize;
+    prevCount = held.entries.length;
+    // Still suspect until a chunk carries something new: the agent re-sends in
+    // order, so the first new entry means it has caught up with the file. While
+    // suspect, archiveBytes keeps its lagging value on the row and the sidecar,
+    // so a restart mid-re-send re-derives the suspicion (rebuildIndex/reconcile
+    // compare it with the file) instead of trusting a cursor still behind it.
+    if (fresh.length) {
+      unverifiedCursors.delete(transcriptId);
+      archiveBytes = fileSize;
+    } else {
+      unverifiedCursors.add(transcriptId);
+    }
   }
 
   // pg mode keeps NO local entries index — the entry text lives only in Postgres
@@ -2503,8 +2539,8 @@ function reconcileHydratedCursors() {
     // sidecar is rewritten after every append, so it describes this `.jsonl` when
     // its archiveBytes is the file's size; else the row may (a promoted follower
     // keeps its own same-size stale `.meta` while the hydrate re-downloads the
-    // grown `.jsonl`). When neither does, take the LOWER cursor — a re-send then
-    // overlaps the file instead of leaving a gap — and have ingest de-duplicate it.
+    // grown `.jsonl`). When neither does, take the LOWER cursor — the safer of two
+    // unproven ones — and have ingest de-duplicate whatever the re-send overlaps.
     const scBytes = sc && Number.isFinite(sc.bytesStored) ? sc.bytesStored : null;
     let bytesStored;
     if (scBytes != null && sc.archiveBytes === fileSize) bytesStored = scBytes;

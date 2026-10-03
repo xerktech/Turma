@@ -1701,3 +1701,32 @@ test("XERK-1364: a rebuild from a stale sidecar de-duplicates the agent's re-sen
   assert.deepEqual(uuids, ["s1", "s2"]);
   assert.equal(archive.getTranscript(id).entries.length, 2);
 });
+
+// Last in the file: it reloads the module to simulate a hub restart.
+test("XERK-1364: a restart mid-re-send stays de-duplicated; held entries stay searchable", async () => {
+  const id = "t-1364-restart";
+  const m = { ...META, summary: "Restart resend" };
+  const b1 = [ent("r1", "user", "heldzulu one"), ent("r2", "assistant", "two")];
+  const b2 = [ent("r3", "user", "three")];
+  archive.ingestChunk("nas", id, m, 0, 10, b1);
+  archive.ingestChunk("nas", id, m, 10, 20, b2);
+  const jsonl = path.join(process.env.ARCHIVE_DIR, archive.archiveRelPath(id, { ...m, host: "nas" }));
+  fs.rmSync(jsonl + ".meta");
+  archive.rebuildIndex();                       // the orphan: no row, cursor 0
+  archive.ingestChunk("nas", id, m, 0, 10, b1); // the re-send's first chunk
+  // The orphan's held entries were indexed when ingest found them, not only appended ones.
+  const hits = (await archive.searchArchive("heldzulu")).groups
+    .flatMap((g) => g.matches).filter((x) => x.transcriptId === id);
+  assert.equal(hits.length, 1);
+
+  archive.closeDb();
+  delete require.cache[require.resolve("../archive.js")];
+  const fresh = require("../archive.js");
+  fresh.rebuildIndex();
+  assert.equal(fresh.manifestCursors("nas", [{ transcriptId: id, ...m }])[id], 10);
+  fresh.ingestChunk("nas", id, m, 10, 20, b2);  // the rest of the re-send, after the restart
+  fresh.ingestChunk("nas", id, m, 20, 30, [ent("r4", "assistant", "four")]);
+  const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+  assert.deepEqual(uuids, ["r1", "r2", "r3", "r4"]);
+  fresh.closeDb();
+});
