@@ -57,8 +57,8 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 ## Surfaces
 
 - **The needs-you cards live in the Sessions page's Ready for review — the dashboard has NO
-  needs-you list** (the operator's screenshot-review call; a dashboard "Needs you" group and
-  Android's `NeedsYouCard` were built and removed). Don't add one back.
+  needs-you list**: Ready for review is the one home for waiting work, so a second list on the
+  dashboard (web or Android) would split it. The operator's call; don't add one.
   - **Where the hub serves attention it DECIDES the section** (`inReview`: sessions.html, Android
     `core/Sessions.kt`, glasses `sessions.ts`): every `needs-you:*` session is listed — question,
     permission, review, stalled (a stall whose own turn never finished included) — and a session
