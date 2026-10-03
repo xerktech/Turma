@@ -43,6 +43,11 @@ specific fixture that caught it was added.
     same-user pair's losing block, reviving a dropped ticket for auto-start. Only `fleetTicketRows`
     and `hostTriagedTicket` may read a block's `tickets`; a test pins that as a tripwire, not a proof
     — its own comment lists what still escapes it.
+  - **Only a host DECIDED into the org it claims contributes a block** (XERK-1491):
+    `fleetTicketRows` skips `decidedOrgOf(a) !== jira.siteKey`; `mergeSites` (+ vendored copy,
+    `Board.kt`) skips a host whose served `org` differs from its claim (absent `org` = older hub,
+    trusted). Grouping by the CLAIMED siteKey let a drifted host's newer-`updated` forged rows
+    make the sweeps kill/merge another org's sessions. Tests: `XERK-1491` in all three suites.
   - **`ticketRepo` reads the resolved ROW; it does not rank blocks itself** — ranking there was
     subtly wrong twice (ignored the newer-`updated` override; showed untriaged when the winning
     block had no `repoGuess`).

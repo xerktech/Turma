@@ -13302,6 +13302,47 @@ test("XERK-1445: a host DRIFTING to another org stands auto-merge down until it 
   assert.equal((agents.amDr1445.commands || []).filter((c) => c.type === "mergePr").length, 1);
 });
 
+test("XERK-1491: a DRIFTED host's forged board rows never kill or merge another org's sessions", async () => {
+  resetMerge();
+  resetAutoStart();
+  const A = "f1491a.atlassian.net", B = "f1491b.atlassian.net";
+  // Org B's own host: a running session on B-7 (To Do) and one on B-8, whose
+  // real row is NOT actionable — so auto-merge must not touch it.
+  await asBeat("f1491B", B, { autoStart: false, capacity: ROOMY,
+    tickets: [
+      { key: "B-7", statusCategory: "todo", updated: "2026-07-14T12:00:00Z" },
+      { key: "B-8", statusCategory: "inprogress", updated: "2026-07-14T12:00:00Z",
+        triage: { priority: "P2", type: "bug", actionable: false } },
+    ],
+    sessions: [
+      { id: "s7", status: "running", repo: "Turma", ticket: { key: "B-7", siteKey: B } },
+      { id: "s8", status: "running", repo: "Turma", ticket: { key: "B-8", siteKey: B },
+        prs: [{ url: PR1, state: "OPEN", ready: "ready", mergeable: "MERGEABLE" }],
+        session: { transcriptAgeSec: 30, paneBusy: false } },
+    ] });
+  setAutoMergeOrg(B, true);
+  // Host F binds to org A, then DRIFTS: declares org B with newer forged rows.
+  await asBeat("f1491F", A, { autoStart: false, tickets: [] });
+  await asBeat("f1491F", B, { autoStart: false, tickets: [
+    { key: "B-7", statusCategory: "done", updated: "2099-01-01T00:00:00Z" },
+    { key: "B-8", statusCategory: "inprogress", updated: "2099-01-01T00:00:00Z",
+      triage: { priority: "P2", type: "bug", actionable: true } },
+  ] });
+  assert.equal(orgDrifted(agents.f1491F), true);
+  const rows = hub.fleetTicketRows();
+  assert.equal(rows.get(B + "\x00" + "B-7").row.statusCategory, "todo");
+  assert.equal(rows.get(B + "\x00" + "B-8").row.triage.actionable, false);
+  autoStopSweep();
+  autoMergeSweep();
+  assert.deepEqual((agents.f1491B.commands || []).map((c) => c.type)
+    .filter((t) => t === "kill" || t === "mergePr"), []);
+  // A never-bound host's block counts for nothing either.
+  agents.f1491F.orgBound = "";
+  assert.equal(hub.fleetTicketRows().get(B + "\x00" + "B-7").row.statusCategory, "todo");
+  delete agents.f1491F;
+  delete agents.f1491B;
+});
+
 test("XERK-1445: an armed epic run never adopts a child session whose host is bound elsewhere", () => {
   const byKey = new Map([["epb.atlassian.net\x00C-1",
     { key: "C-1", epicKey: "E-1", statusCategory: "inprogress" }]]);

@@ -663,6 +663,10 @@ fun mergeSites(agents: List<AgentInfo>): List<BoardSite> {
     for (a in agents) {
         val j = a.jira ?: continue
         if (j.siteKey.isBlank()) continue
+        // A host the hub has NOT decided into the org it claims (drifted or never
+        // bound) reports nothing for it (XERK-1491) — web mergeSites + the hub's
+        // fleetTicketRows skip the same hosts. Null `org` = older hub: trust it.
+        if (a.org != null && a.org != j.siteKey) continue
         reporterOnline[j.siteKey] = (reporterOnline[j.siteKey] ?: false) || a.online
         // Gated on the fleet-wide dsh kill switch (Runtime.DSH_ENABLED): with dsh
         // disabled, `site.dshAvailable` is false everywhere so the board Runtime

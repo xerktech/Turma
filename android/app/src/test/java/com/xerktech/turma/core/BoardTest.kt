@@ -139,6 +139,21 @@ class BoardTest {
         assertEquals(3, sites[0].tickets.size) // X-2 deduped
     }
 
+    @Test fun `XERK-1491 a host not decided into its claimed org reports nothing for it`() {
+        // Parity with board.js + the hub's fleetTicketRows: the served `org` is the
+        // DECIDED org, "" for a drifted/never-bound host, whose rows are dropped.
+        val honest = AgentInfo(key = "h1", online = true, org = "org", jira = JiraBlock(siteKey = "org",
+            user = "u1", fetchedAt = "2026-07-16T01:00:00Z", tickets = listOf(ticket("X-1", "todo"))))
+        val drifted = AgentInfo(key = "h2", online = true, org = "", jira = JiraBlock(siteKey = "org",
+            user = "u2", fetchedAt = "2099-01-01T00:00:00Z",
+            tickets = listOf(ticket("X-1", "done", updated = "2099-01-01T00:00:00Z"), ticket("X-9"))))
+        val site = mergeSites(listOf(honest, drifted)).single()
+        assertEquals(listOf("X-1" to "todo"), site.tickets.map { it.key to it.statusCategory })
+        // Null org = an older hub: the claim is trusted.
+        assertEquals(1, mergeSites(listOf(agent("h3", true, JiraBlock(siteKey = "org",
+            tickets = listOf(ticket("X-1")))))).single().tickets.size)
+    }
+
     @Test fun `site is online when any reporting host is online`() {
         val a1 = agent("h1", false, JiraBlock(siteKey = "org", user = "u1", fetchedAt = "2026-07-16T01:00:00Z"))
         val a2 = agent("h2", true, JiraBlock(siteKey = "org", user = "u1", fetchedAt = "2026-07-16T02:00:00Z"))

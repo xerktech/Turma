@@ -78,6 +78,24 @@ test("mergeSites: freshest block wins for the same site+user (never unioned)", (
   assert.equal(sites[0].lastFetched, "2026-07-14T12:00:00Z");
 });
 
+test("XERK-1491: mergeSites ignores a host the hub has not decided into the org it claims", () => {
+  // The hub serves `org` = the DECIDED org ("" for a drifted or never-bound
+  // host). fleetTicketRows skips such a host's block, so the board must too —
+  // else a forged Done shows on the card the sweeps rightly ignore.
+  const sites = mergeSites([
+    agent("honest", block({ tickets: [ticket("T-1", { statusCategory: "todo" })] }),
+      { org: "myorg.atlassian.net" }),
+    agent("drifted", block({ fetchedAt: "2099-01-01T00:00:00Z",
+      tickets: [ticket("T-1", { statusCategory: "done", updated: "2099-01-01T00:00:00Z" }),
+                ticket("T-9")] }), { org: "" }),
+  ]);
+  assert.equal(sites.length, 1);
+  assert.deepEqual(sites[0].tickets.map((t) => [t.key, t.statusCategory]), [["T-1", "todo"]]);
+  assert.deepEqual(sites[0].hosts, ["honest"]);
+  // An older hub serves no `org`: the claim is trusted, as before.
+  assert.equal(mergeSites([agent("old", block({ tickets: [ticket("T-1")] }))])[0].tickets.length, 1);
+});
+
 test("XERK-325: mergeSites ranks an ONLINE host's block above any offline one", () => {
   // The card and the hub have to resolve a ticket the same way. `ticketRepo`
   // prefers an online host and routing can only reach one, so an offline host
