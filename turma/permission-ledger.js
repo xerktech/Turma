@@ -237,8 +237,29 @@ function median(nums) {
   return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
 }
 
+// Bash heads a `Bash(<head>:*)` rule must never be offered for: an interpreter,
+// shell, wrapper or shell keyword runs WHATEVER follows it, so its prefix rule
+// allows arbitrary code. A head outside a plain command shape (`(cd`, a glob, a
+// paren) would be a malformed rule. Either way the card says no rule retires it.
+const BASH_NEVER_HEADS = new Set([
+  "bash", "sh", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "pwsh", "powershell",
+  "python", "python2", "python3", "node", "deno", "ruby", "perl", "php", "lua",
+  "osascript", "sudo", "su", "doas", "env", "xargs", "timeout", "nohup", "nice",
+  "time", "watch", "exec", "eval", "source", ".", "command", "builtin", "for", "while",
+  "until", "if", "case", "select", "function", "do", "then", "npx", "bunx", "uvx",
+  "npm exec", "pnpm exec", "pnpm dlx", "yarn dlx", "uv run", "docker run",
+  "docker exec", "kubectl exec", "ssh", "awk", "find", "parallel", "script",
+]);
+const BASH_HEAD_RE = /^[A-Za-z0-9._/-]+( [A-Za-z0-9._-]+)?$/;
+
 function toolRule(tool, head) {
-  if (tool === "Bash" && head) return `Bash(${head}:*)`;
+  if (tool === "Bash" && head) {
+    const word = head.split(" ")[0];
+    const base = word.slice(word.lastIndexOf("/") + 1);
+    if (!BASH_HEAD_RE.test(head) || BASH_NEVER_HEADS.has(head)
+        || BASH_NEVER_HEADS.has(word) || BASH_NEVER_HEADS.has(base)) return null;
+    return `Bash(${head}:*)`;
+  }
   if (typeof tool === "string" && tool.startsWith("mcp__")) return tool;
   if (tool === "WebFetch" && head && HOST_RE.test(head)) return `WebFetch(domain:${head})`;
   return null;
@@ -253,7 +274,9 @@ function toolRule(tool, head) {
  *                                      call's tool rule; NONE when the call has no
  *                                      tool rule (a sentence lifted from the deny
  *                                      reason is not a line anything accepts)
- *   Bash                             → Bash(<head>:*)
+ *   Bash                             → Bash(<head>:*), except an interpreter /
+ *                                      wrapper / shell-keyword head or a head
+ *                                      outside a plain command shape (null)
  *   MCP                              → the full mcp__<server>__<tool>
  *   WebFetch                         → WebFetch(domain:<d>)
  *   anything else                    → null (no rule retires it)

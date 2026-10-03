@@ -159,6 +159,23 @@ test("suggestedRule: the deterministic table", () => {
   for (const [g, want] of cases) assert.equal(suggestedRule(g), want, JSON.stringify(g));
 });
 
+test("suggestedRule: never an allow-everything or malformed Bash prefix rule", () => {
+  // An interpreter / shell / wrapper / keyword head runs whatever follows it.
+  for (const head of ["python3", "bash", "sh", "sudo", "env", "xargs", "timeout", "for",
+    "eval", "/usr/bin/python3", "npx tsx", "uv run", "docker run", "npm exec"]) {
+    assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
+    assert.equal(suggestedRule({ kind: "classifier-denied", tool: "Bash", head }), null, head);
+  }
+  // A head outside a plain command shape would be a malformed rule.
+  for (const head of ["(cd", "rm*", "a)b", "$(foo)", "x;y", "make all extra"]) {
+    assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
+  }
+  // Ordinary commands keep their rule.
+  for (const head of ["make", "npm test", "./gradlew test", "bun test", "go test"]) {
+    assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), `Bash(${head}:*)`, head);
+  }
+});
+
 test("aggregate: ask-in-chat groups by its question, with no allowed/denied to claim", () => {
   const ask = (id, prompt, extra = {}) => ({ id, kind: "ask-in-chat", sessionId: "s1", prompt,
     openedAt: NOW - MIN, closedAt: NOW, waitedMs: MIN, answer: "unknown", via: "turma", ...extra });

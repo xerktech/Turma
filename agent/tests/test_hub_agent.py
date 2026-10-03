@@ -36860,6 +36860,105 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
             now_ms=at, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
         self.assertIn(f"r-{self.SID}-toolu_old", {r["id"] for r in self.rows()})
 
+    # --- back-to-back dialogs, pickers, parallel calls -------------------------
+
+    def test_back_to_back_dialogs_are_two_rows(self):
+        # Call A's dialog is answered and call B's (same question, another
+        # command) is up before the next beat: the pane never shows "no dialog".
+        self.write(self.tool_use("toolu_A", inp={"command": "git push"}))
+        self.edge(dict(self.dialog(), detail="Bash command\ngit push"), at=1000)
+        self.write(self.tool_result("toolu_A"),
+                   self.tool_use("toolu_B", inp={"command": "rm -rf build"}))
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.edge(None, at=9000)
+        rows = {}
+        for r in self.rows():
+            rows[r["id"]] = r
+        self.assertEqual(sorted((r["head"], r["waitedMs"], r["answer"])
+                                for r in rows.values()),
+                         [("git push", 5000, "allow"), ("rm", 3000, "unknown")])
+
+    def test_a_second_request_never_merges_into_a_row_that_has_one(self):
+        # PermissionRequest rows with no toolUseId: the first claims the open
+        # dialog, the second is another prompt's and is held, not merged.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(dict(self.request_hook(""), head="git push", ts=1000),
+                       dict(self.request_hook(""), head="rm", ts=1500))
+        self.sm._apply_permission_hook_rows(now_ms=1600, mono=0)
+        self.assertEqual(self.sm._perm_open[self.SID]["rulesMatched"],
+                         ["Bash(npm test:*)"])
+        held = self.sm._perm_hook_pending[self.SID]
+        self.assertEqual([h["head"] for h, _ in held.values()], ["rm"])
+
+    def test_an_ask_user_question_picker_is_not_a_permission_row(self):
+        self.write(self.tool_use("toolu_Q", name="AskUserQuestion",
+                                 inp={"questions": [{"question": "Which plan?"}]}))
+        self.edge({"prompt": "Which plan?", "options": [
+            {"number": 1, "label": "A", "selected": True},
+            {"number": 2, "label": "B", "selected": False}]}, at=1000)
+        self.assertEqual(self.rows(), [])
+        self.edge(self.dialog(), at=2000, question="Which plan?")
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn(self.SID, self.sm._perm_open)
+
+    def test_parallel_calls_charge_the_oldest_open_call_of_the_newest_message(self):
+        def use(tuid, cmd, mid):
+            e = self.tool_use(tuid, inp={"command": cmd})
+            e["message"]["id"] = mid
+            return e
+        self.write(use("toolu_0", "ls", "msg_0"), self.tool_result("toolu_0"),
+                   use("toolu_A", "git push", "msg_1"),
+                   use("toolu_B", "npm test", "msg_1"),
+                   use("toolu_C", "make", "msg_1"))
+        self.edge(self.dialog(), at=1000)
+        self.assertEqual(self.rows()[-1]["toolUseId"], "toolu_A")
+        self.assertEqual(ha.pending_tool_call([use("toolu_X", "ls", "m")])["toolUseId"],
+                         "toolu_X")
+
+    # --- the beat wiring ------------------------------------------------------
+
+    def test_the_beat_drives_every_edge_end_to_end(self):
+        # The real payload build, session_report stubbed: dialog open, close,
+        # a staged hook row folded, and a session leaving running.
+        signals = {}
+
+        def report(*_a, **_k):
+            return dict({"prUrls": [], "modelActual": "m",
+                         "lastTurnContextTokens": 1, "paneBusy": False,
+                         "panePrompt": None}, **signals)
+
+        self.sm._stage_permission_fetch = mock.Mock()
+
+        def beat():
+            with mock.patch.object(ha, "session_report", side_effect=report), \
+                    mock.patch.object(self.sm, "_live_tmux_panes", return_value=None):
+                payload = self.sm.build_payload(1, light=True)
+            self.sm._clear_delivered_staged(payload)
+            return {r["id"]: r for r in payload.get("permissionEvents") or []}
+
+        self.write(self.tool_use("toolu_1"))
+        signals["panePrompt"] = self.dialog()
+        got = beat()
+        (rid, opened), = got.items()
+        self.assertEqual((opened["kind"], opened["toolUseId"]), ("dialog", "toolu_1"))
+        self.assertNotIn("closedAt", opened)
+        self.write(self.tool_result("toolu_1"))
+        signals["panePrompt"] = None
+        closed = beat()[rid]
+        self.assertEqual((closed["answer"], closed["via"]), ("allow", "terminal"))
+        self.hook_rows({"sessionId": self.SID, "event": "PermissionDenied", "ts": 5,
+                        "toolUseId": "toolu_9", "tool": "Bash", "head": "git push",
+                        "digest": "{}", "denyReason": "no"})
+        self.assertEqual([r["kind"] for r in beat().values()], ["classifier-denied"])
+        self.write(self.tool_use("toolu_2"))
+        signals["panePrompt"] = self.dialog()
+        (rid2, _), = beat().items()
+        self.sess["status"] = "stopped"
+        gone = beat()[rid2]
+        self.assertEqual((gone["answer"], gone["via"]), ("unknown", "unknown"))
+        self.assertEqual(self.sm._perm_open, {})
+
     def test_a_raising_edge_never_costs_the_sessions_signals(self):
         with mock.patch.object(self.sm, "_permission_edges",
                                side_effect=RuntimeError("boom")), \
@@ -36904,6 +37003,19 @@ class TestPermissionLogTail(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.staged(), ["new1", "new2"])
         self.sm._fetch_permission_rows()
         self.assertEqual(self.staged(), [])
+
+    def test_a_stopped_sessions_log_is_primed_too(self):
+        # Stopped when the manager started, Started later with the same id:
+        # its old prompts were sent by the previous process — never again.
+        self.sm.registry = [{"id": self.SID, "status": "stopped"}]
+        self.append(self.denied("old0"), self.denied("old1"))
+        self.sm._fetch_permission_rows()
+        self.sm.registry[0]["status"] = "running"
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])
+        self.append(self.denied("new"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["new"])
 
     def test_a_log_that_appears_later_is_read_from_its_start(self):
         self.sm._fetch_permission_rows()             # primed with no file

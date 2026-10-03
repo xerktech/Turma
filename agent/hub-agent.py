@@ -10865,6 +10865,15 @@ def classify_pane_dialog(prompt):
     return "other"
 
 
+def _pane_dialog_identity(prompt):
+    """What tells one on-screen dialog from the next: its question, its detail
+    (the command / path / host it is about) and its option labels."""
+    labels = tuple(str(o.get("label") or "")[:200] for o in (prompt.get("options") or [])
+                   if isinstance(o, dict))
+    return (str(prompt.get("prompt") or "")[:PERMISSION_TEXT_MAX],
+            str(prompt.get("detail") or "")[:800], labels)
+
+
 def _pane_dialog_host(prompt):
     """The first host name a sandbox dialog's text mentions, or ""."""
     text = f"{prompt.get('prompt') or ''}\n{prompt.get('detail') or ''}"
@@ -10884,19 +10893,24 @@ def _option_answer(label):
 
 
 def _tool_calls(entries):
-    """(uses, results) off transcript entries: uses = [(id, name, input)] in file
-    order, results = {tool_use_id: (is_error, text)}."""
+    """(uses, results) off transcript entries: uses = [(id, name, input, message
+    key)] in file order — the key groups the calls of ONE assistant message
+    (Claude Code writes each block of it as its own entry, sharing message.id) —
+    and results = {tool_use_id: (is_error, text)}."""
     uses, results = [], {}
-    for entry in entries:
+    for n, entry in enumerate(entries):
         msg = entry.get("message") if isinstance(entry, dict) else None
         content = msg.get("content") if isinstance(msg, dict) else None
         if not isinstance(content, list):
             continue
+        mid = msg.get("id")
+        mkey = mid if isinstance(mid, str) and mid else f"#{n}"
         for block in content:
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
-                uses.append((block["id"], block.get("name") or "", block.get("input")))
+                uses.append((block["id"], block.get("name") or "", block.get("input"),
+                             mkey))
             elif (block.get("type") == "tool_result"
                   and isinstance(block.get("tool_use_id"), str)):
                 body = block.get("content")
@@ -10911,18 +10925,20 @@ def _tool_calls(entries):
 
 
 def pending_tool_call(entries):
-    """The call a permission dialog is asking about: the NEWEST tool_use in the
-    transcript tail with no tool_result yet, as {toolUseId, tool, head, digest},
-    or None. Claude Code writes the tool_use before it asks, and the result only
-    once the dialog is answered."""
+    """The call a permission dialog is asking about, as {toolUseId, tool, head,
+    digest}, or None: of the NEWEST assistant message that still has a tool_use
+    with no tool_result, its OLDEST such call. Claude Code writes the tool_use
+    before it asks and the result only once the dialog is answered, and asks
+    about a message's parallel calls one at a time, in order."""
     uses, results = _tool_calls(entries)
-    for tuid, name, tool_input in reversed(uses):
-        if tuid in results:
-            continue
-        head, dig = _permission_head_digest(name, tool_input)
-        return {"toolUseId": tuid[:128], "tool": name[:128], "head": head,
-                "digest": dig}
-    return None
+    open_uses = [u for u in uses if u[0] not in results]
+    if not open_uses:
+        return None
+    newest = open_uses[-1][3]
+    tuid, name, tool_input, _mkey = next(u for u in open_uses if u[3] == newest)
+    head, dig = _permission_head_digest(name, tool_input)
+    return {"toolUseId": tuid[:128], "tool": name[:128], "head": head,
+            "digest": dig}
 
 
 def tool_call_outcome(entries, tool_use_id):
@@ -17192,6 +17208,7 @@ class SessionManager:
         self._permission_primed = False
         self.permission_events = []
         self._perm_open = {}          # sid -> the open `dialog` row
+        self._perm_dialog_key = {}    # sid -> identity of the dialog on screen
         self._perm_ask = {}           # sid -> the open `ask-in-chat` row
         self._perm_ask_turn = {}      # sid -> the lastActivityTs that row opened on
         self._perm_ask_seen = {}      # sid -> last assistant timestamp checked
@@ -28643,13 +28660,25 @@ class SessionManager:
         Per-file cursor `(inode, offset)` — worker-owned, never touched by the
         beat. A changed inode means permlog.py rotated the file: the old one's
         unread tail is drained from `<name>.1` first. The FIRST pass of a
-        process primes every existing log to its end, so a restarted manager
-        does not replay rows the hub already has as new prompts. Bounded per
-        file per pass (PERMISSION_LOG_READ_MAX); a backlog drains over passes."""
+        process primes EVERY existing log to its end — a stopped session's too,
+        which keeps its log (and its id) for PERMISSION_LOG_RETAIN_SEC and would
+        otherwise be read from offset 0 when it is started again — so a
+        restarted manager never replays rows the hub already has as new prompts.
+        Bounded per file per pass (PERMISSION_LOG_READ_MAX); a backlog drains
+        over passes."""
         sids = [s.get("id") for s in list(self.registry)
                 if s.get("status") == "running" and isinstance(s.get("id"), str)
                 and VALID_PERMISSION_SID_RE.fullmatch(s.get("id"))]
+        running = set(sids)
         prime = not self._permission_primed
+        if prime:
+            try:
+                names = os.listdir(PERMISSIONS_DIR)
+            except OSError:
+                names = []
+            on_disk = [n[:-len(".jsonl")] for n in names if n.endswith(".jsonl")]
+            sids = list(dict.fromkeys(sids + [
+                sid for sid in on_disk if VALID_PERMISSION_SID_RE.fullmatch(sid)]))
         fetched = {}
         for sid in sids:
             path = os.path.join(PERMISSIONS_DIR, f"{sid}.jsonl")
@@ -28683,7 +28712,7 @@ class SessionManager:
             if rows:
                 fetched[sid] = rows
         self._permission_primed = True
-        self._sweep_permission_logs(set(sids))
+        self._sweep_permission_logs(running)
         if not fetched:
             return
         with self._permission_lock:
@@ -28762,8 +28791,9 @@ class SessionManager:
                     # real one — one prompt, attributed to the real call.
                     self._merge_permission_hook(target, hook, override=True)
                     continue
-                if target is None or (target.get("toolUseId") and tuid
-                                      and target["toolUseId"] != tuid):
+                if target is None or "rulesMatched" in target or (
+                        target.get("toolUseId") and tuid
+                        and target["toolUseId"] != tuid):
                     last = self._perm_last_closed.get(sid)
                     target = last if (last and tuid and last.get("toolUseId") == tuid
                                       and "rulesMatched" not in last) else None
@@ -28809,13 +28839,23 @@ class SessionManager:
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         pp = signals.get("panePrompt")
         pp = pp if isinstance(pp, dict) and pp.get("prompt") else None
-        row = self._perm_open.get(sid)
-        if row is not None and (pp is None or pp.get("prompt")[:PERMISSION_TEXT_MAX]
-                                != row.get("prompt")):
-            self._close_dialog_row(sess, row, signals, now_ms)
-            row = None
-        if pp is not None and row is None:
-            self._open_dialog_row(sess, pp, now_ms)
+        # A dialog is told apart by its WHOLE face, not its question: every tool
+        # prompt asks "Do you want to proceed?", and the call it is about sits in
+        # the detail and the option labels. Back-to-back prompts answered between
+        # two beats never show "no dialog", so only this tells them apart.
+        key = _pane_dialog_identity(pp) if pp is not None else None
+        if key != self._perm_dialog_key.get(sid):
+            row = self._perm_open.get(sid)
+            if row is not None:
+                self._close_dialog_row(sess, row, signals, now_ms)
+            if key is None:
+                self._perm_dialog_key.pop(sid, None)
+            else:
+                self._perm_dialog_key[sid] = key
+                # A pending AskUserQuestion is a human question, not a permission
+                # prompt (its native picker shows once ask.py's wait runs out).
+                if not signals.get("question"):
+                    self._open_dialog_row(sess, pp, now_ms)
         self._permission_ask_edge(sess, signals, now_ms)
 
     def _open_dialog_row(self, sess, pp, now_ms):
@@ -28828,6 +28868,8 @@ class SessionManager:
                "options": options, "openedAt": now_ms}
         path = _session_transcript_path(sess)
         call = pending_tool_call(_tail_entries(path)) if path else None
+        if call and call.get("tool") == "AskUserQuestion":
+            return                  # a question's picker: no allow rule retires it
         if call:
             row.update(call)
         if kind == "sandbox":
@@ -28944,7 +28986,7 @@ class SessionManager:
         otherwise they read "still open" on the hub forever."""
         running = {s.get("id") for s in self.registry if s.get("status") == "running"}
         for sid in (set(self._perm_open) | set(self._perm_ask)
-                    | set(self._perm_hook_pending)) - running:
+                    | set(self._perm_hook_pending) | set(self._perm_dialog_key)) - running:
             self._permission_forget(sid)
 
     def _permission_forget(self, sid):
@@ -28962,7 +29004,7 @@ class SessionManager:
         for hook, _seen in (self._perm_hook_pending.pop(sid, None) or {}).values():
             self._emit_unclaimed_request(sid, hook)
         for cache in (self._perm_ask_seen, self._perm_turma_answer,
-                      self._perm_last_closed):
+                      self._perm_last_closed, self._perm_dialog_key):
             cache.pop(sid, None)
 
     def _stage_pr_comment_fetch(self):

@@ -20,15 +20,23 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 - **`dialog`** — the numbered TUI dialog (rule/manual prompt, plan approval, sandbox escape). Source:
   the `panePrompt` EDGES the beat already scrapes. `dialogKind` = `permission`/`plan`/`sandbox`/`other`
   off the dialog text (`classify_pane_dialog`; wording is the TUI's, so unknown = `other`).
-  - On None→dialog the row opens and attaches the PENDING CALL: the newest `tool_use` in the
-    transcript tail with no `tool_result` (`pending_tool_call`), its `head`/`digest` computed by
-    permlog.py's OWN functions (`_permlog_module`) so pane and hook rows aggregate together.
+  - On None→dialog the row opens and attaches the PENDING CALL (`pending_tool_call`): of the newest
+    assistant message (entries sharing `message.id`) with a `tool_use` lacking a `tool_result`, its
+    OLDEST such call — Claude asks about parallel calls one at a time, in order. `head`/`digest` come
+    from permlog.py's OWN functions (`_permlog_module`) so pane and hook rows aggregate together.
+  - **A dialog is keyed on its whole face** (`_pane_dialog_identity`: question + detail + option
+    labels), not its question: every tool prompt asks "Do you want to proceed?", and two prompts
+    answered between beats never show "no dialog". A changed face closes the row and opens another.
+  - **A question picker is not a permission row**: no row opens while `signals.question` is set or
+    the pending call is `AskUserQuestion` (its native picker after ask.py's wait) — no rule retires it.
   - On dialog→gone it closes: `waitedMs`, and `answer` = Turma's `answer_pane_prompt` number mapped
     through that option's label (`via:"turma"`), else the call's result (`tool_call_outcome`: a
     refusal's words → `deny`, any other result → `allow`, `via:"terminal"`), else `allow` if the pane
     went busy with no result yet (it is running), else `unknown`.
   - A `PermissionRequest` hook row merges into its dialog by `toolUseId` (its `rulesMatched`); one no
     dialog claims within `PERMISSION_HOOK_HOLD_SEC` (answered between two beats) is its own row.
+  - **A dialog claims ONE hook row**: one already carrying `rulesMatched` never takes another, so a
+    second request with no `toolUseId` is held as its own prompt instead of vanishing into the first.
   - **A dialog raised inside a foreground sub-agent** has the parent's `Agent`/`Task` call as its
     pending call (`PERMISSION_DELEGATING_TOOLS`). The sub-agent's hook row (its own `toolUseId`)
     OVERRIDES tool/head/digest/toolUseId on that row — one prompt, counted once, named by the real
@@ -60,7 +68,8 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 - **The hook-log tail runs on its OWN worker** (`_permission_fetch_worker_loop`, the
   `_fetch_pr_comments` shape) — never on the beat, never on the slow-refresh worker. Per-file cursor
   `(inode, offset)`, worker-owned; a changed inode drains the rotated `.1` first; the first pass of a
-  process PRIMES every log to EOF (a restart replays nothing). Rows are staged in
+  process PRIMES every log ON DISK to EOF, a stopped session's included (it keeps its id and log, and
+  a later Start would otherwise replay them as new prompts). Rows are staged in
   `_permission_rows_fetched`, REBOUND under `_permission_lock`; the beat drains and owns every row.
 - **The log is session-written** (Bash walks past the `Edit` deny): every read is `O_NONBLOCK` +
   `O_NOFOLLOW` + regular-file only + bounded (`_read_permission_log`, guard.py's `_read_text`
@@ -98,7 +107,7 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 | `ask-in-chat` | `model behaviour: see CLAUDE.md step 0` |
 | `dialog` `sandbox` naming a host | `sandbox.network.allowedDomains: <host>` |
 | `classifier-denied` | `autoMode.environment: allow <tool rule>`; NONE without a tool rule |
-| Bash | `Bash(<head>:*)` |
+| Bash | `Bash(<head>:*)`; NONE for an interpreter/wrapper/shell-keyword head or a malformed one |
 | MCP | the full `mcp__<server>__<tool>` |
 | WebFetch | `WebFetch(domain:<d>)` |
 | a plan approval, a file path, anything else | none |
@@ -106,6 +115,9 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 - **A classifier block with no tool rule gets NO rule** — a sentence lifted from its deny reason
   pastes nowhere. Its group carries `denyReason` instead, shown as the "why" under "no rule".
 - The ask-in-chat entry is a pointer, not a setting: the card shows it as text with no Copy.
+- **Never an allow-everything Bash rule** (`BASH_NEVER_HEADS`): `Bash(python3:*)`, `Bash(sudo:*)`,
+  `Bash(env:*)`… run whatever follows. A head outside `BASH_HEAD_RE` (`(cd`, a glob) would be a
+  malformed rule. Both get no rule — the table is copied verbatim, and XERK-1566 consumes it.
 
 `head` = the Bash command's first word, two for a subcommand CLI (`git push`, `npm test`), leading
 `VAR=x` skipped; the file path; the MCP tool name; the WebFetch domain. The LLM judge (XERK-1566)
