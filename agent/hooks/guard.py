@@ -5,7 +5,7 @@ Sessions run the agent hands-off (``--permission-mode auto`` by default, or
 ``bypassPermissions`` when an operator picks it) so it can do whatever a task
 needs (read, write, run builds/tests, git, network) with little or **no**
 per-tool approval round-trip. This hook is the backstop that makes that safe: it
-inspects every Bash tool call *before* it runs and blocks only three narrow
+inspects every Bash tool call *before* it runs and blocks only four narrow
 categories.
 
 1. **destructive** — commands that would wreck the whole repository or the host
@@ -33,6 +33,11 @@ categories.
    agent rewrites the message and continues. Disable with
    ``$TURMA_NO_ATTRIBUTION=0``.
 
+4. **pr-summary** — opening a PR/MR (or rewriting its description) whose
+   description lacks the sections of the PR summary standard, or of the repo's
+   own PR template when it has one. Denied with a reason naming the missing
+   sections. Disable with ``$TURMA_PR_SUMMARY=0``.
+
 Everything else is allowed (the hook exits 0 silently, deferring to the normal
 — here, bypass — flow).
 
@@ -57,6 +62,7 @@ import os
 import posixpath
 import re
 import shlex
+import stat
 import sys
 
 # --- command segmentation ------------------------------------------------
@@ -1633,6 +1639,252 @@ def attribution_reason(command: str) -> str | None:
     return None
 
 
+# --- PR summary standard ---------------------------------------------------
+
+# Every PR/MR a session opens follows one layout, so a reviewer scans each in
+# the same order: a plain-English summary line, then these sections. The full
+# template and its readability rules ride PR_SUMMARY_SYSTEM_PROMPT in
+# hub-agent.py; this is the hard check behind it. A repo's OWN template wins:
+# when the repo has one, its headings are what is required instead.
+_PR_SUMMARY_LINE = re.compile(r"^\s*\*\*summary:?\*\*", re.IGNORECASE | re.MULTILINE)
+_PR_SECTIONS = (
+    ("Why", r"why"),
+    ("What changed", r"what\s+changed"),
+    ("Risk", r"risk"),
+    ("Testing", r"testing"),
+    ("Follow-ups", r"follow[\s-]?ups?"),
+)
+# Where GitHub, GitLab and Azure DevOps look for a repo's default template.
+_REPO_PR_TEMPLATES = (
+    ".github/pull_request_template.md",
+    "pull_request_template.md",
+    "docs/pull_request_template.md",
+    ".gitlab/merge_request_templates/default.md",
+    ".azuredevops/pull_request_template.md",
+)
+# A repo template heading worded as optional is not required of every PR.
+_OPTIONAL_HEADING = re.compile(r"optional|if applicable", re.IGNORECASE)
+_TEMPLATE_HEADING = re.compile(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_PR_BODY_MAX_READ = 256 * 1024
+
+
+def _heading_present(body: str, pattern: str) -> bool:
+    # `(?!\w)`, not `\b`: a template heading may end in `?`/`:`/`)`, after
+    # which there is no word boundary at the end of a line.
+    return re.search(rf"^\s*#{{1,6}}\s*{pattern}(?!\w)", body,
+                     re.IGNORECASE | re.MULTILINE) is not None
+
+
+# Forge CLIs, the subcommand group, the verbs that open one (`new` is a
+# documented alias of `create` for both gh and glab), and the flags that carry
+# a description. A short flag may be glued to its value (`-bTEXT`).
+_PR_CLIS = {
+    "gh": ("pr", ("create", "new"), ("-b", "--body", "-F", "--body-file")),
+    "glab": ("mr", ("create", "new"), ("-d", "--description")),
+    "az": ("pr", ("create",), ("--description",)),
+}
+
+
+def _flag_value(arg: str, flags: tuple[str, ...]) -> tuple[str, str | None] | None:
+    """``(flag, glued value or None)`` if ``arg`` is one of ``flags``."""
+    for f in flags:
+        if arg == f:
+            return f, None
+        if f.startswith("--") and arg.startswith(f + "="):
+            return f, arg[len(f) + 1:]
+        if not f.startswith("--") and arg.startswith(f) and len(arg) > len(f):
+            return f, arg[len(f):]
+    return None
+
+
+def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
+    """``(inline bodies, body files)`` if this simple command opens a PR/MR or
+    rewrites its description, else None. ``create`` always carries one; an
+    ``edit``/``update`` only counts when it sets one (``gh pr edit --add-label``
+    is not a description change). Help invocations are not PRs."""
+    spec = _PR_CLIS.get(_basename(tokens[0]))
+    rest = tokens[1:]
+    if not spec or spec[0] not in rest:
+        return None
+    group, creates, body_flags = spec
+    head = rest[:rest.index(group)]
+    if (rest[:1] == ["help"]
+            or (_basename(tokens[0]) == "az" and "repos" not in head)):
+        return None
+    args = rest[rest.index(group) + 1:]
+    verbs = (*creates, "edit", "update")
+    # ONE pass over everything after the group, because gh/glab accept any
+    # flag on either side of the verb (`gh pr -R o/r create`, `gh pr -b x edit
+    # 1`). A bare non-body flag may take the next token as its value, and which
+    # ones do differs per CLI, so that token is read as a value — unless it is
+    # a verb with no later verb (a boolean: `az repos pr --debug create`).
+    verb = subcommand = None
+    bodies: list[str] = []
+    files: list[str] = []
+    seen_flag = False
+    prev_bare = False  # the previous token was a flag that may take a value
+    i = 0
+    while i < len(args):
+        arg = args[i]
+        hit = _flag_value(arg, body_flags)
+        if hit:
+            seen_flag = True
+            flag, value = hit
+            if value is None and i + 1 < len(args):
+                i += 1
+                value = args[i]
+            if value is not None:
+                (files if flag in ("-F", "--body-file") else bodies).append(value)
+            prev_bare = False
+        elif arg in ("-h", "--help") and not prev_bare:
+            # Help prints wherever it sits — unless it is the previous flag's
+            # VALUE (`--label -h`), which the CLI sends as that value. The cost
+            # of reading it so after ANY bare flag: a refused `--web -h`.
+            return None
+        elif arg.startswith("-") and len(arg) > 1:
+            prev_bare = "=" not in arg
+        else:
+            # The first POSITIONAL token is the subcommand (`checkout create`
+            # checks out a branch named create); a token after a bare flag is
+            # that flag's value instead.
+            is_value = prev_bare and not (
+                arg in verbs and not any(a in verbs for a in args[i + 1:]))
+            if subcommand is None and not is_value:
+                subcommand = arg
+                verb = arg if arg in verbs else None
+            prev_bare = False
+        i += 1
+    if verb in creates or (verb in ("edit", "update") and seen_flag):
+        return bodies, [f for f in files if f and f != "-"]
+    return None
+
+
+def _read_text(path: str) -> str:
+    """A bounded read of a REGULAR file, else "". ``O_NONBLOCK`` + the fstat
+    check keep a FIFO planted at the path from hanging the hook, which Claude
+    Code would then time out and let the command through unchecked."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except (OSError, ValueError):
+        return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return os.read(fd, _PR_BODY_MAX_READ).decode("utf-8", "replace")
+    except OSError:
+        return ""
+    finally:
+        os.close(fd)
+
+
+def _repo_root(start: str) -> str | None:
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _repo_template_sections(root: str | None) -> list[tuple[str, str]] | None:
+    """The required headings of the repo's own PR template; ``[]`` when its
+    template has no headings (nothing to check against), None when it has no
+    template. Matched case-insensitively, since GitHub accepts any case for the
+    name."""
+    if not root:
+        return None
+    for rel in _REPO_PR_TEMPLATES:
+        dirname, name = os.path.split(os.path.join(root, rel))
+        try:
+            entries = os.listdir(dirname)
+        except OSError:
+            continue
+        match = next((e for e in entries if e.lower() == name), None)
+        if not match:
+            continue
+        text = _read_text(os.path.join(dirname, match))
+        if not text.strip():
+            # Unreadable, a FIFO, or empty: no template to follow, so the
+            # standard applies rather than nothing at all.
+            return None
+        heads = [h for h in _TEMPLATE_HEADING.findall(text)
+                 if not _OPTIONAL_HEADING.search(h)]
+        return [(h, re.escape(h)) for h in heads]
+    return None
+
+
+def _join_path(cwd: str, path: str) -> str:
+    try:
+        return os.path.join(cwd, os.path.expanduser(path))
+    except ValueError:  # an embedded NUL: nothing real lives there
+        return cwd
+
+
+def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
+    """A reason if ``command`` opens a PR/MR (or rewrites its description)
+    whose description is missing a required section.
+
+    The description is what the command would actually send: the inline
+    ``--body``/``--description`` values, any ``--body-file`` (resolved against
+    ``cwd`` as moved by a preceding ``cd``), and the command's heredoc bodies —
+    which covers ``$(cat <<EOF …)``, ``-F - <<EOF`` and a body file the same
+    command writes first (it does not exist yet when the hook runs). The rest of
+    the command text (titles, comments) never counts. A description pulled from
+    somewhere else (``--fill``, the editor, ``$(cat file)``) can't be checked,
+    so it is refused with a reason saying how to pass it."""
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = "/"
+    heredocs = None
+    for tokens, _segment, *_flags in _expand_segments(command):
+        if _basename(tokens[0]) == "cd" and len(tokens) > 1:
+            cwd = _join_path(cwd, tokens[1])
+            continue
+        hit = _pr_body_command(tokens)
+        if not hit:
+            continue
+        bodies, files = hit
+        if heredocs is None:
+            # Every heredoc counts. Matching a heredoc to the command it feeds
+            # (owner line, redirect target) refused 26% of real compliant PR
+            # commands — `git push && gh pr create … <<EOF`, `cd x && …`,
+            # `cat > "$S/b.md"` — so whatever _split_heredocs reads as a heredoc
+            # counts (an unrelated one, or `<<EOF` text inside a quoted title):
+            # the accepted residual, since it takes a model gaming its own guard.
+            heredocs = [b for _owner, b in _split_heredocs(command)[1]]
+        body = "\n".join(bodies + heredocs + [_read_text(_join_path(cwd, f)) for f in files])
+        sections = _repo_template_sections(_repo_root(cwd))
+        if sections is not None:
+            # A template with no headings asks for prose; there is nothing to check.
+            missing = [name for name, pat in sections if not _heading_present(body, pat)]
+            if missing:
+                return (
+                    "this repo has its own PR template — the description is missing "
+                    f"its section(s): {', '.join(missing)}. Follow that template, "
+                    "and pass the description inline (--body/--description, or a "
+                    "heredoc) or with --body-file so it can be checked."
+                )
+            return None
+        missing = [name for name, pat in _PR_SECTIONS if not _heading_present(body, pat)]
+        if not _PR_SUMMARY_LINE.search(body):
+            missing.insert(0, "a '**Summary:**' first line")
+        if missing:
+            return (
+                "the PR description does not follow the Turma PR summary standard — "
+                f"missing: {', '.join(missing)}. Required, in order: a "
+                "'**Summary:**' line, then '## Why', '## What changed', '## Risk', "
+                "'## Testing', '## Follow-ups' (see the PR summary standard in your "
+                "system prompt). Pass the description inline (--body/--description, "
+                "or a heredoc) or with --body-file so it can be checked — --fill and "
+                "the editor can't be."
+            )
+    return None
+
+
 # --- top-level classification -------------------------------------------
 
 
@@ -1933,11 +2185,14 @@ def decide(
     *,
     overrides: list[str] | None = None,
     no_attribution: bool = True,
+    pr_summary: bool = True,
+    cwd: str | None = None,
 ) -> tuple[str, str | None, str | None]:
     """Return ``(decision, reason, category)``.
 
     ``decision`` is ``"allow"`` or ``"deny"``. ``category`` is
-    ``"destructive"`` / ``"policy"`` / ``"attribution"`` / ``None``. Only
+    ``"destructive"`` / ``"policy"`` / ``"attribution"`` / ``"pr-summary"`` /
+    ``None``. Only
     ``"destructive"`` honours an operator override grant; the others are hard
     rules the agent self-corrects from.
     """
@@ -1962,6 +2217,11 @@ def decide(
         attrib = attribution_reason(command)
         if attrib:
             return ("deny", attrib, "attribution")
+
+    if pr_summary:
+        summary = pr_summary_reason(command, cwd)
+        if summary:
+            return ("deny", summary, "pr-summary")
 
     return ("allow", None, None)
 
@@ -1996,6 +2256,8 @@ def main(argv: list[str] | None = None) -> int:
     tool_input = event.get("tool_input") or {}
     overrides = _parse_overrides(os.environ.get("TURMA_TOOL_GRANTS"))
     no_attribution = os.environ.get("TURMA_NO_ATTRIBUTION", "1") != "0"
+    pr_summary = os.environ.get("TURMA_PR_SUMMARY", "1") != "0"
+    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
 
     try:
         decision, reason, _category = decide(
@@ -2003,6 +2265,8 @@ def main(argv: list[str] | None = None) -> int:
             tool_input if isinstance(tool_input, dict) else {},
             overrides=overrides,
             no_attribution=no_attribution,
+            pr_summary=pr_summary,
+            cwd=cwd,
         )
     except Exception as exc:  # noqa: BLE001 - any classifier bug
         # Fail CLOSED here, unlike a malformed event above: a traceback exits 1,

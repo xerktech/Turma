@@ -3846,6 +3846,50 @@ Everything above still applies: cut that branch from the REFRESHED remote defaul
 branch, not from this checkout.
 """
 
+# The PR summary standard every session writes to. Rides --append-system-prompt
+# beside the policies above, on every launch. The guard hook
+# (hooks/guard.py `pr_summary_reason`) refuses a PR/MR whose description lacks
+# these sections, so the two must name the same headings. A repo's own PR
+# template outranks it in both places.
+PR_SUMMARY_SYSTEM_PROMPT = """
+PR summary standard (set by Turma; the safety guard refuses a PR/MR without it):
+
+If the repo has its own PR template (.github/pull_request_template.md or
+similar), follow that instead. Otherwise every PR/MR description uses this
+layout, in this order:
+
+  Title: `<TICKET-KEY>: <imperative outcome>` (or `<Component>: …`), ≤72 chars.
+  It states the effect a reader cares about, not the mechanism.
+
+  **Summary:** 1–2 plain-English sentences: what is different once this
+  merges, and for whom. No code identifiers.
+
+  Fixes <TICKET-KEY>   (or Part of / Refs; omit if there is no ticket)
+
+  ## Why          — the problem or gap, with its evidence; root cause for a fix.
+  ## What changed — ≤5 bullets of behaviour; the one design choice worth knowing.
+  ## Risk         — Low/Medium/High — what could break, who it affects, deploy
+                    or config impact, how to roll back.
+  ## Testing      — `**QA result:** <verdict> — <what was exercised>` and
+                    `**Not tested:** <what, and why>`, then the commands, test
+                    lists, QA pass history and screenshots inside
+                    `<details><summary>Test evidence</summary> … </details>`.
+  ## Follow-ups   — each finding → fixed here / #PR / TICKET-KEY / accepted;
+                    or "None".
+  ## Review focus — optional: where the reviewer's attention should go.
+
+Write it for a human reviewer who never saw this session:
+  - Plain words before code: Summary, Why and Risk must read without knowing
+    the codebase. Put file and symbol names in What changed and the details.
+  - Keep the part outside <details> to about 250 words. One idea per bullet.
+  - Define an internal term the first time, or leave it out. No ALL-CAPS
+    emphasis, no "as discussed", no pasted logs or commit lists.
+  - Describe the final state, not how you got there; when the PR changes,
+    update the description (`gh pr edit --body-file`) so it stays true.
+  - Pass the description inline (--body/--description or a heredoc) or with
+    --body-file; the guard can't check --fill or an editor.
+"""
+
 # --- cross-session messaging (XERK-339) --------------------------------------
 #
 # Claude Code sessions on one machine can message each other (ListAgents /
@@ -19066,6 +19110,7 @@ class SessionManager:
             policy += TICKET_BRANCH_PROMPT.format(
                 key=ticket.get("key") or "this session's ticket",
                 branch=ticket["branch"])
+        policy += PR_SUMMARY_SYSTEM_PROMPT
         policy += PEERS_SYSTEM_PROMPT.format(
             path=PEERS_FILE, sid=sess["id"], host=self.device)
         return policy + addendum

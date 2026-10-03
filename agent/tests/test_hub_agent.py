@@ -11157,7 +11157,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"--name {shlex.quote(sess['rcName'])} "
             f"--permission-mode auto --settings {shlex.quote(settings)} "
             f"--append-system-prompt "
-            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + peers)}",
+            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers)}",
         )
         # The guard settings file was written and wires three PreToolUse
         # matchers: the Bash guard, the ~/.claude file guard, and the
@@ -11315,7 +11315,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             path=ha.PEERS_FILE, sid=sm.registry[0]["id"], host=sm.device)
         self.assertIn(
             "--append-system-prompt "
-            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + peers),
+            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers),
             cmd,
         )
 
@@ -11326,6 +11326,15 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertIn("git fetch origin", policy)
         self.assertIn("refs/remotes/origin/HEAD", policy)
         self.assertIn("git switch -c <your-branch> origin/main", policy)
+
+    def test_pr_summary_standard_names_the_sections_the_guard_requires(self):
+        """The directive and guard.py's hard check must name the same layout,
+        or a session following its instructions is refused by its own guard."""
+        policy = ha.PR_SUMMARY_SYSTEM_PROMPT
+        for heading in ("**Summary:**", "## Why", "## What changed", "## Risk",
+                        "## Testing", "## Follow-ups"):
+            self.assertIn(heading, policy)
+        self.assertIn("pull_request_template.md", policy)  # a repo's own wins
 
     def test_root_session_also_gets_branching_policy(self):
         """A repos-root session has no worktree, so it works in the repo dirs on

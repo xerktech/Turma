@@ -314,6 +314,10 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
 - It's `--append-system-prompt` (settings.json has no instruction field) as a **directive, not
   manager-side enforcement**, since only the agent knows when "new work" begins. Tests:
   `TestSessionLifecycle`.
+- The same append carries **`PR_SUMMARY_SYSTEM_PROMPT`**, the PR summary standard (a plain-English
+  `**Summary:**` line, then Why / What changed / Risk / Testing / Follow-ups; a repo template wins).
+  Unlike the branching policy it IS enforced: `hooks/guard.py` refuses a PR/MR missing a section
+  (`agent-hooks.md`). Rides `_session_directive`, so qwen/dsh get it too.
 
 ## Cross-session messaging (XERK-339)
 

@@ -35,11 +35,46 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   except the two agent-memory trees," which a glob list can't express — deny beats allow, and a deny
   matching a DIRECTORY takes its whole subtree, so `Edit(~/.claude/*)` is the blanket rule. Patterns
   still cover the catastrophic subset as defence in depth (mechanics below).
-- Hard-denies three narrow categories, each with a self-correcting reason: **destructive** (`rm -rf`
+- Hard-denies four narrow categories, each with a self-correcting reason: **destructive** (`rm -rf`
   of `/`/home/system/`.git`, disk wipes, fork bombs, power changes, recursive `chmod`/`chown` of
   system roots, protected-branch history destruction, `DROP DATABASE|TABLE`); **policy** (push to /
   delete `main`/`master`, self-merging a PR/MR — work lands via a human-merged PR); **attribution**
-  (AI self-attribution trailers).
+  (AI self-attribution trailers); **pr-summary** (a PR/MR description missing a required section).
+- **pr-summary is the hard half of `PR_SUMMARY_SYSTEM_PROMPT`** (`pr_summary_reason`): the two must
+  name the same headings, or a session following its instructions is refused by its own guard.
+  - Checks `gh pr create|new`, `glab mr create|new`, `az repos pr create`, and an `edit`/`update`
+    only when it sets the description (glued `-bTEXT` too). `-h`/`--help` is help wherever it
+    sits, EXCEPT right after a bare flag: gh/glab read it as that flag's VALUE (`-b -h`,
+    `--label -h`), so the check runs. Value-taking flags differ per CLI, hence "any bare flag";
+    the cost is refusing `--web -h` / `-tfoo -h`, which would only print help.
+  - **Flags sit on EITHER side of the verb** (`gh pr -R o/r create`, `gh pr -b x edit 1` — real
+    gh/glab accept both), so everything after `pr`/`mr` is ONE pass: body flags collected wherever
+    they are, a token after a bare flag read as its value unless it is a verb with no later verb.
+    Each earlier attempt to special-case "flags before the verb" left a bypass.
+  - **The body is inline body values + any `--body-file` (event `cwd`, moved by a leading `cd`) +
+    EVERY heredoc in the command** — never the plain command text, so a title or comment alone
+    does not satisfy it. `cat > f <<EOF; gh pr create -F f` is common, and `f` does not exist yet
+    when the hook runs.
+    - **Do not narrow heredocs to "the one feeding the PR command"**: matching by owner line or
+      redirect target refused 26% of real compliant PR commands (`git push && gh pr create …`,
+      `cd x && …`, `cat > "$S/b.md"`, `\`-continued).
+    - **The accepted residual is anything `_split_heredocs` reads as a heredoc** — an unrelated
+      one, and lexer false positives: `<<EOF` inside a quoted title/label/echo, after `#`, `<<<`,
+      `\<<`. Each needs a model gaming its own guard; no honest command looks like that. Measured by swapping a
+      compliant body into all 473 real heredoc PR commands in `~/.claude/projects`: 0 refused.
+  - A body it can't see (`--fill`, the editor, `$(cat file)`) is refused, saying how to pass it.
+  - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_text`): a FIFO at the body or
+    template path hung the hook, and Claude Code lets a timed-out hook's command THROUGH.
+  - Headings match with `(?!\w)`, not `\b` — a template heading ending `?`/`:`/`)` never matched.
+  - Not covered (accepted): `gh api …/pulls`, `hub pull-request`, `git push -o
+    merge_request.create`; `-R other/repo` is checked against the LOCAL checkout's template.
+  - **A repo's own PR template wins**: its headings are required instead (ones worded `optional`/
+    `if applicable` excepted); a headingless template checks nothing; an EMPTY or unreadable one
+    (FIFO) is no template, so the standard applies — failing open there disabled the check. Turma ships one, so Turma's
+    sessions are held to its headings, not the `**Summary:**` line.
+  - Off with `$TURMA_PR_SUMMARY=0`. Replayed against 32k real Bash commands: refuses only PR
+    creates/body edits, 0 others. Tests: `TestPrSummary`, the hook-entrypoint toggle case (its cwd
+    must be OUTSIDE this repo, or Turma's own template switches it to template mode).
 - **Destructive includes the agent's tmux server** (XERK-1077): `kill-server`, killing tmux by name
   or PID, and `kill-session`/`-window`/`-pane` of anything that could resolve to an `agent-*` session
   are denied unless tmux names some OTHER server (`-L`/`-S`). Protected: the default server and the
