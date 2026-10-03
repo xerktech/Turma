@@ -5162,10 +5162,14 @@ class GitTimeout(Exception):
     this a stalled disk reads as a removed worktree, or as a clean one."""
 
 
-def _strict_git(cmd, cwd, timeout=15):
+def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False):
     """run() for a `strict` cheap read: stripped stdout on success, "" when git
     answered with a failure or `cwd` is gone, GitTimeout when there was no
-    answer — a timeout, or a launch failure in a directory that still exists."""
+    answer — a timeout, or a launch failure in a directory that still exists.
+
+    `fail_is_unknown` makes a nonzero exit GitTimeout too: for `status`, whose
+    EMPTY output is itself the verdict "clean", a failure (a corrupt index, an
+    EIO) must not read as one. rev-parse keeps "" — that failure IS "gone"."""
     try:
         out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                              timeout=timeout)
@@ -5176,6 +5180,8 @@ def _strict_git(cmd, cwd, timeout=15):
         # the worktree is gone.
         if cwd and not os.path.isdir(cwd):
             return ""
+        raise GitTimeout(" ".join(cmd[1:3]))
+    if out.returncode != 0 and fail_is_unknown:
         raise GitTimeout(" ".join(cmd[1:3]))
     return out.stdout.strip() if out.returncode == 0 else ""
 
@@ -5193,7 +5199,8 @@ def git_info_cheap(cwd, strict=False):
     if strict:
         if not _strict_git(["git", "rev-parse", "--git-dir"], cwd):
             return None
-        dirty = _strict_git(["git", "status", "--porcelain"], cwd)
+        dirty = _strict_git(["git", "status", "--porcelain"], cwd,
+                            fail_is_unknown=True)
         return {
             "branch": _strict_git(["git", "rev-parse", "--abbrev-ref", "HEAD"], cwd),
             "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
@@ -12397,9 +12404,9 @@ def repo_cheap_facts(path, strict=False):
     branch and the `git status --porcelain` dirty count. Two git spawns — which is
     why a `light` beat reuses the previous answer instead (see repo_entry).
     `strict` raises GitTimeout on a timed-out read, as git_info_cheap does."""
-    git = ((lambda cmd: _strict_git(cmd, path)) if strict
-           else (lambda cmd: run(cmd, cwd=path)))
-    dirty = git(["git", "status", "--porcelain"])
+    git = ((lambda cmd, **kw: _strict_git(cmd, path, **kw)) if strict
+           else (lambda cmd, **kw: run(cmd, cwd=path)))
+    dirty = git(["git", "status", "--porcelain"], fail_is_unknown=True)
     return {
         "branch": git(["git", "rev-parse", "--abbrev-ref", "HEAD"]),
         "dirtyFiles": len(dirty.splitlines()) if dirty else 0,
@@ -28386,6 +28393,15 @@ class SessionManager:
                 continue
             dirty = (gi or {}).get("dirtyFiles") or 0
             live_branch = (self.session_facts.get(sid) or {}).get("liveBranch")
+            # branch_sync degrades a failed/timed-out read to None. A live
+            # branch always exists locally, so `pushed` None there — or a
+            # pushed branch with no ahead count — is an UNANSWERED read, not
+            # "delivered": skip the decision rather than re-arm (XERK-1263).
+            if live_branch is not None and (
+                    (work or {}).get("pushed") is None
+                    or ((work or {}).get("pushed")
+                        and (work or {}).get("aheadOfRemote") is None)):
+                continue
             ahead_remote = (work or {}).get("aheadOfRemote") or 0
             undelivered = (
                 dirty > 0

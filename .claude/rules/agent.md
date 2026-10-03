@@ -194,6 +194,9 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
     is still "gone". A cached `None` is served, never re-read inline.
   - A `fresh` read RE-RAISES `GitTimeout` instead of serving the cache: the undelivered-work poller
     then skips the nudge decision (neither nudges nor re-arms) — an unknown dirty count is not 0.
+    A nonzero `status` exit is no answer too (`fail_is_unknown`); a failed `rev-parse` stays "gone".
+    The poller also skips on `branch_sync`'s None (`pushed` None on a live branch, or a pushed
+    branch with no `aheadOfRemote`) — that is a failed read, never "delivered".
   - Both sides write `repo_cheap`/`session_cheap`, so every write REBINDS under `_cheap_lock`
     (`_cheap_store`/`_cheap_forget`); never mutate them in place. The worker stores
     `only_if_present`, so a key pruned mid-read stays pruned. Tests: `TestCheapGitWorker`.

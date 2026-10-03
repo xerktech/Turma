@@ -14733,7 +14733,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self.run_calls.clear()
         return sm
 
-    def _session(self, sm, dirty=1, live_branch="feature-x", pushed=None,
+    def _session(self, sm, dirty=1, live_branch="feature-x", pushed=False,
                  ahead_remote=0, status="running", urls=()):
         sess = {"id": "s1", "status": status, "tmuxName": "agent-s1",
                 "worktreePath": os.path.join(self.tmp, "wt"), "summary": "work"}
@@ -14807,6 +14807,24 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
             sm._poll_open_pr_nudges()
         self.assertEqual(self._typed(), [])
         self.assertEqual(sess["prOpenNudged"], {"s1": {"attempts": 1, "at": 0}})
+
+    def test_an_unanswered_branch_sync_neither_nudges_nor_rearms(self):
+        """XERK-1263: branch_sync degrades a timed-out read to None, and None
+        is not 0 — a pushed branch with no ahead count, or a live branch whose
+        existence read failed, skips the decision."""
+        for pushed, ahead in ((True, None), (None, None)):
+            with self.subTest(pushed=pushed):
+                self.run_stdin_calls.clear()
+                sm = self.make_manager()
+                sess = self._session(sm, dirty=0, pushed=pushed,
+                                     ahead_remote=ahead)
+                sess["prOpenNudged"] = {"s1": {"attempts": 1, "at": 0}}
+                with mock.patch.object(ha, "_pane_status",
+                                       return_value=(False, "auto", None)):
+                    sm._poll_open_pr_nudges()
+                self.assertEqual(self._typed(), [])
+                self.assertEqual(sess["prOpenNudged"],
+                                 {"s1": {"attempts": 1, "at": 0}})
 
     def test_blocking_dialog_is_not_nudged(self):
         sm = self.make_manager()
@@ -22474,6 +22492,18 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         with self.assertRaises(ha.GitTimeout):
             sm._cheap_read("session_cheap", "s1", stalled, "/w/s1", fresh=True)
         self.assertEqual(sm.session_cheap["s1"], good)
+
+    def test_a_failed_status_is_no_answer_not_clean(self):
+        """XERK-1263: `status` exiting nonzero (a corrupt index, an EIO) is NO
+        answer — while a failed rev-parse still reads as gone."""
+        def fake(cmd, **kw):
+            rc = 128 if "status" in cmd else 0
+            return mock.Mock(returncode=rc, stdout="" if rc else "main")
+        with mock.patch.object(ha.subprocess, "run", side_effect=fake):
+            with self.assertRaises(ha.GitTimeout):
+                ha.git_info_cheap("/w", strict=True)
+            with self.assertRaises(ha.GitTimeout):
+                ha.repo_cheap_facts("/w", strict=True)
 
     def test_a_launch_failure_is_no_answer_not_clean(self):
         """XERK-1263: git that could not be launched (a fork refused at the
