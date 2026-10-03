@@ -23555,7 +23555,7 @@ class TestPokeHeartbeat(unittest.TestCase):
 
     def test_sigusr1_sets_the_poke_event_and_cuts_the_wait_short(self):
         prev = signal.getsignal(signal.SIGUSR1)
-        signal.signal(signal.SIGUSR1, lambda *_: ha._poke.set())
+        signal.signal(signal.SIGUSR1, ha._on_sigusr1)
         self.addCleanup(signal.signal, signal.SIGUSR1, prev)
 
         ha._poke.clear()
@@ -23568,6 +23568,68 @@ class TestPokeHeartbeat(unittest.TestCase):
         start = time.monotonic()
         self.assertTrue(ha._poke.wait(5))
         self.assertLess(time.monotonic() - start, 1.0)
+        # clear() drops the pending poke, so the next wait sleeps again.
+        ha._poke.clear()
+        self.assertFalse(ha._poke.wait(0.05))
+
+    def test_a_sigusr1_burst_while_the_loop_waits_neither_deadlocks_nor_recurses(self):
+        # XERK-1558: the handler used to be `_poke.set()` on a threading.Event.
+        # A signal landing while the main thread sat inside Event.wait() (holding
+        # its non-reentrant Condition lock) blocked the handler on that lock; the
+        # burst's next signal nested another handler, and so on — a deadlocked
+        # manager, or RecursionError out of run_forever. Drive the real shape:
+        # this (main) thread loops clear()/wait() like run_forever while another
+        # process fires SIGUSR1 as fast as it can.
+        prev = signal.getsignal(signal.SIGUSR1)
+        signal.signal(signal.SIGUSR1, ha._on_sigusr1)
+        self.addCleanup(signal.signal, signal.SIGUSR1, prev)
+
+        class _Hung(Exception):
+            pass
+
+        def _deadline(*_):
+            raise _Hung()
+        prev_alrm = signal.signal(signal.SIGALRM, _deadline)
+        self.addCleanup(signal.signal, signal.SIGALRM, prev_alrm)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+
+        sender = subprocess.Popen([sys.executable, "-c",
+            "import os, signal, sys\n"
+            "pid = int(sys.argv[1])\n"
+            "for _ in range(50000): os.kill(pid, signal.SIGUSR1)\n",
+            str(os.getpid())])
+        self.addCleanup(sender.kill)
+        signal.setitimer(signal.ITIMER_REAL, 60)
+        waits = 0
+        try:
+            while sender.poll() is None:
+                ha._poke.clear()
+                ha._poke.wait(0.001)
+                waits += 1
+        except _Hung:
+            self.fail(f"the wait loop wedged under a SIGUSR1 burst after {waits} waits")
+        except RecursionError:
+            self.fail("a SIGUSR1 burst nested handlers into RecursionError")
+        finally:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+        self.assertEqual(sender.returncode, 0)
+        # The loop still works after the storm: a poke wakes it, quiet sleeps.
+        ha._poke.clear()
+        self.assertFalse(ha._poke.wait(0.05))
+        os.kill(os.getpid(), signal.SIGUSR1)
+        self.assertTrue(ha._poke.wait(5))
+
+    def test_a_poke_flood_with_no_waiter_never_blocks_the_setter(self):
+        # The pipe's capacity is finite; set() past it must drop (a poke is
+        # already pending) rather than block — a blocked signal handler is the
+        # very wedge this guards against.
+        ha._poke.clear()
+        self.addCleanup(ha._poke.clear)
+        start = time.monotonic()
+        for _ in range(200000):
+            ha._poke.set()
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertTrue(ha._poke.wait(0))
 
 
 class TestPokeListener(unittest.TestCase):
