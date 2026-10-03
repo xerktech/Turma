@@ -228,6 +228,29 @@ test("aggregate: ask-in-chat groups by its question, with no allowed/denied to c
   assert.equal(aggregate({ now: NOW }).top.length, 1);
 });
 
+test("aggregate: counts rows still waiting, and an ask's recent row claims no answer", () => {
+  const open = { closedAt: undefined, waitedMs: undefined, answer: undefined, via: undefined };
+  ledger.ingest("h1", [
+    row("o1", { ...open, head: "terraform apply" }),
+    row("o2", { head: "npm test" }),
+    row("o3", { ...open, head: "npm test", openedAt: NOW - 1000 }),
+    // a request answered between beats: never closed, but not open either
+    row("o4", { ...open, answer: "unknown", head: "make" }),
+    { id: "o5", kind: "ask-in-chat", sessionId: "s1", prompt: "May I push?", openedAt: NOW - MIN,
+      closedAt: NOW, waitedMs: MIN, answer: "unknown", via: "turma" },
+  ], NOW);
+  const { top, recent } = aggregate({ now: NOW });
+  const by = (h) => top.find((g) => g.head === h);
+  assert.deepEqual([by("terraform apply").count, by("terraform apply").open], [1, 1]);
+  assert.deepEqual([by("npm test").count, by("npm test").open], [2, 1]);
+  assert.equal(by("make").open, 0);
+  assert.equal(top.find((g) => g.kind === "ask-in-chat").open, 0);
+  const ask = recent.find((r) => r.id === "o5");
+  assert.equal(ask.answer, undefined, "an ask has no allow/deny: its stored 'unknown' is not served");
+  assert.equal(ask.waitedMs, MIN);
+  assert.equal(recent.find((r) => r.id === "o4").answer, "unknown");
+});
+
 test("aggregate: a classifier block with no rule carries its deny reason", () => {
   ledger.ingest("h1", [
     row("c1", { kind: "classifier-denied", dialogKind: undefined, tool: "Write",

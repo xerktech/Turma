@@ -257,6 +257,7 @@
   }
   .perm-recent li:last-child { border-bottom: none; }
   .perm-recent .perm-subj { margin-top: 0; flex: 1 1 220px; min-width: 0; }
+  .perm-recent .perm-meta { display: flex; flex-wrap: wrap; gap: 2px 10px; flex: 0 1 auto; min-width: 0; }
   .perm-recent .meta { color: var(--muted); font-size: 11.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
   .perm-empty { color: var(--muted); font-size: 12.5px; padding: 6px 0 2px; }
 
@@ -286,6 +287,13 @@
     .perm-card tbody td.perm-stat { flex: none; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
     .perm-card tbody td.perm-stat::before { content: attr(data-label) " "; color: var(--muted); }
     .perm-card tbody td.perm-rule { flex: 1 1 100%; min-width: 0; margin-top: 2px; }
+    /* A rule long enough to wrap pushes Copy to its own line: flush left, not indented. */
+    .perm-card tbody td.perm-rule:has(.perm-copy) { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
+    .perm-card tbody td.perm-rule .perm-copy { margin-left: 0; }
+    /* Recent prompts: kind + subject on the first line, then host · wait · age
+       always on a line of their own, host first. */
+    .perm-recent .perm-subj { flex: 1 1 0; }
+    .perm-recent .perm-meta { flex: 1 1 100%; }
   }
   /* Touch devices: roomier legend/table hit areas. */
   @media (pointer: coarse) {
@@ -295,7 +303,7 @@
 </style>
 </head>
 <body class="app-shell">
-<header class="site-header" id="siteHeader" data-page="usage" data-sub="Subscription limits · token usage"></header>
+<header class="site-header" id="siteHeader" data-page="usage" data-sub="Subscription limits · token usage · permission prompts"></header>
 <div class="page-scroll">
 <div class="wrap">
   <div class="totals" id="totals"></div>
@@ -1670,12 +1678,18 @@ function permSubjectHtml(g, tag) {
 function permNum(n) { return typeof n === "number" && Number.isFinite(n) ? n : 0; }
 // Allowed / denied, or "—" when no answer is knowable: an ask in chat is
 // answered in prose, never allow/deny, so 0 / 0 there would read as "ignored".
+// A group whose every row is still holding its session says "open" until one
+// is answered — 0 / 0 there would read "asked and ignored" too.
 function permAnswers(g) {
   const known = (n) => typeof n === "number" && Number.isFinite(n);
+  const open = known(g.open) && g.open > 0 ? g.open : 0;
+  if (open && open >= permNum(g.count)) {
+    return `<span class="perm-na" title="Still waiting for an answer">open</span>`;
+  }
   if (g.kind === "ask-in-chat" || !known(g.allowed) || !known(g.denied)) {
     return `<span class="perm-na" title="No allow/deny answer is recorded for this kind of prompt">—</span>`;
   }
-  return `${g.allowed} / ${g.denied}`;
+  return `${g.allowed} / ${g.denied}` + (open ? ` <span class="perm-na">· ${open} open</span>` : "");
 }
 // The rule cell. A pasteable rule gets a Copy button; the ask-in-chat entry is
 // a pointer, not a setting, so it is shown as text; no rule says so — and a
@@ -1701,7 +1715,8 @@ function permissionsCardHtml(view, now, recentOpen = false) {
   const days = view && permNum(view.days) > 0 ? permNum(view.days) : PERM_DAYS;
   const head = `<h2>Permission prompts (${days} days)</h2>` +
     `<div class="note">Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat ` +
-    `that held a session, grouped with the allow rule that would retire it.</div>`;
+    `that held a session, grouped with the allow rule that would retire it. Follows the header's org ` +
+    `filter only — the chart's series toggles above do not apply here.</div>`;
   if (!view) return head + `<div class="perm-empty">Loading…</div>`;
   const top = Array.isArray(view.top) ? view.top.filter((g) => g && typeof g === "object") : [];
   const recent = Array.isArray(view.recent) ? view.recent.filter((r) => r && typeof r === "object") : [];
@@ -1727,14 +1742,18 @@ function permissionsCardHtml(view, now, recentOpen = false) {
     const ago = opened ? fmtDuration((now - opened) / 1000) + " ago" : "";
     // A closed row without a wait (a classifier block holds nothing) says only
     // its answer; a row with no close yet is still holding its session.
+    // An ask has no allow/deny by design (the table shows "—" for it), so it
+    // never says "unknown" here either — an older hub still sends that.
     const parts = [];
     if (typeof r.waitedMs === "number") parts.push(`waited ${permWait(r.waitedMs)}`);
-    else if (!r.closedAt) parts.push("still open");
-    if (r.answer) parts.push(r.answer);
-    const wait = parts.join(" · ");
+    else if (!r.closedAt && !r.answer) parts.push("still open");
+    if (r.answer && r.kind !== "ask-in-chat") parts.push(r.answer);
+    // Host, wait and age ride ONE group, host first, so the host sits in the
+    // same place on every row (on a phone: the start of the second line).
+    const meta = [r.host, parts.join(" · "), ago].filter(Boolean)
+      .map((t) => `<span class="meta">${esc(t)}</span>`).join("");
     return `<li>${permKindHtml(r)}${permSubjectHtml(r, "span")}` +
-      `<span class="meta">${esc(r.host || "")}</span>` +
-      `<span class="meta">${esc(wait)}</span><span class="meta">${esc(ago)}</span></li>`;
+      `<span class="perm-meta">${meta}</span></li>`;
   }).join("");
   const list = items
     ? `<details class="table-view perm-recent-view"${recentOpen ? " open" : ""}><summary>Recent prompts (${recent.length})</summary><ul class="perm-recent">${items}</ul></details>`

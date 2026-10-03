@@ -354,13 +354,16 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
     let g = groups.get(key);
     if (!g) {
       g = { kind: row.kind, dialogKind: row.dialogKind || null, tool: row.tool || null,
-        head: row.head || null, count: 0, allowed: 0, denied: 0, waits: [], lastAt: 0,
+        head: row.head || null, count: 0, allowed: 0, denied: 0, open: 0, waits: [], lastAt: 0,
         denyReason: null, prompt: null };
       groups.set(key, g);
     }
     g.count += 1;
     if (row.answer === "allow") g.allowed += 1;
     if (row.answer === "deny") g.denied += 1;
+    // Still holding its session: not closed and no answer of any kind yet. A
+    // group whose every row is open has no answer to show, which 0/0 would hide.
+    if (typeof row.closedAt !== "number" && !row.answer) g.open += 1;
     if (typeof row.waitedMs === "number") g.waits.push(row.waitedMs);
     if (row.openedAt >= g.lastAt) {
       g.lastAt = row.openedAt;
@@ -374,7 +377,7 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
     .map((g) => {
       const out = {
         kind: g.kind, dialogKind: g.dialogKind, tool: g.tool, head: g.head,
-        count: g.count, allowed: g.allowed, denied: g.denied,
+        count: g.count, allowed: g.allowed, denied: g.denied, open: g.open,
         medianWaitMs: median(g.waits), lastAt: g.lastAt, suggestedRule: suggestedRule(g),
       };
       // An ask-in-chat group's subject is its newest question. Nobody answers
@@ -398,6 +401,9 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
         "denyReason", "answer", "via", "waitedMs", "openedAt", "closedAt"]) {
         if (row[k] !== undefined) out[k] = row[k];
       }
+      // An ask is answered in prose, never allow/deny: its stored "unknown" is
+      // not an answer, and the top table shows "—" for the same group.
+      if (row.kind === "ask-in-chat") delete out.answer;
       return out;
     });
   return { days: Math.min(Math.max(1, days || 7), DAYS), top, recent };

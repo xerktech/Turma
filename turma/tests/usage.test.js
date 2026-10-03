@@ -1292,7 +1292,42 @@ test("XERK-1563: the permission card lists each prompt with its rule and a copy 
   assert.match(html, /Dialog · plan/);
   assert.match(html, /no rule retires this/);             // a plan approval has no rule
   assert.match(html, /Recent prompts \(1\)/);
-  assert.match(html, /Should I proceed with the deploy\?.*nas01.*waited 1m · unknown.*2m ago/s);
+  // An ask has no allow/deny by design: its stored "unknown" never shows (the
+  // table says "—" for the same group), and the host leads the meta group.
+  assert.match(html, /Should I proceed with the deploy\?<\/span><span class="perm-meta"><span class="meta">nas01<\/span><span class="meta">waited 1m<\/span><span class="meta">2m ago<\/span><\/span>/);
+  assert.doesNotMatch(html, /unknown/);
+});
+
+test("XERK-1563: a group still waiting on its only answer reads 'open', never 0 / 0", () => {
+  const g = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "terraform apply",
+    suggestedRule: "Bash(terraform apply:*)", medianWaitMs: null };
+  const one = H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...g, count: 1, allowed: 0, denied: 0, open: 1 }] }, PERM_NOW);
+  assert.match(one, /data-label="Allowed \/ denied"><span class="perm-na"[^>]*>open<\/span><\/td>/);
+  assert.doesNotMatch(one, /0 \/ 0/);
+  // Some answered, some still open: the answers, and how many still wait.
+  const mixed = H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...g, count: 3, allowed: 1, denied: 0, open: 2 }] }, PERM_NOW);
+  assert.match(mixed, /data-label="Allowed \/ denied">1 \/ 0 <span class="perm-na">· 2 open<\/span><\/td>/);
+  // An older hub sends no `open`: unchanged.
+  const old = H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...g, count: 1, allowed: 1, denied: 0 }] }, PERM_NOW);
+  assert.match(old, /data-label="Allowed \/ denied">1 \/ 0<\/td>/);
+  // An ask still waiting is open too; once answered it is "—".
+  const ask = { kind: "ask-in-chat", prompt: "May I push?", count: 1, allowed: null, denied: null };
+  assert.match(H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...ask, open: 1 }] }, PERM_NOW), />open<\/span>/);
+  assert.match(H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...ask, open: 0 }] }, PERM_NOW), />—<\/span>/);
+});
+
+test("XERK-1563: a recent row says 'still open' only while it has no answer at all", () => {
+  const rows = (r) => H.permissionsCardHtml({ days: 7, top: [{ kind: "dialog", head: "x", count: 1 }],
+    recent: [{ host: "h1", kind: "dialog", head: "x", openedAt: PERM_NOW - 60000, ...r }] }, PERM_NOW);
+  assert.match(rows({}), /<span class="meta">h1<\/span><span class="meta">still open<\/span>/);
+  // A request answered between two beats arrives closed-less but answered.
+  const between = rows({ answer: "unknown" });
+  assert.doesNotMatch(between, /still open/);
+  assert.match(between, /<span class="meta">h1<\/span><span class="meta">unknown<\/span>/);
+  // No host: the group leads with the next part rather than an empty slot.
+  assert.match(H.permissionsCardHtml({ days: 7, top: [{ kind: "dialog", head: "x", count: 1 }],
+    recent: [{ kind: "dialog", head: "x", openedAt: PERM_NOW - 60000, waitedMs: 1000, closedAt: PERM_NOW, answer: "allow" }] }, PERM_NOW),
+    /<span class="perm-meta"><span class="meta">waited 1s · allow<\/span>/);
 });
 
 test("XERK-1563: every agent-supplied field in the card is escaped", () => {
@@ -1416,6 +1451,8 @@ test("XERK-1563: on a phone the card reflows to blocks, not a sideways-scrolling
   assert.match(block, /\.perm-card tbody td \{[^}]*position: static;/);
   assert.match(block, /td\.perm-rule \{ flex: 1 1 100%;/);
   assert.match(block, /td\.perm-stat::before \{ content: attr\(data-label\)/);
+  // Recent prompts: host · wait · age always on a second line of their own.
+  assert.match(block, /\.perm-recent \.perm-meta \{ flex: 1 1 100%; \}/);
   // Prose subjects wrap at word boundaries; only commands may break mid-token.
   assert.doesNotMatch(src, /\.perm-subj \{[^}]*break-all/);
   assert.match(src, /\.perm-subj\.cmd \{[^}]*overflow-wrap: anywhere;/);

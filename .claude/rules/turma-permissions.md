@@ -102,6 +102,12 @@ consumes this table; it does not replace it.
   at `ASK_KEY_MAX`), since it has no tool or head — keyed without it, every ask merged into one
   generic row. The group serves its newest `prompt` as the subject and `allowed`/`denied` = `null`
   (an ask is answered in prose; 0/0 would read "ignored"), which the card renders as "—".
+- **Each group also serves `open`** = rows with no `closedAt` AND no `answer` (still holding a
+  session). A group whose every row is open renders "open", never 0/0 ("asked and ignored"); a mixed
+  one appends "· N open". A never-closed row WITH an answer (a request answered between beats) is
+  not open. An older hub without `open` keeps the plain answers.
+- **A `recent` ask-in-chat row is served WITHOUT `answer`** (its stored `unknown` is not an answer):
+  the table shows "—" for its group, so the recent list must not say "unknown" for it either.
 - **Groups are fleet-wide, not per host** — a deliberate deviation from the ticket's
   `(host, kind, tool, head)`: one allow rule retires a prompt on every host, so per-host groups would
   split one fix into N rows. The host rides each `recent` row; scope by org to narrow.
@@ -119,6 +125,9 @@ consumes this table; it does not replace it.
   - **Below 600px each group reflows to a stacked block** (CSS only, same markup): kind + subject;
     one line of count / answers / wait (`data-label`); the rule + Copy on its own line. No sideways
     scroll — the sticky Prompt column used to cover the rule column on a phone.
+  - **A recent row's host · wait · age ride ONE `.perm-meta` group, host first** (an empty part is
+    dropped, not left as a blank slot); below 600px that group takes a full line, so the host always
+    starts the second line. Loose spans put the host in a different place row to row.
   - **Only a command/tool subject (`.perm-subj.cmd`) breaks mid-token**; an ask's question is prose
     and wraps between words.
   - That repaint goes through `TurmaNav.preserveScroll` and re-applies "Recent prompts"' open state
