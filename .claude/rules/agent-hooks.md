@@ -58,10 +58,12 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - **Do not narrow heredocs to "the one feeding the PR command"**: matching by owner line or
       redirect target refused 26% of real compliant PR commands (`git push && gh pr create …`,
       `cd x && …`, `cat > "$S/b.md"`, `\`-continued).
-    - **The accepted residual is anything `_split_heredocs` reads as a heredoc** — an unrelated
-      one, and lexer false positives: `<<EOF` inside a quoted title/label/echo, after `#`, `<<<`,
-      `\<<`. Each needs a model gaming its own guard; no honest command looks like that. Measured by swapping a
-      compliant body into all 473 real heredoc PR commands in `~/.claude/projects`: 0 refused.
+    - **The accepted residual is an UNRELATED real heredoc in the same command** (`cat > n.txt
+      <<EOF …` then `gh pr create -b junk`) — it takes a model gaming its own guard. `<<` inside
+      quotes, after `#`, `<<<` and `\<<` are not heredocs to the XERK-1256 lexer, so they don't
+      count. Measured by swapping a compliant body into all 483 real heredoc PR commands: 0 refused.
+    - **`_split_heredocs` yields `(owner, body, quoted)`** — a shape change there crashes this check,
+      and the guard then fails CLOSED on every heredoc-bodied PR (shipped once, in v2.1.50).
   - A body it can't see (`--fill`, the editor, `$(cat file)`) is refused, saying how to pass it.
   - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_text`): a FIFO at the body or
     template path hung the hook, and Claude Code lets a timed-out hook's command THROUGH.

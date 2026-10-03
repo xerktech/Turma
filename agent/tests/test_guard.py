@@ -1753,6 +1753,18 @@ class TestPrSummary(unittest.TestCase):
         self.assertIsNone(self.reason(f"gh pr -b {q} create -t x"))
         self.assertIsNone(self.reason(f"glab mr -d {q} update 1"))
 
+    def test_heredoc_lookalikes_are_not_the_body(self):
+        """`<<EOF` in quotes, a comment, a here-string or escaped is not a
+        heredoc to bash, so its text must not count as the description."""
+        g = GOOD_BODY + "EOF"
+        for cmd in ("gh pr create --title 'x <<EOF\n" + g + "' --body junk",
+                    "echo 'a <<EOF\n" + g + "'\ngh pr create --body junk",
+                    "# <<EOF\n" + g + "\ngh pr create --body junk",
+                    "cat <<<EOF\n" + g + "\ngh pr create --body junk",
+                    "echo \\<<EOF\n" + g + "\ngh pr create --body junk"):
+            with self.subTest(cmd=cmd[:30]):
+                self.assertIsNotNone(self.reason(cmd))
+
     def test_a_multiline_title_is_not_the_body(self):
         title = "x\n**Summary:** a\n## Why\n## What changed\n## Risk\n## Testing\n## Follow-ups"
         self.assertIsNotNone(self.reason(

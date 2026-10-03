@@ -2166,10 +2166,11 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             # Every heredoc counts. Matching a heredoc to the command it feeds
             # (owner line, redirect target) refused 26% of real compliant PR
             # commands — `git push && gh pr create … <<EOF`, `cd x && …`,
-            # `cat > "$S/b.md"` — so whatever _split_heredocs reads as a heredoc
-            # counts (an unrelated one, or `<<EOF` text inside a quoted title):
-            # the accepted residual, since it takes a model gaming its own guard.
-            heredocs = [b for _owner, b in _split_heredocs(command)[1]]
+            # `cat > "$S/b.md"` — so an unrelated heredoc in the same command
+            # counts too: the accepted residual, since it takes a model gaming
+            # its own guard. (`<<` in quotes/comments is not a heredoc to the
+            # XERK-1256 lexer, so it never counts.)
+            heredocs = [b for _owner, b, _quoted in _split_heredocs(command)[1]]
         body = "\n".join(bodies + heredocs + [_read_text(_join_path(cwd, f)) for f in files])
         sections = _repo_template_sections(_repo_root(cwd))
         if sections is not None:
