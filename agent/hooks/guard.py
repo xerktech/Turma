@@ -186,7 +186,10 @@ def _is_comment(command: str, i: int) -> bool:
     if i == 0:
         return True
     prev = command[i - 1]
-    if prev in ";&|()":
+    # Not after `)`: `$(x)#…`, `<(x)#…` and `$((1))#…` CONTINUE the word, so
+    # bash runs what follows. After a subshell's `)` it would be a comment;
+    # reading it as text there can only classify more.
+    if prev in ";&|(":
         return True
     # `a\ #` is one word, `a\<newline>#` is `a#`: an escaped blank is no break.
     return prev in " \t\n" and not (i >= 2 and command[i - 2] == "\\")
@@ -407,23 +410,61 @@ def _quote_states(command: str) -> list[str]:
     return out
 
 
-def _live_substs(segment: str) -> list["re.Match[str]"]:
+# Programs that only ever treat a quoted argument as TEXT — never hand it to a
+# shell, run it as a hook, or feed it to a pager/alias. Deliberately an
+# allowlist: `find -exec sh -c '…'`, `xargs sh -c`, `| sh`, `<<< … | bash`,
+# `flock`, `env -S`, `builtin eval` and `git -c core.pager='…'` all turn a
+# single-quoted string into a script, and a denylist of those is never done.
+_QUOTED_TEXT_PROGS = {
+    "echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "head", "tail", "wc",
+    "jq", "yq", "sort", "uniq", "diff", "ls", "mkdir", "cd", "touch", "test", "[",
+    "true", ":",
+}
+# `git <sub>` whose quoted arguments are a message or a path, never a command
+# (unlike `rebase --exec`, `bisect run`, `submodule foreach`, `-c alias.x=!…`).
+_QUOTED_TEXT_GIT = {"commit", "tag", "notes", "log", "show", "status", "add", "diff"}
+_QUOTED_TEXT_FORGE = {"create", "comment", "edit", "review", "note", "update"}
+
+
+def _quoted_text_only(tokens: list[str]) -> bool:
+    """Whether ``tokens`` (one stage) only ever reads a quoted string as text."""
+    if not tokens:
+        return True
+    prog = _basename(tokens[0])
+    if prog in _QUOTED_TEXT_PROGS:
+        return True
+    if prog == "git":
+        if any(t.startswith(("-c", "--config-env", "--exec-path")) for t in tokens[1:]):
+            return False
+        args = _git_args(tokens)
+        return bool(args) and args[0] in _QUOTED_TEXT_GIT
+    if prog in ("gh", "glab"):
+        return len(tokens) > 2 and tokens[2] in _QUOTED_TEXT_FORGE
+    return False
+
+
+def _live_substs(segment: str, quoted_text: bool = False) -> list["re.Match[str]"]:
     """The substitutions in ``segment`` bash would actually run.
 
     `git commit -m '$(rm -rf /)'` runs nothing — inside single quotes (or after
     a backslash) it is text — and expanding it refused the commit (XERK-1256).
-    A quoted script handed to `bash -c`/`eval`/`ssh` is still found: those
-    branches re-expand their argument unquoted.
+    That holds only when ``quoted_text``: the WHOLE command line is stages that
+    read a quoted string as text (`_quoted_text_only`). Anywhere else a quoted
+    `$(…)` may reach a shell by a channel nothing here models
+    (`echo '$(…)' | sh`), so it is classified as if it ran.
     """
+    if not quoted_text:
+        return list(_SUBST_RE.finditer(segment))
     states = _quote_states(segment)
     return [m for m in _SUBST_RE.finditer(segment) if states[m.start()] not in ("'", "\\")]
 
 
-def _sub_live(segment: str, repl: Callable[["re.Match[str]"], str]) -> str:
+def _sub_live(segment: str, repl: Callable[["re.Match[str]"], str],
+              quoted_text: bool = False) -> str:
     """``_SUBST_RE.sub`` over the live substitutions only."""
     parts: list[str] = []
     last = 0
-    for m in _live_substs(segment):
+    for m in _live_substs(segment, quoted_text):
         parts.append(segment[last:m.start()])
         parts.append(repl(m))
         last = m.end()
@@ -755,6 +796,8 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
             kept.append(command[i:end])
             i = end
             continue
+        elif top == "p":
+            pass  # `${x:-<<y}` is a word, not a redirection
         elif command.startswith("<<<", i):
             kept.append("<<<")
             i += 3
@@ -1094,6 +1137,9 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
     # be judged against what is actually going to be fed to it.
+    quoted_text = all(
+        _quoted_text_only(_strip_prefixes(_tokenize(_unwrap_group(raw)))) for raw in segments
+    )
     piped_operands: list[str] = []
     for raw in segments:
         for tok in _tokenize(raw):
@@ -1107,16 +1153,17 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             for frag in _stray_group_fragments(raw):
                 out.extend(_expand_segments(frag, depth + 1))
         # Anything a substitution would run, wherever it sits in the segment.
-        for m in _live_substs(raw):
+        for m in _live_substs(raw, quoted_text):
             inner = _subst_inner(m)
             if inner.strip():
                 out.extend(_expand_segments(inner, depth + 1))
         # A substitution also CONTRIBUTES text where it sits — `$(echo …)` is
         # what `eval "$(echo rm -rf /etc)"` runs and what `rm -rf $(echo /etc)`
         # deletes. Both fall out of substituting rather than erasing.
-        seg = _unwrap_group(_sub_live(raw, _subst_text))
+        seg = _unwrap_group(_sub_live(raw, _subst_text, quoted_text))
         # ...and one that printed nothing leaves the word it is glued to.
-        bare = _unwrap_group(_sub_live(raw, lambda m: _subst_text(m, glued_empty=True)))
+        bare = _unwrap_group(
+            _sub_live(raw, lambda m: _subst_text(m, glued_empty=True), quoted_text))
         if bare != seg and bare:
             out.extend(_expand_segments(bare, depth + 1))
         if seg != raw.strip() and seg:

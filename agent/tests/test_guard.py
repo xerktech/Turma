@@ -970,6 +970,7 @@ class TestParserGaps(unittest.TestCase):
                     # Bash strips quoting from the WHOLE delimiter word.
                     f'cat <<E"OF"\nhi\nEOF\n{R}',
                     f"cat <<A <<B\na\nA\nb\nB\n{R}",
+                    f"echo ${{x:-<<y}}\n{R}\ny",
                     f'cat <<<"$({R})"'):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
@@ -979,6 +980,16 @@ class TestParserGaps(unittest.TestCase):
         kept, bodies = guard._split_heredocs("cat <<A <<'B'\na\nA\nb\nB\necho done")
         self.assertEqual(kept, "cat <<A <<'B'\necho done")
         self.assertEqual([(b, q) for _o, b, q in bodies], [("a", False), ("b", True)])
+
+    def test_a_hash_after_a_substitution_is_no_comment(self):
+        """`$(x)#` continues the word, so bash runs what follows it. Reading
+        a subshell's `)#…` as text too is the fail-closed side of that."""
+        R = self.R
+        for cmd in (f"echo $(true)#; {R}", f"echo $(true)#|{R}", f"x=$(true)#; {R}",
+                    f"cat <(true)#; {R}", f"echo $((1))#; {R}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertTrue(guard._balanced_groups("(t)#(\n(a; b)")[1])
 
     def test_a_comment_apostrophe_is_not_a_quote(self):
         for cmd in (f"# don't\n{self.R}", f"echo hi # don't\n{self.R}"):
@@ -1005,14 +1016,22 @@ class TestParserGaps(unittest.TestCase):
 
     def test_a_single_quoted_substitution_is_text(self):
         for cmd in (f"git commit -m '$({self.R})'", f"echo '`{self.R}`'",
+                    f"gh pr create --title t --body '$({self.R})'",
+                    f"git commit -m '$({self.R})' && git status",
                     "echo \\$\\(rm -rf /\\)"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
         R = self.R
-        # ...unless something runs it, or it only LOOKS single-quoted.
+        # ...unless something runs it, or it only LOOKS single-quoted — and
+        # only where EVERY stage is a known text reader: a quoted string has
+        # more ways into a shell than the guard models.
         for cmd in (f"bash -c 'echo $({R})'", f"eval 'echo $({R})'",
                     f"echo \"'$({R})'\"", f"x='$({R})'; eval $x",
-                    f"x='{R}'; eval $x"):
+                    f"x='{R}'; eval $x", f"echo 'x $({R})' | sh",
+                    f"find . -exec sh -c 'echo $({R})' \\;", f"sh <<< 'x $({R})'",
+                    f"builtin eval 'x $({R})'", f"eval -- 'x $({R})'",
+                    f"sh -c \"$(echo '$({R})')\"", f"eval \"$(echo '$({R})')\"",
+                    f"git -c core.pager='less $({R})' log"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
 
@@ -1513,7 +1532,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             ("[[ $x =~ (a|b) ]]", []),
             ("case $x in (a|b) t;; esac", []),
             ("ls # (a; b)", []),
-            ("(t)#(\n(a; b)", ["t", "a; b"]),                           # `#` after `)`
+            # `#` after a substitution's `)` continues the word (XERK-1256).
+            ("echo $(t)#; (a; b)", ["t", "a; b"]),
         ]
         for cmd, bodies in cases:
             with self.subTest(cmd=cmd):

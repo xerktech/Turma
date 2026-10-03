@@ -77,8 +77,13 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - Pre-normalisation runs on the heredoc-free text, so body prose cannot shift quoting.
   - **The splitter knows comments, backticks and `case` patterns** (`_split_on_operators`):
     `# don't` desynced its quotes; a pattern's `|` is no pipe and a plain pattern is dropped.
-  - **Substitutions/braces inside single quotes are text** (`_live_substs`, `_expand_braces`):
-    `bash -c`/`eval`/wrapper branches re-expand a quoted script, so nothing is lost by skipping.
+  - **Braces inside quotes are text** (`_expand_braces`); `bash -c`/`eval` re-expand a quoted script.
+  - **A single-quoted substitution is text ONLY when every stage is a known text reader**
+    (`_quoted_text_only` allowlist: echo/grep/…, `git commit|tag|log…` without `-c`, `gh … create`).
+    - Never widen it to "skip unless a modelled executor is present": `| sh`, `find -exec sh -c`,
+      `xargs sh -c`, `<<<` into a shell, `flock`, `env -S`, `git -c core.pager=` each run it.
+  - **`#` after `)` is never a comment** (`_is_comment`): `$(x)#; rm …` continues the word, so bash
+    runs the rest; a subshell's `)#` read as text only classifies more.
     - Quoted assignment values are read whole (`_VAR_ASSIGN_RE`); without that, skipping quoted
       substitutions lost `x='$(rm -rf /)'; eval $x`.
   - **An opaque substitution glued to a word is also read as EMPTY** (`glued_empty`): `$(true)rm`
