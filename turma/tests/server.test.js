@@ -13287,19 +13287,19 @@ test("XERK-1445: auto-merge/close never act on a session whose ticket names an o
 
 test("XERK-1445: a host DRIFTING to another org stands auto-merge down until it re-declares its bound org", async () => {
   resetMerge();
-  // amD2 keeps org D's board row for ENG-9 visible while amD drifts.
-  await mergeBeat("amD2", "amd.atlassian.net", { prs: [] });
-  await mergeBeat("amD", "amd.atlassian.net", {});          // binds amD to org D
-  const sessions = agents.amD.sessions;
-  await asBeat("amD", "amx.atlassian.net", { autoStart: false, tickets: [], sessions });
-  assert.equal(boundOrgOf(agents.amD), "amd.atlassian.net");
-  assert.equal(decidedOrgOf(agents.amD), "");
+  // amDr1445b keeps org D's board row for ENG-9 visible while amD drifts.
+  await mergeBeat("amDr1445b", "amdrift1445.atlassian.net", { prs: [] });
+  await mergeBeat("amDr1445", "amdrift1445.atlassian.net", {});          // binds amDr1445 to org D
+  const sessions = agents.amDr1445.sessions;
+  await asBeat("amDr1445", "amxdrift1445.atlassian.net", { autoStart: false, tickets: [], sessions });
+  assert.equal(boundOrgOf(agents.amDr1445), "amdrift1445.atlassian.net");
+  assert.equal(decidedOrgOf(agents.amDr1445), "");
   autoMergeSweep();
-  assert.equal((agents.amD.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  assert.equal((agents.amDr1445.commands || []).filter((c) => c.type === "mergePr").length, 0);
   // Silence is not drift, and re-declaring the bound org heals it in one beat.
-  await mergeBeat("amD", "amd.atlassian.net", {});
+  await mergeBeat("amDr1445", "amdrift1445.atlassian.net", {});
   autoMergeSweep();
-  assert.equal((agents.amD.commands || []).filter((c) => c.type === "mergePr").length, 1);
+  assert.equal((agents.amDr1445.commands || []).filter((c) => c.type === "mergePr").length, 1);
 });
 
 test("XERK-1445: an armed epic run never adopts a child session whose host is bound elsewhere", () => {
