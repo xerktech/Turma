@@ -313,10 +313,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     `sessionWait` — `LiveState.HOLDING` (Active, never Ready for review, "⏳ waiting · 12m left" /
     "⏳ waiting · Watch CI"; a session-CLI sleeper "💤 sleeping until 14:05", XERK-1571) until
     stalled, then IDLE. The chat bar reads "Waiting…" and a wait row "waiting".
-  - **Gap:** a STALLED card's state label still reads plain "idle" on Android where the web says
-    "stalled · <what>". XERK-1571 surfaces the hub's `needs-you:stalled` only as the Needs-you
-    "stalled" chip and the review card's why line; labelling an IDLE card from that served
-    attention would close it. The HOLDING dot is a dimmed working colour, not the hollow ring.
+  - **Gap:** the Fleet card labels an IDLE session from the hub's served attention
+    (`attentionLabel` → "stalled · Watch CI", in the error colour) as the web does, but the
+    Sessions-screen card has no state label, so a stalled session there shows only the
+    Needs-you "stalled" chip and the review card's why line. The HOLDING dot is a dimmed
+    working colour, not the hollow ring.
 
 ## Done (XERK-78 installment — the P0 sweep)
 

@@ -13678,6 +13678,18 @@ test("XERK-550: auto-merge dispatches mergePr for a ready, idle, eligible sessio
   assert.equal(autoMergeState.get(PR1).attempts, 1);
 });
 
+test("XERK-1571: auto-merge leaves a SLEEPING session alone until its wake has passed", async () => {
+  resetMerge();
+  await mergeBeat("amSleep", "amsleep.atlassian.net", {});
+  const live = agents.amSleep.sessions[0].session;
+  live.wakeAt = Date.now() + 10 * 60_000;   // asked to be woken in 10 minutes
+  autoMergeSweep();
+  assert.equal((agents.amSleep.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  live.wakeAt = Date.now() - 1000;          // the wake is now behind us
+  autoMergeSweep();
+  assert.equal((agents.amSleep.commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
 test("XERK-550: auto-merge skips when the org has NOT opted in", async () => {
   resetMerge();
   await mergeBeat("am2", "am2.atlassian.net", { autoMerge: false });
