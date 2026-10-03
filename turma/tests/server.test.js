@@ -13285,6 +13285,23 @@ test("XERK-1445: auto-merge/close never act on a session whose ticket names an o
   assert.equal((agents.amB.commands || []).filter((c) => c.type === "mergePr").length, 1);
 });
 
+test("XERK-1445: a host DRIFTING to another org stands auto-merge down until it re-declares its bound org", async () => {
+  resetMerge();
+  // amD2 keeps org D's board row for ENG-9 visible while amD drifts.
+  await mergeBeat("amD2", "amd.atlassian.net", { prs: [] });
+  await mergeBeat("amD", "amd.atlassian.net", {});          // binds amD to org D
+  const sessions = agents.amD.sessions;
+  await asBeat("amD", "amx.atlassian.net", { autoStart: false, tickets: [], sessions });
+  assert.equal(boundOrgOf(agents.amD), "amd.atlassian.net");
+  assert.equal(decidedOrgOf(agents.amD), "");
+  autoMergeSweep();
+  assert.equal((agents.amD.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  // Silence is not drift, and re-declaring the bound org heals it in one beat.
+  await mergeBeat("amD", "amd.atlassian.net", {});
+  autoMergeSweep();
+  assert.equal((agents.amD.commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
 test("XERK-1445: an armed epic run never adopts a child session whose host is bound elsewhere", () => {
   const byKey = new Map([["epb.atlassian.net\x00C-1",
     { key: "C-1", epicKey: "E-1", statusCategory: "inprogress" }]]);
