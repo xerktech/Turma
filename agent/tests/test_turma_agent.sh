@@ -703,7 +703,9 @@ cp "$PREFIX/hub-agent.py" "$odd/hub-agent.py"
 near="$WORK/odd/aXbbc"  # matched by the UNESCAPED "a.b+c" prefix
 mkdir -p "$near"
 cp "$PREFIX/hub-agent.py" "$near/hub-agent.py"
-setsid bash -c "exec -a python3 \"$REAL_PYTHON3\" \"$odd/hub-agent.py\"" >/dev/null 2>&1 &
+# The odd-prefix manager also runs as a free-threaded argv0 with an interpreter
+# flag, pinning the loose interpreter match (a python3 wrapper adding -I).
+setsid bash -c "exec -a python3.13t \"$REAL_PYTHON3\" -I \"$odd/hub-agent.py\"" >/dev/null 2>&1 &
 ODD=$!
 setsid bash -c "exec -a python3 \"$REAL_PYTHON3\" \"$near/hub-agent.py\"" >/dev/null 2>&1 &
 NEAR=$!
@@ -712,7 +714,7 @@ manager_re=""
 eval "${re_line//\$PREFIX/\$odd}"  # the launcher's line, evaluated for $odd
 got="$(pgrep -xf "$manager_re" | tr '\n' ' ')"
 if [ "$got" = "$ODD " ]; then
-  ok "matched exactly the odd-prefix manager"
+  ok "matched exactly the odd-prefix python3.13t -I manager"
 else
   fail "odd-prefix match returned '$got', expected '$ODD '"
 fi

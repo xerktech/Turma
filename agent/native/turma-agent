@@ -295,7 +295,9 @@ fi
 # re-execs `/…/python3.12`), and interpreter flags a python3 wrapper may add
 # (`-I`) — because a real manager the guard fails to see means two managers.
 # A concurrent `hub-agent.py --enroll` probe has an argument AFTER the script,
-# so it no longer matches. $PREFIX is regex-escaped. This
+# so it no longer matches. Accepted residue: a flag with its value glued on
+# (`python3 -mfoo $PREFIX/hub-agent.py`) reads as a manager — a deliberately odd
+# argv, and a loud refusal, never a second manager. $PREFIX is regex-escaped. This
 # launcher's own argv is the bash script path, so it never matches itself. A
 # zombie has an empty /proc/<pid>/cmdline and never matches. Missing pgrep fails
 # OPEN — the prior behaviour, never worse. TURMA_ALLOW_SECOND_MANAGER=1 opts out
