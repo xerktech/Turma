@@ -191,10 +191,13 @@ test("dashboard: the Needs you group lists hub needs-you sessions, oldest first"
   assert.ok(ny.includes("nas · Turma · PR open · CI passing"));
   assert.ok(ny.includes('<span class="ny-age">50m</span>'));
   assert.ok(ny.includes('href="/sessions?session=s2"'));
+  // XERK-1571: the tile counts the SAME set the group lists, worded to match.
+  assert.deepEqual(tileOf(D.els.tiles.innerHTML, "Needs you"), { value: "3", hint: "sessions waiting on you" });
   // Nothing waiting on the operator: no group at all.
   const D2 = loadDashboard();
   D2.render({ now, agents: [{ ...liveHost("nas", 1), sessions: [sess("s4", "Busy", at("working", 1))] }] });
   assert.ok(!D2.els.groups.innerHTML.includes("needs-you"));
+  assert.equal(tileOf(D2.els.tiles.innerHTML, "Needs you").value, "0");
 });
 
 test("dashboard tiles: a removed host's spend still counts toward the fleet totals", () => {

@@ -41,6 +41,13 @@
   --warning:     #fab219;
   --critical:    #d03b3b;
 
+  /* status TEXT on a surface (XERK-1571): the semantic colours above are fills
+     and dots; as small text on the dark surface three of them drop under 4.5:1,
+     so text takes these, which step up in dark only (light = the fill colour). */
+  --good-text:     var(--good);
+  --accent-text:   var(--accent);
+  --critical-text: var(--critical);
+
   /* validated categorical chart slots — fixed order, never cycled (history) */
   --s1: #2a78d6; --s2: #1baf7a; --s3: #eda100; --s4: #008300;
   --s5: #4a3aa7; --s6: #e34948; --s7: #e87ba4; --s8: #eb6834;
@@ -77,6 +84,10 @@
     --border:    rgba(255,255,255,0.10);
     --accent:    #3987e5;
     --field:     #111110;
+    /* status text, stepped up to clear 4.5:1 on an org-tinted dark card */
+    --good-text:     #4cc94c;
+    --accent-text:   #78aef2;
+    --critical-text: #f08080;
     /* same hues, stepped for the dark surface (validated as a set) */
     --s1: #3987e5; --s2: #199e70; --s3: #c98500; --s4: #008300;
     --s5: #9085e9; --s6: #e66767; --s7: #d55181; --s8: #d95926;
@@ -412,6 +423,8 @@ input:focus, textarea:focus, select:focus {
 .dot.waiting,
 .dot.updating              { background: var(--warning);  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
 .dot.offline               { background: var(--critical);  box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
+/* A stalled background wait (XERK-1571): the danger colour it has on every surface. */
+.dot.stalled               { background: var(--critical);  box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
 .dot.idle                  { background: var(--muted); }
 /* Ready for review (XERK-224): work that has stopped and is waiting on YOU.
    Accent rather than the muted idle it is lifted out of — the section is a

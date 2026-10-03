@@ -1189,6 +1189,16 @@ test("XERK-1571: sessionAttention derives every state in precedence order", () =
   const timed = { type: "shell", label: "Sleep", kind: "wait-timed", eta: now + 10 * WMIN };
   assert.deepEqual(att(s({ question: "Ship it?" })), { state: "needs-you:question", why: "Ship it?" });
   assert.deepEqual(att(s({ panePrompt: { prompt: "Allow rm?" } })), { state: "needs-you:permission", why: "Allow rm?" });
+  // The dialog's question is a generic "Do you want to proceed?", so the why names
+  // the pending command off the block above it (the real Claude Code dialog shape).
+  const perm = (detail) => att(s({ panePrompt: { prompt: "Do you want to proceed?", detail } })).why;
+  assert.equal(perm("Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp"), "Bash: touch /tmp/permtest-marker");
+  assert.equal(perm("Edit file\nsrc/app.js"), "Edit file: src/app.js");
+  assert.equal(perm("rm -rf build/"), "rm -rf build/");
+  assert.equal(perm(""), "Do you want to proceed?");
+  const long = perm("Bash command\n" + "x".repeat(300));
+  assert.equal(long.length, 120);
+  assert.ok(long.endsWith("…"));
   // A question outranks everything below it, stalled included.
   assert.equal(att(s({ question: "Q", transcriptAgeSec: 50 * 60, agents: [ci] })).state, "needs-you:question");
   assert.deepEqual(att(s({ paneBusy: true })), { state: "working" });

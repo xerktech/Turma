@@ -60,13 +60,28 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   `NeedsYouCard` + `core/Sessions.kt` `needsYou`): running sessions whose served state is
   `needs-you:*`, oldest `since` first — chip, name, age, host · repo · why; a row opens the session.
   Read off the served attention, never re-derived, so it matches the phone's alerts.
+  - **The "Needs you" tile counts that SAME list** (`needsYou(sess).length`; Android `fleetSummary`
+    `waiting` via `needsYouChip`) — a questions-only count said 2 above a group of 4.
+  - The chip is a FILLED pill in a fixed 84px column (names/why lines align); text is picked
+    against the fill (amber text on the light surface is <2:1). Name + why clamp to 2 lines on phones.
+- **A fleet card never reads "idle" for a needs-you session**: where liveState would say idle, it
+  says `attentionLabel` ("review · PR open · CI passing", "stalled · Watch CI"; Android same name).
+- **Permission `why` is the pending COMMAND, not the dialog's question** (`permissionWhy`): the
+  question is nearly always "Do you want to proceed?", so a leading dialog title + next line of
+  `panePrompt.detail` becomes "Bash: touch /tmp/x" (first line alone if no title; capped at 120).
+- **Stalled is the danger colour on every surface** (`.dot.stalled`, `.state.stalled`,
+  `.sess-stalled`, Android `colorScheme.error`/`TurmaColors.critical`) — never the review accent.
+- Status TEXT uses `--good-text`/`--accent-text`/`--critical-text` (`app.css`), equal to the fill
+  colours in light and stepped up in dark so 12px state lines clear 4.5:1 on a tinted card.
 - **Sessions page Ready for review** is sorted by `since`, oldest first (`bySince`, Android
   `sortedBySince`, glasses phone `render.ts`); a card with no `since` keeps its createdAt place after
   them. The section is still DECIDED by each client's own `readyForReview` mirror. Each review card
-  carries a `.why` line (`attentionWhy`: the why + "waiting 12m"; the web drops the why on a
-  question/permission/stalled card, whose label already says it — the Android card has no label,
-  so it keeps it).
-- Waiting cards read "⏳ waiting · …" (`backgroundWaitLabel`, Android `liveStateLabel`).
+  carries a `.why` line (`attentionWhy`: the why + the time — "waiting 12m", "for 22m" under a
+  question/permission, "stalled 31m" on a stall; the web drops the why on a question/stalled card,
+  whose label already says it, and keeps a permission's command — the Android card has no label,
+  so it keeps every why).
+- Waiting cards read "⏳ waiting · …" (`backgroundWaitLabel`, Android `liveStateLabel`); with no ETA
+  they add the time since the oldest wait row's `startedAt` ("· 12m"), with one "· 11m left".
 
 ## The stalled alert
 

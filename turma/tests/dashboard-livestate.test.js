@@ -114,7 +114,8 @@ test("dashboard liveState: waiting shells hold, stall, and never read working", 
   assert.equal(timed.label, "⏳ waiting · 5m left");
   const stalled = liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW);
   assert.equal(stalled.label, "stalled · Watch CI");
-  assert.equal(stalled.cls, "");
+  // XERK-1571: the danger tone it has on every surface.
+  assert.equal(stalled.cls, "sess-stalled");
   // A work shell beside the wait is working, named by its work rows only.
   const mixed = liveState(sess({ paneBusy: false, transcriptAgeSec: 5,
     agents: [ci, { type: "shell", kind: "work" }] }), onlineHost, NOW);
@@ -125,6 +126,43 @@ test("dashboard liveState: waiting shells hold, stall, and never read working", 
   // Offline host: no wait read at all — plain idle.
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }),
     { online: false, lastSeen: NOW - 600_000 }, NOW).label, "idle");
+});
+
+// XERK-1571: a wait with no ETA says how long it has waited, off the oldest
+// wait row's startedAt; an ETA still says the time left.
+test("dashboard liveState: a wait with no ETA says how long it has waited", () => {
+  const { liveState } = loadDashboard();
+  const ci = { type: "shell", label: "Watch CI on PR #412", kind: "wait-external", startedAt: NOW - 12 * 60 * 1000 };
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }), onlineHost, NOW).label,
+    "⏳ waiting · Watch CI on PR #412 · 12m");
+  const two = [{ ...ci, label: "" }, { type: "shell", kind: "wait-timed", startedAt: NOW - 20 * 60 * 1000 }];
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: two }), onlineHost, NOW).label,
+    "⏳ waiting on 2 background shells · 20m");
+  const timed = { ...ci, kind: "wait-timed", eta: NOW + 11 * 60 * 1000 };
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [timed] }), onlineHost, NOW).label,
+    "⏳ waiting · 11m left");
+});
+
+// XERK-1571: a card the hub says needs the operator never reads "idle" — its
+// State row takes the attention read the Needs-you group lists it under.
+test("dashboard liveState: a needs-you session reads its attention, never idle", () => {
+  const { liveState } = loadDashboard();
+  const done = { paneBusy: false, transcriptAgeSec: 52 * 60 };
+  const review = liveState({ session: done,
+    attention: { state: "needs-you:review", since: NOW - 60_000, why: "PR open · CI passing" } }, onlineHost, NOW);
+  assert.equal(review.label, "review · PR open · CI passing");
+  assert.equal(review.cls, "sess-review");
+  assert.match(review.detail, /^last write /);
+  const stalled = liveState({ session: done,
+    attention: { state: "needs-you:stalled", since: NOW - 60_000, why: "Watch CI" } }, onlineHost, NOW);
+  assert.equal(stalled.label, "stalled · Watch CI");
+  assert.equal(stalled.cls, "sess-stalled");
+  // No attention (an older hub) or a non-needs-you state: idle as before.
+  assert.equal(liveState({ session: done }, onlineHost, NOW).label, "idle");
+  assert.equal(liveState({ session: done, attention: { state: "idle", since: NOW } }, onlineHost, NOW).label, "idle");
+  // Working outranks it.
+  assert.equal(liveState({ session: { paneBusy: true, transcriptAgeSec: 1 },
+    attention: { state: "needs-you:review", since: NOW } }, onlineHost, NOW).label, "working");
 });
 
 // XERK-1571: a session-CLI wake still ahead reads sleeping (holding style), "until

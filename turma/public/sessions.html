@@ -127,7 +127,7 @@
     text-decoration: none; }
   a.s-ticket:hover { text-decoration: underline; }
   .s-card .state { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
-  .s-card .state.working { color: var(--good); }
+  .s-card .state.working { color: var(--good-text); }
   .s-card .state.waiting { color: var(--warning); font-weight: 600; }
   /* Waiting out a background shell it launched (XERK-1570): not working, not
      the operator's yet — a quiet in-between, never the attention colours. */
@@ -137,7 +137,10 @@
   .s-card .why { font-size: 11px; color: var(--ink-2); margin-top: 3px; }
   /* A card in the Ready-for-review section says why it is there instead of the
      bare "idle" it would otherwise read (XERK-224). */
-  .s-card .state.review { color: var(--accent); font-weight: 600; }
+  .s-card .state.review { color: var(--accent-text); font-weight: 600; }
+  /* A STALLED wait (XERK-1571) is the danger colour wherever it shows — the
+     dashboard's Needs-you chip and card included — never the review blue. */
+  .s-card .state.stalled { color: var(--critical-text); font-weight: 600; }
   .s-card .question {
     font-size: 12px; color: var(--ink-2); margin-top: 3px;
     display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
@@ -2270,8 +2273,14 @@ function backgroundWaitLabel(rows, wait, now) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
   const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
   if (wait.eta != null && wait.eta > now) return word + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
-  if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label;
-  return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s");
+  // No ETA: how long it has been waiting, off the oldest wait row's startedAt
+  // (XERK-1571) — a CI watch with no duration reads as if it just began.
+  let started = null;
+  for (const a of waits)
+    if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
+  const since = started == null ? "" : " · " + ago(now - started).replace(/ ago$/, "");
+  if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label + since;
+  return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s") + since;
 }
 // The oppositional QA agents (`qa` on the first pass, `qa-delta` on every pass
 // after) — a card running one is still `working`, so it stays Active, but says
@@ -2367,16 +2376,24 @@ function reviewState(s, live, now) {
 
 // The hub's attention read (XERK-1571), as a review card's second line: WHY the
 // session is the operator's ("PR open · CI passing") and how long it has been
-// ("· 12m"). A question/permission card already quotes its question and a
-// stalled one names its wait in its label, so for those only the wait shows.
-// "" from an older hub that serves no `attention`.
+// ("· waiting 12m"). A question card already quotes its question and a stalled
+// one names its wait in its label, so for those only the time shows — "for 22m"
+// under "waiting for your answer", "stalled 31m" under a stall. A permission
+// card quotes the dialog's generic question, so its why (the pending command)
+// shows too. "" from an older hub that serves no `attention`.
 function attentionWhy(s, now) {
   const att = s.attention;
-  if (!att || !String(att.state || "").startsWith("needs-you:")) return "";
-  const asked = att.state !== "needs-you:review" && att.state !== "needs-you:test";
+  const st = String(att?.state || "");
+  if (!st.startsWith("needs-you:")) return "";
+  const asked = st === "needs-you:question" || st === "needs-you:permission";
   const bits = [];
-  if (att.why && !asked) bits.push(att.why);
-  if (Number.isSafeInteger(att.since)) bits.push("waiting " + ago(now - att.since).replace(/ ago$/, ""));
+  const quoted = s.session?.panePrompt?.prompt;
+  if (att.why && (st === "needs-you:review" || st === "needs-you:test"
+      || (st === "needs-you:permission" && att.why !== quoted))) bits.push(att.why);
+  if (Number.isSafeInteger(att.since)) {
+    const age = ago(now - att.since).replace(/ ago$/, "");
+    bits.push((st === "needs-you:stalled" ? "stalled " : asked ? "for " : "waiting ") + age);
+  }
   return bits.join(" · ");
 }
 
@@ -2774,6 +2791,9 @@ function queuedCard({ a, s }) {
 
 function activeCard({ a, s, live }) {
   if (renameId === s.id) return renameCard(a, s);
+  // A stalled wait keeps its section (Idle, or Ready for review) but takes the
+  // danger tone on its dot and state line (XERK-1571).
+  const tone = live.stalled ? "stalled" : live.kind;
   const attachable = a.terminalOnline;
   const cur = s.id === currentId;
   const meta = cardMeta(a, s);
@@ -2787,12 +2807,12 @@ function activeCard({ a, s, live }) {
           aria-label="${esc("Open session " + sessTitle(s))}"
           onclick="selectSession('${escJs(s.id)}')"
           ${attachable ? "" : 'title="Terminal tunnel offline"'}></button>
-      <span class="dot ${live.kind}"></span>
+      <span class="dot ${tone}"></span>
       <span class="body">
         <div class="title" title="${esc(sessTitle(s))}">${esc(sessTitle(s))}</div>
         ${meta}
         <div class="state-row">
-          <div class="state ${live.kind}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
+          <div class="state ${tone}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
             esc("Running on this host's self-hosted model, not the Claude subscription"
                 + (s.modelSourceAt ? ` — since ${new Date(s.modelSourceAt).toLocaleString()}` : ""))

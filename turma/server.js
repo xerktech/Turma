@@ -11328,6 +11328,24 @@ function reviewWhy(session) {
   return what;
 }
 
+// What a blocking TUI dialog is asking to do, for a permission's `why` line: the
+// dialog's question is nearly always the same "Do you want to proceed?", which
+// says nothing, so the line names the pending command instead. The agent serves
+// the block above the question as `panePrompt.detail` (hub-agent.py
+// parse_pane_prompt) — "Bash command\ntouch /tmp/x\nCreate marker file" — so a
+// leading dialog TITLE (a short run of plain words) becomes the tool name and the
+// next line its target: "Bash: touch /tmp/x". No detail = the question itself.
+const PERMISSION_WHY_MAX = 120;
+function permissionWhy(pp) {
+  const lines = (typeof pp.detail === "string" ? pp.detail : "").split("\n").map((l) => l.trim()).filter(Boolean);
+  let why = lines[0] || "";
+  if (lines.length > 1 && /^[A-Z][A-Za-z]*( [A-Za-z]+){0,3}$/.test(lines[0])) {
+    why = `${lines[0].replace(/ command$/i, "")}: ${lines[1]}`;
+  }
+  if (!why) why = String(pp.prompt || "");
+  return why.length > PERMISSION_WHY_MAX ? why.slice(0, PERMISSION_WHY_MAX - 1) + "…" : why;
+}
+
 // One session's attention (XERK-1571): {state, eta?, why?} — `since` is added
 // by the caller from the edge it keeps in alerts.sessions. Pure; `working` and
 // `wait` are the caller's sessionWorking/sessionWait reads. Precedence, highest
@@ -11340,7 +11358,7 @@ function sessionAttention(session, working, wait, now) {
   const why = (t) => (typeof t === "string" && t ? { why: t.slice(0, ATTENTION_WHY_MAX) } : {});
   const eta = (t) => (Number.isSafeInteger(t) && t > 0 ? { eta: t } : {});
   if (s.question) return { state: "needs-you:question", ...why(s.question) };
-  if (s.panePrompt && s.panePrompt.prompt) return { state: "needs-you:permission", ...why(s.panePrompt.prompt) };
+  if (s.panePrompt && s.panePrompt.prompt) return { state: "needs-you:permission", ...why(permissionWhy(s.panePrompt)) };
   if (working) return { state: "working" };
   if (sessionSleeping(s, now)) return { state: "sleeping", ...eta(s.wakeAt), ...why(s.wakeReason) };
   if (wait) {

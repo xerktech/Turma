@@ -294,8 +294,11 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         val waits = live?.agents.orEmpty().filter(::isWaitAgent)
         val eta = waits.mapNotNull { it.eta }.maxOrNull()
         if (eta != null && eta > now) return "⏳ waiting · ${waitLeftText(eta - now)} left"
-        if (waits.size == 1 && waits[0].label.isNotBlank()) return "⏳ waiting · ${waits[0].label}"
-        return "⏳ waiting on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
+        // No ETA: how long it has waited, off the oldest row's startedAt (XERK-1571).
+        val started = waits.mapNotNull { it.startedAt }.filter { it <= now }.minOrNull()
+        val since = if (started == null) "" else " · ${waitLeftText(now - started)}"
+        if (waits.size == 1 && waits[0].label.isNotBlank()) return "⏳ waiting · ${waits[0].label}$since"
+        return "⏳ waiting on ${waits.size} background shell" + (if (waits.size == 1) "" else "s") + since
     }
     // Only WORK rows name the working state; a waiting shell beside them is not work.
     if (state == LiveState.WORKING && hasLiveWork(live)) {

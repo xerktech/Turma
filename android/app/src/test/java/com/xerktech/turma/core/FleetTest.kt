@@ -25,8 +25,12 @@ class FleetTest {
     ) = AgentInfo(key = key, device = device, online = online, sessions = sessions, usage = usage,
         capacity = capacity)
 
-    private fun session(status: String, question: String = "", usage: UsageInfo? = null) =
-        SessionInfo(id = status, status = status, usage = usage, session = LiveSignals(question = question))
+    private fun session(
+        status: String,
+        question: String = "",
+        usage: UsageInfo? = null,
+        attention: com.xerktech.turma.model.Attention? = null,
+    ) = SessionInfo(id = status, status = status, usage = usage, session = LiveSignals(question = question), attention = attention)
 
     @Test fun `fleet tokens sum the persistent usage block per window`() {
         val a = agent("h1", usage = UsageInfo(today = bucket(10), week = bucket(20), totals = bucket(100)))
@@ -116,10 +120,13 @@ class FleetTest {
     }
 
     @Test fun `summary counts hosts, running, and waiting-on-you`() {
+        // XERK-1571: the tile counts the SAME set the Needs-you group lists — every
+        // running session the hub serves a needs-you:* attention for, not questions alone.
+        val needs = { state: String -> com.xerktech.turma.model.Attention(state = state, since = 1L) }
         val a = agent("h1", online = true, sessions = listOf(
-            session("running", question = "Which option?"),
+            session("running", question = "Which option?", attention = needs("needs-you:question")),
             session("running"),
-            session("stopped", question = "ignored — not running"),
+            session("stopped", question = "ignored — not running", attention = needs("needs-you:question")),
         ))
         val b = agent("h2", online = false)
         val s = fleetSummary(listOf(a, b))
@@ -127,7 +134,13 @@ class FleetTest {
         assertEquals(2, s.hostsTotal)
         assertEquals(2, s.running)
         assertEquals(3, s.totalSessions)
-        assertEquals(1, s.waiting) // only the running one with a question
+        assertEquals(1, s.waiting) // only the running one the hub says needs you
+        val b2 = agent("h3", online = true, sessions = listOf(
+            session("running", attention = needs("needs-you:review")),
+            session("running", attention = needs("needs-you:stalled")),
+            session("running", attention = needs("working")),
+        ))
+        assertEquals(3, fleetSummary(listOf(a, b2)).waiting)
     }
 
     @Test fun `max sessions sums the per-agent cap across the org's hosts`() {

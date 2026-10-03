@@ -158,6 +158,16 @@ class SessionsTest {
         assertEquals("⏳ waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
         val two = LiveSignals(agents = listOf(shell("wait-external"), shell("wait-timed")))
         assertEquals("⏳ waiting on 2 background shells", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, two, now))
+        // XERK-1571: no ETA, but a startedAt — how long it has been waiting, off the oldest row.
+        val started = LiveSignals(agents = listOf(
+            shell("wait-external", "Watch CI on PR #412").copy(startedAt = now - 12 * 60_000L)))
+        assertEquals("⏳ waiting · Watch CI on PR #412 · 12m",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, started, now))
+        val twoStarted = LiveSignals(agents = listOf(
+            shell("wait-external").copy(startedAt = now - 5 * 60_000L),
+            shell("wait-timed").copy(startedAt = now - 20 * 60_000L)))
+        assertEquals("⏳ waiting on 2 background shells · 20m",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, twoStarted, now))
         // A working card names only its WORK rows.
         val mixed = LiveSignals(agents = listOf(shell("work"), shell("wait-external")))
         assertEquals("1 background shell", com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, mixed, now))
@@ -208,10 +218,25 @@ class SessionsTest {
     @Test fun `attentionWhy says why and for how long`() {
         assertEquals("PR open · CI passing · waiting 12m",
             attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
-        assertEquals("Ship it? · waiting 3m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
-        assertEquals("waiting 3m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
+        // A question/permission already reads "waiting"; a stall says it stalled.
+        assertEquals("Ship it? · for 3m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("Bash: rm -rf build · for 3m",
+            attentionWhy(att("needs-you:permission", now - 3 * 60_000L, "Bash: rm -rf build"), now))
+        assertEquals("stalled 3m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
         assertEquals("", attentionWhy(att("working", now), now))
         assertEquals("", attentionWhy(null, now))
+    }
+
+    @Test fun `attentionLabel names a needs-you state, never idle`() {
+        assertEquals("review · PR open · CI passing", attentionLabel(att("needs-you:review", now, "PR open · CI passing")))
+        assertEquals("stalled · Watch CI", attentionLabel(att("needs-you:stalled", now, "Watch CI")))
+        assertEquals("waiting for your answer", attentionLabel(att("needs-you:question", now, "Ship it?")))
+        assertEquals("waiting for your answer", attentionLabel(att("needs-you:permission", now, "Bash: ls")))
+        assertEquals("review", attentionLabel(att("needs-you:review", now)))
+        assertEquals(null, attentionLabel(att("working", now)))
+        assertEquals(null, attentionLabel(null))
+        assertEquals(true, attentionStalled(att("needs-you:stalled", now)))
+        assertEquals(false, attentionStalled(att("needs-you:review", now)))
     }
 
     @Test fun `sortedBySince puts the oldest first and keeps since-less rows in place after them`() {

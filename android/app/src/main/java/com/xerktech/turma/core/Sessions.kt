@@ -168,16 +168,41 @@ fun <T> sortedBySince(rows: List<T>, attention: (T) -> Attention?): List<T> =
  * A review card's second line (XERK-1571, web sessions.html `attentionWhy`): WHY
  * the session is the operator's and how long it has waited. Unlike the web card,
  * the phone card carries no state label or quoted question, so the why is kept for
- * every needs-you state (the question text, the wait, the PR). "" when the hub
- * serves none.
+ * every needs-you state (the question text, the wait, the PR). The time reads
+ * "stalled 31m" on a stall, "for 22m" on a question/permission (no second
+ * "waiting"), else "waiting 12m". "" when the hub serves none.
  */
 fun attentionWhy(att: Attention?, now: Long): String {
     if (att == null || needsYouChip(att.state) == null) return ""
     val bits = ArrayList<String>()
     att.why?.takeIf { it.isNotBlank() }?.let { bits.add(it) }
-    att.since?.let { bits.add("waiting ${waitLeftText(now - it)}") }
+    att.since?.let {
+        val word = when (att.state) {
+            "needs-you:stalled" -> "stalled"
+            "needs-you:question", "needs-you:permission" -> "for"
+            else -> "waiting"
+        }
+        bits.add("$word ${waitLeftText(now - it)}")
+    }
     return bits.joinToString(" · ")
 }
+
+/**
+ * A fleet card's State row for a session the hub says needs the operator (XERK-1571,
+ * web index.html `attentionLabel`): "review · PR open · CI passing", "stalled ·
+ * Watch CI", "waiting for your answer". Null when it doesn't — the card then keeps
+ * its own live-state word. Used where that word would be "idle", so a session the
+ * Needs-you group lists never reads idle on its own card.
+ */
+fun attentionLabel(att: Attention?): String? {
+    if (att == null) return null
+    val chip = needsYouChip(att.state) ?: return null
+    if (chip == "question" || chip == "permission") return "waiting for your answer"
+    return listOf(chip, att.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
+}
+
+/** Does the hub say this session has STALLED on a background wait (XERK-1571)? */
+fun attentionStalled(att: Attention?): Boolean = att?.state == "needs-you:stalled"
 
 /**
  * Has this PR left the operator's plate? MERGED/CLOSED are the two end states;

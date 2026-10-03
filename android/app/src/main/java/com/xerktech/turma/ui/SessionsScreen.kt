@@ -1027,7 +1027,13 @@ private fun SessionListCard(
             // anything but — so it takes the accent one instead (web
             // `.dot.review`). A waiting card keeps its own stronger amber.
             val dotState = liveState(r.session, r.hostLastSeen, now)
-            if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
+            // A STALLED background wait takes the danger colour it has on every
+            // surface (XERK-1571, web `.dot.stalled`), never the review accent.
+            val stalled = dotState == com.xerktech.turma.core.LiveState.IDLE &&
+                com.xerktech.turma.core.sessionWait(r.session, r.hostLastSeen, now)?.stalled == true
+            if (stalled) {
+                StatusLight(com.xerktech.turma.ui.theme.TurmaColors.critical)
+            } else if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
                 StatusLight(com.xerktech.turma.ui.theme.TurmaColors.review)
             } else {
                 StateDot(dotState)
