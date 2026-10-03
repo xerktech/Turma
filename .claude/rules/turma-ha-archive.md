@@ -110,6 +110,8 @@ of-record**, so both halves of the ADR split now hold:
   back to the of-record; its files are append-only + authoritative and re-mirror on the next drain. A
   leader that has been writing thus hydrates to a near-no-op. Best-effort per key; a store blip
   leaves the local copy stale, not the hub down.
+- **A `.meta` follows its `.jsonl`'s decision, never its own size (XERK-1364)**: a same-size stale
+  sidecar kept beside a re-downloaded `.jsonl` handed reconcile a stale cursor and duplicated lines.
 - **ALL ingest stays CLOSED until the bucket LISTS (XERK-1048)** (`mirror.hydrated`).
   `hydrateArchiveOnce` holds `setHydrating(true)` across it (`hydrateUntilListed`: capped backoff,
   retried forever) and hands straight to the index hydrate. Opened over an unlisted tree with

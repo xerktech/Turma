@@ -179,11 +179,14 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
   - `ingestChunk` de-dups a chunk against the file when it is LARGER than the row's `archiveBytes`,
     or the id is in `unverifiedCursors`; suspect until a chunk carries a NEW entry, since a re-send
     from a stale cursor spans several chunks.
-  - While suspect, `archiveBytes` stays at its LAGGING value on row + sidecar: that mismatch is what
-    re-derives the suspicion after a restart (the Set is in memory). Never write the file size there.
+  - The suspicion is DURABLE as `cursorUnverified: true` in the sidecar (omitted when false, so a
+    healthy sidecar is unchanged); rebuild/reconcile/backfill re-add it to the in-memory Set. Don't
+    encode it in `archiveBytes` — rebuild, reconcile and heal-on-read all reset that to the file size.
   - Keys are a MULTISET (pr-link rows share an id); uuid'd entries key on uuid+role+ts, not text.
   - Entering suspicion re-seats the transcript's FTS/PG entries from the file (an orphan's held
     entries were never indexed).
+  - Hydrate fetches a `.meta` exactly when it fetches its `.jsonl` (`archive-mirror.js`): a sidecar's
+    SIZE says nothing about how current it is, so the size rule kept stale sidecars.
   - A sidecar's `bytesStored` is trusted only when its `archiveBytes` equals the file size
     (`reconcileHydratedCursors`, `rebuildIndex`, backfill): hydrate keeps a same-size STALE `.meta`
     beside a re-downloaded `.jsonl`. Neither sidecar nor row matches → lower cursor + suspect.

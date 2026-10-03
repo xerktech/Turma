@@ -216,16 +216,31 @@ class ArchiveMirror {
       const downloads = [];
       const listed = new Set();
       let pendingRaw = 0;
-      for (const item of listing) {
+      // A `.meta` sidecar follows its `.jsonl` (XERK-1364): its size says nothing
+      // about how current it is, so a size compare kept a same-size STALE sidecar
+      // beside a re-downloaded `.jsonl` — and its cursor duplicated the re-send.
+      // Rendered `.jsonl` keys are classified first so the sidecars can follow.
+      const isMeta = (k) => String(k).endsWith(".jsonl.meta") && !rawRootOf(k);
+      const ordered = listing.filter((it) => !isMeta(it && it.key))
+        .concat(listing.filter((it) => isMeta(it && it.key)));
+      const fetchedJsonl = new Set();
+      const listedKeys = new Set(listing.map((it) => it && it.key));
+      for (const item of ordered) {
         const key = item && item.key;
         const dest = this.pathFor(key);
         if (!dest || !Number.isFinite(item.size)) continue;
         listed.add(key);
         let localSize = -1;
         try { localSize = fs.statSync(dest).size; } catch { localSize = -1; }
+        const jsonlKey = isMeta(key) ? key.slice(0, -".meta".length) : null;
         // Skip when local is same-size OR larger (ahead of the bucket) — only a
         // missing/partial (smaller) local is (re)fetched. Never truncate a leader.
-        if (localSize >= item.size) { this._blocked.delete(key); continue; }
+        // A sidecar instead goes with its `.jsonl`'s decision when that is listed.
+        const fetch = jsonlKey && listedKeys.has(jsonlKey)
+          ? localSize < 0 || fetchedJsonl.has(jsonlKey)
+          : localSize < item.size;
+        if (!fetch) { this._blocked.delete(key); continue; }
+        if (!isMeta(key) && !rawRootOf(key)) fetchedJsonl.add(key);
         const root = rawRootOf(key);
         if (root) {
           // Raw layer: recorded, not downloaded (see the header). `have` is the

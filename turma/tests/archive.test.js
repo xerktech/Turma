@@ -1702,6 +1702,38 @@ test("XERK-1364: a rebuild from a stale sidecar de-duplicates the agent's re-sen
   assert.equal(archive.getTranscript(id).entries.length, 2);
 });
 
+test("XERK-1364: identical held entries are consumed once each, not as a set", () => {
+  const id = "t-1364-multi";
+  const m = { ...META, summary: "Multiset" };
+  const same = () => ({ uuid: null, role: "assistant", ts: null, text: "ok" });
+  archive.ingestChunk("nas", id, m, 0, 10, [same()]);
+  const jsonl = path.join(process.env.ARCHIVE_DIR, archive.archiveRelPath(id, { ...m, host: "nas" }));
+  fs.rmSync(jsonl + ".meta");
+  archive.rebuildIndex();
+  // Re-sent from 0: the first "ok" is the held one, the second is new.
+  archive.ingestChunk("nas", id, m, 0, 20, [same(), same()]);
+  assert.equal(fs.readFileSync(jsonl, "utf8").trim().split("\n").length, 2);
+});
+
+test("XERK-1364: a stale-sidecar re-send survives a read (heal-on-read) and a restart", () => {
+  const id = "t-1364-heal";
+  const m = { ...META, summary: "Heal then restart" };
+  const a = [ent("h1", "user", "a"), ent("h2", "assistant", "b")];
+  archive.ingestChunk("nas", id, m, 0, 10, a);
+  const jsonl = path.join(process.env.ARCHIVE_DIR, archive.archiveRelPath(id, { ...m, host: "nas" }));
+  const stale = fs.readFileSync(jsonl + ".meta");
+  archive.ingestChunk("nas", id, m, 10, 20, [ent("h3", "user", "c")]);
+  archive.ingestChunk("nas", id, m, 20, 30, [ent("h4", "assistant", "d")]);
+  fs.writeFileSync(jsonl + ".meta", stale);
+  archive.rebuildIndex();
+  archive.ingestChunk("nas", id, m, 10, 20, [ent("h3", "user", "c")]); // held
+  archive.getTranscript(id);                                          // heal-on-read
+  archive.rebuildIndex();                                             // a restart's rebuild
+  archive.ingestChunk("nas", id, m, 20, 30, [ent("h4", "assistant", "d")]); // held
+  const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+  assert.deepEqual(uuids, ["h1", "h2", "h3", "h4"]);
+});
+
 // Last in the file: it reloads the module to simulate a hub restart.
 test("XERK-1364: a restart mid-re-send stays de-duplicated; held entries stay searchable", async () => {
   const id = "t-1364-restart";

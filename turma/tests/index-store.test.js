@@ -985,3 +985,38 @@ test("XERK-1364 pg mode: backfill from a stale sidecar de-dups; a repeated key i
     assert.equal(mem.entries.get("t-bf").size, 4);
   } finally { pgTeardown(); }
 });
+
+test("XERK-1364 pg mode: a handover mid-re-send keeps de-duplicating", async () => {
+  const mem = pgSetup();
+  const handover = async () => {
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+  };
+  try {
+    const sz = (l) => Buffer.byteLength(JSON.stringify(l));
+    const a = [ent("g0", "user", "a"), ent("g1", "assistant", "b")];
+    const c = [ent("g2", "user", "c")];
+    const d = [ent("g3", "assistant", "d")];
+    archive.ingestChunk("nas", "t-ho", META, 0, sz(a), a, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-ho").filePath);
+    const staleMeta = fs.readFileSync(jsonl + ".meta");
+    const pgStale = { ...mem.sessions.get("t-ho") };
+    archive.ingestChunk("nas", "t-ho", META, sz(a), sz(a) + sz(c), c, "acme");
+    archive.ingestChunk("nas", "t-ho", META, sz(a) + sz(c), sz(a) + sz(c) + sz(d), d, "acme");
+    fs.writeFileSync(jsonl + ".meta", staleMeta);
+    mem.sessions.set("t-ho", pgStale);
+    await handover();
+    const have = archive.manifestCursors("nas", [{ transcriptId: "t-ho" }], "acme")["t-ho"];
+    assert.equal(have, sz(a));
+    archive.ingestChunk("nas", "t-ho", META, have, have + sz(c), c, "acme");  // held
+    await handover();                                                         // mid-re-send
+    const h2 = archive.manifestCursors("nas", [{ transcriptId: "t-ho" }], "acme")["t-ho"];
+    archive.ingestChunk("nas", "t-ho", META, h2, h2 + sz(d), d, "acme");      // held
+    const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+    assert.deepEqual(uuids, ["g0", "g1", "g2", "g3"]);
+    assert.equal(mem.entries.get("t-ho").size, 4);
+  } finally { pgTeardown(); }
+});

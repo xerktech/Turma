@@ -1357,16 +1357,12 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     list = fresh;
     prevCount = held.entries.length;
     // Still suspect until a chunk carries something new: the agent re-sends in
-    // order, so the first new entry means it has caught up with the file. While
-    // suspect, archiveBytes keeps its lagging value on the row and the sidecar,
-    // so a restart mid-re-send re-derives the suspicion (rebuildIndex/reconcile
-    // compare it with the file) instead of trusting a cursor still behind it.
-    if (fresh.length) {
-      unverifiedCursors.delete(transcriptId);
-      archiveBytes = fileSize;
-    } else {
-      unverifiedCursors.add(transcriptId);
-    }
+    // order, so the first new entry means it has caught up with the file. The
+    // sidecar carries the suspicion (`cursorUnverified`) so a restart or handover
+    // mid-re-send re-derives it — every other figure now matches the file.
+    if (fresh.length) unverifiedCursors.delete(transcriptId);
+    else unverifiedCursors.add(transcriptId);
+    archiveBytes = fileSize;
   }
 
   // pg mode keeps NO local entries index — the entry text lives only in Postgres
@@ -1461,6 +1457,8 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     createdAt: meta.createdAt || null, endedTs: meta.endedTs || null,
     summary: meta.summary || null, msgCount, bytesStored, archiveBytes,
     updatedAt: nowIso,
+    // Only while suspect, so a healthy sidecar is byte-identical to before.
+    ...(unverifiedCursors.has(transcriptId) ? { cursorUnverified: true } : {}),
   });
 
   // Mirror the durable index write to the Postgres of-record (XERK-780, no-op off
@@ -2388,7 +2386,7 @@ function rebuildIndex() {
     const rawBytes = rawLayerBytes(jsonl + RAW_DIR_SUFFIX);
     // The sidecar's bytesStored is the cursor, and it only describes this file
     // when its archiveBytes is the file's size (XERK-1364): else de-dup the re-send.
-    if (meta.archiveBytes !== archiveBytes) unverifiedCursors.add(transcriptId);
+    if (meta.cursorUnverified || meta.archiveBytes !== archiveBytes) unverifiedCursors.add(transcriptId);
     else unverifiedCursors.delete(transcriptId);
     tx(() => {
       let msgCount = 0;
@@ -2543,6 +2541,7 @@ function reconcileHydratedCursors() {
     // unproven ones — and have ingest de-duplicate whatever the re-send overlaps.
     const scBytes = sc && Number.isFinite(sc.bytesStored) ? sc.bytesStored : null;
     let bytesStored;
+    if (sc && sc.cursorUnverified) unverifiedCursors.add(row.transcriptId);
     if (scBytes != null && sc.archiveBytes === fileSize) bytesStored = scBytes;
     else if (row.archiveBytes === fileSize) bytesStored = row.bytesStored || 0;
     else {
@@ -2712,7 +2711,7 @@ function backfillPgIndexFromFiles() {
     const rawBytes = rawLayerBytes(jsonl + RAW_DIR_SUFFIX);
     // The sidecar's bytesStored is the cursor, and it only describes this file
     // when its archiveBytes is the file's size (XERK-1364): else de-dup the re-send.
-    if (meta.archiveBytes !== archiveBytes) unverifiedCursors.add(transcriptId);
+    if (meta.cursorUnverified || meta.archiveBytes !== archiveBytes) unverifiedCursors.add(transcriptId);
     else unverifiedCursors.delete(transcriptId);
     const entries = [];
     for (const line of raw.split("\n")) {
