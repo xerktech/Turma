@@ -80,3 +80,12 @@ test("the restored localModel block is normalized and preserved", () => {
   assert.ok(lm && lm.available === true, "localModel.available survived the restore normalize");
   assert.ok(Array.isArray(lm.models) && lm.models.length === 2, "the discovered models list survived");
 });
+
+test("a registry restored from state.json stays null-prototype", () => {
+  // Booting from state.json is the production path once a hub has flushed. A
+  // plain-object restore re-opened `/api/agents/__proto__/restart` writing
+  // commands onto Object.prototype, inherited by every new host.
+  assert.equal(Object.getPrototypeOf(hub.agents), null);
+  assert.equal(hub.agents.__proto__, undefined);
+  assert.equal(hub.agents.toString, undefined);
+});

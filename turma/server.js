@@ -1381,7 +1381,12 @@ const SPEND_SEEN_MAX = positiveEnv("SPEND_SEEN_MAX", 200);
 
 // Keyed by the host name (`device`), value = last heartbeat payload +
 // bookkeeping. One container per host, so the host name is the stable identity.
-let agents = {};
+// NULL-PROTOTYPE, and every assignment below keeps it so: dozens of routes look a
+// host up as `agents[decodeURIComponent(parts[2])]`, and on a plain object
+// `__proto__`/`constructor`/`toString` resolve to built-ins — `/api/agents/
+// __proto__/restart` queued its command onto Object.prototype.commands, which
+// every host registering afterwards inherited and re-ran on every beat.
+let agents = Object.create(null);
 
 // ---- the registry's own ceiling (XERK-272) ---------------------------------
 //
@@ -1967,7 +1972,7 @@ if (!HA_ON) try {
       : Array.isArray(loaded) ? "an array" : typeof loaded;
     throw new Error(`state file is ${shape}, not an object`);
   }
-  agents = loaded;
+  agents = Object.assign(Object.create(null), loaded);
   // Records written before a coercion existed — and any host that is OFFLINE,
   // so no beat will ever rewrite its record — carry whatever shape was current
   // when they were saved. Normalize what we LOAD, not just what arrives: the
@@ -2030,7 +2035,7 @@ if (!HA_ON) try {
   // operator has to be told about, and which leaves a partially-built registry
   // behind unless it is cleared.
   if (!e || e.code !== "ENOENT") {
-    agents = {};
+    agents = Object.create(null);
     console.error(`state restore skipped: ${(e && e.message) || e}`);
   }
 }

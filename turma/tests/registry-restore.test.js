@@ -428,3 +428,7 @@ test("every field the restore coerces is reachable from the restore's own line",
     { maxSessions: 4, running: 1, queued: 0, free: 3, rootRunning: false });
   assert.equal(out.soloKept.uploadMaxBytes, 5_000_000);
 });
+
+test("a refused restore resets to a null-prototype registry", () => {
+  assert.equal(Object.getPrototypeOf(hub.agents), null);
+});
