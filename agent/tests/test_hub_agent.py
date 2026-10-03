@@ -3182,6 +3182,40 @@ class TestHookQuestion(unittest.TestCase):
         self.assertEqual(len(hq["question"]), 300)
         self.assertEqual(hq["labels"], ["L" * 80])
 
+    # XERK-1562: the questions dir is SESSION-writable, and _hook_question runs
+    # on the heartbeat. A plain open() of a planted FIFO blocks forever.
+
+    def _call_bounded(self, fn, *args):
+        """Run fn on a thread and fail if it does not return inside a beat."""
+        out = []
+        t = threading.Thread(target=lambda: out.append(fn(*args)), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "blocked on the req file")
+        return out[0]
+
+    def test_a_fifo_at_the_req_path_returns_none_instead_of_blocking(self):
+        os.mkfifo(os.path.join(self.tmp, "s.req.json"))
+        self.assertIsNone(self._call_bounded(ha._hook_question, "s"))
+
+    def test_a_symlink_out_of_the_questions_dir_is_refused(self):
+        outside = tempfile.mkdtemp(prefix="hub-agent-hookq-out-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        target = os.path.join(outside, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"question": "Planted?", "options": [{"label": "A"}]}, f)
+        os.symlink(target, os.path.join(self.tmp, "s.req.json"))
+        self.assertIsNone(ha._hook_question("s"))
+
+    def test_an_oversize_req_file_is_refused(self):
+        # A COMPLETE object then padding: an uncapped read parses it fine, so
+        # only the size ceiling can make this read as "no question".
+        with open(os.path.join(self.tmp, "s.req.json"), "w") as f:
+            f.write(json.dumps({"question": "Big?"}) + " " * 5000)
+        with mock.patch.object(ha, "QUESTION_REQ_MAX_BYTES", 1000):
+            self.assertIsNone(ha._hook_question("s"))
+        self.assertEqual(ha._hook_question("s")["question"], "Big?")
+
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
     def test_missing_file(self):
@@ -5968,6 +6002,37 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
         self.assertEqual([o["label"] for o in req["options"]], ["Approve", "Reject"])
         self.assertTrue(req["question"])           # a non-empty synthesized prompt
         self.assertEqual(req["header"], "Bash")
+
+    def test_a_fifo_at_the_dsh_req_path_reads_as_nothing_pending(self):
+        # XERK-1562: _dsh_pending_request_id runs on the beat via
+        # _refresh_dsh_questions; a planted FIFO must not wedge it.
+        sm, sess, ctl = self._dsh_session()
+        req_path, _ = sm._question_paths("dsh1")
+        os.mkfifo(req_path)
+        out = []
+        t = threading.Thread(target=lambda: (
+            sm._refresh_dsh_questions(),
+            out.append(sm._dsh_pending_request_id("dsh1"))), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "blocked on the dsh req file")
+        self.assertEqual(out, [None])
+
+    def test_a_symlinked_or_oversize_dsh_req_is_refused(self):
+        sm, sess, ctl = self._dsh_session()
+        req_path, _ = sm._question_paths("dsh1")
+        target = os.path.join(self.tmp, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"question": "Q", "_dshRequestId": "req-x"}, f)
+        os.symlink(target, req_path)
+        self.assertIsNone(sm._dsh_pending_request_id("dsh1"))
+        os.remove(req_path)
+        with open(req_path, "w") as f:
+            f.write(json.dumps({"question": "Q", "_dshRequestId": "req-x"})
+                    + " " * 5000)
+        with mock.patch.object(ha, "QUESTION_REQ_MAX_BYTES", 1000):
+            self.assertIsNone(sm._dsh_pending_request_id("dsh1"))
+        self.assertEqual(sm._dsh_pending_request_id("dsh1"), "req-x")
 
     def test_interaction_end_clears_matching_request(self):
         sm, sess, ctl = self._dsh_session()
@@ -32347,6 +32412,40 @@ class TestParseTicketTriage(unittest.TestCase):
     def test_reason_is_capped(self):
         out = self._parse(self._raw(reason="x" * 400))
         self.assertEqual(len(out["ENG-1"]["reason"]), ha.JIRA_TRIAGE_REASON_MAX)
+
+    def test_a_rollup_verdict_parses_as_not_actionable(self):
+        # XERK-1568: the classifier's answer for a rollup ticket is an ordinary
+        # actionable:false assessment — no new field, nothing the hub must learn.
+        out = self._parse(self._raw(actionable=False, type="other",
+                                    reason="rollup list, not work"))
+        self.assertIs(out["ENG-1"]["actionable"], False)
+
+
+class TestTicketTriagePrompt(unittest.TestCase):
+    """XERK-1568: a rollup ticket (`[Rollup] <repo>: low-severity findings`,
+    labelled `rollup`) is a findings list, never work. The hub gates it out of the
+    auto stream on its own; the classifier marks it not actionable too (belt and
+    braces), so the instruction must say so and the ticket line must carry what
+    it keys on."""
+
+    def test_the_instruction_marks_a_rollup_ticket_not_actionable(self):
+        text = ha.TICKET_TRIAGE_INSTRUCTION
+        self.assertIn("[Rollup]", text)
+        self.assertIn("labelled 'rollup'", text)
+        self.assertRegex(text, r"ROLLUP ticket[^\n]*\n?[^\n]*actionable is always false")
+
+    def test_the_prompt_carries_the_rule_and_the_rollup_markers(self):
+        t = {"key": "ENG-7", "summary": "[Rollup] Turma: low-severity findings",
+             "labels": ["rollup", "Turma"]}
+        prompt = ha._ticket_triage_prompt([t], [t])
+        self.assertTrue(prompt.startswith(ha.TICKET_TRIAGE_INSTRUCTION))
+        self.assertIn("- ENG-7: [Rollup] Turma: low-severity findings", prompt)
+        self.assertIn("(labels: rollup, Turma)", prompt)
+
+    def test_adding_the_rollup_label_re_triages(self):
+        before = {"key": "ENG-7", "summary": "Findings", "labels": ["Turma"]}
+        after = dict(before, labels=["Turma", "rollup"])
+        self.assertNotEqual(ha._ticket_fingerprint(before), ha._ticket_fingerprint(after))
 
 
 class TestTicketTriage(ManagerMixin, unittest.TestCase):

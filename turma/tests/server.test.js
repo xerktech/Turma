@@ -200,7 +200,7 @@ const {
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
   epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, buildEpicWaves, epicChildRows,
-  isEpicOrEpicChild, sanitizeEpicRunRecord,
+  isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord,
   epicBuilders, armEpicBuilder, clearEpicBuilder, advanceEpicBuilder,
   ingestEpicBuilderStatus, epicBuilderDriveSweep, sanitizeEpicBuilderRecord,
   normalizeEpicBuilderStatus, EPIC_BUILDER_STATES, EPIC_BUILDER_IDEA_MAX,
@@ -9693,31 +9693,40 @@ test("XERK-487: an ignore-tier repo's tickets never enter the auto stream", asyn
   assert.deepEqual((agents.rtIgnore.commands || []).map((c) => c.issueKey), ["ENG-7"]);
 });
 
-test("XERK-487: two same-priority tickets take the auto slots in tier order", async () => {
+test("XERK-487: same-age, same-priority tickets take the auto slots in tier order", async () => {
   resetAutoStart();
   resetRepoTiers();
-  // One host, no free slots, three eligible To Do tickets in three repos. All
-  // three share the same triage band and type, so the tier tiebreak is what
-  // decides. The board order deliberately runs LOW→HIGH, so a pass that honors
-  // tier must reorder it high→low.
+  // One host, no free slots, eligible To Do tickets in three repos. Three share
+  // the same band, type AND creation time, so the tier tiebreak is what decides
+  // among them. The board order deliberately runs LOW→HIGH, so a pass that
+  // honors tier must reorder it high→low. XERK-1567: tier is only a TIEBREAK
+  // below age — an OLDER archive-tier ticket still leads them all.
   const triage = { priority: "P2", type: "task", actionable: true };
+  const created = "2026-05-01T09:00:00.000+0000";
   await asBeat("rtOrder", "rt2.atlassian.net", { capacity: FULL,
     repos: ["Live", "Arch", "Mystery"],
     tickets: [
-      { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true }, triage },
-      { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Mystery", cloned: true }, triage },
-      { key: "ENG-3", statusCategory: "todo", repoGuess: { repo: "Live", cloned: true }, triage },
+      { key: "ENG-1", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true },
+        triage, created },
+      { key: "ENG-2", statusCategory: "todo", repoGuess: { repo: "Mystery", cloned: true },
+        triage, created },
+      { key: "ENG-3", statusCategory: "todo", repoGuess: { repo: "Live", cloned: true },
+        triage, created },
+      { key: "ENG-4", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true },
+        triage, created: "2026-04-01T09:00:00.000+0000" },
     ] });
   setRepoTier("Live", "live");
   setRepoTier("Arch", "archive");            // "Mystery" stays unset -> active
-  autoStartRound();                          // host is full, so all three queue
-  // live > default(active) > archive — and the unset repo still routes, in the
-  // middle.
-  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-3", "ENG-2", "ENG-1"]);
-  // So when the single slot frees, the live-tier ticket is the one dispatched.
+  autoStartRound();                          // host is full, so all four queue
+  // Oldest first; then live > default(active) > archive among the same-age
+  // three — and the unset repo still routes, in the middle.
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-4", "ENG-3", "ENG-2", "ENG-1"]);
+  // So when a slot frees, the oldest ticket is the one dispatched, the
+  // live-tier one next.
   agents.rtOrder.capacity = { ...ROOMY };
   drainTicketQueue();
-  assert.deepEqual((agents.rtOrder.commands || []).map((c) => c.issueKey), ["ENG-3"]);
+  drainTicketQueue();
+  assert.deepEqual((agents.rtOrder.commands || []).map((c) => c.issueKey), ["ENG-4", "ENG-3"]);
 });
 
 test("XERK-487: a repo retiered to ignore while its ticket waits drops from the queue", async () => {
@@ -9818,46 +9827,92 @@ test("XERK-485: untriaged, non-actionable and duplicate tickets render but are n
   ticketQueue.length = 0;
 });
 
-test("XERK-485: the auto stream orders by triage band, type, repo tier — then FIFO", async () => {
+test("XERK-485: the auto stream orders P0, then oldest created, type, repo tier — then FIFO", async () => {
   resetAutoStart();
   resetRepoTiers();
   const site = "x485o.atlassian.net";
-  // Board order deliberately runs LOW -> HIGH priority: a sweep that honoured
-  // board order would queue chores ahead of the P0, exactly as before.
+  // XERK-1567: board order deliberately runs NEWEST-touched first (the agent's
+  // `updated DESC` query) — the order that let the newest ticket win every tie.
+  // Jira stamps `+0000`, ADO stamps `Z`; the 04-01 group mixes both formats at
+  // the SAME instant, so it only ties if both parse.
   const tri = (o) => Object.assign({ priority: "P2", type: "task", actionable: true }, o);
   await asBeat("oOrder", site, { capacity: FULL, repos: ["Turma", "Live", "Arch"],
     tickets: [
-      { key: "O-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
-        triage: tri({ priority: "P3", type: "chore" }) },
-      { key: "O-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
-        triage: tri({ priority: "P1", type: "feature" }) },
-      { key: "O-5", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
-        triage: tri({ priority: "P1", type: "bug" }) },
-      { key: "O-7", statusCategory: "todo", repoGuess: { repo: "Live", cloned: true },
-        triage: tri({}) },
-      { key: "O-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
-        triage: tri({}) },
-      { key: "O-6", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
-        triage: tri({}) },
-      { key: "O-8", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true },
-        triage: tri({}) },
       { key: "O-4", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
-        triage: tri({ priority: "P0", type: "bug" }) },
+        created: "2026-09-01T00:00:00.000+0000", triage: tri({ priority: "P0", type: "bug" }) },
+      { key: "O-3", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        created: "2026-03-01T00:00:00Z", triage: tri({ priority: "P1", type: "feature" }) },
+      { key: "O-5", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        created: "2026-03-01T00:00:00.000+0000", triage: tri({ priority: "P1", type: "bug" }) },
+      { key: "O-8", statusCategory: "todo", repoGuess: { repo: "Arch", cloned: true },
+        created: "2026-04-01T00:00:00Z", triage: tri({}) },
+      { key: "O-2", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        created: "2026-04-01T00:00:00.000+0000", triage: tri({}) },
+      { key: "O-6", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        created: "2026-04-01T00:00:00Z", triage: tri({}) },
+      { key: "O-7", statusCategory: "todo", repoGuess: { repo: "Live", cloned: true },
+        created: "2026-04-01T00:00:00.000+0000", triage: tri({}) },
+      { key: "O-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+        created: "2026-01-01T00:00:00.000+0000", triage: tri({ priority: "P3", type: "chore" }) },
     ] });
   setRepoTier("Live", "live");
   setRepoTier("Arch", "archive");           // "Turma" stays default (active)
   autoStartSweep();
-  // band -> type -> tier -> FIFO: the P0 leads; in P1 the bug beats the
-  // feature; in P2 the live-tier ticket leads, O-2 precedes its identical-key
-  // twin O-6 only because the board listed it first, and the archive-tier
-  // ticket trails.
+  // P0 -> oldest created -> type -> tier -> board order: the newest P0 still
+  // leads; the oldest ticket (a P3 chore) is next; the two same-day P1s split
+  // on type (bug beats feature); in the same-instant 04-01 group the live-tier
+  // ticket leads, O-2 precedes its identical-key twin O-6 only because the
+  // board listed it first, and the archive-tier ticket trails.
   assert.deepEqual(ticketQueue.map((e) => e.issueKey),
-    ["O-4", "O-5", "O-3", "O-7", "O-2", "O-6", "O-8", "O-1"]);
+    ["O-4", "O-1", "O-5", "O-3", "O-7", "O-2", "O-6", "O-8"]);
   // So when the single slot frees, the P0 bug is the one that goes out.
   agents.oOrder.capacity = { ...ROOMY };
   drainTicketQueue();
   assert.deepEqual((agents.oOrder.commands || []).map((c) => c.issueKey), ["O-4"]);
   resetRepoTiers();
+});
+
+test("XERK-1567: an older P2 beats a newer P1, a P0 beats both, no-created keeps board order", async () => {
+  resetAutoStart();
+  resetRepoTiers();
+  const site = "x1567.atlassian.net";
+  const tri = (priority) => ({ priority, type: "task", actionable: true });
+  const row = (key, priority, created) => ({ key, statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, triage: tri(priority),
+    ...(created ? { created } : {}) });
+  // Board order is newest-touched first (the agent's `updated DESC` query).
+  await asBeat("fifo1567", site, { capacity: FULL, tickets: [
+    row("F-5", "P1"),                                        // no created
+    row("F-1", "P1", "2026-09-20T08:00:00.000+0000"),        // newer P1 (Jira)
+    row("F-4", "P2"),                                        // no created
+    row("F-2", "P2", "2026-02-03T08:00:00Z"),                // older P2 (ADO)
+    row("F-3", "P0", "2026-09-30T08:00:00.000+0000"),        // newest, P0
+  ] });
+  autoStartSweep();
+  // P0 first; then oldest created (the P2 beats the P1); the two without
+  // `created` sort last and keep their board order between themselves.
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["F-3", "F-2", "F-1", "F-5", "F-4"]);
+  // The DRAIN orders by the same key, not by enqueue time: reverse the line and
+  // its `at` stamps so FIFO alone would dispatch the no-created tickets first.
+  ticketQueue.reverse();
+  const base = Date.now() - 60000;
+  ticketQueue.forEach((e, i) => { e.at = base + i; });
+  agents.fifo1567.capacity = { ...ROOMY };
+  drainTicketQueue();
+  drainTicketQueue();
+  assert.deepEqual((agents.fifo1567.commands || []).map((c) => c.issueKey), ["F-3", "F-2"]);
+  // The key itself: Jira's `+0000` and ADO's `Z` parse to the same instant;
+  // absent, non-string and unparseable `created` all sort last (Infinity).
+  const ms = Date.UTC(2026, 1, 3, 8, 0, 0);
+  assert.equal(triageSortKey({ created: "2026-02-03T08:00:00.000+0000" }, null)[1], ms);
+  assert.equal(triageSortKey({ created: "2026-02-03T08:00:00Z" }, null)[1], ms);
+  for (const created of [undefined, 1767225600000, "not a date", null]) {
+    assert.equal(triageSortKey({ created }, null)[1], Infinity, String(created));
+  }
+  assert.equal(triageSortKey({ triage: { priority: "P0" } }, null)[0], 0);
+  assert.equal(triageSortKey({ triage: { priority: "P1" } }, null)[0], 1);
+  assert.equal(triageSortKey(null, null)[0], 1);
+  ticketQueue.length = 0;
 });
 
 test("XERK-485: a P0 breaks through the org's auto share, bounded only by the fleet cap", async () => {
@@ -12321,7 +12376,17 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
     { key: "CHORE-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: "chore", actionable: true } },
     { key: "RAW-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    // XERK-1568: rollup tickets (by label, and by `[Rollup]` summary prefix — the
+    // latter operator-APPROVED, which must not force it in) gate out of both.
+    { key: "ROLL-1", statusCategory: "todo", labels: ["Turma", "rollup"],
+      summary: "Findings", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "bug", actionable: true } },
+    { key: "ROLL-2", statusCategory: "todo",
+      summary: "[Rollup] Turma: low-severity findings",
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "bug", actionable: true } },
   ];
+  setTicketTriageAction("xcheck.atlassian.net", "ROLL-2", "approve");
   await asBeat("xc", "xcheck.atlassian.net", { autoStart: true, tickets });
   setAutoMergeOrg("xcheck.atlassian.net", true);
   autoStartRound();
@@ -12336,6 +12401,11 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
   }
   // The eligible bug is the only one that both queued and gates clean.
   assert.equal(autoStartContentGate("xcheck.atlassian.net", rows.get("BUG-1"), "Turma"), null);
+  assert.deepEqual([...queued], ["BUG-1"]);
+  for (const key of ["ROLL-1", "ROLL-2"]) {
+    assert.equal(autoStartContentGate("xcheck.atlassian.net", rows.get(key), "Turma").kind,
+      "rollup", key);
+  }
   resetAutoStart();
   delete triagePolicies["xcheck.atlassian.net"];
 });
@@ -12465,6 +12535,77 @@ test("XERK-635: the content gate rejects an epic/child and agrees with the sweep
   // A plain ticket still gates clean.
   assert.equal(autoStartContentGate("ep1.atlassian.net",
     { key: "W-1", triage: { type: "task", actionable: true } }, "Turma"), null);
+  // XERK-1568: a rollup ticket is rejected by the same gate, by either marker.
+  const tri = { type: "task", actionable: true };
+  assert.equal(autoStartContentGate("ep1.atlassian.net",
+    { key: "R-1", labels: ["rollup"], triage: tri }, "Turma").kind, "rollup");
+  assert.equal(autoStartContentGate("ep1.atlassian.net",
+    { key: "R-2", summary: "[Rollup] Turma: low-severity findings", triage: tri }, "Turma").kind,
+    "rollup");
+});
+
+// ---- rollup tickets never auto-start or auto-merge (XERK-1568) ---------------
+
+test("XERK-1568: isRollupTicket keys on the `rollup` label OR a `[Rollup]` summary prefix", () => {
+  assert.equal(isRollupTicket({ key: "R-1", labels: ["Turma", "rollup"] }), true);
+  assert.equal(isRollupTicket({ key: "R-1", labels: ["Rollup"] }), true);
+  assert.equal(isRollupTicket({ key: "R-2", summary: "[Rollup] Turma: low-severity findings" }), true);
+  assert.equal(isRollupTicket({ key: "R-2", summary: "  [rollup] x" }), true);
+  assert.equal(isRollupTicket({ key: "W-1", labels: ["rollups", "roll-up"], summary: "Fix it" }), false);
+  assert.equal(isRollupTicket({ key: "W-1", summary: "Track the [Rollup] ticket" }), false);
+  assert.equal(isRollupTicket({ key: "W-1" }), false);
+  assert.equal(isRollupTicket(null), false);
+});
+
+test("XERK-1568: the auto-start sweep never queues a rollup ticket, by label or summary", async () => {
+  resetAutoStart();
+  const triage = { priority: "P2", type: "task", actionable: true };
+  const row = (key, extra) => ({ key, summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, triage, ...extra });
+  // A FULL host, so whatever the sweep admits stays visible in the hub queue
+  // (the drain's own rollup drop can't mask a sweep that let one through).
+  await asBeat("rollS", "roll0.atlassian.net", { capacity: FULL, tickets: [
+    row("ENG-1"),
+    row("ENG-2", { labels: ["rollup"] }),
+    row("ENG-3", { summary: "[Rollup] Turma: low-severity findings" }),
+  ] });
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-1"]);
+  resetAutoStart();
+});
+
+test("XERK-1568: an auto entry whose ticket became a rollup while it waited drops from the queue", async () => {
+  resetAutoStart();
+  const site = "roll1.atlassian.net";
+  const triage = { priority: "P2", type: "task", actionable: true };
+  await asBeat("rollQ", site, { capacity: FULL,
+    tickets: [{ key: "ENG-7", summary: "Fix it", statusCategory: "todo",
+      repoGuess: { repo: "Turma", cloned: true }, triage }] });
+  autoStartRound();                          // queues (host full, ticket eligible)
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-7"]);
+  // The ticket is labelled `rollup` mid-wait, and a slot frees in the same beat.
+  await asBeat("rollQ", site, { capacity: ROOMY,
+    tickets: [{ key: "ENG-7", summary: "Fix it", statusCategory: "todo", labels: ["rollup"],
+      repoGuess: { repo: "Turma", cloned: true }, triage }] });
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 0, "the auto entry drops, no session");
+  assert.equal((agents.rollQ.commands || []).filter((c) => c.type === "spawnTicket").length, 0);
+  resetAutoStart();
+});
+
+test("XERK-1568: a manual Start on a rollup ticket is not gated (deliberate intent)", async () => {
+  resetAutoStart();
+  await asBeat("rollM", "roll2.atlassian.net", { autoStart: false,
+    tickets: [{ key: "ENG-8", summary: "[Rollup] Turma: low-severity findings",
+      statusCategory: "todo", labels: ["rollup"],
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } }] });
+  const r = await request("POST", "/api/jira/roll2.atlassian.net/ENG-8/session",
+    { headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual((agents.rollM.commands || []).filter((c) => c.type === "spawnTicket")
+    .map((c) => c.issueKey), ["ENG-8"]);
+  resetAutoStart();
 });
 
 test("XERK-635: POST .../epic-run arms a durable run whose DAG matches the blocks-links", async () => {
@@ -13460,6 +13601,44 @@ test("XERK-636: the run advances to done once every child is Done, and drives no
   assert.equal(epicRuns["ed7.atlassian.net/E-1"].state, "done");
   ticketQueue.length = 0;
   resetEpicRuns();
+});
+
+test("XERK-1568: an armed epic run never starts, merges or messages a rollup child", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  resetEpicD();
+  const site = "roll3.atlassian.net";
+  // C-1 is a rollup (labelled) child with no blockers: without the gate it is the
+  // one ready child the driver would dispatch.
+  const tickets = driveTickets().map((t) => (t.key === "C-1"
+    ? { ...t, labels: ["rollup"], summary: "[Rollup] Turma: low-severity findings" } : t));
+  await asBeat("rollE", site, { autoStart: false,
+    capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 }, tickets });
+  armEpicRun(site, "E-1");
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("rollE"), [], "a rollup child is never started by the run");
+  // A session already on the rollup child (started by hand) is not merged or
+  // messaged by the run's hands-off sweeps.
+  const url = "https://github.com/roll/e1/pull/1";
+  await asBeat("rollE", site, { autoStart: false,
+    capacity: { maxSessions: 6, running: 1, queued: 0, free: 4 },
+    tickets: tickets.map((t) => (t.key === "C-1" ? { ...t, statusCategory: "inprogress" } : t)),
+    sessions: [dChildSession("s-r1", "C-1", site, "OPEN", url)] });
+  autoMergeSweep();
+  assert.equal((agents.rollE.commands || []).filter((c) => c.type === "mergePr").length, 0,
+    `a rollup child's PR is never merged, got ${JSON.stringify(dCmds("rollE"))}`);
+  // Once that PR merges, the run's auto-close sweep never messages the rollup
+  // session to self-close either.
+  await asBeat("rollE", site, { autoStart: false,
+    capacity: { maxSessions: 6, running: 1, queued: 0, free: 4 },
+    tickets: tickets.map((t) => (t.key === "C-1" ? { ...t, statusCategory: "inprogress" } : t)),
+    sessions: [dChildSession("s-r1", "C-1", site, "MERGED", url)] });
+  autoCloseSweep();
+  assert.equal(inputTo("rollE", "s-r1").length, 0,
+    `a rollup child is never messaged to self-close, got ${JSON.stringify(dCmds("rollE"))}`);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+  resetEpicD();
 });
 
 test("XERK-636: epicChildBlockersDone — in-epic blocker authoritative, external only if visible", () => {

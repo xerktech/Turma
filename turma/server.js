@@ -2935,6 +2935,19 @@ function isEpicOrEpicChild(t) {
   return !!(t && (t.isEpic === true
     || (typeof t.epicKey === "string" && t.epicKey)));
 }
+// A ROLLUP ticket (XERK-1568) is one per repo collecting low-severity findings
+// (`[Rollup] <repo>: low-severity findings`, labelled `rollup`): a list, never
+// work, so nothing hands-off may start a session on it or merge for it. Either
+// marker is enough — the label (case-insensitive; `labels` is coerced to strings
+// by normalizeJira) or the `[Rollup]` summary prefix — so a ticket that lost one
+// of them is still caught. Consulted wherever isEpicOrEpicChild is, plus the
+// drain's auto branch and the epic run's child start.
+function isRollupTicket(t) {
+  if (!t) return false;
+  if (Array.isArray(t.labels) && t.labels.some(
+    (l) => typeof l === "string" && l.trim().toLowerCase() === "rollup")) return true;
+  return typeof t.summary === "string" && /^\s*\[rollup\]/i.test(t.summary);
+}
 // Layer a set of child tickets into dependency waves from their blocks-links.
 // `childRows` is the epic's children (each a ticket row with `key` + `blockedBy`,
 // XERK-634). Only blockers WITHIN the child set order the waves — an external
@@ -3459,6 +3472,9 @@ function epicRunDriveSweep() {
       // a blocked entry that would churn a terminal "gave up" note.
       const repo = ticketRepo(siteKey, childKey, rows);
       if (!repo || isRepoIgnored(repo)) continue;
+      // XERK-1568: a rollup ticket is a findings list, never work — even when an
+      // armed epic lists it as a child. Skipped silently like an ignore-tier repo.
+      if (isRollupTicket(row)) continue;
       // A full org line refuses the entry — retry next sweep, spending no attempt
       // (queuing commits nothing; the backoff is for a spawn the AGENT can't
       // complete, not for capacity backpressure the queue already handles).
@@ -12042,11 +12058,11 @@ const TICKET_QUEUE_NOTES_MAX = TICKET_QUEUE_MAX;
 // How long a dispatch is remembered, so a cancel that LOST to it can say so
 // rather than 404ing as if the ticket had never been queued.
 const TICKET_DISPATCH_MEMO_MS = 5 * 60 * 1000;
-// XERK-485 [E]: the auto stream and the queue are ordered by the model's
-// triage, not just by repo tier. Lower rank comes first. An unknown band or
-// type (no triage yet, or one whose field survived sanitization as something
-// else) sorts AFTER every real one — an unassessed ticket never outranks one
-// the model actually assessed.
+// XERK-485 [E]: the model's triage bands and types. Lower rank comes first; an
+// unknown band or type (no triage yet, or one whose field survived
+// sanitization as something else) ranks AFTER every real one. The auto
+// stream's ORDER reads only P0 off the band (XERK-1567, `triageSortKey`); the
+// full band rank still drives the org policy's `minPriority`.
 const TRIAGE_PRIORITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const NO_PRIORITY_RANK = 9;
 // Within one band, the KIND of work: a P1 bug ahead of a P1 doc nit. Same
@@ -12495,9 +12511,10 @@ function holdQueued(e, reason, error) {
 }
 
 // Hand the highest-priority waiting tickets to whichever hosts can actually
-// start them. Visit order (XERK-485 [E]): within an org's line the priority key
-// — triage band -> type weight -> repo tier -> FIFO — decides, and across orgs
-// the lines interleave round-robin so one backlog can't starve another.
+// start them. Visit order (XERK-485 [E]): within an org's line the sort key
+// — P0 -> oldest created -> type weight -> repo tier -> FIFO (XERK-1567) —
+// decides, and across orgs the lines interleave round-robin so one backlog
+// can't starve another.
 // Runs on every heartbeat (a beat is when capacity changes) and on the 15s
 // sweep, so a freed slot is filled within a beat rather than a sweep interval.
 //
@@ -12633,6 +12650,13 @@ function drainTicketQueue() {
     // left alone: a hand-started ticket is deliberate intent, not tier-gated.
     if (e.source === "auto" && isRepoIgnored(repo)) {
       drop("its repo is now ignore-tier");
+      continue;
+    }
+    // XERK-1568: the ticket became a rollup (labelled `rollup` / retitled
+    // `[Rollup] …`) while this AUTO entry waited. The sweep won't re-queue it, so
+    // drop with no churn, like a retiered repo above. A MANUAL entry drains.
+    if (e.source === "auto" && isRollupTicket(row)) {
+      drop("it is a rollup ticket");
       continue;
     }
     // XERK-485 [E]: the model re-triaged this ticket while it waited and the new
@@ -12903,16 +12927,24 @@ function triageGateReason(t) {
   return null;
 }
 
-// XERK-485 [E]: the priority key as a comparable array —
-// [triage band, type weight, -repo tier]. A caller's STABLE sort on this is the
-// full ordering: priority -> type -> repo tier (XERK-487's [G], the tiebreak
-// below priority+type) -> the caller's insertion order (board order for the
-// sweep, FIFO for the queue).
-function triageSortKey(triage, repo) {
-  const tr = triage && typeof triage === "object" ? triage : null;
+// XERK-1567: the auto stream's order key, as a comparable array over a ticket
+// ROW — [P0 ? 0 : 1, created ms, type weight, -repo tier]. A caller's STABLE
+// sort on this is the full ordering: a P0 preempts -> OLDEST created first ->
+// type -> repo tier (XERK-487's [G]) -> the caller's insertion order (board
+// order for the sweep, FIFO for the queue). Oldest-first replaced the band
+// order (XERK-485 [E]) because the board order underneath it is the agent's
+// `updated DESC` query, so the NEWEST-touched ticket won every tie and old work
+// starved; P1-P3 are now FIFO by creation and type/tier only break ties.
+// An absent or unparseable `created` sorts LAST (Infinity) — both comparators
+// test `!==` before subtracting, so two Infinities stay equal and keep board
+// order. `Date.parse` reads Jira's `+0000` and ADO's `Z` alike.
+function triageSortKey(t, repo) {
+  const tr = t && typeof t === "object" && t.triage && typeof t.triage === "object"
+    ? t.triage : null;
+  const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
   return [
-    tr && TRIAGE_PRIORITY_RANK[tr.priority] !== undefined
-      ? TRIAGE_PRIORITY_RANK[tr.priority] : NO_PRIORITY_RANK,
+    tr && tr.priority === "P0" ? 0 : 1,
+    Number.isFinite(created) ? created : Infinity,
     tr && TRIAGE_TYPE_WEIGHT[tr.type] !== undefined
       ? TRIAGE_TYPE_WEIGHT[tr.type] : NO_TYPE_WEIGHT,
     -repoTierRank(repo),
@@ -12962,8 +12994,9 @@ function autoStartRateMax(siteKey) {
   return p && Number.isInteger(p.rateMax) && p.rateMax >= 1 ? p.rateMax : TICKET_QUEUE_RATE_MAX;
 }
 
-// XERK-485 [E]: the drain's visit order. Within an org's line the priority key
-// decides (band -> type -> tier -> FIFO by `at`); across orgs the lines
+// XERK-485 [E]: the drain's visit order. Within an org's line the sort key
+// decides (P0 -> oldest created -> type -> tier -> FIFO by `at`, XERK-1567);
+// across orgs the lines
 // interleave round-robin, each org's turn anchored on its OLDEST entry, so one
 // org's backlog can't starve another's. Hosts never cross orgs, so in practice
 // this decides which ticket in an org claims a host's one-per-pass dispatch —
@@ -12975,8 +13008,7 @@ function ticketQueueOrder(rows) {
   for (const e of ticketQueue) {
     const hit = rows.get(ticketQueueKey(e.siteKey, e.issueKey));
     const row = hit ? hit.row : null;
-    const key = triageSortKey(
-      row ? row.triage : null, ticketRepo(e.siteKey, e.issueKey, rows));
+    const key = triageSortKey(row, ticketRepo(e.siteKey, e.issueKey, rows));
     let line = lines.get(e.siteKey);
     if (!line) lines.set(e.siteKey, (line = []));
     line.push({ e, key });
@@ -13013,22 +13045,24 @@ function autoStartSweep() {
     // The board's own view of this org's tickets — see `fleetTicketRows`. Never
     // walk `agents` for a ticket list here: this sweep STARTS work, so acting on
     // a copy the operator was not shown is a session nobody asked for.
-    // XERK-485 [E]: the full priority key orders the auto stream —
-    // triage band -> type weight -> repo tier (XERK-487's [G], now a
-    // tiebreak below priority+type) -> board order (stable sort).
-    // A P0 bug takes the scarce auto slots ahead of a P3 chore.
+    // XERK-1567: the sort key orders the auto stream — a P0 preempts, then
+    // OLDEST created first, then type weight -> repo tier (XERK-487's [G]) ->
+    // board order (stable sort). Board order is the agent's `updated DESC`
+    // query, so without the age term the newest-touched ticket won every tie.
     const candidates = ticketRowsForSite(rows, siteKey)
       .map((r) => {
         const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
-        return { t: r.row, repo, key: triageSortKey(r.row && r.row.triage, repo) };
+        return { t: r.row, repo, key: triageSortKey(r.row, repo) };
       })
       // XERK-635: an epic and its children never ride the org auto-start stream —
       // an epic is not a work ticket, and a child is started by its epic run in
       // dependency order, not here. Dropped silently at the filter (spending no
       // attempt) exactly like a repo-less ticket; the shared content gate below
       // rejects the same set, so the two stay in agreement (XERK-550 cross-check).
+      // A rollup ticket (XERK-1568) is dropped the same way: a list, not work.
       .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
-        && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t))
+        && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t)
+        && !isRollupTicket(c.t))
       .sort((a, b) => {
         for (let i = 0; i < a.key.length; i++) {
           if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
@@ -13458,6 +13492,10 @@ function autoStartContentGate(siteKey, t, repo) {
   // the epic run drives its children in dependency order. Kept in lock-step with
   // the autoStartSweep candidate filter above (the XERK-550 cross-check pins it).
   if (isEpicOrEpicChild(t)) return { kind: "epic", reason: "epic or epic child (driven by the epic run)" };
+  // XERK-1568: a rollup ticket is a list of findings, never work. Checked BEFORE
+  // the operator verdict so an `approve` cannot force it into the auto stream or
+  // into auto-merge/auto-close (both read this gate through autoMergeSession).
+  if (isRollupTicket(t)) return { kind: "rollup", reason: "rollup ticket (a findings list, not work)" };
   const action = ticketTriageAction(siteKey, t.key);
   if (action === "hold" || action === "reject") {
     return { kind: "triaged", reason: `${action} by triage` };
@@ -13568,6 +13606,9 @@ function epicRunChildSession(a, s, byKey, rows) {
   // auto-close pass skips a done row anyway, but bail early so its PR is never
   // merged after the ticket was abandoned/finished out of band.
   if (row.statusCategory === "done") return null;
+  // XERK-1568: a rollup child is never merged/messaged hands-off either — this
+  // stream skips the content gate, so it carries the rollup check itself.
+  if (isRollupTicket(row)) return null;
   const repo = ticketRepo(siteKey, t.key, rows);
   return { siteKey, key: t.key, row, repo };
 }
@@ -20123,7 +20164,7 @@ if (process.env.TURMA_TEST) {
     setEpicRunPaused,
     buildEpicWaves,
     epicChildRows,
-    isEpicOrEpicChild,
+    isEpicOrEpicChild, isRollupTicket,
     sanitizeEpicRunRecord,
     EPIC_RUN_STATES,
     // Epic Builder (XERK-725, epic XERK-721): the durable run store, its arm/clear
