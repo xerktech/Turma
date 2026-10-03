@@ -10858,9 +10858,11 @@ def classify_pane_dialog(prompt):
     text = f"{prompt.get('prompt') or ''}\n{prompt.get('detail') or ''}"
     if re.search(r"\bplan\b", text, re.IGNORECASE):
         return "plan"
-    if re.search(r"\bsandbox\b|network (?:access|request)", text, re.IGNORECASE):
+    # \s+, not a space: a narrow pane wraps the detail mid-phrase, and the kind
+    # must not change with the width (a repaint keeps its row only while it holds).
+    if re.search(r"\bsandbox\b|network\s+(?:access|request)", text, re.IGNORECASE):
         return "sandbox"
-    if re.search(r"\bdo you want to\b|\ballow\b", text, re.IGNORECASE):
+    if re.search(r"\bdo\s+you\s+want\s+to\b|\ballow\b", text, re.IGNORECASE):
         return "permission"
     return "other"
 
@@ -28846,17 +28848,42 @@ class SessionManager:
         key = _pane_dialog_identity(pp) if pp is not None else None
         if key != self._perm_dialog_key.get(sid):
             row = self._perm_open.get(sid)
-            if row is not None:
-                self._close_dialog_row(sess, row, signals, now_ms)
-            if key is None:
-                self._perm_dialog_key.pop(sid, None)
-            else:
+            if (row is not None and pp is not None
+                    and self._dialog_is_repaint(sess, row, pp)):
+                # The SAME prompt redrawn (a resize rewraps it, Tab amends the
+                # command): one prompt, one row — never close and reopen it.
                 self._perm_dialog_key[sid] = key
-                # A pending AskUserQuestion is a human question, not a permission
-                # prompt (its native picker shows once ask.py's wait runs out).
-                if not signals.get("question"):
-                    self._open_dialog_row(sess, pp, now_ms)
+            else:
+                if row is not None:
+                    self._close_dialog_row(sess, row, signals, now_ms)
+                if key is None:
+                    self._perm_dialog_key.pop(sid, None)
+                else:
+                    self._perm_dialog_key[sid] = key
+                    # A pending AskUserQuestion is a human question, not a
+                    # permission prompt (its native picker shows once ask.py's
+                    # wait runs out).
+                    if not signals.get("question"):
+                        self._open_dialog_row(sess, pp, now_ms)
         self._permission_ask_edge(sess, signals, now_ms)
+
+    def _dialog_is_repaint(self, sess, row, pp):
+        """True when a CHANGED dialog face is the open row's prompt redrawn: the
+        face moves with the pane's width (wrapped detail, a lost wrapped option)
+        and with Tab-to-amend, while the call it asks about does not. Only a row
+        holding a toolUseId of its own can tell (a sub-agent's delegation id is
+        shared by every prompt raised inside it), only when the kind is unchanged
+        (a sandbox prompt for a running call is a second prompt), and only when
+        the call still pending is that same call. Reads the tail on a face change
+        only, never on the steady-state beat."""
+        tuid = row.get("toolUseId")
+        if not tuid or row.get("tool") in PERMISSION_DELEGATING_TOOLS:
+            return False
+        if classify_pane_dialog(pp) != row.get("dialogKind"):
+            return False
+        path = _session_transcript_path(sess)
+        call = pending_tool_call(_tail_entries(path)) if path else None
+        return bool(call) and call.get("toolUseId") == tuid
 
     def _open_dialog_row(self, sess, pp, now_ms):
         sid = sess["id"]

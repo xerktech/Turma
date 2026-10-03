@@ -27,6 +27,12 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
   - **A dialog is keyed on its whole face** (`_pane_dialog_identity`: question + detail + option
     labels), not its question: every tool prompt asks "Do you want to proceed?", and two prompts
     answered between beats never show "no dialog". A changed face closes the row and opens another.
+  - **Except a REPAINT** (`_dialog_is_repaint`): the face moves with the pane's width (the ttyd
+    attach resizes tmux, wrapping detail and labels) and with Tab-to-amend, not the call. A changed
+    face whose pending call is still the open row's `toolUseId`, with the same `dialogKind`, keeps the
+    row. NOT for a delegated row (every sub-agent prompt shares the Task id) or one with no
+    `toolUseId`, which fall back to the face. The tail is read only on a face change.
+  - `classify_pane_dialog` matches its phrases across any whitespace, so a wrap never changes the kind.
   - **A question picker is not a permission row**: no row opens while `signals.question` is set or
     the pending call is `AskUserQuestion` (its native picker after ask.py's wait) — no rule retires it.
   - On dialog→gone it closes: `waitedMs`, and `answer` = Turma's `answer_pane_prompt` number mapped
@@ -107,7 +113,7 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 | `ask-in-chat` | `model behaviour: see CLAUDE.md step 0` |
 | `dialog` `sandbox` naming a host | `sandbox.network.allowedDomains: <host>` |
 | `classifier-denied` | `autoMode.environment: allow <tool rule>`; NONE without a tool rule |
-| Bash | `Bash(<head>:*)`; NONE for an interpreter/wrapper/shell-keyword head or a malformed one |
+| Bash | `Bash(<head>:*)`; NONE for an interpreter/wrapper/keyword head, a bare subcommand CLI, a malformed one |
 | MCP | the full `mcp__<server>__<tool>` |
 | WebFetch | `WebFetch(domain:<d>)` |
 | a plan approval, a file path, anything else | none |
@@ -118,6 +124,10 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 - **Never an allow-everything Bash rule** (`BASH_NEVER_HEADS`): `Bash(python3:*)`, `Bash(sudo:*)`,
   `Bash(env:*)`… run whatever follows. A head outside `BASH_HEAD_RE` (`(cd`, a glob) would be a
   malformed rule. Both get no rule — the table is copied verbatim, and XERK-1566 consumes it.
+- **Nor a BARE subcommand CLI** (`git`, `docker`, `kubectl`, `make`…; `SUBCOMMAND_CLIS`, a
+  parity-tested mirror of permlog.py's set). permlog keeps the subcommand only as the SECOND word, so
+  `git -C /repo push` / `kubectl -n prod exec` head as the bare CLI, whose rule allows every
+  subcommand — the never-listed `docker run`/`kubectl exec` and `git -c alias.x='!sh'` included.
 
 `head` = the Bash command's first word, two for a subcommand CLI (`git push`, `npm test`), leading
 `VAR=x` skipped; the file path; the MCP tool name; the WebFetch domain. The LLM judge (XERK-1566)

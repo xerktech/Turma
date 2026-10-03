@@ -154,7 +154,7 @@ test("suggestedRule: the deterministic table", () => {
     [{ kind: "dialog", dialogKind: "plan", tool: "ExitPlanMode", head: "ExitPlanMode" }, null],
     [{ kind: "dialog", tool: "Edit", head: "/repo/a.py" }, null],
     [{ kind: "dialog", tool: "WebFetch", head: "not a host" }, null],
-    [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "npm" }, "Bash(npm:*)"],
+    [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "pytest" }, "Bash(pytest:*)"],
   ];
   for (const [g, want] of cases) assert.equal(suggestedRule(g), want, JSON.stringify(g));
 });
@@ -170,10 +170,28 @@ test("suggestedRule: never an allow-everything or malformed Bash prefix rule", (
   for (const head of ["(cd", "rm*", "a)b", "$(foo)", "x;y", "make all extra"]) {
     assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
   }
+  // A BARE subcommand CLI — what permlog's head is when a global flag precedes
+  // the subcommand (`git -C /repo push`, `kubectl -n prod exec`) — allows every
+  // subcommand, the never-listed ones included.
+  for (const head of ["git", "gh", "docker", "kubectl", "npm", "make", "/usr/bin/git",
+    "./gradlew"]) {
+    assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
+    assert.equal(suggestedRule({ kind: "classifier-denied", tool: "Bash", head }), null, head);
+  }
   // Ordinary commands keep their rule.
-  for (const head of ["make", "npm test", "./gradlew test", "bun test", "go test"]) {
+  for (const head of ["npm test", "./gradlew test", "bun test", "go test", "git status",
+    "pytest", "ls"]) {
     assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), `Bash(${head}:*)`, head);
   }
+});
+
+test("suggestedRule: the subcommand-CLI set mirrors permlog.py's SUBCOMMAND_CLIS", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "..", "agent", "hooks", "permlog.py"),
+    "utf8");
+  const m = /SUBCOMMAND_CLIS = frozenset\(\{([^}]*)\}\)/.exec(src);
+  assert.ok(m, "permlog.py declares SUBCOMMAND_CLIS");
+  const py = [...m[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]).sort();
+  assert.deepEqual([...ledger.SUBCOMMAND_CLIS].sort(), py);
 });
 
 test("aggregate: ask-in-chat groups by its question, with no allowed/denied to claim", () => {

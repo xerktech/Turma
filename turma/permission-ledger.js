@@ -251,6 +251,17 @@ const BASH_NEVER_HEADS = new Set([
   "docker exec", "kubectl exec", "ssh", "awk", "find", "parallel", "script",
 ]);
 const BASH_HEAD_RE = /^[A-Za-z0-9._/-]+( [A-Za-z0-9._-]+)?$/;
+// MIRRORS `SUBCOMMAND_CLIS` in agent/hooks/permlog.py (parity-tested): CLIs whose
+// subcommand is the decision. permlog keeps the subcommand in the head only when
+// it is the second word, so a leading global flag (`git -C /repo push`,
+// `kubectl -n prod exec`, `docker -H x run`) leaves the BARE CLI — and its
+// prefix rule (`Bash(git:*)`) would allow every subcommand, the never-listed
+// ones (`docker run`, `kubectl exec`) and `git -c alias.x='!sh'` included.
+const SUBCOMMAND_CLIS = new Set([
+  "git", "gh", "glab", "az", "npm", "pnpm", "yarn", "npx", "bun", "docker",
+  "kubectl", "helm", "cargo", "go", "uv", "pip", "pip3", "terraform", "make",
+  "systemctl", "brew", "apt", "apt-get", "dotnet", "gradle", "./gradlew",
+]);
 
 function toolRule(tool, head) {
   if (tool === "Bash" && head) {
@@ -258,6 +269,7 @@ function toolRule(tool, head) {
     const base = word.slice(word.lastIndexOf("/") + 1);
     if (!BASH_HEAD_RE.test(head) || BASH_NEVER_HEADS.has(head)
         || BASH_NEVER_HEADS.has(word) || BASH_NEVER_HEADS.has(base)) return null;
+    if (word === head && (SUBCOMMAND_CLIS.has(word) || SUBCOMMAND_CLIS.has(base))) return null;
     return `Bash(${head}:*)`;
   }
   if (typeof tool === "string" && tool.startsWith("mcp__")) return tool;
@@ -275,8 +287,9 @@ function toolRule(tool, head) {
  *                                      tool rule (a sentence lifted from the deny
  *                                      reason is not a line anything accepts)
  *   Bash                             → Bash(<head>:*), except an interpreter /
- *                                      wrapper / shell-keyword head or a head
- *                                      outside a plain command shape (null)
+ *                                      wrapper / shell-keyword head, a bare
+ *                                      subcommand CLI (`git`, `docker`), or a
+ *                                      head outside a plain command shape (null)
  *   MCP                              → the full mcp__<server>__<tool>
  *   WebFetch                         → WebFetch(domain:<d>)
  *   anything else                    → null (no rule retires it)
@@ -721,7 +734,7 @@ module.exports = {
   ingest, aggregate, kindTotals, sanitizePermissionEvent, suggestedRule, configure,
   rehydrate, flush, setMemoryLimit,
   LEDGER_FILE, MAX_ROWS, HOST_MAX_ROWS, DAYS, EVENTS_PER_BEAT, T_EVENT,
-  PermissionLedgerPgStore,
+  SUBCOMMAND_CLIS, PermissionLedgerPgStore,
   _internals: {
     hosts: () => hosts,
     rowCount, load, writeNow, totalBytes, maxBytes: () => maxBytes,

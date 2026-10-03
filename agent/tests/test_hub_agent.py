@@ -36878,6 +36878,102 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
                                 for r in rows.values()),
                          [("git push", 5000, "allow"), ("rm", 3000, "unknown")])
 
+    PANE_WIDE = """\
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   docker compose -f deploy/compose.yml up --build --remove-orphans --detach
+   Rebuild and restart the stack in the background
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for docker compose commands in this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+"""
+    # The same dialog after the window narrows (the operator's ttyd attaches):
+    # the command and option 2 wrap, and the wrapped label ends the 1..N run.
+    PANE_NARROW = """\
+──────────────────────────────────────────────
+ Bash command
+
+   docker compose -f deploy/compose.yml up
+   --build --remove-orphans --detach
+   Rebuild and restart the stack in the
+   background
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for docker
+   compose commands in this project
+   3. No
+
+ Esc to cancel · Tab to amend
+"""
+
+    def test_the_same_dialog_redrawn_at_another_width_is_one_row(self):
+        wide = ha.parse_pane_prompt(self.PANE_WIDE)
+        narrow = ha.parse_pane_prompt(self.PANE_NARROW)
+        self.assertIsNotNone(wide)
+        self.assertIsNotNone(narrow)
+        self.assertNotEqual(ha._pane_dialog_identity(wide), ha._pane_dialog_identity(narrow))
+        self.write(self.tool_use("toolu_1", inp={"command": "docker compose up"}))
+        self.edge(wide, at=1000)
+        self.edge(narrow, at=20000)                # a resize: same call, new face
+        self.edge(wide, at=21000)                  # and back again
+        self.write(self.tool_result("toolu_1"))
+        self.edge(None, at=25000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual([(r["openedAt"], r["waitedMs"], r["answer"], r["toolUseId"])
+                          for r in rows.values()],
+                         [(1000, 24000, "allow", "toolu_1")])
+
+    def test_a_new_call_behind_a_changed_face_is_still_a_new_row(self):
+        # The repaint rule keys on the CALL: a changed face whose pending call
+        # moved on is the next prompt, whatever the pane width did.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(ha.parse_pane_prompt(self.PANE_WIDE), at=1000)
+        self.write(self.tool_result("toolu_1"), self.tool_use("toolu_2"))
+        self.edge(ha.parse_pane_prompt(self.PANE_NARROW), at=5000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["toolUseId"], r.get("answer")) for r in rows.values()),
+                         [("toolu_1", "allow"), ("toolu_2", None)])
+
+    def test_a_sandbox_prompt_for_the_running_call_is_a_second_row(self):
+        # Allowed, the command runs (no result yet) and asks to reach the
+        # network: the same call, but another prompt the operator answers.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge({"prompt": "Allow network access outside the sandbox?",
+                   "detail": "Host: registry.npmjs.org",
+                   "options": [{"number": 1, "label": "Yes", "selected": True},
+                               {"number": 2, "label": "No", "selected": False}]}, at=4000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["dialogKind"], r["openedAt"]) for r in rows.values()),
+                         [("permission", 1000), ("sandbox", 4000)])
+
+    def test_dialogs_inside_a_sub_agent_are_not_folded_by_its_delegation_id(self):
+        # Every prompt a foreground sub-agent raises shares the parent's pending
+        # Task call, so that id cannot tell a repaint from the next prompt.
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        self.edge(dict(self.dialog(), detail="Bash command\ngit push"), at=1000)
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_a_pending_question_opens_no_row_before_its_call_is_in_the_tail(self):
+        # ask.py's bridge reports the question before the transcript tail shows
+        # the AskUserQuestion call; the pending call is still an older Bash one.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000, question="Which plan?")
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn(self.SID, self.sm._perm_open)
+        self.lines = []
+        self.write()                                   # empty transcript too
+        self.edge(dict(self.dialog(), prompt="Which one?"), at=2000, question="Which one?")
+        self.assertEqual(self.rows(), [])
+
     def test_a_second_request_never_merges_into_a_row_that_has_one(self):
         # PermissionRequest rows with no toolUseId: the first claims the open
         # dialog, the second is another prompt's and is held, not merged.
