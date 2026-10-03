@@ -1294,6 +1294,13 @@ class TestProducedScripts(unittest.TestCase):
                 self.assertAllowed(cmd)
         self.assertDenied("d=/; bash -c 'rm -rf $d'")
         self.assertAllowed("eval echo 'rm -rf /etc is banned'")
+        # Both readings reach the policy and SQL rules too, not just rm.
+        self.assertIsNotNone(guard.policy_reason("x=';'; eval 'eval echo $x git push origin main'"))
+        self.assertIsNotNone(guard._destructive_database(
+            "x=';'; eval 'eval echo $x psql -c \"DROP DATABASE prod\"'"))
+        # A `#` inside "…" is text; a comment ends at its newline.
+        self.assertDenied("x=\"'\"; echo \"a # don't\"; echo $x; rm -rf /")
+        self.assertDenied("echo hi # note\nrm -rf /")
         # Comments cost one scan, not one per comment.
         cmd = "x=\"it's\"; " + ("echo step # don't panic\n" * 400) + "echo \"$x\""
         started = time.monotonic()
