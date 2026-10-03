@@ -133,9 +133,15 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
     never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
     clearing let `cd /; (cd /tmp); rm -rf *` through.
-    - Order counts, except in text that can re-run (loop/function body, trap, a group after
-      one, `_REPLAYS_RE`): fully order-blind refused a real `chmod -R go-w .; …; cd /`.
-    - Joining covers `rm`/`unlink`/`chmod`/`chown` and `find` roots.
+    - Order counts: fully order-blind refused a real `chmod -R go-w .; …; cd /`.
+    - Text that can re-run is classified ONCE MORE seeing every `cd` on the line: each loop
+      (keyword→matching `done`, condition included) and function body (`_replay_regions`), and
+      every trap/alias/eval/`sh -c` script. A per-segment "inside a body" stack was tried and
+      lost to nesting (`do { :; }; rm -rf *; cd /; done`) — don't bring it back.
+    - Joining covers `rm`/`unlink`/`chmod`/`chown` and `find` roots, never an opaque
+      substitution (`trap 'rm -rf "$tmpd"' EXIT; cd /` is the cleanup idiom).
+    - The literal `~/.ssh` is dangerous to `rm` only (`_is_home_ssh`): `chmod -R 700 ~/.ssh`
+      is the routine fix.
     - Inside an exact protected root/home every relative `rm` operand is joined (`cd /; rm -rf *`
       is `/*`); deeper, only `..`-climbing ones are. Joining all there would refuse ordinary
       `cd /usr/src/app && rm -rf build` — do not widen it.

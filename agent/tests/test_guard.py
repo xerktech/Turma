@@ -1158,9 +1158,38 @@ class TestProducedScripts(unittest.TestCase):
         # ...unless the earlier text can run again after it.
         for cmd in ("for i in 1 2; do rm -rf *; cd /; done",
                     "while true; do rm -rf *; cd /; done",
-                    "f() { rm -rf *; }; cd /; f", "trap 'rm -rf *' EXIT; cd /"):
+                    "f() { rm -rf *; }; cd /; f", "trap 'rm -rf *' EXIT; cd /",
+                    # Nesting inside the re-run body, and while/until conditions.
+                    "for i in 1 2; do { true; }; rm -rf *; cd /; done",
+                    "for i in 1 2; do\n  { :; }\n  rm -rf *\n  cd /\ndone",
+                    "i=0; while rm -rf *; cd /; [ $i -lt 1 ]; do i=1; done",
+                    "i=0; until rm -rf *; cd /; [ $i -lt 1 ]; do i=1; done",
+                    "f() { { :; }; rm -rf *; }; cd /; f",
+                    "f() { for i in 1; do :; done; rm -rf *; }; cd /; f",
+                    "function f { rm -rf *; }; cd /; f", "f() ( rm -rf * ); cd /; f",
+                    "f() { echo ${x}; rm -rf *; }; cd /; f",
+                    "f() { echo $(date); rm -rf *; }; cd /; f",
+                    "for i in 1 2; do (rm -rf *); cd /; done",
+                    # Defined by text a shell or eval runs.
+                    "eval 'f() { rm -rf *; }'; cd /; f", "eval \"trap 'rm -rf *' EXIT\"; cd /",
+                    "bash -c 'trap \"rm -rf *\" EXIT; cd /'",
+                    "alias f='rm -rf *'\ncd /\nf"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
+        for cmd in ("tmpd=$(mktemp -d); trap 'rm -rf \"$tmpd\"' EXIT; cd /",
+                    "f() { echo hi; }; rm -rf ./build; cd /; f",
+                    "for f in a b; do echo $f; done; rm -rf ./build; cd /",
+                    "# loop for each file\nrm -rf ./build; cd /"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_fixing_ssh_permissions_is_not_deleting_them(self):
+        for cmd in ("chmod -R 700 ~/.ssh", "chmod -R go-rwx ~/.ssh", "chown -R me:me ~/.ssh",
+                    "cd ~ && chown -R me .ssh"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertDenied("rm -r ~/.ssh")
+        self.assertDenied("rm -rf $HOME/.ssh/")
 
     def test_printf_renders_like_printf(self):
         for cmd in ("printf -v x -- 'rm -rf /'; $x", "printf -v x '%.2s -rf /' rmxx; $x",

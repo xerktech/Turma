@@ -1251,9 +1251,14 @@ def _expand_segments(command: str, depth: int = 0,
     # clears one: it can fail, sit in a subshell or pipe, or be `cd -`, and
     # clearing let `cd /; (cd /tmp); rm -rf *` through (XERK-1549). Order
     # counts only outside text that can run AGAIN: a trailing `cd /` must not
-    # turn an earlier `chmod -R go-w .` into `/.`, but a loop body, function
-    # body or trap handler can run after it, so those see every `cd`.
+    # turn an earlier `chmod -R go-w .` into `/.`, but a loop, function body,
+    # alias, trap handler or eval'd script can run after it, so each of those
+    # is classified once more seeing EVERY `cd` on the line. Tracking which
+    # segment sits inside which body was tried and lost to nesting.
     every_cd = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(raw_commands)), cwds)
+    if every_cd != cwds:
+        for region in _replay_regions(raw_commands):
+            out.extend(_expand_segments(_substitute_vars(region, raw_vals), depth + 1, every_cd))
     bodies, suspect = _balanced_groups(raw_commands)
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
@@ -1280,8 +1285,7 @@ def _expand_segments(command: str, depth: int = 0,
         if every_cd != cwds:
             # The `cd`s written before the group are the ones it runs after.
             head = raw_commands[:max(raw_commands.find(body), 0)]
-            before = every_cd if _REPLAYS_RE.search(head) else _cd_targets(
-                _SUBST_RE.sub(_subst_text, _prenormalise(head)), cwds)
+            before = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(head)), cwds)
         out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, before))
     command = _prenormalise(raw_commands)
     segments = _split_segments(command)
@@ -1294,19 +1298,9 @@ def _expand_segments(command: str, depth: int = 0,
         for tok in _tokenize(raw):
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
-    replay: list[bool] = []  # open `do`/function/`{` bodies: True = can re-run
-    seen = cwds
     for raw in segments:
         if every_cd != cwds:
-            seen = _cd_targets(_SUBST_RE.sub(_subst_text, raw), seen)
-            head = raw.strip()
-            if _REPLAY_OPEN_RE.match(head):
-                replay.append(True)
-            elif head.startswith("{"):
-                replay.append(False)
-        cwds = every_cd if any(replay) else seen
-        if replay and _REPLAY_CLOSE_RE.match(raw.strip()):
-            replay.pop()
+            cwds = _cd_targets(_SUBST_RE.sub(_subst_text, raw), cwds)
         if suspect:
             # The group scan lost track, so a body it should have found may
             # sit here split in half (see _balanced_groups): classify the
@@ -1346,7 +1340,7 @@ def _expand_segments(command: str, depth: int = 0,
         if prog in _SHELL_PROGS:
             i = _shell_c_index(rest)
             if i >= 0 and i + 1 < len(rest):
-                out.extend(_expand_segments(rest[i + 1], depth + 1, cwds))
+                out.extend(_expand_segments(rest[i + 1], depth + 1, every_cd))
         elif prog == "eval" and rest:
             # `eval eval eval … rm -rf /etc` is valid shell. Collapse the chain
             # ITERATIVELY — recursing once per `eval` burned the depth budget,
@@ -1364,7 +1358,8 @@ def _expand_segments(command: str, depth: int = 0,
                 #    has already dropped the quotes, and a plain join turned
                 #    `eval bash -c 'rm -rf /etc'` into `bash -c rm -rf /etc`,
                 #    where `-c`'s argument is the bare word `rm`.
-                out.extend(_expand_segments(" ".join(shlex.quote(t) for t in inner), depth + 1, cwds))
+                out.extend(_expand_segments(
+                    " ".join(shlex.quote(t) for t in inner), depth + 1, every_cd))
                 # 2. The FIRST token, when it is itself a command line. A quoted
                 #    script is one token and keeps that shape whatever follows
                 #    it, so this covers the redirection case above.
@@ -1374,7 +1369,12 @@ def _expand_segments(command: str, depth: int = 0,
                 #    nothing — as destructive. That is the "commit message
                 #    mentioning rm -rf" class this file exists not to refuse.
                 if inner[0].strip() and re.search(r"\s", inner[0]):
-                    out.extend(_expand_segments(inner[0], depth + 1, cwds))
+                    out.extend(_expand_segments(inner[0], depth + 1, every_cd))
+        elif prog == "alias" and rest:
+            # `alias f='rm -rf *'` runs wherever `f` is used — after any `cd`.
+            for tok in rest:
+                if "=" in tok:
+                    out.extend(_expand_segments(tok.split("=", 1)[1], depth + 1, every_cd))
         elif prog == "trap" and rest:
             cwds = every_cd  # a handler runs after whatever `cd` comes later
             # `trap 'rm -rf /etc' EXIT` runs its handler on the way out. Scan
@@ -1478,13 +1478,76 @@ _CD_RE = re.compile(r"(?:^|[\s;&|({`])(?:(?:builtin|command)\s+)?\\?([\"']?)(?:c
                     r"(?=$|[\s;&|)`])"
                     r"([^;&|\n)`]*)")
 _MAX_CWDS = 8
-# Text that can run AGAIN after a later `cd`: a loop body, a function, a trap
-# or an alias. A group written after one sees every `cd` on the line; a plain
-# segment does while inside an open `do`/function body (`_REPLAY_OPEN_RE`).
-_REPLAYS_RE = re.compile(r"\b(?:do|function|trap|alias)\b|\(\)\s*\{")
-_REPLAY_OPEN_RE = re.compile(r"(?:do\b|function\b|[A-Za-z_][\w-]*\s*\(\)\s*\{?)")
-_REPLAY_CLOSE_RE = re.compile(r"(?:done\b|\})")
 _HOME_USER_RE = re.compile(r"^~[a-z0-9_][a-z0-9_.-]*$")
+_LOOP_OPEN_RE = re.compile(r"\b(?:while|until|for|select)\b")
+_LOOP_WORD_RE = re.compile(r"\b(?:while|until|for|select|done)\b")
+_FUNC_HEAD_RE = re.compile(
+    r"(?:\bfunction\s+[^\s(){};&|]+(?:\s*\(\))?|\b[A-Za-z_][\w.:-]*\s*\(\))\s*([{(])")
+_MAX_REGIONS = 16
+
+
+def _replay_regions(text: str) -> list[str]:
+    """Text that can run AGAIN after a later `cd`: each loop (keyword to its
+    matching `done`, so a while/until condition is in it) and each function
+    body (to its matching brace). Unquoted words only; an unclosed one runs to
+    the end. A nested one is skipped: it is inside its parent's text, which
+    is classified with every `cd` on the line already."""
+    states = list(_quote_states(text))
+    # A `#` comment is text too: `# … for symlink checks` opened a "loop".
+    i = text.find("#")
+    while i >= 0:
+        end = text.find("\n", i)
+        end = len(text) if end < 0 else end
+        if not states[i] and _is_comment(text, i):
+            states[i:end] = ["#"] * (end - i)
+        i = text.find("#", end)
+    spans: list[tuple[int, int]] = []
+
+    def nested(i: int) -> bool:  # already inside a region taken
+        return any(a <= i < b for a, b in spans)
+
+    for m in _LOOP_OPEN_RE.finditer(text):
+        if (states[m.start()] or nested(m.start()) or len(spans) >= _MAX_REGIONS
+                or not _at_command_start(text, m.start())):
+            continue
+        depth, end = 0, len(text)
+        for w in _LOOP_WORD_RE.finditer(text, m.start()):
+            if states[w.start()] or not _at_command_start(text, w.start()):
+                continue
+            depth += -1 if w.group(0) == "done" else 1
+            if depth == 0:
+                end = w.end()
+                break
+        spans.append((m.start(), end))
+    for m in _FUNC_HEAD_RE.finditer(text):
+        if (states[m.start()] or nested(m.start()) or len(spans) >= _MAX_REGIONS
+                or not _at_command_start(text, m.start())):
+            continue
+        opener = m.group(1)
+        closer = "}" if opener == "{" else ")"
+        depth, end = 0, len(text)
+        i = m.start(1)
+        while i < len(text):
+            ch = text[i]
+            if states[i]:
+                i += 1
+                continue
+            if text.startswith(("${", "$("), i):
+                # `${x}`'s brace and `$(…)`'s paren are not the body's.
+                j = text.find("}" if text[i + 1] == "{" else ")", i + 2)
+                i = len(text) if j < 0 else j + 1
+                continue
+            if ch == opener:
+                depth += 1
+            elif ch == closer:
+                depth -= 1
+                if depth == 0:
+                    end = i + 1
+                    break
+            i += 1
+        spans.append((m.start(1) + 1, end - 1 if end < len(text) else end))
+    return [text[a:b] for a, b in spans]
+
 
 
 def _cd_targets(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
@@ -1522,7 +1585,7 @@ def _under_cwd(tok: str, cwd: str) -> str:
     Deeper, only one climbing out with `..` is (`cd /tmp; rm -rf ../*` is
     `/*`): joining the rest would refuse `cd /usr/src/app && rm -rf build`,
     which names nothing an absolute rm would not, for a cwd that may be stale."""
-    if tok.startswith(("-", "/", "~", "$")):
+    if tok.startswith(("-", "/", "~", "$", _OPAQUE_SUBST)):
         return tok
     if _is_exact_root(cwd) or ".." in tok.split("/"):
         return cwd.rstrip("/") + "/" + tok
@@ -1619,7 +1682,7 @@ def _is_dangerous_path(tok: str) -> bool:
     # A glob straight under a home directory that can match its dotfiles
     # (`~/*`, `~/.*`, `~/.[!.]*`) takes `.ssh` and the rest with it.
     parent, _, leaf = low.rpartition("/")
-    if ((parent in _HOME_TOKENS or _HOME_USER_RE.match(parent))
+    if (_GLOB_CHARS.search(leaf) and (parent in _HOME_TOKENS or _HOME_USER_RE.match(parent))
             and fnmatch.fnmatch(".ssh", leaf)):
         return True
     # `~root` / `~someuser` expand to that account's home, and `/root` is itself
@@ -1652,6 +1715,13 @@ def _is_dangerous_path(tok: str) -> bool:
     return False
 
 
+def _is_home_ssh(tok: str) -> bool:
+    """`~/.ssh` itself — deleting it loses the keys, though `chmod -R 700` of
+    it is the routine permission fix, so only `rm` asks this."""
+    parent, _, leaf = _norm_path(tok).lower().rstrip("/").rpartition("/")
+    return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent)))
+
+
 def _rm_is_recursive(flags: str) -> bool:
     """`-r` alone already deletes a tree.
 
@@ -1681,7 +1751,7 @@ def _destructive_rm(tokens: list[str]) -> str | None:
     if prog == "rm" and not _rm_is_recursive(flags):
         return None
     for tgt in targets:
-        if _is_dangerous_path(tgt):
+        if _is_dangerous_path(tgt) or _is_home_ssh(tgt):
             return f"refusing recursive delete of a protected path ({tgt!r})"
     return None
 
