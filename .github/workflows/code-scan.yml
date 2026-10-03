@@ -52,6 +52,13 @@ on:
       # these paths the gate would never run on the change it exists to catch.
       - "CLAUDE.md"
       - ".claude/rules/**"
+  # release.yml calls this whole workflow as the gate before it plans a release
+  # (XERK-1542). A PR is only tested against the main it branched from, so two
+  # individually-green PRs can merge into a red main; nothing re-ran these jobs
+  # on main, and the release shipped it. Under workflow_call the paths filter
+  # above does not apply — every job runs — and github.ref is the caller's
+  # (refs/heads/main), which never collides with a PR's refs/pull/<n>/merge.
+  workflow_call:
 
 concurrency:
   group: code-scan-${{ github.ref }}

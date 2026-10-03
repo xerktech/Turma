@@ -98,6 +98,10 @@ paths:
   PowerShell-on-POSIX suites + the `agent/win` pty-protocol test, Python + Node suites).
   Path-filtered to include `CLAUDE.md`/`.claude/rules/**` so a docs-only PR still runs the size gate.
   All jobs run on GitHub-hosted runners (`ubuntu-latest`; `pwsh` ships there).
+- **A release re-runs `code-scan.yml` on the commit it ships** (XERK-1542): `release.yml`'s
+  `code-scan` job calls it (`workflow_call`) and `plan` needs it, so a red main publishes nothing.
+  - A PR is tested against its base, not the main it lands on — two green PRs can merge red.
+  - Never drop that `needs:`; it is the last gate before hosts self-update.
 - **Instruction file size limits** — `CLAUDE.md` + every `.claude/rules/*.md` must stay under 40,000
   characters (Claude Code's own perf threshold). Measured in CHARS not bytes (`wc -m`). See
   `CLAUDE.md`'s "Editing these files".
