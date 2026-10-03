@@ -386,7 +386,8 @@ def _quote_states(command: str) -> list[str]:
     while i < n:
         ch = command[i]
         top = stack[-1] if stack else ""
-        if ch == "#" and top != '"' and _is_comment(command, i):
+        # Inside `${…}` a `#` is text, never a comment: `${y:- #}` (XERK-1585).
+        if ch == "#" and top not in ('"', "p") and _is_comment(command, i):
             end = command.find("\n", i)
             end = n if end < 0 else end
             out[i:end] = ["#"] * (end - i)
@@ -399,6 +400,14 @@ def _quote_states(command: str) -> list[str]:
         if command.startswith("$(", i):
             stack.append("(")
             i += 2
+            continue
+        if top != '"' and command.startswith("${", i):
+            stack.append("p")
+            i += 2
+            continue
+        if ch == "}" and top == "p":
+            stack.pop()
+            i += 1
             continue
         if top == '"':
             out[i] = '"'
@@ -813,7 +822,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     if vals is None:
         vals = _var_values(command)
 
-    states = _quote_states(command) if vals and "$" in command else []
+    states = _quote_states(command) if "$" in command and (vals or "${" in command) else []
 
     def rep(m: "re.Match[str]") -> str:
         name = m.group(1) or m.group(3) or ""
@@ -830,7 +839,13 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 value = _apply_var_op(value, op.group(1), op.group(2))
             return _quote_literal(value, state)
         if op and op.group(1) in _VAR_DEFAULT_OPS:
-            return op.group(2)
+            # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
+            # the `rm` a comment. The `#` was a word inside the braces; keep it
+            # one (XERK-1585). Quotes and `$(…)` in the default stay live.
+            state = states[m.start()] if m.start() < len(states) else ""
+            if state == '"':
+                return op.group(2)
+            return re.sub(r"(?<!\\)#", r"\\#", op.group(2))
         return m.group(0)
 
     return _VAR_USE_RE.sub(rep, command)
@@ -1070,6 +1085,9 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
     want_in = False
     in_pattern = False
     pat_parens = 0
+    # Open `${…}` expansions: a `#` inside one is text, so `${y:- #}; rm -rf /`
+    # must not hide the `rm` as a comment (XERK-1585).
+    braces = 0
     i, n = 0, len(command)
 
     def flush() -> None:
@@ -1102,7 +1120,14 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
             buf.append(command[i + 1])
             i += 2
             continue
-        if ch == "#" and _is_comment(command, i):
+        if command.startswith("${", i):
+            braces += 1
+            buf.append("${")
+            i += 2
+            continue
+        if ch == "}" and braces:
+            braces -= 1
+        elif ch == "#" and not braces and _is_comment(command, i):
             end = command.find("\n", i)
             i = n if end < 0 else end
             continue
@@ -1449,6 +1474,18 @@ def _expand_segments(command: str, depth: int = 0,
                 #    escaped `\;` is an operator again (`eval echo \; rm -rf /`).
                 if len(inner) > 1:
                     out.extend(_expand_segments(" ".join(inner), depth + 1, every_cd))
+            # 4. ONE re-parse of the segment's own words, before substitution
+            #    stripping (XERK-1585). Collapsing `eval eval …` skipped a
+            #    parse: `eval eval echo \\\; rm -rf /` only becomes an operator
+            #    on the SECOND eval, which this reaches by recursing once per
+            #    eval (each level is bounded by _MAX_EXPAND_DEPTH, which fails
+            #    closed). And the substitution pass above swallowed a QUOTED
+            #    `'$('` that eval's join makes live: `eval echo '$(' rm -rf / ')'`.
+            words = _strip_prefixes(_tokenize(_unwrap_group(raw)))
+            if len(words) > 1 and _basename(words[0]) == "eval":
+                again = " ".join(words[1:])
+                if again != " ".join(inner):
+                    out.extend(_expand_segments(again, depth + 1, every_cd))
         elif prog == "alias" and rest:
             # `alias f='rm -rf *'` runs wherever `f` is used — after any `cd`.
             for tok in rest:

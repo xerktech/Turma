@@ -1324,6 +1324,44 @@ class TestProducedScripts(unittest.TestCase):
         self.assertAllowed("rm -rf ~/tmp*")
 
 
+class TestCommentAndEvalReparse(unittest.TestCase):
+    """XERK-1585: a `#` inside `${…}` read as a comment, and an `eval` chain or a
+    quoted `$(` eval's join makes live skipped a re-parse. Each ran its payload
+    under real bash (touch marker) while the guard allowed it."""
+
+    def assertDenied(self, cmd):
+        self.assertIsNotNone(guard.is_destructive(cmd), cmd)
+
+    def assertAllowed(self, cmd):
+        self.assertIsNone(guard.is_destructive(cmd), cmd)
+
+    def test_a_hash_inside_braces_is_no_comment(self):
+        for cmd in ("echo ${y:- #}; rm -rf /", "echo ${y/ #/x}; rm -rf /",
+                    "echo ${y:+ #}; rm -rf /", "x=a; echo ${x:- #}; rm -rf /",
+                    "bash -c 'echo ${y:- #}; rm -rf /'",
+                    "eval 'echo ${y:- #}; rm -rf /'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A real comment after a closed expansion still hides its text.
+        self.assertAllowed("echo ${HOME} # rm -rf /")
+        self.assertAllowed("echo ${#x} ${x#*/}; ls")
+
+    def test_each_eval_in_a_chain_reparses_once(self):
+        for cmd in ("eval eval echo \\\\\\; rm -rf /",
+                    "eval eval eval echo \\\\\\\\\\\\\\; rm -rf /"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("eval eval echo hello")
+
+    def test_a_quoted_substitution_opener_eval_joins_is_live(self):
+        for cmd in ("eval echo '$(' rm -rf / ')'", "eval echo '`' rm -rf / '`'",
+                    "eval echo '<(' rm -rf / ')'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("eval echo 'rm -rf /etc'")
+        self.assertAllowed("echo '$(' rm -rf / ')'")
+
+
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
         for cmd in DESTRUCTIVE:
