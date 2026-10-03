@@ -118,6 +118,16 @@ of-record**, so both halves of the ADR split now hold:
   Postgres cursors, agents re-shipped tails onto missing files and the drain PUT those over the
   complete objects (reproduced on MinIO: 30190 → 324 bytes).
   - The gate lives in `mirror.hydrateGated(setGate)`, not inline in server.js, so a test pins it.
+- **Every await under the gate is BOUNDED (XERK-1282)** — one that never settled kept prod ingest
+  503'd for days, and `hydrateArchive`'s single-flight swallowed every later promotion.
+  - A byte pass past `HYDRATE_PASS_DEADLINE_MS` is ABANDONED (`_hydrateRun` bump) and retried with
+    the gate still CLOSED — never opened over an unclassified tree (XERK-1048).
+  - An abandoned pass writes nothing: its late GET is discarded via `_download`'s `stillWanted`,
+    or it would rename an older object over a file ingest has since appended to.
+  - The index load past `ARCHIVE_INDEX_HYDRATE_DEADLINE_MS` is treated as a failed one, its loader
+    CUT first (`withLoaderDeadline`) so a late page never lands in a map ingest now owns.
+  - A run still in flight logs every `ARCHIVE_HYDRATE_WATCH_MS`; gate duration is on `/metrics`
+    (`turma_archive_ingest_gated_seconds`) and the `/readyz` body — `/readyz` stays 200.
 - **A rendered file that did not land closes ingest for ITS transcript only (XERK-1050)**, not the
   replica: one undownloadable key (403, IAM List-without-Get, EACCES/ENOSPC) used to stall the
   whole fleet's archive ingest forever.

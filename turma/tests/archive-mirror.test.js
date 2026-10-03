@@ -920,3 +920,28 @@ test("XERK-1364: a matching .jsonl with a different .meta refreshes the sidecar"
   assert.equal(await m.hydrate(), 1);
   assert.match(fs.readFileSync(path.join(root, "repo", "a.jsonl.meta"), "utf8"), /cursorUnverified/);
 });
+
+test("a hydrate pass that never settles is abandoned and retried, ingest gated throughout (XERK-1282)", async () => {
+  const root = mkdtemp("turma-mir-");
+  let hang = true;
+  const late = [];
+  const store = { list: async () => ["repo/a.jsonl"], stat: async () => ({ size: 2 }),
+    getToFile: (k, dest) => {
+      if (hang) { hang = false; return new Promise((r) => late.push(() => { fs.writeFileSync(dest, "o"); r(true); })); }
+      fs.writeFileSync(dest, "ab"); return Promise.resolve(true);
+    } };
+  const logs = [];
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log: (l) => logs.push(l) });
+  const gate = [];
+  await m.hydrateGated((v) => gate.push(v), { passDeadlineMs: 20, firstDelayMs: 1, sleep: async () => {} });
+  assert.deepEqual(gate, [true, false]); // closed across the abandoned pass, opened after the retry
+  assert.equal(m.hydrated, true);
+  assert.match(logs.join("\n"), /a hydrate pass did not finish within 0s .*abandoned\. Archive ingest stays closed/);
+  const dest = path.join(root, "repo", "a.jsonl");
+  assert.equal(fs.readFileSync(dest, "utf8"), "ab");
+  // The abandoned pass's GET finally returns: discarded, never renamed over the file.
+  late.forEach((f) => f());
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fs.readFileSync(dest, "utf8"), "ab");
+  assert.equal(m._hydrating, false);
+});

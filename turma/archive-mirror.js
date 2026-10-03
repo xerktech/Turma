@@ -45,6 +45,13 @@ const path = require("path");
 // before answering "still syncing" (the fetches carry on). XERK-1043.
 const RAW_FETCH_CONCURRENCY = 4;
 const RAW_ROUTE_WAIT_MS = 10 * 1000;
+// The longest ONE hydrate pass may run before hydrateUntilListed abandons it and
+// starts another (XERK-1282). A pass awaits a listing and one GET per missing
+// rendered file; any of those that never settles (a request queued for a socket
+// it never gets, before its own idle timeout is armed) otherwise held the ingest
+// gate closed for days. Generous: a slow first fill that hits it loses nothing —
+// what it downloaded stays on disk and the next pass fetches only the rest.
+const HYDRATE_PASS_DEADLINE_MS = 15 * 60 * 1000;
 
 class ArchiveMirror {
   /**
@@ -69,6 +76,9 @@ class ArchiveMirror {
     this._dirty = new Set();
     this._draining = null; // the in-flight drain's promise, while one runs
     this._hydrating = false;
+    // Bumped by every hydrate pass and by abandoning one: a pass whose number is no
+    // longer current stops at its next await and writes nothing (XERK-1282).
+    this._hydrateRun = 0;
     // Remote-pending raw objects: raw-root key (`<repo>/<x>.jsonl.raw`) ->
     // Map(key -> remote size). Grouped by root so the per-transcript questions
     // (pending bytes, fetch a directory) never scan the whole bucket's keys.
@@ -183,10 +193,13 @@ class ArchiveMirror {
   async hydrate() {
     if (!this.blobStore || this._hydrating) return 0;
     this._hydrating = true;
+    const run = ++this._hydrateRun;
+    const stale = () => run !== this._hydrateRun;
     let fetched = 0;
     try {
       // A retryBlocked pass renames files into place; never classify under it.
       if (this._retrying) await this._retrying;
+      if (stale()) return 0;
       // [{key, size}] in one listing when the store can give sizes (S3 always
       // does); otherwise a HEAD per key, the pre-XERK-1043 shape.
       let listing;
@@ -202,10 +215,12 @@ class ArchiveMirror {
           }
         }
       } catch (e) {
+        if (stale()) return 0;
         this.hydrated = false;
         this.lastFailure = `listing the bucket failed (${e && e.message}) — is the object store reachable?`;
         return 0;
       }
+      if (stale()) return 0;
       // Classify EVERY key against local disk and swap the pending set in ONE
       // synchronous step — no await between the listing and the swap. Clearing
       // the set and refilling it across the download loop's awaits left a window
@@ -276,9 +291,13 @@ class ArchiveMirror {
           // file at its real path, which ingest would then append to and the
           // drain PUT over the complete object (XERK-1043 QA, pass 2). A 404
           // (deleted since the listing) returns false: gone, as above.
-          if (await this._download(key, dest)) fetched++;
+          // An abandoned pass's late GET is discarded, never renamed over a file
+          // a newer pass (and the ingest it reopened) has since written.
+          if (await this._download(key, dest, () => !stale())) fetched++;
+          if (stale()) return fetched;
           this._blocked.delete(key);
         } catch (e) {
+          if (stale()) return fetched;
           // ABSENT (or short) locally while Postgres holds its full cursor:
           // ingest onto it would write a tail-only file the drain PUTs over the
           // complete object. Blocked until retryBlocked lands it (XERK-1050).
@@ -293,9 +312,30 @@ class ArchiveMirror {
         this.log(`archive hydrate: reindex failed (${e && e.message})`);
       }
     } finally {
-      this._hydrating = false;
+      if (!stale()) this._hydrating = false;
     }
     return fetched;
+  }
+
+  // One hydrate(), bounded by `deadlineMs`. A pass still running at the deadline is
+  // ABANDONED — its later awaits return without writing — and reported as an
+  // incomplete hydrate, so hydrateUntilListed logs it and retries with ingest still
+  // gated (XERK-1048: never open over a tree that was not fully classified).
+  async _boundedHydrate(deadlineMs) {
+    let timer;
+    const timedOut = Symbol("timedOut");
+    const r = await Promise.race([
+      this.hydrate(),
+      new Promise((res) => { timer = setTimeout(() => res(timedOut), deadlineMs); timer.unref?.(); }),
+    ]);
+    clearTimeout(timer);
+    if (r !== timedOut) return r;
+    this._hydrateRun++;
+    this._hydrating = false;
+    this.hydrated = false;
+    this.lastFailure = `a hydrate pass did not finish within ${Math.round(deadlineMs / 1000)}s ` +
+      `(a store request that never settled?) and was abandoned.`;
+    return 0;
   }
 
   // One summary line, never one per key: a persistent failure across a whole prod
@@ -316,14 +356,15 @@ class ArchiveMirror {
   // one undownloadable key no longer stalls the whole hub (XERK-1050). `sleep` is
   // injectable for tests.
   async hydrateUntilListed({ firstDelayMs = 2000, maxDelayMs = 60 * 1000,
+    passDeadlineMs = HYDRATE_PASS_DEADLINE_MS,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
-    let fetched = await this.hydrate();
+    let fetched = await this._boundedHydrate(passDeadlineMs);
     for (let delay = firstDelayMs; this.blobStore && !this.hydrated;
       delay = Math.min(delay * 2, maxDelayMs)) {
       this.log(`archive hydrate: incomplete — ${this.lastFailure} Archive ingest ` +
         `stays closed on this replica; retrying in ${Math.round(delay / 1000)}s`);
       await sleep(delay);
-      fetched = await this.hydrate();
+      fetched = await this._boundedHydrate(passDeadlineMs);
     }
     return fetched;
   }
