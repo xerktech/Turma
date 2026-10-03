@@ -16570,6 +16570,14 @@ class SessionManager:
         self._archive_inventory_pos = 0
         self._archive_catalog = {}
         self._archive_sent_inventory = False
+        # The inventory is built on its own worker (XERK-1266, see
+        # _stage_archive_inventory): the staged input snapshot, the newest
+        # published (inventory, catalog), and the thread, all under the lock.
+        self._inventory_lock = threading.Lock()
+        self._inventory_wake = threading.Event()
+        self._inventory_inputs = None
+        self._inventory_ready = None
+        self._inventory_worker = None
         # XERK-424. `_archive_known` is transcriptId -> the byte cursor the hub
         # last reported for it, which is the only way this side can tell "the hub
         # has this" from "the hub has never seen it" — the reply only carries
@@ -26590,6 +26598,13 @@ class SessionManager:
         (`_archive_inventory`). Returns `(out, defer_raw, universe)`; `universe`
         (every eligible slug's *.jsonl, running ones included) is only used by the
         old rotation's `_trim_archive_offered` bound."""
+        return self._archive_candidates_from(self._archive_candidate_inputs())
+
+    def _archive_candidate_inputs(self):
+        """The IN-MEMORY half of `_archive_candidates`: registry/ledger reads only,
+        no disk. Split out so the beat can snapshot them and hand them to the
+        inventory worker (XERK-1266) — the registry and `usage_ledger` are the
+        beat's to mutate, so the worker never iterates them itself."""
         running = self._running_slugs()
         # A running non-dsh session ships its RENDERED transcript (for instant chat
         # scrollback) but DEFERS its raw sidecars to session end — bounding the
@@ -26609,6 +26624,13 @@ class SessionManager:
                 "remoteKey": normalize_remote(m.get("remote")) or (m.get("repo") or "?"),
                 "worktree": wt,
             }
+        return running, defer_raw, sess_meta, slug_attr
+
+    def _archive_candidates_from(self, inputs):
+        """The DISK half of `_archive_candidates`: listdir + stat every eligible
+        slug's transcripts, given `_archive_candidate_inputs()`. Safe off the
+        beat — it reads nothing but `inputs` and the filesystem."""
+        running, defer_raw, sess_meta, slug_attr = inputs
         out = []
         # Every transcript in every eligible slug, RUNNING ONES INCLUDED — the
         # universe the rotation's bookkeeping has to cover, which is not the same
@@ -26707,7 +26729,7 @@ class SessionManager:
             self._archive_inventory_pos = (pos + slots) % len(rest)
         return window
 
-    def _archive_inventory(self):
+    def _archive_inventory(self, inputs=None):
         """The hub-driven replacement for `_archive_manifest` (XERK-431): a cheap
         `[{i, s, r}]` inventory of what this host HAS — transcript id, current
         rendered size, current raw total — over a bounded rotating window. The hub
@@ -26721,8 +26743,15 @@ class SessionManager:
         to files. `r` is 0 for a deferred-raw (running non-dsh) transcript, so the
         hub never raw-wants what this side will not push while it runs.
 
-        Design + rollover: docs/archive-offer-inversion-adr.md."""
-        out, defer_raw, _universe = self._archive_candidates()
+        Design + rollover: docs/archive-offer-inversion-adr.md.
+
+        Runs on the inventory WORKER, never the beat (XERK-1266): `inputs` is the
+        beat's `_archive_candidate_inputs()` snapshot. Its cost is ~3 disk I/Os
+        per windowed transcript, which on a cache-cold contended pool measured
+        35-75s. `_archive_inventory_pos` is the worker's alone."""
+        if inputs is None:
+            inputs = self._archive_candidate_inputs()
+        out, defer_raw, _universe = self._archive_candidates_from(inputs)
         window = self._inventory_window(out)
         inventory = []
         catalog = {}
@@ -26930,6 +26959,51 @@ class SessionManager:
         return out
 
     # --- Archive sync worker (XERK-395) -----------------------------------
+
+    def _stage_archive_inventory(self, inputs):
+        """Hand the inventory worker a snapshot to build from, starting it if it
+        is not running (XERK-1266). Coalesces: a snapshot staged while a build is
+        in flight replaces any older one still waiting. Never raises onto the
+        beat — a failed Thread.start() (pids_limit, XERK-402) leaves the snapshot
+        staged and the next refresh beat retries."""
+        try:
+            with self._inventory_lock:
+                self._inventory_inputs = inputs
+                w = self._inventory_worker
+                if w is None or not w.is_alive():
+                    w = threading.Thread(target=self._inventory_worker_loop,
+                                         name="archive-inventory", daemon=True)
+                    self._inventory_worker = w
+                    w.start()
+            self._inventory_wake.set()
+        except Exception as e:
+            log(f"archive inventory could not be staged: {type(e).__name__}: {e}")
+
+    def _take_archive_inventory(self):
+        """Pop the newest published `(inventory, catalog)`, or None. Each result
+        ships once."""
+        with self._inventory_lock:
+            ready, self._inventory_ready = self._inventory_ready, None
+        return ready
+
+    def _inventory_worker_loop(self):
+        """Build each staged inventory off the beat and publish it for the next
+        full beat to ship. Never raises — a dead worker would silently stop the
+        archive's offers."""
+        while True:
+            self._inventory_wake.wait()
+            self._inventory_wake.clear()
+            with self._inventory_lock:
+                inputs, self._inventory_inputs = self._inventory_inputs, None
+            if inputs is None:
+                continue
+            try:
+                ready = self._archive_inventory(inputs)
+            except Exception as e:
+                log(f"archive inventory build failed: {type(e).__name__}: {e}")
+                continue
+            with self._inventory_lock:
+                self._inventory_ready = ready
 
     def queue_archive_sync(self, reply):
         """Stage a heartbeat reply's archive cursors for the sync WORKER and
@@ -31347,12 +31421,23 @@ class SessionManager:
         # back hub), remembered by id so the reply's cursors map back for the push.
         # `_archive_sent_inventory` tells queue_archive_sync which path this beat
         # took, so it reads the reply correctly across the one-beat flag transition.
-        if refresh:
-            if self._archive_hub_offer:
-                inventory, self._archive_catalog = self._archive_inventory()
+        #
+        # The inventory is BUILT on its own worker (XERK-1266): a refresh beat only
+        # stages a snapshot of its in-memory inputs, and whichever full beat first
+        # finds the result published ships it, swapping in the catalog it was built
+        # with in the same step so the reply's wanted ids resolve against exactly
+        # what was offered. One beat stale, accepted.
+        if not light and self._archive_hub_offer:
+            ready = self._take_archive_inventory()
+            if ready is not None:
+                inventory, self._archive_catalog = ready
                 self._archive_sent_inventory = True
                 if inventory:
                     payload["archiveInventory"] = inventory
+        if refresh:
+            if self._archive_hub_offer:
+                self._archive_sent_inventory = True
+                self._stage_archive_inventory(self._archive_candidate_inputs())
             else:
                 self._archive_sent_inventory = False
                 manifest = self._archive_manifest()

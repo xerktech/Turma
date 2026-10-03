@@ -36,6 +36,12 @@ paths:
   - **`_archive_sent_inventory` records which path build_payload took THIS beat**, so
     `queue_archive_sync` reads the reply correctly across the one-beat capability flip; a hub rollback
     (marker gone) reverts to the manifest path within one refresh beat.
+  - **The inventory is BUILT on its own worker, never the beat** (XERK-1266): its walk is ~3 disk
+    I/Os per windowed transcript, measured 35-75s cache-cold on a contended pool. A refresh beat
+    stages `_archive_candidate_inputs()` (the in-memory registry/ledger reads — the worker must
+    never iterate those itself); the next FULL beat takes the published `(inventory, catalog)` and
+    swaps that catalog in alongside it, so a want resolves against exactly what was offered.
+    `_archive_inventory_pos` is the worker's alone. The legacy manifest path is still inline.
   - **The old rotation (`_archive_offered`/`_archive_cand_hwm`/`ARCHIVE_OFFERED_HARD_MAX`/
     `archive-offered.json`/`_archive_known`/`_note_archive_known`/`_archive_window`) is KEPT behind
     the `archiveOffer` flag for an older/rolled-back hub; a follow-up removes it once the fleet has

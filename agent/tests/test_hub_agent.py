@@ -25555,12 +25555,75 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
         self.assertIn("archiveManifest", payload)
         self.assertNotIn("archiveInventory", payload)
         self.assertFalse(sm._archive_sent_inventory)
-        # Once the hub advertised it -> the inventory path.
+        # Once the hub advertised it -> the inventory path. The refresh beat only
+        # STAGES the build (XERK-1266); the next full beat ships what it published.
         sm._archive_hub_offer = True
         payload = sm.build_payload(0)
+        self.assertNotIn("archiveManifest", payload)
+        self.assertTrue(sm._archive_sent_inventory)
+        self._wait_published(sm)
+        payload = sm.build_payload(1)
         self.assertIn("archiveInventory", payload)
         self.assertNotIn("archiveManifest", payload)
         self.assertTrue(sm._archive_sent_inventory)
+
+    def _wait_published(self, sm, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with sm._inventory_lock:
+                if sm._inventory_ready is not None:
+                    return
+            time.sleep(0.01)
+        self.fail("the inventory worker never published")
+
+    def test_inventory_is_built_off_the_beat(self):
+        """XERK-1266: the inventory's disk walk (measured 35-75s cache-cold on a
+        contended pool) never runs on the beat thread, and a refresh beat does
+        not wait for it."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/off"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_hub_offer = True
+        threads = []
+        release = threading.Event()
+        real = sm._archive_candidates_from
+        def slow_walk(inputs):
+            threads.append(threading.current_thread().name)
+            release.wait(5)
+            return real(inputs)
+        with mock.patch.object(sm, "_archive_candidates_from", slow_walk):
+            t0 = time.time()
+            payload = sm.build_payload(0)
+            self.assertLess(time.time() - t0, 3, "the refresh beat waited for the walk")
+            self.assertNotIn("archiveInventory", payload)
+            # A full beat while the walk is still running ships nothing.
+            self.assertNotIn("archiveInventory", sm.build_payload(1))
+            release.set()
+            self._wait_published(sm)
+        self.assertEqual(threads, ["archive-inventory"])
+        # A LIGHT beat never ships it; the next full beat does, once, with the
+        # catalog it was built with swapped in beside it.
+        sm._archive_catalog = {}
+        self.assertNotIn("archiveInventory", sm.build_payload(2, light=True))
+        payload = sm.build_payload(3)
+        self.assertEqual([e["i"] for e in payload["archiveInventory"]], ["t1"])
+        self.assertEqual(set(sm._archive_catalog), {"t1"})
+        self.assertNotIn("archiveInventory", sm.build_payload(4))
+        # The reply's want resolves against that catalog.
+        sm.queue_archive_sync({"archiveOffer": "hub", "archiveHave": {"t1": 0}})
+        self.assertEqual(set(sm._archive_pending), {"t1"})
+
+    def test_a_failed_worker_start_never_raises_onto_the_beat(self):
+        sm = self.make_manager()
+        sm._archive_hub_offer = True
+        sm.usage_ledger = {}
+        sm.registry = []
+        with mock.patch.object(ha.threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            sm._stage_archive_inventory(sm._archive_candidate_inputs())
+        self.assertIsNotNone(sm._inventory_inputs, "the snapshot stays staged")
 
     def test_queue_sync_tracks_capability_and_builds_pending_from_the_want(self):
         sm = self.make_manager()
