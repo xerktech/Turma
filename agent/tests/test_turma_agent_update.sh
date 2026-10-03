@@ -64,6 +64,8 @@ make_tarball() {  # <version> <outdir> [nohooks] [withdsh]
     echo "// driver $version" >"$staged/dsh-session-driver/dist/index.js"
     echo "// guard $version" >"$staged/dsh/guard/index.mjs"
   fi
+  # Every real payload ships the update timer (release.yml).
+  echo "# timer $version" >"$staged/turma-agent-update.timer"
   echo "$version" >"$staged/VERSION"
   local tgz="$out/turma-agent-native-v${version}.tar.gz"
   tar czf "$tgz" -C "$staged" .
@@ -1565,6 +1567,48 @@ else
   fail "log lines are not prefix-tagged: $(cat "$root/home/.turma/update.log" 2>/dev/null)"
 fi
 rm -rf "$root" "$d"
+
+# --- the update timer is refreshed from the payload (XERK-1266) ---------------
+# install.sh was the only writer of the timer, so a host whose timer had gone
+# `elapsed` (monotonic OnUnitActiveSec) never got the fix. An update now
+# rewrites it when it differs, reloads and restarts it; an identical one is left.
+if [ -d /run/systemd/system ]; then
+  for same in no yes; do
+    d="$(new_gh_dir)"; add_unified_release "$d" "v0.5.0" "0.5.0" "v0.5.0"
+    root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+    cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+    echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+    mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+    echo "0.4.0" >"$prefix/VERSION"
+    install_fake_restart "$bin"; install_fake_gh "$bin"
+    udir="$root/home/.config/systemd/user"; mkdir -p "$udir"
+    if [ "$same" = yes ]; then echo "# timer 0.5.0" >"$udir/turma-agent-update.timer"
+    else echo "OnUnitActiveSec=1h" >"$udir/turma-agent-update.timer"; fi
+    export TURMA_TEST_RESTART_LOG="$root/restart.log"; : > "$TURMA_TEST_RESTART_LOG"
+    FAKE_GH_DIR="$d" HOME="$root/home" XDG_CONFIG_HOME="" PATH="$bin:$PATH" \
+      TURMA_REPO="xerktech/turma" TURMA_CLAUDE_AUTO_UPDATE=0 \
+      "$bin/turma-agent-update" >/dev/null 2>&1 || true
+    unset TURMA_TEST_RESTART_LOG
+    got="$(cat "$udir/turma-agent-update.timer")"
+    assert_eq "# timer 0.5.0" "$got" "timer content after update (same=$same)" \
+      "installed timer not refreshed from the payload: $got"
+    if [ "$same" = no ]; then
+      if grep -q "systemctl --user daemon-reload" "$root/restart.log" \
+         && grep -q "systemctl --user try-restart turma-agent-update.timer" "$root/restart.log"; then
+        pass "a changed timer is reloaded and restarted"
+      else
+        fail "changed timer not reloaded/restarted: $(cat "$root/restart.log")"
+      fi
+    elif grep -q "turma-agent-update.timer" "$root/restart.log"; then
+      fail "an identical timer was restarted anyway"
+    else
+      pass "an identical timer is left alone"
+    fi
+    rm -rf "$root" "$d"
+  done
+else
+  pass "timer refresh cases skipped: no systemd on this runner"
+fi
 
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
 exit "$FAILED"
