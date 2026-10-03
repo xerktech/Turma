@@ -32,8 +32,12 @@ hook-log tail) + `agent/hooks/permlog.py`.
   - **Except a REPAINT** (`_dialog_is_repaint`): the face moves with the pane's width (the ttyd
     attach resizes tmux, wrapping detail and labels) and with Tab-to-amend, not the call. A changed
     face whose pending call is still the open row's `toolUseId`, with the same `dialogKind`, keeps the
-    row. NOT for a delegated row (every sub-agent prompt shares the Task id) or one with no
-    `toolUseId`, which fall back to the face. The tail is read only on a face change.
+    row. The tail is read only on a face change.
+  - **A row with no `toolUseId` of its own repaints on its FACE** (`_dialog_faces_match`): a delegated
+    row (every sub-agent prompt shares the Task id), an overridden one (the id was cleared) or one
+    with no pending call. Same `dialogKind`, and question + detail equal with all whitespace removed;
+    a face at parse_pane_prompt's line cap is the other's tail, at its char cap the other's head.
+    Labels are not compared (a wrap drops one). Without it a ttyd attach split such a prompt in two.
   - **Only a PRE-EXECUTION prompt (`permission`/`plan`) repaints on the call alone.** A running call
     raises any number of sandbox prompts under one `toolUseId` (`npm install`: the registry, then
     GitHub), so a `sandbox` face is a repaint only while its host equals the row's `head`.

@@ -11308,6 +11308,36 @@ def _pane_dialog_identity(prompt):
             str(prompt.get("detail") or "")[:800], labels)
 
 
+def _dialog_compact(text):
+    return re.sub(r"\s+", "", str(text or ""))
+
+
+def _dialog_faces_match(prev_prompt, prev_detail, prompt):
+    """True when `prompt` (a parse_pane_prompt dict) is the face (`prev_prompt`,
+    `prev_detail`) rewrapped: the question + detail equal with every whitespace
+    removed (the question is the LAST line only, so a wrapped question moves its
+    head into the detail). A face at parse_pane_prompt's caps is a cut of the
+    other: one at PANE_PROMPT_DETAIL_LINES lost its TOP lines (its text is the
+    other's tail); one at PANE_PROMPT_DETAIL_CHARS lost its BOTTOM (its detail is
+    the other's head, under the same question). Option labels are not compared:
+    a narrow pane wraps one off the 1..N run."""
+    faces = [(str(prev_prompt or ""), str(prev_detail or "")),
+             (str(prompt.get("prompt") or ""), str(prompt.get("detail") or ""))]
+    full = [_dialog_compact(d + q) for q, d in faces]
+    if not full[0] or not full[1]:
+        return False
+    if full[0] == full[1]:
+        return True
+    for (q, d), mine, (oq, od), other in ((faces[0], full[0], faces[1], full[1]),
+                                          (faces[1], full[1], faces[0], full[0])):
+        if len(d.splitlines()) >= PANE_PROMPT_DETAIL_LINES and other.endswith(mine):
+            return True
+        if (len(d) >= PANE_PROMPT_DETAIL_CHARS and _dialog_compact(q) == _dialog_compact(oq)
+                and _dialog_compact(od).startswith(_dialog_compact(d))):
+            return True
+    return False
+
+
 def _pane_dialog_host(prompt):
     """The host a sandbox dialog asks about — its "Host:" line, else the first
     host name its text mentions — or ""."""
@@ -29461,8 +29491,8 @@ class SessionManager:
         key = _pane_dialog_identity(pp) if pp is not None else None
         if key != self._perm_dialog_key.get(sid):
             row = self._perm_open.get(sid)
-            if (row is not None and pp is not None
-                    and self._dialog_is_repaint(sess, row, pp)):
+            if (row is not None and pp is not None and self._dialog_is_repaint(
+                    sess, row, pp, self._perm_dialog_key.get(sid))):
                 # The SAME prompt redrawn (a resize rewraps it, Tab amends the
                 # command): one prompt, one row — never close and reopen it.
                 self._perm_dialog_key[sid] = key
@@ -29480,13 +29510,20 @@ class SessionManager:
                         self._open_dialog_row(sess, pp, now_ms)
         self._permission_ask_edge(sess, signals, now_ms)
 
-    def _dialog_is_repaint(self, sess, row, pp):
+    def _dialog_is_repaint(self, sess, row, pp, prev_key=None):
         """True when a CHANGED dialog face is the open row's prompt redrawn: the
         face moves with the pane's width (wrapped detail, a lost wrapped option)
-        and with Tab-to-amend, while the call it asks about does not. Only a row
-        holding a toolUseId of its own can tell (a sub-agent's delegation id is
-        shared by every prompt raised inside it), and only when the call still
-        pending is that same call with the kind unchanged.
+        and with Tab-to-amend, while the call it asks about does not. A row
+        holding a toolUseId of its own tells by that: the call still pending is
+        that same call with the kind unchanged.
+
+        A row with none of its own — a sub-agent's (the delegation id is shared
+        by every prompt raised inside it, and an adopted hook clears it), or one
+        with no pending call — tells by the FACE instead: the kind unchanged and
+        the question + detail equal once every whitespace is gone
+        (`_dialog_faces_match`). A rewrap (a ttyd attach resizes tmux) moves only
+        where the lines break; the next prompt names another command. Tab-to-amend
+        on such a row opens a new one — the face is all it has.
 
         That call identifies a PRE-EXECUTION prompt only (`permission`, `plan`):
         it asks once, before the call runs. A RUNNING call can raise any number
@@ -29495,7 +29532,9 @@ class SessionManager:
         it names the row's host — another host is another prompt. Reads the tail
         on a face change only, never on the steady-state beat."""
         tuid = row.get("toolUseId")
-        if not tuid or row.get("tool") in PERMISSION_DELEGATING_TOOLS:
+        own = bool(tuid) and row.get("tool") not in PERMISSION_DELEGATING_TOOLS
+        if not own and not (isinstance(prev_key, tuple) and len(prev_key) == 3
+                            and _dialog_faces_match(prev_key[0], prev_key[1], pp)):
             return False
         kind = row.get("dialogKind")
         if kind == "sandbox":
@@ -29506,7 +29545,7 @@ class SessionManager:
             return False
         path = _session_transcript_path(sess)
         call = pending_tool_call(_tail_entries(path)) if path else None
-        if not call or call.get("toolUseId") != tuid:
+        if own and (not call or call.get("toolUseId") != tuid):
             return False
         return classify_pane_dialog(pp, call) == kind
 

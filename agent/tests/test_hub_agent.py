@@ -37342,6 +37342,46 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
         self.assertEqual(len({r["id"] for r in self.rows()}), 2)
 
+    def test_a_sub_agents_prompt_rewrapped_after_the_override_stays_one_row(self):
+        # Answering at the terminal attaches ttyd, which resizes tmux and
+        # rewraps the dialog. The overridden row has no call id of its own, so
+        # its face (whitespace aside) says it is the same prompt.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        wide = dict(self.dialog(), detail="Bash command\nnpm test -- --runInBand "
+                    "--coverage --reporter=dot\nRun the suite")
+        self.edge(wide, at=1000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        narrow = dict(self.dialog(), prompt="proceed?",
+                      detail="Bash command\nnpm test -- --runInBand\n--coverage "
+                      "--reporter=dot\nRun the suite\nDo you want to")
+        narrow["options"] = narrow["options"][:1] + [
+            dict(narrow["options"][1], label="Yes, and don't ask")]
+        self.edge(narrow, at=5000)
+        self.edge(None, at=30000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(list(rows), [f"d-{self.SID}-1000"])
+        row, = rows.values()
+        self.assertEqual((row["tool"], row["head"], row["waitedMs"]),
+                         ("Bash", "npm test", 29000))
+
+    def test_a_rewrapped_face_with_the_detail_line_capped_is_the_same_prompt(self):
+        # A narrow pane wraps a long heredoc past PANE_PROMPT_DETAIL_LINES: the
+        # face keeps only the bottom lines, a tail of the wide face.
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        body = [f"line{i} " + "x" * 30 for i in range(10)]
+        self.edge(dict(self.dialog(), detail="\n".join(["Bash command"] + body)), at=1000)
+        wrapped = [part for b in body for part in (b[:20], b[20:])]
+        self.edge(dict(self.dialog(), detail="\n".join(
+            wrapped[-ha.PANE_PROMPT_DETAIL_LINES:])), at=2000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 1)
+        # A command that only EXTENDS the last one is the next prompt.
+        self.edge(dict(self.dialog(), detail="\n".join(
+            wrapped[-ha.PANE_PROMPT_DETAIL_LINES:]) + " --force"), at=3000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
     def test_the_delegations_own_prompt_is_not_overridden(self):
         # A prompt to LAUNCH the Agent is the delegation's own call: same tool
         # and input, so it merges without rewriting the row.
