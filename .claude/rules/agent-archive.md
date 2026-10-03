@@ -43,8 +43,9 @@ paths:
     swaps that catalog in alongside it, so a want resolves against exactly what was offered.
     `_archive_inventory_pos` is the worker's alone. The legacy manifest path is still inline.
   - **No archive path runs until a reply has named the hub's** (`_archive_offer_known`): beat 0
-    after a restart used to default to the inline manifest walk. The manifest path drops any
-    published inventory, so a rolled-back-then-re-rolled hub never gets a stale one.
+    after a restart used to default to the inline manifest walk. Every full beat that sees the hub
+    NOT offering bumps `_inventory_gen`; a result staged under an older generation is discarded,
+    so a rolled-back-then-re-rolled hub never gets a stale one, even from a walk still in flight.
   - **The old rotation (`_archive_offered`/`_archive_cand_hwm`/`ARCHIVE_OFFERED_HARD_MAX`/
     `archive-offered.json`/`_archive_known`/`_note_archive_known`/`_archive_window`) is KEPT behind
     the `archiveOffer` flag for an older/rolled-back hub; a follow-up removes it once the fleet has

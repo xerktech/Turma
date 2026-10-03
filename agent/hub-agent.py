@@ -16577,6 +16577,10 @@ class SessionManager:
         self._inventory_wake = threading.Event()
         self._inventory_inputs = None
         self._inventory_ready = None
+        # Bumped by every full beat that sees the hub NOT offering; a build
+        # staged under an older generation is discarded rather than shipped
+        # after a rollback-and-re-roll, however long its walk ran.
+        self._inventory_gen = 0
         self._inventory_worker = None
         # Whether any reply has told us the hub's archive path yet, and whether
         # an inventory has been staged since boot (see build_payload).
@@ -26972,7 +26976,7 @@ class SessionManager:
         staged and the next refresh beat retries."""
         try:
             with self._inventory_lock:
-                self._inventory_inputs = inputs
+                self._inventory_inputs = (self._inventory_gen, inputs)
                 w = self._inventory_worker
                 if w is None or not w.is_alive():
                     w = threading.Thread(target=self._inventory_worker_loop,
@@ -26988,7 +26992,9 @@ class SessionManager:
         ships once."""
         with self._inventory_lock:
             ready, self._inventory_ready = self._inventory_ready, None
-        return ready
+        if ready is None or ready[0] != self._inventory_gen:
+            return None
+        return ready[1]
 
     def _inventory_worker_loop(self):
         """Build each staged inventory off the beat and publish it for the next
@@ -26998,11 +27004,12 @@ class SessionManager:
             self._inventory_wake.wait()
             self._inventory_wake.clear()
             with self._inventory_lock:
-                inputs, self._inventory_inputs = self._inventory_inputs, None
-            if inputs is None:
+                staged, self._inventory_inputs = self._inventory_inputs, None
+            if staged is None:
                 continue
+            gen, inputs = staged
             try:
-                ready = self._archive_inventory(inputs)
+                ready = (gen, self._archive_inventory(inputs))
             except Exception as e:
                 log(f"archive inventory build failed: {type(e).__name__}: {e}")
                 continue
@@ -31432,6 +31439,12 @@ class SessionManager:
         # finds the result published ships it, swapping in the catalog it was built
         # with in the same step so the reply's wanted ids resolve against exactly
         # what was offered. One beat stale, accepted.
+        if not light and not self._archive_hub_offer:
+            # A hub that is not (or no longer) offering: nothing built or still
+            # building for an earlier offer may ship after it re-advertises, and
+            # the first full beat after that re-stages rather than waiting.
+            self._inventory_gen += 1
+            self._inventory_staged_once = False
         if not light and self._archive_hub_offer:
             ready = self._take_archive_inventory()
             if ready is not None:
@@ -31452,9 +31465,6 @@ class SessionManager:
                 self._inventory_staged_once = True
                 self._stage_archive_inventory(self._archive_candidate_inputs())
             elif refresh:
-                # A hub that stopped offering: an inventory published for it must
-                # never ship after it re-advertises, however stale by then.
-                self._take_archive_inventory()
                 self._archive_sent_inventory = False
                 manifest = self._archive_manifest()
                 self._archive_pending = {m["transcriptId"]: m for m in manifest}

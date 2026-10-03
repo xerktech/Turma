@@ -25659,13 +25659,26 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
         sm.usage_ledger = {}
         sm._archive_offer_known = True
         sm._archive_hub_offer = True
+        old = (sm._inventory_gen, ([{"i": "old", "s": 1, "r": 1}], {"old": {}}))
+        # V1: published, the hub rolls back for one NON-refresh beat, re-rolls.
         with sm._inventory_lock:
-            sm._inventory_ready = ([{"i": "old", "s": 1, "r": 1}], {"old": {}})
-        sm._archive_hub_offer = False  # a rolled-back hub
-        sm.build_payload(ha.USAGE_EVERY)  # refresh: the manifest path
-        sm._archive_hub_offer = True   # re-rolled
+            sm._inventory_ready = old
+        sm._archive_hub_offer = False
+        sm.build_payload(1)
+        sm._archive_hub_offer = True
+        with mock.patch.object(sm, "_stage_archive_inventory") as stage:
+            payload = sm.build_payload(2)
+            stage.assert_called_once()  # re-staged at once, not a cycle later
+        self.assertNotIn("archiveInventory", payload)
+        # V2: a walk STARTED before the rollback publishes after it.
+        gen = sm._inventory_gen
+        sm._archive_hub_offer = False
+        sm.build_payload(3)
+        with sm._inventory_lock:
+            sm._inventory_ready = (gen, ([{"i": "inflight", "s": 1, "r": 1}], {}))
+        sm._archive_hub_offer = True
         with mock.patch.object(sm, "_stage_archive_inventory"):
-            payload = sm.build_payload(ha.USAGE_EVERY + 1)
+            payload = sm.build_payload(4)
         self.assertNotIn("archiveInventory", payload)
 
     def test_a_failed_worker_start_never_raises_onto_the_beat(self):
