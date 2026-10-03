@@ -643,6 +643,70 @@ test("XERK-1315: the raw ceiling counts the raw dir (plus bucket-pending bytes),
   assert.deepEqual(JSON.parse(fresh.stdout.trim().split("\n").pop()), [20, 24, 34, true]);
 });
 
+test("XERK-1321: rawLimits confirms an over-cap row off the raw dir, healing an inflated one", () => {
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    const tmp = mkdtemp("turma-rawinfl-");
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES = "32";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-07-11T00:00:00Z", summary: "s" };
+    const db = a.openDb();
+    const row = (id) => db.prepare("SELECT rawBytes FROM sessions WHERE transcriptId=?").get(id).rawBytes;
+    const out = [];
+    for (const [id, n] of [["inf", 10], ["over", 40]]) {
+      a.ingestChunk("nas", id, meta, 0, 10, [{ uuid: id, role: "user", text: "hi" }]);
+      a.ingestRaw("nas", id, id + ".jsonl", 0, Buffer.alloc(n, 0x61));
+    }
+    // A figure the old double count left over the cap, 10 bytes on disk.
+    db.prepare("UPDATE sessions SET rawBytes=200 WHERE transcriptId='inf'").run();
+    out.push(a.rawLimits(["inf", "over"]));
+    out.push(row("inf"));
+    // ...and with the skip gone, ingestRaw takes the agent's next push.
+    out.push(a.ingestRaw("nas", "inf", "inf.jsonl", 10, Buffer.alloc(4, 0x62)).stored);
+    console.log(JSON.stringify(out));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.deepEqual(JSON.parse(fresh.stdout.trim().split("\n").pop()), [["over"], 10, 14]);
+});
+
+test("XERK-1321: rawLimits' confirm budget is capped, fails closed, and skips rows already confirmed over", () => {
+  const fresh = require("child_process").spawnSync(process.execPath, ["-e", `
+    const path = require("path");
+    const { mkdtemp } = require(${JSON.stringify(path.join(__dirname, "tmpdirs.js"))});
+    const tmp = mkdtemp("turma-rawbudget-");
+    process.env.ARCHIVE_DIR = path.join(tmp, "archive");
+    process.env.ARCHIVE_DB = path.join(tmp, "archive", "index.db");
+    process.env.ARCHIVE_RAW_TRANSCRIPT_MAX_BYTES = "32";
+    const a = require(${JSON.stringify(path.join(__dirname, "..", "archive.js"))});
+    const meta = { repo: "r", endedTs: "2026-07-11T00:00:00Z", summary: "s" };
+    const db = a.openDb();
+    const ids = [];
+    // 70 rows truly over the cap, then one inflated row behind them.
+    for (let i = 0; i < 71; i++) {
+      const id = "b" + String(i).padStart(3, "0");
+      ids.push(id);
+      a.ingestChunk("nas", id, meta, 0, 10, [{ uuid: id, role: "user", text: "hi" }]);
+      a.ingestRaw("nas", id, id + ".jsonl", 0, Buffer.alloc(i < 70 ? 40 : 10, 0x61));
+    }
+    db.prepare("UPDATE sessions SET rawBytes=999 WHERE transcriptId='b070'").run();
+    // Another host's beat, flagging nothing, lands between this host's beats.
+    a.ingestChunk("nas", "other", meta, 0, 10, [{ uuid: "o", role: "user", text: "hi" }]);
+    const out = [];
+    // The first call's budget runs out before b070: reported unconfirmed (fail-closed).
+    out.push(a.rawLimits(ids).includes("b070"));
+    out.push(a.rawLimits(["other"]).length);
+    // The rows confirmed over are not re-walked, so b070 is reached and healed.
+    out.push(a.rawLimits(ids).includes("b070"));
+    out.push(a.rawLimits(ids).length);
+    console.log(JSON.stringify(out));
+  `], { encoding: "utf8" });
+  assert.equal(fresh.status, 0, fresh.stderr);
+  assert.deepEqual(JSON.parse(fresh.stdout.trim().split("\n").pop()), [true, 0, false, 70]);
+});
+
 test("the store total counts raw bytes of EVERY extension", () => {
   // The ceiling exists to keep this volume writable for the hub's own state, so
   // it has to see the raw layer — most of which is not named .jsonl.

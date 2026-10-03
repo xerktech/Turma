@@ -645,6 +645,60 @@ test("XERK-793 pg mode: a promoted replica hydrates its map from PG (sessions on
   } finally { pgTeardown(); }
 });
 
+test("XERK-1321 pg mode: a raw_bytes Postgres kept inflated does not raw-shed a transcript", async () => {
+  const mem = pgSetup();
+  try {
+    const b = [ent("u0", "user", "inflated raw")];
+    const len = Buffer.byteLength(JSON.stringify(b));
+    archive.ingestChunk("nas", "t-infl", META, 0, len, b, "acme");
+    archive.ingestRaw("nas", "t-infl", "t-infl.jsonl", 0, Buffer.from("rawbytes"));
+    // The pre-XERK-1315 double count left PG over the 128 MiB cap; GREATEST keeps it.
+    mem.sessions.get("t-infl").rawBytes = 200 * 1024 * 1024;
+    // No local rendered `.jsonl`, so reconcile cannot re-derive the row.
+    fs.unlinkSync(path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-infl").filePath));
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+    assert.deepEqual(archive.rawLimits(["t-infl"]), [], "the raw dir is 8 bytes: not over the cap");
+    assert.equal(archive.ingestRaw("nas", "t-infl", "t-infl.jsonl", 8, Buffer.from("more")).stored, 12,
+      "the agent's next raw push is taken");
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1321 pg mode: bucket-pending bytes still confirm a real over-cap row; a healed or below-cap row is not walked", async () => {
+  const mem = pgSetup();
+  const realReaddir = fs.readdirSync;
+  let walks = 0;
+  try {
+    for (const id of ["t-bkt", "t-heal", "t-low"]) {
+      const b = [ent("u0", "user", id)];
+      archive.ingestChunk("nas", id, { ...META, summary: id }, 0, Buffer.byteLength(JSON.stringify(b)), b, "acme");
+      archive.ingestRaw("nas", id, `${id}.jsonl`, 0, Buffer.from("rawbytes"));
+    }
+    const big = 200 * 1024 * 1024;
+    mem.sessions.get("t-bkt").rawBytes = big;
+    mem.sessions.get("t-heal").rawBytes = big;
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    // An emptyDir rollout: t-bkt's raw copy is only in the bucket, and over the cap.
+    archive.setRawRemote({ pending: () => false, pendingSize: () => null, pendingFiles: () => [],
+      pendingBytes: (dir) => (dir.includes("t-bkt") ? big : 0) });
+    fs.readdirSync = (...a) => { walks += 1; return realReaddir.apply(fs, a); };
+    assert.deepEqual(archive.rawLimits(["t-bkt", "t-heal", "t-low"]), ["t-bkt"]);
+    walks = 0;
+    assert.deepEqual(archive.rawLimits(["t-heal", "t-low"]), []);
+    assert.equal(walks, 0, "the healed row and the below-cap row cost no walk");
+  } finally {
+    fs.readdirSync = realReaddir;
+    archive.setRawRemote(null);
+    pgTeardown();
+  }
+});
+
 test("pg mode: a filed row whose rendered files exist nowhere is reset so its agent re-sends it", async () => {
   const mem = pgSetup();
   const blocked = new Set();

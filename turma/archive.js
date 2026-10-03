@@ -1560,17 +1560,61 @@ function rawLimits(ids) {
   openDb();
   const list = Array.isArray(ids) ? ids : [];
   if (!(ARCHIVE_RAW_TRANSCRIPT_MAX > 0) || !list.length) return [];
+  let flagged;
   if (isPgMode()) {
-    return list.filter((id) => {
+    flagged = list.filter((id) => {
       const r = sessionsMap.get(id);
       return !!(r && r.rawBytes >= ARCHIVE_RAW_TRANSCRIPT_MAX);
     });
+  } else {
+    const over = new Set(db.prepare(
+      "SELECT transcriptId FROM sessions WHERE rawBytes >= ?"
+    ).all(ARCHIVE_RAW_TRANSCRIPT_MAX).map((r) => r.transcriptId));
+    flagged = list.filter((id) => over.has(id));
   }
-  const over = new Set(db.prepare(
-    "SELECT transcriptId FROM sessions WHERE rawBytes >= ?"
-  ).all(ARCHIVE_RAW_TRANSCRIPT_MAX).map((r) => r.transcriptId));
-  return list.filter((id) => over.has(id));
+  // The row only NOMINATES: a figure the pre-XERK-1315 double count inflated stays
+  // high in Postgres (raw_bytes is a GREATEST column), and with no local `.jsonl`
+  // reconcileHydratedCursors never re-derives it — so trusting it keeps the agent
+  // from pushing, and ingestRaw (which would correct it) never runs (XERK-1321).
+  // Confirm each nominee off the raw dir, the measure ingestRaw enforces with, and
+  // heal a row found under the cap so it is not walked again. Only rows AT the cap
+  // are walked, so a healthy fleet pays nothing; the heal is not mirrored, since
+  // GREATEST would not lower Postgres — each boot heals it again on first sight.
+  // Synchronous on the beat, so the walks are capped: a nominee past the budget is
+  // reported unconfirmed (the old, fail-closed answer). A row confirmed truly over
+  // the cap is not re-walked for RAW_LIMIT_RECONFIRM_MS — it never heals, so walking
+  // it every beat would spend the budget on it and starve an inflated row listed
+  // behind it. Per id, not a shared cursor: rawLimits runs on every host's beat.
+  const now = Date.now();
+  let walks = 0;
+  const healed = new Set();
+  for (const id of flagged) {
+    const at = rawConfirmedOver.get(id);
+    if (at != null && now - at < RAW_LIMIT_RECONFIRM_MS) continue;
+    if (walks >= RAW_LIMIT_CONFIRM_MAX) continue;
+    const row = idxGetSession(id);
+    if (!row || !row.filePath) continue;
+    walks += 1;
+    const rawBytes = rawLayerBytes(filePaths(row.filePath).jsonl + RAW_DIR_SUFFIX);
+    if (rawBytes >= ARCHIVE_RAW_TRANSCRIPT_MAX) { rawConfirmedOver.set(id, now); continue; }
+    rawConfirmedOver.delete(id);
+    if (isPgMode()) {
+      const live = sessionsMap.get(id);
+      if (live) live.rawBytes = rawBytes;
+    } else {
+      db.prepare("UPDATE sessions SET rawBytes=? WHERE transcriptId=?").run(rawBytes, id);
+    }
+    healed.add(id);
+  }
+  return flagged.filter((id) => !healed.has(id));
 }
+
+// How many over-cap nominees one rawLimits call confirms off the raw dir (XERK-1321).
+const RAW_LIMIT_CONFIRM_MAX = 64;
+// A confirmed-over row is re-walked after this long (its raw dir can shrink, e.g. an
+// operator's rm -rf). Holds only ids truly over the cap, so it stays small.
+const RAW_LIMIT_RECONFIRM_MS = 10 * 60 * 1000;
+const rawConfirmedOver = new Map(); // transcriptId -> when it was last walked over the cap
 
 let lastRawOverWarnAt = 0;
 
