@@ -2629,14 +2629,14 @@ function effectiveTicketPlatform(siteKey, issueKey, rows) {
 // offers dsh while briefly offline still means the org can run it.
 function orgOffersDsh(siteKey) {
   return Object.values(agents).some(
-    (a) => a && a.jira && a.jira.siteKey === siteKey && dshAvailable(a));
+    (a) => hostInOrg(a, siteKey) && dshAvailable(a));
 }
 // The qwen twin of orgOffersDsh (XERK-515) — whether any host reporting `siteKey`
 // offers the qwen runtime, so the runtime pin's "qwen" option is gated the same
 // way (rejected server-side where no host could honour it, hidden on the board).
 function orgOffersQwen(siteKey) {
   return Object.values(agents).some(
-    (a) => a && a.jira && a.jira.siteKey === siteKey && qwenAvailable(a));
+    (a) => hostInOrg(a, siteKey) && qwenAvailable(a));
 }
 
 // The set of model aliases a ticket may be pinned to for an org: the aliases the
@@ -2650,7 +2650,7 @@ const STATIC_MODEL_ALIASES = ["opus", "sonnet", "haiku", "fable"];
 function orgModelAliases(siteKey) {
   const set = new Set(STATIC_MODEL_ALIASES);
   for (const a of Object.values(agents)) {
-    if (!a || !a.jira || a.jira.siteKey !== siteKey) continue;
+    if (!hostInOrg(a, siteKey)) continue;
     const avail = a.models && Array.isArray(a.models.available) ? a.models.available : [];
     for (const m of avail) {
       if (typeof m === "string" && m && m !== "default" &&
@@ -3164,7 +3164,7 @@ function publishEpicBuilders() {
 // UI↔route seam that always fails (QA). So this accepts either, matching this
 // comment's stated "cloned or merely listed" intent and the pickers' own pool.
 function orgReportsRepo(siteKey, repo) {
-  return Object.values(agents).some((a) => a && a.jira && a.jira.siteKey === siteKey
+  return Object.values(agents).some((a) => hostInOrg(a, siteKey)
     && ((Array.isArray(a.repos) && a.repos.some((r) => r && r.name === repo))
       || (Array.isArray(a.jira.repoOptions) && a.jira.repoOptions.some((r) => r && r.name === repo))));
 }
@@ -3270,7 +3270,7 @@ function epicBuilderDriveSweep() {
       // A pinned host is used only when it is a live, free host of the org; else
       // the run HOLDS (a pin says WHICH host, never around it), retried next tick.
       const a = agents[run.targetHost];
-      if (a && a.jira && a.jira.siteKey === run.siteKey
+      if (hostInOrg(a, run.siteKey)
           && now - (a.lastSeen || 0) < OFFLINE_AFTER_MS && hostHasFreeSlot(a)) {
         host = run.targetHost;
       }
@@ -5566,6 +5566,21 @@ function decidedOrgOf(a) {
   return orgDrifted(a) ? "" : boundOrgOf(a);
 }
 
+// Is host `a` in org `siteKey` for that org's TICKET WORK — routing, in-flight
+// guards, tracker writes, capability unions (XERK-1497)? Only when it currently
+// DECLARES the org AND the hub BOUND it there. Keying on the claimed
+// `jira.siteKey` alone put a drifted host (bound A, declaring B) in B's routing
+// pool: it took B's tickets and slots and ran B's work under a host the hub
+// decided is in A. A drifted host is in NO org's pool while it drifts — the same
+// quarantine `decidedOrgOf` applies to the roster and migration. The claim is
+// required too (unlike `decidedOrgOf`) because every caller reads `a.jira`.
+// Every claimed-org filter on the dispatch path keys on this ONE predicate, and
+// `startedTicketKeys` on the bound org: routing and the dedup must agree, or the
+// sweep re-dispatches to a host whose sessions it does not count.
+function hostInOrg(a, siteKey) {
+  return !!siteKey && siteKeyOf(a) === siteKey && boundOrgOf(a) === siteKey;
+}
+
 // May a session move from `src` to `tgt`? Only within one decided org, and only
 // a NON-EMPTY one — so a drifted host (decided ""), a never-bound host (decided
 // ""), and a pair of either never match. The clients mirror this predicate over
@@ -7439,7 +7454,7 @@ function jiraHostPool(siteKey, requireOnline) {
   const now = Date.now();
   const pool = [];
   for (const [key, a] of Object.entries(agents)) {
-    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    if (!hostInOrg(a, siteKey)) continue;
     const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
     if (requireOnline && !online) continue;
     pool.push({ key, online, healthy: jiraHostHealthy(a) });
@@ -7550,10 +7565,9 @@ function commandHost(siteKey, cmdId, kind, resultKey) {
     (a.commands || []).some((c) => c && c.cmdId === cmdId && c.type === kind) ||
     ((a.resultWaits || {})[cmdId] || {}).kind === kind ||
     !!(a[resultKey] || {})[cmdId];
-  if (owner && owner.kind === kind && agents[owner.host] && agents[owner.host].jira &&
-      agents[owner.host].jira.siteKey === siteKey) return owner.host;
+  if (owner && owner.kind === kind && hostInOrg(agents[owner.host], siteKey)) return owner.host;
   for (const [key, a] of Object.entries(agents)) {
-    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    if (!hostInOrg(a, siteKey)) continue;
     if (claims(a)) return key;
   }
   return null;
@@ -7853,7 +7867,7 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
   let anyUnpaused = false;
   const cloned = [], uncloned = [];
   for (const [key, a] of Object.entries(agents)) {
-    if (!a.jira || a.jira.siteKey !== siteKey) continue;
+    if (!hostInOrg(a, siteKey)) continue;
     anyOrg = true;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     anyOnline = true;
@@ -7900,7 +7914,7 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
   const pin = issueKey ? ticketAgentPin(siteKey, issueKey) : null;
   if (pin) {
     const a = agents[pin.host];
-    if (!a || !a.jira || a.jira.siteKey !== siteKey) {
+    if (!hostInOrg(a, siteKey)) {
       return { status: 409, error:
         `this ticket is pinned to agent "${pin.host}", which no longer reports that Jira org` };
     }
@@ -11625,23 +11639,25 @@ function orgsWithAutoStart() {
 // session whose `ticket` names it. Keyed "<siteKey>\x00<key>" like the routing
 // helpers, so a lookup is a plain Set membership test.
 //
-// A host's session counts only for a ticket of an org that host is BOUND to or
-// currently CLAIMS (XERK-1492). `ticket.siteKey` is agent-asserted, so without
-// this a host of org A naming org B's ticket marked it started and withheld B's
-// auto-start and epic-run dispatch indefinitely. The claimed org stays in on
-// purpose: findTicketHost routes on the CLAIMED `jira.siteKey`, so a drifted
-// host (bound A, declaring B) is handed B's tickets — dropping its sessions here
-// made the sweep re-dispatch the same ticket to it after every backoff. A false
+// A host's session counts only for a ticket of the org that host is BOUND to
+// (XERK-1492, narrowed in XERK-1497). `ticket.siteKey` is agent-asserted, so
+// without this a host of org A naming org B's ticket — or DECLARING B (drift) —
+// marked it started and withheld B's auto-start and epic-run dispatch. This is
+// safe only because findTicketHost routes on `hostInOrg` (bound AND claimed): a
+// drifted host is never handed B's tickets, so ignoring its B sessions cannot
+// make the sweep re-dispatch to it. A drifted host's in-flight B work is not
+// killed, but it is not B's work: B may start the ticket on a host decided into
+// B. Its sessions still count for its BOUND org even while it drifts — a false
 // "started" only withholds a start; a missed one starts a second session.
 function startedTicketKeys() {
   const keys = new Set();
   for (const a of Object.values(agents)) {
-    const bound = boundOrgOf(a), claimed = siteKeyOf(a);
-    if (!bound && !claimed) continue;
+    const bound = boundOrgOf(a);
+    if (!bound) continue;
     const add = (s) => {
       const t = s && s.ticket;
       const org = t && typeof t.siteKey === "string" ? t.siteKey : "";
-      if (t && t.key && org && (org === bound || org === claimed)) {
+      if (t && t.key && org && org === bound) {
         keys.add(org + "\x00" + t.key);
       }
     };
@@ -12126,7 +12142,7 @@ function fleetTicketRows() {
 // The window between dispatch and the session's first heartbeat.
 function spawnTicketInFlight(siteKey, issueKey) {
   return Object.values(agents).some((a) =>
-    a.jira && a.jira.siteKey === siteKey &&
+    hostInOrg(a, siteKey) &&
     (a.commands || []).some(
       (c) => c && c.type === "spawnTicket" && c.issueKey === issueKey));
 }
@@ -12165,7 +12181,7 @@ function spawnTicketInFlight(siteKey, issueKey) {
 function committedTicketSpawn(siteKey, issueKey) {
   const now = Date.now();
   for (const [host, a] of Object.entries(agents)) {
-    if (!a || !a.jira || a.jira.siteKey !== siteKey) continue;
+    if (!hostInOrg(a, siteKey)) continue;
     const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
     for (const c of a.commands || []) {
       if (!c || c.type !== "spawnTicket" || c.issueKey !== issueKey) continue;
@@ -12770,7 +12786,7 @@ function autoStartSweep() {
       // A spawnTicket already riding some org host's queue: the agent hasn't
       // taken it yet, so there is nothing to conclude about it either way.
       const inFlight = Object.values(agents).some((a) =>
-        a.jira && a.jira.siteKey === siteKey &&
+        hostInOrg(a, siteKey) &&
         (a.commands || []).some(
           (c) => c && c.type === "spawnTicket" && c.issueKey === t.key));
       if (inFlight) continue;
@@ -12865,11 +12881,13 @@ function orgsWithPriorityWriteBack() {
 
 // Which tracker source a siteKey is polled from: the first reporting host
 // whose jira block names it. An org is only ever served by one source type;
-// "jira" is the safe default for an unknown source.
+// "jira" is the safe default for an unknown source. Only a host IN the org
+// (`hostInOrg`, XERK-1497) answers: a drifted host declaring another org's key
+// with the wrong source would otherwise misroute that org's tracker writes.
 function orgBoardSource(siteKey) {
   for (const a of Object.values(agents)) {
     const j = a && a.jira;
-    if (j && j.siteKey === siteKey && (j.source === "jira" || j.source === "azure"))
+    if (hostInOrg(a, siteKey) && (j.source === "jira" || j.source === "azure"))
       return j.source;
   }
   return "jira";
@@ -12878,7 +12896,7 @@ function orgBoardSource(siteKey) {
 // A setTicketPriority for this ticket already riding some org host's queue.
 function setTicketPriorityInFlight(siteKey, issueKey) {
   return Object.values(agents).some((a) =>
-    a.jira && a.jira.siteKey === siteKey &&
+    hostInOrg(a, siteKey) &&
     (a.commands || []).some(
       (c) => c && c.type === "setTicketPriority" && c.issueKey === issueKey));
 }
@@ -12955,7 +12973,7 @@ function orgsWithDedupeLink() {
 // A createDuplicateLink for this ticket already riding some org host's queue.
 function dedupeLinkInFlight(siteKey, issueKey) {
   return Object.values(agents).some((a) =>
-    a.jira && a.jira.siteKey === siteKey &&
+    hostInOrg(a, siteKey) &&
     (a.commands || []).some(
       (c) => c && c.type === "createDuplicateLink" && c.issueKey === issueKey));
 }
@@ -18031,7 +18049,7 @@ const server = http.createServer(async (req, res) => {
       const cmdId = decodeURIComponent(parts[4]);
       let found = null, anyHost = null;
       for (const [k, a] of Object.entries(agents)) {
-        if (!a.jira || a.jira.siteKey !== siteKey) continue;
+        if (!hostInOrg(a, siteKey)) continue;
         anyHost = anyHost || k;
         const r = (a.createResults || {})[cmdId];
         if (r) { found = r; break; }
@@ -18421,7 +18439,7 @@ const server = http.createServer(async (req, res) => {
       // watching wants the pin to show up now, not in an hour — but that is a UI
       // judgement about feedback, not a reason to let the fleet diverge.
       const hosts = Object.keys(agents).filter(
-        (k) => agents[k] && agents[k].jira && agents[k].jira.siteKey === siteKey);
+        (k) => hostInOrg(agents[k], siteKey));
       if (!hosts.length) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
@@ -18463,12 +18481,12 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "body needs {host} or {auto:true}" });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       if (!auto) {
         const a = agents[body.host];
-        if (!a || !a.jira || a.jira.siteKey !== siteKey) {
+        if (!hostInOrg(a, siteKey)) {
           return json(res, 400, { error: "that agent does not report this Jira org" });
         }
       }
@@ -18506,7 +18524,7 @@ const server = http.createServer(async (req, res) => {
       // "drop the pin" outcome rather than storing a "default" alias to resolve.
       const auto = body.auto === true || raw === "default" || raw === "";
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       if (!auto && !orgModelAliases(siteKey).has(raw)) {
@@ -18544,7 +18562,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "runtime must be claude, dsh or qwen" });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       if (!auto && raw === "dsh" && !orgOffersDsh(siteKey)) {
@@ -18583,7 +18601,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "platform must be windows, linux or any" });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setTicketPlatform(siteKey, issueKey, auto ? null : raw);
@@ -18609,7 +18627,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "body needs {action:approve|hold|reject} or {clear:true}" });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setTicketTriageAction(siteKey, issueKey, action);
@@ -18633,7 +18651,7 @@ const server = http.createServer(async (req, res) => {
       }
       const body = JSON.parse((await readBody(req)) || "{}");
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       if (body.clear === true || body.cancel === true) {
@@ -18709,7 +18727,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 413, { error: `idea must be at most ${EPIC_BUILDER_IDEA_MAX} characters` });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       // A named repo must be cloneable by the org — some host of it must already
@@ -18720,7 +18738,7 @@ const server = http.createServer(async (req, res) => {
       }
       if (targetHost !== null) {
         const a = agents[targetHost];
-        if (!a || !a.jira || a.jira.siteKey !== siteKey) {
+        if (!hostInOrg(a, siteKey)) {
           return json(res, 404, { error: "no such host reports that Jira org" });
         }
       }
@@ -18758,7 +18776,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "body needs {enabled:true|false}" });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setAutoStartOrg(siteKey, body.enabled);
@@ -18778,7 +18796,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "body needs {enabled:true|false}" });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setAutoMergeOrg(siteKey, body.enabled);
@@ -18799,7 +18817,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "body needs {enabled:true|false}" });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setPriorityWriteBackOrg(siteKey, body.enabled);
@@ -18820,7 +18838,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "body needs {enabled:true|false}" });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setDedupeLinkOrg(siteKey, body.enabled);
@@ -18844,7 +18862,7 @@ const server = http.createServer(async (req, res) => {
         });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setTriagePolicy(siteKey, p);
@@ -18866,7 +18884,7 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: `body needs {slot:1..${ORG_COLOR_SLOTS}} or {auto:true}` });
       }
       if (!Object.values(agents).some(
-        (a) => a && a.jira && a.jira.siteKey === siteKey)) {
+        (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
       }
       setOrgColor(siteKey, auto ? null : body.slot);
@@ -19891,6 +19909,10 @@ if (process.env.TURMA_TEST) {
     orgOffersDsh,
     orgOffersQwen,
     findTicketHost,
+    hostInOrg,
+    jiraHostPool,
+    orgBoardSource,
+    spawnTicketInFlight,
     hostHasFreeSlot,
     // XERK-544/548 auto-start pause on a maxed subscription (7-day pace line OR
     // 5-hour cap). Exported so a test can hold each predicate and the

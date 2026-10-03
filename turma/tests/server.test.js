@@ -8347,12 +8347,51 @@ test("auto-start: another org's host reporting a session on this org's ticket do
   agents.asPhantomB.jira = { ...agents.asPhantomB.jira, siteKey: "as1492a.atlassian.net" };
   assert.ok(startedTicketKeys().has("as1492b.atlassian.net\x00ENG-9"));
 
-  // ...and a drifted host's session on the org it CLAIMS counts too:
-  // findTicketHost routes on the claimed org, so dropping it re-dispatched the
-  // same ticket to that host after every backoff (QA, XERK-1492).
+  // ...but a drifted host's session on the org it merely CLAIMS does not
+  // (XERK-1497): findTicketHost no longer routes that org's tickets to it, so
+  // counting it would only let a drift withhold another org's start.
   agents.asPhantomB.closedSessions = [{ id: "dr", transcriptId: "t-dr",
     ticket: { key: "ENG-11", siteKey: "as1492a.atlassian.net" } }];
-  assert.ok(startedTicketKeys().has("as1492a.atlassian.net\x00ENG-11"));
+  assert.equal(startedTicketKeys().has("as1492a.atlassian.net\x00ENG-11"), false);
+});
+
+// XERK-1497: routing keys on the org the hub BOUND a host to, not the one it
+// declares. A host bound to org C that later declares org D (drift) must not
+// enter D's pool — not for the sweep, a manual Start, or the in-flight guards.
+test("auto-start: a host bound to another org that declares this one is never routed its tickets", async () => {
+  resetAutoStart();
+  const C = "as1497c.atlassian.net", D = "as1497d.atlassian.net";
+  const ticket = { key: "D-1", summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } };
+  await asBeat("as1497hC", C, { autoStart: false, tickets: [] });
+  assert.equal(agents.as1497hC.orgBound, C);
+  // Later beats declare D and report D's ticket, triaged and cloned.
+  await asBeat("as1497hC", D, { tickets: [ticket],
+    capacity: { maxSessions: 8, running: 0, queued: 0 } });
+  assert.equal(agents.as1497hC.orgBound, C, "the binding does not move");
+  autoStartRound();
+  assert.equal((agents.as1497hC.commands || []).length, 0,
+    "the sweep dispatched D's ticket to a host bound to C");
+  const pick = hub.findTicketHost(D, "Turma", "D-1", { requireFree: true });
+  assert.ok(!pick.host, "findTicketHost routed D's ticket to a host bound to C");
+  assert.equal(pick.status, 404);
+  // The in-flight guard ignores its queue too, so a command it holds for D
+  // neither blocks D's sweep nor counts as D's.
+  agents.as1497hC.commands = [{ type: "spawnTicket", issueKey: "D-1", cmdId: "x" }];
+  assert.equal(hub.spawnTicketInFlight(D, "D-1"), false);
+
+  // A host genuinely bound to D takes it.
+  await asBeat("as1497hD", D, { tickets: [ticket],
+    capacity: { maxSessions: 8, running: 0, queued: 0 } });
+  autoStartRound();
+  assert.deepEqual((agents.as1497hD.commands || []).map((c) => c.issueKey), ["D-1"]);
+
+  // Drift is quarantine, not a new org: the drifted host is in C's pool again
+  // the beat it re-declares C.
+  await asBeat("as1497hC", C, { tickets: [] });
+  assert.ok(hub.hostInOrg(agents.as1497hC, C));
+  assert.equal(hub.hostInOrg(agents.as1497hC, D), false);
 });
 
 // XERK-61: a spawnTicket the agent acked but that produced no session is a
@@ -12266,6 +12305,36 @@ test("XERK-725: epic-builder route validates input, idea length, org and repo", 
   }
   // No refusal created a run.
   assert.equal(Object.keys(epicBuilders).length, 0);
+});
+
+// XERK-1497: a host bound to another org that merely DECLARES this one is not
+// in its pool — not as an epic-builder target (route or sweep), not as a
+// tracker-write host, and not as the org's tracker-source authority.
+test("XERK-1497: a drifted host is no epic-builder target, tracker writer or source authority", async () => {
+  resetEpicBuilders();
+  const C = "eb1497c.atlassian.net", D = "eb1497d.atlassian.net";
+  await builderBeat("eb1497drift", C);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "eb1497drift", repos: [{ name: "Turma", path: "/git/Turma" }],
+      jira: { available: true, configured: true, siteKey: D, source: "azure",
+        user: "eb1497drift@x.com", fetchedAt: "2026-07-14T12:00:00Z", tickets: [] } },
+    headers: agentHeaders,
+  });
+  await builderBeat("eb1497legit", D);
+  assert.equal(agents.eb1497drift.orgBound, C);
+  // The route refuses the drifted host as a target.
+  const r = await request("POST", `/api/jira/${D}/epic-builder`,
+    { body: { title: "T", idea: "go", targetHost: "eb1497drift" }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  // A run pinned to it (armed before it drifted, say) HOLDS rather than dispatch.
+  armEpicBuilder(D, { title: "T", idea: "go", repo: "Turma", targetHost: "eb1497drift" });
+  epicBuilderDriveSweep();
+  assert.equal((agents.eb1497drift.commands || [])
+    .filter((c) => c.type === "spawnEpicBuilder").length, 0);
+  // Tracker writes and the source lookup see only the legit host.
+  assert.deepEqual(hub.jiraHostPool(D, false), ["eb1497legit"]);
+  assert.equal(hub.orgBoardSource(D), "jira");
+  resetEpicBuilders();
 });
 
 test("XERK-726: the route accepts a LISTED-but-uncloned repo (clone-on-demand), not just on-disk ones", async () => {
