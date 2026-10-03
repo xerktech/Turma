@@ -289,6 +289,7 @@
 
   .sess-working { color: var(--good); }
   .sess-wait { color: var(--warning); }
+  .sess-holding { color: var(--ink-2); font-style: italic; }
   .sess-dying { color: var(--critical); }
 
   /* Per-session work-state line: warning when there's unpushed/uncommitted
@@ -1102,6 +1103,34 @@ function backgroundWorkLabel(rows) {
 function qaReviewing(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).some(a => a && QA_AGENT_TYPES.has(a.type));
 }
+// A background shell that is WAITING (XERK-1570) — a sleep, a CI watch, a poll
+// loop. No kind (an agent, or an older agent) is work. Same as sessions.html.
+function isWaitRow(a) {
+  return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
+}
+// The hub's ATTENTION_WAIT_STALL_MIN default and its ETA grace (server.js).
+const WAIT_STALL_MS = 45 * 60 * 1000;
+const WAIT_ETA_GRACE_MS = 2 * 60 * 1000;
+// null or {state:"waiting"|"stalled", eta}: mirror of server.js backgroundWait.
+function backgroundWait(rows, lastWrite, now) {
+  const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
+  if (!waits.length) return null;
+  let eta = null;
+  for (const a of waits) if (Number.isSafeInteger(a.eta) && (eta == null || a.eta > eta)) eta = a.eta;
+  if (eta != null && eta > now) return { state: "waiting", eta };
+  const overdue = eta != null && lastWrite < eta && now - eta >= WAIT_ETA_GRACE_MS;
+  const silent = now - lastWrite >= WAIT_STALL_MS;
+  return { state: overdue || silent ? "stalled" : "waiting", eta };
+}
+// "waiting · 12m left" / "waiting · Watch CI" / "waiting on 2 background shells",
+// "stalled …" once stalled. Same as sessions.html.
+function backgroundWaitLabel(rows, wait, now) {
+  const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
+  const word = wait.state === "stalled" ? "stalled" : "waiting";
+  if (wait.eta != null && wait.eta > now) return word + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
+  if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label;
+  return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s");
+}
 
 function liveState(sess, host, now) {
   const s = sess.session;
@@ -1124,15 +1153,23 @@ function liveState(sess, host, now) {
   // Background agents, which paneBusy cannot see: a session that delegated work
   // and ended its own turn paints no interrupt hint, so it read "idle" while an
   // agent was still running (XERK-245). Same rule and wording as sessions.html.
+  // Only WORK rows count (XERK-1570): a waiting shell is not working.
   const agentsLive = Array.isArray(s.agents) ? s.agents.length : 0;
-  if (host.online && agentsLive)
-    return { label: qaReviewing(s) ? "QA Review" : backgroundWorkLabel(s.agents),
+  const workRows = (Array.isArray(s.agents) ? s.agents : []).filter(a => !isWaitRow(a));
+  if (host.online && workRows.length)
+    return { label: qaReviewing(s) ? "QA Review" : backgroundWorkLabel(workRows),
              cls: "sess-working", detail: "last write " + ago(age), busy: true };
   const working = s.paneBusy != null
     ? (host.online && s.paneBusy)
-    : (host.online && age < 90 * 1000);
+    : (host.online && !agentsLive && age < 90 * 1000);
   if (working)
     return { label: "working", cls: "sess-working", detail: "last write " + ago(age), busy: true };
+  // Every live row is a wait: holding, or stalled past its ETA / too long silent.
+  // Same rule and wording as sessions.html (and the hub's sessionWait).
+  const wait = host.online ? backgroundWait(s.agents, now - age, now) : null;
+  if (wait)
+    return { label: backgroundWaitLabel(s.agents, wait, now),
+             cls: wait.state === "stalled" ? "" : "sess-holding", detail: "last write " + ago(age) };
   return {
     label: s.bridgeAttached ? "idle · session attached" : "idle",
     cls: "",

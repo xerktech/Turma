@@ -40,8 +40,9 @@ a nested agent dir.
   `status.agents` row from an older agent, or a launch predating a manager restart's EOF-primed
   offsets). **Do not "simplify" by dropping the index and widening the 8 MiB window — that just
   moves the cliff, and a full-transcript scan per click is what the window exists to avoid.** The
-  wire stays `[{type,label}]` (`live_agents_report` unchanged); `resolveId` is agent-internal, so the
-  `tunnel-agent.js` mirror does not carry it (it never resolves). Tests: the `_past_the_window_`
+  wire row is `{type,label,kind?,startedAt?,eta?}` (`session-working.md`) and never carries
+  `resolveId`, which is agent-internal, so the `tunnel-agent.js` mirror does not keep it (it never
+  resolves). Tests: the `_past_the_window_`
   cases in `TestStageSubagentHistory`, `TestLiveAgentResolveId`, `TestWorkflowRunDir`.
 - **The run dir is named after the launch record's `runId`, NOT its `taskId`** — different handles
   on the same launch (`wf_86e01141-7bc` vs `we1gtmfyd`), and `_async_launch` keys the ROW on taskId

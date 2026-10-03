@@ -1635,7 +1635,7 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         write_jsonl(path, self.opened_pr(self.PR1, "old") + SHELL_LAUNCH_ENTRIES)
         state = {}
         rep = ha.session_report(self.WORKDIR, state)
-        self.assertEqual(rep["agents"], [{"type": "shell", "label": "Watch CI"}])
+        self.assertEqual(rep["agents"], [{"type": "shell", "label": "Watch CI", "kind": "wait-external"}])
         self.assertEqual(rep["prUrls"], [])
         # The stop edge still lands on a later beat, incrementally.
         with open(path, "a") as f:
@@ -1676,7 +1676,7 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, SHELL_LAUNCH_ENTRIES)
         self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"],
-                         [{"type": "shell", "label": "Watch CI"}])
+                         [{"type": "shell", "label": "Watch CI", "kind": "wait-external"}])
 
     def test_a_launch_in_the_lead_in_never_goes_live(self):
         # The lead-in records stops only; a launch there is outside the window.
@@ -1696,7 +1696,7 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                 mock.patch.object(ha, "AGENT_BACKSCAN_LEAD_IN", 500):
             write_jsonl(path, [pad] * 6 + SHELL_LAUNCH_ENTRIES)
             self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"],
-                             [{"type": "shell", "label": "Watch CI"}])
+                             [{"type": "shell", "label": "Watch CI", "kind": "wait-external"}])
 
     def test_a_restart_does_not_resurrect_finished_background_work(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -3851,6 +3851,64 @@ SHELL_LAUNCH_ENTRIES = [
 ]
 
 
+class TestShellKind(unittest.TestCase):
+    """_shell_kind (XERK-1570) — which background shells are WAITING. Driven by
+    the SAME vector file the JS twin (`shellKind` in tunnel-agent.test.js) reads,
+    so the two classifiers cannot drift."""
+
+    def test_the_shared_vectors(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shell_kind_vectors.json")
+        with open(path, encoding="utf-8") as f:
+            vectors = json.load(f)["vectors"]
+        self.assertGreater(len(vectors), 40)
+        for cmd, kind, secs in vectors:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(ha._shell_kind(cmd), (kind, secs))
+
+    def test_a_hostile_command_never_raises_onto_the_beat(self):
+        # The scan runs on the beat: an absurd literal, deep nesting or an
+        # unterminated construct must classify (as anything), never raise.
+        for cmd in ("sleep " + "9" * 400, "timeout 1 " * 5000 + "sleep 1",
+                    "$(" * 10000, "'" + "x" * 1000, "while " * 3000, None, 7):
+            with self.subTest(cmd=str(cmd)[:40]):
+                kind, _ = ha._shell_kind(cmd)
+                self.assertIn(kind, ("wait-timed", "wait-external", "work"))
+
+    def test_a_hostile_command_classifies_in_bounded_time(self):
+        # A try/except catches exceptions, never TIME (XERK-395): the old tail
+        # regex backtracked quadratically, ~48s for one 128 KB `-fff…!` word.
+        hostile = "-" + "f" * 200000 + "!"
+        for cmd in ("tail " + hostile, "tail " + hostile + " " + hostile,
+                    "sleep 5 " + "x" * (1 << 20), "a b " * 300000):
+            with self.subTest(cmd=cmd[:20]):
+                t0 = time.monotonic()
+                self.assertEqual(ha._shell_kind(cmd), ("work", None))
+                self.assertLess(time.monotonic() - t0, 0.5)
+        # The follow check itself is linear too, past the input caps.
+        t0 = time.monotonic()
+        self.assertFalse(ha._shell_tail_follow(hostile))
+        self.assertTrue(ha._shell_tail_follow("-" + "q" * 200000 + "f"))
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+
+class TestTsMs(unittest.TestCase):
+    """_ts_ms — the same table as the `tsMs` case in tunnel-agent.test.js, so a
+    shell row's startedAt/eta agree across the two mirrors."""
+
+    def test_the_shared_table(self):
+        for ts, ms in (("2026-10-03T12:00:00Z", 1791028800000),
+                       ("2026-10-03T12:00:00", 1791028800000),
+                       ("2026-10-03T12:00:00.5+02:00", 1791021600500),
+                       ("2026-10-03T12:00:00.123456789-0130", 1791034200123),
+                       (" 2026-10-03T12:00:00.000Z\n", 1791028800000),
+                       ("Oct 3 2026", None), ("2026-02-30T00:00:00Z", None),
+                       ("2026-10-03T24:00:00Z", None), ("2026-10-03T12:00:60Z", None),
+                       ("0000-01-01T00:00:00Z", None), ("2026-10-03T12:00:00Zjunk", None),
+                       ("٢٠٢٦-10-03T12:00:00Z", None), (7, None)):
+            with self.subTest(ts=ts):
+                self.assertEqual(ha._ts_ms(ts), ms)
+
+
 class TestLiveAgentsScan(unittest.TestCase):
     """_scan_agent_entry — which background agents are in flight, off the
     transcript's own launch/stop edges. The TUI footer is NOT the source: its
@@ -3871,7 +3929,48 @@ class TestLiveAgentsScan(unittest.TestCase):
     def test_a_background_shell_is_live_work(self):
         # The TUI footer says "1 shell" while the session otherwise reads idle.
         st = self._scan(SHELL_LAUNCH_ENTRIES)
-        self.assertEqual(ha.live_agents_report(st), [{"type": "shell", "label": "Watch CI"}])
+        self.assertEqual(ha.live_agents_report(st), [{"type": "shell", "label": "Watch CI", "kind": "wait-external"}])
+
+    def test_a_shell_row_carries_kind_started_at_and_eta(self):
+        # XERK-1570: the kind of the COMMAND (never the description), startedAt
+        # = the call's timestamp, eta = startedAt + N for a timed wait. The JS
+        # twin in tunnel-agent.test.js asserts the same rows — keep in step.
+        def shell_call(tid, command, description, ts, bg):
+            return [
+                {"type": "assistant", "timestamp": ts, "message": {"content": [
+                    {"type": "tool_use", "id": tid, "name": "Bash",
+                     "input": {"command": command, "description": description,
+                               "run_in_background": True}}]}},
+                {"type": "user", "timestamp": "2026-10-03T12:00:09.000Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                          "content": "x"}]},
+                 "toolUseResult": {"stdout": "", "backgroundTaskId": bg}},
+            ]
+        st = self._scan(
+            shell_call("t1", "sleep 600", "Wait for the deploy", "2026-10-03T12:00:00.000Z", "b1")
+            + shell_call("t2", "npm test", "Wait for the tests", "2026-10-03T12:00:01.000Z", "b2")
+            + shell_call("t3", "gh run watch 9", "Watch CI", "2026-10-03T12:00:02.000Z", "b3")
+            + TASK_LAUNCH_ENTRIES)
+        t0 = ha._ts_ms("2026-10-03T12:00:00.000Z")
+        self.assertEqual(ha.live_agents_report(st), [
+            {"type": "shell", "label": "Wait for the deploy", "kind": "wait-timed",
+             "startedAt": t0, "eta": t0 + 600000},
+            {"type": "shell", "label": "Wait for the tests", "kind": "work", "startedAt": t0 + 1000},
+            {"type": "shell", "label": "Watch CI", "kind": "wait-external", "startedAt": t0 + 2000},
+            # An agent row carries no kind: absent reads as work.
+            {"type": "agent", "label": "QA the parity change"},
+        ])
+        # With no call timestamp the LAUNCH entry's timestamp starts the clock.
+        late = self._scan([
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t9", "name": "Bash", "input": {"command": "sleep 60"}}]}},
+            {"type": "user", "timestamp": "2026-10-03T12:00:09.000Z",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "t9", "content": "x"}]},
+             "toolUseResult": {"stdout": "", "backgroundTaskId": "b9"}},
+        ])
+        self.assertEqual(ha.live_agents_report(late), [
+            {"type": "shell", "label": "sleep 60", "kind": "wait-timed",
+             "startedAt": t0 + 9000, "eta": t0 + 69000}])
 
     def test_a_background_shell_stops_on_its_notification(self):
         st = self._scan(SHELL_LAUNCH_ENTRIES + [

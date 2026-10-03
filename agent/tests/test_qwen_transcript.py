@@ -444,7 +444,9 @@ class TestQwenSubagentDelegation(unittest.TestCase):
         for e in entries[:-1]:          # everything up to the notification
             ha._scan_agent_entry(e, running)
         self.assertEqual(ha.live_agents_report(running),
-                         [{"type": "Explore", "label": "Find org selector dropdown"}])
+                         [{"type": "Explore", "label": "Find org selector dropdown",
+                           # The launch entry's own timestamp (XERK-1570).
+                           "startedAt": 1787871769024}])
         # The final entry IS the <task-notification>; folding it retires the row.
         ha._scan_agent_entry(entries[-1], running)
         self.assertEqual(running.get("liveAgents"), {})

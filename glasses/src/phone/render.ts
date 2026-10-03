@@ -68,6 +68,7 @@ export function orgOptions(state: AppState): OrgOption[] {
 const STATE_LABEL: Record<LiveState, string> = {
   working: "working",
   waiting: "waiting for your answer",
+  holding: "waiting on a background shell",
   idle: "idle",
   stopped: "stopped",
   error: "error",
@@ -214,8 +215,9 @@ export function sessionsBodyHtml(state: AppState): string {
   const now = Date.now();
   const review = running.filter((r) => readyForReview(r.s, r.lastSeen, now));
   const rest = running.filter((r) => !readyForReview(r.s, r.lastSeen, now));
-  const active = rest.filter((r) => ["working", "waiting"].includes(liveState(r.s, r.lastSeen, now)));
-  const idle = rest.filter((r) => !["working", "waiting"].includes(liveState(r.s, r.lastSeen, now)));
+  const ACTIVE = ["working", "waiting", "holding"];
+  const active = rest.filter((r) => ACTIVE.includes(liveState(r.s, r.lastSeen, now)));
+  const idle = rest.filter((r) => !ACTIVE.includes(liveState(r.s, r.lastSeen, now)));
   const byCreated = (a: Row, b: Row) => (b.s.createdAt ?? "").localeCompare(a.s.createdAt ?? "");
   [review, active, idle, queued, ended].forEach((l) => l.sort(byCreated));
 

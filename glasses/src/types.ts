@@ -42,7 +42,10 @@ export interface LiveSignals {
   // agent list. Non-empty means delegated work is still running even when
   // paneBusy is false — the session ended its own turn to wait on them
   // (XERK-245). Absent from older agents, which reads as "can't tell".
-  agents?: { type: string; label: string }[];
+  // A shell row also carries its `kind` (XERK-1570): `wait-*` is the session
+  // WAITING (a sleep / CI watch), absent or `work` is work. `startedAt`/`eta`
+  // are epoch ms (eta only on a timed wait).
+  agents?: { type: string; label: string; kind?: string; startedAt?: number; eta?: number }[];
   transcriptAgeSec: number | null;
   lastRole: string | null;
   lastHasToolUse: boolean;
