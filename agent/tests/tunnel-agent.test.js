@@ -2945,4 +2945,13 @@ test("backscanLiveAgents: a stop in the lead-in before the window still wins", (
   const fresh = { live: new Map(), tasks: new Map() };
   mod.backscanLiveAgents(p, fresh, body.length - cut, 0);
   assert.equal(mod.liveAgentsReport(fresh).length, 1);
+
+  // A launch that sits wholly IN the lead-in is discarded, never registered:
+  // the lead-in may only contribute stops.
+  const early = path.join(dir, "early.jsonl");
+  fs.writeFileSync(early, [pad, ...launch, pad, pad, pad].map((e) => JSON.stringify(e)).join("\n") + "\n");
+  const eb = fs.readFileSync(early, "utf8");
+  const leadState = { live: new Map(), tasks: new Map() };
+  mod.backscanLiveAgents(early, leadState, eb.length - (eb.indexOf("backgroundTaskId") + 600));
+  assert.deepEqual(mod.liveAgentsReport(leadState), []);
 });
