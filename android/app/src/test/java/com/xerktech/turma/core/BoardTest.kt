@@ -850,6 +850,27 @@ class BoardTest {
         assertEquals("", sessions[0].id)             // the orphan never had one
     }
 
+    @Test fun `ticketSessionIndex counts a host only for the org it is decided into (XERK-1501)`() {
+        // Web parity + the hub's startedTicketKeys: a host bound to A reporting a
+        // ticket of B must not chip B-1 — on any channel.
+        val t = tref("B-1", site = "B")
+        fun host(key: String, org: String?, claims: String?, tid: String) = AgentInfo(
+            key = key, org = org, jira = claims?.let { JiraBlock(siteKey = it) },
+            sessions = listOf(com.xerktech.turma.model.SessionInfo(id = "s-$tid", ticket = t, transcriptId = "$tid-s")),
+            closedSessions = listOf(com.xerktech.turma.model.ClosedSessionInfo(id = "c-$tid", ticket = t, transcriptId = "$tid-c")),
+            repos = listOf(com.xerktech.turma.model.RepoInfo(name = "r",
+                resumable = listOf(com.xerktech.turma.model.ResumableInfo(transcriptId = "$tid-r", ticket = t)))),
+        )
+        fun chips(a: AgentInfo) = ticketSessionsOf(ticketSessionIndex(listOf(a)), "B", "B-1").size
+        assertEquals(0, chips(host("hA", org = "A", claims = "A", tid = "a")))
+        // Served org "" = drifted / never bound: counts nowhere, not even its claim.
+        assertEquals(0, chips(host("hD", org = "", claims = "B", tid = "d")))
+        assertEquals(3, chips(host("hB", org = "B", claims = "B", tid = "b")))
+        // Older hub (no served org): fall back to the claimed siteKey; no claim = trusted.
+        assertEquals(0, chips(host("hO", org = null, claims = "A", tid = "o")))
+        assertEquals(3, chips(host("hN", org = null, claims = null, tid = "n")))
+    }
+
     @Test fun `chip label prefers rename, then branch, and state maps status`() {
         val s = TicketSession(
             host = "h", id = "aa1", transcriptId = "t", status = "running",

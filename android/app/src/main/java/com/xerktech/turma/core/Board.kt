@@ -983,7 +983,13 @@ private fun ticketIndexKey(siteKey: String, issueKey: String) = siteKey + "\u000
 fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>> {
     val idx = LinkedHashMap<String, MutableList<TicketSession>>()
     val seen = HashSet<String>()
-    fun add(host: String, s: TicketSession) {
+    // A host's session counts only for the org the hub decided that host into
+    // (XERK-1501), as the hub's startedTicketKeys does — web ticketSessionIndex.
+    // Served `org` "" (drifted / never bound) counts nowhere; null = older hub:
+    // fall back to the claimed jira.siteKey, and a host claiming nothing is trusted.
+    fun orgOf(a: AgentInfo): String? = a.org ?: a.jira?.siteKey?.ifBlank { null }
+    fun add(host: String, s: TicketSession, org: String?) {
+        if (org != null && org != s.siteKey) return
         // Untranscripted records can't collide (nothing to key on) and are rare:
         // a session killed before its first turn, or one an older agent wrote.
         if (s.transcriptId.isNotBlank() && !seen.add(host + "\u0000" + s.transcriptId)) return
@@ -992,6 +998,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
     }
     for (a in agents) {
         val host = a.key.ifBlank { a.device }
+        val org = orgOf(a)
         for (s in a.sessions) {
             val t = s.ticket ?: continue
             add(host, TicketSession(
@@ -1000,7 +1007,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 ticketBranch = t.branch.orEmpty(), summary = s.summary,
                 summaryManual = false, label = s.label, ticketKey = t.key,
                 siteKey = t.siteKey, spawnCmdId = s.spawnCmdId, at = s.createdAt,
-            ))
+            ), org)
         }
         for (c in a.closedSessions) {
             val t = c.ticket ?: continue
@@ -1010,7 +1017,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 ticketBranch = t.branch.orEmpty(), summary = c.summary,
                 summaryManual = c.summaryManual, label = c.label, ticketKey = t.key,
                 siteKey = t.siteKey, at = c.createdAt,
-            ))
+            ), org)
         }
     }
     // Resumable last, in its own pass over the whole fleet: it is the weakest
@@ -1019,6 +1026,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
     // would lose to its own scan entry and show up id-less.
     for (a in agents) {
         val host = a.key.ifBlank { a.device }
+        val org = orgOf(a)
         for (r in a.repos) for (t in r.resumable) {
             val tk = t.ticket ?: continue
             add(host, TicketSession(
@@ -1027,7 +1035,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 ticketBranch = tk.branch.orEmpty(), summary = t.summary,
                 summaryManual = false, label = "", ticketKey = tk.key,
                 siteKey = tk.siteKey, at = t.endedTs,
-            ))
+            ), org)
         }
     }
     for (list in idx.values) list.sortBy { it.at }

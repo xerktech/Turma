@@ -53,6 +53,13 @@ cd android && ANDROID_USER_HOME=/tmp/claude-1000/andhome gradle assembleDebug --
    (`npm install playwright-core --prefix /tmp/... --cache /tmp/...`).
    Clean up with `docker rm -f verify-chrome`.
 
+   **On a native host with no Docker access** (TrueNAS: socket permission denied), use
+   playwright's cached `~/.cache/ms-playwright/chromium_headless_shell-*` and launch it with
+   `LD_LIBRARY_PATH` pointing at its missing libs (libatk, libatk-bridge, libatspi, libXcomposite,
+   libXdamage, libXfixes, libXrandr, libxkbcommon — `apt-get download` + `dpkg-deb -x`, no root).
+   **Extract them under `$HOME`, not `/tmp`**: `/tmp` is mounted noexec, so the loader fails with
+   "failed to map segment from shared object".
+
 ### Two traps that will cost you an hour each
 
 - **`httpCredentials` does nothing.** The hub 302s HTML navigations to `/login`
