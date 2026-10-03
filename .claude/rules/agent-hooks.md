@@ -60,9 +60,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     the floor as keeping a session off main.
   - Residual: `gh pr create`/`gh pr edit` post whatever body the command names, past the
     classifier. pr-summary is no credential filter: it refuses a second description flag, `-dF`
-    clusters included (below), but a conforming body plus `$(cat ~/.config/gh/hosts.yml)`, or a lone `--body-file` under
-    `TURMA_PR_SUMMARY=0`, still posts the file unless Claude Code's prefix match refuses the
-    substitution — unmeasured, part of the spike below.
+    clusters included (below), but a conforming body plus `$(cat ~/.config/gh/hosts.yml)`, or a
+    lone `--body-file` under `TURMA_PR_SUMMARY=0`, still posts the file unless Claude Code's prefix
+    match refuses the substitution — unmeasured, part of the spike below.
   - `TURMA_TOOL_ALLOW` splits on every comma with no escape, so a rule whose pattern holds a comma
     cannot be set through it (it lands as two malformed rules).
   - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
