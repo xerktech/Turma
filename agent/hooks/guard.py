@@ -57,6 +57,7 @@ import os
 import posixpath
 import re
 import shlex
+from collections.abc import Callable
 import sys
 
 # --- command segmentation ------------------------------------------------
@@ -191,7 +192,7 @@ def _is_comment(command: str, i: int) -> bool:
     return prev in " \t\n" and not (i >= 2 and command[i - 2] == "\\")
 
 
-def _balanced_groups(command: str) -> tuple[list[str], bool]:
+def _balanced_groups(command: str, heredoc: bool = False) -> tuple[list[str], bool]:
     """Bodies of the outermost `$(…)`, `<(…)`, `>(…)`, `(…)` and backtick groups,
     and whether the scan is SUSPECT.
 
@@ -218,12 +219,18 @@ def _balanced_groups(command: str) -> tuple[list[str], bool]:
     where on its own it swallowed the group's `)` and extracted nothing.
     An unclosed group yields no body: reading it to the end of the string
     swallowed later commands into it.
+
+    ``heredoc`` scans the body of an UNQUOTED heredoc, which bash expands like
+    a double-quoted string whose `"` is literal (XERK-1256): only `$(`, `${` and
+    backticks open anything, so `don't $(rm -rf /)` still runs its group.
     """
     bodies: list[str] = []
     # One entry per open context: '"' a double-quoted string, 'p' a `${…}`,
     # '[' a `[[ … ]]` test, 'c' a `case … esac`, '(' a group. Quoting nests
     # inside `$(…)`, so a flat flag cannot tell `"$(grep "a)" f)"` from `"a)"`.
-    stack: list[str] = []
+    # 'h' (heredoc mode only) is the body itself; nothing closes it.
+    base = ["h"] if heredoc else []
+    stack: list[str] = list(base)
     suspect = False
     start = 0
     i, n = 0, len(command)
@@ -265,8 +272,8 @@ def _balanced_groups(command: str) -> tuple[list[str], bool]:
             stack.append("p")
             i += 2
             continue
-        if top == '"':
-            if ch == '"':
+        if top in ('"', "h"):
+            if ch == '"' and top == '"':
                 stack.pop()
             i += 1
             continue
@@ -321,7 +328,7 @@ def _balanced_groups(command: str) -> tuple[list[str], bool]:
             elif top != "c":
                 suspect = True  # closes nothing: some context was misread
         i += 1
-    return [b for b in bodies if b.strip()], suspect or bool(stack)
+    return [b for b in bodies if b.strip()], suspect or stack != base
 
 
 # The ends a group leaves on an operator-split fragment: `rm -rf /)` is the
@@ -356,17 +363,103 @@ def _subst_inner(m: "re.Match[str]") -> str:
 _OPAQUE_SUBST = "turma_substituted_value"
 
 
-def _subst_text(m: "re.Match[str]") -> str:
+def _quote_states(command: str) -> list[str]:
+    """How each character of ``command`` is quoted: `'` inside a single-quoted
+    literal, `"` inside a double-quoted string, `\\` escaped, "" bare.
+
+    A `$(…)` inside a string restarts quoting, as bash does, so the `'…'` in
+    `"$(echo 'a')"` is a real single-quoted literal again.
+    """
+    out = [""] * len(command)
+    stack: list[str] = []
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        top = stack[-1] if stack else ""
+        if ch == "\\":
+            out[i:i + 2] = ["\\"] * len(out[i:i + 2])
+            i += 2
+            continue
+        if command.startswith("$(", i):
+            stack.append("(")
+            i += 2
+            continue
+        if top == '"':
+            out[i] = '"'
+            if ch == '"':
+                stack.pop()
+            i += 1
+            continue
+        if ch == "'":
+            end = command.find("'", i + 1)
+            end = n - 1 if end < 0 else end
+            out[i:end + 1] = ["'"] * (end + 1 - i)
+            i = end + 1
+            continue
+        if ch == '"':
+            out[i] = '"'
+            stack.append('"')
+        elif ch == "(":
+            stack.append("(")
+        elif ch == ")" and top == "(":
+            stack.pop()
+        i += 1
+    return out
+
+
+def _live_substs(segment: str) -> list["re.Match[str]"]:
+    """The substitutions in ``segment`` bash would actually run.
+
+    `git commit -m '$(rm -rf /)'` runs nothing — inside single quotes (or after
+    a backslash) it is text — and expanding it refused the commit (XERK-1256).
+    A quoted script handed to `bash -c`/`eval`/`ssh` is still found: those
+    branches re-expand their argument unquoted.
+    """
+    states = _quote_states(segment)
+    return [m for m in _SUBST_RE.finditer(segment) if states[m.start()] not in ("'", "\\")]
+
+
+def _sub_live(segment: str, repl: Callable[["re.Match[str]"], str]) -> str:
+    """``_SUBST_RE.sub`` over the live substitutions only."""
+    parts: list[str] = []
+    last = 0
+    for m in _live_substs(segment):
+        parts.append(segment[last:m.start()])
+        parts.append(repl(m))
+        last = m.end()
+    parts.append(segment[last:])
+    return "".join(parts)
+
+
+def _subst_standalone(m: "re.Match[str]") -> bool:
+    """Whether the substitution is a whole word of its own (quotes aside)."""
+    s, a, b = m.string, m.start(), m.end()
+    while a > 0 and s[a - 1] in "'\"":
+        a -= 1
+    while b < len(s) and s[b] in "'\"":
+        b += 1
+    return (a == 0 or s[a - 1] in _WORD_END) and (b == len(s) or s[b] in _WORD_END)
+
+
+def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
     """What a substitution CONTRIBUTES to the command line around it.
 
     `rm -rf $(echo /etc)` deletes /etc, and erasing the substitution erased the
     target with it — an easier spelling than the `eval "$(echo …)"` form. Where
     the inner command only prints its arguments, those arguments ARE the text;
     anything else is opaque.
+
+    ``glued_empty`` is the other reading of an opaque substitution: that it
+    printed NOTHING. Glued to a word, that is the word itself — `$()rm -rf /`
+    and `` `true`rm -rf / `` run `rm`, which the placeholder alone hid as the
+    program `turma_substituted_valuerm` (XERK-1256). A standalone one stays
+    opaque: an empty WORD reads as the root (see `_OPAQUE_SUBST`).
     """
     toks = _tokenize(_subst_inner(m))
     if toks and _basename(toks[0]) in _ECHO_PROGS:
         return " ".join(toks[1:])
+    if glued_empty and not _subst_standalone(m):
+        return ""
     return _OPAQUE_SUBST
 
 
@@ -398,9 +491,13 @@ _TOO_DEEP = "\x00turma-too-deep"
 
 _IFS_RE = re.compile(r"\$\{IFS\}|\$IFS")
 _ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
-_BRACE_RE = re.compile(r"\{([^{}]+,[^{}]*)\}")
+_BRACE_RE = re.compile(r"\{([^{}\s]+,[^{}\s]*)\}")
+# A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
+# inlined as `eval 'rm`. The substitution scan skips single quotes, so inlining
+# is the only way `x='$(rm -rf /)'; eval $x` is seen at all (XERK-1256).
 _VAR_ASSIGN_RE = re.compile(
-    r"(?:^|[;\n&|]|\bexport\s+)\s*([A-Za-z_][A-Za-z0-9_]*)=([^\s;|&\n]+)"
+    r"(?:^|[;\n&|]|\bexport\s+)\s*([A-Za-z_][A-Za-z0-9_]*)="
+    r"('[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n]+)"
 )
 _FOR_IN_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)")
 # `$NAME`, `${NAME}`, and the operator forms — `${d%/}`, `${d#x}`, `${d:0:4}`,
@@ -458,12 +555,24 @@ def _decode_ansi_c(command: str) -> str:
 
 
 def _expand_braces(command: str) -> str:
-    """`rm -rf {/etc,/var}` → `rm -rf /etc /var` (prefix/suffix preserved)."""
-    for _ in range(4):  # bounded: an expansion can re-create a brace
-        m = _BRACE_RE.search(command)
+    """`rm -rf {/etc,/var}` → `rm -rf /etc /var` (prefix/suffix preserved).
+
+    A QUOTED brace is text — bash expands none inside `'…'` or `"…"`, and
+    rewriting `awk '{print $2,$4}'` unbalanced its quotes (XERK-1256). A quoted
+    script handed to `bash -c`/`eval` is re-expanded unquoted where it runs.
+    """
+    pos = 0
+    expansions = 0
+    states = _quote_states(command)
+    while expansions < 4:  # bounded: an expansion can re-create a brace
+        m = _BRACE_RE.search(command, pos)
         if not m:
             break
         start, end = m.span()
+        if states[start]:
+            pos = start + 1
+            continue
+        expansions += 1
         word_start = command.rfind(" ", 0, start) + 1
         word_end = command.find(" ", end)
         if word_end == -1:
@@ -471,6 +580,8 @@ def _expand_braces(command: str) -> str:
         prefix, suffix = command[word_start:start], command[end:word_end]
         parts = [prefix + p.strip() + suffix for p in m.group(1).split(",")]
         command = command[:word_start] + " ".join(parts) + command[word_end:]
+        pos = word_start
+        states = _quote_states(command)
     return command
 
 
@@ -483,7 +594,22 @@ def _var_values(command: str) -> dict[str, list[str]]:
         words = [w for w in m.group(2).split() if w != "do"]
         if words:
             vals.setdefault(m.group(1), []).extend(words)
-    return vals
+    # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
+    # HERE, once, against the values that name none. Left in, every recursion
+    # level re-inlined it, the text grew each time, and an ordinary command
+    # was refused as nested too deeply. An unresolvable one is empty, as bash
+    # reads an unset name.
+    plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
+
+    def resolve(m: "re.Match[str]") -> str:
+        name = m.group(1) or m.group(3) or ""
+        return " ".join(plain[name]) if name in vals else m.group(0)
+
+    return {k: [_VAR_USE_RE.sub(resolve, v) for v in vs] for k, vs in vals.items()}
+
+
+def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
+    return any((m.group(1) or m.group(3)) in vals for m in _VAR_USE_RE.finditer(value))
 
 
 def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> str:
@@ -520,30 +646,157 @@ def _prenormalise(command: str) -> str:
 # line of a heredoc body gets classified as a command of its own: a commit
 # message documenting `DROP TABLE`, or any prose containing `rm -rf`, was
 # refused. The body is still checked, but attributed to the command it feeds.
-_HEREDOC_START = re.compile(r"<<-?\s*(['\"]?)([A-Za-z_][A-Za-z0-9_]*)\1")
 
 
-def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str]]]:
-    """Split `command` into (commands-only text, [(owner line, body), ...])."""
+def _heredoc_word(command: str, j: int) -> tuple[str, bool, int]:
+    """The delimiter word starting at ``j``: (delimiter, quoted, end index).
+
+    Bash strips the quoting from the WHOLE word, and ANY quoting makes the body
+    literal: `<<E"OF"` ends at `EOF`, `<<\\EOF` is quoted. Reading only an
+    identifier ended `<<E"OF"` at a line `E` that never came, so every later
+    line was swallowed as data.
+    """
+    n = len(command)
+    word: list[str] = []
+    quoted = False
+    while j < n and command[j] not in _WORD_END:
+        ch = command[j]
+        if ch == "\\" and j + 1 < n:
+            quoted = True
+            word.append(command[j + 1])
+            j += 2
+        elif ch in ("'", '"'):
+            quoted = True
+            end = command.find(ch, j + 1)
+            end = n if end < 0 else end
+            word.append(command[j + 1:end])
+            j = end + 1
+        else:
+            word.append(ch)
+            j += 1
+    return "".join(word), quoted, j
+
+
+def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
+    """Split ``command`` into (commands-only text, [(owner line, body, quoted)]).
+
+    A lexer, not a per-line regex (XERK-1256): a regex found `<<` wherever it
+    sat, so the here-string `cat <<<x`, a quoted `echo '<<x'` and a comment
+    `# <<x` each opened a "heredoc" that swallowed every following line up to
+    one reading `x` — commands bash runs, never classified. Only an operator
+    outside quotes and comments opens one, and arithmetic `$((1<<2))` is a
+    shift. ``quoted`` is whether the delimiter was, i.e. whether bash leaves
+    the body literal or expands `$(…)` and backticks inside it.
+    """
     kept: list[str] = []
-    bodies: list[tuple[str, str]] = []
-    lines = command.splitlines()
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-        kept.append(line)
-        m = _HEREDOC_START.search(line)
-        i += 1
-        if not m:
+    bodies: list[tuple[str, str, bool]] = []
+    pending: list[tuple[str, bool, bool]] = []  # (delimiter, quoted, strip tabs)
+    # '"' a double-quoted string, '(' a `$(…)`/`(…)` group (quoting restarts in
+    # one, even inside a string), 'p' a `${…}`.
+    stack: list[str] = []
+    line_start = 0  # index into ``kept`` of the current line's first piece
+    i, n = 0, len(command)
+    while i < n:
+        ch = command[i]
+        top = stack[-1] if stack else ""
+        if ch == "\\":
+            kept.append(command[i:i + 2])
+            i += 2
             continue
-        delim = m.group(2)
-        body: list[str] = []
-        while i < len(lines) and lines[i].strip() != delim:
-            body.append(lines[i])
+        if ch == "`":
+            end = command.find("`", i + 1)
+            end = n - 1 if end < 0 else end
+            kept.append(command[i:end + 1])
+            i = end + 1
+            continue
+        if command.startswith("$((", i) or (top != '"' and command.startswith("((", i)):
+            # Arithmetic: its `<<` is a shift. Skip to the matching `))`.
+            depth, j = 0, i
+            while j < n:
+                if command[j] == "(":
+                    depth += 1
+                elif command[j] == ")":
+                    depth -= 1
+                    if depth == 0:
+                        break
+                j += 1
+            kept.append(command[i:j + 1])
+            i = j + 1
+            continue
+        if ch == "$" and command[i + 1:i + 2] in ("(", "{"):
+            stack.append("(" if command[i + 1] == "(" else "p")
+            kept.append(command[i:i + 2])
+            i += 2
+            continue
+        if top == '"':
+            if ch == '"':
+                stack.pop()
+            kept.append(ch)
             i += 1
-        i += 1  # the delimiter line itself
-        bodies.append((line, "\n".join(body)))
-    return "\n".join(kept), bodies
+            continue
+        if ch == "'" or (ch == "$" and command[i + 1:i + 2] == "'"):
+            j = i + (2 if ch == "$" else 1)
+            while j < n and command[j] != "'":
+                j += 2 if ch == "$" and command[j] == "\\" else 1
+            kept.append(command[i:j + 1])
+            i = j + 1
+            continue
+        if ch == '"':
+            stack.append('"')
+        elif ch == "(":
+            stack.append("(")
+        elif ch == ")" and top == "(":
+            stack.pop()
+        elif ch == "}" and top == "p":
+            stack.pop()
+        elif ch == "#" and top != "p" and _is_comment(command, i):
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            kept.append(command[i:end])
+            i = end
+            continue
+        elif command.startswith("<<<", i):
+            kept.append("<<<")
+            i += 3
+            continue
+        elif command.startswith("<<", i):
+            j = i + 2
+            strip_tabs = command[j:j + 1] == "-"
+            j += strip_tabs
+            while j < n and command[j] in " \t":
+                j += 1
+            delim, quoted, end = _heredoc_word(command, j)
+            if delim:
+                pending.append((delim, quoted, strip_tabs))
+            kept.append(command[i:end])
+            i = end
+            continue
+        elif ch == "\n" and pending:
+            # Bodies start after the line the operators sit on, in order.
+            owner = "".join(kept[line_start:])
+            kept.append("\n")
+            i += 1
+            for delim, quoted, strip_tabs in pending:
+                body: list[str] = []
+                while i < n:
+                    end = command.find("\n", i)
+                    end = n if end < 0 else end
+                    line = command[i:end]
+                    i = end + 1
+                    # A looser end than bash's (it wants the exact line) only
+                    # ever ends a body EARLIER, classifying more, never less.
+                    if (line.lstrip("\t") if strip_tabs else line).strip() == delim:
+                        break
+                    body.append(line)
+                bodies.append((owner, "\n".join(body), quoted))
+            pending = []
+            line_start = len(kept)
+            continue
+        if ch == "\n":
+            line_start = len(kept) + 1
+        kept.append(ch)
+        i += 1
+    return "".join(kept), bodies
 
 
 def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
@@ -559,18 +812,39 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
 
     Stripping stray quotes in the tokenizer instead is NOT the fix: it turns
     `rg -n 'shutdown|reboot' ansible/` into a power-state command.
+
+    Three more things are not operators (XERK-1256):
+    - a `#` comment, whose apostrophe (`# don't`) opened a "quote" that hid
+      every command after it;
+    - anything inside backticks, so `` `|`rm -rf / `` stays one segment;
+    - the `|` between `case` pattern alternatives: `reboot|shutdown) …` read
+      as the power command `reboot`. A plain pattern is dropped, not emitted —
+      it is never a command — unless it holds a substitution, which runs.
     """
     out: list[str] = []
     buf: list[str] = []
     quote: str | None = None
+    # `case` state: how many are open, whether the next `in` is a case's, and
+    # whether we are reading a pattern (with its extglob paren depth).
+    case_depth = 0
+    want_in = False
+    in_pattern = False
+    pat_parens = 0
     i, n = 0, len(command)
+
+    def flush() -> None:
+        nonlocal buf
+        out.append("".join(buf))
+        buf = []
+
     while i < n:
         ch = command[i]
         if quote:
             buf.append(ch)
             # Inside double quotes a backslash escapes the next character;
             # inside single quotes it does not, and nothing ends them but `'`.
-            if ch == "\\" and quote == '"' and i + 1 < n:
+            # Inside backticks it escapes, as in double quotes.
+            if ch == "\\" and quote != "'" and i + 1 < n:
                 buf.append(command[i + 1])
                 i += 2
                 continue
@@ -578,7 +852,7 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
                 quote = None
             i += 1
             continue
-        if ch in ("'", '"'):
+        if ch in ("'", '"', "`"):
             quote = ch
             buf.append(ch)
             i += 1
@@ -588,19 +862,65 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
             buf.append(command[i + 1])
             i += 2
             continue
+        if ch == "#" and _is_comment(command, i):
+            end = command.find("\n", i)
+            i = n if end < 0 else end
+            continue
+        if in_pattern:
+            if not "".join(buf).strip() and _word_at(command, i, "esac"):
+                case_depth -= 1
+                in_pattern = False
+                buf.append("esac")
+                i += 4
+                continue
+            if ch == "(":
+                # The optional opener `(a|b)` is no extglob paren.
+                pat_parens += 1 if "".join(buf).strip() else 0
+            elif ch == ")" and pat_parens:
+                pat_parens -= 1
+            elif ch == ")":
+                in_pattern = False
+                pattern = re.sub(r"\s*\|\s*", "|", "".join(buf).strip())
+                if re.search(r"\s|\$\(|`|[<>]\(", pattern):
+                    flush()
+                else:
+                    buf = []
+                i += 1
+                continue
+            elif ch == "|":
+                buf.append(ch)
+                i += 1
+                continue
+        elif _word_at(command, i, "case") and _at_command_start(command, i):
+            case_depth += 1
+            want_in = True
+        elif want_in and _word_at(command, i, "in") and command[i - 1:i] in (" ", "\t", "\n"):
+            want_in = False
+            in_pattern = True
+            pat_parens = 0
+            buf.append("in")
+            flush()
+            i += 2
+            continue
+        elif case_depth and command.startswith((";;", ";&"), i):
+            flush()
+            in_pattern = True
+            pat_parens = 0
+            i += 3 if command.startswith(";;&", i) else 2
+            continue
+        elif case_depth and _word_at(command, i, "esac") and _esac_closes(command, i):
+            case_depth -= 1
         if command[i:i + 2] in ("&&", "||"):
-            out.append("".join(buf))
-            buf = []
+            flush()
             i += 2
             continue
         if ch in (";", "\n", "&") or (include_pipe and ch == "|"):
-            out.append("".join(buf))
-            buf = []
+            flush()
             i += 1
             continue
         buf.append(ch)
         i += 1
-    out.append("".join(buf))
+    flush()
     return [seg.strip() for seg in out if seg.strip()]
 
 
@@ -743,21 +1063,32 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     # BEFORE pre-normalisation, whose brace expansion ignores quoting and can
     # unbalance them (`awk '{print $2, $4}'`); each body gets the variables
     # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
-    raw_commands, _ = _split_heredocs(command)
+    raw_commands, heredocs = _split_heredocs(command)
     raw_vals = _var_values(raw_commands)
     bodies, suspect = _balanced_groups(raw_commands)
+    for owner, body, quoted in heredocs:
+        # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
+        # runs every line of it. Expand those bodies as commands; bodies fed to
+        # anything else stay data (see _destructive_database for the psql case).
+        owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
+        if owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."}):
+            out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1))
+        elif not quoted:
+            # ...but data behind an UNQUOTED delimiter is expanded first, so its
+            # `$(…)` and backticks run whoever reads it: `cat <<EOF` / `$(rm -rf
+            # /)` / `EOF` deletes / (XERK-1256). A lost scan fails closed, as
+            # the command line's own does below.
+            found, lost = _balanced_groups(body, heredoc=True)
+            bodies.extend(found)
+            if lost:
+                for raw in _split_segments(body):
+                    for frag in _stray_group_fragments(raw):
+                        out.extend(_expand_segments(frag, depth + 1))
     for body in bodies:
         if _ARITH_BODY_RE.match(body):
             continue
         out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1))
-    command, heredocs = _split_heredocs(_prenormalise(command))
-    # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF` runs
-    # every line of it. Expand those bodies as commands; bodies fed to anything
-    # else stay data (see _destructive_database for the psql case).
-    for owner, body in heredocs:
-        owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
-        if owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."}):
-            out.extend(_expand_segments(body, depth + 1))
+    command = _prenormalise(raw_commands)
     segments = _split_segments(command)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
@@ -776,14 +1107,18 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             for frag in _stray_group_fragments(raw):
                 out.extend(_expand_segments(frag, depth + 1))
         # Anything a substitution would run, wherever it sits in the segment.
-        for m in _SUBST_RE.finditer(raw):
+        for m in _live_substs(raw):
             inner = _subst_inner(m)
             if inner.strip():
                 out.extend(_expand_segments(inner, depth + 1))
         # A substitution also CONTRIBUTES text where it sits — `$(echo …)` is
         # what `eval "$(echo rm -rf /etc)"` runs and what `rm -rf $(echo /etc)`
         # deletes. Both fall out of substituting rather than erasing.
-        seg = _unwrap_group(_SUBST_RE.sub(_subst_text, raw))
+        seg = _unwrap_group(_sub_live(raw, _subst_text))
+        # ...and one that printed nothing leaves the word it is glued to.
+        bare = _unwrap_group(_sub_live(raw, lambda m: _subst_text(m, glued_empty=True)))
+        if bare != seg and bare:
+            out.extend(_expand_segments(bare, depth + 1))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
             if _SEGMENT_SPLIT.search(seg):
@@ -1829,7 +2164,7 @@ def _destructive_database(command: str) -> str | None:
     # stage while the stage that executes it carries no SQL of its own, so
     # judging stages separately cleared both halves. Judge the pipeline whole —
     # it is destructive if any stage is something other than a text tool.
-    for pipeline in _split_on_operators(_split_heredocs(_prenormalise(command))[0],
+    for pipeline in _split_on_operators(_prenormalise(_split_heredocs(command)[0]),
                                         include_pipe=False):
         if not _DB_DESTRUCTION.search(pipeline):
             continue
@@ -1839,7 +2174,7 @@ def _destructive_database(command: str) -> str | None:
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     # A heredoc body is data, but `psql <<EOF ... DROP DATABASE x; ... EOF` is
     # still the statement being executed — judge it by the command it feeds.
-    for owner, body in _split_heredocs(command)[1]:
+    for owner, body, _quoted in _split_heredocs(command)[1]:
         if not _DB_DESTRUCTION.search(body):
             continue
         for tokens, _seg, *_flags in _expand_segments(owner):

@@ -63,15 +63,30 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     first cut `$(true; rm -rf /)` / `(cd x; rm -rf /)` in half and allowed them.
     - It is a small lexer, not a paren count: `'…'`/`$'…'`, `"…"`, `[[ … ]]`, `case … esac` and
       `#` comments each hid a bypass or caused a false deny when miscounted. Scans the RAW line
-      (pre-normalisation brace expansion unbalances quotes); unclosed groups yield nothing.
+      (pre-normalisation rewrites it); unclosed groups yield nothing.
     - **A misread must fail CLOSED**: no lexer short of bash is exact, and a misread context
       swallows the group's `)`. So the scan reports SUSPECT (context open at the end, or a `)`
       closing nothing outside `case`) and the split fragments are then also classified
       edge-stripped (`_stray_group_fragments`). Never drop that fallback to fix a false deny.
     - Exhausting `_MAX_EXPAND_DEPTH` DENIES (`_TOO_DEEP`) — returning nothing let a 7-deep group
       through, since a group body is only reachable by recursing.
-    - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old
-      vs new guard): 0 diffs is the bar. Unit cases alone missed every false deny above.
+  - **Heredocs are split by a lexer** (`_split_heredocs`, XERK-1256): only a `<<` outside quotes,
+    comments, `<<<` and arithmetic opens one; the delimiter word is de-quoted whole.
+    - An UNQUOTED delimiter's body is scanned for groups (`_balanced_groups(heredoc=True)`) — bash
+      expands `$(…)`/backticks there. A quoted one stays data unless a shell owns it.
+    - Pre-normalisation runs on the heredoc-free text, so body prose cannot shift quoting.
+  - **The splitter knows comments, backticks and `case` patterns** (`_split_on_operators`):
+    `# don't` desynced its quotes; a pattern's `|` is no pipe and a plain pattern is dropped.
+  - **Substitutions/braces inside single quotes are text** (`_live_substs`, `_expand_braces`):
+    `bash -c`/`eval`/wrapper branches re-expand a quoted script, so nothing is lost by skipping.
+    - Quoted assignment values are read whole (`_VAR_ASSIGN_RE`); without that, skipping quoted
+      substitutions lost `x='$(rm -rf /)'; eval $x`.
+  - **An opaque substitution glued to a word is also read as EMPTY** (`glued_empty`): `$(true)rm`
+    runs `rm`. A standalone one stays the placeholder — an empty word reads as the root.
+  - **`_var_values` resolves a value naming an assigned variable once** (`d=$d/x`): left in, each
+    recursion level re-inlined it until `_TOO_DEEP` refused an ordinary command.
+  - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old vs
+    new guard): 0 diffs is the bar, or each diff explained. Unit cases missed every false deny above.
   - Keep in sync with the twin hook outside this repo.
   - Tests: `test_guard.py`, `test_guard_settings.py`.
 - **File guard** (`hooks/fileguard.py`, same shape) — `PreToolUse` over
