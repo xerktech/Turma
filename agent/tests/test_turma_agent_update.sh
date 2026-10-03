@@ -1594,7 +1594,7 @@ if [ -d /run/systemd/system ]; then
       "installed timer not refreshed from the payload: $got"
     if [ "$same" = no ]; then
       if grep -q "systemctl --user daemon-reload" "$root/restart.log" \
-         && grep -q "systemctl --user restart turma-agent-update.timer" "$root/restart.log"; then
+         && grep -q "systemctl --user try-restart turma-agent-update.timer" "$root/restart.log"; then
         pass "a changed timer is reloaded and restarted"
       else
         fail "changed timer not reloaded/restarted: $(cat "$root/restart.log")"

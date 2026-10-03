@@ -802,6 +802,8 @@ install_payload() {  # <tgz> <version>
 # existing host — the one that matters is the host whose timer had gone `elapsed`
 # (XERK-1266), which only an update run by hand could still reach. Same two
 # systemd scopes as the manager restart below; best-effort, never fails the update.
+# try-restart, never restart: an `elapsed` timer is still active and re-arms, but
+# a timer the operator deliberately STOPPED must stay stopped.
 refresh_update_timer() {  # <payload dir>
   local src="$1" dir
   [ -f "$src/turma-agent-update.timer" ] && [ -d /run/systemd/system ] || return 0
@@ -811,7 +813,7 @@ refresh_update_timer() {  # <payload dir>
     cmp -s "$src/turma-agent-update.timer" "$dir/turma-agent-update.timer" && return 0
     if cp -f "$src/turma-agent-update.timer" "$dir/turma-agent-update.timer" \
        && systemctl --user daemon-reload \
-       && systemctl --user restart turma-agent-update.timer; then
+       && systemctl --user try-restart turma-agent-update.timer; then
       logmsg "update timer refreshed from payload"
     else
       logmsg "update timer refresh failed (continuing)"
@@ -819,7 +821,7 @@ refresh_update_timer() {  # <payload dir>
   elif [ "$(id -u)" = 0 ] && [ -f /etc/systemd/system/turma-agent-update.timer ]; then
     cmp -s "$src/turma-agent-update.timer" /etc/systemd/system/turma-agent-update.timer && return 0
     if cp -f "$src/turma-agent-update.timer" /etc/systemd/system/turma-agent-update.timer \
-       && systemctl daemon-reload && systemctl restart turma-agent-update.timer; then
+       && systemctl daemon-reload && systemctl try-restart turma-agent-update.timer; then
       logmsg "update timer refreshed from payload"
     else
       logmsg "update timer refresh failed (continuing)"
