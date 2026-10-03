@@ -250,8 +250,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     (`TURMA_QUESTION_TIMEOUT_SEC`, 600s) sits under the settings-level `timeout`; passes through
     silently when env vars absent. Kill/delete/restart clear pending req/ans files. `multiSelect`
     accepts `optionIndices`.
-  - **The manager reads every SESSION-written file only via `_read_untrusted_json`** (XERK-1562):
+  - **A new manager reader of a SESSION-written file must use `_read_untrusted_json`** (XERK-1562):
     `O_NONBLOCK|O_NOFOLLOW`, regular file only, size-capped. `questions/` is session-writable, and
     `_hook_question` + `_dsh_pending_request_id` run on the beat — a plain `open()` of a planted
     FIFO froze the heartbeat. A FIFO, symlink or file past `QUESTION_REQ_MAX_BYTES` is no request.
+  - **Known remaining plain open:** `read_limits_snapshot` still `open()`s the session-writable
+    `~/.turma/limits.json` on the beat — the same FIFO hang, not yet routed through that reader.
   - Tests: `test_ask.py`, `TestHookQuestion`, `TestAnswerQuestion`, `test_guard_settings.py`.
