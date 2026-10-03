@@ -994,4 +994,11 @@ test("a retryBlocked GET that never settles is bounded and cannot wedge a hydrat
   await hyd;
   assert.deepEqual(gets, ["repo/a.jsonl"]);
   assert.equal(m.hydrated, true);
+  // The yield is per pass: the next retry pass fetches what this one left.
+  m._blocked.set("repo/b.jsonl", "x");
+  const next = m.retryBlocked({ getDeadlineMs: 2000 });
+  await new Promise((r) => setImmediate(r));
+  late.shift()();
+  assert.equal(await next, 1);
+  assert.deepEqual(gets, ["repo/a.jsonl", "repo/b.jsonl"]);
 });
