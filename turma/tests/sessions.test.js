@@ -379,7 +379,7 @@ test("background shell kinds: waiting holds, stalled surfaces, work stays workin
   render({ now, agents: [h] });
   const a = els.active.innerHTML, r = els.review.innerHTML;
   // Holding: Active, labelled with the ETA or what it waits on, styled holding.
-  assert.ok(a.includes("Sleeping Task") && a.includes("waiting · 12m left"), a);
+  assert.ok(a.includes("Sleeping Task") && a.includes("waiting · Sleep · 12m left"), a);
   assert.ok(a.includes("CI Watcher") && a.includes("waiting · Watch CI"));
   assert.ok(/state holding/.test(a));
   assert.ok(!r.includes("Sleeping Task") && !r.includes("CI Watcher"));
@@ -412,8 +412,8 @@ test("attention: sleeping holds, review sorts oldest-waiting first with the why 
   render({ now, agents: [h] });
   const r = els.review.innerHTML, a = els.active.innerHTML;
   assert.ok(r.indexOf("Older Wait") >= 0 && r.indexOf("Older Wait") < r.indexOf("Newer Wait"), "oldest-waiting first");
-  assert.ok(r.includes('<div class="why">PR open · CI passing · waiting 40m</div>'), r);
-  assert.ok(r.includes('<div class="why">finished · nothing to merge · waiting 5m</div>'));
+  assert.ok(r.includes('<div class="why">PR open · CI passing · waiting\u00a040m</div>'), r);
+  assert.ok(r.includes('<div class="why">finished · nothing to merge · waiting\u00a05m</div>'));
   // A stalled card names its wait in its label, so its why line is the age only —
   // "stalled 2m", never a second "waiting" — and it takes the danger tone.
   const { render: render2, els: els2 } = loadPage();
@@ -423,7 +423,7 @@ test("attention: sleeping holds, review sorts oldest-waiting first with the why 
   ].map((x) => ({ ...x, attention: { state: "needs-you:stalled", since: t - 2 * 60 * 1000, why: "Watch CI" } })));
   render2({ now: n2, agents: [h2] });
   assert.ok(els2.review.innerHTML.includes('stalled · Watch CI'));
-  assert.ok(els2.review.innerHTML.includes('<div class="why">stalled 2m</div>'), els2.review.innerHTML);
+  assert.ok(els2.review.innerHTML.includes('<div class="why">stalled\u00a02m</div>'), els2.review.innerHTML);
   assert.ok(els2.review.innerHTML.includes('<span class="dot stalled"></span>'), els2.review.innerHTML);
   assert.ok(els2.review.innerHTML.includes('<div class="state stalled">stalled · Watch CI'), els2.review.innerHTML);
   // Sleeping: Active, holding, "until HH:MM" — not Ready for review.
@@ -431,6 +431,36 @@ test("attention: sleeping holds, review sorts oldest-waiting first with the why 
   assert.ok(a.includes("Asleep") && a.includes("💤 sleeping until " + hhmm), a);
   // Waiting cards lead with the hourglass.
   assert.ok(a.includes("⏳ waiting · Watch CI"));
+});
+
+// XERK-1571 screenshot pass. A permission card says it waits for PERMISSION and
+// names the pending command (the hub's why), never the dialog's generic
+// question; a stalled card carries ONE age (the stall's), not the wait's start
+// age beside it; a timed wait keeps its subject.
+test("attention: permission names its command, a stall shows one age, a timed wait keeps its subject", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const { now, host: h } = host([
+    { ...running("61111", "Restarter", { paneBusy: false, transcriptAgeSec: 30,
+        panePrompt: { prompt: "Do you want to proceed?" } }),
+      attention: { state: "needs-you:permission", since: t - 4 * 60 * 1000,
+        why: "Bash: kubectl -n turma rollout restart deploy/turma" } },
+    { ...running("62222", "Stuck Deploy", { paneBusy: false, transcriptAgeSec: 50 * 60, lastRole: "assistant", lastHasToolUse: false,
+        agents: [{ type: "shell", label: "Wait for staging deploy", kind: "wait-external", startedAt: t - 38 * 60 * 1000 }] }),
+      attention: { state: "needs-you:stalled", since: t - 31 * 60 * 1000, why: "Wait for staging deploy" } },
+    running("63333", "Rollout", { paneBusy: false, transcriptAgeSec: 5,
+      agents: [{ type: "shell", label: "Wait for the rollout", kind: "wait-timed", eta: t + 11 * 60 * 1000 + 30000 }] }),
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML, a = els.active.innerHTML;
+  assert.ok(r.includes("waiting for your permission"), r);
+  assert.ok(r.includes('<div class="question ask">Bash: kubectl -n turma rollout restart deploy/turma</div>'), r);
+  assert.ok(!r.includes("Do you want to proceed?"), "the generic dialog question is not quoted");
+  assert.ok(r.includes('<div class="why">for 4m</div>'), r);
+  assert.ok(r.includes('<div class="state stalled">stalled · Wait for staging deploy</div>'), r);
+  assert.ok(r.includes('<div class="why">stalled 31m</div>'));
+  assert.ok(!r.includes("38m"), "the wait's start age is not shown beside the stall age");
+  assert.ok(a.includes("⏳ waiting · Wait for the rollout · 11m left"), a);
 });
 
 // XERK-735. The card's second line reads repo · related ticket · pc name ·

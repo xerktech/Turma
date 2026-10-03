@@ -2189,8 +2189,13 @@ function liveState(sess, host, now) {
   // neither can see it: nothing about the dialog reaches the transcript, and
   // while it is up the pane shows no interrupt hint — so the card would read
   // "idle" for a session that is actually waiting on a human.
+  //
+  // A permission is not a question, and its dialog's own question is nearly
+  // always "Do you want to proceed?" — so the card says it waits for PERMISSION
+  // and names what is asked for (XERK-1571): the hub's attention why (the
+  // pending command), else the dialog's question from an older hub.
   if (s && s.panePrompt && s.panePrompt.prompt)
-    return { kind: "waiting", label: "waiting for your answer", question: s.panePrompt.prompt };
+    return { kind: "waiting", label: "waiting for your permission", ask: permissionAsk(sess) };
   if (!s || s.transcriptAgeSec == null) return { kind: "idle", label: "no transcript yet" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   // Background agents are the other thing paneBusy cannot see (XERK-245): a
@@ -2236,6 +2241,13 @@ function liveAgentCount(s) {
 function isWaitRow(a) {
   return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
 }
+// What a blocking dialog asks permission FOR (XERK-1571): the hub's attention
+// why ("Bash: kubectl …", read off the dialog's detail), else its question.
+function permissionAsk(sess) {
+  const att = sess?.attention;
+  if (att?.state === "needs-you:permission" && typeof att.why === "string" && att.why) return att.why;
+  return sess?.session?.panePrompt?.prompt || "";
+}
 // A session-CLI wake still ahead (XERK-1571) — mirror of server.js sessionSleeping.
 function sleepingUntil(s, now) {
   return Number.isSafeInteger(s?.wakeAt) && s.wakeAt > now;
@@ -2267,19 +2279,25 @@ function backgroundWait(rows, lastWrite, now) {
   const silent = now - lastWrite >= WAIT_STALL_MS;
   return { state: overdue || silent ? "stalled" : "waiting", eta };
 }
-// "waiting · 12m left" (a timed wait), "waiting · Watch CI" (one named wait),
-// else "waiting on 2 background shells"; "stalled …" once it has stalled.
+// "waiting · Sleep · 12m left" (a timed wait), "waiting · Watch CI" (one named
+// wait), else "waiting on 2 background shells"; "stalled …" once it has stalled.
 function backgroundWaitLabel(rows, wait, now) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
   const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
-  if (wait.eta != null && wait.eta > now) return word + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
+  // One named wait keeps its subject on every branch (XERK-1571): a timed wait
+  // that read only "11m left" said nothing about what it waits for.
+  const what = waits.length === 1 && waits[0].label ? " · " + waits[0].label : "";
+  if (wait.eta != null && wait.eta > now) return word + what + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
   // No ETA: how long it has been waiting, off the oldest wait row's startedAt
-  // (XERK-1571) — a CI watch with no duration reads as if it just began.
+  // (XERK-1571) — a CI watch with no duration reads as if it just began. Not on
+  // a STALL: how long it has been stalled is the hub's attention `since` (the
+  // card's why line, the dashboard's Needs-you row), and a second, different age
+  // beside it read as two stall lengths for one session.
   let started = null;
   for (const a of waits)
     if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
-  const since = started == null ? "" : " · " + ago(now - started).replace(/ ago$/, "");
-  if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label + since;
+  const since = started == null || wait.state === "stalled" ? "" : " · " + ago(now - started).replace(/ ago$/, "");
+  if (what) return word + what + since;
   return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s") + since;
 }
 // The oppositional QA agents (`qa` on the first pass, `qa-delta` on every pass
@@ -2376,23 +2394,22 @@ function reviewState(s, live, now) {
 
 // The hub's attention read (XERK-1571), as a review card's second line: WHY the
 // session is the operator's ("PR open · CI passing") and how long it has been
-// ("· waiting 12m"). A question card already quotes its question and a stalled
-// one names its wait in its label, so for those only the time shows — "for 22m"
-// under "waiting for your answer", "stalled 31m" under a stall. A permission
-// card quotes the dialog's generic question, so its why (the pending command)
-// shows too. "" from an older hub that serves no `attention`.
+// ("· waiting 12m"). A question card already quotes its question, a permission
+// card names what it asks for (`ask`), and a stalled one names its wait in its
+// label, so for those only the time shows — "for 22m" under "waiting for your
+// answer", "stalled 31m" under a stall. The age is glued to its word by a
+// no-break space, so a narrow card never leaves "4m" alone on a line. "" from an
+// older hub that serves no `attention`.
 function attentionWhy(s, now) {
   const att = s.attention;
   const st = String(att?.state || "");
   if (!st.startsWith("needs-you:")) return "";
   const asked = st === "needs-you:question" || st === "needs-you:permission";
   const bits = [];
-  const quoted = s.session?.panePrompt?.prompt;
-  if (att.why && (st === "needs-you:review" || st === "needs-you:test"
-      || (st === "needs-you:permission" && att.why !== quoted))) bits.push(att.why);
+  if (att.why && (st === "needs-you:review" || st === "needs-you:test")) bits.push(att.why);
   if (Number.isSafeInteger(att.since)) {
     const age = ago(now - att.since).replace(/ ago$/, "");
-    bits.push((st === "needs-you:stalled" ? "stalled " : asked ? "for " : "waiting ") + age);
+    bits.push((st === "needs-you:stalled" ? "stalled" : asked ? "for" : "waiting") + " " + age);
   }
   return bits.join(" · ");
 }
@@ -2820,6 +2837,7 @@ function activeCard({ a, s, live }) {
           ${s.prs?.length ? `<span class="pr-list">${s.prs.map(prBadgeLinkHtml).join("")}</span>` : ""}
         </div>
         ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
+        ${live.ask ? `<div class="question ask">${esc(live.ask)}</div>` : ""}
         ${live.why ? `<div class="why">${esc(live.why)}</div>` : ""}
         ${moving}
       </span>

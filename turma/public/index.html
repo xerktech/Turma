@@ -1152,6 +1152,14 @@ function qaReviewing(s) {
 function sleepingUntil(s, now) {
   return Number.isSafeInteger(s?.wakeAt) && s.wakeAt > now;
 }
+// What a blocking dialog asks permission FOR (XERK-1571): the hub's attention
+// why ("Bash: kubectl …", read off the dialog's detail), else its question.
+// Same as sessions.html.
+function permissionAsk(sess) {
+  const att = sess?.attention;
+  if (att?.state === "needs-you:permission" && typeof att.why === "string" && att.why) return att.why;
+  return sess?.session?.panePrompt?.prompt || "";
+}
 // "14:05" — the local wall-clock time a sleeping session wakes at.
 function clockTime(ms) {
   const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
@@ -1178,8 +1186,8 @@ function attentionLabel(att) {
   const chip = att && NEEDS_YOU_CHIP[att.state];
   if (!chip) return null;
   const [cls, word] = chip;
-  if (cls === "question" || cls === "permission")
-    return { label: "waiting for your answer", cls: "sess-wait" };
+  if (cls === "question") return { label: "waiting for your answer", cls: "sess-wait" };
+  if (cls === "permission") return { label: "waiting for your permission", cls: "sess-wait" };
   return { label: [word, att.why].filter(Boolean).join(" · "),
            cls: cls === "stalled" ? "sess-stalled" : "sess-review" };
 }
@@ -1224,19 +1232,24 @@ function backgroundWait(rows, lastWrite, now) {
   const silent = now - lastWrite >= WAIT_STALL_MS;
   return { state: overdue || silent ? "stalled" : "waiting", eta };
 }
-// "waiting · 12m left" / "waiting · Watch CI" / "waiting on 2 background shells",
-// "stalled …" once stalled. Same as sessions.html.
+// "waiting · Sleep · 12m left" / "waiting · Watch CI" / "waiting on 2 background
+// shells", "stalled …" once stalled. Same as sessions.html.
 function backgroundWaitLabel(rows, wait, now) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
   const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
-  if (wait.eta != null && wait.eta > now) return word + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
+  // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
+  const what = waits.length === 1 && waits[0].label ? " · " + waits[0].label : "";
+  if (wait.eta != null && wait.eta > now) return word + what + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
   // No ETA: how long it has been waiting, off the oldest wait row's startedAt
-  // (XERK-1571) — a CI watch with no duration reads as if it just began.
+  // (XERK-1571) — a CI watch with no duration reads as if it just began. Not on
+  // a STALL: how long it has been stalled is the hub's attention `since`, which
+  // the Needs-you row shows; a second, different age here read as two stall
+  // lengths for one session.
   let started = null;
   for (const a of waits)
     if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
-  const since = started == null ? "" : " · " + ago(now - started).replace(/ ago$/, "");
-  if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label + since;
+  const since = started == null || wait.state === "stalled" ? "" : " · " + ago(now - started).replace(/ ago$/, "");
+  if (what) return word + what + since;
   return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s") + since;
 }
 
@@ -1253,9 +1266,13 @@ function liveState(sess, host, now) {
   // for the operator, and MUST be checked before the working read: while one is
   // up the pane shows no interrupt hint, so paneBusy reads false and the
   // session would otherwise be labelled plain "idle" while it waits on a human.
+  // A permission is not a question (XERK-1571): the card says it waits for
+  // permission and names what for — the hub's attention why (the pending
+  // command), not the dialog's generic "Do you want to proceed?". Same as
+  // sessions.html.
   if (s && s.panePrompt && s.panePrompt.prompt)
-    return { label: "waiting for your answer", cls: "sess-wait",
-             question: s.panePrompt.prompt, busy: true };
+    return { label: "waiting for your permission", cls: "sess-wait",
+             ask: permissionAsk(sess), busy: true };
   if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   // Background agents, which paneBusy cannot see: a session that delegated work
@@ -1992,6 +2009,7 @@ function sessCard(a, s, now) {
         : st === "queued" ? `<dt>State</dt><dd><b class="sess-queued">${esc(queuedReasonText(s.queuedReason))}</b>${s.queuedAt ? " · " + esc(ago(now - Date.parse(s.queuedAt))) : ""}</dd>`
         : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
+      ${live && live.ask ? `<dt>Permission</dt><dd>${esc(live.ask)}</dd>` : ""}
       ${st === "error" && s.errorMsg ? `<dt>Error</dt><dd class="errmsg">${esc(s.errorMsg)}</dd>` : ""}
       ${prs}
       <dt>Created</dt><dd>${s.createdAt ? esc(ago(now - Date.parse(s.createdAt))) : "–"}${s.stoppedAt ? " · stopped " + esc(ago(now - Date.parse(s.stoppedAt))) : ""}</dd>

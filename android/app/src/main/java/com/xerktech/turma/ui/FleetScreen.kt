@@ -585,6 +585,18 @@ private fun SessionCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+                // What a permission dialog asks for (XERK-1571, web Permission row):
+                // the hub's why — the pending command — not the dialog's generic question.
+                session.attention?.takeIf { it.state == "needs-you:permission" }?.why
+                    ?.takeIf { it.isNotBlank() }?.let { ask ->
+                        Text(
+                            ask,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 if (st == "error" && session.errorMsg.isNotBlank()) {
                     Text(session.errorMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 2)
                 }

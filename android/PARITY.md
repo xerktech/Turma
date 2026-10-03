@@ -310,7 +310,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     via `liveStateLabel(state, live)`, matching the web's `agentWorkLabel`.
   - **Waiting shells are not work (XERK-1570).** `LiveAgent`/`AgentRow` type `kind`
     (+ `startedAt`/`eta` on `LiveAgent`); `core/Sessions.kt` mirrors the hub's
-    `sessionWait` — `LiveState.HOLDING` (Active, never Ready for review, "⏳ waiting · 12m left" /
+    `sessionWait` — `LiveState.HOLDING` (Active, never Ready for review, "⏳ waiting · Sleep · 12m left" /
     "⏳ waiting · Watch CI"; a session-CLI sleeper "💤 sleeping until 14:05", XERK-1571) until
     stalled, then IDLE. The chat bar reads "Waiting…" and a wait row "waiting".
   - **Gap:** the Fleet card labels an IDLE session from the hub's served attention

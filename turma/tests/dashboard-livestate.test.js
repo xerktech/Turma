@@ -140,7 +140,25 @@ test("dashboard liveState: a wait with no ETA says how long it has waited", () =
     "⏳ waiting on 2 background shells · 20m");
   const timed = { ...ci, kind: "wait-timed", eta: NOW + 11 * 60 * 1000 };
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [timed] }), onlineHost, NOW).label,
-    "⏳ waiting · 11m left");
+    "⏳ waiting · Watch CI on PR #412 · 11m left");
+  // Stalled: no start age — the stall's own age (the hub's `since`) is the
+  // Needs-you row's, and a second number here read as a second stall length.
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW).label,
+    "stalled · Watch CI on PR #412");
+});
+
+// XERK-1571: a permission dialog is not a question — the card says so and names
+// the pending command (the hub's why), falling back to the dialog's question
+// from an older hub that serves no attention.
+test("dashboard liveState: a permission names what it asks for", () => {
+  const { liveState } = loadDashboard();
+  const pp = { paneBusy: false, transcriptAgeSec: 5, panePrompt: { prompt: "Do you want to proceed?" } };
+  const withWhy = liveState({ session: pp,
+    attention: { state: "needs-you:permission", since: NOW, why: "Bash: kubectl rollout restart" } }, onlineHost, NOW);
+  assert.equal(withWhy.label, "waiting for your permission");
+  assert.equal(withWhy.ask, "Bash: kubectl rollout restart");
+  assert.equal(withWhy.question, undefined);
+  assert.equal(liveState({ session: pp }, onlineHost, NOW).ask, "Do you want to proceed?");
 });
 
 // XERK-1571: a card the hub says needs the operator never reads "idle" — its

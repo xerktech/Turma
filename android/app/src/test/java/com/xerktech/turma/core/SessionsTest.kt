@@ -153,7 +153,7 @@ class SessionsTest {
 
     @Test fun `liveStateLabel says what a holding session waits on`() {
         val timed = LiveSignals(agents = listOf(shell("wait-timed", "Sleep", eta = now + 12 * 60_000L)))
-        assertEquals("⏳ waiting · 12m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
+        assertEquals("⏳ waiting · Sleep · 12m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
         val ci = LiveSignals(agents = listOf(shell("wait-external", "Watch CI")))
         assertEquals("⏳ waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
         val two = LiveSignals(agents = listOf(shell("wait-external"), shell("wait-timed")))
@@ -231,7 +231,7 @@ class SessionsTest {
         assertEquals("review · PR open · CI passing", attentionLabel(att("needs-you:review", now, "PR open · CI passing")))
         assertEquals("stalled · Watch CI", attentionLabel(att("needs-you:stalled", now, "Watch CI")))
         assertEquals("waiting for your answer", attentionLabel(att("needs-you:question", now, "Ship it?")))
-        assertEquals("waiting for your answer", attentionLabel(att("needs-you:permission", now, "Bash: ls")))
+        assertEquals("waiting for your permission", attentionLabel(att("needs-you:permission", now, "Bash: ls")))
         assertEquals("review", attentionLabel(att("needs-you:review", now)))
         assertEquals(null, attentionLabel(att("working", now)))
         assertEquals(null, attentionLabel(null))

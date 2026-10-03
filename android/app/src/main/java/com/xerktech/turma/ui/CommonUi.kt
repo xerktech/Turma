@@ -293,11 +293,13 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         live?.wakeAt?.takeIf { it > now }?.let { return "💤 sleeping until ${com.xerktech.turma.core.clockTime(it)}" }
         val waits = live?.agents.orEmpty().filter(::isWaitAgent)
         val eta = waits.mapNotNull { it.eta }.maxOrNull()
-        if (eta != null && eta > now) return "⏳ waiting · ${waitLeftText(eta - now)} left"
+        // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
+        val what = if (waits.size == 1 && waits[0].label.isNotBlank()) " · ${waits[0].label}" else ""
+        if (eta != null && eta > now) return "⏳ waiting$what · ${waitLeftText(eta - now)} left"
         // No ETA: how long it has waited, off the oldest row's startedAt (XERK-1571).
         val started = waits.mapNotNull { it.startedAt }.filter { it <= now }.minOrNull()
         val since = if (started == null) "" else " · ${waitLeftText(now - started)}"
-        if (waits.size == 1 && waits[0].label.isNotBlank()) return "⏳ waiting · ${waits[0].label}$since"
+        if (what.isNotEmpty()) return "⏳ waiting$what$since"
         return "⏳ waiting on ${waits.size} background shell" + (if (waits.size == 1) "" else "s") + since
     }
     // Only WORK rows name the working state; a waiting shell beside them is not work.

@@ -190,14 +190,15 @@ fun attentionWhy(att: Attention?, now: Long): String {
 /**
  * A fleet card's State row for a session the hub says needs the operator (XERK-1571,
  * web index.html `attentionLabel`): "review · PR open · CI passing", "stalled ·
- * Watch CI", "waiting for your answer". Null when it doesn't — the card then keeps
- * its own live-state word. Used where that word would be "idle", so a session the
- * Needs-you group lists never reads idle on its own card.
+ * Watch CI", "waiting for your answer", "waiting for your permission". Null when it
+ * doesn't — the card then keeps its own live-state word. Used where that word would
+ * be "idle", so a session the Needs-you group lists never reads idle on its own card.
  */
 fun attentionLabel(att: Attention?): String? {
     if (att == null) return null
     val chip = needsYouChip(att.state) ?: return null
-    if (chip == "question" || chip == "permission") return "waiting for your answer"
+    if (chip == "question") return "waiting for your answer"
+    if (chip == "permission") return "waiting for your permission"
     return listOf(chip, att.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
 }
 

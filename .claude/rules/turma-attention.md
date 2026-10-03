@@ -65,7 +65,8 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   - The chip is a FILLED pill in a fixed 84px column (names/why lines align); text is picked
     against the fill (amber text on the light surface is <2:1). Name + why clamp to 2 lines on phones.
 - **A fleet card never reads "idle" for a needs-you session**: where liveState would say idle, it
-  says `attentionLabel` ("review · PR open · CI passing", "stalled · Watch CI"; Android same name).
+  says `attentionLabel` ("review · PR open · CI passing", "stalled · Watch CI", "waiting for your
+  permission"; Android same name).
 - **Permission `why` is the pending COMMAND, not the dialog's question** (`permissionWhy`): the
   question is nearly always "Do you want to proceed?", so a leading dialog title + next line of
   `panePrompt.detail` becomes "Bash: touch /tmp/x" (first line alone if no title; capped at 120).
@@ -77,11 +78,16 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   `sortedBySince`, glasses phone `render.ts`); a card with no `since` keeps its createdAt place after
   them. The section is still DECIDED by each client's own `readyForReview` mirror. Each review card
   carries a `.why` line (`attentionWhy`: the why + the time — "waiting 12m", "for 22m" under a
-  question/permission, "stalled 31m" on a stall; the web drops the why on a question/stalled card,
-  whose label already says it, and keeps a permission's command — the Android card has no label,
-  so it keeps every why).
-- Waiting cards read "⏳ waiting · …" (`backgroundWaitLabel`, Android `liveStateLabel`); with no ETA
-  they add the time since the oldest wait row's `startedAt` ("· 12m"), with one "· 11m left".
+  question/permission, "stalled 31m" on a stall; the web drops the why on a question/permission/
+  stalled card, whose label or ask line already says it — the Android card has no label, so it keeps
+  every why). The age is glued to its word by a no-break space, so "4m" never wraps alone.
+- **A permission card is not a question card**: "waiting for your permission" (both pages, Android
+  `attentionLabel`) plus an ask line / dashboard `Permission` row naming the hub's why (the command),
+  falling back to `panePrompt.prompt` from an older hub — never the quoted "Do you want to proceed?".
+- Waiting cards read "⏳ waiting · …" (`backgroundWaitLabel`, Android `liveStateLabel`); one named
+  wait keeps its label on EVERY branch ("· Sleep · 11m left"); with no ETA they add the time since the
+  oldest wait row's `startedAt` ("· 12m"). **A STALLED label carries no start age** — the stall's own
+  age is the hub's `since` (why line, Needs-you row); two unlabelled numbers read as two stall lengths.
 
 ## The stalled alert
 
