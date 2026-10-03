@@ -1597,7 +1597,10 @@ class TestPrSummary(unittest.TestCase):
     def test_a_help_flag_used_as_a_value_is_still_checked(self):
         for cmd in ("gh pr create -t x -b -h", "gh pr create -t -h -b junk",
                     "gh pr create -t x -b junk --title --help",
-                    "gh --repo help pr create -b junk"):
+                    "gh --repo help pr create -b junk",
+                    "gh pr create -l -h -b junk", "gh pr create -B -h -b junk",
+                    "gh pr edit 1 --add-label -h -b junk",
+                    "glab mr create -l -h -d junk", "glab mr update 1 -l -h -d junk"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self.reason(cmd))
 

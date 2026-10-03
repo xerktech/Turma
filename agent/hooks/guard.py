@@ -1683,9 +1683,8 @@ _PR_CLIS = {
     "glab": ("mr", ("create", "new"), ("-d", "--description")),
     "az": ("pr", ("create",), ("--description",)),
 }
-# Text-valued flags whose value may itself be `-h` (`-t -h`); a help flag in
-# that position is the value, not a request for help.
-_PR_TEXT_FLAGS = ("-t", "--title")
+
+
 
 
 def _flag_value(arg: str, flags: tuple[str, ...]) -> tuple[str, str | None] | None:
@@ -1723,13 +1722,15 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
     seen_flag = False
     i = 1
     while i < len(args):
-        # A standalone help flag prints help wherever it sits; one consumed as
-        # another flag's value (`-b -h`) is sent as that value instead.
-        if args[i] in ("-h", "--help"):
+        # A help flag prints help wherever it sits — unless it is the VALUE of
+        # the flag before it (`-b -h`, `--label -h`), which the CLI sends as
+        # that value. Which flags take values differs per CLI and version, so
+        # after ANY bare flag it is read as a value: the check then runs, and
+        # the worst case is a refused `--web -h` that would only print help.
+        prev = args[i - 1]
+        if (args[i] in ("-h", "--help")
+                and not (prev.startswith("-") and "=" not in prev)):
             return None
-        if args[i] in _PR_TEXT_FLAGS:
-            i += 2
-            continue
         hit = _flag_value(args[i], body_flags)
         if hit:
             seen_flag = True
@@ -1838,8 +1839,9 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             # Every heredoc counts. Matching a heredoc to the command it feeds
             # (owner line, redirect target) refused 26% of real compliant PR
             # commands — `git push && gh pr create … <<EOF`, `cd x && …`,
-            # `cat > "$S/b.md"` — so an unrelated heredoc satisfying the check
-            # is the accepted residual: it takes a model gaming its own guard.
+            # `cat > "$S/b.md"` — so whatever _split_heredocs reads as a heredoc
+            # counts (an unrelated one, or `<<EOF` text inside a quoted title):
+            # the accepted residual, since it takes a model gaming its own guard.
             heredocs = [b for _owner, b in _split_heredocs(command)[1]]
         body = "\n".join(bodies + heredocs + [_read_text(_join_path(cwd, f)) for f in files])
         sections = _repo_template_sections(_repo_root(cwd))

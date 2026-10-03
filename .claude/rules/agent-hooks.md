@@ -43,17 +43,20 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
 - **pr-summary is the hard half of `PR_SUMMARY_SYSTEM_PROMPT`** (`pr_summary_reason`): the two must
   name the same headings, or a session following its instructions is refused by its own guard.
   - Checks `gh pr create|new`, `glab mr create|new`, `az repos pr create`, and an `edit`/`update`
-    only when it sets the description (glued `-bTEXT` too). A standalone `-h`/`--help` is help
-    wherever it sits (as real gh treats it), but one consumed as a flag's VALUE (`-b -h`, `-t -h`)
-    is sent as that value, so the check still runs.
+    only when it sets the description (glued `-bTEXT` too). `-h`/`--help` is help wherever it
+    sits, EXCEPT right after a bare flag: gh/glab read it as that flag's VALUE (`-b -h`,
+    `--label -h`), so the check runs. Value-taking flags differ per CLI, hence "any bare flag";
+    the cost is refusing `--web -h`, which would only print help.
   - **The body is inline body values + any `--body-file` (event `cwd`, moved by a leading `cd`) +
-    EVERY heredoc in the command** — never the rest of the command text (a title or comment then
-    satisfied it). `cat > f <<EOF; gh pr create -F f` is common, and `f` does not exist yet when
-    the hook runs.
+    EVERY heredoc in the command** — never the plain command text, so a title or comment alone
+    does not satisfy it. `cat > f <<EOF; gh pr create -F f` is common, and `f` does not exist yet
+    when the hook runs.
     - **Do not narrow heredocs to "the one feeding the PR command"**: matching by owner line or
       redirect target refused 26% of real compliant PR commands (`git push && gh pr create …`,
-      `cd x && …`, `cat > "$S/b.md"`, `\`-continued). An unrelated heredoc satisfying the check is
-      the accepted residual — it takes a model gaming its own guard. Measured by swapping a
+      `cd x && …`, `cat > "$S/b.md"`, `\`-continued).
+    - **The accepted residual is anything `_split_heredocs` reads as a heredoc** — an unrelated
+      one, and lexer false positives: `<<EOF` inside a quoted title/label/echo, after `#`, `<<<`,
+      `\<<`. Each needs a model gaming its own guard; no honest command looks like that. Measured by swapping a
       compliant body into all 473 real heredoc PR commands in `~/.claude/projects`: 0 refused.
   - A body it can't see (`--fill`, the editor, `$(cat file)`) is refused, saying how to pass it.
   - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_text`): a FIFO at the body or
