@@ -41,7 +41,8 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   launcher saw the still-dying old manager, the guard refused, and the host went DARK (zero managers,
   no self-heal on non-systemd). Tests: `test_turma_agent.sh`, `test_turma_agentctl.sh`.
 - **The duplicate-manager match is anchored to the exec'd argv, never a substring** (XERK-1552):
-  `^([^ ]*/)?python[0-9.]*t?( -[^ ]+)* <escaped $PREFIX>/hub-agent\.py$` (loose interpreter, exact tail). `pgrep -f "$PREFIX/hub-agent.py"`
+  `^([^ ]*/)?python[0-9.]*t?( -[^ ]+)* <escaped $PREFIX>/hub-agent\.py$` (loose interpreter, exact tail).
+  `pgrep -f "$PREFIX/hub-agent.py"`
   also matched any grep/tail/editor/session Bash command naming the path, refused an auto-update's
   restart, and left the host stopped. Keep it in step with the `exec python3 …` line; the test stub
   `exec -a python3`s a real python so its argv matches the real manager's.
