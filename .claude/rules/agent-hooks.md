@@ -188,6 +188,41 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     runs the rest; a subshell's `)#` read as text only classifies more.
   - **An opaque substitution glued to a word is also read as EMPTY** (`glued_empty`): `$(true)rm`
     runs `rm`. A standalone one stays the placeholder — an empty word reads as the root.
+  - **A variable a producer filled holds that producer's OUTPUT** (XERK-1549): an assignment
+    value is read whole (quoted runs, nested `$(…)`), and `printf -v x FMT ARGS` binds the
+    rendered text (`_render_printf`: escapes, `\c`, precision, width, `*`, `%b`, `%c`; out of
+    repeat passes it KEEPS the leftover args — dropping them hid a 9th `/etc`). `_produced_text` stores
+    what the substitution PRINTS, never its `$(…)` text — inlining that re-classified it at
+    every `$x` and a long line took minutes, past the hook timeout, which fails OPEN.
+  - **A spliced value's quotes stay LITERAL** (`_quote_literal`, by the `_quote_states` at the
+    use): bash never re-reads quotes an expansion made, and splicing raw let
+    `x='"'; echo "$x"; rm -rf /` unbalance the line and hide the `rm`. Never inline a value
+    unescaped. `"${a[@]}"` closes the quote around the elements (one word each).
+    - Inside `'…'` (a script `eval`/`bash -c`/`trap` parses later) the value is a WORD there:
+      quotes, `#` and operators all escaped. Bare keeps `;&|` live — `eval $x` re-parses them.
+    - Each escape is right for ONE re-parse depth (`eval 'eval echo $x …'` makes `x=';'` code
+      again), so `_expand_both` also classifies the line with values spliced RAW whenever one
+      needed escaping, and denies if either reading does. Don't add escape layers instead.
+    - `_quote_states` reads a `#` comment as `#` to line end, in its one pass: `# don't`
+      opened a "quote"; a per-comment re-scan was 10x slower and capped (fail-open).
+  - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
+    never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
+    clearing let `cd /; (cd /tmp); rm -rf *` through.
+    - Order counts only on a line with NO re-run construct (`_REPLAYS_RE`, matched loosely:
+      loop words, `function`, `()`, alias, trap, eval, coproc); otherwise every `cd` counts
+      everywhere. trap/alias/eval/`sh -c` scripts always see every `cd`.
+    - Finding where a body ends was tried twice and lost to bash's grammar (a per-segment
+      stack; then a region scanner: `done=1`, `f() if …`, `${a:-${b}}`, a region cap). Don't
+      retry without a bash parser.
+    - Accepted cost: one real command in 33.7k replayed (defines a function, `chmod -R go-w .`,
+      trailing `cd /`) is refused; the reason names the cwd and asks for an absolute path.
+    - Joining covers `rm`/`unlink`/`chmod`/`chown` and `find` roots, never an opaque
+      substitution (`trap 'rm -rf "$tmpd"' EXIT; cd /` is the cleanup idiom).
+    - The literal `~/.ssh` is dangerous to `rm` only (`_is_home_ssh`): `chmod -R 700 ~/.ssh`
+      is the routine fix.
+    - Inside an exact protected root/home every relative `rm` operand is joined (`cd /; rm -rf *`
+      is `/*`); deeper, only `..`-climbing ones are. Joining all there would refuse ordinary
+      `cd /usr/src/app && rm -rf build` — do not widen it.
   - **`_var_values` resolves a value naming an assigned variable once** (`d=$d/x`): left in, each
     recursion level re-inlined it until `_TOO_DEEP` refused an ordinary command.
   - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old vs
@@ -314,4 +349,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     (`TURMA_QUESTION_TIMEOUT_SEC`, 600s) sits under the settings-level `timeout`; passes through
     silently when env vars absent. Kill/delete/restart clear pending req/ans files. `multiSelect`
     accepts `optionIndices`.
+  - **A new manager reader of a SESSION-written file must use `_read_untrusted_json`** (XERK-1562):
+    `O_NONBLOCK|O_NOFOLLOW`, regular file only, size-capped. `questions/` is session-writable, and
+    `_hook_question` + `_dsh_pending_request_id` run on the beat — a plain `open()` of a planted
+    FIFO froze the heartbeat. A FIFO, symlink or file past `QUESTION_REQ_MAX_BYTES` is no request.
+  - **Known remaining plain open:** `read_limits_snapshot` still `open()`s the session-writable
+    `~/.turma/limits.json` on the beat — the same FIFO hang, not yet routed through that reader.
   - Tests: `test_ask.py`, `TestHookQuestion`, `TestAnswerQuestion`, `test_guard_settings.py`.

@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -1090,6 +1091,237 @@ class TestParserGaps(unittest.TestCase):
                "print((d.get(k) for k in (1, 2)))\"'")
         self.assertAllowed(cmd)
         self.assertEqual(guard._var_values("d=/; d=$d/etc")["d"], ["/", "//etc"])
+
+
+class TestProducedScripts(unittest.TestCase):
+    """XERK-1549: a payload carried into execution by a variable a substitution
+    or `printf -v` filled, or a relative `rm` after `cd` into a protected root.
+    Each bypass ran its payload under real bash (touch marker)."""
+
+    R = "rm -rf /"
+
+    def assertDenied(self, cmd):
+        self.assertIsNotNone(guard.is_destructive(cmd), cmd)
+
+    def assertAllowed(self, cmd):
+        self.assertIsNone(guard.is_destructive(cmd), cmd)
+
+    def test_a_substitution_assigned_unquoted_is_one_value(self):
+        R = self.R
+        for cmd in (f"x=$(echo '{R}'); $x", f"x=$(printf '{R}'); $x",
+                    f"x=`echo '{R}'`; eval $x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("x=$(pwd)/build; rm -rf $x")
+
+    def test_printf_v_assigns_what_printf_prints(self):
+        for cmd in (f"printf -v x '{self.R}'; $x", "printf -v x '%s ' rm -rf /; $x",
+                    "printf -v x '%s %s %s' rm -rf /; eval \"$x\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("printf -v x '%s' hello; echo $x")
+        self.assertAllowed("printf -v x '%s/%s' /tmp build; rm -rf $x")
+
+    def test_a_relative_rm_after_cd_into_a_root_names_that_root(self):
+        for cmd in ("cd / && rm -rf *", "cd /; rm -rf *", "cd /etc; rm -rf ./*",
+                    "cd /usr && rm -r lib", "cd ~ && rm -rf *", "cd; rm -rf *",
+                    "cd -P / && rm -rf -- *", "pushd / && rm -rf *",
+                    "builtin cd / && rm -rf *", "cd ~root && rm -rf *",
+                    # Climbing out of a deeper cwd reaches the root too.
+                    "cd /tmp; rm -rf ../*", "cd /tmp/a; rm -rf ../../*",
+                    # The cwd reaches into groups and re-parsed scripts.
+                    "cd / && (rm -rf *; true)", "cd / && bash -c 'rm -rf *'",
+                    "cd / && eval 'rm -rf *'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("cd /tmp/x && rm -rf *", "cd / && rm -rf tmp/build",
+                    "cd /etc && ls", "cd ~ && rm -rf .cache",
+                    "cd /repos/x && rm -rf node_modules",
+                    "cd /usr/src/app && rm -rf build"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_a_later_cd_never_clears_the_root(self):
+        # Each leaves bash in `/`: the second cd fails, runs in a subshell or
+        # pipe, or goes back. Order- and scope-blind is the fail-closed read.
+        for cmd in ("cd /; (cd /tmp); rm -rf *", "cd /; cd /tmp | true; rm -rf *",
+                    "cd /; cd /tmp & rm -rf *", "cd /; cd /nope 2>/dev/null; rm -rf *",
+                    "cd /; cd /tmp; cd -; rm -rf *", "cd /; cd usr; rm -rf *",
+                    "cd /; cd /tmp/x; rm -rf *"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_a_cd_counts_only_for_what_runs_after_it(self):
+        # A real command: tidy a dir, then `cd /` at the very end.
+        self.assertAllowed("cd /tmp/x && chmod -R go-w . && rm -rf build; cd /")
+        self.assertAllowed("rm -rf ./*; cd ~")
+        # ...unless the earlier text can run again after it.
+        for cmd in ("for i in 1 2; do rm -rf *; cd /; done",
+                    "while true; do rm -rf *; cd /; done",
+                    "f() { rm -rf *; }; cd /; f", "trap 'rm -rf *' EXIT; cd /",
+                    # Nesting inside the re-run body, and while/until conditions.
+                    "for i in 1 2; do { true; }; rm -rf *; cd /; done",
+                    "for i in 1 2; do\n  { :; }\n  rm -rf *\n  cd /\ndone",
+                    "i=0; while rm -rf *; cd /; [ $i -lt 1 ]; do i=1; done",
+                    "i=0; until rm -rf *; cd /; [ $i -lt 1 ]; do i=1; done",
+                    "f() { { :; }; rm -rf *; }; cd /; f",
+                    "f() { for i in 1; do :; done; rm -rf *; }; cd /; f",
+                    "function f { rm -rf *; }; cd /; f", "f() ( rm -rf * ); cd /; f",
+                    "f() { echo ${x}; rm -rf *; }; cd /; f",
+                    "f() { echo $(date); rm -rf *; }; cd /; f",
+                    "for i in 1 2; do (rm -rf *); cd /; done",
+                    # Defined by text a shell or eval runs.
+                    "eval 'f() { rm -rf *; }'; cd /; f", "eval \"trap 'rm -rf *' EXIT\"; cd /",
+                    "bash -c 'trap \"rm -rf *\" EXIT; cd /'",
+                    "alias f='rm -rf *'\ncd /\nf",
+                    # Where a body ends is bash grammar (XERK-1549 QA pass 4):
+                    "for i in 1 2; do done=1; rm -rf *; cd /; done",
+                    "for i in 1 2; do cat <<E >/dev/null\ndone\nE\nrm -rf *; cd /; done",
+                    "f() if true; then rm -rf *; fi; cd /; f",
+                    "f()\nif true; then rm -rf *; fi\ncd /\nf",
+                    "f() { echo ${a:-${b}}; rm -rf *; }; cd /; f",
+                    "f() ( x=$((1+2)); rm -rf * ); cd /; f",
+                    "f() { echo x}; rm -rf *; }; cd /; f",
+                    "for i in 1; do :; done; " * 20 + "g() { rm -rf *; }; cd /; g",
+                    # The whole command line, re-run by a child shell.
+                    'rm -rf *; cd /; [ -n "$Y" ] || Y=1 bash -c "$BASH_EXECUTION_STRING"',
+                    # An array's elements, one word each even when quoted.
+                    'a=(rm -rf *); cd /; "${a[@]}"', "a=(rm -rf *); cd /; ${a[@]}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("tmpd=$(mktemp -d); trap 'rm -rf \"$tmpd\"' EXIT; cd /",
+                    "f() { echo hi; }; rm -rf ./build; cd /; f",
+                    "for f in a b; do echo $f; done; rm -rf ./build; cd /"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # The accepted cost: any loop/function/trap/alias/eval sign makes the
+        # whole line order-blind, so a trailing `cd /` reaches an earlier `.`.
+        self.assertDenied("f() { :; }; chmod -R go-w .; cd /")
+        # ...and the refusal says where the path came from, find included.
+        for cmd in ("f() { :; }; chmod -R go-w .; cd /",
+                    "find . -name '*.o' -delete; cd /; for x in 1; do :; done"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("absolute path", guard.is_destructive(cmd))
+        self.assertAllowed('a=(build dist); rm -rf "${a[@]}"')
+
+    def test_fixing_ssh_permissions_is_not_deleting_them(self):
+        for cmd in ("chmod -R 700 ~/.ssh", "chmod -R go-rwx ~/.ssh", "chown -R me:me ~/.ssh",
+                    "cd ~ && chown -R me .ssh"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertDenied("rm -r ~/.ssh")
+        self.assertDenied("rm -rf $HOME/.ssh/")
+
+    def test_printf_renders_like_printf(self):
+        for cmd in ("printf -v x -- 'rm -rf /'; $x", "printf -v x '%.2s -rf /' rmxx; $x",
+                    "printf -v x '%*s -rf /' 0 rm; $x", "printf -v x 'rm\\x20-rf\\x20/'; $x",
+                    "printf -v x 'rm\\040-rf\\040/'; $x", "printf -v x '%b' 'rm\\x20-rf\\x20/'; $x",
+                    "printf -v \"x\" 'rm -rf /'; $x", "printf -v 'x' 'rm -rf /'; $x",
+                    "printf -vx 'rm -rf /'; $x", "x=$(printf 'rm\\x20-rf\\x20/'); $x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_printf_edge_cases_fail_closed(self):
+        for cmd in (
+            # Arguments past the format-repeat bound are kept, not dropped.
+            "rm -rf $(printf '%s ' a b c d e f g h /etc)",
+            "x=$(printf '%s ' rm -rf a b c d e f /); $x",
+            "rm -rf $(printf '%s ' " + "a " * 100 + "/etc)",
+            # %c, width padding and \c are text printf produces.
+            "printf -v x '%c%c -rf /' rx mx; $x", "printf -v x 'rm%1s-rf%1s/' '' ''; $x",
+            "printf -v x 'rm -rf /\\cjunk'; $x", "printf -v x '%b' 'rm -rf /\\cjunk'; $x",
+            "printf -v a[0] 'rm -rf /'; $a", "builtin printf -v x 'rm -rf /'; $x",
+            "x=$(echo -e 'rm\\x20-rf\\x20/'); $x",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("printf -v x '%99999999s' a; echo $x")
+
+    def test_a_quoted_or_escaped_cd_still_moves(self):
+        for cmd in ('"cd" / && rm -rf *', "'cd' / && rm -rf *", "\\cd / && rm -rf *",
+                    "cd / && chmod -R 777 *", "cd / && chown -R x *", "cd / && find . -delete",
+                    "cd ~ && rm -rf .ssh", "rm -rf ~/.ssh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("cd /tmp/x && find . -delete")
+        self.assertAllowed("cd /repos/x && chmod -R u+w build")
+
+    def test_assignment_values_nest_and_glue(self):
+        for cmd in ("x=$(echo $(echo rm) -rf /); $x", "x=$(echo 'rm -rf / (x)'); $x",
+                    "x=$(echo 'rm -rf')' /'; $x", "declare x='rm -rf /'; $x",
+                    "local x='rm -rf /'; $x", "readonly x='rm -rf /'; $x",
+                    "x=$(echo $(echo $(echo $(echo rm))) -rf /); $x",
+                    "declare a=1 x='rm -rf /'; $x", "declare -- x='rm -rf /'; $x",
+                    "export a=1 x='rm -rf /'; $x", "x=rm; x+=' -rf /'; $x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_a_quote_in_a_value_stays_literal(self):
+        # Bash never re-reads quotes an expansion produced; splicing them raw
+        # unbalanced the line and hid everything after it (QA pass 6).
+        for cmd in ("x='\"'; echo \"$x\"; rm -rf /", "x='\"'; echo $x; rm -rf /",
+                    "x='a\"b'; echo \"$x\"; rm -rf /", "x=\"'\"; echo '$x'; rm -rf /",
+                    "a=(x '\"'); echo \"${a[@]}\"; rm -rf /",
+                    "msgs=(\"it's\" done); echo \"${msgs[@]}\"; rm -rf /",
+                    "a=(x '\"'); echo \"${a[@]}\"; git push --force origin main",
+                    # An empty assignment is a value too.
+                    "b=; a=(rm -rf *); cd /; \"${b}${a[@]}\"", "x=; rm -rf $x/etc",
+                    # A script parsed again expands `$x` to a WORD: never a
+                    # quote, comment or operator (QA pass 7).
+                    "x=\"'\"; eval 'echo $x; rm -rf /'", "x='\"' bash -c 'echo $x; rm -rf /'",
+                    "a=(\"'\"); eval 'echo ${a[@]}; rm -rf /'",
+                    "x='\"'; eval 'echo \"$x\"; rm -rf /'",
+                    "export x='\"'; bash -c 'echo $x; rm -rf /'",
+                    "x='\"'; trap 'echo $x; rm -rf /' EXIT", "x='\\'; eval 'echo $x; rm -rf /'",
+                    "x='<<'; eval 'echo $x E\nrm -rf /\nE'",
+                    # A comment's apostrophe is no quote; a `#` value no comment.
+                    "x='\"'; echo hi # don't\necho \"$x\"; rm -rf /",
+                    "x='#'; echo $x; rm -rf /",
+                    "x=\"'\"; echo hi # don't\necho $x; rm -rf /",
+                    "x=\"'\"; " + "echo n # c\n" * 70 + "echo hi # don't\necho $x; rm -rf /",
+                    # Parsed TWICE, the value is code again (QA pass 8).
+                    "x=';'; eval 'eval echo $x rm -rf /'",
+                    "x=';' bash -c 'bash -c \"echo $x rm -rf /\"'",
+                    "x='&&'; eval 'eval echo hi $x rm -rf /'",
+                    "x=';'; trap 'eval echo $x rm -rf /' EXIT",
+                    # eval re-parses its joined words: `\;` is an operator again.
+                    "eval echo \\; rm -rf /", "eval echo hi \\&\\& rm -rf /"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(guard.is_destructive(cmd) or guard.policy_reason(cmd), cmd)
+        for cmd in ("x=\"it's fine\"; git commit -m \"$x\"", 'a=(x y); echo "x${a[@]}"',
+                    "FOO= make install", "d=/; echo 'rm -rf $d is banned'"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertDenied("d=/; bash -c 'rm -rf $d'")
+        self.assertAllowed("eval echo 'rm -rf /etc is banned'")
+        # Both readings reach the policy and SQL rules too, not just rm.
+        self.assertIsNotNone(guard.policy_reason("x=';'; eval 'eval echo $x git push origin main'"))
+        self.assertIsNotNone(guard._destructive_database(
+            "x=';'; eval 'eval echo $x psql -c \"DROP DATABASE prod\"'"))
+        # A `#` inside "…" is text; a comment ends at its newline.
+        self.assertDenied("x=\"'\"; echo \"a # don't\"; echo $x; rm -rf /")
+        self.assertDenied("echo hi # note\nrm -rf /")
+        # Comments cost one scan, not one per comment.
+        cmd = "x=\"it's\"; " + ("echo step # don't panic\n" * 400) + "echo \"$x\""
+        started = time.monotonic()
+        self.assertAllowed(cmd)
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_substitution_value_is_classified_once(self):
+        # Inlining the `$(…)` text re-classified it at every use: minutes for
+        # a long line, past the hook timeout, which lets a command through.
+        cmd = "x=$(echo a b c); " + "echo $x; " * 2000
+        started = time.monotonic()
+        self.assertAllowed(cmd)
+        self.assertLess(time.monotonic() - started, 10)
+
+    def test_home_glob_is_the_home_directory(self):
+        for cmd in ("rm -rf ~/*", "rm -rf $HOME/*", "rm -rf ~/.*", "rm -rf ~/.[!.]*",
+                    "rm -rf ~root/*"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("rm -rf ~/proj/build/*")
+        self.assertAllowed("rm -rf ~/tmp*")
 
 
 class TestClassification(unittest.TestCase):

@@ -10386,6 +10386,9 @@ def _workflow_agent_path(run_dir, agent_id):
 # such a stale req is exactly how a long-answered question keeps showing on the
 # card and re-opens in the chat; past this age we drop (and clean up) instead.
 QUESTION_STALE_AFTER_SEC = ASK_HOOK_TIMEOUT_SEC + 60
+# Ceiling on a req file read on the beat. ask.py caps every option preview at
+# 2000 chars, so a real request is a few KB; anything past this is not one.
+QUESTION_REQ_MAX_BYTES = 1 << 20
 
 
 def _hook_question(session_id):
@@ -10431,12 +10434,10 @@ def _hook_question(session_id):
     # Answer already delivered — the bridge is consuming it, not still asking.
     if os.path.exists(ans_path):
         return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            req = json.load(f)
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    if not isinstance(req, dict):
+    # The questions dir is SESSION-writable, so this file is untrusted: a plain
+    # open() of a FIFO planted here would block the heartbeat forever (XERK-1562).
+    req = _read_untrusted_json(path, QUESTION_REQ_MAX_BYTES)
+    if req is None:
         return None
     question = str(req.get("question") or "")[:300] or None
     if not question:
@@ -25004,12 +25005,10 @@ class SessionManager:
         nothing is pending. The id lives IN that file rather than a separate map,
         so there is one source of truth and a restart cannot desync them."""
         req_path, _ = self._question_paths(sid)
-        try:
-            with open(req_path, encoding="utf-8") as f:
-                req = json.load(f)
-        except (OSError, ValueError):
-            return None
-        if not isinstance(req, dict):
+        # Session-writable rendezvous file, read on the beat (via
+        # _refresh_dsh_questions): never a plain open(), or a FIFO wedges it.
+        req = _read_untrusted_json(req_path, QUESTION_REQ_MAX_BYTES)
+        if req is None:
             return None
         rid = req.get("_dshRequestId")
         return str(rid) if rid else None

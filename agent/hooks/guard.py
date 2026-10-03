@@ -80,7 +80,7 @@ _ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
 # (a destructive command is destructive with or without `sudo`).
 _PREFIX_WORDS = {
     "sudo", "doas", "runas", "command", "nohup", "time", "exec", "env",
-    "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer",
+    "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer", "builtin",
 }
 
 # Options of those wrappers that consume the NEXT token as their value, so
@@ -376,7 +376,9 @@ def _quote_states(command: str) -> list[str]:
     literal, `"` inside a double-quoted string, `\\` escaped, "" bare.
 
     A `$(…)` inside a string restarts quoting, as bash does, so the `'…'` in
-    `"$(echo 'a')"` is a real single-quoted literal again.
+    `"$(echo 'a')"` is a real single-quoted literal again. A `#` comment is
+    `#` to its line's end: the apostrophe in `# don't` opened a "quote" that
+    every later character was read inside (XERK-1549).
     """
     out = [""] * len(command)
     stack: list[str] = []
@@ -384,6 +386,12 @@ def _quote_states(command: str) -> list[str]:
     while i < n:
         ch = command[i]
         top = stack[-1] if stack else ""
+        if ch == "#" and top != '"' and _is_comment(command, i):
+            end = command.find("\n", i)
+            end = n if end < 0 else end
+            out[i:end] = ["#"] * (end - i)
+            i = end
+            continue
         if ch == "\\":
             out[i:i + 2] = ["\\"] * len(out[i:i + 2])
             i += 2
@@ -425,6 +433,25 @@ def _subst_standalone(m: "re.Match[str]") -> bool:
     return (a == 0 or s[a - 1] in _WORD_END) and (b == len(s) or s[b] in _WORD_END)
 
 
+def _printed_text(command: str) -> str | None:
+    """What ``command`` prints when it only prints its arguments (echo, or
+    printf rendered as printf would), else None."""
+    toks = _tokenize(command)
+    if not toks:
+        return None
+    prog = _basename(toks[0])
+    if prog == "printf":
+        name, rest = _printf_args(toks)
+        return _render_printf(rest[0], rest[1:]) if name is None and rest else ""
+    if prog in _ECHO_PROGS:
+        args, flags = toks[1:], ""
+        while args and re.match(r"^-[neE]+$", args[0]):
+            flags += args.pop(0)
+        text = " ".join(args)
+        return _printf_unescape(text).split(_PRINTF_STOP, 1)[0] if "e" in flags else text
+    return None
+
+
 def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
     """What a substitution CONTRIBUTES to the command line around it.
 
@@ -439,9 +466,9 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
     program `turma_substituted_valuerm` (XERK-1256). A standalone one stays
     opaque: an empty WORD reads as the root (see `_OPAQUE_SUBST`).
     """
-    toks = _tokenize(_subst_inner(m))
-    if toks and _basename(toks[0]) in _ECHO_PROGS:
-        return " ".join(toks[1:])
+    printed = _printed_text(_subst_inner(m))
+    if printed is not None:
+        return printed
     if glued_empty and not _subst_standalone(m):
         return ""
     return _OPAQUE_SUBST
@@ -478,10 +505,30 @@ _ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
 _BRACE_RE = re.compile(r"\{([^{}\s]+,[^{}\s]*)\}")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
 # inlined as `eval 'rm` (XERK-1256).
+# A value is read WHOLE, quoted runs and substitutions included: cut at its
+# first blank, `x='rm -rf /'; eval $x` inlined as `eval 'rm` (XERK-1256), and
+# `x=$(echo 'rm -rf /'); $x` as `$(echo` (XERK-1549). Any word starting a
+# blank-separated `NAME=`/`NAME+=` counts: `declare a=1 x=…`, `local -- x=…`,
+# and an env prefix all assign, and reading one too many only resolves more.
+_ASSIGN_NEST = r"[^()]*"
+for _ in range(8):  # parentheses nested this deep inside one `$(…)`
+    _ASSIGN_NEST = r"(?:[^()]|\(" + _ASSIGN_NEST + r"\))*"
+_ASSIGN_SUBST = r"\$\(" + _ASSIGN_NEST + r"\)|`[^`]*`"
+_ASSIGN_SUBST_RE = re.compile(_ASSIGN_SUBST)
 _VAR_ASSIGN_RE = re.compile(
-    r"(?:^|[;\n&|]|\bexport\s+)\s*([A-Za-z_][A-Za-z0-9_]*)="
-    r"('[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n]+)"
+    r"(?:^|[;\n&|\s])"
+    r"\s*([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\s]*\])?\+?="
+    r"(\([^()]*\)|(?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])*)"
 )
+# printf's conversions — flags, `*`/digit width, `.`/`.*`/digit precision —
+# and the backslash escapes it decodes in a format (and in a `%b` argument).
+_PRINTF_SPEC_RE = re.compile(r"%(%|[-+ #0']*(\*|\d+)?(?:\.(\*|\d*))?[hlLqjzt]*([a-zA-Z]))")
+_PRINTF_ESC_RE = re.compile(r"\\(x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|0?[0-7]{1,3}|.)", re.S)
+# `\c` ends printf's output, there and then.
+_PRINTF_STOP = "\x00turma-printf-stop"
+_PRINTF_MAX_WIDTH = 256
+_PRINTF_ESCAPES = {"c": _PRINTF_STOP, "n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b",
+                   "f": "\f", "v": "\v", "\\": "\\", "'": "'", '"': '"'}
 _FOR_IN_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)")
 # `$NAME`, `${NAME}`, and the operator forms — `${d%/}`, `${d#x}`, `${d:0:4}`,
 # `${nope:-/etc}`. The operator matters less than the value it operates on: a
@@ -572,11 +619,20 @@ def _var_values(command: str) -> dict[str, list[str]]:
     """Values this command line itself assigns to a variable."""
     vals: dict[str, list[str]] = {}
     for m in _VAR_ASSIGN_RE.finditer(command):
-        vals.setdefault(m.group(1), []).append(m.group(2).strip("'\""))
+        value = m.group(2)
+        if value.startswith("(") and value.endswith(")"):
+            # An array, `a=(rm -rf *)`: its words, which `"${a[@]}"` runs.
+            value = value[1:-1].strip()
+        vals.setdefault(m.group(1), []).append(_produced_text(_dequote_value(value)))
     for m in _FOR_IN_RE.finditer(command):
         words = [w for w in m.group(2).split() if w != "do"]
         if words:
             vals.setdefault(m.group(1), []).extend(words)
+    if "printf" in command and "-v" in command:
+        for seg in _split_segments(command):
+            bound = _printf_v(_strip_prefixes(_tokenize(seg)))
+            if bound:
+                vals.setdefault(bound[0], []).append(bound[1])
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
     # HERE, once, against the values that name none. Left in, every recursion
     # level re-inlined it, the text grew each time, and an ordinary command
@@ -589,6 +645,157 @@ def _var_values(command: str) -> dict[str, list[str]]:
         return " ".join(plain[name]) if name in vals else m.group(0)
 
     return {k: [_VAR_USE_RE.sub(resolve, v) for v in vs] for k, vs in vals.items()}
+
+
+def _dequote_value(value: str) -> str:
+    """An assignment value as bash stores it: quotes removed, their contents
+    and any substitution kept verbatim (`'a b'c` → `a bc`)."""
+    out: list[str] = []
+    i, n = 0, len(value)
+    while i < n:
+        m = _ASSIGN_SUBST_RE.match(value, i)
+        if m:
+            out.append(m.group(0))
+            i = m.end()
+            continue
+        ch = value[i]
+        if ch == "'":
+            j = value.find("'", i + 1)
+            j = n if j < 0 else j
+            out.append(value[i + 1:j])
+            i = j + 1
+        elif ch == '"':
+            j = i + 1
+            while j < n and value[j] != '"':
+                m = _ASSIGN_SUBST_RE.match(value, j)
+                if m:
+                    out.append(m.group(0))
+                    j = m.end()
+                    continue
+                if value[j] == "\\" and j + 1 < n:
+                    j += 1
+                out.append(value[j])
+                j += 1
+            i = j + 1
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
+
+
+def _produced_text(value: str) -> str:
+    """``value`` with each substitution replaced by what it prints.
+
+    The substitution's own command is classified where it sits; the variable
+    holds only its OUTPUT. Inlining the `$(…)` text instead re-classified it
+    at every use, and a long line of `$x`s took minutes (XERK-1549) — past
+    Claude Code's hook timeout, which lets the command through. Innermost
+    first, so `$(echo $(echo rm) …)` resolves too; bounded like the braces.
+    """
+    for _ in range(9):
+        new = _SUBST_RE.sub(_subst_text, value)
+        if new == value:
+            break
+        value = new
+    # ...and one whose body holds parentheses `_SUBST_RE` cannot match.
+    return _ASSIGN_SUBST_RE.sub(lambda m: _printed_text(
+        m.group(0)[2:-1] if m.group(0).startswith("$(") else m.group(0)[1:-1]
+    ) or _OPAQUE_SUBST, value)
+
+
+def _printf_unescape(text: str) -> str:
+    """The backslash escapes printf decodes: `\\n`, `\\x20`, `\\040`, …"""
+
+    def rep(m: "re.Match[str]") -> str:
+        esc = m.group(1)
+        try:
+            if esc[0] in "xu" and len(esc) > 1:
+                return chr(int(esc[1:], 16))
+            if esc[0].isdigit():
+                return chr(int(esc, 8) & 0xFF)
+        except ValueError:
+            return m.group(0)
+        return _PRINTF_ESCAPES.get(esc, m.group(0))
+
+    return _PRINTF_ESC_RE.sub(rep, text)
+
+
+def _render_printf(fmt: str, args: list[str]) -> str:
+    """Roughly what `printf FMT ARGS…` prints: each conversion takes the next
+    argument (and a `*` width/precision one more), the format repeats while
+    arguments remain, as bash's does. Only the TEXT matters here, so width is
+    ignored and every conversion prints its argument as `%s` would."""
+    fmt = _printf_unescape(fmt)
+    out: list[str] = []
+    rest = list(args)
+
+    def take() -> str:
+        return rest.pop(0) if rest else ""
+
+    def conv(m: "re.Match[str]") -> str:
+        if m.group(1) == "%":
+            return "%"
+        if m.group(2) == "*":
+            take()
+        prec = m.group(3)
+        if prec == "*":
+            prec = take()
+        arg = take()
+        kind = m.group(4)
+        if kind == "b":
+            arg = _printf_unescape(arg)
+        elif kind == "c":
+            arg = arg[:1]
+        if prec is not None and kind in "sb":
+            try:
+                arg = arg[:max(int(prec or 0), 0)]
+            except ValueError:
+                pass
+        if m.group(2) and m.group(2).isdigit():
+            # Padding is text too: `rm%1s-rf` with an empty argument is `rm -rf`.
+            width = min(int(m.group(2)), _PRINTF_MAX_WIDTH)
+            arg = arg.ljust(width) if "-" in m.group(1) else arg.rjust(width)
+        return arg
+
+    for _ in range(64):  # bounded: a format with no conversion consumes nothing
+        before = len(rest)
+        out.append(_PRINTF_SPEC_RE.sub(conv, fmt))
+        if not rest or len(rest) == before:
+            break
+    else:
+        # Out of passes with arguments left: bash would print every one, and
+        # dropping them hid `/etc` as the ninth (XERK-1549). Keep them as text.
+        out.append(" " + " ".join(rest))
+    return "".join(out).split(_PRINTF_STOP, 1)[0]
+
+
+def _printf_args(tokens: list[str]) -> tuple[str | None, list[str]]:
+    """Split a `printf …` argv into its `-v` name (or None) and FORMAT ARGS."""
+    name, i = None, 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if tok == "--":
+            i += 1
+            break
+        if tok == "-v" and i + 1 < len(tokens):
+            name, i = tokens[i + 1], i + 2
+        elif tok.startswith("-v") and len(tok) > 2:
+            name, i = tok[2:], i + 1
+        else:
+            break
+    return name, tokens[i:]
+
+
+def _printf_v(tokens: list[str]) -> tuple[str, str] | None:
+    """`printf -v NAME FORMAT [ARGS…]` assigns what printf would have printed,
+    so `printf -v x 'rm -rf /'; $x` runs it (XERK-1549)."""
+    if not tokens or _basename(tokens[0]) != "printf":
+        return None
+    name, rest = _printf_args(tokens)
+    m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]]*\])?$", name or "")
+    if not m or not rest:
+        return None  # `a[0]` is `$a` too
+    return m.group(1), _render_printf(rest[0], rest[1:])
 
 
 def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
@@ -606,18 +813,66 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     if vals is None:
         vals = _var_values(command)
 
+    states = _quote_states(command) if vals and "$" in command else []
+
     def rep(m: "re.Match[str]") -> str:
         name = m.group(1) or m.group(3) or ""
         got = vals.get(name)
         op = _VAR_OP_RE.match(m.group(2) or "")
         if got:
             value = got[0] if len(got) == 1 else " ".join(got)
-            return _apply_var_op(value, op.group(1), op.group(2)) if op else value
+            state = states[m.start()] if m.start() < len(states) else ""
+            if state == '"' and (m.group(2) or "").startswith(("[@]", "[*]")):
+                # `"${a[@]}"` is one word PER element, even mid-word: close
+                # the quote around them, as bash's expansion does.
+                return '"' + _quote_literal(value, "") + '"'
+            if op:
+                value = _apply_var_op(value, op.group(1), op.group(2))
+            return _quote_literal(value, state)
         if op and op.group(1) in _VAR_DEFAULT_OPS:
             return op.group(2)
         return m.group(0)
 
     return _VAR_USE_RE.sub(rep, command)
+
+
+# Set while `_expand_both` takes its raw reading; counts escaping splices.
+_SPLICE_RAW = [False]
+_SPLICES_ESCAPED = [0]
+
+
+def _quote_literal(value: str, state: str) -> str:
+    """``value`` spliced where quoting is ``state``, its quote characters kept
+    LITERAL — bash never re-reads quotes an expansion produced. Spliced raw,
+    `x='"'; echo "$x"; rm -rf /` unbalanced the line and hid the `rm`
+    (XERK-1549). Inside `'…'` (a script some shell will expand later) the
+    value's `'` closes, escapes and reopens. `$` stays live, so a `$(…)` a
+    value carries is still classified where it lands.
+
+    Each escape is right for ONE re-parse depth only — a value an `eval` of an
+    `eval` reads is code again (`x=';'; eval 'eval echo $x rm -rf /'`). So when
+    any value needed escaping, `_expand_both` also classifies the line with
+    every value spliced RAW and denies if either reading does."""
+    if _SPLICE_RAW[0]:
+        return value
+    escaped = _escape_value(value, state)
+    if escaped != value:
+        _SPLICES_ESCAPED[0] += 1
+    return escaped
+
+
+def _escape_value(value: str, state: str) -> str:
+    if state == "'":
+        # The script `eval`/`bash -c`/`trap` will parse, where the expansion
+        # is a WORD — never a quote, comment or operator (`x='<<'` opened a
+        # heredoc): escaped for THAT parse, then `'` closed and reopened here.
+        inner = re.sub(r"([\\\"'`#<>;&|()])", r"\\\1", value)
+        return inner.replace("'", "'\\''")
+    # Bare: `;`/`|`/`&` stay live, since `eval $x` re-parses them as operators.
+    bare = re.sub(r"([\\\"'`#<>])", r"\\\1", value)
+    if state == '"':
+        return re.sub(r'([\\"`])', r"\\\1", value)
+    return bare
 
 
 def _prenormalise(command: str) -> str:
@@ -1031,7 +1286,23 @@ def _find_roots(tokens: list[str]) -> list[str]:
     return roots
 
 
-def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]]:
+def _expand_both(command: str) -> list[tuple[list[str], str]]:
+    """`_expand_segments`, and — when a spliced value needed escaping — again
+    with every value spliced raw (see `_quote_literal`). Neither reading is
+    right at every re-parse depth; together they fail closed."""
+    _SPLICES_ESCAPED[0] = 0
+    out = _expand_segments(command)
+    if _SPLICES_ESCAPED[0]:
+        _SPLICE_RAW[0] = True
+        try:
+            out = out + _expand_segments(command)
+        finally:
+            _SPLICE_RAW[0] = False
+    return out
+
+
+def _expand_segments(command: str, depth: int = 0,
+                     cwds: tuple[str, ...] = ()) -> list[tuple[list[str], str]]:
     """Every command ``command`` would actually run, as (tokens, segment) pairs.
 
     Splitting on shell operators alone only ever saw the OUTERMOST command, so
@@ -1050,6 +1321,19 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
     raw_commands, heredocs = _split_heredocs(command)
     raw_vals = _var_values(raw_commands)
+    # Every directory a `cd` before a command (on this line or an enclosing
+    # one) may have moved it into. SCOPE-blind on purpose — a later `cd` never
+    # clears one: it can fail, sit in a subshell or pipe, or be `cd -`, and
+    # clearing let `cd /; (cd /tmp); rm -rf *` through (XERK-1549). Order
+    # counts only on a line where nothing can run AGAIN: a trailing `cd /` must
+    # not turn an earlier `chmod -R go-w .` into `/.`. A loop, function,
+    # alias, trap or eval can re-run earlier text after a later `cd`, and
+    # finding where such a body ends lost to bash's grammar twice (a stack of
+    # open bodies, then a region scanner: `done=1`, `f() if …`, `${a:-${b}}`).
+    # So any sign of one, anywhere, makes the whole line order-blind.
+    every_cd = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(raw_commands)), cwds)
+    if every_cd != cwds and _REPLAYS_RE.search(command):
+        cwds = every_cd
     bodies, suspect = _balanced_groups(raw_commands)
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
@@ -1057,7 +1341,7 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
         # anything else stay data (see _destructive_database for the psql case).
         owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
         if owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."}):
-            out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1))
+            out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, every_cd))
         elif not quoted:
             # ...but data behind an UNQUOTED delimiter is expanded first, so its
             # `$(…)` and backticks run whoever reads it: `cat <<EOF` / `$(rm -rf
@@ -1068,11 +1352,16 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             if lost:
                 for raw in _split_segments(body):
                     for frag in _stray_group_fragments(raw):
-                        out.extend(_expand_segments(frag, depth + 1))
+                        out.extend(_expand_segments(frag, depth + 1, cwds))
     for body in bodies:
         if _ARITH_BODY_RE.match(body):
             continue
-        out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1))
+        before = cwds
+        if every_cd != cwds:
+            # The `cd`s written before the group are the ones it runs after.
+            head = raw_commands[:max(raw_commands.find(body), 0)]
+            before = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(head)), cwds)
+        out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, before))
     command = _prenormalise(raw_commands)
     segments = _split_segments(command)
     # `xargs` takes its operands from the PIPE, not its own argv, so
@@ -1085,17 +1374,19 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
     for raw in segments:
+        if every_cd != cwds:
+            cwds = _cd_targets(_SUBST_RE.sub(_subst_text, raw), cwds)
         if suspect:
             # The group scan lost track, so a body it should have found may
             # sit here split in half (see _balanced_groups): classify the
             # halves too.
             for frag in _stray_group_fragments(raw):
-                out.extend(_expand_segments(frag, depth + 1))
+                out.extend(_expand_segments(frag, depth + 1, cwds))
         # Anything a substitution would run, wherever it sits in the segment.
         for m in _SUBST_RE.finditer(raw):
             inner = _subst_inner(m)
             if inner.strip():
-                out.extend(_expand_segments(inner, depth + 1))
+                out.extend(_expand_segments(inner, depth + 1, cwds))
         # A substitution also CONTRIBUTES text where it sits — `$(echo …)` is
         # what `eval "$(echo rm -rf /etc)"` runs and what `rm -rf $(echo /etc)`
         # deletes. Both fall out of substituting rather than erasing.
@@ -1103,11 +1394,11 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
         # ...and one that printed nothing leaves the word it is glued to.
         bare = _unwrap_group(_SUBST_RE.sub(lambda m: _subst_text(m, glued_empty=True), raw))
         if bare != seg and bare:
-            out.extend(_expand_segments(bare, depth + 1))
+            out.extend(_expand_segments(bare, depth + 1, cwds))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
             if _SEGMENT_SPLIT.search(seg):
-                out.extend(_expand_segments(seg, depth + 1))
+                out.extend(_expand_segments(seg, depth + 1, cwds))
                 continue
         tokens = _strip_prefixes(_tokenize(seg))
         if not tokens:
@@ -1115,10 +1406,16 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
         out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
+        if prog in ("rm", "unlink", "chmod", "chown"):
+            # `cd /; rm -rf *` deletes `/*`, which `rm` alone never names.
+            for cwd in cwds:
+                joined = [_under_cwd(t, cwd) for t in rest]
+                if joined != rest:
+                    out.append(([tokens[0], *joined], seg, False, cwd))
         if prog in _SHELL_PROGS:
             i = _shell_c_index(rest)
             if i >= 0 and i + 1 < len(rest):
-                out.extend(_expand_segments(rest[i + 1], depth + 1))
+                out.extend(_expand_segments(rest[i + 1], depth + 1, every_cd))
         elif prog == "eval" and rest:
             # `eval eval eval … rm -rf /etc` is valid shell. Collapse the chain
             # ITERATIVELY — recursing once per `eval` burned the depth budget,
@@ -1136,7 +1433,8 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
                 #    has already dropped the quotes, and a plain join turned
                 #    `eval bash -c 'rm -rf /etc'` into `bash -c rm -rf /etc`,
                 #    where `-c`'s argument is the bare word `rm`.
-                out.extend(_expand_segments(" ".join(shlex.quote(t) for t in inner), depth + 1))
+                out.extend(_expand_segments(
+                    " ".join(shlex.quote(t) for t in inner), depth + 1, every_cd))
                 # 2. The FIRST token, when it is itself a command line. A quoted
                 #    script is one token and keeps that shape whatever follows
                 #    it, so this covers the redirection case above.
@@ -1146,14 +1444,24 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
                 #    nothing — as destructive. That is the "commit message
                 #    mentioning rm -rf" class this file exists not to refuse.
                 if inner[0].strip() and re.search(r"\s", inner[0]):
-                    out.extend(_expand_segments(inner[0], depth + 1))
+                    out.extend(_expand_segments(inner[0], depth + 1, every_cd))
+                # 3. The words joined bare, as eval itself re-parses them: an
+                #    escaped `\;` is an operator again (`eval echo \; rm -rf /`).
+                if len(inner) > 1:
+                    out.extend(_expand_segments(" ".join(inner), depth + 1, every_cd))
+        elif prog == "alias" and rest:
+            # `alias f='rm -rf *'` runs wherever `f` is used — after any `cd`.
+            for tok in rest:
+                if "=" in tok:
+                    out.extend(_expand_segments(tok.split("=", 1)[1], depth + 1, every_cd))
         elif prog == "trap" and rest:
+            cwds = every_cd  # a handler runs after whatever `cd` comes later
             # `trap 'rm -rf /etc' EXIT` runs its handler on the way out. Scan
             # every non-flag argument, not just the first: `trap -- '<cmd>' EXIT`
             # displaces the handler by one and hid it completely.
             for tok in rest:
                 if not tok.startswith("-"):
-                    out.extend(_expand_segments(tok, depth + 1))
+                    out.extend(_expand_segments(tok, depth + 1, cwds))
         elif prog in _EXEC_WRAPPERS and rest:
             # `ssh h 'rm -rf /'`, `docker exec c rm -rf /etc`,
             # `kubectl exec pod -- rm -rf /etc` were all allowed: a wrapper's
@@ -1172,14 +1480,14 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             # is banned'` as a destructive command.
             inner_cmd = _wrapper_command(prog, rest)
             if len(inner_cmd) == 1 and re.search(r"\s", inner_cmd[0]):
-                out.extend(_expand_segments(inner_cmd[0], depth + 1))
+                out.extend(_expand_segments(inner_cmd[0], depth + 1, cwds))
             elif inner_cmd and prog in _JOINING_WRAPPERS:
                 # ssh JOINS its operands and hands the string to a remote shell,
                 # so `ssh host 'rm -rf /etc' 'b'` runs `rm -rf /etc b`.
-                out.extend(_expand_segments(" ".join(inner_cmd), depth + 1))
+                out.extend(_expand_segments(" ".join(inner_cmd), depth + 1, cwds))
             elif inner_cmd:
                 out.extend(_expand_segments(
-                    " ".join(shlex.quote(t) for t in inner_cmd), depth + 1))
+                    " ".join(shlex.quote(t) for t in inner_cmd), depth + 1, cwds))
             # ...and, because the option table above CANNOT be kept complete,
             # classify every non-option suffix as an argv too. Wherever the
             # command really starts, one of these begins at it, so a missing
@@ -1219,9 +1527,15 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
                 out.append((_strip_prefixes(expanded + piped_operands), seg))
         elif prog == "find":
             roots = _find_roots(tokens) or ["."]
+            # Relative roots from inside a protected cwd: `cd /; find . -delete`.
+            by_cwd = [(cwd, [_under_cwd(r, cwd) for r in roots]) for cwd in cwds]
+            by_cwd = [(cwd, joined) for cwd, joined in by_cwd if joined != roots]
             if "-delete" in rest:
                 # Equivalent to a recursive delete of everything it walks.
                 out.append((["rm", "-r", *roots], seg))
+                for cwd, joined in by_cwd:
+                    out.append((["rm", "-r", *joined], seg, False, cwd))
+            roots += [r for _, joined in by_cwd for r in joined]
             for flag in ("-exec", "-execdir", "-ok"):
                 while flag in rest:
                     i = rest.index(flag)
@@ -1240,6 +1554,62 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
 
 
 # --- dangerous-path detection (for rm / chmod / chown) -------------------
+
+# `cd`/`pushd` (bare or behind `builtin`/`command`) and the words after it.
+_CD_RE = re.compile(r"(?:^|[\s;&|({`])(?:(?:builtin|command)\s+)?\\?([\"']?)(?:cd|pushd)\1"
+                    r"(?=$|[\s;&|)`])"
+                    r"([^;&|\n)`]*)")
+_MAX_CWDS = 8
+_HOME_USER_RE = re.compile(r"^~[a-z0-9_][a-z0-9_.-]*$")
+# A construct that can run earlier text again after a later `cd`. Matched
+# loosely — in quotes, comments and heredocs too — since a miss fails open.
+_REPLAYS_RE = re.compile(
+    r"\b(?:while|until|for|select|function|alias|trap|eval|coproc|BASH_EXECUTION_STRING)\b"
+    r"|\(\s*\)")
+
+
+
+def _cd_targets(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
+    """``inherited`` plus each absolute or home directory a `cd` in ``text``
+    names. A relative or unknowable one (`cd -`, `cd $OLDPWD`) adds nothing:
+    the directories already listed stay listed whatever it does."""
+    if "cd" not in text and "pushd" not in text:
+        return inherited
+    found = list(inherited)
+    for m in _CD_RE.finditer(text):
+        try:
+            args = shlex.split(m.group(2))
+        except ValueError:
+            args = m.group(2).split()
+        ops = [a for a in args if not (a.startswith("-") and len(a) > 1)]
+        target = _norm_path(ops[0]) if ops else "~"  # a bare `cd` goes home
+        low = target.lower()
+        if low.startswith("/") or low.rstrip("/") in _HOME_TOKENS or _HOME_USER_RE.match(low):
+            target = target.rstrip("/") or "/"
+            if target not in found:
+                found.append(target)
+        if len(found) >= _MAX_CWDS:
+            break
+    return tuple(found)
+
+
+def _is_exact_root(path: str) -> bool:
+    low = path.lower()
+    return low in _HOME_TOKENS or low in _SYSTEM_ROOTS or bool(_HOME_USER_RE.match(low))
+
+
+def _under_cwd(tok: str, cwd: str) -> str:
+    """An `rm` operand read from inside ``cwd``. Inside an exact protected root
+    every relative operand is joined (`cd /etc; rm -rf ./*` is `/etc/*`).
+    Deeper, only one climbing out with `..` is (`cd /tmp; rm -rf ../*` is
+    `/*`): joining the rest would refuse `cd /usr/src/app && rm -rf build`,
+    which names nothing an absolute rm would not, for a cwd that may be stale."""
+    if tok.startswith(("-", "/", "~", "$", _OPAQUE_SUBST)):
+        return tok
+    if _is_exact_root(cwd) or ".." in tok.split("/"):
+        return cwd.rstrip("/") + "/" + tok
+    return tok
+
 
 # Absolute roots whose recursive removal/permission-change destroys the host.
 _SYSTEM_ROOTS = (
@@ -1328,6 +1698,12 @@ def _is_dangerous_path(tok: str) -> bool:
             return True
     if bare in _HOME_TOKENS or low in _HOME_TOKENS:
         return True
+    # A glob straight under a home directory that can match its dotfiles
+    # (`~/*`, `~/.*`, `~/.[!.]*`) takes `.ssh` and the rest with it.
+    parent, _, leaf = low.rpartition("/")
+    if (_GLOB_CHARS.search(leaf) and (parent in _HOME_TOKENS or _HOME_USER_RE.match(parent))
+            and fnmatch.fnmatch(".ssh", leaf)):
+        return True
     # `~root` / `~someuser` expand to that account's home, and `/root` is itself
     # a system root.
     if re.match(r"^~[a-z0-9_][a-z0-9_.-]*/?$", low):
@@ -1356,6 +1732,13 @@ def _is_dangerous_path(tok: str) -> bool:
                 continue
             return True
     return False
+
+
+def _is_home_ssh(tok: str) -> bool:
+    """`~/.ssh` itself — deleting it loses the keys, though `chmod -R 700` of
+    it is the routine permission fix, so only `rm` asks this."""
+    parent, _, leaf = _norm_path(tok).lower().rstrip("/").rpartition("/")
+    return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent)))
 
 
 def _rm_is_recursive(flags: str) -> bool:
@@ -1387,7 +1770,7 @@ def _destructive_rm(tokens: list[str]) -> str | None:
     if prog == "rm" and not _rm_is_recursive(flags):
         return None
     for tgt in targets:
-        if _is_dangerous_path(tgt):
+        if _is_dangerous_path(tgt) or _is_home_ssh(tgt):
             return f"refusing recursive delete of a protected path ({tgt!r})"
     return None
 
@@ -1906,7 +2289,7 @@ def policy_reason(command: str) -> str | None:
     not push to / delete `main`/`master` directly, and it may not merge any
     pull request — that is a human reviewer's call.
     """
-    for tokens, _segment, *_flags in _expand_segments(command):
+    for tokens, _segment, *_flags in _expand_both(command):
         prog = _basename(tokens[0])
         rest = tokens[1:]
         if prog == "git":
@@ -2243,7 +2626,7 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
         except OSError:
             cwd = "/"
     heredocs = None
-    for tokens, segment, *_flags in _expand_segments(command):
+    for tokens, segment, *_flags in _expand_both(command):
         if _basename(tokens[0]) == "cd" and len(tokens) > 1:
             cwd = _join_path(cwd, tokens[1])
             continue
@@ -2519,7 +2902,7 @@ def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
 
 
 def _destructive_database(command: str) -> str | None:
-    for tokens, segment, *_flags in _expand_segments(command):
+    for tokens, segment, *_flags in _expand_both(command):
         if not _DB_DESTRUCTION.search(segment):
             continue
         if not _stage_executes_sql(tokens):
@@ -2561,7 +2944,7 @@ def is_destructive(command: str) -> str | None:
     reason = _destructive_database(command)
     if reason:
         return reason
-    for tokens, segment, *flags in _expand_segments(command):
+    for tokens, segment, *flags in _expand_both(command):
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"
         # A candidate recovered by the wrapper SUFFIX pass is a guess at where
@@ -2592,6 +2975,10 @@ def is_destructive(command: str) -> str | None:
         checks.append(_destructive_agent_tmux(tokens))
         for reason in checks:
             if reason:
+                if len(flags) > 1:
+                    # Joined to a cwd the session never typed: say where from.
+                    reason += (f" — read from inside {flags[1]!r}, where a `cd` on this line"
+                               " may have left it; name the target by absolute path")
                 return reason
     return None
 

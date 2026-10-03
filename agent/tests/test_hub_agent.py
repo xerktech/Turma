@@ -3182,6 +3182,40 @@ class TestHookQuestion(unittest.TestCase):
         self.assertEqual(len(hq["question"]), 300)
         self.assertEqual(hq["labels"], ["L" * 80])
 
+    # XERK-1562: the questions dir is SESSION-writable, and _hook_question runs
+    # on the heartbeat. A plain open() of a planted FIFO blocks forever.
+
+    def _call_bounded(self, fn, *args):
+        """Run fn on a thread and fail if it does not return inside a beat."""
+        out = []
+        t = threading.Thread(target=lambda: out.append(fn(*args)), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "blocked on the req file")
+        return out[0]
+
+    def test_a_fifo_at_the_req_path_returns_none_instead_of_blocking(self):
+        os.mkfifo(os.path.join(self.tmp, "s.req.json"))
+        self.assertIsNone(self._call_bounded(ha._hook_question, "s"))
+
+    def test_a_symlink_out_of_the_questions_dir_is_refused(self):
+        outside = tempfile.mkdtemp(prefix="hub-agent-hookq-out-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        target = os.path.join(outside, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"question": "Planted?", "options": [{"label": "A"}]}, f)
+        os.symlink(target, os.path.join(self.tmp, "s.req.json"))
+        self.assertIsNone(ha._hook_question("s"))
+
+    def test_an_oversize_req_file_is_refused(self):
+        # A COMPLETE object then padding: an uncapped read parses it fine, so
+        # only the size ceiling can make this read as "no question".
+        with open(os.path.join(self.tmp, "s.req.json"), "w") as f:
+            f.write(json.dumps({"question": "Big?"}) + " " * 5000)
+        with mock.patch.object(ha, "QUESTION_REQ_MAX_BYTES", 1000):
+            self.assertIsNone(ha._hook_question("s"))
+        self.assertEqual(ha._hook_question("s")["question"], "Big?")
+
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
     def test_missing_file(self):
@@ -5866,6 +5900,37 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
         self.assertEqual([o["label"] for o in req["options"]], ["Approve", "Reject"])
         self.assertTrue(req["question"])           # a non-empty synthesized prompt
         self.assertEqual(req["header"], "Bash")
+
+    def test_a_fifo_at_the_dsh_req_path_reads_as_nothing_pending(self):
+        # XERK-1562: _dsh_pending_request_id runs on the beat via
+        # _refresh_dsh_questions; a planted FIFO must not wedge it.
+        sm, sess, ctl = self._dsh_session()
+        req_path, _ = sm._question_paths("dsh1")
+        os.mkfifo(req_path)
+        out = []
+        t = threading.Thread(target=lambda: (
+            sm._refresh_dsh_questions(),
+            out.append(sm._dsh_pending_request_id("dsh1"))), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "blocked on the dsh req file")
+        self.assertEqual(out, [None])
+
+    def test_a_symlinked_or_oversize_dsh_req_is_refused(self):
+        sm, sess, ctl = self._dsh_session()
+        req_path, _ = sm._question_paths("dsh1")
+        target = os.path.join(self.tmp, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"question": "Q", "_dshRequestId": "req-x"}, f)
+        os.symlink(target, req_path)
+        self.assertIsNone(sm._dsh_pending_request_id("dsh1"))
+        os.remove(req_path)
+        with open(req_path, "w") as f:
+            f.write(json.dumps({"question": "Q", "_dshRequestId": "req-x"})
+                    + " " * 5000)
+        with mock.patch.object(ha, "QUESTION_REQ_MAX_BYTES", 1000):
+            self.assertIsNone(sm._dsh_pending_request_id("dsh1"))
+        self.assertEqual(sm._dsh_pending_request_id("dsh1"), "req-x")
 
     def test_interaction_end_clears_matching_request(self):
         sm, sess, ctl = self._dsh_session()
