@@ -2011,11 +2011,12 @@ def _flag_value(arg: str, flags: tuple[str, ...]) -> tuple[str, str | None] | No
     return None
 
 
-def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
-    """``(inline bodies, body files)`` if this simple command opens a PR/MR or
-    rewrites its description, else None. ``create`` always carries one; an
-    ``edit``/``update`` only counts when it sets one (``gh pr edit --add-label``
-    is not a description change). Help invocations are not PRs."""
+def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str], int] | None:
+    """``(inline bodies, body files, description-flag count)`` if this simple
+    command opens a PR/MR or rewrites its description, else None. ``create``
+    always carries one; an ``edit``/``update`` only counts when it sets one
+    (``gh pr edit --add-label`` is not a description change). Help invocations
+    are not PRs."""
     spec = _PR_CLIS.get(_basename(tokens[0]))
     rest = tokens[1:]
     if not spec or spec[0] not in rest:
@@ -2036,6 +2037,7 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
     bodies: list[str] = []
     files: list[str] = []
     seen_flag = False
+    sources = 0
     prev_bare = False  # the previous token was a flag that may take a value
     i = 0
     while i < len(args):
@@ -2043,6 +2045,7 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
         hit = _flag_value(arg, body_flags)
         if hit:
             seen_flag = True
+            sources += 1
             flag, value = hit
             if value is None and i + 1 < len(args):
                 i += 1
@@ -2069,7 +2072,7 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
             prev_bare = False
         i += 1
     if verb in creates or (verb in ("edit", "update") and seen_flag):
-        return bodies, [f for f in files if f and f != "-"]
+        return bodies, [f for f in files if f and f != "-"], sources
     return None
 
 
@@ -2161,7 +2164,18 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
         hit = _pr_body_command(tokens)
         if not hit:
             continue
-        bodies, files = hit
+        bodies, files, sources = hit
+        if sources > 1:
+            # The check below reads the UNION of every description source,
+            # but gh/glab/az send only ONE (gh's pflag keeps the last), so
+            # `--body-file ok.md --body-file ~/.config/gh/hosts.yml` passed on
+            # ok.md's sections and posted the other file (XERK-1565).
+            return (
+                "the command passes the description more than once "
+                "(--body/--body-file/--description) — the CLI sends only one of "
+                "them, so the description that is checked may not be the one "
+                "that is sent. Pass the description exactly once."
+            )
         if heredocs is None:
             # Every heredoc counts. Matching a heredoc to the command it feeds
             # (owner line, redirect target) refused 26% of real compliant PR

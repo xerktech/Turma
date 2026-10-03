@@ -4593,13 +4593,23 @@ QWEN_NATIVE_ASK_TOOL = "ask_user_question"
 #
 # The sandbox prompts for every domain outside `allowedDomains`; these are the
 # ones routine fleet work (clone, push, install, build, the tracker) reaches.
+# Residual: the floor removes the PROMPT, it adds no containment. Several of
+# these are multi-tenant and accept data from anyone — a comment on any public
+# GitHub issue, a site anyone can create under `*.atlassian.net`, a push to any
+# registry account whose token the command carries — and a sandboxed command's
+# file reads are open except for `Read()` denies (none cover `~/.config/gh` or
+# `~/.claude`), so a sandboxed command can send any readable file to one of them
+# unprompted. `*.googleapis.com` is deliberately NOT listed: storage.googleapis.com
+# takes an upload to anyone's bucket through a signed URL with no auth on the
+# sender's side, and no routine build needs the wildcard (Android/Gradle use
+# dl.google.com + maven.google.com); an off-floor domain still runs, it prompts.
 # `TURMA_SANDBOX_DOMAINS` (CSV) REPLACES the list when set non-blank.
 SANDBOX_DOMAIN_FLOOR = (
     "github.com", "*.github.com", "*.githubusercontent.com", "ghcr.io",
     "registry.npmjs.org", "*.npmjs.org", "pypi.org", "files.pythonhosted.org",
     "*.atlassian.net", "api.atlassian.com",
     "docker.io", "*.docker.io", "*.docker.com", "quay.io", "*.quay.io",
-    "*.googleapis.com", "dl.google.com", "maven.google.com",
+    "dl.google.com", "maven.google.com",
     "*.gradle.org", "repo.maven.apache.org", "repo1.maven.org",
     "proxy.golang.org", "sum.golang.org", "crates.io", "*.crates.io",
     "deb.debian.org", "security.debian.org", "archive.ubuntu.com",
@@ -4622,7 +4632,15 @@ SANDBOX_DOMAIN_FLOOR = (
 # `./gradlew` script, package.json scripts, conftest.py, test modules) past
 # both the classifier and the guard, which sees only the runner's command line,
 # so a session can still reach main or credentials through a script it writes.
-# Dropping the git rules closed the DIRECT route, not every route.
+# Dropping the git rules closed the DIRECT route, not every route. Residual too:
+# the `gh pr create`/`gh pr edit` rules post whatever body the command names
+# past the classifier, which would otherwise see a credential path. The guard's
+# PR-standard check reads the body but is no credential filter: it now refuses
+# a SECOND description flag (it read the union while gh sends the last, so a
+# conforming file vouched for `~/.config/gh/hosts.yml`), but one body that holds
+# the required sections plus `$(cat <credential>)`, or any lone `--body-file`
+# under `TURMA_PR_SUMMARY=0`, still posts that file unless Claude Code's prefix
+# match refuses the substitution (unmeasured — the real-host spike).
 # `TURMA_TOOL_ALLOW` (CSV) REPLACES the list when set non-blank; keep git rules
 # out of it for the same reason. It splits on every comma with no escape, so a
 # rule whose pattern holds a comma cannot be set through it. Distinct from `TURMA_TOOL_GRANTS`, which only
@@ -4672,6 +4690,25 @@ def tool_allow_floor():
     return _csv_override("TURMA_TOOL_ALLOW", TOOL_ALLOW_FLOOR)
 
 
+def _url_without_credentials(url):
+    """`url` as scheme://host[:port]/path only. Userinfo is a credential and a
+    query may carry a token; the host block is written to a file every session
+    can read. Userinfo ends at the LAST '@' of the authority, as HTTP clients
+    split it (a raw '@' in a password left its tail behind a first-'@' strip).
+    An '@' OUTSIDE the parsed authority (a raw '/', '?' or '#' in a password
+    ends the authority early) makes the split ambiguous, so nothing is named."""
+    url = str(url or "")
+    hidden = "(configured; not shown)"
+    try:
+        parts = urllib.parse.urlsplit(url)
+    except ValueError:
+        return hidden
+    if url.count("@") != parts.netloc.count("@"):
+        return hidden
+    host = parts.netloc.rpartition("@")[2]
+    return urllib.parse.urlunsplit((parts.scheme, host, parts.path, "", ""))
+
+
 def auto_mode_host_block(device=None, repos=None):
     """The per-host `autoMode.environment` entry: the facts auto mode's
     classifier needs so this host is not "unknown infrastructure" to it. The
@@ -4691,9 +4728,7 @@ def auto_mode_host_block(device=None, repos=None):
     owners = [o for o in re.split(r"[\s,]+", os.environ.get("GH_CLONE_OWNERS", "").strip()) if o]
     site = board_site_key()
     org = " / ".join(x for x in (BOARD_ORG_NAME, site) if x) or "none configured"
-    # A URL's userinfo is a credential; the block is written to a file every
-    # session can read, so only the scheme/host/path is named.
-    hub = re.sub(r"^([a-zA-Z][\w.+-]*://)[^/@]*@", r"\1", TURMA_URL)
+    hub = _url_without_credentials(TURMA_URL)
     worktrees = os.path.join(REPOS_ROOT, ".turma", "worktrees")
     return (
         f"Turma agent host {device or 'unnamed'}, which runs the operator's Claude "

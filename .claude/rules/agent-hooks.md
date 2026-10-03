@@ -35,6 +35,11 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   (lists merge across scopes; `--settings` sits above project settings), never replace them:
   - `sandbox.network.allowedDomains` = `SANDBOX_DOMAIN_FLOOR`; `TURMA_SANDBOX_DOMAINS` (CSV)
     REPLACES it when non-blank.
+  - Residual: the domain floor removes the PROMPT and adds no containment. GitHub (any public
+    issue), `*.atlassian.net` (anyone can create a site) and the registries are multi-tenant sinks,
+    and sandboxed reads are open bar `Read()` denies (none on `~/.config/gh`, `~/.claude`), so a
+    sandboxed command can send any readable file there unprompted. `*.googleapis.com` stays OFF
+    (storage.googleapis.com takes a signed-URL upload to anyone's bucket); off-floor still prompts.
   - `permissions.allow` gains `TOOL_ALLOW_FLOOR` (narrow `Bash(<cmd>:*)` PR/CI-read/test rules,
     which skip auto mode's classifier) after `_GUARD_ALLOW_PATH_RULES`, before the operator's;
     `TURMA_TOOL_ALLOW` (CSV) REPLACES it. Not `TURMA_TOOL_GRANTS`, which is a hook-time
@@ -53,6 +58,11 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     A session can write a `--mirror` push into one and run it unprompted, so it can still reach main
     or credentials. Dropping the git rules closed the DIRECT route, not every route; never describe
     the floor as keeping a session off main.
+  - Residual: `gh pr create`/`gh pr edit` post whatever body the command names, past the
+    classifier. pr-summary is no credential filter: it refuses a second description flag (below),
+    but a conforming body plus `$(cat ~/.config/gh/hosts.yml)`, or a lone `--body-file` under
+    `TURMA_PR_SUMMARY=0`, still posts the file unless Claude Code's prefix match refuses the
+    substitution — unmeasured, part of the spike below.
   - `TURMA_TOOL_ALLOW` splits on every comma with no escape, so a rule whose pattern holds a comma
     cannot be set through it (it lands as two malformed rules).
   - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
@@ -104,6 +114,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - **`_split_heredocs` yields `(owner, body, quoted)`** — a shape change there crashes this check,
       and the guard then fails CLOSED on every heredoc-bodied PR (shipped once, in v2.1.50).
   - A body it can't see (`--fill`, the editor, `$(cat file)`) is refused, saying how to pass it.
+  - **More than one description flag is refused** (XERK-1565): the check reads the UNION of every
+    source while gh sends only the LAST, so `--body-file ok.md --body-file ~/.config/gh/hosts.yml`
+    passed on ok.md's sections and posted the token file. Heredocs are not flags, so `--body
+    "$(cat <<EOF …)"` and `-F - <<EOF` stay one source.
   - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_text`): a FIFO at the body or
     template path hung the hook, and Claude Code lets a timed-out hook's command THROUGH.
   - Headings match with `(?!\w)`, not `\b` — a template heading ending `?`/`:`/`)` never matched.

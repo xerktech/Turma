@@ -558,6 +558,31 @@ class TestFleetPolicy(unittest.TestCase):
         # A credential in the hub URL never reaches a file every session reads.
         self.assertNotIn("s3cret", block)
 
+    def test_the_hub_url_loses_every_credential_shape(self):
+        # Userinfo ends at the LAST '@' (as HTTP clients split it), so a raw
+        # '@' in the password must not leave its tail behind; a query may carry
+        # a token too. Anything that still holds an '@' is not named at all.
+        strip = ha._url_without_credentials
+        self.assertEqual(strip("https://bot:p@ss@hub.example/x"), "https://hub.example/x")
+        self.assertEqual(strip("https://bot:pw@hub.example:8443/x?token=t#f"),
+                         "https://hub.example:8443/x")
+        self.assertEqual(strip("http://[::1]:8080/"), "http://[::1]:8080/")
+        self.assertEqual(strip("https://hub.example"), "https://hub.example")
+        # A raw '/', '?' or '#' in the password moves the '@' out of the
+        # parsed authority; the split is then ambiguous, so nothing is named.
+        for url in ("https://bot:p?x@hub/x", "https://bot:p#x@hub/x",
+                    "https://bot:p/w@hub/x"):
+            with self.subTest(url=url):
+                self.assertEqual(strip(url), "(configured; not shown)")
+        for url in ("https://bot:p@ss@hub.example/x", "https://bot:a@b@c@hub/x",
+                    "https://bot:p?x@hub/x", "https://bot:p#x@hub/x"):
+            with self.subTest(url=url), \
+                    mock.patch.object(ha, "TURMA_URL", url):
+                block = ha.auto_mode_host_block(device="h", repos=[])
+                self.assertNotIn("bot", block)
+                self.assertNotIn("ss@", block)
+                self.assertNotIn("@", block)
+
     def test_auto_mode_host_block_scans_repos_and_caps_the_list(self):
         many = [{"name": f"r{i}", "path": f"/r/r{i}"}
                 for i in range(ha.AUTO_MODE_REPOS_MAX + 3)]
