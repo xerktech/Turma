@@ -4636,8 +4636,9 @@ SANDBOX_DOMAIN_FLOOR = (
 # the `gh pr create`/`gh pr edit` rules post whatever body the command names
 # past the classifier, which would otherwise see a credential path. The guard's
 # PR-standard check reads the body but is no credential filter: it now refuses
-# a SECOND description flag (it read the union while gh sends the last, so a
-# conforming file vouched for `~/.config/gh/hosts.yml`), but one body that holds
+# a SECOND description flag, a pflag shorthand cluster (`-dF`) included (it
+# read the union while gh sends the last, so a conforming file vouched for
+# `~/.config/gh/hosts.yml`), but one body that holds
 # the required sections plus `$(cat <credential>)`, or any lone `--body-file`
 # under `TURMA_PR_SUMMARY=0`, still posts that file unless Claude Code's prefix
 # match refuses the substitution (unmeasured — the real-host spike).

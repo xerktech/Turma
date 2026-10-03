@@ -1990,24 +1990,46 @@ def _heading_present(body: str, pattern: str) -> bool:
 
 
 # Forge CLIs, the subcommand group, the verbs that open one (`new` is a
-# documented alias of `create` for both gh and glab), and the flags that carry
-# a description. A short flag may be glued to its value (`-bTEXT`).
+# documented alias of `create` for both gh and glab), the long flags that carry
+# a description, and the SHORTHAND letters that do (az has none).
 _PR_CLIS = {
-    "gh": ("pr", ("create", "new"), ("-b", "--body", "-F", "--body-file")),
-    "glab": ("mr", ("create", "new"), ("-d", "--description")),
-    "az": ("pr", ("create",), ("--description",)),
+    "gh": ("pr", ("create", "new"), ("--body", "--body-file"), "bF"),
+    "glab": ("mr", ("create", "new"), ("--description",), "d"),
+    "az": ("pr", ("create",), ("--description",), ""),
 }
+# The description sources that name a FILE rather than carry the text.
+_PR_FILE_FLAGS = ("--body-file", "F")
 
 
 def _flag_value(arg: str, flags: tuple[str, ...]) -> tuple[str, str | None] | None:
-    """``(flag, glued value or None)`` if ``arg`` is one of ``flags``."""
+    """``(flag, glued value or None)`` if ``arg`` is one of the long ``flags``."""
     for f in flags:
         if arg == f:
             return f, None
-        if f.startswith("--") and arg.startswith(f + "="):
+        if arg.startswith(f + "="):
             return f, arg[len(f) + 1:]
-        if not f.startswith("--") and arg.startswith(f) and len(arg) > len(f):
-            return f, arg[len(f):]
+    return None
+
+
+def _shorthand_value(arg: str, letters: str) -> tuple[str, str | None] | None:
+    """``(letter, glued value or None)`` if the single-dash ``arg`` holds a
+    description shorthand. pflag reads `-dF x` as a CLUSTER — `-d -F x` — and
+    the rest of the cluster after a value-taking letter is its value (`-dFx`,
+    `-dF=x`), so a lone `-F`/`-Fx` is just the one-letter case. ANY earlier
+    letter is assumed boolean: a glued value holding the letter (`-Rbob/r`)
+    over-counts, the safe way, while stopping at a value-taking letter we
+    misjudge would let `-dF hosts.yml` slip past the one-source rule."""
+    if not letters or not arg.startswith("-") or arg.startswith("--"):
+        return None
+    for j, ch in enumerate(arg[1:], start=1):
+        if ch in letters:
+            value = arg[j + 1:]
+            if value.startswith("="):
+                value = value[1:]
+            return ch, (value or None)
+        if not ch.isalpha():
+            # Shorthands are letters: past a non-letter this is a value.
+            return None
     return None
 
 
@@ -2021,7 +2043,7 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str], int] | No
     rest = tokens[1:]
     if not spec or spec[0] not in rest:
         return None
-    group, creates, body_flags = spec
+    group, creates, body_flags, letters = spec
     head = rest[:rest.index(group)]
     if (rest[:1] == ["help"]
             or (_basename(tokens[0]) == "az" and "repos" not in head)):
@@ -2042,7 +2064,7 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str], int] | No
     i = 0
     while i < len(args):
         arg = args[i]
-        hit = _flag_value(arg, body_flags)
+        hit = _flag_value(arg, body_flags) or _shorthand_value(arg, letters)
         if hit:
             seen_flag = True
             sources += 1
@@ -2051,7 +2073,7 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str], int] | No
                 i += 1
                 value = args[i]
             if value is not None:
-                (files if flag in ("-F", "--body-file") else bodies).append(value)
+                (files if flag in _PR_FILE_FLAGS else bodies).append(value)
             prev_bare = False
         elif arg in ("-h", "--help") and not prev_bare:
             # Help prints wherever it sits — unless it is the previous flag's
@@ -2172,7 +2194,8 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             # ok.md's sections and posted the other file (XERK-1565).
             return (
                 "the command passes the description more than once "
-                "(--body/--body-file/--description) — the CLI sends only one of "
+                "(--body/-b, --body-file/-F, --description/-d, a letter in a "
+                "flag cluster such as -dF counts too) — the CLI sends only one of "
                 "them, so the description that is checked may not be the one "
                 "that is sent. Pass the description exactly once."
             )

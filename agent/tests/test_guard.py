@@ -1676,13 +1676,29 @@ class TestPrSummary(unittest.TestCase):
                     f"gh pr create -t x --body {q} -F hosts.yml",
                     f"gh pr create -t x -b {q} -b \"$(cat hosts.yml)\"",
                     f"glab mr create -d {q} --description x",
-                    f"az repos pr create --description {q} --description x"):
+                    f"az repos pr create --description {q} --description x",
+                    # A pflag shorthand CLUSTER carries a description letter
+                    # too: `-dF` is --draft + --body-file (gh keeps the last).
+                    "gh pr create --title x --body-file ok.md -dF hosts.yml",
+                    "gh pr create --title x --body-file ok.md -dFhosts.yml",
+                    "gh pr create --title x --body-file ok.md -wF hosts.yml",
+                    "gh pr create --title x --body-file ok.md -dF=hosts.yml",
+                    "gh pr create --title x --body-file ok.md -db x",
+                    f"glab mr create -d {q} -yd x"):
             with self.subTest(cmd=cmd):
                 r = self.reason(cmd)
                 self.assertIsNotNone(r)
                 self.assertIn("more than once", r)
         # One flag, heredoc-fed or not, is still the routine shape.
         self.assertIsNone(self.reason("gh pr edit 12 --body-file ok.md"))
+        # A single clustered source is that source, validated like a lone one.
+        for ok in ("gh pr create -t x -dF ok.md", "gh pr create -t x -dFok.md",
+                   f"gh pr create -t x -db {q}", f"glab mr create -yd {q}"):
+            with self.subTest(cmd=ok):
+                self.assertIsNone(self.reason(ok))
+        r = self.reason("gh pr create -t x -dF hosts.yml")
+        self.assertIsNotNone(r)
+        self.assertNotIn("more than once", r)
         self.assertIsNone(self.reason(
             "gh pr create -t x --body \"$(cat <<'EOF'\n" + GOOD_BODY + "EOF\n)\""))
         self.assertIsNone(self.reason(

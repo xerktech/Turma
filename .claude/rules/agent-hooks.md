@@ -59,8 +59,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     or credentials. Dropping the git rules closed the DIRECT route, not every route; never describe
     the floor as keeping a session off main.
   - Residual: `gh pr create`/`gh pr edit` post whatever body the command names, past the
-    classifier. pr-summary is no credential filter: it refuses a second description flag (below),
-    but a conforming body plus `$(cat ~/.config/gh/hosts.yml)`, or a lone `--body-file` under
+    classifier. pr-summary is no credential filter: it refuses a second description flag, `-dF`
+    clusters included (below), but a conforming body plus `$(cat ~/.config/gh/hosts.yml)`, or a lone `--body-file` under
     `TURMA_PR_SUMMARY=0`, still posts the file unless Claude Code's prefix match refuses the
     substitution — unmeasured, part of the spike below.
   - `TURMA_TOOL_ALLOW` splits on every comma with no escape, so a rule whose pattern holds a comma
@@ -118,6 +118,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     source while gh sends only the LAST, so `--body-file ok.md --body-file ~/.config/gh/hosts.yml`
     passed on ok.md's sections and posted the token file. Heredocs are not flags, so `--body
     "$(cat <<EOF …)"` and `-F - <<EOF` stay one source.
+  - **A shorthand CLUSTER is a description flag too** (`_shorthand_value`): pflag reads `-dF x` as
+    `-d -F x`, so `--body-file ok.md -dF hosts.yml` (also `-dFhosts.yml`, `-wF`, glab `-yd`) is
+    two sources. ANY letter of a single-dash token counts (gh `b`/`F`, glab `d`): a glued value
+    holding one (`-Rbob/r`) over-refuses; stopping at a misjudged value-taking letter would leak.
   - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_text`): a FIFO at the body or
     template path hung the hook, and Claude Code lets a timed-out hook's command THROUGH.
   - Headings match with `(?!\w)`, not `\b` — a template heading ending `?`/`:`/`)` never matched.
