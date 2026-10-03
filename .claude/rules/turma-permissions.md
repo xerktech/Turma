@@ -19,7 +19,11 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 
 - **`dialog`** — the numbered TUI dialog (rule/manual prompt, plan approval, sandbox escape). Source:
   the `panePrompt` EDGES the beat already scrapes. `dialogKind` = `permission`/`plan`/`sandbox`/`other`
-  off the dialog text (`classify_pane_dialog`; wording is the TUI's, so unknown = `other`).
+  (`classify_pane_dialog`; wording is the TUI's, so unknown = `other`).
+  - **The kind comes from the PENDING CALL and the QUESTION line, never the detail.** The detail is
+    the call's free text (a command, Claude's description, a path), so `terraform plan`, `ls sandbox/`
+    or "Check network access" there would mislabel a tool prompt. Pending `ExitPlanMode` → `plan`;
+    "Do you want to allow this connection?" → `sandbox`; any other "Do you want to …" → `permission`.
   - On None→dialog the row opens and attaches the PENDING CALL (`pending_tool_call`): of the newest
     assistant message (entries sharing `message.id`) with a `tool_use` lacking a `tool_result`, its
     OLDEST such call — Claude asks about parallel calls one at a time, in order. `head`/`digest` come
@@ -32,6 +36,9 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
     face whose pending call is still the open row's `toolUseId`, with the same `dialogKind`, keeps the
     row. NOT for a delegated row (every sub-agent prompt shares the Task id) or one with no
     `toolUseId`, which fall back to the face. The tail is read only on a face change.
+  - **Only a PRE-EXECUTION prompt (`permission`/`plan`) repaints on the call alone.** A running call
+    raises any number of sandbox prompts under one `toolUseId` (`npm install`: the registry, then
+    GitHub), so a `sandbox` face is a repaint only while its host equals the row's `head`.
   - `classify_pane_dialog` matches its phrases across any whitespace, so a wrap never changes the kind.
   - **A question picker is not a permission row**: no row opens while `signals.question` is set or
     the pending call is `AskUserQuestion` (its native picker after ask.py's wait) — no rule retires it.

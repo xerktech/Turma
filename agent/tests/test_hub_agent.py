@@ -36548,6 +36548,19 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
                              "selected": False},
                             {"number": 3, "label": "No", "selected": False}]}
 
+    def sandbox(self, host="registry.npmjs.org"):
+        # Claude Code's sandbox escape, in its own wording (the 2.1.x TUI): a
+        # "Network request outside of sandbox" title, a "Host:" row, and the
+        # question, all drawn by the TUI rather than written by the call.
+        return {"prompt": "Do you want to allow this connection?",
+                "detail": f"Network request outside of sandbox\nHost: {host}",
+                "options": [{"number": 1, "label": "Yes", "selected": True},
+                            {"number": 2, "label": f"Yes, and don't ask again for {host}",
+                             "selected": False},
+                            {"number": 3,
+                             "label": "No, and tell Claude what to do differently (esc)",
+                             "selected": False}]}
+
     def edge(self, pane_prompt=None, at=1000, **sig):
         signals = {"panePrompt": pane_prompt, "paneBusy": False}
         signals.update(sig)
@@ -36627,17 +36640,47 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
                          "plan")
         self.assertEqual(ha.classify_pane_dialog(
             ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)), "permission")
-        self.assertEqual(ha.classify_pane_dialog(
-            {"prompt": "Allow network access outside the sandbox?",
-             "detail": "Host: registry.npmjs.org"}), "sandbox")
+        self.assertEqual(ha.classify_pane_dialog(self.sandbox()), "sandbox")
         self.assertEqual(ha.classify_pane_dialog({"prompt": "Which one?"}), "other")
+        # A pending ExitPlanMode is the plan approval, even when a narrow pane
+        # wrapped all but the question's tail onto the lines above it.
+        self.assertEqual(ha.classify_pane_dialog(
+            {"prompt": "proceed?", "detail": "Plan\nI will add one test."},
+            {"tool": "ExitPlanMode", "toolUseId": "toolu_P"}), "plan")
+
+    def test_a_tool_prompts_own_text_never_picks_its_kind(self):
+        # The detail is the CALL's free text — its command, Claude's description
+        # of it, a path — so "plan", "sandbox" or "network access" in it says
+        # nothing about the dialog: each is an ordinary tool prompt.
+        cases = [
+            ("Bash command\nterraform plan -out tf.plan\nPlan the infra change",
+             "terraform plan -out tf.plan"),
+            ("Bash command\ngit add docs/plan.md\nStage the plan", "git add docs/plan.md"),
+            ("Bash command\ncurl -s https://api.github.com/repos/o/r\n"
+             "Check network access to GitHub", "curl -s https://api.github.com/repos/o/r"),
+            ("Bash command\nls sandbox/\nList the sandbox directory", "ls sandbox/"),
+        ]
+        for n, (detail, command) in enumerate(cases):
+            with self.subTest(command=command):
+                pp = dict(self.dialog(), detail=detail)
+                self.assertEqual(ha.classify_pane_dialog(pp), "permission")
+                self.lines = []
+                self.write(self.tool_use(f"toolu_{n}", inp={"command": command}))
+                self.edge(pp, at=1000 + n * 10000)
+                row = self.sm._perm_open[self.SID]
+                self.assertEqual(row["dialogKind"], "permission")
+                self.assertNotEqual(row["head"], "api.github.com")
+                self.edge(None, at=2000 + n * 10000)
+        # Nor does a path in the question of an edit prompt.
+        for q in ("Do you want to make this edit to docs/plan.md?",
+                  "Do you want to create sandbox/network-access.md?"):
+            with self.subTest(question=q):
+                self.assertEqual(ha.classify_pane_dialog(
+                    dict(self.dialog(), prompt=q), {"tool": "Edit"}), "permission")
 
     def test_a_sandbox_dialog_names_its_host(self):
         self.write(self.tool_use("toolu_1"))
-        self.edge({"prompt": "Allow this command to reach the network outside the sandbox?",
-                   "detail": "Host: registry.npmjs.org",
-                   "options": [{"number": 1, "label": "Yes", "selected": True},
-                               {"number": 2, "label": "No", "selected": False}]})
+        self.edge(self.sandbox())
         row, = self.rows()
         self.assertEqual((row["dialogKind"], row["head"]),
                          ("sandbox", "registry.npmjs.org"))
@@ -36945,13 +36988,37 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         # network: the same call, but another prompt the operator answers.
         self.write(self.tool_use("toolu_1"))
         self.edge(self.dialog(), at=1000)
-        self.edge({"prompt": "Allow network access outside the sandbox?",
-                   "detail": "Host: registry.npmjs.org",
-                   "options": [{"number": 1, "label": "Yes", "selected": True},
-                               {"number": 2, "label": "No", "selected": False}]}, at=4000)
+        self.edge(self.sandbox(), at=4000)
         rows = {r["id"]: r for r in self.rows()}
         self.assertEqual(sorted((r["dialogKind"], r["openedAt"]) for r in rows.values()),
                          [("permission", 1000), ("sandbox", 4000)])
+
+    def test_two_hosts_one_running_call_asks_for_are_two_rows(self):
+        # `npm install` is allowed and runs (no result yet), then asks to reach
+        # the registry and, answered between two beats, GitHub: one toolUseId,
+        # two prompts — each host its own row, wait and allowedDomains rule.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox("registry.npmjs.org"), at=1000)
+        self.edge(self.sandbox("codeload.github.com"), at=6000)
+        self.edge(None, at=9000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["head"], r["waitedMs"]) for r in rows.values()),
+                         [("codeload.github.com", 3000), ("registry.npmjs.org", 5000)])
+        self.assertEqual({r["toolUseId"] for r in rows.values()}, {"toolu_1"})
+
+    def test_the_same_sandbox_prompt_redrawn_is_one_row(self):
+        # A resize wraps the "don't ask again" label off the 1..N run: the face
+        # changed, the host did not — the same prompt.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox(), at=1000)
+        narrow = self.sandbox()
+        narrow["options"] = [narrow["options"][0], dict(narrow["options"][1],
+                                                        label="Yes, and don't ask again")]
+        self.edge(narrow, at=4000)
+        self.edge(None, at=7000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual([(r["head"], r["waitedMs"]) for r in rows.values()],
+                         [("registry.npmjs.org", 6000)])
 
     def test_dialogs_inside_a_sub_agent_are_not_folded_by_its_delegation_id(self):
         # Every prompt a foreground sub-agent raises shares the parent's pending

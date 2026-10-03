@@ -10848,21 +10848,48 @@ def _permission_head_digest(tool, tool_input):
         return (tool or "")[:200], ""
 
 
-def classify_pane_dialog(prompt):
+# The dialog's own QUESTION line is the TUI's wording; the detail above it is the
+# call's free text (a Bash command, Claude's description, a path), so nothing
+# below reads the detail. `\s+`, not a space: a narrow pane wraps the question,
+# and the kind must not change with the width (a repaint keeps its row only
+# while the kind holds). Claude Code's sandbox escape asks "Do you want to allow
+# this connection?" under its "Network request outside of sandbox" title.
+_DIALOG_SANDBOX_Q_RE = re.compile(r"\ballow\s+this\s+connection\b", re.IGNORECASE)
+# A tool prompt: "Do you want to proceed?", "… make this edit to <path>?",
+# "… create <path>?" — whatever the path or command it names says.
+_DIALOG_TOOL_Q_RE = re.compile(r"^\s*do\s+you\s+want\s+to\b", re.IGNORECASE)
+# The plan approval: "Claude has written up a plan and is ready to execute.
+# Would you like to proceed?" (a wrapped one keeps only its tail, which is why
+# the pending ExitPlanMode call decides first).
+_DIALOG_PLAN_Q_RE = re.compile(
+    r"ready\s+to\s+execute|\bplan\b.*\bwould\s+you\s+like\s+to\s+proceed\b",
+    re.IGNORECASE)
+
+
+def classify_pane_dialog(prompt, call=None):
     """`permission` / `plan` / `sandbox` / `other` for a parse_pane_prompt dict,
-    off its text. A plan approval names the plan; a sandbox escape names the
-    sandbox or the network; a tool prompt asks "Do you want to …". Wording is
-    the TUI's, so anything unrecognised is `other`, never guessed."""
+    off the PENDING CALL (`call`, pending_tool_call's dict) and the dialog's own
+    question line — never its detail, which carries the call's free text: a
+    `terraform plan`, a `git add docs/plan.md`, a description saying "network
+    access" or an `ls sandbox/` would otherwise pick the kind. A pending
+    ExitPlanMode is the plan approval; the sandbox prompt's question names the
+    connection; a tool prompt asks "Do you want to …" whatever it is about.
+    Wording is the TUI's, so anything unrecognised is `other`, never guessed."""
     if not isinstance(prompt, dict):
         return "other"
-    text = f"{prompt.get('prompt') or ''}\n{prompt.get('detail') or ''}"
-    if re.search(r"\bplan\b", text, re.IGNORECASE):
+    tool = call.get("tool") if isinstance(call, dict) else None
+    if tool == "ExitPlanMode":
         return "plan"
-    # \s+, not a space: a narrow pane wraps the detail mid-phrase, and the kind
-    # must not change with the width (a repaint keeps its row only while it holds).
-    if re.search(r"\bsandbox\b|network\s+(?:access|request)", text, re.IGNORECASE):
+    question = str(prompt.get("prompt") or "")
+    if _DIALOG_SANDBOX_Q_RE.search(question):
         return "sandbox"
-    if re.search(r"\bdo\s+you\s+want\s+to\b|\ballow\b", text, re.IGNORECASE):
+    if _DIALOG_TOOL_Q_RE.search(question):
+        return "permission"
+    if _DIALOG_PLAN_Q_RE.search(question):
+        return "plan"
+    if tool or re.search(r"\ballow\b", question, re.IGNORECASE):
+        # A numbered dialog over a pending tool call is that call's prompt (a
+        # narrow pane can wrap "Do you want to …" off the question line).
         return "permission"
     return "other"
 
@@ -10877,9 +10904,11 @@ def _pane_dialog_identity(prompt):
 
 
 def _pane_dialog_host(prompt):
-    """The first host name a sandbox dialog's text mentions, or ""."""
+    """The host a sandbox dialog asks about — its "Host:" line, else the first
+    host name its text mentions — or ""."""
     text = f"{prompt.get('prompt') or ''}\n{prompt.get('detail') or ''}"
-    m = _PERMISSION_HOST_RE.search(text)
+    m = (re.search(r"(?im)^\s*host:\s*" + _PERMISSION_HOST_RE.pattern, text)
+         or _PERMISSION_HOST_RE.search(text))
     return m.group(1).lower()[:200] if m else ""
 
 
@@ -28872,31 +28901,43 @@ class SessionManager:
         face moves with the pane's width (wrapped detail, a lost wrapped option)
         and with Tab-to-amend, while the call it asks about does not. Only a row
         holding a toolUseId of its own can tell (a sub-agent's delegation id is
-        shared by every prompt raised inside it), only when the kind is unchanged
-        (a sandbox prompt for a running call is a second prompt), and only when
-        the call still pending is that same call. Reads the tail on a face change
-        only, never on the steady-state beat."""
+        shared by every prompt raised inside it), and only when the call still
+        pending is that same call with the kind unchanged.
+
+        That call identifies a PRE-EXECUTION prompt only (`permission`, `plan`):
+        it asks once, before the call runs. A RUNNING call can raise any number
+        of sandbox prompts (`npm install` reaching the registry, then GitHub), all
+        under its one toolUseId, so a `sandbox` face is the same prompt only while
+        it names the row's host — another host is another prompt. Reads the tail
+        on a face change only, never on the steady-state beat."""
         tuid = row.get("toolUseId")
         if not tuid or row.get("tool") in PERMISSION_DELEGATING_TOOLS:
             return False
-        if classify_pane_dialog(pp) != row.get("dialogKind"):
+        kind = row.get("dialogKind")
+        if kind == "sandbox":
+            host = _pane_dialog_host(pp)
+            if not host or host != row.get("head"):
+                return False
+        elif kind not in ("permission", "plan"):
             return False
         path = _session_transcript_path(sess)
         call = pending_tool_call(_tail_entries(path)) if path else None
-        return bool(call) and call.get("toolUseId") == tuid
+        if not call or call.get("toolUseId") != tuid:
+            return False
+        return classify_pane_dialog(pp, call) == kind
 
     def _open_dialog_row(self, sess, pp, now_ms):
         sid = sess["id"]
-        kind = classify_pane_dialog(pp)
+        path = _session_transcript_path(sess)
+        call = pending_tool_call(_tail_entries(path)) if path else None
+        if call and call.get("tool") == "AskUserQuestion":
+            return                  # a question's picker: no allow rule retires it
+        kind = classify_pane_dialog(pp, call)
         options = [str(o.get("label") or "")[:200] for o in (pp.get("options") or [])
                    if isinstance(o, dict)][:PANE_PROMPT_MAX_OPTIONS]
         row = {"id": f"d-{sid}-{now_ms}", "sessionId": sid, "kind": "dialog",
                "dialogKind": kind, "prompt": pp["prompt"][:PERMISSION_TEXT_MAX],
                "options": options, "openedAt": now_ms}
-        path = _session_transcript_path(sess)
-        call = pending_tool_call(_tail_entries(path)) if path else None
-        if call and call.get("tool") == "AskUserQuestion":
-            return                  # a question's picker: no allow rule retires it
         if call:
             row.update(call)
         if kind == "sandbox":
