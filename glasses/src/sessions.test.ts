@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { __setDshEnabled, flattenSessions, glyph, isDsh, liveState } from "./sessions.ts";
+import { __setDshEnabled, flattenSessions, glyph, isDsh, liveState, readyForReview } from "./sessions.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
@@ -65,6 +65,32 @@ describe("liveState", () => {
       now - 10_000, now)).toBe("idle");
     // Behind the offline gate, like paneBusy.
     expect(liveState(s, now - 600_000, now)).toBe("idle");
+  });
+
+  // XERK-1570: only WORK keeps a session working. A session whose live rows are
+  // all WAITING shells is "holding" (not ready for review) until it stalls.
+  it("is 'holding' while only waiting shells run, 'idle' once stalled", () => {
+    const now = 10_000_000;
+    const waitOn = (agents: NonNullable<LiveSignals["agents"]>, ageSec = 5) => session({
+      session: signals({ paneBusy: false, transcriptAgeSec: ageSec, lastRole: "assistant", agents }),
+    });
+    const ci = { type: "shell", label: "Watch CI", kind: "wait-external" };
+    expect(liveState(waitOn([ci]), now, now)).toBe("holding");
+    expect(readyForReview(waitOn([ci]), now, now)).toBe(false);
+    expect(liveState(waitOn([{ type: "shell", label: "Sleep", kind: "wait-timed", eta: now + 60_000 }]), now, now))
+      .toBe("holding");
+    // Stalled: past its ETA (+ grace) with nothing written since, or silent 45 min.
+    const overdue = waitOn([{ type: "shell", label: "Sleep", kind: "wait-timed", eta: now - 180_000 }], 600);
+    expect(liveState(overdue, now, now)).toBe("idle");
+    expect(readyForReview(overdue, now, now)).toBe(true);
+    expect(liveState(waitOn([ci], 46 * 60), now, now)).toBe("idle");
+    // A work shell, or a row with no kind (an older agent), is working.
+    expect(liveState(waitOn([{ type: "shell", label: "Tests", kind: "work" }]), now, now)).toBe("working");
+    expect(liveState(waitOn([{ type: "shell", label: "Old" }]), now, now)).toBe("working");
+    expect(liveState(waitOn([ci, { type: "qa", label: "QA" }]), now, now)).toBe("working");
+    // paneBusy unknown + a fresh transcript does not make a wait-only session working.
+    expect(liveState(session({ session: signals({ transcriptAgeSec: 1, agents: [ci] }) }), now, now)).toBe("holding");
+    expect(glyph("holding")).toBe("~");
   });
 
   it("is 'error' when status is error, regardless of session signals", () => {

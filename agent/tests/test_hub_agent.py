@@ -1635,7 +1635,7 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         write_jsonl(path, self.opened_pr(self.PR1, "old") + SHELL_LAUNCH_ENTRIES)
         state = {}
         rep = ha.session_report(self.WORKDIR, state)
-        self.assertEqual(rep["agents"], [{"type": "shell", "label": "Watch CI"}])
+        self.assertEqual(rep["agents"], [{"type": "shell", "label": "Watch CI", "kind": "wait-external"}])
         self.assertEqual(rep["prUrls"], [])
         # The stop edge still lands on a later beat, incrementally.
         with open(path, "a") as f:
@@ -1676,7 +1676,7 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, SHELL_LAUNCH_ENTRIES)
         self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"],
-                         [{"type": "shell", "label": "Watch CI"}])
+                         [{"type": "shell", "label": "Watch CI", "kind": "wait-external"}])
 
     def test_a_launch_in_the_lead_in_never_goes_live(self):
         # The lead-in records stops only; a launch there is outside the window.
@@ -1696,7 +1696,7 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                 mock.patch.object(ha, "AGENT_BACKSCAN_LEAD_IN", 500):
             write_jsonl(path, [pad] * 6 + SHELL_LAUNCH_ENTRIES)
             self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"],
-                             [{"type": "shell", "label": "Watch CI"}])
+                             [{"type": "shell", "label": "Watch CI", "kind": "wait-external"}])
 
     def test_a_restart_does_not_resurrect_finished_background_work(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -3182,6 +3182,40 @@ class TestHookQuestion(unittest.TestCase):
         self.assertEqual(len(hq["question"]), 300)
         self.assertEqual(hq["labels"], ["L" * 80])
 
+    # XERK-1562: the questions dir is SESSION-writable, and _hook_question runs
+    # on the heartbeat. A plain open() of a planted FIFO blocks forever.
+
+    def _call_bounded(self, fn, *args):
+        """Run fn on a thread and fail if it does not return inside a beat."""
+        out = []
+        t = threading.Thread(target=lambda: out.append(fn(*args)), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "blocked on the req file")
+        return out[0]
+
+    def test_a_fifo_at_the_req_path_returns_none_instead_of_blocking(self):
+        os.mkfifo(os.path.join(self.tmp, "s.req.json"))
+        self.assertIsNone(self._call_bounded(ha._hook_question, "s"))
+
+    def test_a_symlink_out_of_the_questions_dir_is_refused(self):
+        outside = tempfile.mkdtemp(prefix="hub-agent-hookq-out-")
+        self.addCleanup(shutil.rmtree, outside, ignore_errors=True)
+        target = os.path.join(outside, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"question": "Planted?", "options": [{"label": "A"}]}, f)
+        os.symlink(target, os.path.join(self.tmp, "s.req.json"))
+        self.assertIsNone(ha._hook_question("s"))
+
+    def test_an_oversize_req_file_is_refused(self):
+        # A COMPLETE object then padding: an uncapped read parses it fine, so
+        # only the size ceiling can make this read as "no question".
+        with open(os.path.join(self.tmp, "s.req.json"), "w") as f:
+            f.write(json.dumps({"question": "Big?"}) + " " * 5000)
+        with mock.patch.object(ha, "QUESTION_REQ_MAX_BYTES", 1000):
+            self.assertIsNone(ha._hook_question("s"))
+        self.assertEqual(ha._hook_question("s")["question"], "Big?")
+
 
 class TestTranscriptTail(ProjectDirMixin, unittest.TestCase):
     def test_missing_file(self):
@@ -3817,6 +3851,64 @@ SHELL_LAUNCH_ENTRIES = [
 ]
 
 
+class TestShellKind(unittest.TestCase):
+    """_shell_kind (XERK-1570) — which background shells are WAITING. Driven by
+    the SAME vector file the JS twin (`shellKind` in tunnel-agent.test.js) reads,
+    so the two classifiers cannot drift."""
+
+    def test_the_shared_vectors(self):
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "shell_kind_vectors.json")
+        with open(path, encoding="utf-8") as f:
+            vectors = json.load(f)["vectors"]
+        self.assertGreater(len(vectors), 40)
+        for cmd, kind, secs in vectors:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(ha._shell_kind(cmd), (kind, secs))
+
+    def test_a_hostile_command_never_raises_onto_the_beat(self):
+        # The scan runs on the beat: an absurd literal, deep nesting or an
+        # unterminated construct must classify (as anything), never raise.
+        for cmd in ("sleep " + "9" * 400, "timeout 1 " * 5000 + "sleep 1",
+                    "$(" * 10000, "'" + "x" * 1000, "while " * 3000, None, 7):
+            with self.subTest(cmd=str(cmd)[:40]):
+                kind, _ = ha._shell_kind(cmd)
+                self.assertIn(kind, ("wait-timed", "wait-external", "work"))
+
+    def test_a_hostile_command_classifies_in_bounded_time(self):
+        # A try/except catches exceptions, never TIME (XERK-395): the old tail
+        # regex backtracked quadratically, ~48s for one 128 KB `-fff…!` word.
+        hostile = "-" + "f" * 200000 + "!"
+        for cmd in ("tail " + hostile, "tail " + hostile + " " + hostile,
+                    "sleep 5 " + "x" * (1 << 20), "a b " * 300000):
+            with self.subTest(cmd=cmd[:20]):
+                t0 = time.monotonic()
+                self.assertEqual(ha._shell_kind(cmd), ("work", None))
+                self.assertLess(time.monotonic() - t0, 0.5)
+        # The follow check itself is linear too, past the input caps.
+        t0 = time.monotonic()
+        self.assertFalse(ha._shell_tail_follow(hostile))
+        self.assertTrue(ha._shell_tail_follow("-" + "q" * 200000 + "f"))
+        self.assertLess(time.monotonic() - t0, 0.5)
+
+
+class TestTsMs(unittest.TestCase):
+    """_ts_ms — the same table as the `tsMs` case in tunnel-agent.test.js, so a
+    shell row's startedAt/eta agree across the two mirrors."""
+
+    def test_the_shared_table(self):
+        for ts, ms in (("2026-10-03T12:00:00Z", 1791028800000),
+                       ("2026-10-03T12:00:00", 1791028800000),
+                       ("2026-10-03T12:00:00.5+02:00", 1791021600500),
+                       ("2026-10-03T12:00:00.123456789-0130", 1791034200123),
+                       (" 2026-10-03T12:00:00.000Z\n", 1791028800000),
+                       ("Oct 3 2026", None), ("2026-02-30T00:00:00Z", None),
+                       ("2026-10-03T24:00:00Z", None), ("2026-10-03T12:00:60Z", None),
+                       ("0000-01-01T00:00:00Z", None), ("2026-10-03T12:00:00Zjunk", None),
+                       ("٢٠٢٦-10-03T12:00:00Z", None), (7, None)):
+            with self.subTest(ts=ts):
+                self.assertEqual(ha._ts_ms(ts), ms)
+
+
 class TestLiveAgentsScan(unittest.TestCase):
     """_scan_agent_entry — which background agents are in flight, off the
     transcript's own launch/stop edges. The TUI footer is NOT the source: its
@@ -3837,7 +3929,48 @@ class TestLiveAgentsScan(unittest.TestCase):
     def test_a_background_shell_is_live_work(self):
         # The TUI footer says "1 shell" while the session otherwise reads idle.
         st = self._scan(SHELL_LAUNCH_ENTRIES)
-        self.assertEqual(ha.live_agents_report(st), [{"type": "shell", "label": "Watch CI"}])
+        self.assertEqual(ha.live_agents_report(st), [{"type": "shell", "label": "Watch CI", "kind": "wait-external"}])
+
+    def test_a_shell_row_carries_kind_started_at_and_eta(self):
+        # XERK-1570: the kind of the COMMAND (never the description), startedAt
+        # = the call's timestamp, eta = startedAt + N for a timed wait. The JS
+        # twin in tunnel-agent.test.js asserts the same rows — keep in step.
+        def shell_call(tid, command, description, ts, bg):
+            return [
+                {"type": "assistant", "timestamp": ts, "message": {"content": [
+                    {"type": "tool_use", "id": tid, "name": "Bash",
+                     "input": {"command": command, "description": description,
+                               "run_in_background": True}}]}},
+                {"type": "user", "timestamp": "2026-10-03T12:00:09.000Z",
+                 "message": {"content": [{"type": "tool_result", "tool_use_id": tid,
+                                          "content": "x"}]},
+                 "toolUseResult": {"stdout": "", "backgroundTaskId": bg}},
+            ]
+        st = self._scan(
+            shell_call("t1", "sleep 600", "Wait for the deploy", "2026-10-03T12:00:00.000Z", "b1")
+            + shell_call("t2", "npm test", "Wait for the tests", "2026-10-03T12:00:01.000Z", "b2")
+            + shell_call("t3", "gh run watch 9", "Watch CI", "2026-10-03T12:00:02.000Z", "b3")
+            + TASK_LAUNCH_ENTRIES)
+        t0 = ha._ts_ms("2026-10-03T12:00:00.000Z")
+        self.assertEqual(ha.live_agents_report(st), [
+            {"type": "shell", "label": "Wait for the deploy", "kind": "wait-timed",
+             "startedAt": t0, "eta": t0 + 600000},
+            {"type": "shell", "label": "Wait for the tests", "kind": "work", "startedAt": t0 + 1000},
+            {"type": "shell", "label": "Watch CI", "kind": "wait-external", "startedAt": t0 + 2000},
+            # An agent row carries no kind: absent reads as work.
+            {"type": "agent", "label": "QA the parity change"},
+        ])
+        # With no call timestamp the LAUNCH entry's timestamp starts the clock.
+        late = self._scan([
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "t9", "name": "Bash", "input": {"command": "sleep 60"}}]}},
+            {"type": "user", "timestamp": "2026-10-03T12:00:09.000Z",
+             "message": {"content": [{"type": "tool_result", "tool_use_id": "t9", "content": "x"}]},
+             "toolUseResult": {"stdout": "", "backgroundTaskId": "b9"}},
+        ])
+        self.assertEqual(ha.live_agents_report(late), [
+            {"type": "shell", "label": "sleep 60", "kind": "wait-timed",
+             "startedAt": t0 + 9000, "eta": t0 + 69000}])
 
     def test_a_background_shell_stops_on_its_notification(self):
         st = self._scan(SHELL_LAUNCH_ENTRIES + [
@@ -5869,6 +6002,37 @@ class TestDshRouting(ManagerMixin, unittest.TestCase):
         self.assertEqual([o["label"] for o in req["options"]], ["Approve", "Reject"])
         self.assertTrue(req["question"])           # a non-empty synthesized prompt
         self.assertEqual(req["header"], "Bash")
+
+    def test_a_fifo_at_the_dsh_req_path_reads_as_nothing_pending(self):
+        # XERK-1562: _dsh_pending_request_id runs on the beat via
+        # _refresh_dsh_questions; a planted FIFO must not wedge it.
+        sm, sess, ctl = self._dsh_session()
+        req_path, _ = sm._question_paths("dsh1")
+        os.mkfifo(req_path)
+        out = []
+        t = threading.Thread(target=lambda: (
+            sm._refresh_dsh_questions(),
+            out.append(sm._dsh_pending_request_id("dsh1"))), daemon=True)
+        t.start()
+        t.join(5)
+        self.assertFalse(t.is_alive(), "blocked on the dsh req file")
+        self.assertEqual(out, [None])
+
+    def test_a_symlinked_or_oversize_dsh_req_is_refused(self):
+        sm, sess, ctl = self._dsh_session()
+        req_path, _ = sm._question_paths("dsh1")
+        target = os.path.join(self.tmp, "elsewhere.json")
+        with open(target, "w") as f:
+            json.dump({"question": "Q", "_dshRequestId": "req-x"}, f)
+        os.symlink(target, req_path)
+        self.assertIsNone(sm._dsh_pending_request_id("dsh1"))
+        os.remove(req_path)
+        with open(req_path, "w") as f:
+            f.write(json.dumps({"question": "Q", "_dshRequestId": "req-x"})
+                    + " " * 5000)
+        with mock.patch.object(ha, "QUESTION_REQ_MAX_BYTES", 1000):
+            self.assertIsNone(sm._dsh_pending_request_id("dsh1"))
+        self.assertEqual(sm._dsh_pending_request_id("dsh1"), "req-x")
 
     def test_interaction_end_clears_matching_request(self):
         sm, sess, ctl = self._dsh_session()
@@ -32662,6 +32826,40 @@ class TestParseTicketTriage(unittest.TestCase):
     def test_reason_is_capped(self):
         out = self._parse(self._raw(reason="x" * 400))
         self.assertEqual(len(out["ENG-1"]["reason"]), ha.JIRA_TRIAGE_REASON_MAX)
+
+    def test_a_rollup_verdict_parses_as_not_actionable(self):
+        # XERK-1568: the classifier's answer for a rollup ticket is an ordinary
+        # actionable:false assessment — no new field, nothing the hub must learn.
+        out = self._parse(self._raw(actionable=False, type="other",
+                                    reason="rollup list, not work"))
+        self.assertIs(out["ENG-1"]["actionable"], False)
+
+
+class TestTicketTriagePrompt(unittest.TestCase):
+    """XERK-1568: a rollup ticket (`[Rollup] <repo>: low-severity findings`,
+    labelled `rollup`) is a findings list, never work. The hub gates it out of the
+    auto stream on its own; the classifier marks it not actionable too (belt and
+    braces), so the instruction must say so and the ticket line must carry what
+    it keys on."""
+
+    def test_the_instruction_marks_a_rollup_ticket_not_actionable(self):
+        text = ha.TICKET_TRIAGE_INSTRUCTION
+        self.assertIn("[Rollup]", text)
+        self.assertIn("labelled 'rollup'", text)
+        self.assertRegex(text, r"ROLLUP ticket[^\n]*\n?[^\n]*actionable is always false")
+
+    def test_the_prompt_carries_the_rule_and_the_rollup_markers(self):
+        t = {"key": "ENG-7", "summary": "[Rollup] Turma: low-severity findings",
+             "labels": ["rollup", "Turma"]}
+        prompt = ha._ticket_triage_prompt([t], [t])
+        self.assertTrue(prompt.startswith(ha.TICKET_TRIAGE_INSTRUCTION))
+        self.assertIn("- ENG-7: [Rollup] Turma: low-severity findings", prompt)
+        self.assertIn("(labels: rollup, Turma)", prompt)
+
+    def test_adding_the_rollup_label_re_triages(self):
+        before = {"key": "ENG-7", "summary": "Findings", "labels": ["Turma"]}
+        after = dict(before, labels=["Turma", "rollup"])
+        self.assertNotEqual(ha._ticket_fingerprint(before), ha._ticket_fingerprint(after))
 
 
 class TestTicketTriage(ManagerMixin, unittest.TestCase):

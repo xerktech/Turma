@@ -129,6 +129,9 @@
   .s-card .state { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
   .s-card .state.working { color: var(--good); }
   .s-card .state.waiting { color: var(--warning); font-weight: 600; }
+  /* Waiting out a background shell it launched (XERK-1570): not working, not
+     the operator's yet — a quiet in-between, never the attention colours. */
+  .s-card .state.holding { color: var(--ink-2); font-style: italic; }
   /* A card in the Ready-for-review section says why it is there instead of the
      bare "idle" it would otherwise read (XERK-224). */
   .s-card .state.review { color: var(--accent); font-weight: 600; }
@@ -2189,13 +2192,24 @@ function liveState(sess, host, now) {
   // so it read plain "idle" while an agent was still running — and worse, it
   // qualified as Ready for review, buzzing the operator's phone mid-run. Behind
   // the host-online gate for the same reason paneBusy is.
-  if (host.online && liveAgentCount(s))
+  //
+  // Only WORK rows count (XERK-1570): a background shell that is a sleep, a CI
+  // watch or a poll loop is the session WAITING, not working.
+  if (host.online && liveWorkCount(s))
     return { kind: "working", label: agentWorkLabel(s), detail: "last write " + ago(age) };
   const working = s.paneBusy != null
     ? (host.online && s.paneBusy)
-    : (host.online && age < 90 * 1000);
+    : (host.online && !liveAgentCount(s) && age < 90 * 1000);
   if (working)
     return { kind: "working", label: "working", detail: "last write " + ago(age) };
+  // Every live row is a wait: "holding" while it waits (never Ready for review),
+  // or — past its ETA, or silent too long — "stalled", which reads as idle so a
+  // dead shell surfaces like any finished session. Mirrors the hub's sessionWait.
+  const wait = host.online ? backgroundWait(s.agents, now - age, now) : null;
+  if (wait && wait.state === "waiting")
+    return { kind: "holding", label: backgroundWaitLabel(s.agents, wait, now), detail: "last write " + ago(age) };
+  if (wait)
+    return { kind: "idle", stalled: true, label: backgroundWaitLabel(s.agents, wait, now), detail: "last write " + ago(age) };
   return { kind: "idle", label: "idle", detail: "last write " + ago(age) };
 }
 
@@ -2204,6 +2218,43 @@ function liveState(sess, host, now) {
 // field reports none, which reads as "can't tell", leaving that host as it was.
 function liveAgentCount(s) {
   return Array.isArray(s?.agents) ? s.agents.length : 0;
+}
+// A background shell row's kind (XERK-1570). ABSENT means work — an agent or
+// workflow row, or an agent predating the field — so only an explicit wait kind
+// takes a row out of "working".
+function isWaitRow(a) {
+  return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
+}
+function liveWorkRows(s) {
+  return (Array.isArray(s?.agents) ? s.agents : []).filter(a => !isWaitRow(a));
+}
+function liveWorkCount(s) {
+  return liveWorkRows(s).length;
+}
+// The hub's ATTENTION_WAIT_STALL_MIN default and its ETA grace (server.js).
+const WAIT_STALL_MS = 45 * 60 * 1000;
+const WAIT_ETA_GRACE_MS = 2 * 60 * 1000;
+// null, or {state:"waiting"|"stalled", eta} — a mirror of server.js
+// backgroundWait: an ETA still ahead is waiting; past it (plus grace) with no
+// transcript write since, or silent WAIT_STALL_MS with no ETA ahead, is stalled.
+function backgroundWait(rows, lastWrite, now) {
+  const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
+  if (!waits.length) return null;
+  let eta = null;
+  for (const a of waits) if (Number.isSafeInteger(a.eta) && (eta == null || a.eta > eta)) eta = a.eta;
+  if (eta != null && eta > now) return { state: "waiting", eta };
+  const overdue = eta != null && lastWrite < eta && now - eta >= WAIT_ETA_GRACE_MS;
+  const silent = now - lastWrite >= WAIT_STALL_MS;
+  return { state: overdue || silent ? "stalled" : "waiting", eta };
+}
+// "waiting · 12m left" (a timed wait), "waiting · Watch CI" (one named wait),
+// else "waiting on 2 background shells"; "stalled …" once it has stalled.
+function backgroundWaitLabel(rows, wait, now) {
+  const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
+  const word = wait.state === "stalled" ? "stalled" : "waiting";
+  if (wait.eta != null && wait.eta > now) return word + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
+  if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label;
+  return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s");
 }
 // The oppositional QA agents (`qa` on the first pass, `qa-delta` on every pass
 // after) — a card running one is still `working`, so it stays Active, but says
@@ -2220,7 +2271,7 @@ function qaReviewing(s) {
 // "1 background agent" / "3 background agents".
 function agentWorkLabel(s) {
   if (qaReviewing(s)) return "QA Review";
-  return backgroundWorkLabel(s.agents);
+  return backgroundWorkLabel(liveWorkRows(s));
 }
 // "1 background agent" / "2 background shells" / "3 background tasks" (mixed):
 // a background shell rides `agents` as a `shell` row. Mirrored in index.html and
@@ -2270,6 +2321,7 @@ function prLanded(p) {
 function readyForReview(s, live) {
   if (live.kind === "waiting") return true;    // blocked on you either way
   if (live.kind === "working") return false;   // still its own turn
+  if (live.kind === "holding") return false;   // waiting out a shell it launched (XERK-1570)
   const sig = s.session;
   if (!sig) return false;
   const prs = s.prs || [];
@@ -2289,6 +2341,8 @@ function readyForReview(s, live) {
 // "idle" under a heading that says they are not, so they say why they qualified.
 function reviewState(s, live) {
   if (live.kind !== "idle") return live;
+  // A stalled background wait keeps its own reason — it is why it is here.
+  if (live.stalled) return { ...live, kind: "review" };
   const label = (s.prs || []).some(p => !prLanded(p)) ? "PR awaiting review" : "finished · awaiting review";
   return { ...live, kind: "review", label, detail: live.detail };
 }

@@ -308,6 +308,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     and with no status behind them `BackgroundAgentsBar` renders the web's "Background
     agents…" row. A `main`-only list raises nothing. Session cards say which is running
     via `liveStateLabel(state, live)`, matching the web's `agentWorkLabel`.
+  - **Waiting shells are not work (XERK-1570).** `LiveAgent`/`AgentRow` type `kind`
+    (+ `startedAt`/`eta` on `LiveAgent`); `core/Sessions.kt` mirrors the hub's
+    `sessionWait` — `LiveState.HOLDING` (Active, never Ready for review, "waiting · 12m left" /
+    "waiting · Watch CI") until stalled, then IDLE. The chat bar reads "Waiting…" and a wait
+    row "waiting". **Gap:** a STALLED card reads plain "idle" on Android where the web says
+    "stalled · <what>" (the label has no host `lastSeen` to judge silence) — XERK-1571's
+    hub-stamped attention state replaces both; and the HOLDING dot is a dimmed working
+    colour, not the web's hollow ring.
 
 ## Done (XERK-78 installment — the P0 sweep)
 

@@ -5912,7 +5912,7 @@ class _UsageAcc:
 
 _ISO_INSTANT_RE = re.compile(
     r"(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2}):(\d{2})(?:\.(\d{1,9}))?"
-    r"(Z|[+-]\d{2}:?\d{2})?$")
+    r"(Z|[+-]\d{2}:?\d{2})?$", re.ASCII)   # ASCII digits, like tsMs in tunnel-agent.js
 
 
 def _ts_ms(ts):
@@ -8569,6 +8569,343 @@ AGENT_DONE_STATUSES = frozenset({"completed", "failed", "killed", "stopped", "er
 LIVE_AGENTS_MAX = 32
 
 
+# ---- background shell kinds (XERK-1570) --------------------------------------
+#
+# A background shell is not always WORK. `sleep 3600`, `gh pr checks --watch` or
+# a `until …; do sleep 30; done` poll is the session WAITING, and reading it as
+# working hid a session parked on a dead shell for as long as the shell lived.
+# So a shell row carries a `kind`, classified off the call's COMMAND (never its
+# description, which is the model's prose):
+#
+#   wait-timed     a sleep / `timeout N` / a loop whose only body is sleep|date;
+#                  `eta` = start + N when N is a literal
+#   wait-external  a watch on something outside: `gh pr checks --watch`,
+#                  `gh run watch`, `kubectl wait|rollout status`, `docker logs -f`,
+#                  `tail -f`, `watch`, an `until …; do sleep …; done` poll
+#   work           anything else
+#
+# **Anything not recognised is `work`** — that is today's reading, so a miss
+# costs nothing new. The opposite miss (work read as waiting) would hide a busy
+# session, so every rule below errs toward `work`. Mirrored by `shellKind` in
+# tunnel-agent.js; the shared vectors in both suites keep the two in step.
+SHELL_KIND_WAIT_TIMED = "wait-timed"
+SHELL_KIND_WAIT_EXTERNAL = "wait-external"
+SHELL_KIND_WORK = "work"
+# The hub keeps `startedAt`/`eta` only as JS-safe integers (Number.isSafeInteger).
+_MAX_SAFE_INT = 2 ** 53 - 1
+# Commands that neither do work nor wait: they may sit beside a sleep.
+_SHELL_NEUTRAL_CMDS = frozenset({"date", "echo", "printf", "true", ":", "cd"})
+# Pipeline stages that only filter a waiting command's output.
+_SHELL_FILTER_CMDS = frozenset({"grep", "egrep", "fgrep", "head", "tail", "sed", "awk",
+                                "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"})
+# Wrappers that run the rest of the line unchanged.
+_SHELL_PREFIX_CMDS = frozenset({"nohup", "exec", "command"})
+# re.ASCII + \Z, never `$`: Python's `\d` takes Unicode digits and `$` matches
+# before a final newline, where the JS mirror (and bash's `sleep`) do neither.
+_SHELL_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?|\.\d+)([smhd]?)\Z", re.ASCII)
+_SHELL_DURATION_UNIT = {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}
+_SHELL_DURATION_MAX = 10 ** 9   # ~31 years: past it, "no literal"
+_SHELL_ENV_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=", re.ASCII)
+_SHELL_REDIR_RE = re.compile(r"^(\d+|&)?(>>?|<<?<?)(&?)(.*)\Z", re.ASCII)
+# The classifier runs on the BEAT (XERK-395), so its INPUT is bounded, not just
+# guarded against raising: a command longer than this, or with any word longer
+# than _SHELL_KIND_MAX_WORD, is `work` before any rule looks at it. A real wait
+# is a short line, and `work` is today's reading.
+_SHELL_KIND_MAX_CHARS = 4096
+_SHELL_KIND_MAX_WORD = 256
+
+
+def _utf16_len(s):
+    """Length in UTF-16 units, the unit JS `.length` counts — so both caps cut
+    at the SAME place in the tunnel mirror (an astral char is 2 there, 1 in len)."""
+    return len(s.encode("utf-16-le", "surrogatepass")) // 2
+# kubectl global flags that take a SEPARATE value, skipped to find the subcommand.
+_KUBECTL_VALUE_FLAGS = frozenset({"-n", "--namespace", "--context", "--kubeconfig",
+                                  "--cluster", "--user", "-s", "--server", "--as",
+                                  "--token", "--request-timeout"})
+
+
+def _shell_segments(command):
+    """A command line as segments (split on `;` `&&` `||` `&` newline) of
+    pipeline stages (split on `|`) of words — a deliberately small tokenizer:
+    quotes group, `$(…)`/backticks stay inside one word, `#` starts a comment.
+    Anything it cannot model just yields words no rule matches, i.e. `work`."""
+    segs, stages, words = [], [], []
+    word, in_word = [], False
+    quote, depth, tick = "", 0, False
+    s = str(command or "")
+    n = len(s)
+
+    def end_word():
+        nonlocal word, in_word
+        if in_word:
+            words.append("".join(word))
+        word, in_word = [], False
+
+    def end_stage():
+        nonlocal words
+        end_word()
+        if words:
+            stages.append(words)
+        words = []
+
+    def end_seg():
+        nonlocal stages
+        end_stage()
+        if stages:
+            segs.append(stages)
+        stages = []
+
+    i = 0
+    while i < n:
+        c = s[i]
+        if quote:
+            if c == quote:
+                quote = ""
+            elif c == "\\" and quote == '"' and i + 1 < n:
+                i += 1
+                word.append(s[i])
+            else:
+                word.append(c)
+            i += 1
+            continue
+        if depth or tick:
+            word.append(c)
+            if c == "`" and not depth:
+                tick = False
+            elif c == "(":
+                depth += 1
+            elif c == ")":
+                depth -= 1
+            i += 1
+            continue
+        if c in ("'", '"'):
+            quote, in_word = c, True
+        elif c == "\\" and i + 1 < n:
+            i += 1
+            if s[i] != "\n":
+                word.append(s[i])
+                in_word = True
+        elif c == "$" and i + 1 < n and s[i + 1] == "(":
+            word.append("$(")
+            in_word, depth = True, 1
+            i += 1
+        elif c == "`":
+            word.append(c)
+            in_word, tick = True, True
+        elif c == "#" and not in_word:
+            while i + 1 < n and s[i + 1] != "\n":
+                i += 1
+        elif c in (";", "\n"):
+            end_seg()
+        elif c == "|":
+            if i + 1 < n and s[i + 1] == "|":
+                i += 1
+                end_seg()
+            else:
+                end_stage()
+        elif c == "&":
+            if i + 1 < n and s[i + 1] == "&":
+                i += 1
+                end_seg()
+            elif (word and word[-1] in "<>") or (i + 1 < n and s[i + 1] == ">"):
+                word.append(c)   # 2>&1, &>file: a redirection, not a separator
+                in_word = True
+            else:
+                end_seg()
+        elif c in (" ", "\t", "\r"):
+            end_word()
+        else:
+            word.append(c)
+            in_word = True
+        i += 1
+    end_seg()
+    return segs
+
+
+def _shell_words(words):
+    """A stage's words minus env assignments, redirections and no-op wrappers."""
+    out, skip = [], False
+    for w in words:
+        if skip:
+            skip = False
+            continue
+        m = _SHELL_REDIR_RE.match(w)
+        if m:
+            if not m.group(3) and not m.group(4):
+                skip = True   # `> file`: the target is the next word
+            continue
+        if not out and _SHELL_ENV_RE.match(w):
+            continue
+        out.append(w)
+    while out and out[0].rsplit("/", 1)[-1] in _SHELL_PREFIX_CMDS:
+        out = out[1:]
+    return out
+
+
+def _shell_tail_follow(arg):
+    """`tail`'s follow flag: `--follow…`, or a short-option cluster with letters
+    up to the first f/F and ASCII alphanumerics after (`-f`, `-F`, `-qf`, `-f5`).
+    A linear scan, never a regex: `^-[A-Za-z]*[fF][A-Za-z0-9]*$` backtracks
+    quadratically on a long `-fff…!` word, and this runs on the beat."""
+    if arg.startswith("--follow"):
+        return True
+    body = arg[1:]
+    if not arg.startswith("-") or not body or not body.isascii() or not body.isalnum():
+        return False
+    for ch in body:
+        if ch in "fF":
+            return True
+        if not ch.isalpha():
+            return False
+    return False
+
+
+def _kubectl_positionals(args):
+    """kubectl's non-flag words, skipping a known global flag's separate value."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif a.startswith("-"):
+            skip = a in _KUBECTL_VALUE_FLAGS
+        else:
+            out.append(a)
+    return out
+
+
+def _shell_duration(arg):
+    """`sleep`/`timeout` duration as seconds, or None when it is not a literal."""
+    m = _SHELL_DURATION_RE.match(arg or "")
+    secs = float(m.group(1)) * _SHELL_DURATION_UNIT[m.group(2)] if m else None
+    # A 400-digit literal is `inf`, which `int()` raises on — on the beat.
+    return secs if secs is not None and secs <= _SHELL_DURATION_MAX else None
+
+
+def _shell_cmd_kind(words, depth=0):
+    """(`neutral`|`timed`|`external`|`work`, seconds-or-None) for one command."""
+    if not words:
+        return "neutral", None
+    cmd, args = words[0].rsplit("/", 1)[-1], words[1:]
+    if cmd == "sleep":
+        secs = [_shell_duration(a) for a in args]
+        return "timed", (sum(secs) if secs and None not in secs else None)
+    if cmd == "timeout":
+        if depth >= 4:   # `timeout 1 timeout 1 …` must not recurse on the beat
+            return "work", None
+        rest = list(args)
+        while rest and rest[0].startswith("-"):
+            opt = rest.pop(0)
+            if opt in ("-s", "-k", "--signal", "--kill-after") and rest:
+                rest.pop(0)
+        if not rest:
+            return "work", None
+        limit = _shell_duration(rest[0])
+        kind, secs = _shell_cmd_kind(_shell_words(rest[1:]), depth + 1)
+        if kind in ("work", "neutral"):
+            return kind, None
+        if secs is not None and (limit is None or secs < limit):
+            limit = secs
+        return "timed", limit
+    if cmd in _SHELL_NEUTRAL_CMDS:
+        return "neutral", None
+    if cmd == "gh" and ((args[:2] == ["pr", "checks"] and "--watch" in args)
+                        or args[:2] == ["run", "watch"]):
+        return "external", None
+    if cmd == "kubectl":
+        # The SUBCOMMAND, not any word: `kubectl delete pod wait` is work.
+        sub = _kubectl_positionals(args)[:2]
+        if sub[:1] == ["wait"] or sub == ["rollout", "status"]:
+            return "external", None
+    if cmd == "docker" and "logs" in args and ("-f" in args or "--follow" in args):
+        return "external", None
+    if cmd == "tail" and any(_shell_tail_follow(a) for a in args):
+        return "external", None
+    if cmd == "watch":
+        return "external", None
+    return "work", None
+
+
+def _shell_pipeline_kind(stages):
+    """A pipeline's kind: its first command's, when every later stage is a filter."""
+    for st in stages[1:]:
+        w = _shell_words(st)
+        if w and w[0].rsplit("/", 1)[-1] not in _SHELL_FILTER_CMDS:
+            return "work", None
+    return _shell_cmd_kind(_shell_words(stages[0]))
+
+
+def _shell_loop(segs, i):
+    """(kind, next index) for a `while|until|for …; do …; done` at segs[i], or
+    ("work", None) when it is not a plain sleep loop."""
+    head = _shell_words(segs[i][0])
+    if len(segs[i]) != 1 or i + 1 >= len(segs):
+        return "work", None
+    first = _shell_words(segs[i + 1][0])
+    if not first or first[0] != "do":
+        return "work", None
+    body = [[first[1:]] + segs[i + 1][1:]]
+    j = i + 2
+    while j < len(segs) and _shell_words(segs[j][0]) != ["done"]:
+        body.append(segs[j])
+        j += 1
+    if j >= len(segs):
+        return "work", None
+    slept = False
+    for st in body:
+        if _shell_words(st[0])[:1] in (["while"], ["until"], ["for"]):
+            return "work", None   # a nested loop: never recurse
+        kind, _ = _shell_pipeline_kind(st)
+        if kind not in ("timed", "neutral"):
+            return "work", None
+        slept = slept or kind == "timed"
+    if not slept or _shell_pipeline_kind([["true"]] + segs[j][1:])[0] == "work":
+        return "work", None
+    if head[0] == "until" or (head[0] == "while" and head[1:] not in (["true"], [":"])):
+        return "external", j + 1
+    return "timed", j + 1
+
+
+def _shell_kind(command):
+    """(kind, seconds-or-None) of a background shell's command — see above."""
+    # len() first: a code-point count never exceeds the UTF-16 one, so an
+    # oversize command is refused before anything encodes it.
+    if (not isinstance(command, str) or len(command) > _SHELL_KIND_MAX_CHARS
+            or _utf16_len(command) > _SHELL_KIND_MAX_CHARS):
+        return SHELL_KIND_WORK, None
+    segs = _shell_segments(command)
+    if any(_utf16_len(w) > _SHELL_KIND_MAX_WORD for seg in segs for st in seg for w in st):
+        return SHELL_KIND_WORK, None
+    timed = external = False
+    total = 0.0
+    i = 0
+    while i < len(segs):
+        head = _shell_words(segs[i][0])
+        if head and head[0] in ("while", "until", "for"):
+            kind, nxt = _shell_loop(segs, i)
+            if kind == "work":
+                return SHELL_KIND_WORK, None
+            external = external or kind == "external"
+            timed = timed or kind == "timed"
+            total = None   # a loop's length is not a literal
+            i = nxt
+            continue
+        kind, secs = _shell_pipeline_kind(segs[i])
+        if kind == "work":
+            return SHELL_KIND_WORK, None
+        if kind == "external":
+            external = True
+        elif kind == "timed":
+            timed = True
+            total = None if (total is None or secs is None) else total + secs
+        i += 1
+    if external:
+        return SHELL_KIND_WAIT_EXTERNAL, None
+    if timed:
+        return SHELL_KIND_WAIT_TIMED, total
+    return SHELL_KIND_WORK, None
+
+
 def _async_launch(entry):
     """`{id, type, label}` iff this entry is a BACKGROUND WORK launch, else None.
 
@@ -8649,8 +8986,15 @@ def _scan_agent_entry(entry, state):
                 # Any Bash call can end up in the background (run_in_background,
                 # or moved there on its timeout); its description — or, failing
                 # that, its command — labels the shell row.
+                # The KIND is read off the command (XERK-1570), never the
+                # description; the call's own timestamp is when it started,
+                # which for a shell moved to the background on its timeout is
+                # minutes before the launch record lands.
                 inp = block.get("input") or {}
-                shells[block["id"]] = str(inp.get("description") or inp.get("command") or "").strip()[:200]
+                kind, secs = _shell_kind(inp.get("command"))
+                shells[block["id"]] = {
+                    "label": str(inp.get("description") or inp.get("command") or "").strip()[:200],
+                    "kind": kind, "secs": secs, "ts": _ts_ms(entry.get("timestamp"))}
                 while len(shells) > LIVE_AGENTS_MAX * 4:
                     shells.pop(next(iter(shells)))
             elif block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
@@ -8686,14 +9030,28 @@ def _scan_agent_entry(entry, state):
             # index — which spans the whole conversation — rather than the 8 MiB
             # window the resolvers read. The JS mirror (scanAgentEntry) does not
             # carry it: resolution lives only here, and its liveAgentsReport emits
-            # the same {type,label} rows onto the wire, so parity is unaffected.
+            # the same {type,label,kind?,startedAt?,eta?} rows (never resolveId),
+            # so parity is unaffected.
+            launched_at = _ts_ms(entry.get("timestamp"))
             if launch["type"] == "shell":
-                live[launch["id"]] = {"type": "shell", "label": shells.get(tool_id) or "",
-                                      "resolveId": ""}
+                call = shells.get(tool_id) or {}
+                row = {"type": "shell", "label": call.get("label") or "", "resolveId": "",
+                       "kind": call.get("kind") or SHELL_KIND_WORK}
+                started = call.get("ts") or launched_at
+                secs = call.get("secs")
+                if started is not None and secs is not None \
+                        and row["kind"] == SHELL_KIND_WAIT_TIMED:
+                    eta = started + int(math.floor(secs * 1000 + 0.5))   # = JS Math.round
+                    if eta <= _MAX_SAFE_INT:
+                        row["eta"] = eta
             else:
-                live[launch["id"]] = {"type": tasks.get(tool_id) or launch["type"],
-                                      "label": launch["label"],
-                                      "resolveId": launch.get("resolveId") or ""}
+                row = {"type": tasks.get(tool_id) or launch["type"],
+                       "label": launch["label"],
+                       "resolveId": launch.get("resolveId") or ""}
+                started = launched_at
+            if started is not None:
+                row["startedAt"] = started
+            live[launch["id"]] = row
     # The notification rides a queued operation, the user turn it becomes once
     # dequeued, or an attachment — never an ASSISTANT turn, which is skipped so
     # that a session merely QUOTING a notification (this feature's own fixtures,
@@ -8790,10 +9148,18 @@ def _backscan_live_agents(path, state):
 
 
 def live_agents_report(state):
-    """`state["liveAgents"]` as the heartbeat's [{type, label}] (no ids: they are
-    internal, and the chat resolves a row back to its transcript by type+label)."""
-    return [{"type": a["type"], "label": a["label"]}
-            for a in (state.get("liveAgents") or {}).values()]
+    """`state["liveAgents"]` as the heartbeat's [{type, label, kind?, startedAt?,
+    eta?}] (no ids: they are internal, and the chat resolves a row back to its
+    transcript by type+label). `kind` rides SHELL rows only — an agent/workflow
+    row carries none, which every reader takes as `work` (XERK-1570)."""
+    out = []
+    for a in (state.get("liveAgents") or {}).values():
+        row = {"type": a["type"], "label": a["label"]}
+        for k in ("kind", "startedAt", "eta"):
+            if a.get(k) is not None:
+                row[k] = a[k]
+        out.append(row)
+    return out
 
 
 def _live_agent_resolve_id(state, agent_type, label):
@@ -10275,6 +10641,9 @@ def _workflow_agent_path(run_dir, agent_id):
 # such a stale req is exactly how a long-answered question keeps showing on the
 # card and re-opens in the chat; past this age we drop (and clean up) instead.
 QUESTION_STALE_AFTER_SEC = ASK_HOOK_TIMEOUT_SEC + 60
+# Ceiling on a req file read on the beat. ask.py caps every option preview at
+# 2000 chars, so a real request is a few KB; anything past this is not one.
+QUESTION_REQ_MAX_BYTES = 1 << 20
 
 
 def _hook_question(session_id):
@@ -10320,12 +10689,10 @@ def _hook_question(session_id):
     # Answer already delivered — the bridge is consuming it, not still asking.
     if os.path.exists(ans_path):
         return None
-    try:
-        with open(path, encoding="utf-8") as f:
-            req = json.load(f)
-    except (FileNotFoundError, ValueError, OSError):
-        return None
-    if not isinstance(req, dict):
+    # The questions dir is SESSION-writable, so this file is untrusted: a plain
+    # open() of a FIFO planted here would block the heartbeat forever (XERK-1562).
+    req = _read_untrusted_json(path, QUESTION_REQ_MAX_BYTES)
+    if req is None:
         return None
     question = str(req.get("question") or "")[:300] or None
     if not question:
@@ -15989,6 +16356,8 @@ TICKET_TRIAGE_INSTRUCTION = (
     "- actionable: true only if it is concrete engineering work a coding "
     "session can start on; false for pure discussion, design, meeting, "
     "access-request, or blocked work.\n"
+    "- A ROLLUP ticket (summary starting '[Rollup]', or labelled 'rollup') "
+    "is a list of findings, not work: actionable is always false.\n"
     "- dedupeOf: the key of ANOTHER ticket listed below that this one "
     "duplicates, or null.\n"
     "- reason: at most 12 words.\n\n"
@@ -25362,12 +25731,10 @@ class SessionManager:
         nothing is pending. The id lives IN that file rather than a separate map,
         so there is one source of truth and a restart cannot desync them."""
         req_path, _ = self._question_paths(sid)
-        try:
-            with open(req_path, encoding="utf-8") as f:
-                req = json.load(f)
-        except (OSError, ValueError):
-            return None
-        if not isinstance(req, dict):
+        # Session-writable rendezvous file, read on the beat (via
+        # _refresh_dsh_questions): never a plain open(), or a FIFO wedges it.
+        req = _read_untrusted_json(req_path, QUESTION_REQ_MAX_BYTES)
+        if req is None:
             return None
         rid = req.get("_dshRequestId")
         return str(rid) if rid else None

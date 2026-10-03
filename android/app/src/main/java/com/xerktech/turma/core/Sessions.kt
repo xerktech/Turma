@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.LiveAgent
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.PrInfo
 import com.xerktech.turma.model.SessionInfo
@@ -40,8 +41,13 @@ fun sessionWorking(session: SessionInfo, agentLastSeen: Long, now: Long): Boolea
     // idle while an agent was still running — and qualified as Ready for review,
     // buzzing the phone mid-run. Behind the offline gate for the same reason
     // paneBusy is: this too is a value on the record a host last pushed.
-    if (hasLiveAgents(s)) return true
+    //
+    // Only WORK rows count (XERK-1570): a background shell that is a sleep or a
+    // CI watch is the session WAITING, and must not keep it "working" forever.
+    if (hasLiveWork(s)) return true
     s.paneBusy?.let { return it }
+    // Every live row is a wait: waiting, not working — whatever freshness says.
+    if (hasLiveAgents(s)) return false
     return (age * 1000).toLong() + max(0, now - agentLastSeen) < WORKING_WINDOW_MS
 }
 
@@ -51,12 +57,66 @@ fun sessionWorking(session: SessionInfo, agentLastSeen: Long, now: Long): Boolea
  */
 fun hasLiveAgents(s: LiveSignals?): Boolean = !(s?.agents.isNullOrEmpty())
 
-enum class LiveState { WORKING, IDLE, WAITING, STOPPED }
+/** A background row that is WAITING (XERK-1570); no kind (an agent row, an older agent) is work. */
+fun isWaitAgent(a: LiveAgent): Boolean = a.kind == "wait-timed" || a.kind == "wait-external"
+
+/** Does this session have background WORK in flight — any row that is not a wait? */
+fun hasLiveWork(s: LiveSignals?): Boolean = s?.agents.orEmpty().any { !isWaitAgent(it) }
+
+/** The hub's ATTENTION_WAIT_STALL_MIN default and its ETA grace (turma/server.js). */
+private const val WAIT_STALL_MS = 45 * 60_000L
+private const val WAIT_ETA_GRACE_MS = 2 * 60_000L
+
+/** A session's background wait: [stalled] once past its ETA or silent too long; [eta] epoch ms. */
+data class BackgroundWait(val stalled: Boolean, val eta: Long?)
+
+/**
+ * Mirror of the hub's `backgroundWait` (turma/server.js): null with no wait rows;
+ * an ETA still ahead is waiting; past it (plus grace) with no transcript write
+ * since, or silent [WAIT_STALL_MS] with no ETA ahead, is stalled.
+ */
+fun backgroundWait(rows: List<LiveAgent>, lastWrite: Long, now: Long): BackgroundWait? {
+    val waits = rows.filter(::isWaitAgent)
+    if (waits.isEmpty()) return null
+    val eta = waits.mapNotNull { it.eta }.maxOrNull()
+    if (eta != null && eta > now) return BackgroundWait(stalled = false, eta = eta)
+    val overdue = eta != null && lastWrite < eta && now - eta >= WAIT_ETA_GRACE_MS
+    val silent = now - lastWrite >= WAIT_STALL_MS
+    return BackgroundWait(stalled = overdue || silent, eta = eta)
+}
+
+/** The hub's `sessionWait`: the wait read for a live, online, not-working session. */
+fun sessionWait(session: SessionInfo, agentLastSeen: Long, now: Long): BackgroundWait? {
+    val s = session.session ?: return null
+    val age = s.transcriptAgeSec ?: return null
+    if (now - agentLastSeen >= OFFLINE_AFTER_MS) return null
+    if (hasLiveWork(s) || s.paneBusy == true) return null
+    return backgroundWait(s.agents, agentLastSeen - (age * 1000).toLong(), now)
+}
+
+/** "45s" / "12m" / "1h 5m" / "2d" — the web's `ago()` buckets without "ago". */
+fun waitLeftText(ms: Long): String {
+    val s = max(0L, ms / 1000)
+    return when {
+        s < 60 -> "${s}s"
+        s < 3600 -> "${s / 60}m"
+        s < 86400 -> "${s / 3600}h ${(s % 3600) / 60}m"
+        else -> "${s / 86400}d"
+    }
+}
+
+/**
+ * HOLDING (XERK-1570): every live background row is a WAITING shell — not working,
+ * and not the operator's yet. A STALLED wait reads IDLE, so a dead shell surfaces
+ * in Ready for review like any finished session.
+ */
+enum class LiveState { WORKING, IDLE, WAITING, HOLDING, STOPPED }
 
 fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState = when {
     session.status != "running" -> LiveState.STOPPED
     (session.session?.question ?: "").isNotBlank() -> LiveState.WAITING
     sessionWorking(session, agentLastSeen, now) -> LiveState.WORKING
+    sessionWait(session, agentLastSeen, now)?.stalled == false -> LiveState.HOLDING
     else -> LiveState.IDLE
 }
 
@@ -96,7 +156,7 @@ fun prLanded(p: PrInfo): Boolean = p.state.uppercase().let { it == "MERGED" || i
  */
 fun readyForReview(session: SessionInfo, state: LiveState): Boolean {
     if (state == LiveState.WAITING) return true      // blocked on you either way
-    if (state != LiveState.IDLE) return false        // working, or not live at all
+    if (state != LiveState.IDLE) return false        // working, holding, or not live at all
     val sig = session.session ?: return false
     val prs = session.prs
     if (prs.any { !prLanded(it) }) return true      // an unlanded PR is a diff to read

@@ -169,6 +169,27 @@ class AgentDecodeTest {
         assertEquals("windows", resp.ticketPlatforms["acme.atlassian.net/ENG-1"]?.platform)
     }
 
+    // XERK-1570: a live shell row's kind/startedAt/eta are TYPED, so the hub's
+    // strict coercion is what keeps this decode safe; absent fields default.
+    @Test fun `a live shell row's kind, startedAt and eta decode, defaulting when absent`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+                "sessions": [ { "id": "s1", "session": { "agents": [
+                  { "sel": false, "type": "shell", "label": "Sleep", "kind": "wait-timed",
+                    "startedAt": 1700000000000, "eta": 1700000600000 },
+                  { "type": "Explore", "label": "Search" }
+                ] } } ] } ] }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val rows = resp.agents[0].sessions[0].session!!.agents
+        assertEquals("wait-timed", rows[0].kind)
+        assertEquals(1700000000000L, rows[0].startedAt)
+        assertEquals(1700000600000L, rows[0].eta)
+        assertEquals("", rows[1].kind)
+        assertNull(rows[1].startedAt)
+        assertNull(rows[1].eta)
+    }
+
     // XERK-544: the hub-derived auto-start-paused flag. Emitted only when true,
     // so the default `false` must cover an absent field (an older hub, or any
     // host not past the weekly pace line) — typing it makes a wrong value

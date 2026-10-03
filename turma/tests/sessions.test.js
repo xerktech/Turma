@@ -359,6 +359,36 @@ test("a background shell keeps a session Active and is named as a shell", () => 
   assert.ok(!els.idle.innerHTML.includes("Shell Wait"));
 });
 
+// XERK-1570: a WAITING shell (a sleep, a CI watch) is not work. A session whose
+// live rows are all waits is "holding" — Active, never Ready for review — until
+// it stalls, when it surfaces in Ready for review saying so.
+test("background shell kinds: waiting holds, stalled surfaces, work stays working", () => {
+  const { render, els } = loadPage();
+  const finished = { paneBusy: false, lastRole: "assistant", lastHasToolUse: false };
+  const { now, host: h } = host([
+    running("41111", "Sleeping Task", { ...finished, transcriptAgeSec: 5,
+      agents: [{ type: "shell", label: "Sleep", kind: "wait-timed", eta: Date.now() + 12 * 60 * 1000 + 30000 }] }),
+    running("42222", "CI Watcher", { ...finished, transcriptAgeSec: 5,
+      agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+    running("43333", "Dead Shell", { ...finished, transcriptAgeSec: 50 * 60,
+      agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+    running("44444", "Test Runner", { ...finished, transcriptAgeSec: 5,
+      agents: [{ type: "shell", label: "Run tests", kind: "work" },
+               { type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+  ]);
+  render({ now, agents: [h] });
+  const a = els.active.innerHTML, r = els.review.innerHTML;
+  // Holding: Active, labelled with the ETA or what it waits on, styled holding.
+  assert.ok(a.includes("Sleeping Task") && a.includes("waiting · 12m left"), a);
+  assert.ok(a.includes("CI Watcher") && a.includes("waiting · Watch CI"));
+  assert.ok(/state holding/.test(a));
+  assert.ok(!r.includes("Sleeping Task") && !r.includes("CI Watcher"));
+  // Stalled: Ready for review, keeping its own reason.
+  assert.ok(r.includes("Dead Shell") && r.includes("stalled · Watch CI"), r);
+  // A work shell beside a wait: working, named by its WORK rows only.
+  assert.ok(a.includes("Test Runner") && a.includes("1 background shell"));
+});
+
 // XERK-735. The card's second line reads repo · related ticket · pc name ·
 // session id, one line, and the ticket key links to that ticket's detail on the
 // board rather than out to Jira.

@@ -1,6 +1,9 @@
 import type { AgentInfo, PrInfo, SessionInfo, SessionRef } from "./types.ts";
 
-export type LiveState = "working" | "waiting" | "idle" | "stopped" | "error";
+// "holding" (XERK-1570): every live background row is a WAITING shell (a sleep,
+// a CI watch) — not working, and not the operator's yet. Stalled waits read
+// "idle", so a dead shell surfaces like any finished session.
+export type LiveState = "working" | "waiting" | "holding" | "idle" | "stopped" | "error";
 
 // "pending" is not a live-server state — it's an app-layer overlay app.ts
 // paints over a session's glyph right after queuing a mutation, until the
@@ -10,6 +13,9 @@ export type DisplayState = LiveState | "pending";
 const WORKING_WINDOW_MS = 90 * 1000;
 // Mirrors the hub's OFFLINE_AFTER_MS: beats arrive every ~20s.
 const OFFLINE_AFTER_MS = 75 * 1000;
+// The hub's ATTENTION_WAIT_STALL_MIN default and its ETA grace (server.js).
+const WAIT_STALL_MS = 45 * 60 * 1000;
+const WAIT_ETA_GRACE_MS = 2 * 60 * 1000;
 
 // Precedence: error > stopped > waiting > working > idle. "working" is read
 // straight off the session's TUI (paneBusy: the "esc to interrupt" hint is on
@@ -39,11 +45,47 @@ export function liveState(
   // delegated work and ended its own turn paints no interrupt hint, so it read
   // idle here while an agent was still running. Checked after the offline gate
   // for the same reason paneBusy is — this too is a value on a pushed record.
-  if (hasLiveAgents(live)) return "working";
+  //
+  // Only WORK rows count (XERK-1570): a waiting shell is not working.
+  if (hasLiveWork(live)) return "working";
   const working = live?.paneBusy != null
     ? live.paneBusy
-    : live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS;
-  return working ? "working" : "idle";
+    : !hasLiveAgents(live) && live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS;
+  if (working) return "working";
+  const t = now ?? Date.now();
+  const wait = backgroundWait(live?.agents, (hostLastSeen ?? t) - live.transcriptAgeSec * 1000, t);
+  return wait?.state === "waiting" ? "holding" : "idle";
+}
+
+type LiveAgentRow = NonNullable<NonNullable<SessionInfo["session"]>["agents"]>[number];
+
+// A background row that is WAITING (XERK-1570). No kind — an agent/workflow row,
+// or an agent predating the field — is work.
+export function isWaitRow(a: LiveAgentRow | null | undefined): boolean {
+  return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
+}
+
+// Does the session have background WORK in flight (any row that isn't a wait)?
+export function hasLiveWork(live: SessionInfo["session"]): boolean {
+  return (live?.agents ?? []).some((a) => !isWaitRow(a));
+}
+
+export interface BackgroundWait { state: "waiting" | "stalled"; eta: number | null }
+
+// Mirror of the hub's backgroundWait (server.js): null with no wait rows; an
+// ETA still ahead is waiting; past it (plus grace) with no transcript write
+// since, or silent WAIT_STALL_MS with no ETA ahead, is stalled.
+export function backgroundWait(rows: LiveAgentRow[] | undefined, lastWrite: number, now: number): BackgroundWait | null {
+  const waits = (rows ?? []).filter(isWaitRow);
+  if (!waits.length) return null;
+  let eta: number | null = null;
+  for (const a of waits) {
+    if (typeof a.eta === "number" && Number.isSafeInteger(a.eta) && (eta == null || a.eta > eta)) eta = a.eta;
+  }
+  if (eta != null && eta > now) return { state: "waiting", eta };
+  const overdue = eta != null && lastWrite < eta && now - eta >= WAIT_ETA_GRACE_MS;
+  const silent = now - lastWrite >= WAIT_STALL_MS;
+  return { state: overdue || silent ? "stalled" : "waiting", eta };
 }
 
 // Does the session have background agents in flight? Older agents report none,
@@ -80,7 +122,7 @@ export function readyForReview(
 ): boolean {
   const state = liveState(s, hostLastSeen, now);
   if (state === "waiting") return true;
-  if (state !== "idle") return false;
+  if (state !== "idle") return false;   // working, holding (XERK-1570), or not live
   const live = s.session;
   if (!live) return false;
   const prs = s.prs ?? [];
@@ -101,6 +143,7 @@ export function readyForReview(
 const GLYPHS: Record<DisplayState, string> = {
   working: "!",
   waiting: "?",
+  holding: "~",
   idle: "-",
   stopped: "o",
   error: "x",
