@@ -47,6 +47,8 @@ spec = importlib.util.spec_from_file_location("hub_agent", MODULE_PATH)
 ha = importlib.util.module_from_spec(spec)
 sys.modules["hub_agent"] = ha
 spec.loader.exec_module(ha)
+# The real run(), before ManagerMixin fakes it — for the tests that need git.
+_ORIG_RUN = ha.run
 
 
 # The shipped probe interval, captured before ManagerMixin patches it to 0 for
@@ -14743,14 +14745,28 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         gi = {"branch": live_branch or "HEAD", "dirtyFiles": dirty}
         work = {"baseRef": None, "aheadOfBase": None,
                 "pushed": pushed, "aheadOfRemote": ahead_remote}
+        # The poller decides on its OWN fresh read, staged on the cheap-git
+        # worker (XERK-1262) — never the card caches, which may predate the
+        # agent's last edit (XERK-1217). Those say "clean and in sync" here, so
+        # a nudge proves the fresh read is what was used.
+        sm.session_cheap = {"s1": {**gi, "dirtyFiles": 0}}
         sm.session_facts = {"s1": {"liveBranch": live_branch, "slow": {},
-                                   "work": work}}
-        # The poller must read the dirty count as of NOW (fresh=True): a full
-        # beat's cached read may predate the agent's last edit (XERK-1217), so
-        # the stub answers "clean" to anything that is not a fresh read.
-        sm._session_git = lambda sess_, refresh=False, fresh=False: (
-            gi if fresh else {**gi, "dirtyFiles": 0}, work)
+                                   "work": {**work, "pushed": True,
+                                            "aheadOfRemote": 0}}}
+        self._read_as(sm, dirty, live_branch, work)
+        self.staged = hold_cheap_refreshes(self, sm)
         return sess
+
+    def _read_as(self, sm, dirty, live_branch, work):
+        sm._open_pr_nudge_reader = lambda sess_: (
+            lambda path, strict=True: {"dirtyFiles": dirty,
+                                       "liveBranch": live_branch, "work": work})
+
+    def _poll(self, sm):
+        """One stage beat, the worker's read, then the next full beat's decide."""
+        sm._poll_open_pr_nudges(stage=True)
+        run_held_cheap_refreshes(sm, self.staged)
+        sm._poll_open_pr_nudges(stage=False)
 
     def _typed(self):
         return [data for _cmd, data in self.run_stdin_calls]
@@ -14760,7 +14776,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(len(self._typed()), 1)
         self.assertIn("feature-x", self._typed()[0])
         self.assertIn("uncommitted", self._typed()[0])
@@ -14771,8 +14787,8 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self._session(sm)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
-            sm._poll_open_pr_nudges()          # within PR_OPEN_NUDGE_RETRY_SEC
+            self._poll(sm)
+            self._poll(sm)          # within PR_OPEN_NUDGE_RETRY_SEC
         self.assertEqual(len(self._typed()), 1)
 
     def test_busy_session_is_not_nudged(self):
@@ -14780,7 +14796,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self._session(sm)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(True, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
 
     def test_unknown_pane_state_is_not_nudged(self):
@@ -14788,7 +14804,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self._session(sm)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(None, None, None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
 
     def test_unanswered_git_status_neither_nudges_nor_rearms(self):
@@ -14799,12 +14815,20 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm)
         sess["prOpenNudged"] = {"s1": {"attempts": 1, "at": 0}}
 
-        def stalled(sess_, refresh=False, fresh=False):
-            raise ha.GitTimeout("status")
-        sm._session_git = stalled
+        def stalled(sess_):
+            def read(path, strict=True):
+                raise ha.GitTimeout("status")
+            return read
+        sm._open_pr_nudge_reader = stalled
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            sm._poll_open_pr_nudges(stage=True)
+            # The worker skips a GitTimeout, so the read never lands.
+            for _a, _k, fn, path in list(self.staged):
+                with self.assertRaises(ha.GitTimeout):
+                    fn(path, strict=True)
+            self.staged.clear()
+            sm._poll_open_pr_nudges(stage=False)
         self.assertEqual(self._typed(), [])
         self.assertEqual(sess["prOpenNudged"], {"s1": {"attempts": 1, "at": 0}})
 
@@ -14821,8 +14845,9 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
                 sess["prOpenNudged"] = {"s1": {"attempts": 1, "at": 0}}
                 with mock.patch.object(ha, "_pane_status",
                                        return_value=(False, "auto", None)):
-                    sm._poll_open_pr_nudges()
+                    self._poll(sm)
                 self.assertEqual(self._typed(), [])
+                self.assertNotIn("s1", sm.nudge_reads, "the read was decided")
                 self.assertEqual(sess["prOpenNudged"],
                                  {"s1": {"attempts": 1, "at": 0}})
 
@@ -14833,7 +14858,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self._session(sm, dirty=2, pushed=None)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(len(self._typed()), 1)
 
     def test_blocking_dialog_is_not_nudged(self):
@@ -14841,7 +14866,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self._session(sm)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", "allow? y/n")):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
 
     def test_clean_worktree_is_not_nudged(self):
@@ -14849,7 +14874,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm, dirty=0, pushed=True, ahead_remote=0)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
 
     def test_live_background_agent_is_not_nudged(self):
@@ -14862,7 +14887,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
                                                       "label": "QA"}}}}
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
         self.assertNotIn("prOpenNudged", sess)
 
@@ -14874,7 +14899,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm.sess_state = {"s1": {"liveAgents": {}}}
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(len(self._typed()), 1)
 
     def test_unpushed_branch_is_nudged(self):
@@ -14882,7 +14907,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm, dirty=0, pushed=False, ahead_remote=0)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(len(self._typed()), 1)
         self.assertIn("never pushed", self._typed()[0])
 
@@ -14891,7 +14916,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm, dirty=0, pushed=True, ahead_remote=2)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(len(self._typed()), 1)
         self.assertIn("not yet on origin", self._typed()[0])
 
@@ -14901,7 +14926,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm.pr_status_cache = {self.URL: {"state": "OPEN"}}
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
 
     def test_unfetched_pr_is_treated_as_open(self):
@@ -14911,7 +14936,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm.pr_status_cache = {}
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
 
     def test_open_pr_clears_a_stale_episode(self):
@@ -14919,14 +14944,14 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()          # nudged, episode armed
+            self._poll(sm)          # nudged, episode armed
         self.assertIn("s1", sess["prOpenNudged"])
         # A PR now covers the work -> episode cleared.
         sm.session_pr_urls["s1"] = [self.URL]
         sm.pr_status_cache = {self.URL: {"state": "OPEN"}}
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertNotIn("prOpenNudged", sess)
         self.assertEqual(len(self._typed()), 1)
 
@@ -14935,17 +14960,15 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm)
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()          # nudged, episode armed
+            self._poll(sm)          # nudged, episode armed
         self.assertIn("s1", sess["prOpenNudged"])
         # Work delivered (clean tree, in sync) -> episode cleared.
-        sm.session_facts["s1"]["liveBranch"] = "feature-x"
-        sm._session_git = lambda s, refresh=False, fresh=False: (
-            {"branch": "feature-x", "dirtyFiles": 0},
-            {"baseRef": None, "aheadOfBase": None, "pushed": True,
-             "aheadOfRemote": 0})
+        self._read_as(sm, 0, "feature-x",
+                      {"baseRef": None, "aheadOfBase": None, "pushed": True,
+                       "aheadOfRemote": 0})
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertNotIn("prOpenNudged", sess)
         self.assertEqual(len(self._typed()), 1)
 
@@ -14955,7 +14978,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         for _ in range(ha.PR_OPEN_NUDGE_MAX_ATTEMPTS + 2):
             with mock.patch.object(ha, "_pane_status",
                                    return_value=(False, "auto", None)):
-                sm._poll_open_pr_nudges()
+                self._poll(sm)
             ep = sess.get("prOpenNudged", {}).get("s1")
             if ep:
                 ep["at"] = 0                  # age past the backoff
@@ -14967,7 +14990,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self._session(sm, status="stopped")
         with mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
 
     def test_dsh_running_session_is_not_nudged(self):
@@ -14978,7 +15001,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm)
         sess["agentType"] = "dsh"
         sm.dsh_status["s1"] = {"status": "running"}
-        sm._poll_open_pr_nudges()
+        self._poll(sm)
         self.assertEqual(self._typed(), [])
         self.assertNotIn("prOpenNudged", sess)
 
@@ -14989,7 +15012,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm.dsh_status["s1"] = {"status": "idle"}
         fake = _FakeDshControl()
         sm.dsh_controls["s1"] = fake
-        sm._poll_open_pr_nudges()
+        self._poll(sm)
         self.assertEqual(len(fake.inputs), 1)
         self.assertIn("feature-x", fake.inputs[0][0])
         self.assertEqual(fake.inputs[0][1], "machine")
@@ -15002,7 +15025,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sess = self._session(sm)
         sess["agentType"] = "dsh"
         sm.dsh_status["s1"] = {"status": "idle", "pendingInteraction": True}
-        sm._poll_open_pr_nudges()
+        self._poll(sm)
         self.assertEqual(self._typed(), [])
         self.assertNotIn("prOpenNudged", sess)
 
@@ -15010,7 +15033,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._session(sm)
         sess["agentType"] = "dsh"
-        sm._poll_open_pr_nudges()
+        self._poll(sm)
         self.assertEqual(self._typed(), [])
         self.assertNotIn("prOpenNudged", sess)
 
@@ -15024,10 +15047,144 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
                                return_value=(False, "auto", None)), \
              mock.patch.object(ha, "_post_to_inbox",
                                side_effect=lambda *a: posts.append(a) or True):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
         self.assertIn("feature-x", posts[0][3])
         self.assertEqual(sess["prOpenNudged"]["s1"]["attempts"], 1)
+
+    def test_the_beat_never_reads_git_itself(self):
+        """XERK-1262: the stage beat only QUEUES the read, and nothing is
+        decided until it lands — the old inline fresh read put a dirty walk and
+        a ref walk per idle session on the beat, each bounded only by 15s."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges(stage=True)
+            self.assertEqual([j[:2] for j in self.staged], [("nudge_reads", "s1")])
+            sm._poll_open_pr_nudges(stage=False)     # read not landed yet
+            self.assertEqual(self._typed(), [])
+            run_held_cheap_refreshes(sm, self.staged)
+            sm._poll_open_pr_nudges(stage=False)
+        self.assertEqual(len(self._typed()), 1)
+        self.assertNotIn("s1", sm.nudge_reads, "a read is decided once")
+        self.assertEqual(sess["prOpenNudged"]["s1"]["attempts"], 1)
+
+    def test_a_session_that_went_busy_before_the_read_landed_is_not_nudged(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges(stage=True)
+        run_held_cheap_refreshes(sm, self.staged)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(True, "auto", None)):
+            sm._poll_open_pr_nudges(stage=False)
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("prOpenNudged", sess)
+        self.assertNotIn("s1", sm.nudge_reads)
+
+    def test_a_timed_out_read_stays_pending_and_is_re_staged(self):
+        """A strict read that times out leaves no answer, never a "clean" one:
+        nothing is decided, and the next stage beat queues it again."""
+        sm = self.make_manager()
+        self._session(sm)
+
+        def stalled(sess_):
+            def read(path, strict=True):
+                raise ha.GitTimeout("status")
+            return read
+        sm._open_pr_nudge_reader = stalled
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges(stage=True)
+            for _a, _k, fn, path in list(self.staged):
+                with self.assertRaises(ha.GitTimeout):
+                    fn(path, strict=True)        # what the worker skips
+            self.staged.clear()
+            sm._poll_open_pr_nudges(stage=False)
+            self.assertEqual(self._typed(), [])
+            self.assertIn("s1", sm.nudge_reads)
+            sm._poll_open_pr_nudges(stage=True)
+        self.assertEqual([j[:2] for j in self.staged], [("nudge_reads", "s1")])
+
+    def test_the_reader_publishes_to_the_card_caches(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": "/w/s1", "repoPath": "/x/A",
+                "baseRef": "origin/main"}
+        sm.session_cheap = {"s1": {"branch": "HEAD", "dirtyFiles": 0}}
+        sm.session_facts = {"s1": {"liveBranch": None, "slow": {}, "work": None}}
+        work = {"baseRef": "origin/main", "aheadOfBase": 1, "pushed": False,
+                "aheadOfRemote": None}
+        with mock.patch.object(ha, "git_info_cheap",
+                               return_value={"branch": "feat", "dirtyFiles": 3}), \
+             mock.patch.object(ha, "git_info_slow", return_value={"repoName": "A"}), \
+             mock.patch.object(ha, "branch_sync", return_value=work) as sync:
+            got = sm._open_pr_nudge_reader(sess)("/w/s1")
+        self.assertEqual(got, {"dirtyFiles": 3, "liveBranch": "feat", "work": work})
+        sync.assert_called_once_with("/x/A", "feat", "origin/main")
+        self.assertEqual(sm.session_cheap["s1"]["branch"], "feat")
+        self.assertEqual(sm.session_facts["s1"]["liveBranch"], "feat")
+
+    def test_cold_start_reader_uses_its_own_branch_not_the_card_cache(self):
+        """The poller runs before the session's payload in build_payload, so
+        on a cold start session_cheap has no entry yet. Facts built from it
+        read a never-pushed branch as delivered and re-armed the attempt cap
+        on every restart."""
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": "/w/s1", "repoPath": "/x/A",
+                "baseRef": "origin/main"}
+        sm.session_cheap, sm.session_facts = {}, {}
+        with mock.patch.object(ha, "git_info_cheap",
+                               return_value={"branch": "feat", "dirtyFiles": 0}), \
+             mock.patch.object(ha, "git_info_slow", return_value={}), \
+             mock.patch.object(ha, "branch_sync",
+                               side_effect=lambda r, br, b: {"pushed": False}
+                               if br else {"pushed": None}):
+            got = sm._open_pr_nudge_reader(sess)("/w/s1")
+        self.assertEqual(got["liveBranch"], "feat")
+        self.assertIs(got["work"]["pushed"], False)
+
+    def test_the_reader_is_strict_so_a_stall_is_never_clean(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": "/w/s1", "repoPath": "/x/A"}
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("git", 15)):
+            with self.assertRaises(ha.GitTimeout):
+                sm._open_pr_nudge_reader(sess)("/w/s1")
+
+    def test_a_landed_read_does_not_survive_a_status_bounce(self):
+        """A read that landed, then the session errored, its work was
+        delivered, and it came back: the old read must not be decided."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges(stage=True)
+            run_held_cheap_refreshes(sm, self.staged)
+            sess["status"] = "error"
+            sm._poll_open_pr_nudges(stage=False)
+            sess["status"] = "running"
+            sm._poll_open_pr_nudges(stage=False)
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("s1", sm.nudge_reads)
+
+    def test_a_record_without_a_worktree_is_never_read(self):
+        """git with cwd=None reads the AGENT's own cwd."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        del sess["worktreePath"]
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges(stage=True)
+        self.assertEqual(self.staged, [])
+
+    def test_kill_forgets_a_pending_read(self):
+        sm = self.make_manager()
+        self._session(sm)
+        sm.nudge_reads = {"s1": None, "s2": None}
+        sm._forget_session_caches("s1")
+        self.assertEqual(list(sm.nudge_reads), ["s2"])
 
     def test_disabled_by_env_flag(self):
         sm = self.make_manager()
@@ -15035,7 +15192,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "PR_OPEN_NUDGE", False), \
              mock.patch.object(ha, "_pane_status",
                                return_value=(False, "auto", None)):
-            sm._poll_open_pr_nudges()
+            self._poll(sm)
         self.assertEqual(self._typed(), [])
 
 
@@ -18275,14 +18432,23 @@ class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):
 
     def test_repo_slow_facts_cached_and_recomputed_on_cadence(self):
         sm = self.make_manager()
+        staged = hold_cheap_refreshes(self, sm)
         computed = []
         with mock.patch.object(ha, "repo_slow_facts",
                                lambda path: computed.append(path) or {"remote": path}):
-            self.assertEqual(sm._repo_slow_facts("/x/R", refresh=False), {"remote": "/x/R"})
-            self.assertEqual(computed, ["/x/R"])        # first sight -> computed
-            sm._repo_slow_facts("/x/R", refresh=False)  # cached -> not recomputed
-            self.assertEqual(computed, ["/x/R"])
-            sm._repo_slow_facts("/x/R", refresh=True)   # slow cadence -> recomputed
+            # First sight serves empty facts and stages the read (XERK-1262):
+            # the beat never computes them itself.
+            first = sm._repo_slow_facts("/x/R", refresh=False)
+            self.assertEqual(first["remote"], "")
+            self.assertEqual(first["branches"], [])
+            self.assertEqual(computed, [])
+            run_held_cheap_refreshes(sm, staged)
+            self.assertEqual(computed, ["/x/R"])        # the worker computed them
+            self.assertEqual(sm._repo_slow_facts("/x/R", refresh=False),
+                             {"remote": "/x/R"})
+            self.assertEqual(staged, [])                # cached -> not re-staged
+            sm._repo_slow_facts("/x/R", refresh=True)   # slow cadence -> re-staged
+            run_held_cheap_refreshes(sm, staged)
             self.assertEqual(computed, ["/x/R", "/x/R"])
 
     def test_session_git_caches_slow_and_recomputes_on_branch_change(self):
@@ -18297,18 +18463,48 @@ class TestBuildPayloadCaching(ManagerMixin, unittest.TestCase):
              mock.patch.object(ha, "branch_sync",
                                lambda repo, br, base: sync_calls.append(br) or {"baseRef": base}):
             self._branch = "HEAD"          # still detached
+            # First sight: placeholders, nothing read on the beat (XERK-1262).
             gi, work = sm._session_git(sess, refresh=False)
-            self.assertEqual(gi, {"branch": "HEAD", "remote": "r"})
-            self.assertEqual(len(slow_calls), 1)       # first sight -> computed
+            self.assertIsNone(gi)
+            self.assertIsNone(work)
+            self.assertEqual(slow_calls, [])
+            run_held_cheap_refreshes(sm, staged)       # cheap, then slow facts
+            self.assertEqual(len(slow_calls), 1)
 
             gi, work = sm._session_git(sess, refresh=False)
+            self.assertEqual(gi, {"branch": "HEAD", "remote": "r"})
+            run_held_cheap_refreshes(sm, staged)       # cheap re-read only
             self.assertEqual(len(slow_calls), 1)       # cached, no recompute
 
             self._branch = "feature-x"     # agent just named its work branch
-            run_held_cheap_refreshes(sm, staged)       # the worker reads it
             sm._session_git(sess, refresh=False)
+            run_held_cheap_refreshes(sm, staged)       # the worker reads it
+            sm._session_git(sess, refresh=False)       # branch moved -> re-stage
+            run_held_cheap_refreshes(sm, staged)
             self.assertEqual(len(slow_calls), 2)       # branch change -> recompute
             self.assertEqual(sync_calls[-1], "feature-x")
+            gi, _work = sm._session_git(sess, refresh=False)
+            self.assertEqual(gi["branch"], "feature-x")
+
+    def test_first_sight_facts_use_the_branch_the_worker_just_read(self):
+        """The slow-facts job reads the live branch when it RUNS, so the cold
+        start converges in one worker pass, not two beats."""
+        sm = self.make_manager()
+        sess = self._session("aaa")
+        staged = hold_cheap_refreshes(self, sm)
+        sync_calls = []
+        with mock.patch.object(ha, "git_info_cheap",
+                               lambda wt, strict=False: {"branch": "feat",
+                                                         "dirtyFiles": 0}), \
+             mock.patch.object(ha, "git_info_slow", lambda wt: {}), \
+             mock.patch.object(ha, "branch_sync",
+                               lambda repo, br, base: sync_calls.append(br) or {}):
+            sm._session_git(sess, refresh=False)
+            self.assertEqual([j[0] for j in staged],
+                             ["session_cheap", "session_facts"])
+            run_held_cheap_refreshes(sm, staged)
+        self.assertEqual(sync_calls, ["feat"])
+        self.assertEqual(sm.session_facts["aaa"]["liveBranch"], "feat")
 
 
 class TestNormalizeGithubRepo(unittest.TestCase):
@@ -22409,17 +22605,25 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(got, {"branch": "main", "dirtyFiles": 0})
         self.assertEqual([j[:2] for j in staged], [("repo_cheap", "/x/A")])
 
-    def test_first_sight_and_fresh_read_inline(self):
+    def test_first_sight_seeds_the_default_and_stages_even_on_a_light_beat(self):
+        """XERK-1262: the cold-start beat read every repo and session inline
+        (121s on a stalled host). First sight now serves `default` and leaves
+        the read to the worker — on a light beat too, or nothing would fill it."""
         sm = self.make_manager()
         staged = hold_cheap_refreshes(self, sm)
         reads = []
         fn = lambda p, strict=False: reads.append(p) or {"branch": "b",
-                                                          "dirtyFiles": len(reads)}
-        sm._cheap_read("session_cheap", "s1", fn, "/w/s1")          # first sight
-        got = sm._cheap_read("session_cheap", "s1", fn, "/w/s1", fresh=True)
-        self.assertEqual(reads, ["/w/s1", "/w/s1"])
-        self.assertEqual(got["dirtyFiles"], 2)
-        self.assertEqual(sm.session_cheap["s1"]["dirtyFiles"], 2)
+                                                          "dirtyFiles": 1}
+        got = sm._cheap_read("session_cheap", "s1", fn, "/w/s1", refresh=False,
+                             default="placeholder")
+        self.assertEqual(got, "placeholder")
+        self.assertEqual(reads, [])
+        self.assertEqual([j[:2] for j in staged], [("session_cheap", "s1")])
+        run_held_cheap_refreshes(sm, staged)
+        self.assertEqual(reads, ["/w/s1"])
+        self.assertEqual(sm._cheap_read("session_cheap", "s1", fn, "/w/s1",
+                                        refresh=False),
+                         {"branch": "b", "dirtyFiles": 1})
         self.assertEqual(staged, [])
 
     def test_the_worker_refreshes_the_cache_off_the_beat(self):
@@ -22472,15 +22676,15 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "git_info_cheap") as cheap:
             got = sm._cheap_read("session_cheap", "s1", ha.git_info_cheap, "/w/s1")
             sm._cheap_read("session_cheap", "s1", ha.git_info_cheap, "/w/s1",
-                           light=True)
+                           refresh=False)
         cheap.assert_not_called()
         self.assertIsNone(got)
         self.assertEqual(len(staged), 1)
 
     def test_a_timed_out_read_keeps_the_last_answer(self):
         """run() folds a timeout into the same answer as "not a worktree" /
-        "clean", so strict reads raise GitTimeout and every path — the worker,
-        the poller's fresh read — keeps the last real answer instead."""
+        "clean", so strict reads raise GitTimeout and the worker keeps the last
+        real answer instead."""
         sm = self.make_manager()
         good = {"branch": "feat", "dirtyFiles": 2}
         sm.session_cheap = {"s1": good}
@@ -22497,10 +22701,6 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         sm._stage_cheap_refresh("session_cheap", "s2",
                                 lambda p, strict=False: done.set(), "/w/s2")
         self.assertTrue(done.wait(5))
-        self.assertEqual(sm.session_cheap["s1"], good)
-        # A fresh caller wants NOW, so the stale answer is not one (XERK-1263).
-        with self.assertRaises(ha.GitTimeout):
-            sm._cheap_read("session_cheap", "s1", stalled, "/w/s1", fresh=True)
         self.assertEqual(sm.session_cheap["s1"], good)
 
     def test_a_failed_status_is_no_answer_not_clean(self):
@@ -22554,20 +22754,20 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
         rev-parse at once, and that must still read as gone."""
         sm = self.make_manager()
         sm.session_cheap = {"s1": {"branch": "feat", "dirtyFiles": 0}}
+        staged = hold_cheap_refreshes(self, sm)
+        sm._cheap_read("session_cheap", "s1", ha.git_info_cheap, "/w/s1")
         with mock.patch.object(ha.subprocess, "run", return_value=mock.Mock(
                 returncode=128, stdout="")):
-            got = sm._cheap_read("session_cheap", "s1", ha.git_info_cheap,
-                                 "/w/s1", fresh=True)
-        self.assertIsNone(got)
+            run_held_cheap_refreshes(sm, staged)
         self.assertIsNone(sm.session_cheap["s1"])
 
-    def test_first_sight_timeout_reports_the_default_and_retries_off_the_beat(self):
+    def test_first_sight_never_spawns_git_on_the_beat(self):
         sm = self.make_manager()
         staged = hold_cheap_refreshes(self, sm)
-        with mock.patch.object(ha.subprocess, "run",
-                               side_effect=subprocess.TimeoutExpired("git", 15)):
+        with mock.patch.object(ha.subprocess, "run") as spawn:
             got = sm._cheap_read("repo_cheap", "/x/A", ha.repo_cheap_facts, "/x/A",
                                  default={"branch": "", "dirtyFiles": 0})
+        spawn.assert_not_called()
         self.assertEqual(got, {"branch": "", "dirtyFiles": 0})
         self.assertEqual([j[:2] for j in staged], [("repo_cheap", "/x/A")])
 
@@ -22591,6 +22791,61 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
                                side_effect=RuntimeError("can't start new thread")):
             sm._stage_cheap_refresh("repo_cheap", "/x/A", lambda p: {}, "/x/A")
         self.assertIn(("repo_cheap", "/x/A"), sm._cheap_due)
+
+    def test_no_beat_spawns_git_on_the_beat_thread(self):
+        """XERK-1262: the cold-start beat (every repo and session at first
+        sight), the slow-cadence beat, and the open-PR poller each still ran
+        git inline after XERK-1217 — 27, 19 and 7 spawns on a two-repo,
+        one-session host, each bounded only by run()'s 15s. Real repos, real
+        git; only spawns from the beat's own thread count."""
+        root = os.path.join(self.tmp, "repos-1262")
+        repos = []
+        for name in ("A", "B"):
+            path = os.path.join(root, name)
+            subprocess.run(["git", "init", "-q", path], check=True)
+            repos.append({"name": name, "path": path})
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "tmuxName": "agent-s1",
+                "worktreePath": repos[0]["path"], "repoPath": repos[0]["path"],
+                "repo": "A", "baseRef": "origin/main"}
+        sm.registry = [sess]
+        beat_thread = threading.current_thread()
+        inline = []
+        real_spawn = subprocess.run
+
+        def spawn(cmd, *a, **kw):
+            if (isinstance(cmd, (list, tuple)) and cmd and cmd[0] == "git"
+                    and threading.current_thread() is beat_thread):
+                inline.append(cmd)
+            return real_spawn(cmd, *a, **kw)
+
+        with mock.patch.object(ha, "run", _ORIG_RUN), \
+             mock.patch.object(ha.subprocess, "run", spawn), \
+             mock.patch.object(ha, "scan_repos", return_value=repos), \
+             mock.patch.object(ha, "REPOS_ROOT", root), \
+             mock.patch.object(ha, "PR_OPEN_NUDGE", True), \
+             mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._sorted_repo_entries(refresh=False)          # cold start
+            sm._session_payload(sess, refresh=False)
+            self.assertEqual(inline, [], "cold start")
+            sm._sorted_repo_entries(refresh=True)           # slow cadence
+            sm._session_payload(sess, refresh=True)
+            self.assertEqual(inline, [], "slow cadence")
+            sm._poll_open_pr_nudges(stage=True)             # open-PR poller
+            sm._poll_open_pr_nudges(stage=False)
+            self.assertEqual(inline, [], "open-PR poller")
+            # ...and the worker still fills every cache it was handed.
+            for _ in range(500):
+                with sm._cheap_lock:
+                    idle = not sm._cheap_due
+                if (idle and sm.session_facts["s1"]["slow"]
+                        and sm.repo_facts[repos[0]["path"]]["branches"] is not None
+                        and sm.session_cheap["s1"] is not None):
+                    break
+                time.sleep(0.01)
+        self.assertEqual(sm.session_cheap["s1"]["dirtyFiles"], 0)
+        self.assertEqual(sm.session_facts["s1"]["slow"]["repoName"], "A")
 
 
 @unittest.skipUnless(
@@ -22622,6 +22877,8 @@ class TestLightBeatCost(ManagerMixin, unittest.TestCase):
                                side_effect=lambda remote=None, cheap=None: {"name": "(root)"}), \
              mock.patch.object(sm, "_root_repo_remote", return_value=""):
             first = sm._sorted_repo_entries(refresh=False)
+            self.assertEqual(calls, [], "first sight reads on the worker")
+            run_held_cheap_refreshes(sm, staged)
             self.assertEqual(calls, ["/x/A"])
             light = sm._sorted_repo_entries(refresh=False, light=True)
             self.assertEqual(calls, ["/x/A"], "a light beat must not re-spawn")
@@ -22656,13 +22913,17 @@ class TestLightBeatCost(ManagerMixin, unittest.TestCase):
             calls.append(path)
             return {"branch": "feat", "dirtyFiles": 2}
 
+        staged = hold_cheap_refreshes(self, sm)
         with mock.patch.object(ha, "git_info_cheap", side_effect=fake_cheap), \
              mock.patch.object(ha, "git_info_slow", return_value={}), \
              mock.patch.object(ha, "branch_sync", return_value={}), \
              mock.patch.object(ha, "run", return_value="main"):
-            gi, _work = sm._session_git(sess, refresh=False)
+            sm._session_git(sess, refresh=False)
+            run_held_cheap_refreshes(sm, staged)
+            gi, _work = sm._session_git(sess, refresh=False, light=True)
             self.assertEqual(gi["branch"], "feat")
             gi2, _ = sm._session_git(sess, refresh=False, light=True)
+            self.assertEqual(staged, [])
         self.assertEqual(calls, ["/w/s1"])
         self.assertEqual(gi2["branch"], "feat")
         # The caller mutates the returned dict (it folds the slow facts in), so a
@@ -22683,11 +22944,17 @@ class TestLightBeatCost(ManagerMixin, unittest.TestCase):
 
     def test_root_remote_is_cached_across_beats_and_refreshed_on_cadence(self):
         sm = self.make_manager()
+        staged = hold_cheap_refreshes(self, sm)
         with mock.patch.object(ha, "run", return_value="origin-url") as runner:
+            # "" (never None: root_repo_entry reads None inline) until the
+            # worker's read lands (XERK-1262).
+            self.assertEqual(sm._root_repo_remote(refresh=False), "")
+            self.assertEqual(runner.call_count, 0)
+            run_held_cheap_refreshes(sm, staged)
             self.assertEqual(sm._root_repo_remote(refresh=False), "origin-url")
-            sm._root_repo_remote(refresh=False)     # cached
-            self.assertEqual(runner.call_count, 1)
+            self.assertEqual(runner.call_count, 1)  # cached
             sm._root_repo_remote(refresh=True)      # slow cadence -> re-read
+            run_held_cheap_refreshes(sm, staged)
             self.assertEqual(runner.call_count, 2)
 
 
