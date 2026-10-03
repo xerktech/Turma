@@ -51,6 +51,10 @@ hook-log tail) + `agent/hooks/permlog.py`.
     through that option's label (`via:"turma"`), else the call's result (`tool_call_outcome`: a
     refusal's words → `deny`, any other result → `allow`, `via:"terminal"`), else `allow` if the pane
     went busy with no result yet (it is running), else `unknown`.
+  - **"A refusal's words" are Claude Code's OWN, anchored at the result's start**
+    (`_PERMISSION_DENIED_RESULT_RE`: "The user doesn't want to proceed…", "Permission for this … was
+    denied", "Permission to use … has been denied", "User rejected"). Never a bare `denied`/`not
+    allowed`: an APPROVED call that failed (`Permission denied`, `push … not allowed`) ran — an allow.
   - **`PermissionRequest` carries NO `tool_use_id`** (Claude Code 2.1.288: the binary builds it from
     `tool_name`/`tool_input`/`permission_suggestions` only, confirmed by a live hook dumping its stdin;
     `PermissionDenied` and `PreToolUse` do carry one). So its row merges into a dialog on the CALL
@@ -84,8 +88,9 @@ hook-log tail) + `agent/hooks/permlog.py`.
     trailing entry of another role (a `system` line) is not an answer.
 - **A session that leaves `running`** without a kill/delete (exited, errored, stopped) closes its
   open rows on the next beat (`_permission_close_departed`), as kill/delete already did.
-- **Accepted: a manager restart re-files a live dialog.** `_perm_open` is in memory, so a dialog up
-  across a restart stays open on the hub under its old id and is opened again under a new one.
+- **A manager restart re-files a live dialog.** `_perm_open` is in memory, so a dialog up across a
+  restart is opened again under a new id. The HUB closes the orphan (`closeSuperseded`, answer and
+  wait unknown — `turma-permissions.md`); the prompt still counts twice and its pre-restart wait is lost.
 - **A sandbox escape is not hookable at all** — the pane is its only source.
 - **Open question (record the answer here):** what the TUI shows for a classifier block. The first
   week of real data answers it; until then nothing assumes it shows a dialog.

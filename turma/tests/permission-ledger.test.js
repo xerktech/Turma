@@ -85,6 +85,39 @@ test("ingest: a row id seen again REPLACES the stored row (open, then closed)", 
   assert.equal(m.get("d-1").answer, "allow");
 });
 
+test("ingest: a newer dialog row for a session closes that session's row left open", () => {
+  // The agent restarted with a prompt up: its old row was never closed, and the
+  // same prompt is filed again under a new id.
+  const open = { closedAt: undefined, waitedMs: undefined, answer: undefined, via: undefined,
+    sessionId: "s1" };
+  ledger.ingest("h1", [row("d-s1-1", { ...open, openedAt: NOW - 10 * MIN }),
+    row("d-s2-1", { ...open, sessionId: "s2", openedAt: NOW - 10 * MIN }),
+    // answered between beats: never closed, but not open either — left alone
+    row("d-s1-0", { ...open, answer: "allow", openedAt: NOW - 20 * MIN })], NOW);
+  ledger.ingest("h2", [row("d-s1-x", { ...open, openedAt: NOW - 10 * MIN })], NOW);
+  const changed = [];
+  const orig = ledger._internals.getBackend();
+  ledger._internals.setBackend({ onChange: (host, rows) => changed.push([host, rows.map((r) => r.id)]) });
+  try {
+    ledger.ingest("h1", [row("d-s1-2", { ...open, openedAt: NOW - MIN })], NOW);
+  } finally { ledger._internals.setBackend(orig); }
+  const m = ledger._internals.hosts().get("h1");
+  const old = m.get("d-s1-1");
+  assert.equal(old.closedAt, NOW - MIN);
+  assert.deepEqual([old.answer, old.via, old.waitedMs], ["unknown", "unknown", undefined]);
+  assert.equal(m.get("d-s1-2").closedAt, undefined, "the new row stays open");
+  assert.equal(m.get("d-s2-1").closedAt, undefined, "another session's row is untouched");
+  assert.equal(m.get("d-s1-0").closedAt, undefined);
+  assert.equal(ledger._internals.hosts().get("h2").get("d-s1-x").closedAt, undefined,
+    "another host's session is untouched");
+  assert.deepEqual(changed, [["h1", ["d-s1-2", "d-s1-1"]]], "the closed copy is persisted too");
+  const g = aggregate({ now: NOW }).top.find((t) => t.head === "npm test");
+  assert.equal(g.open, 3);         // d-s1-2, d-s2-1, d-s1-x — no longer the lost d-s1-1
+  // A real closed copy arriving later still replaces the synthetic close.
+  ledger.ingest("h1", [row("d-s1-1", { sessionId: "s1", openedAt: NOW - 10 * MIN })], NOW);
+  assert.equal(m.get("d-s1-1").answer, "allow");
+});
+
 test("ingest: at most EVENTS_PER_BEAT rows a beat; junk hosts refused", () => {
   const many = Array.from({ length: ledger.EVENTS_PER_BEAT + 50 }, (_, i) =>
     row(`x${i}`, { openedAt: NOW - i }));
@@ -172,7 +205,13 @@ test("suggestedRule: never an allow-everything or malformed Bash prefix rule", (
     "poetry", "pipx", "pdm", "hatch", "conda", "mamba", "micromamba", "nix", "nix-shell",
     "mise", "asdf", "direnv", "java", "julia", "Rscript", "tclsh",
     "cmd", "cmd.exe", "powershell.exe", "pwsh.exe", "wsl", "wsl.exe",
-    "/usr/bin/stdbuf"]) {
+    "/usr/bin/stdbuf",
+    // …another name for a listed interpreter or exec, and a versioned or .exe
+    // interpreter binary (permlog heads `python3.11 -c …` as `python3.11`).
+    "nodejs", "pypy", "pypy3", "ipython", "bpython", "luajit", "gawk", "mawk", "nawk",
+    "pnpx", "uv tool", "yarn node", "dotnet exec",
+    "python3.11", "/usr/bin/python3.11", "python3.12", "php8.2", "perl5.36", "node22",
+    "lua5.4", "ruby3.2", "tclsh8.6", "python.exe", "node.exe", "bash5"]) {
     assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
     assert.equal(suggestedRule({ kind: "classifier-denied", tool: "Bash", head }), null, head);
   }
@@ -190,7 +229,7 @@ test("suggestedRule: never an allow-everything or malformed Bash prefix rule", (
   }
   // Ordinary commands keep their rule.
   for (const head of ["npm test", "./gradlew test", "bun test", "go test", "git status",
-    "pytest", "ls"]) {
+    "pytest", "ls", "md5sum", "s3cmd", "uv sync", "yarn test"]) {
     assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), `Bash(${head}:*)`, head);
   }
 });

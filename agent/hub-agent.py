@@ -11223,10 +11223,22 @@ PERMISSION_TEXT_MAX = 300
 # row costs a ledger line, never an action.
 PERMISSION_ASK_RE = re.compile(
     r"\b(?:permission|may i|should i proceed|let me know if)\b", re.IGNORECASE)
-# What a refused call's tool_result says (manual "No", a deny rule, a rejected
-# edit). Anything else that came back ran.
+# What a refused call's tool_result says — Claude Code's OWN rejection wording,
+# anchored at the start of the result: the dialog's "No" ("The user doesn't want
+# to proceed with this tool use. The tool use was rejected …"), a refused
+# permission ("Permission for this tool use was denied." / "Permission for this
+# action has been denied. Reason: …" / "Permission to use Bash with command …
+# has been denied."), a rejected plan ("User rejected …"). Never a bare "denied"
+# or "not allowed": a call the operator APPROVED that then failed says those
+# all the time (`Permission denied`, `push … is not allowed`), and reading that
+# as a deny skews the very allowed/denied count the ledger exists to measure.
+# Anything else that came back ran.
 _PERMISSION_DENIED_RESULT_RE = re.compile(
-    r"doesn't want to proceed|was rejected|\bdenied\b|not allowed|user rejected",
+    r"^\s*(?:<tool_use_error>\s*)?(?:"
+    r"the user doesn't want to proceed with this tool use"
+    r"|permission for this (?:tool use|action) (?:was|has been) denied"
+    r"|permission to (?:use|read|write|edit) [^\n]{0,2000}? has been denied"
+    r"|user rejected\b)",
     re.IGNORECASE)
 _PERMISSION_HOST_RE = re.compile(
     r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})\b", re.IGNORECASE)

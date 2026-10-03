@@ -37006,6 +37006,42 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
                          ("allow", "terminal"))
 
+    def test_an_approved_call_that_failed_is_still_an_allow(self):
+        # Only Claude Code's own rejection wording reads deny: a call the
+        # operator approved that then failed with ordinary error text ran.
+        n = 0
+        for text in ("Exit code 1\ncat: /etc/shadow: Permission denied",
+                     "error: push to main is not allowed by branch protection",
+                     "permission denied while trying to connect to the Docker daemon socket",
+                     "git@github.com: Permission denied (publickey).",
+                     "ERROR: Permission to acme/x.git denied to bot."):
+            n += 1
+            tuid = f"toolu_f{n}"
+            self.write(self.tool_use(tuid))
+            self.edge(self.dialog(), at=n * 1000)
+            self.write(self.tool_result(tuid, text, True))
+            self.edge(None, at=n * 1000 + 500)
+            self.assertEqual(self.rows()[-1]["answer"], "allow", text)
+
+    def test_claude_codes_own_rejections_read_deny(self):
+        for text in (
+                "The user doesn't want to proceed with this tool use. The tool use "
+                "was rejected (eg. if it was a file edit, the new_string was NOT "
+                "written to the file).",
+                "Permission for this tool use was denied. The tool use was rejected.",
+                "Permission for this action has been denied. Reason: outside scope",
+                "Permission to use Bash with command rm -rf x has been denied.",
+                "<tool_use_error>Permission to use Bash with command x has been "
+                "denied.</tool_use_error>",
+                "User rejected Claude's plan:"):
+            entries = [self.tool_use("toolu_x"), self.tool_result("toolu_x", text, True)]
+            self.assertEqual(ha.tool_call_outcome(entries, "toolu_x"), "deny", text)
+        # The wording mid-result (quoted in a command's output) is not a refusal.
+        entries = [self.tool_use("toolu_y"), self.tool_result(
+            "toolu_y", "Exit code 1\nThe user doesn't want to proceed with this tool use.",
+            True)]
+        self.assertEqual(ha.tool_call_outcome(entries, "toolu_y"), "allow")
+
     def test_no_result_yet_reads_allow_only_while_the_pane_is_busy(self):
         self.write(self.tool_use("toolu_1"))
         self.edge(self.dialog(), at=1000)

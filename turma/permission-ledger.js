@@ -217,9 +217,35 @@ function ingest(host, events, now = Date.now()) {
   let m = hosts.get(host);
   if (!m) hosts.set(host, (m = new Map()));
   for (const row of kept) m.set(row.id, row);
+  const closed = closeSuperseded(m, kept);
   evict(now);
-  backend.onChange(host, kept);
+  backend.onChange(host, closed.length ? [...kept.filter((r) => m.get(r.id) === r), ...closed] : kept);
   return kept.length;
+}
+
+// A session shows ONE dialog at a time, and the agent closes its open row before
+// it opens the next — so a newer dialog row for a session means any older row of
+// that session still open here has ended. It stays open only when the agent
+// lost it (a manager restart forgets its open rows, and files the still-showing
+// prompt again under a new id), and would otherwise read "open" for the whole
+// retention window. Closed with the answer and wait unknown — the hub never saw
+// either. A real closed copy arriving later replaces this one by id.
+function closeSuperseded(m, kept) {
+  const newest = new Map();      // sessionId -> openedAt of this beat's newest dialog row
+  for (const r of kept) {
+    if (r.kind !== "dialog" || !r.sessionId) continue;
+    if (!(newest.get(r.sessionId) >= r.openedAt)) newest.set(r.sessionId, r.openedAt);
+  }
+  if (!newest.size) return [];
+  const closed = [];
+  for (const row of m.values()) {
+    const at = newest.get(row.sessionId);
+    if (at === undefined || row.kind !== "dialog" || row.openedAt >= at) continue;
+    if (typeof row.closedAt === "number" || row.answer) continue;
+    closed.push(track({ ...row, closedAt: at, answer: "unknown", via: "unknown" }));
+  }
+  for (const row of closed) m.set(row.id, row);
+  return closed;
 }
 
 // ---- reads ---------------------------------------------------------------------
@@ -262,7 +288,21 @@ const BASH_NEVER_HEADS = new Set([
   "poetry", "pipx", "pdm", "hatch", "conda", "mamba", "micromamba", "nix", "nix-shell",
   "mise", "asdf", "direnv", "java", "julia", "Rscript", "tclsh",
   "cmd", "cmd.exe", "powershell.exe", "pwsh.exe", "wsl", "wsl.exe",
+  // Other names for a listed interpreter or exec: a distro/alternate binary
+  // (`nodejs`, `pypy`, `gawk`), a REPL, and a runner verb the lists above missed
+  // (`pnpx` = `pnpm dlx`, `uv tool run` = `uvx`, `yarn node`, `dotnet exec`).
+  "nodejs", "pypy", "ipython", "bpython", "luajit", "gawk", "mawk", "nawk", "pnpx",
+  "uv tool", "yarn node", "dotnet exec",
 ]);
+// A versioned interpreter binary (`python3.11`, `php8.2`, `perl5.36`, `node22`) or
+// a Windows `.exe` runs exactly what its family does, so the never-list is also
+// checked against the name with that suffix cut. Over-matching only withholds a
+// suggestion; under-matching hands out an allow-everything rule.
+function bashFamily(base) {
+  const name = base.replace(/\.exe$/i, "");
+  const m = /^(.*?[A-Za-z])[\d.]+$/.exec(name);
+  return m ? m[1] : name;
+}
 const BASH_HEAD_RE = /^[A-Za-z0-9._/-]+( [A-Za-z0-9._-]+)?$/;
 // MIRRORS `SUBCOMMAND_CLIS` in agent/hooks/permlog.py (parity-tested): CLIs whose
 // subcommand is the decision. permlog keeps the subcommand in the head only when
@@ -281,7 +321,8 @@ function toolRule(tool, head) {
     const word = head.split(" ")[0];
     const base = word.slice(word.lastIndexOf("/") + 1);
     if (!BASH_HEAD_RE.test(head) || BASH_NEVER_HEADS.has(head)
-        || BASH_NEVER_HEADS.has(word) || BASH_NEVER_HEADS.has(base)) return null;
+        || BASH_NEVER_HEADS.has(word) || BASH_NEVER_HEADS.has(base)
+        || BASH_NEVER_HEADS.has(bashFamily(base))) return null;
     if (word === head && (SUBCOMMAND_CLIS.has(word) || SUBCOMMAND_CLIS.has(base))) return null;
     return `Bash(${head}:*)`;
   }

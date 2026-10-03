@@ -27,6 +27,10 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 - Bounds: `EVENTS_PER_BEAT` (200) per beat, `PERMISSION_LEDGER_HOST_MAX_ROWS` per host (a flooding
   host cannot evict the fleet), `PERMISSION_LEDGER_MAX_ROWS` (20000) store-wide, oldest-`openedAt`
   first; `PERMISSION_LEDGER_DAYS` (30) retention.
+- **A newer `dialog` row for a session closes that session's older OPEN dialog row on the same host**
+  (`closeSuperseded`, `answer`/`via` "unknown", no `waitedMs`). A pane shows one dialog at a time and
+  the agent closes before it opens, so only a lost row (a manager restart) is still open — else it
+  reads "open" for 30 days. A real closed copy arriving later replaces it by id.
 - **And a BYTE budget**, oldest first: every cap is in chars, so a row reaches ~15 KB of UTF-8 and
   20000 of them would be a file `load()` refuses (the ledger lost at the next boot). The budget is
   the smaller of 0.9 x `PERMISSION_LEDGER_FILE_MAX` and a sixteenth of the container limit
@@ -56,6 +60,8 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
   (`docker container run` → `docker container`, `docker compose run` → `docker compose`, `npm x`,
   `yarn exec`, `go run`), and a wrapper/runner whose head is the bare CLI (`stdbuf`, `nsenter`,
   `poetry`, `conda`) covers its argument. Add a new exec form here, with a test row, as it is found.
+- **A versioned or `.exe` interpreter binary is its family** (`bashFamily`): `python3.11`, `php8.2`,
+  `node22`, `python.exe` are checked with the version/`.exe` cut. Over-matching only withholds a rule.
 - **Nor a BARE subcommand CLI** (`git`, `docker`, `kubectl`, `make`…; `SUBCOMMAND_CLIS`, a
   parity-tested mirror of permlog.py's set). permlog keeps the subcommand only as the SECOND word, so
   `git -C /repo push` / `kubectl -n prod exec` head as the bare CLI, whose rule allows every
