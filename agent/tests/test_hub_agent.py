@@ -22853,9 +22853,29 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
             self.assertIs(sm._abandon_stalled_cheap_worker(busy), busy)
         with mock.patch.object(ha.subprocess, "run",
                                side_effect=subprocess.TimeoutExpired("git", 15)):
-            before = time.monotonic()
-            _ORIG_RUN(["git", "status"])
-        self.assertGreaterEqual(threading.current_thread().spawnedAt, before)
+            for spawn in (lambda: _ORIG_RUN(["git", "status"]),
+                          lambda: ha.run_out(["git", "status"]),
+                          lambda: ha._strict_git(["git", "status"], None)):
+                before = time.monotonic()
+                try:
+                    spawn()
+                except ha.GitTimeout:
+                    pass
+                self.assertGreaterEqual(threading.current_thread().spawnedAt,
+                                        before)
+
+    def test_an_abandoned_worker_cannot_publish_from_inside_a_job(self):
+        """The open-PR reader stores session_cheap/session_facts itself, so the
+        loop's own check is not enough: a stall in one of its non-strict reads
+        returns after abandonment and would overwrite fresher answers."""
+        sm = self.make_manager()
+        sm.session_cheap = {"s1": {"branch": "fresh"}}
+        ghost = threading.Thread(target=lambda: sm._cheap_store(
+            "session_cheap", "s1", {"branch": "late"}, only_if_present=True))
+        ghost.cheapLeft = {}            # a cheap-git worker, but not the current one
+        ghost.start()
+        ghost.join(5)
+        self.assertEqual(sm.session_cheap["s1"], {"branch": "fresh"})
 
     def test_first_sight_never_spawns_git_on_the_beat(self):
         sm = self.make_manager()

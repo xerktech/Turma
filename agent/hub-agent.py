@@ -27990,10 +27990,15 @@ class SessionManager:
         sees a dict change size mid-iteration, and neither writer loses the
         other's update. `only_if_present` is the worker's guard — a key pruned
         while its read was in flight (a killed session, a removed repo) stays
-        pruned rather than being resurrected."""
+        pruned rather than being resurrected — and a worker the watchdog
+        abandoned (XERK-1537) publishes nothing, including from inside a job
+        (the open-PR reader stores its side reads itself)."""
+        me = threading.current_thread()
         with self._cheap_lock:
             cur = getattr(self, attr)
             if only_if_present and key not in cur:
+                return
+            if hasattr(me, "cheapLeft") and self._cheap_worker is not me:
                 return
             setattr(self, attr, {**cur, key: value})
 
@@ -28063,7 +28068,7 @@ class SessionManager:
         The pass's unread jobs and the job in hand live on the Thread object
         (`cheapLeft`, `cheapJob`, `jobAt`), under _cheap_lock, for the watchdog
         (_abandon_stalled_cheap_worker); a worker that finds it was abandoned
-        exits without publishing."""
+        exits, and _cheap_store refuses its late answers."""
         me = threading.current_thread()
         me.cheapJob, me.cheapLeft = None, {}
         while True:
@@ -28090,8 +28095,6 @@ class SessionManager:
                 except Exception as e:
                     log(f"cheap git refresh of {path} failed: {e}")
                     continue
-                if self._cheap_worker is not me:
-                    return
                 self._cheap_store(job[0], job[1], value, only_if_present=True)
 
     def _refresh_jira_if_configured(self):
