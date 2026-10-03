@@ -1042,6 +1042,33 @@ test("XERK-1459 pg mode: a sidecar and row AHEAD of the .jsonl never skip what i
   } finally { pgTeardown(); }
 });
 
+test("XERK-1459 pg mode: a row whose archiveBytes is unknown (0) is not a cursor candidate", async () => {
+  const mem = pgSetup();
+  try {
+    const b1 = [ent("z0", "user", "one")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    archive.ingestChunk("nas", "t-zero", META, 0, len1, b1, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-zero").filePath);
+    const pushedJsonl = fs.readFileSync(jsonl);
+    const b2 = [ent("z1", "assistant", "two")];
+    const len2 = len1 + Buffer.byteLength(JSON.stringify(b2));
+    archive.ingestChunk("nas", "t-zero", META, len1, len2, b2, "acme");
+    fs.writeFileSync(jsonl, pushedJsonl);
+    fs.rmSync(jsonl + ".meta");                        // no sidecar: the row alone decides
+    mem.sessions.set("t-zero", { ...mem.sessions.get("t-zero"), archiveBytes: 0 }); // NOT NULL DEFAULT 0
+
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-zero" }], "acme")["t-zero"], 0);
+    archive.ingestChunk("nas", "t-zero", META, 0, len2, [...b1, ...b2], "acme");
+    const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+    assert.deepEqual(uuids, ["z0", "z1"]);
+  } finally { pgTeardown(); }
+});
+
 test("XERK-1364 pg mode: backfill from a stale sidecar de-dups; a repeated key is not a re-send", async () => {
   const mem = pgSetup();
   try {
