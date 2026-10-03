@@ -179,6 +179,14 @@ of-record**, so both halves of the ADR split now hold:
     failure: an open fd kept the unlinked temp's bytes allocated, invisible to `du` (QA D4).
   - `rawBytes` = local walk + `pendingBytes`, where pending counts only the bucket's EXCESS over a
     partial local copy — counting the full size double-counts it and refuses ingest (QA D3).
+  - **`rawLimits` lets the row only NOMINATE an over-cap id; the raw walk confirms it** (XERK-1321).
+    PG `raw_bytes` is GREATEST, so a pre-XERK-1315 inflated figure never comes down, and with no local
+    `.jsonl` reconcile can't heal it — trusting the row raw-sheds the transcript forever. A nominee
+    found under the cap heals its map row (unmirrored; each boot re-heals). Tests: `XERK-1321` in
+    `archive.test.js` + `index-store.test.js`.
+  - Its walks are budgeted per call, and a row confirmed truly over is skipped for 10 min PER ID —
+    never a shared cursor: `rawLimits` runs on EVERY host's beat, so shared state is reset/perturbed
+    by other hosts and the inflated row behind the truly-over ones starves again.
   - Routes `await fetchRawUnder(dir)` (4 at a time, answering 503 "still syncing" after 10s while the
     fetches carry on) — never the S3 client's 60s timeout.
   - `archive.setRawRemote` THROWS on an incomplete hook set: silently unwiring disables every
