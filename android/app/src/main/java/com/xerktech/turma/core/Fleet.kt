@@ -95,7 +95,10 @@ fun fleetSummary(
         devices = agents.map { it.device }.filter { it.isNotBlank() }.distinct(),
         running = sessions.count { it.status == "running" },
         totalSessions = sessions.size,
-        maxSessions = if (capHosts.isEmpty()) null else capHosts.sumOf { it.maxSessions },
+        // Summed as Long and saturated: two hosts near Int.MAX_VALUE (the hub only
+        // drops NEGATIVE counts, XERK-1479) would otherwise wrap to a negative ceiling.
+        maxSessions = if (capHosts.isEmpty()) null
+            else capHosts.sumOf { it.maxSessions.toLong() }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
         waiting = sessions.count { it.status == "running" && !it.session?.question.isNullOrBlank() },
         tokensToday = fleetTokens(spenders, UsageWindow.TODAY),
         tokensWeek = fleetTokens(spenders, UsageWindow.WEEK),

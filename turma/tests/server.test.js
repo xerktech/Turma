@@ -3278,6 +3278,30 @@ test("http: an agent cannot put `retired` on its own record (XERK-338)", async (
   delete agents["retired-forger"];
 });
 
+test("XERK-1479: a negative capacity count is dropped, not served into the fleet tile", async () => {
+  // wireInt32 admits negatives, so one malformed agent beating maxSessions:-2^31
+  // dragged the dashboard's RUNNING SESSIONS ceiling (a sum over hosts) to
+  // "0 / -2147483600". A negative count is "can't tell", same as absent.
+  const body = {
+    device: "xerk1479-neg",
+    capacity: { maxSessions: -2147483648, running: -9, queued: -1, free: -3, rootRunning: false },
+  };
+  const r = await request("POST", "/api/heartbeat", { body, headers: agentHeaders });
+  assert.equal(r.status, 200);
+  const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "xerk1479-neg");
+  assert.deepEqual(rec.capacity, { rootRunning: false });
+
+  const ok = {
+    device: "xerk1479-zero",
+    capacity: { maxSessions: 1, running: 0, queued: 0, free: 0, rootRunning: false },
+  };
+  await request("POST", "/api/heartbeat", { body: ok, headers: agentHeaders });
+  const kept = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "xerk1479-zero");
+  assert.deepEqual(kept.capacity, ok.capacity);   // zero is a real count, kept
+});
+
 test("XERK-455: typed /api/agents fields are coerced at ingest, not served raw", async () => {
   // A field is decode-fatal on Android the moment a client TYPES it: /api/agents
   // decodes atomically, so one host beating a wrong-typed value throws the whole

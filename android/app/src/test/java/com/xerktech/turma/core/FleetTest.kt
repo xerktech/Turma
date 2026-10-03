@@ -140,6 +140,13 @@ class FleetTest {
         assertEquals(null, fleetSummary(listOf(agent("old"))).maxSessions)
     }
 
+    @Test fun `max sessions saturates instead of wrapping past the Int ceiling`() {
+        // XERK-1479: two hosts near Int.MAX_VALUE must not wrap the ceiling negative.
+        val a = agent("h1", capacity = Capacity(maxSessions = Int.MAX_VALUE))
+        val b = agent("h2", capacity = Capacity(maxSessions = Int.MAX_VALUE))
+        assertEquals(Int.MAX_VALUE, fleetSummary(listOf(a, b)).maxSessions)
+    }
+
     @Test fun `max sessions sums only the hosts that report a capacity block`() {
         val a = agent("h1", capacity = Capacity(maxSessions = 4))
         val b = agent("old") // pre-capacity agent, no ceiling reported
