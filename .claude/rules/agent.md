@@ -183,8 +183,8 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 - **`light` means "reuse the caches" for the CHEAP git reads too**, not just the slow ones:
   `repo_cheap`/`session_cheap` hold the previous beat's branch + dirty counts. Never make a light beat
   re-derive something a scheduled beat will re-derive moments later. Tests: `TestLightBeatCost`.
-- **The beat spawns NO git: every per-repo/per-session git fact is served from cache and read on the
-  cheap-git worker** (XERK-1217, XERK-1262). Inline, `git status` per repo and per running session —
+- **The beat reads NO per-repo/per-session git fact itself: each is served from cache and read on
+  the cheap-git worker** (XERK-1217, XERK-1262). Inline, `git status` per repo and per running session —
   each bounded only by `run()`'s 15s — took beats to 100-425s on an HDD pool under NFS load, and a
   cold-start beat to 121s, so the hub read the host offline.
   - `_cheap_read` is the one path, for the cheap maps (`repo_cheap`/`session_cheap`, re-staged every
@@ -198,6 +198,10 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - The open-PR poller is a STAGE/DECIDE split: its cadence beat stages a fresh read
     (`nudge_reads`, `None` = pending); each full beat decides only reads that landed, re-checking
     the idle gates first.
+  - NOT yet off the beat: `_backfill_ledger`'s `git remote get-url` (XERK-1536). Spawn-time git
+    (`_worktree_add`, a ticket branch fetch) is command handling, not this rule.
+  - The open-PR reader builds its facts from the branch IT read, never `session_cheap` — the poller
+    runs before the session payload, so on a cold start the card cache holds the placeholder.
   - The cheap reads are `strict`: a git TIMEOUT raises `GitTimeout` (plain `run()` folds it into
     "gone"/"clean") and the worker keeps the last real answer. A fast failure — missing cwd,
     broken `.git` link — is still "gone". A cached `None` is served, never re-read inline.

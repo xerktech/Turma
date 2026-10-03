@@ -5155,6 +5155,24 @@ def coding_agent():
     return {"name": CODING_AGENT_NAME, "version": out}
 
 
+def _session_slow_facts(sess, gi, path):
+    """A session's slow git facts against the live branch in `gi` (its cheap
+    read): repo name / remote / last commit, and the branch-sync counts."""
+    live = gi.get("branch") if gi else None
+    if live == "HEAD":
+        live = None
+    # Compare the live branch against what the session forked from (baseRef,
+    # e.g. origin/main), falling back to the repo's current checkout when we
+    # didn't record a base.
+    base = sess.get("baseRef") or run(
+        ["git", "-C", sess["repoPath"], "rev-parse", "--abbrev-ref", "HEAD"])
+    return {
+        "liveBranch": live,
+        "slow": git_info_slow(path),
+        "work": branch_sync(sess["repoPath"], live, base or None),
+    }
+
+
 class GitTimeout(Exception):
     """A `strict` cheap git read that did not answer in time (XERK-1217).
     run() folds a timeout into the same "" as a failure, so without this a
@@ -28332,9 +28350,13 @@ class SessionManager:
             return
         now = time.time()
         for sess in self.registry:
-            if sess.get("status") != "running":
+            sid = sess.get("id")
+            if sess.get("status") != "running" or not sess.get("worktreePath"):
+                # A read must not outlive the state it was taken in: a session
+                # that errored and came back would be decided on stale facts.
+                if sid in self.nudge_reads:
+                    self._cheap_forget("nudge_reads", lambda k: k != sid)
                 continue
-            sid = sess["id"]
             read = self.nudge_reads.get(sid)       # None = none, or pending
             if not stage and read is None:
                 continue                            # nothing landed to decide
@@ -28397,7 +28419,7 @@ class SessionManager:
                     self._cheap_store("nudge_reads", sid, None)
                 self._stage_cheap_refresh("nudge_reads", sid,
                                           self._open_pr_nudge_reader(sess),
-                                          sess.get("worktreePath"))
+                                          sess["worktreePath"])
                 continue
             self._cheap_forget("nudge_reads", lambda k: k != sid)
             dirty = read.get("dirtyFiles") or 0
@@ -28452,8 +28474,12 @@ class SessionManager:
 
         def read(path, strict=True):
             gi = git_info_cheap(path, strict=True)
+            # Facts from the branch THIS read saw, never session_cheap: the
+            # poller runs before the session's payload on a cold start, so the
+            # card cache may still hold the placeholder — and a None branch
+            # reads a never-pushed branch as delivered.
+            facts = _session_slow_facts(sess, gi, path)
             self._cheap_store("session_cheap", sid, gi, only_if_present=True)
-            facts = self._session_facts_reader(sess)(path)
             self._cheap_store("session_facts", sid, facts, only_if_present=True)
             return {"dirtyFiles": (gi or {}).get("dirtyFiles") or 0,
                     "liveBranch": facts["liveBranch"], "work": facts["work"]}
@@ -30703,23 +30729,8 @@ class SessionManager:
         the cheap read first, so on first sight the worker computes the sync
         facts against the branch it has just read rather than the placeholder."""
         sid = sess["id"]
-
-        def read(path, strict=True):
-            gi = self.session_cheap.get(sid)
-            live = gi.get("branch") if gi else None
-            if live == "HEAD":
-                live = None
-            # Compare the live branch against what the session forked from
-            # (baseRef, e.g. origin/main), falling back to the repo's current
-            # checkout when we didn't record a base.
-            base = sess.get("baseRef") or run(
-                ["git", "-C", sess["repoPath"], "rev-parse", "--abbrev-ref", "HEAD"])
-            return {
-                "liveBranch": live,
-                "slow": git_info_slow(path),
-                "work": branch_sync(sess["repoPath"], live, base or None),
-            }
-        return read
+        return lambda path, strict=True: _session_slow_facts(
+            sess, self.session_cheap.get(sid), path)
 
     def _new_work_since_prs(self, sess, signals):
         """Has this session said anything since every PR it opened landed?

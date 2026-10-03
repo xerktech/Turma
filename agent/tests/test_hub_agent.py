@@ -15072,6 +15072,66 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.session_cheap["s1"]["branch"], "feat")
         self.assertEqual(sm.session_facts["s1"]["liveBranch"], "feat")
 
+    def test_cold_start_reader_uses_its_own_branch_not_the_card_cache(self):
+        """The poller runs before the session's payload in build_payload, so
+        on a cold start session_cheap has no entry yet. Facts built from it
+        read a never-pushed branch as delivered and re-armed the attempt cap
+        on every restart."""
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": "/w/s1", "repoPath": "/x/A",
+                "baseRef": "origin/main"}
+        sm.session_cheap, sm.session_facts = {}, {}
+        with mock.patch.object(ha, "git_info_cheap",
+                               return_value={"branch": "feat", "dirtyFiles": 0}), \
+             mock.patch.object(ha, "git_info_slow", return_value={}), \
+             mock.patch.object(ha, "branch_sync",
+                               side_effect=lambda r, br, b: {"pushed": False}
+                               if br else {"pushed": None}):
+            got = sm._open_pr_nudge_reader(sess)("/w/s1")
+        self.assertEqual(got["liveBranch"], "feat")
+        self.assertIs(got["work"]["pushed"], False)
+
+    def test_the_reader_is_strict_so_a_stall_is_never_clean(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "worktreePath": "/w/s1", "repoPath": "/x/A"}
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("git", 15)):
+            with self.assertRaises(ha.GitTimeout):
+                sm._open_pr_nudge_reader(sess)("/w/s1")
+
+    def test_a_landed_read_does_not_survive_a_status_bounce(self):
+        """A read that landed, then the session errored, its work was
+        delivered, and it came back: the old read must not be decided."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges(stage=True)
+            run_held_cheap_refreshes(sm, self.staged)
+            sess["status"] = "error"
+            sm._poll_open_pr_nudges(stage=False)
+            sess["status"] = "running"
+            sm._poll_open_pr_nudges(stage=False)
+        self.assertEqual(self._typed(), [])
+        self.assertNotIn("s1", sm.nudge_reads)
+
+    def test_a_record_without_a_worktree_is_never_read(self):
+        """git with cwd=None reads the AGENT's own cwd."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        del sess["worktreePath"]
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges(stage=True)
+        self.assertEqual(self.staged, [])
+
+    def test_kill_forgets_a_pending_read(self):
+        sm = self.make_manager()
+        self._session(sm)
+        sm.nudge_reads = {"s1": None, "s2": None}
+        sm._forget_session_caches("s1")
+        self.assertEqual(list(sm.nudge_reads), ["s2"])
+
     def test_disabled_by_env_flag(self):
         sm = self.make_manager()
         self._session(sm)
