@@ -46,6 +46,8 @@ function makeEl() {
 // What the page's TurmaOrg.filter stub does, swappable per test. Identity by
 // default, which is "All orgs".
 let orgFilter = (agents) => agents;
+// The header's selected org keys, for the permission card's scoped fetch.
+let orgKeys = [];
 
 function loadHelpers(fetchReply = null) {
   const els = {};
@@ -98,7 +100,7 @@ function loadHelpers(fetchReply = null) {
     TurmaNav: { preserveScroll: (_el, paint) => paint() },
     // Indirected through `orgFilter` so a test can narrow the page the way the
     // header's org control does, and check what each section was rendered from.
-    TurmaOrg: { get: () => "", update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop, orgColors: () => ({}) },
+    TurmaOrg: { get: () => "", getKeys: () => orgKeys, update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop, orgColors: () => ({}) },
     TurmaBoard: { orgName: (k) => k, orgColorMap: () => ({}) },
     TurmaNewTicket: { update: noop },
   };
@@ -109,7 +111,8 @@ function loadHelpers(fetchReply = null) {
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
     hostLabel, hostSeries, repoSeries,
-    applyAgent, connectSSE, refresh, mergeSnapshot, setCache: (c) => { cache = c; }, getCache: () => cache };`;
+    applyAgent, connectSSE, refresh, mergeSnapshot,
+    permissionsCardHtml, refreshPermissions, getPermView: () => permView, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
   const api = new Function(...keys, body)(...keys.map((k) => stubs[k]));
@@ -1251,4 +1254,65 @@ test("a removal re-polls once, however many hosts the hub evicts", async () => {
   await H2.runTimers();
   await new Promise((r) => setImmediate(r));
   assert.equal(H2.fetches.filter((u) => u === "/api/agents").length, 1);
+});
+
+// --- Permission prompts (XERK-1563) --------------------------------------------
+
+const PERM_NOW = Date.parse("2026-10-03T12:00:00Z");
+const permView = {
+  days: 7,
+  top: [
+    { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "npm test", count: 12,
+      allowed: 11, denied: 1, medianWaitMs: 95000, lastAt: PERM_NOW, suggestedRule: "Bash(npm test:*)" },
+    { kind: "classifier-denied", tool: "Bash", head: "git push", count: 3, allowed: 0, denied: 3,
+      medianWaitMs: null, lastAt: PERM_NOW, suggestedRule: "autoMode.environment: allow Bash(git push:*)" },
+    { kind: "dialog", dialogKind: "plan", tool: "ExitPlanMode", head: "ExitPlanMode", count: 1,
+      allowed: 1, denied: 0, medianWaitMs: 4000, lastAt: PERM_NOW, suggestedRule: null },
+  ],
+  recent: [
+    { host: "nas01", kind: "ask-in-chat", prompt: "Should I proceed with the deploy?",
+      openedAt: PERM_NOW - 120000, waitedMs: 60000, answer: "unknown" },
+  ],
+};
+
+test("XERK-1563: the permission card lists each prompt with its rule and a copy button", () => {
+  const html = H.permissionsCardHtml(permView, PERM_NOW);
+  assert.match(html, /Permission prompts \(7 days\)/);
+  assert.match(html, /<code>Bash\(npm test:\*\)<\/code><button[^>]*data-perm-rule="Bash\(npm test:\*\)"/);
+  assert.match(html, /<td>12<\/td>\s*<td>11 \/ 1<\/td>\s*<td>2m<\/td>/);   // count, answers, median wait
+  assert.match(html, /k-classifier-denied/);
+  assert.match(html, /Dialog · plan/);
+  assert.match(html, /no rule retires this/);             // a plan approval has no rule
+  assert.match(html, /Recent prompts \(1\)/);
+  assert.match(html, /Should I proceed with the deploy\?.*nas01.*waited 1m · unknown.*2m ago/s);
+});
+
+test("XERK-1563: every agent-supplied field in the card is escaped", () => {
+  const evil = "<img src=x onerror=alert(1)>";
+  const html = H.permissionsCardHtml({ days: 7,
+    top: [{ kind: "dialog", tool: evil, head: `"${evil}`, count: 1, suggestedRule: `Bash(${evil})` }],
+    recent: [{ host: evil, kind: "dialog", head: evil, openedAt: PERM_NOW }] }, PERM_NOW);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /data-perm-rule="Bash\(&lt;img/);
+});
+
+test("XERK-1563: the card says loading, then empty, never a broken table", () => {
+  assert.match(H.permissionsCardHtml(null, PERM_NOW), /Loading/);
+  const empty = H.permissionsCardHtml({ days: 7, top: [], recent: [] }, PERM_NOW);
+  assert.match(empty, /No permission prompts recorded in the last 7 days/);
+  assert.doesNotMatch(empty, /<table/);
+  // A malformed view (an older hub answering something else) degrades the same way.
+  assert.match(H.permissionsCardHtml({ top: "nope", recent: [null] }, PERM_NOW), /No permission prompts/);
+});
+
+test("XERK-1563: the card's fetch is scoped by the header's org filter", async () => {
+  const H3 = loadHelpers(() => permView);
+  orgKeys = ["acme.atlassian.net", "rival.atlassian.net"];
+  try {
+    await H3.refreshPermissions();
+  } finally { orgKeys = []; }
+  const url = H3.fetches.filter((u) => u.startsWith("/api/permissions")).pop();
+  assert.equal(url, "/api/permissions?days=7&org=acme.atlassian.net%2Crival.atlassian.net");
+  assert.equal(H3.getPermView(), permView);
+  assert.match(H3.els.permissions.innerHTML, /Bash\(npm test:\*\)/);
 });

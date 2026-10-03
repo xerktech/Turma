@@ -4826,6 +4826,9 @@ class ManagerMixin:
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
+            # Derived from REGISTRY_DIR at import (XERK-1563): the permission
+            # ledger's hook-log tail would otherwise read the real host's logs.
+            ("PERMISSIONS_DIR", os.path.join(self.tmp, "permissions")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
@@ -36495,6 +36498,405 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
                 mock.patch.object(ha.threading, "Thread") as t:
             sm._start_memguard()
         t.assert_not_called()
+
+
+class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
+    """The permission ledger's agent half (XERK-1563): dialog rows off the
+    panePrompt edges, merged with the hook rows the worker tails, classifier
+    denials, ask-in-chat rows, and the outbox's wire discipline."""
+
+    SID = "perm1"
+    CLAUDE_SID = "0b9f2c1e-1111-4222-8333-444455556666"
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        self.wt = os.path.join(self.tmp, "worktrees", "repo", "wt1")
+        os.makedirs(self.wt)
+        self.sess = {"id": self.SID, "status": "running", "tmuxName": "agent-perm1",
+                     "worktreePath": self.wt, "repoPath": self.wt,
+                     "claudeSessionId": self.CLAUDE_SID}
+        self.sm.registry = [self.sess]
+        self.tpath = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.wt),
+                                  f"{self.CLAUDE_SID}.jsonl")
+        os.makedirs(os.path.dirname(self.tpath))
+        self.lines = []
+        self.sm._perm_first_beat_done = True
+
+    # --- helpers --------------------------------------------------------------
+
+    def write(self, *entries):
+        self.lines.extend(entries)
+        with open(self.tpath, "w") as f:
+            for e in self.lines:
+                f.write(json.dumps(e) + "\n")
+
+    def tool_use(self, tuid, name="Bash", inp=None):
+        return {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tuid, "name": name,
+             "input": inp if inp is not None else {"command": "npm test"}}]}}
+
+    def tool_result(self, tuid, text="ok", is_error=False):
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tuid, "content": text,
+             "is_error": is_error}]}}
+
+    def dialog(self, prompt="Do you want to proceed?"):
+        return {"prompt": prompt, "detail": "Bash command\nnpm test",
+                "options": [{"number": 1, "label": "Yes", "selected": True},
+                            {"number": 2, "label": "Yes, and don't ask again",
+                             "selected": False},
+                            {"number": 3, "label": "No", "selected": False}]}
+
+    def edge(self, pane_prompt=None, at=1000, **sig):
+        signals = {"panePrompt": pane_prompt, "paneBusy": False}
+        signals.update(sig)
+        self.sm._permission_edges(self.sess, signals, now_ms=at)
+
+    def rows(self):
+        return list(self.sm.permission_events)
+
+    def hook_rows(self, *rows):
+        self.sm._permission_rows_fetched = {self.SID: list(rows)}
+
+    def request_hook(self, tuid="toolu_1", ts=900):
+        return {"sessionId": self.SID, "event": "PermissionRequest", "ts": ts,
+                "toolUseId": tuid, "tool": "Bash", "head": "npm test",
+                "digest": "{}", "rulesMatched": ["Bash(npm test:*)"]}
+
+    # --- dialog edges ---------------------------------------------------------
+
+    def test_a_dialog_opens_a_row_carrying_the_pending_call(self):
+        self.write(self.tool_use("toolu_0"), self.tool_result("toolu_0"),
+                   self.tool_use("toolu_1", inp={"command": "npm test -- -x"}))
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual(row["kind"], "dialog")
+        self.assertEqual(row["dialogKind"], "permission")
+        self.assertEqual(row["openedAt"], 1000)
+        self.assertEqual(row["toolUseId"], "toolu_1")   # the one with no result
+        self.assertEqual(row["head"], "npm test")       # permlog.py's own head
+        self.assertEqual(row["options"], ["Yes", "Yes, and don't ask again", "No"])
+        self.assertNotIn("closedAt", row)
+        # Still up next beat: nothing new.
+        self.edge(self.dialog(), at=2000)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_the_closed_row_reports_turmas_own_answer(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        with mock.patch.object(ha, "_capture_pane", return_value=PANE_PERMISSION_DIALOG):
+            self.sm.answer_pane_prompt(self.SID, 3)
+        self.edge(None, at=4500)
+        closed = self.rows()[-1]
+        self.assertEqual(closed["id"], self.rows()[0]["id"])   # same row, upserted
+        self.assertEqual((closed["answer"], closed["answerNumber"], closed["via"]),
+                         ("deny", 3, "turma"))
+        self.assertEqual(closed["waitedMs"], 3500)
+        self.assertEqual(closed["closedAt"], 4500)
+
+    def test_an_answer_at_the_terminal_is_inferred_from_the_calls_result(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.write(self.tool_result(
+            "toolu_1", "The user doesn't want to proceed with this tool use.", True))
+        self.edge(None, at=2000)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("deny", "terminal"))
+        # …and a call that RAN is an allow.
+        self.write(self.tool_use("toolu_2"))
+        self.edge(self.dialog(), at=3000)
+        self.write(self.tool_result("toolu_2", "tests passed"))
+        self.edge(None, at=4000)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("allow", "terminal"))
+
+    def test_no_result_yet_reads_allow_only_while_the_pane_is_busy(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge(None, at=2000, paneBusy=True)
+        self.assertEqual(self.rows()[-1]["answer"], "allow")
+        self.write(self.tool_use("toolu_2"))
+        self.edge(self.dialog(), at=3000)
+        self.edge(None, at=4000, paneBusy=None)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("unknown", "unknown"))
+
+    def test_dialog_kinds(self):
+        self.assertEqual(ha.classify_pane_dialog(ha.parse_pane_prompt(PANE_PLAN_DIALOG)),
+                         "plan")
+        self.assertEqual(ha.classify_pane_dialog(
+            ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)), "permission")
+        self.assertEqual(ha.classify_pane_dialog(
+            {"prompt": "Allow network access outside the sandbox?",
+             "detail": "Host: registry.npmjs.org"}), "sandbox")
+        self.assertEqual(ha.classify_pane_dialog({"prompt": "Which one?"}), "other")
+
+    def test_a_sandbox_dialog_names_its_host(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge({"prompt": "Allow this command to reach the network outside the sandbox?",
+                   "detail": "Host: registry.npmjs.org",
+                   "options": [{"number": 1, "label": "Yes", "selected": True},
+                               {"number": 2, "label": "No", "selected": False}]})
+        row, = self.rows()
+        self.assertEqual((row["dialogKind"], row["head"]),
+                         ("sandbox", "registry.npmjs.org"))
+
+    # --- hook rows ------------------------------------------------------------
+
+    def test_a_permission_request_merges_into_its_dialog_by_tool_use_id(self):
+        self.write(self.tool_use("toolu_1"))
+        self.hook_rows(self.request_hook("toolu_1"))
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.assertEqual(self.rows(), [])          # held for the dialog
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual(row["rulesMatched"], ["Bash(npm test:*)"])
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
+
+    def test_a_request_tailed_after_its_dialog_closed_upserts_that_row(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge(None, at=2000)
+        self.hook_rows(self.request_hook("toolu_1"))
+        self.sm._apply_permission_hook_rows(now_ms=2100, mono=0)
+        last = self.rows()[-1]
+        self.assertEqual(last["id"], self.rows()[0]["id"])
+        self.assertEqual(last["rulesMatched"], ["Bash(npm test:*)"])
+        self.assertIn("closedAt", last)
+
+    def test_an_unclaimed_request_becomes_its_own_dialog_row(self):
+        self.hook_rows(self.request_hook("toolu_9"))
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.sm._apply_permission_hook_rows(
+            now_ms=900, mono=ha.PERMISSION_HOOK_HOLD_SEC - 1)
+        self.assertEqual(self.rows(), [])
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=ha.PERMISSION_HOOK_HOLD_SEC)
+        row, = self.rows()
+        self.assertEqual((row["kind"], row["dialogKind"], row["toolUseId"], row["answer"]),
+                         ("dialog", "permission", "toolu_9", "unknown"))
+
+    def test_a_classifier_denial_is_a_complete_row(self):
+        self.hook_rows({"sessionId": self.SID, "event": "PermissionDenied", "ts": 777,
+                        "toolUseId": "toolu_5", "tool": "Bash", "head": "git push",
+                        "digest": "{}", "denyReason": "outside scope"})
+        self.sm._apply_permission_hook_rows(now_ms=800, mono=0)
+        row, = self.rows()
+        self.assertEqual((row["kind"], row["answer"], row["denyReason"], row["openedAt"]),
+                         ("classifier-denied", "deny", "outside scope", 777))
+
+    # --- ask-in-chat ----------------------------------------------------------
+
+    def ended(self, ts, text):
+        self.write({"type": "assistant", "timestamp": ts,
+                    "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": text}]}})
+        return {"lastRole": "assistant", "lastHasToolUse": False,
+                "lastActivityTs": ts}
+
+    def test_an_ask_in_chat_opens_on_the_ended_turn_and_closes_on_input(self):
+        sig = self.ended("2026-10-03T10:00:00Z",
+                         "The build is ready. Should I proceed with the deploy?")
+        self.edge(None, at=5000, **sig)
+        row, = self.rows()
+        self.assertEqual(row["kind"], "ask-in-chat")
+        self.assertIn("Should I proceed", row["prompt"])
+        self.edge(None, at=6000, **sig)          # same turn: no second row
+        self.assertEqual(len(self.rows()), 1)
+        self.sm.handle_commands([{"cmdId": "c1", "type": "input",
+                                  "sessionId": self.SID, "text": "yes go"}])
+        closed = self.rows()[-1]
+        self.assertEqual((closed["id"], closed["via"]), (row["id"], "turma"))
+        self.assertGreaterEqual(closed["waitedMs"], 0)
+
+    def test_a_turn_that_asks_nothing_opens_nothing(self):
+        self.edge(None, **self.ended("2026-10-03T10:00:00Z", "Done — PR #12 is up."))
+        self.assertEqual(self.rows(), [])
+
+    def test_a_busy_or_tool_ending_turn_is_not_an_ask(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "May I run the migration?")
+        self.edge(None, **dict(sig, lastHasToolUse=True))
+        self.edge(None, **dict(sig, paneBusy=True))
+        self.assertEqual(self.rows(), [])
+
+    def test_the_first_beat_primes_rather_than_refiles_old_asks(self):
+        self.sm._perm_first_beat_done = False
+        sig = self.ended("2026-10-03T10:00:00Z", "May I run the migration?")
+        self.edge(None, **sig)
+        self.assertEqual(self.rows(), [])
+
+    # --- the wire -------------------------------------------------------------
+
+    def test_rows_ride_the_heartbeat_bounded_per_beat(self):
+        for i in range(ha.PERMISSION_EVENTS_MAX + 5):
+            self.sm._emit_permission({"id": f"x{i}", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(len(payload["permissionEvents"]), ha.PERMISSION_EVENTS_MAX)
+        self.assertEqual(payload["permissionEvents"][0]["id"], "x0")   # oldest first
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual([r["id"] for r in self.sm.permission_events],
+                         [f"x{i}" for i in range(ha.PERMISSION_EVENTS_MAX,
+                                                 ha.PERMISSION_EVENTS_MAX + 5)])
+
+    def test_cleared_by_identity_so_a_row_emitted_after_the_snapshot_survives(self):
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})  # same content
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual([r["id"] for r in self.sm.permission_events], ["a"])
+
+    def test_the_413_shed_never_drops_permission_rows(self):
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.sm._drop_on_demand_results(payload)
+        self.assertIn("permissionEvents", payload)
+        self.assertEqual(len(self.sm.permission_events), 1)
+
+    def test_the_outbox_is_bounded(self):
+        with mock.patch.object(ha, "log"):
+            for i in range(ha.PERMISSION_OUTBOX_MAX + 3):
+                self.sm._emit_permission({"id": f"x{i}"})
+        self.assertEqual(len(self.sm.permission_events), ha.PERMISSION_OUTBOX_MAX)
+        self.assertEqual(self.sm.permission_events[0]["id"], "x3")
+
+    def test_a_session_that_ends_closes_its_open_rows(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.sm._forget_session_caches(self.SID)
+        last = self.rows()[-1]
+        self.assertEqual((last["answer"], last["via"]), ("unknown", "unknown"))
+        self.assertIn("closedAt", last)
+        self.assertNotIn(self.SID, self.sm._perm_open)
+
+    def test_a_raising_edge_never_costs_the_sessions_signals(self):
+        with mock.patch.object(self.sm, "_permission_edges",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(ha, "log"):
+            out = self.sm._session_payload(self.sess)
+        self.assertEqual(out["id"], self.SID)
+
+
+class TestPermissionLogTail(ManagerMixin, unittest.TestCase):
+    """The hook-log tail (XERK-1563): its own worker, a per-file cursor, priming
+    on the first pass, rotation, and the session-written-file read discipline."""
+
+    SID = "perm2"
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        self.sm.registry = [{"id": self.SID, "status": "running"}]
+        os.makedirs(ha.PERMISSIONS_DIR)
+        self.path = os.path.join(ha.PERMISSIONS_DIR, f"{self.SID}.jsonl")
+
+    def append(self, *rows, path=None):
+        with open(path or self.path, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def denied(self, tuid):
+        return {"ts": 1, "event": "PermissionDenied", "toolUseId": tuid,
+                "tool": "Bash", "head": "x", "digest": "", "denyReason": "no"}
+
+    def staged(self):
+        with self.sm._permission_lock:
+            got, self.sm._permission_rows_fetched = self.sm._permission_rows_fetched, {}
+        return [r["toolUseId"] for r in got.get(self.SID, [])]
+
+    def test_the_first_pass_primes_then_only_new_lines_are_read(self):
+        self.append(self.denied("old"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])          # a restart replays nothing
+        self.append(self.denied("new1"), self.denied("new2"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["new1", "new2"])
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])
+
+    def test_a_log_that_appears_later_is_read_from_its_start(self):
+        self.sm._fetch_permission_rows()             # primed with no file
+        self.append(self.denied("a"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["a"])
+
+    def test_a_partial_line_waits_for_its_end(self):
+        self.sm._fetch_permission_rows()
+        with open(self.path, "a") as f:
+            f.write(json.dumps(self.denied("a")) + "\n" + '{"ts": 1, "ev')
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["a"])
+        with open(self.path, "a") as f:
+            f.write('ent": "PermissionDenied", "toolUseId": "b"}\n')
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["b"])
+
+    def test_rotation_drains_the_old_file_first(self):
+        self.sm._fetch_permission_rows()
+        self.append(self.denied("a"))
+        self.sm._fetch_permission_rows()
+        self.staged()
+        self.append(self.denied("b"))              # written, not yet read
+        os.replace(self.path, self.path + ".1")     # permlog.py rotates
+        self.append(self.denied("c"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["b", "c"])
+
+    def test_junk_lines_are_skipped_and_fields_reshaped(self):
+        self.sm._fetch_permission_rows()
+        with open(self.path, "a") as f:
+            f.write("not json\n[1]\n" + json.dumps({"event": "Stop", "ts": 1}) + "\n"
+                    + json.dumps({"event": "PermissionDenied", "ts": "x"}) + "\n"
+                    + "x" * (ha.PERMISSION_LOG_LINE_MAX + 5) + "\n")
+            f.write(json.dumps(dict(self.denied("ok"), tool="T" * 999,
+                                    extra="dropped")) + "\n")
+        self.sm._fetch_permission_rows()
+        with self.sm._permission_lock:
+            row, = self.sm._permission_rows_fetched[self.SID]
+        self.assertEqual(row["toolUseId"], "ok")
+        self.assertEqual(len(row["tool"]), 128)
+        self.assertNotIn("extra", row)
+
+    def test_a_fifo_at_the_log_path_never_wedges_the_tail(self):
+        self.sm._fetch_permission_rows()
+        os.mkfifo(self.path)
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (self.sm._fetch_permission_rows(), done.set()),
+                             daemon=True)
+        t.start()
+        self.assertTrue(done.wait(5), "the tail blocked opening a FIFO")
+        self.assertEqual(self.staged(), [])
+        self.assertIsNone(ha._read_permission_log(self.path, 0, 10))
+
+    def test_the_beat_stages_the_tail_and_never_reads_it_inline(self):
+        self.sm._stage_permission_fetch = mock.Mock()
+        self.sm._fetch_permission_rows = mock.Mock()
+        self.sm.registry = []
+        self.sm.build_payload(0)
+        self.sm._stage_permission_fetch.assert_called_once_with()
+        self.sm._fetch_permission_rows.assert_not_called()
+
+    def test_the_worker_runs_the_staged_tail(self):
+        ran = threading.Event()
+        self.sm._fetch_permission_rows = lambda: ran.set()
+        self.sm._stage_permission_fetch()
+        self.assertTrue(ran.wait(2))
+
+    def test_staging_never_raises_onto_the_beat(self):
+        with mock.patch.object(ha.threading, "Thread",
+                               side_effect=RuntimeError("no threads")), \
+             mock.patch.object(ha, "log"):
+            self.sm._stage_permission_fetch()
+
+    def test_a_gone_sessions_old_log_is_swept(self):
+        stale = os.path.join(ha.PERMISSIONS_DIR, "gone.jsonl")
+        self.append(self.denied("x"), path=stale)
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        os.utime(stale, (old, old))
+        self.append(self.denied("y"))
+        os.utime(self.path, (old, old))             # running: kept however old
+        self.sm._fetch_permission_rows()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(self.path))
 
 
 if __name__ == "__main__":

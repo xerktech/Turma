@@ -313,6 +313,14 @@ UPDATING_ANNOUNCE_TIMEOUT_SEC = _env_float("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC"
 # question lives here as `<sessionId>.req.json`; the answer the glasses client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
 QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
+# The permission ledger's hook rows (XERK-1563): hooks/permlog.py appends one
+# JSON line per PermissionRequest / PermissionDenied event to
+# `<sessionId>.jsonl` here (rotating to `.1` past 1 MiB), and a worker tails it.
+# SESSION-WRITTEN, so every read is O_NONBLOCK + regular-file only + bounded
+# (_read_permission_log), and the file-edit tools are denied it
+# (`_GUARD_DENY_PATH_RULES`). Bash can still write it — the documented ~/.turma
+# residual — which is why the hub whitelists and bounds every field it ingests.
+PERMISSIONS_DIR = os.path.join(REGISTRY_DIR, "permissions")
 # Killed-but-resumable session history (branch + transcript survive a kill).
 #
 # This is a CACHE of what a kill knew, not the record of it. It buys a killed
@@ -4332,6 +4340,13 @@ _GUARD_DENY_PATH_RULES = [
     # guard walks past Bash either way (XERK-309), so this covers the file-edit
     # tools only, exactly like its neighbours.
     "Edit(~/.turma/peers.tsv)",
+    # The permission ledger's hook rows (XERK-1563). A session editing its own
+    # rows could hide the prompts it hit, or forge ones it never did. NEW, not a
+    # copy: the questions dir beside it is deliberately NOT denied (a session's
+    # own hook writes there through the tool flow), whereas only permlog.py — a
+    # hook process, not a tool call — ever writes here. File-edit tools only;
+    # Bash walks past it (XERK-309) like every neighbour.
+    "Edit(~/.turma/permissions/**)",
     # The qwen safety-guard shim config (XERK-510 [Qwen F]) — it holds the hook
     # script paths and the credential/runtime-code globs the qwen PreToolUse shim
     # enforces, so a session that rewrote it could disable its own guard. Adding
@@ -4555,6 +4570,12 @@ def fileguard_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "fileguard.py")
 
 
+def permlog_script_path():
+    """Absolute path to the bundled permission-ledger hook (``hooks/permlog.py``,
+    XERK-1563), resolved the same way as ``guard_script_path``."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "permlog.py")
+
+
 def statusline_script_path():
     """Absolute path to the bundled subscription-limits statusLine hook
     (``hooks/statusline.py``), resolved the same way as ``guard_script_path``."""
@@ -4573,6 +4594,13 @@ ASK_HOOK_TIMEOUT_SEC = 660
 # question is never stale-dropped from the beat's pending read while the operator
 # is still deciding — the qwen analogue of ask.py's own 600s block.
 QWEN_QUESTION_BLOCK_TIMEOUT_SEC = 600
+# The permission-ledger hook (hooks/permlog.py, XERK-1563) appends one line and
+# exits; it never blocks a prompt, so its timeout only bounds a wedged disk.
+PERMLOG_HOOK_TIMEOUT_SEC = 10
+# The hook events the ledger records. NOT PreToolUse: that runs BEFORE the
+# auto-mode classifier, so it cannot see a classifier block (PermissionDenied
+# can) nor whether a dialog will follow (PermissionRequest fires only for one).
+PERMLOG_HOOK_EVENTS = ("PermissionRequest", "PermissionDenied")
 
 # The BUILT-IN qwen tool the launcher DISABLES (XERK-509 D2, QA reopen XERK-520).
 # qwen 0.22.x ships a native `ask_user_question` that renders its HITL selector
@@ -4587,7 +4615,8 @@ QWEN_NATIVE_ASK_TOOL = "ask_user_question"
 
 
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
-                         local_settings_path=None, fileguard_path=None):
+                         local_settings_path=None, fileguard_path=None,
+                         permlog_path=None):
     """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
     Bash (the safety guard), the file-editing tools (the ~/.claude file guard)
     and AskUserQuestion (the glasses answer bridge),
@@ -4663,9 +4692,24 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
             "timeout": ASK_HOOK_TIMEOUT_SEC,
         }],
     })
+    hooks = {"PreToolUse": pre}
+    # The permission ledger (XERK-1563): RECORDS each permission prompt and
+    # classifier block, decides nothing. Wired only when the script is there —
+    # a missing command would print a hook error into every session's pane on
+    # every prompt, for a ledger that is best-effort anyway. The ledger dir rides
+    # the command line so the hook and the manager's reader can never disagree.
+    permlog_path = permlog_path or permlog_script_path()
+    if os.path.exists(permlog_path):
+        permlog_command = f'"{python_exe}" -SsE "{permlog_path}" "{PERMISSIONS_DIR}"'
+        for event in PERMLOG_HOOK_EVENTS:
+            hooks[event] = [{"hooks": [{
+                "type": "command",
+                "command": permlog_command,
+                "timeout": PERMLOG_HOOK_TIMEOUT_SEC,
+            }]}]
     return {
         "permissions": perms,
-        "hooks": {"PreToolUse": pre},
+        "hooks": hooks,
         # Peer messages are DELIVERED rather than held (XERK-339). Claude Code's
         # default holds one whenever the sending and receiving sessions'
         # permission-mode classes differ — and `bypassPermissions` is a class of
@@ -10715,6 +10759,246 @@ def _pane_status(tmux_name, state):
         return None, None, None
     busy, cap = _stable_pane_busy_from(tmux_name, state, _capture_pane(tmux_name))
     return busy, parse_pane_mode(cap), parse_pane_prompt(cap)
+
+
+# --- the permission ledger (XERK-1563) ---------------------------------------
+#
+# Every permission prompt a session hits, recorded so the operator can see which
+# ones stall work and which allow rule would retire them. Three sources, three
+# kinds, each with a different fix:
+#   * `dialog` — the numbered TUI dialog (manual/rule prompt, plan approval,
+#     sandbox escape), seen on the panePrompt EDGES this beat already scrapes, and
+#     merged by toolUseId with the PermissionRequest hook row when one fired;
+#   * `classifier-denied` — auto mode's soft block, which shows NO dialog: only
+#     the PermissionDenied hook (hooks/permlog.py) sees it;
+#   * `ask-in-chat` — the session ended its turn asking for permission in prose,
+#     caught by a cheap regex on the ready-for-review edge until the wait
+#     classifier lands.
+# The hook rows are tailed on their OWN worker (never the beat, never the
+# slow-refresh worker); the beat owns every row state and the outbox.
+PERMISSION_EVENTS_MAX = _env_int("TURMA_PERMISSION_EVENTS_MAX", 200, minimum=1)
+# The outbox past a hub outage: rows wait for a delivered beat, oldest dropped
+# past this (loudly) rather than growing the heartbeat without bound.
+PERMISSION_OUTBOX_MAX = 2000
+# One pass reads at most this much of one session's hook log; a backlog drains
+# over successive passes, never in one unbounded read.
+PERMISSION_LOG_READ_MAX = 256 * 1024
+# A hook line is ~1 KiB (permlog.py caps every field); a longer one is not ours.
+PERMISSION_LOG_LINE_MAX = 16 * 1024
+# A PermissionRequest no pane edge claimed within this long is still a prompt —
+# one answered between two beats — so it becomes a `dialog` row of its own.
+PERMISSION_HOOK_HOLD_SEC = 120
+# How long a gone session's hook log is kept before the worker removes it.
+PERMISSION_LOG_RETAIN_SEC = 7 * 86400
+# The session ids a hook log may be named for — permlog.py's own SID_RE.
+VALID_PERMISSION_SID_RE = re.compile(r"[A-Za-z0-9._-]{1,64}")
+PERMISSION_TEXT_MAX = 300
+# The interim ask-in-chat detector. Deliberately cheap and deliberately loose:
+# it is replaced by the wait classifier (a later XERK-1560 child), and a false
+# row costs a ledger line, never an action.
+PERMISSION_ASK_RE = re.compile(
+    r"\b(?:permission|may i|should i proceed|let me know if)\b", re.IGNORECASE)
+# What a refused call's tool_result says (manual "No", a deny rule, a rejected
+# edit). Anything else that came back ran.
+_PERMISSION_DENIED_RESULT_RE = re.compile(
+    r"doesn't want to proceed|was rejected|\bdenied\b|not allowed|user rejected",
+    re.IGNORECASE)
+_PERMISSION_HOST_RE = re.compile(
+    r"\b((?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63})\b", re.IGNORECASE)
+
+_PERMLOG_MODULE = None
+
+
+def _permlog_module():
+    """hooks/permlog.py loaded as a module, so the pane-side rows compute `head`
+    and `digest` with the SAME code the hook does — the two merge and aggregate
+    on them, and two implementations would drift. None when it cannot load (a
+    version-skewed install), and the callers fall back to the tool name."""
+    global _PERMLOG_MODULE
+    if _PERMLOG_MODULE is None:
+        try:
+            import importlib.util
+            spec = importlib.util.spec_from_file_location(
+                "turma_permlog", permlog_script_path())
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)
+            _PERMLOG_MODULE = mod
+        except Exception as e:      # noqa: BLE001 — never raise onto the beat
+            log(f"permission ledger: hooks/permlog.py did not load ({e}); "
+                f"pane rows carry the tool name only")
+            _PERMLOG_MODULE = False
+    return _PERMLOG_MODULE or None
+
+
+def _permission_head_digest(tool, tool_input):
+    mod = _permlog_module()
+    if mod is None:
+        return (tool or "")[:200], ""
+    try:
+        return mod.tool_head(tool, tool_input), mod.digest(tool_input)
+    except Exception:               # noqa: BLE001
+        return (tool or "")[:200], ""
+
+
+def classify_pane_dialog(prompt):
+    """`permission` / `plan` / `sandbox` / `other` for a parse_pane_prompt dict,
+    off its text. A plan approval names the plan; a sandbox escape names the
+    sandbox or the network; a tool prompt asks "Do you want to …". Wording is
+    the TUI's, so anything unrecognised is `other`, never guessed."""
+    if not isinstance(prompt, dict):
+        return "other"
+    text = f"{prompt.get('prompt') or ''}\n{prompt.get('detail') or ''}"
+    if re.search(r"\bplan\b", text, re.IGNORECASE):
+        return "plan"
+    if re.search(r"\bsandbox\b|network (?:access|request)", text, re.IGNORECASE):
+        return "sandbox"
+    if re.search(r"\bdo you want to\b|\ballow\b", text, re.IGNORECASE):
+        return "permission"
+    return "other"
+
+
+def _pane_dialog_host(prompt):
+    """The first host name a sandbox dialog's text mentions, or ""."""
+    text = f"{prompt.get('prompt') or ''}\n{prompt.get('detail') or ''}"
+    m = _PERMISSION_HOST_RE.search(text)
+    return m.group(1).lower()[:200] if m else ""
+
+
+def _option_answer(label):
+    """allow / deny / unknown for a dialog option's label — the dialog's own
+    wording ("Yes, and don't ask again", "No, and tell Claude …")."""
+    text = (label or "").strip().lower()
+    if re.match(r"(?:yes|allow|approve|proceed)\b", text):
+        return "allow"
+    if re.match(r"(?:no|deny|reject|cancel|tell claude)\b", text):
+        return "deny"
+    return "unknown"
+
+
+def _tool_calls(entries):
+    """(uses, results) off transcript entries: uses = [(id, name, input)] in file
+    order, results = {tool_use_id: (is_error, text)}."""
+    uses, results = [], {}
+    for entry in entries:
+        msg = entry.get("message") if isinstance(entry, dict) else None
+        content = msg.get("content") if isinstance(msg, dict) else None
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and isinstance(block.get("id"), str):
+                uses.append((block["id"], block.get("name") or "", block.get("input")))
+            elif (block.get("type") == "tool_result"
+                  and isinstance(block.get("tool_use_id"), str)):
+                body = block.get("content")
+                if isinstance(body, list):
+                    body = " ".join(b.get("text", "") for b in body
+                                    if isinstance(b, dict)
+                                    and isinstance(b.get("text"), str))
+                results[block["tool_use_id"]] = (
+                    block.get("is_error") is True,
+                    body if isinstance(body, str) else "")
+    return uses, results
+
+
+def pending_tool_call(entries):
+    """The call a permission dialog is asking about: the NEWEST tool_use in the
+    transcript tail with no tool_result yet, as {toolUseId, tool, head, digest},
+    or None. Claude Code writes the tool_use before it asks, and the result only
+    once the dialog is answered."""
+    uses, results = _tool_calls(entries)
+    for tuid, name, tool_input in reversed(uses):
+        if tuid in results:
+            continue
+        head, dig = _permission_head_digest(name, tool_input)
+        return {"toolUseId": tuid[:128], "tool": name[:128], "head": head,
+                "digest": dig}
+    return None
+
+
+def tool_call_outcome(entries, tool_use_id):
+    """allow / deny / None for one call, off its tool_result: a refusal's own
+    words read deny, any other result read allow (it ran), no result yet None."""
+    if not tool_use_id:
+        return None
+    _uses, results = _tool_calls(entries)
+    got = results.get(tool_use_id)
+    if got is None:
+        return None
+    is_error, text = got
+    if is_error and _PERMISSION_DENIED_RESULT_RE.search(text or ""):
+        return "deny"
+    return "allow"
+
+
+def _read_permission_log(path, offset, max_bytes):
+    """(bytes, inode, size) read from `offset` of a session-written hook log, or
+    None. The file is SESSION-written (Bash walks past every deny rule), so the
+    open is O_NONBLOCK|O_NOFOLLOW and REGULAR-file only and the read is bounded —
+    the discipline guard.py's _read_text and _read_untrusted_json share: a FIFO
+    planted here would otherwise wedge the worker in the open itself."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        if offset > st.st_size:
+            offset = 0                      # truncated/rewritten underneath us
+        os.lseek(fd, offset, os.SEEK_SET)
+        chunks, want = [], min(max_bytes, max(0, st.st_size - offset))
+        while want > 0:
+            chunk = os.read(fd, want)
+            if not chunk:
+                break
+            chunks.append(chunk)
+            want -= len(chunk)
+        return b"".join(chunks), st.st_ino, offset
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def parse_permission_log_lines(blob, session_id):
+    """(rows, consumed) for the COMPLETE lines in `blob`: a trailing partial line
+    is left for the next pass, an over-long or unparseable line is skipped. Every
+    row is re-shaped here — the file is a claim, the hub bounds it again."""
+    end = blob.rfind(b"\n") + 1
+    rows = []
+    for raw in blob[:end].split(b"\n"):
+        if not raw.strip() or len(raw) > PERMISSION_LOG_LINE_MAX:
+            continue
+        try:
+            row = json.loads(raw)
+        except (ValueError, RecursionError):
+            continue
+        if not isinstance(row, dict) or row.get("event") not in PERMLOG_HOOK_EVENTS:
+            continue
+        ts = row.get("ts")
+        if (isinstance(ts, bool) or not isinstance(ts, (int, float))
+                or not math.isfinite(ts)):
+            continue
+
+        def s(key, limit=200):
+            v = row.get(key)
+            return v[:limit] if isinstance(v, str) else ""
+
+        out = {"sessionId": session_id, "event": row["event"], "ts": int(ts),
+               "toolUseId": s("toolUseId", 128), "tool": s("tool", 128),
+               "head": s("head"), "digest": s("digest", 400)}
+        if row["event"] == "PermissionDenied":
+            out["denyReason"] = s("denyReason", PERMISSION_TEXT_MAX)
+        else:
+            rules = row.get("rulesMatched")
+            out["rulesMatched"] = [r[:200] for r in rules[:8] if isinstance(r, str)] \
+                if isinstance(rules, list) else []
+        rows.append(out)
+    return rows, end
 
 
 def _tmux_pane(tmux_name):
@@ -16885,6 +17169,28 @@ class SessionManager:
         self._pr_comments_wake = threading.Event()
         self._pr_comments_worker = None
         self._pr_comments_fetched = {}
+        # The permission ledger (XERK-1563). The hook-log TAIL is a worker's
+        # (`_permission_cursors` is its alone); it stages parsed hook rows in
+        # `_permission_rows_fetched`, REBOUND under `_permission_lock` like the
+        # PR-comment staging. Everything else is the BEAT's: the open dialog /
+        # ask-in-chat rows, the PermissionRequest rows waiting for a dialog to
+        # claim them, and the outbox `permission_events`, which rides the
+        # heartbeat snapshotted under the same lock and is cleared BY IDENTITY.
+        self._permission_lock = threading.Lock()
+        self._permission_wake = threading.Event()
+        self._permission_worker = None
+        self._permission_rows_fetched = {}
+        self._permission_cursors = {}
+        self._permission_primed = False
+        self.permission_events = []
+        self._perm_open = {}          # sid -> the open `dialog` row
+        self._perm_ask = {}           # sid -> the open `ask-in-chat` row
+        self._perm_ask_seen = {}      # sid -> last assistant timestamp checked
+        self._perm_hook_pending = {}  # sid -> {toolUseId: (hook row, seen mono)}
+        self._perm_turma_answer = {}  # sid -> option number Turma typed
+        self._perm_last_closed = {}   # sid -> the last closed `dialog` row
+        self._perm_first_beat_done = False
+        self._perm_swept_at = None
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -20829,6 +21135,11 @@ class SessionManager:
         # drop any leftover question rendezvous files so a dead question can't
         # surface as a phantom on the next beat.
         self._clear_question_files(sid)
+        # Close the permission ledger's open rows for it (XERK-1563).
+        try:
+            self._permission_forget(sid)
+        except Exception as e:
+            log(f"permission ledger forget failed for {sid}: {e}")
 
     def _set_error(self, sess, msg):
         sess["status"] = "error"
@@ -23795,6 +24106,9 @@ class SessionManager:
         # submits on the digit alone, so Enter is qwen-only.
         if sess.get("agentType") == "qwen":
             _pane_send_keys(sess["tmuxName"], "Enter")
+        # The ledger's dialog row closes on the next beat's dialog→gone edge
+        # and reports THIS as its answer, via Turma (XERK-1563).
+        self._perm_turma_answer[sid] = number
         log(f"answered pane prompt for session {sid}: option {number}")
 
     def set_summary(self, sid, summary):
@@ -28283,6 +28597,328 @@ class SessionManager:
             return None
         return [self.pr_status_cache.get(u) or {"url": u} for u in urls]
 
+    # --- the permission ledger (XERK-1563) -----------------------------------
+
+    def _stage_permission_fetch(self):
+        """Wake the hook-log tail worker. Same never-raise shape as
+        _stage_pr_comment_fetch: a failed Thread.start() leaves a dead worker
+        the next beat retries."""
+        try:
+            with self._permission_lock:
+                worker = self._permission_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(
+                        target=self._permission_fetch_worker_loop,
+                        name="permission-log", daemon=True)
+                    self._permission_worker = worker
+                    worker.start()
+            self._permission_wake.set()
+        except Exception as e:
+            log(f"permission log tail could not be staged: {type(e).__name__}: {e}")
+
+    def _permission_fetch_worker_loop(self):
+        """Tail the hook logs, then wait for the next stage. Wake cleared BEFORE
+        the pass, like every worker here, so a stage landing mid-pass is kept."""
+        while True:
+            self._permission_wake.wait()
+            self._permission_wake.clear()
+            try:
+                self._fetch_permission_rows()
+            except Exception as e:
+                log(f"permission log tail failed: {e}")
+
+    def _fetch_permission_rows(self):
+        """Read what each running session's hook log grew by, OFF THE BEAT, and
+        stage the parsed rows for the beat (`_apply_permission_hook_rows`).
+
+        Per-file cursor `(inode, offset)` — worker-owned, never touched by the
+        beat. A changed inode means permlog.py rotated the file: the old one's
+        unread tail is drained from `<name>.1` first. The FIRST pass of a
+        process primes every existing log to its end, so a restarted manager
+        does not replay rows the hub already has as new prompts. Bounded per
+        file per pass (PERMISSION_LOG_READ_MAX); a backlog drains over passes."""
+        sids = [s.get("id") for s in list(self.registry)
+                if s.get("status") == "running" and isinstance(s.get("id"), str)
+                and VALID_PERMISSION_SID_RE.fullmatch(s.get("id"))]
+        prime = not self._permission_primed
+        fetched = {}
+        for sid in sids:
+            path = os.path.join(PERMISSIONS_DIR, f"{sid}.jsonl")
+            try:
+                st = os.lstat(path)
+            except OSError:
+                continue
+            if not stat.S_ISREG(st.st_mode):
+                continue
+            cur = self._permission_cursors.get(path)
+            if prime:
+                self._permission_cursors[path] = (st.st_ino, st.st_size)
+                continue
+            rows = []
+            offset = 0
+            if cur is not None:
+                ino, offset = cur
+                if ino != st.st_ino:
+                    rot = _read_permission_log(path + ".1", offset,
+                                               PERMISSION_LOG_READ_MAX)
+                    if rot is not None and rot[1] == ino:
+                        rows.extend(parse_permission_log_lines(rot[0], sid)[0])
+                    offset = 0
+            got = _read_permission_log(path, offset, PERMISSION_LOG_READ_MAX)
+            if got is None or got[1] != st.st_ino:
+                continue                    # replaced between lstat and open
+            blob, ino, start = got
+            parsed, consumed = parse_permission_log_lines(blob, sid)
+            rows.extend(parsed)
+            self._permission_cursors[path] = (ino, start + consumed)
+            if rows:
+                fetched[sid] = rows
+        self._permission_primed = True
+        self._sweep_permission_logs(set(sids))
+        if not fetched:
+            return
+        with self._permission_lock:
+            staged = dict(self._permission_rows_fetched)
+            for sid, rows in fetched.items():
+                staged[sid] = (staged.get(sid, []) + rows)[-PERMISSION_OUTBOX_MAX:]
+            self._permission_rows_fetched = staged
+
+    def _sweep_permission_logs(self, running):
+        """Remove the hook logs of sessions that are gone, once they are
+        PERMISSION_LOG_RETAIN_SEC old. Hourly, on the worker. Best-effort."""
+        now = time.monotonic()
+        if self._perm_swept_at is not None and now - self._perm_swept_at < 3600:
+            return
+        self._perm_swept_at = now
+        try:
+            names = os.listdir(PERMISSIONS_DIR)
+        except OSError:
+            return
+        cutoff = time.time() - PERMISSION_LOG_RETAIN_SEC
+        for name in names:
+            sid, sep, _rest = name.partition(".jsonl")
+            if not sep or sid in running:
+                continue
+            path = os.path.join(PERMISSIONS_DIR, name)
+            try:
+                st = os.lstat(path)
+                if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                    os.remove(path)
+                    self._permission_cursors.pop(path, None)
+            except OSError:
+                pass
+
+    def _emit_permission(self, row):
+        """Put one row (a COPY — the beat keeps mutating its open rows) on the
+        outbox. The hub upserts by `id`, so an open row re-sent closed replaces
+        itself. Past PERMISSION_OUTBOX_MAX the oldest go, said once."""
+        with self._permission_lock:
+            self.permission_events.append(dict(row))
+            over = len(self.permission_events) - PERMISSION_OUTBOX_MAX
+            if over > 0:
+                del self.permission_events[:over]
+                log(f"permission ledger: outbox past {PERMISSION_OUTBOX_MAX}; "
+                    f"dropped {over} oldest row(s)")
+
+    def _apply_permission_hook_rows(self, now_ms=None, mono=None):
+        """ON THE BEAT: drain the worker's staged hook rows into ledger rows.
+
+        A PermissionDenied is a complete `classifier-denied` row on its own. A
+        PermissionRequest belongs to a dialog: merged (rulesMatched, the call)
+        into the open dialog row or the one just closed with the same
+        toolUseId, else held until a dialog opens for it. One no dialog claims
+        within PERMISSION_HOOK_HOLD_SEC was answered between two beats — still a
+        prompt, so it becomes a `dialog` row of its own."""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        mono = time.monotonic() if mono is None else mono
+        with self._permission_lock:
+            fetched, self._permission_rows_fetched = self._permission_rows_fetched, {}
+        for sid, rows in fetched.items():
+            for hook in rows:
+                tuid = hook.get("toolUseId") or ""
+                if hook["event"] == "PermissionDenied":
+                    self._emit_permission({
+                        "id": f"c-{sid}-{tuid or hook['ts']}", "sessionId": sid,
+                        "kind": "classifier-denied", "tool": hook["tool"],
+                        "head": hook["head"], "digest": hook["digest"],
+                        "toolUseId": tuid, "denyReason": hook.get("denyReason", ""),
+                        "openedAt": hook["ts"], "closedAt": hook["ts"],
+                        "answer": "deny"})
+                    continue
+                target = self._perm_open.get(sid)
+                if target is None or (target.get("toolUseId") and tuid
+                                      and target["toolUseId"] != tuid):
+                    last = self._perm_last_closed.get(sid)
+                    target = last if (last and tuid and last.get("toolUseId") == tuid
+                                      and "rulesMatched" not in last) else None
+                    if target is not None:
+                        self._merge_permission_hook(target, hook)
+                        self._emit_permission(target)
+                        continue
+                    self._perm_hook_pending.setdefault(sid, {})[
+                        tuid or f"ts{hook['ts']}"] = (hook, mono)
+                    continue
+                self._merge_permission_hook(target, hook)
+        for sid in list(self._perm_hook_pending):
+            pend = self._perm_hook_pending[sid]
+            for key in [k for k, (_h, seen) in pend.items()
+                        if mono - seen >= PERMISSION_HOOK_HOLD_SEC]:
+                self._emit_unclaimed_request(sid, pend.pop(key)[0])
+            if not pend:
+                del self._perm_hook_pending[sid]
+
+    @staticmethod
+    def _merge_permission_hook(row, hook):
+        row["rulesMatched"] = list(hook.get("rulesMatched") or [])
+        for key in ("toolUseId", "tool", "head", "digest"):
+            if not row.get(key) and hook.get(key):
+                row[key] = hook[key]
+
+    def _emit_unclaimed_request(self, sid, hook):
+        self._emit_permission({
+            "id": f"r-{sid}-{hook.get('toolUseId') or hook['ts']}", "sessionId": sid,
+            "kind": "dialog", "dialogKind": "permission", "tool": hook["tool"],
+            "head": hook["head"], "digest": hook["digest"],
+            "toolUseId": hook.get("toolUseId") or "",
+            "rulesMatched": list(hook.get("rulesMatched") or []),
+            "openedAt": hook["ts"], "answer": "unknown", "via": "unknown"})
+
+    def _permission_edges(self, sess, signals, now_ms=None):
+        """ON THE BEAT, per running session, off the signals session_report
+        already read: the panePrompt None→dialog / dialog→gone edges, and the
+        ask-in-chat edge. Reads the transcript tail only ON an edge."""
+        sid = sess.get("id")
+        if not isinstance(sid, str) or not isinstance(signals, dict):
+            return
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        pp = signals.get("panePrompt")
+        pp = pp if isinstance(pp, dict) and pp.get("prompt") else None
+        row = self._perm_open.get(sid)
+        if row is not None and (pp is None or pp.get("prompt")[:PERMISSION_TEXT_MAX]
+                                != row.get("prompt")):
+            self._close_dialog_row(sess, row, signals, now_ms)
+            row = None
+        if pp is not None and row is None:
+            self._open_dialog_row(sess, pp, now_ms)
+        self._permission_ask_edge(sess, signals, now_ms)
+
+    def _open_dialog_row(self, sess, pp, now_ms):
+        sid = sess["id"]
+        kind = classify_pane_dialog(pp)
+        options = [str(o.get("label") or "")[:200] for o in (pp.get("options") or [])
+                   if isinstance(o, dict)][:PANE_PROMPT_MAX_OPTIONS]
+        row = {"id": f"d-{sid}-{now_ms}", "sessionId": sid, "kind": "dialog",
+               "dialogKind": kind, "prompt": pp["prompt"][:PERMISSION_TEXT_MAX],
+               "options": options, "openedAt": now_ms}
+        path = _session_transcript_path(sess)
+        call = pending_tool_call(_tail_entries(path)) if path else None
+        if call:
+            row.update(call)
+        if kind == "sandbox":
+            host = _pane_dialog_host(pp)
+            if host:
+                row["head"] = host
+        pend = self._perm_hook_pending.get(sid) or {}
+        hit = pend.pop(row["toolUseId"], None) if row.get("toolUseId") else None
+        if hit is None and not row.get("toolUseId") and len(pend) == 1:
+            hit = pend.popitem()[1]
+        if hit is not None:
+            self._merge_permission_hook(row, hit[0])
+        self._perm_turma_answer.pop(sid, None)
+        self._perm_open[sid] = row
+        self._emit_permission(row)
+
+    def _close_dialog_row(self, sess, row, signals, now_ms):
+        """Close a dialog row: how long it held the session, and what the answer
+        was — Turma's own when the operator answered through Turma, else
+        inferred from the call's result (ran → allow, a refusal → deny), else
+        unknown. A call with no result yet whose pane went busy is running,
+        which is an allow."""
+        sid = sess["id"]
+        row["closedAt"] = now_ms
+        row["waitedMs"] = max(0, now_ms - int(row.get("openedAt") or now_ms))
+        number = self._perm_turma_answer.pop(sid, None)
+        if number is not None:
+            opts = row.get("options") or []
+            label = opts[number - 1] if 1 <= number <= len(opts) else ""
+            row.update(answer=_option_answer(label), answerNumber=number, via="turma")
+        else:
+            outcome = None
+            if row.get("toolUseId"):
+                path = _session_transcript_path(sess)
+                outcome = tool_call_outcome(_tail_entries(path) if path else [],
+                                            row["toolUseId"])
+                if outcome is None and signals.get("paneBusy") is True:
+                    outcome = "allow"
+            row.update(answer=outcome or "unknown",
+                       via="terminal" if outcome else "unknown")
+        del self._perm_open[sid]
+        self._perm_last_closed[sid] = row
+        self._emit_permission(row)
+
+    def _permission_ask_edge(self, sess, signals, now_ms):
+        """ask-in-chat: on the edge where a session ENDED its turn (the
+        ready-for-review shape agent-side: pane idle, nothing pending, last word
+        the assistant's with no tool call), regex its last message once. Sessions
+        already sitting there on this process's first beat are primed, not
+        re-read — a restart must not re-file old asks."""
+        sid = sess["id"]
+        ts = signals.get("lastActivityTs")
+        ended = (signals.get("paneBusy") is False and not signals.get("panePrompt")
+                 and not signals.get("question") and not signals.get("agents")
+                 and signals.get("lastRole") == "assistant"
+                 and not signals.get("lastHasToolUse"))
+        if not ended or not isinstance(ts, str) or not ts:
+            return
+        seen = self._perm_ask_seen.get(sid)
+        self._perm_ask_seen[sid] = ts
+        if seen == ts or (seen is None and not self._perm_first_beat_done):
+            return
+        if sid in self._perm_ask:
+            return
+        path = _session_transcript_path(sess)
+        entry = _last_entry(path) if path else None
+        text = (_entry_text(entry) or "") if isinstance(entry, dict) else ""
+        text = text[-2000:]
+        m = PERMISSION_ASK_RE.search(text)
+        if not m:
+            return
+        start = max(text.rfind(".", 0, m.start()), text.rfind("\n", 0, m.start())) + 1
+        row = {"id": f"a-{sid}-{now_ms}", "sessionId": sid, "kind": "ask-in-chat",
+               "prompt": " ".join(text[start:].split())[:PERMISSION_TEXT_MAX],
+               "openedAt": now_ms}
+        self._perm_ask[sid] = row
+        self._emit_permission(row)
+
+    def _permission_close_ask(self, sid, now_ms=None, via="turma"):
+        """The operator's next input answers an ask-in-chat row: close it with
+        how long the session waited for them."""
+        row = self._perm_ask.pop(sid, None) if isinstance(sid, str) else None
+        if row is None:
+            return
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        row.update(closedAt=now_ms, waitedMs=max(0, now_ms - row["openedAt"]),
+                   answer="unknown", via=via)
+        self._emit_permission(row)
+
+    def _permission_forget(self, sid):
+        """A session that ended closes whatever it still had open (answer
+        unknown) and hands its unclaimed PermissionRequest rows over as rows of
+        their own; nothing of it is kept on the beat."""
+        now_ms = int(time.time() * 1000)
+        row = self._perm_open.pop(sid, None)
+        if row is not None:
+            row.update(closedAt=now_ms,
+                       waitedMs=max(0, now_ms - int(row.get("openedAt") or now_ms)),
+                       answer="unknown", via="unknown")
+            self._emit_permission(row)
+        self._permission_close_ask(sid, now_ms, via="unknown")
+        for hook, _seen in (self._perm_hook_pending.pop(sid, None) or {}).values():
+            self._emit_unclaimed_request(sid, hook)
+        for cache in (self._perm_ask_seen, self._perm_turma_answer,
+                      self._perm_last_closed):
+            cache.pop(sid, None)
+
     def _stage_pr_comment_fetch(self):
         """Wake the PR-comment fetch worker (XERK-543). Called from the beat on
         the PR_COMMENTS cadence, which STAGES the network fetch off-beat and
@@ -30444,6 +31080,12 @@ class SessionManager:
                     # records the outbox on the beat.
                     self._stage_input(cmd.get("sessionId"), cmd.get("text") or "",
                                       uploads=cmd.get("uploads"))
+                    # The operator answered: an open ask-in-chat row closes on
+                    # it (XERK-1563). Never worth failing the input over.
+                    try:
+                        self._permission_close_ask(cmd.get("sessionId"))
+                    except Exception as e:
+                        log(f"permission ledger ask close failed: {e}")
                 elif ctype == "interrupt":
                     self.interrupt(cmd.get("sessionId"))
                 elif ctype == "setSummary":
@@ -31061,6 +31703,14 @@ class SessionManager:
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
+            # The permission ledger's pane + ask-in-chat edges (XERK-1563), off
+            # the signals just read. Its own guard: a ledger row is never worth
+            # this session's signals, let alone the beat.
+            if signals is not None:
+                try:
+                    self._permission_edges(sess, signals)
+                except Exception as e:
+                    log(f"permission ledger edge failed for {sid}: {e}")
         # _session_git reads repoPath/worktreePath and shells out to git; on the
         # beat loop a record missing those keys (a legacy/hand-edited/partial
         # ~/.turma/sessions.json) must degrade to "no git info", never raise and
@@ -31575,6 +32225,15 @@ class SessionManager:
                 self._reconcile_rc_names()
             except Exception as e:
                 log(f"rc-name reconcile failed: {e}")
+        # The permission ledger (XERK-1563): the hook-log TAIL runs on its own
+        # worker (staged here, every full beat); the beat only folds what the
+        # previous pass staged, before the sessions' pane edges below claim it.
+        if not light:
+            self._stage_permission_fetch()
+        try:
+            self._apply_permission_hook_rows()
+        except Exception as e:
+            log(f"permission hook rows failed: {e}")
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
@@ -31759,6 +32418,16 @@ class SessionManager:
         with self._merge_pr_lock:
             if self.merge_pr_results:
                 payload["mergePrResults"] = list(self.merge_pr_results)
+        # The permission ledger's rows (XERK-1563), oldest first, at most
+        # PERMISSION_EVENTS_MAX a beat; the rest wait for the next. Snapshotted
+        # under the lock and cleared BY IDENTITY like mergePrResults. NOT an
+        # on-demand result: _drop_on_demand_results never sheds it — a row is
+        # an event that exists nowhere else.
+        self._perm_first_beat_done = True
+        with self._permission_lock:
+            if self.permission_events:
+                payload["permissionEvents"] = list(
+                    self.permission_events[:PERMISSION_EVENTS_MAX])
         if self.spawn_failures:
             # Snapshotted under the lock the export thread's _refuse_start
             # appends under (XERK-397): post() removes exactly these delivered
@@ -31873,6 +32542,14 @@ class SessionManager:
             with self._merge_pr_lock:
                 self.merge_pr_results[:] = [
                     x for x in self.merge_pr_results if id(x) not in delivered]
+        # The permission ledger's rows (XERK-1563), the same way: only what
+        # THIS payload carried, so a row emitted after the snapshot survives.
+        pstaged = payload.get("permissionEvents")
+        if pstaged:
+            delivered = {id(x) for x in pstaged}
+            with self._permission_lock:
+                self.permission_events[:] = [
+                    x for x in self.permission_events if id(x) not in delivered]
 
     def post(self, payload):
         """POST one heartbeat. Returns the parsed reply dict, or None on failure

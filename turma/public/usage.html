@@ -218,6 +218,42 @@
     font-family: inherit; font-size: 13px; word-break: normal;
   }
 
+  /* "Permission prompts" (XERK-1563): every prompt that held a session, grouped
+     with the allow rule that would retire it. Reuses the models card; the rule
+     column is mono + a copy button, the recent list sits under a disclosure. */
+  .perm-card td:first-child { font-family: inherit; font-size: 13px; word-break: normal; white-space: normal; min-width: 180px; }
+  .perm-card .perm-rule { text-align: left; white-space: normal; min-width: 220px; }
+  .perm-kind {
+    display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: 0.01em;
+    padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--ink-2); background: var(--page); white-space: nowrap;
+  }
+  .perm-kind.k-classifier-denied { color: var(--critical); border-color: currentColor; background: transparent; }
+  .perm-kind.k-ask-in-chat { color: var(--warning); border-color: currentColor; background: transparent; }
+  .perm-subj { font-family: var(--font-mono); font-size: 12px; color: var(--ink); margin-top: 4px; word-break: break-all; }
+  .perm-tool { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .perm-rule code {
+    font-family: var(--font-mono); font-size: 12px; color: var(--ink);
+    background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+    padding: 2px 6px; word-break: break-all; display: inline-block; max-width: 100%;
+  }
+  .perm-rule .none { color: var(--muted); }
+  .perm-copy {
+    font: inherit; font-size: 11.5px; margin-left: 6px; padding: 2px 8px; cursor: pointer;
+    color: var(--ink-2); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); vertical-align: middle;
+  }
+  .perm-copy:hover { color: var(--accent); border-color: var(--accent); }
+  .perm-recent { list-style: none; margin: 8px 0 0; padding: 0; }
+  .perm-recent li {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px;
+    padding: 7px 0; border-bottom: 1px solid var(--hairline); font-size: 12.5px;
+  }
+  .perm-recent li:last-child { border-bottom: none; }
+  .perm-recent .perm-subj { margin-top: 0; flex: 1 1 220px; min-width: 0; }
+  .perm-recent .meta { color: var(--muted); font-size: 11.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .perm-empty { color: var(--muted); font-size: 12.5px; padding: 6px 0 2px; }
+
   @media (max-width: 600px) {
     .chart-card { padding: 12px 10px 8px; }
     .models-card { padding: 12px 10px; }
@@ -240,6 +276,7 @@
   <div class="viewbar" id="viewbar"></div>
   <div id="chart"></div>
   <div id="models"></div>
+  <div id="permissions"></div>
   <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. There is <b>one card per subscription</b>, not per host: hosts logged into the same Claude account are reading and spending the same pool, so they fold into one card listing them all, and each window shows the freshest reading any of them took. A host whose agent is too old to say which account it's on stays on a card of its own. The <b>token figures</b> — the Today / This week / All-time totals above the limits, and every breakdown of them below — are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 </div>
@@ -1552,6 +1589,116 @@ function mergeSnapshot(body, since) {
   cache = body;
 }
 
+// ---- Permission prompts (XERK-1563) -----------------------------------------
+// Every prompt that held a session — a TUI permission dialog, an auto-mode
+// classifier block, or the session asking for permission in chat — grouped by
+// what it asked about, with the allow rule that would retire it (the hub's
+// deterministic `suggestedRule`). Its own fetch (`/api/permissions`), scoped by
+// the header's org filter like everything else here; it does not ride
+// /api/agents, so the beat's SSE patches never repaint it.
+const $perms = document.getElementById("permissions");
+const PERM_DAYS = 7;
+const PERM_REFRESH_MS = 60000;
+const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat" };
+let permView = null;
+let permFetchSeq = 0;
+
+function permWait(ms) {
+  return typeof ms === "number" && Number.isFinite(ms) && ms >= 0 ? fmtDuration(ms / 1000) : "—";
+}
+function permKindHtml(g) {
+  const kind = PERM_KIND[g.kind] ? g.kind : "dialog";
+  const sub = g.kind === "dialog" && g.dialogKind && g.dialogKind !== "permission" ? ` · ${g.dialogKind}` : "";
+  return `<span class="perm-kind k-${kind}">${esc((PERM_KIND[g.kind] || "Prompt") + sub)}</span>`;
+}
+function permSubject(g) {
+  if (g.head) return g.head;
+  if (g.kind === "ask-in-chat") return g.prompt || "asked for permission in chat";
+  return g.tool || "—";
+}
+function permNum(n) { return typeof n === "number" && Number.isFinite(n) ? n : 0; }
+
+// The whole card, as markup — pure over the hub's `{days, top, recent}`. Every
+// field is agent-supplied text, so every one is escaped (a rule or a command can
+// carry anything).
+function permissionsCardHtml(view, now) {
+  const days = view && permNum(view.days) > 0 ? permNum(view.days) : PERM_DAYS;
+  const head = `<h2>Permission prompts (${days} days)</h2>` +
+    `<div class="note">Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat ` +
+    `that held a session, grouped with the allow rule that would retire it.</div>`;
+  if (!view) return head + `<div class="perm-empty">Loading…</div>`;
+  const top = Array.isArray(view.top) ? view.top.filter((g) => g && typeof g === "object") : [];
+  const recent = Array.isArray(view.recent) ? view.recent.filter((r) => r && typeof r === "object") : [];
+  if (!top.length) {
+    return head + `<div class="perm-empty">No permission prompts recorded in the last ${days} days for the selected orgs.</div>`;
+  }
+  const rows = top.map((g) => {
+    const rule = typeof g.suggestedRule === "string" && g.suggestedRule ? g.suggestedRule : "";
+    const subject = permSubject(g);
+    const tool = g.tool && g.head && g.tool !== g.head ? `<div class="perm-tool">${esc(g.tool)}</div>` : "";
+    return `<tr>
+      <td>${permKindHtml(g)}<div class="perm-subj">${esc(subject)}</div>${tool}</td>
+      <td>${permNum(g.count)}</td>
+      <td>${permNum(g.allowed)} / ${permNum(g.denied)}</td>
+      <td>${esc(permWait(g.medianWaitMs))}</td>
+      <td class="perm-rule">${rule
+        ? `<code>${esc(rule)}</code><button type="button" class="perm-copy" data-perm-rule="${esc(rule)}" title="Copy this rule">Copy</button>`
+        : `<span class="none">no rule retires this</span>`}</td>
+    </tr>`;
+  }).join("");
+  const table = `<div class="table-scroll"><table>
+    <thead><tr><th>Prompt</th><th>Count</th><th>Allowed / denied</th><th>Median wait</th><th class="perm-rule">Suggested rule</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+  const items = recent.map((r) => {
+    const opened = permNum(r.openedAt);
+    const ago = opened ? fmtDuration((now - opened) / 1000) + " ago" : "";
+    // A closed row without a wait (a classifier block holds nothing) says only
+    // its answer; a row with no close yet is still holding its session.
+    const parts = [];
+    if (typeof r.waitedMs === "number") parts.push(`waited ${permWait(r.waitedMs)}`);
+    else if (!r.closedAt) parts.push("still open");
+    if (r.answer) parts.push(r.answer);
+    const wait = parts.join(" · ");
+    return `<li>${permKindHtml(r)}<span class="perm-subj">${esc(permSubject(r))}</span>` +
+      `<span class="meta">${esc(r.host || "")}</span>` +
+      `<span class="meta">${esc(wait)}</span><span class="meta">${esc(ago)}</span></li>`;
+  }).join("");
+  const list = items
+    ? `<details class="table-view"><summary>Recent prompts (${recent.length})</summary><ul class="perm-recent">${items}</ul></details>`
+    : "";
+  return head + table + list;
+}
+
+function paintPermissions() {
+  $perms.innerHTML = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now())}</div>`;
+}
+
+async function refreshPermissions() {
+  const seq = ++permFetchSeq;
+  const keys = (TurmaOrg.getKeys && TurmaOrg.getKeys()) || [];
+  const q = new URLSearchParams({ days: String(PERM_DAYS) });
+  if (keys.length) q.set("org", keys.join(","));
+  try {
+    const r = await fetch("/api/permissions?" + q.toString());
+    if (!r.ok) return;
+    const body = await r.json();
+    if (seq !== permFetchSeq) return;        // an org change raced this answer
+    permView = body;
+    paintPermissions();
+  } catch { /* keep the last view */ }
+}
+
+// One delegated listener: the card is repainted wholesale, its buttons are not.
+$perms.addEventListener("click", (ev) => {
+  const btn = ev.target && ev.target.closest && ev.target.closest("[data-perm-rule]");
+  if (!btn) return;
+  const rule = btn.getAttribute("data-perm-rule") || "";
+  const done = (label) => { btn.textContent = label; setTimeout(() => { btn.textContent = "Copy"; }, 1500); };
+  try {
+    navigator.clipboard.writeText(rule).then(() => done("Copied"), () => done("Copy failed"));
+  } catch { done("Copy failed"); }
+});
+
 async function refresh() {
   const since = sseClock;   // captured BEFORE the fetch — the write window is its RTT
   try {
@@ -1643,10 +1790,13 @@ function connectSSE() {
 // The org scope lives in the header and applies to every page (XERK-62);
 // a change there repaints this one straight away rather than waiting for
 // the next beat.
-TurmaOrg.subscribe(() => { if (cache) render(cache); });
+TurmaOrg.subscribe(() => { if (cache) render(cache); refreshPermissions(); });
 refresh();
 connectSSE();
 setInterval(() => { if (!sseOk) refresh(); }, 30000);
+paintPermissions();
+refreshPermissions();
+setInterval(refreshPermissions, PERM_REFRESH_MS);
 let resizeTimer;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);

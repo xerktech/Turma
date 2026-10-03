@@ -251,3 +251,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     silently when env vars absent. Kill/delete/restart clear pending req/ans files. `multiSelect`
     accepts `optionIndices`.
   - Tests: `test_ask.py`, `TestHookQuestion`, `TestAnswerQuestion`, `test_guard_settings.py`.
+- **Permission ledger hook** (`hooks/permlog.py`, XERK-1563) — wired on `PermissionRequest` and
+  `PermissionDenied` (NOT `PreToolUse`, whose matcher list stays `["Bash","AskUserQuestion"]` plus
+  the file guard); RECORDS one line per event to `~/.turma/permissions/<sid>.jsonl`, decides nothing,
+  fails open on everything, `-SsE` like every hook, wired only when the script exists. Its dir is
+  `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `turma-permissions.md`.

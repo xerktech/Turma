@@ -16,7 +16,7 @@ RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/bin/npm /usr/local/bin/npx
 
 ENV NODE_ENV=production
 WORKDIR /app
-COPY server.js archive.js tar.js push.js usage-ledger.js usage-ledger-store.js ha-config.js store.js leader.js blobstore.js archive-mirror.js pgclient.js index-store.js relay.js forward.js ./
+COPY server.js archive.js tar.js push.js usage-ledger.js usage-ledger-store.js permission-ledger.js ha-config.js store.js leader.js blobstore.js archive-mirror.js pgclient.js index-store.js relay.js forward.js ./
 COPY public ./public
 
 LABEL org.opencontainers.image.source="https://github.com/xerktech/DockerOps" \
