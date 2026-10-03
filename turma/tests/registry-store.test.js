@@ -180,6 +180,16 @@ test("XERK-756: the watch mirrors another replica's record without echoing it ba
   assert.equal(hub.agents.remote1, undefined, "a watched deletion is applied locally");
 });
 
+test("XERK-1451: the watch refuses a store record keyed by an unusable host name", async () => {
+  reset(true);
+  for (const key of ["__proto__", "constructor", "prototype", ".", ".."]) {
+    hub.applyRemoteAgent(key, { device: key, lastSeen: Date.now(), sessions: [], commands: [] });
+    assert.equal(Object.hasOwn(hub.agents, key), false, `${key} never lands in the fleet view`);
+  }
+  hub.applyRemoteAgent("ok-host", { device: "ok-host", lastSeen: Date.now(), sessions: [], commands: [] });
+  assert.ok(hub.agents["ok-host"], "an ordinary host name still applies");
+});
+
 // ---- XERK-919: single-writer handover hardening ------------------------------
 
 // A store whose watch callback the test drives by hand, so an echo can be delivered

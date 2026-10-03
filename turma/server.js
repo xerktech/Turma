@@ -2313,7 +2313,7 @@ const asPlainObject = (raw) =>
 // truthy keys, normalized to `true` (presence = enabled), matching every one of
 // these stores' identical boot filter.
 const asFlagMap = (raw) => {
-  const o = {};
+  const o = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [k, v] of Object.entries(raw)) if (v) o[k] = true;
   }
@@ -2668,7 +2668,7 @@ function orgModelAliases(siteKey) {
 // the key). Unlike the ticket->agent pins there's no eviction cap: orgs are
 // bounded by how many Jira sites the operator connects (a handful), not by the
 // churn of tickets. See AUTOSTART_ORGS_FILE for why it's durable and hub-owned.
-let autoStartOrgs = {};
+let autoStartOrgs = Object.create(null);
 autoStartOrgs = asFlagMap(readJsonFile(AUTOSTART_ORGS_FILE));
 const persistAutoStartOrgs = registerExternalStore({
   name: "autoStartOrgs", file: AUTOSTART_ORGS_FILE,
@@ -2697,7 +2697,7 @@ function setAutoStartOrg(siteKey, enabled) {
 // lifecycle as autoStartOrgs; OFF by default everywhere, since it MERGES code to
 // the default branch with no human review — the operator's deliberate,
 // per-project trust decision, mirroring the auto-start switch it sits beside.
-let autoMergeOrgs = {};
+let autoMergeOrgs = Object.create(null);
 autoMergeOrgs = asFlagMap(readJsonFile(AUTOMERGE_ORGS_FILE));
 const persistAutoMergeOrgs = registerExternalStore({
   name: "autoMergeOrgs", file: AUTOMERGE_ORGS_FILE,
@@ -2768,12 +2768,12 @@ function setTicketTriageAction(siteKey, issueKey, action) {
 // excludeTypes, repoAllow/repoDeny, rateMax. siteKey -> policy object. Loaded
 // with per-field sanitization at boot so a hand-edited file can't smuggle a
 // non-string into a .includes() or a float into a rate comparison.
-let triagePolicies = {};
+let triagePolicies = Object.create(null);
 // Per-org, per-field sanitize — the same whitelist the file boot-load applied,
 // now also guarding a malformed remote value on the watch path (a non-string in
 // a .includes(), a float in the rate compare).
 const triagePoliciesCoerce = (raw) => {
-  const out = {};
+  const out = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [k, v] of Object.entries(raw)) {
       const p = {};
@@ -3468,7 +3468,7 @@ function epicRunDriveSweep() {
 // keyed by siteKey with the value simply `true` (presence = enabled; disabling
 // deletes the key). Writing priority into someone's tracker is intrusive, so
 // this is OFF by default everywhere. Same shape and lifecycle as autoStartOrgs.
-let priorityWriteBackOrgs = {};
+let priorityWriteBackOrgs = Object.create(null);
 priorityWriteBackOrgs = asFlagMap(readJsonFile(PRIORITY_WRITEBACK_ORGS_FILE));
 const persistPriorityWriteBackOrgs = registerExternalStore({
   name: "priorityWriteBackOrgs", file: PRIORITY_WRITEBACK_ORGS_FILE,
@@ -3491,7 +3491,7 @@ function setPriorityWriteBackOrg(siteKey, enabled) {
 // siteKey with the value simply `true` (presence = enabled; disabling deletes
 // the key). Writing issue links into someone's tracker is intrusive, so this is
 // OFF by default everywhere. Same shape and lifecycle as priorityWriteBackOrgs.
-let dedupeLinkOrgs = {};
+let dedupeLinkOrgs = Object.create(null);
 dedupeLinkOrgs = asFlagMap(readJsonFile(DEDUPE_LINK_ORGS_FILE));
 const persistDedupeLinkOrgs = registerExternalStore({
   name: "dedupeLinkOrgs", file: DEDUPE_LINK_ORGS_FILE,
@@ -3513,11 +3513,11 @@ function setDedupeLinkOrg(siteKey, enabled) {
 // The operator's per-org palette pins, keyed by siteKey with the value the slot
 // number (1..8). Loaded like the auto-start opt-in: only well-formed entries
 // survive a read, so a hand-edited or corrupt file degrades to auto colors.
-let orgColors = {};
+let orgColors = Object.create(null);
 // Keep only in-range integer slots — the file boot-load's filter, now also on the
 // watch path so a hand-edited or malformed remote value degrades to auto colors.
 const orgColorsCoerce = (raw) => {
-  const o = {};
+  const o = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [k, v] of Object.entries(raw)) {
       if (Number.isInteger(v) && v >= 1 && v <= ORG_COLOR_SLOTS) o[k] = v;
@@ -3558,12 +3558,12 @@ const DEFAULT_REPO_TIER = "active";
 // the key is bounded like every other durable free-text key.
 const REPO_NAME_MAX = 200;
 const isRepoTier = (t) => typeof t === "string" && Object.hasOwn(REPO_TIER_RANK, t);
-let repoTiers = {};
+let repoTiers = Object.create(null);
 // Keep only NON-default, in-range tiers (the default is implicit, so storing it
 // is dead weight — setRepoTier deletes back to it). Same whitelist the file
 // boot-load used, now also guarding a malformed remote value on the watch path.
 const repoTiersCoerce = (raw) => {
-  const o = {};
+  const o = Object.create(null);
   if (raw && typeof raw === "object" && !Array.isArray(raw)) {
     for (const [k, v] of Object.entries(raw)) {
       if (k && k.length <= REPO_NAME_MAX && isRepoTier(v) && v !== DEFAULT_REPO_TIER) o[k] = v;
@@ -3577,7 +3577,7 @@ const repoTiersCoerce = (raw) => {
 // load), NEVER on a remote watch: a runtime change on any replica is authoritative
 // and must not be undone by the seed, and an operator RELEASE still reverts to the
 // seed at the next boot (the seed is a boot-time default, as it always was).
-const repoTierSeed = {};
+const repoTierSeed = Object.create(null);
 if (REPO_TIER_SEED) {
   try {
     const seed = JSON.parse(REPO_TIER_SEED);
@@ -5055,6 +5055,13 @@ function publishAgent(key) {
 // off the map here in the meantime.
 function applyRemoteAgent(key, value) {
   if (!value || typeof value !== "object") return;
+  // The same host-key gate the heartbeat, state.json restore and boot hydration
+  // apply (XERK-1451): a store record keyed `agent:__proto__`/`agent:constructor`
+  // would otherwise reach every client that keys a plain object by host name.
+  if (!isPlainHostKey(key)) {
+    console.error(`HA registry: ignoring store record for unusable host key ${hostKeyLabel(key)}`);
+    return;
+  }
   // Caches are per-process (kept LOCAL, XERK-756) — a store record never carries
   // them, so preserve whatever this replica already holds for the host rather
   // than let a remote update (or a self-echo) blank them.
