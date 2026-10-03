@@ -224,6 +224,7 @@ class ArchiveMirror {
       const ordered = listing.filter((it) => !isMeta(it && it.key))
         .concat(listing.filter((it) => isMeta(it && it.key)));
       const fetchedJsonl = new Set();
+      const sameJsonl = new Set();   // local `.jsonl` byte-for-byte the bucket's size
       const listedKeys = new Set(listing.map((it) => it && it.key));
       for (const item of ordered) {
         const key = item && item.key;
@@ -235,10 +236,15 @@ class ArchiveMirror {
         const jsonlKey = isMeta(key) ? key.slice(0, -".meta".length) : null;
         // Skip when local is same-size OR larger (ahead of the bucket) — only a
         // missing/partial (smaller) local is (re)fetched. Never truncate a leader.
-        // A sidecar instead goes with its `.jsonl`'s decision when that is listed.
+        // A sidecar instead goes with its `.jsonl`'s decision when that is listed:
+        // fetched with it, kept with a local copy that is ahead, and refreshed when
+        // the copies match but the sidecars differ (a de-dup chunk rewrites the
+        // sidecar without growing the file).
         const fetch = jsonlKey && listedKeys.has(jsonlKey)
-          ? localSize < 0 || fetchedJsonl.has(jsonlKey)
+          ? localSize < 0 || fetchedJsonl.has(jsonlKey) ||
+            (sameJsonl.has(jsonlKey) && localSize !== item.size)
           : localSize < item.size;
+        if (!jsonlKey && !rawRootOf(key) && localSize === item.size) sameJsonl.add(key);
         if (!fetch) { this._blocked.delete(key); continue; }
         if (!isMeta(key) && !rawRootOf(key)) fetchedJsonl.add(key);
         const root = rawRootOf(key);

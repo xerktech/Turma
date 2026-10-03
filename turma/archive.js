@@ -1334,6 +1334,12 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   try { fileSize = fs.statSync(paths.jsonl).size; } catch { /* absent: 0 */ }
   let prevCount = row ? (row.msgCount || 0) : 0;
   let archiveBytes = (row && row.archiveBytes) || 0;
+  // The Set is a cache of the sidecar's `cursorUnverified`, which is what
+  // survives a restart: a non-HA boot keeps index.db and rebuilds nothing.
+  if (!unverifiedCursors.has(transcriptId) && fileSize > 0) {
+    const sc = readSidecar(paths.meta);
+    if (sc && sc.cursorUnverified) unverifiedCursors.add(transcriptId);
+  }
   const wasSuspect = unverifiedCursors.has(transcriptId);
   if (wasSuspect || fileSize > archiveBytes) {
     const held = heldEntries(paths.jsonl);

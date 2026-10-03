@@ -1753,8 +1753,7 @@ test("XERK-1364: a restart mid-re-send stays de-duplicated; held entries stay se
 
   archive.closeDb();
   delete require.cache[require.resolve("../archive.js")];
-  const fresh = require("../archive.js");
-  fresh.rebuildIndex();
+  const fresh = require("../archive.js");   // index.db kept; a non-HA boot rebuilds nothing
   assert.equal(fresh.manifestCursors("nas", [{ transcriptId: id, ...m }])[id], 10);
   fresh.ingestChunk("nas", id, m, 10, 20, b2);  // the rest of the re-send, after the restart
   fresh.ingestChunk("nas", id, m, 20, 30, [ent("r4", "assistant", "four")]);

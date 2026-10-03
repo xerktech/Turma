@@ -907,3 +907,16 @@ test("XERK-1364: hydrate re-fetches a .meta with its .jsonl, and keeps it with a
   assert.equal(await m.hydrate(), 0);
   assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl.meta"), "utf8"), '{"b":3}');
 });
+
+test("XERK-1364: a matching .jsonl with a different .meta refreshes the sidecar", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.from("one\n"));
+  store.map.set("repo/a.jsonl.meta", Buffer.from('{"bytesStored":9,"cursorUnverified":true}'));
+  fs.mkdirSync(path.join(root, "repo"), { recursive: true });
+  fs.writeFileSync(path.join(root, "repo", "a.jsonl"), "one\n");
+  fs.writeFileSync(path.join(root, "repo", "a.jsonl.meta"), '{"bytesStored":4}');
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {} });
+  assert.equal(await m.hydrate(), 1);
+  assert.match(fs.readFileSync(path.join(root, "repo", "a.jsonl.meta"), "utf8"), /cursorUnverified/);
+});
