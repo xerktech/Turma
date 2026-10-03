@@ -65,9 +65,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     classifier. pr-summary is no credential filter: it refuses a second description flag, `-dF`
     clusters included (below), but a conforming body plus `$(cat ~/.config/gh/hosts.yml)`, or a
     lone `--body-file` under `TURMA_PR_SUMMARY=0`, still posts the file unless Claude Code's prefix
-    match refuses the substitution — unmeasured, part of the spike below. A stdin body is closed
-    (below); a `--body-file` the command creates first (`cp <cred> b.md; … -F b.md`) is still vouched
-    for by any heredoc in it — the `cp` half stays with the classifier.
+    match refuses the substitution — unmeasured, part of the spike below. Stdin and fd paths are
+    closed (below), as is a body file an earlier segment names (`cp <cred> b.md; … -F b.md`); one
+    spelled so the hook can't match it (a glob, `$(…)`) or swapped by an EARLIER tool call is not.
   - `TURMA_TOOL_ALLOW` splits on every comma with no escape, so a rule whose pattern holds a comma
     cannot be set through it (it lands as two malformed rules).
   - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
@@ -126,13 +126,25 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   - **A STDIN description must be the PR command's OWN heredoc** (XERK-1565, `_stdin_redirects`):
     gh reads whatever fd 0 ends up as, so `-F - <<EOF … < hosts.yml` (also `0<`, `<<<`, `<&`, a pipe,
     or a sibling's heredoc: `-F - < f; gh pr view 1 <<EOF`) posted the file on the heredoc's sections.
-    A file flag plus any non-heredoc fd-0 input is refused; `-` or `/dev/stdin` needs one heredoc
-    in the command, on that segment; `/dev/fd/N` (N≠0) is refused outright.
+    `-` or a path resolving to `/dev/stdin` needs one heredoc in the command, on that segment.
+  - **A description FILE fails CLOSED** (XERK-1565, `_pr_description_file`) — never enumerate bad
+    paths; four rounds of that each left one (`/dev/stderr 2<f`, `//dev/fd/3 3<f`, a symlink).
+    - Accepted ONLY: stdin as above; a REGULAR file outside `/dev` and `/proc`; or a path that does
+      not exist yet and an earlier heredoc-only `cat > f <<EOF` / `tee f <<EOF` writes (`_note_paths`).
+    - Refused: every other `/dev`/`/proc` name, a non-regular or unreadable path, a missing file
+      nothing writes, and a file an earlier segment names any other way (`ln -sf /dev/stdin f`,
+      `cp hosts.yml f`, `cat hosts.yml <<EOF > f`) — each with its own reason. Only a pure reader or
+      remover (`rm`, `cat`, `test`, … `_PR_PATH_READERS`) may name it; its output redirects count.
+    - Symlinks resolve one component at a time and NEVER through `/dev`/`/proc`: `realpath` follows
+      the HOOK's own `/proc/self/fd` links, which name different fds in gh. A leading `//` is `/`.
+    - With a file flag, an input redirect on ANY fd (`<`, `N<`, `<&`, `<<<`) is refused, and a
+      redirect BEFORE the command word (`< f gh pr create -F -`) is the PR command's
+      (`_drop_leading_redirects`).
   - **A shorthand CLUSTER is a description flag too** (`_shorthand_value`): pflag reads `-dF x` as
     `-d -F x`, so `--body-file ok.md -dF hosts.yml` (also `-dFhosts.yml`, `-wF`, glab `-yd`) is
     two sources. ANY letter of a single-dash token counts (gh `b`/`F`, glab `d`): a glued value
     holding one (`-Rbob/r`) over-refuses; stopping at a misjudged value-taking letter would leak.
-  - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_text`): a FIFO at the body or
+  - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_regular`): a FIFO at the body or
     template path hung the hook, and Claude Code lets a timed-out hook's command THROUGH.
   - Headings match with `(?!\w)`, not `\b` — a template heading ending `?`/`:`/`)` never matched.
   - Not covered (accepted): `gh api …/pulls`, `hub pull-request`, `git push -o
