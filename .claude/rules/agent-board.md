@@ -24,10 +24,19 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   so no new query. Wire mirrors that must agree: agent shape → `normalizeJira` whitelist (blocks/
   blockedBy `coerceStringList`, epicKey non-string→absent, isEpic non-bool→absent) → Android
   `JiraTicket`/`JiraIssueDetail` typed decode (a malformed field is decode-fatal for the whole atomic
-  `/api/agents` array, so absence = "not collected"). Azure is out of scope — it emits none, and the
-  Android defaults (null/false/[]) read them as absent. Tests: `TestShapeIssue`
+  `/api/agents` array, so absence = "not collected"). Tests: `TestShapeIssue`
   (`test_epic_membership`/`test_*_links`/`test_malformed_issuelinks_degrade`/`test_links_are_bounded`),
   the XERK-455 `normalizeRecord` case, Android `AgentDecodeTest`.
+- **Azure emits `isEpic`/`epicKey` too (XERK-1444), but no `blocks`/`blockedBy`.** `isEpic` = the
+  work item's type is a portfolio level, `Epic` OR `Feature` (`_AZDO_EPIC_TYPES`, by name) — so the
+  hub keeps both off the org auto-start/auto-merge stream. Do not narrow it back to `Epic` only: a
+  Feature is ADO's Jira-Epic level, and leaving it out lets its stories auto-merge unreviewed.
+  - `epicKey` = `parentKey` ONLY when the parent's type is a portfolio level, and never on an
+    organizer itself (a Feature under an Epic keeps `epicKey` None, so an epic run's children are
+    only work items — arm the Feature, not the Epic, to run its stories).
+  - The batch GET has no parent type, so `fetch_azure_items` makes ONE extra type-only GET for
+    parents outside the batch (`_azure_parent_types`); a failure there leaves `epicKey` None and
+    keeps the board. Tests: the `xerk1444` cases in `TestShapeAzureItem` + `TestCollectAzure`.
 - **An agent serves exactly ONE org** (a host is Jira or Azure, never both).
   `board_source()`/`board_configured()`/`collect_board()`/`fetch_board_issue()`/`board_site_key()`/
   `valid_issue_key()` are the dispatch shims every gate goes through; downstream reads `self.jira`
