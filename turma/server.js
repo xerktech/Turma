@@ -8796,14 +8796,16 @@ function normalizeClaudeAuth(a) {
 }
 
 // `capacity` (Capacity? on Android). maxSessions/running/queued/free are Int,
-// rootRunning is Boolean.
+// rootRunning is Boolean. They are COUNTS, so a negative one is dropped as "can't
+// tell" (XERK-1479): the dashboard sums maxSessions across hosts, and one agent
+// beating -2^31 poisoned the fleet ceiling. Real agents never send one.
 function normalizeCapacity(a) {
   if (!a || typeof a !== "object") return;
   if (!("capacity" in a)) return;
   if (!objectish(a.capacity)) { delete a.capacity; return; }
   const c = a.capacity;
   for (const k of ["maxSessions", "running", "queued", "free"]) {
-    if (k in c && !wireInt32(c[k])) delete c[k];
+    if (k in c && !(wireInt32(c[k]) && c[k] >= 0)) delete c[k];
   }
   if ("rootRunning" in c && typeof c.rootRunning !== "boolean") delete c.rootRunning;
 }
