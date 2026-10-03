@@ -989,7 +989,7 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
     // fall back to the claimed jira.siteKey, and a host claiming nothing is trusted.
     fun orgOf(a: AgentInfo): String? = a.org ?: a.jira?.siteKey?.ifBlank { null }
     fun add(host: String, s: TicketSession, org: String?) {
-        if (org != null && org != s.siteKey) return
+        if (org != null && (s.siteKey.isEmpty() || org != s.siteKey)) return
         // Untranscripted records can't collide (nothing to key on) and are rare:
         // a session killed before its first turn, or one an older agent wrote.
         if (s.transcriptId.isNotBlank() && !seen.add(host + "\u0000" + s.transcriptId)) return

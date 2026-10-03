@@ -1238,7 +1238,7 @@
       const t = s && s.ticket;
       if (!t || !t.key) return;
       const org = orgOf(a);
-      if (org != null && org !== t.siteKey) return;
+      if (org != null && (!t.siteKey || org !== t.siteKey)) return;
       const host = a.key || a.device;
       const tid = s.transcriptId;
       // Untranscripted records can't collide (nothing to key on) and are rare:

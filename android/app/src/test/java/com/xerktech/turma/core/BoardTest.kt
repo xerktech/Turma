@@ -869,6 +869,10 @@ class BoardTest {
         // Older hub (no served org): fall back to the claimed siteKey; no claim = trusted.
         assertEquals(0, chips(host("hO", org = null, claims = "A", tid = "o")))
         assertEquals(3, chips(host("hN", org = null, claims = null, tid = "n")))
+        // A ticket naming no org matches no host org — not even a drifted host's "".
+        val siteless = AgentInfo(key = "hS", org = "", sessions = listOf(
+            com.xerktech.turma.model.SessionInfo(id = "s", ticket = tref("B-9", site = ""), transcriptId = "ts")))
+        assertTrue(ticketSessionIndex(listOf(siteless)).isEmpty())
     }
 
     @Test fun `chip label prefers rename, then branch, and state maps status`() {

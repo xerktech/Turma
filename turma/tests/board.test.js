@@ -1680,6 +1680,10 @@ test("ticketSessionIndex: a host's session counts only for the org it is decided
   // Decided into B: counts.
   const bound = agent("hostB", block({ siteKey: "B" }), { org: "B", sessions: [b1("s3")] });
   assert.deepEqual(ticketSessionsOf(ticketSessionIndex([bound]), "B", "B-1").map(s => s.id), ["s3"]);
+  // A ticket naming no org matches no host org — not even a drifted host's "".
+  const siteless = { ...tsess("s4", "B-9"), ticket: { key: "B-9" } };
+  const idx = ticketSessionIndex([agent("hostD", block({ siteKey: "B" }), { org: "", sessions: [siteless] })]);
+  assert.equal(idx.size, 0);
 });
 
 test("ticketSessionIndex: an older hub (no served org) falls back to the claimed siteKey", () => {
