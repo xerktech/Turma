@@ -4959,6 +4959,9 @@ class ManagerMixin:
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
+            # Derived from REGISTRY_DIR at import (XERK-1563): the permission
+            # ledger's hook-log tail would otherwise read the real host's logs.
+            ("PERMISSIONS_DIR", os.path.join(self.tmp, "permissions")),
             # Derived from REGISTRY_DIR at import; kill/delete rmtree a session's
             # request dir (XERK-1564), so it must never be the host's real one.
             ("SESSION_REQUESTS_DIR", os.path.join(self.tmp, "session-requests")),
@@ -36916,6 +36919,1045 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
                 mock.patch.object(ha.threading, "Thread") as t:
             sm._start_memguard()
         t.assert_not_called()
+
+
+class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
+    """The permission ledger's agent half (XERK-1563): dialog rows off the
+    panePrompt edges, merged with the hook rows the worker tails, classifier
+    denials, ask-in-chat rows, and the outbox's wire discipline."""
+
+    SID = "perm1"
+    CLAUDE_SID = "0b9f2c1e-1111-4222-8333-444455556666"
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        self.wt = os.path.join(self.tmp, "worktrees", "repo", "wt1")
+        os.makedirs(self.wt)
+        self.sess = {"id": self.SID, "status": "running", "tmuxName": "agent-perm1",
+                     "worktreePath": self.wt, "repoPath": self.wt,
+                     "claudeSessionId": self.CLAUDE_SID}
+        self.sm.registry = [self.sess]
+        self.tpath = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.wt),
+                                  f"{self.CLAUDE_SID}.jsonl")
+        os.makedirs(os.path.dirname(self.tpath))
+        self.lines = []
+        self.sm._perm_first_beat_done = True
+
+    # --- helpers --------------------------------------------------------------
+
+    def write(self, *entries):
+        self.lines.extend(entries)
+        with open(self.tpath, "w") as f:
+            for e in self.lines:
+                f.write(json.dumps(e) + "\n")
+
+    def tool_use(self, tuid, name="Bash", inp=None):
+        return {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tuid, "name": name,
+             "input": inp if inp is not None else {"command": "npm test"}}]}}
+
+    def tool_result(self, tuid, text="ok", is_error=False):
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tuid, "content": text,
+             "is_error": is_error}]}}
+
+    def dialog(self, prompt="Do you want to proceed?"):
+        return {"prompt": prompt, "detail": "Bash command\nnpm test",
+                "options": [{"number": 1, "label": "Yes", "selected": True},
+                            {"number": 2, "label": "Yes, and don't ask again",
+                             "selected": False},
+                            {"number": 3, "label": "No", "selected": False}]}
+
+    def sandbox(self, host="registry.npmjs.org"):
+        # Claude Code's sandbox escape, in its own wording (the 2.1.x TUI): a
+        # "Network request outside of sandbox" title, a "Host:" row, and the
+        # question, all drawn by the TUI rather than written by the call.
+        return {"prompt": "Do you want to allow this connection?",
+                "detail": f"Network request outside of sandbox\nHost: {host}",
+                "options": [{"number": 1, "label": "Yes", "selected": True},
+                            {"number": 2, "label": f"Yes, and don't ask again for {host}",
+                             "selected": False},
+                            {"number": 3,
+                             "label": "No, and tell Claude what to do differently (esc)",
+                             "selected": False}]}
+
+    def edge(self, pane_prompt=None, at=1000, **sig):
+        signals = {"panePrompt": pane_prompt, "paneBusy": False}
+        signals.update(sig)
+        self.sm._permission_edges(self.sess, signals, now_ms=at)
+
+    def rows(self):
+        return list(self.sm.permission_events)
+
+    def hook_rows(self, *rows):
+        self.sm._permission_rows_fetched = {self.SID: list(rows)}
+
+    def request_hook(self, ts=900, head="npm test", tool="Bash"):
+        # The REAL shape: Claude Code's PermissionRequest carries NO
+        # tool_use_id (2.1.288, confirmed with a live hook dumping its stdin),
+        # so permlog.py writes toolUseId null and the tail reads it as "".
+        return {"sessionId": self.SID, "event": "PermissionRequest", "ts": ts,
+                "toolUseId": "", "tool": tool, "head": head,
+                "digest": "{}", "rulesMatched": [f"{tool}({head}:*)"]}
+
+    # --- dialog edges ---------------------------------------------------------
+
+    def test_a_dialog_opens_a_row_carrying_the_pending_call(self):
+        self.write(self.tool_use("toolu_0"), self.tool_result("toolu_0"),
+                   self.tool_use("toolu_1", inp={"command": "npm test -- -x"}))
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual(row["kind"], "dialog")
+        self.assertEqual(row["dialogKind"], "permission")
+        self.assertEqual(row["openedAt"], 1000)
+        self.assertEqual(row["toolUseId"], "toolu_1")   # the one with no result
+        self.assertEqual(row["head"], "npm test")       # permlog.py's own head
+        self.assertEqual(row["options"], ["Yes", "Yes, and don't ask again", "No"])
+        self.assertNotIn("closedAt", row)
+        # Still up next beat: nothing new.
+        self.edge(self.dialog(), at=2000)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_the_closed_row_reports_turmas_own_answer(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        with mock.patch.object(ha, "_capture_pane", return_value=PANE_PERMISSION_DIALOG):
+            self.sm.answer_pane_prompt(self.SID, 3)
+        self.edge(None, at=4500)
+        closed = self.rows()[-1]
+        self.assertEqual(closed["id"], self.rows()[0]["id"])   # same row, upserted
+        self.assertEqual((closed["answer"], closed["answerNumber"], closed["via"]),
+                         ("deny", 3, "turma"))
+        self.assertEqual(closed["waitedMs"], 3500)
+        self.assertEqual(closed["closedAt"], 4500)
+
+    def test_an_answer_at_the_terminal_is_inferred_from_the_calls_result(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.write(self.tool_result(
+            "toolu_1", "The user doesn't want to proceed with this tool use.", True))
+        self.edge(None, at=2000)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("deny", "terminal"))
+        # …and a call that RAN is an allow.
+        self.write(self.tool_use("toolu_2"))
+        self.edge(self.dialog(), at=3000)
+        self.write(self.tool_result("toolu_2", "tests passed"))
+        self.edge(None, at=4000)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("allow", "terminal"))
+
+    def test_an_approved_call_that_failed_is_still_an_allow(self):
+        # Only Claude Code's own rejection wording reads deny: a call the
+        # operator approved that then failed with ordinary error text ran.
+        n = 0
+        for text in ("Exit code 1\ncat: /etc/shadow: Permission denied",
+                     "error: push to main is not allowed by branch protection",
+                     "permission denied while trying to connect to the Docker daemon socket",
+                     "git@github.com: Permission denied (publickey).",
+                     "ERROR: Permission to acme/x.git denied to bot."):
+            n += 1
+            tuid = f"toolu_f{n}"
+            self.write(self.tool_use(tuid))
+            self.edge(self.dialog(), at=n * 1000)
+            self.write(self.tool_result(tuid, text, True))
+            self.edge(None, at=n * 1000 + 500)
+            self.assertEqual(self.rows()[-1]["answer"], "allow", text)
+
+    def test_claude_codes_own_rejections_read_deny(self):
+        for text in (
+                "The user doesn't want to proceed with this tool use. The tool use "
+                "was rejected (eg. if it was a file edit, the new_string was NOT "
+                "written to the file).",
+                "Permission for this tool use was denied. The tool use was rejected.",
+                "Permission for this action has been denied. Reason: outside scope",
+                "Permission to use Bash with command rm -rf x has been denied.",
+                "<tool_use_error>Permission to use Bash with command x has been "
+                "denied.</tool_use_error>",
+                "User rejected Claude's plan:"):
+            entries = [self.tool_use("toolu_x"), self.tool_result("toolu_x", text, True)]
+            self.assertEqual(ha.tool_call_outcome(entries, "toolu_x"), "deny", text)
+        # The wording mid-result (quoted in a command's output) is not a refusal.
+        entries = [self.tool_use("toolu_y"), self.tool_result(
+            "toolu_y", "Exit code 1\nThe user doesn't want to proceed with this tool use.",
+            True)]
+        self.assertEqual(ha.tool_call_outcome(entries, "toolu_y"), "allow")
+
+    def test_no_result_yet_reads_allow_only_while_the_pane_is_busy(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge(None, at=2000, paneBusy=True)
+        self.assertEqual(self.rows()[-1]["answer"], "allow")
+        self.write(self.tool_use("toolu_2"))
+        self.edge(self.dialog(), at=3000)
+        self.edge(None, at=4000, paneBusy=None)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("unknown", "unknown"))
+
+    def test_dialog_kinds(self):
+        self.assertEqual(ha.classify_pane_dialog(ha.parse_pane_prompt(PANE_PLAN_DIALOG)),
+                         "plan")
+        self.assertEqual(ha.classify_pane_dialog(
+            ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)), "permission")
+        self.assertEqual(ha.classify_pane_dialog(self.sandbox()), "sandbox")
+        self.assertEqual(ha.classify_pane_dialog({"prompt": "Which one?"}), "other")
+        # A pending ExitPlanMode is the plan approval, even when a narrow pane
+        # wrapped all but the question's tail onto the lines above it.
+        self.assertEqual(ha.classify_pane_dialog(
+            {"prompt": "proceed?", "detail": "Plan\nI will add one test."},
+            {"tool": "ExitPlanMode", "toolUseId": "toolu_P"}), "plan")
+
+    def test_a_tool_prompts_own_text_never_picks_its_kind(self):
+        # The detail is the CALL's free text — its command, Claude's description
+        # of it, a path — so "plan", "sandbox" or "network access" in it says
+        # nothing about the dialog: each is an ordinary tool prompt.
+        cases = [
+            ("Bash command\nterraform plan -out tf.plan\nPlan the infra change",
+             "terraform plan -out tf.plan"),
+            ("Bash command\ngit add docs/plan.md\nStage the plan", "git add docs/plan.md"),
+            ("Bash command\ncurl -s https://api.github.com/repos/o/r\n"
+             "Check network access to GitHub", "curl -s https://api.github.com/repos/o/r"),
+            ("Bash command\nls sandbox/\nList the sandbox directory", "ls sandbox/"),
+        ]
+        for n, (detail, command) in enumerate(cases):
+            with self.subTest(command=command):
+                pp = dict(self.dialog(), detail=detail)
+                self.assertEqual(ha.classify_pane_dialog(pp), "permission")
+                self.lines = []
+                self.write(self.tool_use(f"toolu_{n}", inp={"command": command}))
+                self.edge(pp, at=1000 + n * 10000)
+                row = self.sm._perm_open[self.SID]
+                self.assertEqual(row["dialogKind"], "permission")
+                self.assertNotEqual(row["head"], "api.github.com")
+                self.edge(None, at=2000 + n * 10000)
+        # Nor does a path in the question of an edit prompt.
+        for q in ("Do you want to make this edit to docs/plan.md?",
+                  "Do you want to create sandbox/network-access.md?"):
+            with self.subTest(question=q):
+                self.assertEqual(ha.classify_pane_dialog(
+                    dict(self.dialog(), prompt=q), {"tool": "Edit"}), "permission")
+
+    def test_a_sandbox_dialog_names_its_host(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.sandbox())
+        row, = self.rows()
+        self.assertEqual((row["dialogKind"], row["head"]),
+                         ("sandbox", "registry.npmjs.org"))
+
+    # --- hook rows ------------------------------------------------------------
+
+    def test_a_permission_request_merges_into_its_dialog_by_its_call(self):
+        # Tailed before the dialog is seen: held, then claimed by the dialog
+        # whose pending call is the same tool + head — though that row carries a
+        # transcript toolUseId and the hook none.
+        self.write(self.tool_use("toolu_1"))
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.assertEqual(self.rows(), [])          # held for the dialog
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual(row["rulesMatched"], ["Bash(npm test:*)"])
+        self.assertEqual(row["toolUseId"], "toolu_1")   # the transcript's, kept
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
+
+    def test_a_held_request_and_its_dialog_are_one_row_never_two(self):
+        # Hook staging and the pane edge on different beats: the dialog opens
+        # and closes, and once the hold runs out no second `r-` row appears.
+        self.write(self.tool_use("toolu_1"))
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.edge(self.dialog(), at=1000)
+        self.write(self.tool_result("toolu_1"))
+        self.edge(None, at=2000)
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertEqual({r["id"] for r in self.rows()}, {f"d-{self.SID}-1000"})
+        self.assertEqual(self.rows()[-1]["rulesMatched"], ["Bash(npm test:*)"])
+
+    def test_the_real_hook_line_merges_end_to_end(self):
+        # permlog.py's own row for the real event shape, through the tail's
+        # parser, merges into the open dialog: no toolUseId anywhere upstream.
+        mod = ha._permlog_module()
+        self.assertIsNotNone(mod)
+        line = mod.build_row({
+            "session_id": self.CLAUDE_SID, "transcript_path": self.tpath,
+            "cwd": self.wt, "prompt_id": "p1", "permission_mode": "default",
+            "hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "permission_suggestions": [{"rules": [
+                {"toolName": "Bash", "ruleContent": "npm test:*"}]}]}, now_ms=900)
+        self.assertIsNone(line["toolUseId"])
+        parsed, _ = ha.parse_permission_log_lines(
+            (json.dumps(line) + "\n").encode(), self.SID)
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(*parsed)
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        row = self.sm._perm_open[self.SID]
+        self.assertEqual((row["toolUseId"], row["digest"], row["rulesMatched"]),
+                         ("toolu_1", line["digest"], ["Bash(npm test:*)"]))
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), None)
+
+    def test_a_request_for_another_call_is_not_merged_into_the_open_dialog(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook(head="git push", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
+        held = self.sm._perm_hook_pending[self.SID]
+        self.assertEqual([h["head"] for h, _ in held.values()], ["git push"])
+
+    def test_a_request_stamped_after_the_dialog_was_seen_is_a_later_prompts(self):
+        # A hook fires BEFORE its dialog is drawn: one stamped well after the
+        # beat that saw this dialog belongs to the next prompt, same command or not.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        late = 1000 + ha.PERMISSION_HOOK_LATE_MS + 1
+        self.hook_rows(self.request_hook(ts=late))
+        self.sm._apply_permission_hook_rows(now_ms=late, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
+        self.assertEqual(len(self.sm._perm_hook_pending[self.SID]), 1)
+
+    def test_a_sandbox_prompt_never_takes_a_permission_request(self):
+        # A sandbox escape is not hookable: a request held while one is up is
+        # the call's own prompt (or another's), never the sandbox prompt's.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox(), at=1000)
+        self.hook_rows(self.request_hook(head="npm install", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
+
+    def test_a_request_tailed_after_its_dialog_closed_upserts_that_row(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge(None, at=2000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=2100, mono=0)
+        last = self.rows()[-1]
+        self.assertEqual(last["id"], self.rows()[0]["id"])
+        self.assertEqual(last["rulesMatched"], ["Bash(npm test:*)"])
+        self.assertIn("closedAt", last)
+
+    def test_an_unclaimed_request_becomes_its_own_dialog_row(self):
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.sm._apply_permission_hook_rows(
+            now_ms=900, mono=ha.PERMISSION_HOOK_HOLD_SEC - 1)
+        self.assertEqual(self.rows(), [])
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=ha.PERMISSION_HOOK_HOLD_SEC)
+        row, = self.rows()
+        self.assertEqual((row["id"], row["kind"], row["dialogKind"], row["toolUseId"],
+                          row["answer"]),
+                         (f"r-{self.SID}-900", "dialog", "permission", "", "unknown"))
+
+    def test_a_classifier_denial_is_a_complete_row(self):
+        self.hook_rows({"sessionId": self.SID, "event": "PermissionDenied", "ts": 777,
+                        "toolUseId": "toolu_5", "tool": "Bash", "head": "git push",
+                        "digest": "{}", "denyReason": "outside scope"})
+        self.sm._apply_permission_hook_rows(now_ms=800, mono=0)
+        row, = self.rows()
+        self.assertEqual((row["kind"], row["answer"], row["denyReason"], row["openedAt"]),
+                         ("classifier-denied", "deny", "outside scope", 777))
+
+    # --- ask-in-chat ----------------------------------------------------------
+
+    def ended(self, ts, text):
+        self.write({"type": "assistant", "timestamp": ts,
+                    "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": text}]}})
+        return {"lastRole": "assistant", "lastHasToolUse": False,
+                "lastActivityTs": ts}
+
+    def test_an_ask_in_chat_opens_on_the_ended_turn_and_closes_on_input(self):
+        sig = self.ended("2026-10-03T10:00:00Z",
+                         "The build is ready. Should I proceed with the deploy?")
+        self.edge(None, at=5000, **sig)
+        row, = self.rows()
+        self.assertEqual(row["kind"], "ask-in-chat")
+        self.assertIn("Should I proceed", row["prompt"])
+        self.edge(None, at=6000, **sig)          # same turn: no second row
+        self.assertEqual(len(self.rows()), 1)
+        self.sm.handle_commands([{"cmdId": "c1", "type": "input",
+                                  "sessionId": self.SID, "text": "yes go"}])
+        closed = self.rows()[-1]
+        self.assertEqual((closed["id"], closed["via"]), (row["id"], "turma"))
+        self.assertGreaterEqual(closed["waitedMs"], 0)
+
+    def test_an_ask_answered_outside_turma_closes_and_the_next_ask_records(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "Should I proceed with the deploy?")
+        self.edge(None, at=5000, **sig)
+        first = self.rows()[0]["id"]
+        # The operator answers in the terminal: a user entry, the pane busy.
+        self.write({"type": "user", "timestamp": "2026-10-03T10:01:00Z",
+                    "message": {"role": "user", "content": "yes"}})
+        self.edge(None, at=65000, lastRole="user",
+                  lastActivityTs="2026-10-03T10:01:00Z", paneBusy=True)
+        closed = self.rows()[-1]
+        self.assertEqual((closed["id"], closed["via"], closed["waitedMs"]),
+                         (first, "terminal", 60000))
+        self.assertEqual(self.sm._perm_ask, {})
+        sig = self.ended("2026-10-03T10:05:00Z", "May I push the branch?")
+        self.edge(None, at=300000, **sig)
+        asks = [r for r in self.rows() if "closedAt" not in r]
+        self.assertEqual(len(asks), 2)
+        self.assertIn("push the branch", asks[-1]["prompt"])
+
+    def test_an_ask_answered_between_two_beats_closes_on_the_next_ended_turn(self):
+        self.edge(None, at=5000, **self.ended("2026-10-03T10:00:00Z", "May I merge it?"))
+        # Answered and the next turn finished between beats: only a NEW ended turn.
+        self.edge(None, at=9000, **self.ended("2026-10-03T10:02:00Z", "Merged. Done."))
+        closed = self.rows()[-1]
+        self.assertEqual((closed["via"], closed["closedAt"]), ("terminal", 9000))
+        self.assertNotIn(self.SID, self.sm._perm_ask)
+
+    def test_a_trailing_system_entry_does_not_close_an_ask(self):
+        self.edge(None, at=5000, **self.ended("2026-10-03T10:00:00Z", "May I merge it?"))
+        self.edge(None, at=6000, lastRole="system",
+                  lastActivityTs="2026-10-03T10:00:01Z")
+        self.assertEqual(len(self.rows()), 1)
+        self.assertIn(self.SID, self.sm._perm_ask)
+
+    def test_a_turn_that_asks_nothing_opens_nothing(self):
+        self.edge(None, **self.ended("2026-10-03T10:00:00Z", "Done — PR #12 is up."))
+        self.assertEqual(self.rows(), [])
+
+    def test_a_busy_or_tool_ending_turn_is_not_an_ask(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "May I run the migration?")
+        self.edge(None, **dict(sig, lastHasToolUse=True))
+        self.edge(None, **dict(sig, paneBusy=True))
+        self.assertEqual(self.rows(), [])
+
+    def test_the_first_beat_primes_rather_than_refiles_old_asks(self):
+        self.sm._perm_first_beat_done = False
+        sig = self.ended("2026-10-03T10:00:00Z", "May I run the migration?")
+        self.edge(None, **sig)
+        self.assertEqual(self.rows(), [])
+
+    # --- the wire -------------------------------------------------------------
+
+    def test_rows_ride_the_heartbeat_bounded_per_beat(self):
+        for i in range(ha.PERMISSION_EVENTS_MAX + 5):
+            self.sm._emit_permission({"id": f"x{i}", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(len(payload["permissionEvents"]), ha.PERMISSION_EVENTS_MAX)
+        self.assertEqual(payload["permissionEvents"][0]["id"], "x0")   # oldest first
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual([r["id"] for r in self.sm.permission_events],
+                         [f"x{i}" for i in range(ha.PERMISSION_EVENTS_MAX,
+                                                 ha.PERMISSION_EVENTS_MAX + 5)])
+
+    def test_cleared_by_identity_so_a_row_emitted_after_the_snapshot_survives(self):
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})  # same content
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual([r["id"] for r in self.sm.permission_events], ["a"])
+
+    def test_the_413_shed_never_drops_permission_rows(self):
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.sm._drop_on_demand_results(payload)
+        self.assertIn("permissionEvents", payload)
+        self.assertEqual(len(self.sm.permission_events), 1)
+
+    def test_the_outbox_is_bounded(self):
+        with mock.patch.object(ha, "log"):
+            for i in range(ha.PERMISSION_OUTBOX_MAX + 3):
+                self.sm._emit_permission({"id": f"x{i}"})
+        self.assertEqual(len(self.sm.permission_events), ha.PERMISSION_OUTBOX_MAX)
+        self.assertEqual(self.sm.permission_events[0]["id"], "x3")
+
+    def test_a_session_that_ends_closes_its_open_rows(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.sm._forget_session_caches(self.SID)
+        last = self.rows()[-1]
+        self.assertEqual((last["answer"], last["via"]), ("unknown", "unknown"))
+        self.assertIn("closedAt", last)
+        self.assertNotIn(self.SID, self.sm._perm_open)
+
+    def test_a_session_that_leaves_running_closes_its_open_rows(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "May I merge?")
+        self.edge(None, at=1000, **sig)
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=5000, **sig)
+        self.sm._permission_close_departed()          # still running: nothing
+        self.assertTrue(all("closedAt" not in r for r in self.rows()))
+        self.sess["status"] = "stopped"
+        self.sm._permission_close_departed()
+        closed = {r["id"]: r for r in self.rows() if "closedAt" in r}
+        self.assertEqual(len(closed), 2)
+        self.assertEqual((self.sm._perm_open, self.sm._perm_ask), ({}, {}))
+
+    def test_a_sub_agents_request_names_the_real_call_not_the_delegation(self):
+        # The parent's only result-less call is the foreground Agent; the
+        # dialog is the sub-agent's, whose hook row names another tool/input.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.edge(None, at=2000)
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        ids = {r["id"] for r in self.rows()}
+        self.assertEqual(len(ids), 1)                 # one prompt, counted once
+        last = self.rows()[-1]
+        # The delegation's id is dropped, never kept as this call's.
+        self.assertEqual((last["tool"], last["head"], last["toolUseId"]),
+                         ("Bash", "npm test", ""))
+        self.assertEqual(last["rulesMatched"], ["Bash(npm test:*)"])
+
+    def test_a_sub_agents_next_prompt_is_not_folded_after_the_override(self):
+        # Once the sub-agent's hook named the real call, the row holds no
+        # delegation id the repaint rule could fold the NEXT prompt under.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(dict(self.dialog(), detail="Bash command\nnpm test"), at=1000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_a_sub_agents_prompt_rewrapped_after_the_override_stays_one_row(self):
+        # Answering at the terminal attaches ttyd, which resizes tmux and
+        # rewraps the dialog. The overridden row has no call id of its own, so
+        # its face (whitespace aside) says it is the same prompt.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        wide = dict(self.dialog(), detail="Bash command\nnpm test -- --runInBand "
+                    "--coverage --reporter=dot\nRun the suite")
+        self.edge(wide, at=1000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        narrow = dict(self.dialog(), prompt="proceed?",
+                      detail="Bash command\nnpm test -- --runInBand\n--coverage "
+                      "--reporter=dot\nRun the suite\nDo you want to")
+        narrow["options"] = narrow["options"][:1] + [
+            dict(narrow["options"][1], label="Yes, and don't ask")]
+        self.edge(narrow, at=5000)
+        self.edge(None, at=30000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(list(rows), [f"d-{self.SID}-1000"])
+        row, = rows.values()
+        self.assertEqual((row["tool"], row["head"], row["waitedMs"]),
+                         ("Bash", "npm test", 29000))
+
+    def test_a_rewrapped_face_with_the_detail_line_capped_is_the_same_prompt(self):
+        # A narrow pane wraps a long heredoc past PANE_PROMPT_DETAIL_LINES: the
+        # face keeps only the bottom lines, a tail of the wide face.
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        body = [f"line{i} " + "x" * 30 for i in range(10)]
+        self.edge(dict(self.dialog(), detail="\n".join(["Bash command"] + body)), at=1000)
+        wrapped = [part for b in body for part in (b[:20], b[20:])]
+        self.edge(dict(self.dialog(), detail="\n".join(
+            wrapped[-ha.PANE_PROMPT_DETAIL_LINES:])), at=2000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 1)
+        # A command that only EXTENDS the last one is the next prompt.
+        self.edge(dict(self.dialog(), detail="\n".join(
+            wrapped[-ha.PANE_PROMPT_DETAIL_LINES:]) + " --force"), at=3000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def pane_edge(self, body, width, at):
+        # The dialog drawn at `width` and read the way the beat reads it:
+        # parse_pane_prompt(face=True) via session_report, which lifts the uncut
+        # face out of the wire field into the `face` the beat passes on.
+        wrapped = [" " * 3 + line[i:i + width - 3]
+                   for line in body for i in range(0, len(line), width - 3)]
+        cap = "\n".join(["─" * width, " Bash command", ""] + wrapped + [
+            "", " Do you want to proceed?", " ❯ 1. Yes",
+            "   2. Yes, and don't ask again", "   3. No", ""])
+        pp = ha.parse_pane_prompt(cap, face=True)
+        face = pp.pop("detailFace", None)
+        self.sm._permission_edges(self.sess, {"panePrompt": pp, "paneBusy": False},
+                                  now_ms=at, face=face)
+        return pp, face
+
+    def test_a_long_sub_agent_command_redrawn_narrower_stays_one_row(self):
+        # Over PANE_PROMPT_DETAIL_CHARS, the wide face is char-cut (bottom
+        # lost) and the narrow one line-cut (top lost): two windows of one
+        # command that may not even overlap. The uncut face keeps it one row.
+        for n, size, narrow in ((10, 88, 60), (20, 110, 100)):
+            with self.subTest(lines=n, width=narrow):
+                self.setUp()
+                self.write(self.tool_use("toolu_A", name="Agent",
+                                         inp={"description": "x", "prompt": "y"}))
+                body = ["npm test " + "a" * (size - 9)] + [
+                    f"line{i} " + "x" * (size - 6) for i in range(1, n)] + ["Do it"]
+                wide, wide_face = self.pane_edge(body, 200, at=1000)
+                self.assertEqual(len(wide["detail"]), ha.PANE_PROMPT_DETAIL_CHARS)
+                self.assertIsNotNone(wide_face)
+                self.hook_rows(self.request_hook())
+                self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+                self.pane_edge(body, narrow, at=5000)
+                self.edge(None, at=30000, paneBusy=True)
+                rows = {r["id"]: r for r in self.rows()}
+                self.assertEqual(list(rows), [f"d-{self.SID}-1000"])
+                row, = rows.values()
+                self.assertEqual((row["tool"], row["head"], row["waitedMs"]),
+                                 ("Bash", "npm test", 29000))
+                # The face is never on the wire.
+                self.assertNotIn("detailFace", wide)
+
+    def test_a_long_commands_next_prompt_is_still_a_new_row(self):
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        body = [f"line{i} " + "x" * 100 for i in range(10)]
+        self.pane_edge(body, 200, at=1000)
+        # Same first 800 chars, another command after them.
+        self.pane_edge(body[:-1] + ["rm -rf build"], 200, at=2000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_a_char_cut_face_is_the_head_of_the_other_under_one_question(self):
+        # Pins _dialog_faces_match's char-cap branch: a detail of exactly
+        # PANE_PROMPT_DETAIL_CHARS lost its bottom, so it is the other's head.
+        full = "Bash command\n" + "\n".join(f"line{i} " + "y" * 70 for i in range(12))
+        cut = full[:ha.PANE_PROMPT_DETAIL_CHARS]
+        rewrapped = {"prompt": "Do you want to proceed?",
+                     "detail": full.replace(" y", "\ny")}
+        self.assertTrue(ha._dialog_faces_match("Do you want to proceed?", cut, rewrapped))
+        # Another question is another prompt, and an uncut face shorter than
+        # the cap is no cut at all.
+        self.assertFalse(ha._dialog_faces_match(
+            "Do you want to allow this?", cut, rewrapped))
+        self.assertFalse(ha._dialog_faces_match(
+            "Do you want to proceed?", cut[:-1], rewrapped))
+
+    def test_the_delegations_own_prompt_is_not_overridden(self):
+        # A prompt to LAUNCH the Agent is the delegation's own call: same tool
+        # and input, so it merges without rewriting the row.
+        inp = {"description": "x", "prompt": "y"}
+        self.write(self.tool_use("toolu_A", name="Agent", inp=inp))
+        self.edge(self.dialog(), at=1000)
+        _head, dig = ha._permission_head_digest("Agent", inp)
+        self.hook_rows(dict(self.request_hook(tool="Agent", head="Agent"), digest=dig))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        row = self.sm._perm_open[self.SID]
+        self.assertEqual((row["tool"], row["toolUseId"]), ("Agent", "toolu_A"))
+        self.assertEqual(row["rulesMatched"], ["Agent(Agent:*)"])
+
+    def test_a_sub_agents_request_tailed_first_is_claimed_by_the_dialog(self):
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual((row["tool"], row["head"], row["toolUseId"]),
+                         ("Bash", "npm test", ""))
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
+
+    def test_a_sub_agents_dialog_takes_the_newest_request_not_an_older_one(self):
+        # Two sub-agent prompts tailed together: the older was answered between
+        # beats (its own row once the hold runs out), the newer is on screen.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook(head="git push", ts=600),
+                       self.request_hook(head="npm test", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertEqual(self.sm._perm_open[self.SID]["head"], "npm test")
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertIn(f"r-{self.SID}-600", {r["id"] for r in self.rows()})
+
+    def test_a_stale_held_request_is_not_taken_for_a_sub_agents_dialog(self):
+        # A parent-level prompt answered between beats is still held when a
+        # sub-agent's dialog opens much later: it is NOT that dialog's call.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.hook_rows(self.request_hook(ts=1000))
+        self.sm._apply_permission_hook_rows(now_ms=1000, mono=0)
+        at = 1000 + ha.PERMISSION_HOOK_ADOPT_MS + 1
+        self.edge(self.dialog(), at=at)
+        row, = self.rows()
+        self.assertEqual(row["tool"], "Agent")             # no wrong call adopted
+        self.assertEqual(len(self.sm._perm_hook_pending.get(self.SID)), 1)
+        # The held one still becomes its own row once the hold expires.
+        self.sm._apply_permission_hook_rows(
+            now_ms=at, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertIn(f"r-{self.SID}-1000", {r["id"] for r in self.rows()})
+
+    # --- back-to-back dialogs, pickers, parallel calls -------------------------
+
+    def test_back_to_back_dialogs_are_two_rows(self):
+        # Call A's dialog is answered and call B's (same question, another
+        # command) is up before the next beat: the pane never shows "no dialog".
+        self.write(self.tool_use("toolu_A", inp={"command": "git push"}))
+        self.edge(dict(self.dialog(), detail="Bash command\ngit push"), at=1000)
+        self.write(self.tool_result("toolu_A"),
+                   self.tool_use("toolu_B", inp={"command": "rm -rf build"}))
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.edge(None, at=9000)
+        rows = {}
+        for r in self.rows():
+            rows[r["id"]] = r
+        self.assertEqual(sorted((r["head"], r["waitedMs"], r["answer"])
+                                for r in rows.values()),
+                         [("git push", 5000, "allow"), ("rm", 3000, "unknown")])
+
+    PANE_WIDE = """\
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   docker compose -f deploy/compose.yml up --build --remove-orphans --detach
+   Rebuild and restart the stack in the background
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for docker compose commands in this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+"""
+    # The same dialog after the window narrows (the operator's ttyd attaches):
+    # the command and option 2 wrap, and the wrapped label ends the 1..N run.
+    PANE_NARROW = """\
+──────────────────────────────────────────────
+ Bash command
+
+   docker compose -f deploy/compose.yml up
+   --build --remove-orphans --detach
+   Rebuild and restart the stack in the
+   background
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for docker
+   compose commands in this project
+   3. No
+
+ Esc to cancel · Tab to amend
+"""
+
+    def test_the_same_dialog_redrawn_at_another_width_is_one_row(self):
+        wide = ha.parse_pane_prompt(self.PANE_WIDE)
+        narrow = ha.parse_pane_prompt(self.PANE_NARROW)
+        self.assertIsNotNone(wide)
+        self.assertIsNotNone(narrow)
+        self.assertNotEqual(ha._pane_dialog_identity(wide), ha._pane_dialog_identity(narrow))
+        self.write(self.tool_use("toolu_1", inp={"command": "docker compose up"}))
+        self.edge(wide, at=1000)
+        self.edge(narrow, at=20000)                # a resize: same call, new face
+        self.edge(wide, at=21000)                  # and back again
+        self.write(self.tool_result("toolu_1"))
+        self.edge(None, at=25000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual([(r["openedAt"], r["waitedMs"], r["answer"], r["toolUseId"])
+                          for r in rows.values()],
+                         [(1000, 24000, "allow", "toolu_1")])
+
+    def test_a_new_call_behind_a_changed_face_is_still_a_new_row(self):
+        # The repaint rule keys on the CALL: a changed face whose pending call
+        # moved on is the next prompt, whatever the pane width did.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(ha.parse_pane_prompt(self.PANE_WIDE), at=1000)
+        self.write(self.tool_result("toolu_1"), self.tool_use("toolu_2"))
+        self.edge(ha.parse_pane_prompt(self.PANE_NARROW), at=5000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["toolUseId"], r.get("answer")) for r in rows.values()),
+                         [("toolu_1", "allow"), ("toolu_2", None)])
+
+    def test_a_sandbox_prompt_for_the_running_call_is_a_second_row(self):
+        # Allowed, the command runs (no result yet) and asks to reach the
+        # network: the same call, but another prompt the operator answers.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge(self.sandbox(), at=4000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["dialogKind"], r["openedAt"]) for r in rows.values()),
+                         [("permission", 1000), ("sandbox", 4000)])
+
+    def test_two_hosts_one_running_call_asks_for_are_two_rows(self):
+        # `npm install` is allowed and runs (no result yet), then asks to reach
+        # the registry and, answered between two beats, GitHub: one toolUseId,
+        # two prompts — each host its own row, wait and allowedDomains rule.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox("registry.npmjs.org"), at=1000)
+        self.edge(self.sandbox("codeload.github.com"), at=6000)
+        self.edge(None, at=9000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["head"], r["waitedMs"]) for r in rows.values()),
+                         [("codeload.github.com", 3000), ("registry.npmjs.org", 5000)])
+        self.assertEqual({r["toolUseId"] for r in rows.values()}, {"toolu_1"})
+
+    def test_the_same_sandbox_prompt_redrawn_is_one_row(self):
+        # A resize wraps the "don't ask again" label off the 1..N run: the face
+        # changed, the host did not — the same prompt.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox(), at=1000)
+        narrow = self.sandbox()
+        narrow["options"] = [narrow["options"][0], dict(narrow["options"][1],
+                                                        label="Yes, and don't ask again")]
+        self.edge(narrow, at=4000)
+        self.edge(None, at=7000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual([(r["head"], r["waitedMs"]) for r in rows.values()],
+                         [("registry.npmjs.org", 6000)])
+
+    def test_dialogs_inside_a_sub_agent_are_not_folded_by_its_delegation_id(self):
+        # Every prompt a foreground sub-agent raises shares the parent's pending
+        # Task call, so that id cannot tell a repaint from the next prompt.
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        self.edge(dict(self.dialog(), detail="Bash command\ngit push"), at=1000)
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_a_pending_question_opens_no_row_before_its_call_is_in_the_tail(self):
+        # ask.py's bridge reports the question before the transcript tail shows
+        # the AskUserQuestion call; the pending call is still an older Bash one.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000, question="Which plan?")
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn(self.SID, self.sm._perm_open)
+        self.lines = []
+        self.write()                                   # empty transcript too
+        self.edge(dict(self.dialog(), prompt="Which one?"), at=2000, question="Which one?")
+        self.assertEqual(self.rows(), [])
+
+    def test_a_second_request_never_merges_into_a_row_that_has_one(self):
+        # Two requests for the same command: the newest claims the open dialog
+        # (it is the one on screen), the older is another prompt's and is held.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook(ts=700), self.request_hook(ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1600, mono=0)
+        self.assertEqual(self.sm._perm_open[self.SID]["rulesMatched"],
+                         ["Bash(npm test:*)"])
+        held = self.sm._perm_hook_pending[self.SID]
+        self.assertEqual([h["ts"] for h, _ in held.values()], [700])
+
+    def test_an_ask_user_question_picker_is_not_a_permission_row(self):
+        self.write(self.tool_use("toolu_Q", name="AskUserQuestion",
+                                 inp={"questions": [{"question": "Which plan?"}]}))
+        self.edge({"prompt": "Which plan?", "options": [
+            {"number": 1, "label": "A", "selected": True},
+            {"number": 2, "label": "B", "selected": False}]}, at=1000)
+        self.assertEqual(self.rows(), [])
+        self.edge(self.dialog(), at=2000, question="Which plan?")
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn(self.SID, self.sm._perm_open)
+
+    def test_parallel_calls_charge_the_oldest_open_call_of_the_newest_message(self):
+        def use(tuid, cmd, mid):
+            e = self.tool_use(tuid, inp={"command": cmd})
+            e["message"]["id"] = mid
+            return e
+        self.write(use("toolu_0", "ls", "msg_0"), self.tool_result("toolu_0"),
+                   use("toolu_A", "git push", "msg_1"),
+                   use("toolu_B", "npm test", "msg_1"),
+                   use("toolu_C", "make", "msg_1"))
+        self.edge(self.dialog(), at=1000)
+        self.assertEqual(self.rows()[-1]["toolUseId"], "toolu_A")
+        self.assertEqual(ha.pending_tool_call([use("toolu_X", "ls", "m")])["toolUseId"],
+                         "toolu_X")
+
+    # --- the beat wiring ------------------------------------------------------
+
+    def test_the_beat_drives_every_edge_end_to_end(self):
+        # The real payload build, session_report stubbed: dialog open, close,
+        # a staged hook row folded, and a session leaving running.
+        signals = {}
+
+        def report(*_a, **_k):
+            return dict({"prUrls": [], "modelActual": "m",
+                         "lastTurnContextTokens": 1, "paneBusy": False,
+                         "panePrompt": None}, **signals)
+
+        self.sm._stage_permission_fetch = mock.Mock()
+
+        def beat():
+            with mock.patch.object(ha, "session_report", side_effect=report), \
+                    mock.patch.object(self.sm, "_live_tmux_panes", return_value=None):
+                payload = self.sm.build_payload(1, light=True)
+            self.sm._clear_delivered_staged(payload)
+            return {r["id"]: r for r in payload.get("permissionEvents") or []}
+
+        self.write(self.tool_use("toolu_1"))
+        signals["panePrompt"] = self.dialog()
+        got = beat()
+        (rid, opened), = got.items()
+        self.assertEqual((opened["kind"], opened["toolUseId"]), ("dialog", "toolu_1"))
+        self.assertNotIn("closedAt", opened)
+        self.write(self.tool_result("toolu_1"))
+        signals["panePrompt"] = None
+        closed = beat()[rid]
+        self.assertEqual((closed["answer"], closed["via"]), ("allow", "terminal"))
+        self.hook_rows({"sessionId": self.SID, "event": "PermissionDenied", "ts": 5,
+                        "toolUseId": "toolu_9", "tool": "Bash", "head": "git push",
+                        "digest": "{}", "denyReason": "no"})
+        self.assertEqual([r["kind"] for r in beat().values()], ["classifier-denied"])
+        self.write(self.tool_use("toolu_2"))
+        signals["panePrompt"] = self.dialog()
+        (rid2, _), = beat().items()
+        self.sess["status"] = "stopped"
+        gone = beat()[rid2]
+        self.assertEqual((gone["answer"], gone["via"]), ("unknown", "unknown"))
+        self.assertEqual(self.sm._perm_open, {})
+
+    def test_the_uncut_face_reaches_the_ledger_and_never_the_wire(self):
+        cap = "\n".join(["─" * 80, " Bash command", ""]
+                        + ["   " + "z" * 70] * 13 + ["", " Do you want to proceed?",
+                                                   " ❯ 1. Yes", "   2. No", ""])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, None, ha.parse_pane_prompt(
+                                   cap, face=True))):
+            rep = ha.session_report(self.sess["worktreePath"], {}, "agent-x")
+        self.assertNotIn("detailFace", rep["panePrompt"])
+        self.assertGreater(len(rep["panePromptFace"]), ha.PANE_PROMPT_DETAIL_CHARS)
+        self.sm._stage_permission_fetch = mock.Mock()
+        with mock.patch.object(ha, "session_report", return_value=dict(rep, prUrls=[])), \
+                mock.patch.object(self.sm, "_live_tmux_panes", return_value=None), \
+                mock.patch.object(self.sm, "_permission_edges") as edges:
+            payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(edges.call_args.kwargs["face"], rep["panePromptFace"])
+        self.assertNotIn("panePromptFace", json.dumps(payload))
+
+    def test_a_raising_edge_never_costs_the_sessions_signals(self):
+        with mock.patch.object(self.sm, "_permission_edges",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(ha, "log"):
+            out = self.sm._session_payload(self.sess)
+        self.assertEqual(out["id"], self.SID)
+
+
+class TestPermissionLogTail(ManagerMixin, unittest.TestCase):
+    """The hook-log tail (XERK-1563): its own worker, a per-file cursor, priming
+    on the first pass, rotation, and the session-written-file read discipline."""
+
+    SID = "perm2"
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        self.sm.registry = [{"id": self.SID, "status": "running"}]
+        os.makedirs(ha.PERMISSIONS_DIR)
+        self.path = os.path.join(ha.PERMISSIONS_DIR, f"{self.SID}.jsonl")
+
+    def append(self, *rows, path=None):
+        with open(path or self.path, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def denied(self, tuid):
+        return {"ts": 1, "event": "PermissionDenied", "toolUseId": tuid,
+                "tool": "Bash", "head": "x", "digest": "", "denyReason": "no"}
+
+    def staged(self):
+        with self.sm._permission_lock:
+            got, self.sm._permission_rows_fetched = self.sm._permission_rows_fetched, {}
+        return [r["toolUseId"] for r in got.get(self.SID, [])]
+
+    def test_the_first_pass_primes_then_only_new_lines_are_read(self):
+        self.append(self.denied("old"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])          # a restart replays nothing
+        self.append(self.denied("new1"), self.denied("new2"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["new1", "new2"])
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])
+
+    def test_a_stopped_sessions_log_is_primed_too(self):
+        # Stopped when the manager started, Started later with the same id:
+        # its old prompts were sent by the previous process — never again.
+        self.sm.registry = [{"id": self.SID, "status": "stopped"}]
+        self.append(self.denied("old0"), self.denied("old1"))
+        self.sm._fetch_permission_rows()
+        self.sm.registry[0]["status"] = "running"
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])
+        self.append(self.denied("new"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["new"])
+
+    def test_a_log_that_appears_later_is_read_from_its_start(self):
+        self.sm._fetch_permission_rows()             # primed with no file
+        self.append(self.denied("a"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["a"])
+
+    def test_a_partial_line_waits_for_its_end(self):
+        self.sm._fetch_permission_rows()
+        with open(self.path, "a") as f:
+            f.write(json.dumps(self.denied("a")) + "\n" + '{"ts": 1, "ev')
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["a"])
+        with open(self.path, "a") as f:
+            f.write('ent": "PermissionDenied", "toolUseId": "b"}\n')
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["b"])
+
+    def test_rotation_drains_the_old_file_first(self):
+        self.sm._fetch_permission_rows()
+        self.append(self.denied("a"))
+        self.sm._fetch_permission_rows()
+        self.staged()
+        self.append(self.denied("b"))              # written, not yet read
+        os.replace(self.path, self.path + ".1")     # permlog.py rotates
+        self.append(self.denied("c"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["b", "c"])
+
+    def test_junk_lines_are_skipped_and_fields_reshaped(self):
+        self.sm._fetch_permission_rows()
+        with open(self.path, "a") as f:
+            f.write("not json\n[1]\n" + json.dumps({"event": "Stop", "ts": 1}) + "\n"
+                    + json.dumps({"event": "PermissionDenied", "ts": "x"}) + "\n"
+                    + "x" * (ha.PERMISSION_LOG_LINE_MAX + 5) + "\n")
+            f.write(json.dumps(dict(self.denied("ok"), tool="T" * 999,
+                                    extra="dropped")) + "\n")
+        self.sm._fetch_permission_rows()
+        with self.sm._permission_lock:
+            row, = self.sm._permission_rows_fetched[self.SID]
+        self.assertEqual(row["toolUseId"], "ok")
+        self.assertEqual(len(row["tool"]), 128)
+        self.assertNotIn("extra", row)
+
+    def test_a_fifo_at_the_log_path_never_wedges_the_tail(self):
+        self.sm._fetch_permission_rows()
+        os.mkfifo(self.path)
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (self.sm._fetch_permission_rows(), done.set()),
+                             daemon=True)
+        t.start()
+        self.assertTrue(done.wait(5), "the tail blocked opening a FIFO")
+        self.assertEqual(self.staged(), [])
+        self.assertIsNone(ha._read_permission_log(self.path, 0, 10))
+
+    def test_the_beat_stages_the_tail_and_never_reads_it_inline(self):
+        self.sm._stage_permission_fetch = mock.Mock()
+        self.sm._fetch_permission_rows = mock.Mock()
+        self.sm.registry = []
+        self.sm.build_payload(0)
+        self.sm._stage_permission_fetch.assert_called_once_with()
+        self.sm._fetch_permission_rows.assert_not_called()
+
+    def test_the_worker_runs_the_staged_tail(self):
+        ran = threading.Event()
+        self.sm._fetch_permission_rows = lambda: ran.set()
+        self.sm._stage_permission_fetch()
+        self.assertTrue(ran.wait(2))
+
+    def test_staging_never_raises_onto_the_beat(self):
+        with mock.patch.object(ha.threading, "Thread",
+                               side_effect=RuntimeError("no threads")), \
+             mock.patch.object(ha, "log"):
+            self.sm._stage_permission_fetch()
+
+    def test_a_gone_sessions_old_log_is_swept(self):
+        stale = os.path.join(ha.PERMISSIONS_DIR, "gone.jsonl")
+        self.append(self.denied("x"), path=stale)
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        os.utime(stale, (old, old))
+        self.append(self.denied("y"))
+        os.utime(self.path, (old, old))             # running: kept however old
+        self.sm._fetch_permission_rows()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(self.path))
 
 
 if __name__ == "__main__":

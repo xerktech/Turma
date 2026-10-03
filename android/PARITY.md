@@ -886,6 +886,11 @@ those are marked `[MODEL]`.
   `panePrompt` onto the session model, the waiting state in `core/Sessions.kt`, and the picker in
   `ChatScreen`/`ChatViewModel` beside the existing question sheet.
 ### Usage
+- P2 **Permission prompts card (XERK-1563).** The web Usage page's "Permission prompts (7 days)"
+  section (top prompts with counts, allowed/denied, median wait and a copyable suggested rule; a
+  recent list) reads its own route, `GET /api/permissions`, not `/api/agents` — so nothing on the
+  fleet payload changed and Android's atomic decode is untouched. It is a web-only operator tuning
+  view for now; the Android screen is a later XERK-1560 child (XERK-1576).
 - P2 **Table-view state persistence (XERK-31).** The web keeps the usage table open + the page put
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 

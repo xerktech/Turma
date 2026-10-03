@@ -96,6 +96,11 @@ process.env.USAGE_LEDGER_FILE = path.join(
   os.tmpdir(),
   `turma-test-usage-ledger-${process.pid}.json`
 );
+// The permission ledger (XERK-1563) is another /data file read at require time.
+process.env.PERMISSION_LEDGER_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-permission-ledger-${process.pid}.json`
+);
 // The migration relay spools transcript bundles to disk (XERK-263) and sweeps
 // its whole directory at boot, so it gets a throwaway one of its own — sharing
 // /data/migrations, or one dir across test files, would have each sweep delete
@@ -22631,4 +22636,90 @@ test("subagent history: a malformed block is coerced at ingest too", async () =>
   assert.strictEqual(bad.truncated, true,
     "a non-bool truncated is decode-fatal on Android for BOTH history routes");
   delete agents[host];
+});
+
+// ---- the permission ledger (XERK-1563) -----------------------------------------
+
+function permRow(id, extra = {}) {
+  const now = Date.now();
+  return { id, sessionId: "s1", kind: "dialog", dialogKind: "permission", tool: "Bash",
+    head: "npm test", openedAt: now - 5000, closedAt: now, waitedMs: 5000,
+    answer: "allow", via: "terminal", ...extra };
+}
+
+test("XERK-1563: permissionEvents fold into the ledger and never ride the record", async () => {
+  hub.permissionLedger._internals.reset();
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("permissionEvents"));
+  const host = "perm-ledger-host";
+  const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: host, jira: { siteKey: "acme.atlassian.net" },
+    permissionEvents: [permRow("d-1"), permRow("d-2", { answer: "deny" }), { id: "junk" }],
+  } });
+  assert.equal(r.status, 200);
+  const rec = (await fleet()).agents.find((a) => a.key === host);
+  assert.ok(rec);
+  assert.equal(rec.permissionEvents, undefined, "rows are folded, never stored on the record");
+  const view = await request("GET", "/api/permissions", { headers: userHeaders });
+  assert.equal(view.status, 200);
+  const g = view.body.top.find((x) => x.head === "npm test");
+  assert.deepEqual([g.count, g.allowed, g.denied, g.medianWaitMs, g.suggestedRule],
+    [2, 1, 1, 5000, "Bash(npm test:*)"]);
+  assert.equal(view.body.recent.length, 2);
+  assert.equal(view.body.recent[0].host, host);
+  delete agents[host];
+});
+
+test("XERK-1563: /api/permissions is org-scoped off the live fleet", async () => {
+  hub.permissionLedger._internals.reset();
+  for (const [host, site, n] of [["perm-acme", "acme.atlassian.net", 1],
+    ["perm-rival", "rival.atlassian.net", 3]]) {
+    await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+      device: host, jira: { siteKey: site },
+      permissionEvents: Array.from({ length: n }, (_, i) => permRow(`d-${i}`)) } });
+  }
+  const acme = await request("GET", "/api/permissions?org=acme.atlassian.net",
+    { headers: userHeaders });
+  assert.equal(acme.body.top[0].count, 1);
+  assert.ok(acme.body.recent.every((x) => x.host === "perm-acme"));
+  const both = await request("GET",
+    "/api/permissions?org=acme.atlassian.net,rival.atlassian.net", { headers: userHeaders });
+  assert.equal(both.body.top[0].count, 4);
+  const none = await request("GET", "/api/permissions?org=nobody.atlassian.net",
+    { headers: userHeaders });
+  assert.deepEqual(none.body.top, []);
+  // A removed host's rows show only under "All orgs" — scoping reads the LIVE fleet.
+  delete agents["perm-rival"];
+  const after = await request("GET", "/api/permissions?org=rival.atlassian.net",
+    { headers: userHeaders });
+  assert.deepEqual(after.body.top, []);
+  assert.equal((await request("GET", "/api/permissions", { headers: userHeaders }))
+    .body.top[0].count, 4);
+  delete agents["perm-acme"];
+});
+
+test("XERK-1563: /api/permissions is user-authed", async () => {
+  assert.equal((await request("GET", "/api/permissions")).status, 401);
+  assert.equal((await request("GET", "/api/permissions", { headers: agentHeaders })).status, 401);
+});
+
+test("XERK-1563: /metrics carries the ledger's per-kind aggregates and nothing else", async () => {
+  hub.permissionLedger._internals.reset();
+  await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "perm-metrics-host", permissionEvents: [
+      permRow("d-1", { waitedMs: 4000 }), permRow("d-2", { waitedMs: 2000 }),
+      { id: "c-1", kind: "classifier-denied", tool: "Bash", head: "secret-cmd",
+        openedAt: Date.now() - 10 }] } });
+  const m = await request("GET", "/metrics");
+  assert.equal(m.status, 200);
+  assert.match(m.raw, /^turma_permission_prompts\{kind="dialog"\} 2$/m);
+  assert.match(m.raw, /^turma_permission_prompts\{kind="classifier-denied"\} 1$/m);
+  assert.match(m.raw, /^turma_permission_wait_seconds\{kind="dialog"\} 6$/m);
+  // Retention-window totals FALL as rows age out: gauges, never counters (a
+  // counter's drop reads as a reset, and rate() reports a false spike).
+  assert.match(m.raw, /^# TYPE turma_permission_prompts gauge$/m);
+  assert.match(m.raw, /^# TYPE turma_permission_wait_seconds gauge$/m);
+  assert.doesNotMatch(m.raw, /turma_permission_\w+ counter/);
+  // The route is unauthenticated: no host, command or session leaks into it.
+  assert.doesNotMatch(m.raw, /perm-metrics-host|secret-cmd|npm test/);
+  delete agents["perm-metrics-host"];
 });
