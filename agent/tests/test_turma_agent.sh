@@ -58,8 +58,16 @@ chmod +x "$WORK/stub-bin/node"
 # Stands in for the session manager. Reports the pid the launcher named against
 # its own — \`exec\` means they must be the same process — and where claude
 # resolves on the PATH the manager inherited (what every session launch uses).
+# It ends by exec'ing a REAL python as \`python3 $PREFIX/hub-agent.py\`, so its argv
+# is the real manager's exactly — the launcher's duplicate-manager guard matches
+# that whole argv (XERK-1552), and a /bin/sh stub's argv would never match it.
+REAL_PYTHON3="$(command -v python3)"
+cat > "$PREFIX/hub-agent.py" <<'STUB'
+import time
+time.sleep(30)
+STUB
 cat > "$WORK/stub-bin/python3" <<STUB
-#!/bin/sh
+#!/usr/bin/env bash
 echo "named=\${TURMA_MANAGER_PID:-unset} actual=\$\$" > "$WORK/manager.log"
 echo "claude=\$(command -v claude || echo missing)" >> "$WORK/manager.log"
 # Whether the start-time Claude Code check had FINISHED before the manager
@@ -67,7 +75,7 @@ echo "claude=\$(command -v claude || echo missing)" >> "$WORK/manager.log"
 # being replaced claude is absent from PATH, and the manager is what launches
 # sessions into it.
 echo "claudecheck=\$([ -f "$WORK/claude-done" ] && echo done || echo unfinished)" >> "$WORK/manager.log"
-sleep 30
+exec -a python3 "$REAL_PYTHON3" "\$@"
 STUB
 chmod +x "$WORK/stub-bin/python3"
 
@@ -587,6 +595,26 @@ for args in "--help" "-h" "--bogus" "start" "--preflight extra"; do
   fi
 done
 kill "$LIVE_SUP" 2>/dev/null || true
+
+# --- Case 15b (XERK-1552): a process merely MENTIONING the path is no manager --
+# The guard once substring-matched any argv containing $PREFIX/hub-agent.py, so
+# an operator's grep/tail loop (or a session's Bash command) mentioning the path
+# made an auto-update's restart refuse, leaving the host stopped. Only the real
+# manager's exact argv may count.
+echo "case: a decoy argv mentioning hub-agent.py does not block a start"
+reset_agents
+rm -f "$WORK/manager.log"
+setsid bash -c "sleep 30; : $PREFIX/hub-agent.py" >/dev/null 2>&1 &
+DECOY=$!
+setsid bash -c "sleep 30; : python3 $PREFIX/hub-agent.py --enroll" >/dev/null 2>&1 &
+DECOY2=$!
+PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run-decoy.log" 2>&1 &
+if wait_for file_has_content "$WORK/manager.log"; then
+  ok "started a manager despite decoy processes mentioning the path"
+else
+  fail "a decoy blocked the start: $(cat "$WORK/run-decoy.log")"
+fi
+kill "$DECOY" "$DECOY2" 2>/dev/null || true
 
 # --- Case 16 (XERK-938): a hand re-run is refused while a manager is live -----
 # No-args is the legit systemd/turma-agentctl entry point, so it can't be
