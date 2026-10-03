@@ -25549,18 +25549,161 @@ class TestArchiveInventory(ManagerMixin, unittest.TestCase):
         self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
         self._ledger(sm, wt)
         sm.registry = []
-        # Default: no capability seen yet -> the old manifest path.
+        # A hub that does NOT offer -> the old manifest path.
+        sm._archive_offer_known = True
         sm._archive_hub_offer = False
         payload = sm.build_payload(0)
         self.assertIn("archiveManifest", payload)
         self.assertNotIn("archiveInventory", payload)
         self.assertFalse(sm._archive_sent_inventory)
-        # Once the hub advertised it -> the inventory path.
+        # Once the hub advertised it -> the inventory path. The refresh beat only
+        # STAGES the build (XERK-1266); the next full beat ships what it published.
         sm._archive_hub_offer = True
         payload = sm.build_payload(0)
+        self.assertNotIn("archiveManifest", payload)
+        self.assertTrue(sm._archive_sent_inventory)
+        self._wait_published(sm)
+        payload = sm.build_payload(1)
         self.assertIn("archiveInventory", payload)
         self.assertNotIn("archiveManifest", payload)
         self.assertTrue(sm._archive_sent_inventory)
+
+    def _wait_published(self, sm, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with sm._inventory_lock:
+                if sm._inventory_ready is not None:
+                    return
+            time.sleep(0.01)
+        self.fail("the inventory worker never published")
+
+    def test_inventory_is_built_off_the_beat(self):
+        """XERK-1266: the inventory's disk walk (measured 35-75s cache-cold on a
+        contended pool) never runs on the beat thread, and a refresh beat does
+        not wait for it."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/off"
+        self._write_transcript(wt, "t1.jsonl", [_text_entry("u1", "user", "hi")])
+        self._ledger(sm, wt)
+        sm.registry = []
+        sm._archive_offer_known = True
+        sm._archive_hub_offer = True
+        threads = []
+        input_threads = []
+        release = threading.Event()
+        real = sm._archive_candidates_from
+        real_inputs = sm._archive_candidate_inputs
+        def slow_walk(inputs):
+            threads.append(threading.current_thread().name)
+            release.wait(5)
+            return real(inputs)
+        def inputs_spy():
+            input_threads.append(threading.current_thread().name)
+            return real_inputs()
+        # An EMPTY repos root: the bound below times the inventory, not the
+        # first beat's git over whatever repos this host has.
+        empty = tempfile.mkdtemp(dir=self.tmp)
+        with mock.patch.object(sm, "_archive_candidates_from", slow_walk), \
+             mock.patch.object(sm, "_archive_candidate_inputs", inputs_spy), \
+             mock.patch.object(ha, "REPOS_ROOT", empty):
+            t0 = time.time()
+            payload = sm.build_payload(0)
+            self.assertLess(time.time() - t0, 3, "the refresh beat waited for the walk")
+            self.assertNotIn("archiveInventory", payload)
+            # A full beat while the walk is still running ships nothing.
+            self.assertNotIn("archiveInventory", sm.build_payload(1))
+            release.set()
+            self._wait_published(sm)
+        self.assertEqual(threads, ["archive-inventory"])
+        # The registry/ledger reads stay on the beat; the worker only walks disk.
+        self.assertTrue(input_threads)
+        self.assertNotIn("archive-inventory", input_threads)
+        # A LIGHT beat never ships it; the next full beat does, once, with the
+        # catalog it was built with swapped in beside it.
+        sm._archive_catalog = {}
+        self.assertNotIn("archiveInventory", sm.build_payload(2, light=True))
+        payload = sm.build_payload(3)
+        self.assertEqual([e["i"] for e in payload["archiveInventory"]], ["t1"])
+        self.assertEqual(set(sm._archive_catalog), {"t1"})
+        self.assertNotIn("archiveInventory", sm.build_payload(4))
+        # The reply's want resolves against that catalog.
+        sm.queue_archive_sync({"archiveOffer": "hub", "archiveHave": {"t1": 0}})
+        self.assertEqual(set(sm._archive_pending), {"t1"})
+
+    def test_no_archive_walk_until_the_hub_has_said_which_path(self):
+        # Beat 0 after a restart knows nothing of the hub yet; it must not take
+        # the inline manifest walk by default.
+        sm = self.make_manager()
+        sm.registry = []
+        sm.usage_ledger = {}
+        with mock.patch.object(sm, "_archive_manifest",
+                               side_effect=AssertionError("inline walk")), \
+             mock.patch.object(sm, "_stage_archive_inventory",
+                               side_effect=AssertionError("staged blind")):
+            payload = sm.build_payload(0)
+        self.assertNotIn("archiveManifest", payload)
+        # The first reply says the hub offers: the very next full beat stages,
+        # without waiting for a refresh beat.
+        sm.queue_archive_sync({"archiveOffer": "hub"})
+        with mock.patch.object(sm, "_stage_archive_inventory") as stage:
+            sm.build_payload(1, light=True)
+            stage.assert_not_called()
+            sm.build_payload(1)
+            stage.assert_called_once()
+            sm.build_payload(2)
+            stage.assert_called_once()
+
+    def test_a_stale_inventory_never_ships_after_the_offer_flips_back(self):
+        sm = self.make_manager()
+        sm.registry = []
+        sm.usage_ledger = {}
+        sm._archive_offer_known = True
+        sm._archive_hub_offer = True
+        old = (sm._inventory_gen, ([{"i": "old", "s": 1, "r": 1}], {"old": {}}))
+        # V1: published, the hub rolls back for one NON-refresh beat, re-rolls.
+        with sm._inventory_lock:
+            sm._inventory_ready = old
+        sm._inventory_staged_once = True  # as after the boot-time stage
+        sm._archive_hub_offer = False
+        sm.build_payload(1)
+        sm._archive_hub_offer = True
+        with mock.patch.object(sm, "_stage_archive_inventory") as stage:
+            payload = sm.build_payload(2)
+            stage.assert_called_once()  # re-staged at once, not a cycle later
+        self.assertNotIn("archiveInventory", payload)
+        # V2: a REAL walk staged before the rollback, published after it. The
+        # worker must stamp the generation it was STAGED under, not the current.
+        started, release = threading.Event(), threading.Event()
+        def gated(inputs):
+            started.set()
+            release.wait(5)
+            return [{"i": "inflight", "s": 1, "r": 1}], {}
+        with mock.patch.object(sm, "_archive_inventory", gated):
+            sm._stage_archive_inventory(sm._archive_candidate_inputs())
+            self.assertTrue(started.wait(5))
+            sm._archive_hub_offer = False
+            sm.build_payload(3)
+            sm._archive_hub_offer = True
+            release.set()
+            deadline = time.time() + 5
+            while time.time() < deadline:
+                with sm._inventory_lock:
+                    if sm._inventory_ready is not None:
+                        break
+                time.sleep(0.01)
+            with mock.patch.object(sm, "_stage_archive_inventory"):
+                payload = sm.build_payload(4)
+        self.assertNotIn("archiveInventory", payload)
+
+    def test_a_failed_worker_start_never_raises_onto_the_beat(self):
+        sm = self.make_manager()
+        sm._archive_hub_offer = True
+        sm.usage_ledger = {}
+        sm.registry = []
+        with mock.patch.object(ha.threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            sm._stage_archive_inventory(sm._archive_candidate_inputs())
+        self.assertIsNotNone(sm._inventory_inputs, "the snapshot stays staged")
 
     def test_queue_sync_tracks_capability_and_builds_pending_from_the_want(self):
         sm = self.make_manager()
