@@ -474,6 +474,16 @@ class TestGuardedClaudeDir(unittest.TestCase):
         # Carries mcpServers -- command lines run at the next session's startup.
         self._refuses(".claude.json")
 
+    def test_the_session_request_dir_is_refused(self):
+        # XERK-1564: the session CLI's rendezvous dir. Outside ~/.claude, so
+        # only the pattern can refuse it (the hook never looks there): the
+        # baseline must land the write, and our rule must stop it.
+        rel = ".turma/session-requests/s1/wake.json"
+        self.assertEqual(self._case(rel, self.EMPTY), ALLOWED,
+                         "baseline: nothing refused this with empty settings, so "
+                         "the REAL arm's refusal cannot be attributed to our rule")
+        self.assertEqual(self._case(rel, self.REAL), DENIED)
+
     def test_the_memory_directory_entry_itself_is_not_writable(self):
         """A FILE planted at this name makes the directory impossible to create,
         permanently disabling that agent's memory.

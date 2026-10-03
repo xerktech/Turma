@@ -1,0 +1,94 @@
+---
+paths:
+  - "agent/hooks/session_cli.py"
+  - "agent/hub-agent.py"
+  - "agent/tests/test_session_cli.py"
+---
+
+# The session CLI — a session handing its manager structured intent (XERK-1564, epic XERK-1560)
+
+A running session asks the manager for something (wake me later, close my ticket) by running
+`python3 -SsE "$TURMA_SESSION_CLI" <subcommand> …`, which writes ONE rendezvous file the manager
+reads. `agent.md` is at its size ceiling; this file carries the contract.
+
+## Why a file, never a transcript marker
+
+- A marker in the transcript is forgeable by any quoted line (a PR comment, a pasted log), and
+  reading it would add a parser to the `hub-agent.py` ⇄ `tunnel-agent.js` parity list.
+- A file read through the hardened reader is the existing precedent: `ask.py`'s req/ans files, the
+  epic builder's `TURMA_EPIC_PLAN.json` (`_read_untrusted_json`).
+
+## The CLI (`agent/hooks/session_cli.py`)
+
+- **Lives under `agent/hooks/`** because only `agent/hooks/*.py` is globbed by the native install,
+  the updater and release staging on BOTH OSes; `bin/` is an explicit list and the Windows zip is
+  `.ps1`-only. Do not move it.
+- Stdlib only, run with `-SsE` (the hook security flags, `agent-hooks.md`).
+- Subcommands, each writing `~/.turma/session-requests/<TURMA_SESSION_ID>/<subcommand>.json`:
+  - `wake <duration> <reason…>` → `{wakeAt (epoch ms), reason, requestedAt}`. Durations are
+    `20m`/`2h`/`1h30m`-style (`s`/`m`/`h`/`d`), above zero, at most 7 days; reason ≤200 chars.
+  - `close-ticket <done|not-reproducible|already-fixed> --note "<evidence>"` →
+    `{resolution, note, requestedAt}`, note ≤2000 chars. **Only WRITTEN here** — its reader is the
+    close-ticket child (XERK-1569).
+- Exit 0 + one confirmation line on success; **2** on a refusal (usage, a bound, no
+  `TURMA_SESSION_ID`, an id that is not a plain name), saying why and writing nothing; 1 on an
+  I/O error.
+- **The write is atomic**: a DOT-PREFIXED temp file in the same dir (`O_EXCL|O_NOFOLLOW`, 0600),
+  then `os.replace`. A reader never sees half a request; a failed write leaves the previous one.
+- `REQUESTS_DIR` is derived from `~`, exactly as the manager's `REGISTRY_DIR` is — not taken from
+  the environment, so the two cannot disagree.
+
+## Launch env
+
+- Every Claude launch exports `TURMA_SESSION_CLI=<absolute path>` beside `TURMA_SESSION_ID`/
+  `TURMA_QUESTIONS_DIR` — in the POSIX env prefix and in the Windows `extra_env` dict.
+- Not yet exported to dsh/qwen sessions (their launchers build their own env); a follow-up.
+
+## Guard bookkeeping
+
+- **Allow**: `build_guard_settings` adds `Bash(python3 -SsE <absolute hooks dir>/session_cli.py:*)`
+  (`session_cli_allow_rule`, computed beside `guard_script_path`) right after
+  `_GUARD_ALLOW_PATH_RULES`, so the call never prompts. Narrow on purpose — never a bare `python3`
+  allow, which would admit any code.
+- **Deny**: `_GUARD_DENY_PATH_RULES` has `Edit(~/.turma/session-requests/**)` (pinned in
+  `EXPECTED_DENY_RULES`; oracle case `test_the_session_request_dir_is_refused`). File-edit tools
+  only: Bash still writes the dir — that is how the CLI works, and the documented `~/.turma`
+  residual — which is why the manager trusts nothing in it.
+
+## The reader rule
+
+- **Every file under `session-requests/` is read ONLY via `_read_untrusted_json`**
+  (`O_NONBLOCK|O_NOFOLLOW`, regular file, size-bounded by `SESSION_REQUEST_MAX_BYTES`): a session
+  can plant a FIFO or symlink at the name, and a plain `open()` of a FIFO wedges the beat thread.
+- The session id is joined onto a path only through `session_request_dir`, which accepts a plain
+  name only (`SESSION_REQUEST_SID_RE`, the same pattern the CLI applies).
+
+## Wake delivery (agent side; no UI yet)
+
+- `session_report._finish` reads `wake.json` (`read_wake_request`): `wakeAt` must be a positive
+  integer below 2^53, else no request; the reason is flattened to one line and capped.
+- `_session_payload` (`_ingest_wake_request`) persists it on the registry record as `wakeAt`/
+  `wakeReason`, so a manager restart keeps it, and serves the RECORD's value on the session's
+  `session` block. Absent = no wake pending. The hub coerces both by name in `coerceLiveSignals`
+  (`wakeAt` a positive safe integer, `wakeReason` a string capped at 200); nothing renders them yet.
+- **On the beat, a time compare only** (`_deliver_due_wakes`): a RUNNING session whose
+  `now ≥ wakeAt` gets `_stage_input(sid, "Wake-up: <reason>. Check it and continue.")` — the
+  operator path, delivered off the beat by the input worker and kept through a compaction by the
+  `pendingInputs` outbox. Then the fields are cleared and `wake.json` removed — unless the session
+  has since written a DIFFERENT request, which stands. `_wake_fired` stops a file that could not be
+  removed from firing twice.
+- **Kill / delete / clear-context restart** (and the dead-session sweep's fresh relaunch) clear the
+  whole request dir via `_clear_session_requests` beside `_clear_question_files` — a request made by
+  a conversation dies with it. A symlinked dir is unlinked, never followed. A model switch or
+  model-source switch (same conversation, `--resume`) keeps it.
+- Tests: `test_session_cli.py`; `TestWakeRequest` in `test_hub_agent.py`; the guard pins in
+  `test_guard_settings.py`; the `XERK-1564` case in `server.test.js`.
+
+## Real-host spike (not yet run)
+
+- In a worktree session run `python3 -SsE "$TURMA_SESSION_CLI" wake 2m test`: the request file
+  appears, no permission prompt, and two minutes later the pane receives the wake-up input.
+- **Open question it must answer**: the allow rule names the ABSOLUTE path, and Claude Code matches
+  Bash rules on the command text, so the `"$TURMA_SESSION_CLI"` spelling may not match it. If it
+  prompts, the directive that teaches sessions the CLI (a later child) must give the absolute path
+  (`session_cli_path()`), not the variable. Record the answer here.
