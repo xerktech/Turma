@@ -105,8 +105,11 @@ paths:
 - **The main ruleset (`Default`) requires `Unit tests` + branches up to date** (XERK-1542).
   - Never re-add a paths filter to code-scan's `pull_request`: a required check that never starts
     blocks the PR forever.
-  - GitHub Actions is a bypass actor so `bump`'s direct `VERSION`/`CHANGELOG` push lands; that
-    push only runs after the release's own code-scan passed.
+  - Its only bypass actor is **deploy keys**: `bump` pushes `VERSION`/`CHANGELOG` straight to main
+    with `RELEASE_BUMP_DEPLOY_KEY`, after the release's own code-scan passed.
+  - A repository ruleset cannot name GitHub Actions as a bypass actor (422), hence the key.
+  - The key lives in the `release-bump` Environment (main-only), never as a repo secret — same
+    reasoning as `ARGOCD_DEPLOY_KEY`.
 - **Instruction file size limits** — `CLAUDE.md` + every `.claude/rules/*.md` must stay under 40,000
   characters (Claude Code's own perf threshold). Measured in CHARS not bytes (`wc -m`). See
   `CLAUDE.md`'s "Editing these files".
