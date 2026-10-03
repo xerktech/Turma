@@ -143,6 +143,8 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
     is offered only the board's OTHER Done statuses, so a plain close's sole option may be "Won't
     Do". Before taking an option the kind did not ask for, the status is read; already Done → `ok`,
     no move. Never drop that read: it rewrote correctly closed tickets as abandoned.
+  - **A FAILED status read fails the attempt** (raises, so the bounded retry runs), never "not
+    in Done": that would move a ticket already in Done into the fallback after all.
   - **The target is resolved BEFORE the comment posts**, so a workflow with no edge into Done
     never gets an evidence comment on a ticket left open.
   - Only for a RUNNING Claude session whose `ticket.siteKey` is this host's board; dsh/qwen skipped.

@@ -15591,9 +15591,11 @@ _NOT_REPRO_STATUS_RE = re.compile(r"\b(not|cannot|can'?t|unable\s+to)[\s_-]*repr
 
 def _board_issue_done_status(key):
     """The name of `key`'s CURRENT status when it already sits in the Done
-    column, else None (also on any read failure — the caller then reports its
-    own error). Needed because a tracker offers no transition into the status
-    an issue is already in, so "no Done option" can mean "already Done"."""
+    column, else None. A read failure RAISES (RuntimeError naming it), never
+    None: "not in Done" would let the caller move a ticket that IS in Done into
+    a fallback like "Won't Do", so an unknown status must fail the attempt (the
+    bounded retry). Needed because a tracker offers no transition into the
+    status an issue is already in, so "no Done option" can mean "already Done"."""
     try:
         if azure_configured():
             wi = azure_req(f"/_apis/wit/workitems/{urllib.parse.quote(key)}",
@@ -15611,7 +15613,7 @@ def _board_issue_done_status(key):
                 ((status.get("statusCategory") or {}).get("key") or "").lower(), "todo")
     except Exception as e:
         log(f"close-ticket: could not read {key}'s current status: {e}")
-        return None
+        raise RuntimeError(f"could not read its current status: {e}") from e
     if name and _board_column(name, cat) == "done":
         return str(name)
     return None
@@ -25464,7 +25466,8 @@ class SessionManager:
                 # lands here — with no Done option, or only a Done-column one
                 # the kind did not ask for (a ticket in Done is offered just the
                 # board's OTHER Done statuses, e.g. "Won't Do"): already Done is
-                # the outcome asked for, never a move into that fallback.
+                # the outcome asked for, never a move into that fallback. A
+                # failed read raises (retried), so an unknown status never moves.
                 current = _board_issue_done_status(key)
                 if current is not None:
                     option = None

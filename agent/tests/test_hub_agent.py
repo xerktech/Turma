@@ -17819,7 +17819,7 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
     def test_an_open_ticket_still_takes_the_fallback_done_status(self):
         # The current-status read only spares a ticket ALREADY in Done: an open
         # ticket on a board whose only Done option is "Won't Do" still leaves
-        # the open columns, and an unreadable status changes nothing either.
+        # the open columns (as does a read that names no status at all).
         todo = {"id": "1", "name": "To Do", "category": "todo"}
         neg = {"id": "41", "name": "Won't Do", "category": "done"}
         for current in (("In Progress", "indeterminate"), None):
@@ -17834,6 +17834,40 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
                          "done", ("Done", "done"))
         self.assertNotIn(f"/rest/api/3/issue/{self.KEY}", [p for p, _ in self.calls])
         self.assertEqual(self._transitions(), [{"transition": {"id": "31"}}])
+
+    def test_a_failed_status_read_never_takes_the_fallback(self):
+        # The ticket may already be in Done, so a status read that FAILS is not
+        # "not in Done": the attempt fails (no comment, no move) and is retried;
+        # the retry that reads Done counts it closed without moving it.
+        todo = {"id": "1", "name": "To Do", "category": "todo"}
+        self.OPTS = [todo, {"id": "41", "name": "Won't Do", "category": "done"}]
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+        reads = {"n": 0}
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                reads["n"] += 1
+                if reads["n"] == 1:
+                    raise ha.BoardHttpError("HTTP 503: blip", 503)
+                return {"fields": {"status": {"name": "Done",
+                                              "statusCategory": {"key": "done"}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req(resolution="done")
+            sm._process_close_ticket_requests(now=1000.0)
+            self.assertEqual(self._transitions(), [])
+            self.assertEqual(self._comments(), [])
+            sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        sm._apply_closed_tickets()
+        self.assertEqual(self._transitions(), [])
+        self.assertEqual(len(self._comments()), 1)
+        first, last = sm.ticket_outcome_results
+        self.assertEqual((first["ok"], first["final"]), (False, False))
+        self.assertIn("could not read", first["error"])
+        self.assertEqual((last["ok"], last["status"]), (True, "Done"))
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "done")
 
     def test_the_fallback_predicate(self):
         def o(name):
