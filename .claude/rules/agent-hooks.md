@@ -130,6 +130,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     repeat passes it KEEPS the leftover args — dropping them hid a 9th `/etc`). `_produced_text` stores
     what the substitution PRINTS, never its `$(…)` text — inlining that re-classified it at
     every `$x` and a long line took minutes, past the hook timeout, which fails OPEN.
+  - **A spliced value's quotes stay LITERAL** (`_quote_literal`, by the `_quote_states` at the
+    use): bash never re-reads quotes an expansion made, and splicing raw let
+    `x='"'; echo "$x"; rm -rf /` unbalance the line and hide the `rm`. Never inline a value
+    unescaped. `"${a[@]}"` closes the quote around the elements (one word each).
   - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
     never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
     clearing let `cd /; (cd /tmp); rm -rf *` through.

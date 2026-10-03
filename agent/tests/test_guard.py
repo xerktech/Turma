@@ -1256,6 +1256,24 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
 
+    def test_a_quote_in_a_value_stays_literal(self):
+        # Bash never re-reads quotes an expansion produced; splicing them raw
+        # unbalanced the line and hid everything after it (QA pass 6).
+        for cmd in ("x='\"'; echo \"$x\"; rm -rf /", "x='\"'; echo $x; rm -rf /",
+                    "x='a\"b'; echo \"$x\"; rm -rf /", "x=\"'\"; echo '$x'; rm -rf /",
+                    "a=(x '\"'); echo \"${a[@]}\"; rm -rf /",
+                    "msgs=(\"it's\" done); echo \"${msgs[@]}\"; rm -rf /",
+                    "a=(x '\"'); echo \"${a[@]}\"; git push --force origin main",
+                    # An empty assignment is a value too.
+                    "b=; a=(rm -rf *); cd /; \"${b}${a[@]}\"", "x=; rm -rf $x/etc"):
+            with self.subTest(cmd=cmd):
+                self.assertTrue(guard.is_destructive(cmd) or guard.policy_reason(cmd), cmd)
+        for cmd in ("x=\"it's fine\"; git commit -m \"$x\"", 'a=(x y); echo "x${a[@]}"',
+                    "FOO= make install", "d=/; echo 'rm -rf $d is banned'"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertDenied("d=/; bash -c 'rm -rf $d'")
+
     def test_a_substitution_value_is_classified_once(self):
         # Inlining the `$(…)` text re-classified it at every use: minutes for
         # a long line, past the hook timeout, which lets a command through.

@@ -510,7 +510,7 @@ _ASSIGN_SUBST_RE = re.compile(_ASSIGN_SUBST)
 _VAR_ASSIGN_RE = re.compile(
     r"(?:^|[;\n&|\s])"
     r"\s*([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\s]*\])?\+?="
-    r"(\([^()]*\)|(?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])+)"
+    r"(\([^()]*\)|(?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])*)"
 )
 # printf's conversions — flags, `*`/digit width, `.`/`.*`/digit precision —
 # and the backslash escapes it decodes in a format (and in a `%b` argument).
@@ -805,22 +805,41 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     if vals is None:
         vals = _var_values(command)
 
+    states = _quote_states(command) if vals and "$" in command else []
+
     def rep(m: "re.Match[str]") -> str:
         name = m.group(1) or m.group(3) or ""
         got = vals.get(name)
         op = _VAR_OP_RE.match(m.group(2) or "")
         if got:
             value = got[0] if len(got) == 1 else " ".join(got)
-            if (m.group(2) or "").startswith(("[@]", "[*]")) and m.string[m.start() - 1:m.start()] == '"':
-                # `"${a[@]}"` is one word PER element, quotes and all: close
+            state = states[m.start()] if m.start() < len(states) else ""
+            if state == '"' and (m.group(2) or "").startswith(("[@]", "[*]")):
+                # `"${a[@]}"` is one word PER element, even mid-word: close
                 # the quote around them, as bash's expansion does.
-                return '"' + value + '"'
-            return _apply_var_op(value, op.group(1), op.group(2)) if op else value
+                return '"' + _quote_literal(value, "") + '"'
+            if op:
+                value = _apply_var_op(value, op.group(1), op.group(2))
+            return _quote_literal(value, state)
         if op and op.group(1) in _VAR_DEFAULT_OPS:
             return op.group(2)
         return m.group(0)
 
     return _VAR_USE_RE.sub(rep, command)
+
+
+def _quote_literal(value: str, state: str) -> str:
+    """``value`` spliced where quoting is ``state``, its quote characters kept
+    LITERAL — bash never re-reads quotes an expansion produced. Spliced raw,
+    `x='"'; echo "$x"; rm -rf /` unbalanced the line and hid the `rm`
+    (XERK-1549). Inside `'…'` (a script some shell will expand later) the
+    value's `'` closes, escapes and reopens. `$` stays live, so a `$(…)` a
+    value carries is still classified where it lands."""
+    if state == "'":
+        return value.replace("'", "'\\''")
+    if state == '"':
+        return re.sub(r'([\\"`])', r"\\\1", value)
+    return re.sub(r"([\\\"'`])", r"\\\1", value)
 
 
 def _prenormalise(command: str) -> str:
