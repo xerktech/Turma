@@ -373,6 +373,32 @@ test("org: the auto switch flips optimistically and rolls back on a failed POST"
   assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/);
 });
 
+test("org: autoOn reads own keys only — prototype-member org names (XERK-1486)", () => {
+  for (const k of ["constructor", "toString", "valueOf", "__proto__"]) {
+    assert.equal(Org.autoOn({}, k), false, k);
+    assert.equal(Org.autoOn(JSON.parse(`{${JSON.stringify(k)}:true}`), k), true, k);
+  }
+});
+
+test("org: toggling a __proto__ / constructor org paints that org's switch (XERK-1486)", async () => {
+  for (const k of ["__proto__", "constructor"]) {
+    const { slot, click } = mountOrg();
+    Org.update({ agents: [agent("a", k)], autoStartOrgs: {}, autoMergeOrgs: {} });
+    click("data-org-toggle", "");
+    assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/, `${k}: hub has it OFF`);
+    const posts = [];
+    global.fetch = (url, init) => {
+      posts.push(JSON.parse(init.body));
+      return Promise.resolve({ ok: true, status: 200 });
+    };
+    await Org.setAutoStart(k, true);
+    assert.deepEqual(posts, [{ enabled: true }], `${k}: an OFF org's click turns it ON`);
+    assert.match(slot.innerHTML, /org-chip-auto on/, `${k}: the switch paints ON`);
+    await Org.setAutoStart(k, false);
+    assert.doesNotMatch(slot.innerHTML, /org-chip-auto on/, `${k}: and back OFF`);
+  }
+});
+
 // ---- manual org colors (XERK-145) ------------------------------------------
 
 test("org: each org row carries a color chip; the swatch strip only when expanded", () => {
@@ -416,7 +442,7 @@ test("org: a swatch pick paints optimistically, POSTs, and rolls back on failure
   const p = Org.setOrgColor("acme.atlassian.net", 5);
   // Painted (and pages notified, so their card tints follow) before the POST
   // settles; the strip closes on the pick.
-  assert.deepEqual(Org.orgColors(), { "acme.atlassian.net": 5 });
+  assert.deepEqual({ ...Org.orgColors() }, { "acme.atlassian.net": 5 });
   assert.doesNotMatch(slot.innerHTML, /org-swatch-row/);
   assert.ok(seen.length >= 1);
   await p;
@@ -434,7 +460,7 @@ test("org: releasing a pin POSTs {auto:true}", async () => {
   };
   await Org.setOrgColor("acme.atlassian.net", null);
   assert.deepEqual(posts, [{ url: "/api/jira/acme.atlassian.net/color", body: { auto: true } }]);
-  assert.deepEqual(Org.orgColors(), {});
+  assert.deepEqual({ ...Org.orgColors() }, {});
 });
 
 test("org: the hub's orgColors broadcast updates the pins and notifies the pages", () => {

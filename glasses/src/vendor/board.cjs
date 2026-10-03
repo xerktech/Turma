@@ -1043,8 +1043,12 @@
   // Whether an org is opted in to auto-start, for the org-chip switch (XERK-41).
   // Hub-only: it's the hub-owned per-org toggle (data.autoStartOrgs) and nothing
   // else — no agent-side flag — so a click freely turns it on and off.
+  // Own keys only (XERK-1486): the map is a plain JSON.parse object, so an org
+  // named "constructor"/"toString" would otherwise read Object.prototype's
+  // member and show ON while the hub has it OFF.
   function autoStartOn(autoStartOrgs, siteKey) {
-    return !!(autoStartOrgs && autoStartOrgs[siteKey]);
+    return !!(autoStartOrgs && Object.prototype.hasOwnProperty.call(autoStartOrgs, siteKey) &&
+      autoStartOrgs[siteKey]);
   }
 
   // djb2 hash of a siteKey -> its PREFERRED palette slot (0..SLOTS-1).

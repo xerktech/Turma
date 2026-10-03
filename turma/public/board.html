@@ -1624,7 +1624,9 @@ function policyPanelHtml() {
     policySiteKey = sites[0].siteKey;
   }
   const single = sites.length === 1;
-  const p = (cache && cache.triagePolicies && cache.triagePolicies[policySiteKey]) || {};
+  const tps = cache && cache.triagePolicies;
+  // Own keys only (XERK-1486): an org named "constructor" must not read a prototype member.
+  const p = (tps && Object.prototype.hasOwnProperty.call(tps, policySiteKey) && tps[policySiteKey]) || {};
   const orgRow = single
     ? `<div class="tp-field"><span>Org</span><input type="text" value="${esc(B.orgName(policySiteKey, sites[0].orgName))}" disabled></div>`
     : `<label class="tp-field"><span>Org</span><select data-policy-org="1">` +
@@ -1736,7 +1738,9 @@ async function savePolicy() {
   policyBusy = false;
   if (ok) {
     if (!cache) cache = { now: Date.now(), agents: [] };
-    const tp = cache.triagePolicies || (cache.triagePolicies = {});
+    // Null-prototype copy (XERK-1486): on a plain {} tp["__proto__"] = policy
+    // would set the prototype, not the org's key.
+    const tp = cache.triagePolicies = Object.assign(Object.create(null), cache.triagePolicies);
     if (policy) tp[siteKey] = policy; else delete tp[siteKey];
     policyErr = "";
     paintPolicyPanel();

@@ -85,8 +85,16 @@
     return keysOf(keys).filter(k => list.some(s => s.siteKey === k));
   }
 
+  // Own keys only (XERK-1486) — see board.js autoStartOn.
   function autoOn(map, siteKey) {
-    return !!(map && map[siteKey]);
+    return !!(map && Object.prototype.hasOwnProperty.call(map, siteKey) && map[siteKey]);
+  }
+
+  // A writable copy of an org-keyed map with no prototype (XERK-1486): on a
+  // plain {} an own "__proto__" key is dropped by Object.assign and
+  // `m["__proto__"] = true` sets the prototype instead of a key.
+  function orgMapCopy(map) {
+    return Object.assign(Object.create(null), map);
   }
 
   // The header button: the current scope, one dot per selected org, each
@@ -328,7 +336,7 @@
   // instantly. Rolls back if the POST fails.
   async function setAutoStart(siteKey, enabled) {
     const had = autoOn(autoMap, siteKey);
-    autoMap = Object.assign({}, autoMap);
+    autoMap = orgMapCopy(autoMap);
     if (enabled) autoMap[siteKey] = true; else delete autoMap[siteKey];
     paint();
     let ok = false;
@@ -340,7 +348,7 @@
       ok = r.ok;
     } catch { /* network error — fall through to rollback */ }
     if (!ok) {
-      autoMap = Object.assign({}, autoMap);
+      autoMap = orgMapCopy(autoMap);
       if (had) autoMap[siteKey] = true; else delete autoMap[siteKey];
       paint();
     }
@@ -351,7 +359,7 @@
   // branch unreviewed), so it stays its own switch beside auto-start.
   async function setAutoMerge(siteKey, enabled) {
     const had = autoOn(mergeMap, siteKey);
-    mergeMap = Object.assign({}, mergeMap);
+    mergeMap = orgMapCopy(mergeMap);
     if (enabled) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
     paint();
     let ok = false;
@@ -363,7 +371,7 @@
       ok = r.ok;
     } catch { /* network error — fall through to rollback */ }
     if (!ok) {
-      mergeMap = Object.assign({}, mergeMap);
+      mergeMap = orgMapCopy(mergeMap);
       if (had) mergeMap[siteKey] = true; else delete mergeMap[siteKey];
       paint();
     }
@@ -376,7 +384,7 @@
   // reads the pins through orgColors() below, so a repaint sees the new map.
   async function setOrgColor(siteKey, slotN) {
     const prev = colorPins;
-    colorPins = Object.assign({}, colorPins);
+    colorPins = orgMapCopy(colorPins);
     if (slotN) colorPins[siteKey] = slotN; else delete colorPins[siteKey];
     colorFor = null;
     paint();

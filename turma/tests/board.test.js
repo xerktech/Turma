@@ -441,6 +441,14 @@ test("autoStartOn: the org-chip switch reads the hub-only per-org opt-in", () =>
   assert.equal(autoStartOn(undefined, site), false);
 });
 
+test("autoStartOn: a prototype-member org name reads OFF unless the hub set it (XERK-1486)", () => {
+  for (const k of ["constructor", "toString", "valueOf", "hasOwnProperty", "__proto__"]) {
+    assert.equal(autoStartOn({}, k), false, k);
+    // The hub serves an own key; JSON.parse keeps "__proto__" as one.
+    assert.equal(autoStartOn(JSON.parse(`{${JSON.stringify(k)}:true}`), k), true, k);
+  }
+});
+
 test("ageStr: human ages from ISO timestamps (Jira's +0000 offset included)", () => {
   const now = Date.parse("2026-07-14T12:00:00Z");
   assert.equal(ageStr("2026-07-14T11:59:30.000+0000", now), "now");

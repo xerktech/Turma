@@ -8,7 +8,7 @@
 // repaint.
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { mountPhone } from "./phone.ts";
-import { createInitialState, newSessionState, type AppState } from "../app.ts";
+import { App, createInitialState, newSessionState, type AppState } from "../app.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "../types.ts";
 
 function signals(o: Partial<LiveSignals> = {}): LiveSignals {
@@ -72,14 +72,11 @@ describe("phone controller", () => {
       getState: () => state,
       enterSession: vi.fn((id: string, host?: string) => { state = sessionState(id, host ?? "host-a"); handle.render(state); }),
       setOrgFilter: vi.fn((k: string) => { state = { ...state, orgFilter: k }; handle.render(state); }),
-      setAutoStartOrg: vi.fn((site: string, enabled: boolean) => {
-        const prev = !!state.autoStartOrgs[site];
-        const next = { ...state.autoStartOrgs };
-        if (enabled) next[site] = true; else delete next[site];
-        state = { ...state, autoStartOrgs: next };
-        handle.render(state);
-        return prev;
-      }),
+      // The REAL App logic over the fake's state, so this can't drift from it (XERK-1486).
+      setAutoStartOrg: vi.fn((site: string, enabled: boolean) => App.prototype.setAutoStartOrg.call({
+        get state() { return state; },
+        setState(p: Partial<AppState>) { state = { ...state, ...p }; handle.render(state); },
+      } as unknown as App, site, enabled)),
     };
     onSignOut = vi.fn();
     handle = mountPhone({ root, app: app as never, client: client as never, onSignOut: onSignOut as unknown as () => void });
@@ -143,6 +140,23 @@ describe("phone controller", () => {
     expect(client.setAutoStart).toHaveBeenCalledWith("globex.atlassian.net", true);
     expect(root.querySelector<HTMLElement>('[data-org-auto="globex.atlassian.net"]')!.classList.contains("on")).toBe(true);
     expect(app.setOrgFilter).not.toHaveBeenCalled(); // clicking auto is not a scope pick
+  });
+
+  it("an org named after a prototype member starts OFF and toggles ON then OFF (XERK-1486)", () => {
+    for (const k of ["constructor", "__proto__"]) {
+      // The hub's map arrives JSON-parsed, as over the wire.
+      state = { ...state, agents: [agent({ key: "host-x", jira: { siteKey: k } })], autoStartOrgs: JSON.parse("{}") };
+      handle.render(state);
+      if (!root.querySelector(`[data-org-auto="${k}"]`)) root.querySelector<HTMLElement>("[data-org-toggle]")!.click();
+      const sel = `[data-org-auto="${k}"]`;
+      expect(root.querySelector<HTMLElement>(sel)!.classList.contains("on")).toBe(false);
+      root.querySelector<HTMLElement>(sel)!.click();
+      expect(client.setAutoStart).toHaveBeenLastCalledWith(k, true);
+      expect(root.querySelector<HTMLElement>(sel)!.classList.contains("on")).toBe(true);
+      root.querySelector<HTMLElement>(sel)!.click();
+      expect(client.setAutoStart).toHaveBeenLastCalledWith(k, false);
+      expect(root.querySelector<HTMLElement>(sel)!.classList.contains("on")).toBe(false);
+    }
   });
 
   it("Send delivers the compose text through the shared HubClient and clears it", () => {
