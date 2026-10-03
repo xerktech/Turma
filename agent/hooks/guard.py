@@ -410,20 +410,18 @@ def _quote_states(command: str) -> list[str]:
     return out
 
 
-# Programs that only ever treat a quoted argument as TEXT — never hand it to a
-# shell, run it as a hook, or feed it to a pager/alias. Deliberately an
-# allowlist: `find -exec sh -c '…'`, `xargs sh -c`, `| sh`, `<<< … | bash`,
-# `flock`, `env -S`, `builtin eval` and `git -c core.pager='…'` all turn a
-# single-quoted string into a script, and a denylist of those is never done.
-_QUOTED_TEXT_PROGS = {
-    "echo", "printf", "cat", "grep", "egrep", "fgrep", "rg", "head", "tail", "wc",
-    "jq", "yq", "sort", "uniq", "diff", "ls", "mkdir", "cd", "touch", "test", "[",
-    "true", ":",
-}
-# `git <sub>` whose quoted arguments are a message or a path, never a command
-# (unlike `rebase --exec`, `bisect run`, `submodule foreach`, `-c alias.x=!…`).
-_QUOTED_TEXT_GIT = {"commit", "tag", "notes", "log", "show", "status", "add", "diff"}
-_QUOTED_TEXT_FORGE = {"create", "comment", "edit", "review", "note", "update"}
+# Stages that only ever treat a quoted argument as TEXT — never hand it to a
+# shell, a hook, a pager or an alias. Deliberately a small allowlist, each
+# entry checked against its argv: `find -exec sh -c '…'`, `xargs sh -c`,
+# `| sh`, `<<<` into a shell, `flock`, `env -S`, `builtin eval` and
+# `git -c core.pager='…'` all turn a single-quoted string into a script, and a
+# denylist of those is never complete. What runs a git/gh editor, pager, hook,
+# signer or browser comes from the environment or config, never from argv —
+# which is why an assignment in front disqualifies the stage.
+_QUOTED_TEXT_PROGS = {"echo", "printf"}
+_QUOTED_TEXT_GIT = {"commit", "tag"}
+_QUOTED_TEXT_GH = {("pr", "create"), ("pr", "edit"), ("pr", "comment"),
+                   ("issue", "create"), ("issue", "edit"), ("issue", "comment")}
 
 
 def _quoted_text_only(raw_tokens: list[str]) -> bool:
@@ -434,14 +432,15 @@ def _quoted_text_only(raw_tokens: list[str]) -> bool:
     assignment is an environment the program may RUN — `GIT_EDITOR='$(x)' git
     commit` has git hand it to `sh -c` — and a wrapper word is a program of its
     own. A bare assignment stage (`GIT_EDITOR='…'; git commit`) updates an
-    exported variable the same way.
+    exported variable the same way. The program must be a bare name: `./git`
+    is whatever that file does.
     """
     tokens = _strip_prefixes(raw_tokens)
     if any(t not in _SHELL_KEYWORDS for t in raw_tokens[:len(raw_tokens) - len(tokens)]):
         return False
     if not tokens:
         return True
-    prog = _basename(tokens[0])
+    prog = tokens[0]
     if prog in _QUOTED_TEXT_PROGS:
         return True
     if prog == "git":
@@ -449,8 +448,8 @@ def _quoted_text_only(raw_tokens: list[str]) -> bool:
             return False
         args = _git_args(tokens)
         return bool(args) and args[0] in _QUOTED_TEXT_GIT
-    if prog in ("gh", "glab"):
-        return len(tokens) > 2 and tokens[2] in _QUOTED_TEXT_FORGE
+    if prog == "gh":
+        return tuple(tokens[1:3]) in _QUOTED_TEXT_GH
     return False
 
 

@@ -1017,7 +1017,7 @@ class TestParserGaps(unittest.TestCase):
     def test_a_single_quoted_substitution_is_text(self):
         for cmd in (f"git commit -m '$({self.R})'", f"echo '`{self.R}`'",
                     f"gh pr create --title t --body '$({self.R})'",
-                    f"git commit -m '$({self.R})' && git status",
+                    f"git commit -m '$({self.R})' && echo done",
                     "echo \\$\\(rm -rf /\\)"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
@@ -1036,6 +1036,7 @@ class TestParserGaps(unittest.TestCase):
                     # wrapper word is a program of its own.
                     "GIT_EDITOR='$(reboot)' git commit", "GIT_EDITOR='`reboot`'; git commit",
                     "nice git commit -m '$(reboot)'",
+                    "./git commit -m '$(reboot)'", "git commit -m x && git status '$(reboot)'",
                     f"echo \"$(sh -c 'echo $({R})')\"",
                     f"for i in 1; do printf '$({R})'; done | sh"):
             with self.subTest(cmd=cmd):
