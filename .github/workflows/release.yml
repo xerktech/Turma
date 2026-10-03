@@ -213,6 +213,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      digest: ${{ steps.build.outputs.digest }}
     steps:
       - uses: actions/checkout@v7
         with:
@@ -225,6 +227,7 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - uses: docker/setup-buildx-action@v4
       - name: Build and push
+        id: build
         uses: docker/build-push-action@v7
         with:
           context: ./turma
@@ -238,36 +241,61 @@ jobs:
           labels: |
             org.opencontainers.image.revision=${{ needs.bump.outputs.sha || needs.plan.outputs.sha }}
             org.opencontainers.image.version=${{ needs.plan.outputs.version }}
-      # Point k8x at the image just pushed. The hub runs there as `ai/turma` in
-      # xerktech/ArgoCD, whose Application is `automated` + `selfHeal`, so this
-      # commit IS the deploy — without it a release publishes the image and
-      # nothing ever runs it.
-      #
-      # Authenticated by a WRITE DEPLOY KEY on that repo, not a PAT: GITHUB_TOKEN
-      # is scoped to this repo, a classic PAT would carry a human's whole account
-      # into CI, and a fine-grained one expires — which fails as a deploy that
-      # silently stops happening. The key is write-only, on one repo, and is
-      # revoked by deleting it there.
-      #
-      # Skipped on a dry run, which pushes no image, and off main, since a
-      # dispatch takes any ref and this is the step that reaches production.
-      - name: Update the hub image tag in ArgoCD
-        if: needs.plan.outputs.dry_run != 'true' && github.ref == 'refs/heads/main'
+
+  # ------------------------------------------------------- deploy: argocd ----
+  # Point k8x at the image just pushed. The hub runs there as `ai/turma` in
+  # xerktech/ArgoCD, whose Application is `automated` + `selfHeal`, so this
+  # commit IS the deploy — without it a release publishes the image and nothing
+  # ever runs it.
+  #
+  # - Pins `<version>@<digest>`: the digest is what build-turma-image actually
+  #   pushed. The version is only a tag, and a version reused after a release
+  #   that failed before `publish` tagged it would leave the manifest text
+  #   unchanged — no commit, no rollout, production on stale code (XERK-1410).
+  # - Authenticated by a WRITE DEPLOY KEY on that repo, not a PAT: GITHUB_TOKEN
+  #   is scoped to this repo, a classic PAT would carry a human's whole account
+  #   into CI, and a fine-grained one expires — which fails as a deploy that
+  #   silently stops happening. The key is held in the `argocd-deploy`
+  #   Environment, which only `main` may use, and in its own job, so the build
+  #   never sees it. (Isolation needs the old repo-level ARGOCD_DEPLOY_KEY gone:
+  #   XERK-1439 deletes it once this job has deployed once.)
+  # - publish requires this job to have succeeded or been skipped: a deploy
+  #   that timed out reports `cancelled`, not `failure`, and must not be tagged.
+  # - Skipped on a dry run, which pushes no image, and off main, since a
+  #   dispatch takes any ref and this is the job that reaches production.
+  deploy-argocd:
+    needs: [plan, build-turma-image]
+    if: >-
+      !cancelled() && needs.build-turma-image.result == 'success'
+      && needs.plan.outputs.dry_run != 'true' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment: argocd-deploy
+    permissions: {}
+    steps:
+      - name: Update the hub image in ArgoCD
         env:
           GITOPS_DEPLOY_KEY: ${{ secrets.ARGOCD_DEPLOY_KEY }}
           GITOPS_REPO: ${{ github.repository_owner }}/ArgoCD
           MANIFEST: ai/turma/deployment.yaml
           IMAGE: ${{ env.TURMA_IMAGE }}
           VERSION: ${{ needs.plan.outputs.version }}
+          DIGEST: ${{ needs.build-turma-image.outputs.digest }}
           TAG: ${{ needs.plan.outputs.tag }}
         run: |
           set -euo pipefail
           if [ -z "$GITOPS_DEPLOY_KEY" ]; then
-            echo "::error::ARGOCD_DEPLOY_KEY is not set — k8x will stay on the previous hub image. See RELEASING.md." >&2
+            echo "::error::ARGOCD_DEPLOY_KEY is not set in the argocd-deploy environment — k8x will stay on the previous hub image. See RELEASING.md." >&2
             exit 1
           fi
+          if ! [[ $DIGEST =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::build-turma-image produced no image digest ('$DIGEST') — refusing to deploy an unpinned image." >&2
+            exit 1
+          fi
+          REF="${IMAGE}:${VERSION}@${DIGEST}"
           KEY="$RUNNER_TEMP/argocd_deploy_key"
           KNOWN="$RUNNER_TEMP/argocd_known_hosts"
+          trap 'rm -f "$KEY"' EXIT
           printf '%s\n' "$GITOPS_DEPLOY_KEY" > "$KEY"
           chmod 600 "$KEY"
           # GitHub's published ed25519 host key, PINNED rather than accepted on
@@ -277,23 +305,37 @@ jobs:
           export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o UserKnownHostsFile=$KNOWN"
           git clone --quiet "git@github.com:${GITOPS_REPO}.git" "$RUNNER_TEMP/gitops"
           cd "$RUNNER_TEMP/gitops"
-          # Only the hub's own line: the pattern is anchored on the exact
-          # repository image. The old pin may carry a tag, a @digest, or neither.
-          sed -i -E "s#^([[:space:]]*image: )${IMAGE}([:@][^[:space:]]*)?[[:space:]]*\$#\1${IMAGE}:${VERSION}#" "$MANIFEST"
-          # A sed that matched nothing is silent, and a cluster that quietly
-          # never updates is the failure this step exists to prevent.
-          grep -q "image: ${IMAGE}:${VERSION}$" "$MANIFEST" || {
-            echo "::error::${MANIFEST} has no \`image: ${IMAGE}\` line to update — k8x is still on the previous image." >&2
-            exit 1
-          }
-          if git diff --quiet -- "$MANIFEST"; then
-            echo "Already at ${VERSION}; nothing to commit."
-            exit 0
-          fi
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit --quiet -m "Turma hub ${VERSION} (${TAG})" -- "$MANIFEST"
-          git push --quiet origin HEAD:main
+          # Other repos' release bots push to this main too; a push that lost
+          # the race is rebased onto the new main and retried, not failed.
+          for attempt in 1 2 3; do
+            # Only the hub's own line: the pattern is anchored on the exact
+            # repository image. The old pin may carry a tag, a @digest, both,
+            # or neither.
+            sed -i -E "s#^([[:space:]]*image: )${IMAGE}([:@][^[:space:]]*)?[[:space:]]*\$#\1${REF}#" "$MANIFEST"
+            # A sed that matched nothing is silent, and a cluster that quietly
+            # never updates is the failure this job exists to prevent. Anchored
+            # at line start so a comment naming the image cannot satisfy it.
+            grep -Eq "^[[:space:]]*image: ${REF}\$" "$MANIFEST" || {
+              echo "::error::${MANIFEST} has no \`image: ${IMAGE}\` line to update — k8x is still on the previous image." >&2
+              exit 1
+            }
+            if git diff --quiet -- "$MANIFEST"; then
+              echo "Already at ${REF}; nothing to commit."
+              exit 0
+            fi
+            git commit --quiet -m "Turma hub ${VERSION} (${TAG})" -- "$MANIFEST"
+            if git push --quiet origin HEAD:main; then
+              echo "Deployed ${REF}"
+              exit 0
+            fi
+            echo "::warning::push to ${GITOPS_REPO} main lost a race (attempt ${attempt}); rebasing"
+            git fetch --quiet origin main
+            git reset --quiet --hard origin/main
+          done
+          echo "::error::could not push to ${GITOPS_REPO} main after 3 attempts" >&2
+          exit 1
 
   # ------------------------------------------------------- build: glasses -----
   # GitHub-hosted: an npm build + pack, no docker cache to keep warm.
@@ -563,11 +605,12 @@ jobs:
   # that was SUPPOSED to run failed (a skipped/carried component is fine).
   publish:
     needs:
-      [plan, bump, build-turma-image, build-glasses, build-android, build-agent-native, build-agent-windows]
+      [plan, bump, build-turma-image, deploy-argocd, build-glasses, build-android, build-agent-native, build-agent-windows]
     if: >-
       !cancelled() && needs.plan.result == 'success'
       && needs.bump.result != 'failure'
       && needs.build-turma-image.result != 'failure'
+      && contains(fromJSON('["success", "skipped"]'), needs.deploy-argocd.result)
       && needs.build-glasses.result != 'failure'
       && needs.build-android.result != 'failure'
       && needs.build-agent-native.result != 'failure'

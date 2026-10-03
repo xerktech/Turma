@@ -389,9 +389,9 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   <device>`; set `TURMA_AGENT_STRICT` on the hub once every host has one), and the push
   service-account. No pricing/cost env — usage is counted in tokens per model.
 - **The HUB runs on `k8x` from xerktech/ArgoCD (`ai/turma/`), and a release DEPLOYS it** (XERK-425):
-  the last step of `build-turma-image` rewrites that manifest's image tag, and the Application is
-  `automated`, so merging hub code to main puts it in production. Needs the `ARGOCD_DEPLOY_KEY` secret
-  (a write deploy key, not a PAT) and fails loudly without it. Detail: `release.md`.
+  the `deploy-argocd` job pins that manifest's image digest, and the Application is `automated`, so
+  merging hub code to main puts it in production. Needs `ARGOCD_DEPLOY_KEY` in the main-only
+  `argocd-deploy` Environment and fails loudly without it. Detail: `release.md`.
 - Adding a host is a native install; the hub is the only container this repo ships.
 - The hub's `/data` volume holds `state.json` AND the durable archive, so it must be persisted
   (`ARCHIVE_DIR`/`ARCHIVE_DB` override).
