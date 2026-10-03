@@ -1103,12 +1103,30 @@ def _start_poke_listener():
     log(f"poke listener on 127.0.0.1:{port} (Windows beat-now channel)")
 
 
+# How long the cheap-git worker may go without starting a new subprocess
+# before the beat abandons it for a fresh one (XERK-1537). Every read is
+# bounded by run()'s 15s — but on a timeout CPython kill()s and then waits
+# UNBOUNDED, and a git in uninterruptible (D) sleep on a stalled block device
+# cannot be reaped until its I/O completes. Twice that timeout plus margin, so
+# a healthy read sequence never trips it.
+CHEAP_GIT_STALL_SEC = 60
+
+
+def _note_spawn():
+    """Stamp the calling thread with the time it last started a subprocess:
+    the cheap-git watchdog's progress signal (XERK-1537). An attribute on the
+    Thread object, so the beat can read another thread's stamp and nothing
+    outlives the thread."""
+    threading.current_thread().spawnedAt = time.monotonic()
+
+
 def run(cmd, cwd=None, timeout=15):
     """Run a command, return stripped stdout or '' on any failure.
 
     Failure and "no output" are the SAME answer here, so callers that must tell
     them apart (a `git status --porcelain` deciding a worktree is clean, say)
     want run_out instead."""
+    _note_spawn()
     try:
         out = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
@@ -1128,6 +1146,7 @@ def run_out(cmd, cwd=None, timeout=15):
     """Run a command, return (rc, stripped stdout). rc is None if it couldn't
     launch or timed out — the distinction run() collapses, and the one that
     matters when EMPTY output is itself a verdict."""
+    _note_spawn()
     try:
         out = subprocess.run(
             cmd, cwd=cwd, capture_output=True, text=True, timeout=timeout
@@ -5304,6 +5323,7 @@ def _strict_git(cmd, cwd, timeout=15, fail_is_unknown=False):
     `fail_is_unknown` makes a nonzero exit GitTimeout too: for `status`, whose
     EMPTY output is itself the verdict "clean", a failure (a corrupt index, an
     EIO) must not read as one. rev-parse keeps "" — that failure IS "gone"."""
+    _note_spawn()
     try:
         out = subprocess.run(cmd, cwd=cwd, capture_output=True, text=True,
                              timeout=timeout)
@@ -16664,6 +16684,10 @@ class SessionManager:
         self._cheap_wake = threading.Event()
         self._cheap_worker = None
         self._cheap_due = {}                     # (attr, key) -> (fn, path)
+        # Jobs whose worker the watchdog abandoned mid-read (XERK-1537):
+        # (attr, key) -> that worker. Not re-staged while it is still stuck,
+        # so a stalled disk leaks at most one thread per key.
+        self._cheap_stuck = {}
         # The slow facts above, and these, are served from cache the same way
         # and read on the same worker (XERK-1262) — so the beat reads no
         # per-repo/per-session git fact itself, not on cold start, not on the
@@ -27988,8 +28012,13 @@ class SessionManager:
         restarts."""
         try:
             with self._cheap_lock:
-                self._cheap_due[(attr, key)] = (fn, path)
+                self._cheap_stuck = {k: t for k, t in self._cheap_stuck.items()
+                                     if t.is_alive()}
+                if (attr, key) not in self._cheap_stuck:
+                    self._cheap_due[(attr, key)] = (fn, path)
                 worker = self._cheap_worker
+                if worker is not None and worker.is_alive():
+                    worker = self._abandon_stalled_cheap_worker(worker)
                 if worker is None or not worker.is_alive():
                     worker = threading.Thread(
                         target=self._cheap_git_worker_loop,
@@ -28000,19 +28029,60 @@ class SessionManager:
         except Exception as e:
             log(f"cheap git refresh could not be staged: {type(e).__name__}: {e}")
 
+    def _abandon_stalled_cheap_worker(self, worker):
+        """The watchdog (XERK-1537); caller holds _cheap_lock. Returns `worker`,
+        or None once it is abandoned so the caller starts a fresh one.
+
+        A worker is stalled when it is mid-job and has started no subprocess for
+        CHEAP_GIT_STALL_SEC — a git in D sleep that the timeout's kill() cannot
+        reap, or a stat on the stalled disk. Nothing can interrupt that thread,
+        so it is left behind (a daemon; it exits, answer discarded, if its read
+        ever returns) and its unread jobs go back on the due map. Its stuck job
+        does not: a fresh worker would block on the same path."""
+        job = getattr(worker, "cheapJob", None)
+        if job is None or time.monotonic() - max(
+                worker.jobAt, getattr(worker, "spawnedAt", 0)) < CHEAP_GIT_STALL_SEC:
+            return worker
+        log(f"cheap git worker stalled on {job[0]} {job[1]} for over "
+            f"{CHEAP_GIT_STALL_SEC}s; abandoning it for a fresh worker")
+        self._cheap_stuck[job] = worker
+        self._cheap_due = {**worker.cheapLeft, **self._cheap_due}
+        self._cheap_due.pop(job, None)
+        worker.cheapLeft = {}
+        self._cheap_worker = None
+        return None
+
     def _cheap_git_worker_loop(self):
         """Run the staged cheap git reads, then wait for the beat to stage more.
 
         Daemon and never joined, like the slow-refresh worker: every read is a
         cache the next beat re-stages, so a pass cut short by a restart costs
         nothing. The wake is cleared BEFORE the due map is taken, so a job
-        staged mid-pass is never dropped."""
+        staged mid-pass is never dropped.
+
+        The pass's unread jobs and the job in hand live on the Thread object
+        (`cheapLeft`, `cheapJob`, `jobAt`), under _cheap_lock, for the watchdog
+        (_abandon_stalled_cheap_worker); a worker that finds it was abandoned
+        exits without publishing."""
+        me = threading.current_thread()
+        me.cheapJob, me.cheapLeft = None, {}
         while True:
             self._cheap_wake.wait()
             self._cheap_wake.clear()
             with self._cheap_lock:
-                due, self._cheap_due = self._cheap_due, {}
-            for (attr, key), (fn, path) in due.items():
+                if self._cheap_worker is not me:
+                    return
+                me.cheapLeft, self._cheap_due = self._cheap_due, {}
+            while True:
+                with self._cheap_lock:
+                    if self._cheap_worker is not me:
+                        return
+                    if not me.cheapLeft:
+                        me.cheapJob = None
+                        break
+                    job = next(iter(me.cheapLeft))
+                    fn, path = me.cheapLeft.pop(job)
+                    me.cheapJob, me.jobAt = job, time.monotonic()
                 try:
                     value = fn(path, strict=True)
                 except GitTimeout:
@@ -28020,7 +28090,9 @@ class SessionManager:
                 except Exception as e:
                     log(f"cheap git refresh of {path} failed: {e}")
                     continue
-                self._cheap_store(attr, key, value, only_if_present=True)
+                if self._cheap_worker is not me:
+                    return
+                self._cheap_store(job[0], job[1], value, only_if_present=True)
 
     def _refresh_jira_if_configured(self):
         """The worker's jira arm. The configured() re-check keeps 'unset creds =

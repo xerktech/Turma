@@ -22790,6 +22790,73 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
             run_held_cheap_refreshes(sm, staged)
         self.assertIsNone(sm.session_cheap["s1"])
 
+    def test_a_read_stuck_past_its_timeout_is_abandoned_not_waited_on(self):
+        """XERK-1537: on a timeout subprocess.run kill()s and then waits
+        UNBOUNDED, and a git in D sleep cannot be reaped until its I/O lands —
+        which froze the ONE worker, and with it every git cache. The beat now
+        abandons a worker that has started no subprocess for
+        CHEAP_GIT_STALL_SEC: the pass's other jobs go to a fresh worker, the
+        stuck key is not re-staged while it is stuck, and the stuck read's late
+        answer is never published."""
+        sm = self.make_manager()
+        sm.repo_cheap = {k: {"branch": "old"} for k in ("A", "B", "C")}
+        entered, release = threading.Event(), threading.Event()
+
+        def stuck(path, strict=False):
+            entered.set()
+            release.wait(10)
+            return {"branch": "late"}
+
+        def fresh(path, strict=False):
+            return {"branch": "new"}
+
+        def wait_for(cond):
+            for _ in range(500):
+                if cond():
+                    return True
+                time.sleep(0.01)
+            return False
+
+        sm._cheap_due = {("repo_cheap", "A"): (stuck, "A"),
+                         ("repo_cheap", "B"): (fresh, "B")}
+        sm._stage_cheap_refresh("repo_cheap", "C", fresh, "C")
+        self.assertTrue(entered.wait(5))
+        old = sm._cheap_worker
+        with mock.patch.object(ha, "CHEAP_GIT_STALL_SEC", 0):
+            # The next beat re-stages A; the watchdog fires instead of queueing
+            # it behind the read that is stuck on it.
+            sm._stage_cheap_refresh("repo_cheap", "A", fresh, "A")
+            self.assertTrue(wait_for(
+                lambda: sm.repo_cheap["B"] == sm.repo_cheap["C"] == {"branch": "new"}),
+                "the stuck read froze every other cache")
+            self.assertIsNot(sm._cheap_worker, old)
+            self.assertEqual(sm.repo_cheap["A"], {"branch": "old"})
+            sm._stage_cheap_refresh("repo_cheap", "A", fresh, "A")
+            self.assertNotIn(("repo_cheap", "A"), sm._cheap_due)
+        release.set()
+        old.join(5)
+        self.assertFalse(old.is_alive())
+        self.assertEqual(sm.repo_cheap["A"], {"branch": "old"}, "late answer published")
+        sm._stage_cheap_refresh("repo_cheap", "A", fresh, "A")
+        self.assertTrue(wait_for(lambda: sm.repo_cheap["A"] == {"branch": "new"}))
+
+    def test_the_watchdog_spares_an_idle_or_progressing_worker(self):
+        """Only a worker mid-job with no recent spawn is stalled: a healthy
+        read sequence (several 15s-bounded spawns) keeps restamping spawnedAt."""
+        sm = self.make_manager()
+        now = time.monotonic()
+        idle = types.SimpleNamespace(cheapJob=None, jobAt=0, cheapLeft={})
+        busy = types.SimpleNamespace(cheapJob=("repo_cheap", "A"), jobAt=0,
+                                     spawnedAt=now, cheapLeft={})
+        with sm._cheap_lock:
+            self.assertIs(sm._abandon_stalled_cheap_worker(idle), idle)
+            self.assertIs(sm._abandon_stalled_cheap_worker(busy), busy)
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=subprocess.TimeoutExpired("git", 15)):
+            before = time.monotonic()
+            _ORIG_RUN(["git", "status"])
+        self.assertGreaterEqual(threading.current_thread().spawnedAt, before)
+
     def test_first_sight_never_spawns_git_on_the_beat(self):
         sm = self.make_manager()
         staged = hold_cheap_refreshes(self, sm)
