@@ -623,8 +623,17 @@ function closeDb() {
 //      the corrupt file — which is exactly what the old fallback did, so it failed
 //      identically. Callers detect a corruption with `isSqliteCorruption`.
 let hydrating = false;
+// When the gate last CLOSED (ms epoch), null while open — so a gate that never
+// reopens is a measurable duration on /metrics + /readyz, not a silent boolean
+// (XERK-1282: a hung hydrate kept ingest 503'd for days with /readyz all green).
+let hydratingSince = null;
 function isHydrating() { return hydrating; }
-function setHydrating(v) { hydrating = !!v; }
+function setHydrating(v) {
+  if (v && !hydrating) hydratingSince = Date.now();
+  if (!v) hydratingSince = null;
+  hydrating = !!v;
+}
+function hydratingForMs(now = Date.now()) { return hydratingSince == null ? 0 : now - hydratingSince; }
 function isSqliteCorruption(e) {
   // "database disk image is malformed" (SQLITE_CORRUPT), "fts5: corruption found …"
   // (SQLITE_CORRUPT_VTAB), AND "file is not a database" (SQLITE_NOTADB) — a
@@ -3468,7 +3477,7 @@ module.exports = {
   openDb, closeDb, rebuildIndex, setBlobSink, setRawRemote,
   // Boot/hydrate serialization + corrupt-cache self-heal (XERK-789) — all inert
   // off HA (`hydrating` is only ever set around the HA index hydrate).
-  isHydrating, setHydrating, isSqliteCorruption, lostTranscripts, reseedLost, reseedCeiling, resetLocalIndex, checkIndexIntegrity,
+  isHydrating, setHydrating, hydratingForMs, isSqliteCorruption, lostTranscripts, reseedLost, reseedCeiling, resetLocalIndex, checkIndexIntegrity,
   // The per-transcript rendered gate (XERK-1050) — unset, and inert, off HA.
   setRenderedGate, missingFiledPaths, reconcileLanded,
   // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration

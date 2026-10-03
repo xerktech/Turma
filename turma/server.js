@@ -4196,7 +4196,11 @@ function metricsText(now = Date.now()) {
     "# HELP turma_archive_ingest_gated 1 while ALL archive ingest is closed " +
     "(boot/promotion hydrate, or the bucket cannot be listed).\n" +
     "# TYPE turma_archive_ingest_gated gauge\n" +
-    `turma_archive_ingest_gated ${archive.isHydrating() ? 1 : 0}\n`;
+    `turma_archive_ingest_gated ${archive.isHydrating() ? 1 : 0}\n` +
+    "# HELP turma_archive_ingest_gated_seconds How long ALL archive ingest has been " +
+    "closed, 0 while open.\n" +
+    "# TYPE turma_archive_ingest_gated_seconds gauge\n" +
+    `turma_archive_ingest_gated_seconds ${Math.floor(archive.hydratingForMs(now) / 1000)}\n`;
 }
 
 // Under HA a transcript's raw files may still be in the bucket (XERK-1043): fetch
@@ -4306,6 +4310,44 @@ function setIndexMirror(store, ha) {
 // fresh local index via archive.js's bulk loader. Best-effort with a HARD fallback:
 // on any failure, rebuild from the (already-hydrated) files, so a store blip never
 // leaves a promoted replica unable to serve archive reads.
+//
+// BOUNDED (XERK-1282): a Postgres load still running after
+// ARCHIVE_INDEX_HYDRATE_DEADLINE_MS is abandoned and handled exactly like a failed
+// one. Its loader is cut off first, so if the hung await ever does return it writes
+// nothing into the index that ingest (reopened by the `finally`) now owns. Without
+// it one await that never settled kept ingest 503'd until the pod died.
+// setTimeout fires after ~1ms for a delay past 2^31-1, so clamp the env knobs below.
+const MAX_TIMER_MS = 2147483647;
+const ARCHIVE_INDEX_HYDRATE_DEADLINE_MS = Math.min(MAX_TIMER_MS,
+  positiveEnv("ARCHIVE_INDEX_HYDRATE_DEADLINE_MS", 10 * 60 * 1000));
+// Every method of `loader`, made a no-op once `cut()` is called.
+function cuttableLoader(loader) {
+  let live = true;
+  const wrapped = {};
+  for (const [k, v] of Object.entries(loader)) {
+    wrapped[k] = typeof v === "function" ? (...a) => (live ? v.apply(loader, a) : undefined) : v;
+  }
+  return { loader: wrapped, cut() { live = false; } };
+}
+async function withLoaderDeadline(load, loader, what, deadlineMs = ARCHIVE_INDEX_HYDRATE_DEADLINE_MS) {
+  const c = cuttableLoader(loader);
+  let timer;
+  try {
+    return await Promise.race([
+      load(c.loader),
+      new Promise((_, rej) => {
+        timer = setTimeout(() => {
+          c.cut();
+          rej(new Error(`${what} did not finish within ` +
+            `${Math.round(deadlineMs / 1000)}s and was abandoned`));
+        }, deadlineMs);
+        timer.unref?.();
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
 async function hydrateArchiveIndex() {
   if (!archiveIndexStore) return;
   // Gate archive ingest for the whole hydrate: the paged hydrate `await`s each
@@ -4321,7 +4363,8 @@ async function hydrateArchiveIndex() {
       // direct from there). `hydrating` gates ingest for the whole load, so the
       // reset-then-fill never races a concurrent map write. There is NO local FTS5 to
       // integrity-check and nothing to reset — the map is ephemeral, rebuilt every boot.
-      await archiveIndexStore.hydrateSessionsInto(archive.sessionLoader());
+      await withLoaderDeadline((l) => archiveIndexStore.hydrateSessionsInto(l),
+        archive.sessionLoader(), "the Postgres sessions hydrate");
       // The rebuild-of-record-FROM-FILES backstop the sqlite path had and XERK-793
       // removed (XERK-797): if Postgres was wiped/rebuilt independently of the S3
       // byte-of-record (or a fresh PG stood up beside an existing bucket), the hydrate
@@ -4335,7 +4378,8 @@ async function hydrateArchiveIndex() {
     } else {
       // Legacy sqlite-hot-cache hydrate (HA on but no Postgres index store — a degraded
       // misconfig; XERK-780/789/791 path).
-      await archiveIndexStore.hydrateInto(archive.indexLoader());
+      await withLoaderDeadline((l) => archiveIndexStore.hydrateInto(l),
+        archive.indexLoader(), "the Postgres index hydrate");
       // XERK-791: PROACTIVELY verify the freshly-hydrated FTS5 index BEFORE this
       // replica serves reads or accepts ingest. A hydrate that completed WITHOUT
       // throwing can still have left `entries_fts` physically corrupt. Catching it
@@ -4391,11 +4435,27 @@ async function hydrateArchiveIndex() {
 // `hydrating` clears only when that single run's `finally` fires. A caller
 // arriving AFTER a run has completed (the promise cleared) starts a FRESH run, so
 // a promotion that happens after boot still re-hydrates.
+//
+// Each phase is bounded on its own (the byte pass in archive-mirror.js, the index
+// load above), but a run is also WATCHED (XERK-1282): every
+// ARCHIVE_HYDRATE_WATCH_MS it is still in flight it says so, naming how long ingest
+// has been gated — a hydrate that hangs somewhere new is a log line and a growing
+// `turma_archive_ingest_gated_seconds`, never days of silence.
+const ARCHIVE_HYDRATE_WATCH_MS = Math.min(MAX_TIMER_MS,
+  positiveEnv("ARCHIVE_HYDRATE_WATCH_MS", 5 * 60 * 1000));
 let archiveHydrateInFlight = null;
 function hydrateArchive() {
   if (archiveHydrateInFlight) return archiveHydrateInFlight;
+  const started = Date.now();
+  const watch = setInterval(() => {
+    console.error(`archive hydrate: still running after ${Math.round((Date.now() - started) / 60000)}m; ` +
+      (archive.isHydrating()
+        ? `archive ingest has been closed (503) on this replica for ${Math.round(archive.hydratingForMs() / 1000)}s`
+        : "archive ingest is open"));
+  }, ARCHIVE_HYDRATE_WATCH_MS);
+  watch.unref?.();
   archiveHydrateInFlight = hydrateArchiveOnce()
-    .finally(() => { archiveHydrateInFlight = null; });
+    .finally(() => { clearInterval(watch); archiveHydrateInFlight = null; });
   return archiveHydrateInFlight;
 }
 async function hydrateArchiveOnce() {
@@ -4405,7 +4465,12 @@ async function hydrateArchiveOnce() {
     // a missing or half-downloaded local tree, the agents' re-shipped tails became
     // partial files the drain PUT over the complete objects. hydrateArchiveIndex
     // re-sets the gate synchronously on entry, so there is no gap between the two.
-    try { await archiveMirror.hydrateGated((v) => archive.setHydrating(v)); }
+    // With an index hydrate to follow, ITS `finally` is what opens the gate: the
+    // byte phase never opens it in between, so the gate's closed-since stamp
+    // (turma_archive_ingest_gated_seconds) spans the whole run (XERK-1282).
+    try {
+      await archiveMirror.hydrateGated((v) => { if (v || !archiveIndexStore) archive.setHydrating(v); });
+    }
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
   }
   await hydrateArchiveIndex();
@@ -15284,6 +15349,12 @@ const server = http.createServer(async (req, res) => {
     // removes a branch a single-process hub never took.
     if (url.pathname === "/readyz") {
       if (hubDraining) return json(res, 503, { ready: false, draining: true });
+      // Still Ready — the leader must keep serving everything else — but a gated
+      // archive ingest is on the probe body, so a hung hydrate is visible there.
+      if (archive.isHydrating()) {
+        return json(res, 200, { ready: true,
+          archiveIngestGatedSec: Math.floor(archive.hydratingForMs() / 1000) });
+      }
       return json(res, 200, { ready: true });
     }
 
@@ -19466,6 +19537,9 @@ if (process.env.TURMA_TEST) {
     // late-landed file's cursor, and dropping it loses data with no unit failing.
     setArchiveMirror,
     getArchiveMirror: () => archiveMirror,
+    // The index hydrate's deadline (XERK-1282): a hung load must reject AND cut its
+    // loader, or a late page lands in an index ingest has since reopened.
+    withLoaderDeadline,
     metricsText,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —

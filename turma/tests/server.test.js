@@ -2336,6 +2336,19 @@ test("http: /healthz is unauthenticated; everything else is gated", async () => 
   const ready = await request("GET", "/readyz");
   assert.equal(ready.status, 200);
   assert.equal(ready.body.ready, true);
+  assert.equal(ready.body.archiveIngestGatedSec, undefined);
+  // XERK-1282: a gated archive ingest is on the body, but the probe stays Ready —
+  // a hydrate must never pull the leader out of the Service.
+  const archiveMod = require("../archive.js");
+  archiveMod.setHydrating(true);
+  try {
+    const gated = await request("GET", "/readyz");
+    assert.equal(gated.status, 200);
+    assert.equal(gated.body.ready, true);
+    assert.equal(gated.body.archiveIngestGatedSec, 0);
+  } finally {
+    archiveMod.setHydrating(false);
+  }
   assert.equal((await request("GET", "/api/agents")).status, 401);
   assert.equal(
     (await request("GET", "/api/agents", { headers: { authorization: basic("hubuser", "bad") } })).status,
