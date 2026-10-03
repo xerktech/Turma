@@ -35,8 +35,11 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
     organizer itself (a Feature under an Epic keeps `epicKey` None, so an epic run's children are
     only work items — arm the Feature, not the Epic, to run its stories).
   - The batch GET has no parent type, so `fetch_azure_items` makes ONE extra type-only GET for
-    parents outside the batch (`_azure_parent_types`); a failure there leaves `epicKey` None and
-    keeps the board. Tests: the `xerk1444` cases in `TestShapeAzureItem` + `TestCollectAzure`.
+    parents outside the batch (`_azure_parent_types`). A failed chunk falls back to the last-known
+    `_AZDO_PARENT_TYPE_CACHE`: an unknown type means NO `epicKey`, i.e. the epic child passes the
+    auto-merge gate, so one transient ADO error must never be enough for that. Keep the fallback.
+  - `fetch_azure_issue` (inline on the beat) reads that cache and never GETs the parent.
+  - Tests: the `xerk1444` cases in `TestShapeAzureItem`, `TestCollectAzure`, `fetch_azure_issue`'s.
 - **An agent serves exactly ONE org** (a host is Jira or Azure, never both).
   `board_source()`/`board_configured()`/`collect_board()`/`fetch_board_issue()`/`board_site_key()`/
   `valid_issue_key()` are the dispatch shims every gate goes through; downstream reads `self.jira`

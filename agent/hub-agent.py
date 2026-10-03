@@ -14799,19 +14799,40 @@ def _azure_batch_get(ids, fields):
     return out
 
 
+# Last-known {parent key: System.WorkItemType}, filled by every board poll. A
+# work item's type almost never changes, so a failed or partial type GET falls
+# back to it: an unknown parent type means NO epicKey, which lets an epic child
+# through the auto-start/auto-merge gate — so one transient ADO error must not
+# be enough to do that (XERK-1444). Bounded: cleared when it outgrows the cap.
+_AZDO_PARENT_TYPE_CACHE = {}
+_AZDO_PARENT_TYPE_CACHE_MAX = 5000
+
+
+def _remember_azure_types(types):
+    if len(_AZDO_PARENT_TYPE_CACHE) + len(types) > _AZDO_PARENT_TYPE_CACHE_MAX:
+        _AZDO_PARENT_TYPE_CACHE.clear()
+    _AZDO_PARENT_TYPE_CACHE.update(
+        {k: v for k, v in types.items() if isinstance(v, str)})
+
+
 def _azure_parent_types(parent_ids, known=None):
     """{parent key: System.WorkItemType} for `parent_ids`, GETting only the ones
-    not already in `known` (the caller's own batch). Best-effort: a failed GET
-    leaves those parents unknown (-> no epicKey) rather than losing the board."""
+    not already in `known` (the caller's own batch). Best-effort per chunk: a
+    failed chunk falls back to the last-known types, else leaves those parents
+    unknown (-> no epicKey) rather than losing the board."""
     types = dict(known or {})
     missing = sorted({str(p) for p in parent_ids if p is not None} - set(types))
-    if not missing:
-        return types
-    try:
-        for wi in _azure_batch_get(missing, ["System.Id", "System.WorkItemType"]):
-            types[str(wi["id"])] = (wi.get("fields") or {}).get("System.WorkItemType")
-    except Exception as e:
-        log(f"azure parent-type fetch failed: {e}")
+    for i in range(0, len(missing), AZDO_BATCH):
+        chunk = missing[i:i + AZDO_BATCH]
+        try:
+            for wi in _azure_batch_get(chunk, ["System.Id", "System.WorkItemType"]):
+                types[str(wi["id"])] = (wi.get("fields") or {}).get("System.WorkItemType")
+        except Exception as e:
+            log(f"azure parent-type fetch failed: {e}")
+    _remember_azure_types(types)
+    for k in missing:
+        if types.get(k) is None and k in _AZDO_PARENT_TYPE_CACHE:
+            types[k] = _AZDO_PARENT_TYPE_CACHE[k]
     return types
 
 
@@ -15007,8 +15028,10 @@ def fetch_azure_issue(key):
                 {"api-version": f"{AZDO_API_VERSION}-preview.3"})
         except Exception as e:
             log(f"azure comments fetch failed for {key}: {e}")
-    parent_types = _azure_parent_types([f.get("System.Parent")])
-    detail = _shape_azure_detail(wi, comments_data, site_key, base, parent_types)
+    # The parent's type from the board poll's cache, not a fresh GET: this runs
+    # inline on the beat (handle_commands), so it must not add a request.
+    detail = _shape_azure_detail(wi, comments_data, site_key, base,
+                                 _AZDO_PARENT_TYPE_CACHE)
     detail["statusOptions"] = _azure_status_options(
         site_key, project, f.get("System.WorkItemType"), f.get("System.State"))
     return detail

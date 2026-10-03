@@ -29153,6 +29153,7 @@ class TestCollectAzure(unittest.TestCase):
                 return {"workItems": [{"id": i["id"]} for i in items]}
             return base(path, params, body)
         with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
              mock.patch.object(ha, "azure_req", req):
             block = ha.collect_azure()
         by = {t["key"]: t for t in block["tickets"]}
@@ -29167,18 +29168,31 @@ class TestCollectAzure(unittest.TestCase):
         items = [_azure_wi(1, "Active", wtype="Epic"),
                  _azure_wi(2, "Active", wtype="User Story", **{"System.Parent": 100})]
         base = self._fake_req(items)
+        fail = {"on": False}
 
         def req(path, params, body=None):
             if path == "/_apis/wit/workitems" and params["ids"] == "100":
-                raise OSError("boom")
+                if fail["on"]:
+                    raise OSError("boom")
+                return {"value": [_azure_wi(100, "New", wtype="Epic")]}
             return base(path, params, body)
         with self._configured(), mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {}), \
              mock.patch.object(ha, "azure_req", req):
+            # Never resolved -> unknown -> no epicKey, board still available.
+            fail["on"] = True
             block = ha.collect_azure()
-        self.assertTrue(block["available"])
-        by = {t["key"]: t for t in block["tickets"]}
-        self.assertTrue(by["1"]["isEpic"])
-        self.assertIsNone(by["2"]["epicKey"])
+            self.assertTrue(block["available"])
+            by = {t["key"]: t for t in block["tickets"]}
+            self.assertTrue(by["1"]["isEpic"])
+            self.assertIsNone(by["2"]["epicKey"])
+            # Resolved once, then a failed GET falls back to the last-known type,
+            # so a transient error never lets the epic child through the gate.
+            fail["on"] = False
+            ha.collect_azure()
+            fail["on"] = True
+            by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
+            self.assertEqual(by["2"]["epicKey"], "100")
 
     def test_project_scope_added_to_wiql(self):
         seen = {}
@@ -29259,6 +29273,23 @@ class TestFetchAzureIssue(unittest.TestCase):
         self.assertEqual(d["resolution"], "Investigation complete")
         self.assertEqual(d["commentTotal"], 2)
         self.assertEqual([c["body"] for c in d["comments"]], ["older", "newer"])
+
+    def test_epic_key_from_cached_parent_type_no_extra_get_xerk1444(self):
+        # The detail runs inline on the beat, so the parent's type comes from the
+        # board poll's cache — no extra GET (the req below refuses any other path).
+        def req(path, params, body=None):
+            if path == "/_apis/wit/workitems/42":
+                return _azure_wi(42, "Active", wtype="User Story",
+                                 **{"System.Parent": 100})
+            raise RuntimeError("no comments")
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org",
+                                 AZDO_TOKEN="p"), \
+             mock.patch.object(ha, "_AZDO_STATE_CACHE", {}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {"100": "Epic"}), \
+             mock.patch.object(ha, "azure_req", req):
+            d = ha.fetch_azure_issue("42")
+        self.assertEqual(d["epicKey"], "100")
+        self.assertFalse(d["isEpic"])
 
     def test_comments_failure_degrades_to_none(self):
         def req(path, params, body=None):
