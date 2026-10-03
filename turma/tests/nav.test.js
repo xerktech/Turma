@@ -221,6 +221,12 @@ test("nav: scroll keys with nothing focused scroll the page pane, never move foc
   doc.activeElement = { tagName: "A" };                    // a header link, outside the pane
   assert.equal(key(" ").prevented, false, "Space activates a focused header control");
   assert.ok(key("PageDown").prevented, "a focused header control still lets the page scroll");
+  assert.equal(pane.scrollTop, 700);  // A focused row inside a scrolling menu outside the pane (the org menu,
+  // XERK-1285): the browser scrolls the menu, so the pane must not take the key.
+  const menu = { nodeType: 1, oy: "auto", scrollHeight: 1087, clientHeight: 250, parentElement: body };
+  doc.activeElement = { nodeType: 1, tagName: "BUTTON", parentElement: menu };
+  assert.equal(key("ArrowDown").prevented, false, "a focused menu row keeps its arrow keys");
+  assert.equal(key("End").prevented, false, "a focused menu row keeps End");
   assert.equal(pane.scrollTop, 700);
 });
 

@@ -111,8 +111,9 @@
   // pane on load: that moves where Tab starts, so the first Tab skipped the
   // whole header. It steps aside whenever the browser has a scroll target of
   // its own, because the browser does that better (inner lists, the pane itself):
-  //  - the focused element is inside the pane (its own scroller handles it) or
-  //    is editable (keys are text); a focused header link/button outside the
+  //  - the focused element is inside the pane or another scroller (the org
+  //    menu — the browser scrolls that one) or is editable (keys are text);
+  //    a focused header link/button outside the
   //    pane keeps only Space, which activates it — its other keys route here,
   //    since the browser would send them to the unscrollable root;
   //  - a modal is open (`body.td-open`) — its keys belong to the modal;
@@ -126,7 +127,7 @@
     if (e.ctrlKey && e.key !== "Home" && e.key !== "End") return;
     const focused = doc.activeElement && doc.activeElement !== doc.body ? doc.activeElement : null;
     if (focused) {
-      if (e.key === " " || pane.contains(focused)) return;
+      if (e.key === " " || pane.contains(focused) || inScroller(doc, focused)) return;
       if (focused.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName)) return;
     }
     if (doc.body.classList && doc.body.classList.contains("td-open")) return;
