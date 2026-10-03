@@ -2178,6 +2178,19 @@ class TestPrSummary(unittest.TestCase):
             fh.write("Describe your change.\n")
         self.assertIsNone(self.reason("gh pr create --body 'anything'"))
 
+    def test_a_template_checks_every_pr_command_in_the_line(self):
+        # XERK-1565: a passing first PR command used to return early, so a
+        # second one in the same command went unchecked under a template.
+        with open(os.path.join(self.repo, "pull_request_template.md"), "w") as fh:
+            fh.write("## Why\n\n## Risk\n")
+        with open(os.path.join(self.repo, "ok.md"), "w") as fh:
+            fh.write("## Why\nx\n## Risk\ny\n")
+        with open(os.path.join(self.repo, "bad.md"), "w") as fh:
+            fh.write("nothing\n")
+        self.assertIsNone(self.reason("gh pr create -t x -F ok.md"))
+        self.assertIn("Why", self.reason(
+            "gh pr create -t x -F ok.md; gh pr edit 2 -F bad.md"))
+
     def test_the_new_aliases_are_checked(self):
         for cmd in ("gh pr new --fill", "glab mr new -d x"):
             with self.subTest(cmd=cmd):
