@@ -4608,17 +4608,21 @@ SANDBOX_DOMAIN_FLOOR = (
 )
 # Narrow `Bash(<cmd>:*)` allow rules skip auto mode's classifier: the routine
 # branch/PR/test steps an operator would always approve. The safety guard is a
-# PreToolUse hook and runs BEFORE these, but it refuses a push only when the
-# target is main/master (`_is_protected_ref`, any spelling, forced or not). So a
-# FORCE push to any other branch (`+feat`, `--force`, `-f`) matches
-# `git push origin:*` and runs unprompted, and so does a push to a repo whose
-# default branch has another name (develop, trunk): accepted residuals of this
-# floor. `TURMA_TOOL_ALLOW` (CSV) REPLACES the list when set non-blank. Distinct from `TURMA_TOOL_GRANTS`, which
-# only exempts the guard's destructive category at hook run time and is never
-# written here. The session-CLI rule is XERK-1564's, not this list's.
+# PreToolUse hook and runs BEFORE these, but it refuses a push only when a
+# LITERAL refspec token names main/master (`_is_protected_ref`): it never
+# resolves `HEAD`, `@` or a bare `git push origin` to the branch checked out.
+# So the floor must never put a session ON main: branch switching is floored
+# only as creation (`git switch -c`, what NEW_WORK_SYSTEM_PROMPT tells a session
+# to run); a plain `git switch`/`git checkout` still goes through the classifier.
+# Accepted residuals: a FORCE push to any other branch (`+feat`, `--force`),
+# a push to a default branch named otherwise (develop, trunk), and a session
+# already on main via an unfloored, classifier-approved step pushing `HEAD`.
+# `TURMA_TOOL_ALLOW` (CSV) REPLACES the list when set non-blank. Distinct from
+# `TURMA_TOOL_GRANTS`, which only exempts the guard's destructive category at
+# hook run time and is never written here. The session-CLI rule is XERK-1564's.
 TOOL_ALLOW_FLOOR = (
     "Bash(git fetch:*)", "Bash(git push origin:*)", "Bash(git push -u origin:*)",
-    "Bash(git switch:*)", "Bash(gh pr create:*)", "Bash(gh pr checks:*)",
+    "Bash(git switch -c:*)", "Bash(gh pr create:*)", "Bash(gh pr checks:*)",
     "Bash(gh pr view:*)", "Bash(gh pr edit:*)", "Bash(gh run view:*)",
     "Bash(npm test:*)", "Bash(node --test:*)", "Bash(python3 -m unittest:*)",
     "Bash(pytest:*)", "Bash(./gradlew:*)",
@@ -4626,6 +4630,13 @@ TOOL_ALLOW_FLOOR = (
 # How many scanned repo names the host block lists before summarising the rest:
 # it is classifier context on every launch, not an inventory.
 AUTO_MODE_REPOS_MAX = 100
+# The only repo names the host block will copy into that classifier context.
+# A directory name under REPOS_ROOT is SESSION-WRITABLE (a repos-root session's
+# cwd is REPOS_ROOT; any session can clone into it under any target name) and
+# may hold any text but '/' and NUL, so an unfiltered name would let one session
+# plant a standing "operator note" in every session's trusted environment.
+# GitHub's own repo-name charset; anything else is only counted.
+AUTO_MODE_REPO_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
 
 
 def _csv_override(name, floor):
@@ -4661,10 +4672,12 @@ def auto_mode_host_block(device=None, repos=None):
     `repos` defaults to `scan_repos()` (one listdir); `device` to `$DEVICE_NAME`
     — the manager passes its own resolved name, since `device_name()` may probe."""
     device = device if device is not None else os.environ.get("DEVICE_NAME", "").strip()
-    names = [r["name"] for r in (scan_repos() if repos is None else repos)]
-    shown = ", ".join(names[:AUTO_MODE_REPOS_MAX]) or "none yet"
-    if len(names) > AUTO_MODE_REPOS_MAX:
-        shown += f" (and {len(names) - AUTO_MODE_REPOS_MAX} more)"
+    names = [str(r.get("name") or "") for r in (scan_repos() if repos is None else repos)]
+    listed = [n for n in names if AUTO_MODE_REPO_NAME_RE.fullmatch(n)][:AUTO_MODE_REPOS_MAX]
+    shown = ", ".join(listed) or "none listed"
+    hidden = len(names) - len(listed)
+    if hidden:
+        shown += f" (and {hidden} other{'' if hidden == 1 else 's'})"
     owners = [o for o in re.split(r"[\s,]+", os.environ.get("GH_CLONE_OWNERS", "").strip()) if o]
     site = board_site_key()
     org = " / ".join(x for x in (BOARD_ORG_NAME, site) if x) or "none configured"

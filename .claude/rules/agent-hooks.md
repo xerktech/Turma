@@ -39,12 +39,17 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     skip auto mode's classifier) after `_GUARD_ALLOW_PATH_RULES`, before the operator's;
     `TURMA_TOOL_ALLOW` (CSV) REPLACES it. Not `TURMA_TOOL_GRANTS`, which is a hook-time
     destructive exemption and never written here.
-  - The guard hook runs first but refuses a push ONLY to main/master (`_is_protected_ref`). A FORCE
-    push to any other branch (`+feat`, `--force`), and a push to a default branch named otherwise
-    (develop, trunk), match `git push origin:*` and run unprompted — accepted residuals. Never write
-    that the guard denies force pushes; it does not.
+  - The guard hook runs first but refuses a push only when a LITERAL refspec token names
+    main/master (`_is_protected_ref`); `HEAD`, `@` and a bare `git push origin` are never resolved
+    to the checked-out branch. So the floor never puts a session ON main: switching is floored only
+    as `git switch -c` (plain `git switch`/`checkout` still meet the classifier).
+  - Accepted residuals, run unprompted: a FORCE push to any other branch (`+feat`, `--force`), a
+    push to a default branch named otherwise (develop, trunk), and `git push origin HEAD` from a
+    session already on main via an unfloored step. Never write that the guard denies force pushes.
   - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
-    repos (capped), `GH_CLONE_OWNERS`, tracker org/site, `TURMA_URL` minus userinfo, the worktree/PR/
+    repos (capped; only names matching `AUTO_MODE_REPO_NAME_RE` are COPIED, the rest counted — a
+    `REPOS_ROOT` dir name is session-writable text in trusted classifier context), `GH_CLONE_OWNERS`,
+    tracker org/site, `TURMA_URL` minus userinfo, the worktree/PR/
     default-branch facts. The operator file keeps the org-wide block. A SNAPSHOT at the manager's
     first launch (the file is cached per process): a repo cloned later is missing until restart.
   - dsh/qwen read only `permissions`, and only its `Read()`/`Edit()` rules, so none of this leaks
