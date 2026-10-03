@@ -1044,7 +1044,10 @@ class TestParserGaps(unittest.TestCase):
                     f"echo -e '[trailer \"x\"]\\n\\tcommand = $({R})' >> .git/config; "
                     "git commit --trailer x:y",
                     f"echo '$({R})' > .git/hooks/pre-commit",
-                    f"git commit -m '$({R})' && echo done", "git commit -m x && git status '$(reboot)'",
+                    f"git commit -m '$({R})' && echo done",
+                    # A configured trailer.<k>.command runs the value via sh.
+                    f"git commit -m m --trailer 'k:$({R})'", f"git commit -m m --trailer='k:$({R})'",
+                    f"git tag -a t -m '$({R})'", "git commit -m x && git status '$(reboot)'",
                     f"echo \"$(sh -c 'echo $({R})')\"",
                     f"for i in 1; do printf '$({R})'; done | sh"):
             with self.subTest(cmd=cmd):

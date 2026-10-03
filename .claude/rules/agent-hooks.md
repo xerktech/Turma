@@ -79,7 +79,7 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     `# don't` desynced its quotes; a pattern's `|` is no pipe and a plain pattern is dropped.
   - **Braces inside quotes are text** (`_expand_braces`); `bash -c`/`eval` re-expand a quoted script.
   - **A single-quoted substitution is text ONLY on a line that is ONE allowlisted stage, no redirection**
-    (`_quoted_text_only`: echo (not printf: `-v` assigns), `git commit|tag` w/o `-c`, `gh pr|issue create|edit|comment`),
+    (`_quoted_text_only`: echo (not printf: `-v` assigns), `git commit` w/o `-c`/`--trailer`, `gh pr|issue create|edit|comment`),
     with NOTHING but reserved words before the program — `GIT_EDITOR='$(x)' git commit` runs it.
     - Never widen it to "skip unless a modelled executor is present": `| sh`, `find -exec sh -c`,
       `xargs sh -c`, `<<<` into a shell, `flock`, `env -S`, `git -c core.pager=` each run it.

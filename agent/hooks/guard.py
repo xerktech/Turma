@@ -421,7 +421,7 @@ def _quote_states(command: str) -> list[str]:
 # Not `printf`: `printf -v GIT_EDITOR '$(x)'; git commit` ASSIGNS what git
 # then runs through `sh -c` (Claude Code's shells export GIT_EDITOR).
 _QUOTED_TEXT_PROGS = {"echo"}
-_QUOTED_TEXT_GIT = {"commit", "tag"}
+_QUOTED_TEXT_GIT = {"commit"}
 _ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?=")
 _QUOTED_TEXT_GH = {("pr", "create"), ("pr", "edit"), ("pr", "comment"),
                    ("issue", "create"), ("issue", "edit"), ("issue", "comment")}
@@ -447,7 +447,10 @@ def _quoted_text_only(raw_tokens: list[str]) -> bool:
     if prog in _QUOTED_TEXT_PROGS:
         return True
     if prog == "git":
-        if any(t.startswith(("-c", "--config-env", "--exec-path")) for t in tokens[1:]):
+        # `--trailer 'k:$(x)'`: a configured `trailer.k.command` splices the
+        # value into a SHELL command at `$ARG` (proved with a touch marker).
+        if any(t.startswith(("-c", "--config-env", "--exec-path", "--trailer"))
+               for t in tokens[1:]):
             return False
         args = _git_args(tokens)
         return bool(args) and args[0] in _QUOTED_TEXT_GIT
