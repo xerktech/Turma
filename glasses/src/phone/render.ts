@@ -144,16 +144,22 @@ function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, cur
   // and what it will check then when the session said (web "· <reason>").
   const wakeAt = s.session?.wakeAt;
   const wakeWhy = typeof s.session?.wakeReason === "string" ? s.session.wakeReason.trim() : "";
-  const label = st === "holding" && sleeping(s.session, now ?? Date.now()) && typeof wakeAt === "number"
+  // The hub says it STALLED (XERK-1571/1572, web `reviewState`): a background wait
+  // gone silent, or a session LOOPING on one failing call — which is busy, so its
+  // own liveState would read "working". The hub's read, in the danger tone.
+  const stalled = s.attention?.state === "needs-you:stalled";
+  const stallWhy = typeof s.attention?.why === "string" ? s.attention.why : "";
+  const label = stalled ? ["stalled", stallWhy].filter(Boolean).join(" · ")
+    : st === "holding" && sleeping(s.session, now ?? Date.now()) && typeof wakeAt === "number"
     ? `sleeping until ${clockTime(wakeAt)}${wakeWhy ? ` · ${wakeWhy}` : ""}` : STATE_LABEL[st];
   const stateRow =
     `<span class="ph-state-row">` +
-    `<span class="ph-state st-${st}">${esc(label)}</span>` +
+    `<span class="ph-state st-${stalled ? "stalled" : st}">${esc(label)}</span>` +
     prChips(s) +
     `</span>`;
   return (
     `<button class="ph-card ph-sess${current ? " cur" : ""}"${tint} data-enter="${esc(s.id)}" data-host="${esc(hostKey)}">` +
-    `<span class="ph-dot st-${st}" aria-hidden="true"></span>` +
+    `<span class="ph-dot st-${stalled ? "stalled" : st}" aria-hidden="true"></span>` +
     `<span class="ph-card-body">` +
     `<span class="ph-card-title">${esc(name)}</span>` +
     `<span class="ph-card-meta">${metaLine(hostLabel, s)}</span>` +

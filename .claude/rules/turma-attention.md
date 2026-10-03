@@ -117,7 +117,8 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 - **A hint answers ONE state run** (`attentionWithHint`): kept on `sa.hint` (persists with `alerts`)
   and folded only while the state its edge names holds (a `loop` hint only on a loop stall, a
   `stalled` one only on a wait stall). The first beat it answers nothing current it is deleted —
-  so a later wait of the same kind never shows the last one's verdict.
+  so a later wait of the same kind never shows the last one's verdict. A flicker back onto the SAME
+  edge is healed by the AGENT re-sending its cached verdict, not by the hub keeping it.
 - `wireAttention` rebuilds `hint` field by field (label in the set, why non-empty) or omits it;
   Android types it (`AttentionHint`), so a corrupt `state.json` must not reach the wire.
 - **Surfaces** — one wording (`HINT_KIND`: "decision · …", "needs a human test · …", then
@@ -125,14 +126,16 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   the dashboard card's State row (`attentionHintHtml`, needs-you only), Android
   `attentionHintLine`/`attentionSuggested` on both cards, glasses phone card (`attentionHint`).
 - **A looping card never reads "working"**: the dashboard State row (`liveState`, a `loop` + hub
-  stall), the Sessions review card (`reviewState`) and Android's fleet card speak the hub's stall.
+  stall), the Sessions review card (`reviewState`), Android's fleet card and Sessions card dot
+  (`attentionStalled`) and the glasses phone card (`st-stalled`) speak the hub's stall.
 
 ## Nudges (XERK-1572)
 
 - `attentionNudgeSweep` (leader-only, on `masterOrchestrationTick`) queues ONE `input` command per
   (session, reason) for a running `needs-you:stalled` session on an ONLINE host. `input`, not the
   inbox: operator voice, like `autoCloseMergedMessage` — a session is told peer text is never
-  instruction. Reason is `loop` (cause) or `stalled`; texts in `attentionNudgeText`.
+  instruction. Reason is `loop` (cause) or `stalled`; texts in `attentionNudgeText`. The command
+  carries `source:"nudge"` so the agent's permission ledger never reads it as the operator answering.
 - Session text inside the message is bounded: a shell label one-lined, backtick-free, ≤80; a tool
   name reduced to `[A-Za-z0-9_.:-]`, ≤64.
 - **Backoff + cap** (`attentionNudged`, the `autoCloseNotified` shape `{at, count, since}`, bounded

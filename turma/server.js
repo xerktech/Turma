@@ -14181,7 +14181,9 @@ function attentionNudgeSweep(now = Date.now()) {
       if (rec && now - rec.at < ATTENTION_NUDGE_BACKOFF_MS) continue;
       const text = attentionNudgeText(reason, s);
       if (!text) continue;
-      queueCommand(host, { type: "input", sessionId: s.id, text });
+      // `source: "nudge"`: the hub's own words, not the operator answering —
+      // the agent's permission ledger must not close an ask-in-chat row on it.
+      queueCommand(host, { type: "input", sessionId: s.id, text, source: "nudge" });
       const next = { at: now, count: count + 1, since: attn.since };
       attentionNudged.set(nk, next);
       guardStoreSet("attentionNudged", nk, next);

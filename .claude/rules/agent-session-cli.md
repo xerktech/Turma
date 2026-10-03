@@ -109,12 +109,24 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - **The classifier is a `claude -p` Haiku one-shot on the `_start_summary` posture** (cwd
   `REGISTRY_DIR`, no `--settings`, stdin closed, prompt an argv element, `TURMA_ATTENTION_HINT_MODEL`,
   `TURMA_ATTENTION_HINT_TIMEOUT_SEC`), its prompt signature in `INTERNAL_TOOL_PROMPT_SIGS` so its
-  transcripts never surface as a repo. `TURMA_ATTENTION_HINTS=0` turns it off; dsh/qwen skip it (no
+  transcripts never surface as a repo.
+- **It runs with NO tool and NO MCP server** (`ATTENTION_HINT_LOCKDOWN` = `--tools=` +
+  `--strict-mcp-config`): its DATA is the session's own text, which repo content and tool output can
+  steer, and no guard hook is wired. `--tools=` (equals form) because a variadic `--tools ""` swallows
+  the prompt after it. Verified on the installed CLI: the init event lists `tools: []`, `mcp: []`.
+- **Output goes to a FILE and the child leads its own process group** (`start_new_session`), killed
+  whole on a timeout and reaped with a bound — a pipe read waits for EOF unbounded, so a grandchild
+  holding stdout would wedge the one worker. Only the job's OWN answer (same edge + `stagedAt`) frees
+  `_attn_job`; a late answer from a watchdog-dropped job does not. `TURMA_ATTENTION_HINTS=0` turns it off; dsh/qwen skip it (no
   Claude login assumed, like naming).
 - **Only a NEW edge is classified** (`attention_edge`, a pure read of the beat's signals: question |
   permission | loop | stalled | review, with an anchor). `_attention_edge` notes it on the record
   as `attentionHint {edge, kind, edgeTs, attempts}`; the RECORD is the ledger, so an edge it already
-  holds (a restart, a flicker back) is never asked again.
+  holds (a restart, a flicker back) is never asked again — but re-entering one it ANSWERED re-ships
+  the cached verdict (same `<sid>:<edgeTs>` key): the hub drops its copy the beat the state leaves.
+- **A sleeping session is no edge** (`wakeAt` in the future): the hub reads `sleeping` ahead of
+  review/stalled. `ATTENTION_WAIT_STALL_MIN` is read agent-side under the hub's env name and must
+  MATCH the hub's — a mismatch asks about a stall the hub does not read (its hint is dropped).
 - **Runs on its OWN worker, never the beat** (`_attention_hint_worker_loop`, XERK-395): the beat only
   stages ONE job (the oldest due edge, `_attn_job` = one in flight, freed if unanswered past the
   timeout) and drains `_attn_results` (REBOUND under `_attn_lock`). The input is built from signals

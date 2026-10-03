@@ -203,6 +203,22 @@ describe("phone render", () => {
     expect(html.split('class="ph-card-hint').length - 1).toBe(2);
   });
 
+  it("a LOOPING session reads stalled, never working (XERK-1572)", () => {
+    const now = Date.now();
+    const st = state({
+      agents: [agent({ sessions: [
+        session({ id: "lp", summary: "looping one",
+          session: signals({ paneBusy: true, transcriptAgeSec: 2, lastRole: "user" }),
+          attention: { state: "needs-you:stalled", since: now - 60_000, why: "repeating Bash ×5" } }),
+      ] })],
+    });
+    const html = sessionsBodyHtml(st);
+    const review = html.slice(html.indexOf("Ready for review"));
+    expect(review).toContain('<span class="ph-state st-stalled">stalled · repeating Bash ×5</span>');
+    expect(review).toContain('class="ph-dot st-stalled"');
+    expect(review).not.toContain("st-working");
+  });
+
   it("a new task on a merged-PR session is not hidden by that PR (XERK-224)", () => {
     const quiet = { paneBusy: false, transcriptAgeSec: 900, lastRole: "assistant" };
     const merged = [{ url: "https://github.com/o/r/pull/2", number: 2, state: "Merged" }];

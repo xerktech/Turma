@@ -38173,8 +38173,12 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         self.sm._stage_attention_hint(now=1)
         job = self.sm._attn_request
         self.assertEqual(job["argv"][:4], ["claude", "-p", "--model", ha.ATTENTION_HINT_MODEL])
-        self.assertTrue(job["argv"][4].startswith(ha.ATTENTION_HINT_INSTRUCTION))
-        self.assertIn("deploy it", job["argv"][4])
+        # No tool and no MCP server: its input is the session's own (steerable)
+        # text. The equals form, since a variadic `--tools ""` eats the prompt.
+        self.assertEqual(job["argv"][4:-1], ["--tools=", "--strict-mcp-config"])
+        self.assertEqual(list(ha.ATTENTION_HINT_LOCKDOWN), job["argv"][4:-1])
+        self.assertTrue(job["argv"][-1].startswith(ha.ATTENTION_HINT_INSTRUCTION))
+        self.assertIn("deploy it", job["argv"][-1])
         self.assertEqual(self.started, ["wait-classifier"])
         # The same state on later beats asks nothing more.
         self.beat(sig, at=2000)
@@ -38183,15 +38187,48 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         self.verdict({"label": "design-decision", "why": "Picks a schema version."})
         self.sm._stage_attention_hint(now=10 ** 9)
         self.assertIsNone(self.sm._attn_request, "answered: nothing more to ask")
-        # Working, then back on the SAME finished turn (a flicker): no re-ask.
+        # Working, then back on the SAME finished turn (a flicker): no re-ask —
+        # but the CACHED verdict ships again, under the same key, because the
+        # hub dropped its copy the beat the state left.
+        self.assertEqual(len(self.sm.attention_hints), 1)
         self.beat(dict(sig, paneBusy=True), at=4000)
         self.beat(sig, at=5000)
         self.assertTrue(self.sess["attentionHint"]["done"])
         self.assertEqual(self.sess["attentionHint"]["edgeTs"], 1000)
+        first, again = self.sm.attention_hints
+        self.assertEqual(again, first)
+        self.assertEqual(again["key"], f"{self.SID}:1000")
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(self.sm._attn_request, "re-sent, never re-asked")
+        self.beat(sig, at=5500)
+        self.assertEqual(len(self.sm.attention_hints), 2, "a steady state re-sends nothing")
         # A NEW finished turn is a new edge.
         self.beat(self.ended(ts="2026-10-03T10:09:00Z"), at=6000)
         self.assertEqual(self.sess["attentionHint"]["edgeTs"], 6000)
         self.assertNotIn("done", self.sess["attentionHint"])
+
+    def test_a_sleeping_session_is_no_edge(self):
+        # Ended its turn to sleep through the session CLI's `wake`: the hub reads
+        # `sleeping` (ahead of review), so asking about a "review" is a wasted call.
+        now = 10 ** 12
+        sig = self.ended(wakeAt=now + 60_000)
+        self.assertIsNone(ha.attention_edge(sig, now))
+        self.assertEqual(ha.attention_edge(dict(sig, wakeAt=now - 1), now)[0], "review")
+        self.assertEqual(ha.attention_edge(dict(sig, wakeAt=True), now)[0], "review")
+        self.beat(sig, at=now)
+        self.assertNotIn("attentionHint", self.sess)
+
+    def test_an_unexplained_edge_is_never_re_sent(self):
+        # Exhausted with no verdict: re-entering the edge ships nothing.
+        sig = self.ended()
+        self.beat(sig, at=1000)
+        for t in (1, 10 ** 9):
+            self.sm._stage_attention_hint(now=t)
+            self.verdict(None)
+        self.assertTrue(self.sess["attentionHint"]["done"])
+        self.beat(dict(sig, paneBusy=True), at=4000)
+        self.beat(sig, at=5000)
+        self.assertEqual(self.sm.attention_hints, [])
 
     def test_a_restart_never_reasks_an_answered_edge(self):
         sig = self.ended()
@@ -38260,6 +38297,25 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         self.sm._stage_attention_hint(now=3)
         self.assertEqual(self.sm._attn_request["sid"], "hint2")
 
+    def test_a_late_answer_never_frees_a_newer_job(self):
+        # The watchdog dropped a job that never answered; a newer one for the
+        # same session runs. The old one's late answer must not free the slot.
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=100)
+        old = self.sm._attn_request
+        self.sm._attn_request = None
+        self.sm._stage_attention_hint(now=100 + ha.ATTENTION_HINT_TIMEOUT_SEC + 31
+                                      + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC)
+        new = self.sm._attn_job
+        self.assertIsNotNone(new)
+        self.assertNotEqual(new["stagedAt"], old["stagedAt"])
+        self.sm._attn_results = [dict(old, hint=None)]
+        self.sm._apply_attention_hints()
+        self.assertIs(self.sm._attn_job, new, "the late answer is not the job in flight")
+        self.sm._attn_results = [dict(new, hint=None)]
+        self.sm._apply_attention_hints()
+        self.assertIsNone(self.sm._attn_job)
+
     def test_an_edge_the_session_left_is_not_asked_and_its_verdict_dropped(self):
         self.beat(self.ended(), at=1000)
         self.sm._stage_attention_hint(now=1)
@@ -38270,23 +38326,55 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.sm.attention_hints, [], "a stale verdict is dropped")
         self.assertIsNone(self.sm._attn_job)
 
+    def _fake_popen(self, out=b"", rc=0, hang=False):
+        """A Popen stand-in: writes `out` to the stdout FILE it is handed (the
+        run writes to a file, never a pipe) and exits `rc` — or never exits."""
+        calls = []
+
+        def popen(argv, **kw):
+            kw["stdout"].write(out)
+            proc = mock.Mock(pid=4242)
+            if hang:
+                proc.wait.side_effect = [ha.subprocess.TimeoutExpired("claude", 1), None]
+            else:
+                proc.wait.return_value = rc
+            calls.append((argv, kw, proc))
+            return proc
+        return popen, calls
+
     def test_the_run_is_the_summary_posture_and_strictly_parsed(self):
         out = json.dumps({"label": "rubber-stamp", "why": "Asks to push.",
                           "suggestedAnswer": "Yes, push it."}).encode()
-        with mock.patch.object(ha.subprocess, "run",
-                               return_value=mock.Mock(returncode=0, stdout=out)) as run:
+        popen, calls = self._fake_popen(out)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
             hint = self.sm._run_attention_hint(["claude", "-p", "x"])
         self.assertEqual(hint, {"label": "rubber-stamp", "why": "Asks to push.",
                                 "suggestedAnswer": "Yes, push it."})
-        kw = run.call_args.kwargs
-        self.assertEqual((kw["cwd"], kw["stdin"], kw["timeout"]),
-                         (ha.REGISTRY_DIR, ha.subprocess.DEVNULL, ha.ATTENTION_HINT_TIMEOUT_SEC))
-        with mock.patch.object(ha.subprocess, "run",
-                               return_value=mock.Mock(returncode=1, stdout=out)):
+        (argv, kw, proc), = calls
+        self.assertEqual((kw["cwd"], kw["stdin"], kw["start_new_session"]),
+                         (ha.REGISTRY_DIR, ha.subprocess.DEVNULL, True))
+        self.assertNotEqual(kw["stdout"], ha.subprocess.PIPE, "a file, never a pipe")
+        proc.wait.assert_called_once_with(timeout=ha.ATTENTION_HINT_TIMEOUT_SEC)
+        self.assertFalse(os.path.exists(os.path.join(ha.REGISTRY_DIR, "attention-hint.out")),
+                         "the output file is removed")
+        popen, _ = self._fake_popen(out, rc=1)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
             self.assertIsNone(self.sm._run_attention_hint(["claude"]))
-        with mock.patch.object(ha.subprocess, "run",
-                               side_effect=ha.subprocess.TimeoutExpired("claude", 1)):
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=OSError("no claude")):
             self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+
+    def test_a_hung_run_kills_its_whole_group_and_never_waits_unbounded(self):
+        # A grandchild holding stdout must not wedge the one worker: the run
+        # writes to a file, and a timeout kills the process GROUP, then reaps
+        # it with a bound.
+        popen, calls = self._fake_popen(hang=True)
+        killpg = mock.Mock()
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(ha.os, "killpg", killpg, create=True):
+            self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+        (_argv, _kw, proc), = calls
+        killpg.assert_called_once_with(4242, ha.signal.SIGKILL)
+        self.assertEqual(proc.wait.call_args_list[-1], mock.call(timeout=5))
 
     def test_strict_parse(self):
         P = ha.parse_attention_hint
@@ -38362,16 +38450,47 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
     # --- the ask-in-chat ledger row -------------------------------------------
 
     def test_a_rubber_stamp_verdict_writes_the_ask_in_chat_row(self):
-        self.beat(self.ended(text="Tests pass. Is it OK to push the branch?"), at=1000)
+        self.beat(self.ended(text="Tests pass. May I push the branch?"), at=1000)
         self.assertEqual(self.sm.permission_events, [], "waits on the classifier")
         self.sm._stage_attention_hint(now=1)
         self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
         row, = self.sm.permission_events
+        # Named by the session's OWN asking sentence (the verbatim text the
+        # ledger's rule work reads), not the classifier's paraphrase.
+        asked = ha._permission_ask_prompt("Tests pass. May I push the branch?")
+        self.assertIn("push the branch", asked)
         self.assertEqual((row["kind"], row["prompt"], row["openedAt"]),
-                         ("ask-in-chat", "Asks to push the branch.", 1000))
+                         ("ask-in-chat", asked[:ha.PERMISSION_TEXT_MAX], 1000))
         # Closed on the operator's next input, as before.
         self.sm.handle_commands([{"cmdId": "c1", "type": "input",
                                   "sessionId": self.SID, "text": "yes"}])
+        self.assertEqual(self.sm.permission_events[-1]["via"], "turma")
+
+    def test_a_rubber_stamp_the_regex_cannot_name_takes_the_classifiers_why(self):
+        text = "Everything is staged and green."
+        self.assertIsNone(ha._permission_ask_prompt(text))
+        self.beat(self.ended(text=text), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Waits for a go-ahead to push."})
+        row, = self.sm.permission_events
+        self.assertEqual(row["prompt"], "Waits for a go-ahead to push.")
+
+    def test_the_hubs_own_nudge_is_not_the_operator_answering(self):
+        # A loop/stall nudge is an `input` the HUB typed (`source: "nudge"`): it
+        # must neither settle a pending ask nor close an open row as answered.
+        self.beat(self.ended(text="Tests pass. May I push the branch?"), at=1000)
+        self.sm.handle_commands([{"cmdId": "n1", "type": "input", "sessionId": self.SID,
+                                  "text": "You have run `Bash` 4 times...", "source": "nudge"}])
+        self.assertEqual(self.sm.permission_events, [])
+        self.assertIn(self.SID, self.sm._perm_ask_pending)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push."})
+        row, = self.sm.permission_events
+        self.sm.handle_commands([{"cmdId": "n2", "type": "input", "sessionId": self.SID,
+                                  "text": "nudge again", "source": "nudge"}])
+        self.assertEqual(self.sm.permission_events, [row], "still open")
+        self.sm.handle_commands([{"cmdId": "c3", "type": "input", "sessionId": self.SID,
+                                  "text": "yes"}])
         self.assertEqual(self.sm.permission_events[-1]["via"], "turma")
 
     def test_the_classifier_overrules_the_regex(self):

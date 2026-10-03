@@ -22847,6 +22847,35 @@ test("XERK-1572: a hint folds into attention while the state it answers holds", 
   assert.equal(rec.alerts.sessions.s1.attn.hint.why, "Retries npm ci.");
 });
 
+test("XERK-1572: a flicker drops the hint for a beat; the agent's re-sent verdict restores it", () => {
+  // The agent never re-ASKS an edge its record already answered, but it ships the
+  // CACHED verdict again when the session comes back to that edge — the hub has
+  // dropped its copy the beat the state left, and must fold the re-sent row.
+  const alerts = {};
+  let prev = {};
+  const beat = (payload, at, hints) => {
+    const next = { ...payload, lastSeen: at, alerts };
+    heartbeatAlerts("host-flicker", prev, next, hints);
+    prev = next;
+    return next;
+  };
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
+  const row = [hub.normalizeAttentionHint({ sessionId: "s1", edge: "review",
+    label: "rubber-stamp", why: "Asks to deploy.", suggestedAnswer: "Yes, deploy it." })];
+  beat(sess({ paneBusy: true }), t0);
+  beat(sess({}), t0 + 20000);
+  let rec = beat(sess({}), t0 + 40000, row);
+  assert.equal(rec.alerts.sessions.s1.attn.hint.why, "Asks to deploy.");
+  rec = beat(sess({ paneBusy: true }), t0 + 60000);          // a one-beat busy flicker
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
+  rec = beat(sess({}), t0 + 80000, row);                      // the agent re-sends it
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
+  assert.deepEqual(rec.alerts.sessions.s1.attn.hint,
+    { label: "rubber-stamp", why: "Asks to deploy.", suggestedAnswer: "Yes, deploy it." });
+});
+
 test("XERK-1572: a forged or corrupt stored hint never reaches the wire", () => {
   const now = Date.now();
   const w = (hint) => hub.wireAttention({ state: "needs-you:review", since: now, hint });
@@ -22892,6 +22921,9 @@ test("XERK-1572: a stalled shell is nudged once per edge, in the operator's voic
   sweep(t0);
   const [n1] = nudges(host);
   assert.equal(n1.sessionId, "s1");
+  // Marked as the hub's own words, so the agent's permission ledger never
+  // reads it as the operator answering an ask-in-chat row.
+  assert.equal(n1.source, "nudge");
   assert.equal(n1.text, "Your background shell `Watch CI run` has produced nothing for 41 minutes. Check "
     + "whether it is still doing anything; if it is waiting on something with a known duration, stop it "
     + "and use the session CLI's `wake`; if it is dead, say what you know and end the turn.");

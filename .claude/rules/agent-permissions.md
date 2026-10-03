@@ -82,8 +82,11 @@ hook-log tail) + `agent/hooks/permlog.py`.
   tool call); closed by the next operator `input` (`via:"turma"`). Sessions already sitting there on
   a manager's first beat are PRIMED, not re-filed.
   - **Where the wait classifier runs (XERK-1572) ITS verdict decides**: the turn waits in
-    `_perm_ask_pending` and a `rubber-stamp` label opens the row (prompt = the classifier's `why`,
-    `openedAt` = the edge); any other label opens none, even where the regex would have matched.
+    `_perm_ask_pending` and a `rubber-stamp` label opens the row (prompt = the session's asking
+    sentence via the regex, else the classifier's `why`; `openedAt` = the edge); any other label
+    opens none, even where the regex would have matched.
+  - **The hub's own stall/loop nudge is not an answer**: it rides `input` with `source:"nudge"`,
+    which skips `_permission_close_ask` — no pending ask is settled, no open row closed `via:"turma"`.
   - **The regex (`PERMISSION_ASK_RE`, `_permission_ask_prompt`) is the FALLBACK**: a dsh/qwen
     session, `TURMA_ATTENTION_HINTS=0`, a classifier that gave no verdict after its last attempt,
     and a turn answered (Turma `input` or the session moved on) before the verdict landed — that
