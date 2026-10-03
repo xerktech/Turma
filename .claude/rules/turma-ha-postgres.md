@@ -81,15 +81,23 @@ byte-identical + no-work-on-the-beat invariants. This file is the operative rule
 - **`query(text, params) -> rows`** and **`execute(...) -> {rows, command, rowCount}`**. `PgPool` is a
   bounded set of reusable connections (default `max` 4) with a waiter queue and **one query in flight
   per connection** (the pool serialises). Fail-narrow socket posture like SharedLiveStore: a connect
-  failure rejects ONE waiting caller; a query error or **timeout POISONS its connection** (we can't
+  failure rejects ONE waiting caller — only one queued BEFORE that dial started; a later waiter is
+  served or re-dialled (a black-holed dial outliving a PG recovery must not fail fresh work); a query
+  error or **timeout POISONS its connection** (we can't
   tell where in the reply stream we are), which is torn down and dropped — the next acquire lazily
   spawns a fresh one. Per-query timeout (`queryTimeoutMs`, default 30s) + connect timeout
   (`connectTimeoutMs`, default 15s). `health` is `idle`/`connecting`/`ready`/`closed`; `ready()`
-  resolves once a connection is up.
+  resolves once a connection is up and REJECTS when every warming dial fails or the pool closes.
+- **Nothing in the pool may stay pending forever.** Acquire has a deadline (`queryTimeoutMs`), so a
+  slot leak surfaces as rejected queries, not a silent wedge; `close()` rejects in-flight queries
+  and pending connects (`PgConnection.close` routes through `_fail`). A dial's socket is held in
+  `_dialSocket` until the handshake promotes it, so a mid-negotiation timeout still destroys it.
+  Tests: `live: acquire has a deadline…`, `live: close() rejects…`, `live: a failed dial never…`.
 - **Every torn-down connection leaves `_conns` (`onDead`), including one that dies IDLE.** An idle
   death (PG restart/failover) has no query to fail and no `_afterQuery`; kept, it counts toward
-  `max`, so `_pump` spawns nothing and every acquire waits FOREVER — acquire has no deadline. That
-  hung the leader's archive hydrate for 3 days (ingest 503 "still syncing" the whole time).
+  `max`, so `_pump` spawns nothing and every acquire stalls to its deadline. That hung the leader's
+  archive hydrate for 3 days (ingest 503 "still syncing" the whole time). An idle death logs one
+  `postgres pool: idle connection … died` line, since no query fails to announce it.
   Tests: `live: idle connections the server closed never wedge the pool` in `pgclient.test.js`.
 - **`upsertGreatest({table, keys, values, greatest})`** builds the `INSERT … ON CONFLICT (keys) DO
   UPDATE SET col = GREATEST(table.col, EXCLUDED.col)` the ledger's per-host high-water needs — a

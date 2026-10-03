@@ -508,6 +508,7 @@ class PgConnection {
     this.alive = false; // ready to take a query
     this.busy = false; // held by a caller
     this._connectTimer = null;
+    this._dialSocket = null; // the socket still negotiating (plain, then TLS)
     // Handshake resolvers.
     this._onReady = null;
     this._onFail = null;
@@ -515,7 +516,8 @@ class PgConnection {
     this._q = null; // { resolve, reject, fields, rows, command, rowCount, timer, error }
     // SCRAM in-flight state.
     this._scram = null; // { clientNonce, clientFirstBare, expectedServerSignature }
-    // Called once when this connection is torn down, so its pool stops counting it.
+    // Called once when this connection is torn down — (err, wasAlive) — so its pool
+    // stops counting it.
     this.onDead = null;
   }
 
@@ -524,7 +526,7 @@ class PgConnection {
     return new Promise((resolve, reject) => {
       this._onReady = resolve;
       this._onFail = (e) => {
-        this._teardown();
+        this._teardown(e);
         reject(e);
       };
       this._connectTimer = setTimeout(
@@ -538,6 +540,9 @@ class PgConnection {
 
   _dial() {
     const plain = net.connect({ host: this.cfg.host, port: this.cfg.port });
+    // Held until the handshake promotes it to `this.socket`, so a dial that times
+    // out mid-negotiation (a black-holed SYN or SSLRequest) is still destroyed.
+    this._dialSocket = plain;
     plain.on("error", (e) => this._fail(e));
     if (this.cfg.sslmode === "disable") {
       plain.on("connect", () => {
@@ -569,6 +574,7 @@ class PgConnection {
             this._sendStartup();
           }
         );
+        this._dialSocket = secure; // destroying the TLS wrapper destroys `plain` too
         secure.on("error", (e) => this._fail(e));
       } else if (answer === "N") {
         if (this.cfg.sslmode === "require" || this.cfg.sslmode === "verify-full") {
@@ -781,8 +787,9 @@ class PgConnection {
         // discards it and a later acquire makes a fresh one.
         const q = this._q;
         this._q = null;
-        if (q) q.reject(new Error("postgres query timeout"));
-        this._teardown();
+        const err = new Error("postgres query timeout");
+        if (q) q.reject(err);
+        this._teardown(err);
       }, timeoutMs);
       timer.unref?.();
       this._q = { resolve, reject, fields: null, rows: [], command: null, rowCount: null, timer, error: null };
@@ -821,32 +828,37 @@ class PgConnection {
       if (q.timer) clearTimeout(q.timer);
       q.reject(err);
     }
-    this._teardown();
+    this._teardown(err);
   }
 
-  _teardown() {
+  _teardown(err) {
+    const wasAlive = this.alive;
     this.alive = false;
     if (this.onDead) {
       const dead = this.onDead;
       this.onDead = null;
-      dead();
+      dead(err, wasAlive);
     }
     if (this._connectTimer) {
       clearTimeout(this._connectTimer);
       this._connectTimer = null;
     }
-    if (this.socket) {
+    for (const sock of new Set([this.socket, this._dialSocket])) {
+      if (!sock) continue;
       try {
-        this.socket.removeAllListeners();
-        this.socket.destroy();
+        sock.removeAllListeners();
+        sock.on("error", () => {}); // a late error on a torn-down socket must not throw
+        sock.destroy();
       } catch {
         /* best effort */
       }
-      this.socket = null;
     }
+    this.socket = null;
+    this._dialSocket = null;
   }
 
-  // Graceful close: send Terminate then destroy.
+  // Graceful close: send Terminate then destroy. Goes through _fail so a pending
+  // connect or in-flight query REJECTS rather than staying pending forever.
   close() {
     if (this.socket && this.alive) {
       try {
@@ -855,7 +867,7 @@ class PgConnection {
         /* best effort */
       }
     }
-    this._teardown();
+    this._fail(new Error("postgres connection closed"));
   }
 }
 
@@ -880,7 +892,9 @@ class PgPool {
     this.max = Math.max(1, opts.max || DEFAULT_MAX_CONNS);
     this.queryTimeoutMs = opts.queryTimeoutMs || DEFAULT_QUERY_TIMEOUT_MS;
     this._conns = [];
-    this._waiters = [];
+    this._waiters = []; // { resolve, reject, seq, timer }
+    this._waiterSeq = 0;
+    this._lastConnectError = null;
     this._closed = false;
     this._emitter = new EventEmitter();
     this._health = "idle";
@@ -936,20 +950,41 @@ class PgPool {
     return res.rowCount;
   }
 
+  // Wait for a connection, bounded by queryTimeoutMs. Without a deadline a slot
+  // leak (or a pool that can never spawn) wedges every consumer SILENTLY — the
+  // archive hydrate and the usage ledger hung for days that way. A deadline turns
+  // that into a rejected query the caller already handles and logs.
   _acquire() {
     if (this._closed) return Promise.reject(new Error("postgres pool closed"));
     return new Promise((resolve, reject) => {
-      this._waiters.push({ resolve, reject });
+      const w = { resolve, reject, seq: ++this._waiterSeq, timer: null };
+      w.timer = setTimeout(() => {
+        const i = this._waiters.indexOf(w);
+        if (i < 0) return;
+        this._waiters.splice(i, 1);
+        const live = this._conns.filter((c) => c.alive).length;
+        reject(
+          new Error(
+            `postgres pool acquire timeout after ${this.queryTimeoutMs}ms ` +
+              `(${live} live / ${this._conns.length} held / max ${this.max})`
+          )
+        );
+      }, this.queryTimeoutMs);
+      w.timer.unref?.();
+      this._waiters.push(w);
       this._pump();
     });
   }
 
   _pump() {
+    if (this._closed) return;
     while (this._waiters.length) {
       const idle = this._conns.find((c) => c.alive && !c.busy);
       if (idle) {
         idle.busy = true;
-        this._waiters.shift().resolve(idle);
+        const w = this._waiters.shift();
+        clearTimeout(w.timer);
+        w.resolve(idle);
         continue;
       }
       if (this._conns.length < this.max) {
@@ -968,7 +1003,20 @@ class PgPool {
     // every later acquire waits forever — which hung the archive hydrate for days
     // with ingest 503'd behind it. Busy/connecting deaths are dropped by
     // _afterQuery/the connect catch too; `_removeConn` is idempotent.
-    conn.onDead = () => this._removeConn(conn);
+    conn.onDead = (err, wasAlive) => {
+      // A death before ready is a connect failure; ready() reports it.
+      if (!wasAlive && err) this._lastConnectError = err;
+      // An IDLE death is otherwise invisible (no query fails), so say it once.
+      if (wasAlive && !conn.busy && !this._closed) {
+        console.warn(
+          `postgres pool: idle connection to ${this.cfg.host}:${this.cfg.port} died ` +
+            `(${(err && err.message) || "closed"}); dropped from the pool`
+        );
+      }
+      this._removeConn(conn);
+    };
+    // Only waiters queued by now can be blamed on this dial (see the catch).
+    const spawnSeq = this._waiterSeq;
     this._conns.push(conn);
     this._setHealth();
     conn
@@ -978,11 +1026,18 @@ class PgPool {
         this._pump();
       })
       .catch((e) => {
+        if (this._closed) return;
         this._removeConn(conn);
-        // A connect failure is surfaced to ONE waiting caller (fail-narrow); the
-        // others retry via _pump, which may spawn again.
-        const w = this._waiters.shift();
-        if (w) w.reject(e);
+        // A connect failure is surfaced to ONE waiting caller (fail-narrow) — and
+        // only one that was already waiting when this dial started. A waiter that
+        // arrived later (e.g. after Postgres recovered, while a black-holed dial ran
+        // out its connectTimeoutMs) is not this dial's: _pump serves or re-dials it.
+        const w = this._waiters[0];
+        if (w && w.seq <= spawnSeq) {
+          this._waiters.shift();
+          clearTimeout(w.timer);
+          w.reject(e);
+        }
         this._pump();
       });
   }
@@ -1005,6 +1060,8 @@ class PgPool {
     }
   }
 
+  // Resolves once a connection is up; rejects if the pool closes or every warming
+  // connection fails (health falls back to idle) — never stays pending.
   async ready() {
     if (this.health === "ready") return;
     await new Promise((resolve, reject) => {
@@ -1013,6 +1070,12 @@ class PgPool {
         if (h === "ready") {
           off();
           resolve();
+        } else if (h === "closed") {
+          off();
+          reject(new Error("postgres pool closed"));
+        } else if (h === "idle") {
+          off();
+          reject(this._lastConnectError || new Error("postgres connection failed"));
         }
       });
       // Kick a connection if none is warming.
@@ -1022,7 +1085,10 @@ class PgPool {
 
   close() {
     this._closed = true;
-    for (const w of this._waiters.splice(0)) w.reject(new Error("postgres pool closed"));
+    for (const w of this._waiters.splice(0)) {
+      clearTimeout(w.timer);
+      w.reject(new Error("postgres pool closed"));
+    }
     for (const conn of this._conns.splice(0)) conn.close();
     this._setHealth();
   }
