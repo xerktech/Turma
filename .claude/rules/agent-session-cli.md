@@ -114,6 +114,12 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   manager comment on and close another same-host session's ticket with the host's tracker creds.
   Accepted: same host, same org/board (siteKey-gated), and Done is reversible with the comment as
   the audit trail. A sid stamped in the file would not help — the forger writes it too.
+- **An ADOPTED ticket is refused** (`ticket.adopted` / `ticketAdopted`, via `_served_ticket`): its
+  block came from the session's own branch name (`_maybe_adopt_ticket`), so any collected ticket is
+  one branch away, and its close gets every session on it killed org-wide by the hub's auto-stop.
+  The XERK-1440 provenance reason. The refusal reaches the session, which uses its tracker tool.
+- **A session killed before the beat applies a success** has its newest `self.closed` record (and
+  its ledger entry) stamped instead, so the board still says why the ticket closed.
 - **Taught by three directives**, each "session CLI first, the host's tracker CLI/MCP else":
   `TICKET_CLOSE_STALE_CLAUSE` (bug prompt + `TICKET_CLOSE_PROMPT` in `_session_directive`) and the
   hub's `autoCloseMergedMessage`. All spell `"$TURMA_SESSION_CLI"` — see the open question below.

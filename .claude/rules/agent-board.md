@@ -133,6 +133,8 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   - **Already in Done is a SUCCESS**: a tracker offers no transition into the current status, so
     with no Done option `_board_issue_done_status` reads the issue's own status; Done-column →
     `ok` with that status name (an operator's close, or a repeat request), else the failure.
+  - **The target is resolved BEFORE the comment posts**, so a workflow with no edge into Done
+    never gets an evidence comment on a ticket left open.
   - Only for a RUNNING Claude session whose `ticket.siteKey` is this host's board; dsh/qwen skipped.
   - Success stamps **`ticket.outcome = {kind, at}`** on the record (served via `_served_ticket`)
     AND its `_remember_ticket` ledger entry (added only when present), so `repos[].resumable`

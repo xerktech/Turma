@@ -24956,7 +24956,9 @@ class SessionManager:
             if req is None:
                 continue
             pending.add(sess["id"])
-            self._close_ticket_try(sess["id"], ticket, req, now)
+            # The SERVED block, so a record adopted before the block carried
+            # `adopted` (only `ticketAdopted`) is refused like any other.
+            self._close_ticket_try(sess["id"], _served_ticket(sess), req, now)
         for sid in list(self._close_ticket_tries):
             if sid not in pending:
                 self._close_ticket_tries.pop(sid, None)
@@ -24993,15 +24995,22 @@ class SessionManager:
             refusal = "no board credentials on this host"
         if refusal is None and ticket.get("siteKey") not in (None, "", board_site_key()):
             refusal = "the session's ticket is not on this host's board"
+        if refusal is None and ticket.get("adopted"):
+            # An ADOPTED block came from the session's own branch name
+            # (`_maybe_adopt_ticket`), so any ticket this host collected is one
+            # branch rename away, and closing it gets every session working it
+            # killed org-wide (the hub's auto-stop). The provenance reason
+            # XERK-1440 refuses auto-merge for an adopted session.
+            refusal = "an adopted ticket is closed with the host's tracker tool"
         if refusal is not None:
             log(f"close-ticket for {sid}: refused: {refusal}")
             return land(f"refused: {refusal}")
         st["attempts"] += 1
         try:
-            if not st["commented"]:
-                add_board_comment(key, _close_ticket_comment(req))
-                st["commented"] = True
+            # Resolve where the ticket goes BEFORE commenting, so a workflow with
+            # no edge into Done never gets a comment saying it is being closed.
             option = _close_ticket_option(board_status_options(key), req["kind"])
+            current = None
             if option is None:
                 # Trackers offer no transition into the status an issue is
                 # already in, so an operator's own close (or a repeat request)
@@ -25009,6 +25018,10 @@ class SessionManager:
                 current = _board_issue_done_status(key)
                 if current is None:
                     raise RuntimeError("nothing can move it to Done")
+            if not st["commented"]:
+                add_board_comment(key, _close_ticket_comment(req))
+                st["commented"] = True
+            if option is None:
                 log(f"close-ticket: {key} already in {current} ({req['kind']})")
                 return land(status=current)
             apply_board_status(key, option["id"])
@@ -25060,7 +25073,11 @@ class SessionManager:
                     except Exception as e:
                         log(f"close-ticket: could not tell {r['sessionId']}: {e}")
                 continue
-            sess = self._find(r["sessionId"])
+            # A session killed between the worker's tracker writes and this beat
+            # has only its closed record left: stamp that (newest first), so the
+            # resumable channel still says why the ticket closed.
+            sess = self._find(r["sessionId"]) or next(
+                (c for c in reversed(self.closed) if c.get("id") == r["sessionId"]), None)
             ticket = (sess or {}).get("ticket")
             if not isinstance(ticket, dict) or ticket.get("key") != r["key"]:
                 continue

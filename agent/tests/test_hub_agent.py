@@ -17658,6 +17658,75 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
             sm._stage_close_ticket_work()          # logged, never raised onto the beat
         self.assertIsNot(sm._close_ticket_worker, first)
 
+    def test_an_adopted_ticket_is_refused_and_the_session_told(self):
+        # An adopted block came from the session's own branch name, so honouring
+        # it would let any session close any collected ticket (and get every
+        # session on it killed by the hub's auto-stop). Both the served flag and
+        # the older internal one are refused.
+        for over in ({"adopted": True}, None):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                sess = self._sess(sm)
+                if over:
+                    sess["ticket"].update(over)
+                else:
+                    sess["ticketAdopted"] = True
+                self.calls.clear()
+                self.notified.clear()
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])                 # no tracker HTTP at all
+                self.assertFalse(os.path.exists(self._path()))
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertEqual((r["ok"], r["final"]), (False, True))
+                self.assertIn("adopted ticket", r["error"])
+                [(sid, text)] = self.notified
+                self.assertIn("refused: an adopted ticket", text)
+                self.assertNotIn("outcome", sess["ticket"])
+
+    def test_no_comment_is_posted_when_nothing_can_move_it_to_done(self):
+        # The target is resolved first, so a workflow with no edge into Done never
+        # gets an evidence comment on a ticket that stays open — on either try.
+        self.OPTS = self.OPTS[:1]
+        sm = self.make_manager()
+        self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        self.assertEqual(self._comments(), [])
+        self.assertEqual(self._transitions(), [])
+        sm._apply_closed_tickets()
+        self.assertEqual([r["final"] for r in sm.ticket_outcome_results], [False, True])
+
+    def test_a_session_killed_before_the_beat_still_gets_its_outcome(self):
+        # The worker closed the ticket, then the operator killed the session before
+        # the beat applied it: the closed record and its ledger entry get stamped.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        rec = dict(sess, status="stopped")
+        sm.registry = []
+        sm.closed = [{"id": "other", "repo": "Turma"}, rec]
+        sm._apply_closed_tickets()
+        self.assertEqual(rec["ticket"]["outcome"], {"kind": "not-reproducible", "at": 1_000_000})
+        self.assertEqual(sm.ticket_ledger[sess["claudeSessionId"]]["outcome"]["kind"],
+                         "not-reproducible")
+        self.assertNotIn("ticket", sm.closed[0])
+
+    def test_staged_results_are_capped(self):
+        sm = self.make_manager()
+        n = ha.TICKET_OUTCOME_RESULTS_MAX + 15
+        for i in range(n):
+            with sm._close_ticket_lock:
+                sm._close_ticket_landed.append({
+                    "sessionId": self.SID, "key": self.KEY, "kind": "done", "ok": False,
+                    "error": f"e{i}", "final": False, "status": None, "at": i})
+            sm._apply_closed_tickets()
+        self.assertEqual(len(sm.ticket_outcome_results), ha.TICKET_OUTCOME_RESULTS_MAX)
+        self.assertEqual(sm.ticket_outcome_results[-1]["error"], f"e{n - 1}")   # newest kept
+
     def test_an_azure_comment_posts_escaped_html_to_the_work_item(self):
         seen = []
 
