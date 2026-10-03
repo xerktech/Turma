@@ -46,7 +46,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     only when it sets the description (glued `-bTEXT` too). `-h`/`--help` is help wherever it
     sits, EXCEPT right after a bare flag: gh/glab read it as that flag's VALUE (`-b -h`,
     `--label -h`), so the check runs. Value-taking flags differ per CLI, hence "any bare flag";
-    the cost is refusing `--web -h`, which would only print help.
+    the cost is refusing `--web -h` / `-tfoo -h`, which would only print help. Group flags before
+    the verb (`gh pr -R o/r create`) are skipped first — reading `-R` as the verb skipped the check.
   - **The body is inline body values + any `--body-file` (event `cwd`, moved by a leading `cd`) +
     EVERY heredoc in the command** — never the plain command text, so a title or comment alone
     does not satisfy it. `cat > f <<EOF; gh pr create -F f` is common, and `f` does not exist yet

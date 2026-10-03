@@ -1604,6 +1604,14 @@ class TestPrSummary(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self.reason(cmd))
 
+    def test_a_repo_flag_before_the_verb_is_still_checked(self):
+        for cmd in ("gh pr -R o/r create -b junk -t x", "gh pr --repo o/r create -b junk",
+                    "gh pr --repo=o/r create -b junk", "gh pr -R o/r edit 1 -b junk",
+                    "glab mr -R o/r create -d junk -t x", "glab mr --repo o/r create -d junk",
+                    "az repos pr --debug create --description junk"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.reason(cmd))
+
     def test_an_unreadable_template_falls_back_to_the_standard(self):
         os.makedirs(os.path.join(self.repo, ".github"))
         open(os.path.join(self.repo, ".github", "pull_request_template.md"), "w").close()
@@ -1612,7 +1620,8 @@ class TestPrSummary(unittest.TestCase):
     def test_help_is_not_a_pr(self):
         for cmd in ("gh pr create --help", "gh pr create -h", "gh help pr create",
                     "glab mr create --help", "gh pr create --help 2>&1 | grep -i body",
-                    "gh pr create -b junk --help", "az repos pr create -h 2>/dev/null"):
+                    "gh pr create -b junk --help", "az repos pr create -h 2>/dev/null",
+                    "gh pr create --title=x -h", "gh pr -R o/r create --help"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.reason(cmd))
 

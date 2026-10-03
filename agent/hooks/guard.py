@@ -1685,8 +1685,6 @@ _PR_CLIS = {
 }
 
 
-
-
 def _flag_value(arg: str, flags: tuple[str, ...]) -> tuple[str, str | None] | None:
     """``(flag, glued value or None)`` if ``arg`` is one of ``flags``."""
     for f in flags:
@@ -1714,6 +1712,13 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
             or (_basename(tokens[0]) == "az" and "repos" not in head)):
         return None
     args = rest[rest.index(group) + 1:]
+    # Group-level flags may precede the verb (`gh pr -R o/r create`). One
+    # takes a value unless written `--flag=value` or followed straight by a
+    # verb (a boolean, e.g. `az repos pr --debug create`).
+    verbs = (*creates, "edit", "update")
+    while args and args[0].startswith("-"):
+        boolean = "=" in args[0] or (len(args) > 1 and args[1] in verbs)
+        args = args[1:] if boolean else args[2:]
     if not args:
         return None
     verb = args[0]
