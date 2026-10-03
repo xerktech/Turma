@@ -259,8 +259,9 @@ jobs:
   #   Environment, which only `main` may use, and in its own job, so the build
   #   never sees it. (Isolation needs the old repo-level ARGOCD_DEPLOY_KEY gone:
   #   XERK-1439 deletes it once this job has deployed once.)
-  # - publish requires this job to have succeeded or been skipped: a deploy
-  #   that timed out reports `cancelled`, not `failure`, and must not be tagged.
+  # - publish requires this job AND build-turma-image to have succeeded or been
+  #   skipped: a job that timed out reports `cancelled`, not `failure`, and a
+  #   timed-out build also SKIPS this job — neither may be tagged.
   # - Skipped on a dry run, which pushes no image, and off main, since a
   #   dispatch takes any ref and this is the job that reaches production.
   deploy-argocd:
@@ -609,7 +610,7 @@ jobs:
     if: >-
       !cancelled() && needs.plan.result == 'success'
       && needs.bump.result != 'failure'
-      && needs.build-turma-image.result != 'failure'
+      && contains(fromJSON('["success", "skipped"]'), needs.build-turma-image.result)
       && contains(fromJSON('["success", "skipped"]'), needs.deploy-argocd.result)
       && needs.build-glasses.result != 'failure'
       && needs.build-android.result != 'failure'

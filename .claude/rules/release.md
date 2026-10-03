@@ -75,8 +75,9 @@ paths:
 - **The key lives in the `argocd-deploy` Environment (main-only branch policy)**, in its own job so
   the build never holds it. **Never also add a repo-level `ARGOCD_DEPLOY_KEY`**: a repo secret is
   readable by a workflow edited on any branch, and silently backs the env one if that is removed.
-- `publish` needs `deploy-argocd` to be `success` or `skipped`, not merely `!= failure` — a timed-out
-  job reports `cancelled`, and that version must not be tagged.
+- `publish` needs `build-turma-image` and `deploy-argocd` to be `success` or `skipped`, not merely
+  `!= failure` — a timed-out job reports `cancelled` (and a cancelled build skips the deploy), and that
+  version must not be tagged.
 - Auths with a **write deploy key**, never a PAT (`GITHUB_TOKEN` can't reach another repo; a classic
   PAT carries the whole account; a fine-grained one expires silently). GitHub's host key is pinned,
   not accepted on first use.
