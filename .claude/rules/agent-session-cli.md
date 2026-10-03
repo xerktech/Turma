@@ -139,7 +139,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 
 - **close-ticket (XERK-1569)**: on a scratch bug ticket, `close-ticket not-reproducible --note "…"`
   → comment + Done within a minute, the auto-stop kill within a Jira poll (`JIRA_REFRESH_EVERY`),
-  the chip reading "closed · not reproducible" on the board and a "Closed by" panel row. Not yet run; record the answer here.
+  the chip reading "not reproducible" on the board and a "Closed by" panel row naming the session
+  with its note. Not yet run; record the answer here.
 
 - In a worktree session run `python3 -SsE "$TURMA_SESSION_CLI" wake 2m test`: the request file
   appears, no permission prompt, and two minutes later the pane receives the wake-up input.

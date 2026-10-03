@@ -935,7 +935,7 @@ function paintDetail() {
 // open panel the beat a session's close-ticket lands.
 function outcomeSig(sessions) {
   const o = B.ticketOutcomeOf(sessions);
-  return o ? `${o.kind}|${o.at}` : "";
+  return o ? `${o.kind}|${o.at}|${B.sessionChipName(o.session)}|${o.note}` : "";
 }
 
 // How long a saved repo keeps its optimistic paint before the heartbeat's word is

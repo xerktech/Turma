@@ -52,7 +52,7 @@ class AgentDecodeTest {
 
     @Test fun `a ticket's self-close outcome decodes on every ticket channel`() {
         // XERK-1569: ticket.outcome = {kind, at}, coerced hub-side (coerceTicketOutcome).
-        val t = """{ "key": "X-1", "siteKey": "s", "outcome": { "kind": "not-reproducible", "at": 1786400000000 } }"""
+        val t = """{ "key": "X-1", "siteKey": "s", "outcome": { "kind": "not-reproducible", "at": 1786400000000, "note": "repro passes" } }"""
         val body = """
             { "now": 1, "agents": [ {
               "key": "h", "device": "h", "online": true,
@@ -65,6 +65,11 @@ class AgentDecodeTest {
         assertEquals("not-reproducible", a.sessions[0].ticket!!.outcome!!.kind)
         assertEquals("not-reproducible", a.closedSessions[0].ticket!!.outcome!!.kind)
         assertEquals("not-reproducible", a.repos[0].resumable[0].ticket!!.outcome!!.kind)
+        assertEquals("repro passes", a.sessions[0].ticket!!.outcome!!.note)
+        // No note served → "" (never invented).
+        val noNote = TurmaJson.decodeFromString<AgentsResponse>(
+            """{ "now": 1, "agents": [ { "key": "h", "device": "h", "sessions": [ { "id": "s", "ticket": { "key": "X-1", "outcome": { "kind": "done", "at": 1 } } } ] } ] }""")
+        assertEquals("", noNote.agents[0].sessions[0].ticket!!.outcome!!.note)
         // Absent = the session did not close it.
         val plain = TurmaJson.decodeFromString<AgentsResponse>(
             """{ "now": 1, "agents": [ { "key": "h", "device": "h", "sessions": [ { "id": "s", "ticket": { "key": "X-1" } } ] } ] }""")

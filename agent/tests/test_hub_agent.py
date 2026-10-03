@@ -17578,16 +17578,22 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         # The worker wrote nothing to the registry — that is the beat's.
         self.assertNotIn("outcome", sess["ticket"])
         sm._apply_closed_tickets()
+        # The session's evidence note rides the outcome (the board's "Closed by"
+        # row shows it), on the record AND the ledger entry.
         self.assertEqual(sess["ticket"]["outcome"],
-                         {"kind": "not-reproducible", "at": 1_000_000})
+                         {"kind": "not-reproducible", "at": 1_000_000,
+                          "note": "ran repro.sh on main: passes"})
         entry = sm.ticket_ledger[sess["claudeSessionId"]]
-        self.assertEqual(entry["outcome"], {"kind": "not-reproducible", "at": 1_000_000})
+        self.assertEqual(entry["outcome"], {"kind": "not-reproducible", "at": 1_000_000,
+                                            "note": "ran repro.sh on main: passes"})
         with open(ha.TICKET_LEDGER_PATH) as fh:      # persisted, not just in memory
             self.assertEqual(json.load(fh)[sess["claudeSessionId"]]["outcome"]["kind"],
                              "not-reproducible")
         [r] = sm.ticket_outcome_results
         self.assertEqual((r["sessionId"], r["key"], r["kind"], r["ok"], r["status"]),
                          (self.SID, self.KEY, "not-reproducible", True, "Done"))
+        # The note rides the ticket only, never the hub's result list.
+        self.assertNotIn("note", r)
         # The served ticket carries it, so the board can say why.
         self.assertEqual(ha._served_ticket(sess)["outcome"]["kind"], "not-reproducible")
         # A later pass finds nothing to do.
@@ -17960,7 +17966,8 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         sm.registry = []
         sm.closed = [{"id": "other", "repo": "Turma"}, rec]
         sm._apply_closed_tickets()
-        self.assertEqual(rec["ticket"]["outcome"], {"kind": "not-reproducible", "at": 1_000_000})
+        self.assertEqual(rec["ticket"]["outcome"], {"kind": "not-reproducible", "at": 1_000_000,
+                                                    "note": "ran repro.sh on main: passes"})
         self.assertEqual(sm.ticket_ledger[sess["claudeSessionId"]]["outcome"]["kind"],
                          "not-reproducible")
         self.assertNotIn("ticket", sm.closed[0])

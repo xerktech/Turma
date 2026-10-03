@@ -9020,9 +9020,13 @@ function normalizeRepos(a) {
 // ledger (so it rides sessions, closedSessions AND repos[].resumable). Android
 // TYPES it (TicketRef.outcome), so a wrong shape is decode-fatal: `kind` must be
 // one of the CLI's three resolutions and `at` a finite integer (epoch ms), else
-// the whole key is deleted — absent reads as "not closed by its session". The
-// kinds are an INLINE literal, never a module const: this runs from loadState's
-// restore at module-init, where a const declared down here is in its TDZ.
+// the whole key is deleted — absent reads as "not closed by its session".
+// `note` is the session's evidence (the close-ticket request's note): kept only
+// as a non-empty string cut to 2000 code points (the agent's
+// CLOSE_TICKET_NOTE_MAX), else dropped ALONE — absent = no note, never an
+// invented one, and a bad note never costs the outcome. The kinds and the cap
+// are INLINE literals, never module consts: this runs from loadState's restore
+// at module-init, where a const declared down here is in its TDZ.
 function coerceTicketOutcome(t) {
   if (!("outcome" in t)) return;
   const o = t.outcome;
@@ -9032,7 +9036,9 @@ function coerceTicketOutcome(t) {
     delete t.outcome;
     return;
   }
-  t.outcome = { kind: o.kind, at: o.at };
+  const note = typeof o.note === "string" && o.note
+    ? (o.note.length > 2000 ? Array.from(o.note).slice(0, 2000).join("") : o.note) : "";
+  t.outcome = note ? { kind: o.kind, at: o.at, note } : { kind: o.kind, at: o.at };
 }
 
 // `closedSessions` (List<ClosedSessionInfo> on Android). Non-array → [],

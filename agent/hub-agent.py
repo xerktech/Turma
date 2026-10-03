@@ -25418,7 +25418,10 @@ class SessionManager:
                 self._close_ticket_landed.append({
                     "sessionId": sid, "key": key, "kind": req.get("kind"),
                     "ok": error is None, "error": error and error[:300],
-                    "final": final, "status": status, "at": int(now * 1000)})
+                    "final": final, "status": status, "at": int(now * 1000),
+                    # The evidence, for the board's "Closed by" row; the beat
+                    # stamps it on the ticket, never on the hub's result list.
+                    "note": req.get("note") or ""})
 
         refusal = "this session has no ticket" if not key else req.get("error")
         if refusal is None and not valid_issue_key(key):
@@ -25483,8 +25486,10 @@ class SessionManager:
     def _apply_closed_tickets(self):
         """ON THE BEAT: take what the worker staged, stage it for the hub
         (`ticketOutcomeResults`), and stamp a success as `ticket.outcome =
-        {kind, at}` on the session's record AND its ticket-ledger entry, so the
-        board can say why the ticket closed after the session is gone too. The
+        {kind, at, note}` on the session's record AND its ticket-ledger entry, so
+        the board can say why the ticket closed after the session is gone too.
+        `note` is the request's evidence (≤ CLOSE_TICKET_NOTE_MAX, omitted when
+        empty) and rides only the ticket, never `ticketOutcomeResults`. The
         block is REBOUND, never mutated, since the worker reads it.
 
         A FINAL failure (a refusal, or the last attempt failing) is told to the
@@ -25496,6 +25501,7 @@ class SessionManager:
             landed, self._close_ticket_landed = self._close_ticket_landed, []
         changed = False
         for r in landed:
+            note = r.pop("note", "")
             self.ticket_outcome_results.append(r)
             if not r["ok"]:
                 if r.get("final"):
@@ -25513,7 +25519,10 @@ class SessionManager:
             ticket = (sess or {}).get("ticket")
             if not isinstance(ticket, dict) or ticket.get("key") != r["key"]:
                 continue
-            sess["ticket"] = {**ticket, "outcome": {"kind": r["kind"], "at": r["at"]}}
+            outcome = {"kind": r["kind"], "at": r["at"]}
+            if isinstance(note, str) and note:
+                outcome["note"] = note[:CLOSE_TICKET_NOTE_MAX]
+            sess["ticket"] = {**ticket, "outcome": outcome}
             self._remember_ticket(sess)
             changed = True
         del self.ticket_outcome_results[:-TICKET_OUTCOME_RESULTS_MAX]

@@ -798,11 +798,18 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kc-sess.kc-sess-err { color: var(--critical); border-color: var(--critical); }
 .kc-sess.kc-sess-err .kc-sess-dot { background: var(--critical); }
 /* A session that closed its own ticket (XERK-1569): the chip's label becomes
-   "closed · <why>" in the chip's normal ink, with a neutral dot — never the green
-   running one, even while the session is still up. The label is a fixed phrase,
-   so it is let past the 22ch name cap rather than ellipsised. */
-.kc-sess.kc-sess-closed { max-width: none; }
+   its reason ("not reproducible", "already fixed", or "closed") in the chip's
+   normal ink, with a neutral dot — never the green running one, even while the
+   session is still up. It stays inside the 22ch name cap on one line, so the
+   card's org tag never wraps onto a row of its own. */
 .kc-sess.kc-sess-closed .kc-sess-dot { background: var(--muted); }
+/* On that card the closing session's chip, the start control and the org tag
+   wrap as one unit (board.js cardHtml), filling the rest of their row so the
+   org tag still sits flush right — and never alone on a row of its own. */
+.kanban-card .kc-tail {
+  display: inline-flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center;
+  gap: 5px 7px; min-width: 0;
+}
 .kc-org {
   display: inline-flex; align-items: center; gap: 5px;
   color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;
@@ -896,6 +903,12 @@ body.td-open { overflow: hidden; }
 .td-field { min-width: 0; font-size: 12px; }
 .td-field dt { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
 .td-field dd { margin: 2px 0 0; color: var(--ink); overflow-wrap: anywhere; }
+/* The "Closed by" row's evidence note (XERK-1569): the session's own words,
+   clamped to three lines on screen; the full text is the element's title. */
+.td-outcome-note {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3;
+  overflow: hidden; margin-top: 3px; color: var(--ink-2); white-space: pre-line;
+}
 .td-dim { color: var(--muted); }
 /* The Repo row's manual override (see repoFieldHtml/repoPickerHtml in board.js).
    "Change" is a quiet text button, not a filled one: the row's job is to report

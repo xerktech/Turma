@@ -1841,12 +1841,15 @@ test("XERK-1569: a session that closed its own ticket says why INSIDE its chip",
   });
   const nr = sessionChipHtml(closed("not-reproducible"));
   assert.ok(nr.includes('class="kc-sess kc-sess-closed"'), nr);
-  assert.ok(nr.includes('<span class="kc-sess-name">closed · not reproducible</span>'), nr);
+  // The reason alone: the neutral dot already says closed, so no "closed ·"
+  // prefix — the label stays inside the 22ch name cap on one line.
+  assert.ok(nr.includes('<span class="kc-sess-name">not reproducible</span>'), nr);
+  assert.ok(!nr.includes("closed ·"), nr);
   assert.ok(!nr.includes("kc-sess-why"), "no separate caption beside the chip");
   assert.ok(nr.includes(`href="/sessions?ended=tr1"`), "the chip still links");
   assert.match(nr, /title="[^"]*X-1[^"]*stopped/, "the name and run state move to the tooltip");
   const af = sessionChipHtml(closed("already-fixed"));
-  assert.ok(af.includes(">closed · already fixed</span>"), af);
+  assert.ok(af.includes(">already fixed</span>"), af);
   // `done` says just "closed" (the Done column says the rest).
   const dn = sessionChipHtml(closed("done"));
   assert.ok(dn.includes('<span class="kc-sess-name">closed</span>'), dn);
@@ -1862,29 +1865,72 @@ test("XERK-1569: a session that closed its own ticket says why INSIDE its chip",
   // An unknown kind or no outcome at all changes nothing.
   for (const s of [closed("wontfix"), tsess("s1", "X-1", { status: "stopped" })]) {
     const h = sessionChipHtml(s);
-    assert.ok(!h.includes("kc-sess-closed") && !h.includes("closed ·"), h);
+    assert.ok(!h.includes("kc-sess-closed") && !h.includes("not reproducible"), h);
   }
   // A chip with no conversation still says why.
   assert.ok(sessionChipHtml(closed("not-reproducible", { transcriptId: undefined }))
-    .includes(">closed · not reproducible</span>"));
+    .includes(">not reproducible</span>"));
+  // Every label fits the chip's 22ch name cap, so it never ellipsises or wraps.
+  for (const kind of ["done", "not-reproducible", "already-fixed"]) {
+    const label = ticketOutcomeLabel(closed(kind));
+    assert.ok(label && label.length <= 22, label);
+  }
   assert.equal(ticketOutcomeLabel({}), "");
   assert.equal(ticketOutcomeLabel({ ticket: { outcome: "not-reproducible" } }), "");
 });
 
-test("XERK-1569: the detail panel says a session closed the ticket, why and when", () => {
+test("XERK-1569: a closed card wraps its closer's chip, the start control and the org tag as one unit", () => {
+  const done = ticket("X-1", { status: "Done", statusCategory: "done", project: "XERK",
+    repoGuess: { repo: "Turma", cloned: true, reason: "" } });
+  const closer = tsess("b", "X-1", { status: "stopped", transcriptId: "tb",
+    ticket: { key: "X-1", siteKey: "myorg.atlassian.net", branch: "X-1",
+              outcome: { kind: "already-fixed", at: 1 } } });
+  const older = tsess("a", "X-1", { status: "stopped", transcriptId: "ta", git: { branch: "X-1-old" } });
+  const html = cardHtml(done, { siteKey: "myorg.atlassian.net" }, { sessions: [older, closer] });
+  const tail = html.match(/<span class="kc-tail">([\s\S]*?)<span class="kc-org"[^>]*>XERK<\/span><\/span>/);
+  assert.ok(tail, html);
+  // The closer's chip and the "+" ride inside the tail with the org tag...
+  assert.ok(tail[1].includes(">already fixed</span>") && tail[1].includes("kc-start-more"), tail[1]);
+  // ...an earlier session's chip stays loose ahead of it, and nothing repeats.
+  assert.ok(!tail[1].includes("X-1-old") && html.indexOf("X-1-old") < html.indexOf("kc-tail"), html);
+  assert.equal(html.split("data-start=").length - 1, 1, html);
+  assert.equal(html.split('class="kc-org"').length - 1, 1, html);
+  // A card whose newest session did not close it keeps the flat row.
+  const open = cardHtml(done, { siteKey: "myorg.atlassian.net" }, { sessions: [closer, older] });
+  assert.ok(!open.includes("kc-tail") && open.includes('class="kc-org"'), open);
+});
+
+test("XERK-1569: the detail panel names the session that closed the ticket, why, when and its note", () => {
   const now = Date.parse("2026-10-03T12:00:00Z");
   const at = now - 3 * 3600 * 1000;
-  const withOutcome = (id, kind, when) => tsess(id, "X-1", {
-    status: "stopped", transcriptId: "t" + id,
-    ticket: { key: "X-1", siteKey: "myorg.atlassian.net", outcome: { kind, at: when } },
+  const withOutcome = (id, kind, when, note) => tsess(id, "X-1", {
+    status: "stopped", transcriptId: "t" + id, git: { branch: "X-1-fix-" + id },
+    ticket: { key: "X-1", siteKey: "myorg.atlassian.net",
+              outcome: note === undefined ? { kind, at: when } : { kind, at: when, note } },
   });
   // The newest session decides: it closed the ticket, so its outcome is shown.
-  const sessions = [withOutcome("a", "already-fixed", at - 1000), withOutcome("b", "not-reproducible", at)];
+  const note = "ran repro.sh on main: passes <b>& the fix is a1b2c3</b>";
+  const sessions = [withOutcome("a", "already-fixed", at - 1000),
+    withOutcome("b", "not-reproducible", at, note)];
   const o = ticketOutcomeOf(sessions);
   assert.equal(o.kind, "not-reproducible");
   assert.equal(o.session.id, "b");
+  assert.equal(o.note, note);
   const html = detailHtml(ticket("X-1"), null, { siteKey: "myorg.atlassian.net", sessions, now });
-  assert.match(html, /<dt>Closed by<\/dt><dd><span class="td-outcome"[^>]*>session — not reproducible · 3h ago<\/span>/);
+  // The row names the session that closed it (its chip name), not a bare "session".
+  assert.match(html, /<dt>Closed by<\/dt><dd><span class="td-outcome"[^>]*><span class="td-outcome-who">X-1-fix-b<\/span> — not reproducible · 3h ago<\/span>/);
+  // The evidence note follows, escaped, clamped on screen with the full text as
+  // its tooltip.
+  const esc = "ran repro.sh on main: passes &lt;b&gt;&amp; the fix is a1b2c3&lt;/b&gt;";
+  assert.ok(html.includes(`<span class="td-outcome-note" title="${esc}">${esc}</span>`), html);
+  assert.ok(!html.includes("<b>&"), "the note is never markup");
+  // No note served → no note element (never an invented one).
+  assert.ok(!ticketOutcomeFieldHtml(ticketOutcomeOf([withOutcome("a", "done", at)]), now)
+    .includes("td-outcome-note"));
+  assert.equal(ticketOutcomeOf([withOutcome("a", "done", at, 7)]).note, "");
+  assert.equal(ticketOutcomeFieldHtml(ticketOutcomeOf([withOutcome("a", "done", now - 10 * 1000)]), now)
+    .replace(/<[^>]+>/g, ""), "X-1-fix-a — done · just now");
+  // An outcome with no session object still reads.
   assert.equal(ticketOutcomeFieldHtml({ kind: "done", at: now - 10 * 1000 }, now)
     .replace(/<[^>]+>/g, ""), "session — done · just now");
   assert.equal(ticketOutcomeFieldHtml({ kind: "already-fixed" }, now).replace(/<[^>]+>/g, ""),

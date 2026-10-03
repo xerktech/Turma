@@ -785,9 +785,10 @@ private fun TicketCard(
 @Composable
 private fun TicketSessionChip(s: TicketSession, onClick: () -> Unit) {
     val state = ticketSessionState(s)
-    // A session that closed its own ticket (XERK-1569) reads "closed · <why>" in
-    // the chip's normal ink with a neutral dot, whatever its run state — web's
-    // .kc-sess-closed. ticketSessionLabel already swaps the label.
+    // A session that closed its own ticket (XERK-1569) reads its reason ("not
+    // reproducible", "already fixed", "closed") in the chip's normal ink with a
+    // neutral dot, whatever its run state — web's .kc-sess-closed.
+    // ticketSessionLabel already swaps the label; it fits the name cap.
     val closed = ticketOutcomeLabel(s.outcome).isNotEmpty()
     val dot = if (closed) TurmaColors.stopped else when (state) {
         "running" -> TurmaColors.working
@@ -813,8 +814,7 @@ private fun TicketSessionChip(s: TicketSession, onClick: () -> Unit) {
             fontFamily = FontFamily.Monospace,
             maxLines = 1,
             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
-            // The closed phrase is fixed-length, so it is let past the name cap.
-            modifier = Modifier.widthIn(max = if (closed) 220.dp else 140.dp),
+            modifier = Modifier.widthIn(max = 140.dp),
             color = if (closed || state == "running") MaterialTheme.colorScheme.onSurface
             else MaterialTheme.colorScheme.onSurfaceVariant,
         )
@@ -1769,6 +1769,19 @@ private fun TicketDetailSheet(
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                     SectionLabel("Closed by")
                     Text(ticketOutcomeText(closedBy), style = MaterialTheme.typography.bodyMedium)
+                    // The session's evidence note — web's .td-outcome-note: three
+                    // lines, the full text a tap away (a phone has no hover).
+                    if (closedBy.outcomeNote.isNotEmpty()) {
+                        var noteOpen by remember(closedBy.outcomeNote) { mutableStateOf(false) }
+                        Text(
+                            closedBy.outcomeNote,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = if (noteOpen) Int.MAX_VALUE else 3,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.clickable { noteOpen = !noteOpen },
+                        )
+                    }
                 }
             }
             // An epic is an organizer: it shows the epic-run panel (Start/progress),

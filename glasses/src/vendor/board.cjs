@@ -1305,8 +1305,8 @@
   //     turn has no conversation to open, and an <a> to nothing is worse than
   //     plain text saying so.
   // Why a session closed its OWN ticket (XERK-1569): the agent stamps
-  // `ticket.outcome = {kind, at}` when the session's `close-ticket` lands. The
-  // words for each kind the hub lets through (coerceTicketOutcome); "" = the
+  // `ticket.outcome = {kind, at, note?}` when the session's `close-ticket` lands.
+  // The words for each kind the hub lets through (coerceTicketOutcome); "" = the
   // session did not close it (or an unknown kind, which says nothing).
   function ticketOutcomeWords(kind) {
     return kind === "not-reproducible" ? "not reproducible"
@@ -1314,26 +1314,34 @@
       : kind === "done" ? "done" : "";
   }
 
-  // The chip label of a session that closed its own ticket: "closed · <why>",
-  // or plain "closed" for `done` (the Done column already says the rest).
+  // The chip label of a session that closed its own ticket: the reason alone,
+  // "not reproducible" / "already fixed", or plain "closed" for `done`. The
+  // neutral dot already says closed, so there is no "closed ·" prefix: the label
+  // must fit the chip's name cap on one line, or the card's org tag wraps onto a
+  // row of its own.
   function ticketOutcomeLabel(s) {
     const o = s && s.ticket && s.ticket.outcome;
     const words = ticketOutcomeWords(o && o.kind);
-    return !words ? "" : words === "done" ? "closed" : "closed · " + words;
+    return !words ? "" : words === "done" ? "closed" : words;
   }
 
   // The ticket's NEWEST session (ticketSessionsOf, oldest first) when it closed
-  // the ticket, as {kind, at, session}; null otherwise. Only the newest counts:
-  // a reopened ticket worked by a fresh session must not still read "closed".
-  // The detail panel's "Closed by" row reads it.
+  // the ticket, as {kind, at, note, session}; null otherwise. Only the newest
+  // counts: a reopened ticket worked by a fresh session must not still read
+  // "closed". The detail panel's "Closed by" row reads it. `note` is the
+  // session's evidence, "" when the hub served none (never invented).
   function ticketOutcomeOf(sessions) {
     const s = (sessions || [])[(sessions || []).length - 1];
     const o = s && s.ticket && s.ticket.outcome;
-    return o && ticketOutcomeWords(o.kind) ? { kind: o.kind, at: o.at, session: s } : null;
+    return o && ticketOutcomeWords(o.kind)
+      ? { kind: o.kind, at: o.at, note: typeof o.note === "string" ? o.note : "", session: s }
+      : null;
   }
 
-  // The "Closed by" row's value: "session — not reproducible · 3h ago". `at` is
-  // epoch ms (wireLong-coerced by the hub); a missing one just drops the age.
+  // The "Closed by" row's value: the closing session's name, "XERK-12-fix — not
+  // reproducible · 3h ago", then the evidence note the session gave, clamped to
+  // three lines on screen with the full text in its tooltip. `at` is epoch ms
+  // (wireLong-coerced by the hub); a missing one just drops the age.
   function ticketOutcomeFieldHtml(outcome, now) {
     if (!outcome) return "";
     const at = Number.isFinite(outcome.at) ? new Date(outcome.at) : null;
@@ -1341,7 +1349,12 @@
     const age = iso ? ageStr(iso, now) : "";
     const when = !age ? "" : age === "now" ? " · just now" : ` · ${age} ago`;
     const title = iso ? ` title="${esc(iso)}"` : "";
-    return `<span class="td-outcome"${title}>session — ${esc(ticketOutcomeWords(outcome.kind))}${esc(when)}</span>`;
+    const who = outcome.session ? sessionChipName(outcome.session) : "session";
+    const note = outcome.note
+      ? `<span class="td-outcome-note" title="${esc(outcome.note)}">${esc(outcome.note)}</span>`
+      : "";
+    return `<span class="td-outcome"${title}><span class="td-outcome-who">${esc(who)}</span>`
+      + ` — ${esc(ticketOutcomeWords(outcome.kind))}${esc(when)}</span>${note}`;
   }
 
   // Where a session's chip links (see above): live chat while running, the
@@ -1352,17 +1365,24 @@
       : (s.transcriptId ? `/sessions?ended=${encodeURIComponent(s.transcriptId)}` : null);
   }
 
-  function sessionChipHtml(s) {
+  // A ticket session's NAME (see above): the operator's rename, else its branch,
+  // else whatever names it. The chip and the "Closed by" row both say it.
+  function sessionChipName(s) {
     const branch = (s.git && s.git.branch) || (s.ticket && s.ticket.branch);
     const renamed = s.summaryManual ? s.summary : null;
-    const name = renamed || branch || s.summary || s.label || s.id
+    return renamed || branch || s.summary || s.label || s.id
       || (s.ticket && s.ticket.key) || "session";
+  }
+
+  function sessionChipHtml(s) {
+    const branch = (s.git && s.git.branch) || (s.ticket && s.ticket.branch);
+    const name = sessionChipName(s);
     const stopped = s.status !== "running";
     const state = s.status === "error" ? "failed"
       : s.status === "queued" ? "queued"
       : (stopped ? "stopped" : "running");
     // A session that closed its own ticket says so INSIDE its chip, in place of
-    // its name: "closed · not reproducible" in the chip's normal ink, with a
+    // its name: "not reproducible" in the chip's normal ink, with a
     // neutral dot. Its run state stops mattering to the card — the session may
     // still be running, but the ticket's work is over — so the state and the
     // name move to the tooltip rather than a green "running" dot beside "closed".
@@ -1550,7 +1570,7 @@
     if (isEpicTicket(t)) {
       const chips = (o.sessions || []).map(sessionChipHtml).join("");
       bits.push(chips + epicCardControlHtml(t, o.epicRun));
-    } else {
+    } else if (!ticketOutcomeOf(o.sessions)) {
       const start = ticketStartHtml(t, o.sessions, o.start, o.queued);
       if (start) bits.push(start);
     }
@@ -1558,7 +1578,18 @@
     // one shows why on the card (same inline convention as the start-error note).
     if (o.moving) bits.push(`<span class="kc-moving">moving…</span>`);
     else if (o.moveError) bits.push(`<span class="kc-move-err" title="${esc(o.moveError)}">couldn't move</span>`);
-    bits.push(`<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`);
+    const org = `<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`;
+    if (!isEpicTicket(t) && ticketOutcomeOf(o.sessions)) {
+      // A ticket its newest session closed (XERK-1569): that session's chip, the
+      // start control after it and the org tag wrap as ONE unit (.kc-tail), so
+      // the org tag never lands on a row of its own under the meta pills.
+      // Earlier sessions' chips stay loose ahead of it, as on any other card.
+      const ss = o.sessions;
+      bits.push(ss.slice(0, -1).map(sessionChipHtml).join(""));
+      bits.push(`<span class="kc-tail">${ticketStartHtml(t, ss.slice(-1), o.start, o.queued)}${org}</span>`);
+    } else {
+      bits.push(org);
+    }
     // The card itself opens the detail view (data-* carry what the click
     // handler needs to route the fetch: the issue and its owning org). It's a
     // div, not a button, because it contains the kc-key link out to Jira, the
@@ -2149,7 +2180,8 @@
           })),
       fieldRow("Resolution", d.resolution ? esc(d.resolution) : ""),
       // A session that closed this ticket itself (XERK-1569), and why. The card's
-      // chip says why too; only this row has room for when.
+      // chip says why too; only this row has room for which session, when, and
+      // the evidence it gave.
       fieldRow("Closed by", ticketOutcomeFieldHtml(ticketOutcomeOf(o.sessions), now)),
       fieldRow("Priority", v("priority")
         ? `<span class="kc-prio ${prioClass(v("priority"))}">${esc(v("priority"))}</span>` : ""),
@@ -2620,6 +2652,7 @@
     boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
     ticketOutcomeWords, ticketOutcomeLabel, ticketOutcomeOf, ticketOutcomeFieldHtml,
+    sessionChipName,
     queuedTicketOf, queuedLabel, queuedTip,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };

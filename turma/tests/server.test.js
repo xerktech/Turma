@@ -3485,6 +3485,22 @@ test("XERK-1569: ticket.outcome is coerced by name on every ticket channel", () 
       assert.equal("outcome" in t, false, `outcome ${JSON.stringify(bad)} kept`);
     }
   }
+  // The evidence note rides as a bounded string; a bad note is dropped ALONE
+  // (absent = no note, never invented) and never costs the outcome.
+  for (const t of rec({ kind: "done", at: 1, note: "ran repro.sh: passes" })) {
+    assert.deepEqual(t.outcome, { kind: "done", at: 1, note: "ran repro.sh: passes" });
+  }
+  for (const bad of [5, "", null, ["x"], { x: 1 }, true]) {
+    for (const t of rec({ kind: "done", at: 1, note: bad })) {
+      assert.deepEqual(t.outcome, { kind: "done", at: 1 }, `note ${JSON.stringify(bad)} kept`);
+    }
+  }
+  // Over the agent's 2000 cap it is cut at a code point, never mid-surrogate.
+  const long = "😀".repeat(2500);
+  for (const t of rec({ kind: "done", at: 1, note: long })) {
+    assert.equal(Array.from(t.outcome.note).length, 2000);
+    assert.equal(t.outcome.note, "😀".repeat(2000));
+  }
 });
 
 test("XERK-1569: ticketOutcomeResults are consumed by the ingest, never kept on the record", async () => {

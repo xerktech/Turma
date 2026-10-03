@@ -142,9 +142,11 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   - **The target is resolved BEFORE the comment posts**, so a workflow with no edge into Done
     never gets an evidence comment on a ticket left open.
   - Only for a RUNNING Claude session whose `ticket.siteKey` is this host's board; dsh/qwen skipped.
-  - Success stamps **`ticket.outcome = {kind, at}`** on the record (served via `_served_ticket`)
+  - Success stamps **`ticket.outcome = {kind, at, note}`** on the record (`_served_ticket`)
     AND its `_remember_ticket` ledger entry (added only when present), so `repos[].resumable`
     carries it after the record ages out. The hub coerces it (`coerceTicketOutcome`).
+  - `note` is the request's evidence (≤ `CLOSE_TICKET_NOTE_MAX`, omitted when empty) for the
+    board's "Closed by" row; it rides the ticket only, never `ticketOutcomeResults`.
   - Results ride `ticketOutcomeResults` (`ticket_outcome_results`, keyed by sessionId + key — no
     cmdId, a session asked); the hub only logs them. Tests: `TestCloseTicketRequest`.
 - Tests: `TestSetBoardStatus`, `TestAzureStatusOptions`, `TestCreateAzureIssue`,

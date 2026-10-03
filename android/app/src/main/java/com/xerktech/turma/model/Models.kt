@@ -557,12 +557,14 @@ data class TicketRef(
 /**
  * A ticket's self-close outcome (`ticket.outcome`): kind = done | not-reproducible |
  * already-fixed, at = epoch ms. The hub deletes the whole key unless `at` is a
- * finite integer (wireLong), so a Long here never sees a fraction.
+ * finite integer (wireLong), so a Long here never sees a fraction. `note` is the
+ * session's evidence, a hub-bounded string (≤2000 chars); "" = none served.
  */
 @Serializable
 data class TicketOutcome(
     val kind: String = "",
     val at: Long = 0L,
+    val note: String = "",
 )
 
 // ---- Jira board (the agent's `jira` heartbeat block; see hub-agent collect_jira) --
