@@ -8315,6 +8315,46 @@ test("auto-start: a resumable-only session (durable, survives restart) still cou
   assert.equal((agents.asResume.commands || []).length, 0);
 });
 
+// XERK-1492: `ticket.siteKey` is agent-asserted, so a host bound to ANOTHER org
+// naming this org's ticket must not mark it "started" — that withheld the
+// ticket's auto-start (and its epic-run dispatch) forever. A host's OWN org's
+// sessions still count, including while it momentarily drifts, since a false
+// "started" only withholds a start but a missed one double-starts the ticket.
+test("auto-start: another org's host reporting a session on this org's ticket does not block it", async () => {
+  resetAutoStart();
+  await asBeat("asPhantomA", "as1492a.atlassian.net", { autoStart: false, tickets: [] });
+  await asBeat("asPhantomB", "as1492b.atlassian.net", {
+    tickets: ["ENG-9", "ENG-10"].map((key) => ({
+      key, summary: "Fix it", statusCategory: "todo",
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } })),
+    capacity: { maxSessions: 8, running: 0, queued: 0 },
+  });
+  agents.asPhantomA.closedSessions = [{ id: "ph", transcriptId: "t-ph",
+    ticket: { key: "ENG-9", siteKey: "as1492b.atlassian.net" } }];
+  assert.equal(startedTicketKeys().has("as1492b.atlassian.net\x00ENG-9"), false);
+  assert.equal(startedTicketKeys().has("as1492a.atlassian.net\x00ENG-9"), false,
+    "a foreign-org ticket is not re-keyed under the reporting host's own org");
+  autoStartRound();
+  autoStartRound();   // one dispatch per host per pass
+  assert.deepEqual((agents.asPhantomB.commands || []).map((c) => c.issueKey).sort(),
+    ["ENG-10", "ENG-9"]);
+
+  // Its own org's host still counts — bound, and while momentarily drifted.
+  agents.asPhantomB.closedSessions = [{ id: "own", transcriptId: "t-own",
+    ticket: { key: "ENG-9", siteKey: "as1492b.atlassian.net" } }];
+  assert.ok(startedTicketKeys().has("as1492b.atlassian.net\x00ENG-9"));
+  agents.asPhantomB.jira = { ...agents.asPhantomB.jira, siteKey: "as1492a.atlassian.net" };
+  assert.ok(startedTicketKeys().has("as1492b.atlassian.net\x00ENG-9"));
+
+  // ...and a drifted host's session on the org it CLAIMS counts too:
+  // findTicketHost routes on the claimed org, so dropping it re-dispatched the
+  // same ticket to that host after every backoff (QA, XERK-1492).
+  agents.asPhantomB.closedSessions = [{ id: "dr", transcriptId: "t-dr",
+    ticket: { key: "ENG-11", siteKey: "as1492a.atlassian.net" } }];
+  assert.ok(startedTicketKeys().has("as1492a.atlassian.net\x00ENG-11"));
+});
+
 // XERK-61: a spawnTicket the agent acked but that produced no session is a
 // FAILED attempt, not a completed one — the agent acks a refusal and a mid-spawn
 // exception exactly like a success. So the sweep retries it, bounded and backed

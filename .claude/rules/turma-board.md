@@ -164,6 +164,11 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
   `startedTicketKeys()` (durable: any channel including a killed session counts as handled), an
   in-flight `spawnTicket` on some host, and `autoStarted` (in-memory attempt record — the only thing
   stopping a spawn the agent **refuses** from requeueing every sweep).
+- **`startedTicketKeys()` counts a session only for an org its host is BOUND to or CLAIMS**
+  (XERK-1492). `ticket.siteKey` is agent-asserted, so another org's host naming this org's ticket
+  otherwise withheld its auto-start + epic-run dispatch forever.
+  - Never narrow it to `boundOrgOf`/`decidedOrgOf` alone: `findTicketHost` routes on the CLAIMED
+    org, so a drifted host is handed tickets it would then not count — re-dispatched every backoff.
 - **A queued `spawnTicket` is an ATTEMPT, not a start** (XERK-61), so auto-start **retries on
   growing backoff and never gives up** (XERK-109): `AUTO_START_RETRY_MS` doubles 1/2/4/8min, holds
   at `AUTO_START_RETRY_MAX_MS` (10min) past `AUTO_START_BACKOFF_STEPS` (5).
