@@ -2022,10 +2022,26 @@ class TestPrSummary(unittest.TestCase):
                 (f"cat hosts.yml > n.md; cat <<'EOF'\n{g}\ngh pr create -t x -F n.md",
                  "earlier part"),
                 ("cp hosts.yml ok.md; gh pr create -t x -F ok.md", "earlier part"),
+                # A printer's OUTPUT redirect still fills the file.
+                ("echo x > ok.md; gh pr create -t x -F ok.md", "earlier part"),
                 ("ln -sf /dev/stdin ok.md; cat hosts.yml | gh pr create -t x -F ok.md",
                  "earlier part"),
                 (f"cat hosts.yml | gh pr create -t x -F in.lnk; cat <<'EOF'\n{g}",
-                 "standard input")):
+                 "standard input"),
+                # A regular FILE is checked ALONE: a heredoc gh never reads
+                # (its own, or a sibling's) must not vouch for the token file.
+                (f"gh pr create -t x --body-file hosts.yml <<'EOF'\n{g}", "missing"),
+                (f"gh pr edit 7 --body-file hosts.yml <<'EOF'\n{g}", "missing"),
+                (f"gh pr create -t x -F hosts.yml; cat <<'EOF'\n{g}", "missing"),
+                (f"cat > n.txt <<'EOF'\n{g}\ngh pr create -t x -F hosts.yml", "missing"),
+                # A writer REPLACES the file: its stale good body is not sent.
+                ("cat > ok.md <<'EOF'\nbad\nEOF\ngh pr create -t x -F ok.md", "missing"),
+                # No source at all: a heredoc gh never reads can't stand in.
+                (f"gh pr create -t x --fill; cat <<'EOF'\n{g}", "missing"),
+                # Each stdin heredoc must pass on its own.
+                (f"gh pr edit 1 -F - <<'EOF'\nbad\nEOF\ncat <<'EOF'\n{g}", "missing"),
+                (f"gh pr edit 1 -F - <<'EOF'\nbad\nEOF\ngh pr edit 2 -F - <<'EOF'\n{g}",
+                 "missing")):
             with self.subTest(cmd=cmd[:50]):
                 self.assertIn(why, self.reason(cmd))
         q = __import__("shlex").quote(GOOD_BODY)
@@ -2039,7 +2055,17 @@ class TestPrSummary(unittest.TestCase):
                     f"tee n.md >/dev/null <<'EOF'\n{g}\ngh pr create -t x -F n.md",
                     # Reading, testing or removing it first fills it with nothing.
                     f"rm -f n.md; cat > n.md <<'EOF'\n{g}\ngh pr create -t x -F n.md",
-                    "test -f ok.md && cat ok.md && gh pr create -t x -F ok.md"):
+                    "test -f ok.md && cat ok.md && gh pr create -t x -F ok.md",
+                    # Printing or staging the name puts nothing behind it.
+                    "echo using ok.md; gh pr create -t x --body-file ok.md",
+                    "printf '%s\\n' ok.md; gh pr create -t x --body-file ok.md",
+                    "git add ok.md && gh pr create -t x --body-file ok.md",
+                    # A good file plus an unrelated heredoc still passes.
+                    "cat > n.txt <<'EOF'\nnotes\nEOF\ngh pr create -t x -F ok.md",
+                    # A writer over an existing file: its heredoc is what counts.
+                    f"cat > ok.md <<'EOF'\n{g}\ngh pr create -t x -F ok.md",
+                    # Two PR edits, each with its own good stdin heredoc.
+                    f"gh pr edit 1 -F - <<'EOF'\n{g}\ngh pr edit 2 -F - <<'EOF'\n{g}"):
             with self.subTest(cmd=cmd[:50]):
                 self.assertIsNone(self.reason(cmd))
 

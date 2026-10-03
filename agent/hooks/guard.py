@@ -2584,11 +2584,12 @@ def _drop_leading_redirects(tokens: list[str]) -> list[str]:
     return tokens[i:]
 
 
-# Commands that only read, test or remove their operands: naming the body file
-# (`rm -f b.md; cat > b.md <<EOF …`) cannot put other content behind it. Their
+# Commands that only read, test, print or remove their operands: naming the
+# body file (`rm -f b.md; cat > b.md <<EOF …`, `echo using b.md`) cannot put
+# other content behind it; nor can `git add`, which only stages it. Their
 # OUTPUT redirects still count.
 _PR_PATH_READERS = frozenset(("cat", "head", "tail", "wc", "ls", "stat", "test", "[",
-                              "grep", "rm", "unlink"))
+                              "grep", "rm", "unlink", "echo", "printf"))
 
 
 def _note_paths(tokens: list[str], segment: str, cwd: str,
@@ -2628,7 +2629,7 @@ def _note_paths(tokens: list[str], segment: str, cwd: str,
     if writer and cmd == "tee":
         outs += [w for w in words[1:] if not w.startswith("-")]
         words = words[:1]
-    elif cmd in _PR_PATH_READERS:
+    elif cmd in _PR_PATH_READERS or (cmd == "git" and words[1:2] == ["add"]):
         words = words[:1]  # it reads or removes its operands, never fills one
     for out in outs:
         (written if writer else named).add(_pr_full_path(cwd, out))
@@ -2755,11 +2756,12 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     """A reason if ``command`` opens a PR/MR (or rewrites its description)
     whose description is missing a required section.
 
-    The description is what the command would actually send: the inline
-    ``--body``/``--description`` values, any ``--body-file`` (resolved against
-    ``cwd`` as moved by a preceding ``cd``), and the command's heredoc bodies —
-    which covers ``$(cat <<EOF …)``, ``-F - <<EOF`` and a body file the same
-    command writes first (it does not exist yet when the hook runs). A stdin
+    The description is the ONE source the command would actually send: a
+    regular ``--body-file`` (resolved against ``cwd`` as moved by a preceding
+    ``cd``) is checked alone; a stdin body against each heredoc on its own; an
+    inline ``--body``/``--description`` value, or a body file a heredoc writer
+    in the same command fills, together with the command's heredoc bodies —
+    which covers ``$(cat <<EOF …)`` and ``cat > f <<EOF; … -F f``. A stdin
     description must be the PR command's own heredoc — a `< file`, `<<<`, pipe
     or sibling heredoc is what gh would read instead. A description FILE fails
     closed: a regular file outside /dev and /proc, or one a heredoc writer
@@ -2812,6 +2814,7 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             )
         stdin = False
         texts: list[str] = []
+        from_writer = False
         for f in files:
             # FAIL CLOSED (XERK-1565): `-`/stdin under the own-heredoc rule, a
             # regular file outside /dev and /proc, or a file a heredoc writer
@@ -2827,10 +2830,12 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
                 )
             if kind == "stdin":
                 stdin = True
+            elif kind in ("file", "missing") and _pr_full_path(cwd, f) in written:
+                # A heredoc writer in this command fills it: what is there
+                # NOW (a stale earlier body) is not what gh reads.
+                from_writer = True
             elif kind == "file":
                 texts.append(text or "")
-            elif kind == "missing" and _pr_full_path(cwd, f) in written:
-                pass  # its heredoc is in the check below
             elif kind == "device":
                 return (
                     f"the description is read from a device or file-descriptor "
@@ -2855,55 +2860,78 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
                     "to a regular file, inline (--body/--description) or as a "
                     "heredoc."
                 )
-        if stdin and (_stdin_redirects(segment)[0] != 1
-                      or len(_split_heredocs(command)[1]) != 1):
-            # A stdin description is checked against the command's heredocs,
-            # so it must BE the one heredoc, owned by the PR command: one fed
-            # by a pipe, an inherited stdin or a sibling segment's heredoc
+        if stdin and _stdin_redirects(segment)[0] != 1:
+            # A stdin description must BE the PR command's own heredoc: one
+            # fed by a pipe, an inherited stdin or a sibling segment's heredoc
             # (`gh pr create -F - < f; gh pr view 1 <<EOF`) is not what is
             # checked.
             return (
                 "the description is read from standard input, but not from a "
                 "heredoc on the PR command itself — the input gh reads may not "
                 "be the description that is checked. Use -F - <<'EOF' on the "
-                "PR command as the command's only heredoc, --body \"$(cat "
-                "<<'EOF' …)\", or --body-file <path>."
+                "PR command, --body \"$(cat <<'EOF' …)\", or --body-file <path>."
             )
         if heredocs is None:
-            # Every heredoc counts. Matching a heredoc to the command it feeds
-            # (owner line, redirect target) refused 26% of real compliant PR
-            # commands — `git push && gh pr create … <<EOF`, `cd x && …`,
-            # `cat > "$S/b.md"` — so an unrelated heredoc in the same command
-            # counts too: the accepted residual, since it takes a model gaming
-            # its own guard. (`<<` in quotes/comments is not a heredoc to the
-            # XERK-1256 lexer, so it never counts.)
             heredocs = [b for _owner, b, _quoted in _split_heredocs(command)[1]]
-        body = "\n".join(bodies + heredocs + texts)
-        sections = _repo_template_sections(_repo_root(cwd))
-        if sections is not None:
-            # A template with no headings asks for prose; there is nothing to check.
-            missing = [name for name, pat in sections if not _heading_present(body, pat)]
-            if missing:
-                return (
-                    "this repo has its own PR template — the description is missing "
-                    f"its section(s): {', '.join(missing)}. Follow that template, "
-                    "and pass the description inline (--body/--description, or a "
-                    "heredoc) or with --body-file so it can be checked."
-                )
-            return None
-        missing = [name for name, pat in _PR_SECTIONS if not _heading_present(body, pat)]
-        if not _PR_SUMMARY_LINE.search(body):
-            missing.insert(0, "a '**Summary:**' first line")
+        # What gh sends — exactly one source by now (XERK-1565):
+        # - a regular FILE is checked ALONE: a heredoc gh never reads must not
+        #   vouch for it (`--body-file hosts.yml <<EOF …`);
+        # - STDIN is its own heredoc, but which one that is in a multi-heredoc
+        #   command is not mapped, so EVERY heredoc must pass on its own (two
+        #   `gh pr edit N -F - <<EOF` pass; a good sibling can't vouch for a
+        #   bad one);
+        # - an inline body or a file a heredoc writer creates is checked with
+        #   every heredoc. Matching a heredoc to the command it feeds (owner
+        #   line, redirect target) refused 26% of real compliant PR commands —
+        #   `git push && gh pr create … <<EOF`, `cd x && …`, `cat > "$S/b.md"`
+        #   — so an unrelated heredoc counts there: the accepted residual,
+        #   since it takes a model gaming its own guard. (`<<` in
+        #   quotes/comments is not a heredoc to the XERK-1256 lexer.)
+        # With no source at all (--fill, the editor) nothing is checked
+        # against, so it is refused.
+        if texts:
+            candidates = texts
+        elif stdin:
+            candidates = heredocs or [""]
+        elif bodies or from_writer:
+            candidates = ["\n".join(bodies + heredocs)]
+        else:
+            candidates = [""]
+        for body in candidates:
+            reason = _pr_body_reason(body, cwd)
+            if reason:
+                return reason
+    return None
+
+
+def _pr_body_reason(body: str, cwd: str) -> str | None:
+    """Why ``body`` misses the repo's PR template (or, with none, the Turma
+    PR summary standard), else None."""
+    sections = _repo_template_sections(_repo_root(cwd))
+    if sections is not None:
+        # A template with no headings asks for prose; there is nothing to check.
+        missing = [name for name, pat in sections if not _heading_present(body, pat)]
         if missing:
             return (
-                "the PR description does not follow the Turma PR summary standard — "
-                f"missing: {', '.join(missing)}. Required, in order: a "
-                "'**Summary:**' line, then '## Why', '## What changed', '## Risk', "
-                "'## Testing', '## Follow-ups' (see the PR summary standard in your "
-                "system prompt). Pass the description inline (--body/--description, "
-                "or a heredoc) or with --body-file so it can be checked — --fill and "
-                "the editor can't be."
+                "this repo has its own PR template — the description is missing "
+                f"its section(s): {', '.join(missing)}. Follow that template, "
+                "and pass the description inline (--body/--description, or a "
+                "heredoc) or with --body-file so it can be checked."
             )
+        return None
+    missing = [name for name, pat in _PR_SECTIONS if not _heading_present(body, pat)]
+    if not _PR_SUMMARY_LINE.search(body):
+        missing.insert(0, "a '**Summary:**' first line")
+    if missing:
+        return (
+            "the PR description does not follow the Turma PR summary standard — "
+            f"missing: {', '.join(missing)}. Required, in order: a "
+            "'**Summary:**' line, then '## Why', '## What changed', '## Risk', "
+            "'## Testing', '## Follow-ups' (see the PR summary standard in your "
+            "system prompt). Pass the description inline (--body/--description, "
+            "or a heredoc) or with --body-file so it can be checked — --fill and "
+            "the editor can't be."
+        )
     return None
 
 

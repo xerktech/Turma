@@ -4664,8 +4664,9 @@ SANDBOX_DOMAIN_FLOOR = (
 # classifier. Residual: the test-runner rules run SESSION-EDITABLE code (the
 # `./gradlew` script, package.json scripts, conftest.py, test modules) past
 # both the classifier and the guard, which sees only the runner's command line,
-# so a session can still reach main or credentials through a script it writes.
-# Dropping the git rules closed the DIRECT route, not every route. Residual too:
+# so a session can still reach main or credentials through a script it writes —
+# or with no file at all: `node --test --import 'data:text/javascript,…'` (or
+# `--require`) runs INLINE code in one unprompted command. Dropping the git rules closed the DIRECT route, not every route. Residual too:
 # the `gh pr create`/`gh pr edit` rules post whatever body the command names
 # past the classifier, which would otherwise see a credential path. The guard's
 # PR-standard check reads the body but is no credential filter: it now refuses
@@ -4676,7 +4677,8 @@ SANDBOX_DOMAIN_FLOOR = (
 # under `TURMA_PR_SUMMARY=0`, still posts that file unless Claude Code's prefix
 # match refuses the substitution (unmeasured — the real-host spike). A stdin
 # body (`-F -`) must be the PR command's own heredoc with no other fd-0 input,
-# so `-F - <<EOF … < hosts.yml` is refused too.
+# so `-F - <<EOF … < hosts.yml` is refused too, and a body FILE is checked
+# alone, so a heredoc gh never reads cannot vouch for `--body-file hosts.yml`.
 # `TURMA_TOOL_ALLOW` (CSV) REPLACES the list when set non-blank; keep git rules
 # out of it for the same reason. It splits on every comma with no escape, so a
 # rule whose pattern holds a comma cannot be set through it. Distinct from `TURMA_TOOL_GRANTS`, which only
