@@ -98,6 +98,10 @@ whose deployment-branch policy admits only `main`; the public half is a write
 deploy key titled `turma-release-bump (XERK-1542)` on this repo. Never add it as
 a repo-level secret — any branch's workflow could read it and push past the
 checks. Without it the bump job fails by name. Revoke by deleting the deploy key.
+The bypass is granted to deploy keys as a type, so **any** write deploy key added
+to this repo can also push past the checks — keep this the only one. Create the
+environment (with its `main` policy) before the first real minor/major: a running
+job auto-creates a missing environment with no branch policy.
 
 ## Dry run
 

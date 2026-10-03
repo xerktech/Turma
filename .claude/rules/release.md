@@ -108,6 +108,7 @@ paths:
   - Its only bypass actor is **deploy keys**: `bump` pushes `VERSION`/`CHANGELOG` straight to main
     with `RELEASE_BUMP_DEPLOY_KEY`, after the release's own code-scan passed.
   - A repository ruleset cannot name GitHub Actions as a bypass actor (422), hence the key.
+  - The bypass is by actor TYPE: never add another write deploy key to this repo.
   - The key lives in the `release-bump` Environment (main-only), never as a repo secret — same
     reasoning as `ARGOCD_DEPLOY_KEY`.
 - **Instruction file size limits** — `CLAUDE.md` + every `.claude/rules/*.md` must stay under 40,000
