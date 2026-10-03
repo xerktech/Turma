@@ -2,10 +2,15 @@
 Description=Periodic Turma agent self-update
 
 [Timer]
-# First check shortly after boot, then hourly. Persistent catches up a check
-# missed while the WSL distro was shut down.
+# First check shortly after boot, then hourly on the WALL CLOCK. Never a
+# monotonic OnUnitActiveSec: it counts from the service's last activation, which
+# the user manager forgets when it restarts — after that (OnBootSec long past)
+# the timer sits `elapsed` with no next run, and the host silently stops
+# self-updating (seen on TrueNAS, XERK-1266). A calendar trigger cannot elapse.
+# Persistent catches up a check missed while the box (or WSL distro) was down.
 OnBootSec=10min
-OnUnitActiveSec=1h
+OnCalendar=hourly
+RandomizedDelaySec=10min
 Persistent=true
 
 [Install]

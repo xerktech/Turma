@@ -112,6 +112,11 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     contended poll strand the host for an hour and sustained contention strand it forever. The retry
     is capped at `INTERVAL` and floored at 1s; `note_agent_check`'s `STRAND_WARN_AT` escalation still
     fires. Tests: cases 37–39 in `test_turma_agent_update.sh`.
+  - **The update timer is WALL-CLOCK (`OnCalendar=hourly`), never `OnUnitActiveSec`** (XERK-1266).
+    A monotonic trigger counts from the service's last activation, which the user manager forgets on
+    restart; with `OnBootSec` past, the timer sat `elapsed` and the host silently stopped updating.
+    `install.sh` is not the only writer: `refresh_update_timer` rewrites an installed timer that
+    differs from the payload's (reload + restart), so a timer fix reaches existing hosts.
   - **A run cannot WEDGE holding the lock (XERK-549)** — a hung child once held it forever (a
     network/subprocess call that outran its own `timeout`), stranding the host on a stale build
     silently. Three guards, all in `with_lock`/`run_locked`:
