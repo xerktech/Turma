@@ -49,10 +49,14 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 
 - `_session_directive` appends `WAKE_SYSTEM_PROMPT` (`wake_directive()`) for a CLAUDE session:
   "do not sleep in a shell: run `python3 -SsE <cli> wake <N>m <what to check>` and end the turn".
-- **It names the CLI by its ABSOLUTE path** (`shlex.quote(session_cli_path())`), never
+- **It names the CLI by its ABSOLUTE path** (`session_cli_path()`), never
   `"$TURMA_SESSION_CLI"`: the allow rule matches command TEXT, so only the absolute spelling is
   known to match `session_cli_allow_rule` (`TestSessionDirective` pins the prefix). That settles
-  the spike's spelling question by construction; the Windows interpreter one stays open.
+  the spike's spelling question for a SHELL-SAFE path; the Windows interpreter one stays open.
+- **A path that needs shell quoting is NOT taught** (`wake_directive` returns ""): quoted in the
+  command but raw in the rule, the two never match and every wake would prompt. That withholds it
+  on every Windows agent (backslashes) and any POSIX install path with a space — part of the open
+  Windows spike below.
 
 ## Guard bookkeeping
 

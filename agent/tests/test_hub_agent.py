@@ -17275,6 +17275,17 @@ class TestSessionDirective(ManagerMixin, unittest.TestCase):
         prefix = ha.session_cli_allow_rule()[len("Bash("):-len(":*)")]
         self.assertTrue(cmd.startswith(prefix + " wake "), (cmd, prefix))
 
+    def test_a_path_that_needs_quoting_is_not_taught(self):
+        """Quoted in the command but raw in the rule, the two never match, so a
+        Windows path or one with a space withholds the paragraph instead."""
+        for path in (r"C:\Program Files\turma\hooks\session_cli.py",
+                     "/home/john doe/turma-agent/hooks/session_cli.py"):
+            self.assertEqual(ha.wake_directive(path), "", path)
+        safe = "/opt/turma-agent/hooks/session_cli.py"
+        cmd = ha.wake_directive(safe).split("`")[1]
+        prefix = ha.session_cli_allow_rule(safe)[len("Bash("):-len(":*)")]
+        self.assertTrue(cmd.startswith(prefix + " wake "), (cmd, prefix))
+
     def test_dsh_and_qwen_are_not_taught_the_cli(self):
         sm = self.make_manager()
         for rt in ("dsh", "qwen"):

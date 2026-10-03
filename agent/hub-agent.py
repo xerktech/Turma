@@ -4133,6 +4133,10 @@ that is not in it is not yours to contact.
 # hub can only call stalled. {cli} is the ABSOLUTE CLI path, spelled exactly as
 # `session_cli_allow_rule` names it, so the call matches that allow rule and never
 # prompts (the "$TURMA_SESSION_CLI" spelling may not match a command-text rule).
+# That holds only for a SHELL-SAFE path: one that needs quoting (every Windows
+# path, a POSIX path with a space) would be taught quoted while the rule names it
+# raw, so `wake_directive` withholds the paragraph there rather than teach a call
+# that prompts on every wake.
 # Claude sessions only: dsh/qwen launches export neither TURMA_SESSION_ID nor
 # TURMA_SESSION_CLI yet, so the CLI would refuse there (agent-session-cli.md).
 WAKE_SYSTEM_PROMPT = """
@@ -4458,8 +4462,13 @@ def session_cli_allow_rule(cli_path=None):
 
 def wake_directive(cli_path=None):
     """The wake paragraph of the session directive (XERK-1571), naming the CLI
-    exactly as the allow rule does (``session_cli_allow_rule``)."""
-    return WAKE_SYSTEM_PROMPT.format(cli=shlex.quote(cli_path or session_cli_path()))
+    exactly as the allow rule does (``session_cli_allow_rule``). Empty when the
+    path is not shell-safe: the taught command would carry it quoted, the rule
+    raw, and the two would never match (a session then just isn't taught)."""
+    cli = cli_path or session_cli_path()
+    if shlex.quote(cli) != cli:
+        return ""
+    return WAKE_SYSTEM_PROMPT.format(cli=cli)
 
 
 def qwen_ask_mcp_path():
