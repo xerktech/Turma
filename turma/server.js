@@ -12265,9 +12265,10 @@ function holdQueued(e, reason, error) {
 }
 
 // Hand the highest-priority waiting tickets to whichever hosts can actually
-// start them. Visit order (XERK-485 [E]): within an org's line the priority key
-// — triage band -> type weight -> repo tier -> FIFO — decides, and across orgs
-// the lines interleave round-robin so one backlog can't starve another.
+// start them. Visit order (XERK-485 [E]): within an org's line the sort key
+// — P0 -> oldest created -> type weight -> repo tier -> FIFO (XERK-1567) —
+// decides, and across orgs the lines interleave round-robin so one backlog
+// can't starve another.
 // Runs on every heartbeat (a beat is when capacity changes) and on the 15s
 // sweep, so a freed slot is filled within a beat rather than a sweep interval.
 //

@@ -176,5 +176,5 @@ Drain order is the stable sort on `triageSortKey(row, repo)` =
 - `board.test.js`: `triageLaneOf`/`triageActionOf` placement, the lane-gathering `boardHtml` case,
   chip/field/picker units, "a live drag beats the Triage lane".
 - `server.test.js`: the `/triage` and `/triage-policy` routes, `triageGateReason`,
-  `triageSortKey`/drain order (incl. the `XERK-1567:` oldest-first case), the policy knobs + P0 preemption, hold/reject drops, and the
-  `priority-writeback` sweep cases (XERK-483).
+  `triageSortKey`/drain order (incl. the `XERK-1567:` oldest-first case), the policy knobs +
+  P0 preemption, hold/reject drops, and the `priority-writeback` sweep cases (XERK-483).
