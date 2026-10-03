@@ -1342,7 +1342,19 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                     "eval 'echo ${y:- #}; rm -rf /'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
-        # A real comment after a closed expansion still hides its text.
+        # A quoted or nested `}` does not close the expansion, so the `#`
+        # after it is still inside the braces.
+        for cmd in ("echo ${a:-'}' #}; rm -rf /", "echo ${a:=\"}\" #}; rm -rf /",
+                    "echo ${a:-${b:-'}'} #}; rm -rf /", "echo ${a:-$'\\x7d' #}; rm -rf /",
+                    "echo ${a:-$(echo }) #}; rm -rf /", "echo ${a:-`echo }` #}; rm -rf /",
+                    "bash -c \"echo \\${a:-'}' #}; rm -rf /\"",
+                    "eval \"echo \\${a:-'}' #}; rm -rf /\"",
+                    "eval 'echo ${a:-$(echo }) #}; rm -rf /'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A real comment after a closed expansion still hides its text, and
+        # `$$` is the PID: `$${` opens nothing.
+        self.assertAllowed("echo $${ #; rm -rf /")
         self.assertAllowed("echo ${HOME} # rm -rf /")
         self.assertAllowed("echo ${#x} ${x#*/}; ls")
 

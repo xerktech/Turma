@@ -386,8 +386,7 @@ def _quote_states(command: str) -> list[str]:
     while i < n:
         ch = command[i]
         top = stack[-1] if stack else ""
-        # Inside `${…}` a `#` is text, never a comment: `${y:- #}` (XERK-1585).
-        if ch == "#" and top not in ('"', "p") and _is_comment(command, i):
+        if ch == "#" and top != '"' and _is_comment(command, i):
             end = command.find("\n", i)
             end = n if end < 0 else end
             out[i:end] = ["#"] * (end - i)
@@ -400,14 +399,6 @@ def _quote_states(command: str) -> list[str]:
         if command.startswith("$(", i):
             stack.append("(")
             i += 2
-            continue
-        if top != '"' and command.startswith("${", i):
-            stack.append("p")
-            i += 2
-            continue
-        if ch == "}" and top == "p":
-            stack.pop()
-            i += 1
             continue
         if top == '"':
             out[i] = '"'
@@ -811,6 +802,56 @@ def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
     return any((m.group(1) or m.group(3)) in vals for m in _VAR_USE_RE.finditer(value))
 
 
+def _brace_end(command: str, i: int) -> int:
+    """Index of the `}` closing the `${` at ``i``, or -1 if it never closes.
+
+    Quotes, `$(…)`, backticks and nested `${…}` inside the braces hide a `}`,
+    as they do from bash: `${a:-'}'}` and `${a:-$(echo })}` are one expansion.
+    """
+    stack = ["{"]
+    j, n = i + 2, len(command)
+    while j < n:
+        ch = command[j]
+        top = stack[-1]
+        if ch == "\\":
+            j += 2
+            continue
+        if top == "`":
+            if ch == "`":
+                stack.pop()
+            j += 1
+            continue
+        if top == '"':
+            if ch == '"':
+                stack.pop()
+            elif command.startswith(("${", "$("), j):
+                stack.append(command[j + 1])
+                j += 1
+            elif ch == "`":
+                stack.append("`")
+            j += 1
+            continue
+        if ch == "'" or command.startswith("$'", j):
+            ansi = ch == "$"
+            j += 2 if ansi else 1
+            while j < n and command[j] != "'":
+                j += 2 if ansi and command[j] == "\\" else 1
+            j += 1
+            continue
+        if command.startswith(("${", "$("), j):
+            stack.append(command[j + 1])
+            j += 2
+            continue
+        if ch in ('"', "`"):
+            stack.append(ch)
+        elif (ch == "}" and top == "{") or (ch == ")" and top == "("):
+            stack.pop()
+            if not stack:
+                return j
+        j += 1
+    return -1
+
+
 def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> str:
     """Inline variables the command line sets itself.
 
@@ -822,9 +863,15 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     if vals is None:
         vals = _var_values(command)
 
-    states = _quote_states(command) if "$" in command and (vals or "${" in command) else []
+    states = _quote_states(command) if vals and "$" in command else []
 
     def rep(m: "re.Match[str]") -> str:
+        if m.group(1) and _brace_end(command, m.start()) != m.end() - 1:
+            # `[^}]*` stopped at a `}` that is quoted or nested — in
+            # `${a:-'}' #}` the expansion runs on to the last `}`. Splicing the
+            # short match left the `#` bare, a comment hiding the rest of the
+            # line (XERK-1585); the raw text is read as one word instead.
+            return m.group(0)
         name = m.group(1) or m.group(3) or ""
         got = vals.get(name)
         op = _VAR_OP_RE.match(m.group(2) or "")
@@ -842,9 +889,6 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
             # the `rm` a comment. The `#` was a word inside the braces; keep it
             # one (XERK-1585). Quotes and `$(…)` in the default stay live.
-            state = states[m.start()] if m.start() < len(states) else ""
-            if state == '"':
-                return op.group(2)
             return re.sub(r"(?<!\\)#", r"\\#", op.group(2))
         return m.group(0)
 
@@ -1085,9 +1129,10 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
     want_in = False
     in_pattern = False
     pat_parens = 0
-    # Open `${…}` expansions: a `#` inside one is text, so `${y:- #}; rm -rf /`
-    # must not hide the `rm` as a comment (XERK-1585).
-    braces = 0
+    # Open `${…}` expansions, and the `$(` groups inside them: a `#` inside one
+    # is text, so `${y:- #}; rm -rf /` must not hide the `rm` as a comment, and
+    # the `}` in `${a:-$(echo }) #}` closes nothing (XERK-1585).
+    braces: list[str] = []
     i, n = 0, len(command)
 
     def flush() -> None:
@@ -1120,13 +1165,17 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
             buf.append(command[i + 1])
             i += 2
             continue
-        if command.startswith("${", i):
-            braces += 1
-            buf.append("${")
+        if command.startswith(("$$", "${", "$("), i) and (braces or command[i + 1] in "{$"):
+            # `$$` is the PID, so `$${` opens nothing.
+            if command[i + 1] != "$":
+                braces.append(command[i + 1])
+            buf.append(command[i:i + 2])
             i += 2
             continue
-        if ch == "}" and braces:
-            braces -= 1
+        if braces and ch == "}" and braces[-1] == "{":
+            braces.pop()
+        elif braces and ch == ")" and braces[-1] == "(":
+            braces.pop()
         elif ch == "#" and not braces and _is_comment(command, i):
             end = command.find("\n", i)
             i = n if end < 0 else end
@@ -1326,6 +1375,18 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     return out
 
 
+def _script_readings(script: str) -> list[str]:
+    """``script`` as a word shlex produced, and again with `\\${` unescaped.
+    Inside `"…"` bash drops that backslash and shlex keeps it, so
+    `bash -c "echo \\${a:-'}' #}; rm -rf /"` reached the re-parse with an
+    escaped `$` and its `#` read as a comment (XERK-1585). The token no longer
+    says which quoting it came from; reading both fails closed. Only `${`: an
+    escaped `$(` or backtick is already classified where it sits, and
+    unescaping those too nested real scripts past _MAX_EXPAND_DEPTH."""
+    plain = script.replace("\\${", "${")
+    return [script] if plain == script else [script, plain]
+
+
 def _expand_segments(command: str, depth: int = 0,
                      cwds: tuple[str, ...] = ()) -> list[tuple[list[str], str]]:
     """Every command ``command`` would actually run, as (tokens, segment) pairs.
@@ -1420,6 +1481,17 @@ def _expand_segments(command: str, depth: int = 0,
         bare = _unwrap_group(_SUBST_RE.sub(lambda m: _subst_text(m, glued_empty=True), raw))
         if bare != seg and bare:
             out.extend(_expand_segments(bare, depth + 1, cwds))
+        # An `eval`'s words joined as eval re-parses them, read off the RAW
+        # segment (XERK-1585). The substitution pass above swallowed a QUOTED
+        # `'$('` that the join makes live (`eval echo '$(' rm -rf / ')'`), and
+        # collapsing `eval eval …` (below) skipped a parse: the `\\\;` in
+        # `eval eval echo \\\; rm -rf /` is an operator only to the SECOND
+        # eval, which this reaches by recursing once per eval (bounded by
+        # _MAX_EXPAND_DEPTH, which fails closed).
+        words = _strip_prefixes(_tokenize(_unwrap_group(raw)))
+        if len(words) > 1 and _basename(words[0]) == "eval":
+            for script in _script_readings(" ".join(words[1:])):
+                out.extend(_expand_segments(script, depth + 1, every_cd))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
             if _SEGMENT_SPLIT.search(seg):
@@ -1440,7 +1512,8 @@ def _expand_segments(command: str, depth: int = 0,
         if prog in _SHELL_PROGS:
             i = _shell_c_index(rest)
             if i >= 0 and i + 1 < len(rest):
-                out.extend(_expand_segments(rest[i + 1], depth + 1, every_cd))
+                for script in _script_readings(rest[i + 1]):
+                    out.extend(_expand_segments(script, depth + 1, every_cd))
         elif prog == "eval" and rest:
             # `eval eval eval … rm -rf /etc` is valid shell. Collapse the chain
             # ITERATIVELY — recursing once per `eval` burned the depth budget,
@@ -1474,18 +1547,6 @@ def _expand_segments(command: str, depth: int = 0,
                 #    escaped `\;` is an operator again (`eval echo \; rm -rf /`).
                 if len(inner) > 1:
                     out.extend(_expand_segments(" ".join(inner), depth + 1, every_cd))
-            # 4. ONE re-parse of the segment's own words, before substitution
-            #    stripping (XERK-1585). Collapsing `eval eval …` skipped a
-            #    parse: `eval eval echo \\\; rm -rf /` only becomes an operator
-            #    on the SECOND eval, which this reaches by recursing once per
-            #    eval (each level is bounded by _MAX_EXPAND_DEPTH, which fails
-            #    closed). And the substitution pass above swallowed a QUOTED
-            #    `'$('` that eval's join makes live: `eval echo '$(' rm -rf / ')'`.
-            words = _strip_prefixes(_tokenize(_unwrap_group(raw)))
-            if len(words) > 1 and _basename(words[0]) == "eval":
-                again = " ".join(words[1:])
-                if again != " ".join(inner):
-                    out.extend(_expand_segments(again, depth + 1, every_cd))
         elif prog == "alias" and rest:
             # `alias f='rm -rf *'` runs wherever `f` is used — after any `cd`.
             for tok in rest:
