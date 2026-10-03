@@ -421,7 +421,15 @@ def _quote_states(command: str) -> list[str]:
 # Not `printf`: `printf -v GIT_EDITOR '$(x)'; git commit` ASSIGNS what git
 # then runs through `sh -c` (Claude Code's shells export GIT_EDITOR).
 _QUOTED_TEXT_PROGS = {"echo"}
-_QUOTED_TEXT_GIT = {"commit"}
+# `git commit`'s options, EXACTLY — git accepts any unique prefix of a long
+# option, so `--trai 'k:$(x)'` is `--trailer`, whose configured
+# `trailer.<k>.command` splices the value into a shell command at `$ARG`
+# (proved with a touch marker). Matching what may NOT appear cannot keep up
+# with that; anything outside this set disqualifies the stage. Short options
+# cluster (`-am`), so those are checked letter by letter.
+_QUOTED_TEXT_GIT_LONG = {"--message", "--all", "--quiet", "--amend", "--allow-empty",
+                         "--no-verify", "--signoff", "--no-edit", "--verbose"}
+_QUOTED_TEXT_GIT_SHORT = set("aqnsv")
 _ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?=")
 _QUOTED_TEXT_GH = {("pr", "create"), ("pr", "edit"), ("pr", "comment"),
                    ("issue", "create"), ("issue", "edit"), ("issue", "comment")}
@@ -447,13 +455,27 @@ def _quoted_text_only(raw_tokens: list[str]) -> bool:
     if prog in _QUOTED_TEXT_PROGS:
         return True
     if prog == "git":
-        # `--trailer 'k:$(x)'`: a configured `trailer.k.command` splices the
-        # value into a SHELL command at `$ARG` (proved with a touch marker).
-        if any(t.startswith(("-c", "--config-env", "--exec-path", "--trailer"))
-               for t in tokens[1:]):
+        # `git commit` and nothing before it — a global option is config.
+        if tokens[1:2] != ["commit"]:
             return False
-        args = _git_args(tokens)
-        return bool(args) and args[0] in _QUOTED_TEXT_GIT
+        rest = iter(tokens[2:])
+        for tok in rest:
+            if tok == "--":
+                break
+            if tok.startswith("--"):
+                name = tok.split("=", 1)[0]
+                if name not in _QUOTED_TEXT_GIT_LONG:
+                    return False
+                if name == "--message" and "=" not in tok:
+                    next(rest, None)
+            elif tok.startswith("-") and len(tok) > 1:
+                # `-m` takes the rest of the cluster, or the next token, as its value.
+                head, m, value = tok[1:].partition("m")
+                if not set(head) <= _QUOTED_TEXT_GIT_SHORT:
+                    return False
+                if m and not value:
+                    next(rest, None)
+        return True
     if prog == "gh":
         return tuple(tokens[1:3]) in _QUOTED_TEXT_GH
     return False

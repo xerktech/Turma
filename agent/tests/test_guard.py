@@ -1018,6 +1018,8 @@ class TestParserGaps(unittest.TestCase):
         for cmd in (f"git commit -m '$({self.R})'", f"echo '`{self.R}`'",
                     f"gh pr create --title t --body '$({self.R})'",
                     f"(git commit -m '$({self.R})')",
+                    f"git commit -qam '$({self.R})'", f"git commit --message='$({self.R})' --no-verify",
+                    f"git commit -a -m x -m '$({self.R})'",
                     "echo \\$\\(rm -rf /\\)"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
@@ -1047,6 +1049,9 @@ class TestParserGaps(unittest.TestCase):
                     f"git commit -m '$({R})' && echo done",
                     # A configured trailer.<k>.command runs the value via sh.
                     f"git commit -m m --trailer 'k:$({R})'", f"git commit -m m --trailer='k:$({R})'",
+                    # git takes any unique prefix of a long option.
+                    f"git commit -m m --trai 'k:$({R})'", f"git commit -m m --tr='k:$({R})'",
+                    f"git -c x=y commit -m '$({R})'", f"git commit -C HEAD -m '$({R})'",
                     f"git tag -a t -m '$({R})'", "git commit -m x && git status '$(reboot)'",
                     f"echo \"$(sh -c 'echo $({R})')\"",
                     f"for i in 1; do printf '$({R})'; done | sh"):
