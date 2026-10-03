@@ -219,7 +219,7 @@ class SessionsTest {
             sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "XERK-121"))),
         )
         // No repo (repos-root) or no branch (detached) still reads cleanly.
-        assertEquals("truenas · detached", sessionHeaderMeta("truenas", SessionInfo(repo = "")))
+        assertEquals("truenas · detached", sessionHeaderMeta("truenas", SessionInfo(repo = "", git = GitState(branch = "HEAD"))))
         assertEquals(
             "truenas · Turma · detached",
             sessionHeaderMeta("truenas", SessionInfo(repo = "Turma", git = GitState(branch = "HEAD"))),
