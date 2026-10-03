@@ -2169,7 +2169,7 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             # `cat > "$S/b.md"` — so whatever _split_heredocs reads as a heredoc
             # counts (an unrelated one, or `<<EOF` text inside a quoted title):
             # the accepted residual, since it takes a model gaming its own guard.
-            heredocs = [b for _owner, b in _split_heredocs(command)[1]]
+            heredocs = [b for _owner, b, _quoted in _split_heredocs(command)[1]]
         body = "\n".join(bodies + heredocs + [_read_text(_join_path(cwd, f)) for f in files])
         sections = _repo_template_sections(_repo_root(cwd))
         if sections is not None:
