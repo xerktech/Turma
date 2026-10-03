@@ -8805,6 +8805,14 @@ function coerceLiveSignals(live) {
     if (k in live && !wireInt32(live[k])) delete live[k];
   }
   if ("transcriptAgeSec" in live && !wireDouble(live.transcriptAgeSec)) delete live.transcriptAgeSec;
+  // A session-CLI wake request (XERK-1564): epoch ms + a short reason. Absent =
+  // no wake pending; never repaired into a plausible time. No client renders
+  // it yet, but a client that types it later must not decode junk.
+  if ("wakeAt" in live && !(Number.isSafeInteger(live.wakeAt) && live.wakeAt > 0)) delete live.wakeAt;
+  if ("wakeReason" in live) {
+    if (typeof live.wakeReason === "string") live.wakeReason = live.wakeReason.slice(0, 200);
+    else delete live.wakeReason;
+  }
   coerceStringList(live, "questionOptions");
   coerceStringList(live, "newPrUrls");
   coerceObjectList(live, "questionOptionsRich"); // QuestionOption leaves are all Strings

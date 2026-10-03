@@ -4860,6 +4860,9 @@ class ManagerMixin:
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
+            # Derived from REGISTRY_DIR at import; kill/delete rmtree a session's
+            # request dir (XERK-1564), so it must never be the host's real one.
+            ("SESSION_REQUESTS_DIR", os.path.join(self.tmp, "session-requests")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
@@ -11217,6 +11220,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             ha._TMUX_ENV_STRIP +
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(ha.QUESTIONS_DIR)} "
+            f"TURMA_SESSION_CLI={shlex.quote(ha.session_cli_path())} "
             f"claude --session-id {sess['claudeSessionId']} "
             f"--remote-control {shlex.quote(sess['rcName'])} "
             f"--name {shlex.quote(sess['rcName'])} "
@@ -17211,6 +17215,182 @@ class TestModelActualPayload(ManagerMixin, unittest.TestCase):
         self.assertEqual(payload["permissionMode"], "plan")
         self.assertEqual(sess["permissionMode"], "plan")
         self.assertEqual(payload["pendingModel"], "sonnet")
+
+
+class TestWakeRequest(ManagerMixin, unittest.TestCase):
+    """XERK-1564: a session's `session_cli.py wake` file becomes wakeAt/wakeReason
+    on its record (surviving a manager restart), and the beat stages the wake-up
+    input once it is due, clearing the request."""
+
+    SID = "abcde"
+
+    def _sess(self, sm):
+        sess = {"id": self.SID, "status": "running", "repo": "Turma",
+                "repoPath": "/w/Turma", "worktreePath": os.path.join(self.tmp, "wt"),
+                "rcName": "rc", "tmuxName": f"agent-{self.SID}",
+                "claudeSessionId": "22222222-2222-4222-8222-222222222222"}
+        sm.registry = [sess]
+        return sess
+
+    def _wake_path(self, sid=None):
+        return os.path.join(ha.SESSION_REQUESTS_DIR, sid or self.SID, "wake.json")
+
+    def _write(self, data, sid=None):
+        path = self._wake_path(sid)
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as fh:
+            json.dump(data, fh)
+        return path
+
+    def _payload(self, sm, sess):
+        with mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            return sm._session_payload(sess, refresh=False)
+
+    def test_the_file_becomes_fields_on_the_record_and_the_wire(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._write({"wakeAt": 1_786_400_000_000, "reason": "  check\n CI  "})
+        payload = self._payload(sm, sess)    # the REAL session_report reads it
+        self.assertEqual(sess["wakeAt"], 1_786_400_000_000)
+        self.assertEqual(sess["wakeReason"], "check CI")
+        self.assertEqual(payload["session"]["wakeAt"], 1_786_400_000_000)
+        self.assertEqual(payload["session"]["wakeReason"], "check CI")
+
+    def test_no_request_serves_no_fields(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        payload = self._payload(sm, sess)
+        self.assertNotIn("wakeAt", payload["session"])
+        self.assertNotIn("wakeReason", payload["session"])
+        self.assertNotIn("wakeAt", sess)
+
+    def test_the_input_is_staged_at_the_due_beat_and_the_request_cleared(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        at = 1_786_400_000_000
+        path = self._write({"wakeAt": at, "reason": "CI should be done."})
+        self._payload(sm, sess)
+        sm._deliver_due_wakes(now_ms=at - 1)          # not yet due
+        self.assertEqual(sm.input_queue, [])
+        self.assertTrue(os.path.exists(path))
+        sm._deliver_due_wakes(now_ms=at)              # due: staged once
+        self.assertEqual(sm.input_queue, [
+            (self.SID, "Wake-up: CI should be done. Check it and continue.", None)])
+        self.assertFalse(os.path.exists(path))
+        self.assertNotIn("wakeAt", sess)
+        self.assertNotIn("wakeReason", sess)
+        # A later beat neither re-reads a request nor stages it twice.
+        payload = self._payload(sm, sess)
+        sm._deliver_due_wakes(now_ms=at + 60_000)
+        self.assertEqual(len(sm.input_queue), 1)
+        self.assertNotIn("wakeAt", payload["session"])
+
+    def test_a_request_that_cannot_be_removed_fires_once(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        at = 1_786_400_000_000
+        self._write({"wakeAt": at, "reason": "r"})
+        self._payload(sm, sess)
+        with mock.patch.object(ha.os, "remove", side_effect=OSError("ro")):
+            sm._deliver_due_wakes(now_ms=at)
+        self._payload(sm, sess)                       # the file is still there
+        sm._deliver_due_wakes(now_ms=at + 1)
+        self.assertEqual(len(sm.input_queue), 1)
+
+    def test_a_newer_request_written_meanwhile_survives_delivery(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        at = 1_786_400_000_000
+        self._write({"wakeAt": at, "reason": "first"})
+        self._payload(sm, sess)
+        path = self._write({"wakeAt": at + 3_600_000, "reason": "second"})
+        sm._deliver_due_wakes(now_ms=at)
+        self.assertTrue(os.path.exists(path))
+        self._payload(sm, sess)
+        self.assertEqual(sess["wakeAt"], at + 3_600_000)
+
+    def test_a_stopped_session_is_not_woken(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess.update(status="stopped", wakeAt=1, wakeReason="r")
+        sm._deliver_due_wakes(now_ms=10)
+        self.assertEqual(sm.input_queue, [])
+
+    def test_a_manager_restart_keeps_a_pending_wake(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        at = 1_786_400_000_000
+        path = self._write({"wakeAt": at, "reason": "after restart"})
+        self._payload(sm, sess)
+        os.remove(path)            # the RECORD carries it, not only the file
+        sm2 = self.make_manager()
+        rec = sm2._find(self.SID)
+        self.assertEqual((rec["wakeAt"], rec["wakeReason"]), (at, "after restart"))
+        sm2._deliver_due_wakes(now_ms=at)
+        self.assertEqual(sm2.input_queue[0][1],
+                         "Wake-up: after restart. Check it and continue.")
+
+    def test_kill_and_delete_and_restart_clear_the_request_dir(self):
+        for how in ("kill", "delete", "restart"):
+            with self.subTest(how=how):
+                sm = self.make_manager()
+                sess = self._sess(sm)
+                if how == "delete":
+                    sess["status"] = "stopped"
+                    sess["root"] = True       # no worktree to remove
+                path = self._write({"wakeAt": 5, "reason": "r"})
+                with open(os.path.join(os.path.dirname(path), "close-ticket.json"),
+                          "w") as fh:
+                    json.dump({"resolution": "done", "note": "n"}, fh)
+                sess.update(wakeAt=5, wakeReason="r")
+                with mock.patch.object(sm, "_launch_tmux"), \
+                        mock.patch.object(sm, "_launch_ttyd"):
+                    getattr(sm, how)(self.SID)
+                self.assertFalse(os.path.exists(os.path.dirname(path)), how)
+                if how == "restart":
+                    self.assertNotIn("wakeAt", sess)
+                    self.assertNotIn("wakeReason", sess)
+
+    def test_a_symlinked_request_dir_is_unlinked_not_followed(self):
+        sm = self.make_manager()
+        self._sess(sm)
+        target = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(target)
+        keep = os.path.join(target, "keep.txt")
+        open(keep, "w").close()
+        os.makedirs(ha.SESSION_REQUESTS_DIR, exist_ok=True)
+        os.symlink(target, os.path.join(ha.SESSION_REQUESTS_DIR, self.SID))
+        sm._clear_session_requests(self.SID)
+        self.assertFalse(os.path.lexists(os.path.join(ha.SESSION_REQUESTS_DIR, self.SID)))
+        self.assertTrue(os.path.exists(keep))
+
+    def test_a_fifo_or_symlink_at_the_name_is_refused(self):
+        os.makedirs(os.path.dirname(self._wake_path()), exist_ok=True)
+        os.mkfifo(self._wake_path())
+        self.assertIsNone(ha.read_wake_request(self.SID))   # never blocks
+        os.remove(self._wake_path())
+        real = os.path.join(self.tmp, "real.json")
+        with open(real, "w") as fh:
+            json.dump({"wakeAt": 5, "reason": "r"}, fh)
+        os.symlink(real, self._wake_path())
+        self.assertIsNone(ha.read_wake_request(self.SID))
+
+    def test_unusable_requests_read_as_none(self):
+        for bad in ({"wakeAt": "soon"}, {"wakeAt": 1.5}, {"wakeAt": True},
+                    {"wakeAt": 0}, {"wakeAt": -5}, {"wakeAt": 2 ** 53}, {}, []):
+            with self.subTest(bad=bad):
+                self._write(bad)
+                self.assertIsNone(ha.read_wake_request(self.SID))
+        for sid in ("..", ".x", "a/b", "", None, 5):
+            self.assertIsNone(ha.read_wake_request(sid))
+
+    def test_the_reason_is_flattened_and_capped(self):
+        self._write({"wakeAt": 5, "reason": "a\n\tb" + "x" * 400})
+        got = ha.read_wake_request(self.SID)
+        self.assertTrue(got["wakeReason"].startswith("a b"))
+        self.assertEqual(len(got["wakeReason"]), ha.WAKE_REASON_MAX_CHARS)
+        self._write({"wakeAt": 5, "reason": 7})
+        self.assertIsNone(ha.read_wake_request(self.SID)["wakeReason"])
 
 
 class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
@@ -35898,6 +36078,7 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         # The env-assignment prefix the shell string carried becomes env entries.
         self.assertEqual(env["TURMA_SESSION_ID"], "w1")
         self.assertEqual(env["TURMA_QUESTIONS_DIR"], ha.QUESTIONS_DIR)
+        self.assertEqual(env["TURMA_SESSION_CLI"], ha.session_cli_path())
 
     def test_launch_tmux_merges_the_local_model_env_file_on_windows(self):
         # The `set -a; . <file>` failover source has no shell equivalent: the file
