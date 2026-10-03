@@ -478,10 +478,16 @@ _ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
 _BRACE_RE = re.compile(r"\{([^{}\s]+,[^{}\s]*)\}")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
 # inlined as `eval 'rm` (XERK-1256).
+# An unquoted `$(…)`/backtick value is one word too, blanks and all: cut at
+# its first blank, `x=$(echo 'rm -rf /'); $x` inlined as `$(echo` (XERK-1549).
 _VAR_ASSIGN_RE = re.compile(
     r"(?:^|[;\n&|]|\bexport\s+)\s*([A-Za-z_][A-Za-z0-9_]*)="
-    r"('[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n]+)"
+    r"('[^']*'|\"(?:[^\"\\]|\\.)*\"|(?:\$\([^()]*\)|`[^`]*`|[^\s;|&\n])+)"
 )
+# `printf -v NAME FORMAT [ARGS…]` assigns what printf would have printed, so
+# `printf -v x 'rm -rf /'; $x` runs it (XERK-1549).
+_PRINTF_V_RE = re.compile(r"\bprintf\s+-v\s*([A-Za-z_][A-Za-z0-9_]*)\s+([^;\n&|]+)")
+_PRINTF_SPEC_RE = re.compile(r"%(%|[-+ #0-9.]*[a-zA-Z])")
 _FOR_IN_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)")
 # `$NAME`, `${NAME}`, and the operator forms — `${d%/}`, `${d#x}`, `${d:0:4}`,
 # `${nope:-/etc}`. The operator matters less than the value it operates on: a
@@ -577,6 +583,14 @@ def _var_values(command: str) -> dict[str, list[str]]:
         words = [w for w in m.group(2).split() if w != "do"]
         if words:
             vals.setdefault(m.group(1), []).extend(words)
+    if "-v" in command:
+        for m in _PRINTF_V_RE.finditer(command):
+            try:
+                words = shlex.split(m.group(2))
+            except ValueError:
+                continue
+            if words:
+                vals.setdefault(m.group(1), []).append(_render_printf(words[0], words[1:]))
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
     # HERE, once, against the values that name none. Left in, every recursion
     # level re-inlined it, the text grew each time, and an ordinary command
@@ -589,6 +603,25 @@ def _var_values(command: str) -> dict[str, list[str]]:
         return " ".join(plain[name]) if name in vals else m.group(0)
 
     return {k: [_VAR_USE_RE.sub(resolve, v) for v in vs] for k, vs in vals.items()}
+
+
+def _render_printf(fmt: str, args: list[str]) -> str:
+    """Roughly what `printf FMT ARGS…` prints: each conversion takes the next
+    argument, and the format repeats while arguments remain, as bash's does.
+    Only the TEXT matters here, so every conversion is read as `%s`."""
+    fmt = fmt.replace("\\n", "\n").replace("\\t", "\t")
+    out: list[str] = []
+    rest = list(args)
+    for _ in range(8):  # bounded: a format with no conversion consumes nothing
+        def conv(m: "re.Match[str]") -> str:
+            if m.group(1) == "%":
+                return "%"
+            return rest.pop(0) if rest else ""
+        before = len(rest)
+        out.append(_PRINTF_SPEC_RE.sub(conv, fmt))
+        if not rest or len(rest) == before:
+            break
+    return "".join(out)
 
 
 def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
@@ -1084,6 +1117,9 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
         for tok in _tokenize(raw):
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
+    # The root a `cd` moved this line into, if it moved into one: `cd /; rm
+    # -rf *` deletes `/*`, which `rm` alone never names (XERK-1549).
+    cd_root: str | None = None
     for raw in segments:
         if suspect:
             # The group scan lost track, so a body it should have found may
@@ -1115,6 +1151,10 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
         out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
+        if prog == "cd":
+            cd_root = _cd_root(rest)
+        elif prog in ("rm", "unlink") and cd_root:
+            out.append(([tokens[0], *(_under_root(t, cd_root) for t in rest)], seg))
         if prog in _SHELL_PROGS:
             i = _shell_c_index(rest)
             if i >= 0 and i + 1 < len(rest):
@@ -1241,6 +1281,28 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
 
 # --- dangerous-path detection (for rm / chmod / chown) -------------------
 
+def _cd_root(args: list[str]) -> str | None:
+    """The protected root `cd ARGS` lands in — `/`, a system root or home —
+    else None. Only an EXACT root counts: below one, a relative `rm` names
+    the same path an absolute one would, which `_is_dangerous_path` already
+    judges, but a deeper cwd is ordinary work and an unknown one is unknown."""
+    ops = [a for a in args if not (a.startswith("-") and len(a) > 1)]
+    if not ops:
+        return "~"  # a bare `cd` goes home
+    target = _norm_path(ops[0])
+    low = target.lower().rstrip("/") or "/"
+    if low in _HOME_TOKENS or low in _SYSTEM_ROOTS:
+        return target.rstrip("/") or "/"
+    return None
+
+
+def _under_root(tok: str, root: str) -> str:
+    """An `rm` operand read from inside ``root``: relative ones are joined."""
+    if tok.startswith(("-", "/", "~", "$")):
+        return tok
+    return root.rstrip("/") + "/" + tok
+
+
 # Absolute roots whose recursive removal/permission-change destroys the host.
 _SYSTEM_ROOTS = (
     "/",
@@ -1327,6 +1389,9 @@ def _is_dangerous_path(tok: str) -> bool:
                        or re.match(r"^~[a-z0-9_][a-z0-9_.-]*$", stem)):
             return True
     if bare in _HOME_TOKENS or low in _HOME_TOKENS:
+        return True
+    # `~/*` is every file in the home directory, as `/*` is the root's.
+    if low.endswith("/*") and low[:-2] in _HOME_TOKENS:
         return True
     # `~root` / `~someuser` expand to that account's home, and `/root` is itself
     # a system root.

@@ -124,6 +124,12 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     runs the rest; a subshell's `)#` read as text only classifies more.
   - **An opaque substitution glued to a word is also read as EMPTY** (`glued_empty`): `$(true)rm`
     runs `rm`. A standalone one stays the placeholder — an empty word reads as the root.
+  - **A variable a producer filled is that producer's text** (XERK-1549): an unquoted
+    `x=$(…)`/`` x=`…` `` value is read whole, and `printf -v x FMT ARGS` binds the rendered
+    text (`_render_printf`), so `x=$(echo '<cmd>'); $x` classifies `<cmd>`.
+  - **A relative `rm` after `cd` into an EXACT protected root is joined to it** (`_cd_root`,
+    `_under_root`): `cd /; rm -rf *` is `rm -rf /*`. Only exact roots/home — a deeper cwd stays
+    unknown, and joining there would refuse ordinary `cd /usr/src/app && rm -rf build`.
   - **`_var_values` resolves a value naming an assigned variable once** (`d=$d/x`): left in, each
     recursion level re-inlined it until `_TOO_DEEP` refused an ordinary command.
   - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old vs

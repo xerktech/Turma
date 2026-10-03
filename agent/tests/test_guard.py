@@ -1092,6 +1092,53 @@ class TestParserGaps(unittest.TestCase):
         self.assertEqual(guard._var_values("d=/; d=$d/etc")["d"], ["/", "//etc"])
 
 
+class TestProducedScripts(unittest.TestCase):
+    """XERK-1549: a payload carried into execution by a variable a substitution
+    or `printf -v` filled, or a relative `rm` after `cd` into a protected root.
+    Each bypass ran its payload under real bash (touch marker)."""
+
+    R = "rm -rf /"
+
+    def assertDenied(self, cmd):
+        self.assertIsNotNone(guard.is_destructive(cmd), cmd)
+
+    def assertAllowed(self, cmd):
+        self.assertIsNone(guard.is_destructive(cmd), cmd)
+
+    def test_a_substitution_assigned_unquoted_is_one_value(self):
+        R = self.R
+        for cmd in (f"x=$(echo '{R}'); $x", f"x=$(printf '{R}'); $x",
+                    f"x=`echo '{R}'`; eval $x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("x=$(pwd)/build; rm -rf $x")
+
+    def test_printf_v_assigns_what_printf_prints(self):
+        for cmd in (f"printf -v x '{self.R}'; $x", "printf -v x '%s ' rm -rf /; $x",
+                    "printf -v x '%s %s %s' rm -rf /; eval \"$x\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("printf -v x '%s' hello; echo $x")
+        self.assertAllowed("printf -v x '%s/%s' /tmp build; rm -rf $x")
+
+    def test_a_relative_rm_after_cd_into_a_root_names_that_root(self):
+        for cmd in ("cd / && rm -rf *", "cd /; rm -rf *", "cd /etc; rm -rf ./*",
+                    "cd /usr && rm -r lib", "cd ~ && rm -rf *", "cd; rm -rf *",
+                    "cd -P / && rm -rf -- *"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("cd /tmp/x && rm -rf *", "cd / && rm -rf tmp/build",
+                    "cd /etc && ls", "cd ~ && rm -rf .cache",
+                    "cd /; cd /tmp/x; rm -rf *", "cd /repos/x && rm -rf node_modules"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_home_glob_is_the_home_directory(self):
+        self.assertDenied("rm -rf ~/*")
+        self.assertDenied("rm -rf $HOME/*")
+        self.assertAllowed("rm -rf ~/proj/build/*")
+
+
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
         for cmd in DESTRUCTIVE:
