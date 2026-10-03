@@ -178,13 +178,33 @@ jobs:
       && needs.plan.outputs.dry_run != 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    # main's ruleset requires the "Unit tests" check (XERK-1542), so a direct
+    # push of a fresh commit — which has no checks — is refused unless its pusher
+    # may bypass. Repository rulesets cannot name GitHub Actions as a bypass
+    # actor; deploy keys can. So this job pushes with a write deploy key held,
+    # like ARGOCD_DEPLOY_KEY, in a main-only Environment, never as a repo secret
+    # (readable by a workflow edited on any branch). The commit only touches
+    # VERSION + CHANGELOG.md and lands after this release's own code-scan passed.
+    environment: release-bump
     outputs:
       sha: ${{ steps.commit.outputs.sha }}
     steps:
+      # Without the key checkout silently falls back to GITHUB_TOKEN, and the
+      # push then dies on the ruleset with an error that names neither — fail
+      # here, by name, instead.
+      - name: Require the bump deploy key
+        env:
+          BUMP_KEY: ${{ secrets.RELEASE_BUMP_DEPLOY_KEY }}
+        run: |
+          if [ -z "$BUMP_KEY" ]; then
+            echo "::error::RELEASE_BUMP_DEPLOY_KEY is not set in the release-bump environment — the VERSION/CHANGELOG commit cannot bypass main's required checks. See RELEASING.md." >&2
+            exit 1
+          fi
       - uses: actions/checkout@v7
         with:
           fetch-depth: 0
           fetch-tags: true
+          ssh-key: ${{ secrets.RELEASE_BUMP_DEPLOY_KEY }}
       - uses: actions/setup-node@v5
         with:
           node-version: "24"

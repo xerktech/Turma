@@ -90,6 +90,19 @@ Run the **release** workflow from the Actions tab with `release_type: minor` (or
 `CHANGELOG.md` holds only these minor rollups; per-patch notes live on each
 release's GitHub page.
 
+The bump commit is pushed straight to `main`, which the `Default` ruleset only
+allows a deploy key to do (it requires the `Unit tests` check, and a fresh commit
+has none; a repository ruleset cannot exempt GitHub Actions). The private half is
+the secret **`RELEASE_BUMP_DEPLOY_KEY`** in the **`release-bump` Environment**,
+whose deployment-branch policy admits only `main`; the public half is a write
+deploy key titled `turma-release-bump (XERK-1542)` on this repo. Never add it as
+a repo-level secret — any branch's workflow could read it and push past the
+checks. Without it the bump job fails by name. Revoke by deleting the deploy key.
+The bypass is granted to deploy keys as a type, so **any** write deploy key added
+to this repo can also push past the checks — keep this the only one. Create the
+environment (with its `main` policy) before the first real minor/major: a running
+job auto-creates a missing environment with no branch policy.
+
 ## Dry run
 
 `workflow_dispatch` defaults `dry_run: true`. A dry run computes the version and
