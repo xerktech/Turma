@@ -475,7 +475,8 @@ data class Capacity(
     val maxSessions: Int = 0,
     val running: Int = 0,
     val queued: Int = 0,
-    val free: Int = 0,
+    // Null = the agent didn't say (hub drops a non-int); "can't tell", never full.
+    val free: Int? = null,
     val rootRunning: Boolean = false,
 )
 

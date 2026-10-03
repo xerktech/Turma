@@ -302,7 +302,26 @@ fun rankRunning(rows: List<FlatSession>, now: Long): LiveGroups {
 }
 
 /** An online host and the repos a new session can be spawned in on it. */
-data class SpawnHost(val key: String, val device: String, val repos: List<com.xerktech.turma.model.RepoInfo>)
+data class SpawnHost(
+    val key: String,
+    val device: String,
+    val repos: List<com.xerktech.turma.model.RepoInfo>,
+    val capacity: com.xerktech.turma.model.Capacity? = null,
+)
+
+/**
+ * "running / MAX_SESSIONS" beside a host in the New-session picker (web
+ * `hostCapHtml`), so the operator sees which host has room before queueing onto
+ * a full one; `full` reads `free` (slots used, broken included — XERK-1044), which
+ * is what decides start-vs-queue; a missing `free` is "can't tell", never full
+ * (the hub's hostHasFreeSlot). Null for an agent reporting no ceiling.
+ */
+data class HostCapLabel(val text: String, val full: Boolean)
+
+fun hostCapLabel(c: com.xerktech.turma.model.Capacity?): HostCapLabel? {
+    if (c == null || c.maxSessions <= 0) return null
+    return HostCapLabel("${c.running.coerceAtLeast(0)} / ${c.maxSessions}", c.free != null && c.free <= 0)
+}
 
 /**
  * The spawn picker's source list — mirrors the web sessions sidebar's "New
@@ -317,7 +336,7 @@ fun spawnTargets(agents: List<AgentInfo>): List<SpawnHost> =
             val repos = a.repos.filter { repo ->
                 !repo.root || a.sessions.none { it.root && it.status == "running" }
             }
-            SpawnHost(a.key, a.device.ifBlank { a.key }, repos)
+            SpawnHost(a.key, a.device.ifBlank { a.key }, repos, a.capacity)
         }
         .filter { it.repos.isNotEmpty() }
 

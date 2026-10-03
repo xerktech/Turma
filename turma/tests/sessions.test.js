@@ -214,7 +214,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " armTermWatch, disarmTermWatch, termWatchdog, getTermWatch: () => termWatch,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
       + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn,"
-      + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml,"
+      + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, hostCapHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
       + " setPendingSelectAt: (t) => { pendingSelectAt = t; }, SELECT_FOLLOW_MS };");
@@ -3397,4 +3397,32 @@ test("chat-card-shrink: chat.js still wraps rows in a display:contents div", () 
   const chat = fs.readFileSync(path.join(__dirname, "..", "public", "chat.js"), "utf8");
   assert.match(chat, /id="chatBody" style="display:contents"/,
     "the rows are wrapped in a display:contents div; the CSS guard is written for it");
+});
+
+// The New-session picker's "running / limit" beside each host: full off `free`
+// (slots used, broken included — XERK-1044), a missing `free` is "can't tell"
+// (the hub's hostHasFreeSlot read), and no ceiling shows no count at all.
+test("hostCapHtml: running / limit, full off free, nothing without a ceiling", () => {
+  const { hostCapHtml } = loadPage();
+  const room = hostCapHtml({ maxSessions: 8, running: 3, queued: 0, free: 5 });
+  assert.match(room, />3 \/ 8</);
+  assert.doesNotMatch(room, /hcap full/);
+  // A broken session holds a slot: running < max but free 0 is still full.
+  const broken = hostCapHtml({ maxSessions: 6, running: 5, queued: 2, free: 0 });
+  assert.match(broken, /class="hcap full"/);
+  assert.match(broken, />5 \/ 6</);
+  assert.match(broken, /2 queued/);
+  assert.doesNotMatch(hostCapHtml({ maxSessions: 5, running: 2 }), /hcap full/);
+  assert.match(hostCapHtml({ maxSessions: 4, running: -9, free: 4 }), />0 \/ 4</);
+  for (const c of [undefined, null, {}, { maxSessions: 0 }, { maxSessions: -3 }, { maxSessions: "x" }]) {
+    assert.equal(hostCapHtml(c), "");
+  }
+});
+
+test("render puts the capacity beside the host in the New-session picker", () => {
+  const p = loadPage();
+  const data = host([]);
+  data.host.capacity = { maxSessions: 6, running: 6, queued: 0, free: 0 };
+  p.beat({ now: data.now, agents: [data.host] });
+  assert.match(p.els.spawn.innerHTML, /<div class="hname">hostA <span class="hcap full"[^>]*>6 \/ 6<\/span><\/div>/);
 });

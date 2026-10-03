@@ -300,6 +300,8 @@
   details.spawn-wrap[open] > summary .chev { transform: rotate(180deg); }
   .spawn-body { padding: 10px 2px 4px; display: flex; flex-direction: column; gap: 10px; }
   .host-block .hname { font-weight: 600; font-size: 12.5px; margin-bottom: 7px; overflow-wrap: anywhere; }
+  .host-block .hcap { color: var(--muted); font-weight: 400; margin-left: 6px; font-variant-numeric: tabular-nums; }
+  .host-block .hcap.full { color: var(--critical); font-weight: 600; }
   /* Repos flow to fill the sidebar width, several per row (XERK-739), instead of
      one card per line. Each closed repo is sized to its button; an OPEN composer
      takes the whole row so its panel isn't crammed into a narrow column. */
@@ -2806,6 +2808,23 @@ function endedRow(e) {
   </div>`;
 }
 
+// "running / MAX_SESSIONS" beside a host in the New-session picker, so the
+// operator can see which host has room before queueing onto a full one. Marked
+// full off `free` (slots USED, broken sessions included — XERK-1044), not
+// running alone, since that is what decides whether a spawn starts or queues.
+// A missing `free` is "can't tell", never full — the same read as the hub's
+// hostHasFreeSlot. An agent reporting no ceiling shows nothing.
+function hostCapHtml(c) {
+  const max = Number(c && c.maxSessions);
+  if (!(max > 0)) return "";
+  const running = Math.max(0, Number(c.running) || 0);
+  const full = typeof c.free === "number" && c.free <= 0;
+  const queued = Math.max(0, Number(c.queued) || 0);
+  const title = `${running} running of ${max} session slots` +
+    (queued ? ` · ${queued} queued` : "") + (full ? " · full — a new session will queue" : "");
+  return ` <span class="hcap${full ? " full" : ""}" title="${esc(title)}">${running} / ${max}</span>`;
+}
+
 function hostBlock(a) {
   const repos = (a.repos || []).map(r => {
     const rk = a.key + "::" + r.name;
@@ -2821,7 +2840,7 @@ function hostBlock(a) {
     return `<div class="repo-item${open ? " open" : ""}">${btn}${panel}</div>`;
   }).join("");
   return `<div class="host-block">
-    <div class="hname">${esc(a.key)}</div>
+    <div class="hname">${esc(a.key)}${hostCapHtml(a.capacity)}</div>
     <div class="repo-btns">${repos}</div>
   </div>`;
 }
