@@ -1227,9 +1227,18 @@
   function ticketSessionIndex(agents) {
     const idx = new Map();
     const seen = new Set();          // "<host>\x00<transcriptId>" — dedupe key
+    // A host's session counts only for the org the hub decided that host into
+    // (XERK-1501) — the hub's startedTicketKeys counts it for no other, so a chip
+    // there would read "started" on a ticket the hub would still auto-start. The
+    // served `org` is "" for a drifted or never-bound host, which counts nowhere.
+    // An older hub serves no `org`: fall back to the claimed jira.siteKey, as
+    // mergeSites does; a host claiming nothing there is trusted as before.
+    const orgOf = (a) => a.org != null ? a.org : ((a.jira && a.jira.siteKey) || undefined);
     const add = (s, a) => {
       const t = s && s.ticket;
       if (!t || !t.key) return;
+      const org = orgOf(a);
+      if (org != null && (!t.siteKey || org !== t.siteKey)) return;
       const host = a.key || a.device;
       const tid = s.transcriptId;
       // Untranscripted records can't collide (nothing to key on) and are rare:

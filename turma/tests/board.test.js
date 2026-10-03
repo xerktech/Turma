@@ -1655,9 +1655,44 @@ test("ticketSessionIndex: the host is carried onto each session", () => {
 test("ticketSessionIndex: same key in two orgs never collides", () => {
   // Issue keys are only unique WITHIN a site, and the board is cross-org.
   const other = { ...tsess("s2", "X-1"), ticket: { key: "X-1", siteKey: "other.atlassian.net" } };
-  const idx = ticketSessionIndex([agent("hostA", block(), { sessions: [tsess("s1", "X-1"), other] })]);
+  const idx = ticketSessionIndex([
+    agent("hostA", block(), { sessions: [tsess("s1", "X-1")] }),
+    agent("hostB", block({ siteKey: "other.atlassian.net" }), { sessions: [other] }),
+  ]);
   assert.deepEqual(ticketSessionsOf(idx, "myorg.atlassian.net", "X-1").map(s => s.id), ["s1"]);
   assert.deepEqual(ticketSessionsOf(idx, "other.atlassian.net", "X-1").map(s => s.id), ["s2"]);
+});
+
+test("ticketSessionIndex: a host's session counts only for the org it is decided into (XERK-1501)", () => {
+  // Matches the hub's startedTicketKeys: a host bound to A reporting a ticket of
+  // B must not chip B-1, or the board says "started" on a ticket the hub would
+  // auto-start. Every channel is checked — live, closed and resumable.
+  const b1 = (id) => ({ ...tsess(id, "B-1"), ticket: { key: "B-1", siteKey: "B" } });
+  const hostA = agent("hostA", block({ siteKey: "A" }), {
+    org: "A", sessions: [b1("s1")], closedSessions: [b1("c1")],
+    repos: [{ name: "r", resumable: [{ transcriptId: "t9", ticket: { key: "B-1", siteKey: "B" } }] }],
+  });
+  assert.deepEqual(ticketSessionsOf(ticketSessionIndex([hostA]), "B", "B-1"), []);
+  // The hub serves org "" for a drifted (or never-bound) host: it counts nowhere,
+  // not even for the org it now claims.
+  const drifted = agent("hostD", block({ siteKey: "B" }), { org: "", sessions: [b1("s2")] });
+  assert.deepEqual(ticketSessionsOf(ticketSessionIndex([drifted]), "B", "B-1"), []);
+  // Decided into B: counts.
+  const bound = agent("hostB", block({ siteKey: "B" }), { org: "B", sessions: [b1("s3")] });
+  assert.deepEqual(ticketSessionsOf(ticketSessionIndex([bound]), "B", "B-1").map(s => s.id), ["s3"]);
+  // A ticket naming no org matches no host org — not even a drifted host's "".
+  const siteless = { ...tsess("s4", "B-9"), ticket: { key: "B-9" } };
+  const idx = ticketSessionIndex([agent("hostD", block({ siteKey: "B" }), { org: "", sessions: [siteless] })]);
+  assert.equal(idx.size, 0);
+});
+
+test("ticketSessionIndex: an older hub (no served org) falls back to the claimed siteKey", () => {
+  const b1 = { ...tsess("s1", "B-1"), ticket: { key: "B-1", siteKey: "B" } };
+  const claimsA = agent("hostA", block({ siteKey: "A" }), { sessions: [b1] });
+  assert.deepEqual(ticketSessionsOf(ticketSessionIndex([claimsA]), "B", "B-1"), []);
+  // Claiming no org at all on an older hub: nothing to check against, trusted.
+  const noJira = agent("hostN", undefined, { sessions: [b1] });
+  assert.deepEqual(ticketSessionsOf(ticketSessionIndex([noJira]), "B", "B-1").map(s => s.id), ["s1"]);
 });
 
 test("ticketSessionIndex: sessions read oldest first (branch order)", () => {
