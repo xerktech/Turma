@@ -2594,10 +2594,12 @@ _PR_PATH_READERS = frozenset(("cat", "head", "tail", "wc", "ls", "stat", "test",
 
 def _note_paths(tokens: list[str], segment: str, cwd: str,
                 written: set[str], named: set[str]) -> None:
-    """Record what a NON-PR segment does to paths before the PR command runs.
-    ``written``: a heredoc-only writer's outputs — `cat > f <<EOF` or
-    `tee f <<EOF` with no other input — the one way a description file may be
-    created by the same command. ``named``: every other path it mentions
+    """Record what a NON-PR segment of the command does to paths — before or
+    after the PR command, run or not: expansion keeps no source order or
+    condition. ``written``: a heredoc-only writer's outputs — `cat > f <<EOF`,
+    `cat >> f`, `tee [-a] f <<EOF` with no other input — the one way a
+    description file may be filled by the same command (which is why an
+    existing one must still pass alone). ``named``: every other path it mentions
     (`ln -sf /dev/stdin f`, `cp hosts.yml f`, `cat hosts.yml <<EOF > f`)."""
     words: list[str] = []
     outs: list[str] = []
@@ -2765,7 +2767,8 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     description must be the PR command's own heredoc — a `< file`, `<<<`, pipe
     or sibling heredoc is what gh would read instead. A description FILE fails
     closed: a regular file outside /dev and /proc, or one a heredoc writer
-    earlier in the command creates; any other path is refused. The rest of
+    in the command fills (an existing one must ALSO pass alone, since the
+    writer may append, not run, or run after gh); any other path is refused. The rest of
     the command text (titles, comments) never counts. A description pulled from
     somewhere else (``--fill``, the editor, ``$(cat file)``) can't be checked,
     so it is refused with a reason saying how to pass it."""
@@ -2814,6 +2817,7 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             )
         stdin = False
         texts: list[str] = []
+        current: list[tuple[str, str]] = []  # a writer's file as it is NOW
         from_writer = False
         for f in files:
             # FAIL CLOSED (XERK-1565): `-`/stdin under the own-heredoc rule, a
@@ -2822,7 +2826,7 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             kind, text = _pr_description_file(cwd, f)
             if kind != "stdin" and _pr_full_path(cwd, f) in named:
                 return (
-                    "an earlier part of the command names the description file "
+                    "another part of the command names the description file "
                     f"({f}) — it can replace or relink it before gh reads it, so "
                     "the file that is checked may not be the one that is sent. "
                     "Write it with cat > <path> <<'EOF' (or in an earlier step) "
@@ -2831,9 +2835,16 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             if kind == "stdin":
                 stdin = True
             elif kind in ("file", "missing") and _pr_full_path(cwd, f) in written:
-                # A heredoc writer in this command fills it: what is there
-                # NOW (a stale earlier body) is not what gh reads.
+                # A heredoc writer in this command fills it, so its heredoc
+                # is checked (below). But `written` keeps no order or
+                # condition: an APPENDING writer (`>>`, `tee -a`), one gated
+                # by `false &&`, or one in a later `(…)`/`$(…)` (expanded
+                # first) leaves what is there NOW in what gh reads, so an
+                # existing file must pass ALONE too — or `cat >> .env <<EOF`
+                # posted .env on the heredoc's sections (XERK-1565).
                 from_writer = True
+                if kind == "file":
+                    current.append((f, text or ""))
             elif kind == "file":
                 texts.append(text or "")
             elif kind == "device":
@@ -2880,8 +2891,8 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
         #   command is not mapped, so EVERY heredoc must pass on its own (two
         #   `gh pr edit N -F - <<EOF` pass; a good sibling can't vouch for a
         #   bad one);
-        # - an inline body or a file a heredoc writer creates is checked with
-        #   every heredoc. Matching a heredoc to the command it feeds (owner
+        # - an inline body or a file a heredoc writer fills is checked with
+        #   every heredoc (and an existing such file alone too, after this). Matching a heredoc to the command it feeds (owner
         #   line, redirect target) refused 26% of real compliant PR commands —
         #   `git push && gh pr create … <<EOF`, `cd x && …`, `cat > "$S/b.md"`
         #   — so an unrelated heredoc counts there: the accepted residual,
@@ -2901,6 +2912,16 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             reason = _pr_body_reason(body, cwd)
             if reason:
                 return reason
+        for f, body in current:
+            reason = _pr_body_reason(body, cwd)
+            if reason:
+                return (
+                    f"the description file ({f}) already exists and its current "
+                    "text fails the check — a heredoc in this command writes it, "
+                    "but an appending (>>, tee -a), conditional or later writer "
+                    "leaves that text in what gh reads. Remove it in an earlier "
+                    "step or write the description to a new path. " + reason
+                )
     return None
 
 

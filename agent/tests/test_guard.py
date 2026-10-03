@@ -2018,14 +2018,14 @@ class TestPrSummary(unittest.TestCase):
                 # The writer must be a heredoc-only `cat`/`tee`: `cat hosts.yml
                 # <<EOF > f` writes hosts.yml, and `ln`/`cp` relink or replace.
                 (f"cat hosts.yml <<'EOF' > n.md\n{g}\ngh pr create -t x -F n.md",
-                 "earlier part"),
+                 "another part"),
                 (f"cat hosts.yml > n.md; cat <<'EOF'\n{g}\ngh pr create -t x -F n.md",
-                 "earlier part"),
-                ("cp hosts.yml ok.md; gh pr create -t x -F ok.md", "earlier part"),
+                 "another part"),
+                ("cp hosts.yml ok.md; gh pr create -t x -F ok.md", "another part"),
                 # A printer's OUTPUT redirect still fills the file.
-                ("echo x > ok.md; gh pr create -t x -F ok.md", "earlier part"),
+                ("echo x > ok.md; gh pr create -t x -F ok.md", "another part"),
                 ("ln -sf /dev/stdin ok.md; cat hosts.yml | gh pr create -t x -F ok.md",
-                 "earlier part"),
+                 "another part"),
                 (f"cat hosts.yml | gh pr create -t x -F in.lnk; cat <<'EOF'\n{g}",
                  "standard input"),
                 # A regular FILE is checked ALONE: a heredoc gh never reads
@@ -2036,6 +2036,25 @@ class TestPrSummary(unittest.TestCase):
                 (f"cat > n.txt <<'EOF'\n{g}\ngh pr create -t x -F hosts.yml", "missing"),
                 # A writer REPLACES the file: its stale good body is not sent.
                 ("cat > ok.md <<'EOF'\nbad\nEOF\ngh pr create -t x -F ok.md", "missing"),
+                # A writer keeps no order or condition, so an EXISTING file
+                # must pass alone too: an appending, never-run or later writer
+                # leaves the token file in what gh reads.
+                (f"cat >> hosts.yml <<'EOF'\n{g}\ngh pr create --title x --body-file hosts.yml",
+                 "already exists"),
+                (f"tee -a hosts.yml <<'EOF'\n{g}\ngh pr create --title x --body-file hosts.yml",
+                 "already exists"),
+                (f"false && cat > hosts.yml <<'EOF'\n{g}\n"
+                 "gh pr create --title x --body-file hosts.yml", "already exists"),
+                (f"gh pr create --title x --body-file hosts.yml || (cat > hosts.yml <<'EOF'\n{g}\n)",
+                 "already exists"),
+                (f"gh pr create --title x --body-file hosts.yml && x=$(cat > hosts.yml <<'EOF'\n{g}\n)",
+                 "already exists"),
+                (f"gh pr edit 7 --body-file hosts.yml || (tee hosts.yml <<'EOF'\n{g}\n)",
+                 "already exists"),
+                (f"gh pr create --title x --body-file {self.repo}/hosts.yml || "
+                 f"(cat > {self.repo}/hosts.yml <<'EOF'\n{g}\n)", "already exists"),
+                # A path a LATER group names is not called "earlier".
+                ("gh pr create -t x --body-file ok.md; (cp ok.md /tmp/x)", "another part"),
                 # No source at all: a heredoc gh never reads can't stand in.
                 (f"gh pr create -t x --fill; cat <<'EOF'\n{g}", "missing"),
                 # Each stdin heredoc must pass on its own.
