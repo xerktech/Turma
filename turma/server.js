@@ -13147,14 +13147,17 @@ function orgsWithAutoMerge() {
 // class, so auto-merge follows them; there is no separate bug-only floor). Returns
 // {siteKey, key, row, repo} or null. `byKey` is the board's own row per ticket
 // (siteKey\x00key -> row) so eligibility reads the SAME triage block the board
-// shows, never `s.ticket` (which carries no triage).
-function autoMergeSession(s, byKey, rows) {
+// shows, never `s.ticket` (which carries no triage). `a` is the session's HOST
+// record: the ticket's siteKey is agent-asserted, so it must be the org the hub
+// BOUND that host to (`ticketOrgBound`, XERK-1445).
+function autoMergeSession(a, s, byKey, rows) {
   if (!s || s.status !== "running") return null;
   const t = s.ticket;
   if (!t || !t.key) return null;
   if (ticketAdopted(t)) return null;
   const siteKey = t.siteKey || "";
   if (!autoMergeOrgs[siteKey]) return null;
+  if (!ticketOrgBound(a, siteKey)) return null;
   const row = byKey.get(siteKey + "\x00" + t.key);
   if (!row) return null;                    // the board doesn't list it (yet)
   // A ticket a HUMAN moved to Done is a "stop / abandon this work" gesture
@@ -13180,6 +13183,17 @@ function ticketAdopted(t) {
   return !!t && t.adopted === true;
 }
 
+// May a session on `host` act hands-off on a ticket of org `siteKey`? Only when
+// the hub DECIDED that host is in that org (XERK-1445). `ticket.siteKey` is what
+// the agent typed, so without this a host bound to an org with auto-merge OFF
+// could name another org's ticket and have the hub merge its PR under that org's
+// opt-in (or an armed epic run's). Keyed on `decidedOrgOf`, never the claimed
+// `jira.siteKey` (XERK-348/349): a drifted or never-bound host reads "" and never
+// matches, so an empty siteKey can't match either.
+function ticketOrgBound(a, siteKey) {
+  return !!siteKey && decidedOrgOf(a) === siteKey;
+}
+
 function autoMergeRowIndex(rows) {
   const byKey = new Map();
   for (const { row, siteKey } of rows.values()) {
@@ -13199,12 +13213,13 @@ function autoMergeRowIndex(rows) {
 // autoMergeSession so the XERK-550 sweeps act on it with no other change; null if
 // the session is not an armed-run child. Disjoint from autoMergeSession by
 // construction (that one nulls on any epic child), so the two OR together safely.
-function epicRunChildSession(s, byKey, rows) {
+function epicRunChildSession(a, s, byKey, rows) {
   if (!s || s.status !== "running") return null;
   const t = s.ticket;
   if (!t || !t.key) return null;
   if (ticketAdopted(t)) return null;
   const siteKey = t.siteKey || "";
+  if (!ticketOrgBound(a, siteKey)) return null;   // XERK-1445
   const row = byKey.get(siteKey + "\x00" + t.key);
   if (!row) return null;                          // the board doesn't list it yet
   const epicKey = row.epicKey;
@@ -13401,8 +13416,8 @@ function autoMergeSweep() {
       // two are disjoint (autoMergeSession nulls on any epic child). Which one it
       // is decides the merge-readiness bar below (XERK-659): an armed epic child
       // also merges a mergeable no-CI PR, the org stream does not.
-      const viaEpicRun = !!epicRunChildSession(s, byKey, rows);
-      if (!(autoMergeSession(s, byKey, rows) || viaEpicRun)) continue;
+      const viaEpicRun = !!epicRunChildSession(a, s, byKey, rows);
+      if (!(autoMergeSession(a, s, byKey, rows) || viaEpicRun)) continue;
       // Act only on a session that has FINISHED its own turn — never mid-work
       // (it may still be pushing commits, which drops the PR out of "ready"
       // anyway) and never while it is blocked asking the operator something.
@@ -13529,8 +13544,8 @@ function autoCloseSweep() {
       // Either stream makes a session eligible; both react the same way now, so the
       // OR (disjoint by construction — the content gate nulls autoMergeSession on any
       // epic child) is all we need.
-      const elig = autoMergeSession(s, byKey, rows)
-        || epicRunChildSession(s, byKey, rows);
+      const elig = autoMergeSession(a, s, byKey, rows)
+        || epicRunChildSession(a, s, byKey, rows);
       if (!elig) continue;
       const prs = s.prs || [];
       if (!prs.length || !prs.every(prLanded)) continue;
