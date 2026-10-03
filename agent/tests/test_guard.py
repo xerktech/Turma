@@ -1528,6 +1528,7 @@ class TestPrSummary(unittest.TestCase):
         for cmd in ("gh pr view 12", "gh pr edit 12 --add-label x",
                     "glab mr update 3 --label x", "gh pr list",
                     "echo 'gh pr create --fill'", "git commit -m '## Why'",
+                    "gh pr -R o/r checkout create", "gh pr checkout create",
                     "az repos pr update --id 12 --status abandoned"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.reason(cmd))
@@ -1580,6 +1581,11 @@ class TestPrSummary(unittest.TestCase):
                "EOF\ngh pr create -t t -F /tmp/xerk-body.md")
         self.assertIsNone(self.reason(cmd))
 
+    def test_a_body_flag_before_the_verb_counts(self):
+        q = __import__("shlex").quote(GOOD_BODY)
+        self.assertIsNone(self.reason(f"gh pr -b {q} create -t x"))
+        self.assertIsNone(self.reason(f"glab mr -d {q} update 1"))
+
     def test_a_multiline_title_is_not_the_body(self):
         title = "x\n**Summary:** a\n## Why\n## What changed\n## Risk\n## Testing\n## Follow-ups"
         self.assertIsNotNone(self.reason(
@@ -1608,7 +1614,10 @@ class TestPrSummary(unittest.TestCase):
         for cmd in ("gh pr -R o/r create -b junk -t x", "gh pr --repo o/r create -b junk",
                     "gh pr --repo=o/r create -b junk", "gh pr -R o/r edit 1 -b junk",
                     "glab mr -R o/r create -d junk -t x", "glab mr --repo o/r create -d junk",
-                    "az repos pr --debug create --description junk"):
+                    "az repos pr --debug create --description junk",
+                    "gh pr -Ro/r edit 1 -b junk", "gh pr -R create edit 1 -b junk",
+                    "gh pr -b junk edit 1", "gh pr --body junk edit 1",
+                    "glab mr -d junk update 1"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self.reason(cmd))
 
@@ -1621,7 +1630,8 @@ class TestPrSummary(unittest.TestCase):
         for cmd in ("gh pr create --help", "gh pr create -h", "gh help pr create",
                     "glab mr create --help", "gh pr create --help 2>&1 | grep -i body",
                     "gh pr create -b junk --help", "az repos pr create -h 2>/dev/null",
-                    "gh pr create --title=x -h", "gh pr -R o/r create --help"):
+                    "gh pr create --title=x -h", "gh pr -R o/r create --help",
+                    "gh pr --help create", "gh pr -h create", "gh pr -R o/r --help create"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.reason(cmd))
 

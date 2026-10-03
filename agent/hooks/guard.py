@@ -1712,31 +1712,21 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
             or (_basename(tokens[0]) == "az" and "repos" not in head)):
         return None
     args = rest[rest.index(group) + 1:]
-    # Group-level flags may precede the verb (`gh pr -R o/r create`). One
-    # takes a value unless written `--flag=value` or followed straight by a
-    # verb (a boolean, e.g. `az repos pr --debug create`).
     verbs = (*creates, "edit", "update")
-    while args and args[0].startswith("-"):
-        boolean = "=" in args[0] or (len(args) > 1 and args[1] in verbs)
-        args = args[1:] if boolean else args[2:]
-    if not args:
-        return None
-    verb = args[0]
+    # ONE pass over everything after the group, because gh/glab accept any
+    # flag on either side of the verb (`gh pr -R o/r create`, `gh pr -b x edit
+    # 1`). A bare non-body flag may take the next token as its value, and which
+    # ones do differs per CLI, so that token is read as a value — unless it is
+    # a verb with no later verb (a boolean: `az repos pr --debug create`).
+    verb = subcommand = None
     bodies: list[str] = []
     files: list[str] = []
     seen_flag = False
-    i = 1
+    prev_bare = False  # the previous token was a flag that may take a value
+    i = 0
     while i < len(args):
-        # A help flag prints help wherever it sits — unless it is the VALUE of
-        # the flag before it (`-b -h`, `--label -h`), which the CLI sends as
-        # that value. Which flags take values differs per CLI and version, so
-        # after ANY bare flag it is read as a value: the check then runs, and
-        # the worst case is a refused `--web -h` that would only print help.
-        prev = args[i - 1]
-        if (args[i] in ("-h", "--help")
-                and not (prev.startswith("-") and "=" not in prev)):
-            return None
-        hit = _flag_value(args[i], body_flags)
+        arg = args[i]
+        hit = _flag_value(arg, body_flags)
         if hit:
             seen_flag = True
             flag, value = hit
@@ -1745,6 +1735,24 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
                 value = args[i]
             if value is not None:
                 (files if flag in ("-F", "--body-file") else bodies).append(value)
+            prev_bare = False
+        elif arg in ("-h", "--help") and not prev_bare:
+            # Help prints wherever it sits — unless it is the previous flag's
+            # VALUE (`--label -h`), which the CLI sends as that value. The cost
+            # of reading it so after ANY bare flag: a refused `--web -h`.
+            return None
+        elif arg.startswith("-") and len(arg) > 1:
+            prev_bare = "=" not in arg
+        else:
+            # The first POSITIONAL token is the subcommand (`checkout create`
+            # checks out a branch named create); a token after a bare flag is
+            # that flag's value instead.
+            is_value = prev_bare and not (
+                arg in verbs and not any(a in verbs for a in args[i + 1:]))
+            if subcommand is None and not is_value:
+                subcommand = arg
+                verb = arg if arg in verbs else None
+            prev_bare = False
         i += 1
     if verb in creates or (verb in ("edit", "update") and seen_flag):
         return bodies, [f for f in files if f and f != "-"]
