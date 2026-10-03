@@ -102,7 +102,8 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     `timeout … --locked-run` child) outlives the case's `rm -rf $root`, loses the fakes, installs
     the real release and runs the real `systemctl --user restart turma-agent`: TrueNAS restarted
     ~20 times in an hour. Stop a background updater with `stop_loop <pid> "$bin"` (reaps by the
-    case's escaped `$bin` path, not parentage). Keep the top-of-file host isolation: no bus and no
+    case's escaped `$bin` path, not parentage); the suite FAILS if any process outlives it (all
+    roots live under its private `TMPDIR`). Keep the top-of-file host isolation: no bus and no
     gh auth are NOT enough (the updater falls back to anonymous curl, then restarts via the
     installed `turma-agentctl` on the inherited `TURMA_*` env), so it also points every HTTP(S)
     request at a dead proxy and unsets `TURMA_AGENT_ENV`/`TURMA_TOKEN`/`TURMA_URL`. CI has no user

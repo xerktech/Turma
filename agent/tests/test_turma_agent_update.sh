@@ -37,6 +37,10 @@ ISOLATE="$(mktemp -d)"
 chmod 700 "$ISOLATE"
 trap 'rm -rf "$ISOLATE"' EXIT
 export XDG_RUNTIME_DIR="$ISOLATE" GH_CONFIG_DIR="$ISOLATE/gh"
+# Every case root (and the updater's own staging dirs) lands under ISOLATE, so
+# the end-of-suite orphan check below has one path to look for, and the EXIT
+# trap sweeps whatever a case forgot.
+mkdir -p "$ISOLATE/tmp"; export TMPDIR="$ISOLATE/tmp"
 export http_proxy=http://127.0.0.1:9 https_proxy=http://127.0.0.1:9 all_proxy=http://127.0.0.1:9
 export HTTP_PROXY="$http_proxy" HTTPS_PROXY="$https_proxy" ALL_PROXY="$all_proxy"
 unset no_proxy NO_PROXY DBUS_SESSION_BUS_ADDRESS GH_TOKEN GITHUB_TOKEN GH_ENTERPRISE_TOKEN \
@@ -1722,6 +1726,17 @@ EOF2
   rm -rf "$root" "$d"
 else
   pass "timer refresh cases skipped: no systemd on this runner"
+fi
+
+# Nothing this suite started may outlive it (XERK-1481): an orphan loses its
+# fakes when its case root goes and reaches for the real gh/systemctl. Fail on
+# one — so a stop_loop regression can't ship green — and reap it.
+iso_pat="$(printf '%s' "$ISOLATE" | sed 's/[][\.*^$+?(){}|]/\\&/g')"
+if pgrep -f "$iso_pat" >/dev/null; then
+  fail "processes outlived their case: $(pgrep -af "$iso_pat" | cut -c1-160 | tr '\n' ';')"
+  pkill -KILL -f "$iso_pat" 2>/dev/null || true
+else
+  pass "no process outlived its case"
 fi
 
 if [ "$FAILED" = 0 ]; then echo "ALL PASS"; else echo "FAILURES"; fi
