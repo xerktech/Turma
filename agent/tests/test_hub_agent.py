@@ -23553,7 +23553,22 @@ class TestPokeHeartbeat(unittest.TestCase):
     heartbeat loop's interval wait short so a just-queued command is picked up
     right away instead of up to a whole INTERVAL later."""
 
+    class _Hung(Exception):
+        pass
+
+    def _arm_deadline(self, secs):
+        # A poke regression (a blocking pipe end, a revert to Event) WEDGES rather
+        # than fails, so every test here runs under a SIGALRM that unwinds it into
+        # a named failure instead of a silent CI timeout.
+        def _deadline(*_):
+            raise self._Hung()
+        prev = signal.signal(signal.SIGALRM, _deadline)
+        self.addCleanup(signal.signal, signal.SIGALRM, prev)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_REAL, secs)
+
     def test_sigusr1_sets_the_poke_event_and_cuts_the_wait_short(self):
+        self._arm_deadline(30)
         prev = signal.getsignal(signal.SIGUSR1)
         signal.signal(signal.SIGUSR1, ha._on_sigusr1)
         self.addCleanup(signal.signal, signal.SIGUSR1, prev)
@@ -23584,34 +23599,23 @@ class TestPokeHeartbeat(unittest.TestCase):
         signal.signal(signal.SIGUSR1, ha._on_sigusr1)
         self.addCleanup(signal.signal, signal.SIGUSR1, prev)
 
-        class _Hung(Exception):
-            pass
-
-        def _deadline(*_):
-            raise _Hung()
-        prev_alrm = signal.signal(signal.SIGALRM, _deadline)
-        self.addCleanup(signal.signal, signal.SIGALRM, prev_alrm)
-        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
-
         sender = subprocess.Popen([sys.executable, "-c",
             "import os, signal, sys\n"
             "pid = int(sys.argv[1])\n"
             "for _ in range(50000): os.kill(pid, signal.SIGUSR1)\n",
             str(os.getpid())])
         self.addCleanup(sender.kill)
-        signal.setitimer(signal.ITIMER_REAL, 60)
+        self._arm_deadline(60)
         waits = 0
         try:
             while sender.poll() is None:
                 ha._poke.clear()
                 ha._poke.wait(0.001)
                 waits += 1
-        except _Hung:
+        except self._Hung:
             self.fail(f"the wait loop wedged under a SIGUSR1 burst after {waits} waits")
         except RecursionError:
             self.fail("a SIGUSR1 burst nested handlers into RecursionError")
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
         self.assertEqual(sender.returncode, 0)
         # The loop still works after the storm: a poke wakes it, quiet sleeps.
         ha._poke.clear()
@@ -23623,6 +23627,7 @@ class TestPokeHeartbeat(unittest.TestCase):
         # The pipe's capacity is finite; set() past it must drop (a poke is
         # already pending) rather than block — a blocked signal handler is the
         # very wedge this guards against.
+        self._arm_deadline(30)
         ha._poke.clear()
         self.addCleanup(ha._poke.clear)
         start = time.monotonic()
