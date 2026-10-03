@@ -13265,6 +13265,15 @@ test("XERK-1568: an armed epic run never starts, merges or messages a rollup chi
   autoMergeSweep();
   assert.equal((agents.rollE.commands || []).filter((c) => c.type === "mergePr").length, 0,
     `a rollup child's PR is never merged, got ${JSON.stringify(dCmds("rollE"))}`);
+  // Once that PR merges, the run's auto-close sweep never messages the rollup
+  // session to self-close either.
+  await asBeat("rollE", site, { autoStart: false,
+    capacity: { maxSessions: 6, running: 1, queued: 0, free: 4 },
+    tickets: tickets.map((t) => (t.key === "C-1" ? { ...t, statusCategory: "inprogress" } : t)),
+    sessions: [dChildSession("s-r1", "C-1", site, "MERGED", url)] });
+  autoCloseSweep();
+  assert.equal(inputTo("rollE", "s-r1").length, 0,
+    `a rollup child is never messaged to self-close, got ${JSON.stringify(dCmds("rollE"))}`);
   ticketQueue.length = 0;
   resetEpicRuns();
   resetEpicD();
