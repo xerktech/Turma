@@ -15741,6 +15741,8 @@ TICKET_TRIAGE_INSTRUCTION = (
     "- actionable: true only if it is concrete engineering work a coding "
     "session can start on; false for pure discussion, design, meeting, "
     "access-request, or blocked work.\n"
+    "- A ROLLUP ticket (summary starting '[Rollup]', or labelled 'rollup') "
+    "is a list of findings, not work: actionable is always false.\n"
     "- dedupeOf: the key of ANOTHER ticket listed below that this one "
     "duplicates, or null.\n"
     "- reason: at most 12 words.\n\n"

@@ -113,6 +113,10 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   live place in line) — any one means the child is already coming up, whether the sweep or a board
   click put it there. Also skips a child that isn't To Do, or has no triaged / ignore-tier repo
   (silently — re-checked next sweep, never a churny blocked note).
+- **A ROLLUP child (`isRollupTicket`, XERK-1568) is skipped silently and FOREVER** — never started,
+  and `epicRunChildSession` nulls it, so it is never merged or messaged either. The run cannot reach
+  `done` (every child must be Done) and anything the rollup Blocks never starts: **a rollup child
+  must be closed by hand.** Nothing on the run says why it sits in `running`, as with ignore-tier.
 - **It carries its OWN growing backoff (`epicChildAttempts`), the twin of auto-start's `autoStarted`
   (XERK-61/109) — the driver is a manual-source path, so `drainTicketQueue` never stamps `autoStarted`
   for it.** The hub ACKS a `spawnTicket` whether the agent ran it or refused it, so a child dispatched

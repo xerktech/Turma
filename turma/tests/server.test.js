@@ -198,7 +198,7 @@ const {
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
   epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, buildEpicWaves, epicChildRows,
-  isEpicOrEpicChild, sanitizeEpicRunRecord,
+  isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord,
   epicBuilders, armEpicBuilder, clearEpicBuilder, advanceEpicBuilder,
   ingestEpicBuilderStatus, epicBuilderDriveSweep, sanitizeEpicBuilderRecord,
   normalizeEpicBuilderStatus, EPIC_BUILDER_STATES, EPIC_BUILDER_IDEA_MAX,
@@ -12014,7 +12014,17 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
     { key: "CHORE-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: "chore", actionable: true } },
     { key: "RAW-1", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true } },
+    // XERK-1568: rollup tickets (by label, and by `[Rollup]` summary prefix — the
+    // latter operator-APPROVED, which must not force it in) gate out of both.
+    { key: "ROLL-1", statusCategory: "todo", labels: ["Turma", "rollup"],
+      summary: "Findings", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "bug", actionable: true } },
+    { key: "ROLL-2", statusCategory: "todo",
+      summary: "[Rollup] Turma: low-severity findings",
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "bug", actionable: true } },
   ];
+  setTicketTriageAction("xcheck.atlassian.net", "ROLL-2", "approve");
   await asBeat("xc", "xcheck.atlassian.net", { autoStart: true, tickets });
   setAutoMergeOrg("xcheck.atlassian.net", true);
   autoStartRound();
@@ -12029,6 +12039,11 @@ test("XERK-550: the auto-merge content gate agrees with what auto-start would sw
   }
   // The eligible bug is the only one that both queued and gates clean.
   assert.equal(autoStartContentGate("xcheck.atlassian.net", rows.get("BUG-1"), "Turma"), null);
+  assert.deepEqual([...queued], ["BUG-1"]);
+  for (const key of ["ROLL-1", "ROLL-2"]) {
+    assert.equal(autoStartContentGate("xcheck.atlassian.net", rows.get(key), "Turma").kind,
+      "rollup", key);
+  }
   resetAutoStart();
   delete triagePolicies["xcheck.atlassian.net"];
 });
@@ -12158,6 +12173,77 @@ test("XERK-635: the content gate rejects an epic/child and agrees with the sweep
   // A plain ticket still gates clean.
   assert.equal(autoStartContentGate("ep1.atlassian.net",
     { key: "W-1", triage: { type: "task", actionable: true } }, "Turma"), null);
+  // XERK-1568: a rollup ticket is rejected by the same gate, by either marker.
+  const tri = { type: "task", actionable: true };
+  assert.equal(autoStartContentGate("ep1.atlassian.net",
+    { key: "R-1", labels: ["rollup"], triage: tri }, "Turma").kind, "rollup");
+  assert.equal(autoStartContentGate("ep1.atlassian.net",
+    { key: "R-2", summary: "[Rollup] Turma: low-severity findings", triage: tri }, "Turma").kind,
+    "rollup");
+});
+
+// ---- rollup tickets never auto-start or auto-merge (XERK-1568) ---------------
+
+test("XERK-1568: isRollupTicket keys on the `rollup` label OR a `[Rollup]` summary prefix", () => {
+  assert.equal(isRollupTicket({ key: "R-1", labels: ["Turma", "rollup"] }), true);
+  assert.equal(isRollupTicket({ key: "R-1", labels: ["Rollup"] }), true);
+  assert.equal(isRollupTicket({ key: "R-2", summary: "[Rollup] Turma: low-severity findings" }), true);
+  assert.equal(isRollupTicket({ key: "R-2", summary: "  [rollup] x" }), true);
+  assert.equal(isRollupTicket({ key: "W-1", labels: ["rollups", "roll-up"], summary: "Fix it" }), false);
+  assert.equal(isRollupTicket({ key: "W-1", summary: "Track the [Rollup] ticket" }), false);
+  assert.equal(isRollupTicket({ key: "W-1" }), false);
+  assert.equal(isRollupTicket(null), false);
+});
+
+test("XERK-1568: the auto-start sweep never queues a rollup ticket, by label or summary", async () => {
+  resetAutoStart();
+  const triage = { priority: "P2", type: "task", actionable: true };
+  const row = (key, extra) => ({ key, summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, triage, ...extra });
+  // A FULL host, so whatever the sweep admits stays visible in the hub queue
+  // (the drain's own rollup drop can't mask a sweep that let one through).
+  await asBeat("rollS", "roll0.atlassian.net", { capacity: FULL, tickets: [
+    row("ENG-1"),
+    row("ENG-2", { labels: ["rollup"] }),
+    row("ENG-3", { summary: "[Rollup] Turma: low-severity findings" }),
+  ] });
+  autoStartSweep();
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-1"]);
+  resetAutoStart();
+});
+
+test("XERK-1568: an auto entry whose ticket became a rollup while it waited drops from the queue", async () => {
+  resetAutoStart();
+  const site = "roll1.atlassian.net";
+  const triage = { priority: "P2", type: "task", actionable: true };
+  await asBeat("rollQ", site, { capacity: FULL,
+    tickets: [{ key: "ENG-7", summary: "Fix it", statusCategory: "todo",
+      repoGuess: { repo: "Turma", cloned: true }, triage }] });
+  autoStartRound();                          // queues (host full, ticket eligible)
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey), ["ENG-7"]);
+  // The ticket is labelled `rollup` mid-wait, and a slot frees in the same beat.
+  await asBeat("rollQ", site, { capacity: ROOMY,
+    tickets: [{ key: "ENG-7", summary: "Fix it", statusCategory: "todo", labels: ["rollup"],
+      repoGuess: { repo: "Turma", cloned: true }, triage }] });
+  drainTicketQueue();
+  assert.equal(ticketQueue.length, 0, "the auto entry drops, no session");
+  assert.equal((agents.rollQ.commands || []).filter((c) => c.type === "spawnTicket").length, 0);
+  resetAutoStart();
+});
+
+test("XERK-1568: a manual Start on a rollup ticket is not gated (deliberate intent)", async () => {
+  resetAutoStart();
+  await asBeat("rollM", "roll2.atlassian.net", { autoStart: false,
+    tickets: [{ key: "ENG-8", summary: "[Rollup] Turma: low-severity findings",
+      statusCategory: "todo", labels: ["rollup"],
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } }] });
+  const r = await request("POST", "/api/jira/roll2.atlassian.net/ENG-8/session",
+    { headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.deepEqual((agents.rollM.commands || []).filter((c) => c.type === "spawnTicket")
+    .map((c) => c.issueKey), ["ENG-8"]);
+  resetAutoStart();
 });
 
 test("XERK-635: POST .../epic-run arms a durable run whose DAG matches the blocks-links", async () => {
@@ -13153,6 +13239,44 @@ test("XERK-636: the run advances to done once every child is Done, and drives no
   assert.equal(epicRuns["ed7.atlassian.net/E-1"].state, "done");
   ticketQueue.length = 0;
   resetEpicRuns();
+});
+
+test("XERK-1568: an armed epic run never starts, merges or messages a rollup child", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  resetEpicD();
+  const site = "roll3.atlassian.net";
+  // C-1 is a rollup (labelled) child with no blockers: without the gate it is the
+  // one ready child the driver would dispatch.
+  const tickets = driveTickets().map((t) => (t.key === "C-1"
+    ? { ...t, labels: ["rollup"], summary: "[Rollup] Turma: low-severity findings" } : t));
+  await asBeat("rollE", site, { autoStart: false,
+    capacity: { maxSessions: 6, running: 0, queued: 0, free: 5 }, tickets });
+  armEpicRun(site, "E-1");
+  epicDriveRound();
+  assert.deepEqual(spawnedKeys("rollE"), [], "a rollup child is never started by the run");
+  // A session already on the rollup child (started by hand) is not merged or
+  // messaged by the run's hands-off sweeps.
+  const url = "https://github.com/roll/e1/pull/1";
+  await asBeat("rollE", site, { autoStart: false,
+    capacity: { maxSessions: 6, running: 1, queued: 0, free: 4 },
+    tickets: tickets.map((t) => (t.key === "C-1" ? { ...t, statusCategory: "inprogress" } : t)),
+    sessions: [dChildSession("s-r1", "C-1", site, "OPEN", url)] });
+  autoMergeSweep();
+  assert.equal((agents.rollE.commands || []).filter((c) => c.type === "mergePr").length, 0,
+    `a rollup child's PR is never merged, got ${JSON.stringify(dCmds("rollE"))}`);
+  // Once that PR merges, the run's auto-close sweep never messages the rollup
+  // session to self-close either.
+  await asBeat("rollE", site, { autoStart: false,
+    capacity: { maxSessions: 6, running: 1, queued: 0, free: 4 },
+    tickets: tickets.map((t) => (t.key === "C-1" ? { ...t, statusCategory: "inprogress" } : t)),
+    sessions: [dChildSession("s-r1", "C-1", site, "MERGED", url)] });
+  autoCloseSweep();
+  assert.equal(inputTo("rollE", "s-r1").length, 0,
+    `a rollup child is never messaged to self-close, got ${JSON.stringify(dCmds("rollE"))}`);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+  resetEpicD();
 });
 
 test("XERK-636: epicChildBlockersDone — in-epic blocker authoritative, external only if visible", () => {

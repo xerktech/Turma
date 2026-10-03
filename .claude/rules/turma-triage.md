@@ -78,6 +78,11 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
 0. **Not an epic or an epic child** (`isEpicOrEpicChild`, XERK-635) — excluded before the numbered
    gates, in both the sweep filter and `autoStartContentGate`. A child is driven by its epic run, not
    this stream; an epic is never a work ticket. See `.claude/rules/turma-epic-run.md`.
+   - **Nor a ROLLUP ticket** (`isRollupTicket`, XERK-1568): label `rollup` OR a `[Rollup]` summary
+     prefix — one per repo collecting low-severity findings, a list, never work. Same places as the
+     epic check, BEFORE the verdict (an `approve` can't force it, so auto-merge/auto-close never act
+     on one), plus the drain's auto branch and the epic run (`epicRunDriveSweep`,
+     `epicRunChildSession`). A manual Start still works.
 1. **Repo present and not ignore-tier** (`repoGuess` or a manual pin; `isRepoIgnored`). Applies
    even to an `approve`.
 2. **Retriage gate** (`triageGateReason`): no `triage` block → "untriaged"; `actionable !== true`
