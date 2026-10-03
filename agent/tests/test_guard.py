@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import time
 import unittest
 from unittest import mock
 
@@ -1124,19 +1125,63 @@ class TestProducedScripts(unittest.TestCase):
     def test_a_relative_rm_after_cd_into_a_root_names_that_root(self):
         for cmd in ("cd / && rm -rf *", "cd /; rm -rf *", "cd /etc; rm -rf ./*",
                     "cd /usr && rm -r lib", "cd ~ && rm -rf *", "cd; rm -rf *",
-                    "cd -P / && rm -rf -- *"):
+                    "cd -P / && rm -rf -- *", "pushd / && rm -rf *",
+                    "builtin cd / && rm -rf *", "cd ~root && rm -rf *",
+                    # Climbing out of a deeper cwd reaches the root too.
+                    "cd /tmp; rm -rf ../*", "cd /tmp/a; rm -rf ../../*",
+                    # The cwd reaches into groups and re-parsed scripts.
+                    "cd / && (rm -rf *; true)", "cd / && bash -c 'rm -rf *'",
+                    "cd / && eval 'rm -rf *'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("cd /tmp/x && rm -rf *", "cd / && rm -rf tmp/build",
                     "cd /etc && ls", "cd ~ && rm -rf .cache",
-                    "cd /; cd /tmp/x; rm -rf *", "cd /repos/x && rm -rf node_modules"):
+                    "cd /repos/x && rm -rf node_modules",
+                    "cd /usr/src/app && rm -rf build"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_later_cd_never_clears_the_root(self):
+        # Each leaves bash in `/`: the second cd fails, runs in a subshell or
+        # pipe, or goes back. Order- and scope-blind is the fail-closed read.
+        for cmd in ("cd /; (cd /tmp); rm -rf *", "cd /; cd /tmp | true; rm -rf *",
+                    "cd /; cd /tmp & rm -rf *", "cd /; cd /nope 2>/dev/null; rm -rf *",
+                    "cd /; cd /tmp; cd -; rm -rf *", "cd /; cd usr; rm -rf *",
+                    "cd /; cd /tmp/x; rm -rf *"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_printf_renders_like_printf(self):
+        for cmd in ("printf -v x -- 'rm -rf /'; $x", "printf -v x '%.2s -rf /' rmxx; $x",
+                    "printf -v x '%*s -rf /' 0 rm; $x", "printf -v x 'rm\\x20-rf\\x20/'; $x",
+                    "printf -v x 'rm\\040-rf\\040/'; $x", "printf -v x '%b' 'rm\\x20-rf\\x20/'; $x",
+                    "printf -v \"x\" 'rm -rf /'; $x", "printf -v 'x' 'rm -rf /'; $x",
+                    "printf -vx 'rm -rf /'; $x", "x=$(printf 'rm\\x20-rf\\x20/'); $x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_assignment_values_nest_and_glue(self):
+        for cmd in ("x=$(echo $(echo rm) -rf /); $x", "x=$(echo 'rm -rf / (x)'); $x",
+                    "x=$(echo 'rm -rf')' /'; $x", "declare x='rm -rf /'; $x",
+                    "local x='rm -rf /'; $x", "readonly x='rm -rf /'; $x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_a_substitution_value_is_classified_once(self):
+        # Inlining the `$(…)` text re-classified it at every use: minutes for
+        # a long line, past the hook timeout, which lets a command through.
+        cmd = "x=$(echo a b c); " + "echo $x; " * 2000
+        started = time.monotonic()
+        self.assertAllowed(cmd)
+        self.assertLess(time.monotonic() - started, 10)
+
     def test_home_glob_is_the_home_directory(self):
-        self.assertDenied("rm -rf ~/*")
-        self.assertDenied("rm -rf $HOME/*")
+        for cmd in ("rm -rf ~/*", "rm -rf $HOME/*", "rm -rf ~/.*", "rm -rf ~/.[!.]*",
+                    "rm -rf ~root/*"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
         self.assertAllowed("rm -rf ~/proj/build/*")
+        self.assertAllowed("rm -rf ~/tmp*")
 
 
 class TestClassification(unittest.TestCase):

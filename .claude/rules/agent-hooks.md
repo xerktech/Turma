@@ -124,12 +124,17 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     runs the rest; a subshell's `)#` read as text only classifies more.
   - **An opaque substitution glued to a word is also read as EMPTY** (`glued_empty`): `$(true)rm`
     runs `rm`. A standalone one stays the placeholder — an empty word reads as the root.
-  - **A variable a producer filled is that producer's text** (XERK-1549): an unquoted
-    `x=$(…)`/`` x=`…` `` value is read whole, and `printf -v x FMT ARGS` binds the rendered
-    text (`_render_printf`), so `x=$(echo '<cmd>'); $x` classifies `<cmd>`.
-  - **A relative `rm` after `cd` into an EXACT protected root is joined to it** (`_cd_root`,
-    `_under_root`): `cd /; rm -rf *` is `rm -rf /*`. Only exact roots/home — a deeper cwd stays
-    unknown, and joining there would refuse ordinary `cd /usr/src/app && rm -rf build`.
+  - **A variable a producer filled holds that producer's OUTPUT** (XERK-1549): an assignment
+    value is read whole (quoted runs, nested `$(…)`), and `printf -v x FMT ARGS` binds the
+    rendered text (`_render_printf`: escapes, precision, `*`, `%b`). `_produced_text` stores
+    what the substitution PRINTS, never its `$(…)` text — inlining that re-classified it at
+    every `$x` and a long line took minutes, past the hook timeout, which fails OPEN.
+  - **`cd` targets are ORDER- and SCOPE-blind** (`_cd_targets`, inherited into recursion): a
+    later `cd` never clears an earlier one, since it may fail, sit in a subshell/pipe, or be
+    `cd -`; resetting let `cd /; (cd /tmp); rm -rf *` through.
+    - Inside an exact protected root/home every relative `rm` operand is joined (`cd /; rm -rf *`
+      is `/*`); deeper, only `..`-climbing ones are. Joining all there would refuse ordinary
+      `cd /usr/src/app && rm -rf build` — do not widen it.
   - **`_var_values` resolves a value naming an assigned variable once** (`d=$d/x`): left in, each
     recursion level re-inlined it until `_TOO_DEEP` refused an ordinary command.
   - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old vs
