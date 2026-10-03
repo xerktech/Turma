@@ -973,12 +973,13 @@ fun ticketOutcomeLabel(kind: String): String = when (val w = ticketOutcomeWords(
 }
 
 /**
- * The newest of a ticket's sessions (oldest-first, as ticketSessionsOf returns
- * them) that closed it, or null — board.js `ticketOutcomeOf`, for the detail
- * sheet's "Closed by" row.
+ * The ticket's NEWEST session (oldest-first, as ticketSessionsOf returns them)
+ * when it closed the ticket, or null — board.js `ticketOutcomeOf`, for the
+ * detail sheet's "Closed by" row. Only the newest counts: a reopened ticket
+ * worked by a fresh session must not still read "closed".
  */
 fun ticketOutcomeOf(sessions: List<TicketSession>): TicketSession? =
-    sessions.lastOrNull { ticketOutcomeWords(it.outcome).isNotEmpty() }
+    sessions.lastOrNull()?.takeIf { ticketOutcomeWords(it.outcome).isNotEmpty() }
 
 /**
  * The "Closed by" row's text — board.js `ticketOutcomeFieldHtml`:

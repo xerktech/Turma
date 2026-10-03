@@ -902,7 +902,7 @@ class BoardTest {
         assertEquals("X-1", ticketSessionLabel(chips[0].copy(outcome = "")))
     }
 
-    @Test fun `the detail sheet's Closed by row names the newest self-close, why and when`() {
+    @Test fun `the detail sheet's Closed by row names the newest session's self-close, why and when`() {
         // XERK-1569, web board.js ticketOutcomeOf / ticketOutcomeFieldHtml.
         val base = TicketSession(
             host = "h", id = "a", transcriptId = "t", status = "stopped", gitBranch = "",
@@ -913,8 +913,10 @@ class BoardTest {
         val older = base.copy(id = "a", outcome = "already-fixed", outcomeAt = now - 7200_000L)
         val newer = base.copy(id = "b", outcome = "not-reproducible", outcomeAt = now - 3 * 3600_000L)
         val plain = base.copy(id = "c", status = "running")
-        val closedBy = ticketOutcomeOf(listOf(older, newer, plain))
+        val closedBy = ticketOutcomeOf(listOf(older, newer))
         assertEquals("b", closedBy?.id)
+        // Reopened and worked by a newer session that has not closed it: no row.
+        assertNull(ticketOutcomeOf(listOf(older, newer, plain)))
         assertEquals("session — not reproducible · 3h ago", ticketOutcomeText(closedBy!!, now))
         assertEquals("session — done · just now", ticketOutcomeText(base.copy(outcome = "done", outcomeAt = now - 10_000L), now))
         assertEquals("session — already fixed", ticketOutcomeText(base.copy(outcome = "already-fixed"), now))

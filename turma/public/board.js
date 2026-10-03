@@ -1322,16 +1322,14 @@
     return !words ? "" : words === "done" ? "closed" : "closed · " + words;
   }
 
-  // The newest of a ticket's sessions (ticketSessionsOf, oldest first) that
-  // closed it, as {kind, at, session}; null when none did. The detail panel's
-  // "Closed by" row reads it.
+  // The ticket's NEWEST session (ticketSessionsOf, oldest first) when it closed
+  // the ticket, as {kind, at, session}; null otherwise. Only the newest counts:
+  // a reopened ticket worked by a fresh session must not still read "closed".
+  // The detail panel's "Closed by" row reads it.
   function ticketOutcomeOf(sessions) {
-    for (let i = (sessions || []).length - 1; i >= 0; i--) {
-      const s = sessions[i];
-      const o = s && s.ticket && s.ticket.outcome;
-      if (o && ticketOutcomeWords(o.kind)) return { kind: o.kind, at: o.at, session: s };
-    }
-    return null;
+    const s = (sessions || [])[(sessions || []).length - 1];
+    const o = s && s.ticket && s.ticket.outcome;
+    return o && ticketOutcomeWords(o.kind) ? { kind: o.kind, at: o.at, session: s } : null;
   }
 
   // The "Closed by" row's value: "session — not reproducible · 3h ago". `at` is

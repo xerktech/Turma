@@ -1878,9 +1878,8 @@ test("XERK-1569: the detail panel says a session closed the ticket, why and when
     status: "stopped", transcriptId: "t" + id,
     ticket: { key: "X-1", siteKey: "myorg.atlassian.net", outcome: { kind, at: when } },
   });
-  // The newest session that closed it wins; a later one that did not is skipped.
-  const sessions = [withOutcome("a", "already-fixed", at - 1000), withOutcome("b", "not-reproducible", at),
-    tsess("c", "X-1", { status: "running" })];
+  // The newest session decides: it closed the ticket, so its outcome is shown.
+  const sessions = [withOutcome("a", "already-fixed", at - 1000), withOutcome("b", "not-reproducible", at)];
   const o = ticketOutcomeOf(sessions);
   assert.equal(o.kind, "not-reproducible");
   assert.equal(o.session.id, "b");
@@ -1890,6 +1889,12 @@ test("XERK-1569: the detail panel says a session closed the ticket, why and when
     .replace(/<[^>]+>/g, ""), "session — done · just now");
   assert.equal(ticketOutcomeFieldHtml({ kind: "already-fixed" }, now).replace(/<[^>]+>/g, ""),
     "session — already fixed");
+  // Reopened and worked by a NEWER session that has not closed it → no row,
+  // even though the older closer still carries its outcome.
+  const reopened = [...sessions, tsess("c", "X-1", { status: "running" })];
+  assert.equal(ticketOutcomeOf(reopened), null);
+  assert.ok(!detailHtml(ticket("X-1"), null, { siteKey: "myorg.atlassian.net", sessions: reopened, now })
+    .includes("Closed by"));
   // No session closed it (or no sessions passed at all) → no row.
   assert.equal(ticketOutcomeOf([tsess("c", "X-1")]), null);
   assert.ok(!detailHtml(ticket("X-1"), null, { siteKey: "s" }).includes("Closed by"));
