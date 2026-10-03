@@ -166,14 +166,15 @@ fun <T> sortedBySince(rows: List<T>, attention: (T) -> Attention?): List<T> =
 
 /**
  * A review card's second line (XERK-1571, web sessions.html `attentionWhy`): WHY
- * the session is the operator's and how long it has waited. A question/permission
- * card already shows its question, so only the wait. "" when the hub serves none.
+ * the session is the operator's and how long it has waited. Unlike the web card,
+ * the phone card carries no state label or quoted question, so the why is kept for
+ * every needs-you state (the question text, the wait, the PR). "" when the hub
+ * serves none.
  */
 fun attentionWhy(att: Attention?, now: Long): String {
     if (att == null || needsYouChip(att.state) == null) return ""
-    val asked = att.state == "needs-you:question" || att.state == "needs-you:permission"
     val bits = ArrayList<String>()
-    att.why?.takeIf { !asked && it.isNotBlank() }?.let { bits.add(it) }
+    att.why?.takeIf { it.isNotBlank() }?.let { bits.add(it) }
     att.since?.let { bits.add("waiting ${waitLeftText(now - it)}") }
     return bits.joinToString(" · ")
 }

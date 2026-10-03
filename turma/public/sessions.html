@@ -2367,12 +2367,13 @@ function reviewState(s, live, now) {
 
 // The hub's attention read (XERK-1571), as a review card's second line: WHY the
 // session is the operator's ("PR open · CI passing") and how long it has been
-// ("· 12m"). A question/permission card already quotes its question, so only
-// the wait shows. "" from an older hub that serves no `attention`.
+// ("· 12m"). A question/permission card already quotes its question and a
+// stalled one names its wait in its label, so for those only the wait shows.
+// "" from an older hub that serves no `attention`.
 function attentionWhy(s, now) {
   const att = s.attention;
   if (!att || !String(att.state || "").startsWith("needs-you:")) return "";
-  const asked = att.state === "needs-you:question" || att.state === "needs-you:permission";
+  const asked = att.state !== "needs-you:review" && att.state !== "needs-you:test";
   const bits = [];
   if (att.why && !asked) bits.push(att.why);
   if (Number.isSafeInteger(att.since)) bits.push("waiting " + ago(now - att.since).replace(/ ago$/, ""));

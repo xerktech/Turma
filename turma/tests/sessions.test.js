@@ -414,6 +414,15 @@ test("attention: sleeping holds, review sorts oldest-waiting first with the why 
   assert.ok(r.indexOf("Older Wait") >= 0 && r.indexOf("Older Wait") < r.indexOf("Newer Wait"), "oldest-waiting first");
   assert.ok(r.includes('<div class="why">PR open · CI passing · waiting 40m</div>'), r);
   assert.ok(r.includes('<div class="why">finished · nothing to merge · waiting 5m</div>'));
+  // A stalled card names its wait in its label, so its why line is the age only.
+  const { render: render2, els: els2 } = loadPage();
+  const { now: n2, host: h2 } = host([
+    running("55555", "Dead Shell", { paneBusy: false, transcriptAgeSec: 50 * 60, lastRole: "assistant", lastHasToolUse: false,
+      agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] , }),
+  ].map((x) => ({ ...x, attention: { state: "needs-you:stalled", since: t - 2 * 60 * 1000, why: "Watch CI" } })));
+  render2({ now: n2, agents: [h2] });
+  assert.ok(els2.review.innerHTML.includes('stalled · Watch CI'));
+  assert.ok(els2.review.innerHTML.includes('<div class="why">waiting 2m</div>'), els2.review.innerHTML);
   // Sleeping: Active, holding, "until HH:MM" — not Ready for review.
   assert.ok(!r.includes("Asleep"));
   assert.ok(a.includes("Asleep") && a.includes("💤 sleeping until " + hhmm), a);

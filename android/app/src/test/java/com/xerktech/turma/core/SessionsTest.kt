@@ -205,10 +205,11 @@ class SessionsTest {
         assertEquals(null, needsYouChip("waiting"))
     }
 
-    @Test fun `attentionWhy says why and for how long; a question shows only the wait`() {
+    @Test fun `attentionWhy says why and for how long`() {
         assertEquals("PR open · CI passing · waiting 12m",
             attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
-        assertEquals("waiting 3m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("Ship it? · waiting 3m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("waiting 3m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
         assertEquals("", attentionWhy(att("working", now), now))
         assertEquals("", attentionWhy(null, now))
     }

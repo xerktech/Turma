@@ -63,8 +63,9 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 - **Sessions page Ready for review** is sorted by `since`, oldest first (`bySince`, Android
   `sortedBySince`, glasses phone `render.ts`); a card with no `since` keeps its createdAt place after
   them. The section is still DECIDED by each client's own `readyForReview` mirror. Each review card
-  carries a `.why` line (`attentionWhy`: the why, minus a question's text the card already quotes, +
-  "waiting 12m").
+  carries a `.why` line (`attentionWhy`: the why + "waiting 12m"; the web drops the why on a
+  question/permission/stalled card, whose label already says it — the Android card has no label,
+  so it keeps it).
 - Waiting cards read "⏳ waiting · …" (`backgroundWaitLabel`, Android `liveStateLabel`).
 
 ## The stalled alert
