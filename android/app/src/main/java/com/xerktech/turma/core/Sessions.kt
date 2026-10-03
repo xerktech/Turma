@@ -227,6 +227,37 @@ fun attentionLabel(att: Attention?): String? {
 /** Does the hub say this session has STALLED on a background wait (XERK-1571)? */
 fun attentionStalled(att: Attention?): Boolean = att?.state == "needs-you:stalled"
 
+/** The wait classifier's label as a card reads it (XERK-1572, web `HINT_KIND`). */
+fun hintKind(label: String): String = when (label) {
+    "rubber-stamp" -> "go-ahead"
+    "design-decision" -> "decision"
+    "needs-human-test" -> "needs a human test"
+    "blocked-on-host" -> "blocked on the host"
+    "looping" -> "looping"
+    "waiting-external" -> "waiting on something outside"
+    else -> ""
+}
+
+/**
+ * The wait classifier's why on a needs-you card (XERK-1572, web sessions.html
+ * `.att-hint`): "decision · Pick schema v2 or v3". "" when the hub serves no
+ * verdict, or the session no longer needs the operator.
+ */
+fun attentionHintLine(att: Attention?): String {
+    if (att == null || needsYouChip(att.state) == null) return ""
+    val h = att.hint ?: return ""
+    if (h.why.isBlank()) return ""
+    val kind = hintKind(h.label)
+    return if (kind.isEmpty()) h.why else "$kind · ${h.why}"
+}
+
+/** The answer the classifier suggests, as "Suggested: …" (XERK-1572), or "". */
+fun attentionSuggested(att: Attention?): String {
+    if (attentionHintLine(att).isEmpty()) return ""
+    val a = att?.hint?.suggestedAnswer?.takeIf { it.isNotBlank() } ?: return ""
+    return "Suggested: $a"
+}
+
 /**
  * Has this PR left the operator's plate? MERGED/CLOSED are the two end states;
  * everything else — OPEN, DRAFT, and an unfetched/unknown state — counts as

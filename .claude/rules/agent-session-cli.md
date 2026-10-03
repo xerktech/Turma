@@ -102,6 +102,39 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 - Tests: `test_session_cli.py`; `TestWakeRequest` in `test_hub_agent.py`; the guard pins in
   `test_guard_settings.py`; the `XERK-1564` case in `server.test.js`.
 
+## The wait classifier + loop signal (XERK-1572)
+
+Not the CLI, but the other half of "why is this session waiting": hub half in `turma-attention.md`.
+
+- **The classifier is a `claude -p` Haiku one-shot on the `_start_summary` posture** (cwd
+  `REGISTRY_DIR`, no `--settings`, stdin closed, prompt an argv element, `TURMA_ATTENTION_HINT_MODEL`,
+  `TURMA_ATTENTION_HINT_TIMEOUT_SEC`), its prompt signature in `INTERNAL_TOOL_PROMPT_SIGS` so its
+  transcripts never surface as a repo. `TURMA_ATTENTION_HINTS=0` turns it off; dsh/qwen skip it (no
+  Claude login assumed, like naming).
+- **Only a NEW edge is classified** (`attention_edge`, a pure read of the beat's signals: question |
+  permission | loop | stalled | review, with an anchor). `_attention_edge` notes it on the record
+  as `attentionHint {edge, kind, edgeTs, attempts}`; the RECORD is the ledger, so an edge it already
+  holds (a restart, a flicker back) is never asked again.
+- **Runs on its OWN worker, never the beat** (`_attention_hint_worker_loop`, XERK-395): the beat only
+  stages ONE job (the oldest due edge, `_attn_job` = one in flight, freed if unanswered past the
+  timeout) and drains `_attn_results` (REBOUND under `_attn_lock`). The input is built from signals
+  the beat already read (question/dialog text + `session_report`'s `tail`) — no read of its own.
+- **Bounded retries armed up-front**: `ATTENTION_HINT_MAX_ATTEMPTS` (2), backoff
+  `ATTENTION_HINT_RETRY_BACKOFF_SEC` × attempts, persisted on the record before the job runs.
+- **Strict parse** (`parse_attention_hint`): one JSON object (a code fence tolerated), label from the
+  fixed set, `why` a non-empty string, `suggestedAnswer` a string if present; anything else is no
+  verdict, never a repaired one. A verdict for an edge the session has left is dropped.
+- **The wire**: `attentionHints` rows `{key:"<sid>:<edgeTs>", …}`, ≤`ATTENTION_HINTS_MAX` a beat,
+  cleared BY IDENTITY in `_clear_delivered_staged`, never shed; the outbox is bounded.
+- **The loop signal needs no model**: `_scan_loop_entry` (in `_scan_entry_line`) counts consecutive
+  tool results with `is_error` for the same (tool, sha1 of the sorted input); a success or a
+  different call resets it; sidechains ignored; pending calls ≤64, count capped. `session_report`
+  reports `loop: {repeats, tool, since}` from `LOOP_REPEATS_MIN` (4), else null. A restart primes
+  offsets to EOF, so a loop is re-counted from new calls (failure direction: none reported).
+- Tests: `TestAttentionHints`, `TestLoopSignal`, `TestSessionReportLoop`.
+- **Real-host spike (not yet run)**: the classifier against the real login on a few archived prompts
+  (assert schema conformance, not text), and a looping transcript + a stalled shell through `verify`.
+
 ## Real-host spike (not yet run)
 
 - In a worktree session run `python3 -SsE "$TURMA_SESSION_CLI" wake 2m test`: the request file

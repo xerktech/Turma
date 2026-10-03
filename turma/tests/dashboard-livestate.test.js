@@ -48,7 +48,7 @@ function loadDashboard() {
   const fn = new Function(
     "localStorage", "document", "window", "EventSource", "fetch",
     "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "TurmaOrg", "globalThis",
-    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens };\n;globalThis.__setRender = (f) => { render = f; };"
+    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens, sessCard, attentionHintHtml };\n;globalThis.__setRender = (f) => { render = f; };"
   );
   fn(g.localStorage, g.document, g.window, g.EventSource, g.fetch,
      g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g.TurmaOrg, g);
@@ -218,6 +218,39 @@ test("dashboard liveState: a pending wake reads sleeping until its time", () => 
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt: NOW - 1000 }), onlineHost, NOW).label, "idle");
   // Working outranks it: a session still finishing its turn is working.
   assert.equal(liveState(sess({ paneBusy: true, transcriptAgeSec: 1, wakeAt }), onlineHost, NOW).label, "working");
+});
+
+// XERK-1572: a LOOPING session is busy but the hub says it is stuck: its State
+// row reads the hub's stall ("stalled · repeating Bash ×5 · for 3m"), not
+// "working"; without a loop the same busy session still reads working.
+test("dashboard liveState: a looping session reads stalled, not working", () => {
+  const { liveState } = loadDashboard();
+  const attention = { state: "needs-you:stalled", since: NOW - 3 * 60 * 1000, why: "repeating Bash ×5" };
+  const live = { paneBusy: true, transcriptAgeSec: 1, loop: { repeats: 5, tool: "Bash", since: NOW } };
+  const st = liveState({ session: live, attention }, onlineHost, NOW);
+  assert.equal(st.label, "stalled · repeating Bash ×5");
+  assert.equal(st.cls, "sess-stalled");
+  assert.equal(st.detail, "for 3m");
+  assert.equal(liveState({ session: { ...live, loop: undefined }, attention }, onlineHost, NOW).label, "working");
+});
+
+// XERK-1572: the wait classifier's verdict rides a needs-you card's State row —
+// what kind of wait and why, then the answer it suggests — escaped, and only
+// while the hub says the session needs the operator.
+test("dashboard State row: the classifier's why and suggested answer", () => {
+  const { sessCard, attentionHintHtml } = loadDashboard();
+  const hint = { label: "design-decision", why: "Pick <v2> or v3.", suggestedAnswer: "Go with v3." };
+  assert.equal(attentionHintHtml({ state: "needs-you:review", since: NOW, hint }),
+    '<div class="sess-hint"><b>decision</b> · Pick &lt;v2&gt; or v3.</div>'
+    + '<div class="sess-hint answer">Suggested: Go with v3.</div>');
+  assert.equal(attentionHintHtml({ state: "working", since: NOW, hint }), "");
+  assert.equal(attentionHintHtml({ state: "needs-you:review", since: NOW }), "");
+  const card = sessCard({ key: "h1", online: true, lastSeen: NOW, terminalOnline: true },
+    { id: "s1", status: "running", repo: "r", attention: { state: "needs-you:test", since: NOW, hint:
+      { label: "needs-human-test", why: "Wants the login page checked." } },
+      session: { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false } }, NOW);
+  const state = card.match(/<dt>State<\/dt><dd>[\s\S]*?<\/dd>/)[0];
+  assert.ok(state.includes('<div class="sess-hint"><b>needs a human test</b> · Wants the login page checked.</div>'), state);
 });
 
 // XERK-538: a QA / QA-delta pass reads "QA Review" while staying working (Active).

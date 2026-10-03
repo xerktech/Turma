@@ -262,6 +262,24 @@ class SessionsTest {
         assertEquals(false, attentionStalled(att("needs-you:review", now)))
     }
 
+    // XERK-1572: the wait classifier's verdict on a needs-you card, worded as the web's.
+    @Test fun `attentionHintLine and attentionSuggested read the classifier's verdict`() {
+        val hinted = com.xerktech.turma.model.Attention(state = "needs-you:review", since = now,
+            hint = com.xerktech.turma.model.AttentionHint("design-decision", "Pick v2 or v3.", "Go with v3."))
+        assertEquals("decision · Pick v2 or v3.", attentionHintLine(hinted))
+        assertEquals("Suggested: Go with v3.", attentionSuggested(hinted))
+        assertEquals("needs a human test · x", attentionHintLine(hinted.copy(state = "needs-you:test",
+            hint = com.xerktech.turma.model.AttentionHint("needs-human-test", "x"))))
+        assertEquals("", attentionSuggested(hinted.copy(hint = hinted.hint!!.copy(suggestedAnswer = null))))
+        // Only while the session needs the operator, and only with a why.
+        assertEquals("", attentionHintLine(hinted.copy(state = "working")))
+        assertEquals("", attentionSuggested(hinted.copy(state = "working")))
+        assertEquals("", attentionHintLine(hinted.copy(hint = hinted.hint!!.copy(why = " "))))
+        assertEquals("", attentionHintLine(att("needs-you:review", now)))
+        assertEquals("Retries npm ci.", attentionHintLine(hinted.copy(
+            hint = com.xerktech.turma.model.AttentionHint("unknown-label", "Retries npm ci."))))
+    }
+
     @Test fun `sortedBySince puts the oldest first and keeps since-less rows in place after them`() {
         val rows = listOf("a" to null, "b" to 30L, "c" to null, "d" to 10L)
         val out = sortedBySince(rows) { r -> r.second?.let { att("needs-you:review", it) } }

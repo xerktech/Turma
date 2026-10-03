@@ -1071,6 +1071,27 @@ private fun SessionListCard(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
+                    // The wait classifier's verdict and the answer it suggests
+                    // (XERK-1572, web sessions.html `.att-hint`).
+                    val hint = com.xerktech.turma.core.attentionHintLine(r.session.attention)
+                    if (hint.isNotEmpty()) {
+                        Text(
+                            hint,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    val suggested = com.xerktech.turma.core.attentionSuggested(r.session.attention)
+                    if (suggested.isNotEmpty()) {
+                        Text(
+                            suggested,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 }
                 // The PRs share a marks row at the BOTTOM of the card (web
                 // sessions.html state-row), rendered when there is at least one.

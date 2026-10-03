@@ -295,6 +295,9 @@
      Ready-for-review accent, stalled in the danger colour it has everywhere. */
   .sess-review { color: var(--accent-text); }
   .sess-stalled { color: var(--critical-text); }
+  /* The wait classifier's verdict under a needs-you State row (XERK-1572). */
+  .sess-hint { font-size: 12px; color: var(--ink); margin-top: 2px; }
+  .sess-hint.answer { color: var(--ink-2); font-style: italic; }
 
   .sess-dying { color: var(--critical); }
 
@@ -1153,6 +1156,21 @@ function attentionLabel(att) {
   return { label: [word, att.why].filter(Boolean).join(" · "),
            cls: cls === "stalled" ? "sess-stalled" : "sess-review" };
 }
+// The wait classifier's verdict (XERK-1572): "decision · Pick schema v2 or v3"
+// plus the answer it suggests, from the hub's `attention.hint` — the State row's
+// second and third lines on a needs-you card. Same words as sessions.html.
+const HINT_KIND = {
+  "rubber-stamp": "go-ahead", "design-decision": "decision", "needs-human-test": "needs a human test",
+  "blocked-on-host": "blocked on the host", "looping": "looping", "waiting-external": "waiting on something outside",
+};
+function attentionHintHtml(att) {
+  const h = att && NEEDS_YOU_CHIP[att.state] ? att.hint : null;
+  if (!h || typeof h.why !== "string" || !h.why) return "";
+  const kind = HINT_KIND[h.label] ? `<b>${esc(HINT_KIND[h.label])}</b> · ` : "";
+  const ans = typeof h.suggestedAnswer === "string" && h.suggestedAnswer
+    ? `<div class="sess-hint answer">Suggested: ${esc(h.suggestedAnswer)}</div>` : "";
+  return `<div class="sess-hint">${kind}${esc(h.why)}</div>${ans}`;
+}
 function needsYou(sess) {
   return sess
     .filter(x => x.s.status === "running" && NEEDS_YOU_CHIP[x.s.attention?.state])
@@ -1233,6 +1251,10 @@ function liveState(sess, host, now) {
   if (s && s.panePrompt && s.panePrompt.prompt)
     return { label: "waiting for your permission", cls: "sess-wait",
              ask: permissionAsk(sess), busy: true };
+  // LOOPING (XERK-1572): busy, but the hub says it is stuck repeating one failing
+  // call — "stalled · repeating Bash ×5", never "working". Same as sessions.html.
+  if (s && s.loop && sess.attention?.state === "needs-you:stalled")
+    return { ...attentionLabel(sess.attention), detail: attentionFor(sess.attention, now), busy: true };
   if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   // Background agents, which paneBusy cannot see: a session that delegated work
@@ -1971,7 +1993,7 @@ function sessCard(a, s, now) {
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${killing
         ? `<dt>State</dt><dd><b class="sess-dying">shutting down…</b></dd>`
-        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>`
+        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}${attentionHintHtml(s.attention)}</dd>`
         : st === "queued" ? `<dt>State</dt><dd><b class="sess-queued">${esc(queuedReasonText(s.queuedReason))}</b>${s.queuedAt ? " · " + esc(ago(now - Date.parse(s.queuedAt))) : ""}</dd>`
         : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}

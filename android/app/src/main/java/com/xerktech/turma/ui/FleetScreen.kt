@@ -538,7 +538,9 @@ private fun SessionCard(
                         // a session Ready for review lists never reads idle here. Its
                         // one age is the hub's `since` ("stalled · Watch CI · for 31m").
                         // A stall takes the danger colour it has on every surface.
-                        val needs = if (state == LiveState.IDLE) com.xerktech.turma.core.attentionLabel(session.attention) else null
+                        // A stall the hub reads where this read does not — a LOOPING
+                        // session is busy (XERK-1572) — speaks over "working" too.
+                        val needs = if (state == LiveState.IDLE || com.xerktech.turma.core.attentionStalled(session.attention)) com.xerktech.turma.core.attentionLabel(session.attention) else null
                         val needsFor = com.xerktech.turma.core.attentionFor(session.attention, now)
                         Text(
                             needs?.let { if (needsFor.isEmpty()) it else "$it · $needsFor" } ?: liveStateLabel(state, session.session),
@@ -567,6 +569,18 @@ private fun SessionCard(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis,
                     )
+                }
+                // The wait classifier's verdict and suggested answer (XERK-1572, web
+                // index.html State row `.sess-hint`), on a running needs-you card.
+                if (st == "running" && !killing) {
+                    val hint = com.xerktech.turma.core.attentionHintLine(session.attention)
+                    if (hint.isNotEmpty()) {
+                        Text(hint, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                    val suggested = com.xerktech.turma.core.attentionSuggested(session.attention)
+                    if (suggested.isNotEmpty()) {
+                        Text(suggested, style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
                 }
                 // What a permission dialog asks for (XERK-1571, web Permission row):
                 // the hub's why — the pending command — not the dialog's generic question.

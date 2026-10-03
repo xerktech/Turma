@@ -22723,3 +22723,241 @@ test("XERK-1563: /metrics carries the ledger's per-kind aggregates and nothing e
   assert.doesNotMatch(m.raw, /perm-metrics-host|secret-cmd|npm test/);
   delete agents["perm-metrics-host"];
 });
+
+// ---- XERK-1572: wait classifier hints, the loop signal, attention nudges ---------
+
+test("XERK-1572: the loop signal is coerced by name and never repaired", async () => {
+  const host = "loop-coerce";
+  const loops = [
+    { repeats: 5, tool: "Bash", since: 1700000000000, extra: "dropped" },
+    { repeats: "5", tool: "Bash", since: 1700000000000 },
+    { repeats: 5, tool: 7, since: 1700000000000 },
+    { repeats: 5, tool: "", since: 1700000000000 },
+    { repeats: 5, tool: "Bash", since: -1 },
+    { repeats: 0, tool: "Bash", since: 1700000000000 },
+    null,
+    "looping",
+    { repeats: 5, tool: "x".repeat(200), since: 1700000000000 },
+  ];
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: loops.map((loop, i) => ({ id: `s${i}`, status: "running",
+      session: { paneBusy: true, transcriptAgeSec: 1, loop } })) },
+  });
+  assert.equal(r.status, 200);
+  const got = agents[host].sessions.map((s) => s.session.loop);
+  assert.deepEqual(got[0], { repeats: 5, tool: "Bash", since: 1700000000000 });
+  for (const i of [1, 2, 3, 4, 5, 6, 7]) assert.equal(got[i], undefined, `case ${i}`);
+  assert.equal(got[8].tool.length, 64);
+});
+
+test("XERK-1572: a loop reads needs-you:stalled ahead of working, behind a question", () => {
+  const now = Date.now();
+  const s = (live) => ({ id: "s1", status: "running", session: {
+    paneBusy: true, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true, ...live } });
+  const att = (sess) => sessionAttention(sess, sessionWorking(sess, now, now), sessionWait(sess, now, now), now);
+  const loop = { repeats: 5, tool: "Bash", since: now - 60000 };
+  assert.deepEqual(att(s({ loop })), { state: "needs-you:stalled", cause: "loop", why: "repeating Bash ×5" });
+  assert.equal(att(s({ loop, question: "Q?" })).state, "needs-you:question");
+  assert.equal(att(s({})).state, "working");
+  // The cause is internal: never served.
+  assert.deepEqual(hub.wireAttention({ state: "needs-you:stalled", cause: "loop", why: "repeating Bash ×5", since: now }),
+    { state: "needs-you:stalled", since: now, why: "repeating Bash ×5" });
+});
+
+test("XERK-1572: the loop's stalled alert says it repeats, once per edge", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: true, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true, ...live } }] });
+  notifications.length = 0;
+  beat(sess({}), t0);
+  beat(sess({ loop: { repeats: 4, tool: "Bash", since: t0 } }), t0 + 20000);
+  beat(sess({ loop: { repeats: 5, tool: "Bash", since: t0 } }), t0 + 40000);
+  assert.deepEqual(titles(), ["nas-repo-s1 has stalled"]);
+  assert.match(notifications[0].body, /^repeating Bash ×4 with the same failure/);
+});
+
+test("XERK-1572: normalizeAttentionHint whitelists label, edge and capped texts", () => {
+  const n = hub.normalizeAttentionHint;
+  const ok = { key: "s1:1000", sessionId: "s1", edge: "review", edgeTs: 1000,
+    label: "rubber-stamp", why: "Asks to push.", suggestedAnswer: "Yes, push it." };
+  assert.deepEqual(n(ok), { sessionId: "s1", edge: "review", label: "rubber-stamp",
+    why: "Asks to push.", suggestedAnswer: "Yes, push it." });
+  for (const bad of [null, "x", [], { ...ok, label: "maybe" }, { ...ok, label: "Rubber-Stamp" },
+    { ...ok, edge: "idle" }, { ...ok, edge: "__proto__" }, { ...ok, why: "  " }, { ...ok, why: 7 },
+    { ...ok, sessionId: 5 }, { ...ok, sessionId: "" }, { ...ok, sessionId: "x".repeat(129) }]) {
+    assert.equal(n(bad), null, JSON.stringify(bad));
+  }
+  const long = n({ ...ok, why: "w ".repeat(400), suggestedAnswer: 9 });
+  assert.equal(long.why.length, 300);
+  assert.equal("suggestedAnswer" in long, false);
+  assert.deepEqual(hub.normalizeAttentionHints("nope"), []);
+  assert.equal(hub.normalizeAttentionHints(Array.from({ length: 80 }, () => ok)).length, 50);
+});
+
+test("XERK-1572: a hint folds into attention while the state it answers holds", () => {
+  const beat = (() => {
+    const alerts = {};
+    let prev = {};
+    return (payload, at, hints) => {
+      const next = { ...payload, lastSeen: at, alerts };
+      heartbeatAlerts("host1", prev, next, hints);
+      prev = next;
+      return next;
+    };
+  })();
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
+  const hint = (extra) => [hub.normalizeAttentionHint({ sessionId: "s1", edge: "review",
+    label: "design-decision", why: "Pick schema v2 or v3.", suggestedAnswer: "Go with v3.", ...extra })];
+  beat(sess({ paneBusy: true }), t0);
+  let rec = beat(sess({}), t0 + 20000);                         // review edge
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
+  rec = beat(sess({}), t0 + 40000, hint());                     // the verdict lands
+  assert.deepEqual(rec.alerts.sessions.s1.attn.hint,
+    { label: "design-decision", why: "Pick schema v2 or v3.", suggestedAnswer: "Go with v3." });
+  assert.equal(rec.alerts.sessions.s1.attn.since, t0 + 20000);
+  rec = beat(sess({}), t0 + 60000);                             // held across beats
+  assert.equal(rec.alerts.sessions.s1.attn.hint.label, "design-decision");
+  const served = hub.serializeAgent("host1", { device: "host1", lastSeen: t0 + 60000,
+    sessions: rec.sessions, alerts: rec.alerts }, t0 + 60000);
+  assert.deepEqual(served.sessions[0].attention.hint,
+    { label: "design-decision", why: "Pick schema v2 or v3.", suggestedAnswer: "Go with v3." });
+  // needs-human-test turns the review into needs-you:test without restarting its age.
+  rec = beat(sess({}), t0 + 80000, hint({ label: "needs-human-test", why: "Wants the login clicked through." }));
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:test");
+  assert.equal(rec.alerts.sessions.s1.attn.since, t0 + 20000);
+  // The session works again: the hint is gone with the state it answered.
+  rec = beat(sess({ paneBusy: true }), t0 + 100000);
+  assert.equal(rec.alerts.sessions.s1.hint, undefined);
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
+  rec = beat(sess({}), t0 + 120000);
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined, "a new wait carries no old verdict");
+  // A verdict for another state is never folded (a question hint on a review).
+  rec = beat(sess({}), t0 + 140000, hint({ edge: "question" }));
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
+  // A loop verdict folds only on a LOOP stall, a wait verdict only on a wait stall.
+  const loopy = sess({ paneBusy: true, loop: { repeats: 4, tool: "Bash", since: t0 } });
+  rec = beat(loopy, t0 + 160000, hint({ edge: "stalled", label: "waiting-external" }));
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
+  rec = beat(loopy, t0 + 180000, hint({ edge: "loop", label: "looping", why: "Retries npm ci." }));
+  assert.equal(rec.alerts.sessions.s1.attn.hint.why, "Retries npm ci.");
+});
+
+test("XERK-1572: a forged or corrupt stored hint never reaches the wire", () => {
+  const now = Date.now();
+  const w = (hint) => hub.wireAttention({ state: "needs-you:review", since: now, hint });
+  assert.equal("hint" in w({ label: "napping", why: "x" }), false);
+  assert.equal("hint" in w({ label: "looping", why: 5 }), false);
+  assert.deepEqual(w({ label: "looping", why: "a\nb", suggestedAnswer: ["no"], extra: 1 }).hint,
+    { label: "looping", why: "a b" });
+});
+
+test("XERK-1572: attentionHints ride the heartbeat into the served attention", async () => {
+  const host = "hint-wire";
+  const live = { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false };
+  const post = (body) => request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: host, ...body } });
+  await post({ sessions: [{ id: "s1", status: "running", session: { ...live, paneBusy: true } }] });
+  await post({ sessions: [{ id: "s1", status: "running", session: live }] });
+  const r = await post({ sessions: [{ id: "s1", status: "running", session: live }],
+    attentionHints: [{ key: "s1:1", sessionId: "s1", edge: "review", edgeTs: 1, label: "needs-human-test",
+      why: "Asks for a manual check of the login page." }, { junk: true }] });
+  assert.equal(r.status, 200);
+  assert.equal("attentionHints" in agents[host], false, "never stored raw on the record");
+  const served = hub.serializeAgent(host, agents[host], Date.now());
+  assert.equal(served.sessions[0].attention.state, "needs-you:test");
+  assert.deepEqual(served.sessions[0].attention.hint,
+    { label: "needs-human-test", why: "Asks for a manual check of the login page." });
+});
+
+function nudgeHost(host, sessions, now = Date.now()) {
+  agents[host] = { device: host, lastSeen: now, commands: [], sessions: sessions.map((s) => s.session),
+    alerts: { sessions: Object.fromEntries(sessions.map((s) => [s.session.id, { attn: s.attn }])) } };
+  return agents[host];
+}
+const nudges = (host) => (agents[host].commands || []).filter((c) => c.type === "input");
+
+test("XERK-1572: a stalled shell is nudged once per edge, in the operator's voice, with backoff", () => {
+  hub.attentionNudged.clear();
+  const host = "nudge-stall";
+  const t0 = Date.now();
+  const stalled = { id: "s1", status: "running", session: { paneBusy: false, transcriptAgeSec: 41 * 60,
+    agents: [{ type: "shell", label: "Watch `CI`\nrun", kind: "wait-external" }] } };
+  const a = nudgeHost(host, [{ session: stalled, attn: { state: "needs-you:stalled", since: t0, why: "Watch CI" } }], t0);
+  // The host keeps beating (an offline one is never nudged).
+  const sweep = (t) => { a.lastSeen = t; hub.attentionNudgeSweep(t); };
+  sweep(t0);
+  const [n1] = nudges(host);
+  assert.equal(n1.sessionId, "s1");
+  assert.equal(n1.text, "Your background shell `Watch CI run` has produced nothing for 41 minutes. Check "
+    + "whether it is still doing anything; if it is waiting on something with a known duration, stop it "
+    + "and use the session CLI's `wake`; if it is dead, say what you know and end the turn.");
+  sweep(t0 + 15000);                       // the next tick: backoff holds
+  assert.equal(nudges(host).length, 1);
+  sweep(t0 + hub.ATTENTION_NUDGE_BACKOFF_MS);   // still stalled: the second
+  assert.equal(nudges(host).length, 2);
+  sweep(t0 + 3 * hub.ATTENTION_NUDGE_BACKOFF_MS); // second unanswered: operator decides
+  assert.equal(nudges(host).length, hub.ATTENTION_NUDGE_MAX);
+  // It recovered and stalled AGAIN later: a new edge, nudged again.
+  a.alerts.sessions.s1.attn = { state: "needs-you:stalled", since: t0 + 4 * hub.ATTENTION_NUDGE_BACKOFF_MS };
+  sweep(t0 + 5 * hub.ATTENTION_NUDGE_BACKOFF_MS);
+  assert.equal(nudges(host).length, 3);
+  hub.attentionNudged.clear();
+  delete agents[host];
+});
+
+test("XERK-1572: a looping session is nudged under its own reason; nothing else is", () => {
+  hub.attentionNudged.clear();
+  const host = "nudge-loop";
+  const t0 = Date.now();
+  const sess = (id, live) => ({ id, status: "running", session: { paneBusy: true, transcriptAgeSec: 1, ...live } });
+  nudgeHost(host, [
+    { session: sess("loop", { loop: { repeats: 6, tool: "Bash;rm", since: t0 } }),
+      attn: { state: "needs-you:stalled", cause: "loop", since: t0, why: "repeating Bash ×6" } },
+    { session: sess("work", {}), attn: { state: "working", since: t0 } },
+    { session: sess("asks", { question: "Q?" }), attn: { state: "needs-you:question", since: t0 } },
+    { session: { ...sess("gone", {}), status: "stopped" }, attn: { state: "needs-you:stalled", since: t0 } },
+  ], t0);
+  hub.attentionNudgeSweep(t0);
+  const sent = nudges(host);
+  assert.deepEqual(sent.map((c) => c.sessionId), ["loop"]);
+  assert.equal(sent[0].text, "You have run `Bashrm` 6 times with the same failure. Stop, write down what "
+    + "you know on the ticket, and either take a different approach or end the turn with a `Host blocker:` line.");
+  assert.ok(hub.attentionNudged.has(host + "\x00loop\x00loop"));
+  // An OFFLINE host is never nudged (the command would only queue behind silence).
+  const off = "nudge-offline";
+  nudgeHost(off, [{ session: sess("x", { loop: { repeats: 6, tool: "Bash", since: t0 } }),
+    attn: { state: "needs-you:stalled", cause: "loop", since: t0 } }], t0 - 10 * 60 * 1000);
+  hub.attentionNudgeSweep(t0);
+  assert.equal(nudges(off).length, 0);
+  hub.attentionNudged.clear();
+  delete agents[host];
+  delete agents[off];
+});
+
+test("XERK-1572: attentionNudged writes through and hydrates back, so a failover re-sends nothing", async () => {
+  await withGuardStore(async (store) => {
+    hub.attentionNudged.clear();
+    const host = "nudge-ha";
+    const t0 = Date.now();
+    nudgeHost(host, [{ session: { id: "s1", status: "running", session: { transcriptAgeSec: 3000,
+      agents: [{ type: "shell", label: "sleep", kind: "wait-timed" }] } },
+      attn: { state: "needs-you:stalled", since: t0 } }], t0);
+    hub.attentionNudgeSweep(t0);
+    assert.equal(nudges(host).length, 1);
+    await new Promise((r) => setImmediate(r));
+    const nk = host + "\x00s1\x00stalled";
+    assert.deepEqual(await store.get(hub.GUARD_STORE_PREFIX + "attentionNudged:" + nk),
+      { at: t0, count: 1, since: t0 });
+    hub.attentionNudged.clear();              // a newly promoted leader starts empty…
+    await hub.hydrateGuards();                // …and inherits the old leader's memory
+    assert.deepEqual(hub.attentionNudged.get(nk), { at: t0, count: 1, since: t0 });
+    hub.attentionNudgeSweep(t0 + 1000);
+    assert.equal(nudges(host).length, 1, "no re-send after the handover");
+    hub.attentionNudged.clear();
+    delete agents[host];
+  });
+});

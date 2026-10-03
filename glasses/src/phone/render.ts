@@ -10,7 +10,7 @@
 // view; Board is a placeholder tab (Phase 2).
 import type { AppState } from "../app.ts";
 import type { AgentInfo, PrInfo, SessionInfo } from "../types.ts";
-import { filterAgents, inReview, liveState, sessionName, siteKeyOf, sleeping, type LiveState } from "../sessions.ts";
+import { attentionHint, filterAgents, inReview, liveState, sessionName, siteKeyOf, sleeping, type LiveState } from "../sessions.ts";
 import { LIVE_TURN_ID } from "../render.ts";
 import { Board } from "../vendor/engines.ts";
 
@@ -139,6 +139,7 @@ function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, cur
   const st = liveState(s, hostLastSeen, now);
   const name = sessionName(s);
   const q = s.session?.question;
+  const hint = attentionHint(s);
   // A holding session ASLEEP until a session-CLI wake (XERK-1571) says until when,
   // and what it will check then when the session said (web "· <reason>").
   const wakeAt = s.session?.wakeAt;
@@ -158,6 +159,9 @@ function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, cur
     `<span class="ph-card-meta">${metaLine(hostLabel, s)}</span>` +
     stateRow +
     (st === "waiting" && q ? `<span class="ph-card-q">${esc(q)}</span>` : "") +
+    // The wait classifier's verdict and suggested answer (XERK-1572, web `.att-hint`).
+    (hint.line ? `<span class="ph-card-hint">${esc(hint.line)}</span>` : "") +
+    (hint.answer ? `<span class="ph-card-hint answer">Suggested: ${esc(hint.answer)}</span>` : "") +
     `</span>` +
     `</button>`
   );
