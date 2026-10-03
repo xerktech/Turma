@@ -1554,6 +1554,59 @@ class TestPrSummary(unittest.TestCase):
             fh.write("Describe your change.\n")
         self.assertIsNone(self.reason("gh pr create --body 'anything'"))
 
+    def test_the_new_aliases_are_checked(self):
+        for cmd in ("gh pr new --fill", "glab mr new -d x"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.reason(cmd))
+
+    def test_glued_short_flags_and_leading_global_flags_are_checked(self):
+        for cmd in ("gh pr edit 5 -bnope", "gh pr edit 5 -Fbad.md",
+                    "glab mr update 5 -dnope", "az --debug repos pr create --title t"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.reason(cmd))
+        q = __import__("shlex").quote(GOOD_BODY)
+        self.assertIsNone(self.reason("gh pr edit 5 -b" + q))
+
+    def test_only_what_is_sent_counts_as_the_body(self):
+        """Headings in a title or a shell comment are not the description."""
+        for cmd in ("gh pr create --title '**Summary:** x' --body nope",
+                    "# ## Why ## What changed ## Risk ## Testing ## Follow-ups\n"
+                    "gh pr create --body nope"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.reason(cmd))
+
+    def test_a_body_file_written_by_the_same_command_is_checked_from_its_heredoc(self):
+        cmd = ("cat > /tmp/xerk-body.md <<'EOF'\n" + GOOD_BODY +
+               "EOF\ngh pr create -t t -F /tmp/xerk-body.md")
+        self.assertIsNone(self.reason(cmd))
+
+    def test_help_is_not_a_pr(self):
+        for cmd in ("gh pr create --help", "gh pr create -h", "gh help pr create",
+                    "glab mr create --help"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.reason(cmd))
+
+    def test_a_template_heading_ending_in_punctuation_can_be_satisfied(self):
+        os.makedirs(os.path.join(self.repo, ".github"))
+        with open(os.path.join(self.repo, ".github", "pull_request_template.md"), "w") as fh:
+            fh.write("## How Has This Been Tested?\n\n## Checklist:\n\n## Related Issue(s)\n")
+        ok = "## How Has This Been Tested?\nx\n## Checklist:\n- y\n## Related Issue(s)\nz\n"
+        self.assertIsNone(self.reason("gh pr create --body " + __import__("shlex").quote(ok)))
+
+    def test_a_fifo_body_file_or_template_never_hangs_the_hook(self):
+        os.mkfifo(os.path.join(self.repo, "body.fifo"))
+        self.assertIsNotNone(self.reason("gh pr create -t t -F body.fifo"))
+        os.makedirs(os.path.join(self.repo, ".github"))
+        os.mkfifo(os.path.join(self.repo, ".github", "pull_request_template.md"))
+        self.assertIsNone(self.reason("gh pr create -t t --body x"))  # headingless
+
+    def test_unrepresentable_paths_do_not_crash(self):
+        for cmd in ("cd ~$'\\x00' && ls", "gh pr create -F $'a\\x00b'"):
+            with self.subTest(cmd=cmd):
+                guard.pr_summary_reason(cmd, self.repo)  # must not raise
+        self.assertEqual(guard.decide("Bash", {"command": "cd ~$'\\x00' && ls"},
+                                      cwd=self.repo)[0], "allow")
+
     def test_decide_routes_it_and_the_toggle_disables_it(self):
         cmd = "gh pr create --title t --body b"
         d = guard.decide("Bash", {"command": cmd}, cwd=self.repo)
@@ -1603,7 +1656,11 @@ class TestHookEntrypoint(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
     def test_pr_summary_denied_and_toggle_off_allows(self):
-        event = {"tool_name": "Bash", "cwd": AGENT_DIR,
+        # A dir outside any repo: inside this one, Turma's own PR template wins.
+        import tempfile
+        cwd = tempfile.mkdtemp()
+        self.addCleanup(os.rmdir, cwd)
+        event = {"tool_name": "Bash", "cwd": cwd,
                  "tool_input": {"command": "gh pr create --title t --body b"}}
         out = json.loads(self._run_hook(event).stdout)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")

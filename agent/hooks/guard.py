@@ -62,6 +62,7 @@ import os
 import posixpath
 import re
 import shlex
+import stat
 import sys
 
 # --- command segmentation ------------------------------------------------
@@ -1668,64 +1669,87 @@ _PR_BODY_MAX_READ = 256 * 1024
 
 
 def _heading_present(body: str, pattern: str) -> bool:
-    return re.search(rf"^\s*#{{1,6}}\s*{pattern}\b", body,
+    # `(?!\w)`, not `\b`: a template heading may end in `?`/`:`/`)`, after
+    # which there is no word boundary at the end of a line.
+    return re.search(rf"^\s*#{{1,6}}\s*{pattern}(?!\w)", body,
                      re.IGNORECASE | re.MULTILINE) is not None
 
 
-def _pr_body_command(tokens: list[str]) -> tuple[str, list[str]] | None:
-    """``(verb, args)`` if this simple command opens a PR/MR or rewrites its
-    description, else None. ``create`` always carries a description; an
-    ``edit``/``update`` only counts when it sets one (``gh pr edit --add-label``
-    is not a description change)."""
-    prog = _basename(tokens[0])
-    rest = tokens[1:]
-    if prog == "gh":
-        # `gh -R owner/repo pr create`: global flags may precede the subcommand.
-        if "pr" not in rest:
-            return None
-        args = rest[rest.index("pr") + 1:]
-        body_flags = ("-b", "--body", "-F", "--body-file")
-    elif prog == "glab":
-        if "mr" not in rest:
-            return None
-        args = rest[rest.index("mr") + 1:]
-        body_flags = ("-d", "--description")
-    elif prog == "az":
-        if rest[:2] != ["repos", "pr"]:
-            return None
-        args = rest[2:]
-        body_flags = ("--description",)
-    else:
-        return None
-    if not args:
-        return None
-    verb = args[0]
-    if verb == "create":
-        return verb, args[1:]
-    if verb in ("edit", "update") and any(
-            a in body_flags or a.split("=", 1)[0] in body_flags for a in args[1:]):
-        return verb, args[1:]
+# Forge CLIs, the subcommand group, the verbs that open one (`new` is a
+# documented alias of `create` for both gh and glab), and the flags that carry
+# a description. A short flag may be glued to its value (`-bTEXT`).
+_PR_CLIS = {
+    "gh": ("pr", ("create", "new"), ("-b", "--body", "-F", "--body-file")),
+    "glab": ("mr", ("create", "new"), ("-d", "--description")),
+    "az": ("pr", ("create",), ("--description",)),
+}
+
+
+def _flag_value(arg: str, flags: tuple[str, ...]) -> tuple[str, str | None] | None:
+    """``(flag, glued value or None)`` if ``arg`` is one of ``flags``."""
+    for f in flags:
+        if arg == f:
+            return f, None
+        if f.startswith("--") and arg.startswith(f + "="):
+            return f, arg[len(f) + 1:]
+        if not f.startswith("--") and arg.startswith(f) and len(arg) > len(f):
+            return f, arg[len(f):]
     return None
 
 
-def _body_files(args: list[str]) -> list[str]:
-    """Paths passed to ``gh pr create/edit -F|--body-file`` (``-`` = stdin,
-    whose text is the command's own heredoc and so already in the command)."""
-    out = []
-    for i, a in enumerate(args):
-        if a in ("-F", "--body-file") and i + 1 < len(args):
-            out.append(args[i + 1])
-        elif a.startswith("--body-file="):
-            out.append(a.split("=", 1)[1])
-    return [p for p in out if p and p != "-"]
+def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
+    """``(inline bodies, body files)`` if this simple command opens a PR/MR or
+    rewrites its description, else None. ``create`` always carries one; an
+    ``edit``/``update`` only counts when it sets one (``gh pr edit --add-label``
+    is not a description change). Help invocations are not PRs."""
+    spec = _PR_CLIS.get(_basename(tokens[0]))
+    rest = tokens[1:]
+    if not spec or spec[0] not in rest:
+        return None
+    group, creates, body_flags = spec
+    head = rest[:rest.index(group)]
+    if "help" in head or (_basename(tokens[0]) == "az" and "repos" not in head):
+        return None
+    args = rest[rest.index(group) + 1:]
+    if not args or "-h" in args or "--help" in args:
+        return None
+    verb = args[0]
+    bodies: list[str] = []
+    files: list[str] = []
+    seen_flag = False
+    i = 1
+    while i < len(args):
+        hit = _flag_value(args[i], body_flags)
+        if hit:
+            seen_flag = True
+            flag, value = hit
+            if value is None and i + 1 < len(args):
+                i += 1
+                value = args[i]
+            if value is not None:
+                (files if flag in ("-F", "--body-file") else bodies).append(value)
+        i += 1
+    if verb in creates or (verb in ("edit", "update") and seen_flag):
+        return bodies, [f for f in files if f and f != "-"]
+    return None
 
 
 def _read_text(path: str) -> str:
+    """A bounded read of a REGULAR file, else "". ``O_NONBLOCK`` + the fstat
+    check keep a FIFO planted at the path from hanging the hook, which Claude
+    Code would then time out and let the command through unchecked."""
     try:
-        with open(path, encoding="utf-8", errors="replace") as fh:
-            return fh.read(_PR_BODY_MAX_READ)
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+    except (OSError, ValueError):
+        return ""
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return ""
+        return os.read(fd, _PR_BODY_MAX_READ).decode("utf-8", "replace")
     except OSError:
         return ""
+    finally:
+        os.close(fd)
 
 
 def _repo_root(start: str) -> str | None:
@@ -1762,33 +1786,46 @@ def _repo_template_sections(root: str | None) -> list[tuple[str, str]] | None:
     return None
 
 
+def _join_path(cwd: str, path: str) -> str:
+    try:
+        return os.path.join(cwd, os.path.expanduser(path))
+    except ValueError:  # an embedded NUL: nothing real lives there
+        return cwd
+
+
 def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     """A reason if ``command`` opens a PR/MR (or rewrites its description)
     whose description is missing a required section.
 
-    The description is read from the command TEXT — inline ``--body``, a
-    heredoc, or ``$(cat <<EOF …)`` all put it there — plus any ``--body-file``,
-    resolved against ``cwd`` as moved by a preceding ``cd``. A description
-    pulled from somewhere else (``--fill``, the editor, ``$(cat file)``) can't be
-    checked, so it is refused with a reason saying how to pass it."""
-    cwd = cwd or os.getcwd()
+    The description is what the command would actually send: the inline
+    ``--body``/``--description`` values, any ``--body-file`` (resolved against
+    ``cwd`` as moved by a preceding ``cd``), and the command's heredoc bodies —
+    which covers ``$(cat <<EOF …)``, ``-F - <<EOF`` and a body file the same
+    command writes first (it does not exist yet when the hook runs). The rest of
+    the command text (titles, comments) never counts. A description pulled from
+    somewhere else (``--fill``, the editor, ``$(cat file)``) can't be checked,
+    so it is refused with a reason saying how to pass it."""
+    if cwd is None:
+        try:
+            cwd = os.getcwd()
+        except OSError:
+            cwd = "/"
+    heredocs = None
     for tokens, _segment, *_flags in _expand_segments(command):
         if _basename(tokens[0]) == "cd" and len(tokens) > 1:
-            cwd = os.path.join(cwd, os.path.expanduser(tokens[1]))
+            cwd = _join_path(cwd, tokens[1])
             continue
         hit = _pr_body_command(tokens)
         if not hit:
             continue
-        _verb, args = hit
-        # The tokens carry an inline body unquoted, so its first line starts
-        # where the description does rather than after the shell's quote.
-        body = "\n".join([command, *args]) + "".join(
-            "\n" + _read_text(os.path.join(cwd, os.path.expanduser(p)))
-            for p in _body_files(args))
+        bodies, files = hit
+        if heredocs is None:
+            heredocs = [b for _owner, b in _split_heredocs(command)[1]]
+        body = "\n".join(bodies + heredocs + [_read_text(_join_path(cwd, f)) for f in files])
         sections = _repo_template_sections(_repo_root(cwd))
         if sections is not None:
-            missing = [name for name, pat in sections if not _heading_present(body, pat)]
             # A template with no headings asks for prose; there is nothing to check.
+            missing = [name for name, pat in sections if not _heading_present(body, pat)]
             if missing:
                 return (
                     "this repo has its own PR template — the description is missing "
