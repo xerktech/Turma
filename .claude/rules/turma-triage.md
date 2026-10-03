@@ -78,6 +78,11 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
 0. **Not an epic or an epic child** (`isEpicOrEpicChild`, XERK-635) — excluded before the numbered
    gates, in both the sweep filter and `autoStartContentGate`. A child is driven by its epic run, not
    this stream; an epic is never a work ticket. See `.claude/rules/turma-epic-run.md`.
+   - **Nor a ROLLUP ticket** (`isRollupTicket`, XERK-1568): label `rollup` OR a `[Rollup]` summary
+     prefix — one per repo collecting low-severity findings, a list, never work. Same places as the
+     epic check, BEFORE the verdict (an `approve` can't force it, so auto-merge/auto-close never act
+     on one), plus the drain's auto branch and the epic run (`epicRunDriveSweep`,
+     `epicRunChildSession`). A manual Start still works.
 1. **Repo present and not ignore-tier** (`repoGuess` or a manual pin; `isRepoIgnored`). Applies
    even to an `approve`.
 2. **Retriage gate** (`triageGateReason`): no `triage` block → "untriaged"; `actionable !== true`
@@ -144,9 +149,18 @@ attempt** (no retry budget burned, exactly like a repo-less ticket):
   `BoardTest.kt` (the `paused` queued reason), `dashboard-tiles.test.js` (the chip), android
   `AgentDecodeTest`.
 
-Drain order is the stable sort on `triageSortKey` = `[priorityRank, typeWeight, -repoTierRank]`:
-band → type → repo tier (XERK-487 [G] tiebreak) → board order. **A P0 may exceed the org's auto
-share** (`TICKET_QUEUE_PER_ORG_AUTO_MAX`) — the fleet cap is its only bound (logged `p0preempt`).
+Drain order is the stable sort on `triageSortKey(row, repo)` =
+`[isP0 ? 0 : 1, createdMs, typeWeight, -repoTierRank]` (XERK-1567): a P0 preempts → OLDEST
+`created` first → type → repo tier (XERK-487 [G]) → board order (sweep) / FIFO `at` (drain).
+
+- **Why oldest-first**: board order is the agent's `ORDER BY updated DESC` (ADO `ChangedDate DESC`),
+  so with no age term the NEWEST-touched ticket won every tie and old work starved. P1–P3 are FIFO
+  by creation; type and tier only break ties. Do not put the band back ahead of age.
+- **`created` absent/non-string/unparseable → `Infinity`** (sorts last). Both comparators test
+  `!==` before subtracting, so two `Infinity`s tie and keep board order. `Date.parse` reads Jira's
+  `+0000` and ADO's `Z`.
+- **A P0 may exceed the org's auto share** (`TICKET_QUEUE_PER_ORG_AUTO_MAX`) — the fleet cap is
+  its only bound (logged `p0preempt`, keyed on `tri.priority === "P0"`, not on the sort key).
 
 ## Mirrors that must agree
 
@@ -167,5 +181,5 @@ share** (`TICKET_QUEUE_PER_ORG_AUTO_MAX`) — the fleet cap is its only bound (l
 - `board.test.js`: `triageLaneOf`/`triageActionOf` placement, the lane-gathering `boardHtml` case,
   chip/field/picker units, "a live drag beats the Triage lane".
 - `server.test.js`: the `/triage` and `/triage-policy` routes, `triageGateReason`,
-  `triageSortKey`/drain order, the policy knobs + P0 preemption, hold/reject drops, and the
-  `priority-writeback` sweep cases (XERK-483).
+  `triageSortKey`/drain order (incl. the `XERK-1567:` oldest-first case), the policy knobs +
+  P0 preemption, hold/reject drops, and the `priority-writeback` sweep cases (XERK-483).

@@ -2244,6 +2244,30 @@ test("live status bar: a shell keeps the bar up and names it background tasks", 
   } finally { clearDom(); }
 });
 
+// XERK-1570: the bar says "waiting on CI" vs "running tests" — a WAITING shell
+// row reads "waiting" in place of "shell", and an all-wait bar reads "Waiting…".
+test("live status bar: waiting shells read waiting; a work shell beside them keeps 'Background tasks'", () => {
+  const html = agentsHtml([
+    { sel: false, type: "shell", label: "Wait for CI", kind: "wait-external" },
+    { sel: false, type: "shell", label: "Run tests", kind: "work" },
+    { sel: false, type: "shell", label: "Old agent" },
+  ]);
+  assert.match(html, /<span class="atype">waiting<\/span><span class="alabel">Wait for CI<\/span>/);
+  assert.match(html, /<span class="atype">shell<\/span><span class="alabel">Run tests<\/span>/);
+  assert.match(html, /<span class="atype">shell<\/span><span class="alabel">Old agent<\/span>/);
+  const bar = fakeStatusBar();
+  try {
+    __setLiveStatus(null);
+    __setLiveAgents([{ sel: false, type: "shell", label: "Wait for CI", kind: "wait-timed" }]);
+    updateLiveStatus();
+    assert.equal(bar.hidden, false);
+    assert.match(bar.innerHTML, /<span class="verb">Waiting…<\/span>/);
+    __setLiveAgents([{ type: "shell", kind: "wait-timed" }, { type: "shell", kind: "work" }]);
+    updateLiveStatus();
+    assert.match(bar.innerHTML, /Background tasks…/);
+  } finally { clearDom(); }
+});
+
 // `main` is the conversation already on screen. A list carrying only it means
 // nothing is delegated, so raising a "Background agents…" bar for it would claim
 // work that isn't running — the same carve-out live_subagents makes agent-side.

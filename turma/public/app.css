@@ -417,6 +417,9 @@ input:focus, textarea:focus, select:focus {
    Accent rather than the muted idle it is lifted out of — the section is a
    call to action, and the dot has to read that way beside a quiet card. */
 .dot.review                { background: var(--accent);   box-shadow: 0 0 8px color-mix(in srgb, var(--accent) 65%, transparent); }
+/* Holding (XERK-1570): alive but waiting out a background shell — the working
+   colour as a hollow ring, so it reads "not done" without reading "busy". */
+.dot.holding               { background: none; border: 1.5px solid var(--good); box-sizing: border-box; }
 
 /* ---- Spinner ------------------------------------------------------------- */
 .spin {

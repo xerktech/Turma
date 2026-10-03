@@ -14,6 +14,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `agent-input.md` | `agent/hub-agent.py` | `send_input`'s pane path + compaction outbox, `notify_session`'s inbox |
 | `agent-sessions.md` | `agent/hub-agent.py` | session launch, repos-root sessions, queue, kill/resume/delete, new-work directive, local-model failover |
 | `session-transcript.md` | `agent/hub-agent.py`, `agent/tunnel-agent.js`, `turma/server.js`, `turma/public/sessions.html` | which transcript is a session's: id pinning, `_session_transcript_path`, root-session isolation |
+| `session-working.md` | the five working mirrors, `hub-agent.py`, `tunnel-agent.js` | "working" = paneBusy OR live work; shell kinds, waiting/stalled (XERK-1570) |
 | `session-migration.md` | `agent/hub-agent.py`, `turma/server.js`, `sessions.html`, android `Sessions.kt` | migrating a session between agents (XERK-101); a refused start is REPORTED (XERK-265) |
 | `agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
 | `agent-archive.md` | `agent/hub-agent.py` | archive sync: manifest, rendered + raw delta pushes, payload shed, off-beat sync worker |
@@ -241,14 +242,8 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 - **`readyForReview` has FOUR mirrors that must agree**: `turma/public/sessions.html`,
   `turma/server.js`, `android/…/core/Sessions.kt`, `glasses/src/sessions.ts`. Changing the rule means
   changing all four.
-- **"Working" is `paneBusy` OR live background agents** (XERK-245), in every mirror of the read (those
-  four plus `turma/public/index.html`). A session that delegates work ENDS ITS OWN TURN: the pane
-  drops the interrupt hint, so `paneBusy` says False while an agent it launched keeps going — which
-  reads idle everywhere AND qualifies as ready-for-review. The session's `agents[]` is the second
-  input; it sits BEHIND the offline and no-transcript gates like `paneBusy`, and an absent field means
-  "that agent can't tell", never "no agents". **It comes from the TRANSCRIPT** (`_scan_agent_entry`:
-  `agentId:` on launch, `<task-notification>` on stop), **never from the TUI's footer rows** — those
-  are forgeable pane content and linger ~24s past completion.
+- **"Working" is `paneBusy` OR live background WORK** (XERK-245, XERK-1570; waiting shells don't
+  count) — five mirrors, `.claude/rules/session-working.md`.
 - **`turma/public/board.js` has FOUR mirrors of its column rule** (`categoryOf` / `REVIEW_STATUS_RE`):
   the source, its **byte-identical vendored copy** (`glasses/src/vendor/board.cjs`, asserted by
   `vendor.test.ts`), and the two ports — `_board_column` in `hub-agent.py` and `categoryOf` in

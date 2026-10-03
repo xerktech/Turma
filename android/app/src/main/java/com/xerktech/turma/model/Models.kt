@@ -1047,6 +1047,13 @@ data class QuestionOption(
 data class LiveAgent(
     val type: String = "",
     val label: String = "",
+    // XERK-1570: a background SHELL's kind — "wait-timed"/"wait-external" is the
+    // session WAITING (a sleep, a CI watch), "work" or "" (absent: an agent row, or
+    // an older agent) is work. Typed, so the hub keeps it to that strict enum
+    // (else omits it) and `startedAt`/`eta` (epoch ms) to safe integers.
+    val kind: String = "",
+    val startedAt: Long? = null,
+    val eta: Long? = null,
 )
 
 @Serializable
@@ -1306,6 +1313,9 @@ data class AgentRow(
     val sel: Boolean = false,
     val type: String = "",
     val label: String = "",
+    // XERK-1570: a background shell's kind — "wait-*" is a wait (the chat bar
+    // says "waiting"); absent is work. The hub keeps it to its strict enum.
+    val kind: String = "",
 )
 
 @Serializable

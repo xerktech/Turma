@@ -431,8 +431,9 @@ private fun BackgroundAgentsBar(
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                 CircularProgressIndicator(Modifier.size(11.dp), strokeWidth = 2.dp)
                 Text(
-                    // A background shell is not an agent (web chat.js mirrors this).
-                    if (agents.any { it.type == "shell" }) "Background tasks…" else "Background agents…",
+                    // A background shell is not an agent, and a WAITING one is not
+                    // work (XERK-1570) — web chat.js `backgroundBarVerb`.
+                    backgroundBarVerb(agents) + "…",
                     fontWeight = FontWeight.SemiBold,
                     style = MaterialTheme.typography.bodySmall,
                 )
@@ -440,6 +441,19 @@ private fun BackgroundAgentsBar(
             AgentsList(agents, onOpenSubagent)
         }
     }
+}
+
+/** A shell kind that is a wait (XERK-1570); "" (absent) or "work" is work. */
+internal fun isWaitKind(kind: String): Boolean = kind == "wait-timed" || kind == "wait-external"
+
+/**
+ * The background bar's verb — web chat.js `backgroundBarVerb`: "Waiting" when
+ * every background row is a wait, else "Background tasks" / "Background agents".
+ */
+internal fun backgroundBarVerb(agents: List<com.xerktech.turma.model.AgentRow>): String {
+    val bg = agents.filter { it.type.isNotBlank() && it.type != "main" }
+    if (bg.isNotEmpty() && bg.all { isWaitKind(it.kind) }) return "Waiting"
+    return "Background " + if (bg.any { it.type == "shell" }) "tasks" else "agents"
 }
 
 @Composable
@@ -485,7 +499,11 @@ private fun AgentsList(
                             else Modifier.border(1.5.dp, MaterialTheme.colorScheme.onSurfaceVariant, androidx.compose.foundation.shape.CircleShape),
                         ),
                 )
-                Text(a.type, fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelMedium)
+                // A waiting shell says so in place of "shell" (web agentsHtml, XERK-1570).
+                Text(
+                    if (a.type == "shell" && isWaitKind(a.kind)) "waiting" else a.type,
+                    fontWeight = FontWeight.SemiBold, style = MaterialTheme.typography.labelMedium,
+                )
                 if (a.label.isNotBlank()) {
                     Text(
                         a.label,

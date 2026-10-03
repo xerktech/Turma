@@ -268,6 +268,9 @@ class TestGuardSettings(unittest.TestCase):
         # The peer roster is the org boundary (XERK-348), so a session must not
         # be able to append rows to its own address book.
         "Edit(~/.turma/peers.tsv)",
+        # XERK-1564: the session CLI's rendezvous dir. File tools only; Bash
+        # still writes it, so the manager reads it as untrusted.
+        "Edit(~/.turma/session-requests/**)",
         # XERK-510 [Qwen F]: the qwen guard's own config (a rewrite disables the
         # guard) and the qwen per-session model-credential env file. Added to the
         # SHARED list so all three runtimes cover them with no qwen-specific change.
@@ -382,9 +385,24 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # app's own uploads Read is always there and always first (XERK-234).
         path = self._write({"permissions": {"allow": ["Bash(ping *)"]}})
         allow = ha.build_guard_settings(local_settings_path=path)["permissions"]["allow"]
-        n = len(ha._GUARD_ALLOW_PATH_RULES)
-        self.assertEqual(allow[:n], list(ha._GUARD_ALLOW_PATH_RULES))
+        floor = list(ha._GUARD_ALLOW_PATH_RULES) + [ha.session_cli_allow_rule()]
+        self.assertEqual(allow[:len(floor)], floor)
         self.assertIn("Bash(ping *)", allow)
+
+    def test_the_session_cli_is_allowed_by_its_absolute_path(self):
+        # XERK-1564: a session's `wake`/`close-ticket` call must never prompt,
+        # and the rule must admit ONLY the bundled script under the hook flags.
+        allow = ha.build_guard_settings(
+            local_settings_path="/no/such/file.json")["permissions"]["allow"]
+        cli = ha.session_cli_path()
+        self.assertTrue(os.path.isabs(cli))
+        self.assertEqual(os.path.dirname(cli), os.path.dirname(ha.guard_script_path()))
+        self.assertTrue(os.path.isfile(cli), "the CLI must ship beside the hooks")
+        self.assertIn(f"Bash(python3 -SsE {cli}:*)", allow)
+        # Besides the fleet floor (XERK-1565), the CLI is the ONLY Bash rule.
+        floor = set(ha.tool_allow_floor())
+        self.assertEqual([r for r in allow if r.startswith("Bash(") and r not in floor],
+                         [f"Bash(python3 -SsE {cli}:*)"])
 
     def test_operator_allow_duplicate_is_not_repeated(self):
         path = self._write({"permissions": {"allow": ["Read(~/.turma/uploads/**)"]}})
@@ -403,7 +421,8 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # fleet's tool-allow floor (XERK-1565).
         s = ha.build_guard_settings(local_settings_path="/no/such/file.json")
         self.assertEqual(s["permissions"]["allow"],
-                         list(ha._GUARD_ALLOW_PATH_RULES) + ha.tool_allow_floor())
+                         list(ha._GUARD_ALLOW_PATH_RULES) + [ha.session_cli_allow_rule()]
+                         + ha.tool_allow_floor())
         # The runtime-code rule is GENERATED from where this module sits, and is
         # emitted whenever that is outside REPOS_ROOT — which is exactly how CI
         # checks out. Asserting the static list alone passed only when the tree
@@ -487,8 +506,9 @@ class TestFleetPolicy(unittest.TestCase):
 
     def test_tool_allow_floor_follows_the_apps_own_rules(self):
         allow = self._settings()["permissions"]["allow"]
-        n = len(ha._GUARD_ALLOW_PATH_RULES)
-        self.assertEqual(allow[:n], list(ha._GUARD_ALLOW_PATH_RULES))
+        own = list(ha._GUARD_ALLOW_PATH_RULES) + [ha.session_cli_allow_rule()]
+        n = len(own)
+        self.assertEqual(allow[:n], own)
         self.assertEqual(allow[n:], list(ha.TOOL_ALLOW_FLOOR))
         for want in ("Bash(gh pr create:*)", "Bash(gh pr checks:*)",
                      "Bash(gh pr view:*)", "Bash(gh pr edit:*)",
@@ -496,8 +516,11 @@ class TestFleetPolicy(unittest.TestCase):
                      "Bash(node --test:*)", "Bash(python3 -m unittest:*)",
                      "Bash(pytest:*)", "Bash(./gradlew:*)"):
             self.assertIn(want, allow)
-        # The session-CLI rule is XERK-1564's; nothing here names it.
-        self.assertFalse([r for r in allow if "session_cli" in r])
+        # The session-CLI rule is XERK-1564's: it appears once, from the app's
+        # own rules, and the floor never names it.
+        self.assertEqual([r for r in allow if "session_cli" in r],
+                         [ha.session_cli_allow_rule()])
+        self.assertFalse([r for r in ha.TOOL_ALLOW_FLOOR if "session_cli" in r])
 
     def test_the_floor_carries_no_git_rule_at_all(self):
         # The guard refuses only a LITERAL main/master refspec token: it skips
@@ -514,7 +537,7 @@ class TestFleetPolicy(unittest.TestCase):
     def test_tool_allow_env_replaces_the_floor(self):
         allow = self._settings({"TURMA_TOOL_ALLOW": "Bash(make:*), Bash(tox:*)"})[
             "permissions"]["allow"]
-        n = len(ha._GUARD_ALLOW_PATH_RULES)
+        n = len(ha._GUARD_ALLOW_PATH_RULES) + 1  # + the session-CLI rule (XERK-1564)
         self.assertEqual(allow[n:], ["Bash(make:*)", "Bash(tox:*)"])
 
     def test_tool_grants_never_reach_the_settings_file(self):

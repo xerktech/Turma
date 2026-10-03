@@ -100,6 +100,33 @@ test("dashboard liveState: a background shell reads as working and is named", ()
   assert.equal(mixed.label, "2 background tasks");
 });
 
+// XERK-1570: a WAITING shell is not work — the card says what it waits on, in
+// the quiet holding style, and a stalled one says so without reading busy.
+test("dashboard liveState: waiting shells hold, stall, and never read working", () => {
+  const { liveState } = loadDashboard();
+  const ci = { type: "shell", label: "Watch CI", kind: "wait-external" };
+  const held = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }), onlineHost, NOW);
+  assert.equal(held.label, "waiting · Watch CI");
+  assert.equal(held.cls, "sess-holding");
+  assert.notEqual(held.busy, true);
+  const timed = liveState(sess({ paneBusy: false, transcriptAgeSec: 5,
+    agents: [{ type: "shell", kind: "wait-timed", eta: NOW + 5 * 60 * 1000 }] }), onlineHost, NOW);
+  assert.equal(timed.label, "waiting · 5m left");
+  const stalled = liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW);
+  assert.equal(stalled.label, "stalled · Watch CI");
+  assert.equal(stalled.cls, "");
+  // A work shell beside the wait is working, named by its work rows only.
+  const mixed = liveState(sess({ paneBusy: false, transcriptAgeSec: 5,
+    agents: [ci, { type: "shell", kind: "work" }] }), onlineHost, NOW);
+  assert.equal(mixed.label, "1 background shell");
+  assert.equal(mixed.cls, "sess-working");
+  // paneBusy unknown + a fresh transcript: still not working.
+  assert.equal(liveState(sess({ transcriptAgeSec: 1, agents: [ci] }), onlineHost, NOW).cls, "sess-holding");
+  // Offline host: no wait read at all — plain idle.
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }),
+    { online: false, lastSeen: NOW - 600_000 }, NOW).label, "idle");
+});
+
 // XERK-538: a QA / QA-delta pass reads "QA Review" while staying working (Active).
 test("dashboard liveState: a QA agent reads 'QA Review' and stays working", () => {
   const { liveState } = loadDashboard();
