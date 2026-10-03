@@ -866,6 +866,13 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     states = _quote_states(command) if vals and "$" in command else []
 
     def rep(m: "re.Match[str]") -> str:
+        lead = command[:m.start()]
+        if (len(lead) - len(lead.rstrip("\\"))) % 2 or (len(lead) - len(lead.rstrip("$"))) % 2:
+            # `\${a:-\"}` is literal text to bash, and `$${` is the PID then a
+            # brace. Splicing either's "default" shifted the quoting under the
+            # rest of the line: `echo "\${a:-\"}"; rm -rf /` hid the `rm`
+            # inside a string that had closed (XERK-1585).
+            return m.group(0)
         if m.group(1) and _brace_end(command, m.start()) != m.end() - 1:
             # `[^}]*` stopped at a `}` that is quoted or nested — in
             # `${a:-'}' #}` the expansion runs on to the last `}`. Splicing the

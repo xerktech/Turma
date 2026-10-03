@@ -1352,9 +1352,17 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                     "eval 'echo ${a:-$(echo }) #}; rm -rf /'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
+        # An escaped `\${` is literal text: its "default" spliced in shifted
+        # the quoting under the rest of the line.
+        for cmd in ('echo "\\${a:-\\"}"; rm -rf /',
+                    'bash -c "echo \\${a:-\\"}\\" #}; rm -rf /"',
+                    'eval "echo \\${a:-\\"}\\" #}; rm -rf /"'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
         # A real comment after a closed expansion still hides its text, and
         # `$$` is the PID: `$${` opens nothing.
         self.assertAllowed("echo $${ #; rm -rf /")
+        self.assertAllowed("echo $${a:- #}; rm -rf /")
         self.assertAllowed("echo ${HOME} # rm -rf /")
         self.assertAllowed("echo ${#x} ${x#*/}; ls")
 
