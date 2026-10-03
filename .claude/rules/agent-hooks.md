@@ -78,19 +78,13 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   - **The splitter knows comments, backticks and `case` patterns** (`_split_on_operators`):
     `# don't` desynced its quotes; a pattern's `|` is no pipe and a plain pattern is dropped.
   - **Braces inside quotes are text** (`_expand_braces`); `bash -c`/`eval` re-expand a quoted script.
-  - **A single-quoted substitution is text ONLY on a line that is ONE allowlisted stage, no redirection**
-    (`_quoted_text_only`: echo (not printf: `-v` assigns), `git commit` + EXACT option allowlist (git abbreviates `--trai`), `gh pr|issue create|edit|comment`),
-    with NOTHING but reserved words before the program — `GIT_EDITOR='$(x)' git commit` runs it.
-    - Nothing bash rewrites may be bare on that line (`$ * ? [ { ~` backtick): the tokens judged are
-      shlex's, and `$"--trailer"`/`[-]-trailer` become a git option only once bash expands them.
-    - Never widen it to "skip unless a modelled executor is present": `| sh`, `find -exec sh -c`,
-      `xargs sh -c`, `<<<` into a shell, `flock`, `env -S`, `git -c core.pager=` each run it.
-    - Never widen it to several stages or a redirect: `printf -v GIT_EDITOR '$(x)'; git commit`
-      and `echo '<trailer cmd $(x)>' >> .git/config; git commit --trailer …` were proved bypasses.
+  - **A single-quoted `$(…)` is classified as if it ran** — `git commit -m '$(…)'` is a known false
+    deny. Scoping "text where nothing runs it" was tried and backed out (XERK-1256, now XERK-1541): pipes,
+    `printf -v`, redirects into `.git/config`, `--trailer` (+ git's option abbreviation) and
+    shlex-vs-bash word differences each leaked a proved bypass. Don't retry without a bash parser.
+    - So quoted assignment values are read whole (`_VAR_ASSIGN_RE`): `x='rm -rf /'; eval $x`.
   - **`#` after `)` is never a comment** (`_is_comment`): `$(x)#; rm …` continues the word, so bash
     runs the rest; a subshell's `)#` read as text only classifies more.
-    - Quoted assignment values are read whole (`_VAR_ASSIGN_RE`); without that, skipping quoted
-      substitutions lost `x='$(rm -rf /)'; eval $x`.
   - **An opaque substitution glued to a word is also read as EMPTY** (`glued_empty`): `$(true)rm`
     runs `rm`. A standalone one stays the placeholder — an empty word reads as the root.
   - **`_var_values` resolves a value naming an assigned variable once** (`d=$d/x`): left in, each

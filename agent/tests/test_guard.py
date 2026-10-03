@@ -1014,21 +1014,20 @@ class TestParserGaps(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
 
-    def test_a_single_quoted_substitution_is_text(self):
-        for cmd in (f"git commit -m '$({self.R})'", f"echo '`{self.R}`'",
-                    f"gh pr create --title t --body '$({self.R})'",
-                    f"(git commit -m '$({self.R})')",
-                    f"git commit -qam '$({self.R})'", f"git commit --message='$({self.R})' --no-verify",
-                    f"git commit -a -m x -m '$({self.R})'",
-                    f"git commit -m '$({self.R})' -- a.txt",
-                    "echo \\$\\(rm -rf /\\)"):
-            with self.subTest(cmd=cmd):
-                self.assertAllowed(cmd)
+    def test_a_single_quoted_substitution_is_still_classified(self):
+        """A single-quoted `$(…)` is classified as if it ran, even where bash
+        reads it as text (`git commit -m '$(…)'` — a known false deny).
+
+        Treating it as text was tried and backed out (XERK-1256): every way of
+        scoping "only where nothing runs it" leaked — pipes, `printf -v`, a
+        redirect into .git/config, `--trailer` and its abbreviations, and
+        expansions that make shlex's words differ from bash's. Each case below
+        ran its payload under bash in one of those attempts.
+        """
+        self.assertAllowed("echo \\$\\(rm -rf /\\)")
         R = self.R
-        # ...unless something runs it, or it only LOOKS single-quoted — and
-        # only where EVERY stage is a known text reader: a quoted string has
-        # more ways into a shell than the guard models.
-        for cmd in (f"bash -c 'echo $({R})'", f"eval 'echo $({R})'",
+        for cmd in (f"git commit -m '$({R})'", f"gh pr create --title t --body '$({R})'",
+                    f"bash -c 'echo $({R})'", f"eval 'echo $({R})'",
                     f"echo \"'$({R})'\"", f"x='$({R})'; eval $x",
                     f"x='{R}'; eval $x", f"echo 'x $({R})' | sh",
                     f"find . -exec sh -c 'echo $({R})' \\;", f"sh <<< 'x $({R})'",

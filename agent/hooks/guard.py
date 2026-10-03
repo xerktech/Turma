@@ -57,7 +57,6 @@ import os
 import posixpath
 import re
 import shlex
-from collections.abc import Callable
 import sys
 
 # --- command segmentation ------------------------------------------------
@@ -410,130 +409,6 @@ def _quote_states(command: str) -> list[str]:
     return out
 
 
-# Stages that only ever treat a quoted argument as TEXT — never hand it to a
-# shell, a hook, a pager or an alias. Deliberately a small allowlist, each
-# entry checked against its argv: `find -exec sh -c '…'`, `xargs sh -c`,
-# `| sh`, `<<<` into a shell, `flock`, `env -S`, `builtin eval` and
-# `git -c core.pager='…'` all turn a single-quoted string into a script, and a
-# denylist of those is never complete. What runs a git/gh editor, pager, hook,
-# signer or browser comes from the environment or config, never from argv —
-# which is why an assignment in front disqualifies the stage.
-# Not `printf`: `printf -v GIT_EDITOR '$(x)'; git commit` ASSIGNS what git
-# then runs through `sh -c` (Claude Code's shells export GIT_EDITOR).
-_QUOTED_TEXT_PROGS = {"echo"}
-# `git commit`'s options, EXACTLY — git accepts any unique prefix of a long
-# option, so `--trai 'k:$(x)'` is `--trailer`, whose configured
-# `trailer.<k>.command` splices the value into a shell command at `$ARG`
-# (proved with a touch marker). Matching what may NOT appear cannot keep up
-# with that; anything outside this set disqualifies the stage. Short options
-# cluster (`-am`), so those are checked letter by letter.
-_QUOTED_TEXT_GIT_LONG = {"--message", "--all", "--quiet", "--amend", "--allow-empty",
-                         "--no-verify", "--signoff", "--no-edit", "--verbose"}
-_QUOTED_TEXT_GIT_SHORT = set("aqnsv")
-_ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?=")
-_QUOTED_TEXT_GH = {("pr", "create"), ("pr", "edit"), ("pr", "comment"),
-                   ("issue", "create"), ("issue", "edit"), ("issue", "comment")}
-
-
-def _quoted_text_only(raw_tokens: list[str]) -> bool:
-    """Whether one stage (its UNSTRIPPED tokens) only ever reads a quoted
-    string as text.
-
-    Anything but a reserved word in front of the program disqualifies it: an
-    assignment is an environment the program may RUN — `GIT_EDITOR='$(x)' git
-    commit` has git hand it to `sh -c` — and a wrapper word is a program of its
-    own. A bare assignment stage (`GIT_EDITOR='…'; git commit`) updates an
-    exported variable the same way. The program must be a bare name: `./git`
-    is whatever that file does.
-    """
-    tokens = _strip_prefixes(raw_tokens)
-    if any(t not in _SHELL_KEYWORDS for t in raw_tokens[:len(raw_tokens) - len(tokens)]):
-        return False
-    if not tokens:
-        return True
-    prog = tokens[0]
-    if prog in _QUOTED_TEXT_PROGS:
-        return True
-    if prog == "git":
-        # `git commit` and nothing before it — a global option is config.
-        if tokens[1:2] != ["commit"]:
-            return False
-        rest = iter(tokens[2:])
-        for tok in rest:
-            if tok == "--":
-                break
-            if tok.startswith("--"):
-                name = tok.split("=", 1)[0]
-                if name not in _QUOTED_TEXT_GIT_LONG:
-                    return False
-                if name == "--message" and "=" not in tok:
-                    next(rest, None)
-            elif tok.startswith("-") and len(tok) > 1:
-                # `-m` takes the rest of the cluster, or the next token, as its value.
-                head, m, value = tok[1:].partition("m")
-                if not set(head) <= _QUOTED_TEXT_GIT_SHORT:
-                    return False
-                if m and not value:
-                    next(rest, None)
-            else:
-                return False  # a pathspec goes after `--`, where it is inert
-        return True
-    if prog == "gh":
-        return tuple(tokens[1:3]) in _QUOTED_TEXT_GH
-    return False
-
-
-def _quoted_text_line(raw_commands: str, segments: list[str]) -> bool:
-    """Whether a single-quoted substitution on this line is only ever TEXT.
-
-    Only a line that is ONE allowlisted stage with no redirection qualifies.
-    Every channel by which a stage's text reaches a shell later in the SAME
-    line was a proved bypass while this allowed several stages: a pipe
-    (`echo '$(x)' | sh`), an assignment (`printf -v GIT_EDITOR '$(x)'; git
-    commit`), a file (`echo '<trailer command = $(x)>' >> .git/config; git
-    commit --trailer …`). One stage cannot feed itself; `${VAR:=…}` is refused
-    too since it assigns from inside a word.
-    """
-    if len(segments) != 1 or _ASSIGNING_EXPANSION_RE.search(raw_commands):
-        return False
-    # Nothing bash rewrites may be left bare either: the tokens judged below
-    # are shlex's, not bash's, and `$"--trailer"`, `[-]-trailer`, `*` or
-    # `{a,b}` become options (or several words) only once bash expands them.
-    states = _quote_states(raw_commands)
-    if any(ch in "<>$*?[{~`" and not states[i] for i, ch in enumerate(raw_commands)):
-        return False
-    return _quoted_text_only(_tokenize(_unwrap_group(segments[0])))
-
-
-def _live_substs(segment: str, quoted_text: bool = False) -> list["re.Match[str]"]:
-    """The substitutions in ``segment`` bash would actually run.
-
-    `git commit -m '$(rm -rf /)'` runs nothing — inside single quotes (or after
-    a backslash) it is text — and expanding it refused the commit (XERK-1256).
-    That holds only when ``quoted_text``: the WHOLE command line is stages that
-    read a quoted string as text (`_quoted_text_only`). Anywhere else a quoted
-    `$(…)` may reach a shell by a channel nothing here models
-    (`echo '$(…)' | sh`), so it is classified as if it ran.
-    """
-    if not quoted_text:
-        return list(_SUBST_RE.finditer(segment))
-    states = _quote_states(segment)
-    return [m for m in _SUBST_RE.finditer(segment) if states[m.start()] not in ("'", "\\")]
-
-
-def _sub_live(segment: str, repl: Callable[["re.Match[str]"], str],
-              quoted_text: bool = False) -> str:
-    """``_SUBST_RE.sub`` over the live substitutions only."""
-    parts: list[str] = []
-    last = 0
-    for m in _live_substs(segment, quoted_text):
-        parts.append(segment[last:m.start()])
-        parts.append(repl(m))
-        last = m.end()
-    parts.append(segment[last:])
-    return "".join(parts)
-
-
 def _subst_standalone(m: "re.Match[str]") -> bool:
     """Whether the substitution is a whole word of its own (quotes aside)."""
     s, a, b = m.string, m.start(), m.end()
@@ -596,8 +471,7 @@ _IFS_RE = re.compile(r"\$\{IFS\}|\$IFS")
 _ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
 _BRACE_RE = re.compile(r"\{([^{}\s]+,[^{}\s]*)\}")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
-# inlined as `eval 'rm`. The substitution scan skips single quotes, so inlining
-# is the only way `x='$(rm -rf /)'; eval $x` is seen at all (XERK-1256).
+# inlined as `eval 'rm` (XERK-1256).
 _VAR_ASSIGN_RE = re.compile(
     r"(?:^|[;\n&|]|\bexport\s+)\s*([A-Za-z_][A-Za-z0-9_]*)="
     r"('[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n]+)"
@@ -1199,7 +1073,6 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
     # be judged against what is actually going to be fed to it.
-    quoted_text = _quoted_text_line(raw_commands, segments)
     piped_operands: list[str] = []
     for raw in segments:
         for tok in _tokenize(raw):
@@ -1213,17 +1086,16 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
             for frag in _stray_group_fragments(raw):
                 out.extend(_expand_segments(frag, depth + 1))
         # Anything a substitution would run, wherever it sits in the segment.
-        for m in _live_substs(raw, quoted_text):
+        for m in _SUBST_RE.finditer(raw):
             inner = _subst_inner(m)
             if inner.strip():
                 out.extend(_expand_segments(inner, depth + 1))
         # A substitution also CONTRIBUTES text where it sits — `$(echo …)` is
         # what `eval "$(echo rm -rf /etc)"` runs and what `rm -rf $(echo /etc)`
         # deletes. Both fall out of substituting rather than erasing.
-        seg = _unwrap_group(_sub_live(raw, _subst_text, quoted_text))
+        seg = _unwrap_group(_SUBST_RE.sub(_subst_text, raw))
         # ...and one that printed nothing leaves the word it is glued to.
-        bare = _unwrap_group(
-            _sub_live(raw, lambda m: _subst_text(m, glued_empty=True), quoted_text))
+        bare = _unwrap_group(_SUBST_RE.sub(lambda m: _subst_text(m, glued_empty=True), raw))
         if bare != seg and bare:
             out.extend(_expand_segments(bare, depth + 1))
         if seg != raw.strip() and seg:
