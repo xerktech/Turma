@@ -58,11 +58,26 @@ paths:
 
 ### The release DEPLOYS the hub (XERK-425)
 
-- `build-turma-image`'s last step rewrites the k8x hub manifest's `image:` line in the private GitOps
-  repo (`ai/turma/deployment.yaml`, xerktech/ArgoCD) and commits to main. That Application is
-  `automated`+`selfHeal`, so **the commit is the deploy**.
-- **Every failure is loud** — no `ARGOCD_DEPLOY_KEY` or no `image:` line fails the step; a silent
-  skip is a cluster that quietly never updates behind a green pipeline.
+- The `deploy-argocd` job (after `build-turma-image`) rewrites the k8x hub manifest's `image:` line in
+  the private GitOps repo (`ai/turma/deployment.yaml`, xerktech/ArgoCD) and commits to main. That
+  Application is `automated`+`selfHeal`, so **the commit is the deploy**.
+- **It pins `<version>@<digest>`, never the tag alone** (XERK-1410). The version tag is only created
+  by `publish`, so a release that pushed `:X` and then failed lets the next one re-plan and overwrite
+  `:X`; a tag-only pin would then be byte-identical, commit nothing, and leave the pod on the old
+  build (no `imagePullPolicy` → `IfNotPresent`). The digest comes from `build-push-action`'s output.
+- **Pushes retry**: other repos' release bots push to ArgoCD main too, so a non-fast-forward is
+  reset onto the new main, re-edited and retried (3 attempts), not a failed release.
+- **The guard grep is anchored at line start** (`^[[:space:]]*image:`) so a comment naming the
+  image cannot pass for the line.
+- **Every failure is loud** — no `ARGOCD_DEPLOY_KEY`, no digest, or no `image:` line fails the job,
+  and a failed deploy blocks `publish`; a silent skip is a cluster that quietly never updates behind
+  a green pipeline.
+- **The key lives in the `argocd-deploy` Environment (main-only branch policy)**, in its own job so
+  the build never holds it. **Never also add a repo-level `ARGOCD_DEPLOY_KEY`**: a repo secret is
+  readable by a workflow edited on any branch, and silently backs the env one if that is removed.
+- `publish` needs `build-turma-image` and `deploy-argocd` to be `success` or `skipped`, not merely
+  `!= failure` — a timed-out job reports `cancelled` (and a cancelled build skips the deploy), and that
+  version must not be tagged.
 - Auths with a **write deploy key**, never a PAT (`GITHUB_TOKEN` can't reach another repo; a classic
   PAT carries the whole account; a fine-grained one expires silently). GitHub's host key is pinned,
   not accepted on first use.

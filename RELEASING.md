@@ -123,22 +123,32 @@ The `k8x` hub is a Kubernetes Deployment in the private **xerktech/ArgoCD** repo
 (`ai/turma/deployment.yaml`). Its Argo CD Application is `automated` +
 `selfHeal`, so a commit to that file *is* the deploy.
 
-The last step of `build-turma-image` therefore rewrites that file's `image:`
-line to `ghcr.io/<owner>/turma:<version>` — the tag it just pushed — and commits
-it to `main`. It is skipped on a dry run (which pushes no image) and off `main`
-(a dispatch takes any ref, and this is the step that reaches production), and it
-fails loudly if the manifest has no line to update, since a cluster that quietly
-never updates is the failure it exists to prevent.
+The `deploy-argocd` job, which runs after `build-turma-image`, therefore
+rewrites that file's `image:` line to `ghcr.io/<owner>/turma:<version>@<digest>`
+— the digest is the one the build just pushed — and commits it to `main`. The
+digest is what makes it a deploy: a version number reused after a release that
+failed before `publish` tagged it would otherwise leave the line unchanged, and
+the cluster on the previous build (XERK-1410). A push that loses a race with
+another repo's bot is rebased and retried (three attempts). It is skipped on a
+dry run (which pushes no image) and off `main` (a dispatch takes any ref, and
+this is the job that reaches production), and it fails loudly if the build gave
+no digest or the manifest has no line to update, since a cluster that quietly
+never updates is the failure it exists to prevent. A failed deploy blocks
+`publish`, so the version is not tagged and the next release retries it.
 
 It authenticates with a **write deploy key** on the GitOps repo, held as the
-secret **`ARGOCD_DEPLOY_KEY`** (the private half; the public half is a deploy
-key titled `turma-release` on that repo). Not a PAT: `GITHUB_TOKEN` is scoped to
+secret **`ARGOCD_DEPLOY_KEY`** in the **`argocd-deploy` Environment**, whose
+deployment-branch policy admits only `main` (the private half; the public half is a deploy key titled
+`turma-release (XERK-1410)` on that repo). That only keeps it from other
+branches once no repo-level secret of the same name exists — a repo secret is
+readable from any branch and would also be the silent fallback if the
+environment's copy were removed (the pre-XERK-1410 one is deleted by XERK-1439). Not a PAT: `GITHUB_TOKEN` is scoped to
 this repo, a classic PAT would carry a whole account into CI, and a fine-grained
 one expires — which fails as a deploy that silently stops happening. Revoke by
 deleting the deploy key.
 
 One thing it deliberately does not do: fire for a **carried** (unchanged) hub,
-because the job it lives in doesn't run then; but "built" is not "changed" —
+because `build-turma-image` doesn't run then; but "built" is not "changed" —
 `changes.js` maps the whole `turma/` prefix, so a test-only merge still rebuilds
 and redeploys a runtime-identical hub (XERK-426). The `k8x` agent runs natively
 (not as an image this release publishes), so nothing here deploys it.
