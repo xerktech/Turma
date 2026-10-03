@@ -21182,6 +21182,11 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         p = mock.patch.object(ha.subprocess, "run", fake_subprocess_run)
         p.start()
         self.addCleanup(p.stop)
+        # The faked "no server" listings must not consult the HOST's real
+        # sockets (a live `-L turma` server here would read as orphaned).
+        p = mock.patch.object(ha, "_orphaned_tmux_server", return_value=False)
+        p.start()
+        self.addCleanup(p.stop)
         p = mock.patch.object(ha.SessionManager, "_kill_ttyd",
                               lambda self, sid: self and self.killed_ttyd.append(sid))
         p.start()
@@ -21284,6 +21289,21 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
                 sm._sweep_dead_sessions()
             self.assertEqual(sess["status"], "error")
             self.assertEqual(sm.killed_ttyd, ["s1"])
+
+    def test_a_live_server_that_lost_its_socket_is_never_read_as_empty(self):
+        # XERK-1259: a /tmp cleaner deleting the socket file of a RUNNING server
+        # makes its client say the same "no server running" as an exited one.
+        # Its sessions are alive; reaping them orphans their agents.
+        for listing in (self.NO_SERVER, self.NO_SOCKET):
+            sm = self.make_manager(listing=listing)
+            with mock.patch.object(ha, "_orphaned_tmux_server", return_value=True):
+                self.assertIsNone(sm._live_tmux_panes())
+                sess = self._sess()
+                sm.registry = [sess]
+                for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+                    sm._sweep_dead_sessions()
+            self.assertEqual(sess["status"], "running")
+            self.assertEqual(sm.killed_ttyd, [])
 
     def test_a_queued_session_is_never_reaped(self):
         # A queued record has no tmux BY DESIGN — _drain_queue provisions it later.
@@ -34604,6 +34624,16 @@ class TestAgentTmuxSocket(unittest.TestCase):
     def _default(self, *args):
         return subprocess.run(["tmux", *args], capture_output=True, text=True)
 
+    def _orphanable_session(self, name):
+        """Start `name` on the agent server, cleaned up by PID: once a test moves
+        the socket away, kill-server can no longer reach the server."""
+        base = ["tmux", "-L", ha.TMUX_SOCKET]
+        subprocess.run(base + ["new-session", "-d", "-s", name, "cat"], check=True)
+        pid = int(subprocess.run(base + ["display", "-p", "#{pid}"],
+                                 capture_output=True, text=True, check=True).stdout)
+        self.addCleanup(lambda: ha._pid_alive(pid) and os.kill(pid, signal.SIGTERM))
+        return os.path.join(self.tmp, f"tmux-{os.getuid()}", ha.TMUX_SOCKET)
+
     def test_a_sessions_bare_kill_server_spares_the_agents_server(self):
         # The XERK-1077 incident, replayed: a scratch server on the default
         # socket, then the session's runtime runs a bare `tmux kill-server`.
@@ -34670,16 +34700,75 @@ class TestAgentTmuxSocket(unittest.TestCase):
         # XERK-1078 delta QA: a live server whose socket file was deleted says
         # "no server running" — the same words as an exited one. The guard must
         # read that as can't-tell (None: kill nothing), never as "no agents".
-        subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "new-session", "-d", "-s",
-                        "agent-s", "cat"], check=True)
-        sock = os.path.join(self.tmp, f"tmux-{os.getuid()}", ha.TMUX_SOCKET)
+        sock = self._orphanable_session("agent-s")
         os.rename(sock, sock + ".moved")
-        self.addCleanup(lambda: os.path.exists(sock + ".moved")
-                        and os.rename(sock + ".moved", sock))
         mgr = types.SimpleNamespace(
             registry=[{"id": "s", "status": "running", "tmuxName": "agent-s"}],
             _memguard_panes_cache=None)
         self.assertIsNone(ha.SessionManager._memguard_panes(mgr))
+
+    def test_a_live_server_whose_socket_was_deleted_is_not_swept_and_is_repaired(self):
+        # XERK-1259: the ticket's repro. The server outlives its socket file, so
+        # "no server running" must read can't-tell (no strike), and the server is
+        # told to recreate its socket so the next listing reaches it again.
+        sock = self._orphanable_session("agent-s")
+        os.rename(sock, sock + ".moved")
+        mgr = types.SimpleNamespace(registry=[])
+        self.assertIsNone(ha.SessionManager._live_tmux_panes(mgr))
+        for _ in range(50):
+            if os.path.exists(sock):
+                break
+            time.sleep(0.1)
+        self.assertTrue(os.path.exists(sock), "SIGUSR1 did not recreate the socket")
+        live = ha.SessionManager._live_tmux_panes(mgr)
+        self.assertEqual(set(live), {"agent-s"})
+
+    def test_only_a_listening_socket_marks_a_server_orphaned(self):
+        # A CONNECTED socket can carry the same path (/proc/net/unix shows it on
+        # client ends too); only the listener (__SO_ACCEPTCON) is the server.
+        path = "/tmp/tmux-0/turma"
+        hdr = "Num       RefCount Protocol Flags    Type St Inode Path\n"
+        conn = f"0000: 00000003 00000000 00000000 0001 03 111 {path}\n"
+        lstn = f"0000: 00000002 00000000 00010000 0001 01 222 {path}\n"
+        lstn2 = f"0000: 00000002 00000000 00010000 0001 01 333 {path}\n"
+        for body, want in ((conn, set()), (conn + lstn, {"222"}), (hdr, set()),
+                           (lstn + lstn2, {"222", "333"})):
+            with mock.patch("builtins.open", mock.mock_open(read_data=hdr + body)):
+                self.assertEqual(ha._unix_listener_inodes(path), want)
+
+    def test_a_non_tmux_listener_on_the_path_is_never_signalled(self):
+        # SIGUSR1's default action terminates: only a tmux gets it. Its listener
+        # still means "can't tell" — something live holds the path.
+        d = os.path.join(self.tmp, f"tmux-{os.getuid()}")
+        os.makedirs(d, mode=0o700, exist_ok=True)
+        sock = os.path.join(d, ha.TMUX_SOCKET)
+        code = ("import socket,sys,time; s=socket.socket(socket.AF_UNIX); "
+                "s.bind(sys.argv[1]); s.listen(); print(1, flush=True); time.sleep(30)")
+        proc = subprocess.Popen([sys.executable, "-c", code, sock],
+                                stdout=subprocess.PIPE, text=True)
+        self.addCleanup(proc.wait)
+        self.addCleanup(proc.kill)
+        proc.stdout.readline()
+        os.unlink(sock)
+        self.assertTrue(ha._orphaned_tmux_server(["tmux", "-L", ha.TMUX_SOCKET]))
+        time.sleep(0.3)
+        self.assertIsNone(proc.poll(), "a non-tmux listener was signalled")
+
+    def test_an_exited_server_still_lists_as_empty(self):
+        # The XERK-868 half stays: a server that is really gone (its stale socket
+        # file left behind, or none at all) has no listener, so it is EMPTY.
+        subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "new-session", "-d", "-s",
+                        "agent-s", "cat"], check=True)
+        subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "kill-server"], check=True)
+        # kill-server can return before the kernel drops the listener.
+        sock = os.path.join(self.tmp, f"tmux-{os.getuid()}", ha.TMUX_SOCKET)
+        for _ in range(50):
+            if not ha._unix_listener_inodes(os.path.realpath(sock)):
+                break
+            time.sleep(0.1)
+        mgr = types.SimpleNamespace(registry=[])
+        self.assertEqual(ha.SessionManager._live_tmux_panes(mgr), {})
+        self.assertFalse(ha._orphaned_tmux_server(["tmux", "-L", ha.TMUX_SOCKET]))
 
     def test_an_empty_agent_server_does_not_blind_the_memory_guard(self):
         # XERK-1078: every running session is still legacy, and the agent's own

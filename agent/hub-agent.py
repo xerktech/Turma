@@ -1261,10 +1261,79 @@ def _tmux_socket_of(name):
 _TMUX_EMPTY_ERRS = ("no server running", "error connecting to", "no current target")
 
 
+def _tmux_socket_path(base):
+    """The socket file the tmux client `base` (`["tmux"]` or `["tmux", "-L",
+    label]`) connects to: `$TMUX_TMPDIR` (else /tmp), resolved as tmux resolves
+    it, + `tmux-<uid>/<label>`."""
+    label = base[base.index("-L") + 1] if "-L" in base else "default"
+    tmpdir = os.path.realpath(os.environ.get("TMUX_TMPDIR") or "/tmp")
+    return os.path.join(tmpdir, f"tmux-{os.getuid()}", label)
+
+
+def _unix_listener_inodes(path):
+    """Inodes of the LISTENING unix sockets still bound to `path`
+    (/proc/net/unix keeps the bound name after the file is unlinked) — empty
+    when there are none, or None when this host can't say (no /proc)."""
+    try:
+        with open("/proc/net/unix") as f:
+            lines = f.read().splitlines()[1:]
+    except OSError:
+        return None
+    found = set()
+    for line in lines:
+        # Num RefCount Protocol Flags Type St Inode [Path]
+        cols = line.split(None, 7)
+        if (len(cols) == 8 and cols[7] == path
+                and int(cols[3], 16) & 0x10000):          # __SO_ACCEPTCON
+            found.add(cols[6])
+    return found
+
+
+def _orphaned_tmux_server(base):
+    """Whether the server `base` reaches is still RUNNING although its client
+    just said `no server running` / `error connecting to` (XERK-1259): its socket
+    file was deleted (a /tmp cleaner, a session removing $TMUX_TMPDIR) while it
+    kept listening. Its sessions are alive, so that error must not read as empty.
+    Repairs it as a side effect: SIGUSR1 makes a tmux server recreate its socket,
+    so the next listing reaches it again. False where /proc can't tell (the
+    XERK-868 reading stands)."""
+    if IS_WINDOWS:
+        return False
+    path = _tmux_socket_path(base)
+    inodes = _unix_listener_inodes(path)
+    if not inodes:
+        return False
+    # Every listener on the path: one that is not tmux must not hide the
+    # tmux server that also lost its socket there.
+    targets = {f"socket:[{i}]" for i in inodes}
+    for fd_dir in glob.glob("/proc/[0-9]*/fd"):
+        try:
+            if any(os.readlink(os.path.join(fd_dir, fd)) in targets
+                   for fd in os.listdir(fd_dir)):
+                pid = int(fd_dir.split("/")[2])
+                # SIGUSR1's default action is to terminate: signal only a
+                # tmux, never some other process bound to tmux's path.
+                with open(f"/proc/{pid}/comm") as f:
+                    if not f.read().startswith("tmux"):
+                        continue
+                os.kill(pid, signal.SIGUSR1)
+                log(f"tmux: server {pid} lost its socket {path}; told it to "
+                    f"recreate it (SIGUSR1)")
+                break
+        except (OSError, ValueError):
+            continue        # another uid's process, or it exited mid-scan
+    else:
+        log(f"tmux: a live server lost its socket {path} and its pid was not "
+            f"found; its sessions can't be listed")
+    return True
+
+
 def _tmux_list_panes(base, fmt, timeout=5, empty=_TMUX_EMPTY_ERRS):
     """`list-panes -a -F fmt` on one server as (rc, stdout). A server whose
     error is one of `empty` holds NO sessions and answers (0, ""); rc is nonzero
-    or None only when the server could not answer at all."""
+    or None only when the server could not answer at all — including a live
+    server whose socket file was deleted (`_orphaned_tmux_server`), which says
+    the same `no server running` as an exited one."""
     try:
         out = subprocess.run(base + ["list-panes", "-a", "-F", fmt],
                              capture_output=True, text=True, timeout=timeout)
@@ -1273,6 +1342,9 @@ def _tmux_list_panes(base, fmt, timeout=5, empty=_TMUX_EMPTY_ERRS):
     if out.returncode == 0:
         return 0, out.stdout
     err = (out.stderr or "").lower()
+    if (any(m in err for m in ("no server running", "error connecting to"))
+            and _orphaned_tmux_server(base)):
+        return out.returncode, ""
     if any(m in err for m in empty):
         return 0, ""
     return out.returncode, ""
@@ -24042,6 +24114,10 @@ class SessionManager:
         Every OTHER nonzero rc (a wedged tmux, a permissions error, a failure to
         launch at all) stays "can't tell" — `_sweep_dead_sessions` must err toward
         leaving sessions alone, so only `_TMUX_EMPTY_ERRS` mean empty.
+        Except from a server still RUNNING whose socket file was deleted
+        (XERK-1259): its client says the same `no server running`, so
+        `_tmux_list_panes` checks for a live listener on that path first, reads
+        it as "can't tell", and has the server recreate its socket.
         So does a line that does not parse: a partial read could drop a live
         agent pane."""
         if IS_WINDOWS:
