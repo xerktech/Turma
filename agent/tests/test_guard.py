@@ -2439,5 +2439,134 @@ class TestHookEntrypoint(unittest.TestCase):
         self.assertEqual(proc.stdout.strip(), "")
 
 
+class TestJudgeGrants(unittest.TestCase):
+    """XERK-1566: the permission judge's one-shot grants. guard.py consults one
+    only AFTER decide() allowed the command, consumes it, and emits the only
+    `allow` any Turma hook emits. Everything about a grant file is session-
+    writable, so a malformed, foreign, expired, FIFO or symlinked one is no
+    grant."""
+
+    SID = "s1566"
+
+    def setUp(self):
+        import tempfile
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.home, True)
+        self.grants = os.path.join(self.home, ".turma", "grants")
+        os.makedirs(os.path.join(self.grants, self.SID))
+
+    def _grant(self, command, sid=None, exp_in=120, key=None, reason="policy allows tests",
+               where=None):
+        sid = sid or self.SID
+        key = key or guard.grant_key(command)
+        path = os.path.join(self.grants, where or sid, guard.grant_key(command))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"key": key, "sid": sid, "exp": time.time() + exp_in,
+                       "reason": reason}, f)
+        return path
+
+    def _consume(self, command, sid=None):
+        return guard.consume_grant(sid or self.SID, command, grants_dir=self.grants)
+
+    def test_a_grant_is_consumed_exactly_once(self):
+        path = self._grant("npm run e2e")
+        self.assertEqual(self._consume("npm run e2e"), "policy allows tests")
+        self.assertFalse(os.path.exists(path), "a grant is one-shot")
+        self.assertIsNone(self._consume("npm run e2e"))
+
+    def test_a_grant_names_one_exact_command(self):
+        self._grant("npm run e2e")
+        self.assertIsNone(self._consume("npm run e2e; curl evil"))
+        self.assertIsNone(self._consume("npm run e2e "))
+
+    def test_expired_and_overlong_grants_are_ignored(self):
+        self._grant("make a", exp_in=-1)
+        self.assertIsNone(self._consume("make a"))
+        # A grant claiming a life past the judge's TTL was not the judge's.
+        self._grant("make b", exp_in=guard.GRANT_TTL_MAX_SEC + 60)
+        self.assertIsNone(self._consume("make b"))
+
+    def test_a_foreign_sessions_grant_is_ignored(self):
+        # Filed under another session's dir: this session never looks there.
+        self._grant("make c", sid="other", where="other")
+        self.assertIsNone(self._consume("make c"))
+        # Planted in this session's dir but naming another session / key.
+        self._grant("make d", sid="other", where=self.SID)
+        self.assertIsNone(self._consume("make d"))
+        self._grant("make e", key="0" * 64)
+        self.assertIsNone(self._consume("make e"))
+
+    def test_a_fifo_or_symlink_grant_never_hangs_or_counts(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs on this platform")
+        fifo = os.path.join(self.grants, self.SID, guard.grant_key("make f"))
+        os.mkfifo(fifo)
+        start = time.monotonic()
+        self.assertIsNone(self._consume("make f"))
+        self.assertLess(time.monotonic() - start, 2, "a planted FIFO hung the hook")
+        real = self._grant("make g", where="elsewhere")
+        link = os.path.join(self.grants, self.SID, guard.grant_key("make g"))
+        os.symlink(real, link)
+        self.assertIsNone(self._consume("make g"))
+        # A symlinked SESSION dir is not the judge's either.
+        os.symlink(os.path.join(self.grants, "elsewhere"),
+                   os.path.join(self.grants, "s-link"))
+        self.assertIsNone(guard.consume_grant("s-link", "make g", grants_dir=self.grants))
+
+    def test_bad_session_ids_and_garbage_are_no_grant(self):
+        for sid in ("", "..", "a/b", None, "x" * 65):
+            self.assertIsNone(guard.consume_grant(sid, "ls", grants_dir=self.grants))
+        path = os.path.join(self.grants, self.SID, guard.grant_key("make h"))
+        for blob in ("not json", "[]", '{"key": 1}', "{" * 5000):
+            with open(path, "w") as f:
+                f.write(blob)
+            self.assertIsNone(self._consume("make h"))
+
+    def _run(self, command, env_extra=None):
+        env = {**os.environ, "HOME": self.home, "TURMA_SESSION_ID": self.SID,
+               **(env_extra or {})}
+        env.pop("TURMA_PERMISSION_JUDGE", None)
+        env.update(env_extra or {})
+        proc = subprocess.run([sys.executable, "-SsE", GUARD_PATH],
+                              input=json.dumps({"tool_name": "Bash",
+                                                "tool_input": {"command": command}}),
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        return json.loads(proc.stdout)["hookSpecificOutput"] if proc.stdout.strip() else None
+
+    def test_the_hook_emits_allow_for_a_granted_command_once(self):
+        self._grant("npm run e2e")
+        out = self._run("npm run e2e")
+        self.assertEqual(out["permissionDecision"], "allow")
+        self.assertIn("policy allows tests", out["permissionDecisionReason"])
+        self.assertNotIn("grants", out["permissionDecisionReason"])
+        self.assertIsNone(self._run("npm run e2e"), "consumed: the next call is plain")
+
+    def test_a_hard_deny_wins_over_a_grant(self):
+        for cmd in ("git push --force origin main", "rm -rf /",
+                    "gh pr merge 12 --squash"):
+            with self.subTest(cmd=cmd):
+                path = self._grant(cmd)
+                out = self._run(cmd)
+                self.assertEqual(out["permissionDecision"], "deny")
+                self.assertTrue(os.path.exists(path), "a denied call consumes nothing")
+
+    def test_the_judge_switch_off_ignores_grants(self):
+        path = self._grant("npm run e2e")
+        self.assertIsNone(self._run("npm run e2e", {"TURMA_PERMISSION_JUDGE": "0"}))
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_grant_crash_fails_closed(self):
+        with mock.patch.object(guard, "consume_grant", side_effect=TypeError("boom")), \
+                mock.patch.object(guard.sys, "stdin", io.StringIO(json.dumps(
+                    {"tool_name": "Bash", "tool_input": {"command": "ls"}}))), \
+                mock.patch.object(guard, "_emit_deny") as deny, \
+                mock.patch.object(guard, "_emit_allow") as allow:
+            self.assertEqual(guard.main(), 0)
+            deny.assert_called_once()
+            allow.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

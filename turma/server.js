@@ -534,6 +534,11 @@ const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-
 // TICKET_QUEUE_RATE_MAX). Hub-owned durable state like autostart-orgs.json:
 // per-org, tiny, must survive a hub restart, rides the fleet payload + SSE.
 const TRIAGE_POLICIES_FILE = process.env.TRIAGE_POLICIES_FILE || "/data/triage-policies.json";
+// Per-org permission policy TEXT (XERK-1566): siteKey -> {text, at}. The agent's
+// permission judge decides Bash permission prompts against it; it rides every
+// heartbeat reply as `permissionPolicy`. Same store shape/lifecycle as
+// triage-policies.json (operator-set, low churn). Absent = the default text.
+const PERMISSION_POLICIES_FILE = process.env.PERMISSION_POLICIES_FILE || "/data/permission-policies.json";
 // Per-ticket operator triage decision (XERK-486 [F]): "<siteKey>/<issueKey>" ->
 // "approve" | "hold" | "reject". approve forces auto-start eligibility past the
 // org policy and the model's triage gate; hold keeps the ticket out of the auto
@@ -2853,6 +2858,76 @@ function setTriagePolicy(siteKey, patch) {
   persistTriagePolicies();
   invalidateAgentsCache();
   sseBroadcast("triagePolicies", triagePolicies);
+}
+
+// ---- per-org permission policy text (XERK-1566) -----------------------------
+// What the agent-side permission judge decides a Bash permission prompt against:
+// free text the operator writes, handed to `claude -p` with the request. Served
+// on every heartbeat reply as `permissionPolicy` for the host's DECIDED org
+// (`decidedOrgOf` — the bound org, never the claimed one: the policy is what
+// lets a session's command run unprompted, so it follows the same boundary the
+// peer roster does). An org with no stored text gets the default; an org whose
+// operator saved "" gets "", which the judge reads as "stand down".
+const PERMISSION_POLICY_MAX = 16000;
+// Mirrors the operator config's autoMode allow / soft_deny lists (XERK-1561),
+// minus host-specific paths. The judge's deterministic never-list (hub-agent.py)
+// already refuses the soft_deny half whatever this text says.
+const DEFAULT_PERMISSION_POLICY = [
+  "Allow (the operator pre-authorises these for every session):",
+  "- Pushing a NON-default branch (anything other than main/master) of the session's own repository, and gh pr create / gh pr edit / gh pr checks / gh pr view on it.",
+  "- Running the repository's own tests, builds and linters (npm/node, python unittest/pytest, gradle, go, cargo, docker build/compose) inside a Turma worktree under a .turma/worktrees/ path.",
+  "- terraform fmt, terraform validate and terraform plan.",
+  "- Installing user-local tooling QA needs (pip --user, npm -g under the user prefix, a JDK or SDK under $HOME) - never system-wide package installs.",
+  "- Read-only kubectl (get/describe/logs/top) and read-only gh/docker/talosctl inspection.",
+  "- Creating, commenting on, linking and transitioning tracker tickets through the configured tracker CLI or MCP, including moving the session's OWN ticket to Done.",
+  "- Reading the Turma session roster (~/.turma/peers.tsv) and messaging a peer session named in it.",
+  "",
+  "Never allow (a human decides):",
+  "- Merging a PR (gh pr merge, --auto) - a human or the hub's auto-merge does that.",
+  "- Any push to main or master, any force push, and deleting a branch.",
+  "- terraform apply / destroy, kubectl apply|delete|patch|scale|rollout restart, argocd app sync - production changes.",
+  "- docker stop / docker rm, rm -rf of live data or config directories, aws s3 rb.",
+  "- Writing to another session's worktree, or to the host's own checkout from a worktree session.",
+  "- Anything not clearly covered above.",
+].join("\n");
+let permissionPolicies = Object.create(null);
+const permissionPoliciesCoerce = (raw) => {
+  const out = Object.create(null);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [k, v] of Object.entries(raw)) {
+      if (!v || typeof v !== "object" || Array.isArray(v) || typeof v.text !== "string") continue;
+      out[k] = { text: v.text.slice(0, PERMISSION_POLICY_MAX),
+        at: Number.isFinite(v.at) ? v.at : 0 };
+    }
+  }
+  return out;
+};
+permissionPolicies = permissionPoliciesCoerce(readJsonFile(PERMISSION_POLICIES_FILE));
+const persistPermissionPolicies = registerExternalStore({
+  name: "permissionPolicies", file: PERMISSION_POLICIES_FILE,
+  coerce: permissionPoliciesCoerce, read: () => permissionPolicies,
+  install: (v) => { permissionPolicies = v; },
+});
+// Own keys only: an org named "constructor" must not read a prototype member.
+function storedPermissionPolicy(siteKey) {
+  return siteKey && Object.prototype.hasOwnProperty.call(permissionPolicies, siteKey)
+    ? permissionPolicies[siteKey] : null;
+}
+// The text the judge on a host in `siteKey` decides against.
+function permissionPolicyText(siteKey) {
+  const p = storedPermissionPolicy(siteKey);
+  return p ? p.text : DEFAULT_PERMISSION_POLICY;
+}
+// Set an org's text, or (text === null) drop it back to the default.
+function setPermissionPolicy(siteKey, text) {
+  if (text === null) delete permissionPolicies[siteKey];
+  else permissionPolicies[siteKey] = { text: text.slice(0, PERMISSION_POLICY_MAX), at: Date.now() };
+  persistPermissionPolicies();
+}
+// What a heartbeat reply carries: the decided org's text (or the default).
+function permissionPolicyReply(a) {
+  const site = (a && decidedOrgOf(a)) || "";
+  return { site: site || null, text: permissionPolicyText(site), isDefault: !storedPermissionPolicy(site) };
 }
 
 // ---- epic auto-orchestration run records (XERK-635, epic XERK-633) ----------
@@ -16592,11 +16667,15 @@ const server = http.createServer(async (req, res) => {
       // should ship a cheap INVENTORY and let the hub choose what to push, rather
       // than guess with an in-RAM rotation. A hub rollback (marker gone) reverts
       // the agent to the manifest path within one refresh beat.
+      // The org's permission policy text (XERK-1566) rides every reply like
+      // the roster: the agent's judge decides Bash permission prompts against
+      // it, and an agent that gets a reply WITHOUT one stands its judge down.
+      const permissionPolicy = permissionPolicyReply(agents[key]);
       return json(res, 200, archiveHave
         ? { commands: reply, peers, bodyMax, archiveOffer: "hub", archiveHave,
             archiveShed, archiveFull, archiveRawHave, archiveRawSkip,
-            archiveChunkMax: ARCHIVE_CHUNK_BODY_MAX }
-        : { commands: reply, peers, bodyMax, archiveOffer: "hub" });
+            archiveChunkMax: ARCHIVE_CHUNK_BODY_MAX, permissionPolicy }
+        : { commands: reply, peers, bodyMax, archiveOffer: "hub", permissionPolicy });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
@@ -18345,6 +18424,34 @@ const server = http.createServer(async (req, res) => {
             + "so check the board before making it again" });
       }
       return json(res, 202, { pending: true });
+    }
+
+    // GET|POST /api/jira/<siteKey>/permission-policy — the org's permission
+    // policy TEXT (XERK-1566), which the agent-side judge decides Bash permission
+    // prompts against. GET -> {text, isDefault, defaultText}. POST {text: string}
+    // sets it ("" switches the judge off for the org); {text: null} drops back to
+    // the default. Hub-owned durable state like /triage-policy: authoritative on
+    // return, the org must be one the fleet reports, no host need be online.
+    if ((req.method === "GET" || req.method === "POST") && parts[0] === "api" &&
+        parts[1] === "jira" && parts.length === 4 && parts[3] === "permission-policy") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!Object.values(agents).some((a) => hostInOrg(a, siteKey))) {
+        return json(res, 404, { error: "no host reports that Jira org" });
+      }
+      if (req.method === "POST") {
+        const body = JSON.parse((await readBody(req)) || "{}");
+        const text = body && Object.prototype.hasOwnProperty.call(body, "text") ? body.text : undefined;
+        if (text !== null && typeof text !== "string") {
+          return json(res, 400, { error: "body needs {text: string} (or {text: null} for the default)" });
+        }
+        if (typeof text === "string" && text.length > PERMISSION_POLICY_MAX) {
+          return json(res, 413, { error: `policy text is longer than ${PERMISSION_POLICY_MAX} characters`,
+            limit: PERMISSION_POLICY_MAX });
+        }
+        setPermissionPolicy(siteKey, text);
+      }
+      return json(res, 200, { ok: true, text: permissionPolicyText(siteKey),
+        isDefault: !storedPermissionPolicy(siteKey), defaultText: DEFAULT_PERMISSION_POLICY });
     }
 
     // GET /api/jira/<siteKey>/<issueKey> -> one ticket's full detail
@@ -20137,6 +20244,13 @@ if (process.env.TURMA_TEST) {
     triagePolicies,
     setTriagePolicy,
     sanitizeTriagePolicy,
+    // The per-org permission policy text the agent's judge reads (XERK-1566).
+    permissionPolicies: () => permissionPolicies,
+    setPermissionPolicy,
+    permissionPolicyText,
+    permissionPolicyReply,
+    DEFAULT_PERMISSION_POLICY,
+    PERMISSION_POLICY_MAX,
     triagePolicyReason,
     autoStartRateMax,
     ticketTriageActions,

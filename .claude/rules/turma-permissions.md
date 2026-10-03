@@ -142,8 +142,31 @@ consumes this table; it does not replace it.
   - An unchanged card is not repainted: the skip compares the last PAINTED string (`permPainted`),
     never `$perms.innerHTML`, which a browser re-serializes (`open` → `open=""`) so it never matched.
 
+## The permission judge's hub half (XERK-1566)
+
+- **`judged` is a fourth `kind`**: a row the agent's judge wrote for one Bash prompt. It carries
+  `verdict` (allow|stand — strict, a bad one drops to absent) and `judgeReason` (capped 300); both
+  ride `recent`. The Usage card labels it "Judged" and shows `judge: <verdict> — <reason>`.
+- **Policy text is hub-owned, per org**: `permissionPolicies[siteKey] = {text, at}`
+  (`PERMISSION_POLICIES_FILE`, `/data/permission-policies.json`), the `triagePolicies` store shape —
+  `registerExternalStore` is right here (operator-set, low churn), null-prototype map + coerce like
+  every org-keyed map (XERK-1451). An org with no entry reads `DEFAULT_PERMISSION_POLICY` (mirrors
+  the operator config's `autoMode` allow/soft_deny lists, minus host paths); a stored `""` is the
+  operator turning the judge off for that org.
+- **It rides EVERY heartbeat reply** as `permissionPolicy: {site, text, isDefault}`, keyed on the
+  host's DECIDED org (`decidedOrgOf`) — never the claimed `jira.siteKey`: the text decides what a
+  session may run unprompted, the same boundary as the peer roster. A drifted or never-bound host
+  gets the default. The agent forgets the text on a reply without the key (an older hub).
+- **`GET|POST /api/jira/<site>/permission-policy`** (user-authed, placed BEFORE the
+  `/api/jira/<site>/<issueKey>` detail route, which would read it as an issue key): GET →
+  `{text, isDefault, defaultText}`; POST `{text: string}` sets, `{text: null}` resets; 400 on any
+  other shape, 413 past `PERMISSION_POLICY_MAX` (16000), 404 for an org no host is in
+  (`hostInOrg`). Edited from the board's "Permission policy" modal (`permissionRules*` ids);
+  Android: a `PARITY.md` line.
+
 ## Tests
 
-Agent-side tests are listed in `agent-permissions.md`. `permission-ledger.test.js`
+The `XERK-1566:` cases in `server.test.js` (reply, decided-org keying, route refusals, judged rows),
+`external-stores.test.js` and `board.test.js`. Agent-side tests are listed in `agent-permissions.md`. `permission-ledger.test.js`
 (ingest bounds, aggregates, the rule table, scoping, file + fake-Postgres backends); the `XERK-1563:`
 cases in `server.test.js` (ingest, org scoping, auth, `/metrics`) and `usage.test.js` (the card).

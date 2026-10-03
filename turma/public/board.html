@@ -55,6 +55,10 @@
       title="Decides which To Do tickets each org's auto-start sweep qualifies: minimum priority, excluded types, repo allow/deny, auto-start rate (XERK-486)">
       Triage policy
     </button>
+    <button id="permissionPolicy" class="board-refresh"
+      title="The org's written permission policy: the permission judge auto-approves a session's blocked Bash command only when this text clearly covers it (XERK-1566)">
+      Permission policy
+    </button>
     </div>
   </div>
   <div id="epicBuilders"></div>
@@ -73,6 +77,11 @@
        rename these back to a bare `policy*`. -->
   <div class="td-backdrop" id="triageRulesBackdrop" hidden>
     <div class="td-panel td-narrow" id="triageRulesPanel" role="dialog" aria-modal="true" aria-label="Triage policy"></div>
+  </div>
+  <!-- XERK-1566: the org's permission policy text. Same backdrop/narrow-panel
+       pattern; ids are `permissionRules*`, never a bare `policy*` (XERK-587). -->
+  <div class="td-backdrop" id="permissionRulesBackdrop" hidden>
+    <div class="td-panel td-narrow" id="permissionRulesPanel" role="dialog" aria-modal="true" aria-label="Permission policy"></div>
   </div>
   <!-- XERK-726: the "New epic from idea" composer. Same backdrop/narrow-panel
        pattern as the triage-policy modal above. -->
@@ -1686,7 +1695,8 @@ function closePolicyPanel() {
 // Either overlay locks the page scroll; release it only when both are closed.
 function syncOverlayLock() {
   document.body.classList.toggle("td-open",
-    !!(openTicketState || !$policyBackdrop.hidden || !$ebBackdrop.hidden));
+    !!(openTicketState || !$policyBackdrop.hidden || !$ebBackdrop.hidden
+      || !$permBackdrop.hidden));
 }
 
 // Read the current form fields into the patch shape the hub expects; empty
@@ -1767,6 +1777,128 @@ $policyPanel.addEventListener("change", (e) => {
   if (org) { policySiteKey = org.value; policyErr = ""; paintPolicyPanel(); }
 });
 $policyBackdrop.addEventListener("click", (e) => { if (e.target === $policyBackdrop) closePolicyPanel(); });
+
+// --- Per-org permission policy text (XERK-1566) --------------------------------
+// The text the agent-side permission judge decides a session's blocked Bash
+// command against. Hub-owned, read and written through its own route (it does
+// not ride /api/agents): the panel GETs the org's text on open, Save POSTs it,
+// "Use default" POSTs {text:null}. Saving an empty text switches the judge off
+// for that org. The panel is painted on open / org change / busy / error only,
+// never on a beat, so typing keeps its caret. DOM ids `permissionRules*`, never
+// a bare `policy*` (XERK-587).
+const $permBackdrop = document.getElementById("permissionRulesBackdrop");
+const $permPanel = document.getElementById("permissionRulesPanel");
+const $permBtn = document.getElementById("permissionPolicy");
+const permState = { siteKey: null, text: "", isDefault: true, loading: false, busy: false, err: "" };
+
+function permissionPanelHtml() {
+  const sites = policySites();
+  if (!sites.length) return "";
+  if (!permState.siteKey || !sites.some(s => s.siteKey === permState.siteKey)) {
+    permState.siteKey = sites[0].siteKey;
+  }
+  const orgRow = sites.length === 1
+    ? `<div class="tp-field"><span>Org</span><input type="text" value="${esc(B.orgName(permState.siteKey, sites[0].orgName))}" disabled></div>`
+    : `<label class="tp-field"><span>Org</span><select data-perm-org="1">` +
+      sites.map(s => `<option value="${esc(s.siteKey)}"${s.siteKey === permState.siteKey ? " selected" : ""}>${esc(B.orgName(s.siteKey, s.orgName))}</option>`).join("") +
+      `</select></label>`;
+  const busy = permState.loading || permState.busy;
+  return `<div class="td-head">
+      <span class="tp-title">Permission policy</span>
+      <button type="button" class="td-close" data-perm-close="1" aria-label="Close">✕</button>
+    </div>
+    ${orgRow}
+    <p class="tp-note">When a session's Bash command is stopped for permission, the host's
+      permission judge auto-approves it only if this text clearly covers it. Force pushes,
+      merges, pushes to main, production changes and the like are never auto-approved,
+      whatever it says. ${permState.isDefault ? "Showing the default policy." : "A custom policy."}
+      Save it empty to turn the judge off for this org.</p>
+    <label class="tp-field"><span>Policy</span>
+      <textarea data-perm-text="1" rows="14" maxlength="16000"${permState.loading ? " disabled" : ""}>${esc(permState.loading ? "Loading…" : permState.text)}</textarea></label>
+    ${permState.err ? `<div class="tp-err">${esc(permState.err)}</div>` : ""}
+    <div class="cf-actions">
+      <button type="button" class="cf-btn" data-perm-default="1"${busy || permState.isDefault ? " disabled" : ""}>Use default</button>
+      <button type="button" class="cf-btn" data-perm-cancel="1">Cancel</button>
+      <button type="button" class="cf-btn cf-primary" data-perm-save="1"${busy ? " disabled" : ""}>${permState.busy ? "Saving…" : "Save policy"}</button>
+    </div>`;
+}
+
+function paintPermissionPanel() {
+  const html = permissionPanelHtml();
+  if (html) $permPanel.innerHTML = html;
+}
+
+// GET or POST the route; the hub's answer becomes the panel's truth. A refusal
+// toasts the hub's own words (XERK-264) and keeps what the operator typed.
+async function permissionRequest(method, body) {
+  const siteKey = permState.siteKey;
+  let status = 0, d = {};
+  try {
+    const r = await fetch(`/api/jira/${encodeURIComponent(siteKey)}/permission-policy`,
+      method === "GET" ? {} : { method, headers: { "content-type": "application/json" }, body: JSON.stringify(body) });
+    status = r.status;
+    if (r.status === 401) { location.href = "/login"; return; }
+    try { d = await r.json(); } catch { /* non-JSON error body */ }
+    if (siteKey !== permState.siteKey) return;      // the org changed under us
+    if (r.ok) {
+      permState.text = typeof d.text === "string" ? d.text : "";
+      permState.isDefault = d.isDefault !== false;
+      permState.err = "";
+    } else {
+      permState.err = d.error || `HTTP ${r.status}`;
+      TurmaNav.toast(TurmaNav.refusalText(`Permission policy for ${siteKey}`, status, d));
+    }
+  } catch {
+    permState.err = "the hub is unreachable";
+  }
+  permState.loading = false;
+  permState.busy = false;
+  paintPermissionPanel();
+}
+
+function loadPermissionPolicy() {
+  permState.loading = true;
+  permState.err = "";
+  paintPermissionPanel();
+  return permissionRequest("GET");
+}
+
+function openPermissionPanel() {
+  if (!policySites().length) return;
+  $permBackdrop.hidden = false;
+  syncOverlayLock();
+  loadPermissionPolicy();
+}
+
+function closePermissionPanel() {
+  $permBackdrop.hidden = true;
+  permState.err = "";
+  syncOverlayLock();
+}
+
+function savePermissionPolicy(text) {
+  if (permState.busy || permState.loading || !permState.siteKey) return;
+  permState.busy = true;
+  paintPermissionPanel();
+  return permissionRequest("POST", { text });
+}
+
+$permBtn.addEventListener("click", openPermissionPanel);
+$permPanel.addEventListener("click", (e) => {
+  if (e.target.closest("[data-perm-close]") || e.target.closest("[data-perm-cancel]")) {
+    return closePermissionPanel();
+  }
+  if (e.target.closest("[data-perm-default]")) return savePermissionPolicy(null);
+  if (e.target.closest("[data-perm-save]")) {
+    const ta = $permPanel.querySelector("[data-perm-text]");
+    return savePermissionPolicy(ta ? ta.value : "");
+  }
+});
+$permPanel.addEventListener("change", (e) => {
+  const org = e.target.closest("[data-perm-org]");
+  if (org) { permState.siteKey = org.value; loadPermissionPolicy(); }
+});
+$permBackdrop.addEventListener("click", (e) => { if (e.target === $permBackdrop) closePermissionPanel(); });
 
 // Delegated: the board re-renders on every beat, so per-card listeners would be
 // re-bound constantly (and leak). The card's own interactive children are left
@@ -2008,6 +2140,7 @@ document.addEventListener("keydown", (e) => {
   if (anyMenuOpen()) return closeMenus(null);
   if (!openTicketState && !$ebBackdrop.hidden) return closeEpicBuilder();
   if (!openTicketState && !$policyBackdrop.hidden) return closePolicyPanel();
+  if (!openTicketState && !$permBackdrop.hidden) return closePermissionPanel();
   if (openTicketState) closeDetail();
 });
 

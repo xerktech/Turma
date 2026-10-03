@@ -114,9 +114,54 @@ hook-log tail) + `agent/hooks/permlog.py`.
   is bounded (`PERMISSION_OUTBOX_MAX`, oldest dropped, logged). Rows are COPIES; an open row is sent
   again closed under the same `id`, and the hub upserts.
 
+## The permission judge (XERK-1566)
+
+Prompts a human would always approve are judged by an LLM against the org's written policy — on
+the MANAGER, never inside a hook, for **Bash only** (the grant is honoured by guard.py, whose
+matcher is Bash; a classifier-blocked MCP/WebFetch call is retired by the ledger's allow rules).
+Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/qwen request.
+
+- **Hand-off**: permlog.py `--judge`, on a Bash PermissionDenied/PermissionRequest, writes
+  `<sid>.<nonce>.judge.req.json` (the WHOLE command, ≤ `JUDGE_COMMAND_MAX`; the random nonce lets
+  parallel calls not clobber each other) and polls `.judge.ans.json` for at most `JUDGE_WAIT_SEC`
+  (75s, under the hook's 90s timeout). It waits only while `judge.alive` is fresh — the worker
+  touches it every 10s and REMOVES it with no policy, so a stood-down judge costs no wait.
+  `allow` → `retry: true` (PermissionDenied) or `decision.behavior: allow` (PermissionRequest);
+  stand / no answer / a malformed one → prints nothing. The names are mirrored in hub-agent.py
+  (parity-tested).
+- **A DEDICATED worker** (`_judge_worker_loop`, the `_input_worker_loop` shape; polls every 0.5s,
+  at most `JUDGE_REQS_PER_PASS` a pass). Never the beat, never the slow-refresh worker — a request
+  behind a gh sweep would blow the hook's deadline. Off with `TURMA_PERMISSION_JUDGE=0` (also drops
+  `--judge` from the hook). `ManagerMixin` patches it off for the suite.
+- **Requests are session-written**: read only via `_read_untrusted_json`, removed once read, name
+  and every field re-validated; anything addressable but unusable (not Bash, not a running Claude
+  session, too old, too long) is answered `stand` so its hook returns at once.
+- **Order**: `judge_never_reason` FIRST (force/mirror/deleting push, a push naming main/master,
+  branch deletion, PR merge/complete, mutating `gh api`, terraform apply/destroy, mutating
+  kubectl/helm/argocd, AWS/docker deletes, sudo, pipe-to-shell, Turma's/Claude's own state, and the
+  guard's own destructive/policy categories via `_guard_module`) → `stand`, no model call. kubectl
+  is stood in EVERY namespace (the worktree's namespaces are not knowable here). A guard that cannot
+  load stands everything. Else, with a policy, `claude -p --model haiku` (list argv, cwd
+  `REGISTRY_DIR`, no `--settings`, stdin DEVNULL, `JUDGE_TIMEOUT_SEC` 20s, at most `JUDGE_ATTEMPTS`)
+  over `JUDGE_INSTRUCTION` + the policy + the request JSON-encoded as untrusted data.
+- **`parse_judge_verdict` is STRICT**: exactly one JSON object (one ``` fence tolerated) with
+  exactly `verdict` (allow|stand) + non-empty `reason`. Anything else retries, then stands.
+- **On allow for a PermissionDenied**: the one-shot grant (`_write_grant`, `GRANTS_DIR/<sid>/
+  <judge_grant_key>`, TTL `JUDGE_GRANT_TTL_SEC` 120s, random-tmp + rename, a symlinked session dir
+  refused). A PermissionRequest needs none — the hook allows it itself. Grant contract + the
+  accepted same-uid residual: `agent-hooks.md`. `_judge_sweep` drops expired grants, dirs of ended
+  sessions and req/ans files a dead hook left.
+- **Every judgement is a ledger row** — `kind: judged`, id `j-<sid>-<nonce>`, `verdict`,
+  `judgeReason`, `answer` (allow; a stood classifier block `deny`; a stood dialog `unknown`), staged
+  via `_emit_permission` (lock-guarded) for the beat to ship.
+- **Policy text is hub-owned** (`turma-permissions.md`): `permissionPolicy` rides every heartbeat
+  reply; `_ingest_permission_policy` keeps it in memory for the worker and renders
+  `~/.turma/permission-policy.md` on change. A reply without one FORGETS it (judge stands down);
+  an empty text is the operator's off switch for that org.
+
 ## Tests
 
 `test_permlog.py` (event shapes — the REAL PermissionRequest one, bounds, fail-open incl.
-FIFO/symlink, rotation, `-SsE`); `TestPermissionLedgerEdges` + `TestPermissionLogTail`
-(`test_hub_agent.py`); the `test_guard_settings.py` pins (deny equality, every-hook-event `-SsE`, the
-PreToolUse matcher list).
+FIFO/symlink, rotation, `-SsE`, the judge req/ans dance); `TestPermissionLedgerEdges` +
+`TestPermissionLogTail` + `TestPermissionJudge` (`test_hub_agent.py`); the `test_guard_settings.py`
+pins (deny equality, every-hook-event `-SsE`, the PreToolUse matcher list, `--judge` wiring).

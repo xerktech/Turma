@@ -2,7 +2,7 @@
 """Turma permission ledger hook (XERK-1563) — ``PermissionRequest`` + ``PermissionDenied``.
 
 Nothing else measures which permission prompts actually stall sessions, so every
-allow-list change was a guess. This hook RECORDS, it never decides: for each
+allow-list change was a guess. The ledger half RECORDS, it never decides: for each
 event it appends one JSON line to ``<dir>/<TURMA_SESSION_ID>.jsonl`` and prints
 nothing, so Claude Code's own flow (the dialog, or the classifier's "no") runs
 exactly as it would without it. The manager tails the file on a worker and folds
@@ -28,6 +28,19 @@ The directory comes from ``argv[1]`` (the manager writes it into the settings
 file it builds, so the hook and the reader can never disagree), falling back to
 ``~/.turma/permissions``. ``TURMA_SESSION_ID`` is the one the launcher already
 exports; without it (``claude`` run outside a Turma session) this is a no-op.
+
+The permission JUDGE (XERK-1566) rides the same hook: with ``--judge`` as
+``argv[2]`` (the manager adds it unless ``TURMA_PERMISSION_JUDGE=0``), a
+``Bash`` call is also handed to the manager's judge — but only while the judge
+says it is up (``judge.alive`` fresh in the directory; the manager removes it
+when it has no policy text, so a stood-down judge costs no wait). The hook
+writes ``<sid>.<nonce>.judge.req.json`` and polls for the ``.judge.ans.json``
+the manager drops (the ``ask.py`` req/ans pattern, at most ``JUDGE_WAIT_SEC``).
+On ``allow`` it answers ``retry: true`` (PermissionDenied — the retried call
+then meets ``guard.py``, which honours the one-shot grant the judge wrote) or
+``decision.behavior: allow`` (PermissionRequest). Anything else — stand, no
+answer, a malformed one — prints nothing, so Claude Code's own flow runs.
+Scope is Bash only: ``guard.py``, which honours the grant, matches Bash only.
 
 Fails OPEN on everything: a malformed event, an unwritable directory, a FIFO or
 symlink planted at the log path — exit 0, no output. A ledger hook that wedged
@@ -69,6 +82,19 @@ SUBCOMMAND_CLIS = frozenset({
     "systemctl", "brew", "apt", "apt-get", "dotnet", "gradle", "./gradlew",
 })
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+
+# The judge hand-off (XERK-1566). hub-agent.py mirrors every name here
+# (parity-tested in TestPermissionJudge).
+JUDGE_FLAG = "--judge"
+JUDGE_ALIVE_FILE = "judge.alive"
+JUDGE_ALIVE_MAX_AGE_SEC = 30
+JUDGE_WAIT_SEC = 75           # under the hook's 90s settings timeout
+JUDGE_POLL_SEC = 0.25
+JUDGE_COMMAND_MAX = 8000      # a longer command is not handed to the judge
+JUDGE_REQ_SUFFIX = ".judge.req.json"
+JUDGE_ANS_SUFFIX = ".judge.ans.json"
+JUDGE_ANS_MAX_BYTES = 4096
+JUDGE_VERDICTS = ("allow", "stand")
 _SEGMENT_SPLIT_RE = re.compile(r"&&|\|\||;|\||\n")
 
 
@@ -233,6 +259,136 @@ def append_row(directory, session_id, row, max_bytes=LOG_MAX_BYTES):
         os.close(fd)
 
 
+def judge_alive(directory, now=None):
+    """Whether the manager's judge is up and has a policy: its marker file is a
+    regular file touched within JUDGE_ALIVE_MAX_AGE_SEC. lstat only — no open,
+    so a planted FIFO cannot hang this either."""
+    try:
+        st = os.lstat(os.path.join(directory, JUDGE_ALIVE_FILE))
+    except OSError:
+        return False
+    now = time.time() if now is None else now
+    return stat.S_ISREG(st.st_mode) and abs(now - st.st_mtime) <= JUDGE_ALIVE_MAX_AGE_SEC
+
+
+def judge_request(event, row):
+    """The request handed to the judge for this event, or None when it is not
+    the judge's: Bash only, a non-empty command no longer than
+    JUDGE_COMMAND_MAX. The WHOLE command rides (the judge decides on it, and the
+    grant is keyed on its exact text), the rest are the ledger row's fields."""
+    if not isinstance(row, dict) or row.get("tool") != "Bash":
+        return None
+    inp = event.get("tool_input") if isinstance(event, dict) else None
+    command = inp.get("command") if isinstance(inp, dict) else None
+    if not isinstance(command, str) or not command.strip() or len(command) > JUDGE_COMMAND_MAX:
+        return None
+    cwd = event.get("cwd")
+    return {
+        "v": 1, "event": row["event"], "toolUseId": row.get("toolUseId"),
+        "tool": "Bash", "command": command, "head": row.get("head") or "",
+        "digest": row.get("digest") or "", "denyReason": row.get("denyReason") or "",
+        "cwd": _cap(cwd, 1024) if isinstance(cwd, str) else "", "ts": row["ts"],
+    }
+
+
+def _write_new(path, data):
+    """Write `data` as JSON to a fresh per-process tmp, then rename it into
+    place, so the manager never reads half a request. True when it landed."""
+    tmp = f"{path}.{os.getpid()}.tmp"
+    flags = (os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+    try:
+        fd = os.open(tmp, flags, 0o600)
+    except OSError:
+        return False
+    try:
+        os.write(fd, json.dumps(data, ensure_ascii=False).encode("utf-8"))
+    except OSError:
+        os.close(fd)
+        _remove(tmp)
+        return False
+    os.close(fd)
+    try:
+        os.replace(tmp, path)
+        return True
+    except OSError:
+        _remove(tmp)
+        return False
+
+
+def _remove(path):
+    try:
+        os.remove(path)
+    except OSError:
+        pass
+
+
+def _read_answer(path):
+    """The answer object at `path`, or None — not there yet, not a regular
+    file, too big, or not a JSON object."""
+    flags = (os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+             | getattr(os, "O_BINARY", 0))
+    try:
+        fd = os.open(path, flags)
+    except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        blob = os.read(fd, JUDGE_ANS_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(blob) > JUDGE_ANS_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def await_verdict(directory, session_id, req, wait_sec=JUDGE_WAIT_SEC,
+                  poll_sec=JUDGE_POLL_SEC, clock=time.monotonic, sleep=time.sleep):
+    """Hand `req` to the manager's judge and wait for its verdict: "allow",
+    "stand", or None (no answer in time, or a malformed one). The request is
+    removed on the way out whatever happened, and the answer once read."""
+    nonce = os.urandom(8).hex()
+    base = os.path.join(directory, f"{session_id}.{nonce}")
+    req_path, ans_path = base + JUDGE_REQ_SUFFIX, base + JUDGE_ANS_SUFFIX
+    if not _write_new(req_path, dict(req, nonce=nonce)):
+        return None
+    deadline = clock() + wait_sec
+    try:
+        while True:
+            ans = _read_answer(ans_path)
+            if ans is not None:
+                _remove(ans_path)
+                verdict = ans.get("verdict")
+                if ans.get("nonce") == nonce and verdict in JUDGE_VERDICTS:
+                    return verdict
+                return None
+            if clock() >= deadline:
+                return None
+            sleep(poll_sec)
+    finally:
+        _remove(req_path)
+
+
+def decision_output(event_name, verdict):
+    """What this hook prints for a verdict, or None to print nothing (Claude
+    Code's own flow then runs exactly as without the judge)."""
+    if verdict != "allow":
+        return None
+    if event_name == "PermissionDenied":
+        return {"hookSpecificOutput": {"hookEventName": "PermissionDenied", "retry": True}}
+    if event_name == "PermissionRequest":
+        return {"hookSpecificOutput": {"hookEventName": "PermissionRequest",
+                                       "decision": {"behavior": "allow"}}}
+    return None
+
+
 def main(argv=None):
     argv = sys.argv if argv is None else argv
     session_id = (os.environ.get("TURMA_SESSION_ID") or "").strip()
@@ -240,6 +396,7 @@ def main(argv=None):
         return 0
     directory = argv[1] if len(argv) > 1 and argv[1] else os.path.join(
         os.path.expanduser("~"), ".turma", "permissions")
+    judge = len(argv) > 2 and argv[2] == JUDGE_FLAG
     try:
         raw = sys.stdin.read(STDIN_MAX_BYTES + 1)
         if len(raw) > STDIN_MAX_BYTES:
@@ -251,8 +408,21 @@ def main(argv=None):
         row = build_row(event)
     except Exception:            # noqa: BLE001 — a ledger hook must never fail a prompt
         return 0
-    if row is not None:
-        append_row(directory, session_id, row)
+    if row is None:
+        return 0
+    append_row(directory, session_id, row)
+    if not judge:
+        return 0
+    try:
+        req = judge_request(event, row)
+        if req is None or not judge_alive(directory):
+            return 0
+        out = decision_output(row["event"], await_verdict(directory, session_id, req))
+    except Exception:            # noqa: BLE001 — the judge is best-effort too
+        return 0
+    if out is not None:
+        sys.stdout.write(json.dumps(out))
+        sys.stdout.flush()
     return 0
 
 

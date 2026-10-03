@@ -395,3 +395,25 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   the file guard); RECORDS one line per event to `~/.turma/permissions/<sid>.jsonl`, decides nothing,
   fails open on everything, `-SsE` like every hook, wired only when the script exists. Its dir is
   `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `agent-permissions.md`.
+  - With `--judge` (XERK-1566, unless `TURMA_PERMISSION_JUDGE=0`) it also hands a Bash call to the
+    manager's permission judge and waits (timeout 90s); judge contract in `agent-permissions.md`.
+- **The judge's one-shot grant is guard.py's ONLY `allow`** (XERK-1566, `consume_grant`). Consulted
+  only AFTER `decide()` allowed the command (every hard deny wins), only for Bash, inside main()'s
+  fail-CLOSED try. `~/.turma/grants/<TURMA_SESSION_ID>/<sha256(command)>` must be a regular file
+  (`O_NONBLOCK|O_NOFOLLOW`, bounded; the session dir not a symlink) naming this session + exact
+  command, unexpired (`exp` at most `GRANT_TTL_MAX_SEC` out). Unlinked BEFORE allowing, so one
+  grant allows one call. `TURMA_PERMISSION_JUDGE=0` in the hook's env ignores grants.
+  - **Accepted residual: the grant dir is same-uid and Bash can write it.** A model that learns the
+    protocol can self-grant one command past the auto-mode classifier — or drop a judge answer that
+    makes permlog.py allow a PermissionRequest dialog — the same class as `echo >
+    ~/.turma/qwen-guard.json`. Mitigations, none sealing it: `Edit(~/.turma/grants/**)` and
+    `Edit(~/.turma/permission-policy.md)` denies (file tools only, in the equality pin); the grant
+    path/protocol is never named in any reason or prompt a model reads; every judgement is a ledger
+    row (`kind: judged`); the hard denies still win; the never-list stands any command naming
+    `.turma/grants`. Never describe the judge as un-forgeable.
+  - **Real-host spike NOT run** (no agent host here): does `PermissionDenied`'s `retry: true`
+    re-enter `PreToolUse` on the retried call, with the grant honoured? And what does the TUI show
+    for a classifier block? If the retry never reaches guard.py, the grant goes unconsumed, expires
+    (120s) and is swept; the classifier blocks again — nothing runs that did not before. The
+    fallback is then the PermissionRequest path alone plus the ledger's allow rules. Record the
+    answers here. Tests: `TestJudgeGrants` (`test_guard.py`).

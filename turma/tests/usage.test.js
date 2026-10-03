@@ -1298,6 +1298,16 @@ test("XERK-1563: the permission card lists each prompt with its rule and a copy 
   assert.doesNotMatch(html, /unknown/);
 });
 
+test("XERK-1566: a judged row is labelled and says what the judge decided, escaped", () => {
+  const html = H.permissionsCardHtml({ days: 7,
+    top: [{ kind: "judged", tool: "Bash", head: "npm run", count: 1, allowed: 1, denied: 0 }],
+    recent: [{ kind: "judged", tool: "Bash", head: "npm run", host: "nas01", answer: "allow",
+      verdict: "allow", judgeReason: "tests <b>ok</b>", openedAt: PERM_NOW - 60000, closedAt: PERM_NOW }] },
+  PERM_NOW);
+  assert.match(html, /<span class="perm-kind k-judged">Judged<\/span>/);
+  assert.match(html, /judge: allow — tests &lt;b&gt;ok&lt;\/b&gt;/);
+});
+
 test("XERK-1563: a group still waiting on its only answer reads 'open', never 0 / 0", () => {
   const g = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "terraform apply",
     suggestedRule: "Bash(terraform apply:*)", medianWaitMs: null };

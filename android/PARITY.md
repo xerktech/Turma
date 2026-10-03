@@ -889,6 +889,12 @@ those are marked `[MODEL]`.
   recent list) reads its own route, `GET /api/permissions`, not `/api/agents` — so nothing on the
   fleet payload changed and Android's atomic decode is untouched. It is a web-only operator tuning
   view for now; the Android screen is a later XERK-1560 child (XERK-1576).
+  - The permission judge's rows (XERK-1566) land on the same web card as a `Judged` kind with the
+    judge's verdict + reason; they ride the same route, so Android is equally untouched.
+- P2 **Permission policy editor (XERK-1566).** The web board's "Permission policy" button edits the
+  per-org text the agent's permission judge decides blocked Bash commands against, through its own
+  route (`GET|POST /api/jira/<site>/permission-policy`) — nothing on `/api/agents` changed. A
+  web-only operator tool; Android has no editor (the default text applies until one is saved).
 - P2 **Table-view state persistence (XERK-31).** The web keeps the usage table open + the page put
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 

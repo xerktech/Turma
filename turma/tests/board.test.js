@@ -2621,7 +2621,7 @@ const BOARD_HTML = fs.readFileSync(path.join(__dirname, "../public/board.html"),
 const BOARD_SCRIPT = [...BOARD_HTML.matchAll(/<script>([\s\S]*?)<\/script>/g)][0][1];
 const TurmaBoardModule = require("../public/board.js");
 
-function loadBoardPage() {
+function loadBoardPage(opts = {}) {
   const noop = () => {};
   const els = {};
   function makeEl(id) {
@@ -2662,7 +2662,7 @@ function loadBoardPage() {
     // The boot refresh() is inert: its fetch never resolves, so a test drives the
     // merge by calling mergeSnapshot() directly (as the real refresh() would on
     // the reply), with the sseClock it captured before the "fetch".
-    fetch: () => new Promise(() => {}),
+    fetch: opts.fetch || (() => new Promise(() => {})),
     EventSource: class {
       constructor() { this._ls = {}; sse.streams.push(this); }
       addEventListener(name, fn) { (this._ls[name] ||= []).push(fn); }
@@ -2685,9 +2685,10 @@ function loadBoardPage() {
   const names = Object.keys(stubs);
   const fn = new Function(...names, "window",
     BOARD_SCRIPT + "\n;return { mergeSnapshot, applyAgent, sseClock: () => sseClock,"
-      + " setCache: (c) => { cache = c; }, getCache: () => cache };");
+      + " setCache: (c) => { cache = c; }, getCache: () => cache,"
+      + " permState, openPermissionPanel, savePermissionPolicy, setSites: (v) => { lastSites = v; } };");
   const api = fn(...names.map((k) => stubs[k]), stubs);
-  return { ...api, sse };
+  return { ...api, sse, els: document.getElementById };
 }
 
 // Every top-level map board.html live-patches from SSE, paired with the event that
@@ -3167,4 +3168,45 @@ test("epicBuilderComposerHtml: reflects busy + error, and escapes the draft", ()
   assert.match(err, /no host reports that Jira org/);
   assert.match(err, /value="&lt;x&gt;"/);
   assert.equal(epicBuilderComposerHtml([], {}), "", "no sites -> no composer");
+});
+
+// XERK-1566: the org's permission policy text — the board's editor for the text
+// the agent-side permission judge decides a blocked Bash command against.
+test("XERK-1566: the permission policy panel loads, saves and resets the org's text", async () => {
+  const calls = [];
+  let answer = { text: "Allow tests.", isDefault: false };
+  const fetch = async (url, init = {}) => {
+    if (!url.includes("/permission-policy")) return new Promise(() => {});   // the boot poll
+    calls.push({ url, method: init.method || "GET", body: init.body ? JSON.parse(init.body) : undefined });
+    return { ok: true, status: 200, json: async () => answer };
+  };
+  const page = loadBoardPage({ fetch });
+  page.setSites([{ siteKey: "acme.atlassian.net", orgName: "" }]);
+  page.openPermissionPanel();
+  await new Promise((r) => setImmediate(r));
+  const panel = () => page.els("permissionRulesPanel").innerHTML;
+  assert.deepEqual(calls[0], { url: "/api/jira/acme.atlassian.net/permission-policy",
+    method: "GET", body: undefined });
+  assert.match(panel(), /data-perm-text="1"[^>]*>Allow tests\.<\/textarea>/);
+  assert.match(panel(), /A custom policy/);
+  assert.doesNotMatch(panel(), /data-perm-default="1" disabled/, "a custom text can be reset");
+
+  answer = { text: "New <b>rules</b>", isDefault: false };
+  await page.savePermissionPolicy("New <b>rules</b>");
+  assert.deepEqual(calls[1].body, { text: "New <b>rules</b>" });
+  assert.equal(calls[1].method, "POST");
+  assert.match(panel(), /New &lt;b&gt;rules&lt;\/b&gt;/, "operator text is escaped");
+
+  answer = { text: "the default", isDefault: true };
+  await page.savePermissionPolicy(null);
+  assert.deepEqual(calls[2].body, { text: null });
+  assert.match(panel(), /Showing the default policy/);
+  assert.match(panel(), /data-perm-default="1" disabled/);
+});
+
+test("XERK-1566: the permission policy modal never uses a bare policy* id (XERK-587)", () => {
+  assert.ok(BOARD_HTML.includes('id="permissionRulesBackdrop"'));
+  assert.ok(BOARD_HTML.includes('id="permissionRulesPanel"'));
+  assert.ok(BOARD_HTML.includes('getElementById("permissionPolicy")'));
+  assert.doesNotMatch(BOARD_HTML, /id="policy(Backdrop|Panel)"/);
 });
