@@ -290,15 +290,17 @@ fi
 # substring match (`pgrep -f`) also matched ANY process merely mentioning the
 # path — a shell running `grep … hub-agent.py`, a tail/watch loop, an editor, a
 # session's Bash command — and refused the start, leaving the host stopped after
-# an auto-update with nothing to retry it (XERK-1552). The interpreter may be a
-# full path or versioned (a pyenv shim re-execs `/…/python3.12`), so that token
-# is matched loosely; a concurrent `hub-agent.py --enroll` probe has an extra
-# argument and so no longer matches either. $PREFIX is regex-escaped. This
+# an auto-update with nothing to retry it (XERK-1552). The interpreter token is
+# matched loosely — a full path, a versioned/free-threaded name (a pyenv shim
+# re-execs `/…/python3.12`), and interpreter flags a python3 wrapper may add
+# (`-I`) — because a real manager the guard fails to see means two managers.
+# A concurrent `hub-agent.py --enroll` probe has an argument AFTER the script,
+# so it no longer matches. $PREFIX is regex-escaped. This
 # launcher's own argv is the bash script path, so it never matches itself. A
 # zombie has an empty /proc/<pid>/cmdline and never matches. Missing pgrep fails
 # OPEN — the prior behaviour, never worse. TURMA_ALLOW_SECOND_MANAGER=1 opts out
 # for the rare case of deliberately running a second one.
-manager_re="^([^ ]*/)?python3(\.[0-9]+)? $(printf '%s' "$PREFIX" | sed 's/[][\\.*^$+?(){}|]/\\&/g')/hub-agent\.py\$"
+manager_re="^([^ ]*/)?python[0-9.]*t?( -[^ ]+)* $(printf '%s' "$PREFIX" | sed 's/[][\\.*^$+?(){}|]/\\&/g')/hub-agent\.py\$"
 if [ "${TURMA_ALLOW_SECOND_MANAGER:-0}" = 0 ] \
    && command -v pgrep >/dev/null 2>&1 \
    && pgrep -xf "$manager_re" >/dev/null 2>&1; then
