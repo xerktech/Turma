@@ -418,8 +418,11 @@ def _quote_states(command: str) -> list[str]:
 # denylist of those is never complete. What runs a git/gh editor, pager, hook,
 # signer or browser comes from the environment or config, never from argv —
 # which is why an assignment in front disqualifies the stage.
-_QUOTED_TEXT_PROGS = {"echo", "printf"}
+# Not `printf`: `printf -v GIT_EDITOR '$(x)'; git commit` ASSIGNS what git
+# then runs through `sh -c` (Claude Code's shells export GIT_EDITOR).
+_QUOTED_TEXT_PROGS = {"echo"}
 _QUOTED_TEXT_GIT = {"commit", "tag"}
+_ASSIGNING_EXPANSION_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?=")
 _QUOTED_TEXT_GH = {("pr", "create"), ("pr", "edit"), ("pr", "comment"),
                    ("issue", "create"), ("issue", "edit"), ("issue", "comment")}
 
@@ -1147,7 +1150,8 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
     # be judged against what is actually going to be fed to it.
-    quoted_text = all(
+    # `${VAR:=…}` assigns from inside any stage, echo's included.
+    quoted_text = not _ASSIGNING_EXPANSION_RE.search(raw_commands) and all(
         _quoted_text_only(_tokenize(_unwrap_group(raw))) for raw in segments
     )
     piped_operands: list[str] = []
