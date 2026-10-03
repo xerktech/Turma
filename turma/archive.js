@@ -715,6 +715,57 @@ function readSidecar(metaPath) {
   }
 }
 
+// Transcripts whose byte cursor no reconcile could prove against the local
+// `.jsonl` (XERK-1364): their next chunks are de-duplicated against the file
+// until one carries a new entry. In memory — every boot re-derives it.
+const unverifiedCursors = new Set();
+
+// What identifies an entry across a re-send. Not `blocks`: the budget may have
+// shed their payloads from the stored line. A uuid'd entry keys on uuid+role+ts
+// (its rendered text may change between agent versions); one without, on its text.
+function entryKey(e) {
+  const o = e && typeof e === "object" ? e : {};
+  return JSON.stringify(o.uuid
+    ? [o.uuid, o.role || null, o.ts || null]
+    : [null, o.role || null, o.ts || null, String(o.text || "")]);
+}
+
+// The entries a `.jsonl` already holds (as parseEntries reads them — a torn line
+// is no entry) and a count per entry key. Read only for a suspect cursor.
+function heldEntries(jsonl) {
+  let raw = "";
+  try { raw = fs.readFileSync(jsonl, "utf8"); } catch { /* absent: nothing held */ }
+  const entries = [];
+  const keys = new Map();
+  for (const line of raw.split("\n")) {
+    const t = line.trim();
+    if (!t) continue;
+    let e;
+    try { e = JSON.parse(t); } catch { continue; }
+    if (!e || typeof e !== "object") continue;
+    entries.push(e);
+    const k = entryKey(e);
+    keys.set(k, (keys.get(k) || 0) + 1);
+  }
+  return { entries, keys };
+}
+
+// Re-seat a transcript's search entries from what its file holds: the local FTS
+// in sqlite mode, the Postgres of-record (by ordinal) in both.
+function reindexHeld(transcriptId, entries) {
+  if (!isPgMode()) {
+    tx(() => {
+      db.prepare("DELETE FROM entries_fts WHERE transcriptId=?").run(transcriptId);
+      const ins = db.prepare(
+        "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)");
+      for (const e of entries) {
+        ins.run(String(e.text || ""), transcriptId, e.uuid || null, e.role || null, e.ts || null);
+      }
+    });
+  }
+  mirrorReplace(transcriptId, entries);
+}
+
 function writeSidecar(metaPath, obj) {
   const tmp = metaPath + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(obj));
@@ -1270,8 +1321,55 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   fs.mkdirSync(paths.dir, { recursive: true });
 
   // First sight: write the sidecar header so the file is self-describing.
-  const list = Array.isArray(entries) ? entries : [];
+  let list = Array.isArray(entries) ? entries : [];
   const nowIso = new Date().toISOString();
+
+  // The cursor is the only duplicate guard, so check it still describes the
+  // file before appending (XERK-1364). A `.jsonl` LARGER than the row's
+  // archiveBytes — an orphan file under a missing row, a hydrated copy beside a
+  // lagging index — or a transcript the last reconcile could not prove, gets
+  // this chunk de-duplicated against the entries the file already holds. A
+  // SHORTER file (deleted/truncated) cannot duplicate: heal-on-read owns it.
+  let fileSize = 0;
+  try { fileSize = fs.statSync(paths.jsonl).size; } catch { /* absent: 0 */ }
+  let prevCount = row ? (row.msgCount || 0) : 0;
+  let archiveBytes = (row && row.archiveBytes) || 0;
+  // The Set is a cache of the sidecar's `cursorUnverified`, which is what
+  // survives a restart: a non-HA boot keeps index.db and rebuilds nothing.
+  if (!unverifiedCursors.has(transcriptId) && fileSize > 0) {
+    const sc = readSidecar(paths.meta);
+    if (sc && sc.cursorUnverified) unverifiedCursors.add(transcriptId);
+  }
+  const wasSuspect = unverifiedCursors.has(transcriptId);
+  if (wasSuspect || fileSize > archiveBytes) {
+    const held = heldEntries(paths.jsonl);
+    // Entering suspicion here means the index never saw some of what the file
+    // holds (an orphan under a missing row): re-seat the transcript's search
+    // entries from the file once, or they stay unsearchable for good.
+    if (!wasSuspect) reindexHeld(transcriptId, held.entries);
+    // A multiset, consumed one per match: entries can legitimately repeat a key
+    // (pr-link rows share an id), and a re-send repeats each held one ONCE.
+    const fresh = list.filter((e) => {
+      const k = entryKey(e);
+      const n = held.keys.get(k) || 0;
+      if (!n) return true;
+      held.keys.set(k, n - 1);
+      return false;
+    });
+    if (fresh.length < list.length) {
+      console.error(`archive: ${transcriptId}: skipped ${list.length - fresh.length} ` +
+        `re-sent entr(ies) its .jsonl already holds (cursor behind the file; XERK-1364)`);
+    }
+    list = fresh;
+    prevCount = held.entries.length;
+    // Still suspect until a chunk carries something new: the agent re-sends in
+    // order, so the first new entry means it has caught up with the file. The
+    // sidecar carries the suspicion (`cursorUnverified`) so a restart or handover
+    // mid-re-send re-derives it — every other figure now matches the file.
+    if (fresh.length) unverifiedCursors.delete(transcriptId);
+    else unverifiedCursors.add(transcriptId);
+    archiveBytes = fileSize;
+  }
 
   // pg mode keeps NO local entries index — the entry text lives only in Postgres
   // (written by mirrorEntries below, searched direct from PG), so there is nothing
@@ -1279,13 +1377,12 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
   const insert = isPgMode() ? null : db.prepare(
     "INSERT INTO entries_fts(text, transcriptId, uuid, role, ts) VALUES(?,?,?,?,?)"
   );
-  const prevCount = row ? (row.msgCount || 0) : 0;
   const msgCount = prevCount + list.length;
   const bytesStored = Number(endOffset);
-  // What this transcript's .jsonl already costs us, and whether that has taken
-  // it past its budget. Sticky once crossed — the rest of the conversation sheds
-  // rather than every other chunk flipping, so a reader sees one clean cutover.
-  let archiveBytes = (row && row.archiveBytes) || 0;
+  // archiveBytes (above) is what this transcript's .jsonl already costs us; has
+  // that taken it past its budget? Sticky once crossed — the rest of the
+  // conversation sheds rather than every other chunk flipping, so a reader sees
+  // one clean cutover.
   let shed = ARCHIVE_TRANSCRIPT_MAX > 0 && archiveBytes >= ARCHIVE_TRANSCRIPT_MAX;
   let shedBytes = 0;
 
@@ -1366,6 +1463,8 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     createdAt: meta.createdAt || null, endedTs: meta.endedTs || null,
     summary: meta.summary || null, msgCount, bytesStored, archiveBytes,
     updatedAt: nowIso,
+    // Only while suspect, so a healthy sidecar is byte-identical to before.
+    ...(unverifiedCursors.has(transcriptId) ? { cursorUnverified: true } : {}),
   });
 
   // Mirror the durable index write to the Postgres of-record (XERK-780, no-op off
@@ -2335,6 +2434,10 @@ function rebuildIndex() {
     // The whole suffix directory: it now holds one subdirectory per transcript
     // (see rawDirFor), and a collided canonical file legitimately has two.
     const rawBytes = rawLayerBytes(jsonl + RAW_DIR_SUFFIX);
+    // The sidecar's bytesStored is the cursor, and it only describes this file
+    // when its archiveBytes is the file's size (XERK-1364): else de-dup the re-send.
+    if (meta.cursorUnverified || meta.archiveBytes !== archiveBytes) unverifiedCursors.add(transcriptId);
+    else unverifiedCursors.delete(transcriptId);
     tx(() => {
       let msgCount = 0;
       for (const line of raw.split("\n")) {
@@ -2480,7 +2583,21 @@ function reconcileHydratedCursors() {
     try { fileSize = fs.statSync(paths.jsonl).size; }
     catch { continue; } // no local file (or unreadable): trust PG, as rebuildIndex skips it
     const sc = readSidecar(paths.meta);
-    const bytesStored = sc && Number.isFinite(sc.bytesStored) ? sc.bytesStored : (row.bytesStored || 0);
+    // A cursor is only as good as the file it was written beside (XERK-1364). The
+    // sidecar is rewritten after every append, so it describes this `.jsonl` when
+    // its archiveBytes is the file's size; else the row may (a promoted follower
+    // keeps its own same-size stale `.meta` while the hydrate re-downloads the
+    // grown `.jsonl`). When neither does, take the LOWER cursor — the safer of two
+    // unproven ones — and have ingest de-duplicate whatever the re-send overlaps.
+    const scBytes = sc && Number.isFinite(sc.bytesStored) ? sc.bytesStored : null;
+    let bytesStored;
+    if (sc && sc.cursorUnverified) unverifiedCursors.add(row.transcriptId);
+    if (scBytes != null && sc.archiveBytes === fileSize) bytesStored = scBytes;
+    else if (row.archiveBytes === fileSize) bytesStored = row.bytesStored || 0;
+    else {
+      bytesStored = Math.min(scBytes ?? Infinity, row.bytesStored || 0);
+      unverifiedCursors.add(row.transcriptId);
+    }
     const rawBytes = rawLayerBytes(paths.jsonl + RAW_DIR_SUFFIX);
     if (bytesStored === row.bytesStored && fileSize === row.archiveBytes && rawBytes === row.rawBytes) continue;
     if (isPgMode()) {
@@ -2642,6 +2759,10 @@ function backfillPgIndexFromFiles() {
     // pre-field sidecar must not drive the byte budgets).
     const archiveBytes = Buffer.byteLength(raw);
     const rawBytes = rawLayerBytes(jsonl + RAW_DIR_SUFFIX);
+    // The sidecar's bytesStored is the cursor, and it only describes this file
+    // when its archiveBytes is the file's size (XERK-1364): else de-dup the re-send.
+    if (meta.cursorUnverified || meta.archiveBytes !== archiveBytes) unverifiedCursors.add(transcriptId);
+    else unverifiedCursors.delete(transcriptId);
     const entries = [];
     for (const line of raw.split("\n")) {
       const s = line.trim();

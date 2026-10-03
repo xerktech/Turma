@@ -885,3 +885,38 @@ test("drain never PUTs a blocked key over the bucket's copy (XERK-1050)", async 
   m._blocked.clear();
   assert.equal(await m.drain(), 1);
 });
+
+// XERK-1364: a sidecar's size says nothing about how current it is, so it follows its
+// `.jsonl`: a same-size STALE `.meta` beside a re-downloaded `.jsonl` gave the cursor
+// reconcile a stale bytesStored, and the agent's re-send duplicated lines.
+test("XERK-1364: hydrate re-fetches a .meta with its .jsonl, and keeps it with a kept one", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.from("one\ntwo\n"));
+  store.map.set("repo/a.jsonl.meta", Buffer.from('{"bytesStored":222}'));
+  fs.mkdirSync(path.join(root, "repo"), { recursive: true });
+  fs.writeFileSync(path.join(root, "repo", "a.jsonl"), "one\n");                 // behind
+  fs.writeFileSync(path.join(root, "repo", "a.jsonl.meta"), '{"bytesStored":111}'); // same size
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {} });
+  assert.equal(await m.hydrate(), 2);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl.meta"), "utf8"), '{"bytesStored":222}');
+
+  // A local `.jsonl` ahead of the bucket keeps its own (smaller) sidecar too.
+  fs.writeFileSync(path.join(root, "repo", "a.jsonl"), "one\ntwo\nthree\n");
+  fs.writeFileSync(path.join(root, "repo", "a.jsonl.meta"), '{"b":3}');
+  assert.equal(await m.hydrate(), 0);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl.meta"), "utf8"), '{"b":3}');
+});
+
+test("XERK-1364: a matching .jsonl with a different .meta refreshes the sidecar", async () => {
+  const root = mkdtemp("turma-mir-");
+  const store = memStore();
+  store.map.set("repo/a.jsonl", Buffer.from("one\n"));
+  store.map.set("repo/a.jsonl.meta", Buffer.from('{"bytesStored":9,"cursorUnverified":true}'));
+  fs.mkdirSync(path.join(root, "repo"), { recursive: true });
+  fs.writeFileSync(path.join(root, "repo", "a.jsonl"), "one\n");
+  fs.writeFileSync(path.join(root, "repo", "a.jsonl.meta"), '{"bytesStored":4}');
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {} });
+  assert.equal(await m.hydrate(), 1);
+  assert.match(fs.readFileSync(path.join(root, "repo", "a.jsonl.meta"), "utf8"), /cursorUnverified/);
+});

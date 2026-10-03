@@ -942,3 +942,142 @@ test("XERK-1315 pg mode: a raw file re-pushed from 0 after losing its local copy
     assert.equal(mem.sessions.get("t-raw").rawBytes, 10, "PG raw_bytes not inflated to 20");
   } finally { pgTeardown(); }
 });
+
+// XERK-1364: a promoted follower's hydrate re-downloads a `.jsonl` that grew in the
+// bucket but KEEPS its own same-size stale `.meta` (hydrate compares sizes, and a
+// sidecar's size barely moves). The cursor reconcile then took the stale sidecar's
+// bytesStored over the right one, so the agent re-sent a range the `.jsonl` already
+// held and the append duplicated it.
+test("XERK-1364 pg mode: a stale sidecar beside a newer .jsonl never duplicates a re-send", async () => {
+  const mem = pgSetup();
+  try {
+    const b1 = [ent("u0", "user", "one"), ent("u1", "assistant", "two")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    archive.ingestChunk("nas", "t-dup", META, 0, len1, b1, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-dup").filePath);
+    const staleMeta = fs.readFileSync(jsonl + ".meta");
+    const b2 = [ent("u2", "user", "three"), ent("u3", "assistant", "four")];
+    const len2 = len1 + Buffer.byteLength(JSON.stringify(b2));
+    archive.ingestChunk("nas", "t-dup", META, len1, len2, b2, "acme");
+    fs.writeFileSync(jsonl + ".meta", staleMeta);   // the follower's kept sidecar
+
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+
+    // Whatever cursor the hub hands back, the agent re-sends from it to its end.
+    const have = archive.manifestCursors("nas", [{ transcriptId: "t-dup" }], "acme")["t-dup"];
+    const resend = have === 0 ? [...b1, ...b2] : have === len1 ? b2 : [];
+    if (resend.length) archive.ingestChunk("nas", "t-dup", META, have, len2, resend, "acme");
+
+    const lines = fs.readFileSync(jsonl, "utf8").trim().split("\n");
+    assert.deepEqual(lines.map((l) => JSON.parse(l).uuid), ["u0", "u1", "u2", "u3"]);
+    assert.equal(archive.sessionRow("t-dup").msgCount, 4);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1364 pg mode: neither sidecar nor Postgres describes the file — lower cursor, re-send de-duplicated", async () => {
+  const mem = pgSetup();
+  try {
+    const b1 = [ent("n0", "user", "one")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    archive.ingestChunk("nas", "t-nei", META, 0, len1, b1, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-nei").filePath);
+    const staleMeta = fs.readFileSync(jsonl + ".meta");
+    const pgStale = { ...mem.sessions.get("t-nei") };
+    const b2 = [ent("n1", "assistant", "two"), ent("n2", "user", "three")];
+    const len2 = len1 + Buffer.byteLength(JSON.stringify(b2));
+    archive.ingestChunk("nas", "t-nei", META, len1, len2, b2, "acme");
+    fs.writeFileSync(jsonl + ".meta", staleMeta);
+    mem.sessions.set("t-nei", pgStale);              // the index mirror lagged too
+
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    archive.reconcileHydratedCursors();
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-nei" }], "acme")["t-nei"], len1);
+    // The agent re-sends n1,n2 split over two chunks: neither is appended again.
+    const mid = len1 + Buffer.byteLength(JSON.stringify([b2[0]]));
+    archive.ingestChunk("nas", "t-nei", META, len1, mid, [b2[0]], "acme");
+    archive.ingestChunk("nas", "t-nei", META, mid, len2, [b2[1]], "acme");
+    const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+    assert.deepEqual(uuids, ["n0", "n1", "n2"]);
+    assert.equal(archive.sessionRow("t-nei").msgCount, 3);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1364 pg mode: backfill from a stale sidecar de-dups; a repeated key is not a re-send", async () => {
+  const mem = pgSetup();
+  try {
+    // pr-link rows share one id by design; a new one in a re-send is still new.
+    const pr = (ts) => ({ uuid: "pr-link:https://x/pr/1", role: "assistant", ts, text: "PR #1" });
+    const b1 = [ent("p0", "user", "one"), pr("2026-07-10T00:01:00Z")];
+    const len1 = Buffer.byteLength(JSON.stringify(b1));
+    archive.ingestChunk("nas", "t-bf", META, 0, len1, b1, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-bf").filePath);
+    const staleMeta = fs.readFileSync(jsonl + ".meta");
+    const b2 = [ent("p1", "assistant", "two")];
+    const len2 = len1 + Buffer.byteLength(JSON.stringify(b2));
+    archive.ingestChunk("nas", "t-bf", META, len1, len2, b2, "acme");
+    fs.writeFileSync(jsonl + ".meta", staleMeta);
+    mem.sessions.clear(); mem.entries.clear();       // Postgres wiped (XERK-797)
+
+    archive.setIndexMode(null);
+    archive.setIndexSink(mem.sink());
+    archive.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(archive.sessionLoader());
+    assert.equal(archive.backfillPgIndexFromFiles(), 1);
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-bf" }], "acme")["t-bf"], len1);
+    const b3 = [...b2, pr("2026-07-10T00:05:00Z")];
+    archive.ingestChunk("nas", "t-bf", META, len1, len1 + 999, b3, "acme");
+    const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+    assert.deepEqual(uuids, ["p0", "pr-link:https://x/pr/1", "p1", "pr-link:https://x/pr/1"]);
+    assert.equal(archive.sessionRow("t-bf").msgCount, 4);
+    assert.equal(mem.entries.get("t-bf").size, 4);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1364 pg mode: a handover mid-re-send keeps de-duplicating", async () => {
+  const mem = pgSetup();
+  let A = archive;
+  // A new leader is a new process: nothing in memory survives but the files and PG.
+  const handover = async () => {
+    delete require.cache[require.resolve("../archive.js")];
+    A = require("../archive.js");
+    A.setIndexSink(mem.sink());
+    A.setIndexMode("pg", mem);
+    await mem.hydrateSessionsInto(A.sessionLoader());
+    A.reconcileHydratedCursors();
+  };
+  try {
+    const sz = (l) => Buffer.byteLength(JSON.stringify(l));
+    const a = [ent("g0", "user", "a"), ent("g1", "assistant", "b")];
+    const c = [ent("g2", "user", "c")];
+    const d = [ent("g3", "assistant", "d")];
+    A.ingestChunk("nas", "t-ho", META, 0, sz(a), a, "acme");
+    const jsonl = path.join(process.env.ARCHIVE_DIR, A.sessionRow("t-ho").filePath);
+    const staleMeta = fs.readFileSync(jsonl + ".meta");
+    const pgStale = { ...mem.sessions.get("t-ho") };
+    A.ingestChunk("nas", "t-ho", META, sz(a), sz(a) + sz(c), c, "acme");
+    A.ingestChunk("nas", "t-ho", META, sz(a) + sz(c), sz(a) + sz(c) + sz(d), d, "acme");
+    fs.writeFileSync(jsonl + ".meta", staleMeta);
+    mem.sessions.set("t-ho", pgStale);
+    await handover();
+    const have = A.manifestCursors("nas", [{ transcriptId: "t-ho" }], "acme")["t-ho"];
+    assert.equal(have, sz(a));
+    A.ingestChunk("nas", "t-ho", META, have, have + sz(c), c, "acme");  // held
+    await handover();                                                   // mid-re-send
+    const h2 = A.manifestCursors("nas", [{ transcriptId: "t-ho" }], "acme")["t-ho"];
+    A.ingestChunk("nas", "t-ho", META, h2, h2 + sz(d), d, "acme");      // held
+    const uuids = fs.readFileSync(jsonl, "utf8").trim().split("\n").map((l) => JSON.parse(l).uuid);
+    assert.deepEqual(uuids, ["g0", "g1", "g2", "g3"]);
+    assert.equal(mem.entries.get("t-ho").size, 4);
+  } finally {
+    A.setIndexSink(null);
+    A.setIndexMode(null);
+    pgTeardown();
+  }
+});
