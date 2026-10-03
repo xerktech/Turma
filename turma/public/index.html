@@ -1026,8 +1026,11 @@ function worktreeName(s) {
 }
 // The branch to show: the LIVE branch the running agent named for its work (the
 // app itself creates none). "detached" while it's still on detached HEAD.
+// No git block means the agent hasn't read it yet (XERK-1262 serves git:null
+// until its cheap-git worker answers) — unknown, not detached (XERK-1538).
 function sessBranch(s) {
-  const b = s.git?.branch;
+  if (!s.git) return "…";
+  const b = s.git.branch;
   return (b && b !== "HEAD") ? b : "detached";
 }
 
@@ -1760,10 +1763,13 @@ function sessCard(a, s, now) {
   // it's resumable). Delete removes the worktree, but the app owns no branch, so
   // any branch the agent named for its work — and its commits — survive in the
   // repo; only uncommitted worktree files are lost.
-  const dirty = s.git?.dirtyFiles || 0;
+  // No git block = not read yet (XERK-1538): unknown is NOT clean, so warn
+  // that changes may be lost. A repos-root session has no worktree to lose.
+  const dirty = s.git ? (s.git.dirtyFiles || 0) : null;
   const work = workLine(s);
-  const delConfirm = dirty > 0
-    ? "Confirm delete — uncommitted changes will be lost" : "Confirm delete";
+  const delConfirm = dirty > 0 ? "Confirm delete — uncommitted changes will be lost"
+    : dirty == null && !s.root ? "Confirm delete — may have uncommitted changes"
+    : "Confirm delete";
   const killConfirm = "Confirm kill";
 
   const sp = sessPending(a.key, s.id);
