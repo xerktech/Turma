@@ -35,11 +35,22 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   except the two agent-memory trees," which a glob list can't express — deny beats allow, and a deny
   matching a DIRECTORY takes its whole subtree, so `Edit(~/.claude/*)` is the blanket rule. Patterns
   still cover the catastrophic subset as defence in depth (mechanics below).
-- Hard-denies three narrow categories, each with a self-correcting reason: **destructive** (`rm -rf`
+- Hard-denies four narrow categories, each with a self-correcting reason: **destructive** (`rm -rf`
   of `/`/home/system/`.git`, disk wipes, fork bombs, power changes, recursive `chmod`/`chown` of
   system roots, protected-branch history destruction, `DROP DATABASE|TABLE`); **policy** (push to /
   delete `main`/`master`, self-merging a PR/MR — work lands via a human-merged PR); **attribution**
-  (AI self-attribution trailers).
+  (AI self-attribution trailers); **pr-summary** (a PR/MR description missing a required section).
+- **pr-summary is the hard half of `PR_SUMMARY_SYSTEM_PROMPT`** (`pr_summary_reason`): the two must
+  name the same headings, or a session following its instructions is refused by its own guard.
+  - Checks `gh pr create`, `glab mr create`, `az repos pr create`, and an `edit`/`update` only when
+    it sets the description. Body = command text + literal body tokens + any `--body-file`
+    (resolved against the event `cwd`, moved by a leading `cd`).
+  - A body it can't see (`--fill`, the editor, `$(cat file)`) is refused, saying how to pass it.
+  - **A repo's own PR template wins**: its headings are required instead (ones worded `optional`/
+    `if applicable` excepted); a headingless template checks nothing. Turma ships one, so Turma's
+    sessions are held to its headings, not the `**Summary:**` line.
+  - Off with `$TURMA_PR_SUMMARY=0`. Replayed against 32k real Bash commands: refuses only PR
+    creates/body edits, 0 others. Tests: `TestPrSummary`, the hook-entrypoint toggle case.
 - **Destructive includes the agent's tmux server** (XERK-1077): `kill-server`, killing tmux by name
   or PID, and `kill-session`/`-window`/`-pane` of anything that could resolve to an `agent-*` session
   are denied unless tmux names some OTHER server (`-L`/`-S`). Protected: the default server and the

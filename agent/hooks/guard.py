@@ -5,7 +5,7 @@ Sessions run the agent hands-off (``--permission-mode auto`` by default, or
 ``bypassPermissions`` when an operator picks it) so it can do whatever a task
 needs (read, write, run builds/tests, git, network) with little or **no**
 per-tool approval round-trip. This hook is the backstop that makes that safe: it
-inspects every Bash tool call *before* it runs and blocks only three narrow
+inspects every Bash tool call *before* it runs and blocks only four narrow
 categories.
 
 1. **destructive** — commands that would wreck the whole repository or the host
@@ -32,6 +32,11 @@ categories.
    the robot emoji, ``noreply@anthropic.com``). Denied with a reason so the
    agent rewrites the message and continues. Disable with
    ``$TURMA_NO_ATTRIBUTION=0``.
+
+4. **pr-summary** — opening a PR/MR (or rewriting its description) whose
+   description lacks the sections of the PR summary standard, or of the repo's
+   own PR template when it has one. Denied with a reason naming the missing
+   sections. Disable with ``$TURMA_PR_SUMMARY=0``.
 
 Everything else is allowed (the hook exits 0 silently, deferring to the normal
 — here, bypass — flow).
@@ -1633,6 +1638,181 @@ def attribution_reason(command: str) -> str | None:
     return None
 
 
+# --- PR summary standard ---------------------------------------------------
+
+# Every PR/MR a session opens follows one layout, so a reviewer scans each in
+# the same order: a plain-English summary line, then these sections. The full
+# template and its readability rules ride PR_SUMMARY_SYSTEM_PROMPT in
+# hub-agent.py; this is the hard check behind it. A repo's OWN template wins:
+# when the repo has one, its headings are what is required instead.
+_PR_SUMMARY_LINE = re.compile(r"^\s*\*\*summary:?\*\*", re.IGNORECASE | re.MULTILINE)
+_PR_SECTIONS = (
+    ("Why", r"why"),
+    ("What changed", r"what\s+changed"),
+    ("Risk", r"risk"),
+    ("Testing", r"testing"),
+    ("Follow-ups", r"follow[\s-]?ups?"),
+)
+# Where GitHub, GitLab and Azure DevOps look for a repo's default template.
+_REPO_PR_TEMPLATES = (
+    ".github/pull_request_template.md",
+    "pull_request_template.md",
+    "docs/pull_request_template.md",
+    ".gitlab/merge_request_templates/default.md",
+    ".azuredevops/pull_request_template.md",
+)
+# A repo template heading worded as optional is not required of every PR.
+_OPTIONAL_HEADING = re.compile(r"optional|if applicable", re.IGNORECASE)
+_TEMPLATE_HEADING = re.compile(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+_PR_BODY_MAX_READ = 256 * 1024
+
+
+def _heading_present(body: str, pattern: str) -> bool:
+    return re.search(rf"^\s*#{{1,6}}\s*{pattern}\b", body,
+                     re.IGNORECASE | re.MULTILINE) is not None
+
+
+def _pr_body_command(tokens: list[str]) -> tuple[str, list[str]] | None:
+    """``(verb, args)`` if this simple command opens a PR/MR or rewrites its
+    description, else None. ``create`` always carries a description; an
+    ``edit``/``update`` only counts when it sets one (``gh pr edit --add-label``
+    is not a description change)."""
+    prog = _basename(tokens[0])
+    rest = tokens[1:]
+    if prog == "gh":
+        # `gh -R owner/repo pr create`: global flags may precede the subcommand.
+        if "pr" not in rest:
+            return None
+        args = rest[rest.index("pr") + 1:]
+        body_flags = ("-b", "--body", "-F", "--body-file")
+    elif prog == "glab":
+        if "mr" not in rest:
+            return None
+        args = rest[rest.index("mr") + 1:]
+        body_flags = ("-d", "--description")
+    elif prog == "az":
+        if rest[:2] != ["repos", "pr"]:
+            return None
+        args = rest[2:]
+        body_flags = ("--description",)
+    else:
+        return None
+    if not args:
+        return None
+    verb = args[0]
+    if verb == "create":
+        return verb, args[1:]
+    if verb in ("edit", "update") and any(
+            a in body_flags or a.split("=", 1)[0] in body_flags for a in args[1:]):
+        return verb, args[1:]
+    return None
+
+
+def _body_files(args: list[str]) -> list[str]:
+    """Paths passed to ``gh pr create/edit -F|--body-file`` (``-`` = stdin,
+    whose text is the command's own heredoc and so already in the command)."""
+    out = []
+    for i, a in enumerate(args):
+        if a in ("-F", "--body-file") and i + 1 < len(args):
+            out.append(args[i + 1])
+        elif a.startswith("--body-file="):
+            out.append(a.split("=", 1)[1])
+    return [p for p in out if p and p != "-"]
+
+
+def _read_text(path: str) -> str:
+    try:
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            return fh.read(_PR_BODY_MAX_READ)
+    except OSError:
+        return ""
+
+
+def _repo_root(start: str) -> str | None:
+    d = os.path.abspath(start)
+    while True:
+        if os.path.exists(os.path.join(d, ".git")):
+            return d
+        parent = os.path.dirname(d)
+        if parent == d:
+            return None
+        d = parent
+
+
+def _repo_template_sections(root: str | None) -> list[tuple[str, str]] | None:
+    """The required headings of the repo's own PR template; ``[]`` when its
+    template has no headings (nothing to check against), None when it has no
+    template. Matched case-insensitively, since GitHub accepts any case for the
+    name."""
+    if not root:
+        return None
+    for rel in _REPO_PR_TEMPLATES:
+        dirname, name = os.path.split(os.path.join(root, rel))
+        try:
+            entries = os.listdir(dirname)
+        except OSError:
+            continue
+        match = next((e for e in entries if e.lower() == name), None)
+        if not match:
+            continue
+        text = _read_text(os.path.join(dirname, match))
+        heads = [h for h in _TEMPLATE_HEADING.findall(text)
+                 if not _OPTIONAL_HEADING.search(h)]
+        return [(h, re.escape(h)) for h in heads]
+    return None
+
+
+def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
+    """A reason if ``command`` opens a PR/MR (or rewrites its description)
+    whose description is missing a required section.
+
+    The description is read from the command TEXT — inline ``--body``, a
+    heredoc, or ``$(cat <<EOF …)`` all put it there — plus any ``--body-file``,
+    resolved against ``cwd`` as moved by a preceding ``cd``. A description
+    pulled from somewhere else (``--fill``, the editor, ``$(cat file)``) can't be
+    checked, so it is refused with a reason saying how to pass it."""
+    cwd = cwd or os.getcwd()
+    for tokens, _segment, *_flags in _expand_segments(command):
+        if _basename(tokens[0]) == "cd" and len(tokens) > 1:
+            cwd = os.path.join(cwd, os.path.expanduser(tokens[1]))
+            continue
+        hit = _pr_body_command(tokens)
+        if not hit:
+            continue
+        _verb, args = hit
+        # The tokens carry an inline body unquoted, so its first line starts
+        # where the description does rather than after the shell's quote.
+        body = "\n".join([command, *args]) + "".join(
+            "\n" + _read_text(os.path.join(cwd, os.path.expanduser(p)))
+            for p in _body_files(args))
+        sections = _repo_template_sections(_repo_root(cwd))
+        if sections is not None:
+            missing = [name for name, pat in sections if not _heading_present(body, pat)]
+            # A template with no headings asks for prose; there is nothing to check.
+            if missing:
+                return (
+                    "this repo has its own PR template — the description is missing "
+                    f"its section(s): {', '.join(missing)}. Follow that template, "
+                    "and pass the description inline (--body/--description, or a "
+                    "heredoc) or with --body-file so it can be checked."
+                )
+            return None
+        missing = [name for name, pat in _PR_SECTIONS if not _heading_present(body, pat)]
+        if not _PR_SUMMARY_LINE.search(body):
+            missing.insert(0, "a '**Summary:**' first line")
+        if missing:
+            return (
+                "the PR description does not follow the Turma PR summary standard — "
+                f"missing: {', '.join(missing)}. Required, in order: a "
+                "'**Summary:**' line, then '## Why', '## What changed', '## Risk', "
+                "'## Testing', '## Follow-ups' (see the PR summary standard in your "
+                "system prompt). Pass the description inline (--body/--description, "
+                "or a heredoc) or with --body-file so it can be checked — --fill and "
+                "the editor can't be."
+            )
+    return None
+
+
 # --- top-level classification -------------------------------------------
 
 
@@ -1933,11 +2113,14 @@ def decide(
     *,
     overrides: list[str] | None = None,
     no_attribution: bool = True,
+    pr_summary: bool = True,
+    cwd: str | None = None,
 ) -> tuple[str, str | None, str | None]:
     """Return ``(decision, reason, category)``.
 
     ``decision`` is ``"allow"`` or ``"deny"``. ``category`` is
-    ``"destructive"`` / ``"policy"`` / ``"attribution"`` / ``None``. Only
+    ``"destructive"`` / ``"policy"`` / ``"attribution"`` / ``"pr-summary"`` /
+    ``None``. Only
     ``"destructive"`` honours an operator override grant; the others are hard
     rules the agent self-corrects from.
     """
@@ -1962,6 +2145,11 @@ def decide(
         attrib = attribution_reason(command)
         if attrib:
             return ("deny", attrib, "attribution")
+
+    if pr_summary:
+        summary = pr_summary_reason(command, cwd)
+        if summary:
+            return ("deny", summary, "pr-summary")
 
     return ("allow", None, None)
 
@@ -1996,6 +2184,8 @@ def main(argv: list[str] | None = None) -> int:
     tool_input = event.get("tool_input") or {}
     overrides = _parse_overrides(os.environ.get("TURMA_TOOL_GRANTS"))
     no_attribution = os.environ.get("TURMA_NO_ATTRIBUTION", "1") != "0"
+    pr_summary = os.environ.get("TURMA_PR_SUMMARY", "1") != "0"
+    cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
 
     try:
         decision, reason, _category = decide(
@@ -2003,6 +2193,8 @@ def main(argv: list[str] | None = None) -> int:
             tool_input if isinstance(tool_input, dict) else {},
             overrides=overrides,
             no_attribution=no_attribution,
+            pr_summary=pr_summary,
+            cwd=cwd,
         )
     except Exception as exc:  # noqa: BLE001 - any classifier bug
         # Fail CLOSED here, unlike a malformed event above: a traceback exits 1,

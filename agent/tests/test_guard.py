@@ -1441,6 +1441,127 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
 
+GOOD_BODY = """**Summary:** Archived transcripts no longer store lines twice.
+
+Fixes XERK-1
+
+## Why
+Re-sends were appended.
+
+## What changed
+- Trust the cursor only when it matches the file.
+
+## Risk
+Low — archive write path only.
+
+## Testing
+**QA result:** PASS — re-send replayed.
+**Not tested:** real S3.
+
+## Follow-ups
+- None
+"""
+
+
+class TestPrSummary(unittest.TestCase):
+    """The PR summary standard: a PR/MR description missing a required section
+    is refused, with the missing sections named; a repo's own template wins."""
+
+    def setUp(self):
+        import tempfile
+        self.tmp = tempfile.mkdtemp()
+        self.repo = os.path.join(self.tmp, "repo")
+        os.makedirs(os.path.join(self.repo, ".git"))
+        self.addCleanup(__import__("shutil").rmtree, self.tmp)
+
+    def reason(self, command, cwd=None):
+        return guard.pr_summary_reason(command, cwd or self.repo)
+
+    def test_a_conforming_inline_body_is_allowed(self):
+        cmd = "gh pr create --title 'XERK-1: Stop duplicate lines' --body " + \
+            __import__("shlex").quote(GOOD_BODY)
+        self.assertIsNone(self.reason(cmd))
+
+    def test_a_conforming_heredoc_body_is_allowed(self):
+        cmd = ("gh pr create --title t --body \"$(cat <<'EOF'\n" + GOOD_BODY +
+               "EOF\n)\"")
+        self.assertIsNone(self.reason(cmd))
+
+    def test_a_conforming_body_file_is_allowed_after_a_cd(self):
+        sub = os.path.join(self.repo, "sub")
+        os.makedirs(sub)
+        with open(os.path.join(sub, "body.md"), "w") as fh:
+            fh.write(GOOD_BODY)
+        self.assertIsNone(self.reason("cd sub && gh pr create -t t -F body.md"))
+        self.assertIsNone(self.reason("gh pr create -t t --body-file=sub/body.md"))
+
+    def test_missing_sections_are_refused_and_named(self):
+        body = GOOD_BODY.replace("## Risk\n", "").replace("## Follow-ups\n", "")
+        r = self.reason("gh pr create --title t --body " +
+                        __import__("shlex").quote(body))
+        self.assertIsNotNone(r)
+        self.assertIn("Risk", r)
+        self.assertIn("Follow-ups", r)
+        self.assertNotIn("Why,", r)
+
+    def test_a_missing_summary_line_is_refused(self):
+        body = GOOD_BODY.replace("**Summary:**", "")
+        r = self.reason("gh pr create --body " + __import__("shlex").quote(body))
+        self.assertIn("Summary", r)
+
+    def test_fill_and_unreadable_bodies_are_refused(self):
+        for cmd in ("gh pr create --fill", "gh -R a/b pr create --title t",
+                    "gh pr create -t t -F missing.md", "glab mr create --fill",
+                    "az repos pr create --title t --description b"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.reason(cmd))
+
+    def test_every_forge_cli_is_checked(self):
+        q = __import__("shlex").quote(GOOD_BODY)
+        for cmd in (f"glab mr create --title t --description {q}",
+                    f"az repos pr create --title t --description {q}",
+                    f"gh pr edit 12 --body {q}"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.reason(cmd))
+
+    def test_commands_that_set_no_description_are_untouched(self):
+        for cmd in ("gh pr view 12", "gh pr edit 12 --add-label x",
+                    "glab mr update 3 --label x", "gh pr list",
+                    "echo 'gh pr create --fill'", "git commit -m '## Why'",
+                    "az repos pr update --id 12 --status abandoned"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.reason(cmd))
+
+    def test_a_body_edit_is_checked(self):
+        self.assertIsNotNone(self.reason("gh pr edit 12 --body 'tweak'"))
+        self.assertIsNotNone(self.reason("glab mr update 3 -d 'tweak'"))
+
+    def test_the_repos_own_template_wins(self):
+        os.makedirs(os.path.join(self.repo, ".github"))
+        with open(os.path.join(self.repo, ".github", "PULL_REQUEST_TEMPLATE.md"), "w") as fh:
+            fh.write("## Description\n\n## Screenshots (if applicable)\n\n## Checklist\n")
+        # Our standard's sections are not what this repo asks for...
+        r = self.reason("gh pr create --body " + __import__("shlex").quote(GOOD_BODY))
+        self.assertIn("Description", r)
+        self.assertIn("Checklist", r)
+        self.assertNotIn("Screenshots", r)  # worded optional, so not required
+        # ...its own are.
+        ok = "## Description\nx\n\n## Checklist\n- [x] y\n"
+        self.assertIsNone(self.reason("gh pr create --body " + __import__("shlex").quote(ok)))
+
+    def test_a_template_without_headings_disables_nothing_but_checks_nothing(self):
+        with open(os.path.join(self.repo, "pull_request_template.md"), "w") as fh:
+            fh.write("Describe your change.\n")
+        self.assertIsNone(self.reason("gh pr create --body 'anything'"))
+
+    def test_decide_routes_it_and_the_toggle_disables_it(self):
+        cmd = "gh pr create --title t --body b"
+        d = guard.decide("Bash", {"command": cmd}, cwd=self.repo)
+        self.assertEqual((d[0], d[2]), ("deny", "pr-summary"))
+        self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd=self.repo,
+                                      pr_summary=False)[0], "allow")
+
+
 class TestHookEntrypoint(unittest.TestCase):
     """Invoke guard.py as a subprocess the way Claude Code runs the hook."""
 
@@ -1480,6 +1601,14 @@ class TestHookEntrypoint(unittest.TestCase):
             {"TURMA_NO_ATTRIBUTION": "0"},
         )
         self.assertEqual(proc.stdout.strip(), "")
+
+    def test_pr_summary_denied_and_toggle_off_allows(self):
+        event = {"tool_name": "Bash", "cwd": AGENT_DIR,
+                 "tool_input": {"command": "gh pr create --title t --body b"}}
+        out = json.loads(self._run_hook(event).stdout)
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+        self.assertIn("PR summary standard", out["hookSpecificOutput"]["permissionDecisionReason"])
+        self.assertEqual(self._run_hook(event, {"TURMA_PR_SUMMARY": "0"}).stdout.strip(), "")
 
     def test_env_override_allows_destructive(self):
         event = {"tool_name": "Bash", "tool_input": {"command": "rm -rf /opt/app"}}
