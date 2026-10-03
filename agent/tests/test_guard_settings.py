@@ -504,6 +504,17 @@ class TestFleetPolicy(unittest.TestCase):
         self.assertEqual(s["sandbox"]["network"]["allowedDomains"],
                          list(ha.SANDBOX_DOMAIN_FLOOR))
 
+    def test_none_opts_a_host_out_of_either_floor(self):
+        # Blank keeps the floor, so `none` is the only way to say "no floor".
+        for raw in ("none", " NONE "):
+            with mock.patch.dict(os.environ, {"TURMA_SANDBOX_DOMAINS": raw,
+                                              "TURMA_TOOL_ALLOW": raw}):
+                self.assertEqual(ha.sandbox_allowed_domains(), [])
+                self.assertEqual(ha.tool_allow_floor(), [])
+        allow = self._settings({"TURMA_TOOL_ALLOW": "none"})["permissions"]["allow"]
+        self.assertFalse(set(ha.TOOL_ALLOW_FLOOR) & set(allow))
+        self.assertIn(ha.session_cli_allow_rule(), allow)
+
     def test_tool_allow_floor_follows_the_apps_own_rules(self):
         allow = self._settings()["permissions"]["allow"]
         own = list(ha._GUARD_ALLOW_PATH_RULES) + [ha.session_cli_allow_rule()]
@@ -695,20 +706,41 @@ class TestEnsureGuardSettingsWrite(unittest.TestCase):
             self.assertEqual(json.load(fh), {"previous": True})
         self.assertEqual(os.listdir(self.tmp), ["guard-settings.json"])
 
-    @unittest.skipUnless(hasattr(os, "O_NOFOLLOW"), "needs O_NOFOLLOW")
-    def test_a_symlink_planted_at_the_tmp_name_is_refused(self):
-        # A planted link would otherwise redirect the write, and the rename would
-        # leave guard-settings.json a symlink to a file nothing denies editing.
+    def test_nothing_planted_at_a_guessable_tmp_name_blocks_the_write(self):
+        # The tmp name is random: a symlink or a directory at the old pid-named
+        # tmp no longer fails the write onto the guard-less (None) fallback, and
+        # a planted link is never followed.
         outside = tempfile.mkdtemp()
         self.addCleanup(lambda: __import__("shutil").rmtree(outside, True))
         target = os.path.join(outside, "elsewhere.json")
         with open(target, "w", encoding="utf-8") as fh:
             fh.write("untouched")
         os.symlink(target, f"{self.path}.tmp.{os.getpid()}")
-        self.assertIsNone(self.sm._ensure_guard_settings())
+        os.mkdir(f"{self.path}.tmp")
+        self.assertEqual(self.sm._ensure_guard_settings(), self.path)
         with open(target, encoding="utf-8") as fh:
             self.assertEqual(fh.read(), "untouched")
-        self.assertFalse(os.path.lexists(self.path))
+        self.assertFalse(os.path.islink(self.path))
+        with open(self.path, encoding="utf-8") as fh:
+            self.assertIn("hooks", json.load(fh))
+
+    def test_the_tmp_is_created_exclusively_and_never_followed(self):
+        seen = []
+        real_open = ha.os.open
+
+        def spy(p, flags, *a):
+            if ".tmp." in str(p):
+                seen.append((p, flags))
+            return real_open(p, flags, *a)
+
+        with mock.patch.object(ha.os, "open", side_effect=spy):
+            self.assertEqual(self.sm._ensure_guard_settings(), self.path)
+        self.assertEqual(len(seen), 1)
+        tmp, flags = seen[0]
+        self.assertNotEqual(os.path.basename(tmp).split(".tmp.")[1], str(os.getpid()))
+        self.assertTrue(flags & os.O_EXCL)
+        if hasattr(os, "O_NOFOLLOW"):
+            self.assertTrue(flags & os.O_NOFOLLOW)
 
 
 class TestLimitsSettings(unittest.TestCase):

@@ -36,7 +36,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
 - **The same file carries FLEET FLOORS** (XERK-1565), which MERGE with the operator's own settings
   (lists merge across scopes; `--settings` sits above project settings), never replace them:
   - `sandbox.network.allowedDomains` = `SANDBOX_DOMAIN_FLOOR`; `TURMA_SANDBOX_DOMAINS` (CSV)
-    REPLACES it when non-blank.
+    REPLACES it when non-blank; `none` empties it (blank keeps the floor). Same for
+    `TURMA_TOOL_ALLOW` below.
   - Residual: the domain floor removes the PROMPT and adds no containment. GitHub (any public
     issue), `*.atlassian.net` (anyone can create a site) and the registries are multi-tenant sinks,
     and sandboxed reads are open bar `Read()` denies (none on `~/.config/gh`, `~/.claude`), so a
@@ -55,9 +56,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     `--update-head-ok`) moved local main for an `--all` push; a switch onto main set up a `HEAD`
     push. Auto mode already lets a session fetch and push its own non-default branch, so a git
     command TYPED DIRECTLY stays with the classifier. Keep git out of `TURMA_TOOL_ALLOW` too.
-  - Residual: the test-runner rules (`./gradlew`, `npm test`, `node --test`, `pytest`, `python3 -m
-    unittest`) run SESSION-EDITABLE code — the `./gradlew` script, package.json scripts, conftest.py,
-    test modules — past both the classifier and the guard, which sees only the runner's command line.
+  - Residual: the test-runner rules (`./gradlew`, `npm test`, `node --test`, `pytest`,
+    `python3 -m unittest`) run SESSION-EDITABLE code — the `./gradlew` script, package.json
+    scripts, conftest.py, test modules — past both the classifier and the guard, which sees only
+    the runner's command line.
     A session can write a `--mirror` push into one and run it unprompted, so it can still reach main
     or credentials. It needs no file at all: `node --test --import 'data:text/javascript,…'` (or
     `--require`) runs INLINE code in one unprompted command, code the guard never sees. Dropping
@@ -69,8 +71,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     lone `--body-file` under `TURMA_PR_SUMMARY=0`, still posts the file unless Claude Code's prefix
     match refuses the substitution — unmeasured, part of the spike below. Stdin and fd paths are
     closed (below); a body file is checked ALONE, so no heredoc vouches for it; and one another
-    segment names (`cp <cred> b.md; … -F b.md`) is refused. One spelled so the hook can't match
-    it (a glob, `$(…)`) or swapped by an EARLIER tool call is not.
+    segment names (`cp <cred> b.md; … -F b.md`) is refused. That compares path STRINGS, so one
+    spelled so the hook can't match it (a glob, `$(…)`, `"$PWD/b.md"`, `/proc/self/cwd/b.md`, a
+    symlinked dir made in the same line) or swapped by an EARLIER tool call is not.
   - `TURMA_TOOL_ALLOW` splits on every comma with no escape, so a rule whose pattern holds a comma
     cannot be set through it (it lands as two malformed rules).
   - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
@@ -86,8 +89,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     there. `_ensure_guard_settings` writes an `O_NOFOLLOW` per-pid tmp + `os.replace` (no half file
     for a reader, no planted-symlink redirect).
   - Real-host spike (sandboxed floor vs off-floor domain, merged environment, `gh pr create`
-    unprompted) NOT yet run — no agent host was available; record the answers here. Tests: `TestFleetPolicy`,
-    `TestEnsureGuardSettingsWrite`.
+    unprompted) NOT yet run — no agent host was available; record the answers here.
+    Tests: `TestFleetPolicy`, `TestEnsureGuardSettingsWrite`.
 - **`~/.claude` is guarded by `hooks/fileguard.py`, not a pattern**: the rule is "everything under it
   except the two agent-memory trees," which a glob list can't express — deny beats allow, and a deny
   matching a DIRECTORY takes its whole subtree, so `Edit(~/.claude/*)` is the blanket rule. Patterns
@@ -138,8 +141,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     passed on ok.md's sections and posted the token file. Heredocs are not flags, so `--body
     "$(cat <<EOF …)"` and `-F - <<EOF` stay one source.
   - **A STDIN description must be the PR command's OWN heredoc** (XERK-1565, `_stdin_redirects`):
-    gh reads whatever fd 0 ends up as, so `-F - <<EOF … < hosts.yml` (also `0<`, `<<<`, `<&`, a pipe,
-    or a sibling's heredoc: `-F - < f; gh pr view 1 <<EOF`) posted the file on the heredoc's sections.
+    gh reads whatever fd 0 ends up as, so `-F - <<EOF … < hosts.yml` (also `0<`, `<<<`, `<&`, a
+    pipe, or a sibling's heredoc: `-F - < f; gh pr view 1 <<EOF`) posted the file on the heredoc's
+    sections.
     `-` or a path resolving to `/dev/stdin` needs exactly one heredoc on that segment.
   - **A description FILE fails CLOSED** (XERK-1565, `_pr_description_file`) — never enumerate bad
     paths; four rounds of that each left one (`/dev/stderr 2<f`, `//dev/fd/3 3<f`, a symlink).

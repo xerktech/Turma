@@ -2824,6 +2824,10 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             # regular file outside /dev and /proc, or a file a heredoc writer
             # in this command creates first. Nothing else is a description.
             kind, text = _pr_description_file(cwd, f)
+            # Path STRINGS only: another spelling of the same file ("$PWD/f",
+            # /proc/self/cwd/f, a glob, a symlinked dir made in this line)
+            # gets past it — a documented residual (agent-hooks.md), not a
+            # credential filter.
             if kind != "stdin" and _pr_full_path(cwd, f) in named:
                 return (
                     "another part of the command names the description file "
@@ -2892,8 +2896,9 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
         #   `gh pr edit N -F - <<EOF` pass; a good sibling can't vouch for a
         #   bad one);
         # - an inline body or a file a heredoc writer fills is checked with
-        #   every heredoc (and an existing such file alone too, after this). Matching a heredoc to the command it feeds (owner
-        #   line, redirect target) refused 26% of real compliant PR commands —
+        #   every heredoc (and an existing such file alone too, after this).
+        #   Matching a heredoc to the command it feeds (owner line, redirect
+        #   target) refused 26% of real compliant PR commands —
         #   `git push && gh pr create … <<EOF`, `cd x && …`, `cat > "$S/b.md"`
         #   — so an unrelated heredoc counts there: the accepted residual,
         #   since it takes a model gaming its own guard. (`<<` in

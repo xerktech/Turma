@@ -4636,7 +4636,8 @@ QWEN_NATIVE_ASK_TOOL = "ask_user_question"
 # takes an upload to anyone's bucket through a signed URL with no auth on the
 # sender's side, and no routine build needs the wildcard (Android/Gradle use
 # dl.google.com + maven.google.com); an off-floor domain still runs, it prompts.
-# `TURMA_SANDBOX_DOMAINS` (CSV) REPLACES the list when set non-blank.
+# `TURMA_SANDBOX_DOMAINS` (CSV) REPLACES the list when set non-blank; `none`
+# empties it.
 SANDBOX_DOMAIN_FLOOR = (
     "github.com", "*.github.com", "*.githubusercontent.com", "ghcr.io",
     "registry.npmjs.org", "*.npmjs.org", "pypi.org", "files.pythonhosted.org",
@@ -4666,7 +4667,8 @@ SANDBOX_DOMAIN_FLOOR = (
 # both the classifier and the guard, which sees only the runner's command line,
 # so a session can still reach main or credentials through a script it writes —
 # or with no file at all: `node --test --import 'data:text/javascript,…'` (or
-# `--require`) runs INLINE code in one unprompted command. Dropping the git rules closed the DIRECT route, not every route. Residual too:
+# `--require`) runs INLINE code in one unprompted command. Dropping the git
+# rules closed the DIRECT route, not every route. Residual too:
 # the `gh pr create`/`gh pr edit` rules post whatever body the command names
 # past the classifier, which would otherwise see a credential path. The guard's
 # PR-standard check reads the body but is no credential filter: it now refuses
@@ -4681,8 +4683,9 @@ SANDBOX_DOMAIN_FLOOR = (
 # alone, so a heredoc gh never reads cannot vouch for `--body-file hosts.yml`.
 # `TURMA_TOOL_ALLOW` (CSV) REPLACES the list when set non-blank; keep git rules
 # out of it for the same reason. It splits on every comma with no escape, so a
-# rule whose pattern holds a comma cannot be set through it. Distinct from `TURMA_TOOL_GRANTS`, which only
-# exempts the guard's destructive category at hook run time and is never
+# rule whose pattern holds a comma cannot be set through it. `none` sets an
+# EMPTY floor (blank keeps the floor). Distinct from `TURMA_TOOL_GRANTS`, which
+# only exempts the guard's destructive category at hook run time and is never
 # written here. The session-CLI rule is XERK-1564's.
 TOOL_ALLOW_FLOOR = (
     "Bash(gh pr create:*)", "Bash(gh pr checks:*)",
@@ -4706,10 +4709,14 @@ AUTO_MODE_REPO_NAME_RE = re.compile(r"[A-Za-z0-9._-]{1,100}")
 
 
 def _csv_override(name, floor):
-    """`floor` as a list, or the non-blank CSV in env `name` that REPLACES it."""
+    """`floor` as a list, or the non-blank CSV in env `name` that REPLACES it.
+    The value `none` (any case) replaces it with NOTHING: a blank value keeps
+    the floor, so without a sentinel a host could not opt out of one."""
     raw = os.environ.get(name, "").strip()
     if not raw:
         return list(floor)
+    if raw.lower() == "none":
+        return []
     out = []
     for item in raw.split(","):
         item = item.strip()
@@ -19342,12 +19349,13 @@ class SessionManager:
         # start rewrites this file while sessions an earlier manager launched
         # still point at it, so a truncate-in-place write (or one cut short by a
         # full disk) could hand a reader a half file — no guard, no floors.
-        # O_NOFOLLOW like the other per-pid tmp writers here: a symlink already
-        # at that name is an attempt to redirect this write elsewhere, so refuse it.
-        tmp = f"{path}.tmp.{os.getpid()}"
+        # The tmp name is RANDOM and created O_EXCL|O_NOFOLLOW: a predictable
+        # name (pid) let anything planted there (a symlink, a directory) fail
+        # this write and push the launch onto the guard-less fallback below.
+        tmp = f"{path}.tmp.{secrets.token_hex(8)}"
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                          | getattr(os, "O_NOFOLLOW", 0), 0o666)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
                 json.dump(build_guard_settings(device=getattr(self, "device", None)),
