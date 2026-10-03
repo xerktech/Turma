@@ -183,18 +183,28 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 - **`light` means "reuse the caches" for the CHEAP git reads too**, not just the slow ones:
   `repo_cheap`/`session_cheap` hold the previous beat's branch + dirty counts. Never make a light beat
   re-derive something a scheduled beat will re-derive moments later. Tests: `TestLightBeatCost`.
-- **A FULL beat serves the cheap git reads from cache too; the cheap-git worker refreshes them**
-  (XERK-1217). Inline, `git status` per repo and per running session — each bounded only by `run()`'s
-  15s — took beats to 100-425s on an HDD pool under NFS load, and the hub read the host offline.
-  - `_cheap_read` reads inline only on first sight (key absent) and for `fresh` — the
-    undelivered-work poller, which must see the dirty count as of now. Don't route the beat there.
-  - The cache's reads are `strict`: a git TIMEOUT raises `GitTimeout` (plain `run()` folds it into
-    "gone"/"clean"), and the worker and `fresh` path keep the last real answer on it. A fast
-    failure — missing cwd, broken `.git` link — is still "gone". A cached `None` is served, never
-    re-read inline.
-  - Both sides write `repo_cheap`/`session_cheap`, so every write REBINDS under `_cheap_lock`
+- **The beat spawns NO git: every per-repo/per-session git fact is served from cache and read on the
+  cheap-git worker** (XERK-1217, XERK-1262). Inline, `git status` per repo and per running session —
+  each bounded only by `run()`'s 15s — took beats to 100-425s on an HDD pool under NFS load, and a
+  cold-start beat to 121s, so the hub read the host offline.
+  - `_cheap_read` is the one path, for the cheap maps (`repo_cheap`/`session_cheap`, re-staged every
+    full beat) AND the slow ones (`repo_facts`/`session_facts`/`root_remote`, re-staged on the slow
+    cadence or a live-branch change). Don't add an inline read back for "first sight" or "fresh".
+  - First sight seeds a placeholder its consumers already read as "can't tell yet" — session git
+    `None`, work `None`, empty repo facts, root remote `""` (never `None`: `root_repo_entry` reads
+    `None` inline) — and stages the read even on a light beat.
+  - The session slow-facts job reads the live branch from `session_cheap` when it RUNS, so a cold
+    start converges in one worker pass. Keep the cheap read staged before the facts read.
+  - The open-PR poller is a STAGE/DECIDE split: its cadence beat stages a fresh read
+    (`nudge_reads`, `None` = pending); each full beat decides only reads that landed, re-checking
+    the idle gates first.
+  - The cheap reads are `strict`: a git TIMEOUT raises `GitTimeout` (plain `run()` folds it into
+    "gone"/"clean") and the worker keeps the last real answer. A fast failure — missing cwd,
+    broken `.git` link — is still "gone". A cached `None` is served, never re-read inline.
+  - Both sides write these maps, so every write REBINDS under `_cheap_lock`
     (`_cheap_store`/`_cheap_forget`); never mutate them in place. The worker stores
-    `only_if_present`, so a key pruned mid-read stays pruned. Tests: `TestCheapGitWorker`.
+    `only_if_present`, so a key pruned mid-read stays pruned. Tests: `TestCheapGitWorker`,
+    `TestPollOpenPrNudges`.
 - **`root_repo_entry` takes its `remote` from the slow-cadence cache.** It used to call `git_info()`,
   running the whole `git_info_slow` — remote, `log -1`, `rev-parse --show-toplevel` — every beat and
   throwing all but the remote away. Do not re-introduce a full `git_info()` on this path.

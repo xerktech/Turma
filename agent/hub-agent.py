@@ -16499,9 +16499,10 @@ class SessionManager:
         # Seeded from the durable PR-status ledger so a chip keeps its state/CI
         # pill across a restart (an ended session's PR is never re-polled).
         self.pr_status_cache = self._load_pr_status_ledger()
-        # Slow-changing git facts cached across beats (recomputed on the slow
-        # USAGE_EVERY cadence, or on first sight): repo path -> repo_slow_facts,
-        # session id -> {liveBranch, slow git_info, branch_sync work}.
+        # Slow-changing git facts cached across beats (re-read on the slow
+        # USAGE_EVERY cadence, or on first sight, by the cheap-git worker — so
+        # rebound under _cheap_lock like the maps below): repo path ->
+        # repo_slow_facts, session id -> {liveBranch, slow git_info, branch_sync}.
         self.repo_facts = {}
         self.session_facts = {}
         # The CHEAP per-repo/per-session git reads (current branch + dirty count),
@@ -16522,7 +16523,12 @@ class SessionManager:
         self._cheap_wake = threading.Event()
         self._cheap_worker = None
         self._cheap_due = {}                     # (attr, key) -> (fn, path)
-        self.root_repo_cache = None              # repos-root origin remote (slow)
+        # The slow facts above, and these, are served from cache the same way
+        # and read on the same worker (XERK-1262) — so the beat spawns no git at
+        # all: not on cold start, not on the slow cadence.
+        self.root_remote = {}                    # REPOS_ROOT -> origin remote (slow)
+        # session id -> the open-PR poller's fresh read (None = staged, pending).
+        self.nudge_reads = {}
         # Throttled `docker logs` tail (LOG_TAIL_EVERY beats); reused in between.
         self.log_tail_cache = None
         # On Windows every live pty-host re-reads the auth token from this file
@@ -20648,8 +20654,8 @@ class SessionManager:
         # Not slug_usage: the transcript survives kill/delete and still counts
         # toward the persistent per-repo/host usage. It's keyed by slug (not
         # session id) and bounded by _prune_ledger when the transcript is gone.
-        self.session_facts.pop(sid, None)
-        self._cheap_forget("session_cheap", lambda k: k != sid)
+        for attr in ("session_cheap", "session_facts", "nudge_reads"):
+            self._cheap_forget(attr, lambda k: k != sid)
         self.pending_prs.pop(sid, None)
         self.session_pr_urls.pop(sid, None)
         # A killed/deleted session's tmux (and its blocked ask.py hook) is gone;
@@ -27771,38 +27777,33 @@ class SessionManager:
                     # rest, and keeps the worker alive for the next beat.
                     log(f"slow refresh {kind} failed: {e}")
 
-    def _cheap_read(self, attr, key, fn, path, light=False, fresh=False,
-                    default=None):
-        """The cheap git facts (branch + dirty count) for one repo or session,
-        from the `attr` cache (repo_cheap / session_cheap), keyed by `key`.
+    def _cheap_read(self, attr, key, fn, path, refresh=True, default=None):
+        """One cached git fact for a repo or session, from the `attr` cache
+        (repo_cheap / session_cheap / repo_facts / session_facts / root_remote),
+        keyed by `key`. The beat NEVER spawns git here: every read runs on the
+        cheap-git worker.
 
-        A FULL beat serves the cached answer and stages a refresh on the
-        cheap-git worker (XERK-1217) instead of spawning `git status` inline: on
-        a host whose disk is saturated (an HDD pool under NFS load), those
-        spawns — two or three per repo and per running session, each bounded
-        only by run()'s 15s — took beats to 100-425s and the hub read a healthy
-        host as offline. A `light` beat serves the cache without staging.
-        Only first sight (the key is not cached at all) and `fresh` read
-        inline. A cached None ("worktree gone") is served like any other
-        answer, and reads are `strict`: a read that TIMES OUT on a stalled disk
-        raises GitTimeout rather than reporting "gone" or "clean", so the cache
-        keeps its last real answer instead of re-reading inline every beat."""
+        `refresh` stages a re-read on the worker and serves the cached answer
+        meanwhile (XERK-1217): on a host whose disk is saturated (an HDD pool
+        under NFS load), inline `git status` spawns — each bounded only by
+        run()'s 15s — took beats to 100-425s and the hub read a healthy host as
+        offline. The cheap reads pass `refresh` on every full beat, the slow
+        facts on the slow cadence; a `light` beat passes neither.
+
+        First sight (the key is not cached at all) seeds `default` and stages
+        the read even on a light beat (XERK-1262): the cold-start beat after an
+        agent restart used to read every repo and session inline, which took
+        121s on a stalled host — so a restart read offline for its first beat.
+        Callers pick a `default` their consumers already treat as "can't tell
+        yet". A cached None ("worktree gone") is served like any other answer.
+        The cheap reads are `strict`, so a TIMED-OUT read raises GitTimeout on
+        the worker and the cache keeps its last real answer."""
         cache = getattr(self, attr)
-        if fresh or key not in cache:
-            try:
-                value = fn(path, strict=True)
-            except GitTimeout:
-                # Keep the last real answer; with none yet, report `default`
-                # (what a timed-out read used to report) and let the worker
-                # retry it off the beat.
-                if key in cache:
-                    return cache[key]
-                self._cheap_store(attr, key, default)
-                self._stage_cheap_refresh(attr, key, fn, path)
-                return default
-            self._cheap_store(attr, key, value)
-            return value
-        if not light:
+        if key not in cache:
+            self._cheap_store(attr, key, default)
+            self._stage_cheap_refresh(attr, key, fn, path)
+            return default
+        if refresh:
             self._stage_cheap_refresh(attr, key, fn, path)
         return cache[key]
 
@@ -28273,7 +28274,7 @@ class SessionManager:
             sess["prsLandedTs"] = ts
             self.save()
 
-    def _poll_open_pr_nudges(self):
+    def _poll_open_pr_nudges(self, stage=True):
         """Nudge a session that has finished a turn holding code work that is
         not on an open PR (XERK-526): commit, push, open a PR, watch CI.
 
@@ -28317,7 +28318,16 @@ class SessionManager:
         Edge-triggered like _poll_pr_conflicts: one nudge per episode, retried
         only past PR_OPEN_NUDGE_RETRY_SEC, capped at PR_OPEN_NUDGE_MAX_ATTEMPTS.
         Runs off the same beat as refresh_pr_status, so the pr_status_cache it
-        reads is already fresh — no network call of its own."""
+        reads is already fresh — no network call of its own.
+
+        The fresh git read is a STAGE/DECIDE split (XERK-1262), like the PR
+        comment fetch (XERK-543): inline, it was a dirty walk + ref walk per idle
+        session on the beat, each bounded only by run()'s 15s. A `stage` beat
+        (the PR-status cadence) queues the read on the cheap-git worker for each
+        session that passes the gates; every full beat in between decides only
+        the sessions whose read has LANDED (nudge_reads), re-checking the gates
+        first, so a session that went busy meanwhile is still not nudged. The
+        decision is at most a beat behind the read it uses."""
         if not PR_OPEN_NUDGE:
             return
         now = time.time()
@@ -28325,6 +28335,9 @@ class SessionManager:
             if sess.get("status") != "running":
                 continue
             sid = sess["id"]
+            read = self.nudge_reads.get(sid)       # None = none, or pending
+            if not stage and read is None:
+                continue                            # nothing landed to decide
             # An open (or not-yet-fetched) PR already covers the work: re-arm any
             # stale episode and skip before paying for a pane capture.
             have_open = False
@@ -28335,6 +28348,7 @@ class SessionManager:
                     break
             nudged = sess.get("prOpenNudged")
             if have_open:
+                self._cheap_forget("nudge_reads", lambda k: k != sid)
                 if nudged and sid in nudged:
                     del nudged[sid]
                     if not nudged:
@@ -28353,11 +28367,13 @@ class SessionManager:
                 # the way pane_prompt does for a Claude/qwen dialog.
                 blocked = isinstance(snap, dict) and bool(snap.get("pendingInteraction"))
                 if busy is not False or blocked:
+                    self._cheap_forget("nudge_reads", lambda k: k != sid)
                     continue
             else:
                 busy, _mode, prompt = _pane_status(
                     sess.get("tmuxName"), self.sess_state.setdefault(sid, {}))
                 if busy is not False or prompt is not None:
+                    self._cheap_forget("nudge_reads", lambda k: k != sid)
                     continue
             # "Working" is paneBusy OR live background agents (XERK-245): a
             # session that delegates work (a QA/verify subagent, a workflow)
@@ -28370,13 +28386,23 @@ class SessionManager:
             # runtime, dsh/qwen included — the projection folds it), so this is
             # up to date by the time this poller runs on the PR-status cadence.
             if live_agents_report(self.sess_state.get(sid) or {}):
+                self._cheap_forget("nudge_reads", lambda k: k != sid)
                 continue
-            # Force a fresh read of the branch-sync facts: the poller runs more
-            # often than the slow facts refresh (USAGE_EVERY), and the undelivered
-            # check (pushed / aheadOfRemote) must not be up to a beat stale.
-            gi, work = self._session_git(sess, refresh=True, fresh=True)
-            dirty = (gi or {}).get("dirtyFiles") or 0
-            live_branch = (self.session_facts.get(sid) or {}).get("liveBranch")
+            # A fresh read of the dirty count and branch-sync facts: the poller
+            # runs more often than the slow facts refresh (USAGE_EVERY), and the
+            # undelivered check (pushed / aheadOfRemote) must not be that stale.
+            # Staged on the worker; decided once it lands (see the docstring).
+            if read is None:
+                if sid not in self.nudge_reads:
+                    self._cheap_store("nudge_reads", sid, None)
+                self._stage_cheap_refresh("nudge_reads", sid,
+                                          self._open_pr_nudge_reader(sess),
+                                          sess.get("worktreePath"))
+                continue
+            self._cheap_forget("nudge_reads", lambda k: k != sid)
+            dirty = read.get("dirtyFiles") or 0
+            live_branch = read.get("liveBranch")
+            work = read.get("work")
             ahead_remote = (work or {}).get("aheadOfRemote") or 0
             undelivered = (
                 dirty > 0
@@ -28415,6 +28441,23 @@ class SessionManager:
             log(f"open-pr nudge: nudging {sid} to open a PR for "
                 f"undelivered work (attempt {attempts + 1})")
             self.save()
+
+    def _open_pr_nudge_reader(self, sess):
+        """The worker job behind the open-PR poller's fresh read: the dirty count
+        and live branch as of now (strict, so a timed-out read leaves the poll
+        pending instead of reading as "clean"), then the branch-sync facts
+        against that branch. Both are also published to the card caches, as the
+        inline fresh read used to."""
+        sid = sess["id"]
+
+        def read(path, strict=True):
+            gi = git_info_cheap(path, strict=True)
+            self._cheap_store("session_cheap", sid, gi, only_if_present=True)
+            facts = self._session_facts_reader(sess)(path)
+            self._cheap_store("session_facts", sid, facts, only_if_present=True)
+            return {"dirtyFiles": (gi or {}).get("dirtyFiles") or 0,
+                    "liveBranch": facts["liveBranch"], "work": facts["work"]}
+        return read
 
     def _poll_pr_conflicts(self):
         """Tell a running session to resolve the merge conflicts on its OWN PR,
@@ -30619,25 +30662,24 @@ class SessionManager:
         except Exception as e:
             log(f"cc-socks sweep failed: {e}")
 
-    def _session_git(self, sess, refresh, light=False, fresh=False):
-        """(git-info dict | None, branch-sync work dict) for a session's payload.
-        The CHEAP current-branch + dirty reads run every beat; the SLOW facts —
-        repo name / remote URL / last-commit line, and the branch<->base/origin
-        sync counts — are cached and only recomputed on the slow cadence
-        (`refresh`), when the session is first seen, or when its live branch
-        changed (so a session that just named its work branch updates promptly
-        without re-walking refs every beat).
+    def _session_git(self, sess, refresh, light=False):
+        """(git-info dict | None, branch-sync work dict | None) for a session's
+        payload, served entirely from cache — the beat spawns no git here.
 
-        On a `light` beat the cheap reads are cached too (three git spawns per
-        RUNNING session), for the same reason the repo entries cache theirs — a
-        light beat's job is to get the command result back fast. A full beat
-        serves the cache as well and stages a refresh on the cheap-git worker
-        (XERK-1217); only first sight, or `fresh`, reads inline."""
+        The CHEAP current-branch + dirty reads are re-staged on every full beat;
+        the SLOW facts — repo name / remote URL / last-commit line, and the
+        branch<->base/origin sync counts — on the slow cadence (`refresh`), or
+        when the session's live branch changed (so a session that just named its
+        work branch updates within a beat without re-walking refs every beat).
+        Both run on the cheap-git worker (XERK-1217, XERK-1262).
+
+        First sight serves placeholders until the worker answers: git None (what
+        every client already renders as "no branch yet") and work None ("no sync
+        facts") — one beat of "can't tell" instead of a cold-start beat long
+        enough to read the host offline."""
         sid = sess["id"]
-        # None if the worktree is gone. `fresh` is a caller asking for the
-        # facts as of NOW (the undelivered-work poller), so it reads inline.
         gi = self._cheap_read("session_cheap", sid, git_info_cheap,
-                              sess["worktreePath"], light=light, fresh=fresh)
+                              sess["worktreePath"], refresh=not light)
         gi = dict(gi) if gi is not None else None      # never hand out the cache
         # The app owns no branch, so the branch to report is the LIVE one the
         # running agent named for its work ("HEAD" = still detached, not yet
@@ -30646,21 +30688,38 @@ class SessionManager:
         if live_branch == "HEAD":
             live_branch = None
         cached = self.session_facts.get(sid)
-        if refresh or cached is None or cached.get("liveBranch") != live_branch:
+        moved = cached is not None and cached.get("liveBranch") != live_branch
+        cached = self._cheap_read(
+            "session_facts", sid, self._session_facts_reader(sess),
+            sess["worktreePath"], refresh=refresh or moved,
+            default={"liveBranch": live_branch, "slow": {}, "work": None})
+        if gi is not None:
+            gi.update(cached["slow"])  # fold cached repoName/remote/lastCommit in
+        return gi, cached["work"]
+
+    def _session_facts_reader(self, sess):
+        """The worker job behind a session's slow facts. It reads the live branch
+        from session_cheap when it RUNS, not when it was staged: the beat stages
+        the cheap read first, so on first sight the worker computes the sync
+        facts against the branch it has just read rather than the placeholder."""
+        sid = sess["id"]
+
+        def read(path, strict=True):
+            gi = self.session_cheap.get(sid)
+            live = gi.get("branch") if gi else None
+            if live == "HEAD":
+                live = None
             # Compare the live branch against what the session forked from
             # (baseRef, e.g. origin/main), falling back to the repo's current
             # checkout when we didn't record a base.
             base = sess.get("baseRef") or run(
                 ["git", "-C", sess["repoPath"], "rev-parse", "--abbrev-ref", "HEAD"])
-            cached = {
-                "liveBranch": live_branch,
-                "slow": git_info_slow(sess["worktreePath"]),
-                "work": branch_sync(sess["repoPath"], live_branch, base or None),
+            return {
+                "liveBranch": live,
+                "slow": git_info_slow(path),
+                "work": branch_sync(sess["repoPath"], live, base or None),
             }
-            self.session_facts[sid] = cached
-        if gi is not None:
-            gi.update(cached["slow"])  # fold cached repoName/remote/lastCommit in
-        return gi, cached["work"]
+        return read
 
     def _new_work_since_prs(self, sess, signals):
         """Has this session said anything since every PR it opened landed?
@@ -31002,23 +31061,26 @@ class SessionManager:
         return activity
 
     def _repo_slow_facts(self, path, refresh):
-        """Cached slow git facts for a repo (remote/branches/default/lastCommit).
-        Recomputed on the slow cadence (`refresh`) or on the repo's first sight,
-        so a freshly-cloned repo gets its facts on its first appearance rather
-        than waiting up to USAGE_EVERY beats; reused from cache in between."""
-        facts = self.repo_facts.get(path)
-        if refresh or facts is None:
-            facts = repo_slow_facts(path)
-            self.repo_facts[path] = facts
-        return facts
+        """Cached slow git facts for a repo (remote/branches/default/lastCommit),
+        re-read on the cheap-git worker on the slow cadence (`refresh`) or on the
+        repo's first sight — which serves empty facts until the worker answers
+        (XERK-1262), so a freshly-cloned repo gets its facts within a beat rather
+        than waiting up to USAGE_EVERY beats."""
+        return self._cheap_read(
+            "repo_facts", path, lambda p, strict=True: repo_slow_facts(p), path,
+            refresh=refresh,
+            default={"remote": "", "branches": [], "defaultBranch": "",
+                     "lastCommit": ""})
 
     def _root_repo_remote(self, refresh):
         """The repos-root pseudo-repo's origin remote, cached like every other
-        slow git fact (it was the only one on this path re-read every beat)."""
-        if refresh or self.root_repo_cache is None:
-            self.root_repo_cache = run(
-                ["git", "remote", "get-url", "origin"], cwd=REPOS_ROOT)
-        return self.root_repo_cache
+        slow git fact and read on the worker. "" until the first read lands —
+        never None, which root_repo_entry takes as "read it now", inline."""
+        return self._cheap_read(
+            "root_remote", REPOS_ROOT,
+            lambda p, strict=True: run(["git", "remote", "get-url", "origin"],
+                                       cwd=p),
+            REPOS_ROOT, refresh=refresh, default="")
 
     def _sorted_repo_entries(self, refresh=True, light=False):
         """Scanned repos ordered most-recently-active first (see #-activity-sort):
@@ -31039,14 +31101,13 @@ class SessionManager:
         for r in repos:
             path = r["path"]
             cheap = self._cheap_read("repo_cheap", path, repo_cheap_facts, path,
-                                     light=light,
+                                     refresh=not light,
                                      default={"branch": "", "dirtyFiles": 0})
             entries.append(repo_entry(r, self._repo_slow_facts(path, refresh),
                                       cheap))
         # Drop cache entries for repos that are gone (renamed/removed).
         live_paths = {r["path"] for r in repos}
-        self.repo_facts = {p: f for p, f in self.repo_facts.items()
-                           if p in live_paths}
+        self._cheap_forget("repo_facts", lambda p: p in live_paths)
         self._cheap_forget("repo_cheap",
                            lambda p: p in live_paths or p == REPOS_ROOT)
         for e in entries:
@@ -31058,7 +31119,7 @@ class SessionManager:
         # (it is another three spawns), keyed in the same map — REPOS_ROOT is not
         # a scanned repo path, so the prune above never touches it.
         root_cheap = self._cheap_read("repo_cheap", REPOS_ROOT, _root_cheap_facts,
-                                      REPOS_ROOT, light=light, default={})
+                                      REPOS_ROOT, refresh=not light, default={})
         out = [root_repo_entry(self._root_repo_remote(refresh), root_cheap)] + entries
         # Attach each repo's resumable-session list (cached; refreshed on the slow
         # cadence in _refresh_repo_usage) for the "Resume any session" picker and
@@ -31172,11 +31233,15 @@ class SessionManager:
                 self._poll_prs_landed()
             except Exception as e:
                 log(f"pr landed poll failed: {e}")
-            # A session that idled out with code work but no open PR is nudged
-            # to deliver it (XERK-526). Same beat, same cached status; wrapped
-            # for the same reason.
+        # A session that idled out with code work but no open PR is nudged to
+        # deliver it (XERK-526). The PR-status beat STAGES its fresh git read on
+        # the cheap-git worker; every full beat decides the reads that landed
+        # (XERK-1262). Wrapped: a nudge failing must not take the host's
+        # sessions down.
+        if not light:
             try:
-                self._poll_open_pr_nudges()
+                self._poll_open_pr_nudges(
+                    stage=beat % PR_STATUS_REFRESH_EVERY == 0)
             except Exception as e:
                 log(f"open-pr nudge poll failed: {e}")
         # New review activity on a session's PR is typed back into that session
