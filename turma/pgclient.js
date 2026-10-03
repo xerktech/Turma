@@ -1074,8 +1074,13 @@ class PgPool {
           off();
           reject(new Error("postgres pool closed"));
         } else if (h === "idle") {
-          off();
-          reject(this._lastConnectError || new Error("postgres connection failed"));
+          // A failed dial drops health to idle BEFORE its catch re-dials for any
+          // queued query, so judge after that has run: still idle = nothing warming.
+          setImmediate(() => {
+            if (this.health !== "idle") return;
+            off();
+            reject(this._lastConnectError || new Error("postgres connection failed"));
+          });
         }
       });
       // Kick a connection if none is warming.

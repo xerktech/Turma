@@ -494,9 +494,13 @@ function startFakePg(opts = {}) {
     server.listen(0, "127.0.0.1", () => {
       resolve({
         port: server.address().port,
-        close: () => new Promise((r) => server.close(r)),
+        // Destroy what is still open so a leak fails its assertion, not hangs close().
+        close: () => new Promise((r) => { for (const s of sockets) s.destroy(); server.close(r); }),
         get connectionCount() {
           return connectionCount;
+        },
+        get openSockets() {
+          return sockets.size;
         },
         // Server-side close of every open connection — a Postgres restart/failover
         // as the pool's IDLE connections see it.
@@ -738,6 +742,10 @@ test("live: a failed dial never rejects a waiter that queued AFTER it started", 
     assert.deepEqual(r2.resolved, [{ p0: "2" }]);
     assert.ok(!r3.rejected, `q3 was rejected by a stale dial: ${r3.rejected && r3.rejected.message}`);
     assert.deepEqual(r3.resolved, [{ p0: "3" }]);
+    // The timed-out dial was stuck in SSL negotiation; its socket must be destroyed.
+    await new Promise((r) => setTimeout(r, 50));
+    // (the dial's failure re-dials for q3, so every OTHER connection is still open)
+    assert.equal(fake.openSockets, fake.connectionCount - 1, "the black-holed dial's socket was closed");
   } finally {
     pool.close();
     await fake.close();
@@ -785,5 +793,25 @@ test("live: close() rejects an in-flight query and a pending ready()", async () 
     assert.equal(hung.connectionCount, 1, "close() spawned no new dial");
   } finally {
     await hung.close();
+  }
+});
+
+test("live: ready() waits out a failed dial that a queued query immediately re-dials", async () => {
+  // max=1, first handshake black-holed: health goes connecting>idle>connecting>ready.
+  // The transient idle edge is not "nothing is warming", so ready() must resolve.
+  const fake = await startFakePg({ hangConnection: 1 });
+  const pool = poolFor(fake, { max: 1, connectTimeoutMs: 200, queryTimeoutMs: 3000 });
+  try {
+    const q1 = pool.query("SELECT $1", ["1"]);
+    const ready = pool.ready();
+    const q2 = pool.query("SELECT $1", ["2"]);
+    await assert.rejects(q1, /connect timeout/);
+    const r = await settleWithin(ready, 2000);
+    assert.ok(!r.rejected, `ready() rejected: ${r.rejected && r.rejected.message}`);
+    assert.ok("resolved" in r, "ready() must not stay pending");
+    assert.deepEqual(await q2, [{ p0: "2" }]);
+  } finally {
+    pool.close();
+    await fake.close();
   }
 });
