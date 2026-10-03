@@ -28,7 +28,8 @@ makes an `android/` change part of the same PR) live there.
   must go through** (XERK-35) — else the ~1s beat throws window scroll and any inner `overflow:auto`
   region back to the start every second. It snapshots window + every scrolled descendant, runs
   `paint()`, restores synchronously; scrolled nodes re-match by stable `id` (a reordered list keeps
-  its row's scroll) else by structural child-index. Callers: `board.html`, `index.html`, `usage.html`.
+  its row's scroll) else by structural child-index. Callers: `board.html`, `index.html`, `usage.html`,
+  `org.js` (which also restores the focused menu control, XERK-1285).
   - `chat.js`'s transcript repaint and `sessions.html`'s sidebar keep their OWN bespoke scroll logic
     and must NOT route through it (each has an ordering conflict with a caret/selection restore). New
     recurring repaints without such a conflict should use `preserveScroll`.
