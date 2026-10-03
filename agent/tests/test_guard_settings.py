@@ -275,6 +275,9 @@ class TestGuardSettings(unittest.TestCase):
         # XERK-1563: the permission ledger's hook rows. A session editing its own
         # could hide the prompts it hit or forge ones it never did.
         "Edit(~/.turma/permissions/**)",
+        # XERK-1564: the session CLI's rendezvous dir. File tools only; Bash
+        # still writes it, so the manager reads it as untrusted.
+        "Edit(~/.turma/session-requests/**)",
         # XERK-510 [Qwen F]: the qwen guard's own config (a rewrite disables the
         # guard) and the qwen per-session model-credential env file. Added to the
         # SHARED list so all three runtimes cover them with no qwen-specific change.
@@ -420,9 +423,22 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # app's own uploads Read is always there and always first (XERK-234).
         path = self._write({"permissions": {"allow": ["Bash(ping *)"]}})
         allow = ha.build_guard_settings(local_settings_path=path)["permissions"]["allow"]
-        n = len(ha._GUARD_ALLOW_PATH_RULES)
-        self.assertEqual(allow[:n], list(ha._GUARD_ALLOW_PATH_RULES))
+        floor = list(ha._GUARD_ALLOW_PATH_RULES) + [ha.session_cli_allow_rule()]
+        self.assertEqual(allow[:len(floor)], floor)
         self.assertIn("Bash(ping *)", allow)
+
+    def test_the_session_cli_is_allowed_by_its_absolute_path(self):
+        # XERK-1564: a session's `wake`/`close-ticket` call must never prompt,
+        # and the rule must admit ONLY the bundled script under the hook flags.
+        allow = ha.build_guard_settings(
+            local_settings_path="/no/such/file.json")["permissions"]["allow"]
+        cli = ha.session_cli_path()
+        self.assertTrue(os.path.isabs(cli))
+        self.assertEqual(os.path.dirname(cli), os.path.dirname(ha.guard_script_path()))
+        self.assertTrue(os.path.isfile(cli), "the CLI must ship beside the hooks")
+        self.assertIn(f"Bash(python3 -SsE {cli}:*)", allow)
+        self.assertEqual([r for r in allow if r.startswith("Bash(")],
+                         [f"Bash(python3 -SsE {cli}:*)"])
 
     def test_operator_allow_duplicate_is_not_repeated(self):
         path = self._write({"permissions": {"allow": ["Read(~/.turma/uploads/**)"]}})
@@ -439,7 +455,8 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # every guard deny, plus the uploads Read the app grants itself so an
         # attached file never costs a permission prompt (XERK-234).
         s = ha.build_guard_settings(local_settings_path="/no/such/file.json")
-        self.assertEqual(s["permissions"]["allow"], list(ha._GUARD_ALLOW_PATH_RULES))
+        self.assertEqual(s["permissions"]["allow"],
+                         list(ha._GUARD_ALLOW_PATH_RULES) + [ha.session_cli_allow_rule()])
         # The runtime-code rule is GENERATED from where this module sits, and is
         # emitted whenever that is outside REPOS_ROOT — which is exactly how CI
         # checks out. Asserting the static list alone passed only when the tree

@@ -1062,7 +1062,7 @@
   //  - **Live background agents do NOT qualify**, however busy the session is.
   //    The main turn has ENDED (that is the whole point of XERK-245), so the
   //    pane emits `text:""`/`status:null` and `liveAgentsReport` carries only
-  //    `{type,label}` with nothing that ticks — the agent's frame key never
+  //    static fields (`type,label,kind,startedAt,eta`), nothing that ticks — the agent's frame key never
   //    changes and it correctly sends nothing for minutes. Counting that as
   //    "must be emitting" declared every healthy delegating session dead, polled
   //    /history around it and tore the socket down every cooldown — and each
@@ -2302,10 +2302,7 @@
       bar.hidden = false;
       bar.innerHTML =
         '<div class="cc-row"><span class="cc-spin"></span>' +
-        // A background shell is not an agent: name the bar for what is running.
-        '<span class="verb">Background ' +
-        (liveAgents.some((a) => a && a.type === "shell") ? "tasks" : "agents") +
-        '…</span></div>' + agents;
+        '<span class="verb">' + backgroundBarVerb(liveAgents) + '…</span></div>' + agents;
       wireAgentDelegation(bar);
       return;
     }
@@ -2443,6 +2440,22 @@
       && agents.some((a) => a && typeof a === "object" && a.type && a.type !== "main");
   }
 
+  // A background row that is WAITING rather than working (XERK-1570): a shell
+  // whose kind is a wait. No kind (an agent, or an older agent) is work.
+  function isWaitAgent(a) {
+    return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
+  }
+
+  // The bar's verb while only background rows run: "Waiting…" when every one is
+  // a wait, else "Background tasks…" / "Background agents…".
+  function backgroundBarVerb(agents) {
+    const bg = (Array.isArray(agents) ? agents : [])
+      .filter((a) => a && typeof a === "object" && a.type && a.type !== "main");
+    if (bg.length && bg.every(isWaitAgent)) return "Waiting";
+    // A background shell is not an agent: name the bar for what is running.
+    return "Background " + (bg.some((a) => a.type === "shell") ? "tasks" : "agents");
+  }
+
   function agentsHtml(agents) {
     if (!Array.isArray(agents)) return "";
     agents = agents.filter((a) => a && typeof a === "object" && a.type);
@@ -2453,8 +2466,13 @@
       const label = a.label ? '<span class="alabel">' + esc(a.label) + "</span>" : "";
       // "main" (the parent conversation) has no separate transcript to open.
       if (a.type === "main" && !a.label) return '<div class="cc-agent main">' + dot + type + "</div>";
-      // Nor does a background shell — it is a command, not a conversation.
-      if (a.type === "shell") return '<div class="cc-agent main">' + dot + type + label + "</div>";
+      // Nor does a background shell — it is a command, not a conversation. A
+      // WAITING one (a sleep, a CI watch — XERK-1570) says so in place of "shell",
+      // so the bar reads "waiting · Wait for CI" beside "shell · Run the tests".
+      if (a.type === "shell") {
+        const kind = isWaitAgent(a) ? '<span class="atype">waiting</span>' : type;
+        return '<div class="cc-agent main">' + dot + kind + label + "</div>";
+      }
       return '<button type="button" class="cc-agent" data-atype="' + esc(a.type) +
         '" data-alabel="' + esc(a.label || "") + '">' + dot + type + label + "</button>";
     });
@@ -3875,7 +3893,7 @@
     module.exports = {
       mergeTail, foldHistory, weight, buildItems, itemsToHtml, esc, linkify, renderInline, renderProse, copyCodeClick, prFooterChip,
       ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS,
-      agentsHtml, hasBackgroundAgents, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
+      agentsHtml, hasBackgroundAgents, backgroundBarVerb, optionCardHtml, panePromptHtml, filterModeOpts, MODE_OPTS, repaint, selectionInScroll,
       scheduleRepaint, resumePaint, renderEditDiff, renderFoldedThoughts,
       isBusy, updateComposeAction, updateLiveStatus, isToolBullet, sendFailure, isTooLong, TOO_LONG,
       loadHistory, reconnectNow, startWs,

@@ -631,6 +631,9 @@ const HISTORY_ARCHIVE_MSGS = positiveEnv("HISTORY_ARCHIVE_MSGS", 200);
 // the restore.
 const LIVE_AGENTS_MAX = 32;
 const LIVE_AGENT_FIELD_MAX = 400;
+// A background shell row's `kind` (XERK-1570) — a STRICT enum: anything else is
+// omitted, never coerced to `work` ("absent = work" is the READ rule).
+const LIVE_AGENT_KINDS = new Set(["wait-timed", "wait-external", "work"]);
 const DSH_WEB_URL_MAX = 512;   // the host-wide dsh-web viewer URL, capped on the wire
 // Up HERE with the live-agent caps rather than beside sanitizeWorkflowAgents
 // where they are used, and that placement is LOAD-BEARING (XERK-304). The
@@ -1328,6 +1331,12 @@ const WHISPER_TIMEOUT_MS = positiveEnv("WHISPER_TIMEOUT_MS", 30000);
 // A session counts as "working" while its transcript was written to within
 // this window (agents report the age at beat time; add staleness since).
 const WORKING_WINDOW_MS = 90 * 1000;
+// A session whose only live rows are WAITING shells (XERK-1570) is `waiting`,
+// then `stalled` once it has gone silent this long with no ETA to wait out —
+// or once its ETA has passed (plus the grace a shell's own stop notification
+// needs to land and be beaten in) with nothing written since.
+const ATTENTION_WAIT_STALL_MS = positiveEnv("ATTENTION_WAIT_STALL_MIN", 45) * 60 * 1000;
+const WAIT_ETA_GRACE_MS = 2 * 60 * 1000;
 // No offline alerts right after hub boot: agents get a chance to re-report
 // before we conclude anything from a freshly-loaded (possibly stale) state.
 const BOOT_AT = Date.now();
@@ -2936,6 +2945,19 @@ function isEpicOrEpicChild(t) {
   return !!(t && (t.isEpic === true
     || (typeof t.epicKey === "string" && t.epicKey)));
 }
+// A ROLLUP ticket (XERK-1568) is one per repo collecting low-severity findings
+// (`[Rollup] <repo>: low-severity findings`, labelled `rollup`): a list, never
+// work, so nothing hands-off may start a session on it or merge for it. Either
+// marker is enough — the label (case-insensitive; `labels` is coerced to strings
+// by normalizeJira) or the `[Rollup]` summary prefix — so a ticket that lost one
+// of them is still caught. Consulted wherever isEpicOrEpicChild is, plus the
+// drain's auto branch and the epic run's child start.
+function isRollupTicket(t) {
+  if (!t) return false;
+  if (Array.isArray(t.labels) && t.labels.some(
+    (l) => typeof l === "string" && l.trim().toLowerCase() === "rollup")) return true;
+  return typeof t.summary === "string" && /^\s*\[rollup\]/i.test(t.summary);
+}
 // Layer a set of child tickets into dependency waves from their blocks-links.
 // `childRows` is the epic's children (each a ticket row with `key` + `blockedBy`,
 // XERK-634). Only blockers WITHIN the child set order the waves — an external
@@ -3460,6 +3482,9 @@ function epicRunDriveSweep() {
       // a blocked entry that would churn a terminal "gave up" note.
       const repo = ticketRepo(siteKey, childKey, rows);
       if (!repo || isRepoIgnored(repo)) continue;
+      // XERK-1568: a rollup ticket is a findings list, never work — even when an
+      // armed epic lists it as a child. Skipped silently like an ignore-tier repo.
+      if (isRollupTicket(row)) continue;
       // A full org line refuses the entry — retry next sweep, spending no attempt
       // (queuing commits nothing; the backoff is for a spawn the AGENT can't
       // complete, not for capacity backpressure the queue already handles).
@@ -8841,6 +8866,14 @@ function coerceLiveSignals(live) {
     if (k in live && !wireInt32(live[k])) delete live[k];
   }
   if ("transcriptAgeSec" in live && !wireDouble(live.transcriptAgeSec)) delete live.transcriptAgeSec;
+  // A session-CLI wake request (XERK-1564): epoch ms + a short reason. Absent =
+  // no wake pending; never repaired into a plausible time. No client renders
+  // it yet, but a client that types it later must not decode junk.
+  if ("wakeAt" in live && !(Number.isSafeInteger(live.wakeAt) && live.wakeAt > 0)) delete live.wakeAt;
+  if ("wakeReason" in live) {
+    if (typeof live.wakeReason === "string") live.wakeReason = live.wakeReason.slice(0, 200);
+    else delete live.wakeReason;
+  }
   coerceStringList(live, "questionOptions");
   coerceStringList(live, "newPrUrls");
   coerceObjectList(live, "questionOptionsRich"); // QuestionOption leaves are all Strings
@@ -11133,11 +11166,23 @@ function sanitizeLiveAgents(raw) {
     if (!a || typeof a !== "object") continue;
     const type = safeString(a.type).slice(0, LIVE_AGENT_FIELD_MAX);
     if (!type) continue;
-    out.push({ sel: !!a.sel, type,
-      label: safeString(a.label).slice(0, LIVE_AGENT_FIELD_MAX) });
+    const row = { sel: !!a.sel, type,
+      label: safeString(a.label).slice(0, LIVE_AGENT_FIELD_MAX) };
+    // XERK-1570: Android TYPES these (LiveAgent.kind/startedAt/eta) and decodes
+    // /api/agents atomically, so each is kept only in the exact shape it types
+    // and otherwise OMITTED — the "can't tell" every client already reads.
+    if (typeof a.kind === "string" && LIVE_AGENT_KINDS.has(a.kind)) row.kind = a.kind;
+    if (wireEpochMs(a.startedAt)) row.startedAt = a.startedAt;
+    if (wireEpochMs(a.eta)) row.eta = a.eta;
+    out.push(row);
     if (out.length >= LIVE_AGENTS_MAX) break;
   }
   return out;
+}
+
+// An epoch-ms instant as a typed Kotlin Long: a positive JS-safe integer.
+function wireEpochMs(v) {
+  return typeof v === "number" && Number.isSafeInteger(v) && v > 0;
 }
 
 // Does this session have background agents in flight? The agent reports the
@@ -11157,14 +11202,56 @@ function hasLiveAgents(s) {
   return Array.isArray(s?.agents) && s.agents.length > 0;
 }
 
+// Only WORK counts as working (XERK-1570). A background shell that is a sleep,
+// a `--watch` or a poll loop is the session WAITING, and reading it as working
+// hid a session parked on a dead shell for as long as the shell lived. A row
+// with no `kind` (an agent/workflow, or an agent predating the field) is work.
+function isWaitRow(a) {
+  return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
+}
+function hasLiveWork(s) {
+  return Array.isArray(s?.agents) && s.agents.some((a) => !isWaitRow(a));
+}
+
 function sessionWorking(session, lastSeen, now) {
   const s = session.session;
   const age = s?.transcriptAgeSec;
   if (age == null) return false;
   if (now - (lastSeen || 0) >= OFFLINE_AFTER_MS) return false;
-  if (hasLiveAgents(s)) return true;
+  if (hasLiveWork(s)) return true;
   if (s?.paneBusy != null) return s.paneBusy;
+  // Every live row is a wait: the session is waiting, not working — and the
+  // freshness fallback must not say otherwise.
+  if (hasLiveAgents(s)) return false;
   return age * 1000 + Math.max(0, now - (lastSeen || 0)) < WORKING_WINDOW_MS;
+}
+
+// The wait read over a session's live rows: null (no wait rows), or
+// {state:"waiting"|"stalled", eta} where eta is the latest row ETA or null.
+// `lastWrite` is when the transcript was last written (epoch ms). Mirrored by
+// `backgroundWait` in sessions.html/index.html, Sessions.kt and sessions.ts.
+//   - any ETA still ahead → waiting: a timed wait is not finished early;
+//   - else stalled once the newest ETA passed (plus grace) with no write since,
+//     or once the transcript has been silent ATTENTION_WAIT_STALL_MS.
+function backgroundWait(rows, lastWrite, now) {
+  const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
+  if (!waits.length) return null;
+  let eta = null;
+  for (const a of waits) if (Number.isSafeInteger(a.eta) && (eta == null || a.eta > eta)) eta = a.eta;
+  if (eta != null && eta > now) return { state: "waiting", eta };
+  const overdue = eta != null && lastWrite < eta && now - eta >= WAIT_ETA_GRACE_MS;
+  const silent = now - lastWrite >= ATTENTION_WAIT_STALL_MS;
+  return { state: overdue || silent ? "stalled" : "waiting", eta };
+}
+
+// The session-level wait: null unless it is live, online, not working, and
+// every live row is a wait (a computed kind only — the attention child renders it).
+function sessionWait(session, lastSeen, now) {
+  const s = session.session;
+  if (s?.transcriptAgeSec == null) return null;
+  if (now - (lastSeen || 0) >= OFFLINE_AFTER_MS) return null;
+  if (hasLiveWork(s) || s.paneBusy) return null;
+  return backgroundWait(s.agents, (lastSeen || 0) - s.transcriptAgeSec * 1000, now);
 }
 
 // Should a held PR alert fire yet (XERK-153)? `w` is that PR's wait record
@@ -11237,11 +11324,17 @@ function prLanded(p) {
 // opened a PR is judged on the PR alone: it leaves when the session works
 // again, or when every PR it opened has landed (merged or closed IS the
 // review). `working` is the caller's already-computed busy read.
-function readyForReview(session, working) {
+//
+// `wait` is the caller's sessionWait read (XERK-1570): a session WAITING on a
+// background shell (a sleep with an ETA still ahead, a CI watch) has ended its
+// turn but is not the operator's yet; once STALLED it is judged like any idle
+// session, which is how a dead shell surfaces.
+function readyForReview(session, working, wait) {
   if (session.status !== "running") return false;
   const s = session.session || {};
   if (s.question || (s.panePrompt && s.panePrompt.prompt)) return true;
   if (working) return false;
+  if (wait && wait.state === "waiting") return false;
   const prs = session.prs || [];
   if (prs.some((p) => !prLanded(p))) return true;
   // Landed PRs stop being a reason to look, but must not become a reason NOT
@@ -11493,7 +11586,7 @@ function heartbeatAlerts(key, prev, next) {
     //   - A pending question suppresses it: the high-priority question alert
     //     above is already that session's buzz, and it says more.
     const reviewKey = `review:${key}:${session.id}`;
-    const ready = readyForReview(session, working);
+    const ready = readyForReview(session, working, sessionWait(session, next.lastSeen, now));
     // Only PRs still in play are worth naming — one merged while the alert was
     // held has answered itself.
     const notes = (sa.prNotes || []).filter((n) => !prLanded(prStatus.get(n.url)));
@@ -11864,11 +11957,11 @@ const TICKET_QUEUE_NOTES_MAX = TICKET_QUEUE_MAX;
 // How long a dispatch is remembered, so a cancel that LOST to it can say so
 // rather than 404ing as if the ticket had never been queued.
 const TICKET_DISPATCH_MEMO_MS = 5 * 60 * 1000;
-// XERK-485 [E]: the auto stream and the queue are ordered by the model's
-// triage, not just by repo tier. Lower rank comes first. An unknown band or
-// type (no triage yet, or one whose field survived sanitization as something
-// else) sorts AFTER every real one — an unassessed ticket never outranks one
-// the model actually assessed.
+// XERK-485 [E]: the model's triage bands and types. Lower rank comes first; an
+// unknown band or type (no triage yet, or one whose field survived
+// sanitization as something else) ranks AFTER every real one. The auto
+// stream's ORDER reads only P0 off the band (XERK-1567, `triageSortKey`); the
+// full band rank still drives the org policy's `minPriority`.
 const TRIAGE_PRIORITY_RANK = { P0: 0, P1: 1, P2: 2, P3: 3 };
 const NO_PRIORITY_RANK = 9;
 // Within one band, the KIND of work: a P1 bug ahead of a P1 doc nit. Same
@@ -12317,9 +12410,10 @@ function holdQueued(e, reason, error) {
 }
 
 // Hand the highest-priority waiting tickets to whichever hosts can actually
-// start them. Visit order (XERK-485 [E]): within an org's line the priority key
-// — triage band -> type weight -> repo tier -> FIFO — decides, and across orgs
-// the lines interleave round-robin so one backlog can't starve another.
+// start them. Visit order (XERK-485 [E]): within an org's line the sort key
+// — P0 -> oldest created -> type weight -> repo tier -> FIFO (XERK-1567) —
+// decides, and across orgs the lines interleave round-robin so one backlog
+// can't starve another.
 // Runs on every heartbeat (a beat is when capacity changes) and on the 15s
 // sweep, so a freed slot is filled within a beat rather than a sweep interval.
 //
@@ -12455,6 +12549,13 @@ function drainTicketQueue() {
     // left alone: a hand-started ticket is deliberate intent, not tier-gated.
     if (e.source === "auto" && isRepoIgnored(repo)) {
       drop("its repo is now ignore-tier");
+      continue;
+    }
+    // XERK-1568: the ticket became a rollup (labelled `rollup` / retitled
+    // `[Rollup] …`) while this AUTO entry waited. The sweep won't re-queue it, so
+    // drop with no churn, like a retiered repo above. A MANUAL entry drains.
+    if (e.source === "auto" && isRollupTicket(row)) {
+      drop("it is a rollup ticket");
       continue;
     }
     // XERK-485 [E]: the model re-triaged this ticket while it waited and the new
@@ -12725,16 +12826,24 @@ function triageGateReason(t) {
   return null;
 }
 
-// XERK-485 [E]: the priority key as a comparable array —
-// [triage band, type weight, -repo tier]. A caller's STABLE sort on this is the
-// full ordering: priority -> type -> repo tier (XERK-487's [G], the tiebreak
-// below priority+type) -> the caller's insertion order (board order for the
-// sweep, FIFO for the queue).
-function triageSortKey(triage, repo) {
-  const tr = triage && typeof triage === "object" ? triage : null;
+// XERK-1567: the auto stream's order key, as a comparable array over a ticket
+// ROW — [P0 ? 0 : 1, created ms, type weight, -repo tier]. A caller's STABLE
+// sort on this is the full ordering: a P0 preempts -> OLDEST created first ->
+// type -> repo tier (XERK-487's [G]) -> the caller's insertion order (board
+// order for the sweep, FIFO for the queue). Oldest-first replaced the band
+// order (XERK-485 [E]) because the board order underneath it is the agent's
+// `updated DESC` query, so the NEWEST-touched ticket won every tie and old work
+// starved; P1-P3 are now FIFO by creation and type/tier only break ties.
+// An absent or unparseable `created` sorts LAST (Infinity) — both comparators
+// test `!==` before subtracting, so two Infinities stay equal and keep board
+// order. `Date.parse` reads Jira's `+0000` and ADO's `Z` alike.
+function triageSortKey(t, repo) {
+  const tr = t && typeof t === "object" && t.triage && typeof t.triage === "object"
+    ? t.triage : null;
+  const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
   return [
-    tr && TRIAGE_PRIORITY_RANK[tr.priority] !== undefined
-      ? TRIAGE_PRIORITY_RANK[tr.priority] : NO_PRIORITY_RANK,
+    tr && tr.priority === "P0" ? 0 : 1,
+    Number.isFinite(created) ? created : Infinity,
     tr && TRIAGE_TYPE_WEIGHT[tr.type] !== undefined
       ? TRIAGE_TYPE_WEIGHT[tr.type] : NO_TYPE_WEIGHT,
     -repoTierRank(repo),
@@ -12784,8 +12893,9 @@ function autoStartRateMax(siteKey) {
   return p && Number.isInteger(p.rateMax) && p.rateMax >= 1 ? p.rateMax : TICKET_QUEUE_RATE_MAX;
 }
 
-// XERK-485 [E]: the drain's visit order. Within an org's line the priority key
-// decides (band -> type -> tier -> FIFO by `at`); across orgs the lines
+// XERK-485 [E]: the drain's visit order. Within an org's line the sort key
+// decides (P0 -> oldest created -> type -> tier -> FIFO by `at`, XERK-1567);
+// across orgs the lines
 // interleave round-robin, each org's turn anchored on its OLDEST entry, so one
 // org's backlog can't starve another's. Hosts never cross orgs, so in practice
 // this decides which ticket in an org claims a host's one-per-pass dispatch —
@@ -12797,8 +12907,7 @@ function ticketQueueOrder(rows) {
   for (const e of ticketQueue) {
     const hit = rows.get(ticketQueueKey(e.siteKey, e.issueKey));
     const row = hit ? hit.row : null;
-    const key = triageSortKey(
-      row ? row.triage : null, ticketRepo(e.siteKey, e.issueKey, rows));
+    const key = triageSortKey(row, ticketRepo(e.siteKey, e.issueKey, rows));
     let line = lines.get(e.siteKey);
     if (!line) lines.set(e.siteKey, (line = []));
     line.push({ e, key });
@@ -12835,22 +12944,24 @@ function autoStartSweep() {
     // The board's own view of this org's tickets — see `fleetTicketRows`. Never
     // walk `agents` for a ticket list here: this sweep STARTS work, so acting on
     // a copy the operator was not shown is a session nobody asked for.
-    // XERK-485 [E]: the full priority key orders the auto stream —
-    // triage band -> type weight -> repo tier (XERK-487's [G], now a
-    // tiebreak below priority+type) -> board order (stable sort).
-    // A P0 bug takes the scarce auto slots ahead of a P3 chore.
+    // XERK-1567: the sort key orders the auto stream — a P0 preempts, then
+    // OLDEST created first, then type weight -> repo tier (XERK-487's [G]) ->
+    // board order (stable sort). Board order is the agent's `updated DESC`
+    // query, so without the age term the newest-touched ticket won every tie.
     const candidates = ticketRowsForSite(rows, siteKey)
       .map((r) => {
         const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
-        return { t: r.row, repo, key: triageSortKey(r.row && r.row.triage, repo) };
+        return { t: r.row, repo, key: triageSortKey(r.row, repo) };
       })
       // XERK-635: an epic and its children never ride the org auto-start stream —
       // an epic is not a work ticket, and a child is started by its epic run in
       // dependency order, not here. Dropped silently at the filter (spending no
       // attempt) exactly like a repo-less ticket; the shared content gate below
       // rejects the same set, so the two stay in agreement (XERK-550 cross-check).
+      // A rollup ticket (XERK-1568) is dropped the same way: a list, not work.
       .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
-        && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t))
+        && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t)
+        && !isRollupTicket(c.t))
       .sort((a, b) => {
         for (let i = 0; i < a.key.length; i++) {
           if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
@@ -13280,6 +13391,10 @@ function autoStartContentGate(siteKey, t, repo) {
   // the epic run drives its children in dependency order. Kept in lock-step with
   // the autoStartSweep candidate filter above (the XERK-550 cross-check pins it).
   if (isEpicOrEpicChild(t)) return { kind: "epic", reason: "epic or epic child (driven by the epic run)" };
+  // XERK-1568: a rollup ticket is a list of findings, never work. Checked BEFORE
+  // the operator verdict so an `approve` cannot force it into the auto stream or
+  // into auto-merge/auto-close (both read this gate through autoMergeSession).
+  if (isRollupTicket(t)) return { kind: "rollup", reason: "rollup ticket (a findings list, not work)" };
   const action = ticketTriageAction(siteKey, t.key);
   if (action === "hold" || action === "reject") {
     return { kind: "triaged", reason: `${action} by triage` };
@@ -13390,6 +13505,9 @@ function epicRunChildSession(a, s, byKey, rows) {
   // auto-close pass skips a done row anyway, but bail early so its PR is never
   // merged after the ticket was abandoned/finished out of band.
   if (row.statusCategory === "done") return null;
+  // XERK-1568: a rollup child is never merged/messaged hands-off either — this
+  // stream skips the content gate, so it carries the rollup check itself.
+  if (isRollupTicket(row)) return null;
   const repo = ticketRepo(siteKey, t.key, rows);
   return { siteKey, key: t.key, row, repo };
 }
@@ -13578,6 +13696,8 @@ function autoMergeSweep() {
       // (it may still be pushing commits, which drops the PR out of "ready"
       // anyway) and never while it is blocked asking the operator something.
       if (sessionWorking(s, a.lastSeen, now)) continue;
+      // Still waiting out a shell it launched (XERK-1570) — not finished either.
+      if (sessionWait(s, a.lastSeen, now)?.state === "waiting") continue;
       const ss = s.session || {};
       if (ss.question || (ss.panePrompt && ss.panePrompt.prompt)) continue;
       // The agent has to be new enough to run the command; an older one would
@@ -19846,6 +19966,11 @@ if (process.env.TURMA_TEST) {
     SPEND_SEEN_MAX,
     sessionWorking,
     hasLiveAgents,
+    hasLiveWork,
+    sessionWait,
+    backgroundWait,
+    ATTENTION_WAIT_STALL_MS,
+    WAIT_ETA_GRACE_MS,
     sanitizeLiveAgents,
     safeUploadName,
     get uploadsReservedBytes() { return uploadsReservedBytes; },
@@ -19955,7 +20080,7 @@ if (process.env.TURMA_TEST) {
     setEpicRunPaused,
     buildEpicWaves,
     epicChildRows,
-    isEpicOrEpicChild,
+    isEpicOrEpicChild, isRollupTicket,
     sanitizeEpicRunRecord,
     EPIC_RUN_STATES,
     // Epic Builder (XERK-725, epic XERK-721): the durable run store, its arm/clear

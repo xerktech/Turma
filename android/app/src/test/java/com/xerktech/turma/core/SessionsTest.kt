@@ -102,6 +102,67 @@ class SessionsTest {
         assertEquals(true, readyForReview(done, liveState(done, now, now)))
     }
 
+    // ---- background shell kinds (XERK-1570) ----------------------------------
+    // Only WORK keeps a session working; a session whose live rows are all waits
+    // is HOLDING (not working, not ready for review) until it stalls.
+
+    private fun shell(kind: String, label: String = "", eta: Long? = null) =
+        com.xerktech.turma.model.LiveAgent(type = "shell", label = label, kind = kind, eta = eta)
+    private fun waitingOn(vararg rows: com.xerktech.turma.model.LiveAgent, ageSec: Double = 5.0) = SessionInfo(
+        status = "running",
+        session = LiveSignals(paneBusy = false, transcriptAgeSec = ageSec, lastRole = "assistant", agents = rows.toList()),
+    )
+
+    @Test fun `only work rows count as working`() {
+        // A sleep with an ETA ahead: holding, not working, not ready for review.
+        val timed = waitingOn(shell("wait-timed", "Sleep", eta = now + 600_000L))
+        assertEquals(false, sessionWorking(timed, now, now))
+        assertEquals(LiveState.HOLDING, liveState(timed, now, now))
+        assertEquals(false, readyForReview(timed, liveState(timed, now, now)))
+        // A CI watch, freshly launched: holding too.
+        assertEquals(LiveState.HOLDING, liveState(waitingOn(shell("wait-external", "Watch CI")), now, now))
+        // A work shell, an explicit "work", or a row with no kind (an older agent) is work.
+        assertEquals(LiveState.WORKING, liveState(waitingOn(shell("work", "Run tests")), now, now))
+        assertEquals(LiveState.WORKING, liveState(waitingOn(shell("")), now, now))
+        // A wait beside real work is working.
+        assertEquals(LiveState.WORKING,
+            liveState(waitingOn(shell("wait-timed", eta = now + 600_000L), shell("work")), now, now))
+        // paneBusy still wins: its own turn is running.
+        val busy = waitingOn(shell("wait-external")).let { it.copy(session = it.session!!.copy(paneBusy = true)) }
+        assertEquals(LiveState.WORKING, liveState(busy, now, now))
+        // With paneBusy unknown, a fresh transcript does NOT make a wait-only session working.
+        val unknown = waitingOn(shell("wait-external")).let { it.copy(session = it.session!!.copy(paneBusy = null)) }
+        assertEquals(false, sessionWorking(unknown, now, now))
+    }
+
+    @Test fun `a wait stalls past its eta or after long silence, and then reads ready for review`() {
+        // ETA passed (plus the 2-minute grace) with nothing written since: stalled → IDLE.
+        val overdue = waitingOn(shell("wait-timed", eta = now - 180_000L), ageSec = 600.0)
+        assertEquals(true, sessionWait(overdue, now, now)?.stalled)
+        assertEquals(LiveState.IDLE, liveState(overdue, now, now))
+        assertEquals(true, readyForReview(overdue, liveState(overdue, now, now)))
+        // Within the grace it is still holding.
+        val justPast = waitingOn(shell("wait-timed", eta = now - 30_000L), ageSec = 600.0)
+        assertEquals(LiveState.HOLDING, liveState(justPast, now, now))
+        // No ETA: holding until 45 minutes of transcript silence.
+        assertEquals(LiveState.HOLDING, liveState(waitingOn(shell("wait-external"), ageSec = 44 * 60.0), now, now))
+        assertEquals(LiveState.IDLE, liveState(waitingOn(shell("wait-external"), ageSec = 46 * 60.0), now, now))
+        // An offline host's waits read nothing — IDLE, like its stale paneBusy.
+        assertEquals(null, sessionWait(waitingOn(shell("wait-external")), now - 120_000L, now))
+    }
+
+    @Test fun `liveStateLabel says what a holding session waits on`() {
+        val timed = LiveSignals(agents = listOf(shell("wait-timed", "Sleep", eta = now + 12 * 60_000L)))
+        assertEquals("waiting · 12m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
+        val ci = LiveSignals(agents = listOf(shell("wait-external", "Watch CI")))
+        assertEquals("waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
+        val two = LiveSignals(agents = listOf(shell("wait-external"), shell("wait-timed")))
+        assertEquals("waiting on 2 background shells", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, two, now))
+        // A working card names only its WORK rows.
+        val mixed = LiveSignals(agents = listOf(shell("work"), shell("wait-external")))
+        assertEquals("1 background shell", com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, mixed, now))
+    }
+
     // ---- readyForReview (XERK-224) ------------------------------------------
     // The port of the web's rule (turma/public/sessions.html), which the hub's
     // ready-for-review alert mirrors again — all three decide the same group.

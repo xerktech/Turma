@@ -443,7 +443,9 @@ class TestDshSubagentProjection(unittest.TestCase):
         # a dsh subagent far behind the head resolves from the index too.
         self.assertEqual(state["liveAgents"],
                          {CHILD: {"type": "subagent", "label": "Investigate the flake",
-                                  "resolveId": CHILD}})
+                                  "resolveId": CHILD,
+                                  # The launch entry's own timestamp (XERK-1570).
+                                  "startedAt": 1000}})
 
     def test_end_retires_the_agent(self):
         proj = dt.DshProjector(SID)
