@@ -246,20 +246,28 @@ class FakePgPool {
     const sql = text.replace(/\s+/g, " ").trim();
     this.sql.push(sql);
     if (/^CREATE (TABLE|INDEX) IF NOT EXISTS/i.test(sql)) return Promise.resolve([]);
-    let m = /^INSERT INTO "permission_event" \(host, id, opened_at, doc\) VALUES (.*) ON CONFLICT \(host, id\) DO UPDATE SET opened_at = EXCLUDED\.opened_at, doc = EXCLUDED\.doc$/.exec(sql);
+    if (/^ALTER TABLE "permission_event" ADD COLUMN IF NOT EXISTS progress smallint NOT NULL DEFAULT 0$/.test(sql)) {
+      return Promise.resolve([]);
+    }
+    let m = /^INSERT INTO "permission_event" \(host, id, opened_at, progress, doc\) VALUES (.*) ON CONFLICT \(host, id\) DO UPDATE SET opened_at = EXCLUDED\.opened_at, progress = EXCLUDED\.progress, doc = EXCLUDED\.doc WHERE EXCLUDED\.progress >= "permission_event"\.progress$/.exec(sql);
     if (m) {
       const seen = new Set();
-      for (let i = 0; i < params.length; i += 4) {
+      for (let i = 0; i < params.length; i += 5) {
         const k = `${params[i]}\u0000${params[i + 1]}`;
         // Postgres: "ON CONFLICT DO UPDATE command cannot affect row a second time".
         if (seen.has(k)) return Promise.reject(new Error("cannot affect row a second time"));
         seen.add(k);
       }
       if (this.failInserts) return Promise.reject(new Error("pg down"));
-      for (let i = 0; i < params.length; i += 4) {
-        const [host, id, openedAt, doc] = params.slice(i, i + 4);
+      for (let i = 0; i < params.length; i += 5) {
+        const [host, id, openedAt, progress, doc] = params.slice(i, i + 5);
         assert.equal(typeof openedAt, "string");             // text protocol
-        this.rows.set(`${host}\u0000${id}`, { host, id, opened_at: openedAt, doc });
+        assert.equal(typeof progress, "string");
+        const k = `${host}\u0000${id}`;
+        const have = this.rows.get(k);
+        // The WHERE guard: a less-far-along copy never replaces a stored one.
+        if (have && Number(progress) < Number(have.progress || 0)) continue;
+        this.rows.set(k, { host, id, opened_at: openedAt, progress, doc });
       }
       return Promise.resolve([]);
     }
@@ -370,6 +378,52 @@ test("HA: a stale hot copy re-queued by a rescan still lands in the table", asyn
   await ledger.rehydrate();
   await new Promise((r) => ledger.flush(r));
   assert.equal(JSON.parse(pool.rows.get("h1\u0000d-2").doc).answer, "allow");
+});
+
+test("HA: a failed write of a row the table never held lands on the next write", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  // Let the boot ready-edge finish: its rescan would otherwise re-queue the row.
+  await ledger._internals.getBackend()._onReady();
+  const now = Date.now();
+  pool.failInserts = true;
+  const orig = console.error;
+  console.error = () => {};
+  try {
+    ledger.ingest("h1", [row("new-1", { openedAt: now - MIN, closedAt: now })], now);
+    await new Promise((r) => ledger.flush(r));
+  } finally { console.error = orig; }
+  assert.equal(pool.rows.has("h1\u0000new-1"), false);
+  pool.failInserts = false;
+  // The NEXT beat's write — not a rescan, which has no PG copy to compare against.
+  ledger.ingest("h1", [row("other", { openedAt: now - MIN })], now);
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(JSON.parse(pool.rows.get("h1\u0000new-1").doc).closedAt, now);
+});
+
+test("HA: a ready-edge rescan re-queues a hot row the table lacks entirely", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  const now = Date.now();
+  // Trimmed past PG_QUEUE_MAX during an outage: only the hot model holds it.
+  ledger._internals.hosts().set("h1", new Map([["t-1", sanitize(row("t-1", { openedAt: now - MIN, closedAt: now }), now)]]));
+  await ledger.rehydrate();
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(JSON.parse(pool.rows.get("h1\u0000t-1").doc).closedAt, now);
+});
+
+test("HA: the upsert is monotone — a late OPEN copy never reverts a CLOSED row", async () => {
+  const pool = new FakePgPool();
+  await ledger.configure({ ha: true }, pool);
+  const now = Date.now();
+  ledger.ingest("h1", [row("d-m", { openedAt: now - MIN, closedAt: now })], now);
+  await new Promise((r) => ledger.flush(r));
+  // An old leader retrying its held open copy after the new leader wrote the close.
+  ledger._internals.getBackend().onChange("h1",
+    [sanitize({ id: "d-m", kind: "dialog", openedAt: now - MIN }, now)]);
+  await new Promise((r) => ledger.flush(r));
+  assert.equal(JSON.parse(pool.rows.get("h1\u0000d-m").doc).closedAt, now);
+  assert.ok(pool.sql.some((q) => /WHERE EXCLUDED\.progress >= "permission_event"\.progress$/.test(q)));
 });
 
 test("HA: one row open AND closed in one batch upserts once, the closed copy winning", async () => {

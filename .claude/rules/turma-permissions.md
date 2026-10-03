@@ -33,6 +33,9 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
     pending call (`PERMISSION_DELEGATING_TOOLS`). The sub-agent's hook row (its own `toolUseId`)
     OVERRIDES tool/head/digest/toolUseId on that row — one prompt, counted once, named by the real
     call — instead of being held and emitted as a second, mis-attributed row.
+  - A dialog with no `toolUseId` to match (a delegated one, or no pending call) adopts the ONE held
+    hook only if it fired within `PERMISSION_HOOK_ADOPT_MS` (two beats) of the dialog's beat — an
+    older held hook is an earlier prompt answered between beats, and stays its own row.
 - **`classifier-denied`** — auto mode's soft block shows NO dialog: the model is told no and turns to
   the human in chat. Only the `PermissionDenied` hook sees it. A complete row on its own.
 - **`ask-in-chat`** — the session ended its turn asking for permission in prose. INTERIM: a cheap
@@ -109,7 +112,7 @@ consumes this table; it does not replace it.
 - **Non-HA: a `/data` file** (`PERMISSION_LEDGER_FILE`), the usage-ledger FILE skeleton — measured
   before it is read, re-sanitized on load, debounced write, flushed on graceful shutdown. HA `/data` is
   a per-pod emptyDir, so this is NON-HA only.
-- **HA: a Postgres APPEND table** (`permission_event(host, id, opened_at, doc)`, PK `(host, id)`) via
+- **HA: a Postgres APPEND table** (`permission_event(host, id, opened_at, progress, doc)`, PK `(host, id)`) via
   the hub's shared `pgclient.js` pool; upsert by `(host, id)`, retention `DELETE` hourly, rescanned on
   the pool's ready edge and on LEADER PROMOTION (`rehydrate()` in `onLeaderPromoted`). Writes are
   queued and drained off the request path, bounded (`PG_QUEUE_MAX`, oldest dropped).
@@ -118,7 +121,12 @@ consumes this table; it does not replace it.
     rescans). Dropping it let a rescan read the stale OPEN copy over a hot CLOSED row, and the agent
     sends a closed row once — the close was lost in both places.
   - **The rescan is newest-wins, never a blind replace**: a hot row further along (`rowProgress`:
-    closed > open, then has `rulesMatched`) is kept and re-queued so the table catches up.
+    closed > open, then has `rulesMatched`) is kept and re-queued so the table catches up. A hot row
+    the table lacks entirely (trimmed past `PG_QUEUE_MAX`) is re-queued too — but only by a replica
+    that holds it; one that never did cannot, so a long outage past the cap can still lose rows.
+  - **The upsert is MONOTONE** (`WHERE EXCLUDED.progress >= permission_event.progress`, `progress` =
+    `rowProgress`): a late retry of an OPEN copy (an old leader's ready edge after a handover) never
+    reverts a CLOSED row. Equal progress → the newer write wins.
   - **One INSERT never carries the same `(host, id)` twice** — Postgres refuses ("cannot affect row a
     second time") and an outage backlog holds a row open AND closed; the batch keeps the last copy.
 - **Aggregates are computed from the hot in-memory model in both modes**, not by SQL `GROUP BY` —

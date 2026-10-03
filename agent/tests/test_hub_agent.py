@@ -36843,6 +36843,23 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.assertEqual((row["tool"], row["toolUseId"]), ("Bash", "toolu_sub"))
         self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
 
+    def test_a_stale_held_request_is_not_taken_for_a_sub_agents_dialog(self):
+        # A parent-level prompt answered between beats is still held when a
+        # sub-agent's dialog opens much later: it is NOT that dialog's call.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.hook_rows(self.request_hook("toolu_old", ts=1000))
+        self.sm._apply_permission_hook_rows(now_ms=1000, mono=0)
+        at = 1000 + ha.PERMISSION_HOOK_ADOPT_MS + 1
+        self.edge(self.dialog(), at=at)
+        row, = self.rows()
+        self.assertEqual(row["tool"], "Agent")             # no wrong call adopted
+        self.assertIn("toolu_old", self.sm._perm_hook_pending.get(self.SID))
+        # The held one still becomes its own row once the hold expires.
+        self.sm._apply_permission_hook_rows(
+            now_ms=at, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertIn(f"r-{self.SID}-toolu_old", {r["id"] for r in self.rows()})
+
     def test_a_raising_edge_never_costs_the_sessions_signals(self):
         with mock.patch.object(self.sm, "_permission_edges",
                                side_effect=RuntimeError("boom")), \

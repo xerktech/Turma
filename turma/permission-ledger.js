@@ -435,7 +435,7 @@ let backend = fileBackend;
 
 const T_EVENT = "permission_event";
 const PG_QUEUE_MAX = 10000;
-const PG_ROWS_PER_INSERT = 500;          // 4 params a row, far under 65535
+const PG_ROWS_PER_INSERT = 500;          // 5 params a row, far under 65535
 const PG_RETENTION_SWEEP_MS = 60 * 60 * 1000;
 
 class PermissionLedgerPgStore {
@@ -494,9 +494,13 @@ class PermissionLedgerPgStore {
          host text NOT NULL,
          id text NOT NULL,
          opened_at bigint NOT NULL,
+         progress smallint NOT NULL DEFAULT 0,
          doc text NOT NULL,
          PRIMARY KEY (host, id)
        )`);
+    // A table an earlier revision created without the monotone column.
+    await this.pool.query(
+      `ALTER TABLE ${this.table} ADD COLUMN IF NOT EXISTS progress smallint NOT NULL DEFAULT 0`);
     await this.pool.query(
       `CREATE INDEX IF NOT EXISTS permission_event_opened_at ON ${this.table} (opened_at)`);
     this._schemaReady = true;
@@ -507,19 +511,25 @@ class PermissionLedgerPgStore {
   // leaves Postgres holding an OLDER copy of a row (open, where the hot model has
   // it closed), and the agent sends a closed row only once — so a hot copy that
   // is further along (`rowProgress`) is kept, and re-queued so the table catches up.
+  // A hot row the table does not hold at all (a write trimmed past PG_QUEUE_MAX in
+  // a long outage) is re-queued too — bounded by the hot model and the queue cap.
   async rescan(now = Date.now()) {
     await this._ensureSchema();
     const since = now - DAYS * DAY_MS;
     const stale = [];
-    const got = await this.pool.query(
+    const got = (await this.pool.query(
       `SELECT host, doc FROM ${this.table} WHERE opened_at >= $1 ORDER BY opened_at DESC LIMIT $2`,
-      [String(since), String(MAX_ROWS)]);
-    for (const r of got || []) {
+      [String(since), String(MAX_ROWS)])) || [];
+    const held = new Set();
+    let oldest = Infinity;
+    for (const r of got) {
       if (!r || typeof r.host !== "string" || !r.host || r.host === "__proto__") continue;
       let doc = null;
       try { doc = JSON.parse(r.doc); } catch { continue; }
       const row = sanitizePermissionEvent(doc, now);
       if (!row) continue;
+      held.add(`${r.host}\u0000${row.id}`);
+      oldest = Math.min(oldest, row.openedAt);
       let m = hosts.get(r.host);
       if (!m) hosts.set(r.host, (m = new Map()));
       const hot = m.get(row.id);
@@ -530,20 +540,28 @@ class PermissionLedgerPgStore {
       m.set(row.id, track(row));
     }
     evict(now);
+    // A LIMIT-truncated read says nothing about rows older than its oldest.
+    const floor = got.length >= MAX_ROWS ? oldest : since;
+    for (const [host, m] of hosts) {
+      for (const row of m.values()) {
+        if (row.openedAt >= floor && !held.has(`${host}\u0000${row.id}`)) stale.push([host, row]);
+      }
+    }
     for (const [host, row] of stale) this._queue.push(this._tuple(host, row));
+    this._trimQueue();
     if (stale.length) this._drain();
     if (this._onExternalChange) { try { this._onExternalChange(); } catch { /* never breaks a scan */ } }
   }
 
   // Off the beat: enqueue only, a serialized background drain writes. Bounded —
-  // a Postgres outage drops the OLDEST queued writes (the hot model keeps them
-  // until the next promotion rescan), never grows the heap.
+  // a Postgres outage drops the OLDEST queued writes, never grows the heap.
   _tuple(host, row) {
-    return [host, row.id, String(row.openedAt), JSON.stringify(row)];
+    return [host, row.id, String(row.openedAt), String(rowProgress(row)), JSON.stringify(row)];
   }
 
-  // Bounded: past PG_QUEUE_MAX the OLDEST queued writes go (the hot model still
-  // holds them; the next ready-edge rescan re-queues any the table lacks).
+  // Bounded: past PG_QUEUE_MAX the OLDEST queued writes go. The hot model still
+  // holds them, and the next ready-edge rescan re-queues any the table lacks or
+  // holds less far along — on THIS replica; one that never held them cannot.
   _trimQueue() {
     const over = this._queue.length - PG_QUEUE_MAX;
     if (over > 0) {
@@ -581,8 +599,13 @@ class PermissionLedgerPgStore {
           try {
             await this._ensureSchema();
             await this.pool.query(
-              `INSERT INTO ${this.table} (host, id, opened_at, doc) VALUES ${tuples.join(", ")} ` +
-              `ON CONFLICT (host, id) DO UPDATE SET opened_at = EXCLUDED.opened_at, doc = EXCLUDED.doc`,
+              // MONOTONE: a late retry of an OPEN copy (an old leader's ready
+              // edge after a handover) never reverts a CLOSED row another
+              // replica already wrote. Equal progress → the newer write wins.
+              `INSERT INTO ${this.table} (host, id, opened_at, progress, doc) VALUES ${tuples.join(", ")} ` +
+              `ON CONFLICT (host, id) DO UPDATE SET opened_at = EXCLUDED.opened_at, ` +
+              `progress = EXCLUDED.progress, doc = EXCLUDED.doc ` +
+              `WHERE EXCLUDED.progress >= ${this.table}.progress`,
               params);
           } catch (e) {
             // Put the batch BACK (ahead of anything newer) and stop: the pool's

@@ -10792,6 +10792,10 @@ PERMISSION_HOOK_HOLD_SEC = 120
 # call is the delegation itself, so the sub-agent's PermissionRequest (its own
 # toolUseId) names the real call and overrides it rather than counting twice.
 PERMISSION_DELEGATING_TOOLS = ("Agent", "Task")
+# A dialog with no toolUseId to match (a sub-agent's, or no pending call found)
+# adopts the one held hook only if it fired within this long before the beat
+# that saw the dialog — about one beat's gap, plus slack for the tail worker.
+PERMISSION_HOOK_ADOPT_MS = 2 * INTERVAL * 1000
 # How long a gone session's hook log is kept before the worker removes it.
 PERMISSION_LOG_RETAIN_SEC = 7 * 86400
 # The session ids a hook log may be named for — permlog.py's own SID_RE.
@@ -28834,7 +28838,13 @@ class SessionManager:
         hit = pend.pop(row["toolUseId"], None) if row.get("toolUseId") else None
         delegated = row.get("tool") in PERMISSION_DELEGATING_TOOLS
         if hit is None and (delegated or not row.get("toolUseId")) and len(pend) == 1:
-            hit = pend.popitem()[1]
+            # A GUESS (no toolUseId to match on), so only a hook raised about
+            # when this dialog was: one held from an earlier prompt answered
+            # between beats is that prompt's own row, never this one's call.
+            (key, held), = pend.items()
+            ts = held[0].get("ts")
+            if isinstance(ts, (int, float)) and ts >= now_ms - PERMISSION_HOOK_ADOPT_MS:
+                hit = pend.pop(key)
         if hit is not None:
             self._merge_permission_hook(row, hit[0], override=delegated)
         self._perm_turma_answer.pop(sid, None)
