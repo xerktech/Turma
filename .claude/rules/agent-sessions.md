@@ -74,6 +74,20 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
     `CLAUDE_CODE_USE_BEDROCK` in the env file.
   - Tests: `TestScrubClaudeSessionEnv`,
     `TestAgentTmuxSocket.test_a_polluted_warm_server_cannot_switch_a_sessions_transcript_off`.
+- **A pane never holds the agent's own token** (`_AGENT_SECRET_ENV`, XERK-1577): `TURMA_TOKEN`,
+  `TURMA_AGENT_TOKEN`, `LOCAL_MODEL_API_KEY` are unset per pane (`_TMUX_ENV_STRIP`) AND left out of
+  the env that cold-starts the tmux server / a Windows pty-host (`_session_env()`), and
+  `load_tmux_config` unsets them from a WARM server's global env (else `show-environment -g`).
+  - Why: tmux copies the starter's env — all of `turma-agent.env` — into every pane, so a session
+    could impersonate its host to the hub (the hole XERK-268's per-host tokens close).
+  - The manager KEEPS them in `os.environ` (dsh/qwen read their key var at launch); runtimes that
+    need the model key get it from their own 0600 env file, sourced after the strip.
+  - A named list, never a `TURMA_*` prefix (the launch exports `TURMA_SESSION_ID` etc.). Board
+    creds (`JIRA_*`/`AZDO_*`/`GITLAB_TOKEN`) stay: sessions use them by design.
+  - Defence in depth, not containment: a session runs as the manager's uid, so the env file and
+    `/proc/<manager>/environ` stay readable. Don't describe this as sealing the token.
+  - Tests: `TestScrubClaudeSessionEnv`, `TestAgentTmuxSocket.*agents_token`,
+    `TestWindowsTerminalBackendManager.test_spawn_pty_host_keeps_the_agent_secrets_out_of_the_session`.
 
 ### The trust-folder modal, and why it KILLED sessions (XERK-868)
 
