@@ -903,11 +903,19 @@ body.td-open { overflow: hidden; }
 .td-field { min-width: 0; font-size: 12px; }
 .td-field dt { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
 .td-field dd { margin: 2px 0 0; color: var(--ink); overflow-wrap: anywhere; }
+/* A cell that spans the whole grid row: the "Closed by" row (XERK-1569) is the
+   one tall cell, and as an ordinary cell it stretched its row of three. */
+.td-field.td-field-wide { grid-column: 1 / -1; }
 /* The "Closed by" row's evidence note (XERK-1569): the session's own words,
-   clamped to three lines on screen; the full text is the element's title. */
-.td-outcome-note {
+   clamped to three lines until a tap or click opens the <details>, which shows
+   all of it (a phone has no hover for the tooltip). */
+.td-outcome-note { margin-top: 3px; color: var(--ink-2); }
+.td-outcome-note > summary { display: block; list-style: none; cursor: pointer; }
+.td-outcome-note > summary::-webkit-details-marker { display: none; }
+.td-outcome-note-text { white-space: pre-line; }
+.td-outcome-note:not([open]) .td-outcome-note-text {
   display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3;
-  overflow: hidden; margin-top: 3px; color: var(--ink-2); white-space: pre-line;
+  overflow: hidden;
 }
 .td-dim { color: var(--muted); }
 /* The Repo row's manual override (see repoFieldHtml/repoPickerHtml in board.js).

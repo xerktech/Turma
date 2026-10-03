@@ -1340,8 +1340,10 @@
 
   // The "Closed by" row's value: the closing session's name, "XERK-12-fix — not
   // reproducible · 3h ago", then the evidence note the session gave, clamped to
-  // three lines on screen with the full text in its tooltip. `at` is epoch ms
-  // (wireLong-coerced by the hub); a missing one just drops the age.
+  // three lines on screen. The note is a <details> whose summary IS the note, so
+  // a tap (a phone has no hover) or a click unclamps it to the full text —
+  // Android's tap-to-expand; the tooltip still carries it for a mouse. `at` is
+  // epoch ms (wireLong-coerced by the hub); a missing one just drops the age.
   function ticketOutcomeFieldHtml(outcome, now) {
     if (!outcome) return "";
     const at = Number.isFinite(outcome.at) ? new Date(outcome.at) : null;
@@ -1351,7 +1353,8 @@
     const title = iso ? ` title="${esc(iso)}"` : "";
     const who = outcome.session ? sessionChipName(outcome.session) : "session";
     const note = outcome.note
-      ? `<span class="td-outcome-note" title="${esc(outcome.note)}">${esc(outcome.note)}</span>`
+      ? `<details class="td-outcome-note"><summary title="${esc(outcome.note)}">`
+        + `<span class="td-outcome-note-text">${esc(outcome.note)}</span></summary></details>`
       : "";
     return `<span class="td-outcome"${title}><span class="td-outcome-who">${esc(who)}</span>`
       + ` — ${esc(ticketOutcomeWords(outcome.kind))}${esc(when)}</span>${note}`;
@@ -1658,9 +1661,10 @@
     });
   }
 
-  function fieldRow(label, valueHtml) {
+  // `cls` adds a class to the cell (e.g. td-field-wide, a row of its own).
+  function fieldRow(label, valueHtml, cls) {
     if (!valueHtml) return "";
-    return `<div class="td-field"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
+    return `<div class="td-field${cls ? " " + cls : ""}"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
   }
 
   // The triaged repo, for the detail panel's field list: the same three states as
@@ -2167,6 +2171,12 @@
     const labels = Array.isArray(d.labels) && d.labels.length ? d.labels
       : (Array.isArray(t.labels) ? t.labels : []);
     const fields = [
+      // A session that closed this ticket itself (XERK-1569), and why. The card's
+      // chip says why too; only this row has room for which session, when, and
+      // the evidence it gave. It is the one tall cell, so it spans the whole grid
+      // row (td-field-wide) and leads: in a cell of the 3-column grid it
+      // stretched its row and left an empty band under its neighbours.
+      fieldRow("Closed by", ticketOutcomeFieldHtml(ticketOutcomeOf(o.sessions), now), "td-field-wide"),
       // The one editable board field that writes back to Jira/Azure (XERK-138):
       // `statusEditing` swaps the pill for the picker of `statusOptions`, and a
       // pick pushes the change. Editable only once the detail (hence its options)
@@ -2179,10 +2189,6 @@
             error: o.statusError,
           })),
       fieldRow("Resolution", d.resolution ? esc(d.resolution) : ""),
-      // A session that closed this ticket itself (XERK-1569), and why. The card's
-      // chip says why too; only this row has room for which session, when, and
-      // the evidence it gave.
-      fieldRow("Closed by", ticketOutcomeFieldHtml(ticketOutcomeOf(o.sessions), now)),
       fieldRow("Priority", v("priority")
         ? `<span class="kc-prio ${prioClass(v("priority"))}">${esc(v("priority"))}</span>` : ""),
       fieldRow("Type", v("type") ? esc(v("type")) : ""),

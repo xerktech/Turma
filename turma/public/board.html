@@ -842,7 +842,12 @@ function paintDetail() {
   // closed this ticket itself, why, and when.
   const ticketSessions = B.ticketSessionsOf(
     B.ticketSessionIndex((cache && cache.agents) || []), s.siteKey, s.key);
+  // An evidence note the operator expanded stays expanded across a repaint of
+  // the SAME close (another field's beat); a different close starts clamped.
+  const prevOutcome = s.outcomeShown;
   s.outcomeShown = outcomeSig(ticketSessions);
+  const noteExpanded = !!prevOutcome && prevOutcome === s.outcomeShown &&
+    !!$panel.querySelector(".td-outcome-note[open]");
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
     siteKey: s.siteKey,
@@ -901,6 +906,10 @@ function paintDetail() {
     epicRunError: epicOp && epicOp.error,
     sessions: ticketSessions,
   });
+  if (noteExpanded) {
+    const note = $panel.querySelector(".td-outcome-note");
+    if (note) note.open = true;
+  }
   if (s.editing) {
     const sel = $panel.querySelector("[data-repo-select]");
     if (sel) sel.focus();

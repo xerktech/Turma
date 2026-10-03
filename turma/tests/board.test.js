@@ -1919,10 +1919,16 @@ test("XERK-1569: the detail panel names the session that closed the ticket, why,
   const html = detailHtml(ticket("X-1"), null, { siteKey: "myorg.atlassian.net", sessions, now });
   // The row names the session that closed it (its chip name), not a bare "session".
   assert.match(html, /<dt>Closed by<\/dt><dd><span class="td-outcome"[^>]*><span class="td-outcome-who">X-1-fix-b<\/span> — not reproducible · 3h ago<\/span>/);
-  // The evidence note follows, escaped, clamped on screen with the full text as
-  // its tooltip.
+  // The evidence note follows, escaped. It is a <details> whose summary IS the
+  // note: clamped on screen until a tap/click opens it (a phone has no hover for
+  // the tooltip), never only in a title.
   const esc = "ran repro.sh on main: passes &lt;b&gt;&amp; the fix is a1b2c3&lt;/b&gt;";
-  assert.ok(html.includes(`<span class="td-outcome-note" title="${esc}">${esc}</span>`), html);
+  assert.ok(html.includes(`<details class="td-outcome-note"><summary title="${esc}">`
+    + `<span class="td-outcome-note-text">${esc}</span></summary></details>`), html);
+  // The tall row spans the whole field grid and leads it, so it never stretches
+  // a row of three and leaves a band under Status/Resolution.
+  assert.match(html, /<dl class="td-fields">\s*<div class="td-field td-field-wide"><dt>Closed by<\/dt>/);
+  assert.equal((html.match(/td-field-wide/g) || []).length, 1, "only the Closed by row spans");
   assert.ok(!html.includes("<b>&"), "the note is never markup");
   // No note served → no note element (never an invented one).
   assert.ok(!ticketOutcomeFieldHtml(ticketOutcomeOf([withOutcome("a", "done", at)]), now)
