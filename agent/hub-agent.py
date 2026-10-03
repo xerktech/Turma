@@ -16542,8 +16542,9 @@ class SessionManager:
         self._cheap_worker = None
         self._cheap_due = {}                     # (attr, key) -> (fn, path)
         # The slow facts above, and these, are served from cache the same way
-        # and read on the same worker (XERK-1262) — so the beat spawns no git at
-        # all: not on cold start, not on the slow cadence.
+        # and read on the same worker (XERK-1262) — so the beat reads no
+        # per-repo/per-session git fact itself, not on cold start, not on the
+        # slow cadence. (_backfill_ledger's remote lookup is not yet: XERK-1536.)
         self.root_remote = {}                    # REPOS_ROOT -> origin remote (slow)
         # session id -> the open-PR poller's fresh read (None = staged, pending).
         self.nudge_reads = {}
