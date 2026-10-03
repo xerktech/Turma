@@ -81,6 +81,8 @@ machinery is in `.claude/rules/turma-board.md`.
   `TicketSession.outcome`/`outcomeAt`/`outcomeNote` in `Board.kt`, rendered in `BoardScreen.kt`
   (chip + sheet); `TicketRef.outcome` is typed there. Tests: `XERK-1569` in `board.test.js`,
   `BoardTest.kt`, `AgentDecodeTest`.
+- **The outcome is not column-gated**: only a Start/resume clears it (agent `_reopened_ticket`), so
+  a ticket reopened on the board with no new session keeps the closed chip and "Closed by" row.
 - **The org triage-policy modal's DOM ids are `triageRules*`, NEVER `policy*`** (XERK-587). EasyList
   ships an exact-id cosmetic rule `###policyPanel` (an unrelated site's cookie/policy popup), so a
   bare `#policyPanel` is hidden by a user-origin `display:none !important` under Brave Shields /

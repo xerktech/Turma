@@ -139,6 +139,10 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   - **Already in Done is a SUCCESS**: a tracker offers no transition into the current status, so
     with no Done option `_board_issue_done_status` reads the issue's own status; Done-column →
     `ok` with that status name (an operator's close, or a repeat request), else the failure.
+  - **So is a FALLBACK option on a ticket in Done** (`_close_ticket_is_fallback`): a ticket in Done
+    is offered only the board's OTHER Done statuses, so a plain close's sole option may be "Won't
+    Do". Before taking an option the kind did not ask for, the status is read; already Done → `ok`,
+    no move. Never drop that read: it rewrote correctly closed tickets as abandoned.
   - **The target is resolved BEFORE the comment posts**, so a workflow with no edge into Done
     never gets an evidence comment on a ticket left open.
   - Only for a RUNNING Claude session whose `ticket.siteKey` is this host's board; dsh/qwen skipped.

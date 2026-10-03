@@ -15654,6 +15654,18 @@ def _close_ticket_option(options, kind):
             or (plain[0] if plain else done[0]))
 
 
+def _close_ticket_is_fallback(option, kind):
+    """True when `_close_ticket_option` chose `option` only because nothing
+    better was offered: a not-reproducible close not landing on a status named
+    so, or any other close landing on a not-reproducible / won't-do one. The
+    caller then checks whether the ticket already sits in Done before moving it,
+    since a ticket in Done is offered only the board's other Done statuses."""
+    name = str(option.get("name") or "")
+    if kind == "not-reproducible":
+        return not _NOT_REPRO_STATUS_RE.search(name)
+    return bool(_NOT_REPRO_STATUS_RE.search(name) or _NEGATIVE_DONE_STATUS_RE.search(name))
+
+
 def board_create_meta():
     """The New-ticket form's project + label choices from the configured source
     (XERK-137)."""
@@ -25446,12 +25458,17 @@ class SessionManager:
             # no edge into Done never gets a comment saying it is being closed.
             option = _close_ticket_option(board_status_options(key), req["kind"])
             current = None
-            if option is None:
+            if option is None or _close_ticket_is_fallback(option, req["kind"]):
                 # Trackers offer no transition into the status an issue is
                 # already in, so an operator's own close (or a repeat request)
-                # lands here: already Done is the outcome asked for.
+                # lands here — with no Done option, or only a Done-column one
+                # the kind did not ask for (a ticket in Done is offered just the
+                # board's OTHER Done statuses, e.g. "Won't Do"): already Done is
+                # the outcome asked for, never a move into that fallback.
                 current = _board_issue_done_status(key)
-                if current is None:
+                if current is not None:
+                    option = None
+                elif option is None:
                     raise RuntimeError("nothing can move it to Done")
             if not st["commented"]:
                 add_board_comment(key, _close_ticket_comment(req))

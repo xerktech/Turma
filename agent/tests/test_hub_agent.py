@@ -17569,7 +17569,10 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         sess = self._sess(sm)
         self._req()
         sm._process_close_ticket_requests(now=1000.0)      # the WORKER pass
-        self.assertEqual(self.calls[0][0], f"/rest/api/3/issue/{self.KEY}/comment")
+        # The first WRITE is the comment (a not-reproducible close on a board with
+        # no status named so first reads whether the ticket is already Done).
+        writes = [p for p, b in self.calls if b is not None]
+        self.assertEqual(writes[0], f"/rest/api/3/issue/{self.KEY}/comment")
         adf = json.dumps(self._comments()[0])
         self.assertIn("not reproducible", adf)
         self.assertIn("ran repro.sh on main: passes", adf)
@@ -17766,6 +17769,81 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         self.assertTrue(r["ok"])
         self.assertEqual(r["status"], "Closed")
         self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def _close_from(self, opts, kind, current):
+        """One close where the board offers `opts` and the issue's current
+        status is `current` = (name, category key) or None (unreadable)."""
+        self.OPTS = opts
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                self.calls.append((path, body))
+                return {} if current is None else {"fields": {"status": {
+                    "name": current[0], "statusCategory": {"key": current[1]}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req(resolution=kind)
+            sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        return sess, sm.ticket_outcome_results[-1]
+
+    def test_a_ticket_in_done_is_never_moved_into_a_fallback_done_status(self):
+        # A ticket already in Done is offered only the board's OTHER Done
+        # statuses, so a plain-Done close's only Done option is a negative one
+        # ("Won't Do", "Duplicate"). That must read as already closed — never
+        # rewrite a finished ticket as abandoned.
+        todo = {"id": "1", "name": "To Do", "category": "todo"}
+        for kind, neg in (("done", {"id": "41", "name": "Won't Do", "category": "done"}),
+                          ("already-fixed", {"id": "51", "name": "Duplicate",
+                                             "category": "done"}),
+                          ("done", {"id": "61", "name": "Cannot Reproduce",
+                                    "category": "done"})):
+            with self.subTest(kind=kind, neg=neg["name"]):
+                self.calls.clear()
+                sess, r = self._close_from([todo, self.OPTS[0], neg], kind, ("Done", "done"))
+                self.assertEqual(self._transitions(), [])
+                self.assertEqual(len(self._comments()), 1)
+                self.assertEqual((r["ok"], r["status"]), (True, "Done"))
+                self.assertEqual(sess["ticket"]["outcome"]["kind"], kind)
+        # A repeat not-reproducible close sitting in "Cannot Reproduce" is offered
+        # plain Done: it stays where it is.
+        self.calls.clear()
+        _, r = self._close_from([todo, {"id": "31", "name": "Done", "category": "done"}],
+                                "not-reproducible", ("Cannot Reproduce", "done"))
+        self.assertEqual(self._transitions(), [])
+        self.assertEqual((r["ok"], r["status"]), (True, "Cannot Reproduce"))
+
+    def test_an_open_ticket_still_takes_the_fallback_done_status(self):
+        # The current-status read only spares a ticket ALREADY in Done: an open
+        # ticket on a board whose only Done option is "Won't Do" still leaves
+        # the open columns, and an unreadable status changes nothing either.
+        todo = {"id": "1", "name": "To Do", "category": "todo"}
+        neg = {"id": "41", "name": "Won't Do", "category": "done"}
+        for current in (("In Progress", "indeterminate"), None):
+            with self.subTest(current=current):
+                self.calls.clear()
+                _, r = self._close_from([todo, neg], "done", current)
+                self.assertEqual(self._transitions(), [{"transition": {"id": "41"}}])
+                self.assertEqual((r["ok"], r["status"]), (True, "Won't Do"))
+        # The exact match is taken without reading the current status at all.
+        self.calls.clear()
+        self._close_from([todo, {"id": "31", "name": "Done", "category": "done"}],
+                         "done", ("Done", "done"))
+        self.assertNotIn(f"/rest/api/3/issue/{self.KEY}", [p for p, _ in self.calls])
+        self.assertEqual(self._transitions(), [{"transition": {"id": "31"}}])
+
+    def test_the_fallback_predicate(self):
+        def o(name):
+            return {"id": "1", "name": name, "category": "done"}
+        self.assertFalse(ha._close_ticket_is_fallback(o("Done"), "done"))
+        self.assertFalse(ha._close_ticket_is_fallback(o("Shipped"), "already-fixed"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Won't Do"), "done"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Cannot Reproduce"), "already-fixed"))
+        self.assertFalse(ha._close_ticket_is_fallback(o("Cannot Reproduce"), "not-reproducible"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Done"), "not-reproducible"))
 
     def test_a_refusal_is_told_to_the_session_and_a_success_is_not(self):
         sm = self.make_manager()
