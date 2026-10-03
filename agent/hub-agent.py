@@ -1233,13 +1233,42 @@ def _scrub_claude_session_env(env=None):
     return [k for k in _CLAUDE_SESSION_ENV if env.pop(k, None) is not None]
 
 
+# The manager's OWN secrets (XERK-1577): what the env file hands the agent so it
+# can talk to the hub / the local model, which a session must never hold. A tmux
+# server's global env is a copy of whatever started it — the manager, whose env
+# is the whole turma-agent.env — and every pane inherits it, so without this a
+# session could read TURMA_TOKEN and impersonate its host to the hub (forge
+# beats, drain its command queue, fetch /api/agent/token) — the hole XERK-268's
+# per-host tokens close. A NAMED list, never a TURMA_* prefix: the launch
+# deliberately exports TURMA_SESSION_ID / TURMA_QUESTIONS_DIR / TURMA_SESSION_CLI.
+# Board creds (JIRA_*/AZDO_*/GITLAB_TOKEN) are NOT here: sessions file and move
+# tickets with them by design. A runtime that needs the model key (failover,
+# dsh, qwen) gets it back from its own 0600 env file, sourced AFTER the strip.
+# The manager keeps these in os.environ (it reads them at launch time and its
+# restart re-execs with them); only what it hands a pane / tmux server drops them.
+_AGENT_SECRET_ENV = ("TURMA_TOKEN", "TURMA_AGENT_TOKEN", "LOCAL_MODEL_API_KEY")
+
+
+def _session_env(base=None):
+    """A copy of `base` (default: this process's env) fit to start a session or
+    the tmux server sessions inherit from: no Claude session markers, no agent
+    secrets. Never mutates `base`."""
+    env = dict(os.environ if base is None else base)
+    for k in _CLAUDE_SESSION_ENV + _AGENT_SECRET_ENV:
+        env.pop(k, None)
+    return env
+
+
 # Prefixed to every command the agent starts in a tmux pane. tmux exports
 # TMUX/TMUX_PANE into the pane, and tmux prefers $TMUX over TMUX_TMPDIR, so a
 # session that inherited them would still address the agent's server with a
 # bare `tmux`. The Claude session markers are unset here too, not only scrubbed
 # from the manager: a WARM tmux server started by a polluted manager keeps them
 # in its global env across every later manager restart.
-_TMUX_ENV_STRIP = "unset TMUX TMUX_PANE " + " ".join(_CLAUDE_SESSION_ENV) + "; "
+# The agent's own secrets are unset here for the same warm-server reason
+# (XERK-1577): a server cold-started before the fix keeps them in its global env.
+_TMUX_ENV_STRIP = ("unset TMUX TMUX_PANE "
+                   + " ".join(_CLAUDE_SESSION_ENV + _AGENT_SECRET_ENV) + "; ")
 
 # Agent-owned tmux sessions an OLDER agent started on the default server, which
 # a manager-only restart (an in-place update) leaves running there: tmux can't
@@ -1460,11 +1489,23 @@ def load_tmux_config(socket=None):
     `socket` is for tests only (an isolated `-L <name>` so a real-tmux test can
     exercise the cold-boot path without touching the production TMUX_SOCKET).
     Best-effort and non-fatal: a tmux hiccup must never stop the agent booting."""
+    base = ["tmux", "-L", socket or TMUX_SOCKET]
+    # A WARM server (started before XERK-1577, kept alive across manager
+    # restarts by KillMode=process) still holds the agent's secrets in its global
+    # env: the pane unset hides them from $VAR, but `tmux show-environment -g` in
+    # a pane, or a window a session opens itself, would hand them back. Dropped
+    # first, config or not; with no server yet this just fails (and starts none).
+    unset = []
+    for k in _AGENT_SECRET_ENV:
+        unset += ["set-environment", "-g", "-u", k, ";"]
+    run_ok(base + unset[:-1], timeout=10)
     if not os.path.exists(_TMUX_CONF):
         log(f"tmux config not found at {_TMUX_CONF}; using tmux defaults")
         return
-    base = ["tmux", "-L", socket or TMUX_SOCKET]
-    run_ok(base + ["-f", _TMUX_CONF, "start-server"], timeout=10)
+    # The server's global env — what every pane inherits — is a copy of THIS
+    # client's, so a cold start gets the session-safe one (XERK-1577).
+    run_ok(base + ["-f", _TMUX_CONF, "start-server"], timeout=10,
+           env=_session_env())
     rc, err = run_ok(base + ["source-file", _TMUX_CONF], timeout=10)
     if rc == 0:
         log(f"loaded tmux config from {_TMUX_CONF}")
@@ -15990,11 +16031,11 @@ def build_ticket_prompt(detail, attachments=None):
     """A fetched ticket -> the initial task prompt for its session: everything the
     agent would otherwise have to go and read, inlined.
 
-    The session has no board creds of its own (they live in the manager's env, not
-    the worktree), so this text is all it will ever see of the ticket — hence the
-    header saying plainly that it's a spawn-time snapshot and pointing at the URL
-    for the live copy, and hence the ticket's own attachments being fetched FOR it
-    (XERK-242) rather than left behind a login it doesn't have. Caps mirror the
+    The session starts from this text rather than a fetch of its own (it does
+    inherit the manager's board creds, but nothing tells it to re-read first) —
+    hence the header saying plainly that it's a spawn-time snapshot and pointing
+    at the URL for the live copy, and hence the ticket's own attachments being
+    fetched FOR it (XERK-242) rather than left for it to chase. Caps mirror the
     detail fetch's own (description and comment bodies are already clipped
     agent-side by the shaping)."""
     d = detail or {}
@@ -19396,7 +19437,8 @@ class SessionManager:
         _kill_tmux_session(DSH_WEB_TMUX, exact=True)
         rc, err = run_ok(_tmux(
             "new-session", "-d", "-s", DSH_WEB_TMUX,
-            "-c", DSH_HOME, "-x", "200", "-y", "50", _TMUX_ENV_STRIP + cmd))
+            "-c", DSH_HOME, "-x", "200", "-y", "50", _TMUX_ENV_STRIP + cmd),
+            env=_session_env())
         if rc != 0:
             log(f"dsh web launch failed: {err}")
             return False
@@ -19669,7 +19711,7 @@ class SessionManager:
             "new-session", "-d", "-s", sess["tmuxName"],
             "-c", sess["worktreePath"], "-x", "220", "-y", "50",
             _TMUX_ENV_STRIP + cmd,
-        ))
+        ), env=_session_env())
         if rc != 0:
             prefix = f"{what} " if what else ""
             raise RuntimeError(f"{prefix}tmux launch failed: {err}")
@@ -20953,7 +20995,9 @@ class SessionManager:
             "--cols", "220", "--rows", "50",         # the tmux `-x 220 -y 50` geometry
             "--",
         ] + launcher + claude_argv
-        env = dict(os.environ)
+        # No agent secrets in the session (XERK-1577): node-pty hands this whole
+        # dict to claude. Failover's model key comes back via extra_env.
+        env = _session_env()
         env.update({k: str(v) for k, v in extra_env.items()})
         log_path = os.path.join(PTY_HOST_DIR, f"{tmux_name}.log")
         # The detached-spawn / wait-for-bound-ports / reap-on-timeout dance is the
@@ -30313,7 +30357,7 @@ class SessionManager:
             "new-session", "-d", "-s", LIMITS_TMUX,
             "-c", REGISTRY_DIR, "-x", "80", "-y", "24",
             _TMUX_ENV_STRIP + " ".join(parts),
-        ))
+        ), env=_session_env())
         if rc != 0:
             log(f"limits probe launch failed: {err}")
             self._limits_probe_outcome(False)
@@ -30405,7 +30449,7 @@ class SessionManager:
             "--cols", "80", "--rows", "24",   # the tmux `-x 80 -y 24` geometry
             "--",
         ] + launcher + claude_argv
-        env = dict(os.environ)
+        env = _session_env()   # no agent secrets in the probe's claude (XERK-1577)
         # hooks/statusline.py writes the snapshot where read_limits_snapshot reads;
         # the pty-host has no shell to carry the `VAR=x` assignment the tmux path
         # prepends, so pin it in the process env instead (override included).
