@@ -1704,6 +1704,41 @@ class TestPrSummary(unittest.TestCase):
         self.assertIsNone(self.reason(
             "gh pr create -t x -F - <<'EOF'\n" + GOOD_BODY + "EOF"))
 
+    def test_a_stdin_description_must_be_the_commands_own_heredoc(self):
+        # XERK-1565: every heredoc counts toward the check, but gh reads
+        # whatever fd 0 ends up as — a later `< file` beats the heredoc, and a
+        # sibling segment's heredoc never reaches gh at all.
+        with open(os.path.join(self.repo, "ok.md"), "w") as fh:
+            fh.write(GOOD_BODY)
+        with open(os.path.join(self.repo, "hosts.yml"), "w") as fh:
+            fh.write("github.com:\n    oauth_token: gho_SECRET\n")
+        g = GOOD_BODY + "EOF"
+        for cmd in (f"gh pr create -t x -F - <<'EOF' < hosts.yml\n{g}",
+                    f"gh pr create -t x -F /dev/stdin <<'EOF' < hosts.yml\n{g}",
+                    f"gh pr create -t x -F - 0<hosts.yml <<'EOF'\n{g}",
+                    f"gh pr create -t x --body-file /dev/fd/0 <<'EOF' 0<hosts.yml\n{g}",
+                    f"gh pr create -t x -F - < hosts.yml; gh pr view 1 <<'EOF'\n{g}",
+                    f"gh pr create -t x -F-<hosts.yml; cat <<'EOF'\n{g}",
+                    f"gh pr create -t x -F - <&3 3<hosts.yml; cat <<'EOF'\n{g}",
+                    f"gh pr create -t x -F - <<<\"$(cat hosts.yml)\"; cat <<'EOF'\n{g}",
+                    f"cat hosts.yml | gh pr create -t x -F -; cat <<'EOF'\n{g}",
+                    f"cat > n.md <<'EOF'\n{g}\ngh pr create -t x -F - <<'EOF'\njunk\nEOF",
+                    f"gh pr create -t x -F /dev/fd/3 3<hosts.yml <<'EOF'\n{g}",
+                    f"gh pr create -t x -F /proc/self/fd/0 <<'EOF' < hosts.yml\n{g}",
+                    "gh pr create -t x -F ok.md < hosts.yml"):
+            with self.subTest(cmd=cmd[:50]):
+                self.assertIsNotNone(self.reason(cmd))
+        # The routine shapes: the heredoc on the PR command itself, a pipe it
+        # overrides, a chained prefix, and a real file with a stderr redirect.
+        for cmd in (f"gh pr create -t x -F - <<'EOF'\n{g}",
+                    f"gh pr create -t x -F /dev/stdin <<'EOF'\n{g}",
+                    f"cd /tmp && gh pr create -t x -F - <<'EOF'\n{g}",
+                    f"echo hi | gh pr create -t x -F - <<'EOF'\n{g}",
+                    "gh pr create -t x -F ok.md 2>&1",
+                    f"gh pr create -t x --body \"$(cat <<'EOF'\n{g}\n)\" < /dev/null"):
+            with self.subTest(cmd=cmd[:50]):
+                self.assertIsNone(self.reason(cmd))
+
     def test_missing_sections_are_refused_and_named(self):
         body = GOOD_BODY.replace("## Risk\n", "").replace("## Follow-ups\n", "")
         r = self.reason("gh pr create --title t --body " +

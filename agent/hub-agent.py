@@ -4641,7 +4641,9 @@ SANDBOX_DOMAIN_FLOOR = (
 # `~/.config/gh/hosts.yml`), but one body that holds
 # the required sections plus `$(cat <credential>)`, or any lone `--body-file`
 # under `TURMA_PR_SUMMARY=0`, still posts that file unless Claude Code's prefix
-# match refuses the substitution (unmeasured — the real-host spike).
+# match refuses the substitution (unmeasured — the real-host spike). A stdin
+# body (`-F -`) must be the PR command's own heredoc with no other fd-0 input,
+# so `-F - <<EOF … < hosts.yml` is refused too.
 # `TURMA_TOOL_ALLOW` (CSV) REPLACES the list when set non-blank; keep git rules
 # out of it for the same reason. It splits on every comma with no escape, so a
 # rule whose pattern holds a comma cannot be set through it. Distinct from `TURMA_TOOL_GRANTS`, which only

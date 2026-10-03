@@ -62,7 +62,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     classifier. pr-summary is no credential filter: it refuses a second description flag, `-dF`
     clusters included (below), but a conforming body plus `$(cat ~/.config/gh/hosts.yml)`, or a
     lone `--body-file` under `TURMA_PR_SUMMARY=0`, still posts the file unless Claude Code's prefix
-    match refuses the substitution — unmeasured, part of the spike below.
+    match refuses the substitution — unmeasured, part of the spike below. A stdin body is closed
+    (below); a `--body-file` the command creates first (`cp <cred> b.md; … -F b.md`) is still vouched
+    for by any heredoc in it — the `cp` half stays with the classifier.
   - `TURMA_TOOL_ALLOW` splits on every comma with no escape, so a rule whose pattern holds a comma
     cannot be set through it (it lands as two malformed rules).
   - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
@@ -118,6 +120,11 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     source while gh sends only the LAST, so `--body-file ok.md --body-file ~/.config/gh/hosts.yml`
     passed on ok.md's sections and posted the token file. Heredocs are not flags, so `--body
     "$(cat <<EOF …)"` and `-F - <<EOF` stay one source.
+  - **A STDIN description must be the PR command's OWN heredoc** (XERK-1565, `_stdin_redirects`):
+    gh reads whatever fd 0 ends up as, so `-F - <<EOF … < hosts.yml` (also `0<`, `<<<`, `<&`, a pipe,
+    or a sibling's heredoc: `-F - < f; gh pr view 1 <<EOF`) posted the file on the heredoc's sections.
+    A file flag plus any non-heredoc fd-0 input is refused; `-` or `/dev/stdin` needs one heredoc
+    in the command, on that segment; `/dev/fd/N` (N≠0) is refused outright.
   - **A shorthand CLUSTER is a description flag too** (`_shorthand_value`): pflag reads `-dF x` as
     `-d -F x`, so `--body-file ok.md -dF hosts.yml` (also `-dFhosts.yml`, `-wF`, glab `-yd`) is
     two sources. ANY letter of a single-dash token counts (gh `b`/`F`, glab `d`): a glued value
