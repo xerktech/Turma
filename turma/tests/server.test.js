@@ -11823,9 +11823,9 @@ const mergeBeat = async (device, site, {
   paneBusy = false, ticketType = "bug", issueType = "Bug", statusCategory = "inprogress",
   question, prs, tickets, url = PR1,
 } = {}) => {
-  // `issueType` is the TRACKER Issue Type (`type`, what auto-merge now gates on,
-  // XERK-560); `ticketType` is the triage classifier's assessment (`triage.type`,
-  // no longer the gate) — kept distinct so a test can drive them apart.
+  // `issueType` is the TRACKER Issue Type (`type`); `ticketType` is the triage
+  // classifier's assessment (`triage.type`) — kept distinct so a test can drive
+  // them apart.
   const r = await asBeat(device, site, {
     autoStart: false,
     tickets: tickets || [{ key: "ENG-9", summary: "A bug", statusCategory,
@@ -12393,7 +12393,7 @@ test("XERK-725: DELETE cancels a builder run and drops it from the payload", asy
 // ---- auto-close chaining + epic completion (XERK-637, epic XERK-633) --------
 // D advances and completes an armed run: its children auto-MERGE through the
 // XERK-550 sweep (arming the run is the hands-off opt-in, so it overrides the org
-// auto-merge toggle AND the bug-only floor), and once a child's PR lands the hub
+// auto-merge toggle), and once a child's PR lands the hub
 // MESSAGES the child to self-close (XERK-705) rather than forcing its Done+kill.
 // Once every child is Done — self-closed or human-moved — the EPIC itself is written
 // to Done exactly once (still a hub write; the epic has no session) and the run goes
@@ -12414,8 +12414,7 @@ const resetEpicD = () => {
     }
   }
 };
-// The epic organizer ticket, and a child ticket. Children are deliberately type
-// "Task" (not "Bug") to prove the epic run ignores the auto-merge bug-only floor.
+// The epic organizer ticket, and a child ticket (type "Task").
 const dEpic = (statusCategory = "todo") => ({
   key: "E-1", statusCategory, isEpic: true,
   repoGuess: { repo: "Turma", cloned: true },
@@ -12728,16 +12727,13 @@ test("XERK-659: the ORG auto-merge stream never merges a no-CI PR (broadening is
     `org stream must wait for a human on a no-CI PR, got ${JSON.stringify(dCmds("edOrgNoCi"))}`);
 });
 
-// ---- the run-scoped bug-floor bypass, both directions (XERK-642) -------------
-// XERK-642 pins, in ONE place, that lifting the AUTO_MERGE_ISSUE_TYPES bug floor
-// is RUN-SCOPED: a non-bug child of a STARTED epic run auto-merges, while a non-bug
-// ticket OUTSIDE any run in the SAME org still waits for a human (the XERK-560 floor
-// holds). The scope key is HUB-OWNED run membership (`run.children`), never the
-// agent-asserted `epicKey` alone — claiming epic membership is INERT without an
-// operator-armed run, and a child not captured in `run.children` (added after arming)
-// keeps the bug floor. The mechanism is XERK-637's `epicRunChildSession`; this is the
-// acceptance pin for the exception documented in turma-board.md / turma-epic-run.md.
-test("XERK-642: the bug-floor bypass is run-scoped — non-bug run child merges, non-run/added-later non-bug tickets do not", async () => {
+// ---- run-scoped epic membership (XERK-642, XERK-1440) -----------------------
+// An armed run's child merges via the run (epicRunChildSession); a non-epic ticket
+// in an opted-in org merges via the org stream whatever its issue type (XERK-1440);
+// a ticket merely CLAIMING epic membership after arming (not in `run.children`)
+// rides neither — the content gate excludes epic children from the org stream and
+// the run only covers hub-owned `run.children`.
+test("XERK-642: run membership is hub-owned — run child and non-epic ticket merge, an added-later epic child does not", async () => {
   resetEpicD();
   const site = "d642.atlassian.net";
   const childUrl = "https://github.com/ep/x642/pull/1";
@@ -12746,8 +12742,8 @@ test("XERK-642: the bug-floor bypass is run-scoped — non-bug run child merges,
   const nonRunTask = (key) => ({ key, statusCategory: "inprogress", type: "Task",
     repoGuess: { repo: "Turma", cloned: true },
     triage: { priority: "P2", type: "task", actionable: true } });
-  // Arm the run when only C-1 is a child. T-9 (no epic at all) is present too, so the
-  // org is opted into auto-merge and the sweep DOES run for it — proving the floor.
+  // Arm the run when only C-1 is a child. T-9 (no epic at all) is present too, in an
+  // org opted into auto-merge.
   await asBeat("ed642", site, { autoStart: false,
     tickets: [dEpic(), dChild("C-1", [], "inprogress"), nonRunTask("T-9")] });
   setAutoMergeOrg(site, true);
@@ -12767,7 +12763,7 @@ test("XERK-642: the bug-floor bypass is run-scoped — non-bug run child merges,
   const merged = new Set((agents.ed642.commands || [])
     .filter((c) => c.type === "mergePr").map((c) => c.url));
   assert.ok(merged.has(childUrl), "the armed run's non-bug child must auto-merge");
-  assert.ok(!merged.has(outsideUrl), "a non-bug ticket outside any run must NOT auto-merge (bug floor holds)");
+  assert.ok(merged.has(outsideUrl), "a non-bug, non-epic ticket in an opted-in org auto-merges via the org stream");
   assert.ok(!merged.has(lateUrl), "a non-bug child added AFTER arming (not in run.children) must NOT auto-merge");
 });
 
@@ -13261,48 +13257,32 @@ test("XERK-550: auto-merge skips a PR that is not merge-ready or already landed"
   assert.equal((agents.am6.commands || []).filter((c) => c.type === "mergePr").length, 0);
 });
 
-test("XERK-560: auto-merge gates on the tracker ISSUE TYPE, not the triage classifier", async () => {
-  // A ticket that IS content-eligible (actionable, no excludeTypes policy — so
-  // auto-start WOULD start it) must never be auto-merged unless its TRACKER
-  // Issue Type is Bug. The floor is independent of the triage policy.
+test("XERK-1440: auto-merge takes any issue type the auto stream would start, not just Bug", async () => {
+  // The class that auto-merges is the class the org's triage auto-start
+  // settings would START — no separate bug-only floor on the tracker type.
   resetMerge();
   let n = 0;
-  for (const issueType of ["Task", "Story", "Chore", "Improvement", "Epic"]) {
+  for (const issueType of ["Task", "Story", "Chore", "Improvement", "Bug"]) {
     const dev = "amT-" + issueType;
-    await mergeBeat(dev, `amt-${issueType}.atlassian.net`, { issueType, url: `https://github.com/x/y/pull/${n++}` });
+    await mergeBeat(dev, `amt-${issueType}.atlassian.net`, { issueType, url: `https://github.com/x/y${n}/pull/${n++}` });
     autoMergeSweep();
-    autoCloseSweep();
-    assert.equal((agents[dev].commands || []).length, 0,
-      `a ${issueType} issue-type ticket must not be auto-merged or auto-closed`);
+    assert.equal((agents[dev].commands || []).filter((c) => c.type === "mergePr").length, 1,
+      `a ${issueType} issue-type ticket the auto stream would start must auto-merge`);
   }
-  // THE PRODUCTION DEFECT (XERK-560): a Jira TASK the classifier assessed as a
-  // "bug" (triage.type==="bug") must NOT auto-merge — the tracker type wins.
+  // A ticket the triage policy EXCLUDES stays out: the policy still narrows it.
   resetMerge();
-  await mergeBeat("amTaskBug", "amtaskbug.atlassian.net",
-    { issueType: "Task", ticketType: "bug", url: "https://github.com/x/y/pull/tb" });
+  await mergeBeat("amUntriaged", "amuntriaged.atlassian.net", {
+    issueType: "Task", url: "https://github.com/x/y/pull/un",
+    tickets: [{ key: "ENG-9", statusCategory: "inprogress", type: "Task",
+      repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: false } }] });
   autoMergeSweep();
-  autoCloseSweep();
-  assert.equal((agents.amTaskBug.commands || []).length, 0,
-    "a Task the classifier called a bug must not auto-merge");
-  // Case-insensitive: a real Bug (issue type "Bug") DOES merge, even if the
-  // classifier assessed it as something else.
-  resetMerge();
-  await mergeBeat("amRealBug", "amrealbug.atlassian.net",
-    { issueType: "bug", ticketType: "task", url: "https://github.com/x/y/pull/rb" });
-  autoMergeSweep();
-  assert.equal((agents.amRealBug.commands || []).filter((c) => c.type === "mergePr").length, 1,
-    "a tracker Bug must auto-merge regardless of the classifier's assessment");
-  // A malformed non-string `type` must fail safe (QA: `String(["bug"])==="bug"`
-  // would otherwise slip the gate). normalizeJira strips it on ingest AND the
-  // gate's typeof guard stands alone — either way it never merges.
+  assert.equal((agents.amUntriaged.commands || []).length, 0,
+    "a ticket the auto stream would not start must not auto-merge");
+  // A malformed non-string `type` is coerced off the served payload (Android decode safety).
   resetMerge();
   await mergeBeat("amBadType", "ambadtype.atlassian.net",
     { issueType: ["bug"], url: "https://github.com/x/y/pull/bt" });
-  autoMergeSweep();
-  autoCloseSweep();
-  assert.equal((agents.amBadType.commands || []).length, 0,
-    "a non-string tracker type must never auto-merge");
-  // And it was coerced OFF the served payload (Android decode safety).
   const list = await request("GET", "/api/agents", { headers: userHeaders });
   const rec = list.body.agents.find((a) => a.key === "amBadType");
   const badT = (rec.jira.tickets || []).find((t) => t.key === "ENG-9");

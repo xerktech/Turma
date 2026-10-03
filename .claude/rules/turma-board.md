@@ -208,27 +208,17 @@ mechanics — admission, drain, expiries, caps — in `.claude/rules/turma-ticke
   the class that auto-merges is exactly the class the auto stream would START. It is a SEPARATE
   composition from `autoStartSweep`'s inline gates (their per-drop log lines differ); a cross-check
   test pins the two agree.
-  - **HARD floor: auto-merge acts ONLY on tickets whose TRACKER ISSUE TYPE is a bug (XERK-560),
-    independent of the org's triage policy.** The shared content gate matches whatever the AUTO-START
-    stream would start — which the operator can widen past bugs via the policy (or leave wide with no
-    `excludeTypes`) — so on top of it `autoMergeSession` requires `row.type` (the tracker Issue Type:
-    Jira `issuetype`, ADO `System.WorkItemType`) to be in `AUTO_MERGE_ISSUE_TYPES` (case-insensitive,
-    default `{"bug"}`, `TURMA_AUTOMERGE_ISSUE_TYPES` widens it for a "Defect"-named tracker). Even an
-    org that auto-STARTS other types only ever has its BUG PRs merged + closed hands-off; every other
-    type's PR waits for a human. The policy can NARROW auto-merge but never WIDEN it past bugs — with
-    ONE run-scoped exception: a started epic run's children merge regardless of issue type (XERK-642,
-    via `epicRunChildSession` — arming the run IS the per-project trust decision, so it lifts the
-    bug floor for exactly that run's `run.children`; a non-bug ticket OUTSIDE any run still waits for
-    a human). See `.claude/rules/turma-epic-run.md`.
-    - **Keys on the OPERATOR-SET tracker type, NOT the triage classifier's `row.triage.type`**
-      (XERK-560's defect): `triage.type` is a `claude -p` model ASSESSMENT ("the assessed work type
-      bug/feature/…") that labels a content-bug Jira **Task** a "bug" — so gating on it auto-merged
-      Tasks. `row.type` is deterministic and what the operator sets. (`triage.type`/`excludeTypes`
-      still govern auto-START, so a liberal classifier can auto-start non-Bug tickets — that is the
-      auto-start policy's concern, not auto-merge's.)
-    - The gate is also **provenance-agnostic** — a hand-started Bug-type session in an opted-in org
-      auto-merges too, which is the same class — so do not describe it as "only sessions the hub
-      started". It is independent of the auto-START switch (`autoMergeOrgs`, never `autoStartOrgs`).
+  - **No issue-type floor (XERK-1440)**: any tracker Issue Type the content gate passes auto-merges
+    — the org's triage auto-start settings (board → Triage policy, `excludeTypes`) ARE the knob for
+    what merges hands-off. Narrow the policy to narrow auto-merge; there is no second bug-only gate.
+    Jira epics + epic children never ride this stream (the content gate excludes them); an armed
+    epic run merges its own children via `epicRunChildSession` (`.claude/rules/turma-epic-run.md`).
+    - **ADO rows carry no `isEpic`/`epicKey`** (`_shape_azure` emits only `type`/`parentKey`), so an
+      ADO Epic/Feature and its children are NOT excluded — from auto-start OR auto-merge. XERK-1444.
+    - The gate is also **provenance-agnostic** — a hand-started session in an opted-in org
+      whose ticket the auto stream would start auto-merges too, which is the same class — so do
+      not describe it as "only sessions the hub started". It is independent of the auto-START
+      switch (`autoMergeOrgs`, never `autoStartOrgs`).
   - **A Done ticket is excluded** (`statusCategory === "done"`): moving to Done is the abandon/stop
     gesture (autoStopSweep kills the session), and autoStopSweep only QUEUES that kill, so the
     session still reads running for a beat — the column, not the run state, stands the merge down.
