@@ -123,6 +123,12 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   the project-scoped comments endpoint, HTML-escaped), then `apply_board_status` to
   `_close_ticket_option` — a Done-column option, re-read fresh like `set_board_status`; for
   `not-reproducible` a Done-category option NAMED so (`_NOT_REPRO_STATUS_RE`) wins.
+  - **Every other close takes a PLAIN Done, never the first Done-column option**: options reading
+    not-reproducible or won't-do/duplicate/rejected (`_NEGATIVE_DONE_STATUS_RE`) are skipped while
+    another exists, one named Done/Closed/Resolved/Fixed preferred. A board listing "Cannot
+    Reproduce" ahead of "Done" otherwise closed every merged ticket as Cannot Reproduce.
+  - **A Start or resume drops `outcome`** (`_reopened_ticket`): relaunching the session means the
+    operator reopened the ticket, so the chip and "Closed by" row stop saying the session closed it.
   - **Only a status/transition NAME is mapped, never a tracker RESOLUTION field**: the transition
     POST sets no `fields.resolution`, so a Jira board whose "Cannot Reproduce" is a resolution (not
     a status) closes as plain Done, and the kind survives only in the comment text and `outcome`.

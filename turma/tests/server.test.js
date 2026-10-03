@@ -8423,6 +8423,7 @@ const asBeat = async (device, site, {
   ticketLinkResults,
   jiraSource,
   ackedCommands,
+  closeTicket,
 } = {}) => {
   const r = await request("POST", "/api/heartbeat", {
     body: {
@@ -8430,6 +8431,7 @@ const asBeat = async (device, site, {
       repos: repos.map((name) => ({ name, path: `/git/${name}` })),
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
+      ...(closeTicket !== undefined ? { closeTicket } : {}),
       jira: { available: true, configured: true, siteKey: site,
               user: user || `${device}@x.com`, fetchedAt, tickets,
               ...(jiraSource ? { source: jiraSource } : {}) },
@@ -12195,12 +12197,16 @@ const mergeBeat = async (device, site, {
   autoMerge = true, ready = "ready", state = "OPEN", mergeable = "MERGEABLE",
   paneBusy = false, ticketType = "bug", issueType = "Bug", statusCategory = "inprogress",
   question, prs, tickets, url = PR1, agentType,
+  // A current agent reports it reads close-ticket requests (XERK-1569); pass
+  // null to beat as an agent that predates the reader.
+  closeTicket = { available: true },
 } = {}) => {
   // `issueType` is the TRACKER Issue Type (`type`); `ticketType` is the triage
   // classifier's assessment (`triage.type`) — kept distinct so a test can drive
   // them apart.
   const r = await asBeat(device, site, {
     autoStart: false,
+    ...(closeTicket ? { closeTicket } : {}),
     tickets: tickets || [{ key: "ENG-9", summary: "A bug", statusCategory,
       type: issueType,
       repoGuess: { repo: "Turma", cloned: true },
@@ -12948,6 +12954,7 @@ test("XERK-705/637: an armed run's child is MESSAGED to self-close on a merged P
   resetEpicD();
   const url = "https://github.com/ep/c1/pull/1";
   await asBeat("edC", "d637-2.atlassian.net", { autoStart: false,
+    closeTicket: { available: true },
     tickets: [dEpic(), dChild("C-1", [], "inprogress")],
     sessions: [dChildSession("s-c1", "C-1", "d637-2.atlassian.net", "MERGED", url)] });
   armEpicRun("d637-2.atlassian.net", "E-1");
@@ -14279,6 +14286,35 @@ test("XERK-1569: a dsh/qwen session is told to close with its tracker tool, neve
     assert.ok(!msg.includes("TURMA_SESSION_CLI"), `${agentType}: no session CLI, got ${msg}`);
     assert.match(msg, /close it with the tracker CLI\/MCP this host gives you/);
   }
+});
+
+test("XERK-1569: a host that does not report the close-ticket reader is told the tracker tool", async () => {
+  // The hub deploys on merge but agents self-update later: an agent with the
+  // session CLI but no reader would accept the request and never act on it.
+  for (const closeTicket of [null, { available: false }, { available: "yes" }, "junk"]) {
+    resetMerge();
+    const dev = "amCt" + JSON.stringify(closeTicket).replace(/\W/g, "");
+    await mergeBeat(dev, `${dev.toLowerCase()}.atlassian.net`, { state: "MERGED", closeTicket });
+    autoCloseSweep();
+    const [msg] = inputTexts(dev);
+    assert.ok(msg, `${JSON.stringify(closeTicket)}: the session is still messaged`);
+    assert.match(msg, /mark the ticket as Done/i);
+    assert.ok(!msg.includes("TURMA_SESSION_CLI"),
+      `${JSON.stringify(closeTicket)}: no session CLI, got ${msg}`);
+    assert.match(msg, /close it with the tracker CLI\/MCP this host gives you/);
+  }
+});
+
+test("XERK-1569: normalizeCloseTicket keeps a strict boolean, nulls junk, leaves absent absent", () => {
+  const n = (v) => { const p = v === undefined ? {} : { closeTicket: v }; hub.normalizeCloseTicket(p); return p; };
+  assert.deepEqual(n({ available: true }), { closeTicket: { available: true } });
+  assert.deepEqual(n({ available: "yes", extra: 1 }), { closeTicket: { available: false } });
+  assert.deepEqual(n("junk"), { closeTicket: null });
+  assert.deepEqual(n([true]), { closeTicket: null });
+  assert.deepEqual(n(undefined), {});
+  assert.ok(!hub.autoCloseMergedMessage([], undefined, false).includes("TURMA_SESSION_CLI"));
+  assert.ok(hub.autoCloseMergedMessage([], undefined, true).includes("TURMA_SESSION_CLI"));
+  assert.ok(!hub.autoCloseMergedMessage([], "dsh", true).includes("TURMA_SESSION_CLI"));
 });
 
 test("auto-close: only a bounded, URL-shaped PR url reaches the message; odd urls never re-nag", async () => {

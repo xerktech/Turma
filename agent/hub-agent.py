@@ -3973,6 +3973,22 @@ Closing ticket {key} is this session's job, not the operator's:
   else the tracker CLI/MCP this host gives you.
 """
 
+# The same two rules for a session ADOPTED onto its ticket from its branch name
+# (XERK-817): the close-ticket reader refuses an adopted block, so the CLI is not
+# offered — only the host's own tracker tool.
+TICKET_CLOSE_ADOPTED_PROMPT = """
+Ticket {key} was linked to this session from your branch name. Close it with the
+tracker CLI/MCP this host gives you (Turma's close-ticket command refuses a ticket
+linked that way); if this host has no tracker tool, tell the operator it needs
+closing and why:
+
+- If it is a bug you cannot reproduce on the up-to-date default branch, or it is
+  already fixed, do NOT change code or open a PR: comment the evidence (what you
+  ran, what you saw) on the ticket, close it, then end the turn.
+- Once all of its work is merged, deployed and verified working, comment what you
+  verified and move it to Done.
+"""
+
 # The PR summary standard every session writes to. Rides --append-system-prompt
 # beside the policies above, on every launch. The guard hook
 # (hooks/guard.py `pr_summary_reason`) refuses a PR/MR whose description lacks
@@ -12549,7 +12565,7 @@ def _close_ticket_failed_message(key, kind, error):
     it is flattened to one line and capped."""
     label = CLOSE_TICKET_LABELS.get(kind)
     why = re.sub(r"\s+", " ", str(error or "unknown error")).strip()[:300]
-    return (f"The Turma manager could NOT close ticket {key}"
+    return (f"The Turma manager could NOT close {f'ticket {key}' if key else 'a ticket'}"
             f"{f' as {label}' if label else ''}: {why}. It was not moved to Done. "
             "Close it yourself with the tracker CLI/MCP this host gives you (comment "
             "the evidence, then move it to Done); if this host has no tracker tool, "
@@ -15601,18 +15617,41 @@ def _board_issue_done_status(key):
     return None
 
 
+# A Done-category status that closes work WITHOUT finishing it (won't do,
+# duplicate, rejected, obsolete...). Never the target of a plain Done close
+# while the board offers anything else.
+_NEGATIVE_DONE_STATUS_RE = re.compile(
+    r"\b(won'?t|will\s+not|not\s+(?:a\s+bug|needed|planned|fixed?|done)|"
+    r"duplicate|reject|declin|invalid|obsolete|cancel|abandon)", re.I)
+# A Done-category status named as plainly finished.
+_PLAIN_DONE_STATUS_RE = re.compile(r"\b(done|closed?|resolved|fixed|complete[d]?)\b", re.I)
+
+
 def _close_ticket_option(options, kind):
-    """The status option a `close-ticket <kind>` moves the ticket to, or None:
-    for `not-reproducible`, a Done-column option whose NAME says so when the board
-    offers one; otherwise (and for every other kind) the first Done-column option,
-    exactly what a drop on the Done column picks (`_status_option_for_column`)."""
+    """The status option a `close-ticket <kind>` moves the ticket to, or None.
+    `not-reproducible` takes a Done-column option whose NAME says so when the
+    board offers one. Every other case takes a PLAIN Done: among the Done-column
+    options, never one that reads as not-reproducible or won't-do/duplicate while
+    another exists, preferring one named Done/Closed/Resolved/Fixed. So a board
+    listing "Cannot Reproduce" ahead of "Done" never closes finished work as
+    Cannot Reproduce. Only when every Done option carries such a name does the
+    first one stand — the ticket still leaves the board's open columns."""
+    done = [o for o in options or []
+            if _board_column(o.get("name"), o.get("category")) == "done"]
+    if not done:
+        return None
+
+    def name(o):
+        return str(o.get("name") or "")
+
     if kind == "not-reproducible":
-        named = next((o for o in options or []
-                      if _board_column(o.get("name"), o.get("category")) == "done"
-                      and _NOT_REPRO_STATUS_RE.search(str(o.get("name") or ""))), None)
+        named = next((o for o in done if _NOT_REPRO_STATUS_RE.search(name(o))), None)
         if named is not None:
             return named
-    return _status_option_for_column(options, "done")
+    plain = [o for o in done if not _NOT_REPRO_STATUS_RE.search(name(o))
+             and not _NEGATIVE_DONE_STATUS_RE.search(name(o))]
+    return (next((o for o in plain if _PLAIN_DONE_STATUS_RE.search(name(o))), None)
+            or (plain[0] if plain else done[0]))
 
 
 def board_create_meta():
@@ -16012,6 +16051,18 @@ def _served_ticket(sess):
     ticket = sess.get("ticket")
     if isinstance(ticket, dict) and sess.get("ticketAdopted") and not ticket.get("adopted"):
         return {**ticket, "adopted": True}
+    return ticket
+
+
+def _reopened_ticket(ticket):
+    """`ticket` without its `outcome` (XERK-1569), for a session the OPERATOR
+    brings back (Start / resume). A close the session made is history once it is
+    relaunched: the operator disagreed and reopened the ticket, so the board chip
+    and the panel's "Closed by session" row must stop saying it closed it. The
+    launch re-writes the ticket ledger from this block, so the resumable channel
+    forgets it too."""
+    if isinstance(ticket, dict) and "outcome" in ticket:
+        return {k: v for k, v in ticket.items() if k != "outcome"}
     return ticket
 
 
@@ -19846,9 +19897,15 @@ class SessionManager:
                 branch=ticket["branch"])
         # Gated on the KEY, not the branch (which stays None until a deferred
         # reservation fills it), and only for a runtime given the session CLI.
+        # An ADOPTED block is refused by the close-ticket reader, so it is taught
+        # the tracker tool instead of the CLI.
         if ticket.get("key") and sess.get("agentType") not in ("dsh", "qwen"):
-            policy += TICKET_CLOSE_PROMPT.format(
-                key=ticket["key"], stale=TICKET_CLOSE_STALE_CLAUSE)
+            served = _served_ticket(sess) or {}
+            if served.get("adopted"):
+                policy += TICKET_CLOSE_ADOPTED_PROMPT.format(key=ticket["key"])
+            else:
+                policy += TICKET_CLOSE_PROMPT.format(
+                    key=ticket["key"], stale=TICKET_CLOSE_STALE_CLAUSE)
         policy += PR_SUMMARY_SYSTEM_PROMPT
         policy += PEERS_SYSTEM_PROMPT.format(
             path=PEERS_FILE, sid=sess["id"], host=self.device)
@@ -22432,6 +22489,8 @@ class SessionManager:
             # Normally the worktree persists (kill keeps it), so this is skipped.
             if not sess.get("root") and not os.path.isdir(sess["worktreePath"]):
                 self._worktree_add(sess, base_ref=sess.get("baseRef"))
+            if sess.get("ticket") is not None:
+                sess["ticket"] = _reopened_ticket(sess["ticket"])
             self._launch_tmux(sess, resume=True)
             self._launch_ttyd(sess)
             sess["status"] = "running"
@@ -22471,7 +22530,8 @@ class SessionManager:
             # The ticket (and its reserved branch name) survives a kill/resume:
             # it's what this session IS, and _launch_tmux re-tells the agent the
             # same branch name rather than reserving a fresh one.
-            "ticket": _served_ticket(rec),     # folds an older ticketAdopted in
+            # Folds an older ticketAdopted in; a close it made is history now.
+            "ticket": _reopened_ticket(_served_ticket(rec)),
             # The conversation this session was having, so _launch_tmux rejoins
             # THAT one. Root sessions share a project dir, so "the newest
             # transcript here" is not the same question as "this session's".
@@ -25308,17 +25368,18 @@ class SessionManager:
                 log(f"close-ticket pass failed: {e}")
 
     def _process_close_ticket_requests(self, now=None):
-        """One pass, OFF THE BEAT: every RUNNING Claude session with a ticket that
-        has a close-ticket.json gets its request tried. dsh/qwen sessions are left
-        alone — they are not given the CLI (agent-session-cli.md). Reads the
+        """One pass, OFF THE BEAT: every RUNNING Claude session that has a
+        close-ticket.json gets its request tried. One with no ticket (a bare
+        session, or one not yet adopted) is REFUSED, not skipped: the CLI told it
+        the manager would say so if it could not close the ticket, so silence
+        would leave it believing the close is under way. dsh/qwen sessions are
+        left alone — they are not given the CLI (agent-session-cli.md). Reads the
         registry as a snapshot, as the PR-comment fetch does; writes nothing to
         it."""
         now = time.time() if now is None else now
         pending = set()
         for sess in list(self.registry):
-            ticket = sess.get("ticket")
-            if (sess.get("status") != "running" or not isinstance(ticket, dict)
-                    or not ticket.get("key")
+            if (sess.get("status") != "running"
                     or sess.get("agentType") in ("dsh", "qwen")):
                 continue
             req = read_close_ticket_request(sess.get("id"))
@@ -25327,7 +25388,9 @@ class SessionManager:
             pending.add(sess["id"])
             # The SERVED block, so a record adopted before the block carried
             # `adopted` (only `ticketAdopted`) is refused like any other.
-            self._close_ticket_try(sess["id"], _served_ticket(sess), req, now)
+            ticket = _served_ticket(sess)
+            self._close_ticket_try(sess["id"], ticket if isinstance(ticket, dict) else {},
+                                   req, now)
         for sid in list(self._close_ticket_tries):
             if sid not in pending:
                 self._close_ticket_tries.pop(sid, None)
@@ -25337,7 +25400,7 @@ class SessionManager:
         A request is tried at most CLOSE_TICKET_ATTEMPTS times (one bounded retry
         CLOSE_TICKET_RETRY_SEC later); a comment that landed is not re-posted by
         the retry. Every outcome is staged; a final one also drops the file."""
-        key = ticket["key"]
+        key = ticket.get("key") or None
         ident = tuple(req.get(k) for k in ("kind", "note", "requestedAt", "error"))
         st = self._close_ticket_tries.get(sid)
         if st is None or st["req"] != ident:
@@ -25357,7 +25420,7 @@ class SessionManager:
                     "ok": error is None, "error": error and error[:300],
                     "final": final, "status": status, "at": int(now * 1000)})
 
-        refusal = req.get("error")
+        refusal = "this session has no ticket" if not key else req.get("error")
         if refusal is None and not valid_issue_key(key):
             refusal = "the session's ticket key is not a valid issue key"
         if refusal is None and not board_configured():
@@ -32643,6 +32706,12 @@ class SessionManager:
             # read as 'this host can't serve a live full trajectory' and fall back
             # to the DEGRADED rendered view, never assuming full.
             "trajectory": self._trajectory_payload(),
+            # Whether this manager READS a session's close-ticket request
+            # (XERK-1569). The hub names the session CLI's close-ticket in its
+            # auto-close message only for a host reporting it: an agent that
+            # predates the reader would accept the request and never act on it.
+            # Absent is coerced to "can't" hub-side (normalizeCloseTicket).
+            "closeTicket": {"available": True},
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),

@@ -95,8 +95,11 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   snapshot and writes nothing to it. The beat's `_apply_closed_tickets` drains `_close_ticket_landed`
   (rebound under `_close_ticket_lock`), stamps `ticket.outcome` (REBINDS the ticket dict, which the
   worker reads) + the ledger, `save()`s, and stages `ticket_outcome_results`. The PR-comment split.
-- **Served only for a RUNNING session with `ticket.key`, NOT dsh/qwen** (no CLI there), on this
-  host's board. The tracker half (comment, Done mapping, `ticket.outcome`): `agent-board.md`.
+- **Served only for a RUNNING session, NOT dsh/qwen** (no CLI there), on this host's board. The
+  tracker half (comment, Done mapping, `ticket.outcome`): `agent-board.md`.
+- **A request from a session with NO ticket key is REFUSED, never skipped** ("this session has no
+  ticket"): the CLI promised a message if the manager cannot close it, so silence would leave a
+  bare or not-yet-adopted session believing the close is under way. The file is consumed.
 - `read_close_ticket_request`: `_read_untrusted_json` (None = no request: missing/FIFO/symlink/
   oversize); a parsed file breaking the contract (resolution outside `CLOSE_TICKET_KINDS`, note
   empty/non-string/over `CLOSE_TICKET_NOTE_MAX`) is `{error}` → staged `refused: …` and dropped.
@@ -118,13 +121,18 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   block came from the session's own branch name (`_maybe_adopt_ticket`), so any collected ticket is
   one branch away, and its close gets every session on it killed org-wide by the hub's auto-stop.
   The XERK-1440 provenance reason. The refusal reaches the session, which uses its tracker tool.
+  So `_session_directive` teaches an adopted block `TICKET_CLOSE_ADOPTED_PROMPT` (tracker tool
+  only), never the CLI the reader then refuses.
 - **A session killed before the beat applies a success** has its newest `self.closed` record (and
   its ledger entry) stamped instead, so the board still says why the ticket closed.
 - **Taught by three directives**, each "session CLI first, the host's tracker CLI/MCP else":
   `TICKET_CLOSE_STALE_CLAUSE` (bug prompt + `TICKET_CLOSE_PROMPT` in `_session_directive`) and the
   hub's `autoCloseMergedMessage`. All spell `"$TURMA_SESSION_CLI"` — see the open question below.
   Each is gated on runtime: a dsh/qwen session gets tracker-tool wording only (`session_cli=False`
-  agent-side; `autoCloseMergedMessage(urls, s.agentType)` hub-side).
+  agent-side; `autoCloseMergedMessage(urls, s.agentType, cli)` hub-side).
+- **The hub names the CLI only for a host reporting `closeTicket: {available: true}`** (heartbeat
+  capability, `normalizeCloseTicket`). The hub deploys on merge, agents update later: an agent with
+  the XERK-1564 CLI but no reader would accept the request and never act. Absent = tracker wording.
 - Tests: `TestCloseTicketRequest`, `TestTicketClosingDirectives`; hub `XERK-1569` cases.
 
 ## Real-host spike (not yet run)

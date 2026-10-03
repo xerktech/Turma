@@ -17605,6 +17605,36 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         self.assertEqual(ha._close_ticket_option(self.OPTS + odd, "not-reproducible")["id"], "31")
         self.assertIsNone(ha._close_ticket_option(self.OPTS[:1], "done"))
 
+    def test_finished_work_never_closes_into_a_negative_status_listed_first(self):
+        # A board listing "Cannot Reproduce" / "Won't Do" AHEAD of Done: a
+        # `done`/`already-fixed` close must still land on Done, never on the
+        # first Done-column option.
+        opts = [self.OPTS[0],
+                {"id": "41", "name": "Cannot Reproduce", "category": "done"},
+                {"id": "42", "name": "Won't Do", "category": "done"},
+                {"id": "43", "name": "Duplicate", "category": "done"},
+                {"id": "31", "name": "Done", "category": "done"}]
+        for kind in ("done", "already-fixed"):
+            with self.subTest(kind=kind):
+                self.assertEqual(ha._close_ticket_option(opts, kind)["id"], "31")
+        self.assertEqual(ha._close_ticket_option(opts, "not-reproducible")["id"], "41")
+        # A plainly-named Done is preferred over another neutral name...
+        opts2 = [self.OPTS[0], {"id": "5", "name": "Shipped", "category": "done"},
+                 {"id": "6", "name": "Closed", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts2, "done")["id"], "6")
+        # ...a neutral name still beats a negative one...
+        opts3 = [self.OPTS[0], {"id": "41", "name": "Cannot Reproduce", "category": "done"},
+                 {"id": "5", "name": "Shipped", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts3, "already-fixed")["id"], "5")
+        # ...and only a board offering nothing else falls back to the first.
+        opts4 = [self.OPTS[0], {"id": "42", "name": "Won't Do", "category": "done"},
+                 {"id": "41", "name": "Cannot Reproduce", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts4, "done")["id"], "42")
+        # not-reproducible with no named status falls back to a plain Done too.
+        opts5 = [self.OPTS[0], {"id": "42", "name": "Won't Do", "category": "done"},
+                 {"id": "31", "name": "Done", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts5, "not-reproducible")["id"], "31")
+
     def test_bad_requests_are_refused_without_tracker_http(self):
         for bad in ({"resolution": "wontfix", "note": "n"},
                     {"resolution": "done", "note": "   "},
@@ -17764,9 +17794,8 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
             sm._apply_closed_tickets()                 # logged, never raised
         self.assertFalse(sm.ticket_outcome_results[0]["ok"])
 
-    def test_only_a_running_claude_session_with_a_ticket_is_served(self):
-        for over in ({"agentType": "dsh"}, {"agentType": "qwen"}, {"status": "stopped"},
-                     {"ticket": None}, {"ticket": {"key": ""}}):
+    def test_only_a_running_claude_session_is_served(self):
+        for over in ({"agentType": "dsh"}, {"agentType": "qwen"}, {"status": "stopped"}):
             with self.subTest(over=over):
                 sm = self.make_manager()
                 self._sess(sm, **over)
@@ -17774,6 +17803,61 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
                 sm._process_close_ticket_requests(now=1000.0)
                 self.assertEqual(self.calls, [])
                 self.assertTrue(os.path.exists(self._path()))    # untouched
+
+    def test_a_session_with_no_ticket_is_refused_and_told(self):
+        # The CLI promises the manager will say so when it cannot close the
+        # ticket; a bare (or not-yet-adopted) session must hear it, not silence.
+        for over in ({"ticket": None}, {"ticket": {"key": ""}}, {"ticket": "junk"}):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                sess = self._sess(sm, **over)
+                self.calls.clear()
+                self.notified.clear()
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])                 # no tracker HTTP
+                self.assertFalse(os.path.exists(self._path()))  # consumed
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertEqual((r["ok"], r["final"], r["key"]), (False, True, None))
+                self.assertIn("this session has no ticket", r["error"])
+                [(sid, text)] = self.notified
+                self.assertEqual(sid, self.SID)
+                self.assertIn("could NOT close a ticket", text)
+                self.assertNotIn("None", text)
+                self.assertEqual(sess.get("ticket"), over["ticket"])  # untouched
+
+    def test_start_and_resume_forget_a_close_the_session_made(self):
+        # The operator reopening the ticket and bringing the session back means
+        # the board must stop saying the session closed it.
+        sm = self.make_manager()
+        outcome = {"kind": "not-reproducible", "at": 1}
+        sess = self._sess(sm, status="error", ttydPort=7701)
+        sess["ticket"]["outcome"] = outcome
+        with mock.patch.object(sm, "_launch_tmux") as launch, \
+                mock.patch.object(sm, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm.start(self.SID)
+        launch.assert_called_once()
+        self.assertEqual(sess["status"], "running")
+        self.assertNotIn("outcome", sess["ticket"])
+        self.assertEqual(sess["ticket"]["key"], self.KEY)
+        # resume() from the closed history drops it too.
+        sm2 = self.make_manager()
+        closed = dict(self._sess(sm2), status="stopped")
+        closed["ticket"] = {**closed["ticket"], "outcome": outcome}
+        sm2.registry = []
+        sm2.closed = [closed]
+        with mock.patch.object(sm2, "_launch_tmux"), \
+                mock.patch.object(sm2, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm2.resume(self.SID)
+        [back] = [s for s in sm2.registry if s["id"] == self.SID]
+        self.assertNotIn("outcome", back["ticket"])
+        self.assertEqual(back["ticket"]["key"], self.KEY)
+        self.assertEqual(ha._reopened_ticket(None), None)
+        t = {"key": "K-1"}
+        self.assertIs(ha._reopened_ticket(t), t)
 
     def test_a_ticket_from_another_board_is_refused(self):
         sm = self.make_manager()
@@ -17799,6 +17883,8 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         stage.assert_called_once()
         self.assertEqual(self.calls, [])
         self.assertNotIn("ticketOutcomeResults", payload)
+        # The capability the hub gates its close-ticket wording on.
+        self.assertEqual(payload["closeTicket"], {"available": True})
         with mock.patch.object(sm, "_stage_close_ticket_work") as stage:
             sm.build_payload(2, light=True)
         stage.assert_not_called()                 # a light beat does not
@@ -17933,6 +18019,18 @@ class TestTicketClosingDirectives(ManagerMixin, unittest.TestCase):
         self.assertIn(self.CLI + " not-reproducible --note", d)
         self.assertIn(self.CLI + " done --note", d)
         self.assertNotIn("Name the branch you create", d)
+
+    def test_an_adopted_ticket_is_taught_the_tracker_tool_not_the_cli(self):
+        # The close-ticket reader refuses an adopted block, so the directive must
+        # not teach a CLI the manager then refuses.
+        sm = self.make_manager()
+        for sess in ({"id": "s1", "ticket": {"key": "P-7", "adopted": True}},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "ticketAdopted": True}):
+            with self.subTest(sess=sess):
+                d = sm._session_directive(sess)
+                self.assertNotIn("TURMA_SESSION_CLI", d)
+                self.assertIn("Ticket P-7 was linked to this session", d)
+                self.assertIn("tracker CLI/MCP this host gives you", d)
 
     def test_no_ticket_or_a_dsh_qwen_session_gets_no_close_paragraph(self):
         sm = self.make_manager()

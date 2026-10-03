@@ -6820,6 +6820,23 @@ function normalizeTrajectory(payload) {
   payload.trajectory = { available: t.available === true };
 }
 
+// The close-ticket (XERK-1569) capability block: whether this host's manager
+// READS a session's close-ticket request. The hub deploys on merge but agents
+// self-update later, and an agent carrying the session CLI but predating the
+// reader would accept the request, tell the session "the manager will act on
+// it", and never act — so the auto-close message names the CLI only for a host
+// that reports this. Coerced like normalizeTrajectory: strictly boolean,
+// unusable becomes NULL, ABSENT stays absent ("this host can't").
+function normalizeCloseTicket(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.closeTicket;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("closeTicket" in payload) payload.closeTicket = null;
+    return;
+  }
+  payload.closeTicket = { available: t.available === true };
+}
+
 // This host's EFFECTIVE default runtime for an unpinned spawn (XERK-521), coerced
 // at ingest exactly like normalizeQwen/normalizeDsh and for the same reason: it
 // is agent-supplied, a client may TYPE it, and `/api/agents` decodes atomically
@@ -8182,7 +8199,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "qwen", "triage", "trajectory", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "triage", "trajectory", "closeTicket", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
@@ -8577,6 +8594,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeQwen(a);
   normalizeTriage(a);
   normalizeTrajectory(a);
+  normalizeCloseTicket(a);
   normalizeDefaultRuntime(a);
   normalizeHostOs(a);
   normalizeTokenRoll(a);
@@ -13575,11 +13593,13 @@ registerGuardMirror("autoCloseNotified", {
 // URL-charset-only string is interpolated: an oversize one would push the text past
 // the agent's input cap (send_input refuses the WHOLE message, so the session would
 // never hear its PR merged), and a looser shape lets arbitrary text into the pane.
-// The close step names the session CLI only to a CLAUDE session: a dsh/qwen
-// session is not given $TURMA_SESSION_CLI (agent-session-cli.md), so it is sent
-// straight to the host's own tracker tool (XERK-1569).
+// The close step names the session CLI only to a CLAUDE session on a host whose
+// manager reports it READS the request (`closeTicket.available`, XERK-1569): a
+// dsh/qwen session is not given $TURMA_SESSION_CLI (agent-session-cli.md), and an
+// agent that predates the reader would accept the request and never act on it.
+// Either way the session is sent straight to the host's own tracker tool.
 const AUTO_CLOSE_URL_RE = /^https?:\/\/[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]{1,300}$/;
-function autoCloseMergedMessage(urls, agentType) {
+function autoCloseMergedMessage(urls, agentType, closeTicketCli) {
   const named = (urls || []).filter((u) => typeof u === "string" && AUTO_CLOSE_URL_RE.test(u));
   const which = named.length === 1 ? "PR " + named[0] + " has"
     : named.length ? "PRs " + named.join(", ") + " have" : "PR has";
@@ -13592,7 +13612,7 @@ function autoCloseMergedMessage(urls, agentType) {
     + "will be auto-merged the same way and you will be asked to verify again. "
     + "If it IS deployed and working and all the work for this ticket is done, "
     + "mark the ticket as Done so this session can wrap up — "
-    + (agentType === "dsh" || agentType === "qwen"
+    + (closeTicketCli !== true || agentType === "dsh" || agentType === "qwen"
       ? "comment what you verified on the ticket and close it with the tracker "
         + "CLI/MCP this host gives you."
       : "prefer `python3 -SsE \"$TURMA_SESSION_CLI\" close-ticket done --note "
@@ -13841,7 +13861,8 @@ function autoCloseSweep() {
       const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
       if (fresh) {
         const newly = seen ? mergedUrls.filter((u) => !seen.has(u)) : mergedUrls;
-        queueCommand(host, { type: "input", sessionId: s.id, text: autoCloseMergedMessage(newly, s.agentType) });
+        queueCommand(host, { type: "input", sessionId: s.id,
+          text: autoCloseMergedMessage(newly, s.agentType, !!(a.closeTicket && a.closeTicket.available === true)) });
         const at = Date.now();
         autoCloseNotified.set(nk, { at, urls: new Set(mergedUrls) });
         guardStoreSet("autoCloseNotified", nk, { at, urls: [...mergedUrls] });
@@ -19874,6 +19895,8 @@ if (process.env.TURMA_TEST) {
     normalizeQwen,
     normalizeTriage,
     normalizeTrajectory,
+    normalizeCloseTicket,
+    autoCloseMergedMessage,
     ingestTrajectoryTails,
     liveSessionForTranscript,
     normalizeDefaultRuntime,
