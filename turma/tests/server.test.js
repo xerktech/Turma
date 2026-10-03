@@ -12307,6 +12307,36 @@ test("XERK-725: epic-builder route validates input, idea length, org and repo", 
   assert.equal(Object.keys(epicBuilders).length, 0);
 });
 
+// XERK-1497: a host bound to another org that merely DECLARES this one is not
+// in its pool — not as an epic-builder target (route or sweep), not as a
+// tracker-write host, and not as the org's tracker-source authority.
+test("XERK-1497: a drifted host is no epic-builder target, tracker writer or source authority", async () => {
+  resetEpicBuilders();
+  const C = "eb1497c.atlassian.net", D = "eb1497d.atlassian.net";
+  await builderBeat("eb1497drift", C);
+  await request("POST", "/api/heartbeat", {
+    body: { device: "eb1497drift", repos: [{ name: "Turma", path: "/git/Turma" }],
+      jira: { available: true, configured: true, siteKey: D, source: "azure",
+        user: "eb1497drift@x.com", fetchedAt: "2026-07-14T12:00:00Z", tickets: [] } },
+    headers: agentHeaders,
+  });
+  await builderBeat("eb1497legit", D);
+  assert.equal(agents.eb1497drift.orgBound, C);
+  // The route refuses the drifted host as a target.
+  const r = await request("POST", `/api/jira/${D}/epic-builder`,
+    { body: { title: "T", idea: "go", targetHost: "eb1497drift" }, headers: userHeaders });
+  assert.equal(r.status, 404);
+  // A run pinned to it (armed before it drifted, say) HOLDS rather than dispatch.
+  armEpicBuilder(D, { title: "T", idea: "go", repo: "Turma", targetHost: "eb1497drift" });
+  epicBuilderDriveSweep();
+  assert.equal((agents.eb1497drift.commands || [])
+    .filter((c) => c.type === "spawnEpicBuilder").length, 0);
+  // Tracker writes and the source lookup see only the legit host.
+  assert.deepEqual(hub.jiraHostPool(D, false), ["eb1497legit"]);
+  assert.equal(hub.orgBoardSource(D), "jira");
+  resetEpicBuilders();
+});
+
 test("XERK-726: the route accepts a LISTED-but-uncloned repo (clone-on-demand), not just on-disk ones", async () => {
   // The board composer offers uncloned repos (flagged "(not cloned)") off the
   // org's jira.repoOptions, exactly as the manual Start/repo pickers do, and

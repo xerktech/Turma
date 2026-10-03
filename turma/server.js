@@ -12881,11 +12881,13 @@ function orgsWithPriorityWriteBack() {
 
 // Which tracker source a siteKey is polled from: the first reporting host
 // whose jira block names it. An org is only ever served by one source type;
-// "jira" is the safe default for an unknown source.
+// "jira" is the safe default for an unknown source. Only a host IN the org
+// (`hostInOrg`, XERK-1497) answers: a drifted host declaring another org's key
+// with the wrong source would otherwise misroute that org's tracker writes.
 function orgBoardSource(siteKey) {
   for (const a of Object.values(agents)) {
     const j = a && a.jira;
-    if (j && j.siteKey === siteKey && (j.source === "jira" || j.source === "azure"))
+    if (hostInOrg(a, siteKey) && (j.source === "jira" || j.source === "azure"))
       return j.source;
   }
   return "jira";
@@ -19908,6 +19910,8 @@ if (process.env.TURMA_TEST) {
     orgOffersQwen,
     findTicketHost,
     hostInOrg,
+    jiraHostPool,
+    orgBoardSource,
     spawnTicketInFlight,
     hostHasFreeSlot,
     // XERK-544/548 auto-start pause on a maxed subscription (7-day pace line OR
