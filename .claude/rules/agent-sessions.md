@@ -169,6 +169,13 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   session dies. Reading that as "can't tell" left exactly the session this sweep exists for reading
   `running` forever, and `resume_on_boot` does NOT cover it (it runs only at manager START). Only
   tmux's two explicit wordings (`no server running`, `error connecting to`) mean empty.
+- **Except from a LIVE server whose socket file was deleted** (XERK-1259; a /tmp cleaner, a session
+  removing `$TMUX_TMPDIR`) — its client prints the same words. `_orphaned_tmux_server` checks
+  `/proc/net/unix` for a listener still bound to that path (the kernel keeps the name after unlink);
+  if one exists the listing is "can't tell" (no strike) and the server gets `SIGUSR1`, which makes
+  tmux recreate its socket. Never read that stderr as empty without the listener check, or every
+  session on the server is reaped while its agents keep running unmanaged. No `/proc` = old reading.
+  Tests: `test_a_live_server_whose_socket_was_deleted_is_not_swept_and_is_repaired`.
 - Otherwise conservative by construction, because a false positive ENDS a live session: every OTHER
   nonzero rc, and a failure to launch tmux at all, is **"can't tell"**; a `queued` record has no
   tmux by design; and a name must be missing `DEAD_TMUX_STRIKES` CONSECUTIVE beats, since the
