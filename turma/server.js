@@ -11624,13 +11624,27 @@ function orgsWithAutoStart() {
 // (a.closedSessions), or a repo's resumable scan (a.repos[].resumable) carries a
 // session whose `ticket` names it. Keyed "<siteKey>\x00<key>" like the routing
 // helpers, so a lookup is a plain Set membership test.
+//
+// A host's session counts only for a ticket of an org that host is BOUND to or
+// currently CLAIMS (XERK-1492). `ticket.siteKey` is agent-asserted, so without
+// this a host of org A naming org B's ticket marked it started and withheld B's
+// auto-start and epic-run dispatch indefinitely. The claimed org stays in on
+// purpose: findTicketHost routes on the CLAIMED `jira.siteKey`, so a drifted
+// host (bound A, declaring B) is handed B's tickets — dropping its sessions here
+// made the sweep re-dispatch the same ticket to it after every backoff. A false
+// "started" only withholds a start; a missed one starts a second session.
 function startedTicketKeys() {
   const keys = new Set();
-  const add = (s) => {
-    const t = s && s.ticket;
-    if (t && t.key) keys.add((t.siteKey || "") + "\x00" + t.key);
-  };
   for (const a of Object.values(agents)) {
+    const bound = boundOrgOf(a), claimed = siteKeyOf(a);
+    if (!bound && !claimed) continue;
+    const add = (s) => {
+      const t = s && s.ticket;
+      const org = t && typeof t.siteKey === "string" ? t.siteKey : "";
+      if (t && t.key && org && (org === bound || org === claimed)) {
+        keys.add(org + "\x00" + t.key);
+      }
+    };
     for (const s of a.sessions || []) add(s);
     for (const c of a.closedSessions || []) add(c);
     for (const r of a.repos || []) for (const t of r.resumable || []) add(t);
