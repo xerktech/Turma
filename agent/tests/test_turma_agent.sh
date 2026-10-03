@@ -23,6 +23,13 @@ HERE="$(cd "$(dirname "$0")" && pwd)"
 NATIVE_DIR="$(dirname "$HERE")/native"
 WORK="$(mktemp -d)"
 FAILED=0
+# The helpers below pkill/pgrep -f on "$WORK/…" unescaped, which is a REGEX: a
+# TMPDIR with regex metacharacters (or spaces) makes them miss, leaking managers
+# between cases. Refuse up front rather than fail confusingly.
+if printf '%s' "$WORK" | grep -q '[][\\*^$+?(){}| ]'; then
+  echo "test_turma_agent.sh: TMPDIR yields a work dir with regex metacharacters: $WORK" >&2
+  rm -rf "$WORK"; exit 2
+fi
 
 # shellcheck disable=SC2329  # invoked indirectly, via the EXIT trap below.
 cleanup() {
@@ -58,8 +65,16 @@ chmod +x "$WORK/stub-bin/node"
 # Stands in for the session manager. Reports the pid the launcher named against
 # its own — \`exec\` means they must be the same process — and where claude
 # resolves on the PATH the manager inherited (what every session launch uses).
+# It ends by exec'ing a REAL python as \`python3 $PREFIX/hub-agent.py\` (argv0
+# overridable via STUB_ARGV0), so its argv is the real manager's exactly — the launcher's duplicate-manager guard matches
+# that whole argv (XERK-1552), and a /bin/sh stub's argv would never match it.
+REAL_PYTHON3="$(command -v python3)"
+cat > "$PREFIX/hub-agent.py" <<'STUB'
+import time
+time.sleep(30)
+STUB
 cat > "$WORK/stub-bin/python3" <<STUB
-#!/bin/sh
+#!/usr/bin/env bash
 echo "named=\${TURMA_MANAGER_PID:-unset} actual=\$\$" > "$WORK/manager.log"
 echo "claude=\$(command -v claude || echo missing)" >> "$WORK/manager.log"
 # Whether the start-time Claude Code check had FINISHED before the manager
@@ -67,7 +82,7 @@ echo "claude=\$(command -v claude || echo missing)" >> "$WORK/manager.log"
 # being replaced claude is absent from PATH, and the manager is what launches
 # sessions into it.
 echo "claudecheck=\$([ -f "$WORK/claude-done" ] && echo done || echo unfinished)" >> "$WORK/manager.log"
-sleep 30
+exec -a "\${STUB_ARGV0:-python3}" "$REAL_PYTHON3" "\$@"
 STUB
 chmod +x "$WORK/stub-bin/python3"
 
@@ -588,6 +603,29 @@ for args in "--help" "-h" "--bogus" "start" "--preflight extra"; do
 done
 kill "$LIVE_SUP" 2>/dev/null || true
 
+# --- Case 15b (XERK-1552): a process merely MENTIONING the path is no manager --
+# The guard once substring-matched any argv containing $PREFIX/hub-agent.py, so
+# an operator's grep/tail loop (or a session's Bash command) mentioning the path
+# made an auto-update's restart refuse, leaving the host stopped. Only the real
+# manager's exact argv may count.
+echo "case: a decoy argv mentioning hub-agent.py does not block a start"
+reset_agents
+rm -f "$WORK/manager.log"
+setsid bash -c "sleep 30; : $PREFIX/hub-agent.py" >/dev/null 2>&1 &
+DECOY=$!
+# A real python whose argv is the manager's plus an argument — the shape of a
+# concurrent \`hub-agent.py --enroll\` probe.
+setsid bash -c "exec -a python3 \"$REAL_PYTHON3\" \"$PREFIX/hub-agent.py\" --enroll" \
+  >/dev/null 2>&1 &
+DECOY2=$!
+PATH="$WORK/stub-bin:$PATH" setsid "$PREFIX/bin/turma-agent" >"$WORK/run-decoy.log" 2>&1 &
+if wait_for file_has_content "$WORK/manager.log"; then
+  ok "started a manager despite decoy processes mentioning the path"
+else
+  fail "a decoy blocked the start: $(cat "$WORK/run-decoy.log")"
+fi
+kill "$DECOY" "$DECOY2" 2>/dev/null || true
+
 # --- Case 16 (XERK-938): a hand re-run is refused while a manager is live -----
 # No-args is the legit systemd/turma-agentctl entry point, so it can't be
 # rejected like an unknown arg (XERK-937). But run BY HAND while a manager for
@@ -631,6 +669,56 @@ if [ "$n" = "1" ]; then
 else
   fail "expected 1 supervisor after a refused launch, found $n"
 fi
+
+# --- Case 16b (XERK-1552): a full-path, versioned interpreter is still a manager --
+# A pyenv-style shim re-execs \`/…/python3.12 $PREFIX/hub-agent.py\`. The exact
+# match must still see that manager, or a hand re-run starts a second one.
+echo "case: a manager under a full-path versioned interpreter still blocks a re-run"
+reset_agents
+rm -f "$WORK/manager.log"
+STUB_ARGV0=/opt/py/bin/python3.12 PATH="$WORK/stub-bin:$PATH" setsid \
+  "$PREFIX/bin/turma-agent" >"$WORK/run-ver.log" 2>&1 &
+if ! wait_for file_has_content "$WORK/manager.log"; then
+  fail "versioned-interpreter manager never started: $(cat "$WORK/run-ver.log")"
+fi
+rm -f "$WORK/manager.log"
+rc=0
+PATH="$WORK/stub-bin:$PATH" "$PREFIX/bin/turma-agent" >"$WORK/run-ver2.log" 2>&1 || rc=$?
+if [ "$rc" != 0 ] && [ ! -f "$WORK/manager.log" ]; then
+  ok "refused a re-run beside a /…/python3.12 manager (rc=$rc)"
+else
+  fail "a /…/python3.12 manager went unseen (rc=$rc): $(cat "$WORK/run-ver2.log")"
+fi
+reset_agents
+
+# --- Case 16c (XERK-1552): $PREFIX is regex-escaped in the match ---------------
+# Evaluates the launcher's own manager_re line against real processes: a prefix
+# full of regex metacharacters must match its own manager and nothing that only
+# matches it as an unescaped pattern.
+echo "case: the manager match escapes regex metacharacters in the prefix"
+re_line="$(grep '^manager_re=' "$PREFIX/bin/turma-agent")"
+odd="$WORK/odd/a.b+c[x](y){1}|z?*^\$"
+mkdir -p "$odd"
+cp "$PREFIX/hub-agent.py" "$odd/hub-agent.py"
+near="$WORK/odd/aXbbc"  # matched by the UNESCAPED "a.b+c" prefix
+mkdir -p "$near"
+cp "$PREFIX/hub-agent.py" "$near/hub-agent.py"
+# The odd-prefix manager also runs as a free-threaded argv0 with an interpreter
+# flag, pinning the loose interpreter match (a python3 wrapper adding -I).
+setsid bash -c "exec -a python3.13t \"$REAL_PYTHON3\" -I \"$odd/hub-agent.py\"" >/dev/null 2>&1 &
+ODD=$!
+setsid bash -c "exec -a python3 \"$REAL_PYTHON3\" \"$near/hub-agent.py\"" >/dev/null 2>&1 &
+NEAR=$!
+sleep 0.3
+manager_re=""
+eval "${re_line//\$PREFIX/\$odd}"  # the launcher's line, evaluated for $odd
+got="$(pgrep -xf "$manager_re" | tr '\n' ' ')"
+if [ "$got" = "$ODD " ]; then
+  ok "matched exactly the odd-prefix python3.13t -I manager"
+else
+  fail "odd-prefix match returned '$got', expected '$ODD '"
+fi
+kill "$ODD" "$NEAR" 2>/dev/null || true
 
 # --- Case 17 (XERK-938): the opt-out env allows a deliberate second manager ---
 echo "case: TURMA_ALLOW_SECOND_MANAGER=1 overrides the guard"
