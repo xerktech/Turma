@@ -31,6 +31,23 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   into; invisible to `_busy_from_capture`/`_pane_prompt`), then expires and drops the message
   (verified on a real pane). Sits on `--settings` so it scopes to this agent's sessions only; a
   project's own settings can still say `refuse`, which outranks it.
+- **The same file carries FLEET FLOORS** (XERK-1565), which MERGE with the operator's own settings
+  (lists merge across scopes; `--settings` sits above project settings), never replace them:
+  - `sandbox.network.allowedDomains` = `SANDBOX_DOMAIN_FLOOR`; `TURMA_SANDBOX_DOMAINS` (CSV)
+    REPLACES it when non-blank.
+  - `permissions.allow` gains `TOOL_ALLOW_FLOOR` (narrow `Bash(<cmd>:*)` branch/PR/test rules, which
+    skip auto mode's classifier) after `_GUARD_ALLOW_PATH_RULES`, before the operator's;
+    `TURMA_TOOL_ALLOW` (CSV) REPLACES it. The guard hook still runs first, so a force push or a
+    push to `main` stays denied. Not `TURMA_TOOL_GRANTS`, which is a hook-time destructive exemption
+    and never written here.
+  - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
+    repos (capped), `GH_CLONE_OWNERS`, tracker org/site, `TURMA_URL` minus userinfo, the worktree/PR/
+    default-branch facts. The operator file keeps the org-wide block.
+  - dsh/qwen read only `permissions`, and only its `Read()`/`Edit()` rules, so none of this leaks
+    there. `_ensure_guard_settings` writes tmp + `os.replace` (no half file for a reader).
+  - Real-host spike (sandboxed floor vs off-floor domain, merged environment, push + `gh pr create`
+    unprompted) NOT yet run — record the answers here. Tests: `TestFleetPolicy`,
+    `TestEnsureGuardSettingsWrite`.
 - **`~/.claude` is guarded by `hooks/fileguard.py`, not a pattern**: the rule is "everything under it
   except the two agent-memory trees," which a glob list can't express — deny beats allow, and a deny
   matching a DIRECTORY takes its whole subtree, so `Edit(~/.claude/*)` is the blanket rule. Patterns

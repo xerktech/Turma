@@ -4586,8 +4586,102 @@ QWEN_QUESTION_BLOCK_TIMEOUT_SEC = 600
 QWEN_NATIVE_ASK_TOOL = "ask_user_question"
 
 
+# Fleet policy floors (XERK-1565). Claude Code MERGES `permissions.allow` and
+# `sandbox.network.allowedDomains` across settings scopes, and `--settings` sits
+# above project settings, so these reach every session on every host without
+# touching the operator's own settings file — they ADD to it, never replace it.
+#
+# The sandbox prompts for every domain outside `allowedDomains`; these are the
+# ones routine fleet work (clone, push, install, build, the tracker) reaches.
+# `TURMA_SANDBOX_DOMAINS` (CSV) REPLACES the list when set non-blank.
+SANDBOX_DOMAIN_FLOOR = (
+    "github.com", "*.github.com", "*.githubusercontent.com", "ghcr.io",
+    "registry.npmjs.org", "*.npmjs.org", "pypi.org", "files.pythonhosted.org",
+    "*.atlassian.net", "api.atlassian.com",
+    "docker.io", "*.docker.io", "*.docker.com", "quay.io", "*.quay.io",
+    "*.googleapis.com", "dl.google.com", "maven.google.com",
+    "*.gradle.org", "repo.maven.apache.org", "repo1.maven.org",
+    "proxy.golang.org", "sum.golang.org", "crates.io", "*.crates.io",
+    "deb.debian.org", "security.debian.org", "archive.ubuntu.com",
+    "security.ubuntu.com", "ports.ubuntu.com",
+    "xerktech.com", "*.xerktech.com",
+)
+# Narrow `Bash(<cmd>:*)` allow rules skip auto mode's classifier: the routine
+# branch/PR/test steps an operator would always approve. The safety guard is a
+# PreToolUse hook and runs BEFORE these, so a guard-denied form (a force push, a
+# push to a protected branch it refuses) stays denied. `TURMA_TOOL_ALLOW` (CSV)
+# REPLACES the list when set non-blank. Distinct from `TURMA_TOOL_GRANTS`, which
+# only exempts the guard's destructive category at hook run time and is never
+# written here. The session-CLI rule is XERK-1564's, not this list's.
+TOOL_ALLOW_FLOOR = (
+    "Bash(git fetch:*)", "Bash(git push origin:*)", "Bash(git push -u origin:*)",
+    "Bash(git switch:*)", "Bash(gh pr create:*)", "Bash(gh pr checks:*)",
+    "Bash(gh pr view:*)", "Bash(gh pr edit:*)", "Bash(gh run view:*)",
+    "Bash(npm test:*)", "Bash(node --test:*)", "Bash(python3 -m unittest:*)",
+    "Bash(pytest:*)", "Bash(./gradlew:*)",
+)
+# How many scanned repo names the host block lists before summarising the rest:
+# it is classifier context on every launch, not an inventory.
+AUTO_MODE_REPOS_MAX = 100
+
+
+def _csv_override(name, floor):
+    """`floor` as a list, or the non-blank CSV in env `name` that REPLACES it."""
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return list(floor)
+    out = []
+    for item in raw.split(","):
+        item = item.strip()
+        if item and item not in out:
+            out.append(item)
+    return out
+
+
+def sandbox_allowed_domains():
+    """The fleet's `sandbox.network.allowedDomains` (`TURMA_SANDBOX_DOMAINS` replaces)."""
+    return _csv_override("TURMA_SANDBOX_DOMAINS", SANDBOX_DOMAIN_FLOOR)
+
+
+def tool_allow_floor():
+    """The fleet's `permissions.allow` floor (`TURMA_TOOL_ALLOW` replaces)."""
+    return _csv_override("TURMA_TOOL_ALLOW", TOOL_ALLOW_FLOOR)
+
+
+def auto_mode_host_block(device=None, repos=None):
+    """The per-host `autoMode.environment` entry: the facts auto mode's
+    classifier needs so this host is not "unknown infrastructure" to it. The
+    operator's own settings keep the org-wide block; this one is generated per
+    host so it never goes stale against what the host actually holds.
+
+    `repos` defaults to `scan_repos()` (one listdir); `device` to `$DEVICE_NAME`
+    — the manager passes its own resolved name, since `device_name()` may probe."""
+    device = device if device is not None else os.environ.get("DEVICE_NAME", "").strip()
+    names = [r["name"] for r in (scan_repos() if repos is None else repos)]
+    shown = ", ".join(names[:AUTO_MODE_REPOS_MAX]) or "none yet"
+    if len(names) > AUTO_MODE_REPOS_MAX:
+        shown += f" (and {len(names) - AUTO_MODE_REPOS_MAX} more)"
+    owners = [o for o in re.split(r"[\s,]+", os.environ.get("GH_CLONE_OWNERS", "").strip()) if o]
+    site = board_site_key()
+    org = " / ".join(x for x in (BOARD_ORG_NAME, site) if x) or "none configured"
+    # A URL's userinfo is a credential; the block is written to a file every
+    # session can read, so only the scheme/host/path is named.
+    hub = re.sub(r"^([a-zA-Z][\w.+-]*://)[^/@]*@", r"\1", TURMA_URL)
+    worktrees = os.path.join(REPOS_ROOT, ".turma", "worktrees")
+    return (
+        f"Turma agent host {device or 'unnamed'}, which runs the operator's Claude "
+        f"Code sessions. Git repos under {REPOS_ROOT}: {shown}. "
+        f"GitHub clone owners: {', '.join(owners) or 'the gh login and its orgs'}. "
+        f"Tracker org/site: {org}. Turma hub: {hub}. "
+        f"Sessions work in detached worktrees under {worktrees}; pushing a "
+        f"non-default branch and opening a PR is routine; a push to the default "
+        f"branch is a production deploy."
+    )
+
+
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
-                         local_settings_path=None, fileguard_path=None):
+                         local_settings_path=None, fileguard_path=None,
+                         device=None, repos=None):
     """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
     Bash (the safety guard), the file-editing tools (the ~/.claude file guard)
     and AskUserQuestion (the glasses answer bridge),
@@ -4631,7 +4725,8 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
         if rule not in perms["deny"]:
             perms["deny"].append(rule)
     perms["allow"] = list(_GUARD_ALLOW_PATH_RULES)
-    for rule in allow:  # operator allow unions on top of the app's own rules
+    # The fleet floor (XERK-1565), then the operator's allow, each unioned on top.
+    for rule in tool_allow_floor() + allow:
         if rule not in perms["allow"]:
             perms["allow"].append(rule)
     pre = [{
@@ -4666,6 +4761,15 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     return {
         "permissions": perms,
         "hooks": {"PreToolUse": pre},
+        # Fleet floors (XERK-1565). Both lists MERGE with the operator's own
+        # settings rather than replacing them. `$defaults` keeps Claude Code's
+        # built-in environment; the operator file carries the org-wide block,
+        # this one the per-host facts. dsh/qwen read only `permissions` from
+        # this dict (build_dsh_guard_config / build_qwen_guard_config), and only
+        # its Read()/Edit() rules, so none of this reaches those runtimes.
+        "sandbox": {"network": {"allowedDomains": sandbox_allowed_domains()}},
+        "autoMode": {"environment": ["$defaults",
+                                     auto_mode_host_block(device, repos)]},
         # Peer messages are DELIVERED rather than held (XERK-339). Claude Code's
         # default holds one whenever the sending and receiving sessions'
         # permission-mode classes differ — and `bypassPermissions` is a class of
@@ -18718,11 +18822,22 @@ class SessionManager:
         if cached and os.path.exists(cached):
             return cached
         path = os.path.join(REGISTRY_DIR, "guard-settings.json")
+        # Written whole to a tmp, then renamed over (XERK-1565): every manager
+        # start rewrites this file while sessions an earlier manager launched
+        # still point at it, so a truncate-in-place write (or one cut short by a
+        # full disk) could hand a reader a half file — no guard, no floors.
+        tmp = f"{path}.tmp.{os.getpid()}"
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
-            with open(path, "w", encoding="utf-8") as fh:
-                json.dump(build_guard_settings(), fh, indent=2)
+            with open(tmp, "w", encoding="utf-8") as fh:
+                json.dump(build_guard_settings(device=getattr(self, "device", None)),
+                          fh, indent=2)
+            os.replace(tmp, path)
         except OSError as e:
+            try:
+                os.unlink(tmp)
+            except OSError:
+                pass
             log(f"guard settings write failed ({e}); launching without --settings")
             return None
         self._guard_settings_path = path
