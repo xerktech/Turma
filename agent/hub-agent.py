@@ -14809,10 +14809,10 @@ _AZDO_PARENT_TYPE_CACHE_MAX = 5000
 
 
 def _remember_azure_types(types):
-    if len(_AZDO_PARENT_TYPE_CACHE) + len(types) > _AZDO_PARENT_TYPE_CACHE_MAX:
+    fresh = {k: v for k, v in types.items() if isinstance(v, str)}
+    if len(_AZDO_PARENT_TYPE_CACHE.keys() | fresh.keys()) > _AZDO_PARENT_TYPE_CACHE_MAX:
         _AZDO_PARENT_TYPE_CACHE.clear()
-    _AZDO_PARENT_TYPE_CACHE.update(
-        {k: v for k, v in types.items() if isinstance(v, str)})
+    _AZDO_PARENT_TYPE_CACHE.update(fresh)
 
 
 def _azure_parent_types(parent_ids, known=None):
@@ -14829,10 +14829,12 @@ def _azure_parent_types(parent_ids, known=None):
                 types[str(wi["id"])] = (wi.get("fields") or {}).get("System.WorkItemType")
         except Exception as e:
             log(f"azure parent-type fetch failed: {e}")
-    _remember_azure_types(types)
+    # Fall back BEFORE remembering: a cap-overflow clear must not empty the
+    # fallback on the very poll that needs it.
     for k in missing:
         if types.get(k) is None and k in _AZDO_PARENT_TYPE_CACHE:
             types[k] = _AZDO_PARENT_TYPE_CACHE[k]
+    _remember_azure_types(types)
     return types
 
 

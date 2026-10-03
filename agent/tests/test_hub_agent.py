@@ -29194,6 +29194,20 @@ class TestCollectAzure(unittest.TestCase):
             by = {t["key"]: t for t in ha.collect_azure()["tickets"]}
             self.assertEqual(by["2"]["epicKey"], "100")
 
+    def test_parent_type_chunks_fail_independently_xerk1444(self):
+        # A failed 2nd chunk keeps the 1st chunk's types; and a cap-overflow clear
+        # on the failing poll still falls back to the last-known types first.
+        def batch(ids, fields):
+            if "2" in ids:
+                raise OSError("chunk 2 down")
+            return [{"id": int(i), "fields": {"System.WorkItemType": "Epic"}} for i in ids]
+        with mock.patch.object(ha, "AZDO_BATCH", 1), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE", {"2": "Feature"}), \
+             mock.patch.object(ha, "_AZDO_PARENT_TYPE_CACHE_MAX", 1), \
+             mock.patch.object(ha, "_azure_batch_get", batch):
+            types = ha._azure_parent_types([1, 2])
+        self.assertEqual(types, {"1": "Epic", "2": "Feature"})
+
     def test_project_scope_added_to_wiql(self):
         seen = {}
 
