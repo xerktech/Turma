@@ -992,8 +992,10 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
         if (org != null && (s.siteKey.isEmpty() || org != s.siteKey)) return
         // Untranscripted records can't collide (nothing to key on) and are rare:
         // a session killed before its first turn, or one an older agent wrote.
-        if (s.transcriptId.isNotBlank() && !seen.add(host + "\u0000" + s.transcriptId)) return
+        // Keyless before the dedupe, as in web: a keyless record must not take the
+        // transcript's dedupe slot from a later record that names the ticket.
         if (s.ticketKey.isBlank()) return
+        if (s.transcriptId.isNotBlank() && !seen.add(host + "\u0000" + s.transcriptId)) return
         idx.getOrPut(ticketIndexKey(s.siteKey, s.ticketKey)) { mutableListOf() }.add(s)
     }
     for (a in agents) {
