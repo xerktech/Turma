@@ -188,16 +188,18 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   15s — took beats to 100-425s on an HDD pool under NFS load, and the hub read the host offline.
   - `_cheap_read` reads inline only on first sight (key absent) and for `fresh` — the
     undelivered-work poller, which must see the dirty count as of now. Don't route the beat there.
-  - The cache's reads are `strict`: a git TIMEOUT raises `GitTimeout` (plain `run()` folds it into
-    "gone"/"clean"), and the worker and `fresh` path keep the last real answer on it. A fast
-    failure — missing cwd, broken `.git` link — is still "gone". A cached `None` is served, never
-    re-read inline.
+  - The cache's reads are `strict`: NO answer — a git TIMEOUT, or a launch failure in a dir that
+    still exists (XERK-1263) — raises `GitTimeout` (plain `run()` folds both into "gone"/"clean").
+    The worker keeps the last real answer on it. A fast failure — missing cwd, broken `.git` link —
+    is still "gone". A cached `None` is served, never re-read inline.
+  - A `fresh` read RE-RAISES `GitTimeout` instead of serving the cache: the undelivered-work poller
+    then skips the nudge decision (neither nudges nor re-arms) — an unknown dirty count is not 0.
   - Both sides write `repo_cheap`/`session_cheap`, so every write REBINDS under `_cheap_lock`
     (`_cheap_store`/`_cheap_forget`); never mutate them in place. The worker stores
     `only_if_present`, so a key pruned mid-read stays pruned. Tests: `TestCheapGitWorker`.
-- **`root_repo_entry` takes its `remote` from the slow-cadence cache.** It used to call `git_info()`,
-  running the whole `git_info_slow` — remote, `log -1`, `rev-parse --show-toplevel` — every beat and
-  throwing all but the remote away. Do not re-introduce a full `git_info()` on this path.
+- **`root_repo_entry` takes its `remote` from the slow-cadence cache.** Running the whole
+  `git_info_slow` — remote, `log -1`, `rev-parse --show-toplevel` — every beat to keep only the
+  remote is what it replaced. Do not re-introduce slow reads on this path.
 - **`_beat_once` is the ONE place a beat is built and posted**, so its wall clock is measured for
   every beat (`BEAT_SLOW_LOG_SEC`). Build and post are logged separately: a slow build is local
   subprocess/disk cost we own, a slow post is the network. There was no instrumentation at all before,

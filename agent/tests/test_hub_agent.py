@@ -14791,6 +14791,23 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
             sm._poll_open_pr_nudges()
         self.assertEqual(self._typed(), [])
 
+    def test_unanswered_git_status_neither_nudges_nor_rearms(self):
+        """XERK-1263: a fresh read git gave no answer to is an UNKNOWN dirty
+        count, not 0 — so no nudge, and an earlier nudge is not re-armed as
+        if the work had been delivered."""
+        sm = self.make_manager()
+        sess = self._session(sm)
+        sess["prOpenNudged"] = {"s1": {"attempts": 1, "at": 0}}
+
+        def stalled(sess_, refresh=False, fresh=False):
+            raise ha.GitTimeout("status")
+        sm._session_git = stalled
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, "auto", None)):
+            sm._poll_open_pr_nudges()
+        self.assertEqual(self._typed(), [])
+        self.assertEqual(sess["prOpenNudged"], {"s1": {"attempts": 1, "at": 0}})
+
     def test_blocking_dialog_is_not_nudged(self):
         sm = self.make_manager()
         self._session(sm)
@@ -22453,9 +22470,23 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
                                 lambda p, strict=False: done.set(), "/w/s2")
         self.assertTrue(done.wait(5))
         self.assertEqual(sm.session_cheap["s1"], good)
-        got = sm._cheap_read("session_cheap", "s1", stalled, "/w/s1", fresh=True)
-        self.assertEqual(got, good)
+        # A fresh caller wants NOW, so the stale answer is not one (XERK-1263).
+        with self.assertRaises(ha.GitTimeout):
+            sm._cheap_read("session_cheap", "s1", stalled, "/w/s1", fresh=True)
         self.assertEqual(sm.session_cheap["s1"], good)
+
+    def test_a_launch_failure_is_no_answer_not_clean(self):
+        """XERK-1263: git that could not be launched (a fork refused at the
+        pids_limit) in a worktree that still exists is NO answer — never
+        "gone", never dirtyFiles 0."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        with mock.patch.object(ha.subprocess, "run",
+                               side_effect=BlockingIOError(11, "EAGAIN")):
+            with self.assertRaises(ha.GitTimeout):
+                ha.git_info_cheap(d, strict=True)
+            with self.assertRaises(ha.GitTimeout):
+                ha.repo_cheap_facts(d, strict=True)
 
     def test_a_fast_failure_still_reports_the_worktree_gone(self):
         """Only a TIMEOUT is kept: a directory whose .git link broke answers
@@ -22583,11 +22614,9 @@ class TestLightBeatCost(ManagerMixin, unittest.TestCase):
         remote away, unlike every other slow read on this path."""
         with mock.patch.object(ha, "git_info_cheap",
                                return_value={"branch": "main", "dirtyFiles": 0}), \
-             mock.patch.object(ha, "git_info_slow") as slow, \
-             mock.patch.object(ha, "git_info") as full:
+             mock.patch.object(ha, "git_info_slow") as slow:
             entry = ha.root_repo_entry("ssh://example.com/x/y")
         slow.assert_not_called()
-        full.assert_not_called()
         self.assertEqual(entry["remote"], "ssh://example.com/x/y")
         self.assertEqual(entry["branch"], "main")
 
