@@ -11180,20 +11180,28 @@ function recordSpendStage(alerts, id, stage) {
 // Alert checks that key off a fresh heartbeat. `next.alerts` is per-agent
 // bookkeeping carried across beats (and persisted, so hub restarts don't
 // re-fire or drop edges).
+// Recovery from an alerted offline period: the one "back online" edge, shared by
+// a full beat and a slow-build keepalive (XERK-1266) — a keepalive that brought a
+// host back without clearing `offlineAt` would make the offline sweep skip the
+// host's NEXT real outage. Returns whether it fired.
+function alertRecovered(key, rec, now) {
+  const alerts = rec.alerts;
+  if (!alerts || !alerts.offlineAt) return false;
+  const where = rec.device ? ` on ${rec.device}` : "";
+  notify(`${key} back online`, `Was offline ${fmtDur(now - alerts.offlineAt)}${where}`, {
+    tags: "green_circle",
+    route: { host: key },
+  });
+  delete alerts.offlineAt;
+  return true;
+}
+
 function heartbeatAlerts(key, prev, next) {
   const now = next.lastSeen;
   const alerts = next.alerts;
   const where = next.device ? ` on ${next.device}` : "";
 
-  // Recovery from an alerted offline period.
-  const recovered = !!alerts.offlineAt;
-  if (recovered) {
-    notify(`${key} back online`, `Was offline ${fmtDur(now - alerts.offlineAt)}${where}`, {
-      tags: "green_circle",
-      route: { host: key },
-    });
-    delete alerts.offlineAt;
-  }
+  const recovered = alertRecovered(key, next, now);
 
   // Crash loop: several distinct container boots in a short window (the
   // container restarting itself, e.g. on repeated crashes).
@@ -15315,6 +15323,12 @@ const server = http.createServer(async (req, res) => {
       req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
       parts[3] === "updating" && parts.length === 4;
 
+    // The slow-build keepalive (XERK-1266) is agent-pushed like the heartbeat:
+    // a host whose beat BUILD is stalled on disk/git says it is still up.
+    const isAliveSignal =
+      req.method === "POST" && parts[0] === "api" && parts[1] === "agents" &&
+      parts[3] === "alive" && parts.length === 4;
+
     // The programmatic trigger endpoint carries its own bearer-token auth (or a
     // user login), so it's gated by triggerAuthorized instead of the
     // browser-only userAuthorized gate below.
@@ -15351,7 +15365,8 @@ const server = http.createServer(async (req, res) => {
       // credential-less case refused before the body is read, as it always was.
       const gate = agentPresentedRefusal(req);
       if (gate) return json(res, gate.status, { error: gate.error });
-    } else if (isArchiveIngest || isUpdatingSignal || isMigrationBlob || isUploadBlob) {
+    } else if (isArchiveIngest || isUpdatingSignal || isAliveSignal || isMigrationBlob ||
+               isUploadBlob) {
       // These all carry the host they act as in `<host>`, so the credential is
       // checked AGAINST it rather than merely being a valid agent token. The
       // decode is the same expression each route runs on the same segment, so
@@ -16283,7 +16298,9 @@ const server = http.createServer(async (req, res) => {
     // it) or once the grace window lapses on a stuck update.
     if (isUpdatingSignal) {
       const key = decodeURIComponent(parts[2]);
-      const a = agents[key];
+      // OWN keys only: `agents` is a plain object, so `__proto__` would resolve to
+      // Object.prototype and the write below would pollute every object.
+      const a = Object.hasOwn(agents, key) ? agents[key] : undefined;
       // Only a host we already know can be "updating" — an unknown key has no
       // record to hang the status on and nothing to suppress an alert for.
       if (!a) return json(res, 404, { error: "unknown host" });
@@ -16298,6 +16315,29 @@ const server = http.createServer(async (req, res) => {
       scheduleSave();
       // Refresh the memoized fleet payload (its `updating`/`online` flags just
       // changed) and push the transition to open dashboards immediately.
+      publishAgent(key);
+      return json(res, 200, { ok: true });
+    }
+
+    // POST /api/agents/<host>/alive — a host whose beat BUILD has been running a
+    // long time (a cache-cold transcript walk on a contended pool, an inline git
+    // read) saying it is still up, so the stall does not read as offline past
+    // OFFLINE_AFTER_MS (XERK-1266). Agent-authed above with `<host>` bound to the
+    // credential (XERK-268). It bumps `lastSeen` on an EXISTING record and nothing
+    // else: the record's content stays the last full beat's, and nothing a beat
+    // delivers (acks, spawnFailures, results) can ride it. An unknown host has no
+    // record to keep alive, so it 404s; an older hub answers 401 (the route falls
+    // through to the user gate). The agent ignores the reply either way.
+    // publishAgent is what carries the bump to the HA write-through (XERK-756).
+    if (isAliveSignal) {
+      const key = decodeURIComponent(parts[2]);
+      // OWN keys only, as /updating: `__proto__` must never reach the write.
+      const a = Object.hasOwn(agents, key) ? agents[key] : undefined;
+      if (!a) return json(res, 404, { error: "unknown host" });
+      await readBody(req);
+      a.lastSeen = Date.now();
+      alertRecovered(key, a, a.lastSeen);
+      scheduleSave();
       publishAgent(key);
       return json(res, 200, { ok: true });
     }
