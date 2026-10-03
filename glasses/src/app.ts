@@ -418,9 +418,12 @@ export class App {
   // and calls this again to roll back on failure. The next poll reconciles from
   // the hub's authoritative `autoStartOrgs`. Returns the prior value for rollback.
   setAutoStartOrg(siteKey: string, enabled: boolean): boolean {
-    const prev = !!this.state.autoStartOrgs[siteKey];
+    const cur = this.state.autoStartOrgs;
+    const prev = !!(Object.prototype.hasOwnProperty.call(cur, siteKey) && cur[siteKey]);
     if (prev === enabled) return prev;
-    const next = { ...this.state.autoStartOrgs };
+    // Null-prototype copy (XERK-1486): on a plain {} `next["__proto__"] = true`
+    // sets the prototype instead of the org's key, and reads see prototype members.
+    const next: Record<string, boolean> = Object.assign(Object.create(null), cur);
     if (enabled) next[siteKey] = true;
     else delete next[siteKey];
     this.setState({ autoStartOrgs: next });

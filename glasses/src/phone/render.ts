@@ -343,7 +343,8 @@ function orgMenuHtml(state: AppState, open: boolean): string {
 
   const row = (key: string, label: string, count: number, online: boolean): string => {
     const color = key ? colorMap.get(key) || "" : "";
-    const autoOn = !!(key && state.autoStartOrgs[key]);
+    // Own keys only (XERK-1486): an org named "constructor" must not read Object.prototype.
+    const autoOn = !!(key && Object.prototype.hasOwnProperty.call(state.autoStartOrgs, key) && state.autoStartOrgs[key]);
     return (
       `<div class="ph-org-row${key === cur ? " cur" : ""}"${key ? ` style="--org:${color}"` : ""}>` +
       `<button class="ph-org-item" data-org="${esc(key)}">` +

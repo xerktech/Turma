@@ -208,6 +208,17 @@ describe("App", () => {
     expect(display.lines[0]).toBe("TURMA 1 run · 0 ask");
   });
 
+  it("setAutoStartOrg keys a prototype-member org name as an own key (XERK-1486)", () => {
+    const app = makeApp(fakeClient());
+    for (const k of ["constructor", "__proto__"]) {
+      // OFF from the start: the prototype member is not the org's opt-in.
+      expect(app.setAutoStartOrg(k, true)).toBe(false);
+      expect(Object.hasOwn(app.getState().autoStartOrgs, k)).toBe(true);
+      expect(app.setAutoStartOrg(k, false)).toBe(true);
+      expect(Object.hasOwn(app.getState().autoStartOrgs, k)).toBe(false);
+    }
+  });
+
   it("navigates home -> session -> actions -> back to session on double-tap", async () => {
     const client = fakeClient({
       listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
