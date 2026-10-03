@@ -128,7 +128,9 @@
   a.s-ticket:hover { text-decoration: underline; }
   .s-card .state { font-size: 12px; margin-top: 4px; color: var(--ink-2); }
   .s-card .state.working { color: var(--good-text); }
-  .s-card .state.waiting { color: var(--warning); font-weight: 600; }
+  /* Amber as TEXT (XERK-1571): the dark amber in light mode (4.5:1+), the fill
+     amber in dark — the fill colour as small text is under 2:1 on light. */
+  .s-card .state.waiting { color: var(--warning-text); font-weight: 600; }
   /* Waiting out a background shell it launched (XERK-1570): not working, not
      the operator's yet — a quiet in-between, never the attention colours. */
   .s-card .state.holding { color: var(--ink-2); font-style: italic; }
@@ -139,7 +141,7 @@
      bare "idle" it would otherwise read (XERK-224). */
   .s-card .state.review { color: var(--accent-text); font-weight: 600; }
   /* A STALLED wait (XERK-1571) is the danger colour wherever it shows — the
-     dashboard's Needs-you chip and card included — never the review blue. */
+     dashboard's card included — never the review blue. */
   .s-card .state.stalled { color: var(--critical-text); font-weight: 600; }
   .s-card .question {
     font-size: 12px; color: var(--ink-2); margin-top: 3px;
@@ -2217,7 +2219,7 @@ function liveState(sess, host, now) {
   // re-prompted then, so it is "holding" — never Ready for review — like the
   // hub's sessionSleeping (no host-online gate there either).
   if (sleepingUntil(s, now))
-    return { kind: "holding", label: "💤 sleeping until " + clockTime(s.wakeAt), detail: "last write " + ago(age) };
+    return { kind: "holding", label: sleepLabel(s), detail: "last write " + ago(age) };
   // Every live row is a wait: "holding" while it waits (never Ready for review),
   // or — past its ETA, or silent too long — "stalled", which reads as idle so a
   // dead shell surfaces like any finished session. Mirrors the hub's sessionWait.
@@ -2257,6 +2259,12 @@ function clockTime(ms) {
   const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
   return p(d.getHours()) + ":" + p(d.getMinutes());
 }
+// "💤 sleeping until 14:05 · check CI" — a session-CLI wake and, when the
+// session gave one, what it will check then (XERK-1571). Same as index.html.
+function sleepLabel(s) {
+  const why = typeof s.wakeReason === "string" ? s.wakeReason.trim() : "";
+  return "💤 sleeping until " + clockTime(s.wakeAt) + (why ? " · " + why : "");
+}
 function liveWorkRows(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).filter(a => !isWaitRow(a));
 }
@@ -2291,8 +2299,8 @@ function backgroundWaitLabel(rows, wait, now) {
   // No ETA: how long it has been waiting, off the oldest wait row's startedAt
   // (XERK-1571) — a CI watch with no duration reads as if it just began. Not on
   // a STALL: how long it has been stalled is the hub's attention `since` (the
-  // card's why line, the dashboard's Needs-you row), and a second, different age
-  // beside it read as two stall lengths for one session.
+  // card's why line, the dashboard card's State row), and a second, different
+  // age beside it read as two stall lengths for one session.
   let started = null;
   for (const a of waits)
     if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
@@ -2388,6 +2396,11 @@ function reviewState(s, live, now) {
   if (live.kind !== "idle") return { ...live, why };
   // A stalled background wait keeps its own reason — it is why it is here.
   if (live.stalled) return { ...live, kind: "review", why };
+  // The hub says it stalled where this page can't judge silence (XERK-1571: the
+  // host just went quiet) — the hub's read, in the danger tone it has anywhere.
+  if (s.attention?.state === "needs-you:stalled")
+    return { ...live, kind: "review", stalled: true,
+             label: ["stalled", s.attention.why].filter(Boolean).join(" · "), why };
   const label = (s.prs || []).some(p => !prLanded(p)) ? "PR awaiting review" : "finished · awaiting review";
   return { ...live, kind: "review", label, detail: live.detail, why };
 }
@@ -2412,6 +2425,17 @@ function attentionWhy(s, now) {
     bits.push((st === "needs-you:stalled" ? "stalled" : asked ? "for" : "waiting") + " " + age);
   }
   return bits.join(" · ");
+}
+
+// Is this card Ready for review? Where the hub serves an attention state it
+// DECIDES (XERK-1571): every needs-you:* session is listed — a question, a
+// permission, a review, a stall — and nothing else, so the section is exactly
+// the set the dashboard's "Ready for review" tile counts. An older hub serves
+// none, and this page's own readyForReview mirror decides, as before.
+function inReview(x) {
+  const st = x.s.attention?.state;
+  if (typeof st === "string" && st) return st.startsWith("needs-you:");
+  return readyForReview(x.s, x.live);
 }
 
 // Ready for review, OLDEST-waiting first (XERK-1571): the hub's attention
@@ -2650,7 +2674,9 @@ function render(data) {
 
   // Running sessions split three ways, in the order the operator reads them:
   //
-  //   Ready for review — stopped, and waiting on YOU (see readyForReview).
+  //   Ready for review — stopped, and waiting on YOU: every session the hub's
+  //                      attention says needs you (inReview, XERK-1571), else
+  //                      this page's readyForReview from an older hub.
   //   Active           — still working; leave it alone until it is done.
   //   Idle             — quiet, and with nothing asking to be looked at:
   //                      a session whose PR already landed, or one that has
@@ -2662,7 +2688,7 @@ function render(data) {
   // review, ordered oldest-waiting first by the hub's attention `since`
   // (XERK-1571), which moves only when a card enters the section.
   const review = [], rest = [];
-  for (const x of running) (readyForReview(x.s, x.live) ? review : rest).push(x);
+  for (const x of running) (inReview(x) ? review : rest).push(x);
   review.sort(bySince);
   const active = rest.filter(x => x.live.kind !== "idle");
   const idle = rest.filter(x => x.live.kind === "idle");

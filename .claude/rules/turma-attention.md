@@ -56,38 +56,49 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 
 ## Surfaces
 
-- **Dashboard "Needs you"** (`index.html` `needsYou`/`needsYouHtml`, Android `FleetScreen`
-  `NeedsYouCard` + `core/Sessions.kt` `needsYou`): running sessions whose served state is
-  `needs-you:*`, oldest `since` first — chip, name, age, host · repo · why; a row opens the session.
-  Read off the served attention, never re-derived, so it matches the phone's alerts.
-  - **The "Needs you" tile counts that SAME list** (`needsYou(sess).length`; Android `fleetSummary`
-    `waiting` via `needsYouChip`) — a questions-only count said 2 above a group of 4.
-  - The chip is a FILLED pill in a fixed 84px column (names/why lines align); text is picked
-    against the fill (amber text on the light surface is <2:1). Name + why clamp to 2 lines on phones.
+- **The needs-you cards live in the Sessions page's Ready for review — the dashboard has NO
+  needs-you list** (the operator's screenshot-review call; a dashboard "Needs you" group and
+  Android's `NeedsYouCard` were built and removed). Don't add one back.
+  - **Where the hub serves attention it DECIDES the section** (`inReview`: sessions.html, Android
+    `core/Sessions.kt`, glasses `sessions.ts`): every `needs-you:*` session is listed — question,
+    permission, review, stalled (a stall whose own turn never finished included) — and a session
+    it says is anything else is not. **No attention (an older hub) falls back to the page's own
+    `readyForReview` mirror**, so the five-mirror rule still decides there.
+  - Sorted by `since`, oldest first (`bySince`, Android `sortedBySince`, glasses phone
+    `render.ts`); a card with no `since` keeps its createdAt place after them.
+- **The dashboard tile is "Ready for review"** (worded as that section, hint "sessions waiting on
+  you"), counting the SAME set off one helper (`needsYou(sess).length`; Android `fleetSummary`
+  `waiting` via `needsYou`) — a questions-only count said 2 above a list of 4. Tiles don't link.
 - **A fleet card never reads "idle" for a needs-you session**: where liveState would say idle, it
   says `attentionLabel` ("review · PR open · CI passing", "stalled · Watch CI", "waiting for your
   permission"; Android same name).
+- **A stalled card shows ONE age — the hub's `since`** (`attentionFor`: "for 31m" on the dashboard
+  State row and Android's Fleet card, "stalled 31m" on the review card's why line). The dashboard's
+  "last write" beside it read as a second, different stall length; it stays only for an older hub
+  serving no attention. A stalled wait LABEL carries no start age either.
 - **Permission `why` is the pending COMMAND, not the dialog's question** (`permissionWhy`): the
   question is nearly always "Do you want to proceed?", so a leading dialog title + next line of
   `panePrompt.detail` becomes "Bash: touch /tmp/x" (first line alone if no title; capped at 120).
-- **Stalled is the danger colour on every surface** (`.dot.stalled`, `.state.stalled`,
-  `.sess-stalled`, Android `colorScheme.error`/`TurmaColors.critical`) — never the review accent.
-- Status TEXT uses `--good-text`/`--accent-text`/`--critical-text` (`app.css`), equal to the fill
-  colours in light and stepped up in dark so 12px state lines clear 4.5:1 on a tinted card.
-- **Sessions page Ready for review** is sorted by `since`, oldest first (`bySince`, Android
-  `sortedBySince`, glasses phone `render.ts`); a card with no `since` keeps its createdAt place after
-  them. The section is still DECIDED by each client's own `readyForReview` mirror. Each review card
-  carries a `.why` line (`attentionWhy`: the why + the time — "waiting 12m", "for 22m" under a
-  question/permission, "stalled 31m" on a stall; the web drops the why on a question/permission/
-  stalled card, whose label or ask line already says it — the Android card has no label, so it keeps
-  every why). The age is glued to its word by a no-break space, so "4m" never wraps alone.
 - **A permission card is not a question card**: "waiting for your permission" (both pages, Android
   `attentionLabel`) plus an ask line / dashboard `Permission` row naming the hub's why (the command),
   falling back to `panePrompt.prompt` from an older hub — never the quoted "Do you want to proceed?".
+- **Stalled is the danger colour on every surface** (`.dot.stalled`, `.state.stalled`,
+  `.sess-stalled`, Android `colorScheme.error`/`TurmaColors.critical`) — never the review accent. A
+  card the hub says stalled where the page can't judge silence (host gone quiet) still reads
+  "stalled · <why>" in that tone (`reviewState`).
+- Status TEXT uses `--good-text`/`--accent-text`/`--critical-text`/`--warning-text` (`app.css`):
+  the first three equal the fill in light and step UP in dark; amber steps DOWN in light
+  (`#8a5a00`, the fill is <2:1 as text there) and is the fill in dark — both clear 4.5:1 on a
+  tinted card. "waiting for your answer/permission" (`.sess-wait`, `.state.waiting`) uses it.
+- **Each review card carries a `.why` line** (`attentionWhy`: the why + the time — "waiting 12m",
+  "for 22m" under a question/permission, "stalled 31m" on a stall; the web drops the why on a
+  question/permission/stalled card, whose label or ask line already says it — the Android card has
+  no label, so it keeps every why). The age is glued to its word by a no-break space.
 - Waiting cards read "⏳ waiting · …" (`backgroundWaitLabel`, Android `liveStateLabel`); one named
   wait keeps its label on EVERY branch ("· Sleep · 11m left"); with no ETA they add the time since the
-  oldest wait row's `startedAt` ("· 12m"). **A STALLED label carries no start age** — the stall's own
-  age is the hub's `since` (why line, Needs-you row); two unlabelled numbers read as two stall lengths.
+  oldest wait row's `startedAt` ("· 12m").
+- **A sleeping card says what it will check**: "💤 sleeping until 22:31 · <wakeReason>" (`sleepLabel`
+  on both pages, Android `liveStateLabel`, glasses phone card); no reason = the time alone.
 
 ## The stalled alert
 
@@ -99,8 +110,9 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   stalled alert neither fires nor stays (its dismiss fires on the edge).
 - Fires only on an OBSERVED edge (a previous `sa.attn` in another state, not a recovery beat) — a
   session already stalled when the hub first judges it is not announced, as review isn't.
-- Tests: the `XERK-1571:` cases in `server.test.js`; `attention:` in `sessions.test.js`; the Needs
-  you case in `dashboard-tiles.test.js`; the wake case in `dashboard-livestate.test.js`; glasses
+- Tests: the `XERK-1571:` cases in `server.test.js`; `attention:` in `sessions.test.js`; the Ready
+  for review tile case in `dashboard-tiles.test.js`; the wake + stall-age cases in
+  `dashboard-livestate.test.js`; glasses
   `sessions.test.ts` + `phone/render.test.ts`; android `SessionsTest`, `SessionsFlattenTest`,
   `AgentDecodeTest`.
 

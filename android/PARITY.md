@@ -315,9 +315,9 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     stalled, then IDLE. The chat bar reads "Waiting…" and a wait row "waiting".
   - **Gap:** the Fleet card labels an IDLE session from the hub's served attention
     (`attentionLabel` → "stalled · Watch CI", in the error colour) as the web does, but the
-    Sessions-screen card has no state label, so a stalled session there shows only the
-    Needs-you "stalled" chip and the review card's why line. The HOLDING dot is a dimmed
-    working colour, not the hollow ring.
+    Sessions-screen card has no state label, so a stalled session there shows only its
+    danger dot and the review card's why line ("Watch CI · stalled 31m"). The HOLDING dot is a
+    dimmed working colour, not the hollow ring.
 
 ## Done (XERK-78 installment — the P0 sweep)
 

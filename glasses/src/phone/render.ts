@@ -10,7 +10,7 @@
 // view; Board is a placeholder tab (Phase 2).
 import type { AppState } from "../app.ts";
 import type { AgentInfo, PrInfo, SessionInfo } from "../types.ts";
-import { filterAgents, liveState, readyForReview, sessionName, siteKeyOf, sleeping, type LiveState } from "../sessions.ts";
+import { filterAgents, inReview, liveState, sessionName, siteKeyOf, sleeping, type LiveState } from "../sessions.ts";
 import { LIVE_TURN_ID } from "../render.ts";
 import { Board } from "../vendor/engines.ts";
 
@@ -139,10 +139,12 @@ function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, cur
   const st = liveState(s, hostLastSeen, now);
   const name = sessionName(s);
   const q = s.session?.question;
-  // A holding session ASLEEP until a session-CLI wake (XERK-1571) says until when.
+  // A holding session ASLEEP until a session-CLI wake (XERK-1571) says until when,
+  // and what it will check then when the session said (web "· <reason>").
   const wakeAt = s.session?.wakeAt;
+  const wakeWhy = typeof s.session?.wakeReason === "string" ? s.session.wakeReason.trim() : "";
   const label = st === "holding" && sleeping(s.session, now ?? Date.now()) && typeof wakeAt === "number"
-    ? `sleeping until ${clockTime(wakeAt)}` : STATE_LABEL[st];
+    ? `sleeping until ${clockTime(wakeAt)}${wakeWhy ? ` · ${wakeWhy}` : ""}` : STATE_LABEL[st];
   const stateRow =
     `<span class="ph-state-row">` +
     `<span class="ph-state st-${st}">${esc(label)}</span>` +
@@ -223,8 +225,10 @@ export function sessionsBodyHtml(state: AppState): string {
   // dead host's stale paneBusy otherwise reads WORKING forever and its
   // stranded work never reaches Ready for review (XERK-235).
   const now = Date.now();
-  const review = running.filter((r) => readyForReview(r.s, r.lastSeen, now));
-  const rest = running.filter((r) => !readyForReview(r.s, r.lastSeen, now));
+  // Every session the hub says needs you (XERK-1571, `inReview`), else the
+  // local readyForReview port from an older hub.
+  const review = running.filter((r) => inReview(r.s, r.lastSeen, now));
+  const rest = running.filter((r) => !inReview(r.s, r.lastSeen, now));
   const ACTIVE = ["working", "waiting", "holding"];
   const active = rest.filter((r) => ACTIVE.includes(liveState(r.s, r.lastSeen, now)));
   const idle = rest.filter((r) => !ACTIVE.includes(liveState(r.s, r.lastSeen, now)));

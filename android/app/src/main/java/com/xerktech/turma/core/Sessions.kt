@@ -146,15 +146,37 @@ fun needsYouChip(state: String): String? = when (state) {
 }
 
 /**
- * The dashboard's "Needs you" group (XERK-1571, web index.html `needsYou`): the
- * running sessions the HUB says wait on the operator, oldest wait first. Read off
- * the served [SessionInfo.attention], never re-derived, so it agrees with the
- * phone's alerts. An older hub serves none, so nothing is listed.
+ * Does the hub say this running session waits on the operator (XERK-1571, web
+ * index.html `needsYou`)? Read off the served [SessionInfo.attention], never
+ * re-derived, so it agrees with the phone's alerts. The dashboard's Ready-for-review
+ * tile counts these; an older hub serves none, so it counts nothing.
  */
-fun needsYou(agents: List<AgentInfo>): List<FlatSession> =
-    flattenSessions(agents)
-        .filter { it.session.status == "running" && needsYouChip(it.session.attention?.state ?: "") != null }
-        .sortedBy { it.session.attention?.since ?: 0L }
+fun needsYou(session: SessionInfo): Boolean =
+    session.status == "running" && needsYouChip(session.attention?.state ?: "") != null
+
+/**
+ * Is this running session in the Sessions screen's Ready for review group
+ * (XERK-1571, web sessions.html `inReview`)? Where the hub serves an attention
+ * state it decides: every `needs-you:*` session is listed (question, permission,
+ * review, stalled) and nothing else, so the group is the set the dashboard tile
+ * counts. From an older hub (no attention) the local [readyForReview] port decides.
+ */
+fun inReview(session: SessionInfo, state: LiveState): Boolean {
+    val att = session.attention?.state.orEmpty()
+    if (att.isNotEmpty()) return needsYouChip(att) != null
+    return readyForReview(session, state)
+}
+
+/**
+ * How long the hub says a needs-you session has waited, for a fleet card's State
+ * row (XERK-1571, web index.html `attentionFor`): "for 31m" off the attention
+ * `since` — the ONE age a stalled card shows. "" when there is none.
+ */
+fun attentionFor(att: Attention?, now: Long): String {
+    val since = att?.since ?: return ""
+    if (needsYouChip(att.state) == null) return ""
+    return "for ${waitLeftText(now - since)}"
+}
 
 /**
  * Ready for review, oldest-waiting first by the hub's attention `since`
@@ -192,7 +214,7 @@ fun attentionWhy(att: Attention?, now: Long): String {
  * web index.html `attentionLabel`): "review · PR open · CI passing", "stalled ·
  * Watch CI", "waiting for your answer", "waiting for your permission". Null when it
  * doesn't — the card then keeps its own live-state word. Used where that word would
- * be "idle", so a session the Needs-you group lists never reads idle on its own card.
+ * be "idle", so a session Ready for review lists never reads idle on its own card.
  */
 fun attentionLabel(att: Attention?): String? {
     if (att == null) return null

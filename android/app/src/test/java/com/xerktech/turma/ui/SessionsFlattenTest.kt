@@ -126,6 +126,25 @@ class SessionsFlattenTest {
         assertEquals(listOf("oldest", "newest", "noSince"), groups.review.map { it.flat.session.id })
     }
 
+    // XERK-1571: where the hub serves attention it DECIDES Ready for review — every
+    // needs-you:* session is listed (a stall the local read files under Idle too),
+    // and a session it says is idle is not, so the group is the tile's set.
+    @Test fun `rankRunning lists every hub needs-you session in Ready for review`() {
+        fun withAtt(f: FlatSession, state: String, since: Long) =
+            f.copy(session = f.session.copy(attention = com.xerktech.turma.model.Attention(state = state, since = since)))
+        val groups = rankRunning(
+            listOf(
+                withAtt(flat("stalled", paneBusy = false), "needs-you:stalled", 100L),
+                withAtt(flat("asked", question = "pick one"), "needs-you:question", 300L),
+                withAtt(flat("hubIdle", paneBusy = false, lastRole = "assistant"), "idle", 200L),
+                flat("olderHub", paneBusy = false, lastRole = "assistant"),
+            ),
+            now = 1_000L,
+        )
+        assertEquals(listOf("stalled", "asked", "olderHub"), groups.review.map { it.flat.session.id })
+        assertEquals(listOf("hubIdle"), groups.idle.map { it.flat.session.id })
+    }
+
     @Test fun `rankRunning orders newest-created first, whatever the activity`() {
         fun beat(oldAge: Double, newAge: Double) = rankRunning(
             listOf(

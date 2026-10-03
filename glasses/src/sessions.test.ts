@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { __setDshEnabled, flattenSessions, glyph, isDsh, liveState, readyForReview } from "./sessions.ts";
+import { __setDshEnabled, flattenSessions, glyph, inReview, isDsh, liveState, readyForReview } from "./sessions.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
@@ -109,6 +109,18 @@ describe("liveState", () => {
     expect(readyForReview(asleep(now + 60_000), now - 120_000, now)).toBe(false);
     // A question outranks the sleep.
     expect(readyForReview(asleep(now + 60_000, { question: "Q?" }), now, now)).toBe(true);
+  });
+
+  // XERK-1571: where the hub serves attention it decides Ready for review — every
+  // needs-you:* session, nothing else; the local rule only from an older hub.
+  it("inReview follows the hub's attention, else the local rule", () => {
+    const now = 10_000_000;
+    const finished = session({ session: signals({ paneBusy: false, transcriptAgeSec: 600, lastRole: "assistant" }) });
+    const quiet = session({ session: signals({ paneBusy: false, transcriptAgeSec: 600, lastRole: "user" }) });
+    expect(inReview(finished, now, now)).toBe(true);
+    expect(inReview({ ...finished, attention: { state: "idle", since: now } }, now, now)).toBe(false);
+    expect(inReview(quiet, now, now)).toBe(false);
+    expect(inReview({ ...quiet, attention: { state: "needs-you:stalled", since: now } }, now, now)).toBe(true);
   });
 
   it("is 'error' when status is error, regardless of session signals", () => {

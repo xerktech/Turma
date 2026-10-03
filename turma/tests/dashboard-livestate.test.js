@@ -142,9 +142,27 @@ test("dashboard liveState: a wait with no ETA says how long it has waited", () =
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [timed] }), onlineHost, NOW).label,
     "⏳ waiting · Watch CI on PR #412 · 11m left");
   // Stalled: no start age — the stall's own age (the hub's `since`) is the
-  // Needs-you row's, and a second number here read as a second stall length.
+  // State row's, and a second number here read as a second stall length.
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW).label,
     "stalled · Watch CI on PR #412");
+});
+
+// XERK-1571 screenshot defect: a stalled card showed a second age (its last
+// write) beside the 31m the hub says it has been stalled. It now shows ONE age,
+// the hub's attention `since`; "last write" stays only for an older hub.
+test("dashboard liveState: a stall shows one age, the hub's since", () => {
+  const { liveState } = loadDashboard();
+  const ci = { type: "shell", label: "Watch CI", kind: "wait-external", startedAt: NOW - 60 * 60 * 1000 };
+  const s = { paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] };
+  const stalled = liveState({ session: s,
+    attention: { state: "needs-you:stalled", since: NOW - 31 * 60 * 1000, why: "Watch CI" } }, onlineHost, NOW);
+  assert.equal(stalled.label, "stalled · Watch CI");
+  assert.equal(stalled.detail, "for 31m");
+  assert.equal(stalled.cls, "sess-stalled");
+  // The hub is a beat behind (still "waiting"): no second number at all.
+  assert.equal(liveState({ session: s, attention: { state: "waiting", since: NOW - 60_000 } }, onlineHost, NOW).detail, "");
+  // An older hub: the transcript's last write is the only clock there is.
+  assert.match(liveState({ session: s }, onlineHost, NOW).detail, /^last write 50m/);
 });
 
 // XERK-1571: a permission dialog is not a question — the card says so and names
@@ -162,7 +180,7 @@ test("dashboard liveState: a permission names what it asks for", () => {
 });
 
 // XERK-1571: a card the hub says needs the operator never reads "idle" — its
-// State row takes the attention read the Needs-you group lists it under.
+// State row takes the attention read Ready for review lists it under.
 test("dashboard liveState: a needs-you session reads its attention, never idle", () => {
   const { liveState } = loadDashboard();
   const done = { paneBusy: false, transcriptAgeSec: 52 * 60 };
@@ -170,7 +188,8 @@ test("dashboard liveState: a needs-you session reads its attention, never idle",
     attention: { state: "needs-you:review", since: NOW - 60_000, why: "PR open · CI passing" } }, onlineHost, NOW);
   assert.equal(review.label, "review · PR open · CI passing");
   assert.equal(review.cls, "sess-review");
-  assert.match(review.detail, /^last write /);
+  // How long it has waited is the hub's since — one age, not the last write.
+  assert.equal(review.detail, "for 1m");
   const stalled = liveState({ session: done,
     attention: { state: "needs-you:stalled", since: NOW - 60_000, why: "Watch CI" } }, onlineHost, NOW);
   assert.equal(stalled.label, "stalled · Watch CI");
@@ -192,6 +211,9 @@ test("dashboard liveState: a pending wake reads sleeping until its time", () => 
   const asleep = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt }), onlineHost, NOW);
   assert.equal(asleep.label, `💤 sleeping until ${p(d.getHours())}:${p(d.getMinutes())}`);
   assert.equal(asleep.cls, "sess-holding");
+  // The wake reason, when the session gave one, says what it will check.
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt, wakeReason: " check CI on #412 " }), onlineHost, NOW).label,
+    `💤 sleeping until ${p(d.getHours())}:${p(d.getMinutes())} · check CI on #412`);
   assert.notEqual(asleep.busy, true);
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt: NOW - 1000 }), onlineHost, NOW).label, "idle");
   // Working outranks it: a session still finishing its turn is working.

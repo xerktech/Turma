@@ -188,6 +188,12 @@ class SessionsTest {
             "💤 sleeping until ${clockTime(wakeAt)}",
             com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, asleep.session, now),
         )
+        // The wake reason, when the session gave one, says what it will check.
+        assertEquals(
+            "💤 sleeping until ${clockTime(wakeAt)} · check CI on PR #412",
+            com.xerktech.turma.ui.liveStateLabel(
+                LiveState.HOLDING, asleep.session!!.copy(wakeReason = "check CI on PR #412"), now),
+        )
         // A due wake no longer sleeps; working outranks a sleep.
         assertEquals(LiveState.IDLE, liveState(asleep, now, wakeAt + 1))
         val busy = asleep.copy(session = asleep.session!!.copy(paneBusy = true))
@@ -199,20 +205,37 @@ class SessionsTest {
     private fun att(state: String, since: Long?, why: String? = null) =
         com.xerktech.turma.model.Attention(state = state, since = since, why = why)
 
-    @Test fun `needsYou lists the hub's needs-you running sessions, oldest wait first`() {
-        val agents = listOf(
-            AgentInfo(key = "h", sessions = listOf(
-                SessionInfo(id = "new", status = "running", attention = att("needs-you:review", now - 60_000L)),
-                SessionInfo(id = "old", status = "running", attention = att("needs-you:stalled", now - 3_600_000L)),
-                SessionInfo(id = "busy", status = "running", attention = att("working", now - 10L)),
-                SessionInfo(id = "zzz", status = "running", attention = att("sleeping", now - 10L)),
-                SessionInfo(id = "stopped", status = "stopped", attention = att("needs-you:review", 1L)),
-                SessionInfo(id = "olderHub", status = "running"),
-            )),
+    @Test fun `needsYou is a running session the hub serves a needs-you state for`() {
+        val sessions = listOf(
+            SessionInfo(id = "new", status = "running", attention = att("needs-you:review", now - 60_000L)),
+            SessionInfo(id = "old", status = "running", attention = att("needs-you:stalled", now - 3_600_000L)),
+            SessionInfo(id = "busy", status = "running", attention = att("working", now - 10L)),
+            SessionInfo(id = "zzz", status = "running", attention = att("sleeping", now - 10L)),
+            SessionInfo(id = "stopped", status = "stopped", attention = att("needs-you:review", 1L)),
+            SessionInfo(id = "olderHub", status = "running"),
         )
-        assertEquals(listOf("old", "new"), needsYou(agents).map { it.session.id })
+        assertEquals(listOf("new", "old"), sessions.filter(::needsYou).map { it.id })
         assertEquals("stalled", needsYouChip("needs-you:stalled"))
         assertEquals(null, needsYouChip("waiting"))
+    }
+
+    // XERK-1571: the Sessions screen's Ready for review is the hub's needs-you set
+    // where the hub serves attention, the local readyForReview port where it doesn't.
+    @Test fun `inReview follows the hub's attention, else the local rule`() {
+        val finished = SessionInfo(id = "f", status = "running",
+            session = LiveSignals(transcriptAgeSec = 600.0, lastRole = "assistant"))
+        assertEquals(true, inReview(finished, LiveState.IDLE))
+        assertEquals(false, inReview(finished.copy(attention = att("idle", now)), LiveState.IDLE))
+        val quiet = finished.copy(session = finished.session!!.copy(lastRole = "user"))
+        assertEquals(false, inReview(quiet, LiveState.IDLE))
+        assertEquals(true, inReview(quiet.copy(attention = att("needs-you:stalled", now)), LiveState.IDLE))
+    }
+
+    @Test fun `attentionFor is the one age a needs-you fleet card shows`() {
+        assertEquals("for 31m", attentionFor(att("needs-you:stalled", now - 31 * 60_000L), now))
+        assertEquals("", attentionFor(att("needs-you:stalled", null), now))
+        assertEquals("", attentionFor(att("waiting", now - 60_000L), now))
+        assertEquals("", attentionFor(null, now))
     }
 
     @Test fun `attentionWhy says why and for how long`() {

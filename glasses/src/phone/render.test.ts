@@ -165,7 +165,13 @@ describe("phone render", () => {
           attention: { state: "needs-you:review", since: now - 60_000 } }),
         session({ id: "o1", summary: "older wait", createdAt: "2025-01-01T00:00:00Z", session: signals(done),
           attention: { state: "needs-you:review", since: now - 3_600_000 } }),
-        session({ id: "z1", summary: "asleep one", session: signals({ ...done, transcriptAgeSec: 5, wakeAt }) }),
+        session({ id: "z1", summary: "asleep one", session: signals({ ...done, transcriptAgeSec: 5, wakeAt, wakeReason: "check CI" }) }),
+        // The hub decides the group where it serves attention: a stall is listed
+        // even though its own turn never finished; a hub-idle one is not.
+        session({ id: "s1", summary: "stalled one", session: signals({ ...done, lastRole: "user" }),
+          attention: { state: "needs-you:stalled", since: now - 7_200_000 } }),
+        session({ id: "i1", summary: "hub idle one", session: signals(done),
+          attention: { state: "idle", since: now - 60_000 } }),
       ] })],
     });
     const html = sessionsBodyHtml(st);
@@ -173,7 +179,10 @@ describe("phone render", () => {
     expect(review.indexOf("older wait")).toBeGreaterThan(-1);
     expect(review.indexOf("older wait")).toBeLessThan(review.indexOf("newer wait"));
     expect(review).not.toContain("asleep one");
-    expect(html.slice(html.indexOf("Active"))).toContain(`sleeping until ${p(d.getHours())}:${p(d.getMinutes())}`);
+    expect(review.indexOf("stalled one")).toBeGreaterThan(-1);
+    expect(review.indexOf("stalled one")).toBeLessThan(review.indexOf("older wait"));
+    expect(review).not.toContain("hub idle one");
+    expect(html.slice(html.indexOf("Active"))).toContain(`sleeping until ${p(d.getHours())}:${p(d.getMinutes())} · check CI`);
   });
 
   it("a new task on a merged-PR session is not hidden by that PR (XERK-224)", () => {

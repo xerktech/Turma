@@ -43,10 +43,13 @@
 
   /* status TEXT on a surface (XERK-1571): the semantic colours above are fills
      and dots; as small text on the dark surface three of them drop under 4.5:1,
-     so text takes these, which step up in dark only (light = the fill colour). */
+     so text takes these, which step up in dark only (light = the fill colour).
+     Amber is the exception: as text on the light surface it is under 2:1, so
+     light steps it DOWN to a dark amber (4.7:1 on the most-tinted org card). */
   --good-text:     var(--good);
   --accent-text:   var(--accent);
   --critical-text: var(--critical);
+  --warning-text:  #8a5a00;
 
   /* validated categorical chart slots — fixed order, never cycled (history) */
   --s1: #2a78d6; --s2: #1baf7a; --s3: #eda100; --s4: #008300;
@@ -88,6 +91,7 @@
     --good-text:     #4cc94c;
     --accent-text:   #78aef2;
     --critical-text: #f08080;
+    --warning-text:  #fab219;
     /* same hues, stepped for the dark surface (validated as a set) */
     --s1: #3987e5; --s2: #199e70; --s3: #c98500; --s4: #008300;
     --s5: #9085e9; --s6: #e66767; --s7: #d55181; --s8: #d95926;

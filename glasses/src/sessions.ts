@@ -147,6 +147,17 @@ export function readyForReview(
   return live.lastRole === "assistant" && !live.lastHasToolUse;
 }
 
+// Is this session in the Ready for review group (XERK-1571, web sessions.html
+// `inReview`)? Where the hub serves an attention state it DECIDES: every
+// needs-you:* session is listed (question, permission, review, stalled) and
+// nothing else — the set the dashboard's Ready-for-review tile counts. From an
+// older hub (no attention) the local readyForReview port decides, as before.
+export function inReview(s: SessionInfo, hostLastSeen?: number, now?: number): boolean {
+  const st = s.attention?.state;
+  if (typeof st === "string" && st) return st.startsWith("needs-you:");
+  return readyForReview(s, hostLastSeen, now);
+}
+
 // Leading status icon on each home-menu session row — chosen to be
 // glanceable on the G2's tiny monochrome display, with the two states the
 // user acts on made loud: "!" = actively working, "?" = a question from

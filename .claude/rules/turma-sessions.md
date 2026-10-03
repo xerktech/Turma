@@ -327,8 +327,9 @@ words its stage "Queued — <reason>", flipping live once provisioned. Tests: `s
   through to the finished-turn signal; false when unanswerable, erring toward parking.
 - **FIVE mirrors must agree** — see CLAUDE.md. Card shows WHY it qualified (`.dot.review`). Tests:
   `sessions.test.js`, `readyForReview` in `server.test.js`.
-- **The section is ordered by the hub's attention `since`, oldest wait first, each card with a
-  `.why` line; a sleeping session (a session-CLI wake ahead) holds in Active** (XERK-1571) —
+- **Where the hub serves attention, IT decides the section — every `needs-you:*` session (question,
+  permission, review, stalled), oldest `since` first, each with a `.why` line; `readyForReview`
+  decides only from an older hub. A sleeping session holds in Active** (XERK-1571) —
   `turma-attention.md`.
 
 ### Ended sessions

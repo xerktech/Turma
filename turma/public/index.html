@@ -288,53 +288,14 @@
   .ctx-meter.danger .ctx-cap { color: var(--bad, #d9534f); font-weight: 600; }
 
   .sess-working { color: var(--good-text); }
-  .sess-wait { color: var(--warning); }
+  /* Amber as TEXT: the dark amber in light mode (4.5:1+), the fill amber in dark. */
+  .sess-wait { color: var(--warning-text); }
   .sess-holding { color: var(--ink-2); font-style: italic; }
   /* The hub's needs-you read on a card's State row (XERK-1571): review in the
      Ready-for-review accent, stalled in the danger colour it has everywhere. */
   .sess-review { color: var(--accent-text); }
   .sess-stalled { color: var(--critical-text); }
 
-  /* "Needs you" (XERK-1571): every session the hub says is waiting on the
-     operator, oldest wait first, above the host tree. */
-  .needs-you {
-    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
-    padding: 12px 16px; margin-bottom: 16px;
-  }
-  /* Worded and set like the tiles' labels — a section label, not a page heading. */
-  .needs-you h2 {
-    font-family: var(--font-sans); font-size: 12px; font-weight: 600; color: var(--ink-2);
-    text-transform: uppercase; letter-spacing: 0.04em; margin: 0 0 8px;
-  }
-  .needs-you h2 .count { color: var(--muted); font-weight: 400; }
-  /* A fixed first column, so every row's name and why line start at the same x
-     whatever the chip says. */
-  .ny-row {
-    display: grid; grid-template-columns: 84px minmax(0, 1fr) auto; gap: 4px 10px;
-    align-items: baseline; padding: 6px 0; border-top: 1px solid var(--border);
-    color: inherit; text-decoration: none;
-  }
-  .ny-row:first-of-type { border-top: 0; }
-  /* A FILLED pill: amber text on the light surface is under 2:1, so the state
-     colour is the fill and the text is chosen against it (each ≥4.5:1, both themes). */
-  .ny-chip {
-    display: block; text-align: center; padding: 2px 6px; border-radius: 999px;
-    font-size: 11px; font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-    background: color-mix(in srgb, var(--accent) 80%, #000); color: #fff;
-  }
-  .ny-chip.question, .ny-chip.permission { background: var(--warning); color: #0b0b0b; }
-  .ny-chip.stalled { background: color-mix(in srgb, var(--critical) 90%, #000); color: #fff; }
-  .ny-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .ny-age { color: var(--muted); font-size: 12px; white-space: nowrap; }
-  .ny-why { grid-column: 2 / 4; color: var(--ink-2); font-size: 12px;
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  /* Phones: a question cut to one line is unreadable — two lines for both. */
-  @media (max-width: 600px) {
-    .ny-name, .ny-why {
-      white-space: normal; overflow-wrap: anywhere;
-      display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
-    }
-  }
   .sess-dying { color: var(--critical); }
 
   /* Per-session work-state line: warning when there's unpushed/uncommitted
@@ -1166,11 +1127,12 @@ function clockTime(ms) {
   return p(d.getHours()) + ":" + p(d.getMinutes());
 }
 
-// "Needs you" (XERK-1571): the sessions the HUB says are waiting on the
-// operator (`attention.state` needs-you:*), oldest wait first. Read off the
-// served attention rather than re-derived: the hub stamps it on the same beat
-// it decides the alerts, so the group and the phone agree. Absent (an older
-// hub) = not listed. `sess` is the org-scoped [{s, host}] list.
+// The sessions the HUB says are waiting on the operator (XERK-1571,
+// `attention.state` needs-you:*) — the set the Sessions page's Ready for review
+// section lists, which the "Ready for review" tile counts. Read off the served
+// attention rather than re-derived: the hub stamps it on the same beat it
+// decides the alerts, so the tile and the phone agree. Absent (an older hub) =
+// not counted. `sess` is the org-scoped [{s, host}] list.
 const NEEDS_YOU_CHIP = {
   "needs-you:question": ["question", "question"],
   "needs-you:permission": ["permission", "permission"],
@@ -1180,8 +1142,8 @@ const NEEDS_YOU_CHIP = {
 };
 // A card's State row for a session the hub says needs the operator, or null:
 // "review · PR open · CI passing", "stalled · Watch CI". liveState falls back to
-// it where it would otherwise say "idle" — a session the Needs-you group lists
-// must not read idle on its own card.
+// it where it would otherwise say "idle" — a session Ready for review lists must
+// not read idle on its own card.
 function attentionLabel(att) {
   const chip = att && NEEDS_YOU_CHIP[att.state];
   if (!chip) return null;
@@ -1196,21 +1158,19 @@ function needsYou(sess) {
     .filter(x => x.s.status === "running" && NEEDS_YOU_CHIP[x.s.attention?.state])
     .sort((x, y) => (x.s.attention.since || 0) - (y.s.attention.since || 0));
 }
-function needsYouHtml(rows, now) {
-  if (!rows.length) return "";
-  return `<section class="needs-you"><h2>Needs you <span class="count">${rows.length}</span></h2>${
-    rows.map(({ s, host }) => {
-      const att = s.attention;
-      const [cls, word] = NEEDS_YOU_CHIP[att.state];
-      const name = s.summary || s.label || s.rcName || s.id;
-      const age = Number.isSafeInteger(att.since) ? ago(now - att.since).replace(/ ago$/, "") : "";
-      return `<a class="ny-row" href="/sessions?session=${esc(encodeURIComponent(s.id))}">
-        <span class="ny-chip ${cls}">${esc(word)}</span>
-        <span class="ny-name" title="${esc(name)}">${esc(name)}</span>
-        <span class="ny-age">${esc(age)}</span>
-        <span class="ny-why">${esc([host.device || host.key, s.repo, att.why].filter(Boolean).join(" · "))}</span>
-      </a>`;
-    }).join("")}</section>`;
+// How long the hub says a needs-you session has waited (XERK-1571): "for 31m"
+// off the attention `since`. It is the ONE age a stalled or needs-you card
+// shows — the transcript's "last write" beside it read as a second, different
+// stall length. "" when the hub serves none.
+function attentionFor(att, now) {
+  if (!att || !NEEDS_YOU_CHIP[att.state] || !Number.isSafeInteger(att.since)) return "";
+  return "for " + ago(now - att.since).replace(/ ago$/, "");
+}
+// "💤 sleeping until 14:05 · check CI" — a session-CLI wake and, when the
+// session gave one, what it will check then. Same as sessions.html.
+function sleepLabel(s) {
+  const why = typeof s.wakeReason === "string" ? s.wakeReason.trim() : "";
+  return "💤 sleeping until " + clockTime(s.wakeAt) + (why ? " · " + why : "");
 }
 
 // A background shell that is WAITING (XERK-1570) — a sleep, a CI watch, a poll
@@ -1243,7 +1203,7 @@ function backgroundWaitLabel(rows, wait, now) {
   // No ETA: how long it has been waiting, off the oldest wait row's startedAt
   // (XERK-1571) — a CI watch with no duration reads as if it just began. Not on
   // a STALL: how long it has been stalled is the hub's attention `since`, which
-  // the Needs-you row shows; a second, different age here read as two stall
+  // the card's State row shows; a second, different age here read as two stall
   // lengths for one session.
   let started = null;
   for (const a of waits)
@@ -1292,17 +1252,24 @@ function liveState(sess, host, now) {
   // Asleep until a session-CLI wake (XERK-1571). Same rule and wording as
   // sessions.html (and the hub's sessionSleeping).
   if (sleepingUntil(s, now))
-    return { label: "💤 sleeping until " + clockTime(s.wakeAt), cls: "sess-holding", detail: "last write " + ago(age) };
+    return { label: sleepLabel(s), cls: "sess-holding", detail: "last write " + ago(age) };
   // Every live row is a wait: holding, or stalled past its ETA / too long silent.
   // Same rule and wording as sessions.html (and the hub's sessionWait).
   const wait = host.online ? backgroundWait(s.agents, now - age, now) : null;
+  if (wait && wait.state === "waiting")
+    return { label: backgroundWaitLabel(s.agents, wait, now), cls: "sess-holding", detail: "last write " + ago(age) };
+  // A stall shows ONE age (XERK-1571): how long it has been stalled, the hub's
+  // attention `since` ("for 31m") — never the transcript's last write beside it,
+  // a different number that read as a second stall length. An older hub serves
+  // no attention, and "last write" is the only clock it has.
   if (wait)
-    return { label: backgroundWaitLabel(s.agents, wait, now),
-             cls: wait.state === "stalled" ? "sess-stalled" : "sess-holding", detail: "last write " + ago(age) };
-  // The hub says it waits on the operator (XERK-1571): the same read the
-  // Needs-you group lists it under, so the card never says "idle" beside it.
+    return { label: backgroundWaitLabel(s.agents, wait, now), cls: "sess-stalled",
+             detail: sess.attention ? (sess.attention.state === "needs-you:stalled" ? attentionFor(sess.attention, now) : "")
+                                    : "last write " + ago(age) };
+  // The hub says it waits on the operator (XERK-1571): the read Ready for review
+  // lists it under, so the card never says "idle" beside it — with how long.
   const att = attentionLabel(sess.attention);
-  if (att) return { ...att, detail: "last write " + ago(age) };
+  if (att) return { ...att, detail: attentionFor(sess.attention, now) || "last write " + ago(age) };
   return {
     label: s.bridgeAttached ? "idle · session attached" : "idle",
     cls: "",
@@ -1364,10 +1331,10 @@ function render(data) {
   const sess = agents.flatMap(a => (a.sessions || []).map(s => ({ s, host: a })));
   const online = agents.filter(a => a.online);
   const running = sess.filter(x => x.s.status === "running");
-  // The "Needs you" tile counts the SAME set the Needs-you group below lists
-  // (XERK-1571) — every needs-you:* state, off one helper. Counting questions
-  // alone made the tile say 2 above a group listing 4 (and, before that,
-  // disagree with the card beneath it, XERK-235).
+  // The "Ready for review" tile counts the SAME set the Sessions page's Ready
+  // for review section lists (XERK-1571) — every needs-you:* state, off one
+  // helper. Counting questions alone made the tile say 2 above a list of 4 (and,
+  // before that, disagree with the card beneath it, XERK-235).
   const needs = needsYou(sess);
   // Spend OUTLIVES the host that made it (XERK-338), so the token tiles count
   // `retiredUsage` — a removed, pruned or evicted host — alongside the live
@@ -1409,7 +1376,7 @@ function render(data) {
     tile("Hosts online", `${online.length} / ${agents.length}`,
          [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
     tile("Running sessions", runningValue, sess.length + " total") +
-    tile("Needs you", String(needs.length), "sessions waiting on you") +
+    tile("Ready for review", String(needs.length), "sessions waiting on you") +
     tile("Tokens today", fmtTokens(fleetTokens("today")), "all sessions, incl. cache" + retiredNote) +
     tile("Tokens this week", fmtTokens(fleetTokens("week")), "last 7 days (UTC)" + retiredNote) +
     tile("Tokens all-time", fmtTokens(fleetTokens("totals")),
@@ -1441,8 +1408,7 @@ function render(data) {
   // scrolled `.clone-list`, id-keyed, is captured by preserveScroll).
   const focus = captureComposerFocus();
   TurmaNav.preserveScroll($groups, () => {
-    $groups.innerHTML = needsYouHtml(needs, now)
-      + `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
+    $groups.innerHTML = `<div class="hosts">${agents.map(a => hostCard(a, now)).join("")}</div>`;
   });
   restoreComposerFocus(focus);
 }

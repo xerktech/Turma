@@ -162,10 +162,11 @@ test("dashboard: the session card renders a context-fullness meter (XERK-489 Pha
   assert.match(D.contextMeterHtml({ modelSource: "local", lastTurnContextTokens: 97, contextWindowTokens: 100 }), /ctx-meter danger/);
 });
 
-// XERK-1571: the "Needs you" group lists exactly the sessions the hub's served
-// attention says wait on the operator, oldest wait first, with its chip, host,
-// repo, why and age — and is absent when none do (or the hub serves none).
-test("dashboard: the Needs you group lists hub needs-you sessions, oldest first", () => {
+// XERK-1571: the dashboard carries NO needs-you list (the operator's call: those
+// cards live in the Sessions page's Ready for review). Its "Ready for review" tile
+// counts exactly the sessions the hub's served attention says wait on the
+// operator — the set that section lists — and nothing else.
+test("dashboard: the Ready for review tile counts hub needs-you sessions; no list on the page", () => {
   const D = loadDashboard();
   const now = Date.now();
   const sess = (id, summary, attention, status = "running") =>
@@ -181,23 +182,14 @@ test("dashboard: the Needs you group lists hub needs-you sessions, oldest first"
     sess("s7", "Older Hub", undefined),
   ] };
   D.render({ now, agents: [h] });
+  assert.deepEqual(tileOf(D.els.tiles.innerHTML, "Ready for review"), { value: "3", hint: "sessions waiting on you" });
+  assert.equal(tileOf(D.els.tiles.innerHTML, "Needs you"), null);
   const g = D.els.groups.innerHTML;
-  const ny = g.slice(g.indexOf('<section class="needs-you">'), g.indexOf("</section>"));
-  assert.ok(ny.includes('Needs you <span class="count">3</span>'), ny);
-  const order = ["Old Stall", "Asking", "Fresh Review"].map((n) => ny.indexOf(n));
-  assert.ok(order.every((i) => i > 0) && order[0] < order[1] && order[1] < order[2], "oldest wait first");
-  for (const n of ["Busy", "Asleep", "Stopped", "Older Hub"]) assert.ok(!ny.includes(n), n);
-  assert.ok(ny.includes('<span class="ny-chip stalled">stalled</span>'));
-  assert.ok(ny.includes("nas · Turma · PR open · CI passing"));
-  assert.ok(ny.includes('<span class="ny-age">50m</span>'));
-  assert.ok(ny.includes('href="/sessions?session=s2"'));
-  // XERK-1571: the tile counts the SAME set the group lists, worded to match.
-  assert.deepEqual(tileOf(D.els.tiles.innerHTML, "Needs you"), { value: "3", hint: "sessions waiting on you" });
-  // Nothing waiting on the operator: no group at all.
+  assert.ok(!g.includes("needs-you") && !g.includes("ny-row") && !g.includes("Needs you"), "no Needs-you list");
+  // Nothing waiting on the operator (or an older hub serving no attention): 0.
   const D2 = loadDashboard();
-  D2.render({ now, agents: [{ ...liveHost("nas", 1), sessions: [sess("s4", "Busy", at("working", 1))] }] });
-  assert.ok(!D2.els.groups.innerHTML.includes("needs-you"));
-  assert.equal(tileOf(D2.els.tiles.innerHTML, "Needs you").value, "0");
+  D2.render({ now, agents: [{ ...liveHost("nas", 1), sessions: [sess("s4", "Busy", at("working", 1)), sess("s7", "Older Hub")] }] });
+  assert.equal(tileOf(D2.els.tiles.innerHTML, "Ready for review").value, "0");
 });
 
 test("dashboard tiles: a removed host's spend still counts toward the fleet totals", () => {

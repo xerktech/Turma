@@ -99,9 +99,10 @@ fun fleetSummary(
         // drops NEGATIVE counts, XERK-1479) would otherwise wrap to a negative ceiling.
         maxSessions = if (capHosts.isEmpty()) null
             else capHosts.sumOf { it.maxSessions.toLong() }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-        // The SAME set the "Needs you" group lists (XERK-1571, web index.html):
-        // every running session the hub serves a needs-you:* attention for.
-        waiting = sessions.count { it.status == "running" && needsYouChip(it.attention?.state ?: "") != null },
+        // The SAME set the Sessions screen's Ready for review group lists
+        // (XERK-1571, web index.html): every running session the hub serves a
+        // needs-you:* attention for.
+        waiting = sessions.count(::needsYou),
         tokensToday = fleetTokens(spenders, UsageWindow.TODAY),
         tokensWeek = fleetTokens(spenders, UsageWindow.WEEK),
         tokensAllTime = fleetTokens(spenders, UsageWindow.TOTALS),

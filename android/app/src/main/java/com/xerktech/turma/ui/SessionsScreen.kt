@@ -291,8 +291,10 @@ fun rankRunning(rows: List<FlatSession>, now: Long): LiveGroups {
                 .thenBy { it.flat.session.id },
         )
         .toList()
+    // Every session the hub says needs the operator (XERK-1571) — the set the
+    // dashboard's tile counts; the local readyForReview port from an older hub.
     val (review, rest) = running.partition {
-        com.xerktech.turma.core.readyForReview(it.flat.session, it.state)
+        com.xerktech.turma.core.inReview(it.flat.session, it.state)
     }
     return LiveGroups(
         // Oldest-waiting first by the hub's attention `since` (XERK-1571); it

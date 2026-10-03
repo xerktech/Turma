@@ -1,7 +1,6 @@
 package com.xerktech.turma.ui
 
 import androidx.compose.animation.AnimatedVisibility
-import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -16,10 +15,8 @@ import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
-import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.ExpandLess
@@ -47,10 +44,8 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.draw.clip
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
-import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
@@ -61,8 +56,6 @@ import com.xerktech.turma.core.FleetSummary
 import com.xerktech.turma.core.LiveState
 import com.xerktech.turma.core.fleetSummary
 import com.xerktech.turma.core.liveState
-import com.xerktech.turma.core.needsYou
-import com.xerktech.turma.core.needsYouChip
 import com.xerktech.turma.core.orgColorMap
 import com.xerktech.turma.core.scopedAgents
 import com.xerktech.turma.core.scopedRetired
@@ -143,18 +136,6 @@ fun FleetScreen(
                 if (agents.isNotEmpty() || retired.isNotEmpty()) {
                     item(key = "tiles") {
                         FleetTiles(remember(agents, retired) { fleetSummary(agents, retired) })
-                    }
-                }
-                // "Needs you" (XERK-1571, web index.html): what the hub says waits
-                // on the operator, oldest wait first, above the host cards.
-                val needs = needsYou(agents)
-                if (needs.isNotEmpty()) {
-                    item(key = "needsYou") {
-                        NeedsYouCard(
-                            needs,
-                            now = fleet.now.takeIf { it > 0 } ?: System.currentTimeMillis(),
-                            onOpen = onOpenChat,
-                        )
                     }
                 }
                 if (agents.isEmpty()) {
@@ -554,11 +535,13 @@ private fun SessionCard(
                     st == "running" -> {
                         // Where the live read would say "idle", the hub's needs-you
                         // read speaks instead (XERK-1571, web index.html liveState):
-                        // a session the Needs-you group lists never reads idle here.
+                        // a session Ready for review lists never reads idle here. Its
+                        // one age is the hub's `since` ("stalled · Watch CI · for 31m").
                         // A stall takes the danger colour it has on every surface.
                         val needs = if (state == LiveState.IDLE) com.xerktech.turma.core.attentionLabel(session.attention) else null
+                        val needsFor = com.xerktech.turma.core.attentionFor(session.attention, now)
                         Text(
-                            needs ?: liveStateLabel(state, session.session),
+                            needs?.let { if (needsFor.isEmpty()) it else "$it · $needsFor" } ?: liveStateLabel(state, session.session),
                             style = MaterialTheme.typography.bodySmall,
                             color = if (needs != null && com.xerktech.turma.core.attentionStalled(session.attention)) MaterialTheme.colorScheme.error else muted,
                             maxLines = 1,
@@ -674,84 +657,10 @@ private fun SessionCard(
 
 /**
  * The six fleet summary tiles at the top of the dashboard, a 2-up grid matching
- * the web dashboard's `#tiles` (Hosts online / Running / Needs you / Tokens
+ * the web dashboard's `#tiles` (Hosts online / Running / Ready for review / Tokens
  * today / this week / all-time). Data is [fleetSummary], a pure port of the web
  * reducers.
  */
-/**
- * The dashboard's "Needs you" group (XERK-1571) — web index.html `needsYouHtml`:
- * one row per session the hub says waits on the operator, oldest first, with its
- * chip, name, how long, and host · repo · why. A tap opens the session.
- */
-@Composable
-private fun NeedsYouCard(
-    rows: List<com.xerktech.turma.core.FlatSession>,
-    now: Long,
-    onOpen: (String, String) -> Unit,
-) {
-    TurmaCard(Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
-            SectionLabel("Needs you (${rows.size})")
-            rows.forEach { r ->
-                val att = r.session.attention
-                val chip = needsYouChip(att?.state ?: "") ?: "review"
-                // A FILLED pill (web `.ny-chip`): the state colour is the fill and
-                // the text is picked against it, each >=4.5:1 in both themes; amber
-                // TEXT on the light surface is under 2:1.
-                val (chipFill, chipInk) = when (chip) {
-                    "question", "permission" -> com.xerktech.turma.ui.theme.TurmaColors.waiting to Color(0xFF0B0B0B)
-                    "stalled" -> Color(0xFFBB3535) to Color.White
-                    else -> Color(0xFF2262AF) to Color.White
-                }
-                Row(
-                    Modifier.fillMaxWidth().clickable { onOpen(r.host, r.session.id) },
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                ) {
-                    // A fixed-width first column, so every row's name and why
-                    // line start at the same x whatever the chip says.
-                    Text(
-                        chip,
-                        modifier = Modifier
-                            .width(84.dp)
-                            .clip(RoundedCornerShape(50))
-                            .background(chipFill)
-                            .padding(horizontal = 6.dp, vertical = 2.dp),
-                        color = chipInk,
-                        style = MaterialTheme.typography.labelSmall,
-                        fontWeight = FontWeight.SemiBold,
-                        textAlign = TextAlign.Center,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                    Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
-                        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                            // Two lines, not one: a question cut at ~25 characters
-                            // on a phone is unreadable (web `.ny-name` at <=600px).
-                            Text(
-                                sessionName(r.session), Modifier.weight(1f),
-                                fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis,
-                            )
-                            att?.since?.let {
-                                Text(
-                                    com.xerktech.turma.core.waitLeftText(now - it),
-                                    style = MaterialTheme.typography.bodySmall,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                                )
-                            }
-                        }
-                        Text(
-                            listOf(r.host, r.session.repo, att?.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · "),
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 2, overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                }
-            }
-        }
-    }
-}
-
 // Hub-wide "mobile push is off" banner (XERK-152) — shown above the tiles when
 // the hub reports no FCM credential, so a disabled push config is visible instead
 // of silently dropping every alert.
@@ -793,7 +702,9 @@ private fun FleetTiles(s: FleetSummary) {
         SummaryTile("Running sessions",
             if (s.maxSessions != null) "${s.running} / ${s.maxSessions}" else s.running.toString(),
             "${s.totalSessions} total", tileMod)
-        SummaryTile("Needs you", s.waiting.toString(), "sessions waiting on you", tileMod)
+        // The needs-you count (XERK-1571), worded as the Sessions screen's section
+        // that lists exactly those sessions.
+        SummaryTile("Ready for review", s.waiting.toString(), "sessions waiting on you", tileMod)
         val retiredNote = if (s.retiredCounted) " · incl. removed hosts" else ""
         SummaryTile("Tokens today", fmtTokens(s.tokensToday), "all sessions, incl. cache$retiredNote", tileMod)
         SummaryTile("Tokens this week", fmtTokens(s.tokensWeek), "last 7 days (UTC)$retiredNote", tileMod)

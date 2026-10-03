@@ -429,8 +429,53 @@ test("attention: sleeping holds, review sorts oldest-waiting first with the why 
   // Sleeping: Active, holding, "until HH:MM" — not Ready for review.
   assert.ok(!r.includes("Asleep"));
   assert.ok(a.includes("Asleep") && a.includes("💤 sleeping until " + hhmm), a);
+  // …and what it will check then, when the session gave a reason.
+  assert.ok(a.includes("💤 sleeping until " + hhmm + " · check CI"), a);
   // Waiting cards lead with the hourglass.
   assert.ok(a.includes("⏳ waiting · Watch CI"));
+});
+
+// XERK-1571 operator review: the needs-you cards live HERE, in Ready for review
+// (the dashboard has no list of its own). Where the hub serves attention it
+// decides the section: every needs-you:* session is listed — a stall whose own
+// turn never finished included — and a session it says is idle is not, so the
+// section is the set the dashboard's "Ready for review" tile counts. From an
+// older hub (no attention) the page's own readyForReview decides, as before.
+test("attention: Ready for review lists every hub needs-you session, oldest first", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const att = (state, agoMin, why) => ({ attention: { state, since: t - agoMin * 60 * 1000, ...(why ? { why } : {}) } });
+  const quiet = { paneBusy: false, transcriptAgeSec: 50 * 60, lastRole: "user", lastHasToolUse: false };
+  const { now, host: h } = host([
+    { ...running("71111", "Stalled Quiet", { ...quiet,
+        agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+      ...att("needs-you:stalled", 31, "Watch CI") },
+    { ...running("72222", "Asking", { paneBusy: false, transcriptAgeSec: 30, question: "Ship it?" }),
+      ...att("needs-you:question", 10, "Ship it?") },
+    { ...finished("73333", "Hub Says Idle"), ...att("idle", 2) },
+    finished("74444", "Older Hub"),
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML;
+  assert.ok(r.includes('Ready for review <span class="count">3</span>'), r);
+  const order = ["Stalled Quiet", "Asking", "Older Hub"].map((n) => r.indexOf(n));
+  assert.ok(order.every((i) => i >= 0) && order[0] < order[1] && order[1] < order[2], "oldest wait first, since-less last");
+  assert.ok(!r.includes("Hub Says Idle"));
+  assert.ok(els.idle.innerHTML.includes("Hub Says Idle"));
+  assert.ok(r.includes('<div class="why">stalled 31m</div>'), r);
+  assert.ok(r.includes('<div class="why">for 10m</div>'), r);
+  // The hub says it stalled where this page can't judge silence (its host just
+  // went quiet): the hub's read, in the danger tone, never "finished".
+  const { render: render2, els: els2 } = loadPage();
+  const { now: n2, host: h2 } = host([
+    { ...running("75555", "Quiet Host Stall", { ...quiet,
+        agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+      ...att("needs-you:stalled", 31, "Watch CI") },
+  ]);
+  render2({ now: n2, agents: [{ ...h2, online: false, lastSeen: n2 - 10 * 60 * 1000 }] });
+  const r2 = els2.review.innerHTML;
+  assert.ok(r2.includes('<div class="state stalled">stalled · Watch CI'), r2);
+  assert.ok(r2.includes('<span class="dot stalled"></span>'), r2);
 });
 
 // XERK-1571 screenshot pass. A permission card says it waits for PERMISSION and

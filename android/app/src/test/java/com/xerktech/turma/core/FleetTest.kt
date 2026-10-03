@@ -120,8 +120,9 @@ class FleetTest {
     }
 
     @Test fun `summary counts hosts, running, and waiting-on-you`() {
-        // XERK-1571: the tile counts the SAME set the Needs-you group lists — every
-        // running session the hub serves a needs-you:* attention for, not questions alone.
+        // XERK-1571: the tile counts the SAME set the Sessions screen's Ready for
+        // review lists — every running session the hub serves a needs-you:*
+        // attention for, not questions alone.
         val needs = { state: String -> com.xerktech.turma.model.Attention(state = state, since = 1L) }
         val a = agent("h1", online = true, sessions = listOf(
             session("running", question = "Which option?", attention = needs("needs-you:question")),
