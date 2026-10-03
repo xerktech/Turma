@@ -17362,6 +17362,14 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         p3 = mock.patch.object(ha, "board_status_options", lambda key: list(self.OPTS))
         p3.start()
         self.addCleanup(p3.stop)
+        self.notified = []     # (sid, text) per notify_session
+
+        def fake_notify(sm, sid, text):
+            self.notified.append((sid, text))
+            return True
+        p4 = mock.patch.object(ha.SessionManager, "notify_session", fake_notify)
+        p4.start()
+        self.addCleanup(p4.stop)
 
     def _sess(self, sm, **over):
         sess = {"id": self.SID, "status": "running", "repo": "Turma",
@@ -17509,6 +17517,62 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         sm._apply_closed_tickets()
         self.assertEqual([r["final"] for r in sm.ticket_outcome_results], [False, True])
         self.assertNotIn("outcome", sess["ticket"])
+
+    def test_a_final_failure_tells_the_session_to_close_it_itself(self):
+        # The CLI only queues the request and the directive ends the turn, so the
+        # session must be told the ticket is still open — else it thinks it closed
+        # and its tracker-tool fallback never runs.
+        self.OPTS = self.OPTS[:1]          # the workflow offers no Done from here
+        sm = self.make_manager()
+        self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])            # a retry is still due: quiet
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        sm._apply_closed_tickets()
+        [(sid, text)] = self.notified
+        self.assertEqual(sid, self.SID)
+        self.assertIn(f"could NOT close ticket {self.KEY} as not reproducible", text)
+        self.assertIn("nothing can move it to Done", text)
+        self.assertIn("still open", text)
+        self.assertIn("tracker CLI/MCP this host gives you", text)
+        self.assertIn("tell the operator", text)
+        sm._apply_closed_tickets()                     # told once, not every beat
+        self.assertEqual(len(self.notified), 1)
+
+    def test_a_refusal_is_told_to_the_session_and_a_success_is_not(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        [(sid, text)] = self.notified
+        self.assertIn("refused: the session's ticket is not on this host's board", text)
+        self.notified.clear()
+        sess["ticket"]["siteKey"] = self.SITE
+        self._req(at=1_786_400_000_001)
+        sm._process_close_ticket_requests(now=2000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def test_the_failure_message_is_one_bounded_line(self):
+        msg = ha._close_ticket_failed_message("ENG-9", None, "HTTP 400:\n" + "x" * 900)
+        self.assertNotIn("\n", msg)
+        self.assertIn("could NOT close ticket ENG-9: HTTP 400: x", msg)
+        self.assertLess(len(msg), 700)
+
+    def test_a_notify_that_raises_never_breaks_the_beat(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        with mock.patch.object(sm, "notify_session", side_effect=OSError("pane gone")):
+            sm._apply_closed_tickets()                 # logged, never raised
+        self.assertFalse(sm.ticket_outcome_results[0]["ok"])
 
     def test_only_a_running_claude_session_with_a_ticket_is_served(self):
         for over in ({"agentType": "dsh"}, {"agentType": "qwen"}, {"status": "stopped"},

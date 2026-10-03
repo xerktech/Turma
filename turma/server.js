@@ -13465,8 +13465,11 @@ registerGuardMirror("autoCloseNotified", {
 // URL-charset-only string is interpolated: an oversize one would push the text past
 // the agent's input cap (send_input refuses the WHOLE message, so the session would
 // never hear its PR merged), and a looser shape lets arbitrary text into the pane.
+// The close step names the session CLI only to a CLAUDE session: a dsh/qwen
+// session is not given $TURMA_SESSION_CLI (agent-session-cli.md), so it is sent
+// straight to the host's own tracker tool (XERK-1569).
 const AUTO_CLOSE_URL_RE = /^https?:\/\/[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]{1,300}$/;
-function autoCloseMergedMessage(urls) {
+function autoCloseMergedMessage(urls, agentType) {
   const named = (urls || []).filter((u) => typeof u === "string" && AUTO_CLOSE_URL_RE.test(u));
   const which = named.length === 1 ? "PR " + named[0] + " has"
     : named.length ? "PRs " + named.join(", ") + " have" : "PR has";
@@ -13478,10 +13481,13 @@ function autoCloseMergedMessage(urls) {
     + "branch — auto-merge squashes it) and open a follow-up PR from this session — it "
     + "will be auto-merged the same way and you will be asked to verify again. "
     + "If it IS deployed and working and all the work for this ticket is done, "
-    + "mark the ticket as Done so this session can wrap up — prefer "
-    + "`python3 -SsE \"$TURMA_SESSION_CLI\" close-ticket done --note '<what you verified>'` "
-    + "(it comments the evidence and records the outcome on the board), else the "
-    + "tracker CLI/MCP this host gives you.";
+    + "mark the ticket as Done so this session can wrap up — "
+    + (agentType === "dsh" || agentType === "qwen"
+      ? "comment what you verified on the ticket and close it with the tracker "
+        + "CLI/MCP this host gives you."
+      : "prefer `python3 -SsE \"$TURMA_SESSION_CLI\" close-ticket done --note "
+        + "'<what you verified>'` (it comments the evidence and records the outcome "
+        + "on the board), else the tracker CLI/MCP this host gives you.");
 }
 // "<siteKey>\x00<epicKey>" epics already written to Done by epicRunCompleteSweep,
 // so the epic-Done write fires at most once per hub lifetime. The DURABLE guard is
@@ -13723,7 +13729,7 @@ function autoCloseSweep() {
       const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
       if (fresh) {
         const newly = seen ? mergedUrls.filter((u) => !seen.has(u)) : mergedUrls;
-        queueCommand(host, { type: "input", sessionId: s.id, text: autoCloseMergedMessage(newly) });
+        queueCommand(host, { type: "input", sessionId: s.id, text: autoCloseMergedMessage(newly, s.agentType) });
         const at = Date.now();
         autoCloseNotified.set(nk, { at, urls: new Set(mergedUrls) });
         guardStoreSet("autoCloseNotified", nk, { at, urls: [...mergedUrls] });

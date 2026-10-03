@@ -12173,6 +12173,22 @@ def _close_ticket_comment(req):
             f"this ticket:\n\n{req.get('note') or ''}")
 
 
+def _close_ticket_failed_message(key, kind, error):
+    """What a session is told when the manager gave up on its close-ticket
+    request (refused, or failed its last attempt). The CLI only queues the
+    request and the directive then ends the turn, so without this the session
+    believes the ticket closed while it is still open — and its own "else the
+    tracker CLI/MCP" fallback never runs. `error` is tracker/exception text, so
+    it is flattened to one line and capped."""
+    label = CLOSE_TICKET_LABELS.get(kind)
+    why = re.sub(r"\s+", " ", str(error or "unknown error")).strip()[:300]
+    return (f"The Turma manager could NOT close ticket {key}"
+            f"{f' as {label}' if label else ''}: {why}. The ticket is still open. "
+            "Close it yourself with the tracker CLI/MCP this host gives you (comment "
+            "the evidence, then move it to Done); if this host has no tracker tool, "
+            "tell the operator the ticket needs closing and why.")
+
+
 def _inbox_opted_out(workdir):
     """True when this session's settings turn the inbox off, so the pane is the
     only path that will actually deliver.
@@ -24989,13 +25005,25 @@ class SessionManager:
         (`ticketOutcomeResults`), and stamp a success as `ticket.outcome =
         {kind, at}` on the session's record AND its ticket-ledger entry, so the
         board can say why the ticket closed after the session is gone too. The
-        block is REBOUND, never mutated, since the worker reads it."""
+        block is REBOUND, never mutated, since the worker reads it.
+
+        A FINAL failure (a refusal, or the last attempt failing) is told to the
+        session (`notify_session`, the PR-comment deliver's route): the CLI only
+        queued the request and the directive ended the turn, so this is
+        the only way the session learns the ticket is still open and falls back
+        to its own tracker tool. A failure that will be retried says nothing."""
         with self._close_ticket_lock:
             landed, self._close_ticket_landed = self._close_ticket_landed, []
         changed = False
         for r in landed:
             self.ticket_outcome_results.append(r)
             if not r["ok"]:
+                if r.get("final"):
+                    try:
+                        self.notify_session(r["sessionId"], _close_ticket_failed_message(
+                            r["key"], r.get("kind"), r.get("error")))
+                    except Exception as e:
+                        log(f"close-ticket: could not tell {r['sessionId']}: {e}")
                 continue
             sess = self._find(r["sessionId"])
             ticket = (sess or {}).get("ticket")

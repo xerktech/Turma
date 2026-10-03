@@ -12020,7 +12020,7 @@ const resetMerge = () => {
 const mergeBeat = async (device, site, {
   autoMerge = true, ready = "ready", state = "OPEN", mergeable = "MERGEABLE",
   paneBusy = false, ticketType = "bug", issueType = "Bug", statusCategory = "inprogress",
-  question, prs, tickets, url = PR1,
+  question, prs, tickets, url = PR1, agentType,
 } = {}) => {
   // `issueType` is the TRACKER Issue Type (`type`); `ticketType` is the triage
   // classifier's assessment (`triage.type`) — kept distinct so a test can drive
@@ -12032,6 +12032,7 @@ const mergeBeat = async (device, site, {
       repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: ticketType, actionable: true } }],
     sessions: [{ id: "sm1", status: "running",
+      ...(agentType ? { agentType } : {}),
       ticket: { key: "ENG-9", siteKey: site },
       prs: prs || [{ url, state, ready, mergeable }],
       session: { transcriptAgeSec: 30, paneBusy,
@@ -13962,6 +13963,24 @@ test("auto-close: the merged message asks the session to verify the DEPLOY befor
   assert.ok(msg.includes('python3 -SsE "$TURMA_SESSION_CLI" close-ticket done --note'),
     "names the session CLI's close-ticket");
   assert.match(msg, /else the tracker CLI\/MCP this host gives you/);
+});
+
+test("XERK-1569: a dsh/qwen session is told to close with its tracker tool, never the session CLI", async () => {
+  // dsh/qwen sessions are not given $TURMA_SESSION_CLI, so naming it would hand
+  // them a command that cannot run.
+  hub.__setDshEnabled(true);
+  hub.__setQwenEnabled(true);
+  for (const agentType of ["dsh", "qwen"]) {
+    resetMerge();
+    const dev = "amRt" + agentType;
+    await mergeBeat(dev, `amrt${agentType}.atlassian.net`, { state: "MERGED", agentType });
+    autoCloseSweep();
+    const [msg] = inputTexts(dev);
+    assert.ok(msg, `${agentType}: the session is still messaged`);
+    assert.match(msg, /mark the ticket as Done/i);
+    assert.ok(!msg.includes("TURMA_SESSION_CLI"), `${agentType}: no session CLI, got ${msg}`);
+    assert.match(msg, /close it with the tracker CLI\/MCP this host gives you/);
+  }
 });
 
 test("auto-close: only a bounded, URL-shaped PR url reaches the message; odd urls never re-nag", async () => {

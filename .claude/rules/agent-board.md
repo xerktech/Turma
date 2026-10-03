@@ -123,6 +123,13 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   the project-scoped comments endpoint, HTML-escaped), then `apply_board_status` to
   `_close_ticket_option` — a Done-column option, re-read fresh like `set_board_status`; for
   `not-reproducible` a Done-category option NAMED so (`_NOT_REPRO_STATUS_RE`) wins.
+  - **Only a status/transition NAME is mapped, never a tracker RESOLUTION field**: the transition
+    POST sets no `fields.resolution`, so a Jira board whose "Cannot Reproduce" is a resolution (not
+    a status) closes as plain Done, and the kind survives only in the comment text and `outcome`.
+  - **A final failure or refusal is TOLD to the session** (`notify_session` from the beat's
+    `_apply_closed_tickets`, `_close_ticket_failed_message`): the reason, "still open", and to close
+    it with the host's tracker CLI/MCP or tell the operator. The CLI only queues, so without this
+    the session ends its turn believing the ticket closed. A retry still due says nothing.
   - Only for a RUNNING Claude session whose `ticket.siteKey` is this host's board; dsh/qwen skipped.
   - Success stamps **`ticket.outcome = {kind, at}`** on the record (served via `_served_ticket`)
     AND its `_remember_ticket` ledger entry (added only when present), so `repos[].resumable`
@@ -239,8 +246,8 @@ to a tracker, deciding which repo a ticket belongs to, and spawning a session to
   failure class) — a log-only refusal is indistinguishable from a slow spawn, spinning out the
   board's follow window. Tests: the refusal cases in `TestSpawnTicket`.
 - The fetched ticket becomes the **initial prompt** (`build_ticket_prompt`: fields, description, the
-  newest `TICKET_PROMPT_COMMENTS` comments, its attachments) — the session has no board creds of its
-  own, so that text is all it sees.
+  newest `TICKET_PROMPT_COMMENTS` comments, its attachments) — the session may or may not have a
+  tracker CLI/MCP of its own, so that text is all it can count on seeing.
 - **A BUG-typed ticket's prompt tells the session to verify the bug is still real FIRST** (XERK-370,
   `_ticket_is_bug` + `TICKET_BUG_VERIFY_DIRECTIVE`): reproduce it against the up-to-date default
   branch before changing anything, and STOP (no code change, no PR) if it's already

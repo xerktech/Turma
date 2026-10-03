@@ -105,10 +105,15 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   landed (`_close_ticket_tries[sid].commented`). A final outcome drops the file unless the session
   has since written a DIFFERENT request (identity = kind/note/requestedAt). Progress is worker-owned
   and in-memory: a manager restart re-tries a file still there, which can re-post its comment.
+- **A FINAL failure or refusal is messaged to the session** (`notify_session`, on the beat): the CLI
+  returns before the tracker is touched, so this is what lets the "tracker CLI/MCP else" fallback
+  run. Its reply says so ("…and message you if it cannot close the ticket").
 - Kill/delete/restart clears the dir (`_clear_session_requests`) — an unread request dies with it.
 - **Taught by three directives**, each "session CLI first, the host's tracker CLI/MCP else":
   `TICKET_CLOSE_STALE_CLAUSE` (bug prompt + `TICKET_CLOSE_PROMPT` in `_session_directive`) and the
   hub's `autoCloseMergedMessage`. All spell `"$TURMA_SESSION_CLI"` — see the open question below.
+  Each is gated on runtime: a dsh/qwen session gets tracker-tool wording only (`session_cli=False`
+  agent-side; `autoCloseMergedMessage(urls, s.agentType)` hub-side).
 - Tests: `TestCloseTicketRequest`, `TestTicketClosingDirectives`; hub `XERK-1569` cases.
 
 ## Real-host spike (not yet run)
