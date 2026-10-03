@@ -3434,6 +3434,29 @@ test("XERK-1479: a negative capacity count is dropped, not served into the fleet
   assert.deepEqual(kept.capacity, ok.capacity);   // zero is a real count, kept
 });
 
+test("XERK-1564: a session's wake request is coerced by name, absent = none", () => {
+  const live = (session) => {
+    const rec = { device: "xerk1564-wake", sessions: [{ id: "s", session }] };
+    hub.normalizeRecord(rec);
+    return rec.sessions[0].session;
+  };
+  // A well-formed request rides through; an over-long reason is capped.
+  const ok = live({ wakeAt: 1_786_400_000_000, wakeReason: "x".repeat(500) });
+  assert.equal(ok.wakeAt, 1_786_400_000_000);
+  assert.equal(ok.wakeReason.length, 200);
+  // Junk is DROPPED (absent = no wake), never repaired into a plausible time.
+  for (const bad of [1.5, -1, 0, "soon", {}, null, 2 ** 53, Infinity, true]) {
+    assert.equal("wakeAt" in live({ wakeAt: bad }), false, `wakeAt ${String(bad)} kept`);
+  }
+  for (const bad of [5, {}, [], null, true]) {
+    assert.equal("wakeReason" in live({ wakeReason: bad }), false, "non-string reason kept");
+  }
+  // A session that reports none carries none.
+  const none = live({ paneBusy: false });
+  assert.equal("wakeAt" in none, false);
+  assert.equal("wakeReason" in none, false);
+});
+
 test("XERK-455: typed /api/agents fields are coerced at ingest, not served raw", async () => {
   // A field is decode-fatal on Android the moment a client TYPES it: /api/agents
   // decodes atomically, so one host beating a wrong-typed value throws the whole

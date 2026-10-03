@@ -25,6 +25,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     its own address book); Bash walks past it (XERK-309), file-edit tools only, like its neighbours.
   - **`Read(~/.turma/peers.tsv)` is ALLOWED** — without it, reading the roster costs a permission
     prompt with `ListAgents` denied and no way to get that approval, leaving no address book at all.
+  - The session CLI (`hooks/session_cli.py`, XERK-1564) adds one generated Bash allow and the
+    `Edit(~/.turma/session-requests/**)` deny — contract in `agent-session-cli.md`.
 - **`crossSessionInbound: accept`** (XERK-339) is a fix, not a convenience: Claude Code's default
   HOLDS a peer message whenever sender/receiver permission-mode classes differ, opening an approval
   dialog nothing here can answer (not an AskUserQuestion; owns the input line the composer types

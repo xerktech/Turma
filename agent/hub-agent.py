@@ -313,6 +313,16 @@ UPDATING_ANNOUNCE_TIMEOUT_SEC = _env_float("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC"
 # question lives here as `<sessionId>.req.json`; the answer the glasses client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
 QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
+# Rendezvous dir for the session CLI (agent/hooks/session_cli.py, XERK-1564): a
+# session's structured requests land as `<sessionId>/<subcommand>.json`. The
+# files are SESSION-WRITTEN, so they are read only via _read_untrusted_json.
+# See .claude/rules/agent-session-cli.md.
+SESSION_REQUESTS_DIR = os.path.join(REGISTRY_DIR, "session-requests")
+# The same plain-name rule session_cli.py applies before joining an id on a path.
+SESSION_REQUEST_SID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
+# One request file is a few hundred bytes; the CLI caps its own text fields.
+SESSION_REQUEST_MAX_BYTES = 16 * 1024
+WAKE_REASON_MAX_CHARS = 200
 # Killed-but-resumable session history (branch + transcript survive a kill).
 #
 # This is a CACHE of what a kill knew, not the record of it. It buys a killed
@@ -4332,6 +4342,13 @@ _GUARD_DENY_PATH_RULES = [
     # guard walks past Bash either way (XERK-309), so this covers the file-edit
     # tools only, exactly like its neighbours.
     "Edit(~/.turma/peers.tsv)",
+    # The session CLI's rendezvous dir (XERK-1564): a session writes its OWN
+    # requests here through `session_cli.py`, never through the file tools, and
+    # one session must not plant a wake or close-ticket request for another.
+    # File-edit tools only, like its neighbours — Bash still writes it (that is
+    # how the CLI works), which is why the manager reads every file in it as
+    # untrusted (_read_untrusted_json).
+    "Edit(~/.turma/session-requests/**)",
     # The qwen safety-guard shim config (XERK-510 [Qwen F]) — it holds the hook
     # script paths and the credential/runtime-code globs the qwen PreToolUse shim
     # enforces, so a session that rewrote it could disable its own guard. Adding
@@ -4406,6 +4423,22 @@ def ask_script_path():
     """Absolute path to the bundled AskUserQuestion bridge hook (``hooks/ask.py``),
     resolved the same way as ``guard_script_path``."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "ask.py")
+
+
+def session_cli_path():
+    """Absolute path to the session CLI (``hooks/session_cli.py``, XERK-1564),
+    resolved the same way as ``guard_script_path``. Under ``hooks/`` because that
+    directory is what the native install, the updater and release staging glob."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks",
+                        "session_cli.py")
+
+
+def session_cli_allow_rule(cli_path=None):
+    """The generated allow rule that lets a session run the session CLI without
+    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (the hook
+    security flags) and the ABSOLUTE script path, so the rule admits only this
+    script — an allow rule for `python3` alone would admit any code at all."""
+    return f"Bash(python3 -SsE {cli_path or session_cli_path()}:*)"
 
 
 def qwen_ask_mcp_path():
@@ -4630,7 +4663,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     for rule in deny:  # operator deny unions on top of the guard's own rules
         if rule not in perms["deny"]:
             perms["deny"].append(rule)
-    perms["allow"] = list(_GUARD_ALLOW_PATH_RULES)
+    perms["allow"] = list(_GUARD_ALLOW_PATH_RULES) + [session_cli_allow_rule()]
     for rule in allow:  # operator allow unions on top of the app's own rules
         if rule not in perms["allow"]:
             perms["allow"].append(rule)
@@ -12402,6 +12435,39 @@ def _read_untrusted_json(path, max_bytes):
     return data if isinstance(data, dict) else None
 
 
+def session_request_dir(session_id):
+    """`SESSION_REQUESTS_DIR/<session_id>`, or None for an id that is not a
+    plain name (it is joined onto a path). See hooks/session_cli.py."""
+    if not isinstance(session_id, str) or not SESSION_REQUEST_SID_RE.fullmatch(session_id):
+        return None
+    return os.path.join(SESSION_REQUESTS_DIR, session_id)
+
+
+def read_wake_request(session_id):
+    """The session's pending `wake` request as {wakeAt, wakeReason}, or None.
+
+    The file is SESSION-WRITTEN (`session_cli.py wake`, or Bash), so it is read
+    only through `_read_untrusted_json` — a FIFO or symlink planted at the name
+    is refused, never opened on the heartbeat thread. `wakeAt` must be a positive
+    integer epoch-ms inside the hub's safe-integer range; anything else is no
+    request. The reason is flattened to one line and capped, since it is typed
+    back into the session's pane."""
+    folder = session_request_dir(session_id)
+    if not folder:
+        return None
+    data = _read_untrusted_json(os.path.join(folder, "wake.json"),
+                                SESSION_REQUEST_MAX_BYTES)
+    if data is None:
+        return None
+    at = data.get("wakeAt")
+    if isinstance(at, bool) or not isinstance(at, int) or not 0 < at < 2 ** 53:
+        return None
+    reason = data.get("reason")
+    reason = (re.sub(r"\s+", " ", reason).strip()[:WAKE_REASON_MAX_CHARS]
+              if isinstance(reason, str) else "")
+    return {"wakeAt": at, "wakeReason": reason or None}
+
+
 def _inbox_opted_out(workdir):
     """True when this session's settings turn the inbox off, so the pane is the
     only path that will actually deliver.
@@ -12690,6 +12756,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # assistant turn is seen this beat; the record keeps the last known value.
         "lastTurnContextTokens": None,
         "tail": [],                # recent transcript messages, for the glasses client
+        # A pending session-CLI `wake` request (XERK-1564), read off its
+        # rendezvous file; _session_payload persists it on the registry record.
+        "wakeAt": None,
+        "wakeReason": None,
     }
 
     def _finish():
@@ -12712,6 +12782,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
             report["questionTotal"] = hq["total"]
             report["questionMulti"] = hq["multi"]
             report["questionSource"] = "hook"
+        wake = read_wake_request(session_id)
+        if wake:
+            report["wakeAt"] = wake["wakeAt"]
+            report["wakeReason"] = wake["wakeReason"]
         return report
 
     # One listdir serves both jobs: priming every file's offset (so a restarted
@@ -17312,6 +17386,9 @@ class SessionManager:
         # this process — the seed is a one-shot bounded read per session, for
         # records predating the field (the per-beat scan only sees new bytes).
         self._model_seeded = set()
+        # sid -> the wakeAt last delivered (XERK-1564), so a wake.json that could
+        # not be removed is not re-read into a second delivery every beat.
+        self._wake_fired = {}
         # Cached Jira-ticket -> repo triage decisions (persisted), plus the single
         # in-flight triage subprocess. At most one runs at a time: a backlog
         # trickles out a batch per jira beat rather than forking N models at once
@@ -20766,9 +20843,12 @@ class SessionManager:
         # hook subprocesses. Only sessions launched with --settings get the
         # bridge; the one-shot summary claude (no --settings) has neither var,
         # so ask.py passes through there.
+        # TURMA_SESSION_CLI is how the session reaches the session CLI
+        # (hooks/session_cli.py, XERK-1564) — `python3 -SsE "$TURMA_SESSION_CLI"`.
         env_prefix = (
             f"TURMA_SESSION_ID={shlex.quote(sess['id'])} "
             f"TURMA_QUESTIONS_DIR={shlex.quote(QUESTIONS_DIR)} "
+            f"TURMA_SESSION_CLI={shlex.quote(session_cli_path())} "
         )
         # glab reads its default host from GITLAB_HOST — never the agent's own
         # GITLAB_URL — so on a self-hosted GitLab a session's `glab mr create`
@@ -20816,6 +20896,7 @@ class SessionManager:
             extra_env = {
                 "TURMA_SESSION_ID": sess["id"],
                 "TURMA_QUESTIONS_DIR": QUESTIONS_DIR,
+                "TURMA_SESSION_CLI": session_cli_path(),
             }
             if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
                 extra_env["GITLAB_HOST"] = gitlab_base()
@@ -21195,6 +21276,7 @@ class SessionManager:
         # drop any leftover question rendezvous files so a dead question can't
         # surface as a phantom on the next beat.
         self._clear_question_files(sid)
+        self._clear_session_requests(sid)
 
     def _set_error(self, sess, msg):
         sess["status"] = "error"
@@ -23084,6 +23166,7 @@ class SessionManager:
             self.sess_state.pop(sid, None)  # fresh freshness/PR tracking
             self.dsh_status.pop(sid, None)  # restart-clear-context = a fresh dsh agent (XERK-468)
             self._clear_question_files(sid)  # drop any question the old claude was blocked on
+            self._clear_session_requests(sid, sess)  # its wake/close requests too (XERK-1564)
             # A message queued for the pre-restart conversation is contextually
             # gone with it — never re-inject it into the fresh one (XERK-47).
             sess.pop("pendingInputs", None)
@@ -24651,6 +24734,7 @@ class SessionManager:
                 try:
                     self.sess_state.pop(sid, None)   # fresh freshness/PR tracking
                     self._clear_question_files(sid)  # nothing to answer in a fresh convo
+                    self._clear_session_requests(sid, sess)
                     sess.pop("pendingInputs", None)  # queued for the gone convo (XERK-47)
                     sess["errorMsg"] = None
                     self._launch_tmux(sess)          # fresh --session-id, new convo
@@ -24908,6 +24992,83 @@ class SessionManager:
                 os.remove(path)
             except OSError:
                 pass
+
+    # ---- session CLI requests (XERK-1564) ------------------------------------
+
+    def _clear_session_requests(self, sid, sess=None):
+        """Drop a session's whole session-CLI request dir, and its wake fields
+        when the record is still here (kill / delete / clear-context restart): a
+        request made by a conversation dies with it. Best-effort."""
+        folder = session_request_dir(sid)
+        if folder:
+            try:
+                if os.path.islink(folder):
+                    os.unlink(folder)   # never rmtree THROUGH a planted link
+                else:
+                    shutil.rmtree(folder, ignore_errors=True)
+            except OSError:
+                pass
+        self._wake_fired.pop(sid, None)
+        if sess is not None:
+            sess.pop("wakeAt", None)
+            sess.pop("wakeReason", None)
+
+    def _ingest_wake_request(self, sess, signals):
+        """Persist this beat's wake.json read onto the registry record (so a
+        manager restart keeps it) and serve the RECORD's value on the session.
+        Absent on the wire = no wake pending."""
+        at = signals.pop("wakeAt", None)
+        reason = signals.pop("wakeReason", None)
+        if (at is not None and at != self._wake_fired.get(sess.get("id"))
+                and (at, reason) != (sess.get("wakeAt"), sess.get("wakeReason"))):
+            sess["wakeAt"] = at
+            sess["wakeReason"] = reason
+            self.save()
+        if sess.get("wakeAt") is not None:
+            signals["wakeAt"] = sess.get("wakeAt")
+            signals["wakeReason"] = sess.get("wakeReason")
+
+    def _deliver_due_wakes(self, now_ms=None):
+        """Stage a wake-up into every running session whose `wakeAt` has come.
+
+        A time compare only — no pane RPC — so it fits the beat (XERK-395): the
+        input rides `_stage_input`, the operator path, which the input worker
+        delivers off the beat and the compaction outbox keeps. The request file
+        and the record's fields are cleared as it fires, so one request wakes
+        the session once."""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        fired = False
+        for sess in list(self.registry):
+            at = sess.get("wakeAt")
+            if (sess.get("status") != "running" or isinstance(at, bool)
+                    or not isinstance(at, int) or now_ms < at):
+                continue
+            sid = sess.get("id")
+            reason = (sess.get("wakeReason") or "").rstrip(". ") or "the wake you asked for"
+            self._stage_input(sid, f"Wake-up: {reason}. Check it and continue.")
+            self._wake_fired[sid] = at
+            sess.pop("wakeAt", None)
+            sess.pop("wakeReason", None)
+            self._drop_wake_file(sid, at)
+            fired = True
+            log(f"session {sid}: wake-up delivered")
+        if fired:
+            self.save()
+
+    def _drop_wake_file(self, sid, delivered_at):
+        """Remove the wake.json just delivered — unless the session has since
+        written a DIFFERENT request, which stands for its own time."""
+        folder = session_request_dir(sid)
+        if not folder:
+            return
+        path = os.path.join(folder, "wake.json")
+        data = _read_untrusted_json(path, SESSION_REQUEST_MAX_BYTES)
+        if data is not None and data.get("wakeAt") != delivered_at:
+            return
+        try:
+            os.remove(path)
+        except OSError:
+            pass
 
     # ---- dsh liveness seam (XERK-468 [D]) -----------------------------------
     #
@@ -31424,6 +31585,7 @@ class SessionManager:
                 if ma and ma != sess.get("permissionMode"):
                     sess["permissionMode"] = ma
                     self.save()
+                self._ingest_wake_request(sess, signals)
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
@@ -31906,6 +32068,12 @@ class SessionManager:
         # Apply the outbox records the off-beat input worker staged (XERK-867):
         # the worker did the pane delivery, the beat owns the registry mutation.
         self._apply_landed_inputs()
+        # Deliver session-CLI wake-ups that have come due (XERK-1564): a time
+        # compare per record, then a STAGE onto the off-beat input worker.
+        try:
+            self._deliver_due_wakes()
+        except Exception as e:
+            log(f"wake delivery failed: {e}")
         # Tell sessions about process trees the memory guard killed (XERK-1019).
         # The kill already happened on the guard's thread; a message is never
         # worth taking the host's sessions down for.
