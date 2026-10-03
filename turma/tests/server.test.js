@@ -2634,6 +2634,30 @@ test("http: /api/agents carries pushEnabled reflecting FCM config (XERK-152)", a
   await request("POST", "/api/heartbeat", { body: { device: "push-host" }, headers: agentHeaders });
 });
 
+// ---- the registry is a null-prototype map ----------------------------------------
+
+test("http: a prototype key is never a host — no route can queue onto a built-in", async () => {
+  // `agents` was a plain object, so `/api/agents/__proto__/restart` resolved to
+  // Object.prototype and queued `restartAgent` onto Object.prototype.commands:
+  // every host registering afterwards inherited it and restarted on every beat.
+  for (const k of ["__proto__", "constructor", "toString", "hasOwnProperty"]) {
+    for (const [method, route, body] of [
+      ["POST", "restart", {}],
+      ["POST", "sessions/s1/input", { text: "echo pwned" }],
+      ["POST", "updating", {}],
+    ]) {
+      const headers = route === "updating" ? agentHeaders : userHeaders;
+      const r = await request(method, `/api/agents/${encodeURIComponent(k)}/${route}`, { body, headers });
+      assert.ok(r.status >= 400, `${k}/${route} answered ${r.status}`);
+    }
+  }
+  assert.equal(({}).commands, undefined, "Object.prototype.commands polluted");
+  assert.equal(({}).updating, undefined, "Object.prototype.updating polluted");
+  const reply = await request("POST", "/api/heartbeat",
+    { body: { device: "fresh-after-proto" }, headers: agentHeaders });
+  assert.deepEqual(reply.body.commands || [], [], "a new host inherited queued commands");
+});
+
 // ---- updating status (XERK-29) -----------------------------------------------
 
 test("http: /updating shows an expected restart as `updating`, not `offline`", async () => {
