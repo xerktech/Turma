@@ -4617,9 +4617,15 @@ SANDBOX_DOMAIN_FLOOR = (
 # worktree force-rewinds remote main and deletes remote branches unprompted; a
 # floored `git fetch . HEAD:main` (or `--update-head-ok`) moves local main for a
 # later `--all` push to publish; a floored `git switch` puts a session ON main
-# for a `git push origin HEAD`. Git stays with the classifier.
+# for a `git push origin HEAD`. A git command TYPED DIRECTLY stays with the
+# classifier. Residual: the test-runner rules run SESSION-EDITABLE code (the
+# `./gradlew` script, package.json scripts, conftest.py, test modules) past
+# both the classifier and the guard, which sees only the runner's command line,
+# so a session can still reach main or credentials through a script it writes.
+# Dropping the git rules closed the DIRECT route, not every route.
 # `TURMA_TOOL_ALLOW` (CSV) REPLACES the list when set non-blank; keep git rules
-# out of it for the same reason. Distinct from `TURMA_TOOL_GRANTS`, which only
+# out of it for the same reason. It splits on every comma with no escape, so a
+# rule whose pattern holds a comma cannot be set through it. Distinct from `TURMA_TOOL_GRANTS`, which only
 # exempts the guard's destructive category at hook run time and is never
 # written here. The session-CLI rule is XERK-1564's.
 TOOL_ALLOW_FLOOR = (

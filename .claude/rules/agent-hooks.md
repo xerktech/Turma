@@ -45,8 +45,16 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     detached worktree force-rewound remote main and deleted remote branches unprompted (reproduced
     on scratch repos), as do `--all` and `refs/heads/*`; a fetch of `HEAD:main` (or
     `--update-head-ok`) moved local main for an `--all` push; a switch onto main set up a `HEAD`
-    push. Auto mode already lets a session fetch and push its own non-default branch, so git stays
-    with the classifier. Keep git out of `TURMA_TOOL_ALLOW` for the same reason.
+    push. Auto mode already lets a session fetch and push its own non-default branch, so a git
+    command TYPED DIRECTLY stays with the classifier. Keep git out of `TURMA_TOOL_ALLOW` too.
+  - Residual: the test-runner rules (`./gradlew`, `npm test`, `node --test`, `pytest`, `python3 -m
+    unittest`) run SESSION-EDITABLE code — the `./gradlew` script, package.json scripts, conftest.py,
+    test modules — past both the classifier and the guard, which sees only the runner's command line.
+    A session can write a `--mirror` push into one and run it unprompted, so it can still reach main
+    or credentials. Dropping the git rules closed the DIRECT route, not every route; never describe
+    the floor as keeping a session off main.
+  - `TURMA_TOOL_ALLOW` splits on every comma with no escape, so a rule whose pattern holds a comma
+    cannot be set through it (it lands as two malformed rules).
   - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
     repos (capped; only names matching `AUTO_MODE_REPO_NAME_RE` are COPIED, the rest counted — a
     `REPOS_ROOT` dir name is session-writable text in trusted classifier context), `GH_CLONE_OWNERS`,
