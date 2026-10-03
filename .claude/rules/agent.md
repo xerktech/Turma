@@ -30,6 +30,9 @@ Safety-guard policy: `agent-hooks.md`.
   persisted `ttydPid` is alive; `_kill_ttyd` reaps that pid so an adopted ttyd isn't leaked. Tests:
   `TestResumeOnBootAdopt`.
 
+- **`ManagerMixin` (tests) cuts every host-real input off** (XERK-1452): `REPOS_ROOT`, `cc_socket_dirs`,
+  `JIRA_*`/`AZDO_*` creds, and a real `claude` spawn (Popen guard). A new module-level path or env
+  read off the host belongs in its patch list, or the suite runs git/`claude -p` on the dev box.
 - **No call on the BEAT LOOP may raise** — `run_forever` is the container's MAIN process
   (`entrypoint.sh` execs it with no retry loop of its own, unlike the tunnel's `while :`), so an
   exception reaching it is not a skipped cycle: the container exits and every session on the host

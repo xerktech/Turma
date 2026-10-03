@@ -4793,6 +4793,27 @@ class ManagerMixin:
         # tests that exercise that wait flip this themselves.
         self.head_ready = True
 
+        repos_root = os.path.join(self.tmp, "repos")
+        os.makedirs(repos_root)
+
+        # Never spawn the host's REAL `claude` (XERK-1452): beat 0 launches the
+        # `claude -p "/model"` probe, and a test that seeds tickets launches
+        # triage — each a real, billed turn on the dev box's login. It fails
+        # like a host with no claude installed, which every launch path already
+        # handles. Everything else (git in the tests that build real repos)
+        # passes through; tests that fake Popen patch it on top of this.
+        real_popen = subprocess.Popen
+
+        def guarded_popen(args, *a, **kw):
+            argv0 = args[0] if isinstance(args, (list, tuple)) and args else args
+            if os.path.basename(str(argv0)) == "claude":
+                raise FileNotFoundError("ManagerMixin: real claude is not spawned")
+            return real_popen(args, *a, **kw)
+
+        p = mock.patch.object(ha.subprocess, "Popen", guarded_popen)
+        p.start()
+        self.addCleanup(p.stop)
+
         for name, value in [
             ("run", fake_run),
             ("run_ok", fake_run_ok),
@@ -4851,6 +4872,20 @@ class ManagerMixin:
             # box's tmux — nondeterministic, and it could match a session the
             # host actually has. Tests that care patch it themselves on top.
             ("_capture_pane", lambda tmux_name: None),
+            # The host's REAL inputs, cut off by default (XERK-1452): REPOS_ROOT
+            # would have every beat run git over the dev box's repos (seconds of
+            # subprocesses, and timing tests that pass or fail by test order);
+            # cc_socket_dirs would sweep the real /run/user/<uid>/cc-socks; and
+            # an inherited JIRA_*/AZDO_* env would poll the real tracker and
+            # triage its tickets through a real `claude -p`. Tests that need any
+            # of them patch it themselves on top.
+            ("REPOS_ROOT", repos_root),
+            ("cc_socket_dirs", lambda: [os.path.join(self.tmp, "cc-socks")]),
+            ("JIRA_SITE", ""),
+            ("JIRA_EMAIL", ""),
+            ("JIRA_TOKEN", ""),
+            ("AZDO_URL", ""),
+            ("AZDO_TOKEN", ""),
         ]:
             p = mock.patch.object(ha, name, value)
             p.start()
