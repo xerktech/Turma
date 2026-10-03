@@ -1683,6 +1683,9 @@ _PR_CLIS = {
     "glab": ("mr", ("create", "new"), ("-d", "--description")),
     "az": ("pr", ("create",), ("--description",)),
 }
+# Text-valued flags whose value may itself be `-h` (`-t -h`); a help flag in
+# that position is the value, not a request for help.
+_PR_TEXT_FLAGS = ("-t", "--title")
 
 
 def _flag_value(arg: str, flags: tuple[str, ...]) -> tuple[str, str | None] | None:
@@ -1712,9 +1715,7 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
             or (_basename(tokens[0]) == "az" and "repos" not in head)):
         return None
     args = rest[rest.index(group) + 1:]
-    # Help only when it is the ONLY argument: anywhere else `-h` may be another
-    # flag's value (`-b -h`), which the CLI sends as the description.
-    if not args or args[1:] in (["-h"], ["--help"]):
+    if not args:
         return None
     verb = args[0]
     bodies: list[str] = []
@@ -1722,6 +1723,13 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
     seen_flag = False
     i = 1
     while i < len(args):
+        # A standalone help flag prints help wherever it sits; one consumed as
+        # another flag's value (`-b -h`) is sent as that value instead.
+        if args[i] in ("-h", "--help"):
+            return None
+        if args[i] in _PR_TEXT_FLAGS:
+            i += 2
+            continue
         hit = _flag_value(args[i], body_flags)
         if hit:
             seen_flag = True
@@ -1793,15 +1801,6 @@ def _repo_template_sections(root: str | None) -> list[tuple[str, str]] | None:
     return None
 
 
-def _owner_is_pr_command(owner: str) -> bool:
-    """Whether the line a heredoc hangs off is itself a PR/MR command."""
-    try:
-        tokens = _tokenize(owner.split("<<")[0])
-    except ValueError:
-        return False
-    return bool(tokens) and _pr_body_command(tokens) is not None
-
-
 def _join_path(cwd: str, path: str) -> str:
     try:
         return os.path.join(cwd, os.path.expanduser(path))
@@ -1836,12 +1835,13 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             continue
         bodies, files = hit
         if heredocs is None:
-            heredocs = _split_heredocs(command)[1]
-        # Only a heredoc that feeds THIS command (`$(cat <<EOF)`, `-F - <<EOF`)
-        # or writes a file it sends, never an unrelated one in the same command.
-        fed = [b for owner, b in heredocs
-               if _owner_is_pr_command(owner) or any(f in owner for f in files)]
-        body = "\n".join(bodies + fed + [_read_text(_join_path(cwd, f)) for f in files])
+            # Every heredoc counts. Matching a heredoc to the command it feeds
+            # (owner line, redirect target) refused 26% of real compliant PR
+            # commands — `git push && gh pr create … <<EOF`, `cd x && …`,
+            # `cat > "$S/b.md"` — so an unrelated heredoc satisfying the check
+            # is the accepted residual: it takes a model gaming its own guard.
+            heredocs = [b for _owner, b in _split_heredocs(command)[1]]
+        body = "\n".join(bodies + heredocs + [_read_text(_join_path(cwd, f)) for f in files])
         sections = _repo_template_sections(_repo_root(cwd))
         if sections is not None:
             # A template with no headings asks for prose; there is nothing to check.

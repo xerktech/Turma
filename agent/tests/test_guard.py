@@ -1580,12 +1580,19 @@ class TestPrSummary(unittest.TestCase):
                "EOF\ngh pr create -t t -F /tmp/xerk-body.md")
         self.assertIsNone(self.reason(cmd))
 
-    def test_an_unrelated_heredoc_is_not_the_body(self):
-        cmd = ("cat > notes.txt <<'EOF'\n" + GOOD_BODY + "EOF\n"
-               "gh pr create -t x -b junk")
-        self.assertIsNotNone(self.reason(cmd))
-        stdin = "gh pr create -t x -F - <<'EOF'\n" + GOOD_BODY + "EOF"
-        self.assertIsNone(self.reason(stdin))
+    def test_a_multiline_title_is_not_the_body(self):
+        title = "x\n**Summary:** a\n## Why\n## What changed\n## Risk\n## Testing\n## Follow-ups"
+        self.assertIsNotNone(self.reason(
+            "gh pr create --title " + __import__("shlex").quote(title) + " --body junk"))
+
+    def test_chained_and_variable_path_heredoc_bodies_are_allowed(self):
+        q = GOOD_BODY + "EOF"
+        for cmd in ("git push -u origin b && gh pr create -t x --body \"$(cat <<'EOF'\n" + q + "\n)\"",
+                    "cd /tmp && gh pr create -t x -F - <<'EOF'\n" + q,
+                    "S=/tmp/s; cat > \"$S/b.md\" <<'EOF'\n" + q + "\ngh pr create -t x -F \"$S/b.md\"",
+                    "gh pr create -t x \\\n  --body \"$(cat <<'EOF'\n" + q + "\n)\""):
+            with self.subTest(cmd=cmd[:40]):
+                self.assertIsNone(self.reason(cmd))
 
     def test_a_help_flag_used_as_a_value_is_still_checked(self):
         for cmd in ("gh pr create -t x -b -h", "gh pr create -t -h -b junk",
@@ -1601,7 +1608,8 @@ class TestPrSummary(unittest.TestCase):
 
     def test_help_is_not_a_pr(self):
         for cmd in ("gh pr create --help", "gh pr create -h", "gh help pr create",
-                    "glab mr create --help"):
+                    "glab mr create --help", "gh pr create --help 2>&1 | grep -i body",
+                    "gh pr create -b junk --help", "az repos pr create -h 2>/dev/null"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.reason(cmd))
 
