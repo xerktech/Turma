@@ -989,6 +989,204 @@ function parseAgentList(lines) {
 const AGENT_DONE_STATUSES = new Set(["completed", "failed", "killed", "stopped", "error"]);
 const LIVE_AGENTS_MAX = 32;
 
+// ---- background shell kinds (XERK-1570) --------------------------------------
+// Mirror of hub-agent.py's _shell_kind — read there for the three kinds and why
+// anything unrecognised is `work` (today's reading, so a miss costs nothing new).
+// The shared vectors in TestShellKind / tunnel-agent.test.js keep the two in step.
+const SHELL_NEUTRAL_CMDS = new Set(["date", "echo", "printf", "true", ":", "cd"]);
+const SHELL_FILTER_CMDS = new Set(["grep", "egrep", "fgrep", "head", "tail", "sed", "awk",
+  "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"]);
+const SHELL_PREFIX_CMDS = new Set(["nohup", "exec", "command"]);
+const SHELL_DURATION_RE = /^(\d+(?:\.\d+)?|\.\d+)([smhd]?)$/;
+const SHELL_DURATION_UNIT = { "": 1, s: 1, m: 60, h: 3600, d: 86400 };
+const SHELL_DURATION_MAX = 1e9;   // ~31 years: past it, "no literal"
+const SHELL_ENV_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+const SHELL_REDIR_RE = /^(\d+|&)?(>>?|<<?<?)(&?)(.*)$/;
+const SHELL_TAIL_FOLLOW_RE = /^-[A-Za-z]*[fF][A-Za-z0-9]*$/;
+
+// Segments (`;` `&&` `||` `&` newline) of pipeline stages (`|`) of words.
+function shellSegments(command) {
+  const segs = [];
+  let stages = [], words = [], word = [], inWord = false;
+  let quote = "", depth = 0, tick = false;
+  const s = String(command == null ? "" : command);
+  const n = s.length;
+  const endWord = () => { if (inWord) words.push(word.join("")); word = []; inWord = false; };
+  const endStage = () => { endWord(); if (words.length) stages.push(words); words = []; };
+  const endSeg = () => { endStage(); if (stages.length) segs.push(stages); stages = []; };
+  for (let i = 0; i < n; i++) {
+    const c = s[i];
+    if (quote) {
+      if (c === quote) quote = "";
+      else if (c === "\\" && quote === '"' && i + 1 < n) word.push(s[++i]);
+      else word.push(c);
+      continue;
+    }
+    if (depth || tick) {
+      word.push(c);
+      if (c === "`" && !depth) tick = false;
+      else if (c === "(") depth++;
+      else if (c === ")") depth--;
+      continue;
+    }
+    if (c === "'" || c === '"') { quote = c; inWord = true; }
+    else if (c === "\\" && i + 1 < n) {
+      i++;
+      if (s[i] !== "\n") { word.push(s[i]); inWord = true; }
+    } else if (c === "$" && i + 1 < n && s[i + 1] === "(") {
+      word.push("$("); inWord = true; depth = 1; i++;
+    } else if (c === "`") { word.push(c); inWord = true; tick = true; }
+    else if (c === "#" && !inWord) { while (i + 1 < n && s[i + 1] !== "\n") i++; }
+    else if (c === ";" || c === "\n") endSeg();
+    else if (c === "|") {
+      if (i + 1 < n && s[i + 1] === "|") { i++; endSeg(); } else endStage();
+    } else if (c === "&") {
+      if (i + 1 < n && s[i + 1] === "&") { i++; endSeg(); }
+      else if ((word.length && "<>".includes(word[word.length - 1])) || (i + 1 < n && s[i + 1] === ">")) {
+        word.push(c); inWord = true;   // 2>&1, &>file: a redirection, not a separator
+      } else endSeg();
+    } else if (c === " " || c === "\t" || c === "\r") endWord();
+    else { word.push(c); inWord = true; }
+  }
+  endSeg();
+  return segs;
+}
+
+const shellBase = (w) => String(w).split("/").pop();
+
+// A stage's words minus env assignments, redirections and no-op wrappers.
+function shellWords(words) {
+  let out = [], skip = false;
+  for (const w of words) {
+    if (skip) { skip = false; continue; }
+    const m = SHELL_REDIR_RE.exec(w);
+    if (m) {
+      if (!m[3] && !m[4]) skip = true;   // `> file`: the target is the next word
+      continue;
+    }
+    if (!out.length && SHELL_ENV_RE.test(w)) continue;
+    out.push(w);
+  }
+  while (out.length && SHELL_PREFIX_CMDS.has(shellBase(out[0]))) out = out.slice(1);
+  return out;
+}
+
+function shellDuration(arg) {
+  const m = SHELL_DURATION_RE.exec(arg || "");
+  const secs = m ? parseFloat(m[1]) * SHELL_DURATION_UNIT[m[2]] : null;
+  return secs != null && secs <= SHELL_DURATION_MAX ? secs : null;
+}
+
+const sameWords = (a, b) => a.length === b.length && a.every((w, i) => w === b[i]);
+
+// [neutral|timed|external|work, seconds-or-null] for one command.
+function shellCmdKind(words, depth = 0) {
+  if (!words.length) return ["neutral", null];
+  const cmd = shellBase(words[0]), args = words.slice(1);
+  if (cmd === "sleep") {
+    const secs = args.map(shellDuration);
+    return ["timed", secs.length && !secs.includes(null) ? secs.reduce((a, b) => a + b, 0) : null];
+  }
+  if (cmd === "timeout") {
+    if (depth >= 4) return ["work", null];   // nested timeouts never recurse unbounded
+    const rest = args.slice();
+    while (rest.length && rest[0].startsWith("-")) {
+      const opt = rest.shift();
+      if (["-s", "-k", "--signal", "--kill-after"].includes(opt) && rest.length) rest.shift();
+    }
+    if (!rest.length) return ["work", null];
+    let limit = shellDuration(rest[0]);
+    const [kind, secs] = shellCmdKind(shellWords(rest.slice(1)), depth + 1);
+    if (kind === "work" || kind === "neutral") return [kind, null];
+    if (secs != null && (limit == null || secs < limit)) limit = secs;
+    return ["timed", limit];
+  }
+  if (SHELL_NEUTRAL_CMDS.has(cmd)) return ["neutral", null];
+  if (cmd === "gh" && ((sameWords(args.slice(0, 2), ["pr", "checks"]) && args.includes("--watch"))
+                       || sameWords(args.slice(0, 2), ["run", "watch"]))) return ["external", null];
+  if (cmd === "kubectl" && (args.includes("wait")
+      || args.some((a, k) => a === "rollout" && args[k + 1] === "status"))) return ["external", null];
+  if (cmd === "docker" && args.includes("logs") && (args.includes("-f") || args.includes("--follow"))) {
+    return ["external", null];
+  }
+  if (cmd === "tail" && args.some((a) => SHELL_TAIL_FOLLOW_RE.test(a) || a.startsWith("--follow"))) {
+    return ["external", null];
+  }
+  if (cmd === "watch") return ["external", null];
+  return ["work", null];
+}
+
+function shellPipelineKind(stages) {
+  for (const st of stages.slice(1)) {
+    const w = shellWords(st);
+    if (w.length && !SHELL_FILTER_CMDS.has(shellBase(w[0]))) return ["work", null];
+  }
+  return shellCmdKind(shellWords(stages[0]));
+}
+
+const SHELL_LOOP_HEADS = new Set(["while", "until", "for"]);
+
+// [kind, next index] for a `while|until|for …; do …; done` at segs[i].
+function shellLoop(segs, i) {
+  const head = shellWords(segs[i][0]);
+  if (segs[i].length !== 1 || i + 1 >= segs.length) return ["work", null];
+  const first = shellWords(segs[i + 1][0]);
+  if (!first.length || first[0] !== "do") return ["work", null];
+  const body = [[first.slice(1), ...segs[i + 1].slice(1)]];
+  let j = i + 2;
+  while (j < segs.length && !sameWords(shellWords(segs[j][0]), ["done"])) body.push(segs[j++]);
+  if (j >= segs.length) return ["work", null];
+  let slept = false;
+  for (const st of body) {
+    const w = shellWords(st[0]);
+    if (w.length && SHELL_LOOP_HEADS.has(w[0])) return ["work", null];
+    const [kind] = shellPipelineKind(st);
+    if (kind !== "timed" && kind !== "neutral") return ["work", null];
+    slept = slept || kind === "timed";
+  }
+  if (!slept || shellPipelineKind([["true"], ...segs[j].slice(1)])[0] === "work") return ["work", null];
+  const cond = head.slice(1);
+  if (head[0] === "until" || (head[0] === "while" && !sameWords(cond, ["true"]) && !sameWords(cond, [":"]))) {
+    return ["external", j + 1];
+  }
+  return ["timed", j + 1];
+}
+
+function shellKind(command) {
+  const segs = shellSegments(command);
+  let timed = false, external = false, total = 0;
+  for (let i = 0; i < segs.length;) {
+    const head = shellWords(segs[i][0]);
+    if (head.length && SHELL_LOOP_HEADS.has(head[0])) {
+      const [kind, next] = shellLoop(segs, i);
+      if (kind === "work") return ["work", null];
+      external = external || kind === "external";
+      timed = timed || kind === "timed";
+      total = null;   // a loop's length is not a literal
+      i = next;
+      continue;
+    }
+    const [kind, secs] = shellPipelineKind(segs[i]);
+    if (kind === "work") return ["work", null];
+    if (kind === "external") external = true;
+    else if (kind === "timed") {
+      timed = true;
+      total = total == null || secs == null ? null : total + secs;
+    }
+    i++;
+  }
+  if (external) return ["wait-external", null];
+  if (timed) return ["wait-timed", total];
+  return ["work", null];
+}
+
+// Epoch ms of a transcript `timestamp`, or null — mirror of _ts_ms.
+function tsMs(ts) {
+  if (typeof ts !== "string") return null;
+  const ms = Date.parse(ts.trim());
+  return Number.isFinite(ms) ? ms : null;
+}
+
 // `{id, type, label}` iff this entry is a BACKGROUND WORK launch. Mirror of
 // hub-agent.py's _async_launch — read there for why loose `agentId:` text must
 // never be the signal (a grep/cat of any transcript registers a permanent
@@ -1026,8 +1224,11 @@ function scanAgentEntry(entry, state) {
       if (block.type === "tool_use" && block.name === "Bash" && block.id) {
         // Any Bash call can end up in the background; its description (or
         // command) labels the shell row.
+        // Its KIND is read off the command, never the description (XERK-1570).
         const inp = block.input || {};
-        shells.set(block.id, String(inp.description || inp.command || "").trim().slice(0, 200));
+        const [kind, secs] = shellKind(inp.command);
+        shells.set(block.id, { label: String(inp.description || inp.command || "").trim().slice(0, 200),
+                               kind, secs, ts: tsMs(entry.timestamp) });
         while (shells.size > LIVE_AGENTS_MAX * 4) shells.delete(shells.keys().next().value);
       // `Agent` in current Claude Code, `Task` in older transcripts — both.
       } else if (block.type === "tool_use" && (block.name === "Agent" || block.name === "Task") && block.id) {
@@ -1051,9 +1252,22 @@ function scanAgentEntry(entry, state) {
     // A stop already seen wins over a later-read launch: a notification can be
     // written at an EARLIER file offset than the launch it refers to. The
     // call's subagent_type is the only place a real agent TYPE appears.
-    live.set(launch.id, launch.type === "shell"
-      ? { type: "shell", label: shells.get(toolId) || "" }
-      : { type: tasks.get(toolId) || launch.type, label: launch.label });
+    const launchedAt = tsMs(entry.timestamp);
+    let row, started;
+    if (launch.type === "shell") {
+      const call = shells.get(toolId) || {};
+      row = { type: "shell", label: call.label || "", kind: call.kind || "work" };
+      started = call.ts || launchedAt;
+      if (started != null && call.secs != null && row.kind === "wait-timed") {
+        const eta = started + Math.round(call.secs * 1000);
+        if (Number.isSafeInteger(eta)) row.eta = eta;
+      }
+    } else {
+      row = { type: tasks.get(toolId) || launch.type, label: launch.label };
+      started = launchedAt;
+    }
+    if (started != null) row.startedAt = started;
+    live.set(launch.id, row);
   }
   // Never an ASSISTANT turn — a session merely QUOTING a notification must not
   // retire an agent that is still running.
@@ -1092,7 +1306,11 @@ function entryTextsForScan(entry) {
 
 function liveAgentsReport(state) {
   if (!state || !state.live) return [];
-  return [...state.live.values()].map((a) => ({ type: a.type, label: a.label }));
+  return [...state.live.values()].map((a) => {
+    const row = { type: a.type, label: a.label };
+    for (const k of ["kind", "startedAt", "eta"]) if (a[k] != null) row[k] = a[k];
+    return row;
+  });
 }
 
 // Parse a working-status line into { verb, up, down, elapsed } — display strings
@@ -2212,7 +2430,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, shellKind, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

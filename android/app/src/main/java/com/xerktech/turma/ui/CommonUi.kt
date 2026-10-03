@@ -51,7 +51,9 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xerktech.turma.core.ContextMeter
 import com.xerktech.turma.core.LiveState
-import com.xerktech.turma.core.hasLiveAgents
+import com.xerktech.turma.core.hasLiveWork
+import com.xerktech.turma.core.isWaitAgent
+import com.xerktech.turma.core.waitLeftText
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.PrInfo
 import com.xerktech.turma.model.SessionInfo
@@ -253,6 +255,9 @@ fun StateDot(state: LiveState, modifier: Modifier = Modifier) {
         color = when (state) {
             LiveState.WORKING -> TurmaColors.working
             LiveState.WAITING -> TurmaColors.waiting
+            // Waiting out a background shell (XERK-1570): the working colour,
+            // dimmed — alive, not busy (the web draws it as a hollow ring).
+            LiveState.HOLDING -> TurmaColors.working.copy(alpha = 0.45f)
             LiveState.IDLE -> TurmaColors.idle
             LiveState.STOPPED -> TurmaColors.stopped
         },
@@ -263,6 +268,7 @@ fun StateDot(state: LiveState, modifier: Modifier = Modifier) {
 fun liveStateLabel(state: LiveState): String = when (state) {
     LiveState.WORKING -> "working"
     LiveState.WAITING -> "waiting"
+    LiveState.HOLDING -> "waiting"
     LiveState.IDLE -> "idle"
     LiveState.STOPPED -> "stopped"
 }
@@ -279,10 +285,20 @@ private val QA_AGENT_TYPES = setOf("qa", "qa-delta")
  * "working" with nothing on screen explaining what is still running (XERK-245).
  * A QA/QA-delta agent in the fan-out reads "QA Review" instead (XERK-538).
  */
-fun liveStateLabel(state: LiveState, live: LiveSignals?): String {
-    if (state == LiveState.WORKING && hasLiveAgents(live)) {
+fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.currentTimeMillis()): String {
+    // Waiting out a background shell (XERK-1570) — web `backgroundWaitLabel`:
+    // "waiting · 12m left" / "waiting · Watch CI" / "waiting on 2 background shells".
+    if (state == LiveState.HOLDING) {
+        val waits = live?.agents.orEmpty().filter(::isWaitAgent)
+        val eta = waits.mapNotNull { it.eta }.maxOrNull()
+        if (eta != null && eta > now) return "waiting · ${waitLeftText(eta - now)} left"
+        if (waits.size == 1 && waits[0].label.isNotBlank()) return "waiting · ${waits[0].label}"
+        return "waiting on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
+    }
+    // Only WORK rows name the working state; a waiting shell beside them is not work.
+    if (state == LiveState.WORKING && hasLiveWork(live)) {
         if (live?.agents?.any { it.type in QA_AGENT_TYPES } == true) return "QA Review"
-        val rows = live?.agents.orEmpty()
+        val rows = live?.agents.orEmpty().filterNot(::isWaitAgent)
         // A background shell rides `agents` as a `shell` row (web backgroundWorkLabel).
         val shells = rows.count { it.type == "shell" }
         val noun = if (shells == 0) "agent" else if (shells == rows.size) "shell" else "task"

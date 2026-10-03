@@ -1478,13 +1478,63 @@ test("scanAgentEntry: a background shell is live work until its stop edge", () =
     { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "toolu_s1", content: "x" }] },
       toolUseResult: { stdout: "", stderr: "", interrupted: false, isImage: false, backgroundTaskId: "bsh1" } },
   ];
-  assert.deepEqual(liveAgentsReport(scanAll(launch)), [{ type: "shell", label: "Watch CI" }]);
+  assert.deepEqual(liveAgentsReport(scanAll(launch)),
+    [{ type: "shell", label: "Watch CI", kind: "wait-external" }]);
   const notified = scanAll([...launch, { type: "queue-operation", operation: "enqueue",
     content: "<task-notification>\n<task-id>bsh1</task-id>\n<status>completed</status>\n<summary>done</summary>\n</task-notification>" }]);
   assert.deepEqual(liveAgentsReport(notified), []);
   const stopped = scanAll([...launch, { type: "user", message: { content: [{ type: "tool_result", tool_use_id: "k", content: "{}" }] },
     toolUseResult: { message: "Successfully stopped task: bsh1", task_id: "bsh1", task_type: "local_bash" } }]);
   assert.deepEqual(liveAgentsReport(stopped), []);
+});
+
+// XERK-1570: the py/js shell classifiers read ONE vector file, so they cannot
+// drift — TestShellKind in test_hub_agent.py asserts the same table.
+test("shellKind: the shared vectors (keep in step with TestShellKind)", () => {
+  const { shellKind } = require("../tunnel-agent.js");
+  const { vectors } = require("./shell_kind_vectors.json");
+  assert.ok(vectors.length > 40);
+  for (const [cmd, kind, secs] of vectors) {
+    assert.deepEqual(shellKind(cmd), [kind, secs], cmd);
+  }
+});
+
+// XERK-1570: a shell row carries the kind of its COMMAND (never its description),
+// startedAt = the call's timestamp, and eta = startedAt + N for a timed wait.
+test("scanAgentEntry: a shell row carries kind, startedAt and eta (keep in step with TestLiveAgentsScan)", () => {
+  const { liveAgentsReport } = require("../tunnel-agent.js");
+  const shellCall = (id, command, description, ts, bg) => [
+    { type: "assistant", timestamp: ts, message: { content: [{ type: "tool_use", id, name: "Bash",
+      input: { command, description, run_in_background: true } }] } },
+    { type: "user", timestamp: "2026-10-03T12:00:09.000Z",
+      message: { content: [{ type: "tool_result", tool_use_id: id, content: "x" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: bg } },
+  ];
+  const st = scanAll([
+    ...shellCall("t1", "sleep 600", "Wait for the deploy", "2026-10-03T12:00:00.000Z", "b1"),
+    // The DESCRIPTION says wait; the command is work — the command decides.
+    ...shellCall("t2", "npm test", "Wait for the tests", "2026-10-03T12:00:01.000Z", "b2"),
+    ...shellCall("t3", "gh run watch 9", "Watch CI", "2026-10-03T12:00:02.000Z", "b3"),
+    ...LAUNCH_ENTRIES,
+  ]);
+  const t0 = Date.parse("2026-10-03T12:00:00.000Z");
+  assert.deepEqual(liveAgentsReport(st), [
+    { type: "shell", label: "Wait for the deploy", kind: "wait-timed", startedAt: t0, eta: t0 + 600000 },
+    { type: "shell", label: "Wait for the tests", kind: "work", startedAt: t0 + 1000 },
+    { type: "shell", label: "Watch CI", kind: "wait-external", startedAt: t0 + 2000 },
+    // An agent row carries no kind: absent reads as work.
+    { type: "agent", label: "QA the parity change" },
+  ]);
+  // With no call timestamp the LAUNCH entry's timestamp starts the clock.
+  const late = scanAll([
+    { type: "assistant", message: { content: [{ type: "tool_use", id: "t9", name: "Bash",
+      input: { command: "sleep 60" } }] } },
+    { type: "user", timestamp: "2026-10-03T12:00:09.000Z",
+      message: { content: [{ type: "tool_result", tool_use_id: "t9", content: "x" }] },
+      toolUseResult: { stdout: "", backgroundTaskId: "b9" } },
+  ]);
+  assert.deepEqual(liveAgentsReport(late),
+    [{ type: "shell", label: "sleep 60", kind: "wait-timed", startedAt: t0 + 9000, eta: t0 + 69000 }]);
 });
 
 test("scanAgentEntry: one restart notification retires every shell it names; shells cap at half", () => {

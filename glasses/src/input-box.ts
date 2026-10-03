@@ -103,7 +103,7 @@ export function sheetBody(opts: { question: string; options: string[]; selected:
 // own action reflected, not the background "Working"/"Waiting" signal.
 export function statusLabel(opts: {
   mic: MicState;
-  live: "working" | "waiting" | "idle" | "stopped" | "error";
+  live: "working" | "waiting" | "holding" | "idle" | "stopped" | "error";
 }): string {
   switch (opts.mic) {
     case "recording":
@@ -120,6 +120,8 @@ export function statusLabel(opts: {
       return "Working";
     case "waiting":
       return "Waiting";
+    case "holding":
+      return "Holding";
     case "idle":
       return "Idle";
     case "stopped":

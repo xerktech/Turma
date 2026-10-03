@@ -182,6 +182,7 @@ const {
   CLONE_PROGRESS_MAX,
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
+  sessionWait, backgroundWait, ATTENTION_WAIT_STALL_MS, WAIT_ETA_GRACE_MS,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   termRetryReset, terminalFail, terminalReconnectPage, TERM_AGENT_IDLE_MS,
   armChannelIdleTimeout,
@@ -1055,6 +1056,124 @@ test("readyForReview: a session waiting on background agents is not ready", () =
   // Once the agent finishes the list empties and it qualifies as it always did.
   session.session.agents = [];
   assert.equal(readyForReview(session, sessionWorking(session, now, now)), true);
+});
+
+// ---- XERK-1570: background shell kinds -----------------------------------------
+
+const WMIN = 60 * 1000;
+
+test("XERK-1570: sanitizeLiveAgents keeps kind as a strict enum and the instants as safe ints", () => {
+  const rows = sanitizeLiveAgents([
+    { type: "shell", label: "Sleep", kind: "wait-timed", startedAt: 1700000000000, eta: 1700000600000 },
+    { type: "shell", label: "CI", kind: "wait-external" },
+    { type: "shell", label: "Tests", kind: "work" },
+    // Anything else is OMITTED — never invented as "work" on the wire.
+    { type: "shell", kind: "WAIT-TIMED" }, { type: "shell", kind: "sleeping" },
+    { type: "shell", kind: 7 }, { type: "shell", kind: { toString: 1, valueOf: 1 } },
+    // A Kotlin Long: a positive safe integer, or the key is dropped.
+    { type: "shell", kind: "wait-timed", startedAt: "1700000000000", eta: 1.5 },
+    { type: "shell", startedAt: 2 ** 60, eta: -5 }, { type: "shell", startedAt: 0, eta: NaN },
+    { type: "agent", label: "QA", kind: null },
+  ]);
+  assert.deepEqual(rows, [
+    { sel: false, type: "shell", label: "Sleep", kind: "wait-timed", startedAt: 1700000000000, eta: 1700000600000 },
+    { sel: false, type: "shell", label: "CI", kind: "wait-external" },
+    { sel: false, type: "shell", label: "Tests", kind: "work" },
+    { sel: false, type: "shell", label: "" }, { sel: false, type: "shell", label: "" },
+    { sel: false, type: "shell", label: "" }, { sel: false, type: "shell", label: "" },
+    { sel: false, type: "shell", label: "", kind: "wait-timed" },
+    { sel: false, type: "shell", label: "" }, { sel: false, type: "shell", label: "" },
+    { sel: false, type: "agent", label: "QA" },
+  ]);
+});
+
+test("XERK-1570: both sanitizeLiveAgents call sites coerce a forged kind — heartbeat and restore", async () => {
+  const host = "kinds-host";
+  const forged = [
+    { type: "shell", label: "Sleep", kind: "wait-timed", startedAt: 1700000000000, eta: "soon" },
+    { type: "shell", label: "Odd", kind: "napping" },
+  ];
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running",
+      session: { paneBusy: false, transcriptAgeSec: 5, agents: forged } }] },
+  });
+  assert.equal(r.status, 200);
+  const want = [
+    { sel: false, type: "shell", label: "Sleep", kind: "wait-timed", startedAt: 1700000000000 },
+    { sel: false, type: "shell", label: "Odd" },
+  ];
+  assert.deepEqual(agents[host].sessions[0].session.agents, want);
+  // The state.json restore runs the same coercion (normalizeSessions).
+  const restored = { sessions: [{ id: "s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 5, agents: forged } }] };
+  hub.normalizeRecord(restored, "restore");
+  assert.deepEqual(restored.sessions[0].session.agents, want);
+});
+
+test("XERK-1570: only WORK rows keep a session working; all-wait sessions are waiting", () => {
+  const now = Date.now();
+  const s = (agents, extra = {}) => ({ status: "running", session: {
+    paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false, agents, ...extra } });
+  const timed = { type: "shell", label: "Sleep", kind: "wait-timed", eta: now + 10 * WMIN };
+  const ci = { type: "shell", label: "Watch CI", kind: "wait-external" };
+  // A sleep with an ETA ahead: not working, waiting, and NOT ready for review.
+  assert.equal(sessionWorking(s([timed]), now, now), false);
+  assert.deepEqual(sessionWait(s([timed]), now, now), { state: "waiting", eta: now + 10 * WMIN });
+  assert.equal(readyForReview(s([timed]), false, sessionWait(s([timed]), now, now)), false);
+  // A CI watch just launched: waiting (no ETA).
+  assert.deepEqual(sessionWait(s([ci]), now, now), { state: "waiting", eta: null });
+  // Work rows — explicit "work", or NO kind (an older agent / an agent row) — are working.
+  assert.equal(sessionWorking(s([{ type: "shell", kind: "work" }]), now, now), true);
+  assert.equal(sessionWorking(s([{ type: "shell" }]), now, now), true);
+  assert.equal(sessionWorking(s([ci, { type: "qa", label: "QA it" }]), now, now), true);
+  assert.equal(sessionWait(s([ci, { type: "qa" }]), now, now), null);
+  // paneBusy still wins; with paneBusy unknown a fresh transcript does NOT make
+  // an all-wait session working (the freshness fallback would have).
+  assert.equal(sessionWorking(s([ci], { paneBusy: true }), now, now), true);
+  assert.equal(sessionWait(s([ci], { paneBusy: true }), now, now), null);
+  assert.equal(sessionWorking(s([ci], { paneBusy: null, transcriptAgeSec: 1 }), now, now), false);
+  // Behind the offline gate, like everything on a pushed record.
+  assert.equal(sessionWait(s([ci]), now - 120000, now), null);
+});
+
+test("XERK-1570: a wait stalls past its ETA or after ATTENTION_WAIT_STALL_MIN of silence", () => {
+  const now = Date.now();
+  const s = (agents, ageSec) => ({ status: "running", session: {
+    paneBusy: false, transcriptAgeSec: ageSec, lastRole: "assistant", lastHasToolUse: false, agents } });
+  const timedAt = (eta) => [{ type: "shell", kind: "wait-timed", eta }];
+  const ci = [{ type: "shell", kind: "wait-external" }];
+  assert.equal(ATTENTION_WAIT_STALL_MS, 45 * WMIN);
+  // ETA passed, inside the grace: still waiting (the stop notification may be landing).
+  assert.equal(sessionWait(s(timedAt(now - 30000), 600), now, now).state, "waiting");
+  // ETA passed beyond the grace with nothing written since: stalled — and a stalled
+  // session is judged like any idle one, so a dead shell surfaces for review.
+  const overdue = s(timedAt(now - WAIT_ETA_GRACE_MS - 1000), 600);
+  assert.equal(sessionWait(overdue, now, now).state, "stalled");
+  assert.equal(readyForReview(overdue, false, sessionWait(overdue, now, now)), true);
+  // ...but a write AFTER the ETA means the session is alive: waiting, until silence.
+  assert.equal(sessionWait(s(timedAt(now - 10 * WMIN), 60), now, now).state, "waiting");
+  // No ETA: waiting until 45 minutes of transcript silence, then stalled.
+  assert.equal(sessionWait(s(ci, 44 * 60), now, now).state, "waiting");
+  assert.equal(sessionWait(s(ci, 46 * 60), now, now).state, "stalled");
+  // An ETA still ahead outranks silence: a long sleep is not stalled early.
+  assert.equal(sessionWait(s([...ci, ...timedAt(now + WMIN)], 50 * 60), now, now).state, "waiting");
+  assert.deepEqual(backgroundWait([], now, now), null);
+});
+
+test("XERK-1570: a waiting session is not alerted ready for review; once stalled it is", () => {
+  const beat = makeHost();
+  const now = Date.now();
+  const sess = (ageSec, agents) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: ageSec, lastRole: "assistant", lastHasToolUse: false, agents } }] });
+  const ci = [{ type: "shell", label: "Watch CI", kind: "wait-external" }];
+  notifications.length = 0;
+  beat(sess(0, []), now);            // its own turn
+  beat({ sessions: [{ ...sess(0, []).sessions[0], session: { ...sess(0, []).sessions[0].session, paneBusy: true } }] }, now + 1000);
+  beat(sess(5, ci), now + 20000);    // ended its turn to watch CI: waiting, no buzz
+  assert.deepEqual(titles(), []);
+  beat(sess(46 * 60, ci), now + 46 * WMIN); // silent past the stall: surfaces
+  assert.deepEqual(titles(), ["nas-repo-s1 is ready for review"]);
 });
 
 // ---- heartbeatAlerts (edge-triggered) ------------------------------------------
