@@ -805,7 +805,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     if vals is None:
         vals = _var_values(command)
 
-    states = _quote_states(command) if vals and "$" in command else []
+    states = _code_quote_states(command) if vals and "$" in command else []
 
     def rep(m: "re.Match[str]") -> str:
         name = m.group(1) or m.group(3) or ""
@@ -828,6 +828,25 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     return _VAR_USE_RE.sub(rep, command)
 
 
+def _code_quote_states(command: str) -> list[str]:
+    """`_quote_states`, with `#` comments read as comments: the apostrophe in
+    `# don't` opened a "quote" that every later use was escaped for."""
+    states = _quote_states(command)
+    pos = 0
+    for _ in range(64):  # bounded: each comment re-scans the line
+        i = command.find("#", pos)
+        while i >= 0 and (states[i] or not _is_comment(command, i)):
+            i = command.find("#", i + 1)
+        if i < 0:
+            break
+        end = command.find("\n", i)
+        end = len(command) if end < 0 else end
+        command = command[:i] + " " * (end - i) + command[end:]
+        states = _quote_states(command)
+        pos = end
+    return states
+
+
 def _quote_literal(value: str, state: str) -> str:
     """``value`` spliced where quoting is ``state``, its quote characters kept
     LITERAL — bash never re-reads quotes an expansion produced. Spliced raw,
@@ -836,10 +855,16 @@ def _quote_literal(value: str, state: str) -> str:
     value's `'` closes, escapes and reopens. `$` stays live, so a `$(…)` a
     value carries is still classified where it lands."""
     if state == "'":
-        return value.replace("'", "'\\''")
+        # The script `eval`/`bash -c`/`trap` will parse, where the expansion
+        # is a WORD — never a quote, comment or operator (`x='<<'` opened a
+        # heredoc): escaped for THAT parse, then `'` closed and reopened here.
+        inner = re.sub(r"([\\\"'`#<>;&|()])", r"\\\1", value)
+        return inner.replace("'", "'\\''")
+    # Bare: `;`/`|`/`&` stay live, since `eval $x` re-parses them as operators.
+    bare = re.sub(r"([\\\"'`#<>])", r"\\\1", value)
     if state == '"':
         return re.sub(r'([\\"`])', r"\\\1", value)
-    return re.sub(r"([\\\"'`])", r"\\\1", value)
+    return bare
 
 
 def _prenormalise(command: str) -> str:

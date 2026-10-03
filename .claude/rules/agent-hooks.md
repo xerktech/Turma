@@ -134,6 +134,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     use): bash never re-reads quotes an expansion made, and splicing raw let
     `x='"'; echo "$x"; rm -rf /` unbalance the line and hide the `rm`. Never inline a value
     unescaped. `"${a[@]}"` closes the quote around the elements (one word each).
+    - Inside `'…'` (a script `eval`/`bash -c`/`trap` parses later) the value is a WORD there:
+      quotes, `#` and operators all escaped. Bare keeps `;&|` live — `eval $x` re-parses them.
+    - Quote state ignores `#` comments (`_code_quote_states`): `# don't` opened a "quote".
   - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
     never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
     clearing let `cd /; (cd /tmp); rm -rf *` through.

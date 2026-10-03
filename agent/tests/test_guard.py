@@ -1265,7 +1265,18 @@ class TestProducedScripts(unittest.TestCase):
                     "msgs=(\"it's\" done); echo \"${msgs[@]}\"; rm -rf /",
                     "a=(x '\"'); echo \"${a[@]}\"; git push --force origin main",
                     # An empty assignment is a value too.
-                    "b=; a=(rm -rf *); cd /; \"${b}${a[@]}\"", "x=; rm -rf $x/etc"):
+                    "b=; a=(rm -rf *); cd /; \"${b}${a[@]}\"", "x=; rm -rf $x/etc",
+                    # A script parsed again expands `$x` to a WORD: never a
+                    # quote, comment or operator (QA pass 7).
+                    "x=\"'\"; eval 'echo $x; rm -rf /'", "x='\"' bash -c 'echo $x; rm -rf /'",
+                    "a=(\"'\"); eval 'echo ${a[@]}; rm -rf /'",
+                    "x='\"'; eval 'echo \"$x\"; rm -rf /'",
+                    "export x='\"'; bash -c 'echo $x; rm -rf /'",
+                    "x='\"'; trap 'echo $x; rm -rf /' EXIT", "x='\\'; eval 'echo $x; rm -rf /'",
+                    "x='<<'; eval 'echo $x E\nrm -rf /\nE'",
+                    # A comment's apostrophe is no quote; a `#` value no comment.
+                    "x='\"'; echo hi # don't\necho \"$x\"; rm -rf /",
+                    "x='#'; echo $x; rm -rf /"):
             with self.subTest(cmd=cmd):
                 self.assertTrue(guard.is_destructive(cmd) or guard.policy_reason(cmd), cmd)
         for cmd in ("x=\"it's fine\"; git commit -m \"$x\"", 'a=(x y); echo "x${a[@]}"',
