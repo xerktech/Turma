@@ -48,6 +48,12 @@ specific fixture that caught it was added.
     `Board.kt`) skips a host whose served `org` differs from its claim (absent `org` = older hub,
     trusted). Grouping by the CLAIMED siteKey let a drifted host's newer-`updated` forged rows
     make the sweeps kill/merge another org's sessions. Tests: `XERK-1491` in all three suites.
+  - **A host is in an org's TICKET-WORK pool only via `hostInOrg(a, siteKey)`** (XERK-1497):
+    declared AND bound. Routing (`findTicketHost` + pin), in-flight guards, tracker-write pools and
+    org capability unions all use it; never compare `a.jira.siteKey === siteKey` directly — a
+    drifted host (bound A, declaring B) took B's tickets that way. `startedTicketKeys` counts the
+    BOUND org only; that is safe ONLY because routing excludes drifted hosts — widen one, widen both.
+    Tests: `XERK-1497` in `server.test.js`.
   - **`ticketRepo` reads the resolved ROW; it does not rank blocks itself** — ranking there was
     subtly wrong twice (ignored the newer-`updated` override; showed untriaged when the winning
     block had no `repoGuess`).
