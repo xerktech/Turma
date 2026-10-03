@@ -5332,11 +5332,12 @@ def branch_sync(repo_path, branch, base_ref):
     if not branch or branch == "HEAD":
         return info
     def has_ref(ref):
-        # None when git gave no answer (timeout / launch failure), so a
-        # stalled lookup never reads as "never pushed" (XERK-1263).
+        # `--verify --quiet` exits 1 for a missing ref. Anything else — no
+        # answer (timeout / launch failure) or a git error (128, corrupt
+        # refs) — is None, so it never reads as "never pushed" (XERK-1263).
         rc, _ = run_out(["git", "-C", repo_path, "rev-parse", "--verify",
                          "--quiet", ref])
-        return None if rc is None else rc == 0
+        return {0: True, 1: False}.get(rc)
     local = f"refs/heads/{branch}"
     if not has_ref(local):
         return info

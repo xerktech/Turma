@@ -22528,6 +22528,13 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
             return real(["false"])
         with mock.patch.object(ha.subprocess, "run", side_effect=fake):
             self.assertIsNone(ha.branch_sync("/r", "feat", None)["pushed"])
+        # A git ERROR (not the missing-ref exit 1) is unknown too.
+        def errs(cmd, **kw):
+            if "refs/remotes/origin/feat" in cmd:
+                return real(["sh", "-c", "exit 128"])
+            return fake(cmd, **kw)
+        with mock.patch.object(ha.subprocess, "run", side_effect=errs):
+            self.assertIsNone(ha.branch_sync("/r", "feat", None)["pushed"])
 
     def test_a_launch_failure_is_no_answer_not_clean(self):
         """XERK-1263: git that could not be launched (a fork refused at the
