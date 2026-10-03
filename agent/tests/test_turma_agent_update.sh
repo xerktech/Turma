@@ -1606,6 +1606,27 @@ if [ -d /run/systemd/system ]; then
     fi
     rm -rf "$root" "$d"
   done
+  # An UP-TO-DATE run reconciles too, from the copy an earlier install left in
+  # $PREFIX — an install runs the OLD updater, so install-only left a host a
+  # whole extra release away from the fix.
+  d="$(new_gh_dir)"; add_unified_release "$d" "v0.5.0" "0.5.0" "v0.5.0"
+  root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin"
+  cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+  echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
+  mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+  echo "0.5.0" >"$prefix/VERSION"
+  echo "# timer 0.5.0" >"$prefix/turma-agent-update.timer"
+  install_fake_restart "$bin"; install_fake_gh "$bin"
+  udir="$root/home/.config/systemd/user"; mkdir -p "$udir"
+  echo "OnUnitActiveSec=1h" >"$udir/turma-agent-update.timer"
+  FAKE_GH_DIR="$d" HOME="$root/home" XDG_CONFIG_HOME="" PATH="$bin:$PATH" \
+    TURMA_REPO="xerktech/turma" TURMA_CLAUDE_AUTO_UPDATE=0 \
+    "$bin/turma-agent-update" >/dev/null 2>&1 || true
+  assert_eq "0.5.0" "$(tr -d '[:space:]' < "$prefix/VERSION")" "up-to-date run installs nothing" \
+    "an up-to-date run changed VERSION"
+  assert_eq "# timer 0.5.0" "$(cat "$udir/turma-agent-update.timer")" \
+    "an up-to-date run refreshes the timer from \$PREFIX" "timer not refreshed on an up-to-date run"
+  rm -rf "$root" "$d"
 else
   pass "timer refresh cases skipped: no systemd on this runner"
 fi

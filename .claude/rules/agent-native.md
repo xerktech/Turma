@@ -116,7 +116,9 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     A monotonic trigger counts from the service's last activation, which the user manager forgets on
     restart; with `OnBootSec` past, the timer sat `elapsed` and the host silently stopped updating.
     `install.sh` is not the only writer: `refresh_update_timer` rewrites an installed timer that
-    differs from the payload's (reload + restart), so a timer fix reaches existing hosts.
+    differs from the payload's (reload + try-restart), so a timer fix reaches existing hosts.
+  - **It reconciles on EVERY run, from `$PREFIX/turma-agent-update.timer`**, not only on install:
+    an install runs the OLD updater, so install-only left a host one extra release from the fix.
   - **A run cannot WEDGE holding the lock (XERK-549)** — a hung child once held it forever (a
     network/subprocess call that outran its own `timeout`), stranding the host on a stale build
     silently. Three guards, all in `with_lock`/`run_locked`:

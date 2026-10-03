@@ -764,7 +764,11 @@ install_payload() {  # <tgz> <version>
       logmsg "payload no longer ships the dsh toolchain; removed the installed dsh files"
     fi
   fi
-  refresh_update_timer "$src"
+  # Keep the payload's timer beside the runtime, so EVERY later run (run_once)
+  # can reconcile the installed unit against it, not only a run that installs.
+  [ -f "$src/turma-agent-update.timer" ] \
+    && cp -f "$src/turma-agent-update.timer" "$PREFIX/turma-agent-update.timer" 2>/dev/null
+  refresh_update_timer "$PREFIX"
   # An unstampable VERSION means the next check sees the OLD version and does the
   # whole download, swap and restart again, every hour, forever. Say so instead
   # of reporting a clean update.
@@ -800,7 +804,10 @@ install_payload() {  # <tgz> <version>
 # Refresh the installed update TIMER from the payload when it differs. install.sh
 # is the only thing that writes it, so a fix to the timer itself never reached an
 # existing host — the one that matters is the host whose timer had gone `elapsed`
-# (XERK-1266), which only an update run by hand could still reach. Same two
+# (XERK-1266), which only an update run by hand could still reach. Called on
+# EVERY run (run_once) as well as after an install: an install runs the OLD
+# updater, so tying it to installs alone left a host a whole extra native
+# release away from the fix (seen on TrueNAS, 2.1.32 -> 2.1.33). Same two
 # systemd scopes as the manager restart below; best-effort, never fails the update.
 # try-restart, never restart: an `elapsed` timer is still active and re-arms, but
 # a timer the operator deliberately STOPPED must stay stopped.
@@ -904,6 +911,7 @@ run_once() {
   # Stamp FIRST, so a run that then wedges or dies still bounds the next
   # start-fired check.
   stamp_now "$STAMP"
+  refresh_update_timer "$PREFIX"
 
   cur="$(installed_version)"
   stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.XXXXXX")"
