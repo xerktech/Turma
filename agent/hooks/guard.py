@@ -456,6 +456,25 @@ def _quoted_text_only(raw_tokens: list[str]) -> bool:
     return False
 
 
+def _quoted_text_line(raw_commands: str, segments: list[str]) -> bool:
+    """Whether a single-quoted substitution on this line is only ever TEXT.
+
+    Only a line that is ONE allowlisted stage with no redirection qualifies.
+    Every channel by which a stage's text reaches a shell later in the SAME
+    line was a proved bypass while this allowed several stages: a pipe
+    (`echo '$(x)' | sh`), an assignment (`printf -v GIT_EDITOR '$(x)'; git
+    commit`), a file (`echo '<trailer command = $(x)>' >> .git/config; git
+    commit --trailer …`). One stage cannot feed itself; `${VAR:=…}` is refused
+    too since it assigns from inside a word.
+    """
+    if len(segments) != 1 or _ASSIGNING_EXPANSION_RE.search(raw_commands):
+        return False
+    states = _quote_states(raw_commands)
+    if any(ch in "<>" and not states[i] for i, ch in enumerate(raw_commands)):
+        return False
+    return _quoted_text_only(_tokenize(_unwrap_group(segments[0])))
+
+
 def _live_substs(segment: str, quoted_text: bool = False) -> list["re.Match[str]"]:
     """The substitutions in ``segment`` bash would actually run.
 
@@ -1150,10 +1169,7 @@ def _expand_segments(command: str, depth: int = 0) -> list[tuple[list[str], str]
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
     # be judged against what is actually going to be fed to it.
-    # `${VAR:=…}` assigns from inside any stage, echo's included.
-    quoted_text = not _ASSIGNING_EXPANSION_RE.search(raw_commands) and all(
-        _quoted_text_only(_tokenize(_unwrap_group(raw))) for raw in segments
-    )
+    quoted_text = _quoted_text_line(raw_commands, segments)
     piped_operands: list[str] = []
     for raw in segments:
         for tok in _tokenize(raw):

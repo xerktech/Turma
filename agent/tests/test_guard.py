@@ -1017,7 +1017,7 @@ class TestParserGaps(unittest.TestCase):
     def test_a_single_quoted_substitution_is_text(self):
         for cmd in (f"git commit -m '$({self.R})'", f"echo '`{self.R}`'",
                     f"gh pr create --title t --body '$({self.R})'",
-                    f"git commit -m '$({self.R})' && echo done",
+                    f"(git commit -m '$({self.R})')",
                     "echo \\$\\(rm -rf /\\)"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
@@ -1038,7 +1038,13 @@ class TestParserGaps(unittest.TestCase):
                     "nice git commit -m '$(reboot)'",
                     "./git commit -m '$(reboot)'",
                     "printf -v GIT_EDITOR '$(reboot)'; git commit",
-                    "echo ${GIT_EDITOR:='$(reboot)'}; git commit", "git commit -m x && git status '$(reboot)'",
+                    "echo ${GIT_EDITOR:='$(reboot)'}; git commit",
+                    # One stage only, and no redirection: nothing later on the
+                    # line may consume what it writes.
+                    f"echo -e '[trailer \"x\"]\\n\\tcommand = $({R})' >> .git/config; "
+                    "git commit --trailer x:y",
+                    f"echo '$({R})' > .git/hooks/pre-commit",
+                    f"git commit -m '$({R})' && echo done", "git commit -m x && git status '$(reboot)'",
                     f"echo \"$(sh -c 'echo $({R})')\"",
                     f"for i in 1; do printf '$({R})'; done | sh"):
             with self.subTest(cmd=cmd):
