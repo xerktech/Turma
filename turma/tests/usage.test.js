@@ -1281,7 +1281,8 @@ test("XERK-1563: the permission card lists each prompt with its rule and a copy 
   const html = H.permissionsCardHtml(permView, PERM_NOW);
   assert.match(html, /Permission prompts \(7 days\)/);
   assert.match(html, /<code>Bash\(npm test:\*\)<\/code><button[^>]*data-perm-rule="Bash\(npm test:\*\)"/);
-  assert.match(html, /<td>12<\/td>\s*<td>11 \/ 1<\/td>\s*<td>2m<\/td>/);   // count, answers, median wait
+  // count, answers, median wait — each labelled for the phone's stacked block
+  assert.match(html, /data-label="Count">12<\/td>\s*<td[^>]*data-label="Allowed \/ denied">11 \/ 1<\/td>\s*<td[^>]*data-label="Median wait">2m<\/td>/);
   assert.match(html, /k-classifier-denied/);
   assert.match(html, /Dialog · plan/);
   assert.match(html, /no rule retires this/);             // a plan approval has no rule
@@ -1338,4 +1339,48 @@ test("XERK-1563: the card's fetch is scoped by the header's org filter", async (
   assert.equal(url, "/api/permissions?days=7&org=acme.atlassian.net%2Crival.atlassian.net");
   assert.equal(H3.getPermView(), permView);
   assert.match(H3.els.permissions.innerHTML, /Bash\(npm test:\*\)/);
+});
+
+test("XERK-1563: an ask-in-chat group shows its question as prose and no 0 / 0", () => {
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "ask-in-chat", prompt: "Should I rebuild the Dockerfile?", count: 2, allowed: null,
+      denied: null, medianWaitMs: 60000, suggestedRule: "model behaviour: see CLAUDE.md step 0" },
+  ] }, PERM_NOW);
+  // The question is the subject, as prose — never mono, never broken mid-word.
+  assert.match(html, /<div class="perm-subj">Should I rebuild the Dockerfile\?<\/div>/);
+  assert.match(html, /data-label="Allowed \/ denied"><span class="perm-na"[^>]*>—<\/span>/);
+  assert.doesNotMatch(html, /0 \/ 0/);
+  // A model-behaviour pointer is not a setting: shown as text, nothing to copy.
+  assert.match(html, /Model behaviour, not a setting — see CLAUDE\.md step 0/);
+  assert.doesNotMatch(html, /data-perm-rule/);
+  // An older hub that still sends 0 / 0 for an ask reads the same.
+  assert.doesNotMatch(H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "ask-in-chat", prompt: "ok?", count: 1, allowed: 0, denied: 0 }] }, PERM_NOW), /0 \/ 0/);
+});
+
+test("XERK-1563: a classifier block with no rule says why, with nothing to copy", () => {
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "classifier-denied", tool: "Write", head: "/home/u/.ssh/config", count: 1, allowed: 0,
+      denied: 1, suggestedRule: null, denyReason: "Writing to SSH configuration <is> out of scope" },
+  ] }, PERM_NOW);
+  assert.match(html, /no rule retires this<\/span><div class="perm-why">Blocked: Writing to SSH configuration &lt;is&gt; out of scope<\/div>/);
+  assert.doesNotMatch(html, /data-perm-rule|autoMode/);
+  // A command subject is the mono, break-anywhere kind; its tool rides under it.
+  assert.match(html, /<div class="perm-subj cmd">\/home\/u\/\.ssh\/config<\/div><div class="perm-tool">Write<\/div>/);
+});
+
+test("XERK-1563: on a phone the card reflows to blocks, not a sideways-scrolling table", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "usage.html"), "utf8");
+  const phone = src.slice(src.indexOf("@media (max-width: 600px)", src.indexOf(".perm-empty")));
+  const block = phone.slice(0, phone.indexOf("\n  }\n"));
+  assert.match(block, /\.perm-card \.table-scroll \{ overflow-x: visible; \}/);
+  assert.match(block, /\.perm-card thead \{ display: none; \}/);
+  assert.match(block, /\.perm-card tbody tr \{[^}]*display: flex; flex-wrap: wrap;/);
+  // The sticky Prompt column is what hid the rules: it must not stick here.
+  assert.match(block, /\.perm-card tbody td \{[^}]*position: static;/);
+  assert.match(block, /td\.perm-rule \{ flex: 1 1 100%;/);
+  assert.match(block, /td\.perm-stat::before \{ content: attr\(data-label\)/);
+  // Prose subjects wrap at word boundaries; only commands may break mid-token.
+  assert.doesNotMatch(src, /\.perm-subj \{[^}]*break-all/);
+  assert.match(src, /\.perm-subj\.cmd \{[^}]*overflow-wrap: anywhere;/);
 });

@@ -250,7 +250,9 @@ function toolRule(tool, head) {
  *   ask-in-chat                      → "model behaviour: see CLAUDE.md step 0"
  *   a sandbox dialog naming a host   → sandbox.network.allowedDomains: <host>
  *   classifier-denied                → an autoMode.environment allow line for the
- *                                      call (its tool rule, else the reason's subject)
+ *                                      call's tool rule; NONE when the call has no
+ *                                      tool rule (a sentence lifted from the deny
+ *                                      reason is not a line anything accepts)
  *   Bash                             → Bash(<head>:*)
  *   MCP                              → the full mcp__<server>__<tool>
  *   WebFetch                         → WebFetch(domain:<d>)
@@ -263,11 +265,7 @@ function suggestedRule(g) {
     return `sandbox.network.allowedDomains: ${g.head}`;
   }
   const rule = toolRule(g.tool, g.head);
-  if (g.kind === "classifier-denied") {
-    const subject = rule || (g.denyReason || "").split(/[.;:\n]/)[0].trim().slice(0, 120) ||
-      g.head || g.tool;
-    return subject ? `autoMode.environment: allow ${subject}` : null;
-  }
+  if (g.kind === "classifier-denied") return rule ? `autoMode.environment: allow ${rule}` : null;
   if (g.dialogKind === "plan") return null;
   return rule;
 }
@@ -282,6 +280,17 @@ function scopedRows(hostSet, days, now) {
   return out;
 }
 
+// An ask-in-chat row has no tool or head — what tells two asks apart is the
+// question itself. Its group key is the question folded to lower-case letters
+// (case, punctuation, digits and spacing dropped, so "Shall I push PR #12?" and
+// "shall I push PR #13" are one ask) and bounded, so a long ask cannot make a
+// long key.
+const ASK_KEY_MAX = 120;
+function askKey(prompt) {
+  if (typeof prompt !== "string") return "";
+  return prompt.toLowerCase().replace(/[^\p{L}]+/gu, " ").trim().slice(0, ASK_KEY_MAX);
+}
+
 /**
  * `{top, recent}` for the Usage page. `hostSet` (a Set of host keys) scopes it —
  * the route builds it from the LIVE fleet's org, like `retiredUsage`; null = all.
@@ -290,12 +299,14 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
   const rows = scopedRows(hostSet, days, now);
   const groups = new Map();
   for (const { row } of rows) {
-    const key = [row.kind, row.dialogKind || "", row.tool || "", row.head || ""].join("\u0000");
+    const ask = row.kind === "ask-in-chat";
+    const key = [row.kind, row.dialogKind || "", row.tool || "", row.head || "",
+      ask ? askKey(row.prompt) : ""].join("\u0000");
     let g = groups.get(key);
     if (!g) {
       g = { kind: row.kind, dialogKind: row.dialogKind || null, tool: row.tool || null,
         head: row.head || null, count: 0, allowed: 0, denied: 0, waits: [], lastAt: 0,
-        denyReason: null };
+        denyReason: null, prompt: null };
       groups.set(key, g);
     }
     g.count += 1;
@@ -305,16 +316,30 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
     if (row.openedAt >= g.lastAt) {
       g.lastAt = row.openedAt;
       if (row.denyReason) g.denyReason = row.denyReason;
+      if (ask && row.prompt) g.prompt = row.prompt;
     }
   }
   const top = [...groups.values()]
     .sort((a, b) => b.count - a.count || b.lastAt - a.lastAt)
     .slice(0, TOP_MAX)
-    .map((g) => ({
-      kind: g.kind, dialogKind: g.dialogKind, tool: g.tool, head: g.head,
-      count: g.count, allowed: g.allowed, denied: g.denied,
-      medianWaitMs: median(g.waits), lastAt: g.lastAt, suggestedRule: suggestedRule(g),
-    }));
+    .map((g) => {
+      const out = {
+        kind: g.kind, dialogKind: g.dialogKind, tool: g.tool, head: g.head,
+        count: g.count, allowed: g.allowed, denied: g.denied,
+        medianWaitMs: median(g.waits), lastAt: g.lastAt, suggestedRule: suggestedRule(g),
+      };
+      // An ask-in-chat group's subject is its newest question. Nobody answers
+      // an ask with allow/deny, so its allowed/denied are null ("can't tell"),
+      // never a 0/0 that reads as "asked and ignored".
+      if (g.kind === "ask-in-chat") {
+        out.prompt = g.prompt;
+        out.allowed = null;
+        out.denied = null;
+      }
+      // A classifier block with no rule says WHY it was blocked instead.
+      if (g.kind === "classifier-denied" && g.denyReason) out.denyReason = g.denyReason;
+      return out;
+    });
   const recent = rows
     .sort((a, b) => b.row.openedAt - a.row.openedAt)
     .slice(0, RECENT_MAX)

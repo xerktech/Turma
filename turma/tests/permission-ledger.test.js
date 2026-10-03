@@ -144,8 +144,12 @@ test("suggestedRule: the deterministic table", () => {
       "sandbox.network.allowedDomains: registry.npmjs.org"],
     [{ kind: "classifier-denied", tool: "Bash", head: "git push" },
       "autoMode.environment: allow Bash(git push:*)"],
+    // No tool rule → NO rule: a sentence lifted from the deny reason pastes nowhere.
     [{ kind: "classifier-denied", tool: "Edit", head: "/x", denyReason: "Writing outside the repo. Refused" },
-      "autoMode.environment: allow Writing outside the repo"],
+      null],
+    [{ kind: "classifier-denied", tool: "Write", head: "/home/u/.ssh/config",
+      denyReason: "Writing to SSH configuration is outside the task" }, null],
+    [{ kind: "classifier-denied", denyReason: "Something" }, null],
     [{ kind: "ask-in-chat" }, "model behaviour: see CLAUDE.md step 0"],
     [{ kind: "dialog", dialogKind: "plan", tool: "ExitPlanMode", head: "ExitPlanMode" }, null],
     [{ kind: "dialog", tool: "Edit", head: "/repo/a.py" }, null],
@@ -153,6 +157,50 @@ test("suggestedRule: the deterministic table", () => {
     [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "npm" }, "Bash(npm:*)"],
   ];
   for (const [g, want] of cases) assert.equal(suggestedRule(g), want, JSON.stringify(g));
+});
+
+test("aggregate: ask-in-chat groups by its question, with no allowed/denied to claim", () => {
+  const ask = (id, prompt, extra = {}) => ({ id, kind: "ask-in-chat", sessionId: "s1", prompt,
+    openedAt: NOW - MIN, closedAt: NOW, waitedMs: MIN, answer: "unknown", via: "turma", ...extra });
+  ledger.ingest("h1", [
+    ask("a1", "Shall I push PR #12 to origin?"),
+    ask("a2", "shall I push   PR #13 to origin", { openedAt: NOW - 30000 }),   // same ask, folded
+    ask("a3", "Should I rebuild the Dockerfile?"),
+    ask("a4", undefined),                                                       // no question text
+  ], NOW);
+  const asks = aggregate({ now: NOW }).top.filter((g) => g.kind === "ask-in-chat");
+  assert.equal(asks.length, 3, "distinct questions are distinct groups");
+  const push = asks.find((g) => g.count === 2);
+  assert.equal(push.prompt, "shall I push   PR #13 to origin");            // the newest wording
+  assert.deepEqual([push.allowed, push.denied], [null, null]);
+  assert.equal(push.suggestedRule, "model behaviour: see CLAUDE.md step 0");
+  assert.ok(asks.some((g) => g.prompt === "Should I rebuild the Dockerfile?"));
+  assert.ok(asks.some((g) => g.prompt === null && g.count === 1));
+  // The key is bounded: two asks that differ only past the cap share a group.
+  ledger._internals.reset();
+  const long = "may I ".repeat(40);
+  ledger.ingest("h1", [ask("b1", long + "alpha"), ask("b2", long + "beta")], NOW);
+  assert.equal(aggregate({ now: NOW }).top.length, 1);
+});
+
+test("aggregate: a classifier block with no rule carries its deny reason", () => {
+  ledger.ingest("h1", [
+    row("c1", { kind: "classifier-denied", dialogKind: undefined, tool: "Write",
+      head: "/home/u/.ssh/config", denyReason: "Writing to SSH configuration", answer: "deny" }),
+    row("c2", { kind: "classifier-denied", dialogKind: undefined, head: "git push",
+      denyReason: "push is outside scope", answer: "deny" }),
+  ], NOW);
+  const { top } = aggregate({ now: NOW });
+  const write = top.find((g) => g.tool === "Write");
+  assert.equal(write.suggestedRule, null);
+  assert.equal(write.denyReason, "Writing to SSH configuration");
+  const push = top.find((g) => g.head === "git push");
+  assert.equal(push.suggestedRule, "autoMode.environment: allow Bash(git push:*)");
+  assert.deepEqual([push.allowed, push.denied], [0, 1]);
+  // A dialog group never carries a deny reason or a prompt.
+  ledger.ingest("h1", [row("d1")], NOW);
+  const dialog = aggregate({ now: NOW }).top.find((g) => g.kind === "dialog");
+  assert.equal("denyReason" in dialog || "prompt" in dialog, false);
 });
 
 test("kindTotals: per-kind counts and summed waits for /metrics", () => {

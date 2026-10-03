@@ -97,11 +97,15 @@ retire it — so an allow-list change is measured, not guessed. Agent half in `h
 |-----|------|
 | `ask-in-chat` | `model behaviour: see CLAUDE.md step 0` |
 | `dialog` `sandbox` naming a host | `sandbox.network.allowedDomains: <host>` |
-| `classifier-denied` | `autoMode.environment: allow <tool rule>` (else the deny reason's subject) |
+| `classifier-denied` | `autoMode.environment: allow <tool rule>`; NONE without a tool rule |
 | Bash | `Bash(<head>:*)` |
 | MCP | the full `mcp__<server>__<tool>` |
 | WebFetch | `WebFetch(domain:<d>)` |
 | a plan approval, a file path, anything else | none |
+
+- **A classifier block with no tool rule gets NO rule** — a sentence lifted from its deny reason
+  pastes nowhere. Its group carries `denyReason` instead, shown as the "why" under "no rule".
+- The ask-in-chat entry is a pointer, not a setting: the card shows it as text with no Copy.
 
 `head` = the Bash command's first word, two for a subcommand CLI (`git push`, `npm test`), leading
 `VAR=x` skipped; the file path; the MCP tool name; the WebFetch domain. The LLM judge (XERK-1566)
@@ -140,6 +144,10 @@ consumes this table; it does not replace it.
   = groups by `(kind, dialogKind, tool, head)` with `count/allowed/denied/medianWaitMs/lastAt/
   suggestedRule`, most frequent first. **Org-scoped off the LIVE fleet** (hosts currently declaring
   one of those orgs, like `retiredUsage`), so a removed host's rows show only under "All orgs".
+- **An `ask-in-chat` group is keyed on its QUESTION** (`askKey`: letters only, lower-cased, capped
+  at `ASK_KEY_MAX`), since it has no tool or head — keyed without it, every ask merged into one
+  generic row. The group serves its newest `prompt` as the subject and `allowed`/`denied` = `null`
+  (an ask is answered in prose; 0/0 would read "ignored"), which the card renders as "—".
 - **Groups are fleet-wide, not per host** — a deliberate deviation from the ticket's
   `(host, kind, tool, head)`: one allow rule retires a prompt on every host, so per-host groups would
   split one fix into N rows. The host rides each `recent` row; scope by org to narrow.
@@ -150,6 +158,11 @@ consumes this table; it does not replace it.
 - **`usage.html`'s "Permission prompts (7 days)"** card reads its own route (not `/api/agents`), so
   the beat's SSE patches never repaint it; refetched on load, on an org-filter change and every 60s.
   Every agent-supplied field is escaped; each rule has a Copy button.
+  - **Below 600px each group reflows to a stacked block** (CSS only, same markup): kind + subject;
+    one line of count / answers / wait (`data-label`); the rule + Copy on its own line. No sideways
+    scroll — the sticky Prompt column used to cover the rule column on a phone.
+  - **Only a command/tool subject (`.perm-subj.cmd`) breaks mid-token**; an ask's question is prose
+    and wraps between words.
   - That repaint goes through `TurmaNav.preserveScroll` and re-applies "Recent prompts"' open state
     (`permRecentOpen`, caught on capture — `toggle` does not bubble); an unchanged card is not
     repainted. A fresh `<details>` defaults closed, which snapped it shut once a minute.

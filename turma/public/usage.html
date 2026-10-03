@@ -230,14 +230,20 @@
   }
   .perm-kind.k-classifier-denied { color: var(--critical); border-color: currentColor; background: transparent; }
   .perm-kind.k-ask-in-chat { color: var(--warning); border-color: currentColor; background: transparent; }
-  .perm-subj { font-family: var(--font-mono); font-size: 12px; color: var(--ink); margin-top: 4px; word-break: break-all; }
+  /* A subject is prose (an ask's question) unless it is a command or tool name:
+     prose wraps at word boundaries; only `.cmd` may break mid-token, and only
+     where the token would otherwise overflow. */
+  .perm-subj { font-size: 13px; color: var(--ink); margin-top: 4px; word-break: normal; overflow-wrap: break-word; }
+  .perm-subj.cmd { font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
   .perm-tool { color: var(--muted); font-size: 11px; margin-top: 2px; }
   .perm-rule code {
     font-family: var(--font-mono); font-size: 12px; color: var(--ink);
     background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
-    padding: 2px 6px; word-break: break-all; display: inline-block; max-width: 100%;
+    padding: 2px 6px; word-break: normal; overflow-wrap: anywhere; display: inline-block; max-width: 100%;
   }
   .perm-rule .none { color: var(--muted); }
+  .perm-why { color: var(--muted); font-size: 11.5px; margin-top: 3px; word-break: normal; overflow-wrap: break-word; }
+  .perm-na { color: var(--muted); }
   .perm-copy {
     font: inherit; font-size: 11.5px; margin-left: 6px; padding: 2px 8px; cursor: pointer;
     color: var(--ink-2); background: var(--surface);
@@ -259,6 +265,27 @@
     .models-card { padding: 12px 10px; }
     .legend { gap: 6px 16px; margin-bottom: 10px; }
     .tooltip { min-width: 150px; font-size: 11px; padding: 7px 10px; }
+    /* Permission prompts on a phone: the five-column table cannot fit, and the
+       sticky Prompt column covered the rule column however far it scrolled.
+       Each group reflows to a stacked block instead — kind + subject; one line
+       of count, answers and median wait; the rule and its Copy on their own
+       line — with no sideways scroll. The desktop table is untouched. */
+    .perm-card .table-scroll { overflow-x: visible; }
+    .perm-card table, .perm-card tbody, .perm-card td { display: block; }
+    .perm-card thead { display: none; }
+    .perm-card tbody tr {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px;
+      padding: 10px 12px; border-bottom: 1px solid var(--hairline);
+    }
+    .perm-card tbody tr:last-child { border-bottom: none; }
+    .perm-card tbody td {
+      position: static; padding: 0; border: none; background: none;
+      text-align: left; white-space: normal; min-width: 0;
+    }
+    .perm-card tbody td:first-child { flex: 1 1 100%; min-width: 0; }
+    .perm-card tbody td.perm-stat { flex: none; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+    .perm-card tbody td.perm-stat::before { content: attr(data-label) " "; color: var(--muted); }
+    .perm-card tbody td.perm-rule { flex: 1 1 100%; min-width: 0; margin-top: 2px; }
   }
   /* Touch devices: roomier legend/table hit areas. */
   @media (pointer: coarse) {
@@ -1621,7 +1648,38 @@ function permSubject(g) {
   if (g.kind === "ask-in-chat") return g.prompt || "asked for permission in chat";
   return g.tool || "—";
 }
+// The subject as markup: a command or tool name is mono and may break
+// mid-token; an ask's question is prose and wraps only between words.
+function permSubjectHtml(g, tag) {
+  const prose = !g.head && g.kind === "ask-in-chat";
+  return `<${tag} class="perm-subj${prose ? "" : " cmd"}">${esc(permSubject(g))}</${tag}>`;
+}
 function permNum(n) { return typeof n === "number" && Number.isFinite(n) ? n : 0; }
+// Allowed / denied, or "—" when no answer is knowable: an ask in chat is
+// answered in prose, never allow/deny, so 0 / 0 there would read as "ignored".
+function permAnswers(g) {
+  const known = (n) => typeof n === "number" && Number.isFinite(n);
+  if (g.kind === "ask-in-chat" || !known(g.allowed) || !known(g.denied)) {
+    return `<span class="perm-na" title="No allow/deny answer is recorded for this kind of prompt">—</span>`;
+  }
+  return `${g.allowed} / ${g.denied}`;
+}
+// The rule cell. A pasteable rule gets a Copy button; the ask-in-chat entry is
+// a pointer, not a setting, so it is shown as text; no rule says so — and a
+// classifier block says why it was blocked, the one thing to go on.
+const PERM_BEHAVIOUR_RE = /^model behaviour:\s*/;
+function permRuleHtml(g) {
+  const rule = typeof g.suggestedRule === "string" && g.suggestedRule ? g.suggestedRule : "";
+  if (rule && PERM_BEHAVIOUR_RE.test(rule)) {
+    return `<span class="none">Model behaviour, not a setting — ${esc(rule.replace(PERM_BEHAVIOUR_RE, ""))}</span>`;
+  }
+  if (rule) {
+    return `<code>${esc(rule)}</code><button type="button" class="perm-copy" data-perm-rule="${esc(rule)}" title="Copy this rule">Copy</button>`;
+  }
+  const why = g.kind === "classifier-denied" && typeof g.denyReason === "string" && g.denyReason
+    ? `<div class="perm-why">Blocked: ${esc(g.denyReason)}</div>` : "";
+  return `<span class="none">no rule retires this</span>${why}`;
+}
 
 // The whole card, as markup — pure over the hub's `{days, top, recent}`. Every
 // field is agent-supplied text, so every one is escaped (a rule or a command can
@@ -1637,18 +1695,15 @@ function permissionsCardHtml(view, now, recentOpen = false) {
   if (!top.length) {
     return head + `<div class="perm-empty">No permission prompts recorded in the last ${days} days for the selected orgs.</div>`;
   }
+  // data-label names each number when a phone reflows the row into a block.
   const rows = top.map((g) => {
-    const rule = typeof g.suggestedRule === "string" && g.suggestedRule ? g.suggestedRule : "";
-    const subject = permSubject(g);
     const tool = g.tool && g.head && g.tool !== g.head ? `<div class="perm-tool">${esc(g.tool)}</div>` : "";
     return `<tr>
-      <td>${permKindHtml(g)}<div class="perm-subj">${esc(subject)}</div>${tool}</td>
-      <td>${permNum(g.count)}</td>
-      <td>${permNum(g.allowed)} / ${permNum(g.denied)}</td>
-      <td>${esc(permWait(g.medianWaitMs))}</td>
-      <td class="perm-rule">${rule
-        ? `<code>${esc(rule)}</code><button type="button" class="perm-copy" data-perm-rule="${esc(rule)}" title="Copy this rule">Copy</button>`
-        : `<span class="none">no rule retires this</span>`}</td>
+      <td>${permKindHtml(g)}${permSubjectHtml(g, "div")}${tool}</td>
+      <td class="perm-stat" data-label="Count">${permNum(g.count)}</td>
+      <td class="perm-stat" data-label="Allowed / denied">${permAnswers(g)}</td>
+      <td class="perm-stat" data-label="Median wait">${esc(permWait(g.medianWaitMs))}</td>
+      <td class="perm-rule">${permRuleHtml(g)}</td>
     </tr>`;
   }).join("");
   const table = `<div class="table-scroll"><table>
@@ -1664,7 +1719,7 @@ function permissionsCardHtml(view, now, recentOpen = false) {
     else if (!r.closedAt) parts.push("still open");
     if (r.answer) parts.push(r.answer);
     const wait = parts.join(" · ");
-    return `<li>${permKindHtml(r)}<span class="perm-subj">${esc(permSubject(r))}</span>` +
+    return `<li>${permKindHtml(r)}${permSubjectHtml(r, "span")}` +
       `<span class="meta">${esc(r.host || "")}</span>` +
       `<span class="meta">${esc(wait)}</span><span class="meta">${esc(ago)}</span></li>`;
   }).join("");
