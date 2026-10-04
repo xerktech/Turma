@@ -105,6 +105,46 @@ class SessionsFlattenTest {
         assertEquals(listOf("mergedOne", "quietOne"), groups.idle.map { it.flat.session.id }.sorted())
     }
 
+    // XERK-1571: Ready for review is ordered oldest-WAITING first by the hub's
+    // attention `since`, not by createdAt; the other groups keep createdAt.
+    @Test fun `rankRunning orders Ready for review by attention since, oldest first`() {
+        fun done(id: String, createdAt: String, since: Long?) = flat(
+            id, paneBusy = false, lastRole = "assistant", createdAt = createdAt,
+        ).let { f ->
+            f.copy(session = f.session.copy(
+                attention = since?.let { com.xerktech.turma.model.Attention(state = "needs-you:review", since = it) },
+            ))
+        }
+        val groups = rankRunning(
+            listOf(
+                done("newest", "2026-03-01T00:00:00Z", since = 900L),
+                done("oldest", "2026-01-01T00:00:00Z", since = 100L),
+                done("noSince", "2026-04-01T00:00:00Z", since = null),
+            ),
+            now = 1_000L,
+        )
+        assertEquals(listOf("oldest", "newest", "noSince"), groups.review.map { it.flat.session.id })
+    }
+
+    // XERK-1571: where the hub serves attention it DECIDES Ready for review — every
+    // needs-you:* session is listed (a stall the local read files under Idle too),
+    // and a session it says is idle is not, so the group is the tile's set.
+    @Test fun `rankRunning lists every hub needs-you session in Ready for review`() {
+        fun withAtt(f: FlatSession, state: String, since: Long) =
+            f.copy(session = f.session.copy(attention = com.xerktech.turma.model.Attention(state = state, since = since)))
+        val groups = rankRunning(
+            listOf(
+                withAtt(flat("stalled", paneBusy = false), "needs-you:stalled", 100L),
+                withAtt(flat("asked", question = "pick one"), "needs-you:question", 300L),
+                withAtt(flat("hubIdle", paneBusy = false, lastRole = "assistant"), "idle", 200L),
+                flat("olderHub", paneBusy = false, lastRole = "assistant"),
+            ),
+            now = 1_000L,
+        )
+        assertEquals(listOf("stalled", "asked", "olderHub"), groups.review.map { it.flat.session.id })
+        assertEquals(listOf("hubIdle"), groups.idle.map { it.flat.session.id })
+    }
+
     @Test fun `rankRunning orders newest-created first, whatever the activity`() {
         fun beat(oldAge: Double, newAge: Double) = rankRunning(
             listOf(
@@ -336,5 +376,50 @@ class SessionsFlattenTest {
         assertEquals("ended", endedStateText(e(EndedKind.RESUMABLE)))
         assertEquals("failed", endedStateText(e(EndedKind.STOPPED, status = "error")))
         assertEquals("stopped", endedStateText(e(EndedKind.STOPPED, status = "stopped")))
+    }
+
+    // XERK-1575: a sleeper the hub paused for its slot reads asleep until its
+    // wake (web `pausedLabel`), never "killed" — and it rides the closed channel.
+    @Test fun `a paused sleeper reads paused until its wake, not killed`() {
+        val now = 1_786_400_000_000L
+        val wakeAt = now + 90 * 60_000L
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            closedSessions = listOf(
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "nap", transcriptId = "t1", closedAt = "2026-07-22T10:00:00Z",
+                    paused = com.xerktech.turma.model.PausedSleep(wakeAt = wakeAt, wakeReason = "check CI", at = now),
+                ),
+                com.xerktech.turma.model.ClosedSessionInfo(id = "kill", transcriptId = "t2"),
+            ),
+        )
+        val ended = collectSessions(listOf(a), "").ended.associateBy { it.id }
+        assertEquals(
+            "💤 paused until ${com.xerktech.turma.core.clockTime(wakeAt, now)} · check CI",
+            endedStateText(ended.getValue("nap"), now),
+        )
+        assertEquals("killed", endedStateText(ended.getValue("kill"), now))
+    }
+
+    // XERK-1575: paused sleepers leave the collapsed Ended list for their own
+    // Paused section, soonest wake first (web sessions.html `$paused`).
+    @Test fun `paused sleepers split out of Ended, soonest wake first`() {
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            closedSessions = listOf(
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "late", transcriptId = "t1",
+                    paused = com.xerktech.turma.model.PausedSleep(wakeAt = 9_000L),
+                ),
+                com.xerktech.turma.model.ClosedSessionInfo(id = "kill", transcriptId = "t2"),
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "early", transcriptId = "t3",
+                    paused = com.xerktech.turma.model.PausedSleep(wakeAt = 5_000L),
+                ),
+            ),
+        )
+        val ended = collectSessions(listOf(a), "").ended
+        assertEquals(listOf("early", "late"), pausedEnded(ended).map { it.id })
+        assertEquals(listOf("kill"), ended.filterNot(::isPausedEnded).map { it.id })
     }
 }

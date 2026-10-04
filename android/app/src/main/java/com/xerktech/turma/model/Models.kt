@@ -86,6 +86,85 @@ data class AgentsResponse(
     // (sanitizeEpicBuilderRecord) only ever emits clean object entries, so there
     // is no per-value coercion beyond the defaults + TurmaJson.coerceInputValues.
     val epicBuilders: Map<String, EpicBuilder> = emptyMap(),
+    // The per-org brief (XERK-1573), siteKey -> that org's last briefs, newest
+    // first. Hub-owned and sanitized on every write/restore (sanitizeBrief), and
+    // every field below is defaulted, so an older hub (absent) reads as "no brief
+    // yet" and a partial record still decodes — this payload decodes atomically.
+    val briefs: Map<String, List<OrgBrief>> = emptyMap(),
+)
+
+/**
+ * One org's brief (XERK-1573; the hub's `sanitizeBrief` shape): what finished,
+ * what waits on the operator, what waits on time, what is stalled, what starts
+ * next and why, what a session closed as stale, and the subscription spend —
+ * compiled hub-side from hub data, no model. [at]/[since] are epoch ms (the
+ * period it covers); [trigger] is "scheduled" or "manual".
+ */
+@Serializable
+data class OrgBrief(
+    val siteKey: String = "",
+    val at: Long = 0,
+    val since: Long = 0,
+    val trigger: String = "scheduled",
+    val autoStart: Boolean = false,
+    val counts: BriefCounts = BriefCounts(),
+    val finished: List<BriefItem> = emptyList(),
+    val needsYou: List<BriefItem> = emptyList(),
+    val waiting: List<BriefItem> = emptyList(),
+    val stalled: List<BriefItem> = emptyList(),
+    val nextUp: List<BriefItem> = emptyList(),
+    val closedStale: List<BriefItem> = emptyList(),
+    val spend: List<BriefSpend> = emptyList(),
+)
+
+/** A brief's totals — each list above is capped, these are not. */
+@Serializable
+data class BriefCounts(
+    val finished: Long = 0,
+    val needsYou: Long = 0,
+    val waiting: Long = 0,
+    val stalled: Long = 0,
+    val nextUp: Long = 0,
+    val closedStale: Long = 0,
+    val intake: Long = 0,
+    val outflow: Long = 0,
+)
+
+/**
+ * One row of a brief section. [kind] is "ticket" | "pr" | "session"; the rest is
+ * whatever that row has: a ticket's [key], a PR's [url], a session's [host] +
+ * [sessionId] + attention [state]/[why], the [reason] a ticket is next (or the
+ * stale-close kind), [since]/[eta] in epoch ms. A finished ticket's [prUrl] is the
+ * merged PR folded into its row (one piece of work, one row).
+ */
+@Serializable
+data class BriefItem(
+    val kind: String = "",
+    val title: String = "",
+    val key: String? = null,
+    val url: String? = null,
+    val prUrl: String? = null,
+    val host: String? = null,
+    val sessionId: String? = null,
+    val transcriptId: String? = null,
+    val state: String? = null,
+    val why: String? = null,
+    val reason: String? = null,
+    val note: String? = null,
+    val since: Long? = null,
+    val eta: Long? = null,
+)
+
+/** One subscription the org's hosts spend: its live windows and whether it pauses auto-start. */
+@Serializable
+data class BriefSpend(
+    val label: String = "",
+    val fiveHourPct: Double? = null,
+    val sevenDayPct: Double? = null,
+    val fiveHourResetsAt: Long? = null,
+    val sevenDayResetsAt: Long? = null,
+    val capturedAt: Long? = null,
+    val paused: Boolean = false,
 )
 
 /**
@@ -539,6 +618,18 @@ data class ClosedSessionInfo(
     // PR-status objects this session opened, same shape/type as SessionInfo.prs —
     // rendered as chips on the ended card and the read-only review's stage bar.
     val prs: List<PrInfo> = emptyList(),
+    // A sleeper the hub paused to free its slot (XERK-1575): when it wakes and
+    // why. The hub rebuilds it field by field (`wirePaused`) or drops it, so it
+    // is null for an ordinary kill and for an older hub/agent.
+    val paused: PausedSleep? = null,
+)
+
+/** A paused sleeper's wake (ClosedSessionInfo `paused`, XERK-1575). */
+@Serializable
+data class PausedSleep(
+    val wakeAt: Long = 0,
+    val wakeReason: String = "",
+    val at: Long = 0,
 )
 
 /** A session's Jira ticket link (SessionInfo/ClosedSessionInfo `ticket`). */
@@ -549,6 +640,22 @@ data class TicketRef(
     val url: String = "",
     val summary: String = "",
     val branch: String? = null,
+    // How the session closed this ticket itself (XERK-1569); null = it didn't.
+    // The hub coerces it by name (coerceTicketOutcome), or deletes it.
+    val outcome: TicketOutcome? = null,
+)
+
+/**
+ * A ticket's self-close outcome (`ticket.outcome`): kind = done | not-reproducible |
+ * already-fixed, at = epoch ms. The hub deletes the whole key unless `at` is a
+ * finite integer (wireLong), so a Long here never sees a fraction. `note` is the
+ * session's evidence, a hub-bounded string (≤2000 chars); "" = none served.
+ */
+@Serializable
+data class TicketOutcome(
+    val kind: String = "",
+    val at: Long = 0L,
+    val note: String = "",
 )
 
 // ---- Jira board (the agent's `jira` heartbeat block; see hub-agent collect_jira) --
@@ -985,6 +1092,43 @@ data class SessionInfo(
     val restartCount: Int = 0,
     // The live branch's relation to its base/origin — the work-risk line.
     val work: WorkInfo? = null,
+    /**
+     * The hub-derived attention state (XERK-1571, server.js `sessionAttention`):
+     * stamped by the hub on the served copy, never the agent's word (the hub
+     * strips a forged one and rebuilds it to this exact shape). Null from an older
+     * hub, which reads as "can't tell" — no Needs-you row, no since-ordering.
+     */
+    val attention: Attention? = null,
+)
+
+/**
+ * One session's attention (XERK-1571). [state] is `needs-you:question` |
+ * `needs-you:permission` | `needs-you:review` | `needs-you:test` |
+ * `needs-you:stalled` | `working` | `waiting` | `sleeping` | `idle`; [since] the
+ * epoch ms it last changed; [eta] epoch ms for a wait/sleep with a known end;
+ * [why] the one-line reason; [hint] the wait classifier's verdict (XERK-1572).
+ */
+@Serializable
+data class Attention(
+    val state: String = "",
+    val since: Long? = null,
+    val eta: Long? = null,
+    val why: String? = null,
+    val hint: AttentionHint? = null,
+)
+
+/**
+ * The wait classifier's verdict on a needs-you session (XERK-1572, server.js
+ * `wireAttention`): [label] is `rubber-stamp` | `design-decision` |
+ * `needs-human-test` | `blocked-on-host` | `looping` | `waiting-external`, [why]
+ * what it waits on, [suggestedAnswer] the reply it suggests. The hub rebuilds it
+ * strictly (label from the fixed set, texts capped at 300) or omits it.
+ */
+@Serializable
+data class AttentionHint(
+    val label: String = "",
+    val why: String = "",
+    val suggestedAnswer: String? = null,
 )
 
 @Serializable
@@ -1033,6 +1177,11 @@ data class LiveSignals(
     val questionMulti: Boolean = false,
     val newPrUrls: List<String> = emptyList(),
     val tail: List<TailEntry> = emptyList(),
+    // A session-CLI wake request (XERK-1564): epoch ms + why. A [wakeAt] still in
+    // the future is the session SLEEPING (XERK-1571). The hub keeps [wakeAt] a
+    // positive safe integer and [wakeReason] a capped string, else omits them.
+    val wakeAt: Long? = null,
+    val wakeReason: String? = null,
 )
 
 @Serializable

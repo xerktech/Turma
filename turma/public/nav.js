@@ -40,6 +40,10 @@
       icon: `<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>`,
     },
     {
+      id: "brief", href: "/brief", label: "Brief",
+      icon: `<path d="M9 4h6"/><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 10h6"/><path d="M9 14h6"/><path d="M9 18h3"/>`,
+    },
+    {
       id: "sessions", href: "/sessions", label: "Sessions",
       icon: `<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/>`,
       join: `stroke-linejoin="round"`,
@@ -111,8 +115,9 @@
   // pane on load: that moves where Tab starts, so the first Tab skipped the
   // whole header. It steps aside whenever the browser has a scroll target of
   // its own, because the browser does that better (inner lists, the pane itself):
-  //  - the focused element is inside the pane (its own scroller handles it) or
-  //    is editable (keys are text); a focused header link/button outside the
+  //  - the focused element is inside the pane or another scroller (the org
+  //    menu — the browser scrolls that one) or is editable (keys are text);
+  //    a focused header link/button outside the
   //    pane keeps only Space, which activates it — its other keys route here,
   //    since the browser would send them to the unscrollable root;
   //  - a modal is open (`body.td-open`) — its keys belong to the modal;
@@ -126,7 +131,7 @@
     if (e.ctrlKey && e.key !== "Home" && e.key !== "End") return;
     const focused = doc.activeElement && doc.activeElement !== doc.body ? doc.activeElement : null;
     if (focused) {
-      if (e.key === " " || pane.contains(focused)) return;
+      if (e.key === " " || pane.contains(focused) || inScroller(doc, focused)) return;
       if (focused.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(focused.tagName)) return;
     }
     if (doc.body.classList && doc.body.classList.contains("td-open")) return;

@@ -26,7 +26,8 @@ function makeEl() {
     _html: "", textContent: "", value: "", hidden: false,
     style: {}, dataset: {}, children: [],
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
-    addEventListener() {}, removeEventListener() {},
+    listeners: {},
+    addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); }, removeEventListener() {},
     append(...c) { this.children.push(...c); },
     appendChild(c) { this.children.push(c); return c; },
     replaceChildren(...c) { this.children = c; },
@@ -46,12 +47,18 @@ function makeEl() {
 // What the page's TurmaOrg.filter stub does, swappable per test. Identity by
 // default, which is "All orgs".
 let orgFilter = (agents) => agents;
+// The header's selected org keys, for the permission card's scoped fetch.
+let orgKeys = [];
+// A test may stand in org.js's own key/update behaviour (getKeys is [] until
+// update() has seen the sites the data names); null = the plain stub above.
+let orgHooks = null;
 
 function loadHelpers(fetchReply = null) {
   const els = {};
   const sse = [];
   const fetches = [];
   const timers = [];
+  const scrollCalls = [];
   const noop = () => {};
   const document = {
     getElementById(id) { return (els[id] ||= makeEl()); },
@@ -73,9 +80,11 @@ function loadHelpers(fetchReply = null) {
     navigator: { userAgent: "node" },
     fetch: (u) => {
       fetches.push(String(u));
-      return fetchReply
-        ? Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply()) })
-        : new Promise(() => {});
+      if (!fetchReply) return new Promise(() => {});
+      // `fetchReply.httpStatus(url)` returning n answers that refusal instead of a body.
+      const status = fetchReply.httpStatus && fetchReply.httpStatus(String(u));
+      if (status) return Promise.resolve({ status, ok: false, json: () => Promise.resolve({}) });
+      return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply(String(u))) });
     },
     // Captures the page's SSE handlers so a test can deliver a real `removed`
     // event — the fallback poll is skipped while the stream is healthy, so that
@@ -95,10 +104,12 @@ function loadHelpers(fetchReply = null) {
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent,
     parseInt, parseFloat, isNaN, Number, String, Object, Array, Map, Set,
     addEventListener: noop, removeEventListener: noop,
-    TurmaNav: { preserveScroll: (_el, paint) => paint() },
+    TurmaNav: { preserveScroll: (el, paint) => { scrollCalls.push(el); paint(); } },
     // Indirected through `orgFilter` so a test can narrow the page the way the
     // header's org control does, and check what each section was rendered from.
-    TurmaOrg: { get: () => "", update: noop, filter: (a) => orgFilter(a), subscribe: noop, sse: noop, orgColors: () => ({}) },
+    TurmaOrg: { get: () => "", getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
+      update: (d) => { if (orgHooks) orgHooks.update(d); }, filter: (a) => orgFilter(a),
+      subscribe: noop, sse: noop, orgColors: () => ({}) },
     TurmaBoard: { orgName: (k) => k, orgColorMap: () => ({}) },
     TurmaNewTicket: { update: noop },
   };
@@ -109,14 +120,16 @@ function loadHelpers(fetchReply = null) {
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
     hostLabel, hostSeries, repoSeries,
-    applyAgent, connectSSE, refresh, mergeSnapshot, setCache: (c) => { cache = c; }, getCache: () => cache };`;
+    applyAgent, connectSSE, refresh, mergeSnapshot,
+    permissionsCardHtml, refreshPermissions, getPermView: () => permView, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
   const api = new Function(...keys, body)(...keys.map((k) => stubs[k]));
   const runTimers = async () => {
     for (const t of timers.splice(0).filter(Boolean)) await t.fn();
   };
-  return Object.assign(api, { els, sse, fetches, timers, runTimers });
+  return Object.assign(api, { els, sse, fetches, timers, runTimers, scrollCalls,
+    navigator: stubs.navigator });
 }
 
 const H = loadHelpers();
@@ -1251,4 +1264,346 @@ test("a removal re-polls once, however many hosts the hub evicts", async () => {
   await H2.runTimers();
   await new Promise((r) => setImmediate(r));
   assert.equal(H2.fetches.filter((u) => u === "/api/agents").length, 1);
+});
+
+// --- Permission prompts (XERK-1563) --------------------------------------------
+
+const PERM_NOW = Date.parse("2026-10-03T12:00:00Z");
+const permView = {
+  days: 7,
+  top: [
+    { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "git status", count: 12,
+      allowed: 11, denied: 1, medianWaitMs: 95000, lastAt: PERM_NOW, suggestedRule: "Bash(git status:*)" },
+    { kind: "classifier-denied", tool: "Bash", head: "git rev-parse", count: 3, allowed: 0, denied: 3,
+      medianWaitMs: null, lastAt: PERM_NOW, suggestedRule: "autoMode.environment: allow Bash(git rev-parse:*)" },
+    { kind: "dialog", dialogKind: "plan", tool: "ExitPlanMode", head: "ExitPlanMode", count: 1,
+      allowed: 1, denied: 0, medianWaitMs: 4000, lastAt: PERM_NOW, suggestedRule: null },
+  ],
+  recent: [
+    { host: "nas01", kind: "ask-in-chat", prompt: "Should I proceed with the deploy?",
+      openedAt: PERM_NOW - 120000, waitedMs: 60000, answer: "unknown" },
+  ],
+};
+
+test("XERK-1563: the permission card lists each prompt with its rule and a copy button", () => {
+  const html = H.permissionsCardHtml(permView, PERM_NOW);
+  assert.match(html, /Permission prompts \(7 days\)/);
+  assert.match(html, /<code>Bash\(<wbr>git status:\*\)<\/code><button[^>]*data-perm-rule="Bash\(git status:\*\)"/);
+  // count, answers, median wait — each labelled for the phone's stacked block
+  assert.match(html, /data-label="Count">12<\/td>\s*<td[^>]*data-label="Allowed \/ denied">11 \/ 1<\/td>\s*<td[^>]*data-label="Median wait">2m<\/td>/);
+  assert.match(html, /k-classifier-denied/);
+  assert.match(html, /Dialog · plan/);
+  assert.match(html, /no rule retires this/);             // a plan approval has no rule
+  assert.match(html, /Recent prompts \(1\)/);
+  // An ask has no allow/deny by design: its stored "unknown" never shows (the
+  // table says "—" for the same group), and the host leads the meta group.
+  assert.match(html, /Should I proceed with the deploy\?<\/span><span class="perm-meta"><span class="meta">nas01<\/span><span class="meta">waited 1m<\/span><span class="meta">2m ago<\/span><\/span>/);
+  assert.doesNotMatch(html, /unknown/);
+});
+
+test("XERK-1563: a group still waiting on its only answer reads 'open', never 0 / 0", () => {
+  const g = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "terraform apply",
+    suggestedRule: "Bash(terraform apply:*)", medianWaitMs: null };
+  const one = H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...g, count: 1, allowed: 0, denied: 0, open: 1 }] }, PERM_NOW);
+  assert.match(one, /data-label="Allowed \/ denied"><span class="perm-na"[^>]*>still open<\/span><\/td>/);
+  assert.doesNotMatch(one, /0 \/ 0/);
+  // Some answered, some still open: the answers, and how many still wait.
+  const mixed = H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...g, count: 3, allowed: 1, denied: 0, open: 2 }] }, PERM_NOW);
+  assert.match(mixed, /data-label="Allowed \/ denied">1 \/ 0 <span class="perm-na">· 2 open<\/span><\/td>/);
+  // An older hub sends no `open`: unchanged.
+  const old = H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...g, count: 1, allowed: 1, denied: 0 }] }, PERM_NOW);
+  assert.match(old, /data-label="Allowed \/ denied">1 \/ 0<\/td>/);
+  // An ask still waiting is open too; once answered it is "—".
+  const ask = { kind: "ask-in-chat", prompt: "May I push?", count: 1, allowed: null, denied: null };
+  assert.match(H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...ask, open: 1 }] }, PERM_NOW), />still open<\/span>/);
+  assert.match(H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...ask, open: 0 }] }, PERM_NOW), />—<\/span>/);
+});
+
+test("XERK-1563: a recent row says 'still open' only while it has no answer at all", () => {
+  const rows = (r) => H.permissionsCardHtml({ days: 7, top: [{ kind: "dialog", head: "x", count: 1 }],
+    recent: [{ host: "h1", kind: "dialog", head: "x", openedAt: PERM_NOW - 60000, ...r }] }, PERM_NOW);
+  assert.match(rows({}), /<span class="meta">h1<\/span><span class="meta">still open<\/span>/);
+  // A request answered between two beats arrives closed-less but answered.
+  const between = rows({ answer: "unknown" });
+  assert.doesNotMatch(between, /still open/);
+  assert.match(between, /<span class="meta">h1<\/span><span class="meta">unknown<\/span>/);
+  // No host: the group leads with the next part rather than an empty slot.
+  assert.match(H.permissionsCardHtml({ days: 7, top: [{ kind: "dialog", head: "x", count: 1 }],
+    recent: [{ kind: "dialog", head: "x", openedAt: PERM_NOW - 60000, waitedMs: 1000, closedAt: PERM_NOW, answer: "allow" }] }, PERM_NOW),
+    /<span class="perm-meta"><span class="meta">waited 1s · allow<\/span>/);
+});
+
+test("XERK-1563: every agent-supplied field in the card is escaped", () => {
+  const evil = "<img src=x onerror=alert(1)>";
+  const html = H.permissionsCardHtml({ days: 7,
+    top: [{ kind: "dialog", tool: evil, head: `"${evil}`, count: 1, suggestedRule: `Bash(${evil})` }],
+    recent: [{ host: evil, kind: "dialog", head: evil, openedAt: PERM_NOW }] }, PERM_NOW);
+  assert.doesNotMatch(html, /<img/);
+  assert.match(html, /data-perm-rule="Bash\(&lt;img/);
+});
+
+test("XERK-1563: the card says loading, then empty, never a broken table", () => {
+  assert.match(H.permissionsCardHtml(null, PERM_NOW), /Loading/);
+  const empty = H.permissionsCardHtml({ days: 7, top: [], recent: [] }, PERM_NOW);
+  assert.match(empty, /No permission prompts recorded in the last 7 days/);
+  assert.doesNotMatch(empty, /<table/);
+  // A malformed view (an older hub answering something else) degrades the same way.
+  assert.match(H.permissionsCardHtml({ top: "nope", recent: [null] }, PERM_NOW), /No permission prompts/);
+});
+
+test("XERK-1563: a refused first fetch says it failed; a later one keeps the last view", async () => {
+  let refuse = 401;
+  const reply = () => permView;
+  reply.httpStatus = (u) => (u.startsWith("/api/permissions") ? refuse : 0);
+  const H5 = loadHelpers(reply);
+  await H5.refreshPermissions();
+  const el = H5.els.permissions;
+  assert.match(el.innerHTML, /Could not load permission prompts \(HTTP 401\)\./);
+  assert.doesNotMatch(el.innerHTML, /Loading/);
+  refuse = 0;
+  await H5.refreshPermissions();
+  assert.match(el.innerHTML, /Bash\(git status:\*\)/);
+  refuse = 503;
+  await H5.refreshPermissions();
+  assert.match(el.innerHTML, /Bash\(git status:\*\)/, "a failed refresh keeps the last view");
+  assert.doesNotMatch(el.innerHTML, /Could not load/);
+  // The error is escaped like every other field.
+  assert.match(H5.permissionsCardHtml(null, PERM_NOW, false, "<b>"), /\(&lt;b&gt;\)/);
+});
+
+test("XERK-1563: a failed fetch after an org change never shows the old org's view", async () => {
+  let refuse = 0;
+  const reply = () => permView;
+  reply.httpStatus = (u) => (u.startsWith("/api/permissions") ? refuse : 0);
+  const H6 = loadHelpers(reply);
+  const el = H6.els.permissions;
+  orgKeys = ["acme.atlassian.net"];
+  try {
+    await H6.refreshPermissions();
+    assert.match(el.innerHTML, /Bash\(git status:\*\)/);
+    // The operator picks another org and that org's read is refused.
+    orgKeys = ["rival.atlassian.net"];
+    refuse = 503;
+    const pending = H6.refreshPermissions();
+    // While it is in flight the old org's prompts are already gone.
+    assert.match(el.innerHTML, /Loading/);
+    assert.doesNotMatch(el.innerHTML, /git status/);
+    await pending;
+    assert.match(el.innerHTML, /Could not load permission prompts \(HTTP 503\)\./);
+    assert.doesNotMatch(el.innerHTML, /git status/, "acme's view must not read as rival's");
+    assert.equal(H6.getPermView(), null);
+    // A good read for the new org replaces the failure.
+    refuse = 0;
+    await H6.refreshPermissions();
+    assert.match(el.innerHTML, /Bash\(git status:\*\)/);
+    assert.doesNotMatch(el.innerHTML, /Could not load/);
+  } finally { orgKeys = []; }
+});
+
+test("XERK-1563: the minute repaint keeps Recent prompts open and goes through preserveScroll", async () => {
+  const H4 = loadHelpers(() => permView);
+  await H4.refreshPermissions();
+  const el = H4.els.permissions;
+  assert.match(el.innerHTML, /<details class="table-view perm-recent-view"><summary>/);   // closed by default
+  assert.ok(H4.scrollCalls.includes(el), "the repaint must go through TurmaNav.preserveScroll");
+  // The operator opens it; the next refresh must not snap it shut.
+  const toggle = (open) => el.listeners.toggle.forEach((fn) => fn({
+    target: { open, matches: (sel) => sel === "details.perm-recent-view" } }));
+  toggle(true);
+  await H4.refreshPermissions();
+  assert.match(el.innerHTML, /<details class="table-view perm-recent-view" open><summary>/);
+  toggle(false);
+  await H4.refreshPermissions();
+  assert.doesNotMatch(el.innerHTML, /perm-recent-view" open/);
+  // An unchanged card is not repainted at all — even though a browser hands
+  // innerHTML back re-serialized (`open` as `open=""`), so the skip must not
+  // compare against what it reads back.
+  toggle(true);
+  await H4.refreshPermissions();
+  el.innerHTML = el.innerHTML.replace(/ open>/g, ' open="">');
+  const n = H4.scrollCalls.length;
+  await H4.refreshPermissions();
+  assert.equal(H4.scrollCalls.length, n);
+});
+
+test("XERK-1563: the card's fetch is scoped by the header's org filter", async () => {
+  const H3 = loadHelpers(() => permView);
+  orgKeys = ["acme.atlassian.net", "rival.atlassian.net"];
+  try {
+    await H3.refreshPermissions();
+  } finally { orgKeys = []; }
+  const url = H3.fetches.filter((u) => u.startsWith("/api/permissions")).pop();
+  assert.equal(url, "/api/permissions?days=7&org=acme.atlassian.net%2Crival.atlassian.net");
+  assert.equal(H3.getPermView(), permView);
+  assert.match(H3.els.permissions.innerHTML, /Bash\(git status:\*\)/);
+});
+
+test("XERK-1563: the card's first fetch waits for the org scope, then follows it", async () => {
+  // org.js's real order: getKeys() is [] until update() has seen the sites
+  // /api/agents names, so a fetch at script start would go out unscoped.
+  let site = null;
+  orgHooks = {
+    getKeys: () => (site ? [site] : []),
+    update: (d) => { if (!site) site = d && d.site; },   // the sites are now known
+  };
+  try {
+    const H5 = loadHelpers((u) => (u.startsWith("/api/agents")
+      ? { now: Date.now(), agents: [], retiredUsage: [], site: "acme.atlassian.net" }
+      : permView));
+    const card = () => H5.fetches.filter((u) => u.startsWith("/api/permissions"));
+    for (let i = 0; i < 10; i++) await new Promise((r) => setImmediate(r));
+    assert.deepEqual(card(), ["/api/permissions?days=7&org=acme.atlassian.net"],
+      "never an unscoped fetch before the org keys are known");
+    // A render whose keys did not move does not refetch…
+    H5.render(H5.getCache());
+    assert.equal(card().length, 1);
+    // …one whose keys moved does, scoped to the new org.
+    site = "rival.atlassian.net";
+    H5.render(H5.getCache());
+    assert.equal(card().pop(), "/api/permissions?days=7&org=rival.atlassian.net");
+  } finally { orgHooks = null; }
+});
+
+test("XERK-1563: an ask-in-chat group shows its question as prose and no 0 / 0", () => {
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "ask-in-chat", prompt: "Should I rebuild the Dockerfile?", count: 2, allowed: null,
+      denied: null, medianWaitMs: 60000, suggestedRule: "model behaviour: see CLAUDE.md step 0" },
+  ] }, PERM_NOW);
+  // The question is the subject, as prose — never mono, never broken mid-word.
+  assert.match(html, /<div class="perm-subj">Should I rebuild the Dockerfile\?<\/div>/);
+  assert.match(html, /data-label="Allowed \/ denied"><span class="perm-na"[^>]*>—<\/span>/);
+  assert.doesNotMatch(html, /0 \/ 0/);
+  // A model-behaviour pointer is not a setting: shown as text, nothing to copy.
+  assert.match(html, /<td class="perm-rule"><span class="none">Instructions, not a setting — see the note below<\/span><\/td>/);
+  assert.doesNotMatch(html, /data-perm-rule/);
+  // The note names the file and the step, once — never the hub's bare pointer.
+  assert.match(html, /<div class="note perm-foot"><b>Asked in chat<\/b>[^<]*step 0 of “Delivering work” in the global <code>~\/\.claude\/CLAUDE\.md<\/code>/);
+  assert.doesNotMatch(html, /see CLAUDE\.md step 0/);
+  // An answered ask has no allow/deny: its "—" cell is the one a phone hides.
+  assert.match(html, /<td class="perm-stat perm-stat-na" data-label="Allowed \/ denied">/);
+  // An older hub that still sends 0 / 0 for an ask reads the same.
+  assert.doesNotMatch(H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "ask-in-chat", prompt: "ok?", count: 1, allowed: 0, denied: 0 }] }, PERM_NOW), /0 \/ 0/);
+});
+
+test("XERK-1563: four asks share ONE explanatory note; a card with no ask has none", () => {
+  const ask = (q) => ({ kind: "ask-in-chat", prompt: q, count: 1, allowed: null, denied: null,
+    suggestedRule: "model behaviour: see CLAUDE.md step 0" });
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    ask("May I push?"), ask("Shall I open the PR?"), ask("OK to delete it?"), ask("Proceed?")] }, PERM_NOW);
+  assert.equal([...html.matchAll(/perm-foot/g)].length, 1);
+  assert.equal([...html.matchAll(/Instructions, not a setting/g)].length, 4);
+  // The note sits between the table and the recent list.
+  assert.match(html, /<\/table><\/div><div class="note perm-foot">/);
+  const plain = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "dialog", tool: "Bash", head: "ls", count: 1, suggestedRule: "Bash(ls:*)" }] }, PERM_NOW);
+  assert.doesNotMatch(plain, /perm-foot/);
+});
+
+test("XERK-1563: an ask's markdown renders — code spans as code, bold markers dropped", () => {
+  const q = "Should I delete `legacy/` and **all** of `__init__.py`? Or `<b>`";
+  const html = H.permissionsCardHtml({ days: 7, top: [
+    { kind: "ask-in-chat", prompt: q, count: 1, allowed: null, denied: null }],
+  recent: [{ host: "h1", kind: "ask-in-chat", prompt: q, openedAt: PERM_NOW - 60000 }] }, PERM_NOW);
+  const want = "Should I delete <code>legacy/</code> and all of <code>__init__.py</code>? Or <code>&lt;b&gt;</code>";
+  assert.ok(html.includes(`<div class="perm-subj">${want}</div>`), "table subject");
+  assert.ok(html.includes(`<span class="perm-subj">${want}</span>`), "recent subject");
+  assert.doesNotMatch(html, /`|\*\*|<b>/);
+  // An unpaired marker (a question cut at its cap) stays as typed; a COMMAND
+  // subject is never read as markdown.
+  const cut = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "ask-in-chat", prompt: "Delete `legacy/ and", count: 1 },
+    { kind: "dialog", tool: "Bash", head: "echo", count: 1 }] }, PERM_NOW);
+  assert.match(cut, /<div class="perm-subj">Delete `legacy\/ and<\/div>/);
+});
+
+test("XERK-1563: a rule and its Copy share one line, however long the rule", () => {
+  const rule = "sandbox.network.allowedDomains: registry.npmjs.org";
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "registry.npmjs.org", count: 2,
+      allowed: 2, denied: 0, suggestedRule: rule }] }, PERM_NOW);
+  assert.ok(html.includes(`<td class="perm-rule"><span class="perm-rule-line"><code>${rule}</code><button type="button" class="perm-copy" data-perm-rule="${rule}"`));
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "usage.html"), "utf8");
+  // The line never wraps Copy under the rule: the rule shrinks, Copy does not.
+  assert.match(src, /\.perm-rule-line \{ display: flex; align-items: center; gap: 6px; \}/);
+  assert.match(src, /\.perm-rule-line code \{ flex: 0 1 auto; min-width: 0; \}/);
+  assert.match(src, /\.perm-rule-line \.perm-copy \{ flex: none;/);
+  assert.doesNotMatch(src, /td\.perm-rule:has\(\.perm-copy\)/);
+  // A narrow box wraps at `(` or a value-starting `:`, not mid-name; Copy
+  // still copies the raw rule.
+  const wf = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "dialog", tool: "WebFetch", head: "docs.example.com", count: 1,
+      suggestedRule: "WebFetch(domain:docs.example.com)" }] }, PERM_NOW);
+  assert.ok(wf.includes('<code>WebFetch(<wbr>domain:<wbr>docs.example.com)</code>'));
+  assert.ok(wf.includes('data-perm-rule="WebFetch(domain:docs.example.com)"'));
+});
+
+test("XERK-1563: a classifier block's only why is its deny reason, not the allowlist's", () => {
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "classifier-denied", tool: "Bash", head: "kubectl delete", count: 1, allowed: 0, denied: 1,
+      suggestedRule: null, noRuleReason: "not on the known read-only list, so its arguments may run code",
+      denyReason: "Deleting cluster resources is out of scope" }] }, PERM_NOW);
+  assert.match(html, /<td class="perm-rule"><span class="none">no safe rule — review it<\/span><div class="perm-why">Blocked: Deleting cluster resources is out of scope<\/div><\/td>/);
+  assert.doesNotMatch(html, /read-only list/);
+  // With no deny reason recorded, the allowlist reason is the only why left.
+  const bare = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "classifier-denied", tool: "Bash", head: "kubectl delete", count: 1, suggestedRule: null,
+      noRuleReason: "not on the known read-only list, so its arguments may run code" }] }, PERM_NOW);
+  assert.match(bare, /<div class="perm-why">not on the known read-only list, so its arguments may run code<\/div><\/td>/);
+});
+
+test("XERK-1563: a Bash head with no safe rule says review it, and Copy copies nothing", async () => {
+  const noRule = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "pkexec", count: 4,
+    allowed: 4, denied: 0, suggestedRule: null,
+    noRuleReason: "runs whatever follows it" };
+  const safe = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "git status",
+    count: 1, allowed: 1, denied: 0, suggestedRule: "Bash(git status:*)" };
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [noRule] }, PERM_NOW);
+  assert.match(html, /<td class="perm-rule"><span class="none">no safe rule — review it<\/span><div class="perm-why">runs whatever follows it<\/div><\/td>/);
+  // Nothing to copy: no button, no rule attribute, no Bash(...) anywhere.
+  assert.doesNotMatch(html, /data-perm-rule|perm-copy|Bash\(/);
+  // The click handler copies only a [data-perm-rule] button: a click anywhere in
+  // the no-rule row writes nothing; a rule's own button writes exactly its rule.
+  const H6 = loadHelpers(() => ({ days: 7, recent: [], top: [noRule, safe] }));
+  await H6.refreshPermissions();
+  const writes = [];
+  H6.navigator.clipboard = { writeText: (t) => { writes.push(t); return Promise.resolve(); } };
+  const click = (target) => H6.els.permissions.listeners.click.forEach((fn) => fn({ target }));
+  click({ closest: () => null });                    // the no-rule cell: no button inside it
+  assert.deepEqual(writes, []);
+  const btn = { textContent: "Copy", getAttribute: (k) => (k === "data-perm-rule" ? "Bash(git status:*)" : null) };
+  click({ closest: (sel) => (sel === "[data-perm-rule]" ? btn : null) });
+  assert.deepEqual(writes, ["Bash(git status:*)"]);
+  // The rendered card holds exactly one copyable rule — the safe group's.
+  const rules = [...H6.els.permissions.innerHTML.matchAll(/data-perm-rule="([^"]*)"/g)].map((m) => m[1]);
+  assert.deepEqual(rules, ["Bash(git status:*)"]);
+});
+
+test("XERK-1563: a classifier block with no rule says why, with nothing to copy", () => {
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "classifier-denied", tool: "Write", head: "/home/u/.ssh/config", count: 1, allowed: 0,
+      denied: 1, suggestedRule: null, denyReason: "Writing to SSH configuration <is> out of scope" },
+  ] }, PERM_NOW);
+  assert.match(html, /no rule retires this<\/span><div class="perm-why">Blocked: Writing to SSH configuration &lt;is&gt; out of scope<\/div>/);
+  assert.doesNotMatch(html, /data-perm-rule|autoMode/);
+  // A command subject is the mono, break-anywhere kind; its tool rides under it.
+  assert.match(html, /<div class="perm-subj cmd">\/home\/u\/\.ssh\/config<\/div><div class="perm-tool">Write<\/div>/);
+});
+
+test("XERK-1563: on a phone the card reflows to blocks, not a sideways-scrolling table", () => {
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "usage.html"), "utf8");
+  const phone = src.slice(src.indexOf("@media (max-width: 600px)", src.indexOf(".perm-empty")));
+  const block = phone.slice(0, phone.indexOf("\n  }\n"));
+  assert.match(block, /\.perm-card \.table-scroll \{ overflow-x: visible; \}/);
+  assert.match(block, /\.perm-card thead \{ display: none; \}/);
+  assert.match(block, /\.perm-card tbody tr \{[^}]*display: flex; flex-wrap: wrap;/);
+  // The sticky Prompt column is what hid the rules: it must not stick here.
+  assert.match(block, /\.perm-card tbody td \{[^}]*position: static;/);
+  assert.match(block, /td\.perm-rule \{ flex: 1 1 100%;/);
+  assert.match(block, /td\.perm-stat::before \{ content: attr\(data-label\)/);
+  // Recent prompts: host · wait · age always on a second line of their own.
+  assert.match(block, /\.perm-recent \.perm-meta \{ flex: 1 1 100%; \}/);
+  // Prose subjects wrap at word boundaries; only commands may break mid-token.
+  assert.doesNotMatch(src, /\.perm-subj \{[^}]*break-all/);
+  assert.match(src, /\.perm-subj\.cmd \{[^}]*overflow-wrap: anywhere;/);
 });

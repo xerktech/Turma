@@ -117,7 +117,8 @@ def _close_ticket(sid: str, args) -> str:
         raise Refused(f"note is {len(note)} chars; the limit is {CLOSE_NOTE_MAX}")
     write_request(sid, "close-ticket", {"resolution": args.resolution, "note": note,
                                         "requestedAt": int(time.time() * 1000)})
-    return f"close-ticket requested ({args.resolution}); the manager will act on it"
+    return (f"close-ticket requested ({args.resolution}); the manager will act on it "
+            "and message you if it cannot close the ticket")
 
 
 def _parser() -> argparse.ArgumentParser:

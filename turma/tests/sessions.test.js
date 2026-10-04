@@ -206,7 +206,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   // select-on-arrival path reads it, so a bare render() isn't enough.
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer, startSession,"
-      + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
+      + " toggleCardMenu, cardKill, pausedKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " showRestore, hideRestore, toggleRestoreMenu, restoreTo, eligibleRestoreTargets,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
@@ -379,7 +379,7 @@ test("background shell kinds: waiting holds, stalled surfaces, work stays workin
   render({ now, agents: [h] });
   const a = els.active.innerHTML, r = els.review.innerHTML;
   // Holding: Active, labelled with the ETA or what it waits on, styled holding.
-  assert.ok(a.includes("Sleeping Task") && a.includes("waiting · 12m left"), a);
+  assert.ok(a.includes("Sleeping Task") && a.includes("waiting · Sleep\u00a0·\u00a012m left"), a);
   assert.ok(a.includes("CI Watcher") && a.includes("waiting · Watch CI"));
   assert.ok(/state holding/.test(a));
   assert.ok(!r.includes("Sleeping Task") && !r.includes("CI Watcher"));
@@ -387,6 +387,193 @@ test("background shell kinds: waiting holds, stalled surfaces, work stays workin
   assert.ok(r.includes("Dead Shell") && r.includes("stalled · Watch CI"), r);
   // A work shell beside a wait: working, named by its WORK rows only.
   assert.ok(a.includes("Test Runner") && a.includes("1 background shell"));
+});
+
+// XERK-1571. The attention layer on the Sessions page: a sleeping session (a
+// session-CLI wake still ahead) holds in Active, never Ready for review; Ready
+// for review is ordered by the hub's attention `since`, oldest first, and each
+// card carries the hub's `why` and how long it has waited.
+test("attention: sleeping holds, review sorts oldest-waiting first with the why line", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const wake = new Date(t + 30 * 60 * 1000);
+  const hhmm = String(wake.getHours()).padStart(2, "0") + ":" + String(wake.getMinutes()).padStart(2, "0")
+    + (wake.getDate() !== new Date(t).getDate() ? "\u00a0+1d" : "");
+  const att = (state, agoMin, why) => ({ attention: { state, since: t - agoMin * 60 * 1000, ...(why ? { why } : {}) } });
+  const { now, host: h } = host([
+    // createdAt order would put Newer first; `since` puts Older first.
+    finished("51111", "Newer Wait", { createdAt: "2026-10-03T10:00:00Z", ...att("needs-you:review", 5, "finished · nothing to merge") }),
+    finished("52222", "Older Wait", { createdAt: "2026-10-03T09:00:00Z", prs: [pr("OPEN")],
+      ...att("needs-you:review", 40, "PR open · CI passing") }),
+    running("53333", "Asleep", { paneBusy: false, transcriptAgeSec: 30, lastRole: "assistant", lastHasToolUse: false,
+      wakeAt: t + 30 * 60 * 1000, wakeReason: "check CI" }),
+    running("54444", "CI Watcher", { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false,
+      agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML, a = els.active.innerHTML;
+  assert.ok(r.indexOf("Older Wait") >= 0 && r.indexOf("Older Wait") < r.indexOf("Newer Wait"), "oldest-waiting first");
+  assert.ok(r.includes('<div class="why">PR open · CI passing\u00a0·\u00a0for\u00a040m</div>'), r);
+  assert.ok(r.includes('<div class="why">finished · nothing to merge\u00a0·\u00a0for\u00a05m</div>'));
+  // A stalled card names its wait in its label, so its why line is the age only —
+  // "stalled 2m", never a second "waiting" — and it takes the danger tone.
+  const { render: render2, els: els2 } = loadPage();
+  const { now: n2, host: h2 } = host([
+    running("55555", "Dead Shell", { paneBusy: false, transcriptAgeSec: 50 * 60, lastRole: "assistant", lastHasToolUse: false,
+      agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] , }),
+  ].map((x) => ({ ...x, attention: { state: "needs-you:stalled", since: t - 2 * 60 * 1000, why: "Watch CI" } })));
+  render2({ now: n2, agents: [h2] });
+  assert.ok(els2.review.innerHTML.includes('stalled · Watch CI'));
+  assert.ok(els2.review.innerHTML.includes('<div class="why">stalled\u00a02m</div>'), els2.review.innerHTML);
+  assert.ok(els2.review.innerHTML.includes('<span class="dot stalled"></span>'), els2.review.innerHTML);
+  assert.ok(els2.review.innerHTML.includes('<div class="state stalled">stalled · Watch CI'), els2.review.innerHTML);
+  // Sleeping: Active, holding, "until HH:MM" — not Ready for review.
+  assert.ok(!r.includes("Asleep"));
+  assert.ok(a.includes("Asleep") && a.includes("💤 sleeping until " + hhmm), a);
+  // …and what it will check then, when the session gave a reason.
+  assert.ok(a.includes("💤 sleeping until " + hhmm + " · check CI"), a);
+  // Waiting cards lead with the hourglass.
+  assert.ok(a.includes("⏳ waiting · Watch CI"));
+});
+
+// XERK-1571 operator review: the needs-you cards live HERE, in Ready for review
+// (the dashboard has no list of its own). Where the hub serves attention it
+// decides the section: every needs-you:* session is listed — a stall whose own
+// turn never finished included — and a session it says is idle is not, so the
+// section is the set the dashboard's "Ready for review" tile counts. From an
+// older hub (no attention) the page's own readyForReview decides, as before.
+test("attention: Ready for review lists every hub needs-you session, oldest first", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const att = (state, agoMin, why) => ({ attention: { state, since: t - agoMin * 60 * 1000, ...(why ? { why } : {}) } });
+  const quiet = { paneBusy: false, transcriptAgeSec: 50 * 60, lastRole: "user", lastHasToolUse: false };
+  const { now, host: h } = host([
+    { ...running("71111", "Stalled Quiet", { ...quiet,
+        agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+      ...att("needs-you:stalled", 31, "Watch CI") },
+    { ...running("72222", "Asking", { paneBusy: false, transcriptAgeSec: 30, question: "Ship it?" }),
+      ...att("needs-you:question", 10, "Ship it?") },
+    { ...finished("73333", "Hub Says Idle"), ...att("idle", 2) },
+    finished("74444", "Older Hub"),
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML;
+  assert.ok(r.includes('Ready for review <span class="count">3</span>'), r);
+  const order = ["Stalled Quiet", "Asking", "Older Hub"].map((n) => r.indexOf(n));
+  assert.ok(order.every((i) => i >= 0) && order[0] < order[1] && order[1] < order[2], "oldest wait first, since-less last");
+  assert.ok(!r.includes("Hub Says Idle"));
+  assert.ok(els.idle.innerHTML.includes("Hub Says Idle"));
+  assert.ok(r.includes('<div class="why">stalled 31m</div>'), r);
+  assert.ok(r.includes('<div class="why">for 10m</div>'), r);
+  // The hub says it stalled where this page can't judge silence (its host just
+  // went quiet): the hub's read, in the danger tone, never "finished".
+  const { render: render2, els: els2 } = loadPage();
+  const { now: n2, host: h2 } = host([
+    { ...running("75555", "Quiet Host Stall", { ...quiet,
+        agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }),
+      ...att("needs-you:stalled", 31, "Watch CI") },
+  ]);
+  render2({ now: n2, agents: [{ ...h2, online: false, lastSeen: n2 - 10 * 60 * 1000 }] });
+  const r2 = els2.review.innerHTML;
+  assert.ok(r2.includes('<div class="state stalled">stalled · Watch CI'), r2);
+  assert.ok(r2.includes('<span class="dot stalled"></span>'), r2);
+  // The reverse: a dead host's LAST non-needs-you state ("working", "waiting")
+  // is frozen, never re-judged, so it must not keep that host's stranded
+  // finished work out of review — the page's own rule decides it (XERK-235).
+  const { render: render3, els: els3 } = loadPage();
+  const { now: n3, host: h3 } = host([
+    { ...running("76666", "Died Mid Turn", { paneBusy: true, transcriptAgeSec: 700,
+        lastRole: "assistant", lastHasToolUse: false }), ...att("working", 12) },
+    { ...finished("77777", "Died Waiting"), ...att("waiting", 12) },
+  ]);
+  render3({ now: n3, agents: [{ ...h3, online: false, lastSeen: n3 - 10 * 60 * 1000 }] });
+  const r3 = els3.review.innerHTML;
+  assert.ok(r3.includes("Died Mid Turn") && r3.includes("Died Waiting"), r3);
+  // Online, the hub's "working" still decides: the finished turn is not listed.
+  const { render: render4, els: els4 } = loadPage();
+  const { now: n4, host: h4 } = host([{ ...finished("78888", "Hub Says Working"), ...att("working", 1) }]);
+  render4({ now: n4, agents: [h4] });
+  assert.ok(!els4.review.innerHTML.includes("Hub Says Working"), els4.review.innerHTML);
+});
+
+// XERK-1571 screenshot pass. A permission card says it waits for PERMISSION and
+// names the pending command (the hub's why), never the dialog's generic
+// question; a stalled card carries ONE age (the stall's), not the wait's start
+// age beside it; a timed wait keeps its subject.
+test("attention: permission names its command, a stall shows one age, a timed wait keeps its subject", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const { now, host: h } = host([
+    { ...running("61111", "Restarter", { paneBusy: false, transcriptAgeSec: 30,
+        panePrompt: { prompt: "Do you want to proceed?" } }),
+      attention: { state: "needs-you:permission", since: t - 4 * 60 * 1000,
+        why: "Bash: kubectl -n turma rollout restart deploy/turma" } },
+    { ...running("62222", "Stuck Deploy", { paneBusy: false, transcriptAgeSec: 50 * 60, lastRole: "assistant", lastHasToolUse: false,
+        agents: [{ type: "shell", label: "Wait for staging deploy", kind: "wait-external", startedAt: t - 38 * 60 * 1000 }] }),
+      attention: { state: "needs-you:stalled", since: t - 31 * 60 * 1000, why: "Wait for staging deploy" } },
+    running("63333", "Rollout", { paneBusy: false, transcriptAgeSec: 5,
+      agents: [{ type: "shell", label: "Wait for the rollout", kind: "wait-timed", eta: t + 11 * 60 * 1000 + 30000 }] }),
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML, a = els.active.innerHTML;
+  assert.ok(r.includes("waiting for your permission"), r);
+  assert.ok(r.includes('<div class="question ask">Bash: kubectl -n turma rollout restart deploy/turma</div>'), r);
+  assert.ok(!r.includes("Do you want to proceed?"), "the generic dialog question is not quoted");
+  assert.ok(r.includes('<div class="why">for 4m</div>'), r);
+  assert.ok(r.includes('<div class="state stalled">stalled · Wait for staging deploy</div>'), r);
+  assert.ok(r.includes('<div class="why">stalled 31m</div>'));
+  assert.ok(!r.includes("38m"), "the wait's start age is not shown beside the stall age");
+  assert.ok(a.includes("⏳ waiting · Wait for the rollout\u00a0·\u00a011m left"), a);
+});
+
+// XERK-1572. A needs-you card carries the wait classifier's verdict under its
+// why line — what kind of wait and why, then the answer it suggests — escaped;
+// and a LOOPING session (busy, but the hub says it is stuck) sits in Ready for
+// review as stalled in the danger tone, never as "working".
+test("attention: the classifier's why and suggested answer, and a loop reads stalled", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const { now, host: h } = host([
+    finished("81111", "Schema Pick", { attention: { state: "needs-you:review", since: t - 5 * 60 * 1000,
+      why: "finished · nothing to merge",
+      hint: { label: "design-decision", why: "Pick <v2> or v3.", suggestedAnswer: "Go with v3." } } }),
+    { ...running("82222", "Retry Loop", { paneBusy: true, transcriptAgeSec: 2,
+        loop: { repeats: 6, tool: "Bash", since: t - 60000 } }),
+      attention: { state: "needs-you:stalled", since: t - 2 * 60 * 1000, why: "repeating Bash ×6",
+        hint: { label: "looping", why: "Retries npm ci against a dead registry." } } },
+    finished("83333", "Plain Review", { attention: { state: "needs-you:review", since: t - 60000,
+      why: "finished · nothing to merge" } }),
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML;
+  assert.ok(r.includes('<div class="att-hint"><span class="hint-kind">decision</span>\u00a0·\u00a0Pick &lt;v2&gt; or v3.</div>'), r);
+  assert.ok(r.includes('<div class="att-hint answer">Suggested: Go with v3.</div>'), r);
+  assert.ok(r.includes('<div class="state stalled">stalled · repeating Bash ×6'), r);
+  assert.ok(r.includes('<span class="hint-kind">looping</span>\u00a0·\u00a0Retries npm ci against a dead registry.'), r);
+  assert.ok(!els.active.innerHTML.includes("Retry Loop"), "a loop is not Active work");
+  // Only the two cards with a verdict carry hint lines (Plain Review has none).
+  assert.equal(r.split('class="att-hint').length - 1, 3, r);
+});
+
+// XERK-1572 screenshot pass: a review the classifier says needs a human TEST
+// names that in its headline, the dashboard State row's word, instead of reading
+// as a plain "PR awaiting review" whose only difference was its third line.
+test("attention: a needs-you:test card's headline says it awaits your test", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const pr = [{ url: "https://github.com/o/r/pull/7", state: "OPEN" }];
+  const { now, host: h } = host([
+    { ...finished("84444", "Login Page", { attention: { state: "needs-you:test", since: t - 40 * 60 * 1000,
+      why: "PR open · CI passing",
+      hint: { label: "needs-human-test", why: "Wants the login page checked." } } }), prs: pr },
+    { ...finished("85555", "Plain PR", { attention: { state: "needs-you:review", since: t - 60000,
+      why: "PR open · CI passing" } }), prs: pr },
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML;
+  assert.ok(r.includes('<div class="state review">awaiting your test'), r);
+  assert.ok(r.includes('<div class="state review">PR awaiting review'), r);
+  assert.equal(r.split("PR awaiting review").length - 1, 1, "only the plain review reads PR awaiting review");
 });
 
 // XERK-735. The card's second line reads repo · related ticket · pc name ·
@@ -2066,6 +2253,90 @@ test("Ended sessions merges killed + stopped, newest-ended first", () => {
   assert.deepEqual(order, [...order].sort((a, b) => a - b), "sorted newest-ended first");
 });
 
+test("XERK-1575: a sleeper paused for its slot reads asleep until its wake, never killed", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  const wakeAt = now + 90 * 60 * 1000;
+  const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  h.closedSessions = [
+    closed("33333", "Napping", "2026-07-15T09:00:00Z", { paused: { wakeAt, wakeReason: "check CI", at: now } }),
+    closed("44444", "Plain Kill", "2026-07-15T08:00:00Z"),
+  ];
+  beat({ now, agents: [h] });
+  // Its own open Paused section, never folded into the collapsed Ended history.
+  const nap = els.paused.innerHTML;
+  assert.match(nap, /<h2>Paused <span class="count">1<\/span><\/h2>/);
+  assert.ok(!/<details/.test(nap), "the Paused section is never collapsed");
+  assert.ok(nap.includes("Napping"), nap);
+  assert.ok(nap.includes(`<div class="state holding">💤 paused until ${hhmm} · check CI</div>`), nap);
+  assert.ok(!nap.includes("killed"), nap);
+  assert.ok(!nap.includes("Plain Kill"), nap);
+  // Resumed early, so the control says so — the dashboard's paused card's words.
+  assert.match(nap, /<button class="s-resume"[^>]*>\s*Resume now\s*<\/button>/);
+  const e = els.ended.innerHTML;
+  assert.ok(!e.includes("Napping"), "a paused sleeper is not ended history");
+  assert.match(e, /Ended sessions <span class="count">1<\/span>/);
+  assert.match(e.slice(e.indexOf("Plain Kill")), /<div class="state">killed/);
+  assert.match(e, /<button class="s-resume"[^>]*>\s*Resume\s*<\/button>/, "an ordinary kill keeps plain Resume");
+
+  // Woken (no longer a paused record): the Paused section goes away.
+  h.closedSessions = [closed("44444", "Plain Kill", "2026-07-15T08:00:00Z")];
+  beat({ now, agents: [h] });
+  assert.equal(els.paused.innerHTML, "");
+});
+
+test("XERK-1575: Paused lists the soonest wake first", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [
+    closed("55555", "Late Nap", "2026-07-15T10:00:00Z", { paused: { wakeAt: now + 5 * 3600e3, at: now } }),
+    closed("66666", "Early Nap", "2026-07-15T09:00:00Z", { paused: { wakeAt: now + 3600e3, at: now } }),
+  ];
+  beat({ now, agents: [h] });
+  const p = els.paused.innerHTML;
+  assert.ok(p.indexOf("Early Nap") < p.indexOf("Late Nap"), p);
+  assert.equal(els.ended.innerHTML, "", "no other ended sessions -> no Ended section");
+});
+
+test("XERK-1575: a Paused row's Kill arms, confirms, and moves it to Ended as an ordinary kill", () => {
+  const { beat, els, posts, pausedKill } = loadPage();
+  const { now, host: h } = host([]);
+  const nap = closed("33333", "Napping", "2026-07-15T09:00:00Z",
+    { paused: { wakeAt: now + 3600e3, wakeReason: "check CI", at: now } });
+  h.closedSessions = [nap];
+  beat({ now, agents: [h] });
+  const ev = { stopPropagation() {} };
+  // Beside Resume now, never on an ordinary ended row.
+  assert.match(els.paused.innerHTML, /<button class="s-resume s-pkill"[^>]*>\s*Kill\s*<\/button>/);
+  pausedKill(ev, h.key, "33333");                     // arm
+  assert.match(els.paused.innerHTML, /<button class="s-resume s-pkill armed"[^>]*>\s*Confirm kill\s*<\/button>/);
+  assert.equal(posts.length, 0, "an armed Kill sends nothing");
+  pausedKill(ev, h.key, "33333");                     // confirm
+  assert.deepEqual(posts.map((x) => x.url), [`/api/agents/${h.key}/sessions/33333/kill`]);
+  let p = els.paused.innerHTML;
+  assert.match(p, /<button class="s-resume s-pkill"[^>]*disabled[^>]*>\s*<span class="spin"><\/span>/);
+  assert.match(p, /<button class="s-resume" disabled/, "Resume now is off while the kill lands");
+  // Still reported paused: the spinner holds across a beat.
+  beat({ now, agents: [h] });
+  assert.match(els.paused.innerHTML, /s-pkill"[^>]*disabled/);
+  // Reported as an ordinary kill: Paused empties and it reads killed in Ended.
+  h.closedSessions = [{ ...nap, paused: null }];
+  beat({ now, agents: [h] });
+  assert.equal(els.paused.innerHTML, "");
+  const e = els.ended.innerHTML;
+  assert.match(e.slice(e.indexOf("Napping")), /<div class="state">killed/);
+  assert.ok(!e.includes("s-pkill"), "an ordinary ended row has no Kill");
+});
+
+// XERK-1575: a paused row stacks Resume now over Kill in its right gutter, so its
+// state row must keep that gutter — the ended row's reclaim (margin-right -68px)
+// ran the wake text under Kill and clipped it (screenshot review, 390 wide).
+test("a paused row's state line keeps clear of its stacked Kill button", () => {
+  assert.match(html, /\.s-card-wrap\.ended-wrap \.state-row \{ margin-right: -68px; \}/);
+  assert.match(html, /\.s-card-wrap\.ended-wrap > \.s-card\.paused \.state-row \{ margin-right: 0; \}/);
+});
+
 test("Ended sessions is collapsed by default and hidden when there are none", () => {
   const { beat, els } = loadPage();
   const { now, host: h } = host([working("11111", "Live One")]);
@@ -2428,6 +2699,22 @@ test("opening an ended session shows PRs + Resume and never a terminal or compos
   // through to GitHub, which is often the reason to open an ended session at all.
   assert.match(els.trPrs.innerHTML, /<a href="https:\/\/github.com\/o\/r\/pull\/7"/);
   assert.match(els.trPrs.innerHTML, /#7/);
+});
+
+test("XERK-1575: opening a paused sleeper offers Resume now; an ordinary kill, Resume", () => {
+  const { beat, openEndedSession, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [
+    closed("33333", "Napping", "2026-07-15T09:00:00Z",
+      { transcriptId: "t-nap", paused: { wakeAt: now + 3600e3, at: now } }),
+    closed("44444", "Plain Kill", "2026-07-15T08:00:00Z", { transcriptId: "t-kill" }),
+  ];
+  beat({ now, agents: [h] });
+  openEndedSession("33333");
+  assert.equal(els.trResume.hidden, false);
+  assert.equal(els.trResume.textContent, "Resume now");
+  openEndedSession("44444");
+  assert.equal(els.trResume.textContent, "Resume", "the label never sticks to the next view");
 });
 
 // XERK-356. A refused archive push never arrives, so the reassuring "it syncs

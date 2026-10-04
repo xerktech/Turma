@@ -25,8 +25,12 @@ class FleetTest {
     ) = AgentInfo(key = key, device = device, online = online, sessions = sessions, usage = usage,
         capacity = capacity)
 
-    private fun session(status: String, question: String = "", usage: UsageInfo? = null) =
-        SessionInfo(id = status, status = status, usage = usage, session = LiveSignals(question = question))
+    private fun session(
+        status: String,
+        question: String = "",
+        usage: UsageInfo? = null,
+        attention: com.xerktech.turma.model.Attention? = null,
+    ) = SessionInfo(id = status, status = status, usage = usage, session = LiveSignals(question = question), attention = attention)
 
     @Test fun `fleet tokens sum the persistent usage block per window`() {
         val a = agent("h1", usage = UsageInfo(today = bucket(10), week = bucket(20), totals = bucket(100)))
@@ -116,10 +120,14 @@ class FleetTest {
     }
 
     @Test fun `summary counts hosts, running, and waiting-on-you`() {
+        // XERK-1571: the tile counts the SAME set the Sessions screen's Ready for
+        // review lists — every running session the hub serves a needs-you:*
+        // attention for, not questions alone.
+        val needs = { state: String -> com.xerktech.turma.model.Attention(state = state, since = 1L) }
         val a = agent("h1", online = true, sessions = listOf(
-            session("running", question = "Which option?"),
+            session("running", question = "Which option?", attention = needs("needs-you:question")),
             session("running"),
-            session("stopped", question = "ignored — not running"),
+            session("stopped", question = "ignored — not running", attention = needs("needs-you:question")),
         ))
         val b = agent("h2", online = false)
         val s = fleetSummary(listOf(a, b))
@@ -127,7 +135,13 @@ class FleetTest {
         assertEquals(2, s.hostsTotal)
         assertEquals(2, s.running)
         assertEquals(3, s.totalSessions)
-        assertEquals(1, s.waiting) // only the running one with a question
+        assertEquals(1, s.waiting) // only the running one the hub says needs you
+        val b2 = agent("h3", online = true, sessions = listOf(
+            session("running", attention = needs("needs-you:review")),
+            session("running", attention = needs("needs-you:stalled")),
+            session("running", attention = needs("working")),
+        ))
+        assertEquals(3, fleetSummary(listOf(a, b2)).waiting)
     }
 
     @Test fun `max sessions sums the per-agent cap across the org's hosts`() {
@@ -151,5 +165,33 @@ class FleetTest {
         val a = agent("h1", capacity = Capacity(maxSessions = 4))
         val b = agent("old") // pre-capacity agent, no ceiling reported
         assertEquals(4, fleetSummary(listOf(a, b)).maxSessions)
+    }
+
+    // XERK-1575: a sleeper the hub paused for its slot is counted as paused beside
+    // the running count (index.html `pausedCount`), and listed soonest wake first.
+    @Test fun `paused sleepers are counted and ordered by wake`() {
+        val late = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "late", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 2_000L))
+        val early = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "early", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 1_000L))
+        val kill = com.xerktech.turma.model.ClosedSessionInfo(id = "kill")
+        val a = agent("h1", sessions = listOf(session("running"))).copy(closedSessions = listOf(late, kill, early))
+        assertEquals(listOf("early", "late"), pausedSleepers(a).map { it.id })
+        val s = fleetSummary(listOf(a, agent("h2")))
+        assertEquals(2, s.paused)
+        assertEquals(1, s.running)
+        assertEquals(0, fleetSummary(listOf(agent("h2"))).paused)
+    }
+
+    @Test
+    fun theResumePickerLeavesOutAPausedSleeper() {
+        val r = { tid: String -> com.xerktech.turma.model.ResumableInfo(transcriptId = tid) }
+        val paused = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "d79c9", transcriptId = "t-paused", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 1_000L))
+        val untracked = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "old", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 2_000L))
+        val all = listOf(r("t-old"), r("t-paused"))
+        assertEquals(listOf("t-old"), resumablePicks(all, listOf(paused, untracked)).map { it.transcriptId })
+        assertEquals(all, resumablePicks(all, emptyList()))
     }
 }

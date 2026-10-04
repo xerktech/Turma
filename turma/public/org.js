@@ -327,7 +327,25 @@
     const html = sites.length ? controlHtml(sites, keys, colorMap, autoMap, mergeMap, open, B.ageStr, colorPins, colorFor) : "";
     if (html === painted) return;
     painted = html;
-    slot.innerHTML = html;
+    // A long menu scrolls (XERK-1285), and a count or "synced Nm ago" change
+    // rebuilds it: keep the menu's scroll and the focused control across the
+    // swap, or a keyboard user deep in the list is thrown back to the top with
+    // focus on <body>, where their next key scrolls the page instead.
+    const focusSel = focusedSelector(slot);
+    const nav = typeof window !== "undefined" && window.TurmaNav;
+    if (nav && nav.preserveScroll) nav.preserveScroll(slot, () => { slot.innerHTML = html; });
+    else slot.innerHTML = html;
+    const again = focusSel && slot.querySelector(focusSel);
+    if (again && again.focus) again.focus({ preventScroll: true });
+  }
+
+  // The focused control inside `root`, as a selector over its data-org-*
+  // attributes — the stable identity a repaint keeps (row, chip, swatch).
+  function focusedSelector(root) {
+    const el = root.ownerDocument && root.ownerDocument.activeElement;
+    if (!el || el === root || !root.contains(el) || !el.attributes || typeof CSS === "undefined") return null;
+    const attrs = Array.from(el.attributes).filter(a => a.name.startsWith("data-org-"));
+    return attrs.length ? attrs.map(a => `[${a.name}="${CSS.escape(a.value)}"]`).join("") : null;
   }
 
   // Flip an org's hub-side auto-start opt-in (XERK-41). Painted optimistically —

@@ -237,6 +237,10 @@
     padding: 12px; display: flex; flex-direction: column; gap: 8px;
   }
   .sess.stopped, .sess.error { opacity: 0.9; }
+  /* A sleeper the hub paused for its slot (XERK-1575): dashed, since it holds
+     no slot, but not dimmed like a stopped card — it comes back on its own. */
+  .sess.paused { border-style: dashed; }
+  .sess-hd .badge.paused { color: var(--ink-2); }
   /* Optimistic takedown: a confirmed kill immediately dims and pulses the card
      so the shutdown reads as deliberate rather than a card blinking out. */
   .sess.killing { border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); animation: killing-pulse 1.1s ease-in-out infinite; }
@@ -287,9 +291,20 @@
   .ctx-meter.danger .ctx-fill { background: var(--bad, #d9534f); }
   .ctx-meter.danger .ctx-cap { color: var(--bad, #d9534f); font-weight: 600; }
 
-  .sess-working { color: var(--good); }
-  .sess-wait { color: var(--warning); }
+  .sess-working { color: var(--good-text); }
+  /* Amber as TEXT: the dark amber in light mode (4.5:1+), the fill amber in dark. */
+  .sess-wait { color: var(--warning-text); }
   .sess-holding { color: var(--ink-2); font-style: italic; }
+  /* The hub's needs-you read on a card's State row (XERK-1571): review in the
+     Ready-for-review accent, stalled in the danger colour it has everywhere. */
+  .sess-review { color: var(--accent-text); }
+  .sess-stalled { color: var(--critical-text); }
+  /* The wait classifier's verdict under a needs-you State row (XERK-1572). */
+  .sess-hint { font-size: 12px; color: var(--ink); margin-top: 2px; }
+  .sess-hint.answer { color: var(--ink-2); font-style: italic; }
+  /* A State row's "· for 22m" never breaks at its dot (XERK-1571): see stateAge. */
+  .state-age { white-space: nowrap; }
+
   .sess-dying { color: var(--critical); }
 
   /* Per-session work-state line: warning when there's unpushed/uncommitted
@@ -696,6 +711,11 @@ function reconcilePending(agents) {
       if (a && (a.tokenBound === true ||
                 (p.startedAt != null && a.startedAt != null && a.startedAt !== p.startedAt)))
         pending.delete(key);
+    } else if (p.kind === "kill" && p.paused) {
+      // A paused sleeper's Kill (XERK-1575) has no live session to vanish: done
+      // once the host stops reporting it paused (an ordinary killed record).
+      const a = byHost.get(p.host);
+      if (!a || !pausedSleepers(a).some(c => c.id === p.id)) pending.delete(key);
     } else {
       const s = index.get(p.host + "::" + p.id);
       // kill now removes the record entirely (keeping only the branch), so like
@@ -1103,6 +1123,120 @@ function backgroundWorkLabel(rows) {
 function qaReviewing(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).some(a => a && QA_AGENT_TYPES.has(a.type));
 }
+// A session-CLI wake still ahead (XERK-1571) — mirror of server.js sessionSleeping.
+function sleepingUntil(s, now) {
+  return Number.isSafeInteger(s?.wakeAt) && s.wakeAt > now;
+}
+// What a blocking dialog asks permission FOR (XERK-1571): the hub's attention
+// why ("Bash: kubectl …", read off the dialog's detail), else its question.
+// Same as sessions.html.
+function permissionAsk(sess) {
+  const att = sess?.attention;
+  if (att?.state === "needs-you:permission" && typeof att.why === "string" && att.why) return att.why;
+  return sess?.session?.panePrompt?.prompt || "";
+}
+// "14:05" — the local wall-clock time a sleeping session wakes at, "14:05 +2d"
+// when that is a later day (a wake may be up to 7d out), so it never reads as today.
+function clockTime(ms, now = Date.now()) {
+  const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
+  const day = (t) => { const x = new Date(t); return new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime(); };
+  const days = Math.round((day(ms) - day(now)) / 864e5);
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + (days > 0 ? "\u00a0+" + days + "d" : "");
+}
+
+// The sessions the HUB says are waiting on the operator (XERK-1571,
+// `attention.state` needs-you:*) — the set the Sessions page's Ready for review
+// section lists, which the "Ready for review" tile counts. Read off the served
+// attention rather than re-derived: the hub stamps it on the same beat it
+// decides the alerts, so the tile and the phone agree. Absent (an older hub) =
+// not counted. `sess` is the org-scoped [{s, host}] list.
+const NEEDS_YOU_CHIP = {
+  "needs-you:question": ["question", "question"],
+  "needs-you:permission": ["permission", "permission"],
+  "needs-you:review": ["review", "review"],
+  "needs-you:test": ["review", "awaiting your test"],
+  "needs-you:stalled": ["stalled", "stalled"],
+};
+// A card's State row for a session the hub says needs the operator, or null:
+// "review · PR open · CI passing", "awaiting your test · PR open" (the headline
+// the Sessions page's card gives it too), "stalled · Watch CI". liveState falls back to
+// it where it would otherwise say "idle" — a session Ready for review lists must
+// not read idle on its own card.
+function attentionLabel(att) {
+  const chip = att && NEEDS_YOU_CHIP[att.state];
+  if (!chip) return null;
+  const [cls, word] = chip;
+  if (cls === "question") return { label: "waiting for your answer", cls: "sess-wait" };
+  if (cls === "permission") return { label: "waiting for your permission", cls: "sess-wait" };
+  return { label: [word, att.why].filter(Boolean).join(" · "),
+           cls: cls === "stalled" ? "sess-stalled" : "sess-review" };
+}
+// The wait classifier's verdict (XERK-1572): "decision · Pick schema v2 or v3"
+// plus the answer it suggests, from the hub's `attention.hint` — an unlabelled
+// row on a needs-you card, under the State and any Question / Permission row it
+// answers. Same words and order as sessions.html.
+const HINT_KIND = {
+  "rubber-stamp": "go-ahead", "design-decision": "decision", "needs-human-test": "needs a human test",
+  "blocked-on-host": "blocked on the host", "looping": "looping", "waiting-external": "waiting on something outside",
+};
+function attentionHintHtml(att) {
+  const h = att && NEEDS_YOU_CHIP[att.state] ? att.hint : null;
+  if (!h || typeof h.why !== "string" || !h.why) return "";
+  const kind = HINT_KIND[h.label] ? `<b>${esc(HINT_KIND[h.label])}</b>\u00a0·\u00a0` : "";
+  const ans = typeof h.suggestedAnswer === "string" && h.suggestedAnswer
+    ? `<div class="sess-hint answer">Suggested: ${esc(h.suggestedAnswer)}</div>` : "";
+  return `<div class="sess-hint">${kind}${esc(h.why)}</div>${ans}`;
+}
+function needsYou(sess) {
+  return sess
+    .filter(x => x.s.status === "running" && NEEDS_YOU_CHIP[x.s.attention?.state])
+    .sort((x, y) => (x.s.attention.since || 0) - (y.s.attention.since || 0));
+}
+// How long the hub says a needs-you session has waited (XERK-1571): "for 31m"
+// off the attention `since`. It is the ONE age a stalled or needs-you card
+// shows — the transcript's "last write" beside it read as a second, different
+// stall length. Glued by a no-break space, like sessions.html's why line, so a
+// narrow card never leaves "31m" alone on a line. "" when the hub serves none.
+// `state`, when given, must be the one served: a question card shows the
+// question's age, never a review's the hub has not caught up from.
+function attentionFor(att, now, state) {
+  if (!att || !NEEDS_YOU_CHIP[att.state] || !Number.isSafeInteger(att.since)) return "";
+  if (state && att.state !== state) return "";
+  return "for\u00a0" + ago(now - att.since).replace(/ ago$/, "");
+}
+// "💤 sleeping until 14:05 · check CI" — a session-CLI wake and, when the
+// session gave one, what it will check then. Same as sessions.html.
+// A State row's age after its label: " · for 22m", glued so a narrow card never
+// ends a line on a dangling "·" with the age alone on the next (XERK-1571). The
+// no-break space before the dot keeps it on the label's last word; the no-wrap
+// span keeps "· for 22m" whole. "" for no age.
+function stateAge(text) {
+  return text ? `\u00a0<span class="state-age">·\u00a0${esc(text)}</span>` : "";
+}
+function sleepLabel(s, now) {
+  const why = typeof s.wakeReason === "string" ? s.wakeReason.trim() : "";
+  return "💤 sleeping until " + clockTime(s.wakeAt, now) + (why ? " · " + why : "");
+}
+// The host's sleepers the hub paused to free a slot for queued work (XERK-1575):
+// killed records carrying a `paused` wake, which the hub resumes at that wake. They
+// are not running, but they are not gone either, so the host card shows them.
+// Sessions page `isPausedEntry`, Android `pausedSleepers`.
+function pausedSleepers(a) {
+  return (a.closedSessions || []).filter(c => c && c.paused && Number.isSafeInteger(c.paused.wakeAt))
+    .sort((x, y) => x.paused.wakeAt - y.paused.wakeAt);
+}
+// A repo's "Resume ▾" picks without its paused sleepers' transcripts (XERK-1575):
+// a paused sleeper has its own card with Resume now right below, so listing it
+// again as an ordinary ended session shows one session twice. Android `resumablePicks`.
+function resumablePicks(resumable, pausedList) {
+  const skip = new Set((pausedList || []).map(c => c.transcriptId).filter(Boolean));
+  return skip.size ? resumable.filter(t => !skip.has(t && t.transcriptId)) : resumable;
+}
+function pausedLabel(p, now) {
+  const why = typeof p.wakeReason === "string" ? p.wakeReason.trim() : "";
+  return "💤 paused until " + clockTime(p.wakeAt, now) + (why ? " · " + why : "");
+}
+
 // A background shell that is WAITING (XERK-1570) — a sleep, a CI watch, a poll
 // loop. No kind (an agent, or an older agent) is work. Same as sessions.html.
 function isWaitRow(a) {
@@ -1122,14 +1256,31 @@ function backgroundWait(rows, lastWrite, now) {
   const silent = now - lastWrite >= WAIT_STALL_MS;
   return { state: overdue || silent ? "stalled" : "waiting", eta };
 }
-// "waiting · 12m left" / "waiting · Watch CI" / "waiting on 2 background shells",
-// "stalled …" once stalled. Same as sessions.html.
+// "waiting · Sleep · 12m left" / "waiting · Watch CI" / "waiting on 2 background
+// shells", "stalled …" once stalled. Same as sessions.html.
+// When the oldest wait row started (its `startedAt`), or null.
+function waitStarted(rows, now) {
+  let started = null;
+  for (const a of (Array.isArray(rows) ? rows : []).filter(isWaitRow))
+    if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
+  return started;
+}
 function backgroundWaitLabel(rows, wait, now) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
-  const word = wait.state === "stalled" ? "stalled" : "waiting";
-  if (wait.eta != null && wait.eta > now) return word + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
-  if (waits.length === 1 && waits[0].label) return word + " · " + waits[0].label;
-  return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s");
+  const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
+  // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
+  const what = waits.length === 1 && waits[0].label ? " · " + waits[0].label : "";
+  // The age's "·" is glued by no-break spaces (XERK-1571): a line never ends on it.
+  if (wait.eta != null && wait.eta > now) return word + what + "\u00a0·\u00a0" + ago(wait.eta - now).replace(/ ago$/, "") + " left";
+  // No ETA: how long it has been waiting, off the oldest wait row's startedAt
+  // (XERK-1571) — a CI watch with no duration reads as if it just began. Not on
+  // a STALL: how long it has been stalled is the hub's attention `since`, which
+  // the card's State row shows; a second, different age here read as two stall
+  // lengths for one session.
+  const started = waitStarted(waits, now);
+  const since = started == null || wait.state === "stalled" ? "" : "\u00a0·\u00a0" + ago(now - started).replace(/ ago$/, "");
+  if (what) return word + what + since;
+  return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s") + since;
 }
 
 function liveState(sess, host, now) {
@@ -1139,15 +1290,27 @@ function liveState(sess, host, now) {
   // before Claude Code has written a transcript, so `transcriptAgeSec == null`
   // and the card read "no transcript yet": the question was invisible on the
   // Dashboard while the Sessions page showed it correctly (XERK-235).
+  // Both carry how long they have waited (XERK-1571), the hub's `since` — the
+  // age every other needs-you card's State row has, and the Sessions page's.
   if (s && s.question)
-    return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true };
+    return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true,
+             detail: attentionFor(sess.attention, now, "needs-you:question") };
   // A blocking TUI dialog (tool permission / plan approval) is the same thing
   // for the operator, and MUST be checked before the working read: while one is
   // up the pane shows no interrupt hint, so paneBusy reads false and the
   // session would otherwise be labelled plain "idle" while it waits on a human.
+  // A permission is not a question (XERK-1571): the card says it waits for
+  // permission and names what for — the hub's attention why (the pending
+  // command), not the dialog's generic "Do you want to proceed?". Same as
+  // sessions.html.
   if (s && s.panePrompt && s.panePrompt.prompt)
-    return { label: "waiting for your answer", cls: "sess-wait",
-             question: s.panePrompt.prompt, busy: true };
+    return { label: "waiting for your permission", cls: "sess-wait",
+             ask: permissionAsk(sess), busy: true,
+             detail: attentionFor(sess.attention, now, "needs-you:permission") };
+  // LOOPING (XERK-1572): busy, but the hub says it is stuck repeating one failing
+  // call — "stalled · repeating Bash ×5", never "working". Same as sessions.html.
+  if (s && s.loop && sess.attention?.state === "needs-you:stalled")
+    return { ...attentionLabel(sess.attention), detail: attentionFor(sess.attention, now), busy: true };
   if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   // Background agents, which paneBusy cannot see: a session that delegated work
@@ -1164,12 +1327,33 @@ function liveState(sess, host, now) {
     : (host.online && !agentsLive && age < 90 * 1000);
   if (working)
     return { label: "working", cls: "sess-working", detail: "last write " + ago(age), busy: true };
+  // Asleep until a session-CLI wake (XERK-1571). Same rule and wording as
+  // sessions.html (and the hub's sessionSleeping).
+  if (sleepingUntil(s, now))
+    return { label: sleepLabel(s, now), cls: "sess-holding", detail: "last write " + ago(age) };
   // Every live row is a wait: holding, or stalled past its ETA / too long silent.
   // Same rule and wording as sessions.html (and the hub's sessionWait).
   const wait = host.online ? backgroundWait(s.agents, now - age, now) : null;
+  // A wait with no ETA ahead already says how long it has waited ("· 12m"), so
+  // it shows no "last write" beside it — two ages on one card read as two clocks
+  // for one wait (XERK-1571), the same thing a stall's one age fixed.
+  if (wait && wait.state === "waiting") {
+    const ownAge = !(wait.eta != null && wait.eta > now) && waitStarted(s.agents, now) != null;
+    return { label: backgroundWaitLabel(s.agents, wait, now), cls: "sess-holding",
+             detail: ownAge ? "" : "last write " + ago(age) };
+  }
+  // A stall shows ONE age (XERK-1571): how long it has been stalled, the hub's
+  // attention `since` ("for 31m") — never the transcript's last write beside it,
+  // a different number that read as a second stall length. An older hub serves
+  // no attention, and "last write" is the only clock it has.
   if (wait)
-    return { label: backgroundWaitLabel(s.agents, wait, now),
-             cls: wait.state === "stalled" ? "" : "sess-holding", detail: "last write " + ago(age) };
+    return { label: backgroundWaitLabel(s.agents, wait, now), cls: "sess-stalled",
+             detail: sess.attention ? (sess.attention.state === "needs-you:stalled" ? attentionFor(sess.attention, now) : "")
+                                    : "last write " + ago(age) };
+  // The hub says it waits on the operator (XERK-1571): the read Ready for review
+  // lists it under, so the card never says "idle" beside it — with how long.
+  const att = attentionLabel(sess.attention);
+  if (att) return { ...att, detail: attentionFor(sess.attention, now) || "last write " + ago(age) };
   return {
     label: s.bridgeAttached ? "idle · session attached" : "idle",
     cls: "",
@@ -1231,12 +1415,11 @@ function render(data) {
   const sess = agents.flatMap(a => (a.sessions || []).map(s => ({ s, host: a })));
   const online = agents.filter(a => a.online);
   const running = sess.filter(x => x.s.status === "running");
-  // A pane prompt blocks on a human exactly as a question does — liveState
-  // above says so, and so does the Sessions page's own count. Counting only
-  // `question` made this tile disagree with the card directly beneath it
-  // (XERK-235).
-  const waiting = sess.filter(x => x.s.status === "running" && x.s.session &&
-    (x.s.session.question || (x.s.session.panePrompt && x.s.session.panePrompt.prompt)));
+  // The "Ready for review" tile counts the SAME set the Sessions page's Ready
+  // for review section lists (XERK-1571) — every needs-you:* state, off one
+  // helper. Counting questions alone made the tile say 2 above a list of 4 (and,
+  // before that, disagree with the card beneath it, XERK-235).
+  const needs = needsYou(sess);
   // Spend OUTLIVES the host that made it (XERK-338), so the token tiles count
   // `retiredUsage` — a removed, pruned or evicted host — alongside the live
   // fleet. Reading `agents` alone made the front page disagree with the Usage
@@ -1272,12 +1455,16 @@ function render(data) {
   const capHosts = agents.filter(a => a.capacity && typeof a.capacity.maxSessions === "number");
   const maxSessions = capHosts.reduce((t, a) => t + a.capacity.maxSessions, 0);
   const runningValue = capHosts.length ? `${running.length} / ${maxSessions}` : String(running.length);
+  // Paused sleepers (XERK-1575) hold no slot, so they are not in the running
+  // count — said beside it, so a session the hub paused never reads as gone.
+  const pausedCount = agents.reduce((n, a) => n + pausedSleepers(a).length, 0);
 
   $tiles.innerHTML =
     tile("Hosts online", `${online.length} / ${agents.length}`,
          [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
-    tile("Running sessions", runningValue, sess.length + " total") +
-    tile("Waiting on you", String(waiting.length), "sessions with a question") +
+    tile("Running sessions", runningValue,
+         sess.length + " total" + (pausedCount ? ` · ${pausedCount} paused` : "")) +
+    tile("Ready for review", String(needs.length), "sessions waiting on you") +
     tile("Tokens today", fmtTokens(fleetTokens("today")), "all sessions, incl. cache" + retiredNote) +
     tile("Tokens this week", fmtTokens(fleetTokens("week")), "last 7 days (UTC)" + retiredNote) +
     tile("Tokens all-time", fmtTokens(fleetTokens("totals")),
@@ -1342,15 +1529,20 @@ function hostCard(a, now) {
   const repos = a.repos || [];
   const sessions = a.sessions || [];
   const runCount = sessions.filter(s => s.status === "running").length;
+  const paused = pausedSleepers(a);
+  const pausedNote = paused.length ? ` · ${paused.length} paused` : "";
 
   // Repos from the scan, plus synthetic entries for any session whose repo is no
   // longer present (e.g. repo dir removed) so its usage/controls stay reachable.
+  // A paused sleeper counts too: it resumes into that repo at its wake.
   const repoNames = repos.map(r => r.name);
-  const orphans = [...new Set(sessions.map(s => s.repo))].filter(n => !repoNames.includes(n));
+  const orphans = [...new Set([...sessions, ...paused].map(s => s.repo))]
+    .filter(n => n && !repoNames.includes(n));
   const repoEntries = [...repos, ...orphans.map(n => ({ name: n, missing: true }))];
 
   const reposHtml = repoEntries.length
-    ? repoEntries.map(r => repoBlock(a, r, sessions.filter(s => s.repo === r.name), now)).join("")
+    ? repoEntries.map(r => repoBlock(a, r, sessions.filter(s => s.repo === r.name), now,
+        paused.filter(c => c.repo === r.name))).join("")
     : `<div class="repo-empty">No git repos found under ${esc(a.reposRoot || "the repos root")}.</div>`;
 
   const collapsed = collapsedHosts.has(a.key);
@@ -1360,7 +1552,7 @@ function hostCard(a, now) {
       <span><span class="m-label">Memory</span> <b>${esc(mem)}</b></span>
       <span><span class="m-label">Uptime</span> <b>${esc(uptime(a.startedAt, now))}</b> · last seen ${esc(ago(now - a.lastSeen))}</span>
       <span><span class="m-label">Repos root</span> <span class="path">${esc(a.reposRoot || "–")}</span></span>
-      <span><span class="m-label">Sessions</span> <b>${runCount}</b> running · ${sessions.length} total</span>
+      <span><span class="m-label">Sessions</span> <b>${runCount}</b> running · ${sessions.length} total${pausedNote}</span>
     </div>
     <div class="repos">${cloneBar(a)}${reposHtml}</div>
     ${a.logTail ? `<details class="logs" ${openLogs.has(a.key) ? "open" : ""}
@@ -1374,7 +1566,7 @@ function hostCard(a, now) {
   // When collapsed, surface the session count alongside the name so the row still
   // tells you at a glance how busy the host is without expanding it.
   const collapsedMeta = collapsed
-    ? `<span class="status" style="color:var(--muted);font-size:12px">${runCount} running · ${sessions.length} total</span>`
+    ? `<span class="status" style="color:var(--muted);font-size:12px">${runCount} running · ${sessions.length} total${pausedNote}</span>`
     : "";
 
   // The org whose Jira this host polls, alongside its name — a host with no Jira
@@ -1568,7 +1760,7 @@ function cloneBody(a, sources, hid) {
   </div>`;
 }
 
-function repoBlock(a, repo, sessList, now) {
+function repoBlock(a, repo, sessList, now, pausedList = []) {
   const rkey = a.key + "::" + repo.name;
   const collapsed = collapsedRepos.has(rkey);
   const meta = repo.isRoot
@@ -1588,8 +1780,9 @@ function repoBlock(a, repo, sessList, now) {
     ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();toggleComposer('${escJs(rkey)}','${escJs(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : composerOpen.has(rkey) ? "− New session" : "+ New session"}</button>`
     : "";
   const ghost = spawning ? ghostCard() : "";
-  const body = (sessList.length || spawning)
-    ? `<div class="sess-grid">${ghost}${sessList.map(s => sessCard(a, s, now)).join("")}</div>`
+  const body = (sessList.length || spawning || pausedList.length)
+    ? `<div class="sess-grid">${ghost}${sessList.map(s => sessCard(a, s, now)).join("")}${
+        pausedList.map(c => pausedCard(a, c, now)).join("")}</div>`
     : `<div class="repo-empty">No sessions yet${canSpawn ? " — start one with “+ New session”." : "."}</div>`;
 
   // Resumable prior sessions of this repo — the "Resume any session" picker.
@@ -1598,9 +1791,9 @@ function repoBlock(a, repo, sessList, now) {
   // Turma sessions, repo-dir "terminal" runs, and older ones, not just the last
   // few killed). Fall back to the last-5 killed sessions (closedSessions) for
   // agents that predate repo.resumable.
-  const resumable = Array.isArray(repo.resumable) ? repo.resumable : null;
+  const resumable = Array.isArray(repo.resumable) ? resumablePicks(repo.resumable, pausedList) : null;
   const legacyClosed = resumable ? [] : (a.closedSessions || [])
-    .filter(c => c.repo === repo.name)
+    .filter(c => c.repo === repo.name && !c.paused)
     .sort((x, y) => String(y.closedAt || "").localeCompare(String(x.closedAt || "")))
     .slice(0, 5);
   const resumeCount = resumable ? resumable.length : legacyClosed.length;
@@ -1854,6 +2047,11 @@ function sessCard(a, s, now) {
     ? `<dt>PRs</dt><dd class="pr-list">${prItems.map(prBadgeHtml).join("")}</dd>`
     : "";
 
+  // The wait classifier's verdict (XERK-1572) is its own row AFTER the Question
+  // / Permission one: it answers that question or command, so it reads below it,
+  // the order the Sessions page's Ready-for-review card uses.
+  const hint = live && !killing ? attentionHintHtml(s.attention) : "";
+
   return `<div class="sess ${st}${killing ? " killing" : ""}">
     <div class="sess-hd">
       <span class="sid">${id}</span>
@@ -1872,10 +2070,12 @@ function sessCard(a, s, now) {
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${killing
         ? `<dt>State</dt><dd><b class="sess-dying">shutting down…</b></dd>`
-        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>`
-        : st === "queued" ? `<dt>State</dt><dd><b class="sess-queued">${esc(queuedReasonText(s.queuedReason))}</b>${s.queuedAt ? " · " + esc(ago(now - Date.parse(s.queuedAt))) : ""}</dd>`
+        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${stateAge(live.detail)}</dd>`
+        : st === "queued" ? `<dt>State</dt><dd><b class="sess-queued">${esc(queuedReasonText(s.queuedReason))}</b>${s.queuedAt ? stateAge(ago(now - Date.parse(s.queuedAt))) : ""}</dd>`
         : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
+      ${live && live.ask ? `<dt>Permission</dt><dd>${esc(live.ask)}</dd>` : ""}
+      ${hint ? `<dt></dt><dd>${hint}</dd>` : ""}
       ${st === "error" && s.errorMsg ? `<dt>Error</dt><dd class="errmsg">${esc(s.errorMsg)}</dd>` : ""}
       ${prs}
       <dt>Created</dt><dd>${s.createdAt ? esc(ago(now - Date.parse(s.createdAt))) : "–"}${s.stoppedAt ? " · stopped " + esc(ago(now - Date.parse(s.stoppedAt))) : ""}</dd>
@@ -1887,6 +2087,48 @@ function sessCard(a, s, now) {
       <div class="u-sub">${fmtTokens(u?.totals?.output)} out</div>
     </div>
     ${st === "running" ? contextMeterHtml(s) : ""}
+    <div class="sess-actions">${actions}</div>
+  </div>`;
+}
+
+// A sleeper the hub paused to free its slot (XERK-1575): ended for now, but the
+// hub resumes it at its wake, so it keeps a card in its repo — reading asleep in
+// the same muted tone as the sleeping label it had while running — instead of
+// vanishing as if killed. Resume now brings it back early; Kill stops it for
+// good (an ordinary killed session in ended history that never wakes), armed and
+// confirmed like a running card's Kill.
+// Its State is the wake alone, no "paused Ns ago" age: it is waiting, not
+// history — the same line the Sessions page's Paused row shows.
+function pausedCard(a, c, now) {
+  const rp = pending.has(pendKey("resume", a.key, c.id));
+  const killing = pending.has(pendKey("kill", a.key, c.id));
+  const kKey = "sk::" + a.key + "::" + c.id;
+  const prs = (c.prs && c.prs.length)
+    ? `<dt>PRs</dt><dd class="pr-list">${c.prs.map(prBadgeHtml).join("")}</dd>` : "";
+  const actions = killing
+    ? `<button class="btn-sm" disabled><span class="spin"></span> Killing…</button>`
+    : `<button class="btn-sm" ${a.online && !rp ? "" : "disabled"}
+        title="${esc(a.online ? "Resume now, before its wake" : "Host offline")}"
+        onclick="resumeSession('${escJs(a.key)}','${escJs(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume now"}</button>` +
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" ${rp ? "disabled" : ""}
+        title="Stop it for good: it will not wake"
+        onclick="pausedKill('${escJs(a.key)}','${escJs(c.id)}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
+  return `<div class="sess paused${killing ? " killing" : ""}">
+    <div class="sess-hd">
+      <span class="sid">${esc(c.id)}</span>
+      ${c.summary ? `<span class="sess-summary">${esc(c.summary)}</span>` : ""}
+      ${c.label ? `<span class="sess-label" title="session label">${esc(c.label)}</span>` : ""}
+      ${killing
+        ? `<span class="badge stopping"><span class="spin"></span> stopping</span>`
+        : `<span class="badge paused">paused</span>`}
+    </div>
+    <dl>
+      ${c.root
+        ? `<dt>Location</dt><dd><b>repos root (no worktree)</b></dd>`
+        : `<dt>Worktree</dt><dd><b>${esc(worktreeName(c))}</b></dd>`}
+      <dt>State</dt><dd><b class="sess-holding">${esc(pausedLabel(c.paused, now))}</b></dd>
+      ${prs}
+    </dl>
     <div class="sess-actions">${actions}</div>
   </div>`;
 }
@@ -2154,6 +2396,14 @@ function sessRestart(key, id) {
 }
 function sessKill(key, id) {
   twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill")));
+}
+// Kill a paused sleeper (XERK-1575): the same route and arm/confirm as a running
+// card's Kill. The agent drops the pause, so it ends as an ordinary killed session
+// that never wakes; the pending row clears once the host stops reporting it paused.
+function pausedKill(key, id) {
+  twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id),
+    { kind: "kill", paused: true, host: key, id },
     () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill")));
 }
 function sessDelete(key, id) {

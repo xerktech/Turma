@@ -148,6 +148,8 @@ data class EndedSession(
      *  runtime, so the web's resumableSession omits it too) and for any pre-dsh
      *  record; both read as Claude Code and carry no badge. */
     val agentType: String = "",
+    /** A sleeper the hub paused to free its slot (XERK-1575), else null. */
+    val paused: com.xerktech.turma.model.PausedSleep? = null,
 )
 
 /** The sidebar's three lists in one pass — running, queued (FIFO), ended. */
@@ -208,7 +210,7 @@ fun collectSessions(agents: List<AgentInfo>, query: String): SessionLists {
                     transcriptId = c.transcriptId, repo = c.repo,
                     name = closedName(c),
                     endedAt = c.closedAt, endedMs = parseIso(c.closedAt),
-                    prs = c.prs, agentType = c.agentType,
+                    prs = c.prs, agentType = c.agentType, paused = c.paused,
                 ),
             )
         }
@@ -250,7 +252,10 @@ fun queuedReasonText(reason: String): String = when (reason) {
 }
 
 /** The row's state word: killed/stopped/failed/ended (web endedRow `state`). */
-fun endedStateText(e: EndedSession): String = when {
+fun endedStateText(e: EndedSession, now: Long = System.currentTimeMillis()): String = when {
+    // A sleeper paused for its slot (XERK-1575) wakes on its own: web `pausedLabel`.
+    e.kind == EndedKind.CLOSED && e.paused != null && e.paused.wakeAt > 0 ->
+        com.xerktech.turma.core.pausedLabel(e.paused, now)
     e.kind == EndedKind.CLOSED -> "killed"
     // A resumable row is a bare transcript: nothing recorded WHY it ended, only
     // that it did, so it says the one thing that's true of all of them.
@@ -291,11 +296,15 @@ fun rankRunning(rows: List<FlatSession>, now: Long): LiveGroups {
                 .thenBy { it.flat.session.id },
         )
         .toList()
+    // Every session the hub says needs the operator (XERK-1571) — the set the
+    // dashboard's tile counts; the local readyForReview port from an older hub.
     val (review, rest) = running.partition {
-        com.xerktech.turma.core.readyForReview(it.flat.session, it.state)
+        com.xerktech.turma.core.inReview(it.flat.session, it.state, it.flat.hostLastSeen, now)
     }
     return LiveGroups(
-        review = review,
+        // Oldest-waiting first by the hub's attention `since` (XERK-1571); it
+        // moves only when a card ENTERS the group, so it does not reshuffle per beat.
+        review = com.xerktech.turma.core.sortedBySince(review) { it.flat.session.attention },
         active = rest.filter { it.state != com.xerktech.turma.core.LiveState.IDLE },
         idle = rest.filter { it.state == com.xerktech.turma.core.LiveState.IDLE },
     )
@@ -514,6 +523,8 @@ fun SessionsListPane(
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
     val spawnAtts by vm.spawnAtt.collectAsStateWithLifecycle()
+    // In-flight actions, for a Paused row's Kill (XERK-1575).
+    val pending by vm.pending.collectAsStateWithLifecycle()
     // The archive half of the box. The VM debounces and drops anything under
     // HISTORY_MIN_QUERY, so this can fire on every keystroke.
     val arch by archiveVm.state.collectAsStateWithLifecycle()
@@ -545,7 +556,11 @@ fun SessionsListPane(
     val groups = remember(lists, now) { rankRunning(lists.running, now) }
     val (review, active, idle) = groups
     val queued = lists.queued
-    val ended = lists.ended
+    // Paused sleepers (XERK-1575) wake on their own, so they get their own
+    // always-open section above the collapsed Ended history, soonest wake first
+    // (web sessions.html `$paused`); Ended keeps the rest.
+    val pausedRows = remember(lists) { pausedEnded(lists.ended) }
+    val ended = remember(lists) { lists.ended.filterNot(::isPausedEnded) }
     var endedOpen by rememberSaveable { mutableStateOf(false) }
     // A filtered Ended list is a search RESULT, so searching opens the section —
     // a match hiding behind a collapsed header reads as "nothing matched". Only
@@ -575,7 +590,7 @@ fun SessionsListPane(
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             val anyRows = lists.running.isNotEmpty() || queued.isNotEmpty()
-            if (!anyRows && ended.isEmpty()) {
+            if (!anyRows && ended.isEmpty() && pausedRows.isEmpty()) {
                 item {
                     Text(
                         when {
@@ -625,7 +640,7 @@ fun SessionsListPane(
             // Active: sessions still working. The header shows even when empty, so
             // "nothing active right now" reads as a state rather than a missing
             // section — matching the web sidebar.
-            if (anyRows || ended.isNotEmpty()) {
+            if (anyRows || ended.isNotEmpty() || pausedRows.isNotEmpty()) {
                 item(key = "active-header") { SectionLabel("Active (${active.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
                 if (active.isEmpty()) {
                     item(key = "active-empty") {
@@ -667,6 +682,23 @@ fun SessionsListPane(
                         onRename = { name -> vm.setSummary(r.flat.host, r.flat.session.id, name) },
                         onMove = { target -> vm.migrate(r.flat.host, r.flat.session.id, target) },
                         onClick = { onSelect(r.flat.host, r.flat.session.id) },
+                    )
+                }
+            }
+            // Paused: sleepers the hub paused for queued work (XERK-1575). Never
+            // collapsed — each resumes on its own at its wake — and the same row
+            // as Ended, whose Resume brings one back early.
+            if (pausedRows.isNotEmpty()) {
+                item(key = "paused-header") { SectionLabel("Paused (${pausedRows.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
+                items(pausedRows, key = { "paused:" + it.host + "/" + it.id }) { e ->
+                    EndedSessionRow(
+                        e, now,
+                        tint = hostTint[e.host],
+                        selected = selectedKey == e.host + "/" + e.transcriptId,
+                        onOpen = { onSelectEnded(e.host, e.transcriptId) },
+                        onResume = { resumeEnded(vm, e); onSelect(e.host, e.id) },
+                        onKill = { vm.killPaused(e.host, e.id) },
+                        pendingKind = FleetViewModel.sessPending(pending, e.host, e.id),
                     )
                 }
             }
@@ -777,6 +809,13 @@ fun SessionsListPane(
     }
 }
 
+/** An Ended row that is a paused sleeper (XERK-1575) — web sessions.html `isPausedEntry`. */
+fun isPausedEnded(e: EndedSession): Boolean = e.kind == EndedKind.CLOSED && (e.paused?.wakeAt ?: 0L) > 0L
+
+/** The Paused section's rows, soonest wake first (web sessions.html `$paused`). */
+fun pausedEnded(ended: List<EndedSession>): List<EndedSession> =
+    ended.filter(::isPausedEnded).sortedWith(compareBy({ it.paused?.wakeAt ?: 0L }, { it.id }))
+
 fun closedName(c: ClosedSessionInfo): String =
     c.summary.ifBlank { c.label.ifBlank { c.branch.ifBlank { c.id.take(6) } } }
 
@@ -840,7 +879,12 @@ private fun QueuedSessionCard(r: FlatSession, now: Long, tint: Color?, onCancel:
 /** One ended session's row, whatever channel reported it (web endedRow). */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit) {
+private fun EndedSessionRow(
+    e: EndedSession, now: Long, tint: Color?, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit,
+    // Set only on a Paused row (XERK-1575): its Kill, and the in-flight action.
+    onKill: (() -> Unit)? = null,
+    pendingKind: String? = null,
+) {
     val cardMod = Modifier.fillMaxWidth().then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
@@ -871,7 +915,7 @@ private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: 
                 val when_ = e.endedAt.takeIf { it.isNotBlank() }
                     ?.let { com.xerktech.turma.core.ageStr(it, now) }.orEmpty()
                 Text(
-                    endedStateText(e) + if (when_.isNotBlank()) " $when_" else "",
+                    endedStateText(e, now) + if (when_.isNotBlank() && e.paused == null) " $when_" else "",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,
@@ -895,7 +939,26 @@ private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: 
             }
             // Resume needs the host online (it rides the heartbeat as a command);
             // reading the conversation does not, so the card stays clickable.
-            GhostButton("Resume", onResume, enabled = e.online)
+            // A paused sleeper is resumed before its wake (XERK-1575, web `endedRow`).
+            if (onKill == null) {
+                GhostButton(if (isPausedEnded(e)) "Resume now" else "Resume", onResume, enabled = e.online)
+            } else if (pendingKind == "killPaused") {
+                Text("Killing…", style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(end = 6.dp))
+            } else {
+                // A paused sleeper's Kill stops it for good (web `endedRow`'s
+                // `pausedKill`): arm, then confirm, like a queued card's Cancel.
+                var armed by remember(e.host, e.id) { mutableStateOf(false) }
+                LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(KILL_ARM_MS); armed = false } }
+                Column(horizontalAlignment = Alignment.End) {
+                    GhostButton("Resume now", onResume, enabled = e.online && pendingKind == null)
+                    GhostButton(
+                        if (armed) "Confirm kill" else "Kill",
+                        onClick = { if (armed) { armed = false; onKill() } else armed = true },
+                        enabled = pendingKind == null,
+                    )
+                }
+            }
         }
     }
 }
@@ -1025,7 +1088,20 @@ private fun SessionListCard(
             // anything but — so it takes the accent one instead (web
             // `.dot.review`). A waiting card keeps its own stronger amber.
             val dotState = liveState(r.session, r.hostLastSeen, now)
-            if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
+            // A STALLED background wait takes the danger colour it has on every
+            // surface (XERK-1571, web `.dot.stalled`), never the review accent —
+            // also where the hub says stalled but the host just went quiet, so this
+            // screen can't judge the silence itself (web `reviewState`). A session
+            // LOOPING on one failing call is busy, so its own dot would read working;
+            // the hub's stall counts there too (XERK-1572).
+            val stalled = (dotState == com.xerktech.turma.core.LiveState.IDLE &&
+                com.xerktech.turma.core.sessionWait(r.session, r.hostLastSeen, now)?.stalled == true) ||
+                ((dotState == com.xerktech.turma.core.LiveState.IDLE ||
+                    dotState == com.xerktech.turma.core.LiveState.WORKING) &&
+                    com.xerktech.turma.core.attentionStalled(r.session.attention))
+            if (stalled) {
+                StatusLight(com.xerktech.turma.ui.theme.TurmaColors.critical)
+            } else if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
                 StatusLight(com.xerktech.turma.ui.theme.TurmaColors.review)
             } else {
                 StateDot(dotState)
@@ -1048,6 +1124,41 @@ private fun SessionListCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                // Why it is the operator's and for how long (XERK-1571, web
+                // sessions.html `.why` line) — review cards only.
+                if (review) {
+                    val why = com.xerktech.turma.core.attentionWhy(r.session.attention, now)
+                    if (why.isNotEmpty()) {
+                        Text(
+                            why,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    // The wait classifier's verdict and the answer it suggests
+                    // (XERK-1572, web sessions.html `.att-hint`).
+                    val hint = com.xerktech.turma.core.attentionHintLine(r.session.attention)
+                    if (hint.isNotEmpty()) {
+                        Text(
+                            hint,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    val suggested = com.xerktech.turma.core.attentionSuggested(r.session.attention)
+                    if (suggested.isNotEmpty()) {
+                        Text(
+                            suggested,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
                 // The PRs share a marks row at the BOTTOM of the card (web
                 // sessions.html state-row), rendered when there is at least one.
                 if (r.session.prs.isNotEmpty()) {
@@ -1149,7 +1260,7 @@ internal fun EndedSessionView(
                     ChatSettingsMenu(verbosity) { verbosity = it }
                     entry?.let { e ->
                         GhostButton(
-                            "Resume",
+                            if (isPausedEnded(e)) "Resume now" else "Resume",
                             {
                                 resumeEnded(fleetVm, e)
                                 // A resumable row comes back under a NEW id only the

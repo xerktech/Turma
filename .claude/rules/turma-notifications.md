@@ -28,6 +28,10 @@ wire contract and Web ⇄ Android parity — Android's channels/`Notifications.k
     `checks` is "not fetched yet" not "no CI" (`PR_NO_CI_GRACE_MS`); an inconclusive wait ages out and
     fires anyway (may delay, never lose).
 
+- **The org brief's push (XERK-1573) is an org DIGEST, not a session alert** — one per brief, only
+  when that org's needs-you set changed, under `brief:<site>` (replaced, retracted when it empties).
+  Rule: `turma-brief.md`.
+
 ### Runaway session spend (XERK-310)
 
 - A session's cost is invisible until somebody opens `/usage` and adds it up, so a run that takes
@@ -68,8 +72,10 @@ wire contract and Web ⇄ Android parity — Android's channels/`Notifications.k
   killed within 30s of the flagging beat, before `state.json` is written, re-announces on reboot.
   Same window the command queue already carries; acceptable, since the alert is informational and a
   double-buzz on a hard restart is not a correctness problem.
-- **It is the one session alert outside the XERK-224 one-alert-per-piece-of-work rule**: a session
+- **It is the FIRST session alert outside the XERK-224 one-alert-per-piece-of-work rule**: a session
   can be both mid-turn and far too expensive, and the review alert would not be the thing to say.
+- **The stalled alert is the SECOND exception** (XERK-1571, `stalled:<host>:<id>`, retracted on
+  recovery; precedence question > stalled > review) — mechanics in `turma-attention.md`.
 - Gated on `running` — a stopped session's total is history and its record keeps reporting `usage`;
   it announces if resumed, which is when the number can move again. **Notification only**: nothing
   here throttles, interrupts or kills, since a session mid-repro on an expensive bug is allowed to

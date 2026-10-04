@@ -875,6 +875,61 @@ class BoardTest {
         assertTrue(ticketSessionIndex(listOf(siteless)).isEmpty())
     }
 
+    @Test fun `a self-closed ticket's outcome rides each channel to its chip label`() {
+        // XERK-1569, web board.js ticketOutcomeLabel / sessionChipHtml's .kc-sess-closed.
+        val t = com.xerktech.turma.model.TicketRef(
+            key = "X-1", siteKey = "org.atlassian.net", branch = "X-1",
+            outcome = com.xerktech.turma.model.TicketOutcome(kind = "not-reproducible", at = 1786400000000L, note = "repro passes"),
+        )
+        val a = AgentInfo(
+            key = "h",
+            sessions = listOf(com.xerktech.turma.model.SessionInfo(id = "s", ticket = t, transcriptId = "t-s")),
+            closedSessions = listOf(com.xerktech.turma.model.ClosedSessionInfo(id = "c", ticket = t, transcriptId = "t-c")),
+            repos = listOf(com.xerktech.turma.model.RepoInfo(name = "r",
+                resumable = listOf(com.xerktech.turma.model.ResumableInfo(transcriptId = "t-r", ticket = t)))),
+        )
+        val chips = ticketSessionsOf(ticketSessionIndex(listOf(a)), "org.atlassian.net", "X-1")
+        assertEquals(listOf("not-reproducible", "not-reproducible", "not-reproducible"), chips.map { it.outcome })
+        assertEquals(listOf(1786400000000L, 1786400000000L, 1786400000000L), chips.map { it.outcomeAt })
+        assertEquals(listOf("repro passes", "repro passes", "repro passes"), chips.map { it.outcomeNote })
+        // The outcome replaces the chip's name (the branch), whatever its run state:
+        // the reason alone, no "closed ·" prefix (the neutral dot says closed).
+        assertEquals("not reproducible", ticketSessionLabel(chips[0]))
+        assertEquals("not reproducible", ticketOutcomeLabel(chips[0].outcome))
+        assertEquals("already fixed", ticketOutcomeLabel("already-fixed"))
+        assertEquals("closed", ticketOutcomeLabel("done"))
+        // The name behind it still resolves (the "Closed by" row says it).
+        assertEquals("X-1", ticketSessionName(chips[0]))
+        // Unknown/none say nothing, and the chip keeps its branch name.
+        assertEquals("", ticketOutcomeLabel("wontfix"))
+        assertEquals("", ticketOutcomeLabel(""))
+        assertEquals("X-1", ticketSessionLabel(chips[0].copy(outcome = "")))
+    }
+
+    @Test fun `the detail sheet's Closed by row names the newest closing session, why and when`() {
+        // XERK-1569, web board.js ticketOutcomeOf / ticketOutcomeFieldHtml.
+        val base = TicketSession(
+            host = "h", id = "a", transcriptId = "t", status = "stopped", gitBranch = "",
+            ticketBranch = "X-1", summary = "", summaryManual = false, label = "",
+            ticketKey = "X-1", siteKey = "s",
+        )
+        val now = 1786400000000L
+        val older = base.copy(id = "a", outcome = "already-fixed", outcomeAt = now - 7200_000L)
+        val newer = base.copy(id = "b", outcome = "not-reproducible", outcomeAt = now - 3 * 3600_000L)
+        val plain = base.copy(id = "c", status = "running")
+        val closedBy = ticketOutcomeOf(listOf(older, newer))
+        assertEquals("b", closedBy?.id)
+        // Reopened and worked by a newer session that has not closed it: no row.
+        assertNull(ticketOutcomeOf(listOf(older, newer, plain)))
+        // It names the closing session (its chip name — the branch here, "X-1").
+        assertEquals("X-1 — not reproducible · 3h ago", ticketOutcomeText(closedBy!!, now))
+        assertEquals("X-1-fix — done · just now",
+            ticketOutcomeText(base.copy(gitBranch = "X-1-fix", outcome = "done", outcomeAt = now - 10_000L), now))
+        assertEquals("X-1 — already fixed", ticketOutcomeText(base.copy(outcome = "already-fixed"), now))
+        assertNull(ticketOutcomeOf(listOf(plain, base.copy(outcome = "wontfix"))))
+        assertEquals("", ticketOutcomeWords("wontfix"))
+    }
+
     @Test fun `chip label prefers rename, then branch, and state maps status`() {
         val s = TicketSession(
             host = "h", id = "aa1", transcriptId = "t", status = "running",

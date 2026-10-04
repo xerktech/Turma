@@ -30,6 +30,9 @@ data class FleetSummary(
     // Whether a removed host's spend is inside the three token totals, so the
     // tiles can say so (index.html's `retiredNote`).
     val retiredCounted: Boolean = false,
+    // Sleepers the hub paused to free their slot (XERK-1575): no slot, so not in
+    // [running], but said beside it (index.html `pausedCount`).
+    val paused: Int = 0,
 )
 
 private fun bucket(u: UsageInfo, w: UsageWindow) = when (w) {
@@ -99,7 +102,10 @@ fun fleetSummary(
         // drops NEGATIVE counts, XERK-1479) would otherwise wrap to a negative ceiling.
         maxSessions = if (capHosts.isEmpty()) null
             else capHosts.sumOf { it.maxSessions.toLong() }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
-        waiting = sessions.count { it.status == "running" && !it.session?.question.isNullOrBlank() },
+        // The SAME set the Sessions screen's Ready for review group lists
+        // (XERK-1571, web index.html): every running session the hub serves a
+        // needs-you:* attention for.
+        waiting = sessions.count(::needsYou),
         tokensToday = fleetTokens(spenders, UsageWindow.TODAY),
         tokensWeek = fleetTokens(spenders, UsageWindow.WEEK),
         tokensAllTime = fleetTokens(spenders, UsageWindow.TOTALS),
@@ -107,5 +113,6 @@ fun fleetSummary(
         // Said on the tiles rather than left to be discovered: a total larger
         // than the hosts on screen can account for reads as a bug otherwise.
         retiredCounted = retired.isNotEmpty(),
+        paused = agents.sumOf { pausedSleepers(it).size },
     )
 }
