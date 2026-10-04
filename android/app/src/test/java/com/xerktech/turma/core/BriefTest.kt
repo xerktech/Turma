@@ -68,7 +68,7 @@ class BriefTest {
         // A stale close names its kind in words.
         val z = BriefItem(kind = "ticket", title = "flaky", key = "A-9", reason = "not-reproducible",
             note = "ran 50x", since = now - 3_600_000, host = "h1")
-        assertEquals("not reproducible · ran 50x · 60m ago · h1", briefItemMeta("closedStale", z, now))
+        assertEquals("not reproducible · ran 50x · 1h ago · h1", briefItemMeta("closedStale", z, now))
     }
 
     @Test fun `briefItemMeta leads a Finished row with how and when it finished`() {
@@ -89,12 +89,12 @@ class BriefTest {
         val now = 10_000_000L
         val t = BriefItem(kind = "ticket", title = "shipped", key = "P-1", since = now - 3_600_000,
             host = "h1", prUrl = "https://github.com/x/y/pull/42")
-        assertEquals("done 60m ago · merged PR · h1", briefItemMeta("finished", t, now))
+        assertEquals("done 1h ago · merged PR · h1", briefItemMeta("finished", t, now))
         assertEquals("https://github.com/x/y/pull/42", briefPrUrl(t))
         // Only an http(s) link is a link (web safeUrl).
         val bad = t.copy(prUrl = "javascript:alert(1)")
         assertEquals(null, briefPrUrl(bad))
-        assertEquals("done 60m ago · h1", briefItemMeta("finished", bad, now))
+        assertEquals("done 1h ago · h1", briefItemMeta("finished", bad, now))
     }
 
     @Test fun `briefSpendWindow says when each window resets`() {

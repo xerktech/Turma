@@ -56,6 +56,9 @@ paragraph and the per-org decisions log are XERK-1574.
     gate, org policy, spawn in flight), each with `briefNextReason` (the `triageSortKey` terms: P0
     preempts / oldest first, created age, type, non-default tier). **`autoStartCandidates` is the
     sweep's OWN candidate list**, so the brief cannot name an order the sweep does not follow;
+  - nextUp is the ORDER, not a start promise: a ticket in its retry backoff (`autoStarted`) stays
+    listed with "retrying in <d>", and the usage pause and org rate window (applied at dispatch)
+    are not reflected;
   - **closedStale** — `ticket.outcome` of kind `not-reproducible`/`already-fixed` in the period
     (a `done` close is finished work, not a stale close);
   - **spend** — per subscription the org spends, that subscription's freshest non-stale `limits`

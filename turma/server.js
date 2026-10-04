@@ -14411,8 +14411,12 @@ function compileBrief(siteKey, now, trigger, prevList) {
       if (action !== "approve"
         && (triageGateReason(t) || triagePolicyReason(siteKey, t.triage, repo))) continue;
       if (spawnTicketInFlight(siteKey, t.key)) continue;
+      // The sweep holds a ticket in its retry backoff: still in line, but say so.
+      const prior = autoStarted.get(siteKey + "\x00" + t.key);
+      const backoff = prior && now < prior.nextAt
+        ? ` · retrying in ${briefAge(prior.nextAt - now)}` : "";
       nextUp.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
-        reason: briefNextReason(t, repo, now) });
+        reason: briefNextReason(t, repo, now) + backoff });
     }
   }
 

@@ -23238,6 +23238,12 @@ test("XERK-1573: starts next skips a held/rejected ticket; an offline host needs
     const b = hub.compileBrief(S, now, "scheduled", []);
     assert.deepEqual(b.nextUp.map((i) => i.key), ["I-3"],
       "a held, rejected, already-started, untriaged or policy-blocked ticket is not next");
+    assert.ok(!/retrying/.test(b.nextUp[0].reason), b.nextUp[0].reason);
+    // The sweep is holding I-3 in its retry backoff: still next, but the reason says so.
+    autoStarted.set(S + "\x00I-3", { attempts: 1, nextAt: now + 5 * 60 * 1000 });
+    const held = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(held.nextUp.map((i) => i.key), ["I-3"]);
+    assert.match(held.nextUp[0].reason, / · retrying in 5m$/);
     assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["i1"]);
     // The host goes silent: its last beat's attention is frozen, not current.
     agents.brHostI.lastSeen = now - 10 * 60 * 1000;

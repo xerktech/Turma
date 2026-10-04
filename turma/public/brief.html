@@ -254,11 +254,18 @@ function render(data) {
   TurmaNav.preserveScroll($briefs, () => { $briefs.innerHTML = html; });
 }
 
+// A fetch MERGES, never replaces (XERK-444): a `briefs` SSE frame that lands while
+// /api/agents is in flight is newer than the body, so `briefsClock` stamps every
+// frame and a snapshot keeps the cached briefs when one landed since it began.
+let briefsClock = 0;
 async function refresh() {
+  const since = briefsClock;
   try {
     const r = await fetch("/api/agents");
     if (r.status === 401) return void (location.href = "/login");
-    cache = await r.json();
+    const body = await r.json();
+    if (cache && briefsClock !== since) body.briefs = cache.briefs;
+    cache = body;
   } catch { /* keep the last render */ }
   if (cache) render(cache);
 }
@@ -296,6 +303,7 @@ function connectSSE() {
     let b;
     try { b = JSON.parse(e.data); } catch { return; }
     if (!cache) return void refresh();
+    briefsClock++;
     cache.briefs = b;
     render(cache);
   });
