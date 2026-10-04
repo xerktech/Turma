@@ -377,4 +377,49 @@ class SessionsFlattenTest {
         assertEquals("failed", endedStateText(e(EndedKind.STOPPED, status = "error")))
         assertEquals("stopped", endedStateText(e(EndedKind.STOPPED, status = "stopped")))
     }
+
+    // XERK-1575: a sleeper the hub paused for its slot reads asleep until its
+    // wake (web `pausedLabel`), never "killed" — and it rides the closed channel.
+    @Test fun `a paused sleeper reads paused until its wake, not killed`() {
+        val now = 1_786_400_000_000L
+        val wakeAt = now + 90 * 60_000L
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            closedSessions = listOf(
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "nap", transcriptId = "t1", closedAt = "2026-07-22T10:00:00Z",
+                    paused = com.xerktech.turma.model.PausedSleep(wakeAt = wakeAt, wakeReason = "check CI", at = now),
+                ),
+                com.xerktech.turma.model.ClosedSessionInfo(id = "kill", transcriptId = "t2"),
+            ),
+        )
+        val ended = collectSessions(listOf(a), "").ended.associateBy { it.id }
+        assertEquals(
+            "💤 paused until ${com.xerktech.turma.core.clockTime(wakeAt, now)} · check CI",
+            endedStateText(ended.getValue("nap"), now),
+        )
+        assertEquals("killed", endedStateText(ended.getValue("kill"), now))
+    }
+
+    // XERK-1575: paused sleepers leave the collapsed Ended list for their own
+    // Paused section, soonest wake first (web sessions.html `$paused`).
+    @Test fun `paused sleepers split out of Ended, soonest wake first`() {
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            closedSessions = listOf(
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "late", transcriptId = "t1",
+                    paused = com.xerktech.turma.model.PausedSleep(wakeAt = 9_000L),
+                ),
+                com.xerktech.turma.model.ClosedSessionInfo(id = "kill", transcriptId = "t2"),
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "early", transcriptId = "t3",
+                    paused = com.xerktech.turma.model.PausedSleep(wakeAt = 5_000L),
+                ),
+            ),
+        )
+        val ended = collectSessions(listOf(a), "").ended
+        assertEquals(listOf("early", "late"), pausedEnded(ended).map { it.id })
+        assertEquals(listOf("kill"), ended.filterNot(::isPausedEnded).map { it.id })
+    }
 }

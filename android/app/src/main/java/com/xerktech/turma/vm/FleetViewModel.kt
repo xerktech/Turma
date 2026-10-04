@@ -268,6 +268,13 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
         mark(host, id, "kill")
         run("kill queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "kill") }
     }
+    /** Kill a sleeper the hub paused (XERK-1575): the same kill route, but its
+     *  pending row clears once the host stops reporting it paused — it has no
+     *  live session to vanish (web index.html `pausedKill`). */
+    fun killPaused(host: String, id: String) {
+        mark(host, id, "killPaused")
+        run("kill queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "kill") }
+    }
     fun start(host: String, id: String) {
         mark(host, id, "start")
         run("start queued", pendKey(host, id)) { container.client.api.sessionAction(host, id, "start") }
@@ -379,7 +386,9 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
          * list; start when it enters "running"; resume once the id is reported
          * again (even as "error" — the card then shows what went wrong);
          * restart when the agent's monotonic restartCount bumps (TTL fallback
-         * for an older agent that doesn't report it).
+         * for an older agent that doesn't report it). A paused sleeper's kill
+         * ("killPaused", XERK-1575) clears once its host stops reporting it
+         * paused.
          */
         fun reconcilePending(
             pending: Map<String, SessPending>,
@@ -389,6 +398,8 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
             if (pending.isEmpty()) return pending
             val index = HashMap<String, com.xerktech.turma.model.SessionInfo>()
             for (a in agents) for (s in a.sessions) index[pendKey(a.key, s.id)] = s
+            val paused = HashSet<String>()
+            for (a in agents) for (c in com.xerktech.turma.core.pausedSleepers(a)) paused.add(pendKey(a.key, c.id))
             val next = pending.toMutableMap()
             for ((key, p) in pending) {
                 val ttl = if (p.kind == "restart") RESTART_TTL_MS else PENDING_TTL_MS
@@ -396,6 +407,7 @@ class FleetViewModel(app: Application) : AndroidViewModel(app) {
                 val s = index[key]
                 val done = when (p.kind) {
                     "kill", "delete" -> s == null
+                    "killPaused" -> key !in paused
                     "start" -> s?.status == "running"
                     "resume" -> s != null
                     "restart" -> s != null && s.restartCount != p.restartCount

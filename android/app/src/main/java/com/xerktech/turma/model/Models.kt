@@ -618,6 +618,18 @@ data class ClosedSessionInfo(
     // PR-status objects this session opened, same shape/type as SessionInfo.prs —
     // rendered as chips on the ended card and the read-only review's stage bar.
     val prs: List<PrInfo> = emptyList(),
+    // A sleeper the hub paused to free its slot (XERK-1575): when it wakes and
+    // why. The hub rebuilds it field by field (`wirePaused`) or drops it, so it
+    // is null for an ordinary kill and for an older hub/agent.
+    val paused: PausedSleep? = null,
+)
+
+/** A paused sleeper's wake (ClosedSessionInfo `paused`, XERK-1575). */
+@Serializable
+data class PausedSleep(
+    val wakeAt: Long = 0,
+    val wakeReason: String = "",
+    val at: Long = 0,
 )
 
 /** A session's Jira ticket link (SessionInfo/ClosedSessionInfo `ticket`). */

@@ -193,14 +193,26 @@ function queuedCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, tint
   );
 }
 
+// A sleeper the hub paused to free its slot (XERK-1575): "paused until 14:05 ·
+// <reason>" — it wakes on its own, so it never reads as plainly ended. null for
+// any other ended row. Web `pausedLabel`, Android `endedStateText`.
+export function pausedLabel(s: SessionInfo, now: number = Date.now()): string | null {
+  const p = (s as { paused?: unknown }).paused as { wakeAt?: unknown; wakeReason?: unknown } | undefined;
+  if (!p || typeof p.wakeAt !== "number" || !Number.isSafeInteger(p.wakeAt)) return null;
+  const why = typeof p.wakeReason === "string" ? p.wakeReason.trim() : "";
+  return `paused until ${clockTime(p.wakeAt, now)}${why ? ` · ${why}` : ""}`;
+}
+
 // An ended (killed/stopped) session — a muted, non-entering row with its PR chips.
 function endedCardHtml(hostLabel: string, s: SessionInfo, tint: string): string {
+  const paused = pausedLabel(s);
   return (
     `<div class="ph-card ph-ended"${tint}>` +
     `<span class="ph-dot st-stopped" aria-hidden="true"></span>` +
     `<span class="ph-card-body">` +
     `<span class="ph-card-title">${esc(sessionName(s))}</span>` +
     `<span class="ph-card-meta">${esc(hostLabel)} · ${esc(s.repo)}${s.ticket?.key ? " · " + `<span class="ph-ticket">${esc(s.ticket.key)}</span>` : ""}</span>` +
+    (paused ? `<span class="ph-state st-holding">${esc(paused)}</span>` : "") +
     prChips(s) +
     `</span>` +
     `</div>`
@@ -220,6 +232,9 @@ export function sessionsBodyHtml(state: AppState): string {
   const running: Row[] = [];
   const queued: Row[] = [];
   const ended: Row[] = [];
+  // Sleepers the hub paused for their slot (XERK-1575): they wake on their own,
+  // so they get their own section rather than the capped Ended history.
+  const paused: Row[] = [];
   for (const a of agents) {
     const hostLabel = a.device ?? a.key;
     const siteKey = siteKeyOf(a);
@@ -229,7 +244,10 @@ export function sessionsBodyHtml(state: AppState): string {
       else if (s.status === "running") running.push(row);
       else ended.push(row); // stopped / error records still in the registry
     }
-    for (const s of a.closedSessions ?? []) ended.push({ hostKey: a.key, hostLabel, s: s as unknown as SessionInfo, siteKey, lastSeen: typeof a.lastSeen === "number" ? a.lastSeen : undefined });
+    for (const s of a.closedSessions ?? []) {
+      const row = { hostKey: a.key, hostLabel, s: s as unknown as SessionInfo, siteKey, lastSeen: typeof a.lastSeen === "number" ? a.lastSeen : undefined };
+      (pausedLabel(row.s) !== null ? paused : ended).push(row);
+    }
   }
   // Three live groups in reading order (XERK-224): Ready for review (stopped,
   // and waiting on YOU), Active (still working — leave it alone), Idle (quiet,
@@ -247,6 +265,9 @@ export function sessionsBodyHtml(state: AppState): string {
   const idle = rest.filter((r) => !ACTIVE.includes(liveState(r.s, r.lastSeen, now)));
   const byCreated = (a: Row, b: Row) => (b.s.createdAt ?? "").localeCompare(a.s.createdAt ?? "");
   [review, active, idle, queued, ended].forEach((l) => l.sort(byCreated));
+  // Soonest wake first (web sessions.html `$paused`, Android `pausedEnded`).
+  const wakeOf = (r: Row): number => ((r.s as { paused?: { wakeAt?: number } }).paused?.wakeAt ?? 0);
+  paused.sort((a, b) => wakeOf(a) - wakeOf(b));
   // Ready for review, oldest-waiting first by the hub's attention `since`
   // (XERK-1571, web sessions.html bySince); a card without one keeps its place
   // after them (the sort is stable).
@@ -269,6 +290,7 @@ export function sessionsBodyHtml(state: AppState): string {
     section("Active", active, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r), r.lastSeen, now)) +
     section("Idle", idle, (r) => sessionCardHtml(r.hostKey, r.hostLabel, r.s, r.s.id === curId, tintOf(r), r.lastSeen, now)) +
     section("Queued", queued, (r) => queuedCardHtml(r.hostKey, r.hostLabel, r.s, tintOf(r))) +
+    section("Paused", paused, (r) => endedCardHtml(r.hostLabel, r.s, tintOf(r))) +
     section("Ended", ended.slice(0, 20), (r) => endedCardHtml(r.hostLabel, r.s, tintOf(r)), "ph-ended-section");
 
   return `<div class="ph-list">${body || `<div class="ph-empty">No sessions${state.orgFilter ? " in this org" : ""}.</div>`}</div>`;

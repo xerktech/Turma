@@ -76,6 +76,27 @@ class AgentDecodeTest {
         assertNull(plain.agents[0].sessions[0].ticket!!.outcome)
     }
 
+    @Test fun `a paused sleeper's wake decodes on the closed channel`() {
+        // XERK-1575: closedSessions[].paused = {wakeAt, wakeReason?, at?}, rebuilt
+        // hub-side (wirePaused); absent = an ordinary kill.
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "closedSessions": [
+                { "id": "c1", "repo": "r", "paused": { "wakeAt": 1786403600000, "wakeReason": "check CI", "at": 1786400000000 } },
+                { "id": "c2", "repo": "r", "paused": { "wakeAt": 1786403600000 } },
+                { "id": "c3", "repo": "r" }
+              ]
+            } ] }
+        """.trimIndent()
+        val c = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].closedSessions
+        assertEquals(1786403600000L, c[0].paused!!.wakeAt)
+        assertEquals("check CI", c[0].paused!!.wakeReason)
+        assertEquals(1786400000000L, c[0].paused!!.at)
+        assertEquals("", c[1].paused!!.wakeReason)
+        assertNull(c[2].paused)
+    }
+
     @Test fun `a closed session with no ticket decodes to null`() {
         val body = """
             { "now": 1, "agents": [ {
