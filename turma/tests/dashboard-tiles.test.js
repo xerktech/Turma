@@ -584,7 +584,11 @@ test("dashboard: a paused sleeper keeps a card in its repo and is counted as pau
   const now = Date.now();
   const wakeAt = now + 2 * 3600e3;
   const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
-  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  // Mirror clockTime(): a wake on a later calendar day carries a " +Nd"
+  // suffix, so a run within ~2h of midnight sees "+1d" and a bare HH:MM fails.
+  const day = (t) => { const x = new Date(t); return new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime(); };
+  const days = Math.round((day(wakeAt) - day(now)) / 864e5);
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}` + (days > 0 ? ` +${days}d` : "");
   const h = {
     ...liveHost("vm", 1),
     capacity: { maxSessions: 6 },
