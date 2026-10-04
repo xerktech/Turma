@@ -237,6 +237,10 @@
     padding: 12px; display: flex; flex-direction: column; gap: 8px;
   }
   .sess.stopped, .sess.error { opacity: 0.9; }
+  /* A sleeper the hub paused for its slot (XERK-1575): dashed, since it holds
+     no slot, but not dimmed like a stopped card — it comes back on its own. */
+  .sess.paused { border-style: dashed; }
+  .sess-hd .badge.paused { color: var(--ink-2); }
   /* Optimistic takedown: a confirmed kill immediately dims and pulses the card
      so the shutdown reads as deliberate rather than a card blinking out. */
   .sess.killing { border-color: color-mix(in srgb, var(--critical) 40%, var(--border)); animation: killing-pulse 1.1s ease-in-out infinite; }
@@ -707,6 +711,11 @@ function reconcilePending(agents) {
       if (a && (a.tokenBound === true ||
                 (p.startedAt != null && a.startedAt != null && a.startedAt !== p.startedAt)))
         pending.delete(key);
+    } else if (p.kind === "kill" && p.paused) {
+      // A paused sleeper's Kill (XERK-1575) has no live session to vanish: done
+      // once the host stops reporting it paused (an ordinary killed record).
+      const a = byHost.get(p.host);
+      if (!a || !pausedSleepers(a).some(c => c.id === p.id)) pending.delete(key);
     } else {
       const s = index.get(p.host + "::" + p.id);
       // kill now removes the record entirely (keeping only the branch), so like
@@ -1208,6 +1217,25 @@ function sleepLabel(s, now) {
   const why = typeof s.wakeReason === "string" ? s.wakeReason.trim() : "";
   return "💤 sleeping until " + clockTime(s.wakeAt, now) + (why ? " · " + why : "");
 }
+// The host's sleepers the hub paused to free a slot for queued work (XERK-1575):
+// killed records carrying a `paused` wake, which the hub resumes at that wake. They
+// are not running, but they are not gone either, so the host card shows them.
+// Sessions page `isPausedEntry`, Android `pausedSleepers`.
+function pausedSleepers(a) {
+  return (a.closedSessions || []).filter(c => c && c.paused && Number.isSafeInteger(c.paused.wakeAt))
+    .sort((x, y) => x.paused.wakeAt - y.paused.wakeAt);
+}
+// A repo's "Resume ▾" picks without its paused sleepers' transcripts (XERK-1575):
+// a paused sleeper has its own card with Resume now right below, so listing it
+// again as an ordinary ended session shows one session twice. Android `resumablePicks`.
+function resumablePicks(resumable, pausedList) {
+  const skip = new Set((pausedList || []).map(c => c.transcriptId).filter(Boolean));
+  return skip.size ? resumable.filter(t => !skip.has(t && t.transcriptId)) : resumable;
+}
+function pausedLabel(p, now) {
+  const why = typeof p.wakeReason === "string" ? p.wakeReason.trim() : "";
+  return "💤 paused until " + clockTime(p.wakeAt, now) + (why ? " · " + why : "");
+}
 
 // A background shell that is WAITING (XERK-1570) — a sleep, a CI watch, a poll
 // loop. No kind (an agent, or an older agent) is work. Same as sessions.html.
@@ -1427,11 +1455,15 @@ function render(data) {
   const capHosts = agents.filter(a => a.capacity && typeof a.capacity.maxSessions === "number");
   const maxSessions = capHosts.reduce((t, a) => t + a.capacity.maxSessions, 0);
   const runningValue = capHosts.length ? `${running.length} / ${maxSessions}` : String(running.length);
+  // Paused sleepers (XERK-1575) hold no slot, so they are not in the running
+  // count — said beside it, so a session the hub paused never reads as gone.
+  const pausedCount = agents.reduce((n, a) => n + pausedSleepers(a).length, 0);
 
   $tiles.innerHTML =
     tile("Hosts online", `${online.length} / ${agents.length}`,
          [...new Set(agents.map(a => a.device))].join(", ") || "no devices yet") +
-    tile("Running sessions", runningValue, sess.length + " total") +
+    tile("Running sessions", runningValue,
+         sess.length + " total" + (pausedCount ? ` · ${pausedCount} paused` : "")) +
     tile("Ready for review", String(needs.length), "sessions waiting on you") +
     tile("Tokens today", fmtTokens(fleetTokens("today")), "all sessions, incl. cache" + retiredNote) +
     tile("Tokens this week", fmtTokens(fleetTokens("week")), "last 7 days (UTC)" + retiredNote) +
@@ -1497,15 +1529,20 @@ function hostCard(a, now) {
   const repos = a.repos || [];
   const sessions = a.sessions || [];
   const runCount = sessions.filter(s => s.status === "running").length;
+  const paused = pausedSleepers(a);
+  const pausedNote = paused.length ? ` · ${paused.length} paused` : "";
 
   // Repos from the scan, plus synthetic entries for any session whose repo is no
   // longer present (e.g. repo dir removed) so its usage/controls stay reachable.
+  // A paused sleeper counts too: it resumes into that repo at its wake.
   const repoNames = repos.map(r => r.name);
-  const orphans = [...new Set(sessions.map(s => s.repo))].filter(n => !repoNames.includes(n));
+  const orphans = [...new Set([...sessions, ...paused].map(s => s.repo))]
+    .filter(n => n && !repoNames.includes(n));
   const repoEntries = [...repos, ...orphans.map(n => ({ name: n, missing: true }))];
 
   const reposHtml = repoEntries.length
-    ? repoEntries.map(r => repoBlock(a, r, sessions.filter(s => s.repo === r.name), now)).join("")
+    ? repoEntries.map(r => repoBlock(a, r, sessions.filter(s => s.repo === r.name), now,
+        paused.filter(c => c.repo === r.name))).join("")
     : `<div class="repo-empty">No git repos found under ${esc(a.reposRoot || "the repos root")}.</div>`;
 
   const collapsed = collapsedHosts.has(a.key);
@@ -1515,7 +1552,7 @@ function hostCard(a, now) {
       <span><span class="m-label">Memory</span> <b>${esc(mem)}</b></span>
       <span><span class="m-label">Uptime</span> <b>${esc(uptime(a.startedAt, now))}</b> · last seen ${esc(ago(now - a.lastSeen))}</span>
       <span><span class="m-label">Repos root</span> <span class="path">${esc(a.reposRoot || "–")}</span></span>
-      <span><span class="m-label">Sessions</span> <b>${runCount}</b> running · ${sessions.length} total</span>
+      <span><span class="m-label">Sessions</span> <b>${runCount}</b> running · ${sessions.length} total${pausedNote}</span>
     </div>
     <div class="repos">${cloneBar(a)}${reposHtml}</div>
     ${a.logTail ? `<details class="logs" ${openLogs.has(a.key) ? "open" : ""}
@@ -1529,7 +1566,7 @@ function hostCard(a, now) {
   // When collapsed, surface the session count alongside the name so the row still
   // tells you at a glance how busy the host is without expanding it.
   const collapsedMeta = collapsed
-    ? `<span class="status" style="color:var(--muted);font-size:12px">${runCount} running · ${sessions.length} total</span>`
+    ? `<span class="status" style="color:var(--muted);font-size:12px">${runCount} running · ${sessions.length} total${pausedNote}</span>`
     : "";
 
   // The org whose Jira this host polls, alongside its name — a host with no Jira
@@ -1723,7 +1760,7 @@ function cloneBody(a, sources, hid) {
   </div>`;
 }
 
-function repoBlock(a, repo, sessList, now) {
+function repoBlock(a, repo, sessList, now, pausedList = []) {
   const rkey = a.key + "::" + repo.name;
   const collapsed = collapsedRepos.has(rkey);
   const meta = repo.isRoot
@@ -1743,8 +1780,9 @@ function repoBlock(a, repo, sessList, now) {
     ? `<button class="primary btn-sm" ${spawning ? "disabled" : ""} onclick="event.preventDefault();event.stopPropagation();toggleComposer('${escJs(rkey)}','${escJs(repo.name)}')">${spawning ? '<span class="spin"></span> Starting…' : composerOpen.has(rkey) ? "− New session" : "+ New session"}</button>`
     : "";
   const ghost = spawning ? ghostCard() : "";
-  const body = (sessList.length || spawning)
-    ? `<div class="sess-grid">${ghost}${sessList.map(s => sessCard(a, s, now)).join("")}</div>`
+  const body = (sessList.length || spawning || pausedList.length)
+    ? `<div class="sess-grid">${ghost}${sessList.map(s => sessCard(a, s, now)).join("")}${
+        pausedList.map(c => pausedCard(a, c, now)).join("")}</div>`
     : `<div class="repo-empty">No sessions yet${canSpawn ? " — start one with “+ New session”." : "."}</div>`;
 
   // Resumable prior sessions of this repo — the "Resume any session" picker.
@@ -1753,9 +1791,9 @@ function repoBlock(a, repo, sessList, now) {
   // Turma sessions, repo-dir "terminal" runs, and older ones, not just the last
   // few killed). Fall back to the last-5 killed sessions (closedSessions) for
   // agents that predate repo.resumable.
-  const resumable = Array.isArray(repo.resumable) ? repo.resumable : null;
+  const resumable = Array.isArray(repo.resumable) ? resumablePicks(repo.resumable, pausedList) : null;
   const legacyClosed = resumable ? [] : (a.closedSessions || [])
-    .filter(c => c.repo === repo.name)
+    .filter(c => c.repo === repo.name && !c.paused)
     .sort((x, y) => String(y.closedAt || "").localeCompare(String(x.closedAt || "")))
     .slice(0, 5);
   const resumeCount = resumable ? resumable.length : legacyClosed.length;
@@ -2053,6 +2091,48 @@ function sessCard(a, s, now) {
   </div>`;
 }
 
+// A sleeper the hub paused to free its slot (XERK-1575): ended for now, but the
+// hub resumes it at its wake, so it keeps a card in its repo — reading asleep in
+// the same muted tone as the sleeping label it had while running — instead of
+// vanishing as if killed. Resume now brings it back early; Kill stops it for
+// good (an ordinary killed session in ended history that never wakes), armed and
+// confirmed like a running card's Kill.
+// Its State is the wake alone, no "paused Ns ago" age: it is waiting, not
+// history — the same line the Sessions page's Paused row shows.
+function pausedCard(a, c, now) {
+  const rp = pending.has(pendKey("resume", a.key, c.id));
+  const killing = pending.has(pendKey("kill", a.key, c.id));
+  const kKey = "sk::" + a.key + "::" + c.id;
+  const prs = (c.prs && c.prs.length)
+    ? `<dt>PRs</dt><dd class="pr-list">${c.prs.map(prBadgeHtml).join("")}</dd>` : "";
+  const actions = killing
+    ? `<button class="btn-sm" disabled><span class="spin"></span> Killing…</button>`
+    : `<button class="btn-sm" ${a.online && !rp ? "" : "disabled"}
+        title="${esc(a.online ? "Resume now, before its wake" : "Host offline")}"
+        onclick="resumeSession('${escJs(a.key)}','${escJs(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume now"}</button>` +
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" ${rp ? "disabled" : ""}
+        title="Stop it for good: it will not wake"
+        onclick="pausedKill('${escJs(a.key)}','${escJs(c.id)}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
+  return `<div class="sess paused${killing ? " killing" : ""}">
+    <div class="sess-hd">
+      <span class="sid">${esc(c.id)}</span>
+      ${c.summary ? `<span class="sess-summary">${esc(c.summary)}</span>` : ""}
+      ${c.label ? `<span class="sess-label" title="session label">${esc(c.label)}</span>` : ""}
+      ${killing
+        ? `<span class="badge stopping"><span class="spin"></span> stopping</span>`
+        : `<span class="badge paused">paused</span>`}
+    </div>
+    <dl>
+      ${c.root
+        ? `<dt>Location</dt><dd><b>repos root (no worktree)</b></dd>`
+        : `<dt>Worktree</dt><dd><b>${esc(worktreeName(c))}</b></dd>`}
+      <dt>State</dt><dd><b class="sess-holding">${esc(pausedLabel(c.paused, now))}</b></dd>
+      ${prs}
+    </dl>
+    <div class="sess-actions">${actions}</div>
+  </div>`;
+}
+
 // ---- actions → endpoints ---------------------------------------------------
 function enc(s) { return encodeURIComponent(s); }
 // The page's failures all go through the chrome's one toast (XERK-264), so a
@@ -2316,6 +2396,14 @@ function sessRestart(key, id) {
 }
 function sessKill(key, id) {
   twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill")));
+}
+// Kill a paused sleeper (XERK-1575): the same route and arm/confirm as a running
+// card's Kill. The agent drops the pause, so it ends as an ordinary killed session
+// that never wakes; the pending row clears once the host stops reporting it paused.
+function pausedKill(key, id) {
+  twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id),
+    { kind: "kill", paused: true, host: key, id },
     () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill")));
 }
 function sessDelete(key, id) {

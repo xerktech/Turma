@@ -10057,9 +10057,18 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
             self.assertTrue(sm.handle_commands([{
                 "cmdId": "e1", "type": "exportSession",
                 "sessionId": "s", "migrationId": "mig1"}]))
-        self.assertEqual(started["target"], sm.export_session)
+        # The thread runs export_session through a wrapper that clears the
+        # in-flight export mark however it ends (XERK-1575).
+        self.assertEqual(started["target"], sm._export_session_tracked)
         self.assertEqual(started["args"], ("s", "mig1"))
         self.assertTrue(started["started"])
+        self.assertTrue(sm._export_running("s"))
+        ran = []
+        with mock.patch.object(sm, "export_session",
+                               side_effect=lambda *a: ran.append(a)):
+            started["target"](*started["args"])
+        self.assertEqual(ran, [("s", "mig1")])
+        self.assertFalse(sm._export_running("s"))
         self.assertEqual(sm.acked, {"e1"})           # acked regardless
         self.assertEqual(sm.spawn_failures, [])      # nothing refused inline
 
@@ -17555,6 +17564,795 @@ class TestWakeRequest(ManagerMixin, unittest.TestCase):
         self.assertIsNone(ha.read_wake_request(self.SID)["wakeReason"])
 
 
+class TestSleeperSlot(ManagerMixin, unittest.TestCase):
+    """XERK-1575: slot policy v2. On the hub's `pauseSleeper` a QUIET sleeping
+    session is killed through the clean, resumable kill path with its wake kept
+    on the closed record (exempt from the closed-history cap); a resume carries
+    the wake back, and the wake text is staged only once the resumed pane reads
+    an idle composer."""
+
+    NOW = 1_786_400_000_000
+
+    def setUp(self):
+        super().setUp()
+        for name, value in [("REPOS_ROOT", self.tmp)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ha, "scan_repos", lambda: [])
+        p.start()
+        self.addCleanup(p.stop)
+        self.proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.tmp))
+        os.makedirs(self.proj, exist_ok=True)
+
+    def _sleeper(self, sm, ahead_ms=3600_000, reason="check CI on PR #412"):
+        sm.spawn(ha.ROOT_REPO_NAME)
+        sess = sm.registry[-1]
+        # A real conversation, so the resume rejoins it with --resume.
+        path = os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl")
+        write_jsonl(path, [{"type": "user", "uuid": "u1",
+                            "message": {"role": "user", "content": "work"}}])
+        sess["wakeAt"] = self.NOW + ahead_ms
+        sess["wakeReason"] = reason
+        sm._note_quiet(sess["id"], {"paneBusy": False, "panePrompt": None,
+                                    "question": None, "agents": [], "loop": None})
+        return sess
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        # The lifecycle worker's jobs stay queued until `_settle` runs them, so a
+        # test sees the beat half and the worker half apart.
+        sm._start_sleeper_worker = lambda: None
+        return sm
+
+    @staticmethod
+    def _settle(sm):
+        while sm._run_sleeper_job():
+            pass
+
+    def _tmux_kills(self, sess):
+        return [c for c in self.run_calls
+                if "kill-session" in c and "=" + sess["tmuxName"] in c]
+
+    def test_the_pause_tears_the_tmux_down_off_the_beat(self):
+        # XERK-395: the beat drops the record (the slot is free on this beat's
+        # report) and the tmux kill runs on the lifecycle worker.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        proc = mock.Mock(pid=4242)
+        sm.ttyd[sid] = proc
+        self.run_calls.clear()
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self.assertIsNone(sm._find(sid))
+        self.assertEqual(self._tmux_kills(sess), [], "no tmux kill on the beat")
+        proc.terminate.assert_not_called()
+        self.assertNotIn(sid, sm.ttyd)
+        # Mid-teardown, relaunching `agent-<id>` would race the kill: refused, and
+        # said so; a resume-any of its conversation too.
+        sm.resume(sid, cmd_id="r1")
+        sm.resume_transcript(sess["claudeSessionId"], self.tmp, cmd_id="r2")
+        self.assertIsNone(sm._find(sid))
+        self.assertEqual(len(sm.registry), 0)
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["r1", "r2"])
+        self.assertIn("torn down", sm.spawn_failures[0]["error"])
+        self._settle(sm)
+        self.assertEqual(len(self._tmux_kills(sess)), 1)
+        proc.terminate.assert_called_once()
+        self.assertIsNone(sm._sleeper_busy_kind(sid))
+        sm.resume(sid, cmd_id="r3")
+        self.assertEqual(sm._find(sid)["status"], "running")
+
+    def test_the_real_worker_thread_runs_the_teardown(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        sess = self._sleeper(sm)
+        self.run_calls.clear()
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        deadline = time.time() + 10
+        while sm._sleeper_busy_kind(sess["id"]) and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertIsNone(sm._sleeper_busy_kind(sess["id"]))
+        self.assertEqual(len(self._tmux_kills(sess)), 1)
+        self.assertEqual(sm._sleeper_worker.name, "sleeper-lifecycle")
+
+    def test_a_failed_worker_start_is_re_armed_by_the_next_beat(self):
+        # pids_limit (XERK-402): the first Thread.start() raises. The teardown
+        # stays queued and the next beat's apply re-arms the worker, so no tmux
+        # is stranded in a slot the agent reports free.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        sess = self._sleeper(sm)
+        self.run_calls.clear()
+        real_start = threading.Thread.start
+        with mock.patch.object(threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        self.assertEqual(len(sm._sleeper_jobs), 1, "the job waits, not lost")
+        self.assertEqual(self._tmux_kills(sess), [])
+        self.assertIs(threading.Thread.start, real_start)
+        sm._apply_sleeper_landed()
+        deadline = time.time() + 10
+        while sm._sleeper_busy_kind(sess["id"]) and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertIsNone(sm._sleeper_busy_kind(sess["id"]))
+        self.assertEqual(len(self._tmux_kills(sess)), 1)
+
+    def test_a_wake_resume_re_adds_a_vanished_worktree_off_the_beat(self):
+        # A prune swept the paused sleeper's worktree: the `git worktree add`
+        # runs on the worker, the slot stays reserved meanwhile, and the beat
+        # finishes the resume once it lands.
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "repos", "r", ".wt-gone")
+        sm.closed.append({"id": "z1", "repo": "r",
+                          "repoPath": os.path.join(self.tmp, "repos"),
+                          "worktreePath": wt, "claudeSessionId": None,
+                          "tmuxName": "agent-z1",
+                          "paused": {"wakeAt": self.NOW, "wakeReason": "ci"}})
+        used = sm._slots_used()
+        self.run_ok_calls.clear()
+        sm.resume("z1", cmd_id="w1")
+        self.assertIsNone(sm._find("z1"))
+        self.assertFalse([c for c in self.run_ok_calls if "worktree" in c])
+        self.assertEqual(sm._slots_used(), used + 1, "the sleeper's slot is held")
+        self.assertIn(wt, sm._live_worktree_paths(), "no prune takes it meanwhile")
+        sm.resume("z1", cmd_id="w1b")    # a duplicate: ignored, not refused
+        self.assertEqual(sm.spawn_failures, [])
+
+        def add(sess, base_ref=None):
+            os.makedirs(sess["worktreePath"], exist_ok=True)
+        with mock.patch.object(sm, "_worktree_add", side_effect=add) as wadd:
+            self._settle(sm)
+        wadd.assert_called_once()
+        self.assertIsNone(sm._find("z1"), "the worker never registers it")
+        with mock.patch.object(ha.time, "time", return_value=(self.NOW + 1000) / 1000):
+            sm._apply_sleeper_landed()
+        self.assertEqual(sm._find("z1")["status"], "running")
+        self.assertEqual(sm._slots_used(), used + 1, "now held by the session itself")
+        self.assertNotIn("z1", [c["id"] for c in sm.closed])
+        self.assertEqual(sm._sleeper_restoring, {})
+
+    def test_a_re_added_worktree_relaunches_on_a_full_beat_only(self):
+        # The restore-path wake was acked when it was staged, so the hub may hand
+        # this host another launch; that runs inline right before the LIGHT
+        # follow-up beat. The landed relaunch waits for the next full beat so the
+        # two never share one heartbeat gap (XERK-395).
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "repos", "r", ".wt-light")
+        sm.closed.append({"id": "z4", "repo": "r",
+                          "repoPath": os.path.join(self.tmp, "repos"),
+                          "worktreePath": wt, "claudeSessionId": None,
+                          "tmuxName": "agent-z4",
+                          "paused": {"wakeAt": self.NOW, "wakeReason": "ci"}})
+        used = sm._slots_used()
+        sm.resume("z4", cmd_id="w4")
+
+        def add(sess, base_ref=None):
+            os.makedirs(sess["worktreePath"], exist_ok=True)
+        with mock.patch.object(sm, "_worktree_add", side_effect=add):
+            self._settle(sm)
+        with mock.patch.object(ha.time, "time", return_value=(self.NOW + 1000) / 1000):
+            sm._apply_sleeper_landed(light=True)
+            self.assertIsNone(sm._find("z4"), "no relaunch on a light beat")
+            self.assertEqual(sm._slots_used(), used + 1, "its slot stays reserved")
+            self.assertIn(wt, sm._live_worktree_paths())
+            sm._apply_sleeper_landed()
+        self.assertEqual(sm._find("z4")["status"], "running")
+        self.assertEqual(sm._sleeper_restoring, {})
+
+    def test_a_failed_worktree_re_add_leaves_an_ordinary_killed_record(self):
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "repos", "r", ".wt-gone")
+        rec = {"id": "z2", "repo": "r", "repoPath": os.path.join(self.tmp, "repos"),
+               "worktreePath": wt, "paused": {"wakeAt": self.NOW}}
+        sm.closed.append(rec)
+        sm.resume("z2", cmd_id="w2")
+        with mock.patch.object(sm, "_worktree_add",
+                               side_effect=RuntimeError("git worktree add failed: x")):
+            self._settle(sm)
+        sm._apply_sleeper_landed()
+        self.assertIsNone(sm._find("z2"))
+        self.assertNotIn("paused", rec, "never woken again; Resume brings it back")
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["w2"])
+        self.assertIn("could not restore its worktree", sm.spawn_failures[0]["error"])
+        self.assertEqual(sm._slots_used(), 0)
+
+    def test_a_kill_during_the_worktree_re_add_is_not_undone(self):
+        # The operator's Kill unpauses the record while the worker re-adds its
+        # worktree; the landed resume then leaves it killed. A Delete keeps the
+        # worktree the worker is adding rather than racing it.
+        for stop in ("kill", "delete"):
+            with self.subTest(stop):
+                sm = self._manager()
+                wt = os.path.join(self.tmp, "repos", "r", f".wt-{stop}")
+                rec = {"id": "z3", "repo": "r",
+                       "repoPath": os.path.join(self.tmp, "repos"),
+                       "worktreePath": wt, "paused": {"wakeAt": self.NOW}}
+                sm.closed.append(rec)
+                sm.resume("z3", cmd_id="w3")
+                os.makedirs(wt, exist_ok=True)   # the worker's add, half done
+                with mock.patch.object(sm, "_worktree_remove") as rm:
+                    getattr(sm, stop)("z3")
+                rm.assert_not_called()
+                with mock.patch.object(sm, "_worktree_add"):
+                    self._settle(sm)
+                sm._apply_sleeper_landed()
+                self.assertIsNone(sm._find("z3"))
+                self.assertEqual(sm._slots_used(), 0)
+
+    def test_a_dropped_message_to_a_paused_sleeper_is_logged(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sm.pause_sleeper(sess["id"], now_ms=self.NOW)
+        with mock.patch.object(ha, "log") as log:
+            sm.send_input(sess["id"], "hello")
+        self.assertIn("paused as a sleeper", log.call_args[0][0])
+
+    def test_a_quiet_sleeper_is_paused_with_its_wake_on_the_closed_record(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self.assertIsNone(sm._find(sid), "the slot is free: the record is gone")
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertEqual(rec["paused"], {"wakeAt": self.NOW + 3600_000,
+                                         "wakeReason": "check CI on PR #412",
+                                         "pausedAt": self.NOW})
+        # Served on the closed channel, so the hub shows it asleep, not ended.
+        wire = next(c for c in sm._closed_payload() if c["id"] == sid)
+        self.assertEqual(wire["paused"], {"wakeAt": self.NOW + 3600_000,
+                                          "wakeReason": "check CI on PR #412",
+                                          "at": self.NOW})
+        # A plain kill carries no pause.
+        self.assertIsNone(ha._paused_wire(None))
+        self.assertIsNone(ha._paused_wire({"wakeAt": True}))
+
+    def test_only_a_quiet_sleeper_at_least_ten_minutes_out_is_paused(self):
+        cases = {
+            "wake too soon": lambda sm, s: s.__setitem__("wakeAt", self.NOW + 9 * 60_000),
+            "not sleeping": lambda sm, s: s.pop("wakeAt"),
+            "busy pane": lambda sm, s: sm._note_quiet(s["id"], {"paneBusy": True}),
+            "can't tell": lambda sm, s: sm._note_quiet(s["id"], {"paneBusy": None}),
+            "dialog": lambda sm, s: sm._note_quiet(
+                s["id"], {"paneBusy": False, "panePrompt": {"prompt": "Proceed?"}}),
+            "question": lambda sm, s: sm._note_quiet(
+                s["id"], {"paneBusy": False, "question": "Which one?"}),
+            "background work": lambda sm, s: sm._note_quiet(
+                s["id"], {"paneBusy": False, "agents": [{"type": "shell", "label": "x"}]}),
+            "looping": lambda sm, s: sm._note_quiet(
+                s["id"], {"paneBusy": False, "loop": {"repeats": 4, "tool": "Bash"}}),
+            "no signals yet": lambda sm, s: sm._quiet.pop(s["id"]),
+            "stopped": lambda sm, s: s.__setitem__("status", "error"),
+        }
+        for name, spoil in cases.items():
+            with self.subTest(name):
+                sm = self._manager()
+                sess = self._sleeper(sm)
+                spoil(sm, sess)
+                self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+                self.assertIs(sm._find(sess["id"]), sess)
+                self.assertEqual(sm.closed, [])
+
+    def test_the_off_switch_refuses_the_pause(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        with mock.patch.object(ha, "PAUSE_SLEEPERS", False):
+            self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        self.assertIs(sm._find(sess["id"]), sess)
+
+    def test_a_live_shell_read_off_the_transcript_refuses_the_pause(self):
+        # The quiet read comes off the REAL beat signals: a background shell the
+        # back-scan reports live keeps the session out of a pause.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        path = os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)), \
+                mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            sm._session_payload(sess, refresh=False)
+        self.assertEqual(sm._quiet[sess["id"]], (True, False))
+        self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        # The same session with that shell finished pauses.
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                                           "<status>completed</status>\n</task-notification>"}) + "\n")
+        with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)), \
+                mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            sm._session_payload(sess, refresh=False)
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+
+    def test_the_command_path_pauses(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        with mock.patch.object(ha.time, "time", return_value=self.NOW / 1000):
+            sm.handle_commands([{"cmdId": "p1", "type": "pauseSleeper",
+                                 "sessionId": sess["id"]}])
+        self.assertIsNone(sm._find(sess["id"]))
+        self.assertIn("p1", sm.acked)
+
+    def test_an_operator_message_in_the_same_batch_keeps_the_session(self):
+        # Either order: the input staged first (the queue check), or the pause
+        # ahead of it in the list (the batch pre-scan). Killing would drop it.
+        for order in ("input-first", "pause-first"):
+            with self.subTest(order):
+                sm = self._manager()
+                sess = self._sleeper(sm)
+                inp = {"cmdId": "i1", "type": "input", "sessionId": sess["id"],
+                       "text": "are you there?"}
+                pause = {"cmdId": "p1", "type": "pauseSleeper", "sessionId": sess["id"]}
+                cmds = [inp, pause] if order == "input-first" else [pause, inp]
+                with mock.patch.object(ha.time, "time", return_value=self.NOW / 1000):
+                    sm.handle_commands(cmds)
+                self.assertIs(sm._find(sess["id"]), sess)
+                self.assertEqual(sm.closed, [])
+                self.assertEqual(sm.input_queue, [(sess["id"], "are you there?", None)])
+                self.assertEqual({"i1", "p1"} & set(sm.acked), {"i1", "p1"})
+
+    def test_a_running_export_refuses_the_pause(self):
+        # A sleeper mid-move: pausing it would leave a paused record here, later
+        # woken while the moved copy runs on the target (two claudes on one
+        # conversation). The refusal lasts exactly as long as the export thread.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        started, release = threading.Event(), threading.Event()
+
+        def slow_export(session_id, migration_id):
+            started.set()
+            release.wait(10)
+        sm.export_session = slow_export
+        sm._export_session_async(sid, "mig1")
+        self.assertTrue(started.wait(5))
+        self.assertTrue(sm._export_running(sid))
+        self.assertFalse(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self.assertIs(sm._find(sid), sess)
+        self.assertEqual(sm.closed, [])
+        release.set()
+        for t in [t for t in threading.enumerate() if t.name == "migration-export"]:
+            t.join(5)
+        self.assertFalse(sm._export_running(sid))
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+
+    def test_a_move_in_the_same_batch_keeps_the_session(self):
+        # Either order: the export marked first, or the pause ahead of it.
+        for order in ("export-first", "pause-first"):
+            with self.subTest(order):
+                sm = self._manager()
+                sess = self._sleeper(sm)
+                exported = []
+                sm._export_session_async = lambda sid, mid: exported.append(sid)
+                exp = {"cmdId": "e1", "type": "exportSession", "sessionId": sess["id"],
+                       "migrationId": "mig1"}
+                pause = {"cmdId": "p1", "type": "pauseSleeper", "sessionId": sess["id"]}
+                cmds = [exp, pause] if order == "export-first" else [pause, exp]
+                with mock.patch.object(ha.time, "time", return_value=self.NOW / 1000):
+                    sm.handle_commands(cmds)
+                self.assertIs(sm._find(sess["id"]), sess)
+                self.assertEqual(sm.closed, [])
+                self.assertEqual(exported, [sess["id"]])
+
+    def test_an_operator_kill_or_delete_in_the_same_batch_wins(self):
+        # The pause ahead of the operator's Kill/Delete in one batch: run first,
+        # it moved the session to a paused closed record, the Kill then logged
+        # "no such session", and the hub woke the record at its wake. Either
+        # order, the operator's command is what happens.
+        for op in ("kill", "delete"):
+            for order in ("pause-first", "op-first"):
+                with self.subTest(op=op, order=order):
+                    sm = self._manager()
+                    sm.closed = []   # the subtests share one registry dir
+                    sess = self._sleeper(sm)
+                    sid = sess["id"]
+                    pause = {"cmdId": "p1", "type": "pauseSleeper", "sessionId": sid}
+                    stop = {"cmdId": "k1", "type": op, "sessionId": sid}
+                    cmds = [pause, stop] if order == "pause-first" else [stop, pause]
+                    with mock.patch.object(ha.time, "time", return_value=self.NOW / 1000):
+                        sm.handle_commands(cmds)
+                    self.assertIsNone(sm._find(sid))
+                    self.assertFalse(any(c.get("paused") for c in sm.closed),
+                                     "nothing is left to wake")
+                    if op == "kill":
+                        self.assertEqual([c["id"] for c in sm.closed], [sid])
+                    else:
+                        self.assertEqual(sm.closed, [])
+                    self.assertEqual({"p1", "k1"} & set(sm.acked), {"p1", "k1"})
+
+    def test_a_kill_after_the_pause_landed_stops_the_wake(self):
+        # The pause ran on an earlier beat; the operator's Kill of the paused card
+        # reaches the closed record and leaves an ordinary killed session.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        sm.handle_commands([{"cmdId": "k1", "type": "kill", "sessionId": sid}])
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertNotIn("paused", rec)
+        self.assertIsNone(next(c for c in sm._closed_payload() if c["id"] == sid)["paused"])
+        # An ordinary killed record: a second kill is the old no-op.
+        sm.kill(sid)
+        self.assertEqual([c["id"] for c in sm.closed], [sid])
+
+    def test_a_delete_after_the_pause_landed_drops_the_record(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        sm.handle_commands([{"cmdId": "d1", "type": "delete", "sessionId": sid}])
+        self.assertEqual(sm.closed, [])
+        # An ordinary killed record is still left alone by delete (no session).
+        sm.closed.append({"id": "plain", "repo": "r"})
+        sm.delete("plain")
+        self.assertEqual([c["id"] for c in sm.closed], ["plain"])
+
+    def test_deleting_a_paused_record_removes_its_worktree_unless_one_runs_there(self):
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "wt-a")
+        os.makedirs(wt)
+        removed = []
+        sm._worktree_remove = lambda rec: removed.append(rec["worktreePath"])
+        rec = {"id": "s1", "repo": "r", "repoPath": self.tmp, "worktreePath": wt,
+               "paused": {"wakeAt": self.NOW + 3600_000}}
+        sm.closed = [dict(rec)]
+        sm.delete("s1")
+        self.assertEqual(removed, [wt])
+        self.assertEqual(sm.closed, [])
+        # The Resume picker brought the conversation back under a new id, in the
+        # same worktree: the record goes, the worktree stays.
+        removed.clear()
+        sm.closed = [dict(rec)]
+        sm.registry.append({"id": "s2", "status": "running", "worktreePath": wt})
+        sm.delete("s1")
+        self.assertEqual(removed, [])
+        self.assertEqual(sm.closed, [])
+
+    def test_a_kill_or_delete_of_a_paused_record_kills_a_tmux_left_behind(self):
+        # A manager restart between the pause and its worker loses the in-memory
+        # teardown, leaving an idle claude no record owns. The operator's Kill or
+        # Delete of the paused card re-runs the tmux kill, on the worker.
+        for op in ("kill", "delete"):
+            with self.subTest(op=op):
+                sm = self._manager()
+                sm.closed = []   # the subtests share one registry dir
+                sess = self._sleeper(sm)
+                sid = sess["id"]
+                self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+                with sm._sleeper_lock:     # the restart: the staged job is gone
+                    sm._sleeper_jobs.clear()
+                    sm._sleeper_busy.clear()
+                self.run_calls.clear()
+                getattr(sm, op)(sid)
+                self.assertEqual(self._tmux_kills(sess), [], "not on the beat")
+                self._settle(sm)
+                self.assertEqual(len(self._tmux_kills(sess)), 1)
+                self.assertIsNone(sm._sleeper_busy_kind(sid))
+
+    def test_a_kill_during_the_pause_teardown_stages_no_second_one(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        sm.kill(sid)
+        self.assertEqual(len(sm._sleeper_jobs), 1)
+        self.run_calls.clear()
+        self._settle(sm)
+        self.assertEqual(len(self._tmux_kills(sess)), 1)
+
+    def test_a_windows_teardown_never_signals_the_persisted_pid(self):
+        # The pty-host _kill_tmux tears down IS the terminal there; signalling
+        # its persisted pid afterwards could hit a reused pid (_kill_ttyd's rule).
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sess["ttydPid"] = 4242
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+                mock.patch.object(ha, "_pty_teardown", return_value=True) as td, \
+                mock.patch.object(ha.os, "kill") as kill:
+            self._settle(sm)
+        td.assert_called_once_with(sess["tmuxName"])
+        kill.assert_not_called()
+
+    def test_a_review_comment_posted_while_paused_is_delivered_after_the_wake(self):
+        # A pause is not the session's end: its PR links and their seen-comment
+        # baseline ride the paused record, so a comment that arrived while it
+        # slept is NEW on the first delivery pass after the resume, never folded
+        # silently into a fresh baseline as history.
+        url = "https://github.com/o/r/pull/412"
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.session_pr_urls[sid] = [url]
+        sess["prCommentBase"] = {url: ["c1", "c2"]}
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self._settle(sm)
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertEqual(rec["prCommentBase"], {url: ["c1", "c2"]})
+        self.assertNotIn(sid, sm.session_pr_urls)
+        due = self.NOW + 3600_000
+        with mock.patch.object(ha.time, "time", return_value=due / 1000):
+            sm.resume(sid)
+        self.assertEqual(sm._find(sid)["status"], "running")
+        self.assertEqual(sm.session_pr_urls.get(sid), [url])
+        notes = []
+        sm.notify_session = lambda s, msg, *a, **k: notes.append((s, msg))
+
+        def ev(key, body):
+            return {"key": key, "is_self": False, "author": "rev",
+                    "kind": "comment", "body": body}
+        sm._pr_comments_fetched = {sid: {url: [
+            ev("c1", "seen before"), ev("c2", "seen before"),
+            ev("c3", "please fix the flaky test")]}}
+        sm._deliver_pr_comments()
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0][0], sid)
+        self.assertIn("please fix the flaky test", notes[0][1])
+        self.assertNotIn("seen before", notes[0][1])
+        # An ordinary kill keeps no baseline: what it missed is history.
+        sm.kill(sid)
+        self.assertNotIn("prCommentBase", next(c for c in sm.closed if c["id"] == sid))
+
+    def test_a_failed_export_thread_start_clears_the_mark(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        with mock.patch.object(ha.threading, "Thread", side_effect=RuntimeError("pids")):
+            sm._export_session_async(sess["id"], "mig1")
+        self.assertFalse(sm._export_running(sess["id"]))
+
+    def test_an_undelivered_message_refuses_the_pause(self):
+        cases = {
+            "queued": lambda sm, sid: sm._stage_input(sid, "hi"),
+            "being typed": lambda sm, sid: setattr(sm, "input_inflight", [sid]),
+            "landed, not recorded": lambda sm, sid: sm.input_landed.append((sid, "hi", "hi")),
+            "outbox": lambda sm, sid: sm._find(sid).__setitem__(
+                "pendingInputs", [{"text": "hi", "sentAt": 1}]),
+        }
+        for name, stage in cases.items():
+            with self.subTest(name):
+                sm = self._manager()
+                sess = self._sleeper(sm)
+                stage(sm, sess["id"])
+                self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+                self.assertIs(sm._find(sess["id"]), sess)
+        # Another session's message does not hold this one.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sm._stage_input("someone-else", "hi")
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+
+    def test_a_fresh_inbox_message_refuses_the_pause(self):
+        # notify_session's inbox post is on no outbox: a pause in the beat that
+        # read the pane idle just before the message's turn began would lose it.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        with mock.patch.object(ha, "_session_inbox", lambda cs: ("/s.sock", 42, cs)), \
+                mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
+                mock.patch.object(ha, "_post_to_inbox", lambda *a: True):
+            self.assertTrue(sm.notify_session(sess["id"], "new review comment"))
+        self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        self.assertIs(sm._find(sess["id"]), sess)
+        # Two beats on, the quiet read postdates the message: it pauses.
+        sm._inbox_posted[sess["id"]] -= 2 * ha.INTERVAL + 1
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        self.assertNotIn(sess["id"], sm._inbox_posted)
+
+    def test_the_worker_clears_its_in_flight_mark(self):
+        sm = self._manager()
+        seen = []
+        sm.send_input = lambda sid, *a, **k: seen.append(list(sm.input_inflight))
+        sm._stage_input("s1", "hi")
+        sm._deliver_staged_inputs()
+        self.assertEqual(seen, [["s1"]])
+        self.assertEqual(sm.input_inflight, [])
+
+    def test_a_new_wake_drops_the_resume_gate_of_the_carried_one(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sess["wakeResumedAt"] = self.NOW
+        sm._ingest_wake_request(sess, {"wakeAt": self.NOW + 7200_000, "wakeReason": "new"})
+        self.assertNotIn("wakeResumedAt", sess)
+        self.assertEqual((sess["wakeAt"], sess["wakeReason"]), (self.NOW + 7200_000, "new"))
+
+    def test_a_paused_record_survives_the_closed_history_cap(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        for i in range(ha.CLOSED_PER_REPO + 2):
+            sm._remember_closed({"id": f"k{i}", "repo": sess["repo"],
+                                 "worktreePath": os.path.join(self.tmp, f"wt{i}")})
+        ids = [c["id"] for c in sm.closed]
+        self.assertIn(sid, ids, "a paused sleeper must never be evicted")
+        self.assertEqual(len([i for i in ids if i != sid]), ha.CLOSED_PER_REPO)
+        # ...and a prune that removed its worktree keeps it too: the resume
+        # re-adds the worktree, and dropping the record loses the wake.
+        with sm._prune_lock:
+            sm._prune_swept = [sm.closed[0]["worktreePath"], sess["worktreePath"]]
+        sm._poll_prunes()
+        self.assertIn(sid, [c["id"] for c in sm.closed])
+
+    def test_a_resume_carries_the_wake_and_stages_it_once_the_pane_is_quiet(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        self._settle(sm)
+        due = self.NOW + 3600_000
+        with mock.patch.object(ha.time, "time", return_value=due / 1000):
+            sm.resume(sid)
+        back = sm._find(sid)
+        self.assertEqual(back["status"], "running")
+        self.assertEqual((back["wakeAt"], back["wakeReason"], back["wakeResumedAt"]),
+                         (due, "check CI on PR #412", due))
+        launch = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertIn(f"--resume {sess['claudeSessionId']}", launch)
+        self.assertNotIn("Wake-up", launch, "the prompt arg is off until verified")
+        self.assertEqual(sm.closed, [])
+        # Not typed into a pane still coming up, nor one the last beat could not
+        # read as an idle composer.
+        sm._deliver_due_wakes(now_ms=due + 1000)
+        sm._note_quiet(sid, {"paneBusy": True})
+        sm._deliver_due_wakes(now_ms=due + ha.WAKE_RESUME_SETTLE_MS)
+        self.assertEqual(sm.input_queue, [])
+        sm._note_quiet(sid, {"paneBusy": False})
+        sm._deliver_due_wakes(now_ms=due + ha.WAKE_RESUME_SETTLE_MS)
+        self.assertEqual(sm.input_queue, [
+            (sid, "Wake-up: check CI on PR #412. Check it and continue.", None)])
+        self.assertNotIn("wakeAt", back)
+        self.assertNotIn("wakeResumedAt", back)
+        sm._deliver_due_wakes(now_ms=due + 60_000)
+        self.assertEqual(len(sm.input_queue), 1, "delivered once")
+
+    def test_with_the_prompt_arg_on_a_due_wake_rides_the_resume_launch(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        self._settle(sm)
+        due = self.NOW + 3600_000
+        with mock.patch.object(ha, "RESUME_WAKE_PROMPT_ARG", True), \
+                mock.patch.object(ha.time, "time", return_value=due / 1000):
+            sm.resume(sid)
+        launch = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertIn(f"--resume {sess['claudeSessionId']}", launch)
+        self.assertIn("-- 'Wake-up: check CI on PR #412. Check it and continue.'", launch)
+        self.assertNotIn("wakeAt", sm._find(sid), "never delivered twice")
+
+    def test_the_prompt_arg_never_carries_a_wake_for_a_runtime_that_drops_it(self):
+        # qwen/dsh drop a launch prompt on resume, so their due wake goes back on
+        # the record and is staged through input, exactly as with the arg off.
+        sm = self._manager()
+        due = self.NOW + 3600_000
+        paused = {"wakeAt": self.NOW, "wakeReason": "check CI"}
+        for runtime in ("qwen", "dsh"):
+            sess = {"id": "x", "agentType": runtime}
+            with mock.patch.object(ha, "RESUME_WAKE_PROMPT_ARG", True):
+                self.assertIsNone(sm._carry_paused_wake(sess, paused, now_ms=due))
+            self.assertEqual((sess["wakeAt"], sess["wakeReason"], sess["wakeResumedAt"]),
+                             (self.NOW, "check CI", due))
+        with mock.patch.object(ha, "RESUME_WAKE_PROMPT_ARG", True):
+            self.assertEqual(sm._carry_paused_wake({"id": "y", "agentType": "claude"},
+                                                   paused, now_ms=due),
+                             "Wake-up: check CI. Check it and continue.")
+
+    def test_an_early_operator_resume_sleeps_again(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        self._settle(sm)
+        with mock.patch.object(ha.time, "time", return_value=(self.NOW + 60_000) / 1000):
+            sm.resume(sid)
+        back = sm._find(sid)
+        self.assertEqual(back["wakeAt"], self.NOW + 3600_000)
+        sm._note_quiet(sid, {"paneBusy": False})
+        sm._deliver_due_wakes(now_ms=self.NOW + 120_000)
+        self.assertEqual(sm.input_queue, [], "still asleep until its wake")
+        # The operator chose to look at it: never paused again ahead of that wake,
+        # even by a hub that restarted and forgot its own in-memory hold.
+        sm._note_quiet(sid, {"paneBusy": False, "agents": [], "loop": None})
+        self.assertFalse(sm.pause_sleeper(sid, now_ms=self.NOW + 180_000))
+        self.assertIs(sm._find(sid), back)
+        # A wake it asks for itself is an ordinary sleep again: pausable.
+        sm._ingest_wake_request(back, {"wakeAt": self.NOW + 7200_000, "wakeReason": "new"})
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW + 180_000))
+
+    def test_a_resumed_sleeper_does_not_read_its_finished_shell_as_live(self):
+        # The post-resume back-scan starts from a fresh scan state and re-reads the
+        # whole transcript: a background shell that finished before the pause must
+        # come back finished, not as live work that would hold the session busy.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        path = os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES + [
+            {"type": "queue-operation", "operation": "enqueue",
+             "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                        "<status>completed</status>\n</task-notification>"}])
+        def probe(rec):
+            with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)), \
+                    mock.patch.object(sm, "_session_git", return_value=({}, {})):
+                return sm._session_payload(rec, refresh=False)
+        probe(sess)
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self._settle(sm)
+        due = self.NOW + 3600_000
+        with mock.patch.object(ha.time, "time", return_value=due / 1000):
+            sm.resume(sid)
+        back = sm._find(sid)
+        self.assertEqual(back["status"], "running")
+        first = probe(back)
+        self.assertEqual(first["session"]["agents"], [])
+        self.assertEqual(sm._quiet[sid], (True, True))
+
+    def test_a_picker_resume_unpauses_and_a_later_wake_is_refused(self):
+        # The Resume picker resumes by TRANSCRIPT (a new session id) and leaves
+        # the paused record behind; the hub's wake of that record must not start
+        # a second claude on the same conversation.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid, tid = sess["id"], sess["claudeSessionId"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        self._settle(sm)
+        sm.resume_transcript(tid, self.tmp, cmd_id="rt1")
+        back = sm.registry[-1]
+        self.assertNotEqual(back["id"], sid)
+        self.assertEqual(back["claudeSessionId"], tid)
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertNotIn("paused", rec, "its conversation runs again: no wake")
+        rec["paused"] = {"wakeAt": self.NOW}   # a wake the hub sent first
+        launches = len([c for c in self.run_ok_calls if "new-session" in c])
+        sm.resume(sid, cmd_id="w1")
+        self.assertIsNone(sm._find(sid))
+        self.assertEqual(len([c for c in self.run_ok_calls if "new-session" in c]), launches)
+        self.assertNotIn("paused", rec)
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["w1"])
+        self.assertIn("already running", sm.spawn_failures[0]["error"])
+
+    def test_a_resume_into_a_worktree_a_session_runs_in_is_refused(self):
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "wt-busy")
+        sm.registry.append({"id": "live1", "status": "running", "repo": "r",
+                            "worktreePath": wt + "/"})
+        sm.closed.append({"id": "old1", "repo": "r", "worktreePath": wt,
+                          "claudeSessionId": "other", "paused": {"wakeAt": self.NOW}})
+        # A ROOT record shares REPOS_ROOT with every root session: only its
+        # transcript ties it, so a running root session does not block it.
+        sm.registry.append({"id": "live2", "status": "running", "repo": "r",
+                            "root": True, "worktreePath": self.tmp})
+        sm.resume("old1", cmd_id="w2")
+        self.assertIsNone(sm._find("old1"))
+        self.assertNotIn("paused", sm.closed[-1])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["w2"])
+        root_rec = {"id": "r1", "root": True, "worktreePath": self.tmp,
+                    "claudeSessionId": "t-r1"}
+        self.assertIsNone(sm._conversation_holder(root_rec))
+        sm.registry[-1]["claudeSessionId"] = "t-r1"
+        self.assertEqual(sm._conversation_holder(root_rec)["id"], "live2")
+
+    def test_the_unpause_command_leaves_an_ordinary_ended_session(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        sm.handle_commands([{"cmdId": "u1", "type": "unpauseSleeper", "sessionId": sid}])
+        self.assertIn("u1", sm.acked)
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertNotIn("paused", rec)
+        self.assertIsNone(next(c for c in sm._closed_payload() if c["id"] == sid)["paused"])
+        self.assertFalse(sm.unpause_sleeper("nope"))
+
+    def test_the_capability_rides_the_heartbeat(self):
+        sm = self._manager()
+        with mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm.build_payload(0, light=True)
+        self.assertEqual(payload["pauseSleepers"], {"available": True})
+        with mock.patch.object(ha, "PAUSE_SLEEPERS", False), \
+                mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm.build_payload(0, light=True)
+        self.assertEqual(payload["pauseSleepers"], {"available": False})
+
+
 class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
     """XERK-1569: a session's `session_cli.py close-ticket` file is read by a
     WORKER (tracker HTTP off the beat), which comments the evidence and moves the
@@ -24340,9 +25138,24 @@ class TestPokeHeartbeat(unittest.TestCase):
     heartbeat loop's interval wait short so a just-queued command is picked up
     right away instead of up to a whole INTERVAL later."""
 
+    class _Hung(Exception):
+        pass
+
+    def _arm_deadline(self, secs):
+        # A poke regression (a blocking pipe end, a revert to Event) WEDGES rather
+        # than fails, so every test here runs under a SIGALRM that unwinds it into
+        # a named failure instead of a silent CI timeout.
+        def _deadline(*_):
+            raise self._Hung()
+        prev = signal.signal(signal.SIGALRM, _deadline)
+        self.addCleanup(signal.signal, signal.SIGALRM, prev)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_REAL, secs)
+
     def test_sigusr1_sets_the_poke_event_and_cuts_the_wait_short(self):
+        self._arm_deadline(30)
         prev = signal.getsignal(signal.SIGUSR1)
-        signal.signal(signal.SIGUSR1, lambda *_: ha._poke.set())
+        signal.signal(signal.SIGUSR1, ha._on_sigusr1)
         self.addCleanup(signal.signal, signal.SIGUSR1, prev)
 
         ha._poke.clear()
@@ -24355,6 +25168,58 @@ class TestPokeHeartbeat(unittest.TestCase):
         start = time.monotonic()
         self.assertTrue(ha._poke.wait(5))
         self.assertLess(time.monotonic() - start, 1.0)
+        # clear() drops the pending poke, so the next wait sleeps again.
+        ha._poke.clear()
+        self.assertFalse(ha._poke.wait(0.05))
+
+    def test_a_sigusr1_burst_while_the_loop_waits_neither_deadlocks_nor_recurses(self):
+        # XERK-1558: the handler used to be `_poke.set()` on a threading.Event.
+        # A signal landing while the main thread sat inside Event.wait() (holding
+        # its non-reentrant Condition lock) blocked the handler on that lock; the
+        # burst's next signal nested another handler, and so on — a deadlocked
+        # manager, or RecursionError out of run_forever. Drive the real shape:
+        # this (main) thread loops clear()/wait() like run_forever while another
+        # process fires SIGUSR1 as fast as it can.
+        prev = signal.getsignal(signal.SIGUSR1)
+        signal.signal(signal.SIGUSR1, ha._on_sigusr1)
+        self.addCleanup(signal.signal, signal.SIGUSR1, prev)
+
+        sender = subprocess.Popen([sys.executable, "-c",
+            "import os, signal, sys\n"
+            "pid = int(sys.argv[1])\n"
+            "for _ in range(50000): os.kill(pid, signal.SIGUSR1)\n",
+            str(os.getpid())])
+        self.addCleanup(sender.kill)
+        self._arm_deadline(60)
+        waits = 0
+        try:
+            while sender.poll() is None:
+                ha._poke.clear()
+                ha._poke.wait(0.001)
+                waits += 1
+        except self._Hung:
+            self.fail(f"the wait loop wedged under a SIGUSR1 burst after {waits} waits")
+        except RecursionError:
+            self.fail("a SIGUSR1 burst nested handlers into RecursionError")
+        self.assertEqual(sender.returncode, 0)
+        # The loop still works after the storm: a poke wakes it, quiet sleeps.
+        ha._poke.clear()
+        self.assertFalse(ha._poke.wait(0.05))
+        os.kill(os.getpid(), signal.SIGUSR1)
+        self.assertTrue(ha._poke.wait(5))
+
+    def test_a_poke_flood_with_no_waiter_never_blocks_the_setter(self):
+        # The pipe's capacity is finite; set() past it must drop (a poke is
+        # already pending) rather than block — a blocked signal handler is the
+        # very wedge this guards against.
+        self._arm_deadline(30)
+        ha._poke.clear()
+        self.addCleanup(ha._poke.clear)
+        start = time.monotonic()
+        for _ in range(200000):
+            ha._poke.set()
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertTrue(ha._poke.wait(0))
 
 
 class TestPokeListener(unittest.TestCase):

@@ -99,7 +99,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
     "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml, refresh, mergeSnapshot," +
-    " autoPausedBadge, refusedBadge," +
+    " autoPausedBadge, refusedBadge, pausedKill, reconcilePending, toggleResume," +
     " sseClock: () => sseClock," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
@@ -572,4 +572,118 @@ test("dashboard: an in-flight snapshot does not clobber a newer orgColors SSE pa
   D.mergeSnapshot({ now: Date.now(), agents: [], orgColors: { o: "green" }, retiredUsage: [] }, since2);
   assert.deepEqual(D.getCache().orgColors, { o: "green" },
     "an unraced snapshot still replaces orgColors");
+});
+
+// XERK-1575: a sleeper the hub paused to free its slot is a killed record with a
+// `paused` wake. It holds no slot, so it is not in the running count — but it
+// comes back on its own, so the host card keeps a card for it in its repo and
+// the tile and host meta say how many are paused, rather than letting it vanish
+// as if killed.
+test("dashboard: a paused sleeper keeps a card in its repo and is counted as paused", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const wakeAt = now + 2 * 3600e3;
+  const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  const h = {
+    ...liveHost("vm", 1),
+    capacity: { maxSessions: 6 },
+    repos: [{ name: "Turma", branch: "main" }],
+    sessions: [{ id: "s1", summary: "Busy One", status: "running", repo: "Turma" }],
+    closedSessions: [
+      { id: "s2", summary: "Napping", repo: "Turma", worktreePath: "/r/.turma/worktrees/brave-otter",
+        closedAt: new Date(now - 60_000).toISOString(),
+        paused: { wakeAt, wakeReason: "check CI on PR #412", at: now - 60_000 } },
+      { id: "s3", summary: "Plain Kill", repo: "Turma", closedAt: new Date(now).toISOString() },
+    ],
+  };
+  D.render({ now, agents: [h] });
+  assert.deepEqual(tileOf(D.els.tiles.innerHTML, "Running sessions"),
+    { value: "1 / 6", hint: "1 total · 1 paused" });
+  const g = D.els.groups.innerHTML;
+  assert.match(g, /<b>1<\/b> running · 1 total · 1 paused/);
+  assert.ok(g.includes('<div class="sess paused">'), "the paused sleeper has a card");
+  assert.ok(g.includes(`💤 paused until ${hhmm} · check CI on PR #412`), g);
+  assert.ok(g.includes("brave-otter"), "its worktree is named");
+  assert.ok(g.includes("Resume now"), "it can be resumed early");
+  // The State line is the wake alone — "paused" once, no trailing "· paused 1m
+  // ago" — matching the Sessions page's Paused row.
+  assert.ok(g.includes(`<b class="sess-holding">💤 paused until ${hhmm} · check CI on PR #412</b></dd>`), g);
+  assert.ok(!/paused \d+[smhd] ago|paused just now/.test(g), "no paused-ago age on the card");
+  assert.ok(!g.includes("Plain Kill"), "an ordinary kill stays off the card grid");
+
+  // Nothing paused: no note anywhere.
+  const D2 = loadDashboard();
+  D2.render({ now, agents: [{ ...h, closedSessions: [h.closedSessions[1]] }] });
+  assert.equal(tileOf(D2.els.tiles.innerHTML, "Running sessions").hint, "1 total");
+  assert.ok(!D2.els.groups.innerHTML.includes("paused"));
+});
+
+// XERK-1575: the repo's "Resume ▾" picker leaves a paused sleeper out — its own
+// paused card (with Resume now) sits right below, so listing its transcript again
+// as an ordinary ended session showed one session twice.
+test("dashboard: the Resume picker does not list a paused sleeper a second time", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const h = {
+    ...liveHost("vm", 1),
+    capacity: { maxSessions: 6 },
+    repos: [{ name: "web", branch: "main", resumable: [
+      { transcriptId: "t-old", summary: "Older Work", origin: "worktree", endedTs: new Date(now - 3600e3).toISOString() },
+      { transcriptId: "t-nap", summary: "Napping", origin: "worktree", endedTs: new Date(now).toISOString() },
+    ] }],
+    closedSessions: [
+      { id: "d79c9", summary: "Napping", repo: "web", transcriptId: "t-nap",
+        closedAt: new Date(now - 120_000).toISOString(),
+        paused: { wakeAt: now + 3600e3, wakeReason: "re-check the staging deploy", at: now - 120_000 } },
+    ],
+  };
+  D.setCache({ now, agents: [h] });
+  D.toggleResume("vm::web");
+  const g = D.els.groups.innerHTML;
+  const picker = g.slice(g.indexOf('<div class="resume-list">'), g.indexOf('<div class="sess paused'));
+  assert.ok(picker.includes("Older Work"), picker);
+  assert.ok(!picker.includes("t-nap") && !picker.includes("Napping"), picker);
+  assert.ok(g.includes('<div class="sess paused">'), "the paused card itself stays");
+
+  // Only the paused sleeper's transcript left: no Resume ▾ at all.
+  const D2 = loadDashboard();
+  D2.render({ now, agents: [{ ...h, repos: [{ ...h.repos[0], resumable: [h.repos[0].resumable[1]] }] }] });
+  assert.ok(!D2.els.groups.innerHTML.includes("Resume ▾"), D2.els.groups.innerHTML);
+});
+
+// XERK-1575: a paused card can be stopped for good. Kill arms then confirms like a
+// running card's, posts the existing kill route, and holds a "Killing…" row until
+// the host stops reporting the record paused (it is then an ordinary kill, off
+// the card grid). Resume now stays beside it.
+test("dashboard: a paused card's Kill arms, confirms, and clears once it is no longer paused", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const nap = { id: "s2", summary: "Napping", repo: "Turma", closedAt: new Date(now).toISOString(),
+    paused: { wakeAt: now + 3600e3, wakeReason: "check CI", at: now } };
+  const h = { ...liveHost("vm", 1), repos: [{ name: "Turma", branch: "main" }], closedSessions: [nap] };
+  const data = { now, agents: [h] };
+  D.setCache(data);
+  D.render(data);
+  let g = D.els.groups.innerHTML;
+  assert.ok(g.includes("Resume now"), g);
+  assert.match(g, /onclick="pausedKill\('vm','s2'\)">Kill<\/button>/);
+  D.pausedKill("vm", "s2");          // arm
+  D.render(data);
+  assert.match(D.els.groups.innerHTML, /onclick="pausedKill\('vm','s2'\)">Confirm kill<\/button>/);
+  assert.ok(!D.fetches.some((u) => u.endsWith("/kill")), "an armed Kill sends nothing");
+  D.pausedKill("vm", "s2");          // confirm
+  assert.ok(D.fetches.includes("/api/agents/vm/sessions/s2/kill"), D.fetches.join());
+  g = D.els.groups.innerHTML;
+  assert.ok(g.includes('<div class="sess paused killing">'), g);
+  assert.ok(g.includes("Killing…") && !g.includes("Resume now"), "one busy control while it lands");
+  // Still reported paused: the row holds. Reported as an ordinary kill: it clears.
+  D.reconcilePending([h]);
+  D.render(data);
+  assert.ok(D.els.groups.innerHTML.includes("Killing…"));
+  const killed = { ...h, closedSessions: [{ ...nap, paused: null }] };
+  D.reconcilePending([killed]);
+  D.render({ now, agents: [killed] });
+  g = D.els.groups.innerHTML;
+  assert.ok(!g.includes("Napping") && !g.includes("Killing…"), "an ordinary kill leaves the card grid");
 });
