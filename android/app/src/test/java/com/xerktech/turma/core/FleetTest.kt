@@ -182,4 +182,16 @@ class FleetTest {
         assertEquals(1, s.running)
         assertEquals(0, fleetSummary(listOf(agent("h2"))).paused)
     }
+
+    @Test
+    fun theResumePickerLeavesOutAPausedSleeper() {
+        val r = { tid: String -> com.xerktech.turma.model.ResumableInfo(transcriptId = tid) }
+        val paused = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "d79c9", transcriptId = "t-paused", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 1_000L))
+        val untracked = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "old", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 2_000L))
+        val all = listOf(r("t-old"), r("t-paused"))
+        assertEquals(listOf("t-old"), resumablePicks(all, listOf(paused, untracked)).map { it.transcriptId })
+        assertEquals(all, resumablePicks(all, emptyList()))
+    }
 }

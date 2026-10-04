@@ -99,7 +99,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
     "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml, refresh, mergeSnapshot," +
-    " autoPausedBadge, refusedBadge, pausedKill, reconcilePending," +
+    " autoPausedBadge, refusedBadge, pausedKill, reconcilePending, toggleResume," +
     " sseClock: () => sseClock," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
@@ -617,6 +617,39 @@ test("dashboard: a paused sleeper keeps a card in its repo and is counted as pau
   D2.render({ now, agents: [{ ...h, closedSessions: [h.closedSessions[1]] }] });
   assert.equal(tileOf(D2.els.tiles.innerHTML, "Running sessions").hint, "1 total");
   assert.ok(!D2.els.groups.innerHTML.includes("paused"));
+});
+
+// XERK-1575: the repo's "Resume ▾" picker leaves a paused sleeper out — its own
+// paused card (with Resume now) sits right below, so listing its transcript again
+// as an ordinary ended session showed one session twice.
+test("dashboard: the Resume picker does not list a paused sleeper a second time", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const h = {
+    ...liveHost("vm", 1),
+    capacity: { maxSessions: 6 },
+    repos: [{ name: "web", branch: "main", resumable: [
+      { transcriptId: "t-old", summary: "Older Work", origin: "worktree", endedTs: new Date(now - 3600e3).toISOString() },
+      { transcriptId: "t-nap", summary: "Napping", origin: "worktree", endedTs: new Date(now).toISOString() },
+    ] }],
+    closedSessions: [
+      { id: "d79c9", summary: "Napping", repo: "web", transcriptId: "t-nap",
+        closedAt: new Date(now - 120_000).toISOString(),
+        paused: { wakeAt: now + 3600e3, wakeReason: "re-check the staging deploy", at: now - 120_000 } },
+    ],
+  };
+  D.setCache({ now, agents: [h] });
+  D.toggleResume("vm::web");
+  const g = D.els.groups.innerHTML;
+  const picker = g.slice(g.indexOf('<div class="resume-list">'), g.indexOf('<div class="sess paused'));
+  assert.ok(picker.includes("Older Work"), picker);
+  assert.ok(!picker.includes("t-nap") && !picker.includes("Napping"), picker);
+  assert.ok(g.includes('<div class="sess paused">'), "the paused card itself stays");
+
+  // Only the paused sleeper's transcript left: no Resume ▾ at all.
+  const D2 = loadDashboard();
+  D2.render({ now, agents: [{ ...h, repos: [{ ...h.repos[0], resumable: [h.repos[0].resumable[1]] }] }] });
+  assert.ok(!D2.els.groups.innerHTML.includes("Resume ▾"), D2.els.groups.innerHTML);
 });
 
 // XERK-1575: a paused card can be stopped for good. Kill arms then confirms like a

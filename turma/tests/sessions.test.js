@@ -2329,6 +2329,14 @@ test("XERK-1575: a Paused row's Kill arms, confirms, and moves it to Ended as an
   assert.ok(!e.includes("s-pkill"), "an ordinary ended row has no Kill");
 });
 
+// XERK-1575: a paused row stacks Resume now over Kill in its right gutter, so its
+// state row must keep that gutter — the ended row's reclaim (margin-right -68px)
+// ran the wake text under Kill and clipped it (screenshot review, 390 wide).
+test("a paused row's state line keeps clear of its stacked Kill button", () => {
+  assert.match(html, /\.s-card-wrap\.ended-wrap \.state-row \{ margin-right: -68px; \}/);
+  assert.match(html, /\.s-card-wrap\.ended-wrap > \.s-card\.paused \.state-row \{ margin-right: 0; \}/);
+});
+
 test("Ended sessions is collapsed by default and hidden when there are none", () => {
   const { beat, els } = loadPage();
   const { now, host: h } = host([working("11111", "Live One")]);

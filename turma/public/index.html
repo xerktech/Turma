@@ -1225,6 +1225,13 @@ function pausedSleepers(a) {
   return (a.closedSessions || []).filter(c => c && c.paused && Number.isSafeInteger(c.paused.wakeAt))
     .sort((x, y) => x.paused.wakeAt - y.paused.wakeAt);
 }
+// A repo's "Resume ▾" picks without its paused sleepers' transcripts (XERK-1575):
+// a paused sleeper has its own card with Resume now right below, so listing it
+// again as an ordinary ended session shows one session twice. Android `resumablePicks`.
+function resumablePicks(resumable, pausedList) {
+  const skip = new Set((pausedList || []).map(c => c.transcriptId).filter(Boolean));
+  return skip.size ? resumable.filter(t => !skip.has(t && t.transcriptId)) : resumable;
+}
 function pausedLabel(p, now) {
   const why = typeof p.wakeReason === "string" ? p.wakeReason.trim() : "";
   return "💤 paused until " + clockTime(p.wakeAt, now) + (why ? " · " + why : "");
@@ -1784,9 +1791,9 @@ function repoBlock(a, repo, sessList, now, pausedList = []) {
   // Turma sessions, repo-dir "terminal" runs, and older ones, not just the last
   // few killed). Fall back to the last-5 killed sessions (closedSessions) for
   // agents that predate repo.resumable.
-  const resumable = Array.isArray(repo.resumable) ? repo.resumable : null;
+  const resumable = Array.isArray(repo.resumable) ? resumablePicks(repo.resumable, pausedList) : null;
   const legacyClosed = resumable ? [] : (a.closedSessions || [])
-    .filter(c => c.repo === repo.name)
+    .filter(c => c.repo === repo.name && !c.paused)
     .sort((x, y) => String(y.closedAt || "").localeCompare(String(x.closedAt || "")))
     .slice(0, 5);
   const resumeCount = resumable ? resumable.length : legacyClosed.length;

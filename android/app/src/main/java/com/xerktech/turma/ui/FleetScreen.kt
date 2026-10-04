@@ -370,11 +370,13 @@ private fun HostSection(
                     for (repo in agent.repos) {
                         val sessions = agent.sessions.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
                         val paused = pausedAll.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
+                        // Its Resume picker leaves out a paused sleeper: the card below is its resume.
+                        val shown = repo.copy(resumable = com.xerktech.turma.core.resumablePicks(repo.resumable, paused))
                         RepoSection(
-                            repo = repo, sessions = sessions, paused = paused, now = now, hostLastSeen = agent.lastSeen,
+                            repo = shown, sessions = sessions, paused = paused, now = now, hostLastSeen = agent.lastSeen,
                             hostKey = agent.key, pending = pending,
                             onComposeSpawn = { onComposeSpawn(agent.key, repo.name, repo.root) },
-                            onResume = { onResume(agent.key, repo) },
+                            onResume = { onResume(agent.key, shown) },
                             onPrune = { onPrune(agent.key, repo.name) },
                             onOpenSession = { s -> onOpenSession(agent.key, s.id) },
                             onSessionActions = { s -> onSessionActions(agent.key, s) },

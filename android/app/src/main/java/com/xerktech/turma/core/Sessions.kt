@@ -152,6 +152,20 @@ fun isPausedSleeper(c: com.xerktech.turma.model.ClosedSessionInfo): Boolean = (c
 fun pausedSleepers(a: AgentInfo): List<com.xerktech.turma.model.ClosedSessionInfo> =
     a.closedSessions.filter(::isPausedSleeper).sortedBy { it.paused?.wakeAt ?: 0L }
 
+/**
+ * A repo's resume-any picks without its paused sleepers' transcripts (XERK-1575):
+ * a paused sleeper already has its own card with Resume now, so the picker
+ * listing it again as an ordinary ended session shows one session twice.
+ * Web index.html `resumablePicks`.
+ */
+fun resumablePicks(
+    resumable: List<com.xerktech.turma.model.ResumableInfo>,
+    paused: List<com.xerktech.turma.model.ClosedSessionInfo>,
+): List<com.xerktech.turma.model.ResumableInfo> {
+    val skip = paused.map { it.transcriptId }.filter { it.isNotEmpty() }.toSet()
+    return if (skip.isEmpty()) resumable else resumable.filter { it.transcriptId !in skip }
+}
+
 /** "💤 paused until 14:05 · reason" — web `pausedLabel` (index.html, sessions.html). */
 fun pausedLabel(p: com.xerktech.turma.model.PausedSleep, now: Long = System.currentTimeMillis()): String =
     "💤 paused until " + clockTime(p.wakeAt, now) +

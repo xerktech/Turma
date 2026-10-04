@@ -180,6 +180,9 @@
   /* Ended cards reserve a wider right padding for the Resume button; reclaim that
      larger inset so their chip rows reach the edge too. */
   .s-card-wrap.ended-wrap .state-row { margin-right: -68px; }
+  /* A paused sleeper's stacked Resume now + Kill fill its right gutter top to
+     bottom, so its state row keeps that gutter instead of running under Kill. */
+  .s-card-wrap.ended-wrap > .s-card.paused .state-row { margin-right: 0; }
 
   /* Per-card overflow menu (⋯ → Rename / Kill). The trigger and its popover are
      SIBLINGS of .s-card, absolutely positioned over its top-right corner — a live/
