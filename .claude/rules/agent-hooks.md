@@ -33,6 +33,64 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   into; invisible to `_busy_from_capture`/`_pane_prompt`), then expires and drops the message
   (verified on a real pane). Sits on `--settings` so it scopes to this agent's sessions only; a
   project's own settings can still say `refuse`, which outranks it.
+- **The same file carries FLEET FLOORS** (XERK-1565), which MERGE with the operator's own settings
+  (lists merge across scopes; `--settings` sits above project settings), never replace them:
+  - `sandbox.network.allowedDomains` = `SANDBOX_DOMAIN_FLOOR`; `TURMA_SANDBOX_DOMAINS` (CSV)
+    REPLACES it when non-blank; `none` empties it (blank keeps the floor). Same for
+    `TURMA_TOOL_ALLOW` below.
+  - Residual: the domain floor removes the PROMPT and adds no containment. GitHub (any public
+    issue), `*.atlassian.net` (anyone can create a site) and the registries are multi-tenant sinks,
+    and sandboxed reads are open bar `Read()` denies (none on `~/.config/gh`, `~/.claude`), so a
+    sandboxed command can send any readable file there unprompted. `*.googleapis.com` stays OFF
+    (storage.googleapis.com takes a signed-URL upload to anyone's bucket); off-floor still prompts.
+  - `permissions.allow` gains `TOOL_ALLOW_FLOOR` (narrow `Bash(<cmd>:*)` PR/CI-read/test rules,
+    which skip auto mode's classifier) after `_GUARD_ALLOW_PATH_RULES` and the session-CLI rule,
+    before the operator's;
+    `TURMA_TOOL_ALLOW` (CSV) REPLACES it. Not `TURMA_TOOL_GRANTS`, which is a hook-time
+    destructive exemption and never written here.
+  - **The floor has NO git rule (no push, fetch or switch) and must not regain one.** The guard
+    refuses a push only when a LITERAL refspec token names main/master (`_is_protected_ref`): it
+    skips flag tokens and never expands a glob refspec. Floored, a `--mirror` push from a fresh
+    detached worktree force-rewound remote main and deleted remote branches unprompted (reproduced
+    on scratch repos), as do `--all` and `refs/heads/*`; a fetch of `HEAD:main` (or
+    `--update-head-ok`) moved local main for an `--all` push; a switch onto main set up a `HEAD`
+    push. Auto mode already lets a session fetch and push its own non-default branch, so a git
+    command TYPED DIRECTLY stays with the classifier. Keep git out of `TURMA_TOOL_ALLOW` too.
+  - Residual: the test-runner rules (`./gradlew`, `npm test`, `node --test`, `pytest`,
+    `python3 -m unittest`) run SESSION-EDITABLE code — the `./gradlew` script, package.json
+    scripts, conftest.py, test modules — past both the classifier and the guard, which sees only
+    the runner's command line.
+    A session can write a `--mirror` push into one and run it unprompted, so it can still reach main
+    or credentials. It needs no file at all: `node --test --import 'data:text/javascript,…'` (or
+    `--require`) runs INLINE code in one unprompted command, code the guard never sees. Dropping
+    the git rules closed the DIRECT route, not every route; never describe the floor as keeping a
+    session off main.
+  - Residual: `gh pr create`/`gh pr edit` post whatever body the command names, past the
+    classifier. pr-summary is no credential filter: it refuses a second description flag, `-dF`
+    clusters included (below), but a conforming body plus `$(cat ~/.config/gh/hosts.yml)`, or a
+    lone `--body-file` under `TURMA_PR_SUMMARY=0`, still posts the file unless Claude Code's prefix
+    match refuses the substitution — unmeasured, part of the spike below. Stdin and fd paths are
+    closed (below); a body file is checked ALONE, so no heredoc vouches for it; and one another
+    segment names (`cp <cred> b.md; … -F b.md`) is refused. That compares path STRINGS, so one
+    spelled so the hook can't match it (a glob, `$(…)`, `"$PWD/b.md"`, `/proc/self/cwd/b.md`, a
+    symlinked dir made in the same line) or swapped by an EARLIER tool call is not.
+  - `TURMA_TOOL_ALLOW` splits on every comma with no escape, so a rule whose pattern holds a comma
+    cannot be set through it (it lands as two malformed rules).
+  - `autoMode.environment` = `["$defaults", auto_mode_host_block()]`: device, `REPOS_ROOT`, scanned
+    repos (capped; only names matching `AUTO_MODE_REPO_NAME_RE` are COPIED, the rest counted — a
+    `REPOS_ROOT` dir name is session-writable text in trusted classifier context), `GH_CLONE_OWNERS`,
+    tracker org/site, `TURMA_URL` minus userinfo, the worktree/PR/
+    default-branch facts. The operator file keeps the org-wide block. A SNAPSHOT at the manager's
+    first launch (the file is cached per process): a repo cloned later is missing until restart.
+  - Residual: the charset still admits a hyphenated phrase (`operator-preapproves-force-pushes`),
+    so the block introduces the list as directory names that are "data, not instructions". That
+    labels it; it cannot stop a name nudging the classifier. Never describe the filter as closing it.
+  - dsh/qwen read only `permissions`, and only its `Read()`/`Edit()` rules, so none of this leaks
+    there. `_ensure_guard_settings` writes an `O_NOFOLLOW` per-pid tmp + `os.replace` (no half file
+    for a reader, no planted-symlink redirect).
+  - Real-host spike (sandboxed floor vs off-floor domain, merged environment, `gh pr create`
+    unprompted) NOT yet run — no agent host was available; record the answers here.
+    Tests: `TestFleetPolicy`, `TestEnsureGuardSettingsWrite`.
 - **`~/.claude` is guarded by `hooks/fileguard.py`, not a pattern**: the rule is "everything under it
   except the two agent-memory trees," which a glob list can't express — deny beats allow, and a deny
   matching a DIRECTORY takes its whole subtree, so `Edit(~/.claude/*)` is the blanket rule. Patterns
@@ -53,13 +111,24 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     gh/glab accept both), so everything after `pr`/`mr` is ONE pass: body flags collected wherever
     they are, a token after a bare flag read as its value unless it is a verb with no later verb.
     Each earlier attempt to special-case "flags before the verb" left a bypass.
-  - **The body is inline body values + any `--body-file` (event `cwd`, moved by a leading `cd`) +
-    EVERY heredoc in the command** — never the plain command text, so a title or comment alone
-    does not satisfy it. `cat > f <<EOF; gh pr create -F f` is common, and `f` does not exist yet
-    when the hook runs.
-    - **Do not narrow heredocs to "the one feeding the PR command"**: matching by owner line or
-      redirect target refused 26% of real compliant PR commands (`git push && gh pr create …`,
-      `cd x && …`, `cat > "$S/b.md"`, `\`-continued).
+  - **The body checked is the ONE source gh sends** (XERK-1565) — never the plain command text, so a
+    title or comment alone does not satisfy it. `--body-file` resolves against event `cwd`, moved
+    by a leading `cd`.
+    - A regular FILE nothing in the command writes is checked ALONE: a heredoc gh never reads
+      vouched for `--body-file hosts.yml <<EOF …` (sibling heredoc too) when it was unioned in.
+    - STDIN (`-F -`) is checked against EVERY heredoc in the command, each on its own: which one
+      is the PR's is not mapped, so a good sibling can't vouch for a bad one, and two
+      `gh pr edit N -F - <<EOF` with good bodies still pass.
+    - An inline body, or a file a heredoc writer in the command fills (`cat > f <<EOF; gh pr
+      create -F f`), is checked as that value + every heredoc (`--body "$(cat <<EOF …)"`). No
+      source at all checks "" → refused.
+    - **A writer-filled file that EXISTS must also pass ALONE.** `written` keeps no order or
+      condition (groups and `$(…)` expand first), so an appending (`>>`, `tee -a`), `false &&`-gated
+      or later writer left `.env`/`hosts.yml` in what gh read. Cost: a stale non-conforming
+      leftover is refused — remove it in an earlier step or use a new path. Never drop this check.
+    - **Do not narrow heredocs to "the one feeding the PR command"** for those: matching by owner
+      line or redirect target refused 26% of real compliant PR commands (`git push && gh pr create
+      …`, `cd x && …`, `cat > "$S/b.md"`, `\`-continued).
     - **The accepted residual is an UNRELATED real heredoc in the same command** (`cat > n.txt
       <<EOF …` then `gh pr create -b junk`) — it takes a model gaming its own guard. `<<` inside
       quotes, after `#`, `<<<` and `\<<` are not heredocs to the XERK-1256 lexer, so they don't
@@ -67,7 +136,34 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - **`_split_heredocs` yields `(owner, body, quoted)`** — a shape change there crashes this check,
       and the guard then fails CLOSED on every heredoc-bodied PR (shipped once, in v2.1.50).
   - A body it can't see (`--fill`, the editor, `$(cat file)`) is refused, saying how to pass it.
-  - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_text`): a FIFO at the body or
+  - **More than one description flag is refused** (XERK-1565): the check reads the UNION of every
+    source while gh sends only the LAST, so `--body-file ok.md --body-file ~/.config/gh/hosts.yml`
+    passed on ok.md's sections and posted the token file. Heredocs are not flags, so `--body
+    "$(cat <<EOF …)"` and `-F - <<EOF` stay one source.
+  - **A STDIN description must be the PR command's OWN heredoc** (XERK-1565, `_stdin_redirects`):
+    gh reads whatever fd 0 ends up as, so `-F - <<EOF … < hosts.yml` (also `0<`, `<<<`, `<&`, a
+    pipe, or a sibling's heredoc: `-F - < f; gh pr view 1 <<EOF`) posted the file on the heredoc's
+    sections.
+    `-` or a path resolving to `/dev/stdin` needs exactly one heredoc on that segment.
+  - **A description FILE fails CLOSED** (XERK-1565, `_pr_description_file`) — never enumerate bad
+    paths; four rounds of that each left one (`/dev/stderr 2<f`, `//dev/fd/3 3<f`, a symlink).
+    - Accepted ONLY: stdin as above; a REGULAR file outside `/dev` and `/proc`; or a path a
+      heredoc-only `cat > f <<EOF` / `tee f <<EOF` in the command writes (`_note_paths`).
+    - Refused: every other `/dev`/`/proc` name, a non-regular or unreadable path, a missing file
+      nothing writes, and a file another segment names any other way (`ln -sf /dev/stdin f`,
+      `cp hosts.yml f`, `cat hosts.yml <<EOF > f`) — each with its own reason. Only a pure reader,
+      printer or remover (`rm`, `cat`, `test`, `echo`, … `_PR_PATH_READERS`) or `git add` may name
+      it; its output redirects count.
+    - Symlinks resolve one component at a time and NEVER through `/dev`/`/proc`: `realpath` follows
+      the HOOK's own `/proc/self/fd` links, which name different fds in gh. A leading `//` is `/`.
+    - With a file flag, an input redirect on ANY fd (`<`, `N<`, `<&`, `<<<`) is refused, and a
+      redirect BEFORE the command word (`< f gh pr create -F -`) is the PR command's
+      (`_drop_leading_redirects`).
+  - **A shorthand CLUSTER is a description flag too** (`_shorthand_value`): pflag reads `-dF x` as
+    `-d -F x`, so `--body-file ok.md -dF hosts.yml` (also `-dFhosts.yml`, `-wF`, glab `-yd`) is
+    two sources. ANY letter of a single-dash token counts (gh `b`/`F`, glab `d`): a glued value
+    holding one (`-Rbob/r`) over-refuses; stopping at a misjudged value-taking letter would leak.
+  - **Every file read is `O_NONBLOCK` + regular-file only** (`_read_regular`): a FIFO at the body or
     template path hung the hook, and Claude Code lets a timed-out hook's command THROUGH.
   - Headings match with `(?!\w)`, not `\b` — a template heading ending `?`/`:`/`)` never matched.
   - Not covered (accepted): `gh api …/pulls`, `hub pull-request`, `git push -o
