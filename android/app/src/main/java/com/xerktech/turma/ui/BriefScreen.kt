@@ -239,20 +239,28 @@ private fun BriefDecisionTitle(row: BriefDecisionRow) {
 /**
  * A decision's meta line — web `.brief-decision .brief-meta .bit`: each piece (kind,
  * ticket, session name, age, host) stays whole on one line, the row wraps only
- * between pieces, and a piece wider than the row ends in "…".
+ * between pieces, and a piece wider than the row ends in "…". The "·" ENDS the piece
+ * before it (web `.sep`), so a wrapped line never starts with one — as the brief's own
+ * item meta wraps — and the ellipsis can't eat it.
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun BriefDecisionMeta(pieces: List<String>) {
+    val style = MaterialTheme.typography.bodySmall
+    val color = MaterialTheme.colorScheme.onSurfaceVariant
     FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
         pieces.forEachIndexed { i, piece ->
-            Text(
-                if (i == 0) piece else "· $piece",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-                maxLines = 1,
-                overflow = TextOverflow.Ellipsis,
-            )
+            Row {
+                Text(
+                    piece,
+                    modifier = Modifier.weight(1f, fill = false),
+                    style = style,
+                    color = color,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (i < pieces.lastIndex) Text(" ·", style = style, color = color, maxLines = 1)
+            }
         }
     }
 }

@@ -218,6 +218,8 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
     answer with no ticket. Web `DECISION_LABEL_MAX` = Kotlin `BRIEF_DECISION_LABEL_MAX`.
   - **Each meta piece is unbreakable** (web `.bit`, Android a `FlowRow` of one-line `Text`s): the
     line wraps only between pieces, and a piece wider than the row ends in "…".
+  - **The "·" ENDS the piece before it** (web `.sep`, Android a trailing `" ·"` Text beside the
+    clipped one), so a wrapped line ends in a dot and never starts with one, like the brief's rows.
   - **The typed-answer marker is not a choice**: `answerHtml` / `briefDecisionAnswer` split off
     `, plus a typed answer` (or a lone `(a typed answer)`) and show it muted, never bold.
   - A row's kind is a noun — `question` / `permission` / `note` (`DECISION_KIND` = Kotlin

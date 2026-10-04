@@ -267,11 +267,17 @@ test("brief.html: a decision's kind is a noun, its meta pieces each unbreakable 
   ], 5000, false);
   for (const k of ["question", "permission", "note"]) assert.ok(html.includes(`<span class="kind">${k}</span>`), k);
   assert.equal(html.includes("answered"), false);
-  assert.ok(html.includes('<span class="bit"><span class="kind">question</span></span>'
-    + ' <span class="bit">· <span class="key">X-1</span></span>'
-    + ' <span class="bit">· <span class="sess">work</span></span>'
-    + ' <span class="bit">· 4s ago</span> <span class="bit">· Jira poller</span>'));
-  assert.match(SRC, /\.brief-decision \.brief-meta \.bit \{[^}]*white-space: nowrap;[^}]*text-overflow: ellipsis/);
+  // The "·" ENDS each piece but the last, so a wrapped line never starts with one.
+  const sep = '<span class="sep"> ·</span>';
+  assert.ok(html.includes(`<span class="bit"><span class="v"><span class="kind">question</span></span>${sep}</span>`
+    + ` <span class="bit"><span class="v"><span class="key">X-1</span></span>${sep}</span>`
+    + ` <span class="bit"><span class="v"><span class="sess">work</span></span>${sep}</span>`
+    + ` <span class="bit"><span class="v">4s ago</span>${sep}</span>`
+    + ' <span class="bit"><span class="v">Jira poller</span></span></div>'));
+  assert.equal(/<span class="bit">[^<]*·/.test(html), false);
+  assert.match(SRC, /\.brief-decision \.brief-meta \.bit \{[^}]*white-space: nowrap;/);
+  assert.match(SRC, /\.brief-meta \.bit > \.v \{[^}]*text-overflow: ellipsis/);
+  assert.match(SRC, /\.brief-meta \.bit > \.sep \{[^}]*flex: none/);
 });
 
 test("brief.html: the decisions subtitle sits beside its title, not pushed right (XERK-1574)", () => {

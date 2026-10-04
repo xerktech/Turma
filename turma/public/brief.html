@@ -83,12 +83,15 @@
   .brief-decisions .brief-sec { margin-top: 0; }
   .brief-decision .kind { color: var(--ink-2); }
   /* A meta line wraps only BETWEEN its pieces (age, host, ticket, session), never
-     inside one; a piece wider than the row (a long session name) ends in "…". */
+     inside one; a piece wider than the row (a long session name) ends in "…".
+     The "·" ends the piece before it, so a wrapped line ends in one and never
+     starts with one (as the brief card's rows wrap), and the ellipsis can't eat it. */
   .brief-decision .brief-meta { overflow-wrap: normal; }
   .brief-decision .brief-meta .bit {
-    display: inline-block; max-width: 100%; white-space: nowrap; overflow: hidden;
-    text-overflow: ellipsis; vertical-align: bottom;
+    display: inline-flex; max-width: 100%; white-space: nowrap; vertical-align: bottom;
   }
+  .brief-decision .brief-meta .bit > .v { min-width: 0; overflow: hidden; text-overflow: ellipsis; }
+  .brief-decision .brief-meta .bit > .sep { flex: none; white-space: pre; }
   /* The typed-answer marker is not the chosen option: muted, never bold. */
   .brief-decision .typed { color: var(--muted); font-size: 12px; }
   .brief-note { display: flex; gap: 8px; margin-top: 8px; }
@@ -293,7 +296,8 @@ function decisionsHtml(site, list, now, live, count, name) {
     }
     if (typeof d.at === "number") meta.push(`${esc(ago(d.at, now))} ago`);
     if (d.host) meta.push(esc(d.host));
-    const bits = meta.map((m, i) => `<span class="bit">${i ? "· " : ""}${m}</span>`);
+    const bits = meta.map((m, i) => `<span class="bit"><span class="v">${m}</span>`
+      + `${i < meta.length - 1 ? '<span class="sep"> ·</span>' : ""}</span>`);
     return `<li class="brief-item brief-decision"><div class="brief-title">${title}</div>`
       + `<div class="brief-meta">${bits.join(" ")}</div></li>`;
   };
