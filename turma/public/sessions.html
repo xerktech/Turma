@@ -236,6 +236,8 @@
      .s-hit button, and nesting Resume in it would be a button inside a button). */
   .s-card.ended .dot { background: none; border: 1.5px solid var(--muted); box-sizing: border-box; }
   .s-card-wrap.ended-wrap > .s-card { padding-right: 78px; }
+  /* A paused sleeper's button reads "Resume now" (XERK-1575, as on the dashboard). */
+  .s-card-wrap.ended-wrap > .s-card.paused { padding-right: 100px; }
   .s-resume {
     position: absolute; top: 7px; right: 6px; z-index: 2;
     font: inherit; font-size: 11.5px; font-weight: 600; padding: 4px 10px;
@@ -3041,7 +3043,7 @@ function endedRow(e) {
     <button class="s-resume" ${a.online && !resuming ? "" : "disabled"}
         ${a.online ? "" : 'title="Host offline"'}
         onclick="resumeEnded(event,'${escJs(e.id)}')">
-      ${resuming ? '<span class="spin"></span>' : "Resume"}
+      ${resuming ? '<span class="spin"></span>' : paused ? "Resume now" : "Resume"}
     </button>
   </div>`;
 }
@@ -4377,6 +4379,9 @@ async function openEndedSession(id) {
   const $res = document.getElementById("trResume");
   $res.hidden = false;
   $res.disabled = !e.a.online;
+  // A paused sleeper (XERK-1575) is resumed EARLY, before the wake the hub
+  // would resume it at — "Resume now", as its Paused row and the dashboard say.
+  $res.textContent = isPausedEntry(e) ? "Resume now" : "Resume";
   $res.title = e.a.online ? "Bring this session back" : "Host offline";
   // The Trajectory toggle (XERK-718): archive-served, so it works even for an
   // offline host. Offered once the session has an archived transcript id; a

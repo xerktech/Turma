@@ -2083,10 +2083,10 @@ function sessCard(a, s, now) {
 // hub resumes it at its wake, so it keeps a card in its repo — reading asleep in
 // the same muted tone as the sleeping label it had while running — instead of
 // vanishing as if killed. Resume now brings it back early; nothing else applies.
+// Its State is the wake alone, no "paused Ns ago" age: it is waiting, not
+// history — the same line the Sessions page's Paused row shows.
 function pausedCard(a, c, now) {
   const rp = pending.has(pendKey("resume", a.key, c.id));
-  const pausedAt = Number.isSafeInteger(c.paused.at) && c.paused.at > 0 ? c.paused.at
-    : (c.closedAt ? Date.parse(c.closedAt) : NaN);
   const prs = (c.prs && c.prs.length)
     ? `<dt>PRs</dt><dd class="pr-list">${c.prs.map(prBadgeHtml).join("")}</dd>` : "";
   return `<div class="sess paused">
@@ -2100,8 +2100,7 @@ function pausedCard(a, c, now) {
       ${c.root
         ? `<dt>Location</dt><dd><b>repos root (no worktree)</b></dd>`
         : `<dt>Worktree</dt><dd><b>${esc(worktreeName(c))}</b></dd>`}
-      <dt>State</dt><dd><b class="sess-holding">${esc(pausedLabel(c.paused, now))}</b>${
-        Number.isFinite(pausedAt) ? stateAge("paused " + ago(now - pausedAt)) : ""}</dd>
+      <dt>State</dt><dd><b class="sess-holding">${esc(pausedLabel(c.paused, now))}</b></dd>
       ${prs}
     </dl>
     <div class="sess-actions">

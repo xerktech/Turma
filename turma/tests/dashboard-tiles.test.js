@@ -606,6 +606,10 @@ test("dashboard: a paused sleeper keeps a card in its repo and is counted as pau
   assert.ok(g.includes(`💤 paused until ${hhmm} · check CI on PR #412`), g);
   assert.ok(g.includes("brave-otter"), "its worktree is named");
   assert.ok(g.includes("Resume now"), "it can be resumed early");
+  // The State line is the wake alone — "paused" once, no trailing "· paused 1m
+  // ago" — matching the Sessions page's Paused row.
+  assert.ok(g.includes(`<b class="sess-holding">💤 paused until ${hhmm} · check CI on PR #412</b></dd>`), g);
+  assert.ok(!/paused \d+[smhd] ago|paused just now/.test(g), "no paused-ago age on the card");
   assert.ok(!g.includes("Plain Kill"), "an ordinary kill stays off the card grid");
 
   // Nothing paused: no note anywhere.

@@ -2272,10 +2272,13 @@ test("XERK-1575: a sleeper paused for its slot reads asleep until its wake, neve
   assert.ok(nap.includes(`<div class="state holding">💤 paused until ${hhmm} · check CI</div>`), nap);
   assert.ok(!nap.includes("killed"), nap);
   assert.ok(!nap.includes("Plain Kill"), nap);
+  // Resumed early, so the control says so — the dashboard's paused card's words.
+  assert.match(nap, /<button class="s-resume"[^>]*>\s*Resume now\s*<\/button>/);
   const e = els.ended.innerHTML;
   assert.ok(!e.includes("Napping"), "a paused sleeper is not ended history");
   assert.match(e, /Ended sessions <span class="count">1<\/span>/);
   assert.match(e.slice(e.indexOf("Plain Kill")), /<div class="state">killed/);
+  assert.match(e, /<button class="s-resume"[^>]*>\s*Resume\s*<\/button>/, "an ordinary kill keeps plain Resume");
 
   // Woken (no longer a paused record): the Paused section goes away.
   h.closedSessions = [closed("44444", "Plain Kill", "2026-07-15T08:00:00Z")];
@@ -2658,6 +2661,22 @@ test("opening an ended session shows PRs + Resume and never a terminal or compos
   // through to GitHub, which is often the reason to open an ended session at all.
   assert.match(els.trPrs.innerHTML, /<a href="https:\/\/github.com\/o\/r\/pull\/7"/);
   assert.match(els.trPrs.innerHTML, /#7/);
+});
+
+test("XERK-1575: opening a paused sleeper offers Resume now; an ordinary kill, Resume", () => {
+  const { beat, openEndedSession, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [
+    closed("33333", "Napping", "2026-07-15T09:00:00Z",
+      { transcriptId: "t-nap", paused: { wakeAt: now + 3600e3, at: now } }),
+    closed("44444", "Plain Kill", "2026-07-15T08:00:00Z", { transcriptId: "t-kill" }),
+  ];
+  beat({ now, agents: [h] });
+  openEndedSession("33333");
+  assert.equal(els.trResume.hidden, false);
+  assert.equal(els.trResume.textContent, "Resume now");
+  openEndedSession("44444");
+  assert.equal(els.trResume.textContent, "Resume", "the label never sticks to the next view");
 });
 
 // XERK-356. A refused archive push never arrives, so the reassuring "it syncs

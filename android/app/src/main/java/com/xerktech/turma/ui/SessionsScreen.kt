@@ -930,7 +930,8 @@ private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: 
             }
             // Resume needs the host online (it rides the heartbeat as a command);
             // reading the conversation does not, so the card stays clickable.
-            GhostButton("Resume", onResume, enabled = e.online)
+            // A paused sleeper is resumed before its wake (XERK-1575, web `endedRow`).
+            GhostButton(if (isPausedEnded(e)) "Resume now" else "Resume", onResume, enabled = e.online)
         }
     }
 }
@@ -1232,7 +1233,7 @@ internal fun EndedSessionView(
                     ChatSettingsMenu(verbosity) { verbosity = it }
                     entry?.let { e ->
                         GhostButton(
-                            "Resume",
+                            if (isPausedEnded(e)) "Resume now" else "Resume",
                             {
                                 resumeEnded(fleetVm, e)
                                 // A resumable row comes back under a NEW id only the
