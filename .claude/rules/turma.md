@@ -253,12 +253,6 @@ retraction, `pushEnabled`.
 
 ## Terminal proxy (`/term/<sessionId>/`)
 
-- **No agent secret on a process's argv** (XERK-1588): `/proc/<pid>/cmdline` is world-readable.
-  - A host reporting `termSessionAuth` runs each ttyd on `HMAC-SHA256(token, "ttyd:<sessionId>")`
-    (agent `_ttyd_credential`); `ttydAuth(host, sessionId)` re-derives it. Change both or neither.
-  - Absent flag (older agent, Windows) = the raw token; the Windows pty-host reads it from a file.
-  - Tests: `XERK-1588` in `server.test.js`, `test_ttyd_credential_is_per_session_one_way…`.
-
 - ttyd runs with `-b /term/<id>` and answers the bare base path with a 302 to the slash form. **The
   hub adds that slash itself before proxying** rather than letting ttyd redirect — a hop that
   normalizes the slash away sends ttyd's redirect at itself (`ERR_TOO_MANY_REDIRECTS`); one

@@ -39,8 +39,11 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
     lands them on `-L turma`; the set only shrinks. It is published to `~/.turma/tmux-legacy` so the
     tunnel reads the default server ONLY for a listed name — a blind fallback would read a
     session's own `agent-<id>`-named tmux there.
-  - ttyd's `-c` is per-session `_ttyd_credential`, never TURMA_TOKEN (argv is world-readable,
-    XERK-1588); hub `ttydAuth` mirrors it. Headless `claude -p` runs take `_session_env()`.
+  - ttyd listens on `TTYD_SOCK_DIR/<ttydPort>.sock` (0700), no TCP port and no `-c` (XERK-1588):
+    argv is world-readable and loopback is reachable by every local uid, so any credential there
+    was a writable terminal for anyone. `tunnel-agent.js` `ttydSockPath` must name the same file.
+    - A too-long socket path does NOT fail ttyd (it runs bound to nothing): length is checked and
+      the socket awaited after launch. Headless `claude -p` runs take `_session_env()`.
   - A ttyd runs `tmux attach` per browser connection, so it keeps reaching the server it was
     started for: `_launch_ttyd` records `ttydTmuxSocket` and relaunches a ttyd whose socket differs
     from the session's (absent = default, i.e. a pre-XERK-1078 ttyd).

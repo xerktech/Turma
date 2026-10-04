@@ -7,7 +7,7 @@
 // control endpoint. When a browser opens a session's terminal in the Turma,
 // the hub sends {"open":<ch>,"port":<ttydPort>} on that control channel; we then
 // dial back a data WebSocket for <ch> and bridge it to THAT session's local ttyd
-// (127.0.0.1:<port>). The host multiplexes N per-session ttyds (one per port,
+// (its owner-only UNIX socket, keyed by <port>; XERK-1588). The host multiplexes N per-session ttyds (one per port,
 // allocated from TTYD_PORT_BASE by the manager); data channels fan out to them
 // by port while the single control channel stays per-host. Because every
 // connection here is outbound to TURMA_URL, the hub and this container can live on
@@ -1616,8 +1616,9 @@ function liveTurnDecision(prevGen, prevPending, generating) {
 // list rides the frame separately and is unaffected; these are the pane-scraped
 // display halves.)
 const PTY_HOST_DIR = path.join(os.homedir(), ".turma", "pty-hosts");
-// The token the pty-host was minted with (`--auth-token` = TURMA_TOKEN or
-// 'changeme' = ttyd's `-c` token), exactly as hub-agent.py's _pty_control uses.
+// The token the pty-host was minted with (TURMA_TOKEN or 'changeme', which the
+// manager writes to its owner-only auth-token file), exactly as hub-agent.py's
+// _pty_control uses.
 const PTY_CONTROL_TOKEN = TOKEN || "changeme";
 const PTY_CAPTURE_TIMEOUT_MS = 2000; // matches the tmux capture timeout below
 
@@ -2410,13 +2411,33 @@ function deviceName() {
 
 const NAME = deviceName();
 
-// Bridge one data channel: hub data-WS <-> the target session's local ttyd TCP.
+// A Linux ttyd listens on an owner-only UNIX socket keyed by its session's port
+// (XERK-1588), never a loopback TCP port any local uid could reach. Must name the
+// same file as hub-agent.py's `_ttyd_sock_path`. null for a non-integer port.
+const TTYD_SOCK_DIR = path.join(os.homedir(), ".turma", "ttyd");
+function ttydSockPath(port) {
+  const p = Number(port);
+  if (!Number.isInteger(p) || p <= 0) return null;
+  return path.join(TTYD_SOCK_DIR, `${p}.sock`);
+}
+
+// Where to dial a session's terminal: its socket when one is there, else the
+// loopback port — a Windows pty-host, or a ttyd an older agent left on TCP.
+function ttydTarget(port) {
+  const sp = ttydSockPath(port);
+  try {
+    if (sp && fs.lstatSync(sp).isSocket()) return { path: sp };
+  } catch { /* no socket: TCP */ }
+  return { port: port || DEFAULT_TTYD_PORT, host: TTYD_HOST };
+}
+
+// Bridge one data channel: hub data-WS <-> the target session's local ttyd.
 // `port` selects which per-session ttyd to dial (defaults to 7681 for safety).
 function openDataChannel(ch, port) {
   const url = `${WS_BASE}/agent/data?ch=${encodeURIComponent(ch)}&token=${encodeURIComponent(TOKEN)}`;
   const ws = new WebSocket(url);
   ws.binaryType = "arraybuffer";
-  const sock = net.connect(port || DEFAULT_TTYD_PORT, TTYD_HOST);
+  const sock = net.connect(ttydTarget(port));
   // Disable Nagle: terminal traffic is a stream of tiny keystroke/echo packets,
   // and Nagle would coalesce them behind delayed-ACKs (~40ms bursts), making
   // live typing feel choppy. We want each byte on the wire immediately.
@@ -2544,7 +2565,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, backscanLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, backscanLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

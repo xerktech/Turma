@@ -148,3 +148,9 @@ Python side in `.claude/rules/agent.md`.
   `__fsWatchCount()`, a count of OPEN handles: counting `watchers` entries cannot
   see a leak, because `stopWatch` deletes the entry while the orphaned handle
   still holds the file.
+
+## ttyd target (XERK-1588)
+
+- A data channel dials `ttydTarget(port)`: the owner-only `~/.turma/ttyd/<port>.sock` when it is a
+  socket, else loopback TCP (Windows pty-host, or an older agent's ttyd). Never drop the socket
+  preference: a loopback ttyd is reachable by every local uid. Tests: `tunnel-ttyd-sock.test.js`.

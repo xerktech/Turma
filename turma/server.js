@@ -1312,20 +1312,10 @@ const OIDC_SESSION_TTL_MS = Math.max(
 // know which from how its own heartbeat authenticated (`tokenBound` on the
 // record), so a half-rolled fleet keeps every terminal working rather than
 // 401ing the hosts that haven't moved.
-//
-// A host reporting `termSessionAuth` (XERK-1588) runs each ttyd on a PER-SESSION
-// credential, HMAC(token, "ttyd:<sessionId>") — its `_ttyd_credential` — because
-// ttyd takes `-c` only on argv, which any local uid can read through /proc. The
-// hub re-derives it from the token it already knows, so no secret is added to
-// the wire. An older agent (or a Windows host, whose pty-host reads the raw token
-// from a file) reports nothing and keeps getting the raw token.
-function ttydAuth(host, sessionId) {
+function ttydAuth(host) {
   const a = agents[host];
   const token = (a && a.tokenBound ? hostAgentToken(host) : TURMA_AGENT_TOKEN) || "changeme";
-  const cred = a && a.termSessionAuth === true
-    ? crypto.createHmac("sha256", token).update(`ttyd:${sessionId}`).digest("hex")
-    : token;
-  return "Basic " + Buffer.from(`term:${cred}`).toString("base64");
+  return "Basic " + Buffer.from(`term:${token}`).toString("base64");
 }
 
 // ---- LiteLLM backend (OpenAI-compatible: Whisper STT) -----------------------
@@ -7350,8 +7340,6 @@ function normalizeTokenRoll(a) {
   if (!a || typeof a !== "object") return;
   if ("tokenRoll" in a) a.tokenRoll = a.tokenRoll === true;
   if ("tokenBound" in a) a.tokenBound = a.tokenBound === true;
-  // XERK-1588's terminal-credential capability: only a literal true counts.
-  if ("termSessionAuth" in a && a.termSessionAuth !== true) delete a.termSessionAuth;
 }
 
 // Merge the agent's on-demand history deliveries (heartbeat `historyResults`)
@@ -8676,7 +8664,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
   "dsh", "qwen", "triage", "trajectory", "closeTicket", "pauseSleepers", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
-  "sessions", "startedAt", "subscription", "termSessionAuth", "tokenRoll", "uploadMaxBytes", "usage",
+  "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
@@ -17183,8 +17171,8 @@ function terminalReconnectPage(res, tunnelOnline) {
 // is the backstop for anything it (or a future path) misses. Generous — terminal
 // assets are tiny and fast, so it can only ever fire on a genuine hang.
 const TERM_PROXY_TIMEOUT_MS = positiveEnv("TERM_PROXY_TIMEOUT_MS", 30 * 1000);
-async function proxyTerm(req, res, name, port, sessionId) {
-  const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name, sessionId) };
+async function proxyTerm(req, res, name, port) {
+  const headers = { ...req.headers, host: "ttyd", authorization: ttydAuth(name) };
   // Keep-alive over the pooled channel — drop any client-sent Connection header
   // so ttyd keeps the tunnel channel open for the next asset instead of closing.
   delete headers.connection;
@@ -21246,7 +21234,7 @@ const server = http.createServer(async (req, res) => {
       if (parts.length === 2 && !url.pathname.endsWith("/") && req.url.startsWith(url.pathname)) {
         req.url = `${url.pathname}/${req.url.slice(url.pathname.length)}`;
       }
-      return proxyTerm(req, res, loc.host, loc.port, sessionId);
+      return proxyTerm(req, res, loc.host, loc.port);
     }
 
     json(res, 404, { error: "not found" });
@@ -21725,7 +21713,7 @@ server.on("upgrade", async (req, socket, head) => {
     // 101 + WS frames flow straight back (its accept is keyed off the browser's
     // Sec-WebSocket-Key, which we forward verbatim).
     let reqLines = `${req.method} ${req.url} HTTP/1.1\r\n`;
-    const hdrs = { ...req.headers, host: "ttyd", authorization: ttydAuth(loc.host, sessionId) };
+    const hdrs = { ...req.headers, host: "ttyd", authorization: ttydAuth(loc.host) };
     for (const [k, v] of Object.entries(hdrs)) reqLines += `${k}: ${v}\r\n`;
     channel.write(Buffer.from(reqLines + "\r\n"));
     if (head && head.length) channel.write(head);
