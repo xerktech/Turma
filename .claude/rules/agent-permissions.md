@@ -35,12 +35,18 @@ hook-log tail) + `agent/hooks/permlog.py`.
     row. The tail is read only on a face change.
   - **A row with no `toolUseId` of its own repaints on its FACE** (`_dialog_faces_match`): a delegated
     row (every sub-agent prompt shares the Task id), an overridden one (the id was cleared) or one
-    with no pending call. Same `dialogKind`, and question + detail equal with all whitespace removed;
-    a face at parse_pane_prompt's line cap is the other's tail, at its char cap the other's head.
-    Labels are not compared (a wrap drops one). Without it a ttyd attach split such a prompt in two.
-  - **The face is UNCUT by chars** (`detailFace` → `panePromptFace` → `face=`): a long command cut at
-    BOTH caps is a middle window, and two widths' windows need not overlap, so only the line cap may
-    trim it. It never rides the wire: session_report lifts it out of `panePrompt`, the beat pops it.
+    with no pending call. Same `dialogKind`, and the faces are WINDOWS of one text (detail then
+    question, all whitespace removed): uncut ones are equal; one at the line cap lost its top, so it
+    is the other's tail. Labels are not compared (a wrap drops one). Without it a ttyd attach split
+    such a prompt in two.
+  - **The face is cut only by the line cap and `PANE_PROMPT_FACE_CHARS`** (8000; `detailFace` →
+    `panePromptFace` → `face=`), never the wire's 800: at 800 a long command was cut at BOTH caps and
+    two widths' windows need not overlap. It never rides the wire: session_report lifts it out of
+    `panePrompt`, the beat pops it. So an 800-char `detail` with no face is WHOLE, never a cut.
+  - **A face past `PANE_PROMPT_FACE_CHARS`** (14 lines of a ~570+-column pane) lost its bottom too: a
+    middle window. It matches only under the same question and overlapping the other's text by
+    `PANE_FACE_MIN_OVERLAP` (`_windows_overlap`, at most `PANE_FACE_MAX_PROBES` alignments a side).
+    Two windows that do not overlap cannot be placed, so that redraw still opens a second row.
   - **Only a PRE-EXECUTION prompt (`permission`/`plan`) repaints on the call alone.** A running call
     raises any number of sandbox prompts under one `toolUseId` (`npm install`: the registry, then
     GitHub), so a `sandbox` face is a repaint only while its host equals the row's `head`.
@@ -77,11 +83,23 @@ hook-log tail) + `agent/hooks/permlog.py`.
     prompt answered between beats, and stays its own row.
 - **`classifier-denied`** — auto mode's soft block shows NO dialog: the model is told no and turns to
   the human in chat. Only the `PermissionDenied` hook sees it. A complete row on its own.
-- **`ask-in-chat`** — the session ended its turn asking for permission in prose. INTERIM: a cheap
-  regex (`PERMISSION_ASK_RE`) on the last assistant message, once per turn, on the agent's
-  ended-turn edge (idle pane, nothing pending, last word the assistant's with no tool call); closed by
-  the next operator `input` (`via:"turma"`). Sessions already sitting there on a manager's first beat
-  are PRIMED, not re-filed. Replaced by the wait classifier (a later XERK-1560 child).
+- **`ask-in-chat`** — the session ended its turn asking for permission in prose, judged once per
+  turn on the agent's ended-turn edge (idle pane, nothing pending, last word the assistant's with no
+  tool call); closed by the next operator `input` (`via:"turma"`). Sessions already sitting there on
+  a manager's first beat are PRIMED, not re-filed.
+  - **Where the wait classifier runs (XERK-1572) ITS verdict decides**: the turn waits in
+    `_perm_ask_pending` and a `rubber-stamp` label opens the row (prompt = the session's asking
+    sentence via the regex, else the classifier's `why`; `openedAt` = the edge); any other label
+    opens none, even where the regex would have matched.
+  - **A manager restart mid-classification does not lose the ask**: the first beat primes, EXCEPT
+    a turn whose persisted `attentionHint` is the same `review|<ts>` edge and not yet `done` — that
+    one goes back into `_perm_ask_pending`, so the re-staged verdict still files it.
+  - **The hub's own stall/loop nudge is not an answer**: it rides `input` with `source:"nudge"`,
+    which skips `_permission_close_ask` — no pending ask is settled, no open row closed `via:"turma"`.
+  - **The regex (`PERMISSION_ASK_RE`, `_permission_ask_prompt`) is the FALLBACK**: a dsh/qwen
+    session, `TURMA_ATTENTION_HINTS=0`, a classifier that gave no verdict after its last attempt,
+    and a turn answered (Turma `input` or the session moved on) before the verdict landed — that
+    last one opens and closes the row at once, so a quick answer still counts.
   - **Answered OUTSIDE Turma** (the terminal, claude.ai) it closes `via:"terminal"` once the session
     moves past the asking turn: the pane went busy, a newer `user` entry, or a NEWER ended turn. An
     open row blocks every later ask of that session, so it must not wait for a Turma `input`. A
@@ -89,9 +107,14 @@ hook-log tail) + `agent/hooks/permlog.py`.
 - **A session that leaves `running`** without a kill/delete (exited, errored, stopped) closes its
   open rows on the next beat (`_permission_close_departed`), as kill/delete already did.
 - **A manager restart re-files a live dialog.** `_perm_open` is in memory, so a dialog up across a
-  restart is opened again under a new id. The HUB closes the orphan (`closeSuperseded`, answer and
-  wait unknown — `turma-permissions.md`); the prompt still counts twice and its pre-restart wait is lost.
+  restart is opened again under a new id; the prompt counts twice and its pre-restart wait is lost.
+  The agent never closes the lost row. The HUB does (answer and wait unknown, `turma-permissions.md`):
+  a lost dialog row when that session files a NEWER dialog row (the re-filed one), a lost ask on ANY
+  newer row of its session, and any row still open after 24h (`OPEN_MAX_MS`).
 - **A sandbox escape is not hookable at all** — the pane is its only source.
+  - Its host comes ONLY from the TUI's `Host:` row, else its "don't ask again for <host>" option
+    (`_pane_dialog_host`). Any other host-shaped word may be the call's text (`package.json` fits),
+    and the head is pasted as an `allowedDomains` rule; no host means no rule.
 - **Open question (record the answer here):** what the TUI shows for a classifier block. The first
   week of real data answers it; until then nothing assumes it shows a dialog.
 
@@ -103,9 +126,20 @@ hook-log tail) + `agent/hooks/permlog.py`.
   process PRIMES every log ON DISK to EOF, a stopped session's included (it keeps its id and log, and
   a later Start would otherwise replay them as new prompts). Rows are staged in
   `_permission_rows_fetched`, REBOUND under `_permission_lock`; the beat drains and owns every row.
+- **Known gap: priming drops what was logged while the manager was down.** A `PermissionDenied`
+  written then is never read (its `c-<sid>-<toolUseId>` id would replay idempotently, but the
+  `PermissionRequest`s beside it would double-count). Fix = persist cursors with the registry.
+- **The DIR is session-writable too, so it is never read or swept THROUGH a link**
+  (`_permissions_dir_planted`): a session swapping it for a link to `~/.claude/projects/<slug>` would
+  have the hourly sweep delete other sessions' transcripts. The sweep opens the dir
+  `O_DIRECTORY|O_NOFOLLOW`, stats/unlinks relative to that fd, and removes only permlog's own names
+  (`<sid>.jsonl`, `<sid>.jsonl.1`, `_permission_log_sid`).
 - **The log is session-written** (Bash walks past the `Edit` deny): every read is `O_NONBLOCK` +
   `O_NOFOLLOW` + regular-file only + bounded (`_read_permission_log`, guard.py's `_read_text`
   discipline), every line re-shaped (`parse_permission_log_lines`), over-long lines skipped.
+- **A trailing partial already longer than `PERMISSION_LOG_LINE_MAX` is consumed as junk** — a
+  newline-free read otherwise never moves the cursor, so one session's Bash write could blank
+  another session's rows until the file rotates.
 - **The pane edges read the transcript tail ONLY on an edge** — the same bounded tail read
   `session_report` already does every beat.
 - **`permissionEvents`** rides the heartbeat oldest-first, at most `PERMISSION_EVENTS_MAX` (200) a

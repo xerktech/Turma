@@ -2,7 +2,8 @@ import type { AgentInfo, PrInfo, SessionInfo, SessionRef } from "./types.ts";
 
 // "holding" (XERK-1570): every live background row is a WAITING shell (a sleep,
 // a CI watch) — not working, and not the operator's yet. Stalled waits read
-// "idle", so a dead shell surfaces like any finished session.
+// "idle", so a dead shell surfaces like any finished session. A session ASLEEP
+// until a session-CLI wake (XERK-1571) is "holding" too.
 export type LiveState = "working" | "waiting" | "holding" | "idle" | "stopped" | "error";
 
 // "pending" is not a live-server state — it's an app-layer overlay app.ts
@@ -39,7 +40,9 @@ export function liveState(
   // behaviour rather than reading every session as idle.
   if (live?.transcriptAgeSec == null) return "idle";
   if (hostLastSeen != null && (now ?? Date.now()) - hostLastSeen >= OFFLINE_AFTER_MS) {
-    return "idle";
+    // A sleep is not a pushed busy read: the hub honours a pending wake on an
+    // offline host too (sessionSleeping has no online gate), so this does.
+    return sleeping(live, now ?? Date.now()) ? "holding" : "idle";
   }
   // Background agents are what paneBusy cannot see (XERK-245): a session that
   // delegated work and ended its own turn paints no interrupt hint, so it read
@@ -53,6 +56,9 @@ export function liveState(
     : !hasLiveAgents(live) && live.transcriptAgeSec * 1000 < WORKING_WINDOW_MS;
   if (working) return "working";
   const t = now ?? Date.now();
+  // Asleep until a session-CLI wake (XERK-1571) — mirror of server.js
+  // sessionSleeping: never ready for review until the wake is due.
+  if (sleeping(live, t)) return "holding";
   const wait = backgroundWait(live?.agents, (hostLastSeen ?? t) - live.transcriptAgeSec * 1000, t);
   return wait?.state === "waiting" ? "holding" : "idle";
 }
@@ -63,6 +69,12 @@ type LiveAgentRow = NonNullable<NonNullable<SessionInfo["session"]>["agents"]>[n
 // or an agent predating the field — is work.
 export function isWaitRow(a: LiveAgentRow | null | undefined): boolean {
   return !!a && (a.kind === "wait-timed" || a.kind === "wait-external");
+}
+
+// A session-CLI wake still in the future (XERK-1571).
+export function sleeping(live: SessionInfo["session"], now: number): boolean {
+  const w = live?.wakeAt;
+  return typeof w === "number" && Number.isSafeInteger(w) && w > now;
 }
 
 // Does the session have background WORK in flight (any row that isn't a wait)?
@@ -133,6 +145,42 @@ export function readyForReview(
   // moves past the landing (`newWorkSincePrs`, XERK-224).
   if (prs.length && !s.newWorkSincePrs) return false;
   return live.lastRole === "assistant" && !live.lastHasToolUse;
+}
+
+// Is this session in the Ready for review group (XERK-1571, web sessions.html
+// `inReview`)? Where the hub serves an attention state it DECIDES: every
+// needs-you:* session is listed (question, permission, review, stalled) and
+// nothing else — the set the dashboard's Ready-for-review tile counts. From an
+// older hub (no attention) the local readyForReview port decides, as before.
+// On an OFFLINE host the hub's state is frozen at its last beat, so a
+// non-needs-you one must not keep stranded work out: the local rule decides
+// it too (XERK-235).
+export function inReview(s: SessionInfo, hostLastSeen?: number, now?: number): boolean {
+  const st = s.attention?.state;
+  if (typeof st === "string" && st.startsWith("needs-you:")) return true;
+  if (hostLastSeen != null && (now ?? Date.now()) - hostLastSeen >= OFFLINE_AFTER_MS) {
+    return readyForReview(s, hostLastSeen, now);
+  }
+  if (typeof st === "string" && st) return false;
+  return readyForReview(s, hostLastSeen, now);
+}
+
+// The wait classifier's verdict on a needs-you card (XERK-1572, web sessions.html
+// `attentionHint`): "decision · Pick v2 or v3" and the answer it suggests. Empty
+// strings when the hub serves none, or the session no longer needs the operator.
+const HINT_KIND: Record<string, string> = {
+  "rubber-stamp": "go-ahead", "design-decision": "decision", "needs-human-test": "needs a human test",
+  "blocked-on-host": "blocked on the host", looping: "looping", "waiting-external": "waiting on something outside",
+};
+export function attentionHint(s: SessionInfo): { line: string; answer: string } {
+  const att = s.attention;
+  const h = att?.hint;
+  if (!att || !att.state.startsWith("needs-you:") || !h || typeof h.why !== "string" || !h.why) {
+    return { line: "", answer: "" };
+  }
+  const kind = HINT_KIND[h.label] ?? "";
+  return { line: kind ? `${kind} · ${h.why}` : h.why,
+           answer: typeof h.suggestedAnswer === "string" ? h.suggestedAnswer : "" };
 }
 
 // Leading status icon on each home-menu session row — chosen to be

@@ -22,7 +22,7 @@ global.window.TurmaBoard = require("../public/board.js");
 const Org = require("../public/org.js");
 
 const PUBLIC = path.join(__dirname, "..", "public");
-const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html"];
+const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html", "brief.html"];
 
 const agent = (key, siteKey) => ({
   key, device: key, online: true, sessions: [],
@@ -354,6 +354,35 @@ test("org: a beat that changes nothing doesn't rewrite the control", () => {
   Org.update(data);
   Org.update(data);
   assert.equal(writes, 0);
+});
+
+// A long menu scrolls (XERK-1285), so a repaint (a ticket count, a "synced
+// Nm ago" age) must keep the menu's scroll and the focused row, or a keyboard
+// user deep in the list lands back at the top with focus on <body>.
+test("org: a repaint keeps the menu's scroll and the focused control", () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")] });
+  click("data-org-toggle", "");
+  const focused = { attributes: [{ name: "class", value: "org-row-main" },
+    { name: "data-org-key", value: "acme.atlassian.net" }] };
+  const again = { focus(opts) { this.focusedWith = opts; } };
+  let asked = null, wrapped = 0;
+  slot.ownerDocument = { activeElement: focused };
+  slot.querySelector = (sel) => { asked = sel; return again; };
+  global.CSS = { escape: (s) => s.replace(/"/g, '\\"') };
+  global.window.TurmaNav = { preserveScroll(container, paint) {
+    assert.equal(container, slot); wrapped++; paint();
+  } };
+  try {
+    Org.update({ agents: [{ ...agent("a", "acme.atlassian.net"),
+      jira: { siteKey: "acme.atlassian.net", available: true, tickets: [{ key: "A-1" }] } }] });
+    assert.equal(wrapped, 1, "the swap goes through preserveScroll");
+    assert.match(slot.innerHTML, /org-menu/);
+    assert.equal(asked, '[data-org-key="acme.atlassian.net"]');
+    assert.deepEqual(again.focusedWith, { preventScroll: true }, "focus returns to the same row");
+  } finally {
+    delete global.window.TurmaNav; delete global.CSS;
+  }
 });
 
 test("org: the auto switch flips optimistically and rolls back on a failed POST", async () => {

@@ -596,6 +596,10 @@ const EPIC_RUNS_FILE = process.env.EPIC_RUNS_FILE || "/data/epic-runs.json";
 // the hub restarts must survive so its idea is dispatched, not lost. Small (a few
 // per operator burst, bounded EPIC_BUILDERS_MAX).
 const EPIC_BUILDERS_FILE = process.env.EPIC_BUILDERS_FILE || "/data/epic-builders.json";
+// The per-org brief (XERK-1573): siteKey -> its last few briefs. LOW churn (one
+// write per org per BRIEF_INTERVAL_MIN, plus an operator's on-demand one), so it
+// is a registerExternalStore like epicRuns, not a high-churn ledger.
+const BRIEFS_FILE = process.env.BRIEFS_FILE || "/data/briefs.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -3265,6 +3269,117 @@ function publishEpicBuilders() {
   invalidateAgentsCache();
   sseBroadcast("epicBuilders", epicBuilders);
 }
+
+// ---- the per-org brief store (XERK-1573) --------------------------------------
+// siteKey -> that org's last briefs, NEWEST FIRST. Served as top-level `briefs` on
+// /api/agents + its own SSE frame, and Android TYPES it — so every record goes
+// through sanitizeBrief, the ONE whitelist, on compose, restore and a remote
+// watch alike (a live record is then a coerce fixed-point, so HA's own-write echo
+// dedups). Bounds are INLINE LITERALS: this runs at module-init, where a const
+// declared below is in its TDZ (the sibling-store rule). Null-prototype map, like
+// the other org-keyed maps (XERK-1451).
+const BRIEF_SECTIONS = ["finished", "needsYou", "waiting", "stalled", "nextUp", "closedStale"];
+const BRIEF_COUNT_KEYS = [...BRIEF_SECTIONS, "intake", "outflow"];
+function sanitizeBriefItem(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const str = (x, n) => (typeof x === "string" && x ? x.slice(0, n) : undefined);
+  const ms = (x) => (Number.isSafeInteger(x) && x > 0 ? x : undefined);
+  const kind = str(v.kind, 20);
+  const title = str(v.title, 200);
+  if (!kind || !title) return null;
+  const out = { kind, title };
+  for (const [k, n] of [["key", 64], ["url", 500], ["prUrl", 500], ["host", 200], ["sessionId", 100],
+    ["transcriptId", 100], ["state", 40], ["why", 200], ["reason", 200], ["note", 300]]) {
+    const s = str(v[k], n);
+    if (s !== undefined) out[k] = s;
+  }
+  for (const k of ["since", "eta"]) if (ms(v[k]) !== undefined) out[k] = v[k];
+  return out;
+}
+function sanitizeBriefSpend(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.label !== "string" || !v.label) return null;
+  const out = { label: v.label.slice(0, 200) };
+  for (const k of ["fiveHourPct", "sevenDayPct"]) {
+    if (typeof v[k] === "number" && Number.isFinite(v[k])) out[k] = Math.min(100, Math.max(0, v[k]));
+  }
+  for (const k of ["fiveHourResetsAt", "sevenDayResetsAt", "capturedAt"]) {
+    if (Number.isSafeInteger(v[k]) && v[k] > 0) out[k] = v[k];
+  }
+  out.paused = v.paused === true;
+  return out;
+}
+function sanitizeBrief(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.siteKey !== "string" || !v.siteKey) return null;
+  if (!Number.isSafeInteger(v.at) || v.at <= 0) return null;
+  const out = {
+    siteKey: v.siteKey.slice(0, 200),
+    at: v.at,
+    since: Number.isSafeInteger(v.since) && v.since > 0 && v.since <= v.at ? v.since : v.at,
+    trigger: v.trigger === "manual" ? "manual" : "scheduled",
+    autoStart: v.autoStart === true,
+  };
+  const counts = {};
+  const rawCounts = v.counts && typeof v.counts === "object" ? v.counts : {};
+  for (const k of BRIEF_COUNT_KEYS) {
+    const n = rawCounts[k];
+    counts[k] = Number.isSafeInteger(n) && n >= 0 ? n : 0;
+  }
+  out.counts = counts;
+  for (const k of BRIEF_SECTIONS) {
+    out[k] = (Array.isArray(v[k]) ? v[k] : []).map(sanitizeBriefItem).filter(Boolean).slice(0, 10);
+  }
+  out.spend = (Array.isArray(v.spend) ? v.spend : []).map(sanitizeBriefSpend).filter(Boolean).slice(0, 10);
+  // Hub-internal bookkeeping, never on the wire (briefWire strips both): the
+  // digest of the FULL needs-you set (the push compares it — the lists above are
+  // cut at 10), and every merged PR URL a brief already reported, carried forward
+  // on the newest brief alone (the 10-row `finished` list cannot hold them).
+  // Absent stays absent, so a coerced record is still a fixed point.
+  if (typeof v.needsYouSig === "string" && /^(?:[0-9a-f]{40})?$/.test(v.needsYouSig)) {
+    out.needsYouSig = v.needsYouSig;
+  }
+  if (Array.isArray(v.prsReported)) {
+    out.prsReported = [...new Set(v.prsReported.filter((u) => typeof u === "string" && u
+      && u.length <= 500))].slice(0, 500);
+  }
+  return out;
+}
+// What a client is served (/api/agents, the SSE frame, the route): the newest
+// brief in full, each earlier one as its headline only (both clients show just
+// its counts) — so the payload carries one brief's rows per org, not ten. Still
+// the typed shape (empty sections), minus the hub-internal keys.
+function briefWire(b, full) {
+  const out = { ...b };
+  delete out.needsYouSig;
+  delete out.prsReported;
+  if (!full) {
+    for (const k of BRIEF_SECTIONS) out[k] = [];
+    out.spend = [];
+  }
+  return out;
+}
+function briefsWire() {
+  const out = {};
+  for (const [site, list] of Object.entries(briefs)) out[site] = list.map((b, i) => briefWire(b, i === 0));
+  return out;
+}
+const briefsCoerce = (raw) => {
+  const out = Object.create(null);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [site, list] of Object.entries(raw).slice(0, 100)) {
+      if (!site || !Array.isArray(list)) continue;
+      const kept = list.map(sanitizeBrief).filter((b) => b && b.siteKey === site).slice(0, 10);
+      if (kept.length) out[site] = kept;
+    }
+  }
+  return out;
+};
+let briefs = briefsCoerce(readJsonFile(BRIEFS_FILE));
+const persistBriefs = registerExternalStore({
+  name: "briefs", file: BRIEFS_FILE,
+  coerce: briefsCoerce, read: () => briefs, install: (v) => { briefs = v; },
+});
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
 // merely LISTED among the org's triaged `jira.repoOptions` (a gh-clonable repo no
 // host has cloned yet). Used by the route to refuse a builder pinned to a repo no
@@ -4863,6 +4978,9 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
     // Idempotent, and returns the list unchanged when nothing matches.
     repoUsage: usageLedger.foldSystemRepos((durable && durable.repoUsage) || a.repoUsage),
     commands: publicCommands(a.commands),
+    // Each session's hub-derived attention (XERK-1571), stamped on a CLONE of
+    // sessions[] — never into the stored record. See sessionsWithAttention.
+    sessions: sessionsWithAttention(a.sessions, a.alerts && a.alerts.sessions),
     online,
     // An expected restart in progress (XERK-29): only meaningful while the host
     // is actually silent — a host that came back is just `online` again, and its
@@ -4950,6 +5068,11 @@ function buildAgentsCache() {
     // channel for the builder UI (subtask E) plus its own SSE event. A NEW
     // top-level key, so an older client just ignores it.
     epicBuilders,
+    // The per-org brief (XERK-1573): siteKey -> its last briefs, newest first.
+    // Hub-owned, sanitized on every write/restore (sanitizeBrief) because Android
+    // TYPES it; clients scope it by the header org filter like every org surface.
+    // The newest brief per org in full, earlier ones as headlines (briefWire).
+    briefs: briefsWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -6672,6 +6795,21 @@ function subscriptionKeyOf(key, a) {
 // is allowed to spend. AUTO uses the full set (both triggers), as it always has.
 function pausedSubscriptions(nowMs, opts) {
   const fiveHourOnly = !!(opts && opts.fiveHourOnly);
+  const out = new Set();
+  for (const [subKey, v] of freshestLimitsBySub(nowMs)) {
+    const paused = fiveHourOnly
+      ? limitsFiveHourMaxed(v.limits, nowMs)
+      : subscriptionLimitsPaused(v.limits, nowMs);
+    if (paused) out.add(subKey);
+  }
+  return out;
+}
+
+// The freshest non-stale `limits` per subscription, FLEET-WIDE: a subscription is
+// one shared pool whichever org's host reported it. pausedSubscriptions and the
+// brief's spend (XERK-1573) both read this, so a brief's % and its paused chip
+// always come from the same snapshot.
+function freshestLimitsBySub(nowMs) {
   const nowSec = Math.floor(nowMs / 1000);
   const freshest = new Map();  // subKey -> {capturedAt, limits}
   for (const [key, a] of Object.entries(agents)) {
@@ -6684,14 +6822,7 @@ function pausedSubscriptions(nowMs, opts) {
       freshest.set(subKey, { capturedAt: lim.capturedAt || 0, limits: lim });
     }
   }
-  const out = new Set();
-  for (const [subKey, v] of freshest) {
-    const paused = fiveHourOnly
-      ? limitsFiveHourMaxed(v.limits, nowMs)
-      : subscriptionLimitsPaused(v.limits, nowMs);
-    if (paused) out.add(subKey);
-  }
-  return out;
+  return freshest;
 }
 
 // Is this host's UNPINNED/claude auto-start paused (XERK-544/548)? Only a host
@@ -6951,6 +7082,23 @@ function normalizeTrajectory(payload) {
     return;
   }
   payload.trajectory = { available: t.available === true };
+}
+
+// The close-ticket (XERK-1569) capability block: whether this host's manager
+// READS a session's close-ticket request. The hub deploys on merge but agents
+// self-update later, and an agent carrying the session CLI but predating the
+// reader would accept the request, tell the session "the manager will act on
+// it", and never act — so the auto-close message names the CLI only for a host
+// that reports this. Coerced like normalizeTrajectory: strictly boolean,
+// unusable becomes NULL, ABSENT stays absent ("this host can't").
+function normalizeCloseTicket(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.closeTicket;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("closeTicket" in payload) payload.closeTicket = null;
+    return;
+  }
+  payload.closeTicket = { available: t.available === true };
 }
 
 // This host's EFFECTIVE default runtime for an unpinned spawn (XERK-521), coerced
@@ -7287,6 +7435,26 @@ function ingestStatusResults(agent, ticketStatusResults) {
       .sort((a, b) => a[1].at - b[1].at)
       .slice(0, over)
       .forEach(([id]) => delete agent.statusResults[id]);
+  }
+}
+
+// A session closing its OWN ticket (XERK-1569, heartbeat `ticketOutcomeResults`,
+// `[{sessionId, key, kind, ok, error, final, status, at}]`). Logged only: the
+// board reads the outcome off the session's stamped `ticket.outcome`, and
+// autoStopSweep retires the session once the Done edge is polled. Extracted from
+// the payload so the list is never persisted on the record. Every agent-supplied
+// string goes through logName (a newline in one would forge a log line).
+const TICKET_OUTCOME_LOG_MAX = 50;
+function logTicketOutcomes(host, results) {
+  for (const r of (Array.isArray(results) ? results : []).slice(0, TICKET_OUTCOME_LOG_MAX)) {
+    if (!objectish(r)) continue;
+    const what = `${logName(host)}: session closed ticket ${logName(r.key || "?")}`;
+    if (r.ok === true) {
+      console.log(`${what} -> ${logName(r.status || "Done")} as ${logName(r.kind || "?")}`);
+    } else {
+      console.log(`${what} FAILED${r.final === false ? " (will retry)" : ""}: `
+        + logName(String(r.error || "").slice(0, 300)));
+    }
   }
 }
 
@@ -8295,13 +8463,13 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "qwen", "triage", "trajectory", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "triage", "trajectory", "closeTicket", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
-  "ticketPriorityResults", "ticketLinkResults",
-  "spawnFailures", "epicBuilderStatus", "permissionEvents",
+  "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
+  "spawnFailures", "epicBuilderStatus", "permissionEvents", "attentionHints",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -8690,6 +8858,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeQwen(a);
   normalizeTriage(a);
   normalizeTrajectory(a);
+  normalizeCloseTicket(a);
   normalizeDefaultRuntime(a);
   normalizeHostOs(a);
   normalizeTokenRoll(a);
@@ -8955,6 +9124,23 @@ function coerceLiveSignals(live) {
     if (typeof live.wakeReason === "string") live.wakeReason = live.wakeReason.slice(0, 200);
     else delete live.wakeReason;
   }
+  // The loop signal (XERK-1572): a run of the same failing call. Rebuilt to its
+  // three named fields — `repeats` a positive int32, `tool` a non-empty string
+  // capped at 64, `since` epoch ms — else omitted (the agent sends null when
+  // there is no loop). Never repaired: a wrong `loop` is no loop.
+  if ("loop" in live) {
+    const l = live.loop;
+    if (objectish(l) && wireInt32(l.repeats) && l.repeats > 0 && typeof l.tool === "string" &&
+        l.tool && Number.isSafeInteger(l.since) && l.since > 0) {
+      live.loop = { repeats: l.repeats, tool: l.tool.slice(0, 64), since: l.since };
+    } else delete live.loop;
+  }
+  // The wait-classifier edge the agent sees now (XERK-1572): epoch ms, the
+  // `edgeTs` of the attentionHints row that answers it. Absent = no edge or can't
+  // tell, and then no verdict is folded.
+  if ("attentionEdgeTs" in live && !(Number.isSafeInteger(live.attentionEdgeTs) && live.attentionEdgeTs > 0)) {
+    delete live.attentionEdgeTs;
+  }
   coerceStringList(live, "questionOptions");
   coerceStringList(live, "newPrUrls");
   coerceObjectList(live, "questionOptionsRich"); // QuestionOption leaves are all Strings
@@ -9102,11 +9288,38 @@ function normalizeRepos(a) {
       for (const t of res) {
         if ("root" in t && typeof t.root !== "boolean") delete t.root;
         if ("ticket" in t && !objectish(t.ticket)) delete t.ticket;
+        if (objectish(t.ticket)) coerceTicketOutcome(t.ticket);
         const prs = coerceObjectList(t, "prs");
         if (prs) prs.forEach(coercePrElem);
       }
     }
   }
+}
+
+// `ticket.outcome` (XERK-1569) — how a session closed its own ticket, stamped by
+// the agent's close-ticket reader on the session's ticket block and its ticket
+// ledger (so it rides sessions, closedSessions AND repos[].resumable). Android
+// TYPES it (TicketRef.outcome), so a wrong shape is decode-fatal: `kind` must be
+// one of the CLI's three resolutions and `at` a finite integer (epoch ms), else
+// the whole key is deleted — absent reads as "not closed by its session".
+// `note` is the session's evidence (the close-ticket request's note): kept only
+// as a non-empty string cut to 2000 code points (the agent's
+// CLOSE_TICKET_NOTE_MAX), else dropped ALONE — absent = no note, never an
+// invented one, and a bad note never costs the outcome. The kinds and the cap
+// are INLINE literals, never module consts: this runs from loadState's restore
+// at module-init, where a const declared down here is in its TDZ.
+function coerceTicketOutcome(t) {
+  if (!("outcome" in t)) return;
+  const o = t.outcome;
+  const kind = objectish(o) ? o.kind : null;
+  if (!(kind === "done" || kind === "not-reproducible" || kind === "already-fixed")
+      || !wireLong(o.at)) {
+    delete t.outcome;
+    return;
+  }
+  const note = typeof o.note === "string" && o.note
+    ? (o.note.length > 2000 ? Array.from(o.note).slice(0, 2000).join("") : o.note) : "";
+  t.outcome = note ? { kind: o.kind, at: o.at, note } : { kind: o.kind, at: o.at };
 }
 
 // `closedSessions` (List<ClosedSessionInfo> on Android). Non-array → [],
@@ -9121,6 +9334,7 @@ function normalizeClosedSessions(a) {
       if (k in c && typeof c[k] !== "boolean") delete c[k];
     }
     if ("ticket" in c && !objectish(c.ticket)) delete c.ticket;
+    if (objectish(c.ticket)) coerceTicketOutcome(c.ticket);
     const prs = coerceObjectList(c, "prs");
     if (prs) prs.forEach(coercePrElem);
   }
@@ -9463,6 +9677,11 @@ function normalizeSessions(payload) {
       const t = typeof s.summary === "string" ? s.summary.trim() : "";
       s.summary = t.slice(0, 120);
     }
+    // `attention` is HUB-DERIVED (XERK-1571): serializeAgent stamps it on a clone
+    // from the hub's own edge record, so an agent-asserted one (or one a restore
+    // carries) is deleted here — a forged needs-you state, or a wrong-typed one
+    // Android would choke on, never reaches the wire.
+    delete s.attention;
     // Kill switch OFF: a reported/persisted dsh session runtime reads as claude
     // on the wire (coerce "dsh" -> "", which every client already treats as the
     // default), so no client renders a session as dsh and the hub's own /model
@@ -9498,6 +9717,8 @@ function normalizeSessions(payload) {
     for (const k of ["git", "ticket", "work"]) {
       if (k in s && !objectish(s[k])) s[k] = null;
     }
+    // XERK-1569: ticket.outcome (TicketRef.outcome on Android), named coercion.
+    if (objectish(s.ticket)) coerceTicketOutcome(s.ticket);
     // git.dirtyFiles is a non-null Int inside that block; work's aheadOfBase/
     // aheadOfRemote are Int? and pushed a Boolean? — a well-shaped block with a
     // wrong-typed leaf survives the shape check above, so coerce the leaves too.
@@ -11410,12 +11631,16 @@ function prLanded(p) {
 // background shell (a sleep with an ETA still ahead, a CI watch) has ended its
 // turn but is not the operator's yet; once STALLED it is judged like any idle
 // session, which is how a dead shell surfaces.
-function readyForReview(session, working, wait) {
+//
+// A SLEEPING session (XERK-1571: a session-CLI `wake` still ahead) asked to be
+// left alone until then, so it is never ready for review — and so never alerted.
+function readyForReview(session, working, wait, now = Date.now()) {
   if (session.status !== "running") return false;
   const s = session.session || {};
   if (s.question || (s.panePrompt && s.panePrompt.prompt)) return true;
   if (working) return false;
   if (wait && wait.state === "waiting") return false;
+  if (sessionSleeping(s, now)) return false;
   const prs = session.prs || [];
   if (prs.some((p) => !prLanded(p))) return true;
   // Landed PRs stop being a reason to look, but must not become a reason NOT
@@ -11424,6 +11649,194 @@ function readyForReview(session, working, wait) {
   // demotion once the conversation moves past the landing.
   if (prs.length && !session.newWorkSincePrs) return false;
   return s.lastRole === "assistant" && !s.lastHasToolUse;
+}
+
+// Is this session asleep (XERK-1571)? A session-CLI `wake` request (XERK-1564)
+// still in the future: the agent serves it as `wakeAt` on the live block until
+// the beat that delivers it. Mirrored by every client's liveState.
+function sessionSleeping(live, now) {
+  return Number.isSafeInteger(live?.wakeAt) && live.wakeAt > now;
+}
+
+// The attention states (XERK-1571), served as `session.attention.state`. The
+// `needs-you:*` ones are the operator's; `needs-you:test` is a review the wait
+// classifier (XERK-1572) says asks a person to test something by hand.
+const ATTENTION_STATES = new Set([
+  "needs-you:question", "needs-you:permission", "needs-you:review", "needs-you:test",
+  "needs-you:stalled", "working", "waiting", "sleeping", "idle",
+]);
+const ATTENTION_WHY_MAX = 200;
+
+// What a background wait is waiting ON, for the `why` line: the one wait row's
+// label, else a count. Same wording as the clients' backgroundWaitLabel.
+function waitSubject(rows) {
+  const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
+  if (waits.length === 1 && waits[0].label) return waits[0].label;
+  return `${waits.length} background shell${waits.length === 1 ? "" : "s"}`;
+}
+
+// Why a ready-for-review session is the operator's: its live PRs and their CI,
+// or a finished turn with nothing to merge. Read off `session.prs` only.
+function reviewWhy(session) {
+  const live = (session.prs || []).filter((p) => p && !prLanded(p));
+  if (!live.length) return "finished · nothing to merge";
+  const what = live.length === 1 ? "PR open" : `${live.length} PRs open`;
+  if (live.some((p) => p.mergeable === "CONFLICTING")) return `${what} · merge conflict`;
+  const checks = live.map((p) => String(p.checks || "").toLowerCase());
+  if (checks.includes("failing")) return `${what} · CI failing`;
+  if (checks.includes("pending")) return `${what} · CI running`;
+  if (checks.every((c) => c === "passing")) return `${what} · CI passing`;
+  return what;
+}
+
+// What a blocking TUI dialog is asking to do, for a permission's `why` line: the
+// dialog's question is nearly always the same "Do you want to proceed?", which
+// says nothing, so the line names the pending command instead. The agent serves
+// the block above the question as `panePrompt.detail` (hub-agent.py
+// parse_pane_prompt) — "Bash command\ntouch /tmp/x\nCreate marker file" — so a
+// leading dialog TITLE (a short run of plain words) becomes the tool name and the
+// next line its target: "Bash: touch /tmp/x". No detail = the question itself.
+const PERMISSION_WHY_MAX = 120;
+function permissionWhy(pp) {
+  const lines = (typeof pp.detail === "string" ? pp.detail : "").split("\n").map((l) => l.trim()).filter(Boolean);
+  let why = lines[0] || "";
+  if (lines.length > 1 && /^[A-Z][A-Za-z]*( [A-Za-z]+){0,3}$/.test(lines[0])) {
+    why = `${lines[0].replace(/ command$/i, "")}: ${lines[1]}`;
+  }
+  if (!why) why = String(pp.prompt || "");
+  return why.length > PERMISSION_WHY_MAX ? why.slice(0, PERMISSION_WHY_MAX - 1) + "…" : why;
+}
+
+// One session's attention (XERK-1571): {state, eta?, why?} — `since` is added
+// by the caller from the edge it keeps in alerts.sessions. Pure; `working` and
+// `wait` are the caller's sessionWorking/sessionWait reads. Precedence, highest
+// first: question > permission > looping > working > sleeping > waiting >
+// stalled > review > idle. A question outranks stalled and review, so a pending
+// question suppresses both alerts.
+//
+// LOOPING (XERK-1572) is the agent's `loop` signal — the same failing call run
+// LOOP_REPEATS_MIN+ times in a row — and reads needs-you:stalled with `cause:
+// "loop"` (internal: it picks the nudge text and is never served). It outranks
+// working on purpose: a looping session is busy, which is exactly how it hides.
+function sessionAttention(session, working, wait, now) {
+  if (session.status !== "running") return { state: "idle" };
+  const s = session.session || {};
+  const why = (t) => (typeof t === "string" && t ? { why: t.slice(0, ATTENTION_WHY_MAX) } : {});
+  const eta = (t) => (Number.isSafeInteger(t) && t > 0 ? { eta: t } : {});
+  if (s.question) return { state: "needs-you:question", ...why(s.question) };
+  if (s.panePrompt && s.panePrompt.prompt) return { state: "needs-you:permission", ...why(permissionWhy(s.panePrompt)) };
+  const loop = s.loop;
+  if (loop && Number.isSafeInteger(loop.repeats) && typeof loop.tool === "string" && loop.tool) {
+    return { state: "needs-you:stalled", cause: "loop", ...why(`repeating ${loop.tool} ×${loop.repeats}`) };
+  }
+  if (working) return { state: "working" };
+  if (sessionSleeping(s, now)) return { state: "sleeping", ...eta(s.wakeAt), ...why(s.wakeReason) };
+  if (wait) {
+    const st = wait.state === "stalled" ? "needs-you:stalled" : "waiting";
+    return { state: st, ...eta(wait.eta), ...why(waitSubject(s.agents)) };
+  }
+  if (readyForReview(session, working, wait, now)) return { state: "needs-you:review", ...why(reviewWhy(session)) };
+  return { state: "idle" };
+}
+
+// ---- the wait classifier's verdict (XERK-1572) --------------------------------
+// The agent asks a `claude -p` WHY a session waits, once per new needs-you/stalled
+// edge, and ships the verdict as an `attentionHints` row: {key: "<sid>:<edge-ts>",
+// sessionId, edge, edgeTs, label, why, suggestedAnswer?}. Whitelisted here
+// (strict label + edge enums, texts capped), folded into that session's attention
+// as `attention.hint` while the state it answers holds AND the agent still reports
+// that edge: the session's live `attentionEdgeTs` names the edge the agent sees
+// now, so a second wait of the same kind (back-to-back dialogs, a turn shorter
+// than a beat) never wears the first one's verdict.
+const ATTENTION_HINT_LABELS = new Set([
+  "rubber-stamp", "design-decision", "needs-human-test", "blocked-on-host", "looping",
+  "waiting-external",
+]);
+const ATTENTION_HINT_TEXT_MAX = 300;
+const ATTENTION_HINTS_MAX = 50;
+// Which attention state a hint's agent-side edge answers.
+const ATTENTION_HINT_EDGE_STATES = {
+  question: "needs-you:question", permission: "needs-you:permission",
+  review: "needs-you:review", stalled: "needs-you:stalled", loop: "needs-you:stalled",
+};
+function hintText(v) {
+  return typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, ATTENTION_HINT_TEXT_MAX) : "";
+}
+function normalizeAttentionHint(h) {
+  if (!objectish(h)) return null;
+  const sid = h.sessionId;
+  if (typeof sid !== "string" || !sid || sid.length > 128) return null;
+  if (!Object.hasOwn(ATTENTION_HINT_EDGE_STATES, h.edge) || !ATTENTION_HINT_LABELS.has(h.label)) return null;
+  if (!(Number.isSafeInteger(h.edgeTs) && h.edgeTs > 0)) return null;
+  const why = hintText(h.why);
+  if (!why) return null;
+  const out = { sessionId: sid, edge: h.edge, edgeTs: h.edgeTs, label: h.label, why };
+  // A hand test needs a real person, so no suggested reply (it could only claim
+  // a test nobody ran) — dropped here too for an agent that still sends one.
+  const ans = h.label === "needs-human-test" ? "" : hintText(h.suggestedAnswer);
+  if (ans) out.suggestedAnswer = ans;
+  return out;
+}
+function normalizeAttentionHints(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, ATTENTION_HINTS_MAX).map(normalizeAttentionHint).filter(Boolean);
+}
+// Review and test are one edge: the verdict that turns a review into a test must
+// not restart how long it has waited.
+const REVIEW_ATTENTION = new Set(["needs-you:review", "needs-you:test"]);
+function sameAttentionEdge(a, b) {
+  return a === b || (REVIEW_ATTENTION.has(a) && REVIEW_ATTENTION.has(b));
+}
+// The attention with `sa.hint` folded in, or null when the hint does not answer
+// THIS state: its edge names another state, or it is a loop hint on a wait stall
+// (or the reverse). The caller drops a hint the first beat it answers nothing,
+// so a later wait of the same kind never inherits it. `needs-human-test` on a
+// review is needs-you:test.
+function attentionWithHint(attn, hint) {
+  if (!hint || typeof hint !== "object" || !ATTENTION_HINT_LABELS.has(hint.label)) return null;
+  if (ATTENTION_HINT_EDGE_STATES[hint.edge] !== attn.state) return null;
+  if (attn.state === "needs-you:stalled" && (hint.edge === "loop") !== (attn.cause === "loop")) return null;
+  const folded = { label: hint.label, why: hintText(hint.why) };
+  const ans = hintText(hint.suggestedAnswer);
+  if (ans) folded.suggestedAnswer = ans;
+  const out = { ...attn, hint: folded };
+  if (hint.label === "needs-human-test" && attn.state === "needs-you:review") out.state = "needs-you:test";
+  return out;
+}
+
+// The attention a session is SERVED with: a strict rebuild of the edge record
+// kept in alerts.sessions (a restored state.json is as untrusted as a beat), so
+// only the typed shape Android decodes ever reaches the wire. null = omit.
+function wireAttention(attn) {
+  if (!attn || typeof attn !== "object" || !ATTENTION_STATES.has(attn.state)) return null;
+  if (!wireEpochMs(attn.since)) return null;
+  const out = { state: attn.state, since: attn.since };
+  if (wireEpochMs(attn.eta)) out.eta = attn.eta;
+  if (typeof attn.why === "string" && attn.why) out.why = attn.why.slice(0, ATTENTION_WHY_MAX);
+  // The classifier's verdict (XERK-1572): {label, why, suggestedAnswer?}, each
+  // field re-checked, the whole object dropped unless label + why survive.
+  const h = attn.hint;
+  if (h && typeof h === "object" && ATTENTION_HINT_LABELS.has(h.label) && hintText(h.why)) {
+    out.hint = { label: h.label, why: hintText(h.why) };
+    if (hintText(h.suggestedAnswer)) out.hint.suggestedAnswer = hintText(h.suggestedAnswer);
+  }
+  return out;
+}
+
+// The served `sessions[]` with each session's attention STAMPED (XERK-1571).
+// CLONES every session rather than writing into the stored record: the record is
+// the agent's report (size-budgeted, persisted, re-coerced on restore), and a
+// stamp written there would be re-served after the alerts edge moved on. Any
+// `attention` already on a record (normalizeSessions strips a forged one) is
+// dropped here too — the second of two guards.
+function sessionsWithAttention(sessions, alertSessions) {
+  if (!Array.isArray(sessions)) return sessions;
+  return sessions.map((s) => {
+    if (!s || typeof s !== "object") return s;
+    const { attention: _forged, ...rest } = s;
+    const attn = wireAttention(alertSessions && alertSessions[s.id] && alertSessions[s.id].attn);
+    return attn ? { ...rest, attention: attn } : rest;
+  });
 }
 
 // The four token counters the agent reports, summed. Deliberately the SAME
@@ -11507,7 +11920,7 @@ function alertRecovered(key, rec, now) {
   return true;
 }
 
-function heartbeatAlerts(key, prev, next) {
+function heartbeatAlerts(key, prev, next, hints = []) {
   const now = next.lastSeen;
   const alerts = next.alerts;
   const where = next.device ? ` on ${next.device}` : "";
@@ -11580,6 +11993,12 @@ function heartbeatAlerts(key, prev, next) {
   // several Claude sessions a host runs at once.
   alerts.sessions = alerts.sessions || {};
   const liveIds = new Set();
+  // The wait classifier's verdicts this beat delivered (XERK-1572), by session +
+  // the edge each answers, so a late row for an edge already left is never taken.
+  const hintFor = new Map();
+  for (const h of Array.isArray(hints) ? hints : []) {
+    if (h && typeof h.sessionId === "string") hintFor.set(`${h.sessionId}\x00${h.edgeTs}`, h);
+  }
   for (const session of next.sessions || []) {
     liveIds.add(session.id);
     const sa = (alerts.sessions[session.id] = alerts.sessions[session.id] || { prSeen: [] });
@@ -11667,7 +12086,25 @@ function heartbeatAlerts(key, prev, next) {
     //   - A pending question suppresses it: the high-priority question alert
     //     above is already that session's buzz, and it says more.
     const reviewKey = `review:${key}:${session.id}`;
-    const ready = readyForReview(session, working, sessionWait(session, next.lastSeen, now));
+    const waitRead = sessionWait(session, next.lastSeen, now);
+    const ready = readyForReview(session, working, waitRead, now);
+    // The session's attention (XERK-1571), with `since` = the beat its state
+    // last CHANGED — the `reviewAt` pattern: kept on `sa`, so it persists with
+    // `alerts` and is swept with the session by the liveIds cleanup below.
+    const base = sessionAttention(session, working, waitRead, now);
+    const prevAttn = sa.attn;
+    const carried = prevAttn && sameAttentionEdge(prevAttn.state, base.state) && prevAttn.since;
+    // The classifier's verdict (XERK-1572) is held on `sa.hint` and folded while
+    // the state it answers holds and the agent still reports ITS edge
+    // (`attentionEdgeTs`); one that answers nothing current is dropped.
+    const edgeTs = Number.isSafeInteger(s.attentionEdgeTs) ? s.attentionEdgeTs : null;
+    const incoming = edgeTs ? hintFor.get(`${session.id}\x00${edgeTs}`) : null;
+    if (incoming) sa.hint = incoming;
+    const folded = sa.hint && sa.hint.edgeTs === edgeTs ? attentionWithHint(base, sa.hint) : null;
+    if (sa.hint && !folded) delete sa.hint;
+    const attn = folded || base;
+    sa.attn = { ...attn, since: carried ? prevAttn.since : now };
+    const stalled = attn.state === "needs-you:stalled";
     // Only PRs still in play are worth naming — one merged while the alert was
     // held has answered itself.
     const notes = (sa.prNotes || []).filter((n) => !prLanded(prStatus.get(n.url)));
@@ -11684,7 +12121,9 @@ function heartbeatAlerts(key, prev, next) {
       // prAlertDecision holds it past the age-out for the same reason. Every
       // verdict now feeds this one alert, so the hold has to reach it too.
       || livePrs.some((p) => p.mergeable === "CONFLICTING");
-    if (ready && !sa.reviewAlerted && !s.question && !holdingPr && (sa.reviewAt || notes.length)) {
+    // A STALLED session takes the stalled alert below instead (precedence
+    // question > stalled > review): one buzz, the one that says what is wrong.
+    if (ready && !stalled && !sa.reviewAlerted && !s.question && !holdingPr && (sa.reviewAt || notes.length)) {
       const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
       // "Nothing to merge" is a claim about the session, so it may only be made
       // when the session really opened nothing. A live PR with no banked verdict
@@ -11713,6 +12152,32 @@ function heartbeatAlerts(key, prev, next) {
     if (sa.reviewAlerted && !ready) {
       dismiss(reviewKey);
       delete sa.reviewAlerted;
+    }
+    // Stalled (XERK-1571): a session parked on a background wait that has gone
+    // past its ETA, or silent too long. One alert per EDGE into the state, under
+    // its own notifKey, retracted on recovery (XERK-154's dismiss contract). It
+    // is the SECOND exception to the one-alert-per-piece-of-work rule (spend is
+    // the first): it says the work is stuck, not that it is ready. Fires only on
+    // an observed edge — a session already stalled when this hub first sees it
+    // (no `prevAttn`: a fresh hub, an upgrade) is not announced, as review isn't.
+    // A pending question outranks it: the session's attention is then the
+    // question, which already buzzed.
+    const stalledKey = `stalled:${key}:${session.id}`;
+    if (stalled && !sa.stalledAlerted && prevAttn && prevAttn.state !== "needs-you:stalled" && !recovered) {
+      const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
+      const body = attn.cause === "loop"
+        ? `${attn.why} with the same failure${repo}`
+        : `No progress waiting on ${attn.why || "a background shell"}${repo}`;
+      notify(`${label} has stalled`, body, {
+        tags: "hourglass",
+        route,
+        notifKey: stalledKey,
+      });
+      sa.stalledAlerted = true;
+    }
+    if (sa.stalledAlerted && !stalled) {
+      dismiss(stalledKey);
+      delete sa.stalledAlerted;
     }
     // A stale finish edge must not outlive the turn that follows it; a held PR
     // note must, since its alert is still owed.
@@ -13015,6 +13480,33 @@ function ticketQueueOrder(rows) {
   return out;
 }
 
+// One org's auto-start candidates IN ORDER — the sweep's walk AND the org brief's
+// "what starts next" (XERK-1573), one list so the brief can't name an order the
+// sweep doesn't follow: To Do rows with a repo, not ignore-tier, stably sorted on
+// triageSortKey (board order within an identical key).
+// XERK-635: an epic and its children never ride the org auto-start stream — an
+// epic is not a work ticket, and a child is started by its epic run in dependency
+// order, not here. Dropped silently at the filter (spending no attempt) exactly
+// like a repo-less ticket; the shared content gate rejects the same set, so the
+// two stay in agreement (XERK-550 cross-check). A rollup ticket (XERK-1568) is
+// dropped the same way: a list, not work.
+function autoStartCandidates(siteKey, rows) {
+  return ticketRowsForSite(rows, siteKey)
+    .map((r) => {
+      const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
+      return { t: r.row, repo, key: triageSortKey(r.row, repo) };
+    })
+    .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
+      && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t)
+      && !isRollupTicket(c.t))
+    .sort((a, b) => {
+      for (let i = 0; i < a.key.length; i++) {
+        if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
+      }
+      return 0;
+    });
+}
+
 function autoStartSweep() {
   const orgs = orgsWithAutoStart();
   if (!orgs.size) return;
@@ -13029,27 +13521,7 @@ function autoStartSweep() {
     // OLDEST created first, then type weight -> repo tier (XERK-487's [G]) ->
     // board order (stable sort). Board order is the agent's `updated DESC`
     // query, so without the age term the newest-touched ticket won every tie.
-    const candidates = ticketRowsForSite(rows, siteKey)
-      .map((r) => {
-        const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
-        return { t: r.row, repo, key: triageSortKey(r.row, repo) };
-      })
-      // XERK-635: an epic and its children never ride the org auto-start stream —
-      // an epic is not a work ticket, and a child is started by its epic run in
-      // dependency order, not here. Dropped silently at the filter (spending no
-      // attempt) exactly like a repo-less ticket; the shared content gate below
-      // rejects the same set, so the two stay in agreement (XERK-550 cross-check).
-      // A rollup ticket (XERK-1568) is dropped the same way: a list, not work.
-      .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
-        && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t)
-        && !isRollupTicket(c.t))
-      .sort((a, b) => {
-        for (let i = 0; i < a.key.length; i++) {
-          if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
-        }
-        return 0;   // stable: board order within an identical key
-      });
-    for (const { t, repo } of candidates) {
+    for (const { t, repo } of autoStartCandidates(siteKey, rows)) {
       const k = siteKey + "\x00" + t.key;
       // A session exists on some channel — the work is under way (or was, and
       // was deliberately killed). Done with this ticket for good; drop any
@@ -13331,10 +13803,11 @@ function dedupeLinkSweep() {
 //
 // UNLIKE auto-start, this is UNCONDITIONAL — it is NOT gated on the per-org
 // "auto" opt-in (orgsWithAutoStart), which governs ONLY whether the hub
-// auto-STARTS work (XERK-161). A ticket only reaches Done by a HUMAN moving it
-// (the board is pull-only — no session writes to Jira), so it's a deliberate
-// "this work is finished" signal that should always retire its session, whatever
-// the org's auto-start preference. So this sweep runs for EVERY org that reports
+// auto-STARTS work (XERK-161). A ticket reaches Done by a human moving it, or by
+// the session working it closing it itself once its work is verified (the
+// auto-close message, XERK-705; a stale bug's close-ticket, XERK-1569) — either
+// way a deliberate "this work is finished" signal that should always retire its
+// session, whatever the org's auto-start preference. So this sweep runs for EVERY org that reports
 // a board block. It can only ever touch a session that was spawned to WORK a
 // ticket (s.ticket is set) whose key now reads Done on the board — a
 // manually-started session carries no ticket and is never affected.
@@ -13663,8 +14136,13 @@ registerGuardMirror("autoCloseNotified", {
 // URL-charset-only string is interpolated: an oversize one would push the text past
 // the agent's input cap (send_input refuses the WHOLE message, so the session would
 // never hear its PR merged), and a looser shape lets arbitrary text into the pane.
+// The close step names the session CLI only to a CLAUDE session on a host whose
+// manager reports it READS the request (`closeTicket.available`, XERK-1569): a
+// dsh/qwen session is not given $TURMA_SESSION_CLI (agent-session-cli.md), and an
+// agent that predates the reader would accept the request and never act on it.
+// Either way the session is sent straight to the host's own tracker tool.
 const AUTO_CLOSE_URL_RE = /^https?:\/\/[A-Za-z0-9._~:/?#@!$&'()*+,;=%-]{1,300}$/;
-function autoCloseMergedMessage(urls) {
+function autoCloseMergedMessage(urls, agentType, closeTicketCli) {
   const named = (urls || []).filter((u) => typeof u === "string" && AUTO_CLOSE_URL_RE.test(u));
   const which = named.length === 1 ? "PR " + named[0] + " has"
     : named.length ? "PRs " + named.join(", ") + " have" : "PR has";
@@ -13676,8 +14154,13 @@ function autoCloseMergedMessage(urls) {
     + "branch — auto-merge squashes it) and open a follow-up PR from this session — it "
     + "will be auto-merged the same way and you will be asked to verify again. "
     + "If it IS deployed and working and all the work for this ticket is done, "
-    + "mark the ticket as Done (move it to the Done column) so this session can "
-    + "wrap up.";
+    + "mark the ticket as Done so this session can wrap up — "
+    + (closeTicketCli !== true || agentType === "dsh" || agentType === "qwen"
+      ? "comment what you verified on the ticket and close it with the tracker "
+        + "CLI/MCP this host gives you."
+      : "prefer `python3 -SsE \"$TURMA_SESSION_CLI\" close-ticket done --note "
+        + "'<what you verified>'` (it comments the evidence and records the outcome "
+        + "on the board), else the tracker CLI/MCP this host gives you.");
 }
 // "<siteKey>\x00<epicKey>" epics already written to Done by epicRunCompleteSweep,
 // so the epic-Done write fires at most once per hub lifetime. The DURABLE guard is
@@ -13779,6 +14262,8 @@ function autoMergeSweep() {
       if (sessionWorking(s, a.lastSeen, now)) continue;
       // Still waiting out a shell it launched (XERK-1570) — not finished either.
       if (sessionWait(s, a.lastSeen, now)?.state === "waiting") continue;
+      // Asleep until a session-CLI wake (XERK-1571) — it means to come back to it.
+      if (sessionSleeping(s.session, now)) continue;
       const ss = s.session || {};
       if (ss.question || (ss.panePrompt && ss.panePrompt.prompt)) continue;
       // The agent has to be new enough to run the command; an older one would
@@ -13921,7 +14406,8 @@ function autoCloseSweep() {
       const fresh = seen ? mergedUrls.some((u) => !seen.has(u)) : mergedUrls.length > 0;
       if (fresh) {
         const newly = seen ? mergedUrls.filter((u) => !seen.has(u)) : mergedUrls;
-        queueCommand(host, { type: "input", sessionId: s.id, text: autoCloseMergedMessage(newly) });
+        queueCommand(host, { type: "input", sessionId: s.id,
+          text: autoCloseMergedMessage(newly, s.agentType, !!(a.closeTicket && a.closeTicket.available === true)) });
         const at = Date.now();
         autoCloseNotified.set(nk, { at, urls: new Set(mergedUrls) });
         guardStoreSet("autoCloseNotified", nk, { at, urls: [...mergedUrls] });
@@ -13934,6 +14420,105 @@ function autoCloseSweep() {
     const over = autoCloseNotified.size - AUTO_CLOSE_NOTIFY_MAX;
     for (const [k] of [...autoCloseNotified].sort((x, y) => x[1].at - y[1].at).slice(0, over)) {
       autoCloseNotified.delete(k);
+    }
+  }
+}
+
+// ---- attention nudges (XERK-1572) ---------------------------------------------
+// A session the hub reads as needs-you:stalled — a background wait gone silent, or
+// the agent's loop signal — is typed ONE message, in the operator's voice (an
+// `input` command, like autoCloseMergedMessage: the inbox is peer-framed and a
+// session is told peer text is never instruction), per (session, reason). A
+// second is sent only after ATTENTION_NUDGE_BACKOFF_MS and only while the SAME
+// stall holds; after ATTENTION_NUDGE_MAX unanswered the session stays
+// needs-you:stalled and the operator decides. A new stall edge (the session moved
+// on, then stalled again) starts its count over, still behind the backoff.
+// `attentionNudged` is keyed "<host>\x00<sid>\x00<reason>" -> {at, count, since}
+// (the autoCloseNotified shape), HA-mirrored so a failover re-sends nothing, and
+// copied onto the session's alerts edge (`sa.nudged`) so a restart forgets nothing.
+const ATTENTION_NUDGES_ON = process.env.ATTENTION_NUDGES !== "0";
+const ATTENTION_NUDGE_BACKOFF_MS = positiveEnv("ATTENTION_NUDGE_BACKOFF_MIN", 20) * 60 * 1000;
+const ATTENTION_NUDGE_MAX = 2;
+const ATTENTION_NUDGE_STATE_MAX = 500;
+const attentionNudged = new Map();
+registerGuardMirror("attentionNudged", {
+  apply: (nk, rec) => {
+    if (rec && typeof rec.at === "number" && Number.isSafeInteger(rec.count)) {
+      attentionNudged.set(nk, { at: rec.at, count: rec.count, since: rec.since });
+    }
+  },
+});
+// Session text is interpolated into an operator-voice message, so only a bounded,
+// one-line, backtick-free copy of it ever is: a shell label is the session's own
+// command/description, a tool name is restricted to the characters tool names use.
+function nudgeLabel(t) {
+  return String(t || "").replace(/[`\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+function nudgeTool(t) {
+  return String(t || "").replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 64);
+}
+// The message for one stalled session, or null when there is nothing to say.
+function attentionNudgeText(reason, session) {
+  const s = session.session || {};
+  if (reason === "loop") {
+    const tool = nudgeTool(s.loop && s.loop.tool);
+    const n = s.loop && Number.isSafeInteger(s.loop.repeats) ? s.loop.repeats : 0;
+    if (!tool || !n) return null;
+    return `You have run \`${tool}\` ${n} times with the same failure. Stop, write down what you know `
+      + "on the ticket, and either take a different approach or end the turn with a `Host blocker:` line.";
+  }
+  const waits = (Array.isArray(s.agents) ? s.agents : []).filter(isWaitRow);
+  const label = waits.length === 1 ? nudgeLabel(waits[0].label) : "";
+  const subject = label ? `Your background shell \`${label}\` has`
+    : waits.length > 1 ? `Your ${waits.length} background shells have` : "Your background shell has";
+  const mins = Number.isFinite(s.transcriptAgeSec) ? Math.max(1, Math.round(s.transcriptAgeSec / 60)) : null;
+  const quiet = mins ? `produced nothing for ${mins} minute${mins === 1 ? "" : "s"}` : "gone quiet";
+  return `${subject} ${quiet}. Check whether it is still doing anything; if it is waiting on `
+    + "something with a known duration, stop it and use the session CLI's `wake`; if it is dead, "
+    + "say what you know and end the turn.";
+}
+// LEADER-ONLY (masterOrchestrationTick): reads the attention each beat decided.
+function attentionNudgeSweep(now = Date.now()) {
+  if (!ATTENTION_NUDGES_ON) return;
+  for (const [host, a] of Object.entries(agents)) {
+    if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    const sas = (a.alerts && a.alerts.sessions) || {};
+    for (const s of a.sessions || []) {
+      if (!s || s.status !== "running" || typeof s.id !== "string") continue;
+      const sa = sas[s.id];
+      const attn = sa && sa.attn;
+      if (!attn || attn.state !== "needs-you:stalled") continue;
+      const reason = attn.cause === "loop" ? "loop" : "stalled";
+      const nk = host + "\x00" + s.id + "\x00" + reason;
+      // The map is memory (plus the HA guard store); the same record also rides the
+      // session's alerts edge (`sa.nudged`, persisted in state.json), so a non-HA
+      // restart or deploy never forgets a nudge and re-sends past the cap.
+      const kept = sa.nudged && sa.nudged[reason];
+      const rec = attentionNudged.get(nk)
+        || (kept && typeof kept.at === "number" && Number.isSafeInteger(kept.count) ? kept : undefined);
+      // A loop's stall is the RUN, not the beat it was entered: a nudge (or the
+      // operator's prompt) re-arms the agent's count but keeps the run's `since`,
+      // so the same failure resumed is the same stall and the cap still holds.
+      const loopSince = s.session && s.session.loop && s.session.loop.since;
+      const since = reason === "loop" && Number.isSafeInteger(loopSince) ? loopSince : attn.since;
+      const count = rec && rec.since === since ? rec.count : 0;
+      if (count >= ATTENTION_NUDGE_MAX) continue;
+      if (rec && now - rec.at < ATTENTION_NUDGE_BACKOFF_MS) continue;
+      const text = attentionNudgeText(reason, s);
+      if (!text) continue;
+      // `source: "nudge"`: the hub's own words, not the operator answering —
+      // the agent's permission ledger must not close an ask-in-chat row on it.
+      queueCommand(host, { type: "input", sessionId: s.id, text, source: "nudge" });
+      const next = { at: now, count: count + 1, since };
+      attentionNudged.set(nk, next);
+      guardStoreSet("attentionNudged", nk, next);
+      sa.nudged = { ...(sa.nudged && typeof sa.nudged === "object" ? sa.nudged : {}), [reason]: next };
+    }
+  }
+  if (attentionNudged.size > ATTENTION_NUDGE_STATE_MAX) {
+    const over = attentionNudged.size - ATTENTION_NUDGE_STATE_MAX;
+    for (const [k] of [...attentionNudged].sort((x, y) => x[1].at - y[1].at).slice(0, over)) {
+      attentionNudged.delete(k);
     }
   }
 }
@@ -14006,6 +14591,385 @@ function epicRunCompleteSweep() {
   }
 }
 
+// ---- the per-org brief (XERK-1573) --------------------------------------------
+// What the operator would otherwise open every session to learn, per org: what
+// finished, what waits on them and why, what waits on time, what is stalled, what
+// starts next and why, what a session closed as stale, and the subscription
+// spend. v1 is STRUCTURED — compiled from hub data only (the board rows, each
+// session's hub-stamped attention, ticket.outcome, limits), no model, no tracker
+// read. ONE leader sweep iterating orgs, one record per org; never a session per
+// org. The store, its sanitizer and the wire shape are above (sanitizeBrief).
+const BRIEF_INTERVAL_MS = positiveEnv("BRIEF_INTERVAL_MIN", 240) * 60 * 1000;
+const BRIEFS_KEEP = 10;      // briefsCoerce inlines the same 10 (module-init TDZ)
+const BRIEF_NEXT_MAX = 5;    // "what starts next" names this many
+const BRIEF_RETAIN_MS = 30 * 24 * 3600 * 1000;   // an org with no host: briefs kept this long
+
+// The orgs a brief is compiled for: every org some host is DECIDED into — the
+// org boundary every other org surface keys on, never a claimed jira.siteKey.
+function briefOrgs() {
+  const out = new Set();
+  for (const a of Object.values(agents)) {
+    const org = decidedOrgOf(a);
+    if (org) out.add(org);
+  }
+  return out;
+}
+
+// A duration as the brief words it — ONE rule with brief.html `dur` and Android
+// `briefDur` (pinned by the XERK-1573 parity test): minutes stop below the hour
+// (3570s rounds to 60m), so a 61-minute-old ticket reads "1h" here exactly as the
+// page's own ages do, never fmtDur's "61m"; hours run to two days, then days.
+function briefDur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  if (s < 3570) return `${Math.round(s / 60)}m`;
+  if (s < 172800) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
+// Why this ticket is next in the auto-start order — the triageSortKey terms, in
+// the order they decide: a P0 preempts, else the oldest goes first; type and a
+// non-default repo tier only break ties.
+function briefNextReason(t, repo, now) {
+  const tr = t && t.triage && typeof t.triage === "object" ? t.triage : null;
+  const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
+  const parts = [tr && tr.priority === "P0" ? "P0 preempts the line" : "oldest first"];
+  parts.push(Number.isFinite(created)
+    ? `created ${briefDur(Math.max(0, now - created))} ago` : "no created date");
+  if (tr && typeof tr.type === "string" && tr.type) parts.push(`type ${tr.type}`);
+  const tier = repoTier(repo);
+  if (tier !== DEFAULT_REPO_TIER) parts.push(`${tier} repo`);
+  return parts.join(" · ");
+}
+
+// Compile one org's brief from hub data. Pure over the registry/board/queue
+// state (writes nothing); the caller stores it. `prevList` is the org's kept
+// briefs, newest first — the period starts at the newest one.
+function compileBrief(siteKey, now, trigger, prevList) {
+  prevList = prevList || [];
+  const prev = prevList[0] || null;
+  const since = prev ? prev.at : now - BRIEF_INTERVAL_MS;
+  const inPeriod = (ms) => Number.isFinite(ms) && ms > since && ms <= now;
+  const isoIn = (iso) => inPeriod(typeof iso === "string" ? Date.parse(iso) : NaN);
+  const hosts = Object.entries(agents).filter(([, a]) => a && decidedOrgOf(a) === siteKey);
+  const title = (key, s) => s.summary || s.label || s.rcName || `${key} · ${s.id}`;
+  const ticketKey = (s) => (s.ticket && typeof s.ticket.key === "string" ? s.ticket.key : undefined);
+  const rows = fleetTicketRows();
+  const orgRows = ticketRowsForSite(rows, siteKey).map((r) => r.row).filter((t) => t && t.key);
+
+  // Finished since the last brief: Done tickets (resolved — or, from an agent
+  // predating `resolved`, last updated — in the period), merged PRs, ended
+  // sessions — each piece of work ONCE (stale-closed tickets and the ended
+  // sessions are cut below, once closedStale is known). Intake/outflow count the same rows' created/resolved
+  // dates. The rows are what the hosts poll (assignee-scoped, recent Done only).
+  const finished = [];
+  let intake = 0;
+  let outflow = 0;
+  for (const t of orgRows) {
+    if (isoIn(t.created)) intake++;
+    if (t.statusCategory === "done" && isoIn(t.resolved || t.updated)) {
+      outflow++;
+      finished.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
+        since: Date.parse(t.resolved || t.updated) });
+    }
+  }
+  // A PR carries no merge time, so "merged since the last brief" is a MERGED PR
+  // no earlier brief reported. That memory is `prsReported`, carried forward on
+  // the newest brief — never the `finished` rows, which keep only 10 and drop
+  // with their brief (a brief from before `prsReported` still counts its rows).
+  const reported = new Set(prev && Array.isArray(prev.prsReported) ? prev.prsReported : []);
+  for (const b of prevList) {
+    for (const it of b.finished || []) if (it.kind === "pr" && it.url) reported.add(it.url);
+  }
+  const seenPrs = new Set(reported);
+  const newPrs = [];
+  const visiblePrs = new Set();   // every MERGED PR the org's sessions still carry
+  // A URL past sanitizeBrief's 500-char cap could never be remembered (the
+  // memory drops it, the `finished` row cuts it), so it would be finished in
+  // every brief; no real GitHub/GitLab/ADO PR URL is that long — skip it.
+  const mergedOf = (s) => (Array.isArray(s && s.prs) ? s.prs : []).filter((p) =>
+    p && typeof p.url === "string" && p.url && p.url.length <= 500
+    && String(p.state || "").toUpperCase() === "MERGED");
+  const addPrs = (key, s) => {
+    for (const p of mergedOf(s)) {
+      if (seenPrs.has(p.url)) continue;
+      seenPrs.add(p.url);
+      newPrs.push(p.url);
+      finished.push({ kind: "pr", url: p.url, title: p.title || p.url, host: key,
+        sessionId: s.id, key: ticketKey(s) });
+    }
+  };
+  for (const [, a] of hosts) {
+    for (const s of [...(a.sessions || []), ...(a.closedSessions || [])]) {
+      for (const p of mergedOf(s)) visiblePrs.add(p.url);
+    }
+  }
+  const ended = [];   // sessions that ended in the period; cut against the rest below
+  for (const [key, a] of hosts) {
+    for (const s of a.sessions || []) if (s) addPrs(key, s);
+    for (const c of a.closedSessions || []) {
+      if (!c || !isoIn(c.closedAt)) continue;
+      ended.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
+        key: ticketKey(c), since: Date.parse(c.closedAt),
+        transcriptId: typeof c.transcriptId === "string" ? c.transcriptId : undefined,
+        prUrls: mergedOf(c).map((p) => p.url) });   // matching only; sanitizeBrief drops it
+      addPrs(key, c);
+    }
+  }
+
+  // Needs-you / waiting / stalled: the hub's own attention stamp (XERK-1571),
+  // ONLINE hosts only — an offline host's state is frozen at its last beat.
+  // Oldest first; waiting by ETA.
+  const needsYou = [];
+  const waiting = [];
+  const stalled = [];
+  for (const [key, a] of hosts) {
+    if (!agentBlockOnline(a, now)) continue;
+    const alertSessions = a.alerts && a.alerts.sessions;
+    for (const s of a.sessions || []) {
+      if (!s || s.status !== "running") continue;
+      const attn = wireAttention(alertSessions && alertSessions[s.id] && alertSessions[s.id].attn);
+      if (!attn) continue;
+      const item = { kind: "session", title: title(key, s), host: key, sessionId: s.id,
+        state: attn.state, why: attn.why, since: attn.since, eta: attn.eta, key: ticketKey(s) };
+      if (attn.state === "needs-you:stalled") stalled.push(item);
+      else if (attn.state.startsWith("needs-you:")) needsYou.push(item);
+      else if (attn.state === "waiting" || attn.state === "sleeping") waiting.push(item);
+    }
+  }
+  const bySince = (x, y) => (x.since || 0) - (y.since || 0);
+  needsYou.sort(bySince);
+  stalled.sort(bySince);
+  waiting.sort((x, y) => (x.eta || Infinity) - (y.eta || Infinity));
+
+  // What starts next: the org's line in the hub queue (drain order), then — with
+  // auto-start on — the auto-start order (autoStartCandidates, XERK-1567's key)
+  // past the gates the sweep applies, each with the reason it is next.
+  const autoStart = !!autoStartOrgs[siteKey];
+  const nextUp = [];
+  const lined = new Set();
+  for (const e of ticketQueueOrder(rows)) {
+    if (e.siteKey !== siteKey || e.expiredAt) continue;
+    lined.add(e.issueKey);
+    const hit = rows.get(ticketQueueKey(siteKey, e.issueKey));
+    const t = hit ? hit.row : null;
+    nextUp.push({ kind: "ticket", key: e.issueKey, title: (t && t.summary) || e.issueKey,
+      url: t && t.url, since: e.at,
+      reason: `queued (${e.reason || "capacity"}) · ${briefNextReason(t, ticketRepo(siteKey, e.issueKey, rows), now)}` });
+  }
+  if (autoStart) {
+    const started = startedTicketKeys();
+    for (const { t, repo } of autoStartCandidates(siteKey, rows)) {
+      if (lined.has(t.key) || started.has(siteKey + "\x00" + t.key)) continue;
+      const action = ticketTriageAction(siteKey, t.key);
+      if (action === "hold" || action === "reject") continue;
+      if (action !== "approve"
+        && (triageGateReason(t) || triagePolicyReason(siteKey, t.triage, repo))) continue;
+      if (spawnTicketInFlight(siteKey, t.key)) continue;
+      // The sweep holds a ticket in its retry backoff: still in line, but say so.
+      const prior = autoStarted.get(siteKey + "\x00" + t.key);
+      const backoff = prior && now < prior.nextAt
+        ? ` · retrying in ${briefDur(prior.nextAt - now)}` : "";
+      nextUp.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
+        reason: briefNextReason(t, repo, now) + backoff });
+    }
+  }
+
+  // Tickets a session closed as stale (XERK-1569 ticket.outcome) in the period.
+  const closedStale = [];
+  const staleSeen = new Set();
+  const addStale = (key, s) => {
+    const t = s && s.ticket;
+    const o = t && t.outcome;
+    if (!o || (o.kind !== "not-reproducible" && o.kind !== "already-fixed")) return;
+    if (t.siteKey !== siteKey || typeof t.key !== "string" || !inPeriod(o.at)) return;
+    if (staleSeen.has(t.key)) return;
+    staleSeen.add(t.key);
+    closedStale.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
+      reason: o.kind, note: o.note, since: o.at, host: key, sessionId: s.id });
+  };
+  for (const [key, a] of hosts) {
+    for (const s of a.sessions || []) addStale(key, s);
+    for (const c of a.closedSessions || []) addStale(key, c);
+    for (const r of a.repos || []) for (const c of (r && r.resumable) || []) addStale(key, c);
+  }
+
+  // A ticket closed as stale is NOT finished work, though XERK-1569 moves it to a
+  // Done-category status (Won't Do, Cannot Reproduce) and its board row then
+  // reads done + resolved in the period: Closed as stale is its one row. It
+  // still counts in outflow — it did leave the board.
+  const staleKeys = new Set(closedStale.map((it) => it.key));
+  for (let i = finished.length - 1; i >= 0; i--) {
+    if (finished[i].kind === "ticket" && staleKeys.has(finished[i].key)) finished.splice(i, 1);
+  }
+
+  // An ended session is the SAME piece of work as a row already counted when its
+  // merged PR is a Finished row, its ticket's Done row is, or its ticket was
+  // closed as stale — so it is a Finished row only when nothing else stands for
+  // it (else one piece of work counts two or three times). A Done ticket takes
+  // the host of the session that worked it, so the "where" is not lost.
+  const sessionTag = (host, id) => `${host}\x00${id}`;
+  const covered = new Set();
+  for (const it of finished) if (it.kind === "pr") covered.add(sessionTag(it.host, it.sessionId));
+  for (const it of closedStale) covered.add(sessionTag(it.host, it.sessionId));
+  // By URL too: two sessions carrying one merged PR give it ONE row (seenPrs), and
+  // the session that did not get it is that same piece of work.
+  const prRowUrls = new Set(finished.filter((it) => it.kind === "pr").map((it) => it.url));
+  const doneTickets = new Map(finished.filter((it) => it.kind === "ticket").map((it) => [it.key, it]));
+  for (const e of ended) {
+    const done = e.key ? doneTickets.get(e.key) : undefined;
+    if (done && !done.host) done.host = e.host;
+    if (done || (e.key && staleKeys.has(e.key)) || covered.has(sessionTag(e.host, e.sessionId))
+      || e.prUrls.some((u) => prRowUrls.has(u))) continue;
+    finished.push(e);
+  }
+  // A merged PR on a ticket whose Done row is here is that SAME piece of work
+  // (the hands-off flow: the session merges, the ticket goes Done), so it folds
+  // INTO the ticket row as its PR link — never a second Finished row. It stays in
+  // this brief's reported-PR memory (newPrs), so no later brief re-reports it.
+  for (let i = finished.length - 1; i >= 0; i--) {
+    const it = finished[i];
+    const done = it.kind === "pr" && it.key ? doneTickets.get(it.key) : undefined;
+    if (!done) continue;
+    done.prUrl = it.url;   // walking back, the ticket keeps its FIRST PR's link
+    if (!done.host) done.host = it.host;
+    finished.splice(i, 1);
+  }
+
+  // Spend vs the subscription window (XERK-544): one entry per subscription the
+  // org's hosts spend, that subscription's freshest non-stale `limits` FLEET-WIDE
+  // (the same reading pausedSubscriptions judges, so the % and the paused chip
+  // agree), and whether it pauses auto-start. A window whose reset has passed has
+  // rolled over — no figure.
+  const nowSec = Math.floor(now / 1000);
+  const paused = pausedSubscriptions(now);
+  const freshestLim = freshestLimitsBySub(now);
+  const subs = new Map();
+  for (const [key, a] of hosts) {
+    const subKey = subscriptionKeyOf(key, a);
+    let g = subs.get(subKey);
+    if (!g) subs.set(subKey, (g = { hosts: [], label: "", lim: null }));
+    g.hosts.push(key);
+    if (!g.label && a.subscription && a.subscription.label) g.label = a.subscription.label;
+    const f = freshestLim.get(subKey);
+    if (f) g.lim = f.limits;
+  }
+  const spend = [];
+  for (const [subKey, g] of subs) {
+    if (!g.lim) continue;
+    const entry = { label: g.label || g.hosts.join(", "), paused: paused.has(subKey),
+      capturedAt: Math.round((g.lim.capturedAt || 0) * 1000) };
+    for (const [win, name] of [["fiveHour", "fiveHour"], ["sevenDay", "sevenDay"]]) {
+      const w = g.lim[win];
+      if (!w || typeof w.usedPct !== "number") continue;
+      if (typeof w.resetsAt === "number" && w.resetsAt <= nowSec) continue;
+      entry[name + "Pct"] = w.usedPct;
+      if (typeof w.resetsAt === "number") entry[name + "ResetsAt"] = Math.round(w.resetsAt * 1000);
+    }
+    spend.push(entry);
+  }
+
+  // The reported-PR memory, bounded by sanitizeBrief's 500: this brief's new
+  // ones, then the remembered ones a session still carries (the ones that could
+  // be re-reported), then the rest — so a cut drops the PRs no longer visible.
+  const carried = [...reported];
+  const prsReported = [...newPrs, ...carried.filter((u) => visiblePrs.has(u)),
+    ...carried.filter((u) => !visiblePrs.has(u))];
+
+  return sanitizeBrief({
+    siteKey, at: now, since, trigger, autoStart,
+    counts: { finished: finished.length, needsYou: needsYou.length, waiting: waiting.length,
+      stalled: stalled.length, nextUp: nextUp.length, closedStale: closedStale.length,
+      intake, outflow },
+    finished, needsYou, waiting, stalled,
+    nextUp: nextUp.slice(0, BRIEF_NEXT_MAX), closedStale, spend,
+    needsYouSig: briefSigOf([...needsYou, ...stalled]), prsReported,
+  });
+}
+
+// The needs-you SET a brief carries, as a comparable digest: the push fires only
+// when it changes between two consecutive briefs (stalled included — it is a
+// needs-you state). compileBrief digests the FULL set before the 10-row cut, so a
+// newcomer past the cut still changes it; an empty set is "" (the retract case).
+function briefSigOf(items) {
+  const sig = items.map((i) => `${i.host}\x00${i.sessionId}\x00${i.state}`).sort().join("\n");
+  return sig ? crypto.createHash("sha1").update(sig).digest("hex") : "";
+}
+function briefNeedsYouSig(b) {
+  if (!b) return "";
+  if (typeof b.needsYouSig === "string") return b.needsYouSig;
+  // A brief stored before the digest: its (≤10-row) lists, the same digest.
+  return briefSigOf([...(b.needsYou || []), ...(b.stalled || [])]);
+}
+
+// One FCM push per brief, ONLY when the needs-you set changed since the org's
+// previous brief, under one notifKey per org so a new one REPLACES the last; a
+// set that emptied retracts it instead. Carries the headline counts.
+function briefPush(brief, prev) {
+  const sig = briefNeedsYouSig(brief);
+  if (sig === briefNeedsYouSig(prev)) return false;
+  const notifKey = `brief:${brief.siteKey}`;
+  if (!sig) { dismiss(notifKey); return true; }
+  const c = brief.counts;
+  const n = c.needsYou + c.stalled;
+  const org = brief.siteKey.replace(/\.atlassian\.net$/, "");
+  const parts = [`${c.needsYou} waiting on you`];
+  if (c.stalled) parts.push(`${c.stalled} stalled`);
+  parts.push(`${c.waiting} waiting`, `${c.finished} finished`);
+  if (brief.nextUp.length) parts.push(`next: ${brief.nextUp[0].key}`);
+  notify(`${org} brief: ${n} need${n === 1 ? "s" : ""} you`, parts.join(" · "), {
+    tags: "clipboard", notifKey,
+  });
+  return true;
+}
+
+// Compile, store and announce one org's brief (the sweep's per-org unit, and the
+// on-demand route's). Newest first, BRIEFS_KEEP kept.
+function briefSweep(siteKey, trigger = "scheduled", now = Date.now()) {
+  const prevList = briefs[siteKey] || [];
+  const brief = compileBrief(siteKey, now, trigger, prevList);
+  // The reported-PR memory rides the newest brief alone (it carries forward).
+  const older = prevList.map((b) => {
+    if (!b.prsReported) return b;
+    const o = { ...b };
+    delete o.prsReported;
+    return o;
+  });
+  briefs[siteKey] = [brief, ...older].slice(0, BRIEFS_KEEP);
+  persistBriefs();
+  invalidateAgentsCache();
+  sseBroadcast("briefs", briefsWire());
+  briefPush(brief, prevList[0] || null);
+  return brief;
+}
+
+// The cadence gate, on the leader's orchestration tick: an org gets a fresh brief
+// BRIEF_INTERVAL_MS after its newest one — or, with none stored, after this hub
+// booted (the store persists, so a restart keeps the cadence; a fresh hub's first
+// brief is one interval in, or whenever the operator asks for one).
+// An org no host is decided into any more keeps its briefs BRIEF_RETAIN_MS past
+// its newest one (a host that went quiet or is being re-bound gets them back),
+// then they are dropped — nothing else ever removes a store key.
+function briefTick(now = Date.now()) {
+  const orgs = briefOrgs();
+  let pruned = false;
+  for (const [siteKey, list] of Object.entries(briefs)) {
+    if (orgs.has(siteKey) || now - ((list && list[0] && list[0].at) || 0) < BRIEF_RETAIN_MS) continue;
+    delete briefs[siteKey];
+    pruned = true;
+  }
+  if (pruned) {
+    persistBriefs();
+    invalidateAgentsCache();
+    sseBroadcast("briefs", briefsWire());
+  }
+  for (const siteKey of orgs) {
+    const last = (briefs[siteKey] || [])[0];
+    if (now - (last ? last.at : BOOT_AT) < BRIEF_INTERVAL_MS) continue;
+    briefSweep(siteKey, "scheduled", now);
+  }
+}
+
 // Don't act on freshly-loaded (possibly stale) state right after a hub boot, the
 // same reason the offline sweep waits: let agents re-report first. (The opt-in map
 // loads from disk at boot, but the sweeps only act on orgs with a live reporting
@@ -14046,9 +15010,13 @@ function masterOrchestrationTick() {
   // though the close normally waits a beat for the PR poll to read MERGED.
   autoMergeSweep();
   autoCloseSweep();
+  // One nudge for a stalled or looping session (XERK-1572); no-op with none.
+  attentionNudgeSweep();
   // Epic completion (XERK-637): after autoCloseSweep has produced any child Done
   // edges this tick, move an all-children-Done epic to Done and retire its run.
   epicRunCompleteSweep();
+  // The per-org brief (XERK-1573): a fresh one per org every BRIEF_INTERVAL_MIN.
+  briefTick();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
   // same tick, and a session auto-stop just freed is seen by the drain the beat
   // it lands. The heartbeat drains too (that's where capacity actually changes);
@@ -14203,6 +15171,7 @@ const INDEX = htmlPage("index.html");
 const USAGE = htmlPage("usage.html");
 const SESSIONS = htmlPage("sessions.html");
 const BOARD = htmlPage("board.html");
+const BRIEF = htmlPage("brief.html");
 // Not an `htmlPage`: the login form is served `no-store` (a cached login page
 // is its own problem), so it has no conditional-GET path to carry an ETag for.
 const LOGIN = withHashedAssets(readAsset("login.html"));
@@ -16064,6 +17033,10 @@ const server = http.createServer(async (req, res) => {
       return sendPage(req, res, USAGE);
     }
 
+    if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
+      return sendPage(req, res, BRIEF);
+    }
+
     // The page was /history until it dropped cost and became token-only. Keep
     // old bookmarks and the Android client's deep links working.
     if (req.method === "GET" && (url.pathname === "/history" || url.pathname === "/history.html")) {
@@ -16297,6 +17270,9 @@ const server = http.createServer(async (req, res) => {
       // linked (or human-removed) pair is not re-queued every 15s.
       const ticketLinkResults = payload.ticketLinkResults;
       delete payload.ticketLinkResults;
+      // A session closing its own ticket (XERK-1569) — logged below, never kept.
+      const ticketOutcomeResults = payload.ticketOutcomeResults;
+      delete payload.ticketOutcomeResults;
       // PR auto-merge outcomes (XERK-550) — cached by cmdId below like the
       // status/priority results, and read by autoMergeSweep to stop retrying a
       // PR the agent's `gh pr merge` refused (branch protection, review required,
@@ -16312,6 +17288,10 @@ const server = http.createServer(async (req, res) => {
       // stored on the record (they would ride every /api/agents body).
       const permissionEvents = payload.permissionEvents;
       delete payload.permissionEvents;
+      // The wait classifier's verdicts (XERK-1572) — whitelisted here and folded
+      // into each session's attention by heartbeatAlerts, never stored raw.
+      const attentionHints = normalizeAttentionHints(payload.attentionHints);
+      delete payload.attentionHints;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -16566,6 +17546,7 @@ const server = http.createServer(async (req, res) => {
       ingestStatusResults(next, ticketStatusResults);
       ingestPriorityResults(next, ticketPriorityResults);
       ingestTicketLinkResults(next, ticketLinkResults);
+      logTicketOutcomes(key, ticketOutcomeResults);
       ingestMergeResults(next, mergePrResults);
       ingestCreateMeta(next, createMetaResults);
       ingestCreateResults(next, createTicketResults);
@@ -16608,7 +17589,7 @@ const server = http.createServer(async (req, res) => {
         enforceCacheHostBudget(next);
         enforceCacheTotalBudget();
       }
-      heartbeatAlerts(key, prev, next);
+      heartbeatAlerts(key, prev, next, attentionHints);
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
       // the handoff (kill source, mark done) now rather than waiting out the
@@ -19160,6 +20141,21 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, enabled: body.enabled });
     }
 
+    // POST /api/orgs/<siteKey>/brief — compile that org's brief NOW (XERK-1573),
+    // the on-demand twin of the leader's BRIEF_INTERVAL_MIN cadence. Operator-
+    // authed and authoritative on the 200 (returns the brief; it also rides
+    // /api/agents + the `briefs` SSE frame). The org must be one a host is DECIDED
+    // into — never a phantom org that would mint a store key. It resets the cadence
+    // and, like a scheduled brief, pushes only if the needs-you set changed.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "brief") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!briefOrgs().has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      return json(res, 200, { ok: true, brief: briefWire(briefSweep(siteKey, "manual"), true) });
+    }
+
     // POST /api/jira/<siteKey>/automerge — flip an org's hands-off auto-merge
     // opt-in (XERK-550). Body: {enabled:true|false}. Same posture as /autostart:
     // hub-owned durable state, authoritative on return, the org must be one the
@@ -19912,6 +20908,7 @@ if (process.env.TURMA_TEST) {
       // read the mirrors the coerce/watch/seed path installs into.
       epicRuns: () => epicRuns,
       epicBuilders: () => epicBuilders,
+      briefs: () => briefs,
     },
     // XERK-756: the HA fleet-registry externalization. Exported so tests can
     // inject a FileLiveStore as the shared store (a real Valkey can't run in CI),
@@ -20006,6 +21003,8 @@ if (process.env.TURMA_TEST) {
     normalizeQwen,
     normalizeTriage,
     normalizeTrajectory,
+    normalizeCloseTicket,
+    autoCloseMergedMessage,
     ingestTrajectoryTails,
     liveSessionForTranscript,
     normalizeDefaultRuntime,
@@ -20081,6 +21080,11 @@ if (process.env.TURMA_TEST) {
     hasLiveAgents,
     hasLiveWork,
     sessionWait,
+    sessionSleeping,
+    sessionAttention,
+    sessionsWithAttention,
+    wireAttention,
+    reviewWhy,
     backgroundWait,
     ATTENTION_WAIT_STALL_MS,
     WAIT_ETA_GRACE_MS,
@@ -20237,6 +21241,15 @@ if (process.env.TURMA_TEST) {
     autoMergeState,
     autoCloseNotified,
     ingestMergeResults,
+    // Attention nudges + the wait classifier's verdict (XERK-1572).
+    attentionNudgeSweep,
+    attentionNudged,
+    attentionNudgeText,
+    ATTENTION_NUDGE_BACKOFF_MS,
+    ATTENTION_NUDGE_MAX,
+    normalizeAttentionHint,
+    normalizeAttentionHints,
+    attentionWithHint,
     // The capability-gap resolver and its wait TTL. Exported so a test can hold
     // the mergePr-specific rule directly: an ACK whose async worker-thread result
     // lands a LATER beat must NOT stamp `unsupported.mergePr` (that false gap
@@ -20353,6 +21366,12 @@ if (process.env.TURMA_TEST) {
     // hold each rule directly rather than only through a full sweep.
     triageGateReason,
     triageSortKey,
+    // The per-org brief (XERK-1573). `briefs` is a getter: a restore/watch
+    // install REPLACES the map.
+    getBriefs: () => briefs,
+    briefsCoerce, sanitizeBrief, compileBrief, briefSweep, briefTick, briefNeedsYouSig,
+    briefDur, briefNextReason,
+    autoStartCandidates, BRIEF_INTERVAL_MS,
     ticketQueueOrder,
     TRIAGE_PRIORITY_RANK,
     TRIAGE_TYPE_WEIGHT,

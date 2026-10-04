@@ -27,26 +27,43 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 - Bounds: `EVENTS_PER_BEAT` (200) per beat, `PERMISSION_LEDGER_HOST_MAX_ROWS` per host (a flooding
   host cannot evict the fleet), `PERMISSION_LEDGER_MAX_ROWS` (20000) store-wide, oldest-`openedAt`
   first; `PERMISSION_LEDGER_DAYS` (30) retention.
-- **A newer `dialog` row for a session closes that session's older OPEN dialog row on the same host**
-  (`closeSuperseded`, `answer`/`via` "unknown", no `waitedMs`). A pane shows one dialog at a time and
-  the agent closes before it opens, so only a lost row (a manager restart) is still open — else it
-  reads "open" for 30 days. A real closed copy arriving later replaces it by id.
+- A host also keeps at most a QUARTER of the byte budget, oldest first. The row share alone does not
+  protect the fleet: the binding limit is bytes, and a host's row share of max-size rows fills most of
+  it. Tests: `one host's max-size rows cannot push another host's rows out`.
+- **The hub closes rows the agent lost** (a manager restart forgets its open rows), each with
+  `answer`/`via` "unknown" and no `waitedMs`; a real closed copy arriving later replaces it by id.
+  Else a lost row reads "open" for the 30-day window.
+  - `closeSuperseded`, on the same host: a newer `dialog` row for a session closes that session's
+    older OPEN dialog row (a pane shows one dialog at a time and the agent closes before it opens);
+    ANY newer row for a session closes its older OPEN `ask-in-chat` row (the session ran past it).
+    `closedAt` = the newer row's `openedAt`. A dialog is never closed by an ask or a classifier row.
+  - `ageOut`, on EVERY host at every ingest, `load()` and rescan: a row open past `OPEN_MAX_MS` (24h)
+    closes with `closedAt` = now. This is what closes a lost row whose session never files again (a
+    session deleted while the manager was down, a host gone). A prompt really open that long reads
+    closed-unknown until the agent's own close arrives.
 - **And a BYTE budget**, oldest first: every cap is in chars, so a row reaches ~15 KB of UTF-8 and
   20000 of them would be a file `load()` refuses (the ledger lost at the next boot). The budget is
-  the smaller of 0.9 x `PERMISSION_LEDGER_FILE_MAX` and a sixteenth of the container limit
-  (`setMemoryLimit`, from server.js's `containerMemoryLimit()`, logged at boot);
-  `PERMISSION_LEDGER_MAX_BYTES` may only lower it. `writeNow` trims before writing as a backstop, so a
-  written file always loads.
+  the smaller of 0.9 x `PERMISSION_LEDGER_FILE_MAX` (16 MiB) and a SIXTY-FOURTH of the container
+  limit (`setMemoryLimit`, from server.js's `containerMemoryLimit()`, logged at boot; an unknown limit
+  is budgeted as the deployed 512m); `PERMISSION_LEDGER_MAX_BYTES` may only lower it. `writeNow` trims
+  before writing as a backstop (`fileBytes`, from the cached row sizes), so a written file always loads.
+  - **Sized from the XERK-287 margin, not the container** (`turma-limits.md`): 8 MiB at 512m. At 1/16
+    the store plus a save's whole-file string was ~69 MiB — the whole margin. Typical rows fit ~8k.
+  - **A save streams**: `writeSnapshot` writes chunks (`SAVE_CHUNK_CHARS`) to `<file>.tmp` and renames
+    it over the ledger, so no second whole copy sits on the heap and a crash mid-save keeps the old
+    file. One save at a time; saves asked for meanwhile share ONE follow-up save.
+  - A failed rename deletes the `.tmp`; never write the ledger in place. Tests: `a save that fails
+    before its rename leaves the previous file whole`.
 
 ## The suggestedRule table — deterministic, never a judgement
 
 | Row | Rule |
 |-----|------|
 | `ask-in-chat` | `model behaviour: see CLAUDE.md step 0` |
-| `dialog` `sandbox` naming a host | `sandbox.network.allowedDomains: <host>` |
+| `dialog` `sandbox` naming a host | `sandbox.network.allowedDomains: <host>`; no readable host → NONE plus `noRuleReason` |
 | `classifier-denied` | `autoMode.environment: allow <tool rule>`; NONE without a tool rule |
-| Bash | `Bash(<head>:*)`; NONE for an interpreter/wrapper/keyword head, a bare subcommand CLI, a malformed one |
-| MCP | the full `mcp__<server>__<tool>` |
+| Bash | `Bash(<head>:*)` ONLY for a head on the allowlist; any other head gets NONE plus `noRuleReason` |
+| MCP | the full `mcp__<server>__<tool>` ONLY (`MCP_TOOL_RE`); anything else NONE plus `noRuleReason` |
 | WebFetch | `WebFetch(domain:<d>)` |
 | `judged` (XERK-1566) | none — the prompt's own dialog/classifier row carries the rule; a stood one must never offer an allow |
 | a plan approval, a file path, anything else | none |
@@ -54,23 +71,47 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 - **A classifier block with no tool rule gets NO rule** — a sentence lifted from its deny reason
   pastes nowhere. Its group carries `denyReason` instead, shown as the "why" under "no rule".
 - The ask-in-chat entry is a pointer, not a setting: the card shows it as text with no Copy.
-- **Never an allow-everything Bash rule** (`BASH_NEVER_HEADS`): `Bash(python3:*)`, `Bash(sudo:*)`,
-  `Bash(env:*)`… run whatever follows. A head outside `BASH_HEAD_RE` (`(cd`, a glob) would be a
-  malformed rule. Both get no rule — the table is copied verbatim, and XERK-1566 consumes it.
-- **The never-list names each exec under EVERY spelling**: an alias or parent noun heads as itself
-  (`docker container run` → `docker container`, `docker compose run` → `docker compose`, `npm x`,
-  `yarn exec`, `go run`), and a wrapper/runner whose head is the bare CLI (`stdbuf`, `nsenter`,
-  `poetry`, `conda`) covers its argument. Add a new exec form here, with a test row, as it is found.
-- **A versioned or `.exe` interpreter binary is its family** (`bashFamily`): `python3.11`, `php8.2`,
-  `node22`, `python.exe` are checked with the version/`.exe` cut. Over-matching only withholds a rule.
-- **Nor a BARE subcommand CLI** (`git`, `docker`, `kubectl`, `make`…; `SUBCOMMAND_CLIS`, a
-  parity-tested mirror of permlog.py's set). permlog keeps the subcommand only as the SECOND word, so
-  `git -C /repo push` / `kubectl -n prod exec` head as the bare CLI, whose rule allows every
-  subcommand — the never-listed `docker run`/`kubectl exec` and `git -c alias.x='!sh'` included.
+  - Each ask row reads "Instructions, not a setting — see the note below"; ONE note under the
+    table (`PERM_BEHAVIOUR_NOTE`) names the fix: step 0 of "Delivering work" in each host's global
+    `~/.claude/CLAUDE.md`. The hub's terse pointer repeated per row told the operator nothing.
+- **Never an allow-everything Bash rule, by construction: a POSITIVE allowlist.** `BASH_SAFE_HEADS`
+  (single words: `ls`, `cat`, `grep`, `jq`…) and `BASH_SAFE_SUBCOMMANDS` (`git status`, `gh search`,
+  `docker ps`…) are the ONLY Bash heads that get `Bash(<head>:*)`. A prefix rule allows the head with
+  ANY arguments, so a head is listed only when no argument it takes can run code. Every other head —
+  an interpreter, shell, wrapper, runner, unknown CLI, a path to a binary — gets `null`.
+  - **A deny list cannot be the safety**: an open list always misses a spelling (`pkexec`,
+    `podman exec`, `xonsh`, `firejail`, `sed -e`). `BASH_NEVER_HEADS` stays only as a SECOND check
+    and to word the reason; a versioned/`.exe` binary is its family there (`bashFamily`).
+  - **Left off on purpose** (an argument runs a command or writes any file): `git diff`/`log`/`show`
+    (`--output`), `git fetch`/`pull`/`push` (`--upload-pack`/`--receive-pack`), `git rebase`
+    (`--exec`), `kubectl get` (`--kubeconfig` exec plugin), `npm test`/`run` (`--node-options`,
+    `--script-shell`), `go test` (`-exec`), `cargo` (`--config`), `make` (variable overrides), `find`,
+    `rg` (`--pre`), `sort` (`--compress-program`). Add a head only with its argument surface checked,
+    and a test row. Missing one only withholds a suggestion.
+  - **A subcommand GROUP is off too**: a two-word head's rule covers every verb under it. `gh pr`/
+    `glab mr` (`merge --admin` past branch protection, `checkout -R` runs another repo's hooks),
+    `gh run` (`download -D` writes any dir), `gh issue`/`glab issue` (tracker writes), `git commit`/
+    `switch`/`add`/`branch` (session-editable hooks, `branch -D`). A per-verb rule (`gh pr view`)
+    needs a three-word head permlog.py does not emit yet.
+  - **A no-rule Bash group serves `noRuleReason`**, WHY there is none (runs whatever follows it / a
+    path / a bare subcommand CLI / not on the read-only list / not a plain command name). The card
+    shows "no safe rule — review it" over the reason, with NO Copy button. Groups with
+    no rule for another reason (a plan, a file path) serve no `noRuleReason`. `ruleVerdict` returns
+    both; `suggestedRule` is its rule. XERK-1566's judge reads this table's shape unchanged.
+- **Every rule is built from a fixed shape, never echoed.** `tool` is agent-supplied (a session can
+  write its hook log with Bash), so an MCP rule needs a FULL `mcp__<server>__<tool>`: a bare
+  `mcp__github` or `mcp__github__*` would allow every tool on that server.
+- **A sandbox prompt never gets the call's Bash rule** — no tool allow rule retires a sandbox
+  NETWORK prompt, so one with no readable host gets none.
+  - A head outside `BASH_HEAD_RE` (`(cd`, a glob) would be a malformed rule; a BARE subcommand CLI
+    (`git`, `docker`; `SUBCOMMAND_CLIS`, a parity-tested mirror of permlog.py's set) says nothing
+    about what ran — permlog keeps the subcommand only as the SECOND word, so `git -C /repo push`
+    heads as `git`.
 
 `head` = the Bash command's first word, two for a subcommand CLI (`git push`, `npm test`), leading
-`VAR=x` skipped; the file path; the MCP tool name; the WebFetch domain. The LLM judge (XERK-1566)
-consumes this table; it does not replace it.
+`VAR=x` and leading `cd <dir>` segments skipped (`cd` only when nothing follows); the file path;
+the MCP tool name; the WebFetch domain. The LLM judge (XERK-1566) consumes this table; it does not
+replace it.
 
 ## Persistence
 
@@ -129,14 +170,28 @@ consumes this table; it does not replace it.
     before it org.js knows no sites, `getKeys()` is `[]` and the fetch would be fleet-wide under a
     scoped header — and `update()` never notifies, so nothing would refetch. Each render refetches
     when the org keys moved (`permFetchedKeys`); the 60s refresh runs only once scoped.
+  - **A failed read with no view yet paints "Could not load … (HTTP n)"**, never an endless
+    "Loading…"; a failed REFRESH keeps the last view silently.
   - **Below 600px each group reflows to a stacked block** (CSS only, same markup): kind + subject;
     one line of count / answers / wait (`data-label`); the rule + Copy on its own line. No sideways
     scroll — the sticky Prompt column used to cover the rule column on a phone.
+  - An answered ask's "—" answers cell is hidden there (`perm-stat-na`); an all-open group reads
+    "still open", so the label never sits over a bare "—" or "open".
+  - **A rule and its Copy share one flex line (`.perm-rule-line`) at every width**: the rule shrinks
+    and wraps inside its box, Copy keeps its place beside it. An inline-block rule at 100% width
+    pushed Copy under a long rule (`sandbox.network.allowedDomains: …`) and broke the column.
+    `permRuleCodeHtml` adds `<wbr>` after `(` and a value-starting `:`, so a narrow box wraps there,
+    not mid-name; Copy copies the raw rule.
+  - **A classifier block's "why" is its `denyReason` ALONE.** `noRuleReason` (served for its Bash
+    head) is about Bash allow rules, not why the classifier said no; it shows only with no deny reason.
   - **A recent row's host · wait · age ride ONE `.perm-meta` group, host first** (an empty part is
     dropped, not left as a blank slot); below 600px that group takes a full line, so the host always
     starts the second line. Loose spans put the host in a different place row to row.
   - **Only a command/tool subject (`.perm-subj.cmd`) breaks mid-token**; an ask's question is prose
     and wraps between words.
+  - **An ask's question is the session's markdown, rendered** (`permProseHtml`): escaped first, then
+    `code` spans become `<code>` and `**` markers drop, in ONE pass; `__` is left alone
+    (`__init__.py`). An unpaired marker stays as typed. A command subject is never read as markdown.
   - That repaint goes through `TurmaNav.preserveScroll` and re-applies "Recent prompts"' open state
     (`permRecentOpen`, caught on capture — `toggle` does not bubble). A fresh `<details>` defaults
     closed, which snapped it shut once a minute.

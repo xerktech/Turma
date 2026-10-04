@@ -388,6 +388,11 @@ interface HubApi {
         @Query("cmdId") cmdId: String,
     ): Response<StatusChangeResult>
 
+    // Compile an org's brief now (XERK-1573). 200 {ok, brief}; the brief also
+    // rides /api/agents `briefs` + its SSE frame, so only the outcome is read.
+    @POST("api/orgs/{siteKey}/brief")
+    suspend fun briefNow(@Path("siteKey") siteKey: String): OkResponse
+
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
     @POST("api/jira/{siteKey}/autostart")

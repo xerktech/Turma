@@ -82,6 +82,9 @@ data class FleetState(
     // Epic-builder runs (XERK-725/731), keyed by builder id; the board's progress
     // strip reads it. Refreshed by the poll and the "epicBuilders" SSE event.
     val epicBuilders: Map<String, com.xerktech.turma.model.EpicBuilder> = emptyMap(),
+    // The per-org brief (XERK-1573), siteKey -> newest-first briefs; the Brief
+    // screen reads it. Refreshed by the poll and the "briefs" SSE event.
+    val briefs: Map<String, List<com.xerktech.turma.model.OrgBrief>> = emptyMap(),
 )
 
 class FleetRepository(
@@ -157,6 +160,7 @@ class FleetRepository(
             triagePolicies = resp.triagePolicies
             epicRuns = resp.epicRuns
             epicBuilders = resp.epicBuilders
+            briefs = resp.briefs
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -208,6 +212,9 @@ class FleetRepository(
     @Volatile
     private var epicBuilders: Map<String, com.xerktech.turma.model.EpicBuilder> = emptyMap()
 
+    @Volatile
+    private var briefs: Map<String, List<com.xerktech.turma.model.OrgBrief>> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -226,6 +233,7 @@ class FleetRepository(
             triagePolicies = triagePolicies,
             epicRuns = epicRuns,
             epicBuilders = epicBuilders,
+            briefs = briefs,
         )
     }
 
@@ -309,6 +317,11 @@ class FleetRepository(
                     "epicBuilders" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, com.xerktech.turma.model.EpicBuilder>>(data)
                     }.getOrNull()?.let { epicBuilders = it; emit(_state.value.now, null) }
+                    // A brief landed for some org (XERK-1573); the event carries
+                    // the whole (small) map, like the other hub-owned maps.
+                    "briefs" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, List<com.xerktech.turma.model.OrgBrief>>>(data)
+                    }.getOrNull()?.let { briefs = it; emit(_state.value.now, null) }
                 }
             }
 

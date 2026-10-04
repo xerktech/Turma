@@ -179,6 +179,11 @@ with `restart: unless-stopped`
   shrinking either budget (the two rejected levers were halving the upload relay and halving
   `HEARTBEAT_MAX`, both with user-visible cost). The parse-cost model means held memory ≈ the budget,
   so the raise is safe by design; the 256m OOM was the ~6 MiB margin being eaten by transient churn.
+- **The permission ledger (XERK-1563) is a consumer INSIDE that ~68 MiB margin** — the ~60 baseline
+  predates it. Its byte budget is `MEMORY_LIMIT/64` (8 MiB of JSON at 512m, ~9 MiB of heap), sized
+  from the margin, never the container; a save STREAMS the file in 256 KiB chunks (measured live-set
+  +0.5 MiB at the cap) instead of a whole-file string (+32 MiB at the old 1/16). Don't widen the
+  fraction or go back to a whole-file `JSON.stringify` without re-measuring against this margin.
 - **An upload RESERVES its room in `UPLOAD_TOTAL_MAX_BYTES` before its body is read** (XERK-1089,
   `stageUpload`: declared length, or the per-file cap when chunked). The ¾ co-peak assumes uploads
   being READ fit the store; checking only after buffering let 8 concurrent 30 MiB uploads read into

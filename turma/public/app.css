@@ -41,6 +41,16 @@
   --warning:     #fab219;
   --critical:    #d03b3b;
 
+  /* status TEXT on a surface (XERK-1571): the semantic colours above are fills
+     and dots; as small text on the dark surface three of them drop under 4.5:1,
+     so text takes these, which step up in dark only (light = the fill colour).
+     Amber is the exception: as text on the light surface it is under 2:1, so
+     light steps it DOWN to a dark amber (4.7:1 on the most-tinted org card). */
+  --good-text:     var(--good);
+  --accent-text:   var(--accent);
+  --critical-text: var(--critical);
+  --warning-text:  #8a5a00;
+
   /* validated categorical chart slots — fixed order, never cycled (history) */
   --s1: #2a78d6; --s2: #1baf7a; --s3: #eda100; --s4: #008300;
   --s5: #4a3aa7; --s6: #e34948; --s7: #e87ba4; --s8: #eb6834;
@@ -77,6 +87,11 @@
     --border:    rgba(255,255,255,0.10);
     --accent:    #3987e5;
     --field:     #111110;
+    /* status text, stepped up to clear 4.5:1 on an org-tinted dark card */
+    --good-text:     #4cc94c;
+    --accent-text:   #78aef2;
+    --critical-text: #f08080;
+    --warning-text:  #fab219;
     /* same hues, stepped for the dark surface (validated as a set) */
     --s1: #3987e5; --s2: #199e70; --s3: #c98500; --s4: #008300;
     --s5: #9085e9; --s6: #e66767; --s7: #d55181; --s8: #d95926;
@@ -253,7 +268,9 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
    the two segments the board's chips carried, laid out as a list row. A button
    can't nest a button, so the row is a plain container. */
 .org-row {
-  display: flex; align-items: stretch; border-radius: 999px; overflow: hidden;
+  /* flex-shrink: 0 — `overflow: hidden` zeroes a flex item's min-height, so with
+     many orgs the rows squashed to a few px instead of scrolling the menu (XERK-1285). */
+  display: flex; align-items: stretch; border-radius: 999px; overflow: hidden; flex-shrink: 0;
   --org: var(--muted);
 }
 .org-row:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
@@ -412,6 +429,8 @@ input:focus, textarea:focus, select:focus {
 .dot.waiting,
 .dot.updating              { background: var(--warning);  box-shadow: 0 0 8px color-mix(in srgb, var(--warning) 75%, transparent); }
 .dot.offline               { background: var(--critical);  box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
+/* A stalled background wait (XERK-1571): the danger colour it has on every surface. */
+.dot.stalled               { background: var(--critical);  box-shadow: 0 0 7px color-mix(in srgb, var(--critical) 55%, transparent); }
 .dot.idle                  { background: var(--muted); }
 /* Ready for review (XERK-224): work that has stopped and is waiting on YOU.
    Accent rather than the muted idle it is lifted out of — the section is a
@@ -797,6 +816,19 @@ button:disabled .spin { border-top-color: var(--ink-2); }
 .kc-sess.kc-sess-off .kc-sess-dot { background: var(--muted); }
 .kc-sess.kc-sess-err { color: var(--critical); border-color: var(--critical); }
 .kc-sess.kc-sess-err .kc-sess-dot { background: var(--critical); }
+/* A session that closed its own ticket (XERK-1569): the chip's label becomes
+   its reason ("not reproducible", "already fixed", or "closed") in the chip's
+   normal ink, with a neutral dot — never the green running one, even while the
+   session is still up. It stays inside the 22ch name cap on one line, so the
+   card's org tag never wraps onto a row of its own. */
+.kc-sess.kc-sess-closed .kc-sess-dot { background: var(--muted); }
+/* On that card the closing session's chip, the start control and the org tag
+   wrap as one unit (board.js cardHtml), filling the rest of their row so the
+   org tag still sits flush right — and never alone on a row of its own. */
+.kanban-card .kc-tail {
+  display: inline-flex; flex: 1 1 auto; flex-wrap: wrap; align-items: center;
+  gap: 5px 7px; min-width: 0;
+}
 .kc-org {
   display: inline-flex; align-items: center; gap: 5px;
   color: var(--muted); font-family: var(--font-mono); font-size: 10.5px;
@@ -890,6 +922,20 @@ body.td-open { overflow: hidden; }
 .td-field { min-width: 0; font-size: 12px; }
 .td-field dt { color: var(--muted); font-size: 10.5px; text-transform: uppercase; letter-spacing: 0.04em; }
 .td-field dd { margin: 2px 0 0; color: var(--ink); overflow-wrap: anywhere; }
+/* A cell that spans the whole grid row: the "Closed by" row (XERK-1569) is the
+   one tall cell, and as an ordinary cell it stretched its row of three. */
+.td-field.td-field-wide { grid-column: 1 / -1; }
+/* The "Closed by" row's evidence note (XERK-1569): the session's own words,
+   clamped to three lines until a tap or click opens the <details>, which shows
+   all of it (a phone has no hover for the tooltip). */
+.td-outcome-note { margin-top: 3px; color: var(--ink-2); }
+.td-outcome-note > summary { display: block; list-style: none; cursor: pointer; }
+.td-outcome-note > summary::-webkit-details-marker { display: none; }
+.td-outcome-note-text { white-space: pre-line; }
+.td-outcome-note:not([open]) .td-outcome-note-text {
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 3; line-clamp: 3;
+  overflow: hidden;
+}
 .td-dim { color: var(--muted); }
 /* The Repo row's manual override (see repoFieldHtml/repoPickerHtml in board.js).
    "Change" is a quiet text button, not a filled one: the row's job is to report

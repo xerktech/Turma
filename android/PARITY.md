@@ -17,6 +17,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 | Sessions sidebar full-search  | `ui/SessionsScreen.kt`'s search box + "In history" section          |
 | `board.html` + `board.js`     | `ui/BoardScreen.kt`, `core/Board.kt`, `vm/BoardViewModel.kt`       |
 | `usage.html`                  | `ui/UsageScreen.kt`                                                |
+| `brief.html` (org brief)      | `ui/BriefScreen.kt`, `core/Brief.kt`, `vm/BriefViewModel.kt`       |
 | `nav.js` (header/bottom-nav)  | `ui/MainScaffold.kt`, `ui/TurmaApp.kt`                             |
 | `org.js` (header org filter)  | `ui/OrgControl.kt`, `vm/OrgViewModel.kt`, `data/OrgFilter.kt`      |
 | `login.html`                  | `ui/LoginScreen.kt`                                                |
@@ -28,6 +29,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **Brief rows (XERK-1573).** A ticket row on the web brief links to the board's own detail; the
+  phone row is plain text (the Board screen has no deep-link route to a ticket yet) — unless it
+  carries a folded merged PR, which a tap opens (the web links its "merged PR" bit) — and the phone
+  shows a row's age/ETA relative only. Earlier briefs are a count on the phone, an expandable list of
+  headline counts on the web. Same sections, counts, order and "Brief now" otherwise.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
   auto-polls + SSE); the phone keeps a header Refresh button for a deliberate re-poll. It now shows a
   spinner while the awaited `/api/agents` poll runs (a short visible floor so a fast poll still reads
@@ -310,12 +316,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     via `liveStateLabel(state, live)`, matching the web's `agentWorkLabel`.
   - **Waiting shells are not work (XERK-1570).** `LiveAgent`/`AgentRow` type `kind`
     (+ `startedAt`/`eta` on `LiveAgent`); `core/Sessions.kt` mirrors the hub's
-    `sessionWait` — `LiveState.HOLDING` (Active, never Ready for review, "waiting · 12m left" /
-    "waiting · Watch CI") until stalled, then IDLE. The chat bar reads "Waiting…" and a wait
-    row "waiting". **Gap:** a STALLED card reads plain "idle" on Android where the web says
-    "stalled · <what>" (the label has no host `lastSeen` to judge silence) — XERK-1571's
-    hub-stamped attention state replaces both; and the HOLDING dot is a dimmed working
-    colour, not the web's hollow ring.
+    `sessionWait` — `LiveState.HOLDING` (Active, never Ready for review, "⏳ waiting · Sleep · 12m left" /
+    "⏳ waiting · Watch CI"; a session-CLI sleeper "💤 sleeping until 14:05", XERK-1571) until
+    stalled, then IDLE. The chat bar reads "Waiting…" and a wait row "waiting".
+  - **Gap:** the Fleet card labels an IDLE session from the hub's served attention
+    (`attentionLabel` → "stalled · Watch CI", in the error colour) as the web does, but the
+    Sessions-screen card has no state label, so a stalled session there shows only its
+    danger dot and the review card's why line ("Watch CI · stalled 31m"). The HOLDING dot is a
+    dimmed working colour, not the hollow ring.
 
 ## Done (XERK-78 installment — the P0 sweep)
 
@@ -825,7 +833,8 @@ those are marked `[MODEL]`.
   folded into Ended). Still open: a state line + question preview on each live card (the dashboard card
   has both; the sessions-list card shows only the dot). Because there is no state line, a
   Ready-for-review card carries the accent dot where the web card also spells out *why* it qualified
-  ("PR awaiting review" / "finished · awaiting review").
+  ("PR awaiting review" / "finished · awaiting review" / "awaiting your test"); its why and verdict
+  lines still tell a test apart from a plain review.
 - ~~P1 SendUserFile inline previews (XERK-221).~~ **Done**: the app now has an image pipeline (Coil +
   `SvgDecoder`, wired via `TurmaApplication : ImageLoaderFactory`). `SendFile`/`files[]`/`caption` are on
   `ToolUseBlock` (decoded) → `ChatItem.Tool` (`ChatItemsTest`), and `TranscriptView` renders each file:

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { __setDshEnabled, flattenSessions, glyph, isDsh, liveState, readyForReview } from "./sessions.ts";
+import { __setDshEnabled, attentionHint, flattenSessions, glyph, inReview, isDsh, liveState, readyForReview } from "./sessions.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
@@ -93,6 +93,47 @@ describe("liveState", () => {
     expect(glyph("holding")).toBe("~");
   });
 
+  // XERK-1571: a session-CLI wake still ahead is SLEEPING — "holding", never
+  // ready for review (the hub's sessionSleeping); a due wake is idle again.
+  it("is 'holding' while asleep until a wake, and not ready for review", () => {
+    const now = 10_000_000;
+    const asleep = (wakeAt: number, extra: Partial<LiveSignals> = {}) => session({
+      session: signals({ paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", wakeAt, ...extra }),
+    });
+    expect(liveState(asleep(now + 60_000), now, now)).toBe("holding");
+    expect(readyForReview(asleep(now + 60_000), now, now)).toBe(false);
+    expect(liveState(asleep(now - 1), now, now)).toBe("idle");
+    expect(readyForReview(asleep(now - 1), now, now)).toBe(true);
+    // Working outranks it; an offline host's session still sleeps (no online gate).
+    expect(liveState(asleep(now + 60_000, { paneBusy: true }), now, now)).toBe("working");
+    expect(readyForReview(asleep(now + 60_000), now - 120_000, now)).toBe(false);
+    // A question outranks the sleep.
+    expect(readyForReview(asleep(now + 60_000, { question: "Q?" }), now, now)).toBe(true);
+  });
+
+  // XERK-1571: where the hub serves attention it decides Ready for review — every
+  // needs-you:* session, nothing else; the local rule only from an older hub.
+  it("inReview follows the hub's attention, else the local rule", () => {
+    const now = 10_000_000;
+    const finished = session({ session: signals({ paneBusy: false, transcriptAgeSec: 600, lastRole: "assistant" }) });
+    const quiet = session({ session: signals({ paneBusy: false, transcriptAgeSec: 600, lastRole: "user" }) });
+    expect(inReview(finished, now, now)).toBe(true);
+    expect(inReview({ ...finished, attention: { state: "idle", since: now } }, now, now)).toBe(false);
+    expect(inReview(quiet, now, now)).toBe(false);
+    expect(inReview({ ...quiet, attention: { state: "needs-you:stalled", since: now } }, now, now)).toBe(true);
+    // An OFFLINE host's attention is frozen at its last beat: a stale "working"
+    // or "waiting" must not keep its stranded finished work out of review (the
+    // local rule decides), while a needs-you it last reported stays listed.
+    const dead = now - 10 * 60_000;
+    const busy = session({ session: signals({ paneBusy: true, transcriptAgeSec: 600, lastRole: "assistant" }) });
+    expect(inReview({ ...busy, attention: { state: "working", since: dead } }, dead, now)).toBe(true);
+    expect(inReview({ ...finished, attention: { state: "waiting", since: dead } }, dead, now)).toBe(true);
+    expect(inReview({ ...quiet, attention: { state: "working", since: dead } }, dead, now)).toBe(false);
+    expect(inReview({ ...quiet, attention: { state: "needs-you:stalled", since: dead } }, dead, now)).toBe(true);
+    // Online, a "working" still keeps the finished turn out.
+    expect(inReview({ ...finished, attention: { state: "working", since: now } }, now, now)).toBe(false);
+  });
+
   it("is 'error' when status is error, regardless of session signals", () => {
     const s = session({ status: "error", session: signals({ question: "pick one" }) });
     expect(liveState(s)).toBe("error");
@@ -160,6 +201,24 @@ describe("liveState", () => {
   it("is 'idle' when transcriptAgeSec is null", () => {
     const s = session({ status: "running", session: signals({ transcriptAgeSec: null }) });
     expect(liveState(s)).toBe("idle");
+  });
+});
+
+describe("attentionHint (XERK-1572)", () => {
+  const sess = (attention: SessionInfo["attention"]): SessionInfo =>
+    ({ id: "s", repo: "r", status: "running", attention } as unknown as SessionInfo);
+  it("reads the classifier's verdict as the web does", () => {
+    const hint = { label: "needs-human-test", why: "Wants the login checked.", suggestedAnswer: "Checked." };
+    expect(attentionHint(sess({ state: "needs-you:test", since: 1, hint })))
+      .toEqual({ line: "needs a human test · Wants the login checked.", answer: "Checked." });
+    expect(attentionHint(sess({ state: "needs-you:review", since: 1, hint: { label: "odd", why: "x" } })))
+      .toEqual({ line: "x", answer: "" });
+  });
+  it("is empty without a verdict or once the session no longer needs you", () => {
+    const hint = { label: "looping", why: "Retries npm ci." };
+    expect(attentionHint(sess({ state: "working", since: 1, hint }))).toEqual({ line: "", answer: "" });
+    expect(attentionHint(sess({ state: "needs-you:review", since: 1 }))).toEqual({ line: "", answer: "" });
+    expect(attentionHint(sess(null))).toEqual({ line: "", answer: "" });
   });
 });
 

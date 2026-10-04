@@ -22,7 +22,7 @@ global.window.TurmaBoard = require("../public/board.js");
 const NT = require("../public/newticket.js");
 
 const PUBLIC = path.join(__dirname, "..", "public");
-const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html"];
+const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html", "brief.html"];
 
 const agent = (key, siteKey) => ({
   key, device: key, online: true, sessions: [],
@@ -222,7 +222,7 @@ test("newticket: every page loads newticket.js after org.js", () => {
 });
 
 test("newticket: every page feeds it the heartbeat via TurmaNewTicket.update", () => {
-  for (const f of ["index.html", "sessions.html", "usage.html", "board.html"]) {
+  for (const f of ["index.html", "sessions.html", "usage.html", "board.html", "brief.html"]) {
     const html = fs.readFileSync(path.join(PUBLIC, f), "utf8");
     assert.match(html, /TurmaNewTicket\.update\(data\)/, f);
   }

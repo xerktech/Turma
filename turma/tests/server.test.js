@@ -90,6 +90,10 @@ process.env.ORG_COLORS_FILE = path.join(
   os.tmpdir(),
   `turma-test-org-colors-${process.pid}.json`
 );
+process.env.BRIEFS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-briefs-${process.pid}.json`
+);
 // Durable token-usage history (XERK-338) is a /data file of its own, read at
 // require time like the stores above, so it gets a throwaway one too.
 process.env.USAGE_LEDGER_FILE = path.join(
@@ -193,6 +197,7 @@ const {
   wsAccept, wsEncode, wsParser, WS_FRAME_MAX, channelDuplex,
   heartbeatAlerts, prAlertDecision, readyForReview, sessionWorking, sanitizeLiveAgents,
   sessionWait, backgroundWait, ATTENTION_WAIT_STALL_MS, WAIT_ETA_GRACE_MS,
+  sessionAttention, sessionSleeping,
   invalidateAgentsCache, sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
   termRetryReset, terminalFail, terminalReconnectPage, TERM_AGENT_IDLE_MS,
   armChannelIdleTimeout,
@@ -1171,7 +1176,7 @@ test("XERK-1570: a wait stalls past its ETA or after ATTENTION_WAIT_STALL_MIN of
   assert.deepEqual(backgroundWait([], now, now), null);
 });
 
-test("XERK-1570: a waiting session is not alerted ready for review; once stalled it is", () => {
+test("XERK-1570: a waiting session is not alerted ready for review; once stalled it is alerted stalled", () => {
   const beat = makeHost();
   const now = Date.now();
   const sess = (ageSec, agents) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
@@ -1183,7 +1188,171 @@ test("XERK-1570: a waiting session is not alerted ready for review; once stalled
   beat(sess(5, ci), now + 20000);    // ended its turn to watch CI: waiting, no buzz
   assert.deepEqual(titles(), []);
   beat(sess(46 * 60, ci), now + 46 * WMIN); // silent past the stall: surfaces
-  assert.deepEqual(titles(), ["nas-repo-s1 is ready for review"]);
+  // XERK-1571: the stalled alert, not the review one (precedence stalled > review).
+  assert.deepEqual(titles(), ["nas-repo-s1 has stalled"]);
+});
+
+// ---- XERK-1571: attention state per session ------------------------------------
+
+test("XERK-1571: sessionAttention derives every state in precedence order", () => {
+  const now = Date.now();
+  const done = { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false };
+  const s = (live, extra = {}) => ({ id: "s1", status: "running", session: { ...done, ...live }, ...extra });
+  const att = (sess) => sessionAttention(sess, sessionWorking(sess, now, now), sessionWait(sess, now, now), now);
+  const ci = { type: "shell", label: "Watch CI", kind: "wait-external" };
+  const timed = { type: "shell", label: "Sleep", kind: "wait-timed", eta: now + 10 * WMIN };
+  assert.deepEqual(att(s({ question: "Ship it?" })), { state: "needs-you:question", why: "Ship it?" });
+  assert.deepEqual(att(s({ panePrompt: { prompt: "Allow rm?" } })), { state: "needs-you:permission", why: "Allow rm?" });
+  // The dialog's question is a generic "Do you want to proceed?", so the why names
+  // the pending command off the block above it (the real Claude Code dialog shape).
+  const perm = (detail) => att(s({ panePrompt: { prompt: "Do you want to proceed?", detail } })).why;
+  assert.equal(perm("Bash command\ntouch /tmp/permtest-marker\nCreate marker file in /tmp"), "Bash: touch /tmp/permtest-marker");
+  assert.equal(perm("Edit file\nsrc/app.js"), "Edit file: src/app.js");
+  assert.equal(perm("rm -rf build/"), "rm -rf build/");
+  assert.equal(perm(""), "Do you want to proceed?");
+  const long = perm("Bash command\n" + "x".repeat(300));
+  assert.equal(long.length, 120);
+  assert.ok(long.endsWith("…"));
+  // A question outranks everything below it, stalled included.
+  assert.equal(att(s({ question: "Q", transcriptAgeSec: 50 * 60, agents: [ci] })).state, "needs-you:question");
+  assert.deepEqual(att(s({ paneBusy: true })), { state: "working" });
+  // Sleeping: a wake still ahead — never review, carries the wake as eta + why.
+  assert.deepEqual(att(s({ wakeAt: now + 20 * WMIN, wakeReason: "check CI" })),
+    { state: "sleeping", eta: now + 20 * WMIN, why: "check CI" });
+  // ...and a wake already due no longer sleeps (the beat is about to deliver it).
+  assert.equal(att(s({ wakeAt: now - 1000 })).state, "needs-you:review");
+  assert.deepEqual(att(s({ agents: [timed] })), { state: "waiting", eta: now + 10 * WMIN, why: "Sleep" });
+  assert.deepEqual(att(s({ agents: [ci] })), { state: "waiting", why: "Watch CI" });
+  assert.deepEqual(att(s({ agents: [ci], transcriptAgeSec: 46 * 60 })), { state: "needs-you:stalled", why: "Watch CI" });
+  // Review splits on the existing inputs: the PR and its CI, or nothing to merge.
+  assert.deepEqual(att(s({})), { state: "needs-you:review", why: "finished · nothing to merge" });
+  const pr = (extra) => s({}, { prs: [{ url: "u", state: "OPEN", ...extra }] });
+  assert.equal(att(pr({ checks: "passing" })).why, "PR open · CI passing");
+  assert.equal(att(pr({ checks: "failing" })).why, "PR open · CI failing");
+  assert.equal(att(pr({ checks: "pending" })).why, "PR open · CI running");
+  assert.equal(att(pr({ checks: "passing", mergeable: "CONFLICTING" })).why, "PR open · merge conflict");
+  assert.equal(att(pr({})).why, "PR open");
+  // needs-you:test is reserved for the classifier (XERK-1572): nothing produces it.
+  assert.equal(att(s({ lastRole: "user" })).state, "idle");
+  assert.deepEqual(att({ id: "s1", status: "stopped", session: done }), { state: "idle" });
+});
+
+test("XERK-1571: a sleeping session is never ready for review", () => {
+  const now = Date.now();
+  const sess = { id: "s1", status: "running", prs: [{ url: "u", state: "OPEN" }], session: {
+    paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false, wakeAt: now + WMIN } };
+  assert.equal(readyForReview(sess, false, null, now), false);
+  assert.equal(readyForReview(sess, false, null, now + 2 * WMIN), true);
+  assert.equal(sessionSleeping(sess.session, now), true);
+  assert.equal(sessionSleeping({ wakeAt: "soon" }, now), false);
+  // A question still outranks the sleep — blocked on a human either way.
+  assert.equal(readyForReview({ ...sess, session: { ...sess.session, question: "Q" } }, false, null, now), true);
+});
+
+test("XERK-1571: attention `since` is the edge time, kept in alerts.sessions and swept with the session", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
+  let rec = beat(sess({ paneBusy: true }), t0);
+  assert.deepEqual(rec.alerts.sessions.s1.attn, { state: "working", since: t0 });
+  rec = beat(sess({ paneBusy: true }), t0 + 20000);
+  assert.equal(rec.alerts.sessions.s1.attn.since, t0, "same state keeps its edge");
+  rec = beat(sess({}), t0 + 40000);
+  assert.deepEqual(rec.alerts.sessions.s1.attn,
+    { state: "needs-you:review", why: "finished · nothing to merge", since: t0 + 40000 });
+  rec = beat(sess({}), t0 + 60000);
+  assert.equal(rec.alerts.sessions.s1.attn.since, t0 + 40000);
+  rec = beat({ sessions: [] }, t0 + 80000);
+  assert.equal(rec.alerts.sessions.s1, undefined, "swept with liveIds");
+});
+
+test("XERK-1571: the stalled alert fires once per edge, is retracted on recovery, and a question outranks it", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const ci = [{ type: "shell", label: "Watch CI", kind: "wait-external" }];
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
+  notifications.length = 0;
+  beat(sess({ paneBusy: true, transcriptAgeSec: 1 }), t0);
+  beat(sess({ transcriptAgeSec: 5, agents: ci }), t0 + 20000);                // waiting
+  beat(sess({ transcriptAgeSec: 46 * 60, agents: ci }), t0 + 46 * WMIN);       // stalled
+  assert.deepEqual(titles(), ["nas-repo-s1 has stalled"]);
+  const sent = notifications.find((n) => n.title === "nas-repo-s1 has stalled");
+  assert.equal(sent.data.notifKey, "stalled:host1:s1");
+  assert.match(sent.body, /Watch CI/);
+  beat(sess({ transcriptAgeSec: 47 * 60, agents: ci }), t0 + 47 * WMIN);       // still stalled: no re-fire
+  assert.deepEqual(titles(), ["nas-repo-s1 has stalled"]);
+  assert.deepEqual(dismisses(), []);
+  // Recovery (the shell came back, the session works again): retracted, once.
+  beat(sess({ paneBusy: true, transcriptAgeSec: 1 }), t0 + 48 * WMIN);
+  beat(sess({ paneBusy: true, transcriptAgeSec: 1 }), t0 + 49 * WMIN);
+  assert.deepEqual(dismisses(), ["stalled:host1:s1"]);
+
+  // A question pending outranks stalled: the session's attention IS the question.
+  const b2 = makeHost();
+  notifications.length = 0;
+  b2(sess({ paneBusy: true, transcriptAgeSec: 1 }), t0);
+  b2(sess({ transcriptAgeSec: 5, agents: ci }), t0 + 20000);
+  const rec = b2(sess({ transcriptAgeSec: 46 * 60, agents: ci, question: "Keep waiting?" }), t0 + 46 * WMIN);
+  assert.deepEqual(titles(), ["nas-repo-s1 has a question"]);
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:question");
+});
+
+test("XERK-1571: sleeping and waiting never alert", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
+  notifications.length = 0;
+  beat(sess({ paneBusy: true }), t0);
+  // Ends its turn having asked to be woken in 30 minutes: asleep, no review alert.
+  beat(sess({ wakeAt: t0 + 30 * WMIN, wakeReason: "check CI" }), t0 + 20000);
+  beat(sess({ wakeAt: t0 + 30 * WMIN, wakeReason: "check CI", transcriptAgeSec: 20 * 60 }), t0 + 20 * WMIN);
+  assert.deepEqual(titles(), []);
+});
+
+test("XERK-1571: serializeAgent stamps attention on a CLONE, and a forged one never reaches the wire", async () => {
+  const now = Date.now();
+  const rec = {
+    device: "attn-host", lastSeen: now,
+    sessions: [{ id: "s1", status: "running", attention: { state: "needs-you:review", since: 1 } },
+               { id: "s2", status: "running" }, { id: "s3", status: "running" },
+               { id: "s4", status: "running", attention: { state: "needs-you:question", since: 1 } }],
+    alerts: { sessions: {
+      s1: { attn: { state: "sleeping", since: now - 5000, eta: now + WMIN, why: "check CI" } },
+      // A corrupt/hand-edited restore: wrong-typed fields are dropped, a bad state omits it.
+      s2: { attn: { state: "working", since: now - 1000, eta: "soon", why: 7 } },
+      s3: { attn: { state: "napping", since: now } },
+    } },
+  };
+  const out = hub.serializeAgent("attn-host", rec, now);
+  assert.deepEqual(out.sessions[0].attention, { state: "sleeping", since: now - 5000, eta: now + WMIN, why: "check CI" });
+  assert.deepEqual(out.sessions[1].attention, { state: "working", since: now - 1000 });
+  assert.equal("attention" in out.sessions[2], false);
+  assert.equal("attention" in out.sessions[3], false, "a record's own attention is never served");
+  // Never mutated into the stored record (the forged one there is left to normalizeSessions).
+  assert.notEqual(out.sessions, rec.sessions);
+  assert.equal("attention" in rec.sessions[1], false);
+  assert.deepEqual(rec.sessions[0].attention, { state: "needs-you:review", since: 1 });
+
+  // Ingest strips an agent-asserted attention (normalizeSessions), and the served
+  // one is the hub's own read.
+  const host = "attn-forge";
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: [{ id: "s1", status: "running",
+      attention: { state: "needs-you:question", since: 1, why: "forged" },
+      session: { paneBusy: true, transcriptAgeSec: 1 } }] },
+  });
+  assert.equal(r.status, 200);
+  assert.equal("attention" in agents[host].sessions[0], false);
+  const served = hub.serializeAgent(host, agents[host], Date.now());
+  assert.equal(served.sessions[0].attention.state, "working");
+  // The restore path strips it too.
+  const restored = { sessions: [{ id: "s1", attention: { state: "idle", since: 5 } }] };
+  hub.normalizeRecord(restored, "restore");
+  assert.equal("attention" in restored.sessions[0], false);
 });
 
 // ---- heartbeatAlerts (edge-triggered) ------------------------------------------
@@ -3465,6 +3634,82 @@ test("XERK-1564: a session's wake request is coerced by name, absent = none", ()
   const none = live({ paneBusy: false });
   assert.equal("wakeAt" in none, false);
   assert.equal("wakeReason" in none, false);
+});
+
+test("XERK-1569: ticket.outcome is coerced by name on every ticket channel", () => {
+  const rec = (outcome) => {
+    const r = {
+      device: "xerk1569-outcome",
+      sessions: [{ id: "s", ticket: { key: "P-1", outcome } }],
+      closedSessions: [{ id: "c", ticket: { key: "P-1", outcome } }],
+      repos: [{ name: "R", resumable: [{ transcriptId: "t", ticket: { key: "P-1", outcome } }] }],
+    };
+    hub.normalizeRecord(r);
+    return [r.sessions[0].ticket, r.closedSessions[0].ticket, r.repos[0].resumable[0].ticket];
+  };
+  // A well-formed outcome rides through on all three, stray keys dropped.
+  for (const kind of ["done", "not-reproducible", "already-fixed"]) {
+    for (const t of rec({ kind, at: 1_786_400_000_000, extra: { x: 1 } })) {
+      assert.deepEqual(t.outcome, { kind, at: 1_786_400_000_000 });
+      assert.equal(t.key, "P-1");   // the rest of the ticket is untouched
+    }
+  }
+  // Junk DELETES the key (absent = not closed by its session), never repairs it.
+  for (const bad of [
+    "done", 5, [], null, {}, { kind: "wontfix", at: 1 }, { kind: "done" },
+    { kind: "done", at: "soon" }, { kind: "done", at: 1.5 }, { kind: "done", at: Infinity },
+    { kind: 7, at: 1 },
+  ]) {
+    for (const t of rec(bad)) {
+      assert.equal("outcome" in t, false, `outcome ${JSON.stringify(bad)} kept`);
+    }
+  }
+  // The evidence note rides as a bounded string; a bad note is dropped ALONE
+  // (absent = no note, never invented) and never costs the outcome.
+  for (const t of rec({ kind: "done", at: 1, note: "ran repro.sh: passes" })) {
+    assert.deepEqual(t.outcome, { kind: "done", at: 1, note: "ran repro.sh: passes" });
+  }
+  for (const bad of [5, "", null, ["x"], { x: 1 }, true]) {
+    for (const t of rec({ kind: "done", at: 1, note: bad })) {
+      assert.deepEqual(t.outcome, { kind: "done", at: 1 }, `note ${JSON.stringify(bad)} kept`);
+    }
+  }
+  // Over the agent's 2000 cap it is cut at a code point, never mid-surrogate.
+  const long = "😀".repeat(2500);
+  for (const t of rec({ kind: "done", at: 1, note: long })) {
+    assert.equal(Array.from(t.outcome.note).length, 2000);
+    assert.equal(t.outcome.note, "😀".repeat(2000));
+  }
+});
+
+test("XERK-1569: ticketOutcomeResults are consumed by the ingest, never kept on the record", async () => {
+  const body = {
+    device: "xerk1569-results",
+    ticketOutcomeResults: [
+      { sessionId: "s", key: "P-1", kind: "not-reproducible", ok: true, error: null,
+        final: true, status: "Done", at: 1 },
+      { sessionId: "s", key: "P-2", kind: "done", ok: false, error: "boom\nforged line",
+        final: false, status: null, at: 2 },
+      "junk",
+    ],
+  };
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => { logs.push(a.join(" ")); };
+  let r;
+  try {
+    r = await request("POST", "/api/heartbeat", { body, headers: agentHeaders });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(r.status, 200);
+  const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "xerk1569-results");
+  assert.equal("ticketOutcomeResults" in rec, false);
+  assert.ok(logs.some((l) => l.includes("closed ticket \"P-1\"") && l.includes("not-reproducible")));
+  const failed = logs.find((l) => l.includes("\"P-2\""));
+  assert.match(failed, /FAILED \(will retry\)/);
+  assert.equal(failed.includes("\n"), false, "an agent string must not forge a log line");
 });
 
 test("XERK-455: typed /api/agents fields are coerced at ingest, not served raw", async () => {
@@ -8376,6 +8621,7 @@ const asBeat = async (device, site, {
   ticketLinkResults,
   jiraSource,
   ackedCommands,
+  closeTicket,
 } = {}) => {
   const r = await request("POST", "/api/heartbeat", {
     body: {
@@ -8383,6 +8629,7 @@ const asBeat = async (device, site, {
       repos: repos.map((name) => ({ name, path: `/git/${name}` })),
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
+      ...(closeTicket !== undefined ? { closeTicket } : {}),
       jira: { available: true, configured: true, siteKey: site,
               user: user || `${device}@x.com`, fetchedAt, tickets,
               ...(jiraSource ? { source: jiraSource } : {}) },
@@ -12147,18 +12394,23 @@ const resetMerge = () => {
 const mergeBeat = async (device, site, {
   autoMerge = true, ready = "ready", state = "OPEN", mergeable = "MERGEABLE",
   paneBusy = false, ticketType = "bug", issueType = "Bug", statusCategory = "inprogress",
-  question, prs, tickets, url = PR1,
+  question, prs, tickets, url = PR1, agentType,
+  // A current agent reports it reads close-ticket requests (XERK-1569); pass
+  // null to beat as an agent that predates the reader.
+  closeTicket = { available: true },
 } = {}) => {
   // `issueType` is the TRACKER Issue Type (`type`); `ticketType` is the triage
   // classifier's assessment (`triage.type`) — kept distinct so a test can drive
   // them apart.
   const r = await asBeat(device, site, {
     autoStart: false,
+    ...(closeTicket ? { closeTicket } : {}),
     tickets: tickets || [{ key: "ENG-9", summary: "A bug", statusCategory,
       type: issueType,
       repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: ticketType, actionable: true } }],
     sessions: [{ id: "sm1", status: "running",
+      ...(agentType ? { agentType } : {}),
       ticket: { key: "ENG-9", siteKey: site },
       prs: prs || [{ url, state, ready, mergeable }],
       session: { transcriptAgeSec: 30, paneBusy,
@@ -12900,6 +13152,7 @@ test("XERK-705/637: an armed run's child is MESSAGED to self-close on a merged P
   resetEpicD();
   const url = "https://github.com/ep/c1/pull/1";
   await asBeat("edC", "d637-2.atlassian.net", { autoStart: false,
+    closeTicket: { available: true },
     tickets: [dEpic(), dChild("C-1", [], "inprogress")],
     sessions: [dChildSession("s-c1", "C-1", "d637-2.atlassian.net", "MERGED", url)] });
   armEpicRun("d637-2.atlassian.net", "E-1");
@@ -12912,6 +13165,7 @@ test("XERK-705/637: an armed run's child is MESSAGED to self-close on a merged P
   const msgs = inputTo("edC", "s-c1");
   assert.equal(msgs.length, 1, `expected one message to the child, got ${JSON.stringify(got)}`);
   assert.match(msgs[0], /mark the ticket as Done/i);
+  assert.match(msgs[0], /close-ticket done --note/);
 });
 
 test("XERK-637: an epic child with NO armed run stays excluded, even in an auto-merge org", async () => {
@@ -13705,6 +13959,18 @@ test("XERK-550: auto-merge dispatches mergePr for a ready, idle, eligible sessio
   assert.equal(autoMergeState.get(PR1).attempts, 1);
 });
 
+test("XERK-1571: auto-merge leaves a SLEEPING session alone until its wake has passed", async () => {
+  resetMerge();
+  await mergeBeat("amSleep", "amsleep.atlassian.net", {});
+  const live = agents.amSleep.sessions[0].session;
+  live.wakeAt = Date.now() + 10 * 60_000;   // asked to be woken in 10 minutes
+  autoMergeSweep();
+  assert.equal((agents.amSleep.commands || []).filter((c) => c.type === "mergePr").length, 0);
+  live.wakeAt = Date.now() - 1000;          // the wake is now behind us
+  autoMergeSweep();
+  assert.equal((agents.amSleep.commands || []).filter((c) => c.type === "mergePr").length, 1);
+});
+
 test("XERK-550: auto-merge skips when the org has NOT opted in", async () => {
   resetMerge();
   await mergeBeat("am2", "am2.atlassian.net", { autoMerge: false });
@@ -14163,6 +14429,7 @@ test("XERK-705: a merged PR MESSAGES the org-stream session — no Done write, n
   assert.equal(msgs.length, 1, `expected one input message, got ${JSON.stringify(got)}`);
   assert.match(msgs[0], /merged/i);
   assert.match(msgs[0], /mark the ticket as Done/i);
+  assert.match(msgs[0], /close-ticket done --note/);
   assert.equal((agents.amC.commands || []).find((c) => c.type === "input").sessionId, "sm1");
 });
 
@@ -14207,6 +14474,57 @@ test("auto-close: the merged message asks the session to verify the DEPLOY befor
   assert.match(msg, /NOT deployed or NOT working, keep working/i);
   assert.match(msg, /branch fresh from the updated default branch/i);
   assert.match(msg, /IS deployed and working .* mark the ticket as Done/i);
+  // XERK-1569: it names the session CLI first, the host's tracker tool second.
+  assert.ok(msg.includes('python3 -SsE "$TURMA_SESSION_CLI" close-ticket done --note'),
+    "names the session CLI's close-ticket");
+  assert.match(msg, /else the tracker CLI\/MCP this host gives you/);
+});
+
+test("XERK-1569: a dsh/qwen session is told to close with its tracker tool, never the session CLI", async () => {
+  // dsh/qwen sessions are not given $TURMA_SESSION_CLI, so naming it would hand
+  // them a command that cannot run.
+  hub.__setDshEnabled(true);
+  hub.__setQwenEnabled(true);
+  for (const agentType of ["dsh", "qwen"]) {
+    resetMerge();
+    const dev = "amRt" + agentType;
+    await mergeBeat(dev, `amrt${agentType}.atlassian.net`, { state: "MERGED", agentType });
+    autoCloseSweep();
+    const [msg] = inputTexts(dev);
+    assert.ok(msg, `${agentType}: the session is still messaged`);
+    assert.match(msg, /mark the ticket as Done/i);
+    assert.ok(!msg.includes("TURMA_SESSION_CLI"), `${agentType}: no session CLI, got ${msg}`);
+    assert.match(msg, /close it with the tracker CLI\/MCP this host gives you/);
+  }
+});
+
+test("XERK-1569: a host that does not report the close-ticket reader is told the tracker tool", async () => {
+  // The hub deploys on merge but agents self-update later: an agent with the
+  // session CLI but no reader would accept the request and never act on it.
+  for (const closeTicket of [null, { available: false }, { available: "yes" }, "junk"]) {
+    resetMerge();
+    const dev = "amCt" + JSON.stringify(closeTicket).replace(/\W/g, "");
+    await mergeBeat(dev, `${dev.toLowerCase()}.atlassian.net`, { state: "MERGED", closeTicket });
+    autoCloseSweep();
+    const [msg] = inputTexts(dev);
+    assert.ok(msg, `${JSON.stringify(closeTicket)}: the session is still messaged`);
+    assert.match(msg, /mark the ticket as Done/i);
+    assert.ok(!msg.includes("TURMA_SESSION_CLI"),
+      `${JSON.stringify(closeTicket)}: no session CLI, got ${msg}`);
+    assert.match(msg, /close it with the tracker CLI\/MCP this host gives you/);
+  }
+});
+
+test("XERK-1569: normalizeCloseTicket keeps a strict boolean, nulls junk, leaves absent absent", () => {
+  const n = (v) => { const p = v === undefined ? {} : { closeTicket: v }; hub.normalizeCloseTicket(p); return p; };
+  assert.deepEqual(n({ available: true }), { closeTicket: { available: true } });
+  assert.deepEqual(n({ available: "yes", extra: 1 }), { closeTicket: { available: false } });
+  assert.deepEqual(n("junk"), { closeTicket: null });
+  assert.deepEqual(n([true]), { closeTicket: null });
+  assert.deepEqual(n(undefined), {});
+  assert.ok(!hub.autoCloseMergedMessage([], undefined, false).includes("TURMA_SESSION_CLI"));
+  assert.ok(hub.autoCloseMergedMessage([], undefined, true).includes("TURMA_SESSION_CLI"));
+  assert.ok(!hub.autoCloseMergedMessage([], "dsh", true).includes("TURMA_SESSION_CLI"));
 });
 
 test("auto-close: only a bounded, URL-shaped PR url reaches the message; odd urls never re-nag", async () => {
@@ -22469,6 +22787,536 @@ test("subagent history: a malformed block is coerced at ingest too", async () =>
   delete agents[host];
 });
 
+// ---- XERK-1573: the per-org brief ---------------------------------------------
+
+// Stamp a session's hub attention the way heartbeatAlerts keeps it (the brief
+// reads the stamp, never the agent's word).
+function setAttn(host, sid, attn) {
+  const a = agents[host];
+  a.alerts = a.alerts || {};
+  a.alerts.sessions = a.alerts.sessions || {};
+  a.alerts.sessions[sid] = { ...(a.alerts.sessions[sid] || {}), attn };
+}
+
+test("XERK-1573: a brief composes every section from hub data, scoped to the DECIDED org", async () => {
+  resetAutoStart();
+  const A = "brA1573.atlassian.net";
+  const B = "brB1573.atlassian.net";
+  const now = Date.now();
+  const iso = (ms) => new Date(ms).toISOString();
+  const H = 3600 * 1000;
+  const tri = (o) => ({ priority: "P2", type: "task", actionable: true, ...o });
+  const todo = (key, created, extra) => ({ key, summary: `todo ${key}`, statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, triage: tri(extra), created });
+  await asBeat("brHostA", A, {
+    capacity: FULL,
+    tickets: [
+      { key: "A-1", summary: "shipped", statusCategory: "done", created: iso(now - 90 * 24 * H),
+        resolved: iso(now - 2 * H), updated: iso(now - H) },
+      { key: "A-2", summary: "old done", statusCategory: "done", created: iso(now - 90 * 24 * H),
+        resolved: iso(now - 30 * 24 * H) },
+      todo("A-3", iso(now - 60 * 24 * H)),                     // oldest todo
+      todo("A-4", iso(now - H)),                               // new: intake
+      todo("A-5", iso(now - 2 * H), { priority: "P0", type: "bug" }),
+      // Closed as stale (XERK-1569 moves them to a Done-category status): their
+      // board rows read done + resolved in the period, yet they are NOT finished.
+      { key: "A-9", summary: "flaky thing", statusCategory: "done", status: "Cannot Reproduce",
+        created: iso(now - 90 * 24 * H), resolved: iso(now - H) },
+      { key: "A-7", summary: "flaky upload", statusCategory: "done", status: "Won't Do",
+        created: iso(now - 90 * 24 * H), resolved: iso(now - 2 * H) },
+    ],
+    sessions: [
+      { id: "q1", status: "running", summary: "asks a question" },
+      { id: "r1", status: "running", summary: "ready for review",
+        prs: [{ url: "https://github.com/x/y/pull/9", state: "MERGED", title: "Fix it" }] },
+      { id: "w1", status: "running", summary: "waits on CI" },
+      { id: "st1", status: "running", summary: "stalled one" },
+      { id: "z1", status: "running", summary: "closed stale",
+        ticket: { key: "A-9", siteKey: A, summary: "flaky thing",
+          outcome: { kind: "not-reproducible", at: now - H, note: "ran 50x, green" } } },
+      // Closed as DONE by its session: finished work, not a stale close.
+      { id: "z2", status: "running", summary: "closed done",
+        ticket: { key: "A-8", siteKey: A, summary: "real fix",
+          outcome: { kind: "done", at: now - H } } },
+    ],
+    closedSessions: [
+      { id: "c1", summary: "ended run", closedAt: iso(now - 3 * H),
+        prs: [{ url: "https://github.com/x/y/pull/8", state: "MERGED", title: "Earlier" }] },
+      { id: "c0", summary: "ended long ago", closedAt: iso(now - 30 * 24 * H) },
+      // Closed its ticket as stale: counted under closedStale, not Finished too.
+      { id: "c2", summary: "chased flaky upload", closedAt: iso(now - 2 * H),
+        ticket: { key: "A-7", siteKey: A, summary: "flaky upload",
+          outcome: { kind: "already-fixed", at: now - 2 * H } } },
+      // Worked the Done ticket A-1: the ticket row stands for it (and takes its host).
+      { id: "c3", summary: "worked A-1", closedAt: iso(now - 2 * H),
+        ticket: { key: "A-1", siteKey: A, summary: "shipped" } },
+      // Nothing else stands for it: a Finished session row, with when + its transcript.
+      { id: "c4", summary: "plain run", closedAt: iso(now - 3 * H), transcriptId: "t-c4" },
+    ],
+  });
+  setAttn("brHostA", "q1", { state: "needs-you:question", since: now - 10 * 60000, why: "Ship it?" });
+  setAttn("brHostA", "r1", { state: "needs-you:review", since: now - 30 * 60000, why: "PR open · CI passing" });
+  setAttn("brHostA", "w1", { state: "waiting", since: now - 5 * 60000, eta: now + 20 * 60000, why: "Watch CI" });
+  setAttn("brHostA", "st1", { state: "needs-you:stalled", since: now - 50 * 60000, why: "Watch CI" });
+  agents.brHostA.limits = { capturedAt: Math.floor(now / 1000) - 60,
+    fiveHour: { usedPct: 95, resetsAt: Math.floor(now / 1000) + 3600 },
+    sevenDay: { usedPct: 40, resetsAt: Math.floor(now / 1000) - 10 } };   // 7d already reset
+  agents.brHostA.subscription = { key: "sub-a", label: "Team plan" };
+  // Org B's host must not leak into A's brief.
+  await asBeat("brHostB", B, { autoStart: false,
+    sessions: [{ id: "b1", status: "running", summary: "other org" }] });
+  setAttn("brHostB", "b1", { state: "needs-you:question", since: now - 60000, why: "B?" });
+  // A host BOUND to B that now CLAIMS A (drifted): decided into no org, so its
+  // sessions are in neither brief.
+  await asBeat("brDrift", B, { autoStart: false });
+  await asBeat("brDrift", A, { autoStart: false,
+    sessions: [{ id: "d1", status: "running", summary: "drifted" }] });
+  setAttn("brDrift", "d1", { state: "needs-you:question", since: now - 70 * 60000, why: "D?" });
+  // A host BOUND to A whose next beat declares NO tracker org (quiet): silence is
+  // not drift (XERK-348), so its decided org is still A and its sessions are in
+  // A's brief. A host filter on the claimed-and-bound pair would drop it.
+  await asBeat("brQuiet", A, { autoStart: false, tickets: [] });
+  const quietBeat = await request("POST", "/api/heartbeat", { headers: agentHeaders,
+    body: { device: "brQuiet", repos: [{ name: "Turma", path: "/git/Turma" }],
+      sessions: [{ id: "qq1", status: "running", summary: "quiet host asks" }] } });
+  assert.equal(quietBeat.status, 200);
+  assert.equal(agents.brQuiet.jira, undefined, "the quiet beat declares no tracker org");
+  setAttn("brQuiet", "qq1", { state: "needs-you:question", since: now - 2 * 60000, why: "Q?" });
+  setAutoStartOrg(A, true);
+
+  const b = hub.compileBrief(A, now, "scheduled", []);
+  assert.equal(b.siteKey, A);
+  assert.equal(b.since, now - hub.BRIEF_INTERVAL_MS, "no prior brief: the period is one interval");
+  assert.equal(b.autoStart, true);
+  // Needs you: the hub's attention, oldest first; stalled apart; org B and the
+  // drifted host absent; the quiet host's session present.
+  assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["r1", "q1", "qq1"]);
+  assert.equal(b.needsYou[2].host, "brQuiet");
+  assert.equal(b.needsYou[1].why, "Ship it?");
+  assert.equal(b.needsYou[1].state, "needs-you:question");
+  assert.deepEqual(b.stalled.map((i) => i.sessionId), ["st1"]);
+  assert.deepEqual(b.waiting.map((i) => [i.sessionId, i.eta]), [["w1", now + 20 * 60000]]);
+  // Finished: the Done ticket resolved in the period, both merged PRs, and ONE
+  // ended session — each piece of work once. c1 is its PR #8 row, c2 its stale
+  // close, c3 the Done ticket A-1's row (XERK-1573 screenshot pass).
+  assert.deepEqual(b.finished.map((i) => [i.kind, i.kind === "pr" ? i.url : i.key || i.sessionId]).sort(), [
+    ["pr", "https://github.com/x/y/pull/8"], ["pr", "https://github.com/x/y/pull/9"],
+    ["session", "c4"], ["ticket", "A-1"]]);
+  assert.equal(b.counts.finished, 4);
+  // Every finished row says when (a PR carries no merge time) and where.
+  const fin = Object.fromEntries(b.finished.map((i) => [i.key || i.sessionId || i.url, i]));
+  assert.equal(fin["A-1"].since, now - 2 * H, "the ticket's resolved time");
+  assert.equal(fin["A-1"].host, "brHostA", "the host of the session that worked it");
+  assert.equal(fin.c4.since, now - 3 * H, "the session's closedAt");
+  assert.equal(fin.c4.transcriptId, "t-c4", "so the row can open the ended session");
+  // The stale-closed tickets' Done rows are not Finished rows (Closed as stale is
+  // their one row), but they did leave the board, so outflow counts them.
+  assert.equal(b.finished.some((i) => i.key === "A-9" || i.key === "A-7"), false);
+  // Intake/outflow off the rows' created/resolved dates.
+  assert.equal(b.counts.intake, 2);
+  assert.equal(b.counts.outflow, 3, "A-1 plus the two stale closes");
+  // Starts next: the auto-start order (P0 preempts, then oldest), with why.
+  assert.deepEqual(b.nextUp.map((i) => i.key), ["A-5", "A-3", "A-4"]);
+  assert.match(b.nextUp[0].reason, /^P0 preempts the line · created 2h ago · type bug$/);
+  assert.match(b.nextUp[1].reason, /^oldest first · created 60d ago/);
+  // Closed as stale by its session.
+  assert.deepEqual(b.closedStale.map((i) => [i.key, i.reason, i.note]),
+    [["A-9", "not-reproducible", "ran 50x, green"], ["A-7", "already-fixed", undefined]]);
+  // Spend: the subscription, its live 5h window, the rolled-over 7d window
+  // dropped, and the pause it drives.
+  assert.deepEqual(b.spend, [{ label: "Team plan", fiveHourPct: 95,
+    fiveHourResetsAt: (Math.floor(now / 1000) + 3600) * 1000,
+    capturedAt: (Math.floor(now / 1000) - 60) * 1000, paused: true }]);
+  // Org B's brief carries only its own session.
+  const bb = hub.compileBrief(B, now, "scheduled", []);
+  assert.deepEqual(bb.needsYou.map((i) => i.sessionId), ["b1"]);
+  assert.deepEqual(bb.nextUp, [], "auto-start off: nothing from the auto order");
+
+  // A queued ticket leads "starts next", and a merged PR a kept brief listed is
+  // not finished again.
+  ticketQueue.push({ siteKey: A, issueKey: "A-3", source: "manual", at: now - 1000, reason: "capacity" });
+  const b2 = hub.compileBrief(A, now + 1000, "scheduled", [b]);
+  assert.equal(b2.since, now);
+  assert.equal(b2.nextUp[0].key, "A-3");
+  assert.match(b2.nextUp[0].reason, /^queued \(capacity\) · oldest first/);
+  assert.equal(b2.nextUp.filter((i) => i.key === "A-3").length, 1);
+  assert.deepEqual(b2.finished.filter((i) => i.kind === "pr"), []);
+  ticketQueue.length = 0;
+  for (const h of ["brHostA", "brHostB", "brDrift", "brQuiet"]) delete agents[h];
+  resetAutoStart();
+});
+
+test("XERK-1573: the hub words a brief duration by the page's own rule (hours from the hour on)", () => {
+  // The screenshot pass caught "Starts next" saying "created 61m ago" (fmtDur)
+  // beside rows the page words "1h". The hub's briefDur and brief.html's dur are
+  // ONE rule: run the page's own function over the same sweep.
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "brief.html"), "utf8");
+  const a = src.indexOf("function dur(ms) {");
+  assert.ok(a >= 0, "brief.html has dur");
+  const b = src.indexOf("\n}\n", a);
+  const pageDur = vm.runInNewContext(`(${src.slice(a, b + 2)})`);
+  const M = 60000, H = 60 * M;
+  for (const ms of [-5000, 0, 89000, 90000, 3569000, 3570000, H, 61 * M, 89 * M, 90 * M, 2 * H,
+    47 * H, 48 * H, 3 * 24 * H, 60 * 24 * H]) {
+    assert.equal(hub.briefDur(ms), pageDur(ms), `${ms}ms`);
+  }
+  assert.equal(hub.briefDur(61 * M), "1h");
+  assert.equal(hub.briefDur(59 * M), "59m");
+  const now = Date.UTC(2026, 9, 4, 12);
+  const t = { created: new Date(now - 61 * M).toISOString() };
+  assert.equal(hub.briefNextReason(t, null, now), "oldest first · created 1h ago");
+});
+
+test("XERK-1573: spend reads a shared subscription's fleet-wide freshest reading, as its pause does", async () => {
+  resetAutoStart();
+  const A = "spA1573.atlassian.net";
+  const B = "spB1573.atlassian.net";
+  const now = Date.now();
+  const sec = Math.floor(now / 1000);
+  await asBeat("spHostA", A, { autoStart: false });
+  await asBeat("spHostB", B, { autoStart: false });
+  // One subscription spent from both orgs: A's own host holds an older, calm
+  // reading; B's host the fresher, maxed one that pauses the pool.
+  agents.spHostA.subscription = { key: "sub-shared", label: "Shared" };
+  agents.spHostB.subscription = { key: "sub-shared", label: "Shared" };
+  agents.spHostA.limits = { capturedAt: sec - 600, fiveHour: { usedPct: 40, resetsAt: sec + 3600 } };
+  agents.spHostB.limits = { capturedAt: sec - 60, fiveHour: { usedPct: 99, resetsAt: sec + 3600 } };
+  const b = hub.compileBrief(A, now, "scheduled", []);
+  assert.deepEqual(b.spend, [{ label: "Shared", fiveHourPct: 99,
+    fiveHourResetsAt: (sec + 3600) * 1000, capturedAt: (sec - 60) * 1000, paused: true }]);
+  for (const h of ["spHostA", "spHostB"]) delete agents[h];
+  resetAutoStart();
+});
+
+test("XERK-1573: a merged PR and its ticket's Done row are ONE finished row", async () => {
+  const S = "brP1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const pr = "https://github.com/x/y/pull/42";
+  // The hands-off flow: the session on P-1 merged PR #42 and P-1 went Done.
+  await asBeat("brHostP", S, { autoStart: false,
+    tickets: [{ key: "P-1", summary: "the fix", statusCategory: "done",
+      created: iso(now - 9 * 24 * H), resolved: iso(now - H) }],
+    sessions: [{ id: "p1", status: "running", summary: "worked P-1",
+      ticket: { key: "P-1", siteKey: S, summary: "the fix" },
+      prs: [{ url: pr, state: "MERGED", title: "Fix P-1" }] }],
+    closedSessions: [{ id: "p0", summary: "earlier run on P-1", closedAt: iso(now - 2 * H),
+      ticket: { key: "P-1", siteKey: S, summary: "the fix" },
+      prs: [{ url: pr, state: "MERGED", title: "Fix P-1" }] }],
+  });
+  const b = hub.compileBrief(S, now, "scheduled", []);
+  assert.equal(b.counts.finished, 1, "one piece of work, one Finished row");
+  assert.deepEqual(b.finished.map((i) => [i.kind, i.key]), [["ticket", "P-1"]]);
+  assert.equal(b.finished[0].prUrl, pr, "the ticket row carries its PR link");
+  assert.equal(b.finished[0].host, "brHostP");
+  // Still remembered as reported: the next brief does not finish it as a PR row.
+  const b2 = hub.compileBrief(S, now + 1000, "scheduled", [b]);
+  assert.deepEqual(b2.finished, []);
+  // A merged PR whose ticket is NOT Done stays its own row.
+  agents.brHostP.jira.tickets[0].statusCategory = "inprogress";
+  const b3 = hub.compileBrief(S, now, "scheduled", []);
+  assert.deepEqual(b3.finished.map((i) => [i.kind, i.url]), [["pr", pr]]);
+  delete agents.brHostP;
+});
+
+test("XERK-1573: the brief bounds its lists and keeps the newest BRIEFS_KEEP", async () => {
+  const S = "brC1573.atlassian.net";
+  const now = Date.now();
+  const sessions = [];
+  for (let i = 0; i < 15; i++) sessions.push({ id: `n${i}`, status: "running" });
+  await asBeat("brHostC", S, { autoStart: false, sessions });
+  for (let i = 0; i < 15; i++) {
+    setAttn("brHostC", `n${i}`, { state: "needs-you:review", since: now - (100 - i) * 1000, why: "x" });
+  }
+  notifications.length = 0;
+  for (let i = 0; i < 12; i++) hub.briefSweep(S, "scheduled", now + i * 1000);
+  const kept = hub.getBriefs()[S];
+  assert.equal(kept.length, 10);
+  assert.deepEqual(kept.map((x) => x.at), Array.from({ length: 10 }, (_, i) => now + (11 - i) * 1000));
+  assert.equal(kept[0].needsYou.length, 10);
+  assert.equal(kept[0].counts.needsYou, 15);
+  assert.equal(kept[0].needsYou[0].sessionId, "n0", "oldest first, then cut");
+  // The payload serves it top-level.
+  invalidateAgentsCache();
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(r.body.briefs[S].length, 10);
+  // The newest in full; each earlier one as its headline (both clients show only
+  // its counts), though the store keeps its rows.
+  assert.equal(r.body.briefs[S][0].needsYou.length, 10);
+  assert.equal(kept[1].needsYou.length, 10);
+  assert.deepEqual(r.body.briefs[S][1].needsYou, []);
+  assert.equal(r.body.briefs[S][1].counts.needsYou, 15);
+  delete agents.brHostC;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: one push per brief, only when the needs-you set changed", async () => {
+  const S = "brD1573.atlassian.net";
+  const now = Date.now();
+  await asBeat("brHostD", S, { autoStart: false,
+    sessions: [{ id: "p1", status: "running" }, { id: "p2", status: "running" }] });
+  const pushes = () => notifications.filter((n) => n.title != null && n.data && n.data.notifKey === `brief:${S}`);
+  // Whatever attention the beat itself stamped is replaced: no one needs you yet.
+  setAttn("brHostD", "p1", { state: "working", since: now });
+  setAttn("brHostD", "p2", { state: "working", since: now });
+  notifications.length = 0;
+  hub.briefSweep(S, "scheduled", now);
+  assert.equal(pushes().length, 0, "an empty set with no previous brief says nothing");
+  setAttn("brHostD", "p1", { state: "needs-you:question", since: now - 1000, why: "Q?" });
+  hub.briefSweep(S, "scheduled", now + 1000);
+  assert.equal(pushes().length, 1);
+  assert.equal(pushes()[0].title, "brD1573 brief: 1 needs you");
+  assert.equal(pushes()[0].body, "1 waiting on you · 0 waiting · 0 finished");
+  hub.briefSweep(S, "scheduled", now + 2000);
+  assert.equal(pushes().length, 1, "same set: no second push");
+  setAttn("brHostD", "p2", { state: "needs-you:stalled", since: now - 2000, why: "CI" });
+  hub.briefSweep(S, "manual", now + 3000);
+  assert.equal(pushes().length, 2, "a changed set pushes again, under the same key");
+  assert.equal(pushes()[1].title, "brD1573 brief: 2 need you");
+  // The set empties: the standing push is retracted, not replaced.
+  setAttn("brHostD", "p1", { state: "working", since: now });
+  setAttn("brHostD", "p2", { state: "working", since: now });
+  hub.briefSweep(S, "scheduled", now + 4000);
+  assert.equal(pushes().length, 2);
+  assert.deepEqual(dismisses().filter((k) => k === `brief:${S}`), [`brief:${S}`]);
+  delete agents.brHostD;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: briefTick runs one interval after the newest brief, or after boot", async () => {
+  const S = "brE1573.atlassian.net";
+  await asBeat("brHostE", S, { autoStart: false });
+  const before = (hub.getBriefs()[S] || []).length;
+  hub.briefTick(Date.now());
+  assert.equal((hub.getBriefs()[S] || []).length, before, "not due yet after boot");
+  const due = Date.now() + hub.BRIEF_INTERVAL_MS + 1000;
+  hub.briefTick(due);
+  assert.equal(hub.getBriefs()[S].length, 1);
+  hub.briefTick(due + 1000);
+  assert.equal(hub.getBriefs()[S].length, 1, "the newest brief resets the cadence");
+  hub.briefTick(due + hub.BRIEF_INTERVAL_MS);
+  assert.equal(hub.getBriefs()[S].length, 2);
+  // Every other org a test left registered got one too; drop them all.
+  for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
+  delete agents.brHostE;
+});
+
+test("XERK-1573: POST /api/orgs/<site>/brief compiles on demand; a phantom org 404s", async () => {
+  const S = "brF1573.atlassian.net";
+  await asBeat("brHostF", S, { autoStart: false });
+  const noAuth = await request("POST", `/api/orgs/${S}/brief`);
+  assert.equal(noAuth.status, 401);
+  const phantom = await request("POST", "/api/orgs/nobody.atlassian.net/brief", { headers: userHeaders });
+  assert.equal(phantom.status, 404);
+  assert.equal("nobody.atlassian.net" in hub.getBriefs(), false, "a refusal mints no store key");
+  const r = await request("POST", `/api/orgs/${S}/brief`, { headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.brief.siteKey, S);
+  assert.equal(r.body.brief.trigger, "manual");
+  assert.equal(hub.getBriefs()[S][0].at, r.body.brief.at);
+  delete agents.brHostF;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: the brief store coerces to the typed wire shape and survives a restart", () => {
+  const good = { siteKey: "o.atlassian.net", at: 2000, since: 1000, trigger: "manual", autoStart: true,
+    counts: { needsYou: 1, finished: "lots" },
+    needsYou: [{ kind: "session", title: "t", sessionId: "s1", since: 1500, eta: "soon", why: 7 },
+      { kind: "session" }, "junk"],
+    spend: [{ label: "p", fiveHourPct: 140, paused: "yes" }, { fiveHourPct: 3 }] };
+  const out = hub.briefsCoerce(JSON.parse(JSON.stringify({
+    "o.atlassian.net": [good, { siteKey: "other.atlassian.net", at: 5 }, { siteKey: "o.atlassian.net", at: -1 }],
+    "x.atlassian.net": "not a list",
+  })));
+  assert.equal(Object.getPrototypeOf(out), null);
+  assert.deepEqual(Object.keys(out), ["o.atlassian.net"]);
+  const b = out["o.atlassian.net"];
+  assert.equal(b.length, 1, "a record for another org, or with no usable `at`, is dropped");
+  assert.deepEqual(b[0].needsYou, [{ kind: "session", title: "t", sessionId: "s1", since: 1500 }]);
+  assert.equal(b[0].counts.finished, 0);
+  assert.equal(b[0].counts.needsYou, 1);
+  assert.deepEqual(b[0].finished, []);
+  assert.deepEqual(b[0].spend, [{ label: "p", fiveHourPct: 100, paused: false }]);
+  assert.equal(hub.sanitizeBrief({ ...good, since: 9999 }).since, 2000, "a period never starts after it ends");
+  // Coercing a coerced store changes nothing (the HA own-write echo dedups).
+  assert.deepEqual(hub.briefsCoerce(JSON.parse(JSON.stringify(out))), out);
+  const file = path.join(os.tmpdir(), `turma-test-briefs-restore-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({ "o.atlassian.net": [good] }));
+  try {
+    const mod = freshServerModule((env) => { env.BRIEFS_FILE = file; });
+    const restored = mod.getBriefs()["o.atlassian.net"];
+    assert.equal(restored.length, 1);
+    assert.equal(restored[0].at, 2000);
+    assert.equal(restored[0].needsYou[0].title, "t");
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test("XERK-1573: a merged PR is finished in ONE brief, past the 10-row cut and BRIEFS_KEEP", async () => {
+  const S = "brG1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const PR = "https://github.com/x/y/pull/77";
+  // 12 Done tickets resolved in the first period fill `finished` past its 10
+  // stored rows, ahead of the PR row — which used to be the only memory of it.
+  const tickets = [];
+  for (let i = 0; i < 12; i++) {
+    tickets.push({ key: `G-${i}`, summary: `done ${i}`, statusCategory: "done",
+      created: iso(now - 90 * 24 * H), resolved: iso(now - H) });
+  }
+  await asBeat("brHostG", S, { autoStart: false, tickets,
+    sessions: [{ id: "g1", status: "running", prs: [{ url: PR, state: "MERGED", title: "Ship" }] }] });
+  const prRows = (b) => b.finished.filter((i) => i.kind === "pr").length;
+  const b1 = hub.briefSweep(S, "scheduled", now);
+  assert.equal(b1.counts.finished, 13, "12 tickets + the PR");
+  assert.equal(prRows(b1), 0, "the PR row is cut from the stored list");
+  assert.deepEqual(b1.prsReported, [PR], "...but the brief remembers reporting it");
+  const b2 = hub.briefSweep(S, "scheduled", now + 3 * H);
+  assert.equal(prRows(b2), 0);
+  assert.equal(b2.counts.finished, 0, "not finished again");
+  // The session keeps running past BRIEFS_KEEP more briefs (an operator pressing
+  // Brief now): the memory carries forward on the newest brief, so still never.
+  for (let i = 0; i < 12; i++) {
+    const b = hub.briefSweep(S, "manual", now + 4 * H + i * 1000);
+    assert.equal(b.counts.finished, 0, `brief ${i} re-reported the PR`);
+  }
+  const kept = hub.getBriefs()[S];
+  assert.equal(kept.length, 10);
+  assert.deepEqual(kept[0].prsReported, [PR]);
+  assert.ok(kept.slice(1).every((b) => !("prsReported" in b)), "only the newest brief carries it");
+  // Never on the wire: the payload strips the hub-internal keys and serves the
+  // earlier briefs as headlines only.
+  invalidateAgentsCache();
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  const served = r.body.briefs[S];
+  assert.equal(served.length, 10);
+  assert.ok(served.every((b) => !("prsReported" in b) && !("needsYouSig" in b)));
+  assert.deepEqual(served[1].finished, []);
+  assert.deepEqual(served[1].spend, []);
+  assert.equal(typeof served[1].counts.finished, "number");
+  delete agents.brHostG;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: a full PR memory keeps the still-visible PR; an over-long URL is skipped", async () => {
+  const S = "brJ1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const V = "https://github.com/x/y/pull/9";
+  const LONG = "https://github.com/x/y/pull/" + "1".repeat(600);
+  await asBeat("brHostJ", S, { autoStart: false, sessions: [{ id: "j1", status: "running",
+    prs: [{ url: V, state: "MERGED", title: "Visible" }, { url: LONG, state: "MERGED", title: "Long" }] }] });
+  const b1 = hub.briefSweep(S, "scheduled", now);
+  assert.equal(b1.counts.finished, 1, "the visible PR once; the over-long URL is never finished");
+  assert.deepEqual(b1.prsReported, [V]);
+  // The memory is at its 500 cap with the visible PR LAST, and no stored
+  // `finished` row remembers it: the cut must drop the no-longer-visible ones.
+  const old = [];
+  for (let i = 0; i < 500; i++) old.push(`https://github.com/x/old/pull/${i}`);
+  const kept = hub.getBriefs()[S];
+  kept[0].prsReported = [...old, V];
+  kept[0].finished = [];
+  const b2 = hub.briefSweep(S, "scheduled", now + 3 * H);
+  assert.equal(b2.counts.finished, 0);
+  assert.equal(b2.prsReported.length, 500);
+  assert.ok(b2.prsReported.includes(V), "the still-visible PR survives the cut");
+  const b3 = hub.briefSweep(S, "scheduled", now + 6 * H);
+  assert.equal(b3.counts.finished, 0, "the visible PR is not finished again");
+  delete agents.brHostJ;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: a newcomer past the 10-row needs-you cut still pushes", async () => {
+  const S = "brH1573.atlassian.net";
+  const now = Date.now();
+  const sessions = [];
+  for (let i = 0; i < 16; i++) sessions.push({ id: `h${i}`, status: "running" });
+  await asBeat("brHostH", S, { autoStart: false, sessions });
+  for (let i = 0; i < 16; i++) setAttn("brHostH", `h${i}`, { state: "working", since: now });
+  for (let i = 0; i < 15; i++) {
+    setAttn("brHostH", `h${i}`, { state: "needs-you:review", since: now - (100 - i) * 1000, why: "x" });
+  }
+  const pushes = () => notifications.filter((n) => n.title != null && n.data && n.data.notifKey === `brief:${S}`);
+  notifications.length = 0;
+  hub.briefSweep(S, "scheduled", now);
+  assert.equal(pushes().length, 1);
+  // The 16th is the NEWEST, so the oldest-first 10-row list does not show it.
+  setAttn("brHostH", "h15", { state: "needs-you:question", since: now, why: "new?" });
+  const b = hub.briefSweep(S, "scheduled", now + 1000);
+  assert.equal(b.needsYou.some((i) => i.sessionId === "h15"), false, "cut from the stored list");
+  assert.equal(b.counts.needsYou, 16);
+  assert.equal(pushes().length, 2, "the set changed, so it pushes");
+  hub.briefSweep(S, "scheduled", now + 2000);
+  assert.equal(pushes().length, 2, "same full set: no push");
+  delete agents.brHostH;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: starts next skips a held/rejected ticket; an offline host needs no one", async () => {
+  resetAutoStart();
+  const S = "brI1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const todo = (key, ageH) => ({ key, summary: `todo ${key}`, statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, created: iso(now - ageH * H),
+    triage: { priority: "P2", type: "task", actionable: true } });
+  const untriaged = { ...todo("I-5", 50) };
+  delete untriaged.triage;
+  await asBeat("brHostI", S, { capacity: FULL,
+    // I-4 already has a session (a resumable one counts too); I-5 is untriaged;
+    // I-6 is below the org policy's minimum priority. The sweep starts none of
+    // them, so none may be named next — all are OLDER than I-3, so they would lead.
+    tickets: [todo("I-1", 30), todo("I-2", 20), todo("I-3", 10), todo("I-4", 40), untriaged,
+      { ...todo("I-6", 45), triage: { priority: "P3", type: "task", actionable: true } }],
+    sessions: [{ id: "i1", status: "running", summary: "asks" }],
+    closedSessions: [{ id: "i4", summary: "worked I-4", closedAt: iso(now - 90 * 24 * H),
+      ticket: { key: "I-4", siteKey: S, summary: "todo I-4" } }] });
+  setAttn("brHostI", "i1", { state: "needs-you:question", since: now - 60000, why: "Q?" });
+  setTicketTriageAction(S, "I-1", "hold");
+  setTicketTriageAction(S, "I-2", "reject");
+  setTriagePolicy(S, { minPriority: "P2" });
+  try {
+    const b = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(b.nextUp.map((i) => i.key), ["I-3"],
+      "a held, rejected, already-started, untriaged or policy-blocked ticket is not next");
+    assert.ok(!/retrying/.test(b.nextUp[0].reason), b.nextUp[0].reason);
+    // The sweep is holding I-3 in its retry backoff: still next, but the reason says so.
+    autoStarted.set(S + "\x00I-3", { attempts: 1, nextAt: now + 5 * 60 * 1000 });
+    const held = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(held.nextUp.map((i) => i.key), ["I-3"]);
+    assert.match(held.nextUp[0].reason, / · retrying in 5m$/);
+    assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["i1"]);
+    // The host goes silent: its last beat's attention is frozen, not current.
+    agents.brHostI.lastSeen = now - 10 * 60 * 1000;
+    const off = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(off.needsYou, [], "an offline host's session is not in needs-you");
+    assert.equal(off.counts.needsYou, 0);
+  } finally {
+    setTicketTriageAction(S, "I-1", null);
+    setTicketTriageAction(S, "I-2", null);
+    delete triagePolicies[S];
+    delete agents.brHostI;
+    resetAutoStart();
+  }
+});
+
+test("XERK-1573: briefTick drops an org with no host once its briefs are old", async () => {
+  const S = "brJ1573.atlassian.net";
+  const now = Date.now();
+  await asBeat("brHostJ", S, { autoStart: false });
+  hub.briefSweep(S, "scheduled", now);
+  delete agents.brHostJ;
+  hub.briefTick(now + 24 * 3600 * 1000);
+  assert.equal(hub.getBriefs()[S].length, 1, "kept a while: a quiet host may come back");
+  hub.briefTick(now + 31 * 24 * 3600 * 1000);
+  assert.equal(S in hub.getBriefs(), false, "dropped past the retention");
+  for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
+});
+
 // ---- the permission judge's policy text (XERK-1566) ---------------------------
 
 test("XERK-1566: the org's permission policy rides every heartbeat reply", async () => {
@@ -22601,8 +23449,11 @@ test("XERK-1563: permissionEvents fold into the ledger and never ride the record
   const view = await request("GET", "/api/permissions", { headers: userHeaders });
   assert.equal(view.status, 200);
   const g = view.body.top.find((x) => x.head === "npm test");
+  // `npm test` is off the safe-head list (its arguments can run code): no rule,
+  // and the reason rides the group.
   assert.deepEqual([g.count, g.allowed, g.denied, g.medianWaitMs, g.suggestedRule],
-    [2, 1, 1, 5000, "Bash(npm test:*)"]);
+    [2, 1, 1, 5000, null]);
+  assert.match(g.noRuleReason, /not on the known read-only list/);
   assert.equal(view.body.recent.length, 2);
   assert.equal(view.body.recent[0].host, host);
   delete agents[host];
@@ -22661,4 +23512,396 @@ test("XERK-1563: /metrics carries the ledger's per-kind aggregates and nothing e
   // The route is unauthenticated: no host, command or session leaks into it.
   assert.doesNotMatch(m.raw, /perm-metrics-host|secret-cmd|npm test/);
   delete agents["perm-metrics-host"];
+});
+
+// ---- XERK-1572: wait classifier hints, the loop signal, attention nudges ---------
+
+test("XERK-1572: the loop signal is coerced by name and never repaired", async () => {
+  const host = "loop-coerce";
+  const loops = [
+    { repeats: 5, tool: "Bash", since: 1700000000000, extra: "dropped" },
+    { repeats: "5", tool: "Bash", since: 1700000000000 },
+    { repeats: 5, tool: 7, since: 1700000000000 },
+    { repeats: 5, tool: "", since: 1700000000000 },
+    { repeats: 5, tool: "Bash", since: -1 },
+    { repeats: 0, tool: "Bash", since: 1700000000000 },
+    null,
+    "looping",
+    { repeats: 5, tool: "x".repeat(200), since: 1700000000000 },
+  ];
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: loops.map((loop, i) => ({ id: `s${i}`, status: "running",
+      session: { paneBusy: true, transcriptAgeSec: 1, loop } })) },
+  });
+  assert.equal(r.status, 200);
+  const got = agents[host].sessions.map((s) => s.session.loop);
+  assert.deepEqual(got[0], { repeats: 5, tool: "Bash", since: 1700000000000 });
+  for (const i of [1, 2, 3, 4, 5, 6, 7]) assert.equal(got[i], undefined, `case ${i}`);
+  assert.equal(got[8].tool.length, 64);
+});
+
+test("XERK-1572: a loop reads needs-you:stalled ahead of working, behind a question", () => {
+  const now = Date.now();
+  const s = (live) => ({ id: "s1", status: "running", session: {
+    paneBusy: true, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true, ...live } });
+  const att = (sess) => sessionAttention(sess, sessionWorking(sess, now, now), sessionWait(sess, now, now), now);
+  const loop = { repeats: 5, tool: "Bash", since: now - 60000 };
+  assert.deepEqual(att(s({ loop })), { state: "needs-you:stalled", cause: "loop", why: "repeating Bash ×5" });
+  assert.equal(att(s({ loop, question: "Q?" })).state, "needs-you:question");
+  assert.equal(att(s({})).state, "working");
+  // The cause is internal: never served.
+  assert.deepEqual(hub.wireAttention({ state: "needs-you:stalled", cause: "loop", why: "repeating Bash ×5", since: now }),
+    { state: "needs-you:stalled", since: now, why: "repeating Bash ×5" });
+});
+
+test("XERK-1572: the loop's stalled alert says it repeats, once per edge", () => {
+  const beat = makeHost();
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: true, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true, ...live } }] });
+  notifications.length = 0;
+  beat(sess({}), t0);
+  beat(sess({ loop: { repeats: 4, tool: "Bash", since: t0 } }), t0 + 20000);
+  beat(sess({ loop: { repeats: 5, tool: "Bash", since: t0 } }), t0 + 40000);
+  assert.deepEqual(titles(), ["nas-repo-s1 has stalled"]);
+  assert.match(notifications[0].body, /^repeating Bash ×4 with the same failure/);
+});
+
+test("XERK-1572: normalizeAttentionHint whitelists label, edge and capped texts", () => {
+  const n = hub.normalizeAttentionHint;
+  const ok = { key: "s1:1000", sessionId: "s1", edge: "review", edgeTs: 1000,
+    label: "rubber-stamp", why: "Asks to push.", suggestedAnswer: "Yes, push it." };
+  assert.deepEqual(n(ok), { sessionId: "s1", edge: "review", edgeTs: 1000, label: "rubber-stamp",
+    why: "Asks to push.", suggestedAnswer: "Yes, push it." });
+  for (const bad of [null, "x", [], { ...ok, label: "maybe" }, { ...ok, label: "Rubber-Stamp" },
+    { ...ok, edgeTs: undefined }, { ...ok, edgeTs: "1000" }, { ...ok, edgeTs: 0 }, { ...ok, edgeTs: 1.5 },
+    { ...ok, edge: "idle" }, { ...ok, edge: "__proto__" }, { ...ok, why: "  " }, { ...ok, why: 7 },
+    { ...ok, sessionId: 5 }, { ...ok, sessionId: "" }, { ...ok, sessionId: "x".repeat(129) }]) {
+    assert.equal(n(bad), null, JSON.stringify(bad));
+  }
+  const long = n({ ...ok, why: "w ".repeat(400), suggestedAnswer: 9 });
+  assert.equal(long.why.length, 300);
+  assert.equal("suggestedAnswer" in long, false);
+  assert.deepEqual(hub.normalizeAttentionHints("nope"), []);
+  assert.equal(hub.normalizeAttentionHints(Array.from({ length: 80 }, () => ok)).length, 50);
+});
+
+test("XERK-1572: a hint folds into attention while the state it answers holds", () => {
+  const beat = (() => {
+    const alerts = {};
+    let prev = {};
+    return (payload, at, hints) => {
+      const next = { ...payload, lastSeen: at, alerts };
+      heartbeatAlerts("host1", prev, next, hints);
+      prev = next;
+      return next;
+    };
+  })();
+  const t0 = Date.now();
+  // The agent's live edge (`attentionEdgeTs`) is 1 for the first wait, then 2.
+  const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false,
+      attentionEdgeTs: 1, ...live } }] });
+  const hint = (extra) => [hub.normalizeAttentionHint({ sessionId: "s1", edge: "review", edgeTs: 1,
+    label: "design-decision", why: "Pick schema v2 or v3.", suggestedAnswer: "Go with v3.", ...extra })];
+  beat(sess({ paneBusy: true, attentionEdgeTs: undefined }), t0);
+  let rec = beat(sess({}), t0 + 20000);                         // review edge
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
+  rec = beat(sess({}), t0 + 40000, hint());                     // the verdict lands
+  assert.deepEqual(rec.alerts.sessions.s1.attn.hint,
+    { label: "design-decision", why: "Pick schema v2 or v3.", suggestedAnswer: "Go with v3." });
+  assert.equal(rec.alerts.sessions.s1.attn.since, t0 + 20000);
+  rec = beat(sess({}), t0 + 60000);                             // held across beats
+  assert.equal(rec.alerts.sessions.s1.attn.hint.label, "design-decision");
+  const served = hub.serializeAgent("host1", { device: "host1", lastSeen: t0 + 60000,
+    sessions: rec.sessions, alerts: rec.alerts }, t0 + 60000);
+  assert.deepEqual(served.sessions[0].attention.hint,
+    { label: "design-decision", why: "Pick schema v2 or v3.", suggestedAnswer: "Go with v3." });
+  // needs-human-test turns the review into needs-you:test without restarting its age.
+  rec = beat(sess({}), t0 + 80000, hint({ label: "needs-human-test", why: "Wants the login clicked through." }));
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:test");
+  assert.equal(rec.alerts.sessions.s1.attn.since, t0 + 20000);
+  // The session works again: the hint is gone with the state it answered.
+  rec = beat(sess({ paneBusy: true, attentionEdgeTs: undefined }), t0 + 100000);
+  assert.equal(rec.alerts.sessions.s1.hint, undefined);
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
+  rec = beat(sess({ attentionEdgeTs: 2 }), t0 + 120000);
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined, "a new wait carries no old verdict");
+  // A verdict for another state is never folded (a question hint on a review).
+  rec = beat(sess({ attentionEdgeTs: 2 }), t0 + 140000, hint({ edge: "question", edgeTs: 2 }));
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
+  // A loop verdict folds only on a LOOP stall, a wait verdict only on a wait stall.
+  const loopy = sess({ paneBusy: true, attentionEdgeTs: 3, loop: { repeats: 4, tool: "Bash", since: t0 } });
+  rec = beat(loopy, t0 + 160000, hint({ edge: "stalled", edgeTs: 3, label: "waiting-external" }));
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
+  rec = beat(loopy, t0 + 180000, hint({ edge: "loop", edgeTs: 3, label: "looping", why: "Retries npm ci." }));
+  assert.equal(rec.alerts.sessions.s1.attn.hint.why, "Retries npm ci.");
+});
+
+test("XERK-1572: a flicker drops the hint for a beat; the agent's re-sent verdict restores it", () => {
+  // The agent never re-ASKS an edge its record already answered, but it ships the
+  // CACHED verdict again when the session comes back to that edge — the hub has
+  // dropped its copy the beat the state left, and must fold the re-sent row.
+  const alerts = {};
+  let prev = {};
+  const beat = (payload, at, hints) => {
+    const next = { ...payload, lastSeen: at, alerts };
+    heartbeatAlerts("host-flicker", prev, next, hints);
+    prev = next;
+    return next;
+  };
+  const t0 = Date.now();
+  const sess = (live) => ({ sessions: [{ id: "s1", status: "running",
+    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false,
+      attentionEdgeTs: 7, ...live } }] });
+  const row = [hub.normalizeAttentionHint({ sessionId: "s1", edge: "review", edgeTs: 7,
+    label: "rubber-stamp", why: "Asks to deploy.", suggestedAnswer: "Yes, deploy it." })];
+  beat(sess({ paneBusy: true, attentionEdgeTs: undefined }), t0);
+  beat(sess({}), t0 + 20000);
+  let rec = beat(sess({}), t0 + 40000, row);
+  assert.equal(rec.alerts.sessions.s1.attn.hint.why, "Asks to deploy.");
+  rec = beat(sess({ paneBusy: true, attentionEdgeTs: undefined }), t0 + 60000);   // a one-beat busy flicker
+  assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
+  rec = beat(sess({}), t0 + 80000, row);                      // the agent re-sends it
+  assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
+  assert.deepEqual(rec.alerts.sessions.s1.attn.hint,
+    { label: "rubber-stamp", why: "Asks to deploy.", suggestedAnswer: "Yes, deploy it." });
+});
+
+test("XERK-1572: a second wait of the same kind never wears the first one's verdict", () => {
+  // Back-to-back permission dialogs and back-to-back questions: no working beat
+  // between them, so the attention STATE never changes. The agent's live
+  // `attentionEdgeTs` names the new edge, and the old verdict is dropped at once.
+  const alerts = {};
+  let prev = {};
+  const beat = (live, at, hints) => {
+    const next = { sessions: [{ id: "s1", status: "running", session: { paneBusy: true,
+      transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true, ...live } }], lastSeen: at, alerts };
+    heartbeatAlerts("host-b2b", prev, next, hints);
+    prev = next;
+    return next.alerts.sessions.s1.attn;
+  };
+  const row = (edge, edgeTs, why, extra) => [hub.normalizeAttentionHint({ sessionId: "s1", edge, edgeTs,
+    label: "rubber-stamp", why, suggestedAnswer: "Yes", ...extra })];
+  const t0 = Date.now();
+  const dialog = (detail, ts) => ({ panePrompt: { prompt: "Bash command", detail }, attentionEdgeTs: ts });
+  beat(dialog("git status", 100), t0);
+  let attn = beat(dialog("git status", 100), t0 + 20000, row("permission", 100, "Wants to run git status."));
+  assert.equal(attn.state, "needs-you:permission");
+  assert.equal(attn.hint.why, "Wants to run git status.");
+  // Dialog B, straight after A: no hint row for it yet.
+  attn = beat(dialog("git push --force origin main", 200), t0 + 40000);
+  assert.equal(attn.state, "needs-you:permission");
+  assert.equal(attn.hint, undefined, "dialog B carries no verdict for dialog A");
+  assert.equal(alerts.sessions.s1.hint, undefined);
+  attn = beat(dialog("git push --force origin main", 200), t0 + 60000);
+  assert.equal(attn.hint, undefined, "and does not on the beat after");
+  // A LATE row for dialog A (the outbox delivered it after B opened) is never taken.
+  attn = beat(dialog("git push --force origin main", 200), t0 + 80000, row("permission", 100, "Wants to run git status."));
+  assert.equal(attn.hint, undefined);
+  // B's own verdict folds.
+  attn = beat(dialog("git push --force origin main", 200), t0 + 100000,
+    row("permission", 200, "Wants to force-push main.", { label: "design-decision", suggestedAnswer: "" }));
+  assert.deepEqual(attn.hint, { label: "design-decision", why: "Wants to force-push main." });
+  // Two questions in a row, the same way.
+  const ask = (q, ts) => ({ question: q, attentionEdgeTs: ts });
+  attn = beat(ask("Use v2?", 300), t0 + 120000, row("question", 300, "Asks whether to use v2."));
+  assert.equal(attn.state, "needs-you:question");
+  assert.equal(attn.hint.why, "Asks whether to use v2.");
+  attn = beat(ask("Delete the old table?", 400), t0 + 140000);
+  assert.equal(attn.state, "needs-you:question");
+  assert.equal(attn.hint, undefined, "question B carries no verdict for question A");
+  // An agent that stops reporting the edge (can't tell) folds nothing either.
+  attn = beat(ask("Delete the old table?", undefined), t0 + 160000, row("question", 400, "Asks to drop it."));
+  assert.equal(attn.hint, undefined);
+});
+
+test("XERK-1572: attentionEdgeTs is coerced by name and never repaired", async () => {
+  const host = "edge-coerce";
+  const vals = [1700000000000, "1700000000000", 0, -5, 1.5, { t: 1 }, null];
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: vals.map((attentionEdgeTs, i) => ({ id: `s${i}`, status: "running",
+      session: { paneBusy: true, transcriptAgeSec: 1, attentionEdgeTs } })) },
+  });
+  assert.equal(r.status, 200);
+  const got = agents[host].sessions.map((s) => s.session.attentionEdgeTs);
+  assert.equal(got[0], 1700000000000);
+  for (const i of [1, 2, 3, 4, 5, 6]) assert.equal(got[i], undefined, `case ${i}`);
+});
+
+test("XERK-1572: a forged or corrupt stored hint never reaches the wire", () => {
+  const now = Date.now();
+  const w = (hint) => hub.wireAttention({ state: "needs-you:review", since: now, hint });
+  assert.equal("hint" in w({ label: "napping", why: "x" }), false);
+  assert.equal("hint" in w({ label: "looping", why: 5 }), false);
+  assert.deepEqual(w({ label: "looping", why: "a\nb", suggestedAnswer: ["no"], extra: 1 }).hint,
+    { label: "looping", why: "a b" });
+});
+
+test("XERK-1572: attentionHints ride the heartbeat into the served attention", async () => {
+  const host = "hint-wire";
+  const live = { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false,
+    attentionEdgeTs: 1 };
+  const post = (body) => request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: host, ...body } });
+  await post({ sessions: [{ id: "s1", status: "running", session: { ...live, paneBusy: true } }] });
+  await post({ sessions: [{ id: "s1", status: "running", session: live }] });
+  const r = await post({ sessions: [{ id: "s1", status: "running", session: live }],
+    attentionHints: [{ key: "s1:1", sessionId: "s1", edge: "review", edgeTs: 1, label: "needs-human-test",
+      why: "Asks for a manual check of the login page.",
+      // A hand test never ships a suggested reply: it could only claim a test nobody ran.
+      suggestedAnswer: "I checked it, merge." }, { junk: true }] });
+  assert.equal(r.status, 200);
+  assert.equal("attentionHints" in agents[host], false, "never stored raw on the record");
+  const served = hub.serializeAgent(host, agents[host], Date.now());
+  assert.equal(served.sessions[0].attention.state, "needs-you:test");
+  assert.deepEqual(served.sessions[0].attention.hint,
+    { label: "needs-human-test", why: "Asks for a manual check of the login page." });
+});
+
+function nudgeHost(host, sessions, now = Date.now()) {
+  agents[host] = { device: host, lastSeen: now, commands: [], sessions: sessions.map((s) => s.session),
+    alerts: { sessions: Object.fromEntries(sessions.map((s) => [s.session.id, { attn: s.attn }])) } };
+  return agents[host];
+}
+const nudges = (host) => (agents[host].commands || []).filter((c) => c.type === "input");
+
+test("XERK-1572: a stalled shell is nudged once per edge, in the operator's voice, with backoff", () => {
+  hub.attentionNudged.clear();
+  const host = "nudge-stall";
+  const t0 = Date.now();
+  const stalled = { id: "s1", status: "running", session: { paneBusy: false, transcriptAgeSec: 41 * 60,
+    agents: [{ type: "shell", label: "Watch `CI`\nrun", kind: "wait-external" }] } };
+  const a = nudgeHost(host, [{ session: stalled, attn: { state: "needs-you:stalled", since: t0, why: "Watch CI" } }], t0);
+  // The host keeps beating (an offline one is never nudged).
+  const sweep = (t) => { a.lastSeen = t; hub.attentionNudgeSweep(t); };
+  sweep(t0);
+  const [n1] = nudges(host);
+  assert.equal(n1.sessionId, "s1");
+  // Marked as the hub's own words, so the agent's permission ledger never
+  // reads it as the operator answering an ask-in-chat row.
+  assert.equal(n1.source, "nudge");
+  assert.equal(n1.text, "Your background shell `Watch CI run` has produced nothing for 41 minutes. Check "
+    + "whether it is still doing anything; if it is waiting on something with a known duration, stop it "
+    + "and use the session CLI's `wake`; if it is dead, say what you know and end the turn.");
+  sweep(t0 + 15000);                       // the next tick: backoff holds
+  assert.equal(nudges(host).length, 1);
+  sweep(t0 + hub.ATTENTION_NUDGE_BACKOFF_MS);   // still stalled: the second
+  assert.equal(nudges(host).length, 2);
+  sweep(t0 + 3 * hub.ATTENTION_NUDGE_BACKOFF_MS); // second unanswered: operator decides
+  assert.equal(nudges(host).length, hub.ATTENTION_NUDGE_MAX);
+  // It recovered and stalled AGAIN later: a new edge, nudged again.
+  a.alerts.sessions.s1.attn = { state: "needs-you:stalled", since: t0 + 4 * hub.ATTENTION_NUDGE_BACKOFF_MS };
+  sweep(t0 + 5 * hub.ATTENTION_NUDGE_BACKOFF_MS);
+  assert.equal(nudges(host).length, 3);
+  hub.attentionNudged.clear();
+  delete agents[host];
+});
+
+test("XERK-1572: a looping session is nudged under its own reason; nothing else is", () => {
+  hub.attentionNudged.clear();
+  const host = "nudge-loop";
+  const t0 = Date.now();
+  const sess = (id, live) => ({ id, status: "running", session: { paneBusy: true, transcriptAgeSec: 1, ...live } });
+  nudgeHost(host, [
+    { session: sess("loop", { loop: { repeats: 6, tool: "Bash;rm", since: t0 } }),
+      attn: { state: "needs-you:stalled", cause: "loop", since: t0, why: "repeating Bash ×6" } },
+    { session: sess("work", {}), attn: { state: "working", since: t0 } },
+    { session: sess("asks", { question: "Q?" }), attn: { state: "needs-you:question", since: t0 } },
+    { session: { ...sess("gone", {}), status: "stopped" }, attn: { state: "needs-you:stalled", since: t0 } },
+  ], t0);
+  hub.attentionNudgeSweep(t0);
+  const sent = nudges(host);
+  assert.deepEqual(sent.map((c) => c.sessionId), ["loop"]);
+  assert.equal(sent[0].text, "You have run `Bashrm` 6 times with the same failure. Stop, write down what "
+    + "you know on the ticket, and either take a different approach or end the turn with a `Host blocker:` line.");
+  assert.ok(hub.attentionNudged.has(host + "\x00loop\x00loop"));
+  // An OFFLINE host is never nudged (the command would only queue behind silence).
+  const off = "nudge-offline";
+  nudgeHost(off, [{ session: sess("x", { loop: { repeats: 6, tool: "Bash", since: t0 } }),
+    attn: { state: "needs-you:stalled", cause: "loop", since: t0 } }], t0 - 10 * 60 * 1000);
+  hub.attentionNudgeSweep(t0);
+  assert.equal(nudges(off).length, 0);
+  hub.attentionNudged.clear();
+  delete agents[host];
+  delete agents[off];
+});
+
+test("XERK-1572: a loop resumed after a nudge is the same stall, so the two-nudge cap holds", () => {
+  // The nudge (or the operator's prompt) re-arms the agent's count, so the session
+  // reads working for a while and then stalled again on a NEW attention edge; the
+  // run's own `since` is unchanged, and the cap is keyed on it.
+  hub.attentionNudged.clear();
+  const host = "nudge-loop-cap";
+  const t0 = Date.now();
+  const loop = { repeats: 4, tool: "Bash", since: t0 - 60000 };
+  const a = nudgeHost(host, [{ session: { id: "s1", status: "running", session: { paneBusy: true, loop } },
+    attn: { state: "needs-you:stalled", cause: "loop", since: t0 } }], t0);
+  const sweep = (t) => { a.lastSeen = t; hub.attentionNudgeSweep(t); };
+  sweep(t0);
+  assert.equal(nudges(host).length, 1);
+  const B = hub.ATTENTION_NUDGE_BACKOFF_MS;
+  a.alerts.sessions.s1.attn = { state: "needs-you:stalled", cause: "loop", since: t0 + B / 2 };
+  sweep(t0 + B);
+  assert.equal(nudges(host).length, 2);
+  a.alerts.sessions.s1.attn = { state: "needs-you:stalled", cause: "loop", since: t0 + 2 * B };
+  sweep(t0 + 3 * B);
+  assert.equal(nudges(host).length, hub.ATTENTION_NUDGE_MAX, "the same run is never nudged a third time");
+  // A DIFFERENT run (a new `since`) is a new stall.
+  a.sessions[0].session.loop = { repeats: 4, tool: "Bash", since: t0 + 3 * B };
+  sweep(t0 + 4 * B);
+  assert.equal(nudges(host).length, 3);
+  hub.attentionNudged.clear();
+  delete agents[host];
+});
+
+test("XERK-1572: a non-HA restart forgets no nudge: the record rides the persisted alerts edge", () => {
+  // `attentionNudged` is memory; a restart empties it while state.json restores the
+  // session's alerts edge (attn AND nudged), so the backoff and the cap still hold.
+  hub.attentionNudged.clear();
+  const host = "nudge-restart";
+  const t0 = Date.now();
+  const B = hub.ATTENTION_NUDGE_BACKOFF_MS;
+  const a = nudgeHost(host, [{ session: { id: "s1", status: "running", session: { transcriptAgeSec: 3000,
+    agents: [{ type: "shell", label: "sleep", kind: "wait-timed" }] } },
+    attn: { state: "needs-you:stalled", since: t0 } }], t0);
+  const sweep = (t) => { a.lastSeen = t; hub.attentionNudgeSweep(t); };
+  sweep(t0);
+  assert.deepEqual(a.alerts.sessions.s1.nudged, { stalled: { at: t0, count: 1, since: t0 } });
+  hub.attentionNudged.clear();                          // the restart
+  sweep(t0 + 1000);
+  assert.equal(nudges(host).length, 1, "backoff still holds after the restart");
+  sweep(t0 + B);
+  assert.equal(nudges(host).length, 2);
+  hub.attentionNudged.clear();                          // another restart
+  sweep(t0 + 3 * B);
+  assert.equal(nudges(host).length, hub.ATTENTION_NUDGE_MAX, "the cap still holds after the restart");
+  hub.attentionNudged.clear();
+  delete agents[host];
+});
+
+test("XERK-1572: attentionNudged writes through and hydrates back, so a failover re-sends nothing", async () => {
+  await withGuardStore(async (store) => {
+    hub.attentionNudged.clear();
+    const host = "nudge-ha";
+    const t0 = Date.now();
+    nudgeHost(host, [{ session: { id: "s1", status: "running", session: { transcriptAgeSec: 3000,
+      agents: [{ type: "shell", label: "sleep", kind: "wait-timed" }] } },
+      attn: { state: "needs-you:stalled", since: t0 } }], t0);
+    hub.attentionNudgeSweep(t0);
+    assert.equal(nudges(host).length, 1);
+    await new Promise((r) => setImmediate(r));
+    const nk = host + "\x00s1\x00stalled";
+    assert.deepEqual(await store.get(hub.GUARD_STORE_PREFIX + "attentionNudged:" + nk),
+      { at: t0, count: 1, since: t0 });
+    hub.attentionNudged.clear();              // a newly promoted leader starts empty…
+    await hub.hydrateGuards();                // …and inherits the old leader's memory
+    assert.deepEqual(hub.attentionNudged.get(nk), { at: t0, count: 1, since: t0 });
+    hub.attentionNudgeSweep(t0 + 1000);
+    assert.equal(nudges(host).length, 1, "no re-send after the handover");
+    hub.attentionNudged.clear();
+    delete agents[host];
+  });
 });

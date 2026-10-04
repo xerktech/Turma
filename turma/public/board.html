@@ -847,6 +847,16 @@ function paintDetail() {
   }
   const epicOp = epicOps.get(startKey(s.siteKey, s.key)) || null;
   s.epicRunShown = B.epicRunSig(epicRun);
+  // The ticket's sessions, for the "Closed by" row (XERK-1569): a session that
+  // closed this ticket itself, why, and when.
+  const ticketSessions = B.ticketSessionsOf(
+    B.ticketSessionIndex((cache && cache.agents) || []), s.siteKey, s.key);
+  // An evidence note the operator expanded stays expanded across a repaint of
+  // the SAME close (another field's beat); a different close starts clamped.
+  const prevOutcome = s.outcomeShown;
+  s.outcomeShown = outcomeSig(ticketSessions);
+  const noteExpanded = !!prevOutcome && prevOutcome === s.outcomeShown &&
+    !!$panel.querySelector(".td-outcome-note[open]");
   $panel.innerHTML = B.detailHtml(s.ticket, s.detail, {
     color: B.orgColor(s.siteKey, lastAllKeys, TurmaOrg.orgColors()),
     siteKey: s.siteKey,
@@ -903,7 +913,12 @@ function paintDetail() {
     epicRun,
     epicRunPending: !!(epicOp && epicOp.pending),
     epicRunError: epicOp && epicOp.error,
+    sessions: ticketSessions,
   });
+  if (noteExpanded) {
+    const note = $panel.querySelector(".td-outcome-note");
+    if (note) note.open = true;
+  }
   if (s.editing) {
     const sel = $panel.querySelector("[data-repo-select]");
     if (sel) sel.focus();
@@ -932,6 +947,13 @@ function paintDetail() {
     const sel = $panel.querySelector("[data-status-select]");
     if (sel) sel.focus();
   }
+}
+
+// What the "Closed by" row draws (XERK-1569), so refreshOpenTicket repaints the
+// open panel the beat a session's close-ticket lands.
+function outcomeSig(sessions) {
+  const o = B.ticketOutcomeOf(sessions);
+  return o ? `${o.kind}|${o.at}|${B.sessionChipName(o.session)}|${o.note}` : "";
 }
 
 // How long a saved repo keeps its optimistic paint before the heartbeat's word is
@@ -1003,7 +1025,9 @@ function refreshOpenTicket() {
     (ppin ? ppin.platform : "") !== (s.platformPinShown || "") ||
     (pInherit ? pInherit.platform : "") !== (s.platformInheritedShown || "") ||
     tpin !== (s.triageActionShown || "") ||
-    epicSig !== (s.epicRunShown || "");
+    epicSig !== (s.epicRunShown || "") ||
+    outcomeSig(B.ticketSessionsOf(B.ticketSessionIndex((cache && cache.agents) || []),
+      s.siteKey, s.key)) !== (s.outcomeShown || "");
   s.ticket = fresh;
   // No picker may be swapped out from under an operator mid-edit.
   if (changed && !s.editing && !s.agentEditing && !s.modelEditing &&

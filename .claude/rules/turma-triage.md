@@ -62,6 +62,27 @@ machinery is in `.claude/rules/turma-board.md`.
   green, hold amber, reject red. The detail panel's **Triage row** (`triageFieldHtml` +
   `triagePickerHtml`, `data-triage-select`) follows the row-picker pattern: "Change" swaps the
   row for the picker, choosing an option IS the save, "Auto" is the release.
+- **A session that closed its OWN ticket says why INSIDE its chip** (XERK-1569): `board.js`
+  `ticketOutcomeLabel` reads `session.ticket.outcome.kind` (hub-coerced `coerceTicketOutcome`) and
+  `sessionChipHtml` swaps the chip's name for "not reproducible" / "already fixed" / "closed"
+  (done) — no "closed ·" prefix, so it fits the 22ch name cap on ONE line and the org tag never
+  wraps (operator, 2026-10-03) — class `.kc-sess-closed`: neutral dot, normal ink, whatever the
+  run state (a still-running session must not show a green dot beside "closed"); name + state
+  move to the tooltip. Never a separate caption beside the chip — it wrapped under the row in
+  muted italic.
+- **On such a card the closer's chip, the start control and the org tag wrap as ONE `.kc-tail`**
+  (`cardHtml`), so the org tag never sits alone on a row; other cards keep the flat meta row.
+- **The detail panel's "Closed by" row** (`ticketOutcomeOf` + `ticketOutcomeFieldHtml`): "<session
+  name> — not reproducible · 3h ago" (`sessionChipName`) off the newest session that closed it,
+  then its evidence `note` clamped to 3 lines (`.td-outcome-note`, full text as `title`; a tap
+  expands on Android); no note served = no note line. `board.html` passes the ticket's sessions
+  and repaints on `outcomeSig`. Mirrors: vendored `board.cjs` (+ its `board.css`) and Android
+  `ticketOutcomeLabel`/`ticketOutcomeOf`/`ticketOutcomeText`/`ticketSessionName` +
+  `TicketSession.outcome`/`outcomeAt`/`outcomeNote` in `Board.kt`, rendered in `BoardScreen.kt`
+  (chip + sheet); `TicketRef.outcome` is typed there. Tests: `XERK-1569` in `board.test.js`,
+  `BoardTest.kt`, `AgentDecodeTest`.
+- **The outcome is not column-gated**: only a Start/resume clears it (agent `_reopened_ticket`), so
+  a ticket reopened on the board with no new session keeps the closed chip and "Closed by" row.
 - **The org triage-policy modal's DOM ids are `triageRules*`, NEVER `policy*`** (XERK-587). EasyList
   ships an exact-id cosmetic rule `###policyPanel` (an unrelated site's cookie/policy popup), so a
   bare `#policyPanel` is hidden by a user-origin `display:none !important` under Brave Shields /

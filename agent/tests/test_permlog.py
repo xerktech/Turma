@@ -100,6 +100,10 @@ class PermlogTest(unittest.TestCase):
             ("Bash", {"command": "FOO=1 BAR=2 pytest -q tests/"}, "pytest"),
             ("Bash", {"command": "ls -la && rm x"}, "ls"),
             ("Bash", {"command": "git -C x status"}, "git"),   # a flag is not a subcommand
+            ("Bash", {"command": "cd /repo && npm test"}, "npm test"),   # a cd is not the command
+            ("Bash", {"command": "cd a; cd 'b c' && FOO=1 git status"}, "git status"),
+            ("Bash", {"command": "cd /repo"}, "cd"),          # nothing follows: cd it is
+            ("Bash", {"command": "cd /repo && "}, "cd"),
             ("Edit", {"file_path": "/repo/a.py", "old_string": "x"}, "/repo/a.py"),
             ("NotebookEdit", {"notebook_path": "/repo/n.ipynb"}, "/repo/n.ipynb"),
             ("mcp__github__create_issue", {"title": "t"}, "mcp__github__create_issue"),
