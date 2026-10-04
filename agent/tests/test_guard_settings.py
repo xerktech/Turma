@@ -274,6 +274,9 @@ class TestGuardSettings(unittest.TestCase):
         # The peer roster is the org boundary (XERK-348), so a session must not
         # be able to append rows to its own address book.
         "Edit(~/.turma/peers.tsv)",
+        # XERK-1574: the org's decisions log, rendered by the manager and read by
+        # every session as reference material — a session must not rewrite it.
+        "Edit(~/.turma/decisions-*.md)",
         # XERK-1563: the permission ledger's hook rows. A session editing its own
         # could hide the prompts it hit or forge ones it never did.
         "Edit(~/.turma/permissions/**)",
@@ -482,6 +485,14 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # Read only. It is the org boundary, so a session must not append rows
         # to its own address book.
         self.assertIn("Edit(~/.turma/peers.tsv)", s["permissions"]["deny"])
+
+    def test_the_decisions_log_is_readable_but_not_writable(self):
+        # XERK-1574: every session's directive names ~/.turma/decisions-<org>.md
+        # as reference material, so reading it must not cost a prompt — and a
+        # session must not rewrite what the operator decided.
+        s = ha.build_guard_settings()
+        self.assertIn("Read(~/.turma/decisions-*.md)", s["permissions"]["allow"])
+        self.assertIn("Edit(~/.turma/decisions-*.md)", s["permissions"]["deny"])
 
     def test_listagents_is_denied_and_sendmessage_is_not(self):
         # XERK-348. `ListAgents` enumerates the whole ACCOUNT — every org's hosts
