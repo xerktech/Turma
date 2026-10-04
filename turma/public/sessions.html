@@ -4388,10 +4388,10 @@ function archiveRefusalNote(body) {
 // minutes" is untrue for as long as that lasts — once three days. `since` is
 // when it closed, on the hub's clock.
 function archiveIngestNote(body) {
-  const since = body && body.ingestClosed && Number(body.ingestClosed.since);
+  const since = body && body.ingestClosed && body.ingestClosed.since;
   // A real epoch-ms stamp, not one Date can't print (8.64e15 is its range);
   // the Android twin draws the same line.
-  if (!(since > 0 && since < 8.64e15)) return "";
+  if (typeof since !== "number" || !(since > 0 && since < 8.64e15)) return "";
   return `The hub has not been accepting archive pushes since ` +
     `${esc(new Date(since).toLocaleString())} (${ago(Date.now() - since)}), so this ` +
     `conversation can&rsquo;t reach the archive until it does.`;
