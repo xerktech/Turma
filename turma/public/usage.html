@@ -218,11 +218,96 @@
     font-family: inherit; font-size: 13px; word-break: normal;
   }
 
+  /* "Permission prompts" (XERK-1563): every prompt that held a session, grouped
+     with the allow rule that would retire it. Reuses the models card; the rule
+     column is mono + a copy button, the recent list sits under a disclosure. */
+  .perm-card td:first-child { font-family: inherit; font-size: 13px; word-break: normal; white-space: normal; min-width: 180px; }
+  .perm-card .perm-rule { text-align: left; white-space: normal; min-width: 220px; }
+  .perm-kind {
+    display: inline-block; font-size: 11px; font-weight: 600; letter-spacing: 0.01em;
+    padding: 1px 7px; border-radius: 999px; border: 1px solid var(--border);
+    color: var(--ink-2); background: var(--page); white-space: nowrap;
+  }
+  .perm-kind.k-classifier-denied { color: var(--critical); border-color: currentColor; background: transparent; }
+  .perm-kind.k-ask-in-chat { color: var(--warning); border-color: currentColor; background: transparent; }
+  /* A subject is prose (an ask's question) unless it is a command or tool name:
+     prose wraps at word boundaries; only `.cmd` may break mid-token, and only
+     where the token would otherwise overflow. */
+  .perm-subj { font-size: 13px; color: var(--ink); margin-top: 4px; word-break: normal; overflow-wrap: break-word; }
+  .perm-subj.cmd { font-family: var(--font-mono); font-size: 12px; overflow-wrap: anywhere; }
+  .perm-tool { color: var(--muted); font-size: 11px; margin-top: 2px; }
+  .perm-rule code {
+    font-family: var(--font-mono); font-size: 12px; color: var(--ink);
+    background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+    padding: 2px 6px; word-break: normal; overflow-wrap: anywhere; display: inline-block; max-width: 100%;
+  }
+  /* The rule and its Copy share one line: the rule shrinks and wraps inside its
+     box, Copy stays beside it — a long rule never drops Copy below it. */
+  .perm-rule-line { display: flex; align-items: center; gap: 6px; }
+  .perm-rule-line code { flex: 0 1 auto; min-width: 0; }
+  .perm-rule-line .perm-copy { flex: none; margin-left: 0; }
+  .perm-rule .none { color: var(--muted); }
+  /* Inline code inside an ask's question (`legacy/`), rendered — never raw backticks. */
+  .perm-subj code {
+    font-family: var(--font-mono); font-size: 0.92em; padding: 0 4px;
+    background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+    overflow-wrap: anywhere;
+  }
+  /* The note sits below the table at the same gap as "Recent prompts" (12px), so it never
+     reads as part of the last row. `.models-card .note`'s -4px top would otherwise win. */
+  .models-card .note.perm-foot { margin-top: 12px; }
+  .perm-foot code { font-family: var(--font-mono); font-size: 0.92em; }
+  .perm-why { color: var(--muted); font-size: 11.5px; margin-top: 3px; word-break: normal; overflow-wrap: break-word; }
+  .perm-na { color: var(--muted); }
+  .perm-copy {
+    font: inherit; font-size: 11.5px; margin-left: 6px; padding: 2px 8px; cursor: pointer;
+    color: var(--ink-2); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); vertical-align: middle;
+  }
+  .perm-copy:hover { color: var(--accent); border-color: var(--accent); }
+  .perm-recent { list-style: none; margin: 8px 0 0; padding: 0; }
+  .perm-recent li {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px;
+    padding: 7px 0; border-bottom: 1px solid var(--hairline); font-size: 12.5px;
+  }
+  .perm-recent li:last-child { border-bottom: none; }
+  .perm-recent .perm-subj { margin-top: 0; flex: 1 1 220px; min-width: 0; }
+  .perm-recent .perm-meta { display: flex; flex-wrap: wrap; gap: 2px 10px; flex: 0 1 auto; min-width: 0; }
+  .perm-recent .meta { color: var(--muted); font-size: 11.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .perm-empty { color: var(--muted); font-size: 12.5px; padding: 6px 0 2px; }
+
   @media (max-width: 600px) {
     .chart-card { padding: 12px 10px 8px; }
     .models-card { padding: 12px 10px; }
     .legend { gap: 6px 16px; margin-bottom: 10px; }
     .tooltip { min-width: 150px; font-size: 11px; padding: 7px 10px; }
+    /* Permission prompts on a phone: the five-column table cannot fit, and the
+       sticky Prompt column covered the rule column however far it scrolled.
+       Each group reflows to a stacked block instead — kind + subject; one line
+       of count, answers and median wait; the rule and its Copy on their own
+       line — with no sideways scroll. The desktop table is untouched. */
+    .perm-card .table-scroll { overflow-x: visible; }
+    .perm-card table, .perm-card tbody, .perm-card td { display: block; }
+    .perm-card thead { display: none; }
+    .perm-card tbody tr {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px;
+      padding: 10px 12px; border-bottom: 1px solid var(--hairline);
+    }
+    .perm-card tbody tr:last-child { border-bottom: none; }
+    .perm-card tbody td {
+      position: static; padding: 0; border: none; background: none;
+      text-align: left; white-space: normal; min-width: 0;
+    }
+    .perm-card tbody td:first-child { flex: 1 1 100%; min-width: 0; }
+    .perm-card tbody td.perm-stat { flex: none; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
+    .perm-card tbody td.perm-stat::before { content: attr(data-label) " "; color: var(--muted); }
+    .perm-card tbody td.perm-rule { flex: 1 1 100%; min-width: 0; margin-top: 2px; }
+    /* No allow/deny answer exists for an ask: a bare "—" under a label says nothing. */
+    .perm-card tbody td.perm-stat.perm-stat-na { display: none; }
+    /* Recent prompts: kind + subject on the first line, then host · wait · age
+       always on a line of their own, host first. */
+    .perm-recent .perm-subj { flex: 1 1 0; }
+    .perm-recent .perm-meta { flex: 1 1 100%; }
   }
   /* Touch devices: roomier legend/table hit areas. */
   @media (pointer: coarse) {
@@ -232,7 +317,7 @@
 </style>
 </head>
 <body class="app-shell">
-<header class="site-header" id="siteHeader" data-page="usage" data-sub="Subscription limits · token usage"></header>
+<header class="site-header" id="siteHeader" data-page="usage" data-sub="Subscription limits · token usage · permission prompts"></header>
 <div class="page-scroll">
 <div class="wrap">
   <div class="totals" id="totals"></div>
@@ -240,6 +325,7 @@
   <div class="viewbar" id="viewbar"></div>
   <div id="chart"></div>
   <div id="models"></div>
+  <div id="permissions"></div>
   <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. There is <b>one card per subscription</b>, not per host: hosts logged into the same Claude account are reading and spending the same pool, so they fold into one card listing them all, and each window shows the freshest reading any of them took. A host whose agent is too old to say which account it's on stays on a card of its own. The <b>token figures</b> — the Today / This week / All-time totals above the limits, and every breakdown of them below — are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 </div>
@@ -1011,6 +1097,10 @@ function renderInner(data) {
   // and "By repo" charts only what the scoped org's hosts spent — a repo two
   // orgs share reads as that org's share of it, which is the point of scoping.
   TurmaOrg.update(data);
+  // Only now do the header's org keys mean anything (org.js resolves them
+  // against the sites this data names), so the permission card's org scope is
+  // settled here — its first fetch included.
+  syncPermissionsScope();
   TurmaNewTicket.update(data);
   // Live hosts PLUS the usage of hosts the hub no longer has (XERK-338), which
   // is the only place a deleted, pruned or wiped host's spend still exists. They
@@ -1552,6 +1642,259 @@ function mergeSnapshot(body, since) {
   cache = body;
 }
 
+// ---- Permission prompts (XERK-1563) -----------------------------------------
+// Every prompt that held a session — a TUI permission dialog, an auto-mode
+// classifier block, or the session asking for permission in chat — grouped by
+// what it asked about, with the allow rule that would retire it (the hub's
+// deterministic `suggestedRule`). Its own fetch (`/api/permissions`), scoped by
+// the header's org filter like everything else here; it does not ride
+// /api/agents, so the beat's SSE patches never repaint it.
+const $perms = document.getElementById("permissions");
+const PERM_DAYS = 7;
+const PERM_REFRESH_MS = 60000;
+const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat" };
+let permView = null;
+let permLoadError = null;
+let permFetchSeq = 0;
+// The card is fetched only once a render has run TurmaOrg.update: before that
+// org.js knows no sites, so getKeys() is [] and an unscoped fetch would show
+// every org's prompts under a scoped header. `permFetchedKeys` is the key set
+// the card was last fetched for — a render whose keys differ refetches it.
+let permScoped = false;
+let permFetchedKeys = null;
+// The key set `permView` itself was fetched for. A failed read keeps the last
+// view only when it is THAT scope's view — another org's view is never shown
+// under the new selection, not even while the new one loads or after it fails.
+let permViewKeys = null;
+// The last string painted, compared instead of $perms.innerHTML: a browser
+// re-serializes innerHTML (`open` reads back `open=""`), so that never matched.
+let permPainted = null;
+// The card repaints every PERM_REFRESH_MS and on every org change, which builds a
+// fresh <details> — and a fresh one defaults CLOSED, snapping "Recent prompts"
+// shut under the operator once a minute. Its open state lives here and is
+// re-applied each paint (the `tableOpen` fix, for this card).
+let permRecentOpen = false;
+
+function permWait(ms) {
+  return typeof ms === "number" && Number.isFinite(ms) && ms >= 0 ? fmtDuration(ms / 1000) : "—";
+}
+function permKindHtml(g) {
+  const kind = PERM_KIND[g.kind] ? g.kind : "dialog";
+  const sub = g.kind === "dialog" && g.dialogKind && g.dialogKind !== "permission" ? ` · ${g.dialogKind}` : "";
+  return `<span class="perm-kind k-${kind}">${esc((PERM_KIND[g.kind] || "Prompt") + sub)}</span>`;
+}
+function permSubject(g) {
+  if (g.head) return g.head;
+  if (g.kind === "ask-in-chat") return g.prompt || "asked for permission in chat";
+  return g.tool || "—";
+}
+// The subject as markup: a command or tool name is mono and may break
+// mid-token; an ask's question is prose and wraps only between words.
+function permSubjectHtml(g, tag) {
+  const prose = !g.head && g.kind === "ask-in-chat";
+  const text = prose ? permProseHtml(permSubject(g)) : esc(permSubject(g));
+  return `<${tag} class="perm-subj${prose ? "" : " cmd"}">${text}</${tag}>`;
+}
+// An ask's question is the session's own markdown: `code` spans render as code
+// and **bold** markers drop, so no literal backticks or asterisks show. ONE
+// pass, so a code span's own text (`**kwargs`) is never re-read as bold; `__`
+// is left alone (`__init__.py` is a name, not emphasis). Escaped FIRST (esc
+// leaves ` and * alone), so a span only wraps text that is already safe; an
+// unpaired marker (a question cut at its cap) stays as typed.
+function permProseHtml(text) {
+  return esc(text).replace(/`([^`\n]+)`|\*\*([^*\n]+)\*\*/g,
+    (m, code, bold) => (code !== undefined ? `<code>${code}</code>` : bold));
+}
+function permNum(n) { return typeof n === "number" && Number.isFinite(n) ? n : 0; }
+// Allowed / denied, or "—" when no answer is knowable: an ask in chat is
+// answered in prose, never allow/deny, so 0 / 0 there would read as "ignored".
+// A group whose every row is still holding its session says "open" until one
+// is answered — 0 / 0 there would read "asked and ignored" too.
+function permAnswers(g) {
+  const known = (n) => typeof n === "number" && Number.isFinite(n);
+  const open = known(g.open) && g.open > 0 ? g.open : 0;
+  if (open && open >= permNum(g.count)) {
+    return `<span class="perm-na" title="Still waiting for an answer">still open</span>`;
+  }
+  if (g.kind === "ask-in-chat" || !known(g.allowed) || !known(g.denied)) {
+    return `<span class="perm-na" title="No allow/deny answer is recorded for this kind of prompt">—</span>`;
+  }
+  return `${g.allowed} / ${g.denied}` + (open ? ` <span class="perm-na">· ${open} open</span>` : "");
+}
+// An ask that is no longer open has no allow/deny answer to show at all (its
+// cell reads "—"); on a phone that cell is hidden rather than labelled.
+function permAnswerless(g) {
+  const open = typeof g.open === "number" && g.open > 0 && g.open >= permNum(g.count);
+  return !open && g.kind === "ask-in-chat";
+}
+// The rule cell. A pasteable rule gets a Copy button beside it; the ask-in-chat
+// entry is a pointer, not a setting — its row says so in a few words and ONE
+// note under the table says where the fix lives (`PERM_BEHAVIOUR_NOTE`), rather
+// than the hub's terse pointer repeated on every ask; no rule says so — and a
+// classifier block says why it was blocked, the one thing to go on.
+const PERM_BEHAVIOUR_RE = /^model behaviour:\s*/;
+function permIsBehaviour(g) {
+  return typeof g.suggestedRule === "string" && PERM_BEHAVIOUR_RE.test(g.suggestedRule);
+}
+const PERM_BEHAVIOUR_NOTE = `<div class="note perm-foot"><b>Asked in chat</b> has no setting to copy: ` +
+  `the session ended its turn to ask in prose, and only its instructions change that. The fix is ` +
+  `step 0 of “Delivering work” in the global <code>~/.claude/CLAUDE.md</code> on each host: the ` +
+  `session runs unattended and never waits for a human to approve, continue, push or open a PR.</div>`;
+// A rule shown in its box: a narrow column wraps it after `(` or a `:` that
+// starts a value (`WebFetch(` / `domain:docs.example.com)`), never mid-name
+// where a natural break exists. Display only — Copy copies the raw rule.
+function permRuleCodeHtml(rule) {
+  return esc(rule).replace(/([(:])(?=[A-Za-z0-9])/g, "$1<wbr>");
+}
+function permRuleHtml(g) {
+  const rule = typeof g.suggestedRule === "string" && g.suggestedRule ? g.suggestedRule : "";
+  if (rule && permIsBehaviour(g)) {
+    return `<span class="none">Instructions, not a setting — see the note below</span>`;
+  }
+  if (rule) {
+    return `<span class="perm-rule-line"><code>${permRuleCodeHtml(rule)}</code><button type="button" class="perm-copy" data-perm-rule="${esc(rule)}" title="Copy this rule">Copy</button></span>`;
+  }
+  const why = g.kind === "classifier-denied" && typeof g.denyReason === "string" && g.denyReason
+    ? `<div class="perm-why">Blocked: ${esc(g.denyReason)}</div>` : "";
+  // A Bash head off the hub's safe list: no rule to copy, and the hub's reason.
+  // A classifier block's why is its deny reason ALONE: the allowlist reason is
+  // about Bash allow rules and says nothing of why the classifier said no.
+  if (typeof g.noRuleReason === "string" && g.noRuleReason) {
+    return `<span class="none">no safe rule — review it</span>` +
+      (why || `<div class="perm-why">${esc(g.noRuleReason)}</div>`);
+  }
+  return `<span class="none">no rule retires this</span>${why}`;
+}
+
+// The whole card, as markup — pure over the hub's `{days, top, recent}`. Every
+// field is agent-supplied text, so every one is escaped (a rule or a command can
+// carry anything).
+function permissionsCardHtml(view, now, recentOpen = false, loadError = null) {
+  const days = view && permNum(view.days) > 0 ? permNum(view.days) : PERM_DAYS;
+  const head = `<h2>Permission prompts (${days} days)</h2>` +
+    `<div class="note">Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat ` +
+    `that held a session, grouped with the allow rule that would retire it. Follows the header's org ` +
+    `filter only — the chart's series toggles above do not apply here.</div>`;
+  // A first fetch that failed says so; "Loading…" there would wait forever.
+  if (!view && typeof loadError === "string" && loadError) {
+    return head + `<div class="perm-empty">Could not load permission prompts (${esc(loadError)}).</div>`;
+  }
+  if (!view) return head + `<div class="perm-empty">Loading…</div>`;
+  const top = Array.isArray(view.top) ? view.top.filter((g) => g && typeof g === "object") : [];
+  const recent = Array.isArray(view.recent) ? view.recent.filter((r) => r && typeof r === "object") : [];
+  if (!top.length) {
+    return head + `<div class="perm-empty">No permission prompts recorded in the last ${days} days for the selected orgs.</div>`;
+  }
+  // data-label names each number when a phone reflows the row into a block.
+  const rows = top.map((g) => {
+    const tool = g.tool && g.head && g.tool !== g.head ? `<div class="perm-tool">${esc(g.tool)}</div>` : "";
+    return `<tr>
+      <td>${permKindHtml(g)}${permSubjectHtml(g, "div")}${tool}</td>
+      <td class="perm-stat" data-label="Count">${permNum(g.count)}</td>
+      <td class="perm-stat${permAnswerless(g) ? " perm-stat-na" : ""}" data-label="Allowed / denied">${permAnswers(g)}</td>
+      <td class="perm-stat" data-label="Median wait">${esc(permWait(g.medianWaitMs))}</td>
+      <td class="perm-rule">${permRuleHtml(g)}</td>
+    </tr>`;
+  }).join("");
+  const table = `<div class="table-scroll"><table>
+    <thead><tr><th>Prompt</th><th>Count</th><th>Allowed / denied</th><th>Median wait</th><th class="perm-rule">Suggested rule</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>`;
+  const items = recent.map((r) => {
+    const opened = permNum(r.openedAt);
+    const ago = opened ? fmtDuration((now - opened) / 1000) + " ago" : "";
+    // A closed row without a wait (a classifier block holds nothing) says only
+    // its answer; a row with no close yet is still holding its session.
+    // An ask has no allow/deny by design (the table shows "—" for it), so it
+    // never says "unknown" here either — an older hub still sends that.
+    const parts = [];
+    if (typeof r.waitedMs === "number") parts.push(`waited ${permWait(r.waitedMs)}`);
+    else if (!r.closedAt && !r.answer) parts.push("still open");
+    if (r.answer && r.kind !== "ask-in-chat") parts.push(r.answer);
+    // Host, wait and age ride ONE group, host first, so the host sits in the
+    // same place on every row (on a phone: the start of the second line).
+    const meta = [r.host, parts.join(" · "), ago].filter(Boolean)
+      .map((t) => `<span class="meta">${esc(t)}</span>`).join("");
+    return `<li>${permKindHtml(r)}${permSubjectHtml(r, "span")}` +
+      `<span class="perm-meta">${meta}</span></li>`;
+  }).join("");
+  const list = items
+    ? `<details class="table-view perm-recent-view"${recentOpen ? " open" : ""}><summary>Recent prompts (${recent.length})</summary><ul class="perm-recent">${items}</ul></details>`
+    : "";
+  const note = top.some(permIsBehaviour) ? PERM_BEHAVIOUR_NOTE : "";
+  return head + table + note + list;
+}
+
+function paintPermissions() {
+  const html = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now(), permRecentOpen, permLoadError)}</div>`;
+  if (html === permPainted) return;
+  permPainted = html;
+  // A recurring innerHTML repaint: preserveScroll keeps the table's sideways
+  // scroll (and the page's) across the swap, like every other repaint here.
+  TurmaNav.preserveScroll($perms, () => { $perms.innerHTML = html; });
+}
+
+function permKeys() {
+  return (TurmaOrg.getKeys && TurmaOrg.getKeys()) || [];
+}
+
+function syncPermissionsScope() {
+  permScoped = true;
+  if (permKeys().join(",") !== permFetchedKeys) refreshPermissions();
+}
+
+async function refreshPermissions() {
+  const seq = ++permFetchSeq;
+  const keys = permKeys();
+  const scope = keys.join(",");
+  permFetchedKeys = scope;
+  const q = new URLSearchParams({ days: String(PERM_DAYS) });
+  if (keys.length) q.set("org", scope);
+  // A scope change drops the previous org's view at once: the card says
+  // loading rather than showing org A's prompts under org B's selection.
+  if (permView && permViewKeys !== scope) {
+    permView = null;
+    permViewKeys = null;
+    permLoadError = null;
+    paintPermissions();
+  }
+  // A failed read keeps this scope's last view; with none, the card says it failed.
+  const failed = (why) => {
+    if (seq !== permFetchSeq) return;
+    if (permView && permViewKeys === scope) return;
+    permView = null;
+    permViewKeys = null;
+    permLoadError = why;
+    paintPermissions();
+  };
+  try {
+    const r = await fetch("/api/permissions?" + q.toString());
+    if (!r.ok) return failed(`HTTP ${r.status}`);
+    const body = await r.json();
+    if (seq !== permFetchSeq) return;        // an org change raced this answer
+    permView = body;
+    permViewKeys = scope;
+    permLoadError = null;
+    paintPermissions();
+  } catch { failed("no readable answer from the hub"); }
+}
+
+// `toggle` does not bubble, so the disclosure's open state is caught on capture.
+$perms.addEventListener("toggle", (ev) => {
+  const d = ev.target;
+  if (d && d.matches && d.matches("details.perm-recent-view")) permRecentOpen = !!d.open;
+}, true);
+
+// One delegated listener: the card is repainted wholesale, its buttons are not.
+$perms.addEventListener("click", (ev) => {
+  const btn = ev.target && ev.target.closest && ev.target.closest("[data-perm-rule]");
+  if (!btn) return;
+  const rule = btn.getAttribute("data-perm-rule") || "";
+  const done = (label) => { btn.textContent = label; setTimeout(() => { btn.textContent = "Copy"; }, 1500); };
+  try {
+    navigator.clipboard.writeText(rule).then(() => done("Copied"), () => done("Copy failed"));
+  } catch { done("Copy failed"); }
+});
+
 async function refresh() {
   const since = sseClock;   // captured BEFORE the fetch — the write window is its RTT
   try {
@@ -1643,10 +1986,13 @@ function connectSSE() {
 // The org scope lives in the header and applies to every page (XERK-62);
 // a change there repaints this one straight away rather than waiting for
 // the next beat.
+// The render refetches the permission card when the change moved its org keys.
 TurmaOrg.subscribe(() => { if (cache) render(cache); });
 refresh();
 connectSSE();
 setInterval(() => { if (!sseOk) refresh(); }, 30000);
+paintPermissions();
+setInterval(() => { if (permScoped) refreshPermissions(); }, PERM_REFRESH_MS);
 let resizeTimer;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);
