@@ -29,12 +29,14 @@ import com.xerktech.turma.model.JiraIssueDetail
 import com.xerktech.turma.model.QueuedTicket
 import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.net.hubErrorMessage
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.serialization.json.JsonNull
@@ -582,6 +584,77 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
+    // The permission policy sheet's state (XERK-1566). VM-owned rather than
+    // composable-local so the hub's answer lands through a StateFlow, the way
+    // every other board fetch does.
+    private val _permission = MutableStateFlow(PermissionPolicyUi())
+    val permission: StateFlow<PermissionPolicyUi> = _permission
+
+    /**
+     * Load an org's permission-policy text (XERK-1566) off its OWN route — never
+     * the atomic `/api/agents` decode. Resets the sheet to that org, loading; the
+     * hub's answer becomes its truth, a refusal its error in the hub's own words
+     * ([hubErrorMessage], XERK-264). An answer for an org no longer selected is
+     * dropped (board.html's "the org changed under us").
+     */
+    fun loadPermissionPolicy(siteKey: String): Job {
+        _permission.value = PermissionPolicyUi(siteKey = siteKey, loading = true)
+        return viewModelScope.launch {
+            val r = try {
+                permissionPolicyResult(container.client.api.getPermissionPolicy(siteKey))
+            } catch (_: Exception) {
+                PermissionPolicyResult(error = "the hub is unreachable")
+            }
+            _permission.update { cur ->
+                when {
+                    cur.siteKey != siteKey -> cur
+                    r.error != null -> cur.copy(loading = false, error = r.error)
+                    else -> cur.copy(loading = false, loaded = true, text = r.text,
+                        isDefault = r.isDefault, rev = cur.rev + 1)
+                }
+            }
+        }
+    }
+
+    /** The sheet closed: forget its state, so a reopen starts clean. */
+    fun closePermissionPolicy() {
+        _permission.value = PermissionPolicyUi()
+    }
+
+    /**
+     * Save the selected org's permission-policy text (XERK-1566): a string stores
+     * it ("" switches the judge off for the org), null drops back to the hub's
+     * default ("Use default"). Nothing reads as saved until the hub's 200 says so
+     * — then the sheet shows what the hub STORED (and closes when [close]); a
+     * refusal leaves the operator's edit alone and shows the hub's words. A save
+     * waits for a successful load, so a failed GET is never saved over.
+     */
+    fun savePermissionPolicy(text: String?, close: Boolean): Job? {
+        val cur0 = _permission.value
+        if (cur0.siteKey.isEmpty() || !cur0.loaded || cur0.busy || cur0.loading) return null
+        val siteKey = cur0.siteKey
+        _permission.update { it.copy(busy = true, error = "") }
+        val body = buildJsonObject { put("text", text?.let { JsonPrimitive(it) } ?: JsonNull) }
+        return viewModelScope.launch {
+            val r = try {
+                permissionPolicyResult(container.client.api.setPermissionPolicy(siteKey, body))
+            } catch (_: Exception) {
+                PermissionPolicyResult(error = "the hub is unreachable")
+            }
+            _permission.update { cur ->
+                when {
+                    cur.siteKey != siteKey -> cur
+                    r.error != null -> cur.copy(busy = false, error = r.error)
+                    else -> cur.copy(busy = false, text = r.text, isDefault = r.isDefault,
+                        rev = cur.rev + 1, done = close)
+                }
+            }
+            if (r.error == null) {
+                _messages.tryEmit(if (text == null) "✓ permission policy reset to default" else "✓ permission policy saved")
+            }
+        }
+    }
+
     /**
      * Change a ticket's status and push it to the board (XERK-138) — the one
      * thing Turma writes back. The hub queues a command on an online host and
@@ -795,6 +868,50 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
         }
         return CreateResultFetch.Error("the create didn't complete in time")
     }
+}
+
+/**
+ * The permission policy sheet (XERK-1566): the selected org, the hub's text for
+ * it and whether that is the default; [loading]/[busy] while a GET/POST is out;
+ * [loaded] once a GET succeeded (Save waits for it); [error] the hub's refusal
+ * words. [rev] bumps whenever the hub's answer replaces [text], which is when
+ * the sheet's draft resets to it; [done] asks the sheet to close (a Save landed).
+ */
+data class PermissionPolicyUi(
+    val siteKey: String = "",
+    val text: String = "",
+    val isDefault: Boolean = true,
+    val loading: Boolean = false,
+    val loaded: Boolean = false,
+    val busy: Boolean = false,
+    val error: String = "",
+    val rev: Int = 0,
+    val done: Boolean = false,
+)
+
+/**
+ * One answer from the permission-policy route (XERK-1566): the org's [text] and
+ * whether it is the hub's default, or — when [error] is non-null — the hub's
+ * refusal in its own words and nothing else (the caller keeps what it had).
+ */
+data class PermissionPolicyResult(
+    val text: String = "",
+    val isDefault: Boolean = true,
+    val error: String? = null,
+)
+
+/**
+ * Read a permission-policy response the way board.html's `permissionRequest`
+ * does: a 2xx is authoritative (an absent `text` reads empty, an absent
+ * `isDefault` reads as the default); anything else is a refusal worded by
+ * [hubErrorMessage] — the hub's `{error}`, else "the hub answered HTTP <n>".
+ */
+internal fun permissionPolicyResult(
+    r: retrofit2.Response<com.xerktech.turma.net.PermissionPolicyResponse>,
+): PermissionPolicyResult {
+    if (!r.isSuccessful) return PermissionPolicyResult(error = hubErrorMessage(r))
+    val b = r.body() ?: return PermissionPolicyResult(error = "the hub answered HTTP ${r.code()} with no body")
+    return PermissionPolicyResult(text = b.text ?: "", isDefault = b.isDefault != false)
 }
 
 /**
