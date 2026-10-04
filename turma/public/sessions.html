@@ -2298,7 +2298,8 @@ function backgroundWaitLabel(rows, wait, now) {
   // One named wait keeps its subject on every branch (XERK-1571): a timed wait
   // that read only "11m left" said nothing about what it waits for.
   const what = waits.length === 1 && waits[0].label ? " · " + waits[0].label : "";
-  if (wait.eta != null && wait.eta > now) return word + what + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
+  // The age's "·" is glued by no-break spaces (XERK-1571): a line never ends on it.
+  if (wait.eta != null && wait.eta > now) return word + what + "\u00a0·\u00a0" + ago(wait.eta - now).replace(/ ago$/, "") + " left";
   // No ETA: how long it has been waiting, off the oldest wait row's startedAt
   // (XERK-1571) — a CI watch with no duration reads as if it just began. Not on
   // a STALL: how long it has been stalled is the hub's attention `since` (the
@@ -2307,7 +2308,7 @@ function backgroundWaitLabel(rows, wait, now) {
   let started = null;
   for (const a of waits)
     if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
-  const since = started == null || wait.state === "stalled" ? "" : " · " + ago(now - started).replace(/ ago$/, "");
+  const since = started == null || wait.state === "stalled" ? "" : "\u00a0·\u00a0" + ago(now - started).replace(/ ago$/, "");
   if (what) return word + what + since;
   return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s") + since;
 }
@@ -2410,24 +2411,22 @@ function reviewState(s, live, now) {
 
 // The hub's attention read (XERK-1571), as a review card's second line: WHY the
 // session is the operator's ("PR open · CI passing") and how long it has been
-// ("· waiting 12m"). A question card already quotes its question, a permission
-// card names what it asks for (`ask`), and a stalled one names its wait in its
-// label, so for those only the time shows — "for 22m" under "waiting for your
-// answer", "stalled 31m" under a stall. The age is glued to its word by a
-// no-break space, so a narrow card never leaves "4m" alone on a line. "" from an
+// ("· for 12m", the wording every surface uses). A question card already quotes
+// its question, a permission card names what it asks for (`ask`), and a stalled
+// one names its wait in its label, so for those only the time shows — "for 22m"
+// under "waiting for your answer", "stalled 31m" under a stall. The age is glued
+// to its word, and its "·" to both sides, by no-break spaces, so a narrow card
+// never leaves "4m" alone on a line or ends one on a dangling "·". "" from an
 // older hub that serves no `attention`.
 function attentionWhy(s, now) {
   const att = s.attention;
   const st = String(att?.state || "");
   if (!st.startsWith("needs-you:")) return "";
-  const asked = st === "needs-you:question" || st === "needs-you:permission";
-  const bits = [];
-  if (att.why && (st === "needs-you:review" || st === "needs-you:test")) bits.push(att.why);
-  if (Number.isSafeInteger(att.since)) {
-    const age = ago(now - att.since).replace(/ ago$/, "");
-    bits.push((st === "needs-you:stalled" ? "stalled" : asked ? "for" : "waiting") + " " + age);
-  }
-  return bits.join(" · ");
+  const why = att.why && (st === "needs-you:review" || st === "needs-you:test") ? String(att.why) : "";
+  const age = Number.isSafeInteger(att.since)
+    ? (st === "needs-you:stalled" ? "stalled" : "for") + " " + ago(now - att.since).replace(/ ago$/, "")
+    : "";
+  return why && age ? why + " · " + age : why || age;
 }
 
 // Is this card Ready for review? Where the hub serves an attention state it
@@ -2863,7 +2862,7 @@ function activeCard({ a, s, live }) {
         <div class="title" title="${esc(sessTitle(s))}">${esc(sessTitle(s))}</div>
         ${meta}
         <div class="state-row">
-          <div class="state ${tone}">${esc(live.label)}${!attachable ? " · terminal offline" : ""}</div>
+          <div class="state ${tone}">${esc(live.label)}${!attachable ? "\u00a0·\u00a0terminal offline" : ""}</div>
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
             esc("Running on this host's self-hosted model, not the Claude subscription"
                 + (s.modelSourceAt ? ` — since ${new Date(s.modelSourceAt).toLocaleString()}` : ""))

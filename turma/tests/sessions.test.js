@@ -379,7 +379,7 @@ test("background shell kinds: waiting holds, stalled surfaces, work stays workin
   render({ now, agents: [h] });
   const a = els.active.innerHTML, r = els.review.innerHTML;
   // Holding: Active, labelled with the ETA or what it waits on, styled holding.
-  assert.ok(a.includes("Sleeping Task") && a.includes("waiting · Sleep · 12m left"), a);
+  assert.ok(a.includes("Sleeping Task") && a.includes("waiting · Sleep\u00a0·\u00a012m left"), a);
   assert.ok(a.includes("CI Watcher") && a.includes("waiting · Watch CI"));
   assert.ok(/state holding/.test(a));
   assert.ok(!r.includes("Sleeping Task") && !r.includes("CI Watcher"));
@@ -413,8 +413,8 @@ test("attention: sleeping holds, review sorts oldest-waiting first with the why 
   render({ now, agents: [h] });
   const r = els.review.innerHTML, a = els.active.innerHTML;
   assert.ok(r.indexOf("Older Wait") >= 0 && r.indexOf("Older Wait") < r.indexOf("Newer Wait"), "oldest-waiting first");
-  assert.ok(r.includes('<div class="why">PR open · CI passing · waiting\u00a040m</div>'), r);
-  assert.ok(r.includes('<div class="why">finished · nothing to merge · waiting\u00a05m</div>'));
+  assert.ok(r.includes('<div class="why">PR open · CI passing\u00a0·\u00a0for\u00a040m</div>'), r);
+  assert.ok(r.includes('<div class="why">finished · nothing to merge\u00a0·\u00a0for\u00a05m</div>'));
   // A stalled card names its wait in its label, so its why line is the age only —
   // "stalled 2m", never a second "waiting" — and it takes the danger tone.
   const { render: render2, els: els2 } = loadPage();
@@ -523,7 +523,7 @@ test("attention: permission names its command, a stall shows one age, a timed wa
   assert.ok(r.includes('<div class="state stalled">stalled · Wait for staging deploy</div>'), r);
   assert.ok(r.includes('<div class="why">stalled 31m</div>'));
   assert.ok(!r.includes("38m"), "the wait's start age is not shown beside the stall age");
-  assert.ok(a.includes("⏳ waiting · Wait for the rollout · 11m left"), a);
+  assert.ok(a.includes("⏳ waiting · Wait for the rollout\u00a0·\u00a011m left"), a);
 });
 
 // XERK-735. The card's second line reads repo · related ticket · pc name ·
