@@ -22859,6 +22859,16 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   await asBeat("brDrift", A, { autoStart: false,
     sessions: [{ id: "d1", status: "running", summary: "drifted" }] });
   setAttn("brDrift", "d1", { state: "needs-you:question", since: now - 70 * 60000, why: "D?" });
+  // A host BOUND to A whose next beat declares NO tracker org (quiet): silence is
+  // not drift (XERK-348), so its decided org is still A and its sessions are in
+  // A's brief. A host filter on the claimed-and-bound pair would drop it.
+  await asBeat("brQuiet", A, { autoStart: false, tickets: [] });
+  const quietBeat = await request("POST", "/api/heartbeat", { headers: agentHeaders,
+    body: { device: "brQuiet", repos: [{ name: "Turma", path: "/git/Turma" }],
+      sessions: [{ id: "qq1", status: "running", summary: "quiet host asks" }] } });
+  assert.equal(quietBeat.status, 200);
+  assert.equal(agents.brQuiet.jira, undefined, "the quiet beat declares no tracker org");
+  setAttn("brQuiet", "qq1", { state: "needs-you:question", since: now - 2 * 60000, why: "Q?" });
   setAutoStartOrg(A, true);
 
   const b = hub.compileBrief(A, now, "scheduled", []);
@@ -22866,8 +22876,9 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   assert.equal(b.since, now - hub.BRIEF_INTERVAL_MS, "no prior brief: the period is one interval");
   assert.equal(b.autoStart, true);
   // Needs you: the hub's attention, oldest first; stalled apart; org B and the
-  // drifted host absent.
-  assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["r1", "q1"]);
+  // drifted host absent; the quiet host's session present.
+  assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["r1", "q1", "qq1"]);
+  assert.equal(b.needsYou[2].host, "brQuiet");
   assert.equal(b.needsYou[1].why, "Ship it?");
   assert.equal(b.needsYou[1].state, "needs-you:question");
   assert.deepEqual(b.stalled.map((i) => i.sessionId), ["st1"]);
@@ -22918,7 +22929,7 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   assert.equal(b2.nextUp.filter((i) => i.key === "A-3").length, 1);
   assert.deepEqual(b2.finished.filter((i) => i.kind === "pr"), []);
   ticketQueue.length = 0;
-  for (const h of ["brHostA", "brHostB", "brDrift"]) delete agents[h];
+  for (const h of ["brHostA", "brHostB", "brDrift", "brQuiet"]) delete agents[h];
   resetAutoStart();
 });
 
