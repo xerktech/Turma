@@ -22805,6 +22805,12 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
       todo("A-3", iso(now - 60 * 24 * H)),                     // oldest todo
       todo("A-4", iso(now - H)),                               // new: intake
       todo("A-5", iso(now - 2 * H), { priority: "P0", type: "bug" }),
+      // Closed as stale (XERK-1569 moves them to a Done-category status): their
+      // board rows read done + resolved in the period, yet they are NOT finished.
+      { key: "A-9", summary: "flaky thing", statusCategory: "done", status: "Cannot Reproduce",
+        created: iso(now - 90 * 24 * H), resolved: iso(now - H) },
+      { key: "A-7", summary: "flaky upload", statusCategory: "done", status: "Won't Do",
+        created: iso(now - 90 * 24 * H), resolved: iso(now - 2 * H) },
     ],
     sessions: [
       { id: "q1", status: "running", summary: "asks a question" },
@@ -22879,9 +22885,12 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   assert.equal(fin["A-1"].host, "brHostA", "the host of the session that worked it");
   assert.equal(fin.c4.since, now - 3 * H, "the session's closedAt");
   assert.equal(fin.c4.transcriptId, "t-c4", "so the row can open the ended session");
+  // The stale-closed tickets' Done rows are not Finished rows (Closed as stale is
+  // their one row), but they did leave the board, so outflow counts them.
+  assert.equal(b.finished.some((i) => i.key === "A-9" || i.key === "A-7"), false);
   // Intake/outflow off the rows' created/resolved dates.
   assert.equal(b.counts.intake, 2);
-  assert.equal(b.counts.outflow, 1);
+  assert.equal(b.counts.outflow, 3, "A-1 plus the two stale closes");
   // Starts next: the auto-start order (P0 preempts, then oldest), with why.
   assert.deepEqual(b.nextUp.map((i) => i.key), ["A-5", "A-3", "A-4"]);
   assert.match(b.nextUp[0].reason, /^P0 preempts the line · created 2h ago · type bug$/);
@@ -23157,15 +23166,25 @@ test("XERK-1573: starts next skips a held/rejected ticket; an offline host needs
   const todo = (key, ageH) => ({ key, summary: `todo ${key}`, statusCategory: "todo",
     repoGuess: { repo: "Turma", cloned: true }, created: iso(now - ageH * H),
     triage: { priority: "P2", type: "task", actionable: true } });
+  const untriaged = { ...todo("I-5", 50) };
+  delete untriaged.triage;
   await asBeat("brHostI", S, { capacity: FULL,
-    tickets: [todo("I-1", 30), todo("I-2", 20), todo("I-3", 10)],
-    sessions: [{ id: "i1", status: "running", summary: "asks" }] });
+    // I-4 already has a session (a resumable one counts too); I-5 is untriaged;
+    // I-6 is below the org policy's minimum priority. The sweep starts none of
+    // them, so none may be named next — all are OLDER than I-3, so they would lead.
+    tickets: [todo("I-1", 30), todo("I-2", 20), todo("I-3", 10), todo("I-4", 40), untriaged,
+      { ...todo("I-6", 45), triage: { priority: "P3", type: "task", actionable: true } }],
+    sessions: [{ id: "i1", status: "running", summary: "asks" }],
+    closedSessions: [{ id: "i4", summary: "worked I-4", closedAt: iso(now - 90 * 24 * H),
+      ticket: { key: "I-4", siteKey: S, summary: "todo I-4" } }] });
   setAttn("brHostI", "i1", { state: "needs-you:question", since: now - 60000, why: "Q?" });
   setTicketTriageAction(S, "I-1", "hold");
   setTicketTriageAction(S, "I-2", "reject");
+  setTriagePolicy(S, { minPriority: "P2" });
   try {
     const b = hub.compileBrief(S, now, "scheduled", []);
-    assert.deepEqual(b.nextUp.map((i) => i.key), ["I-3"], "a held or rejected ticket is not next");
+    assert.deepEqual(b.nextUp.map((i) => i.key), ["I-3"],
+      "a held, rejected, already-started, untriaged or policy-blocked ticket is not next");
     assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["i1"]);
     // The host goes silent: its last beat's attention is frozen, not current.
     agents.brHostI.lastSeen = now - 10 * 60 * 1000;
@@ -23175,6 +23194,7 @@ test("XERK-1573: starts next skips a held/rejected ticket; an offline host needs
   } finally {
     setTicketTriageAction(S, "I-1", null);
     setTicketTriageAction(S, "I-2", null);
+    delete triagePolicies[S];
     delete agents.brHostI;
     resetAutoStart();
   }

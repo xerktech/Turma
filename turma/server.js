@@ -14296,8 +14296,8 @@ function compileBrief(siteKey, now, trigger, prevList) {
 
   // Finished since the last brief: Done tickets (resolved — or, from an agent
   // predating `resolved`, last updated — in the period), merged PRs, ended
-  // sessions — each piece of work ONCE (the ended sessions are cut below, once
-  // closedStale is known). Intake/outflow count the same rows' created/resolved
+  // sessions — each piece of work ONCE (stale-closed tickets and the ended
+  // sessions are cut below, once closedStale is known). Intake/outflow count the same rows' created/resolved
   // dates. The rows are what the hosts poll (assignee-scoped, recent Done only).
   const finished = [];
   let intake = 0;
@@ -14426,6 +14426,15 @@ function compileBrief(siteKey, now, trigger, prevList) {
     for (const r of a.repos || []) for (const c of (r && r.resumable) || []) addStale(key, c);
   }
 
+  // A ticket closed as stale is NOT finished work, though XERK-1569 moves it to a
+  // Done-category status (Won't Do, Cannot Reproduce) and its board row then
+  // reads done + resolved in the period: Closed as stale is its one row. It
+  // still counts in outflow — it did leave the board.
+  const staleKeys = new Set(closedStale.map((it) => it.key));
+  for (let i = finished.length - 1; i >= 0; i--) {
+    if (finished[i].kind === "ticket" && staleKeys.has(finished[i].key)) finished.splice(i, 1);
+  }
+
   // An ended session is the SAME piece of work as a row already counted when its
   // merged PR is a Finished row, its ticket's Done row is, or its ticket was
   // closed as stale — so it is a Finished row only when nothing else stands for
@@ -14436,7 +14445,6 @@ function compileBrief(siteKey, now, trigger, prevList) {
   for (const it of finished) if (it.kind === "pr") covered.add(sessionTag(it.host, it.sessionId));
   for (const it of closedStale) covered.add(sessionTag(it.host, it.sessionId));
   const doneTickets = new Map(finished.filter((it) => it.kind === "ticket").map((it) => [it.key, it]));
-  const staleKeys = new Set(closedStale.map((it) => it.key));
   for (const e of ended) {
     const done = e.key ? doneTickets.get(e.key) : undefined;
     if (done && !done.host) done.host = e.host;

@@ -34,6 +34,11 @@ paragraph and the per-org decisions log are XERK-1574.
     row here, its ticket's Done row is (that row takes the session's host), or its ticket is in
     closedStale. Listing it too made "Finished 7" of five things. A kept session row carries
     `transcriptId`, so both clients open it read-only (`?ended=` / `Routes.ended`);
+  - **a stale-closed ticket is never a finished row** — XERK-1569 closes it to a Done-category status
+    (Won't Do, Cannot Reproduce), so its row reads done + resolved in the period. closedStale is its
+    one row; outflow still counts it (it left the board);
+  - **an org's FIRST brief has no PR memory** — it lists every merged PR its running sessions still
+    show, however old (also after the 30-day drop or a lost `/data`). One-time per org, accepted;
   - **"already reported" is `prsReported`, never the `finished` rows** — those keep 10 and drop with
     their brief, so a merged PR cut from the list (or on a session outliving `BRIEFS_KEEP` briefs)
     was finished again. The newest brief alone carries it forward (≤500 URLs, the ones a session
