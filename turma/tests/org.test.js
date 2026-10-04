@@ -22,7 +22,7 @@ global.window.TurmaBoard = require("../public/board.js");
 const Org = require("../public/org.js");
 
 const PUBLIC = path.join(__dirname, "..", "public");
-const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html"];
+const PAGE_FILES = ["index.html", "sessions.html", "board.html", "usage.html", "brief.html"];
 
 const agent = (key, siteKey) => ({
   key, device: key, online: true, sessions: [],

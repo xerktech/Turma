@@ -50,6 +50,32 @@ class AgentDecodeTest {
         assertEquals("xerk.atlassian.net", ticket.siteKey)
     }
 
+    @Test fun `a ticket's self-close outcome decodes on every ticket channel`() {
+        // XERK-1569: ticket.outcome = {kind, at}, coerced hub-side (coerceTicketOutcome).
+        val t = """{ "key": "X-1", "siteKey": "s", "outcome": { "kind": "not-reproducible", "at": 1786400000000, "note": "repro passes" } }"""
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "sessions": [ { "id": "s1", "ticket": $t } ],
+              "closedSessions": [ { "id": "c1", "repo": "r", "ticket": $t } ],
+              "repos": [ { "name": "r", "resumable": [ { "transcriptId": "t1", "ticket": $t } ] } ]
+            } ] }
+        """.trimIndent()
+        val a = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0]
+        assertEquals("not-reproducible", a.sessions[0].ticket!!.outcome!!.kind)
+        assertEquals("not-reproducible", a.closedSessions[0].ticket!!.outcome!!.kind)
+        assertEquals("not-reproducible", a.repos[0].resumable[0].ticket!!.outcome!!.kind)
+        assertEquals("repro passes", a.sessions[0].ticket!!.outcome!!.note)
+        // No note served → "" (never invented).
+        val noNote = TurmaJson.decodeFromString<AgentsResponse>(
+            """{ "now": 1, "agents": [ { "key": "h", "device": "h", "sessions": [ { "id": "s", "ticket": { "key": "X-1", "outcome": { "kind": "done", "at": 1 } } } ] } ] }""")
+        assertEquals("", noNote.agents[0].sessions[0].ticket!!.outcome!!.note)
+        // Absent = the session did not close it.
+        val plain = TurmaJson.decodeFromString<AgentsResponse>(
+            """{ "now": 1, "agents": [ { "key": "h", "device": "h", "sessions": [ { "id": "s", "ticket": { "key": "X-1" } } ] } ] }""")
+        assertNull(plain.agents[0].sessions[0].ticket!!.outcome)
+    }
+
     @Test fun `a closed session with no ticket decodes to null`() {
         val body = """
             { "now": 1, "agents": [ {
@@ -167,6 +193,55 @@ class AgentDecodeTest {
         assertEquals("", rows[1].kind)
         assertNull(rows[1].startedAt)
         assertNull(rows[1].eta)
+    }
+
+    // XERK-1571: the hub-stamped `attention` and the session-CLI `wakeAt`/
+    // `wakeReason` are TYPED, so the decode is pinned; absent decodes to null.
+    @Test fun `a session's attention and wake decode, null when absent`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+                "sessions": [
+                  { "id": "s1", "attention": { "state": "sleeping", "since": 1700000000000,
+                      "eta": 1700000600000, "why": "check CI" },
+                    "session": { "wakeAt": 1700000600000, "wakeReason": "check CI" } },
+                  { "id": "s2", "attention": { "state": "needs-you:review", "since": 1700000000000 },
+                    "session": { } },
+                  { "id": "s3" }
+                ] } ] }
+        """.trimIndent()
+        val s = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].sessions
+        assertEquals("sleeping", s[0].attention!!.state)
+        assertEquals(1700000000000L, s[0].attention!!.since)
+        assertEquals(1700000600000L, s[0].attention!!.eta)
+        assertEquals("check CI", s[0].attention!!.why)
+        assertEquals(1700000600000L, s[0].session!!.wakeAt)
+        assertEquals("check CI", s[0].session!!.wakeReason)
+        assertNull(s[1].attention!!.eta)
+        assertNull(s[1].attention!!.why)
+        assertNull(s[1].session!!.wakeAt)
+        assertNull(s[2].attention)
+    }
+
+    // XERK-1572: the wait classifier's verdict rides attention as a typed `hint`;
+    // absent decodes to null, a missing suggestedAnswer to null.
+    @Test fun `an attention hint decodes, null when absent`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+                "sessions": [
+                  { "id": "s1", "attention": { "state": "needs-you:test", "since": 1700000000000,
+                      "hint": { "label": "needs-human-test", "why": "Wants the login checked.",
+                                "suggestedAnswer": "Checked, ship it." } } },
+                  { "id": "s2", "attention": { "state": "needs-you:review", "since": 1700000000000,
+                      "hint": { "label": "looping", "why": "Retries npm ci." } } },
+                  { "id": "s3", "attention": { "state": "needs-you:review", "since": 1700000000000 } }
+                ] } ] }
+        """.trimIndent()
+        val s = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].sessions
+        assertEquals("needs-human-test", s[0].attention!!.hint!!.label)
+        assertEquals("Wants the login checked.", s[0].attention!!.hint!!.why)
+        assertEquals("Checked, ship it.", s[0].attention!!.hint!!.suggestedAnswer)
+        assertNull(s[1].attention!!.hint!!.suggestedAnswer)
+        assertNull(s[2].attention!!.hint)
     }
 
     // XERK-544: the hub-derived auto-start-paused flag. Emitted only when true,
@@ -734,5 +809,49 @@ class AgentDecodeTest {
         val plain = TurmaJson.decodeFromString<Block>("""{"t":"tool_use","id":"t2","name":"Bash"}""")
         assertTrue((plain as ToolUseBlock).files.isEmpty())
         assertEquals("", plain.caption)
+    }
+
+    // XERK-1573: the per-org brief rides /api/agents as a TYPED top-level map, so
+    // a hub brief must decode into it and an older hub (no key) must not throw.
+    @Test fun `briefs decode typed, and their absence reads as no brief yet`() {
+        val body = """
+            { "now": 1, "agents": [ $plainHost ],
+              "briefs": { "o.atlassian.net": [ {
+                "siteKey": "o.atlassian.net", "at": 2000, "since": 1000, "trigger": "manual",
+                "autoStart": true,
+                "counts": { "needsYou": 15, "finished": 1, "intake": 2, "outflow": 1 },
+                "needsYou": [ { "kind": "session", "title": "t", "host": "h", "sessionId": "s1",
+                                "state": "needs-you:question", "why": "Ship it?", "since": 1500 } ],
+                "nextUp": [ { "kind": "ticket", "title": "do it", "key": "O-1",
+                              "reason": "P0 preempts the line · created 2h ago" } ],
+                "finished": [ { "kind": "session", "title": "run", "host": "h", "sessionId": "c4",
+                                "transcriptId": "t-c4", "since": 1200 },
+                              { "kind": "ticket", "title": "fix", "key": "O-2",
+                                "prUrl": "https://github.com/x/y/pull/42", "since": 1300 } ],
+                "spend": [ { "label": "Team plan", "fiveHourPct": 95, "fiveHourResetsAt": 9000,
+                             "paused": true } ]
+              } ] } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val b = resp.briefs.getValue("o.atlassian.net").single()
+        assertEquals(2000L, b.at)
+        assertEquals("manual", b.trigger)
+        assertEquals(15L, b.counts.needsYou)
+        assertEquals(0L, b.counts.stalled)
+        assertEquals("Ship it?", b.needsYou.single().why)
+        assertEquals(1500L, b.needsYou.single().since)
+        assertNull(b.needsYou.single().eta)
+        assertEquals("O-1", b.nextUp.single().key)
+        assertEquals("t-c4", b.finished.first().transcriptId)
+        assertNull(b.finished.first().prUrl)
+        assertEquals("https://github.com/x/y/pull/42", b.finished[1].prUrl)
+        assertNull(b.needsYou.single().transcriptId)
+        assertEquals(95.0, b.spend.single().fiveHourPct!!, 0.0)
+        assertEquals(9000L, b.spend.single().fiveHourResetsAt)
+        assertTrue(b.spend.single().paused)
+        assertTrue(b.waiting.isEmpty())
+        val older = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [ $plainHost ] }""")
+        assertTrue(older.briefs.isEmpty())
+        assertEquals(listOf("mxh-t16"), older.agents.map { it.key })
     }
 }

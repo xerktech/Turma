@@ -1,6 +1,7 @@
 package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.Attention
 import com.xerktech.turma.model.LiveAgent
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.PrInfo
@@ -116,8 +117,172 @@ fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState =
     session.status != "running" -> LiveState.STOPPED
     (session.session?.question ?: "").isNotBlank() -> LiveState.WAITING
     sessionWorking(session, agentLastSeen, now) -> LiveState.WORKING
+    // Asleep until a session-CLI wake (XERK-1571): holding, never Ready for review.
+    sessionSleeping(session, now) -> LiveState.HOLDING
     sessionWait(session, agentLastSeen, now)?.stalled == false -> LiveState.HOLDING
     else -> LiveState.IDLE
+}
+
+/** A session-CLI wake still in the future (XERK-1571) — the hub's `sessionSleeping`. */
+fun sessionSleeping(session: SessionInfo, now: Long): Boolean = (session.session?.wakeAt ?: 0L) > now
+
+/**
+ * "14:05" — the local wall-clock time a sleeping session wakes at, "14:05 +2d" when
+ * that is a later day (a wake may be up to 7d out), so it never reads as today. Web
+ * `clockTime`.
+ */
+fun clockTime(ms: Long, now: Long = System.currentTimeMillis()): String {
+    val c = java.util.Calendar.getInstance().apply { timeInMillis = ms }
+    val time = String.format(
+        java.util.Locale.ROOT, "%02d:%02d",
+        c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE),
+    )
+    val days = Math.round((localMidnight(ms) - localMidnight(now)) / 86_400_000.0)
+    return if (days > 0) "$time\u00a0+${days}d" else time
+}
+
+private fun localMidnight(ms: Long): Long = java.util.Calendar.getInstance().apply {
+    timeInMillis = ms
+    set(java.util.Calendar.HOUR_OF_DAY, 0)
+    set(java.util.Calendar.MINUTE, 0)
+    set(java.util.Calendar.SECOND, 0)
+    set(java.util.Calendar.MILLISECOND, 0)
+}.timeInMillis
+
+/** The chip word for a `needs-you:*` attention state (XERK-1571), else null. */
+fun needsYouChip(state: String): String? = when (state) {
+    "needs-you:question" -> "question"
+    "needs-you:permission" -> "permission"
+    "needs-you:review" -> "review"
+    "needs-you:test" -> "test"
+    "needs-you:stalled" -> "stalled"
+    else -> null
+}
+
+/**
+ * Does the hub say this running session waits on the operator (XERK-1571, web
+ * index.html `needsYou`)? Read off the served [SessionInfo.attention], never
+ * re-derived, so it agrees with the phone's alerts. The dashboard's Ready-for-review
+ * tile counts these; an older hub serves none, so it counts nothing.
+ */
+fun needsYou(session: SessionInfo): Boolean =
+    session.status == "running" && needsYouChip(session.attention?.state ?: "") != null
+
+/**
+ * Is this running session in the Sessions screen's Ready for review group
+ * (XERK-1571, web sessions.html `inReview`)? Where the hub serves an attention
+ * state it decides: every `needs-you:*` session is listed (question, permission,
+ * review, stalled) and nothing else, so the group is the set the dashboard tile
+ * counts. From an older hub (no attention) the local [readyForReview] port decides.
+ * On an OFFLINE host the hub's state is frozen at its last beat, so a non-needs-you
+ * one must not keep stranded work out: the local rule decides it too (XERK-235).
+ * A null [agentLastSeen] (a caller that cannot supply it) trusts the served state.
+ */
+fun inReview(
+    session: SessionInfo,
+    state: LiveState,
+    agentLastSeen: Long? = null,
+    now: Long = 0L,
+): Boolean {
+    val att = session.attention?.state.orEmpty()
+    if (needsYouChip(att) != null) return true
+    if (agentLastSeen != null && now - agentLastSeen >= OFFLINE_AFTER_MS) {
+        return readyForReview(session, state)
+    }
+    if (att.isNotEmpty()) return false
+    return readyForReview(session, state)
+}
+
+/**
+ * How long the hub says a needs-you session has waited, for a fleet card's State
+ * row (XERK-1571, web index.html `attentionFor`): "for 31m" off the attention
+ * `since` — the ONE age a stalled card shows. The age is glued to its word by a
+ * no-break space, as on the web, so "31m" never wraps alone. "" when there is none.
+ */
+fun attentionFor(att: Attention?, now: Long): String {
+    val since = att?.since ?: return ""
+    if (needsYouChip(att.state) == null) return ""
+    return "for\u00A0${waitLeftText(now - since)}"
+}
+
+/**
+ * Ready for review, oldest-waiting first by the hub's attention `since`
+ * (XERK-1571, web sessions.html `bySince`). A row with no `since` (an older hub)
+ * keeps its place after them — `sortedWith` is stable.
+ */
+fun <T> sortedBySince(rows: List<T>, attention: (T) -> Attention?): List<T> =
+    rows.sortedWith(compareBy<T, Long?>(nullsLast<Long>()) { attention(it)?.since })
+
+/**
+ * A review card's second line (XERK-1571, web sessions.html `attentionWhy`): WHY
+ * the session is the operator's and how long it has waited. Unlike the web card,
+ * the phone card carries no state label or quoted question, so the why is kept for
+ * every needs-you state (the question text, the wait, the PR). The time reads
+ * "stalled 31m" on a stall, else "for 22m" (the wording every surface uses). The
+ * age is glued to its word, and its "·" to both sides, by no-break spaces, so a
+ * line never ends on a dangling "·". "" when the hub serves none.
+ */
+fun attentionWhy(att: Attention?, now: Long): String {
+    if (att == null || needsYouChip(att.state) == null) return ""
+    val why = att.why?.takeIf { it.isNotBlank() }.orEmpty()
+    val age = att.since?.let {
+        val word = if (att.state == "needs-you:stalled") "stalled" else "for"
+        "$word\u00A0${waitLeftText(now - it)}"
+    }.orEmpty()
+    return if (why.isNotEmpty() && age.isNotEmpty()) "$why\u00A0·\u00A0$age" else why.ifEmpty { age }
+}
+
+/**
+ * A fleet card's State row for a session the hub says needs the operator (XERK-1571,
+ * web index.html `attentionLabel`): "review · PR open · CI passing", "awaiting your
+ * test · PR open", "stalled · Watch CI", "waiting for your answer", "waiting for your
+ * permission". Null when it
+ * doesn't — the card then keeps its own live-state word. Used where that word would
+ * be "idle", so a session Ready for review lists never reads idle on its own card.
+ */
+fun attentionLabel(att: Attention?): String? {
+    if (att == null) return null
+    val chip = needsYouChip(att.state) ?: return null
+    if (chip == "question") return "waiting for your answer"
+    if (chip == "permission") return "waiting for your permission"
+    // A review the classifier says needs a human TEST (XERK-1572) reads as one,
+    // not as a bare "test" chip word — the web dashboard and Sessions headline.
+    val word = if (chip == "test") "awaiting your test" else chip
+    return listOf(word, att.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
+}
+
+/** Does the hub say this session has STALLED on a background wait (XERK-1571)? */
+fun attentionStalled(att: Attention?): Boolean = att?.state == "needs-you:stalled"
+
+/** The wait classifier's label as a card reads it (XERK-1572, web `HINT_KIND`). */
+fun hintKind(label: String): String = when (label) {
+    "rubber-stamp" -> "go-ahead"
+    "design-decision" -> "decision"
+    "needs-human-test" -> "needs a human test"
+    "blocked-on-host" -> "blocked on the host"
+    "looping" -> "looping"
+    "waiting-external" -> "waiting on something outside"
+    else -> ""
+}
+
+/**
+ * The wait classifier's why on a needs-you card (XERK-1572, web sessions.html
+ * `.att-hint`): "decision · Pick schema v2 or v3". "" when the hub serves no
+ * verdict, or the session no longer needs the operator.
+ */
+fun attentionHintLine(att: Attention?): String {
+    if (att == null || needsYouChip(att.state) == null) return ""
+    val h = att.hint ?: return ""
+    if (h.why.isBlank()) return ""
+    val kind = hintKind(h.label)
+    return if (kind.isEmpty()) h.why else "$kind\u00A0·\u00A0${h.why}"
+}
+
+/** The answer the classifier suggests, as "Suggested: …" (XERK-1572), or "". */
+fun attentionSuggested(att: Attention?): String {
+    if (attentionHintLine(att).isEmpty()) return ""
+    val a = att?.hint?.suggestedAnswer?.takeIf { it.isNotBlank() } ?: return ""
+    return "Suggested: $a"
 }
 
 /**

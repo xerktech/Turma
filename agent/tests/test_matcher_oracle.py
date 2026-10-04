@@ -484,6 +484,15 @@ class TestGuardedClaudeDir(unittest.TestCase):
                          "the REAL arm's refusal cannot be attributed to our rule")
         self.assertEqual(self._case(rel, self.REAL), DENIED)
 
+    def test_the_permissions_dir_is_refused(self):
+        # XERK-1563: permlog.py's ledger dir, the same shape as the
+        # session-request dir above -- the pattern is the only layer there.
+        rel = ".turma/permissions/s1.jsonl"
+        self.assertEqual(self._case(rel, self.EMPTY), ALLOWED,
+                         "baseline: nothing refused this with empty settings, so "
+                         "the REAL arm's refusal cannot be attributed to our rule")
+        self.assertEqual(self._case(rel, self.REAL), DENIED)
+
     def test_the_memory_directory_entry_itself_is_not_writable(self):
         """A FILE planted at this name makes the directory impossible to create,
         permanently disabling that agent's memory.

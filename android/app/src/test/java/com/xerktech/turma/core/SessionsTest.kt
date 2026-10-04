@@ -153,14 +153,165 @@ class SessionsTest {
 
     @Test fun `liveStateLabel says what a holding session waits on`() {
         val timed = LiveSignals(agents = listOf(shell("wait-timed", "Sleep", eta = now + 12 * 60_000L)))
-        assertEquals("waiting · 12m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
+        assertEquals("⏳ waiting · Sleep · 12m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
         val ci = LiveSignals(agents = listOf(shell("wait-external", "Watch CI")))
-        assertEquals("waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
+        assertEquals("⏳ waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
         val two = LiveSignals(agents = listOf(shell("wait-external"), shell("wait-timed")))
-        assertEquals("waiting on 2 background shells", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, two, now))
+        assertEquals("⏳ waiting on 2 background shells", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, two, now))
+        // XERK-1571: no ETA, but a startedAt — how long it has been waiting, off the oldest row.
+        val started = LiveSignals(agents = listOf(
+            shell("wait-external", "Watch CI on PR #412").copy(startedAt = now - 12 * 60_000L)))
+        assertEquals("⏳ waiting · Watch CI on PR #412 · 12m",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, started, now))
+        val twoStarted = LiveSignals(agents = listOf(
+            shell("wait-external").copy(startedAt = now - 5 * 60_000L),
+            shell("wait-timed").copy(startedAt = now - 20 * 60_000L)))
+        assertEquals("⏳ waiting on 2 background shells · 20m",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, twoStarted, now))
         // A working card names only its WORK rows.
         val mixed = LiveSignals(agents = listOf(shell("work"), shell("wait-external")))
         assertEquals("1 background shell", com.xerktech.turma.ui.liveStateLabel(LiveState.WORKING, mixed, now))
+    }
+
+    // ---- attention (XERK-1571) ----------------------------------------------
+
+    @Test fun `a pending wake sleeps — holding, never ready for review, labelled until when`() {
+        val wakeAt = now + 30 * 60_000L
+        val asleep = SessionInfo(
+            status = "running",
+            session = LiveSignals(paneBusy = false, transcriptAgeSec = 5.0, lastRole = "assistant", wakeAt = wakeAt),
+        )
+        assertEquals(true, sessionSleeping(asleep, now))
+        assertEquals(LiveState.HOLDING, liveState(asleep, now, now))
+        assertEquals(false, readyForReview(asleep, liveState(asleep, now, now)))
+        assertEquals(
+            "💤 sleeping until ${clockTime(wakeAt, now)}",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, asleep.session, now),
+        )
+        // The wake reason, when the session gave one, says what it will check.
+        assertEquals(
+            "💤 sleeping until ${clockTime(wakeAt, now)} · check CI on PR #412",
+            com.xerktech.turma.ui.liveStateLabel(
+                LiveState.HOLDING, asleep.session!!.copy(wakeReason = "check CI on PR #412"), now),
+        )
+        // A due wake no longer sleeps; working outranks a sleep.
+        assertEquals(LiveState.IDLE, liveState(asleep, now, wakeAt + 1))
+        val busy = asleep.copy(session = asleep.session!!.copy(paneBusy = true))
+        assertEquals(LiveState.WORKING, liveState(busy, now, now))
+        // "14:05"-shaped local clock time.
+        assertEquals(true, Regex("^\\d\\d:\\d\\d$").matches(clockTime(wakeAt, now)))
+    }
+
+    @Test fun `a wake on a later day says how many days out`() {
+        fun at(day: Int, hour: Int, minute: Int) = java.util.Calendar.getInstance().apply {
+            clear()
+            set(2026, java.util.Calendar.OCTOBER, day, hour, minute)
+        }.timeInMillis
+        val today = at(4, 10, 0)
+        assertEquals("14:05", clockTime(at(4, 14, 5), today))
+        assertEquals("09:30\u00a0+1d", clockTime(at(5, 9, 30), today))
+        assertEquals("14:05\u00a0+2d", clockTime(at(6, 14, 5), today))
+        val asleep = LiveSignals(wakeAt = at(6, 14, 5))
+        assertEquals(
+            "💤 sleeping until 14:05\u00a0+2d",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, asleep, today),
+        )
+    }
+
+    private fun att(state: String, since: Long?, why: String? = null) =
+        com.xerktech.turma.model.Attention(state = state, since = since, why = why)
+
+    @Test fun `needsYou is a running session the hub serves a needs-you state for`() {
+        val sessions = listOf(
+            SessionInfo(id = "new", status = "running", attention = att("needs-you:review", now - 60_000L)),
+            SessionInfo(id = "old", status = "running", attention = att("needs-you:stalled", now - 3_600_000L)),
+            SessionInfo(id = "busy", status = "running", attention = att("working", now - 10L)),
+            SessionInfo(id = "zzz", status = "running", attention = att("sleeping", now - 10L)),
+            SessionInfo(id = "stopped", status = "stopped", attention = att("needs-you:review", 1L)),
+            SessionInfo(id = "olderHub", status = "running"),
+        )
+        assertEquals(listOf("new", "old"), sessions.filter(::needsYou).map { it.id })
+        assertEquals("stalled", needsYouChip("needs-you:stalled"))
+        assertEquals(null, needsYouChip("waiting"))
+    }
+
+    // XERK-1571: the Sessions screen's Ready for review is the hub's needs-you set
+    // where the hub serves attention, the local readyForReview port where it doesn't.
+    @Test fun `inReview follows the hub's attention, else the local rule`() {
+        val finished = SessionInfo(id = "f", status = "running",
+            session = LiveSignals(transcriptAgeSec = 600.0, lastRole = "assistant"))
+        assertEquals(true, inReview(finished, LiveState.IDLE))
+        assertEquals(false, inReview(finished.copy(attention = att("idle", now)), LiveState.IDLE))
+        val quiet = finished.copy(session = finished.session!!.copy(lastRole = "user"))
+        assertEquals(false, inReview(quiet, LiveState.IDLE))
+        assertEquals(true, inReview(quiet.copy(attention = att("needs-you:stalled", now)), LiveState.IDLE))
+        // An OFFLINE host's attention is frozen at its last beat: a stale "working"
+        // or "waiting" must not keep its stranded finished work out of review (the
+        // local rule decides), while a needs-you it last reported stays listed.
+        val dead = now - 600_000L
+        assertEquals(true, inReview(finished.copy(attention = att("working", dead)), LiveState.IDLE, dead, now))
+        assertEquals(true, inReview(finished.copy(attention = att("waiting", dead)), LiveState.IDLE, dead, now))
+        assertEquals(false, inReview(quiet.copy(attention = att("working", dead)), LiveState.IDLE, dead, now))
+        assertEquals(true, inReview(quiet.copy(attention = att("needs-you:stalled", dead)), LiveState.IDLE, dead, now))
+        // Online, a "working" still keeps the finished turn out.
+        assertEquals(false, inReview(finished.copy(attention = att("working", now)), LiveState.IDLE, now, now))
+    }
+
+    @Test fun `attentionFor is the one age a needs-you fleet card shows`() {
+        assertEquals("for\u00A031m", attentionFor(att("needs-you:stalled", now - 31 * 60_000L), now))
+        assertEquals("", attentionFor(att("needs-you:stalled", null), now))
+        assertEquals("", attentionFor(att("waiting", now - 60_000L), now))
+        assertEquals("", attentionFor(null, now))
+    }
+
+    @Test fun `attentionWhy says why and for how long`() {
+        // "for Nm" on every surface (operator review); the age's "·" never ends a line.
+        assertEquals("PR open · CI passing\u00A0·\u00A0for\u00A012m",
+            attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
+        // A stall says it stalled.
+        assertEquals("Ship it?\u00A0·\u00A0for\u00A03m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("Bash: rm -rf build\u00A0·\u00A0for\u00A03m",
+            attentionWhy(att("needs-you:permission", now - 3 * 60_000L, "Bash: rm -rf build"), now))
+        assertEquals("stalled\u00A03m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
+        assertEquals("", attentionWhy(att("working", now), now))
+        assertEquals("", attentionWhy(null, now))
+    }
+
+    @Test fun `attentionLabel names a needs-you state, never idle`() {
+        assertEquals("review · PR open · CI passing", attentionLabel(att("needs-you:review", now, "PR open · CI passing")))
+        assertEquals("stalled · Watch CI", attentionLabel(att("needs-you:stalled", now, "Watch CI")))
+        assertEquals("waiting for your answer", attentionLabel(att("needs-you:question", now, "Ship it?")))
+        assertEquals("waiting for your permission", attentionLabel(att("needs-you:permission", now, "Bash: ls")))
+        assertEquals("review", attentionLabel(att("needs-you:review", now)))
+        assertEquals("awaiting your test · PR open", attentionLabel(att("needs-you:test", now, "PR open")))
+        assertEquals(null, attentionLabel(att("working", now)))
+        assertEquals(null, attentionLabel(null))
+        assertEquals(true, attentionStalled(att("needs-you:stalled", now)))
+        assertEquals(false, attentionStalled(att("needs-you:review", now)))
+    }
+
+    // XERK-1572: the wait classifier's verdict on a needs-you card, worded as the web's.
+    @Test fun `attentionHintLine and attentionSuggested read the classifier's verdict`() {
+        val hinted = com.xerktech.turma.model.Attention(state = "needs-you:review", since = now,
+            hint = com.xerktech.turma.model.AttentionHint("design-decision", "Pick v2 or v3.", "Go with v3."))
+        assertEquals("decision\u00A0·\u00A0Pick v2 or v3.", attentionHintLine(hinted))
+        assertEquals("Suggested: Go with v3.", attentionSuggested(hinted))
+        assertEquals("needs a human test\u00A0·\u00A0x", attentionHintLine(hinted.copy(state = "needs-you:test",
+            hint = com.xerktech.turma.model.AttentionHint("needs-human-test", "x"))))
+        assertEquals("", attentionSuggested(hinted.copy(hint = hinted.hint!!.copy(suggestedAnswer = null))))
+        // Only while the session needs the operator, and only with a why.
+        assertEquals("", attentionHintLine(hinted.copy(state = "working")))
+        assertEquals("", attentionSuggested(hinted.copy(state = "working")))
+        assertEquals("", attentionHintLine(hinted.copy(hint = hinted.hint!!.copy(why = " "))))
+        assertEquals("", attentionHintLine(att("needs-you:review", now)))
+        assertEquals("Retries npm ci.", attentionHintLine(hinted.copy(
+            hint = com.xerktech.turma.model.AttentionHint("unknown-label", "Retries npm ci."))))
+    }
+
+    @Test fun `sortedBySince puts the oldest first and keeps since-less rows in place after them`() {
+        val rows = listOf("a" to null, "b" to 30L, "c" to null, "d" to 10L)
+        val out = sortedBySince(rows) { r -> r.second?.let { att("needs-you:review", it) } }
+        assertEquals(listOf("d", "b", "a", "c"), out.map { it.first })
     }
 
     // ---- readyForReview (XERK-224) ------------------------------------------
