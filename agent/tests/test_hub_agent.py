@@ -38011,6 +38011,13 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "git -c remote.origin.mirror=true push origin", "git -c remote.origin.mirror=true fetch",
         "git config remote.origin.push '+refs/heads/*'", "git -c alias.p=push p",
         "git config alias.p push", "git p origin main", "git $SUB origin",
+        # ...and local ref rewrites: a forced create/reset, a fetch refspec
+        # with a destination or a `+`, `replace`.
+        "git checkout -B main origin/feature", "git switch -C main",
+        "git switch --force-create main", "git worktree add -B main ../x",
+        "git fetch origin +feature:main", "git fetch origin main:main",
+        "git fetch origin '+refs/heads/*:refs/heads/*'", "git pull origin +x",
+        "git replace HEAD abc", "hub fork-it",
         # ANY gh pr merge; ANY gh api that is not a plain read; every graphql call.
         "gh pr merge 12 --squash", "GH PR MERGE 1", "glab mr merge 3",
         "az repos pr update --id 3 --status completed",
@@ -38026,6 +38033,11 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "gh api graphql -f query='mutation{deleteRef(input:{refId:1}){clientMutationId}}'",
         "gh api graphql -f query='mutation{updateRef(input:{refId:1}){clientMutationId}}'",
         "gh api graphql -f query='query{viewer{login}}'",
+        # gh/glab fail closed on the command word: an alias, an extension, an
+        # agent, a preview, and defining any of those, all stand.
+        "gh m 12", "gh co 12", "gh merge-ext 1", "gh extension exec merge-it 1",
+        "gh ext install o/gh-merge", "gh alias import /tmp/a.yml", "gh alias set m 'pr merge'",
+        "gh copilot", "gh agent-task create x", "GH M 1", "glab duo ask x", "glab m 3",
         # gh repo sync/delete, release delete, workflow run.
         "gh repo sync o/fork", "gh repo sync o/fork --force", "gh repo delete o/r --yes",
         "gh release delete v1", "gh workflow run ci.yml",
@@ -38033,6 +38045,11 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "curl -X PUT -H 'Authorization: token x' https://api.github.com/repos/o/r/pulls/3/merge",
         "curl https://github.com/o/r", "wget https://api.github.com/x",
         "http PUT api.github.com/repos/o/r/pulls/3/merge", "xh put github.com/x", "curl $URL",
+        # ...or to wherever the judge cannot read: a URL or config from a file
+        # or stdin, or no destination in argv at all (a .curlrc supplies it).
+        "curl -K /tmp/c", "curl --config /tmp/c", "curl --conf=/tmp/c", "curl -sK -",
+        "curl --url @/tmp/u", "curl --url=@/tmp/u", "wget -i /tmp/urls",
+        "wget --input-file=-", "aria2c -i urls.txt", "curl -s -X PUT",
         "python3 -c \"import os; os.system('git push origin main')\"",
         # Infra.
         "terraform apply -auto-approve", "terraform -chdir=x destroy", "tofu import a b",
@@ -38090,6 +38107,12 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
                     "gh api -H 'Accept: application/vnd.github+json' repos/o/r/pulls/3",
                     "gh run view 3 --log-failed", "gh pr checks 3",
                     "curl -sSf https://example.com/x", "git clone https://github.com/o/r",
+                    "curl -i http://localhost:8080/x", "wget https://example.com/x -O out",
+                    "http :8080/health", "git fetch https://example.com/r.git main",
+                    "git fetch git@example.com:o/r main", "git pull origin main",
+                    "git checkout -b feat", "git switch -c feat", "git checkout main",
+                    "git worktree add ../x -b feat", "hub pr list", "glab mr view 3",
+                    "gh auth status", "gh --version",
                     "npm test # don't skip"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(ha.judge_never_reason(cmd))
@@ -38292,6 +38315,94 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         self.sm._judge_sweep(time.time())
         self.assertEqual(os.listdir(sdir), [])
 
+    def _victim_tree(self):
+        """A directory standing in for $HOME / repos / ~/.claude, holding a
+        file, a credential and a nested tree — what a planted link aims at."""
+        victim = os.path.join(self.tmp, "victim")
+        for rel in ("notes.txt", ".claude/.credentials.json", "repos/proj/src/main.py",
+                    "a" * 64, "judge1/" + "b" * 64, "x.judge.req.json"):
+            path = os.path.join(victim, rel)
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            with open(path, "w") as f:
+                f.write("keep")
+        old = time.time() - 3600
+        for dirpath, _dirs, files in os.walk(victim):
+            for name in files:
+                os.utime(os.path.join(dirpath, name), (old, old))
+        return victim
+
+    def _tree(self, root):
+        return sorted(os.path.relpath(os.path.join(d, f), root)
+                      for d, _ds, fs in os.walk(root) for f in fs)
+
+    def test_a_symlinked_grants_dir_is_never_followed(self):
+        # `ln -s ~ ~/.turma/grants` passes the guard. The sweep must remove
+        # the LINK, never what it points at — it once rm -rf'd the target.
+        victim = self._victim_tree()
+        before = self._tree(victim)
+        os.symlink(victim, ha.GRANTS_DIR)
+        self.sm.registry = []                   # no session running: sweep all
+        self.sm._judge_sweep(time.time())
+        self.assertEqual(self._tree(victim), before)
+        self.assertFalse(os.path.lexists(ha.GRANTS_DIR), "the planted link is dropped")
+        # A grant write through a re-planted link lands nowhere and stands.
+        os.symlink(victim, ha.GRANTS_DIR)
+        self.sm.registry = [{"id": self.SID, "status": "running"}]
+        self.req()
+        self.sm._judge_pass()
+        self.assertEqual(self.answer(), "stand")
+        self.assertEqual(self._tree(victim), before)
+
+    def test_links_inside_the_grants_dir_are_never_followed(self):
+        victim = self._victim_tree()
+        before = self._tree(victim)
+        os.makedirs(os.path.join(ha.GRANTS_DIR, self.SID))
+        os.symlink(victim, os.path.join(ha.GRANTS_DIR, "gone1"))          # a session dir
+        os.symlink(os.path.join(victim, "a" * 64),
+                   os.path.join(ha.GRANTS_DIR, self.SID, "c" * 64))      # a grant file
+        os.makedirs(os.path.join(ha.GRANTS_DIR, self.SID, "d" * 64, "deep"))
+        self.sm.registry = []
+        self.sm._judge_sweep(time.time())
+        self.assertEqual(self._tree(victim), before)
+        self.assertFalse(os.path.lexists(os.path.join(ha.GRANTS_DIR, "gone1")))
+        self.assertFalse(os.path.lexists(os.path.join(ha.GRANTS_DIR, self.SID, "c" * 64)))
+        # Nothing recurses: a planted directory stays (and keeps its parent).
+        self.assertTrue(os.path.isdir(os.path.join(ha.GRANTS_DIR, self.SID, "d" * 64)))
+        # A link at the session dir is refused for a write too.
+        os.symlink(victim, os.path.join(ha.GRANTS_DIR, "judge9"))
+        self.assertFalse(self.sm._write_grant("judge9", "npm test", "r", time.time()))
+        self.assertEqual(self._tree(victim), before)
+
+    def test_a_symlinked_permissions_dir_is_not_swept(self):
+        victim = self._victim_tree()
+        before = self._tree(victim)
+        os.rmdir(ha.PERMISSIONS_DIR)
+        os.symlink(victim, ha.PERMISSIONS_DIR)
+        self.sm._judge_sweep(time.time())
+        self.assertEqual(self._tree(victim), before)
+
+    # --- fairness ----------------------------------------------------------------
+
+    def test_requests_are_picked_by_when_the_judge_saw_them_not_their_mtime(self):
+        a = f"judge1.aaaaaaaa{ha.JUDGE_REQ_SUFFIX}"
+        b = f"judge0.bbbbbbbb{ha.JUDGE_REQ_SUFFIX}"     # sorts first by name
+        with mock.patch.object(ha, "JUDGE_REQS_PER_PASS", 1):
+            self.assertEqual(self.sm._judge_pick([a], 100), [a])
+            self.assertEqual(self.sm._judge_pick([a, b], 200), [a])
+            self.assertEqual(self.sm._judge_pick([b], 300), [b])
+        self.assertEqual(list(self.sm._judge_seen), [b], "a gone file is forgotten")
+
+    def test_one_session_id_gets_a_bounded_number_of_model_calls(self):
+        self.run_model.return_value = None          # unusable: every attempt is spent
+        with mock.patch.object(ha, "JUDGE_CALLS_PER_SID_MIN", ha.JUDGE_ATTEMPTS):
+            self.req(nonce="aa000001")
+            self.req(nonce="aa000002")
+            self.sm._judge_pass()
+        self.assertEqual(self.run_model.call_count, ha.JUDGE_ATTEMPTS)
+        reasons = sorted(r["judgeReason"] for r in self.rows())
+        self.assertTrue(any("too many judgements" in r for r in reasons), reasons)
+        self.assertEqual({self.answer("aa000001"), self.answer("aa000002")}, {"stand"})
+
     # --- untrusted requests ------------------------------------------------------
 
     def test_requests_that_are_not_the_judges_are_stood_or_dropped(self):
@@ -38374,6 +38485,42 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
             self.assertFalse(os.path.exists(ha.PERMISSION_POLICY_FILE))
         self.sm._ingest_permission_policy({"text": "y" * (ha.PERMISSION_POLICY_MAX + 50)})
         self.assertEqual(len(self.sm.permission_policy), ha.PERMISSION_POLICY_MAX)
+
+    def test_the_real_beat_loop_feeds_the_reply_policy_to_the_judge(self):
+        # Drive run_forever: the full beat's reply AND the post-command light
+        # beat's reply each hand their policy over. Without this wiring the
+        # judge silently never turns on.
+        class Stop(Exception):
+            pass
+        replies = [{"permissionPolicy": {"text": "Allow tests."}, "commands": [{"cmdId": "c1"}]},
+                   {"permissionPolicy": {"text": "Allow lint."}}]
+        seen = []
+
+        def fake_beat(_beat, light=False):
+            return replies.pop(0)
+
+        def fake_handle(cmds):
+            seen.append(self.sm.permission_policy)
+            return bool(cmds)
+
+        def fake_wait(_timeout):
+            raise Stop()
+
+        self.sm.permission_policy = None
+        with mock.patch.object(ha, "IS_WINDOWS", False), \
+             mock.patch.object(ha.signal, "signal"), \
+             mock.patch.object(self.sm, "_start_dsh_web"), \
+             mock.patch.object(self.sm, "_start_permission_judge"), \
+             mock.patch.object(self.sm, "resume_on_boot"), \
+             mock.patch.object(self.sm, "queue_archive_sync"), \
+             mock.patch.object(self.sm, "_beat_once", side_effect=fake_beat), \
+             mock.patch.object(self.sm, "handle_commands", side_effect=fake_handle), \
+             mock.patch.object(ha._poke, "wait", side_effect=fake_wait), \
+             mock.patch.object(ha._poke, "clear"):
+            with self.assertRaises(Stop):
+                self.sm.run_forever()
+        self.assertEqual(seen, ["Allow tests.", "Allow lint."])
+        self.assertEqual(self.sm.permission_policy, "Allow lint.")
 
     # --- worker isolation --------------------------------------------------------
 

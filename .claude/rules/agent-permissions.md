@@ -131,8 +131,8 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
   stand / no answer / a malformed one → prints nothing. The names are mirrored in hub-agent.py
   (parity-tested).
 - **A DEDICATED worker** (`_judge_worker_loop`, the `_input_worker_loop` shape; polls every 0.5s,
-  at most `JUDGE_REQS_PER_PASS` a pass, oldest mtime first, at most `JUDGE_REQS_PER_SID` per
-  session so one that plants request files cannot starve the rest). Each request reads the clock
+  at most `JUDGE_REQS_PER_PASS` a pass, at most `JUDGE_REQS_PER_SID` per session so one that
+  plants request files cannot starve the rest). Each request reads the clock
   afresh (a pass of serial model calls runs minutes). No model call starts that could end past
   `ts + JUDGE_ANSWER_BY_SEC` (70s, under the hook's 75s wait) — that request stands — so an `allow`
   is one the hook read. Never the beat, never the slow-refresh worker — a request
@@ -141,6 +141,12 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
 - **Requests are session-written**: read only via `_read_untrusted_json`, removed once read, name
   and every field re-validated; anything addressable but unusable (not Bash, not a running Claude
   session, too old, too long) is answered `stand` so its hook returns at once.
+  - **Picked oldest-first by when the WORKER first saw the file** (`_judge_seen`), never its mtime —
+    `touch -d` would let a session jump the queue.
+  - **A session can plant requests under ANOTHER running session's sid** (the sid is only the
+    filename). So model calls are capped per sid (`JUDGE_CALLS_PER_SID_MIN` a rolling minute;
+    past it a request stands). An allow then grants the named session one exact command the model
+    approved under its policy — the same-uid residual in `agent-hooks.md`, not a new one.
 - **Order**: `judge_never_reason` FIRST (the never-list below) → `stand`, no model call. Else,
   with a policy, `claude -p --model haiku --tools "" --strict-mcp-config` (list argv, cwd
   `REGISTRY_DIR`, no `--settings`, stdin DEVNULL, `JUDGE_TIMEOUT_SEC` 20s, at most
@@ -157,11 +163,19 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
     session's own branch, so the judge never needs to approve one;
   - git ref rewrites: `branch` with any delete/move/copy/force option or prefix, `update-ref`,
     `symbolic-ref`, `tag -d/-f`, a `remote.*.push|mirror` / `alias.*` config, and any git
-    subcommand not in `_JUDGE_GIT_KNOWN` (an alias defined elsewhere can be `push`);
+    subcommand not in `_JUDGE_GIT_KNOWN` (an alias defined elsewhere can be `push`); local ones
+    too — `checkout -B`, `switch -C`, `worktree add -B`, a fetch/pull refspec with `:` or a
+    leading `+`, `replace` (`_judge_git_ref_rewrite`); `hub` against git's + hub's known set;
   - ANY `gh|glab pr|mr merge`; ANY `gh api` with `-f/-F/--field/--raw-field/--input/-X/--method`
     (any long prefix, any short cluster) and EVERY `graphql` call; `gh repo sync|delete|…`,
     `release delete`, `workflow run`, any gh `delete`; `az repos pr update|complete`;
-  - any curl/wget/http/httpie/xh/Invoke-WebRequest to github.com or api.github.com;
+  - ANY gh/glab whose first word is not in `_JUDGE_GH_KNOWN`/`_JUDGE_GLAB_KNOWN`: an alias
+    (`gh m 12`), an extension, `copilot`/`agent-task`/glab `duo`, and `alias`/`extension`
+    themselves — `guard.decide` cannot resolve an alias either, so a grant would allow it;
+  - any curl/wget/http/httpie/xh/Invoke-WebRequest to github.com or api.github.com, AND any whose
+    destination the judge cannot read: from a file or stdin (`curl -K/--config`, `--url @f`,
+    `wget -i/-e/--config`, `aria2c -i`) or no argv token that could be a host at all (a
+    `.curlrc` supplies it) — `_judge_http_reason`;
   - terraform/tofu apply/destroy/import/state-rm; mutating kubectl/oc (every namespace), helm,
     argocd; AWS/docker deletes, sudo, pipe-to-shell, Turma's/Claude's own state; the guard's
     own destructive/policy categories (`_guard_module`; one that cannot load stands everything).
@@ -176,10 +190,16 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
 - **`parse_judge_verdict` is STRICT**: exactly one JSON object (one ``` fence tolerated) with
   exactly `verdict` (allow|stand) + non-empty `reason`. Anything else retries, then stands.
 - **On allow for a PermissionDenied**: the one-shot grant (`_write_grant`, `GRANTS_DIR/<sid>/
-  <judge_grant_key>`, TTL `JUDGE_GRANT_TTL_SEC` 120s, random-tmp + rename, a symlinked session dir
-  refused). A PermissionRequest needs none — the hook allows it itself. Grant contract + the
-  accepted same-uid residual: `agent-hooks.md`. `_judge_sweep` drops expired grants, dirs of ended
-  sessions and req/ans files a dead hook left.
+  <judge_grant_key>`, TTL `JUDGE_GRANT_TTL_SEC` 120s, random-tmp + rename). A PermissionRequest
+  needs none — the hook allows it itself. Grant contract + the accepted same-uid residual:
+  `agent-hooks.md`. `_judge_sweep` drops expired grants, dirs of ended sessions and req/ans files
+  a dead hook left.
+- **GRANTS_DIR and PERMISSIONS_DIR are session-writable, so the manager never follows a link in
+  them** (`_RealDir`): `ln -s ~ ~/.turma/grants` passes the guard and once turned the sweep into
+  an `rm -rf ~`. Each dir is opened `O_DIRECTORY|O_NOFOLLOW` and walked fd-relative (path + lstat
+  on Windows); a link at GRANTS_DIR or a sid dir is UNLINKED (the entry, never its target); the
+  sweep touches only `VALID_PERMISSION_SID_RE` dirs and `_JUDGE_GRANT_FILE_RE` names in them, and
+  NEVER recurses (no rmtree). `_write_grant` writes through the same handles or not at all.
 - **Every judgement is a ledger row** — `kind: judged`, id `j-<sid>-<nonce>`, `verdict`,
   `judgeReason`, `answer` (allow; a stood classifier block `deny`; a stood dialog `unknown`), staged
   via `_emit_permission` (lock-guarded) for the beat to ship.
@@ -199,5 +219,7 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
 
 `test_permlog.py` (event shapes — the REAL PermissionRequest one, bounds, fail-open incl.
 FIFO/symlink, rotation, `-SsE`, the judge req/ans dance); `TestPermissionLedgerEdges` +
-`TestPermissionLogTail` + `TestPermissionJudge` (`test_hub_agent.py`); the `test_guard_settings.py`
+`TestPermissionLogTail` + `TestPermissionJudge` (`test_hub_agent.py`: incl. the symlinked
+grants/permissions dir cases, pick order, the per-sid call cap, and the REAL `run_forever` loop
+feeding `permissionPolicy` from both replies); the `test_guard_settings.py`
 pins (deny equality, every-hook-event `-SsE`, the PreToolUse matcher list, `--judge` wiring).

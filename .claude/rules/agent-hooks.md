@@ -413,11 +413,15 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     `Edit(~/.turma/permission-policy.md)` denies (file tools only, in the equality pin); the grant
     path/protocol is never named in any reason or prompt a model reads; every judgement is a ledger
     row (`kind: judged`); the hard denies still win; the never-list stands any command naming
-    `.turma/grants`. Never describe the judge as un-forgeable.
+    `.turma/grants`. Never describe the judge as un-forgeable. A session can also plant a request
+    under ANOTHER running session's sid (capped per sid, `agent-permissions.md`); the manager
+    never follows a link in the grant dir it sweeps.
   - **The judge's never-list is FAMILY-level and fails closed** — it stands (before any model call)
     ANY `git push`, any git ref rewrite (branch delete/move/force, update-ref, tag -d, symbolic-ref,
-    a push/mirror config or alias), ANY `gh pr merge`, ANY `gh api` that is not a plain read
-    (any field/input/method flag, every `graphql`), any HTTP client to github.com, and terraform/
+    a push/mirror config or alias, local `checkout -B`/fetch refspecs), ANY `gh pr merge`, ANY gh
+    alias/extension (an unknown first word), ANY `gh api` that is not a plain read (any
+    field/input/method flag, every `graphql`), any HTTP client to github.com or to a destination
+    from a file/stdin, and terraform/
     kubectl/helm/argocd mutators — matched on head + subcommand AFTER this file's own unwrapping
     (`_expand_both`), and on anything shlex cannot parse. Never a list of flag spellings: each
     review round found one more. Families + tests: `agent-permissions.md`.

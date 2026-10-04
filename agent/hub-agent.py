@@ -11519,6 +11519,11 @@ JUDGE_REQS_PER_PASS = 8
 # At most this many of one session's requests per pass (oldest first), so a
 # session that plants request files cannot starve every other session's.
 JUDGE_REQS_PER_SID = 2
+# At most this many MODEL CALLS for one session id per rolling minute. Request
+# files are session-written and name their sid in the filename, so one
+# session can plant requests under another's; past the cap a request stands
+# (a human decides), which costs the planter nothing it was owed.
+JUDGE_CALLS_PER_SID_MIN = 6
 # The (sid, nonce) of recent `allow`s, read by the beat to keep a judge-
 # approved prompt from being counted as a human dialog. Bounded by count and
 # by age (past the beat's hook hold window an entry can match nothing).
@@ -11538,6 +11543,9 @@ PERMISSION_POLICY_MAX = 16000
 JUDGE_ALIVE_FILE = "judge.alive"
 JUDGE_REQ_SUFFIX = ".judge.req.json"
 JUDGE_ANS_SUFFIX = ".judge.ans.json"
+# A grant file the judge writes (`judge_grant_key`), or its write tmp — the
+# only names the sweep removes from a session's grant dir.
+_JUDGE_GRANT_FILE_RE = re.compile(r"[0-9a-f]{64}(?:\.tmp\.[0-9a-f]{16})?")
 JUDGE_COMMAND_MAX = 8000
 _JUDGE_NONCE_RE = re.compile(r"[0-9a-f]{8,64}")
 _JUDGE_TOOL_USE_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
@@ -11681,6 +11689,35 @@ _JUDGE_GIT_KNOWN = frozenset((
     "status", "stripspace", "submodule", "switch", "tag", "update-index", "var",
     "verify-commit", "verify-pack", "verify-tag", "version", "whatchanged",
     "worktree", "write-tree", "--version", "--help", "-h"))
+# `hub` is git plus these; any other subcommand stands like a git one.
+_JUDGE_HUB_KNOWN = _JUDGE_GIT_KNOWN | frozenset((
+    "alias", "api", "browse", "ci-status", "compare", "create", "delete", "fork", "gist",
+    "issue", "pr", "pull-request", "release", "sync"))
+# The gh / glab top-level commands the judge knows. Any other first word — an
+# alias (`gh m 12` where `m: pr merge`), an extension, an agent that acts on
+# its own (`copilot`, `agent-task`, glab `duo`), a feature preview — stands:
+# none of them can be read from the command line. `alias`/`extension` are
+# left out on purpose, so defining or running one stands too.
+_JUDGE_GH_KNOWN = frozenset((
+    "auth", "browse", "codespace", "gist", "issue", "org", "pr", "project", "release",
+    "repo", "cache", "run", "workflow", "api", "attestation", "completion", "config",
+    "gpg-key", "label", "licenses", "ruleset", "search", "secret", "ssh-key", "status",
+    "variable", "help", "version", "accessibility", "actions", "environment",
+    "exit-codes", "formatting", "mintty", "reference"))
+_JUDGE_GLAB_KNOWN = frozenset((
+    "api", "attestation", "auth", "changelog", "check-update", "ci", "cluster",
+    "completion", "config", "deploy-key", "gpg-key", "help", "incident", "issue",
+    "iteration", "job", "label", "milestone", "mr", "opentofu", "release", "repo",
+    "schedule", "securefile", "snippet", "ssh-key", "stack", "token", "user",
+    "variable", "version", "work-items"))
+# Where an HTTP client takes its destination (or its whole config) from a
+# file or stdin rather than argv: (long options, short letters) per client.
+# The destination is then unreadable, so the request stands.
+_JUDGE_HTTP_FROM_FILE = {
+    "curl": (("config",), "K"), "curlie": (("config",), "K"),
+    "wget": (("input-file", "execute", "config"), "ie"),
+    "aria2c": (("input-file", "conf-path"), "i"),
+}
 _JUDGE_GH_PAIRS = {
     ("pr", "merge"): "merging a PR/MR", ("mr", "merge"): "merging a PR/MR",
     ("repo", "sync"): "a gh repo/release/workflow change",
@@ -11727,7 +11764,27 @@ def _judge_opt_hits(token, longs, shorts):
     return token.startswith("-") and len(token) > 1 and any(c in shorts for c in token[1:])
 
 
-def _judge_git_reason(guard, tokens):
+def _judge_git_ref_rewrite(sub, rest):
+    """`git <sub> <rest>` rewrites a LOCAL ref outside `branch`/`tag`: a
+    forced branch create/reset (`checkout -B`, `switch -C`, `worktree add -B`),
+    a fetch/pull refspec naming a destination or forcing (`+src`, `src:dst`),
+    or `replace`. Every push already stands; these only move local refs."""
+    if sub == "replace":
+        return True
+    if sub == "checkout" or (sub == "worktree" and "add" in rest):
+        return any(_judge_opt_hits(t, (), "B") for t in rest)
+    if sub == "switch":
+        return any(_judge_opt_hits(t, ("force-create",), "C") for t in rest)
+    if sub in ("fetch", "pull"):
+        for t in rest:
+            if t.startswith("-") or "://" in t or re.match(r"[^:/\s]+@[^:/\s]+:", t):
+                continue
+            if t.startswith("+") or ":" in t:
+                return True
+    return False
+
+
+def _judge_git_reason(guard, tokens, known=_JUDGE_GIT_KNOWN):
     lowered = [t.lower() for t in tokens[1:]]
     if any(t in _JUDGE_GIT_PUSHES for t in lowered):
         return "a git push"
@@ -11741,7 +11798,7 @@ def _judge_git_reason(guard, tokens):
     sub = args[0].lower()
     if _JUDGE_OPAQUE_RE.search(sub):
         return "a git command the judge cannot read"
-    if sub not in _JUDGE_GIT_KNOWN:
+    if sub not in known:
         return "a git command the judge does not know (an alias?)"
     opaque = any(_JUDGE_OPAQUE_RE.search(t) for t in args[1:])
     if sub == "branch":
@@ -11753,6 +11810,9 @@ def _judge_git_reason(guard, tokens):
             return "deleting or forcing a tag"
     if sub == "config" and opaque:
         return "a git config the judge cannot read"
+    if _judge_git_ref_rewrite(sub, args[1:]) \
+            or (opaque and sub in ("checkout", "switch", "worktree", "fetch", "pull")):
+        return "a git ref rewrite"
     return None
 
 
@@ -11760,6 +11820,9 @@ def _judge_gh_reason(prog, rest):
     pos = [t.lower() for t in rest if not t.startswith("-")]
     if any(_JUDGE_OPAQUE_RE.search(p) for p in pos[:2]):
         return f"a {prog} command the judge cannot read"
+    known = {"gh": _JUDGE_GH_KNOWN, "glab": _JUDGE_GLAB_KNOWN}.get(prog)
+    if known is not None and pos and pos[0] not in known:
+        return f"a {prog} command the judge does not know (an alias or extension?)"
     for pair in zip(pos, pos[1:]):
         if pair in _JUDGE_GH_PAIRS:
             return _JUDGE_GH_PAIRS[pair]
@@ -11780,6 +11843,27 @@ def _judge_gh_reason(prog, rest):
     return None
 
 
+def _judge_http_reason(prog, rest):
+    """An HTTP client's request stands when it reaches GitHub, or when the
+    judge cannot read where it goes: a destination or config from a file or
+    stdin (`curl -K`, `wget -i`, `--url @file`), or no argument that could be
+    a destination at all (a `.curlrc`/`.wgetrc` supplies it)."""
+    if any("github.com" in t.lower() or _JUDGE_OPAQUE_RE.search(t) for t in rest):
+        return "a request to github.com"
+    longs, shorts = _JUDGE_HTTP_FROM_FILE.get(prog, ((), ""))
+    for i, t in enumerate(rest):
+        if (longs or shorts) and _judge_opt_hits(t, longs, shorts):
+            return "an HTTP request whose destination comes from a file"
+        low = t.lower()
+        if low.startswith("--url=@") or (low == "--url" and i + 1 < len(rest)
+                                          and rest[i + 1].startswith("@")):
+            return "an HTTP request whose destination comes from a file"
+    if not any(not t.startswith("-") and (re.search(r"[./:]", t) or "localhost" in t.lower())
+               for t in rest):
+        return "an HTTP request whose destination the judge cannot read"
+    return None
+
+
 def _judge_family_reason(guard, tokens):
     """Why one unwrapped command (`tokens`, after guard.py's prefix strip)
     is on the never-list by its FAMILY, or None."""
@@ -11788,19 +11872,14 @@ def _judge_family_reason(guard, tokens):
     prog = _judge_prog(tokens[0])
     rest = tokens[1:]
     if prog in ("git", "hub"):
-        reason = _judge_git_reason(guard, tokens) if prog == "git" else None
-        if prog == "hub":
-            lowered = [t.lower() for t in rest]
-            if any(t in _JUDGE_GIT_PUSHES | _JUDGE_GIT_REF_WRITERS for t in lowered):
-                reason = "a git push"
+        reason = _judge_git_reason(guard, tokens,
+                                   _JUDGE_GIT_KNOWN if prog == "git" else _JUDGE_HUB_KNOWN)
         if reason:
             return reason
     if prog in ("gh", "glab", "hub", "az"):
         return _judge_gh_reason(prog, rest)
     if prog in _JUDGE_HTTP_HEADS:
-        if any("github.com" in t.lower() or _JUDGE_OPAQUE_RE.search(t) for t in rest):
-            return "a request to github.com"
-        return None
+        return _judge_http_reason(prog, rest)
     for progs, verbs, label in _JUDGE_FAMILY_VERBS:
         if prog in progs:
             pos = [t.lower() for t in rest if not t.startswith("-")]
@@ -11949,6 +12028,131 @@ def _write_json_replace(path, data):
         except OSError:
             pass
         return False
+
+
+# fd-relative directory ops: where the platform has them (not Windows), a
+# directory is OPENED once without following a symlink at it and every entry
+# op is relative to that fd — so swapping a path component for a symlink
+# between a check and a use redirects nothing.
+_FD_DIR_OPS = (hasattr(os, "O_DIRECTORY") and hasattr(os, "O_NOFOLLOW")
+               and all(f in os.supports_dir_fd
+                       for f in (os.open, os.stat, os.unlink, os.rmdir, os.mkdir, os.rename))
+               and os.stat in os.supports_follow_symlinks
+               and os.listdir in os.supports_fd)
+
+
+def _is_real_dir(st):
+    """A directory that is not a symlink, junction or other reparse point."""
+    return stat.S_ISDIR(st.st_mode) and not (
+        getattr(st, "st_file_attributes", 0) & getattr(stat, "FILE_ATTRIBUTE_REPARSE_POINT", 0x400))
+
+
+class _RealDir:
+    """A directory a SESSION can tamper with (same uid), handled so a symlink
+    planted at it — or at an entry in it — is never followed: `open` refuses
+    anything that is not a real directory, entry ops act on the entry itself
+    (an unlink removes a link, never its target), and nothing here recurses.
+    fd-relative where `_FD_DIR_OPS`; elsewhere each op re-lstats its path."""
+
+    def __init__(self, path, fd):
+        self.path, self.fd = path, fd
+
+    @classmethod
+    def open(cls, path, create=False, dir_fd=None, drop_link=False):
+        """The real directory at `path` (`dir_fd`-relative when given), made
+        first when `create` (0700; inheriting on Windows, where the session
+        reading it is another identity — `UPLOAD_DIR_MODE`); None when absent
+        or not a real directory — a link or file there is unlinked (the entry
+        only) when `drop_link`."""
+        kw = {"dir_fd": dir_fd} if dir_fd is not None else {}
+        if create:
+            try:
+                os.mkdir(path, UPLOAD_DIR_MODE, **kw)   # never follows a link at `path`
+            except FileExistsError:
+                pass
+            except OSError:
+                return None
+        try:
+            st = os.stat(path, follow_symlinks=False, **kw)
+        except OSError:
+            return None
+        if not _is_real_dir(st):
+            log(f"permission judge: {path} is not a real directory; not followed")
+            if drop_link:
+                try:
+                    os.unlink(path, **kw)
+                except OSError:
+                    pass
+            return None
+        if not _FD_DIR_OPS:
+            return cls(path, None)
+        try:
+            fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, **kw)
+        except OSError:
+            return None
+        return cls(path, fd)
+
+    def close(self):
+        if self.fd is not None:
+            try:
+                os.close(self.fd)
+            except OSError:
+                pass
+            self.fd = None
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *_exc):
+        self.close()
+
+    def _at(self, name):
+        if self.fd is not None:
+            return name, {"dir_fd": self.fd}
+        return os.path.join(self.path, name), {}
+
+    def names(self):
+        return os.listdir(self.fd if self.fd is not None else self.path)
+
+    def lstat(self, name):
+        p, kw = self._at(name)
+        return os.stat(p, follow_symlinks=False, **kw)
+
+    def unlink(self, name):
+        p, kw = self._at(name)
+        os.unlink(p, **kw)
+
+    def rmdir(self, name):
+        p, kw = self._at(name)
+        os.rmdir(p, **kw)
+
+    def sub(self, name, create=False, drop_link=False):
+        if self.fd is not None:
+            return _RealDir.open(name, create, dir_fd=self.fd, drop_link=drop_link)
+        return _RealDir.open(os.path.join(self.path, name), create, drop_link=drop_link)
+
+    def write_json(self, name, data):
+        """`_write_json_replace` inside this directory. True when it landed."""
+        tmp = f"{name}.tmp.{secrets.token_hex(8)}"
+        tp, kw = self._at(tmp)
+        dp, _ = self._at(name)
+        try:
+            fd = os.open(tp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                         | getattr(os, "O_NOFOLLOW", 0), 0o600, **kw)
+            with os.fdopen(fd, "wb") as fh:
+                fh.write(json.dumps(data, ensure_ascii=False).encode("utf-8"))
+            if self.fd is not None:
+                os.replace(tp, dp, src_dir_fd=self.fd, dst_dir_fd=self.fd)
+            else:
+                os.replace(tp, dp)
+            return True
+        except Exception as e:      # noqa: BLE001
+            log(f"permission judge: could not write {os.path.join(self.path, name)}: {e}")
+            try:
+                os.unlink(tp, **kw)
+            except OSError:
+                pass
+            return False
 
 
 # The dialog's own QUESTION line is the TUI's wording; the detail above it is the
@@ -18451,6 +18655,11 @@ class SessionManager:
         self._judge_lock = threading.Lock()
         self._judge_alive_at = None
         self._judge_swept_at = None
+        # Request file -> when THIS worker first saw it (the pick order: a
+        # file's mtime is the session's to set), and sid -> recent model-call
+        # times (JUDGE_CALLS_PER_SID_MIN). Both the judge worker's alone.
+        self._judge_seen = {}
+        self._judge_calls = {}
         # (sid, nonce) -> when the judge ALLOWED it. Written by the judge
         # worker, read by the beat's hook-row fold; `_judge_allowed_lock` is
         # held across each side's check-or-record AND its ledger emit, so a
@@ -30544,7 +30753,7 @@ class SessionManager:
             names = os.listdir(PERMISSIONS_DIR)
         except OSError:
             names = []
-        for name in self._judge_pick(names):
+        for name in self._judge_pick(names, start):
             # A pass of model calls outlives the hook's freshness window
             # (permlog JUDGE_ALIVE_MAX_AGE_SEC), so re-mark before each request
             # (throttled) — else a prompt arriving mid-pass skips the judge.
@@ -30555,22 +30764,17 @@ class SessionManager:
             self._judge_swept_at = start
             self._judge_sweep(start)
 
-    @staticmethod
-    def _judge_pick(names):
-        """The request files this pass answers: oldest first (by mtime, then
-        name), at most JUDGE_REQS_PER_SID per session and JUDGE_REQS_PER_PASS
-        in all — so one session that plants many cannot starve the rest."""
-        found = []
-        for name in names:
-            if not name.endswith(JUDGE_REQ_SUFFIX):
-                continue
-            try:
-                mtime = os.lstat(os.path.join(PERMISSIONS_DIR, name)).st_mtime
-            except OSError:
-                continue
-            found.append((mtime, name))
+    def _judge_pick(self, names, now):
+        """The request files this pass answers: oldest first by when THIS
+        worker first saw each (then name) — never the file's mtime, which the
+        writing session controls (`touch -d`) — at most JUDGE_REQS_PER_SID per
+        session and JUDGE_REQS_PER_PASS in all, so one session that plants
+        many cannot starve the rest."""
+        reqs = [n for n in names if n.endswith(JUDGE_REQ_SUFFIX)]
+        seen = {n: self._judge_seen.get(n, now) for n in reqs}
+        self._judge_seen = seen           # forget files that are gone
         picked, per_sid = [], {}
-        for _mtime, name in sorted(found):
+        for name in sorted(reqs, key=lambda n: (seen[n], n)):
             sid = name[:-len(JUDGE_REQ_SUFFIX)].rpartition(".")[0]
             if per_sid.get(sid, 0) >= JUDGE_REQS_PER_SID:
                 continue
@@ -30579,6 +30783,19 @@ class SessionManager:
             if len(picked) >= JUDGE_REQS_PER_PASS:
                 break
         return picked
+
+    def _judge_call_allowed(self, sid, now):
+        """Record one model call for `sid` if it is under
+        JUDGE_CALLS_PER_SID_MIN in the last minute; False (record nothing)
+        when it is not. Bounded: sids with no recent call are dropped."""
+        calls = {k: [t for t in v if now - t < 60] for k, v in self._judge_calls.items()}
+        calls = {k: v for k, v in calls.items() if v}
+        mine = calls.setdefault(sid, [])
+        ok = len(mine) < JUDGE_CALLS_PER_SID_MIN
+        if ok:
+            mine.append(now)
+        self._judge_calls = {k: v for k, v in calls.items() if v}
+        return ok
 
     def _judge_mark_alive(self, on, now):
         """The marker hooks/permlog.py checks before it waits: present (and
@@ -30645,7 +30862,7 @@ class SessionManager:
         else:
             verdict, reason = self._judge(command, cwd[:1024], deny[:PERMISSION_TEXT_MAX],
                                           event, policy,
-                                          answer_by=ts / 1000 + JUDGE_ANSWER_BY_SEC)
+                                          answer_by=ts / 1000 + JUDGE_ANSWER_BY_SEC, sid=sid)
             if not pinned:          # the model calls took time: stamp what follows fresh
                 now = time.time()
                 now_ms = int(now * 1000)
@@ -30670,7 +30887,7 @@ class SessionManager:
                        "deny" if event == "PermissionDenied" else "unknown"),
             "verdict": verdict, "judgeReason": reason})
 
-    def _judge(self, command, cwd, deny_reason, event, policy, answer_by=None):
+    def _judge(self, command, cwd, deny_reason, event, policy, answer_by=None, sid=None):
         """`(verdict, reason)`: the never-list first, then — only with a policy
         — the model, JUDGE_ATTEMPTS times at most. Anything short of a strict,
         parseable answer stands. No model call starts that could end past
@@ -30685,6 +30902,8 @@ class SessionManager:
         for _attempt in range(JUDGE_ATTEMPTS):
             if answer_by is not None and time.time() + JUDGE_TIMEOUT_SEC > answer_by:
                 return "stand", "no time left to judge before the prompt moved on"
+            if sid is not None and not self._judge_call_allowed(sid, time.time()):
+                return "stand", "too many judgements for this session in the last minute"
             # One request's attempts can outlast the marker's freshness too.
             self._judge_mark_alive(bool(self.permission_policy), time.time())
             parsed = parse_judge_verdict(self._run_judge_model(prompt))
@@ -30746,19 +30965,27 @@ class SessionManager:
 
     def _write_grant(self, sid, command, reason, now):
         """The one-shot grant hooks/guard.py consumes on the retried call:
-        `GRANTS_DIR/<sid>/<sha256(command)>` = {key, sid, exp, reason}. A
-        session-planted symlink at the session dir is refused, not followed."""
-        sdir = os.path.join(GRANTS_DIR, sid)
+        `GRANTS_DIR/<sid>/<sha256(command)>` = {key, sid, exp, reason}. Every
+        level is opened through `_RealDir`: a session-planted symlink at
+        GRANTS_DIR or at the session dir is refused (and unlinked), never
+        followed — the write lands inside our own real directories or nowhere."""
         try:
-            os.makedirs(sdir, mode=0o700, exist_ok=True)
-            if not stat.S_ISDIR(os.lstat(sdir).st_mode):
-                return False
-        except OSError as e:
-            log(f"permission judge: grant dir unusable: {e}")
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+        except OSError:
+            pass
+        root = _RealDir.open(GRANTS_DIR, create=True, drop_link=True)
+        if root is None:
+            log("permission judge: grant dir unusable; the approval stands")
             return False
-        key = judge_grant_key(command)
-        return _write_json_replace(os.path.join(sdir, key), {
-            "key": key, "sid": sid, "exp": now + JUDGE_GRANT_TTL_SEC, "reason": reason})
+        with root:
+            sdir = root.sub(sid, create=True, drop_link=True)
+            if sdir is None:
+                return False
+            with sdir:
+                key = judge_grant_key(command)
+                return sdir.write_json(key, {
+                    "key": key, "sid": sid, "exp": now + JUDGE_GRANT_TTL_SEC,
+                    "reason": reason})
 
     def _write_judge_answer(self, sid, nonce, verdict):
         return _write_json_replace(os.path.join(PERMISSIONS_DIR, f"{sid}.{nonce}{JUDGE_ANS_SUFFIX}"),
@@ -30766,46 +30993,67 @@ class SessionManager:
 
     def _judge_sweep(self, now):
         """Remove expired grants (and the dirs of sessions no longer running)
-        and req/ans files a dead hook left behind. Best-effort, on the worker."""
+        and req/ans files a dead hook left behind. Best-effort, on the worker.
+
+        Both dirs are SESSION-writable (same uid), so the sweep never follows
+        a link: `_RealDir` refuses a symlink at GRANTS_DIR (unlinking the
+        link itself) or at PERMISSIONS_DIR, every removal is an `unlink` of a
+        NAMED entry inside a real directory (never its target), only names
+        the judge writes are touched, and nothing recurses — no rmtree."""
         running = {s.get("id") for s in list(self.registry) if s.get("status") == "running"}
-        try:
-            sids = os.listdir(GRANTS_DIR)
-        except OSError:
-            sids = []
-        for sid in sids:
-            sdir = os.path.join(GRANTS_DIR, sid)
+        root = _RealDir.open(GRANTS_DIR, drop_link=True)
+        if root is not None:
+            with root:
+                self._judge_sweep_grants(root, now, running)
+        perms = _RealDir.open(PERMISSIONS_DIR)
+        if perms is None:
+            return
+        with perms:
             try:
-                if not stat.S_ISDIR(os.lstat(sdir).st_mode):
-                    os.remove(sdir)
-                    continue
-                left = 0
-                for name in os.listdir(sdir):
-                    p = os.path.join(sdir, name)
-                    st = os.lstat(p)
-                    if sid not in running or now - st.st_mtime > JUDGE_GRANT_TTL_SEC \
-                            or not stat.S_ISREG(st.st_mode):
-                        if stat.S_ISDIR(st.st_mode):
-                            shutil.rmtree(p, ignore_errors=True)
-                        else:
-                            os.remove(p)
-                    else:
-                        left += 1
-                if not left and sid not in running:
-                    os.rmdir(sdir)
+                names = perms.names()
             except OSError:
-                pass
+                return
+            for name in names:
+                # req/ans files and both writers' tmps; never a session's .jsonl.
+                if ".judge." not in name and not name.startswith(JUDGE_ALIVE_FILE + ".tmp."):
+                    continue
+                try:
+                    st = perms.lstat(name)
+                    if not stat.S_ISDIR(st.st_mode) and now - st.st_mtime > JUDGE_LEFTOVER_SEC:
+                        perms.unlink(name)
+                except OSError:
+                    pass
+
+    @staticmethod
+    def _judge_sweep_grants(root, now, running):
         try:
-            names = os.listdir(PERMISSIONS_DIR)
+            sids = root.names()
         except OSError:
             return
-        for name in names:
-            # req/ans files and both writers' tmps; never a session's .jsonl.
-            if ".judge." not in name and not name.startswith(JUDGE_ALIVE_FILE + ".tmp."):
-                continue
-            p = os.path.join(PERMISSIONS_DIR, name)
+        for sid in sids:
             try:
-                if now - os.lstat(p).st_mtime > JUDGE_LEFTOVER_SEC:
-                    os.remove(p)
+                st = root.lstat(sid)
+                if not _is_real_dir(st):
+                    if not stat.S_ISDIR(st.st_mode):
+                        root.unlink(sid)          # a file or link: the entry only
+                    continue
+                if not VALID_PERMISSION_SID_RE.fullmatch(sid):
+                    continue                      # not a dir the judge made
+                sdir = root.sub(sid)
+                if sdir is None:
+                    continue
+                with sdir:
+                    for name in sdir.names():
+                        if not _JUDGE_GRANT_FILE_RE.fullmatch(name):
+                            continue
+                        est = sdir.lstat(name)
+                        if stat.S_ISDIR(est.st_mode):
+                            continue              # never recurse
+                        if sid not in running or now - est.st_mtime > JUDGE_GRANT_TTL_SEC \
+                                or not stat.S_ISREG(est.st_mode):
+                            sdir.unlink(name)
+                if sid not in running:
+                    root.rmdir(sid)               # fails harmlessly unless empty
             except OSError:
                 pass
 
