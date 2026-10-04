@@ -1908,7 +1908,9 @@ class TestExpansionBudget(unittest.TestCase):
         ):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:80])
-            self.assertLess(time.monotonic() - t, 5, cmd[:80])
+            # xargs re-expands each argv (XERK-1539) until the budget is
+            # spent: ~2.5s idle, so leave a shared CI runner headroom.
+            self.assertLess(time.monotonic() - t, 10, cmd[:80])
 
     def test_ordinary_find_exec_and_xargs_stay_allowed(self):
         for cmd in (
