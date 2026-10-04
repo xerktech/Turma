@@ -3622,6 +3622,82 @@ test("XERK-1564: a session's wake request is coerced by name, absent = none", ()
   assert.equal("wakeReason" in none, false);
 });
 
+test("XERK-1569: ticket.outcome is coerced by name on every ticket channel", () => {
+  const rec = (outcome) => {
+    const r = {
+      device: "xerk1569-outcome",
+      sessions: [{ id: "s", ticket: { key: "P-1", outcome } }],
+      closedSessions: [{ id: "c", ticket: { key: "P-1", outcome } }],
+      repos: [{ name: "R", resumable: [{ transcriptId: "t", ticket: { key: "P-1", outcome } }] }],
+    };
+    hub.normalizeRecord(r);
+    return [r.sessions[0].ticket, r.closedSessions[0].ticket, r.repos[0].resumable[0].ticket];
+  };
+  // A well-formed outcome rides through on all three, stray keys dropped.
+  for (const kind of ["done", "not-reproducible", "already-fixed"]) {
+    for (const t of rec({ kind, at: 1_786_400_000_000, extra: { x: 1 } })) {
+      assert.deepEqual(t.outcome, { kind, at: 1_786_400_000_000 });
+      assert.equal(t.key, "P-1");   // the rest of the ticket is untouched
+    }
+  }
+  // Junk DELETES the key (absent = not closed by its session), never repairs it.
+  for (const bad of [
+    "done", 5, [], null, {}, { kind: "wontfix", at: 1 }, { kind: "done" },
+    { kind: "done", at: "soon" }, { kind: "done", at: 1.5 }, { kind: "done", at: Infinity },
+    { kind: 7, at: 1 },
+  ]) {
+    for (const t of rec(bad)) {
+      assert.equal("outcome" in t, false, `outcome ${JSON.stringify(bad)} kept`);
+    }
+  }
+  // The evidence note rides as a bounded string; a bad note is dropped ALONE
+  // (absent = no note, never invented) and never costs the outcome.
+  for (const t of rec({ kind: "done", at: 1, note: "ran repro.sh: passes" })) {
+    assert.deepEqual(t.outcome, { kind: "done", at: 1, note: "ran repro.sh: passes" });
+  }
+  for (const bad of [5, "", null, ["x"], { x: 1 }, true]) {
+    for (const t of rec({ kind: "done", at: 1, note: bad })) {
+      assert.deepEqual(t.outcome, { kind: "done", at: 1 }, `note ${JSON.stringify(bad)} kept`);
+    }
+  }
+  // Over the agent's 2000 cap it is cut at a code point, never mid-surrogate.
+  const long = "😀".repeat(2500);
+  for (const t of rec({ kind: "done", at: 1, note: long })) {
+    assert.equal(Array.from(t.outcome.note).length, 2000);
+    assert.equal(t.outcome.note, "😀".repeat(2000));
+  }
+});
+
+test("XERK-1569: ticketOutcomeResults are consumed by the ingest, never kept on the record", async () => {
+  const body = {
+    device: "xerk1569-results",
+    ticketOutcomeResults: [
+      { sessionId: "s", key: "P-1", kind: "not-reproducible", ok: true, error: null,
+        final: true, status: "Done", at: 1 },
+      { sessionId: "s", key: "P-2", kind: "done", ok: false, error: "boom\nforged line",
+        final: false, status: null, at: 2 },
+      "junk",
+    ],
+  };
+  const logs = [];
+  const orig = console.log;
+  console.log = (...a) => { logs.push(a.join(" ")); };
+  let r;
+  try {
+    r = await request("POST", "/api/heartbeat", { body, headers: agentHeaders });
+  } finally {
+    console.log = orig;
+  }
+  assert.equal(r.status, 200);
+  const rec = (await request("GET", "/api/agents", { headers: userHeaders }))
+    .body.agents.find((a) => a.key === "xerk1569-results");
+  assert.equal("ticketOutcomeResults" in rec, false);
+  assert.ok(logs.some((l) => l.includes("closed ticket \"P-1\"") && l.includes("not-reproducible")));
+  const failed = logs.find((l) => l.includes("\"P-2\""));
+  assert.match(failed, /FAILED \(will retry\)/);
+  assert.equal(failed.includes("\n"), false, "an agent string must not forge a log line");
+});
+
 test("XERK-455: typed /api/agents fields are coerced at ingest, not served raw", async () => {
   // A field is decode-fatal on Android the moment a client TYPES it: /api/agents
   // decodes atomically, so one host beating a wrong-typed value throws the whole
@@ -8528,6 +8604,7 @@ const asBeat = async (device, site, {
   ticketLinkResults,
   jiraSource,
   ackedCommands,
+  closeTicket,
 } = {}) => {
   const r = await request("POST", "/api/heartbeat", {
     body: {
@@ -8535,6 +8612,7 @@ const asBeat = async (device, site, {
       repos: repos.map((name) => ({ name, path: `/git/${name}` })),
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
+      ...(closeTicket !== undefined ? { closeTicket } : {}),
       jira: { available: true, configured: true, siteKey: site,
               user: user || `${device}@x.com`, fetchedAt, tickets,
               ...(jiraSource ? { source: jiraSource } : {}) },
@@ -12299,18 +12377,23 @@ const resetMerge = () => {
 const mergeBeat = async (device, site, {
   autoMerge = true, ready = "ready", state = "OPEN", mergeable = "MERGEABLE",
   paneBusy = false, ticketType = "bug", issueType = "Bug", statusCategory = "inprogress",
-  question, prs, tickets, url = PR1,
+  question, prs, tickets, url = PR1, agentType,
+  // A current agent reports it reads close-ticket requests (XERK-1569); pass
+  // null to beat as an agent that predates the reader.
+  closeTicket = { available: true },
 } = {}) => {
   // `issueType` is the TRACKER Issue Type (`type`); `ticketType` is the triage
   // classifier's assessment (`triage.type`) — kept distinct so a test can drive
   // them apart.
   const r = await asBeat(device, site, {
     autoStart: false,
+    ...(closeTicket ? { closeTicket } : {}),
     tickets: tickets || [{ key: "ENG-9", summary: "A bug", statusCategory,
       type: issueType,
       repoGuess: { repo: "Turma", cloned: true },
       triage: { priority: "P2", type: ticketType, actionable: true } }],
     sessions: [{ id: "sm1", status: "running",
+      ...(agentType ? { agentType } : {}),
       ticket: { key: "ENG-9", siteKey: site },
       prs: prs || [{ url, state, ready, mergeable }],
       session: { transcriptAgeSec: 30, paneBusy,
@@ -13052,6 +13135,7 @@ test("XERK-705/637: an armed run's child is MESSAGED to self-close on a merged P
   resetEpicD();
   const url = "https://github.com/ep/c1/pull/1";
   await asBeat("edC", "d637-2.atlassian.net", { autoStart: false,
+    closeTicket: { available: true },
     tickets: [dEpic(), dChild("C-1", [], "inprogress")],
     sessions: [dChildSession("s-c1", "C-1", "d637-2.atlassian.net", "MERGED", url)] });
   armEpicRun("d637-2.atlassian.net", "E-1");
@@ -13064,6 +13148,7 @@ test("XERK-705/637: an armed run's child is MESSAGED to self-close on a merged P
   const msgs = inputTo("edC", "s-c1");
   assert.equal(msgs.length, 1, `expected one message to the child, got ${JSON.stringify(got)}`);
   assert.match(msgs[0], /mark the ticket as Done/i);
+  assert.match(msgs[0], /close-ticket done --note/);
 });
 
 test("XERK-637: an epic child with NO armed run stays excluded, even in an auto-merge org", async () => {
@@ -14327,6 +14412,7 @@ test("XERK-705: a merged PR MESSAGES the org-stream session — no Done write, n
   assert.equal(msgs.length, 1, `expected one input message, got ${JSON.stringify(got)}`);
   assert.match(msgs[0], /merged/i);
   assert.match(msgs[0], /mark the ticket as Done/i);
+  assert.match(msgs[0], /close-ticket done --note/);
   assert.equal((agents.amC.commands || []).find((c) => c.type === "input").sessionId, "sm1");
 });
 
@@ -14371,6 +14457,57 @@ test("auto-close: the merged message asks the session to verify the DEPLOY befor
   assert.match(msg, /NOT deployed or NOT working, keep working/i);
   assert.match(msg, /branch fresh from the updated default branch/i);
   assert.match(msg, /IS deployed and working .* mark the ticket as Done/i);
+  // XERK-1569: it names the session CLI first, the host's tracker tool second.
+  assert.ok(msg.includes('python3 -SsE "$TURMA_SESSION_CLI" close-ticket done --note'),
+    "names the session CLI's close-ticket");
+  assert.match(msg, /else the tracker CLI\/MCP this host gives you/);
+});
+
+test("XERK-1569: a dsh/qwen session is told to close with its tracker tool, never the session CLI", async () => {
+  // dsh/qwen sessions are not given $TURMA_SESSION_CLI, so naming it would hand
+  // them a command that cannot run.
+  hub.__setDshEnabled(true);
+  hub.__setQwenEnabled(true);
+  for (const agentType of ["dsh", "qwen"]) {
+    resetMerge();
+    const dev = "amRt" + agentType;
+    await mergeBeat(dev, `amrt${agentType}.atlassian.net`, { state: "MERGED", agentType });
+    autoCloseSweep();
+    const [msg] = inputTexts(dev);
+    assert.ok(msg, `${agentType}: the session is still messaged`);
+    assert.match(msg, /mark the ticket as Done/i);
+    assert.ok(!msg.includes("TURMA_SESSION_CLI"), `${agentType}: no session CLI, got ${msg}`);
+    assert.match(msg, /close it with the tracker CLI\/MCP this host gives you/);
+  }
+});
+
+test("XERK-1569: a host that does not report the close-ticket reader is told the tracker tool", async () => {
+  // The hub deploys on merge but agents self-update later: an agent with the
+  // session CLI but no reader would accept the request and never act on it.
+  for (const closeTicket of [null, { available: false }, { available: "yes" }, "junk"]) {
+    resetMerge();
+    const dev = "amCt" + JSON.stringify(closeTicket).replace(/\W/g, "");
+    await mergeBeat(dev, `${dev.toLowerCase()}.atlassian.net`, { state: "MERGED", closeTicket });
+    autoCloseSweep();
+    const [msg] = inputTexts(dev);
+    assert.ok(msg, `${JSON.stringify(closeTicket)}: the session is still messaged`);
+    assert.match(msg, /mark the ticket as Done/i);
+    assert.ok(!msg.includes("TURMA_SESSION_CLI"),
+      `${JSON.stringify(closeTicket)}: no session CLI, got ${msg}`);
+    assert.match(msg, /close it with the tracker CLI\/MCP this host gives you/);
+  }
+});
+
+test("XERK-1569: normalizeCloseTicket keeps a strict boolean, nulls junk, leaves absent absent", () => {
+  const n = (v) => { const p = v === undefined ? {} : { closeTicket: v }; hub.normalizeCloseTicket(p); return p; };
+  assert.deepEqual(n({ available: true }), { closeTicket: { available: true } });
+  assert.deepEqual(n({ available: "yes", extra: 1 }), { closeTicket: { available: false } });
+  assert.deepEqual(n("junk"), { closeTicket: null });
+  assert.deepEqual(n([true]), { closeTicket: null });
+  assert.deepEqual(n(undefined), {});
+  assert.ok(!hub.autoCloseMergedMessage([], undefined, false).includes("TURMA_SESSION_CLI"));
+  assert.ok(hub.autoCloseMergedMessage([], undefined, true).includes("TURMA_SESSION_CLI"));
+  assert.ok(!hub.autoCloseMergedMessage([], "dsh", true).includes("TURMA_SESSION_CLI"));
 });
 
 test("auto-close: only a bounded, URL-shaped PR url reaches the message; odd urls never re-nag", async () => {
