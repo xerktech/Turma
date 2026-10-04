@@ -7,7 +7,7 @@ import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.HISTORY_MIN_QUERY
 import com.xerktech.turma.model.ArchiveTranscript
 import com.xerktech.turma.model.SearchGroup
-import com.xerktech.turma.net.archiveRefusalMessage
+import com.xerktech.turma.net.archiveMissingMessage
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -80,9 +80,9 @@ class ArchiveViewModel(app: Application) : AndroidViewModel(app) {
         viewModelScope.launch {
             val res = runCatching { container.client.api.archiveTranscript(transcriptId) }
             val t = res.getOrNull()
-            // A 404 that says WHY is the difference between "it syncs within a
-            // few minutes" and a push the hub refused, which never syncs at all.
-            val refusal = if (t == null) res.exceptionOrNull()?.let(::archiveRefusalMessage) else null
+            // Anything but the plain 404 is a reason "it syncs within a few
+            // minutes" is untrue: a refused push, closed ingest, a failed load.
+            val refusal = if (t == null) res.exceptionOrNull()?.let { archiveMissingMessage(it) } else null
             _state.update {
                 it.copy(
                     open = t,

@@ -18,6 +18,8 @@ import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 import retrofit2.HttpException
 import retrofit2.Response
 import retrofit2.http.Body
@@ -506,31 +508,61 @@ data class ArchiveRefusal(
     val error: String = "",
 )
 
-/** The 404 body `GET /api/archive/<id>` answers with when it knows why. */
+/** When the hub closed archive ingest (XERK-1283), epoch ms on its clock. */
 @Serializable
-private data class ArchiveMissing(
-    val error: String = "",
-    val refused: ArchiveRefusal? = null,
-)
+data class ArchiveIngestClosed(val since: Double = 0.0)
 
 /**
- * Why an archived transcript is missing, in the hub's own words, when its 404
- * carries them (XERK-356) — else null, meaning the ordinary "not here yet".
+ * Why an archived transcript could not be shown, in the hub's own words when it
+ * gave any — else null, meaning the ordinary 404 "not here yet", the one case
+ * where "it syncs within a few minutes" is the right thing to tell the operator.
  *
- * The distinction is the point: a refused push never arrives, so the reassuring
- * "it syncs within a few minutes" the ended view falls back to is a promise that
- * will not be kept, and the operator would go on waiting for it. Web twin:
- * `archiveRefusalNote` in sessions.html.
+ * Every other case is a promise nothing will keep, so it is said instead:
+ * - a REFUSED push never arrives (XERK-356);
+ * - while the hub holds archive ingest closed, no push lands (XERK-1283 — an HA
+ *   hydrate once held it shut for three days);
+ * - a non-404 or no answer at all is a failed LOAD, not "not synced yet",
+ *   worded like every other hub refusal (XERK-264).
+ * Web twin: `archiveMissingNote` in sessions.html.
  */
-fun archiveRefusalMessage(e: Throwable): String? {
-    val resp = (e as? HttpException)?.response() ?: return null
-    if (resp.code() != 404) return null
+fun archiveMissingMessage(e: Throwable, nowMs: Long = System.currentTimeMillis()): String? {
+    val resp = (e as? HttpException)?.response()
+        ?: return "Couldn\u2019t load this conversation from the hub."
+    if (resp.code() != 404) return "Couldn\u2019t load this conversation \u2014 ${hubErrorMessage(resp)}."
     val body = runCatching { resp.errorBody()?.string() }.getOrNull().orEmpty()
-    val r = runCatching { TurmaJson.decodeFromString<ArchiveMissing>(body).refused }.getOrNull()
-        ?: return null
-    if (r.error.isBlank()) return null
-    return "${r.host.ifBlank { "The agent" }}\u2019s last push of this conversation " +
-        "to the archive was refused: ${r.error}."
+    // Each reason decodes on its own, so a malformed one can't take the other
+    // down with it and fall back to the few-minutes promise.
+    val obj = runCatching { TurmaJson.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
+    val r = obj["refused"]?.let {
+        runCatching { TurmaJson.decodeFromJsonElement<ArchiveRefusal>(it) }.getOrNull()
+    }
+    val c = obj["ingestClosed"]?.let {
+        runCatching { TurmaJson.decodeFromJsonElement<ArchiveIngestClosed>(it) }.getOrNull()
+    }
+    val refused = r?.takeIf { it.error.isNotBlank() }?.let {
+        "${it.host.ifBlank { "The agent" }}\u2019s last push of this conversation " +
+            "to the archive was refused: ${it.error}."
+    }
+    // Same range as the web twin: a real epoch-ms stamp a date can print.
+    val closed = c?.since?.takeIf { it > 0 && it < 8.64e15 }?.toLong()?.let { since ->
+        val at = java.text.DateFormat.getDateTimeInstance(
+            java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT,
+        ).format(java.util.Date(since))
+        "The hub has not been accepting archive pushes since $at (${agoText(nowMs - since)}), " +
+            "so this conversation can\u2019t reach the archive until it does."
+    }
+    return listOfNotNull(refused, closed).joinToString(" ").ifEmpty { null }
+}
+
+/** sessions.html `ago`, so both clients word an elapsed time alike. */
+private fun agoText(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    return when {
+        s < 60 -> "${s}s ago"
+        s < 3600 -> "${s / 60}m ago"
+        s < 86400 -> "${s / 3600}h ${(s % 3600) / 60}m ago"
+        else -> "${s / 86400}d ago"
+    }
 }
 
 @Serializable

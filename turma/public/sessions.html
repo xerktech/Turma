@@ -4383,11 +4383,33 @@ function archiveRefusalNote(body) {
     `conversation to the archive was refused: ${esc(r.error)}.`;
 }
 
-// The 404 body, when there is one to read. A refusal note is worth a parse; a
-// body that isn't JSON just means the ordinary "not here yet".
+// The other push that never lands (XERK-1283): while the hub holds archive
+// ingest closed (its HA index hydrate), every push is turned away, so "a few
+// minutes" is untrue for as long as that lasts — once three days. `since` is
+// when it closed, on the hub's clock.
+function archiveIngestNote(body) {
+  const since = body && body.ingestClosed && body.ingestClosed.since;
+  // A real epoch-ms stamp, not one Date can't print (8.64e15 is its range);
+  // the Android twin draws the same line.
+  if (typeof since !== "number" || !(since > 0 && since < 8.64e15)) return "";
+  return `The hub has not been accepting archive pushes since ` +
+    `${esc(new Date(since).toLocaleString())} (${ago(Date.now() - since)}), so this ` +
+    `conversation can&rsquo;t reach the archive until it does.`;
+}
+
+// Why the archive answered without a transcript, or "" for the ordinary 404
+// "not here yet" — the one case where waiting a few minutes is the right advice.
+// Any other status is a failure to LOAD, worded in the hub's words when it gave
+// any (XERK-264), never as "not synced yet" (XERK-1283).
 async function archiveMissingNote(res) {
-  if (res.status !== 404) return "";
-  try { return archiveRefusalNote(await res.json()); } catch { return ""; }
+  let body = null;
+  try { body = await res.json(); } catch { /* not JSON: nothing more to say */ }
+  if (res.status !== 404) {
+    const why = body && typeof body.error === "string" && body.error.trim()
+      ? body.error.trim() : `the hub answered HTTP ${res.status}`;
+    return `Couldn&rsquo;t load this conversation &mdash; ${esc(why)}.`;
+  }
+  return [archiveRefusalNote(body), archiveIngestNote(body)].filter(Boolean).join(" ");
 }
 
 async function openEndedSession(id) {
@@ -4448,7 +4470,10 @@ async function openEndedSession(id) {
       `<div class="tr-empty">No conversation recorded for this session.</div>`;
     return;
   }
-  let t, note = "";
+  // `note` stays null when there was no hub answer to read (a dead socket, a
+  // 200 that wasn't JSON), "" for the ordinary not-here-yet 404, and a sentence
+  // for anything else the hub told us.
+  let t, note = null;
   try {
     const r = await fetch(`/api/archive/${enc(tid)}`);
     if (r.status === 401) return void (location.href = "/login");
@@ -4459,8 +4484,9 @@ async function openEndedSession(id) {
     // The agent ships ended transcripts to the archive on its slow usage
     // cadence, so a just-killed session is legitimately not there yet. Say that,
     // rather than the flat "unavailable" that reads as history lost — unless the
-    // hub knows the push was REFUSED, in which case waiting is exactly what the
-    // operator must not do.
+    // hub knows the push was REFUSED or its ingest is closed, or the load itself
+    // failed, in which case waiting is exactly what the operator must not do.
+    if (note === null) note = "Couldn&rsquo;t load this conversation from the hub.";
     document.getElementById("trScroll").innerHTML = note
       ? `<div class="tr-empty">${note} Resume still works.</div>`
       : `<div class="tr-empty">This session's conversation hasn't reached the archive yet — it syncs within a few minutes of ending. Resume still works.</div>`;

@@ -19097,10 +19097,17 @@ const server = http.createServer(async (req, res) => {
         // minutes of ending" — which is a promise the hub cannot keep once a
         // push has been refused (XERK-356). `error` keeps its old value so
         // anything reading only that is unchanged; `refused` is the new half.
+        //
+        // `ingestClosed` is the other reason it never arrives (XERK-1283): while
+        // the HA index hydrate holds archive ingest shut, every push 503s, so
+        // "a few minutes" is untrue for as long as the gate stays closed — once
+        // for three days. `since` is when it closed, so the pane can say so.
         const r = archiveRefusalFor(transcriptId);
-        return json(res, 404, r
+        const body = r
           ? { error: "unknown transcript", refused: { host: r.host, at: r.at, error: r.error } }
-          : { error: "unknown transcript" });
+          : { error: "unknown transcript" };
+        if (archive.isHydrating()) body.ingestClosed = { since: Date.now() - archive.hydratingForMs() };
+        return json(res, 404, body);
       }
       return json(res, 200, t);
     }
