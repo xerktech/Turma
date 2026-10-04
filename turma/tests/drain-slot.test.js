@@ -242,3 +242,83 @@ test("XERK-1076: lingers are capped at REFUSE_LINGER_MAX and bounded in time by 
     for (const s of socks) s.destroy();
   }
 });
+
+// XERK-1091: the archive ingest routes refuse a body the same two ways — a budget 503
+// and a no-drain 413 — and must close the connection the same way, rather than leave
+// the paused body for Node's keep-alive handling to dump (or the socket to hang).
+for (const [label, route, declared, status, hold] of [
+  ["archive chunk budget 503", "/api/agents/arch1091/archive/t1", 1 << 20, 503, holdBigLane],
+  ["archive chunk no-drain 413", "/api/agents/arch1091/archive/t1", 40 << 20, 413, null],
+  ["raw archive budget 503", "/api/agents/arch1091/archive/t1/raw/a.jsonl", 4 << 20, 503, holdBigLane],
+  ["raw archive no-drain 413", "/api/agents/arch1091/archive/t1/raw/a.jsonl", 40 << 20, 413, null],
+]) {
+  test(`XERK-1091: ${label} lingers and announces the close`, async () => {
+    // A previous test's holder releases its charge only once its socket closes.
+    for (let i = 0; i < 80 && hub.bodyInflightHeld(); i++) await sleep(25);
+    const holder = hold ? await hold() : null;
+    try {
+      const r = await postWhileWriting(declared, route);
+      assert.equal(r.err, null, `the connection was reset (${r.err}) instead of closing cleanly`);
+      assert.ok(r.wroteAll, "the hub kept reading (and discarding) until the client finished");
+      assert.match(r.got, new RegExp(`^HTTP/1\\.1 ${status} `), `the ${status} reached the client`);
+      assert.match(r.got, /\r\nconnection: close\r\n/i, "the refusal announces the close");
+      assert.ok(r.finMs < hub.REFUSE_LINGER_MS / 4, `FIN ${r.finMs}ms after the status, not at the time bound`);
+      for (let i = 0; i < 40 && hub.refusalsLingering; i++) await sleep(50);
+      assert.equal(hub.refusalsLingering, 0, "lingering refusal released on close");
+    } finally {
+      if (holder) holder.destroy();
+    }
+  });
+}
+
+// Sends one request with a `declared`-byte body, then a GET /healthz on the SAME
+// socket. Resolves with everything read, whether the socket stayed open for the GET.
+function postThenReuse(declared, route) {
+  const { port } = server.address();
+  return new Promise((resolve) => {
+    const sock = require("net").connect(port, "127.0.0.1");
+    let got = "";
+    sock.on("error", () => {});
+    sock.on("data", (c) => {
+      got += c;
+      if (/^HTTP\/1\.1 \d+ [\s\S]*\r\n0\r\n\r\n/.test(got) && !sock.sentGet) {
+        sock.sentGet = true;
+        sock.write("GET /healthz HTTP/1.1\r\nhost: x\r\n\r\n");
+      }
+      if (/HTTP\/1\.1 200 /.test(got)) sock.destroy();
+    });
+    sock.on("close", () => resolve(got));
+    sock.write(`POST ${route} HTTP/1.1\r\nhost: x\r\nauthorization: Bearer agenttok\r\n` +
+      `content-type: application/json\r\ncontent-length: ${declared}\r\n\r\n`);
+    sock.write(Buffer.alloc(declared, 0x79));
+  });
+}
+
+for (const [label, route, declared] of [
+  ["archive chunk", "/api/agents/arch1091/archive/t1", 2 << 20],
+  ["raw archive", "/api/agents/arch1091/archive/t1/raw/a.jsonl", (4 << 20) + (1 << 20)],
+]) {
+  test(`XERK-1091: a DRAINED ${label} 413 keeps the connection`, async () => {
+    for (let i = 0; i < 80 && hub.bodyInflightHeld(); i++) await sleep(25);
+    const got = await postThenReuse(declared, route);
+    assert.match(got, /^HTTP\/1\.1 413 /, "the 413 reached the client");
+    assert.doesNotMatch(got, /\r\nconnection: close\r\n/i, "a drained refusal does not close");
+    assert.match(got, /HTTP\/1\.1 200 /, "the same socket served the next request");
+  });
+}
+
+test("XERK-1091: the hydrate-gate 503 on both archive routes closes rather than leave the body unread", async () => {
+  const archive = require("../archive.js");
+  archive.setHydrating(true);
+  try {
+    for (const route of ["/api/agents/arch1091/archive/t1", "/api/agents/arch1091/archive/t1/raw/a.jsonl"]) {
+      const r = await postWhileWriting(4 << 20, route);
+      assert.equal(r.err, null, `${route}: reset (${r.err}) instead of closing cleanly`);
+      assert.match(r.got, /^HTTP\/1\.1 503 /, `${route}: the 503 reached the client`);
+      assert.match(r.got, /\r\nconnection: close\r\n/i, `${route}: the refusal announces the close`);
+      for (let i = 0; i < 40 && hub.refusalsLingering; i++) await sleep(50);
+    }
+  } finally {
+    archive.setHydrating(false);
+  }
+});

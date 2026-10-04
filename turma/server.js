@@ -10706,6 +10706,20 @@ function readRawBody(req, cap, pressure = null) {
   });
 }
 
+// Answer an archive ingest's refused body. A budget refusal and a no-drain size
+// refusal both leave the request PAUSED mid-body, and a refusal made before the
+// body is read (the hydrate gate) leaves all of it unread — so, like the heartbeat
+// and upload routes, close the connection rather than leave that body for Node's
+// keep-alive handling to dump into memory, or the socket to hang (XERK-1091).
+// A drained 413 has read its body to the end and keeps the connection.
+function refuseArchiveBody(req, res, status, body, close) {
+  if (close) res.setHeader("Connection", "close");
+  json(res, status, body);
+  if (close) endRefusedConnection(req, res);
+}
+// The read refusals that leave the request paused, so must close.
+const refusedPaused = (e) => !!(e && (e.budgetExceeded || e.noDrain));
+
 /**
  * Close the connection under a request whose body we refused on BUDGET (or past
  * the drain concurrency cap), once its response has flushed.
@@ -18597,7 +18611,8 @@ const server = http.createServer(async (req, res) => {
       // agent's retry signal (same contract as the budget 503 below); the read side
       // already answers "still syncing" during this window. Inert off HA.
       if (archive.isHydrating()) {
-        return json(res, 503, { error: "archive index is still syncing on this replica — retry" });
+        return refuseArchiveBody(req, res, 503,
+          { error: "archive index is still syncing on this replica — retry" }, true);
       }
       // A raw push whose <file> segment was an unencoded `.`/`..` has had that
       // segment normalised away by the URL parser and arrives HERE, on the
@@ -18622,9 +18637,9 @@ const server = http.createServer(async (req, res) => {
           const error = `archive chunk is larger than this hub takes (${e.cap} bytes)`;
           noteArchiveRefusal(transcriptId, key, error);
           console.error(`archive: refused a chunk from ${key} for ${transcriptId}: ${error}`);
-          return json(res, 413, { error, limit: e.cap });
+          return refuseArchiveBody(req, res, 413, { error, limit: e.cap }, refusedPaused(e));
         }
-        if (e && e.budgetExceeded) return json(res, 503, { error: e.message });
+        if (e && e.budgetExceeded) return refuseArchiveBody(req, res, 503, { error: e.message }, true);
         if (e && e.stalled) return; // socket already gone — nobody to answer
         return json(res, 400, { error: "could not read body" });
       }
@@ -18700,7 +18715,8 @@ const server = http.createServer(async (req, res) => {
       // route (XERK-789): the raw ingest also touches the shared node:sqlite index
       // (the sessions rawBytes cursor). 503 = retry. Inert off HA.
       if (archive.isHydrating()) {
-        return json(res, 503, { error: "archive index is still syncing on this replica — retry" });
+        return refuseArchiveBody(req, res, 503,
+          { error: "archive index is still syncing on this replica — retry" }, true);
       }
       let rel;
       try { rel = decodeURIComponent(parts[6]); } catch { return json(res, 400, { error: "bad file" }); }
@@ -18714,8 +18730,8 @@ const server = http.createServer(async (req, res) => {
         // 413 and 503 mean opposite things and must not be collapsed: on a 503
         // the agent retries, on a 413 it must not. `budgetExceeded` is the flag
         // the reader actually sets — `overloaded` was never set by anything.
-        if (e && e.tooLarge) return json(res, 413, { error: e.message });
-        if (e && e.budgetExceeded) return json(res, 503, { error: e.message });
+        if (e && e.tooLarge) return refuseArchiveBody(req, res, 413, { error: e.message }, refusedPaused(e));
+        if (e && e.budgetExceeded) return refuseArchiveBody(req, res, 503, { error: e.message }, true);
         return json(res, 400, { error: "could not read body" });
       }
       // `gunzipSync` is SYNCHRONOUS, so the decompressed buffer is not a
