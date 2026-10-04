@@ -58,8 +58,10 @@ paragraph and the per-org decisions log are XERK-1574.
     sweep's OWN candidate list**, so the brief cannot name an order the sweep does not follow;
   - **closedStale** — `ticket.outcome` of kind `not-reproducible`/`already-fixed` in the period
     (a `done` close is finished work, not a stale close);
-  - **spend** — per subscription the org spends, the freshest non-stale `limits` (a window whose
-    `resetsAt` passed is dropped), and whether `pausedSubscriptions` pauses it (XERK-544/548).
+  - **spend** — per subscription the org spends, that subscription's freshest non-stale `limits`
+    FLEET-WIDE (`freshestLimitsBySub`, the reading `pausedSubscriptions` judges, so the % and the
+    paused chip never come from two snapshots; a window whose `resetsAt` passed is dropped), and
+    whether `pausedSubscriptions` pauses it (XERK-544/548).
     Each window carries its `*ResetsAt`; both clients word it off NOW ("resets in 52m", "has
     reset since" once it passed — the brief is a snapshot);
   - **counts** — every section's UNCAPPED total plus intake/outflow (rows `created`/resolved in the
@@ -97,6 +99,8 @@ paragraph and the per-org decisions log are XERK-1574.
   says nothing. It carries the headline counts and the first "next" key. Tag `clipboard` (Android
   General alerts). It is an org digest, outside the one-alert-per-session rule
   (`turma-notifications.md`).
+- **The push carries no deep link yet**: no `click`/route, so a tap opens the app's default screen,
+  not Brief (Android deep-links only host/session/url extras). A Brief route is a follow-up.
 
 ## Surfaces
 

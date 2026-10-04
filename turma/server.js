@@ -6662,6 +6662,21 @@ function subscriptionKeyOf(key, a) {
 // is allowed to spend. AUTO uses the full set (both triggers), as it always has.
 function pausedSubscriptions(nowMs, opts) {
   const fiveHourOnly = !!(opts && opts.fiveHourOnly);
+  const out = new Set();
+  for (const [subKey, v] of freshestLimitsBySub(nowMs)) {
+    const paused = fiveHourOnly
+      ? limitsFiveHourMaxed(v.limits, nowMs)
+      : subscriptionLimitsPaused(v.limits, nowMs);
+    if (paused) out.add(subKey);
+  }
+  return out;
+}
+
+// The freshest non-stale `limits` per subscription, FLEET-WIDE: a subscription is
+// one shared pool whichever org's host reported it. pausedSubscriptions and the
+// brief's spend (XERK-1573) both read this, so a brief's % and its paused chip
+// always come from the same snapshot.
+function freshestLimitsBySub(nowMs) {
   const nowSec = Math.floor(nowMs / 1000);
   const freshest = new Map();  // subKey -> {capturedAt, limits}
   for (const [key, a] of Object.entries(agents)) {
@@ -6674,14 +6689,7 @@ function pausedSubscriptions(nowMs, opts) {
       freshest.set(subKey, { capturedAt: lim.capturedAt || 0, limits: lim });
     }
   }
-  const out = new Set();
-  for (const [subKey, v] of freshest) {
-    const paused = fiveHourOnly
-      ? limitsFiveHourMaxed(v.limits, nowMs)
-      : subscriptionLimitsPaused(v.limits, nowMs);
-    if (paused) out.add(subKey);
-  }
-  return out;
+  return freshest;
 }
 
 // Is this host's UNPINNED/claude auto-start paused (XERK-544/548)? Only a host
@@ -14470,10 +14478,13 @@ function compileBrief(siteKey, now, trigger, prevList) {
   }
 
   // Spend vs the subscription window (XERK-544): one entry per subscription the
-  // org's hosts spend, its freshest non-stale `limits`, and whether it pauses
-  // auto-start. A window whose reset has passed has rolled over — no figure.
+  // org's hosts spend, that subscription's freshest non-stale `limits` FLEET-WIDE
+  // (the same reading pausedSubscriptions judges, so the % and the paused chip
+  // agree), and whether it pauses auto-start. A window whose reset has passed has
+  // rolled over — no figure.
   const nowSec = Math.floor(now / 1000);
   const paused = pausedSubscriptions(now);
+  const freshestLim = freshestLimitsBySub(now);
   const subs = new Map();
   for (const [key, a] of hosts) {
     const subKey = subscriptionKeyOf(key, a);
@@ -14481,9 +14492,8 @@ function compileBrief(siteKey, now, trigger, prevList) {
     if (!g) subs.set(subKey, (g = { hosts: [], label: "", lim: null }));
     g.hosts.push(key);
     if (!g.label && a.subscription && a.subscription.label) g.label = a.subscription.label;
-    const lim = a.limits;
-    if (lim && typeof lim === "object" && nowSec - (lim.capturedAt || 0) <= LIMIT_MAX_AGE_SEC
-        && (!g.lim || (lim.capturedAt || 0) > (g.lim.capturedAt || 0))) g.lim = lim;
+    const f = freshestLim.get(subKey);
+    if (f) g.lim = f.limits;
   }
   const spend = [];
   for (const [subKey, g] of subs) {

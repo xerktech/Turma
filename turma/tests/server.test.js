@@ -22922,6 +22922,27 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   resetAutoStart();
 });
 
+test("XERK-1573: spend reads a shared subscription's fleet-wide freshest reading, as its pause does", async () => {
+  resetAutoStart();
+  const A = "spA1573.atlassian.net";
+  const B = "spB1573.atlassian.net";
+  const now = Date.now();
+  const sec = Math.floor(now / 1000);
+  await asBeat("spHostA", A, { autoStart: false });
+  await asBeat("spHostB", B, { autoStart: false });
+  // One subscription spent from both orgs: A's own host holds an older, calm
+  // reading; B's host the fresher, maxed one that pauses the pool.
+  agents.spHostA.subscription = { key: "sub-shared", label: "Shared" };
+  agents.spHostB.subscription = { key: "sub-shared", label: "Shared" };
+  agents.spHostA.limits = { capturedAt: sec - 600, fiveHour: { usedPct: 40, resetsAt: sec + 3600 } };
+  agents.spHostB.limits = { capturedAt: sec - 60, fiveHour: { usedPct: 99, resetsAt: sec + 3600 } };
+  const b = hub.compileBrief(A, now, "scheduled", []);
+  assert.deepEqual(b.spend, [{ label: "Shared", fiveHourPct: 99,
+    fiveHourResetsAt: (sec + 3600) * 1000, capturedAt: (sec - 60) * 1000, paused: true }]);
+  for (const h of ["spHostA", "spHostB"]) delete agents[h];
+  resetAutoStart();
+});
+
 test("XERK-1573: a merged PR and its ticket's Done row are ONE finished row", async () => {
   const S = "brP1573.atlassian.net";
   const now = Date.now();

@@ -233,6 +233,7 @@ function orgHtml(site, list, now, live) {
 
 function render(data) {
   TurmaOrg.update(data);
+  TurmaNewTicket.update(data);
   const now = Date.now();
   const all = data.briefs && typeof data.briefs === "object" ? data.briefs : {};
   const keys = TurmaOrg.getKeys();
