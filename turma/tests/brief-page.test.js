@@ -262,7 +262,7 @@ test("brief.html: a decision's kind is a noun, its meta pieces each unbreakable 
   const { decisionsHtml } = loadRenderers();
   const html = decisionsHtml("a.net", [
     { at: 1000, source: "question", question: "Q?", answer: "A", ticket: "X-1", label: "work", host: "Jira poller" },
-    { at: 2000, source: "permission", question: "Bash: npm test", answer: "Yes" },
+    { at: 2000, source: "permission", question: "Bash", answer: "Yes" },
     { at: 3000, source: "note", text: "n" },
   ], 5000, false);
   for (const k of ["question", "permission", "note"]) assert.ok(html.includes(`<span class="kind">${k}</span>`), k);

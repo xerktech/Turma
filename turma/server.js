@@ -11768,10 +11768,11 @@ function reviewWhy(session) {
 // leading dialog TITLE (a short run of plain words) becomes the tool name and the
 // next line its target: "Bash: touch /tmp/x". No detail = the question itself.
 const PERMISSION_WHY_MAX = 120;
+const DIALOG_TITLE_RE = /^[A-Z][A-Za-z]*( [A-Za-z]+){0,3}$/;
 function permissionWhy(pp) {
   const lines = (typeof pp.detail === "string" ? pp.detail : "").split("\n").map((l) => l.trim()).filter(Boolean);
   let why = lines[0] || "";
-  if (lines.length > 1 && /^[A-Z][A-Za-z]*( [A-Za-z]+){0,3}$/.test(lines[0])) {
+  if (lines.length > 1 && DIALOG_TITLE_RE.test(lines[0])) {
     why = `${lines[0].replace(/ command$/i, "")}: ${lines[1]}`;
   }
   if (!why) why = String(pp.prompt || "");
@@ -15047,10 +15048,15 @@ function briefNarrativeInput(b) {
 
 function requestBriefNarrative(brief) {
   const siteKey = brief.siteKey;
-  const host = jiraHostPool(siteKey, true).find((k) => {
+  // A host whose Claude login has lapsed advertises the capability but cannot
+  // run claude -p, so a logged-in capable host is preferred; one that needs a
+  // login is asked only when no other can be.
+  const capable = jiraHostPool(siteKey, true).filter((k) => {
     const a = agents[k];
     return a && a.briefRender && a.briefRender.available === true;
   });
+  const host = capable.find((k) => !(agents[k].claudeAuth && agents[k].claudeAuth.needsLogin === true))
+    || capable[0];
   const prev = briefRenders.get(siteKey);
   if (prev) dropQueuedCommand(prev.host, prev.cmdId, "renderBrief");
   briefRenders.delete(siteKey);
@@ -15138,23 +15144,26 @@ function recordAnswerDecision(key, sessionId, kind, answer) {
   return appendDecision(org, { source: kind, question, answer, host: key, sessionId, ticket, label });
 }
 
-// A permission dialog's line in the decisions log: what was asked for first
-// ("Bash: npm test"), then the dialog's own question only when it says something.
-// Claude Code's questions are boilerplate — "Do you want to proceed?", "Do you
-// want to make this edit to <file>?", the plan approval's "Would you like to
-// proceed?" — and next to the subject they only pad the line, so they are
-// dropped; a question that is not one of those is kept, and with no subject the
-// question is all there is. Pure; "" for a dialog with no question.
+// A permission dialog's line in the decisions log: the TOOL that asked ("Bash",
+// "Edit file"), then the dialog's own question only when it says something. Never
+// the subject's body — a command line, path or URL is session content and can
+// carry a secret (`curl -H "Authorization: Bearer …"`), and the log reaches every
+// same-org session, so it is cut like a typed answer's words. Claude Code's
+// questions are boilerplate — "Do you want to proceed?", "Do you want to make
+// this edit to <file>?", the plan approval's "Would you like to proceed?" — and
+// next to the tool they only pad the line, so they are dropped; a question that
+// is not one of those is kept, and with no title-shaped tool line (the plan
+// approval's text, no detail) the question is all there is. Pure; "" for a
+// dialog with no question.
 const GENERIC_DIALOG_Q_RE =
   /^(?:claude has written up a plan and is ready to execute\.\s*)?(?:do you want to|would you like to)\b[^?\n]*\?$/i;
 function permissionDecisionQuestion(pp) {
   const prompt = pp && typeof pp.prompt === "string" ? pp.prompt.trim() : "";
   if (!prompt) return "";
-  // No detail = no subject: permissionWhy would only echo (or clip) the question.
-  if (typeof pp.detail !== "string" || !pp.detail.trim()) return prompt;
-  const why = permissionWhy(pp);
-  if (!why || why === prompt) return prompt;
-  return GENERIC_DIALOG_Q_RE.test(prompt.replace(/\s+/g, " ")) ? why : `${why} — ${prompt}`;
+  const lines = (typeof pp.detail === "string" ? pp.detail : "").split("\n").map((l) => l.trim()).filter(Boolean);
+  const tool = lines.length > 1 && DIALOG_TITLE_RE.test(lines[0]) ? lines[0].replace(/ command$/i, "") : "";
+  if (!tool) return prompt;
+  return GENERIC_DIALOG_Q_RE.test(prompt.replace(/\s+/g, " ")) ? tool : `${tool} — ${prompt}`;
 }
 
 // The chosen option's own words: the labels the session offered for each picked

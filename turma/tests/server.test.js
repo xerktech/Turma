@@ -23373,6 +23373,23 @@ test("XERK-1574: a brief asks ONE capable host of its org for a narrative, and o
   hub.briefRenders.clear();
 });
 
+test("XERK-1574: a capable host whose Claude login lapsed is asked only when no other can be", async () => {
+  const S = "nrL1574.atlassian.net";
+  await beat1574("nrLapsed", S, { briefRender: { available: true },
+    claudeAuth: { present: true, needsLogin: true, expiringSoon: false } });
+  await beat1574("nrHealthy", S, { briefRender: { available: true },
+    claudeAuth: { present: true, needsLogin: false, expiringSoon: false } });
+  hub.briefSweep(S, "manual");
+  assert.equal(renderCmds("nrLapsed").length, 0, "a host that cannot run claude is passed over");
+  assert.equal(renderCmds("nrHealthy").length, 1);
+  delete agents.nrHealthy;
+  hub.briefSweep(S, "manual", Date.now() + 1000);
+  assert.equal(renderCmds("nrLapsed").length, 1, "the only capable host is still asked");
+  delete agents.nrLapsed;
+  delete hub.getBriefs()[S];
+  hub.briefRenders.clear();
+});
+
 test("XERK-1574: a brief with no capable host stands without a narrative", async () => {
   const S = "nrC1574.atlassian.net";
   await beat1574("nrNone", S);
@@ -23516,7 +23533,7 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
       sessionId: "q1", ticket: "XERK-9", label: "db work" },
     { source: "question", question: "Which DB?", answer: "Postgres; SQLite, plus a typed answer",
       host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
-    { source: "permission", question: "Bash: npm test", answer: "Yes",
+    { source: "permission", question: "Bash", answer: "Yes",
       host: "dcHostB", sessionId: "p1", label: "lbl" },
   ]);
   // A drifted host (bound to S, now declaring another org) is in NO org: its
@@ -23543,28 +23560,31 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
   delete hub.getDecisions()[E];
 });
 
-test("XERK-1574: a permission's log line drops the dialog's boilerplate question beside its subject", () => {
+test("XERK-1574: a permission's log line names the tool, never the command, and drops boilerplate", () => {
   const q = (prompt, detail) => hub.permissionDecisionQuestion({ prompt, detail });
-  // The subject says what was asked for; the TUI's stock questions add nothing.
-  assert.equal(q("Do you want to proceed?", "Bash command\nnpm test -- --runInBand"),
-    "Bash: npm test -- --runInBand");
-  assert.equal(q("Do you want to make this edit to server.js?", "Edit file\nturma/server.js"),
-    "Edit file: turma/server.js");
-  assert.equal(q("Do you want to create\n notes.md?", "Create file\nnotes.md"), "Create file: notes.md",
+  // The tool says what kind of thing was asked for; its command line, path or
+  // URL is session content (a token in a curl header) and never reaches the log.
+  assert.equal(q("Do you want to proceed?", "Bash command\nnpm test -- --runInBand"), "Bash");
+  assert.equal(q("Do you want to proceed?",
+    "Bash command\ncurl -H \"Authorization: Bearer sk-secret\" https://x\nCall the API"), "Bash");
+  assert.equal(q("Do you want to make this edit to server.js?", "Edit file\nturma/server.js"), "Edit file");
+  assert.equal(q("Do you want to create\n notes.md?", "Create file\nnotes.md"), "Create file",
     "a question the pane wrapped is still the stock one");
-  assert.equal(q("Do you want to allow Claude to fetch this content?", "Fetch\nhttps://example.com"),
-    "Fetch: https://example.com");
+  assert.equal(q("Do you want to allow Claude to fetch this content?", "Fetch\nhttps://example.com/?token=x"),
+    "Fetch");
+  // No title-shaped tool line (the plan approval's own text): the question alone.
   assert.equal(q("Claude has written up a plan and is ready to execute. Would you like to proceed?",
-    "Ship the brief page"), "Ship the brief page");
-  // A question that is not boilerplate stays, after the subject.
+    "Ship the brief page"), "Claude has written up a plan and is ready to execute. Would you like to proceed?");
+  // A question that is not boilerplate stays, after the tool.
   assert.equal(q("Allow access to the staging database?", "Bash command\npsql staging"),
-    "Bash: psql staging — Allow access to the staging database?");
+    "Bash — Allow access to the staging database?");
   assert.equal(q("Do you want to proceed? This deletes 40 files.", "Bash command\nrm -rf build"),
-    "Bash: rm -rf build — Do you want to proceed? This deletes 40 files.");
+    "Bash — Do you want to proceed? This deletes 40 files.");
   // No subject: the question is all there is, generic or not.
   assert.equal(q("Do you want to proceed?", ""), "Do you want to proceed?");
   assert.equal(q("Do you want to proceed?", undefined), "Do you want to proceed?");
   assert.equal(q("", "Bash command\nnpm test"), "", "no question, nothing to log");
+  assert.ok(!q("Do you want to proceed?", "Bash command\nexport TOKEN=abc").includes("TOKEN"));
   assert.equal(hub.permissionDecisionQuestion(undefined), "");
 });
 
@@ -23603,10 +23623,11 @@ test("XERK-1574: an auto-appended decision is capped — question 300, chosen op
   const [entry] = hub.getDecisions()[S];
   assert.equal(entry.question, "Q".repeat(300));
   assert.equal(entry.answer, "(a typed answer)", "a typed answer is logged as a marker, never its words");
-  // The permission line's 120-unit clip lands inside an emoji: no half pair.
+  // A permission line never carries the dialog's body (here a long line with no
+  // tool title above it): the question alone is logged.
   assert.equal((await request("POST", "/api/agents/dcHostD/sessions/lp/pane-prompt",
     { body: { optionNumber: 1 }, headers: userHeaders })).status, 200);
-  assert.equal(hub.getDecisions()[S][1].question, "x".repeat(118) + "… — Proceed?");
+  assert.equal(hub.getDecisions()[S][1].question, "Proceed?");
   const direct = hub.sanitizeDecision({ at: 1, source: "question", question: "q".repeat(5000),
     answer: "a".repeat(5000), text: "t".repeat(5000) });
   assert.equal(direct.question.length, 300);

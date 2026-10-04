@@ -138,6 +138,8 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
   reporting `briefRender.available` gets `{type:"renderBrief", siteKey, briefAt, brief}`. The input
   is `briefNarrativeInput` — the served brief minus ids/links — never a transcript. Agent side
   (worker, lockdown, bounds): `agent-session-cli.md`.
+- **The asked host is a capable one whose `claudeAuth.needsLogin` is not true**, falling back to
+  any capable host: the capability is advertised unconditionally, and a lapsed login cannot run it.
 - **One request per org in flight** (`briefRenders`, in memory): a newer brief drops the older
   undelivered command. A row is taken only from the host ASKED, for the brief ASKED about, while
   that host is still decided into the org (`ingestBriefNarratives`) — a host cannot write another
@@ -185,11 +187,14 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
     label) + `, plus a typed answer` for free text
     (`(a typed answer)` alone with no pick) — never its words: the log reaches every same-org
     session, and text typed for one must not;
-  - the pane-prompt route → `permissionDecisionQuestion`: `permissionWhy` (the subject), + the
-    picked option's label;
-  - the dialog's question rides after the subject ONLY when it is not boilerplate —
+  - the pane-prompt route → `permissionDecisionQuestion`: the dialog's TOOL title ("Bash",
+    "Edit file"; `DIALOG_TITLE_RE`), + the picked option's label;
+  - **never the subject's body** (command line, path, URL): it is session content and can carry a
+    secret (`curl -H "Authorization: Bearer …"`), cut for the reason a typed answer's words are.
+    Do not switch this to `permissionWhy` — that serves the body for the attention line only;
+  - the dialog's question rides after the tool ONLY when it is not boilerplate —
     `GENERIC_DIALOG_Q_RE` drops "Do you want to …?" / "Would you like to proceed?", which only pad
-    the line; with no subject (no `detail`) the question is all there is, generic or not.
+    the line; with no title-shaped tool line the question is all there is, generic or not.
   - `POST /api/orgs/<site>/decisions {text}` (operator-authed, 400 empty / 413 >500 / 404 an org no
     host is decided into, minting no key).
   - Nothing is logged for a drifted/unbound host, an unknown session, or no pending question. It is
