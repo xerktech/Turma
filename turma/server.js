@@ -3303,20 +3303,34 @@ function briefWire(b, full) {
 // Inline literals: sanitizeBrief runs at module-init (TDZ).
 function cleanBriefNarrative(v) {
   if (typeof v !== "string" || !v) return "";
+  // A standalone HEADING line is dropped, never joined into the next sentence
+  // ("Summary for acme Two pieces…"): a #-heading or a line that is only
+  // *-emphasis (seen before the markup strip), or a short line ending ":"
+  // (seen after it). The cleaned text has no # or *, and any line ending ":"
+  // that survived is longer than the colon bound, so it stays a fixed point.
+  // Lengths are code points ([...t]), as Python's len counts them.
+  const heading = (l) => {
+    const t = l.replace(/^ +| +$/g, "");
+    return /^#{1,6}(?: |$)/.test(t) || ([...t].length <= 80 && /^\*{1,3}[^*]+\*{1,3}:?$/.test(t));
+  };
   let s = v.slice(0, 20000)
     .replace(/```[^\n]*/g, " ")
     .replace(/<[^>\n]*>/g, " ")
     .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
-    .replace(/[*`#~|<>[\]]/g, "")
     // Control/bidi/zero-width (all but the newline), then every other
-    // non-newline whitespace, become spaces BEFORE the per-line bullet strip \u2014
-    // a leading one would hide a bullet from this pass and expose it to the
-    // next. Explicit ASCII classes after that, so the agent's Python mirror
-    // (wider \s and \d) agrees exactly.
+    // non-newline whitespace, become spaces BEFORE the per-line heading and
+    // bullet passes \u2014 a leading one would hide a heading or bullet from this
+    // pass and expose it to the next. Explicit ASCII classes after that, so the
+    // agent's Python mirror (wider \s and \d) agrees exactly.
     .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ")
     .replace(/[^\S\n]/g, " ")
     .split("\n")
-    .map((l) => l.replace(/^ *(?:(?:[-+]|[0-9]+[.)])(?: +|$))+/, ""))
+    .filter((l) => !heading(l))
+    .map((l) => l.replace(/[*`#~|<>[\]]/g, "")
+      .replace(/^ *(?:(?:[-+]|[0-9]+[.)])(?: +|$))+/, "")
+      .replace(/ +/g, " ")
+      .replace(/^ | $/g, ""))
+    .filter((l) => !(l.endsWith(":") && [...l].length <= 40))
     .join(" ")
     .replace(/ +/g, " ")
     .replace(/^ | $/g, "");

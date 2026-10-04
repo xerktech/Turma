@@ -39702,7 +39702,7 @@ class TestRenderBrief(ManagerMixin, unittest.TestCase):
         popen, calls = self._fake_popen(reply.encode())
         with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
             text = self.sm._run_brief_render(["claude", "-p", "x"])
-        self.assertEqual(text, "Brief XERK-1 finished. Next : XERK-2.")
+        self.assertEqual(text, "XERK-1 finished. Next : XERK-2.", "the heading line is dropped")
         (argv, kw, proc), = calls
         self.assertEqual((kw["cwd"], kw["stdin"], kw["start_new_session"]),
                          (ha.REGISTRY_DIR, ha.subprocess.DEVNULL, True))
@@ -39744,6 +39744,28 @@ class TestRenderBrief(ManagerMixin, unittest.TestCase):
         self.assertEqual(C("\u200b1. first"), "first")
         self.assertEqual(C("\x1c- z"), "z")
         self.assertEqual(C("\u0661. x"), "\u0661. x", "ASCII digits only, like the hub")
+
+    def test_clean_brief_narrative_drops_heading_lines(self):
+        # A standalone heading line is dropped, never run into the next sentence.
+        # The SAME vectors as the hub's server.test.js narrative-whitelist test.
+        C = ha.clean_brief_narrative
+        for raw, want in (
+            ("**Summary for acme**\nTwo pieces of work landed.", "Two pieces of work landed."),
+            ("## Summary\nTwo landed.", "Two landed."),
+            ("Two landed.\n### Decisions\nThe operator chose Postgres.",
+             "Two landed. The operator chose Postgres."),
+            ("Two landed.\n**Next steps:**\n- review XERK-2", "Two landed. review XERK-2"),
+            ("Two landed.\nNext steps:\n- review XERK-2", "Two landed. review XERK-2"),
+            ("\u200b*Recap*\nTwo landed.", "Two landed."),
+            ("We **kept** the plan and *shipped* XERK-1.", "We kept the plan and shipped XERK-1."),
+            ("**XERK-1** shipped.", "XERK-1 shipped."),
+            ("The operator decided the following, after a long review of both options:\n- Postgres",
+             "The operator decided the following, after a long review of both options: Postgres"),
+            ("#hashtag stays", "hashtag stays"),
+            ("**Only a heading**", ""),
+        ):
+            self.assertEqual(C(raw), want, repr(raw))
+            self.assertEqual(C(C(raw)), C(raw), f"a fixed point: {raw!r}")
 
 
 class TestDecisionsFile(ManagerMixin, unittest.TestCase):

@@ -23356,18 +23356,18 @@ test("XERK-1574: a brief asks ONE capable host of its org for a narrative, and o
   // The asked host's answer lands, cleaned to one plain paragraph.
   await beat1574("nrCapable", S, { briefNarratives: [row("## Brief\n- **XERK-1** shipped.\n<script>x</script>")] });
   const kept = hub.getBriefs()[S][0];
-  assert.equal(kept.narrative, "Brief XERK-1 shipped. x");
+  assert.equal(kept.narrative, "XERK-1 shipped. x", "the heading line is dropped, not run in");
   assert.ok(Number.isSafeInteger(kept.narrativeAt));
-  assert.equal((await fleet()).briefs[S][0].narrative, "Brief XERK-1 shipped. x");
+  assert.equal((await fleet()).briefs[S][0].narrative, "XERK-1 shipped. x");
   // Answered once: a second row for the same brief changes nothing.
   await beat1574("nrCapable", S, { briefNarratives: [row("again")] });
-  assert.equal(hub.getBriefs()[S][0].narrative, "Brief XERK-1 shipped. x");
+  assert.equal(hub.getBriefs()[S][0].narrative, "XERK-1 shipped. x");
   // A newer brief replaces the request; the earlier brief's narrative leaves the wire.
   hub.briefSweep(S, "manual", Date.now() + 1000);
   assert.equal(renderCmds("nrCapable").length, 1, "one request per org in flight");
   const wire = (await fleet()).briefs[S];
   assert.equal("narrative" in wire[1], false, "an earlier brief is served headline-only");
-  assert.equal(hub.getBriefs()[S][1].narrative, "Brief XERK-1 shipped. x", "kept in the store");
+  assert.equal(hub.getBriefs()[S][1].narrative, "XERK-1 shipped. x", "kept in the store");
   for (const h of ["nrCapable", "nrOld", "nrOther"]) delete agents[h];
   for (const k of [S, T]) delete hub.getBriefs()[k];
   hub.briefRenders.clear();
@@ -23386,7 +23386,26 @@ test("XERK-1574: a brief with no capable host stands without a narrative", async
 
 test("XERK-1574: the narrative is whitelisted — plain, bounded, a coerce fixed point", () => {
   const C = hub.cleanBriefNarrative;
-  assert.equal(C("```js\ncode\n```\n# Head\n1. one\n- two\n[link](http://x) a\u202eb"), "code Head one two link a b");
+  assert.equal(C("```js\ncode\n```\n# Head\n1. one\n- two\n[link](http://x) a\u202eb"), "code one two link a b");
+  // A standalone heading line is dropped, never run into the next sentence.
+  // The SAME vectors as the agent's test_clean_brief_narrative_drops_heading_lines.
+  for (const [input, want] of [
+    ["**Summary for acme**\nTwo pieces of work landed.", "Two pieces of work landed."],
+    ["## Summary\nTwo landed.", "Two landed."],
+    ["Two landed.\n### Decisions\nThe operator chose Postgres.", "Two landed. The operator chose Postgres."],
+    ["Two landed.\n**Next steps:**\n- review XERK-2", "Two landed. review XERK-2"],
+    ["Two landed.\nNext steps:\n- review XERK-2", "Two landed. review XERK-2"],
+    ["\u200b*Recap*\nTwo landed.", "Two landed."],
+    ["We **kept** the plan and *shipped* XERK-1.", "We kept the plan and shipped XERK-1."],
+    ["**XERK-1** shipped.", "XERK-1 shipped."],
+    ["The operator decided the following, after a long review of both options:\n- Postgres",
+      "The operator decided the following, after a long review of both options: Postgres"],
+    ["#hashtag stays", "hashtag stays"],
+    ["**Only a heading**", ""],
+  ]) {
+    assert.equal(C(input), want, JSON.stringify(input));
+    assert.equal(C(C(input)), C(input), `a fixed point: ${JSON.stringify(input)}`);
+  }
   assert.equal(C(42), "");
   const long = C("word ".repeat(600));
   assert.ok(long.length <= 1200 && long.endsWith("…"));
@@ -23403,10 +23422,10 @@ test("XERK-1574: the narrative is whitelisted — plain, bounded, a coerce fixed
   const astral = C(`${"a".repeat(1198)}\u{1F600}${" b".repeat(10)}`);
   assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(astral), "no lone high surrogate");
   const raw = { "o.atlassian.net": [{ siteKey: "o.atlassian.net", at: 2000,
-    narrative: "## Title\n**bold**", narrativeAt: 2500 },
+    narrative: "## Title\n**bold** text", narrativeAt: 2500 },
   { siteKey: "o.atlassian.net", at: 1000, narrative: "   ", narrativeAt: 1500 }] };
   const out = hub.briefsCoerce(JSON.parse(JSON.stringify(raw)));
-  assert.equal(out["o.atlassian.net"][0].narrative, "Title bold");
+  assert.equal(out["o.atlassian.net"][0].narrative, "bold text");
   assert.equal(out["o.atlassian.net"][0].narrativeAt, 2500);
   assert.equal("narrative" in out["o.atlassian.net"][1], false, "an empty narrative is absent");
   assert.equal("narrativeAt" in out["o.atlassian.net"][1], false);

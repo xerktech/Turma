@@ -232,6 +232,8 @@ Hub side (the request, the store, the routes, the page): `turma-brief.md`.
   ≤`BRIEF_TEXT_MAX`, a fixed point); the hub re-cleans regardless — it is the whitelist.
   Same step order and EXPLICIT ASCII classes (` `, `[0-9]`) as the JS, since Python's `\s`/`\d`
   are wider; change both together.
+- **Its heading-line drop (`_brief_heading_line` + the short-`:` filter) mirrors the hub's
+  `heading`** — same bounds, same vectors (`test_clean_brief_narrative_drops_heading_lines`).
 - **The result rides `briefNarratives`**, cleared BY IDENTITY like `attentionHints`; the capability
   is `briefRender:{available:true}` (an older agent acks `renderBrief` and never answers).
 - **`_ingest_decisions` renders the reply's `decisions:{org, entries}` to

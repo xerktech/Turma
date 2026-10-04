@@ -149,6 +149,11 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
 - **Control/bidi chars and non-newline whitespace become spaces BEFORE the per-line bullet strip**
   — else a leading one hides a bullet from the first pass (not a fixed point). After that only
   explicit ASCII classes, so the agent's `clean_brief_narrative` gives the same answer.
+- **A standalone heading line is DROPPED, never joined into the next sentence** ("Summary for acme
+  Two pieces…"): a `#`-heading or an only-`*`-emphasis line (≤80, judged before the markup strip),
+  or a cleaned line ending `:` of ≤40. Still a fixed point: the output has no `#`/`*`, and a kept
+  `:` line is longer than 40. Lengths count code points (`[...t]`) to match Python's `len`.
+  A bold phrase inside a sentence is kept. Shared vectors in both test files — change them together.
 - **Strictly additive**: no capable host, a failed render, or an older agent = the brief stands as
   v1. `briefWire` strips it from earlier briefs (headline-only). The push does not carry it (it
   lands after the push fires).

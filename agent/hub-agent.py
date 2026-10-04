@@ -11846,6 +11846,23 @@ _BRIEF_CTRL_RE = re.compile(
     "[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
 _BRIEF_SPACE_RE = re.compile(r"[^\S\n]")
 _BRIEF_BULLET_RE = re.compile(r"^ *(?:(?:[-+]|[0-9]+[.)])(?: +|$))+")
+_BRIEF_HEADING_RE = re.compile(r"#{1,6}(?: |$)")
+_BRIEF_EMPHASIS_RE = re.compile(r"\*{1,3}[^*]+\*{1,3}:?")
+
+
+def _brief_heading_line(line):
+    """A standalone heading in the model's reply: a #-heading or a line that is
+    only *-emphasis, judged before the markup strip (`heading` in the hub's
+    cleanBriefNarrative). len counts code points, as the hub's [...t] does."""
+    t = line.strip(" ")
+    return bool(_BRIEF_HEADING_RE.match(t)
+                or (len(t) <= 80 and _BRIEF_EMPHASIS_RE.fullmatch(t)))
+
+
+def _brief_clean_line(line):
+    line = re.sub(r"[*`#~|<>\[\]]", "", line)
+    line = _BRIEF_BULLET_RE.sub("", line)
+    return re.sub(" +", " ", line).strip(" ")
 
 
 def clean_brief_narrative(text):
@@ -11854,16 +11871,18 @@ def clean_brief_narrative(text):
     (cleanBriefNarrative in server.js) applies, so a reply the agent ships is
     one the hub keeps as-is: code fences, tags, link syntax, emphasis/heading/
     table characters and list bullets go; control and bidi characters become
-    spaces; whitespace collapses; an over-long text is cut on a word with "…"."""
+    spaces; a standalone heading line (#-heading, an emphasis-only line, or a
+    short line ending ":") is dropped rather than run into the next sentence;
+    whitespace collapses; an over-long text is cut on a word with "…"."""
     if not isinstance(text, str) or not text:
         return ""
     s = text[:20000]
     s = re.sub(r"```[^\n]*", " ", s)
     s = re.sub(r"<[^>\n]*>", " ", s)
     s = re.sub(r"!?\[([^\]\n]*)\]\([^)\n]*\)", r"\1", s)
-    s = re.sub(r"[*`#~|<>\[\]]", "", s)
     s = _BRIEF_SPACE_RE.sub(" ", _BRIEF_CTRL_RE.sub(" ", s))
-    s = " ".join(_BRIEF_BULLET_RE.sub("", line) for line in s.split("\n"))
+    lines = [_brief_clean_line(l) for l in s.split("\n") if not _brief_heading_line(l)]
+    s = " ".join(l for l in lines if not (l.endswith(":") and len(l) <= 40))
     s = re.sub(" +", " ", s).strip(" ")
     if len(s) > BRIEF_TEXT_MAX:
         cut = s[:BRIEF_TEXT_MAX - 1]

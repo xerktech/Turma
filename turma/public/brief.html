@@ -261,7 +261,7 @@ function decisionsHtml(site, list, now, live, count) {
     : `<div class="brief-none">No decisions recorded yet.</div>`;
   const form = live
     ? `<form class="brief-note" data-note="${esc(site)}"><input data-note-input="${esc(site)}" maxlength="500"`
-      + ` placeholder="Record a decision for this org's sessions…" value="${esc(drafts.get(site) || "")}">`
+      + ` placeholder="Record a decision for this org…" value="${esc(drafts.get(site) || "")}">`
       + `<button type="submit"${noteBusy.has(site) ? " disabled" : ""}>${noteBusy.has(site) ? "Adding…" : "Add"}</button></form>`
     : "";
   return `<div class="brief-sec decisions"><h3>Decisions <span class="n">${total}</span></h3>${body}${form}</div>`;
