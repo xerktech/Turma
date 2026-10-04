@@ -16167,10 +16167,29 @@ def _azure_item_url(base, project, wid):
     return f"{base}{proj}/_workitems/edit/{wid}"
 
 
-def _shape_azure_item(wi, site_key, base):
+# ADO's portfolio (organizer) levels: Epic and Feature sit above the backlog
+# items (User Story / PBI / Bug / Task) the way a Jira Epic does, so both map to
+# XERK-634's `isEpic` — an organizer, never a work session (XERK-1444). Matched
+# by name, case-insensitively; a custom portfolio level with another name is
+# not recognised.
+_AZDO_EPIC_TYPES = frozenset({"epic", "feature"})
+
+
+def _azure_is_epic_type(wtype):
+    """True when a System.WorkItemType names an ADO portfolio level. Total."""
+    return isinstance(wtype, str) and wtype.strip().lower() in _AZDO_EPIC_TYPES
+
+
+def _shape_azure_item(wi, site_key, base, parent_types=None):
     """One raw work item (from the batch GET) -> the compact wire ticket the
     board renders — the SAME shape _shape_issue produces for Jira, so the board
-    can't tell them apart. Everything optional degrades to None/[]."""
+    can't tell them apart. Everything optional degrades to None/[].
+
+    `parent_types` maps a parent key -> its System.WorkItemType (the batch GET
+    does not carry it), so `epicKey` is the parent key ONLY when the parent is a
+    portfolio level — Jira's rule (XERK-634). An organizer is never itself an
+    epic child: a Feature under an Epic keeps `epicKey` None, so an epic run's
+    children are only work items. Unknown parent type -> None."""
     f = wi.get("fields") or {}
     wid = wi.get("id")
     key = str(wid) if wid is not None else ""
@@ -16181,6 +16200,10 @@ def _shape_azure_item(wi, site_key, base):
     tags = f.get("System.Tags")
     labels = [t.strip() for t in str(tags).split(";") if t.strip()] if tags else []
     parent = f.get("System.Parent")
+    parent_key = str(parent) if parent is not None else None
+    is_epic = _azure_is_epic_type(wtype)
+    parent_is_epic = bool(parent_key) and _azure_is_epic_type(
+        (parent_types or {}).get(parent_key))
     return {
         "key": key,
         "url": _azure_item_url(base, project, key),
@@ -16196,7 +16219,9 @@ def _shape_azure_item(wi, site_key, base):
         "created": f.get("System.CreatedDate"),
         "resolved": f.get("Microsoft.VSTS.Common.ClosedDate"),
         "dueDate": f.get("Microsoft.VSTS.Scheduling.DueDate"),
-        "parentKey": str(parent) if parent is not None else None,
+        "parentKey": parent_key,
+        "epicKey": parent_key if parent_is_epic and not is_epic else None,
+        "isEpic": is_epic,
     }
 
 
@@ -16208,21 +16233,71 @@ _AZDO_LIST_FIELDS = [
 ]
 
 
-def fetch_azure_items(ids, site_key, base):
-    """Batch-GET work items by id (chunked to the API's 200 cap), shaped. Missing
-    ids are omitted (errorPolicy) rather than failing the whole batch."""
+def _azure_batch_get(ids, fields):
+    """Raw work items for `ids` (chunked to the API's 200 cap). Missing ids are
+    omitted (errorPolicy) rather than failing the whole batch."""
     out = []
     for i in range(0, len(ids), AZDO_BATCH):
         chunk = ids[i:i + AZDO_BATCH]
         data = azure_req("/_apis/wit/workitems", {
             "ids": ",".join(str(x) for x in chunk),
-            "fields": ",".join(_AZDO_LIST_FIELDS),
+            "fields": ",".join(fields),
             "errorPolicy": "omit",
         })
         for wi in data.get("value") or []:
             if isinstance(wi, dict) and wi.get("id") is not None:
-                out.append(_shape_azure_item(wi, site_key, base))
+                out.append(wi)
     return out
+
+
+# Last-known {parent key: System.WorkItemType}, filled by every board poll. A
+# work item's type almost never changes, so a failed or partial type GET falls
+# back to it: an unknown parent type means NO epicKey, which lets an epic child
+# through the auto-start/auto-merge gate — so one transient ADO error must not
+# be enough to do that (XERK-1444). Bounded: cleared when it outgrows the cap.
+_AZDO_PARENT_TYPE_CACHE = {}
+_AZDO_PARENT_TYPE_CACHE_MAX = 5000
+
+
+def _remember_azure_types(types):
+    fresh = {k: v for k, v in types.items() if isinstance(v, str)}
+    if len(_AZDO_PARENT_TYPE_CACHE.keys() | fresh.keys()) > _AZDO_PARENT_TYPE_CACHE_MAX:
+        _AZDO_PARENT_TYPE_CACHE.clear()
+    _AZDO_PARENT_TYPE_CACHE.update(fresh)
+
+
+def _azure_parent_types(parent_ids, known=None):
+    """{parent key: System.WorkItemType} for `parent_ids`, GETting only the ones
+    not already in `known` (the caller's own batch). Best-effort per chunk: a
+    failed chunk falls back to the last-known types, else leaves those parents
+    unknown (-> no epicKey) rather than losing the board."""
+    types = dict(known or {})
+    missing = sorted({str(p) for p in parent_ids if p is not None} - set(types))
+    for i in range(0, len(missing), AZDO_BATCH):
+        chunk = missing[i:i + AZDO_BATCH]
+        try:
+            for wi in _azure_batch_get(chunk, ["System.Id", "System.WorkItemType"]):
+                types[str(wi["id"])] = (wi.get("fields") or {}).get("System.WorkItemType")
+        except Exception as e:
+            log(f"azure parent-type fetch failed: {e}")
+    # Fall back BEFORE remembering: a cap-overflow clear must not empty the
+    # fallback on the very poll that needs it.
+    for k in missing:
+        if types.get(k) is None and k in _AZDO_PARENT_TYPE_CACHE:
+            types[k] = _AZDO_PARENT_TYPE_CACHE[k]
+    _remember_azure_types(types)
+    return types
+
+
+def fetch_azure_items(ids, site_key, base):
+    """Batch-GET work items by id, shaped. Parents outside the batch get one
+    extra type-only GET so an Epic/Feature parent sets `epicKey` (XERK-1444)."""
+    raw = _azure_batch_get(ids, _AZDO_LIST_FIELDS)
+    known = {str(wi["id"]): (wi.get("fields") or {}).get("System.WorkItemType")
+             for wi in raw}
+    parent_types = _azure_parent_types(
+        [(wi.get("fields") or {}).get("System.Parent") for wi in raw], known)
+    return [_shape_azure_item(wi, site_key, base, parent_types) for wi in raw]
 
 
 def collect_azure():
@@ -16334,10 +16409,10 @@ def azure_plain(raw, limit):
     return text[:limit].rstrip(), True
 
 
-def _shape_azure_detail(wi, comments_data, site_key, base):
+def _shape_azure_detail(wi, comments_data, site_key, base, parent_types=None):
     """A GET work item ($expand=all) + its comments -> the same detail shape
     _shape_issue_detail produces for Jira."""
-    detail = _shape_azure_item(wi, site_key, base)
+    detail = _shape_azure_item(wi, site_key, base, parent_types)
     f = wi.get("fields") or {}
 
     def person(field):
@@ -16406,7 +16481,10 @@ def fetch_azure_issue(key):
                 {"api-version": f"{AZDO_API_VERSION}-preview.3"})
         except Exception as e:
             log(f"azure comments fetch failed for {key}: {e}")
-    detail = _shape_azure_detail(wi, comments_data, site_key, base)
+    # The parent's type from the board poll's cache, not a fresh GET: this runs
+    # inline on the beat (handle_commands), so it must not add a request.
+    detail = _shape_azure_detail(wi, comments_data, site_key, base,
+                                 _AZDO_PARENT_TYPE_CACHE)
     detail["statusOptions"] = _azure_status_options(
         site_key, project, f.get("System.WorkItemType"), f.get("System.State"))
     return detail

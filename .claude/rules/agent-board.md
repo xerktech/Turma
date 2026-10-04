@@ -24,10 +24,22 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   so no new query. Wire mirrors that must agree: agent shape → `normalizeJira` whitelist (blocks/
   blockedBy `coerceStringList`, epicKey non-string→absent, isEpic non-bool→absent) → Android
   `JiraTicket`/`JiraIssueDetail` typed decode (a malformed field is decode-fatal for the whole atomic
-  `/api/agents` array, so absence = "not collected"). Azure is out of scope — it emits none, and the
-  Android defaults (null/false/[]) read them as absent. Tests: `TestShapeIssue`
+  `/api/agents` array, so absence = "not collected"). Tests: `TestShapeIssue`
   (`test_epic_membership`/`test_*_links`/`test_malformed_issuelinks_degrade`/`test_links_are_bounded`),
   the XERK-455 `normalizeRecord` case, Android `AgentDecodeTest`.
+- **Azure emits `isEpic`/`epicKey` too (XERK-1444), but no `blocks`/`blockedBy`.** `isEpic` = the
+  work item's type is a portfolio level, `Epic` OR `Feature` (`_AZDO_EPIC_TYPES`, by name) — so the
+  hub keeps both off the org auto-start/auto-merge stream. Do not narrow it back to `Epic` only: a
+  Feature is ADO's Jira-Epic level, and leaving it out lets its stories auto-merge unreviewed.
+  - `epicKey` = `parentKey` ONLY when the parent's type is a portfolio level, and never on an
+    organizer itself (a Feature under an Epic keeps `epicKey` None, so an epic run's children are
+    only work items — arm the Feature, not the Epic, to run its stories).
+  - The batch GET has no parent type, so `fetch_azure_items` makes ONE extra type-only GET for
+    parents outside the batch (`_azure_parent_types`). A failed chunk falls back to the last-known
+    `_AZDO_PARENT_TYPE_CACHE`: an unknown type means NO `epicKey`, i.e. the epic child passes the
+    auto-merge gate, so one transient ADO error must never be enough for that. Keep the fallback.
+  - `fetch_azure_issue` (inline on the beat) reads that cache and never GETs the parent.
+  - Tests: the `xerk1444` cases in `TestShapeAzureItem`, `TestCollectAzure`, `fetch_azure_issue`'s.
 - **Every row carries `resolved`** (Jira `resolutiondate`, ADO `Microsoft.VSTS.Common.ClosedDate`;
   null while open) — the hub's org brief counts the period's outflow by it (XERK-1573,
   `turma-brief.md`). Untyped on Android, so absent from an older agent is decode-safe.
