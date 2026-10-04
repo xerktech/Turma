@@ -1832,11 +1832,12 @@ function permissionPanelHtml() {
       <button type="button" class="td-close" data-perm-close="1" aria-label="Close">✕</button>
     </div>
     ${orgRow}
-    <p class="tp-note">When a session's Bash command is stopped for permission, the host's
-      permission judge auto-approves it only if this text clearly covers it. Force pushes,
-      merges, pushes to main, production changes and the like are never auto-approved,
-      whatever it says. ${permState.isDefault ? "Showing the default policy." : "A custom policy."}
-      Save it empty to turn the judge off for this org.</p>
+    <p class="tp-note tp-note-tight">When a session's Bash command is stopped for permission, the host's
+      permission judge auto-approves it only if this text clearly covers it. Commands it
+      recognises as force pushes, merges, pushes to main or production changes are refused
+      before the model is asked, whatever this text says. Save it empty to turn the judge off
+      for this org.</p>
+    <p class="tp-note" data-perm-status="1">${permState.isDefault ? "Showing the default policy." : "A custom policy."}</p>
     <label class="tp-field"><span>Policy</span>
       <textarea data-perm-text="1" rows="14" maxlength="16000"${permState.loading ? " disabled" : ""}>${esc(permState.loading ? "Loading…" : permState.text)}</textarea></label>
     ${permState.err ? `<div class="tp-err">${esc(permState.err)}</div>` : ""}

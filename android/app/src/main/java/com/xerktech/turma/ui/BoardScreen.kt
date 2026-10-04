@@ -28,7 +28,6 @@ import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Gavel
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Tune
 import androidx.compose.material3.AlertDialog
@@ -250,7 +249,20 @@ fun BoardScreen(
     }
 
     Column(modifier.fillMaxSize()) {
-        ScreenHeader("Board") {
+        ScreenHeader(
+            "Board",
+            // The permission policy (XERK-1566) is a labelled ⋮ entry, not a header
+            // icon: a fourth icon squeezed the org filter to a bare "…" on a phone.
+            // The web folds it behind its ⋯ menu the same way. Org-less = absent.
+            menuItems = { closeMenu ->
+                if (sites.isNotEmpty()) {
+                    DropdownMenuItem(
+                        text = { Text("Permission policy") },
+                        onClick = { closeMenu(); permissionOpen = true },
+                    )
+                }
+            },
+        ) {
             // The New-ticket button moved into the shared ScreenHeader (XERK-150),
             // so it's on every screen — see NewTicketAction. Refresh and the
             // triage policy are board-specific now.
@@ -260,9 +272,6 @@ fun BoardScreen(
                 }
                 HeaderIconButton(onClick = { policyOpen = true }) {
                     Icon(Icons.Filled.Tune, "Triage policy")
-                }
-                HeaderIconButton(onClick = { permissionOpen = true }) {
-                    Icon(Icons.Filled.Gavel, "Permission policy")
                 }
             }
             HeaderIconButton(onClick = { vm.refresh() }, enabled = !refreshing) {
@@ -2236,6 +2245,18 @@ private fun DimRow(text: String) {
     Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
 }
 
+/**
+ * The permission policy sheet's explanation — word-for-word board.html's
+ * `permissionRules*` note. It claims only what the deterministic refusal does
+ * ("commands it recognises"), never that such work is never auto-approved.
+ */
+internal const val PERMISSION_POLICY_EXPLANATION =
+    "When a session's Bash command is stopped for permission, the host's " +
+        "permission judge auto-approves it only if this text clearly covers it. " +
+        "Commands it recognises as force pushes, merges, pushes to main or production " +
+        "changes are refused before the model is asked, whatever this text says. " +
+        "Save it empty to turn the judge off for this org."
+
 /** The hub's PERMISSION_POLICY_MAX (server.js) — board.html's textarea maxlength. */
 internal const val PERMISSION_POLICY_MAX = 16000
 
@@ -2290,21 +2311,28 @@ private fun PermissionPolicySheet(
                     siteKey,
                 ) { if (!busy && it != siteKey) vm.loadPermissionPolicy(it) }
             }
-            Text(
-                "When a session's Bash command is stopped for permission, the host's " +
-                    "permission judge auto-approves it only if this text clearly covers it. " +
-                    "Force pushes, merges, pushes to main, production changes and the like are " +
-                    "never auto-approved, whatever it says. " +
-                    (if (isDefault) "Showing the default policy." else "A custom policy.") +
-                    " Save it empty to turn the judge off for this org.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant,
-            )
+            // The explanation, then the status as its OWN short line (board.html's
+            // `data-perm-status` paragraph) — never appended mid-explanation.
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    PERMISSION_POLICY_EXPLANATION,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    if (isDefault) "Showing the default policy." else "A custom policy.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
             OutlinedTextField(
                 if (loading) "Loading…" else text,
                 { text = it.take(PERMISSION_POLICY_MAX) },
                 label = { Text("Policy") },
                 enabled = !loading,
+                // bodyMedium, not the field's default bodyLarge: closer to the
+                // web textarea's density for a long free-text policy.
+                textStyle = MaterialTheme.typography.bodyMedium,
                 minLines = 8,
                 maxLines = 16,
                 modifier = Modifier.fillMaxWidth(),

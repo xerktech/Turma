@@ -869,7 +869,15 @@ private fun SummaryTile(label: String, value: String, hint: String, modifier: Mo
  * and the org filter (XERK-62) for the same reason — one scope, on every screen.
  */
 @Composable
-fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
+fun ScreenHeader(
+    title: String,
+    // Page-specific entries for the ⋮ overflow, listed above Sign out — a LABELLED
+    // home for a page action too rare to earn a header icon (XERK-1566: an extra
+    // icon squeezed the org filter to a bare "…" on a phone). Given `close` to
+    // shut the menu as it acts.
+    menuItems: @Composable (close: () -> Unit) -> Unit = {},
+    actions: @Composable () -> Unit = {},
+) {
     val signOut = LocalSignOut.current
     var menuOpen by remember { mutableStateOf(false) }
     Row(
@@ -916,6 +924,7 @@ fun ScreenHeader(title: String, actions: @Composable () -> Unit = {}) {
                 Box {
                     HeaderIconButton(onClick = { menuOpen = true }) { Icon(Icons.Filled.MoreVert, "More") }
                     DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        menuItems { menuOpen = false }
                         DropdownMenuItem(
                             text = { Text("Sign out") },
                             onClick = { menuOpen = false; signOut() },

@@ -6,6 +6,7 @@ import androidx.compose.ui.semantics.SemanticsProperties
 import androidx.compose.ui.test.SemanticsMatcher
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.assertCountEquals
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsEnabled
 import androidx.compose.ui.test.assertIsNotEnabled
@@ -42,7 +43,8 @@ import java.util.concurrent.TimeUnit
  * these drive that route over the real HTTP stack: the load, a save, the hub's
  * refusal words (XERK-264) with the operator's edit kept (or as a message once
  * the sheet was dismissed mid-save), "Use default" as
- * `{text:null}`, an absent-field body, and the org-less view with no button.
+ * `{text:null}`, an absent-field body, and the org-less view with no entry. The
+ * entry is a labelled item in the header's ⋮ overflow, never a header icon.
  */
 @RunWith(RobolectricTestRunner::class)
 @Config(
@@ -106,10 +108,19 @@ class BoardPermissionPolicyTest {
         compose.waitForIdle()
     }
 
-    /** Open the sheet and wait out its GET (the field reads "Loading…" until then). */
-    private fun openSheet() {
-        compose.onNodeWithContentDescription("Permission policy").performClick()
+    /** Open the header's ⋮ overflow menu. */
+    private fun openOverflow() {
+        compose.onNodeWithContentDescription("More").performClick()
         compose.waitForIdle()
+    }
+
+    /**
+     * Open the sheet through the ⋮ overflow's labelled entry and wait out its GET
+     * (the field reads "Loading…" until then).
+     */
+    private fun openSheet() {
+        openOverflow()
+        click("Permission policy")
         compose.waitUntil(WAIT_MS) {
             compose.onAllNodesWithText("Loading…").fetchSemanticsNodes().isEmpty()
         }
@@ -147,7 +158,18 @@ class BoardPermissionPolicyTest {
 
         waitForText("Allow npm test.")
         compose.onNodeWithText("Permission policy").assertIsDisplayed()
-        compose.onNodeWithText("A custom policy.", substring = true).assertIsDisplayed()
+        // The status is its OWN line (an exact-text node), never mid-explanation.
+        compose.onNodeWithText("A custom policy.").assertIsDisplayed()
+        // The explanation claims only the deterministic refusal (XERK-1595).
+        compose.onNodeWithText(PERMISSION_POLICY_EXPLANATION).assertIsDisplayed()
+        assertTrue(
+            PERMISSION_POLICY_EXPLANATION.contains(
+                "Commands it recognises as force pushes, merges, pushes to main or production " +
+                    "changes are refused before the model is asked, whatever this text says.",
+            ),
+        )
+        assertTrue(!PERMISSION_POLICY_EXPLANATION.contains("never auto-approved"))
+        compose.onAllNodesWithText("never auto-approved", substring = true).assertCountEquals(0)
         // A custom text can drop back to the default.
         compose.onNodeWithText("Use default").assertIsEnabled()
         compose.onNodeWithText("Save policy").assertIsEnabled()
@@ -210,7 +232,7 @@ class BoardPermissionPolicyTest {
 
         waitForText("The default.")
         assertEquals("""{"text":null}""", posts.single())
-        compose.onNodeWithText("Showing the default policy.", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("Showing the default policy.").assertIsDisplayed()
         compose.onNodeWithText("Use default").assertIsNotEnabled()
         closeSheet()
     }
@@ -221,7 +243,7 @@ class BoardPermissionPolicyTest {
         openBoard()
         openSheet()
 
-        compose.onNodeWithText("Showing the default policy.", substring = true).assertIsDisplayed()
+        compose.onNodeWithText("Showing the default policy.").assertIsDisplayed()
         // An absent `text` reads empty, never "null" or a stale value.
         compose.onNode(hasSetTextAction() and hasText("Policy"))
             .assert(SemanticsMatcher.expectValue(SemanticsProperties.EditableText, AnnotatedString("")))
@@ -274,8 +296,23 @@ class BoardPermissionPolicyTest {
     }
 
     @Test
-    fun `an org-less board offers no permission policy button`() {
+    fun `the entry is a labelled overflow item, not a header icon`() {
+        openBoard()
+        // No header icon: a fourth one squeezed the org filter to a bare "…".
+        compose.onNodeWithContentDescription("Permission policy").assertDoesNotExist()
+        compose.onNodeWithText("Permission policy").assertDoesNotExist()
+        openOverflow()
+        compose.onNodeWithText("Permission policy").assertIsDisplayed()
+        compose.onNodeWithText("Sign out").assertIsDisplayed()
+    }
+
+    @Test
+    fun `an org-less board offers no permission policy entry`() {
         openBoard(jira = null)
         compose.onNodeWithContentDescription("Permission policy").assertDoesNotExist()
+        openOverflow()
+        // The ⋮ menu still opens (Sign out), with no policy entry in it.
+        compose.onNodeWithText("Sign out").assertIsDisplayed()
+        compose.onNodeWithText("Permission policy").assertDoesNotExist()
     }
 }

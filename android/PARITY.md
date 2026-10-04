@@ -706,9 +706,10 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     `GET|POST /api/jira/<site>/permission-policy`, read into `PermissionPolicyResponse` (every field
     optional: absent `text` = "", absent `isDefault` = the default, as the web reads them). Nothing on
     the fleet payload changed, so the atomic decode is untouched.
-  - **`PermissionPolicySheet`** (header gavel "Permission policy" button beside "Triage policy",
+  - **`PermissionPolicySheet`** (a labelled "Permission policy" item in the header's ⋮ overflow —
+    the web folds it behind its ⋯ menu; a header icon squeezed the org filter to "…" on a phone —
     shown only with a reporting org — the web panel bails with no `policySites`): the org picker, the
-    web's note wording, a 16000-character field (`PERMISSION_POLICY_MAX`, the hub's limit), **Use
+    web's note wording with the status on its own line, a 16000-character field (`PERMISSION_POLICY_MAX`, the hub's limit), **Use
     default** (`{text:null}`, off while already default), Cancel, **Save policy** (`{text}`; "" turns
     the judge off for the org). State lives in `BoardViewModel.permission`.
   - **No optimistic success**: only the hub's 200 changes the sheet (it shows what the hub stored); a

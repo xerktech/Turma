@@ -3313,7 +3313,10 @@ test("XERK-1566: the permission policy panel loads, saves and resets the org's t
   assert.deepEqual(calls[0], { url: "/api/jira/acme.atlassian.net/permission-policy",
     method: "GET", body: undefined });
   assert.match(panel(), /data-perm-text="1"[^>]*>Allow tests\.<\/textarea>/);
-  assert.match(panel(), /A custom policy/);
+  assert.match(panel(), /<p class="tp-note" data-perm-status="1">A custom policy\.<\/p>/,
+    "the status is its own line, never mid-explanation");
+  assert.match(panel(), /Commands it\s+recognises as force pushes, merges, pushes to main or production changes are refused\s+before the model is asked, whatever this text says\./);
+  assert.doesNotMatch(panel(), /never auto-approved/, "the explanation must not over-claim (XERK-1595)");
   assert.doesNotMatch(panel(), /data-perm-default="1" disabled/, "a custom text can be reset");
 
   answer = { text: "New <b>rules</b>", isDefault: false };
@@ -3325,7 +3328,7 @@ test("XERK-1566: the permission policy panel loads, saves and resets the org's t
   answer = { text: "the default", isDefault: true };
   await page.savePermissionPolicy(null);
   assert.deepEqual(calls[2].body, { text: null });
-  assert.match(panel(), /Showing the default policy/);
+  assert.match(panel(), /data-perm-status="1">Showing the default policy\.<\/p>/);
   assert.match(panel(), /data-perm-default="1" disabled/);
 });
 
