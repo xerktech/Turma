@@ -211,6 +211,8 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
     take a second sleeper while a newer one (another org, another repo) got none.
   - **An orphan pause is adopted, not duplicated**: one whose ticket no longer waits (dispatched,
     cancelled, unstamped) is re-stamped to a waiting ticket that fits its host.
+  - **An orphan no waiting ticket adopts is withdrawn** if undelivered (`dropQueuedCommand`), the
+    empty-queue drain included — else a cancelled ticket's pause kills a sleeper for nothing.
 - **A pause never handed to a host that went offline is withdrawn** (`reclaimStrandedTicketSpawns`,
   no `deliveredAt`): the demand it answered may be gone when the host returns, and the agent
   re-checks only the sleeper, never the queue. A delivered one is left (it has likely run).

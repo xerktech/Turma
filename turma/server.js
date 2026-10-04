@@ -12975,7 +12975,11 @@ function holdQueued(e, reason, error) {
 // TICKET_QUEUE_MAX_WAIT_MS caps any wait, TICKET_QUEUE_STALE_MS a ticket no host
 // reports any more, TICKET_QUEUE_BLOCKED_MAX_MS one nothing can route.
 function drainTicketQueue() {
-  if (!ticketQueue.length) return;
+  if (!ticketQueue.length) {
+    // Nothing waits, so no undelivered sleeper pause answers anything (XERK-1575).
+    pauseSleepersFor([]);
+    return;
+  }
   const now = Date.now();
   // A due paused sleeper (XERK-1575) takes a freed slot ahead of the queue: it
   // was paused FOR queued work, and starving it would turn a pause into a kill.
@@ -13414,7 +13418,6 @@ function wakePausedSleepers(now = Date.now()) {
 // the stamp) is adopted by a waiting ticket that could run on that host, rather
 // than pausing another sleeper for it.
 function pauseSleepersFor(waiting, now = Date.now(), rows) {
-  if (!waiting.length) return;
   const waitingKeys = new Set(waiting.map(({ e }) => ticketQueueKey(e.siteKey, e.issueKey)));
   const answered = new Set();
   const orphans = [];
@@ -13462,6 +13465,16 @@ function pauseSleepersFor(waiting, now = Date.now(), rows) {
     answered.add(key);
     console.log(`sleeper slot: pausing ${logName(best.s.id)} on ${logName(best.host)}`
       + ` for ${logName(e.issueKey)}`);
+  }
+  // A pause no waiting ticket answered or adopted frees a slot for nothing — its
+  // ticket was cancelled or dispatched elsewhere — so withdraw it while the agent
+  // has not been handed it yet. A delivered one may already be running: leave it.
+  for (const { host, c } of orphans) {
+    if (!("deliveredAt" in c)) {
+      dropQueuedCommand(host, c.cmdId, "pauseSleeper");
+      console.log(`sleeper slot: withdrew the pause of ${logName(c.sessionId)} on `
+        + `${logName(host)} — no ticket waits for its slot any more`);
+    }
   }
 }
 

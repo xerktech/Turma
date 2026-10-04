@@ -18765,6 +18765,11 @@ class SessionManager:
         # A failed probe drops the entry ("can't tell" = not quiet). In-memory
         # only; the next beat re-learns it.
         self._quiet = {}
+        # sid -> time.monotonic() of the last machine message notify_session put
+        # in that session's inbox (XERK-1575). The beat probe can read the pane
+        # idle in the moments before the inbox starts its turn, and an inbox
+        # message is on no outbox, so a pause then would lose it for good.
+        self._inbox_posted = {}
         # sids whose migration export thread is running (XERK-1575): a pause
         # then would kill a session mid-move, leaving its paused record to be
         # woken on this host while the moved copy runs on the target. Written by
@@ -25667,6 +25672,7 @@ class SessionManager:
             sock_path, pid, claude_sid = found
             if _post_to_inbox(sock_path, pid, claude_sid,
                               f"{INBOX_PREFIX}\n\n{text}"):
+                self._inbox_posted[sid] = time.monotonic()
                 log(f"notified session {sid} over its inbox "
                     f"({len(text)} chars): {text[:80]}")
                 return True
@@ -26706,6 +26712,13 @@ class SessionManager:
         # the kill would lose it (XERK-47's outbox dies with the session).
         if sess.get("pendingInputs") or self._input_undelivered(sess.get("id")):
             return "an operator message to it is not delivered yet"
+        # A machine message just went to its inbox: the idle read may predate the
+        # turn it starts, so wait out two beats before trusting quiet again.
+        posted = self._inbox_posted.get(sess.get("id"))
+        if posted is not None:
+            if time.monotonic() - posted < 2 * INTERVAL:
+                return "a message was just posted to its inbox"
+            self._inbox_posted.pop(sess.get("id"), None)
         return None
 
     def pause_sleeper(self, sid, now_ms=None, operator_pending=False):

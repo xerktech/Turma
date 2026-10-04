@@ -23833,6 +23833,28 @@ test("XERK-1575: a full host pauses its FARTHEST quiet sleeper, one per waiting 
   ticketQueue.length = 0; delete agents[host];
 });
 
+test("XERK-1575: an undelivered pause is withdrawn once its ticket stops waiting", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpCancel";
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeperSession("s1", 60 * 60_000), sleeperSession("s2", 3 * 60 * 60_000)] });
+  await startTicket(SLEEP_SITE, "ENG-5");
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["s2"]);
+  const d = await request("DELETE", `/api/jira/${SLEEP_SITE}/ENG-5/session`, { headers: userHeaders });
+  assert.equal(d.status, 200);
+  assert.equal(ticketQueue.length, 0);
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0,
+    "no ticket waits, so the never-handed-over pause is dropped");
+  // A pause already handed to the agent may be running: it is left alone.
+  agents[host].commands = [{ cmdId: "handed", type: "pauseSleeper", sessionId: "s1",
+    deliveredAt: Date.now() }];
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.cmdId), ["handed"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
 test("XERK-1575: each pause answers ONE ticket — a second ticket queued mid-pause gets its own", async () => {
   resetAutoStart(); resetSleepers();
   const siteA = "slptwoa.atlassian.net", siteB = "slptwob.atlassian.net";

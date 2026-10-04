@@ -17774,6 +17774,22 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sm._stage_input("someone-else", "hi")
         self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
 
+    def test_a_fresh_inbox_message_refuses_the_pause(self):
+        # notify_session's inbox post is on no outbox: a pause in the beat that
+        # read the pane idle just before the message's turn began would lose it.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        with mock.patch.object(ha, "_session_inbox", lambda cs: ("/s.sock", 42, cs)), \
+                mock.patch.object(ha, "_inbox_opted_out", lambda wt: False), \
+                mock.patch.object(ha, "_post_to_inbox", lambda *a: True):
+            self.assertTrue(sm.notify_session(sess["id"], "new review comment"))
+        self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        self.assertIs(sm._find(sess["id"]), sess)
+        # Two beats on, the quiet read postdates the message: it pauses.
+        sm._inbox_posted[sess["id"]] -= 2 * ha.INTERVAL + 1
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        self.assertNotIn(sess["id"], sm._inbox_posted)
+
     def test_the_worker_clears_its_in_flight_mark(self):
         sm = self._manager()
         seen = []

@@ -115,6 +115,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   worker (`input_inflight`), landed but not recorded, or on the `pendingInputs` outbox
   (`_input_undelivered`). `handle_commands` pre-scans its batch for `SLEEPER_PANE_COMMANDS` on the
   session, so a pause listed BEFORE the input is refused too. Killing would drop the message.
+- **Never within two beats of an inbox post** (`_inbox_posted`, set by `notify_session`): the probe
+  can read idle before that turn starts, and an inbox message is on no outbox to re-send it.
 - **Never mid-move**: `_export_running(sid)` refuses while a migration export thread runs for it
   (`_exporting`, marked before the thread starts, cleared in `_export_session_tracked`'s finally),
   and an `exportSession` in the same batch counts like a pane command. Paused mid-move, the record
