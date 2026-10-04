@@ -60,6 +60,9 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 - **A classifier block with no tool rule gets NO rule** — a sentence lifted from its deny reason
   pastes nowhere. Its group carries `denyReason` instead, shown as the "why" under "no rule".
 - The ask-in-chat entry is a pointer, not a setting: the card shows it as text with no Copy.
+  - Each ask row reads "Instructions, not a setting — see the note below"; ONE note under the
+    table (`PERM_BEHAVIOUR_NOTE`) names the fix: step 0 of "Delivering work" in each host's global
+    `~/.claude/CLAUDE.md`. The hub's terse pointer repeated per row told the operator nothing.
 - **Never an allow-everything Bash rule, by construction: a POSITIVE allowlist.** `BASH_SAFE_HEADS`
   (single words: `ls`, `cat`, `grep`, `jq`…) and `BASH_SAFE_SUBCOMMANDS` (`git status`, `gh pr`,
   `docker ps`…) are the ONLY Bash heads that get `Bash(<head>:*)`. A prefix rule allows the head with
@@ -155,11 +158,23 @@ consumes this table; it does not replace it.
   - **Below 600px each group reflows to a stacked block** (CSS only, same markup): kind + subject;
     one line of count / answers / wait (`data-label`); the rule + Copy on its own line. No sideways
     scroll — the sticky Prompt column used to cover the rule column on a phone.
+  - An answered ask's "—" answers cell is hidden there (`perm-stat-na`); an all-open group reads
+    "still open", so the label never sits over a bare "—" or "open".
+  - **A rule and its Copy share one flex line (`.perm-rule-line`) at every width**: the rule shrinks
+    and wraps inside its box, Copy keeps its place beside it. An inline-block rule at 100% width
+    pushed Copy under a long rule (`sandbox.network.allowedDomains: …`) and broke the column.
+    `permRuleCodeHtml` adds `<wbr>` after `(` and a value-starting `:`, so a narrow box wraps there,
+    not mid-name; Copy copies the raw rule.
+  - **A classifier block's "why" is its `denyReason` ALONE.** `noRuleReason` (served for its Bash
+    head) is about Bash allow rules, not why the classifier said no; it shows only with no deny reason.
   - **A recent row's host · wait · age ride ONE `.perm-meta` group, host first** (an empty part is
     dropped, not left as a blank slot); below 600px that group takes a full line, so the host always
     starts the second line. Loose spans put the host in a different place row to row.
   - **Only a command/tool subject (`.perm-subj.cmd`) breaks mid-token**; an ask's question is prose
     and wraps between words.
+  - **An ask's question is the session's markdown, rendered** (`permProseHtml`): escaped first, then
+    `code` spans become `<code>` and `**` markers drop, in ONE pass; `__` is left alone
+    (`__init__.py`). An unpaired marker stays as typed. A command subject is never read as markdown.
   - That repaint goes through `TurmaNav.preserveScroll` and re-applies "Recent prompts"' open state
     (`permRecentOpen`, caught on capture — `toggle` does not bubble). A fresh `<details>` defaults
     closed, which snapped it shut once a minute.

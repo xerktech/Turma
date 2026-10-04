@@ -1288,7 +1288,7 @@ const permView = {
 test("XERK-1563: the permission card lists each prompt with its rule and a copy button", () => {
   const html = H.permissionsCardHtml(permView, PERM_NOW);
   assert.match(html, /Permission prompts \(7 days\)/);
-  assert.match(html, /<code>Bash\(git status:\*\)<\/code><button[^>]*data-perm-rule="Bash\(git status:\*\)"/);
+  assert.match(html, /<code>Bash\(<wbr>git status:\*\)<\/code><button[^>]*data-perm-rule="Bash\(git status:\*\)"/);
   // count, answers, median wait — each labelled for the phone's stacked block
   assert.match(html, /data-label="Count">12<\/td>\s*<td[^>]*data-label="Allowed \/ denied">11 \/ 1<\/td>\s*<td[^>]*data-label="Median wait">2m<\/td>/);
   assert.match(html, /k-classifier-denied/);
@@ -1305,7 +1305,7 @@ test("XERK-1563: a group still waiting on its only answer reads 'open', never 0 
   const g = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "terraform apply",
     suggestedRule: "Bash(terraform apply:*)", medianWaitMs: null };
   const one = H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...g, count: 1, allowed: 0, denied: 0, open: 1 }] }, PERM_NOW);
-  assert.match(one, /data-label="Allowed \/ denied"><span class="perm-na"[^>]*>open<\/span><\/td>/);
+  assert.match(one, /data-label="Allowed \/ denied"><span class="perm-na"[^>]*>still open<\/span><\/td>/);
   assert.doesNotMatch(one, /0 \/ 0/);
   // Some answered, some still open: the answers, and how many still wait.
   const mixed = H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...g, count: 3, allowed: 1, denied: 0, open: 2 }] }, PERM_NOW);
@@ -1315,7 +1315,7 @@ test("XERK-1563: a group still waiting on its only answer reads 'open', never 0 
   assert.match(old, /data-label="Allowed \/ denied">1 \/ 0<\/td>/);
   // An ask still waiting is open too; once answered it is "—".
   const ask = { kind: "ask-in-chat", prompt: "May I push?", count: 1, allowed: null, denied: null };
-  assert.match(H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...ask, open: 1 }] }, PERM_NOW), />open<\/span>/);
+  assert.match(H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...ask, open: 1 }] }, PERM_NOW), />still open<\/span>/);
   assert.match(H.permissionsCardHtml({ days: 7, recent: [], top: [{ ...ask, open: 0 }] }, PERM_NOW), />—<\/span>/);
 });
 
@@ -1474,11 +1474,82 @@ test("XERK-1563: an ask-in-chat group shows its question as prose and no 0 / 0",
   assert.match(html, /data-label="Allowed \/ denied"><span class="perm-na"[^>]*>—<\/span>/);
   assert.doesNotMatch(html, /0 \/ 0/);
   // A model-behaviour pointer is not a setting: shown as text, nothing to copy.
-  assert.match(html, /Model behaviour, not a setting — see CLAUDE\.md step 0/);
+  assert.match(html, /<td class="perm-rule"><span class="none">Instructions, not a setting — see the note below<\/span><\/td>/);
   assert.doesNotMatch(html, /data-perm-rule/);
+  // The note names the file and the step, once — never the hub's bare pointer.
+  assert.match(html, /<div class="note perm-foot"><b>Asked in chat<\/b>[^<]*step 0 of “Delivering work” in the global <code>~\/\.claude\/CLAUDE\.md<\/code>/);
+  assert.doesNotMatch(html, /see CLAUDE\.md step 0/);
+  // An answered ask has no allow/deny: its "—" cell is the one a phone hides.
+  assert.match(html, /<td class="perm-stat perm-stat-na" data-label="Allowed \/ denied">/);
   // An older hub that still sends 0 / 0 for an ask reads the same.
   assert.doesNotMatch(H.permissionsCardHtml({ days: 7, recent: [], top: [
     { kind: "ask-in-chat", prompt: "ok?", count: 1, allowed: 0, denied: 0 }] }, PERM_NOW), /0 \/ 0/);
+});
+
+test("XERK-1563: four asks share ONE explanatory note; a card with no ask has none", () => {
+  const ask = (q) => ({ kind: "ask-in-chat", prompt: q, count: 1, allowed: null, denied: null,
+    suggestedRule: "model behaviour: see CLAUDE.md step 0" });
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    ask("May I push?"), ask("Shall I open the PR?"), ask("OK to delete it?"), ask("Proceed?")] }, PERM_NOW);
+  assert.equal([...html.matchAll(/perm-foot/g)].length, 1);
+  assert.equal([...html.matchAll(/Instructions, not a setting/g)].length, 4);
+  // The note sits between the table and the recent list.
+  assert.match(html, /<\/table><\/div><div class="note perm-foot">/);
+  const plain = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "dialog", tool: "Bash", head: "ls", count: 1, suggestedRule: "Bash(ls:*)" }] }, PERM_NOW);
+  assert.doesNotMatch(plain, /perm-foot/);
+});
+
+test("XERK-1563: an ask's markdown renders — code spans as code, bold markers dropped", () => {
+  const q = "Should I delete `legacy/` and **all** of `__init__.py`? Or `<b>`";
+  const html = H.permissionsCardHtml({ days: 7, top: [
+    { kind: "ask-in-chat", prompt: q, count: 1, allowed: null, denied: null }],
+  recent: [{ host: "h1", kind: "ask-in-chat", prompt: q, openedAt: PERM_NOW - 60000 }] }, PERM_NOW);
+  const want = "Should I delete <code>legacy/</code> and all of <code>__init__.py</code>? Or <code>&lt;b&gt;</code>";
+  assert.ok(html.includes(`<div class="perm-subj">${want}</div>`), "table subject");
+  assert.ok(html.includes(`<span class="perm-subj">${want}</span>`), "recent subject");
+  assert.doesNotMatch(html, /`|\*\*|<b>/);
+  // An unpaired marker (a question cut at its cap) stays as typed; a COMMAND
+  // subject is never read as markdown.
+  const cut = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "ask-in-chat", prompt: "Delete `legacy/ and", count: 1 },
+    { kind: "dialog", tool: "Bash", head: "echo", count: 1 }] }, PERM_NOW);
+  assert.match(cut, /<div class="perm-subj">Delete `legacy\/ and<\/div>/);
+});
+
+test("XERK-1563: a rule and its Copy share one line, however long the rule", () => {
+  const rule = "sandbox.network.allowedDomains: registry.npmjs.org";
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "registry.npmjs.org", count: 2,
+      allowed: 2, denied: 0, suggestedRule: rule }] }, PERM_NOW);
+  assert.ok(html.includes(`<td class="perm-rule"><span class="perm-rule-line"><code>${rule}</code><button type="button" class="perm-copy" data-perm-rule="${rule}"`));
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "usage.html"), "utf8");
+  // The line never wraps Copy under the rule: the rule shrinks, Copy does not.
+  assert.match(src, /\.perm-rule-line \{ display: flex; align-items: center; gap: 6px; \}/);
+  assert.match(src, /\.perm-rule-line code \{ flex: 0 1 auto; min-width: 0; \}/);
+  assert.match(src, /\.perm-rule-line \.perm-copy \{ flex: none;/);
+  assert.doesNotMatch(src, /td\.perm-rule:has\(\.perm-copy\)/);
+  // A narrow box wraps at `(` or a value-starting `:`, not mid-name; Copy
+  // still copies the raw rule.
+  const wf = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "dialog", tool: "WebFetch", head: "docs.example.com", count: 1,
+      suggestedRule: "WebFetch(domain:docs.example.com)" }] }, PERM_NOW);
+  assert.ok(wf.includes('<code>WebFetch(<wbr>domain:<wbr>docs.example.com)</code>'));
+  assert.ok(wf.includes('data-perm-rule="WebFetch(domain:docs.example.com)"'));
+});
+
+test("XERK-1563: a classifier block's only why is its deny reason, not the allowlist's", () => {
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "classifier-denied", tool: "Bash", head: "kubectl delete", count: 1, allowed: 0, denied: 1,
+      suggestedRule: null, noRuleReason: "not on the known read-only list, so its arguments may run code",
+      denyReason: "Deleting cluster resources is out of scope" }] }, PERM_NOW);
+  assert.match(html, /<td class="perm-rule"><span class="none">no safe rule — review it<\/span><div class="perm-why">Blocked: Deleting cluster resources is out of scope<\/div><\/td>/);
+  assert.doesNotMatch(html, /read-only list/);
+  // With no deny reason recorded, the allowlist reason is the only why left.
+  const bare = H.permissionsCardHtml({ days: 7, recent: [], top: [
+    { kind: "classifier-denied", tool: "Bash", head: "kubectl delete", count: 1, suggestedRule: null,
+      noRuleReason: "not on the known read-only list, so its arguments may run code" }] }, PERM_NOW);
+  assert.match(bare, /<div class="perm-why">not on the known read-only list, so its arguments may run code<\/div><\/td>/);
 });
 
 test("XERK-1563: a Bash head with no safe rule says review it, and Copy copies nothing", async () => {
