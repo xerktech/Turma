@@ -17,11 +17,15 @@ object Permissions {
     /** How often an open card re-reads its route (web `PERM_REFRESH_MS`). */
     const val REFRESH_MS = 60_000L
 
-    /** Kind → chip label (web `PERM_KIND`). An unknown kind reads "Prompt". */
+    /**
+     * Kind → chip label (web `PERM_KIND`). An unknown kind reads "Prompt".
+     * `judged` (XERK-1566): the agent's permission judge decided a Bash prompt.
+     */
     val KIND_LABELS = mapOf(
         "dialog" to "Dialog",
         "classifier-denied" to "Classifier block",
         "ask-in-chat" to "Asked in chat",
+        "judged" to "Judged",
     )
 
     /** The chip's colour class: a kind this build doesn't know paints as a dialog. */
@@ -167,9 +171,21 @@ object Permissions {
         if (r.waitedMs != null) parts.add("waited ${wait(r.waitedMs)}")
         else if (r.closedAt == null && r.answer.isNullOrEmpty()) parts.add("still open")
         if (!r.answer.isNullOrEmpty() && r.kind != "ask-in-chat") parts.add(r.answer)
+        judgeMeta(r)?.let(parts::add)
         val opened = r.openedAt?.takeIf { it.isFinite() && it > 0 }
         val ago = if (opened != null) fmtDuration(Math.round((nowMs - opened) / 1000.0)) + " ago" else ""
         return listOf(r.host, parts.joinToString(" · "), ago).filter { it.isNotEmpty() }
+    }
+
+    /**
+     * What the permission judge decided on a judged row, and why (XERK-1566):
+     * "judge: allow" / "judge: stand", plus " — <judgeReason>" when there is
+     * one. Null for any other kind or verdict (web `permissionsCardHtml`).
+     */
+    fun judgeMeta(r: PermissionRow): String? {
+        if (r.kind != "judged" || (r.verdict != "allow" && r.verdict != "stand")) return null
+        val why = if (!r.judgeReason.isNullOrEmpty()) " — ${r.judgeReason}" else ""
+        return "judge: ${r.verdict}$why"
     }
 
     /**

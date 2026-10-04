@@ -60,6 +60,30 @@ class PermissionDecodeTest {
         assertEquals(1759500045000.0, r.closedAt!!, 0.0)
     }
 
+    @Test fun `a judged row decodes its verdict and reason, and tolerates both absent`() {
+        val s = decode(
+            """
+            {"days":7,
+             "top":[{"kind":"judged","tool":"Bash","head":"rm","count":2,"allowed":1,"denied":1,"open":0,
+                     "medianWaitMs":3000,"lastAt":5,"suggestedRule":null}],
+             "recent":[
+              {"host":"nas01","id":"j1","sessionId":"s1","kind":"judged","tool":"Bash","head":"rm",
+               "answer":"allow","waitedMs":3000,"openedAt":5,"closedAt":8,
+               "verdict":"allow","judgeReason":"build output only"},
+              {"host":"nas01","id":"j2","sessionId":"s1","kind":"judged","tool":"Bash","head":"rm",
+               "openedAt":4}]}
+            """.trimIndent(),
+        )
+        assertEquals("judged", s.top.single().kind)
+        assertNull(s.top.single().suggestedRule)
+        val (with, without) = s.recent
+        assertEquals("judged", with.kind)
+        assertEquals("allow", with.verdict)
+        assertEquals("build output only", with.judgeReason)
+        assertNull(without.verdict)
+        assertNull(without.judgeReason)
+    }
+
     @Test fun `every field absent decodes to its can't-tell default`() {
         val s = decode("{}")
         assertEquals(0, s.days)
@@ -77,6 +101,8 @@ class PermissionDecodeTest {
         assertEquals("", r.host)
         assertNull(r.openedAt)
         assertNull(r.waitedMs)
+        assertNull(r.verdict)
+        assertNull(r.judgeReason)
     }
 
     @Test fun `a kind this build has never seen, and unknown keys, still decode`() {

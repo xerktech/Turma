@@ -25,7 +25,7 @@ data class PermissionSummary(
 /** One group of the top table: prompts that asked about the same thing. */
 @Serializable
 data class PermissionGroup(
-    /** `dialog` / `classifier-denied` / `ask-in-chat`, or a kind this build doesn't know. */
+    /** `dialog` / `classifier-denied` / `ask-in-chat` / `judged`, or a kind this build doesn't know. */
     val kind: String = "",
     val dialogKind: String? = null,
     val tool: String? = null,
@@ -64,4 +64,8 @@ data class PermissionRow(
     val waitedMs: Double? = null,
     val openedAt: Double? = null,
     val closedAt: Double? = null,
+    /** A `judged` row's verdict (XERK-1566): `allow` or `stand`; absent on any other row. */
+    val verdict: String? = null,
+    /** Why the permission judge decided as it did; absent when it gave no reason. */
+    val judgeReason: String? = null,
 )

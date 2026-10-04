@@ -136,12 +136,16 @@ private fun behaviourNote(): AnnotatedString = buildAnnotatedString {
     }
 }
 
-/** The kind chip: a classifier block reads critical, an ask warning, the rest plain. */
+/**
+ * The kind chip: a classifier block reads critical, an ask warning, a judged
+ * prompt accent (`primary` is the web's `--accent`, light and dark), the rest plain.
+ */
 @Composable
 private fun PermKindChip(kind: String, dialogKind: String?, modifier: Modifier = Modifier) {
     val color = when (Permissions.kindStyle(kind)) {
         "classifier-denied" -> TurmaColors.critical
         "ask-in-chat" -> TurmaColors.warning
+        "judged" -> MaterialTheme.colorScheme.primary
         else -> MaterialTheme.colorScheme.onSurfaceVariant
     }
     val plain = Permissions.kindStyle(kind) == "dialog"

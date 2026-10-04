@@ -717,6 +717,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   its open state is held by `PermissionsSection`, above the loading/error branch.
 - **Platform form**: Copy puts the raw rule on the clipboard with Android's own confirmation (the
   system overlay on 13+, a toast below it), where the web flashes its button.
+- **The permission judge's rows (XERK-1566) render as on the web**: kind `judged` reads "Judged" in
+  an accent-outlined chip (web `.k-judged`; `colorScheme.primary` is the web's `--accent` in both
+  themes), its group shows the web's "no rule retires this" (the hub sends no rule for it), and a
+  Recent row adds "judge: <allow|stand>[ — <judgeReason>]" after its answer
+  (`Permissions.judgeMeta`). `verdict`/`judgeReason` decode as optional strings on `PermissionRow`.
 - Tests: `core/PermissionsTest`, `model/PermissionDecodeTest`, `vm/UsagePermissionsViewModelTest`,
   `ui/PermissionsSectionTest`.
 

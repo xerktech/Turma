@@ -6,6 +6,7 @@ import com.xerktech.turma.model.PermissionGroup
 import com.xerktech.turma.model.PermissionRow
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
@@ -20,6 +21,22 @@ class PermissionsTest {
         assertEquals("Prompt", Permissions.kindLabel("sandbox-escape", null))
         assertEquals("dialog", Permissions.kindStyle("sandbox-escape"))
         assertEquals("ask-in-chat", Permissions.kindStyle("ask-in-chat"))
+    }
+
+    @Test fun `a judged prompt reads Judged in its own chip style (XERK-1566)`() {
+        assertEquals("Judged", Permissions.kindLabel("judged", null))
+        // A sub-kind is a dialog's alone; a judged row never carries one into its label.
+        assertEquals("Judged", Permissions.kindLabel("judged", "sandbox"))
+        // Its own style (web `.perm-kind.k-judged`), never the dialog fallback.
+        assertEquals("judged", Permissions.kindStyle("judged"))
+    }
+
+    @Test fun `a judged group offers no rule — the web's no-rule wording stands in`() {
+        // The hub sends `suggestedRule: null` and no reason for a judged group.
+        assertEquals(
+            Permissions.Rule.None("no rule retires this", null),
+            Permissions.rule(PermissionGroup(kind = "judged", tool = "Bash", head = "rm", count = 2, allowed = 1, denied = 1)),
+        )
     }
 
     @Test fun `the subject is the head, an ask's question, or the tool`() {
@@ -115,6 +132,27 @@ class PermissionsTest {
             Permissions.recentMeta(PermissionRow(host = "h", kind = "classifier-denied", answer = "deny", closedAt = 1.0), now))
         assertEquals(listOf("h"),
             Permissions.recentMeta(PermissionRow(host = "h", kind = "ask-in-chat", answer = "unknown", closedAt = 1.0), now))
+    }
+
+    @Test fun `a judged recent row says what the judge decided, and why, after the answer`() {
+        val now = 1_000_000_000L
+        val allow = PermissionRow(host = "nas01", kind = "judged", head = "rm -rf build", answer = "allow",
+            waitedMs = 3_000.0, verdict = "allow", judgeReason = "build output only",
+            openedAt = (now - 120_000).toDouble(), closedAt = now.toDouble())
+        assertEquals("judge: allow — build output only", Permissions.judgeMeta(allow))
+        assertEquals(
+            listOf("nas01", "waited 3s · allow · judge: allow — build output only", "2m ago"),
+            Permissions.recentMeta(allow, now),
+        )
+        // No reason: the verdict alone.
+        val stand = PermissionRow(host = "h", kind = "judged", verdict = "stand", closedAt = 1.0)
+        assertEquals("judge: stand", Permissions.judgeMeta(stand))
+        assertEquals(listOf("h", "judge: stand"), Permissions.recentMeta(stand, now))
+        // Any other verdict, an absent one, or a non-judged row: nothing.
+        assertNull(Permissions.judgeMeta(stand.copy(verdict = "deny")))
+        assertNull(Permissions.judgeMeta(stand.copy(verdict = null)))
+        assertNull(Permissions.judgeMeta(stand.copy(kind = "dialog")))
+        assertEquals(listOf("h"), Permissions.recentMeta(stand.copy(verdict = null, judgeReason = "x"), now))
     }
 
     @Test fun `the fetch scope is the pick as it applies off the live fleet, sorted`() {

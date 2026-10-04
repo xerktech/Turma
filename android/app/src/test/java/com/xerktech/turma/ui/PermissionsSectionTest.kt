@@ -184,6 +184,46 @@ class PermissionsSectionTest {
     }
 
     @Test
+    fun `a judged group and a judged recent row render as the web's (XERK-1566)`() {
+        val accent = Color(0xFF00AA55)
+        val view = PermissionSummary(
+            days = 7,
+            top = listOf(
+                PermissionGroup(kind = "judged", tool = "Bash", head = "rm -rf build", count = 2,
+                    allowed = 1, denied = 1, open = 0, medianWaitMs = 3_000.0),
+            ),
+            recent = listOf(
+                PermissionRow(host = "nas01", kind = "judged", head = "rm -rf build", answer = "allow",
+                    waitedMs = 3_000.0, verdict = "allow", judgeReason = "build output only",
+                    openedAt = (now - 120_000).toDouble(), closedAt = now.toDouble()),
+            ),
+        )
+        compose.setContent {
+            MaterialTheme(colorScheme = lightColorScheme(primary = accent)) {
+                Column(Modifier.verticalScroll(rememberScrollState())) {
+                    PermissionsSection(UsageViewModel.PermissionsUi(view = view), nowMs = now)
+                }
+            }
+        }
+        compose.waitForIdle()
+        // The group: a Judged chip in the accent (web `.k-judged`), never read as a Dialog.
+        compose.onNodeWithText("Dialog").assertDoesNotExist()
+        val chip = compose.onNodeWithText("Judged").fetchSemanticsNode()
+        assertEquals(accent, textLayout(chip).layoutInput.style.color)
+        compose.onNodeWithText("Allowed / denied 1 / 1").assertExists()
+        // No suggested rule (the hub sends none): the web's no-rule wording, and no Copy.
+        compose.onNodeWithText("no rule retires this").assertExists()
+        compose.onNodeWithText("Copy").assertDoesNotExist()
+        // The recent row: its meta carries the judge's verdict and reason after the answer.
+        compose.onNodeWithText("▸ Recent prompts (1)").performScrollTo().performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("waited 3s · allow · judge: allow — build output only").assertExists()
+        val chips = compose.onAllNodesWithText("Judged").fetchSemanticsNodes()
+        assertEquals(2, chips.size)
+        for (c in chips) assertEquals(accent, textLayout(c).layoutInput.style.color)
+    }
+
+    @Test
     fun `an empty window says so for the selected orgs`() {
         show(UsageViewModel.PermissionsUi(view = PermissionSummary(days = 7)))
         compose.onNodeWithText("No permission prompts recorded in the last 7 days for the selected orgs.")
