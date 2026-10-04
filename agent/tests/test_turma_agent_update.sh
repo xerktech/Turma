@@ -1506,6 +1506,22 @@ if [ -n "$foreign" ]; then
   fi
 fi
 kill "$live_pid" 2>/dev/null || true; wait "$live_pid" 2>/dev/null || true
+# The updater's OWN stage must name a pid that stays alive while the run does,
+# or the skip above never protects a real run (a $BASHPID read inside the
+# mktemp substitution named the dead substitution child).
+HOME="$root/home" TMPDIR="$root/tmp" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=20 TURMA_RUN_KILL_GRACE=1 \
+  "$bin/turma-agent-update" --boot >/dev/null 2>&1 &
+run_pid=$!
+cur=""; i=0
+while [ -z "$cur" ] && [ "$i" -lt 50 ]; do sleep 0.2; cur="$(own_stages)"; i=$((i + 1)); done
+stage_pid="${cur#turma-update."$tag".}"; stage_pid="${stage_pid%%.*}"
+if [ -n "$cur" ] && kill -0 "$stage_pid" 2>/dev/null; then
+  pass "a running updater's stage names its own live pid ($stage_pid)"
+else
+  fail "a running updater's stage names a dead pid (stage='$cur')"
+fi
+stop_loop "$run_pid" "$bin"
 rm -rf "$root"
 
 # 35. A holder that is ALREADY wedged (deadline disabled, so only the reclaim can

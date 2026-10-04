@@ -954,7 +954,7 @@ sweep_stages() {
 # The agent self-update. Claude Code and dsh are NOT part of this — see the
 # Claude Code / dsh sections for why they only ever run at agent start.
 run_once() {
-  local cur stage
+  local cur stage me
   # Stamp FIRST, so a run that then wedges or dies still bounds the next
   # start-fired check.
   stamp_now "$STAMP"
@@ -967,7 +967,10 @@ run_once() {
   # trapped signal until its foreground child exits, so a TERM to a run wedged
   # on a hung child would no longer end it, and a KILL runs no trap anyway.
   sweep_stages
-  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.$PREFIX_TAG.$BASHPID.XXXXXX")"
+  # Read OUTSIDE the $(...): inside it, $BASHPID is the short-lived substitution
+  # child, and a stage named for a dead pid is swept from under a live run.
+  me="$BASHPID"
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.$PREFIX_TAG.$me.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf '$stage' '$PREFIX.update'" RETURN
 
