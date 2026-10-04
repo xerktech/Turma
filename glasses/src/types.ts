@@ -108,7 +108,12 @@ export interface SessionInfo {
   // The hub-derived attention state (XERK-1571, server.js sessionAttention):
   // `state` is needs-you:<why> | working | waiting | sleeping | idle, `since`
   // the epoch ms it last changed. Absent from an older hub.
-  attention?: { state: string; since: number; eta?: number; why?: string } | null;
+  // `hint` is the wait classifier's verdict (XERK-1572): what kind of wait and
+  // why, plus the answer it suggests. Absent when the hub serves none.
+  attention?: {
+    state: string; since: number; eta?: number; why?: string;
+    hint?: { label: string; why: string; suggestedAnswer?: string };
+  } | null;
   [key: string]: unknown;
 }
 

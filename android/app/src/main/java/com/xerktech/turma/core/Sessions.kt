@@ -234,8 +234,9 @@ fun attentionWhy(att: Attention?, now: Long): String {
 
 /**
  * A fleet card's State row for a session the hub says needs the operator (XERK-1571,
- * web index.html `attentionLabel`): "review · PR open · CI passing", "stalled ·
- * Watch CI", "waiting for your answer", "waiting for your permission". Null when it
+ * web index.html `attentionLabel`): "review · PR open · CI passing", "awaiting your
+ * test · PR open", "stalled · Watch CI", "waiting for your answer", "waiting for your
+ * permission". Null when it
  * doesn't — the card then keeps its own live-state word. Used where that word would
  * be "idle", so a session Ready for review lists never reads idle on its own card.
  */
@@ -244,11 +245,45 @@ fun attentionLabel(att: Attention?): String? {
     val chip = needsYouChip(att.state) ?: return null
     if (chip == "question") return "waiting for your answer"
     if (chip == "permission") return "waiting for your permission"
-    return listOf(chip, att.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
+    // A review the classifier says needs a human TEST (XERK-1572) reads as one,
+    // not as a bare "test" chip word — the web dashboard and Sessions headline.
+    val word = if (chip == "test") "awaiting your test" else chip
+    return listOf(word, att.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
 }
 
 /** Does the hub say this session has STALLED on a background wait (XERK-1571)? */
 fun attentionStalled(att: Attention?): Boolean = att?.state == "needs-you:stalled"
+
+/** The wait classifier's label as a card reads it (XERK-1572, web `HINT_KIND`). */
+fun hintKind(label: String): String = when (label) {
+    "rubber-stamp" -> "go-ahead"
+    "design-decision" -> "decision"
+    "needs-human-test" -> "needs a human test"
+    "blocked-on-host" -> "blocked on the host"
+    "looping" -> "looping"
+    "waiting-external" -> "waiting on something outside"
+    else -> ""
+}
+
+/**
+ * The wait classifier's why on a needs-you card (XERK-1572, web sessions.html
+ * `.att-hint`): "decision · Pick schema v2 or v3". "" when the hub serves no
+ * verdict, or the session no longer needs the operator.
+ */
+fun attentionHintLine(att: Attention?): String {
+    if (att == null || needsYouChip(att.state) == null) return ""
+    val h = att.hint ?: return ""
+    if (h.why.isBlank()) return ""
+    val kind = hintKind(h.label)
+    return if (kind.isEmpty()) h.why else "$kind\u00A0·\u00A0${h.why}"
+}
+
+/** The answer the classifier suggests, as "Suggested: …" (XERK-1572), or "". */
+fun attentionSuggested(att: Attention?): String {
+    if (attentionHintLine(att).isEmpty()) return ""
+    val a = att?.hint?.suggestedAnswer?.takeIf { it.isNotBlank() } ?: return ""
+    return "Suggested: $a"
+}
 
 /**
  * Has this PR left the operator's plate? MERGED/CLOSED are the two end states;

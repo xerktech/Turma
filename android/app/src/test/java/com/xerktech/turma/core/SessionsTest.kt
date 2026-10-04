@@ -283,10 +283,29 @@ class SessionsTest {
         assertEquals("waiting for your answer", attentionLabel(att("needs-you:question", now, "Ship it?")))
         assertEquals("waiting for your permission", attentionLabel(att("needs-you:permission", now, "Bash: ls")))
         assertEquals("review", attentionLabel(att("needs-you:review", now)))
+        assertEquals("awaiting your test · PR open", attentionLabel(att("needs-you:test", now, "PR open")))
         assertEquals(null, attentionLabel(att("working", now)))
         assertEquals(null, attentionLabel(null))
         assertEquals(true, attentionStalled(att("needs-you:stalled", now)))
         assertEquals(false, attentionStalled(att("needs-you:review", now)))
+    }
+
+    // XERK-1572: the wait classifier's verdict on a needs-you card, worded as the web's.
+    @Test fun `attentionHintLine and attentionSuggested read the classifier's verdict`() {
+        val hinted = com.xerktech.turma.model.Attention(state = "needs-you:review", since = now,
+            hint = com.xerktech.turma.model.AttentionHint("design-decision", "Pick v2 or v3.", "Go with v3."))
+        assertEquals("decision\u00A0·\u00A0Pick v2 or v3.", attentionHintLine(hinted))
+        assertEquals("Suggested: Go with v3.", attentionSuggested(hinted))
+        assertEquals("needs a human test\u00A0·\u00A0x", attentionHintLine(hinted.copy(state = "needs-you:test",
+            hint = com.xerktech.turma.model.AttentionHint("needs-human-test", "x"))))
+        assertEquals("", attentionSuggested(hinted.copy(hint = hinted.hint!!.copy(suggestedAnswer = null))))
+        // Only while the session needs the operator, and only with a why.
+        assertEquals("", attentionHintLine(hinted.copy(state = "working")))
+        assertEquals("", attentionSuggested(hinted.copy(state = "working")))
+        assertEquals("", attentionHintLine(hinted.copy(hint = hinted.hint!!.copy(why = " "))))
+        assertEquals("", attentionHintLine(att("needs-you:review", now)))
+        assertEquals("Retries npm ci.", attentionHintLine(hinted.copy(
+            hint = com.xerktech.turma.model.AttentionHint("unknown-label", "Retries npm ci."))))
     }
 
     @Test fun `sortedBySince puts the oldest first and keeps since-less rows in place after them`() {

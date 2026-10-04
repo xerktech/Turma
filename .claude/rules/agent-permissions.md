@@ -83,11 +83,23 @@ hook-log tail) + `agent/hooks/permlog.py`.
     prompt answered between beats, and stays its own row.
 - **`classifier-denied`** — auto mode's soft block shows NO dialog: the model is told no and turns to
   the human in chat. Only the `PermissionDenied` hook sees it. A complete row on its own.
-- **`ask-in-chat`** — the session ended its turn asking for permission in prose. INTERIM: a cheap
-  regex (`PERMISSION_ASK_RE`) on the last assistant message, once per turn, on the agent's
-  ended-turn edge (idle pane, nothing pending, last word the assistant's with no tool call); closed by
-  the next operator `input` (`via:"turma"`). Sessions already sitting there on a manager's first beat
-  are PRIMED, not re-filed. Replaced by the wait classifier (a later XERK-1560 child).
+- **`ask-in-chat`** — the session ended its turn asking for permission in prose, judged once per
+  turn on the agent's ended-turn edge (idle pane, nothing pending, last word the assistant's with no
+  tool call); closed by the next operator `input` (`via:"turma"`). Sessions already sitting there on
+  a manager's first beat are PRIMED, not re-filed.
+  - **Where the wait classifier runs (XERK-1572) ITS verdict decides**: the turn waits in
+    `_perm_ask_pending` and a `rubber-stamp` label opens the row (prompt = the session's asking
+    sentence via the regex, else the classifier's `why`; `openedAt` = the edge); any other label
+    opens none, even where the regex would have matched.
+  - **A manager restart mid-classification does not lose the ask**: the first beat primes, EXCEPT
+    a turn whose persisted `attentionHint` is the same `review|<ts>` edge and not yet `done` — that
+    one goes back into `_perm_ask_pending`, so the re-staged verdict still files it.
+  - **The hub's own stall/loop nudge is not an answer**: it rides `input` with `source:"nudge"`,
+    which skips `_permission_close_ask` — no pending ask is settled, no open row closed `via:"turma"`.
+  - **The regex (`PERMISSION_ASK_RE`, `_permission_ask_prompt`) is the FALLBACK**: a dsh/qwen
+    session, `TURMA_ATTENTION_HINTS=0`, a classifier that gave no verdict after its last attempt,
+    and a turn answered (Turma `input` or the session moved on) before the verdict landed — that
+    last one opens and closes the row at once, so a quick answer still counts.
   - **Answered OUTSIDE Turma** (the terminal, claude.ai) it closes `via:"terminal"` once the session
     moves past the asking turn: the pane went busy, a newer `user` entry, or a NEWER ended turn. An
     open row blocks every later ask of that session, so it must not wait for a Turma `input`. A
