@@ -20581,6 +20581,29 @@ class TestListGithubRepos(unittest.TestCase):
             self.assertEqual(ha.list_github_repos(), [])
 
 
+_REAL_POPEN = subprocess.Popen
+
+
+@contextlib.contextmanager
+def _patch_clone_popen(**kw):
+    """Fake ONLY clone()'s `git clone` Popen; yield the mock that receives it.
+
+    subprocess.Popen is process-global, and subprocess.run calls it, so a plain
+    patch also catches every Popen another thread makes while it is in place —
+    a worker an earlier test left running, say. Its args then overwrite what the
+    fake captured, so the test asserts against a stranger's call (XERK-1493).
+    Every other caller gets the real Popen and never touches the mock."""
+    fake = mock.MagicMock(**kw)
+
+    def route(args, *a, **k):
+        if list(args[:2]) == ["git", "clone"]:
+            return fake(args, *a, **k)
+        return _REAL_POPEN(args, *a, **k)
+
+    with mock.patch.object(ha.subprocess, "Popen", side_effect=route):
+        yield fake
+
+
 class TestClone(ManagerMixin, unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -20592,7 +20615,7 @@ class TestClone(ManagerMixin, unittest.TestCase):
 
     def test_invalid_spec_records_error_without_popen(self):
         sm = self.make_manager()
-        with mock.patch.object(ha.subprocess, "Popen") as popen:
+        with _patch_clone_popen() as popen:
             sm.clone("not a repo")
             popen.assert_not_called()
         jobs = sm._clones_payload()
@@ -20602,7 +20625,7 @@ class TestClone(ManagerMixin, unittest.TestCase):
     def test_existing_dest_refused_without_popen(self):
         sm = self.make_manager()
         os.makedirs(os.path.join(self.repos_root, "Turma"))
-        with mock.patch.object(ha.subprocess, "Popen") as popen:
+        with _patch_clone_popen() as popen:
             sm.clone("xerktech/Turma")
             popen.assert_not_called()
         job = sm.clones["Turma"]
@@ -20628,8 +20651,7 @@ class TestClone(ManagerMixin, unittest.TestCase):
             captured["tmp"] = args[-1]  # git clone --progress -- <url> <tmp>
             return FakeProc()
 
-        with mock.patch.object(ha.subprocess, "Popen",
-                               side_effect=fake_popen) as popen:
+        with _patch_clone_popen(side_effect=fake_popen) as popen:
             sm.clone("xerktech/Turma")
             # git clone <url> <tmp> was launched (not a session run_ok call).
             args = popen.call_args[0][0]
@@ -20668,7 +20690,7 @@ class TestClone(ManagerMixin, unittest.TestCase):
             def kill(self_inner):
                 pass
 
-        with mock.patch.object(ha.subprocess, "Popen", return_value=FailProc()):
+        with _patch_clone_popen(return_value=FailProc()):
             sm.clone("xerktech/Turma")
         sm._poll_clones()
         self.assertEqual(sm.clones["Turma"]["status"], "error")
@@ -20706,7 +20728,7 @@ class TestCloneStaging(ManagerMixin, unittest.TestCase):
                 os.makedirs(os.path.join(args[-1], ".git"), exist_ok=True)
             return RunningProc()
 
-        with mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+        with _patch_clone_popen(side_effect=fake_popen):
             sm.clone("xerktech/Turma")
         return captured["tmp"]
 
@@ -20753,7 +20775,7 @@ class TestCloneStaging(ManagerMixin, unittest.TestCase):
             os.makedirs(args[-1], exist_ok=True)  # a partial checkout, no .git
             return FailProc()
 
-        with mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+        with _patch_clone_popen(side_effect=fake_popen):
             sm.clone("xerktech/Turma")
         sm._poll_clones()
         self.assertEqual(sm.clones["Turma"]["status"], "error")
@@ -20778,7 +20800,7 @@ class TestCloneStaging(ManagerMixin, unittest.TestCase):
             captured["tmp"] = args[-1]
             return DoneProc()
 
-        with mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+        with _patch_clone_popen(side_effect=fake_popen):
             sm.clone("xerktech/Turma")
         # Something else claims the dest before the poll reaps the clone.
         os.makedirs(os.path.join(self.repos_root, "Turma"))
@@ -20855,8 +20877,7 @@ class TestCloneStaging(ManagerMixin, unittest.TestCase):
             procs.append(p)
             return p
 
-        with mock.patch.object(ha.subprocess, "Popen",
-                               side_effect=fake_popen) as popen:
+        with _patch_clone_popen(side_effect=fake_popen) as popen:
             sm.clone("xerktech/Turma")
             first = sm.clones["Turma"]
             tmp = first["tmp"]
@@ -20868,8 +20889,7 @@ class TestCloneStaging(ManagerMixin, unittest.TestCase):
         self.assertFalse(procs[0].killed)
         # A terminal job does NOT block a fresh re-clone.
         first["status"] = "error"
-        with mock.patch.object(ha.subprocess, "Popen",
-                               side_effect=fake_popen) as popen2:
+        with _patch_clone_popen(side_effect=fake_popen) as popen2:
             sm.clone("xerktech/Turma")
             self.assertEqual(popen2.call_count, 1)
         self.assertEqual(sm.clones["Turma"]["status"], "cloning")
@@ -20894,7 +20914,7 @@ class TestCloneStaging(ManagerMixin, unittest.TestCase):
             captured["proc"] = RunningProc()
             return captured["proc"]
 
-        with mock.patch.object(ha.subprocess, "Popen", side_effect=fake_popen):
+        with _patch_clone_popen(side_effect=fake_popen):
             sm.clone("xerktech/Turma")
         sm._kill_clones()
         self.assertTrue(captured["proc"].killed)
