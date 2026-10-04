@@ -76,6 +76,27 @@ class AgentDecodeTest {
         assertNull(plain.agents[0].sessions[0].ticket!!.outcome)
     }
 
+    @Test fun `a paused sleeper's wake decodes on the closed channel`() {
+        // XERK-1575: closedSessions[].paused = {wakeAt, wakeReason?, at?}, rebuilt
+        // hub-side (wirePaused); absent = an ordinary kill.
+        val body = """
+            { "now": 1, "agents": [ {
+              "key": "h", "device": "h", "online": true,
+              "closedSessions": [
+                { "id": "c1", "repo": "r", "paused": { "wakeAt": 1786403600000, "wakeReason": "check CI", "at": 1786400000000 } },
+                { "id": "c2", "repo": "r", "paused": { "wakeAt": 1786403600000 } },
+                { "id": "c3", "repo": "r" }
+              ]
+            } ] }
+        """.trimIndent()
+        val c = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].closedSessions
+        assertEquals(1786403600000L, c[0].paused!!.wakeAt)
+        assertEquals("check CI", c[0].paused!!.wakeReason)
+        assertEquals(1786400000000L, c[0].paused!!.at)
+        assertEquals("", c[1].paused!!.wakeReason)
+        assertNull(c[2].paused)
+    }
+
     @Test fun `a closed session with no ticket decodes to null`() {
         val body = """
             { "now": 1, "agents": [ {
@@ -853,5 +874,34 @@ class AgentDecodeTest {
         val older = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [ $plainHost ] }""")
         assertTrue(older.briefs.isEmpty())
         assertEquals(listOf("mxh-t16"), older.agents.map { it.key })
+        assertNull(b.narrative)
+    }
+
+    // XERK-1574: the brief's narrative and the per-org decisions log are TYPED
+    // too, so a hub's must decode and an older hub's absence must read as none.
+    @Test fun `a brief narrative and the decisions log decode typed`() {
+        val body = """
+            { "now": 1, "agents": [ $plainHost ],
+              "briefs": { "o.atlassian.net": [ { "siteKey": "o.atlassian.net", "at": 2000,
+                "narrative": "Two tickets finished.", "narrativeAt": 2500 } ] },
+              "decisions": { "o.atlassian.net": [
+                { "id": "ab12", "at": 1000, "source": "question", "question": "Which DB?",
+                  "answer": "Postgres", "host": "h", "sessionId": "s1", "ticket": "O-1" },
+                { "at": 1100, "source": "note", "text": "No infra merges." } ] },
+              "decisionCounts": { "o.atlassian.net": 57 } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val b = resp.briefs.getValue("o.atlassian.net").single()
+        assertEquals("Two tickets finished.", b.narrative)
+        assertEquals(2500L, b.narrativeAt)
+        val log = resp.decisions.getValue("o.atlassian.net")
+        assertEquals("Postgres", log[0].answer)
+        assertEquals("O-1", log[0].ticket)
+        assertEquals("note", log[1].source)
+        assertNull(log[1].question)
+        assertEquals(57, resp.decisionCounts["o.atlassian.net"])
+        val older = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [ $plainHost ] }""")
+        assertTrue(older.decisions.isEmpty())
+        assertTrue(older.decisionCounts.isEmpty())
     }
 }

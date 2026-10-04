@@ -88,6 +88,10 @@ Python side in `.claude/rules/agent.md`.
   the pane out (`agent.md`). A tail window is a pure suffix, so re-folding is safe; a stop already
   seen beats a later-read launch (a queued notification can sit at an earlier offset than its
   launch).
+- **A watch arming SEEDS `agentState` with `backscanLiveAgents`** (XERK-1421) — the same 4 MiB
+  window + 64 KiB stops-only lead-in as `hub-agent.py`'s `_backscan_live_agents`. The per-poll tail
+  is only `TAIL_READ_BYTES` (128 KiB), so one large attachment hid an older shell from the bar
+  while the card listed it. Keep the two windows equal or card and bar disagree again.
 - `__setControlSink` lets a test drive `startWatch` → `transcriptTail` → `pollWatcher` and assert the
   emitted frame carries `agents`.
 - The pane's footer rows still ride `status.agents` while a turn runs, for live elapsed/token

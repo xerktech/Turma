@@ -493,6 +493,18 @@ class TestGuardedClaudeDir(unittest.TestCase):
                          "the REAL arm's refusal cannot be attributed to our rule")
         self.assertEqual(self._case(rel, self.REAL), DENIED)
 
+    def test_the_judge_grants_dir_and_policy_file_are_refused(self):
+        # XERK-1566: a planted grant would override the auto-mode classifier
+        # for one Bash call; the policy text is what the judge decides against.
+        # Outside ~/.claude, so the pattern is the only layer, as above.
+        for rel in (".turma/grants/s1/" + "0" * 64, ".turma/permission-policy.md"):
+            with self.subTest(rel=rel):
+                self.assertEqual(self._case(rel, self.EMPTY), ALLOWED,
+                                 "baseline: nothing refused this with empty "
+                                 "settings, so the REAL arm's refusal cannot be "
+                                 "attributed to our rule")
+                self.assertEqual(self._case(rel, self.REAL), DENIED)
+
     def test_the_memory_directory_entry_itself_is_not_writable(self):
         """A FILE planted at this name makes the directory impossible to create,
         permanently disabling that agent's memory.

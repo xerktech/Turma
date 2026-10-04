@@ -91,6 +91,15 @@ data class AgentsResponse(
     // every field below is defaulted, so an older hub (absent) reads as "no brief
     // yet" and a partial record still decodes — this payload decodes atomically.
     val briefs: Map<String, List<OrgBrief>> = emptyMap(),
+    // The per-org decisions log (XERK-1574), siteKey -> its newest operator
+    // decisions, OLDEST first (the hub serves a bounded tail). Hub-owned and
+    // sanitized on every write/restore (sanitizeDecision); every field below is
+    // defaulted, so an older hub (absent) reads as "no decisions yet".
+    val decisions: Map<String, List<OrgDecision>> = emptyMap(),
+    // siteKey -> how many decisions that org KEEPS (XERK-1574). The tail above is
+    // capped, so this is the count to show; hub-computed ints. Absent on an older
+    // hub, where the served tail is the floor.
+    val decisionCounts: Map<String, Int> = emptyMap(),
 )
 
 /**
@@ -115,6 +124,30 @@ data class OrgBrief(
     val nextUp: List<BriefItem> = emptyList(),
     val closedStale: List<BriefItem> = emptyList(),
     val spend: List<BriefSpend> = emptyList(),
+    // The brief's model-written summary (XERK-1574): one plain-text paragraph a
+    // host of the org wrote from the sections above, or null when none could be
+    // rendered. Only the newest brief carries it on the wire.
+    val narrative: String? = null,
+    val narrativeAt: Long? = null,
+)
+
+/**
+ * One entry of an org's decisions log (XERK-1574; the hub's `sanitizeDecision`
+ * shape). [source] is "question" | "permission" | "note": an answer carries the
+ * [question] and the chosen [answer], a note its [text]. [at] is epoch ms.
+ */
+@Serializable
+data class OrgDecision(
+    val id: String? = null,
+    val at: Long = 0,
+    val source: String = "",
+    val question: String? = null,
+    val answer: String? = null,
+    val text: String? = null,
+    val host: String? = null,
+    val sessionId: String? = null,
+    val ticket: String? = null,
+    val label: String? = null,
 )
 
 /** A brief's totals — each list above is capped, these are not. */
@@ -618,6 +651,18 @@ data class ClosedSessionInfo(
     // PR-status objects this session opened, same shape/type as SessionInfo.prs —
     // rendered as chips on the ended card and the read-only review's stage bar.
     val prs: List<PrInfo> = emptyList(),
+    // A sleeper the hub paused to free its slot (XERK-1575): when it wakes and
+    // why. The hub rebuilds it field by field (`wirePaused`) or drops it, so it
+    // is null for an ordinary kill and for an older hub/agent.
+    val paused: PausedSleep? = null,
+)
+
+/** A paused sleeper's wake (ClosedSessionInfo `paused`, XERK-1575). */
+@Serializable
+data class PausedSleep(
+    val wakeAt: Long = 0,
+    val wakeReason: String = "",
+    val at: Long = 0,
 )
 
 /** A session's Jira ticket link (SessionInfo/ClosedSessionInfo `ticket`). */

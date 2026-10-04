@@ -182,6 +182,134 @@ class PermlogTest(unittest.TestCase):
         self.assertTrue(permlog.append_row(self.dir, self.sid, row, max_bytes=300))
         self.assertEqual(len(self.rows()), 2)
 
+    # --- the judge hand-off (XERK-1566) ----------------------------------------
+
+    def _alive(self):
+        os.makedirs(self.dir, exist_ok=True)
+        with open(os.path.join(self.dir, permlog.JUDGE_ALIVE_FILE), "w") as f:
+            f.write("1")
+
+    def _answering(self, verdict, nonce_ok=True, delay=0.05):
+        """A fake manager: answers the first request it sees, then stops."""
+        import threading
+        seen = {}
+
+        def run():
+            import time as _t
+            end = _t.monotonic() + 5
+            while _t.monotonic() < end:
+                names = [n for n in os.listdir(self.dir)
+                         if n.endswith(permlog.JUDGE_REQ_SUFFIX)]
+                if names:
+                    path = os.path.join(self.dir, names[0])
+                    with open(path) as f:
+                        req = json.load(f)
+                    seen["req"] = req
+                    _t.sleep(delay)
+                    ans = path[:-len(permlog.JUDGE_REQ_SUFFIX)] + permlog.JUDGE_ANS_SUFFIX
+                    with open(ans + ".t", "w") as f:
+                        json.dump({"nonce": req["nonce"] if nonce_ok else "nope",
+                                   "verdict": verdict}, f)
+                    os.replace(ans + ".t", ans)
+                    return
+                _t.sleep(0.01)
+        t = threading.Thread(target=run, daemon=True)
+        t.start()
+        return seen, t
+
+    def run_judge(self, event):
+        out = io.StringIO()
+        with mock.patch.object(sys, "stdin", io.StringIO(json.dumps(event))), \
+             mock.patch.object(sys, "stdout", out), \
+             mock.patch.dict(os.environ, {"TURMA_SESSION_ID": self.sid}, clear=False):
+            rc = permlog.main(["permlog.py", self.dir, permlog.JUDGE_FLAG])
+        return rc, out.getvalue()
+
+    def judge_files(self):
+        return [n for n in os.listdir(self.dir) if ".judge." in n]
+
+    def test_an_allowed_classifier_block_asks_for_a_retry(self):
+        self._alive()
+        seen, t = self._answering("allow")
+        rc, out = self.run_judge(denied())
+        t.join()
+        self.assertEqual(rc, 0)
+        self.assertEqual(json.loads(out), {"hookSpecificOutput": {
+            "hookEventName": "PermissionDenied", "retry": True}})
+        req = seen["req"]
+        self.assertEqual(req["command"], "git push origin feature")   # the WHOLE command
+        self.assertEqual(req["denyReason"], "Pushing to a remote is outside scope")
+        self.assertEqual(req["event"], "PermissionDenied")
+        self.assertEqual(self.judge_files(), [], "req and ans are both cleaned up")
+        row, = self.rows()
+        # The ledger line names the hand-off, so the manager can tell a prompt
+        # its judge allowed from one that reached a human.
+        self.assertEqual(row["judgeNonce"], req["nonce"])
+
+    def test_a_logged_only_event_carries_no_judge_nonce(self):
+        # No judge up (or not Bash): nothing was handed over, nothing to name.
+        self.assertEqual(self.run_judge(denied()), (0, ""))
+        self.assertNotIn("judgeNonce", self.rows()[0])
+
+    def test_an_allowed_permission_request_is_allowed(self):
+        self._alive()
+        _seen, t = self._answering("allow")
+        _rc, out = self.run_judge(requested())
+        t.join()
+        self.assertEqual(json.loads(out)["hookSpecificOutput"],
+                         {"hookEventName": "PermissionRequest",
+                          "decision": {"behavior": "allow"}})
+
+    def test_stand_or_a_foreign_answer_prints_nothing(self):
+        self._alive()
+        for verdict, nonce_ok in (("stand", True), ("allow", False), ("maybe", True)):
+            with self.subTest(verdict=verdict, nonce_ok=nonce_ok):
+                _seen, t = self._answering(verdict, nonce_ok=nonce_ok)
+                self.assertEqual(self.run_judge(denied()), (0, ""))
+                t.join()
+                self.assertEqual(self.judge_files(), [])
+
+    def test_no_answer_in_time_is_no_decision(self):
+        self._alive()
+        req = permlog.judge_request(denied(), permlog.build_row(denied()))
+        ticks = iter(range(0, 1000, 10))
+        verdict = permlog.await_verdict(self.dir, self.sid, req, wait_sec=30,
+                                        clock=lambda: next(ticks), sleep=lambda _s: None)
+        self.assertIsNone(verdict)
+        self.assertEqual(self.judge_files(), [], "a timed-out request is withdrawn")
+
+    def test_non_bash_and_a_down_judge_only_log(self):
+        # Non-Bash: the grant is honoured by guard.py, whose matcher is Bash.
+        self._alive()
+        with mock.patch.object(permlog, "await_verdict", return_value="allow") as wait:
+            for ev in (denied(tool_name="WebFetch", tool_input={"url": "https://x.example/a"}),
+                       # A non-Bash tool whose input happens to carry a `command`.
+                       denied(tool_name="mcp__shell__run", tool_input={"command": "ls"})):
+                self.assertEqual(self.run_judge(ev), (0, ""))
+            # No (or a stale) alive marker: no request, no wait.
+            os.remove(os.path.join(self.dir, permlog.JUDGE_ALIVE_FILE))
+            self.assertEqual(self.run_judge(denied()), (0, ""))
+            wait.assert_not_called()
+        self.assertEqual(self.judge_files(), [])
+        self._alive()
+        old = os.path.getmtime(os.path.join(self.dir, permlog.JUDGE_ALIVE_FILE)) - 3600
+        os.utime(os.path.join(self.dir, permlog.JUDGE_ALIVE_FILE), (old, old))
+        self.assertFalse(permlog.judge_alive(self.dir))
+        self.assertEqual(len(self.rows()), 3, "every event is still logged")
+
+    def test_without_the_flag_nothing_is_handed_over(self):
+        self._alive()
+        self.assertEqual(self.run_main(json.dumps(denied())), (0, ""))
+        self.assertEqual(self.judge_files(), [])
+
+    def test_an_oversized_command_or_planted_answer_fifo_is_harmless(self):
+        big = denied(tool_input={"command": "x" * (permlog.JUDGE_COMMAND_MAX + 1)})
+        self.assertIsNone(permlog.judge_request(big, permlog.build_row(big)))
+        os.makedirs(self.dir, exist_ok=True)
+        fifo = os.path.join(self.dir, "fifo")
+        os.mkfifo(fifo)
+        self.assertIsNone(permlog._read_answer(fifo))   # must not hang
+
     def test_runs_under_the_security_flags(self):
         # The settings file runs it as `python3 -SsE` — stdlib only, no site.
         proc = subprocess.run(

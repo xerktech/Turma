@@ -230,6 +230,7 @@
   }
   .perm-kind.k-classifier-denied { color: var(--critical); border-color: currentColor; background: transparent; }
   .perm-kind.k-ask-in-chat { color: var(--warning); border-color: currentColor; background: transparent; }
+  .perm-kind.k-judged { color: var(--accent); border-color: currentColor; background: transparent; }
   /* A subject is prose (an ask's question) unless it is a command or tool name:
      prose wraps at word boundaries; only `.cmd` may break mid-token, and only
      where the token would otherwise overflow. */
@@ -274,6 +275,7 @@
   .perm-recent .perm-subj { margin-top: 0; flex: 1 1 220px; min-width: 0; }
   .perm-recent .perm-meta { display: flex; flex-wrap: wrap; gap: 2px 10px; flex: 0 1 auto; min-width: 0; }
   .perm-recent .meta { color: var(--muted); font-size: 11.5px; white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .perm-recent .meta.meta-judge { white-space: normal; overflow-wrap: break-word; min-width: 0; }
   .perm-empty { color: var(--muted); font-size: 12.5px; padding: 6px 0 2px; }
 
   @media (max-width: 600px) {
@@ -1652,7 +1654,9 @@ function mergeSnapshot(body, since) {
 const $perms = document.getElementById("permissions");
 const PERM_DAYS = 7;
 const PERM_REFRESH_MS = 60000;
-const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat" };
+// `judged` (XERK-1566): the agent's permission judge decided a Bash prompt.
+const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat",
+  judged: "Judged" };
 let permView = null;
 let permLoadError = null;
 let permFetchSeq = 0;
@@ -1810,10 +1814,18 @@ function permissionsCardHtml(view, now, recentOpen = false, loadError = null) {
     if (typeof r.waitedMs === "number") parts.push(`waited ${permWait(r.waitedMs)}`);
     else if (!r.closedAt && !r.answer) parts.push("still open");
     if (r.answer && r.kind !== "ask-in-chat") parts.push(r.answer);
+    // A judged row says what the permission judge decided, and why (XERK-1566).
+    // The reason is free prose of any length, so it rides its own WRAPPING
+    // span: inside the no-break wait span it ran off a phone-width card.
+    let judge = "";
+    if (r.kind === "judged" && (r.verdict === "allow" || r.verdict === "stand")) {
+      const why = typeof r.judgeReason === "string" && r.judgeReason ? ` — ${r.judgeReason}` : "";
+      judge = `<span class="meta meta-judge">${esc(`judge: ${r.verdict}${why}`)}</span>`;
+    }
     // Host, wait and age ride ONE group, host first, so the host sits in the
     // same place on every row (on a phone: the start of the second line).
-    const meta = [r.host, parts.join(" · "), ago].filter(Boolean)
-      .map((t) => `<span class="meta">${esc(t)}</span>`).join("");
+    const span = (t) => (t ? `<span class="meta">${esc(t)}</span>` : "");
+    const meta = span(r.host) + span(parts.join(" · ")) + judge + span(ago);
     return `<li>${permKindHtml(r)}${permSubjectHtml(r, "span")}` +
       `<span class="perm-meta">${meta}</span></li>`;
   }).join("");

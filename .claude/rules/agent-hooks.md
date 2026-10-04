@@ -239,6 +239,16 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
       needed escaping, and denies if either reading does. Don't add escape layers instead.
     - `_quote_states` reads a `#` comment as `#` to line end, in its one pass: `# don't`
       opened a "quote"; a per-comment re-scan was 10x slower and capped (fail-open).
+  - **A `#` inside `${…}` is text** (XERK-1585): `${y:- #}; rm -rf /` runs the `rm`. The
+    splitter tracks `${`/`$(` nesting; the default splice escapes its `#`.
+    - `_VAR_USE_RE`'s `[^}]*` stops at a QUOTED or nested `}` (`${a:-'}' #}`); `rep` leaves
+      such a match raw (`_brace_end`) rather than splice a short one.
+    - Whether a `$` is live (`_live_dollar`: `\${`, `$${`) holds for ONE parse — an unquoted
+      heredoc or `bash -c "…"` strips a backslash first. A skip therefore also triggers
+      `_expand_both`'s splice-everything reading. Never trust a single escape judgement.
+  - **`eval` re-parses its RAW words once per `eval`** (XERK-1585): read before the
+    substitution pass (which ate a quoted `'$('`) and before the `_SEGMENT_SPLIT` early
+    `continue`. A 7-deep `eval` chain hits `_MAX_EXPAND_DEPTH` and is denied, on purpose.
   - **`cd` targets are SCOPE-blind** (`_cd_targets`, inherited into recursion): a later `cd`
     never clears an earlier one, since it may fail, sit in a subshell/pipe, or be `cd -`;
     clearing let `cd /; (cd /tmp); rm -rf *` through.
@@ -270,6 +280,16 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - The producer→shell link is lost where `_split_on_operators` severs the pipeline — the
       `&` in `2>&1`/`|&`, the `;` inside `{ …; }` — a pre-existing splitter limit this relies
       on; wrapped forms (`echo P | ssh h sh`, `| docker exec -i c sh`) are residuals too.
+  - **Variable inlining has a growth budget** (`_MAX_SUBST_GROWTH`, XERK-1556): each `$x` inlines
+    the whole value, so size × uses took minutes, and a hook past Claude Code's timeout RUNS the
+    command. Spent → DENY (`_TOO_LARGE`), never an early return, never grantable (`decide`
+    checks it before the grant AND before its final allow — a grantable reason found pre-expansion
+    left the budget to run out inside the policy checks).
+    - ONE budget per decision (`@_budgeted`): a per-call budget let N re-expansions spend it N times.
+    - Whole top-level expansions are memoised per decision; substitutions are NOT — identical bodies
+      at N places are N times the work, and memoising them let 1000 heredocs through uncharged.
+    - The exec-wrapper suffix pass charges the words it emits (n args → n²/2); `find -exec` and
+      `xargs` still scale superlinearly in work, not growth (XERK-1589).
   - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old vs
     new guard): 0 diffs is the bar, or each diff explained. Unit cases missed every false deny above.
   - Keep in sync with the twin hook outside this repo.
@@ -406,3 +426,7 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   the file guard); RECORDS one line per event to `~/.turma/permissions/<sid>.jsonl`, decides nothing,
   fails open on everything, `-SsE` like every hook, wired only when the script exists. Its dir is
   `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `agent-permissions.md`.
+  - With `--judge` (XERK-1566, unless `TURMA_PERMISSION_JUDGE=0`) it also hands a Bash call to the
+    manager's permission judge and waits (timeout 90s); judge contract in `agent-permissions.md`.
+- **The judge's one-shot grant is guard.py's ONLY `allow`** (XERK-1566, `consume_grant`, `--grants`):
+  the grant contract, the same-uid residual and the judge's gate live in `agent-permissions.md`.

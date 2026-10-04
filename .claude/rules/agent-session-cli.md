@@ -101,6 +101,103 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 - Tests: `test_session_cli.py`; `TestWakeRequest` in `test_hub_agent.py`; the guard pins in
   `test_guard_settings.py`; the `XERK-1564` case in `server.test.js`.
 
+## Pausing a sleeper for its slot (XERK-1575; hub half `turma-attention.md`)
+
+- **`pauseSleeper` (command) → `pause_sleeper`**: the clean kill an operator click runs (worktree,
+  branch, ticket, transcript kept) with `paused={wakeAt, wakeReason, pausedAt}` stamped on the
+  closed record and served as `closedSessions[].paused` (`_paused_wire`).
+- **It is a STAGE/WORK split, never a teardown on the beat** (XERK-395). The beat re-checks, takes
+  the dsh control + ttyd process off the live maps, then `_drop_killed` (registry, closed.json,
+  caches); the **sleeper lifecycle worker** (`_run_sleeper_job`) kills dsh, tmux (~15s worst) and
+  ttyd. Only the beat writes the registry; the worker touches processes and git only.
+  - **`_sleeper_busy[sid]` holds until the teardown ends**: `resume()` of it refuses (reported) and
+    `_resume_at_cwd` refuses its worktree/transcript (`_sleeper_job_blocks`) — relaunching
+    `agent-<id>` then would race the worker's kill.
+  - **Every beat re-arms the worker while jobs wait** (`_apply_sleeper_landed`): a failed
+    `Thread.start()` (pids_limit) would strand a teardown — a live tmux in a slot reported free.
+  - **The operator's Kill/Delete of a paused record re-stages the tmux kill** (`_reap_paused_tmux`):
+    teardown jobs are in-memory, so a restart mid-pause leaves an idle claude no record owns.
+  - **On Windows the teardown never signals `ttydPid`** — the pty-host `_kill_tmux` ended IS that
+    process, so a later signal could hit a reused pid (`_kill_ttyd`'s rule).
+- **A paused record carries its PRs' `prCommentBase`** (`_remember_closed`, paused only), and
+  `resume()` restores it with the PR links (`_carry_paused_prs`). A review comment posted while it
+  slept is then a NEW key, delivered to its inbox; without it the first pass baselines it silently.
+- **A wake resume whose worktree vanished re-adds it on the same worker** (`_stage_worktree_restore`
+  → `_apply_sleeper_landed` on the beat finishes `resume()`). Meanwhile its slot is held
+  (`_slots_used` counts `_restores_in_flight`), the path rides `_live_worktree_paths` so no prune
+  takes it, and a duplicate resume is ignored. A failed re-add unpauses + reports; a record killed,
+  unpaused or deleted meanwhile is not resumed (delete keeps the worktree being added).
+- **The relaunch itself (`_launch_tmux`/`_launch_ttyd`) stays on the beat**, the same inline cost
+  as every `spawnTicket` the hub's queue drain sends: it writes the record and `save()`s, which no
+  worker may do. The hub never puts a wake beside another launch on one host: the drain sends no
+  `spawnTicket` to a host with a wake in flight (`hostWakeInFlight`), and a wake waits out a queued
+  spawn (`pendingSpawnCount`). An operator spawn queued in the same beat can still pair with it.
+  - A restore-path wake is acked before its relaunch, so the hub cannot see it in flight. Its
+    relaunch therefore runs on FULL beats only (`_apply_sleeper_landed(light=...)`), never on the
+    light follow-up beat behind an inline `handle_commands` launch. Do not ungate it.
+  - Worst case, a recorded deviation from XERK-395: `INTERVAL` + 2×`HEARTBEAT_TIMEOUT_SEC` (40s)
+    + one launch (tmux kill 15s + new-session 30s + display 5s + ttyd port wait 2s = 52s) ≈ 92s,
+    over `OFFLINE_AFTER_MS` (75s) only on a wedged tmux — as for any `spawnTicket` today. Moving
+    it to a worker needs a launch-path refactor (follow-up).
+- **The agent re-checks before it kills** (`_sleeper_unpausable`): running, an int `wakeAt` at
+  least `PAUSE_SLEEPER_MIN_AHEAD_MS` away, and the LAST beat's signals quiet (`_note_quiet` →
+  `self._quiet[sid] = (pane, work)`): `paneBusy is False`, no panePrompt, no question, no live
+  `agents`, no `loop`. A failed probe drops the entry — can't tell = refuse. Refusals are logged.
+- **A message that still loses the race is said, never silent**: the hub refuses (409) input to a
+  session whose pause it handed over and withdraws an undelivered one (`sleeperPauseHandedOver`);
+  `send_input` logs a drop for a paused record.
+  - **Acked too** (`sleeperAlreadyPaused`): no running session with that id and a paused closed
+    record → 409 "Resume now, then send again". A client a beat stale still shows a composer.
+- **Never while an operator message is on its way in**: one queued, being typed by the input
+  worker (`input_inflight`), landed but not recorded, or on the `pendingInputs` outbox
+  (`_input_undelivered`). `handle_commands` pre-scans its batch for `SLEEPER_PANE_COMMANDS` on the
+  session, so a pause listed BEFORE the input is refused too. Killing would drop the message.
+- **Never beside the operator's Kill or Delete of it**: the pre-scan also counts
+  `SLEEPER_STOP_COMMANDS` (`kill`, `delete`). Run first, the pause moved the session to a paused
+  record, the Kill logged "no such session", and the hub woke the record at its wake.
+- **`kill(sid)`/`delete(sid)` reach a PAUSED closed record** (no live session): `kill` drops the
+  pause (an ordinary killed record that never wakes); `delete` drops the record and its uploads
+  and removes the worktree unless a registry session works there (`_delete_paused_record`). So a
+  Kill that lands after the pause still wins. An unpaused closed record keeps the old no-op.
+- **Never within two beats of an inbox post** (`_inbox_posted`, set by `notify_session`): the probe
+  can read idle before that turn starts, and an inbox message is on no outbox to re-send it.
+- **Never mid-move**: `_export_running(sid)` refuses while a migration export thread runs for it
+  (`_exporting`, marked before the thread starts, cleared in `_export_session_tracked`'s finally),
+  and an `exportSession` in the same batch counts like a pane command. Paused mid-move, the record
+  here would be woken while the moved copy runs on the target — two claudes on one conversation.
+- **Never one resumed AHEAD of its carried wake**: `wakeResumedAt` still set (cleared when that wake
+  fires or a new wake.json lands) means an operator chose to look at it. This survives a hub
+  restart; the hub's own hold (`sleeperResumeHold`) does not.
+- **`TURMA_PAUSE_SLEEPERS=0`** refuses every pause and reports `pauseSleepers: {available:false}`.
+- **A paused record is exempt from `CLOSED_PER_REPO`** (up to `PAUSED_KEEP_MAX`, newest kept) and
+  from the prune's closed-record sweep (`_poll_prunes`): evicted, it could never be woken; a
+  pruned worktree is re-added by `resume`.
+- **Resume carries the wake back** (`_carry_paused_wake`, in `resume()`), keeping the session id,
+  ticket and `rcName`. Default: the record gets `wakeAt`/`wakeReason` + `wakeResumedAt`, and
+  `_deliver_due_wakes` stages `wake_text` through the operator input path only once
+  `WAKE_RESUME_SETTLE_MS` has passed AND the last beat read an idle composer — never a timed paste
+  into a booting TUI. A wake still ahead (an early operator Resume) is simply asleep again.
+- **`resume()` refuses a conversation that already runs** (`_conversation_holder`: a running
+  session with its transcript, or in its worktree unless root), reported via `_refuse_start` — the
+  `_resume_at_cwd` rule. It also unpauses the record. Else a wake starts a second claude beside one
+  the Resume picker started (`resume_transcript` unpauses matching closed records on success).
+- **`unpauseSleeper` → `unpause_sleeper`** drops `paused` from a closed record (any switch state):
+  the hub sends it for a Done ticket, a conversation already running again (here or on another
+  host), or a move/restore of it that handed off.
+- **A NEW wake.json drops `wakeResumedAt`** (`_ingest_wake_request`): the settle gate and the
+  early-resume pause refusal belong to the carried wake only.
+- **`TURMA_RESUME_WAKE_PROMPT=1` rides a DUE wake on the launch instead** (`claude --resume <id> --
+  <text>`, `_launch_tmux`'s positional prompt). OFF until a real pane proves `--resume` submits it.
+  - **claude only**: `_launch_qwen`/`_launch_dsh` drop a prompt on resume, so any other runtime
+    takes the default record-and-stage path, or its wake text is lost.
+- The resume's `resumeRelaunch` stamp applies: a doomed `--resume` relaunches fresh, and that fresh
+  launch clears the wake with the rest of the request dir (a conversation's wake dies with it).
+- Tests: `TestSleeperSlot`.
+- **Real-host spike (not yet run)**: on a scratch session, `wake 30m x`, queue a ticket at
+  capacity, confirm the pause, then the resume at wake with the wake text landing once; and
+  whether `claude --resume <id> -- <text>` submits `<text>` as the first turn (if it does, flip
+  `TURMA_RESUME_WAKE_PROMPT` on). Record the answers here.
+
 ## The wait classifier + loop signal (XERK-1572)
 
 Not the CLI, but the other half of "why is this session waiting": hub half in `turma-attention.md`.
@@ -214,6 +311,51 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   capability, `normalizeCloseTicket`). The hub deploys on merge, agents update later: an agent with
   the XERK-1564 CLI but no reader would accept the request and never act. Absent = tracker wording.
 - Tests: `TestCloseTicketRequest`, `TestTicketClosingDirectives`; hub `XERK-1569` cases.
+
+## The brief narrative + the decisions file (XERK-1574, agent side)
+
+Hub side (the request, the store, the routes, the page): `turma-brief.md`.
+
+- **`renderBrief` is only STAGED by `handle_commands`** (`_stage_render_brief`: newest brief wins,
+  input re-serialised and cut at `BRIEF_RENDER_INPUT_MAX`); `_brief_render_tick` on the beat hands
+  ONE job to its own worker (`_brief_worker_loop`) and folds results — the wait classifier's split.
+  Attempt + backoff armed up-front, `BRIEF_RENDER_MAX_ATTEMPTS` (2), then the brief stands without one.
+- **The run is `_run_lockdown_oneshot`, shared with the wait classifier**: `ATTENTION_HINT_LOCKDOWN`
+  in the argv (no tool, no MCP server, `--setting-sources=user` — the brief carries session-written
+  `why`/titles), cwd `REGISTRY_DIR`, stdin `DEVNULL`, a fresh mkstemp output file read back through
+  its own fd, process group killed on `BRIEF_RENDER_TIMEOUT_SEC`. Its INPUT is the hub's structured
+  brief JSON alone — never a transcript. Never give it a second runner.
+- **`clean_brief_narrative` mirrors the hub's `cleanBriefNarrative`** (one plain paragraph,
+  ≤`BRIEF_TEXT_MAX`, a fixed point); the hub re-cleans regardless — it is the whitelist.
+  Same step order and EXPLICIT ASCII classes (` `, `[0-9]`) as the JS, since Python's `\s`/`\d`
+  are wider; change both together.
+- **Its heading-line drop (`_brief_heading_line` + the short-`:` filter) mirrors the hub's
+  `heading`** — same bounds, same vectors (`test_clean_brief_narrative_drops_heading_lines`).
+- **The result rides `briefNarratives`**, cleared BY IDENTITY like `attentionHints`; the capability
+  is `briefRender:{available:true}` (an older agent acks `renderBrief` and never answers).
+- **`_ingest_decisions` renders the reply's `decisions:{org, entries}` to
+  `~/.turma/decisions-<org>.md`** (`decisions_path_for` flattens the siteKey), on every reply beside
+  `_ingest_peers`. Written only when the text changed OR the file's BYTES differ (Bash walks past
+  the Edit deny, so a tampered file is restored next reply). Compared by bytes, never mtime — a
+  same-uid session can `touch -d` a forged file's mtime back; a non-regular file (FIFO) reads as
+  tampered without blocking. mkstemp + `os.replace`, never a fixed temp name.
+- **Each decisions entry is ONE `- ` line**, every cell flattened and capped (no forged heading).
+  A reply without a usable block REMOVES the file — fails narrow like the roster. Never raises.
+- **Guard**: `Read(~/.turma/decisions-*.md)` allowed (the directive points at it),
+  `Edit(~/.turma/decisions-*.md)` denied and pinned in `EXPECTED_DENY_RULES`.
+- **`_session_directive` names the file only once THIS manager rendered it from a reply**
+  (`decisions_path`) — `DECISIONS_SYSTEM_PROMPT` words it as reference material about what was
+  decided, not instructions, and says its questions were written by other sessions. Fixed at launch
+  like peers.
+- **Never discover it on disk at boot**: `~/.turma` is Bash-writable, so a lone planted
+  `decisions-*.md` would be named, for life, to every session launched before the first reply. A
+  boot relaunch before that reply is simply not pointed at the log (fails narrow).
+- **Every reply removes every OTHER `decisions-*.md`** (`_remove_other_decisions`), on the unchanged
+  path too — a planted sibling never outlives one beat.
+- **Residual**: the questions in the file are SESSION-written (an AskUserQuestion's text), so one
+  session can plant text another session reads. The directive frames it as data; an org boundary
+  (decided org) still bounds who sees it.
+- Tests: `TestRenderBrief`, `TestDecisionsFile`, `test_the_decisions_log_is_readable_but_not_writable`.
 
 ## Real-host spike (not yet run)
 

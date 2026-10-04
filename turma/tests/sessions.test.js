@@ -206,7 +206,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   // select-on-arrival path reads it, so a bare render() isn't enough.
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer, startSession,"
-      + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
+      + " toggleCardMenu, cardKill, pausedKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " showRestore, hideRestore, toggleRestoreMenu, restoreTo, eligibleRestoreTargets,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
@@ -2253,6 +2253,90 @@ test("Ended sessions merges killed + stopped, newest-ended first", () => {
   assert.deepEqual(order, [...order].sort((a, b) => a - b), "sorted newest-ended first");
 });
 
+test("XERK-1575: a sleeper paused for its slot reads asleep until its wake, never killed", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  const wakeAt = now + 90 * 60 * 1000;
+  const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  h.closedSessions = [
+    closed("33333", "Napping", "2026-07-15T09:00:00Z", { paused: { wakeAt, wakeReason: "check CI", at: now } }),
+    closed("44444", "Plain Kill", "2026-07-15T08:00:00Z"),
+  ];
+  beat({ now, agents: [h] });
+  // Its own open Paused section, never folded into the collapsed Ended history.
+  const nap = els.paused.innerHTML;
+  assert.match(nap, /<h2>Paused <span class="count">1<\/span><\/h2>/);
+  assert.ok(!/<details/.test(nap), "the Paused section is never collapsed");
+  assert.ok(nap.includes("Napping"), nap);
+  assert.ok(nap.includes(`<div class="state holding">💤 paused until ${hhmm} · check CI</div>`), nap);
+  assert.ok(!nap.includes("killed"), nap);
+  assert.ok(!nap.includes("Plain Kill"), nap);
+  // Resumed early, so the control says so — the dashboard's paused card's words.
+  assert.match(nap, /<button class="s-resume"[^>]*>\s*Resume now\s*<\/button>/);
+  const e = els.ended.innerHTML;
+  assert.ok(!e.includes("Napping"), "a paused sleeper is not ended history");
+  assert.match(e, /Ended sessions <span class="count">1<\/span>/);
+  assert.match(e.slice(e.indexOf("Plain Kill")), /<div class="state">killed/);
+  assert.match(e, /<button class="s-resume"[^>]*>\s*Resume\s*<\/button>/, "an ordinary kill keeps plain Resume");
+
+  // Woken (no longer a paused record): the Paused section goes away.
+  h.closedSessions = [closed("44444", "Plain Kill", "2026-07-15T08:00:00Z")];
+  beat({ now, agents: [h] });
+  assert.equal(els.paused.innerHTML, "");
+});
+
+test("XERK-1575: Paused lists the soonest wake first", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [
+    closed("55555", "Late Nap", "2026-07-15T10:00:00Z", { paused: { wakeAt: now + 5 * 3600e3, at: now } }),
+    closed("66666", "Early Nap", "2026-07-15T09:00:00Z", { paused: { wakeAt: now + 3600e3, at: now } }),
+  ];
+  beat({ now, agents: [h] });
+  const p = els.paused.innerHTML;
+  assert.ok(p.indexOf("Early Nap") < p.indexOf("Late Nap"), p);
+  assert.equal(els.ended.innerHTML, "", "no other ended sessions -> no Ended section");
+});
+
+test("XERK-1575: a Paused row's Kill arms, confirms, and moves it to Ended as an ordinary kill", () => {
+  const { beat, els, posts, pausedKill } = loadPage();
+  const { now, host: h } = host([]);
+  const nap = closed("33333", "Napping", "2026-07-15T09:00:00Z",
+    { paused: { wakeAt: now + 3600e3, wakeReason: "check CI", at: now } });
+  h.closedSessions = [nap];
+  beat({ now, agents: [h] });
+  const ev = { stopPropagation() {} };
+  // Beside Resume now, never on an ordinary ended row.
+  assert.match(els.paused.innerHTML, /<button class="s-resume s-pkill"[^>]*>\s*Kill\s*<\/button>/);
+  pausedKill(ev, h.key, "33333");                     // arm
+  assert.match(els.paused.innerHTML, /<button class="s-resume s-pkill armed"[^>]*>\s*Confirm kill\s*<\/button>/);
+  assert.equal(posts.length, 0, "an armed Kill sends nothing");
+  pausedKill(ev, h.key, "33333");                     // confirm
+  assert.deepEqual(posts.map((x) => x.url), [`/api/agents/${h.key}/sessions/33333/kill`]);
+  let p = els.paused.innerHTML;
+  assert.match(p, /<button class="s-resume s-pkill"[^>]*disabled[^>]*>\s*<span class="spin"><\/span>/);
+  assert.match(p, /<button class="s-resume" disabled/, "Resume now is off while the kill lands");
+  // Still reported paused: the spinner holds across a beat.
+  beat({ now, agents: [h] });
+  assert.match(els.paused.innerHTML, /s-pkill"[^>]*disabled/);
+  // Reported as an ordinary kill: Paused empties and it reads killed in Ended.
+  h.closedSessions = [{ ...nap, paused: null }];
+  beat({ now, agents: [h] });
+  assert.equal(els.paused.innerHTML, "");
+  const e = els.ended.innerHTML;
+  assert.match(e.slice(e.indexOf("Napping")), /<div class="state">killed/);
+  assert.ok(!e.includes("s-pkill"), "an ordinary ended row has no Kill");
+});
+
+// XERK-1575: a paused row stacks Resume now over Kill in its right gutter, so its
+// state row must keep that gutter — the ended row's reclaim (margin-right -68px)
+// ran the wake text under Kill and clipped it (screenshot review, 390 wide).
+test("a paused row's state line keeps clear of its stacked Kill button", () => {
+  assert.match(html, /\.s-card-wrap\.ended-wrap \.state-row \{ margin-right: -68px; \}/);
+  assert.match(html, /\.s-card-wrap\.ended-wrap > \.s-card\.paused \.state-row \{ margin-right: 0; \}/);
+});
+
 test("Ended sessions is collapsed by default and hidden when there are none", () => {
   const { beat, els } = loadPage();
   const { now, host: h } = host([working("11111", "Live One")]);
@@ -2615,6 +2699,22 @@ test("opening an ended session shows PRs + Resume and never a terminal or compos
   // through to GitHub, which is often the reason to open an ended session at all.
   assert.match(els.trPrs.innerHTML, /<a href="https:\/\/github.com\/o\/r\/pull\/7"/);
   assert.match(els.trPrs.innerHTML, /#7/);
+});
+
+test("XERK-1575: opening a paused sleeper offers Resume now; an ordinary kill, Resume", () => {
+  const { beat, openEndedSession, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [
+    closed("33333", "Napping", "2026-07-15T09:00:00Z",
+      { transcriptId: "t-nap", paused: { wakeAt: now + 3600e3, at: now } }),
+    closed("44444", "Plain Kill", "2026-07-15T08:00:00Z", { transcriptId: "t-kill" }),
+  ];
+  beat({ now, agents: [h] });
+  openEndedSession("33333");
+  assert.equal(els.trResume.hidden, false);
+  assert.equal(els.trResume.textContent, "Resume now");
+  openEndedSession("44444");
+  assert.equal(els.trResume.textContent, "Resume", "the label never sticks to the next view");
 });
 
 // XERK-356. A refused archive push never arrives, so the reassuring "it syncs

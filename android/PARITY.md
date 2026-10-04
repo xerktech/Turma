@@ -34,6 +34,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   carries a folded merged PR, which a tap opens (the web links its "merged PR" bit) — and the phone
   shows a row's age/ETA relative only. Earlier briefs are a count on the phone, an expandable list of
   headline counts on the web. Same sections, counts, order and "Brief now" otherwise.
+- **Brief decisions log (XERK-1574) — read-only on the phone.** Both show the brief's model-written
+  Summary above the sections and the org's newest ten decisions, newest first. Recording a decision
+  by hand (the web's note box, `POST /api/orgs/<site>/decisions`) is WEB-ONLY for now: a phone
+  composer needs a text field + refusal handling in `BriefViewModel`, deferred to keep this change
+  small. The phone also lists the log only under an org it already shows (a decided org or one with
+  a kept brief); the web additionally lists an org whose only content is its log.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
   auto-polls + SSE); the phone keeps a header Refresh button for a deliberate re-poll. It now shows a
   spinner while the awaited `/api/agents` poll runs (a short visible floor so a fast poll still reads
@@ -691,6 +697,59 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - Tests: `core/BoardTest.kt` (`epicBuilderRows`/label/terminal cases), `model/AgentDecodeTest.kt`
   (the `epicBuilders` decode + tolerance case).
 
+## Done (XERK-1576 — Permission prompts on the Usage screen)
+
+- **The web Usage page's "Permission prompts (7 days)" card (XERK-1563) is on `ui/UsageScreen.kt`**
+  (`PermissionsSection` in `ui/UsagePermissions.kt`), below the grouping's rows, in the web's phone
+  layout: each group a block (kind chip; subject; Count / Allowed / denied / Median wait; the rule
+  with Copy, or why there is none), the one "Asked in chat" note, then "Recent prompts (N)".
+  Wording, kind labels and order are usage.html's; the pure helpers are `core/Permissions.kt`.
+- **Its own call, never the atomic `/api/agents` decode**: `HubApi.permissions` →
+  `model/Permissions.kt` (`PermissionSummary`), every field defaulted and `kind` a plain string, so an
+  older or newer hub still decodes and a wrong-typed field costs this section only.
+- **Scoped like the web**: `UsageViewModel.watchPermissions` waits for a FULL fleet snapshot
+  (`FleetState.polled`, set by the `/api/agents` poll only, never by an SSE upsert), fetches
+  `?days=7&org=<the header's effective keys>`, refetches when the scope moves and every 60s while the
+  screen shows. A scope change drops the old org's view at once and discards a late answer for it; a
+  failed refresh keeps the same scope's view; a first read that fails shows the hub's own words
+  (`hubErrorMessage`, XERK-264).
+- **"Recent prompts" stays open across scope changes** like the web's page-level `permRecentOpen`:
+  its open state is held by `PermissionsSection`, above the loading/error branch.
+- **Platform form**: Copy puts the raw rule on the clipboard with Android's own confirmation (the
+  system overlay on 13+, a toast below it), where the web flashes its button.
+- **The permission judge's rows (XERK-1566) render as on the web**: kind `judged` reads "Judged" in
+  an accent-outlined chip (web `.k-judged`; `colorScheme.primary` is the web's `--accent` in both
+  themes), its group shows the web's "no rule retires this" (the hub sends no rule for it), and a
+  Recent row adds "judge: <allow|stand>[ — <judgeReason>]" after its answer
+  (`Permissions.judgeMeta`). `verdict`/`judgeReason` decode as optional strings on `PermissionRow`.
+- Tests: `core/PermissionsTest`, `model/PermissionDecodeTest`, `vm/UsagePermissionsViewModelTest`,
+  `ui/PermissionsSectionTest`.
+
+## Done (XERK-1566 — permission policy editor)
+
+- **Android has the board's permission policy editor** (web `permissionRules*` panel in
+  `board.html`): the per-org text the agent's permission judge decides a blocked Bash command
+  against.
+  - **Its OWN route, never `/api/agents`** — `HubApi.getPermissionPolicy`/`setPermissionPolicy` →
+    `GET|POST /api/jira/<site>/permission-policy`, read into `PermissionPolicyResponse` (every field
+    optional: absent `text` = "", absent `isDefault` = the default, as the web reads them). Nothing on
+    the fleet payload changed, so the atomic decode is untouched.
+  - **`PermissionPolicySheet`** (a labelled "Permission policy" item in the header's ⋮ overflow —
+    the web folds it behind its ⋯ menu; a header icon squeezed the org filter to "…" on a phone —
+    shown only with a reporting org — the web panel bails with no `policySites`): the org picker, the
+    web's note wording with the status on its own line, a 16000-character field (`PERMISSION_POLICY_MAX`, the hub's limit), **Use
+    default** (`{text:null}`, off while already default), Cancel, **Save policy** (`{text}`; "" turns
+    the judge off for the org). State lives in `BoardViewModel.permission`.
+  - **No optimistic success**: only the hub's 200 changes the sheet (it shows what the hub stored); a
+    refusal shows the hub's own words (`hubErrorMessage`, XERK-264) and keeps the operator's edit. Save
+    waits for a successful load, so a failed GET is never saved over the org's real text (the web
+    leaves Save live after a failed load — Android is deliberately stricter there).
+- **Platform-form notes:** a modal sheet vs the web's narrow panel, and a successful Save closes it
+  (the triage sheet's pattern) where the web panel stays open — same wire calls, same semantics.
+- Tests: `ui/BoardPermissionPolicyTest.kt` (load, save, refused save keeps the edit, Use default,
+  absent fields, refused load blocks Save, org-less board has no button — Robolectric over
+  MockWebServer), `vm/PermissionPolicyResultTest.kt` (the response reading).
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -893,11 +952,6 @@ those are marked `[MODEL]`.
   `panePrompt` onto the session model, the waiting state in `core/Sessions.kt`, and the picker in
   `ChatScreen`/`ChatViewModel` beside the existing question sheet.
 ### Usage
-- P2 **Permission prompts card (XERK-1563).** The web Usage page's "Permission prompts (7 days)"
-  section (top prompts with counts, allowed/denied, median wait and a copyable suggested rule; a
-  recent list) reads its own route, `GET /api/permissions`, not `/api/agents` — so nothing on the
-  fleet payload changed and Android's atomic decode is untouched. It is a web-only operator tuning
-  view for now; the Android screen is a later XERK-1560 child (XERK-1576).
 - P2 **Table-view state persistence (XERK-31).** The web keeps the usage table open + the page put
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 

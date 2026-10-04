@@ -368,6 +368,25 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): retrofit2.Response<OkResponse>
 
+    // An org's permission-policy TEXT (XERK-1566): what the agent-side permission
+    // judge decides a session's blocked Bash command against. Hub-owned durable
+    // state on its OWN route — never on /api/agents — so the board's editor reads
+    // it here. 200 {ok, text, isDefault, defaultText}; 404 {error} for an org no
+    // host reports.
+    @GET("api/jira/{siteKey}/permission-policy")
+    suspend fun getPermissionPolicy(
+        @Path("siteKey") siteKey: String,
+    ): retrofit2.Response<PermissionPolicyResponse>
+
+    // Set it: {text:"..."} stores the text ("" switches the judge off for the
+    // org), {text:null} drops back to the hub's default. 200 carries what the hub
+    // stored (authoritative); 400/404/413 {error} on a refusal.
+    @POST("api/jira/{siteKey}/permission-policy")
+    suspend fun setPermissionPolicy(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): retrofit2.Response<PermissionPolicyResponse>
+
     // Change a ticket's status and push it to the board (XERK-138) — the one
     // thing Turma writes back. Body: {value:"<transition id / state name>"}
     // from the detail's statusOptions. Needs an online host (it's a write);
@@ -392,6 +411,16 @@ interface HubApi {
     // rides /api/agents `briefs` + its SSE frame, so only the outcome is read.
     @POST("api/orgs/{siteKey}/brief")
     suspend fun briefNow(@Path("siteKey") siteKey: String): OkResponse
+
+    // The permission ledger (XERK-1563): prompts that held a session over the
+    // last `days`, grouped with the rule that would retire each. Its OWN call,
+    // never the atomic /api/agents decode. `org` = comma-separated siteKeys;
+    // null (omitted) = every org. A typed Response so a refusal's words survive.
+    @GET("api/permissions")
+    suspend fun permissions(
+        @Query("days") days: Int,
+        @Query("org") org: String?,
+    ): Response<com.xerktech.turma.model.PermissionSummary>
 
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
@@ -425,6 +454,21 @@ interface HubApi {
     @DELETE("api/devices")
     suspend fun unregisterDevice(@Query("token") token: String): OkResponse
 }
+
+/**
+ * The permission-policy route's answer (XERK-1566). Every field is optional so an
+ * older or partial body degrades rather than throws: an absent [text] reads as
+ * empty and an absent [isDefault] as "the default" — board.html's
+ * `typeof d.text === "string" ? d.text : ""` and `d.isDefault !== false`.
+ */
+@Serializable
+data class PermissionPolicyResponse(
+    val ok: Boolean = false,
+    val text: String? = null,
+    val isDefault: Boolean? = null,
+    val defaultText: String? = null,
+    val error: String = "",
+)
 
 @Serializable
 data class OkResponse(val ok: Boolean = false, val cmdId: String = "", val error: String = "")

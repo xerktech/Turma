@@ -194,5 +194,120 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 
 - `_session_directive` appends `WAKE_SYSTEM_PROMPT` for a CLAUDE session only: "do not sleep in a
   shell: run `python3 -SsE <cli> wake <N>m <what to check>` and end the turn". Mechanics + why the
-  CLI is spelled by absolute path: `agent-session-cli.md`. Slot policy v1: a sleeper HOLDS its slot
-  (freeing it is the kill/resume child, XERK-1575).
+  CLI is spelled by absolute path: `agent-session-cli.md`. A sleeper no longer always holds its
+  slot: see slot policy v2 below.
+
+## Slot policy v2 — pausing a sleeper for queued work (XERK-1575)
+
+- **The hub decides; the agent executes on the command path.** Only the hub sees the ticket queue,
+  so `pauseSleepersFor` (end of `drainTicketQueue`) and `wakePausedSleepers` (start of the drain,
+  and every `masterOrchestrationTick`, since the drain returns early on an empty queue) queue
+  ordinary commands: `pauseSleeper` and `resume` + `wake:true`. The hub never kills or resumes.
+- **One pause in flight per HOST** (`pausing` in `pauseSleepersFor`). The agent's tmux teardown
+  and a wake's worktree re-add run on its sleeper lifecycle worker, off the beat (XERK-395), but
+  the wake's relaunch runs on the beat like any `spawnTicket`, and one at a time keeps that worker's
+  queue short. A host with a `pauseSleeper` queued or unacked takes no second; the other waiting
+  tickets get their slots on later passes (the wake's one-per-host rule too).
+  - **A wake `resume` (`wake:true`) queued or unacked holds that same one**, so a host never gets
+    a wake and a pause in one beat (`pausing` counts both).
+- **A message to a sleeper whose pause was HANDED OVER is refused** (409, input route,
+  `sleeperPauseHandedOver`): the agent may be killing it, and the text would be lost unseen. An
+  undelivered pause is withdrawn instead and the message goes through.
+- **One pause per still-waiting ticket.** Waiting = entries the drain just held `capacity`
+  (`waitingFull`). Each pause is stamped with the ticket it answers (`pauseFor`, its queue key,
+  hub-only like `ticketSite` — `INTERNAL_COMMAND_FIELDS`), and a ticket with an unacked pause on
+  an ONLINE host is skipped, so a drain every beat never pauses a second sleeper for it.
+  - **Never a fleet-wide count**: subtracting all pauses in flight let the FIRST waiting ticket
+    take a second sleeper while a newer one (another org, another repo) got none.
+  - **An orphan pause is adopted, not duplicated**: one whose ticket no longer waits (dispatched,
+    cancelled, unstamped) is re-stamped to a waiting ticket that fits its host.
+  - **An orphan no waiting ticket adopts is withdrawn** if undelivered (`dropQueuedCommand`), the
+    empty-queue drain included — else a cancelled ticket's pause kills a sleeper for nothing.
+- **A pause never handed to a host that went offline is withdrawn** (`reclaimStrandedTicketSpawns`,
+  no `deliveredAt`): the demand it answered may be gone when the host returns, and the agent
+  re-checks only the sleeper, never the queue. A delivered one is left (it has likely run).
+- **Only where the ticket could run**: a FULL (`!hostHasFreeSlot`), online host reporting
+  `pauseSleepers.available` that `findTicketHost(..., {onlyHost})` accepts — every triage/pin/
+  runtime/OS/subscription-pause rule applies, so a pause never frees a slot the ticket can't use.
+  `onlyHost` only narrows the loop; without it `findTicketHost` is unchanged.
+- **Only a quiet sleeper** (`sleeperPausable`): running, `wakeAt` at least
+  `SLEEPER_PAUSE_MIN_AHEAD_MS` (10 min) away, no question/panePrompt/loop, `paneBusy === false`,
+  `agents` an EMPTY array (absent = can't tell = no). Farthest `wakeAt` first. The agent re-checks
+  against its own beat (`agent-session-cli.md`) — the hub's view is a beat old.
+- **Never a sleeper someone is talking to**: a queued `SLEEPER_PANE_COMMANDS` command for it
+  (`input`, `answerQuestion`, `setModel`, ...) skips it. The kill would land before the text is
+  typed, and the composer already showed the message as sent. The agent checks its own queue too.
+- **Never one the operator is stopping**: a queued `kill`/`delete` for it (`sleeperHasQueuedStop`,
+  `SLEEPER_STOP_COMMANDS`) skips the pause, and skips its paused record in `wakePausedSleepers`
+  (neither woken nor unpaused — the agent's Kill ends the pause). The agent pre-scans its batch the
+  same way. Paused first, the Kill found no session and the hub woke the record at its wake.
+- **Kill and Delete reach a paused record**: the routes queue for any id (no running check), and
+  the agent applies them to the closed record (`agent-session-cli.md`). Both also withdraw an
+  UNDELIVERED wake `resume` for that id (`withdrawSleeperWake`); a delivered one is left.
+- **A paused card can be stopped for good**: Kill beside Resume now on the dashboard
+  `pausedCard` (`pausedKill`, `twoClick` arm/confirm, a `kill` pending flagged `paused` that clears
+  once the host stops reporting it paused), the Sessions page Paused row (`pausedKill`, arm then
+  confirm, pending kind `pausedKill`), and Android's `PausedCard` + Paused row
+  (`FleetViewModel.killPaused`, pending `killPaused`). It ends as an ordinary killed session in
+  Ended. Glasses shows no control.
+- **An operator Resume on a paused row holds off re-pausing until that wake**
+  (`sleeperResumeHold`, set by the resume route): the carried wake makes it a sleeper again, and
+  the next drain would otherwise pause it while the operator reads it.
+  - That map is in-memory, so the AGENT holds it too (`wakeResumedAt` refuses a pause): a hub
+    restart or leader handover then costs one refused pause per `SLEEPER_RETRY_MS`, never a kill.
+- **A refused or unacted command is not re-sent for `SLEEPER_RETRY_MS`** (`sleeperPauseTried`/
+  `sleeperWakeTried`/`sleeperUnpauseTried`, in-memory, bounded): an agent that disagreed acks and keeps the session.
+- **The capability gates the pause** (`normalizePauseSleepers`, strict boolean, a
+  `HEARTBEAT_KNOWN_KEYS` member): an older agent would ack the unknown command and free nothing.
+  `TURMA_PAUSE_SLEEPERS=0` reports false. The RESUME is not gated — any agent knows `resume`.
+- **The pause is served on the CLOSED channel**: `closedSessions[].paused = {wakeAt, wakeReason?,
+  at?}`, rebuilt by `wirePaused` in `normalizeClosedSessions` (ingest + restore) or dropped whole.
+  Android TYPES it (`PausedSleep`). Its slot reads free through the agent's own `capacity`.
+- **A due sleeper takes a freed slot AHEAD of the queue**: `wakePausedSleepers` runs before the
+  drain dispatches, one resume per host per pass, oldest wake first, and `pendingSpawnCount` counts
+  a `resume` with `wake:true`, so the drain never hands that slot to a ticket. Starving it would
+  turn a pause into a kill.
+- **A wake never shares a beat with another launch on its host**: the drain seeds `usedHosts` with
+  every host whose wake is in flight (`hostWakeInFlight`), and `wakePausedSleepers` skips a host
+  with any spawn or wake queued. The agent relaunches both on its beat; two would overrun
+  `OFFLINE_AFTER_MS` (XERK-395). The ticket takes the other free slot a beat later.
+- **A wake is never auto-stop-exempt.** `markResumedTicketAutoStopExempt` (XERK-561) is the
+  operator's resume route only; exempting an automatic wake made a paused sleeper immune to
+  auto-stop and kept a Done ticket's session holding a slot forever.
+- **Two paused records are UNPAUSED (`unpauseSleeper`), never woken**: one whose ticket the board
+  shows Done (`doneTicketKeys`, the set `autoStopSweep` reads — it kills an unpaused sleeper there),
+  and one whose conversation already runs on the host (`pausedSleeperHeldLive`: a live session with
+  its `transcriptId`, or in its worktree unless root — the Resume picker resumes by transcript and
+  leaves the record behind). Unpaused, it is an ordinary ended, resumable session.
+- **A sleeper being MOVED is never paused** (`sleeperMigrating`: the `srcSessionId` of an
+  exporting/importing migration on that host, or an `exportSession` still queued for it). Paused
+  mid-move, its record was woken at its wake while the moved copy ran on the target.
+- **A paused record whose conversation lives on ANOTHER host is unpaused, never woken**
+  (`pausedSleeperHeldElsewhere`): an online host in the same DECIDED org runs its `transcriptId`
+  (the org scope stops another org's host from holding a sleeper asleep by naming the id), or it
+  is the source of a `done` move, or a `done` restore carried its transcript.
+  - **A move/restore still in flight holds the wake** (`pausedSleeperMoving`): neither woken nor
+    unpaused until it settles — done unpauses, failed wakes as usual.
+  - **The handoff itself unpauses** (`unpauseMovedSleepers` in `advanceMigrations`): the move's
+    source record, and ANY host's paused record of a restored transcript — a restore is not
+    org-scoped, so after its done record retires the org-scoped check would miss it.
+- **The brief reads it as asleep, never finished** (`compileBrief`): a closed record carrying a
+  valid `paused` is no Finished row (its merged PRs still count) and is a Waiting row on an online
+  host, `state:"sleeping"`, `eta` its wake, `why` its reason. A live copy of the id wins.
+- **Never alerted.** A paused sleeper is a closed record (no `alerts.sessions` entry); the
+  resumed session starts a fresh `sa` with no `reviewAt`/`prevAttn`, so neither review nor stalled
+  fires off the resume itself. `startedTicketKeys` reads closed records, so auto-start never
+  re-dispatches its ticket meanwhile.
+- **It reads asleep, never "killed"**: "💤 paused until 14:05 · <reason>" (web `pausedLabel`,
+  Android `core/Sessions.kt` `pausedLabel`, glasses phone `pausedLabel`), in the sleeping
+  label's muted tone, with no "ended N ago" beside it. Resume on its row is an early wake.
+- **It is never hidden in the collapsed Ended history.** The Sessions list gives paused
+  sleepers their own always-open **Paused** section above Ended, soonest wake first (web
+  `isPausedEntry` → `#paused`, Android `pausedEnded`, glasses `Paused` section).
+- **The dashboard keeps its card.** The host card's repo grid shows a `pausedCard` (Android
+  `PausedCard`) beside the running ones, and the Running-sessions tile and host meta say
+  "· N paused" (`pausedSleepers`; Android `FleetSummary.paused`). It holds no slot, so it
+  is never in the running count — but a session must not vanish there as if killed.
+- Tests: the `XERK-1575:` cases in `server.test.js`, `sessions.test.js` and
+  `dashboard-tiles.test.js`, glasses `phone/render.test.ts`, android
+  `SessionsFlattenTest`/`AgentDecodeTest`/`FleetTest`.

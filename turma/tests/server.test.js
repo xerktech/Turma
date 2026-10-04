@@ -105,6 +105,11 @@ process.env.PERMISSION_LEDGER_FILE = path.join(
   os.tmpdir(),
   `turma-test-permission-ledger-${process.pid}.json`
 );
+// The per-org permission policy text (XERK-1566), an externalized /data store.
+process.env.PERMISSION_POLICIES_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-permission-policies-${process.pid}.json`
+);
 // The migration relay spools transcript bundles to disk (XERK-263) and sweeps
 // its whole directory at boot, so it gets a throwaway one of its own — sharing
 // /data/migrations, or one dir across test files, would have each sweep delete
@@ -4876,7 +4881,13 @@ test("http: command queue rides the reply until acked", async () => {
   // `archiveOffer:"hub"` rides EVERY reply (XERK-431) so a fresh agent learns to
   // ship an inventory and let the hub choose what to archive, before its first
   // archive beat — present even with no archiveHave, as here.
-  assert.deepEqual(Object.keys(res.body).sort(), ["archiveOffer", "bodyMax", "commands", "peers"]);
+  // `permissionPolicy` rides every reply too (XERK-1566): the agent's judge
+  // decides against it, and a reply without one stands the judge down.
+  // `decisions` rides every reply too (XERK-1574): the host's decided org's log
+  // tail, `org: ""` here — an absent key would remove the agent's file anyway.
+  assert.deepEqual(Object.keys(res.body).sort(),
+    ["archiveOffer", "bodyMax", "commands", "decisions", "peers", "permissionPolicy"]);
+  assert.deepEqual(res.body.decisions, { org: "", entries: [] });
   assert.equal(res.body.archiveOffer, "hub");
   assert.deepEqual(res.body.commands, []);
   assert.deepEqual(res.body.peers, []);
@@ -8614,6 +8625,7 @@ const asBeat = async (device, site, {
   jiraSource,
   ackedCommands,
   closeTicket,
+  pauseSleepers,
 } = {}) => {
   const r = await request("POST", "/api/heartbeat", {
     body: {
@@ -8622,6 +8634,7 @@ const asBeat = async (device, site, {
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
       ...(closeTicket !== undefined ? { closeTicket } : {}),
+      ...(pauseSleepers !== undefined ? { pauseSleepers } : {}),
       jira: { available: true, configured: true, siteKey: site,
               user: user || `${device}@x.com`, fetchedAt, tickets,
               ...(jiraSource ? { source: jiraSource } : {}) },
@@ -23309,6 +23322,512 @@ test("XERK-1573: briefTick drops an org with no host once its briefs are old", a
   for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
 });
 
+// ---- the permission judge's policy text (XERK-1566) ---------------------------
+
+test("XERK-1566: the org's permission policy rides every heartbeat reply", async () => {
+  const site = "x1566a.atlassian.net";
+  hub.setPermissionPolicy(site, null);
+  let r = await asBeat("x1566-host", site);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.permissionPolicy,
+    { site, text: hub.DEFAULT_PERMISSION_POLICY, isDefault: true });
+  const set = await request("POST", `/api/jira/${site}/permission-policy`,
+    { body: { text: "Only the repo's own tests." }, headers: userHeaders });
+  assert.equal(set.status, 200);
+  assert.deepEqual([set.body.text, set.body.isDefault], ["Only the repo's own tests.", false]);
+  r = await asBeat("x1566-host", site);
+  assert.deepEqual(r.body.permissionPolicy,
+    { site, text: "Only the repo's own tests.", isDefault: false });
+  // Another org's host still gets the default — the text is per DECIDED org.
+  r = await asBeat("x1566-other", "x1566b.atlassian.net");
+  assert.equal(r.body.permissionPolicy.text, hub.DEFAULT_PERMISSION_POLICY);
+  // An empty text is stored (the judge stands down); null drops back to the default.
+  await request("POST", `/api/jira/${site}/permission-policy`, { body: { text: "" }, headers: userHeaders });
+  r = await asBeat("x1566-host", site);
+  assert.deepEqual([r.body.permissionPolicy.text, r.body.permissionPolicy.isDefault], ["", false]);
+  const reset = await request("POST", `/api/jira/${site}/permission-policy`,
+    { body: { text: null }, headers: userHeaders });
+  assert.equal(reset.body.isDefault, true);
+  const got = await request("GET", `/api/jira/${site}/permission-policy`, { headers: userHeaders });
+  assert.deepEqual([got.status, got.body.text, got.body.defaultText],
+    [200, hub.DEFAULT_PERMISSION_POLICY, hub.DEFAULT_PERMISSION_POLICY]);
+  for (const h of ["x1566-host", "x1566-other"]) delete agents[h];
+});
+
+test("XERK-1566: a host with no decided org gets NO policy text, so its judge stands down", async () => {
+  const site = "x1566c.atlassian.net";
+  const other = "x1566d.atlassian.net";
+  await asBeat("x1566-bound", site);
+  hub.setPermissionPolicy(site, "acme only");
+  // A host bound to ANOTHER org that now CLAIMS this one is drifted: its decided
+  // org is "", so it reads neither this org's text NOR the looser default —
+  // fail NARROW, like the peer roster.
+  await asBeat("x1566-drift", other);
+  let r = await asBeat("x1566-drift", site);
+  assert.deepEqual(r.body.permissionPolicy, { site: null, text: "", isDefault: false });
+  // Its OWN org turned the judge off ("") — a drift must not switch it back
+  // on with the default.
+  hub.setPermissionPolicy(other, "");
+  r = await asBeat("x1566-drift", site);
+  assert.equal(r.body.permissionPolicy.text, "");
+  // A never-bound host (no tracker block at all) gets no text either.
+  const bare = await request("POST", "/api/heartbeat",
+    { body: { device: "x1566-bare", repos: [], sessions: [] }, headers: agentHeaders });
+  assert.equal(bare.status, 200);
+  assert.deepEqual(bare.body.permissionPolicy, { site: null, text: "", isDefault: false });
+  assert.deepEqual(hub.permissionPolicyReply({}), { site: null, text: "", isDefault: false });
+  // The bound host still reads its org's text; an org with no entry reads the default.
+  r = await asBeat("x1566-bound", site);
+  assert.equal(r.body.permissionPolicy.text, "acme only");
+  hub.setPermissionPolicy(site, null);
+  r = await asBeat("x1566-bound", site);
+  assert.deepEqual(r.body.permissionPolicy,
+    { site, text: hub.DEFAULT_PERMISSION_POLICY, isDefault: true });
+  hub.setPermissionPolicy(other, null);
+  for (const h of ["x1566-bound", "x1566-drift", "x1566-bare"]) delete agents[h];
+});
+
+test("XERK-1566: the permission-policy route refuses bad bodies, phantom orgs and anonymous callers", async () => {
+  const site = "x1566e.atlassian.net";
+  await asBeat("x1566-route", site);
+  for (const body of [{}, { text: 5 }, { text: ["x"] }]) {
+    const r = await request("POST", `/api/jira/${site}/permission-policy`, { body, headers: userHeaders });
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  const big = await request("POST", `/api/jira/${site}/permission-policy`,
+    { body: { text: "x".repeat(hub.PERMISSION_POLICY_MAX + 1) }, headers: userHeaders });
+  assert.equal(big.status, 413);
+  assert.equal(big.body.limit, hub.PERMISSION_POLICY_MAX);
+  assert.equal(hub.permissionPolicies()[site], undefined, "no partial state on refusal");
+  const phantom = await request("GET", "/api/jira/nobody1566.atlassian.net/permission-policy",
+    { headers: userHeaders });
+  assert.equal(phantom.status, 404);
+  const anon = await request("GET", `/api/jira/${site}/permission-policy`);
+  assert.equal(anon.status, 401);
+  delete agents["x1566-route"];
+});
+
+test("XERK-1566: a judged ledger row keeps its verdict and reason", async () => {
+  hub.permissionLedger._internals.reset();
+  const now = Date.now();
+  const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "x1566-judged", jira: { siteKey: "acme.atlassian.net" },
+    permissionEvents: [
+      { id: "j-s1-aa", sessionId: "s1", kind: "judged", tool: "Bash", head: "npm run",
+        openedAt: now - 1000, closedAt: now, answer: "allow", verdict: "allow",
+        judgeReason: "tests are pre-authorised" },
+      { id: "j-s1-bb", sessionId: "s1", kind: "judged", tool: "Bash", head: "npm run",
+        openedAt: now - 900, closedAt: now, answer: "deny", verdict: "maybe" }] } });
+  assert.equal(r.status, 200);
+  const view = await request("GET", "/api/permissions", { headers: userHeaders });
+  const byId = Object.fromEntries(view.body.recent.map((x) => [x.id, x]));
+  assert.deepEqual([byId["j-s1-aa"].verdict, byId["j-s1-aa"].judgeReason],
+    ["allow", "tests are pre-authorised"]);
+  assert.equal(byId["j-s1-bb"].verdict, undefined, "an unknown verdict is dropped, never guessed");
+  const judged = view.body.top.find((g) => g.kind === "judged");
+  assert.equal(judged.count, 2);
+  assert.equal(judged.suggestedRule, null, "a judged group offers no rule to copy");
+  delete agents["x1566-judged"];
+});
+
+// ---- XERK-1574: the brief narrative + the per-org decisions log ---------------
+
+// One host's beat in an org, with whatever else the test needs on it.
+async function beat1574(device, site, extra = {}) {
+  return request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device,
+    jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+      fetchedAt: new Date().toISOString(), tickets: [] },
+    ...extra,
+  } });
+}
+const renderCmds = (host) => (agents[host].commands || []).filter((c) => c.type === "renderBrief");
+
+test("XERK-1574: a brief asks ONE capable host of its org for a narrative, and only its answer lands", async () => {
+  const S = "nrA1574.atlassian.net";
+  const T = "nrB1574.atlassian.net";
+  await beat1574("nrCapable", S, { briefRender: { available: true } });
+  await beat1574("nrOld", S);                                       // no capability
+  await beat1574("nrOther", T, { briefRender: { available: true } });
+  const b = hub.briefSweep(S, "manual");
+  assert.equal(renderCmds("nrOld").length, 0, "an agent that cannot answer is never asked");
+  assert.equal(renderCmds("nrOther").length, 0, "another org's host is never asked");
+  const [cmd] = renderCmds("nrCapable");
+  assert.equal(cmd.siteKey, S);
+  assert.equal(cmd.briefAt, b.at);
+  // The input is the structured brief alone — no ids/links, never a transcript.
+  assert.equal(cmd.brief.siteKey, S);
+  assert.deepEqual(Object.keys(cmd.brief.counts).sort(), Object.keys(b.counts).sort());
+  assert.ok(!JSON.stringify(cmd.brief).includes("sessionId"));
+  assert.equal("narrative" in cmd.brief, false);
+
+  const row = (text, extra = {}) => ({ siteKey: S, briefAt: b.at, text, ...extra });
+  // Another org's host, a wrong brief, and a forged siteKey are all ignored.
+  await beat1574("nrOther", T, { briefNarratives: [row("forged by another org")] });
+  await beat1574("nrCapable", S, { briefNarratives: [row("wrong brief", { briefAt: b.at - 1 })] });
+  // A same-org host the hub never asked cannot write the org's summary either.
+  const asked = JSON.stringify(hub.briefRenders.get(S));
+  await beat1574("nrOld", S, { briefNarratives: [row("not asked")] });
+  assert.equal("narrative" in hub.getBriefs()[S][0], false);
+  assert.equal(JSON.stringify(hub.briefRenders.get(S)), asked, "the request still waits on the asked host");
+  // The asked host's answer lands, cleaned to one plain paragraph.
+  await beat1574("nrCapable", S, { briefNarratives: [row("## Brief\n- **XERK-1** shipped.\n<script>x</script>")] });
+  const kept = hub.getBriefs()[S][0];
+  assert.equal(kept.narrative, "XERK-1 shipped. x", "the heading line is dropped, not run in");
+  assert.ok(Number.isSafeInteger(kept.narrativeAt));
+  assert.equal((await fleet()).briefs[S][0].narrative, "XERK-1 shipped. x");
+  // Answered once: a second row for the same brief changes nothing.
+  await beat1574("nrCapable", S, { briefNarratives: [row("again")] });
+  assert.equal(hub.getBriefs()[S][0].narrative, "XERK-1 shipped. x");
+  // A newer brief replaces the request; the earlier brief's narrative leaves the wire.
+  hub.briefSweep(S, "manual", Date.now() + 1000);
+  assert.equal(renderCmds("nrCapable").length, 1, "one request per org in flight");
+  const wire = (await fleet()).briefs[S];
+  assert.equal("narrative" in wire[1], false, "an earlier brief is served headline-only");
+  assert.equal(hub.getBriefs()[S][1].narrative, "XERK-1 shipped. x", "kept in the store");
+  for (const h of ["nrCapable", "nrOld", "nrOther"]) delete agents[h];
+  for (const k of [S, T]) delete hub.getBriefs()[k];
+  hub.briefRenders.clear();
+});
+
+test("XERK-1574: a capable host whose Claude login lapsed is asked only when no other can be", async () => {
+  const S = "nrL1574.atlassian.net";
+  await beat1574("nrLapsed", S, { briefRender: { available: true },
+    claudeAuth: { present: true, needsLogin: true, expiringSoon: false } });
+  await beat1574("nrHealthy", S, { briefRender: { available: true },
+    claudeAuth: { present: true, needsLogin: false, expiringSoon: false } });
+  hub.briefSweep(S, "manual");
+  assert.equal(renderCmds("nrLapsed").length, 0, "a host that cannot run claude is passed over");
+  assert.equal(renderCmds("nrHealthy").length, 1);
+  delete agents.nrHealthy;
+  hub.briefSweep(S, "manual", Date.now() + 1000);
+  assert.equal(renderCmds("nrLapsed").length, 1, "the only capable host is still asked");
+  delete agents.nrLapsed;
+  delete hub.getBriefs()[S];
+  hub.briefRenders.clear();
+});
+
+test("XERK-1574: a brief with no capable host stands without a narrative", async () => {
+  const S = "nrC1574.atlassian.net";
+  await beat1574("nrNone", S);
+  const b = hub.briefSweep(S, "manual");
+  assert.equal(hub.requestBriefNarrative(b), null);
+  assert.equal(hub.briefRenders.has(S), false);
+  assert.equal("narrative" in hub.getBriefs()[S][0], false);
+  delete agents.nrNone;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1574: the narrative is whitelisted — plain, bounded, a coerce fixed point", () => {
+  const C = hub.cleanBriefNarrative;
+  assert.equal(C("```js\ncode\n```\n# Head\n1. one\n- two\n[link](http://x) a\u202eb"), "code one two link a b");
+  // A standalone heading line is dropped, never run into the next sentence.
+  // The SAME vectors as the agent's test_clean_brief_narrative_drops_heading_lines.
+  for (const [input, want] of [
+    ["**Summary for acme**\nTwo pieces of work landed.", "Two pieces of work landed."],
+    ["## Summary\nTwo landed.", "Two landed."],
+    ["Two landed.\n### Decisions\nThe operator chose Postgres.", "Two landed. The operator chose Postgres."],
+    ["Two landed.\n**Next steps:**\n- review XERK-2", "Two landed. review XERK-2"],
+    ["Two landed.\nNext steps:\n- review XERK-2", "Two landed. review XERK-2"],
+    ["\u200b*Recap*\nTwo landed.", "Two landed."],
+    ["We **kept** the plan and *shipped* XERK-1.", "We kept the plan and shipped XERK-1."],
+    ["**XERK-1** shipped.", "XERK-1 shipped."],
+    ["The operator decided the following, after a long review of both options:\n- Postgres",
+      "The operator decided the following, after a long review of both options: Postgres"],
+    ["#hashtag stays", "#hashtag stays"],
+    ["**Only a heading**", ""],
+    // '#' is markup only as a line-leading heading mark.
+    ["CI is red on PR #215.", "CI is red on PR #215."],
+    ["Fixed issue #3 and issue #4.", "Fixed issue #3 and issue #4."],
+    ["# Heading\nCI on PR #215.", "CI on PR #215."],
+    ["- ## x\n`#` y", "x y"],
+  ]) {
+    assert.equal(C(input), want, JSON.stringify(input));
+    assert.equal(C(C(input)), C(input), `a fixed point: ${JSON.stringify(input)}`);
+  }
+  assert.equal(C(42), "");
+  const long = C("word ".repeat(600));
+  assert.ok(long.length <= 1200 && long.endsWith("…"));
+  for (const t of ["*a* `b`", long, "1.\nnext", "[[a](x)](y)",
+    "\u0007- x y", "​1. first", "\x1c- z", " - w", "a\n​- b", "١. x"]) {
+    assert.equal(C(C(t)), C(t), JSON.stringify(t));
+  }
+  // A leading control/zero-width character no longer hides a bullet.
+  assert.equal(C("\u0007- x y"), "x y");
+  assert.equal(C("​1. first"), "first");
+  assert.equal(C("\x1c- z"), "z", "the same answer the agent's Python mirror gives");
+  assert.equal(C("١. x"), "١. x", "ASCII digits only, like the Python mirror");
+  // A cut never leaves half a surrogate pair.
+  const astral = C(`${"a".repeat(1198)}\u{1F600}${" b".repeat(10)}`);
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(astral), "no lone high surrogate");
+  // The cut counts code points, as the agent's Python mirror does (same answers as
+  // clean_brief_narrative): 300 "😀ok" words are 1199 code points, kept whole;
+  // 400 are cut to 299 words and "…" (1196 code points).
+  const emoji = (n) => Array(n).fill("\u{1F600}ok").join(" ");
+  assert.equal(C(emoji(300)), emoji(300));
+  const cut = C(emoji(400));
+  assert.equal([...cut].length, 1196);
+  assert.equal(cut, `${emoji(299)}…`);
+  const raw = { "o.atlassian.net": [{ siteKey: "o.atlassian.net", at: 2000,
+    narrative: "## Title\n**bold** text", narrativeAt: 2500 },
+  { siteKey: "o.atlassian.net", at: 1000, narrative: "   ", narrativeAt: 1500 }] };
+  const out = hub.briefsCoerce(JSON.parse(JSON.stringify(raw)));
+  assert.equal(out["o.atlassian.net"][0].narrative, "bold text");
+  assert.equal(out["o.atlassian.net"][0].narrativeAt, 2500);
+  assert.equal("narrative" in out["o.atlassian.net"][1], false, "an empty narrative is absent");
+  assert.equal("narrativeAt" in out["o.atlassian.net"][1], false);
+  assert.deepEqual(hub.briefsCoerce(JSON.parse(JSON.stringify(out))), out);
+});
+
+test("XERK-1574: the briefRender capability is coerced strictly", () => {
+  const n = (v) => { const a = { briefRender: v }; hub.normalizeBriefRender(a); return a.briefRender; };
+  assert.deepEqual(n({ available: true }), { available: true });
+  assert.deepEqual(n({ available: "yes", junk: 1 }), { available: false });
+  assert.equal(n("yes"), null);
+  const absent = {};
+  hub.normalizeBriefRender(absent);
+  assert.equal("briefRender" in absent, false, "absent stays absent");
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("briefRender"));
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("briefNarratives"));
+});
+
+test("XERK-1574: POST /api/orgs/<site>/decisions records a note; refusals mint nothing", async () => {
+  const S = "dcA1574.atlassian.net";
+  await beat1574("dcHostA", S);
+  const post = (site, body, headers = userHeaders) =>
+    request("POST", `/api/orgs/${site}/decisions`, { body, headers });
+  assert.equal((await post(S, { text: "x" }, {})).status, 401);
+  assert.equal((await post(S, { text: "   " })).status, 400);
+  const tooLong = await post(S, { text: "y".repeat(501) });
+  assert.equal(tooLong.status, 413);
+  assert.match(tooLong.body.error, /the limit is 500/);
+  const phantom = await post("nobody.atlassian.net", { text: "x" });
+  assert.equal(phantom.status, 404);
+  assert.equal("nobody.atlassian.net" in hub.getDecisions(), false);
+  assert.equal(S in hub.getDecisions(), false, "a refusal mints no store key");
+  const ok = await post(S, { text: "  Never auto-merge infra.  " });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.decision.source, "note");
+  assert.equal(ok.body.decision.text, "Never auto-merge infra.");
+  assert.deepEqual((await fleet()).decisions[S], [ok.body.decision]);
+  // The org's hosts get it on their next reply, keyed on the DECIDED org.
+  const reply = await beat1574("dcHostA", S);
+  // The reply carries only the cells the agent writes to its file, never the
+  // row's id/host/sessionId/label.
+  const { at, source, text } = ok.body.decision;
+  assert.deepEqual(reply.body.decisions, { org: S, entries: [{ at, source, text }] });
+  assert.ok(ok.body.decision.id, "the stored row keeps its id");
+  delete agents.dcHostA;
+  delete hub.getDecisions()[S];
+});
+
+test("XERK-1574: answering a question or a permission dialog appends to the org's log", async () => {
+  const S = "dcB1574.atlassian.net";
+  const sessions = [
+    { id: "q1", status: "running", summary: "db work", ticket: { key: "XERK-9", siteKey: S },
+      session: { question: "Which DB?", questionOptions: ["Postgres", "SQLite"] } },
+    { id: "p1", status: "running", label: "lbl",
+      session: { panePrompt: { prompt: "Do you want to proceed?", detail: "Bash command\nnpm test",
+        options: [{ number: 1, label: "Yes" },
+          { number: 2, label: "Yes, and don't ask again for npm test commands in this project" },
+          { number: 3, label: "No" }] } } },
+    { id: "idle", status: "running" },
+  ];
+  await beat1574("dcHostB", S, { sessions });
+  const ans = (sid, body) => request("POST", `/api/agents/dcHostB/sessions/${sid}/answer`,
+    { body, headers: userHeaders });
+  assert.equal((await ans("q1", { optionIndex: 0 })).status, 200);
+  assert.equal((await ans("q1", { optionIndices: [0, 1, 5], custom: "and backups" })).status, 200);
+  assert.equal((await ans("idle", { custom: "hello" })).status, 200, "no question: nothing recorded");
+  const pp = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
+    { body: { optionNumber: 1 }, headers: userHeaders });
+  assert.equal(pp.status, 200);
+  // The standing grant's label names the command; only its kind is logged.
+  const ppGrant = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
+    { body: { optionNumber: 2 }, headers: userHeaders });
+  assert.equal(ppGrant.status, 200);
+  // A number the three-option dialog does not offer is not logged as a choice.
+  const pp7 = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
+    { body: { optionNumber: 7 }, headers: userHeaders });
+  assert.equal(pp7.status, 200);
+  const log = hub.getDecisions()[S].map(({ id, at, ...rest }) => rest);
+  assert.deepEqual(log, [
+    { source: "question", question: "Which DB?", answer: "Postgres", host: "dcHostB",
+      sessionId: "q1", ticket: "XERK-9", label: "db work" },
+    { source: "question", question: "Which DB?", answer: "Postgres; SQLite, plus a typed answer",
+      host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
+    { source: "permission", question: "Bash", answer: "Yes",
+      host: "dcHostB", sessionId: "p1", label: "lbl" },
+    { source: "permission", question: "Bash", answer: "Yes, don't ask again",
+      host: "dcHostB", sessionId: "p1", label: "lbl" },
+  ]);
+  // A drifted host (bound to S, now declaring another org) is in NO org: its
+  // answers are not logged — not under S, and NOT under the org it claims,
+  // whose real hosts would otherwise read them — and its reply carries no log.
+  const E = "elsewhere1574.atlassian.net";
+  await beat1574("dcHostE", E);                     // a host genuinely decided into E
+  await beat1574("dcHostB", E, { sessions });
+  const before = hub.getDecisions()[S].length;
+  assert.equal((await ans("q1", { optionIndex: 1 })).status, 200);
+  const pp2 = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
+    { body: { optionNumber: 2 }, headers: userHeaders });
+  assert.equal(pp2.status, 200);
+  assert.equal(hub.getDecisions()[S].length, before);
+  assert.equal(E in hub.getDecisions(), false, "never keyed on the claimed org");
+  const reply = await beat1574("dcHostB", E, { sessions });
+  assert.deepEqual(reply.body.decisions, { org: "", entries: [] });
+  const replyE = await beat1574("dcHostE", E);
+  assert.deepEqual(replyE.body.decisions, { org: E, entries: [] },
+    "the claimed org's own hosts never see the drifted host's answers");
+  delete agents.dcHostB;
+  delete agents.dcHostE;
+  delete hub.getDecisions()[S];
+  delete hub.getDecisions()[E];
+});
+
+test("XERK-1574: a permission's log line names the tool, never the command, and drops boilerplate", () => {
+  const q = (prompt, detail) => hub.permissionDecisionQuestion({ prompt, detail });
+  // The tool says what kind of thing was asked for; its command line, path or
+  // URL is session content (a token in a curl header) and never reaches the log.
+  assert.equal(q("Do you want to proceed?", "Bash command\nnpm test -- --runInBand"), "Bash");
+  assert.equal(q("Do you want to proceed?",
+    "Bash command\ncurl -H \"Authorization: Bearer sk-secret\" https://x\nCall the API"), "Bash");
+  assert.equal(q("Do you want to make this edit to server.js?", "Edit file\nturma/server.js"), "Edit file");
+  assert.equal(q("Do you want to create\n notes.md?", "Create file\nnotes.md"), "Create file",
+    "a question the pane wrapped is still the stock one");
+  assert.equal(q("Do you want to allow Claude to fetch this content?", "Fetch\nhttps://example.com/?token=x"),
+    "Fetch");
+  // No title-shaped tool line (the plan approval's own text): the question alone.
+  assert.equal(q("Claude has written up a plan and is ready to execute. Would you like to proceed?",
+    "Ship the brief page"), "Claude has written up a plan and is ready to execute. Would you like to proceed?");
+  // A question that is not boilerplate stays, after the tool.
+  assert.equal(q("Allow access to the staging database?", "Bash command\npsql staging"),
+    "Bash — Allow access to the staging database?");
+  assert.equal(q("Do you want to proceed? This deletes 40 files.", "Bash command\nrm -rf build"),
+    "Bash — Do you want to proceed? This deletes 40 files.");
+  // No subject: the question is all there is, generic or not.
+  assert.equal(q("Do you want to proceed?", ""), "Do you want to proceed?");
+  assert.equal(q("Do you want to proceed?", undefined), "Do you want to proceed?");
+  assert.equal(q("", "Bash command\nnpm test"), "", "no question, nothing to log");
+  assert.ok(!q("Do you want to proceed?", "Bash command\nexport TOKEN=abc").includes("TOKEN"));
+  assert.equal(hub.permissionDecisionQuestion(undefined), "");
+});
+
+test("XERK-1574: a permission answer logs the option's kind, never its label's subject", () => {
+  const k = hub.permissionAnswerKind;
+  assert.equal(k("Yes"), "Yes");
+  assert.equal(k("Yes, and don't ask again for docker compose commands in this project"),
+    "Yes, don't ask again");
+  assert.equal(k("Yes, and don't ask again for internal.example.com"), "Yes, don't ask again");
+  assert.equal(k("Yes, allow all edits during this session (shift+tab)"), "Yes, don't ask again");
+  assert.equal(k("Yes, and auto-accept edits"), "Yes, don't ask again");
+  assert.equal(k("Yes, and manually approve edits"), "Yes");
+  assert.equal(k("No, and tell Claude what to do differently (esc)"), "No");
+  assert.equal(k("No, keep planning"), "No");
+  assert.equal(k("Yesterday's build"), "", "a word that merely starts with yes is no kind");
+  assert.equal(k("Deploy to staging"), "");
+  assert.equal(k(undefined), "");
+});
+
+test("XERK-1574: the log is a bounded tail — 200 kept, 20 served, 30 on a reply", async () => {
+  const S = "dcC1574.atlassian.net";
+  await beat1574("dcHostC", S);
+  for (let i = 0; i < 205; i++) hub.appendDecision(S, { source: "note", text: `n${i}` }, 1000 + i);
+  const kept = hub.getDecisions()[S];
+  assert.equal(kept.length, 200);
+  assert.equal(kept[0].text, "n5", "oldest evicted");
+  assert.equal((await fleet()).decisions[S].length, 20);
+  assert.equal((await fleet()).decisions[S][19].text, "n204");
+  // The count a client shows is the org's (200 kept), not the served tail's 20.
+  assert.equal((await fleet()).decisionCounts[S], 200);
+  assert.equal(hub.decisionCountsWire()[S], 200);
+  const reply = await beat1574("dcHostC", S);
+  assert.equal(reply.body.decisions.entries.length, 30);
+  assert.equal(reply.body.decisions.entries[29].text, "n204");
+  assert.equal(hub.appendDecision("", { source: "note", text: "x" }), null);
+  assert.equal(hub.appendDecision(S, { source: "bogus", text: "x" }), null);
+  delete agents.dcHostC;
+  delete hub.getDecisions()[S];
+});
+
+test("XERK-1574: an auto-appended decision is capped — question 300, chosen option 200", async () => {
+  const S = "dcD1574.atlassian.net";
+  const longQ = "Q".repeat(400) + "?";
+  await beat1574("dcHostD", S, { sessions: [{ id: "lq", status: "running",
+    session: { question: longQ, questionOptions: ["A"] } },
+  { id: "lp", status: "running", session: { panePrompt: { prompt: "Proceed?",
+    detail: "x".repeat(118) + "\u{1F600}yyyy", options: [{ number: 1, label: "Yes" }] } } }] });
+  const custom = "z".repeat(3000);                  // within the legacy input cap
+  const res = await request("POST", "/api/agents/dcHostD/sessions/lq/answer",
+    { body: { custom }, headers: userHeaders });
+  assert.equal(res.status, 200);
+  const [entry] = hub.getDecisions()[S];
+  assert.equal(entry.question, "Q".repeat(300));
+  assert.equal(entry.answer, "(a typed answer)", "a typed answer is logged as a marker, never its words");
+  // A permission line never carries the dialog's body (here a long line with no
+  // tool title above it): the question alone is logged.
+  assert.equal((await request("POST", "/api/agents/dcHostD/sessions/lp/pane-prompt",
+    { body: { optionNumber: 1 }, headers: userHeaders })).status, 200);
+  assert.equal(hub.getDecisions()[S][1].question, "Proceed?");
+  const direct = hub.sanitizeDecision({ at: 1, source: "question", question: "q".repeat(5000),
+    answer: "a".repeat(5000), text: "t".repeat(5000) });
+  assert.equal(direct.question.length, 300);
+  assert.equal(direct.answer.length, 200);
+  assert.equal(direct.text.length, 500);
+  // A cap through an emoji never strands half its surrogate pair (the agent
+  // writes these to a UTF-8 file, which cannot encode one); a lone surrogate
+  // elsewhere becomes U+FFFD. Still a coerce fixed point.
+  const emoji = hub.sanitizeDecision({ at: 1, source: "question",
+    question: "a".repeat(299) + "\u{1F600}tail", answer: "b".repeat(199) + "\u{1F600}",
+    label: "ok \uDC00 \uD83D" });
+  assert.equal(emoji.question, "a".repeat(299));
+  assert.equal(emoji.answer, "b".repeat(199));
+  assert.equal(emoji.label, "ok \uFFFD");
+  const wellFormed = (s) => !/\p{Surrogate}/u.test(s);
+  assert.ok([emoji.question, emoji.answer, emoji.label].every(wellFormed));
+  assert.deepEqual(hub.sanitizeDecision(emoji), emoji);
+  const kept = hub.sanitizeDecision({ at: 1, source: "note", text: "x".repeat(498) + "\u{1F600}" });
+  assert.equal(kept.text, "x".repeat(498) + "\u{1F600}", "a pair that fits is kept whole");
+  delete agents.dcHostD;
+  delete hub.getDecisions()[S];
+});
+
+test("XERK-1574: the decisions store coerces to the typed shape and survives a restart", () => {
+  const good = { id: "abc123", at: 5, source: "question", question: " Q? ", answer: "A",
+    host: 7, sessionId: "s1", ticket: "X-1", extra: "dropped" };
+  const raw = { "o.atlassian.net": [good, { at: 6, source: "note" }, { at: -1, source: "note", text: "t" },
+    { at: 7, source: "note", text: "t", id: "NOT-HEX" }, "junk"], "x.atlassian.net": "nope" };
+  const out = hub.decisionsCoerce(JSON.parse(JSON.stringify(raw)));
+  assert.equal(Object.getPrototypeOf(out), null);
+  assert.deepEqual(Object.keys(out), ["o.atlassian.net"]);
+  assert.deepEqual(out["o.atlassian.net"], [
+    { at: 5, source: "question", id: "abc123", question: "Q?", answer: "A", sessionId: "s1", ticket: "X-1" },
+    { at: 7, source: "note", text: "t" },
+  ]);
+  assert.deepEqual(hub.decisionsCoerce(JSON.parse(JSON.stringify(out))), out, "a fixed point");
+  const file = path.join(os.tmpdir(), `turma-test-decisions-restore-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify(raw));
+  try {
+    const mod = freshServerModule((env) => { env.DECISIONS_FILE = file; });
+    assert.equal(mod.getDecisions()["o.atlassian.net"].length, 2);
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test("XERK-1574: briefTick drops an org's log once no host is in it and it is old", async () => {
+  const S = "dcD1574.atlassian.net";
+  const now = Date.now();
+  await beat1574("dcHostD", S);
+  hub.appendDecision(S, { source: "note", text: "keep me a while" }, now);
+  delete agents.dcHostD;
+  hub.briefTick(now + 24 * 3600 * 1000);
+  assert.equal(hub.getDecisions()[S].length, 1, "kept a while: a quiet host may come back");
+  hub.briefTick(now + 31 * 24 * 3600 * 1000);
+  assert.equal(S in hub.getDecisions(), false);
+  for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
+});
+
 // ---- the permission ledger (XERK-1563) -----------------------------------------
 
 function permRow(id, extra = {}) {
@@ -23788,4 +24307,655 @@ test("XERK-1572: attentionNudged writes through and hydrates back, so a failover
     hub.attentionNudged.clear();
     delete agents[host];
   });
+});
+
+// ---- XERK-1575: slot policy v2 — pause a sleeper, resume it at its wake ---------
+
+const SLEEP_SITE = "slp.atlassian.net";
+const sleeperSession = (id, wakeIn, extra = {}) => ({
+  id, status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z",
+  session: { wakeAt: Date.now() + wakeIn, wakeReason: `check ${id}`, paneBusy: false,
+             agents: [], ...extra },
+});
+const sleeperCmds = (host, type) => (agents[host].commands || []).filter((c) => c.type === type);
+const resetSleepers = () => {
+  hub.sleeperPauseTried.clear();
+  hub.sleeperWakeTried.clear();
+  hub.sleeperUnpauseTried.clear();
+  hub.sleeperResumeHold.clear();
+};
+
+test("XERK-1575: a full host pauses its FARTHEST quiet sleeper, one per waiting ticket", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpFull";
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeperSession("near", 60 * 60_000), sleeperSession("far", 3 * 60 * 60_000)] });
+  const r = await startTicket(SLEEP_SITE, "ENG-5");
+  assert.equal(r.body.queued, true);
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["far"]);
+  // The pause still in flight counts against the one waiting ticket: no second.
+  drainTicketQueue();
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 1);
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 0, "the slot is not free yet");
+  // The agent killed it: the slot reads free on the next beat and the ticket takes it.
+  agents[host].commands = [];
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 },
+    pauseSleepers: { available: true }, sessions: [sleeperSession("near", 60 * 60_000)],
+    closedSessions: [{ id: "far", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: Date.now() + 3 * 60 * 60_000, wakeReason: "check far", at: Date.now() } }] });
+  assert.deepEqual(sleeperCmds(host, "spawnTicket").map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0, "nothing waits, so nothing else pauses");
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: an undelivered pause is withdrawn once its ticket stops waiting", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpCancel";
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeperSession("s1", 60 * 60_000), sleeperSession("s2", 3 * 60 * 60_000)] });
+  await startTicket(SLEEP_SITE, "ENG-5");
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["s2"]);
+  const d = await request("DELETE", `/api/jira/${SLEEP_SITE}/ENG-5/session`, { headers: userHeaders });
+  assert.equal(d.status, 200);
+  assert.equal(ticketQueue.length, 0);
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0,
+    "no ticket waits, so the never-handed-over pause is dropped");
+  // A pause already handed to the agent may be running: it is left alone.
+  agents[host].commands = [{ cmdId: "handed", type: "pauseSleeper", sessionId: "s1",
+    deliveredAt: Date.now() }];
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.cmdId), ["handed"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: each pause answers ONE ticket — a second ticket queued mid-pause gets its own", async () => {
+  resetAutoStart(); resetSleepers();
+  const siteA = "slptwoa.atlassian.net", siteB = "slptwob.atlassian.net";
+  const sleepy = { autoStart: false, capacity: FULL, pauseSleepers: { available: true } };
+  const triaged = (key) => ({ key, summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } });
+  await asBeat("slpTwoA", siteA, { ...sleepy, tickets: [triaged("ENG-5"), triaged("ENG-6")],
+    sessions: [sleeperSession("a1", 60 * 60_000), sleeperSession("a2", 3 * 60 * 60_000)] });
+  await asBeat("slpTwoB", siteB, { ...sleepy,
+    sessions: [sleeperSession("b1", 60 * 60_000), sleeperSession("b2", 3 * 60 * 60_000)] });
+  await startTicket(siteA, "ENG-5");
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds("slpTwoA", "pauseSleeper").map((c) => c.sessionId), ["a2"]);
+  // Org B's ticket arrives while A's pause is still unacked: B's host pauses for
+  // it, and A's ticket — already answered — never gets a second sleeper. (The
+  // fleet-wide count paused a1 for A here and nothing for B.)
+  assert.equal((await startTicket(siteB, "ENG-5")).body.queued, true);
+  drainTicketQueue();
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds("slpTwoA", "pauseSleeper").map((c) => c.sessionId), ["a2"]);
+  assert.deepEqual(sleeperCmds("slpTwoB", "pauseSleeper").map((c) => c.sessionId), ["b2"]);
+  // The attribution is hub-only: never on the wire.
+  invalidateAgentsCache();
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  const wire = JSON.parse(r.raw).agents.find((a) => a.key === "slpTwoA");
+  assert.ok(wire.commands.some((c) => c.type === "pauseSleeper"));
+  assert.ok(wire.commands.every((c) => !("pauseFor" in c)));
+  // A pause whose ticket no longer waits (cancelled here) is ADOPTED by the next
+  // ticket that fits its host, rather than pausing another sleeper for it.
+  ticketQueue.splice(0, ticketQueue.length, ...ticketQueue.filter((e) => e.issueKey !== "ENG-5"));
+  await startTicket(siteA, "ENG-6");
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds("slpTwoA", "pauseSleeper").map((c) => [c.sessionId, c.pauseFor]),
+    [["a2", `${siteA}\x00ENG-6`]]);
+  ticketQueue.length = 0; delete agents.slpTwoA; delete agents.slpTwoB;
+});
+
+test("XERK-1575: one waiting ticket pauses ONE sleeper fleet-wide, even with two full hosts that fit it", async () => {
+  // Two full hosts of ONE org could each run the ticket. While the first pause is
+  // queued or handed over but unacked, a drain must not pause the other host's
+  // sleeper too: that would kill two sessions for one ticket.
+  resetAutoStart(); resetSleepers();
+  const site = "slppr.atlassian.net";
+  const sleepy = { autoStart: false, capacity: FULL, pauseSleepers: { available: true } };
+  await asBeat("slpPrA", site, { ...sleepy, sessions: [sleeperSession("a1", 3 * 60 * 60_000)] });
+  await asBeat("slpPrB", site, { ...sleepy, sessions: [sleeperSession("b1", 60 * 60_000)] });
+  assert.equal((await startTicket(site, "ENG-5")).body.queued, true);
+  const pauses = () => [...sleeperCmds("slpPrA", "pauseSleeper"),
+    ...sleeperCmds("slpPrB", "pauseSleeper")].map((c) => c.sessionId);
+  drainTicketQueue();
+  assert.deepEqual(pauses(), ["a1"], "the farthest sleeper across both hosts");
+  drainTicketQueue();
+  drainTicketQueue();
+  assert.deepEqual(pauses(), ["a1"], "queued: no second pause on the other host");
+  for (const c of agents.slpPrA.commands) c.deliveredAt = Date.now();
+  drainTicketQueue();
+  assert.deepEqual(pauses(), ["a1"], "handed over, unacked: still none");
+  ticketQueue.length = 0; delete agents.slpPrA; delete agents.slpPrB;
+});
+
+test("XERK-1575: a message to a sleeper whose pause was handed over is refused, never lost", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpMsg";
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeperSession("x", 60 * 60_000)] });
+  const send = () => request("POST", `/api/agents/${host}/sessions/x/input`,
+    { body: { text: "are you there?" }, headers: userHeaders });
+  // Handed to the agent, unacked: it may be killing the session right now.
+  agents[host].commands = [{ cmdId: "p-handed", type: "pauseSleeper", sessionId: "x",
+    deliveredAt: Date.now() }];
+  const refused = await send();
+  assert.equal(refused.status, 409);
+  assert.match(refused.body.error, /being paused/);
+  assert.equal(sleeperCmds(host, "input").length, 0);
+  // Not handed over yet: the pause is withdrawn and the message goes through.
+  agents[host].commands = [{ cmdId: "p-queued", type: "pauseSleeper", sessionId: "x" }];
+  const ok = await send();
+  assert.equal(ok.status, 200);
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
+  assert.deepEqual(sleeperCmds(host, "input").map((c) => c.sessionId), ["x"]);
+  // Acked: x reads as a paused closed record, so a stale client's message is
+  // refused with the hub's words instead of being dropped on the agent.
+  agents[host].commands = [];
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [], closedSessions: [{ id: "x", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: Date.now() + 3600_000, wakeReason: "check later", at: Date.now() } }] });
+  const paused = await send();
+  assert.equal(paused.status, 409);
+  assert.match(paused.body.error, /Resume now/);
+  assert.equal(sleeperCmds(host, "input").length, 0);
+  // An ordinary killed record (no pause) is not this refusal.
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [], closedSessions: [{ id: "x", repo: "Turma", closedAt: "2026-10-01T01:00:00Z" }] });
+  assert.equal((await send()).status, 200);
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: one pause in flight per host — never a batch of automated kills", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpOneHost", site = "slpone.atlassian.net";
+  const triaged = (key) => ({ key, summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } });
+  const sleepy = { autoStart: false, pauseSleepers: { available: true },
+    tickets: [triaged("ENG-5"), triaged("ENG-6"), triaged("ENG-7")] };
+  await asBeat(host, site, { ...sleepy, capacity: { maxSessions: 3, running: 3, queued: 0, free: 0 },
+    sessions: [sleeperSession("s1", 60 * 60_000), sleeperSession("s2", 2 * 60 * 60_000),
+      sleeperSession("s3", 3 * 60 * 60_000)] });
+  for (const k of ["ENG-5", "ENG-6", "ENG-7"]) assert.equal((await startTicket(site, k)).body.queued, true);
+  drainTicketQueue();
+  drainTicketQueue();
+  // Three tickets wait, but one host gets ONE kill at a time, never a batch.
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["s3"]);
+  // Handed over but unacked still counts.
+  for (const c of agents[host].commands) c.deliveredAt = Date.now();
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 1);
+  // Acked (s3 paused, its slot taken by the first ticket): the next pause goes out.
+  agents[host].commands = [];
+  await asBeat(host, site, { ...sleepy, capacity: { maxSessions: 3, running: 3, queued: 0, free: 0 },
+    sessions: [sleeperSession("s1", 60 * 60_000), sleeperSession("s2", 2 * 60 * 60_000),
+      { id: "t5", status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z" }] });
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["s2"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: a wake resume in flight holds the host's one automated lifecycle command", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpWakePause", site = "slpwakepause.atlassian.net";
+  const triaged = (key) => ({ key, summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } });
+  const now = Date.now();
+  const beat = { autoStart: false, pauseSleepers: { available: true }, tickets: [triaged("ENG-5")],
+    capacity: { maxSessions: 2, running: 1, queued: 0, free: 1 },
+    sessions: [sleeperSession("s1", 3 * 60 * 60_000)],
+    closedSessions: [{ id: "due", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: now - 1000, wakeReason: "check due", at: now - 3600_000 } }] };
+  // The ticket queues while the host is full; then a slot frees with a wake due.
+  await asBeat(host, site, { ...beat, capacity: { maxSessions: 2, running: 2, queued: 0, free: 0 },
+    sessions: [{ id: "busy1", status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z" },
+      { id: "busy2", status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z" }],
+    closedSessions: [] });
+  assert.equal((await startTicket(site, "ENG-5")).body.queued, true);
+  drainTicketQueue();
+  agents[host].commands = [];
+  await asBeat(host, site, beat);
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "ENG-5").reason, "capacity");
+  // The wake takes the free slot; the host then reads full and the ticket waits,
+  // but no pause rides the same pass: one relaunch OR one kill per beat, never both.
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => c.sessionId), ["due"]);
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
+  for (const c of agents[host].commands) c.deliveredAt = Date.now();
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
+  // The wake lands (acked, the slot now taken): the pause goes out.
+  agents[host].commands = [];
+  await asBeat(host, site, { ...beat, capacity: { maxSessions: 2, running: 2, queued: 0, free: 0 },
+    sessions: [sleeperSession("s1", 3 * 60 * 60_000),
+      { id: "due", status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z" }],
+    closedSessions: [] });
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["s1"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: only a quiet sleeper, ten minutes out, on a capable full host that could run the ticket", async () => {
+  const cases = {
+    "wake too soon": { s: sleeperSession("x", 9 * 60_000) },
+    "busy pane": { s: sleeperSession("x", 60 * 60_000, { paneBusy: true }) },
+    "pane can't tell": { s: sleeperSession("x", 60 * 60_000, { paneBusy: null }) },
+    "a question": { s: sleeperSession("x", 60 * 60_000, { question: "Which?" }) },
+    "a dialog": { s: sleeperSession("x", 60 * 60_000, { panePrompt: { prompt: "Proceed?", options: [] } }) },
+    "background work": { s: sleeperSession("x", 60 * 60_000,
+      { agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }) },
+    "agents can't tell": { s: (() => { const s = sleeperSession("x", 60 * 60_000); delete s.session.agents; return s; })() },
+    "not sleeping": { s: (() => { const s = sleeperSession("x", 0); delete s.session.wakeAt; return s; })() },
+    "no capability": { s: sleeperSession("x", 60 * 60_000), cap: undefined },
+    "capability off": { s: sleeperSession("x", 60 * 60_000), cap: { available: false } },
+    "untriaged host": { s: sleeperSession("x", 60 * 60_000), tickets: [{ key: "ENG-5",
+      summary: "Fix it", statusCategory: "todo", triage: { priority: "P2", type: "task", actionable: true } }] },
+  };
+  let n = 0;
+  for (const [name, c] of Object.entries(cases)) {
+    resetAutoStart(); resetSleepers();
+    const host = `slpNo${n++}`;
+    const site = `slpno${n}.atlassian.net`;
+    // A second, free-less host that triaged the ticket keeps the entry queued
+    // (rather than blocked) when this one has not triaged it.
+    await asBeat(`${host}b`, site, { autoStart: false, capacity: FULL });
+    await asBeat(host, site, { autoStart: false, capacity: FULL,
+      pauseSleepers: "cap" in c ? c.cap : { available: true }, sessions: [c.s],
+      ...(c.tickets ? { tickets: c.tickets } : {}) });
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.equal(sleeperCmds(host, "pauseSleeper").length, 0, name);
+    ticketQueue.length = 0; delete agents[host]; delete agents[`${host}b`];
+  }
+  // And with nothing waiting at all, a sleeper keeps its slot.
+  resetAutoStart(); resetSleepers();
+  await asBeat("slpIdle", "slpidle.atlassian.net", { autoStart: false, capacity: FULL,
+    pauseSleepers: { available: true }, sessions: [sleeperSession("x", 60 * 60_000)] });
+  drainTicketQueue();
+  hub.pauseSleepersFor([], Date.now());
+  assert.equal(sleeperCmds("slpIdle", "pauseSleeper").length, 0);
+  delete agents.slpIdle;
+});
+
+test("XERK-1575: a due paused sleeper takes the freed slot ahead of the queue, never auto-stop-exempt", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpWake";
+  const site = "slpwake.atlassian.net";
+  const paused = (id, wakeAt, key) => ({ id, repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+    ticket: { key, siteKey: site }, paused: { wakeAt, wakeReason: `check ${id}`, at: wakeAt - 3600_000 } });
+  const tickets = [
+    { key: "ENG-5", summary: "Fix it", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
+    { key: "ENG-7", summary: "Slept", statusCategory: "done", repoGuess: { repo: "Turma", cloned: true } },
+  ];
+  await asBeat(host, site, { autoStart: false, capacity: FULL, tickets, pauseSleepers: { available: true } });
+  const started = await startTicket(site, "ENG-5");
+  assert.equal(started.body.queued, true, JSON.stringify(started.body));
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "ENG-5").reason, "capacity");
+  // A slot frees while one paused sleeper's wake has come and another's has not.
+  const now = Date.now();
+  await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 }, tickets,
+    pauseSleepers: { available: true },
+    closedSessions: [paused("later", now + 3600_000, "ENG-6"), paused("due", now - 1000, "ENG-8"),
+      paused("doneDue", now - 5000, "ENG-7")] });
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => [c.sessionId, c.wake]), [["due", true]]);
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 0, "the woken sleeper holds the slot");
+  assert.equal(queuedTicket(site, "ENG-5").reason, "capacity");
+  // An automatic wake is not the operator overriding auto-stop (XERK-561).
+  assert.ok(!autoStopResumeExempt.has(host + "\x00due"));
+  // Its ticket went Done while it slept: never woken (auto-stop would have
+  // killed it awake), unpaused instead so it is an ordinary ended session.
+  assert.ok(!autoStopResumeExempt.has(host + "\x00doneDue"));
+  assert.deepEqual(sleeperCmds(host, "unpauseSleeper").map((c) => c.sessionId), ["doneDue"]);
+  // The in-flight resume and unpause are not re-sent by the next pass.
+  hub.wakePausedSleepers(Date.now());
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "resume").length, 1);
+  assert.equal(sleeperCmds(host, "unpauseSleeper").length, 1);
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: a wake and a ticket spawn never share one beat on a host (two inline launches)", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpOneLaunch";
+  const site = "slponelaunch.atlassian.net";
+  const tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, triage: { priority: "P2", type: "task", actionable: true } }];
+  await asBeat(host, site, { autoStart: false, capacity: FULL, tickets, pauseSleepers: { available: true } });
+  const started = await startTicket(site, "ENG-5");
+  assert.equal(started.body.queued, true, JSON.stringify(started.body));
+  // Two slots free at once and one paused sleeper due: the wake goes out and the
+  // ticket waits a beat. The agent relaunches both on its beat, and the pair
+  // would overrun the hub's offline threshold (XERK-395).
+  const now = Date.now();
+  await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 0, free: 2 }, tickets,
+    pauseSleepers: { available: true },
+    closedSessions: [{ id: "due", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: now - 1000, wakeReason: "check due" } }] });
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => c.sessionId), ["due"]);
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 0, "never a second launch beside the wake");
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 0);
+  // Once the wake is acked, the ticket takes the other slot.
+  agents[host].commands = agents[host].commands.filter((c) => c.type !== "resume");
+  agents[host].capacity = { ...FULL, running: 1, free: 1 };
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 1);
+  // And a due wake waits out a launch already queued on the host.
+  agents[host].closedSessions = [{ id: "due2", repo: "Turma", paused: { wakeAt: Date.now() - 1000 } }];
+  agents[host].capacity = { ...FULL, running: 0, free: 2 };
+  hub.wakePausedSleepers(Date.now());
+  assert.equal(sleeperCmds(host, "resume").length, 0);
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: a paused sleeper whose conversation already runs again is unpaused, never woken", () => {
+  resetSleepers();
+  const now = Date.now();
+  const rec = (id, extra) => ({ id, repo: "Turma", paused: { wakeAt: now - 1 }, ...extra });
+  const running = (id, extra) => ({ id, status: "running", repo: "Turma", ...extra });
+  const free = { maxSessions: 4, running: 2, queued: 0, free: 2 };
+  // The operator's Resume picker resumed transcript T1 as a NEW session (S2) in
+  // the same worktree, leaving the paused record P behind.
+  agents.slpHeld = { lastSeen: now, capacity: free, commands: [],
+    sessions: [running("S2", { transcriptId: "T1", worktreePath: "/w/x" })],
+    closedSessions: [rec("P", { transcriptId: "T1", worktreePath: "/w/other" }),
+      rec("Q", { transcriptId: "T9", worktreePath: "/w/x" }),
+      // Root sessions all share REPOS_ROOT: only the transcript ties them.
+      rec("R", { root: true, transcriptId: "T7", worktreePath: "/w/x" })] };
+  hub.wakePausedSleepers(now);
+  assert.deepEqual(sleeperCmds("slpHeld", "unpauseSleeper").map((c) => c.sessionId), ["P", "Q"]);
+  assert.deepEqual(sleeperCmds("slpHeld", "resume").map((c) => c.sessionId), ["R"]);
+  delete agents.slpHeld;
+});
+
+test("XERK-1575: a sleeper being moved is never paused, and its paused record is never woken beside the moved copy", async () => {
+  // The review-round-3 probe: a full host A holds sleeper S (transcript T1)
+  // while the operator moves S to B and a ticket waits. Paused mid-move, S's
+  // record on A was woken at its wake while the moved copy ran T1 on B.
+  resetAutoStart(); resetSleepers();
+  const site = "slpmig.atlassian.net";
+  const A = "slpMigA", B = "slpMigB";
+  const sleeper = { ...sleeperSession("S", 60 * 60_000), transcriptId: "T1" };
+  await asBeat(B, site, { autoStart: false, capacity: FULL });
+  await asBeat(A, site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeper] });
+  const mig = { id: "slp-mig-1", srcHost: A, srcSessionId: "S", targetHost: B, transcriptId: "T1",
+    repo: "Turma", phase: "exporting", importCmdId: null, startedAt: Date.now(), at: Date.now() };
+  migrations.set(mig.id, mig);
+  try {
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.equal(sleeperCmds(A, "pauseSleeper").length, 0, "a sleeper mid-move is never paused");
+    // Nor while its exportSession is still queued, before the record exists.
+    migrations.delete(mig.id);
+    agents[A].commands = [{ cmdId: "ex1", type: "exportSession", sessionId: "S", migrationId: mig.id }];
+    drainTicketQueue();
+    assert.equal(sleeperCmds(A, "pauseSleeper").length, 0, "an export still queued holds it too");
+    // The control: with neither, the same sleeper IS paused.
+    agents[A].commands = [];
+    drainTicketQueue();
+    assert.deepEqual(sleeperCmds(A, "pauseSleeper").map((c) => c.sessionId), ["S"]);
+    agents[A].commands = [];
+    ticketQueue.length = 0;
+
+    // Say it was paused anyway (an older hub): after the handoff A is free, and
+    // B runs the moved copy of T1.
+    const now = Date.now();
+    const paused = { id: "S", repo: "Turma", transcriptId: "T1", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: now - 1000, wakeReason: "check S", at: now - 3600_000 } };
+    await asBeat(A, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 },
+      pauseSleepers: { available: true }, closedSessions: [paused] });
+    await asBeat(B, site, { autoStart: false, capacity: FULL,
+      sessions: [{ id: "S2", status: "running", repo: "Turma", transcriptId: "T1" }] });
+    agents[A].commands = [];
+
+    // While the move is still settling, the wake waits: neither woken nor unpaused.
+    mig.phase = "importing";
+    migrations.set(mig.id, mig);
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds(A, "resume").length, 0, "never woken while its move is in flight");
+    assert.equal(sleeperCmds(A, "unpauseSleeper").length, 0);
+
+    // Settled (done): unpaused, never woken.
+    mig.phase = "done";
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds(A, "resume").length, 0, "never woken beside the moved copy");
+    assert.deepEqual(sleeperCmds(A, "unpauseSleeper").map((c) => c.sessionId), ["S"]);
+
+    // The done record retired: B running T1 in the same org still holds it.
+    migrations.delete(mig.id);
+    resetSleepers(); agents[A].commands = [];
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds(A, "resume").length, 0, "the transcript running on B holds it");
+    assert.deepEqual(sleeperCmds(A, "unpauseSleeper").map((c) => c.sessionId), ["S"]);
+
+    // Another org's host reporting T1 does not hold it (it cannot keep a
+    // sleeper asleep by naming its id); the wake proceeds.
+    resetSleepers(); agents[A].commands = [];
+    agents[B].orgBound = "rival.atlassian.net";
+    agents[B].jira = { ...(agents[B].jira || {}), siteKey: "rival.atlassian.net" };
+    hub.wakePausedSleepers(now);
+    assert.deepEqual(sleeperCmds(A, "resume").map((c) => c.sessionId), ["S"]);
+  } finally {
+    migrations.delete(mig.id);
+    ticketQueue.length = 0; delete agents[A]; delete agents[B];
+  }
+});
+
+test("XERK-1575: an archive restore holds a paused sleeper's wake, and its handoff unpauses it", () => {
+  resetSleepers();
+  const now = Date.now();
+  const free = { maxSessions: 4, running: 2, queued: 0, free: 2 };
+  const rec = (id, tid) => ({ id, repo: "Turma", transcriptId: tid,
+    paused: { wakeAt: now - 1, wakeReason: `check ${id}`, at: now - 60_000 } });
+  // A restore is not org-scoped: the target may be any host, so the handoff
+  // itself unpauses every paused record of the restored transcript.
+  agents.slpRstSrc = { lastSeen: now, capacity: free, commands: [], sessions: [],
+    closedSessions: [rec("P", "T5"), { ...rec("O", "T6"), paused: { wakeAt: now + 3600_000 } }] };
+  agents.slpRstTgt = { lastSeen: now, capacity: free, commands: [], closedSessions: [], sessions: [] };
+  const rst = { id: "slp-rst-1", restore: true, srcHost: null, srcSessionId: null,
+    targetHost: "slpRstTgt", transcriptId: "T5", repo: "Turma", phase: "importing",
+    importCmdId: "rst-ic", startedAt: now, at: now };
+  migrations.set(rst.id, rst);
+  try {
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds("slpRstSrc", "resume").length, 0, "a restore in flight holds the wake");
+    assert.equal(sleeperCmds("slpRstSrc", "unpauseSleeper").length, 0);
+    agents.slpRstTgt.sessions = [{ id: "N", status: "running", repo: "Turma", transcriptId: "T5",
+      spawnCmdId: "rst-ic" }];
+    advanceMigrations();
+    assert.equal(rst.phase, "done");
+    assert.deepEqual(sleeperCmds("slpRstSrc", "unpauseSleeper").map((c) => c.sessionId), ["P"]);
+    // And the next wake pass neither wakes it nor re-sends the unpause.
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds("slpRstSrc", "resume").length, 0);
+    assert.equal(sleeperCmds("slpRstSrc", "unpauseSleeper").length, 1);
+  } finally {
+    migrations.delete(rst.id);
+    delete agents.slpRstSrc; delete agents.slpRstTgt;
+  }
+});
+
+test("XERK-1575: the orchestration pass wakes a due sleeper with an empty queue, never on a full or offline host", () => {
+  resetSleepers();
+  const now = Date.now();
+  const closed = [{ id: "z", repo: "Turma", paused: { wakeAt: now - 1 } }];
+  agents.slpTickFree = { lastSeen: now, capacity: { maxSessions: 2, running: 1, queued: 0, free: 1 },
+    closedSessions: closed, commands: [] };
+  agents.slpTickFull = { lastSeen: now, capacity: FULL, closedSessions: closed, commands: [] };
+  agents.slpTickGone = { lastSeen: now - 10 * 60_000, capacity: { ...FULL, free: 2 },
+    closedSessions: closed, commands: [] };
+  hub.wakePausedSleepers(now);
+  assert.deepEqual(sleeperCmds("slpTickFree", "resume").map((c) => c.sessionId), ["z"]);
+  assert.equal(sleeperCmds("slpTickFull", "resume").length, 0);
+  assert.equal(sleeperCmds("slpTickGone", "resume").length, 0);
+  delete agents.slpTickFree; delete agents.slpTickFull; delete agents.slpTickGone;
+});
+
+test("XERK-1575: the paused block and the capability are coerced at ingest", async () => {
+  const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "slpWire", repos: [], sessions: [], pauseSleepers: { available: "yes" },
+    closedSessions: [
+      { id: "ok", repo: "Turma", paused: { wakeAt: 4_102_444_800_000, wakeReason: "r".repeat(300), at: 5, x: 1 } },
+      { id: "junk", repo: "Turma", paused: { wakeAt: "soon" } },
+      { id: "arr", repo: "Turma", paused: [1] },
+      { id: "plain", repo: "Turma" },
+    ] } });
+  assert.equal(r.status, 200);
+  const a = agents.slpWire;
+  assert.deepEqual(a.pauseSleepers, { available: false });
+  const by = Object.fromEntries(a.closedSessions.map((c) => [c.id, c.paused]));
+  assert.deepEqual(by.ok, { wakeAt: 4_102_444_800_000, wakeReason: "r".repeat(200), at: 5 });
+  assert.equal(by.junk, undefined);
+  assert.equal(by.arr, undefined);
+  assert.equal(by.plain, undefined);
+  assert.equal(hub.wirePaused({ wakeAt: 0 }), null);
+  const n = { pauseSleepers: [] };
+  hub.normalizePauseSleepers(n);
+  assert.equal(n.pauseSleepers, null);
+  delete agents.slpWire;
+});
+
+test("XERK-1575: a sleeper someone is talking to is never paused (its message would be lost)", async () => {
+  for (const type of ["input", "answerQuestion", "setModel"]) {
+    resetAutoStart(); resetSleepers();
+    const host = `slpTalk${type}`;
+    const site = `slptalk${type.toLowerCase()}.atlassian.net`;
+    await asBeat(host, site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+      sessions: [sleeperSession("x", 60 * 60_000)] });
+    agents[host].commands = [{ cmdId: `c-${type}`, type, sessionId: "x", text: "hi" }];
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.equal(sleeperCmds(host, "pauseSleeper").length, 0, type);
+    // Delivered (acked off the queue): the sleeper is pausable again.
+    agents[host].commands = [];
+    drainTicketQueue();
+    assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["x"], type);
+    ticketQueue.length = 0; delete agents[host];
+  }
+});
+
+test("XERK-1575: a sleeper the operator is killing or deleting is never paused", async () => {
+  for (const type of ["kill", "delete"]) {
+    resetAutoStart(); resetSleepers();
+    const host = `slpStop${type}`;
+    const site = `slpstop${type}.atlassian.net`;
+    await asBeat(host, site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+      sessions: [sleeperSession("x", 60 * 60_000)] });
+    // Queued through the real routes, so the route and the guard agree.
+    const r = type === "kill"
+      ? await request("POST", `/api/agents/${host}/sessions/x/kill`, { headers: userHeaders })
+      : await request("DELETE", `/api/agents/${host}/sessions/x`, { headers: userHeaders });
+    assert.equal(r.status, 200, type);
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.equal(sleeperCmds(host, "pauseSleeper").length, 0, type);
+    // The kill landed and the session is gone: nothing left to pause.
+    ticketQueue.length = 0; delete agents[host];
+  }
+});
+
+test("XERK-1575: Kill on a paused card reaches its record, and nothing wakes it meanwhile", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpKillPaused";
+  const site = "slpkillpaused.atlassian.net";
+  const now = Date.now();
+  const paused = { id: "p", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+    paused: { wakeAt: now - 1000, wakeReason: "check p", at: now - 3600_000 } };
+  await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 },
+    pauseSleepers: { available: true }, closedSessions: [paused] });
+  // The due sleeper is woken; the operator kills it before the agent takes it.
+  hub.wakePausedSleepers(Date.now());
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => c.sessionId), ["p"]);
+  const r = await request("POST", `/api/agents/${host}/sessions/p/kill`, { headers: userHeaders });
+  assert.equal(r.status, 200, "the route queues a kill for a session that is only a closed record");
+  assert.deepEqual(sleeperCmds(host, "kill").map((c) => c.sessionId), ["p"]);
+  assert.equal(sleeperCmds(host, "resume").length, 0, "the undelivered wake is withdrawn");
+  // While the kill is queued nothing wakes or unpauses the record.
+  resetSleepers();
+  hub.wakePausedSleepers(Date.now());
+  assert.equal(sleeperCmds(host, "resume").length, 0);
+  assert.equal(sleeperCmds(host, "unpauseSleeper").length, 0);
+  // A wake already handed to the agent is left alone (it may be running).
+  agents[host].commands = [{ cmdId: "w1", type: "resume", sessionId: "p", wake: true, deliveredAt: now }];
+  await request("DELETE", `/api/agents/${host}/sessions/p`, { headers: userHeaders });
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => c.cmdId), ["w1"]);
+  assert.deepEqual(sleeperCmds(host, "delete").map((c) => c.sessionId), ["p"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: a pause stranded on an offline host neither starves the need nor outlives it", async () => {
+  resetAutoStart(); resetSleepers();
+  const site = "slpstrand.atlassian.net";
+  await asBeat("slpGone", site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true } });
+  agents.slpGone.lastSeen = Date.now() - 10 * 60_000;
+  agents.slpGone.commands = [{ cmdId: "stale-pause", type: "pauseSleeper", sessionId: "old" },
+    { cmdId: "handed-pause", type: "pauseSleeper", sessionId: "old2", deliveredAt: Date.now() }];
+  await asBeat("slpLive", site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeperSession("x", 60 * 60_000)] });
+  await startTicket(site, "ENG-5");
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds("slpLive", "pauseSleeper").map((c) => c.sessionId), ["x"],
+    "the offline host's pauses do not count against the waiting ticket");
+  hub.reclaimStrandedTicketSpawns();
+  assert.deepEqual(sleeperCmds("slpGone", "pauseSleeper").map((c) => c.cmdId), ["handed-pause"],
+    "the never-delivered pause is withdrawn; a handed-over one is left");
+  ticketQueue.length = 0; delete agents.slpGone; delete agents.slpLive;
+});
+
+test("XERK-1575: an operator who resumes a paused sleeper early is not undone by the next drain", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpEarly";
+  const site = "slpearly.atlassian.net";
+  const wakeAt = Date.now() + 2 * 3600_000;
+  await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 },
+    pauseSleepers: { available: true },
+    closedSessions: [{ id: "x", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt, wakeReason: "check x", at: Date.now() - 60_000 } }] });
+  const r = await request("POST", `/api/agents/${host}/sessions/x/resume`, { headers: userHeaders });
+  assert.equal(r.status, 200);
+  // Back up and asleep on its carried wake, the host full, a ticket waiting.
+  await asBeat(host, site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [{ ...sleeperSession("x", 0), session: { ...sleeperSession("x", 0).session, wakeAt } }] });
+  agents[host].commands = [];
+  await startTicket(site, "ENG-5");
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
+  // A sleeper the operator did not touch is still fair game.
+  hub.sleeperResumeHold.clear();
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["x"]);
+  autoStopResumeExempt.delete(host + "\x00x");
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: the brief reads a paused sleeper as asleep, never as finished work", async () => {
+  const S = "slpbrief.atlassian.net";
+  const now = Date.now();
+  const iso = (ms) => new Date(ms).toISOString();
+  const wakeAt = now + 3600_000;
+  await asBeat("slpBrief", S, { autoStart: false, tickets: [],
+    closedSessions: [
+      { id: "napping", repo: "Turma", summary: "napping", closedAt: iso(now - 60_000),
+        paused: { wakeAt, wakeReason: "check CI", at: now - 60_000 } },
+      { id: "done", repo: "Turma", summary: "really ended", closedAt: iso(now - 60_000) },
+    ] });
+  const b = hub.compileBrief(S, now, "scheduled", []);
+  assert.deepEqual(b.finished.map((i) => i.title), ["really ended"]);
+  assert.deepEqual(b.waiting.map((i) => [i.title, i.state, i.eta, i.why]),
+    [["napping", "sleeping", wakeAt, "check CI"]]);
+  assert.equal(b.counts.finished, 1);
+  assert.equal(b.counts.waiting, 1);
+  // Resumed (live again): the live session's own stamp speaks for it, no double row.
+  agents.slpBrief.sessions = [{ id: "napping", status: "running", repo: "Turma" }];
+  assert.equal(hub.compileBrief(S, now, "scheduled", []).counts.waiting, 0);
+  delete agents.slpBrief;
 });

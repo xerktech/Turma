@@ -47,7 +47,10 @@ Contract (Claude Code ``PreToolUse`` hook):
   deny   — print ``{"hookSpecificOutput": {"hookEventName": "PreToolUse",
            "permissionDecision": "deny", "permissionDecisionReason": ...}}``
            and exit 0. The reason is fed back to the model.
-  allow  — exit 0 with no output.
+  allow  — exit 0 with no output. The one exception is a consumed permission
+           judge grant (XERK-1566, ``consume_grant``): an explicit
+           ``permissionDecision: allow``, emitted only for a command every
+           check above already allowed.
 
 Stdlib only: this file is invoked by absolute path with the session's worktree
 as cwd, so it cannot rely on any package being importable.
@@ -57,6 +60,7 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import hashlib
 import json
 import os
 import posixpath
@@ -64,6 +68,7 @@ import re
 import shlex
 import stat
 import sys
+import time
 
 # --- command segmentation ------------------------------------------------
 
@@ -495,6 +500,75 @@ _ARITH_BODY_RE = re.compile(r"\([^\s$`]*\)\Z")
 # The program name `_expand_segments` reports once the depth budget is spent.
 _TOO_DEEP = "\x00turma-too-deep"
 
+# How many characters inlining variables may ADD across one decision (an exec
+# wrapper's suffix pass charges the words it emits here too).
+# Each `$x` use inlines x's whole value and the result is split and classified
+# again, so a large value used many times cost minutes — past Claude Code's
+# hook timeout, which RUNS the command unchecked (XERK-1556). Exhausting it
+# DENIES (`_TOO_LARGE`), never stops early: the unread tail is where an `rm`
+# would hide. Spent incrementally, so the oversized text is never built.
+# One expansion still re-substitutes the same text 2-6x (cwd tracking, groups,
+# `$(…)`), so this allows roughly 170-500 KiB of inlined text; real commands
+# spend at most ~10 KiB.
+_MAX_SUBST_GROWTH = 1024 * 1024
+
+# The program name `_expand_segments` reports once the growth budget is spent.
+_TOO_LARGE = "\x00turma-too-large"
+_TOO_LARGE_REASON = ("refusing a command too large to classify (its variables or wrapped "
+                     "arguments expand too far) — split it, or put the data in a file")
+
+
+class _ExpansionTooLarge(Exception):
+    pass
+
+
+# The decision under way: characters still to spend, and the expansions already
+# made. ONE per decision, opened by whichever budgeted entry point is reached
+# first: a fresh budget per `_expand_segments` call let a line re-expanded once
+# per heredoc spend it N times over. Every check re-expands the same command, so
+# a whole expansion is memoised and charged once; a substitution never is —
+# identical bodies at N places are N times the work.
+_budget: dict | None = None
+
+
+def _budgeted(fn):
+    """Run ``fn`` under the decision's budget, opening one if none is open."""
+
+    @functools.wraps(fn)
+    def run(*args, **kwargs):
+        global _budget
+        if _budget is not None:
+            return fn(*args, **kwargs)
+        _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}}
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _budget = None
+
+    return run
+
+
+def _memo(kind: str, key, fn, *args):
+    """``fn(*args)``, made once per decision. A hit replays the escaping
+    splices it counted, which is what makes `_expand_both` take its raw pass."""
+    memo = _budget[kind]
+    key = (key, _SPLICE_RAW[0])
+    if key not in memo:
+        before = _SPLICES_ESCAPED[0]
+        memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
+    else:
+        _SPLICES_ESCAPED[0] += memo[key][1]
+    return memo[key][0]
+
+
+def _spend(added: int) -> None:
+    """Charge ``added`` inlined characters; raise once the budget is spent."""
+    if added <= 0 or _budget is None:
+        return
+    _budget["left"] -= added
+    if _budget["left"] < 0:
+        raise _ExpansionTooLarge
+
 
 # --- pre-normalisation ---------------------------------------------------
 #
@@ -620,8 +694,13 @@ def _expand_braces(command: str) -> str:
     return command
 
 
+@_budgeted
 def _var_values(command: str) -> dict[str, list[str]]:
     """Values this command line itself assigns to a variable."""
+    return _memo("vals", command, _assigned_values, command)
+
+
+def _assigned_values(command: str) -> dict[str, list[str]]:
     vals: dict[str, list[str]] = {}
     for m in _VAR_ASSIGN_RE.finditer(command):
         value = m.group(2)
@@ -647,7 +726,11 @@ def _var_values(command: str) -> dict[str, list[str]]:
 
     def resolve(m: "re.Match[str]") -> str:
         name = m.group(1) or m.group(3) or ""
-        return " ".join(plain[name]) if name in vals else m.group(0)
+        if name not in vals:
+            return m.group(0)
+        value = " ".join(plain[name])
+        _spend(len(value) - len(m.group(0)))
+        return value
 
     return {k: [_VAR_USE_RE.sub(resolve, v) for v in vs] for k, vs in vals.items()}
 
@@ -807,6 +890,72 @@ def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
     return any((m.group(1) or m.group(3)) in vals for m in _VAR_USE_RE.finditer(value))
 
 
+def _brace_end(command: str, i: int) -> int:
+    """Index of the `}` closing the `${` at ``i``, or -1 if it never closes.
+
+    Quotes, `$(…)`, backticks and nested `${…}` inside the braces hide a `}`,
+    as they do from bash: `${a:-'}'}` and `${a:-$(echo })}` are one expansion.
+    """
+    stack = ["{"]
+    j, n = i + 2, len(command)
+    while j < n:
+        ch = command[j]
+        top = stack[-1]
+        if ch == "\\":
+            j += 2
+            continue
+        if top == "`":
+            if ch == "`":
+                stack.pop()
+            j += 1
+            continue
+        if top == '"':
+            if ch == '"':
+                stack.pop()
+            elif command.startswith(("${", "$("), j):
+                stack.append(command[j + 1])
+                j += 1
+            elif ch == "`":
+                stack.append("`")
+            j += 1
+            continue
+        if ch == "'" or command.startswith("$'", j):
+            ansi = ch == "$"
+            j += 2 if ansi else 1
+            while j < n and command[j] != "'":
+                j += 2 if ansi and command[j] == "\\" else 1
+            j += 1
+            continue
+        if command.startswith(("${", "$("), j):
+            stack.append(command[j + 1])
+            j += 2
+            continue
+        if ch in ('"', "`"):
+            stack.append(ch)
+        elif (ch == "}" and top == "{") or (ch == ")" and top == "("):
+            stack.pop()
+            if not stack:
+                return j
+        j += 1
+    return -1
+
+
+def _live_dollar(command: str, i: int) -> bool:
+    """Whether the `$` at ``i`` starts an expansion: not escaped, and not the
+    second half of a `$$`. A run of `$` pairs into PIDs from its first LIVE
+    one, and an odd run of backslashes before the run makes its first `$`
+    literal — so `\\$${x}` expands `${x}` while `$${x}` and `\\${x}` do not."""
+    j = i
+    while j > 0 and command[j - 1] == "$":
+        j -= 1
+    k = j
+    while k > 0 and command[k - 1] == "\\":
+        k -= 1
+    live = i - j + 1 - (j - k) % 2
+    return live % 2 == 1
+
+
+@_budgeted
 def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> str:
     """Inline variables the command line sets itself.
 
@@ -821,6 +970,22 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     states = _quote_states(command) if vals and "$" in command else []
 
     def rep(m: "re.Match[str]") -> str:
+        if not _SPLICE_RAW[0] and not _live_dollar(command, m.start()):
+            # `\${a:-\"}` is literal text to bash, and `$${` is the PID then a
+            # brace. Splicing either's "default" shifted the quoting under the
+            # rest of the line: `echo "\${a:-\"}"; rm -rf /` hid the `rm`
+            # inside a string that had closed (XERK-1585). Which `$` is live is
+            # right for ONE parse only — an unquoted heredoc or `bash -c "…"`
+            # strips a backslash level first — so `_expand_both` also takes the
+            # splice-everything reading.
+            _SPLICES_ESCAPED[0] += 1
+            return m.group(0)
+        if m.group(1) and _brace_end(command, m.start()) != m.end() - 1:
+            # `[^}]*` stopped at a `}` that is quoted or nested — in
+            # `${a:-'}' #}` the expansion runs on to the last `}`. Splicing the
+            # short match left the `#` bare, a comment hiding the rest of the
+            # line (XERK-1585); the raw text is read as one word instead.
+            return m.group(0)
         name = m.group(1) or m.group(3) or ""
         got = vals.get(name)
         op = _VAR_OP_RE.match(m.group(2) or "")
@@ -830,13 +995,20 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             if state == '"' and (m.group(2) or "").startswith(("[@]", "[*]")):
                 # `"${a[@]}"` is one word PER element, even mid-word: close
                 # the quote around them, as bash's expansion does.
-                return '"' + _quote_literal(value, "") + '"'
-            if op:
-                value = _apply_var_op(value, op.group(1), op.group(2))
-            return _quote_literal(value, state)
-        if op and op.group(1) in _VAR_DEFAULT_OPS:
-            return op.group(2)
-        return m.group(0)
+                out = '"' + _quote_literal(value, "") + '"'
+            else:
+                if op:
+                    value = _apply_var_op(value, op.group(1), op.group(2))
+                out = _quote_literal(value, state)
+        elif op and op.group(1) in _VAR_DEFAULT_OPS:
+            # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
+            # the `rm` a comment. The `#` was a word inside the braces; keep it
+            # one (XERK-1585). Quotes and `$(…)` in the default stay live.
+            out = re.sub(r"(?<!\\)#", r"\\#", op.group(2))
+        else:
+            return m.group(0)
+        _spend(len(out) - len(m.group(0)))
+        return out
 
     return _VAR_USE_RE.sub(rep, command)
 
@@ -1075,6 +1247,10 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
     want_in = False
     in_pattern = False
     pat_parens = 0
+    # Open `${…}` expansions, and the `$(` groups inside them: a `#` inside one
+    # is text, so `${y:- #}; rm -rf /` must not hide the `rm` as a comment, and
+    # the `}` in `${a:-$(echo }) #}` closes nothing (XERK-1585).
+    braces: list[str] = []
     i, n = 0, len(command)
 
     def flush() -> None:
@@ -1107,7 +1283,18 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
             buf.append(command[i + 1])
             i += 2
             continue
-        if ch == "#" and _is_comment(command, i):
+        if command.startswith(("$$", "${", "$("), i) and (braces or command[i + 1] in "{$"):
+            # `$$` is the PID, so `$${` opens nothing.
+            if command[i + 1] != "$":
+                braces.append(command[i + 1])
+            buf.append(command[i:i + 2])
+            i += 2
+            continue
+        if braces and ch == "}" and braces[-1] == "{":
+            braces.pop()
+        elif braces and ch == ")" and braces[-1] == "(":
+            braces.pop()
+        elif ch == "#" and not braces and _is_comment(command, i):
             end = command.find("\n", i)
             i = n if end < 0 else end
             continue
@@ -1414,9 +1601,10 @@ def _find_roots(tokens: list[str]) -> list[str]:
 
 
 def _expand_both(command: str) -> list[tuple[list[str], str]]:
-    """`_expand_segments`, and — when a spliced value needed escaping — again
-    with every value spliced raw (see `_quote_literal`). Neither reading is
-    right at every re-parse depth; together they fail closed."""
+    """`_expand_segments`, and — when a spliced value needed escaping, or an
+    expansion was read as escaped — again with every value spliced raw and
+    every expansion live (see `_quote_literal`, `_live_dollar`). Neither
+    reading is right at every re-parse depth; together they fail closed."""
     _SPLICES_ESCAPED[0] = 0
     out = _expand_segments(command)
     if _SPLICES_ESCAPED[0]:
@@ -1428,8 +1616,34 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     return out
 
 
+def _script_readings(script: str) -> list[str]:
+    """``script`` as a word shlex produced, and again with `\\${` unescaped.
+    Inside `"…"` bash drops that backslash and shlex keeps it, so
+    `bash -c "echo \\${a:-'}' #}; rm -rf /"` reached the re-parse with an
+    escaped `$` and its `#` read as a comment (XERK-1585). The token no longer
+    says which quoting it came from; reading both fails closed. Only `${`: an
+    escaped `$(` or backtick is already classified where it sits, and
+    unescaping those too nested real scripts past _MAX_EXPAND_DEPTH."""
+    plain = script.replace("\\${", "${")
+    return [script] if plain == script else [script, plain]
+
+
 def _expand_segments(command: str, depth: int = 0,
                      cwds: tuple[str, ...] = ()) -> list[tuple[list[str], str]]:
+    """`_expand`, reporting a spent growth budget as `_TOO_LARGE`."""
+    if depth:
+        return _expand(command, depth, cwds)
+    return list(_budgeted(_memo)("expand", (command, cwds), _expand_top, command, cwds))
+
+
+def _expand_top(command: str, cwds: tuple[str, ...]) -> list[tuple[list[str], str]]:
+    try:
+        return _expand(command, 0, cwds)
+    except _ExpansionTooLarge:
+        return [([_TOO_LARGE], command)]
+
+
+def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[str], str]]:
     """Every command ``command`` would actually run, as (tokens, segment) pairs.
 
     Splitting on shell operators alone only ever saw the OUTERMOST command, so
@@ -1462,14 +1676,21 @@ def _expand_segments(command: str, depth: int = 0,
     if every_cd != cwds and _REPLAYS_RE.search(command):
         cwds = every_cd
     bodies, suspect = _balanced_groups(raw_commands)
+    # Every heredoc on one line shares that whole line as its owner, so the
+    # pipes-into-a-shell scan below is memoised on the owner string — re-running
+    # it per heredoc was O(heredocs × stages) and hung a 2000-heredoc line.
+    owner_pipes_to_shell: dict[str, bool] = {}
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
         # runs every line of it. Expand those bodies as commands; bodies fed to
         # anything else stay data (see _destructive_database for the psql case).
         owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
-        # So is one an owner PIPES into a shell: `cat <<'EOF' | bash` (XERK-1539).
+        if owner not in owner_pipes_to_shell:
+            # So is one an owner PIPES into a shell: `cat <<'EOF' | bash` (XERK-1539).
+            owner_pipes_to_shell[owner] = any(
+                _reads_stdin_script(st) for st in _split_segments(owner)[1:])
         if (owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."})
-                or any(_reads_stdin_script(st) for st in _split_segments(owner)[1:])):
+                or owner_pipes_to_shell[owner]):
             out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, every_cd))
         elif not quoted:
             # ...but data behind an UNQUOTED delimiter is expanded first, so its
@@ -1562,6 +1783,17 @@ def _expand_segments(command: str, depth: int = 0,
         bare = _unwrap_group(_SUBST_RE.sub(lambda m: _subst_text(m, glued_empty=True), raw))
         if bare != seg and bare:
             out.extend(_expand_segments(bare, depth + 1, cwds))
+        # An `eval`'s words joined as eval re-parses them, read off the RAW
+        # segment (XERK-1585). The substitution pass above swallowed a QUOTED
+        # `'$('` that the join makes live (`eval echo '$(' rm -rf / ')'`), and
+        # collapsing `eval eval …` (below) skipped a parse: the `\\\;` in
+        # `eval eval echo \\\; rm -rf /` is an operator only to the SECOND
+        # eval, which this reaches by recursing once per eval (bounded by
+        # _MAX_EXPAND_DEPTH, which fails closed).
+        words = _strip_prefixes(_tokenize(_unwrap_group(raw)))
+        if len(words) > 1 and _basename(words[0]) == "eval":
+            for script in _script_readings(" ".join(words[1:])):
+                out.extend(_expand_segments(script, depth + 1, every_cd))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
             if _SEGMENT_SPLIT.search(seg):
@@ -1582,7 +1814,8 @@ def _expand_segments(command: str, depth: int = 0,
         if prog in _SHELL_PROGS:
             i = _shell_c_index(rest)
             if i >= 0 and i + 1 < len(rest):
-                out.extend(_expand_segments(rest[i + 1], depth + 1, every_cd))
+                for script in _script_readings(rest[i + 1]):
+                    out.extend(_expand_segments(script, depth + 1, every_cd))
         elif prog == "eval" and rest:
             # `eval eval eval … rm -rf /etc` is valid shell. Collapse the chain
             # ITERATIVELY — recursing once per `eval` burned the depth budget,
@@ -1673,6 +1906,9 @@ def _expand_segments(command: str, depth: int = 0,
             for idx in range(len(rest)):
                 if stop or rest[idx].startswith("-"):
                     continue
+                # n arguments emit n²/2 suffix words, each classified again:
+                # 20k arguments took minutes (XERK-1589), so they share the budget.
+                _spend(len(rest) - idx)
                 tail = _strip_prefixes(rest[idx:])
                 if len(tail) > 1:
                     out.append((tail, seg, True))
@@ -2466,6 +2702,7 @@ def _gitlab_push_automerges(tokens: list[str]) -> bool:
     return False
 
 
+@_budgeted
 def policy_reason(command: str) -> str | None:
     """Return a reason if ``command`` violates the PR workflow policy.
 
@@ -2507,6 +2744,7 @@ def policy_reason(command: str) -> str | None:
     return None
 
 
+@_budgeted
 def attribution_reason(command: str) -> str | None:
     if not _ATTRIB_CONTEXT.search(command):
         return None
@@ -2938,6 +3176,7 @@ def _join_path(cwd: str, path: str) -> str:
         return cwd
 
 
+@_budgeted
 def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     """A reason if ``command`` opens a PR/MR (or rewrites its description)
     whose description is missing a required section.
@@ -3343,8 +3582,13 @@ def _destructive_database(command: str) -> str | None:
     # stage while the stage that executes it carries no SQL of its own, so
     # judging stages separately cleared both halves. Judge the pipeline whole —
     # it is destructive if any stage is something other than a text tool.
-    for pipeline in _split_on_operators(_prenormalise(_split_heredocs(command)[0]),
-                                        include_pipe=False):
+    try:
+        flat = _prenormalise(_split_heredocs(command)[0])
+    except _ExpansionTooLarge:
+        # Not a pass: `_expand_segments` grows the same text by at least as
+        # much, so `is_destructive` refuses it as `_TOO_LARGE` below.
+        flat = ""
+    for pipeline in _split_on_operators(flat, include_pipe=False):
         if not _DB_DESTRUCTION.search(pipeline):
             continue
         for stage in _split_on_operators(pipeline, include_pipe=True):
@@ -3353,15 +3597,19 @@ def _destructive_database(command: str) -> str | None:
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     # A heredoc body is data, but `psql <<EOF ... DROP DATABASE x; ... EOF` is
     # still the statement being executed — judge it by the command it feeds.
+    # Heredocs on one line share it as their owner: judge each owner once.
+    judged: set[str] = set()
     for owner, body, _quoted in _split_heredocs(command)[1]:
-        if not _DB_DESTRUCTION.search(body):
+        if owner in judged or not _DB_DESTRUCTION.search(body):
             continue
+        judged.add(owner)
         for tokens, _seg, *_flags in _expand_segments(owner):
             if _stage_executes_sql(tokens):
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     return None
 
 
+@_budgeted
 def is_destructive(command: str) -> str | None:
     """Return a human reason if ``command`` is catastrophic, else ``None``."""
     # Fork bombs contain the `;`/`|` we segment on, so match the whole string.
@@ -3377,6 +3625,8 @@ def is_destructive(command: str) -> str | None:
     for tokens, segment, *flags in _expand_both(command):
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"
+        if tokens[0] == _TOO_LARGE:
+            return _TOO_LARGE_REASON
         # A candidate recovered by the wrapper SUFFIX pass is a guess at where
         # the command starts, so only the rules that also require a dangerous
         # PATH run on it. `_destructive_disk_power` matches on argv[0] ALONE, and
@@ -3445,6 +3695,7 @@ def command_overridden(command: str, overrides: list[str]) -> bool:
     return False
 
 
+@_budgeted
 def decide(
     tool_name: str,
     tool_input: dict,
@@ -3470,6 +3721,8 @@ def decide(
         return ("allow", None, None)
 
     reason = is_destructive(command)
+    if _budget["left"] < 0:
+        return ("deny", _TOO_LARGE_REASON, "policy")
     if reason and not command_overridden(command, overrides):
         return ("deny", reason, "destructive")
 
@@ -3489,10 +3742,126 @@ def decide(
         if summary:
             return ("deny", summary, "pr-summary")
 
+    # Not grantable: the budget replaces the WHOLE expansion, so the checks
+    # above saw nothing. A granted reason found before any expansion (a heredoc
+    # fed to psql, a fork bomb) let it run out inside them, and `gh pr merge`
+    # through — so it is checked here, last, as well as before the grant.
+    if _budget["left"] < 0:
+        return ("deny", _TOO_LARGE_REASON, "policy")
     return ("allow", None, None)
 
 
+# --- the permission judge's one-shot grants (XERK-1566) --------------------
+#
+# The manager's permission judge (hub-agent.py) may approve a Bash call the
+# auto-mode classifier blocked. It writes a ONE-SHOT grant under
+# `~/.turma/grants/<session id>/<sha256 of the command>`; on the retried call
+# this hook consumes it and emits `allow`, which overrides the classifier. It is
+# consulted ONLY after decide() allowed the command, so every hard deny above
+# still wins, and a grant is never a reason to skip a check.
+#
+# The directory is same-uid and Bash can write it (the documented ~/.turma
+# residual, .claude/rules/agent-hooks.md), so this read is defensive rather than
+# trusting: O_NONBLOCK + O_NOFOLLOW + regular-file only + bounded (a FIFO planted
+# at the path would hang the hook, and Claude Code lets a timed-out hook's
+# command THROUGH); the grant must name this session and this exact command and
+# be unexpired. Consumed by unlink BEFORE it allows: of two racing calls that
+# both read it, only the one whose unlink succeeded is allowed.
+
+GRANT_SID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+GRANT_MAX_BYTES = 4096
+# The judge writes a 120s TTL; a grant claiming a longer life was not written
+# by the judge, and is ignored rather than honoured for longer.
+GRANT_TTL_MAX_SEC = 300
+GRANT_REASON_MAX = 300
+
+
+def grant_key(command: str) -> str:
+    """The file name a grant for this exact command lives under. The judge
+    (hub-agent.py `judge_grant_key`) computes the same — parity-tested."""
+    return hashlib.sha256(command.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+# The argv flag the manager's `build_guard_settings` adds to this hook's command
+# only while the permission judge is on. Without it no grant is ever honoured:
+# the switch rides each session's own settings (written per launch), not an env
+# var the long-lived tmux server would keep from whenever it started.
+GRANTS_FLAG = "--grants"
+
+
+def _grants_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".turma", "grants")
+
+
+def consume_grant(session_id, command, *, grants_dir=None, now=None):
+    """The judge's reason when an unexpired grant for exactly this session and
+    command exists — consuming it — else None. Never raises on anything the
+    filesystem or a planted file can do: it runs inside main()'s fail-CLOSED
+    try, where an exception would refuse an ordinary command."""
+    if not isinstance(session_id, str) or not GRANT_SID_RE.match(session_id) \
+            or session_id in (".", ".."):
+        return None
+    if not isinstance(command, str) or not command:
+        return None
+    sdir = os.path.join(grants_dir or _grants_dir(), session_id)
+    try:
+        if not stat.S_ISDIR(os.lstat(sdir).st_mode):
+            return None                 # a symlinked dir is not the judge's
+    except (OSError, ValueError):
+        return None                     # absent: the common case
+    key = grant_key(command)
+    path = os.path.join(sdir, key)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except (OSError, ValueError):
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        blob = os.read(fd, GRANT_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(blob) > GRANT_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or data.get("key") != key or data.get("sid") != session_id:
+        return None
+    exp = data.get("exp")
+    now = time.time() if now is None else now
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)) \
+            or not now < exp <= now + GRANT_TTL_MAX_SEC:
+        return None
+    try:
+        os.unlink(path)
+    except OSError:
+        return None                     # another call consumed it first
+    reason = data.get("reason")
+    reason = " ".join(reason.split()) if isinstance(reason, str) else ""
+    return reason[:GRANT_REASON_MAX] or "the operator's permission policy covers it"
+
+
 # --- hook entrypoint -----------------------------------------------------
+
+
+def _emit_allow(reason: str) -> None:
+    """The only allow a Turma hook emits (XERK-1566): a consumed judge grant.
+    It overrides the auto-mode classifier for this one call."""
+    payload = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason":
+                f"Approved by the operator's permission policy: {reason}",
+        }
+    }
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.flush()
 
 
 def _emit_deny(reason: str) -> None:
@@ -3508,6 +3877,9 @@ def _emit_deny(reason: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv if argv is None else argv
+    grants_on = GRANTS_FLAG in argv[1:] \
+        and os.environ.get("TURMA_PERMISSION_JUDGE", "1") != "0"
     try:
         raw = sys.stdin.read()
         event = json.loads(raw) if raw.strip() else {}
@@ -3534,6 +3906,15 @@ def main(argv: list[str] | None = None) -> int:
             pr_summary=pr_summary,
             cwd=cwd,
         )
+        granted = None
+        # A judge grant (XERK-1566) is consulted only once decide() ALLOWED the
+        # command — every hard deny wins — and only for Bash, the one tool this
+        # hook's matcher covers. Inside this fail-closed try on purpose. Only
+        # when this session was launched with the judge on (GRANTS_FLAG).
+        if grants_on and decision == "allow" and tool_name == "Bash" \
+                and isinstance(tool_input, dict):
+            granted = consume_grant(os.environ.get("TURMA_SESSION_ID"),
+                                    tool_input.get("command"))
     except Exception as exc:  # noqa: BLE001 - any classifier bug
         # Fail CLOSED here, unlike a malformed event above: a traceback exits 1,
         # which Claude Code treats as non-blocking, so a crash on one segment
@@ -3546,6 +3927,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if decision == "deny" and reason:
         _emit_deny(reason)
+    elif decision == "allow" and granted:
+        _emit_allow(granted)
     return 0
 
 

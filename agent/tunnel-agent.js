@@ -1344,6 +1344,62 @@ function scanAgentEntry(entry, state) {
   }
 }
 
+// How far back a watch looks, once when it arms, for background work still in
+// flight — the SAME window as hub-agent.py's restart back-scan
+// (AGENT_BACKSCAN_BYTES / _LEAD_IN), so the chat bar and the card agree
+// (XERK-1421). The per-poll tail only reads TAIL_READ_BYTES, so without this a
+// shell launched one large attachment ago was missing from the bar.
+const AGENT_BACKSCAN_BYTES = 1 << 22;
+// A lead-in before the window whose lines may only record STOPS: a notification
+// can be written a few KB BEFORE its launch, and a window cut between the two
+// would register a phantom.
+const AGENT_BACKSCAN_LEAD_IN = 1 << 16;
+
+// Mirror of hub-agent.py _backscan_live_agents: fold the transcript's last
+// `windowBytes` into `state` through scanAgentEntry only, keeping just the
+// STOPS from the lead-in before it.
+function backscanLiveAgents(p, state, windowBytes = AGENT_BACKSCAN_BYTES,
+                            leadInBytes = AGENT_BACKSCAN_LEAD_IN) {
+  let fd, buf, lead, start;
+  try {
+    fd = fs.openSync(p, "r");
+    const size = fs.fstatSync(fd).size;
+    start = Math.max(0, size - windowBytes);
+    lead = Math.max(0, start - leadInBytes);
+    buf = Buffer.alloc(size - lead);
+    fs.readSync(fd, buf, 0, buf.length, lead);
+  } catch {
+    return;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  }
+  let leadIn = { live: new Map(), tasks: new Map() }; // scratch: launches discarded, stops kept
+  let inLead = start > lead;
+  let pos = lead;
+  let first = true;
+  while (pos < lead + buf.length) {
+    const nl = buf.indexOf(0x0a, pos - lead);
+    const end = nl < 0 ? buf.length : nl;
+    const lineStart = pos;
+    const line = buf.toString("utf8", lineStart - lead, end);
+    pos = lead + end + 1;
+    if (first && lead) { first = false; continue; } // the cut line's fragment
+    first = false;
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (!entry || typeof entry !== "object") continue;
+    if (lineStart < start) { scanAgentEntry(entry, leadIn); continue; }
+    if (inLead) {
+      const stopped = state.stopped || (state.stopped = new Set());
+      for (const id of leadIn.stopped || []) stopped.add(id);
+      while (stopped.size > LIVE_AGENTS_MAX * 4) stopped.delete(stopped.values().next().value);
+      leadIn = null;
+      inLead = false;
+    }
+    scanAgentEntry(entry, state);
+  }
+}
+
 // The raw strings on one entry that could BE a `<task-notification>`: a
 // queue-operation's content, and any string/text-block message content.
 function entryTextsForScan(entry) {
@@ -2094,6 +2150,11 @@ function startWatch(sessionId, worktreePath, transcriptId) {
   if (w.dshEvents) {
     try { w.dshOffset = fs.statSync(w.dshEvents).size; } catch { /* missing */ }
   }
+  // Seed the live agents from the same window the manager's card reads, not
+  // just the per-poll tail (XERK-1421); the tail's re-fold of the same lines
+  // is idempotent.
+  const seedPath = sessionTranscript(worktreePath, w.transcriptId);
+  if (seedPath) backscanLiveAgents(seedPath, w.agentState);
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
   armTranscriptWatch(sessionId, w);
@@ -2483,7 +2544,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, backscanLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

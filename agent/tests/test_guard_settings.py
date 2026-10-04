@@ -274,9 +274,17 @@ class TestGuardSettings(unittest.TestCase):
         # The peer roster is the org boundary (XERK-348), so a session must not
         # be able to append rows to its own address book.
         "Edit(~/.turma/peers.tsv)",
+        # XERK-1574: the org's decisions log, rendered by the manager and read by
+        # every session as reference material — a session must not rewrite it.
+        "Edit(~/.turma/decisions-*.md)",
         # XERK-1563: the permission ledger's hook rows. A session editing its own
         # could hide the prompts it hit or forge ones it never did.
         "Edit(~/.turma/permissions/**)",
+        # XERK-1566: the permission judge's one-shot grants (one overrides the
+        # auto-mode classifier for a Bash call) and the org policy text it
+        # judges against. File tools only; Bash walks past both.
+        "Edit(~/.turma/grants/**)",
+        "Edit(~/.turma/permission-policy.md)",
         # XERK-1564: the session CLI's rendezvous dir. File tools only; Bash
         # still writes it, so the manager reads it as untrusted.
         "Edit(~/.turma/session-requests/**)",
@@ -331,9 +339,19 @@ class TestGuardSettings(unittest.TestCase):
         self.assertTrue(os.path.exists(path))
 
     def test_explicit_guard_path_is_used(self):
-        s = ha.build_guard_settings(python_exe="py", guard_path="/x/hooks/guard.py")
+        with mock.patch.object(ha, "PERMISSION_JUDGE", False):
+            s = ha.build_guard_settings(python_exe="py", guard_path="/x/hooks/guard.py")
         cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
         self.assertEqual(cmd, '"py" -SsE "/x/hooks/guard.py"')
+
+    def test_the_guard_honours_judge_grants_only_when_launched_with_the_judge_on(self):
+        # XERK-1566: the switch rides the session's own --settings (written per
+        # launch), not an env var the long-lived tmux server would keep stale.
+        with mock.patch.object(ha, "PERMISSION_JUDGE", True):
+            s = ha.build_guard_settings(python_exe="py", guard_path="/x/hooks/guard.py")
+        cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertEqual(cmd, '"py" -SsE "/x/hooks/guard.py" --grants')
+        self.assertTrue(cmd.endswith(" " + ha._guard_module().GRANTS_FLAG))
 
     def test_registers_askuserquestion_bridge_hook(self):
         s = ha.build_guard_settings(python_exe="/usr/bin/python3")
@@ -368,9 +386,23 @@ class TestGuardSettings(unittest.TestCase):
             # The ledger dir rides the command line, so the hook and the
             # manager's tail can never disagree about where rows live.
             self.assertIn(ha.PERMISSIONS_DIR, hook["command"])
-            self.assertEqual(hook["timeout"], ha.PERMLOG_HOOK_TIMEOUT_SEC)
+            # XERK-1566: the judge rides the same hook, which then WAITS for the
+            # manager's verdict — so its timeout must outlast permlog's wait.
+            self.assertTrue(hook["command"].endswith(" --judge"))
+            self.assertEqual(hook["timeout"], ha.PERMLOG_JUDGE_HOOK_TIMEOUT_SEC)
+            self.assertGreater(hook["timeout"], ha._permlog_module().JUDGE_WAIT_SEC)
         self.assertEqual(set(s["hooks"]),
                          {"PreToolUse", "PermissionRequest", "PermissionDenied"})
+
+    def test_the_judge_switch_off_wires_the_ledger_alone(self):
+        # TURMA_PERMISSION_JUDGE=0: no `--judge`, so the hook never waits, and
+        # the ledger's short timeout is back.
+        with mock.patch.object(ha, "PERMISSION_JUDGE", False):
+            s = ha.build_guard_settings(python_exe="/usr/bin/python3")
+        for event in ("PermissionRequest", "PermissionDenied"):
+            hook, = s["hooks"][event][0]["hooks"]
+            self.assertNotIn("--judge", hook["command"])
+            self.assertEqual(hook["timeout"], ha.PERMLOG_HOOK_TIMEOUT_SEC)
 
     def test_a_missing_permlog_hook_is_not_wired(self):
         # A missing command prints a hook error into every pane on every prompt.
@@ -482,6 +514,14 @@ class TestOperatorLocalPermissions(unittest.TestCase):
         # Read only. It is the org boundary, so a session must not append rows
         # to its own address book.
         self.assertIn("Edit(~/.turma/peers.tsv)", s["permissions"]["deny"])
+
+    def test_the_decisions_log_is_readable_but_not_writable(self):
+        # XERK-1574: every session's directive names ~/.turma/decisions-<org>.md
+        # as reference material, so reading it must not cost a prompt — and a
+        # session must not rewrite what the operator decided.
+        s = ha.build_guard_settings()
+        self.assertIn("Read(~/.turma/decisions-*.md)", s["permissions"]["allow"])
+        self.assertIn("Edit(~/.turma/decisions-*.md)", s["permissions"]["deny"])
 
     def test_listagents_is_denied_and_sendmessage_is_not(self):
         # XERK-348. `ListAgents` enumerates the whole ACCOUNT — every org's hosts

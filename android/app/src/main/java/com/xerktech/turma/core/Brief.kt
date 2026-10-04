@@ -3,6 +3,7 @@ package com.xerktech.turma.core
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.BriefItem
 import com.xerktech.turma.model.OrgBrief
+import com.xerktech.turma.model.OrgDecision
 
 /**
  * The per-org brief (XERK-1573) — pure reads behind `ui/BriefScreen.kt`, the
@@ -153,3 +154,87 @@ fun briefItemMeta(section: String, item: BriefItem, now: Long): String {
     if (host != null && section != "nextUp") parts += host
     return parts.joinToString(" · ")
 }
+
+/** How many decisions the Brief screen shows — web brief.html `DECISIONS_SHOWN`. */
+const val BRIEF_DECISIONS_SHOWN = 10
+
+/** How much of a decision's session name its meta line shows — web `DECISION_LABEL_MAX`. */
+const val BRIEF_DECISION_LABEL_MAX = 60
+
+/**
+ * The count the Decisions header shows — web `decisionsHtml`'s `total`: how many
+ * the org keeps (the hub's `decisionCounts`), never fewer than the served tail
+ * (an older hub sends no count).
+ */
+fun briefDecisionTotal(served: Int, count: Int?): Int = maxOf(served, count ?: 0)
+
+/** A decision's kind as the brief words it, a noun — web brief.html `DECISION_KIND`. */
+val BRIEF_DECISION_KIND = mapOf("question" to "question", "permission" to "permission", "note" to "note")
+
+/**
+ * How many lines the brief's summary shows until "Show more" — web brief.html's
+ * `.brief-narrative p.clamped` line clamp. A summary that fits gets no toggle.
+ */
+const val BRIEF_NARRATIVE_LINES = 4
+
+/** The hub's typed-answer markers (server.js `questionAnswerText`) — web brief.html `TYPED_*`. */
+const val BRIEF_TYPED_SUFFIX = ", plus a typed answer"
+const val BRIEF_TYPED_ALONE = "(a typed answer)"
+
+/**
+ * One decisions-log row as the Brief screen lays it out — web brief.html
+ * `decisionsHtml`'s `item`.
+ */
+data class BriefDecisionRow(
+    /** A note's text, or the question asked (then " → " and the answer). */
+    val title: String,
+    /** The chosen option(s), shown bold; null for a note or a typed answer alone. */
+    val answer: String?,
+    /** The typed-answer marker, shown muted after [answer] — never bold as if chosen. */
+    val typed: String?,
+    /** The meta pieces — kind, ticket, session name, age, host — each kept whole. */
+    val meta: List<String>,
+)
+
+/**
+ * An answer split into the chosen option(s) and the typed-answer marker — web
+ * brief.html `answerHtml`: the marker is not a choice, so it is shown muted.
+ */
+fun briefDecisionAnswer(answer: String): Pair<String?, String?> = when {
+    answer == BRIEF_TYPED_ALONE -> null to answer
+    answer.endsWith(BRIEF_TYPED_SUFFIX) && answer.length > BRIEF_TYPED_SUFFIX.length ->
+        answer.dropLast(BRIEF_TYPED_SUFFIX.length) to BRIEF_TYPED_SUFFIX
+    else -> answer to null
+}
+
+/**
+ * The org's decisions log (XERK-1574) as rows, newest first, the newest
+ * [BRIEF_DECISIONS_SHOWN] only — web brief.html `decisionsHtml`: a note's text, or
+ * the question with its answer; then its kind, ticket, session name (clipped to
+ * [BRIEF_DECISION_LABEL_MAX] characters), age and host.
+ */
+fun briefDecisionLines(decisions: List<OrgDecision>, now: Long): List<BriefDecisionRow> =
+    decisions.takeLast(BRIEF_DECISIONS_SHOWN).asReversed().map { d ->
+        val meta = mutableListOf(BRIEF_DECISION_KIND[d.source] ?: d.source)
+        val ticket = d.ticket
+        val host = d.host
+        val label = d.label
+        if (ticket != null) meta += ticket
+        if (!label.isNullOrEmpty()) {
+            meta += if (label.length > BRIEF_DECISION_LABEL_MAX) {
+                val cut = label.take(BRIEF_DECISION_LABEL_MAX - 1)
+                // never half a surrogate pair
+                (if (cut.last().isHighSurrogate()) cut.dropLast(1) else cut) + "…"
+            } else {
+                label
+            }
+        }
+        if (d.at > 0L) meta += "${briefDur(now - d.at)} ago"
+        if (host != null) meta += host
+        if (d.source == "note") {
+            BriefDecisionRow(d.text.orEmpty(), null, null, meta)
+        } else {
+            val (chosen, typed) = briefDecisionAnswer(d.answer.orEmpty())
+            BriefDecisionRow(d.question.orEmpty(), chosen, typed, meta)
+        }
+    }
