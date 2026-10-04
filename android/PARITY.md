@@ -17,6 +17,7 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 | Sessions sidebar full-search  | `ui/SessionsScreen.kt`'s search box + "In history" section          |
 | `board.html` + `board.js`     | `ui/BoardScreen.kt`, `core/Board.kt`, `vm/BoardViewModel.kt`       |
 | `usage.html`                  | `ui/UsageScreen.kt`                                                |
+| `brief.html` (org brief)      | `ui/BriefScreen.kt`, `core/Brief.kt`, `vm/BriefViewModel.kt`       |
 | `nav.js` (header/bottom-nav)  | `ui/MainScaffold.kt`, `ui/TurmaApp.kt`                             |
 | `org.js` (header org filter)  | `ui/OrgControl.kt`, `vm/OrgViewModel.kt`, `data/OrgFilter.kt`      |
 | `login.html`                  | `ui/LoginScreen.kt`                                                |
@@ -28,6 +29,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **Brief rows (XERK-1573).** A ticket row on the web brief links to the board's own detail; the
+  phone row is plain text (the Board screen has no deep-link route to a ticket yet) — unless it
+  carries a folded merged PR, which a tap opens (the web links its "merged PR" bit) — and the phone
+  shows a row's age/ETA relative only. Earlier briefs are a count on the phone, an expandable list of
+  headline counts on the web. Same sections, counts, order and "Brief now" otherwise.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
   auto-polls + SSE); the phone keeps a header Refresh button for a deliberate re-poll. It now shows a
   spinner while the awaited `/api/agents` poll runs (a short visible floor so a fast poll still reads

@@ -15080,6 +15080,9 @@ def _shape_issue(issue, site_key):
         "labels": labels[:5] if isinstance(labels, list) else [],
         "updated": fields.get("updated"),
         "created": fields.get("created"),
+        # When it was resolved (None while open) — the hub's org brief counts the
+        # period's outflow by it (XERK-1573).
+        "resolved": fields.get("resolutiondate"),
         "dueDate": fields.get("duedate"),
         "parentKey": parent.get("key"),
         "epicKey": parent.get("key") if parent_is_epic else None,
@@ -15101,7 +15104,7 @@ def fetch_jira_issues(jql, max_issues):
             "jql": jql,
             "maxResults": min(JIRA_PAGE_SIZE, max_issues - len(tickets)),
             "fields": "summary,status,priority,issuetype,updated,created,"
-                      "duedate,labels,project,parent,issuelinks",
+                      "resolutiondate,duedate,labels,project,parent,issuelinks",
         }
         if token:
             params["nextPageToken"] = token
@@ -15866,6 +15869,7 @@ def _shape_azure_item(wi, site_key, base):
         "labels": labels[:5],
         "updated": f.get("System.ChangedDate"),
         "created": f.get("System.CreatedDate"),
+        "resolved": f.get("Microsoft.VSTS.Common.ClosedDate"),
         "dueDate": f.get("Microsoft.VSTS.Scheduling.DueDate"),
         "parentKey": str(parent) if parent is not None else None,
     }
@@ -15875,7 +15879,7 @@ _AZDO_LIST_FIELDS = [
     "System.Id", "System.Title", "System.State", "System.WorkItemType",
     "System.TeamProject", "System.ChangedDate", "System.CreatedDate",
     "System.Tags", "Microsoft.VSTS.Common.Priority", "System.Parent",
-    "Microsoft.VSTS.Scheduling.DueDate",
+    "Microsoft.VSTS.Scheduling.DueDate", "Microsoft.VSTS.Common.ClosedDate",
 ]
 
 

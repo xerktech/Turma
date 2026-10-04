@@ -28,6 +28,10 @@ wire contract and Web ⇄ Android parity — Android's channels/`Notifications.k
     `checks` is "not fetched yet" not "no CI" (`PR_NO_CI_GRACE_MS`); an inconclusive wait ages out and
     fires anyway (may delay, never lose).
 
+- **The org brief's push (XERK-1573) is an org DIGEST, not a session alert** — one per brief, only
+  when that org's needs-you set changed, under `brief:<site>` (replaced, retracted when it empties).
+  Rule: `turma-brief.md`.
+
 ### Runaway session spend (XERK-310)
 
 - A session's cost is invisible until somebody opens `/usage` and adds it up, so a run that takes

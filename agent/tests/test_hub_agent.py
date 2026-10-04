@@ -28863,6 +28863,10 @@ class TestShapeIssue(unittest.TestCase):
         self.assertEqual(t["labels"], ["infra", "urgent"])
         self.assertEqual(t["dueDate"], "2026-07-20")
         self.assertEqual(t["parentKey"], "PROJ-100")
+        # Open: no resolution date (the brief's outflow reads it, XERK-1573).
+        self.assertIsNone(t["resolved"])
+        done = ha._shape_issue(self._issue(resolutiondate="2026-07-15T09:00:00.000+0000"), "s")
+        self.assertEqual(done["resolved"], "2026-07-15T09:00:00.000+0000")
         # A plain parent (no issuetype expansion) is not an epic; no links.
         self.assertIsNone(t["epicKey"])
         self.assertFalse(t["isEpic"])

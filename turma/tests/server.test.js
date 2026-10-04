@@ -90,6 +90,10 @@ process.env.ORG_COLORS_FILE = path.join(
   os.tmpdir(),
   `turma-test-org-colors-${process.pid}.json`
 );
+process.env.BRIEFS_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-briefs-${process.pid}.json`
+);
 // Durable token-usage history (XERK-338) is a /data file of its own, read at
 // require time like the stores above, so it gets a throwaway one too.
 process.env.USAGE_LEDGER_FILE = path.join(
@@ -22773,6 +22777,536 @@ test("subagent history: a malformed block is coerced at ingest too", async () =>
   assert.strictEqual(bad.truncated, true,
     "a non-bool truncated is decode-fatal on Android for BOTH history routes");
   delete agents[host];
+});
+
+// ---- XERK-1573: the per-org brief ---------------------------------------------
+
+// Stamp a session's hub attention the way heartbeatAlerts keeps it (the brief
+// reads the stamp, never the agent's word).
+function setAttn(host, sid, attn) {
+  const a = agents[host];
+  a.alerts = a.alerts || {};
+  a.alerts.sessions = a.alerts.sessions || {};
+  a.alerts.sessions[sid] = { ...(a.alerts.sessions[sid] || {}), attn };
+}
+
+test("XERK-1573: a brief composes every section from hub data, scoped to the DECIDED org", async () => {
+  resetAutoStart();
+  const A = "brA1573.atlassian.net";
+  const B = "brB1573.atlassian.net";
+  const now = Date.now();
+  const iso = (ms) => new Date(ms).toISOString();
+  const H = 3600 * 1000;
+  const tri = (o) => ({ priority: "P2", type: "task", actionable: true, ...o });
+  const todo = (key, created, extra) => ({ key, summary: `todo ${key}`, statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, triage: tri(extra), created });
+  await asBeat("brHostA", A, {
+    capacity: FULL,
+    tickets: [
+      { key: "A-1", summary: "shipped", statusCategory: "done", created: iso(now - 90 * 24 * H),
+        resolved: iso(now - 2 * H), updated: iso(now - H) },
+      { key: "A-2", summary: "old done", statusCategory: "done", created: iso(now - 90 * 24 * H),
+        resolved: iso(now - 30 * 24 * H) },
+      todo("A-3", iso(now - 60 * 24 * H)),                     // oldest todo
+      todo("A-4", iso(now - H)),                               // new: intake
+      todo("A-5", iso(now - 2 * H), { priority: "P0", type: "bug" }),
+      // Closed as stale (XERK-1569 moves them to a Done-category status): their
+      // board rows read done + resolved in the period, yet they are NOT finished.
+      { key: "A-9", summary: "flaky thing", statusCategory: "done", status: "Cannot Reproduce",
+        created: iso(now - 90 * 24 * H), resolved: iso(now - H) },
+      { key: "A-7", summary: "flaky upload", statusCategory: "done", status: "Won't Do",
+        created: iso(now - 90 * 24 * H), resolved: iso(now - 2 * H) },
+    ],
+    sessions: [
+      { id: "q1", status: "running", summary: "asks a question" },
+      { id: "r1", status: "running", summary: "ready for review",
+        prs: [{ url: "https://github.com/x/y/pull/9", state: "MERGED", title: "Fix it" }] },
+      { id: "w1", status: "running", summary: "waits on CI" },
+      { id: "st1", status: "running", summary: "stalled one" },
+      { id: "z1", status: "running", summary: "closed stale",
+        ticket: { key: "A-9", siteKey: A, summary: "flaky thing",
+          outcome: { kind: "not-reproducible", at: now - H, note: "ran 50x, green" } } },
+      // Closed as DONE by its session: finished work, not a stale close.
+      { id: "z2", status: "running", summary: "closed done",
+        ticket: { key: "A-8", siteKey: A, summary: "real fix",
+          outcome: { kind: "done", at: now - H } } },
+    ],
+    closedSessions: [
+      { id: "c1", summary: "ended run", closedAt: iso(now - 3 * H),
+        prs: [{ url: "https://github.com/x/y/pull/8", state: "MERGED", title: "Earlier" }] },
+      { id: "c0", summary: "ended long ago", closedAt: iso(now - 30 * 24 * H) },
+      // Closed its ticket as stale: counted under closedStale, not Finished too.
+      { id: "c2", summary: "chased flaky upload", closedAt: iso(now - 2 * H),
+        ticket: { key: "A-7", siteKey: A, summary: "flaky upload",
+          outcome: { kind: "already-fixed", at: now - 2 * H } } },
+      // Worked the Done ticket A-1: the ticket row stands for it (and takes its host).
+      { id: "c3", summary: "worked A-1", closedAt: iso(now - 2 * H),
+        ticket: { key: "A-1", siteKey: A, summary: "shipped" } },
+      // Nothing else stands for it: a Finished session row, with when + its transcript.
+      { id: "c4", summary: "plain run", closedAt: iso(now - 3 * H), transcriptId: "t-c4" },
+    ],
+  });
+  setAttn("brHostA", "q1", { state: "needs-you:question", since: now - 10 * 60000, why: "Ship it?" });
+  setAttn("brHostA", "r1", { state: "needs-you:review", since: now - 30 * 60000, why: "PR open · CI passing" });
+  setAttn("brHostA", "w1", { state: "waiting", since: now - 5 * 60000, eta: now + 20 * 60000, why: "Watch CI" });
+  setAttn("brHostA", "st1", { state: "needs-you:stalled", since: now - 50 * 60000, why: "Watch CI" });
+  agents.brHostA.limits = { capturedAt: Math.floor(now / 1000) - 60,
+    fiveHour: { usedPct: 95, resetsAt: Math.floor(now / 1000) + 3600 },
+    sevenDay: { usedPct: 40, resetsAt: Math.floor(now / 1000) - 10 } };   // 7d already reset
+  agents.brHostA.subscription = { key: "sub-a", label: "Team plan" };
+  // Org B's host must not leak into A's brief.
+  await asBeat("brHostB", B, { autoStart: false,
+    sessions: [{ id: "b1", status: "running", summary: "other org" }] });
+  setAttn("brHostB", "b1", { state: "needs-you:question", since: now - 60000, why: "B?" });
+  // A host BOUND to B that now CLAIMS A (drifted): decided into no org, so its
+  // sessions are in neither brief.
+  await asBeat("brDrift", B, { autoStart: false });
+  await asBeat("brDrift", A, { autoStart: false,
+    sessions: [{ id: "d1", status: "running", summary: "drifted" }] });
+  setAttn("brDrift", "d1", { state: "needs-you:question", since: now - 70 * 60000, why: "D?" });
+  // A host BOUND to A whose next beat declares NO tracker org (quiet): silence is
+  // not drift (XERK-348), so its decided org is still A and its sessions are in
+  // A's brief. A host filter on the claimed-and-bound pair would drop it.
+  await asBeat("brQuiet", A, { autoStart: false, tickets: [] });
+  const quietBeat = await request("POST", "/api/heartbeat", { headers: agentHeaders,
+    body: { device: "brQuiet", repos: [{ name: "Turma", path: "/git/Turma" }],
+      sessions: [{ id: "qq1", status: "running", summary: "quiet host asks" }] } });
+  assert.equal(quietBeat.status, 200);
+  assert.equal(agents.brQuiet.jira, undefined, "the quiet beat declares no tracker org");
+  setAttn("brQuiet", "qq1", { state: "needs-you:question", since: now - 2 * 60000, why: "Q?" });
+  setAutoStartOrg(A, true);
+
+  const b = hub.compileBrief(A, now, "scheduled", []);
+  assert.equal(b.siteKey, A);
+  assert.equal(b.since, now - hub.BRIEF_INTERVAL_MS, "no prior brief: the period is one interval");
+  assert.equal(b.autoStart, true);
+  // Needs you: the hub's attention, oldest first; stalled apart; org B and the
+  // drifted host absent; the quiet host's session present.
+  assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["r1", "q1", "qq1"]);
+  assert.equal(b.needsYou[2].host, "brQuiet");
+  assert.equal(b.needsYou[1].why, "Ship it?");
+  assert.equal(b.needsYou[1].state, "needs-you:question");
+  assert.deepEqual(b.stalled.map((i) => i.sessionId), ["st1"]);
+  assert.deepEqual(b.waiting.map((i) => [i.sessionId, i.eta]), [["w1", now + 20 * 60000]]);
+  // Finished: the Done ticket resolved in the period, both merged PRs, and ONE
+  // ended session — each piece of work once. c1 is its PR #8 row, c2 its stale
+  // close, c3 the Done ticket A-1's row (XERK-1573 screenshot pass).
+  assert.deepEqual(b.finished.map((i) => [i.kind, i.kind === "pr" ? i.url : i.key || i.sessionId]).sort(), [
+    ["pr", "https://github.com/x/y/pull/8"], ["pr", "https://github.com/x/y/pull/9"],
+    ["session", "c4"], ["ticket", "A-1"]]);
+  assert.equal(b.counts.finished, 4);
+  // Every finished row says when (a PR carries no merge time) and where.
+  const fin = Object.fromEntries(b.finished.map((i) => [i.key || i.sessionId || i.url, i]));
+  assert.equal(fin["A-1"].since, now - 2 * H, "the ticket's resolved time");
+  assert.equal(fin["A-1"].host, "brHostA", "the host of the session that worked it");
+  assert.equal(fin.c4.since, now - 3 * H, "the session's closedAt");
+  assert.equal(fin.c4.transcriptId, "t-c4", "so the row can open the ended session");
+  // The stale-closed tickets' Done rows are not Finished rows (Closed as stale is
+  // their one row), but they did leave the board, so outflow counts them.
+  assert.equal(b.finished.some((i) => i.key === "A-9" || i.key === "A-7"), false);
+  // Intake/outflow off the rows' created/resolved dates.
+  assert.equal(b.counts.intake, 2);
+  assert.equal(b.counts.outflow, 3, "A-1 plus the two stale closes");
+  // Starts next: the auto-start order (P0 preempts, then oldest), with why.
+  assert.deepEqual(b.nextUp.map((i) => i.key), ["A-5", "A-3", "A-4"]);
+  assert.match(b.nextUp[0].reason, /^P0 preempts the line · created 2h ago · type bug$/);
+  assert.match(b.nextUp[1].reason, /^oldest first · created 60d ago/);
+  // Closed as stale by its session.
+  assert.deepEqual(b.closedStale.map((i) => [i.key, i.reason, i.note]),
+    [["A-9", "not-reproducible", "ran 50x, green"], ["A-7", "already-fixed", undefined]]);
+  // Spend: the subscription, its live 5h window, the rolled-over 7d window
+  // dropped, and the pause it drives.
+  assert.deepEqual(b.spend, [{ label: "Team plan", fiveHourPct: 95,
+    fiveHourResetsAt: (Math.floor(now / 1000) + 3600) * 1000,
+    capturedAt: (Math.floor(now / 1000) - 60) * 1000, paused: true }]);
+  // Org B's brief carries only its own session.
+  const bb = hub.compileBrief(B, now, "scheduled", []);
+  assert.deepEqual(bb.needsYou.map((i) => i.sessionId), ["b1"]);
+  assert.deepEqual(bb.nextUp, [], "auto-start off: nothing from the auto order");
+
+  // A queued ticket leads "starts next", and a merged PR a kept brief listed is
+  // not finished again.
+  ticketQueue.push({ siteKey: A, issueKey: "A-3", source: "manual", at: now - 1000, reason: "capacity" });
+  const b2 = hub.compileBrief(A, now + 1000, "scheduled", [b]);
+  assert.equal(b2.since, now);
+  assert.equal(b2.nextUp[0].key, "A-3");
+  assert.match(b2.nextUp[0].reason, /^queued \(capacity\) · oldest first/);
+  assert.equal(b2.nextUp.filter((i) => i.key === "A-3").length, 1);
+  assert.deepEqual(b2.finished.filter((i) => i.kind === "pr"), []);
+  ticketQueue.length = 0;
+  for (const h of ["brHostA", "brHostB", "brDrift", "brQuiet"]) delete agents[h];
+  resetAutoStart();
+});
+
+test("XERK-1573: the hub words a brief duration by the page's own rule (hours from the hour on)", () => {
+  // The screenshot pass caught "Starts next" saying "created 61m ago" (fmtDur)
+  // beside rows the page words "1h". The hub's briefDur and brief.html's dur are
+  // ONE rule: run the page's own function over the same sweep.
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "brief.html"), "utf8");
+  const a = src.indexOf("function dur(ms) {");
+  assert.ok(a >= 0, "brief.html has dur");
+  const b = src.indexOf("\n}\n", a);
+  const pageDur = vm.runInNewContext(`(${src.slice(a, b + 2)})`);
+  const M = 60000, H = 60 * M;
+  for (const ms of [-5000, 0, 89000, 90000, 3569000, 3570000, H, 61 * M, 89 * M, 90 * M, 2 * H,
+    47 * H, 48 * H, 3 * 24 * H, 60 * 24 * H]) {
+    assert.equal(hub.briefDur(ms), pageDur(ms), `${ms}ms`);
+  }
+  assert.equal(hub.briefDur(61 * M), "1h");
+  assert.equal(hub.briefDur(59 * M), "59m");
+  const now = Date.UTC(2026, 9, 4, 12);
+  const t = { created: new Date(now - 61 * M).toISOString() };
+  assert.equal(hub.briefNextReason(t, null, now), "oldest first · created 1h ago");
+});
+
+test("XERK-1573: spend reads a shared subscription's fleet-wide freshest reading, as its pause does", async () => {
+  resetAutoStart();
+  const A = "spA1573.atlassian.net";
+  const B = "spB1573.atlassian.net";
+  const now = Date.now();
+  const sec = Math.floor(now / 1000);
+  await asBeat("spHostA", A, { autoStart: false });
+  await asBeat("spHostB", B, { autoStart: false });
+  // One subscription spent from both orgs: A's own host holds an older, calm
+  // reading; B's host the fresher, maxed one that pauses the pool.
+  agents.spHostA.subscription = { key: "sub-shared", label: "Shared" };
+  agents.spHostB.subscription = { key: "sub-shared", label: "Shared" };
+  agents.spHostA.limits = { capturedAt: sec - 600, fiveHour: { usedPct: 40, resetsAt: sec + 3600 } };
+  agents.spHostB.limits = { capturedAt: sec - 60, fiveHour: { usedPct: 99, resetsAt: sec + 3600 } };
+  const b = hub.compileBrief(A, now, "scheduled", []);
+  assert.deepEqual(b.spend, [{ label: "Shared", fiveHourPct: 99,
+    fiveHourResetsAt: (sec + 3600) * 1000, capturedAt: (sec - 60) * 1000, paused: true }]);
+  for (const h of ["spHostA", "spHostB"]) delete agents[h];
+  resetAutoStart();
+});
+
+test("XERK-1573: a merged PR and its ticket's Done row are ONE finished row", async () => {
+  const S = "brP1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const pr = "https://github.com/x/y/pull/42";
+  // The hands-off flow: the session on P-1 merged PR #42 and P-1 went Done.
+  await asBeat("brHostP", S, { autoStart: false,
+    tickets: [{ key: "P-1", summary: "the fix", statusCategory: "done",
+      created: iso(now - 9 * 24 * H), resolved: iso(now - H) }],
+    sessions: [{ id: "p1", status: "running", summary: "worked P-1",
+      ticket: { key: "P-1", siteKey: S, summary: "the fix" },
+      prs: [{ url: pr, state: "MERGED", title: "Fix P-1" }] }],
+    closedSessions: [{ id: "p0", summary: "earlier run on P-1", closedAt: iso(now - 2 * H),
+      ticket: { key: "P-1", siteKey: S, summary: "the fix" },
+      prs: [{ url: pr, state: "MERGED", title: "Fix P-1" }] }],
+  });
+  const b = hub.compileBrief(S, now, "scheduled", []);
+  assert.equal(b.counts.finished, 1, "one piece of work, one Finished row");
+  assert.deepEqual(b.finished.map((i) => [i.kind, i.key]), [["ticket", "P-1"]]);
+  assert.equal(b.finished[0].prUrl, pr, "the ticket row carries its PR link");
+  assert.equal(b.finished[0].host, "brHostP");
+  // Still remembered as reported: the next brief does not finish it as a PR row.
+  const b2 = hub.compileBrief(S, now + 1000, "scheduled", [b]);
+  assert.deepEqual(b2.finished, []);
+  // A merged PR whose ticket is NOT Done stays its own row.
+  agents.brHostP.jira.tickets[0].statusCategory = "inprogress";
+  const b3 = hub.compileBrief(S, now, "scheduled", []);
+  assert.deepEqual(b3.finished.map((i) => [i.kind, i.url]), [["pr", pr]]);
+  delete agents.brHostP;
+});
+
+test("XERK-1573: the brief bounds its lists and keeps the newest BRIEFS_KEEP", async () => {
+  const S = "brC1573.atlassian.net";
+  const now = Date.now();
+  const sessions = [];
+  for (let i = 0; i < 15; i++) sessions.push({ id: `n${i}`, status: "running" });
+  await asBeat("brHostC", S, { autoStart: false, sessions });
+  for (let i = 0; i < 15; i++) {
+    setAttn("brHostC", `n${i}`, { state: "needs-you:review", since: now - (100 - i) * 1000, why: "x" });
+  }
+  notifications.length = 0;
+  for (let i = 0; i < 12; i++) hub.briefSweep(S, "scheduled", now + i * 1000);
+  const kept = hub.getBriefs()[S];
+  assert.equal(kept.length, 10);
+  assert.deepEqual(kept.map((x) => x.at), Array.from({ length: 10 }, (_, i) => now + (11 - i) * 1000));
+  assert.equal(kept[0].needsYou.length, 10);
+  assert.equal(kept[0].counts.needsYou, 15);
+  assert.equal(kept[0].needsYou[0].sessionId, "n0", "oldest first, then cut");
+  // The payload serves it top-level.
+  invalidateAgentsCache();
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(r.body.briefs[S].length, 10);
+  // The newest in full; each earlier one as its headline (both clients show only
+  // its counts), though the store keeps its rows.
+  assert.equal(r.body.briefs[S][0].needsYou.length, 10);
+  assert.equal(kept[1].needsYou.length, 10);
+  assert.deepEqual(r.body.briefs[S][1].needsYou, []);
+  assert.equal(r.body.briefs[S][1].counts.needsYou, 15);
+  delete agents.brHostC;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: one push per brief, only when the needs-you set changed", async () => {
+  const S = "brD1573.atlassian.net";
+  const now = Date.now();
+  await asBeat("brHostD", S, { autoStart: false,
+    sessions: [{ id: "p1", status: "running" }, { id: "p2", status: "running" }] });
+  const pushes = () => notifications.filter((n) => n.title != null && n.data && n.data.notifKey === `brief:${S}`);
+  // Whatever attention the beat itself stamped is replaced: no one needs you yet.
+  setAttn("brHostD", "p1", { state: "working", since: now });
+  setAttn("brHostD", "p2", { state: "working", since: now });
+  notifications.length = 0;
+  hub.briefSweep(S, "scheduled", now);
+  assert.equal(pushes().length, 0, "an empty set with no previous brief says nothing");
+  setAttn("brHostD", "p1", { state: "needs-you:question", since: now - 1000, why: "Q?" });
+  hub.briefSweep(S, "scheduled", now + 1000);
+  assert.equal(pushes().length, 1);
+  assert.equal(pushes()[0].title, "brD1573 brief: 1 needs you");
+  assert.equal(pushes()[0].body, "1 waiting on you · 0 waiting · 0 finished");
+  hub.briefSweep(S, "scheduled", now + 2000);
+  assert.equal(pushes().length, 1, "same set: no second push");
+  setAttn("brHostD", "p2", { state: "needs-you:stalled", since: now - 2000, why: "CI" });
+  hub.briefSweep(S, "manual", now + 3000);
+  assert.equal(pushes().length, 2, "a changed set pushes again, under the same key");
+  assert.equal(pushes()[1].title, "brD1573 brief: 2 need you");
+  // The set empties: the standing push is retracted, not replaced.
+  setAttn("brHostD", "p1", { state: "working", since: now });
+  setAttn("brHostD", "p2", { state: "working", since: now });
+  hub.briefSweep(S, "scheduled", now + 4000);
+  assert.equal(pushes().length, 2);
+  assert.deepEqual(dismisses().filter((k) => k === `brief:${S}`), [`brief:${S}`]);
+  delete agents.brHostD;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: briefTick runs one interval after the newest brief, or after boot", async () => {
+  const S = "brE1573.atlassian.net";
+  await asBeat("brHostE", S, { autoStart: false });
+  const before = (hub.getBriefs()[S] || []).length;
+  hub.briefTick(Date.now());
+  assert.equal((hub.getBriefs()[S] || []).length, before, "not due yet after boot");
+  const due = Date.now() + hub.BRIEF_INTERVAL_MS + 1000;
+  hub.briefTick(due);
+  assert.equal(hub.getBriefs()[S].length, 1);
+  hub.briefTick(due + 1000);
+  assert.equal(hub.getBriefs()[S].length, 1, "the newest brief resets the cadence");
+  hub.briefTick(due + hub.BRIEF_INTERVAL_MS);
+  assert.equal(hub.getBriefs()[S].length, 2);
+  // Every other org a test left registered got one too; drop them all.
+  for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
+  delete agents.brHostE;
+});
+
+test("XERK-1573: POST /api/orgs/<site>/brief compiles on demand; a phantom org 404s", async () => {
+  const S = "brF1573.atlassian.net";
+  await asBeat("brHostF", S, { autoStart: false });
+  const noAuth = await request("POST", `/api/orgs/${S}/brief`);
+  assert.equal(noAuth.status, 401);
+  const phantom = await request("POST", "/api/orgs/nobody.atlassian.net/brief", { headers: userHeaders });
+  assert.equal(phantom.status, 404);
+  assert.equal("nobody.atlassian.net" in hub.getBriefs(), false, "a refusal mints no store key");
+  const r = await request("POST", `/api/orgs/${S}/brief`, { headers: userHeaders });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.brief.siteKey, S);
+  assert.equal(r.body.brief.trigger, "manual");
+  assert.equal(hub.getBriefs()[S][0].at, r.body.brief.at);
+  delete agents.brHostF;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: the brief store coerces to the typed wire shape and survives a restart", () => {
+  const good = { siteKey: "o.atlassian.net", at: 2000, since: 1000, trigger: "manual", autoStart: true,
+    counts: { needsYou: 1, finished: "lots" },
+    needsYou: [{ kind: "session", title: "t", sessionId: "s1", since: 1500, eta: "soon", why: 7 },
+      { kind: "session" }, "junk"],
+    spend: [{ label: "p", fiveHourPct: 140, paused: "yes" }, { fiveHourPct: 3 }] };
+  const out = hub.briefsCoerce(JSON.parse(JSON.stringify({
+    "o.atlassian.net": [good, { siteKey: "other.atlassian.net", at: 5 }, { siteKey: "o.atlassian.net", at: -1 }],
+    "x.atlassian.net": "not a list",
+  })));
+  assert.equal(Object.getPrototypeOf(out), null);
+  assert.deepEqual(Object.keys(out), ["o.atlassian.net"]);
+  const b = out["o.atlassian.net"];
+  assert.equal(b.length, 1, "a record for another org, or with no usable `at`, is dropped");
+  assert.deepEqual(b[0].needsYou, [{ kind: "session", title: "t", sessionId: "s1", since: 1500 }]);
+  assert.equal(b[0].counts.finished, 0);
+  assert.equal(b[0].counts.needsYou, 1);
+  assert.deepEqual(b[0].finished, []);
+  assert.deepEqual(b[0].spend, [{ label: "p", fiveHourPct: 100, paused: false }]);
+  assert.equal(hub.sanitizeBrief({ ...good, since: 9999 }).since, 2000, "a period never starts after it ends");
+  // Coercing a coerced store changes nothing (the HA own-write echo dedups).
+  assert.deepEqual(hub.briefsCoerce(JSON.parse(JSON.stringify(out))), out);
+  const file = path.join(os.tmpdir(), `turma-test-briefs-restore-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify({ "o.atlassian.net": [good] }));
+  try {
+    const mod = freshServerModule((env) => { env.BRIEFS_FILE = file; });
+    const restored = mod.getBriefs()["o.atlassian.net"];
+    assert.equal(restored.length, 1);
+    assert.equal(restored[0].at, 2000);
+    assert.equal(restored[0].needsYou[0].title, "t");
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test("XERK-1573: a merged PR is finished in ONE brief, past the 10-row cut and BRIEFS_KEEP", async () => {
+  const S = "brG1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const PR = "https://github.com/x/y/pull/77";
+  // 12 Done tickets resolved in the first period fill `finished` past its 10
+  // stored rows, ahead of the PR row — which used to be the only memory of it.
+  const tickets = [];
+  for (let i = 0; i < 12; i++) {
+    tickets.push({ key: `G-${i}`, summary: `done ${i}`, statusCategory: "done",
+      created: iso(now - 90 * 24 * H), resolved: iso(now - H) });
+  }
+  await asBeat("brHostG", S, { autoStart: false, tickets,
+    sessions: [{ id: "g1", status: "running", prs: [{ url: PR, state: "MERGED", title: "Ship" }] }] });
+  const prRows = (b) => b.finished.filter((i) => i.kind === "pr").length;
+  const b1 = hub.briefSweep(S, "scheduled", now);
+  assert.equal(b1.counts.finished, 13, "12 tickets + the PR");
+  assert.equal(prRows(b1), 0, "the PR row is cut from the stored list");
+  assert.deepEqual(b1.prsReported, [PR], "...but the brief remembers reporting it");
+  const b2 = hub.briefSweep(S, "scheduled", now + 3 * H);
+  assert.equal(prRows(b2), 0);
+  assert.equal(b2.counts.finished, 0, "not finished again");
+  // The session keeps running past BRIEFS_KEEP more briefs (an operator pressing
+  // Brief now): the memory carries forward on the newest brief, so still never.
+  for (let i = 0; i < 12; i++) {
+    const b = hub.briefSweep(S, "manual", now + 4 * H + i * 1000);
+    assert.equal(b.counts.finished, 0, `brief ${i} re-reported the PR`);
+  }
+  const kept = hub.getBriefs()[S];
+  assert.equal(kept.length, 10);
+  assert.deepEqual(kept[0].prsReported, [PR]);
+  assert.ok(kept.slice(1).every((b) => !("prsReported" in b)), "only the newest brief carries it");
+  // Never on the wire: the payload strips the hub-internal keys and serves the
+  // earlier briefs as headlines only.
+  invalidateAgentsCache();
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  const served = r.body.briefs[S];
+  assert.equal(served.length, 10);
+  assert.ok(served.every((b) => !("prsReported" in b) && !("needsYouSig" in b)));
+  assert.deepEqual(served[1].finished, []);
+  assert.deepEqual(served[1].spend, []);
+  assert.equal(typeof served[1].counts.finished, "number");
+  delete agents.brHostG;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: a full PR memory keeps the still-visible PR; an over-long URL is skipped", async () => {
+  const S = "brJ1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const V = "https://github.com/x/y/pull/9";
+  const LONG = "https://github.com/x/y/pull/" + "1".repeat(600);
+  await asBeat("brHostJ", S, { autoStart: false, sessions: [{ id: "j1", status: "running",
+    prs: [{ url: V, state: "MERGED", title: "Visible" }, { url: LONG, state: "MERGED", title: "Long" }] }] });
+  const b1 = hub.briefSweep(S, "scheduled", now);
+  assert.equal(b1.counts.finished, 1, "the visible PR once; the over-long URL is never finished");
+  assert.deepEqual(b1.prsReported, [V]);
+  // The memory is at its 500 cap with the visible PR LAST, and no stored
+  // `finished` row remembers it: the cut must drop the no-longer-visible ones.
+  const old = [];
+  for (let i = 0; i < 500; i++) old.push(`https://github.com/x/old/pull/${i}`);
+  const kept = hub.getBriefs()[S];
+  kept[0].prsReported = [...old, V];
+  kept[0].finished = [];
+  const b2 = hub.briefSweep(S, "scheduled", now + 3 * H);
+  assert.equal(b2.counts.finished, 0);
+  assert.equal(b2.prsReported.length, 500);
+  assert.ok(b2.prsReported.includes(V), "the still-visible PR survives the cut");
+  const b3 = hub.briefSweep(S, "scheduled", now + 6 * H);
+  assert.equal(b3.counts.finished, 0, "the visible PR is not finished again");
+  delete agents.brHostJ;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: a newcomer past the 10-row needs-you cut still pushes", async () => {
+  const S = "brH1573.atlassian.net";
+  const now = Date.now();
+  const sessions = [];
+  for (let i = 0; i < 16; i++) sessions.push({ id: `h${i}`, status: "running" });
+  await asBeat("brHostH", S, { autoStart: false, sessions });
+  for (let i = 0; i < 16; i++) setAttn("brHostH", `h${i}`, { state: "working", since: now });
+  for (let i = 0; i < 15; i++) {
+    setAttn("brHostH", `h${i}`, { state: "needs-you:review", since: now - (100 - i) * 1000, why: "x" });
+  }
+  const pushes = () => notifications.filter((n) => n.title != null && n.data && n.data.notifKey === `brief:${S}`);
+  notifications.length = 0;
+  hub.briefSweep(S, "scheduled", now);
+  assert.equal(pushes().length, 1);
+  // The 16th is the NEWEST, so the oldest-first 10-row list does not show it.
+  setAttn("brHostH", "h15", { state: "needs-you:question", since: now, why: "new?" });
+  const b = hub.briefSweep(S, "scheduled", now + 1000);
+  assert.equal(b.needsYou.some((i) => i.sessionId === "h15"), false, "cut from the stored list");
+  assert.equal(b.counts.needsYou, 16);
+  assert.equal(pushes().length, 2, "the set changed, so it pushes");
+  hub.briefSweep(S, "scheduled", now + 2000);
+  assert.equal(pushes().length, 2, "same full set: no push");
+  delete agents.brHostH;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: starts next skips a held/rejected ticket; an offline host needs no one", async () => {
+  resetAutoStart();
+  const S = "brI1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const todo = (key, ageH) => ({ key, summary: `todo ${key}`, statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, created: iso(now - ageH * H),
+    triage: { priority: "P2", type: "task", actionable: true } });
+  const untriaged = { ...todo("I-5", 50) };
+  delete untriaged.triage;
+  await asBeat("brHostI", S, { capacity: FULL,
+    // I-4 already has a session (a resumable one counts too); I-5 is untriaged;
+    // I-6 is below the org policy's minimum priority. The sweep starts none of
+    // them, so none may be named next — all are OLDER than I-3, so they would lead.
+    tickets: [todo("I-1", 30), todo("I-2", 20), todo("I-3", 10), todo("I-4", 40), untriaged,
+      { ...todo("I-6", 45), triage: { priority: "P3", type: "task", actionable: true } }],
+    sessions: [{ id: "i1", status: "running", summary: "asks" }],
+    closedSessions: [{ id: "i4", summary: "worked I-4", closedAt: iso(now - 90 * 24 * H),
+      ticket: { key: "I-4", siteKey: S, summary: "todo I-4" } }] });
+  setAttn("brHostI", "i1", { state: "needs-you:question", since: now - 60000, why: "Q?" });
+  setTicketTriageAction(S, "I-1", "hold");
+  setTicketTriageAction(S, "I-2", "reject");
+  setTriagePolicy(S, { minPriority: "P2" });
+  try {
+    const b = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(b.nextUp.map((i) => i.key), ["I-3"],
+      "a held, rejected, already-started, untriaged or policy-blocked ticket is not next");
+    assert.ok(!/retrying/.test(b.nextUp[0].reason), b.nextUp[0].reason);
+    // The sweep is holding I-3 in its retry backoff: still next, but the reason says so.
+    autoStarted.set(S + "\x00I-3", { attempts: 1, nextAt: now + 5 * 60 * 1000 });
+    const held = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(held.nextUp.map((i) => i.key), ["I-3"]);
+    assert.match(held.nextUp[0].reason, / · retrying in 5m$/);
+    assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["i1"]);
+    // The host goes silent: its last beat's attention is frozen, not current.
+    agents.brHostI.lastSeen = now - 10 * 60 * 1000;
+    const off = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(off.needsYou, [], "an offline host's session is not in needs-you");
+    assert.equal(off.counts.needsYou, 0);
+  } finally {
+    setTicketTriageAction(S, "I-1", null);
+    setTicketTriageAction(S, "I-2", null);
+    delete triagePolicies[S];
+    delete agents.brHostI;
+    resetAutoStart();
+  }
+});
+
+test("XERK-1573: briefTick drops an org with no host once its briefs are old", async () => {
+  const S = "brJ1573.atlassian.net";
+  const now = Date.now();
+  await asBeat("brHostJ", S, { autoStart: false });
+  hub.briefSweep(S, "scheduled", now);
+  delete agents.brHostJ;
+  hub.briefTick(now + 24 * 3600 * 1000);
+  assert.equal(hub.getBriefs()[S].length, 1, "kept a while: a quiet host may come back");
+  hub.briefTick(now + 31 * 24 * 3600 * 1000);
+  assert.equal(S in hub.getBriefs(), false, "dropped past the retention");
+  for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
 });
 
 // ---- the permission ledger (XERK-1563) -----------------------------------------

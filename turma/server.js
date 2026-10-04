@@ -591,6 +591,10 @@ const EPIC_RUNS_FILE = process.env.EPIC_RUNS_FILE || "/data/epic-runs.json";
 // the hub restarts must survive so its idea is dispatched, not lost. Small (a few
 // per operator burst, bounded EPIC_BUILDERS_MAX).
 const EPIC_BUILDERS_FILE = process.env.EPIC_BUILDERS_FILE || "/data/epic-builders.json";
+// The per-org brief (XERK-1573): siteKey -> its last few briefs. LOW churn (one
+// write per org per BRIEF_INTERVAL_MIN, plus an operator's on-demand one), so it
+// is a registerExternalStore like epicRuns, not a high-churn ledger.
+const BRIEFS_FILE = process.env.BRIEFS_FILE || "/data/briefs.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -3184,6 +3188,117 @@ function publishEpicBuilders() {
   invalidateAgentsCache();
   sseBroadcast("epicBuilders", epicBuilders);
 }
+
+// ---- the per-org brief store (XERK-1573) --------------------------------------
+// siteKey -> that org's last briefs, NEWEST FIRST. Served as top-level `briefs` on
+// /api/agents + its own SSE frame, and Android TYPES it — so every record goes
+// through sanitizeBrief, the ONE whitelist, on compose, restore and a remote
+// watch alike (a live record is then a coerce fixed-point, so HA's own-write echo
+// dedups). Bounds are INLINE LITERALS: this runs at module-init, where a const
+// declared below is in its TDZ (the sibling-store rule). Null-prototype map, like
+// the other org-keyed maps (XERK-1451).
+const BRIEF_SECTIONS = ["finished", "needsYou", "waiting", "stalled", "nextUp", "closedStale"];
+const BRIEF_COUNT_KEYS = [...BRIEF_SECTIONS, "intake", "outflow"];
+function sanitizeBriefItem(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  const str = (x, n) => (typeof x === "string" && x ? x.slice(0, n) : undefined);
+  const ms = (x) => (Number.isSafeInteger(x) && x > 0 ? x : undefined);
+  const kind = str(v.kind, 20);
+  const title = str(v.title, 200);
+  if (!kind || !title) return null;
+  const out = { kind, title };
+  for (const [k, n] of [["key", 64], ["url", 500], ["prUrl", 500], ["host", 200], ["sessionId", 100],
+    ["transcriptId", 100], ["state", 40], ["why", 200], ["reason", 200], ["note", 300]]) {
+    const s = str(v[k], n);
+    if (s !== undefined) out[k] = s;
+  }
+  for (const k of ["since", "eta"]) if (ms(v[k]) !== undefined) out[k] = v[k];
+  return out;
+}
+function sanitizeBriefSpend(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.label !== "string" || !v.label) return null;
+  const out = { label: v.label.slice(0, 200) };
+  for (const k of ["fiveHourPct", "sevenDayPct"]) {
+    if (typeof v[k] === "number" && Number.isFinite(v[k])) out[k] = Math.min(100, Math.max(0, v[k]));
+  }
+  for (const k of ["fiveHourResetsAt", "sevenDayResetsAt", "capturedAt"]) {
+    if (Number.isSafeInteger(v[k]) && v[k] > 0) out[k] = v[k];
+  }
+  out.paused = v.paused === true;
+  return out;
+}
+function sanitizeBrief(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (typeof v.siteKey !== "string" || !v.siteKey) return null;
+  if (!Number.isSafeInteger(v.at) || v.at <= 0) return null;
+  const out = {
+    siteKey: v.siteKey.slice(0, 200),
+    at: v.at,
+    since: Number.isSafeInteger(v.since) && v.since > 0 && v.since <= v.at ? v.since : v.at,
+    trigger: v.trigger === "manual" ? "manual" : "scheduled",
+    autoStart: v.autoStart === true,
+  };
+  const counts = {};
+  const rawCounts = v.counts && typeof v.counts === "object" ? v.counts : {};
+  for (const k of BRIEF_COUNT_KEYS) {
+    const n = rawCounts[k];
+    counts[k] = Number.isSafeInteger(n) && n >= 0 ? n : 0;
+  }
+  out.counts = counts;
+  for (const k of BRIEF_SECTIONS) {
+    out[k] = (Array.isArray(v[k]) ? v[k] : []).map(sanitizeBriefItem).filter(Boolean).slice(0, 10);
+  }
+  out.spend = (Array.isArray(v.spend) ? v.spend : []).map(sanitizeBriefSpend).filter(Boolean).slice(0, 10);
+  // Hub-internal bookkeeping, never on the wire (briefWire strips both): the
+  // digest of the FULL needs-you set (the push compares it — the lists above are
+  // cut at 10), and every merged PR URL a brief already reported, carried forward
+  // on the newest brief alone (the 10-row `finished` list cannot hold them).
+  // Absent stays absent, so a coerced record is still a fixed point.
+  if (typeof v.needsYouSig === "string" && /^(?:[0-9a-f]{40})?$/.test(v.needsYouSig)) {
+    out.needsYouSig = v.needsYouSig;
+  }
+  if (Array.isArray(v.prsReported)) {
+    out.prsReported = [...new Set(v.prsReported.filter((u) => typeof u === "string" && u
+      && u.length <= 500))].slice(0, 500);
+  }
+  return out;
+}
+// What a client is served (/api/agents, the SSE frame, the route): the newest
+// brief in full, each earlier one as its headline only (both clients show just
+// its counts) — so the payload carries one brief's rows per org, not ten. Still
+// the typed shape (empty sections), minus the hub-internal keys.
+function briefWire(b, full) {
+  const out = { ...b };
+  delete out.needsYouSig;
+  delete out.prsReported;
+  if (!full) {
+    for (const k of BRIEF_SECTIONS) out[k] = [];
+    out.spend = [];
+  }
+  return out;
+}
+function briefsWire() {
+  const out = {};
+  for (const [site, list] of Object.entries(briefs)) out[site] = list.map((b, i) => briefWire(b, i === 0));
+  return out;
+}
+const briefsCoerce = (raw) => {
+  const out = Object.create(null);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [site, list] of Object.entries(raw).slice(0, 100)) {
+      if (!site || !Array.isArray(list)) continue;
+      const kept = list.map(sanitizeBrief).filter((b) => b && b.siteKey === site).slice(0, 10);
+      if (kept.length) out[site] = kept;
+    }
+  }
+  return out;
+};
+let briefs = briefsCoerce(readJsonFile(BRIEFS_FILE));
+const persistBriefs = registerExternalStore({
+  name: "briefs", file: BRIEFS_FILE,
+  coerce: briefsCoerce, read: () => briefs, install: (v) => { briefs = v; },
+});
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
 // merely LISTED among the org's triaged `jira.repoOptions` (a gh-clonable repo no
 // host has cloned yet). Used by the route to refuse a builder pinned to a repo no
@@ -4872,6 +4987,11 @@ function buildAgentsCache() {
     // channel for the builder UI (subtask E) plus its own SSE event. A NEW
     // top-level key, so an older client just ignores it.
     epicBuilders,
+    // The per-org brief (XERK-1573): siteKey -> its last briefs, newest first.
+    // Hub-owned, sanitized on every write/restore (sanitizeBrief) because Android
+    // TYPES it; clients scope it by the header org filter like every org surface.
+    // The newest brief per org in full, earlier ones as headlines (briefWire).
+    briefs: briefsWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -6594,6 +6714,21 @@ function subscriptionKeyOf(key, a) {
 // is allowed to spend. AUTO uses the full set (both triggers), as it always has.
 function pausedSubscriptions(nowMs, opts) {
   const fiveHourOnly = !!(opts && opts.fiveHourOnly);
+  const out = new Set();
+  for (const [subKey, v] of freshestLimitsBySub(nowMs)) {
+    const paused = fiveHourOnly
+      ? limitsFiveHourMaxed(v.limits, nowMs)
+      : subscriptionLimitsPaused(v.limits, nowMs);
+    if (paused) out.add(subKey);
+  }
+  return out;
+}
+
+// The freshest non-stale `limits` per subscription, FLEET-WIDE: a subscription is
+// one shared pool whichever org's host reported it. pausedSubscriptions and the
+// brief's spend (XERK-1573) both read this, so a brief's % and its paused chip
+// always come from the same snapshot.
+function freshestLimitsBySub(nowMs) {
   const nowSec = Math.floor(nowMs / 1000);
   const freshest = new Map();  // subKey -> {capturedAt, limits}
   for (const [key, a] of Object.entries(agents)) {
@@ -6606,14 +6741,7 @@ function pausedSubscriptions(nowMs, opts) {
       freshest.set(subKey, { capturedAt: lim.capturedAt || 0, limits: lim });
     }
   }
-  const out = new Set();
-  for (const [subKey, v] of freshest) {
-    const paused = fiveHourOnly
-      ? limitsFiveHourMaxed(v.limits, nowMs)
-      : subscriptionLimitsPaused(v.limits, nowMs);
-    if (paused) out.add(subKey);
-  }
-  return out;
+  return freshest;
 }
 
 // Is this host's UNPINNED/claude auto-start paused (XERK-544/548)? Only a host
@@ -13271,6 +13399,33 @@ function ticketQueueOrder(rows) {
   return out;
 }
 
+// One org's auto-start candidates IN ORDER — the sweep's walk AND the org brief's
+// "what starts next" (XERK-1573), one list so the brief can't name an order the
+// sweep doesn't follow: To Do rows with a repo, not ignore-tier, stably sorted on
+// triageSortKey (board order within an identical key).
+// XERK-635: an epic and its children never ride the org auto-start stream — an
+// epic is not a work ticket, and a child is started by its epic run in dependency
+// order, not here. Dropped silently at the filter (spending no attempt) exactly
+// like a repo-less ticket; the shared content gate rejects the same set, so the
+// two stay in agreement (XERK-550 cross-check). A rollup ticket (XERK-1568) is
+// dropped the same way: a list, not work.
+function autoStartCandidates(siteKey, rows) {
+  return ticketRowsForSite(rows, siteKey)
+    .map((r) => {
+      const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
+      return { t: r.row, repo, key: triageSortKey(r.row, repo) };
+    })
+    .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
+      && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t)
+      && !isRollupTicket(c.t))
+    .sort((a, b) => {
+      for (let i = 0; i < a.key.length; i++) {
+        if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
+      }
+      return 0;
+    });
+}
+
 function autoStartSweep() {
   const orgs = orgsWithAutoStart();
   if (!orgs.size) return;
@@ -13285,27 +13440,7 @@ function autoStartSweep() {
     // OLDEST created first, then type weight -> repo tier (XERK-487's [G]) ->
     // board order (stable sort). Board order is the agent's `updated DESC`
     // query, so without the age term the newest-touched ticket won every tie.
-    const candidates = ticketRowsForSite(rows, siteKey)
-      .map((r) => {
-        const repo = r.row ? ticketRepo(siteKey, r.row.key, rows) : null;
-        return { t: r.row, repo, key: triageSortKey(r.row, repo) };
-      })
-      // XERK-635: an epic and its children never ride the org auto-start stream —
-      // an epic is not a work ticket, and a child is started by its epic run in
-      // dependency order, not here. Dropped silently at the filter (spending no
-      // attempt) exactly like a repo-less ticket; the shared content gate below
-      // rejects the same set, so the two stay in agreement (XERK-550 cross-check).
-      // A rollup ticket (XERK-1568) is dropped the same way: a list, not work.
-      .filter((c) => c.t && c.t.key && c.t.statusCategory === "todo"
-        && c.repo && !isRepoIgnored(c.repo) && !isEpicOrEpicChild(c.t)
-        && !isRollupTicket(c.t))
-      .sort((a, b) => {
-        for (let i = 0; i < a.key.length; i++) {
-          if (a.key[i] !== b.key[i]) return a.key[i] - b.key[i];
-        }
-        return 0;   // stable: board order within an identical key
-      });
-    for (const { t, repo } of candidates) {
+    for (const { t, repo } of autoStartCandidates(siteKey, rows)) {
       const k = siteKey + "\x00" + t.key;
       // A session exists on some channel — the work is under way (or was, and
       // was deliberately killed). Done with this ticket for good; drop any
@@ -14375,6 +14510,385 @@ function epicRunCompleteSweep() {
   }
 }
 
+// ---- the per-org brief (XERK-1573) --------------------------------------------
+// What the operator would otherwise open every session to learn, per org: what
+// finished, what waits on them and why, what waits on time, what is stalled, what
+// starts next and why, what a session closed as stale, and the subscription
+// spend. v1 is STRUCTURED — compiled from hub data only (the board rows, each
+// session's hub-stamped attention, ticket.outcome, limits), no model, no tracker
+// read. ONE leader sweep iterating orgs, one record per org; never a session per
+// org. The store, its sanitizer and the wire shape are above (sanitizeBrief).
+const BRIEF_INTERVAL_MS = positiveEnv("BRIEF_INTERVAL_MIN", 240) * 60 * 1000;
+const BRIEFS_KEEP = 10;      // briefsCoerce inlines the same 10 (module-init TDZ)
+const BRIEF_NEXT_MAX = 5;    // "what starts next" names this many
+const BRIEF_RETAIN_MS = 30 * 24 * 3600 * 1000;   // an org with no host: briefs kept this long
+
+// The orgs a brief is compiled for: every org some host is DECIDED into — the
+// org boundary every other org surface keys on, never a claimed jira.siteKey.
+function briefOrgs() {
+  const out = new Set();
+  for (const a of Object.values(agents)) {
+    const org = decidedOrgOf(a);
+    if (org) out.add(org);
+  }
+  return out;
+}
+
+// A duration as the brief words it — ONE rule with brief.html `dur` and Android
+// `briefDur` (pinned by the XERK-1573 parity test): minutes stop below the hour
+// (3570s rounds to 60m), so a 61-minute-old ticket reads "1h" here exactly as the
+// page's own ages do, never fmtDur's "61m"; hours run to two days, then days.
+function briefDur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  if (s < 3570) return `${Math.round(s / 60)}m`;
+  if (s < 172800) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+
+// Why this ticket is next in the auto-start order — the triageSortKey terms, in
+// the order they decide: a P0 preempts, else the oldest goes first; type and a
+// non-default repo tier only break ties.
+function briefNextReason(t, repo, now) {
+  const tr = t && t.triage && typeof t.triage === "object" ? t.triage : null;
+  const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
+  const parts = [tr && tr.priority === "P0" ? "P0 preempts the line" : "oldest first"];
+  parts.push(Number.isFinite(created)
+    ? `created ${briefDur(Math.max(0, now - created))} ago` : "no created date");
+  if (tr && typeof tr.type === "string" && tr.type) parts.push(`type ${tr.type}`);
+  const tier = repoTier(repo);
+  if (tier !== DEFAULT_REPO_TIER) parts.push(`${tier} repo`);
+  return parts.join(" · ");
+}
+
+// Compile one org's brief from hub data. Pure over the registry/board/queue
+// state (writes nothing); the caller stores it. `prevList` is the org's kept
+// briefs, newest first — the period starts at the newest one.
+function compileBrief(siteKey, now, trigger, prevList) {
+  prevList = prevList || [];
+  const prev = prevList[0] || null;
+  const since = prev ? prev.at : now - BRIEF_INTERVAL_MS;
+  const inPeriod = (ms) => Number.isFinite(ms) && ms > since && ms <= now;
+  const isoIn = (iso) => inPeriod(typeof iso === "string" ? Date.parse(iso) : NaN);
+  const hosts = Object.entries(agents).filter(([, a]) => a && decidedOrgOf(a) === siteKey);
+  const title = (key, s) => s.summary || s.label || s.rcName || `${key} · ${s.id}`;
+  const ticketKey = (s) => (s.ticket && typeof s.ticket.key === "string" ? s.ticket.key : undefined);
+  const rows = fleetTicketRows();
+  const orgRows = ticketRowsForSite(rows, siteKey).map((r) => r.row).filter((t) => t && t.key);
+
+  // Finished since the last brief: Done tickets (resolved — or, from an agent
+  // predating `resolved`, last updated — in the period), merged PRs, ended
+  // sessions — each piece of work ONCE (stale-closed tickets and the ended
+  // sessions are cut below, once closedStale is known). Intake/outflow count the same rows' created/resolved
+  // dates. The rows are what the hosts poll (assignee-scoped, recent Done only).
+  const finished = [];
+  let intake = 0;
+  let outflow = 0;
+  for (const t of orgRows) {
+    if (isoIn(t.created)) intake++;
+    if (t.statusCategory === "done" && isoIn(t.resolved || t.updated)) {
+      outflow++;
+      finished.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
+        since: Date.parse(t.resolved || t.updated) });
+    }
+  }
+  // A PR carries no merge time, so "merged since the last brief" is a MERGED PR
+  // no earlier brief reported. That memory is `prsReported`, carried forward on
+  // the newest brief — never the `finished` rows, which keep only 10 and drop
+  // with their brief (a brief from before `prsReported` still counts its rows).
+  const reported = new Set(prev && Array.isArray(prev.prsReported) ? prev.prsReported : []);
+  for (const b of prevList) {
+    for (const it of b.finished || []) if (it.kind === "pr" && it.url) reported.add(it.url);
+  }
+  const seenPrs = new Set(reported);
+  const newPrs = [];
+  const visiblePrs = new Set();   // every MERGED PR the org's sessions still carry
+  // A URL past sanitizeBrief's 500-char cap could never be remembered (the
+  // memory drops it, the `finished` row cuts it), so it would be finished in
+  // every brief; no real GitHub/GitLab/ADO PR URL is that long — skip it.
+  const mergedOf = (s) => (Array.isArray(s && s.prs) ? s.prs : []).filter((p) =>
+    p && typeof p.url === "string" && p.url && p.url.length <= 500
+    && String(p.state || "").toUpperCase() === "MERGED");
+  const addPrs = (key, s) => {
+    for (const p of mergedOf(s)) {
+      if (seenPrs.has(p.url)) continue;
+      seenPrs.add(p.url);
+      newPrs.push(p.url);
+      finished.push({ kind: "pr", url: p.url, title: p.title || p.url, host: key,
+        sessionId: s.id, key: ticketKey(s) });
+    }
+  };
+  for (const [, a] of hosts) {
+    for (const s of [...(a.sessions || []), ...(a.closedSessions || [])]) {
+      for (const p of mergedOf(s)) visiblePrs.add(p.url);
+    }
+  }
+  const ended = [];   // sessions that ended in the period; cut against the rest below
+  for (const [key, a] of hosts) {
+    for (const s of a.sessions || []) if (s) addPrs(key, s);
+    for (const c of a.closedSessions || []) {
+      if (!c || !isoIn(c.closedAt)) continue;
+      ended.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
+        key: ticketKey(c), since: Date.parse(c.closedAt),
+        transcriptId: typeof c.transcriptId === "string" ? c.transcriptId : undefined,
+        prUrls: mergedOf(c).map((p) => p.url) });   // matching only; sanitizeBrief drops it
+      addPrs(key, c);
+    }
+  }
+
+  // Needs-you / waiting / stalled: the hub's own attention stamp (XERK-1571),
+  // ONLINE hosts only — an offline host's state is frozen at its last beat.
+  // Oldest first; waiting by ETA.
+  const needsYou = [];
+  const waiting = [];
+  const stalled = [];
+  for (const [key, a] of hosts) {
+    if (!agentBlockOnline(a, now)) continue;
+    const alertSessions = a.alerts && a.alerts.sessions;
+    for (const s of a.sessions || []) {
+      if (!s || s.status !== "running") continue;
+      const attn = wireAttention(alertSessions && alertSessions[s.id] && alertSessions[s.id].attn);
+      if (!attn) continue;
+      const item = { kind: "session", title: title(key, s), host: key, sessionId: s.id,
+        state: attn.state, why: attn.why, since: attn.since, eta: attn.eta, key: ticketKey(s) };
+      if (attn.state === "needs-you:stalled") stalled.push(item);
+      else if (attn.state.startsWith("needs-you:")) needsYou.push(item);
+      else if (attn.state === "waiting" || attn.state === "sleeping") waiting.push(item);
+    }
+  }
+  const bySince = (x, y) => (x.since || 0) - (y.since || 0);
+  needsYou.sort(bySince);
+  stalled.sort(bySince);
+  waiting.sort((x, y) => (x.eta || Infinity) - (y.eta || Infinity));
+
+  // What starts next: the org's line in the hub queue (drain order), then — with
+  // auto-start on — the auto-start order (autoStartCandidates, XERK-1567's key)
+  // past the gates the sweep applies, each with the reason it is next.
+  const autoStart = !!autoStartOrgs[siteKey];
+  const nextUp = [];
+  const lined = new Set();
+  for (const e of ticketQueueOrder(rows)) {
+    if (e.siteKey !== siteKey || e.expiredAt) continue;
+    lined.add(e.issueKey);
+    const hit = rows.get(ticketQueueKey(siteKey, e.issueKey));
+    const t = hit ? hit.row : null;
+    nextUp.push({ kind: "ticket", key: e.issueKey, title: (t && t.summary) || e.issueKey,
+      url: t && t.url, since: e.at,
+      reason: `queued (${e.reason || "capacity"}) · ${briefNextReason(t, ticketRepo(siteKey, e.issueKey, rows), now)}` });
+  }
+  if (autoStart) {
+    const started = startedTicketKeys();
+    for (const { t, repo } of autoStartCandidates(siteKey, rows)) {
+      if (lined.has(t.key) || started.has(siteKey + "\x00" + t.key)) continue;
+      const action = ticketTriageAction(siteKey, t.key);
+      if (action === "hold" || action === "reject") continue;
+      if (action !== "approve"
+        && (triageGateReason(t) || triagePolicyReason(siteKey, t.triage, repo))) continue;
+      if (spawnTicketInFlight(siteKey, t.key)) continue;
+      // The sweep holds a ticket in its retry backoff: still in line, but say so.
+      const prior = autoStarted.get(siteKey + "\x00" + t.key);
+      const backoff = prior && now < prior.nextAt
+        ? ` · retrying in ${briefDur(prior.nextAt - now)}` : "";
+      nextUp.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
+        reason: briefNextReason(t, repo, now) + backoff });
+    }
+  }
+
+  // Tickets a session closed as stale (XERK-1569 ticket.outcome) in the period.
+  const closedStale = [];
+  const staleSeen = new Set();
+  const addStale = (key, s) => {
+    const t = s && s.ticket;
+    const o = t && t.outcome;
+    if (!o || (o.kind !== "not-reproducible" && o.kind !== "already-fixed")) return;
+    if (t.siteKey !== siteKey || typeof t.key !== "string" || !inPeriod(o.at)) return;
+    if (staleSeen.has(t.key)) return;
+    staleSeen.add(t.key);
+    closedStale.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
+      reason: o.kind, note: o.note, since: o.at, host: key, sessionId: s.id });
+  };
+  for (const [key, a] of hosts) {
+    for (const s of a.sessions || []) addStale(key, s);
+    for (const c of a.closedSessions || []) addStale(key, c);
+    for (const r of a.repos || []) for (const c of (r && r.resumable) || []) addStale(key, c);
+  }
+
+  // A ticket closed as stale is NOT finished work, though XERK-1569 moves it to a
+  // Done-category status (Won't Do, Cannot Reproduce) and its board row then
+  // reads done + resolved in the period: Closed as stale is its one row. It
+  // still counts in outflow — it did leave the board.
+  const staleKeys = new Set(closedStale.map((it) => it.key));
+  for (let i = finished.length - 1; i >= 0; i--) {
+    if (finished[i].kind === "ticket" && staleKeys.has(finished[i].key)) finished.splice(i, 1);
+  }
+
+  // An ended session is the SAME piece of work as a row already counted when its
+  // merged PR is a Finished row, its ticket's Done row is, or its ticket was
+  // closed as stale — so it is a Finished row only when nothing else stands for
+  // it (else one piece of work counts two or three times). A Done ticket takes
+  // the host of the session that worked it, so the "where" is not lost.
+  const sessionTag = (host, id) => `${host}\x00${id}`;
+  const covered = new Set();
+  for (const it of finished) if (it.kind === "pr") covered.add(sessionTag(it.host, it.sessionId));
+  for (const it of closedStale) covered.add(sessionTag(it.host, it.sessionId));
+  // By URL too: two sessions carrying one merged PR give it ONE row (seenPrs), and
+  // the session that did not get it is that same piece of work.
+  const prRowUrls = new Set(finished.filter((it) => it.kind === "pr").map((it) => it.url));
+  const doneTickets = new Map(finished.filter((it) => it.kind === "ticket").map((it) => [it.key, it]));
+  for (const e of ended) {
+    const done = e.key ? doneTickets.get(e.key) : undefined;
+    if (done && !done.host) done.host = e.host;
+    if (done || (e.key && staleKeys.has(e.key)) || covered.has(sessionTag(e.host, e.sessionId))
+      || e.prUrls.some((u) => prRowUrls.has(u))) continue;
+    finished.push(e);
+  }
+  // A merged PR on a ticket whose Done row is here is that SAME piece of work
+  // (the hands-off flow: the session merges, the ticket goes Done), so it folds
+  // INTO the ticket row as its PR link — never a second Finished row. It stays in
+  // this brief's reported-PR memory (newPrs), so no later brief re-reports it.
+  for (let i = finished.length - 1; i >= 0; i--) {
+    const it = finished[i];
+    const done = it.kind === "pr" && it.key ? doneTickets.get(it.key) : undefined;
+    if (!done) continue;
+    done.prUrl = it.url;   // walking back, the ticket keeps its FIRST PR's link
+    if (!done.host) done.host = it.host;
+    finished.splice(i, 1);
+  }
+
+  // Spend vs the subscription window (XERK-544): one entry per subscription the
+  // org's hosts spend, that subscription's freshest non-stale `limits` FLEET-WIDE
+  // (the same reading pausedSubscriptions judges, so the % and the paused chip
+  // agree), and whether it pauses auto-start. A window whose reset has passed has
+  // rolled over — no figure.
+  const nowSec = Math.floor(now / 1000);
+  const paused = pausedSubscriptions(now);
+  const freshestLim = freshestLimitsBySub(now);
+  const subs = new Map();
+  for (const [key, a] of hosts) {
+    const subKey = subscriptionKeyOf(key, a);
+    let g = subs.get(subKey);
+    if (!g) subs.set(subKey, (g = { hosts: [], label: "", lim: null }));
+    g.hosts.push(key);
+    if (!g.label && a.subscription && a.subscription.label) g.label = a.subscription.label;
+    const f = freshestLim.get(subKey);
+    if (f) g.lim = f.limits;
+  }
+  const spend = [];
+  for (const [subKey, g] of subs) {
+    if (!g.lim) continue;
+    const entry = { label: g.label || g.hosts.join(", "), paused: paused.has(subKey),
+      capturedAt: Math.round((g.lim.capturedAt || 0) * 1000) };
+    for (const [win, name] of [["fiveHour", "fiveHour"], ["sevenDay", "sevenDay"]]) {
+      const w = g.lim[win];
+      if (!w || typeof w.usedPct !== "number") continue;
+      if (typeof w.resetsAt === "number" && w.resetsAt <= nowSec) continue;
+      entry[name + "Pct"] = w.usedPct;
+      if (typeof w.resetsAt === "number") entry[name + "ResetsAt"] = Math.round(w.resetsAt * 1000);
+    }
+    spend.push(entry);
+  }
+
+  // The reported-PR memory, bounded by sanitizeBrief's 500: this brief's new
+  // ones, then the remembered ones a session still carries (the ones that could
+  // be re-reported), then the rest — so a cut drops the PRs no longer visible.
+  const carried = [...reported];
+  const prsReported = [...newPrs, ...carried.filter((u) => visiblePrs.has(u)),
+    ...carried.filter((u) => !visiblePrs.has(u))];
+
+  return sanitizeBrief({
+    siteKey, at: now, since, trigger, autoStart,
+    counts: { finished: finished.length, needsYou: needsYou.length, waiting: waiting.length,
+      stalled: stalled.length, nextUp: nextUp.length, closedStale: closedStale.length,
+      intake, outflow },
+    finished, needsYou, waiting, stalled,
+    nextUp: nextUp.slice(0, BRIEF_NEXT_MAX), closedStale, spend,
+    needsYouSig: briefSigOf([...needsYou, ...stalled]), prsReported,
+  });
+}
+
+// The needs-you SET a brief carries, as a comparable digest: the push fires only
+// when it changes between two consecutive briefs (stalled included — it is a
+// needs-you state). compileBrief digests the FULL set before the 10-row cut, so a
+// newcomer past the cut still changes it; an empty set is "" (the retract case).
+function briefSigOf(items) {
+  const sig = items.map((i) => `${i.host}\x00${i.sessionId}\x00${i.state}`).sort().join("\n");
+  return sig ? crypto.createHash("sha1").update(sig).digest("hex") : "";
+}
+function briefNeedsYouSig(b) {
+  if (!b) return "";
+  if (typeof b.needsYouSig === "string") return b.needsYouSig;
+  // A brief stored before the digest: its (≤10-row) lists, the same digest.
+  return briefSigOf([...(b.needsYou || []), ...(b.stalled || [])]);
+}
+
+// One FCM push per brief, ONLY when the needs-you set changed since the org's
+// previous brief, under one notifKey per org so a new one REPLACES the last; a
+// set that emptied retracts it instead. Carries the headline counts.
+function briefPush(brief, prev) {
+  const sig = briefNeedsYouSig(brief);
+  if (sig === briefNeedsYouSig(prev)) return false;
+  const notifKey = `brief:${brief.siteKey}`;
+  if (!sig) { dismiss(notifKey); return true; }
+  const c = brief.counts;
+  const n = c.needsYou + c.stalled;
+  const org = brief.siteKey.replace(/\.atlassian\.net$/, "");
+  const parts = [`${c.needsYou} waiting on you`];
+  if (c.stalled) parts.push(`${c.stalled} stalled`);
+  parts.push(`${c.waiting} waiting`, `${c.finished} finished`);
+  if (brief.nextUp.length) parts.push(`next: ${brief.nextUp[0].key}`);
+  notify(`${org} brief: ${n} need${n === 1 ? "s" : ""} you`, parts.join(" · "), {
+    tags: "clipboard", notifKey,
+  });
+  return true;
+}
+
+// Compile, store and announce one org's brief (the sweep's per-org unit, and the
+// on-demand route's). Newest first, BRIEFS_KEEP kept.
+function briefSweep(siteKey, trigger = "scheduled", now = Date.now()) {
+  const prevList = briefs[siteKey] || [];
+  const brief = compileBrief(siteKey, now, trigger, prevList);
+  // The reported-PR memory rides the newest brief alone (it carries forward).
+  const older = prevList.map((b) => {
+    if (!b.prsReported) return b;
+    const o = { ...b };
+    delete o.prsReported;
+    return o;
+  });
+  briefs[siteKey] = [brief, ...older].slice(0, BRIEFS_KEEP);
+  persistBriefs();
+  invalidateAgentsCache();
+  sseBroadcast("briefs", briefsWire());
+  briefPush(brief, prevList[0] || null);
+  return brief;
+}
+
+// The cadence gate, on the leader's orchestration tick: an org gets a fresh brief
+// BRIEF_INTERVAL_MS after its newest one — or, with none stored, after this hub
+// booted (the store persists, so a restart keeps the cadence; a fresh hub's first
+// brief is one interval in, or whenever the operator asks for one).
+// An org no host is decided into any more keeps its briefs BRIEF_RETAIN_MS past
+// its newest one (a host that went quiet or is being re-bound gets them back),
+// then they are dropped — nothing else ever removes a store key.
+function briefTick(now = Date.now()) {
+  const orgs = briefOrgs();
+  let pruned = false;
+  for (const [siteKey, list] of Object.entries(briefs)) {
+    if (orgs.has(siteKey) || now - ((list && list[0] && list[0].at) || 0) < BRIEF_RETAIN_MS) continue;
+    delete briefs[siteKey];
+    pruned = true;
+  }
+  if (pruned) {
+    persistBriefs();
+    invalidateAgentsCache();
+    sseBroadcast("briefs", briefsWire());
+  }
+  for (const siteKey of orgs) {
+    const last = (briefs[siteKey] || [])[0];
+    if (now - (last ? last.at : BOOT_AT) < BRIEF_INTERVAL_MS) continue;
+    briefSweep(siteKey, "scheduled", now);
+  }
+}
+
 // Don't act on freshly-loaded (possibly stale) state right after a hub boot, the
 // same reason the offline sweep waits: let agents re-report first. (The opt-in map
 // loads from disk at boot, but the sweeps only act on orgs with a live reporting
@@ -14420,6 +14934,8 @@ function masterOrchestrationTick() {
   // Epic completion (XERK-637): after autoCloseSweep has produced any child Done
   // edges this tick, move an all-children-Done epic to Done and retire its run.
   epicRunCompleteSweep();
+  // The per-org brief (XERK-1573): a fresh one per org every BRIEF_INTERVAL_MIN.
+  briefTick();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
   // same tick, and a session auto-stop just freed is seen by the drain the beat
   // it lands. The heartbeat drains too (that's where capacity actually changes);
@@ -14574,6 +15090,7 @@ const INDEX = htmlPage("index.html");
 const USAGE = htmlPage("usage.html");
 const SESSIONS = htmlPage("sessions.html");
 const BOARD = htmlPage("board.html");
+const BRIEF = htmlPage("brief.html");
 // Not an `htmlPage`: the login form is served `no-store` (a cached login page
 // is its own problem), so it has no conditional-GET path to carry an ETag for.
 const LOGIN = withHashedAssets(readAsset("login.html"));
@@ -16433,6 +16950,10 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === "GET" && (url.pathname === "/usage" || url.pathname === "/usage.html")) {
       return sendPage(req, res, USAGE);
+    }
+
+    if (req.method === "GET" && (url.pathname === "/brief" || url.pathname === "/brief.html")) {
+      return sendPage(req, res, BRIEF);
     }
 
     // The page was /history until it dropped cost and became token-only. Keep
@@ -19507,6 +20028,21 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, enabled: body.enabled });
     }
 
+    // POST /api/orgs/<siteKey>/brief — compile that org's brief NOW (XERK-1573),
+    // the on-demand twin of the leader's BRIEF_INTERVAL_MIN cadence. Operator-
+    // authed and authoritative on the 200 (returns the brief; it also rides
+    // /api/agents + the `briefs` SSE frame). The org must be one a host is DECIDED
+    // into — never a phantom org that would mint a store key. It resets the cadence
+    // and, like a scheduled brief, pushes only if the needs-you set changed.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "brief") {
+      const siteKey = decodeURIComponent(parts[2]);
+      if (!briefOrgs().has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      return json(res, 200, { ok: true, brief: briefWire(briefSweep(siteKey, "manual"), true) });
+    }
+
     // POST /api/jira/<siteKey>/automerge — flip an org's hands-off auto-merge
     // opt-in (XERK-550). Body: {enabled:true|false}. Same posture as /autostart:
     // hub-owned durable state, authoritative on return, the org must be one the
@@ -20259,6 +20795,7 @@ if (process.env.TURMA_TEST) {
       // read the mirrors the coerce/watch/seed path installs into.
       epicRuns: () => epicRuns,
       epicBuilders: () => epicBuilders,
+      briefs: () => briefs,
     },
     // XERK-756: the HA fleet-registry externalization. Exported so tests can
     // inject a FileLiveStore as the shared store (a real Valkey can't run in CI),
@@ -20709,6 +21246,12 @@ if (process.env.TURMA_TEST) {
     // hold each rule directly rather than only through a full sweep.
     triageGateReason,
     triageSortKey,
+    // The per-org brief (XERK-1573). `briefs` is a getter: a restore/watch
+    // install REPLACES the map.
+    getBriefs: () => briefs,
+    briefsCoerce, sanitizeBrief, compileBrief, briefSweep, briefTick, briefNeedsYouSig,
+    briefDur, briefNextReason,
+    autoStartCandidates, BRIEF_INTERVAL_MS,
     ticketQueueOrder,
     TRIAGE_PRIORITY_RANK,
     TRIAGE_TYPE_WEIGHT,

@@ -34,6 +34,7 @@ Mirrors the glasses pure-core/adapter-shell split:
 | `sessions.html` + `chat.js` | `ui/SessionsScreen.kt` + `ui/ChatScreen.kt` + `vm/ChatViewModel.kt` |
 | `board.js` + `board.html` | `ui/BoardScreen.kt` + `core/Board.kt` + `vm/BoardViewModel.kt` |
 | `usage.html` | `ui/UsageScreen.kt` |
+| `brief.html` | `ui/BriefScreen.kt` + `core/Brief.kt` + `vm/BriefViewModel.kt` |
 | `nav.js` | `ui/MainScaffold.kt` + `ui/TurmaApp.kt` |
 | `org.js` | `ui/OrgControl.kt` + `vm/OrgViewModel.kt` + `data/OrgFilter.kt` |
 
