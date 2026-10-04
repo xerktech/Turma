@@ -1371,6 +1371,35 @@ test("XERK-1563: a refused first fetch says it failed; a later one keeps the las
   assert.match(H5.permissionsCardHtml(null, PERM_NOW, false, "<b>"), /\(&lt;b&gt;\)/);
 });
 
+test("XERK-1563: a failed fetch after an org change never shows the old org's view", async () => {
+  let refuse = 0;
+  const reply = () => permView;
+  reply.httpStatus = (u) => (u.startsWith("/api/permissions") ? refuse : 0);
+  const H6 = loadHelpers(reply);
+  const el = H6.els.permissions;
+  orgKeys = ["acme.atlassian.net"];
+  try {
+    await H6.refreshPermissions();
+    assert.match(el.innerHTML, /Bash\(git status:\*\)/);
+    // The operator picks another org and that org's read is refused.
+    orgKeys = ["rival.atlassian.net"];
+    refuse = 503;
+    const pending = H6.refreshPermissions();
+    // While it is in flight the old org's prompts are already gone.
+    assert.match(el.innerHTML, /Loading/);
+    assert.doesNotMatch(el.innerHTML, /git status/);
+    await pending;
+    assert.match(el.innerHTML, /Could not load permission prompts \(HTTP 503\)\./);
+    assert.doesNotMatch(el.innerHTML, /git status/, "acme's view must not read as rival's");
+    assert.equal(H6.getPermView(), null);
+    // A good read for the new org replaces the failure.
+    refuse = 0;
+    await H6.refreshPermissions();
+    assert.match(el.innerHTML, /Bash\(git status:\*\)/);
+    assert.doesNotMatch(el.innerHTML, /Could not load/);
+  } finally { orgKeys = []; }
+});
+
 test("XERK-1563: the minute repaint keeps Recent prompts open and goes through preserveScroll", async () => {
   const H4 = loadHelpers(() => permView);
   await H4.refreshPermissions();

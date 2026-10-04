@@ -1648,6 +1648,10 @@ let permFetchSeq = 0;
 // the card was last fetched for — a render whose keys differ refetches it.
 let permScoped = false;
 let permFetchedKeys = null;
+// The key set `permView` itself was fetched for. A failed read keeps the last
+// view only when it is THAT scope's view — another org's view is never shown
+// under the new selection, not even while the new one loads or after it fails.
+let permViewKeys = null;
 // The last string painted, compared instead of $perms.innerHTML: a browser
 // re-serializes innerHTML (`open` reads back `open=""`), so that never matched.
 let permPainted = null;
@@ -1792,12 +1796,24 @@ function syncPermissionsScope() {
 async function refreshPermissions() {
   const seq = ++permFetchSeq;
   const keys = permKeys();
-  permFetchedKeys = keys.join(",");
+  const scope = keys.join(",");
+  permFetchedKeys = scope;
   const q = new URLSearchParams({ days: String(PERM_DAYS) });
-  if (keys.length) q.set("org", keys.join(","));
-  // A failed read keeps the last view; with none yet, the card says it failed.
+  if (keys.length) q.set("org", scope);
+  // A scope change drops the previous org's view at once: the card says
+  // loading rather than showing org A's prompts under org B's selection.
+  if (permView && permViewKeys !== scope) {
+    permView = null;
+    permViewKeys = null;
+    permLoadError = null;
+    paintPermissions();
+  }
+  // A failed read keeps this scope's last view; with none, the card says it failed.
   const failed = (why) => {
-    if (seq !== permFetchSeq || permView) return;
+    if (seq !== permFetchSeq) return;
+    if (permView && permViewKeys === scope) return;
+    permView = null;
+    permViewKeys = null;
     permLoadError = why;
     paintPermissions();
   };
@@ -1807,6 +1823,7 @@ async function refreshPermissions() {
     const body = await r.json();
     if (seq !== permFetchSeq) return;        // an org change raced this answer
     permView = body;
+    permViewKeys = scope;
     permLoadError = null;
     paintPermissions();
   } catch { failed("no readable answer from the hub"); }
