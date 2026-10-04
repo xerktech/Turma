@@ -1030,12 +1030,16 @@ private fun SessionListCard(
             // `.dot.review`). A waiting card keeps its own stronger amber.
             val dotState = liveState(r.session, r.hostLastSeen, now)
             // A STALLED background wait takes the danger colour it has on every
-            // surface (XERK-1571, web `.dot.stalled`), never the review accent.
-            // The hub's stall counts too (XERK-1572, web `reviewState`): a session
-            // LOOPING on one failing call is busy, so its own dot would read working.
-            val stalled = com.xerktech.turma.core.attentionStalled(r.session.attention) ||
-                (dotState == com.xerktech.turma.core.LiveState.IDLE &&
-                    com.xerktech.turma.core.sessionWait(r.session, r.hostLastSeen, now)?.stalled == true)
+            // surface (XERK-1571, web `.dot.stalled`), never the review accent —
+            // also where the hub says stalled but the host just went quiet, so this
+            // screen can't judge the silence itself (web `reviewState`). A session
+            // LOOPING on one failing call is busy, so its own dot would read working;
+            // the hub's stall counts there too (XERK-1572).
+            val stalled = (dotState == com.xerktech.turma.core.LiveState.IDLE &&
+                com.xerktech.turma.core.sessionWait(r.session, r.hostLastSeen, now)?.stalled == true) ||
+                ((dotState == com.xerktech.turma.core.LiveState.IDLE ||
+                    dotState == com.xerktech.turma.core.LiveState.WORKING) &&
+                    com.xerktech.turma.core.attentionStalled(r.session.attention))
             if (stalled) {
                 StatusLight(com.xerktech.turma.ui.theme.TurmaColors.critical)
             } else if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {

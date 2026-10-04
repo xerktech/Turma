@@ -218,22 +218,18 @@ fun <T> sortedBySince(rows: List<T>, attention: (T) -> Attention?): List<T> =
  * the session is the operator's and how long it has waited. Unlike the web card,
  * the phone card carries no state label or quoted question, so the why is kept for
  * every needs-you state (the question text, the wait, the PR). The time reads
- * "stalled 31m" on a stall, "for 22m" on a question/permission (no second
- * "waiting"), else "waiting 12m". "" when the hub serves none.
+ * "stalled 31m" on a stall, else "for 22m" (the wording every surface uses). The
+ * age is glued to its word, and its "·" to both sides, by no-break spaces, so a
+ * line never ends on a dangling "·". "" when the hub serves none.
  */
 fun attentionWhy(att: Attention?, now: Long): String {
     if (att == null || needsYouChip(att.state) == null) return ""
-    val bits = ArrayList<String>()
-    att.why?.takeIf { it.isNotBlank() }?.let { bits.add(it) }
-    att.since?.let {
-        val word = when (att.state) {
-            "needs-you:stalled" -> "stalled"
-            "needs-you:question", "needs-you:permission" -> "for"
-            else -> "waiting"
-        }
-        bits.add("$word\u00A0${waitLeftText(now - it)}")
-    }
-    return bits.joinToString(" · ")
+    val why = att.why?.takeIf { it.isNotBlank() }.orEmpty()
+    val age = att.since?.let {
+        val word = if (att.state == "needs-you:stalled") "stalled" else "for"
+        "$word\u00A0${waitLeftText(now - it)}"
+    }.orEmpty()
+    return if (why.isNotEmpty() && age.isNotEmpty()) "$why\u00A0·\u00A0$age" else why.ifEmpty { age }
 }
 
 /**

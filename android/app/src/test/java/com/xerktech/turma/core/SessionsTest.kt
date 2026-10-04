@@ -265,11 +265,12 @@ class SessionsTest {
     }
 
     @Test fun `attentionWhy says why and for how long`() {
-        assertEquals("PR open · CI passing · waiting\u00A012m",
+        // "for Nm" on every surface (operator review); the age's "·" never ends a line.
+        assertEquals("PR open · CI passing\u00A0·\u00A0for\u00A012m",
             attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
-        // A question/permission already reads "waiting"; a stall says it stalled.
-        assertEquals("Ship it? · for\u00A03m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
-        assertEquals("Bash: rm -rf build · for\u00A03m",
+        // A stall says it stalled.
+        assertEquals("Ship it?\u00A0·\u00A0for\u00A03m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("Bash: rm -rf build\u00A0·\u00A0for\u00A03m",
             attentionWhy(att("needs-you:permission", now - 3 * 60_000L, "Bash: rm -rf build"), now))
         assertEquals("stalled\u00A03m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
         assertEquals("", attentionWhy(att("working", now), now))
