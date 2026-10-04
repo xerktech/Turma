@@ -3,6 +3,9 @@ package com.xerktech.turma.vm
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
+import com.xerktech.turma.model.AgentInfo
+import com.xerktech.turma.model.TurmaJson
+import kotlinx.serialization.decodeFromString
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
@@ -110,6 +113,24 @@ class UsagePermissionsViewModelTest {
         startWatching(vm)
         // Before a snapshot no org is known: an unscoped fetch would show every
         // org's prompts under a scoped header.
+        assertNull(hub.findRequestOrNull("/api/permissions", timeoutMs = 800))
+        hub.seedFleet(fleet)
+        assertEquals("acme", hub.findRequest("/api/permissions").requestUrl?.queryParameter("org"))
+    }
+
+    @Test
+    fun `an SSE upsert before the first poll is not a fleet snapshot`() {
+        routeByOrg()
+        hub.container.org.set(setOf("acme"))
+        val vm = UsageViewModel(hub.app)
+        startWatching(vm)
+        // One rival host arrives over SSE before any poll: the state reads loaded
+        // with no error, but scoping "acme" against it would drop the org and
+        // fetch EVERY org's prompts under a scoped header.
+        hub.container.fleet.upsert(TurmaJson.decodeFromString<AgentInfo>(
+            """{"key":"h2","device":"h2","online":true,"jira":{"siteKey":"rival","site":"Rival"}}"""))
+        val s = hub.container.fleet.state.value
+        assertTrue(!s.loading && s.error == null && !s.polled && s.agents.size == 1)
         assertNull(hub.findRequestOrNull("/api/permissions", timeoutMs = 800))
         hub.seedFleet(fleet)
         assertEquals("acme", hub.findRequest("/api/permissions").requestUrl?.queryParameter("org"))

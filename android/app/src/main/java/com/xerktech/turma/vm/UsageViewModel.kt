@@ -64,14 +64,12 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     /** The scope [_permissions]' current value (view OR error) belongs to. */
     @Volatile private var permStateScope: String? = null
 
-    /** True once a fleet snapshot has landed, so the org keys mean something. */
-    @Volatile private var fleetReady = false
-
     /**
      * Keep the card fetched for the header's org scope while the screen shows it
      * (the caller's scope — the screen's `LaunchedEffect` — bounds it): fetch on
      * entry, refetch whenever the scope moves, and every [Permissions.REFRESH_MS].
-     * The first fetch waits for a delivered fleet snapshot — before one, no org
+     * The first fetch waits for a FULL fleet snapshot ([FleetState.polled], set
+     * only by the /api/agents poll, never by an SSE upsert) — before one, no org
      * is known, so the keys would read "every org" under a scoped header (the web
      * waits for its first render's `TurmaOrg.update` for the same reason).
      */
@@ -81,8 +79,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         launch {
             combine(container.fleet.state, container.org.stored) { f, o -> f to o }
                 .collect { (f, o) ->
-                    if (!f.loading && f.error == null) fleetReady = true
-                    if (fleetReady) syncPermissions(Permissions.scope(f.agents, o))
+                    if (f.polled) syncPermissions(Permissions.scope(f.agents, o))
                     // No fleet yet and the fleet read failed: say why rather than
                     // "Loading…" with no end. The first good snapshot clears it.
                     else if (f.error != null && permStateScope == null)

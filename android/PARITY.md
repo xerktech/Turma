@@ -707,11 +707,14 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Its own call, never the atomic `/api/agents` decode**: `HubApi.permissions` →
   `model/Permissions.kt` (`PermissionSummary`), every field defaulted and `kind` a plain string, so an
   older or newer hub still decodes and a wrong-typed field costs this section only.
-- **Scoped like the web**: `UsageViewModel.watchPermissions` waits for a fleet snapshot, fetches
+- **Scoped like the web**: `UsageViewModel.watchPermissions` waits for a FULL fleet snapshot
+  (`FleetState.polled`, set by the `/api/agents` poll only, never by an SSE upsert), fetches
   `?days=7&org=<the header's effective keys>`, refetches when the scope moves and every 60s while the
   screen shows. A scope change drops the old org's view at once and discards a late answer for it; a
   failed refresh keeps the same scope's view; a first read that fails shows the hub's own words
   (`hubErrorMessage`, XERK-264).
+- **"Recent prompts" stays open across scope changes** like the web's page-level `permRecentOpen`:
+  its open state is held by `PermissionsSection`, above the loading/error branch.
 - **Platform form**: Copy puts the raw rule on the clipboard with Android's own confirmation (the
   system overlay on 13+, a toast below it), where the web flashes its button.
 - Tests: `core/PermissionsTest`, `model/PermissionDecodeTest`, `vm/UsagePermissionsViewModelTest`,

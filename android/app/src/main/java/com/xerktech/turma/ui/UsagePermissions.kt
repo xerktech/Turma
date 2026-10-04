@@ -56,6 +56,10 @@ internal fun PermissionsSection(
     nowMs: Long = ui.at.takeIf { it > 0 } ?: System.currentTimeMillis(),
 ) {
     val view = ui.view
+    // Held ABOVE the loading/error/empty early return (the web's page-level
+    // `permRecentOpen`): an org change resets the view to loading, which drops
+    // RecentPrompts from composition, and the disclosure must not collapse then.
+    var recentOpen by rememberSaveable { mutableStateOf(false) }
     val days = view?.days?.takeIf { it > 0 } ?: Permissions.DAYS
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     // The card's small print shares bodySmall's line height, not the default
@@ -97,7 +101,7 @@ internal fun PermissionsSection(
                     modifier = Modifier.padding(top = 12.dp),
                 )
             }
-            if (view.recent.isNotEmpty()) RecentPrompts(view.recent, nowMs)
+            if (view.recent.isNotEmpty()) RecentPrompts(view.recent, nowMs, recentOpen) { recentOpen = it }
         }
     }
 }
@@ -259,20 +263,25 @@ private fun CopyRuleButton(rule: String) {
 }
 
 /**
- * "Recent prompts (N)", collapsed by default. Its open state survives the
- * card's refresh and recomposition (the web's `permRecentOpen`).
+ * "Recent prompts (N)", collapsed by default. Its open state is hoisted into
+ * [PermissionsSection], so it survives refreshes, an org change's loading
+ * state and a list that empties and refills (the web's `permRecentOpen`).
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun RecentPrompts(recent: List<PermissionRow>, nowMs: Long) {
-    var open by rememberSaveable { mutableStateOf(false) }
+private fun RecentPrompts(
+    recent: List<PermissionRow>,
+    nowMs: Long,
+    open: Boolean,
+    setOpen: (Boolean) -> Unit,
+) {
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     Column(Modifier.fillMaxWidth().padding(top = 12.dp)) {
         Text(
             (if (open) "▾ " else "▸ ") + "Recent prompts (${recent.size})",
             style = MaterialTheme.typography.bodyMedium,
             color = MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.fillMaxWidth().clickable { open = !open }.padding(vertical = 6.dp),
+            modifier = Modifier.fillMaxWidth().clickable { setOpen(!open) }.padding(vertical = 6.dp),
         )
         if (!open) return@Column
         recent.forEachIndexed { i, r ->

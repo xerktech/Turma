@@ -62,7 +62,7 @@ Mirrors the glasses pure-core/adapter-shell split:
 - Usage's permission card (XERK-1576) is its OWN `GET /api/permissions` call
   (`model/Permissions.kt`, all fields defaulted, `kind` a string), never the atomic `/api/agents`
   decode. `UsageViewModel.watchPermissions` mirrors usage.html's `refreshPermissions`: waits for a
-  fleet snapshot, scopes by the header's effective org keys, drops the old org's view on a scope
+  FULL fleet snapshot (`FleetState.polled` — poll-only; an SSE upsert is a partial fleet), scopes by the header's effective org keys, drops the old org's view on a scope
   change and discards a late answer for it. Port logic in `core/Permissions.kt`. Tests:
   `UsagePermissionsViewModelTest`, `PermissionsSectionTest`.
 

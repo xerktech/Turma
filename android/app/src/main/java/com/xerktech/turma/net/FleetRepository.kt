@@ -30,6 +30,10 @@ data class FleetState(
     val now: Long = 0,
     val loading: Boolean = true,
     val error: String? = null,
+    // True once a FULL /api/agents snapshot has landed (refresh()'s success path),
+    // never from an SSE event alone: an `agent` upsert before the first poll is a
+    // one-host fleet, and an org scope computed from it is wrong (XERK-1576).
+    val polled: Boolean = false,
     // Ticket -> pinned host (XERK-38), from the same /api/agents payload; the
     // board's Agent row reads it. Refreshed by the poll and the hub's
     // "ticketAgents" SSE event.
@@ -173,11 +177,15 @@ class FleetRepository(
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
+            polled = true
             emit(_state.value.now.coerceAtLeast(resp.now), error = null)
         } catch (e: Exception) {
             emit(_state.value.now, error = e.message ?: "hub unreachable")
         }
     }
+
+    @Volatile
+    private var polled: Boolean = false
 
     @Volatile
     private var ticketAgents: Map<String, com.xerktech.turma.model.TicketAgentPin> = emptyMap()
@@ -233,7 +241,7 @@ class FleetRepository(
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
-            agents = list, now = now, loading = false, error = error,
+            agents = list, now = now, loading = false, error = error, polled = polled,
             ticketAgents = ticketAgents,
             autoStartOrgs = autoStartOrgs,
             autoMergeOrgs = autoMergeOrgs,
@@ -254,7 +262,8 @@ class FleetRepository(
         )
     }
 
-    private fun upsert(agent: AgentInfo) {
+    @androidx.annotation.VisibleForTesting
+    internal fun upsert(agent: AgentInfo) {
         if (agent.key.isEmpty()) return
         // Same freshness guard as refresh() (XERK-812): drop an SSE event older
         // than the record we already hold, so a late/out-of-order event can't

@@ -6,6 +6,9 @@ import androidx.activity.ComponentActivity
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
@@ -147,6 +150,26 @@ class PermissionsSectionTest {
         compose.onNodeWithText("nas01").assertExists()
         compose.onNodeWithText("waited 45s · allow").assertExists()
         compose.onNodeWithText("2m ago").assertExists()
+    }
+
+    @Test
+    fun `the open disclosure survives an org change's loading state`() {
+        // The web's `permRecentOpen` is page-level: a scope change repaints the
+        // card through "Loading…" and the list comes back still open.
+        var ui by mutableStateOf(UsageViewModel.PermissionsUi(view = populated))
+        compose.setContent {
+            Column(Modifier.verticalScroll(rememberScrollState())) { PermissionsSection(ui, nowMs = now) }
+        }
+        compose.onNodeWithText("▸ Recent prompts (1)").performScrollTo().performClick()
+        compose.waitForIdle()
+        compose.onNodeWithText("nas01").assertExists()
+        ui = UsageViewModel.PermissionsUi()
+        compose.waitForIdle()
+        compose.onNodeWithText("Loading…").assertExists()
+        ui = UsageViewModel.PermissionsUi(view = populated)
+        compose.waitForIdle()
+        compose.onNodeWithText("▾ Recent prompts (1)").assertExists()
+        compose.onNodeWithText("nas01").assertExists()
     }
 
     @Test
