@@ -132,6 +132,9 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   worker may do. The hub never puts a wake beside another launch on one host: the drain sends no
   `spawnTicket` to a host with a wake in flight (`hostWakeInFlight`), and a wake waits out a queued
   spawn (`pendingSpawnCount`). An operator spawn queued in the same beat can still pair with it.
+  - A restore-path wake is acked before its relaunch, so the hub cannot see it in flight. Its
+    relaunch therefore runs on FULL beats only (`_apply_sleeper_landed(light=...)`), never on the
+    light follow-up beat behind an inline `handle_commands` launch. Do not ungate it.
   - Worst case, a recorded deviation from XERK-395: `INTERVAL` + 2×`HEARTBEAT_TIMEOUT_SEC` (40s)
     + one launch (tmux kill 15s + new-session 30s + display 5s + ttyd port wait 2s = 52s) ≈ 92s,
     over `OFFLINE_AFTER_MS` (75s) only on a wedged tmux — as for any `spawnTicket` today. Moving

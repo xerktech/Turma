@@ -17712,6 +17712,34 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         self.assertNotIn("z1", [c["id"] for c in sm.closed])
         self.assertEqual(sm._sleeper_restoring, {})
 
+    def test_a_re_added_worktree_relaunches_on_a_full_beat_only(self):
+        # The restore-path wake was acked when it was staged, so the hub may hand
+        # this host another launch; that runs inline right before the LIGHT
+        # follow-up beat. The landed relaunch waits for the next full beat so the
+        # two never share one heartbeat gap (XERK-395).
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "repos", "r", ".wt-light")
+        sm.closed.append({"id": "z4", "repo": "r",
+                          "repoPath": os.path.join(self.tmp, "repos"),
+                          "worktreePath": wt, "claudeSessionId": None,
+                          "tmuxName": "agent-z4",
+                          "paused": {"wakeAt": self.NOW, "wakeReason": "ci"}})
+        used = sm._slots_used()
+        sm.resume("z4", cmd_id="w4")
+
+        def add(sess, base_ref=None):
+            os.makedirs(sess["worktreePath"], exist_ok=True)
+        with mock.patch.object(sm, "_worktree_add", side_effect=add):
+            self._settle(sm)
+        with mock.patch.object(ha.time, "time", return_value=(self.NOW + 1000) / 1000):
+            sm._apply_sleeper_landed(light=True)
+            self.assertIsNone(sm._find("z4"), "no relaunch on a light beat")
+            self.assertEqual(sm._slots_used(), used + 1, "its slot stays reserved")
+            self.assertIn(wt, sm._live_worktree_paths())
+            sm._apply_sleeper_landed()
+        self.assertEqual(sm._find("z4")["status"], "running")
+        self.assertEqual(sm._sleeper_restoring, {})
+
     def test_a_failed_worktree_re_add_leaves_an_ordinary_killed_record(self):
         sm = self._manager()
         wt = os.path.join(self.tmp, "repos", "r", ".wt-gone")

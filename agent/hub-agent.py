@@ -27056,17 +27056,26 @@ class SessionManager:
              "claudeSessionId": rec.get("claudeSessionId")})
         log(f"resume of paused session {sid}: re-adding its worktree off the beat")
 
-    def _apply_sleeper_landed(self):
+    def _apply_sleeper_landed(self, light=False):
         """Beat: finish each wake resume whose worktree the worker re-added. A
         record no longer paused (the operator killed it, or the hub unpaused it)
         or gone (deleted) is not resumed; a failed re-add leaves an ordinary
         killed record that Resume brings back, and says why. Also re-arms the
         worker while jobs wait: a failed Thread.start() would otherwise strand a
-        teardown, leaving an unmanaged tmux in a slot reported free."""
+        teardown, leaving an unmanaged tmux in a slot reported free.
+
+        The relaunch runs on FULL beats only. A restore-path wake was acked on
+        the beat that staged it, so the hub no longer counts it in flight and
+        may hand this host another launch; that command runs inline in
+        handle_commands right before the light follow-up beat. Relaunching on
+        that light beat too would put two launches between one POST and the
+        next (XERK-395). The landed restore waits, its slot still reserved."""
         with self._sleeper_lock:
             pending = bool(self._sleeper_jobs)
         if pending:
             self._start_sleeper_worker()
+        if light:
+            return
         with self._sleeper_lock:
             if not self._sleeper_landed:
                 return
@@ -35228,7 +35237,7 @@ class SessionManager:
         # re-added (XERK-1575): the git ran off the beat, the registry write is
         # the beat's.
         try:
-            self._apply_sleeper_landed()
+            self._apply_sleeper_landed(light=light)
         except Exception as e:
             log(f"sleeper resume apply failed: {e}")
         # Deliver session-CLI wake-ups that have come due (XERK-1564): a time
