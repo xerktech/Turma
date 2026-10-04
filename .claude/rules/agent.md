@@ -180,6 +180,10 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - **A light beat also does not advance `beat`**, which indexes the cadence work it skipped. That
     stops a slot being SKIPPED; only the deadline stops the cadence being STARVED — do not conflate
     the two guards. Tests: `TestPokedBeatIsLight`.
+- **The SIGUSR1 handler takes no lock** (XERK-1558): on POSIX `_poke` is a non-blocking self-pipe.
+  - A handler runs on the main thread mid-`wait()`; `Event.set()` there blocks on the lock that frame
+    holds, and a poke burst nests handlers → deadlock or RecursionError. Never revert to an Event.
+  - Tests: `TestPokeHeartbeat`.
 - **`light` means "reuse the caches" for the CHEAP git reads too**, not just the slow ones:
   `repo_cheap`/`session_cheap` hold the previous beat's branch + dirty counts. Never make a light beat
   re-derive something a scheduled beat will re-derive moments later. Tests: `TestLightBeatCost`.

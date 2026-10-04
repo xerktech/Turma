@@ -54,6 +54,7 @@ import math
 import os
 import re
 import secrets
+import select
 import shlex
 import shutil
 import signal
@@ -98,10 +99,68 @@ _TMUX_CONF = os.path.join(_AGENT_DIR, "tmux.conf")
 # SIGUSR1 when the hub pokes it over the control channel because a command was
 # just queued, so the heartbeat loop cuts its interval sleep short and delivers
 # that command in the next beat's reply instead of up to a whole INTERVAL
-# later. A threading.Event lets the loop wait interruptibly (plain time.sleep
-# wouldn't wake on the signal). On Windows there is no SIGUSR1, so a loopback
-# poke listener sets this same Event instead (_start_poke_listener).
-_poke = threading.Event()
+# later. On Windows there is no SIGUSR1, so a loopback poke listener sets this
+# same poke instead (_start_poke_listener).
+#
+# POSIX is a self-pipe, never a threading.Event (XERK-1558): a Python signal
+# handler runs on the main thread BETWEEN BYTECODES, including while that thread
+# is inside Event.wait() holding the Event's non-reentrant Condition lock. A
+# handler calling Event.set() then blocks on that same lock, the next poke in a
+# burst (the hub pokes once per queued command) interrupts it and nests another,
+# and the manager either deadlocks or dies with RecursionError. A non-blocking
+# os.write takes no Python lock, so the handler can't block and can't nest
+# deeper than the signals that land during one write. Windows keeps the Event:
+# its setter is the listener THREAD, never a signal handler, and select() there
+# takes only sockets.
+class _Poke:
+    """Event-shaped (set/clear/wait) wake-up the main loop sleeps on. Safe to
+    set() from a signal handler on POSIX."""
+
+    def __init__(self):
+        if os.name == "nt":
+            self._event = threading.Event()
+            return
+        self._event = None
+        self._r, self._w = os.pipe()  # non-inheritable (PEP 446): no leak to children
+        os.set_blocking(self._r, False)
+        os.set_blocking(self._w, False)
+
+    def set(self):
+        if self._event is not None:
+            self._event.set()
+            return
+        try:
+            os.write(self._w, b"\0")
+        except BlockingIOError:
+            pass  # pipe full: a poke is already pending, which is all set() means
+
+    def clear(self):
+        if self._event is not None:
+            self._event.clear()
+            return
+        try:
+            while os.read(self._r, 4096):
+                pass
+        except BlockingIOError:
+            pass  # drained
+
+    def wait(self, timeout):
+        """True if poked (now or before, since the last clear()), else False
+        after `timeout` seconds. Leaves the poke pending, like Event.wait()."""
+        if self._event is not None:
+            return self._event.wait(timeout)
+        # PEP 475: a signal mid-select re-enters it with the remaining timeout,
+        # and the handler's write has made the pipe readable by then.
+        ready, _, _ = select.select([self._r], [], [], timeout)
+        return bool(ready)
+
+
+_poke = _Poke()
+
+
+def _on_sigusr1(_signum, _frame):
+    """The SIGUSR1 handler. Lock-free: _poke.set() is one non-blocking write."""
+    _poke.set()
 
 def _env_num(name, default, cast, *, minimum=None, maximum=None):
     """Read a numeric env var, FALLING BACK to `default` instead of raising.
@@ -35358,7 +35417,7 @@ class SessionManager:
         # it every command sat until the next scheduled beat (up to 20s), which
         # read as the terminal/chat/submit "instability" on native Windows hosts.
         if not IS_WINDOWS:
-            signal.signal(signal.SIGUSR1, lambda *_: _poke.set())
+            signal.signal(signal.SIGUSR1, _on_sigusr1)
         else:
             _start_poke_listener()
         # SIGTERM/SIGINT = the supervisor is restarting us (an update swapping
