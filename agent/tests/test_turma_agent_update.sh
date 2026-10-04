@@ -1451,6 +1451,36 @@ else
 fi
 rm -rf "$root"
 
+# 34b. A killed run runs no RETURN trap, so its staging dir (and any downloaded
+#      tarball) is left in TMPDIR; the next run of the same prefix sweeps it,
+#      and never another prefix's (XERK-1489).
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin" "$root/tmp"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_hanging_gh "$bin"
+mkdir "$root/tmp/turma-update.othertag0000.keepme"
+stage_run() {
+  HOME="$root/home" TMPDIR="$root/tmp" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+    TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=2 TURMA_RUN_KILL_GRACE=1 \
+    "$bin/turma-agent-update" --boot >/dev/null 2>&1 || true
+  rm -f "$root/home/.turma/last-update-check."* 2>/dev/null || true  # unthrottle the next --boot
+}
+stage_run
+first="$(find "$root/tmp" -mindepth 1 -maxdepth 1 -name "turma-update.*" ! -name "*othertag*" -printf "%f\n")"
+stage_run
+second="$(find "$root/tmp" -mindepth 1 -maxdepth 1 -name "turma-update.*" ! -name "*othertag*" -printf "%f\n")"
+if [ -n "$first" ] && [ ! -e "$root/tmp/$first" ] && [ "$(printf '%s\n' "$second" | wc -l)" = 1 ]; then
+  pass "a killed run's staging dir is swept by the next run ($first -> $second)"
+else
+  fail "killed runs' staging dirs accumulate (first='$first' now='$second')"
+fi
+if [ -d "$root/tmp/turma-update.othertag0000.keepme" ]; then
+  pass "the sweep leaves another prefix's staging dir alone"
+else
+  fail "the sweep removed another prefix's staging dir"
+fi
+rm -rf "$root"
+
 # 35. A holder that is ALREADY wedged (deadline disabled, so only the reclaim can
 #     save it) is detected by age, killed, and the lock retaken — and the
 #     reclaiming check then completes a real update. This is the end-to-end path

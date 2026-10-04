@@ -935,7 +935,17 @@ run_once() {
   refresh_update_timer "$PREFIX"
 
   cur="$(installed_version)"
-  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.XXXXXX")"
+  # A RETURN trap never fires on a kill, so a run the watchdog, a lock reclaim
+  # or `systemctl stop` terminates would leave its stage (and any downloaded
+  # tarball) in TMPDIR forever (XERK-1489). So the stage is named per prefix
+  # and each run sweeps its predecessors' — safe because we hold this prefix's
+  # lock, so no live run owns one. -user: never touch another identity's dirs.
+  # No TERM trap instead: bash defers a trapped signal until its foreground
+  # child exits, so a TERM to a run wedged on a hung child would no longer end
+  # it, and a KILL (the watchdog's -k, a reclaim) runs no trap anyway.
+  find "${TMPDIR:-/tmp}" -maxdepth 1 -name "turma-update.$PREFIX_TAG.*" \
+    -user "$(id -u)" -exec rm -rf {} + 2>/dev/null || true
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.$PREFIX_TAG.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf '$stage' '$PREFIX.update'" RETURN
 
