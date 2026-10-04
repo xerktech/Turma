@@ -2253,6 +2253,24 @@ test("Ended sessions merges killed + stopped, newest-ended first", () => {
   assert.deepEqual(order, [...order].sort((a, b) => a - b), "sorted newest-ended first");
 });
 
+test("XERK-1575: a sleeper paused for its slot reads asleep until its wake, never killed", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  const wakeAt = now + 90 * 60 * 1000;
+  const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  h.closedSessions = [
+    closed("33333", "Napping", "2026-07-15T09:00:00Z", { paused: { wakeAt, wakeReason: "check CI", at: now } }),
+    closed("44444", "Plain Kill", "2026-07-15T08:00:00Z"),
+  ];
+  beat({ now, agents: [h] });
+  const e = els.ended.innerHTML;
+  const nap = e.slice(e.indexOf("Napping"), e.indexOf("Plain Kill"));
+  assert.ok(nap.includes(`<div class="state">💤 paused until ${hhmm} · check CI</div>`), nap);
+  assert.ok(!nap.includes("killed"), nap);
+  assert.match(e.slice(e.indexOf("Plain Kill")), /<div class="state">killed/);
+});
+
 test("Ended sessions is collapsed by default and hidden when there are none", () => {
   const { beat, els } = loadPage();
   const { now, host: h } = host([working("11111", "Live One")]);

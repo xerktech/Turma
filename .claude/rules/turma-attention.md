@@ -194,5 +194,45 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 
 - `_session_directive` appends `WAKE_SYSTEM_PROMPT` for a CLAUDE session only: "do not sleep in a
   shell: run `python3 -SsE <cli> wake <N>m <what to check>` and end the turn". Mechanics + why the
-  CLI is spelled by absolute path: `agent-session-cli.md`. Slot policy v1: a sleeper HOLDS its slot
-  (freeing it is the kill/resume child, XERK-1575).
+  CLI is spelled by absolute path: `agent-session-cli.md`. A sleeper no longer always holds its
+  slot: see slot policy v2 below.
+
+## Slot policy v2 — pausing a sleeper for queued work (XERK-1575)
+
+- **The hub decides; the agent executes on the command path.** Only the hub sees the ticket queue,
+  so `pauseSleepersFor` (end of `drainTicketQueue`) and `wakePausedSleepers` (start of the drain,
+  and every `masterOrchestrationTick`, since the drain returns early on an empty queue) queue
+  ordinary commands: `pauseSleeper` and `resume` + `wake:true`. Never a kill/resume on the beat.
+- **One pause per still-waiting ticket.** Waiting = entries the drain just held `capacity`
+  (`waitingFull`). Unacked `pauseSleeper` commands fleet-wide count against that need, so a drain
+  every beat never pauses a second sleeper for the same ticket.
+- **Only where the ticket could run**: a FULL (`!hostHasFreeSlot`), online host reporting
+  `pauseSleepers.available` that `findTicketHost(..., {onlyHost})` accepts — every triage/pin/
+  runtime/OS/subscription-pause rule applies, so a pause never frees a slot the ticket can't use.
+  `onlyHost` only narrows the loop; without it `findTicketHost` is unchanged.
+- **Only a quiet sleeper** (`sleeperPausable`): running, `wakeAt` at least
+  `SLEEPER_PAUSE_MIN_AHEAD_MS` (10 min) away, no question/panePrompt/loop, `paneBusy === false`,
+  `agents` an EMPTY array (absent = can't tell = no). Farthest `wakeAt` first. The agent re-checks
+  against its own beat (`agent-session-cli.md`) — the hub's view is a beat old.
+- **A refused or unacted command is not re-sent for `SLEEPER_RETRY_MS`** (`sleeperPauseTried`/
+  `sleeperWakeTried`, in-memory, bounded): an agent that disagreed acks and keeps the session.
+- **The capability gates the pause** (`normalizePauseSleepers`, strict boolean, a
+  `HEARTBEAT_KNOWN_KEYS` member): an older agent would ack the unknown command and free nothing.
+  `TURMA_PAUSE_SLEEPERS=0` reports false. The RESUME is not gated — any agent knows `resume`.
+- **The pause is served on the CLOSED channel**: `closedSessions[].paused = {wakeAt, wakeReason?,
+  at?}`, rebuilt by `wirePaused` in `normalizeClosedSessions` (ingest + restore) or dropped whole.
+  Android TYPES it (`PausedSleep`). Its slot reads free through the agent's own `capacity`.
+- **A due sleeper takes a freed slot AHEAD of the queue**: `wakePausedSleepers` runs before the
+  drain dispatches, one resume per host per pass, oldest wake first, and `pendingSpawnCount` counts
+  a `resume` with `wake:true`, so the drain never hands that slot to a ticket. Starving it would
+  turn a pause into a kill. It calls `markResumedTicketAutoStopExempt` like the resume route, or
+  `autoStopSweep` re-kills a sleeper whose ticket went Done while it slept.
+- **Never alerted.** A paused sleeper is a closed record (no `alerts.sessions` entry); the
+  resumed session starts a fresh `sa` with no `reviewAt`/`prevAttn`, so neither review nor stalled
+  fires off the resume itself. `startedTicketKeys` reads closed records, so auto-start never
+  re-dispatches its ticket meanwhile.
+- **Every Ended list shows it asleep, never "killed"**: "💤 paused until 14:05 · <reason>" (web
+  `pausedLabel` in `endedRow`, Android `endedStateText`, glasses phone `pausedLabel` in
+  `endedCardHtml`), with no "ended N ago" beside it. Resume on that row is an early wake.
+- Tests: the `XERK-1575:` cases in `server.test.js` and `sessions.test.js`, glasses
+  `phone/render.test.ts`, android `SessionsFlattenTest`/`AgentDecodeTest`.

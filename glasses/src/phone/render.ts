@@ -193,14 +193,26 @@ function queuedCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, tint
   );
 }
 
+// A sleeper the hub paused to free its slot (XERK-1575): "paused until 14:05 ·
+// <reason>" — it wakes on its own, so it never reads as plainly ended. null for
+// any other ended row. Web `pausedLabel`, Android `endedStateText`.
+export function pausedLabel(s: SessionInfo, now: number = Date.now()): string | null {
+  const p = (s as { paused?: unknown }).paused as { wakeAt?: unknown; wakeReason?: unknown } | undefined;
+  if (!p || typeof p.wakeAt !== "number" || !Number.isSafeInteger(p.wakeAt)) return null;
+  const why = typeof p.wakeReason === "string" ? p.wakeReason.trim() : "";
+  return `paused until ${clockTime(p.wakeAt, now)}${why ? ` · ${why}` : ""}`;
+}
+
 // An ended (killed/stopped) session — a muted, non-entering row with its PR chips.
 function endedCardHtml(hostLabel: string, s: SessionInfo, tint: string): string {
+  const paused = pausedLabel(s);
   return (
     `<div class="ph-card ph-ended"${tint}>` +
     `<span class="ph-dot st-stopped" aria-hidden="true"></span>` +
     `<span class="ph-card-body">` +
     `<span class="ph-card-title">${esc(sessionName(s))}</span>` +
     `<span class="ph-card-meta">${esc(hostLabel)} · ${esc(s.repo)}${s.ticket?.key ? " · " + `<span class="ph-ticket">${esc(s.ticket.key)}</span>` : ""}</span>` +
+    (paused ? `<span class="ph-state st-holding">${esc(paused)}</span>` : "") +
     prChips(s) +
     `</span>` +
     `</div>`

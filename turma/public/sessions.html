@@ -2273,6 +2273,14 @@ function sleepLabel(s, now) {
   const why = typeof s.wakeReason === "string" ? s.wakeReason.trim() : "";
   return "💤 sleeping until " + clockTime(s.wakeAt, now) + (why ? " · " + why : "");
 }
+// A sleeper the hub paused to free its slot (XERK-1575): ended for now, but it
+// wakes on its own — the hub resumes it at its wake — so it never reads "killed".
+// null for an ordinary ended row. Android `endedStateText`, glasses `endedCardHtml`.
+function pausedLabel(p, now) {
+  if (!p || !Number.isSafeInteger(p.wakeAt)) return null;
+  const why = typeof p.wakeReason === "string" ? p.wakeReason.trim() : "";
+  return "💤 paused until " + clockTime(p.wakeAt, now) + (why ? " · " + why : "");
+}
 function liveWorkRows(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).filter(a => !isWaitRow(a));
 }
@@ -2984,9 +2992,10 @@ function endedRow(e) {
   const when = e.endedMs ? ago(Date.now() - e.endedMs) : "";
   // A resumable row is a bare transcript: nothing recorded WHY it ended, only
   // that it did, so it says the one thing that's true of all of them.
-  const state = (kind === "closed" ? "killed"
-    : kind === "resumable" ? "ended"
-    : (s.status === "error" ? "failed" : "stopped"))
+  const state = (kind === "closed" && pausedLabel(s.paused, Date.now()))
+    || (kind === "closed" ? "killed"
+      : kind === "resumable" ? "ended"
+      : (s.status === "error" ? "failed" : "stopped"))
     + (when ? " " + when : "");
   return `<div class="s-card-wrap ended-wrap"${orgTintStyle(a)}>
     <div class="s-card ended ${cur ? "cur" : ""}">

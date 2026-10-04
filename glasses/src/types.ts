@@ -137,6 +137,9 @@ export interface ClosedSessionInfo {
   label?: string | null;
   createdAt?: string | null;
   closedAt?: string | null;
+  // A sleeper the hub paused to free its slot (XERK-1575), rebuilt hub-side
+  // (`wirePaused`); absent for an ordinary kill.
+  paused?: { wakeAt: number; wakeReason?: string; at?: number };
   [key: string]: unknown;
 }
 

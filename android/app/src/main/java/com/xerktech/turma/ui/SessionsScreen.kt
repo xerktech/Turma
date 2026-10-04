@@ -148,6 +148,8 @@ data class EndedSession(
      *  runtime, so the web's resumableSession omits it too) and for any pre-dsh
      *  record; both read as Claude Code and carry no badge. */
     val agentType: String = "",
+    /** A sleeper the hub paused to free its slot (XERK-1575), else null. */
+    val paused: com.xerktech.turma.model.PausedSleep? = null,
 )
 
 /** The sidebar's three lists in one pass — running, queued (FIFO), ended. */
@@ -208,7 +210,7 @@ fun collectSessions(agents: List<AgentInfo>, query: String): SessionLists {
                     transcriptId = c.transcriptId, repo = c.repo,
                     name = closedName(c),
                     endedAt = c.closedAt, endedMs = parseIso(c.closedAt),
-                    prs = c.prs, agentType = c.agentType,
+                    prs = c.prs, agentType = c.agentType, paused = c.paused,
                 ),
             )
         }
@@ -250,7 +252,11 @@ fun queuedReasonText(reason: String): String = when (reason) {
 }
 
 /** The row's state word: killed/stopped/failed/ended (web endedRow `state`). */
-fun endedStateText(e: EndedSession): String = when {
+fun endedStateText(e: EndedSession, now: Long = System.currentTimeMillis()): String = when {
+    // A sleeper paused for its slot (XERK-1575) wakes on its own: web `pausedLabel`.
+    e.kind == EndedKind.CLOSED && e.paused != null && e.paused.wakeAt > 0 ->
+        "💤 paused until " + com.xerktech.turma.core.clockTime(e.paused.wakeAt, now) +
+            e.paused.wakeReason.trim().let { if (it.isNotEmpty()) " · $it" else "" }
     e.kind == EndedKind.CLOSED -> "killed"
     // A resumable row is a bare transcript: nothing recorded WHY it ended, only
     // that it did, so it says the one thing that's true of all of them.
@@ -875,7 +881,7 @@ private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: 
                 val when_ = e.endedAt.takeIf { it.isNotBlank() }
                     ?.let { com.xerktech.turma.core.ageStr(it, now) }.orEmpty()
                 Text(
-                    endedStateText(e) + if (when_.isNotBlank()) " $when_" else "",
+                    endedStateText(e, now) + if (when_.isNotBlank() && e.paused == null) " $when_" else "",
                     style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                     maxLines = 1,

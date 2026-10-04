@@ -7020,6 +7020,22 @@ function normalizeCloseTicket(payload) {
   payload.closeTicket = { available: t.available === true };
 }
 
+// The sleeper-pause (XERK-1575) capability block: whether this host's manager
+// executes a `pauseSleeper` command (kill a quiet sleeper, keeping its wake on the
+// closed record). The hub frees a slot that way only on a host reporting it — an
+// older agent would ack the unknown command and free nothing, and a host with
+// TURMA_PAUSE_SLEEPERS=0 reports false. Coerced like normalizeCloseTicket:
+// strictly boolean, unusable becomes NULL, ABSENT stays absent ("this host can't").
+function normalizePauseSleepers(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.pauseSleepers;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("pauseSleepers" in payload) payload.pauseSleepers = null;
+    return;
+  }
+  payload.pauseSleepers = { available: t.available === true };
+}
+
 // This host's EFFECTIVE default runtime for an unpinned spawn (XERK-521), coerced
 // at ingest exactly like normalizeQwen/normalizeDsh and for the same reason: it
 // is agent-supplied, a client may TYPE it, and `/api/agents` decodes atomically
@@ -8049,8 +8065,11 @@ function ticketRepo(siteKey, issueKey, rows) {
 // routes. Can go negative (more committed than free) — that's fine, it's a
 // sortable score, not a count.
 function pendingSpawnCount(a) {
+  // A wake resume (XERK-1575) takes a slot exactly as a spawn does, so a queued
+  // ticket never claims the slot a due sleeper was resumed into.
   return (a.commands || []).filter(
-    (c) => c && (c.type === "spawn" || c.type === "spawnTicket")).length;
+    (c) => c && (c.type === "spawn" || c.type === "spawnTicket"
+      || (c.type === "resume" && c.wake === true))).length;
 }
 function hostAvailability(a) {
   const c = a.capacity;
@@ -8176,7 +8195,11 @@ function findTicketHost(siteKey, repo, issueKey, opts) {
   // spends no Claude pool (qwen/dsh) never hits the pause and counts as unpaused.
   let anyUnpaused = false;
   const cloned = [], uncloned = [];
+  // `opts.onlyHost` (XERK-1575) asks "could THIS host take it?" through every
+  // rule below — the sleeper pause frees a slot only where the ticket can run.
+  const onlyHost = opts && opts.onlyHost;
   for (const [key, a] of Object.entries(agents)) {
+    if (onlyHost && key !== onlyHost) continue;
     if (!hostInOrg(a, siteKey)) continue;
     anyOrg = true;
     if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
@@ -8382,7 +8405,7 @@ const SPAWN_FIELD_MAX = 100000;
 const HEARTBEAT_KNOWN_KEYS = new Set([
   "agentId", "agentVersion", "archiveManifest", "capacity", "claudeAuth",
   "claudeVersion", "clones", "closedSessions", "codingAgent", "device",
-  "dsh", "qwen", "triage", "trajectory", "closeTicket", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
+  "dsh", "qwen", "triage", "trajectory", "closeTicket", "pauseSleepers", "defaultRuntime", "gitSources", "github", "hostOs", "inputMaxChars", "jira", "limits", "localModel",
   "logTail", "memory", "models", "prunes", "repoUsage", "repos", "reposRoot",
   "sessions", "startedAt", "subscription", "tokenRoll", "uploadMaxBytes", "usage",
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
@@ -8778,6 +8801,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeTriage(a);
   normalizeTrajectory(a);
   normalizeCloseTicket(a);
+  normalizePauseSleepers(a);
   normalizeDefaultRuntime(a);
   normalizeHostOs(a);
   normalizeTokenRoll(a);
@@ -9244,6 +9268,19 @@ function coerceTicketOutcome(t) {
 // `closedSessions` (List<ClosedSessionInfo> on Android). Non-array → [],
 // non-object element dropped; root/summaryManual are Boolean, ticket a nullable
 // object, prs a List<PrInfo>.
+// A closed record's `paused` block (XERK-1575), rebuilt from a whitelist: `wakeAt`
+// a positive safe integer (else the block is no pause at all), `wakeReason` a
+// string capped like the live one, `at` (when it was paused) a positive safe
+// integer. null when unusable.
+function wirePaused(p) {
+  if (!objectish(p)) return null;
+  if (!(Number.isSafeInteger(p.wakeAt) && p.wakeAt > 0)) return null;
+  const out = { wakeAt: p.wakeAt };
+  if (typeof p.wakeReason === "string" && p.wakeReason) out.wakeReason = p.wakeReason.slice(0, 200);
+  if (Number.isSafeInteger(p.at) && p.at > 0) out.at = p.at;
+  return out;
+}
+
 function normalizeClosedSessions(a) {
   if (!a || typeof a !== "object") return;
   const list = coerceObjectList(a, "closedSessions");
@@ -9254,6 +9291,13 @@ function normalizeClosedSessions(a) {
     }
     if ("ticket" in c && !objectish(c.ticket)) delete c.ticket;
     if (objectish(c.ticket)) coerceTicketOutcome(c.ticket);
+    // A sleeper paused for its slot (XERK-1575): {wakeAt, wakeReason?, at?}.
+    // Android TYPES it, so it is rebuilt field by field or dropped whole.
+    if ("paused" in c) {
+      const p = wirePaused(c.paused);
+      if (p) c.paused = p;
+      else delete c.paused;
+    }
     const prs = coerceObjectList(c, "prs");
     if (prs) prs.forEach(coercePrElem);
   }
@@ -12907,8 +12951,13 @@ function holdQueued(e, reason, error) {
 function drainTicketQueue() {
   if (!ticketQueue.length) return;
   const now = Date.now();
+  // A due paused sleeper (XERK-1575) takes a freed slot ahead of the queue: it
+  // was paused FOR queued work, and starving it would turn a pause into a kill.
+  wakePausedSleepers(now);
   const rows = fleetTicketRows();
   const usedHosts = new Set();
+  // Entries still waiting for a slot after this pass — what a sleeper pause frees.
+  const waitingFull = [];
   let started = null;
   let changed = false;
   for (const e of ticketQueueOrder(rows)) {
@@ -13058,6 +13107,7 @@ function drainTicketQueue() {
       // null (the client words "waiting for a free slot" generically).
       changed = holdQueued(e, full ? "capacity" : paused ? "paused" : "blocked",
         full ? null : error) || changed;
+      if (full) waitingFull.push({ e, repo });
       if (full || paused) { if (e.blockedSince) { e.blockedSince = 0; changed = true; } continue; }
       // A routing failure HOLDS, whatever queued it. Dropping an auto entry here
       // dropped it into the sweep's arms: an org whose hosts are all offline was
@@ -13127,11 +13177,125 @@ function drainTicketQueue() {
     }
     drop(null);
   }
+  // Whatever still waits for a slot may get one from a sleeper (XERK-1575).
+  pauseSleepersFor(waitingFull, now, rows);
   if (changed) {
     // The drain is where notes are MINTED, so the bound belongs here too —
     // applied only on enqueue it held at 2x until the next click.
     sweepExpiredNotes();
     publishTicketQueue();
+  }
+}
+
+// ---- slot policy v2: pause a sleeper to free its slot (XERK-1575) -------------
+// v1 let a session-CLI sleeper hold its MAX_SESSIONS slot for its whole wait. Now,
+// when a ticket waits for a slot and a host that could run it is full, the hub
+// asks that host to PAUSE one quiet sleeper — the agent's clean, resumable kill,
+// keeping the wake on the closed record (served as `closedSessions[].paused`) —
+// ONE per waiting ticket. At the wake (or the first free slot after it) the hub
+// resumes it with an ordinary `resume` command, and the agent delivers the wake
+// text. Both ride the command path an operator click takes, never the beat.
+
+// A wake must be at least this far off before its sleeper is worth pausing: a
+// pause + resume costs a relaunch, and a nearer wake would hand the slot straight
+// back.
+const SLEEPER_PAUSE_MIN_AHEAD_MS = 10 * 60 * 1000;
+// A pause or wake command the agent acked without acting on (it disagreed: the
+// session woke, a dialog opened) is not re-sent for this long.
+const SLEEPER_RETRY_MS = 5 * 60 * 1000;
+const SLEEPER_TRIED_MAX = 500;
+// "<host>\x00<sid>" -> when a pause / a wake resume was last queued. In-memory:
+// a restart forgets them, which costs at most one repeat command.
+const sleeperPauseTried = new Map();
+const sleeperWakeTried = new Map();
+function sleeperTriedRecently(map, host, sid, now) {
+  const at = map.get(host + "\x00" + sid);
+  return at != null && now - at < SLEEPER_RETRY_MS;
+}
+function noteSleeperTried(map, host, sid, now) {
+  map.delete(host + "\x00" + sid);
+  map.set(host + "\x00" + sid, now);
+  while (map.size > SLEEPER_TRIED_MAX) map.delete(map.keys().next().value);
+}
+
+function pauseSleepersAvailable(a) {
+  return !!(a && objectish(a.pauseSleepers) && a.pauseSleepers.available === true);
+}
+
+// May the hub ask for this session to be paused? A running sleeper whose wake is
+// at least SLEEPER_PAUSE_MIN_AHEAD_MS off, with nothing else going on: no pending
+// question or dialog, a pane the agent read IDLE (absent = can't tell = no), no
+// live background agent or shell (absent = can't tell = no), no loop. The agent
+// re-checks all of it against its own beat before it kills anything.
+function sleeperPausable(s, now) {
+  if (!s || s.status !== "running") return false;
+  const live = s.session;
+  if (!objectish(live) || !sessionSleeping(live, now)) return false;
+  if (live.wakeAt - now < SLEEPER_PAUSE_MIN_AHEAD_MS) return false;
+  if (live.question || live.panePrompt || live.loop) return false;
+  if (live.paneBusy !== false) return false;
+  return Array.isArray(live.agents) && live.agents.length === 0;
+}
+
+// A paused sleeper whose wake has come (served on the closed channel).
+function pausedSleeperDue(c, now) {
+  return objectish(c && c.paused) && Number.isSafeInteger(c.paused.wakeAt)
+    && c.paused.wakeAt <= now;
+}
+
+// Resume every due paused sleeper on an online host with a free slot, one per
+// host per pass (the drain's own rule), oldest wake first. A wake resume in
+// flight holds its slot (pendingSpawnCount), so the queue never takes it. Like
+// the resume route, it stands auto-stop down for a ticket that went Done while it
+// slept (XERK-561) — or the sweep would re-kill the session it just woke.
+function wakePausedSleepers(now = Date.now()) {
+  for (const [host, a] of Object.entries(agents)) {
+    if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    const due = (Array.isArray(a.closedSessions) ? a.closedSessions : [])
+      .filter((c) => pausedSleeperDue(c, now) && typeof c.id === "string"
+        && !sleeperTriedRecently(sleeperWakeTried, host, c.id, now))
+      .sort((x, y) => x.paused.wakeAt - y.paused.wakeAt);
+    if (!due.length || !hostHasFreeSlot(a)) continue;
+    const c = due[0];
+    queueCommand(host, { type: "resume", sessionId: c.id, wake: true });
+    noteSleeperTried(sleeperWakeTried, host, c.id, now);
+    markResumedTicketAutoStopExempt(host, c.id);
+    console.log(`sleeper slot: waking ${logName(c.id)} on ${logName(host)}`);
+  }
+}
+
+// Free ONE slot per still-waiting ticket by pausing a sleeper on a full host that
+// could run it — the farthest wake first, since that slot sits idle longest.
+// Pauses already in flight (an unacked `pauseSleeper`) count against the need, so
+// a beat-by-beat drain never pauses a second sleeper for the same ticket.
+function pauseSleepersFor(waiting, now = Date.now(), rows) {
+  if (!waiting.length) return;
+  let need = waiting.length;
+  for (const a of Object.values(agents)) {
+    need -= (a.commands || []).filter((c) => c && c.type === "pauseSleeper").length;
+  }
+  for (const { e, repo } of waiting) {
+    if (need <= 0) return;
+    let best = null;
+    for (const [host, a] of Object.entries(agents)) {
+      if (!pauseSleepersAvailable(a) || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+      if (hostHasFreeSlot(a)) continue;   // a free host is the drain's, not ours
+      const sleepers = (a.sessions || []).filter((s) => sleeperPausable(s, now)
+        && !sleeperTriedRecently(sleeperPauseTried, host, s.id, now));
+      if (!sleepers.length) continue;
+      const fit = findTicketHost(e.siteKey, repo, e.issueKey,
+        { auto: e.source === "auto", onlyHost: host, rows });
+      if (fit.host !== host) continue;
+      for (const s of sleepers) {
+        if (!best || s.session.wakeAt > best.s.session.wakeAt) best = { host, s };
+      }
+    }
+    if (!best) continue;
+    queueCommand(best.host, { type: "pauseSleeper", sessionId: best.s.id });
+    noteSleeperTried(sleeperPauseTried, best.host, best.s.id, now);
+    need -= 1;
+    console.log(`sleeper slot: pausing ${logName(best.s.id)} on ${logName(best.host)}`
+      + ` for ${logName(e.issueKey)}`);
   }
 }
 
@@ -14936,6 +15100,9 @@ function masterOrchestrationTick() {
   epicRunCompleteSweep();
   // The per-org brief (XERK-1573): a fresh one per org every BRIEF_INTERVAL_MIN.
   briefTick();
+  // Resume paused sleepers whose wake has come (XERK-1575). The drain does it
+  // too, but only runs with something queued.
+  wakePausedSleepers();
   // Drained AFTER the sweeps so a ticket the sweep just queued can go out in the
   // same tick, and a session auto-stop just freed is seen by the drain the beat
   // it lands. The heartbeat drains too (that's where capacity actually changes);
@@ -20891,6 +21058,9 @@ if (process.env.TURMA_TEST) {
     normalizeTriage,
     normalizeTrajectory,
     normalizeCloseTicket,
+    // XERK-1575: slot policy v2 (pause a sleeper, resume it at its wake).
+    normalizePauseSleepers, wirePaused, sleeperPausable, wakePausedSleepers,
+    pauseSleepersFor, sleeperPauseTried, sleeperWakeTried, SLEEPER_PAUSE_MIN_AHEAD_MS,
     autoCloseMergedMessage,
     ingestTrajectoryTails,
     liveSessionForTranscript,

@@ -17554,6 +17554,215 @@ class TestWakeRequest(ManagerMixin, unittest.TestCase):
         self.assertIsNone(ha.read_wake_request(self.SID)["wakeReason"])
 
 
+class TestSleeperSlot(ManagerMixin, unittest.TestCase):
+    """XERK-1575: slot policy v2. On the hub's `pauseSleeper` a QUIET sleeping
+    session is killed through the clean, resumable kill path with its wake kept
+    on the closed record (exempt from the closed-history cap); a resume carries
+    the wake back, and the wake text is staged only once the resumed pane reads
+    an idle composer."""
+
+    NOW = 1_786_400_000_000
+
+    def setUp(self):
+        super().setUp()
+        for name, value in [("REPOS_ROOT", self.tmp)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+        p = mock.patch.object(ha, "scan_repos", lambda: [])
+        p.start()
+        self.addCleanup(p.stop)
+        self.proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.tmp))
+        os.makedirs(self.proj, exist_ok=True)
+
+    def _sleeper(self, sm, ahead_ms=3600_000, reason="check CI on PR #412"):
+        sm.spawn(ha.ROOT_REPO_NAME)
+        sess = sm.registry[-1]
+        # A real conversation, so the resume rejoins it with --resume.
+        path = os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl")
+        write_jsonl(path, [{"type": "user", "uuid": "u1",
+                            "message": {"role": "user", "content": "work"}}])
+        sess["wakeAt"] = self.NOW + ahead_ms
+        sess["wakeReason"] = reason
+        sm._note_quiet(sess["id"], {"paneBusy": False, "panePrompt": None,
+                                    "question": None, "agents": [], "loop": None})
+        return sess
+
+    def _manager(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        return sm
+
+    def test_a_quiet_sleeper_is_paused_with_its_wake_on_the_closed_record(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self.assertIsNone(sm._find(sid), "the slot is free: the record is gone")
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertEqual(rec["paused"], {"wakeAt": self.NOW + 3600_000,
+                                         "wakeReason": "check CI on PR #412",
+                                         "pausedAt": self.NOW})
+        # Served on the closed channel, so the hub shows it asleep, not ended.
+        wire = next(c for c in sm._closed_payload() if c["id"] == sid)
+        self.assertEqual(wire["paused"], {"wakeAt": self.NOW + 3600_000,
+                                          "wakeReason": "check CI on PR #412",
+                                          "at": self.NOW})
+        # A plain kill carries no pause.
+        self.assertIsNone(ha._paused_wire(None))
+        self.assertIsNone(ha._paused_wire({"wakeAt": True}))
+
+    def test_only_a_quiet_sleeper_at_least_ten_minutes_out_is_paused(self):
+        cases = {
+            "wake too soon": lambda sm, s: s.__setitem__("wakeAt", self.NOW + 9 * 60_000),
+            "not sleeping": lambda sm, s: s.pop("wakeAt"),
+            "busy pane": lambda sm, s: sm._note_quiet(s["id"], {"paneBusy": True}),
+            "can't tell": lambda sm, s: sm._note_quiet(s["id"], {"paneBusy": None}),
+            "dialog": lambda sm, s: sm._note_quiet(
+                s["id"], {"paneBusy": False, "panePrompt": {"prompt": "Proceed?"}}),
+            "question": lambda sm, s: sm._note_quiet(
+                s["id"], {"paneBusy": False, "question": "Which one?"}),
+            "background work": lambda sm, s: sm._note_quiet(
+                s["id"], {"paneBusy": False, "agents": [{"type": "shell", "label": "x"}]}),
+            "looping": lambda sm, s: sm._note_quiet(
+                s["id"], {"paneBusy": False, "loop": {"repeats": 4, "tool": "Bash"}}),
+            "no signals yet": lambda sm, s: sm._quiet.pop(s["id"]),
+            "stopped": lambda sm, s: s.__setitem__("status", "error"),
+        }
+        for name, spoil in cases.items():
+            with self.subTest(name):
+                sm = self._manager()
+                sess = self._sleeper(sm)
+                spoil(sm, sess)
+                self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+                self.assertIs(sm._find(sess["id"]), sess)
+                self.assertEqual(sm.closed, [])
+
+    def test_the_off_switch_refuses_the_pause(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        with mock.patch.object(ha, "PAUSE_SLEEPERS", False):
+            self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        self.assertIs(sm._find(sess["id"]), sess)
+
+    def test_a_live_shell_read_off_the_transcript_refuses_the_pause(self):
+        # The quiet read comes off the REAL beat signals: a background shell the
+        # back-scan reports live keeps the session out of a pause.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        path = os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)), \
+                mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            sm._session_payload(sess, refresh=False)
+        self.assertEqual(sm._quiet[sess["id"]], (True, False))
+        self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        # The same session with that shell finished pauses.
+        with open(path, "a") as f:
+            f.write(json.dumps({"type": "queue-operation", "operation": "enqueue",
+                                "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                                           "<status>completed</status>\n</task-notification>"}) + "\n")
+        with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)), \
+                mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            sm._session_payload(sess, refresh=False)
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+
+    def test_the_command_path_pauses(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        with mock.patch.object(ha.time, "time", return_value=self.NOW / 1000):
+            sm.handle_commands([{"cmdId": "p1", "type": "pauseSleeper",
+                                 "sessionId": sess["id"]}])
+        self.assertIsNone(sm._find(sess["id"]))
+        self.assertIn("p1", sm.acked)
+
+    def test_a_paused_record_survives_the_closed_history_cap(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        for i in range(ha.CLOSED_PER_REPO + 2):
+            sm._remember_closed({"id": f"k{i}", "repo": sess["repo"],
+                                 "worktreePath": os.path.join(self.tmp, f"wt{i}")})
+        ids = [c["id"] for c in sm.closed]
+        self.assertIn(sid, ids, "a paused sleeper must never be evicted")
+        self.assertEqual(len([i for i in ids if i != sid]), ha.CLOSED_PER_REPO)
+        # ...and a prune that removed its worktree keeps it too: the resume
+        # re-adds the worktree, and dropping the record loses the wake.
+        with sm._prune_lock:
+            sm._prune_swept = [sm.closed[0]["worktreePath"], sess["worktreePath"]]
+        sm._poll_prunes()
+        self.assertIn(sid, [c["id"] for c in sm.closed])
+
+    def test_a_resume_carries_the_wake_and_stages_it_once_the_pane_is_quiet(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        due = self.NOW + 3600_000
+        with mock.patch.object(ha.time, "time", return_value=due / 1000):
+            sm.resume(sid)
+        back = sm._find(sid)
+        self.assertEqual(back["status"], "running")
+        self.assertEqual((back["wakeAt"], back["wakeReason"], back["wakeResumedAt"]),
+                         (due, "check CI on PR #412", due))
+        launch = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertIn(f"--resume {sess['claudeSessionId']}", launch)
+        self.assertNotIn("Wake-up", launch, "the prompt arg is off until verified")
+        self.assertEqual(sm.closed, [])
+        # Not typed into a pane still coming up, nor one the last beat could not
+        # read as an idle composer.
+        sm._deliver_due_wakes(now_ms=due + 1000)
+        sm._note_quiet(sid, {"paneBusy": True})
+        sm._deliver_due_wakes(now_ms=due + ha.WAKE_RESUME_SETTLE_MS)
+        self.assertEqual(sm.input_queue, [])
+        sm._note_quiet(sid, {"paneBusy": False})
+        sm._deliver_due_wakes(now_ms=due + ha.WAKE_RESUME_SETTLE_MS)
+        self.assertEqual(sm.input_queue, [
+            (sid, "Wake-up: check CI on PR #412. Check it and continue.", None)])
+        self.assertNotIn("wakeAt", back)
+        self.assertNotIn("wakeResumedAt", back)
+        sm._deliver_due_wakes(now_ms=due + 60_000)
+        self.assertEqual(len(sm.input_queue), 1, "delivered once")
+
+    def test_with_the_prompt_arg_on_a_due_wake_rides_the_resume_launch(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        due = self.NOW + 3600_000
+        with mock.patch.object(ha, "RESUME_WAKE_PROMPT_ARG", True), \
+                mock.patch.object(ha.time, "time", return_value=due / 1000):
+            sm.resume(sid)
+        launch = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        self.assertIn(f"--resume {sess['claudeSessionId']}", launch)
+        self.assertIn("-- 'Wake-up: check CI on PR #412. Check it and continue.'", launch)
+        self.assertNotIn("wakeAt", sm._find(sid), "never delivered twice")
+
+    def test_an_early_operator_resume_sleeps_again(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        with mock.patch.object(ha.time, "time", return_value=(self.NOW + 60_000) / 1000):
+            sm.resume(sid)
+        back = sm._find(sid)
+        self.assertEqual(back["wakeAt"], self.NOW + 3600_000)
+        sm._note_quiet(sid, {"paneBusy": False})
+        sm._deliver_due_wakes(now_ms=self.NOW + 120_000)
+        self.assertEqual(sm.input_queue, [], "still asleep until its wake")
+
+    def test_the_capability_rides_the_heartbeat(self):
+        sm = self._manager()
+        with mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm.build_payload(0, light=True)
+        self.assertEqual(payload["pauseSleepers"], {"available": True})
+        with mock.patch.object(ha, "PAUSE_SLEEPERS", False), \
+                mock.patch.object(sm, "_session_git", return_value=({}, {})):
+            payload = sm.build_payload(0, light=True)
+        self.assertEqual(payload["pauseSleepers"], {"available": False})
+
+
 class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
     """XERK-1569: a session's `session_cli.py close-ticket` file is read by a
     WORKER (tracker HTTP off the beat), which comments the evidence and moves the

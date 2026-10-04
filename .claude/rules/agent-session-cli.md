@@ -101,6 +101,35 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 - Tests: `test_session_cli.py`; `TestWakeRequest` in `test_hub_agent.py`; the guard pins in
   `test_guard_settings.py`; the `XERK-1564` case in `server.test.js`.
 
+## Pausing a sleeper for its slot (XERK-1575; hub half `turma-attention.md`)
+
+- **`pauseSleeper` (command) → `pause_sleeper`**: the same `kill` an operator click runs (worktree,
+  branch, ticket, transcript kept) with `paused={wakeAt, wakeReason, pausedAt}` stamped on the
+  closed record and served as `closedSessions[].paused` (`_paused_wire`). Runs in
+  `handle_commands`, like every kill — never staged from the beat.
+- **The agent re-checks before it kills** (`_sleeper_unpausable`): running, an int `wakeAt` at
+  least `PAUSE_SLEEPER_MIN_AHEAD_MS` away, and the LAST beat's signals quiet (`_note_quiet` →
+  `self._quiet[sid] = (pane, work)`): `paneBusy is False`, no panePrompt, no question, no live
+  `agents`, no `loop`. A failed probe drops the entry — can't tell = refuse. Refusals are logged.
+- **`TURMA_PAUSE_SLEEPERS=0`** refuses every pause and reports `pauseSleepers: {available:false}`.
+- **A paused record is exempt from `CLOSED_PER_REPO`** (up to `PAUSED_KEEP_MAX`, newest kept) and
+  from the prune's closed-record sweep (`_poll_prunes`): evicted, it could never be woken; a
+  pruned worktree is re-added by `resume`.
+- **Resume carries the wake back** (`_carry_paused_wake`, in `resume()`), keeping the session id,
+  ticket and `rcName`. Default: the record gets `wakeAt`/`wakeReason` + `wakeResumedAt`, and
+  `_deliver_due_wakes` stages `wake_text` through the operator input path only once
+  `WAKE_RESUME_SETTLE_MS` has passed AND the last beat read an idle composer — never a timed paste
+  into a booting TUI. A wake still ahead (an early operator Resume) is simply asleep again.
+- **`TURMA_RESUME_WAKE_PROMPT=1` rides a DUE wake on the launch instead** (`claude --resume <id> --
+  <text>`, `_launch_tmux`'s positional prompt). OFF until a real pane proves `--resume` submits it.
+- The resume's `resumeRelaunch` stamp applies: a doomed `--resume` relaunches fresh, and that fresh
+  launch clears the wake with the rest of the request dir (a conversation's wake dies with it).
+- Tests: `TestSleeperSlot`.
+- **Real-host spike (not yet run)**: on a scratch session, `wake 30m x`, queue a ticket at
+  capacity, confirm the pause, then the resume at wake with the wake text landing once; and
+  whether `claude --resume <id> -- <text>` submits `<text>` as the first turn (if it does, flip
+  `TURMA_RESUME_WAKE_PROMPT` on). Record the answers here.
+
 ## The wait classifier + loop signal (XERK-1572)
 
 Not the CLI, but the other half of "why is this session waiting": hub half in `turma-attention.md`.

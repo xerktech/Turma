@@ -8614,6 +8614,7 @@ const asBeat = async (device, site, {
   jiraSource,
   ackedCommands,
   closeTicket,
+  pauseSleepers,
 } = {}) => {
   const r = await request("POST", "/api/heartbeat", {
     body: {
@@ -8622,6 +8623,7 @@ const asBeat = async (device, site, {
       sessions, closedSessions,
       ...(capacity ? { capacity } : {}),
       ...(closeTicket !== undefined ? { closeTicket } : {}),
+      ...(pauseSleepers !== undefined ? { pauseSleepers } : {}),
       jira: { available: true, configured: true, siteKey: site,
               user: user || `${device}@x.com`, fetchedAt, tickets,
               ...(jiraSource ? { source: jiraSource } : {}) },
@@ -23788,4 +23790,159 @@ test("XERK-1572: attentionNudged writes through and hydrates back, so a failover
     hub.attentionNudged.clear();
     delete agents[host];
   });
+});
+
+// ---- XERK-1575: slot policy v2 — pause a sleeper, resume it at its wake ---------
+
+const SLEEP_SITE = "slp.atlassian.net";
+const sleeperSession = (id, wakeIn, extra = {}) => ({
+  id, status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z",
+  session: { wakeAt: Date.now() + wakeIn, wakeReason: `check ${id}`, paneBusy: false,
+             agents: [], ...extra },
+});
+const sleeperCmds = (host, type) => (agents[host].commands || []).filter((c) => c.type === type);
+const resetSleepers = () => {
+  hub.sleeperPauseTried.clear();
+  hub.sleeperWakeTried.clear();
+};
+
+test("XERK-1575: a full host pauses its FARTHEST quiet sleeper, one per waiting ticket", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpFull";
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeperSession("near", 60 * 60_000), sleeperSession("far", 3 * 60 * 60_000)] });
+  const r = await startTicket(SLEEP_SITE, "ENG-5");
+  assert.equal(r.body.queued, true);
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["far"]);
+  // The pause still in flight counts against the one waiting ticket: no second.
+  drainTicketQueue();
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 1);
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 0, "the slot is not free yet");
+  // The agent killed it: the slot reads free on the next beat and the ticket takes it.
+  agents[host].commands = [];
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 },
+    pauseSleepers: { available: true }, sessions: [sleeperSession("near", 60 * 60_000)],
+    closedSessions: [{ id: "far", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: Date.now() + 3 * 60 * 60_000, wakeReason: "check far", at: Date.now() } }] });
+  assert.deepEqual(sleeperCmds(host, "spawnTicket").map((c) => c.issueKey), ["ENG-5"]);
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0, "nothing waits, so nothing else pauses");
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: only a quiet sleeper, ten minutes out, on a capable full host that could run the ticket", async () => {
+  const cases = {
+    "wake too soon": { s: sleeperSession("x", 9 * 60_000) },
+    "busy pane": { s: sleeperSession("x", 60 * 60_000, { paneBusy: true }) },
+    "pane can't tell": { s: sleeperSession("x", 60 * 60_000, { paneBusy: null }) },
+    "a question": { s: sleeperSession("x", 60 * 60_000, { question: "Which?" }) },
+    "a dialog": { s: sleeperSession("x", 60 * 60_000, { panePrompt: { prompt: "Proceed?", options: [] } }) },
+    "background work": { s: sleeperSession("x", 60 * 60_000,
+      { agents: [{ type: "shell", label: "Watch CI", kind: "wait-external" }] }) },
+    "agents can't tell": { s: (() => { const s = sleeperSession("x", 60 * 60_000); delete s.session.agents; return s; })() },
+    "not sleeping": { s: (() => { const s = sleeperSession("x", 0); delete s.session.wakeAt; return s; })() },
+    "no capability": { s: sleeperSession("x", 60 * 60_000), cap: undefined },
+    "capability off": { s: sleeperSession("x", 60 * 60_000), cap: { available: false } },
+    "untriaged host": { s: sleeperSession("x", 60 * 60_000), tickets: [{ key: "ENG-5",
+      summary: "Fix it", statusCategory: "todo", triage: { priority: "P2", type: "task", actionable: true } }] },
+  };
+  let n = 0;
+  for (const [name, c] of Object.entries(cases)) {
+    resetAutoStart(); resetSleepers();
+    const host = `slpNo${n++}`;
+    const site = `slpno${n}.atlassian.net`;
+    // A second, free-less host that triaged the ticket keeps the entry queued
+    // (rather than blocked) when this one has not triaged it.
+    await asBeat(`${host}b`, site, { autoStart: false, capacity: FULL });
+    await asBeat(host, site, { autoStart: false, capacity: FULL,
+      pauseSleepers: "cap" in c ? c.cap : { available: true }, sessions: [c.s],
+      ...(c.tickets ? { tickets: c.tickets } : {}) });
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.equal(sleeperCmds(host, "pauseSleeper").length, 0, name);
+    ticketQueue.length = 0; delete agents[host]; delete agents[`${host}b`];
+  }
+  // And with nothing waiting at all, a sleeper keeps its slot.
+  resetAutoStart(); resetSleepers();
+  await asBeat("slpIdle", "slpidle.atlassian.net", { autoStart: false, capacity: FULL,
+    pauseSleepers: { available: true }, sessions: [sleeperSession("x", 60 * 60_000)] });
+  drainTicketQueue();
+  hub.pauseSleepersFor([], Date.now());
+  assert.equal(sleeperCmds("slpIdle", "pauseSleeper").length, 0);
+  delete agents.slpIdle;
+});
+
+test("XERK-1575: a due paused sleeper takes the freed slot ahead of the queue, auto-stop stood down", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpWake";
+  const site = "slpwake.atlassian.net";
+  const paused = (id, wakeAt, key) => ({ id, repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+    ticket: { key, siteKey: site }, paused: { wakeAt, wakeReason: `check ${id}`, at: wakeAt - 3600_000 } });
+  const tickets = [
+    { key: "ENG-5", summary: "Fix it", statusCategory: "todo", repoGuess: { repo: "Turma", cloned: true },
+      triage: { priority: "P2", type: "task", actionable: true } },
+    { key: "ENG-7", summary: "Slept", statusCategory: "done", repoGuess: { repo: "Turma", cloned: true } },
+  ];
+  await asBeat(host, site, { autoStart: false, capacity: FULL, tickets, pauseSleepers: { available: true } });
+  const started = await startTicket(site, "ENG-5");
+  assert.equal(started.body.queued, true, JSON.stringify(started.body));
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "ENG-5").reason, "capacity");
+  // A slot frees while one paused sleeper's wake has come and another's has not.
+  const now = Date.now();
+  await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 }, tickets,
+    pauseSleepers: { available: true },
+    closedSessions: [paused("later", now + 3600_000, "ENG-6"), paused("due", now - 1000, "ENG-7")] });
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => [c.sessionId, c.wake]), [["due", true]]);
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 0, "the woken sleeper holds the slot");
+  assert.equal(queuedTicket(site, "ENG-5").reason, "capacity");
+  // Its ticket went Done while it slept: the resume is exempt from the re-kill.
+  assert.ok(autoStopResumeExempt.has(host + "\x00due"));
+  // The in-flight resume is not re-sent by the next pass.
+  hub.wakePausedSleepers(Date.now());
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "resume").length, 1);
+  autoStopResumeExempt.delete(host + "\x00due");
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: the orchestration pass wakes a due sleeper with an empty queue, never on a full or offline host", () => {
+  resetSleepers();
+  const now = Date.now();
+  const closed = [{ id: "z", repo: "Turma", paused: { wakeAt: now - 1 } }];
+  agents.slpTickFree = { lastSeen: now, capacity: { maxSessions: 2, running: 1, queued: 0, free: 1 },
+    closedSessions: closed, commands: [] };
+  agents.slpTickFull = { lastSeen: now, capacity: FULL, closedSessions: closed, commands: [] };
+  agents.slpTickGone = { lastSeen: now - 10 * 60_000, capacity: { ...FULL, free: 2 },
+    closedSessions: closed, commands: [] };
+  hub.wakePausedSleepers(now);
+  assert.deepEqual(sleeperCmds("slpTickFree", "resume").map((c) => c.sessionId), ["z"]);
+  assert.equal(sleeperCmds("slpTickFull", "resume").length, 0);
+  assert.equal(sleeperCmds("slpTickGone", "resume").length, 0);
+  delete agents.slpTickFree; delete agents.slpTickFull; delete agents.slpTickGone;
+});
+
+test("XERK-1575: the paused block and the capability are coerced at ingest", async () => {
+  const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "slpWire", repos: [], sessions: [], pauseSleepers: { available: "yes" },
+    closedSessions: [
+      { id: "ok", repo: "Turma", paused: { wakeAt: 4_102_444_800_000, wakeReason: "r".repeat(300), at: 5, x: 1 } },
+      { id: "junk", repo: "Turma", paused: { wakeAt: "soon" } },
+      { id: "arr", repo: "Turma", paused: [1] },
+      { id: "plain", repo: "Turma" },
+    ] } });
+  assert.equal(r.status, 200);
+  const a = agents.slpWire;
+  assert.deepEqual(a.pauseSleepers, { available: false });
+  const by = Object.fromEntries(a.closedSessions.map((c) => [c.id, c.paused]));
+  assert.deepEqual(by.ok, { wakeAt: 4_102_444_800_000, wakeReason: "r".repeat(200), at: 5 });
+  assert.equal(by.junk, undefined);
+  assert.equal(by.arr, undefined);
+  assert.equal(by.plain, undefined);
+  assert.equal(hub.wirePaused({ wakeAt: 0 }), null);
+  const n = { pauseSleepers: [] };
+  hub.normalizePauseSleepers(n);
+  assert.equal(n.pauseSleepers, null);
+  delete agents.slpWire;
 });
