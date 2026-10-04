@@ -116,10 +116,10 @@ test("brief.html: a decisionCounts frame that lands mid-fetch survives with its 
 });
 
 function loadRenderers() {
-  const src = slice("function narrativeHtml(b) {", "\n// `live` = a host is decided");
+  const src = slice("const narrativeOpen = new Set();", "\n// `live` = a host is decided");
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
   return new Function("esc", "ago", "drafts", "noteBusy",
-    `${src}\nreturn { narrativeHtml, decisionsHtml };`)(
+    `${src}\nreturn { narrativeHtml, decisionsHtml, narrativeOpen };`)(
     esc, (ms, now) => `${Math.round((now - ms) / 1000)}s`,
     new Map([["a.net", "half <typed>"]]), new Set());
 }
@@ -165,7 +165,8 @@ test("brief.html: a decision row names the session it came from (XERK-1574)", ()
     { at: 1000, source: "question", question: "Q?", answer: "A", label: "archive <index> work", host: "h" },
     { at: 2000, source: "question", question: "Q2?", answer: "B", label: "x".repeat(80) },
   ], 5000, false);
-  assert.ok(html.includes("answered</span> · archive &#60;index&#62; work · 4s ago · h"));
+  const text = (h) => h.replace(/<[^>]*>/g, "");
+  assert.ok(text(html).includes("question · archive &#60;index&#62; work · 4s ago · h"));
   assert.ok(html.includes(`${"x".repeat(59)}…`));
   assert.equal(html.includes("x".repeat(60)), false, "a long label is clipped");
 });
@@ -204,4 +205,79 @@ test("brief.html: the decisions log is its own card AFTER the brief's, not insid
   assert.ok(none[1].includes("No infra merges."));
   // Nothing logged and nowhere to add one: no decisions card at all.
   assert.equal(orgHtml("a.net", [brief], 9500, false, [], 0).split('<section class="brief-org').length, 2);
+});
+
+test("brief.html: the summary is clamped until Show more, its toggle hidden until measured (XERK-1574)", () => {
+  const { narrativeHtml, narrativeOpen } = loadRenderers();
+  const shut = narrativeHtml({ narrative: "Two shipped." }, "a.net");
+  assert.match(shut, /<p data-narrative="a\.net" class="clamped">/);
+  assert.match(shut, /data-narrative-toggle="a\.net" aria-expanded="false" hidden>Show more</);
+  narrativeOpen.add("a.net");
+  const open = narrativeHtml({ narrative: "Two shipped." }, "a.net");
+  assert.match(open, /<p data-narrative="a\.net">/, "an expanded summary is not clamped");
+  assert.match(open, /aria-expanded="true" hidden>Show less</);
+  // A readable measure at desktop width.
+  assert.match(SRC, /\.brief-narrative p \{[^}]*max-width: 70ch/);
+  assert.match(SRC, /\.brief-narrative p\.clamped \{[^}]*-webkit-line-clamp: 4/);
+});
+
+test("brief.html: a summary's toggle shows only when the text overflows the clamp (XERK-1574)", () => {
+  const src = slice("function fitNarratives() {", "\n}\n");
+  const para = (lines, open) => {
+    const cls = new Set(open ? [] : ["clamped"]);
+    const btn = { dataset: { narrativeToggle: "a.net" }, hidden: true };
+    return {
+      btn,
+      cls,
+      classList: { add: (c) => cls.add(c), remove: (c) => cls.delete(c), contains: (c) => cls.has(c) },
+      get clientHeight() { return cls.has("clamped") ? Math.min(lines, 4) * 21 : lines * 21; },
+      get scrollHeight() { return lines * 21; },
+      nextElementSibling: btn,
+    };
+  };
+  const ps = [para(3, false), para(18, false), para(18, true)];
+  const fit = new Function("$briefs", `${src}\nreturn fitNarratives;`)({ querySelectorAll: () => ps });
+  fit();
+  assert.equal(ps[0].btn.hidden, true, "a summary that fits gets no toggle");
+  assert.equal(ps[1].btn.hidden, false);
+  assert.equal(ps[2].btn.hidden, false, "an expanded summary keeps its Show less");
+  assert.ok(ps[1].cls.has("clamped"));
+  assert.equal(ps[2].cls.has("clamped"), false, "measuring never re-clamps an expanded one");
+});
+
+test("brief.html: a typed-answer marker is muted, never bold as if chosen (XERK-1574)", () => {
+  const { decisionsHtml } = loadRenderers();
+  const html = decisionsHtml("a.net", [
+    { at: 1000, source: "question", question: "Which DB?", answer: "Postgres, plus a typed answer" },
+    { at: 2000, source: "question", question: "Why?", answer: "(a typed answer)" },
+    { at: 3000, source: "question", question: "Q?", answer: "Yes" },
+  ], 5000, false);
+  assert.ok(html.includes('Which DB? → <b>Postgres</b><span class="typed">, plus a typed answer</span>'));
+  assert.ok(html.includes('Why? → <span class="typed">(a typed answer)</span>'));
+  assert.ok(html.includes("Q? → <b>Yes</b>"));
+  assert.equal(/<b>[^<]*typed answer/.test(html), false);
+});
+
+test("brief.html: a decision's kind is a noun, its meta pieces each unbreakable (XERK-1574)", () => {
+  const { decisionsHtml } = loadRenderers();
+  const html = decisionsHtml("a.net", [
+    { at: 1000, source: "question", question: "Q?", answer: "A", ticket: "X-1", label: "work", host: "Jira poller" },
+    { at: 2000, source: "permission", question: "Bash: npm test", answer: "Yes" },
+    { at: 3000, source: "note", text: "n" },
+  ], 5000, false);
+  for (const k of ["question", "permission", "note"]) assert.ok(html.includes(`<span class="kind">${k}</span>`), k);
+  assert.equal(html.includes("answered"), false);
+  assert.ok(html.includes('<span class="bit"><span class="kind">question</span></span>'
+    + ' <span class="bit">· <span class="key">X-1</span></span>'
+    + ' <span class="bit">· <span class="sess">work</span></span>'
+    + ' <span class="bit">· 4s ago</span> <span class="bit">· Jira poller</span>'));
+  assert.match(SRC, /\.brief-decision \.brief-meta \.bit \{[^}]*white-space: nowrap;[^}]*text-overflow: ellipsis/);
+});
+
+test("brief.html: the decisions subtitle sits beside its title, not pushed right (XERK-1574)", () => {
+  const { decisionsHtml } = loadRenderers();
+  const head = decisionsHtml("a.net", [{ at: 1, source: "note", text: "n" }], 5000, false, 1, "acme")
+    .match(/<div class="brief-head">(.*?)<\/div>/)[1];
+  assert.ok(head.endsWith('<span class="spacer"></span>'), "the spacer, not the subtitle, is the last child");
+  assert.ok(head.includes("acme · the org's log, across every brief"));
 });

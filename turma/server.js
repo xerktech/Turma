@@ -3316,8 +3316,10 @@ function cleanBriefNarrative(v) {
   // A standalone HEADING line is dropped, never joined into the next sentence
   // ("Summary for acme Two pieces…"): a #-heading or a line that is only
   // *-emphasis (seen before the markup strip), or a short line ending ":"
-  // (seen after it). The cleaned text has no # or *, and any line ending ":"
-  // that survived is longer than the colon bound, so it stays a fixed point.
+  // (seen after it). '#' is markup only as a line-LEADING heading mark (stripped
+  // with the bullets), so "PR #215" keeps it. The cleaned text has no * and
+  // never starts with a heading mark, and any line ending ":" that survived is
+  // longer than the colon bound, so it stays a fixed point.
   // Lengths are code points ([...t]), as Python's len counts them.
   const heading = (l) => {
     const t = l.replace(/^ +| +$/g, "");
@@ -3336,8 +3338,8 @@ function cleanBriefNarrative(v) {
     .replace(/[^\S\n]/g, " ")
     .split("\n")
     .filter((l) => !heading(l))
-    .map((l) => l.replace(/[*`#~|<>[\]]/g, "")
-      .replace(/^ *(?:(?:[-+]|[0-9]+[.)])(?: +|$))+/, "")
+    .map((l) => l.replace(/[*`~|<>[\]]/g, "")
+      .replace(/^ *(?:(?:[-+]|[0-9]+[.)]|#{1,6})(?: +|$))+/, "")
       .replace(/ +/g, " ")
       .replace(/^ | $/g, ""))
     .filter((l) => !(l.endsWith(":") && [...l].length <= 40))

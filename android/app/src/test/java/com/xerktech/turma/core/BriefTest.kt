@@ -127,17 +127,17 @@ class BriefTest {
         )
         assertEquals(
             listOf(
-                "Proceed? → Yes" to "permission",
-                "No infra merges." to "note · 60s ago",
-                "Which DB? → Postgres" to "answered · O-1 · 2h ago · h",
+                BriefDecisionRow("Proceed?", "Yes", null, listOf("permission")),
+                BriefDecisionRow("No infra merges.", null, null, listOf("note", "60s ago")),
+                BriefDecisionRow("Which DB?", "Postgres", null, listOf("question", "O-1", "2h ago", "h")),
             ),
             briefDecisionLines(log, now),
         )
         val many = (1..15).map { OrgDecision(at = it.toLong(), source = "note", text = "n$it") }
         val lines = briefDecisionLines(many, 100)
         assertEquals(BRIEF_DECISIONS_SHOWN, lines.size)
-        assertEquals("n15", lines.first().first)
-        assertEquals("n6", lines.last().first)
+        assertEquals("n15", lines.first().title)
+        assertEquals("n6", lines.last().title)
     }
 
     @Test fun `a decision's meta names its session, clipped like the web`() {
@@ -147,8 +147,28 @@ class BriefTest {
                 label = "archive index work", host = "devbox"),
             OrgDecision(at = 0, source = "question", question = "Q2?", answer = "B", label = "x".repeat(80)),
         ), now)
-        assertEquals("answered · ${"x".repeat(59)}…", lines[0].second)
-        assertEquals("answered · archive index work · 50m ago · devbox", lines[1].second)
+        assertEquals(listOf("question", "${"x".repeat(59)}…"), lines[0].meta)
+        assertEquals(listOf("question", "archive index work", "50m ago", "devbox"), lines[1].meta)
+    }
+
+    @Test fun `a decision's kind is a noun, as the web words it`() {
+        assertEquals(mapOf("question" to "question", "permission" to "permission", "note" to "note"),
+            BRIEF_DECISION_KIND)
+    }
+
+    @Test fun `a typed-answer marker is split off the chosen option, as the web shows it muted`() {
+        assertEquals("Postgres" to ", plus a typed answer", briefDecisionAnswer("Postgres, plus a typed answer"))
+        assertEquals(null to "(a typed answer)", briefDecisionAnswer("(a typed answer)"))
+        assertEquals("Yes" to null, briefDecisionAnswer("Yes"))
+        assertEquals("a bare marker is an option's own words", ", plus a typed answer" to null,
+            briefDecisionAnswer(", plus a typed answer"))
+        val row = briefDecisionLines(listOf(OrgDecision(at = 0, source = "question", question = "Q?",
+            answer = "A; B, plus a typed answer")), 1).single()
+        assertEquals(BriefDecisionRow("Q?", "A; B", ", plus a typed answer", listOf("question")), row)
+    }
+
+    @Test fun `the summary clamps to the web's four lines`() {
+        assertEquals(4, BRIEF_NARRATIVE_LINES)
     }
 
     @Test fun `the decisions count is the org's, the served tail its floor`() {

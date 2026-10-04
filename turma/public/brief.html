@@ -66,13 +66,31 @@
     padding: 10px 12px; margin: 0 0 12px;
   }
   .brief-narrative-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
-  .brief-narrative p { margin: 0; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
+  /* A readable measure on a wide screen; clamped to 4 lines until "Show more"
+     (android BRIEF_NARRATIVE_LINES). */
+  .brief-narrative p { margin: 0; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; max-width: 70ch; }
+  .brief-narrative p.clamped {
+    display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 4; line-clamp: 4; overflow: hidden;
+  }
+  .brief-narrative-toggle {
+    font: inherit; font-size: 12px; border: 0; background: none; color: var(--accent-text);
+    padding: 4px 0 0; cursor: pointer;
+  }
   /* XERK-1574: the org's decisions log tail + the note composer. */
   /* An org-level log, so its own card after the brief's (never inside the
      brief's period). */
   .brief-decisions .brief-org-name .n { color: var(--muted); font-weight: 400; font-size: 15px; }
   .brief-decisions .brief-sec { margin-top: 0; }
   .brief-decision .kind { color: var(--ink-2); }
+  /* A meta line wraps only BETWEEN its pieces (age, host, ticket, session), never
+     inside one; a piece wider than the row (a long session name) ends in "…". */
+  .brief-decision .brief-meta { overflow-wrap: normal; }
+  .brief-decision .brief-meta .bit {
+    display: inline-block; max-width: 100%; white-space: nowrap; overflow: hidden;
+    text-overflow: ellipsis; vertical-align: bottom;
+  }
+  /* The typed-answer marker is not the chosen option: muted, never bold. */
+  .brief-decision .typed { color: var(--muted); font-size: 12px; }
   .brief-note { display: flex; gap: 8px; margin-top: 8px; }
   .brief-note input {
     flex: 1; min-width: 0; font: inherit; font-size: 13px; border: 1px solid var(--border);
@@ -221,10 +239,17 @@ function countsHtml(b) {
 
 // The brief's model-written summary (XERK-1574): labelled as such, above the
 // sections it was written from. A brief without one renders exactly as before.
-function narrativeHtml(b) {
+// Clamped to 4 lines (the CSS line-clamp; android BRIEF_NARRATIVE_LINES) so the
+// counts and Needs you stay in view; the toggle shows only when the text
+// overflows the clamp (`fitNarratives` measures it).
+const narrativeOpen = new Set();     // orgs whose summary the operator expanded
+function narrativeHtml(b, site) {
   if (!b || typeof b.narrative !== "string" || !b.narrative) return "";
+  const open = narrativeOpen.has(site);
   return `<div class="brief-narrative"><div class="brief-narrative-label">Summary · written by a model from the sections below</div>`
-    + `<p>${esc(b.narrative)}</p></div>`;
+    + `<p data-narrative="${esc(site)}"${open ? "" : ` class="clamped"`}>${esc(b.narrative)}</p>`
+    + `<button type="button" class="brief-narrative-toggle" data-narrative-toggle="${esc(site)}"`
+    + ` aria-expanded="${open}" hidden>${open ? "Show less" : "Show more"}</button></div>`;
 }
 
 // The org's decisions log (XERK-1574) as its OWN card, after the brief's: it is
@@ -235,13 +260,25 @@ function narrativeHtml(b) {
 // is the org's display name, which ties the card to its brief.
 const DECISIONS_SHOWN = 10;
 const DECISION_LABEL_MAX = 60;   // the session's name in a row's meta line
-const DECISION_KIND = { question: "answered", permission: "permission", note: "note" };
+const DECISION_KIND = { question: "question", permission: "permission", note: "note" };
+// The hub's typed-answer markers (server.js `questionAnswerText`): free text is
+// logged as a marker, never its words, and the marker is not a chosen option.
+const TYPED_SUFFIX = ", plus a typed answer";
+const TYPED_ALONE = "(a typed answer)";
+function answerHtml(a) {
+  if (a === TYPED_ALONE) return `<span class="typed">${esc(a)}</span>`;
+  if (a.endsWith(TYPED_SUFFIX) && a.length > TYPED_SUFFIX.length) {
+    return `<b>${esc(a.slice(0, -TYPED_SUFFIX.length))}</b><span class="typed">${esc(TYPED_SUFFIX)}</span>`;
+  }
+  return `<b>${esc(a)}</b>`;
+}
 function decisionsHtml(site, list, now, live, count, name) {
   const rows = (Array.isArray(list) ? list : []).slice(-DECISIONS_SHOWN).reverse();
   if (!rows.length && !live) return "";
   const item = (d) => {
     const title = d.source === "note" ? esc(d.text || "")
-      : `${esc(d.question || "")} → <b>${esc(d.answer || "")}</b>`;
+      : `${esc(d.question || "")} → ${answerHtml(d.answer || "")}`;
+    // Each piece is one unbreakable `.bit`; the line wraps only between them.
     const meta = [`<span class="kind">${esc(DECISION_KIND[d.source] || d.source || "")}</span>`];
     if (d.ticket) meta.push(`<span class="key">${esc(d.ticket)}</span>`);
     // Which session it came from — the only tie back for an answer with no ticket.
@@ -252,12 +289,13 @@ function decisionsHtml(site, list, now, live, count, name) {
         if (/[\ud800-\udbff]$/.test(l)) l = l.slice(0, -1);   // never half a surrogate pair
         l += "…";
       }
-      meta.push(esc(l));
+      meta.push(`<span class="sess">${esc(l)}</span>`);
     }
     if (typeof d.at === "number") meta.push(`${esc(ago(d.at, now))} ago`);
     if (d.host) meta.push(esc(d.host));
+    const bits = meta.map((m, i) => `<span class="bit">${i ? "· " : ""}${m}</span>`);
     return `<li class="brief-item brief-decision"><div class="brief-title">${title}</div>`
-      + `<div class="brief-meta">${meta.join(" · ")}</div></li>`;
+      + `<div class="brief-meta">${bits.join(" ")}</div></li>`;
   };
   const served = Array.isArray(list) ? list.length : 0;
   const total = Math.max(served, Number.isSafeInteger(count) ? count : 0);
@@ -272,7 +310,10 @@ function decisionsHtml(site, list, now, live, count, name) {
     : "";
   return `<section class="brief-org brief-decisions"><div class="brief-head">`
     + `<span class="brief-org-name">Decisions <span class="n">${total}</span></span>`
-    + `<span class="brief-when">${esc(name || site)} · the org's log, across every brief</span></div>`
+    + `<span class="brief-when">${esc(name || site)} · the org's log, across every brief</span>`
+    // The spacer is the head's last child, so the subtitle sits beside the title
+    // as the brief card's does (`.brief-head > :last-child` pushes right).
+    + `<span class="spacer"></span></div>`
     + `<div class="brief-sec decisions">${body}${form}</div></section>`;
 }
 
@@ -314,7 +355,7 @@ function orgHtml(site, list, now, live, decisions, decisionCount) {
   const when = `${esc(clock(b.at))} · covers the last ${esc(ago(b.since, b.at))}`
     + (b.trigger === "manual" ? " · on demand" : "");
   return `<section class="brief-org">` + headHtml(site, name, when, live)
-    + narrativeHtml(b) + countsHtml(b) + secs + spendHtml(b, now)
+    + narrativeHtml(b, site) + countsHtml(b) + secs + spendHtml(b, now)
     + (earlier ? `<details class="brief-earlier"><summary>Earlier briefs (${list.length - 1})</summary><ul class="brief-list">${earlier}</ul></details>` : "")
     + `</section>` + decisionsHtml(site, decisions, now, live, decisionCount, name);
 }
@@ -343,12 +384,27 @@ function render(data) {
   const focused = document.activeElement && document.activeElement.dataset
     ? document.activeElement.dataset.noteInput : undefined;
   const caret = focused !== undefined ? document.activeElement.selectionStart : null;
-  TurmaNav.preserveScroll($briefs, () => { $briefs.innerHTML = html; });
+  TurmaNav.preserveScroll($briefs, () => { $briefs.innerHTML = html; fitNarratives(); });
   if (focused !== undefined) {
     const el = [...$briefs.querySelectorAll("[data-note-input]")].find((x) => x.dataset.noteInput === focused);
     if (el) { el.focus(); if (caret != null) el.setSelectionRange(caret, caret); }
   }
 }
+
+// Show a summary's toggle only when the text overflows the clamp: measured with
+// the clamp ON (even for an expanded one), so a summary that fits gets none.
+function fitNarratives() {
+  for (const p of $briefs.querySelectorAll("[data-narrative]")) {
+    const btn = p.nextElementSibling;
+    if (!btn || btn.dataset.narrativeToggle === undefined) continue;
+    const open = !p.classList.contains("clamped");
+    p.classList.add("clamped");
+    const over = p.scrollHeight > p.clientHeight + 1;
+    if (open) p.classList.remove("clamped");
+    btn.hidden = !over;
+  }
+}
+window.addEventListener("resize", () => fitNarratives());
 
 // A fetch MERGES, never replaces (XERK-444): a `briefs` SSE frame that lands while
 // /api/agents is in flight is newer than the body, so `briefsClock` stamps every
@@ -391,6 +447,12 @@ async function briefNow(site) {
 $briefs.addEventListener("click", (e) => {
   const btn = e.target.closest("[data-brief-now]");
   if (btn && !btn.disabled) briefNow(btn.dataset.briefNow);
+  const tog = e.target.closest("[data-narrative-toggle]");
+  if (tog) {
+    const site = tog.dataset.narrativeToggle;
+    if (narrativeOpen.has(site)) narrativeOpen.delete(site); else narrativeOpen.add(site);
+    if (cache) render(cache);
+  }
 });
 
 // Record a decision by hand (XERK-1574). The hub's refusal is toasted in its own

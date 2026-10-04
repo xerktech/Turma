@@ -23400,8 +23400,13 @@ test("XERK-1574: the narrative is whitelisted — plain, bounded, a coerce fixed
     ["**XERK-1** shipped.", "XERK-1 shipped."],
     ["The operator decided the following, after a long review of both options:\n- Postgres",
       "The operator decided the following, after a long review of both options: Postgres"],
-    ["#hashtag stays", "hashtag stays"],
+    ["#hashtag stays", "#hashtag stays"],
     ["**Only a heading**", ""],
+    // '#' is markup only as a line-leading heading mark.
+    ["CI is red on PR #215.", "CI is red on PR #215."],
+    ["Fixed issue #3 and issue #4.", "Fixed issue #3 and issue #4."],
+    ["# Heading\nCI on PR #215.", "CI on PR #215."],
+    ["- ## x\n`#` y", "x y"],
   ]) {
     assert.equal(C(input), want, JSON.stringify(input));
     assert.equal(C(C(input)), C(input), `a fixed point: ${JSON.stringify(input)}`);

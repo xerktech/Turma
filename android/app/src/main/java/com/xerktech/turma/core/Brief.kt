@@ -168,18 +168,53 @@ const val BRIEF_DECISION_LABEL_MAX = 60
  */
 fun briefDecisionTotal(served: Int, count: Int?): Int = maxOf(served, count ?: 0)
 
-/** A decision's kind as the brief words it — web brief.html `DECISION_KIND`. */
-val BRIEF_DECISION_KIND = mapOf("question" to "answered", "permission" to "permission", "note" to "note")
+/** A decision's kind as the brief words it, a noun — web brief.html `DECISION_KIND`. */
+val BRIEF_DECISION_KIND = mapOf("question" to "question", "permission" to "permission", "note" to "note")
 
 /**
- * The org's decisions log (XERK-1574) as (title, meta) lines, newest first, the
- * newest [BRIEF_DECISIONS_SHOWN] only — web brief.html `decisionsHtml`: a note's
- * text, or "<question> → <answer>"; then its kind, ticket, session name (clipped
- * to [BRIEF_DECISION_LABEL_MAX] characters), age and host.
+ * How many lines the brief's summary shows until "Show more" — web brief.html's
+ * `.brief-narrative p.clamped` line clamp. A summary that fits gets no toggle.
  */
-fun briefDecisionLines(decisions: List<OrgDecision>, now: Long): List<Pair<String, String>> =
+const val BRIEF_NARRATIVE_LINES = 4
+
+/** The hub's typed-answer markers (server.js `questionAnswerText`) — web brief.html `TYPED_*`. */
+const val BRIEF_TYPED_SUFFIX = ", plus a typed answer"
+const val BRIEF_TYPED_ALONE = "(a typed answer)"
+
+/**
+ * One decisions-log row as the Brief screen lays it out — web brief.html
+ * `decisionsHtml`'s `item`.
+ */
+data class BriefDecisionRow(
+    /** A note's text, or the question asked (then " → " and the answer). */
+    val title: String,
+    /** The chosen option(s), shown bold; null for a note or a typed answer alone. */
+    val answer: String?,
+    /** The typed-answer marker, shown muted after [answer] — never bold as if chosen. */
+    val typed: String?,
+    /** The meta pieces — kind, ticket, session name, age, host — each kept whole. */
+    val meta: List<String>,
+)
+
+/**
+ * An answer split into the chosen option(s) and the typed-answer marker — web
+ * brief.html `answerHtml`: the marker is not a choice, so it is shown muted.
+ */
+fun briefDecisionAnswer(answer: String): Pair<String?, String?> = when {
+    answer == BRIEF_TYPED_ALONE -> null to answer
+    answer.endsWith(BRIEF_TYPED_SUFFIX) && answer.length > BRIEF_TYPED_SUFFIX.length ->
+        answer.dropLast(BRIEF_TYPED_SUFFIX.length) to BRIEF_TYPED_SUFFIX
+    else -> answer to null
+}
+
+/**
+ * The org's decisions log (XERK-1574) as rows, newest first, the newest
+ * [BRIEF_DECISIONS_SHOWN] only — web brief.html `decisionsHtml`: a note's text, or
+ * the question with its answer; then its kind, ticket, session name (clipped to
+ * [BRIEF_DECISION_LABEL_MAX] characters), age and host.
+ */
+fun briefDecisionLines(decisions: List<OrgDecision>, now: Long): List<BriefDecisionRow> =
     decisions.takeLast(BRIEF_DECISIONS_SHOWN).asReversed().map { d ->
-        val title = if (d.source == "note") d.text.orEmpty() else "${d.question.orEmpty()} → ${d.answer.orEmpty()}"
         val meta = mutableListOf(BRIEF_DECISION_KIND[d.source] ?: d.source)
         val ticket = d.ticket
         val host = d.host
@@ -196,5 +231,10 @@ fun briefDecisionLines(decisions: List<OrgDecision>, now: Long): List<Pair<Strin
         }
         if (d.at > 0L) meta += "${briefDur(now - d.at)} ago"
         if (host != null) meta += host
-        title to meta.joinToString(" · ")
+        if (d.source == "note") {
+            BriefDecisionRow(d.text.orEmpty(), null, null, meta)
+        } else {
+            val (chosen, typed) = briefDecisionAnswer(d.answer.orEmpty())
+            BriefDecisionRow(d.question.orEmpty(), chosen, typed, meta)
+        }
     }

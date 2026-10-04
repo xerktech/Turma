@@ -145,7 +145,7 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
 - **A restart can waste one Haiku run per org**: a `renderBrief` already in a host's persisted
   queue still runs, but `briefRenders` is gone, so its row is dropped. Accepted, not a leak.
 - **`sanitizeBrief` whitelists it**: `cleanBriefNarrative` (fences, tags, link syntax,
-  `* \` # ~ | < > [ ]`, list bullets and control/bidi chars stripped, whitespace collapsed, cut at
+  `* \` ~ | < > [ ]`, list bullets and control/bidi chars stripped, whitespace collapsed, cut at
   1200 on a word with "…"). A FIXED POINT, so a sanitized brief stays one (HA echo dedup). Empty =
   absent, never "". `narrativeAt` rides only with a narrative.
 - **Control/bidi chars and non-newline whitespace become spaces BEFORE the per-line bullet strip**
@@ -153,15 +153,21 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
   explicit ASCII classes, so the agent's `clean_brief_narrative` gives the same answer.
 - **A standalone heading line is DROPPED, never joined into the next sentence** ("Summary for acme
   Two pieces…"): a `#`-heading or an only-`*`-emphasis line (≤80, judged before the markup strip),
-  or a cleaned line ending `:` of ≤40. Still a fixed point: the output has no `#`/`*`, and a kept
-  `:` line is longer than 40. Lengths count code points (`[...t]`) to match Python's `len` —
+  or a cleaned line ending `:` of ≤40. Still a fixed point: the output has no `*`, never STARTS
+  with a heading mark, and a kept `:` line is longer than 40. Lengths count code points (`[...t]`) to match Python's `len` —
   the 20000 prefix and the 1200 cut too, so both sides cut an emoji-heavy text at one place.
   A bold phrase inside a sentence is kept. Shared vectors in both test files — change them together.
+- **`#` is markup ONLY as a line-leading heading mark** — stripped there with the bullets
+  (`#{1,6}` + space), kept anywhere else, so "PR #215" / "issue #3" survive and the summary names
+  the PR the Waiting row does.
 - **Strictly additive**: no capable host, a failed render, or an older agent = the brief stands as
   v1. `briefWire` strips it from earlier briefs (headline-only). The push does not carry it (it
   lands after the push fires).
 - **Both clients show it ABOVE the sections, labelled "Summary · written by a model from the
   sections below"** (web `narrativeHtml`, Android `BriefBody`).
+- **Clamped to 4 lines with Show more / Show less** (web line-clamp + `fitNarratives`, Kotlin
+  `BRIEF_NARRATIVE_LINES`) — a ~1200-char paragraph otherwise pushes the counts and Needs you below
+  a phone's fold. The toggle shows ONLY when the text overflows the clamp. Web caps it at 70ch.
 
 ## v2: the decisions log (XERK-1574)
 
@@ -205,5 +211,11 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
     card. Test: the "own card AFTER the brief's" case in `brief-page.test.js`.
   - A row's meta names its session (`label`, clipped to 60 chars) — the only tie back for an
     answer with no ticket. Web `DECISION_LABEL_MAX` = Kotlin `BRIEF_DECISION_LABEL_MAX`.
+  - **Each meta piece is unbreakable** (web `.bit`, Android a `FlowRow` of one-line `Text`s): the
+    line wraps only between pieces, and a piece wider than the row ends in "…".
+  - **The typed-answer marker is not a choice**: `answerHtml` / `briefDecisionAnswer` split off
+    `, plus a typed answer` (or a lone `(a typed answer)`) and show it muted, never bold.
+  - A row's kind is a noun — `question` / `permission` / `note` (`DECISION_KIND` = Kotlin
+    `BRIEF_DECISION_KIND`).
 - Tests: the `XERK-1574:` cases in `server.test.js`, `brief-page.test.js`, android `BriefTest`,
   `AgentDecodeTest`.

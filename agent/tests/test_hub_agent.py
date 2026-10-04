@@ -39762,8 +39762,13 @@ class TestRenderBrief(ManagerMixin, unittest.TestCase):
             ("**XERK-1** shipped.", "XERK-1 shipped."),
             ("The operator decided the following, after a long review of both options:\n- Postgres",
              "The operator decided the following, after a long review of both options: Postgres"),
-            ("#hashtag stays", "hashtag stays"),
+            ("#hashtag stays", "#hashtag stays"),
             ("**Only a heading**", ""),
+            # '#' is markup only as a line-leading heading mark.
+            ("CI is red on PR #215.", "CI is red on PR #215."),
+            ("Fixed issue #3 and issue #4.", "Fixed issue #3 and issue #4."),
+            ("# Heading\nCI on PR #215.", "CI on PR #215."),
+            ("- ## x\n`#` y", "x y"),
         ):
             self.assertEqual(C(raw), want, repr(raw))
             self.assertEqual(C(C(raw)), C(raw), f"a fixed point: {raw!r}")

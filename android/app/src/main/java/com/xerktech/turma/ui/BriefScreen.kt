@@ -16,16 +16,24 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalUriHandler
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.core.BRIEF_NARRATIVE_LINES
 import com.xerktech.turma.core.BRIEF_SECTIONS
+import com.xerktech.turma.core.BriefDecisionRow
 import com.xerktech.turma.core.briefDur
 import com.xerktech.turma.core.briefItemMeta
 import com.xerktech.turma.core.briefLiveOrgs
@@ -191,17 +199,60 @@ private fun OrgDecisionsCard(site: String, decisions: List<OrgDecision>, count: 
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                 modifier = Modifier.padding(bottom = 4.dp),
             )
-            for ((title, meta) in lines) {
+            for (row in lines) {
                 Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
-                    Text(title, style = MaterialTheme.typography.bodyMedium)
-                    Text(meta, style = MaterialTheme.typography.bodySmall,
-                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    BriefDecisionTitle(row)
+                    BriefDecisionMeta(row.meta)
                 }
             }
             if (total > lines.size) {
                 Text("+${total - lines.size} earlier", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+        }
+    }
+}
+
+/**
+ * A decision's title — web `decisionsHtml`/`answerHtml`: the question, then the
+ * chosen option(s) bold and a typed-answer marker muted (it is not a choice).
+ */
+@Composable
+private fun BriefDecisionTitle(row: BriefDecisionRow) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val small = MaterialTheme.typography.bodySmall.fontSize
+    val text = remember(row, muted, small) {
+        buildAnnotatedString {
+            append(row.title)
+            val chosen = row.answer
+            val typed = row.typed
+            if (chosen != null || typed != null) {
+                append(" → ")
+                if (chosen != null) withStyle(SpanStyle(fontWeight = FontWeight.SemiBold)) { append(chosen) }
+                if (typed != null) withStyle(SpanStyle(color = muted, fontSize = small)) { append(typed) }
+            }
+        }
+    }
+    Text(text, style = MaterialTheme.typography.bodyMedium)
+}
+
+/**
+ * A decision's meta line — web `.brief-decision .brief-meta .bit`: each piece (kind,
+ * ticket, session name, age, host) stays whole on one line, the row wraps only
+ * between pieces, and a piece wider than the row ends in "…".
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun BriefDecisionMeta(pieces: List<String>) {
+    FlowRow(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
+        pieces.forEachIndexed { i, piece ->
+            Text(
+                if (i == 0) piece else "· $piece",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
         }
     }
 }
@@ -217,17 +268,35 @@ private fun BriefBody(
 ) {
     Column {
         // The model-written summary (XERK-1574), labelled as such, above the
-        // sections it was written from — web `narrativeHtml`.
+        // sections it was written from — web `narrativeHtml`. Clamped to
+        // BRIEF_NARRATIVE_LINES so the counts and Needs you stay in view; the
+        // toggle shows only when the text overflows the clamp.
         val narrative = brief.narrative
         if (!narrative.isNullOrBlank()) {
+            var expanded by remember(narrative) { mutableStateOf(false) }
+            var clipped by remember(narrative) { mutableStateOf(false) }
             Column(Modifier.fillMaxWidth().padding(top = 10.dp)) {
                 Text(
                     "SUMMARY · WRITTEN BY A MODEL FROM THE SECTIONS BELOW",
                     style = MaterialTheme.typography.labelSmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
-                Text(narrative, style = MaterialTheme.typography.bodyMedium,
-                    modifier = Modifier.padding(top = 2.dp))
+                Text(
+                    narrative,
+                    style = MaterialTheme.typography.bodyMedium,
+                    maxLines = if (expanded) Int.MAX_VALUE else BRIEF_NARRATIVE_LINES,
+                    overflow = TextOverflow.Ellipsis,
+                    onTextLayout = { layout -> if (!expanded) clipped = layout.hasVisualOverflow },
+                    modifier = Modifier.padding(top = 2.dp),
+                )
+                if (clipped) {
+                    Text(
+                        if (expanded) "Show less" else "Show more",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.primary,
+                        modifier = Modifier.clickable { expanded = !expanded }.padding(top = 4.dp),
+                    )
+                }
             }
         }
         FlowRow(

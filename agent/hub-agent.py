@@ -11845,7 +11845,9 @@ BRIEF_RENDER_INSTRUCTION = (
 _BRIEF_CTRL_RE = re.compile(
     "[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
 _BRIEF_SPACE_RE = re.compile(r"[^\S\n]")
-_BRIEF_BULLET_RE = re.compile(r"^ *(?:(?:[-+]|[0-9]+[.)])(?: +|$))+")
+# A leading bullet or heading mark ("- ", "1. ", "## "): '#' is markup ONLY
+# there, so "PR #215" and "issue #3" keep theirs (the hub's cleaner agrees).
+_BRIEF_BULLET_RE = re.compile(r"^ *(?:(?:[-+]|[0-9]+[.)]|#{1,6})(?: +|$))+")
 _BRIEF_HEADING_RE = re.compile(r"#{1,6}(?: |$)")
 _BRIEF_EMPHASIS_RE = re.compile(r"\*{1,3}[^*]+\*{1,3}:?")
 
@@ -11860,7 +11862,7 @@ def _brief_heading_line(line):
 
 
 def _brief_clean_line(line):
-    line = re.sub(r"[*`#~|<>\[\]]", "", line)
+    line = re.sub(r"[*`~|<>\[\]]", "", line)
     line = _BRIEF_BULLET_RE.sub("", line)
     return re.sub(" +", " ", line).strip(" ")
 
@@ -11870,7 +11872,8 @@ def clean_brief_narrative(text):
     characters, or "" — the same cleaning the hub's whitelist
     (cleanBriefNarrative in server.js) applies, so a reply the agent ships is
     one the hub keeps as-is: code fences, tags, link syntax, emphasis/heading/
-    table characters and list bullets go; control and bidi characters become
+    table characters, list bullets and a line-leading heading mark go (a '#'
+    mid-sentence, "PR #215", stays); control and bidi characters become
     spaces; a standalone heading line (#-heading, an emphasis-only line, or a
     short line ending ":") is dropped rather than run into the next sentence;
     whitespace collapses; an over-long text is cut on a word with "…"."""
