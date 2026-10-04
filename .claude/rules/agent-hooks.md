@@ -425,6 +425,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     kubectl/helm/argocd mutators — matched on head + subcommand AFTER this file's own unwrapping
     (`_expand_both`), and on anything shlex cannot parse. Never a list of flag spellings: each
     review round found one more. Families + tests: `agent-permissions.md`.
+  - **Only plain commands reach the model** (`_judge_plain_reason`, in front of the families): a
+    deny list cannot cover what bash can spell (`/usr/bin/g[i]t`, `hash -p`, `ln -s`, `gh pr
+    merg*`, a flag between noun and verb). A command the strict lexer cannot fully read stands
+    before any model call — rules + tests in `agent-permissions.md`.
   - **A family stands however its words ARRIVE or are SPELLED**: fed from stdin/a file (`… | xargs
     git`, `xargs -a f gh`, any `parallel`) — `_expand_both` leaves only a bare `git` there — and an
     HTTP host a client would rewrite (percent-encoded, IDN dots, full-width, a curl glob) or route

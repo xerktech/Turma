@@ -12045,6 +12045,337 @@ def _judge_family_reason(guard, tokens):
     return None
 
 
+# --- layer 0: only PLAIN commands reach the model ----------------------------
+# A deny list in front of the model cannot be complete against what bash can
+# express: a globbed program name (`/usr/bin/g[i]t`), `hash -p`, an `ln -s`
+# alias, flags between a noun and its verb, a globbed verb (`merg*`). So the
+# judge only ever SEES a command a strict parser fully understands; anything
+# else stands (a human decides) before any model call. Judgeable only when:
+#   (a) it lexes into simple commands joined by `;`, `&&`, `||`, `|` or a
+#       newline — no subshell, group, function, `&` job, process substitution,
+#       here-string, `$` expansion of any kind, or backtick; a heredoc only
+#       with a body that expands nothing;
+#   (b) every program word is a plain name or path (basename
+#       `[A-Za-z0-9._+-]+`, nothing quoted, escaped or globbed) that is not a
+#       shell, interpreter, runner or feeder, and not a name an earlier word
+#       of the same command wrote or touched;
+#   (c) no unquoted word holds `* ? [ ] { }` or a `~user`/`~+`/`~-`;
+#   (d) after unquoting, no word (or `=`/`,`/`:` part of one, dashes off)
+#       anywhere is a never-list verb or noun, case-insensitively, and none
+#       names a GitHub host outside a `git` command; `run`/`install` stand
+#       beside a family program (`gh … workflow … run`, `helm install`).
+# The family checks (`_judge_family_reason`) and the raw net stay as layers.
+_JUDGE_NEVER_WORDS = frozenset((
+    "push", "merge", "delete", "rebase", "reset", "apply", "destroy", "import", "sync",
+    "patch", "replace", "scale", "rollout", "upgrade", "uninstall", "graphql",
+    "update-ref", "symbolic-ref", "mirror", "force", "send-pack", "http-push",
+    "force-unlock", "taint", "untaint"))
+# `run` is a never-list word for `gh`/`glab` only next to a workflow/pipeline
+# noun (`gh run view` is a read); beside any other family program, always.
+_JUDGE_RUN_NOUNS = frozenset(("workflow", "ci", "pipeline", "schedule", "trigger"))
+_JUDGE_GH_LIKE = frozenset(("gh", "glab", "hub"))
+_JUDGE_PLAIN_PROG_RE = re.compile(r"(?:[A-Za-z0-9._+-]*/)*[A-Za-z0-9._+-]+\Z")
+_JUDGE_ASSIGN_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*)\+?=")
+# A variable that changes which program a name finds, or what a program runs
+# on its own (a git/gh config, an editor, a startup file): standing, since the
+# words after it no longer say what will run.
+_JUDGE_ASSIGN_DENY_RE = re.compile(
+    r"PATH|^(?:LD_|DYLD_|BASH|GIT|GH_|GLAB|GITHUB|KUBE|HELM|TF_|ARGOCD|SSH|XDG_|HIST)|"
+    r"^(?:ENV|IFS|PS4|HOME|SHELL|SHELLOPTS|PROMPT_COMMAND|EDITOR|VISUAL|PAGER|BROWSER|"
+    r"NODE_OPTIONS|PYTHONSTARTUP|PYTHONHOME|PERL5OPT|PERL5LIB|RUBYOPT|GLOBIGNORE)$|"
+    r"_(?:COMMAND|EDITOR|PAGER|OPTIONS|CONFIG)$", re.IGNORECASE)
+# Program words that run, define, rename or reconfigure another program —
+# never judgeable, whatever follows them.
+_JUDGE_PLAIN_RUNNERS = (_JUDGE_RUNNERS - {"find"}) | frozenset((
+    ".", "hash", "alias", "unalias", "ln", "link", "export", "declare", "typeset",
+    "readonly", "local", "set", "shopt", "enable", "trap", "fc", "unset", "let", "mapfile",
+    "readarray", "npx", "bunx", "pnpx", "uvx", "pipx", "strace", "ltrace", "gdb",
+    "valgrind", "chroot", "unshare", "nsenter", "flock", "firejail", "systemd-run",
+    "runuser", "pkexec", "setpriv", "tmux", "screen", "at", "batch", "crontab", "socat",
+    "vi", "vim", "nvim", "ex", "ed", "emacs", "if", "then", "else", "elif", "fi", "for",
+    "while", "until", "do", "done", "case", "esac", "select", "function", "coproc",
+    "sem", "rush"))
+# Programs that copy or write files: they stand when they touch a bin
+# directory or name a family program / runner (a renamed `git` is a `git`).
+_JUDGE_COPIERS = frozenset(("cp", "mv", "rsync", "install", "tee", "dd", "chmod", "chown",
+                            "ginstall", "gcp", "gmv"))
+_JUDGE_BIN_DIRS = frozenset(("bin", "sbin", ".bin", "libexec"))
+_JUDGE_GLOB_CHARS = frozenset("*?[]{}")
+_JUDGE_LEX_STOP = frozenset(" \t\n;&|<>()")
+
+
+class _JudgeUnplain(Exception):
+    """A command the strict lexer does not fully understand."""
+
+
+def _judge_lex_word(s, i):
+    """One word from `s[i:]`: `(word, next_i)`. `word` is a dict — `raw`
+    text, unquoted `value`, `quoted` (any quote or escape), `glob` (an
+    unquoted glob/brace character), `tilde` (an unquoted `~user`-style
+    prefix). Raises `_JudgeUnplain` on any expansion or unterminated quote."""
+    start, n = i, len(s)
+    value, quoted, glob, tilde = [], False, False, False
+    while i < n and s[i] not in _JUDGE_LEX_STOP:
+        c = s[i]
+        if c == "'":
+            j = s.find("'", i + 1)
+            if j < 0:
+                raise _JudgeUnplain("an unterminated quote")
+            value.append(s[i + 1:j])
+            quoted, i = True, j + 1
+        elif c == '"':
+            i += 1
+            while True:
+                if i >= n:
+                    raise _JudgeUnplain("an unterminated quote")
+                d = s[i]
+                if d == '"':
+                    i += 1
+                    break
+                if d in "$`":
+                    raise _JudgeUnplain("an expansion")
+                if d == "\\" and i + 1 < n and s[i + 1] in '$`"\\\n':
+                    if s[i + 1] != "\n":
+                        value.append(s[i + 1])
+                    i += 2
+                    continue
+                value.append(d)
+                i += 1
+            quoted = True
+        elif c == "\\":
+            if i + 1 >= n:
+                raise _JudgeUnplain("a trailing escape")
+            if s[i + 1] != "\n":
+                value.append(s[i + 1])
+            quoted, i = True, i + 2
+        elif c in "$`":
+            raise _JudgeUnplain("an expansion")
+        else:
+            if c in _JUDGE_GLOB_CHARS:
+                glob = True
+            elif c == "~":
+                prev = s[i - 1] if i > start else ""
+                nxt = s[i + 1] if i + 1 < n else ""
+                if (i == start or prev in "=:") and nxt not in ("", "/", ":") \
+                        and nxt not in _JUDGE_LEX_STOP:
+                    tilde = True
+            value.append(c)
+            i += 1
+    return {"raw": s[start:i], "value": "".join(value), "quoted": quoted,
+            "glob": glob, "tilde": tilde}, i
+
+
+def _judge_lex(command):
+    """`command` as a list of simple commands, each `{words, targets, data}`
+    (program and argument words, redirection targets, heredoc body words), or
+    `_JudgeUnplain` for anything outside the plain grammar."""
+    s, n, i = command, len(command), 0
+    cmds = [{"words": [], "targets": [], "data": []}]
+    heredocs = []                       # (delimiter, quoted, strip_tabs, cmd)
+    need_cmd = False                    # after `&&`, `||`, `|`
+
+    def cur():
+        return cmds[-1]
+
+    def empty(c):
+        return not (c["words"] or c["targets"] or c["data"])
+
+    def separate(op):
+        # `;`, `&&`, `||`, `|` — each needs a command before it.
+        nonlocal need_cmd
+        if empty(cur()):
+            raise _JudgeUnplain("an empty command")
+        cmds.append({"words": [], "targets": [], "data": []})
+        need_cmd = op != ";"
+
+    def target(i):
+        while i < n and s[i] in " \t":
+            i += 1
+        if i >= n or s[i] in _JUDGE_LEX_STOP:
+            raise _JudgeUnplain("a redirection with no target")
+        w, i = _judge_lex_word(s, i)
+        cur()["targets"].append(w)
+        return i
+
+    def bodies(i):
+        # `i` is just past a newline: each pending heredoc's body, in order.
+        for delim, dq, strip, cmd in heredocs:
+            while True:
+                if i >= n:
+                    raise _JudgeUnplain("an unterminated heredoc")
+                j = s.find("\n", i)
+                line = s[i:] if j < 0 else s[i:j]
+                i = n if j < 0 else j + 1
+                if (line.lstrip("\t") if strip else line) == delim:
+                    break
+                if not dq and re.search(r"[$`\\]", line):
+                    raise _JudgeUnplain("a heredoc body that expands")
+                cmd["data"].extend(line.split())
+        heredocs.clear()
+        return i
+
+    while i < n:
+        c = s[i]
+        if c in " \t":
+            i += 1
+        elif c == "\\" and s[i + 1:i + 2] == "\n":
+            i += 2
+        elif c == "\n":
+            i += 1
+            if heredocs:
+                i = bodies(i)
+            if not empty(cur()):        # `a &&\n b`: the newline continues it
+                cmds.append({"words": [], "targets": [], "data": []})
+                need_cmd = False
+        elif c == "#":
+            j = s.find("\n", i)
+            i = n if j < 0 else j
+        elif c == ";":
+            if s[i + 1:i + 2] in (";", "&"):
+                raise _JudgeUnplain("a case clause")
+            separate(";")
+            i += 1
+        elif c == "&":
+            if s[i + 1:i + 2] == "&":
+                separate("&&")
+                i += 2
+            elif s[i + 1:i + 2] == ">":
+                i += 3 if s[i + 2:i + 3] == ">" else 2
+                i = target(i)
+            else:
+                raise _JudgeUnplain("a background job")
+        elif c == "|":
+            if s[i + 1:i + 2] == "|":
+                separate("||")
+                i += 2
+            elif s[i + 1:i + 2] == "&":
+                raise _JudgeUnplain("a |& pipe")
+            else:
+                separate("|")
+                i += 1
+        elif c in "<>":
+            two, three = s[i:i + 2], s[i:i + 3]
+            if three == "<<<":
+                raise _JudgeUnplain("a here-string")
+            if s[i + 1:i + 2] == "(":
+                raise _JudgeUnplain("a process substitution")
+            if two == "<<":
+                i += 2
+                strip = s[i:i + 1] == "-"
+                i += 1 if strip else 0
+                while i < n and s[i] in " \t":
+                    i += 1
+                if i >= n or s[i] in _JUDGE_LEX_STOP:
+                    raise _JudgeUnplain("a heredoc with no delimiter")
+                w, i = _judge_lex_word(s, i)
+                if not w["value"] or w["glob"]:
+                    raise _JudgeUnplain("a heredoc delimiter the judge cannot read")
+                heredocs.append((w["value"], w["quoted"], strip, cur()))
+                continue
+            i += 2 if two in (">>", ">&", "<&", ">|", "<>") else 1
+            i = target(i)
+        elif c in "()":
+            raise _JudgeUnplain("a subshell, group or function")
+        else:
+            w, j = _judge_lex_word(s, i)
+            if j < n and s[j] in "<>" and w["raw"].isdigit():
+                i = j                    # `2>` — a file descriptor, not a word
+                continue
+            cur()["words"].append(w)
+            i = j
+    if heredocs:
+        raise _JudgeUnplain("an unterminated heredoc")
+    if need_cmd and empty(cur()):
+        raise _JudgeUnplain("a command that ends in an operator")
+    return [c for c in cmds if not empty(c)]
+
+
+def _judge_basename(value):
+    return _judge_prog(value.rstrip("/") or value)
+
+
+def _judge_word_reason(value, family, prog):
+    """Why one unquoted word value stands under rule (d), or None."""
+    folded = _judge_fold(value)
+    if "github.com" in folded and prog != "git":
+        return "a GitHub host"
+    for text in {value, folded}:
+        for part in re.split(r"[=,:]", text):
+            word = part.lstrip("-+").lower()
+            if word in _JUDGE_NEVER_WORDS:
+                return f"the never-list word {word!r}"
+            if word == "install" and "helm" in family:
+                return "a helm install"
+            others = family - _JUDGE_GH_LIKE - {"git"}
+            if word == "run" and others:
+                return f"a {sorted(others)[0]} run"
+    return None
+
+
+def _judge_plain_reason(command):
+    """Why `command` is NOT a plain command the model may judge, or None.
+    Fails closed: anything the lexer cannot fully read stands."""
+    try:
+        cmds = _judge_lex(command)
+    except _JudgeUnplain as e:
+        return f"not a plain command: {e}"
+    if not cmds:
+        return "not a plain command: nothing to run"
+    seen = set()                        # basenames earlier words named
+    for cmd in cmds:
+        words = cmd["words"]
+        k = 0
+        while k < len(words) and not words[k]["quoted"] \
+                and _JUDGE_ASSIGN_RE.match(words[k]["raw"]):
+            name = _JUDGE_ASSIGN_RE.match(words[k]["raw"]).group(1)
+            if _JUDGE_ASSIGN_DENY_RE.search(name):
+                return f"not a plain command: it sets {name}"
+            k += 1
+        prog_w = words[k] if k < len(words) else None
+        prog = ""
+        if prog_w is not None:
+            raw = prog_w["raw"]
+            if prog_w["quoted"] or prog_w["glob"] or prog_w["tilde"] \
+                    or not _JUDGE_PLAIN_PROG_RE.match(raw):
+                return "not a plain command: a program name the judge cannot read"
+            prog = _judge_prog(raw)
+            if prog in _JUDGE_PLAIN_RUNNERS or _JUDGE_INTERP_RE.match(prog) \
+                    or prog in ("", ".."):
+                return f"not a plain command: {prog or raw} runs another program"
+            if prog in seen:
+                return "not a plain command: it runs a program an earlier word named"
+        args = words[k + 1:] if prog_w is not None else []
+        if prog in ("find", "fd", "fdfind") and any(
+                w["value"] in ("-exec", "-execdir", "-ok", "-okdir", "-x", "-X", "--exec",
+                               "--exec-batch") or w["value"].startswith(("--exec=", "--exec-batch="))
+                for w in args):
+            return f"not a plain command: {prog} runs another program"
+        everything = words + cmd["targets"]
+        for w in everything:
+            if w["glob"] or w["tilde"]:
+                return "not a plain command: a glob, brace or ~user word"
+        family = {_judge_basename(w["value"]) for w in words} & _JUDGE_FAMILY_PROGS
+        if family & _JUDGE_GH_LIKE and any(
+                w["value"].lower() in _JUDGE_RUN_NOUNS for w in words) and any(
+                w["value"].lower() == "run" for w in words):
+            return "not a plain command: a gh/glab workflow run"
+        for w in everything + [{"value": d} for d in cmd["data"]]:
+            reason = _judge_word_reason(w["value"], family, prog)
+            if reason:
+                return f"not a plain command: {reason}"
+        if prog in _JUDGE_COPIERS or cmd["targets"]:
+            for w in (args if prog in _JUDGE_COPIERS else []) + cmd["targets"]:
+                parts = w["value"].lower().split("/")
+                base = _judge_basename(w["value"])
+                if _JUDGE_BIN_DIRS & set(parts[:-1]) or (
+                        prog in _JUDGE_COPIERS and (base in _JUDGE_FAMILY_PROGS
+                                                    or base in _JUDGE_PLAIN_RUNNERS)):
+                    return "not a plain command: it writes a program or a bin directory"
+        seen |= {_judge_basename(w["value"]) for w in args + cmd["targets"]}
+        seen |= {_judge_basename(w["raw"].split("=", 1)[1]) for w in words[:k]}
+    return None
+
+
 _GUARD_MODULE = None
 
 
@@ -12076,7 +12407,9 @@ def judge_grant_key(command):
 def judge_never_reason(command):
     """Why `command` is never auto-approved, or None. The deterministic half of
     the judge: runs BEFORE any model call, and FAILS CLOSED — a raw mention of
-    a never-list family, any unwrapped command in one (`_judge_family_reason`),
+    a never-list family, anything that is not a plain command
+    (`_judge_plain_reason`: only plain commands reach the model), any
+    unwrapped command in a family (`_judge_family_reason`),
     a segment shlex cannot parse, a nesting too deep to read, a guard that
     cannot load or classify: each is a reason, since a model must never be
     asked about a command the guard could not vet."""
@@ -12086,6 +12419,9 @@ def judge_never_reason(command):
     for pattern, label in _JUDGE_NEVER:
         if any(pattern.search(t) for t in texts):
             return label
+    plain = _judge_plain_reason(command)
+    if plain:
+        return plain
     guard = _guard_module()
     if guard is None:
         return "the safety guard is unavailable"

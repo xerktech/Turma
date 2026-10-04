@@ -147,7 +147,7 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
     filename). So model calls are capped per sid (`JUDGE_CALLS_PER_SID_MIN` a rolling minute;
     past it a request stands). An allow then grants the named session one exact command the model
     approved under its policy — the same-uid residual in `agent-hooks.md`, not a new one.
-- **Order**: `judge_never_reason` FIRST (the never-list below) → `stand`, no model call. Else,
+- **Order**: `judge_never_reason` FIRST (plain gate + never-list below) → `stand`, no model call. Else,
   with a policy, `claude -p --model haiku --tools "" --strict-mcp-config` (list argv, cwd
   `REGISTRY_DIR`, no `--settings`, stdin DEVNULL, `JUDGE_TIMEOUT_SEC` 20s, at most
   `JUDGE_ATTEMPTS`) over `JUDGE_INSTRUCTION` + the policy + the request JSON-encoded as untrusted
@@ -156,6 +156,27 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
   to win an approval) and no guard runs in that process, so an injected instruction must have
   nothing to call (verified: the init event lists `tools: []`, `mcp_servers: []`). `--tools` is
   variadic: the boolean `--strict-mcp-config` must sit between it and the prompt.
+- **Only plain commands reach the model** (coordinator decision 2, 2026-10-04): a deny list in
+  front of the model can never be complete against bash (globbed program names `/usr/bin/g[i]t`,
+  `hash -p`, `ln -s` aliases, flags between a noun and its verb, globbed verbs `merg*`). So
+  `_judge_plain_reason` (`_judge_lex`, a strict lexer) runs first and STANDS anything not plain:
+  - (a) only simple commands joined by `;` `&&` `||` `|` or a newline — no subshell, group,
+    function, `&` job, `|&`, process substitution, here-string, any `$` (in a word or a double
+    quote), backtick, or a heredoc body that expands (a quoted-delimiter body is data);
+  - (b) each program word plain (basename `[A-Za-z0-9._+-]+`, unquoted, unescaped, unglobbed),
+    not a shell/interpreter/runner/feeder/keyword (`_JUDGE_PLAIN_RUNNERS`: env, sudo, xargs,
+    `find -exec`, hash, alias, ln, npx, nohup, timeout, watch…), not a name an earlier word of the
+    same command named (written then run); no `PATH`/`GIT_*`/`*_COMMAND`-style assignment; no
+    cp/mv/tee/chmod/redirect into a bin dir or naming a family program;
+  - (c) no unquoted `* ? [ ] { }` and no `~user`/`~+`/`~-` anywhere;
+  - (d) no word (or `=`/`,`/`:` part, leading dashes off, case-folded) in `_JUDGE_NEVER_WORDS`
+    (push, merge, delete, rebase, reset, apply, destroy, import, sync, patch, replace, scale,
+    rollout, upgrade, uninstall, graphql, update-ref, symbolic-ref, mirror, force…), no GitHub
+    host outside a `git` command, `install` beside helm, `run` beside a non-gh family program or a
+    gh/glab workflow/ci noun — so (e) no family program ever reaches the model with one.
+  - Pinned: `PLAIN_GATE_PROBES` + `JUDGEABLE` (`test_only_plain_commands_reach_the_model`; npm ci,
+    pytest -q, docker build, cargo test pass). Residual: a script's contents (`npm test`, `./x`
+    written by an EARLIER call) are not on the command line; the model sees only its name.
 - **The never-list FAILS CLOSED by command FAMILY, never by flag spelling** (coordinator decision,
   2026-10-04: three review rounds each found one more spelling — `--mirr`, a quoted `'+feat'`, a
   glob refspec, REST `/merges`, GraphQL `mergePullRequest`, a curl to api.github.com). Stood whole:
@@ -192,13 +213,13 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
   - terraform/tofu apply/destroy/import/state-rm; mutating kubectl/oc (every namespace), helm,
     argocd; AWS/docker deletes, sudo, pipe-to-shell, Turma's/Claude's own state; the guard's
     own destructive/policy categories (`_guard_module`; one that cannot load stands everything).
-- **Two layers, either stands.** `_JUDGE_NEVER` matches the RAW text case-insensitively, so a
+- **Behind the plain gate, two more layers, either stands.** `_JUDGE_NEVER` matches the RAW text case-insensitively, so a
   MENTION stands (`python -c "os.system('git push')"`). `_judge_family_reason` reads head +
   subcommand of every command guard.py's `_expand_both` unwraps (bash -c, eval, xargs, env, sudo,
   subshells, `$( )`), lower-cased, `.exe` dropped. A segment shlex cannot parse, a too-deep nest,
   or a program/family word that is a `$VAR` or substitution also stands. Pin every family + the
   spellings found in `NEVER_FAMILIES` (`test_the_never_list_stands_before_any_model_call`), and
-  the family layer alone in `test_the_family_layer_stands_without_the_raw_text_layer`. Never
+  the family layer alone (gate + raw off) in `test_the_family_layer_stands_without_the_raw_text_layer`. Never
   narrow a family back to a list of dangerous flags.
 - **`parse_judge_verdict` is STRICT**: exactly one JSON object (one ``` fence tolerated) with
   exactly `verdict` (allow|stand) + non-empty `reason`. Anything else retries, then stands.
