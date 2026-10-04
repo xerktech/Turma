@@ -323,6 +323,11 @@ SESSION_REQUEST_SID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # One request file is a few hundred bytes; the CLI caps its own text fields.
 SESSION_REQUEST_MAX_BYTES = 16 * 1024
 WAKE_REASON_MAX_CHARS = 200
+# The furthest ahead a wake may be: session_cli.py's 7d WAKE_MAX_SEC plus an
+# hour of clock slack. A file written by hand (Bash) past it is no request, so a
+# session cannot hold its slot asleep — out of review, alerts and auto-merge —
+# longer than the CLI allows.
+WAKE_MAX_AHEAD_MS = (7 * 24 + 1) * 3600 * 1000
 # `close-ticket` (XERK-1569): the resolutions session_cli.py offers, the note's
 # bound (its CLOSE_NOTE_MAX), and how many times one request is tried against the
 # tracker — the first try plus ONE bounded retry, CLOSE_TICKET_RETRY_SEC later.
@@ -4169,6 +4174,25 @@ that is not in it is not yours to contact.
 """
 
 
+# The wake directive (XERK-1571): a session waiting out something with a known
+# duration asks the session CLI (XERK-1564) to re-prompt it, and ENDS its turn,
+# instead of parking on a `sleep` — which holds the pane and reads as a wait the
+# hub can only call stalled. {cli} is the ABSOLUTE CLI path, spelled exactly as
+# `session_cli_allow_rule` names it, so the call matches that allow rule and never
+# prompts (the "$TURMA_SESSION_CLI" spelling may not match a command-text rule).
+# That holds only for a SHELL-SAFE path: one that needs quoting (every Windows
+# path, a POSIX path with a space) would be taught quoted while the rule names it
+# raw, so `wake_directive` withholds the paragraph there rather than teach a call
+# that prompts on every wake.
+# Claude sessions only: dsh/qwen launches export neither TURMA_SESSION_ID nor
+# TURMA_SESSION_CLI yet, so the CLI would refuse there (agent-session-cli.md).
+WAKE_SYSTEM_PROMPT = """
+When the next step depends on something with a known duration, do not sleep in a
+shell: run `python3 -SsE {cli} wake <N>m <what to check>` and end the turn; Turma
+re-prompts you then.
+"""
+
+
 # A ticket summary is operator-written and unbounded; the roster is read whole by
 # every session that consults it, so one long cell is charged to all of them.
 PEER_CELL_MAX_CHARS = 120
@@ -4481,6 +4505,17 @@ def session_cli_allow_rule(cli_path=None):
     security flags) and the ABSOLUTE script path, so the rule admits only this
     script — an allow rule for `python3` alone would admit any code at all."""
     return f"Bash(python3 -SsE {cli_path or session_cli_path()}:*)"
+
+
+def wake_directive(cli_path=None):
+    """The wake paragraph of the session directive (XERK-1571), naming the CLI
+    exactly as the allow rule does (``session_cli_allow_rule``). Empty when the
+    path is not shell-safe: the taught command would carry it quoted, the rule
+    raw, and the two would never match (a session then just isn't taught)."""
+    cli = cli_path or session_cli_path()
+    if shlex.quote(cli) != cli:
+        return ""
+    return WAKE_SYSTEM_PROMPT.format(cli=cli)
 
 
 def qwen_ask_mcp_path():
@@ -12671,8 +12706,8 @@ def read_wake_request(session_id):
     The file is SESSION-WRITTEN (`session_cli.py wake`, or Bash), so it is read
     only through `_read_untrusted_json` — a FIFO or symlink planted at the name
     is refused, never opened on the heartbeat thread. `wakeAt` must be a positive
-    integer epoch-ms inside the hub's safe-integer range; anything else is no
-    request. The reason is flattened to one line and capped, since it is typed
+    integer epoch-ms inside the hub's safe-integer range and no further ahead
+    than the CLI's 7d cap (`WAKE_MAX_AHEAD_MS`); anything else is no request. The reason is flattened to one line and capped, since it is typed
     back into the session's pane."""
     folder = session_request_dir(session_id)
     if not folder:
@@ -12683,6 +12718,8 @@ def read_wake_request(session_id):
         return None
     at = data.get("wakeAt")
     if isinstance(at, bool) or not isinstance(at, int) or not 0 < at < 2 ** 53:
+        return None
+    if at > time.time() * 1000 + WAKE_MAX_AHEAD_MS:
         return None
     reason = data.get("reason")
     reason = (re.sub(r"\s+", " ", reason).strip()[:WAKE_REASON_MAX_CHARS]
@@ -20123,6 +20160,8 @@ class SessionManager:
         policy += PR_SUMMARY_SYSTEM_PROMPT
         policy += PEERS_SYSTEM_PROMPT.format(
             path=PEERS_FILE, sid=sess["id"], host=self.device)
+        if sess.get("agentType") not in ("dsh", "qwen"):
+            policy += wake_directive()
         return policy + addendum
 
     def _spawn_in_tmux(self, sess, cmd, what=""):

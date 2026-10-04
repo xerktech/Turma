@@ -46,6 +46,10 @@ export interface LiveSignals {
   // WAITING (a sleep / CI watch), absent or `work` is work. `startedAt`/`eta`
   // are epoch ms (eta only on a timed wait).
   agents?: { type: string; label: string; kind?: string; startedAt?: number; eta?: number }[];
+  // A session-CLI wake request (XERK-1564): epoch ms + why. A wakeAt still
+  // ahead is the session SLEEPING (XERK-1571). Absent = no wake pending.
+  wakeAt?: number;
+  wakeReason?: string;
   transcriptAgeSec: number | null;
   lastRole: string | null;
   lastHasToolUse: boolean;
@@ -101,6 +105,10 @@ export interface SessionInfo {
   newWorkSincePrs?: boolean | null;
   ticket?: { key?: string; siteKey?: string; url?: string; [key: string]: unknown } | null;
   queuedReason?: string | null;
+  // The hub-derived attention state (XERK-1571, server.js sessionAttention):
+  // `state` is needs-you:<why> | working | waiting | sleeping | idle, `since`
+  // the epoch ms it last changed. Absent from an older hub.
+  attention?: { state: string; since: number; eta?: number; why?: string } | null;
   [key: string]: unknown;
 }
 

@@ -289,11 +289,22 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
     // Waiting out a background shell (XERK-1570) — web `backgroundWaitLabel`:
     // "waiting · 12m left" / "waiting · Watch CI" / "waiting on 2 background shells".
     if (state == LiveState.HOLDING) {
+        // Asleep until a session-CLI wake (XERK-1571) — web "💤 sleeping until 14:05 ·
+        // <reason>": what it will check when it wakes, when the session said.
+        live?.wakeAt?.takeIf { it > now }?.let {
+            val why = live?.wakeReason?.trim().orEmpty()
+            return "💤 sleeping until ${com.xerktech.turma.core.clockTime(it, now)}" + if (why.isEmpty()) "" else " · $why"
+        }
         val waits = live?.agents.orEmpty().filter(::isWaitAgent)
         val eta = waits.mapNotNull { it.eta }.maxOrNull()
-        if (eta != null && eta > now) return "waiting · ${waitLeftText(eta - now)} left"
-        if (waits.size == 1 && waits[0].label.isNotBlank()) return "waiting · ${waits[0].label}"
-        return "waiting on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
+        // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
+        val what = if (waits.size == 1 && waits[0].label.isNotBlank()) " · ${waits[0].label}" else ""
+        if (eta != null && eta > now) return "⏳ waiting$what · ${waitLeftText(eta - now)} left"
+        // No ETA: how long it has waited, off the oldest row's startedAt (XERK-1571).
+        val started = waits.mapNotNull { it.startedAt }.filter { it <= now }.minOrNull()
+        val since = if (started == null) "" else " · ${waitLeftText(now - started)}"
+        if (what.isNotEmpty()) return "⏳ waiting$what$since"
+        return "⏳ waiting on ${waits.size} background shell" + (if (waits.size == 1) "" else "s") + since
     }
     // Only WORK rows name the working state; a waiting shell beside them is not work.
     if (state == LiveState.WORKING && hasLiveWork(live)) {
