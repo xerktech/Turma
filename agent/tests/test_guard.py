@@ -1767,6 +1767,101 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(guard._parse_overrides(None), [])
 
 
+class TestExpansionBudget(unittest.TestCase):
+    """Inlining a large variable at every use grew the text without bound.
+
+    `x='<3000 words>'; echo $x; …` ×1000 took ~19s to classify, and a ~100KB
+    command passed Claude Code's 600s hook timeout, which RUNS the command
+    unchecked (XERK-1556). Spending the growth budget must DENY, fast.
+    """
+
+    VALUE = " ".join(["w"] * 3000)
+    TOO_LARGE = "too large to classify"
+
+    def check(self, cmd):
+        t = time.monotonic()
+        reason = guard.is_destructive(cmd)
+        self.assertLess(time.monotonic() - t, 5, cmd[:80])
+        return reason
+
+    def test_large_value_used_many_times_is_denied_fast(self):
+        x = f"x='{self.VALUE}'; "
+        for cmd in (
+            x + "echo $x; " * 1000,
+            x + "(echo $x); " * 1000,
+            x + 'bash -c "echo $x"; ' * 1000,
+            # The budget is per classification, not per substitution: each
+            # heredoc body is substituted on its own and stays small.
+            x + "bash <<EOF\necho $x\nEOF\n" * 1000,
+        ):
+            self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:80])
+
+    def test_value_resolved_into_an_unused_variable_is_charged(self):
+        # Resolving `a` builds the large text before any substitution does.
+        cmd = f"b='{self.VALUE}'; a=" + "$b" * 1000 + "; echo ok"
+        with self.assertRaises(guard._ExpansionTooLarge):
+            guard._budgeted(guard._var_values)(cmd)
+        self.assertIn(self.TOO_LARGE, self.check(cmd) or "")
+
+    def test_one_budget_per_decision(self):
+        # Every heredoc on a line shares that line as its owner; each owner
+        # re-expansion opening a fresh budget ran past the hook timeout.
+        y = "z" * 866
+        cmd = (f"y='{y}'; " + ": $y " * 110 + "; "
+               + " ".join(f"cat <<E{i};" for i in range(2000)) + "\n"
+               + "".join(f"DROP DATABASE a{i};\nE{i}\n" for i in range(2000)) + "rm -rf /")
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.monotonic() - t, 5)
+        self.assertIsNone(guard._budget)
+
+    def test_hidden_tail_is_not_reached_but_still_denied(self):
+        cmd = f"x='{self.VALUE}'; " + "echo $x; " * 1000 + "echo done"
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+
+    def test_a_grant_cannot_override_it(self):
+        # The verdict replaces the whole expansion, so the hard policy checks
+        # behind a granted destructive deny would see nothing.
+        pad = f"x='{self.VALUE}'; " + "echo $x >/dev/null; " * 100
+        for tail in ("gh pr merge 5", "git push origin HEAD:main"):
+            got = guard.decide("Bash", {"command": "npm run build; " + pad + tail},
+                               overrides=["npm run build*"])
+            self.assertEqual(got[:1] + got[2:], ("deny", "policy"), tail)
+
+    def test_a_grant_on_an_earlier_reason_cannot_override_it(self):
+        # Each of these reasons is found before anything is expanded, so the
+        # budget runs out later, inside the policy checks.
+        pad = f"x='{self.VALUE}'; " + ": $x; " * 400 + "gh pr merge 5 --squash"
+        for head, grant in (("psql -d app <<EOF\nDROP TABLE t;\nEOF\n", "psql*"),
+                            (":(){ :|:& };:\n", ":*"),
+                            ("kill $(pgrep tmux)\n", "kill*")):
+            got = guard.decide("Bash", {"command": head + pad}, overrides=[grant])
+            self.assertEqual(got[:1] + got[2:], ("deny", "policy"), head)
+
+    def test_wrapper_suffixes_are_charged(self):
+        # n arguments emit n²/2 suffix words; 20k took minutes (XERK-1589).
+        for cmd in ("ssh h " + "a " * 20000,
+                    f"x='{' '.join(['w'] * 20000)}'; " + "ssh h $x; " * 12 + "\nrm -rf /"):
+            self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:40])
+        self.assertIsNone(self.check("ssh h " + "a " * 200))
+
+    def test_each_heredoc_owner_is_still_judged(self):
+        # The owner dedupe must neither skip a later owner nor mark one judged
+        # before its own body is checked.
+        for cmd in ("cat <<A\nDROP TABLE notes;\nA\npsql <<B\nDROP TABLE y;\nB",
+                    "cat <<A; psql <<B\nhello\nA\nDROP TABLE y;\nB"):
+            self.assertIn("database", guard.is_destructive(cmd) or "", cmd)
+
+    def test_ordinary_use_still_classified(self):
+        self.assertIsNone(self.check(f"x='{self.VALUE}'; " + "echo $x; " * 30))
+        data = '{"k": "' + "a" * 11000 + '"}'
+        self.assertIsNone(self.check(f"DATA='{data}'; " + "".join(
+            f'v{i}=$(echo "$DATA" | jq .k); ' for i in range(5))))
+        self.assertIn("recursive delete", guard.is_destructive("x=/etc; echo $x; rm -rf $x"))
+        self.assertIsNone(self.check("echo " + "w " * 50000))
+        self.assertIsNone(guard._budget)
+
+
 class TestGroupsHoldingOperators(unittest.TestCase):
     """A group whose body holds `;`, `|` or `&&` must still be classified.
 
