@@ -291,11 +291,15 @@ fun rankRunning(rows: List<FlatSession>, now: Long): LiveGroups {
                 .thenBy { it.flat.session.id },
         )
         .toList()
+    // Every session the hub says needs the operator (XERK-1571) — the set the
+    // dashboard's tile counts; the local readyForReview port from an older hub.
     val (review, rest) = running.partition {
-        com.xerktech.turma.core.readyForReview(it.flat.session, it.state)
+        com.xerktech.turma.core.inReview(it.flat.session, it.state, it.flat.hostLastSeen, now)
     }
     return LiveGroups(
-        review = review,
+        // Oldest-waiting first by the hub's attention `since` (XERK-1571); it
+        // moves only when a card ENTERS the group, so it does not reshuffle per beat.
+        review = com.xerktech.turma.core.sortedBySince(review) { it.flat.session.attention },
         active = rest.filter { it.state != com.xerktech.turma.core.LiveState.IDLE },
         idle = rest.filter { it.state == com.xerktech.turma.core.LiveState.IDLE },
     )
@@ -1025,7 +1029,16 @@ private fun SessionListCard(
             // anything but — so it takes the accent one instead (web
             // `.dot.review`). A waiting card keeps its own stronger amber.
             val dotState = liveState(r.session, r.hostLastSeen, now)
-            if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
+            // A STALLED background wait takes the danger colour it has on every
+            // surface (XERK-1571, web `.dot.stalled`), never the review accent —
+            // also where the hub says stalled but the host just went quiet, so this
+            // screen can't judge the silence itself (web `reviewState`).
+            val stalled = dotState == com.xerktech.turma.core.LiveState.IDLE &&
+                (com.xerktech.turma.core.sessionWait(r.session, r.hostLastSeen, now)?.stalled == true ||
+                    com.xerktech.turma.core.attentionStalled(r.session.attention))
+            if (stalled) {
+                StatusLight(com.xerktech.turma.ui.theme.TurmaColors.critical)
+            } else if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
                 StatusLight(com.xerktech.turma.ui.theme.TurmaColors.review)
             } else {
                 StateDot(dotState)
@@ -1048,6 +1061,20 @@ private fun SessionListCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
+                // Why it is the operator's and for how long (XERK-1571, web
+                // sessions.html `.why` line) — review cards only.
+                if (review) {
+                    val why = com.xerktech.turma.core.attentionWhy(r.session.attention, now)
+                    if (why.isNotEmpty()) {
+                        Text(
+                            why,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                }
                 // The PRs share a marks row at the BOTTOM of the card (web
                 // sessions.html state-row), rendered when there is at least one.
                 if (r.session.prs.isNotEmpty()) {

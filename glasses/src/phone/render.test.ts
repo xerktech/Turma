@@ -3,6 +3,7 @@ import { createInitialState, newSessionState, type AppState } from "../app.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "../types.ts";
 import {
   boardBodyHtml,
+  clockTime,
   orgLabel,
   orgOptions,
   phoneHtml,
@@ -152,6 +153,44 @@ describe("phone render", () => {
     const idle = html.slice(html.indexOf("Idle"));
     expect(idle).toContain("merged one");
     expect(idle).toContain("quiet one");
+  });
+
+  it("a wake on a later day carries +Nd, so it never reads as today (XERK-1571)", () => {
+    const today = new Date(2026, 9, 4, 10, 0).getTime();
+    expect(clockTime(new Date(2026, 9, 4, 14, 5).getTime(), today)).toBe("14:05");
+    expect(clockTime(new Date(2026, 9, 5, 9, 30).getTime(), today)).toBe("09:30\u00a0+1d");
+    expect(clockTime(new Date(2026, 9, 6, 14, 5).getTime(), today)).toBe("14:05\u00a0+2d");
+  });
+
+  it("orders Ready for review oldest-waiting first and labels a sleeper (XERK-1571)", () => {
+    const now = Date.now();
+    const done = { paneBusy: false, transcriptAgeSec: 900, lastRole: "assistant" };
+    const wakeAt = now + 30 * 60_000;
+    const d = new Date(wakeAt), p = (n: number) => String(n).padStart(2, "0");
+    const st = state({
+      agents: [agent({ sessions: [
+        session({ id: "n1", summary: "newer wait", createdAt: "2026-01-01T00:00:00Z", session: signals(done),
+          attention: { state: "needs-you:review", since: now - 60_000 } }),
+        session({ id: "o1", summary: "older wait", createdAt: "2025-01-01T00:00:00Z", session: signals(done),
+          attention: { state: "needs-you:review", since: now - 3_600_000 } }),
+        session({ id: "z1", summary: "asleep one", session: signals({ ...done, transcriptAgeSec: 5, wakeAt, wakeReason: "check CI" }) }),
+        // The hub decides the group where it serves attention: a stall is listed
+        // even though its own turn never finished; a hub-idle one is not.
+        session({ id: "s1", summary: "stalled one", session: signals({ ...done, lastRole: "user" }),
+          attention: { state: "needs-you:stalled", since: now - 7_200_000 } }),
+        session({ id: "i1", summary: "hub idle one", session: signals(done),
+          attention: { state: "idle", since: now - 60_000 } }),
+      ] })],
+    });
+    const html = sessionsBodyHtml(st);
+    const review = html.slice(html.indexOf("Ready for review"), html.indexOf("Active"));
+    expect(review.indexOf("older wait")).toBeGreaterThan(-1);
+    expect(review.indexOf("older wait")).toBeLessThan(review.indexOf("newer wait"));
+    expect(review).not.toContain("asleep one");
+    expect(review.indexOf("stalled one")).toBeGreaterThan(-1);
+    expect(review.indexOf("stalled one")).toBeLessThan(review.indexOf("older wait"));
+    expect(review).not.toContain("hub idle one");
+    expect(html.slice(html.indexOf("Active"))).toContain(`sleeping until ${p(d.getHours())}:${p(d.getMinutes())}${d.getDate() !== new Date(now).getDate() ? "\u00a0+1d" : ""} · check CI`);
   });
 
   it("a new task on a merged-PR session is not hidden by that PR (XERK-224)", () => {

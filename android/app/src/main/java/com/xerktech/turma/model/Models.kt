@@ -1001,6 +1001,28 @@ data class SessionInfo(
     val restartCount: Int = 0,
     // The live branch's relation to its base/origin — the work-risk line.
     val work: WorkInfo? = null,
+    /**
+     * The hub-derived attention state (XERK-1571, server.js `sessionAttention`):
+     * stamped by the hub on the served copy, never the agent's word (the hub
+     * strips a forged one and rebuilds it to this exact shape). Null from an older
+     * hub, which reads as "can't tell" — no Needs-you row, no since-ordering.
+     */
+    val attention: Attention? = null,
+)
+
+/**
+ * One session's attention (XERK-1571). [state] is `needs-you:question` |
+ * `needs-you:permission` | `needs-you:review` | `needs-you:test` (reserved) |
+ * `needs-you:stalled` | `working` | `waiting` | `sleeping` | `idle`; [since] the
+ * epoch ms it last changed; [eta] epoch ms for a wait/sleep with a known end;
+ * [why] the one-line reason.
+ */
+@Serializable
+data class Attention(
+    val state: String = "",
+    val since: Long? = null,
+    val eta: Long? = null,
+    val why: String? = null,
 )
 
 @Serializable
@@ -1049,6 +1071,11 @@ data class LiveSignals(
     val questionMulti: Boolean = false,
     val newPrUrls: List<String> = emptyList(),
     val tail: List<TailEntry> = emptyList(),
+    // A session-CLI wake request (XERK-1564): epoch ms + why. A [wakeAt] still in
+    // the future is the session SLEEPING (XERK-1571). The hub keeps [wakeAt] a
+    // positive safe integer and [wakeReason] a capped string, else omits them.
+    val wakeAt: Long? = null,
+    val wakeReason: String? = null,
 )
 
 @Serializable

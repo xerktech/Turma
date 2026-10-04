@@ -4782,6 +4782,9 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
     // Idempotent, and returns the list unchanged when nothing matches.
     repoUsage: usageLedger.foldSystemRepos((durable && durable.repoUsage) || a.repoUsage),
     commands: publicCommands(a.commands),
+    // Each session's hub-derived attention (XERK-1571), stamped on a CLONE of
+    // sessions[] — never into the stored record. See sessionsWithAttention.
+    sessions: sessionsWithAttention(a.sessions, a.alerts && a.alerts.sessions),
     online,
     // An expected restart in progress (XERK-29): only meaningful while the host
     // is actually silent — a host that came back is just `online` again, and its
@@ -9448,6 +9451,11 @@ function normalizeSessions(payload) {
       const t = typeof s.summary === "string" ? s.summary.trim() : "";
       s.summary = t.slice(0, 120);
     }
+    // `attention` is HUB-DERIVED (XERK-1571): serializeAgent stamps it on a clone
+    // from the hub's own edge record, so an agent-asserted one (or one a restore
+    // carries) is deleted here — a forged needs-you state, or a wrong-typed one
+    // Android would choke on, never reaches the wire.
+    delete s.attention;
     // Kill switch OFF: a reported/persisted dsh session runtime reads as claude
     // on the wire (coerce "dsh" -> "", which every client already treats as the
     // default), so no client renders a session as dsh and the hub's own /model
@@ -11397,12 +11405,16 @@ function prLanded(p) {
 // background shell (a sleep with an ETA still ahead, a CI watch) has ended its
 // turn but is not the operator's yet; once STALLED it is judged like any idle
 // session, which is how a dead shell surfaces.
-function readyForReview(session, working, wait) {
+//
+// A SLEEPING session (XERK-1571: a session-CLI `wake` still ahead) asked to be
+// left alone until then, so it is never ready for review — and so never alerted.
+function readyForReview(session, working, wait, now = Date.now()) {
   if (session.status !== "running") return false;
   const s = session.session || {};
   if (s.question || (s.panePrompt && s.panePrompt.prompt)) return true;
   if (working) return false;
   if (wait && wait.state === "waiting") return false;
+  if (sessionSleeping(s, now)) return false;
   const prs = session.prs || [];
   if (prs.some((p) => !prLanded(p))) return true;
   // Landed PRs stop being a reason to look, but must not become a reason NOT
@@ -11411,6 +11423,114 @@ function readyForReview(session, working, wait) {
   // demotion once the conversation moves past the landing.
   if (prs.length && !session.newWorkSincePrs) return false;
   return s.lastRole === "assistant" && !s.lastHasToolUse;
+}
+
+// Is this session asleep (XERK-1571)? A session-CLI `wake` request (XERK-1564)
+// still in the future: the agent serves it as `wakeAt` on the live block until
+// the beat that delivers it. Mirrored by every client's liveState.
+function sessionSleeping(live, now) {
+  return Number.isSafeInteger(live?.wakeAt) && live.wakeAt > now;
+}
+
+// The attention states (XERK-1571), served as `session.attention.state`. The
+// `needs-you:*` ones are the operator's; `needs-you:test` is RESERVED for the
+// wait classifier (XERK-1572) — nothing produces it yet, so such a session
+// still reads `needs-you:review`.
+const ATTENTION_STATES = new Set([
+  "needs-you:question", "needs-you:permission", "needs-you:review", "needs-you:test",
+  "needs-you:stalled", "working", "waiting", "sleeping", "idle",
+]);
+const ATTENTION_WHY_MAX = 200;
+
+// What a background wait is waiting ON, for the `why` line: the one wait row's
+// label, else a count. Same wording as the clients' backgroundWaitLabel.
+function waitSubject(rows) {
+  const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
+  if (waits.length === 1 && waits[0].label) return waits[0].label;
+  return `${waits.length} background shell${waits.length === 1 ? "" : "s"}`;
+}
+
+// Why a ready-for-review session is the operator's: its live PRs and their CI,
+// or a finished turn with nothing to merge. Read off `session.prs` only.
+function reviewWhy(session) {
+  const live = (session.prs || []).filter((p) => p && !prLanded(p));
+  if (!live.length) return "finished · nothing to merge";
+  const what = live.length === 1 ? "PR open" : `${live.length} PRs open`;
+  if (live.some((p) => p.mergeable === "CONFLICTING")) return `${what} · merge conflict`;
+  const checks = live.map((p) => String(p.checks || "").toLowerCase());
+  if (checks.includes("failing")) return `${what} · CI failing`;
+  if (checks.includes("pending")) return `${what} · CI running`;
+  if (checks.every((c) => c === "passing")) return `${what} · CI passing`;
+  return what;
+}
+
+// What a blocking TUI dialog is asking to do, for a permission's `why` line: the
+// dialog's question is nearly always the same "Do you want to proceed?", which
+// says nothing, so the line names the pending command instead. The agent serves
+// the block above the question as `panePrompt.detail` (hub-agent.py
+// parse_pane_prompt) — "Bash command\ntouch /tmp/x\nCreate marker file" — so a
+// leading dialog TITLE (a short run of plain words) becomes the tool name and the
+// next line its target: "Bash: touch /tmp/x". No detail = the question itself.
+const PERMISSION_WHY_MAX = 120;
+function permissionWhy(pp) {
+  const lines = (typeof pp.detail === "string" ? pp.detail : "").split("\n").map((l) => l.trim()).filter(Boolean);
+  let why = lines[0] || "";
+  if (lines.length > 1 && /^[A-Z][A-Za-z]*( [A-Za-z]+){0,3}$/.test(lines[0])) {
+    why = `${lines[0].replace(/ command$/i, "")}: ${lines[1]}`;
+  }
+  if (!why) why = String(pp.prompt || "");
+  return why.length > PERMISSION_WHY_MAX ? why.slice(0, PERMISSION_WHY_MAX - 1) + "…" : why;
+}
+
+// One session's attention (XERK-1571): {state, eta?, why?} — `since` is added
+// by the caller from the edge it keeps in alerts.sessions. Pure; `working` and
+// `wait` are the caller's sessionWorking/sessionWait reads. Precedence, highest
+// first: question > permission > working > sleeping > waiting > stalled >
+// review > idle. A question outranks stalled and review, so a pending question
+// suppresses both alerts.
+function sessionAttention(session, working, wait, now) {
+  if (session.status !== "running") return { state: "idle" };
+  const s = session.session || {};
+  const why = (t) => (typeof t === "string" && t ? { why: t.slice(0, ATTENTION_WHY_MAX) } : {});
+  const eta = (t) => (Number.isSafeInteger(t) && t > 0 ? { eta: t } : {});
+  if (s.question) return { state: "needs-you:question", ...why(s.question) };
+  if (s.panePrompt && s.panePrompt.prompt) return { state: "needs-you:permission", ...why(permissionWhy(s.panePrompt)) };
+  if (working) return { state: "working" };
+  if (sessionSleeping(s, now)) return { state: "sleeping", ...eta(s.wakeAt), ...why(s.wakeReason) };
+  if (wait) {
+    const st = wait.state === "stalled" ? "needs-you:stalled" : "waiting";
+    return { state: st, ...eta(wait.eta), ...why(waitSubject(s.agents)) };
+  }
+  if (readyForReview(session, working, wait, now)) return { state: "needs-you:review", ...why(reviewWhy(session)) };
+  return { state: "idle" };
+}
+
+// The attention a session is SERVED with: a strict rebuild of the edge record
+// kept in alerts.sessions (a restored state.json is as untrusted as a beat), so
+// only the typed shape Android decodes ever reaches the wire. null = omit.
+function wireAttention(attn) {
+  if (!attn || typeof attn !== "object" || !ATTENTION_STATES.has(attn.state)) return null;
+  if (!wireEpochMs(attn.since)) return null;
+  const out = { state: attn.state, since: attn.since };
+  if (wireEpochMs(attn.eta)) out.eta = attn.eta;
+  if (typeof attn.why === "string" && attn.why) out.why = attn.why.slice(0, ATTENTION_WHY_MAX);
+  return out;
+}
+
+// The served `sessions[]` with each session's attention STAMPED (XERK-1571).
+// CLONES every session rather than writing into the stored record: the record is
+// the agent's report (size-budgeted, persisted, re-coerced on restore), and a
+// stamp written there would be re-served after the alerts edge moved on. Any
+// `attention` already on a record (normalizeSessions strips a forged one) is
+// dropped here too — the second of two guards.
+function sessionsWithAttention(sessions, alertSessions) {
+  if (!Array.isArray(sessions)) return sessions;
+  return sessions.map((s) => {
+    if (!s || typeof s !== "object") return s;
+    const { attention: _forged, ...rest } = s;
+    const attn = wireAttention(alertSessions && alertSessions[s.id] && alertSessions[s.id].attn);
+    return attn ? { ...rest, attention: attn } : rest;
+  });
 }
 
 // The four token counters the agent reports, summed. Deliberately the SAME
@@ -11654,7 +11774,15 @@ function heartbeatAlerts(key, prev, next) {
     //   - A pending question suppresses it: the high-priority question alert
     //     above is already that session's buzz, and it says more.
     const reviewKey = `review:${key}:${session.id}`;
-    const ready = readyForReview(session, working, sessionWait(session, next.lastSeen, now));
+    const waitRead = sessionWait(session, next.lastSeen, now);
+    const ready = readyForReview(session, working, waitRead, now);
+    // The session's attention (XERK-1571), with `since` = the beat its state
+    // last CHANGED — the `reviewAt` pattern: kept on `sa`, so it persists with
+    // `alerts` and is swept with the session by the liveIds cleanup below.
+    const attn = sessionAttention(session, working, waitRead, now);
+    const prevAttn = sa.attn;
+    sa.attn = { ...attn, since: prevAttn && prevAttn.state === attn.state && prevAttn.since ? prevAttn.since : now };
+    const stalled = attn.state === "needs-you:stalled";
     // Only PRs still in play are worth naming — one merged while the alert was
     // held has answered itself.
     const notes = (sa.prNotes || []).filter((n) => !prLanded(prStatus.get(n.url)));
@@ -11671,7 +11799,9 @@ function heartbeatAlerts(key, prev, next) {
       // prAlertDecision holds it past the age-out for the same reason. Every
       // verdict now feeds this one alert, so the hold has to reach it too.
       || livePrs.some((p) => p.mergeable === "CONFLICTING");
-    if (ready && !sa.reviewAlerted && !s.question && !holdingPr && (sa.reviewAt || notes.length)) {
+    // A STALLED session takes the stalled alert below instead (precedence
+    // question > stalled > review): one buzz, the one that says what is wrong.
+    if (ready && !stalled && !sa.reviewAlerted && !s.question && !holdingPr && (sa.reviewAt || notes.length)) {
       const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
       // "Nothing to merge" is a claim about the session, so it may only be made
       // when the session really opened nothing. A live PR with no banked verdict
@@ -11700,6 +11830,29 @@ function heartbeatAlerts(key, prev, next) {
     if (sa.reviewAlerted && !ready) {
       dismiss(reviewKey);
       delete sa.reviewAlerted;
+    }
+    // Stalled (XERK-1571): a session parked on a background wait that has gone
+    // past its ETA, or silent too long. One alert per EDGE into the state, under
+    // its own notifKey, retracted on recovery (XERK-154's dismiss contract). It
+    // is the SECOND exception to the one-alert-per-piece-of-work rule (spend is
+    // the first): it says the work is stuck, not that it is ready. Fires only on
+    // an observed edge — a session already stalled when this hub first sees it
+    // (no `prevAttn`: a fresh hub, an upgrade) is not announced, as review isn't.
+    // A pending question outranks it: the session's attention is then the
+    // question, which already buzzed.
+    const stalledKey = `stalled:${key}:${session.id}`;
+    if (stalled && !sa.stalledAlerted && prevAttn && prevAttn.state !== "needs-you:stalled" && !recovered) {
+      const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
+      notify(`${label} has stalled`, `No progress waiting on ${attn.why || "a background shell"}${repo}`, {
+        tags: "hourglass",
+        route,
+        notifKey: stalledKey,
+      });
+      sa.stalledAlerted = true;
+    }
+    if (sa.stalledAlerted && !stalled) {
+      dismiss(stalledKey);
+      delete sa.stalledAlerted;
     }
     // A stale finish edge must not outlive the turn that follows it; a held PR
     // note must, since its alert is still owed.
@@ -13777,6 +13930,8 @@ function autoMergeSweep() {
       if (sessionWorking(s, a.lastSeen, now)) continue;
       // Still waiting out a shell it launched (XERK-1570) — not finished either.
       if (sessionWait(s, a.lastSeen, now)?.state === "waiting") continue;
+      // Asleep until a session-CLI wake (XERK-1571) — it means to come back to it.
+      if (sessionSleeping(s.session, now)) continue;
       const ss = s.session || {};
       if (ss.question || (ss.panePrompt && ss.panePrompt.prompt)) continue;
       // The agent has to be new enough to run the command; an older one would
@@ -20054,6 +20209,11 @@ if (process.env.TURMA_TEST) {
     hasLiveAgents,
     hasLiveWork,
     sessionWait,
+    sessionSleeping,
+    sessionAttention,
+    sessionsWithAttention,
+    wireAttention,
+    reviewWhy,
     backgroundWait,
     ATTENTION_WAIT_STALL_MS,
     WAIT_ETA_GRACE_MS,

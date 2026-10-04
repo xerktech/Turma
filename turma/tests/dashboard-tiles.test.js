@@ -162,6 +162,36 @@ test("dashboard: the session card renders a context-fullness meter (XERK-489 Pha
   assert.match(D.contextMeterHtml({ modelSource: "local", lastTurnContextTokens: 97, contextWindowTokens: 100 }), /ctx-meter danger/);
 });
 
+// XERK-1571: the dashboard carries NO needs-you list (the operator's call: those
+// cards live in the Sessions page's Ready for review). Its "Ready for review" tile
+// counts exactly the sessions the hub's served attention says wait on the
+// operator — the set that section lists — and nothing else.
+test("dashboard: the Ready for review tile counts hub needs-you sessions; no list on the page", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const sess = (id, summary, attention, status = "running") =>
+    ({ id, summary, status, repo: "Turma", attention });
+  const at = (state, agoMin, why) => ({ state, since: now - agoMin * 60_000, ...(why ? { why } : {}) });
+  const h = { ...liveHost("nas", 1), sessions: [
+    sess("s1", "Fresh Review", at("needs-you:review", 3, "PR open · CI passing")),
+    sess("s2", "Old Stall", at("needs-you:stalled", 50, "Watch CI")),
+    sess("s3", "Asking", at("needs-you:question", 10, "Ship it?")),
+    sess("s4", "Busy", at("working", 1)),
+    sess("s5", "Asleep", at("sleeping", 1, "check CI")),
+    sess("s6", "Stopped", at("needs-you:review", 99), "stopped"),
+    sess("s7", "Older Hub", undefined),
+  ] };
+  D.render({ now, agents: [h] });
+  assert.deepEqual(tileOf(D.els.tiles.innerHTML, "Ready for review"), { value: "3", hint: "sessions waiting on you" });
+  assert.equal(tileOf(D.els.tiles.innerHTML, "Needs you"), null);
+  const g = D.els.groups.innerHTML;
+  assert.ok(!g.includes("needs-you") && !g.includes("ny-row") && !g.includes("Needs you"), "no Needs-you list");
+  // Nothing waiting on the operator (or an older hub serving no attention): 0.
+  const D2 = loadDashboard();
+  D2.render({ now, agents: [{ ...liveHost("nas", 1), sessions: [sess("s4", "Busy", at("working", 1)), sess("s7", "Older Hub")] }] });
+  assert.equal(tileOf(D2.els.tiles.innerHTML, "Ready for review").value, "0");
+});
+
 test("dashboard tiles: a removed host's spend still counts toward the fleet totals", () => {
   const D = loadDashboard();
   D.render({ now: Date.now(), agents: [liveHost("live", 100)], retiredUsage: [retiredHost("gone", 900)] });

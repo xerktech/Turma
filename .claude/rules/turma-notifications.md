@@ -68,8 +68,10 @@ wire contract and Web ⇄ Android parity — Android's channels/`Notifications.k
   killed within 30s of the flagging beat, before `state.json` is written, re-announces on reboot.
   Same window the command queue already carries; acceptable, since the alert is informational and a
   double-buzz on a hard restart is not a correctness problem.
-- **It is the one session alert outside the XERK-224 one-alert-per-piece-of-work rule**: a session
+- **It is the FIRST session alert outside the XERK-224 one-alert-per-piece-of-work rule**: a session
   can be both mid-turn and far too expensive, and the review alert would not be the thing to say.
+- **The stalled alert is the SECOND exception** (XERK-1571, `stalled:<host>:<id>`, retracted on
+  recovery; precedence question > stalled > review) — mechanics in `turma-attention.md`.
 - Gated on `running` — a stopped session's total is history and its record keeps reporting `usage`;
   it announces if resumed, which is when the number can move again. **Notification only**: nothing
   here throttles, interrupts or kills, since a session mid-repro on an expensive bug is allowed to

@@ -48,7 +48,7 @@ function loadDashboard() {
   const fn = new Function(
     "localStorage", "document", "window", "EventSource", "fetch",
     "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "TurmaOrg", "globalThis",
-    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens };\n;globalThis.__setRender = (f) => { render = f; };"
+    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens, stateAge };\n;globalThis.__setRender = (f) => { render = f; };"
   );
   fn(g.localStorage, g.document, g.window, g.EventSource, g.fetch,
      g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g.TurmaOrg, g);
@@ -106,15 +106,16 @@ test("dashboard liveState: waiting shells hold, stall, and never read working", 
   const { liveState } = loadDashboard();
   const ci = { type: "shell", label: "Watch CI", kind: "wait-external" };
   const held = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }), onlineHost, NOW);
-  assert.equal(held.label, "waiting · Watch CI");
+  assert.equal(held.label, "⏳ waiting · Watch CI");
   assert.equal(held.cls, "sess-holding");
   assert.notEqual(held.busy, true);
   const timed = liveState(sess({ paneBusy: false, transcriptAgeSec: 5,
     agents: [{ type: "shell", kind: "wait-timed", eta: NOW + 5 * 60 * 1000 }] }), onlineHost, NOW);
-  assert.equal(timed.label, "waiting · 5m left");
+  assert.equal(timed.label, "⏳ waiting\u00a0·\u00a05m left");
   const stalled = liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW);
   assert.equal(stalled.label, "stalled · Watch CI");
-  assert.equal(stalled.cls, "");
+  // XERK-1571: the danger tone it has on every surface.
+  assert.equal(stalled.cls, "sess-stalled");
   // A work shell beside the wait is working, named by its work rows only.
   const mixed = liveState(sess({ paneBusy: false, transcriptAgeSec: 5,
     agents: [ci, { type: "shell", kind: "work" }] }), onlineHost, NOW);
@@ -125,6 +126,142 @@ test("dashboard liveState: waiting shells hold, stall, and never read working", 
   // Offline host: no wait read at all — plain idle.
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }),
     { online: false, lastSeen: NOW - 600_000 }, NOW).label, "idle");
+});
+
+// XERK-1571: a wait with no ETA says how long it has waited, off the oldest
+// wait row's startedAt; an ETA still says the time left.
+test("dashboard liveState: a wait with no ETA says how long it has waited", () => {
+  const { liveState } = loadDashboard();
+  const ci = { type: "shell", label: "Watch CI on PR #412", kind: "wait-external", startedAt: NOW - 12 * 60 * 1000 };
+  const ciCard = liveState(sess({ paneBusy: false, transcriptAgeSec: 12 * 60, agents: [ci] }), onlineHost, NOW);
+  assert.equal(ciCard.label, "⏳ waiting · Watch CI on PR #412\u00a0·\u00a012m");
+  // Screenshot defect: "· 12m · last write 12m ago" was two ages for one wait.
+  // The wait's own age is the card's one clock.
+  assert.equal(ciCard.detail, "");
+  const two = [{ ...ci, label: "" }, { type: "shell", kind: "wait-timed", startedAt: NOW - 20 * 60 * 1000 }];
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: two }), onlineHost, NOW).label,
+    "⏳ waiting on 2 background shells\u00a0·\u00a020m");
+  const timed = { ...ci, kind: "wait-timed", eta: NOW + 11 * 60 * 1000 };
+  const timedCard = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [timed] }), onlineHost, NOW);
+  assert.equal(timedCard.label, "⏳ waiting · Watch CI on PR #412\u00a0·\u00a011m left");
+  // Time LEFT is not an age: the last write still shows beside it.
+  assert.match(timedCard.detail, /^last write 5s/);
+  // A wait row with no startedAt (an older agent): the last write is its only clock.
+  const { startedAt, ...noStart } = ci;
+  assert.match(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [noStart] }), onlineHost, NOW).detail,
+    /^last write 5s/);
+  // Stalled: no start age — the stall's own age (the hub's `since`) is the
+  // State row's, and a second number here read as a second stall length.
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW).label,
+    "stalled · Watch CI on PR #412");
+});
+
+// XERK-1571 screenshot defect: a stalled card showed a second age (its last
+// write) beside the 31m the hub says it has been stalled. It now shows ONE age,
+// the hub's attention `since`; "last write" stays only for an older hub.
+test("dashboard liveState: a stall shows one age, the hub's since", () => {
+  const { liveState } = loadDashboard();
+  const ci = { type: "shell", label: "Watch CI", kind: "wait-external", startedAt: NOW - 60 * 60 * 1000 };
+  const s = { paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] };
+  const stalled = liveState({ session: s,
+    attention: { state: "needs-you:stalled", since: NOW - 31 * 60 * 1000, why: "Watch CI" } }, onlineHost, NOW);
+  assert.equal(stalled.label, "stalled · Watch CI");
+  // The age is glued to its word by a no-break space, so "31m" never wraps alone.
+  assert.equal(stalled.detail, "for\u00a031m");
+  assert.equal(stalled.cls, "sess-stalled");
+  // The hub is a beat behind (still "waiting"): no second number at all.
+  assert.equal(liveState({ session: s, attention: { state: "waiting", since: NOW - 60_000 } }, onlineHost, NOW).detail, "");
+  // An older hub: the transcript's last write is the only clock there is.
+  assert.match(liveState({ session: s }, onlineHost, NOW).detail, /^last write 50m/);
+});
+
+// XERK-1571: a permission dialog is not a question — the card says so and names
+// the pending command (the hub's why), falling back to the dialog's question
+// from an older hub that serves no attention.
+test("dashboard liveState: a permission names what it asks for", () => {
+  const { liveState } = loadDashboard();
+  const pp = { paneBusy: false, transcriptAgeSec: 5, panePrompt: { prompt: "Do you want to proceed?" } };
+  const withWhy = liveState({ session: pp,
+    attention: { state: "needs-you:permission", since: NOW, why: "Bash: kubectl rollout restart" } }, onlineHost, NOW);
+  assert.equal(withWhy.label, "waiting for your permission");
+  assert.equal(withWhy.ask, "Bash: kubectl rollout restart");
+  assert.equal(withWhy.question, undefined);
+  // Screenshot defect: the State row showed an age for review and stalled but
+  // not here, where the Sessions page shows "for 4m". Now it does.
+  const asked = liveState({ session: pp,
+    attention: { state: "needs-you:permission", since: NOW - 4 * 60 * 1000, why: "Bash: ls" } }, onlineHost, NOW);
+  assert.equal(asked.detail, "for\u00a04m");
+  assert.equal(liveState({ session: pp }, onlineHost, NOW).ask, "Do you want to proceed?");
+});
+
+// XERK-1571 screenshot defect: a question card's State row carries how long it
+// has waited, like every other needs-you card and the Sessions page's "for 22m".
+test("dashboard liveState: a question card says how long it has waited", () => {
+  const { liveState } = loadDashboard();
+  const q = { paneBusy: false, transcriptAgeSec: 5, question: "Ship it?" };
+  const card = liveState({ session: q,
+    attention: { state: "needs-you:question", since: NOW - 22 * 60 * 1000 } }, onlineHost, NOW);
+  assert.equal(card.label, "waiting for your answer");
+  assert.equal(card.detail, "for\u00a022m");
+  // The hub a beat behind (still "review"): not the review's age under a question.
+  assert.equal(liveState({ session: q,
+    attention: { state: "needs-you:review", since: NOW - 47 * 60 * 1000 } }, onlineHost, NOW).detail, "");
+  // An older hub: no age, as before.
+  assert.equal(liveState({ session: q }, onlineHost, NOW).detail, "");
+});
+
+// XERK-1571: a card the hub says needs the operator never reads "idle" — its
+// State row takes the attention read Ready for review lists it under.
+test("dashboard liveState: a needs-you session reads its attention, never idle", () => {
+  const { liveState } = loadDashboard();
+  const done = { paneBusy: false, transcriptAgeSec: 52 * 60 };
+  const review = liveState({ session: done,
+    attention: { state: "needs-you:review", since: NOW - 60_000, why: "PR open · CI passing" } }, onlineHost, NOW);
+  assert.equal(review.label, "review · PR open · CI passing");
+  assert.equal(review.cls, "sess-review");
+  // How long it has waited is the hub's since — one age, not the last write.
+  assert.equal(review.detail, "for\u00a01m");
+  const stalled = liveState({ session: done,
+    attention: { state: "needs-you:stalled", since: NOW - 60_000, why: "Watch CI" } }, onlineHost, NOW);
+  assert.equal(stalled.label, "stalled · Watch CI");
+  assert.equal(stalled.cls, "sess-stalled");
+  // No attention (an older hub) or a non-needs-you state: idle as before.
+  assert.equal(liveState({ session: done }, onlineHost, NOW).label, "idle");
+  assert.equal(liveState({ session: done, attention: { state: "idle", since: NOW } }, onlineHost, NOW).label, "idle");
+  // Working outranks it.
+  assert.equal(liveState({ session: { paneBusy: true, transcriptAgeSec: 1 },
+    attention: { state: "needs-you:review", since: NOW } }, onlineHost, NOW).label, "working");
+});
+
+// XERK-1571: a session-CLI wake still ahead reads sleeping (holding style), "until
+// HH:MM" in local time; a due wake no longer does.
+// A wake on a later day (up to 7d out) says so, so it never reads as today.
+test("dashboard liveState: a wake on a later day carries +Nd", () => {
+  const { liveState } = loadDashboard();
+  const today = new Date(2026, 9, 4, 10, 0).getTime();
+  const wakeAt = new Date(2026, 9, 6, 14, 5).getTime();
+  const host = { online: true, lastSeen: today };
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt, wakeReason: "check CI" }), host, today).label,
+    "💤 sleeping until 14:05\u00a0+2d · check CI");
+  const tomorrow = new Date(2026, 9, 5, 9, 30).getTime();
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt: tomorrow }), host, today).label,
+    "💤 sleeping until 09:30\u00a0+1d");
+});
+
+test("dashboard liveState: a pending wake reads sleeping until its time", () => {
+  const { liveState } = loadDashboard();
+  const wakeAt = NOW + 30 * 60 * 1000;
+  const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
+  const asleep = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt }), onlineHost, NOW);
+  assert.equal(asleep.label, `💤 sleeping until ${p(d.getHours())}:${p(d.getMinutes())}`);
+  assert.equal(asleep.cls, "sess-holding");
+  // The wake reason, when the session gave one, says what it will check.
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt, wakeReason: " check CI on #412 " }), onlineHost, NOW).label,
+    `💤 sleeping until ${p(d.getHours())}:${p(d.getMinutes())} · check CI on #412`);
+  assert.notEqual(asleep.busy, true);
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt: NOW - 1000 }), onlineHost, NOW).label, "idle");
+  // Working outranks it: a session still finishing its turn is working.
+  assert.equal(liveState(sess({ paneBusy: true, transcriptAgeSec: 1, wakeAt }), onlineHost, NOW).label, "working");
 });
 
 // XERK-538: a QA / QA-delta pass reads "QA Review" while staying working (Active).
@@ -239,4 +376,18 @@ test("dashboard fmtTokens: the unit boundary is inclusive, as everywhere else", 
   assert.equal(fmtTokens(1_000), "1.0k");
   assert.equal(fmtTokens(1_000_000), "1.0M");
   assert.equal(fmtTokens(1_000_000_000), "1.0B");
+});
+
+// Operator screenshot review (XERK-1571): a State row broke at its " · ", leaving
+// a line ending on a dangling "·" and the age alone on the next. The dot is glued
+// to the label's last word by a no-break space and to the age by a no-wrap span.
+test("dashboard stateAge: the age's dot never ends a line", () => {
+  const { stateAge } = loadDashboard();
+  assert.equal(stateAge("for\u00a022m"), '\u00a0<span class="state-age">·\u00a0for\u00a022m</span>');
+  assert.equal(stateAge("last write <1m ago"), '\u00a0<span class="state-age">·\u00a0last write &lt;1m ago</span>');
+  assert.equal(stateAge(""), "");
+  const html = fs.readFileSync(path.join(__dirname, "..", "public", "index.html"), "utf8");
+  assert.ok(html.includes("${stateAge(live.detail)}"), "the State row uses it");
+  assert.ok(!html.includes('live.detail ? " · "'), "no breakable separator left");
+  assert.match(html, /\.state-age \{ white-space: nowrap; \}/);
 });

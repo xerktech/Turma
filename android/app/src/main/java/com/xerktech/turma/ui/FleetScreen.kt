@@ -532,7 +532,29 @@ private fun SessionCard(
                 // State row: shutting down / live state / queued reason + since.
                 when {
                     killing -> Text("shutting down…", style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
-                    st == "running" -> Text(liveStateLabel(state, session.session), style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 1)
+                    st == "running" -> {
+                        // Where the live read would say "idle", the hub's needs-you
+                        // read speaks instead (XERK-1571, web index.html liveState):
+                        // a session Ready for review lists never reads idle here. Its
+                        // one age is the hub's `since` ("stalled · Watch CI · for 31m").
+                        // A stall takes the danger colour it has on every surface.
+                        val needs = if (state == LiveState.IDLE) com.xerktech.turma.core.attentionLabel(session.attention) else null
+                        val needsFor = com.xerktech.turma.core.attentionFor(session.attention, now)
+                        // A question card carries its age too (web "waiting for your
+                        // answer · for 22m"), but only the question's own — never a
+                        // review's the hub has not caught up from.
+                        val askedFor = if (state == LiveState.WAITING && session.attention?.state == "needs-you:question") needsFor else ""
+                        val stateFor = if (needs != null) needsFor else askedFor
+                        val stateLabel = needs ?: liveStateLabel(state, session.session)
+                        // The age's "·" is glued by no-break spaces (web index.html
+                        // stateAge), so a line never ends on a dangling "·".
+                        Text(
+                            if (stateFor.isEmpty()) stateLabel else "$stateLabel\u00A0·\u00A0$stateFor",
+                            style = MaterialTheme.typography.bodySmall,
+                            color = if (needs != null && com.xerktech.turma.core.attentionStalled(session.attention)) MaterialTheme.colorScheme.error else muted,
+                            maxLines = 1,
+                        )
+                    }
                     st == "queued" -> {
                         val since = session.queuedAt.takeIf { it.isNotBlank() }
                             ?.let { " · " + com.xerktech.turma.core.ageStr(it, now) }.orEmpty()
@@ -554,6 +576,18 @@ private fun SessionCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
+                // What a permission dialog asks for (XERK-1571, web Permission row):
+                // the hub's why — the pending command — not the dialog's generic question.
+                session.attention?.takeIf { it.state == "needs-you:permission" }?.why
+                    ?.takeIf { it.isNotBlank() }?.let { ask ->
+                        Text(
+                            ask,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = com.xerktech.turma.ui.theme.TurmaColors.waiting,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
                 if (st == "error" && session.errorMsg.isNotBlank()) {
                     Text(session.errorMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 2)
                 }
@@ -631,7 +665,7 @@ private fun SessionCard(
 
 /**
  * The six fleet summary tiles at the top of the dashboard, a 2-up grid matching
- * the web dashboard's `#tiles` (Hosts online / Running / Waiting on you / Tokens
+ * the web dashboard's `#tiles` (Hosts online / Running / Ready for review / Tokens
  * today / this week / all-time). Data is [fleetSummary], a pure port of the web
  * reducers.
  */
@@ -676,7 +710,9 @@ private fun FleetTiles(s: FleetSummary) {
         SummaryTile("Running sessions",
             if (s.maxSessions != null) "${s.running} / ${s.maxSessions}" else s.running.toString(),
             "${s.totalSessions} total", tileMod)
-        SummaryTile("Waiting on you", s.waiting.toString(), "sessions with a question", tileMod)
+        // The needs-you count (XERK-1571), worded as the Sessions screen's section
+        // that lists exactly those sessions.
+        SummaryTile("Ready for review", s.waiting.toString(), "sessions waiting on you", tileMod)
         val retiredNote = if (s.retiredCounted) " · incl. removed hosts" else ""
         SummaryTile("Tokens today", fmtTokens(s.tokensToday), "all sessions, incl. cache$retiredNote", tileMod)
         SummaryTile("Tokens this week", fmtTokens(s.tokensWeek), "last 7 days (UTC)$retiredNote", tileMod)

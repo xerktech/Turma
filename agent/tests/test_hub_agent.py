@@ -11328,7 +11328,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"--name {shlex.quote(sess['rcName'])} "
             f"--permission-mode auto --settings {shlex.quote(settings)} "
             f"--append-system-prompt "
-            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers)}",
+            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers + ha.wake_directive())}",
         )
         # The guard settings file was written and wires three PreToolUse
         # matchers: the Bash guard, the ~/.claude file guard, and the
@@ -11486,7 +11486,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             path=ha.PEERS_FILE, sid=sm.registry[0]["id"], host=sm.device)
         self.assertIn(
             "--append-system-prompt "
-            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers),
+            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers + ha.wake_directive()),
             cmd,
         )
 
@@ -17319,6 +17319,48 @@ class TestModelActualPayload(ManagerMixin, unittest.TestCase):
         self.assertEqual(payload["pendingModel"], "sonnet")
 
 
+class TestSessionDirective(ManagerMixin, unittest.TestCase):
+    """XERK-1571: the wake paragraph of `_session_directive` — taught to a Claude
+    session, naming the session CLI exactly as its allow rule does, and withheld
+    from dsh/qwen, whose launches export no TURMA_SESSION_ID/TURMA_SESSION_CLI."""
+
+    def _sess(self, **kw):
+        return {"id": "abcde", **kw}
+
+    def test_claude_directive_ends_with_the_wake_paragraph(self):
+        sm = self.make_manager()
+        policy = sm._session_directive(self._sess())
+        peers = ha.PEERS_SYSTEM_PROMPT.format(path=ha.PEERS_FILE, sid="abcde", host=sm.device)
+        self.assertEqual(policy, ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT
+                         + peers + ha.wake_directive())
+        self.assertIn("do not sleep in a", policy)
+        self.assertIn(" wake <N>m <what to check>` and end the turn", policy)
+
+    def test_wake_command_matches_the_session_cli_allow_rule(self):
+        """The taught command must start with the allow rule's prefix, or every
+        wake call prompts — the very thing the directive exists to avoid."""
+        cmd = ha.wake_directive().split("`")[1]
+        prefix = ha.session_cli_allow_rule()[len("Bash("):-len(":*)")]
+        self.assertTrue(cmd.startswith(prefix + " wake "), (cmd, prefix))
+
+    def test_a_path_that_needs_quoting_is_not_taught(self):
+        """Quoted in the command but raw in the rule, the two never match, so a
+        Windows path or one with a space withholds the paragraph instead."""
+        for path in (r"C:\Program Files\turma\hooks\session_cli.py",
+                     "/home/john doe/turma-agent/hooks/session_cli.py"):
+            self.assertEqual(ha.wake_directive(path), "", path)
+        safe = "/opt/turma-agent/hooks/session_cli.py"
+        cmd = ha.wake_directive(safe).split("`")[1]
+        prefix = ha.session_cli_allow_rule(safe)[len("Bash("):-len(":*)")]
+        self.assertTrue(cmd.startswith(prefix + " wake "), (cmd, prefix))
+
+    def test_dsh_and_qwen_are_not_taught_the_cli(self):
+        sm = self.make_manager()
+        for rt in ("dsh", "qwen"):
+            self.assertNotIn(" wake <N>m", sm._session_directive(self._sess(agentType=rt), "X"))
+            self.assertTrue(sm._session_directive(self._sess(agentType=rt), "X").endswith("X"))
+
+
 class TestWakeRequest(ManagerMixin, unittest.TestCase):
     """XERK-1564: a session's `session_cli.py wake` file becomes wakeAt/wakeReason
     on its record (surviving a manager restart), and the beat stages the wake-up
@@ -17357,6 +17399,21 @@ class TestWakeRequest(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["wakeReason"], "check CI")
         self.assertEqual(payload["session"]["wakeAt"], 1_786_400_000_000)
         self.assertEqual(payload["session"]["wakeReason"], "check CI")
+
+    def test_a_wake_past_the_cli_cap_is_no_request(self):
+        """A hand-written wake.json further out than the CLI's 7d cap (plus an
+        hour of slack) is ignored, so a session cannot sleep out of review
+        indefinitely; one inside the cap is read."""
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        now_ms = 1_786_400_000_000
+        with mock.patch.object(ha.time, "time", return_value=now_ms / 1000):
+            self._write({"wakeAt": now_ms + ha.WAKE_MAX_AHEAD_MS + 1, "reason": "r"})
+            self.assertIsNone(ha.read_wake_request(self.SID))
+            self.assertNotIn("wakeAt", self._payload(sm, sess)["session"])
+            ok = now_ms + 7 * 24 * 3600 * 1000
+            self._write({"wakeAt": ok, "reason": "r"})
+            self.assertEqual(ha.read_wake_request(self.SID)["wakeAt"], ok)
 
     def test_no_request_serves_no_fields(self):
         sm = self.make_manager()
