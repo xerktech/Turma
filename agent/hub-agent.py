@@ -11526,7 +11526,9 @@ JUDGE_ALLOWED_MAX = 512
 JUDGE_ALLOWED_KEEP_SEC = 600
 JUDGE_OUTPUT_MAX = 8192
 JUDGE_REASON_MAX = 300
-JUDGE_ALIVE_EVERY_SEC = 10
+# Re-marked before every request and model attempt, so the marker is at most
+# this + JUDGE_TIMEOUT_SEC old — under permlog's JUDGE_ALIVE_MAX_AGE_SEC (30).
+JUDGE_ALIVE_EVERY_SEC = 5
 JUDGE_SWEEP_EVERY_SEC = 60
 # A req/ans file older than this was left by a hook that died mid-wait.
 JUDGE_LEFTOVER_SEC = 300
@@ -11551,21 +11553,50 @@ _JUDGE_SEG = r"[^\n;&|]*"
 # Where a flag or ref ENDS: whitespace, the end, or shell punctuation — so
 # `(git push --mirror)`, `git push -f&&…` and a quoted `bash -c` form match too.
 _JUDGE_END = r"(?=[\s'\"`;&|()<>]|$)"
+# Where an abbreviated long option ends (also `=`, its value).
+_JUDGE_OPT_END = r"(?=[=\s'\"`;&|()<>]|$)"
+# A ref or refspec may sit behind quotes (`'+feat'`, `"main"`, `$'…'`).
+_JUDGE_QUOTE = r"\$?['\"]*"
+
+
+def _judge_long_opt(*names):
+    """`--<any non-empty prefix of a name>`. git accepts a unique prefix of a
+    long option (`--mirr`, `--del`, `--prun`), so matching only the full word
+    misses ordinary forms. A prefix git would call ambiguous matches too —
+    erring to "a human decides"."""
+    alts = sorted({n[:i] for n in names for i in range(1, len(n) + 1)},
+                  key=len, reverse=True)
+    return r"\s--(?:" + "|".join(re.escape(a) for a in alts) + ")" + _JUDGE_OPT_END
+
+
 _JUDGE_NEVER = (
     (re.compile(rf"\bgit\b{_JUDGE_SEG}\bpush\b{_JUDGE_SEG}"
-                r"(?:\s(?:--force\S*|-f|--mirror|--all|--delete|-d|--prune)" + _JUDGE_END +
-                r"|\s-[A-Za-z]*f[A-Za-z]*" + _JUDGE_END + r"|\s[+:]\S)"),
+                r"(?:\s--force\S*" + _JUDGE_END +
+                "|" + _judge_long_opt("force", "mirror", "all", "delete", "prune") +
+                r"|\s-[A-Za-z0-9]*[fd][A-Za-z0-9]*" + _JUDGE_END +
+                r"|[\s=]" + _JUDGE_QUOTE + r"[+:]\S)"),
      "a force, mirror, all-branch, pruning or deleting push"),
-    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bpush\b{_JUDGE_SEG}[\s:/](?:main|master)"
-                r"(?=[\s'\"`;&|()<>:]|$)"),
+    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bpush\b{_JUDGE_SEG}[\s:/]" + _JUDGE_QUOTE +
+                r"(?:main|master)(?=[\s'\"`;&|()<>:]|$)"),
      "a push naming main or master"),
     (re.compile(rf"\bgit\b{_JUDGE_SEG}\bbranch\b{_JUDGE_SEG}"
-                r"\s(?:-[A-Za-z]*[dD][A-Za-z]*|--delete)" + _JUDGE_END),
+                r"(?:\s-[A-Za-z]*[dD][A-Za-z]*" + _JUDGE_END +
+                "|" + _judge_long_opt("delete") + ")"),
      "deleting a branch"),
+    # A remote's mirror/push config (`git -c remote.origin.mirror=true push`,
+    # `git config remote.origin.push '+refs/*'`) turns a plain push into one.
+    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bremote\.[^\s=]*\.(?:mirror|push)\b", re.IGNORECASE),
+     "a remote's mirror or push config"),
     (re.compile(r"\b(?:gh|glab)\s+(?:pr|mr)\s+merge\b"), "merging a PR/MR"),
     (re.compile(r"\baz\s+repos\s+pr\s+(?:update|complete)\b"), "completing a PR"),
     (re.compile(rf"\bgh\s+api\b{_JUDGE_SEG}(?:-X|--method)[\s=]*['\"]?(?:DELETE|PUT|PATCH)\b",
                 re.IGNORECASE), "a mutating gh api call"),
+    # A merge through the REST API (`…/merges` — `-f` alone makes gh POST —
+    # `…/pulls/N/merge`, `…/merge-upstream`) or any call naming the default
+    # branch's ref.
+    (re.compile(rf"\bgh\s+api\b{_JUDGE_SEG}(?:/merges?\b|\brefs/heads/(?:main|master)\b)"),
+     "a merge or default-branch change through gh api"),
+    (re.compile(rf"\bgh\s+repo\s+sync\b{_JUDGE_SEG}\s--force\b"), "a forced gh repo sync"),
     (re.compile(r"\bgh\s+(?:repo|release|secret|variable|run|cache)\s+delete\b"),
      "a gh delete"),
     (re.compile(rf"\b(?:terraform|tofu|terragrunt)\b{_JUDGE_SEG}"
@@ -30311,6 +30342,11 @@ class SessionManager:
         except OSError:
             names = []
         for name in self._judge_pick(names):
+            # A pass of model calls outlives the hook's freshness window
+            # (permlog JUDGE_ALIVE_MAX_AGE_SEC), so re-mark before each request
+            # (throttled) — else a prompt arriving mid-pass skips the judge.
+            self._judge_mark_alive(bool(self.permission_policy),
+                                   time.time() if now is None else now)
             self._judge_request_file(name, policy, now)
         if self._judge_swept_at is None or start - self._judge_swept_at >= JUDGE_SWEEP_EVERY_SEC:
             self._judge_swept_at = start
@@ -30446,6 +30482,8 @@ class SessionManager:
         for _attempt in range(JUDGE_ATTEMPTS):
             if answer_by is not None and time.time() + JUDGE_TIMEOUT_SEC > answer_by:
                 return "stand", "no time left to judge before the prompt moved on"
+            # One request's attempts can outlast the marker's freshness too.
+            self._judge_mark_alive(bool(self.permission_policy), time.time())
             parsed = parse_judge_verdict(self._run_judge_model(prompt))
             if parsed is not None:
                 return parsed

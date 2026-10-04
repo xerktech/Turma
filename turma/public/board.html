@@ -1879,6 +1879,10 @@ function closePermissionPanel() {
 function savePermissionPolicy(text) {
   if (permState.busy || permState.loading || !permState.siteKey) return;
   permState.busy = true;
+  // The busy repaint rebuilds the textarea from permState.text: carry the
+  // operator's edit there, so a refused save still shows it (a success
+  // replaces it with what the hub stored).
+  if (typeof text === "string") permState.text = text;
   paintPermissionPanel();
   return permissionRequest("POST", { text });
 }

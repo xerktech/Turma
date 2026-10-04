@@ -156,6 +156,11 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
 - **The never-list's flag/ref ends are shell punctuation too** (`_JUDGE_END`): `(git push
   --mirror)`, `git push -f&&…`, `bash -c 'git push -f'` all stand. guard.py allows these, so the
   never-list is the only layer in front of the model for them.
+- **git long options match by PREFIX** (`_judge_long_opt`): git takes any unique abbreviation, so
+  `--mirr`, `--del`, `--prun`, `--al` really push. A refspec or ref may sit behind a quote
+  (`'+feat'`, `'main'`). Also stood: `gh api …/merges`/`…/merge`/`refs/heads/main`, `gh repo sync
+  --force`, and a `remote.*.mirror|push` config (`git -c …`, `git config …`). Pin each new form in
+  `test_the_never_list_stands_before_any_model_call`.
 - **`parse_judge_verdict` is STRICT**: exactly one JSON object (one ``` fence tolerated) with
   exactly `verdict` (allow|stand) + non-empty `reason`. Anything else retries, then stands.
 - **On allow for a PermissionDenied**: the one-shot grant (`_write_grant`, `GRANTS_DIR/<sid>/

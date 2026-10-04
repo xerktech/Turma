@@ -37996,6 +37996,21 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
                 "bash -c 'git push -f'", "bash -c \"git push origin main\"",
                 "(git push origin master)", "(git branch -D old)",
                 "git push origin feat -f;echo done", "git push -f>/dev/null",
+                # git takes a unique PREFIX of a long option.
+                "git push --mirr origin", "git push origin --del feat",
+                "git push --al origin", "git push --no-verify --mirro",
+                "git push origin --prun", "git push --del=feat", "git push -ud origin x",
+                "git branch --del feat",
+                # A quoted refspec or ref.
+                "git push origin '+refs/heads/x:refs/heads/x'", 'git push origin "+feat"',
+                "git push origin '+feat'", "git push origin 'main'",
+                # A merge or default-branch change outside `git push`.
+                "gh api repos/o/r/merges -f base=main -f head=feat",
+                "gh api -X POST repos/o/r/merges -f base=main -f head=x",
+                "gh api repos/o/r/git/refs/heads/main -f sha=abc",
+                "gh repo sync o/fork --force",
+                "git -c remote.origin.mirror=true push origin",
+                "git config remote.origin.push '+refs/heads/*'",
         )):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(ha.judge_never_reason(cmd), cmd)
@@ -38013,7 +38028,12 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         for cmd in ("npm run e2e", "git push -u origin XERK-1-thing",
                     "git push origin feature/main-fix", "pytest -q",
                     "gh pr view 12", "kubectl get pods -n web",
-                    "docker build -t x .", "cd /repos/.turma/worktrees/a && npm test"):
+                    "docker build -t x .", "cd /repos/.turma/worktrees/a && npm test",
+                    # Long options that only SHARE a first letter with a never-list one.
+                    "git push --dry-run origin x", "git push --follow-tags origin x",
+                    "git push --progress origin x", "git push --atomic origin x",
+                    "git push --porcelain origin x", "git push --no-verify origin feat",
+                    "git branch --list", "gh api repos/o/r/pulls/3", "gh repo sync o/fork"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(ha.judge_never_reason(cmd))
 
@@ -38250,6 +38270,29 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         self.run_model.assert_not_called()
 
     # --- policy text + stand-down ------------------------------------------------
+
+    def test_the_alive_marker_stays_fresh_through_a_long_pass(self):
+        # Each model call is made to look like it took 100s: the marker the
+        # hook checks must be fresh again before the NEXT call, or a prompt
+        # arriving mid-pass skips the judge.
+        alive = os.path.join(ha.PERMISSIONS_DIR, ha.JUDGE_ALIVE_FILE)
+        ages = []
+
+        def slow_model(_prompt):
+            ages.append(time.time() - os.lstat(alive).st_mtime)
+            old = time.time() - 100
+            os.utime(alive, (old, old))
+            self.sm._judge_alive_at = old
+            return None             # unusable: retried, then stands
+        self.run_model.side_effect = slow_model
+        self.req(nonce="aa000001")
+        self.req(nonce="aa000002")
+        self.sm._judge_pass()
+        self.assertEqual(len(ages), 2 * ha.JUDGE_ATTEMPTS)
+        self.assertTrue(all(a < ha.JUDGE_ALIVE_EVERY_SEC for a in ages), ages)
+        self.assertLess(ha.JUDGE_ALIVE_EVERY_SEC + ha.JUDGE_TIMEOUT_SEC,
+                        ha._permlog_module().JUDGE_ALIVE_MAX_AGE_SEC,
+                        "a marker re-made before each attempt stays under permlog's age cap")
 
     def test_without_a_policy_the_judge_stands_down(self):
         alive = os.path.join(ha.PERMISSIONS_DIR, ha.JUDGE_ALIVE_FILE)
