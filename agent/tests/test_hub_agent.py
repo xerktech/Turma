@@ -20,6 +20,7 @@ import inspect
 import io
 import json
 import os
+import stat
 import re
 import shlex
 import socket
@@ -39868,6 +39869,9 @@ class TestDecisionsFile(ManagerMixin, unittest.TestCase):
         os.remove(self._path())
         os.mkfifo(self._path())
         self.sm._ingest_decisions(reply)
+        # Checked BEFORE the open: a blocking open of a FIFO left in place would
+        # hang the suite instead of failing this test.
+        self.assertTrue(stat.S_ISREG(os.lstat(self._path()).st_mode), "FIFO not replaced")
         with open(self._path(), encoding="utf-8") as f:
             self.assertIn("Postgres", f.read())
 

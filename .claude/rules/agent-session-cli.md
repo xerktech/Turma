@@ -241,8 +241,9 @@ Hub side (the request, the store, the routes, the page): `turma-brief.md`.
   `_ingest_peers`. Written only when the text changed OR the file's BYTES differ (Bash walks past
   the Edit deny, so a tampered file is restored next reply). Compared by bytes, never mtime — a
   same-uid session can `touch -d` a forged file's mtime back; a non-regular file (FIFO) reads as
-  tampered without blocking. mkstemp + `os.replace`, never a fixed temp name. Every cell flattened and capped, each entry ONE `- ` line (no forged heading). A reply
-  without a usable block REMOVES it — fails narrow like the roster. Never raises.
+  tampered without blocking. mkstemp + `os.replace`, never a fixed temp name.
+- **Each decisions entry is ONE `- ` line**, every cell flattened and capped (no forged heading).
+  A reply without a usable block REMOVES the file — fails narrow like the roster. Never raises.
 - **Guard**: `Read(~/.turma/decisions-*.md)` allowed (the directive points at it),
   `Edit(~/.turma/decisions-*.md)` denied and pinned in `EXPECTED_DENY_RULES`.
 - **`_session_directive` names the file only once THIS manager rendered it from a reply**

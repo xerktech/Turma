@@ -23473,7 +23473,11 @@ test("XERK-1574: POST /api/orgs/<site>/decisions records a note; refusals mint n
   assert.deepEqual((await fleet()).decisions[S], [ok.body.decision]);
   // The org's hosts get it on their next reply, keyed on the DECIDED org.
   const reply = await beat1574("dcHostA", S);
-  assert.deepEqual(reply.body.decisions, { org: S, entries: [ok.body.decision] });
+  // The reply carries only the cells the agent writes to its file, never the
+  // row's id/host/sessionId/label.
+  const { at, source, text } = ok.body.decision;
+  assert.deepEqual(reply.body.decisions, { org: S, entries: [{ at, source, text }] });
+  assert.ok(ok.body.decision.id, "the stored row keeps its id");
   delete agents.dcHostA;
   delete hub.getDecisions()[S];
 });

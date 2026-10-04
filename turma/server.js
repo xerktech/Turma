@@ -3329,7 +3329,7 @@ function cleanBriefNarrative(v) {
     .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
     // Control/bidi/zero-width (all but the newline), then every other
     // non-newline whitespace, become spaces BEFORE the per-line heading and
-    // bullet passes \u2014 a leading one would hide a heading or bullet from this
+    // bullet passes — a leading one would hide a heading or bullet from this
     // pass and expose it to the next. Explicit ASCII classes after that, so the
     // agent's Python mirror (wider \s and \d) agrees exactly.
     .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ")
@@ -15208,7 +15208,16 @@ function broadcastDecisions() {
 // in no decided org gets `org: ""` and no entries, so its file goes away.
 function decisionsReplyFor(key) {
   const org = agents[key] ? decidedOrgOf(agents[key]) : "";
-  return { org, entries: org ? (decisions[org] || []).slice(-DECISIONS_REPLY_TAIL) : [] };
+  // Only the cells `render_decisions` writes: id/host/sessionId/label never reach
+  // the file, and this rides every heartbeat reply.
+  const entries = org ? (decisions[org] || []).slice(-DECISIONS_REPLY_TAIL).map((e) => {
+    const out = {};
+    for (const k of ["at", "source", "ticket", "question", "answer", "text"]) {
+      if (e && e[k] !== undefined) out[k] = e[k];
+    }
+    return out;
+  }) : [];
+  return { org, entries };
 }
 
 // The cadence gate, on the leader's orchestration tick: an org gets a fresh brief

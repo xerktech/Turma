@@ -142,6 +142,8 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
   undelivered command. A row is taken only from the host ASKED, for the brief ASKED about, while
   that host is still decided into the org (`ingestBriefNarratives`) — a host cannot write another
   org's summary, or one nobody asked for. A hub restart/failover mid-render just loses it.
+- **A restart can waste one Haiku run per org**: a `renderBrief` already in a host's persisted
+  queue still runs, but `briefRenders` is gone, so its row is dropped. Accepted, not a leak.
 - **`sanitizeBrief` whitelists it**: `cleanBriefNarrative` (fences, tags, link syntax,
   `* \` # ~ | < > [ ]`, list bullets and control/bidi chars stripped, whitespace collapsed, cut at
   1200 on a word with "…"). A FIXED POINT, so a sanitized brief stays one (HA echo dedup). Empty =
