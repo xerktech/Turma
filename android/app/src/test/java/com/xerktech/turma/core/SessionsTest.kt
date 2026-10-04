@@ -256,6 +256,7 @@ class SessionsTest {
         assertEquals("waiting for your answer", attentionLabel(att("needs-you:question", now, "Ship it?")))
         assertEquals("waiting for your permission", attentionLabel(att("needs-you:permission", now, "Bash: ls")))
         assertEquals("review", attentionLabel(att("needs-you:review", now)))
+        assertEquals("awaiting your test · PR open", attentionLabel(att("needs-you:test", now, "PR open")))
         assertEquals(null, attentionLabel(att("working", now)))
         assertEquals(null, attentionLabel(null))
         assertEquals(true, attentionStalled(att("needs-you:stalled", now)))

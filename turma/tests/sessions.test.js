@@ -537,6 +537,27 @@ test("attention: the classifier's why and suggested answer, and a loop reads sta
   assert.equal(r.split('class="att-hint').length - 1, 3, r);
 });
 
+// XERK-1572 screenshot pass: a review the classifier says needs a human TEST
+// names that in its headline, the dashboard State row's word, instead of reading
+// as a plain "PR awaiting review" whose only difference was its third line.
+test("attention: a needs-you:test card's headline says it awaits your test", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const pr = [{ url: "https://github.com/o/r/pull/7", state: "OPEN" }];
+  const { now, host: h } = host([
+    { ...finished("84444", "Login Page", { attention: { state: "needs-you:test", since: t - 40 * 60 * 1000,
+      why: "PR open · CI passing",
+      hint: { label: "needs-human-test", why: "Wants the login page checked." } } }), prs: pr },
+    { ...finished("85555", "Plain PR", { attention: { state: "needs-you:review", since: t - 60000,
+      why: "PR open · CI passing" } }), prs: pr },
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML;
+  assert.ok(r.includes('<div class="state review">awaiting your test'), r);
+  assert.ok(r.includes('<div class="state review">PR awaiting review'), r);
+  assert.equal(r.split("PR awaiting review").length - 1, 1, "only the plain review reads PR awaiting review");
+});
+
 // XERK-735. The card's second line reads repo · related ticket · pc name ·
 // session id, one line, and the ticket key links to that ticket's detail on the
 // board rather than out to Jira.

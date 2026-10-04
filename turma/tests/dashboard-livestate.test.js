@@ -250,7 +250,33 @@ test("dashboard State row: the classifier's why and suggested answer", () => {
       { label: "needs-human-test", why: "Wants the login page checked." } },
       session: { paneBusy: false, transcriptAgeSec: 5, lastRole: "assistant", lastHasToolUse: false } }, NOW);
   const state = card.match(/<dt>State<\/dt><dd>[\s\S]*?<\/dd>/)[0];
-  assert.ok(state.includes('<div class="sess-hint"><b>needs a human test</b> · Wants the login page checked.</div>'), state);
+  // The test state is named on the State row, the Sessions card's headline word.
+  assert.ok(state.includes('<b class="sess-review">awaiting your test</b>'), state);
+  assert.ok(!state.includes("sess-hint"), "the verdict is its own row, not inside State");
+  assert.ok(card.includes('<dt></dt><dd><div class="sess-hint"><b>needs a human test</b> · Wants the login page checked.</div></dd>'), card);
+});
+
+// XERK-1572 screenshot pass: the verdict answers a question or a permission, so
+// it reads AFTER the Question / Permission row, the order the Sessions page uses
+// — never above the thing it answers.
+test("dashboard card: the verdict row follows the question or permission it answers", () => {
+  const { sessCard } = loadDashboard();
+  const host = { key: "h1", online: true, lastSeen: NOW, terminalOnline: true };
+  const hint = { label: "rubber-stamp", why: "Routine test run.", suggestedAnswer: "Yes" };
+  const perm = sessCard(host, { id: "s1", status: "running", repo: "r",
+    attention: { state: "needs-you:permission", since: NOW, why: "Bash: npm test -- --runInBand", hint },
+    session: { paneBusy: false, transcriptAgeSec: 5, panePrompt: { prompt: "Do you want to proceed?" } } }, NOW);
+  const ask = perm.indexOf("<dt>Permission</dt><dd>Bash: npm test -- --runInBand</dd>");
+  assert.ok(ask > 0, perm);
+  assert.ok(perm.indexOf("Suggested: Yes") > ask, perm);
+  assert.ok(perm.indexOf("Routine test run.") > ask, perm);
+  const q = sessCard(host, { id: "s2", status: "running", repo: "r",
+    attention: { state: "needs-you:question", since: NOW, why: "Backfill online or offline?",
+      hint: { label: "design-decision", why: "A migration strategy call.", suggestedAnswer: "Online backfill" } },
+    session: { paneBusy: false, transcriptAgeSec: 5, question: "Backfill online or offline?" } }, NOW);
+  const qi = q.indexOf("<dt>Question</dt>");
+  assert.ok(qi > 0, q);
+  assert.ok(q.indexOf("Suggested: Online backfill") > qi, q);
 });
 
 // XERK-538: a QA / QA-delta pass reads "QA Review" while staying working (Active).

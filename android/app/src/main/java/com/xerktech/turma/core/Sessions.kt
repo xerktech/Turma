@@ -211,8 +211,9 @@ fun attentionWhy(att: Attention?, now: Long): String {
 
 /**
  * A fleet card's State row for a session the hub says needs the operator (XERK-1571,
- * web index.html `attentionLabel`): "review · PR open · CI passing", "stalled ·
- * Watch CI", "waiting for your answer", "waiting for your permission". Null when it
+ * web index.html `attentionLabel`): "review · PR open · CI passing", "awaiting your
+ * test · PR open", "stalled · Watch CI", "waiting for your answer", "waiting for your
+ * permission". Null when it
  * doesn't — the card then keeps its own live-state word. Used where that word would
  * be "idle", so a session Ready for review lists never reads idle on its own card.
  */
@@ -221,7 +222,10 @@ fun attentionLabel(att: Attention?): String? {
     val chip = needsYouChip(att.state) ?: return null
     if (chip == "question") return "waiting for your answer"
     if (chip == "permission") return "waiting for your permission"
-    return listOf(chip, att.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
+    // A review the classifier says needs a human TEST (XERK-1572) reads as one,
+    // not as a bare "test" chip word — the web dashboard and Sessions headline.
+    val word = if (chip == "test") "awaiting your test" else chip
+    return listOf(word, att.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
 }
 
 /** Does the hub say this session has STALLED on a background wait (XERK-1571)? */

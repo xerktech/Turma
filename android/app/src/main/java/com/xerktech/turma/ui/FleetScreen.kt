@@ -570,18 +570,6 @@ private fun SessionCard(
                         overflow = TextOverflow.Ellipsis,
                     )
                 }
-                // The wait classifier's verdict and suggested answer (XERK-1572, web
-                // index.html State row `.sess-hint`), on a running needs-you card.
-                if (st == "running" && !killing) {
-                    val hint = com.xerktech.turma.core.attentionHintLine(session.attention)
-                    if (hint.isNotEmpty()) {
-                        Text(hint, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    }
-                    val suggested = com.xerktech.turma.core.attentionSuggested(session.attention)
-                    if (suggested.isNotEmpty()) {
-                        Text(suggested, style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
-                    }
-                }
                 // What a permission dialog asks for (XERK-1571, web Permission row):
                 // the hub's why — the pending command — not the dialog's generic question.
                 session.attention?.takeIf { it.state == "needs-you:permission" }?.why
@@ -594,6 +582,19 @@ private fun SessionCard(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
+                // The wait classifier's verdict and suggested answer (XERK-1572, web
+                // index.html `.sess-hint` row), on a running needs-you card, AFTER the
+                // question / permission it answers, as on both web pages.
+                if (st == "running" && !killing) {
+                    val hint = com.xerktech.turma.core.attentionHintLine(session.attention)
+                    if (hint.isNotEmpty()) {
+                        Text(hint, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                    val suggested = com.xerktech.turma.core.attentionSuggested(session.attention)
+                    if (suggested.isNotEmpty()) {
+                        Text(suggested, style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                }
                 if (st == "error" && session.errorMsg.isNotBlank()) {
                     Text(session.errorMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 2)
                 }

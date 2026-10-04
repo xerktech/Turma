@@ -2413,7 +2413,11 @@ function reviewState(s, live, now) {
   if (s.attention?.state === "needs-you:stalled")
     return { ...live, kind: "review", stalled: true, hint,
              label: ["stalled", s.attention.why].filter(Boolean).join(" · "), why };
-  const label = (s.prs || []).some(p => !prLanded(p)) ? "PR awaiting review" : "finished · awaiting review";
+  // A review the classifier says needs a human TEST (XERK-1572) says so in its
+  // headline, the dashboard card's State row word, so it never reads as a plain
+  // review whose only difference is its third line.
+  const label = s.attention?.state === "needs-you:test" ? "awaiting your test"
+    : (s.prs || []).some(p => !prLanded(p)) ? "PR awaiting review" : "finished · awaiting review";
   return { ...live, kind: "review", label, detail: live.detail, why, hint };
 }
 

@@ -127,8 +127,12 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   Android types it (`AttentionHint`), so a corrupt `state.json` must not reach the wire.
 - **Surfaces** — one wording (`HINT_KIND`: "decision · …", "needs a human test · …", then
   "Suggested: …"): the Ready-for-review cards on the Sessions page (`.att-hint`, from `reviewState`),
-  the dashboard card's State row (`attentionHintHtml`, needs-you only), Android
+  the dashboard card's own unlabelled row (`attentionHintHtml`, needs-you only), Android
   `attentionHintLine`/`attentionSuggested` on both cards, glasses phone card (`attentionHint`).
+- **The verdict reads AFTER what it answers** on every card: below the question / permission row
+  (dashboard, Android fleet card) as on the Sessions card — never inside the State row above it.
+- **`needs-you:test` is named "awaiting your test"**: the dashboard State row, the Sessions review
+  card's headline (`reviewState`) and Android's `attentionLabel`, so it never reads as plain review.
 - **A looping card never reads "working"**: the dashboard State row (`liveState`, a `loop` + hub
   stall), the Sessions review card (`reviewState`), Android's fleet card and Sessions card dot
   (`attentionStalled`) and the glasses phone card (`st-stalled`) speak the hub's stall.
