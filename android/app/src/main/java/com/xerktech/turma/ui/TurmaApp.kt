@@ -220,7 +220,11 @@ fun TurmaApp(
         }
         composable(TopDest.BRIEF.route) {
             MainScaffold(TopDest.BRIEF, goTab) { m ->
-                BriefScreen(modifier = m, onOpenChat = { h, s -> nav.navigate(Routes.chat(h, s)) })
+                BriefScreen(
+                    modifier = m,
+                    onOpenChat = { h, s -> nav.navigate(Routes.chat(h, s)) },
+                    onOpenEnded = { h, tid -> nav.navigate(Routes.ended(h, tid)) },
+                )
             }
         }
         composable(

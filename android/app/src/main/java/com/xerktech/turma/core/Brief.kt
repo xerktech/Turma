@@ -29,6 +29,14 @@ private val BRIEF_STALE_LABEL = mapOf(
     "not-reproducible" to "not reproducible", "already-fixed" to "already fixed",
 )
 
+/**
+ * How a Finished row finished — leads its meta, with the age where the hub knows
+ * it (a PR carries no merge time). web brief.html `FINISHED_VERB`.
+ */
+private val BRIEF_FINISHED_VERB = mapOf(
+    "ticket" to "done", "pr" to "merged", "session" to "ended",
+)
+
 /** One section's rows off a brief, by [BRIEF_SECTIONS] key. */
 fun briefSection(b: OrgBrief, key: String): List<BriefItem> = when (key) {
     "needsYou" -> b.needsYou
@@ -91,8 +99,9 @@ fun briefDur(ms: Long): String {
 /**
  * A row's meta line — web brief.html `itemHtml`'s meta, part for part: the
  * attention state, its why, the reason it is next (or how it was closed), the
- * session's note, then "in <eta>" or "<age> ago", the ticket key of a non-ticket
- * row and the host.
+ * session's note, then "in <eta>" or "<age> ago" (a Finished row's led by how it
+ * finished — "done 3h ago", "merged"), the ticket key of a non-ticket row and the
+ * host.
  */
 fun briefItemMeta(section: String, item: BriefItem, now: Long): String {
     val parts = mutableListOf<String>()
@@ -108,8 +117,14 @@ fun briefItemMeta(section: String, item: BriefItem, now: Long): String {
     if (why != null) parts += why
     if (reason != null) parts += if (section == "closedStale") BRIEF_STALE_LABEL[reason] ?: reason else reason
     if (note != null) parts += note
-    if (eta != null && eta > now) parts += "in ${briefDur(eta - now)}"
-    else if (since != null && section != "nextUp") parts += "${briefDur(now - since)} ago"
+    val verb = if (section == "finished") BRIEF_FINISHED_VERB[item.kind] else null
+    if (eta != null && eta > now) {
+        parts += "in ${briefDur(eta - now)}"
+    } else if (since != null && section != "nextUp") {
+        parts += (if (verb != null) "$verb " else "") + "${briefDur(now - since)} ago"
+    } else if (verb != null) {
+        parts += verb
+    }
     if (item.kind != "ticket" && key != null) parts += key
     if (host != null && section != "nextUp") parts += host
     return parts.joinToString(" · ")

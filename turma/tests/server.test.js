@@ -22824,6 +22824,15 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
       { id: "c1", summary: "ended run", closedAt: iso(now - 3 * H),
         prs: [{ url: "https://github.com/x/y/pull/8", state: "MERGED", title: "Earlier" }] },
       { id: "c0", summary: "ended long ago", closedAt: iso(now - 30 * 24 * H) },
+      // Closed its ticket as stale: counted under closedStale, not Finished too.
+      { id: "c2", summary: "chased flaky upload", closedAt: iso(now - 2 * H),
+        ticket: { key: "A-7", siteKey: A, summary: "flaky upload",
+          outcome: { kind: "already-fixed", at: now - 2 * H } } },
+      // Worked the Done ticket A-1: the ticket row stands for it (and takes its host).
+      { id: "c3", summary: "worked A-1", closedAt: iso(now - 2 * H),
+        ticket: { key: "A-1", siteKey: A, summary: "shipped" } },
+      // Nothing else stands for it: a Finished session row, with when + its transcript.
+      { id: "c4", summary: "plain run", closedAt: iso(now - 3 * H), transcriptId: "t-c4" },
     ],
   });
   setAttn("brHostA", "q1", { state: "needs-you:question", since: now - 10 * 60000, why: "Ship it?" });
@@ -22857,10 +22866,19 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   assert.equal(b.needsYou[1].state, "needs-you:question");
   assert.deepEqual(b.stalled.map((i) => i.sessionId), ["st1"]);
   assert.deepEqual(b.waiting.map((i) => [i.sessionId, i.eta]), [["w1", now + 20 * 60000]]);
-  // Finished: the Done ticket resolved in the period, both merged PRs, the ended session.
+  // Finished: the Done ticket resolved in the period, both merged PRs, and ONE
+  // ended session — each piece of work once. c1 is its PR #8 row, c2 its stale
+  // close, c3 the Done ticket A-1's row (XERK-1573 screenshot pass).
   assert.deepEqual(b.finished.map((i) => [i.kind, i.kind === "pr" ? i.url : i.key || i.sessionId]).sort(), [
     ["pr", "https://github.com/x/y/pull/8"], ["pr", "https://github.com/x/y/pull/9"],
-    ["session", "c1"], ["ticket", "A-1"]]);
+    ["session", "c4"], ["ticket", "A-1"]]);
+  assert.equal(b.counts.finished, 4);
+  // Every finished row says when (a PR carries no merge time) and where.
+  const fin = Object.fromEntries(b.finished.map((i) => [i.key || i.sessionId || i.url, i]));
+  assert.equal(fin["A-1"].since, now - 2 * H, "the ticket's resolved time");
+  assert.equal(fin["A-1"].host, "brHostA", "the host of the session that worked it");
+  assert.equal(fin.c4.since, now - 3 * H, "the session's closedAt");
+  assert.equal(fin.c4.transcriptId, "t-c4", "so the row can open the ended session");
   // Intake/outflow off the rows' created/resolved dates.
   assert.equal(b.counts.intake, 2);
   assert.equal(b.counts.outflow, 1);
@@ -22870,7 +22888,7 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   assert.match(b.nextUp[1].reason, /^oldest first · created 60d ago/);
   // Closed as stale by its session.
   assert.deepEqual(b.closedStale.map((i) => [i.key, i.reason, i.note]),
-    [["A-9", "not-reproducible", "ran 50x, green"]]);
+    [["A-9", "not-reproducible", "ran 50x, green"], ["A-7", "already-fixed", undefined]]);
   // Spend: the subscription, its live 5h window, the rolled-over 7d window
   // dropped, and the pause it drives.
   assert.deepEqual(b.spend, [{ label: "Team plan", fiveHourPct: 95,

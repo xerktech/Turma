@@ -144,6 +144,7 @@ data class BriefItem(
     val url: String? = null,
     val host: String? = null,
     val sessionId: String? = null,
+    val transcriptId: String? = null,
     val state: String? = null,
     val why: String? = null,
     val reason: String? = null,

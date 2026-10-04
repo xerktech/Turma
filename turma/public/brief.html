@@ -94,6 +94,9 @@ const STATE_LABEL = {
   waiting: "waiting", sleeping: "sleeping",
 };
 const STALE_LABEL = { "not-reproducible": "not reproducible", "already-fixed": "already fixed" };
+// How a Finished row finished — leads its meta, with the age where the hub knows
+// it (a PR carries no merge time). Android `BRIEF_FINISHED_VERB`.
+const FINISHED_VERB = { ticket: "done", pr: "merged", session: "ended" };
 
 // A duration as the brief words it (Android `briefDur`, same thresholds).
 function dur(ms) {
@@ -117,6 +120,10 @@ function itemHref(sec, it, site) {
   if (it.kind === "session" && it.sessionId && sec !== "finished") {
     return `/sessions?session=${encodeURIComponent(it.sessionId)}`;
   }
+  // An ended session opens read-only by its conversation, as the board's chips do.
+  if (it.kind === "session" && sec === "finished" && it.transcriptId) {
+    return `/sessions?ended=${encodeURIComponent(it.transcriptId)}`;
+  }
   return "";
 }
 
@@ -131,8 +138,10 @@ function itemHtml(sec, it, site, now) {
   if (sec === "closedStale" && it.reason) meta.push(`<span class="why">${esc(STALE_LABEL[it.reason] || it.reason)}</span>`);
   else if (it.reason) meta.push(esc(it.reason));
   if (it.note) meta.push(esc(it.note));
+  const verb = sec === "finished" ? FINISHED_VERB[it.kind] || "" : "";
   if (it.eta && it.eta > now) meta.push(`in ${esc(dur(it.eta - now))}`);
-  else if (it.since && sec !== "nextUp") meta.push(`${esc(ago(it.since, now))} ago`);
+  else if (it.since && sec !== "nextUp") meta.push(`${verb ? verb + " " : ""}${esc(ago(it.since, now))} ago`);
+  else if (verb) meta.push(verb);
   if (it.kind !== "ticket" && it.key) meta.push(`<span class="key">${esc(it.key)}</span>`);
   if (it.host && sec !== "nextUp") meta.push(esc(it.host));
   return `<li class="brief-item"><div class="brief-title">${key}${text}</div>`
@@ -160,7 +169,7 @@ function countsHtml(b) {
     + stat("", "Waiting", c.waiting)
     + stat("", "Finished", c.finished)
     + stat("", "Intake", c.intake)
-    + stat("", "Closed", c.outflow)
+    + stat("", "Resolved", c.outflow)
     + `</div>`;
 }
 

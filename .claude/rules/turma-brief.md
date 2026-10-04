@@ -29,7 +29,11 @@ paragraph and the per-org decisions log are XERK-1574.
   - **finished** — Done rows whose `resolved` (agent `resolutiondate` / ADO `ClosedDate`; an older
     agent's row falls back to `updated`) is in the period, MERGED PRs on the org's sessions no
     earlier brief reported (a PR carries no merge time), and sessions whose `closedAt` is in the
-    period;
+    period. Each row carries `since` (resolved / `closedAt`; a PR has none) so the row says when;
+  - **one piece of work is ONE finished row** — an ended session is dropped when its merged PR is a
+    row here, its ticket's Done row is (that row takes the session's host), or its ticket is in
+    closedStale. Listing it too made "Finished 7" of five things. A kept session row carries
+    `transcriptId`, so both clients open it read-only (`?ended=` / `Routes.ended`);
   - **"already reported" is `prsReported`, never the `finished` rows** — those keep 10 and drop with
     their brief, so a merged PR cut from the list (or on a session outliving `BRIEFS_KEEP` briefs)
     was finished again. The newest brief alone carries it forward (≤500 URLs, the ones a session
@@ -48,7 +52,8 @@ paragraph and the per-org decisions log are XERK-1574.
   - **spend** — per subscription the org spends, the freshest non-stale `limits` (a window whose
     `resetsAt` passed is dropped), and whether `pausedSubscriptions` pauses it (XERK-544/548);
   - **counts** — every section's UNCAPPED total plus intake/outflow (rows `created`/resolved in the
-    period). The rows are what hosts poll (assignee-scoped, recent Done only).
+    period). The rows are what hosts poll (assignee-scoped, recent Done only). Both clients label
+    outflow **"Resolved"**, never "Closed" — that read as the "Closed as stale" section's number.
 
 ## The store — a LOW-churn registerExternalStore
 

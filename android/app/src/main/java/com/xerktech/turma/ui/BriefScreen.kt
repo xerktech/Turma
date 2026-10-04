@@ -49,6 +49,7 @@ import com.xerktech.turma.vm.BriefViewModel
 fun BriefScreen(
     modifier: Modifier = Modifier,
     onOpenChat: (String, String) -> Unit = { _, _ -> },
+    onOpenEnded: (host: String, transcriptId: String) -> Unit = { _, _ -> },
     vm: BriefViewModel = viewModel(),
 ) {
     LaunchedEffect(Unit) { vm.start() }
@@ -85,6 +86,7 @@ fun BriefScreen(
                     error = errors[site],
                     onBriefNow = { vm.briefNow(site) },
                     onOpenChat = onOpenChat,
+                    onOpenEnded = onOpenEnded,
                 )
             }
         }
@@ -102,6 +104,7 @@ private fun OrgBriefCard(
     error: String?,
     onBriefNow: () -> Unit,
     onOpenChat: (String, String) -> Unit,
+    onOpenEnded: (String, String) -> Unit,
 ) {
     TurmaCard(Modifier.fillMaxWidth()) {
         Column(Modifier.padding(14.dp)) {
@@ -140,7 +143,7 @@ private fun OrgBriefCard(
                     modifier = Modifier.padding(top = 8.dp),
                 )
             } else {
-                BriefBody(brief, earlier, now, onOpenChat)
+                BriefBody(brief, earlier, now, onOpenChat, onOpenEnded)
             }
         }
     }
@@ -148,7 +151,13 @@ private fun OrgBriefCard(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun BriefBody(brief: OrgBrief, earlier: Int, now: Long, onOpenChat: (String, String) -> Unit) {
+private fun BriefBody(
+    brief: OrgBrief,
+    earlier: Int,
+    now: Long,
+    onOpenChat: (String, String) -> Unit,
+    onOpenEnded: (String, String) -> Unit,
+) {
     Column {
         FlowRow(
             Modifier.fillMaxWidth().padding(top = 10.dp),
@@ -160,7 +169,7 @@ private fun BriefBody(brief: OrgBrief, earlier: Int, now: Long, onOpenChat: (Str
             BriefStat("Waiting", c.waiting, null)
             BriefStat("Finished", c.finished, null)
             BriefStat("Intake", c.intake, null)
-            BriefStat("Closed", c.outflow, null)
+            BriefStat("Resolved", c.outflow, null)
         }
         // Needs you always shows (an empty one is the good news); the others only
         // when they have rows — web brief.html's section rule.
@@ -179,7 +188,7 @@ private fun BriefBody(brief: OrgBrief, earlier: Int, now: Long, onOpenChat: (Str
                 Text("Nothing is waiting on you.", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-            for (row in rows) BriefRow(key, row, now, onOpenChat)
+            for (row in rows) BriefRow(key, row, now, onOpenChat, onOpenEnded)
             if (total > rows.size) {
                 Text("+${total - rows.size} more", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
@@ -217,15 +226,26 @@ private fun BriefStat(label: String, n: Long, color: Color?) {
 }
 
 @Composable
-private fun BriefRow(section: String, item: BriefItem, now: Long, onOpenChat: (String, String) -> Unit) {
+private fun BriefRow(
+    section: String,
+    item: BriefItem,
+    now: Long,
+    onOpenChat: (String, String) -> Unit,
+    onOpenEnded: (String, String) -> Unit,
+) {
     val uri = LocalUriHandler.current
     val host = item.host
     val sid = item.sessionId
+    val tid = item.transcriptId
     val url = item.url
-    // Same targets as the web rows: a live session opens its chat, a PR its page.
+    // Same targets as the web rows: a live session opens its chat, an ended one
+    // its read-only review, a PR its page.
     val onClick: (() -> Unit)? = when {
         item.kind == "session" && section != "finished" && host != null && sid != null -> {
             { onOpenChat(host, sid) }
+        }
+        item.kind == "session" && section == "finished" && host != null && !tid.isNullOrBlank() -> {
+            { onOpenEnded(host, tid) }
         }
         item.kind == "pr" && url != null && (url.startsWith("https://") || url.startsWith("http://")) -> {
             { uri.openUri(url) }

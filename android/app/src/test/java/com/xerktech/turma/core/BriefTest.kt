@@ -69,6 +69,20 @@ class BriefTest {
         assertEquals("not reproducible · ran 50x · 60m ago · h1", briefItemMeta("closedStale", z, now))
     }
 
+    @Test fun `briefItemMeta leads a Finished row with how and when it finished`() {
+        val now = 10_000_000L
+        val t = BriefItem(kind = "ticket", title = "shipped", key = "A-1", since = now - 7_200_000, host = "h1")
+        assertEquals("done 2h ago · h1", briefItemMeta("finished", t, now))
+        // A PR carries no merge time: the verb alone.
+        val p = BriefItem(kind = "pr", title = "Fix it", url = "https://x/pull/9", key = "A-2", host = "h1")
+        assertEquals("merged · A-2 · h1", briefItemMeta("finished", p, now))
+        val s = BriefItem(kind = "session", title = "run", sessionId = "c4", transcriptId = "t-c4",
+            since = now - 600_000, host = "h1")
+        assertEquals("ended 10m ago · h1", briefItemMeta("finished", s, now))
+        // Only the Finished section words it so.
+        assertEquals("2h ago · h1", briefItemMeta("closedStale", t, now))
+    }
+
     @Test fun `briefSectionCount is the uncapped total, never below the rows shown`() {
         val rows = List(10) { BriefItem(kind = "session", title = "s$it") }
         val b = OrgBrief(counts = BriefCounts(needsYou = 15), needsYou = rows, waiting = rows.take(2))

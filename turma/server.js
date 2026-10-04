@@ -3198,7 +3198,7 @@ function sanitizeBriefItem(v) {
   if (!kind || !title) return null;
   const out = { kind, title };
   for (const [k, n] of [["key", 64], ["url", 500], ["host", 200], ["sessionId", 100],
-    ["state", 40], ["why", 200], ["reason", 200], ["note", 300]]) {
+    ["transcriptId", 100], ["state", 40], ["why", 200], ["reason", 200], ["note", 300]]) {
     const s = str(v[k], n);
     if (s !== undefined) out[k] = s;
   }
@@ -14296,8 +14296,9 @@ function compileBrief(siteKey, now, trigger, prevList) {
 
   // Finished since the last brief: Done tickets (resolved — or, from an agent
   // predating `resolved`, last updated — in the period), merged PRs, ended
-  // sessions. Intake/outflow count the same rows' created/resolved dates. The
-  // rows are what the hosts poll (assignee-scoped, recent Done only).
+  // sessions — each piece of work ONCE (the ended sessions are cut below, once
+  // closedStale is known). Intake/outflow count the same rows' created/resolved
+  // dates. The rows are what the hosts poll (assignee-scoped, recent Done only).
   const finished = [];
   let intake = 0;
   let outflow = 0;
@@ -14305,7 +14306,8 @@ function compileBrief(siteKey, now, trigger, prevList) {
     if (isoIn(t.created)) intake++;
     if (t.statusCategory === "done" && isoIn(t.resolved || t.updated)) {
       outflow++;
-      finished.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url });
+      finished.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
+        since: Date.parse(t.resolved || t.updated) });
     }
   }
   // A PR carries no merge time, so "merged since the last brief" is a MERGED PR
@@ -14339,12 +14341,14 @@ function compileBrief(siteKey, now, trigger, prevList) {
       for (const p of mergedOf(s)) visiblePrs.add(p.url);
     }
   }
+  const ended = [];   // sessions that ended in the period; cut against the rest below
   for (const [key, a] of hosts) {
     for (const s of a.sessions || []) if (s) addPrs(key, s);
     for (const c of a.closedSessions || []) {
       if (!c || !isoIn(c.closedAt)) continue;
-      finished.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
-        key: ticketKey(c) });
+      ended.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
+        key: ticketKey(c), since: Date.parse(c.closedAt),
+        transcriptId: typeof c.transcriptId === "string" ? c.transcriptId : undefined });
       addPrs(key, c);
     }
   }
@@ -14420,6 +14424,24 @@ function compileBrief(siteKey, now, trigger, prevList) {
     for (const s of a.sessions || []) addStale(key, s);
     for (const c of a.closedSessions || []) addStale(key, c);
     for (const r of a.repos || []) for (const c of (r && r.resumable) || []) addStale(key, c);
+  }
+
+  // An ended session is the SAME piece of work as a row already counted when its
+  // merged PR is a Finished row, its ticket's Done row is, or its ticket was
+  // closed as stale — so it is a Finished row only when nothing else stands for
+  // it (else one piece of work counts two or three times). A Done ticket takes
+  // the host of the session that worked it, so the "where" is not lost.
+  const sessionTag = (host, id) => `${host}\x00${id}`;
+  const covered = new Set();
+  for (const it of finished) if (it.kind === "pr") covered.add(sessionTag(it.host, it.sessionId));
+  for (const it of closedStale) covered.add(sessionTag(it.host, it.sessionId));
+  const doneTickets = new Map(finished.filter((it) => it.kind === "ticket").map((it) => [it.key, it]));
+  const staleKeys = new Set(closedStale.map((it) => it.key));
+  for (const e of ended) {
+    const done = e.key ? doneTickets.get(e.key) : undefined;
+    if (done && !done.host) done.host = e.host;
+    if (done || (e.key && staleKeys.has(e.key)) || covered.has(sessionTag(e.host, e.sessionId))) continue;
+    finished.push(e);
   }
 
   // Spend vs the subscription window (XERK-544): one entry per subscription the
