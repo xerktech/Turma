@@ -34,6 +34,12 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
   carries a folded merged PR, which a tap opens (the web links its "merged PR" bit) — and the phone
   shows a row's age/ETA relative only. Earlier briefs are a count on the phone, an expandable list of
   headline counts on the web. Same sections, counts, order and "Brief now" otherwise.
+- **Brief decisions log (XERK-1574) — read-only on the phone.** Both show the brief's model-written
+  Summary above the sections and the org's newest ten decisions, newest first. Recording a decision
+  by hand (the web's note box, `POST /api/orgs/<site>/decisions`) is WEB-ONLY for now: a phone
+  composer needs a text field + refusal handling in `BriefViewModel`, deferred to keep this change
+  small. The phone also lists the log only under an org it already shows (a decided org or one with
+  a kept brief); the web additionally lists an org whose only content is its log.
 - **Manual Refresh button on the Dashboard.** The web dashboard has no explicit refresh control (it
   auto-polls + SSE); the phone keeps a header Refresh button for a deliberate re-poll. It now shows a
   spinner while the awaited `/api/agents` poll runs (a short visible floor so a fast poll still reads
