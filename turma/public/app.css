@@ -268,7 +268,9 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
    the two segments the board's chips carried, laid out as a list row. A button
    can't nest a button, so the row is a plain container. */
 .org-row {
-  display: flex; align-items: stretch; border-radius: 999px; overflow: hidden;
+  /* flex-shrink: 0 — `overflow: hidden` zeroes a flex item's min-height, so with
+     many orgs the rows squashed to a few px instead of scrolling the menu (XERK-1285). */
+  display: flex; align-items: stretch; border-radius: 999px; overflow: hidden; flex-shrink: 0;
   --org: var(--muted);
 }
 .org-row:hover { background: color-mix(in srgb, var(--ink) 6%, transparent); }
