@@ -803,7 +803,9 @@ class AgentDecodeTest {
                 "nextUp": [ { "kind": "ticket", "title": "do it", "key": "O-1",
                               "reason": "P0 preempts the line · created 2h ago" } ],
                 "finished": [ { "kind": "session", "title": "run", "host": "h", "sessionId": "c4",
-                                "transcriptId": "t-c4", "since": 1200 } ],
+                                "transcriptId": "t-c4", "since": 1200 },
+                              { "kind": "ticket", "title": "fix", "key": "O-2",
+                                "prUrl": "https://github.com/x/y/pull/42", "since": 1300 } ],
                 "spend": [ { "label": "Team plan", "fiveHourPct": 95, "fiveHourResetsAt": 9000,
                              "paused": true } ]
               } ] } }
@@ -818,9 +820,12 @@ class AgentDecodeTest {
         assertEquals(1500L, b.needsYou.single().since)
         assertNull(b.needsYou.single().eta)
         assertEquals("O-1", b.nextUp.single().key)
-        assertEquals("t-c4", b.finished.single().transcriptId)
+        assertEquals("t-c4", b.finished.first().transcriptId)
+        assertNull(b.finished.first().prUrl)
+        assertEquals("https://github.com/x/y/pull/42", b.finished[1].prUrl)
         assertNull(b.needsYou.single().transcriptId)
         assertEquals(95.0, b.spend.single().fiveHourPct!!, 0.0)
+        assertEquals(9000L, b.spend.single().fiveHourResetsAt)
         assertTrue(b.spend.single().paused)
         assertTrue(b.waiting.isEmpty())
         val older = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [ $plainHost ] }""")

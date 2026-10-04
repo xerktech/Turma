@@ -30,8 +30,10 @@ import com.xerktech.turma.core.briefDur
 import com.xerktech.turma.core.briefItemMeta
 import com.xerktech.turma.core.briefLiveOrgs
 import com.xerktech.turma.core.briefOrgs
+import com.xerktech.turma.core.briefPrUrl
 import com.xerktech.turma.core.briefSection
 import com.xerktech.turma.core.briefSectionCount
+import com.xerktech.turma.core.briefSpendWindow
 import com.xerktech.turma.core.orgName
 import com.xerktech.turma.model.BriefItem
 import com.xerktech.turma.model.OrgBrief
@@ -200,8 +202,8 @@ private fun BriefBody(
                 modifier = Modifier.padding(top = 12.dp, bottom = 2.dp))
             for (s in brief.spend) {
                 val bits = mutableListOf(s.label)
-                s.fiveHourPct?.let { bits += "5h ${Math.round(it)}%" }
-                s.sevenDayPct?.let { bits += "7d ${Math.round(it)}%" }
+                briefSpendWindow("5h", s.fiveHourPct, s.fiveHourResetsAt, now)?.let { bits += it }
+                briefSpendWindow("7d", s.sevenDayPct, s.sevenDayResetsAt, now)?.let { bits += it }
                 if (s.paused) bits += "auto-start paused"
                 Text(bits.joinToString(" · "), style = MaterialTheme.typography.bodySmall,
                     color = if (s.paused) TurmaColors.warning else Color.Unspecified)
@@ -238,9 +240,14 @@ private fun BriefRow(
     val sid = item.sessionId
     val tid = item.transcriptId
     val url = item.url
+    val prUrl = briefPrUrl(item)
     // Same targets as the web rows: a live session opens its chat, an ended one
-    // its read-only review, a PR its page.
+    // its read-only review, a PR its page — and a Done ticket its folded merged PR
+    // (web links the row's "merged PR").
     val onClick: (() -> Unit)? = when {
+        item.kind == "ticket" && prUrl != null -> {
+            { uri.openUri(prUrl) }
+        }
         item.kind == "session" && section != "finished" && host != null && sid != null -> {
             { onOpenChat(host, sid) }
         }

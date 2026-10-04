@@ -83,6 +83,27 @@ class BriefTest {
         assertEquals("2h ago · h1", briefItemMeta("closedStale", t, now))
     }
 
+    @Test fun `a Done ticket carries its folded merged PR`() {
+        val now = 10_000_000L
+        val t = BriefItem(kind = "ticket", title = "shipped", key = "P-1", since = now - 3_600_000,
+            host = "h1", prUrl = "https://github.com/x/y/pull/42")
+        assertEquals("done 60m ago · merged PR · h1", briefItemMeta("finished", t, now))
+        assertEquals("https://github.com/x/y/pull/42", briefPrUrl(t))
+        // Only an http(s) link is a link (web safeUrl).
+        val bad = t.copy(prUrl = "javascript:alert(1)")
+        assertEquals(null, briefPrUrl(bad))
+        assertEquals("done 60m ago · h1", briefItemMeta("finished", bad, now))
+    }
+
+    @Test fun `briefSpendWindow says when each window resets`() {
+        val now = 10_000_000L
+        assertEquals("5h 95%, resets in 52m", briefSpendWindow("5h", 95.2, now + 52 * 60_000L, now))
+        assertEquals("7d 40%, resets in 3d", briefSpendWindow("7d", 40.0, now + 3 * 86_400_000L, now))
+        assertEquals("5h 95%, has reset since", briefSpendWindow("5h", 95.0, now - 1000, now))
+        assertEquals("7d 40%", briefSpendWindow("7d", 40.0, null, now))
+        assertEquals(null, briefSpendWindow("5h", null, now + 1000, now))
+    }
+
     @Test fun `briefSectionCount is the uncapped total, never below the rows shown`() {
         val rows = List(10) { BriefItem(kind = "session", title = "s$it") }
         val b = OrgBrief(counts = BriefCounts(needsYou = 15), needsYou = rows, waiting = rows.take(2))

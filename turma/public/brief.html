@@ -47,6 +47,7 @@
   .brief-title .key { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); margin-right: 6px; }
   .brief-meta { color: var(--muted); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
   .brief-meta .why { color: var(--ink-2); }
+  .brief-meta a { color: var(--accent-text); text-decoration: none; }
   .brief-sec.needs .brief-meta .state { color: var(--warning-text); }
   .brief-sec.stalled .brief-meta .state { color: var(--critical-text); }
   .brief-more { color: var(--muted); font-size: 12px; padding-top: 4px; }
@@ -142,18 +143,33 @@ function itemHtml(sec, it, site, now) {
   if (it.eta && it.eta > now) meta.push(`in ${esc(dur(it.eta - now))}`);
   else if (it.since && sec !== "nextUp") meta.push(`${verb ? verb + " " : ""}${esc(ago(it.since, now))} ago`);
   else if (verb) meta.push(verb);
+  // A Done ticket's merged PR folds into its row (one piece of work, one row).
+  const pr = safeUrl(it.prUrl);
+  if (pr) meta.push(`<a href="${esc(pr)}" target="_blank" rel="noopener">merged PR</a>`);
   if (it.kind !== "ticket" && it.key) meta.push(`<span class="key">${esc(it.key)}</span>`);
   if (it.host && sec !== "nextUp") meta.push(esc(it.host));
   return `<li class="brief-item"><div class="brief-title">${key}${text}</div>`
     + (meta.length ? `<div class="brief-meta">${meta.join(" · ")}</div>` : "") + `</li>`;
 }
 
-function spendHtml(b) {
+// One subscription window: its used share and when it resets, worded off NOW —
+// the brief is a snapshot, so a reset that has passed since says so. Android
+// `briefSpendWindow`.
+function spendWindow(name, pct, resetsAt, now) {
+  if (typeof pct !== "number") return "";
+  let out = `${name} ${Math.round(pct)}%`;
+  if (typeof resetsAt === "number" && resetsAt > 0) {
+    out += resetsAt > now ? `, resets in ${dur(resetsAt - now)}` : ", has reset since";
+  }
+  return out;
+}
+
+function spendHtml(b, now) {
   if (!b.spend || !b.spend.length) return "";
   const row = (s) => {
     const bits = [`<b>${esc(s.label)}</b>`];
-    if (typeof s.fiveHourPct === "number") bits.push(`5h ${Math.round(s.fiveHourPct)}%`);
-    if (typeof s.sevenDayPct === "number") bits.push(`7d ${Math.round(s.sevenDayPct)}%`);
+    for (const w of [spendWindow("5h", s.fiveHourPct, s.fiveHourResetsAt, now),
+      spendWindow("7d", s.sevenDayPct, s.sevenDayResetsAt, now)]) if (w) bits.push(esc(w));
     if (s.paused) bits.push(`<span class="paused">auto-start paused</span>`);
     return `<span>${bits.join(" · ")}</span>`;
   };
@@ -210,7 +226,7 @@ function orgHtml(site, list, now, live) {
   const when = `${esc(clock(b.at))} · covers the ${esc(ago(b.since, b.at))} before`
     + (b.trigger === "manual" ? " · on demand" : "");
   return `<section class="brief-org">` + headHtml(site, name, when, live)
-    + countsHtml(b) + secs + spendHtml(b)
+    + countsHtml(b) + secs + spendHtml(b, now)
     + (earlier ? `<details class="brief-earlier"><summary>Earlier briefs (${list.length - 1})</summary><ul class="brief-list">${earlier}</ul></details>` : "")
     + `</section>`;
 }

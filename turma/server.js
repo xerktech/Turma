@@ -3197,7 +3197,7 @@ function sanitizeBriefItem(v) {
   const title = str(v.title, 200);
   if (!kind || !title) return null;
   const out = { kind, title };
-  for (const [k, n] of [["key", 64], ["url", 500], ["host", 200], ["sessionId", 100],
+  for (const [k, n] of [["key", 64], ["url", 500], ["prUrl", 500], ["host", 200], ["sessionId", 100],
     ["transcriptId", 100], ["state", 40], ["why", 200], ["reason", 200], ["note", 300]]) {
     const s = str(v[k], n);
     if (s !== undefined) out[k] = s;
@@ -14348,7 +14348,8 @@ function compileBrief(siteKey, now, trigger, prevList) {
       if (!c || !isoIn(c.closedAt)) continue;
       ended.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
         key: ticketKey(c), since: Date.parse(c.closedAt),
-        transcriptId: typeof c.transcriptId === "string" ? c.transcriptId : undefined });
+        transcriptId: typeof c.transcriptId === "string" ? c.transcriptId : undefined,
+        prUrls: mergedOf(c).map((p) => p.url) });   // matching only; sanitizeBrief drops it
       addPrs(key, c);
     }
   }
@@ -14444,12 +14445,28 @@ function compileBrief(siteKey, now, trigger, prevList) {
   const covered = new Set();
   for (const it of finished) if (it.kind === "pr") covered.add(sessionTag(it.host, it.sessionId));
   for (const it of closedStale) covered.add(sessionTag(it.host, it.sessionId));
+  // By URL too: two sessions carrying one merged PR give it ONE row (seenPrs), and
+  // the session that did not get it is that same piece of work.
+  const prRowUrls = new Set(finished.filter((it) => it.kind === "pr").map((it) => it.url));
   const doneTickets = new Map(finished.filter((it) => it.kind === "ticket").map((it) => [it.key, it]));
   for (const e of ended) {
     const done = e.key ? doneTickets.get(e.key) : undefined;
     if (done && !done.host) done.host = e.host;
-    if (done || (e.key && staleKeys.has(e.key)) || covered.has(sessionTag(e.host, e.sessionId))) continue;
+    if (done || (e.key && staleKeys.has(e.key)) || covered.has(sessionTag(e.host, e.sessionId))
+      || e.prUrls.some((u) => prRowUrls.has(u))) continue;
     finished.push(e);
+  }
+  // A merged PR on a ticket whose Done row is here is that SAME piece of work
+  // (the hands-off flow: the session merges, the ticket goes Done), so it folds
+  // INTO the ticket row as its PR link — never a second Finished row. It stays in
+  // this brief's reported-PR memory (newPrs), so no later brief re-reports it.
+  for (let i = finished.length - 1; i >= 0; i--) {
+    const it = finished[i];
+    const done = it.kind === "pr" && it.key ? doneTickets.get(it.key) : undefined;
+    if (!done) continue;
+    done.prUrl = it.url;   // walking back, the ticket keeps its FIRST PR's link
+    if (!done.host) done.host = it.host;
+    finished.splice(i, 1);
   }
 
   // Spend vs the subscription window (XERK-544): one entry per subscription the

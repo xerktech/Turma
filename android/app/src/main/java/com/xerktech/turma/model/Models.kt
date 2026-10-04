@@ -134,7 +134,8 @@ data class BriefCounts(
  * One row of a brief section. [kind] is "ticket" | "pr" | "session"; the rest is
  * whatever that row has: a ticket's [key], a PR's [url], a session's [host] +
  * [sessionId] + attention [state]/[why], the [reason] a ticket is next (or the
- * stale-close kind), [since]/[eta] in epoch ms.
+ * stale-close kind), [since]/[eta] in epoch ms. A finished ticket's [prUrl] is the
+ * merged PR folded into its row (one piece of work, one row).
  */
 @Serializable
 data class BriefItem(
@@ -142,6 +143,7 @@ data class BriefItem(
     val title: String = "",
     val key: String? = null,
     val url: String? = null,
+    val prUrl: String? = null,
     val host: String? = null,
     val sessionId: String? = null,
     val transcriptId: String? = null,

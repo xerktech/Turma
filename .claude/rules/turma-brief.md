@@ -31,9 +31,13 @@ paragraph and the per-org decisions log are XERK-1574.
     earlier brief reported (a PR carries no merge time), and sessions whose `closedAt` is in the
     period. Each row carries `since` (resolved / `closedAt`; a PR has none) so the row says when;
   - **one piece of work is ONE finished row** — an ended session is dropped when its merged PR is a
-    row here, its ticket's Done row is (that row takes the session's host), or its ticket is in
-    closedStale. Listing it too made "Finished 7" of five things. A kept session row carries
-    `transcriptId`, so both clients open it read-only (`?ended=` / `Routes.ended`);
+    row here (by session or by URL), its ticket's Done row is (that row takes the session's host),
+    or its ticket is in closedStale. Listing it too made "Finished 7" of five things. A kept session
+    row carries `transcriptId`, so both clients open it read-only (`?ended=` / `Routes.ended`);
+  - **a merged PR whose ticket's Done row is here FOLDS into that row** as `prUrl` (the hands-off
+    flow: the session merges, the ticket goes Done) — two rows doubled Finished and the push's
+    "N finished". It still enters `prsReported`, so no later brief reports it; a PR whose ticket is
+    not Done stays its own row. Web links "merged PR"; Android opens it on a tap of the row;
   - **a stale-closed ticket is never a finished row** — XERK-1569 closes it to a Done-category status
     (Won't Do, Cannot Reproduce), so its row reads done + resolved in the period. closedStale is its
     one row; outflow still counts it (it left the board);
@@ -55,7 +59,9 @@ paragraph and the per-org decisions log are XERK-1574.
   - **closedStale** — `ticket.outcome` of kind `not-reproducible`/`already-fixed` in the period
     (a `done` close is finished work, not a stale close);
   - **spend** — per subscription the org spends, the freshest non-stale `limits` (a window whose
-    `resetsAt` passed is dropped), and whether `pausedSubscriptions` pauses it (XERK-544/548);
+    `resetsAt` passed is dropped), and whether `pausedSubscriptions` pauses it (XERK-544/548).
+    Each window carries its `*ResetsAt`; both clients word it off NOW ("resets in 52m", "has
+    reset since" once it passed — the brief is a snapshot);
   - **counts** — every section's UNCAPPED total plus intake/outflow (rows `created`/resolved in the
     period). The rows are what hosts poll (assignee-scoped, recent Done only). Both clients label
     outflow **"Resolved"**, never "Closed" — that read as the "Closed as stale" section's number.
@@ -100,10 +106,11 @@ paragraph and the per-org decisions log are XERK-1574.
 - `brief.html` (nav `brief`): every org a host is decided into (the served `org`) plus any org with
   a kept brief, so an org with none yet still offers **Brief now**. Refusals toast the hub's words.
 - Android `BriefScreen` (bottom-nav `Brief`) renders the same off `FleetState.briefs`; `core/Brief.kt`
-  ports the org list (`briefOrgs`, `briefLiveOrgs`), the row meta line (`briefItemMeta`) and `briefDur`. Deliberate
+  ports the org list (`briefOrgs`, `briefLiveOrgs`), the row meta line (`briefItemMeta`),
+  `briefPrUrl`, `briefSpendWindow` and `briefDur`. Deliberate
   differences in `android/PARITY.md`.
 - Tests: the `XERK-1573:` cases in `server.test.js` (composition + decided-org scoping, bounds +
   keep + the headline-only wire, the push dedupe/retract + a newcomer past the cut, a merged PR
-  reported once, hold/reject + offline-host exclusion, the cadence + retention, the route, the
+  reported once, a merged PR + its Done ticket counting ONE row, hold/reject + offline-host exclusion, the cadence + retention, the route, the
   sanitizer + restart restore); `nav.test.js`;
   `test_full_issue` (`resolved`) in `test_hub_agent.py`; android `BriefTest`, `AgentDecodeTest`.

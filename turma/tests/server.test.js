@@ -22922,6 +22922,38 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   resetAutoStart();
 });
 
+test("XERK-1573: a merged PR and its ticket's Done row are ONE finished row", async () => {
+  const S = "brP1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const pr = "https://github.com/x/y/pull/42";
+  // The hands-off flow: the session on P-1 merged PR #42 and P-1 went Done.
+  await asBeat("brHostP", S, { autoStart: false,
+    tickets: [{ key: "P-1", summary: "the fix", statusCategory: "done",
+      created: iso(now - 9 * 24 * H), resolved: iso(now - H) }],
+    sessions: [{ id: "p1", status: "running", summary: "worked P-1",
+      ticket: { key: "P-1", siteKey: S, summary: "the fix" },
+      prs: [{ url: pr, state: "MERGED", title: "Fix P-1" }] }],
+    closedSessions: [{ id: "p0", summary: "earlier run on P-1", closedAt: iso(now - 2 * H),
+      ticket: { key: "P-1", siteKey: S, summary: "the fix" },
+      prs: [{ url: pr, state: "MERGED", title: "Fix P-1" }] }],
+  });
+  const b = hub.compileBrief(S, now, "scheduled", []);
+  assert.equal(b.counts.finished, 1, "one piece of work, one Finished row");
+  assert.deepEqual(b.finished.map((i) => [i.kind, i.key]), [["ticket", "P-1"]]);
+  assert.equal(b.finished[0].prUrl, pr, "the ticket row carries its PR link");
+  assert.equal(b.finished[0].host, "brHostP");
+  // Still remembered as reported: the next brief does not finish it as a PR row.
+  const b2 = hub.compileBrief(S, now + 1000, "scheduled", [b]);
+  assert.deepEqual(b2.finished, []);
+  // A merged PR whose ticket is NOT Done stays its own row.
+  agents.brHostP.jira.tickets[0].statusCategory = "inprogress";
+  const b3 = hub.compileBrief(S, now, "scheduled", []);
+  assert.deepEqual(b3.finished.map((i) => [i.kind, i.url]), [["pr", pr]]);
+  delete agents.brHostP;
+});
+
 test("XERK-1573: the brief bounds its lists and keeps the newest BRIEFS_KEEP", async () => {
   const S = "brC1573.atlassian.net";
   const now = Date.now();

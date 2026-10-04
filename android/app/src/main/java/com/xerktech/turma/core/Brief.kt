@@ -97,11 +97,31 @@ fun briefDur(ms: Long): String {
 }
 
 /**
+ * A Done ticket row's folded merged PR, when it is an http(s) link — web
+ * brief.html `safeUrl(it.prUrl)`. The row opens it (web links the "merged PR" bit).
+ */
+fun briefPrUrl(item: BriefItem): String? =
+    item.prUrl?.takeIf { it.startsWith("https://") || it.startsWith("http://") }
+
+/**
+ * One subscription window — its used share and when it resets, worded off [now]
+ * (the brief is a snapshot, so a reset that has since passed says so). Null with
+ * no share. web brief.html `spendWindow`.
+ */
+fun briefSpendWindow(name: String, pct: Double?, resetsAt: Long?, now: Long): String? {
+    if (pct == null) return null
+    val base = "$name ${Math.round(pct)}%"
+    val at = resetsAt ?: return base
+    if (at <= 0L) return base
+    return if (at > now) "$base, resets in ${briefDur(at - now)}" else "$base, has reset since"
+}
+
+/**
  * A row's meta line — web brief.html `itemHtml`'s meta, part for part: the
  * attention state, its why, the reason it is next (or how it was closed), the
  * session's note, then "in <eta>" or "<age> ago" (a Finished row's led by how it
- * finished — "done 3h ago", "merged"), the ticket key of a non-ticket row and the
- * host.
+ * finished — "done 3h ago", "merged"), a Done ticket's folded "merged PR", the
+ * ticket key of a non-ticket row and the host.
  */
 fun briefItemMeta(section: String, item: BriefItem, now: Long): String {
     val parts = mutableListOf<String>()
@@ -125,6 +145,7 @@ fun briefItemMeta(section: String, item: BriefItem, now: Long): String {
     } else if (verb != null) {
         parts += verb
     }
+    if (briefPrUrl(item) != null) parts += "merged PR"
     if (item.kind != "ticket" && key != null) parts += key
     if (host != null && section != "nextUp") parts += host
     return parts.joinToString(" · ")
