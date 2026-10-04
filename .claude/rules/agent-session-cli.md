@@ -105,8 +105,10 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 
 - **`pauseSleeper` (command) → `pause_sleeper`**: the same `kill` an operator click runs (worktree,
   branch, ticket, transcript kept) with `paused={wakeAt, wakeReason, pausedAt}` stamped on the
-  closed record and served as `closedSessions[].paused` (`_paused_wire`). Runs in
-  `handle_commands`, like every kill — never staged from the beat.
+  closed record and served as `closedSessions[].paused` (`_paused_wire`). Runs INLINE in
+  `handle_commands`, on the beat loop, like every operator kill (one teardown, up to ~15s).
+- **The hub keeps ONE `pauseSleeper` in flight per host** (`pauseSleepersFor`), so a beat runs at
+  most one automated kill — never N teardowns summing past `OFFLINE_AFTER_MS` (XERK-395).
 - **The agent re-checks before it kills** (`_sleeper_unpausable`): running, an int `wakeAt` at
   least `PAUSE_SLEEPER_MIN_AHEAD_MS` away, and the LAST beat's signals quiet (`_note_quiet` →
   `self._quiet[sid] = (pane, work)`): `paneBusy is False`, no panePrompt, no question, no live
@@ -144,6 +146,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   early-resume pause refusal belong to the carried wake only.
 - **`TURMA_RESUME_WAKE_PROMPT=1` rides a DUE wake on the launch instead** (`claude --resume <id> --
   <text>`, `_launch_tmux`'s positional prompt). OFF until a real pane proves `--resume` submits it.
+  - **claude only**: `_launch_qwen`/`_launch_dsh` drop a prompt on resume, so any other runtime
+    takes the default record-and-stage path, or its wake text is lost.
 - The resume's `resumeRelaunch` stamp applies: a doomed `--resume` relaunches fresh, and that fresh
   launch clears the wake with the rest of the request dir (a conversation's wake dies with it).
 - Tests: `TestSleeperSlot`.

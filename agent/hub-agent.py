@@ -23854,7 +23854,11 @@ class SessionManager:
         `wakeAt`/`wakeReason` + `wakeResumedAt`, and `_deliver_due_wakes` stages
         the text through the operator input path once the resumed pane reads an
         idle composer. A wake still ahead (an operator resumed it early) is just
-        a sleeping session again — the v1 path wakes it."""
+        a sleeping session again — the v1 path wakes it.
+
+        Only a claude launch takes the prompt: `_launch_qwen`/`_launch_dsh` drop
+        one on resume, so every other runtime takes the default path, or its
+        wake text would be lost for good."""
         if not isinstance(paused, dict):
             return None
         at = paused.get("wakeAt")
@@ -23863,7 +23867,8 @@ class SessionManager:
         reason = paused.get("wakeReason")
         reason = reason if isinstance(reason, str) else None
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
-        if RESUME_WAKE_PROMPT_ARG and at <= now_ms:
+        if (RESUME_WAKE_PROMPT_ARG and at <= now_ms
+                and (sess.get("agentType") or "claude") == "claude"):
             return wake_text(reason)
         sess["wakeAt"] = at
         sess["wakeReason"] = reason
@@ -34535,7 +34540,8 @@ class SessionManager:
     def _closed_payload(self):
         """Killed-but-resumable sessions for the hub's per-repo Resume picker and
         its Ended-sessions list, newest first. Already capped at CLOSED_PER_REPO
-        per repo, so this can never balloon the heartbeat."""
+        per repo, plus at most PAUSED_KEEP_MAX paused sleepers per host, which
+        that cap exempts (XERK-1575), so this can never balloon the heartbeat."""
         return [
             {
                 "id": c.get("id"),

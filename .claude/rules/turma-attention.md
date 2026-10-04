@@ -202,7 +202,11 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 - **The hub decides; the agent executes on the command path.** Only the hub sees the ticket queue,
   so `pauseSleepersFor` (end of `drainTicketQueue`) and `wakePausedSleepers` (start of the drain,
   and every `masterOrchestrationTick`, since the drain returns early on an empty queue) queue
-  ordinary commands: `pauseSleeper` and `resume` + `wake:true`. Never a kill/resume on the beat.
+  ordinary commands: `pauseSleeper` and `resume` + `wake:true`. The hub never kills or resumes.
+- **One pause in flight per HOST** (`pausing` in `pauseSleepersFor`): the agent kills inline in
+  `handle_commands` on its beat loop (~15s teardown each), so N pauses in one beat could outrun
+  `OFFLINE_AFTER_MS` (XERK-395). A host with a `pauseSleeper` queued or unacked takes no second;
+  the other waiting tickets get their slots on later passes (the wake's one-per-host rule too).
 - **One pause per still-waiting ticket.** Waiting = entries the drain just held `capacity`
   (`waitingFull`). Each pause is stamped with the ticket it answers (`pauseFor`, its queue key,
   hub-only like `ticketSite` — `INTERNAL_COMMAND_FIELDS`), and a ticket with an unacked pause on

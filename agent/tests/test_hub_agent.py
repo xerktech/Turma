@@ -17870,6 +17870,23 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         self.assertIn("-- 'Wake-up: check CI on PR #412. Check it and continue.'", launch)
         self.assertNotIn("wakeAt", sm._find(sid), "never delivered twice")
 
+    def test_the_prompt_arg_never_carries_a_wake_for_a_runtime_that_drops_it(self):
+        # qwen/dsh drop a launch prompt on resume, so their due wake goes back on
+        # the record and is staged through input, exactly as with the arg off.
+        sm = self._manager()
+        due = self.NOW + 3600_000
+        paused = {"wakeAt": self.NOW, "wakeReason": "check CI"}
+        for runtime in ("qwen", "dsh"):
+            sess = {"id": "x", "agentType": runtime}
+            with mock.patch.object(ha, "RESUME_WAKE_PROMPT_ARG", True):
+                self.assertIsNone(sm._carry_paused_wake(sess, paused, now_ms=due))
+            self.assertEqual((sess["wakeAt"], sess["wakeReason"], sess["wakeResumedAt"]),
+                             (self.NOW, "check CI", due))
+        with mock.patch.object(ha, "RESUME_WAKE_PROMPT_ARG", True):
+            self.assertEqual(sm._carry_paused_wake({"id": "y", "agentType": "claude"},
+                                                   paused, now_ms=due),
+                             "Wake-up: check CI. Check it and continue.")
+
     def test_an_early_operator_resume_sleeps_again(self):
         sm = self._manager()
         sess = self._sleeper(sm)

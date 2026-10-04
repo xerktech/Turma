@@ -23893,6 +23893,36 @@ test("XERK-1575: each pause answers ONE ticket — a second ticket queued mid-pa
   ticketQueue.length = 0; delete agents.slpTwoA; delete agents.slpTwoB;
 });
 
+test("XERK-1575: one pause in flight per host — the agent kills on its beat loop", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpOneHost", site = "slpone.atlassian.net";
+  const triaged = (key) => ({ key, summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } });
+  const sleepy = { autoStart: false, pauseSleepers: { available: true },
+    tickets: [triaged("ENG-5"), triaged("ENG-6"), triaged("ENG-7")] };
+  await asBeat(host, site, { ...sleepy, capacity: { maxSessions: 3, running: 3, queued: 0, free: 0 },
+    sessions: [sleeperSession("s1", 60 * 60_000), sleeperSession("s2", 2 * 60 * 60_000),
+      sleeperSession("s3", 3 * 60 * 60_000)] });
+  for (const k of ["ENG-5", "ENG-6", "ENG-7"]) assert.equal((await startTicket(site, k)).body.queued, true);
+  drainTicketQueue();
+  drainTicketQueue();
+  // Three tickets wait, but one host gets ONE kill at a time, never a batch.
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["s3"]);
+  // Handed over but unacked still counts.
+  for (const c of agents[host].commands) c.deliveredAt = Date.now();
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 1);
+  // Acked (s3 paused, its slot taken by the first ticket): the next pause goes out.
+  agents[host].commands = [];
+  await asBeat(host, site, { ...sleepy, capacity: { maxSessions: 3, running: 3, queued: 0, free: 0 },
+    sessions: [sleeperSession("s1", 60 * 60_000), sleeperSession("s2", 2 * 60 * 60_000),
+      { id: "t5", status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z" }] });
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["s2"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
 test("XERK-1575: only a quiet sleeper, ten minutes out, on a capable full host that could run the ticket", async () => {
   const cases = {
     "wake too soon": { s: sleeperSession("x", 9 * 60_000) },
