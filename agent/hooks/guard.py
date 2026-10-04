@@ -1728,6 +1728,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         for tok in _tokenize(raw):
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
+    piped_chars = sum(len(t) + 1 for t in piped_operands)
     # A shell that reads its SCRIPT from stdin runs whatever the pipeline,
     # a here-string or a `<(…)` feeds it — `echo '<cmd>' | sh`, `sh <<< '<cmd>'`,
     # `. <(echo '<cmd>')` — none of which is an argv of its own (XERK-1539).
@@ -1945,10 +1946,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
                     inner.pop(0)
             if inner:
-                # `{}` stands for whatever the pipeline feeds in.
+                # `{}` stands for whatever the pipeline feeds in. Every xargs
+                # carries EVERY operand on the line, so n segments emit n²
+                # words: 4096 took 18s (XERK-1589), so they share the budget.
                 expanded: list[str] = []
                 for tok in inner:
+                    if tok == "{}":
+                        _spend(piped_chars)
                     expanded.extend(piped_operands if tok == "{}" else [tok])
+                _spend(piped_chars)
                 argv = _strip_prefixes(expanded + piped_operands)
                 out.append((argv, seg))
                 # ...and expanded again, so a shell/eval/wrapper it runs is
@@ -1966,22 +1972,35 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 for cwd, joined in by_cwd:
                     out.append((["rm", "-r", *joined], seg, False, cwd))
             roots += [r for _, joined in by_cwd for r in joined]
+            # Each flag's run ends at the next terminator, found in ONE
+            # backward pass: rescanning and re-slicing `rest` per `-exec` was
+            # quadratic (XERK-1589).
+            ends, end = [0] * len(rest), len(rest)
+            for i in range(len(rest) - 1, -1, -1):
+                if rest[i] in (";", "+", "\\;"):
+                    end = i
+                ends[i] = end
+            roots_chars = sum(len(r) + 1 for r in roots)
             for flag in ("-exec", "-execdir", "-ok", "-okdir"):
-                while flag in rest:
-                    i = rest.index(flag)
+                for i, flag_tok in enumerate(rest):
+                    if flag_tok != flag:
+                        continue
                     run = []
-                    for tok in rest[i + 1:]:
-                        if tok in (";", "+", "\\;"):
-                            break
+                    for tok in rest[i + 1:ends[i]]:
                         # `{}` stands for each path found — i.e. the roots.
+                        if tok == "{}":
+                            _spend(roots_chars)
                         run.extend(roots if tok == "{}" else [tok])
                     if run:
+                        # Every run is classified with the whole segment, and
+                        # checkers rescan that text per entry: 5000 runs took
+                        # 30s (XERK-1589), so each run charges the segment.
+                        _spend(len(seg))
                         argv = _strip_prefixes(run)
                         out.append((argv, seg))
                         # `find . -exec sh -c '<cmd>' \;` (XERK-1539).
                         out.extend(_expand_segments(
                             " ".join(shlex.quote(t) for t in argv), depth + 1, cwds))
-                    rest = rest[i + 1:]
     # An unwrap can leave nothing behind (`$(x | xargs kill)`); every checker
     # reads tokens[0], and a crash there let the WHOLE command through (XERK-1080).
     return [entry for entry in out if entry[0]]
