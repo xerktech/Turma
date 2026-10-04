@@ -15141,9 +15141,11 @@ function recordAnswerDecision(key, sessionId, kind, answer) {
 function questionAnswerText(a, sessionId, picks, custom) {
   const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
   const labels = s && s.session && Array.isArray(s.session.questionOptions) ? s.session.questionOptions : [];
-  const out = picks.map((i) => (typeof labels[i] === "string" && labels[i] ? labels[i] : `option ${i + 1}`));
-  if (custom.trim()) out.push("(a typed answer)");
-  return out.join("; ");
+  const picked = picks.map((i) => (typeof labels[i] === "string" && labels[i] ? labels[i] : `option ${i + 1}`))
+    .join("; ");
+  if (!custom.trim()) return picked;
+  // Worded as a phrase, not a "; (…)" list item, which read like a glitch.
+  return picked ? `${picked}, plus a typed answer` : "(a typed answer)";
 }
 function panePromptAnswerText(a, sessionId, n) {
   const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);

@@ -23501,7 +23501,7 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
   assert.deepEqual(log, [
     { source: "question", question: "Which DB?", answer: "Postgres", host: "dcHostB",
       sessionId: "q1", ticket: "XERK-9", label: "db work" },
-    { source: "question", question: "Which DB?", answer: "Postgres; SQLite; option 6; (a typed answer)",
+    { source: "question", question: "Which DB?", answer: "Postgres; SQLite; option 6, plus a typed answer",
       host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
     { source: "permission", question: "Bash: npm test — Do you want to proceed?", answer: "Yes",
       host: "dcHostB", sessionId: "p1", label: "lbl" },

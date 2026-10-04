@@ -170,8 +170,9 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
   `answer` ≤200, `text` ≤500; inline literals; null-proto map; a coerce fixed point).
 - **Writers, always under the DECIDED org (`decidedOrgOf`), never the claimed siteKey**:
   - the answer route → `{question, answer}` = the session's served `question` + the picked
-    `questionOptions` labels (1-based "option N" fallback) + `(a typed answer)` for free text —
-    never its words: the log reaches every same-org session, and text typed for one must not;
+    `questionOptions` labels (1-based "option N" fallback) + `, plus a typed answer` for free text
+    (`(a typed answer)` alone with no pick) — never its words: the log reaches every same-org
+    session, and text typed for one must not;
   - the pane-prompt route → `permissionWhy` FIRST, then the dialog's prompt (mostly a generic
     "Do you want to proceed?"), + the picked option's label;
   - `POST /api/orgs/<site>/decisions {text}` (operator-authed, 400 empty / 413 >500 / 404 an org no
