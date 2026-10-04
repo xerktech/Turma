@@ -253,7 +253,9 @@
     background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
     overflow-wrap: anywhere;
   }
-  .perm-foot { margin-top: 8px; }
+  /* The note sits below the table at the same gap as "Recent prompts" (12px), so it never
+     reads as part of the last row. `.models-card .note`'s -4px top would otherwise win. */
+  .models-card .note.perm-foot { margin-top: 12px; }
   .perm-foot code { font-family: var(--font-mono); font-size: 0.92em; }
   .perm-why { color: var(--muted); font-size: 11.5px; margin-top: 3px; word-break: normal; overflow-wrap: break-word; }
   .perm-na { color: var(--muted); }
