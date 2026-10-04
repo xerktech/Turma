@@ -114,6 +114,9 @@ hook-log tail) + `agent/hooks/permlog.py`.
 - **The log is session-written** (Bash walks past the `Edit` deny): every read is `O_NONBLOCK` +
   `O_NOFOLLOW` + regular-file only + bounded (`_read_permission_log`, guard.py's `_read_text`
   discipline), every line re-shaped (`parse_permission_log_lines`), over-long lines skipped.
+- **A trailing partial already longer than `PERMISSION_LOG_LINE_MAX` is consumed as junk** — a
+  newline-free read otherwise never moves the cursor, so one session's Bash write could blank
+  another session's rows until the file rotates.
 - **The pane edges read the transcript tail ONLY on an edge** — the same bounded tail read
   `session_report` already does every beat.
 - **`permissionEvents`** rides the heartbeat oldest-first, at most `PERMISSION_EVENTS_MAX` (200) a

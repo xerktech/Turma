@@ -11524,8 +11524,12 @@ def _read_permission_log(path, offset, max_bytes):
 def parse_permission_log_lines(blob, session_id):
     """(rows, consumed) for the COMPLETE lines in `blob`: a trailing partial line
     is left for the next pass, an over-long or unparseable line is skipped. Every
-    row is re-shaped here — the file is a claim, the hub bounds it again."""
+    row is re-shaped here — the file is a claim, the hub bounds it again.
+    A trailing partial ALREADY longer than any line of ours is junk and is
+    consumed too: left in place, a newline-free read would never move the
+    cursor and every later row would wait for the file to rotate."""
     end = blob.rfind(b"\n") + 1
+    consumed = len(blob) if len(blob) - end > PERMISSION_LOG_LINE_MAX else end
     rows = []
     for raw in blob[:end].split(b"\n"):
         if not raw.strip() or len(raw) > PERMISSION_LOG_LINE_MAX:
@@ -11555,7 +11559,7 @@ def parse_permission_log_lines(blob, session_id):
             out["rulesMatched"] = [r[:200] for r in rules[:8] if isinstance(r, str)] \
                 if isinstance(rules, list) else []
         rows.append(out)
-    return rows, end
+    return rows, consumed
 
 
 def _tmux_pane(tmux_name):

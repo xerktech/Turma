@@ -37902,6 +37902,24 @@ class TestPermissionLogTail(ManagerMixin, unittest.TestCase):
         self.sm._fetch_permission_rows()
         self.assertEqual(self.staged(), ["b"])
 
+    def test_a_newline_free_read_moves_the_cursor_past_the_junk(self):
+        # One read of junk with no newline in it must not park the cursor: the
+        # rows written after it arrive on the following passes, not at rotation.
+        self.sm._fetch_permission_rows()
+        with open(self.path, "a") as f:
+            f.write("x" * (ha.PERMISSION_LOG_READ_MAX + 4096) + "\n"
+                    + json.dumps(self.denied("after")) + "\n")
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["after"])
+
+    def test_a_short_partial_line_is_never_consumed(self):
+        blob = b'{"event": "PermissionDenied"'
+        self.assertEqual(ha.parse_permission_log_lines(blob, self.SID), ([], 0))
+        junk = b"x" * (ha.PERMISSION_LOG_LINE_MAX + 1)
+        self.assertEqual(ha.parse_permission_log_lines(junk, self.SID), ([], len(junk)))
+
     def test_rotation_drains_the_old_file_first(self):
         self.sm._fetch_permission_rows()
         self.append(self.denied("a"))

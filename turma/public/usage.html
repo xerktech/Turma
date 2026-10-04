@@ -1640,6 +1640,7 @@ const PERM_DAYS = 7;
 const PERM_REFRESH_MS = 60000;
 const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat" };
 let permView = null;
+let permLoadError = null;
 let permFetchSeq = 0;
 // The card is fetched only once a render has run TurmaOrg.update: before that
 // org.js knows no sites, so getKeys() is [] and an unscoped fetch would show
@@ -1716,12 +1717,16 @@ function permRuleHtml(g) {
 // The whole card, as markup — pure over the hub's `{days, top, recent}`. Every
 // field is agent-supplied text, so every one is escaped (a rule or a command can
 // carry anything).
-function permissionsCardHtml(view, now, recentOpen = false) {
+function permissionsCardHtml(view, now, recentOpen = false, loadError = null) {
   const days = view && permNum(view.days) > 0 ? permNum(view.days) : PERM_DAYS;
   const head = `<h2>Permission prompts (${days} days)</h2>` +
     `<div class="note">Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat ` +
     `that held a session, grouped with the allow rule that would retire it. Follows the header's org ` +
     `filter only — the chart's series toggles above do not apply here.</div>`;
+  // A first fetch that failed says so; "Loading…" there would wait forever.
+  if (!view && typeof loadError === "string" && loadError) {
+    return head + `<div class="perm-empty">Could not load permission prompts (${esc(loadError)}).</div>`;
+  }
   if (!view) return head + `<div class="perm-empty">Loading…</div>`;
   const top = Array.isArray(view.top) ? view.top.filter((g) => g && typeof g === "object") : [];
   const recent = Array.isArray(view.recent) ? view.recent.filter((r) => r && typeof r === "object") : [];
@@ -1767,7 +1772,7 @@ function permissionsCardHtml(view, now, recentOpen = false) {
 }
 
 function paintPermissions() {
-  const html = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now(), permRecentOpen)}</div>`;
+  const html = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now(), permRecentOpen, permLoadError)}</div>`;
   if (html === permPainted) return;
   permPainted = html;
   // A recurring innerHTML repaint: preserveScroll keeps the table's sideways
@@ -1790,14 +1795,21 @@ async function refreshPermissions() {
   permFetchedKeys = keys.join(",");
   const q = new URLSearchParams({ days: String(PERM_DAYS) });
   if (keys.length) q.set("org", keys.join(","));
+  // A failed read keeps the last view; with none yet, the card says it failed.
+  const failed = (why) => {
+    if (seq !== permFetchSeq || permView) return;
+    permLoadError = why;
+    paintPermissions();
+  };
   try {
     const r = await fetch("/api/permissions?" + q.toString());
-    if (!r.ok) return;
+    if (!r.ok) return failed(`HTTP ${r.status}`);
     const body = await r.json();
     if (seq !== permFetchSeq) return;        // an org change raced this answer
     permView = body;
+    permLoadError = null;
     paintPermissions();
-  } catch { /* keep the last view */ }
+  } catch { failed("no readable answer from the hub"); }
 }
 
 // `toggle` does not bubble, so the disclosure's open state is caught on capture.

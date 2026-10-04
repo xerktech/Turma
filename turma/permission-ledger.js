@@ -409,9 +409,16 @@ function bashVerdict(head) {
     reason: "not on the known read-only list, so its arguments may run code" };
 }
 
+// A FULL MCP tool name, `mcp__<server>__<tool>`, no wildcard. `tool` is
+// agent-supplied (a session can write its own hook log with Bash), and a bare
+// `mcp__github` or `mcp__github__*` would allow every tool on that server.
+const MCP_TOOL_RE = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/;
+
 function toolVerdict(tool, head) {
   if (tool === "Bash") return bashVerdict(head);
-  if (typeof tool === "string" && tool.startsWith("mcp__")) return { rule: tool };
+  if (typeof tool === "string" && tool.startsWith("mcp__")) {
+    return MCP_TOOL_RE.test(tool) ? { rule: tool } : { rule: null, reason: "not a full MCP tool name" };
+  }
   if (tool === "WebFetch" && head && HOST_RE.test(head)) return { rule: `WebFetch(domain:${head})` };
   return { rule: null };
 }
@@ -420,7 +427,8 @@ function toolVerdict(tool, head) {
  * The allow rule that would retire a prompt — DETERMINISTIC, a table, never a
  * judgement (the LLM judge, XERK-1566, consumes it):
  *   ask-in-chat                      → "model behaviour: see CLAUDE.md step 0"
- *   a sandbox dialog naming a host   → sandbox.network.allowedDomains: <host>
+ *   a sandbox dialog naming a host   → sandbox.network.allowedDomains: <host>;
+ *                                      one with no readable host gets none
  *   classifier-denied                → an autoMode.environment allow line for the
  *                                      call's tool rule; NONE when the call has no
  *                                      tool rule (a sentence lifted from the deny
@@ -429,16 +437,23 @@ function toolVerdict(tool, head) {
  *                                      allowlist (BASH_SAFE_HEADS /
  *                                      BASH_SAFE_SUBCOMMANDS); any other head gets
  *                                      none, with a reason
- *   MCP                              → the full mcp__<server>__<tool>
+ *   MCP                              → the full mcp__<server>__<tool> ONLY
+ *                                      (MCP_TOOL_RE); a bare server or a
+ *                                      wildcard gets none, with a reason
  *   WebFetch                         → WebFetch(domain:<d>)
  *   anything else                    → null (no rule retires it)
- * Returns `{rule, reason}`: `reason` only for a Bash head that gets no rule.
+ * Returns `{rule, reason}`: `reason` only for a Bash head, an MCP name or a
+ * sandbox prompt that gets no rule.
  */
 function ruleVerdict(g) {
   if (!g) return { rule: null };
   if (g.kind === "ask-in-chat") return { rule: "model behaviour: see CLAUDE.md step 0" };
-  if (g.dialogKind === "sandbox" && g.head && HOST_RE.test(g.head)) {
-    return { rule: `sandbox.network.allowedDomains: ${g.head}` };
+  if (g.dialogKind === "sandbox") {
+    // No tool allow rule retires a sandbox NETWORK prompt, so one whose host
+    // could not be read gets no rule, never the call's own Bash rule.
+    return g.head && HOST_RE.test(g.head)
+      ? { rule: `sandbox.network.allowedDomains: ${g.head}` }
+      : { rule: null, reason: "no host recorded for this sandbox prompt" };
   }
   const v = toolVerdict(g.tool, g.head);
   if (g.kind === "classifier-denied") {

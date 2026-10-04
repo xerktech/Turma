@@ -80,9 +80,11 @@ function loadHelpers(fetchReply = null) {
     navigator: { userAgent: "node" },
     fetch: (u) => {
       fetches.push(String(u));
-      return fetchReply
-        ? Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply(String(u))) })
-        : new Promise(() => {});
+      if (!fetchReply) return new Promise(() => {});
+      // `fetchReply.httpStatus(url)` returning n answers that refusal instead of a body.
+      const status = fetchReply.httpStatus && fetchReply.httpStatus(String(u));
+      if (status) return Promise.resolve({ status, ok: false, json: () => Promise.resolve({}) });
+      return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply(String(u))) });
     },
     // Captures the page's SSE handlers so a test can deliver a real `removed`
     // event — the fallback poll is skipped while the stream is healthy, so that
@@ -1347,6 +1349,26 @@ test("XERK-1563: the card says loading, then empty, never a broken table", () =>
   assert.doesNotMatch(empty, /<table/);
   // A malformed view (an older hub answering something else) degrades the same way.
   assert.match(H.permissionsCardHtml({ top: "nope", recent: [null] }, PERM_NOW), /No permission prompts/);
+});
+
+test("XERK-1563: a refused first fetch says it failed; a later one keeps the last view", async () => {
+  let refuse = 401;
+  const reply = () => permView;
+  reply.httpStatus = (u) => (u.startsWith("/api/permissions") ? refuse : 0);
+  const H5 = loadHelpers(reply);
+  await H5.refreshPermissions();
+  const el = H5.els.permissions;
+  assert.match(el.innerHTML, /Could not load permission prompts \(HTTP 401\)\./);
+  assert.doesNotMatch(el.innerHTML, /Loading/);
+  refuse = 0;
+  await H5.refreshPermissions();
+  assert.match(el.innerHTML, /Bash\(git status:\*\)/);
+  refuse = 503;
+  await H5.refreshPermissions();
+  assert.match(el.innerHTML, /Bash\(git status:\*\)/, "a failed refresh keeps the last view");
+  assert.doesNotMatch(el.innerHTML, /Could not load/);
+  // The error is escaped like every other field.
+  assert.match(H5.permissionsCardHtml(null, PERM_NOW, false, "<b>"), /\(&lt;b&gt;\)/);
 });
 
 test("XERK-1563: the minute repaint keeps Recent prompts open and goes through preserveScroll", async () => {

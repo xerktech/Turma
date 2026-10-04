@@ -257,9 +257,44 @@ test("suggestedRule: the deterministic table", () => {
     [{ kind: "dialog", dialogKind: "plan", tool: "ExitPlanMode", head: "ExitPlanMode" }, null],
     [{ kind: "dialog", tool: "Edit", head: "/repo/a.py" }, null],
     [{ kind: "dialog", tool: "WebFetch", head: "not a host" }, null],
-    [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "ls" }, "Bash(ls:*)"],
+    // A Bash rule never retires a sandbox NETWORK prompt: no readable host, no rule.
+    [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "ls" }, null],
   ];
   for (const [g, want] of cases) assert.equal(suggestedRule(g), want, JSON.stringify(g));
+  assert.match(ledger.ruleVerdict({ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "ls" })
+    .reason, /no host/);
+});
+
+// `tool` is agent-supplied, so an MCP rule is only ever a FULL server+tool name.
+test("suggestedRule: an MCP rule needs a full mcp__<server>__<tool> name", () => {
+  const bad = ["mcp__github", "mcp__github__", "mcp__github__*", "mcp__x\", \"Bash",
+    "mcp____tool", "mcp__srv__to ol", "mcp__srv__tool\n"];
+  for (const tool of bad) {
+    for (const kind of ["dialog", "classifier-denied"]) {
+      const g = { kind, dialogKind: kind === "dialog" ? "permission" : undefined, tool, head: tool };
+      const v = ledger.ruleVerdict(g);
+      assert.equal(v.rule, null, `${kind} ${JSON.stringify(tool)}`);
+      assert.equal(v.reason, "not a full MCP tool name", `${kind} ${JSON.stringify(tool)}`);
+    }
+  }
+  assert.equal(suggestedRule({ kind: "classifier-denied", tool: "mcp__srv__do-it", head: "x" }),
+    "autoMode.environment: allow mcp__srv__do-it");
+  // Through ingest + aggregate too: what the card and XERK-1566's judge read.
+  ledger._internals.reset();
+  ledger.ingest("h1", [
+    row("m1", { tool: "mcp__github", head: "mcp__github" }),
+    row("m2", { tool: "mcp__github__*", head: "mcp__github__*" }),
+    row("m3", { kind: "classifier-denied", dialogKind: undefined, tool: "mcp__srv",
+      head: "mcp__srv", answer: "deny" }),
+    row("m4", { tool: "mcp__github__get_me", head: "mcp__github__get_me" }),
+  ], NOW);
+  const { top } = aggregate({ now: NOW });
+  const by = (t) => top.find((g) => g.tool === t);
+  for (const t of ["mcp__github", "mcp__github__*", "mcp__srv"]) {
+    assert.equal(by(t).suggestedRule, null, t);
+    assert.equal(by(t).noRuleReason, "not a full MCP tool name", t);
+  }
+  assert.equal(by("mcp__github__get_me").suggestedRule, "mcp__github__get_me");
 });
 
 // A Bash rule is offered ONLY for a head on the positive allowlist; every other

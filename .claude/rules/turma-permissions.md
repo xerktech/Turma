@@ -50,10 +50,10 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 | Row | Rule |
 |-----|------|
 | `ask-in-chat` | `model behaviour: see CLAUDE.md step 0` |
-| `dialog` `sandbox` naming a host | `sandbox.network.allowedDomains: <host>` |
+| `dialog` `sandbox` naming a host | `sandbox.network.allowedDomains: <host>`; no readable host → NONE plus `noRuleReason` |
 | `classifier-denied` | `autoMode.environment: allow <tool rule>`; NONE without a tool rule |
 | Bash | `Bash(<head>:*)` ONLY for a head on the allowlist; any other head gets NONE plus `noRuleReason` |
-| MCP | the full `mcp__<server>__<tool>` |
+| MCP | the full `mcp__<server>__<tool>` ONLY (`MCP_TOOL_RE`); anything else NONE plus `noRuleReason` |
 | WebFetch | `WebFetch(domain:<d>)` |
 | a plan approval, a file path, anything else | none |
 
@@ -79,6 +79,11 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
     shows "no safe rule — review it" over the reason, with NO Copy button. Groups with
     no rule for another reason (a plan, a file path) serve no `noRuleReason`. `ruleVerdict` returns
     both; `suggestedRule` is its rule. XERK-1566's judge reads this table's shape unchanged.
+- **Every rule is built from a fixed shape, never echoed.** `tool` is agent-supplied (a session can
+  write its hook log with Bash), so an MCP rule needs a FULL `mcp__<server>__<tool>`: a bare
+  `mcp__github` or `mcp__github__*` would allow every tool on that server.
+- **A sandbox prompt never gets the call's Bash rule** — no tool allow rule retires a sandbox
+  NETWORK prompt, so one with no readable host gets none.
   - A head outside `BASH_HEAD_RE` (`(cd`, a glob) would be a malformed rule; a BARE subcommand CLI
     (`git`, `docker`; `SUBCOMMAND_CLIS`, a parity-tested mirror of permlog.py's set) says nothing
     about what ran — permlog keeps the subcommand only as the SECOND word, so `git -C /repo push`
@@ -145,6 +150,8 @@ consumes this table; it does not replace it.
     before it org.js knows no sites, `getKeys()` is `[]` and the fetch would be fleet-wide under a
     scoped header — and `update()` never notifies, so nothing would refetch. Each render refetches
     when the org keys moved (`permFetchedKeys`); the 60s refresh runs only once scoped.
+  - **A failed read with no view yet paints "Could not load … (HTTP n)"**, never an endless
+    "Loading…"; a failed REFRESH keeps the last view silently.
   - **Below 600px each group reflows to a stacked block** (CSS only, same markup): kind + subject;
     one line of count / answers / wait (`data-label`); the rule + Copy on its own line. No sideways
     scroll — the sticky Prompt column used to cover the rule column on a phone.
