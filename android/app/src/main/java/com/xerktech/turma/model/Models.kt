@@ -584,7 +584,9 @@ data class LocalModelOption(
 /** A host's session ceiling and live counts (hub-agent `_capacity_payload`). */
 @Serializable
 data class Capacity(
-    val maxSessions: Int = 0,
+    // Null = the agent didn't say (hub drops a non-int32 or negative one, XERK-1479):
+    // the dashboard tile then leaves this host out of the ceiling, as the web does.
+    val maxSessions: Int? = null,
     val running: Int = 0,
     val queued: Int = 0,
     // Null = the agent didn't say (hub drops a non-int); "can't tell", never full.
