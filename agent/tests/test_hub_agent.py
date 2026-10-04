@@ -4966,6 +4966,9 @@ class ManagerMixin:
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
+            # Derived from REGISTRY_DIR at import (XERK-1563): the permission
+            # ledger's hook-log tail would otherwise read the real host's logs.
+            ("PERMISSIONS_DIR", os.path.join(self.tmp, "permissions")),
             # Derived from REGISTRY_DIR at import; kill/delete rmtree a session's
             # request dir (XERK-1564), so it must never be the host's real one.
             ("SESSION_REQUESTS_DIR", os.path.join(self.tmp, "session-requests")),
@@ -8517,6 +8520,8 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
                             for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
         self.assertTrue(any(ha.SUMMARY_INSTRUCTION.startswith(s)
                             for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
+        self.assertTrue(any(ha.ATTENTION_HINT_INSTRUCTION.startswith(s)
+                            for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
 
 
 class TestSanitizeJunkRepoEntries(ManagerMixin, unittest.TestCase):
@@ -11335,7 +11340,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             f"--name {shlex.quote(sess['rcName'])} "
             f"--permission-mode auto --settings {shlex.quote(settings)} "
             f"--append-system-prompt "
-            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers)}",
+            f"{shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers + ha.wake_directive())}",
         )
         # The guard settings file was written and wires three PreToolUse
         # matchers: the Bash guard, the ~/.claude file guard, and the
@@ -11493,7 +11498,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             path=ha.PEERS_FILE, sid=sm.registry[0]["id"], host=sm.device)
         self.assertIn(
             "--append-system-prompt "
-            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers),
+            + shlex.quote(ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT + peers + ha.wake_directive()),
             cmd,
         )
 
@@ -17326,6 +17331,48 @@ class TestModelActualPayload(ManagerMixin, unittest.TestCase):
         self.assertEqual(payload["pendingModel"], "sonnet")
 
 
+class TestSessionDirective(ManagerMixin, unittest.TestCase):
+    """XERK-1571: the wake paragraph of `_session_directive` — taught to a Claude
+    session, naming the session CLI exactly as its allow rule does, and withheld
+    from dsh/qwen, whose launches export no TURMA_SESSION_ID/TURMA_SESSION_CLI."""
+
+    def _sess(self, **kw):
+        return {"id": "abcde", **kw}
+
+    def test_claude_directive_ends_with_the_wake_paragraph(self):
+        sm = self.make_manager()
+        policy = sm._session_directive(self._sess())
+        peers = ha.PEERS_SYSTEM_PROMPT.format(path=ha.PEERS_FILE, sid="abcde", host=sm.device)
+        self.assertEqual(policy, ha.NEW_WORK_SYSTEM_PROMPT + ha.PR_SUMMARY_SYSTEM_PROMPT
+                         + peers + ha.wake_directive())
+        self.assertIn("do not sleep in a", policy)
+        self.assertIn(" wake <N>m <what to check>` and end the turn", policy)
+
+    def test_wake_command_matches_the_session_cli_allow_rule(self):
+        """The taught command must start with the allow rule's prefix, or every
+        wake call prompts — the very thing the directive exists to avoid."""
+        cmd = ha.wake_directive().split("`")[1]
+        prefix = ha.session_cli_allow_rule()[len("Bash("):-len(":*)")]
+        self.assertTrue(cmd.startswith(prefix + " wake "), (cmd, prefix))
+
+    def test_a_path_that_needs_quoting_is_not_taught(self):
+        """Quoted in the command but raw in the rule, the two never match, so a
+        Windows path or one with a space withholds the paragraph instead."""
+        for path in (r"C:\Program Files\turma\hooks\session_cli.py",
+                     "/home/john doe/turma-agent/hooks/session_cli.py"):
+            self.assertEqual(ha.wake_directive(path), "", path)
+        safe = "/opt/turma-agent/hooks/session_cli.py"
+        cmd = ha.wake_directive(safe).split("`")[1]
+        prefix = ha.session_cli_allow_rule(safe)[len("Bash("):-len(":*)")]
+        self.assertTrue(cmd.startswith(prefix + " wake "), (cmd, prefix))
+
+    def test_dsh_and_qwen_are_not_taught_the_cli(self):
+        sm = self.make_manager()
+        for rt in ("dsh", "qwen"):
+            self.assertNotIn(" wake <N>m", sm._session_directive(self._sess(agentType=rt), "X"))
+            self.assertTrue(sm._session_directive(self._sess(agentType=rt), "X").endswith("X"))
+
+
 class TestWakeRequest(ManagerMixin, unittest.TestCase):
     """XERK-1564: a session's `session_cli.py wake` file becomes wakeAt/wakeReason
     on its record (surviving a manager restart), and the beat stages the wake-up
@@ -17364,6 +17411,21 @@ class TestWakeRequest(ManagerMixin, unittest.TestCase):
         self.assertEqual(sess["wakeReason"], "check CI")
         self.assertEqual(payload["session"]["wakeAt"], 1_786_400_000_000)
         self.assertEqual(payload["session"]["wakeReason"], "check CI")
+
+    def test_a_wake_past_the_cli_cap_is_no_request(self):
+        """A hand-written wake.json further out than the CLI's 7d cap (plus an
+        hour of slack) is ignored, so a session cannot sleep out of review
+        indefinitely; one inside the cap is read."""
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        now_ms = 1_786_400_000_000
+        with mock.patch.object(ha.time, "time", return_value=now_ms / 1000):
+            self._write({"wakeAt": now_ms + ha.WAKE_MAX_AHEAD_MS + 1, "reason": "r"})
+            self.assertIsNone(ha.read_wake_request(self.SID))
+            self.assertNotIn("wakeAt", self._payload(sm, sess)["session"])
+            ok = now_ms + 7 * 24 * 3600 * 1000
+            self._write({"wakeAt": ok, "reason": "r"})
+            self.assertEqual(ha.read_wake_request(self.SID)["wakeAt"], ok)
 
     def test_no_request_serves_no_fields(self):
         sm = self.make_manager()
@@ -17500,6 +17562,730 @@ class TestWakeRequest(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(got["wakeReason"]), ha.WAKE_REASON_MAX_CHARS)
         self._write({"wakeAt": 5, "reason": 7})
         self.assertIsNone(ha.read_wake_request(self.SID)["wakeReason"])
+
+
+class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
+    """XERK-1569: a session's `session_cli.py close-ticket` file is read by a
+    WORKER (tracker HTTP off the beat), which comments the evidence and moves the
+    ticket to a Done-category status; the BEAT then stamps `ticket.outcome` on the
+    record and the ticket ledger and stages `ticketOutcomeResults`."""
+
+    SID = "abcde"
+    KEY = "ENG-9"
+    SITE = "s.atlassian.net"
+    OPTS = [{"id": "11", "name": "In Progress", "category": "inprogress"},
+            {"id": "31", "name": "Done", "category": "done"}]
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.multiple(ha, JIRA_SITE=self.SITE, JIRA_EMAIL="e",
+                                JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN="")
+        p.start()
+        self.addCleanup(p.stop)
+        self.calls = []        # (path, body) per jira_req
+        self.fail_paths = {}   # path suffix -> how many more calls to fail
+
+        def fake_req(path, params, body=None):
+            self.calls.append((path, body))
+            for suffix, n in list(self.fail_paths.items()):
+                if path.endswith(suffix) and n > 0:
+                    self.fail_paths[suffix] = n - 1
+                    raise ha.BoardHttpError("HTTP 500: tracker down", 500)
+            return {}
+        p2 = mock.patch.object(ha, "jira_req", fake_req)
+        p2.start()
+        self.addCleanup(p2.stop)
+        p3 = mock.patch.object(ha, "board_status_options", lambda key: list(self.OPTS))
+        p3.start()
+        self.addCleanup(p3.stop)
+        self.notified = []     # (sid, text) per notify_session
+
+        def fake_notify(sm, sid, text):
+            self.notified.append((sid, text))
+            return True
+        p4 = mock.patch.object(ha.SessionManager, "notify_session", fake_notify)
+        p4.start()
+        self.addCleanup(p4.stop)
+
+    def _sess(self, sm, **over):
+        sess = {"id": self.SID, "status": "running", "repo": "Turma",
+                "repoPath": "/w/Turma", "worktreePath": os.path.join(self.tmp, "wt"),
+                "rcName": "rc", "tmuxName": f"agent-{self.SID}",
+                "claudeSessionId": "22222222-2222-4222-8222-222222222222",
+                "ticket": {"key": self.KEY, "siteKey": self.SITE, "branch": self.KEY,
+                           "url": f"https://{self.SITE}/browse/{self.KEY}", "summary": "s"}}
+        sess.update(over)
+        sm.registry = [sess]
+        return sess
+
+    def _path(self):
+        return os.path.join(ha.SESSION_REQUESTS_DIR, self.SID, "close-ticket.json")
+
+    def _write(self, data):
+        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+        with open(self._path(), "w") as fh:
+            json.dump(data, fh)
+
+    def _req(self, resolution="not-reproducible", note="ran repro.sh on main: passes",
+             at=1_786_400_000_000):
+        self._write({"resolution": resolution, "note": note, "requestedAt": at})
+
+    def _comments(self):
+        return [b for p, b in self.calls if p.endswith("/comment")]
+
+    def _transitions(self):
+        return [b for p, b in self.calls if p.endswith("/transitions")]
+
+    def test_the_file_becomes_a_comment_and_done_then_the_beat_stamps_the_outcome(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)      # the WORKER pass
+        # The first WRITE is the comment (a not-reproducible close on a board with
+        # no status named so first reads whether the ticket is already Done).
+        writes = [p for p, b in self.calls if b is not None]
+        self.assertEqual(writes[0], f"/rest/api/3/issue/{self.KEY}/comment")
+        adf = json.dumps(self._comments()[0])
+        self.assertIn("not reproducible", adf)
+        self.assertIn("ran repro.sh on main: passes", adf)
+        self.assertEqual(self._transitions(), [{"transition": {"id": "31"}}])
+        self.assertFalse(os.path.exists(self._path()))
+        # The worker wrote nothing to the registry — that is the beat's.
+        self.assertNotIn("outcome", sess["ticket"])
+        sm._apply_closed_tickets()
+        # The session's evidence note rides the outcome (the board's "Closed by"
+        # row shows it), on the record AND the ledger entry.
+        self.assertEqual(sess["ticket"]["outcome"],
+                         {"kind": "not-reproducible", "at": 1_000_000,
+                          "note": "ran repro.sh on main: passes"})
+        entry = sm.ticket_ledger[sess["claudeSessionId"]]
+        self.assertEqual(entry["outcome"], {"kind": "not-reproducible", "at": 1_000_000,
+                                            "note": "ran repro.sh on main: passes"})
+        with open(ha.TICKET_LEDGER_PATH) as fh:      # persisted, not just in memory
+            self.assertEqual(json.load(fh)[sess["claudeSessionId"]]["outcome"]["kind"],
+                             "not-reproducible")
+        [r] = sm.ticket_outcome_results
+        self.assertEqual((r["sessionId"], r["key"], r["kind"], r["ok"], r["status"]),
+                         (self.SID, self.KEY, "not-reproducible", True, "Done"))
+        # The note rides the ticket only, never the hub's result list.
+        self.assertNotIn("note", r)
+        # The served ticket carries it, so the board can say why.
+        self.assertEqual(ha._served_ticket(sess)["outcome"]["kind"], "not-reproducible")
+        # A later pass finds nothing to do.
+        sm._process_close_ticket_requests(now=2000.0)
+        self.assertEqual(len(self._comments()), 1)
+
+    def test_a_board_that_names_not_reproducible_is_mapped_to_it(self):
+        named = {"id": "41", "name": "Cannot Reproduce", "category": "done"}
+        opts = self.OPTS + [named]
+        self.assertEqual(ha._close_ticket_option(opts, "not-reproducible"), named)
+        # Only for that kind, and only a Done-category one.
+        self.assertEqual(ha._close_ticket_option(opts, "already-fixed")["id"], "31")
+        self.assertEqual(ha._close_ticket_option(opts, "done")["id"], "31")
+        odd = [{"id": "9", "name": "Not reproducible yet", "category": "inprogress"}]
+        self.assertEqual(ha._close_ticket_option(self.OPTS + odd, "not-reproducible")["id"], "31")
+        self.assertIsNone(ha._close_ticket_option(self.OPTS[:1], "done"))
+
+    def test_finished_work_never_closes_into_a_negative_status_listed_first(self):
+        # A board listing "Cannot Reproduce" / "Won't Do" AHEAD of Done: a
+        # `done`/`already-fixed` close must still land on Done, never on the
+        # first Done-column option.
+        opts = [self.OPTS[0],
+                {"id": "41", "name": "Cannot Reproduce", "category": "done"},
+                {"id": "42", "name": "Won't Do", "category": "done"},
+                {"id": "43", "name": "Duplicate", "category": "done"},
+                {"id": "31", "name": "Done", "category": "done"}]
+        for kind in ("done", "already-fixed"):
+            with self.subTest(kind=kind):
+                self.assertEqual(ha._close_ticket_option(opts, kind)["id"], "31")
+        self.assertEqual(ha._close_ticket_option(opts, "not-reproducible")["id"], "41")
+        # A plainly-named Done is preferred over another neutral name...
+        opts2 = [self.OPTS[0], {"id": "5", "name": "Shipped", "category": "done"},
+                 {"id": "6", "name": "Closed", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts2, "done")["id"], "6")
+        # ...a neutral name still beats a negative one...
+        opts3 = [self.OPTS[0], {"id": "41", "name": "Cannot Reproduce", "category": "done"},
+                 {"id": "5", "name": "Shipped", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts3, "already-fixed")["id"], "5")
+        # ...and only a board offering nothing else falls back to the first.
+        opts4 = [self.OPTS[0], {"id": "42", "name": "Won't Do", "category": "done"},
+                 {"id": "41", "name": "Cannot Reproduce", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts4, "done")["id"], "42")
+        # not-reproducible with no named status falls back to a plain Done too.
+        opts5 = [self.OPTS[0], {"id": "42", "name": "Won't Do", "category": "done"},
+                 {"id": "31", "name": "Done", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts5, "not-reproducible")["id"], "31")
+
+    def test_bad_requests_are_refused_without_tracker_http(self):
+        for bad in ({"resolution": "wontfix", "note": "n"},
+                    {"resolution": "done", "note": "   "},
+                    {"resolution": "done"},
+                    {"resolution": "done", "note": "x" * (ha.CLOSE_TICKET_NOTE_MAX + 1)},
+                    {"resolution": ["done"], "note": "n"}):
+            with self.subTest(bad=bad):
+                sm = self.make_manager()
+                sess = self._sess(sm)
+                self.calls.clear()
+                self._write(bad)
+                self.assertIn("error", ha.read_close_ticket_request(self.SID))
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])
+                self.assertFalse(os.path.exists(self._path()))   # dropped, never re-read
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertFalse(r["ok"])
+                self.assertTrue(r["final"])
+                self.assertIn("refused", r["error"])
+                self.assertNotIn("outcome", sess["ticket"])
+        # The note bound is inclusive.
+        self._write({"resolution": "done", "note": "x" * ha.CLOSE_TICKET_NOTE_MAX})
+        self.assertNotIn("error", ha.read_close_ticket_request(self.SID))
+
+    def test_a_fifo_or_symlink_at_the_name_is_refused_and_never_blocks(self):
+        sm = self.make_manager()
+        self._sess(sm)
+        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+        os.mkfifo(self._path())
+        self.assertIsNone(ha.read_close_ticket_request(self.SID))
+        sm._process_close_ticket_requests(now=1000.0)       # returns, no HTTP
+        self.assertEqual(self.calls, [])
+        os.remove(self._path())
+        real = os.path.join(self.tmp, "real.json")
+        with open(real, "w") as fh:
+            json.dump({"resolution": "done", "note": "n"}, fh)
+        os.symlink(real, self._path())
+        self.assertIsNone(ha.read_close_ticket_request(self.SID))
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual(self.calls, [])
+
+    def test_a_failure_is_staged_and_retried_once_without_reposting_the_comment(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        self.fail_paths["/transitions"] = 1
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertTrue(os.path.exists(self._path()))      # left for the retry
+        sm._apply_closed_tickets()
+        [r] = sm.ticket_outcome_results
+        self.assertEqual((r["ok"], r["final"]), (False, False))
+        self.assertIn("tracker down", r["error"])
+        # Not before the retry delay.
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC - 1)
+        self.assertEqual(len(self._transitions()), 1)
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        self.assertEqual(len(self._comments()), 1)        # the comment landed once
+        self.assertEqual(len(self._transitions()), 2)
+        self.assertFalse(os.path.exists(self._path()))
+        sm._apply_closed_tickets()
+        self.assertTrue(sm.ticket_outcome_results[-1]["ok"])
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def test_a_request_that_fails_twice_is_dropped_with_a_final_error(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        self.fail_paths["/comment"] = 5
+        for t in (1000.0, 1000.0 + ha.CLOSE_TICKET_RETRY_SEC, 5000.0, 9000.0):
+            sm._process_close_ticket_requests(now=t)
+        self.assertEqual(len(self._comments()), ha.CLOSE_TICKET_ATTEMPTS)
+        self.assertFalse(os.path.exists(self._path()))
+        sm._apply_closed_tickets()
+        self.assertEqual([r["final"] for r in sm.ticket_outcome_results], [False, True])
+        self.assertNotIn("outcome", sess["ticket"])
+
+    def test_a_final_failure_tells_the_session_to_close_it_itself(self):
+        # The CLI only queues the request and the directive ends the turn, so the
+        # session must be told the ticket is still open — else it thinks it closed
+        # and its tracker-tool fallback never runs.
+        self.OPTS = self.OPTS[:1]          # the workflow offers no Done from here
+        sm = self.make_manager()
+        self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])            # a retry is still due: quiet
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        sm._apply_closed_tickets()
+        [(sid, text)] = self.notified
+        self.assertEqual(sid, self.SID)
+        self.assertIn(f"could NOT close ticket {self.KEY} as not reproducible", text)
+        self.assertIn("nothing can move it to Done", text)
+        self.assertIn("It was not moved to Done", text)
+        self.assertIn("tracker CLI/MCP this host gives you", text)
+        self.assertIn("tell the operator", text)
+        sm._apply_closed_tickets()                     # told once, not every beat
+        self.assertEqual(len(self.notified), 1)
+
+    def test_a_ticket_already_in_done_is_a_success_not_a_failure(self):
+        # Trackers offer no transition into the current status, so an operator's
+        # own close (or a repeat request) has no Done option: read the issue's
+        # current status and count already-Done as the outcome asked for.
+        self.OPTS = self.OPTS[:1]
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                return {"fields": {"status": {"name": "Closed",
+                                              "statusCategory": {"key": "done"}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req()
+            sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])
+        self.assertEqual(self._transitions(), [])
+        self.assertFalse(os.path.exists(self._path()))
+        [r] = sm.ticket_outcome_results
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["status"], "Closed")
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def _close_from(self, opts, kind, current):
+        """One close where the board offers `opts` and the issue's current
+        status is `current` = (name, category key) or None (unreadable)."""
+        self.OPTS = opts
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                self.calls.append((path, body))
+                return {} if current is None else {"fields": {"status": {
+                    "name": current[0], "statusCategory": {"key": current[1]}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req(resolution=kind)
+            sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        return sess, sm.ticket_outcome_results[-1]
+
+    def test_a_ticket_in_done_is_never_moved_into_a_fallback_done_status(self):
+        # A ticket already in Done is offered only the board's OTHER Done
+        # statuses, so a plain-Done close's only Done option is a negative one
+        # ("Won't Do", "Duplicate"). That must read as already closed — never
+        # rewrite a finished ticket as abandoned.
+        todo = {"id": "1", "name": "To Do", "category": "todo"}
+        for kind, neg in (("done", {"id": "41", "name": "Won't Do", "category": "done"}),
+                          ("already-fixed", {"id": "51", "name": "Duplicate",
+                                             "category": "done"}),
+                          ("done", {"id": "61", "name": "Cannot Reproduce",
+                                    "category": "done"})):
+            with self.subTest(kind=kind, neg=neg["name"]):
+                self.calls.clear()
+                sess, r = self._close_from([todo, self.OPTS[0], neg], kind, ("Done", "done"))
+                self.assertEqual(self._transitions(), [])
+                self.assertEqual(len(self._comments()), 1)
+                self.assertEqual((r["ok"], r["status"]), (True, "Done"))
+                self.assertEqual(sess["ticket"]["outcome"]["kind"], kind)
+        # A repeat not-reproducible close sitting in "Cannot Reproduce" is offered
+        # plain Done: it stays where it is.
+        self.calls.clear()
+        _, r = self._close_from([todo, {"id": "31", "name": "Done", "category": "done"}],
+                                "not-reproducible", ("Cannot Reproduce", "done"))
+        self.assertEqual(self._transitions(), [])
+        self.assertEqual((r["ok"], r["status"]), (True, "Cannot Reproduce"))
+
+    def test_finished_work_on_an_open_ticket_is_never_closed_as_abandoned(self):
+        # A common workflow: a global "Won't Do"/"Cancelled" edge from any
+        # status, while Done is reachable only from In Review. A `done` or
+        # `already-fixed` close on an open ticket must NOT record shipped work
+        # as abandoned: it is refused (final, no comment, no move) and the
+        # session is told to use its tracker tool. So is a read naming no status.
+        todo = {"id": "1", "name": "In Review", "category": "inprogress"}
+        for kind, negs in (("done", [{"id": "41", "name": "Won't Do", "category": "done"}]),
+                           ("done", [{"id": "42", "name": "Cancelled", "category": "done"},
+                                     {"id": "43", "name": "Duplicate", "category": "done"}]),
+                           ("already-fixed", [{"id": "44", "name": "Duplicate",
+                                               "category": "done"}]),
+                           ("already-fixed", [{"id": "45", "name": "Cannot Reproduce",
+                                               "category": "done"}]),
+                           # Azure DevOps' built-in Removed state, a typographic
+                           # apostrophe, and a "Not Doing" status.
+                           ("done", [{"id": "46", "name": "Removed", "category": "done"}]),
+                           ("done", [{"id": "47", "name": "Won’t Do", "category": "done"}]),
+                           ("already-fixed", [{"id": "48", "name": "Not Doing",
+                                               "category": "done"}])):
+            for current in (("In Progress", "indeterminate"), None):
+                with self.subTest(kind=kind, neg=negs[0]["name"], current=current):
+                    self.calls.clear()
+                    self.notified.clear()
+                    sess, r = self._close_from([todo] + negs, kind, current)
+                    self.assertEqual(self._transitions(), [])
+                    self.assertEqual(self._comments(), [])
+                    self.assertEqual((r["ok"], r["final"]), (False, True))
+                    self.assertIn("refused: no plain Done transition", r["error"])
+                    self.assertIn(f"only {negs[0]['name']}", r["error"])
+                    self.assertNotIn("outcome", sess["ticket"])
+                    self.assertFalse(os.path.exists(self._path()))
+                    [(_, text)] = self.notified
+                    self.assertIn("It was not moved to Done", text)
+                    self.assertIn("tracker CLI/MCP this host gives you", text)
+        # A not-reproducible close may take such a status (no change was made,
+        # which is what it says), and only after the already-in-Done read.
+        self.calls.clear()
+        _, r = self._close_from([todo, {"id": "41", "name": "Won't Do", "category": "done"}],
+                                "not-reproducible", ("In Progress", "indeterminate"))
+        self.assertIn(f"/rest/api/3/issue/{self.KEY}", [p for p, _ in self.calls])
+        self.assertEqual(self._transitions(), [{"transition": {"id": "41"}}])
+        self.assertEqual((r["ok"], r["status"]), (True, "Won't Do"))
+        # The exact match is taken without reading the current status at all.
+        self.calls.clear()
+        self._close_from([todo, {"id": "31", "name": "Done", "category": "done"}],
+                         "done", ("Done", "done"))
+        self.assertNotIn(f"/rest/api/3/issue/{self.KEY}", [p for p, _ in self.calls])
+        self.assertEqual(self._transitions(), [{"transition": {"id": "31"}}])
+
+    def test_a_failed_status_read_never_takes_the_fallback(self):
+        # The ticket may already be in Done, so a status read that FAILS is not
+        # "not in Done": the attempt fails (no comment, no move) and is retried;
+        # the retry that reads Done counts it closed without moving it.
+        todo = {"id": "1", "name": "To Do", "category": "todo"}
+        self.OPTS = [todo, {"id": "41", "name": "Won't Do", "category": "done"}]
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+        reads = {"n": 0}
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                reads["n"] += 1
+                if reads["n"] == 1:
+                    raise ha.BoardHttpError("HTTP 503: blip", 503)
+                return {"fields": {"status": {"name": "Done",
+                                              "statusCategory": {"key": "done"}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req(resolution="done")
+            sm._process_close_ticket_requests(now=1000.0)
+            self.assertEqual(self._transitions(), [])
+            self.assertEqual(self._comments(), [])
+            sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        sm._apply_closed_tickets()
+        self.assertEqual(self._transitions(), [])
+        self.assertEqual(len(self._comments()), 1)
+        first, last = sm.ticket_outcome_results
+        self.assertEqual((first["ok"], first["final"]), (False, False))
+        self.assertIn("could not read", first["error"])
+        self.assertEqual((last["ok"], last["status"]), (True, "Done"))
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "done")
+
+    def test_the_fallback_predicate(self):
+        def o(name):
+            return {"id": "1", "name": name, "category": "done"}
+        self.assertFalse(ha._close_ticket_is_fallback(o("Done"), "done"))
+        self.assertFalse(ha._close_ticket_is_fallback(o("Shipped"), "already-fixed"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Won't Do"), "done"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Cannot Reproduce"), "already-fixed"))
+        self.assertFalse(ha._close_ticket_is_fallback(o("Cannot Reproduce"), "not-reproducible"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Done"), "not-reproducible"))
+
+    def test_a_refusal_is_told_to_the_session_and_a_success_is_not(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        [(sid, text)] = self.notified
+        self.assertIn("refused: the session's ticket is not on this host's board", text)
+        self.notified.clear()
+        sess["ticket"]["siteKey"] = self.SITE
+        self._req(at=1_786_400_000_001)
+        sm._process_close_ticket_requests(now=2000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def test_the_failure_message_is_one_bounded_line(self):
+        msg = ha._close_ticket_failed_message("ENG-9", None, "HTTP 400:\n" + "x" * 900)
+        self.assertNotIn("\n", msg)
+        self.assertIn("could NOT close ticket ENG-9: HTTP 400: x", msg)
+        self.assertLess(len(msg), 700)
+
+    def test_a_notify_that_raises_never_breaks_the_beat(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        with mock.patch.object(sm, "notify_session", side_effect=OSError("pane gone")):
+            sm._apply_closed_tickets()                 # logged, never raised
+        self.assertFalse(sm.ticket_outcome_results[0]["ok"])
+
+    def test_only_a_running_claude_session_is_served(self):
+        for over in ({"agentType": "dsh"}, {"agentType": "qwen"}, {"status": "stopped"}):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                self._sess(sm, **over)
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])
+                self.assertTrue(os.path.exists(self._path()))    # untouched
+
+    def test_a_session_with_no_ticket_is_refused_and_told(self):
+        # The CLI promises the manager will say so when it cannot close the
+        # ticket; a bare (or not-yet-adopted) session must hear it, not silence.
+        for over in ({"ticket": None}, {"ticket": {"key": ""}}, {"ticket": "junk"}):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                sess = self._sess(sm, **over)
+                self.calls.clear()
+                self.notified.clear()
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])                 # no tracker HTTP
+                self.assertFalse(os.path.exists(self._path()))  # consumed
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertEqual((r["ok"], r["final"], r["key"]), (False, True, None))
+                self.assertIn("this session has no ticket", r["error"])
+                [(sid, text)] = self.notified
+                self.assertEqual(sid, self.SID)
+                self.assertIn("could NOT close a ticket", text)
+                self.assertNotIn("None", text)
+                self.assertEqual(sess.get("ticket"), over["ticket"])  # untouched
+
+    def test_start_and_resume_forget_a_close_the_session_made(self):
+        # The operator reopening the ticket and bringing the session back means
+        # the board must stop saying the session closed it.
+        sm = self.make_manager()
+        outcome = {"kind": "not-reproducible", "at": 1}
+        sess = self._sess(sm, status="error", ttydPort=7701)
+        sess["ticket"]["outcome"] = outcome
+        with mock.patch.object(sm, "_launch_tmux") as launch, \
+                mock.patch.object(sm, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm.start(self.SID)
+        launch.assert_called_once()
+        self.assertEqual(sess["status"], "running")
+        self.assertNotIn("outcome", sess["ticket"])
+        self.assertEqual(sess["ticket"]["key"], self.KEY)
+        # resume() from the closed history drops it too.
+        sm2 = self.make_manager()
+        closed = dict(self._sess(sm2), status="stopped")
+        closed["ticket"] = {**closed["ticket"], "outcome": outcome}
+        sm2.registry = []
+        sm2.closed = [closed]
+        with mock.patch.object(sm2, "_launch_tmux"), \
+                mock.patch.object(sm2, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm2.resume(self.SID)
+        [back] = [s for s in sm2.registry if s["id"] == self.SID]
+        self.assertNotIn("outcome", back["ticket"])
+        self.assertEqual(back["ticket"]["key"], self.KEY)
+        self.assertEqual(ha._reopened_ticket(None), None)
+        t = {"key": "K-1"}
+        self.assertIs(ha._reopened_ticket(t), t)
+
+    def test_start_drops_a_close_request_left_from_before_the_stop(self):
+        # A request whose first attempt failed (not final), or written just
+        # before the session crashed to `error`, must not re-close the ticket
+        # the operator just brought back. A wake request still stands.
+        sm = self.make_manager()
+        self._sess(sm, status="error", ttydPort=7701)
+        self._req()
+        wake = os.path.join(os.path.dirname(self._path()), "wake.json")
+        with open(wake, "w") as fh:
+            json.dump({"wakeAt": 1, "reason": "r"}, fh)
+        with mock.patch.object(sm, "_launch_tmux"), \
+                mock.patch.object(sm, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm.start(self.SID)
+        self.assertFalse(os.path.exists(self._path()))
+        self.assertTrue(os.path.exists(wake))
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual((self._comments(), self._transitions()), ([], []))
+        sm.start(self.SID)          # nothing left to drop: still quiet
+
+    def test_a_ticket_from_another_board_is_refused(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual(self.calls, [])
+        sm._apply_closed_tickets()
+        self.assertIn("not on this host's board", sm.ticket_outcome_results[0]["error"])
+
+    def test_the_beat_applies_what_the_worker_landed_and_wakes_it_off_the_beat(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        # No real tmux here: keep the dead-session sweep from ending the session.
+        p = mock.patch.object(sm, "_sweep_dead_sessions")
+        p.start()
+        self.addCleanup(p.stop)
+        # The beat itself makes no tracker call: it only wakes the worker.
+        with mock.patch.object(sm, "_stage_close_ticket_work") as stage:
+            payload = sm.build_payload(1)
+        stage.assert_called_once()
+        self.assertEqual(self.calls, [])
+        self.assertNotIn("ticketOutcomeResults", payload)
+        # The capability the hub gates its close-ticket wording on.
+        self.assertEqual(payload["closeTicket"], {"available": True})
+        with mock.patch.object(sm, "_stage_close_ticket_work") as stage:
+            sm.build_payload(2, light=True)
+        stage.assert_not_called()                 # a light beat does not
+        sm._process_close_ticket_requests(now=1000.0)    # the worker pass
+        with mock.patch.object(sm, "_stage_close_ticket_work"):
+            payload = sm.build_payload(3)
+        self.assertEqual(payload["ticketOutcomeResults"][0]["kind"], "not-reproducible")
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+        # Delivered results are cleared with the rest of the staged work.
+        sm._clear_delivered_staged(payload)
+        self.assertEqual(sm.ticket_outcome_results, [])
+
+    def test_the_worker_starts_once_and_a_failed_start_never_raises(self):
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_close_ticket_worker_loop"):
+            sm._stage_close_ticket_work()
+            first = sm._close_ticket_worker
+            first.join(1)
+        with mock.patch.object(ha.threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            sm._stage_close_ticket_work()          # logged, never raised onto the beat
+        self.assertIsNot(sm._close_ticket_worker, first)
+
+    def test_an_adopted_ticket_is_refused_and_the_session_told(self):
+        # An adopted block came from the session's own branch name, so honouring
+        # it would let any session close any collected ticket (and get every
+        # session on it killed by the hub's auto-stop). Both the served flag and
+        # the older internal one are refused.
+        for over in ({"adopted": True}, None):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                sess = self._sess(sm)
+                if over:
+                    sess["ticket"].update(over)
+                else:
+                    sess["ticketAdopted"] = True
+                self.calls.clear()
+                self.notified.clear()
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])                 # no tracker HTTP at all
+                self.assertFalse(os.path.exists(self._path()))
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertEqual((r["ok"], r["final"]), (False, True))
+                self.assertIn("adopted ticket", r["error"])
+                [(sid, text)] = self.notified
+                self.assertIn("refused: an adopted ticket", text)
+                self.assertNotIn("outcome", sess["ticket"])
+
+    def test_no_comment_is_posted_when_nothing_can_move_it_to_done(self):
+        # The target is resolved first, so a workflow with no edge into Done never
+        # gets an evidence comment on a ticket that stays open — on either try.
+        self.OPTS = self.OPTS[:1]
+        sm = self.make_manager()
+        self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        self.assertEqual(self._comments(), [])
+        self.assertEqual(self._transitions(), [])
+        sm._apply_closed_tickets()
+        self.assertEqual([r["final"] for r in sm.ticket_outcome_results], [False, True])
+
+    def test_a_session_killed_before_the_beat_still_gets_its_outcome(self):
+        # The worker closed the ticket, then the operator killed the session before
+        # the beat applied it: the closed record and its ledger entry get stamped.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        rec = dict(sess, status="stopped")
+        sm.registry = []
+        sm.closed = [{"id": "other", "repo": "Turma"}, rec]
+        sm._apply_closed_tickets()
+        self.assertEqual(rec["ticket"]["outcome"], {"kind": "not-reproducible", "at": 1_000_000,
+                                                    "note": "ran repro.sh on main: passes"})
+        self.assertEqual(sm.ticket_ledger[sess["claudeSessionId"]]["outcome"]["kind"],
+                         "not-reproducible")
+        self.assertNotIn("ticket", sm.closed[0])
+
+    def test_staged_results_are_capped(self):
+        sm = self.make_manager()
+        n = ha.TICKET_OUTCOME_RESULTS_MAX + 15
+        for i in range(n):
+            with sm._close_ticket_lock:
+                sm._close_ticket_landed.append({
+                    "sessionId": self.SID, "key": self.KEY, "kind": "done", "ok": False,
+                    "error": f"e{i}", "final": False, "status": None, "at": i})
+            sm._apply_closed_tickets()
+        self.assertEqual(len(sm.ticket_outcome_results), ha.TICKET_OUTCOME_RESULTS_MAX)
+        self.assertEqual(sm.ticket_outcome_results[-1]["error"], f"e{n - 1}")   # newest kept
+
+    def test_an_azure_comment_posts_escaped_html_to_the_work_item(self):
+        seen = []
+
+        def fake_azure(path, params, body=None, method=None, content_type="application/json"):
+            seen.append((path, params, body))
+            return {"fields": {"System.TeamProject": "Proj One"}} if body is None else {}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org", AZDO_TOKEN="p",
+                                 JIRA_SITE=""), \
+                mock.patch.object(ha, "azure_req", fake_azure):
+            ha.add_board_comment("42", "a <b>\nline two")
+        self.assertEqual(seen[1][0], "/Proj%20One/_apis/wit/workItems/42/comments")
+        self.assertEqual(seen[1][2], {"text": "a &lt;b&gt;<br>line two"})
+
+
+class TestTicketClosingDirectives(ManagerMixin, unittest.TestCase):
+    """XERK-1569: a ticket session is told to close its own ticket — the bug
+    directive and the appended system prompt name the session CLI first; a
+    dsh/qwen session (no CLI yet) is not taught it."""
+
+    CLI = 'python3 -SsE "$TURMA_SESSION_CLI" close-ticket'
+
+    def test_the_bug_directive_closes_a_stale_bug_with_the_cli(self):
+        p = ha.build_ticket_prompt({"key": "P-1", "type": "Bug"})
+        self.assertIn(self.CLI + " not-reproducible --note", p)
+        self.assertIn("else the tracker CLI/MCP this host gives you", p)
+        self.assertIn("end the turn: no PR, no question", p)
+        self.assertNotIn("so it can be closed", p)
+
+    def test_a_runtime_without_the_cli_keeps_the_report_wording(self):
+        p = ha.build_ticket_prompt({"key": "P-1", "type": "Bug"}, session_cli=False)
+        self.assertNotIn("TURMA_SESSION_CLI", p)
+        self.assertIn("so it can be closed", p)
+        self.assertIn("STOP", p)
+
+    def test_the_session_directive_restates_both_rules_for_a_ticket_key(self):
+        sm = self.make_manager()
+        # No branch yet (a deferred reservation) — the key alone is the gate.
+        d = sm._session_directive({"id": "s1", "ticket": {"key": "P-7", "branch": None}})
+        self.assertIn("Closing ticket P-7 is this session's job", d)
+        self.assertIn(self.CLI + " not-reproducible --note", d)
+        self.assertIn(self.CLI + " done --note", d)
+        self.assertNotIn("Name the branch you create", d)
+
+    def test_an_adopted_ticket_is_taught_the_tracker_tool_not_the_cli(self):
+        # The close-ticket reader refuses an adopted block, so the directive must
+        # not teach a CLI the manager then refuses.
+        sm = self.make_manager()
+        for sess in ({"id": "s1", "ticket": {"key": "P-7", "adopted": True}},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "ticketAdopted": True}):
+            with self.subTest(sess=sess):
+                d = sm._session_directive(sess)
+                self.assertNotIn("TURMA_SESSION_CLI", d)
+                self.assertIn("Ticket P-7 was linked to this session", d)
+                self.assertIn("tracker CLI/MCP this host gives you", d)
+
+    def test_no_ticket_or_a_dsh_qwen_session_gets_no_close_paragraph(self):
+        sm = self.make_manager()
+        for sess in ({"id": "s1"}, {"id": "s1", "ticket": None},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "agentType": "dsh"},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "agentType": "qwen"}):
+            with self.subTest(sess=sess):
+                d = sm._session_directive(sess)
+                self.assertNotIn("TURMA_SESSION_CLI", d)
+                self.assertNotIn("Closing ticket", d)
+
+    def test_the_branch_prompt_no_longer_promises_the_first_message(self):
+        self.assertNotIn("whose full text is in your first", ha.TICKET_BRANCH_PROMPT)
 
 
 class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
@@ -23563,9 +24349,24 @@ class TestPokeHeartbeat(unittest.TestCase):
     heartbeat loop's interval wait short so a just-queued command is picked up
     right away instead of up to a whole INTERVAL later."""
 
+    class _Hung(Exception):
+        pass
+
+    def _arm_deadline(self, secs):
+        # A poke regression (a blocking pipe end, a revert to Event) WEDGES rather
+        # than fails, so every test here runs under a SIGALRM that unwinds it into
+        # a named failure instead of a silent CI timeout.
+        def _deadline(*_):
+            raise self._Hung()
+        prev = signal.signal(signal.SIGALRM, _deadline)
+        self.addCleanup(signal.signal, signal.SIGALRM, prev)
+        self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
+        signal.setitimer(signal.ITIMER_REAL, secs)
+
     def test_sigusr1_sets_the_poke_event_and_cuts_the_wait_short(self):
+        self._arm_deadline(30)
         prev = signal.getsignal(signal.SIGUSR1)
-        signal.signal(signal.SIGUSR1, lambda *_: ha._poke.set())
+        signal.signal(signal.SIGUSR1, ha._on_sigusr1)
         self.addCleanup(signal.signal, signal.SIGUSR1, prev)
 
         ha._poke.clear()
@@ -23578,6 +24379,58 @@ class TestPokeHeartbeat(unittest.TestCase):
         start = time.monotonic()
         self.assertTrue(ha._poke.wait(5))
         self.assertLess(time.monotonic() - start, 1.0)
+        # clear() drops the pending poke, so the next wait sleeps again.
+        ha._poke.clear()
+        self.assertFalse(ha._poke.wait(0.05))
+
+    def test_a_sigusr1_burst_while_the_loop_waits_neither_deadlocks_nor_recurses(self):
+        # XERK-1558: the handler used to be `_poke.set()` on a threading.Event.
+        # A signal landing while the main thread sat inside Event.wait() (holding
+        # its non-reentrant Condition lock) blocked the handler on that lock; the
+        # burst's next signal nested another handler, and so on — a deadlocked
+        # manager, or RecursionError out of run_forever. Drive the real shape:
+        # this (main) thread loops clear()/wait() like run_forever while another
+        # process fires SIGUSR1 as fast as it can.
+        prev = signal.getsignal(signal.SIGUSR1)
+        signal.signal(signal.SIGUSR1, ha._on_sigusr1)
+        self.addCleanup(signal.signal, signal.SIGUSR1, prev)
+
+        sender = subprocess.Popen([sys.executable, "-c",
+            "import os, signal, sys\n"
+            "pid = int(sys.argv[1])\n"
+            "for _ in range(50000): os.kill(pid, signal.SIGUSR1)\n",
+            str(os.getpid())])
+        self.addCleanup(sender.kill)
+        self._arm_deadline(60)
+        waits = 0
+        try:
+            while sender.poll() is None:
+                ha._poke.clear()
+                ha._poke.wait(0.001)
+                waits += 1
+        except self._Hung:
+            self.fail(f"the wait loop wedged under a SIGUSR1 burst after {waits} waits")
+        except RecursionError:
+            self.fail("a SIGUSR1 burst nested handlers into RecursionError")
+        self.assertEqual(sender.returncode, 0)
+        # The loop still works after the storm: a poke wakes it, quiet sleeps.
+        ha._poke.clear()
+        self.assertFalse(ha._poke.wait(0.05))
+        os.kill(os.getpid(), signal.SIGUSR1)
+        self.assertTrue(ha._poke.wait(5))
+
+    def test_a_poke_flood_with_no_waiter_never_blocks_the_setter(self):
+        # The pipe's capacity is finite; set() past it must drop (a poke is
+        # already pending) rather than block — a blocked signal handler is the
+        # very wedge this guards against.
+        self._arm_deadline(30)
+        ha._poke.clear()
+        self.addCleanup(ha._poke.clear)
+        start = time.monotonic()
+        for _ in range(200000):
+            ha._poke.set()
+        self.assertLess(time.monotonic() - start, 10)
+        self.assertTrue(ha._poke.wait(0))
 
 
 class TestPokeListener(unittest.TestCase):
@@ -28087,6 +28940,10 @@ class TestShapeIssue(unittest.TestCase):
         self.assertEqual(t["labels"], ["infra", "urgent"])
         self.assertEqual(t["dueDate"], "2026-07-20")
         self.assertEqual(t["parentKey"], "PROJ-100")
+        # Open: no resolution date (the brief's outflow reads it, XERK-1573).
+        self.assertIsNone(t["resolved"])
+        done = ha._shape_issue(self._issue(resolutiondate="2026-07-15T09:00:00.000+0000"), "s")
+        self.assertEqual(done["resolved"], "2026-07-15T09:00:00.000+0000")
         # A plain parent (no issuetype expansion) is not an epic; no links.
         self.assertIsNone(t["epicKey"])
         self.assertFalse(t["isEpic"])
@@ -36995,6 +37852,1907 @@ class TestMemoryGuard(ManagerMixin, unittest.TestCase):
                 mock.patch.object(ha.threading, "Thread") as t:
             sm._start_memguard()
         t.assert_not_called()
+
+
+class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
+    """The permission ledger's agent half (XERK-1563): dialog rows off the
+    panePrompt edges, merged with the hook rows the worker tails, classifier
+    denials, ask-in-chat rows, and the outbox's wire discipline."""
+
+    SID = "perm1"
+    CLAUDE_SID = "0b9f2c1e-1111-4222-8333-444455556666"
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        self.wt = os.path.join(self.tmp, "worktrees", "repo", "wt1")
+        os.makedirs(self.wt)
+        self.sess = {"id": self.SID, "status": "running", "tmuxName": "agent-perm1",
+                     "worktreePath": self.wt, "repoPath": self.wt,
+                     "claudeSessionId": self.CLAUDE_SID}
+        self.sm.registry = [self.sess]
+        self.tpath = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.wt),
+                                  f"{self.CLAUDE_SID}.jsonl")
+        os.makedirs(os.path.dirname(self.tpath))
+        self.lines = []
+        self.sm._perm_first_beat_done = True
+        # These pin the XERK-1563 regex, which is now the FALLBACK where the wait
+        # classifier does not run (XERK-1572); TestAttentionHints covers the
+        # classifier deciding the ask-in-chat row.
+        p = mock.patch.object(ha, "ATTENTION_HINTS_ON", False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    # --- helpers --------------------------------------------------------------
+
+    def write(self, *entries):
+        self.lines.extend(entries)
+        with open(self.tpath, "w") as f:
+            for e in self.lines:
+                f.write(json.dumps(e) + "\n")
+
+    def tool_use(self, tuid, name="Bash", inp=None):
+        return {"type": "assistant", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": tuid, "name": name,
+             "input": inp if inp is not None else {"command": "npm test"}}]}}
+
+    def tool_result(self, tuid, text="ok", is_error=False):
+        return {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": tuid, "content": text,
+             "is_error": is_error}]}}
+
+    def dialog(self, prompt="Do you want to proceed?"):
+        return {"prompt": prompt, "detail": "Bash command\nnpm test",
+                "options": [{"number": 1, "label": "Yes", "selected": True},
+                            {"number": 2, "label": "Yes, and don't ask again",
+                             "selected": False},
+                            {"number": 3, "label": "No", "selected": False}]}
+
+    def sandbox(self, host="registry.npmjs.org"):
+        # Claude Code's sandbox escape, in its own wording (the 2.1.x TUI): a
+        # "Network request outside of sandbox" title, a "Host:" row, and the
+        # question, all drawn by the TUI rather than written by the call.
+        return {"prompt": "Do you want to allow this connection?",
+                "detail": f"Network request outside of sandbox\nHost: {host}",
+                "options": [{"number": 1, "label": "Yes", "selected": True},
+                            {"number": 2, "label": f"Yes, and don't ask again for {host}",
+                             "selected": False},
+                            {"number": 3,
+                             "label": "No, and tell Claude what to do differently (esc)",
+                             "selected": False}]}
+
+    def edge(self, pane_prompt=None, at=1000, **sig):
+        signals = {"panePrompt": pane_prompt, "paneBusy": False}
+        signals.update(sig)
+        self.sm._permission_edges(self.sess, signals, now_ms=at)
+
+    def rows(self):
+        return list(self.sm.permission_events)
+
+    def hook_rows(self, *rows):
+        self.sm._permission_rows_fetched = {self.SID: list(rows)}
+
+    def request_hook(self, ts=900, head="npm test", tool="Bash"):
+        # The REAL shape: Claude Code's PermissionRequest carries NO
+        # tool_use_id (2.1.288, confirmed with a live hook dumping its stdin),
+        # so permlog.py writes toolUseId null and the tail reads it as "".
+        return {"sessionId": self.SID, "event": "PermissionRequest", "ts": ts,
+                "toolUseId": "", "tool": tool, "head": head,
+                "digest": "{}", "rulesMatched": [f"{tool}({head}:*)"]}
+
+    # --- dialog edges ---------------------------------------------------------
+
+    def test_a_dialog_opens_a_row_carrying_the_pending_call(self):
+        self.write(self.tool_use("toolu_0"), self.tool_result("toolu_0"),
+                   self.tool_use("toolu_1", inp={"command": "npm test -- -x"}))
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual(row["kind"], "dialog")
+        self.assertEqual(row["dialogKind"], "permission")
+        self.assertEqual(row["openedAt"], 1000)
+        self.assertEqual(row["toolUseId"], "toolu_1")   # the one with no result
+        self.assertEqual(row["head"], "npm test")       # permlog.py's own head
+        self.assertEqual(row["options"], ["Yes", "Yes, and don't ask again", "No"])
+        self.assertNotIn("closedAt", row)
+        # Still up next beat: nothing new.
+        self.edge(self.dialog(), at=2000)
+        self.assertEqual(len(self.rows()), 1)
+
+    def test_the_closed_row_reports_turmas_own_answer(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        with mock.patch.object(ha, "_capture_pane", return_value=PANE_PERMISSION_DIALOG):
+            self.sm.answer_pane_prompt(self.SID, 3)
+        self.edge(None, at=4500)
+        closed = self.rows()[-1]
+        self.assertEqual(closed["id"], self.rows()[0]["id"])   # same row, upserted
+        self.assertEqual((closed["answer"], closed["answerNumber"], closed["via"]),
+                         ("deny", 3, "turma"))
+        self.assertEqual(closed["waitedMs"], 3500)
+        self.assertEqual(closed["closedAt"], 4500)
+
+    def test_an_answer_at_the_terminal_is_inferred_from_the_calls_result(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.write(self.tool_result(
+            "toolu_1", "The user doesn't want to proceed with this tool use.", True))
+        self.edge(None, at=2000)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("deny", "terminal"))
+        # …and a call that RAN is an allow.
+        self.write(self.tool_use("toolu_2"))
+        self.edge(self.dialog(), at=3000)
+        self.write(self.tool_result("toolu_2", "tests passed"))
+        self.edge(None, at=4000)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("allow", "terminal"))
+
+    def test_an_approved_call_that_failed_is_still_an_allow(self):
+        # Only Claude Code's own rejection wording reads deny: a call the
+        # operator approved that then failed with ordinary error text ran.
+        n = 0
+        for text in ("Exit code 1\ncat: /etc/shadow: Permission denied",
+                     "error: push to main is not allowed by branch protection",
+                     "permission denied while trying to connect to the Docker daemon socket",
+                     "git@github.com: Permission denied (publickey).",
+                     "ERROR: Permission to acme/x.git denied to bot."):
+            n += 1
+            tuid = f"toolu_f{n}"
+            self.write(self.tool_use(tuid))
+            self.edge(self.dialog(), at=n * 1000)
+            self.write(self.tool_result(tuid, text, True))
+            self.edge(None, at=n * 1000 + 500)
+            self.assertEqual(self.rows()[-1]["answer"], "allow", text)
+
+    def test_claude_codes_own_rejections_read_deny(self):
+        for text in (
+                "The user doesn't want to proceed with this tool use. The tool use "
+                "was rejected (eg. if it was a file edit, the new_string was NOT "
+                "written to the file).",
+                "Permission for this tool use was denied. The tool use was rejected.",
+                "Permission for this action has been denied. Reason: outside scope",
+                "Permission to use Bash with command rm -rf x has been denied.",
+                "<tool_use_error>Permission to use Bash with command x has been "
+                "denied.</tool_use_error>",
+                "User rejected Claude's plan:"):
+            entries = [self.tool_use("toolu_x"), self.tool_result("toolu_x", text, True)]
+            self.assertEqual(ha.tool_call_outcome(entries, "toolu_x"), "deny", text)
+        # The wording mid-result (quoted in a command's output) is not a refusal.
+        entries = [self.tool_use("toolu_y"), self.tool_result(
+            "toolu_y", "Exit code 1\nThe user doesn't want to proceed with this tool use.",
+            True)]
+        self.assertEqual(ha.tool_call_outcome(entries, "toolu_y"), "allow")
+
+    def test_no_result_yet_reads_allow_only_while_the_pane_is_busy(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge(None, at=2000, paneBusy=True)
+        self.assertEqual(self.rows()[-1]["answer"], "allow")
+        self.write(self.tool_use("toolu_2"))
+        self.edge(self.dialog(), at=3000)
+        self.edge(None, at=4000, paneBusy=None)
+        self.assertEqual((self.rows()[-1]["answer"], self.rows()[-1]["via"]),
+                         ("unknown", "unknown"))
+
+    def test_dialog_kinds(self):
+        self.assertEqual(ha.classify_pane_dialog(ha.parse_pane_prompt(PANE_PLAN_DIALOG)),
+                         "plan")
+        self.assertEqual(ha.classify_pane_dialog(
+            ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)), "permission")
+        self.assertEqual(ha.classify_pane_dialog(self.sandbox()), "sandbox")
+        self.assertEqual(ha.classify_pane_dialog({"prompt": "Which one?"}), "other")
+        # A pending ExitPlanMode is the plan approval, even when a narrow pane
+        # wrapped all but the question's tail onto the lines above it.
+        self.assertEqual(ha.classify_pane_dialog(
+            {"prompt": "proceed?", "detail": "Plan\nI will add one test."},
+            {"tool": "ExitPlanMode", "toolUseId": "toolu_P"}), "plan")
+
+    def test_a_tool_prompts_own_text_never_picks_its_kind(self):
+        # The detail is the CALL's free text — its command, Claude's description
+        # of it, a path — so "plan", "sandbox" or "network access" in it says
+        # nothing about the dialog: each is an ordinary tool prompt.
+        cases = [
+            ("Bash command\nterraform plan -out tf.plan\nPlan the infra change",
+             "terraform plan -out tf.plan"),
+            ("Bash command\ngit add docs/plan.md\nStage the plan", "git add docs/plan.md"),
+            ("Bash command\ncurl -s https://api.github.com/repos/o/r\n"
+             "Check network access to GitHub", "curl -s https://api.github.com/repos/o/r"),
+            ("Bash command\nls sandbox/\nList the sandbox directory", "ls sandbox/"),
+        ]
+        for n, (detail, command) in enumerate(cases):
+            with self.subTest(command=command):
+                pp = dict(self.dialog(), detail=detail)
+                self.assertEqual(ha.classify_pane_dialog(pp), "permission")
+                self.lines = []
+                self.write(self.tool_use(f"toolu_{n}", inp={"command": command}))
+                self.edge(pp, at=1000 + n * 10000)
+                row = self.sm._perm_open[self.SID]
+                self.assertEqual(row["dialogKind"], "permission")
+                self.assertNotEqual(row["head"], "api.github.com")
+                self.edge(None, at=2000 + n * 10000)
+        # Nor does a path in the question of an edit prompt.
+        for q in ("Do you want to make this edit to docs/plan.md?",
+                  "Do you want to create sandbox/network-access.md?"):
+            with self.subTest(question=q):
+                self.assertEqual(ha.classify_pane_dialog(
+                    dict(self.dialog(), prompt=q), {"tool": "Edit"}), "permission")
+
+    def test_a_sandbox_dialog_names_its_host(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.sandbox())
+        row, = self.rows()
+        self.assertEqual((row["dialogKind"], row["head"]),
+                         ("sandbox", "registry.npmjs.org"))
+
+    def test_a_sandbox_host_comes_only_from_the_tuis_own_rows(self):
+        # The head becomes a pasted allowedDomains rule, so a host-shaped word
+        # in the call's own text (a file name) must never become it.
+        d = self.sandbox()
+        self.assertEqual(ha._pane_dialog_host(d), "registry.npmjs.org")
+        no_host_line = dict(d, detail="Network request outside of sandbox\n"
+                                      "npm install --prefix . package.json")
+        self.assertEqual(ha._pane_dialog_host(no_host_line), "registry.npmjs.org")
+        bare = dict(no_host_line, options=[{"number": 1, "label": "Yes"},
+                                           {"number": 2, "label": "No"}])
+        self.assertEqual(ha._pane_dialog_host(bare), "")
+        self.assertEqual(ha._pane_dialog_host(dict(
+            bare, prompt="Do you want to allow this connection? README.md")), "")
+
+    # --- hook rows ------------------------------------------------------------
+
+    def test_a_permission_request_merges_into_its_dialog_by_its_call(self):
+        # Tailed before the dialog is seen: held, then claimed by the dialog
+        # whose pending call is the same tool + head — though that row carries a
+        # transcript toolUseId and the hook none.
+        self.write(self.tool_use("toolu_1"))
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.assertEqual(self.rows(), [])          # held for the dialog
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual(row["rulesMatched"], ["Bash(npm test:*)"])
+        self.assertEqual(row["toolUseId"], "toolu_1")   # the transcript's, kept
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
+
+    def test_a_held_request_and_its_dialog_are_one_row_never_two(self):
+        # Hook staging and the pane edge on different beats: the dialog opens
+        # and closes, and once the hold runs out no second `r-` row appears.
+        self.write(self.tool_use("toolu_1"))
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.edge(self.dialog(), at=1000)
+        self.write(self.tool_result("toolu_1"))
+        self.edge(None, at=2000)
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertEqual({r["id"] for r in self.rows()}, {f"d-{self.SID}-1000"})
+        self.assertEqual(self.rows()[-1]["rulesMatched"], ["Bash(npm test:*)"])
+
+    def test_the_real_hook_line_merges_end_to_end(self):
+        # permlog.py's own row for the real event shape, through the tail's
+        # parser, merges into the open dialog: no toolUseId anywhere upstream.
+        mod = ha._permlog_module()
+        self.assertIsNotNone(mod)
+        line = mod.build_row({
+            "session_id": self.CLAUDE_SID, "transcript_path": self.tpath,
+            "cwd": self.wt, "prompt_id": "p1", "permission_mode": "default",
+            "hook_event_name": "PermissionRequest", "tool_name": "Bash",
+            "tool_input": {"command": "npm test"},
+            "permission_suggestions": [{"rules": [
+                {"toolName": "Bash", "ruleContent": "npm test:*"}]}]}, now_ms=900)
+        self.assertIsNone(line["toolUseId"])
+        parsed, _ = ha.parse_permission_log_lines(
+            (json.dumps(line) + "\n").encode(), self.SID)
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(*parsed)
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        row = self.sm._perm_open[self.SID]
+        self.assertEqual((row["toolUseId"], row["digest"], row["rulesMatched"]),
+                         ("toolu_1", line["digest"], ["Bash(npm test:*)"]))
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), None)
+
+    def test_a_request_for_another_call_is_not_merged_into_the_open_dialog(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook(head="git push", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
+        held = self.sm._perm_hook_pending[self.SID]
+        self.assertEqual([h["head"] for h, _ in held.values()], ["git push"])
+
+    def test_a_request_stamped_after_the_dialog_was_seen_is_a_later_prompts(self):
+        # A hook fires BEFORE its dialog is drawn: one stamped well after the
+        # beat that saw this dialog belongs to the next prompt, same command or not.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        late = 1000 + ha.PERMISSION_HOOK_LATE_MS + 1
+        self.hook_rows(self.request_hook(ts=late))
+        self.sm._apply_permission_hook_rows(now_ms=late, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
+        self.assertEqual(len(self.sm._perm_hook_pending[self.SID]), 1)
+
+    def test_a_sandbox_prompt_never_takes_a_permission_request(self):
+        # A sandbox escape is not hookable: a request held while one is up is
+        # the call's own prompt (or another's), never the sandbox prompt's.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox(), at=1000)
+        self.hook_rows(self.request_hook(head="npm install", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertNotIn("rulesMatched", self.sm._perm_open[self.SID])
+
+    def test_a_request_tailed_after_its_dialog_closed_upserts_that_row(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge(None, at=2000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=2100, mono=0)
+        last = self.rows()[-1]
+        self.assertEqual(last["id"], self.rows()[0]["id"])
+        self.assertEqual(last["rulesMatched"], ["Bash(npm test:*)"])
+        self.assertIn("closedAt", last)
+
+    def test_an_unclaimed_request_becomes_its_own_dialog_row(self):
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.sm._apply_permission_hook_rows(
+            now_ms=900, mono=ha.PERMISSION_HOOK_HOLD_SEC - 1)
+        self.assertEqual(self.rows(), [])
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=ha.PERMISSION_HOOK_HOLD_SEC)
+        row, = self.rows()
+        self.assertEqual((row["id"], row["kind"], row["dialogKind"], row["toolUseId"],
+                          row["answer"]),
+                         (f"r-{self.SID}-900", "dialog", "permission", "", "unknown"))
+
+    def test_a_classifier_denial_is_a_complete_row(self):
+        self.hook_rows({"sessionId": self.SID, "event": "PermissionDenied", "ts": 777,
+                        "toolUseId": "toolu_5", "tool": "Bash", "head": "git push",
+                        "digest": "{}", "denyReason": "outside scope"})
+        self.sm._apply_permission_hook_rows(now_ms=800, mono=0)
+        row, = self.rows()
+        self.assertEqual((row["kind"], row["answer"], row["denyReason"], row["openedAt"]),
+                         ("classifier-denied", "deny", "outside scope", 777))
+
+    # --- ask-in-chat ----------------------------------------------------------
+
+    def ended(self, ts, text):
+        self.write({"type": "assistant", "timestamp": ts,
+                    "message": {"role": "assistant",
+                                "content": [{"type": "text", "text": text}]}})
+        return {"lastRole": "assistant", "lastHasToolUse": False,
+                "lastActivityTs": ts}
+
+    def test_an_ask_in_chat_opens_on_the_ended_turn_and_closes_on_input(self):
+        sig = self.ended("2026-10-03T10:00:00Z",
+                         "The build is ready. Should I proceed with the deploy?")
+        self.edge(None, at=5000, **sig)
+        row, = self.rows()
+        self.assertEqual(row["kind"], "ask-in-chat")
+        self.assertIn("Should I proceed", row["prompt"])
+        self.edge(None, at=6000, **sig)          # same turn: no second row
+        self.assertEqual(len(self.rows()), 1)
+        self.sm.handle_commands([{"cmdId": "c1", "type": "input",
+                                  "sessionId": self.SID, "text": "yes go"}])
+        closed = self.rows()[-1]
+        self.assertEqual((closed["id"], closed["via"]), (row["id"], "turma"))
+        self.assertGreaterEqual(closed["waitedMs"], 0)
+
+    def test_an_ask_answered_outside_turma_closes_and_the_next_ask_records(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "Should I proceed with the deploy?")
+        self.edge(None, at=5000, **sig)
+        first = self.rows()[0]["id"]
+        # The operator answers in the terminal: a user entry, the pane busy.
+        self.write({"type": "user", "timestamp": "2026-10-03T10:01:00Z",
+                    "message": {"role": "user", "content": "yes"}})
+        self.edge(None, at=65000, lastRole="user",
+                  lastActivityTs="2026-10-03T10:01:00Z", paneBusy=True)
+        closed = self.rows()[-1]
+        self.assertEqual((closed["id"], closed["via"], closed["waitedMs"]),
+                         (first, "terminal", 60000))
+        self.assertEqual(self.sm._perm_ask, {})
+        sig = self.ended("2026-10-03T10:05:00Z", "May I push the branch?")
+        self.edge(None, at=300000, **sig)
+        asks = [r for r in self.rows() if "closedAt" not in r]
+        self.assertEqual(len(asks), 2)
+        self.assertIn("push the branch", asks[-1]["prompt"])
+
+    def test_an_ask_answered_between_two_beats_closes_on_the_next_ended_turn(self):
+        self.edge(None, at=5000, **self.ended("2026-10-03T10:00:00Z", "May I merge it?"))
+        # Answered and the next turn finished between beats: only a NEW ended turn.
+        self.edge(None, at=9000, **self.ended("2026-10-03T10:02:00Z", "Merged. Done."))
+        closed = self.rows()[-1]
+        self.assertEqual((closed["via"], closed["closedAt"]), ("terminal", 9000))
+        self.assertNotIn(self.SID, self.sm._perm_ask)
+
+    def test_a_trailing_system_entry_does_not_close_an_ask(self):
+        self.edge(None, at=5000, **self.ended("2026-10-03T10:00:00Z", "May I merge it?"))
+        self.edge(None, at=6000, lastRole="system",
+                  lastActivityTs="2026-10-03T10:00:01Z")
+        self.assertEqual(len(self.rows()), 1)
+        self.assertIn(self.SID, self.sm._perm_ask)
+
+    def test_a_turn_that_asks_nothing_opens_nothing(self):
+        self.edge(None, **self.ended("2026-10-03T10:00:00Z", "Done — PR #12 is up."))
+        self.assertEqual(self.rows(), [])
+
+    def test_a_busy_or_tool_ending_turn_is_not_an_ask(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "May I run the migration?")
+        self.edge(None, **dict(sig, lastHasToolUse=True))
+        self.edge(None, **dict(sig, paneBusy=True))
+        self.assertEqual(self.rows(), [])
+
+    def test_the_first_beat_primes_rather_than_refiles_old_asks(self):
+        self.sm._perm_first_beat_done = False
+        sig = self.ended("2026-10-03T10:00:00Z", "May I run the migration?")
+        self.edge(None, **sig)
+        self.assertEqual(self.rows(), [])
+
+    # --- the wire -------------------------------------------------------------
+
+    def test_rows_ride_the_heartbeat_bounded_per_beat(self):
+        for i in range(ha.PERMISSION_EVENTS_MAX + 5):
+            self.sm._emit_permission({"id": f"x{i}", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(len(payload["permissionEvents"]), ha.PERMISSION_EVENTS_MAX)
+        self.assertEqual(payload["permissionEvents"][0]["id"], "x0")   # oldest first
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual([r["id"] for r in self.sm.permission_events],
+                         [f"x{i}" for i in range(ha.PERMISSION_EVENTS_MAX,
+                                                 ha.PERMISSION_EVENTS_MAX + 5)])
+
+    def test_cleared_by_identity_so_a_row_emitted_after_the_snapshot_survives(self):
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})  # same content
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual([r["id"] for r in self.sm.permission_events], ["a"])
+
+    def test_the_413_shed_never_drops_permission_rows(self):
+        self.sm._emit_permission({"id": "a", "kind": "ask-in-chat"})
+        payload = self.sm.build_payload(1, light=True)
+        self.sm._drop_on_demand_results(payload)
+        self.assertIn("permissionEvents", payload)
+        self.assertEqual(len(self.sm.permission_events), 1)
+
+    def test_the_outbox_is_bounded(self):
+        with mock.patch.object(ha, "log"):
+            for i in range(ha.PERMISSION_OUTBOX_MAX + 3):
+                self.sm._emit_permission({"id": f"x{i}"})
+        self.assertEqual(len(self.sm.permission_events), ha.PERMISSION_OUTBOX_MAX)
+        self.assertEqual(self.sm.permission_events[0]["id"], "x3")
+
+    def test_a_session_that_ends_closes_its_open_rows(self):
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.sm._forget_session_caches(self.SID)
+        last = self.rows()[-1]
+        self.assertEqual((last["answer"], last["via"]), ("unknown", "unknown"))
+        self.assertIn("closedAt", last)
+        self.assertNotIn(self.SID, self.sm._perm_open)
+
+    def test_a_session_that_leaves_running_closes_its_open_rows(self):
+        sig = self.ended("2026-10-03T10:00:00Z", "May I merge?")
+        self.edge(None, at=1000, **sig)
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=5000, **sig)
+        self.sm._permission_close_departed()          # still running: nothing
+        self.assertTrue(all("closedAt" not in r for r in self.rows()))
+        self.sess["status"] = "stopped"
+        self.sm._permission_close_departed()
+        closed = {r["id"]: r for r in self.rows() if "closedAt" in r}
+        self.assertEqual(len(closed), 2)
+        self.assertEqual((self.sm._perm_open, self.sm._perm_ask), ({}, {}))
+
+    def test_a_sub_agents_request_names_the_real_call_not_the_delegation(self):
+        # The parent's only result-less call is the foreground Agent; the
+        # dialog is the sub-agent's, whose hook row names another tool/input.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.edge(None, at=2000)
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        ids = {r["id"] for r in self.rows()}
+        self.assertEqual(len(ids), 1)                 # one prompt, counted once
+        last = self.rows()[-1]
+        # The delegation's id is dropped, never kept as this call's.
+        self.assertEqual((last["tool"], last["head"], last["toolUseId"]),
+                         ("Bash", "npm test", ""))
+        self.assertEqual(last["rulesMatched"], ["Bash(npm test:*)"])
+
+    def test_a_sub_agents_next_prompt_is_not_folded_after_the_override(self):
+        # Once the sub-agent's hook named the real call, the row holds no
+        # delegation id the repaint rule could fold the NEXT prompt under.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(dict(self.dialog(), detail="Bash command\nnpm test"), at=1000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_a_sub_agents_prompt_rewrapped_after_the_override_stays_one_row(self):
+        # Answering at the terminal attaches ttyd, which resizes tmux and
+        # rewraps the dialog. The overridden row has no call id of its own, so
+        # its face (whitespace aside) says it is the same prompt.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        wide = dict(self.dialog(), detail="Bash command\nnpm test -- --runInBand "
+                    "--coverage --reporter=dot\nRun the suite")
+        self.edge(wide, at=1000)
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        narrow = dict(self.dialog(), prompt="proceed?",
+                      detail="Bash command\nnpm test -- --runInBand\n--coverage "
+                      "--reporter=dot\nRun the suite\nDo you want to")
+        narrow["options"] = narrow["options"][:1] + [
+            dict(narrow["options"][1], label="Yes, and don't ask")]
+        self.edge(narrow, at=5000)
+        self.edge(None, at=30000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(list(rows), [f"d-{self.SID}-1000"])
+        row, = rows.values()
+        self.assertEqual((row["tool"], row["head"], row["waitedMs"]),
+                         ("Bash", "npm test", 29000))
+
+    def test_a_rewrapped_face_with_the_detail_line_capped_is_the_same_prompt(self):
+        # A narrow pane wraps a long heredoc past PANE_PROMPT_DETAIL_LINES: the
+        # face keeps only the bottom lines, a tail of the wide face.
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        body = [f"line{i} " + "x" * 30 for i in range(10)]
+        self.edge(dict(self.dialog(), detail="\n".join(["Bash command"] + body)), at=1000)
+        wrapped = [part for b in body for part in (b[:20], b[20:])]
+        self.edge(dict(self.dialog(), detail="\n".join(
+            wrapped[-ha.PANE_PROMPT_DETAIL_LINES:])), at=2000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 1)
+        # A command that only EXTENDS the last one is the next prompt.
+        self.edge(dict(self.dialog(), detail="\n".join(
+            wrapped[-ha.PANE_PROMPT_DETAIL_LINES:]) + " --force"), at=3000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def pane_edge(self, body, width, at):
+        # The dialog drawn at `width` and read the way the beat reads it:
+        # parse_pane_prompt(face=True) via session_report, which lifts the uncut
+        # face out of the wire field into the `face` the beat passes on.
+        wrapped = [" " * 3 + line[i:i + width - 3]
+                   for line in body for i in range(0, len(line), width - 3)]
+        cap = "\n".join(["─" * width, " Bash command", ""] + wrapped + [
+            "", " Do you want to proceed?", " ❯ 1. Yes",
+            "   2. Yes, and don't ask again", "   3. No", ""])
+        pp = ha.parse_pane_prompt(cap, face=True)
+        face = pp.pop("detailFace", None)
+        self.sm._permission_edges(self.sess, {"panePrompt": pp, "paneBusy": False},
+                                  now_ms=at, face=face)
+        return pp, face
+
+    def test_a_long_sub_agent_command_redrawn_narrower_stays_one_row(self):
+        # Over PANE_PROMPT_DETAIL_CHARS, the wide face is char-cut (bottom
+        # lost) and the narrow one line-cut (top lost): two windows of one
+        # command that may not even overlap. The uncut face keeps it one row.
+        for n, size, narrow in ((10, 88, 60), (20, 110, 100)):
+            with self.subTest(lines=n, width=narrow):
+                self.setUp()
+                self.write(self.tool_use("toolu_A", name="Agent",
+                                         inp={"description": "x", "prompt": "y"}))
+                body = ["npm test " + "a" * (size - 9)] + [
+                    f"line{i} " + "x" * (size - 6) for i in range(1, n)] + ["Do it"]
+                wide, wide_face = self.pane_edge(body, 200, at=1000)
+                self.assertEqual(len(wide["detail"]), ha.PANE_PROMPT_DETAIL_CHARS)
+                self.assertIsNotNone(wide_face)
+                self.hook_rows(self.request_hook())
+                self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+                self.pane_edge(body, narrow, at=5000)
+                self.edge(None, at=30000, paneBusy=True)
+                rows = {r["id"]: r for r in self.rows()}
+                self.assertEqual(list(rows), [f"d-{self.SID}-1000"])
+                row, = rows.values()
+                self.assertEqual((row["tool"], row["head"], row["waitedMs"]),
+                                 ("Bash", "npm test", 29000))
+                # The face is never on the wire.
+                self.assertNotIn("detailFace", wide)
+
+    def test_a_long_commands_next_prompt_is_still_a_new_row(self):
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        body = [f"line{i} " + "x" * 100 for i in range(10)]
+        self.pane_edge(body, 200, at=1000)
+        # Same first 800 chars, another command after them.
+        self.pane_edge(body[:-1] + ["rm -rf build"], 200, at=2000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_a_face_cut_at_the_face_cap_overlaps_the_others_window(self):
+        # Pins _dialog_faces_match's char-cap branch: a face of
+        # PANE_PROMPT_FACE_CHARS lost its bottom detail too (a middle window),
+        # so it is the same prompt only while it OVERLAPS the other's text by
+        # PANE_FACE_MIN_OVERLAP under the same question.
+        q = "Do you want to proceed?"
+        text = "".join(f"seg{i:05d}-" + "abcdefghij"[i % 10] * 20 for i in range(400))
+        wide = text[:ha.PANE_PROMPT_FACE_CHARS]               # head kept, bottom lost
+        tail = {"prompt": q, "detail": text[-6000:]}           # top lost, bottom kept
+        self.assertGreater(len(text), ha.PANE_PROMPT_FACE_CHARS)
+        self.assertTrue(ha._dialog_faces_match(q, wide, tail))
+        self.assertTrue(ha._dialog_faces_match(q, tail["detail"], {"prompt": q, "detail": wide}))
+        # Another question is another prompt.
+        self.assertFalse(ha._dialog_faces_match("Do you want to allow this?", wide, tail))
+        # A tail that starts past the window's end shares nothing it can place.
+        self.assertFalse(ha._dialog_faces_match(
+            q, wide, {"prompt": q, "detail": text[ha.PANE_PROMPT_FACE_CHARS + 50:]}))
+        # Overlapping by less than PANE_FACE_MIN_OVERLAP is a coincidence.
+        short = ha.PANE_FACE_MIN_OVERLAP - 10
+        self.assertFalse(ha._dialog_faces_match(
+            q, wide, {"prompt": q, "detail": text[ha.PANE_PROMPT_FACE_CHARS - short:]}))
+        # Another command that only shares the window's text is not placed in it.
+        self.assertFalse(ha._dialog_faces_match(
+            q, wide, {"prompt": q, "detail": "rm -rf build " + text[-6000:].replace("seg", "SEG")}))
+
+    def test_a_detail_of_exactly_the_wire_cap_is_whole_not_cut(self):
+        # The beat passes the uncut face whenever the 800-char cap cut a detail,
+        # so a detail of exactly 800 chars is a WHOLE one — a longer next prompt
+        # starting with the same 800 chars is another command, not its redraw.
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        # "Bash command" + 9 lines of 80 + one of 58, newlines between: 800.
+        first = [f"l{i:02d} " + "z" * 76 for i in range(9)] + ["tail " + "z" * 53]
+        pp, face = self.pane_edge(first, 200, at=1000)
+        self.assertEqual(len(pp["detail"]), ha.PANE_PROMPT_DETAIL_CHARS)
+        self.assertIsNone(face)
+        self.pane_edge(first + ["&& rm -rf build"], 200, at=2000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+        self.assertFalse(ha._dialog_faces_match(
+            "Do you want to proceed?", "x" * ha.PANE_PROMPT_DETAIL_CHARS,
+            {"prompt": "Do you want to proceed?",
+             "detail": "x" * ha.PANE_PROMPT_DETAIL_CHARS + "\nrm -rf build"}))
+
+    def test_an_overridden_sub_agent_dialog_cut_at_the_face_cap_redraws_as_one_row(self):
+        # A command so long that 14 lines of a very wide pane pass
+        # PANE_PROMPT_FACE_CHARS: the wide face is cut at BOTH caps (a middle
+        # window), the narrow one is the line-capped tail. The sub-agent's hook
+        # overrode the row (no call id of its own), so only the faces tell —
+        # and they overlap, so the redraw keeps the one row.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        body = ["npm test " + "a" * 641] + [
+            f"line{i:02d} " + "".join(chr(97 + (i * 7 + k) % 26) for k in range(643))
+            for i in range(1, 20)] + ["Do it"]
+        wide, wide_face = self.pane_edge(body, 700, at=1000)
+        self.assertIsNotNone(wide_face)
+        self.assertEqual(len(wide_face), ha.PANE_PROMPT_FACE_CHARS)   # cut at both caps
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        row = self.sm._perm_open[self.SID]
+        self.assertEqual((row["tool"], row["toolUseId"]), ("Bash", ""))   # overridden
+        self.pane_edge(body, 120, at=5000)
+        self.edge(None, at=30000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(list(rows), [f"d-{self.SID}-1000"])
+        self.assertEqual(rows[f"d-{self.SID}-1000"]["waitedMs"], 29000)
+        self.assertNotIn("detailFace", wide)
+
+    def test_the_delegations_own_prompt_is_not_overridden(self):
+        # A prompt to LAUNCH the Agent is the delegation's own call: same tool
+        # and input, so it merges without rewriting the row.
+        inp = {"description": "x", "prompt": "y"}
+        self.write(self.tool_use("toolu_A", name="Agent", inp=inp))
+        self.edge(self.dialog(), at=1000)
+        _head, dig = ha._permission_head_digest("Agent", inp)
+        self.hook_rows(dict(self.request_hook(tool="Agent", head="Agent"), digest=dig))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        row = self.sm._perm_open[self.SID]
+        self.assertEqual((row["tool"], row["toolUseId"]), ("Agent", "toolu_A"))
+        self.assertEqual(row["rulesMatched"], ["Agent(Agent:*)"])
+
+    def test_a_sub_agents_request_tailed_first_is_claimed_by_the_dialog(self):
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=900, mono=0)
+        self.edge(self.dialog(), at=1000)
+        row, = self.rows()
+        self.assertEqual((row["tool"], row["head"], row["toolUseId"]),
+                         ("Bash", "npm test", ""))
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), {})
+
+    def test_a_sub_agents_dialog_takes_the_newest_request_not_an_older_one(self):
+        # Two sub-agent prompts tailed together: the older was answered between
+        # beats (its own row once the hold runs out), the newer is on screen.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook(head="git push", ts=600),
+                       self.request_hook(head="npm test", ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        self.assertEqual(self.sm._perm_open[self.SID]["head"], "npm test")
+        self.sm._apply_permission_hook_rows(
+            now_ms=9000, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertIn(f"r-{self.SID}-600", {r["id"] for r in self.rows()})
+
+    def test_a_stale_held_request_is_not_taken_for_a_sub_agents_dialog(self):
+        # A parent-level prompt answered between beats is still held when a
+        # sub-agent's dialog opens much later: it is NOT that dialog's call.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        self.hook_rows(self.request_hook(ts=1000))
+        self.sm._apply_permission_hook_rows(now_ms=1000, mono=0)
+        at = 1000 + ha.PERMISSION_HOOK_ADOPT_MS + 1
+        self.edge(self.dialog(), at=at)
+        row, = self.rows()
+        self.assertEqual(row["tool"], "Agent")             # no wrong call adopted
+        self.assertEqual(len(self.sm._perm_hook_pending.get(self.SID)), 1)
+        # The held one still becomes its own row once the hold expires.
+        self.sm._apply_permission_hook_rows(
+            now_ms=at, mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.assertIn(f"r-{self.SID}-1000", {r["id"] for r in self.rows()})
+
+    # --- back-to-back dialogs, pickers, parallel calls -------------------------
+
+    def test_back_to_back_dialogs_are_two_rows(self):
+        # Call A's dialog is answered and call B's (same question, another
+        # command) is up before the next beat: the pane never shows "no dialog".
+        self.write(self.tool_use("toolu_A", inp={"command": "git push"}))
+        self.edge(dict(self.dialog(), detail="Bash command\ngit push"), at=1000)
+        self.write(self.tool_result("toolu_A"),
+                   self.tool_use("toolu_B", inp={"command": "rm -rf build"}))
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.edge(None, at=9000)
+        rows = {}
+        for r in self.rows():
+            rows[r["id"]] = r
+        self.assertEqual(sorted((r["head"], r["waitedMs"], r["answer"])
+                                for r in rows.values()),
+                         [("git push", 5000, "allow"), ("rm", 3000, "unknown")])
+
+    PANE_WIDE = """\
+────────────────────────────────────────────────────────────────────────────────────────────────────
+ Bash command
+
+   docker compose -f deploy/compose.yml up --build --remove-orphans --detach
+   Rebuild and restart the stack in the background
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for docker compose commands in this project
+   3. No
+
+ Esc to cancel · Tab to amend · ctrl+e to explain
+"""
+    # The same dialog after the window narrows (the operator's ttyd attaches):
+    # the command and option 2 wrap, and the wrapped label ends the 1..N run.
+    PANE_NARROW = """\
+──────────────────────────────────────────────
+ Bash command
+
+   docker compose -f deploy/compose.yml up
+   --build --remove-orphans --detach
+   Rebuild and restart the stack in the
+   background
+
+ Do you want to proceed?
+ ❯ 1. Yes
+   2. Yes, and don't ask again for docker
+   compose commands in this project
+   3. No
+
+ Esc to cancel · Tab to amend
+"""
+
+    def test_the_same_dialog_redrawn_at_another_width_is_one_row(self):
+        wide = ha.parse_pane_prompt(self.PANE_WIDE)
+        narrow = ha.parse_pane_prompt(self.PANE_NARROW)
+        self.assertIsNotNone(wide)
+        self.assertIsNotNone(narrow)
+        self.assertNotEqual(ha._pane_dialog_identity(wide), ha._pane_dialog_identity(narrow))
+        self.write(self.tool_use("toolu_1", inp={"command": "docker compose up"}))
+        self.edge(wide, at=1000)
+        self.edge(narrow, at=20000)                # a resize: same call, new face
+        self.edge(wide, at=21000)                  # and back again
+        self.write(self.tool_result("toolu_1"))
+        self.edge(None, at=25000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual([(r["openedAt"], r["waitedMs"], r["answer"], r["toolUseId"])
+                          for r in rows.values()],
+                         [(1000, 24000, "allow", "toolu_1")])
+
+    def test_a_new_call_behind_a_changed_face_is_still_a_new_row(self):
+        # The repaint rule keys on the CALL: a changed face whose pending call
+        # moved on is the next prompt, whatever the pane width did.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(ha.parse_pane_prompt(self.PANE_WIDE), at=1000)
+        self.write(self.tool_result("toolu_1"), self.tool_use("toolu_2"))
+        self.edge(ha.parse_pane_prompt(self.PANE_NARROW), at=5000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["toolUseId"], r.get("answer")) for r in rows.values()),
+                         [("toolu_1", "allow"), ("toolu_2", None)])
+
+    def test_a_sandbox_prompt_for_the_running_call_is_a_second_row(self):
+        # Allowed, the command runs (no result yet) and asks to reach the
+        # network: the same call, but another prompt the operator answers.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.edge(self.sandbox(), at=4000)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["dialogKind"], r["openedAt"]) for r in rows.values()),
+                         [("permission", 1000), ("sandbox", 4000)])
+
+    def test_two_hosts_one_running_call_asks_for_are_two_rows(self):
+        # `npm install` is allowed and runs (no result yet), then asks to reach
+        # the registry and, answered between two beats, GitHub: one toolUseId,
+        # two prompts — each host its own row, wait and allowedDomains rule.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox("registry.npmjs.org"), at=1000)
+        self.edge(self.sandbox("codeload.github.com"), at=6000)
+        self.edge(None, at=9000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(sorted((r["head"], r["waitedMs"]) for r in rows.values()),
+                         [("codeload.github.com", 3000), ("registry.npmjs.org", 5000)])
+        self.assertEqual({r["toolUseId"] for r in rows.values()}, {"toolu_1"})
+
+    def test_the_same_sandbox_prompt_redrawn_is_one_row(self):
+        # A resize wraps the "don't ask again" label off the 1..N run: the face
+        # changed, the host did not — the same prompt.
+        self.write(self.tool_use("toolu_1", inp={"command": "npm install"}))
+        self.edge(self.sandbox(), at=1000)
+        narrow = self.sandbox()
+        narrow["options"] = [narrow["options"][0], dict(narrow["options"][1],
+                                                        label="Yes, and don't ask again")]
+        self.edge(narrow, at=4000)
+        self.edge(None, at=7000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual([(r["head"], r["waitedMs"]) for r in rows.values()],
+                         [("registry.npmjs.org", 6000)])
+
+    def test_dialogs_inside_a_sub_agent_are_not_folded_by_its_delegation_id(self):
+        # Every prompt a foreground sub-agent raises shares the parent's pending
+        # Task call, so that id cannot tell a repaint from the next prompt.
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        self.edge(dict(self.dialog(), detail="Bash command\ngit push"), at=1000)
+        self.edge(dict(self.dialog(), detail="Bash command\nrm -rf build"), at=6000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+
+    def test_a_pending_question_opens_no_row_before_its_call_is_in_the_tail(self):
+        # ask.py's bridge reports the question before the transcript tail shows
+        # the AskUserQuestion call; the pending call is still an older Bash one.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000, question="Which plan?")
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn(self.SID, self.sm._perm_open)
+        self.lines = []
+        self.write()                                   # empty transcript too
+        self.edge(dict(self.dialog(), prompt="Which one?"), at=2000, question="Which one?")
+        self.assertEqual(self.rows(), [])
+
+    def test_a_second_request_never_merges_into_a_row_that_has_one(self):
+        # Two requests for the same command: the newest claims the open dialog
+        # (it is the one on screen), the older is another prompt's and is held.
+        self.write(self.tool_use("toolu_1"))
+        self.edge(self.dialog(), at=1000)
+        self.hook_rows(self.request_hook(ts=700), self.request_hook(ts=950))
+        self.sm._apply_permission_hook_rows(now_ms=1600, mono=0)
+        self.assertEqual(self.sm._perm_open[self.SID]["rulesMatched"],
+                         ["Bash(npm test:*)"])
+        held = self.sm._perm_hook_pending[self.SID]
+        self.assertEqual([h["ts"] for h, _ in held.values()], [700])
+
+    def test_an_ask_user_question_picker_is_not_a_permission_row(self):
+        self.write(self.tool_use("toolu_Q", name="AskUserQuestion",
+                                 inp={"questions": [{"question": "Which plan?"}]}))
+        self.edge({"prompt": "Which plan?", "options": [
+            {"number": 1, "label": "A", "selected": True},
+            {"number": 2, "label": "B", "selected": False}]}, at=1000)
+        self.assertEqual(self.rows(), [])
+        self.edge(self.dialog(), at=2000, question="Which plan?")
+        self.assertEqual(self.rows(), [])
+        self.assertNotIn(self.SID, self.sm._perm_open)
+
+    def test_parallel_calls_charge_the_oldest_open_call_of_the_newest_message(self):
+        def use(tuid, cmd, mid):
+            e = self.tool_use(tuid, inp={"command": cmd})
+            e["message"]["id"] = mid
+            return e
+        self.write(use("toolu_0", "ls", "msg_0"), self.tool_result("toolu_0"),
+                   use("toolu_A", "git push", "msg_1"),
+                   use("toolu_B", "npm test", "msg_1"),
+                   use("toolu_C", "make", "msg_1"))
+        self.edge(self.dialog(), at=1000)
+        self.assertEqual(self.rows()[-1]["toolUseId"], "toolu_A")
+        self.assertEqual(ha.pending_tool_call([use("toolu_X", "ls", "m")])["toolUseId"],
+                         "toolu_X")
+
+    # --- the beat wiring ------------------------------------------------------
+
+    def test_the_beat_drives_every_edge_end_to_end(self):
+        # The real payload build, session_report stubbed: dialog open, close,
+        # a staged hook row folded, and a session leaving running.
+        signals = {}
+
+        def report(*_a, **_k):
+            return dict({"prUrls": [], "modelActual": "m",
+                         "lastTurnContextTokens": 1, "paneBusy": False,
+                         "panePrompt": None}, **signals)
+
+        self.sm._stage_permission_fetch = mock.Mock()
+
+        def beat():
+            with mock.patch.object(ha, "session_report", side_effect=report), \
+                    mock.patch.object(self.sm, "_live_tmux_panes", return_value=None):
+                payload = self.sm.build_payload(1, light=True)
+            self.sm._clear_delivered_staged(payload)
+            return {r["id"]: r for r in payload.get("permissionEvents") or []}
+
+        self.write(self.tool_use("toolu_1"))
+        signals["panePrompt"] = self.dialog()
+        got = beat()
+        (rid, opened), = got.items()
+        self.assertEqual((opened["kind"], opened["toolUseId"]), ("dialog", "toolu_1"))
+        self.assertNotIn("closedAt", opened)
+        self.write(self.tool_result("toolu_1"))
+        signals["panePrompt"] = None
+        closed = beat()[rid]
+        self.assertEqual((closed["answer"], closed["via"]), ("allow", "terminal"))
+        self.hook_rows({"sessionId": self.SID, "event": "PermissionDenied", "ts": 5,
+                        "toolUseId": "toolu_9", "tool": "Bash", "head": "git push",
+                        "digest": "{}", "denyReason": "no"})
+        self.assertEqual([r["kind"] for r in beat().values()], ["classifier-denied"])
+        self.write(self.tool_use("toolu_2"))
+        signals["panePrompt"] = self.dialog()
+        (rid2, _), = beat().items()
+        self.sess["status"] = "stopped"
+        gone = beat()[rid2]
+        self.assertEqual((gone["answer"], gone["via"]), ("unknown", "unknown"))
+        self.assertEqual(self.sm._perm_open, {})
+
+    def test_the_uncut_face_reaches_the_ledger_and_never_the_wire(self):
+        cap = "\n".join(["─" * 80, " Bash command", ""]
+                        + ["   " + "z" * 70] * 13 + ["", " Do you want to proceed?",
+                                                   " ❯ 1. Yes", "   2. No", ""])
+        with mock.patch.object(ha, "_pane_status",
+                               return_value=(False, None, ha.parse_pane_prompt(
+                                   cap, face=True))):
+            rep = ha.session_report(self.sess["worktreePath"], {}, "agent-x")
+        self.assertNotIn("detailFace", rep["panePrompt"])
+        self.assertGreater(len(rep["panePromptFace"]), ha.PANE_PROMPT_DETAIL_CHARS)
+        self.sm._stage_permission_fetch = mock.Mock()
+        with mock.patch.object(ha, "session_report", return_value=dict(rep, prUrls=[])), \
+                mock.patch.object(self.sm, "_live_tmux_panes", return_value=None), \
+                mock.patch.object(self.sm, "_permission_edges") as edges:
+            payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(edges.call_args.kwargs["face"], rep["panePromptFace"])
+        self.assertNotIn("panePromptFace", json.dumps(payload))
+
+    def test_a_raising_edge_never_costs_the_sessions_signals(self):
+        with mock.patch.object(self.sm, "_permission_edges",
+                               side_effect=RuntimeError("boom")), \
+             mock.patch.object(ha, "log"):
+            out = self.sm._session_payload(self.sess)
+        self.assertEqual(out["id"], self.SID)
+
+
+class TestPermissionLogTail(ManagerMixin, unittest.TestCase):
+    """The hook-log tail (XERK-1563): its own worker, a per-file cursor, priming
+    on the first pass, rotation, and the session-written-file read discipline."""
+
+    SID = "perm2"
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        self.sm.registry = [{"id": self.SID, "status": "running"}]
+        os.makedirs(ha.PERMISSIONS_DIR)
+        self.path = os.path.join(ha.PERMISSIONS_DIR, f"{self.SID}.jsonl")
+
+    def append(self, *rows, path=None):
+        with open(path or self.path, "a") as f:
+            for r in rows:
+                f.write(json.dumps(r) + "\n")
+
+    def denied(self, tuid):
+        return {"ts": 1, "event": "PermissionDenied", "toolUseId": tuid,
+                "tool": "Bash", "head": "x", "digest": "", "denyReason": "no"}
+
+    def staged(self):
+        with self.sm._permission_lock:
+            got, self.sm._permission_rows_fetched = self.sm._permission_rows_fetched, {}
+        return [r["toolUseId"] for r in got.get(self.SID, [])]
+
+    def test_the_first_pass_primes_then_only_new_lines_are_read(self):
+        self.append(self.denied("old"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])          # a restart replays nothing
+        self.append(self.denied("new1"), self.denied("new2"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["new1", "new2"])
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])
+
+    def test_a_stopped_sessions_log_is_primed_too(self):
+        # Stopped when the manager started, Started later with the same id:
+        # its old prompts were sent by the previous process — never again.
+        self.sm.registry = [{"id": self.SID, "status": "stopped"}]
+        self.append(self.denied("old0"), self.denied("old1"))
+        self.sm._fetch_permission_rows()
+        self.sm.registry[0]["status"] = "running"
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])
+        self.append(self.denied("new"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["new"])
+
+    def test_a_log_that_appears_later_is_read_from_its_start(self):
+        self.sm._fetch_permission_rows()             # primed with no file
+        self.append(self.denied("a"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["a"])
+
+    def test_a_partial_line_waits_for_its_end(self):
+        self.sm._fetch_permission_rows()
+        with open(self.path, "a") as f:
+            f.write(json.dumps(self.denied("a")) + "\n" + '{"ts": 1, "ev')
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["a"])
+        with open(self.path, "a") as f:
+            f.write('ent": "PermissionDenied", "toolUseId": "b"}\n')
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["b"])
+
+    def test_a_newline_free_read_moves_the_cursor_past_the_junk(self):
+        # One read of junk with no newline in it must not park the cursor: the
+        # rows written after it arrive on the following passes, not at rotation.
+        self.sm._fetch_permission_rows()
+        with open(self.path, "a") as f:
+            f.write("x" * (ha.PERMISSION_LOG_READ_MAX + 4096) + "\n"
+                    + json.dumps(self.denied("after")) + "\n")
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), [])
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["after"])
+
+    def test_a_short_partial_line_is_never_consumed(self):
+        blob = b'{"event": "PermissionDenied"'
+        self.assertEqual(ha.parse_permission_log_lines(blob, self.SID), ([], 0))
+        junk = b"x" * (ha.PERMISSION_LOG_LINE_MAX + 1)
+        self.assertEqual(ha.parse_permission_log_lines(junk, self.SID), ([], len(junk)))
+
+    def test_rotation_drains_the_old_file_first(self):
+        self.sm._fetch_permission_rows()
+        self.append(self.denied("a"))
+        self.sm._fetch_permission_rows()
+        self.staged()
+        self.append(self.denied("b"))              # written, not yet read
+        os.replace(self.path, self.path + ".1")     # permlog.py rotates
+        self.append(self.denied("c"))
+        self.sm._fetch_permission_rows()
+        self.assertEqual(self.staged(), ["b", "c"])
+
+    def test_junk_lines_are_skipped_and_fields_reshaped(self):
+        self.sm._fetch_permission_rows()
+        with open(self.path, "a") as f:
+            f.write("not json\n[1]\n" + json.dumps({"event": "Stop", "ts": 1}) + "\n"
+                    + json.dumps({"event": "PermissionDenied", "ts": "x"}) + "\n"
+                    + "x" * (ha.PERMISSION_LOG_LINE_MAX + 5) + "\n")
+            f.write(json.dumps(dict(self.denied("ok"), tool="T" * 999,
+                                    extra="dropped")) + "\n")
+        self.sm._fetch_permission_rows()
+        with self.sm._permission_lock:
+            row, = self.sm._permission_rows_fetched[self.SID]
+        self.assertEqual(row["toolUseId"], "ok")
+        self.assertEqual(len(row["tool"]), 128)
+        self.assertNotIn("extra", row)
+
+    def test_a_fifo_at_the_log_path_never_wedges_the_tail(self):
+        self.sm._fetch_permission_rows()
+        os.mkfifo(self.path)
+        done = threading.Event()
+        t = threading.Thread(target=lambda: (self.sm._fetch_permission_rows(), done.set()),
+                             daemon=True)
+        t.start()
+        self.assertTrue(done.wait(5), "the tail blocked opening a FIFO")
+        self.assertEqual(self.staged(), [])
+        self.assertIsNone(ha._read_permission_log(self.path, 0, 10))
+
+    def test_the_beat_stages_the_tail_and_never_reads_it_inline(self):
+        self.sm._stage_permission_fetch = mock.Mock()
+        self.sm._fetch_permission_rows = mock.Mock()
+        self.sm.registry = []
+        self.sm.build_payload(0)
+        self.sm._stage_permission_fetch.assert_called_once_with()
+        self.sm._fetch_permission_rows.assert_not_called()
+
+    def test_the_worker_runs_the_staged_tail(self):
+        ran = threading.Event()
+        self.sm._fetch_permission_rows = lambda: ran.set()
+        self.sm._stage_permission_fetch()
+        self.assertTrue(ran.wait(2))
+
+    def test_staging_never_raises_onto_the_beat(self):
+        with mock.patch.object(ha.threading, "Thread",
+                               side_effect=RuntimeError("no threads")), \
+             mock.patch.object(ha, "log"):
+            self.sm._stage_permission_fetch()
+
+    def test_a_gone_sessions_old_log_is_swept(self):
+        stale = os.path.join(ha.PERMISSIONS_DIR, "gone.jsonl")
+        self.append(self.denied("x"), path=stale)
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        os.utime(stale, (old, old))
+        self.append(self.denied("y"))
+        os.utime(self.path, (old, old))             # running: kept however old
+        self.sm._fetch_permission_rows()
+        self.assertFalse(os.path.exists(stale))
+        self.assertTrue(os.path.exists(self.path))
+
+    def test_only_permlogs_own_names_are_swept(self):
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        names = ["gone.jsonl.1", "notes.txt", "gone.jsonl.2", "bad sid.jsonl"]
+        for n in names:
+            p = os.path.join(ha.PERMISSIONS_DIR, n)
+            self.append(self.denied("x"), path=p)
+            os.utime(p, (old, old))
+        self.sm._fetch_permission_rows()
+        left = sorted(os.listdir(ha.PERMISSIONS_DIR))
+        self.assertEqual(left, sorted(names[1:]))   # only the rotation went
+
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name != "nt", "posix links")
+    def test_a_planted_dir_link_is_never_swept_or_read_through(self):
+        # A session swaps the dir for a link to a Claude project dir: an old
+        # transcript there must survive, and nothing in it is read as a row.
+        victim = os.path.join(self.tmp, "victim")
+        os.makedirs(victim)
+        transcript = os.path.join(victim, "0b7c-transcript.jsonl")
+        self.append(self.denied("t"), path=transcript)
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        os.utime(transcript, (old, old))
+        shutil.rmtree(ha.PERMISSIONS_DIR)
+        os.symlink(victim, ha.PERMISSIONS_DIR)
+        self.sm.registry = [{"id": "0b7c-transcript", "status": "running"}]
+        self.sm._fetch_permission_rows()            # would-be prime
+        self.sm.registry = []
+        self.sm._perm_swept_at = None
+        self.sm._fetch_permission_rows()            # would-be sweep
+        self.assertTrue(os.path.exists(transcript))
+        self.assertEqual(self.sm._permission_rows_fetched, {})
+        self.assertFalse(self.sm._permission_primed)
+
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name != "nt", "posix links")
+    def test_the_sweep_alone_refuses_a_planted_dir_link(self):
+        victim = os.path.join(self.tmp, "victim2")
+        os.makedirs(victim)
+        transcript = os.path.join(victim, "abc.jsonl")
+        self.append(self.denied("t"), path=transcript)
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        os.utime(transcript, (old, old))
+        shutil.rmtree(ha.PERMISSIONS_DIR)
+        os.symlink(victim, ha.PERMISSIONS_DIR)
+        self.sm._perm_swept_at = None
+        with mock.patch.object(ha, "_permissions_dir_planted", return_value=False):
+            self.sm._sweep_permission_logs(set())   # the O_NOFOLLOW open refuses
+        self.assertTrue(os.path.exists(transcript))
+
+
+class TestLoopSignal(unittest.TestCase):
+    """The loop signal (XERK-1572): consecutive failing calls with the same tool
+    + input digest, counted in the beat's incremental scan, reported as
+    `loop: {repeats, tool, since}` from LOOP_REPEATS_MIN on."""
+
+    T0 = "2026-10-03T10:00:00Z"
+
+    def call(self, state, tuid, inp=None, tool="Bash", ok=False, ts=None):
+        for entry in (
+                {"type": "assistant", "timestamp": ts or self.T0,
+                 "message": {"role": "assistant", "content": [
+                     {"type": "tool_use", "id": tuid, "name": tool,
+                      "input": inp if inp is not None else {"command": "npm test"}}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": tuid,
+                     "content": "ok" if ok else "Exit code 1", "is_error": not ok}]}}):
+            ha._scan_entry_line(json.dumps(entry).encode(), state, {})
+
+    def test_the_threshold(self):
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN - 1):
+            self.call(state, f"t{i}")
+        self.assertIsNone(ha.loop_report(state))
+        self.call(state, "t9")
+        self.assertEqual(ha.loop_report(state), {
+            "repeats": ha.LOOP_REPEATS_MIN, "tool": "Bash",
+            "since": ha._ts_ms(self.T0)})
+        self.call(state, "t10", ts="2026-10-03T10:05:00Z")
+        rep = ha.loop_report(state)
+        self.assertEqual(rep["repeats"], ha.LOOP_REPEATS_MIN + 1)
+        self.assertEqual(rep["since"], ha._ts_ms(self.T0), "since is the run's first call")
+
+    def test_a_success_resets_it(self):
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"t{i}")
+        self.assertIsNotNone(ha.loop_report(state))
+        self.call(state, "ok", inp={"command": "ls"}, ok=True)
+        self.assertIsNone(ha.loop_report(state))
+        self.assertNotIn("loop", state)
+
+    def test_a_different_failing_call_starts_a_new_run(self):
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN - 1):
+            self.call(state, f"t{i}")
+        self.call(state, "other", inp={"command": "npm run lint"})
+        for i in range(ha.LOOP_REPEATS_MIN - 2):
+            self.call(state, f"u{i}")
+        self.assertIsNone(ha.loop_report(state), "the run restarted at the other call")
+        self.assertEqual(state["loop"]["repeats"], ha.LOOP_REPEATS_MIN - 2)
+        # Same input but another tool is another call too.
+        self.call(state, "edit", tool="Edit")
+        self.assertEqual((state["loop"]["tool"], state["loop"]["repeats"]), ("Edit", 1))
+
+    def test_it_is_bounded(self):
+        state = {}
+        for i in range(ha.LOOP_PENDING_MAX + 20):   # calls whose results never land
+            ha._scan_loop_entry({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": f"p{i}", "name": "Bash", "input": {}}]}}, state)
+        self.assertEqual(len(state["loopCalls"]), ha.LOOP_PENDING_MAX)
+        self.assertNotIn("p0", state["loopCalls"], "oldest dropped")
+        state = {"loop": {"tool": "Bash", "digest": ha._loop_digest({"command": "npm test"}),
+                          "repeats": ha.LOOP_REPEATS_CAP, "since": 1}}
+        self.call(state, "x")
+        self.assertEqual(state["loop"]["repeats"], ha.LOOP_REPEATS_CAP)
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"t{i}", tool="mcp__" + "x" * 200)
+        self.assertEqual(len(ha.loop_report(state)["tool"]), ha.LOOP_TOOL_MAX)
+
+    def prompt(self, state, content, **extra):
+        ha._scan_loop_entry(dict({"type": "user", "message": {"role": "user", "content": content}},
+                                 **extra), state)
+
+    def test_a_new_prompt_rearms_the_run_but_keeps_its_since(self):
+        # The loop, then the turn ends (a `Host blocker:` line) and the operator
+        # answers: the next turn is not still looping. The same failure resumed
+        # later is the SAME run (its `since` kept), so the hub's two-nudge cap,
+        # keyed on it, still holds across the hub's own nudge.
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"t{i}")
+        since = ha.loop_report(state)["since"]
+        ha._scan_loop_entry({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Host blocker: npm ci cannot reach the registry."}]}}, state)
+        self.assertIsNotNone(ha.loop_report(state), "an assistant line is not a new turn")
+        self.prompt(state, "ok, leave it")
+        self.assertIsNone(ha.loop_report(state), "a new prompt is a new turn")
+        for i in range(ha.LOOP_REPEATS_MIN - 1):
+            self.call(state, f"u{i}", ts="2026-10-03T11:00:00Z")
+        self.assertIsNone(ha.loop_report(state))
+        self.call(state, "u9", ts="2026-10-03T11:00:00Z")
+        self.assertEqual(ha.loop_report(state),
+                         {"repeats": ha.LOOP_REPEATS_MIN, "tool": "Bash", "since": since})
+        # A list-content prompt re-arms too; a tool result, a meta entry, a
+        # compaction summary and a background task's notification do not.
+        self.prompt(state, [{"type": "text", "text": "try again"}])
+        self.assertIsNone(ha.loop_report(state))
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"v{i}")
+        for content, extra in (
+                ("<local-command-caveat>x</local-command-caveat>", {"isMeta": True}),
+                ("This session is being continued…", {"isCompactSummary": True}),
+                ("<task-notification><status>completed</status></task-notification>", {}),
+                ([{"type": "tool_result", "tool_use_id": "nope", "content": "x"}], {}),
+                ("   ", {})):
+            self.prompt(state, content, **extra)
+            self.assertIsNotNone(ha.loop_report(state), repr(content))
+
+    def test_a_sidechain_is_not_the_sessions_own_loop(self):
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN + 1):
+            for entry in (
+                    {"type": "assistant", "isSidechain": True, "message": {"content": [
+                        {"type": "tool_use", "id": f"s{i}", "name": "Bash", "input": {}}]}},
+                    {"type": "user", "isSidechain": True, "message": {"content": [
+                        {"type": "tool_result", "tool_use_id": f"s{i}", "is_error": True}]}}):
+                ha._scan_loop_entry(entry, state)
+        self.assertIsNone(ha.loop_report(state))
+
+
+class TestSessionReportLoop(ProjectDirMixin, unittest.TestCase):
+    def test_session_report_carries_the_loop(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "user", "message": {"content": "go"}}])
+        state = {}
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertIsNone(rep["loop"])
+        lines = []
+        for i in range(ha.LOOP_REPEATS_MIN):
+            lines += [
+                {"type": "assistant", "timestamp": "2026-10-03T10:00:00Z", "message": {
+                    "content": [{"type": "tool_use", "id": f"t{i}", "name": "Bash",
+                                 "input": {"command": "make"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": f"t{i}", "is_error": True,
+                     "content": "make: *** Error 2"}]}}]
+        write_jsonl(path, lines)
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["loop"]["repeats"], ha.LOOP_REPEATS_MIN)
+        self.assertEqual(rep["loop"]["tool"], "Bash")
+        # A beat that appended nothing still reports it (accumulated in state).
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["loop"], rep["loop"])
+        # Only while the turn runs: an ended turn (paneBusy False) is the
+        # operator's wait to read, not a loop; can't-tell (None) keeps it.
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+            self.assertIsNone(ha.session_report(self.WORKDIR, state, "agent-x")["loop"])
+        with mock.patch.object(ha, "_pane_status", return_value=(True, "auto", None)):
+            self.assertEqual(ha.session_report(self.WORKDIR, state, "agent-x")["loop"], rep["loop"])
+
+
+class TestAttentionHints(ManagerMixin, unittest.TestCase):
+    """The wait classifier (XERK-1572): a `claude -p` per NEW needs-you/stalled
+    edge, on its own worker, bounded retries, cached on the session record;
+    its verdict rides `attentionHints` and decides the ask-in-chat row."""
+
+    SID = "hint1"
+    CLAUDE_SID = "1c9f2c1e-1111-4222-8333-444455556666"
+    TS = "2026-10-03T10:00:00Z"
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        self.wt = os.path.join(self.tmp, "worktrees", "repo", "wt1")
+        os.makedirs(self.wt)
+        self.sess = {"id": self.SID, "status": "running", "tmuxName": "agent-hint1",
+                     "worktreePath": self.wt, "repoPath": self.wt,
+                     "claudeSessionId": self.CLAUDE_SID}
+        self.sm.registry = [self.sess]
+        self.tpath = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.wt),
+                                  f"{self.CLAUDE_SID}.jsonl")
+        os.makedirs(os.path.dirname(self.tpath))
+        self.sm._perm_first_beat_done = True
+        p = mock.patch.object(ha, "ATTENTION_HINTS_ON", True)
+        p.start()
+        self.addCleanup(p.stop)
+        # Never start the real worker thread here: the stage is inspected, and a
+        # verdict is handed back as the worker would stage it.
+        self.started = []
+        p = mock.patch.object(ha.threading, "Thread", self._fake_thread)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _fake_thread(self, target=None, name=None, daemon=None):
+        t = mock.Mock()
+        t.is_alive.return_value = True
+        self.started.append(name)
+        return t
+
+    def ended(self, ts=None, text="All done — the PR is up.", **extra):
+        ts = ts or self.TS
+        with open(self.tpath, "a") as f:
+            f.write(json.dumps({"type": "assistant", "timestamp": ts, "message": {
+                "role": "assistant", "content": [{"type": "text", "text": text}]}}) + "\n")
+        sig = {"paneBusy": False, "panePrompt": None, "question": None, "agents": [],
+               "lastRole": "assistant", "lastHasToolUse": False, "lastActivityTs": ts,
+               "transcriptAgeSec": 5,
+               "tail": [{"role": "user", "text": "deploy it"},
+                        {"role": "assistant", "text": text}]}
+        sig.update(extra)
+        return sig
+
+    def beat(self, sig, at=1000):
+        self.sm._permission_edges(self.sess, sig, now_ms=at)
+        self.sm._attention_edge(self.sess, sig, now_ms=at)
+
+    def verdict(self, hint):
+        job = self.sm._attn_request
+        self.assertIsNotNone(job, "a job was staged")
+        self.sm._attn_request = None
+        self.sm._attn_results = [dict(job, hint=hint)]
+        self.sm._apply_attention_hints()
+
+    # --- edges ----------------------------------------------------------------
+
+    def test_attention_edge_reads_each_kind_in_precedence(self):
+        now = 10 ** 12
+        base = {"paneBusy": False, "lastRole": "assistant", "lastHasToolUse": False,
+                "lastActivityTs": self.TS, "transcriptAgeSec": 5, "agents": []}
+        edge = lambda **kw: ha.attention_edge(dict(base, **kw), now)
+        self.assertEqual(edge(), ("review", self.TS))
+        self.assertEqual(edge(question="Ship it?")[0], "question")
+        self.assertEqual(edge(panePrompt={"prompt": "Do you want to proceed?",
+                                          "detail": "Bash command\nls"})[0], "permission")
+        loop = {"repeats": 4, "tool": "Bash", "since": 5}
+        self.assertEqual(edge(loop=loop, paneBusy=True), ("loop", "Bash@5"))
+        self.assertIsNone(edge(paneBusy=True))
+        self.assertIsNone(edge(paneBusy=None), "can't tell is not an edge")
+        self.assertIsNone(edge(lastHasToolUse=True))
+        ci = {"type": "shell", "label": "Watch CI", "kind": "wait-external"}
+        self.assertIsNone(edge(agents=[ci]), "waiting, not stalled")
+        self.assertEqual(edge(agents=[ci], transcriptAgeSec=46 * 60)[0], "stalled")
+        timed = {"type": "shell", "kind": "wait-timed", "eta": now - 3 * 60 * 1000}
+        self.assertEqual(edge(agents=[timed], transcriptAgeSec=10 * 60)[0], "stalled")
+        self.assertIsNone(edge(agents=[ci, {"type": "agent", "label": "x"}],
+                               transcriptAgeSec=46 * 60), "work is running")
+        # A rewrapped dialog is the same edge.
+        a = edge(panePrompt={"prompt": "Do you want to proceed?", "detail": "Bash command\nls -la"})
+        b = edge(panePrompt={"prompt": "Do you want to\nproceed?", "detail": "Bash  command ls\n-la"})
+        self.assertEqual(a, b)
+
+    def test_only_a_new_edge_is_classified(self):
+        sig = self.ended()
+        self.beat(sig, at=1000)
+        rec = self.sess["attentionHint"]
+        self.assertEqual((rec["edge"], rec["kind"], rec["edgeTs"], rec["attempts"]),
+                         (f"review|{self.TS}", "review", 1000, 0))
+        self.sm._stage_attention_hint(now=1)
+        job = self.sm._attn_request
+        self.assertEqual(job["argv"][:4], ["claude", "-p", "--model", ha.ATTENTION_HINT_MODEL])
+        # No tool and no MCP server: its input is the session's own (steerable)
+        # text. The equals form, since a variadic `--tools ""` eats the prompt.
+        # And user settings only: its cwd (~/.turma) is session-writable, so a
+        # planted project .claude/settings.json hook or CLAUDE.md must not load.
+        self.assertEqual(job["argv"][4:-1],
+                         ["--tools=", "--strict-mcp-config", "--setting-sources=user"])
+        self.assertEqual(list(ha.ATTENTION_HINT_LOCKDOWN), job["argv"][4:-1])
+        self.assertTrue(job["argv"][-1].startswith(ha.ATTENTION_HINT_INSTRUCTION))
+        self.assertIn("deploy it", job["argv"][-1])
+        self.assertEqual(self.started, ["wait-classifier"])
+        # The same state on later beats asks nothing more.
+        self.beat(sig, at=2000)
+        self.beat(sig, at=3000)
+        self.assertEqual(self.sess["attentionHint"]["edgeTs"], 1000)
+        self.verdict({"label": "design-decision", "why": "Picks a schema version."})
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(self.sm._attn_request, "answered: nothing more to ask")
+        # Working, then back on the SAME finished turn (a flicker): no re-ask —
+        # but the CACHED verdict ships again, under the same key, because the
+        # hub dropped its copy the beat the state left.
+        self.assertEqual(len(self.sm.attention_hints), 1)
+        self.beat(dict(sig, paneBusy=True), at=4000)
+        self.beat(sig, at=5000)
+        self.assertTrue(self.sess["attentionHint"]["done"])
+        self.assertEqual(self.sess["attentionHint"]["edgeTs"], 1000)
+        first, again = self.sm.attention_hints
+        self.assertEqual(again, first)
+        self.assertEqual(again["key"], f"{self.SID}:1000")
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(self.sm._attn_request, "re-sent, never re-asked")
+        self.beat(sig, at=5500)
+        self.assertEqual(len(self.sm.attention_hints), 2, "a steady state re-sends nothing")
+        # A NEW finished turn is a new edge.
+        self.beat(self.ended(ts="2026-10-03T10:09:00Z"), at=6000)
+        self.assertEqual(self.sess["attentionHint"]["edgeTs"], 6000)
+        self.assertNotIn("done", self.sess["attentionHint"])
+
+    def test_the_live_signals_name_the_current_edge(self):
+        # `attentionEdgeTs` rides the session's live signals every beat the session
+        # is on an edge, so the hub folds a verdict only on the edge it answers:
+        # a second dialog straight after the first gets a NEW one.
+        dialog = lambda detail: self.ended(paneBusy=True, panePrompt={
+            "prompt": "Do you want to proceed?", "detail": f"Bash command\n{detail}"})
+        a = dialog("git status")
+        self.beat(a, at=1000)
+        self.assertEqual(a["attentionEdgeTs"], 1000)
+        a2 = dialog("git status")
+        self.beat(a2, at=2000)
+        self.assertEqual(a2["attentionEdgeTs"], 1000, "the same dialog is the same edge")
+        b = dialog("git push --force origin main")
+        self.beat(b, at=3000)
+        self.assertEqual(b["attentionEdgeTs"], 3000)
+        busy = self.ended(paneBusy=True)
+        self.beat(busy, at=4000)
+        self.assertNotIn("attentionEdgeTs", busy, "no edge, nothing named")
+        # Back on the answered edge after a flicker: its own edgeTs again, which
+        # is the key the re-sent cached verdict carries.
+        b2 = dialog("git push --force origin main")
+        self.beat(b2, at=5000)
+        self.assertEqual(b2["attentionEdgeTs"], 3000)
+        # A session the classifier does not run for names nothing.
+        with mock.patch.object(ha, "ATTENTION_HINTS_ON", False):
+            off = dialog("ls")
+            self.beat(off, at=6000)
+        self.assertNotIn("attentionEdgeTs", off)
+
+    def test_a_sleeping_session_is_no_edge(self):
+        # Ended its turn to sleep through the session CLI's `wake`: the hub reads
+        # `sleeping` (ahead of review), so asking about a "review" is a wasted call.
+        now = 10 ** 12
+        sig = self.ended(wakeAt=now + 60_000)
+        self.assertIsNone(ha.attention_edge(sig, now))
+        self.assertEqual(ha.attention_edge(dict(sig, wakeAt=now - 1), now)[0], "review")
+        self.assertEqual(ha.attention_edge(dict(sig, wakeAt=True), now)[0], "review")
+        self.beat(sig, at=now)
+        self.assertNotIn("attentionHint", self.sess)
+
+    def test_an_unexplained_edge_is_never_re_sent(self):
+        # Exhausted with no verdict: re-entering the edge ships nothing.
+        sig = self.ended()
+        self.beat(sig, at=1000)
+        for t in (1, 10 ** 9):
+            self.sm._stage_attention_hint(now=t)
+            self.verdict(None)
+        self.assertTrue(self.sess["attentionHint"]["done"])
+        self.beat(dict(sig, paneBusy=True), at=4000)
+        self.beat(sig, at=5000)
+        self.assertEqual(self.sm.attention_hints, [])
+
+    def test_a_restart_never_reasks_an_answered_edge(self):
+        sig = self.ended()
+        self.beat(sig, at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to deploy."})
+        self.sm.save()
+        sm2 = self.make_manager()
+        sess2 = sm2._find(self.SID)
+        self.assertTrue(sess2["attentionHint"]["done"], "the verdict is persisted")
+        sm2._attention_edge(sess2, sig, now_ms=9000)
+        sm2._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(sm2._attn_request)
+        self.assertEqual(sess2["attentionHint"]["edgeTs"], 1000)
+
+    def test_dsh_and_qwen_sessions_are_not_classified(self):
+        for runtime in ("dsh", "qwen"):
+            self.sess["agentType"] = runtime
+            self.sess.pop("attentionHint", None)
+            self.beat(self.ended(), at=1000)
+            self.assertNotIn("attentionHint", self.sess)
+
+    # --- the job --------------------------------------------------------------
+
+    def test_retries_are_bounded_and_backed_off(self):
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=100)
+        rec = self.sess["attentionHint"]
+        self.assertEqual((rec["attempts"], rec["retryAt"]),
+                         (1, 100 + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC))
+        self.verdict(None)                      # no verdict: retry owed
+        self.assertNotIn("done", rec)
+        self.sm._stage_attention_hint(now=101)
+        self.assertIsNone(self.sm._attn_request, "inside the backoff")
+        self.sm._stage_attention_hint(now=100 + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC)
+        self.assertEqual(rec["attempts"], 2)
+        self.verdict(None)
+        self.assertTrue(rec["done"], "exhausted")
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(self.sm._attn_request)
+        self.assertEqual(ha.ATTENTION_HINT_MAX_ATTEMPTS, 2)
+
+    def test_a_lost_job_is_freed_but_never_past_the_attempt_budget(self):
+        # The worker never answers (it died): past the timeout the slot frees and
+        # the next try runs — but a lost LAST attempt is not followed by another.
+        self.beat(self.ended(), at=1000)
+        t = 100
+        for _ in range(ha.ATTENTION_HINT_MAX_ATTEMPTS + 2):
+            self.sm._stage_attention_hint(now=t)
+            t += ha.ATTENTION_HINT_TIMEOUT_SEC + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC * 10
+        self.assertEqual(self.sess["attentionHint"]["attempts"], ha.ATTENTION_HINT_MAX_ATTEMPTS)
+        self.assertIsNone(self.sm._attn_job, "the lost last job was freed")
+
+    def test_one_job_in_flight(self):
+        other = dict(self.sess, id="hint2", tmuxName="agent-hint2")
+        self.sm.registry.append(other)
+        self.beat(self.ended(), at=1000)
+        self.sm._attention_edge(other, self.ended(ts="2026-10-03T10:01:00Z"), now_ms=2000)
+        self.sm._stage_attention_hint(now=1)
+        self.assertEqual(self.sm._attn_request["sid"], self.SID, "oldest edge first")
+        self.sm._attn_request = None
+        self.sm._stage_attention_hint(now=2)
+        self.assertIsNone(self.sm._attn_request, "one in flight")
+        self.sm._attn_results = [dict(self.sm._attn_job, hint=None)]
+        self.sm._apply_attention_hints()
+        self.sm._stage_attention_hint(now=3)
+        self.assertEqual(self.sm._attn_request["sid"], "hint2")
+
+    def test_a_late_answer_never_frees_a_newer_job(self):
+        # The watchdog dropped a job that never answered; a newer one for the
+        # same session runs. The old one's late answer must not free the slot.
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=100)
+        old = self.sm._attn_request
+        self.sm._attn_request = None
+        self.sm._stage_attention_hint(now=100 + ha.ATTENTION_HINT_TIMEOUT_SEC + 31
+                                      + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC)
+        new = self.sm._attn_job
+        self.assertIsNotNone(new)
+        self.assertNotEqual(new["stagedAt"], old["stagedAt"])
+        self.sm._attn_results = [dict(old, hint=None)]
+        self.sm._apply_attention_hints()
+        self.assertIs(self.sm._attn_job, new, "the late answer is not the job in flight")
+        self.sm._attn_results = [dict(new, hint=None)]
+        self.sm._apply_attention_hints()
+        self.assertIsNone(self.sm._attn_job)
+
+    def test_an_edge_the_session_left_is_not_asked_and_its_verdict_dropped(self):
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        job = self.sm._attn_request
+        self.beat(self.ended(ts="2026-10-03T10:09:00Z"), at=2000)   # a newer turn
+        self.sm._attn_results = [dict(job, hint={"label": "looping", "why": "x"})]
+        self.sm._apply_attention_hints()
+        self.assertEqual(self.sm.attention_hints, [], "a stale verdict is dropped")
+        self.assertIsNone(self.sm._attn_job)
+
+    def _fake_popen(self, out=b"", rc=0, hang=False):
+        """A Popen stand-in: writes `out` to the stdout FILE it is handed (the
+        run writes to a file, never a pipe) and exits `rc` — or never exits."""
+        calls = []
+
+        def popen(argv, **kw):
+            kw["stdout"].write(out)
+            proc = mock.Mock(pid=4242)
+            if hang:
+                proc.wait.side_effect = [ha.subprocess.TimeoutExpired("claude", 1), None]
+            else:
+                proc.wait.return_value = rc
+            calls.append((argv, kw, proc))
+            return proc
+        return popen, calls
+
+    def test_the_run_is_the_summary_posture_and_strictly_parsed(self):
+        out = json.dumps({"label": "rubber-stamp", "why": "Asks to push.",
+                          "suggestedAnswer": "Yes, push it."}).encode()
+        popen, calls = self._fake_popen(out)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
+            hint = self.sm._run_attention_hint(["claude", "-p", "x"])
+        self.assertEqual(hint, {"label": "rubber-stamp", "why": "Asks to push.",
+                                "suggestedAnswer": "Yes, push it."})
+        (argv, kw, proc), = calls
+        self.assertEqual((kw["cwd"], kw["stdin"], kw["start_new_session"]),
+                         (ha.REGISTRY_DIR, ha.subprocess.DEVNULL, True))
+        self.assertNotEqual(kw["stdout"], ha.subprocess.PIPE, "a file, never a pipe")
+        proc.wait.assert_called_once_with(timeout=ha.ATTENTION_HINT_TIMEOUT_SEC)
+        self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR)
+                          if n.startswith("attention-hint")], [],
+                         "the output file is removed")
+        popen, _ = self._fake_popen(out, rc=1)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
+            self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=OSError("no claude")):
+            self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFOs")
+    def test_a_planted_fifo_or_symlink_never_blocks_or_truncates(self):
+        # ~/.turma is session-writable: the reply file is a fresh mkstemp, so a
+        # FIFO or symlink planted at the old fixed name is never opened.
+        os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
+        os.mkfifo(os.path.join(ha.REGISTRY_DIR, "attention-hint.out"))
+        victim = os.path.join(self.tmp_victim_dir(), "victim")
+        with open(victim, "w") as f:
+            f.write("keep")
+        os.symlink(victim, os.path.join(ha.REGISTRY_DIR, "attention-hint-x.out"))
+        out = json.dumps({"label": "looping", "why": "Same error."}).encode()
+        popen, calls = self._fake_popen(out)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
+            hint = self.sm._run_attention_hint(["claude"])
+        self.assertEqual(hint, {"label": "looping", "why": "Same error."})
+        self.assertEqual(len(calls), 1)
+        with open(victim) as f:
+            self.assertEqual(f.read(), "keep")
+
+    def tmp_victim_dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
+
+    def test_a_hung_run_kills_its_whole_group_and_never_waits_unbounded(self):
+        # A grandchild holding stdout must not wedge the one worker: the run
+        # writes to a file, and a timeout kills the process GROUP, then reaps
+        # it with a bound.
+        popen, calls = self._fake_popen(hang=True)
+        killpg = mock.Mock()
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(ha.os, "killpg", killpg, create=True):
+            self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+        (_argv, _kw, proc), = calls
+        killpg.assert_called_once_with(4242, ha.signal.SIGKILL)
+        self.assertEqual(proc.wait.call_args_list[-1], mock.call(timeout=5))
+
+    def test_strict_parse(self):
+        P = ha.parse_attention_hint
+        ok = {"label": "needs-human-test", "why": "Wants the login flow clicked through."}
+        self.assertEqual(P(json.dumps(ok)), ok)
+        self.assertEqual(P("```json\n" + json.dumps(ok) + "\n```"), ok)
+        self.assertEqual(P(json.dumps(dict(ok, extra=1, suggestedAnswer=""))), ok)
+        for bad in (None, "", "no json here", "{", '["x"]',
+                    json.dumps(dict(ok, label="maybe")),
+                    json.dumps(dict(ok, label="Rubber-Stamp")),
+                    json.dumps(dict(ok, why="  ")),
+                    json.dumps(dict(ok, why=7)),
+                    json.dumps({"label": "looping"}),
+                    json.dumps(dict(ok, suggestedAnswer=["yes"]))):
+            self.assertIsNone(P(bad), bad)
+        long = P(json.dumps({"label": "looping", "why": "w" * 900,
+                             "suggestedAnswer": "a\n" * 400}))
+        self.assertEqual(len(long["why"]), ha.ATTENTION_HINT_TEXT_MAX)
+        self.assertLessEqual(len(long["suggestedAnswer"]), ha.ATTENTION_HINT_TEXT_MAX)
+        self.assertNotIn("\n", long["suggestedAnswer"])
+
+    def test_a_hand_test_never_carries_a_suggested_answer(self):
+        # A suggested reply to "please test this by hand" could only claim a
+        # test nobody ran, so the parse drops it and the prompt forbids it.
+        got = ha.parse_attention_hint(json.dumps({
+            "label": "needs-human-test", "why": "Wants the swipe checked on a phone.",
+            "suggestedAnswer": "I've tested it on my phone, go ahead and merge."}))
+        self.assertEqual(got, {"label": "needs-human-test",
+                               "why": "Wants the swipe checked on a phone."})
+        self.assertIn("never says the operator tested", ha.ATTENTION_HINT_INSTRUCTION)
+        kept = ha.parse_attention_hint(json.dumps({
+            "label": "rubber-stamp", "why": "Asks to push.", "suggestedAnswer": "Yes."}))
+        self.assertEqual(kept["suggestedAnswer"], "Yes.")
+
+    def test_the_edge_survives_a_tail_that_fills_the_budget(self):
+        tail = [{"role": "assistant" if i % 2 else "user", "text": "word " * 400}
+                for i in range(6)]
+        cases = {
+            "question": ({"question": "Ship the migration now or wait for Monday?"},
+                         "Ship the migration now or wait for Monday?"),
+            "permission": ({"panePrompt": {"prompt": "Do you want to run rm -rf build?",
+                                           "options": [{"label": "Yes"}]}},
+                           "A permission dialog is open: Do you want to run rm -rf build?"),
+            "loop": ({"loop": {"tool": "Bash", "repeats": 6}},
+                     "has run Bash 6 times in a row"),
+        }
+        for kind, (signals, needle) in cases.items():
+            text = ha.attention_hint_input(kind, dict(signals, tail=tail))
+            self.assertLessEqual(len(text), ha.ATTENTION_HINT_INPUT_MAX, kind)
+            self.assertIn(needle, text, kind)
+            # The newest row's end is still there; the tail was cut at its front.
+            self.assertTrue(text.endswith("word"), kind)
+        huge = ha.attention_hint_input("question", {"question": "q" * 9000, "tail": tail})
+        self.assertEqual(len(huge), ha.ATTENTION_HINT_INPUT_MAX)
+
+    def test_the_worker_runs_the_job_off_the_beat(self):
+        sm = self.make_manager()
+        job = {"sid": "s", "edge": "review|t", "edgeTs": 1, "argv": ["claude"]}
+        with mock.patch.object(sm, "_run_attention_hint",
+                               return_value={"label": "looping", "why": "x"}):
+            sm._attn_request = job
+            # Drive one loop iteration on this thread: the wake is set, the job
+            # taken, the verdict staged by REBINDING the results list.
+            sm._attn_wake.set()
+            before = sm._attn_results
+            with mock.patch.object(sm._attn_wake, "wait",
+                                   side_effect=[True, KeyboardInterrupt]):
+                with self.assertRaises(KeyboardInterrupt):
+                    sm._attention_hint_worker_loop()
+        self.assertIsNot(sm._attn_results, before, "rebound, never mutated")
+        self.assertEqual(sm._attn_results[0]["hint"], {"label": "looping", "why": "x"})
+        self.assertIsNone(sm._attn_request)
+
+    # --- the wire -------------------------------------------------------------
+
+    def test_a_verdict_rides_the_heartbeat_keyed_by_its_edge_and_clears_by_identity(self):
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "needs-human-test", "why": "Wants the UI checked.",
+                      "suggestedAnswer": "Checked, ship it."})
+        row, = self.sm.attention_hints
+        self.assertEqual(row, {"key": f"{self.SID}:1000", "sessionId": self.SID,
+                               "edge": "review", "edgeTs": 1000,
+                               "label": "needs-human-test", "why": "Wants the UI checked.",
+                               "suggestedAnswer": "Checked, ship it."})
+        self.assertEqual(self.sess["attentionHint"]["label"], "needs-human-test")
+        self.sm.registry = []
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(payload["attentionHints"], [row])
+        late = {"key": "late"}
+        self.sm.attention_hints.append(late)
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual(self.sm.attention_hints, [late])
+
+    def test_the_outbox_is_bounded(self):
+        for i in range(ha.ATTENTION_HINT_OUTBOX_MAX + 3):
+            self.sm.attention_hints.append({"key": str(i)})
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "looping", "why": "x"})
+        self.assertEqual(len(self.sm.attention_hints), ha.ATTENTION_HINT_OUTBOX_MAX)
+        self.assertEqual(self.sm.attention_hints[-1]["sessionId"], self.SID)
+        self.sm.registry = []
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(len(payload["attentionHints"]), ha.ATTENTION_HINTS_MAX)
+
+    # --- the ask-in-chat ledger row -------------------------------------------
+
+    def test_a_rubber_stamp_verdict_writes_the_ask_in_chat_row(self):
+        self.beat(self.ended(text="Tests pass. May I push the branch?"), at=1000)
+        self.assertEqual(self.sm.permission_events, [], "waits on the classifier")
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
+        row, = self.sm.permission_events
+        # Named by the session's OWN asking sentence (the verbatim text the
+        # ledger's rule work reads), not the classifier's paraphrase.
+        asked = ha._permission_ask_prompt("Tests pass. May I push the branch?")
+        self.assertIn("push the branch", asked)
+        self.assertEqual((row["kind"], row["prompt"], row["openedAt"]),
+                         ("ask-in-chat", asked[:ha.PERMISSION_TEXT_MAX], 1000))
+        # Closed on the operator's next input, as before.
+        self.sm.handle_commands([{"cmdId": "c1", "type": "input",
+                                  "sessionId": self.SID, "text": "yes"}])
+        self.assertEqual(self.sm.permission_events[-1]["via"], "turma")
+
+    def test_a_rubber_stamp_the_regex_cannot_name_takes_the_classifiers_why(self):
+        text = "Everything is staged and green."
+        self.assertIsNone(ha._permission_ask_prompt(text))
+        self.beat(self.ended(text=text), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Waits for a go-ahead to push."})
+        row, = self.sm.permission_events
+        self.assertEqual(row["prompt"], "Waits for a go-ahead to push.")
+
+    def test_the_hubs_own_nudge_is_not_the_operator_answering(self):
+        # A loop/stall nudge is an `input` the HUB typed (`source: "nudge"`): it
+        # must neither settle a pending ask nor close an open row as answered.
+        self.beat(self.ended(text="Tests pass. May I push the branch?"), at=1000)
+        self.sm.handle_commands([{"cmdId": "n1", "type": "input", "sessionId": self.SID,
+                                  "text": "You have run `Bash` 4 times...", "source": "nudge"}])
+        self.assertEqual(self.sm.permission_events, [])
+        self.assertIn(self.SID, self.sm._perm_ask_pending)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push."})
+        row, = self.sm.permission_events
+        self.sm.handle_commands([{"cmdId": "n2", "type": "input", "sessionId": self.SID,
+                                  "text": "nudge again", "source": "nudge"}])
+        self.assertEqual(self.sm.permission_events, [row], "still open")
+        self.sm.handle_commands([{"cmdId": "c3", "type": "input", "sessionId": self.SID,
+                                  "text": "yes"}])
+        self.assertEqual(self.sm.permission_events[-1]["via"], "turma")
+
+    def test_the_classifier_overrules_the_regex(self):
+        # The regex would file this ("should I proceed"); the classifier says it is
+        # a real decision, so no permission row is written.
+        self.beat(self.ended(text="Two designs fit. Should I proceed with B?"), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "design-decision", "why": "Choose design A or B."})
+        self.assertEqual(self.sm.permission_events, [])
+        self.assertEqual(self.sm._perm_ask_pending, {})
+
+    def test_no_verdict_falls_back_to_the_regex(self):
+        self.beat(self.ended(text="Build ready. Should I proceed with the deploy?"), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict(None)
+        self.assertEqual(self.sm.permission_events, [])
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.verdict(None)                       # exhausted
+        row, = self.sm.permission_events
+        self.assertIn("Should I proceed", row["prompt"])
+        self.assertEqual(row["openedAt"], 1000)
+
+    def restarted(self):
+        # A fresh manager over the same persisted record: in-memory ask state
+        # gone, and its first beat primes rather than re-reads.
+        sm = self.make_manager()
+        sm.registry = [self.sess]
+        sm._perm_first_beat_done = False
+        self.sm = sm
+        return sm
+
+    def test_a_restart_mid_classification_still_files_the_rubber_stamp(self):
+        sig = self.ended(text="Tests pass. May I push the branch?")
+        self.beat(sig, at=1000)
+        self.sm._stage_attention_hint(now=1)       # attempt 1 in flight, then a restart
+        sm = self.restarted()
+        self.assertEqual(sm._perm_ask_pending, {})
+        self.beat(sig, at=2000)
+        sm._perm_first_beat_done = True
+        self.assertIn(self.SID, sm._perm_ask_pending, "the undecided turn waits again")
+        sm._stage_attention_hint(now=10 ** 9)       # the persisted record re-stages
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
+        row, = sm.permission_events
+        self.assertEqual((row["kind"], row["openedAt"]), ("ask-in-chat", 2000))
+        self.assertIn("push the branch", row["prompt"])
+
+    def test_a_restart_after_the_verdict_does_not_re_file(self):
+        sig = self.ended(text="Tests pass. May I push the branch?")
+        self.beat(sig, at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
+        sm = self.restarted()
+        self.beat(sig, at=2000)
+        self.assertEqual(sm._perm_ask_pending, {})
+        self.assertEqual(sm.permission_events, [])
+
+    def test_an_ask_answered_before_the_verdict_is_still_counted(self):
+        self.beat(self.ended(text="May I merge it?"), at=1000)
+        self.sm.handle_commands([{"cmdId": "c1", "type": "input",
+                                  "sessionId": self.SID, "text": "go"}])
+        opened, closed = self.sm.permission_events
+        self.assertEqual((opened["kind"], closed["via"]), ("ask-in-chat", "turma"))
+        self.assertEqual(self.sm._perm_ask_pending, {})
 
 
 if __name__ == "__main__":

@@ -948,7 +948,59 @@ data class TicketSession(
     val spawnCmdId: String = "",
     /** Sort key: createdAt for a record, endedTs for a resumable row. */
     val at: String = "",
+    /** `ticket.outcome.kind` — how the session closed its own ticket (XERK-1569); "" = it didn't. */
+    val outcome: String = "",
+    /** `ticket.outcome.at` (epoch ms); 0 = unknown. */
+    val outcomeAt: Long = 0L,
+    /** `ticket.outcome.note` — the session's evidence; "" = none served. */
+    val outcomeNote: String = "",
 )
+
+/** The words for a self-close kind — board.js `ticketOutcomeWords`; "" for none/unknown. */
+fun ticketOutcomeWords(kind: String): String = when (kind) {
+    "not-reproducible" -> "not reproducible"
+    "already-fixed" -> "already fixed"
+    "done" -> "done"
+    else -> ""
+}
+
+/**
+ * The chip label of a session that closed its own ticket — board.js
+ * `ticketOutcomeLabel`: the reason alone ("not reproducible", "already fixed"),
+ * plain "closed" for done, "" otherwise. The neutral dot already says closed, so
+ * there is no "closed ·" prefix: the label fits the chip's name cap on one line.
+ */
+fun ticketOutcomeLabel(kind: String): String = when (val w = ticketOutcomeWords(kind)) {
+    "" -> ""
+    "done" -> "closed"
+    else -> w
+}
+
+/**
+ * The ticket's NEWEST session (oldest-first, as ticketSessionsOf returns them)
+ * when it closed the ticket, or null — board.js `ticketOutcomeOf`, for the
+ * detail sheet's "Closed by" row. Only the newest counts: a reopened ticket
+ * worked by a fresh session must not still read "closed".
+ */
+fun ticketOutcomeOf(sessions: List<TicketSession>): TicketSession? =
+    sessions.lastOrNull()?.takeIf { ticketOutcomeWords(it.outcome).isNotEmpty() }
+
+/**
+ * The "Closed by" row's text — board.js `ticketOutcomeFieldHtml`: the closing
+ * session's name, "X-1-fix — not reproducible · 3h ago"; an unknown `at` drops
+ * the age. The evidence note (`outcomeNote`) is shown beneath it by the sheet.
+ */
+fun ticketOutcomeText(s: TicketSession, nowMs: Long = System.currentTimeMillis()): String {
+    val words = ticketOutcomeWords(s.outcome)
+    if (words.isEmpty()) return ""
+    val age = if (s.outcomeAt > 0) ageStr(java.time.Instant.ofEpochMilli(s.outcomeAt).toString(), nowMs) else ""
+    val whenText = when (age) {
+        "" -> ""
+        "now" -> " · just now"
+        else -> " · $age ago"
+    }
+    return "${ticketSessionName(s)} — $words$whenText"
+}
 
 /** The chip's run-state dot, board.js sessionChipHtml's `state`. */
 fun ticketSessionState(s: TicketSession): String = when {
@@ -965,7 +1017,15 @@ fun ticketSessionState(s: TicketSession): String = when {
  * exists; the live branch beats the reserved one. Port of board.js
  * sessionChipHtml's precedence.
  */
-fun ticketSessionLabel(s: TicketSession): String {
+fun ticketSessionLabel(s: TicketSession): String =
+    // A session that closed its own ticket (XERK-1569) says so in place of its name.
+    ticketOutcomeLabel(s.outcome).ifEmpty { ticketSessionName(s) }
+
+/**
+ * A ticket session's NAME — board.js `sessionChipName`: the rename, else the
+ * branch, else whatever names it. The chip and the "Closed by" row both say it.
+ */
+fun ticketSessionName(s: TicketSession): String {
     val renamed = if (s.summaryManual) s.summary else ""
     val branch = s.gitBranch.ifBlank { s.ticketBranch }
     return renamed.ifBlank { branch }.ifBlank { s.summary }.ifBlank { s.label }
@@ -1009,6 +1069,8 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 ticketBranch = t.branch.orEmpty(), summary = s.summary,
                 summaryManual = false, label = s.label, ticketKey = t.key,
                 siteKey = t.siteKey, spawnCmdId = s.spawnCmdId, at = s.createdAt,
+                outcome = t.outcome?.kind.orEmpty(), outcomeAt = t.outcome?.at ?: 0L,
+                outcomeNote = t.outcome?.note.orEmpty(),
             ), org)
         }
         for (c in a.closedSessions) {
@@ -1018,7 +1080,8 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 status = "stopped", gitBranch = c.branch,
                 ticketBranch = t.branch.orEmpty(), summary = c.summary,
                 summaryManual = c.summaryManual, label = c.label, ticketKey = t.key,
-                siteKey = t.siteKey, at = c.createdAt,
+                siteKey = t.siteKey, at = c.createdAt, outcome = t.outcome?.kind.orEmpty(),
+                outcomeAt = t.outcome?.at ?: 0L, outcomeNote = t.outcome?.note.orEmpty(),
             ), org)
         }
     }
@@ -1036,7 +1099,8 @@ fun ticketSessionIndex(agents: List<AgentInfo>): Map<String, List<TicketSession>
                 status = "stopped", gitBranch = "",
                 ticketBranch = tk.branch.orEmpty(), summary = t.summary,
                 summaryManual = false, label = "", ticketKey = tk.key,
-                siteKey = tk.siteKey, at = t.endedTs,
+                siteKey = tk.siteKey, at = t.endedTs, outcome = tk.outcome?.kind.orEmpty(),
+                outcomeAt = tk.outcome?.at ?: 0L, outcomeNote = tk.outcome?.note.orEmpty(),
             ), org)
         }
     }

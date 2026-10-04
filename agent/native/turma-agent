@@ -283,25 +283,32 @@ fi
 #     it to exit before `start` (see agent/native/turma-agentctl).
 # Both leave no hub-agent.py for the pgrep below to find. A crash-restart is the
 # same: the old process is already gone. A zombie has an empty /proc/<pid>/cmdline
-# so `pgrep -f` never matches one.
+# so pgrep never matches one.
 #
-# pgrep -f matches the full argv; $PREFIX/hub-agent.py is this install's manager
-# and the manager never re-spawns itself, so a match is a live manager — with one
-# rare exception: a CONCURRENT `hub-agent.py --enroll` probe (self-enroll, or
-# `turma-agentctl enroll`) shares the path and could read as a manager. This
-# launcher's OWN enroll (above) is awaited and gone before we get here, so it
-# never trips its own guard; only a second, overlapping enroll would, and it
-# fails LOUD (a printed refusal an operator retries), never dark. This launcher's
-# own argv is the bash script path, not hub-agent.py, so it never matches itself
-# (the exec is far below). Missing pgrep fails OPEN — the prior behaviour, never
-# worse. TURMA_ALLOW_SECOND_MANAGER=1 opts out for the rare case of deliberately
-# running a second one.
+# The match is on the manager's WHOLE argv (`pgrep -xf`), anchored: the exec
+# below runs `python3 $PREFIX/hub-agent.py` with nothing after it. A bare
+# substring match (`pgrep -f`) also matched ANY process merely mentioning the
+# path — a shell running `grep … hub-agent.py`, a tail/watch loop, an editor, a
+# session's Bash command — and refused the start, leaving the host stopped after
+# an auto-update with nothing to retry it (XERK-1552). The interpreter token is
+# matched loosely — a full path, a versioned/free-threaded name (a pyenv shim
+# re-execs `/…/python3.12`), and interpreter flags a python3 wrapper may add
+# (`-I`) — because a real manager the guard fails to see means two managers.
+# A concurrent `hub-agent.py --enroll` probe has an argument AFTER the script,
+# so it no longer matches. Accepted residue: a flag with its value glued on
+# (`python3 -mfoo $PREFIX/hub-agent.py`) reads as a manager — a deliberately odd
+# argv, and a loud refusal, never a second manager. $PREFIX is regex-escaped. This
+# launcher's own argv is the bash script path, so it never matches itself. A
+# zombie has an empty /proc/<pid>/cmdline and never matches. Missing pgrep fails
+# OPEN — the prior behaviour, never worse. TURMA_ALLOW_SECOND_MANAGER=1 opts out
+# for the rare case of deliberately running a second one.
+manager_re="^([^ ]*/)?python[0-9.]*t?( -[^ ]+)* $(printf '%s' "$PREFIX" | sed 's/[][\\.*^$+?(){}|]/\\&/g')/hub-agent\.py\$"
 if [ "${TURMA_ALLOW_SECOND_MANAGER:-0}" = 0 ] \
    && command -v pgrep >/dev/null 2>&1 \
-   && pgrep -f "$PREFIX/hub-agent.py" >/dev/null 2>&1; then
+   && pgrep -xf "$manager_re" >/dev/null 2>&1; then
   echo "=================================================================="
   echo " A Turma manager for this install ($PREFIX) is already running:"
-  pgrep -af "$PREFIX/hub-agent.py" 2>/dev/null | sed 's/^/   /'
+  pgrep -axf "$manager_re" 2>/dev/null | sed 's/^/   /'
   echo
   echo " NOT starting a second one — two managers would beat as the same host"
   echo " and fight over the reverse tunnel. Restart the running one instead:"

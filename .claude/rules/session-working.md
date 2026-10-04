@@ -73,8 +73,8 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     stalled session is judged like any idle one, so a dead shell surfaces in Ready for review;
   - `paneBusy` true still means working; with `paneBusy` unknown an all-wait session is NOT working
     (the freshness fallback would otherwise say it is).
-- Stalled is only COMPUTED here; the attention layer (XERK-1571) owns rendering it as its own state
-  and the stalled alert. Until then a stalled session takes the ordinary review alert.
+- Stalled is only COMPUTED here; the attention layer renders it as `needs-you:stalled` and owns
+  the stalled alert, which REPLACES the review alert for it (`turma-attention.md`, XERK-1571).
 - **The chat bar labels a wait**: `agentsHtml` reads a wait row's type as `waiting`, and an all-wait
   bar's verb is `Waiting…` (`backgroundBarVerb`, Android `ChatScreen.kt` mirrors it).
 - Tests: `TestShellKind`, `TestLiveAgentsScan` ↔ `scanAgentEntry` in `tunnel-agent.test.js`; the
