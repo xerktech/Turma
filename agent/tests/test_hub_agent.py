@@ -17492,6 +17492,730 @@ class TestWakeRequest(ManagerMixin, unittest.TestCase):
         self.assertIsNone(ha.read_wake_request(self.SID)["wakeReason"])
 
 
+class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
+    """XERK-1569: a session's `session_cli.py close-ticket` file is read by a
+    WORKER (tracker HTTP off the beat), which comments the evidence and moves the
+    ticket to a Done-category status; the BEAT then stamps `ticket.outcome` on the
+    record and the ticket ledger and stages `ticketOutcomeResults`."""
+
+    SID = "abcde"
+    KEY = "ENG-9"
+    SITE = "s.atlassian.net"
+    OPTS = [{"id": "11", "name": "In Progress", "category": "inprogress"},
+            {"id": "31", "name": "Done", "category": "done"}]
+
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.multiple(ha, JIRA_SITE=self.SITE, JIRA_EMAIL="e",
+                                JIRA_TOKEN="t", AZDO_URL="", AZDO_TOKEN="")
+        p.start()
+        self.addCleanup(p.stop)
+        self.calls = []        # (path, body) per jira_req
+        self.fail_paths = {}   # path suffix -> how many more calls to fail
+
+        def fake_req(path, params, body=None):
+            self.calls.append((path, body))
+            for suffix, n in list(self.fail_paths.items()):
+                if path.endswith(suffix) and n > 0:
+                    self.fail_paths[suffix] = n - 1
+                    raise ha.BoardHttpError("HTTP 500: tracker down", 500)
+            return {}
+        p2 = mock.patch.object(ha, "jira_req", fake_req)
+        p2.start()
+        self.addCleanup(p2.stop)
+        p3 = mock.patch.object(ha, "board_status_options", lambda key: list(self.OPTS))
+        p3.start()
+        self.addCleanup(p3.stop)
+        self.notified = []     # (sid, text) per notify_session
+
+        def fake_notify(sm, sid, text):
+            self.notified.append((sid, text))
+            return True
+        p4 = mock.patch.object(ha.SessionManager, "notify_session", fake_notify)
+        p4.start()
+        self.addCleanup(p4.stop)
+
+    def _sess(self, sm, **over):
+        sess = {"id": self.SID, "status": "running", "repo": "Turma",
+                "repoPath": "/w/Turma", "worktreePath": os.path.join(self.tmp, "wt"),
+                "rcName": "rc", "tmuxName": f"agent-{self.SID}",
+                "claudeSessionId": "22222222-2222-4222-8222-222222222222",
+                "ticket": {"key": self.KEY, "siteKey": self.SITE, "branch": self.KEY,
+                           "url": f"https://{self.SITE}/browse/{self.KEY}", "summary": "s"}}
+        sess.update(over)
+        sm.registry = [sess]
+        return sess
+
+    def _path(self):
+        return os.path.join(ha.SESSION_REQUESTS_DIR, self.SID, "close-ticket.json")
+
+    def _write(self, data):
+        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+        with open(self._path(), "w") as fh:
+            json.dump(data, fh)
+
+    def _req(self, resolution="not-reproducible", note="ran repro.sh on main: passes",
+             at=1_786_400_000_000):
+        self._write({"resolution": resolution, "note": note, "requestedAt": at})
+
+    def _comments(self):
+        return [b for p, b in self.calls if p.endswith("/comment")]
+
+    def _transitions(self):
+        return [b for p, b in self.calls if p.endswith("/transitions")]
+
+    def test_the_file_becomes_a_comment_and_done_then_the_beat_stamps_the_outcome(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)      # the WORKER pass
+        # The first WRITE is the comment (a not-reproducible close on a board with
+        # no status named so first reads whether the ticket is already Done).
+        writes = [p for p, b in self.calls if b is not None]
+        self.assertEqual(writes[0], f"/rest/api/3/issue/{self.KEY}/comment")
+        adf = json.dumps(self._comments()[0])
+        self.assertIn("not reproducible", adf)
+        self.assertIn("ran repro.sh on main: passes", adf)
+        self.assertEqual(self._transitions(), [{"transition": {"id": "31"}}])
+        self.assertFalse(os.path.exists(self._path()))
+        # The worker wrote nothing to the registry — that is the beat's.
+        self.assertNotIn("outcome", sess["ticket"])
+        sm._apply_closed_tickets()
+        # The session's evidence note rides the outcome (the board's "Closed by"
+        # row shows it), on the record AND the ledger entry.
+        self.assertEqual(sess["ticket"]["outcome"],
+                         {"kind": "not-reproducible", "at": 1_000_000,
+                          "note": "ran repro.sh on main: passes"})
+        entry = sm.ticket_ledger[sess["claudeSessionId"]]
+        self.assertEqual(entry["outcome"], {"kind": "not-reproducible", "at": 1_000_000,
+                                            "note": "ran repro.sh on main: passes"})
+        with open(ha.TICKET_LEDGER_PATH) as fh:      # persisted, not just in memory
+            self.assertEqual(json.load(fh)[sess["claudeSessionId"]]["outcome"]["kind"],
+                             "not-reproducible")
+        [r] = sm.ticket_outcome_results
+        self.assertEqual((r["sessionId"], r["key"], r["kind"], r["ok"], r["status"]),
+                         (self.SID, self.KEY, "not-reproducible", True, "Done"))
+        # The note rides the ticket only, never the hub's result list.
+        self.assertNotIn("note", r)
+        # The served ticket carries it, so the board can say why.
+        self.assertEqual(ha._served_ticket(sess)["outcome"]["kind"], "not-reproducible")
+        # A later pass finds nothing to do.
+        sm._process_close_ticket_requests(now=2000.0)
+        self.assertEqual(len(self._comments()), 1)
+
+    def test_a_board_that_names_not_reproducible_is_mapped_to_it(self):
+        named = {"id": "41", "name": "Cannot Reproduce", "category": "done"}
+        opts = self.OPTS + [named]
+        self.assertEqual(ha._close_ticket_option(opts, "not-reproducible"), named)
+        # Only for that kind, and only a Done-category one.
+        self.assertEqual(ha._close_ticket_option(opts, "already-fixed")["id"], "31")
+        self.assertEqual(ha._close_ticket_option(opts, "done")["id"], "31")
+        odd = [{"id": "9", "name": "Not reproducible yet", "category": "inprogress"}]
+        self.assertEqual(ha._close_ticket_option(self.OPTS + odd, "not-reproducible")["id"], "31")
+        self.assertIsNone(ha._close_ticket_option(self.OPTS[:1], "done"))
+
+    def test_finished_work_never_closes_into_a_negative_status_listed_first(self):
+        # A board listing "Cannot Reproduce" / "Won't Do" AHEAD of Done: a
+        # `done`/`already-fixed` close must still land on Done, never on the
+        # first Done-column option.
+        opts = [self.OPTS[0],
+                {"id": "41", "name": "Cannot Reproduce", "category": "done"},
+                {"id": "42", "name": "Won't Do", "category": "done"},
+                {"id": "43", "name": "Duplicate", "category": "done"},
+                {"id": "31", "name": "Done", "category": "done"}]
+        for kind in ("done", "already-fixed"):
+            with self.subTest(kind=kind):
+                self.assertEqual(ha._close_ticket_option(opts, kind)["id"], "31")
+        self.assertEqual(ha._close_ticket_option(opts, "not-reproducible")["id"], "41")
+        # A plainly-named Done is preferred over another neutral name...
+        opts2 = [self.OPTS[0], {"id": "5", "name": "Shipped", "category": "done"},
+                 {"id": "6", "name": "Closed", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts2, "done")["id"], "6")
+        # ...a neutral name still beats a negative one...
+        opts3 = [self.OPTS[0], {"id": "41", "name": "Cannot Reproduce", "category": "done"},
+                 {"id": "5", "name": "Shipped", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts3, "already-fixed")["id"], "5")
+        # ...and only a board offering nothing else falls back to the first.
+        opts4 = [self.OPTS[0], {"id": "42", "name": "Won't Do", "category": "done"},
+                 {"id": "41", "name": "Cannot Reproduce", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts4, "done")["id"], "42")
+        # not-reproducible with no named status falls back to a plain Done too.
+        opts5 = [self.OPTS[0], {"id": "42", "name": "Won't Do", "category": "done"},
+                 {"id": "31", "name": "Done", "category": "done"}]
+        self.assertEqual(ha._close_ticket_option(opts5, "not-reproducible")["id"], "31")
+
+    def test_bad_requests_are_refused_without_tracker_http(self):
+        for bad in ({"resolution": "wontfix", "note": "n"},
+                    {"resolution": "done", "note": "   "},
+                    {"resolution": "done"},
+                    {"resolution": "done", "note": "x" * (ha.CLOSE_TICKET_NOTE_MAX + 1)},
+                    {"resolution": ["done"], "note": "n"}):
+            with self.subTest(bad=bad):
+                sm = self.make_manager()
+                sess = self._sess(sm)
+                self.calls.clear()
+                self._write(bad)
+                self.assertIn("error", ha.read_close_ticket_request(self.SID))
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])
+                self.assertFalse(os.path.exists(self._path()))   # dropped, never re-read
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertFalse(r["ok"])
+                self.assertTrue(r["final"])
+                self.assertIn("refused", r["error"])
+                self.assertNotIn("outcome", sess["ticket"])
+        # The note bound is inclusive.
+        self._write({"resolution": "done", "note": "x" * ha.CLOSE_TICKET_NOTE_MAX})
+        self.assertNotIn("error", ha.read_close_ticket_request(self.SID))
+
+    def test_a_fifo_or_symlink_at_the_name_is_refused_and_never_blocks(self):
+        sm = self.make_manager()
+        self._sess(sm)
+        os.makedirs(os.path.dirname(self._path()), exist_ok=True)
+        os.mkfifo(self._path())
+        self.assertIsNone(ha.read_close_ticket_request(self.SID))
+        sm._process_close_ticket_requests(now=1000.0)       # returns, no HTTP
+        self.assertEqual(self.calls, [])
+        os.remove(self._path())
+        real = os.path.join(self.tmp, "real.json")
+        with open(real, "w") as fh:
+            json.dump({"resolution": "done", "note": "n"}, fh)
+        os.symlink(real, self._path())
+        self.assertIsNone(ha.read_close_ticket_request(self.SID))
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual(self.calls, [])
+
+    def test_a_failure_is_staged_and_retried_once_without_reposting_the_comment(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        self.fail_paths["/transitions"] = 1
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertTrue(os.path.exists(self._path()))      # left for the retry
+        sm._apply_closed_tickets()
+        [r] = sm.ticket_outcome_results
+        self.assertEqual((r["ok"], r["final"]), (False, False))
+        self.assertIn("tracker down", r["error"])
+        # Not before the retry delay.
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC - 1)
+        self.assertEqual(len(self._transitions()), 1)
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        self.assertEqual(len(self._comments()), 1)        # the comment landed once
+        self.assertEqual(len(self._transitions()), 2)
+        self.assertFalse(os.path.exists(self._path()))
+        sm._apply_closed_tickets()
+        self.assertTrue(sm.ticket_outcome_results[-1]["ok"])
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def test_a_request_that_fails_twice_is_dropped_with_a_final_error(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        self.fail_paths["/comment"] = 5
+        for t in (1000.0, 1000.0 + ha.CLOSE_TICKET_RETRY_SEC, 5000.0, 9000.0):
+            sm._process_close_ticket_requests(now=t)
+        self.assertEqual(len(self._comments()), ha.CLOSE_TICKET_ATTEMPTS)
+        self.assertFalse(os.path.exists(self._path()))
+        sm._apply_closed_tickets()
+        self.assertEqual([r["final"] for r in sm.ticket_outcome_results], [False, True])
+        self.assertNotIn("outcome", sess["ticket"])
+
+    def test_a_final_failure_tells_the_session_to_close_it_itself(self):
+        # The CLI only queues the request and the directive ends the turn, so the
+        # session must be told the ticket is still open — else it thinks it closed
+        # and its tracker-tool fallback never runs.
+        self.OPTS = self.OPTS[:1]          # the workflow offers no Done from here
+        sm = self.make_manager()
+        self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])            # a retry is still due: quiet
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        sm._apply_closed_tickets()
+        [(sid, text)] = self.notified
+        self.assertEqual(sid, self.SID)
+        self.assertIn(f"could NOT close ticket {self.KEY} as not reproducible", text)
+        self.assertIn("nothing can move it to Done", text)
+        self.assertIn("It was not moved to Done", text)
+        self.assertIn("tracker CLI/MCP this host gives you", text)
+        self.assertIn("tell the operator", text)
+        sm._apply_closed_tickets()                     # told once, not every beat
+        self.assertEqual(len(self.notified), 1)
+
+    def test_a_ticket_already_in_done_is_a_success_not_a_failure(self):
+        # Trackers offer no transition into the current status, so an operator's
+        # own close (or a repeat request) has no Done option: read the issue's
+        # current status and count already-Done as the outcome asked for.
+        self.OPTS = self.OPTS[:1]
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                return {"fields": {"status": {"name": "Closed",
+                                              "statusCategory": {"key": "done"}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req()
+            sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])
+        self.assertEqual(self._transitions(), [])
+        self.assertFalse(os.path.exists(self._path()))
+        [r] = sm.ticket_outcome_results
+        self.assertTrue(r["ok"])
+        self.assertEqual(r["status"], "Closed")
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def _close_from(self, opts, kind, current):
+        """One close where the board offers `opts` and the issue's current
+        status is `current` = (name, category key) or None (unreadable)."""
+        self.OPTS = opts
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                self.calls.append((path, body))
+                return {} if current is None else {"fields": {"status": {
+                    "name": current[0], "statusCategory": {"key": current[1]}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req(resolution=kind)
+            sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        return sess, sm.ticket_outcome_results[-1]
+
+    def test_a_ticket_in_done_is_never_moved_into_a_fallback_done_status(self):
+        # A ticket already in Done is offered only the board's OTHER Done
+        # statuses, so a plain-Done close's only Done option is a negative one
+        # ("Won't Do", "Duplicate"). That must read as already closed — never
+        # rewrite a finished ticket as abandoned.
+        todo = {"id": "1", "name": "To Do", "category": "todo"}
+        for kind, neg in (("done", {"id": "41", "name": "Won't Do", "category": "done"}),
+                          ("already-fixed", {"id": "51", "name": "Duplicate",
+                                             "category": "done"}),
+                          ("done", {"id": "61", "name": "Cannot Reproduce",
+                                    "category": "done"})):
+            with self.subTest(kind=kind, neg=neg["name"]):
+                self.calls.clear()
+                sess, r = self._close_from([todo, self.OPTS[0], neg], kind, ("Done", "done"))
+                self.assertEqual(self._transitions(), [])
+                self.assertEqual(len(self._comments()), 1)
+                self.assertEqual((r["ok"], r["status"]), (True, "Done"))
+                self.assertEqual(sess["ticket"]["outcome"]["kind"], kind)
+        # A repeat not-reproducible close sitting in "Cannot Reproduce" is offered
+        # plain Done: it stays where it is.
+        self.calls.clear()
+        _, r = self._close_from([todo, {"id": "31", "name": "Done", "category": "done"}],
+                                "not-reproducible", ("Cannot Reproduce", "done"))
+        self.assertEqual(self._transitions(), [])
+        self.assertEqual((r["ok"], r["status"]), (True, "Cannot Reproduce"))
+
+    def test_finished_work_on_an_open_ticket_is_never_closed_as_abandoned(self):
+        # A common workflow: a global "Won't Do"/"Cancelled" edge from any
+        # status, while Done is reachable only from In Review. A `done` or
+        # `already-fixed` close on an open ticket must NOT record shipped work
+        # as abandoned: it is refused (final, no comment, no move) and the
+        # session is told to use its tracker tool. So is a read naming no status.
+        todo = {"id": "1", "name": "In Review", "category": "inprogress"}
+        for kind, negs in (("done", [{"id": "41", "name": "Won't Do", "category": "done"}]),
+                           ("done", [{"id": "42", "name": "Cancelled", "category": "done"},
+                                     {"id": "43", "name": "Duplicate", "category": "done"}]),
+                           ("already-fixed", [{"id": "44", "name": "Duplicate",
+                                               "category": "done"}]),
+                           ("already-fixed", [{"id": "45", "name": "Cannot Reproduce",
+                                               "category": "done"}]),
+                           # Azure DevOps' built-in Removed state, a typographic
+                           # apostrophe, and a "Not Doing" status.
+                           ("done", [{"id": "46", "name": "Removed", "category": "done"}]),
+                           ("done", [{"id": "47", "name": "Won’t Do", "category": "done"}]),
+                           ("already-fixed", [{"id": "48", "name": "Not Doing",
+                                               "category": "done"}])):
+            for current in (("In Progress", "indeterminate"), None):
+                with self.subTest(kind=kind, neg=negs[0]["name"], current=current):
+                    self.calls.clear()
+                    self.notified.clear()
+                    sess, r = self._close_from([todo] + negs, kind, current)
+                    self.assertEqual(self._transitions(), [])
+                    self.assertEqual(self._comments(), [])
+                    self.assertEqual((r["ok"], r["final"]), (False, True))
+                    self.assertIn("refused: no plain Done transition", r["error"])
+                    self.assertIn(f"only {negs[0]['name']}", r["error"])
+                    self.assertNotIn("outcome", sess["ticket"])
+                    self.assertFalse(os.path.exists(self._path()))
+                    [(_, text)] = self.notified
+                    self.assertIn("It was not moved to Done", text)
+                    self.assertIn("tracker CLI/MCP this host gives you", text)
+        # A not-reproducible close may take such a status (no change was made,
+        # which is what it says), and only after the already-in-Done read.
+        self.calls.clear()
+        _, r = self._close_from([todo, {"id": "41", "name": "Won't Do", "category": "done"}],
+                                "not-reproducible", ("In Progress", "indeterminate"))
+        self.assertIn(f"/rest/api/3/issue/{self.KEY}", [p for p, _ in self.calls])
+        self.assertEqual(self._transitions(), [{"transition": {"id": "41"}}])
+        self.assertEqual((r["ok"], r["status"]), (True, "Won't Do"))
+        # The exact match is taken without reading the current status at all.
+        self.calls.clear()
+        self._close_from([todo, {"id": "31", "name": "Done", "category": "done"}],
+                         "done", ("Done", "done"))
+        self.assertNotIn(f"/rest/api/3/issue/{self.KEY}", [p for p, _ in self.calls])
+        self.assertEqual(self._transitions(), [{"transition": {"id": "31"}}])
+
+    def test_a_failed_status_read_never_takes_the_fallback(self):
+        # The ticket may already be in Done, so a status read that FAILS is not
+        # "not in Done": the attempt fails (no comment, no move) and is retried;
+        # the retry that reads Done counts it closed without moving it.
+        todo = {"id": "1", "name": "To Do", "category": "todo"}
+        self.OPTS = [todo, {"id": "41", "name": "Won't Do", "category": "done"}]
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        real = ha.jira_req
+        reads = {"n": 0}
+
+        def fake_req(path, params, body=None):
+            if path == f"/rest/api/3/issue/{self.KEY}":
+                reads["n"] += 1
+                if reads["n"] == 1:
+                    raise ha.BoardHttpError("HTTP 503: blip", 503)
+                return {"fields": {"status": {"name": "Done",
+                                              "statusCategory": {"key": "done"}}}}
+            return real(path, params, body)
+        with mock.patch.object(ha, "jira_req", fake_req):
+            self._req(resolution="done")
+            sm._process_close_ticket_requests(now=1000.0)
+            self.assertEqual(self._transitions(), [])
+            self.assertEqual(self._comments(), [])
+            sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        sm._apply_closed_tickets()
+        self.assertEqual(self._transitions(), [])
+        self.assertEqual(len(self._comments()), 1)
+        first, last = sm.ticket_outcome_results
+        self.assertEqual((first["ok"], first["final"]), (False, False))
+        self.assertIn("could not read", first["error"])
+        self.assertEqual((last["ok"], last["status"]), (True, "Done"))
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "done")
+
+    def test_the_fallback_predicate(self):
+        def o(name):
+            return {"id": "1", "name": name, "category": "done"}
+        self.assertFalse(ha._close_ticket_is_fallback(o("Done"), "done"))
+        self.assertFalse(ha._close_ticket_is_fallback(o("Shipped"), "already-fixed"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Won't Do"), "done"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Cannot Reproduce"), "already-fixed"))
+        self.assertFalse(ha._close_ticket_is_fallback(o("Cannot Reproduce"), "not-reproducible"))
+        self.assertTrue(ha._close_ticket_is_fallback(o("Done"), "not-reproducible"))
+
+    def test_a_refusal_is_told_to_the_session_and_a_success_is_not(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._apply_closed_tickets()
+        [(sid, text)] = self.notified
+        self.assertIn("refused: the session's ticket is not on this host's board", text)
+        self.notified.clear()
+        sess["ticket"]["siteKey"] = self.SITE
+        self._req(at=1_786_400_000_001)
+        sm._process_close_ticket_requests(now=2000.0)
+        sm._apply_closed_tickets()
+        self.assertEqual(self.notified, [])
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+
+    def test_the_failure_message_is_one_bounded_line(self):
+        msg = ha._close_ticket_failed_message("ENG-9", None, "HTTP 400:\n" + "x" * 900)
+        self.assertNotIn("\n", msg)
+        self.assertIn("could NOT close ticket ENG-9: HTTP 400: x", msg)
+        self.assertLess(len(msg), 700)
+
+    def test_a_notify_that_raises_never_breaks_the_beat(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        with mock.patch.object(sm, "notify_session", side_effect=OSError("pane gone")):
+            sm._apply_closed_tickets()                 # logged, never raised
+        self.assertFalse(sm.ticket_outcome_results[0]["ok"])
+
+    def test_only_a_running_claude_session_is_served(self):
+        for over in ({"agentType": "dsh"}, {"agentType": "qwen"}, {"status": "stopped"}):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                self._sess(sm, **over)
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])
+                self.assertTrue(os.path.exists(self._path()))    # untouched
+
+    def test_a_session_with_no_ticket_is_refused_and_told(self):
+        # The CLI promises the manager will say so when it cannot close the
+        # ticket; a bare (or not-yet-adopted) session must hear it, not silence.
+        for over in ({"ticket": None}, {"ticket": {"key": ""}}, {"ticket": "junk"}):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                sess = self._sess(sm, **over)
+                self.calls.clear()
+                self.notified.clear()
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])                 # no tracker HTTP
+                self.assertFalse(os.path.exists(self._path()))  # consumed
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertEqual((r["ok"], r["final"], r["key"]), (False, True, None))
+                self.assertIn("this session has no ticket", r["error"])
+                [(sid, text)] = self.notified
+                self.assertEqual(sid, self.SID)
+                self.assertIn("could NOT close a ticket", text)
+                self.assertNotIn("None", text)
+                self.assertEqual(sess.get("ticket"), over["ticket"])  # untouched
+
+    def test_start_and_resume_forget_a_close_the_session_made(self):
+        # The operator reopening the ticket and bringing the session back means
+        # the board must stop saying the session closed it.
+        sm = self.make_manager()
+        outcome = {"kind": "not-reproducible", "at": 1}
+        sess = self._sess(sm, status="error", ttydPort=7701)
+        sess["ticket"]["outcome"] = outcome
+        with mock.patch.object(sm, "_launch_tmux") as launch, \
+                mock.patch.object(sm, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm.start(self.SID)
+        launch.assert_called_once()
+        self.assertEqual(sess["status"], "running")
+        self.assertNotIn("outcome", sess["ticket"])
+        self.assertEqual(sess["ticket"]["key"], self.KEY)
+        # resume() from the closed history drops it too.
+        sm2 = self.make_manager()
+        closed = dict(self._sess(sm2), status="stopped")
+        closed["ticket"] = {**closed["ticket"], "outcome": outcome}
+        sm2.registry = []
+        sm2.closed = [closed]
+        with mock.patch.object(sm2, "_launch_tmux"), \
+                mock.patch.object(sm2, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm2.resume(self.SID)
+        [back] = [s for s in sm2.registry if s["id"] == self.SID]
+        self.assertNotIn("outcome", back["ticket"])
+        self.assertEqual(back["ticket"]["key"], self.KEY)
+        self.assertEqual(ha._reopened_ticket(None), None)
+        t = {"key": "K-1"}
+        self.assertIs(ha._reopened_ticket(t), t)
+
+    def test_start_drops_a_close_request_left_from_before_the_stop(self):
+        # A request whose first attempt failed (not final), or written just
+        # before the session crashed to `error`, must not re-close the ticket
+        # the operator just brought back. A wake request still stands.
+        sm = self.make_manager()
+        self._sess(sm, status="error", ttydPort=7701)
+        self._req()
+        wake = os.path.join(os.path.dirname(self._path()), "wake.json")
+        with open(wake, "w") as fh:
+            json.dump({"wakeAt": 1, "reason": "r"}, fh)
+        with mock.patch.object(sm, "_launch_tmux"), \
+                mock.patch.object(sm, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm.start(self.SID)
+        self.assertFalse(os.path.exists(self._path()))
+        self.assertTrue(os.path.exists(wake))
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual((self._comments(), self._transitions()), ([], []))
+        sm.start(self.SID)          # nothing left to drop: still quiet
+
+    def test_a_ticket_from_another_board_is_refused(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        sess["ticket"]["siteKey"] = "other.atlassian.net"
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual(self.calls, [])
+        sm._apply_closed_tickets()
+        self.assertIn("not on this host's board", sm.ticket_outcome_results[0]["error"])
+
+    def test_the_beat_applies_what_the_worker_landed_and_wakes_it_off_the_beat(self):
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        # No real tmux here: keep the dead-session sweep from ending the session.
+        p = mock.patch.object(sm, "_sweep_dead_sessions")
+        p.start()
+        self.addCleanup(p.stop)
+        # The beat itself makes no tracker call: it only wakes the worker.
+        with mock.patch.object(sm, "_stage_close_ticket_work") as stage:
+            payload = sm.build_payload(1)
+        stage.assert_called_once()
+        self.assertEqual(self.calls, [])
+        self.assertNotIn("ticketOutcomeResults", payload)
+        # The capability the hub gates its close-ticket wording on.
+        self.assertEqual(payload["closeTicket"], {"available": True})
+        with mock.patch.object(sm, "_stage_close_ticket_work") as stage:
+            sm.build_payload(2, light=True)
+        stage.assert_not_called()                 # a light beat does not
+        sm._process_close_ticket_requests(now=1000.0)    # the worker pass
+        with mock.patch.object(sm, "_stage_close_ticket_work"):
+            payload = sm.build_payload(3)
+        self.assertEqual(payload["ticketOutcomeResults"][0]["kind"], "not-reproducible")
+        self.assertEqual(sess["ticket"]["outcome"]["kind"], "not-reproducible")
+        # Delivered results are cleared with the rest of the staged work.
+        sm._clear_delivered_staged(payload)
+        self.assertEqual(sm.ticket_outcome_results, [])
+
+    def test_the_worker_starts_once_and_a_failed_start_never_raises(self):
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_close_ticket_worker_loop"):
+            sm._stage_close_ticket_work()
+            first = sm._close_ticket_worker
+            first.join(1)
+        with mock.patch.object(ha.threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            sm._stage_close_ticket_work()          # logged, never raised onto the beat
+        self.assertIsNot(sm._close_ticket_worker, first)
+
+    def test_an_adopted_ticket_is_refused_and_the_session_told(self):
+        # An adopted block came from the session's own branch name, so honouring
+        # it would let any session close any collected ticket (and get every
+        # session on it killed by the hub's auto-stop). Both the served flag and
+        # the older internal one are refused.
+        for over in ({"adopted": True}, None):
+            with self.subTest(over=over):
+                sm = self.make_manager()
+                sess = self._sess(sm)
+                if over:
+                    sess["ticket"].update(over)
+                else:
+                    sess["ticketAdopted"] = True
+                self.calls.clear()
+                self.notified.clear()
+                self._req()
+                sm._process_close_ticket_requests(now=1000.0)
+                self.assertEqual(self.calls, [])                 # no tracker HTTP at all
+                self.assertFalse(os.path.exists(self._path()))
+                sm._apply_closed_tickets()
+                [r] = sm.ticket_outcome_results
+                self.assertEqual((r["ok"], r["final"]), (False, True))
+                self.assertIn("adopted ticket", r["error"])
+                [(sid, text)] = self.notified
+                self.assertIn("refused: an adopted ticket", text)
+                self.assertNotIn("outcome", sess["ticket"])
+
+    def test_no_comment_is_posted_when_nothing_can_move_it_to_done(self):
+        # The target is resolved first, so a workflow with no edge into Done never
+        # gets an evidence comment on a ticket that stays open — on either try.
+        self.OPTS = self.OPTS[:1]
+        sm = self.make_manager()
+        self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        sm._process_close_ticket_requests(now=1000.0 + ha.CLOSE_TICKET_RETRY_SEC)
+        self.assertEqual(self._comments(), [])
+        self.assertEqual(self._transitions(), [])
+        sm._apply_closed_tickets()
+        self.assertEqual([r["final"] for r in sm.ticket_outcome_results], [False, True])
+
+    def test_a_session_killed_before_the_beat_still_gets_its_outcome(self):
+        # The worker closed the ticket, then the operator killed the session before
+        # the beat applied it: the closed record and its ledger entry get stamped.
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        self._req()
+        sm._process_close_ticket_requests(now=1000.0)
+        rec = dict(sess, status="stopped")
+        sm.registry = []
+        sm.closed = [{"id": "other", "repo": "Turma"}, rec]
+        sm._apply_closed_tickets()
+        self.assertEqual(rec["ticket"]["outcome"], {"kind": "not-reproducible", "at": 1_000_000,
+                                                    "note": "ran repro.sh on main: passes"})
+        self.assertEqual(sm.ticket_ledger[sess["claudeSessionId"]]["outcome"]["kind"],
+                         "not-reproducible")
+        self.assertNotIn("ticket", sm.closed[0])
+
+    def test_staged_results_are_capped(self):
+        sm = self.make_manager()
+        n = ha.TICKET_OUTCOME_RESULTS_MAX + 15
+        for i in range(n):
+            with sm._close_ticket_lock:
+                sm._close_ticket_landed.append({
+                    "sessionId": self.SID, "key": self.KEY, "kind": "done", "ok": False,
+                    "error": f"e{i}", "final": False, "status": None, "at": i})
+            sm._apply_closed_tickets()
+        self.assertEqual(len(sm.ticket_outcome_results), ha.TICKET_OUTCOME_RESULTS_MAX)
+        self.assertEqual(sm.ticket_outcome_results[-1]["error"], f"e{n - 1}")   # newest kept
+
+    def test_an_azure_comment_posts_escaped_html_to_the_work_item(self):
+        seen = []
+
+        def fake_azure(path, params, body=None, method=None, content_type="application/json"):
+            seen.append((path, params, body))
+            return {"fields": {"System.TeamProject": "Proj One"}} if body is None else {}
+        with mock.patch.multiple(ha, AZDO_URL="https://dev.azure.com/org", AZDO_TOKEN="p",
+                                 JIRA_SITE=""), \
+                mock.patch.object(ha, "azure_req", fake_azure):
+            ha.add_board_comment("42", "a <b>\nline two")
+        self.assertEqual(seen[1][0], "/Proj%20One/_apis/wit/workItems/42/comments")
+        self.assertEqual(seen[1][2], {"text": "a &lt;b&gt;<br>line two"})
+
+
+class TestTicketClosingDirectives(ManagerMixin, unittest.TestCase):
+    """XERK-1569: a ticket session is told to close its own ticket — the bug
+    directive and the appended system prompt name the session CLI first; a
+    dsh/qwen session (no CLI yet) is not taught it."""
+
+    CLI = 'python3 -SsE "$TURMA_SESSION_CLI" close-ticket'
+
+    def test_the_bug_directive_closes_a_stale_bug_with_the_cli(self):
+        p = ha.build_ticket_prompt({"key": "P-1", "type": "Bug"})
+        self.assertIn(self.CLI + " not-reproducible --note", p)
+        self.assertIn("else the tracker CLI/MCP this host gives you", p)
+        self.assertIn("end the turn: no PR, no question", p)
+        self.assertNotIn("so it can be closed", p)
+
+    def test_a_runtime_without_the_cli_keeps_the_report_wording(self):
+        p = ha.build_ticket_prompt({"key": "P-1", "type": "Bug"}, session_cli=False)
+        self.assertNotIn("TURMA_SESSION_CLI", p)
+        self.assertIn("so it can be closed", p)
+        self.assertIn("STOP", p)
+
+    def test_the_session_directive_restates_both_rules_for_a_ticket_key(self):
+        sm = self.make_manager()
+        # No branch yet (a deferred reservation) — the key alone is the gate.
+        d = sm._session_directive({"id": "s1", "ticket": {"key": "P-7", "branch": None}})
+        self.assertIn("Closing ticket P-7 is this session's job", d)
+        self.assertIn(self.CLI + " not-reproducible --note", d)
+        self.assertIn(self.CLI + " done --note", d)
+        self.assertNotIn("Name the branch you create", d)
+
+    def test_an_adopted_ticket_is_taught_the_tracker_tool_not_the_cli(self):
+        # The close-ticket reader refuses an adopted block, so the directive must
+        # not teach a CLI the manager then refuses.
+        sm = self.make_manager()
+        for sess in ({"id": "s1", "ticket": {"key": "P-7", "adopted": True}},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "ticketAdopted": True}):
+            with self.subTest(sess=sess):
+                d = sm._session_directive(sess)
+                self.assertNotIn("TURMA_SESSION_CLI", d)
+                self.assertIn("Ticket P-7 was linked to this session", d)
+                self.assertIn("tracker CLI/MCP this host gives you", d)
+
+    def test_no_ticket_or_a_dsh_qwen_session_gets_no_close_paragraph(self):
+        sm = self.make_manager()
+        for sess in ({"id": "s1"}, {"id": "s1", "ticket": None},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "agentType": "dsh"},
+                     {"id": "s1", "ticket": {"key": "P-7"}, "agentType": "qwen"}):
+            with self.subTest(sess=sess):
+                d = sm._session_directive(sess)
+                self.assertNotIn("TURMA_SESSION_CLI", d)
+                self.assertNotIn("Closing ticket", d)
+
+    def test_the_branch_prompt_no_longer_promises_the_first_message(self):
+        self.assertNotIn("whose full text is in your first", ha.TICKET_BRANCH_PROMPT)
+
+
 class TestAnswerQuestion(ManagerMixin, unittest.TestCase):
     """answer_question drops the ask.py bridge's answer file — only when a
     request file is actually pending for that session."""

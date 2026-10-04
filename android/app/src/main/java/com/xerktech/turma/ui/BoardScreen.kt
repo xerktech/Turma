@@ -128,6 +128,9 @@ import com.xerktech.turma.core.overdueOf
 import com.xerktech.turma.core.prioClass
 import com.xerktech.turma.core.rateMaxError
 import com.xerktech.turma.core.splitLabels
+import com.xerktech.turma.core.ticketOutcomeLabel
+import com.xerktech.turma.core.ticketOutcomeOf
+import com.xerktech.turma.core.ticketOutcomeText
 import com.xerktech.turma.core.ticketSessionIndex
 import com.xerktech.turma.core.ticketSessionLabel
 import com.xerktech.turma.core.ticketSessionState
@@ -466,7 +469,9 @@ fun BoardScreen(
             epicRunOf(fleet.epicRuns, site.siteKey, ticket.key)
                 ?.let { epicRunView(it, liveSite, sessionIndex, ticketQueue) }
         } else null
-        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, vm, onDismiss = { detail = null })
+        // A session that closed this ticket itself (XERK-1569) — web's "Closed by" row.
+        val closedBy = ticketOutcomeOf(ticketSessionsOf(sessionIndex, site.siteKey, ticket.key))
+        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, vm, closedBy, onDismiss = { detail = null })
     }
 
     if (filterOpen) {
@@ -780,7 +785,12 @@ private fun TicketCard(
 @Composable
 private fun TicketSessionChip(s: TicketSession, onClick: () -> Unit) {
     val state = ticketSessionState(s)
-    val dot = when (state) {
+    // A session that closed its own ticket (XERK-1569) reads its reason ("not
+    // reproducible", "already fixed", "closed") in the chip's normal ink with a
+    // neutral dot, whatever its run state — web's .kc-sess-closed.
+    // ticketSessionLabel already swaps the label; it fits the name cap.
+    val closed = ticketOutcomeLabel(s.outcome).isNotEmpty()
+    val dot = if (closed) TurmaColors.stopped else when (state) {
         "running" -> TurmaColors.working
         "queued" -> TurmaColors.waiting
         "failed" -> MaterialTheme.colorScheme.error
@@ -805,7 +815,7 @@ private fun TicketSessionChip(s: TicketSession, onClick: () -> Unit) {
             maxLines = 1,
             overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
             modifier = Modifier.widthIn(max = 140.dp),
-            color = if (state == "running") MaterialTheme.colorScheme.onSurface
+            color = if (closed || state == "running") MaterialTheme.colorScheme.onSurface
             else MaterialTheme.colorScheme.onSurfaceVariant,
         )
     }
@@ -1734,6 +1744,7 @@ private fun TicketDetailSheet(
     triageAction: String?,
     epicView: EpicRunView?,
     vm: BoardViewModel,
+    closedBy: TicketSession?,
     onDismiss: () -> Unit,
 ) {
     val siteKey = site.siteKey
@@ -1754,6 +1765,25 @@ private fun TicketDetailSheet(
             }
             Text(t.summary, style = MaterialTheme.typography.titleMedium)
             StatusSection(site, t, detail, vm, onDetailChange = { detail = it })
+            if (closedBy != null) {
+                Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                    SectionLabel("Closed by")
+                    Text(ticketOutcomeText(closedBy), style = MaterialTheme.typography.bodyMedium)
+                    // The session's evidence note — web's .td-outcome-note: three
+                    // lines, the full text a tap away (a phone has no hover).
+                    if (closedBy.outcomeNote.isNotEmpty()) {
+                        var noteOpen by remember(closedBy.outcomeNote) { mutableStateOf(false) }
+                        Text(
+                            closedBy.outcomeNote,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = if (noteOpen) Int.MAX_VALUE else 3,
+                            overflow = androidx.compose.ui.text.style.TextOverflow.Ellipsis,
+                            modifier = Modifier.clickable { noteOpen = !noteOpen },
+                        )
+                    }
+                }
+            }
             // An epic is an organizer: it shows the epic-run panel (Start/progress),
             // not the work-ticket pins (repo/agent/model/runtime), which don't apply.
             if (isEpicTicket(t)) {
