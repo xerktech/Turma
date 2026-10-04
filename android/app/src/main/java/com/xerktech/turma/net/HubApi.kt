@@ -368,6 +368,25 @@ interface HubApi {
         @Body body: kotlinx.serialization.json.JsonObject,
     ): retrofit2.Response<OkResponse>
 
+    // An org's permission-policy TEXT (XERK-1566): what the agent-side permission
+    // judge decides a session's blocked Bash command against. Hub-owned durable
+    // state on its OWN route — never on /api/agents — so the board's editor reads
+    // it here. 200 {ok, text, isDefault, defaultText}; 404 {error} for an org no
+    // host reports.
+    @GET("api/jira/{siteKey}/permission-policy")
+    suspend fun getPermissionPolicy(
+        @Path("siteKey") siteKey: String,
+    ): retrofit2.Response<PermissionPolicyResponse>
+
+    // Set it: {text:"..."} stores the text ("" switches the judge off for the
+    // org), {text:null} drops back to the hub's default. 200 carries what the hub
+    // stored (authoritative); 400/404/413 {error} on a refusal.
+    @POST("api/jira/{siteKey}/permission-policy")
+    suspend fun setPermissionPolicy(
+        @Path("siteKey") siteKey: String,
+        @Body body: kotlinx.serialization.json.JsonObject,
+    ): retrofit2.Response<PermissionPolicyResponse>
+
     // Change a ticket's status and push it to the board (XERK-138) — the one
     // thing Turma writes back. Body: {value:"<transition id / state name>"}
     // from the detail's statusOptions. Needs an online host (it's a write);
@@ -425,6 +444,21 @@ interface HubApi {
     @DELETE("api/devices")
     suspend fun unregisterDevice(@Query("token") token: String): OkResponse
 }
+
+/**
+ * The permission-policy route's answer (XERK-1566). Every field is optional so an
+ * older or partial body degrades rather than throws: an absent [text] reads as
+ * empty and an absent [isDefault] as "the default" — board.html's
+ * `typeof d.text === "string" ? d.text : ""` and `d.isDefault !== false`.
+ */
+@Serializable
+data class PermissionPolicyResponse(
+    val ok: Boolean = false,
+    val text: String? = null,
+    val isDefault: Boolean? = null,
+    val defaultText: String? = null,
+    val error: String = "",
+)
 
 @Serializable
 data class OkResponse(val ok: Boolean = false, val cmdId: String = "", val error: String = "")

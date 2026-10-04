@@ -4,6 +4,8 @@ paths:
   - "agent/tests/test_hub_agent.py"
   - "agent/hooks/permlog.py"
   - "agent/tests/test_permlog.py"
+  - "agent/hooks/guard.py"
+  - "agent/tests/test_guard.py"
 ---
 
 # The permission ledger — agent half (XERK-1563, epic XERK-1560)
@@ -148,9 +150,188 @@ hook-log tail) + `agent/hooks/permlog.py`.
   is bounded (`PERMISSION_OUTBOX_MAX`, oldest dropped, logged). Rows are COPIES; an open row is sent
   again closed under the same `id`, and the hub upserts.
 
+## The permission judge (XERK-1566)
+
+Prompts a human would always approve are judged by an LLM against the org's written policy — on
+the MANAGER, never inside a hook, for **Bash only** (the grant is honoured by guard.py, whose
+matcher is Bash; a classifier-blocked MCP/WebFetch call is retired by the ledger's allow rules).
+Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/qwen request.
+
+- **Hand-off**: permlog.py `--judge`, on a Bash PermissionDenied/PermissionRequest, writes
+  `<sid>.<nonce>.judge.req.json` (the WHOLE command, ≤ `JUDGE_COMMAND_MAX`; the random nonce lets
+  parallel calls not clobber each other) and polls `.judge.ans.json` for at most `JUDGE_WAIT_SEC`
+  (75s, under the hook's 90s timeout). It waits only while `judge.alive` is fresh — the worker
+  re-marks it before each request and model attempt (≤5s throttle) and REMOVES it with no
+  policy, so a stood-down judge costs no wait and a long pass never ages it out.
+  `allow` → `retry: true` (PermissionDenied) or `decision.behavior: allow` (PermissionRequest);
+  stand / no answer / a malformed one → prints nothing. The names are mirrored in hub-agent.py
+  (parity-tested).
+- **A DEDICATED worker** (`_judge_worker_loop`, the `_input_worker_loop` shape; polls every 0.5s,
+  at most `JUDGE_REQS_PER_PASS` a pass, at most `JUDGE_REQS_PER_SID` per session so one that
+  plants request files cannot starve the rest). Each request reads the clock
+  afresh (a pass of serial model calls runs minutes). No model call starts that could end past
+  `ts + JUDGE_ANSWER_BY_SEC` (70s, under the hook's 75s wait) — that request stands — so an `allow`
+  is one the hook read. Never the beat, never the slow-refresh worker — a request
+  behind a gh sweep would blow the hook's deadline. Off with `TURMA_PERMISSION_JUDGE=0` (also drops
+  `--judge` from the hook). `ManagerMixin` patches it off for the suite.
+- **Requests are session-written**: read only via `_read_untrusted_json`, removed once read, name
+  and every field re-validated; anything addressable but unusable (not Bash, not a running Claude
+  session, too old, too long) is answered `stand` so its hook returns at once.
+  - **Picked oldest-first by when the WORKER first saw the file** (`_judge_seen`), never its mtime —
+    `touch -d` would let a session jump the queue.
+  - **A session can plant requests under ANOTHER running session's sid** (the sid is only the
+    filename). So model calls are capped per sid (`JUDGE_CALLS_PER_SID_MIN` a rolling minute;
+    past it a request stands). An allow then grants the named session one exact command the model
+    approved under its policy — the same-uid residual in `agent-hooks.md`, not a new one.
+- **Order**: `judge_never_reason` FIRST (plain gate + never-list below) → `stand`, no model call. Else,
+  with a policy, `claude -p --model haiku --tools "" --strict-mcp-config` (list argv, cwd
+  `REGISTRY_DIR`, no `--settings`, stdin DEVNULL, `JUDGE_TIMEOUT_SEC` 20s, at most
+  `JUDGE_ATTEMPTS`) over `JUDGE_INSTRUCTION` + the policy + the request JSON-encoded as untrusted
+  data.
+- **The judge gets NO tools and NO MCP servers** — its input is ADVERSARIAL (text a session wrote
+  to win an approval) and no guard runs in that process, so an injected instruction must have
+  nothing to call (verified: the init event lists `tools: []`, `mcp_servers: []`). `--tools` is
+  variadic: the boolean `--strict-mcp-config` must sit between it and the prompt.
+- **Only plain commands reach the model** (coordinator decision 2, 2026-10-04): a deny list in
+  front of the model can never be complete against bash (globbed program names `/usr/bin/g[i]t`,
+  `hash -p`, `ln -s` aliases, flags between a noun and its verb, globbed verbs `merg*`). So
+  `_judge_plain_reason` (`_judge_lex`, a strict lexer) runs first and STANDS anything not plain:
+  - (a) only simple commands joined by `;` `&&` `||` `|` or a newline — no subshell, group,
+    function, `&` job, `|&`, process substitution, here-string, any `$` (in a word or a double
+    quote), backtick, or a heredoc body that expands (a quoted-delimiter body is data);
+  - (b) each program word plain (basename `[A-Za-z0-9._+-]+`, unquoted, unescaped, unglobbed),
+    not a shell/interpreter/runner/feeder/keyword (`_JUDGE_PLAIN_RUNNERS`: env, sudo, xargs,
+    `find -exec`, hash, alias, ln, npx, nohup, timeout, watch…), not a name an earlier word of the
+    same command named (written then run); no `PATH`/`GIT_*`/`*_COMMAND`-style assignment; no
+    cp/mv/tee/chmod/redirect into a bin dir or naming a family program;
+  - (b′) rule (b) reaches PAST the program word — a program run from an argument stands too,
+    since its payload is a word the lexer never reads as a command: an argv executor + its verb
+    (`_JUDGE_ARGV_EXECUTORS`: ssh always; docker/podman exec|run, uv/poetry/pipenv/pdm/hatch run,
+    npm/pnpm/yarn exec|dlx|x, bundle exec, nix run, gcloud/vagrant ssh…; `npm`/`cargo`/`go run`
+    of a project script stays judgeable); any unquoted argument or `=`-value that is a shell,
+    runner or interpreter (`--entrypoint=sh`, `rsync -e ssh`); a quoted command line with a
+    shell/runner token, or a runner/executor/interpreter in a command position (`_judge_runs_another`);
+  - (d) no word (or `=`/`,`/`:` part, leading dashes off, case-folded) in `_JUDGE_NEVER_WORDS`
+    (push, merge, delete, rebase, reset, apply, destroy, import, sync, patch, replace, scale,
+    rollout, upgrade, uninstall, graphql, update-ref, symbolic-ref, mirror, force…), no GitHub
+    host outside a `git` command, `install` beside helm, `run` beside a non-gh family program or a
+    gh/glab workflow/ci noun — so (e) no family program ever reaches the model with one.
+  - Pinned: `PLAIN_GATE_PROBES` + `JUDGEABLE` (`test_only_plain_commands_reach_the_model`; npm ci,
+    pytest -q, docker build, cargo test pass). Residual: a script's contents (`npm test`, `./x`
+    written by an EARLIER call) are not on the command line; the model sees only its name.
+  - **Known open gap: XERK-1595** (shipped by operator decision, 2026-10-04). A quoted option value
+    some programs hand to a shell (`tar --to-command`, `make --eval`, `git -c core.sshCommand`, …)
+    reads as plain, so a command hidden there can reach the model. Until it is fixed the model's
+    own reading is the last check; never describe the gate as complete.
+- **The never-list FAILS CLOSED by command FAMILY, never by flag spelling** (coordinator decision,
+  2026-10-04: three review rounds each found one more spelling — `--mirr`, a quoted `'+feat'`, a
+  glob refspec, REST `/merges`, GraphQL `mergePullRequest`, a curl to api.github.com). Stood whole:
+  - ANY `git push` (also `send-pack`/`http-push`/`hub push`) — auto mode already allows pushing a
+    session's own branch, so the judge never needs to approve one;
+  - git ref rewrites: `branch` with any delete/move/copy/force option or prefix, `update-ref`,
+    `symbolic-ref`, `tag -d/-f`, a `remote.*.push|mirror` / `alias.*` config, and any git
+    subcommand not in `_JUDGE_GIT_KNOWN` (an alias defined elsewhere can be `push`); local ones
+    too — `checkout -B`, `switch -C`, `worktree add -B`, a fetch/pull refspec with `:` or a
+    leading `+`, `replace` (`_judge_git_ref_rewrite`); `hub` against git's + hub's known set;
+  - ANY `gh|glab pr|mr merge`; ANY `gh api` with `-f/-F/--field/--raw-field/--input/-X/--method`
+    (any long prefix, any short cluster) and EVERY `graphql` call; `gh repo sync|delete|…`,
+    `release delete`, `workflow run`, any gh `delete`; `az repos pr update|complete`;
+  - ANY gh/glab whose first word is not in `_JUDGE_GH_KNOWN`/`_JUDGE_GLAB_KNOWN`: an alias
+    (`gh m 12`), an extension, `copilot`/`agent-task`/glab `duo`, and `alias`/`extension`
+    themselves — `guard.decide` cannot resolve an alias either, so a grant would allow it;
+  - any curl/wget/http/httpie/xh/Invoke-WebRequest to github.com or api.github.com, AND any whose
+    destination the judge cannot read: from a file or stdin (`curl -K/--config`, `--url @f`,
+    `wget -i/-e/--config`, `aria2c -i`) or no argv token that could be a host at all (a
+    `.curlrc` supplies it) — `_judge_http_reason`;
+  - any HTTP request whose HOST the client would rewrite: every token is matched after
+    `_judge_fold` (percent-decode, NFKC, the U+3002/FF0E/FF61/FE52 dots → `.`, lower-case), so
+    `api%2Egithub%2Ecom` and `api。github。com` are github.com (the raw-text layer matches the
+    folded text too); a host still carrying `%`, non-ASCII, `\` or a curl glob (`{}`/`[]` other
+    than an IPv6 literal) stands; so does a curl `--connect-to`/`--resolve`/`--doh-url` reroute
+    and `-H @file` (a `Host:` header from a file). curl's value options (`-w`, `-H`, `-d`…) are
+    skipped, so `-w '%{http_code}'` is not a host;
+  - any family command FED its arguments from stdin or a file (`_judge_feeder_reason`): guard.py
+    unwraps `printf 'push origin main' | xargs git` to a bare `git`, the subcommand still in
+    stdin. `parallel`/`sem`/`rush` always stand (they read whole command lines); `xargs` and
+    `find`/`fd` with an exec action stand when a word they run is a family program, a shell,
+    `env`/`sudo`-style runner, an interpreter or a `$VAR`, or xargs' program word is its `-I`
+    replace-string;
+  - terraform/tofu apply/destroy/import/state-rm; mutating kubectl/oc (every namespace), helm,
+    argocd; AWS/docker deletes, sudo, pipe-to-shell, Turma's/Claude's own state; the guard's
+    own destructive/policy categories (`_guard_module`; one that cannot load stands everything).
+- **Behind the plain gate, two more layers, either stands.** `_JUDGE_NEVER` matches the RAW text case-insensitively, so a
+  MENTION stands (`python -c "os.system('git push')"`). `_judge_family_reason` reads head +
+  subcommand of every command guard.py's `_expand_both` unwraps (bash -c, eval, xargs, env, sudo,
+  subshells, `$( )`), lower-cased, `.exe` dropped. A segment shlex cannot parse, a too-deep nest,
+  or a program/family word that is a `$VAR` or substitution also stands. Pin every family + the
+  spellings found in `NEVER_FAMILIES` (`test_the_never_list_stands_before_any_model_call`), and
+  the family layer alone (gate + raw off) in `test_the_family_layer_stands_without_the_raw_text_layer`. Never
+  narrow a family back to a list of dangerous flags.
+- **`parse_judge_verdict` is STRICT**: exactly one JSON object (one ``` fence tolerated) with
+  exactly `verdict` (allow|stand) + non-empty `reason`. Anything else retries, then stands.
+- **On allow for a PermissionDenied**: the one-shot grant (`_write_grant`, `GRANTS_DIR/<sid>/
+  <judge_grant_key>`, TTL `JUDGE_GRANT_TTL_SEC` 120s, random-tmp + rename). A PermissionRequest
+  needs none — the hook allows it itself. Grant contract + the accepted same-uid residual:
+  `agent-hooks.md`. `_judge_sweep` drops expired grants, dirs of ended sessions and req/ans files
+  a dead hook left.
+- **GRANTS_DIR and PERMISSIONS_DIR are session-writable, so the manager never follows a link in
+  them** (`_RealDir`): `ln -s ~ ~/.turma/grants` passes the guard and once turned the sweep into
+  an `rm -rf ~`. Each dir is opened `O_DIRECTORY|O_NOFOLLOW` and walked fd-relative (path + lstat
+  on Windows); a link at GRANTS_DIR or a sid dir is UNLINKED (the entry, never its target); the
+  sweep touches only `VALID_PERMISSION_SID_RE` dirs and `_JUDGE_GRANT_FILE_RE` names in them, and
+  NEVER recurses (no rmtree). `_write_grant` writes through the same handles or not at all.
+- **Every judgement is a ledger row** — `kind: judged`, id `j-<sid>-<nonce>`, `verdict`,
+  `judgeReason`, `answer` (allow; a stood classifier block `deny`; a stood dialog `unknown`), staged
+  via `_emit_permission` (lock-guarded) for the beat to ship.
+- **A judge-allowed prompt is NOT a human dialog in the ledger.** permlog.py writes the hand-off's
+  nonce into its OWN ledger line (`judgeNonce`) before waiting; the worker records each `allow`
+  (`_note_judge_allowed`, bounded). The beat's fold (`_judge_was_allowed`) then drops that
+  PermissionRequest row instead of holding it into a `dialog`/`unknown` row, and a PermissionDenied's
+  `classifier-denied` row reads `answer: allow` (re-sent by the worker under the same id if the beat
+  sent the deny first; one lock spans each side's check and emit, so the allow lands last). The
+  nonce only ever HIDES a row the judge itself allowed — never approves anything.
+- **Policy text is hub-owned** (`turma-permissions.md`): `permissionPolicy` rides every heartbeat
+  reply; `_ingest_permission_policy` keeps it in memory for the worker and renders
+  `~/.turma/permission-policy.md` on change. A reply without one FORGETS it (judge stands down);
+  an empty text is the operator's off switch for that org.
+
 ## Tests
 
 `test_permlog.py` (event shapes — the REAL PermissionRequest one, bounds, fail-open incl.
-FIFO/symlink, rotation, `-SsE`); `TestPermissionLedgerEdges` + `TestPermissionLogTail`
-(`test_hub_agent.py`); the `test_guard_settings.py` pins (deny equality, every-hook-event `-SsE`, the
-PreToolUse matcher list).
+FIFO/symlink, rotation, `-SsE`, the judge req/ans dance); `TestPermissionLedgerEdges` +
+`TestPermissionLogTail` + `TestPermissionJudge` (`test_hub_agent.py`: incl. the symlinked
+grants/permissions dir cases, pick order, the per-sid call cap, and the REAL `run_forever` loop
+feeding `permissionPolicy` from both replies); the `test_guard_settings.py`
+pins (deny equality, every-hook-event `-SsE`, the PreToolUse matcher list, `--judge` wiring).
+
+## The judge's one-shot grant (guard.py)
+
+- **The judge's one-shot grant is guard.py's ONLY `allow`** (XERK-1566, `consume_grant`). Consulted
+  only AFTER `decide()` allowed the command (every hard deny wins), only for Bash, inside main()'s
+  fail-CLOSED try. `~/.turma/grants/<TURMA_SESSION_ID>/<sha256(command)>` must be a regular file
+  (`O_NONBLOCK|O_NOFOLLOW`, bounded; the session dir not a symlink) naming this session + exact
+  command, unexpired (`exp` at most `GRANT_TTL_MAX_SEC` out). Unlinked BEFORE allowing, so one
+  grant allows one call. Honoured ONLY by a guard launched with `--grants`, which
+  `build_guard_settings` adds while the judge is on — the switch rides each launch's settings, since
+  a session's env comes from the long-lived tmux server, not the manager. A session launched before
+  `TURMA_PERMISSION_JUDGE=0` keeps the flag until relaunched (the judge then writes no grant).
+  - **Accepted residual: the grant dir is same-uid and Bash can write it.** A model that learns the
+    protocol can self-grant one command past the auto-mode classifier — or drop a judge answer that
+    makes permlog.py allow a PermissionRequest dialog — the same class as `echo >
+    ~/.turma/qwen-guard.json`. Mitigations, none sealing it: `Edit(~/.turma/grants/**)` and
+    `Edit(~/.turma/permission-policy.md)` denies (file tools only, in the equality pin); the grant
+    path/protocol is never named in any reason or prompt a model reads; every judgement is a ledger
+    row (`kind: judged`); the hard denies still win; the never-list stands any command naming
+    `.turma/grants`. Never describe the judge as un-forgeable. A session can also plant a request
+    under ANOTHER running session's sid (capped per sid, `agent-permissions.md`); the manager
+    never follows a link in the grant dir it sweeps.
+  - **Before any model call the judge stands non-plain commands and never-list FAMILIES** (any push,
+    ref rewrite, PR merge, non-read `gh api`, prod mutators), matched AFTER guard.py's `_expand_both`
+    unwrapping, so a change to that unwrapping changes what the judge sees. Rules + tests: the
+    never-list and plain-command sections above. Never describe the gate as complete.
+  - **Real-host spike NOT run** (no agent host here): does `PermissionDenied`'s `retry: true`
+    re-enter `PreToolUse` on the retried call, with the grant honoured? And what does the TUI show
+    for a classifier block? If the retry never reaches guard.py, the grant goes unconsumed, expires
+    (120s) and is swept; the classifier blocks again — nothing runs that did not before. The
+    fallback is then the PermissionRequest path alone plus the ledger's allow rules. Record the
+    answers here. Tests: `TestJudgeGrants` (`test_guard.py`).

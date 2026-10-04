@@ -230,6 +230,7 @@
   }
   .perm-kind.k-classifier-denied { color: var(--critical); border-color: currentColor; background: transparent; }
   .perm-kind.k-ask-in-chat { color: var(--warning); border-color: currentColor; background: transparent; }
+  .perm-kind.k-judged { color: var(--accent); border-color: currentColor; background: transparent; }
   /* A subject is prose (an ask's question) unless it is a command or tool name:
      prose wraps at word boundaries; only `.cmd` may break mid-token, and only
      where the token would otherwise overflow. */
@@ -1652,7 +1653,9 @@ function mergeSnapshot(body, since) {
 const $perms = document.getElementById("permissions");
 const PERM_DAYS = 7;
 const PERM_REFRESH_MS = 60000;
-const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat" };
+// `judged` (XERK-1566): the agent's permission judge decided a Bash prompt.
+const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat",
+  judged: "Judged" };
 let permView = null;
 let permLoadError = null;
 let permFetchSeq = 0;
@@ -1810,6 +1813,11 @@ function permissionsCardHtml(view, now, recentOpen = false, loadError = null) {
     if (typeof r.waitedMs === "number") parts.push(`waited ${permWait(r.waitedMs)}`);
     else if (!r.closedAt && !r.answer) parts.push("still open");
     if (r.answer && r.kind !== "ask-in-chat") parts.push(r.answer);
+    // A judged row says what the permission judge decided, and why (XERK-1566).
+    if (r.kind === "judged" && (r.verdict === "allow" || r.verdict === "stand")) {
+      const why = typeof r.judgeReason === "string" && r.judgeReason ? ` — ${r.judgeReason}` : "";
+      parts.push(`judge: ${r.verdict}${why}`);
+    }
     // Host, wait and age ride ONE group, host first, so the host sits in the
     // same place on every row (on a phone: the start of the second line).
     const meta = [r.host, parts.join(" · "), ago].filter(Boolean)

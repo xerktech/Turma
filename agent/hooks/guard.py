@@ -47,7 +47,10 @@ Contract (Claude Code ``PreToolUse`` hook):
   deny   — print ``{"hookSpecificOutput": {"hookEventName": "PreToolUse",
            "permissionDecision": "deny", "permissionDecisionReason": ...}}``
            and exit 0. The reason is fed back to the model.
-  allow  — exit 0 with no output.
+  allow  — exit 0 with no output. The one exception is a consumed permission
+           judge grant (XERK-1566, ``consume_grant``): an explicit
+           ``permissionDecision: allow``, emitted only for a command every
+           check above already allowed.
 
 Stdlib only: this file is invoked by absolute path with the session's worktree
 as cwd, so it cannot rely on any package being importable.
@@ -57,6 +60,7 @@ from __future__ import annotations
 
 import fnmatch
 import functools
+import hashlib
 import json
 import os
 import posixpath
@@ -64,6 +68,7 @@ import re
 import shlex
 import stat
 import sys
+import time
 
 # --- command segmentation ------------------------------------------------
 
@@ -3553,7 +3558,117 @@ def decide(
     return ("allow", None, None)
 
 
+# --- the permission judge's one-shot grants (XERK-1566) --------------------
+#
+# The manager's permission judge (hub-agent.py) may approve a Bash call the
+# auto-mode classifier blocked. It writes a ONE-SHOT grant under
+# `~/.turma/grants/<session id>/<sha256 of the command>`; on the retried call
+# this hook consumes it and emits `allow`, which overrides the classifier. It is
+# consulted ONLY after decide() allowed the command, so every hard deny above
+# still wins, and a grant is never a reason to skip a check.
+#
+# The directory is same-uid and Bash can write it (the documented ~/.turma
+# residual, .claude/rules/agent-hooks.md), so this read is defensive rather than
+# trusting: O_NONBLOCK + O_NOFOLLOW + regular-file only + bounded (a FIFO planted
+# at the path would hang the hook, and Claude Code lets a timed-out hook's
+# command THROUGH); the grant must name this session and this exact command and
+# be unexpired. Consumed by unlink BEFORE it allows: of two racing calls that
+# both read it, only the one whose unlink succeeded is allowed.
+
+GRANT_SID_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}$")
+GRANT_MAX_BYTES = 4096
+# The judge writes a 120s TTL; a grant claiming a longer life was not written
+# by the judge, and is ignored rather than honoured for longer.
+GRANT_TTL_MAX_SEC = 300
+GRANT_REASON_MAX = 300
+
+
+def grant_key(command: str) -> str:
+    """The file name a grant for this exact command lives under. The judge
+    (hub-agent.py `judge_grant_key`) computes the same — parity-tested."""
+    return hashlib.sha256(command.encode("utf-8", "surrogatepass")).hexdigest()
+
+
+# The argv flag the manager's `build_guard_settings` adds to this hook's command
+# only while the permission judge is on. Without it no grant is ever honoured:
+# the switch rides each session's own settings (written per launch), not an env
+# var the long-lived tmux server would keep from whenever it started.
+GRANTS_FLAG = "--grants"
+
+
+def _grants_dir() -> str:
+    return os.path.join(os.path.expanduser("~"), ".turma", "grants")
+
+
+def consume_grant(session_id, command, *, grants_dir=None, now=None):
+    """The judge's reason when an unexpired grant for exactly this session and
+    command exists — consuming it — else None. Never raises on anything the
+    filesystem or a planted file can do: it runs inside main()'s fail-CLOSED
+    try, where an exception would refuse an ordinary command."""
+    if not isinstance(session_id, str) or not GRANT_SID_RE.match(session_id) \
+            or session_id in (".", ".."):
+        return None
+    if not isinstance(command, str) or not command:
+        return None
+    sdir = os.path.join(grants_dir or _grants_dir(), session_id)
+    try:
+        if not stat.S_ISDIR(os.lstat(sdir).st_mode):
+            return None                 # a symlinked dir is not the judge's
+    except (OSError, ValueError):
+        return None                     # absent: the common case
+    key = grant_key(command)
+    path = os.path.join(sdir, key)
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except (OSError, ValueError):
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            return None
+        blob = os.read(fd, GRANT_MAX_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+    if len(blob) > GRANT_MAX_BYTES:
+        return None
+    try:
+        data = json.loads(blob.decode("utf-8"))
+    except (ValueError, RecursionError):
+        return None
+    if not isinstance(data, dict) or data.get("key") != key or data.get("sid") != session_id:
+        return None
+    exp = data.get("exp")
+    now = time.time() if now is None else now
+    if isinstance(exp, bool) or not isinstance(exp, (int, float)) \
+            or not now < exp <= now + GRANT_TTL_MAX_SEC:
+        return None
+    try:
+        os.unlink(path)
+    except OSError:
+        return None                     # another call consumed it first
+    reason = data.get("reason")
+    reason = " ".join(reason.split()) if isinstance(reason, str) else ""
+    return reason[:GRANT_REASON_MAX] or "the operator's permission policy covers it"
+
+
 # --- hook entrypoint -----------------------------------------------------
+
+
+def _emit_allow(reason: str) -> None:
+    """The only allow a Turma hook emits (XERK-1566): a consumed judge grant.
+    It overrides the auto-mode classifier for this one call."""
+    payload = {
+        "hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "allow",
+            "permissionDecisionReason":
+                f"Approved by the operator's permission policy: {reason}",
+        }
+    }
+    sys.stdout.write(json.dumps(payload))
+    sys.stdout.flush()
 
 
 def _emit_deny(reason: str) -> None:
@@ -3569,6 +3684,9 @@ def _emit_deny(reason: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv if argv is None else argv
+    grants_on = GRANTS_FLAG in argv[1:] \
+        and os.environ.get("TURMA_PERMISSION_JUDGE", "1") != "0"
     try:
         raw = sys.stdin.read()
         event = json.loads(raw) if raw.strip() else {}
@@ -3595,6 +3713,15 @@ def main(argv: list[str] | None = None) -> int:
             pr_summary=pr_summary,
             cwd=cwd,
         )
+        granted = None
+        # A judge grant (XERK-1566) is consulted only once decide() ALLOWED the
+        # command — every hard deny wins — and only for Bash, the one tool this
+        # hook's matcher covers. Inside this fail-closed try on purpose. Only
+        # when this session was launched with the judge on (GRANTS_FLAG).
+        if grants_on and decision == "allow" and tool_name == "Bash" \
+                and isinstance(tool_input, dict):
+            granted = consume_grant(os.environ.get("TURMA_SESSION_ID"),
+                                    tool_input.get("command"))
     except Exception as exc:  # noqa: BLE001 - any classifier bug
         # Fail CLOSED here, unlike a malformed event above: a traceback exits 1,
         # which Claude Code treats as non-blocking, so a crash on one segment
@@ -3607,6 +3734,8 @@ def main(argv: list[str] | None = None) -> int:
         )
     if decision == "deny" and reason:
         _emit_deny(reason)
+    elif decision == "allow" and granted:
+        _emit_allow(granted)
     return 0
 
 

@@ -56,6 +56,8 @@ Mirrors the glasses pure-core/adapter-shell split:
 - Org filter/board pins/tinting: `data/OrgFilter.kt` + `ui/OrgControl.kt` + `core/Board.kt`
   (`orgColorMap`, `FleetState.orgColors`, `TurmaCard(tint=)`), tested in `BoardTest.kt` alongside
   `hostOptions`/`agentPinOf`/`modelPinOf`/`statusChangeable`/`autoStartOn`.
+- Permission policy editor (XERK-1566): `PermissionPolicySheet` in `ui/BoardScreen.kt` (a labelled
+  item in `ScreenHeader`'s ⋮ `menuItems`, never a header icon — one crowded the org filter), state in `BoardViewModel.permission`, its own route — never `/api/agents`.
 - Create-ticket parity: ＋ in `ScreenHeader` → `CreateTicketSheet`; `source` on
   `JiraBlock`/`BoardSite`, endpoints in `net/HubApi.kt`, ports in `core/Board.kt`. A `409` agent-gap
   refusal reads via `hubError()`.

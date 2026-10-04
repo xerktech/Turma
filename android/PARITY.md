@@ -697,6 +697,31 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - Tests: `core/BoardTest.kt` (`epicBuilderRows`/label/terminal cases), `model/AgentDecodeTest.kt`
   (the `epicBuilders` decode + tolerance case).
 
+## Done (XERK-1566 — permission policy editor)
+
+- **Android has the board's permission policy editor** (web `permissionRules*` panel in
+  `board.html`): the per-org text the agent's permission judge decides a blocked Bash command
+  against.
+  - **Its OWN route, never `/api/agents`** — `HubApi.getPermissionPolicy`/`setPermissionPolicy` →
+    `GET|POST /api/jira/<site>/permission-policy`, read into `PermissionPolicyResponse` (every field
+    optional: absent `text` = "", absent `isDefault` = the default, as the web reads them). Nothing on
+    the fleet payload changed, so the atomic decode is untouched.
+  - **`PermissionPolicySheet`** (a labelled "Permission policy" item in the header's ⋮ overflow —
+    the web folds it behind its ⋯ menu; a header icon squeezed the org filter to "…" on a phone —
+    shown only with a reporting org — the web panel bails with no `policySites`): the org picker, the
+    web's note wording with the status on its own line, a 16000-character field (`PERMISSION_POLICY_MAX`, the hub's limit), **Use
+    default** (`{text:null}`, off while already default), Cancel, **Save policy** (`{text}`; "" turns
+    the judge off for the org). State lives in `BoardViewModel.permission`.
+  - **No optimistic success**: only the hub's 200 changes the sheet (it shows what the hub stored); a
+    refusal shows the hub's own words (`hubErrorMessage`, XERK-264) and keeps the operator's edit. Save
+    waits for a successful load, so a failed GET is never saved over the org's real text (the web
+    leaves Save live after a failed load — Android is deliberately stricter there).
+- **Platform-form notes:** a modal sheet vs the web's narrow panel, and a successful Save closes it
+  (the triage sheet's pattern) where the web panel stays open — same wire calls, same semantics.
+- Tests: `ui/BoardPermissionPolicyTest.kt` (load, save, refused save keeps the edit, Use default,
+  absent fields, refused load blocks Save, org-less board has no button — Robolectric over
+  MockWebServer), `vm/PermissionPolicyResultTest.kt` (the response reading).
+
 ## Open (subsequent installments), by screen and priority
 
 Many of these need Android's wire model (`model/Models.kt`) to decode fields the web already renders;
@@ -904,6 +929,8 @@ those are marked `[MODEL]`.
   recent list) reads its own route, `GET /api/permissions`, not `/api/agents` — so nothing on the
   fleet payload changed and Android's atomic decode is untouched. It is a web-only operator tuning
   view for now; the Android screen is a later XERK-1560 child (XERK-1576).
+  - The permission judge's rows (XERK-1566) land on the same web card as a `Judged` kind with the
+    judge's verdict + reason; they ride the same route, so Android is equally untouched.
 - P2 **Table-view state persistence (XERK-31).** The web keeps the usage table open + the page put
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 

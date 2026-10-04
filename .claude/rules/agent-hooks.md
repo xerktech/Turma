@@ -415,3 +415,7 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   the file guard); RECORDS one line per event to `~/.turma/permissions/<sid>.jsonl`, decides nothing,
   fails open on everything, `-SsE` like every hook, wired only when the script exists. Its dir is
   `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `agent-permissions.md`.
+  - With `--judge` (XERK-1566, unless `TURMA_PERMISSION_JUDGE=0`) it also hands a Bash call to the
+    manager's permission judge and waits (timeout 90s); judge contract in `agent-permissions.md`.
+- **The judge's one-shot grant is guard.py's ONLY `allow`** (XERK-1566, `consume_grant`, `--grants`):
+  the grant contract, the same-uid residual and the judge's gate live in `agent-permissions.md`.
