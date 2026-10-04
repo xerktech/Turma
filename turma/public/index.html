@@ -1161,10 +1161,14 @@ function needsYou(sess) {
 // How long the hub says a needs-you session has waited (XERK-1571): "for 31m"
 // off the attention `since`. It is the ONE age a stalled or needs-you card
 // shows — the transcript's "last write" beside it read as a second, different
-// stall length. "" when the hub serves none.
-function attentionFor(att, now) {
+// stall length. Glued by a no-break space, like sessions.html's why line, so a
+// narrow card never leaves "31m" alone on a line. "" when the hub serves none.
+// `state`, when given, must be the one served: a question card shows the
+// question's age, never a review's the hub has not caught up from.
+function attentionFor(att, now, state) {
   if (!att || !NEEDS_YOU_CHIP[att.state] || !Number.isSafeInteger(att.since)) return "";
-  return "for " + ago(now - att.since).replace(/ ago$/, "");
+  if (state && att.state !== state) return "";
+  return "for\u00a0" + ago(now - att.since).replace(/ ago$/, "");
 }
 // "💤 sleeping until 14:05 · check CI" — a session-CLI wake and, when the
 // session gave one, what it will check then. Same as sessions.html.
@@ -1194,6 +1198,13 @@ function backgroundWait(rows, lastWrite, now) {
 }
 // "waiting · Sleep · 12m left" / "waiting · Watch CI" / "waiting on 2 background
 // shells", "stalled …" once stalled. Same as sessions.html.
+// When the oldest wait row started (its `startedAt`), or null.
+function waitStarted(rows, now) {
+  let started = null;
+  for (const a of (Array.isArray(rows) ? rows : []).filter(isWaitRow))
+    if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
+  return started;
+}
 function backgroundWaitLabel(rows, wait, now) {
   const waits = (Array.isArray(rows) ? rows : []).filter(isWaitRow);
   const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
@@ -1205,9 +1216,7 @@ function backgroundWaitLabel(rows, wait, now) {
   // a STALL: how long it has been stalled is the hub's attention `since`, which
   // the card's State row shows; a second, different age here read as two stall
   // lengths for one session.
-  let started = null;
-  for (const a of waits)
-    if (Number.isSafeInteger(a.startedAt) && a.startedAt <= now && (started == null || a.startedAt < started)) started = a.startedAt;
+  const started = waitStarted(waits, now);
   const since = started == null || wait.state === "stalled" ? "" : " · " + ago(now - started).replace(/ ago$/, "");
   if (what) return word + what + since;
   return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s") + since;
@@ -1220,8 +1229,11 @@ function liveState(sess, host, now) {
   // before Claude Code has written a transcript, so `transcriptAgeSec == null`
   // and the card read "no transcript yet": the question was invisible on the
   // Dashboard while the Sessions page showed it correctly (XERK-235).
+  // Both carry how long they have waited (XERK-1571), the hub's `since` — the
+  // age every other needs-you card's State row has, and the Sessions page's.
   if (s && s.question)
-    return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true };
+    return { label: "waiting for your answer", cls: "sess-wait", question: s.question, busy: true,
+             detail: attentionFor(sess.attention, now, "needs-you:question") };
   // A blocking TUI dialog (tool permission / plan approval) is the same thing
   // for the operator, and MUST be checked before the working read: while one is
   // up the pane shows no interrupt hint, so paneBusy reads false and the
@@ -1232,7 +1244,8 @@ function liveState(sess, host, now) {
   // sessions.html.
   if (s && s.panePrompt && s.panePrompt.prompt)
     return { label: "waiting for your permission", cls: "sess-wait",
-             ask: permissionAsk(sess), busy: true };
+             ask: permissionAsk(sess), busy: true,
+             detail: attentionFor(sess.attention, now, "needs-you:permission") };
   if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   // Background agents, which paneBusy cannot see: a session that delegated work
@@ -1256,8 +1269,14 @@ function liveState(sess, host, now) {
   // Every live row is a wait: holding, or stalled past its ETA / too long silent.
   // Same rule and wording as sessions.html (and the hub's sessionWait).
   const wait = host.online ? backgroundWait(s.agents, now - age, now) : null;
-  if (wait && wait.state === "waiting")
-    return { label: backgroundWaitLabel(s.agents, wait, now), cls: "sess-holding", detail: "last write " + ago(age) };
+  // A wait with no ETA ahead already says how long it has waited ("· 12m"), so
+  // it shows no "last write" beside it — two ages on one card read as two clocks
+  // for one wait (XERK-1571), the same thing a stall's one age fixed.
+  if (wait && wait.state === "waiting") {
+    const ownAge = !(wait.eta != null && wait.eta > now) && waitStarted(s.agents, now) != null;
+    return { label: backgroundWaitLabel(s.agents, wait, now), cls: "sess-holding",
+             detail: ownAge ? "" : "last write " + ago(age) };
+  }
   // A stall shows ONE age (XERK-1571): how long it has been stalled, the hub's
   // attention `since` ("for 31m") — never the transcript's last write beside it,
   // a different number that read as a second stall length. An older hub serves

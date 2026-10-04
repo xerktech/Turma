@@ -76,6 +76,10 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   State row and Android's Fleet card, "stalled 31m" on the review card's why line). The dashboard's
   "last write" beside it read as a second, different stall length; it stays only for an older hub
   serving no attention. A stalled wait LABEL carries no start age either.
+- **Every needs-you fleet card's State row carries that age**, a question/permission card too
+  ("waiting for your answer · for 22m") — only when the served state IS that question/permission,
+  never a lagging review's age. A wait with no ETA ahead shows its own start age ("· 12m") and NO
+  "last write" beside it; a timed wait's "11m left" is not an age, so its last write stays.
 - **Permission `why` is the pending COMMAND, not the dialog's question** (`permissionWhy`): the
   question is nearly always "Do you want to proceed?", so a leading dialog title + next line of
   `panePrompt.detail` becomes "Bash: touch /tmp/x" (first line alone if no title; capped at 120).

@@ -242,20 +242,20 @@ class SessionsTest {
     }
 
     @Test fun `attentionFor is the one age a needs-you fleet card shows`() {
-        assertEquals("for 31m", attentionFor(att("needs-you:stalled", now - 31 * 60_000L), now))
+        assertEquals("for\u00A031m", attentionFor(att("needs-you:stalled", now - 31 * 60_000L), now))
         assertEquals("", attentionFor(att("needs-you:stalled", null), now))
         assertEquals("", attentionFor(att("waiting", now - 60_000L), now))
         assertEquals("", attentionFor(null, now))
     }
 
     @Test fun `attentionWhy says why and for how long`() {
-        assertEquals("PR open · CI passing · waiting 12m",
+        assertEquals("PR open · CI passing · waiting\u00A012m",
             attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
         // A question/permission already reads "waiting"; a stall says it stalled.
-        assertEquals("Ship it? · for 3m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
-        assertEquals("Bash: rm -rf build · for 3m",
+        assertEquals("Ship it? · for\u00A03m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("Bash: rm -rf build · for\u00A03m",
             attentionWhy(att("needs-you:permission", now - 3 * 60_000L, "Bash: rm -rf build"), now))
-        assertEquals("stalled 3m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
+        assertEquals("stalled\u00A03m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
         assertEquals("", attentionWhy(att("working", now), now))
         assertEquals("", attentionWhy(null, now))
     }

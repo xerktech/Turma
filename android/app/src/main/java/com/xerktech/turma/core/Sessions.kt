@@ -182,12 +182,13 @@ fun inReview(
 /**
  * How long the hub says a needs-you session has waited, for a fleet card's State
  * row (XERK-1571, web index.html `attentionFor`): "for 31m" off the attention
- * `since` — the ONE age a stalled card shows. "" when there is none.
+ * `since` — the ONE age a stalled card shows. The age is glued to its word by a
+ * no-break space, as on the web, so "31m" never wraps alone. "" when there is none.
  */
 fun attentionFor(att: Attention?, now: Long): String {
     val since = att?.since ?: return ""
     if (needsYouChip(att.state) == null) return ""
-    return "for ${waitLeftText(now - since)}"
+    return "for\u00A0${waitLeftText(now - since)}"
 }
 
 /**
@@ -216,7 +217,7 @@ fun attentionWhy(att: Attention?, now: Long): String {
             "needs-you:question", "needs-you:permission" -> "for"
             else -> "waiting"
         }
-        bits.add("$word ${waitLeftText(now - it)}")
+        bits.add("$word\u00A0${waitLeftText(now - it)}")
     }
     return bits.joinToString(" · ")
 }
