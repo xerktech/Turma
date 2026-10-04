@@ -233,6 +233,19 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 - **Never a sleeper someone is talking to**: a queued `SLEEPER_PANE_COMMANDS` command for it
   (`input`, `answerQuestion`, `setModel`, ...) skips it. The kill would land before the text is
   typed, and the composer already showed the message as sent. The agent checks its own queue too.
+- **Never one the operator is stopping**: a queued `kill`/`delete` for it (`sleeperHasQueuedStop`,
+  `SLEEPER_STOP_COMMANDS`) skips the pause, and skips its paused record in `wakePausedSleepers`
+  (neither woken nor unpaused — the agent's Kill ends the pause). The agent pre-scans its batch the
+  same way. Paused first, the Kill found no session and the hub woke the record at its wake.
+- **Kill and Delete reach a paused record**: the routes queue for any id (no running check), and
+  the agent applies them to the closed record (`agent-session-cli.md`). Both also withdraw an
+  UNDELIVERED wake `resume` for that id (`withdrawSleeperWake`); a delivered one is left.
+- **A paused card can be stopped for good**: Kill beside Resume now on the dashboard
+  `pausedCard` (`pausedKill`, `twoClick` arm/confirm, a `kill` pending flagged `paused` that clears
+  once the host stops reporting it paused), the Sessions page Paused row (`pausedKill`, arm then
+  confirm, pending kind `pausedKill`), and Android's `PausedCard` + Paused row
+  (`FleetViewModel.killPaused`, pending `killPaused`). It ends as an ordinary killed session in
+  Ended. Glasses shows no control.
 - **An operator Resume on a paused row holds off re-pausing until that wake**
   (`sleeperResumeHold`, set by the resume route): the carried wake makes it a sleeper again, and
   the next drain would otherwise pause it while the operator reads it.

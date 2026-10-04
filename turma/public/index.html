@@ -711,6 +711,11 @@ function reconcilePending(agents) {
       if (a && (a.tokenBound === true ||
                 (p.startedAt != null && a.startedAt != null && a.startedAt !== p.startedAt)))
         pending.delete(key);
+    } else if (p.kind === "kill" && p.paused) {
+      // A paused sleeper's Kill (XERK-1575) has no live session to vanish: done
+      // once the host stops reporting it paused (an ordinary killed record).
+      const a = byHost.get(p.host);
+      if (!a || !pausedSleepers(a).some(c => c.id === p.id)) pending.delete(key);
     } else {
       const s = index.get(p.host + "::" + p.id);
       // kill now removes the record entirely (keeping only the branch), so like
@@ -2082,19 +2087,33 @@ function sessCard(a, s, now) {
 // A sleeper the hub paused to free its slot (XERK-1575): ended for now, but the
 // hub resumes it at its wake, so it keeps a card in its repo — reading asleep in
 // the same muted tone as the sleeping label it had while running — instead of
-// vanishing as if killed. Resume now brings it back early; nothing else applies.
+// vanishing as if killed. Resume now brings it back early; Kill stops it for
+// good (an ordinary killed session in ended history that never wakes), armed and
+// confirmed like a running card's Kill.
 // Its State is the wake alone, no "paused Ns ago" age: it is waiting, not
 // history — the same line the Sessions page's Paused row shows.
 function pausedCard(a, c, now) {
   const rp = pending.has(pendKey("resume", a.key, c.id));
+  const killing = pending.has(pendKey("kill", a.key, c.id));
+  const kKey = "sk::" + a.key + "::" + c.id;
   const prs = (c.prs && c.prs.length)
     ? `<dt>PRs</dt><dd class="pr-list">${c.prs.map(prBadgeHtml).join("")}</dd>` : "";
-  return `<div class="sess paused">
+  const actions = killing
+    ? `<button class="btn-sm" disabled><span class="spin"></span> Killing…</button>`
+    : `<button class="btn-sm" ${a.online && !rp ? "" : "disabled"}
+        title="${esc(a.online ? "Resume now, before its wake" : "Host offline")}"
+        onclick="resumeSession('${escJs(a.key)}','${escJs(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume now"}</button>` +
+      `<button class="btn-sm ${confirming.has(kKey) ? "confirm" : ""}" ${rp ? "disabled" : ""}
+        title="Stop it for good: it will not wake"
+        onclick="pausedKill('${escJs(a.key)}','${escJs(c.id)}')">${confirming.has(kKey) ? "Confirm kill" : "Kill"}</button>`;
+  return `<div class="sess paused${killing ? " killing" : ""}">
     <div class="sess-hd">
       <span class="sid">${esc(c.id)}</span>
       ${c.summary ? `<span class="sess-summary">${esc(c.summary)}</span>` : ""}
       ${c.label ? `<span class="sess-label" title="session label">${esc(c.label)}</span>` : ""}
-      <span class="badge paused">paused</span>
+      ${killing
+        ? `<span class="badge stopping"><span class="spin"></span> stopping</span>`
+        : `<span class="badge paused">paused</span>`}
     </div>
     <dl>
       ${c.root
@@ -2103,11 +2122,7 @@ function pausedCard(a, c, now) {
       <dt>State</dt><dd><b class="sess-holding">${esc(pausedLabel(c.paused, now))}</b></dd>
       ${prs}
     </dl>
-    <div class="sess-actions">
-      <button class="btn-sm" ${a.online && !rp ? "" : "disabled"}
-        title="${esc(a.online ? "Resume now, before its wake" : "Host offline")}"
-        onclick="resumeSession('${escJs(a.key)}','${escJs(c.id)}')">${rp ? '<span class="spin"></span> Resuming…' : "Resume now"}</button>
-    </div>
+    <div class="sess-actions">${actions}</div>
   </div>`;
 }
 
@@ -2374,6 +2389,14 @@ function sessRestart(key, id) {
 }
 function sessKill(key, id) {
   twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id), { kind: "kill", host: key, id },
+    () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill")));
+}
+// Kill a paused sleeper (XERK-1575): the same route and arm/confirm as a running
+// card's Kill. The agent drops the pause, so it ends as an ordinary killed session
+// that never wakes; the pending row clears once the host stops reporting it paused.
+function pausedKill(key, id) {
+  twoClick("sk::" + key + "::" + id, () => busy(pendKey("kill", key, id),
+    { kind: "kill", paused: true, host: key, id },
     () => post(`/api/agents/${enc(key)}/sessions/${enc(id)}/kill`, null, "Kill")));
 }
 function sessDelete(key, id) {

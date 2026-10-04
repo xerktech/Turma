@@ -180,6 +180,7 @@ fun FleetScreen(
                         onSessionActions = { host, s -> actionsFor = host to s },
                         onCancelQueued = { host, s -> vm.kill(host, s.id) },
                         onResumePaused = { host, c -> vm.resume(host, c.id) },
+                        onKillPaused = { host, c -> vm.killPaused(host, c.id) },
                     )
                 }
             }
@@ -280,6 +281,7 @@ private fun HostSection(
     onSessionActions: (String, SessionInfo) -> Unit,
     onCancelQueued: (String, SessionInfo) -> Unit,
     onResumePaused: (String, com.xerktech.turma.model.ClosedSessionInfo) -> Unit = { _, _ -> },
+    onKillPaused: (String, com.xerktech.turma.model.ClosedSessionInfo) -> Unit = { _, _ -> },
 ) {
     TurmaCard(Modifier.fillMaxWidth(), tint = orgTint) {
         Column(Modifier.fillMaxWidth()) {
@@ -378,6 +380,7 @@ private fun HostSection(
                             onSessionActions = { s -> onSessionActions(agent.key, s) },
                             onCancelQueued = { s -> onCancelQueued(agent.key, s) },
                             onResumePaused = { c -> onResumePaused(agent.key, c) },
+                            onKillPaused = { c -> onKillPaused(agent.key, c) },
                             hostOnline = agent.online,
                         )
                     }
@@ -404,6 +407,7 @@ private fun RepoSection(
     paused: List<com.xerktech.turma.model.ClosedSessionInfo> = emptyList(),
     onResumePaused: (com.xerktech.turma.model.ClosedSessionInfo) -> Unit = {},
     hostOnline: Boolean = true,
+    onKillPaused: (com.xerktech.turma.model.ClosedSessionInfo) -> Unit = {},
 ) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
         Row(
@@ -441,6 +445,7 @@ private fun RepoSection(
                     pendingKind = FleetViewModel.sessPending(pending, hostKey, c.id),
                     canResume = hostOnline,
                     onResume = { onResumePaused(c) },
+                    onKill = { onKillPaused(c) },
                 )
             }
         }
@@ -451,7 +456,9 @@ private fun RepoSection(
  * A sleeper the hub paused to free its slot (XERK-1575) — web index.html
  * `pausedCard`. Ended for now, but resumed by the hub at its wake, so it keeps a
  * card in its repo, reading asleep (the HOLDING dot and muted label a sleeping
- * session has) rather than vanishing as if killed. Its one action resumes it early.
+ * session has) rather than vanishing as if killed. Resume now brings it back
+ * early; Kill (arm, then confirm) stops it for good — an ordinary killed session
+ * that never wakes.
  */
 @Composable
 private fun PausedCard(
@@ -460,7 +467,10 @@ private fun PausedCard(
     pendingKind: String?,
     canResume: Boolean,
     onResume: () -> Unit,
+    onKill: () -> Unit = {},
 ) {
+    var armed by remember(c.id) { mutableStateOf(false) }
+    LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(3500); armed = false } }
     val muted = MaterialTheme.colorScheme.onSurfaceVariant
     val p = c.paused ?: return
     TurmaCard(Modifier.fillMaxWidth()) {
@@ -501,9 +511,18 @@ private fun PausedCard(
                 }
             }
             if (pendingKind != null) {
-                Text("Resuming…", style = MaterialTheme.typography.labelMedium, color = muted, modifier = Modifier.padding(end = 6.dp))
-            } else if (canResume) {
-                GhostButton("Resume now", onResume)
+                Text(
+                    if (pendingKind == "killPaused") "Killing…" else "Resuming…",
+                    style = MaterialTheme.typography.labelMedium, color = muted, modifier = Modifier.padding(end = 6.dp),
+                )
+            } else {
+                Column(horizontalAlignment = Alignment.End) {
+                    if (canResume) GhostButton("Resume now", onResume)
+                    GhostButton(
+                        if (armed) "Confirm kill" else "Kill",
+                        onClick = { if (armed) { armed = false; onKill() } else armed = true },
+                    )
+                }
             }
         }
     }

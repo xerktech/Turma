@@ -24232,6 +24232,55 @@ test("XERK-1575: a sleeper someone is talking to is never paused (its message wo
   }
 });
 
+test("XERK-1575: a sleeper the operator is killing or deleting is never paused", async () => {
+  for (const type of ["kill", "delete"]) {
+    resetAutoStart(); resetSleepers();
+    const host = `slpStop${type}`;
+    const site = `slpstop${type}.atlassian.net`;
+    await asBeat(host, site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+      sessions: [sleeperSession("x", 60 * 60_000)] });
+    // Queued through the real routes, so the route and the guard agree.
+    const r = type === "kill"
+      ? await request("POST", `/api/agents/${host}/sessions/x/kill`, { headers: userHeaders })
+      : await request("DELETE", `/api/agents/${host}/sessions/x`, { headers: userHeaders });
+    assert.equal(r.status, 200, type);
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.equal(sleeperCmds(host, "pauseSleeper").length, 0, type);
+    // The kill landed and the session is gone: nothing left to pause.
+    ticketQueue.length = 0; delete agents[host];
+  }
+});
+
+test("XERK-1575: Kill on a paused card reaches its record, and nothing wakes it meanwhile", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpKillPaused";
+  const site = "slpkillpaused.atlassian.net";
+  const now = Date.now();
+  const paused = { id: "p", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+    paused: { wakeAt: now - 1000, wakeReason: "check p", at: now - 3600_000 } };
+  await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 },
+    pauseSleepers: { available: true }, closedSessions: [paused] });
+  // The due sleeper is woken; the operator kills it before the agent takes it.
+  hub.wakePausedSleepers(Date.now());
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => c.sessionId), ["p"]);
+  const r = await request("POST", `/api/agents/${host}/sessions/p/kill`, { headers: userHeaders });
+  assert.equal(r.status, 200, "the route queues a kill for a session that is only a closed record");
+  assert.deepEqual(sleeperCmds(host, "kill").map((c) => c.sessionId), ["p"]);
+  assert.equal(sleeperCmds(host, "resume").length, 0, "the undelivered wake is withdrawn");
+  // While the kill is queued nothing wakes or unpauses the record.
+  resetSleepers();
+  hub.wakePausedSleepers(Date.now());
+  assert.equal(sleeperCmds(host, "resume").length, 0);
+  assert.equal(sleeperCmds(host, "unpauseSleeper").length, 0);
+  // A wake already handed to the agent is left alone (it may be running).
+  agents[host].commands = [{ cmdId: "w1", type: "resume", sessionId: "p", wake: true, deliveredAt: now }];
+  await request("DELETE", `/api/agents/${host}/sessions/p`, { headers: userHeaders });
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => c.cmdId), ["w1"]);
+  assert.deepEqual(sleeperCmds(host, "delete").map((c) => c.sessionId), ["p"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
 test("XERK-1575: a pause stranded on an offline host neither starves the need nor outlives it", async () => {
   resetAutoStart(); resetSleepers();
   const site = "slpstrand.atlassian.net";

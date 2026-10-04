@@ -206,7 +206,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
   // select-on-arrival path reads it, so a bare render() isn't enough.
   const fn = new Function(...names, "window",
     script + "\n;return { render, selectSession, followSpawn, toggleComposer, startSession,"
-      + " toggleCardMenu, cardKill, startRename, cancelRename, submitRename,"
+      + " toggleCardMenu, cardKill, pausedKill, startRename, cancelRename, submitRename,"
       + " openMove, moveTo, closeMove,"
       + " showRestore, hideRestore, toggleRestoreMenu, restoreTo, eligibleRestoreTargets,"
       + " termComposeAction, termComposeStop, sendTermInput, openEndedSession, resumeEnded, openTranscript, backToList,"
@@ -2297,6 +2297,36 @@ test("XERK-1575: Paused lists the soonest wake first", () => {
   const p = els.paused.innerHTML;
   assert.ok(p.indexOf("Early Nap") < p.indexOf("Late Nap"), p);
   assert.equal(els.ended.innerHTML, "", "no other ended sessions -> no Ended section");
+});
+
+test("XERK-1575: a Paused row's Kill arms, confirms, and moves it to Ended as an ordinary kill", () => {
+  const { beat, els, posts, pausedKill } = loadPage();
+  const { now, host: h } = host([]);
+  const nap = closed("33333", "Napping", "2026-07-15T09:00:00Z",
+    { paused: { wakeAt: now + 3600e3, wakeReason: "check CI", at: now } });
+  h.closedSessions = [nap];
+  beat({ now, agents: [h] });
+  const ev = { stopPropagation() {} };
+  // Beside Resume now, never on an ordinary ended row.
+  assert.match(els.paused.innerHTML, /<button class="s-resume s-pkill"[^>]*>\s*Kill\s*<\/button>/);
+  pausedKill(ev, h.key, "33333");                     // arm
+  assert.match(els.paused.innerHTML, /<button class="s-resume s-pkill armed"[^>]*>\s*Confirm kill\s*<\/button>/);
+  assert.equal(posts.length, 0, "an armed Kill sends nothing");
+  pausedKill(ev, h.key, "33333");                     // confirm
+  assert.deepEqual(posts.map((x) => x.url), [`/api/agents/${h.key}/sessions/33333/kill`]);
+  let p = els.paused.innerHTML;
+  assert.match(p, /<button class="s-resume s-pkill"[^>]*disabled[^>]*>\s*<span class="spin"><\/span>/);
+  assert.match(p, /<button class="s-resume" disabled/, "Resume now is off while the kill lands");
+  // Still reported paused: the spinner holds across a beat.
+  beat({ now, agents: [h] });
+  assert.match(els.paused.innerHTML, /s-pkill"[^>]*disabled/);
+  // Reported as an ordinary kill: Paused empties and it reads killed in Ended.
+  h.closedSessions = [{ ...nap, paused: null }];
+  beat({ now, agents: [h] });
+  assert.equal(els.paused.innerHTML, "");
+  const e = els.ended.innerHTML;
+  assert.match(e.slice(e.indexOf("Napping")), /<div class="state">killed/);
+  assert.ok(!e.includes("s-pkill"), "an ordinary ended row has no Kill");
 });
 
 test("Ended sessions is collapsed by default and hidden when there are none", () => {

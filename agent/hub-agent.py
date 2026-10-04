@@ -352,6 +352,11 @@ PAUSE_SLEEPER_MIN_AHEAD_MS = 10 * 60 * 1000
 SLEEPER_PANE_COMMANDS = frozenset({
     "input", "answerQuestion", "answerPanePrompt", "interrupt", "setModel",
     "setMode", "setModelSource", "restart"})
+# The operator's lifecycle commands for a session. A pause arriving beside one
+# for the same session is refused too: run first, it would move the session to
+# a paused closed record the Kill/Delete then could not find, and the hub would
+# wake it. Mirrors the hub's SLEEPER_STOP_COMMANDS.
+SLEEPER_STOP_COMMANDS = frozenset({"kill", "delete"})
 # A paused record is exempt from CLOSED_PER_REPO (evicted, it could never be
 # woken); this bounds the exemption, newest kept.
 PAUSED_KEEP_MAX = 32
@@ -23640,9 +23645,18 @@ class SessionManager:
 
         `paused` ({wakeAt, wakeReason, pausedAt}) marks a sleeper paused for its
         slot (XERK-1575, `pause_sleeper`): kept on the closed record, so the
-        resume carries the wake back."""
+        resume carries the wake back.
+
+        The operator's Kill of a sleeper the hub already PAUSED finds no session,
+        only its closed record: the kill drops the pause, leaving an ordinary
+        killed record the hub never wakes — also when the pause won a race with
+        the kill."""
         sess = self._find(sid)
         if not sess:
+            rec = next((c for c in self.closed if c.get("id") == sid), None)
+            if paused is None and self._unpause_closed(rec):
+                log(f"kill: {sid} was a paused sleeper; it stays killed")
+                return
             log(f"kill: no such session {sid}")
             return
         # dsh: ask the plugin to dispose the agent cleanly over the socket before
@@ -24942,9 +24956,16 @@ class SessionManager:
         disappears from the UI and its usage stops being reported. The app owns
         no branch, so any branch the running agent named for its work — and thus
         every committed change on it — survives in the repo untouched; only
-        uncommitted worktree files are lost (the UI warns before confirming)."""
+        uncommitted worktree files are lost (the UI warns before confirming).
+
+        A sleeper the hub already PAUSED (XERK-1575) is a closed record, not a
+        session: the operator's Delete still deletes it, or it would wake."""
         sess = self._find(sid)
         if not sess:
+            rec = next((c for c in self.closed if c.get("id") == sid), None)
+            if isinstance(rec, dict) and "paused" in rec:
+                self._delete_paused_record(rec)
+                return
             log(f"delete: no such session {sid}")
             return
         self._teardown_dsh(sid, kill=True)   # clean dispose before teardown (dsh)
@@ -24971,6 +24992,27 @@ class SessionManager:
         shutil.rmtree(upload_dir_for(sid), ignore_errors=True)
         self._forget_session_caches(sid)
         log(f"deleted session {sid}")
+
+    def _delete_paused_record(self, rec):
+        """delete() for a sleeper the hub paused (XERK-1575): its processes are
+        already gone, so drop the closed record and its uploads, and remove its
+        worktree unless a session in the registry works in it (the Resume picker
+        resumes by transcript, under a new id, into the same worktree)."""
+        sid = rec.get("id")
+        wt = rec.get("worktreePath")
+        wt = (os.path.normpath(wt) if not rec.get("root")
+              and isinstance(wt, str) and wt else None)
+        held = wt is not None and any(
+            isinstance(s.get("worktreePath"), str)
+            and os.path.normpath(s["worktreePath"]) == wt for s in self.registry)
+        if wt is not None and not held and os.path.isdir(wt) \
+                and isinstance(rec.get("repoPath"), str):
+            self._worktree_remove(rec)
+        self.closed = [c for c in self.closed if c.get("id") != sid]
+        shutil.rmtree(upload_dir_for(sid), ignore_errors=True)
+        self._forget_session_caches(sid)
+        log(f"deleted paused session {sid}"
+            + (" (a running session works in its worktree; kept)" if held else ""))
 
     # --- on-demand input/history (glasses client) --------------------------
 
@@ -33669,11 +33711,14 @@ class SessionManager:
         # `pauseSleeper` ahead of it in the list must not kill the session the
         # message is for, whichever order the hub queued the two in. An
         # `exportSession` (the operator's Move) counts too: a pause ahead of it
-        # would leave a paused record here while the session moves away.
+        # would leave a paused record here while the session moves away. So does
+        # the operator's Kill or Delete: a pause ahead of it would leave that
+        # command nothing to act on, and the paused record would later wake.
         pane_sids = {c.get("sessionId") for c in commands or []
                      if isinstance(c, dict) and c.get("cmdId")
                      and c.get("cmdId") not in self.acked
                      and (c.get("type") in SLEEPER_PANE_COMMANDS
+                          or c.get("type") in SLEEPER_STOP_COMMANDS
                           or c.get("type") == "exportSession")}
         for cmd in commands or []:
             if not isinstance(cmd, dict):

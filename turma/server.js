@@ -13294,6 +13294,24 @@ function sleeperHasQueuedPaneCommand(a, sid) {
   return (Array.isArray(a && a.commands) ? a.commands : []).some((c) =>
     c && c.sessionId === sid && SLEEPER_PANE_COMMANDS.has(c.type));
 }
+// The operator's lifecycle commands (Kill, Delete). One still queued for a sleeper
+// means it is being stopped for good: a pause would turn it into a paused record
+// the hub then wakes, and a wake would bring back what the operator just killed.
+// Mirrors the agent's SLEEPER_STOP_COMMANDS.
+const SLEEPER_STOP_COMMANDS = new Set(["kill", "delete"]);
+function sleeperHasQueuedStop(a, sid) {
+  return (Array.isArray(a && a.commands) ? a.commands : []).some((c) =>
+    c && c.sessionId === sid && SLEEPER_STOP_COMMANDS.has(c.type));
+}
+// The operator stops a session: an automated wake of it still waiting to be handed
+// over is withdrawn, so the agent never relaunches it only to kill it again.
+function withdrawSleeperWake(host, sid) {
+  const a = agents[host];
+  for (const c of [...(Array.isArray(a && a.commands) ? a.commands : [])]) {
+    if (c && c.type === "resume" && c.wake === true && c.sessionId === sid
+        && !("deliveredAt" in c)) dropQueuedCommand(host, c.cmdId, "resume");
+  }
+}
 
 // Is this session being MOVED off its host (XERK-101)? A move in flight, or its
 // `exportSession` still queued. Paused mid-move, its record here would later be
@@ -13389,6 +13407,9 @@ function wakePausedSleepers(now = Date.now(), rows) {
     for (const c of Array.isArray(a.closedSessions) ? a.closedSessions : []) {
       if (!c || typeof c.id !== "string" || live.has(c.id) || !wirePaused(c.paused)) continue;
       if (pausedSleeperMoving(host, c)) continue;
+      // The operator's Kill/Delete of the paused card is on its way: it ends the
+      // pause agent-side, so this record is neither woken nor unpaused here.
+      if (sleeperHasQueuedStop(a, c.id)) continue;
       if (pausedSleeperHeldLive(a, c) || pausedSleeperHeldElsewhere(host, a, c, now)
           || pausedSleeperTicketDone(c, doneKeys)) {
         if (sleeperTriedRecently(sleeperUnpauseTried, host, c.id, now)) continue;
@@ -13467,6 +13488,7 @@ function pauseSleepersFor(waiting, now = Date.now(), rows) {
         && !sleeperTriedRecently(sleeperPauseTried, host, s.id, now)
         && !sleeperResumeHeld(host, s.id, now)
         && !sleeperHasQueuedPaneCommand(a, s.id)
+        && !sleeperHasQueuedStop(a, s.id)
         && !sleeperMigrating(host, a, s.id));
       if (!sleepers.length || !fits(host)) continue;
       for (const s of sleepers) {
@@ -19138,6 +19160,10 @@ const server = http.createServer(async (req, res) => {
         // An operator resuming a paused sleeper early (XERK-1575): never re-pause it
         // before the wake it was resumed ahead of.
         if (parts[5] === "resume") holdResumedSleeper(key, sessionId, Date.now());
+        // A Kill reaches a paused sleeper's closed record too (XERK-1575): the agent
+        // drops its pause, so it stays killed. An automated wake not yet handed over
+        // is withdrawn, so the session is not relaunched only to be killed again.
+        if (parts[5] === "kill") withdrawSleeperWake(key, sessionId);
         const cmdId = queueCommand(key, { type: parts[5], sessionId });
         return json(res, 200, { ok: true, cmdId });
       }
@@ -19551,6 +19577,7 @@ const server = http.createServer(async (req, res) => {
       }
       // DELETE /api/agents/<host>/sessions/<id>
       if (req.method === "DELETE" && parts.length === 5) {
+        withdrawSleeperWake(key, sessionId);   // as Kill does (XERK-1575)
         const cmdId = queueCommand(key, { type: "delete", sessionId });
         return json(res, 200, { ok: true, cmdId });
       }

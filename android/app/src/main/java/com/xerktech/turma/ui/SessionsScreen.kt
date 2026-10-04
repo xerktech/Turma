@@ -523,6 +523,8 @@ fun SessionsListPane(
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
     val spawnAtts by vm.spawnAtt.collectAsStateWithLifecycle()
+    // In-flight actions, for a Paused row's Kill (XERK-1575).
+    val pending by vm.pending.collectAsStateWithLifecycle()
     // The archive half of the box. The VM debounces and drops anything under
     // HISTORY_MIN_QUERY, so this can fire on every keystroke.
     val arch by archiveVm.state.collectAsStateWithLifecycle()
@@ -695,6 +697,8 @@ fun SessionsListPane(
                         selected = selectedKey == e.host + "/" + e.transcriptId,
                         onOpen = { onSelectEnded(e.host, e.transcriptId) },
                         onResume = { resumeEnded(vm, e); onSelect(e.host, e.id) },
+                        onKill = { vm.killPaused(e.host, e.id) },
+                        pendingKind = FleetViewModel.sessPending(pending, e.host, e.id),
                     )
                 }
             }
@@ -875,7 +879,12 @@ private fun QueuedSessionCard(r: FlatSession, now: Long, tint: Color?, onCancel:
 /** One ended session's row, whatever channel reported it (web endedRow). */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit) {
+private fun EndedSessionRow(
+    e: EndedSession, now: Long, tint: Color?, selected: Boolean, onOpen: () -> Unit, onResume: () -> Unit,
+    // Set only on a Paused row (XERK-1575): its Kill, and the in-flight action.
+    onKill: (() -> Unit)? = null,
+    pendingKind: String? = null,
+) {
     val cardMod = Modifier.fillMaxWidth().then(
         if (selected)
             Modifier.border(2.dp, MaterialTheme.colorScheme.primary, RoundedCornerShape(14.dp))
@@ -931,7 +940,25 @@ private fun EndedSessionRow(e: EndedSession, now: Long, tint: Color?, selected: 
             // Resume needs the host online (it rides the heartbeat as a command);
             // reading the conversation does not, so the card stays clickable.
             // A paused sleeper is resumed before its wake (XERK-1575, web `endedRow`).
-            GhostButton(if (isPausedEnded(e)) "Resume now" else "Resume", onResume, enabled = e.online)
+            if (onKill == null) {
+                GhostButton(if (isPausedEnded(e)) "Resume now" else "Resume", onResume, enabled = e.online)
+            } else if (pendingKind == "killPaused") {
+                Text("Killing…", style = MaterialTheme.typography.labelMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant, modifier = Modifier.padding(end = 6.dp))
+            } else {
+                // A paused sleeper's Kill stops it for good (web `endedRow`'s
+                // `pausedKill`): arm, then confirm, like a queued card's Cancel.
+                var armed by remember(e.host, e.id) { mutableStateOf(false) }
+                LaunchedEffect(armed) { if (armed) { kotlinx.coroutines.delay(KILL_ARM_MS); armed = false } }
+                Column(horizontalAlignment = Alignment.End) {
+                    GhostButton("Resume now", onResume, enabled = e.online && pendingKind == null)
+                    GhostButton(
+                        if (armed) "Confirm kill" else "Kill",
+                        onClick = { if (armed) { armed = false; onKill() } else armed = true },
+                        enabled = pendingKind == null,
+                    )
+                }
+            }
         }
     }
 }

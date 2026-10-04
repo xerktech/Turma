@@ -236,8 +236,12 @@
      .s-hit button, and nesting Resume in it would be a button inside a button). */
   .s-card.ended .dot { background: none; border: 1.5px solid var(--muted); box-sizing: border-box; }
   .s-card-wrap.ended-wrap > .s-card { padding-right: 78px; }
-  /* A paused sleeper's button reads "Resume now" (XERK-1575, as on the dashboard). */
-  .s-card-wrap.ended-wrap > .s-card.paused { padding-right: 100px; }
+  /* A paused sleeper's button reads "Resume now" (XERK-1575, as on the dashboard),
+     with its Kill stacked below it. */
+  .s-card-wrap.ended-wrap > .s-card.paused { padding-right: 100px; min-height: 64px; }
+  .s-resume.s-pkill { top: 37px; }
+  .s-resume.s-pkill:hover:not(:disabled) { border-color: var(--critical); color: var(--critical); }
+  .s-resume.s-pkill.armed { background: var(--critical); border-color: var(--critical); color: #fff; }
   .s-resume {
     position: absolute; top: 7px; right: 6px; z-index: 2;
     font: inherit; font-size: 11.5px; font-weight: 600; padding: 4px 10px;
@@ -1643,6 +1647,25 @@ function cardKill(ev, host, id) {
   post(`/api/agents/${enc(host)}/sessions/${enc(id)}/kill`, null, "Kill");
 }
 
+// Kill a paused sleeper from its Paused row (XERK-1575): the same route and
+// arm-then-confirm as a live card's menu Kill. The agent drops the pause, so the
+// row moves to Ended as an ordinary killed session that never wakes. Optimistic
+// like Resume: the row spins until the host stops reporting it paused, and a
+// refusal (toasted by post()) drops the spinner.
+function pausedKill(ev, host, id) {
+  ev.stopPropagation();
+  if (killArmedId !== id) {
+    killArmedId = id;
+    if (killArmTimer) clearTimeout(killArmTimer);
+    killArmTimer = setTimeout(() => { disarmCardKill(); render(cache); }, KILL_ARM_MS);
+    render(cache);
+    return;
+  }
+  disarmCardKill();
+  busy(pendKey("kill", host, id), { kind: "pausedKill", host, id },
+    () => post(`/api/agents/${enc(host)}/sessions/${enc(id)}/kill`, null, "Kill"));
+}
+
 // Rename swaps the card for an inline field seeded with the current name. The
 // name is looked up from `cache` rather than passed through the onclick — a
 // user-typed name can contain the quotes that inlining it would break on.
@@ -2087,6 +2110,13 @@ function reconcilePending(agents) {
     } else if (p.kind === "start") {
       const s = index.get(p.host + "::" + p.id);
       if (s && s.status === "running") pending.delete(key);
+    } else if (p.kind === "pausedKill") {
+      // A paused sleeper's Kill (XERK-1575): done once its host stops reporting
+      // it paused — it moves to Ended as an ordinary killed session.
+      const a = agents.find(x => x && x.key === p.host);
+      const still = (a && a.closedSessions || []).some(c => c && c.id === p.id
+        && c.paused && Number.isSafeInteger(c.paused.wakeAt));
+      if (!still) pending.delete(key);
     }
   }
 }
@@ -3010,6 +3040,7 @@ function endedRowId(e) {
 function endedRow(e) {
   const { a, s, kind } = e;
   const resuming = pending.has(pendKey("start", a.key, e.id));
+  const killing = pending.has(pendKey("kill", a.key, e.id));
   const cur = e.id === endedViewId;
   const when = e.endedMs ? ago(Date.now() - e.endedMs) : "";
   // A resumable row is a bare transcript: nothing recorded WHY it ended, only
@@ -3040,11 +3071,16 @@ function endedRow(e) {
         ${s.status === "error" && s.errorMsg ? `<div class="err">${esc(s.errorMsg)}</div>` : ""}
       </span>
     </div>
-    <button class="s-resume" ${a.online && !resuming ? "" : "disabled"}
+    <button class="s-resume" ${a.online && !resuming && !killing ? "" : "disabled"}
         ${a.online ? "" : 'title="Host offline"'}
         onclick="resumeEnded(event,'${escJs(e.id)}')">
       ${resuming ? '<span class="spin"></span>' : paused ? "Resume now" : "Resume"}
     </button>
+    ${paused ? `<button class="s-resume s-pkill${killArmedId === e.id ? " armed" : ""}"
+        ${resuming || killing ? "disabled" : ""} title="Stop it for good: it will not wake"
+        onclick="pausedKill(event,'${escJs(a.key)}','${escJs(e.id)}')">
+      ${killing ? '<span class="spin"></span>' : killArmedId === e.id ? "Confirm kill" : "Kill"}
+    </button>` : ""}
   </div>`;
 }
 

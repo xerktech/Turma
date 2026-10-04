@@ -17746,6 +17746,80 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
                 self.assertEqual(sm.closed, [])
                 self.assertEqual(exported, [sess["id"]])
 
+    def test_an_operator_kill_or_delete_in_the_same_batch_wins(self):
+        # The pause ahead of the operator's Kill/Delete in one batch: run first,
+        # it moved the session to a paused closed record, the Kill then logged
+        # "no such session", and the hub woke the record at its wake. Either
+        # order, the operator's command is what happens.
+        for op in ("kill", "delete"):
+            for order in ("pause-first", "op-first"):
+                with self.subTest(op=op, order=order):
+                    sm = self._manager()
+                    sm.closed = []   # the subtests share one registry dir
+                    sess = self._sleeper(sm)
+                    sid = sess["id"]
+                    pause = {"cmdId": "p1", "type": "pauseSleeper", "sessionId": sid}
+                    stop = {"cmdId": "k1", "type": op, "sessionId": sid}
+                    cmds = [pause, stop] if order == "pause-first" else [stop, pause]
+                    with mock.patch.object(ha.time, "time", return_value=self.NOW / 1000):
+                        sm.handle_commands(cmds)
+                    self.assertIsNone(sm._find(sid))
+                    self.assertFalse(any(c.get("paused") for c in sm.closed),
+                                     "nothing is left to wake")
+                    if op == "kill":
+                        self.assertEqual([c["id"] for c in sm.closed], [sid])
+                    else:
+                        self.assertEqual(sm.closed, [])
+                    self.assertEqual({"p1", "k1"} & set(sm.acked), {"p1", "k1"})
+
+    def test_a_kill_after_the_pause_landed_stops_the_wake(self):
+        # The pause ran on an earlier beat; the operator's Kill of the paused card
+        # reaches the closed record and leaves an ordinary killed session.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        sm.handle_commands([{"cmdId": "k1", "type": "kill", "sessionId": sid}])
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertNotIn("paused", rec)
+        self.assertIsNone(next(c for c in sm._closed_payload() if c["id"] == sid)["paused"])
+        # An ordinary killed record: a second kill is the old no-op.
+        sm.kill(sid)
+        self.assertEqual([c["id"] for c in sm.closed], [sid])
+
+    def test_a_delete_after_the_pause_landed_drops_the_record(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        sm.handle_commands([{"cmdId": "d1", "type": "delete", "sessionId": sid}])
+        self.assertEqual(sm.closed, [])
+        # An ordinary killed record is still left alone by delete (no session).
+        sm.closed.append({"id": "plain", "repo": "r"})
+        sm.delete("plain")
+        self.assertEqual([c["id"] for c in sm.closed], ["plain"])
+
+    def test_deleting_a_paused_record_removes_its_worktree_unless_one_runs_there(self):
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "wt-a")
+        os.makedirs(wt)
+        removed = []
+        sm._worktree_remove = lambda rec: removed.append(rec["worktreePath"])
+        rec = {"id": "s1", "repo": "r", "repoPath": self.tmp, "worktreePath": wt,
+               "paused": {"wakeAt": self.NOW + 3600_000}}
+        sm.closed = [dict(rec)]
+        sm.delete("s1")
+        self.assertEqual(removed, [wt])
+        self.assertEqual(sm.closed, [])
+        # The Resume picker brought the conversation back under a new id, in the
+        # same worktree: the record goes, the worktree stays.
+        removed.clear()
+        sm.closed = [dict(rec)]
+        sm.registry.append({"id": "s2", "status": "running", "worktreePath": wt})
+        sm.delete("s1")
+        self.assertEqual(removed, [])
+        self.assertEqual(sm.closed, [])
+
     def test_a_failed_export_thread_start_clears_the_mark(self):
         sm = self._manager()
         sess = self._sleeper(sm)

@@ -117,6 +117,13 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   worker (`input_inflight`), landed but not recorded, or on the `pendingInputs` outbox
   (`_input_undelivered`). `handle_commands` pre-scans its batch for `SLEEPER_PANE_COMMANDS` on the
   session, so a pause listed BEFORE the input is refused too. Killing would drop the message.
+- **Never beside the operator's Kill or Delete of it**: the pre-scan also counts
+  `SLEEPER_STOP_COMMANDS` (`kill`, `delete`). Run first, the pause moved the session to a paused
+  record, the Kill logged "no such session", and the hub woke the record at its wake.
+- **`kill(sid)`/`delete(sid)` reach a PAUSED closed record** (no live session): `kill` drops the
+  pause (an ordinary killed record that never wakes); `delete` drops the record and its uploads
+  and removes the worktree unless a registry session works there (`_delete_paused_record`). So a
+  Kill that lands after the pause still wins. An unpaused closed record keeps the old no-op.
 - **Never within two beats of an inbox post** (`_inbox_posted`, set by `notify_session`): the probe
   can read idle before that turn starts, and an inbox message is on no outbox to re-send it.
 - **Never mid-move**: `_export_running(sid)` refuses while a migration export thread runs for it

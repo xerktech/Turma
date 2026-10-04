@@ -99,7 +99,7 @@ function loadDashboard(orgFilter = (a) => a || [], fetchReply = null) {
   const keys = Object.keys(g);
   const fn = new Function(...keys, src +
     "\n;return { render, fmtTokens, applyAgent, connectSSE, contextMeterHtml, refresh, mergeSnapshot," +
-    " autoPausedBadge, refusedBadge," +
+    " autoPausedBadge, refusedBadge, pausedKill, reconcilePending," +
     " sseClock: () => sseClock," +
     " setCache: (c) => { cache = c; }, getCache: () => cache };");
   const api = fn(...keys.map((k) => g[k]));
@@ -617,4 +617,40 @@ test("dashboard: a paused sleeper keeps a card in its repo and is counted as pau
   D2.render({ now, agents: [{ ...h, closedSessions: [h.closedSessions[1]] }] });
   assert.equal(tileOf(D2.els.tiles.innerHTML, "Running sessions").hint, "1 total");
   assert.ok(!D2.els.groups.innerHTML.includes("paused"));
+});
+
+// XERK-1575: a paused card can be stopped for good. Kill arms then confirms like a
+// running card's, posts the existing kill route, and holds a "Killing…" row until
+// the host stops reporting the record paused (it is then an ordinary kill, off
+// the card grid). Resume now stays beside it.
+test("dashboard: a paused card's Kill arms, confirms, and clears once it is no longer paused", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const nap = { id: "s2", summary: "Napping", repo: "Turma", closedAt: new Date(now).toISOString(),
+    paused: { wakeAt: now + 3600e3, wakeReason: "check CI", at: now } };
+  const h = { ...liveHost("vm", 1), repos: [{ name: "Turma", branch: "main" }], closedSessions: [nap] };
+  const data = { now, agents: [h] };
+  D.setCache(data);
+  D.render(data);
+  let g = D.els.groups.innerHTML;
+  assert.ok(g.includes("Resume now"), g);
+  assert.match(g, /onclick="pausedKill\('vm','s2'\)">Kill<\/button>/);
+  D.pausedKill("vm", "s2");          // arm
+  D.render(data);
+  assert.match(D.els.groups.innerHTML, /onclick="pausedKill\('vm','s2'\)">Confirm kill<\/button>/);
+  assert.ok(!D.fetches.some((u) => u.endsWith("/kill")), "an armed Kill sends nothing");
+  D.pausedKill("vm", "s2");          // confirm
+  assert.ok(D.fetches.includes("/api/agents/vm/sessions/s2/kill"), D.fetches.join());
+  g = D.els.groups.innerHTML;
+  assert.ok(g.includes('<div class="sess paused killing">'), g);
+  assert.ok(g.includes("Killing…") && !g.includes("Resume now"), "one busy control while it lands");
+  // Still reported paused: the row holds. Reported as an ordinary kill: it clears.
+  D.reconcilePending([h]);
+  D.render(data);
+  assert.ok(D.els.groups.innerHTML.includes("Killing…"));
+  const killed = { ...h, closedSessions: [{ ...nap, paused: null }] };
+  D.reconcilePending([killed]);
+  D.render({ now, agents: [killed] });
+  g = D.els.groups.innerHTML;
+  assert.ok(!g.includes("Napping") && !g.includes("Killing…"), "an ordinary kill leaves the card grid");
 });
