@@ -1928,6 +1928,11 @@ class TestExpansionBudget(unittest.TestCase):
         t = time.monotonic()
         self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         self.assertLess(time.monotonic() - t, 5)
+        # ...and so does xargs: n piped operands × n `{}`.
+        cmd = f"echo {roots} | xargs -I {{}} echo " + "{} " * 2000
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.monotonic() - t, 5)
         # An earlier flag's run before a later `-exec` was skipped: re-slicing
         # past each `-exec` dropped every `-execdir`/`-ok` in front of it.
         for flag in ("-execdir", "-ok", "-okdir"):
