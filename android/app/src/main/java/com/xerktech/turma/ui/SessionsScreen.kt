@@ -328,8 +328,9 @@ data class SpawnHost(
 data class HostCapLabel(val text: String, val full: Boolean)
 
 fun hostCapLabel(c: com.xerktech.turma.model.Capacity?): HostCapLabel? {
-    if (c == null || c.maxSessions <= 0) return null
-    return HostCapLabel("${c.running.coerceAtLeast(0)} / ${c.maxSessions}", c.free != null && c.free <= 0)
+    val max = c?.maxSessions
+    if (max == null || max <= 0) return null
+    return HostCapLabel("${c.running.coerceAtLeast(0)} / $max", c.free != null && c.free <= 0)
 }
 
 /**

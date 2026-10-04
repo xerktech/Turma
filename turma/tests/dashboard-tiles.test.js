@@ -584,7 +584,9 @@ test("dashboard: a paused sleeper keeps a card in its repo and is counted as pau
   const now = Date.now();
   const wakeAt = now + 2 * 3600e3;
   const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
-  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  // The wake can cross midnight (a run late in the day); clockTime then adds "+1d".
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`
+    + (d.getDate() !== new Date(now).getDate() ? "\u00a0+1d" : "");
   const h = {
     ...liveHost("vm", 1),
     capacity: { maxSessions: 6 },
