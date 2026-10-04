@@ -207,6 +207,8 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   `handle_commands` on its beat loop (~15s teardown each), so N pauses in one beat could outrun
   `OFFLINE_AFTER_MS` (XERK-395). A host with a `pauseSleeper` queued or unacked takes no second;
   the other waiting tickets get their slots on later passes (the wake's one-per-host rule too).
+  - **A wake `resume` (`wake:true`) queued or unacked holds that same one**: the agent relaunches
+    inline too, so a host never gets a wake and a pause in one beat (`pausing` counts both).
 - **One pause per still-waiting ticket.** Waiting = entries the drain just held `capacity`
   (`waitingFull`). Each pause is stamped with the ticket it answers (`pauseFor`, its queue key,
   hub-only like `ticketSite` — `INTERNAL_COMMAND_FIELDS`), and a ticket with an unacked pause on

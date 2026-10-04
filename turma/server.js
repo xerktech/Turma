@@ -13432,10 +13432,13 @@ function pauseSleepersFor(waiting, now = Date.now(), rows) {
   const pausing = new Set();
   // Only an ONLINE host's pause can free a slot soon; one stranded on a host that
   // went quiet must not starve the tickets waiting elsewhere (reclaim withdraws
-  // it if it was never handed over).
+  // it if it was never handed over). An automated wake `resume` still queued or
+  // unacked counts too: the agent relaunches inline on the same beat, so a host
+  // gets at most ONE automated lifecycle command (wake or pause) in flight.
   for (const [host, a] of Object.entries(agents)) {
     if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     for (const c of a.commands || []) {
+      if (c && c.type === "resume" && c.wake === true) { pausing.add(host); continue; }
       if (!c || c.type !== "pauseSleeper") continue;
       pausing.add(host);
       if (typeof c.pauseFor === "string" && waitingKeys.has(c.pauseFor)

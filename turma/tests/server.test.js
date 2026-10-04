@@ -23923,6 +23923,47 @@ test("XERK-1575: one pause in flight per host — the agent kills on its beat lo
   ticketQueue.length = 0; delete agents[host];
 });
 
+test("XERK-1575: a wake resume in flight holds the host's one automated lifecycle command", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpWakePause", site = "slpwakepause.atlassian.net";
+  const triaged = (key) => ({ key, summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } });
+  const now = Date.now();
+  const beat = { autoStart: false, pauseSleepers: { available: true }, tickets: [triaged("ENG-5")],
+    capacity: { maxSessions: 2, running: 1, queued: 0, free: 1 },
+    sessions: [sleeperSession("s1", 3 * 60 * 60_000)],
+    closedSessions: [{ id: "due", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: now - 1000, wakeReason: "check due", at: now - 3600_000 } }] };
+  // The ticket queues while the host is full; then a slot frees with a wake due.
+  await asBeat(host, site, { ...beat, capacity: { maxSessions: 2, running: 2, queued: 0, free: 0 },
+    sessions: [{ id: "busy1", status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z" },
+      { id: "busy2", status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z" }],
+    closedSessions: [] });
+  assert.equal((await startTicket(site, "ENG-5")).body.queued, true);
+  drainTicketQueue();
+  agents[host].commands = [];
+  await asBeat(host, site, beat);
+  drainTicketQueue();
+  assert.equal(queuedTicket(site, "ENG-5").reason, "capacity");
+  // The wake takes the free slot; the host then reads full and the ticket waits,
+  // but no pause rides the same pass: one relaunch OR one kill per beat, never both.
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => c.sessionId), ["due"]);
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
+  for (const c of agents[host].commands) c.deliveredAt = Date.now();
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
+  // The wake lands (acked, the slot now taken): the pause goes out.
+  agents[host].commands = [];
+  await asBeat(host, site, { ...beat, capacity: { maxSessions: 2, running: 2, queued: 0, free: 0 },
+    sessions: [sleeperSession("s1", 3 * 60 * 60_000),
+      { id: "due", status: "running", repo: "Turma", createdAt: "2026-10-01T00:00:00Z" }],
+    closedSessions: [] });
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["s1"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
 test("XERK-1575: only a quiet sleeper, ten minutes out, on a capable full host that could run the ticket", async () => {
   const cases = {
     "wake too soon": { s: sleeperSession("x", 9 * 60_000) },
