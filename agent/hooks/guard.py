@@ -1233,6 +1233,12 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             takes_value = _PREFIX_OPTS_WITH_VALUE.get(wrapper, set())
             while out and out[0].startswith("-") and len(out[0]) > 1:
                 opt = out.pop(0)
+                split = _env_split_string(opt, out) if wrapper == "env" else None
+                if split is not None:
+                    # `env -S "sh -c 'rm -rf /'"` runs its operand as a command
+                    # LINE, which classified as one unknown program (XERK-1539).
+                    out[:0] = _tokenize(split)
+                    continue
                 if "=" not in opt and opt in takes_value and out:
                     out.pop(0)
             # `timeout 5s cmd` / `nice 10 cmd`: a bare duration/priority operand.
@@ -1241,6 +1247,113 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             continue
         break
     return out
+
+
+def _env_split_string(opt: str, rest: list[str]) -> str | None:
+    """The command line `env -S`/`--split-string` carries, consuming a separate
+    value from ``rest``; None for any other `env` option. `--s` is already
+    unambiguous to getopt, and a short cluster ends at `S` (`-iS'…'`)."""
+    if opt.startswith("--s"):
+        if "=" in opt:
+            return opt.split("=", 1)[1]
+        return rest.pop(0) if rest else ""
+    if not opt.startswith("--") and "S" in opt:
+        return opt[opt.index("S") + 1:] or (rest.pop(0) if rest else "")
+    return None
+
+
+# A script path that is the shell's own stdin or an inherited fd — what
+# `bash -`, `source /dev/stdin` and `. <(…)` (bash passes `/dev/fd/63`) read.
+_STDIN_SCRIPT_RE = re.compile(r"^(?:-|/dev/stdin|/dev/fd/\d+|/proc/(?:self|\d+)/fd/\d+)$")
+# Shell options that consume the NEXT token, so it is not taken as the script.
+_SHELL_OPTS_WITH_VALUE = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
+# A redirection word: `2>&1`, `>/dev/null`, `<`, `<<<`. Its target follows
+# when the operator stands alone.
+_REDIRECT_RE = re.compile(r"^\d*(?:<<<|<<-?|<>|<&|>&|&>>?|>>?|<)(.*)$", re.S)
+
+
+def _proc_subst_path(m: "re.Match[str]") -> str:
+    """`<(…)` reads as the fd path bash hands the command; anything else as
+    the text it contributes."""
+    return "/dev/fd/63" if m.group(0).startswith("<(") else _subst_text(m)
+
+
+def _reads_stdin_script(stage: str) -> bool:
+    """Whether the command in ``stage`` runs its stdin (or an inherited fd) as
+    a SCRIPT: a shell with no `-c` and no script file (`… | sh`, `bash -s`,
+    `sh <<< '…'`), or `source`/`.` of such a path (`. <(echo …)`)."""
+    tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(_proc_subst_path, stage)))
+    # `sh<<<'…'` tokenises as one word; the program is the part before it.
+    if tokens and "<" in tokens[0] and not tokens[0].startswith("<"):
+        head, _, tail = tokens[0].partition("<")
+        tokens = [head, "<" + tail, *tokens[1:]]
+    if not tokens:
+        return False
+    prog, rest = _basename(tokens[0]), tokens[1:]
+    if prog == "busybox" and rest and _basename(rest[0]) in _SHELL_PROGS:
+        prog, rest = _basename(rest[0]), rest[1:]
+    if prog in ("source", "."):
+        operands = [t for t in rest if not _REDIRECT_RE.match(t)]
+        return bool(operands) and bool(_STDIN_SCRIPT_RE.match(operands[0]))
+    if prog not in _SHELL_PROGS or _shell_c_index(rest) >= 0:
+        return False
+    if prog == "su":
+        return True  # its operands name a USER; without `-c` the shell reads stdin
+    i = 0
+    while i < len(rest):
+        tok = rest[i]
+        redirect = _REDIRECT_RE.match(tok)
+        if redirect:
+            i += 1 if redirect.group(1) else 2
+            continue
+        if tok == "--":
+            return i + 1 >= len(rest) or bool(_STDIN_SCRIPT_RE.match(rest[i + 1]))
+        if tok in _SHELL_OPTS_WITH_VALUE:
+            i += 2
+            continue
+        if tok[:1] in "-+" and len(tok) > 1:
+            if not tok.startswith("--") and "s" in tok[1:]:
+                return True  # `-s`: the script is stdin, the rest are $1…
+            i += 1
+            continue
+        return bool(_STDIN_SCRIPT_RE.match(tok))
+    return True
+
+
+def _herestrings(stage: str) -> list[str]:
+    """The words `<<<` feeds the command in ``stage``."""
+    out = []
+    tokens = _tokenize(stage)
+    for i, tok in enumerate(tokens):
+        m = re.search(r"<<<(.*)$", tok, re.S)
+        if m:
+            word = m.group(1) or (tokens[i + 1] if i + 1 < len(tokens) else "")
+            if word.strip():
+                out.append(word)
+    return out
+
+
+def _fed_script(stages: list[str], k: int) -> list[str]:
+    """The text stage ``k`` of a pipeline reads as a script, as far as it is
+    knowable: its own here-strings and `<(…)` producers, and what an earlier
+    stage PRINTS — `echo '…' | sh`, `printf … | tee f | bash`, `cat <<< '…' |
+    sh`. An earlier stage counts wherever it sits, since a filter between
+    passes the text on. What a file, network or interpreter produces cannot be
+    known here; `curl … | sh` stays a residual (XERK-1539)."""
+    texts = _herestrings(stages[k])
+    for m in _SUBST_RE.finditer(stages[k]):
+        if m.group(0).startswith("<("):
+            printed = _printed_text(_subst_inner(m))
+            if printed and printed.strip():
+                texts.append(printed)
+    for prev in stages[:k]:
+        for seg in _split_segments(_unwrap_group(prev)):
+            seg = _unwrap_group(seg)
+            printed = _printed_text(seg)
+            if printed and printed.strip():
+                texts.append(printed)
+            texts.extend(_herestrings(seg))
+    return texts
 
 
 def _basename(prog: str) -> str:
@@ -1340,7 +1453,9 @@ def _expand_segments(command: str, depth: int = 0,
         # runs every line of it. Expand those bodies as commands; bodies fed to
         # anything else stay data (see _destructive_database for the psql case).
         owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
-        if owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."}):
+        # So is one an owner PIPES into a shell: `cat <<'EOF' | bash` (XERK-1539).
+        if (owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."})
+                or any(_reads_stdin_script(st) for st in _split_segments(owner)[1:])):
             out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, every_cd))
         elif not quoted:
             # ...but data behind an UNQUOTED delimiter is expanded first, so its
@@ -1373,6 +1488,15 @@ def _expand_segments(command: str, depth: int = 0,
         for tok in _tokenize(raw):
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
+    # A shell that reads its SCRIPT from stdin runs whatever the pipeline,
+    # a here-string or a `<(…)` feeds it — `echo '<cmd>' | sh`, `sh <<< '<cmd>'`,
+    # `. <(echo '<cmd>')` — none of which is an argv of its own (XERK-1539).
+    for pipeline in _split_on_operators(command, include_pipe=False):
+        stages = _split_segments(pipeline)
+        for k, stage in enumerate(stages):
+            if _reads_stdin_script(_unwrap_group(stage)):
+                for text in _fed_script(stages, k):
+                    out.extend(_expand_segments(text, depth + 1, every_cd))
     for raw in segments:
         if every_cd != cwds:
             cwds = _cd_targets(_SUBST_RE.sub(_subst_text, raw), cwds)
@@ -1421,7 +1545,8 @@ def _expand_segments(command: str, depth: int = 0,
             # ITERATIVELY — recursing once per `eval` burned the depth budget,
             # and exhausting it used to fail open.
             inner = rest
-            while inner and _basename(inner[0]) == "eval":
+            # `eval -- '<cmd>'`: bash's eval takes (and drops) `--`.
+            while inner and (_basename(inner[0]) == "eval" or inner[0] == "--"):
                 inner = inner[1:]
             if inner:
                 # Two readings, both expanded — branching between them on token
@@ -1478,6 +1603,18 @@ def _expand_segments(command: str, depth: int = 0,
             # containing whitespace": that is the construct removed from eval
             # two rounds ago, and it reads `ssh host git commit -m 'rm -rf /etc
             # is banned'` as a destructive command.
+            if prog == "flock":
+                # `flock f -c '<cmd>'` hands its `-c` value to `sh -c`.
+                for idx, tok in enumerate(rest):
+                    value = None
+                    if tok.startswith("--command"):
+                        value = tok.split("=", 1)[1] if "=" in tok else (
+                            rest[idx + 1] if idx + 1 < len(rest) else None)
+                    elif tok.startswith("-") and not tok.startswith("--") and "c" in tok:
+                        value = tok[tok.index("c") + 1:] or (
+                            rest[idx + 1] if idx + 1 < len(rest) else None)
+                    if value:
+                        out.extend(_expand_segments(value, depth + 1, cwds))
             inner_cmd = _wrapper_command(prog, rest)
             if len(inner_cmd) == 1 and re.search(r"\s", inner_cmd[0]):
                 out.extend(_expand_segments(inner_cmd[0], depth + 1, cwds))
@@ -1524,7 +1661,12 @@ def _expand_segments(command: str, depth: int = 0,
                 expanded: list[str] = []
                 for tok in inner:
                     expanded.extend(piped_operands if tok == "{}" else [tok])
-                out.append((_strip_prefixes(expanded + piped_operands), seg))
+                argv = _strip_prefixes(expanded + piped_operands)
+                out.append((argv, seg))
+                # ...and expanded again, so a shell/eval/wrapper it runs is
+                # unwrapped: `xargs sh -c '<cmd>'` (XERK-1539).
+                out.extend(_expand_segments(
+                    " ".join(shlex.quote(t) for t in argv), depth + 1, cwds))
         elif prog == "find":
             roots = _find_roots(tokens) or ["."]
             # Relative roots from inside a protected cwd: `cd /; find . -delete`.
@@ -1536,7 +1678,7 @@ def _expand_segments(command: str, depth: int = 0,
                 for cwd, joined in by_cwd:
                     out.append((["rm", "-r", *joined], seg, False, cwd))
             roots += [r for _, joined in by_cwd for r in joined]
-            for flag in ("-exec", "-execdir", "-ok"):
+            for flag in ("-exec", "-execdir", "-ok", "-okdir"):
                 while flag in rest:
                     i = rest.index(flag)
                     run = []
@@ -1546,7 +1688,11 @@ def _expand_segments(command: str, depth: int = 0,
                         # `{}` stands for each path found — i.e. the roots.
                         run.extend(roots if tok == "{}" else [tok])
                     if run:
-                        out.append((_strip_prefixes(run), seg))
+                        argv = _strip_prefixes(run)
+                        out.append((argv, seg))
+                        # `find . -exec sh -c '<cmd>' \;` (XERK-1539).
+                        out.extend(_expand_segments(
+                            " ".join(shlex.quote(t) for t in argv), depth + 1, cwds))
                     rest = rest[i + 1:]
     # An unwrap can leave nothing behind (`$(x | xargs kill)`); every checker
     # reads tokens[0], and a crash there let the WHOLE command through (XERK-1080).
@@ -2999,7 +3145,7 @@ _DB_CLIENTS = {
 # arguments. The agent image ships all of these.
 _EXEC_WRAPPERS = {
     "docker", "podman", "kubectl", "oc", "ssh", "nsenter", "chroot",
-    "docker-compose", "flatpak", "distrobox", "lxc", "incus",
+    "docker-compose", "flatpak", "distrobox", "lxc", "incus", "flock",
 }
 
 # How many non-option OPERANDS sit between the wrapper and the command it runs:
@@ -3010,6 +3156,7 @@ _EXEC_WRAPPER_OPERANDS = {
     "ssh": 1, "nsenter": 0, "chroot": 1,
     "docker": 2, "podman": 2, "kubectl": 2, "oc": 2,
     "docker-compose": 2, "flatpak": 2, "distrobox": 2, "lxc": 2, "incus": 2,
+    "flock": 1,
 }
 
 # Wrapper options that consume the NEXT token as their value. Without these the
@@ -3057,6 +3204,7 @@ _EXEC_WRAPPER_OPTS_WITH_VALUE = {
                        "--env-file", "--profile", "-c", "--context"},
     "flatpak": {"--command", "--branch", "--arch", "--env", "--filesystem"},
     "distrobox": {"-n", "--name", "-e", "--extra-flags"},
+    "flock": {"-w", "--wait", "--timeout", "-E", "--conflict-exit-code"},
 }
 
 # Wrappers whose remaining operands are JOINED into one command line for a

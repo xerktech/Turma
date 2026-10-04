@@ -259,6 +259,11 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
       `cd /usr/src/app && rm -rf build` — do not widen it.
   - **`_var_values` resolves a value naming an assigned variable once** (`d=$d/x`): left in, each
     recursion level re-inlined it until `_TOO_DEEP` refused an ordinary command.
+  - **A string that BECOMES a script is expanded as commands** (XERK-1539): find `-exec`/xargs
+    argv re-expanded; `flock -c`, `env -S`, `eval --`; and a shell reading its script from
+    stdin/fd (`_reads_stdin_script`) gets what a pipe, `<<<`, `<(…)` or heredoc feeds it.
+    - Only PRINTED text is knowable (`_fed_script`): `curl … | sh`, `cat f | sh` and a
+      transforming filter (`tr`, `sed`) stay residuals — don't describe pipes as closed.
   - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old vs
     new guard): 0 diffs is the bar, or each diff explained. Unit cases missed every false deny above.
   - Keep in sync with the twin hook outside this repo.
