@@ -37468,20 +37468,73 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.pane_edge(body[:-1] + ["rm -rf build"], 200, at=2000)
         self.assertEqual(len({r["id"] for r in self.rows()}), 2)
 
-    def test_a_char_cut_face_is_the_head_of_the_other_under_one_question(self):
-        # Pins _dialog_faces_match's char-cap branch: a detail of exactly
-        # PANE_PROMPT_DETAIL_CHARS lost its bottom, so it is the other's head.
-        full = "Bash command\n" + "\n".join(f"line{i} " + "y" * 70 for i in range(12))
-        cut = full[:ha.PANE_PROMPT_DETAIL_CHARS]
-        rewrapped = {"prompt": "Do you want to proceed?",
-                     "detail": full.replace(" y", "\ny")}
-        self.assertTrue(ha._dialog_faces_match("Do you want to proceed?", cut, rewrapped))
-        # Another question is another prompt, and an uncut face shorter than
-        # the cap is no cut at all.
+    def test_a_face_cut_at_the_face_cap_overlaps_the_others_window(self):
+        # Pins _dialog_faces_match's char-cap branch: a face of
+        # PANE_PROMPT_FACE_CHARS lost its bottom detail too (a middle window),
+        # so it is the same prompt only while it OVERLAPS the other's text by
+        # PANE_FACE_MIN_OVERLAP under the same question.
+        q = "Do you want to proceed?"
+        text = "".join(f"seg{i:05d}-" + "abcdefghij"[i % 10] * 20 for i in range(400))
+        wide = text[:ha.PANE_PROMPT_FACE_CHARS]               # head kept, bottom lost
+        tail = {"prompt": q, "detail": text[-6000:]}           # top lost, bottom kept
+        self.assertGreater(len(text), ha.PANE_PROMPT_FACE_CHARS)
+        self.assertTrue(ha._dialog_faces_match(q, wide, tail))
+        self.assertTrue(ha._dialog_faces_match(q, tail["detail"], {"prompt": q, "detail": wide}))
+        # Another question is another prompt.
+        self.assertFalse(ha._dialog_faces_match("Do you want to allow this?", wide, tail))
+        # A tail that starts past the window's end shares nothing it can place.
         self.assertFalse(ha._dialog_faces_match(
-            "Do you want to allow this?", cut, rewrapped))
+            q, wide, {"prompt": q, "detail": text[ha.PANE_PROMPT_FACE_CHARS + 50:]}))
+        # Overlapping by less than PANE_FACE_MIN_OVERLAP is a coincidence.
+        short = ha.PANE_FACE_MIN_OVERLAP - 10
         self.assertFalse(ha._dialog_faces_match(
-            "Do you want to proceed?", cut[:-1], rewrapped))
+            q, wide, {"prompt": q, "detail": text[ha.PANE_PROMPT_FACE_CHARS - short:]}))
+        # Another command that only shares the window's text is not placed in it.
+        self.assertFalse(ha._dialog_faces_match(
+            q, wide, {"prompt": q, "detail": "rm -rf build " + text[-6000:].replace("seg", "SEG")}))
+
+    def test_a_detail_of_exactly_the_wire_cap_is_whole_not_cut(self):
+        # The beat passes the uncut face whenever the 800-char cap cut a detail,
+        # so a detail of exactly 800 chars is a WHOLE one — a longer next prompt
+        # starting with the same 800 chars is another command, not its redraw.
+        self.write(self.tool_use("toolu_T", name="Task",
+                                 inp={"description": "fix", "prompt": "fix it"}))
+        # "Bash command" + 9 lines of 80 + one of 58, newlines between: 800.
+        first = [f"l{i:02d} " + "z" * 76 for i in range(9)] + ["tail " + "z" * 53]
+        pp, face = self.pane_edge(first, 200, at=1000)
+        self.assertEqual(len(pp["detail"]), ha.PANE_PROMPT_DETAIL_CHARS)
+        self.assertIsNone(face)
+        self.pane_edge(first + ["&& rm -rf build"], 200, at=2000)
+        self.assertEqual(len({r["id"] for r in self.rows()}), 2)
+        self.assertFalse(ha._dialog_faces_match(
+            "Do you want to proceed?", "x" * ha.PANE_PROMPT_DETAIL_CHARS,
+            {"prompt": "Do you want to proceed?",
+             "detail": "x" * ha.PANE_PROMPT_DETAIL_CHARS + "\nrm -rf build"}))
+
+    def test_an_overridden_sub_agent_dialog_cut_at_the_face_cap_redraws_as_one_row(self):
+        # A command so long that 14 lines of a very wide pane pass
+        # PANE_PROMPT_FACE_CHARS: the wide face is cut at BOTH caps (a middle
+        # window), the narrow one is the line-capped tail. The sub-agent's hook
+        # overrode the row (no call id of its own), so only the faces tell —
+        # and they overlap, so the redraw keeps the one row.
+        self.write(self.tool_use("toolu_A", name="Agent",
+                                 inp={"description": "x", "prompt": "y"}))
+        body = ["npm test " + "a" * 641] + [
+            f"line{i:02d} " + "".join(chr(97 + (i * 7 + k) % 26) for k in range(643))
+            for i in range(1, 20)] + ["Do it"]
+        wide, wide_face = self.pane_edge(body, 700, at=1000)
+        self.assertIsNotNone(wide_face)
+        self.assertEqual(len(wide_face), ha.PANE_PROMPT_FACE_CHARS)   # cut at both caps
+        self.hook_rows(self.request_hook())
+        self.sm._apply_permission_hook_rows(now_ms=1100, mono=0)
+        row = self.sm._perm_open[self.SID]
+        self.assertEqual((row["tool"], row["toolUseId"]), ("Bash", ""))   # overridden
+        self.pane_edge(body, 120, at=5000)
+        self.edge(None, at=30000, paneBusy=True)
+        rows = {r["id"]: r for r in self.rows()}
+        self.assertEqual(list(rows), [f"d-{self.SID}-1000"])
+        self.assertEqual(rows[f"d-{self.SID}-1000"]["waitedMs"], 29000)
+        self.assertNotIn("detailFace", wide)
 
     def test_the_delegations_own_prompt_is_not_overridden(self):
         # A prompt to LAUNCH the Agent is the delegation's own call: same tool

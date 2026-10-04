@@ -11067,10 +11067,11 @@ def parse_pane_prompt(cap, face=False):
     must meet, and why an idle/working pane can't produce a false positive.
 
     `face=True` adds `detailFace` when the char cap cut `detail`: the same lines
-    uncut, for the permission ledger's repaint test (`_dialog_faces_match`). A
-    face cut at BOTH caps keeps a middle window of the text, and two such windows
-    of one long command at two widths need not overlap at all. Never on the wire:
-    session_report lifts it out to `panePromptFace`, which the beat pops.
+    cut only by PANE_PROMPT_FACE_CHARS, for the permission ledger's repaint test
+    (`_dialog_faces_match`). At 800 chars a face cut at BOTH caps was a middle
+    window, and two such windows of one long command at two widths need not
+    overlap at all. Never on the wire: session_report lifts it out to
+    `panePromptFace`, which the beat pops.
 
     Scanned bottom-up: the dialog owns the bottom of the pane, so an earlier
     dialog still scrolled on screen can't shadow the live one."""
@@ -11336,17 +11337,52 @@ def _dialog_compact(text):
     return re.sub(r"\s+", "", str(text or ""))
 
 
+# Two faces cut at the FACE cap overlap by at least this much compact text before
+# they read as one prompt: shorter is a coincidence of the command's own text.
+PANE_FACE_MIN_OVERLAP = 200
+# Alignments `_windows_overlap` tries per side: a repetitive command matches its
+# probe at every offset, and this runs on the beat. Past it the faces read as two.
+PANE_FACE_MAX_PROBES = 64
+
+
+def _windows_overlap(a, b, min_overlap):
+    """True when `a` and `b` read as two windows of ONE text: one holds the other,
+    or the end of one is the start of the other over at least `min_overlap`
+    chars. Tries at most PANE_FACE_MAX_PROBES alignments a side (longest overlap
+    first), so a repetitive text costs a bounded number of compares."""
+    if not a or not b:
+        return False
+    if a in b or b in a:
+        return True
+    for x, y in ((a, b), (b, a)):
+        probe = y[:min_overlap]
+        if len(probe) < min_overlap:
+            continue
+        pos = x.find(probe)
+        for _ in range(PANE_FACE_MAX_PROBES):
+            if pos == -1:
+                break
+            if y.startswith(x[pos:]):
+                return True
+            pos = x.find(probe, pos + 1)
+    return False
+
+
 def _dialog_faces_match(prev_prompt, prev_detail, prompt):
-    """True when `prompt` (a parse_pane_prompt dict) is the face (`prev_prompt`,
-    `prev_detail`) rewrapped: the question + detail equal with every whitespace
-    removed (the question is the LAST line only, so a wrapped question moves its
-    head into the detail). A face at parse_pane_prompt's caps is a cut of the
-    other: one at PANE_PROMPT_DETAIL_LINES lost its TOP lines (its text is the
-    other's tail); one of exactly PANE_PROMPT_DETAIL_CHARS lost its BOTTOM (its
-    detail is the other's head, under the same question). A face cut at BOTH is
-    a middle window no test here can place, so the beat passes the UNCUT face
-    (`detailFace`), which only the line cap trims. Option labels are not
-    compared: a narrow pane wraps one off the 1..N run."""
+    """True when `prompt` (a parse_pane_prompt dict, its detail the UNCUT face
+    when the beat has one) is the face (`prev_prompt`, `prev_detail`) rewrapped.
+
+    Each face is a WINDOW of one text — the detail lines and then the question
+    — compared with every whitespace removed (the question is the LAST line only,
+    so a wrapped question moves its head into the detail):
+      - uncut: the whole text, so two uncut faces are equal;
+      - cut at PANE_PROMPT_DETAIL_LINES: lost its TOP, so it is the other's tail;
+      - cut at PANE_PROMPT_FACE_CHARS too (14 lines of a very wide pane): lost its
+        bottom detail as well, so its detail is a MIDDLE window, which must
+        overlap the other's text by PANE_FACE_MIN_OVERLAP under the same question.
+    The 800-char wire `detail` is never a face here: the beat passes the uncut
+    face whenever that cap cut it, so a detail of exactly 800 is a whole one.
+    Option labels are not compared: a narrow pane wraps one off the 1..N run."""
     faces = [(str(prev_prompt or ""), str(prev_detail or "")),
              (str(prompt.get("prompt") or ""), str(prompt.get("detail") or ""))]
     full = [_dialog_compact(d + q) for q, d in faces]
@@ -11354,12 +11390,17 @@ def _dialog_faces_match(prev_prompt, prev_detail, prompt):
         return False
     if full[0] == full[1]:
         return True
-    for (q, d), mine, (oq, od), other in ((faces[0], full[0], faces[1], full[1]),
-                                          (faces[1], full[1], faces[0], full[0])):
+    bottom_cut = [len(d) >= PANE_PROMPT_FACE_CHARS for _q, d in faces]
+    if any(bottom_cut):
+        # Both end in the same question (a wrapped one ends the other's text).
+        qs = [_dialog_compact(q) for q, _d in faces]
+        if not (qs[0] and qs[1] and full[0].endswith(qs[1]) and full[1].endswith(qs[0])):
+            return False
+        wins = [_dialog_compact(d) if cut else f
+                for (_q, d), cut, f in zip(faces, bottom_cut, full)]
+        return _windows_overlap(wins[0], wins[1], PANE_FACE_MIN_OVERLAP)
+    for (_q, d), mine, other in ((faces[0], full[0], full[1]), (faces[1], full[1], full[0])):
         if len(d.splitlines()) >= PANE_PROMPT_DETAIL_LINES and other.endswith(mine):
-            return True
-        if (len(d) == PANE_PROMPT_DETAIL_CHARS and _dialog_compact(q) == _dialog_compact(oq)
-                and _dialog_compact(od).startswith(_dialog_compact(d))):
             return True
     return False
 

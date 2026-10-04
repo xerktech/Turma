@@ -118,6 +118,71 @@ test("ingest: a newer dialog row for a session closes that session's row left op
   assert.equal(m.get("d-s1-1").answer, "allow");
 });
 
+test("ingest: any newer row for a session closes that session's ask left open", () => {
+  const ask = (id, at, extra = {}) => ({ id, kind: "ask-in-chat", sessionId: "s1",
+    prompt: "May I push?", openedAt: at, ...extra });
+  ledger.ingest("h1", [ask("a-1", NOW - 10 * MIN), ask("a-2", NOW - 10 * MIN, { sessionId: "s2" })],
+    NOW);
+  // A classifier block (a complete row) for the same session moves it past the ask.
+  ledger.ingest("h1", [row("c-1", { kind: "classifier-denied", dialogKind: undefined,
+    sessionId: "s1", openedAt: NOW - 2 * MIN, closedAt: undefined, waitedMs: undefined,
+    answer: "deny", via: undefined })], NOW);
+  const m = ledger._internals.hosts().get("h1");
+  assert.deepEqual([m.get("a-1").closedAt, m.get("a-1").answer, m.get("a-1").via],
+    [NOW - 2 * MIN, "unknown", "unknown"]);
+  assert.equal(m.get("a-1").waitedMs, undefined);
+  assert.equal(m.get("a-2").closedAt, undefined, "another session's ask is untouched");
+  // A newer ASK closes an older one too; a row OLDER than the ask closes nothing.
+  ledger.ingest("h1", [ask("a-3", NOW - MIN, { sessionId: "s2" }),
+    row("d-old", { sessionId: "s2", openedAt: NOW - 20 * MIN })], NOW);
+  assert.equal(m.get("a-2").closedAt, NOW - MIN);
+  assert.equal(m.get("a-3").closedAt, undefined, "the newest ask stays open");
+  // A dialog row is still closed only by a newer DIALOG row, never by an ask.
+  ledger.ingest("h1", [row("d-open", { sessionId: "s3", openedAt: NOW - 9 * MIN,
+    closedAt: undefined, waitedMs: undefined, answer: undefined, via: undefined }),
+  ask("a-s3", NOW - MIN, { sessionId: "s3" })], NOW);
+  assert.equal(m.get("d-open").closedAt, undefined);
+  // The agent's real close still replaces the hub's.
+  ledger.ingest("h1", [ask("a-1", NOW - 10 * MIN, { closedAt: NOW - 3 * MIN, waitedMs: 7 * MIN,
+    answer: "unknown", via: "turma" })], NOW);
+  assert.deepEqual([m.get("a-1").via, m.get("a-1").waitedMs], ["turma", 7 * MIN]);
+});
+
+test("ingest: a row open past OPEN_MAX_MS is closed as unknown, on every host", () => {
+  const open = { closedAt: undefined, waitedMs: undefined, answer: undefined, via: undefined };
+  const old = NOW - ledger.OPEN_MAX_MS - MIN;
+  ledger.ingest("h2", [row("stale", { ...open, sessionId: "gone", openedAt: old }),
+    row("young", { ...open, sessionId: "live", openedAt: NOW - ledger.OPEN_MAX_MS + MIN }),
+    { id: "ask-stale", kind: "ask-in-chat", sessionId: "gone2", prompt: "ok?", openedAt: old }],
+  NOW - 2 * MIN);
+  const changed = [];
+  const orig = ledger._internals.getBackend();
+  ledger._internals.setBackend({ onChange: (host, rows) => changed.push([host, rows.map((r) => r.id)]) });
+  try {
+    // A beat from ANOTHER host is when the hub notices.
+    ledger.ingest("h1", [row("x1")], NOW);
+  } finally { ledger._internals.setBackend(orig); }
+  const m = ledger._internals.hosts().get("h2");
+  assert.deepEqual([m.get("stale").closedAt, m.get("stale").answer, m.get("stale").via],
+    [NOW, "unknown", "unknown"]);
+  assert.equal(m.get("stale").waitedMs, undefined);
+  assert.equal(m.get("ask-stale").closedAt, NOW);
+  assert.equal(m.get("young").closedAt, undefined, "under the limit stays open");
+  // Each host's closes are persisted under that host.
+  assert.deepEqual(changed, [["h1", ["x1"]], ["h2", ["stale", "ask-stale"]]]);
+  assert.equal(aggregate({ now: NOW }).top.find((g) => g.head === "npm test").open, 1);
+});
+
+test("load: a restored row open past OPEN_MAX_MS is closed as unknown", async () => {
+  ledger.ingest("h1", [row("lost", { closedAt: undefined, waitedMs: undefined, answer: undefined,
+    via: undefined, openedAt: Date.now() - ledger.OPEN_MAX_MS - MIN })], Date.now() - 2 * MIN);
+  await new Promise((resolve) => ledger.flush(resolve));
+  ledger._internals.load();
+  const got = ledger._internals.hosts().get("h1").get("lost");
+  assert.equal(got.answer, "unknown");
+  assert.equal(typeof got.closedAt, "number");
+});
+
 test("ingest: at most EVENTS_PER_BEAT rows a beat; junk hosts refused", () => {
   const many = Array.from({ length: ledger.EVENTS_PER_BEAT + 50 }, (_, i) =>
     row(`x${i}`, { openedAt: NOW - i }));
@@ -152,7 +217,9 @@ test("aggregate: groups by (kind, tool, head) with counts, answers, median wait"
   const { top, recent } = aggregate({ now: NOW });
   const npm = top.find((g) => g.head === "npm test" && g.kind === "dialog");
   assert.deepEqual([npm.count, npm.allowed, npm.denied, npm.medianWaitMs], [3, 2, 1, 3000]);
-  assert.equal(npm.suggestedRule, "Bash(npm test:*)");
+  // Off the safe-head list: no rule, and the reason the card shows instead.
+  assert.equal(npm.suggestedRule, null);
+  assert.match(npm.noRuleReason, /not on the known read-only list/);
   assert.equal(top[0], npm);                                  // most frequent first
   assert.equal(recent.length, 4);
   assert.equal(recent[0].host, "h1");
@@ -169,14 +236,17 @@ test("aggregate: scoped by host set — another org's host never counts", () => 
 
 test("suggestedRule: the deterministic table", () => {
   const cases = [
-    [{ kind: "dialog", dialogKind: "permission", tool: "Bash", head: "npm test" }, "Bash(npm test:*)"],
+    [{ kind: "dialog", dialogKind: "permission", tool: "Bash", head: "git status" },
+      "Bash(git status:*)"],
+    [{ kind: "dialog", dialogKind: "permission", tool: "Bash", head: "npm test" }, null],
     [{ kind: "dialog", tool: "mcp__github__create_issue", head: "mcp__github__create_issue" },
       "mcp__github__create_issue"],
     [{ kind: "dialog", tool: "WebFetch", head: "docs.example.com" }, "WebFetch(domain:docs.example.com)"],
     [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "registry.npmjs.org" },
       "sandbox.network.allowedDomains: registry.npmjs.org"],
-    [{ kind: "classifier-denied", tool: "Bash", head: "git push" },
-      "autoMode.environment: allow Bash(git push:*)"],
+    [{ kind: "classifier-denied", tool: "Bash", head: "gh pr" },
+      "autoMode.environment: allow Bash(gh pr:*)"],
+    [{ kind: "classifier-denied", tool: "Bash", head: "git push" }, null],
     // No tool rule → NO rule: a sentence lifted from the deny reason pastes nowhere.
     [{ kind: "classifier-denied", tool: "Edit", head: "/x", denyReason: "Writing outside the repo. Refused" },
       null],
@@ -187,51 +257,105 @@ test("suggestedRule: the deterministic table", () => {
     [{ kind: "dialog", dialogKind: "plan", tool: "ExitPlanMode", head: "ExitPlanMode" }, null],
     [{ kind: "dialog", tool: "Edit", head: "/repo/a.py" }, null],
     [{ kind: "dialog", tool: "WebFetch", head: "not a host" }, null],
-    [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "pytest" }, "Bash(pytest:*)"],
+    [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "ls" }, "Bash(ls:*)"],
   ];
   for (const [g, want] of cases) assert.equal(suggestedRule(g), want, JSON.stringify(g));
 });
 
-test("suggestedRule: never an allow-everything or malformed Bash prefix rule", () => {
-  // An interpreter / shell / wrapper / keyword head runs whatever follows it.
-  for (const head of ["python3", "bash", "sh", "sudo", "env", "xargs", "timeout", "for",
-    "eval", "/usr/bin/python3", "npx tsx", "uv run", "docker run", "npm exec",
-    // …and the same exec under an alias or a parent noun, plus bare wrappers.
-    "docker container", "docker compose", "npm x", "bun x", "bun run", "yarn exec",
-    "go run", "cargo run", "dotnet run", "kubectl run", "kubectl debug",
-    "stdbuf", "setsid", "chroot", "unshare", "nsenter", "strace", "ltrace", "busybox",
-    "flock", "taskset", "ionice", "chrt", "runuser", "setpriv", "systemd-run",
-    "unbuffer", "expect", "xvfb-run", "dbus-run-session", "tsx", "ts-node",
-    "poetry", "pipx", "pdm", "hatch", "conda", "mamba", "micromamba", "nix", "nix-shell",
-    "mise", "asdf", "direnv", "java", "julia", "Rscript", "tclsh",
-    "cmd", "cmd.exe", "powershell.exe", "pwsh.exe", "wsl", "wsl.exe",
-    "/usr/bin/stdbuf",
-    // …another name for a listed interpreter or exec, and a versioned or .exe
-    // interpreter binary (permlog heads `python3.11 -c …` as `python3.11`).
-    "nodejs", "pypy", "pypy3", "ipython", "bpython", "luajit", "gawk", "mawk", "nawk",
-    "pnpx", "uv tool", "yarn node", "dotnet exec",
-    "python3.11", "/usr/bin/python3.11", "python3.12", "php8.2", "perl5.36", "node22",
-    "lua5.4", "ruby3.2", "tclsh8.6", "python.exe", "node.exe", "bash5"]) {
-    assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
-    assert.equal(suggestedRule({ kind: "classifier-denied", tool: "Bash", head }), null, head);
+// A Bash rule is offered ONLY for a head on the positive allowlist; every other
+// head gets none, with a reason. Each check runs as a dialog and as a classifier
+// block (whose rule is the same tool rule inside an autoMode line).
+function assertNoBashRule(head) {
+  for (const kind of ["dialog", "classifier-denied"]) {
+    const v = ledger.ruleVerdict({ kind, tool: "Bash", head });
+    assert.equal(v.rule, null, `${kind} ${head}`);
+    assert.equal(typeof v.reason, "string", `${kind} ${head}`);
+    assert.ok(v.reason.length > 0, `${kind} ${head}`);
+    assert.equal(suggestedRule({ kind, tool: "Bash", head }), null, `${kind} ${head}`);
   }
+}
+
+test("suggestedRule: an exec head under any name gets no Bash rule, and says why", () => {
+  // Sudo-equivalents, container execs, interpreters, shells and wrappers an open
+  // deny list missed — the allowlist never offers them, listed or not.
+  for (const head of ["pkexec", "podman exec", "nerdctl exec", "bundle exec",
+    "py", "pythonw", "R", "swift", "scala", "groovy", "erl", "ghci", "jshell", "racket",
+    "guile", "sbcl", "ash", "mksh", "yash", "xonsh", "nu", "elvish",
+    "gtimeout", "fakeroot", "proot", "bwrap", "firejail", "torsocks", "proxychains", "chpst",
+    "sg", "valgrind", "perf", "caffeinate", "toybox", "sed",
+    // …and the earlier rounds' list: interpreters, shells, wrappers, keywords,
+    // runner verbs, versioned and .exe binaries.
+    "python3", "bash", "sh", "sudo", "env", "xargs", "timeout", "for", "eval",
+    "/usr/bin/python3", "npx tsx", "uv run", "docker run", "npm exec", "docker container",
+    "docker compose", "npm x", "bun x", "bun run", "yarn exec", "go run", "cargo run",
+    "dotnet run", "kubectl run", "kubectl debug", "stdbuf", "nsenter", "busybox", "poetry",
+    "conda", "java", "Rscript", "cmd.exe", "wsl", "nodejs", "pypy3", "gawk", "pnpx",
+    "uv tool", "yarn node", "dotnet exec", "python3.11", "/usr/bin/python3.11", "php8.2",
+    "perl5.36", "node22", "python.exe", "node.exe", "bash5", "awk", "find", "ssh"]) {
+    assertNoBashRule(head);
+  }
+  assert.match(ledger.ruleVerdict({ kind: "dialog", tool: "Bash", head: "pkexec" }).reason,
+    /runs whatever follows it/);
+});
+
+test("suggestedRule: a head off the allowlist gets no rule — unknown, runner or exec-flag tool", () => {
+  // Unknown CLIs, and known ones whose ARGUMENTS can run code (an exec flag, a
+  // config that names a command, a script runner).
+  for (const head of ["frobnicate", "mytool", "s3cmd", "terraform apply", "npm test",
+    "npm run", "yarn test", "pnpm test", "bun test", "go test", "cargo test", "pytest",
+    "./gradlew test", "make all", "uv sync", "git push", "git fetch", "git pull",
+    "git diff", "git log", "git rebase", "git grep", "kubectl get", "rg", "fd", "sort",
+    "tee", "less", "tsc", "eslint", "curl", "wget", "rm", "cp", "mv", "chmod"]) {
+    assertNoBashRule(head);
+    assert.match(ledger.ruleVerdict({ kind: "dialog", tool: "Bash", head }).reason,
+      /not on the known read-only list|runs whatever follows it|a path runs/, head);
+  }
+  // A path runs whatever binary sits there — even one named like a safe head.
+  for (const head of ["/usr/bin/ls", "./ls", "/tmp/x/cat"]) assertNoBashRule(head);
   // A head outside a plain command shape would be a malformed rule.
-  for (const head of ["(cd", "rm*", "a)b", "$(foo)", "x;y", "make all extra"]) {
-    assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
+  for (const head of ["(cd", "rm*", "a)b", "$(foo)", "x;y", "make all extra", ""]) {
+    assertNoBashRule(head);
   }
   // A BARE subcommand CLI — what permlog's head is when a global flag precedes
-  // the subcommand (`git -C /repo push`, `kubectl -n prod exec`) — allows every
-  // subcommand, the never-listed ones included.
+  // the subcommand (`git -C /repo push`, `kubectl -n prod exec`) — says nothing
+  // about what ran.
   for (const head of ["git", "gh", "docker", "kubectl", "npm", "make", "/usr/bin/git",
     "./gradlew"]) {
-    assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), null, head);
-    assert.equal(suggestedRule({ kind: "classifier-denied", tool: "Bash", head }), null, head);
+    assertNoBashRule(head);
   }
-  // Ordinary commands keep their rule.
-  for (const head of ["npm test", "./gradlew test", "bun test", "go test", "git status",
-    "pytest", "ls", "md5sum", "s3cmd", "uv sync", "yarn test"]) {
+});
+
+test("suggestedRule: every allowlisted head keeps its rule, and no allowlisted head is an exec", () => {
+  const safe = [...ledger.BASH_SAFE_HEADS, ...ledger.BASH_SAFE_SUBCOMMANDS];
+  assert.ok(safe.length > 20);
+  for (const head of safe) {
     assert.equal(suggestedRule({ kind: "dialog", tool: "Bash", head }), `Bash(${head}:*)`, head);
+    assert.equal(suggestedRule({ kind: "classifier-denied", tool: "Bash", head }),
+      `autoMode.environment: allow Bash(${head}:*)`, head);
+    assert.equal(ledger.ruleVerdict({ kind: "dialog", tool: "Bash", head }).reason, undefined);
   }
+  // Single words are single words; two-word heads are subcommands of a CLI
+  // permlog splits that way (or permlog would never produce them).
+  for (const h of ledger.BASH_SAFE_HEADS) assert.ok(!h.includes(" ") && !h.includes("/"), h);
+  for (const h of ledger.BASH_SAFE_SUBCOMMANDS) {
+    assert.ok(ledger.SUBCOMMAND_CLIS.has(h.split(" ")[0]), h);
+  }
+});
+
+test("aggregate: a no-rule Bash group serves its reason; other no-rule groups serve none", () => {
+  ledger.ingest("h1", [
+    row("n1", { head: "pkexec" }),
+    row("n2", { head: "git status" }),
+    row("n3", { tool: "Edit", head: "/repo/a.py" }),
+  ], NOW);
+  const { top } = aggregate({ now: NOW });
+  const by = (h) => top.find((g) => g.head === h);
+  assert.equal(by("pkexec").suggestedRule, null);
+  assert.match(by("pkexec").noRuleReason, /^runs whatever follows it$/);
+  assert.equal(by("git status").suggestedRule, "Bash(git status:*)");
+  assert.equal("noRuleReason" in by("git status"), false);
+  assert.equal(by("/repo/a.py").suggestedRule, null);
+  assert.equal("noRuleReason" in by("/repo/a.py"), false);
 });
 
 test("suggestedRule: the subcommand-CLI set mirrors permlog.py's SUBCOMMAND_CLIS", () => {
@@ -294,15 +418,15 @@ test("aggregate: a classifier block with no rule carries its deny reason", () =>
   ledger.ingest("h1", [
     row("c1", { kind: "classifier-denied", dialogKind: undefined, tool: "Write",
       head: "/home/u/.ssh/config", denyReason: "Writing to SSH configuration", answer: "deny" }),
-    row("c2", { kind: "classifier-denied", dialogKind: undefined, head: "git push",
+    row("c2", { kind: "classifier-denied", dialogKind: undefined, head: "gh pr",
       denyReason: "push is outside scope", answer: "deny" }),
   ], NOW);
   const { top } = aggregate({ now: NOW });
   const write = top.find((g) => g.tool === "Write");
   assert.equal(write.suggestedRule, null);
   assert.equal(write.denyReason, "Writing to SSH configuration");
-  const push = top.find((g) => g.head === "git push");
-  assert.equal(push.suggestedRule, "autoMode.environment: allow Bash(git push:*)");
+  const push = top.find((g) => g.head === "gh pr");
+  assert.equal(push.suggestedRule, "autoMode.environment: allow Bash(gh pr:*)");
   assert.deepEqual([push.allowed, push.denied], [0, 1]);
   // A dialog group never carries a deny reason or a prompt.
   ledger.ingest("h1", [row("d1")], NOW);

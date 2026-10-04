@@ -126,7 +126,8 @@ function loadHelpers(fetchReply = null) {
   const runTimers = async () => {
     for (const t of timers.splice(0).filter(Boolean)) await t.fn();
   };
-  return Object.assign(api, { els, sse, fetches, timers, runTimers, scrollCalls });
+  return Object.assign(api, { els, sse, fetches, timers, runTimers, scrollCalls,
+    navigator: stubs.navigator });
 }
 
 const H = loadHelpers();
@@ -1269,10 +1270,10 @@ const PERM_NOW = Date.parse("2026-10-03T12:00:00Z");
 const permView = {
   days: 7,
   top: [
-    { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "npm test", count: 12,
-      allowed: 11, denied: 1, medianWaitMs: 95000, lastAt: PERM_NOW, suggestedRule: "Bash(npm test:*)" },
-    { kind: "classifier-denied", tool: "Bash", head: "git push", count: 3, allowed: 0, denied: 3,
-      medianWaitMs: null, lastAt: PERM_NOW, suggestedRule: "autoMode.environment: allow Bash(git push:*)" },
+    { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "git status", count: 12,
+      allowed: 11, denied: 1, medianWaitMs: 95000, lastAt: PERM_NOW, suggestedRule: "Bash(git status:*)" },
+    { kind: "classifier-denied", tool: "Bash", head: "gh pr", count: 3, allowed: 0, denied: 3,
+      medianWaitMs: null, lastAt: PERM_NOW, suggestedRule: "autoMode.environment: allow Bash(gh pr:*)" },
     { kind: "dialog", dialogKind: "plan", tool: "ExitPlanMode", head: "ExitPlanMode", count: 1,
       allowed: 1, denied: 0, medianWaitMs: 4000, lastAt: PERM_NOW, suggestedRule: null },
   ],
@@ -1285,7 +1286,7 @@ const permView = {
 test("XERK-1563: the permission card lists each prompt with its rule and a copy button", () => {
   const html = H.permissionsCardHtml(permView, PERM_NOW);
   assert.match(html, /Permission prompts \(7 days\)/);
-  assert.match(html, /<code>Bash\(npm test:\*\)<\/code><button[^>]*data-perm-rule="Bash\(npm test:\*\)"/);
+  assert.match(html, /<code>Bash\(git status:\*\)<\/code><button[^>]*data-perm-rule="Bash\(git status:\*\)"/);
   // count, answers, median wait — each labelled for the phone's stacked block
   assert.match(html, /data-label="Count">12<\/td>\s*<td[^>]*data-label="Allowed \/ denied">11 \/ 1<\/td>\s*<td[^>]*data-label="Median wait">2m<\/td>/);
   assert.match(html, /k-classifier-denied/);
@@ -1383,7 +1384,7 @@ test("XERK-1563: the card's fetch is scoped by the header's org filter", async (
   const url = H3.fetches.filter((u) => u.startsWith("/api/permissions")).pop();
   assert.equal(url, "/api/permissions?days=7&org=acme.atlassian.net%2Crival.atlassian.net");
   assert.equal(H3.getPermView(), permView);
-  assert.match(H3.els.permissions.innerHTML, /Bash\(npm test:\*\)/);
+  assert.match(H3.els.permissions.innerHTML, /Bash\(git status:\*\)/);
 });
 
 test("XERK-1563: the card's first fetch waits for the org scope, then follows it", async () => {
@@ -1427,6 +1428,33 @@ test("XERK-1563: an ask-in-chat group shows its question as prose and no 0 / 0",
   // An older hub that still sends 0 / 0 for an ask reads the same.
   assert.doesNotMatch(H.permissionsCardHtml({ days: 7, recent: [], top: [
     { kind: "ask-in-chat", prompt: "ok?", count: 1, allowed: 0, denied: 0 }] }, PERM_NOW), /0 \/ 0/);
+});
+
+test("XERK-1563: a Bash head with no safe rule says review it, and Copy copies nothing", async () => {
+  const noRule = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "pkexec", count: 4,
+    allowed: 4, denied: 0, suggestedRule: null,
+    noRuleReason: "runs whatever follows it" };
+  const safe = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "git status",
+    count: 1, allowed: 1, denied: 0, suggestedRule: "Bash(git status:*)" };
+  const html = H.permissionsCardHtml({ days: 7, recent: [], top: [noRule] }, PERM_NOW);
+  assert.match(html, /<td class="perm-rule"><span class="none">no safe rule — review it<\/span><div class="perm-why">runs whatever follows it<\/div><\/td>/);
+  // Nothing to copy: no button, no rule attribute, no Bash(...) anywhere.
+  assert.doesNotMatch(html, /data-perm-rule|perm-copy|Bash\(/);
+  // The click handler copies only a [data-perm-rule] button: a click anywhere in
+  // the no-rule row writes nothing; a rule's own button writes exactly its rule.
+  const H6 = loadHelpers(() => ({ days: 7, recent: [], top: [noRule, safe] }));
+  await H6.refreshPermissions();
+  const writes = [];
+  H6.navigator.clipboard = { writeText: (t) => { writes.push(t); return Promise.resolve(); } };
+  const click = (target) => H6.els.permissions.listeners.click.forEach((fn) => fn({ target }));
+  click({ closest: () => null });                    // the no-rule cell: no button inside it
+  assert.deepEqual(writes, []);
+  const btn = { textContent: "Copy", getAttribute: (k) => (k === "data-perm-rule" ? "Bash(git status:*)" : null) };
+  click({ closest: (sel) => (sel === "[data-perm-rule]" ? btn : null) });
+  assert.deepEqual(writes, ["Bash(git status:*)"]);
+  // The rendered card holds exactly one copyable rule — the safe group's.
+  const rules = [...H6.els.permissions.innerHTML.matchAll(/data-perm-rule="([^"]*)"/g)].map((m) => m[1]);
+  assert.deepEqual(rules, ["Bash(git status:*)"]);
 });
 
 test("XERK-1563: a classifier block with no rule says why, with nothing to copy", () => {

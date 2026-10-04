@@ -27,10 +27,17 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 - Bounds: `EVENTS_PER_BEAT` (200) per beat, `PERMISSION_LEDGER_HOST_MAX_ROWS` per host (a flooding
   host cannot evict the fleet), `PERMISSION_LEDGER_MAX_ROWS` (20000) store-wide, oldest-`openedAt`
   first; `PERMISSION_LEDGER_DAYS` (30) retention.
-- **A newer `dialog` row for a session closes that session's older OPEN dialog row on the same host**
-  (`closeSuperseded`, `answer`/`via` "unknown", no `waitedMs`). A pane shows one dialog at a time and
-  the agent closes before it opens, so only a lost row (a manager restart) is still open — else it
-  reads "open" for 30 days. A real closed copy arriving later replaces it by id.
+- **The hub closes rows the agent lost** (a manager restart forgets its open rows), each with
+  `answer`/`via` "unknown" and no `waitedMs`; a real closed copy arriving later replaces it by id.
+  Else a lost row reads "open" for the 30-day window.
+  - `closeSuperseded`, on the same host: a newer `dialog` row for a session closes that session's
+    older OPEN dialog row (a pane shows one dialog at a time and the agent closes before it opens);
+    ANY newer row for a session closes its older OPEN `ask-in-chat` row (the session ran past it).
+    `closedAt` = the newer row's `openedAt`. A dialog is never closed by an ask or a classifier row.
+  - `ageOut`, on EVERY host at every ingest, `load()` and rescan: a row open past `OPEN_MAX_MS` (24h)
+    closes with `closedAt` = now. This is what closes a lost row whose session never files again (a
+    session deleted while the manager was down, a host gone). A prompt really open that long reads
+    closed-unknown until the agent's own close arrives.
 - **And a BYTE budget**, oldest first: every cap is in chars, so a row reaches ~15 KB of UTF-8 and
   20000 of them would be a file `load()` refuses (the ledger lost at the next boot). The budget is
   the smaller of 0.9 x `PERMISSION_LEDGER_FILE_MAX` and a sixteenth of the container limit
@@ -45,7 +52,7 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 | `ask-in-chat` | `model behaviour: see CLAUDE.md step 0` |
 | `dialog` `sandbox` naming a host | `sandbox.network.allowedDomains: <host>` |
 | `classifier-denied` | `autoMode.environment: allow <tool rule>`; NONE without a tool rule |
-| Bash | `Bash(<head>:*)`; NONE for an interpreter/wrapper/keyword head, a bare subcommand CLI, a malformed one |
+| Bash | `Bash(<head>:*)` ONLY for a head on the allowlist; any other head gets NONE plus `noRuleReason` |
 | MCP | the full `mcp__<server>__<tool>` |
 | WebFetch | `WebFetch(domain:<d>)` |
 | a plan approval, a file path, anything else | none |
@@ -53,19 +60,29 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 - **A classifier block with no tool rule gets NO rule** — a sentence lifted from its deny reason
   pastes nowhere. Its group carries `denyReason` instead, shown as the "why" under "no rule".
 - The ask-in-chat entry is a pointer, not a setting: the card shows it as text with no Copy.
-- **Never an allow-everything Bash rule** (`BASH_NEVER_HEADS`): `Bash(python3:*)`, `Bash(sudo:*)`,
-  `Bash(env:*)`… run whatever follows. A head outside `BASH_HEAD_RE` (`(cd`, a glob) would be a
-  malformed rule. Both get no rule — the table is copied verbatim, and XERK-1566 consumes it.
-- **The never-list names each exec under EVERY spelling**: an alias or parent noun heads as itself
-  (`docker container run` → `docker container`, `docker compose run` → `docker compose`, `npm x`,
-  `yarn exec`, `go run`), and a wrapper/runner whose head is the bare CLI (`stdbuf`, `nsenter`,
-  `poetry`, `conda`) covers its argument. Add a new exec form here, with a test row, as it is found.
-- **A versioned or `.exe` interpreter binary is its family** (`bashFamily`): `python3.11`, `php8.2`,
-  `node22`, `python.exe` are checked with the version/`.exe` cut. Over-matching only withholds a rule.
-- **Nor a BARE subcommand CLI** (`git`, `docker`, `kubectl`, `make`…; `SUBCOMMAND_CLIS`, a
-  parity-tested mirror of permlog.py's set). permlog keeps the subcommand only as the SECOND word, so
-  `git -C /repo push` / `kubectl -n prod exec` head as the bare CLI, whose rule allows every
-  subcommand — the never-listed `docker run`/`kubectl exec` and `git -c alias.x='!sh'` included.
+- **Never an allow-everything Bash rule, by construction: a POSITIVE allowlist.** `BASH_SAFE_HEADS`
+  (single words: `ls`, `cat`, `grep`, `jq`…) and `BASH_SAFE_SUBCOMMANDS` (`git status`, `gh pr`,
+  `docker ps`…) are the ONLY Bash heads that get `Bash(<head>:*)`. A prefix rule allows the head with
+  ANY arguments, so a head is listed only when no argument it takes can run code. Every other head —
+  an interpreter, shell, wrapper, runner, unknown CLI, a path to a binary — gets `null`.
+  - **A deny list cannot be the safety**: an open list always misses a spelling (`pkexec`,
+    `podman exec`, `xonsh`, `firejail`, `sed -e`). `BASH_NEVER_HEADS` stays only as a SECOND check
+    and to word the reason; a versioned/`.exe` binary is its family there (`bashFamily`).
+  - **Left off on purpose** (an argument runs a command or writes any file): `git diff`/`log`/`show`
+    (`--output`), `git fetch`/`pull`/`push` (`--upload-pack`/`--receive-pack`), `git rebase`
+    (`--exec`), `kubectl get` (`--kubeconfig` exec plugin), `npm test`/`run` (`--node-options`,
+    `--script-shell`), `go test` (`-exec`), `cargo` (`--config`), `make` (variable overrides), `find`,
+    `rg` (`--pre`), `sort` (`--compress-program`). Add a head only with its argument surface checked,
+    and a test row. Missing one only withholds a suggestion.
+  - **A no-rule Bash group serves `noRuleReason`**, WHY there is none (runs whatever follows it / a
+    path / a bare subcommand CLI / not on the read-only list / not a plain command name). The card
+    shows "no safe rule — review it" over the reason, with NO Copy button. Groups with
+    no rule for another reason (a plan, a file path) serve no `noRuleReason`. `ruleVerdict` returns
+    both; `suggestedRule` is its rule. XERK-1566's judge reads this table's shape unchanged.
+  - A head outside `BASH_HEAD_RE` (`(cd`, a glob) would be a malformed rule; a BARE subcommand CLI
+    (`git`, `docker`; `SUBCOMMAND_CLIS`, a parity-tested mirror of permlog.py's set) says nothing
+    about what ran — permlog keeps the subcommand only as the SECOND word, so `git -C /repo push`
+    heads as `git`.
 
 `head` = the Bash command's first word, two for a subcommand CLI (`git push`, `npm test`), leading
 `VAR=x` skipped; the file path; the MCP tool name; the WebFetch domain. The LLM judge (XERK-1566)

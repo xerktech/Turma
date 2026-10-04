@@ -1705,6 +1705,11 @@ function permRuleHtml(g) {
   }
   const why = g.kind === "classifier-denied" && typeof g.denyReason === "string" && g.denyReason
     ? `<div class="perm-why">Blocked: ${esc(g.denyReason)}</div>` : "";
+  // A Bash head off the hub's safe list: no rule to copy, and the hub's reason.
+  if (typeof g.noRuleReason === "string" && g.noRuleReason) {
+    return `<span class="none">no safe rule — review it</span>` +
+      `<div class="perm-why">${esc(g.noRuleReason)}</div>${why}`;
+  }
   return `<span class="none">no rule retires this</span>${why}`;
 }
 
