@@ -1383,6 +1383,48 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_env_short_option_with_glued_value_is_not_split_string(self):
+        # `-u`/`-C` take the rest of the token as their VALUE, so an `S` in it is
+        # not `-S`; reading `-uSHELL` as a command line hid the `rm` (QA, D2).
+        R = self.R
+        for cmd in (f"env -uSHELL {R}", f"env -CSx {R}", f"env -u SHELL {R}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("env -u SHELL ls", "env -C /tmp ls", "env -i PATH=/bin ls"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_shell_option_parsing_on_the_stdin_reader(self):
+        # Glued `-o` takes `pipefail`, so it is not the script file; a `-c` after
+        # `--` is positional, not the flag; `flock` fronting a shell still reads
+        # the pipe (QA, D4). Each ran the marker in real bash.
+        R = self.R
+        for cmd in (f"echo '{R}' | bash -euo pipefail", f"bash -euo pipefail <<< '{R}'",
+                    f"cat <<'EOF' | bash -euo pipefail\n{R}\nEOF",
+                    f"echo '{R}' | sh -s -- -c x", f"echo '{R}' | flock lk sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("bash -euo pipefail script.sh")
+
+    def test_producer_behind_a_prefix_still_prints(self):
+        R = self.R
+        for cmd in (f"sudo echo '{R}' | sh", f"time echo '{R}' | bash",
+                    f"nohup printf '{R}' | sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_flock_wrapping_an_inner_options_c_is_not_flocks(self):
+        # `flock lk grep -c X` — the `-c` is grep's; scanning every token for it
+        # false-denied an ordinary grep (QA, D5).
+        self.assertAllowed(f"flock lk grep -c '{self.R}' notes.txt")
+
+    def test_a_long_pipeline_to_a_shell_does_not_hang(self):
+        # A fresh re-scan per stdin reader was O(stages²) and timed the hook out,
+        # which fails OPEN (QA, D1). The trailing payload must still be denied,
+        # and quickly — the cost here is the regression's canary, not asserted.
+        cmd = " | ".join(["echo ls"] * 3000) + f"; {self.R}"
+        self.assertDenied(cmd)
+
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
         for cmd in DESTRUCTIVE:

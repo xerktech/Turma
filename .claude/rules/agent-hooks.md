@@ -262,8 +262,14 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   - **A string that BECOMES a script is expanded as commands** (XERK-1539): find `-exec`/xargs
     argv re-expanded; `flock -c`, `env -S`, `eval --`; and a shell reading its script from
     stdin/fd (`_reads_stdin_script`) gets what a pipe, `<<<`, `<(…)` or heredoc feeds it.
-    - Only PRINTED text is knowable (`_fed_script`): `curl … | sh`, `cat f | sh` and a
-      transforming filter (`tr`, `sed`) stay residuals — don't describe pipes as closed.
+    - Only PRINTED text is knowable: `curl … | sh`, `cat f | sh`, a transforming filter
+      (`tr`, `sed`), `$(which sh)`/`$SHELL`, and `read l; $l` stay residuals — don't call
+      pipes closed. The per-pipeline fed-text scan is bounded (`_FED_TEXT_CAP`, dedup) so a
+      huge `echo|sh` chain can't time the hook out (which fails OPEN) — a reader past the cap
+      is a miss, not a hang.
+    - The producer→shell link is lost where `_split_on_operators` severs the pipeline — the
+      `&` in `2>&1`/`|&`, the `;` inside `{ …; }` — a pre-existing splitter limit this relies
+      on; wrapped forms (`echo P | ssh h sh`, `| docker exec -i c sh`) are residuals too.
   - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old vs
     new guard): 0 diffs is the bar, or each diff explained. Unit cases missed every false deny above.
   - Keep in sync with the twin hook outside this repo.

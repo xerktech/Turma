@@ -436,7 +436,12 @@ def _subst_standalone(m: "re.Match[str]") -> bool:
 def _printed_text(command: str) -> str | None:
     """What ``command`` prints when it only prints its arguments (echo, or
     printf rendered as printf would), else None."""
-    toks = _tokenize(command)
+    return _printed_from_tokens(_tokenize(command))
+
+
+def _printed_from_tokens(toks: list[str]) -> str | None:
+    """`_printed_text` from an already-tokenised argv, so a caller can strip a
+    prefix (`sudo echo …`) without re-joining and corrupting printf's words."""
     if not toks:
         return None
     prog = _basename(toks[0])
@@ -1251,14 +1256,24 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
 
 def _env_split_string(opt: str, rest: list[str]) -> str | None:
     """The command line `env -S`/`--split-string` carries, consuming a separate
-    value from ``rest``; None for any other `env` option. `--s` is already
-    unambiguous to getopt, and a short cluster ends at `S` (`-iS'…'`)."""
-    if opt.startswith("--s"):
+    value from ``rest``; None for any other `env` option.
+
+    A short cluster is walked letter by letter: `env`'s own value-taking short
+    options (`-u NAME`, `-C DIR`) consume the REST of the token, so an `S` after
+    one of them is part of that value, not `-S` — `env -uSHELL rm -rf /` runs
+    `rm`, and reading the glued `SHELL` as a command line hid it (XERK-1539)."""
+    if opt.startswith("--split-string"):
         if "=" in opt:
             return opt.split("=", 1)[1]
         return rest.pop(0) if rest else ""
-    if not opt.startswith("--") and "S" in opt:
-        return opt[opt.index("S") + 1:] or (rest.pop(0) if rest else "")
+    if opt.startswith("--"):
+        return None
+    for j in range(1, len(opt)):
+        c = opt[j]
+        if c == "S":
+            return opt[j + 1:] or (rest.pop(0) if rest else "")
+        if c in ("u", "C"):  # consumes the remainder (or next token) as its value
+            return None
     return None
 
 
@@ -1290,6 +1305,15 @@ def _reads_stdin_script(stage: str) -> bool:
     if not tokens:
         return False
     prog, rest = _basename(tokens[0]), tokens[1:]
+    # Peel a wrapper that execs the shell in place (`flock lk sh`, `ssh h sh`):
+    # the shell it runs still inherits the pipeline's stdin.
+    seen = 0
+    while prog in _EXEC_WRAPPERS and rest and seen < 4:
+        inner = _wrapper_command(prog, rest)
+        if not inner:
+            break
+        prog, rest = _basename(inner[0]), inner[1:]
+        seen += 1
     if prog == "busybox" and rest and _basename(rest[0]) in _SHELL_PROGS:
         prog, rest = _basename(rest[0]), rest[1:]
     if prog in ("source", "."):
@@ -1314,7 +1338,9 @@ def _reads_stdin_script(stage: str) -> bool:
         if tok[:1] in "-+" and len(tok) > 1:
             if not tok.startswith("--") and "s" in tok[1:]:
                 return True  # `-s`: the script is stdin, the rest are $1…
-            i += 1
+            # `-o`/`-O` take the next token (`bash -euo pipefail`), so it is an
+            # option value, not the script file (XERK-1539).
+            i += 2 if (not tok.startswith("--") and ("o" in tok[1:] or "O" in tok[1:])) else 1
             continue
         return bool(_STDIN_SCRIPT_RE.match(tok))
     return True
@@ -1333,27 +1359,10 @@ def _herestrings(stage: str) -> list[str]:
     return out
 
 
-def _fed_script(stages: list[str], k: int) -> list[str]:
-    """The text stage ``k`` of a pipeline reads as a script, as far as it is
-    knowable: its own here-strings and `<(…)` producers, and what an earlier
-    stage PRINTS — `echo '…' | sh`, `printf … | tee f | bash`, `cat <<< '…' |
-    sh`. An earlier stage counts wherever it sits, since a filter between
-    passes the text on. What a file, network or interpreter produces cannot be
-    known here; `curl … | sh` stays a residual (XERK-1539)."""
-    texts = _herestrings(stages[k])
-    for m in _SUBST_RE.finditer(stages[k]):
-        if m.group(0).startswith("<("):
-            printed = _printed_text(_subst_inner(m))
-            if printed and printed.strip():
-                texts.append(printed)
-    for prev in stages[:k]:
-        for seg in _split_segments(_unwrap_group(prev)):
-            seg = _unwrap_group(seg)
-            printed = _printed_text(seg)
-            if printed and printed.strip():
-                texts.append(printed)
-            texts.extend(_herestrings(seg))
-    return texts
+# The most distinct producer texts fed to the shells in one pipeline. A real
+# `echo '…' | sh` has one; the cap only bites a pathological chain of many
+# DIFFERENT producers, where it costs a miss, never a timeout (XERK-1539).
+_FED_TEXT_CAP = 64
 
 
 def _basename(prog: str) -> str:
@@ -1380,8 +1389,13 @@ def _shell_c_index(rest: list[str]) -> int:
     script in exactly the place `-c` does. Testing for the bare `-c` token alone
     missed every combined spelling — and `bash -lc` is the form a shell actually
     gets invoked with.
+
+    `--` ends options: a `-c` after it is a positional argument, not the flag
+    (`sh -s -- -c x` reads stdin), so the scan stops there (XERK-1539).
     """
     for i, tok in enumerate(rest):
+        if tok == "--":
+            return -1
         if tok == "-c":
             return i
         if tok.startswith("-") and not tok.startswith("--") and "c" in tok[1:]:
@@ -1491,12 +1505,41 @@ def _expand_segments(command: str, depth: int = 0,
     # A shell that reads its SCRIPT from stdin runs whatever the pipeline,
     # a here-string or a `<(…)` feeds it — `echo '<cmd>' | sh`, `sh <<< '<cmd>'`,
     # `. <(echo '<cmd>')` — none of which is an argv of its own (XERK-1539).
+    #
+    # Walk each pipeline left to right ONCE, accumulating the DISTINCT texts
+    # earlier stages print (a filter between passes them on). A fresh re-scan of
+    # every earlier stage per reader was O(stages²) and a 60 KB `echo|sh` chain
+    # took 15 min — past the hook timeout, which fails OPEN. De-duping and the
+    # fed-text cap bound the work; a reader past the cap is a miss, never a hang.
     for pipeline in _split_on_operators(command, include_pipe=False):
-        stages = _split_segments(pipeline)
-        for k, stage in enumerate(stages):
-            if _reads_stdin_script(_unwrap_group(stage)):
-                for text in _fed_script(stages, k):
-                    out.extend(_expand_segments(text, depth + 1, every_cd))
+        producers: list[str] = []       # distinct printed/here-string texts so far
+        seen_texts: set[str] = set()
+        def _feed(text: str) -> None:
+            if text and text.strip() and text not in seen_texts \
+                    and len(seen_texts) < _FED_TEXT_CAP:
+                seen_texts.add(text)
+                producers.append(text)
+        for stage in _split_segments(pipeline):
+            ustage = _unwrap_group(stage)
+            if _reads_stdin_script(ustage):
+                fed = list(producers)
+                fed.extend(_herestrings(ustage))
+                for m in _SUBST_RE.finditer(ustage):
+                    if m.group(0).startswith("<("):
+                        printed = _printed_text(_subst_inner(m))
+                        if printed:
+                            fed.append(printed)
+                for text in fed:
+                    if text.strip():
+                        out.extend(_expand_segments(text, depth + 1, every_cd))
+            # This stage's own contribution to readers DOWNSTREAM of it. A
+            # producer behind a prefix (`sudo echo …`, `time printf …`) still
+            # prints, so strip them before reading what it emits.
+            for seg in _split_segments(ustage):
+                seg = _unwrap_group(seg)
+                _feed(_printed_from_tokens(_strip_prefixes(_tokenize(seg))) or "")
+                for hs in _herestrings(seg):
+                    _feed(hs)
     for raw in segments:
         if every_cd != cwds:
             cwds = _cd_targets(_SUBST_RE.sub(_subst_text, raw), cwds)
@@ -1603,19 +1646,14 @@ def _expand_segments(command: str, depth: int = 0,
             # containing whitespace": that is the construct removed from eval
             # two rounds ago, and it reads `ssh host git commit -m 'rm -rf /etc
             # is banned'` as a destructive command.
-            if prog == "flock":
-                # `flock f -c '<cmd>'` hands its `-c` value to `sh -c`.
-                for idx, tok in enumerate(rest):
-                    value = None
-                    if tok.startswith("--command"):
-                        value = tok.split("=", 1)[1] if "=" in tok else (
-                            rest[idx + 1] if idx + 1 < len(rest) else None)
-                    elif tok.startswith("-") and not tok.startswith("--") and "c" in tok:
-                        value = tok[tok.index("c") + 1:] or (
-                            rest[idx + 1] if idx + 1 < len(rest) else None)
-                    if value:
-                        out.extend(_expand_segments(value, depth + 1, cwds))
             inner_cmd = _wrapper_command(prog, rest)
+            if prog == "flock" and inner_cmd and inner_cmd[0] == "-c" and len(inner_cmd) > 1:
+                # `flock <file> -c '<cmd>'` hands its OWN `-c` value to `sh -c`.
+                # Only flock's — `-c` LEADING the command region, never a `-c`
+                # among the inner command's args (`flock lk grep -c x`, where it
+                # is grep's option; scanning every token false-denied that). The
+                # `--command=`/`-xc` spellings util-linux rejects are left out.
+                out.extend(_expand_segments(inner_cmd[1], depth + 1, cwds))
             if len(inner_cmd) == 1 and re.search(r"\s", inner_cmd[0]):
                 out.extend(_expand_segments(inner_cmd[0], depth + 1, cwds))
             elif inner_cmd and prog in _JOINING_WRAPPERS:
