@@ -228,6 +228,7 @@ function makeForwarder(store, replicaId, deps = {}) {
   let lastMode = null; // for the edge-only mode log
   let draining = false; // set by stop(): this replica is shutting down
   let refusing = 0; // oversize bodies being drained by refuseOversize() right now
+  let relayLingering = 0; // relayed early answers draining the client's unread body (lingerRelay)
   const seenProofs = new Map(); // nonce -> expiry: proofs already accepted (replay guard)
   const hopCache = new WeakMap(); // req -> {hops, loop}: its verified proof (decide() re-runs per poll)
   const ownAliases = new Map(); // addr -> until: leader addresses PROVEN to lead back to us (a 508)
@@ -586,6 +587,30 @@ function makeForwarder(store, replicaId, deps = {}) {
     req.on("error", release);
   }
 
+  // The leader answered before the client finished sending its body (a 413/503 refusal,
+  // a 401): close the CLIENT socket without a reset once that answer is relayed
+  // (XERK-1090). Destroying a socket whose receive buffer holds unread bytes makes the
+  // kernel send an RST, and a client still writing (python urllib: the agent) has it
+  // discard the answer it already received — BrokenPipe instead of "shrink"/"retry".
+  // So, as refuseOversize and the leader's endRefusedConnection do: FIN once the answer
+  // is flushed, read and discard until the client closes, destroy after drainLingerMs
+  // regardless. Discarding is read churn, so at most drainMax relays linger at once;
+  // past that the answer goes out and the socket is reset as before. Returns whether it
+  // lingers: the caller then marks the answer `connection: close`, which is what makes
+  // Node call the destroySoon taken over here.
+  function lingerRelay(req) {
+    const sock = req.socket;
+    if (!sock || sock.destroyed || relayLingering >= drainMax) return false;
+    relayLingering += 1;
+    const kill = () => { try { sock.destroy(); } catch { /* gone */ } };
+    // Bounded from the answer, so one that never flushes cannot hold the slot either.
+    const t = setTimeout(kill, drainLingerMs);
+    if (t.unref) t.unref();
+    sock.once("close", () => { clearTimeout(t); relayLingering -= 1; });
+    sock.destroySoon = () => { try { sock.end(); req.resume(); sock.resume(); } catch { kill(); } };
+    return true;
+  }
+
   // Forward one HTTP request. Resolves true once it is handled here (proxied,
   // refused as oversize, or the client left while held), false when the caller
   // should serve it locally. Never throws, never rejects.
@@ -658,8 +683,13 @@ function makeForwarder(store, replicaId, deps = {}) {
       req.unpipe(feed);
       // A client that went away mid-request: nothing to relay to.
       if (res.destroyed) { upRes.resume(); up.destroy(); return; }
+      const outHeaders = endToEnd(upRes.rawHeaders || []);
+      // A refusal while the body is still arriving: the client will never be read to its
+      // end, so close behind the answer without a reset (XERK-1090). Only an error status:
+      // an early 2xx may be a long-lived stream, which drainLingerMs would truncate.
+      if (upRes.statusCode >= 400 && !req.complete && lingerRelay(req)) outHeaders.push("Connection", "close");
       try {
-        res.writeHead(upRes.statusCode, upRes.statusMessage, endToEnd(upRes.rawHeaders || []));
+        res.writeHead(upRes.statusCode, upRes.statusMessage, outHeaders);
       } catch {
         up.destroy();
         res.destroy();
@@ -678,7 +708,12 @@ function makeForwarder(store, replicaId, deps = {}) {
       // connection) is not a failure of the answer: let the response relay finish.
       if (answered && res.headersSent) return; // upRes' own close/error handling settles it
       if (!res.headersSent && !res.writableEnded && !res.destroyed) {
-        res.writeHead(502, { "content-type": "application/json", "retry-after": "1" });
+        const h = { "content-type": "application/json", "retry-after": "1" };
+        // The leader cut the body short (past its own linger cap): our 502 must reach a
+        // client still writing it too, so close behind it the same way (XERK-1090).
+        req.unpipe(feed);
+        if (!req.complete && lingerRelay(req)) h.connection = "close";
+        res.writeHead(502, h);
         res.end(JSON.stringify({ error: `hub leader unreachable — retry (${e.message})` }));
       } else {
         res.destroy();

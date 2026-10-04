@@ -141,6 +141,17 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
     or migration blob (the leader RECORDS those refusals), NOT default-`BODY_MAX` routes (not every
     POST reads its body). Those, chunked bodies and anything past `drainMax` concurrent refusals keep
     the old path: forwarded through the yielding feed stage, the 502 race still possible (rare).
+- **A RELAYED answer that beats the client's body lingers too** (XERK-1090, `lingerRelay`). The
+  leader's 413/503/401 arrives while the client is still writing; the follower stops feeding the
+  leader, so closing the client socket then is an RST that erases the relayed answer (urllib:
+  BrokenPipe). FIN + discard + `drainLingerMs`, marked `connection: close`, its OWN count capped
+  at `drainMax` (not the `refusing` slots); past it, the old reset. Tests: `XERK-1090: …`.
+  - Only a status >= 400, and the follower's own 502 (leader reset mid-body). An early 2xx may be
+    a long-lived stream that `drainLingerMs` would truncate.
+  - Residual (accepted, as on the leader): a request PIPELINED after the lingered answer is still
+    parsed and forwarded, its answer lost. urllib and nginx don't pipeline.
+  - Test clients must read NOTHING until their write completes (`writeThenRead`): an in-process
+    client that reads as it writes wins the race and passes against the broken code.
 - **Asymmetric store partition — a store-less leader STEPS DOWN, a store-less replica REFUSES if the
   lease is held elsewhere (XERK-935).** A leader whose store link is down cannot publish/refresh its
   endpoint, so a healthy-store follower used to degrade and serve too (two writers). Two-part fix, one
