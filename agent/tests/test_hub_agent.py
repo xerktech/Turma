@@ -38429,13 +38429,38 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
                          (ha.REGISTRY_DIR, ha.subprocess.DEVNULL, True))
         self.assertNotEqual(kw["stdout"], ha.subprocess.PIPE, "a file, never a pipe")
         proc.wait.assert_called_once_with(timeout=ha.ATTENTION_HINT_TIMEOUT_SEC)
-        self.assertFalse(os.path.exists(os.path.join(ha.REGISTRY_DIR, "attention-hint.out")),
+        self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR)
+                          if n.startswith("attention-hint")], [],
                          "the output file is removed")
         popen, _ = self._fake_popen(out, rc=1)
         with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
             self.assertIsNone(self.sm._run_attention_hint(["claude"]))
         with mock.patch.object(ha.subprocess, "Popen", side_effect=OSError("no claude")):
             self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFOs")
+    def test_a_planted_fifo_or_symlink_never_blocks_or_truncates(self):
+        # ~/.turma is session-writable: the reply file is a fresh mkstemp, so a
+        # FIFO or symlink planted at the old fixed name is never opened.
+        os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
+        os.mkfifo(os.path.join(ha.REGISTRY_DIR, "attention-hint.out"))
+        victim = os.path.join(self.tmp_victim_dir(), "victim")
+        with open(victim, "w") as f:
+            f.write("keep")
+        os.symlink(victim, os.path.join(ha.REGISTRY_DIR, "attention-hint-x.out"))
+        out = json.dumps({"label": "looping", "why": "Same error."}).encode()
+        popen, calls = self._fake_popen(out)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
+            hint = self.sm._run_attention_hint(["claude"])
+        self.assertEqual(hint, {"label": "looping", "why": "Same error."})
+        self.assertEqual(len(calls), 1)
+        with open(victim) as f:
+            self.assertEqual(f.read(), "keep")
+
+    def tmp_victim_dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
 
     def test_a_hung_run_kills_its_whole_group_and_never_waits_unbounded(self):
         # A grandchild holding stdout must not wedge the one worker: the run

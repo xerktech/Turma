@@ -63,6 +63,7 @@ import struct
 import subprocess
 import sys
 import tarfile
+import tempfile
 import threading
 import time
 import urllib.error
@@ -30286,19 +30287,28 @@ class SessionManager:
         an argv element, never a shell string. Output goes to a FILE, not a pipe
         (the _start_summary shape), and the child leads its own process group,
         killed whole on a timeout: a pipe read waits for EOF without bound, so a
-        grandchild holding stdout would wedge this one worker for good. Returns
-        the strictly-parsed verdict or None."""
+        grandchild holding stdout would wedge this one worker for good. The file
+        is a fresh mkstemp (O_EXCL, never a fixed name): sessions can write
+        ~/.turma, and a FIFO planted at a fixed name would block this worker on
+        open() for good, a symlink would truncate its target. The reply is read
+        back through the SAME descriptor, so a swapped path is never read.
+        Returns the strictly-parsed verdict or None."""
         os.makedirs(REGISTRY_DIR, exist_ok=True)
-        out_path = os.path.join(REGISTRY_DIR, "attention-hint.out")
         try:
-            with open(out_path, "wb") as outf:
-                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=outf,
-                                        stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
-                                        start_new_session=True)
+            fd, out_path = tempfile.mkstemp(prefix="attention-hint-", suffix=".out",
+                                            dir=REGISTRY_DIR)
         except OSError as e:
             log(f"wait classifier launch failed: {e}")
             return None
+        outf = os.fdopen(fd, "w+b")
         try:
+            try:
+                proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=outf,
+                                        stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                                        start_new_session=True)
+            except OSError as e:
+                log(f"wait classifier launch failed: {e}")
+                return None
             try:
                 rc = proc.wait(timeout=ATTENTION_HINT_TIMEOUT_SEC)
             except subprocess.TimeoutExpired:
@@ -30309,12 +30319,16 @@ class SessionManager:
                 log(f"wait classifier exited {rc}")
                 return None
             try:
-                with open(out_path, "rb") as f:
-                    raw = f.read(ATTENTION_HINT_REPLY_MAX)
+                outf.seek(0)
+                raw = outf.read(ATTENTION_HINT_REPLY_MAX)
             except OSError:
                 return None
             return parse_attention_hint(raw.decode("utf-8", "replace"))
         finally:
+            try:
+                outf.close()
+            except OSError:
+                pass
             try:
                 os.remove(out_path)
             except OSError:
