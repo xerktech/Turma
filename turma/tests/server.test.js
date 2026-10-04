@@ -23421,6 +23421,14 @@ test("XERK-1574: the narrative is whitelisted — plain, bounded, a coerce fixed
   // A cut never leaves half a surrogate pair.
   const astral = C(`${"a".repeat(1198)}\u{1F600}${" b".repeat(10)}`);
   assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(astral), "no lone high surrogate");
+  // The cut counts code points, as the agent's Python mirror does (same answers as
+  // clean_brief_narrative): 300 "😀ok" words are 1199 code points, kept whole;
+  // 400 are cut to 299 words and "…" (1196 code points).
+  const emoji = (n) => Array(n).fill("\u{1F600}ok").join(" ");
+  assert.equal(C(emoji(300)), emoji(300));
+  const cut = C(emoji(400));
+  assert.equal([...cut].length, 1196);
+  assert.equal(cut, `${emoji(299)}…`);
   const raw = { "o.atlassian.net": [{ siteKey: "o.atlassian.net", at: 2000,
     narrative: "## Title\n**bold** text", narrativeAt: 2500 },
   { siteKey: "o.atlassian.net", at: 1000, narrative: "   ", narrativeAt: 1500 }] };
@@ -23493,7 +23501,7 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
   assert.deepEqual(log, [
     { source: "question", question: "Which DB?", answer: "Postgres", host: "dcHostB",
       sessionId: "q1", ticket: "XERK-9", label: "db work" },
-    { source: "question", question: "Which DB?", answer: "Postgres; SQLite; option 6; and backups",
+    { source: "question", question: "Which DB?", answer: "Postgres; SQLite; option 6; (a typed answer)",
       host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
     { source: "permission", question: "Bash: npm test — Do you want to proceed?", answer: "Yes",
       host: "dcHostB", sessionId: "p1", label: "lbl" },
@@ -23554,7 +23562,7 @@ test("XERK-1574: an auto-appended decision is capped — question 300, chosen op
   assert.equal(res.status, 200);
   const [entry] = hub.getDecisions()[S];
   assert.equal(entry.question, "Q".repeat(300));
-  assert.equal(entry.answer, "z".repeat(200));
+  assert.equal(entry.answer, "(a typed answer)", "a typed answer is logged as a marker, never its words");
   const direct = hub.sanitizeDecision({ at: 1, source: "question", question: "q".repeat(5000),
     answer: "a".repeat(5000), text: "t".repeat(5000) });
   assert.equal(direct.question.length, 300);

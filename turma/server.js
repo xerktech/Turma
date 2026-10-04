@@ -3301,6 +3301,16 @@ function briefWire(b, full) {
 // over-long text is cut on a word with "…". A FIXED POINT (cleaning a cleaned
 // text changes nothing), so a sanitized brief stays one for HA's echo dedup.
 // Inline literals: sanitizeBrief runs at module-init (TDZ).
+// The first n CODE POINTS of v (Python's v[:n]), without spreading a huge string.
+function cpPrefix(v, n) {
+  let i = 0;
+  let k = 0;
+  for (const ch of v) {
+    if (k++ === n) break;
+    i += ch.length;
+  }
+  return v.slice(0, i);
+}
 function cleanBriefNarrative(v) {
   if (typeof v !== "string" || !v) return "";
   // A standalone HEADING line is dropped, never joined into the next sentence
@@ -3313,7 +3323,7 @@ function cleanBriefNarrative(v) {
     const t = l.replace(/^ +| +$/g, "");
     return /^#{1,6}(?: |$)/.test(t) || ([...t].length <= 80 && /^\*{1,3}[^*]+\*{1,3}:?$/.test(t));
   };
-  let s = v.slice(0, 20000)
+  let s = cpPrefix(v, 20000)
     .replace(/```[^\n]*/g, " ")
     .replace(/<[^>\n]*>/g, " ")
     .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
@@ -3334,11 +3344,13 @@ function cleanBriefNarrative(v) {
     .join(" ")
     .replace(/ +/g, " ")
     .replace(/^ | $/g, "");
-  if (s.length > 1200) {
-    let cut = s.slice(0, 1199);
-    if (/[\ud800-\udbff]$/.test(cut)) cut = cut.slice(0, -1); // never half a surrogate pair
+  // The cut counts code points too, as the agent's mirror does, so both cut a
+  // text heavy in astral characters (emoji) at the same place.
+  const cps = [...s];
+  if (cps.length > 1200) {
+    const cut = cps.slice(0, 1199);
     const sp = cut.lastIndexOf(" ");
-    s = `${(sp > 900 ? cut.slice(0, sp) : cut).trimEnd()}…`;
+    s = `${(sp > 900 ? cut.slice(0, sp) : cut).join("").trimEnd()}…`;
   }
   return s;
 }
@@ -15122,12 +15134,15 @@ function recordAnswerDecision(key, sessionId, kind, answer) {
 }
 
 // The chosen option's own words: the labels the session offered for each picked
-// index (1-based fallback when a label is missing), then any typed answer.
+// index (1-based fallback when a label is missing), then a MARKER for a typed
+// answer, never its words: the log reaches every same-org session's decisions
+// file, and free text typed for one session (a URL, a pasted secret) must not.
+// A note the operator wants shared goes through the explicit decisions POST.
 function questionAnswerText(a, sessionId, picks, custom) {
   const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
   const labels = s && s.session && Array.isArray(s.session.questionOptions) ? s.session.questionOptions : [];
   const out = picks.map((i) => (typeof labels[i] === "string" && labels[i] ? labels[i] : `option ${i + 1}`));
-  if (custom.trim()) out.push(custom.trim());
+  if (custom.trim()) out.push("(a typed answer)");
   return out.join("; ");
 }
 function panePromptAnswerText(a, sessionId, n) {
