@@ -184,9 +184,15 @@ class TestGuardSettings(unittest.TestCase):
         into every future python3 run as that user.
         """
         s = ha.build_guard_settings(python_exe="/usr/bin/python3")
-        for entry in s["hooks"]["PreToolUse"]:
-            cmd = entry["hooks"][0]["command"]
-            self.assertIn("-SsE", cmd, f"{entry['matcher']} hook is neutralisable")
+        # EVERY hook event, not just PreToolUse: the permission ledger wires
+        # PermissionRequest/PermissionDenied too (XERK-1563), and a hook there
+        # run without the flags is the same one-Write neutralisation.
+        self.assertIn("PermissionRequest", s["hooks"])
+        for event, entries in s["hooks"].items():
+            for entry in entries:
+                for hook in entry["hooks"]:
+                    self.assertIn("-SsE", hook["command"],
+                                  f"{event} {entry.get('matcher')} hook is neutralisable")
         limits = ha.build_limits_settings(python_exe="/usr/bin/python3")
         self.assertIn("-SsE", limits["statusLine"]["command"])
 
@@ -268,6 +274,9 @@ class TestGuardSettings(unittest.TestCase):
         # The peer roster is the org boundary (XERK-348), so a session must not
         # be able to append rows to its own address book.
         "Edit(~/.turma/peers.tsv)",
+        # XERK-1563: the permission ledger's hook rows. A session editing its own
+        # could hide the prompts it hit or forge ones it never did.
+        "Edit(~/.turma/permissions/**)",
         # XERK-1564: the session CLI's rendezvous dir. File tools only; Bash
         # still writes it, so the manager reads it as untrusted.
         "Edit(~/.turma/session-requests/**)",
@@ -341,6 +350,37 @@ class TestGuardSettings(unittest.TestCase):
         s = ha.build_guard_settings(python_exe="py", ask_path="/x/hooks/ask.py")
         ask = next(e for e in s["hooks"]["PreToolUse"] if e["matcher"] == "AskUserQuestion")
         self.assertEqual(ask["hooks"][0]["command"], '"py" -SsE "/x/hooks/ask.py"')
+
+    def test_wires_the_permission_ledger_hook_on_its_two_events(self):
+        # XERK-1563: PermissionRequest (rule/manual prompts) and PermissionDenied
+        # (the auto-mode classifier's soft block, which shows no dialog). NOT
+        # PreToolUse — that runs before the classifier and its matcher list must
+        # stay exactly the guard's.
+        s = ha.build_guard_settings(python_exe="/usr/bin/python3",
+                                    fileguard_path="/nonexistent/fileguard.py")
+        self.assertEqual([e["matcher"] for e in s["hooks"]["PreToolUse"]],
+                         ["Bash", "AskUserQuestion"])
+        for event in ("PermissionRequest", "PermissionDenied"):
+            entry, = s["hooks"][event]
+            self.assertNotIn("matcher", entry)       # every tool
+            hook, = entry["hooks"]
+            self.assertIn("permlog.py", hook["command"])
+            # The ledger dir rides the command line, so the hook and the
+            # manager's tail can never disagree about where rows live.
+            self.assertIn(ha.PERMISSIONS_DIR, hook["command"])
+            self.assertEqual(hook["timeout"], ha.PERMLOG_HOOK_TIMEOUT_SEC)
+        self.assertEqual(set(s["hooks"]),
+                         {"PreToolUse", "PermissionRequest", "PermissionDenied"})
+
+    def test_a_missing_permlog_hook_is_not_wired(self):
+        # A missing command prints a hook error into every pane on every prompt.
+        s = ha.build_guard_settings(permlog_path="/nonexistent/permlog.py")
+        self.assertEqual(set(s["hooks"]), {"PreToolUse"})
+
+    def test_permlog_script_path_points_at_bundled_hook(self):
+        path = ha.permlog_script_path()
+        self.assertTrue(path.endswith(os.path.join("hooks", "permlog.py")))
+        self.assertTrue(os.path.exists(path))
 
     def test_ask_script_path_points_at_bundled_hook(self):
         path = ha.ask_script_path()

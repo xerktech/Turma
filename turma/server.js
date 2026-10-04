@@ -45,6 +45,10 @@ const push = require("./push.js");
 // /data, keyed by host, and folds it back into what /api/agents serves. Reads
 // its file at require time (like the other /data stores below).
 const usageLedger = require("./usage-ledger.js");
+// The permission ledger (XERK-1563): every permission prompt a session hit and
+// the allow rule that would retire it — the agent's `permissionEvents`, kept on
+// /data (non-HA) or a Postgres append table (HA), served by /api/permissions.
+const permissionLedger = require("./permission-ledger.js");
 // HA storage-abstraction seam (XERK-754, epic XERK-751): the config resolver and
 // the LiveStore backends (file/in-memory default, or the Valkey shared client
 // when HA is on). Requiring these is side-effect-free — no socket is dialled and
@@ -348,6 +352,10 @@ function onLeaderPromoted() {
   // their next beat. No-op on the file backend.
   usageLedger.rehydrate().catch((e) =>
     console.error(`leader promotion: usage-ledger rehydrate failed: ${(e && e.message) || e}`));
+  // The permission ledger's Postgres rows (XERK-1563), for the same reason. No-op
+  // on the file backend.
+  permissionLedger.rehydrate().catch((e) =>
+    console.error(`leader promotion: permission-ledger rehydrate failed: ${(e && e.message) || e}`));
 }
 
 const PORT = positiveEnv("PORT", 8300);
@@ -1516,6 +1524,8 @@ function defaultRegistryBudget() {
   return Math.max(8 << 20, Math.min(64 << 20, Math.floor(limit / 8)));
 }
 const AGENTS_TOTAL_MAX = positiveEnv("AGENTS_TOTAL_MAX", defaultRegistryBudget());
+// The permission ledger's byte budget is a fraction of the same limit (XERK-1563).
+const PERMISSION_LEDGER_BYTES = permissionLedger.setMemoryLimit(containerMemoryLimit());
 
 // One host's share of the aggregate — 512 KiB at the deployed sizing, against a
 // measured real fleet whose LARGEST record is 0.30 MiB.
@@ -4322,6 +4332,47 @@ function setArchiveMirror(blobStore, ha) {
 // request: the route is unauthenticated, and this runs on the single writer.
 const METRICS_CACHE_MS = 15 * 1000;
 let metricsBlocked = { at: -Infinity, n: 0 };
+// The permission ledger's served view (XERK-1563). `org` scopes it to the hosts
+// that currently declare one of those orgs — off the LIVE fleet, like
+// `retiredUsage` is scoped client-side — and `days` (default 7) picks the window.
+function permissionsView(params, now = Date.now()) {
+  const orgs = new Set();
+  for (const v of params.getAll("org")) {
+    for (const k of String(v).split(",")) if (k.trim()) orgs.add(k.trim());
+  }
+  let hosts = null;
+  if (orgs.size) {
+    hosts = new Set();
+    for (const [key, a] of Object.entries(agents)) if (orgs.has(siteKeyOf(a))) hosts.add(key);
+  }
+  const days = Number(params.get("days"));
+  return permissionLedger.aggregate({
+    hosts, days: Number.isFinite(days) && days > 0 ? Math.floor(days) : 7, now,
+  });
+}
+
+// The permission ledger's aggregate on /metrics (XERK-1563). That route is
+// UNAUTHENTICATED, so it carries per-kind counts and summed waits only — never a
+// command, a host or a session. Values are over the retained window, so they
+// FALL as rows age out — GAUGES, never counters (Prometheus reads every drop in a
+// counter as a reset, and rate()/increase() report false spikes).
+function permissionMetricsText() {
+  const totals = permissionLedger.kindTotals();
+  let out = "# HELP turma_permission_prompts Permission prompts the permission ledger " +
+    "holds, by kind, over its retention window.\n" +
+    "# TYPE turma_permission_prompts gauge\n";
+  for (const [kind, t] of Object.entries(totals)) {
+    out += `turma_permission_prompts{kind="${kind}"} ${t.count}\n`;
+  }
+  out += "# HELP turma_permission_wait_seconds Seconds sessions spent waiting on a " +
+    "permission prompt, by kind, over the ledger's retention window.\n" +
+    "# TYPE turma_permission_wait_seconds gauge\n";
+  for (const [kind, t] of Object.entries(totals)) {
+    out += `turma_permission_wait_seconds{kind="${kind}"} ${Math.round(t.waitMs / 1000)}\n`;
+  }
+  return out;
+}
+
 function metricsText(now = Date.now()) {
   if (now - metricsBlocked.at >= METRICS_CACHE_MS) {
     metricsBlocked = { at: now, n: new Set([
@@ -4340,7 +4391,8 @@ function metricsText(now = Date.now()) {
     "# HELP turma_archive_ingest_gated_seconds How long ALL archive ingest has been " +
     "closed, 0 while open.\n" +
     "# TYPE turma_archive_ingest_gated_seconds gauge\n" +
-    `turma_archive_ingest_gated_seconds ${Math.floor(archive.hydratingForMs(now) / 1000)}\n`;
+    `turma_archive_ingest_gated_seconds ${Math.floor(archive.hydratingForMs(now) / 1000)}\n` +
+    permissionMetricsText();
 }
 
 // Under HA a transcript's raw files may still be in the bucket (XERK-1043): fetch
@@ -8336,7 +8388,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
-  "spawnFailures", "epicBuilderStatus",
+  "spawnFailures", "epicBuilderStatus", "permissionEvents",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -16799,6 +16851,17 @@ const server = http.createServer(async (req, res) => {
       return res.end(cached.body);
     }
 
+    // The permission ledger (XERK-1563): the prompts that stalled sessions over
+    // the last `days`, grouped with the allow rule that would retire each, plus
+    // the newest rows. User-authed (it sits past the gate, like /api/agents).
+    // `org` (repeatable or comma-separated siteKeys) scopes it off the LIVE
+    // fleet — the hosts that currently declare one of those orgs, the same key
+    // set org.js builds for `retiredUsage` — so a removed host's rows show only
+    // under "All orgs".
+    if (req.method === "GET" && url.pathname === "/api/permissions") {
+      return json(res, 200, permissionsView(url.searchParams));
+    }
+
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
       const raw = JSON.parse((await readBody(req, HEARTBEAT_MAX, HEARTBEAT_PARSE_COST)) || "{}");
       const payload = sanitizeHeartbeat(raw, (raw && raw.device) || "unknown host");
@@ -16923,6 +16986,10 @@ const server = http.createServer(async (req, res) => {
       // name, so a refusal fails the move now rather than at its timeout.
       const spawnFailures = payload.spawnFailures;
       delete payload.spawnFailures;
+      // Permission-ledger rows (XERK-1563) — folded into the ledger below, never
+      // stored on the record (they would ride every /api/agents body).
+      const permissionEvents = payload.permissionEvents;
+      delete payload.permissionEvents;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -17164,6 +17231,12 @@ const server = http.createServer(async (req, res) => {
       // still refuse this beat — a refused beat is not history, and a record
       // rolled back to `prev` must not have been folded into the ledger first.
       usageLedger.ingest(key, next);
+      // The permission ledger (XERK-1563), after the same gates and for the same
+      // reason. Every field is whitelisted + bounded inside (sanitizePermissionEvent).
+      if (Array.isArray(permissionEvents) && permissionEvents.length) {
+        try { permissionLedger.ingest(key, permissionEvents); }
+        catch (e) { console.error(`permission ledger ingest failed for ${logName(key)}: ${(e && e.message) || e}`); }
+      }
       ingestHistory(next, historyResults);
       ingestTrajectoryTails(next, trajectoryTailResults);
       ingestSubagentHistory(next, subagentHistoryResults);
@@ -20436,6 +20509,9 @@ if (process.env.TURMA_TEST) {
     // loader, or a late page lands in an index ingest has since reopened.
     withLoaderDeadline,
     metricsText,
+    // The permission ledger's served view + its module (XERK-1563).
+    permissionsView,
+    permissionLedger,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
     // its value relative to the client's give-up is the whole point (XERK-241).
@@ -21276,6 +21352,12 @@ if (process.env.TURMA_TEST) {
   usageLedger.configure(haConfig, archiveIndexPool, invalidateAgentsCache).catch((e) => {
     console.error(`usage ledger: Postgres configure failed, staying on the local file: ${(e && e.message) || e}`);
   });
+  // The permission ledger (XERK-1563) rides the same pool under HA: a Postgres
+  // append table, never registerExternalStore (rows churn every beat). HA off: a
+  // no-op, the /data file stays. Fire-and-forget, never fatal, like the above.
+  permissionLedger.configure(haConfig, archiveIndexPool).catch((e) => {
+    console.error(`permission ledger: Postgres configure failed, staying on the local file: ${(e && e.message) || e}`);
+  });
 
   // ---- Leader election (XERK-763) ---------------------------------------
   // Elect the ONE replica that runs the singleton sweeps + migration-advance.
@@ -21446,7 +21528,11 @@ if (process.env.TURMA_TEST) {
       try { archive.closeDb(); } catch {}
       const finish = () => { clearTimeout(forceExit); console.log("drain complete — exiting"); process.exit(0); };
       const once = () => { if (!done) { done = true; finish(); } };
-      try { usageLedger.flush(() => once()); } catch { once(); }
+      // Both ledgers flush before exit; `once` fires when the second lands.
+      let pending = 2;
+      const one = () => { if (--pending <= 0) once(); };
+      try { permissionLedger.flush(() => one()); } catch { one(); }
+      try { usageLedger.flush(() => one()); } catch { one(); }
     };
 
     if (READYZ_DRAIN_DELAY_MS > 0) {
@@ -21489,6 +21575,7 @@ if (process.env.TURMA_TEST) {
       `agent on-demand caches: <=${AGENT_CACHE_TOTAL_MAX} bytes fleet-wide, ` +
         `<=${AGENT_CACHE_HOST_MAX} bytes/host`
     );
+    console.log(`permission ledger: <=${PERMISSION_LEDGER_BYTES} bytes retained`);
     if (push.fcmEnabled()) console.log("FCM push alerts -> Android devices");
     // A warning, not an info line: a hub running without FCM delivers ZERO mobile
     // notifications (every notify() is a no-op), and that has silently bitten us
