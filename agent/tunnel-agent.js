@@ -2418,6 +2418,8 @@ const TTYD_SOCK_DIR = path.join(os.homedir(), ".turma", "ttyd");
 function ttydSockPath(port) {
   const p = Number(port);
   if (!Number.isInteger(p) || p <= 0) return null;
+  // Safe: `p` is a validated positive integer, so the join names a child of the dir.
+  // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
   return path.join(TTYD_SOCK_DIR, `${p}.sock`);
 }
 
