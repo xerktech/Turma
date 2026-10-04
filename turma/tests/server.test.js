@@ -24105,6 +24105,40 @@ test("XERK-1575: a due paused sleeper takes the freed slot ahead of the queue, n
   ticketQueue.length = 0; delete agents[host];
 });
 
+test("XERK-1575: a wake and a ticket spawn never share one beat on a host (two inline launches)", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpOneLaunch";
+  const site = "slponelaunch.atlassian.net";
+  const tickets = [{ key: "ENG-5", summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, triage: { priority: "P2", type: "task", actionable: true } }];
+  await asBeat(host, site, { autoStart: false, capacity: FULL, tickets, pauseSleepers: { available: true } });
+  const started = await startTicket(site, "ENG-5");
+  assert.equal(started.body.queued, true, JSON.stringify(started.body));
+  // Two slots free at once and one paused sleeper due: the wake goes out and the
+  // ticket waits a beat. The agent relaunches both on its beat, and the pair
+  // would overrun the hub's offline threshold (XERK-395).
+  const now = Date.now();
+  await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 0, free: 2 }, tickets,
+    pauseSleepers: { available: true },
+    closedSessions: [{ id: "due", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: now - 1000, wakeReason: "check due" } }] });
+  assert.deepEqual(sleeperCmds(host, "resume").map((c) => c.sessionId), ["due"]);
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 0, "never a second launch beside the wake");
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 0);
+  // Once the wake is acked, the ticket takes the other slot.
+  agents[host].commands = agents[host].commands.filter((c) => c.type !== "resume");
+  agents[host].capacity = { ...FULL, running: 1, free: 1 };
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "spawnTicket").length, 1);
+  // And a due wake waits out a launch already queued on the host.
+  agents[host].closedSessions = [{ id: "due2", repo: "Turma", paused: { wakeAt: Date.now() - 1000 } }];
+  agents[host].capacity = { ...FULL, running: 0, free: 2 };
+  hub.wakePausedSleepers(Date.now());
+  assert.equal(sleeperCmds(host, "resume").length, 0);
+  ticketQueue.length = 0; delete agents[host];
+});
+
 test("XERK-1575: a paused sleeper whose conversation already runs again is unpaused, never woken", () => {
   resetSleepers();
   const now = Date.now();

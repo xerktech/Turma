@@ -267,6 +267,10 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   drain dispatches, one resume per host per pass, oldest wake first, and `pendingSpawnCount` counts
   a `resume` with `wake:true`, so the drain never hands that slot to a ticket. Starving it would
   turn a pause into a kill.
+- **A wake never shares a beat with another launch on its host**: the drain seeds `usedHosts` with
+  every host whose wake is in flight (`hostWakeInFlight`), and `wakePausedSleepers` skips a host
+  with any spawn or wake queued. The agent relaunches both on its beat; two would overrun
+  `OFFLINE_AFTER_MS` (XERK-395). The ticket takes the other free slot a beat later.
 - **A wake is never auto-stop-exempt.** `markResumedTicketAutoStopExempt` (XERK-561) is the
   operator's resume route only; exempting an automatic wake made a paused sleeper immune to
   auto-stop and kept a Done ticket's session holding a slot forever.

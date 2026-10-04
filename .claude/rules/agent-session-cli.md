@@ -115,6 +115,13 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
     `agent-<id>` then would race the worker's kill.
   - **Every beat re-arms the worker while jobs wait** (`_apply_sleeper_landed`): a failed
     `Thread.start()` (pids_limit) would strand a teardown — a live tmux in a slot reported free.
+  - **The operator's Kill/Delete of a paused record re-stages the tmux kill** (`_reap_paused_tmux`):
+    teardown jobs are in-memory, so a restart mid-pause leaves an idle claude no record owns.
+  - **On Windows the teardown never signals `ttydPid`** — the pty-host `_kill_tmux` ended IS that
+    process, so a later signal could hit a reused pid (`_kill_ttyd`'s rule).
+- **A paused record carries its PRs' `prCommentBase`** (`_remember_closed`, paused only), and
+  `resume()` restores it with the PR links (`_carry_paused_prs`). A review comment posted while it
+  slept is then a NEW key, delivered to its inbox; without it the first pass baselines it silently.
 - **A wake resume whose worktree vanished re-adds it on the same worker** (`_stage_worktree_restore`
   → `_apply_sleeper_landed` on the beat finishes `resume()`). Meanwhile its slot is held
   (`_slots_used` counts `_restores_in_flight`), the path rides `_live_worktree_paths` so no prune
@@ -122,7 +129,9 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   unpaused or deleted meanwhile is not resumed (delete keeps the worktree being added).
 - **The relaunch itself (`_launch_tmux`/`_launch_ttyd`) stays on the beat**, the same inline cost
   as every `spawnTicket` the hub's queue drain sends: it writes the record and `save()`s, which no
-  worker may do. The hub's one-automated-command-per-host cap bounds it to one launch per beat.
+  worker may do. The hub never puts a wake beside another launch on one host: the drain sends no
+  `spawnTicket` to a host with a wake in flight (`hostWakeInFlight`), and a wake waits out a queued
+  spawn (`pendingSpawnCount`). An operator spawn queued in the same beat can still pair with it.
   - Worst case, a recorded deviation from XERK-395: `INTERVAL` + 2×`HEARTBEAT_TIMEOUT_SEC` (40s)
     + one launch (tmux kill 15s + new-session 30s + display 5s + ttyd port wait 2s = 52s) ≈ 92s,
     over `OFFLINE_AFTER_MS` (75s) only on a wedged tmux — as for any `spawnTicket` today. Moving

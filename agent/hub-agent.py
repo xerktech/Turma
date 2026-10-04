@@ -23629,6 +23629,16 @@ class SessionManager:
         rec["closedAt"] = now_iso()
         if paused:
             rec["paused"] = dict(paused)
+            # Its PRs' seen-comment baseline (XERK-1575): a pause is not the end
+            # of the session, so a review comment posted while it sleeps must
+            # still reach it after the wake. Without the baseline the first
+            # delivery pass after the resume treats every PR as first-seen and
+            # folds those comments in silently.
+            base = sess.get("prCommentBase")
+            if isinstance(base, dict):
+                rec["prCommentBase"] = {u: list(k) for u, k in base.items()
+                                        if isinstance(u, str)
+                                        and isinstance(k, list)}
         # Snapshot the two things the live caches are about to forget, so the
         # hub's Ended-sessions view can still show what this session did:
         #
@@ -23679,6 +23689,7 @@ class SessionManager:
         if not sess:
             rec = next((c for c in self.closed if c.get("id") == sid), None)
             if self._unpause_closed(rec):
+                self._reap_paused_tmux(rec)
                 log(f"kill: {sid} was a paused sleeper; it stays killed")
                 return
             log(f"kill: no such session {sid}")
@@ -23855,6 +23866,8 @@ class SessionManager:
                                f"{sess['worktreePath']}", cmd_id=cmd_id)
             return
         self.closed = [c for c in self.closed if c.get("id") != sid]
+        if rec.get("paused"):
+            self._carry_paused_prs(sess, rec)
         prompt = self._carry_paused_wake(sess, rec.get("paused"))
         try:
             # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
@@ -23907,6 +23920,22 @@ class SessionManager:
             log(f"unpause: no closed session {sid}")
             return False
         return self._unpause_closed(rec)
+
+    def _carry_paused_prs(self, sess, rec):
+        """Bring a paused sleeper's PRs back onto its resumed record (XERK-1575):
+        its links (the live map kill() dropped, which the comment poller and the
+        chips read) and their seen-comment baseline. A comment posted while it
+        slept is then a NEW key on the first delivery pass, delivered through
+        its inbox like any other, rather than baselined silently as history."""
+        sid = sess["id"]
+        urls = [u for u in (rec.get("prUrls") or []) if isinstance(u, str)][-10:]
+        if urls:
+            self.session_pr_urls[sid] = list(urls)
+            sess["prUrls"] = list(urls)
+        base = rec.get("prCommentBase")
+        if isinstance(base, dict):
+            sess["prCommentBase"] = {u: list(k) for u, k in base.items()
+                                     if isinstance(u, str) and isinstance(k, list)}
 
     def _carry_paused_wake(self, sess, paused, now_ms=None):
         """Bring a paused sleeper's wake back onto its resumed record
@@ -25072,6 +25101,9 @@ class SessionManager:
         self.closed = [c for c in self.closed if c.get("id") != sid]
         shutil.rmtree(upload_dir_for(sid), ignore_errors=True)
         self._forget_session_caches(sid)
+        # After the worktree decision: the staged kill marks the record busy,
+        # which would otherwise read as a worker holding that worktree.
+        self._reap_paused_tmux(rec)
         log(f"deleted paused session {sid}"
             + (" (a running session works in its worktree; kept)" if held else ""))
 
@@ -26932,7 +26964,11 @@ class SessionManager:
                         pass
                 if job.get("tmuxName"):
                     self._kill_tmux({"tmuxName": job["tmuxName"]})
-                self._reap_ttyd(job.get("ttyd"), job.get("ttydPid"))
+                # Windows: the pty-host _kill_tmux just tore down IS the
+                # terminal and the persisted pid is that same process, so
+                # signalling it now could hit a reused pid (_kill_ttyd's rule).
+                if not IS_WINDOWS:
+                    self._reap_ttyd(job.get("ttyd"), job.get("ttydPid"))
                 log(f"paused session {sid}: tmux and terminal torn down")
             except Exception as e:
                 log(f"paused session {sid}: teardown failed: {type(e).__name__}: {e}")
@@ -26948,6 +26984,27 @@ class SessionManager:
         with self._sleeper_lock:
             self._sleeper_landed.append((sid, job.get("cmdId"), error))
         return True
+
+    def _reap_paused_tmux(self, rec):
+        """The operator's Kill/Delete of a PAUSED record (XERK-1575) re-runs its
+        tmux kill on the lifecycle worker. The pause's own teardown job lives in
+        memory only, so a manager restart between the pause and the worker loses
+        it and leaves an idle claude no record owns; this is the operator's way
+        to end it. A no-op kill when nothing is there; skipped while a job for
+        the record is already queued or running (that one does it)."""
+        sid = rec.get("id") if isinstance(rec, dict) else None
+        if not isinstance(sid, str) or not sid or self._find(sid):
+            return
+        if self._sleeper_busy_kind(sid) is not None:
+            return
+        tmux = rec.get("tmuxName")
+        tmux = tmux if isinstance(tmux, str) and tmux else f"agent-{sid}"
+        self._stage_sleeper_job(
+            {"kind": "teardown", "sid": sid, "tmuxName": tmux,
+             "dsh": None, "ttyd": None, "ttydPid": None},
+            {"kind": "teardown", "worktreePath": rec.get("worktreePath"),
+             "root": bool(rec.get("root")),
+             "claudeSessionId": rec.get("claudeSessionId")})
 
     def _sleeper_busy_kind(self, sid):
         with self._sleeper_lock:

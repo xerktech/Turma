@@ -12985,7 +12985,9 @@ function drainTicketQueue() {
   // A due paused sleeper (XERK-1575) takes a freed slot ahead of the queue: it
   // was paused FOR queued work, and starving it would turn a pause into a kill.
   wakePausedSleepers(now, rows);
-  const usedHosts = new Set();
+  // A host with a wake in flight takes no spawnTicket this pass: both relaunch on
+  // the agent's beat, and the pair would overrun the hub's offline threshold.
+  const usedHosts = new Set(Object.keys(agents).filter((h) => hostWakeInFlight(agents[h])));
   // Entries still waiting for a slot after this pass — what a sleeper pause frees.
   const waitingFull = [];
   let started = null;
@@ -13356,6 +13358,15 @@ function pausedSleeperDue(c, now) {
     && c.paused.wakeAt <= now;
 }
 
+// Does this host have an automated wake `resume` queued or unacked? Its relaunch
+// runs on the agent's beat like a spawnTicket's, so the drain gives such a host no
+// spawnTicket in the same beat (and a wake waits out any launch already queued):
+// two inline launches on one beat would overrun OFFLINE_AFTER_MS (XERK-395).
+function hostWakeInFlight(a) {
+  return (a && Array.isArray(a.commands) ? a.commands : []).some(
+    (c) => c && c.type === "resume" && c.wake === true);
+}
+
 // Is this paused sleeper's conversation already running on its host? The
 // operator's Resume picker resumes by TRANSCRIPT (a new session id), which leaves
 // the paused record behind; waking it too would start a second claude on one
@@ -13449,6 +13460,8 @@ function wakePausedSleepers(now = Date.now(), rows) {
     }
     due.sort((x, y) => x.paused.wakeAt - y.paused.wakeAt);
     if (!due.length || !hostHasFreeSlot(a)) continue;
+    // One inline launch per beat: never beside a wake or a spawn still queued.
+    if (pendingSpawnCount(a) > 0) continue;
     const c = due[0];
     queueCommand(host, { type: "resume", sessionId: c.id, wake: true });
     noteSleeperTried(sleeperWakeTried, host, c.id, now);

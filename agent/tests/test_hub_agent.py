@@ -17978,6 +17978,91 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         self.assertEqual(removed, [])
         self.assertEqual(sm.closed, [])
 
+    def test_a_kill_or_delete_of_a_paused_record_kills_a_tmux_left_behind(self):
+        # A manager restart between the pause and its worker loses the in-memory
+        # teardown, leaving an idle claude no record owns. The operator's Kill or
+        # Delete of the paused card re-runs the tmux kill, on the worker.
+        for op in ("kill", "delete"):
+            with self.subTest(op=op):
+                sm = self._manager()
+                sm.closed = []   # the subtests share one registry dir
+                sess = self._sleeper(sm)
+                sid = sess["id"]
+                self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+                with sm._sleeper_lock:     # the restart: the staged job is gone
+                    sm._sleeper_jobs.clear()
+                    sm._sleeper_busy.clear()
+                self.run_calls.clear()
+                getattr(sm, op)(sid)
+                self.assertEqual(self._tmux_kills(sess), [], "not on the beat")
+                self._settle(sm)
+                self.assertEqual(len(self._tmux_kills(sess)), 1)
+                self.assertIsNone(sm._sleeper_busy_kind(sid))
+
+    def test_a_kill_during_the_pause_teardown_stages_no_second_one(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        sm.kill(sid)
+        self.assertEqual(len(sm._sleeper_jobs), 1)
+        self.run_calls.clear()
+        self._settle(sm)
+        self.assertEqual(len(self._tmux_kills(sess)), 1)
+
+    def test_a_windows_teardown_never_signals_the_persisted_pid(self):
+        # The pty-host _kill_tmux tears down IS the terminal there; signalling
+        # its persisted pid afterwards could hit a reused pid (_kill_ttyd's rule).
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sess["ttydPid"] = 4242
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+                mock.patch.object(ha, "_pty_teardown", return_value=True) as td, \
+                mock.patch.object(ha.os, "kill") as kill:
+            self._settle(sm)
+        td.assert_called_once_with(sess["tmuxName"])
+        kill.assert_not_called()
+
+    def test_a_review_comment_posted_while_paused_is_delivered_after_the_wake(self):
+        # A pause is not the session's end: its PR links and their seen-comment
+        # baseline ride the paused record, so a comment that arrived while it
+        # slept is NEW on the first delivery pass after the resume, never folded
+        # silently into a fresh baseline as history.
+        url = "https://github.com/o/r/pull/412"
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.session_pr_urls[sid] = [url]
+        sess["prCommentBase"] = {url: ["c1", "c2"]}
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self._settle(sm)
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertEqual(rec["prCommentBase"], {url: ["c1", "c2"]})
+        self.assertNotIn(sid, sm.session_pr_urls)
+        due = self.NOW + 3600_000
+        with mock.patch.object(ha.time, "time", return_value=due / 1000):
+            sm.resume(sid)
+        self.assertEqual(sm._find(sid)["status"], "running")
+        self.assertEqual(sm.session_pr_urls.get(sid), [url])
+        notes = []
+        sm.notify_session = lambda s, msg, *a, **k: notes.append((s, msg))
+
+        def ev(key, body):
+            return {"key": key, "is_self": False, "author": "rev",
+                    "kind": "comment", "body": body}
+        sm._pr_comments_fetched = {sid: {url: [
+            ev("c1", "seen before"), ev("c2", "seen before"),
+            ev("c3", "please fix the flaky test")]}}
+        sm._deliver_pr_comments()
+        self.assertEqual(len(notes), 1)
+        self.assertEqual(notes[0][0], sid)
+        self.assertIn("please fix the flaky test", notes[0][1])
+        self.assertNotIn("seen before", notes[0][1])
+        # An ordinary kill keeps no baseline: what it missed is history.
+        sm.kill(sid)
+        self.assertNotIn("prCommentBase", next(c for c in sm.closed if c["id"] == sid))
+
     def test_a_failed_export_thread_start_clears_the_mark(self):
         sm = self._manager()
         sess = self._sleeper(sm)
