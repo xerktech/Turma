@@ -1,0 +1,283 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Turma — Brief</title>
+<link rel="icon" href="/favicon.svg" type="image/svg+xml">
+<link rel="icon" href="/favicon.ico" sizes="32x32">
+<link rel="apple-touch-icon" href="/apple-touch-icon.png">
+<link rel="manifest" href="/site.webmanifest">
+<meta name="theme-color" content="#f9f9f7" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0d0d0d" media="(prefers-color-scheme: dark)">
+<link rel="stylesheet" href="/app.css">
+<style>
+  /* The per-org brief (XERK-1573): one card per org in the header's scope, its
+     newest brief open, earlier ones folded below. Tokens/base/nav live in app.css. */
+  .brief-org {
+    background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius-md);
+    padding: 14px 16px; margin-bottom: 16px;
+  }
+  .brief-head { display: flex; align-items: baseline; gap: 10px; flex-wrap: wrap; margin-bottom: 10px; }
+  .brief-org-name { font-family: var(--font-display); font-size: 18px; font-weight: 600; }
+  .brief-when { color: var(--muted); font-size: 12px; }
+  .brief-head .spacer { flex: 1; }
+  .brief-now {
+    font: inherit; font-size: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
+    background: var(--field); color: var(--ink); padding: 4px 10px; cursor: pointer;
+  }
+  .brief-now:disabled { opacity: 0.6; cursor: default; }
+  .brief-counts { display: flex; flex-wrap: wrap; gap: 4px 22px; margin: 0 0 12px; }
+  .brief-counts .stat { min-width: 70px; }
+  .brief-counts .label { color: var(--ink-2); font-size: 12px; }
+  .brief-counts .value { font-family: var(--font-display); font-size: 22px; font-weight: 600; }
+  .brief-counts .needs .value { color: var(--warning-text); }
+  .brief-counts .stalled .value { color: var(--critical-text); }
+  .brief-sec { margin: 12px 0 0; }
+  .brief-sec h3 {
+    font-size: 12px; font-weight: 600; color: var(--ink-2); margin: 0 0 6px;
+    text-transform: uppercase; letter-spacing: 0.05em;
+  }
+  .brief-sec h3 .n { color: var(--muted); font-weight: 400; }
+  .brief-list { list-style: none; margin: 0; padding: 0; }
+  .brief-item { border-top: 1px solid var(--hairline); padding: 6px 0; font-size: 13px; min-width: 0; }
+  .brief-item:first-child { border-top: 0; }
+  .brief-title { overflow-wrap: anywhere; }
+  .brief-title a { color: var(--accent-text); text-decoration: none; }
+  .brief-title .key { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); margin-right: 6px; }
+  .brief-meta { color: var(--muted); font-size: 12px; margin-top: 2px; overflow-wrap: anywhere; }
+  .brief-meta .why { color: var(--ink-2); }
+  .brief-sec.needs .brief-meta .state { color: var(--warning-text); }
+  .brief-sec.stalled .brief-meta .state { color: var(--critical-text); }
+  .brief-more { color: var(--muted); font-size: 12px; padding-top: 4px; }
+  .brief-none { color: var(--muted); font-size: 13px; font-style: italic; }
+  .brief-spend { display: flex; flex-wrap: wrap; gap: 6px 18px; font-size: 13px; }
+  .brief-spend .paused { color: var(--warning-text); }
+  .brief-earlier { margin-top: 12px; font-size: 12px; color: var(--ink-2); }
+  .brief-earlier summary { cursor: pointer; color: var(--muted); }
+  .brief-earlier li { padding: 3px 0; }
+  .brief-empty { color: var(--muted); font-size: 14px; padding: 24px 0; }
+</style>
+</head>
+<body class="app-shell">
+<header class="site-header" id="siteHeader" data-page="brief" data-sub="What finished, what waits on you, what starts next"></header>
+<div class="page-scroll">
+<div class="wrap">
+  <div id="briefs"></div>
+  <div class="footer">One brief per org, compiled by the hub every few hours (and on <b>Brief now</b>) from what it already knows — the board's tickets, each session's attention state, the hub's ticket queue and the subscription limits. <b>Needs you</b> is every session waiting on you, oldest first; <b>Waiting</b> is sessions waiting on time or CI; <b>Starts next</b> is the hub's queue then the auto-start order, with why each is next. The phone gets one push per brief, only when the set of sessions needing you changed.</div>
+</div>
+</div>
+
+<nav class="bottom-nav" id="bottomNav"></nav>
+<script src="/board.js"></script>
+<script src="/nav.js"></script>
+<script src="/org.js"></script>
+<script src="/newticket.js"></script>
+
+<script>
+const $briefs = document.getElementById("briefs");
+const esc = TurmaNav.esc;
+let cache = null;
+const busy = new Set();   // orgs with a Brief-now in flight
+
+const SECTIONS = [
+  ["needsYou", "Needs you", "needs"],
+  ["stalled", "Stalled", "stalled"],
+  ["waiting", "Waiting", "waiting"],
+  ["nextUp", "Starts next", "next"],
+  ["finished", "Finished", "finished"],
+  ["closedStale", "Closed as stale", "stale"],
+];
+const STATE_LABEL = {
+  "needs-you:question": "question", "needs-you:permission": "permission",
+  "needs-you:review": "review", "needs-you:test": "test", "needs-you:stalled": "stalled",
+  waiting: "waiting", sleeping: "sleeping",
+};
+const STALE_LABEL = { "not-reproducible": "not reproducible", "already-fixed": "already fixed" };
+
+// A duration as the brief words it (Android `briefDur`, same thresholds).
+function dur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  if (s < 5400) return `${Math.round(s / 60)}m`;
+  if (s < 172800) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
+}
+const ago = (ms, now) => dur(now - ms);
+function clock(ms) {
+  return new Date(ms).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+}
+const safeUrl = (u) => (typeof u === "string" && /^https?:\/\//i.test(u) ? u : "");
+
+function itemHref(sec, it, site) {
+  if (it.kind === "pr") return safeUrl(it.url);
+  if (it.kind === "ticket" && it.key) {
+    return `/board?ticket=${encodeURIComponent(it.key)}&site=${encodeURIComponent(site)}`;
+  }
+  if (it.kind === "session" && it.sessionId && sec !== "finished") {
+    return `/sessions?session=${encodeURIComponent(it.sessionId)}`;
+  }
+  return "";
+}
+
+function itemHtml(sec, it, site, now) {
+  const href = itemHref(sec, it, site);
+  const ext = it.kind === "pr" ? ' target="_blank" rel="noopener"' : "";
+  const key = it.kind === "ticket" && it.key ? `<span class="key">${esc(it.key)}</span>` : "";
+  const text = href ? `<a href="${esc(href)}"${ext}>${esc(it.title)}</a>` : esc(it.title);
+  const meta = [];
+  if (it.state && STATE_LABEL[it.state]) meta.push(`<span class="state">${esc(STATE_LABEL[it.state])}</span>`);
+  if (it.why) meta.push(`<span class="why">${esc(it.why)}</span>`);
+  if (sec === "closedStale" && it.reason) meta.push(`<span class="why">${esc(STALE_LABEL[it.reason] || it.reason)}</span>`);
+  else if (it.reason) meta.push(esc(it.reason));
+  if (it.note) meta.push(esc(it.note));
+  if (it.eta && it.eta > now) meta.push(`in ${esc(dur(it.eta - now))}`);
+  else if (it.since && sec !== "nextUp") meta.push(`${esc(ago(it.since, now))} ago`);
+  if (it.kind !== "ticket" && it.key) meta.push(`<span class="key">${esc(it.key)}</span>`);
+  if (it.host && sec !== "nextUp") meta.push(esc(it.host));
+  return `<li class="brief-item"><div class="brief-title">${key}${text}</div>`
+    + (meta.length ? `<div class="brief-meta">${meta.join(" · ")}</div>` : "") + `</li>`;
+}
+
+function spendHtml(b) {
+  if (!b.spend || !b.spend.length) return "";
+  const row = (s) => {
+    const bits = [`<b>${esc(s.label)}</b>`];
+    if (typeof s.fiveHourPct === "number") bits.push(`5h ${Math.round(s.fiveHourPct)}%`);
+    if (typeof s.sevenDayPct === "number") bits.push(`7d ${Math.round(s.sevenDayPct)}%`);
+    if (s.paused) bits.push(`<span class="paused">auto-start paused</span>`);
+    return `<span>${bits.join(" · ")}</span>`;
+  };
+  return `<div class="brief-sec"><h3>Spend</h3><div class="brief-spend">${b.spend.map(row).join("")}</div></div>`;
+}
+
+function countsHtml(b) {
+  const c = b.counts || {};
+  const stat = (cls, label, n) => `<div class="stat ${cls}"><div class="label">${label}</div><div class="value">${n || 0}</div></div>`;
+  return `<div class="brief-counts">`
+    + stat(c.needsYou ? "needs" : "", "Needs you", c.needsYou)
+    + stat(c.stalled ? "stalled" : "", "Stalled", c.stalled)
+    + stat("", "Waiting", c.waiting)
+    + stat("", "Finished", c.finished)
+    + stat("", "Intake", c.intake)
+    + stat("", "Closed", c.outflow)
+    + `</div>`;
+}
+
+function headHtml(site, name, when) {
+  return `<div class="brief-head"><span class="brief-org-name">${esc(name)}</span>`
+    + (when ? `<span class="brief-when">${when}</span>` : "")
+    + `<span class="spacer"></span>`
+    + `<button class="brief-now" data-brief-now="${esc(site)}"${busy.has(site) ? " disabled" : ""}>${busy.has(site) ? "Compiling…" : "Brief now"}</button></div>`;
+}
+
+function orgHtml(site, list, now) {
+  const b = list[0];
+  const name = TurmaBoard.orgName ? TurmaBoard.orgName(site) : site;
+  if (!b) {
+    return `<section class="brief-org">${headHtml(site, name, "")}`
+      + `<div class="brief-none">No brief yet — the hub compiles one every few hours, or press Brief now.</div></section>`;
+  }
+  const secs = SECTIONS.map(([k, label, cls]) => {
+    const items = b[k] || [];
+    const total = (b.counts && b.counts[k]) || items.length;
+    if (!items.length && k !== "needsYou") return "";
+    const body = items.length
+      ? `<ul class="brief-list">${items.map((it) => itemHtml(k, it, site, now)).join("")}</ul>`
+        + (total > items.length ? `<div class="brief-more">+${total - items.length} more</div>` : "")
+      : `<div class="brief-none">Nothing is waiting on you.</div>`;
+    const sub = k === "nextUp" && !b.autoStart ? " · auto-start is off for this org" : "";
+    return `<div class="brief-sec ${cls}"><h3>${label} <span class="n">${total}${sub}</span></h3>${body}</div>`;
+  }).join("");
+  const earlier = list.slice(1).map((e) => {
+    const c = e.counts || {};
+    return `<li>${esc(clock(e.at))} — ${c.needsYou || 0} needed you · ${c.stalled || 0} stalled · ${c.finished || 0} finished${e.trigger === "manual" ? " · on demand" : ""}</li>`;
+  }).join("");
+  const when = `${esc(clock(b.at))} · covers the ${esc(ago(b.since, b.at))} before`
+    + (b.trigger === "manual" ? " · on demand" : "");
+  return `<section class="brief-org">` + headHtml(site, name, when)
+    + countsHtml(b) + secs + spendHtml(b)
+    + (earlier ? `<details class="brief-earlier"><summary>Earlier briefs (${list.length - 1})</summary><ul class="brief-list">${earlier}</ul></details>` : "")
+    + `</section>`;
+}
+
+function render(data) {
+  TurmaOrg.update(data);
+  const now = Date.now();
+  const all = data.briefs && typeof data.briefs === "object" ? data.briefs : {};
+  const keys = TurmaOrg.getKeys();
+  // Every org a host is decided into (the served `org`), plus any org with a kept
+  // brief — so an org with none yet still offers Brief now.
+  const orgs = new Set(Object.keys(all).filter((s) => Array.isArray(all[s]) && all[s].length));
+  for (const a of data.agents || []) if (a && typeof a.org === "string" && a.org) orgs.add(a.org);
+  const sites = [...orgs].filter((s) => !keys.length || keys.includes(s)).sort();
+  const html = sites.length
+    ? sites.map((s) => orgHtml(s, Array.isArray(all[s]) ? all[s] : [], now)).join("")
+    : `<div class="brief-empty">No org to brief — no host reports a tracker org yet.</div>`;
+  TurmaNav.preserveScroll($briefs, () => { $briefs.innerHTML = html; });
+}
+
+async function refresh() {
+  try {
+    const r = await fetch("/api/agents");
+    if (r.status === 401) return void (location.href = "/login");
+    cache = await r.json();
+  } catch { /* keep the last render */ }
+  if (cache) render(cache);
+}
+
+async function briefNow(site) {
+  busy.add(site);
+  if (cache) render(cache);
+  let res = null, out = null;
+  try {
+    res = await fetch(`/api/orgs/${encodeURIComponent(site)}/brief`, { method: "POST" });
+    try { out = await res.json(); } catch { /* not JSON */ }
+  } catch {
+    TurmaNav.toast("Brief now failed — the hub is unreachable");
+  }
+  busy.delete(site);
+  if (res && res.status === 401) return void (location.href = "/login");
+  if (res && !res.ok) TurmaNav.toast(TurmaNav.refusalText("Brief now", res.status, out));
+  refresh();
+}
+
+$briefs.addEventListener("click", (e) => {
+  const btn = e.target.closest("[data-brief-now]");
+  if (btn && !btn.disabled) briefNow(btn.dataset.briefNow);
+});
+
+let sseOk = false, sseBackoff = 2000;
+function connectSSE() {
+  let es;
+  try { es = new EventSource("/api/events"); }
+  catch { setTimeout(connectSSE, sseBackoff); return; }
+  es.onopen = () => { sseOk = true; sseBackoff = 2000; };
+  // A brief landed (any org): the frame carries the whole (small) map.
+  es.addEventListener("briefs", (e) => {
+    let b;
+    try { b = JSON.parse(e.data); } catch { return; }
+    if (!cache) return void refresh();
+    cache.briefs = b;
+    render(cache);
+  });
+  TurmaOrg.sse(es);
+  es.onerror = () => {
+    sseOk = false;
+    if (es.readyState === EventSource.CLOSED) {
+      setTimeout(connectSSE, sseBackoff);
+      sseBackoff = Math.min(sseBackoff * 2, 30000);
+    }
+  };
+}
+
+TurmaOrg.subscribe(() => { if (cache) render(cache); });
+refresh();
+connectSSE();
+// The org list rides the agent payload, which this page does not live-patch, so a
+// slow poll keeps the header's org menu current; a fast one covers a dead stream.
+setInterval(() => refresh(), 60000);
+setInterval(() => { if (!sseOk) refresh(); }, 15000);
+</script>
+</body>
+</html>

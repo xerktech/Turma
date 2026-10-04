@@ -788,4 +788,39 @@ class AgentDecodeTest {
         assertTrue((plain as ToolUseBlock).files.isEmpty())
         assertEquals("", plain.caption)
     }
+
+    // XERK-1573: the per-org brief rides /api/agents as a TYPED top-level map, so
+    // a hub brief must decode into it and an older hub (no key) must not throw.
+    @Test fun `briefs decode typed, and their absence reads as no brief yet`() {
+        val body = """
+            { "now": 1, "agents": [ $plainHost ],
+              "briefs": { "o.atlassian.net": [ {
+                "siteKey": "o.atlassian.net", "at": 2000, "since": 1000, "trigger": "manual",
+                "autoStart": true,
+                "counts": { "needsYou": 15, "finished": 1, "intake": 2, "outflow": 1 },
+                "needsYou": [ { "kind": "session", "title": "t", "host": "h", "sessionId": "s1",
+                                "state": "needs-you:question", "why": "Ship it?", "since": 1500 } ],
+                "nextUp": [ { "kind": "ticket", "title": "do it", "key": "O-1",
+                              "reason": "P0 preempts the line · created 2h ago" } ],
+                "spend": [ { "label": "Team plan", "fiveHourPct": 95, "fiveHourResetsAt": 9000,
+                             "paused": true } ]
+              } ] } }
+        """.trimIndent()
+        val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
+        val b = resp.briefs.getValue("o.atlassian.net").single()
+        assertEquals(2000L, b.at)
+        assertEquals("manual", b.trigger)
+        assertEquals(15L, b.counts.needsYou)
+        assertEquals(0L, b.counts.stalled)
+        assertEquals("Ship it?", b.needsYou.single().why)
+        assertEquals(1500L, b.needsYou.single().since)
+        assertNull(b.needsYou.single().eta)
+        assertEquals("O-1", b.nextUp.single().key)
+        assertEquals(95.0, b.spend.single().fiveHourPct!!, 0.0)
+        assertTrue(b.spend.single().paused)
+        assertTrue(b.waiting.isEmpty())
+        val older = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [ $plainHost ] }""")
+        assertTrue(older.briefs.isEmpty())
+        assertEquals(listOf("mxh-t16"), older.agents.map { it.key })
+    }
 }

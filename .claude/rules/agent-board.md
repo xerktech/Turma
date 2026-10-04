@@ -28,6 +28,9 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
   Android defaults (null/false/[]) read them as absent. Tests: `TestShapeIssue`
   (`test_epic_membership`/`test_*_links`/`test_malformed_issuelinks_degrade`/`test_links_are_bounded`),
   the XERK-455 `normalizeRecord` case, Android `AgentDecodeTest`.
+- **Every row carries `resolved`** (Jira `resolutiondate`, ADO `Microsoft.VSTS.Common.ClosedDate`;
+  null while open) — the hub's org brief counts the period's outflow by it (XERK-1573,
+  `turma-brief.md`). Untyped on Android, so absent from an older agent is decode-safe.
 - **An agent serves exactly ONE org** (a host is Jira or Azure, never both).
   `board_source()`/`board_configured()`/`collect_board()`/`fetch_board_issue()`/`board_site_key()`/
   `valid_issue_key()` are the dispatch shims every gate goes through; downstream reads `self.jira`

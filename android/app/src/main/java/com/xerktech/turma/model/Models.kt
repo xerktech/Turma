@@ -86,6 +86,82 @@ data class AgentsResponse(
     // (sanitizeEpicBuilderRecord) only ever emits clean object entries, so there
     // is no per-value coercion beyond the defaults + TurmaJson.coerceInputValues.
     val epicBuilders: Map<String, EpicBuilder> = emptyMap(),
+    // The per-org brief (XERK-1573), siteKey -> that org's last briefs, newest
+    // first. Hub-owned and sanitized on every write/restore (sanitizeBrief), and
+    // every field below is defaulted, so an older hub (absent) reads as "no brief
+    // yet" and a partial record still decodes — this payload decodes atomically.
+    val briefs: Map<String, List<OrgBrief>> = emptyMap(),
+)
+
+/**
+ * One org's brief (XERK-1573; the hub's `sanitizeBrief` shape): what finished,
+ * what waits on the operator, what waits on time, what is stalled, what starts
+ * next and why, what a session closed as stale, and the subscription spend —
+ * compiled hub-side from hub data, no model. [at]/[since] are epoch ms (the
+ * period it covers); [trigger] is "scheduled" or "manual".
+ */
+@Serializable
+data class OrgBrief(
+    val siteKey: String = "",
+    val at: Long = 0,
+    val since: Long = 0,
+    val trigger: String = "scheduled",
+    val autoStart: Boolean = false,
+    val counts: BriefCounts = BriefCounts(),
+    val finished: List<BriefItem> = emptyList(),
+    val needsYou: List<BriefItem> = emptyList(),
+    val waiting: List<BriefItem> = emptyList(),
+    val stalled: List<BriefItem> = emptyList(),
+    val nextUp: List<BriefItem> = emptyList(),
+    val closedStale: List<BriefItem> = emptyList(),
+    val spend: List<BriefSpend> = emptyList(),
+)
+
+/** A brief's totals — each list above is capped, these are not. */
+@Serializable
+data class BriefCounts(
+    val finished: Long = 0,
+    val needsYou: Long = 0,
+    val waiting: Long = 0,
+    val stalled: Long = 0,
+    val nextUp: Long = 0,
+    val closedStale: Long = 0,
+    val intake: Long = 0,
+    val outflow: Long = 0,
+)
+
+/**
+ * One row of a brief section. [kind] is "ticket" | "pr" | "session"; the rest is
+ * whatever that row has: a ticket's [key], a PR's [url], a session's [host] +
+ * [sessionId] + attention [state]/[why], the [reason] a ticket is next (or the
+ * stale-close kind), [since]/[eta] in epoch ms.
+ */
+@Serializable
+data class BriefItem(
+    val kind: String = "",
+    val title: String = "",
+    val key: String? = null,
+    val url: String? = null,
+    val host: String? = null,
+    val sessionId: String? = null,
+    val state: String? = null,
+    val why: String? = null,
+    val reason: String? = null,
+    val note: String? = null,
+    val since: Long? = null,
+    val eta: Long? = null,
+)
+
+/** One subscription the org's hosts spend: its live windows and whether it pauses auto-start. */
+@Serializable
+data class BriefSpend(
+    val label: String = "",
+    val fiveHourPct: Double? = null,
+    val sevenDayPct: Double? = null,
+    val fiveHourResetsAt: Long? = null,
+    val sevenDayResetsAt: Long? = null,
+    val capturedAt: Long? = null,
+    val paused: Boolean = false,
 )
 
 /**

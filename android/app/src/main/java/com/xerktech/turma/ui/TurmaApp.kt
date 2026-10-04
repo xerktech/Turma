@@ -218,6 +218,11 @@ fun TurmaApp(
         composable(TopDest.USAGE.route) {
             MainScaffold(TopDest.USAGE, goTab) { m -> UsageScreen(modifier = m) }
         }
+        composable(TopDest.BRIEF.route) {
+            MainScaffold(TopDest.BRIEF, goTab) { m ->
+                BriefScreen(modifier = m, onOpenChat = { h, s -> nav.navigate(Routes.chat(h, s)) })
+            }
+        }
         composable(
             "chat/{host}/{session}",
             arguments = listOf(

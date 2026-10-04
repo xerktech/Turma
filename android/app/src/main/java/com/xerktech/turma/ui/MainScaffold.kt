@@ -6,6 +6,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Analytics
 import androidx.compose.material.icons.filled.GridView
+import androidx.compose.material.icons.filled.Summarize
 import androidx.compose.material.icons.filled.Terminal
 import androidx.compose.material.icons.filled.ViewKanban
 import androidx.compose.material3.Icon
@@ -20,12 +21,13 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 
-/** The four top-level destinations — mirrors the web's phone bottom-nav. */
+/** The top-level destinations — mirrors the web's phone bottom-nav (nav.js PAGES). */
 enum class TopDest(val route: String, val label: String, val icon: ImageVector) {
     DASHBOARD("dashboard", "Dashboard", Icons.Filled.GridView),
     SESSIONS("sessions", "Sessions", Icons.Filled.Terminal),
     BOARD("board", "Board", Icons.Filled.ViewKanban),
     USAGE("usage", "Usage", Icons.Filled.Analytics),
+    BRIEF("brief", "Brief", Icons.Filled.Summarize),
 }
 
 /**

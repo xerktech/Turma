@@ -52,6 +52,10 @@
       id: "usage", href: "/usage", label: "Usage",
       icon: `<path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/>`,
     },
+    {
+      id: "brief", href: "/brief", label: "Brief",
+      icon: `<path d="M9 4h6"/><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 10h6"/><path d="M9 14h6"/><path d="M9 18h3"/>`,
+    },
   ];
 
   const SIGNOUT = "fetch('/api/logout',{method:'POST'}).then(()=>location.href='/login');return false;";
