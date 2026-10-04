@@ -12095,6 +12095,99 @@ _JUDGE_PLAIN_RUNNERS = (_JUDGE_RUNNERS - {"find"}) | frozenset((
     "vi", "vim", "nvim", "ex", "ed", "emacs", "if", "then", "else", "elif", "fi", "for",
     "while", "until", "do", "done", "case", "esac", "select", "function", "coproc",
     "sem", "rush"))
+# Programs that run ANOTHER program named in their argv (rule b reaches past
+# the program word): always, or when one of the listed words follows them —
+# `ssh h 'ls *'`, `docker exec c sh -c …`, `uv run …`, `npm exec -- …`. The
+# payload is then a word the lexer never reads as a command.
+_JUDGE_ARGV_EXECUTORS = {
+    **dict.fromkeys(("ssh", "mosh", "rsh", "rlogin", "slogin", "sshpass", "autossh", "dbclient",
+                     "nix-shell", "systemd-nspawn", "wsl", "wsl.exe", "toolbox", "distrobox",
+                     "proot", "fakeroot", "fakechroot", "chpst", "runas", "gosu", "su-exec",
+                     "tini", "dumb-init", "catchsegv", "faketime", "torsocks", "proxychains",
+                     "proxychains4", "tsocks", "with-contenv", "s6-setuidgid", "setuidgid"), None),
+    **dict.fromkeys(("docker", "podman", "nerdctl", "finch", "lima", "nerdctl.lima", "colima",
+                     "ctr", "crictl", "buildah", "lxc", "incus", "machinectl", "oc",
+                     "devcontainer", "vagrant", "multipass", "orb", "orbctl"),
+                    frozenset(("exec", "run", "shell", "ssh", "enter", "rsh", "debug", "attach",
+                               "start", "create"))),
+    **dict.fromkeys(("uv", "poetry", "pipenv", "pdm", "hatch", "rye", "pixi", "conda", "mamba",
+                     "micromamba", "nix", "guix", "flatpak", "snap", "gcloud", "ip", "dotnet",
+                     "rbenv", "pyenv", "nodenv", "goenv", "asdf", "mise", "rtx", "direnv", "volta",
+                     "fnm", "nvm", "sdk", "bundle", "bundler", "corepack", "npm", "pnpm", "yarn",
+                     "cargo", "go", "stack", "cabal", "opam", "esy", "devbox", "flox", "aws",
+                     "az", "heroku", "fly", "flyctl", "railway"),
+                    frozenset(("run", "exec", "x", "dlx", "shell", "develop", "ssh", "netns",
+                               "environment", "with", "tool", "execute-command", "sh"))),
+}
+# Script/target runners whose `run` only names a script the project defines
+# (`npm run e2e`, `cargo run`): judgeable, like `npm test` — see the residual.
+_JUDGE_SCRIPT_RUN = frozenset(("npm", "pnpm", "yarn", "cargo", "dotnet", "go", "stack",
+                               "cabal", "bundle", "bundler"))
+# Words that mean "a program runs here" wherever they appear in a command —
+# an argv executor's payload (`docker exec c sh -c …`), an option value
+# (`--entrypoint=sh`, `rsync -e ssh`), or a quoted command line
+# (`x 'bash -c …'`). Excludes runner names that are ordinary English or
+# ordinary arguments (`time`, `watch`, `find`, `script`, `set`, `at`…).
+_JUDGE_RUNS_ANYWHERE = frozenset((
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "ash", "busybox", "cmd",
+    "cmd.exe", "powershell", "powershell.exe", "pwsh", "pwsh.exe", "bash.exe", "sh.exe", "eval",
+    "exec", "env", "sudo", "doas", "su", "xargs", "parallel", "nohup", "setsid", "stdbuf",
+    "unbuffer", "chroot", "nsenter", "unshare", "runuser", "pkexec", "firejail", "systemd-run",
+    "strace", "ltrace", "gdb", "valgrind", "flock", "ionice", "chrt", "taskset", "npx", "bunx",
+    "pnpx", "uvx", "pipx", "ssh", "sshpass", "nix-shell", "gosu", "su-exec"))
+# Inside a quoted command line (`x 'bash -c …'`) English prose is common
+# (`-m "fix env loading"`), so only these stand at ANY token; the rest of
+# `_JUDGE_RUNS_ANYWHERE`, an argv executor or an interpreter stands only in a
+# command position (first token, or after `;` `&&` `||` `|` `(` `$(` `` ` ``).
+_JUDGE_QUOTED_RUNS = frozenset((
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "csh", "tcsh", "busybox", "cmd.exe",
+    "powershell", "powershell.exe", "pwsh", "pwsh.exe", "bash.exe", "sh.exe", "sudo", "doas",
+    "xargs", "eval", "nohup", "setsid", "nsenter", "unshare", "chroot", "pkexec", "runuser",
+    "npx", "uvx", "pipx", "bunx", "pnpx", "sshpass", "strace", "gdb", "systemd-run",
+    "firejail", "stdbuf", "unbuffer", "su-exec", "gosu", "nix-shell"))
+_JUDGE_QUOTED_LEAD = "!({[;|&<>`'\"$@"
+_JUDGE_QUOTED_SEPS = frozenset((";", "&&", "||", "|", "&", "!", "then", "do", "else", "elif",
+                                "-exec", "-execdir", "--"))
+
+
+def _judge_value_parts(text):
+    """The parts of one word that could name a program: the value of a
+    `name=value` (never the name — `CMD=x` is not `cmd`), split on `,`."""
+    return [p for v in (text.split("=")[1:] or [text]) for p in v.split(",")]
+
+
+def _judge_runs_another(w):
+    """Why word `w` (an argument, redirect target or heredoc word) names a
+    program that would run, or None: unquoted, its basename (or an `=`/`,`
+    part: `--entrypoint=sh`) is a shell, runner or interpreter; quoted with
+    whitespace — a command line some executor may hand a shell — a token is
+    a shell/runner, or one in a command position is any runner, argv
+    executor or interpreter."""
+    value = w["value"]
+    if w.get("quoted") and re.search(r"\s", value):
+        prev = None
+        toks = value.split()
+        for n, tok in enumerate(toks):
+            lead = tok.lstrip(_JUDGE_QUOTED_LEAD)
+            at_cmd = n == 0 or lead != tok or prev in _JUDGE_QUOTED_SEPS \
+                or prev[-1:] in (";", "|", "&", "(", "`")
+            for part in _judge_value_parts(lead):
+                base = _judge_basename(part.lstrip(_JUDGE_QUOTED_LEAD).rstrip(";|&)}`'\""))
+                verbs = _JUDGE_ARGV_EXECUTORS.get(base, ())
+                if base in _JUDGE_QUOTED_RUNS or at_cmd and (
+                        base in _JUDGE_RUNS_ANYWHERE or base in _JUDGE_RUNNERS
+                        or _JUDGE_INTERP_RE.match(base) or verbs is None
+                        or verbs and any(t.lower() in verbs for t in toks[n + 1:])):
+                    return f"a quoted command line that runs {base}"
+            prev = tok
+        return None
+    for part in _judge_value_parts(value):
+        base = _judge_basename(part)
+        if base in _JUDGE_RUNS_ANYWHERE or _JUDGE_INTERP_RE.match(base):
+            return f"an argument that runs {base}"
+    return None
+
+
 # Programs that copy or write files: they stand when they touch a bin
 # directory or name a family program / runner (a renamed `git` is a `git`).
 _JUDGE_COPIERS = frozenset(("cp", "mv", "rsync", "install", "tee", "dd", "chmod", "chown",
@@ -12345,6 +12438,20 @@ def _judge_plain_reason(command):
             if prog in seen:
                 return "not a plain command: it runs a program an earlier word named"
         args = words[k + 1:] if prog_w is not None else []
+        if prog in _JUDGE_ARGV_EXECUTORS:
+            verbs = _JUDGE_ARGV_EXECUTORS[prog]
+            hit = None if verbs is not None else prog
+            for w in args if verbs is not None else ():
+                v = w["value"].lower()
+                if v in verbs and not (v == "run" and prog in _JUDGE_SCRIPT_RUN):
+                    hit = f"{prog} {v}"
+                    break
+            if hit:
+                return f"not a plain command: {hit} runs another program"
+        for w in args + cmd["targets"]:
+            reason = _judge_runs_another(w)
+            if reason:
+                return f"not a plain command: {reason}"
         if prog in ("find", "fd", "fdfind") and any(
                 w["value"] in ("-exec", "-execdir", "-ok", "-okdir", "-x", "-X", "--exec",
                                "--exec-batch") or w["value"].startswith(("--exec=", "--exec-batch="))

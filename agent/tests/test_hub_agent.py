@@ -38120,13 +38120,29 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "grep -rl foo . | xargs sed -n 1p", "find . -name '*.py' -exec wc -l {} +",
         "curl http://[::1]:8080/x", "ls *.py", "cat ~root/x", "ls ;; ls", "ls && ",
         "cat <<EOF\n$x\nEOF", "cat <<EOF\nno end", "if true; then ls; fi",
+        # A program run from an ARGUMENT, past the program word: an argv
+        # executor's payload, an option value, or a quoted command line —
+        # none of which the lexer reads as a command.
+        "ssh localhost 'ls *.py'", "docker exec c sh -c 'ls *.py'", "uv run sh -c 'ls *'",
+        "npm exec -- sh -c 'ls *'", "poetry run bash -c 'ls ?'", "ssh h ls",
+        "docker run --rm img", "podman exec c ls", "docker compose exec web ls",
+        "uv run pytest", "pipenv run python x.py", "bundle exec rake", "pnpm dlx cowsay",
+        "nix run nixpkgs#hello", "gcloud compute ssh vm --command 'ls'",
+        "vagrant ssh -c 'ls *'", "kubectl exec x -- ls", "rsync -e ssh a b:c",
+        "rsync --rsh=ssh a b:c", "tool --entrypoint=sh", "git -c core.sshCommand=sh fetch",
+        "tool 'bash -c \"ls *\"'", "tool 'cd /x && sh y'", "tool 'ssh h ls'",
+        "tool 'timeout 5 g'", "make CMD='docker run img'", "tool x python3",
     )
 
     # Ordinary commands a model may judge: the gate passes them.
     JUDGEABLE = ("npm ci", "pytest -q", "docker build -t x .", "cargo test", "npm run e2e",
                  "make test 2>&1 | tail -n 20", "CI=1 npm test", "pip install -r req.txt",
                  "npm test &&\n  npm run lint", "cat > notes.txt <<'EOF'\nhello $x\nEOF",
-                 "git lfs install", "gh run view 3 --log-failed", "ls ~/x")
+                 "git lfs install", "gh run view 3 --log-failed", "ls ~/x",
+                 "cargo run --release", "docker compose build", "docker ps", "go test ./...",
+                 "poetry install", "jq '.items[] | .name' f.json", "make CMD=build",
+                 "git commit -m 'fix env loading for the cmd flag'",
+                 "git commit -m 'feat(x): set up CI; go faster'")
 
     def test_only_plain_commands_reach_the_model(self):
         for cmd in self.PLAIN_GATE_PROBES:

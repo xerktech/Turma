@@ -168,7 +168,13 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
     `find -exec`, hash, alias, ln, npx, nohup, timeout, watch…), not a name an earlier word of the
     same command named (written then run); no `PATH`/`GIT_*`/`*_COMMAND`-style assignment; no
     cp/mv/tee/chmod/redirect into a bin dir or naming a family program;
-  - (c) no unquoted `* ? [ ] { }` and no `~user`/`~+`/`~-` anywhere;
+  - (b′) rule (b) reaches PAST the program word — a program run from an argument stands too,
+    since its payload is a word the lexer never reads as a command: an argv executor + its verb
+    (`_JUDGE_ARGV_EXECUTORS`: ssh always; docker/podman exec|run, uv/poetry/pipenv/pdm/hatch run,
+    npm/pnpm/yarn exec|dlx|x, bundle exec, nix run, gcloud/vagrant ssh…; `npm`/`cargo`/`go run`
+    of a project script stays judgeable); any unquoted argument or `=`-value that is a shell,
+    runner or interpreter (`--entrypoint=sh`, `rsync -e ssh`); a quoted command line with a
+    shell/runner token, or a runner/executor/interpreter in a command position (`_judge_runs_another`);
   - (d) no word (or `=`/`,`/`:` part, leading dashes off, case-folded) in `_JUDGE_NEVER_WORDS`
     (push, merge, delete, rebase, reset, apply, destroy, import, sync, patch, replace, scale,
     rollout, upgrade, uninstall, graphql, update-ref, symbolic-ref, mirror, force…), no GitHub
