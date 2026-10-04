@@ -23497,6 +23497,10 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
   const pp = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
     { body: { optionNumber: 1 }, headers: userHeaders });
   assert.equal(pp.status, 200);
+  // A number the two-option dialog does not offer is not logged as a choice.
+  const pp7 = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
+    { body: { optionNumber: 7 }, headers: userHeaders });
+  assert.equal(pp7.status, 200);
   const log = hub.getDecisions()[S].map(({ id, at, ...rest }) => rest);
   assert.deepEqual(log, [
     { source: "question", question: "Which DB?", answer: "Postgres", host: "dcHostB",

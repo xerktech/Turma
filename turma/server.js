@@ -15161,7 +15161,11 @@ function questionAnswerText(a, sessionId, picks, custom) {
 function panePromptAnswerText(a, sessionId, n) {
   const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
   const pp = s && s.session && s.session.panePrompt;
-  const opt = pp && Array.isArray(pp.options) ? pp.options.find((o) => o && o.number === n) : null;
+  const options = pp && Array.isArray(pp.options) ? pp.options : [];
+  const opt = options.find((o) => o && o.number === n);
+  // A number the dialog does not offer is dropped (the agent will not act on it),
+  // as questionAnswerText drops a pick past the served options.
+  if (options.length && !opt) return "";
   return opt && typeof opt.label === "string" && opt.label ? opt.label : `option ${n}`;
 }
 
