@@ -3240,6 +3240,37 @@ function sanitizeBrief(v) {
     out[k] = (Array.isArray(v[k]) ? v[k] : []).map(sanitizeBriefItem).filter(Boolean).slice(0, 10);
   }
   out.spend = (Array.isArray(v.spend) ? v.spend : []).map(sanitizeBriefSpend).filter(Boolean).slice(0, 10);
+  // Hub-internal bookkeeping, never on the wire (briefWire strips both): the
+  // digest of the FULL needs-you set (the push compares it — the lists above are
+  // cut at 10), and every merged PR URL a brief already reported, carried forward
+  // on the newest brief alone (the 10-row `finished` list cannot hold them).
+  // Absent stays absent, so a coerced record is still a fixed point.
+  if (typeof v.needsYouSig === "string" && /^(?:[0-9a-f]{40})?$/.test(v.needsYouSig)) {
+    out.needsYouSig = v.needsYouSig;
+  }
+  if (Array.isArray(v.prsReported)) {
+    out.prsReported = [...new Set(v.prsReported.filter((u) => typeof u === "string" && u
+      && u.length <= 500))].slice(0, 500);
+  }
+  return out;
+}
+// What a client is served (/api/agents, the SSE frame, the route): the newest
+// brief in full, each earlier one as its headline only (both clients show just
+// its counts) — so the payload carries one brief's rows per org, not ten. Still
+// the typed shape (empty sections), minus the hub-internal keys.
+function briefWire(b, full) {
+  const out = { ...b };
+  delete out.needsYouSig;
+  delete out.prsReported;
+  if (!full) {
+    for (const k of BRIEF_SECTIONS) out[k] = [];
+    out.spend = [];
+  }
+  return out;
+}
+function briefsWire() {
+  const out = {};
+  for (const [site, list] of Object.entries(briefs)) out[site] = list.map((b, i) => briefWire(b, i === 0));
   return out;
 }
 const briefsCoerce = (raw) => {
@@ -4907,7 +4938,8 @@ function buildAgentsCache() {
     // The per-org brief (XERK-1573): siteKey -> its last briefs, newest first.
     // Hub-owned, sanitized on every write/restore (sanitizeBrief) because Android
     // TYPES it; clients scope it by the header org filter like every org surface.
-    briefs,
+    // The newest brief per org in full, earlier ones as headlines (briefWire).
+    briefs: briefsWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -14214,6 +14246,7 @@ function epicRunCompleteSweep() {
 const BRIEF_INTERVAL_MS = positiveEnv("BRIEF_INTERVAL_MIN", 240) * 60 * 1000;
 const BRIEFS_KEEP = 10;      // briefsCoerce inlines the same 10 (module-init TDZ)
 const BRIEF_NEXT_MAX = 5;    // "what starts next" names this many
+const BRIEF_RETAIN_MS = 30 * 24 * 3600 * 1000;   // an org with no host: briefs kept this long
 
 // The orgs a brief is compiled for: every org some host is DECIDED into — the
 // org boundary every other org surface keys on, never a claimed jira.siteKey.
@@ -14276,20 +14309,32 @@ function compileBrief(siteKey, now, trigger, prevList) {
     }
   }
   // A PR carries no merge time, so "merged since the last brief" is a MERGED PR
-  // no kept brief already listed.
-  const seenPrs = new Set();
+  // no earlier brief reported. That memory is `prsReported`, carried forward on
+  // the newest brief — never the `finished` rows, which keep only 10 and drop
+  // with their brief (a brief from before `prsReported` still counts its rows).
+  const reported = new Set(prev && Array.isArray(prev.prsReported) ? prev.prsReported : []);
   for (const b of prevList) {
-    for (const it of b.finished || []) if (it.kind === "pr" && it.url) seenPrs.add(it.url);
+    for (const it of b.finished || []) if (it.kind === "pr" && it.url) reported.add(it.url);
   }
+  const seenPrs = new Set(reported);
+  const newPrs = [];
+  const visiblePrs = new Set();   // every MERGED PR the org's sessions still carry
+  const mergedOf = (s) => (Array.isArray(s && s.prs) ? s.prs : []).filter((p) =>
+    p && typeof p.url === "string" && p.url && String(p.state || "").toUpperCase() === "MERGED");
   const addPrs = (key, s) => {
-    for (const p of Array.isArray(s.prs) ? s.prs : []) {
-      if (!p || typeof p.url !== "string" || !p.url) continue;
-      if (String(p.state || "").toUpperCase() !== "MERGED" || seenPrs.has(p.url)) continue;
+    for (const p of mergedOf(s)) {
+      if (seenPrs.has(p.url)) continue;
       seenPrs.add(p.url);
+      newPrs.push(p.url);
       finished.push({ kind: "pr", url: p.url, title: p.title || p.url, host: key,
         sessionId: s.id, key: ticketKey(s) });
     }
   };
+  for (const [, a] of hosts) {
+    for (const s of [...(a.sessions || []), ...(a.closedSessions || [])]) {
+      for (const p of mergedOf(s)) visiblePrs.add(p.url);
+    }
+  }
   for (const [key, a] of hosts) {
     for (const s of a.sessions || []) if (s) addPrs(key, s);
     for (const c of a.closedSessions || []) {
@@ -14404,6 +14449,13 @@ function compileBrief(siteKey, now, trigger, prevList) {
     spend.push(entry);
   }
 
+  // The reported-PR memory, bounded by sanitizeBrief's 500: this brief's new
+  // ones, then the remembered ones a session still carries (the ones that could
+  // be re-reported), then the rest — so a cut drops the PRs no longer visible.
+  const carried = [...reported];
+  const prsReported = [...newPrs, ...carried.filter((u) => visiblePrs.has(u)),
+    ...carried.filter((u) => !visiblePrs.has(u))];
+
   return sanitizeBrief({
     siteKey, at: now, since, trigger, autoStart,
     counts: { finished: finished.length, needsYou: needsYou.length, waiting: waiting.length,
@@ -14411,16 +14463,23 @@ function compileBrief(siteKey, now, trigger, prevList) {
       intake, outflow },
     finished, needsYou, waiting, stalled,
     nextUp: nextUp.slice(0, BRIEF_NEXT_MAX), closedStale, spend,
+    needsYouSig: briefSigOf([...needsYou, ...stalled]), prsReported,
   });
 }
 
-// The needs-you SET a brief carries, as a comparable string: the push fires only
+// The needs-you SET a brief carries, as a comparable digest: the push fires only
 // when it changes between two consecutive briefs (stalled included — it is a
-// needs-you state). Reads the sanitized lists, so two briefs compare like for like.
+// needs-you state). compileBrief digests the FULL set before the 10-row cut, so a
+// newcomer past the cut still changes it; an empty set is "" (the retract case).
+function briefSigOf(items) {
+  const sig = items.map((i) => `${i.host}\x00${i.sessionId}\x00${i.state}`).sort().join("\n");
+  return sig ? crypto.createHash("sha1").update(sig).digest("hex") : "";
+}
 function briefNeedsYouSig(b) {
   if (!b) return "";
-  return [...(b.needsYou || []), ...(b.stalled || [])]
-    .map((i) => `${i.host}\x00${i.sessionId}\x00${i.state}`).sort().join("\n");
+  if (typeof b.needsYouSig === "string") return b.needsYouSig;
+  // A brief stored before the digest: its (≤10-row) lists, the same digest.
+  return briefSigOf([...(b.needsYou || []), ...(b.stalled || [])]);
 }
 
 // One FCM push per brief, ONLY when the needs-you set changed since the org's
@@ -14449,10 +14508,17 @@ function briefPush(brief, prev) {
 function briefSweep(siteKey, trigger = "scheduled", now = Date.now()) {
   const prevList = briefs[siteKey] || [];
   const brief = compileBrief(siteKey, now, trigger, prevList);
-  briefs[siteKey] = [brief, ...prevList].slice(0, BRIEFS_KEEP);
+  // The reported-PR memory rides the newest brief alone (it carries forward).
+  const older = prevList.map((b) => {
+    if (!b.prsReported) return b;
+    const o = { ...b };
+    delete o.prsReported;
+    return o;
+  });
+  briefs[siteKey] = [brief, ...older].slice(0, BRIEFS_KEEP);
   persistBriefs();
   invalidateAgentsCache();
-  sseBroadcast("briefs", briefs);
+  sseBroadcast("briefs", briefsWire());
   briefPush(brief, prevList[0] || null);
   return brief;
 }
@@ -14461,8 +14527,23 @@ function briefSweep(siteKey, trigger = "scheduled", now = Date.now()) {
 // BRIEF_INTERVAL_MS after its newest one — or, with none stored, after this hub
 // booted (the store persists, so a restart keeps the cadence; a fresh hub's first
 // brief is one interval in, or whenever the operator asks for one).
+// An org no host is decided into any more keeps its briefs BRIEF_RETAIN_MS past
+// its newest one (a host that went quiet or is being re-bound gets them back),
+// then they are dropped — nothing else ever removes a store key.
 function briefTick(now = Date.now()) {
-  for (const siteKey of briefOrgs()) {
+  const orgs = briefOrgs();
+  let pruned = false;
+  for (const [siteKey, list] of Object.entries(briefs)) {
+    if (orgs.has(siteKey) || now - ((list && list[0] && list[0].at) || 0) < BRIEF_RETAIN_MS) continue;
+    delete briefs[siteKey];
+    pruned = true;
+  }
+  if (pruned) {
+    persistBriefs();
+    invalidateAgentsCache();
+    sseBroadcast("briefs", briefsWire());
+  }
+  for (const siteKey of orgs) {
     const last = (briefs[siteKey] || [])[0];
     if (now - (last ? last.at : BOOT_AT) < BRIEF_INTERVAL_MS) continue;
     briefSweep(siteKey, "scheduled", now);
@@ -19593,7 +19674,7 @@ const server = http.createServer(async (req, res) => {
       if (!briefOrgs().has(siteKey)) {
         return json(res, 404, { error: "no host is in that org" });
       }
-      return json(res, 200, { ok: true, brief: briefSweep(siteKey, "manual") });
+      return json(res, 200, { ok: true, brief: briefWire(briefSweep(siteKey, "manual"), true) });
     }
 
     // POST /api/jira/<siteKey>/automerge — flip an org's hands-off auto-merge

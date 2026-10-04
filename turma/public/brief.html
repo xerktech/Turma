@@ -164,18 +164,23 @@ function countsHtml(b) {
     + `</div>`;
 }
 
-function headHtml(site, name, when) {
+// `live` = a host is decided into this org; only then can the hub compile a brief
+// (the route 404s otherwise), so an org kept only for its old briefs offers none.
+function headHtml(site, name, when, live) {
   return `<div class="brief-head"><span class="brief-org-name">${esc(name)}</span>`
     + (when ? `<span class="brief-when">${when}</span>` : "")
     + `<span class="spacer"></span>`
-    + `<button class="brief-now" data-brief-now="${esc(site)}"${busy.has(site) ? " disabled" : ""}>${busy.has(site) ? "Compiling…" : "Brief now"}</button></div>`;
+    + (live
+      ? `<button class="brief-now" data-brief-now="${esc(site)}"${busy.has(site) ? " disabled" : ""}>${busy.has(site) ? "Compiling…" : "Brief now"}</button>`
+      : `<span class="brief-when">no host in this org</span>`)
+    + `</div>`;
 }
 
-function orgHtml(site, list, now) {
+function orgHtml(site, list, now, live) {
   const b = list[0];
   const name = TurmaBoard.orgName ? TurmaBoard.orgName(site) : site;
   if (!b) {
-    return `<section class="brief-org">${headHtml(site, name, "")}`
+    return `<section class="brief-org">${headHtml(site, name, "", live)}`
       + `<div class="brief-none">No brief yet — the hub compiles one every few hours, or press Brief now.</div></section>`;
   }
   const secs = SECTIONS.map(([k, label, cls]) => {
@@ -195,7 +200,7 @@ function orgHtml(site, list, now) {
   }).join("");
   const when = `${esc(clock(b.at))} · covers the ${esc(ago(b.since, b.at))} before`
     + (b.trigger === "manual" ? " · on demand" : "");
-  return `<section class="brief-org">` + headHtml(site, name, when)
+  return `<section class="brief-org">` + headHtml(site, name, when, live)
     + countsHtml(b) + secs + spendHtml(b)
     + (earlier ? `<details class="brief-earlier"><summary>Earlier briefs (${list.length - 1})</summary><ul class="brief-list">${earlier}</ul></details>` : "")
     + `</section>`;
@@ -208,11 +213,13 @@ function render(data) {
   const keys = TurmaOrg.getKeys();
   // Every org a host is decided into (the served `org`), plus any org with a kept
   // brief — so an org with none yet still offers Brief now.
+  const live = new Set();
+  for (const a of data.agents || []) if (a && typeof a.org === "string" && a.org) live.add(a.org);
   const orgs = new Set(Object.keys(all).filter((s) => Array.isArray(all[s]) && all[s].length));
-  for (const a of data.agents || []) if (a && typeof a.org === "string" && a.org) orgs.add(a.org);
+  for (const s of live) orgs.add(s);
   const sites = [...orgs].filter((s) => !keys.length || keys.includes(s)).sort();
   const html = sites.length
-    ? sites.map((s) => orgHtml(s, Array.isArray(all[s]) ? all[s] : [], now)).join("")
+    ? sites.map((s) => orgHtml(s, Array.isArray(all[s]) ? all[s] : [], now, live.has(s))).join("")
     : `<div class="brief-empty">No org to brief — no host reports a tracker org yet.</div>`;
   TurmaNav.preserveScroll($briefs, () => { $briefs.innerHTML = html; });
 }
@@ -253,7 +260,8 @@ function connectSSE() {
   try { es = new EventSource("/api/events"); }
   catch { setTimeout(connectSSE, sseBackoff); return; }
   es.onopen = () => { sseOk = true; sseBackoff = 2000; };
-  // A brief landed (any org): the frame carries the whole (small) map.
+  // A brief landed (any org): the frame carries every org's list (the newest
+  // brief in full, earlier ones as headlines), the same shape /api/agents serves.
   es.addEventListener("briefs", (e) => {
     let b;
     try { b = JSON.parse(e.data); } catch { return; }

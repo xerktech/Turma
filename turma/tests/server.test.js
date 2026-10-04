@@ -22916,6 +22916,12 @@ test("XERK-1573: the brief bounds its lists and keeps the newest BRIEFS_KEEP", a
   invalidateAgentsCache();
   const r = await request("GET", "/api/agents", { headers: userHeaders });
   assert.equal(r.body.briefs[S].length, 10);
+  // The newest in full; each earlier one as its headline (both clients show only
+  // its counts), though the store keeps its rows.
+  assert.equal(r.body.briefs[S][0].needsYou.length, 10);
+  assert.equal(kept[1].needsYou.length, 10);
+  assert.deepEqual(r.body.briefs[S][1].needsYou, []);
+  assert.equal(r.body.briefs[S][1].counts.needsYou, 15);
   delete agents.brHostC;
   delete hub.getBriefs()[S];
 });
@@ -23021,4 +23027,122 @@ test("XERK-1573: the brief store coerces to the typed wire shape and survives a 
   } finally {
     fs.unlinkSync(file);
   }
+});
+
+test("XERK-1573: a merged PR is finished in ONE brief, past the 10-row cut and BRIEFS_KEEP", async () => {
+  const S = "brG1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const PR = "https://github.com/x/y/pull/77";
+  // 12 Done tickets resolved in the first period fill `finished` past its 10
+  // stored rows, ahead of the PR row — which used to be the only memory of it.
+  const tickets = [];
+  for (let i = 0; i < 12; i++) {
+    tickets.push({ key: `G-${i}`, summary: `done ${i}`, statusCategory: "done",
+      created: iso(now - 90 * 24 * H), resolved: iso(now - H) });
+  }
+  await asBeat("brHostG", S, { autoStart: false, tickets,
+    sessions: [{ id: "g1", status: "running", prs: [{ url: PR, state: "MERGED", title: "Ship" }] }] });
+  const prRows = (b) => b.finished.filter((i) => i.kind === "pr").length;
+  const b1 = hub.briefSweep(S, "scheduled", now);
+  assert.equal(b1.counts.finished, 13, "12 tickets + the PR");
+  assert.equal(prRows(b1), 0, "the PR row is cut from the stored list");
+  assert.deepEqual(b1.prsReported, [PR], "...but the brief remembers reporting it");
+  const b2 = hub.briefSweep(S, "scheduled", now + 3 * H);
+  assert.equal(prRows(b2), 0);
+  assert.equal(b2.counts.finished, 0, "not finished again");
+  // The session keeps running past BRIEFS_KEEP more briefs (an operator pressing
+  // Brief now): the memory carries forward on the newest brief, so still never.
+  for (let i = 0; i < 12; i++) {
+    const b = hub.briefSweep(S, "manual", now + 4 * H + i * 1000);
+    assert.equal(b.counts.finished, 0, `brief ${i} re-reported the PR`);
+  }
+  const kept = hub.getBriefs()[S];
+  assert.equal(kept.length, 10);
+  assert.deepEqual(kept[0].prsReported, [PR]);
+  assert.ok(kept.slice(1).every((b) => !("prsReported" in b)), "only the newest brief carries it");
+  // Never on the wire: the payload strips the hub-internal keys and serves the
+  // earlier briefs as headlines only.
+  invalidateAgentsCache();
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  const served = r.body.briefs[S];
+  assert.equal(served.length, 10);
+  assert.ok(served.every((b) => !("prsReported" in b) && !("needsYouSig" in b)));
+  assert.deepEqual(served[1].finished, []);
+  assert.deepEqual(served[1].spend, []);
+  assert.equal(typeof served[1].counts.finished, "number");
+  delete agents.brHostG;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: a newcomer past the 10-row needs-you cut still pushes", async () => {
+  const S = "brH1573.atlassian.net";
+  const now = Date.now();
+  const sessions = [];
+  for (let i = 0; i < 16; i++) sessions.push({ id: `h${i}`, status: "running" });
+  await asBeat("brHostH", S, { autoStart: false, sessions });
+  for (let i = 0; i < 16; i++) setAttn("brHostH", `h${i}`, { state: "working", since: now });
+  for (let i = 0; i < 15; i++) {
+    setAttn("brHostH", `h${i}`, { state: "needs-you:review", since: now - (100 - i) * 1000, why: "x" });
+  }
+  const pushes = () => notifications.filter((n) => n.title != null && n.data && n.data.notifKey === `brief:${S}`);
+  notifications.length = 0;
+  hub.briefSweep(S, "scheduled", now);
+  assert.equal(pushes().length, 1);
+  // The 16th is the NEWEST, so the oldest-first 10-row list does not show it.
+  setAttn("brHostH", "h15", { state: "needs-you:question", since: now, why: "new?" });
+  const b = hub.briefSweep(S, "scheduled", now + 1000);
+  assert.equal(b.needsYou.some((i) => i.sessionId === "h15"), false, "cut from the stored list");
+  assert.equal(b.counts.needsYou, 16);
+  assert.equal(pushes().length, 2, "the set changed, so it pushes");
+  hub.briefSweep(S, "scheduled", now + 2000);
+  assert.equal(pushes().length, 2, "same full set: no push");
+  delete agents.brHostH;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1573: starts next skips a held/rejected ticket; an offline host needs no one", async () => {
+  resetAutoStart();
+  const S = "brI1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const iso = (ms) => new Date(ms).toISOString();
+  const todo = (key, ageH) => ({ key, summary: `todo ${key}`, statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true }, created: iso(now - ageH * H),
+    triage: { priority: "P2", type: "task", actionable: true } });
+  await asBeat("brHostI", S, { capacity: FULL,
+    tickets: [todo("I-1", 30), todo("I-2", 20), todo("I-3", 10)],
+    sessions: [{ id: "i1", status: "running", summary: "asks" }] });
+  setAttn("brHostI", "i1", { state: "needs-you:question", since: now - 60000, why: "Q?" });
+  setTicketTriageAction(S, "I-1", "hold");
+  setTicketTriageAction(S, "I-2", "reject");
+  try {
+    const b = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(b.nextUp.map((i) => i.key), ["I-3"], "a held or rejected ticket is not next");
+    assert.deepEqual(b.needsYou.map((i) => i.sessionId), ["i1"]);
+    // The host goes silent: its last beat's attention is frozen, not current.
+    agents.brHostI.lastSeen = now - 10 * 60 * 1000;
+    const off = hub.compileBrief(S, now, "scheduled", []);
+    assert.deepEqual(off.needsYou, [], "an offline host's session is not in needs-you");
+    assert.equal(off.counts.needsYou, 0);
+  } finally {
+    setTicketTriageAction(S, "I-1", null);
+    setTicketTriageAction(S, "I-2", null);
+    delete agents.brHostI;
+    resetAutoStart();
+  }
+});
+
+test("XERK-1573: briefTick drops an org with no host once its briefs are old", async () => {
+  const S = "brJ1573.atlassian.net";
+  const now = Date.now();
+  await asBeat("brHostJ", S, { autoStart: false });
+  hub.briefSweep(S, "scheduled", now);
+  delete agents.brHostJ;
+  hub.briefTick(now + 24 * 3600 * 1000);
+  assert.equal(hub.getBriefs()[S].length, 1, "kept a while: a quiet host may come back");
+  hub.briefTick(now + 31 * 24 * 3600 * 1000);
+  assert.equal(S in hub.getBriefs(), false, "dropped past the retention");
+  for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
 });

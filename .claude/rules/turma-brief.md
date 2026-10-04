@@ -27,8 +27,13 @@ paragraph and the per-org decisions log are XERK-1574.
   drifted host's sessions are in no org's brief (the XERK-348 boundary).
 - **`compileBrief` reads hub data only** and writes nothing:
   - **finished** — Done rows whose `resolved` (agent `resolutiondate` / ADO `ClosedDate`; an older
-    agent's row falls back to `updated`) is in the period, MERGED PRs on the org's sessions no kept
-    brief already listed (a PR carries no merge time), and sessions whose `closedAt` is in the period;
+    agent's row falls back to `updated`) is in the period, MERGED PRs on the org's sessions no
+    earlier brief reported (a PR carries no merge time), and sessions whose `closedAt` is in the
+    period;
+  - **"already reported" is `prsReported`, never the `finished` rows** — those keep 10 and drop with
+    their brief, so a merged PR cut from the list (or on a session outliving `BRIEFS_KEEP` briefs)
+    was finished again. The newest brief alone carries it forward (≤500 URLs, the ones a session
+    still carries kept first); `briefSweep` strips it off the older ones;
   - **needsYou / stalled / waiting** — the hub's own attention stamp (`wireAttention` of
     `alerts.sessions[sid].attn`, XERK-1571), ONLINE hosts only (an offline host's state is frozen);
     needs-you and stalled oldest `since` first, waiting by ETA. `suggestedAnswer` arrives with
@@ -54,8 +59,12 @@ paragraph and the per-org decisions log are XERK-1574.
   literal bounds (module-init TDZ), 10 rows per section, strings capped, `since <= at`. A record for
   another org, or with no usable `at`, is dropped. The map is null-prototype (XERK-1451). A sanitized
   brief is a coerce fixed point, so HA's own-write echo dedups.
-- Served as top-level **`briefs`** on `/api/agents` + its own **`briefs`** SSE frame (the whole
-  map). Clients scope it by the header org pick like every org surface. **Android TYPES it**
+- **Two hub-internal keys never reach the wire** — `prsReported` and `needsYouSig` (`briefWire`
+  strips them on `/api/agents`, the SSE frame and the route). `briefWire` also serves each EARLIER
+  brief as its headline only (empty sections + spend, counts kept): both clients show only its
+  counts, and full rows for ten briefs per org cost every 6s Android poll.
+- Served as top-level **`briefs`** on `/api/agents` + its own **`briefs`** SSE frame (every
+  org, through `briefWire`). Clients scope it by the header org pick like every org surface. **Android TYPES it**
   (`OrgBrief`/`BriefItem`/`BriefCounts`/`BriefSpend`, every field defaulted) — a new field is a
   `sanitizeBrief` line AND a Kotlin field in the same change (decode atomicity).
 
@@ -63,6 +72,9 @@ paragraph and the per-org decisions log are XERK-1574.
 
 - **`POST /api/orgs/<site>/brief`** (operator-authed) compiles now and answers `{ok, brief}`; a site
   no host is decided into is a 404 that mints no store key. It resets the cadence like any brief.
+- **The needs-you set is a digest of the FULL set** (`needsYouSig`, sha1 of host/session/state,
+  computed before the 10-row cut; "" = empty). A sig off the stored lists missed a newcomer cut from
+  them. A brief stored before the digest falls back to digesting its lists the same way.
 - **One FCM push per brief, ONLY when the needs-you set changed** (needs-you + stalled rows, by
   host/session/state) since the org's previous brief — `notifKey brief:<site>`, so a new one
   REPLACES the last; a set that empties RETRACTS it (`dismiss`). An empty set with no previous brief
@@ -72,11 +84,16 @@ paragraph and the per-org decisions log are XERK-1574.
 
 ## Surfaces
 
+- **An org no host is decided into keeps its briefs `BRIEF_RETAIN_MS` (30 days)** past its newest,
+  then `briefTick` drops the key (a quiet host may return); until then both clients show it with
+  "no host in this org" IN PLACE of Brief now, which the route would 404.
 - `brief.html` (nav `brief`): every org a host is decided into (the served `org`) plus any org with
   a kept brief, so an org with none yet still offers **Brief now**. Refusals toast the hub's words.
 - Android `BriefScreen` (bottom-nav `Brief`) renders the same off `FleetState.briefs`; `core/Brief.kt`
-  ports the org list (`briefOrgs`), the row meta line (`briefItemMeta`) and `briefDur`. Deliberate
+  ports the org list (`briefOrgs`, `briefLiveOrgs`), the row meta line (`briefItemMeta`) and `briefDur`. Deliberate
   differences in `android/PARITY.md`.
 - Tests: the `XERK-1573:` cases in `server.test.js` (composition + decided-org scoping, bounds +
-  keep, the push dedupe/retract, the cadence, the route, the sanitizer + restart restore); `nav.test.js`;
+  keep + the headline-only wire, the push dedupe/retract + a newcomer past the cut, a merged PR
+  reported once, hold/reject + offline-host exclusion, the cadence + retention, the route, the
+  sanitizer + restart restore); `nav.test.js`;
   `test_full_issue` (`resolved`) in `test_hub_agent.py`; android `BriefTest`, `AgentDecodeTest`.

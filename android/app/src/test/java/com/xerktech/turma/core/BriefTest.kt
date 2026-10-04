@@ -35,6 +35,13 @@ class BriefTest {
         assertEquals(3, briefOrgs(briefs, agents, setOf("nobody.atlassian.net")).size)
     }
 
+    @Test fun `briefLiveOrgs is the decided orgs alone, never a kept brief's`() {
+        val agents = listOf(host("a1", "a.atlassian.net"), host("a2", "a.atlassian.net"),
+            host("b1", "b.atlassian.net"), host("n1", null), host("e1", ""))
+        assertEquals(setOf("a.atlassian.net", "b.atlassian.net"), briefLiveOrgs(agents))
+        assertEquals(emptySet<String>(), briefLiveOrgs(emptyList()))
+    }
+
     @Test fun `briefDur words a duration like the web page`() {
         assertEquals("0s", briefDur(-5))
         assertEquals("89s", briefDur(89_000))

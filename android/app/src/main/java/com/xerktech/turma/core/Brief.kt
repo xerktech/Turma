@@ -69,6 +69,14 @@ fun briefOrgs(
     return orgs.filter { keys.isEmpty() || it in keys }
 }
 
+/**
+ * The orgs a host is DECIDED into (the served `org`) — the only ones the hub will
+ * compile a brief for, so "Brief now" shows for these alone; an org listed only
+ * for its kept briefs has no host to brief. web brief.html `render`'s `live`.
+ */
+fun briefLiveOrgs(agents: List<AgentInfo>): Set<String> =
+    agents.mapNotNull { a -> a.org?.takeIf { it.isNotEmpty() } }.toSet()
+
 /** A duration as the brief words it — web brief.html `dur`, same thresholds. */
 fun briefDur(ms: Long): String {
     val s = Math.round(ms.coerceAtLeast(0) / 1000.0)

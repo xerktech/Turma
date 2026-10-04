@@ -28,6 +28,7 @@ import androidx.lifecycle.viewmodel.compose.viewModel
 import com.xerktech.turma.core.BRIEF_SECTIONS
 import com.xerktech.turma.core.briefDur
 import com.xerktech.turma.core.briefItemMeta
+import com.xerktech.turma.core.briefLiveOrgs
 import com.xerktech.turma.core.briefOrgs
 import com.xerktech.turma.core.briefSection
 import com.xerktech.turma.core.briefSectionCount
@@ -56,6 +57,7 @@ fun BriefScreen(
     val busy by vm.busy.collectAsStateWithLifecycle()
     val errors by vm.errors.collectAsStateWithLifecycle()
     val sites = remember(fleet.briefs, fleet.agents, org) { briefOrgs(fleet.briefs, fleet.agents, org) }
+    val live = remember(fleet.agents) { briefLiveOrgs(fleet.agents) }
 
     Column(modifier.fillMaxSize()) {
         ScreenHeader("Brief")
@@ -79,6 +81,7 @@ fun BriefScreen(
                     earlier = (fleet.briefs[site]?.size ?: 1) - 1,
                     now = maxOf(fleet.now, System.currentTimeMillis()),
                     busy = site in busy,
+                    canBrief = site in live,
                     error = errors[site],
                     onBriefNow = { vm.briefNow(site) },
                     onOpenChat = onOpenChat,
@@ -95,6 +98,7 @@ private fun OrgBriefCard(
     earlier: Int,
     now: Long,
     busy: Boolean,
+    canBrief: Boolean,
     error: String?,
     onBriefNow: () -> Unit,
     onOpenChat: (String, String) -> Unit,
@@ -113,8 +117,16 @@ private fun OrgBriefCard(
                         )
                     }
                 }
-                OutlinedButton(onClick = onBriefNow, enabled = !busy) {
-                    Text(if (busy) "Compiling…" else "Brief now")
+                if (canBrief) {
+                    OutlinedButton(onClick = onBriefNow, enabled = !busy) {
+                        Text(if (busy) "Compiling…" else "Brief now")
+                    }
+                } else {
+                    Text(
+                        "no host in this org",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
                 }
             }
             if (error != null) {
