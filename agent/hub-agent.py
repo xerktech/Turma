@@ -344,7 +344,8 @@ WAKE_MAX_AHEAD_MS = (7 * 24 + 1) * 3600 * 1000
 # PAUSE_SLEEPER_MIN_AHEAD_MS away. TURMA_PAUSE_SLEEPERS=0 turns it off: the host
 # then reports no `pauseSleepers` capability and refuses the command.
 # See .claude/rules/agent-session-cli.md.
-PAUSE_SLEEPERS = os.environ.get("TURMA_PAUSE_SLEEPERS", "1").strip() != "0"
+PAUSE_SLEEPERS = os.environ.get("TURMA_PAUSE_SLEEPERS", "1").strip().lower() not in (
+    "0", "false", "no", "off")
 PAUSE_SLEEPER_MIN_AHEAD_MS = 10 * 60 * 1000
 # Commands that reach a session's pane for the operator (or the hub's nudge). A
 # pause arriving beside one of these for the same session is refused: the kill
@@ -364,7 +365,8 @@ PAUSED_KEEP_MAX = 32
 # Not verified on a real pane, so OFF: the text is staged through the operator
 # input path once the resumed pane reads an idle composer, at least
 # WAKE_RESUME_SETTLE_MS after the resume launched.
-RESUME_WAKE_PROMPT_ARG = os.environ.get("TURMA_RESUME_WAKE_PROMPT", "0").strip() == "1"
+RESUME_WAKE_PROMPT_ARG = os.environ.get("TURMA_RESUME_WAKE_PROMPT", "0").strip().lower() in (
+    "1", "true", "yes", "on")
 WAKE_RESUME_SETTLE_MS = 15 * 1000
 
 
@@ -18781,6 +18783,23 @@ class SessionManager:
         # the beat (add) and the export thread (discard), under its own lock.
         self._exporting = set()
         self._exporting_lock = threading.Lock()
+        # The sleeper lifecycle worker (XERK-1575): the SLOW halves of a hub-sent
+        # pause (the tmux/ttyd teardown) and of a wake resume (re-adding a
+        # vanished worktree) run here, never on the beat (XERK-395). The beat owns
+        # every registry/closed.json write; the worker only runs processes and
+        # git. `_sleeper_jobs` is the worker's queue; `_sleeper_busy` maps sid ->
+        # {kind: "teardown"|"restore", worktreePath, claudeSessionId} from staging
+        # until the job is done (a teardown) or applied on the beat (a restore);
+        # `_sleeper_restoring` holds a restore's worktree path for the prune
+        # handshake; `_sleeper_landed` carries finished restores
+        # [(sid, cmd_id, error)] for the beat.
+        self._sleeper_jobs = []
+        self._sleeper_landed = []
+        self._sleeper_busy = {}
+        self._sleeper_restoring = {}
+        self._sleeper_lock = threading.Lock()
+        self._sleeper_wake = threading.Event()
+        self._sleeper_worker = None
         # The close-ticket reader (XERK-1569): a worker does the tracker HTTP off
         # the beat (XERK-395) and stages each outcome on `_close_ticket_landed`
         # under the lock; the BEAT drains it, stamps `ticket.outcome` on the
@@ -20428,13 +20447,16 @@ class SessionManager:
         broken (`error`), since a broken session keeps a worktree the operator can
         Start back into. This is the count every capacity gate uses, so a crashed
         session no longer reads as free capacity the hub fills with fresh work.
+        A paused sleeper's wake resume waiting on its worktree re-add (XERK-1575)
+        holds one too: that slot is the sleeper's.
 
         `exclude_id` drops one record from the tally — for `start()`, whose target
         is ALREADY an `error` record in this set: it is transitioning to `running`
         (net zero), so it must never be refused for the slot it already holds."""
         return sum(1 for s in self.registry
                    if s.get("status") in SLOT_HOLDING_STATUSES
-                   and not (exclude_id is not None and s.get("id") == exclude_id))
+                   and not (exclude_id is not None and s.get("id") == exclude_id)
+                   ) + self._restores_in_flight()
 
     def _queued_count(self):
         return sum(1 for s in self.registry if s.get("status") == "queued")
@@ -22602,6 +22624,14 @@ class SessionManager:
         if IS_WINDOWS:
             return
         proc = self.ttyd.pop(sid, None)
+        sess = self._find(sid)
+        self._reap_ttyd(proc, sess.get("ttydPid") if sess else None)
+
+    @staticmethod
+    def _reap_ttyd(proc, pid):
+        """Terminate a session's ttyd: the process we launched and, when it is a
+        different one, the persisted pid. Touches no manager state, so the
+        sleeper lifecycle worker can run it (XERK-1575)."""
         if proc is not None:
             try:
                 proc.terminate()
@@ -22611,8 +22641,6 @@ class SessionManager:
         # prior manager, so it's not in self.ttyd): the persisted pid is that same
         # live process. Without this, stop/delete would leak the orphan and its
         # port. Best-effort — a recycled/dead pid just fails harmlessly.
-        sess = self._find(sid)
-        pid = sess.get("ttydPid") if sess else None
         if pid and (proc is None or proc.pid != pid):
             try:
                 os.kill(int(pid), signal.SIGTERM)
@@ -23636,25 +23664,21 @@ class SessionManager:
                 keep.append(c)
         self.closed = list(reversed(keep))
 
-    def kill(self, sid, paused=None):
+    def kill(self, sid):
         """Stop a session and drop its registry record so the card disappears
         from the hub — but KEEP its worktree on disk (any uncommitted work
         survives) and its transcript. Recorded in the closed history so the
         repo's "Resume" picker can re-attach to the same worktree with its
         conversation. (Contrast delete(), which removes the worktree too.)
 
-        `paused` ({wakeAt, wakeReason, pausedAt}) marks a sleeper paused for its
-        slot (XERK-1575, `pause_sleeper`): kept on the closed record, so the
-        resume carries the wake back.
-
-        The operator's Kill of a sleeper the hub already PAUSED finds no session,
-        only its closed record: the kill drops the pause, leaving an ordinary
-        killed record the hub never wakes — also when the pause won a race with
-        the kill."""
+        The operator's Kill of a sleeper the hub already PAUSED (XERK-1575) finds
+        no session, only its closed record: the kill drops the pause, leaving an
+        ordinary killed record the hub never wakes — also when the pause won a
+        race with the kill."""
         sess = self._find(sid)
         if not sess:
             rec = next((c for c in self.closed if c.get("id") == sid), None)
-            if paused is None and self._unpause_closed(rec):
+            if self._unpause_closed(rec):
                 log(f"kill: {sid} was a paused sleeper; it stays killed")
                 return
             log(f"kill: no such session {sid}")
@@ -23665,6 +23689,13 @@ class SessionManager:
         self._teardown_dsh(sid, kill=True)
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
+        self._drop_killed(sess)
+
+    def _drop_killed(self, sess, paused=None):
+        """The registry half of a kill: drop the record, remember it as closed
+        (with `paused` — {wakeAt, wakeReason, pausedAt} — for a sleeper paused for
+        its slot, XERK-1575) and forget its caches. Beat-only."""
+        sid = sess["id"]
         # The worktree is deliberately left in place — killing must never lose
         # uncommitted work. (Root has no worktree; nothing to leave either way.)
         self.registry = [s for s in self.registry if s.get("id") != sid]
@@ -23726,6 +23757,18 @@ class SessionManager:
         if not rec:
             log(f"resume: no closed session {sid}")
             return
+        # A paused sleeper still in the lifecycle worker's hands (XERK-1575): its
+        # worktree is being re-added for this very resume, or its old tmux is
+        # still being torn down — relaunching `agent-<id>` now would race that
+        # kill.
+        busy = self._sleeper_busy_kind(sid)
+        if busy == "restore":
+            log(f"resume: {sid} is already being resumed")
+            return
+        if busy == "teardown":
+            self._refuse_start("its pause is still being torn down; resume it "
+                               "again in a moment", cmd_id=cmd_id)
+            return
         if self._slots_used() >= MAX_SESSIONS:
             log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
@@ -23739,6 +23782,14 @@ class SessionManager:
             self._unpause_closed(rec)
             self._refuse_start(f"a session is already running in "
                                f"{holder.get('worktreePath')}", cmd_id=cmd_id)
+            return
+        # A paused sleeper's kept worktree is gone (a prune swept it while it
+        # slept): `git worktree add` can take tens of seconds, so it runs on the
+        # lifecycle worker and the resume finishes on a later beat (XERK-395).
+        wt = rec.get("worktreePath")
+        if (rec.get("paused") and not rec.get("root") and isinstance(wt, str)
+                and wt and not os.path.isdir(wt)):
+            self._stage_worktree_restore(sid, rec, cmd_id)
             return
         sess = {
             "id": sid,
@@ -24084,6 +24135,12 @@ class SessionManager:
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
             refuse(f"a session is already running in {cwd}")
+            return None
+        # A paused sleeper's teardown or worktree restore still in flight there,
+        # or on this conversation (XERK-1575).
+        if self._sleeper_job_blocks(cwd=cwd, transcript=transcript_id, root=is_root):
+            refuse(f"a paused session in {cwd} is still being torn down or "
+                   f"restored; try again in a moment")
             return None
         repo_path = REPOS_ROOT if is_root else os.path.join(REPOS_ROOT, repo)
         if not is_root and not os.path.isdir(repo_path):
@@ -25002,9 +25059,13 @@ class SessionManager:
         wt = rec.get("worktreePath")
         wt = (os.path.normpath(wt) if not rec.get("root")
               and isinstance(wt, str) and wt else None)
-        held = wt is not None and any(
+        held = wt is not None and (any(
             isinstance(s.get("worktreePath"), str)
             and os.path.normpath(s["worktreePath"]) == wt for s in self.registry)
+            # The lifecycle worker re-adding it for this record's wake: removing
+            # it now would race that `git worktree add`; the landed resume then
+            # finds no record and leaves the worktree to a later prune.
+            or self._sleeper_job_blocks(cwd=wt))
         if wt is not None and not held and os.path.isdir(wt) \
                 and isinstance(rec.get("repoPath"), str):
             self._worktree_remove(rec)
@@ -25326,6 +25387,12 @@ class SessionManager:
         the same paths at files that are already there."""
         sess = self._find(sid)
         if sess is None:
+            # Said, never silent: the hub refuses a message to a session whose
+            # sleeper pause it already handed over (XERK-1575), so this is a kill
+            # that crossed the message in flight.
+            paused = any(c.get("id") == sid and c.get("paused") for c in self.closed)
+            log(f"input for {sid} dropped: no running session"
+                + (" (it was paused as a sleeper)" if paused else ""))
             return
         if sess.get("status") != "running":
             # A found-but-not-running session has no live pane: surface the drop
@@ -26781,12 +26848,188 @@ class SessionManager:
         if why:
             log(f"pause refused for session {sid}: {why}")
             return False
-        self.kill(sid, paused={"wakeAt": sess["wakeAt"],
-                               "wakeReason": sess.get("wakeReason"),
-                               "pausedAt": now_ms})
+        # The clean kill, split (XERK-395): the processes are handed to the
+        # lifecycle worker FIRST (dsh control, ttyd process and pid taken off the
+        # live maps, so the cache forget below cannot close the dsh socket before
+        # its clean kill), then the beat drops the record at once — the slot is
+        # free on this beat's report while the worker tears the tmux down.
+        job = {"kind": "teardown", "sid": sid,
+               "tmuxName": sess.get("tmuxName"),
+               "dsh": self.dsh_controls.pop(sid, None),
+               "ttyd": self.ttyd.pop(sid, None),
+               "ttydPid": sess.get("ttydPid")}
+        self._drop_killed(sess, paused={"wakeAt": sess["wakeAt"],
+                                        "wakeReason": sess.get("wakeReason"),
+                                        "pausedAt": now_ms})
+        self._stage_sleeper_job(job, {
+            "kind": "teardown", "worktreePath": sess.get("worktreePath"),
+            "root": bool(sess.get("root")),
+            "claudeSessionId": sess.get("claudeSessionId")})
         log(f"paused sleeping session {sid} to free its slot (wakes at "
-            f"{sess['wakeAt']})")
+            f"{sess['wakeAt']}); its tmux is torn down off the beat")
         return True
+
+    # ---- the sleeper lifecycle worker (XERK-1575, XERK-395) -------------------
+    #
+    # Stage (beat) -> work (worker: processes, git) -> apply (beat: registry).
+    # A teardown needs no apply: the beat already dropped the record; the worker
+    # clears the busy mark when the processes are gone. A restore lands
+    # (sid, cmd_id, error) for `_apply_sleeper_landed`, which finishes the resume.
+
+    def _stage_sleeper_job(self, job, busy):
+        """Queue `job` for the lifecycle worker, marking its sid busy, and wake
+        (or start) the worker. MUST NOT raise onto the beat: a failed
+        Thread.start() (pids_limit, XERK-402) leaves the job queued for the next
+        stage to retry — `_stage_close_ticket_work`'s shape."""
+        with self._sleeper_lock:
+            self._sleeper_busy[job["sid"]] = busy
+            self._sleeper_jobs.append(job)
+        self._start_sleeper_worker()
+
+    def _start_sleeper_worker(self):
+        try:
+            with self._sleeper_lock:
+                worker = self._sleeper_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(target=self._sleeper_worker_loop,
+                                              name="sleeper-lifecycle", daemon=True)
+                    self._sleeper_worker = worker
+                    worker.start()
+            self._sleeper_wake.set()
+        except Exception as e:
+            log(f"sleeper worker could not be started: {type(e).__name__}: {e}")
+
+    def _sleeper_worker_loop(self):
+        """Run staged jobs until the queue is empty, then wait. Never raises."""
+        while True:
+            self._sleeper_wake.wait()
+            self._sleeper_wake.clear()
+            try:
+                while self._run_sleeper_job():
+                    pass
+            except Exception as e:
+                log(f"sleeper worker error: {type(e).__name__}: {e}")
+
+    def _run_sleeper_job(self):
+        """Pop and run ONE job (worker thread, or directly in tests). False when
+        the queue was empty. Touches no registry/closed state."""
+        with self._sleeper_lock:
+            if not self._sleeper_jobs:
+                return False
+            job = self._sleeper_jobs.pop(0)
+        sid = job["sid"]
+        if job["kind"] == "teardown":
+            try:
+                ctl = job.get("dsh")
+                if ctl is not None:
+                    try:
+                        ctl.kill()
+                    except Exception:
+                        pass
+                    try:
+                        ctl.close()
+                    except Exception:
+                        pass
+                if job.get("tmuxName"):
+                    self._kill_tmux({"tmuxName": job["tmuxName"]})
+                self._reap_ttyd(job.get("ttyd"), job.get("ttydPid"))
+                log(f"paused session {sid}: tmux and terminal torn down")
+            except Exception as e:
+                log(f"paused session {sid}: teardown failed: {type(e).__name__}: {e}")
+            finally:
+                with self._sleeper_lock:
+                    self._sleeper_busy.pop(sid, None)
+            return True
+        error = None
+        try:
+            self._worktree_add(job["sess"], base_ref=job.get("baseRef"))
+        except Exception as e:
+            error = str(e) or type(e).__name__
+        with self._sleeper_lock:
+            self._sleeper_landed.append((sid, job.get("cmdId"), error))
+        return True
+
+    def _sleeper_busy_kind(self, sid):
+        with self._sleeper_lock:
+            busy = self._sleeper_busy.get(sid)
+            return busy.get("kind") if busy else None
+
+    def _sleeper_job_blocks(self, cwd=None, transcript=None, root=False):
+        """Does a paused sleeper's teardown or worktree restore still in flight
+        hold this conversation (its transcript) or, for a non-root resume, this
+        worktree? A resume of it now would run two claudes on one conversation
+        (or launch into a dir the worker is still adding)."""
+        cwd = os.path.normpath(cwd) if isinstance(cwd, str) and cwd else None
+        with self._sleeper_lock:
+            for busy in self._sleeper_busy.values():
+                if transcript and busy.get("claudeSessionId") == transcript:
+                    return True
+                wt = busy.get("worktreePath")
+                if (cwd and not root and not busy.get("root")
+                        and isinstance(wt, str) and os.path.normpath(wt) == cwd):
+                    return True
+        return False
+
+    def _restores_in_flight(self):
+        """Slots reserved by wake resumes whose worktree the worker is re-adding:
+        the slot is the sleeper's, so the hub must not fill it meanwhile."""
+        with self._sleeper_lock:
+            return sum(1 for b in self._sleeper_busy.values()
+                       if b.get("kind") == "restore")
+
+    def _stage_worktree_restore(self, sid, rec, cmd_id):
+        """A wake resume whose kept worktree has vanished (a prune swept it while
+        the sleeper was paused): re-add it on the worker, then finish the resume
+        on the beat. Refused like resume()'s own claim while a prune is removing
+        that very path."""
+        path = rec.get("worktreePath")
+        with self._prune_lock:
+            if path in self._prune_removing:
+                self._refuse_start(f"a prune is removing the worktree at {path}",
+                                   cmd_id=cmd_id)
+                return
+            with self._sleeper_lock:
+                self._sleeper_restoring[path] = sid
+        self._stage_sleeper_job(
+            {"kind": "restore", "sid": sid, "cmdId": cmd_id,
+             "baseRef": rec.get("baseRef"),
+             "sess": {"id": sid, "repo": rec.get("repo"),
+                      "repoPath": rec.get("repoPath"), "worktreePath": path}},
+            {"kind": "restore", "worktreePath": path, "root": False,
+             "claudeSessionId": rec.get("claudeSessionId")})
+        log(f"resume of paused session {sid}: re-adding its worktree off the beat")
+
+    def _apply_sleeper_landed(self):
+        """Beat: finish each wake resume whose worktree the worker re-added. A
+        record no longer paused (the operator killed it, or the hub unpaused it)
+        or gone (deleted) is not resumed; a failed re-add leaves an ordinary
+        killed record that Resume brings back, and says why."""
+        with self._sleeper_lock:
+            if not self._sleeper_landed:
+                return
+            landed, self._sleeper_landed = self._sleeper_landed, []
+        for sid, cmd_id, error in landed:
+            with self._sleeper_lock:
+                busy = self._sleeper_busy.pop(sid, None) or {}
+            path = busy.get("worktreePath")
+            try:
+                rec = next((c for c in self.closed if c.get("id") == sid), None)
+                if rec is None or not rec.get("paused"):
+                    log(f"resume of {sid} dropped: it is no longer a paused sleeper")
+                elif error:
+                    self._unpause_closed(rec)
+                    self._refuse_start(f"could not restore its worktree: {error}",
+                                       cmd_id=cmd_id)
+                else:
+                    self.resume(sid, cmd_id=cmd_id)
+            except Exception as e:
+                log(f"resume of {sid} failed: {type(e).__name__}: {e}")
+            finally:
+                # After resume()'s own claim registered it: never a gap in which
+                # a prune could take the re-added worktree.
+                with self._sleeper_lock:
+                    if path and self._sleeper_restoring.get(path) == sid:
+                        self._sleeper_restoring.pop(path, None)
 
     def _drop_wake_file(self, sid, delivered_at):
         """Remove the wake.json just delivered — unless the session has since
@@ -33399,7 +33642,12 @@ class SessionManager:
         """Worktrees currently backing a registry record, read fresh. list()
         copies the registry in one C-level step, which is what makes this safe to
         call from the prune worker while the beat mutates sessions."""
-        return {s.get("worktreePath") for s in list(self.registry)}
+        live = {s.get("worktreePath") for s in list(self.registry)}
+        # A paused sleeper's worktree being re-added for its wake (XERK-1575) is
+        # not in the registry yet, but must never be swept from under it.
+        with self._sleeper_lock:
+            live.update(self._sleeper_restoring)
+        return live
 
     def _claim_for_removal(self, path):
         """Prune-worker side of the removal handshake: take `path` if no session
@@ -34913,6 +35161,13 @@ class SessionManager:
         # Apply the outbox records the off-beat input worker staged (XERK-867):
         # the worker did the pane delivery, the beat owns the registry mutation.
         self._apply_landed_inputs()
+        # Finish the wake resumes whose worktree the sleeper lifecycle worker
+        # re-added (XERK-1575): the git ran off the beat, the registry write is
+        # the beat's.
+        try:
+            self._apply_sleeper_landed()
+        except Exception as e:
+            log(f"sleeper resume apply failed: {e}")
         # Deliver session-CLI wake-ups that have come due (XERK-1564): a time
         # compare per record, then a STAGE onto the off-beat input worker.
         try:

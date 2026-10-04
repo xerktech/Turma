@@ -13303,6 +13303,20 @@ function sleeperHasQueuedStop(a, sid) {
   return (Array.isArray(a && a.commands) ? a.commands : []).some((c) =>
     c && c.sessionId === sid && SLEEPER_STOP_COMMANDS.has(c.type));
 }
+// An operator message for `sid`: is a `pauseSleeper` for it already handed to the
+// agent (delivered, not yet acked)? One still queued is withdrawn on the spot —
+// the session is being talked to, so it is no longer a quiet sleeper (the agent
+// would refuse it beside the input anyway).
+function sleeperPauseHandedOver(host, sid) {
+  const a = agents[host];
+  let handed = false;
+  for (const c of [...(Array.isArray(a && a.commands) ? a.commands : [])]) {
+    if (!c || c.type !== "pauseSleeper" || c.sessionId !== sid) continue;
+    if ("deliveredAt" in c) handed = true;
+    else dropQueuedCommand(host, c.cmdId, "pauseSleeper");
+  }
+  return handed;
+}
 // The operator stops a session: an automated wake of it still waiting to be handed
 // over is withdrawn, so the agent never relaunches it only to kill it again.
 function withdrawSleeperWake(host, sid) {
@@ -13434,7 +13448,7 @@ function wakePausedSleepers(now = Date.now(), rows) {
 
 // Free ONE slot per still-waiting ticket by pausing a sleeper on a full host that
 // could run it — the farthest wake first, since that slot sits idle longest — with
-// at most one pause in flight per host (the agent kills on its beat loop).
+// at most one automated pause or wake in flight per host.
 // Each pause is ATTRIBUTED to the ticket it answers (`pauseFor`), so a drain every
 // beat never pauses a second sleeper for the same ticket, and a ticket queued
 // while another's pause is still in flight gets its own. A pause in flight whose
@@ -13445,17 +13459,17 @@ function pauseSleepersFor(waiting, now = Date.now(), rows) {
   const waitingKeys = new Set(waiting.map(({ e }) => ticketQueueKey(e.siteKey, e.issueKey)));
   const answered = new Set();
   const orphans = [];
-  // Hosts with a pause still queued or unacked. The agent runs a pause INLINE in
-  // `handle_commands`, on its beat loop, and each kill's teardown can take ~15s —
-  // so a host gets ONE automated kill per beat at most, never a batch of N whose
-  // sum outruns OFFLINE_AFTER_MS (XERK-395). The rest wait for later passes, the
-  // wake's own one-per-host rule.
+  // Hosts with a pause still queued or unacked. The agent tears a paused session
+  // down on its sleeper lifecycle worker, off the beat (XERK-395), but a wake's
+  // relaunch runs on the beat like any spawnTicket — so a host gets ONE automated
+  // lifecycle command at a time, never a batch. The rest wait for later passes,
+  // the wake's own one-per-host rule.
   const pausing = new Set();
   // Only an ONLINE host's pause can free a slot soon; one stranded on a host that
   // went quiet must not starve the tickets waiting elsewhere (reclaim withdraws
   // it if it was never handed over). An automated wake `resume` still queued or
-  // unacked counts too: the agent relaunches inline on the same beat, so a host
-  // gets at most ONE automated lifecycle command (wake or pause) in flight.
+  // unacked counts too, so a host gets at most ONE automated lifecycle command
+  // (wake or pause) in flight.
   for (const [host, a] of Object.entries(agents)) {
     if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     for (const c of a.commands || []) {
@@ -19323,6 +19337,16 @@ const server = http.createServer(async (req, res) => {
             error: `message too long — ${text.length.toLocaleString("en-US")} characters, ` +
               `the limit is ${cap.toLocaleString("en-US")}`,
             limit: cap,
+          });
+        // A sleeper pause already handed to the agent may be killing this session
+        // right now (XERK-1575): the message would arrive after it and be lost
+        // with no word to the operator. Refused so they can resend once the
+        // session reads paused (Resume now) or awake. A pause not handed over
+        // yet is withdrawn instead: someone is talking to the session.
+        if (sleeperPauseHandedOver(key, sessionId))
+          return json(res, 409, {
+            error: "this session is being paused to free its slot for queued work — "
+              + "send again in a moment",
           });
         const cmd = { type: "input", sessionId, text };
         if (attached.length) cmd.uploads = attached;

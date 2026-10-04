@@ -203,12 +203,16 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   so `pauseSleepersFor` (end of `drainTicketQueue`) and `wakePausedSleepers` (start of the drain,
   and every `masterOrchestrationTick`, since the drain returns early on an empty queue) queue
   ordinary commands: `pauseSleeper` and `resume` + `wake:true`. The hub never kills or resumes.
-- **One pause in flight per HOST** (`pausing` in `pauseSleepersFor`): the agent kills inline in
-  `handle_commands` on its beat loop (~15s teardown each), so N pauses in one beat could outrun
-  `OFFLINE_AFTER_MS` (XERK-395). A host with a `pauseSleeper` queued or unacked takes no second;
-  the other waiting tickets get their slots on later passes (the wake's one-per-host rule too).
-  - **A wake `resume` (`wake:true`) queued or unacked holds that same one**: the agent relaunches
-    inline too, so a host never gets a wake and a pause in one beat (`pausing` counts both).
+- **One pause in flight per HOST** (`pausing` in `pauseSleepersFor`). The agent's tmux teardown
+  and a wake's worktree re-add run on its sleeper lifecycle worker, off the beat (XERK-395), but
+  the wake's relaunch runs on the beat like any `spawnTicket`, and one at a time keeps that worker's
+  queue short. A host with a `pauseSleeper` queued or unacked takes no second; the other waiting
+  tickets get their slots on later passes (the wake's one-per-host rule too).
+  - **A wake `resume` (`wake:true`) queued or unacked holds that same one**, so a host never gets
+    a wake and a pause in one beat (`pausing` counts both).
+- **A message to a sleeper whose pause was HANDED OVER is refused** (409, input route,
+  `sleeperPauseHandedOver`): the agent may be killing it, and the text would be lost unseen. An
+  undelivered pause is withdrawn instead and the message goes through.
 - **One pause per still-waiting ticket.** Waiting = entries the drain just held `capacity`
   (`waitingFull`). Each pause is stamped with the ticket it answers (`pauseFor`, its queue key,
   hub-only like `ticketSite` — `INTERNAL_COMMAND_FIELDS`), and a ticket with an unacked pause on

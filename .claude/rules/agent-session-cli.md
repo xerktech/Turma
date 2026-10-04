@@ -103,16 +103,31 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 
 ## Pausing a sleeper for its slot (XERK-1575; hub half `turma-attention.md`)
 
-- **`pauseSleeper` (command) → `pause_sleeper`**: the same `kill` an operator click runs (worktree,
+- **`pauseSleeper` (command) → `pause_sleeper`**: the clean kill an operator click runs (worktree,
   branch, ticket, transcript kept) with `paused={wakeAt, wakeReason, pausedAt}` stamped on the
-  closed record and served as `closedSessions[].paused` (`_paused_wire`). Runs INLINE in
-  `handle_commands`, on the beat loop, like every operator kill (one teardown, up to ~15s).
-- **The hub keeps ONE `pauseSleeper` in flight per host** (`pauseSleepersFor`), so a beat runs at
-  most one automated kill — never N teardowns summing past `OFFLINE_AFTER_MS` (XERK-395).
+  closed record and served as `closedSessions[].paused` (`_paused_wire`).
+- **It is a STAGE/WORK split, never a teardown on the beat** (XERK-395). The beat re-checks, takes
+  the dsh control + ttyd process off the live maps, then `_drop_killed` (registry, closed.json,
+  caches); the **sleeper lifecycle worker** (`_run_sleeper_job`) kills dsh, tmux (~15s worst) and
+  ttyd. Only the beat writes the registry; the worker touches processes and git only.
+  - **`_sleeper_busy[sid]` holds until the teardown ends**: `resume()` of it refuses (reported) and
+    `_resume_at_cwd` refuses its worktree/transcript (`_sleeper_job_blocks`) — relaunching
+    `agent-<id>` then would race the worker's kill.
+- **A wake resume whose worktree vanished re-adds it on the same worker** (`_stage_worktree_restore`
+  → `_apply_sleeper_landed` on the beat finishes `resume()`). Meanwhile its slot is held
+  (`_slots_used` counts `_restores_in_flight`), the path rides `_live_worktree_paths` so no prune
+  takes it, and a duplicate resume is ignored. A failed re-add unpauses + reports; a record killed,
+  unpaused or deleted meanwhile is not resumed (delete keeps the worktree being added).
+- **The relaunch itself (`_launch_tmux`/`_launch_ttyd`) stays on the beat**, the same inline cost
+  as every `spawnTicket` the hub's queue drain sends: it writes the record and `save()`s, which no
+  worker may do. The hub's one-automated-command-per-host cap bounds it to one launch per beat.
 - **The agent re-checks before it kills** (`_sleeper_unpausable`): running, an int `wakeAt` at
   least `PAUSE_SLEEPER_MIN_AHEAD_MS` away, and the LAST beat's signals quiet (`_note_quiet` →
   `self._quiet[sid] = (pane, work)`): `paneBusy is False`, no panePrompt, no question, no live
   `agents`, no `loop`. A failed probe drops the entry — can't tell = refuse. Refusals are logged.
+- **A message that still loses the race is said, never silent**: the hub refuses (409) input to a
+  session whose pause it handed over and withdraws an undelivered one (`sleeperPauseHandedOver`);
+  `send_input` logs a drop for a paused record.
 - **Never while an operator message is on its way in**: one queued, being typed by the input
   worker (`input_inflight`), landed but not recorded, or on the `pendingInputs` outbox
   (`_input_undelivered`). `handle_commands` pre-scans its batch for `SLEEPER_PANE_COMMANDS` on the

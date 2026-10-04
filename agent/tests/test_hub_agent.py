@@ -17600,7 +17600,143 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
     def _manager(self):
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
+        # The lifecycle worker's jobs stay queued until `_settle` runs them, so a
+        # test sees the beat half and the worker half apart.
+        sm._start_sleeper_worker = lambda: None
         return sm
+
+    @staticmethod
+    def _settle(sm):
+        while sm._run_sleeper_job():
+            pass
+
+    def _tmux_kills(self, sess):
+        return [c for c in self.run_calls
+                if "kill-session" in c and "=" + sess["tmuxName"] in c]
+
+    def test_the_pause_tears_the_tmux_down_off_the_beat(self):
+        # XERK-395: the beat drops the record (the slot is free on this beat's
+        # report) and the tmux kill runs on the lifecycle worker.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        proc = mock.Mock(pid=4242)
+        sm.ttyd[sid] = proc
+        self.run_calls.clear()
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self.assertIsNone(sm._find(sid))
+        self.assertEqual(self._tmux_kills(sess), [], "no tmux kill on the beat")
+        proc.terminate.assert_not_called()
+        self.assertNotIn(sid, sm.ttyd)
+        # Mid-teardown, relaunching `agent-<id>` would race the kill: refused, and
+        # said so; a resume-any of its conversation too.
+        sm.resume(sid, cmd_id="r1")
+        sm.resume_transcript(sess["claudeSessionId"], self.tmp, cmd_id="r2")
+        self.assertIsNone(sm._find(sid))
+        self.assertEqual(len(sm.registry), 0)
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["r1", "r2"])
+        self.assertIn("torn down", sm.spawn_failures[0]["error"])
+        self._settle(sm)
+        self.assertEqual(len(self._tmux_kills(sess)), 1)
+        proc.terminate.assert_called_once()
+        self.assertIsNone(sm._sleeper_busy_kind(sid))
+        sm.resume(sid, cmd_id="r3")
+        self.assertEqual(sm._find(sid)["status"], "running")
+
+    def test_the_real_worker_thread_runs_the_teardown(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        sess = self._sleeper(sm)
+        self.run_calls.clear()
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        deadline = time.time() + 10
+        while sm._sleeper_busy_kind(sess["id"]) and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertIsNone(sm._sleeper_busy_kind(sess["id"]))
+        self.assertEqual(len(self._tmux_kills(sess)), 1)
+        self.assertEqual(sm._sleeper_worker.name, "sleeper-lifecycle")
+
+    def test_a_wake_resume_re_adds_a_vanished_worktree_off_the_beat(self):
+        # A prune swept the paused sleeper's worktree: the `git worktree add`
+        # runs on the worker, the slot stays reserved meanwhile, and the beat
+        # finishes the resume once it lands.
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "repos", "r", ".wt-gone")
+        sm.closed.append({"id": "z1", "repo": "r",
+                          "repoPath": os.path.join(self.tmp, "repos"),
+                          "worktreePath": wt, "claudeSessionId": None,
+                          "tmuxName": "agent-z1",
+                          "paused": {"wakeAt": self.NOW, "wakeReason": "ci"}})
+        used = sm._slots_used()
+        self.run_ok_calls.clear()
+        sm.resume("z1", cmd_id="w1")
+        self.assertIsNone(sm._find("z1"))
+        self.assertFalse([c for c in self.run_ok_calls if "worktree" in c])
+        self.assertEqual(sm._slots_used(), used + 1, "the sleeper's slot is held")
+        self.assertIn(wt, sm._live_worktree_paths(), "no prune takes it meanwhile")
+        sm.resume("z1", cmd_id="w1b")    # a duplicate: ignored, not refused
+        self.assertEqual(sm.spawn_failures, [])
+
+        def add(sess, base_ref=None):
+            os.makedirs(sess["worktreePath"], exist_ok=True)
+        with mock.patch.object(sm, "_worktree_add", side_effect=add) as wadd:
+            self._settle(sm)
+        wadd.assert_called_once()
+        self.assertIsNone(sm._find("z1"), "the worker never registers it")
+        with mock.patch.object(ha.time, "time", return_value=(self.NOW + 1000) / 1000):
+            sm._apply_sleeper_landed()
+        self.assertEqual(sm._find("z1")["status"], "running")
+        self.assertEqual(sm._slots_used(), used + 1, "now held by the session itself")
+        self.assertNotIn("z1", [c["id"] for c in sm.closed])
+        self.assertEqual(sm._sleeper_restoring, {})
+
+    def test_a_failed_worktree_re_add_leaves_an_ordinary_killed_record(self):
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "repos", "r", ".wt-gone")
+        rec = {"id": "z2", "repo": "r", "repoPath": os.path.join(self.tmp, "repos"),
+               "worktreePath": wt, "paused": {"wakeAt": self.NOW}}
+        sm.closed.append(rec)
+        sm.resume("z2", cmd_id="w2")
+        with mock.patch.object(sm, "_worktree_add",
+                               side_effect=RuntimeError("git worktree add failed: x")):
+            self._settle(sm)
+        sm._apply_sleeper_landed()
+        self.assertIsNone(sm._find("z2"))
+        self.assertNotIn("paused", rec, "never woken again; Resume brings it back")
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["w2"])
+        self.assertIn("could not restore its worktree", sm.spawn_failures[0]["error"])
+        self.assertEqual(sm._slots_used(), 0)
+
+    def test_a_kill_during_the_worktree_re_add_is_not_undone(self):
+        # The operator's Kill unpauses the record while the worker re-adds its
+        # worktree; the landed resume then leaves it killed. A Delete keeps the
+        # worktree the worker is adding rather than racing it.
+        for stop in ("kill", "delete"):
+            with self.subTest(stop):
+                sm = self._manager()
+                wt = os.path.join(self.tmp, "repos", "r", f".wt-{stop}")
+                rec = {"id": "z3", "repo": "r",
+                       "repoPath": os.path.join(self.tmp, "repos"),
+                       "worktreePath": wt, "paused": {"wakeAt": self.NOW}}
+                sm.closed.append(rec)
+                sm.resume("z3", cmd_id="w3")
+                os.makedirs(wt, exist_ok=True)   # the worker's add, half done
+                with mock.patch.object(sm, "_worktree_remove") as rm:
+                    getattr(sm, stop)("z3")
+                rm.assert_not_called()
+                with mock.patch.object(sm, "_worktree_add"):
+                    self._settle(sm)
+                sm._apply_sleeper_landed()
+                self.assertIsNone(sm._find("z3"))
+                self.assertEqual(sm._slots_used(), 0)
+
+    def test_a_dropped_message_to_a_paused_sleeper_is_logged(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sm.pause_sleeper(sess["id"], now_ms=self.NOW)
+        with mock.patch.object(ha, "log") as log:
+            sm.send_input(sess["id"], "hello")
+        self.assertIn("paused as a sleeper", log.call_args[0][0])
 
     def test_a_quiet_sleeper_is_paused_with_its_wake_on_the_closed_record(self):
         sm = self._manager()
@@ -17904,6 +18040,7 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sess = self._sleeper(sm)
         sid = sess["id"]
         sm.pause_sleeper(sid, now_ms=self.NOW)
+        self._settle(sm)
         due = self.NOW + 3600_000
         with mock.patch.object(ha.time, "time", return_value=due / 1000):
             sm.resume(sid)
@@ -17935,6 +18072,7 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sess = self._sleeper(sm)
         sid = sess["id"]
         sm.pause_sleeper(sid, now_ms=self.NOW)
+        self._settle(sm)
         due = self.NOW + 3600_000
         with mock.patch.object(ha, "RESUME_WAKE_PROMPT_ARG", True), \
                 mock.patch.object(ha.time, "time", return_value=due / 1000):
@@ -17966,6 +18104,7 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sess = self._sleeper(sm)
         sid = sess["id"]
         sm.pause_sleeper(sid, now_ms=self.NOW)
+        self._settle(sm)
         with mock.patch.object(ha.time, "time", return_value=(self.NOW + 60_000) / 1000):
             sm.resume(sid)
         back = sm._find(sid)
@@ -18000,6 +18139,7 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
                 return sm._session_payload(rec, refresh=False)
         probe(sess)
         self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self._settle(sm)
         due = self.NOW + 3600_000
         with mock.patch.object(ha.time, "time", return_value=due / 1000):
             sm.resume(sid)
@@ -18017,6 +18157,7 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sess = self._sleeper(sm)
         sid, tid = sess["id"], sess["claudeSessionId"]
         sm.pause_sleeper(sid, now_ms=self.NOW)
+        self._settle(sm)
         sm.resume_transcript(tid, self.tmp, cmd_id="rt1")
         back = sm.registry[-1]
         self.assertNotEqual(back["id"], sid)

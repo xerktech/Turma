@@ -23893,7 +23893,53 @@ test("XERK-1575: each pause answers ONE ticket — a second ticket queued mid-pa
   ticketQueue.length = 0; delete agents.slpTwoA; delete agents.slpTwoB;
 });
 
-test("XERK-1575: one pause in flight per host — the agent kills on its beat loop", async () => {
+test("XERK-1575: one waiting ticket pauses ONE sleeper fleet-wide, even with two full hosts that fit it", async () => {
+  // Two full hosts of ONE org could each run the ticket. While the first pause is
+  // queued or handed over but unacked, a drain must not pause the other host's
+  // sleeper too: that would kill two sessions for one ticket.
+  resetAutoStart(); resetSleepers();
+  const site = "slppr.atlassian.net";
+  const sleepy = { autoStart: false, capacity: FULL, pauseSleepers: { available: true } };
+  await asBeat("slpPrA", site, { ...sleepy, sessions: [sleeperSession("a1", 3 * 60 * 60_000)] });
+  await asBeat("slpPrB", site, { ...sleepy, sessions: [sleeperSession("b1", 60 * 60_000)] });
+  assert.equal((await startTicket(site, "ENG-5")).body.queued, true);
+  const pauses = () => [...sleeperCmds("slpPrA", "pauseSleeper"),
+    ...sleeperCmds("slpPrB", "pauseSleeper")].map((c) => c.sessionId);
+  drainTicketQueue();
+  assert.deepEqual(pauses(), ["a1"], "the farthest sleeper across both hosts");
+  drainTicketQueue();
+  drainTicketQueue();
+  assert.deepEqual(pauses(), ["a1"], "queued: no second pause on the other host");
+  for (const c of agents.slpPrA.commands) c.deliveredAt = Date.now();
+  drainTicketQueue();
+  assert.deepEqual(pauses(), ["a1"], "handed over, unacked: still none");
+  ticketQueue.length = 0; delete agents.slpPrA; delete agents.slpPrB;
+});
+
+test("XERK-1575: a message to a sleeper whose pause was handed over is refused, never lost", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpMsg";
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeperSession("x", 60 * 60_000)] });
+  const send = () => request("POST", `/api/agents/${host}/sessions/x/input`,
+    { body: { text: "are you there?" }, headers: userHeaders });
+  // Handed to the agent, unacked: it may be killing the session right now.
+  agents[host].commands = [{ cmdId: "p-handed", type: "pauseSleeper", sessionId: "x",
+    deliveredAt: Date.now() }];
+  const refused = await send();
+  assert.equal(refused.status, 409);
+  assert.match(refused.body.error, /being paused/);
+  assert.equal(sleeperCmds(host, "input").length, 0);
+  // Not handed over yet: the pause is withdrawn and the message goes through.
+  agents[host].commands = [{ cmdId: "p-queued", type: "pauseSleeper", sessionId: "x" }];
+  const ok = await send();
+  assert.equal(ok.status, 200);
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
+  assert.deepEqual(sleeperCmds(host, "input").map((c) => c.sessionId), ["x"]);
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: one pause in flight per host — never a batch of automated kills", async () => {
   resetAutoStart(); resetSleepers();
   const host = "slpOneHost", site = "slpone.atlassian.net";
   const triaged = (key) => ({ key, summary: "Fix it", statusCategory: "todo",
