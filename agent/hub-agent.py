@@ -18807,7 +18807,6 @@ class SessionManager:
         # relaunch before that reply simply is not pointed at the log.
         self.decisions_path = None
         self._decisions_text = None
-        self._decisions_mtime = None
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -31365,6 +31364,31 @@ class SessionManager:
                 except OSError:
                     pass
 
+    @staticmethod
+    def _decisions_file_intact(path, text):
+        """True only when `path` is a regular file holding exactly `text`'s bytes.
+        Size-checked off an lstat first and opened non-blocking where the OS has
+        it, so a FIFO or symlink a session planted at the name never blocks the
+        beat — it just reads as tampered and is replaced."""
+        want = text.encode("utf-8")
+        try:
+            st = os.lstat(path)
+            if not stat.S_ISREG(st.st_mode) or st.st_size != len(want):
+                return False
+            flags = os.O_RDONLY | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(path, flags)
+            try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    return False
+                with os.fdopen(fd, "rb") as f:
+                    fd = None
+                    return f.read(len(want) + 1) == want
+            finally:
+                if fd is not None:
+                    os.close(fd)
+        except OSError:
+            return False
+
     def _ingest_decisions(self, raw):
         """Render the hub's decisions tail for this host's DECIDED org to
         ~/.turma/decisions-<org>.md. A reply with no usable block (an older hub,
@@ -31388,14 +31412,12 @@ class SessionManager:
             text = render_decisions(org, entries)
             if path == self.decisions_path and text == self._decisions_text:
                 # Unchanged — unless something rewrote or removed the file since
-                # (Bash walks past the Edit deny): one stat, then it is restored.
-                # A planted sibling goes either way, not only on a rewrite.
-                try:
-                    if os.stat(path).st_mtime_ns == self._decisions_mtime:
-                        self._remove_other_decisions(path)
-                        return
-                except OSError:
-                    pass
+                # (Bash walks past the Edit deny). Compared by its BYTES, never its
+                # mtime: a same-uid session can `touch -d` a forged file's mtime
+                # back. A planted sibling goes either way, not only on a rewrite.
+                if self._decisions_file_intact(path, text):
+                    self._remove_other_decisions(path)
+                    return
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             # A fresh mkstemp, never a fixed temp name: sessions can write
             # ~/.turma, and a FIFO planted at a fixed name would block the beat.
@@ -31413,10 +31435,6 @@ class SessionManager:
             self._remove_other_decisions(path)
             self.decisions_path = path
             self._decisions_text = text
-            try:
-                self._decisions_mtime = os.stat(path).st_mtime_ns
-            except OSError:
-                self._decisions_mtime = None
         except Exception as e:
             log(f"decisions file write failed: {type(e).__name__}: {e}")
 

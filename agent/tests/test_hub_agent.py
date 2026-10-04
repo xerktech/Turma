@@ -39804,6 +39804,35 @@ class TestDecisionsFile(ManagerMixin, unittest.TestCase):
         with open(self._path(), encoding="utf-8") as f:
             self.assertIn("Postgres", f.read())
 
+    def test_a_forged_file_with_its_mtime_set_back_is_still_restored(self):
+        # A same-uid session can rewrite the file with Bash and `touch -d` its
+        # mtime back; the restore compares bytes, so the mtime proves nothing.
+        reply = {"org": self.ORG, "entries": self.ENTRIES}
+        self.sm._ingest_decisions(reply)
+        path = self._path()
+        with open(path, "rb") as f:
+            good = f.read()
+        st = os.stat(path)
+        forged = good.replace(b"Postgres", b"MongoDB!")
+        self.assertEqual(len(forged), len(good), "same size: only the bytes differ")
+        with open(path, "wb") as f:
+            f.write(forged)
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        self.assertEqual(os.stat(path).st_mtime_ns, st.st_mtime_ns)
+        self.sm._ingest_decisions(reply)
+        with open(path, "rb") as f:
+            self.assertEqual(f.read(), good, "the next reply restores the hub's text")
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFO")
+    def test_a_fifo_planted_at_the_name_never_blocks_and_is_replaced(self):
+        reply = {"org": self.ORG, "entries": self.ENTRIES}
+        self.sm._ingest_decisions(reply)
+        os.remove(self._path())
+        os.mkfifo(self._path())
+        self.sm._ingest_decisions(reply)
+        with open(self._path(), encoding="utf-8") as f:
+            self.assertIn("Postgres", f.read())
+
     def test_no_usable_block_removes_the_file_narrow(self):
         self.sm._ingest_decisions({"org": self.ORG, "entries": self.ENTRIES})
         for raw in (None, {"org": "", "entries": []}, {"org": self.ORG}, "x"):

@@ -23521,6 +23521,27 @@ test("XERK-1574: the log is a bounded tail — 200 kept, 20 served, 30 on a repl
   delete hub.getDecisions()[S];
 });
 
+test("XERK-1574: an auto-appended decision is capped — question 300, chosen option 200", async () => {
+  const S = "dcD1574.atlassian.net";
+  const longQ = "Q".repeat(400) + "?";
+  await beat1574("dcHostD", S, { sessions: [{ id: "lq", status: "running",
+    session: { question: longQ, questionOptions: ["A"] } }] });
+  const custom = "z".repeat(3000);                  // within the legacy input cap
+  const res = await request("POST", "/api/agents/dcHostD/sessions/lq/answer",
+    { body: { custom }, headers: userHeaders });
+  assert.equal(res.status, 200);
+  const [entry] = hub.getDecisions()[S];
+  assert.equal(entry.question, "Q".repeat(300));
+  assert.equal(entry.answer, "z".repeat(200));
+  const direct = hub.sanitizeDecision({ at: 1, source: "question", question: "q".repeat(5000),
+    answer: "a".repeat(5000), text: "t".repeat(5000) });
+  assert.equal(direct.question.length, 300);
+  assert.equal(direct.answer.length, 200);
+  assert.equal(direct.text.length, 500);
+  delete agents.dcHostD;
+  delete hub.getDecisions()[S];
+});
+
 test("XERK-1574: the decisions store coerces to the typed shape and survives a restart", () => {
   const good = { id: "abc123", at: 5, source: "question", question: " Q? ", answer: "A",
     host: 7, sessionId: "s1", ticket: "X-1", extra: "dropped" };

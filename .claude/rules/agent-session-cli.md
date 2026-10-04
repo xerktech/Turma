@@ -236,9 +236,10 @@ Hub side (the request, the store, the routes, the page): `turma-brief.md`.
   is `briefRender:{available:true}` (an older agent acks `renderBrief` and never answers).
 - **`_ingest_decisions` renders the reply's `decisions:{org, entries}` to
   `~/.turma/decisions-<org>.md`** (`decisions_path_for` flattens the siteKey), on every reply beside
-  `_ingest_peers`. Written only when the text changed OR the file's mtime moved (Bash walks past
-  the Edit deny, so a tampered file is restored next beat); mkstemp + `os.replace`, never a fixed
-  temp name. Every cell flattened and capped, each entry ONE `- ` line (no forged heading). A reply
+  `_ingest_peers`. Written only when the text changed OR the file's BYTES differ (Bash walks past
+  the Edit deny, so a tampered file is restored next reply). Compared by bytes, never mtime — a
+  same-uid session can `touch -d` a forged file's mtime back; a non-regular file (FIFO) reads as
+  tampered without blocking. mkstemp + `os.replace`, never a fixed temp name. Every cell flattened and capped, each entry ONE `- ` line (no forged heading). A reply
   without a usable block REMOVES it — fails narrow like the roster. Never raises.
 - **Guard**: `Read(~/.turma/decisions-*.md)` allowed (the directive points at it),
   `Edit(~/.turma/decisions-*.md)` denied and pinned in `EXPECTED_DENY_RULES`.
