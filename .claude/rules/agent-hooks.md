@@ -269,6 +269,17 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
       `cd /usr/src/app && rm -rf build` — do not widen it.
   - **`_var_values` resolves a value naming an assigned variable once** (`d=$d/x`): left in, each
     recursion level re-inlined it until `_TOO_DEEP` refused an ordinary command.
+  - **A string that BECOMES a script is expanded as commands** (XERK-1539): find `-exec`/xargs
+    argv re-expanded; `flock -c`, `env -S`, `eval --`; and a shell reading its script from
+    stdin/fd (`_reads_stdin_script`) gets what a pipe, `<<<`, `<(…)` or heredoc feeds it.
+    - Only PRINTED text is knowable: `curl … | sh`, `cat f | sh`, a transforming filter
+      (`tr`, `sed`), `$(which sh)`/`$SHELL`, and `read l; $l` stay residuals — don't call
+      pipes closed. The per-pipeline fed-text scan is bounded (`_FED_TEXT_CAP`, dedup) so a
+      huge `echo|sh` chain can't time the hook out (which fails OPEN) — a reader past the cap
+      is a miss, not a hang.
+    - The producer→shell link is lost where `_split_on_operators` severs the pipeline — the
+      `&` in `2>&1`/`|&`, the `;` inside `{ …; }` — a pre-existing splitter limit this relies
+      on; wrapped forms (`echo P | ssh h sh`, `| docker exec -i c sh`) are residuals too.
   - **Variable inlining has a growth budget** (`_MAX_SUBST_GROWTH`, XERK-1556): each `$x` inlines
     the whole value, so size × uses took minutes, and a hook past Claude Code's timeout RUNS the
     command. Spent → DENY (`_TOO_LARGE`), never an early return, never grantable (`decide`
