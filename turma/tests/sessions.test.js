@@ -397,7 +397,8 @@ test("attention: sleeping holds, review sorts oldest-waiting first with the why 
   const { render, els } = loadPage();
   const t = Date.now();
   const wake = new Date(t + 30 * 60 * 1000);
-  const hhmm = String(wake.getHours()).padStart(2, "0") + ":" + String(wake.getMinutes()).padStart(2, "0");
+  const hhmm = String(wake.getHours()).padStart(2, "0") + ":" + String(wake.getMinutes()).padStart(2, "0")
+    + (wake.getDate() !== new Date(t).getDate() ? "\u00a0+1d" : "");
   const att = (state, agoMin, why) => ({ attention: { state, since: t - agoMin * 60 * 1000, ...(why ? { why } : {}) } });
   const { now, host: h } = host([
     // createdAt order would put Newer first; `since` puts Older first.

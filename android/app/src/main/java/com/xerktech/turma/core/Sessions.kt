@@ -126,14 +126,28 @@ fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState =
 /** A session-CLI wake still in the future (XERK-1571) — the hub's `sessionSleeping`. */
 fun sessionSleeping(session: SessionInfo, now: Long): Boolean = (session.session?.wakeAt ?: 0L) > now
 
-/** "14:05" — the local wall-clock time a sleeping session wakes at. */
-fun clockTime(ms: Long): String {
+/**
+ * "14:05" — the local wall-clock time a sleeping session wakes at, "14:05 +2d" when
+ * that is a later day (a wake may be up to 7d out), so it never reads as today. Web
+ * `clockTime`.
+ */
+fun clockTime(ms: Long, now: Long = System.currentTimeMillis()): String {
     val c = java.util.Calendar.getInstance().apply { timeInMillis = ms }
-    return String.format(
+    val time = String.format(
         java.util.Locale.ROOT, "%02d:%02d",
         c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE),
     )
+    val days = Math.round((localMidnight(ms) - localMidnight(now)) / 86_400_000.0)
+    return if (days > 0) "$time\u00a0+${days}d" else time
 }
+
+private fun localMidnight(ms: Long): Long = java.util.Calendar.getInstance().apply {
+    timeInMillis = ms
+    set(java.util.Calendar.HOUR_OF_DAY, 0)
+    set(java.util.Calendar.MINUTE, 0)
+    set(java.util.Calendar.SECOND, 0)
+    set(java.util.Calendar.MILLISECOND, 0)
+}.timeInMillis
 
 /** The chip word for a `needs-you:*` attention state (XERK-1571), else null. */
 fun needsYouChip(state: String): String? = when (state) {

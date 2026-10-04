@@ -235,6 +235,19 @@ test("dashboard liveState: a needs-you session reads its attention, never idle",
 
 // XERK-1571: a session-CLI wake still ahead reads sleeping (holding style), "until
 // HH:MM" in local time; a due wake no longer does.
+// A wake on a later day (up to 7d out) says so, so it never reads as today.
+test("dashboard liveState: a wake on a later day carries +Nd", () => {
+  const { liveState } = loadDashboard();
+  const today = new Date(2026, 9, 4, 10, 0).getTime();
+  const wakeAt = new Date(2026, 9, 6, 14, 5).getTime();
+  const host = { online: true, lastSeen: today };
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt, wakeReason: "check CI" }), host, today).label,
+    "💤 sleeping until 14:05\u00a0+2d · check CI");
+  const tomorrow = new Date(2026, 9, 5, 9, 30).getTime();
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt: tomorrow }), host, today).label,
+    "💤 sleeping until 09:30\u00a0+1d");
+});
+
 test("dashboard liveState: a pending wake reads sleeping until its time", () => {
   const { liveState } = loadDashboard();
   const wakeAt = NOW + 30 * 60 * 1000;

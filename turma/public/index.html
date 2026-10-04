@@ -1121,10 +1121,13 @@ function permissionAsk(sess) {
   if (att?.state === "needs-you:permission" && typeof att.why === "string" && att.why) return att.why;
   return sess?.session?.panePrompt?.prompt || "";
 }
-// "14:05" — the local wall-clock time a sleeping session wakes at.
-function clockTime(ms) {
+// "14:05" — the local wall-clock time a sleeping session wakes at, "14:05 +2d"
+// when that is a later day (a wake may be up to 7d out), so it never reads as today.
+function clockTime(ms, now = Date.now()) {
   const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
-  return p(d.getHours()) + ":" + p(d.getMinutes());
+  const day = (t) => { const x = new Date(t); return new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime(); };
+  const days = Math.round((day(ms) - day(now)) / 864e5);
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + (days > 0 ? "\u00a0+" + days + "d" : "");
 }
 
 // The sessions the HUB says are waiting on the operator (XERK-1571,
@@ -1172,9 +1175,9 @@ function attentionFor(att, now, state) {
 }
 // "💤 sleeping until 14:05 · check CI" — a session-CLI wake and, when the
 // session gave one, what it will check then. Same as sessions.html.
-function sleepLabel(s) {
+function sleepLabel(s, now) {
   const why = typeof s.wakeReason === "string" ? s.wakeReason.trim() : "";
-  return "💤 sleeping until " + clockTime(s.wakeAt) + (why ? " · " + why : "");
+  return "💤 sleeping until " + clockTime(s.wakeAt, now) + (why ? " · " + why : "");
 }
 
 // A background shell that is WAITING (XERK-1570) — a sleep, a CI watch, a poll
@@ -1265,7 +1268,7 @@ function liveState(sess, host, now) {
   // Asleep until a session-CLI wake (XERK-1571). Same rule and wording as
   // sessions.html (and the hub's sessionSleeping).
   if (sleepingUntil(s, now))
-    return { label: sleepLabel(s), cls: "sess-holding", detail: "last write " + ago(age) };
+    return { label: sleepLabel(s, now), cls: "sess-holding", detail: "last write " + ago(age) };
   // Every live row is a wait: holding, or stalled past its ETA / too long silent.
   // Same rule and wording as sessions.html (and the hub's sessionWait).
   const wait = host.online ? backgroundWait(s.agents, now - age, now) : null;

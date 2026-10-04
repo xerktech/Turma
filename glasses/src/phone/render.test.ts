@@ -3,6 +3,7 @@ import { createInitialState, newSessionState, type AppState } from "../app.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "../types.ts";
 import {
   boardBodyHtml,
+  clockTime,
   orgLabel,
   orgOptions,
   phoneHtml,
@@ -154,6 +155,13 @@ describe("phone render", () => {
     expect(idle).toContain("quiet one");
   });
 
+  it("a wake on a later day carries +Nd, so it never reads as today (XERK-1571)", () => {
+    const today = new Date(2026, 9, 4, 10, 0).getTime();
+    expect(clockTime(new Date(2026, 9, 4, 14, 5).getTime(), today)).toBe("14:05");
+    expect(clockTime(new Date(2026, 9, 5, 9, 30).getTime(), today)).toBe("09:30\u00a0+1d");
+    expect(clockTime(new Date(2026, 9, 6, 14, 5).getTime(), today)).toBe("14:05\u00a0+2d");
+  });
+
   it("orders Ready for review oldest-waiting first and labels a sleeper (XERK-1571)", () => {
     const now = Date.now();
     const done = { paneBusy: false, transcriptAgeSec: 900, lastRole: "assistant" };
@@ -182,7 +190,7 @@ describe("phone render", () => {
     expect(review.indexOf("stalled one")).toBeGreaterThan(-1);
     expect(review.indexOf("stalled one")).toBeLessThan(review.indexOf("older wait"));
     expect(review).not.toContain("hub idle one");
-    expect(html.slice(html.indexOf("Active"))).toContain(`sleeping until ${p(d.getHours())}:${p(d.getMinutes())} · check CI`);
+    expect(html.slice(html.indexOf("Active"))).toContain(`sleeping until ${p(d.getHours())}:${p(d.getMinutes())}${d.getDate() !== new Date(now).getDate() ? "\u00a0+1d" : ""} · check CI`);
   });
 
   it("a new task on a merged-PR session is not hidden by that PR (XERK-224)", () => {
