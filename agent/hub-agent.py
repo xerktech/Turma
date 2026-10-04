@@ -65,6 +65,7 @@ import sys
 import tarfile
 import threading
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -11747,6 +11748,21 @@ _JUDGE_FAMILY_VERBS = (
                 "create", "edit")),
      "an argocd change"),
 )
+# Every program a never-list family is keyed on.
+_JUDGE_FAMILY_PROGS = (frozenset(("git", "hub", "gh", "glab", "az"))
+                       | frozenset(_JUDGE_HTTP_HEADS)
+                       | frozenset(p for progs, _v, _l in _JUDGE_FAMILY_VERBS for p in progs))
+# Programs that run whatever program word follows them — fed one from stdin
+# (`printf 'git push' | xargs env`), they run a command nothing can read.
+_JUDGE_RUNNERS = frozenset((
+    "sh", "bash", "zsh", "dash", "ksh", "mksh", "fish", "csh", "tcsh", "ash", "busybox",
+    "eval", "exec", "source", "command", "builtin", "env", "sudo", "doas", "su",
+    "nohup", "timeout", "nice", "ionice", "stdbuf", "time", "chrt", "taskset", "setsid",
+    "unbuffer", "script", "watch", "xargs", "parallel", "find", "cmd", "powershell", "pwsh"))
+_JUDGE_INTERP_RE = re.compile(r"^(?:python[\d.]*|pypy[\d.]*|perl[\d.]*|ruby|node|nodejs|php|"
+                              r"deno|bun|[gmn]?awk|lua|tclsh|rscript|osascript|expect)$")
+# Read whole command lines from stdin; never readable here.
+_JUDGE_ARGV_FEEDERS_ALWAYS = frozenset(("parallel", "sem", "rush"))
 
 
 def _judge_prog(token):
@@ -11843,25 +11859,158 @@ def _judge_gh_reason(prog, rest):
     return None
 
 
+def _judge_fold(text):
+    """`text` as a URL parser would read its host: percent-decoded (to a
+    fixed point, a few rounds), NFKC-folded (full-width letters), the IDNA
+    dot variants mapped to `.`, lower-cased. curl decodes `api%2Egithub%2Ecom`
+    and folds `api。github。com` to api.github.com, so a literal substring
+    match on the raw text alone misses both."""
+    out = text
+    for _ in range(4):
+        nxt = urllib.parse.unquote(out, errors="replace")
+        if nxt == out:
+            break
+        out = nxt
+    return unicodedata.normalize("NFKC", out).translate(_JUDGE_DOT_MAP).lower()
+
+
+# U+3002 IDEOGRAPHIC, U+FF0E FULLWIDTH, U+FF61 HALFWIDTH IDEOGRAPHIC and
+# U+FE52 SMALL full stops: UTS-46 maps every one to `.` in a host name.
+_JUDGE_DOT_MAP = str.maketrans({"。": ".", "．": ".", "｡": ".", "﹒": "."})
+# A token's host part, or `--url=<value>`'s.
+_JUDGE_URL_SCHEME_RE = re.compile(r"^[a-z][a-z0-9+.-]*://", re.IGNORECASE)
+# A host the judge can read: a plain name/IPv4 or a bracketed IPv6 literal,
+# with an optional port. Only consulted for a host carrying `%`, non-ASCII,
+# glob or escape characters — the spellings a URL parser rewrites.
+_JUDGE_PLAIN_HOST_RE = re.compile(r"^(?:[a-z0-9._-]*|\[[0-9a-f:.]+\])(?::\d*)?$", re.IGNORECASE)
+_JUDGE_HOST_REWRITTEN_RE = re.compile(r"[%{}\[\]\\]|[^\x00-\x7f]")
+# curl options whose NEXT token is a value, never a destination — skipped so
+# `-w '%{http_code}'` or `-H X:%` does not read as an obfuscated host.
+_JUDGE_CURL_VALUE_OPTS = frozenset((
+    "-H", "--header", "-d", "--data", "--data-raw", "--data-binary", "--data-urlencode",
+    "--data-ascii", "--json", "-F", "--form", "--form-string", "-o", "--output", "-u",
+    "--user", "-A", "--user-agent", "-e", "--referer", "-b", "--cookie", "-c",
+    "--cookie-jar", "-w", "--write-out", "-X", "--request", "-T", "--upload-file",
+    "-m", "--max-time", "--connect-timeout", "--retry", "-r", "--range", "-E", "--cert",
+    "--key", "--cacert", "--capath", "-D", "--dump-header", "--oauth2-bearer"))
+# curl options that send the request somewhere other than the URL's host
+# (`--connect-to ::<github-ip>` with a Host header from a file).
+_JUDGE_HTTP_REROUTE = {"curl": ("connect-to", "resolve", "doh-url", "dns-servers"),
+                       "curlie": ("connect-to", "resolve", "doh-url", "dns-servers")}
+
+
+def _judge_host_part(token):
+    """The host (and port) a URL-shaped `token` names; `''` when none."""
+    rest = _JUDGE_URL_SCHEME_RE.sub("", token)
+    host = re.split(r"[/?#]", rest, 1)[0]
+    return host.rsplit("@", 1)[-1]
+
+
 def _judge_http_reason(prog, rest):
     """An HTTP client's request stands when it reaches GitHub, or when the
     judge cannot read where it goes: a destination or config from a file or
-    stdin (`curl -K`, `wget -i`, `--url @file`), or no argument that could be
-    a destination at all (a `.curlrc`/`.wgetrc` supplies it)."""
-    if any("github.com" in t.lower() or _JUDGE_OPAQUE_RE.search(t) for t in rest):
+    stdin (`curl -K`, `wget -i`, `--url @file`), a host spelled so that the
+    client rewrites it (percent-encoded, non-ASCII/IDN, a curl glob), a
+    connection rerouted past the URL (`--connect-to`, `--resolve`), headers
+    from a file, or no argument that could be a destination at all (a
+    `.curlrc`/`.wgetrc` supplies it)."""
+    if any("github.com" in _judge_fold(t) or _JUDGE_OPAQUE_RE.search(t) for t in rest):
         return "a request to github.com"
     longs, shorts = _JUDGE_HTTP_FROM_FILE.get(prog, ((), ""))
+    reroute = _JUDGE_HTTP_REROUTE.get(prog, ())
+    skip_next = False
     for i, t in enumerate(rest):
         if (longs or shorts) and _judge_opt_hits(t, longs, shorts):
             return "an HTTP request whose destination comes from a file"
+        if reroute and _judge_opt_hits(t, reroute, ""):
+            return "an HTTP request rerouted to an address the judge cannot read"
         low = t.lower()
         if low.startswith("--url=@") or (low == "--url" and i + 1 < len(rest)
                                           and rest[i + 1].startswith("@")):
             return "an HTTP request whose destination comes from a file"
+        if prog in ("curl", "curlie") and (
+                t.startswith("-H@") or low.startswith("--header=@")
+                or (t in ("-H", "--header") and i + 1 < len(rest)
+                    and rest[i + 1].startswith("@"))):
+            # A `Host:` header from a file points a request at any address.
+            return "an HTTP request whose headers come from a file"
+        if skip_next:
+            skip_next = False
+            continue
+        if prog in ("curl", "curlie") and t in _JUDGE_CURL_VALUE_OPTS:
+            skip_next = True
+            continue
+        if low.startswith("--url="):
+            t = t[len("--url="):]
+        elif t.startswith("-") or re.search(r"\s", t):
+            continue
+        host = _judge_host_part(t)
+        if '"' in host or "'" in host or "=" in host:
+            continue        # a form field or JSON body, not a destination
+        if _JUDGE_HOST_REWRITTEN_RE.search(host) and not _JUDGE_PLAIN_HOST_RE.match(host):
+            return "an HTTP request whose destination the judge cannot read"
     if not any(not t.startswith("-") and (re.search(r"[./:]", t) or "localhost" in t.lower())
                for t in rest):
         return "an HTTP request whose destination the judge cannot read"
     return None
+
+
+def _judge_feeder_reason(prog, rest):
+    """A command whose ARGUMENTS (or whole command line) arrive from stdin or
+    a file stands when what it runs could be a never-list family: guard.py
+    unwraps `printf 'push origin main' | xargs git` to a bare `git`, so the
+    subcommand the family check needs is never on the command line.
+      - `parallel`/`sem`/`rush` always stand: they also read whole COMMAND
+        LINES from stdin (`parallel < cmds`), which nothing here can read.
+      - `xargs`, and `find`/`fd` with an exec action, stand when any word
+        they would run names a family program, a shell, an interpreter or an
+        unreadable value, or when xargs' program word is its replace-string
+        (`xargs -I CMD CMD push`, the program itself from stdin)."""
+    if prog in _JUDGE_ARGV_FEEDERS_ALWAYS:
+        return "a command line read from stdin or a file"
+    run = rest
+    if prog in ("find", "fd", "fdfind"):
+        execs = (("-exec", "-execdir", "-ok", "-okdir") if prog == "find"
+                 else ("-x", "-X", "--exec", "--exec-batch"))
+        at = [i for i, t in enumerate(rest) if t in execs or t.split("=", 1)[0] in execs]
+        if not at:
+            return None
+        run = rest[at[0]:]      # the walk's roots and predicates run nothing
+    elif prog != "xargs":
+        return None
+    words = [w for t in run for w in re.split(r"[\s'\"`;&|()<>]+", t) if w]
+    for w in words:
+        if _JUDGE_OPAQUE_RE.search(w):
+            return "a fed command the judge cannot read"
+        p = _judge_prog(w)
+        if p in _JUDGE_FAMILY_PROGS or p in _JUDGE_RUNNERS or _JUDGE_INTERP_RE.match(p):
+            return f"a {p} command whose arguments come from stdin or a file"
+    if prog == "xargs":
+        replace, i = None, 0
+        while i < len(rest) and rest[i].startswith("-"):
+            opt = rest[i]
+            if opt in ("-I", "-J") and i + 1 < len(rest):
+                replace, i = rest[i + 1], i + 2
+                continue
+            if opt.startswith(("-I", "-J")) and len(opt) > 2:
+                replace = opt[2:]
+            elif opt == "-i" or opt == "--replace":
+                replace = "{}"
+            elif opt.startswith("-i") or opt.startswith("--replace="):
+                replace = opt.split("=", 1)[1] if "=" in opt else opt[2:]
+            elif "=" not in opt and opt in guard_xargs_value_opts() and i + 1 < len(rest):
+                i += 1
+            i += 1
+        if replace and i < len(rest) and replace in rest[i]:
+            return "an xargs command whose program comes from stdin"
+    return None
+
+
+def guard_xargs_value_opts():
+    """guard.py's xargs options that take a separate value (its own list, so
+    both readers agree where xargs' command word starts)."""
+    guard = _guard_module()
+    return getattr(guard, "_XARGS_OPTS_WITH_VALUE", ()) if guard else ()
 
 
 def _judge_family_reason(guard, tokens):
@@ -11871,6 +12020,9 @@ def _judge_family_reason(guard, tokens):
         return "a command whose program the judge cannot read"
     prog = _judge_prog(tokens[0])
     rest = tokens[1:]
+    fed = _judge_feeder_reason(prog, rest)
+    if fed:
+        return fed
     if prog in ("git", "hub"):
         reason = _judge_git_reason(guard, tokens,
                                    _JUDGE_GIT_KNOWN if prog == "git" else _JUDGE_HUB_KNOWN)
@@ -11928,8 +12080,11 @@ def judge_never_reason(command):
     a segment shlex cannot parse, a nesting too deep to read, a guard that
     cannot load or classify: each is a reason, since a model must never be
     asked about a command the guard could not vet."""
+    # The raw text as written AND as a URL parser would read it, so a host
+    # spelled `api%2Egithub%2Ecom` or `api。github。com` still matches.
+    texts = (command, _judge_fold(command))
     for pattern, label in _JUDGE_NEVER:
-        if pattern.search(command):
+        if any(pattern.search(t) for t in texts):
             return label
     guard = _guard_module()
     if guard is None:

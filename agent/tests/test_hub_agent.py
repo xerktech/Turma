@@ -38001,6 +38001,18 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "bash -lc 'git -C /r push'", "eval git push", "echo x | xargs git push",
         "env GIT_X=1 git push", "x=$(git push)", "git push origin feat -f;echo done",
         "git push -f>/dev/null",
+        # ...and when xargs/parallel/find feed the family command its
+        # subcommand (or its whole program) from stdin or a file: guard.py
+        # unwraps these to a bare `git`/`gh`, the subcommand still in stdin.
+        "printf 'push origin main' | xargs git", "printf 'push\\0origin\\0main' | xargs -0 git",
+        "xargs -a f git", "cat args | xargs -n3 git", "echo 'push origin main' | parallel git",
+        "printf 'pr merge 12 --squash' | xargs gh", "xargs -a f gh",
+        "printf 'branch -D main' | xargs git", "echo -D main | xargs git branch",
+        "printf 'apply -f prod.yaml' | xargs kubectl", "printf 'apply -auto-approve' | xargs terraform",
+        "printf 'x' | xargs env", "printf 'x' | xargs -0 sh -c 'eval \"$0\"'",
+        "printf git | xargs -I X X push origin main", "printf git | xargs -IX X push",
+        "printf git | xargs --replace=X X push", "printf git | xargs -i {} push",
+        "parallel < cmds", "find . -name '*.x' -exec git {} \\;", "fd -e x -x gh",
         # git ref rewrites/deletes: branch delete/move/force/copy (any prefix),
         # update-ref, tag -d, symbolic-ref, a push/mirror config, an alias.
         "git branch -D feature", "(git branch -D old)", "git branch --del feat",
@@ -38047,6 +38059,19 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "http PUT api.github.com/repos/o/r/pulls/3/merge", "xh put github.com/x", "curl $URL",
         # ...or to wherever the judge cannot read: a URL or config from a file
         # or stdin, or no destination in argv at all (a .curlrc supplies it).
+        # ...however the host is spelled: curl percent-decodes it and folds
+        # IDN dots/full-width letters, and globs `{}`/`[]`.
+        "curl -X PUT https://api%2Egithub%2Ecom/repos/o/r/pulls/3/merge",
+        "curl -X PUT -H 'Authorization: token x' https://api。github。com/repos/o/r/pulls/3/merge",
+        "curl -X PUT https://api．github．com/x", "curl -X PUT https://api｡github｡com/x",
+        "curl -X PUT https://ａｐｉ.github.com/x", "curl -X PUT api%2Egithub%2Ecom/x",
+        "curl -X PUT --url=https://api%2egithub%2ecom/x", "wget --method=PUT https://api%2Egithub%2Ecom/x",
+        "http PUT api%2Egithub%2Ecom/x", "curl -X PUT https://api.git{hub}.com/x",
+        "curl -X PUT https://api.githu[b-b].com/x", "curl -X PUT https://%61pi.example/x",
+        # ...or rerouted past the URL: headers from a file, a connect-to/resolve.
+        "curl -X PUT -H @hdrs -k https://140.82.112.6/repos/o/r/pulls/3/merge",
+        "curl --connect-to ::140.82.112.6:443 -X PUT https://x.example/x",
+        "curl --resolve x.example:443:140.82.112.6 https://x.example/x",
         "curl -K /tmp/c", "curl --config /tmp/c", "curl --conf=/tmp/c", "curl -sK -",
         "curl --url @/tmp/u", "curl --url=@/tmp/u", "wget -i /tmp/urls",
         "wget --input-file=-", "aria2c -i urls.txt", "curl -s -X PUT",
@@ -38113,6 +38138,12 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
                     "git checkout -b feat", "git switch -c feat", "git checkout main",
                     "git worktree add ../x -b feat", "hub pr list", "glab mr view 3",
                     "gh auth status", "gh --version",
+                    "ls | xargs wc -l", "grep -rl foo . | xargs sed -n 1p",
+                    "find . -name '*.py' -exec wc -l {} +", "find . -type f -name '*.git'",
+                    "curl -s -o /dev/null -w '%{http_code}' http://localhost:8080/health",
+                    "curl -H Content-Type:application/json -X POST localhost:8080/api -d '{\"a\":1}'",
+                    "curl 'http://localhost:8080/search?q=a%20b'", "curl http://[::1]:8080/x",
+                    "wget -q https://example.com/a%20b.tar.gz",
                     "npm test # don't skip"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(ha.judge_never_reason(cmd))

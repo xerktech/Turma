@@ -176,6 +176,19 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
     destination the judge cannot read: from a file or stdin (`curl -K/--config`, `--url @f`,
     `wget -i/-e/--config`, `aria2c -i`) or no argv token that could be a host at all (a
     `.curlrc` supplies it) — `_judge_http_reason`;
+  - any HTTP request whose HOST the client would rewrite: every token is matched after
+    `_judge_fold` (percent-decode, NFKC, the U+3002/FF0E/FF61/FE52 dots → `.`, lower-case), so
+    `api%2Egithub%2Ecom` and `api。github。com` are github.com (the raw-text layer matches the
+    folded text too); a host still carrying `%`, non-ASCII, `\` or a curl glob (`{}`/`[]` other
+    than an IPv6 literal) stands; so does a curl `--connect-to`/`--resolve`/`--doh-url` reroute
+    and `-H @file` (a `Host:` header from a file). curl's value options (`-w`, `-H`, `-d`…) are
+    skipped, so `-w '%{http_code}'` is not a host;
+  - any family command FED its arguments from stdin or a file (`_judge_feeder_reason`): guard.py
+    unwraps `printf 'push origin main' | xargs git` to a bare `git`, the subcommand still in
+    stdin. `parallel`/`sem`/`rush` always stand (they read whole command lines); `xargs` and
+    `find`/`fd` with an exec action stand when a word they run is a family program, a shell,
+    `env`/`sudo`-style runner, an interpreter or a `$VAR`, or xargs' program word is its `-I`
+    replace-string;
   - terraform/tofu apply/destroy/import/state-rm; mutating kubectl/oc (every namespace), helm,
     argocd; AWS/docker deletes, sudo, pipe-to-shell, Turma's/Claude's own state; the guard's
     own destructive/policy categories (`_guard_module`; one that cannot load stands everything).

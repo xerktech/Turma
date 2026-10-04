@@ -425,6 +425,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     kubectl/helm/argocd mutators — matched on head + subcommand AFTER this file's own unwrapping
     (`_expand_both`), and on anything shlex cannot parse. Never a list of flag spellings: each
     review round found one more. Families + tests: `agent-permissions.md`.
+  - **A family stands however its words ARRIVE or are SPELLED**: fed from stdin/a file (`… | xargs
+    git`, `xargs -a f gh`, any `parallel`) — `_expand_both` leaves only a bare `git` there — and an
+    HTTP host a client would rewrite (percent-encoded, IDN dots, full-width, a curl glob) or route
+    past (`--connect-to`, `--resolve`, `-H @file`). Both stand before any model call.
   - **Real-host spike NOT run** (no agent host here): does `PermissionDenied`'s `retry: true`
     re-enter `PreToolUse` on the retried call, with the grant honoured? And what does the TUI show
     for a classifier block? If the retry never reaches guard.py, the grant goes unconsumed, expires
