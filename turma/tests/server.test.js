@@ -3562,6 +3562,26 @@ test("XERK-1283: a missing transcript's 404 says when archive ingest closed, and
   assert.equal(open.body.ingestClosed, undefined, "an open gate says nothing — plain not-here-yet");
 });
 
+test("XERK-1283: ingestClosed.since is exactly when the gate closed, however the clock ticks", async () => {
+  // A clock read twice ("now - (now' - closedAt)") lands `since` before the gate
+  // closed whenever the second read is later — a load flake in the test above
+  // (XERK-1095). Tick the clock on every read so that gap is always there.
+  const archive = require("../archive.js");
+  const realNow = Date.now;
+  let t = realNow();
+  try {
+    Date.now = () => (t += 1);
+    archive.setHydrating(true);
+    const closedAt = -archive.hydratingForMs(0);   // hydratingForMs(now) = now - closedAt
+    const r = await request("GET", "/api/archive/never-arrives", { headers: userHeaders });
+    assert.equal(r.status, 404);
+    assert.equal(r.body.ingestClosed.since, closedAt);
+  } finally {
+    Date.now = realNow;
+    archive.setHydrating(false);
+  }
+});
+
 // ---- the archive's raw layer (XERK-338) -------------------------------------
 //
 // Beside the rendered entries above, agents push a byte-for-byte copy of the
