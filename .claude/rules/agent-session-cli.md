@@ -111,6 +111,10 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   least `PAUSE_SLEEPER_MIN_AHEAD_MS` away, and the LAST beat's signals quiet (`_note_quiet` →
   `self._quiet[sid] = (pane, work)`): `paneBusy is False`, no panePrompt, no question, no live
   `agents`, no `loop`. A failed probe drops the entry — can't tell = refuse. Refusals are logged.
+- **Never while an operator message is on its way in**: one queued, being typed by the input
+  worker (`input_inflight`), landed but not recorded, or on the `pendingInputs` outbox
+  (`_input_undelivered`). `handle_commands` pre-scans its batch for `SLEEPER_PANE_COMMANDS` on the
+  session, so a pause listed BEFORE the input is refused too. Killing would drop the message.
 - **`TURMA_PAUSE_SLEEPERS=0`** refuses every pause and reports `pauseSleepers: {available:false}`.
 - **A paused record is exempt from `CLOSED_PER_REPO`** (up to `PAUSED_KEEP_MAX`, newest kept) and
   from the prune's closed-record sweep (`_poll_prunes`): evicted, it could never be woken; a
@@ -120,6 +124,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   `_deliver_due_wakes` stages `wake_text` through the operator input path only once
   `WAKE_RESUME_SETTLE_MS` has passed AND the last beat read an idle composer — never a timed paste
   into a booting TUI. A wake still ahead (an early operator Resume) is simply asleep again.
+- **A NEW wake.json drops `wakeResumedAt`** (`_ingest_wake_request`): the settle gate belongs to
+  the carried wake only.
 - **`TURMA_RESUME_WAKE_PROMPT=1` rides a DUE wake on the launch instead** (`claude --resume <id> --
   <text>`, `_launch_tmux`'s positional prompt). OFF until a real pane proves `--resume` submits it.
 - The resume's `resumeRelaunch` stamp applies: a doomed `--resume` relaunches fresh, and that fresh

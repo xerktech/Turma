@@ -23804,6 +23804,7 @@ const sleeperCmds = (host, type) => (agents[host].commands || []).filter((c) => 
 const resetSleepers = () => {
   hub.sleeperPauseTried.clear();
   hub.sleeperWakeTried.clear();
+  hub.sleeperResumeHold.clear();
 };
 
 test("XERK-1575: a full host pauses its FARTHEST quiet sleeper, one per waiting ticket", async () => {
@@ -23945,4 +23946,91 @@ test("XERK-1575: the paused block and the capability are coerced at ingest", asy
   hub.normalizePauseSleepers(n);
   assert.equal(n.pauseSleepers, null);
   delete agents.slpWire;
+});
+
+test("XERK-1575: a sleeper someone is talking to is never paused (its message would be lost)", async () => {
+  for (const type of ["input", "answerQuestion", "setModel"]) {
+    resetAutoStart(); resetSleepers();
+    const host = `slpTalk${type}`;
+    const site = `slptalk${type.toLowerCase()}.atlassian.net`;
+    await asBeat(host, site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+      sessions: [sleeperSession("x", 60 * 60_000)] });
+    agents[host].commands = [{ cmdId: `c-${type}`, type, sessionId: "x", text: "hi" }];
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.equal(sleeperCmds(host, "pauseSleeper").length, 0, type);
+    // Delivered (acked off the queue): the sleeper is pausable again.
+    agents[host].commands = [];
+    drainTicketQueue();
+    assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["x"], type);
+    ticketQueue.length = 0; delete agents[host];
+  }
+});
+
+test("XERK-1575: a pause stranded on an offline host neither starves the need nor outlives it", async () => {
+  resetAutoStart(); resetSleepers();
+  const site = "slpstrand.atlassian.net";
+  await asBeat("slpGone", site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true } });
+  agents.slpGone.lastSeen = Date.now() - 10 * 60_000;
+  agents.slpGone.commands = [{ cmdId: "stale-pause", type: "pauseSleeper", sessionId: "old" },
+    { cmdId: "handed-pause", type: "pauseSleeper", sessionId: "old2", deliveredAt: Date.now() }];
+  await asBeat("slpLive", site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeperSession("x", 60 * 60_000)] });
+  await startTicket(site, "ENG-5");
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds("slpLive", "pauseSleeper").map((c) => c.sessionId), ["x"],
+    "the offline host's pauses do not count against the waiting ticket");
+  hub.reclaimStrandedTicketSpawns();
+  assert.deepEqual(sleeperCmds("slpGone", "pauseSleeper").map((c) => c.cmdId), ["handed-pause"],
+    "the never-delivered pause is withdrawn; a handed-over one is left");
+  ticketQueue.length = 0; delete agents.slpGone; delete agents.slpLive;
+});
+
+test("XERK-1575: an operator who resumes a paused sleeper early is not undone by the next drain", async () => {
+  resetAutoStart(); resetSleepers();
+  const host = "slpEarly";
+  const site = "slpearly.atlassian.net";
+  const wakeAt = Date.now() + 2 * 3600_000;
+  await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 },
+    pauseSleepers: { available: true },
+    closedSessions: [{ id: "x", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt, wakeReason: "check x", at: Date.now() - 60_000 } }] });
+  const r = await request("POST", `/api/agents/${host}/sessions/x/resume`, { headers: userHeaders });
+  assert.equal(r.status, 200);
+  // Back up and asleep on its carried wake, the host full, a ticket waiting.
+  await asBeat(host, site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [{ ...sleeperSession("x", 0), session: { ...sleeperSession("x", 0).session, wakeAt } }] });
+  agents[host].commands = [];
+  await startTicket(site, "ENG-5");
+  drainTicketQueue();
+  assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
+  // A sleeper the operator did not touch is still fair game.
+  hub.sleeperResumeHold.clear();
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds(host, "pauseSleeper").map((c) => c.sessionId), ["x"]);
+  autoStopResumeExempt.delete(host + "\x00x");
+  ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: the brief reads a paused sleeper as asleep, never as finished work", async () => {
+  const S = "slpbrief.atlassian.net";
+  const now = Date.now();
+  const iso = (ms) => new Date(ms).toISOString();
+  const wakeAt = now + 3600_000;
+  await asBeat("slpBrief", S, { autoStart: false, tickets: [],
+    closedSessions: [
+      { id: "napping", repo: "Turma", summary: "napping", closedAt: iso(now - 60_000),
+        paused: { wakeAt, wakeReason: "check CI", at: now - 60_000 } },
+      { id: "done", repo: "Turma", summary: "really ended", closedAt: iso(now - 60_000) },
+    ] });
+  const b = hub.compileBrief(S, now, "scheduled", []);
+  assert.deepEqual(b.finished.map((i) => i.title), ["really ended"]);
+  assert.deepEqual(b.waiting.map((i) => [i.title, i.state, i.eta, i.why]),
+    [["napping", "sleeping", wakeAt, "check CI"]]);
+  assert.equal(b.counts.finished, 1);
+  assert.equal(b.counts.waiting, 1);
+  // Resumed (live again): the live session's own stamp speaks for it, no double row.
+  agents.slpBrief.sessions = [{ id: "napping", status: "running", repo: "Turma" }];
+  assert.equal(hub.compileBrief(S, now, "scheduled", []).counts.waiting, 0);
+  delete agents.slpBrief;
 });

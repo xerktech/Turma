@@ -346,6 +346,12 @@ WAKE_MAX_AHEAD_MS = (7 * 24 + 1) * 3600 * 1000
 # See .claude/rules/agent-session-cli.md.
 PAUSE_SLEEPERS = os.environ.get("TURMA_PAUSE_SLEEPERS", "1").strip() != "0"
 PAUSE_SLEEPER_MIN_AHEAD_MS = 10 * 60 * 1000
+# Commands that reach a session's pane for the operator (or the hub's nudge). A
+# pause arriving beside one of these for the same session is refused: the kill
+# would land before the message is typed. Mirrors the hub's SLEEPER_PANE_COMMANDS.
+SLEEPER_PANE_COMMANDS = frozenset({
+    "input", "answerQuestion", "answerPanePrompt", "interrupt", "setModel",
+    "setMode", "setModelSource", "restart"})
 # A paused record is exempt from CLOSED_PER_REPO (evicted, it could never be
 # woken); this bounds the exemption, newest kept.
 PAUSED_KEEP_MAX = 32
@@ -18361,6 +18367,10 @@ class SessionManager:
         # pop cannot tear it); do NOT grow the worker to write records or save().
         self.input_queue = []                    # [(sid, text, uploads)] to deliver
         self.input_landed = []                   # [(sid, typed, text)] to record on the beat
+        # Sids of the batch the worker is delivering right now (popped off
+        # input_queue, not yet landed): a sleeper pause (XERK-1575) must see a
+        # message in flight as well as one still queued.
+        self.input_inflight = []
         self._input_lock = threading.Lock()
         self._input_wake = threading.Event()
         self._input_worker = None
@@ -25304,12 +25314,25 @@ class SessionManager:
                 return
             batch = self.input_queue[:INPUT_DELIVER_BATCH]
             del self.input_queue[:INPUT_DELIVER_BATCH]
-        for sid, text, uploads in batch:
-            try:
-                self.send_input(sid, text, uploads=uploads, defer_record=True)
-            except Exception as e:
-                log(f"input delivery failed for session {sid}: "
-                    f"{type(e).__name__}: {e}")
+            self.input_inflight = [sid for sid, _t, _u in batch]
+        try:
+            for sid, text, uploads in batch:
+                try:
+                    self.send_input(sid, text, uploads=uploads, defer_record=True)
+                except Exception as e:
+                    log(f"input delivery failed for session {sid}: "
+                        f"{type(e).__name__}: {e}")
+        finally:
+            with self._input_lock:
+                self.input_inflight = []
+
+    def _input_undelivered(self, sid):
+        """Is an operator message for `sid` staged but not yet recorded: still
+        queued, being typed by the worker, or landed awaiting the beat?"""
+        with self._input_lock:
+            return (any(q[0] == sid for q in self.input_queue)
+                    or sid in self.input_inflight
+                    or any(item[0] == sid for item in self.input_landed))
 
     def _apply_landed_inputs(self):
         """Apply the outbox records the input worker staged (XERK-867). Runs on the
@@ -26494,6 +26517,9 @@ class SessionManager:
                 and (at, reason) != (sess.get("wakeAt"), sess.get("wakeReason"))):
             sess["wakeAt"] = at
             sess["wakeReason"] = reason
+            # A NEW wake replaces one carried across a sleeper resume (XERK-1575):
+            # the resume-only settle gate belongs to the carried wake, not this.
+            sess.pop("wakeResumedAt", None)
             self.save()
         if sess.get("wakeAt") is not None:
             signals["wakeAt"] = sess.get("wakeAt")
@@ -26572,9 +26598,13 @@ class SessionManager:
             return "its pane is busy or shows a question or dialog"
         if not quiet[1]:
             return "it has live background work"
+        # A message on its way in, or typed but not yet seen in the transcript:
+        # the kill would lose it (XERK-47's outbox dies with the session).
+        if sess.get("pendingInputs") or self._input_undelivered(sess.get("id")):
+            return "an operator message to it is not delivered yet"
         return None
 
-    def pause_sleeper(self, sid, now_ms=None):
+    def pause_sleeper(self, sid, now_ms=None, operator_pending=False):
         """Free a SLEEPING session's slot (XERK-1575): kill it through the clean,
         resumable kill path (worktree, branch, ticket and transcript kept) with
         its wake kept on the closed record, so the hub can resume it at that
@@ -26582,6 +26612,8 @@ class SessionManager:
         now_ms = int(time.time() * 1000) if now_ms is None else now_ms
         sess = self._find(sid)
         why = self._sleeper_unpausable(sess, now_ms)
+        if not why and operator_pending:
+            why = "an operator command for it arrived with the pause"
         if why:
             log(f"pause refused for session {sid}: {why}")
             return False
@@ -33511,6 +33543,13 @@ class SessionManager:
         """Execute each not-yet-acked command exactly once. Returns True if any
         ran (the caller then fires an immediate extra heartbeat)."""
         did = False
+        # Sessions an operator command in THIS batch talks to (XERK-1575): a
+        # `pauseSleeper` ahead of it in the list must not kill the session the
+        # message is for, whichever order the hub queued the two in.
+        pane_sids = {c.get("sessionId") for c in commands or []
+                     if isinstance(c, dict) and c.get("cmdId")
+                     and c.get("cmdId") not in self.acked
+                     and c.get("type") in SLEEPER_PANE_COMMANDS}
         for cmd in commands or []:
             if not isinstance(cmd, dict):
                 continue
@@ -33543,7 +33582,9 @@ class SessionManager:
                 elif ctype == "pauseSleeper":
                     # The hub frees a slot for queued work (XERK-1575): the same
                     # clean kill, refused unless still a quiet sleeper.
-                    self.pause_sleeper(cmd.get("sessionId"))
+                    self.pause_sleeper(
+                        cmd.get("sessionId"),
+                        operator_pending=cmd.get("sessionId") in pane_sids)
                 elif ctype == "start":
                     self.start(cmd.get("sessionId"))
                 elif ctype == "restart":

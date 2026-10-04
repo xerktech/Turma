@@ -204,8 +204,11 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   and every `masterOrchestrationTick`, since the drain returns early on an empty queue) queue
   ordinary commands: `pauseSleeper` and `resume` + `wake:true`. Never a kill/resume on the beat.
 - **One pause per still-waiting ticket.** Waiting = entries the drain just held `capacity`
-  (`waitingFull`). Unacked `pauseSleeper` commands fleet-wide count against that need, so a drain
-  every beat never pauses a second sleeper for the same ticket.
+  (`waitingFull`). Unacked `pauseSleeper` commands on ONLINE hosts count against that need, so a
+  drain every beat never pauses a second sleeper for the same ticket.
+- **A pause never handed to a host that went offline is withdrawn** (`reclaimStrandedTicketSpawns`,
+  no `deliveredAt`): the demand it answered may be gone when the host returns, and the agent
+  re-checks only the sleeper, never the queue. A delivered one is left (it has likely run).
 - **Only where the ticket could run**: a FULL (`!hostHasFreeSlot`), online host reporting
   `pauseSleepers.available` that `findTicketHost(..., {onlyHost})` accepts — every triage/pin/
   runtime/OS/subscription-pause rule applies, so a pause never frees a slot the ticket can't use.
@@ -214,6 +217,12 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   `SLEEPER_PAUSE_MIN_AHEAD_MS` (10 min) away, no question/panePrompt/loop, `paneBusy === false`,
   `agents` an EMPTY array (absent = can't tell = no). Farthest `wakeAt` first. The agent re-checks
   against its own beat (`agent-session-cli.md`) — the hub's view is a beat old.
+- **Never a sleeper someone is talking to**: a queued `SLEEPER_PANE_COMMANDS` command for it
+  (`input`, `answerQuestion`, `setModel`, ...) skips it. The kill would land before the text is
+  typed, and the composer already showed the message as sent. The agent checks its own queue too.
+- **An operator Resume on a paused row holds off re-pausing until that wake**
+  (`sleeperResumeHold`, set by the resume route): the carried wake makes it a sleeper again, and
+  the next drain would otherwise pause it while the operator reads it.
 - **A refused or unacted command is not re-sent for `SLEEPER_RETRY_MS`** (`sleeperPauseTried`/
   `sleeperWakeTried`, in-memory, bounded): an agent that disagreed acks and keeps the session.
 - **The capability gates the pause** (`normalizePauseSleepers`, strict boolean, a
@@ -227,6 +236,9 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   a `resume` with `wake:true`, so the drain never hands that slot to a ticket. Starving it would
   turn a pause into a kill. It calls `markResumedTicketAutoStopExempt` like the resume route, or
   `autoStopSweep` re-kills a sleeper whose ticket went Done while it slept.
+- **The brief reads it as asleep, never finished** (`compileBrief`): a closed record carrying a
+  valid `paused` is no Finished row (its merged PRs still count) and is a Waiting row on an online
+  host, `state:"sleeping"`, `eta` its wake, `why` its reason. A live copy of the id wins.
 - **Never alerted.** A paused sleeper is a closed record (no `alerts.sessions` entry); the
   resumed session starts a fresh `sa` with no `reviewAt`/`prevAttn`, so neither review nor stalled
   fires off the resume itself. `startedTicketKeys` reads closed records, so auto-start never

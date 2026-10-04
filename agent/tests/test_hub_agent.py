@@ -17676,6 +17676,62 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         self.assertIsNone(sm._find(sess["id"]))
         self.assertIn("p1", sm.acked)
 
+    def test_an_operator_message_in_the_same_batch_keeps_the_session(self):
+        # Either order: the input staged first (the queue check), or the pause
+        # ahead of it in the list (the batch pre-scan). Killing would drop it.
+        for order in ("input-first", "pause-first"):
+            with self.subTest(order):
+                sm = self._manager()
+                sess = self._sleeper(sm)
+                inp = {"cmdId": "i1", "type": "input", "sessionId": sess["id"],
+                       "text": "are you there?"}
+                pause = {"cmdId": "p1", "type": "pauseSleeper", "sessionId": sess["id"]}
+                cmds = [inp, pause] if order == "input-first" else [pause, inp]
+                with mock.patch.object(ha.time, "time", return_value=self.NOW / 1000):
+                    sm.handle_commands(cmds)
+                self.assertIs(sm._find(sess["id"]), sess)
+                self.assertEqual(sm.closed, [])
+                self.assertEqual(sm.input_queue, [(sess["id"], "are you there?", None)])
+                self.assertEqual({"i1", "p1"} & set(sm.acked), {"i1", "p1"})
+
+    def test_an_undelivered_message_refuses_the_pause(self):
+        cases = {
+            "queued": lambda sm, sid: sm._stage_input(sid, "hi"),
+            "being typed": lambda sm, sid: setattr(sm, "input_inflight", [sid]),
+            "landed, not recorded": lambda sm, sid: sm.input_landed.append((sid, "hi", "hi")),
+            "outbox": lambda sm, sid: sm._find(sid).__setitem__(
+                "pendingInputs", [{"text": "hi", "sentAt": 1}]),
+        }
+        for name, stage in cases.items():
+            with self.subTest(name):
+                sm = self._manager()
+                sess = self._sleeper(sm)
+                stage(sm, sess["id"])
+                self.assertFalse(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+                self.assertIs(sm._find(sess["id"]), sess)
+        # Another session's message does not hold this one.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sm._stage_input("someone-else", "hi")
+        self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+
+    def test_the_worker_clears_its_in_flight_mark(self):
+        sm = self._manager()
+        seen = []
+        sm.send_input = lambda sid, *a, **k: seen.append(list(sm.input_inflight))
+        sm._stage_input("s1", "hi")
+        sm._deliver_staged_inputs()
+        self.assertEqual(seen, [["s1"]])
+        self.assertEqual(sm.input_inflight, [])
+
+    def test_a_new_wake_drops_the_resume_gate_of_the_carried_one(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sess["wakeResumedAt"] = self.NOW
+        sm._ingest_wake_request(sess, {"wakeAt": self.NOW + 7200_000, "wakeReason": "new"})
+        self.assertNotIn("wakeResumedAt", sess)
+        self.assertEqual((sess["wakeAt"], sess["wakeReason"]), (self.NOW + 7200_000, "new"))
+
     def test_a_paused_record_survives_the_closed_history_cap(self):
         sm = self._manager()
         sess = self._sleeper(sm)

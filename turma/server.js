@@ -13217,6 +13217,23 @@ function noteSleeperTried(map, host, sid, now) {
   map.set(host + "\x00" + sid, now);
   while (map.size > SLEEPER_TRIED_MAX) map.delete(map.keys().next().value);
 }
+// "<host>\x00<sid>" -> the wake an OPERATOR resumed a paused sleeper ahead of. The
+// carried wake makes the resumed session a sleeper again, but someone just chose
+// to look at it: it is never re-paused before that wake (the farthest it could
+// have slept anyway). In-memory and bounded like the maps above.
+const sleeperResumeHold = new Map();
+function holdResumedSleeper(host, sid, now) {
+  const a = agents[host];
+  const c = (Array.isArray(a && a.closedSessions) ? a.closedSessions : [])
+    .find((x) => x && x.id === sid);
+  const p = c ? wirePaused(c.paused) : null;
+  if (!p || p.wakeAt <= now) return;
+  noteSleeperTried(sleeperResumeHold, host, sid, p.wakeAt);
+}
+function sleeperResumeHeld(host, sid, now) {
+  const until = sleeperResumeHold.get(host + "\x00" + sid);
+  return until != null && now < until;
+}
 
 function pauseSleepersAvailable(a) {
   return !!(a && objectish(a.pauseSleepers) && a.pauseSleepers.available === true);
@@ -13235,6 +13252,16 @@ function sleeperPausable(s, now) {
   if (live.question || live.panePrompt || live.loop) return false;
   if (live.paneBusy !== false) return false;
   return Array.isArray(live.agents) && live.agents.length === 0;
+}
+
+// Commands that reach a session's pane for the operator (or the hub's nudge). One
+// still queued for a sleeper means someone is talking to it: a pause would kill
+// the session before the text is typed, and the message would be lost.
+const SLEEPER_PANE_COMMANDS = new Set(["input", "answerQuestion", "answerPanePrompt",
+  "interrupt", "setModel", "setMode", "setModelSource", "restart"]);
+function sleeperHasQueuedPaneCommand(a, sid) {
+  return (Array.isArray(a && a.commands) ? a.commands : []).some((c) =>
+    c && c.sessionId === sid && SLEEPER_PANE_COMMANDS.has(c.type));
 }
 
 // A paused sleeper whose wake has come (served on the closed channel).
@@ -13271,7 +13298,11 @@ function wakePausedSleepers(now = Date.now()) {
 function pauseSleepersFor(waiting, now = Date.now(), rows) {
   if (!waiting.length) return;
   let need = waiting.length;
+  // Only an ONLINE host's pause can free a slot soon; one stranded on a host that
+  // went quiet must not starve the tickets waiting elsewhere (reclaim withdraws
+  // it if it was never handed over).
   for (const a of Object.values(agents)) {
+    if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
     need -= (a.commands || []).filter((c) => c && c.type === "pauseSleeper").length;
   }
   for (const { e, repo } of waiting) {
@@ -13281,7 +13312,9 @@ function pauseSleepersFor(waiting, now = Date.now(), rows) {
       if (!pauseSleepersAvailable(a) || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
       if (hostHasFreeSlot(a)) continue;   // a free host is the drain's, not ours
       const sleepers = (a.sessions || []).filter((s) => sleeperPausable(s, now)
-        && !sleeperTriedRecently(sleeperPauseTried, host, s.id, now));
+        && !sleeperTriedRecently(sleeperPauseTried, host, s.id, now)
+        && !sleeperResumeHeld(host, s.id, now)
+        && !sleeperHasQueuedPaneCommand(a, s.id));
       if (!sleepers.length) continue;
       const fit = findTicketHost(e.siteKey, repo, e.issueKey,
         { auto: e.source === "auto", onlyHost: host, rows });
@@ -13359,6 +13392,13 @@ function reclaimStrandedTicketSpawns() {
     if (now - (a.lastSeen || 0) < OFFLINE_AFTER_MS) continue;
     // Iterate a COPY: dropQueuedCommand rewrites a.commands underneath us.
     for (const c of [...(a.commands || [])]) {
+      // A sleeper pause (XERK-1575) never handed over to a host that went quiet:
+      // the demand it answered may be gone by the time the host returns, so it is
+      // withdrawn; the next drain asks a live host if a ticket still waits.
+      if (c && c.type === "pauseSleeper" && !("deliveredAt" in c)) {
+        dropQueuedCommand(host, c.cmdId, "pauseSleeper");
+        continue;
+      }
       if (!c || typeof c !== "object" || c.type !== "spawnTicket") continue;
       // Presence, not truthiness — the same test publicCommands strips on. A
       // stamp the hub has written in any form means "handed over"; the two reads
@@ -14792,6 +14832,9 @@ function compileBrief(siteKey, now, trigger, prevList) {
     for (const s of a.sessions || []) if (s) addPrs(key, s);
     for (const c of a.closedSessions || []) {
       if (!c || !isoIn(c.closedAt)) continue;
+      // A sleeper paused for its slot (XERK-1575) did not END: it is asleep, read
+      // under Waiting below, never a Finished row. Its merged PRs still count.
+      if (wirePaused(c.paused)) { addPrs(key, c); continue; }
       ended.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
         key: ticketKey(c), since: Date.parse(c.closedAt),
         transcriptId: typeof c.transcriptId === "string" ? c.transcriptId : undefined,
@@ -14818,6 +14861,19 @@ function compileBrief(siteKey, now, trigger, prevList) {
       if (attn.state === "needs-you:stalled") stalled.push(item);
       else if (attn.state.startsWith("needs-you:")) needsYou.push(item);
       else if (attn.state === "waiting" || attn.state === "sleeping") waiting.push(item);
+    }
+    // A sleeper paused for its slot (XERK-1575) is a closed record with no
+    // attention stamp, yet it is asleep until its wake, exactly as the Sessions
+    // page reads it — never dropped from Waiting for having given up its slot.
+    const live = new Set((a.sessions || []).map((s) => s && s.id));
+    for (const c of a.closedSessions || []) {
+      const p = c && !live.has(c.id) ? wirePaused(c.paused) : null;
+      if (!p) continue;
+      const since = Date.parse(c.closedAt);
+      waiting.push({ kind: "session", title: title(key, c), host: key, sessionId: c.id,
+        state: "sleeping", why: p.wakeReason || "paused until its wake",
+        since: p.at || (Number.isFinite(since) ? since : undefined), eta: p.wakeAt,
+        key: ticketKey(c) });
     }
   }
   const bySince = (x, y) => (x.since || 0) - (y.since || 0);
@@ -18910,6 +18966,9 @@ const server = http.createServer(async (req, res) => {
         if (parts[5] === "resume" || parts[5] === "start") {
           markResumedTicketAutoStopExempt(key, sessionId);
         }
+        // An operator resuming a paused sleeper early (XERK-1575): never re-pause it
+        // before the wake it was resumed ahead of.
+        if (parts[5] === "resume") holdResumedSleeper(key, sessionId, Date.now());
         const cmdId = queueCommand(key, { type: parts[5], sessionId });
         return json(res, 200, { ok: true, cmdId });
       }
@@ -21060,7 +21119,7 @@ if (process.env.TURMA_TEST) {
     normalizeCloseTicket,
     // XERK-1575: slot policy v2 (pause a sleeper, resume it at its wake).
     normalizePauseSleepers, wirePaused, sleeperPausable, wakePausedSleepers,
-    pauseSleepersFor, sleeperPauseTried, sleeperWakeTried, SLEEPER_PAUSE_MIN_AHEAD_MS,
+    pauseSleepersFor, sleeperPauseTried, sleeperWakeTried, sleeperResumeHold, SLEEPER_PAUSE_MIN_AHEAD_MS,
     autoCloseMergedMessage,
     ingestTrajectoryTails,
     liveSessionForTranscript,
