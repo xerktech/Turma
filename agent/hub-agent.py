@@ -15620,11 +15620,12 @@ def _board_issue_done_status(key):
 
 
 # A Done-category status that closes work WITHOUT finishing it (won't do,
-# duplicate, rejected, obsolete...). Never the target of a plain Done close
-# while the board offers anything else.
+# duplicate, rejected, obsolete, Azure DevOps' built-in Removed...). Never the
+# target of a plain Done close while the board offers anything else. The
+# apostrophe class also takes a typographic one (U+2019, "Won’t Do").
 _NEGATIVE_DONE_STATUS_RE = re.compile(
-    r"\b(won'?t|will\s+not|not\s+(?:a\s+bug|needed|planned|fixed?|done)|"
-    r"duplicate|reject|declin|invalid|obsolete|cancel|abandon)", re.I)
+    r"\b(won['’]?t|will\s+not|not\s+(?:a\s+bug|needed|planned|fixed?|done|doing)|"
+    r"duplicate|reject|declin|invalid|obsolete|cancel|abandon|remov)", re.I)
 # A Done-category status named as plainly finished.
 _PLAIN_DONE_STATUS_RE = re.compile(r"\b(done|closed?|resolved|fixed|complete[d]?)\b", re.I)
 

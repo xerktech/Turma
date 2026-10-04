@@ -17829,6 +17829,12 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
                            ("already-fixed", [{"id": "44", "name": "Duplicate",
                                                "category": "done"}]),
                            ("already-fixed", [{"id": "45", "name": "Cannot Reproduce",
+                                               "category": "done"}]),
+                           # Azure DevOps' built-in Removed state, a typographic
+                           # apostrophe, and a "Not Doing" status.
+                           ("done", [{"id": "46", "name": "Removed", "category": "done"}]),
+                           ("done", [{"id": "47", "name": "Won’t Do", "category": "done"}]),
+                           ("already-fixed", [{"id": "48", "name": "Not Doing",
                                                "category": "done"}])):
             for current in (("In Progress", "indeterminate"), None):
                 with self.subTest(kind=kind, neg=negs[0]["name"], current=current):
