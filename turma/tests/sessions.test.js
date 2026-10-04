@@ -2258,7 +2258,9 @@ test("XERK-1575: a sleeper paused for its slot reads asleep until its wake, neve
   const { now, host: h } = host([]);
   const wakeAt = now + 90 * 60 * 1000;
   const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
-  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`
+    // clockTime marks a wake on a later local day; the CI clock can sit near midnight.
+    + (d.getDate() !== new Date(now).getDate() ? "\u00a0+1d" : "");
   h.closedSessions = [
     closed("33333", "Napping", "2026-07-15T09:00:00Z", { paused: { wakeAt, wakeReason: "check CI", at: now } }),
     closed("44444", "Plain Kill", "2026-07-15T08:00:00Z"),
