@@ -551,6 +551,21 @@ test("bytes: the store is bounded in BYTES too, oldest first, and the file it wr
   assert.equal(ledger._internals.rowCount(), kept);                  // nothing lost to a refused load
 });
 
+test("bytes: one host's max-size rows cannot push another host's rows out", () => {
+  const now = Date.now();
+  // Ordinary rows from three hosts, all older than the flood.
+  for (const h of ["a", "b", "c"]) {
+    ledger.ingest(h, Array.from({ length: 3 }, (_, i) => row(`${h}${i}`, { openedAt: now - 60 * MIN + i })), now);
+  }
+  // One host floods max-size rows, newer than everyone else's.
+  ledger.ingest("evil", Array.from({ length: 30 }, (_, i) => fatRow(`e${i}`, now - 30 * MIN + i)), now);
+  for (const h of ["a", "b", "c"]) assert.equal(ledger._internals.hosts().get(h).size, 3, h);
+  let evilBytes = 0;
+  for (const r of ledger._internals.hosts().get("evil").values()) evilBytes += Buffer.byteLength(JSON.stringify(r)) + 1;
+  assert.ok(evilBytes <= ledger._internals.maxBytes() / 4, `evil holds ${evilBytes} bytes`);
+  assert.ok(ledger._internals.hosts().get("evil").has("e29"));      // its newest stays
+});
+
 test("bytes: the budget is a fraction of the container limit, never above the file budget", () => {
   // A sixty-fourth: 8 MiB at the deployed 512m, sized from the XERK-287 margin.
   assert.equal(ledger.setMemoryLimit(8 << 20), (8 << 20) / 64);
@@ -595,6 +610,29 @@ test("file backend: a save streams in chunks through a temp file, and overlappin
   ledger._internals.load();
   assert.equal(JSON.stringify([...ledger._internals.hosts()].map(([h, m]) => [h, [...m.values()]])),
     want);
+});
+
+test("file backend: a save that fails before its rename leaves the previous file whole", async () => {
+  const now = Date.now();
+  ledger.ingest("h1", [row("keep", { openedAt: now - MIN })], now);
+  await new Promise((r) => ledger.flush(r));
+  const before = fs.readFileSync(ledger.LEDGER_FILE, "utf8");
+  ledger.ingest("h1", Array.from({ length: 10 }, (_, i) => row(`n${i}`, { openedAt: now - i,
+    prompt: "q".repeat(300) })), now);
+  const rename = fs.promises.rename;
+  fs.promises.rename = () => Promise.reject(new Error("crash before rename"));
+  let err;
+  try {
+    err = await new Promise((r) => ledger.flush(r));
+  } finally {
+    fs.promises.rename = rename;
+  }
+  assert.match(String(err && err.message), /crash before rename/);
+  // The ledger was never written in place: the old file is byte-identical and loads.
+  assert.equal(fs.readFileSync(ledger.LEDGER_FILE, "utf8"), before);
+  assert.equal(fs.existsSync(`${ledger.LEDGER_FILE}.tmp`), false);
+  ledger._internals.load();
+  assert.deepEqual([...ledger._internals.hosts().get("h1").keys()], ["keep"]);
 });
 
 test("file backend: an unreadable file starts empty, never throws", () => {

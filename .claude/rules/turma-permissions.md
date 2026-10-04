@@ -27,6 +27,9 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 - Bounds: `EVENTS_PER_BEAT` (200) per beat, `PERMISSION_LEDGER_HOST_MAX_ROWS` per host (a flooding
   host cannot evict the fleet), `PERMISSION_LEDGER_MAX_ROWS` (20000) store-wide, oldest-`openedAt`
   first; `PERMISSION_LEDGER_DAYS` (30) retention.
+- A host also keeps at most a QUARTER of the byte budget, oldest first. The row share alone does not
+  protect the fleet: the binding limit is bytes, and a host's row share of max-size rows fills most of
+  it. Tests: `one host's max-size rows cannot push another host's rows out`.
 - **The hub closes rows the agent lost** (a manager restart forgets its open rows), each with
   `answer`/`via` "unknown" and no `waitedMs`; a real closed copy arriving later replaces it by id.
   Else a lost row reads "open" for the 30-day window.
@@ -49,6 +52,8 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
   - **A save streams**: `writeSnapshot` writes chunks (`SAVE_CHUNK_CHARS`) to `<file>.tmp` and renames
     it over the ledger, so no second whole copy sits on the heap and a crash mid-save keeps the old
     file. One save at a time; saves asked for meanwhile share ONE follow-up save.
+  - A failed rename deletes the `.tmp`; never write the ledger in place. Tests: `a save that fails
+    before its rename leaves the previous file whole`.
 
 ## The suggestedRule table — deterministic, never a judgement
 

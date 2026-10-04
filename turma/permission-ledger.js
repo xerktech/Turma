@@ -38,7 +38,8 @@ function positiveEnv(name, fallback) {
 
 const LEDGER_FILE = process.env.PERMISSION_LEDGER_FILE || "/data/permission-ledger.json";
 const MAX_ROWS = positiveEnv("PERMISSION_LEDGER_MAX_ROWS", 20000);
-// One host may hold at most this share, so a flooding host cannot evict the fleet.
+// One host may hold at most this share of the rows AND of the byte budget (see
+// evict), so a flooding host cannot evict the fleet.
 const HOST_MAX_ROWS = positiveEnv("PERMISSION_LEDGER_HOST_MAX_ROWS", Math.max(1, Math.floor(MAX_ROWS / 4)));
 const DAYS = positiveEnv("PERMISSION_LEDGER_DAYS", 30);
 const DAY_MS = 86400000;
@@ -185,8 +186,18 @@ function evict(now = Date.now()) {
   const dropped = [];
   for (const [host, m] of hosts) {
     for (const [id, row] of m) if (row.openedAt < cutoff) { m.delete(id); dropped.push([host, id]); }
-    if (m.size > HOST_MAX_ROWS) {
-      for (const row of oldestFirst([...m.values()]).slice(0, m.size - HOST_MAX_ROWS)) {
+    // The row share alone is not enough: the binding limit is bytes, and a
+    // host's row share of max-size rows would fill most of it. So a host also
+    // keeps at most a quarter of the byte budget, oldest dropped first.
+    let hostBytes = 0;
+    for (const row of m.values()) hostBytes += bytesOf(row);
+    const hostMaxBytes = Math.floor(maxBytes / 4);
+    if (m.size > HOST_MAX_ROWS || hostBytes > hostMaxBytes) {
+      let overRows = m.size - HOST_MAX_ROWS;
+      for (const row of oldestFirst([...m.values()])) {
+        if (overRows <= 0 && hostBytes <= hostMaxBytes) break;
+        overRows -= 1;
+        hostBytes -= bytesOf(row);
         m.delete(row.id);
         dropped.push([host, row.id]);
       }
@@ -677,7 +688,12 @@ async function writeSnapshot(snapshot) {
     throw e;
   }
   await fh.close();
-  await fs.promises.rename(tmp, LEDGER_FILE);
+  try {
+    await fs.promises.rename(tmp, LEDGER_FILE);
+  } catch (e) {
+    await fs.promises.unlink(tmp).catch(() => {});
+    throw e;
+  }
 }
 
 let saveTimer = null;
