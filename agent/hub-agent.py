@@ -407,6 +407,63 @@ WAKE_REASON_MAX_CHARS = 200
 # session cannot hold its slot asleep — out of review, alerts and auto-merge —
 # longer than the CLI allows.
 WAKE_MAX_AHEAD_MS = (7 * 24 + 1) * 3600 * 1000
+# Slot policy v2 (XERK-1575): when the hub has queued work this host could take
+# and every slot is used, it may PAUSE a sleeping session — kill it through the
+# clean, resumable kill path, keeping its wake on the closed record — and resume
+# it at that wake with the wake text. Only a session whose wake is at least
+# PAUSE_SLEEPER_MIN_AHEAD_MS away. TURMA_PAUSE_SLEEPERS=0 turns it off: the host
+# then reports no `pauseSleepers` capability and refuses the command.
+# See .claude/rules/agent-session-cli.md.
+PAUSE_SLEEPERS = os.environ.get("TURMA_PAUSE_SLEEPERS", "1").strip().lower() not in (
+    "0", "false", "no", "off")
+PAUSE_SLEEPER_MIN_AHEAD_MS = 10 * 60 * 1000
+# Commands that reach a session's pane for the operator (or the hub's nudge). A
+# pause arriving beside one of these for the same session is refused: the kill
+# would land before the message is typed. Mirrors the hub's SLEEPER_PANE_COMMANDS.
+SLEEPER_PANE_COMMANDS = frozenset({
+    "input", "answerQuestion", "answerPanePrompt", "interrupt", "setModel",
+    "setMode", "setModelSource", "restart"})
+# The operator's lifecycle commands for a session. A pause arriving beside one
+# for the same session is refused too: run first, it would move the session to
+# a paused closed record the Kill/Delete then could not find, and the hub would
+# wake it. Mirrors the hub's SLEEPER_STOP_COMMANDS.
+SLEEPER_STOP_COMMANDS = frozenset({"kill", "delete"})
+# A paused record is exempt from CLOSED_PER_REPO (evicted, it could never be
+# woken); this bounds the exemption, newest kept.
+PAUSED_KEEP_MAX = 32
+# Whether a wake resume hands the wake text to `claude --resume <id> -- <text>`.
+# Not verified on a real pane, so OFF: the text is staged through the operator
+# input path once the resumed pane reads an idle composer, at least
+# WAKE_RESUME_SETTLE_MS after the resume launched.
+RESUME_WAKE_PROMPT_ARG = os.environ.get("TURMA_RESUME_WAKE_PROMPT", "0").strip().lower() in (
+    "1", "true", "yes", "on")
+WAKE_RESUME_SETTLE_MS = 15 * 1000
+
+
+def wake_text(reason):
+    """The wake-up input a session-CLI wake delivers (XERK-1564/1575)."""
+    reason = (reason or "").rstrip(". ") or "the wake you asked for"
+    return f"Wake-up: {reason}. Check it and continue."
+
+
+def _paused_wire(paused):
+    """A closed record's `paused` block as served (XERK-1575): {wakeAt,
+    wakeReason, at} or None. Hand-edited junk serves as None."""
+    if not isinstance(paused, dict):
+        return None
+    at = paused.get("wakeAt")
+    if isinstance(at, bool) or not isinstance(at, int) or at <= 0:
+        return None
+    out = {"wakeAt": at}
+    reason = paused.get("wakeReason")
+    if isinstance(reason, str) and reason:
+        out["wakeReason"] = reason[:WAKE_REASON_MAX_CHARS]
+    since = paused.get("pausedAt")
+    if isinstance(since, int) and not isinstance(since, bool) and since > 0:
+        out["at"] = since
+    return out
+
+
 # `close-ticket` (XERK-1569): the resolutions session_cli.py offers, the note's
 # bound (its CLOSE_NOTE_MAX), and how many times one request is tried against the
 # tracker — the first try plus ONE bounded retry, CLOSE_TICKET_RETRY_SEC later.
@@ -1326,13 +1383,42 @@ def _scrub_claude_session_env(env=None):
     return [k for k in _CLAUDE_SESSION_ENV if env.pop(k, None) is not None]
 
 
+# The manager's OWN secrets (XERK-1577): what the env file hands the agent so it
+# can talk to the hub / the local model, which a session must never hold. A tmux
+# server's global env is a copy of whatever started it — the manager, whose env
+# is the whole turma-agent.env — and every pane inherits it, so without this a
+# session could read TURMA_TOKEN and impersonate its host to the hub (forge
+# beats, drain its command queue, fetch /api/agent/token) — the hole XERK-268's
+# per-host tokens close. A NAMED list, never a TURMA_* prefix: the launch
+# deliberately exports TURMA_SESSION_ID / TURMA_QUESTIONS_DIR / TURMA_SESSION_CLI.
+# Board creds (JIRA_*/AZDO_*/GITLAB_TOKEN) are NOT here: sessions file and move
+# tickets with them by design. A runtime that needs the model key (failover,
+# dsh, qwen) gets it back from its own 0600 env file, sourced AFTER the strip.
+# The manager keeps these in os.environ (it reads them at launch time and its
+# restart re-execs with them); only what it hands a pane / tmux server drops them.
+_AGENT_SECRET_ENV = ("TURMA_TOKEN", "TURMA_AGENT_TOKEN", "LOCAL_MODEL_API_KEY")
+
+
+def _session_env(base=None):
+    """A copy of `base` (default: this process's env) fit to start a session or
+    the tmux server sessions inherit from: no Claude session markers, no agent
+    secrets. Never mutates `base`."""
+    env = dict(os.environ if base is None else base)
+    for k in _CLAUDE_SESSION_ENV + _AGENT_SECRET_ENV:
+        env.pop(k, None)
+    return env
+
+
 # Prefixed to every command the agent starts in a tmux pane. tmux exports
 # TMUX/TMUX_PANE into the pane, and tmux prefers $TMUX over TMUX_TMPDIR, so a
 # session that inherited them would still address the agent's server with a
 # bare `tmux`. The Claude session markers are unset here too, not only scrubbed
 # from the manager: a WARM tmux server started by a polluted manager keeps them
 # in its global env across every later manager restart.
-_TMUX_ENV_STRIP = "unset TMUX TMUX_PANE " + " ".join(_CLAUDE_SESSION_ENV) + "; "
+# The agent's own secrets are unset here for the same warm-server reason
+# (XERK-1577): a server cold-started before the fix keeps them in its global env.
+_TMUX_ENV_STRIP = ("unset TMUX TMUX_PANE "
+                   + " ".join(_CLAUDE_SESSION_ENV + _AGENT_SECRET_ENV) + "; ")
 
 # Agent-owned tmux sessions an OLDER agent started on the default server, which
 # a manager-only restart (an in-place update) leaves running there: tmux can't
@@ -1553,11 +1639,23 @@ def load_tmux_config(socket=None):
     `socket` is for tests only (an isolated `-L <name>` so a real-tmux test can
     exercise the cold-boot path without touching the production TMUX_SOCKET).
     Best-effort and non-fatal: a tmux hiccup must never stop the agent booting."""
+    base = ["tmux", "-L", socket or TMUX_SOCKET]
+    # A WARM server (started before XERK-1577, kept alive across manager
+    # restarts by KillMode=process) still holds the agent's secrets in its global
+    # env: the pane unset hides them from $VAR, but `tmux show-environment -g` in
+    # a pane, or a window a session opens itself, would hand them back. Dropped
+    # first, config or not; with no server yet this just fails (and starts none).
+    unset = []
+    for k in _AGENT_SECRET_ENV:
+        unset += ["set-environment", "-g", "-u", k, ";"]
+    run_ok(base + unset[:-1], timeout=10)
     if not os.path.exists(_TMUX_CONF):
         log(f"tmux config not found at {_TMUX_CONF}; using tmux defaults")
         return
-    base = ["tmux", "-L", socket or TMUX_SOCKET]
-    run_ok(base + ["-f", _TMUX_CONF, "start-server"], timeout=10)
+    # The server's global env — what every pane inherits — is a copy of THIS
+    # client's, so a cold start gets the session-safe one (XERK-1577).
+    run_ok(base + ["-f", _TMUX_CONF, "start-server"], timeout=10,
+           env=_session_env())
     rc, err = run_ok(base + ["source-file", _TMUX_CONF], timeout=10)
     if rc == 0:
         log(f"loaded tmux config from {_TMUX_CONF}")
@@ -19681,6 +19779,10 @@ class SessionManager:
         # pop cannot tear it); do NOT grow the worker to write records or save().
         self.input_queue = []                    # [(sid, text, uploads)] to deliver
         self.input_landed = []                   # [(sid, typed, text)] to record on the beat
+        # Sids of the batch the worker is delivering right now (popped off
+        # input_queue, not yet landed): a sleeper pause (XERK-1575) must see a
+        # message in flight as well as one still queued.
+        self.input_inflight = []
         self._input_lock = threading.Lock()
         self._input_wake = threading.Event()
         self._input_worker = None
@@ -20092,6 +20194,40 @@ class SessionManager:
         # sid -> the wakeAt last delivered (XERK-1564), so a wake.json that could
         # not be removed is not re-read into a second delivery every beat.
         self._wake_fired = {}
+        # sid -> (pane_quiet, work_quiet) off the LAST beat's signals (XERK-1575):
+        # pane_quiet = the pane read idle (paneBusy False) with no dialog or
+        # question; work_quiet = additionally no live background agent or loop.
+        # A failed probe drops the entry ("can't tell" = not quiet). In-memory
+        # only; the next beat re-learns it.
+        self._quiet = {}
+        # sid -> time.monotonic() of the last machine message notify_session put
+        # in that session's inbox (XERK-1575). The beat probe can read the pane
+        # idle in the moments before the inbox starts its turn, and an inbox
+        # message is on no outbox, so a pause then would lose it for good.
+        self._inbox_posted = {}
+        # sids whose migration export thread is running (XERK-1575): a pause
+        # then would kill a session mid-move, leaving its paused record to be
+        # woken on this host while the moved copy runs on the target. Written by
+        # the beat (add) and the export thread (discard), under its own lock.
+        self._exporting = set()
+        self._exporting_lock = threading.Lock()
+        # The sleeper lifecycle worker (XERK-1575): the SLOW halves of a hub-sent
+        # pause (the tmux/ttyd teardown) and of a wake resume (re-adding a
+        # vanished worktree) run here, never on the beat (XERK-395). The beat owns
+        # every registry/closed.json write; the worker only runs processes and
+        # git. `_sleeper_jobs` is the worker's queue; `_sleeper_busy` maps sid ->
+        # {kind: "teardown"|"restore", worktreePath, claudeSessionId} from staging
+        # until the job is done (a teardown) or applied on the beat (a restore);
+        # `_sleeper_restoring` holds a restore's worktree path for the prune
+        # handshake; `_sleeper_landed` carries finished restores
+        # [(sid, cmd_id, error)] for the beat.
+        self._sleeper_jobs = []
+        self._sleeper_landed = []
+        self._sleeper_busy = {}
+        self._sleeper_restoring = {}
+        self._sleeper_lock = threading.Lock()
+        self._sleeper_wake = threading.Event()
+        self._sleeper_worker = None
         # The close-ticket reader (XERK-1569): a worker does the tracker HTTP off
         # the beat (XERK-395) and stages each outcome on `_close_ticket_landed`
         # under the lock; the BEAT drains it, stamps `ticket.outcome` on the
@@ -21739,13 +21875,16 @@ class SessionManager:
         broken (`error`), since a broken session keeps a worktree the operator can
         Start back into. This is the count every capacity gate uses, so a crashed
         session no longer reads as free capacity the hub fills with fresh work.
+        A paused sleeper's wake resume waiting on its worktree re-add (XERK-1575)
+        holds one too: that slot is the sleeper's.
 
         `exclude_id` drops one record from the tally — for `start()`, whose target
         is ALREADY an `error` record in this set: it is transitioning to `running`
         (net zero), so it must never be refused for the slot it already holds."""
         return sum(1 for s in self.registry
                    if s.get("status") in SLOT_HOLDING_STATUSES
-                   and not (exclude_id is not None and s.get("id") == exclude_id))
+                   and not (exclude_id is not None and s.get("id") == exclude_id)
+                   ) + self._restores_in_flight()
 
     def _queued_count(self):
         return sum(1 for s in self.registry if s.get("status") == "queued")
@@ -22131,7 +22270,8 @@ class SessionManager:
         _kill_tmux_session(DSH_WEB_TMUX, exact=True)
         rc, err = run_ok(_tmux(
             "new-session", "-d", "-s", DSH_WEB_TMUX,
-            "-c", DSH_HOME, "-x", "200", "-y", "50", _TMUX_ENV_STRIP + cmd))
+            "-c", DSH_HOME, "-x", "200", "-y", "50", _TMUX_ENV_STRIP + cmd),
+            env=_session_env())
         if rc != 0:
             log(f"dsh web launch failed: {err}")
             return False
@@ -22417,7 +22557,7 @@ class SessionManager:
             "new-session", "-d", "-s", sess["tmuxName"],
             "-c", sess["worktreePath"], "-x", "220", "-y", "50",
             _TMUX_ENV_STRIP + cmd,
-        ))
+        ), env=_session_env())
         if rc != 0:
             prefix = f"{what} " if what else ""
             raise RuntimeError(f"{prefix}tmux launch failed: {err}")
@@ -23701,7 +23841,9 @@ class SessionManager:
             "--cols", "220", "--rows", "50",         # the tmux `-x 220 -y 50` geometry
             "--",
         ] + launcher + claude_argv
-        env = dict(os.environ)
+        # No agent secrets in the session (XERK-1577): node-pty hands this whole
+        # dict to claude. Failover's model key comes back via extra_env.
+        env = _session_env()
         env.update({k: str(v) for k, v in extra_env.items()})
         log_path = os.path.join(PTY_HOST_DIR, f"{tmux_name}.log")
         # The detached-spawn / wait-for-bound-ports / reap-on-timeout dance is the
@@ -23913,6 +24055,14 @@ class SessionManager:
         if IS_WINDOWS:
             return
         proc = self.ttyd.pop(sid, None)
+        sess = self._find(sid)
+        self._reap_ttyd(proc, sess.get("ttydPid") if sess else None)
+
+    @staticmethod
+    def _reap_ttyd(proc, pid):
+        """Terminate a session's ttyd: the process we launched and, when it is a
+        different one, the persisted pid. Touches no manager state, so the
+        sleeper lifecycle worker can run it (XERK-1575)."""
         if proc is not None:
             try:
                 proc.terminate()
@@ -23922,8 +24072,6 @@ class SessionManager:
         # prior manager, so it's not in self.ttyd): the persisted pid is that same
         # live process. Without this, stop/delete would leak the orphan and its
         # port. Best-effort — a recycled/dead pid just fails harmlessly.
-        sess = self._find(sid)
-        pid = sess.get("ttydPid") if sess else None
         if pid and (proc is None or proc.pid != pid):
             try:
                 os.kill(int(pid), signal.SIGTERM)
@@ -24033,6 +24181,7 @@ class SessionManager:
         except Exception as e:
             log(f"permission ledger forget failed for {sid}: {e}")
         self._clear_session_requests(sid)
+        self._quiet.pop(sid, None)
 
     def _set_error(self, sess, msg):
         sess["status"] = "error"
@@ -24873,11 +25022,12 @@ class SessionManager:
                 out.append(s)
         return out
 
-    def _remember_closed(self, sess):
+    def _remember_closed(self, sess, paused=None):
         """Record a killed session in the closed history so the hub can offer
         to resume it. Bounded: only the newest CLOSED_PER_REPO per repo are
         kept — older records fall off (their branch/transcript still exist,
-        they just stop being offered)."""
+        they just stop being offered). A PAUSED sleeper (XERK-1575) is exempt,
+        up to PAUSED_KEEP_MAX: evicted, it could never be woken."""
         rec = {k: sess.get(k) for k in (
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
             "rcName", "tmuxName", "createdAt", "label", "summary",
@@ -24908,6 +25058,18 @@ class SessionManager:
             "claudeSessionId",
         )}
         rec["closedAt"] = now_iso()
+        if paused:
+            rec["paused"] = dict(paused)
+            # Its PRs' seen-comment baseline (XERK-1575): a pause is not the end
+            # of the session, so a review comment posted while it sleeps must
+            # still reach it after the wake. Without the baseline the first
+            # delivery pass after the resume treats every PR as first-seen and
+            # folds those comments in silently.
+            base = sess.get("prCommentBase")
+            if isinstance(base, dict):
+                rec["prCommentBase"] = {u: list(k) for u, k in base.items()
+                                        if isinstance(u, str)
+                                        and isinstance(k, list)}
         # Snapshot the two things the live caches are about to forget, so the
         # hub's Ended-sessions view can still show what this session did:
         #
@@ -24931,8 +25093,12 @@ class SessionManager:
         self.closed = [c for c in self.closed if c.get("id") != rec["id"]]
         self.closed.append(rec)
         # Trim per repo, newest first (the list is in close order).
-        keep, per_repo = [], {}
+        keep, per_repo, n_paused = [], {}, 0
         for c in reversed(self.closed):
+            if c.get("paused") and n_paused < PAUSED_KEEP_MAX:
+                n_paused += 1
+                keep.append(c)
+                continue
             n = per_repo.get(c.get("repo"), 0)
             if n < CLOSED_PER_REPO:
                 per_repo[c.get("repo")] = n + 1
@@ -24944,9 +25110,19 @@ class SessionManager:
         from the hub — but KEEP its worktree on disk (any uncommitted work
         survives) and its transcript. Recorded in the closed history so the
         repo's "Resume" picker can re-attach to the same worktree with its
-        conversation. (Contrast delete(), which removes the worktree too.)"""
+        conversation. (Contrast delete(), which removes the worktree too.)
+
+        The operator's Kill of a sleeper the hub already PAUSED (XERK-1575) finds
+        no session, only its closed record: the kill drops the pause, leaving an
+        ordinary killed record the hub never wakes — also when the pause won a
+        race with the kill."""
         sess = self._find(sid)
         if not sess:
+            rec = next((c for c in self.closed if c.get("id") == sid), None)
+            if self._unpause_closed(rec):
+                self._reap_paused_tmux(rec)
+                log(f"kill: {sid} was a paused sleeper; it stays killed")
+                return
             log(f"kill: no such session {sid}")
             return
         # dsh: ask the plugin to dispose the agent cleanly over the socket before
@@ -24955,10 +25131,17 @@ class SessionManager:
         self._teardown_dsh(sid, kill=True)
         self._kill_tmux(sess)
         self._kill_ttyd(sid)
+        self._drop_killed(sess)
+
+    def _drop_killed(self, sess, paused=None):
+        """The registry half of a kill: drop the record, remember it as closed
+        (with `paused` — {wakeAt, wakeReason, pausedAt} — for a sleeper paused for
+        its slot, XERK-1575) and forget its caches. Beat-only."""
+        sid = sess["id"]
         # The worktree is deliberately left in place — killing must never lose
         # uncommitted work. (Root has no worktree; nothing to leave either way.)
         self.registry = [s for s in self.registry if s.get("id") != sid]
-        self._remember_closed(sess)
+        self._remember_closed(sess, paused=paused)
         self._forget_session_caches(sid)
         log(f"killed session {sid} ("
             + ("root, no worktree" if sess.get("root")
@@ -25016,8 +25199,39 @@ class SessionManager:
         if not rec:
             log(f"resume: no closed session {sid}")
             return
+        # A paused sleeper still in the lifecycle worker's hands (XERK-1575): its
+        # worktree is being re-added for this very resume, or its old tmux is
+        # still being torn down — relaunching `agent-<id>` now would race that
+        # kill.
+        busy = self._sleeper_busy_kind(sid)
+        if busy == "restore":
+            log(f"resume: {sid} is already being resumed")
+            return
+        if busy == "teardown":
+            self._refuse_start("its pause is still being torn down; resume it "
+                               "again in a moment", cmd_id=cmd_id)
+            return
         if self._slots_used() >= MAX_SESSIONS:
             log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
+            return
+        # The same refusal as _resume_at_cwd: two claudes on one conversation in
+        # one worktree collide. The Resume picker resumes by transcript (a NEW id)
+        # and leaves this record behind, so a later `resume` of it — the hub's
+        # sleeper wake (XERK-1575) included — must not start a second one. That
+        # conversation is back, so a pause on the record is over too.
+        holder = self._conversation_holder(rec)
+        if holder is not None:
+            self._unpause_closed(rec)
+            self._refuse_start(f"a session is already running in "
+                               f"{holder.get('worktreePath')}", cmd_id=cmd_id)
+            return
+        # A paused sleeper's kept worktree is gone (a prune swept it while it
+        # slept): `git worktree add` can take tens of seconds, so it runs on the
+        # lifecycle worker and the resume finishes on a later beat (XERK-395).
+        wt = rec.get("worktreePath")
+        if (rec.get("paused") and not rec.get("root") and isinstance(wt, str)
+                and wt and not os.path.isdir(wt)):
+            self._stage_worktree_restore(sid, rec, cmd_id)
             return
         sess = {
             "id": sid,
@@ -25083,16 +25297,108 @@ class SessionManager:
                                f"{sess['worktreePath']}", cmd_id=cmd_id)
             return
         self.closed = [c for c in self.closed if c.get("id") != sid]
+        if rec.get("paused"):
+            self._carry_paused_prs(sess, rec)
+        prompt = self._carry_paused_wake(sess, rec.get("paused"))
         try:
             # Root has no worktree to re-add; it resumes in place at REPOS_ROOT.
             # The kept worktree normally still exists, so this is skipped.
             if not sess.get("root") and not os.path.isdir(sess["worktreePath"]):
                 self._worktree_add(sess, base_ref=sess.get("baseRef"))
-            self._launch_tmux(sess, resume=True)
+            self._launch_tmux(sess, resume=True, prompt=prompt)
             self._launch_ttyd(sess)
             log(f"resumed closed session {sid} for {sess['repo']} on :{sess['ttydPort']}")
         except Exception as e:
             self._set_error(sess, e)
+
+    def _conversation_holder(self, rec):
+        """The running session already holding a closed record's conversation, or
+        None: one with its pinned transcript, or — for a non-root record — one in
+        its worktree (root sessions all share REPOS_ROOT on purpose, so only the
+        transcript ties them). The same "one live session per non-root cwd" rule
+        _resume_at_cwd enforces."""
+        tids = {t for t in (rec.get("claudeSessionId"), rec.get("transcriptId"))
+                if isinstance(t, str) and t}
+        wt = rec.get("worktreePath")
+        wt = (os.path.normpath(wt) if not rec.get("root")
+              and isinstance(wt, str) and wt else None)
+        for s in self.registry:
+            if s.get("id") == rec.get("id") or s.get("status") != "running":
+                continue
+            if tids and s.get("claudeSessionId") in tids:
+                return s
+            swt = s.get("worktreePath")
+            if wt and isinstance(swt, str) and os.path.normpath(swt) == wt:
+                return s
+        return None
+
+    def _unpause_closed(self, rec):
+        """Drop a closed record's sleeper pause (XERK-1575), leaving an ordinary
+        killed, resumable session: no longer exempt from the closed-history cap,
+        never woken by the hub. True when there was one."""
+        if not isinstance(rec, dict) or "paused" not in rec:
+            return False
+        rec.pop("paused", None)
+        log(f"unpaused closed session {rec.get('id')}: it is no longer waiting to wake")
+        return True
+
+    def unpause_sleeper(self, sid):
+        """The hub's `unpauseSleeper` (XERK-1575): a paused sleeper that must not
+        be woken — its ticket went Done, or its conversation already runs again —
+        stays an ordinary killed session that Resume brings back."""
+        rec = next((c for c in self.closed if c.get("id") == sid), None)
+        if rec is None:
+            log(f"unpause: no closed session {sid}")
+            return False
+        return self._unpause_closed(rec)
+
+    def _carry_paused_prs(self, sess, rec):
+        """Bring a paused sleeper's PRs back onto its resumed record (XERK-1575):
+        its links (the live map kill() dropped, which the comment poller and the
+        chips read) and their seen-comment baseline. A comment posted while it
+        slept is then a NEW key on the first delivery pass, delivered through
+        its inbox like any other, rather than baselined silently as history."""
+        sid = sess["id"]
+        urls = [u for u in (rec.get("prUrls") or []) if isinstance(u, str)][-10:]
+        if urls:
+            self.session_pr_urls[sid] = list(urls)
+            sess["prUrls"] = list(urls)
+        base = rec.get("prCommentBase")
+        if isinstance(base, dict):
+            sess["prCommentBase"] = {u: list(k) for u, k in base.items()
+                                     if isinstance(u, str) and isinstance(k, list)}
+
+    def _carry_paused_wake(self, sess, paused, now_ms=None):
+        """Bring a paused sleeper's wake back onto its resumed record
+        (XERK-1575). Returns the launch prompt, or None.
+
+        Two designs, because whether `claude --resume <id> -- <text>` submits the
+        text as the first turn is not verified on a real pane: with
+        RESUME_WAKE_PROMPT_ARG a DUE wake rides the launch as that positional
+        prompt; otherwise (the default) the wake goes back on the record as
+        `wakeAt`/`wakeReason` + `wakeResumedAt`, and `_deliver_due_wakes` stages
+        the text through the operator input path once the resumed pane reads an
+        idle composer. A wake still ahead (an operator resumed it early) is just
+        a sleeping session again — the v1 path wakes it.
+
+        Only a claude launch takes the prompt: `_launch_qwen`/`_launch_dsh` drop
+        one on resume, so every other runtime takes the default path, or its
+        wake text would be lost for good."""
+        if not isinstance(paused, dict):
+            return None
+        at = paused.get("wakeAt")
+        if isinstance(at, bool) or not isinstance(at, int) or at <= 0:
+            return None
+        reason = paused.get("wakeReason")
+        reason = reason if isinstance(reason, str) else None
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        if (RESUME_WAKE_PROMPT_ARG and at <= now_ms
+                and (sess.get("agentType") or "claude") == "claude"):
+            return wake_text(reason)
+        sess["wakeAt"] = at
+        sess["wakeReason"] = reason
+        sess["wakeResumedAt"] = now_ms
+        return None
 
     def resume_transcript(self, transcript_id, cwd_hint=None, cmd_id=None):
         """Resume ANY prior Claude session by its transcript id (the "resume any
@@ -25171,7 +25477,22 @@ class SessionManager:
                   "summary": closed.get("summary"),
                   "summaryManual": closed.get("summaryManual")}
                  if closed else None)
-        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
+        back = self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
+        if back is None:
+            return
+        # This conversation runs again, so a closed record of it paused as a
+        # sleeper (XERK-1575) is not waiting to wake any more: unpaused, the hub
+        # never resumes it into a second claude beside this one. Root records
+        # share REPOS_ROOT, so only their transcript ties them.
+        wt = os.path.normpath(back.get("worktreePath") or "")
+        for c in self.closed:
+            if not c.get("paused"):
+                continue
+            cwt = c.get("worktreePath")
+            if (transcript_id in (c.get("claudeSessionId"), c.get("transcriptId"))
+                    or (not c.get("root") and isinstance(cwt, str) and cwt
+                        and os.path.normpath(cwt) == wt)):
+                self._unpause_closed(c)
 
     def _refuse_start(self, reason, *, cmd_id=None, migration_id=None,
                       context="resume"):
@@ -25274,6 +25595,12 @@ class SessionManager:
                and os.path.normpath(s.get("worktreePath") or "") == cwd
                for s in self.registry):
             refuse(f"a session is already running in {cwd}")
+            return None
+        # A paused sleeper's teardown or worktree restore still in flight there,
+        # or on this conversation (XERK-1575).
+        if self._sleeper_job_blocks(cwd=cwd, transcript=transcript_id, root=is_root):
+            refuse(f"a paused session in {cwd} is still being torn down or "
+                   f"restored; try again in a moment")
             return None
         repo_path = REPOS_ROOT if is_root else os.path.join(REPOS_ROOT, repo)
         if not is_root and not os.path.isdir(repo_path):
@@ -25404,13 +25731,34 @@ class SessionManager:
         the move learns why instead of sitting in `exporting` until
         MIGRATE_TIMEOUT_MS. Fire-and-forget: migrations are single-flight per
         session hub-side, so no tracking/join is needed."""
+        # Marked BEFORE the thread starts, so a `pauseSleeper` later in the same
+        # command batch already sees the export (XERK-1575).
+        with self._exporting_lock:
+            self._exporting.add(session_id)
         try:
             threading.Thread(
-                target=self.export_session, args=(session_id, migration_id),
+                target=self._export_session_tracked, args=(session_id, migration_id),
                 name="migration-export", daemon=True).start()
         except Exception as e:
+            self._export_done(session_id)
             self._refuse_start(f"could not start the export worker: {e}",
                                migration_id=migration_id, context="exportSession")
+
+    def _export_session_tracked(self, session_id, migration_id):
+        """export_session, clearing the in-flight export mark however it ends."""
+        try:
+            self.export_session(session_id, migration_id)
+        finally:
+            self._export_done(session_id)
+
+    def _export_done(self, session_id):
+        with self._exporting_lock:
+            self._exporting.discard(session_id)
+
+    def _export_running(self, session_id):
+        """Is a migration export thread running for this session (XERK-1575)?"""
+        with self._exporting_lock:
+            return session_id in self._exporting
 
     def export_session(self, session_id, migration_id):
         """Source half of a migration: snapshot this running session's raw
@@ -26125,9 +26473,16 @@ class SessionManager:
         disappears from the UI and its usage stops being reported. The app owns
         no branch, so any branch the running agent named for its work — and thus
         every committed change on it — survives in the repo untouched; only
-        uncommitted worktree files are lost (the UI warns before confirming)."""
+        uncommitted worktree files are lost (the UI warns before confirming).
+
+        A sleeper the hub already PAUSED (XERK-1575) is a closed record, not a
+        session: the operator's Delete still deletes it, or it would wake."""
         sess = self._find(sid)
         if not sess:
+            rec = next((c for c in self.closed if c.get("id") == sid), None)
+            if isinstance(rec, dict) and "paused" in rec:
+                self._delete_paused_record(rec)
+                return
             log(f"delete: no such session {sid}")
             return
         self._teardown_dsh(sid, kill=True)   # clean dispose before teardown (dsh)
@@ -26154,6 +26509,34 @@ class SessionManager:
         shutil.rmtree(upload_dir_for(sid), ignore_errors=True)
         self._forget_session_caches(sid)
         log(f"deleted session {sid}")
+
+    def _delete_paused_record(self, rec):
+        """delete() for a sleeper the hub paused (XERK-1575): its processes are
+        already gone, so drop the closed record and its uploads, and remove its
+        worktree unless a session in the registry works in it (the Resume picker
+        resumes by transcript, under a new id, into the same worktree)."""
+        sid = rec.get("id")
+        wt = rec.get("worktreePath")
+        wt = (os.path.normpath(wt) if not rec.get("root")
+              and isinstance(wt, str) and wt else None)
+        held = wt is not None and (any(
+            isinstance(s.get("worktreePath"), str)
+            and os.path.normpath(s["worktreePath"]) == wt for s in self.registry)
+            # The lifecycle worker re-adding it for this record's wake: removing
+            # it now would race that `git worktree add`; the landed resume then
+            # finds no record and leaves the worktree to a later prune.
+            or self._sleeper_job_blocks(cwd=wt))
+        if wt is not None and not held and os.path.isdir(wt) \
+                and isinstance(rec.get("repoPath"), str):
+            self._worktree_remove(rec)
+        self.closed = [c for c in self.closed if c.get("id") != sid]
+        shutil.rmtree(upload_dir_for(sid), ignore_errors=True)
+        self._forget_session_caches(sid)
+        # After the worktree decision: the staged kill marks the record busy,
+        # which would otherwise read as a worker holding that worktree.
+        self._reap_paused_tmux(rec)
+        log(f"deleted paused session {sid}"
+            + (" (a running session works in its worktree; kept)" if held else ""))
 
     # --- on-demand input/history (glasses client) --------------------------
 
@@ -26467,6 +26850,12 @@ class SessionManager:
         the same paths at files that are already there."""
         sess = self._find(sid)
         if sess is None:
+            # Said, never silent: the hub refuses a message to a session whose
+            # sleeper pause it already handed over (XERK-1575), so this is a kill
+            # that crossed the message in flight.
+            paused = any(c.get("id") == sid and c.get("paused") for c in self.closed)
+            log(f"input for {sid} dropped: no running session"
+                + (" (it was paused as a sleeper)" if paused else ""))
             return
         if sess.get("status") != "running":
             # A found-but-not-running session has no live pane: surface the drop
@@ -26601,12 +26990,25 @@ class SessionManager:
                 return
             batch = self.input_queue[:INPUT_DELIVER_BATCH]
             del self.input_queue[:INPUT_DELIVER_BATCH]
-        for sid, text, uploads in batch:
-            try:
-                self.send_input(sid, text, uploads=uploads, defer_record=True)
-            except Exception as e:
-                log(f"input delivery failed for session {sid}: "
-                    f"{type(e).__name__}: {e}")
+            self.input_inflight = [sid for sid, _t, _u in batch]
+        try:
+            for sid, text, uploads in batch:
+                try:
+                    self.send_input(sid, text, uploads=uploads, defer_record=True)
+                except Exception as e:
+                    log(f"input delivery failed for session {sid}: "
+                        f"{type(e).__name__}: {e}")
+        finally:
+            with self._input_lock:
+                self.input_inflight = []
+
+    def _input_undelivered(self, sid):
+        """Is an operator message for `sid` staged but not yet recorded: still
+        queued, being typed by the worker, or landed awaiting the beat?"""
+        with self._input_lock:
+            return (any(q[0] == sid for q in self.input_queue)
+                    or sid in self.input_inflight
+                    or any(item[0] == sid for item in self.input_landed))
 
     def _apply_landed_inputs(self):
         """Apply the outbox records the input worker staged (XERK-867). Runs on the
@@ -26847,6 +27249,7 @@ class SessionManager:
             sock_path, pid, claude_sid = found
             if _post_to_inbox(sock_path, pid, claude_sid,
                               f"{INBOX_PREFIX}\n\n{text}"):
+                self._inbox_posted[sid] = time.monotonic()
                 log(f"notified session {sid} over its inbox "
                     f"({len(text)} chars): {text[:80]}")
                 return True
@@ -27779,6 +28182,7 @@ class SessionManager:
         if sess is not None:
             sess.pop("wakeAt", None)
             sess.pop("wakeReason", None)
+            sess.pop("wakeResumedAt", None)
 
     def _ingest_wake_request(self, sess, signals):
         """Persist this beat's wake.json read onto the registry record (so a
@@ -27790,6 +28194,9 @@ class SessionManager:
                 and (at, reason) != (sess.get("wakeAt"), sess.get("wakeReason"))):
             sess["wakeAt"] = at
             sess["wakeReason"] = reason
+            # A NEW wake replaces one carried across a sleeper resume (XERK-1575):
+            # the resume-only settle gate belongs to the carried wake, not this.
+            sess.pop("wakeResumedAt", None)
             self.save()
         if sess.get("wakeAt") is not None:
             signals["wakeAt"] = sess.get("wakeAt")
@@ -27811,16 +28218,321 @@ class SessionManager:
                     or not isinstance(at, int) or now_ms < at):
                 continue
             sid = sess.get("id")
-            reason = (sess.get("wakeReason") or "").rstrip(". ") or "the wake you asked for"
-            self._stage_input(sid, f"Wake-up: {reason}. Check it and continue.")
+            # A session RESUMED from a sleeper pause (XERK-1575) carries its wake
+            # across the relaunch: the text waits until the pane has had time to
+            # come up AND the last beat read an idle composer (no dialog, no
+            # question), never a bare timed paste into a booting TUI.
+            resumed = sess.get("wakeResumedAt")
+            if isinstance(resumed, int) and not isinstance(resumed, bool):
+                quiet = self._quiet.get(sid)
+                if now_ms - resumed < WAKE_RESUME_SETTLE_MS or not (quiet and quiet[0]):
+                    continue
+            self._stage_input(sid, wake_text(sess.get("wakeReason")))
             self._wake_fired[sid] = at
             sess.pop("wakeAt", None)
             sess.pop("wakeReason", None)
+            sess.pop("wakeResumedAt", None)
             self._drop_wake_file(sid, at)
             fired = True
             log(f"session {sid}: wake-up delivered")
         if fired:
             self.save()
+
+    def _note_quiet(self, sid, signals):
+        """Record whether this beat's signals read a QUIET session (XERK-1575):
+        the pane idle with no dialog or question (a resumed sleeper's wake text
+        may be typed), and additionally no live background agent or loop (a
+        sleeper may be paused). A dict write, no I/O."""
+        pane = (signals.get("paneBusy") is False and not signals.get("panePrompt")
+                and not signals.get("question"))
+        work = pane and not signals.get("agents") and not signals.get("loop")
+        self._quiet[sid] = (bool(pane), bool(work))
+
+    # ---- slot policy v2: pause a sleeper, resume it at its wake (XERK-1575) ----
+    #
+    # The HUB decides (it alone sees the ticket queue): when a ticket waits for a
+    # slot this host could take and every slot here is used, it queues a
+    # `pauseSleeper` for this host's farthest sleeper, and a `resume` once that
+    # sleeper's wake is due and a slot is free. Both run on the command path —
+    # the same kill/resume an operator click runs. The agent re-checks the pause
+    # against its OWN signals: the hub's view is a beat old.
+
+    def _sleeper_unpausable(self, sess, now_ms):
+        """Why `sess` may NOT be paused right now, or None when it may."""
+        if not PAUSE_SLEEPERS:
+            return "TURMA_PAUSE_SLEEPERS=0"
+        if sess is None:
+            return "no such session"
+        if sess.get("status") != "running":
+            return "it is not running"
+        # Mid-move: the paused record here would later be woken while the moved
+        # copy runs on the target — two claudes on one conversation and ticket.
+        if self._export_running(sess.get("id")):
+            return "it is being migrated to another host"
+        at = sess.get("wakeAt")
+        if isinstance(at, bool) or not isinstance(at, int):
+            return "it is not sleeping"
+        if at - now_ms < PAUSE_SLEEPER_MIN_AHEAD_MS:
+            return "its wake is less than 10 minutes away"
+        # Resumed from a pause AHEAD of its carried wake: an operator chose to look
+        # at it. The hub holds it too, but only in memory — this record outlives a
+        # hub restart or leader handover. A new wake request or the carried wake
+        # firing clears the mark.
+        if sess.get("wakeResumedAt") is not None:
+            return "it was resumed ahead of its wake"
+        quiet = self._quiet.get(sess.get("id"))
+        if not quiet or not quiet[0]:
+            return "its pane is busy or shows a question or dialog"
+        if not quiet[1]:
+            return "it has live background work"
+        # A message on its way in, or typed but not yet seen in the transcript:
+        # the kill would lose it (XERK-47's outbox dies with the session).
+        if sess.get("pendingInputs") or self._input_undelivered(sess.get("id")):
+            return "an operator message to it is not delivered yet"
+        # A machine message just went to its inbox: the idle read may predate the
+        # turn it starts, so wait out two beats before trusting quiet again.
+        posted = self._inbox_posted.get(sess.get("id"))
+        if posted is not None:
+            if time.monotonic() - posted < 2 * INTERVAL:
+                return "a message was just posted to its inbox"
+            self._inbox_posted.pop(sess.get("id"), None)
+        return None
+
+    def pause_sleeper(self, sid, now_ms=None, operator_pending=False):
+        """Free a SLEEPING session's slot (XERK-1575): kill it through the clean,
+        resumable kill path (worktree, branch, ticket and transcript kept) with
+        its wake kept on the closed record, so the hub can resume it at that
+        wake. Refused — and logged — unless it still reads as a quiet sleeper."""
+        now_ms = int(time.time() * 1000) if now_ms is None else now_ms
+        sess = self._find(sid)
+        why = self._sleeper_unpausable(sess, now_ms)
+        if not why and operator_pending:
+            why = "an operator command for it arrived with the pause"
+        if why:
+            log(f"pause refused for session {sid}: {why}")
+            return False
+        # The clean kill, split (XERK-395): the processes are handed to the
+        # lifecycle worker FIRST (dsh control, ttyd process and pid taken off the
+        # live maps, so the cache forget below cannot close the dsh socket before
+        # its clean kill), then the beat drops the record at once — the slot is
+        # free on this beat's report while the worker tears the tmux down.
+        job = {"kind": "teardown", "sid": sid,
+               "tmuxName": sess.get("tmuxName"),
+               "dsh": self.dsh_controls.pop(sid, None),
+               "ttyd": self.ttyd.pop(sid, None),
+               "ttydPid": sess.get("ttydPid")}
+        self._drop_killed(sess, paused={"wakeAt": sess["wakeAt"],
+                                        "wakeReason": sess.get("wakeReason"),
+                                        "pausedAt": now_ms})
+        self._stage_sleeper_job(job, {
+            "kind": "teardown", "worktreePath": sess.get("worktreePath"),
+            "root": bool(sess.get("root")),
+            "claudeSessionId": sess.get("claudeSessionId")})
+        log(f"paused sleeping session {sid} to free its slot (wakes at "
+            f"{sess['wakeAt']}); its tmux is torn down off the beat")
+        return True
+
+    # ---- the sleeper lifecycle worker (XERK-1575, XERK-395) -------------------
+    #
+    # Stage (beat) -> work (worker: processes, git) -> apply (beat: registry).
+    # A teardown needs no apply: the beat already dropped the record; the worker
+    # clears the busy mark when the processes are gone. A restore lands
+    # (sid, cmd_id, error) for `_apply_sleeper_landed`, which finishes the resume.
+
+    def _stage_sleeper_job(self, job, busy):
+        """Queue `job` for the lifecycle worker, marking its sid busy, and wake
+        (or start) the worker. MUST NOT raise onto the beat: a failed
+        Thread.start() (pids_limit, XERK-402) leaves the job queued, and every
+        beat's `_apply_sleeper_landed` re-arms the worker while jobs wait."""
+        with self._sleeper_lock:
+            self._sleeper_busy[job["sid"]] = busy
+            self._sleeper_jobs.append(job)
+        self._start_sleeper_worker()
+
+    def _start_sleeper_worker(self):
+        try:
+            with self._sleeper_lock:
+                worker = self._sleeper_worker
+                if worker is None or not worker.is_alive():
+                    worker = threading.Thread(target=self._sleeper_worker_loop,
+                                              name="sleeper-lifecycle", daemon=True)
+                    self._sleeper_worker = worker
+                    worker.start()
+            self._sleeper_wake.set()
+        except Exception as e:
+            log(f"sleeper worker could not be started: {type(e).__name__}: {e}")
+
+    def _sleeper_worker_loop(self):
+        """Run staged jobs until the queue is empty, then wait. Never raises."""
+        while True:
+            self._sleeper_wake.wait()
+            self._sleeper_wake.clear()
+            try:
+                while self._run_sleeper_job():
+                    pass
+            except Exception as e:
+                log(f"sleeper worker error: {type(e).__name__}: {e}")
+
+    def _run_sleeper_job(self):
+        """Pop and run ONE job (worker thread, or directly in tests). False when
+        the queue was empty. Touches no registry/closed state."""
+        with self._sleeper_lock:
+            if not self._sleeper_jobs:
+                return False
+            job = self._sleeper_jobs.pop(0)
+        sid = job["sid"]
+        if job["kind"] == "teardown":
+            try:
+                ctl = job.get("dsh")
+                if ctl is not None:
+                    try:
+                        ctl.kill()
+                    except Exception:
+                        pass
+                    try:
+                        ctl.close()
+                    except Exception:
+                        pass
+                if job.get("tmuxName"):
+                    self._kill_tmux({"tmuxName": job["tmuxName"]})
+                # Windows: the pty-host _kill_tmux just tore down IS the
+                # terminal and the persisted pid is that same process, so
+                # signalling it now could hit a reused pid (_kill_ttyd's rule).
+                if not IS_WINDOWS:
+                    self._reap_ttyd(job.get("ttyd"), job.get("ttydPid"))
+                log(f"paused session {sid}: tmux and terminal torn down")
+            except Exception as e:
+                log(f"paused session {sid}: teardown failed: {type(e).__name__}: {e}")
+            finally:
+                with self._sleeper_lock:
+                    self._sleeper_busy.pop(sid, None)
+            return True
+        error = None
+        try:
+            self._worktree_add(job["sess"], base_ref=job.get("baseRef"))
+        except Exception as e:
+            error = str(e) or type(e).__name__
+        with self._sleeper_lock:
+            self._sleeper_landed.append((sid, job.get("cmdId"), error))
+        return True
+
+    def _reap_paused_tmux(self, rec):
+        """The operator's Kill/Delete of a PAUSED record (XERK-1575) re-runs its
+        tmux kill on the lifecycle worker. The pause's own teardown job lives in
+        memory only, so a manager restart between the pause and the worker loses
+        it and leaves an idle claude no record owns; this is the operator's way
+        to end it. A no-op kill when nothing is there; skipped while a job for
+        the record is already queued or running (that one does it)."""
+        sid = rec.get("id") if isinstance(rec, dict) else None
+        if not isinstance(sid, str) or not sid or self._find(sid):
+            return
+        if self._sleeper_busy_kind(sid) is not None:
+            return
+        tmux = rec.get("tmuxName")
+        tmux = tmux if isinstance(tmux, str) and tmux else f"agent-{sid}"
+        self._stage_sleeper_job(
+            {"kind": "teardown", "sid": sid, "tmuxName": tmux,
+             "dsh": None, "ttyd": None, "ttydPid": None},
+            {"kind": "teardown", "worktreePath": rec.get("worktreePath"),
+             "root": bool(rec.get("root")),
+             "claudeSessionId": rec.get("claudeSessionId")})
+
+    def _sleeper_busy_kind(self, sid):
+        with self._sleeper_lock:
+            busy = self._sleeper_busy.get(sid)
+            return busy.get("kind") if busy else None
+
+    def _sleeper_job_blocks(self, cwd=None, transcript=None, root=False):
+        """Does a paused sleeper's teardown or worktree restore still in flight
+        hold this conversation (its transcript) or, for a non-root resume, this
+        worktree? A resume of it now would run two claudes on one conversation
+        (or launch into a dir the worker is still adding)."""
+        cwd = os.path.normpath(cwd) if isinstance(cwd, str) and cwd else None
+        with self._sleeper_lock:
+            for busy in self._sleeper_busy.values():
+                if transcript and busy.get("claudeSessionId") == transcript:
+                    return True
+                wt = busy.get("worktreePath")
+                if (cwd and not root and not busy.get("root")
+                        and isinstance(wt, str) and os.path.normpath(wt) == cwd):
+                    return True
+        return False
+
+    def _restores_in_flight(self):
+        """Slots reserved by wake resumes whose worktree the worker is re-adding:
+        the slot is the sleeper's, so the hub must not fill it meanwhile."""
+        with self._sleeper_lock:
+            return sum(1 for b in self._sleeper_busy.values()
+                       if b.get("kind") == "restore")
+
+    def _stage_worktree_restore(self, sid, rec, cmd_id):
+        """A wake resume whose kept worktree has vanished (a prune swept it while
+        the sleeper was paused): re-add it on the worker, then finish the resume
+        on the beat. Refused like resume()'s own claim while a prune is removing
+        that very path."""
+        path = rec.get("worktreePath")
+        with self._prune_lock:
+            if path in self._prune_removing:
+                self._refuse_start(f"a prune is removing the worktree at {path}",
+                                   cmd_id=cmd_id)
+                return
+            with self._sleeper_lock:
+                self._sleeper_restoring[path] = sid
+        self._stage_sleeper_job(
+            {"kind": "restore", "sid": sid, "cmdId": cmd_id,
+             "baseRef": rec.get("baseRef"),
+             "sess": {"id": sid, "repo": rec.get("repo"),
+                      "repoPath": rec.get("repoPath"), "worktreePath": path}},
+            {"kind": "restore", "worktreePath": path, "root": False,
+             "claudeSessionId": rec.get("claudeSessionId")})
+        log(f"resume of paused session {sid}: re-adding its worktree off the beat")
+
+    def _apply_sleeper_landed(self, light=False):
+        """Beat: finish each wake resume whose worktree the worker re-added. A
+        record no longer paused (the operator killed it, or the hub unpaused it)
+        or gone (deleted) is not resumed; a failed re-add leaves an ordinary
+        killed record that Resume brings back, and says why. Also re-arms the
+        worker while jobs wait: a failed Thread.start() would otherwise strand a
+        teardown, leaving an unmanaged tmux in a slot reported free.
+
+        The relaunch runs on FULL beats only. A restore-path wake was acked on
+        the beat that staged it, so the hub no longer counts it in flight and
+        may hand this host another launch; that command runs inline in
+        handle_commands right before the light follow-up beat. Relaunching on
+        that light beat too would put two launches between one POST and the
+        next (XERK-395). The landed restore waits, its slot still reserved."""
+        with self._sleeper_lock:
+            pending = bool(self._sleeper_jobs)
+        if pending:
+            self._start_sleeper_worker()
+        if light:
+            return
+        with self._sleeper_lock:
+            if not self._sleeper_landed:
+                return
+            landed, self._sleeper_landed = self._sleeper_landed, []
+        for sid, cmd_id, error in landed:
+            with self._sleeper_lock:
+                busy = self._sleeper_busy.pop(sid, None) or {}
+            path = busy.get("worktreePath")
+            try:
+                rec = next((c for c in self.closed if c.get("id") == sid), None)
+                if rec is None or not rec.get("paused"):
+                    log(f"resume of {sid} dropped: it is no longer a paused sleeper")
+                elif error:
+                    self._unpause_closed(rec)
+                    self._refuse_start(f"could not restore its worktree: {error}",
+                                       cmd_id=cmd_id)
+                else:
+                    self.resume(sid, cmd_id=cmd_id)
+            except Exception as e:
+                log(f"resume of {sid} failed: {type(e).__name__}: {e}")
+            finally:
+                # After resume()'s own claim registered it: never a gap in which
+                # a prune could take the re-added worktree.
+                with self._sleeper_lock:
+                    if path and self._sleeper_restoring.get(path) == sid:
+                        self._sleeper_restoring.pop(path, None)
 
     def _drop_wake_file(self, sid, delivered_at):
         """Remove the wake.json just delivered — unless the session has since
@@ -34529,7 +35241,7 @@ class SessionManager:
             "new-session", "-d", "-s", LIMITS_TMUX,
             "-c", REGISTRY_DIR, "-x", "80", "-y", "24",
             _TMUX_ENV_STRIP + " ".join(parts),
-        ))
+        ), env=_session_env())
         if rc != 0:
             log(f"limits probe launch failed: {err}")
             self._limits_probe_outcome(False)
@@ -34621,7 +35333,7 @@ class SessionManager:
             "--cols", "80", "--rows", "24",   # the tmux `-x 80 -y 24` geometry
             "--",
         ] + launcher + claude_argv
-        env = dict(os.environ)
+        env = _session_env()   # no agent secrets in the probe's claude (XERK-1577)
         # hooks/statusline.py writes the snapshot where read_limits_snapshot reads;
         # the pty-host has no shell to carry the `VAR=x` assignment the tmux path
         # prepends, so pin it in the process env instead (override included).
@@ -34829,7 +35541,12 @@ class SessionManager:
         """Worktrees currently backing a registry record, read fresh. list()
         copies the registry in one C-level step, which is what makes this safe to
         call from the prune worker while the beat mutates sessions."""
-        return {s.get("worktreePath") for s in list(self.registry)}
+        live = {s.get("worktreePath") for s in list(self.registry)}
+        # A paused sleeper's worktree being re-added for its wake (XERK-1575) is
+        # not in the registry yet, but must never be swept from under it.
+        with self._sleeper_lock:
+            live.update(self._sleeper_restoring)
+        return live
 
     def _claim_for_removal(self, path):
         """Prune-worker side of the removal handshake: take `path` if no session
@@ -35003,8 +35720,10 @@ class SessionManager:
             swept, self._prune_swept = self._prune_swept, []
         if swept:
             gone = set(swept)
+            # A paused sleeper (XERK-1575) stays: its resume re-adds the
+            # worktree off the recorded base, and dropping it loses the wake.
             self.closed = [c for c in self.closed
-                           if c.get("worktreePath") not in gone]
+                           if c.get("worktreePath") not in gone or c.get("paused")]
         now = time.time()
         with self._prune_lock:
             for repo in list(self.prunes):
@@ -35135,6 +35854,19 @@ class SessionManager:
         """Execute each not-yet-acked command exactly once. Returns True if any
         ran (the caller then fires an immediate extra heartbeat)."""
         did = False
+        # Sessions an operator command in THIS batch talks to (XERK-1575): a
+        # `pauseSleeper` ahead of it in the list must not kill the session the
+        # message is for, whichever order the hub queued the two in. An
+        # `exportSession` (the operator's Move) counts too: a pause ahead of it
+        # would leave a paused record here while the session moves away. So does
+        # the operator's Kill or Delete: a pause ahead of it would leave that
+        # command nothing to act on, and the paused record would later wake.
+        pane_sids = {c.get("sessionId") for c in commands or []
+                     if isinstance(c, dict) and c.get("cmdId")
+                     and c.get("cmdId") not in self.acked
+                     and (c.get("type") in SLEEPER_PANE_COMMANDS
+                          or c.get("type") in SLEEPER_STOP_COMMANDS
+                          or c.get("type") == "exportSession")}
         for cmd in commands or []:
             if not isinstance(cmd, dict):
                 continue
@@ -35164,6 +35896,16 @@ class SessionManager:
                                       agent_type=cmd.get("agentType"))
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
+                elif ctype == "pauseSleeper":
+                    # The hub frees a slot for queued work (XERK-1575): the same
+                    # clean kill, refused unless still a quiet sleeper.
+                    self.pause_sleeper(
+                        cmd.get("sessionId"),
+                        operator_pending=cmd.get("sessionId") in pane_sids)
+                elif ctype == "unpauseSleeper":
+                    # A paused sleeper the hub will not wake (XERK-1575): its
+                    # ticket went Done, or its conversation runs again.
+                    self.unpause_sleeper(cmd.get("sessionId"))
                 elif ctype == "start":
                     self.start(cmd.get("sessionId"))
                 elif ctype == "restart":
@@ -35815,9 +36557,11 @@ class SessionManager:
                     sess["permissionMode"] = ma
                     self.save()
                 self._ingest_wake_request(sess, signals)
+                self._note_quiet(sid, signals)
             except Exception as e:
                 log(f"session probe failed for {sid}: {e}")
                 signals = None
+                self._quiet.pop(sid, None)
             # The permission ledger's pane + ask-in-chat edges (XERK-1563), off
             # the signals just read. Its own guard: a ledger row is never worth
             # this session's signals, let alone the beat.
@@ -35988,7 +36732,8 @@ class SessionManager:
     def _closed_payload(self):
         """Killed-but-resumable sessions for the hub's per-repo Resume picker and
         its Ended-sessions list, newest first. Already capped at CLOSED_PER_REPO
-        per repo, so this can never balloon the heartbeat."""
+        per repo, plus at most PAUSED_KEEP_MAX paused sleepers per host, which
+        that cap exempts (XERK-1575), so this can never balloon the heartbeat."""
         return [
             {
                 "id": c.get("id"),
@@ -36031,6 +36776,10 @@ class SessionManager:
                 # they reached, not a bare link. None when it opened none, which
                 # matches the live payload's "no PRs" shape.
                 "prs": self._closed_prs(c),
+                # A sleeper paused for its slot (XERK-1575): when it wakes and
+                # why, so the hub shows it asleep (not ended) and resumes it
+                # then. None for an ordinary kill.
+                "paused": _paused_wire(c.get("paused")),
             }
             for c in reversed(self.closed)
         ]
@@ -36311,6 +37060,13 @@ class SessionManager:
         # Apply the outbox records the off-beat input worker staged (XERK-867):
         # the worker did the pane delivery, the beat owns the registry mutation.
         self._apply_landed_inputs()
+        # Finish the wake resumes whose worktree the sleeper lifecycle worker
+        # re-added (XERK-1575): the git ran off the beat, the registry write is
+        # the beat's.
+        try:
+            self._apply_sleeper_landed(light=light)
+        except Exception as e:
+            log(f"sleeper resume apply failed: {e}")
         # Deliver session-CLI wake-ups that have come due (XERK-1564): a time
         # compare per record, then a STAGE onto the off-beat input worker.
         try:
@@ -36521,6 +37277,11 @@ class SessionManager:
             # predates the reader would accept the request and never act on it.
             # Absent is coerced to "can't" hub-side (normalizeCloseTicket).
             "closeTicket": {"available": True},
+            # Whether this manager pauses a sleeper on the hub's command
+            # (XERK-1575). The hub sends `pauseSleeper` only to a host reporting
+            # it; TURMA_PAUSE_SLEEPERS=0 reports false. Absent is coerced to
+            # "can't" hub-side (normalizePauseSleepers).
+            "pauseSleepers": {"available": PAUSE_SLEEPERS},
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),

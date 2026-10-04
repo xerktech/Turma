@@ -6,6 +6,7 @@ import {
   clockTime,
   orgLabel,
   orgOptions,
+  pausedLabel,
   phoneHtml,
   transcriptEntries,
   sessionsBodyHtml,
@@ -191,6 +192,29 @@ describe("phone render", () => {
     expect(review.indexOf("stalled one")).toBeLessThan(review.indexOf("older wait"));
     expect(review).not.toContain("hub idle one");
     expect(html.slice(html.indexOf("Active"))).toContain(`sleeping until ${p(d.getHours())}:${p(d.getMinutes())}${d.getDate() !== new Date(now).getDate() ? "\u00a0+1d" : ""} · check CI`);
+  });
+
+  it("an Ended sleeper paused for its slot says when it wakes (XERK-1575)", () => {
+    const now = Date.now();
+    const wakeAt = now + 90 * 60_000;
+    const st = state({
+      agents: [agent({ closedSessions: [
+        { id: "nap", repo: "web", summary: "napping one", closedAt: "2026-07-15T09:00:00Z",
+          paused: { wakeAt, wakeReason: "check CI", at: now } } as never,
+        { id: "k", repo: "web", summary: "killed one", closedAt: "2026-07-15T08:00:00Z" } as never,
+      ] })],
+    });
+    const html = sessionsBodyHtml(st);
+    const nap = html.slice(html.indexOf("napping one"), html.indexOf("killed one"));
+    expect(nap).toContain(`<span class="ph-state st-holding">paused until ${clockTime(wakeAt, now)} · check CI</span>`);
+    expect(html.slice(html.indexOf("killed one"))).not.toContain("paused until");
+    // Its own Paused section above Ended, never inside the capped Ended list.
+    const pausedAt = html.indexOf(`<div class="ph-section-label">Paused <span class="ph-count">1</span></div>`);
+    const endedAt = html.indexOf(`<div class="ph-section-label">Ended <span class="ph-count">1</span></div>`);
+    expect(pausedAt).toBeGreaterThanOrEqual(0);
+    expect(endedAt).toBeGreaterThan(html.indexOf("napping one"));
+    expect(pausedAt).toBeLessThan(html.indexOf("napping one"));
+    expect(pausedLabel({ paused: { wakeAt: "soon" } } as never)).toBeNull();
   });
 
   it("a needs-you card carries the classifier's why and suggested answer (XERK-1572)", () => {

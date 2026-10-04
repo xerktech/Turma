@@ -45,6 +45,18 @@ class FleetPendingTest {
         assertTrue(reconcilePending(p, fleet(SessionInfo(id = "s1", status = "running", restartCount = 3)), 1000).isEmpty())
     }
 
+    @Test fun `a paused sleeper's kill clears once it is no longer reported paused`() {
+        // XERK-1575: no live session to vanish — the paused closed record is the signal.
+        val nap = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "s1", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 5_000_000L))
+        val stillPaused = listOf(AgentInfo(key = "h1", closedSessions = listOf(nap)))
+        assertEquals(1, reconcilePending(pend("killPaused"), stillPaused, 1000).size)
+        val killed = listOf(AgentInfo(key = "h1", closedSessions = listOf(nap.copy(paused = null))))
+        assertTrue(reconcilePending(pend("killPaused"), killed, 1000).isEmpty())
+        // A plain kill of the same id still waits on the live session list.
+        assertTrue(reconcilePending(pend("kill"), stillPaused, 1000).isEmpty())
+    }
+
     @Test fun `the TTL backstop reaps an entry with no signal`() {
         val s = SessionInfo(id = "s1", status = "running")
         // Under the TTL: held. Past it: reaped even though nothing changed.
