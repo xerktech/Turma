@@ -21787,6 +21787,12 @@ test("control WS: a non-string session id is refused, not used as a property key
   const token = await issueToken();
   const live = await wsConnect(`/live/${host}/pk1?auth=${token}`);
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+  // On a loaded box this test can outlast the hub's (test-mode) 1s tunnel-silence
+  // drop, which resets the control socket. wsConnect stops listening for errors
+  // once the upgrade lands, so that reset would surface as an uncaught `read
+  // ECONNRESET` (XERK-1095). It is not what this test checks: the hub staying up is.
+  ctrl.socket.on("error", () => {});
+  live.socket.on("error", () => {});
 
   for (const frame of [
     { turn: UNSTRINGIFIABLE, text: "hi" },
