@@ -100,6 +100,9 @@ hook-log tail) + `agent/hooks/permlog.py`.
   a lost dialog row when that session files a NEWER dialog row (the re-filed one), a lost ask on ANY
   newer row of its session, and any row still open after 24h (`OPEN_MAX_MS`).
 - **A sandbox escape is not hookable at all** — the pane is its only source.
+  - Its host comes ONLY from the TUI's `Host:` row, else its "don't ask again for <host>" option
+    (`_pane_dialog_host`). Any other host-shaped word may be the call's text (`package.json` fits),
+    and the head is pasted as an `allowedDomains` rule; no host means no rule.
 - **Open question (record the answer here):** what the TUI shows for a classifier block. The first
   week of real data answers it; until then nothing assumes it shows a dialog.
 
@@ -111,6 +114,14 @@ hook-log tail) + `agent/hooks/permlog.py`.
   process PRIMES every log ON DISK to EOF, a stopped session's included (it keeps its id and log, and
   a later Start would otherwise replay them as new prompts). Rows are staged in
   `_permission_rows_fetched`, REBOUND under `_permission_lock`; the beat drains and owns every row.
+- **Known gap: priming drops what was logged while the manager was down.** A `PermissionDenied`
+  written then is never read (its `c-<sid>-<toolUseId>` id would replay idempotently, but the
+  `PermissionRequest`s beside it would double-count). Fix = persist cursors with the registry.
+- **The DIR is session-writable too, so it is never read or swept THROUGH a link**
+  (`_permissions_dir_planted`): a session swapping it for a link to `~/.claude/projects/<slug>` would
+  have the hourly sweep delete other sessions' transcripts. The sweep opens the dir
+  `O_DIRECTORY|O_NOFOLLOW`, stats/unlinks relative to that fd, and removes only permlog's own names
+  (`<sid>.jsonl`, `<sid>.jsonl.1`, `_permission_log_sid`).
 - **The log is session-written** (Bash walks past the `Edit` deny): every read is `O_NONBLOCK` +
   `O_NOFOLLOW` + regular-file only + bounded (`_read_permission_log`, guard.py's `_read_text`
   discipline), every line re-shaped (`parse_permission_log_lines`), over-long lines skipped.

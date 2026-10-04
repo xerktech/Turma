@@ -37103,6 +37103,20 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         self.assertEqual((row["dialogKind"], row["head"]),
                          ("sandbox", "registry.npmjs.org"))
 
+    def test_a_sandbox_host_comes_only_from_the_tuis_own_rows(self):
+        # The head becomes a pasted allowedDomains rule, so a host-shaped word
+        # in the call's own text (a file name) must never become it.
+        d = self.sandbox()
+        self.assertEqual(ha._pane_dialog_host(d), "registry.npmjs.org")
+        no_host_line = dict(d, detail="Network request outside of sandbox\n"
+                                      "npm install --prefix . package.json")
+        self.assertEqual(ha._pane_dialog_host(no_host_line), "registry.npmjs.org")
+        bare = dict(no_host_line, options=[{"number": 1, "label": "Yes"},
+                                           {"number": 2, "label": "No"}])
+        self.assertEqual(ha._pane_dialog_host(bare), "")
+        self.assertEqual(ha._pane_dialog_host(dict(
+            bare, prompt="Do you want to allow this connection? README.md")), "")
+
     # --- hook rows ------------------------------------------------------------
 
     def test_a_permission_request_merges_into_its_dialog_by_its_call(self):
@@ -37987,6 +38001,53 @@ class TestPermissionLogTail(ManagerMixin, unittest.TestCase):
         self.sm._fetch_permission_rows()
         self.assertFalse(os.path.exists(stale))
         self.assertTrue(os.path.exists(self.path))
+
+    def test_only_permlogs_own_names_are_swept(self):
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        names = ["gone.jsonl.1", "notes.txt", "gone.jsonl.2", "bad sid.jsonl"]
+        for n in names:
+            p = os.path.join(ha.PERMISSIONS_DIR, n)
+            self.append(self.denied("x"), path=p)
+            os.utime(p, (old, old))
+        self.sm._fetch_permission_rows()
+        left = sorted(os.listdir(ha.PERMISSIONS_DIR))
+        self.assertEqual(left, sorted(names[1:]))   # only the rotation went
+
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name != "nt", "posix links")
+    def test_a_planted_dir_link_is_never_swept_or_read_through(self):
+        # A session swaps the dir for a link to a Claude project dir: an old
+        # transcript there must survive, and nothing in it is read as a row.
+        victim = os.path.join(self.tmp, "victim")
+        os.makedirs(victim)
+        transcript = os.path.join(victim, "0b7c-transcript.jsonl")
+        self.append(self.denied("t"), path=transcript)
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        os.utime(transcript, (old, old))
+        shutil.rmtree(ha.PERMISSIONS_DIR)
+        os.symlink(victim, ha.PERMISSIONS_DIR)
+        self.sm.registry = [{"id": "0b7c-transcript", "status": "running"}]
+        self.sm._fetch_permission_rows()            # would-be prime
+        self.sm.registry = []
+        self.sm._perm_swept_at = None
+        self.sm._fetch_permission_rows()            # would-be sweep
+        self.assertTrue(os.path.exists(transcript))
+        self.assertEqual(self.sm._permission_rows_fetched, {})
+        self.assertFalse(self.sm._permission_primed)
+
+    @unittest.skipUnless(hasattr(os, "symlink") and os.name != "nt", "posix links")
+    def test_the_sweep_alone_refuses_a_planted_dir_link(self):
+        victim = os.path.join(self.tmp, "victim2")
+        os.makedirs(victim)
+        transcript = os.path.join(victim, "abc.jsonl")
+        self.append(self.denied("t"), path=transcript)
+        old = time.time() - ha.PERMISSION_LOG_RETAIN_SEC - 10
+        os.utime(transcript, (old, old))
+        shutil.rmtree(ha.PERMISSIONS_DIR)
+        os.symlink(victim, ha.PERMISSIONS_DIR)
+        self.sm._perm_swept_at = None
+        with mock.patch.object(ha, "_permissions_dir_planted", return_value=False):
+            self.sm._sweep_permission_logs(set())   # the O_NOFOLLOW open refuses
+        self.assertTrue(os.path.exists(transcript))
 
 
 if __name__ == "__main__":

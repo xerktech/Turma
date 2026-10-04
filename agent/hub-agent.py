@@ -11406,11 +11406,20 @@ def _dialog_faces_match(prev_prompt, prev_detail, prompt):
 
 
 def _pane_dialog_host(prompt):
-    """The host a sandbox dialog asks about — its "Host:" line, else the first
-    host name its text mentions — or ""."""
+    """The host a sandbox dialog asks about — its "Host:" line, else the host its
+    "don't ask again for <host>" option names — or "". Only those two TUI-drawn
+    spots: any other host-shaped word in the dialog may be the call's own text
+    (`package.json`, `README.md` fit the shape), and the head becomes a pasted
+    `allowedDomains` rule — no rule beats a wrong one."""
     text = f"{prompt.get('prompt') or ''}\n{prompt.get('detail') or ''}"
-    m = (re.search(r"(?im)^\s*host:\s*" + _PERMISSION_HOST_RE.pattern, text)
-         or _PERMISSION_HOST_RE.search(text))
+    m = re.search(r"(?im)^\s*host:\s*" + _PERMISSION_HOST_RE.pattern + r"\s*$", text)
+    if not m:
+        for opt in prompt.get("options") or []:
+            label = str(opt.get("label") or "") if isinstance(opt, dict) else ""
+            m = re.search(r"(?i)\bdon'?t ask again for\s+" + _PERMISSION_HOST_RE.pattern
+                          + r"\s*$", label)
+            if m:
+                break
     return m.group(1).lower()[:200] if m else ""
 
 
@@ -11487,6 +11496,31 @@ def tool_call_outcome(entries, tool_use_id):
     if is_error and _PERMISSION_DENIED_RESULT_RE.search(text or ""):
         return "deny"
     return "allow"
+
+
+def _permission_log_sid(name):
+    """The session id a hook-log file NAME is for, or None. Only permlog.py's
+    two names count — exactly `<sid>.jsonl` and its rotation `<sid>.jsonl.1` —
+    so the sweep never deletes any other file it finds in the dir."""
+    for suffix in (".jsonl", ".jsonl.1"):
+        if name.endswith(suffix):
+            sid = name[:-len(suffix)]
+            return sid if VALID_PERMISSION_SID_RE.fullmatch(sid) else None
+    return None
+
+
+def _permissions_dir_planted():
+    """True when PERMISSIONS_DIR exists but is NOT a real directory — a link or
+    file a session planted with Bash (the ~/.turma residual; the Edit deny does
+    not stop Bash). Read or swept through such a link, the manager would act as
+    a confused deputy on whatever it points at (another session's Claude
+    transcripts in ~/.claude/projects). A missing dir is not planted: no
+    session has logged yet."""
+    try:
+        st = os.lstat(PERMISSIONS_DIR)
+    except OSError:
+        return False
+    return not stat.S_ISDIR(st.st_mode)
 
 
 def _read_permission_log(path, offset, max_bytes):
@@ -29341,6 +29375,8 @@ class SessionManager:
                 if s.get("status") == "running" and isinstance(s.get("id"), str)
                 and VALID_PERMISSION_SID_RE.fullmatch(s.get("id"))]
         running = set(sids)
+        if _permissions_dir_planted():
+            return                          # never read or sweep THROUGH a link
         prime = not self._permission_primed
         if prime:
             try:
@@ -29394,28 +29430,57 @@ class SessionManager:
 
     def _sweep_permission_logs(self, running):
         """Remove the hook logs of sessions that are gone, once they are
-        PERMISSION_LOG_RETAIN_SEC old. Hourly, on the worker. Best-effort."""
+        PERMISSION_LOG_RETAIN_SEC old. Hourly, on the worker. Best-effort.
+
+        The dir is session-writable, so a delete never goes THROUGH a planted
+        link (the `_clear_session_requests` rule): the dir is opened
+        O_DIRECTORY|O_NOFOLLOW and every stat/unlink is relative to that fd, so
+        a link swapped in after the check still cannot redirect it. Where the
+        platform has no dir_fd (Windows) a planted dir is refused by lstat.
+        Only permlog.py's own names (`_permission_log_sid`) are ever removed."""
         now = time.monotonic()
         if self._perm_swept_at is not None and now - self._perm_swept_at < 3600:
             return
         self._perm_swept_at = now
-        try:
-            names = os.listdir(PERMISSIONS_DIR)
-        except OSError:
+        if _permissions_dir_planted():
             return
+        use_fd = (hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+                  and os.unlink in os.supports_dir_fd
+                  and os.stat in os.supports_dir_fd
+                  and os.listdir in os.supports_fd)
+        fd = None
+        try:
+            if use_fd:
+                fd = os.open(PERMISSIONS_DIR,
+                             os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+            names = os.listdir(PERMISSIONS_DIR if fd is None else fd)
+        except OSError:
+            if fd is not None:
+                os.close(fd)
+            return                          # missing, or a link (ELOOP/ENOTDIR)
         cutoff = time.time() - PERMISSION_LOG_RETAIN_SEC
-        for name in names:
-            sid, sep, _rest = name.partition(".jsonl")
-            if not sep or sid in running:
-                continue
-            path = os.path.join(PERMISSIONS_DIR, name)
-            try:
-                st = os.lstat(path)
-                if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
-                    os.remove(path)
-                    self._permission_cursors.pop(path, None)
-            except OSError:
-                pass
+        try:
+            for name in names:
+                sid = _permission_log_sid(name)
+                if sid is None or sid in running:
+                    continue
+                path = os.path.join(PERMISSIONS_DIR, name)
+                try:
+                    if fd is None:
+                        st = os.lstat(path)
+                    else:
+                        st = os.stat(name, dir_fd=fd, follow_symlinks=False)
+                    if stat.S_ISREG(st.st_mode) and st.st_mtime < cutoff:
+                        if fd is None:
+                            os.remove(path)
+                        else:
+                            os.unlink(name, dir_fd=fd)
+                        self._permission_cursors.pop(path, None)
+                except OSError:
+                    pass
+        finally:
+            if fd is not None:
+                os.close(fd)
 
     def _emit_permission(self, row):
         """Put one row (a COPY — the beat keeps mutating its open rows) on the
