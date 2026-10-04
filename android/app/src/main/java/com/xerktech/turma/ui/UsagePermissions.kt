@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.MaterialTheme
-import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.ProvideTextStyle
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -23,12 +22,13 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
-import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
@@ -91,10 +91,7 @@ internal fun PermissionsSection(
             }
             if (view.top.any(Permissions::isBehaviour)) {
                 Text(
-                    buildAnnotatedString {
-                        withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append("Asked in chat") }
-                        append(Permissions.BEHAVIOUR_NOTE.removePrefix("Asked in chat"))
-                    },
+                    behaviourNote(),
                     style = MaterialTheme.typography.bodySmall,
                     color = muted,
                     modifier = Modifier.padding(top = 12.dp),
@@ -102,6 +99,25 @@ internal fun PermissionsSection(
             }
             if (view.recent.isNotEmpty()) RecentPrompts(view.recent, nowMs)
         }
+    }
+}
+
+/**
+ * The asks note as the web renders `PERM_BEHAVIOUR_NOTE`: the lead-in bold and
+ * the `~/.claude/CLAUDE.md` path in mono, the rest plain.
+ */
+private fun behaviourNote(): AnnotatedString = buildAnnotatedString {
+    val lead = "Asked in chat"
+    val body = Permissions.BEHAVIOUR_NOTE.removePrefix(lead)
+    withStyle(SpanStyle(fontWeight = FontWeight.Bold)) { append(lead) }
+    val code = Permissions.BEHAVIOUR_NOTE_CODE
+    val at = body.indexOf(code)
+    if (at < 0) {
+        append(body)
+    } else {
+        append(body.substring(0, at))
+        withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(code) }
+        append(body.substring(at + code.length))
     }
 }
 
@@ -214,21 +230,32 @@ private fun PermRule(g: PermissionGroup) {
 /**
  * Copies the RAW rule (never the display copy with its wrap hints). Android 13+
  * confirms a copy with its own system overlay; below that the platform shows
- * nothing, so a short toast stands in for it.
+ * nothing, so a short toast stands in for it. A compact bordered button the
+ * height of the rule box beside it (web `.perm-copy`), not a Material button,
+ * whose 40dp minimum would stand twice the rule's height.
  */
 @Composable
 private fun CopyRuleButton(rule: String) {
     val clipboard = LocalClipboardManager.current
     val context = LocalContext.current
-    OutlinedButton(
-        onClick = {
-            clipboard.setText(AnnotatedString(rule))
-            if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
-                Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+    Text(
+        "Copy",
+        fontSize = 11.5.sp,
+        maxLines = 1,
+        softWrap = false,
+        color = MaterialTheme.colorScheme.onSurface,
+        modifier = Modifier
+            .clip(RoundedCornerShape(4.dp))
+            .border(1.dp, MaterialTheme.colorScheme.outline, RoundedCornerShape(4.dp))
+            .background(MaterialTheme.colorScheme.surface, RoundedCornerShape(4.dp))
+            .clickable(role = Role.Button, onClickLabel = "Copy this rule") {
+                clipboard.setText(AnnotatedString(rule))
+                if (Build.VERSION.SDK_INT < Build.VERSION_CODES.TIRAMISU) {
+                    Toast.makeText(context, "Copied", Toast.LENGTH_SHORT).show()
+                }
             }
-        },
-        contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
-    ) { Text("Copy", fontSize = 12.sp) }
+            .padding(horizontal = 8.dp, vertical = 2.dp),
+    )
 }
 
 /**

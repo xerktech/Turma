@@ -140,6 +140,9 @@ object Permissions {
         "in the global ~/.claude/CLAUDE.md on each host: the session runs unattended and never waits " +
         "for a human to approve, continue, push or open a PR."
 
+    /** The path inside [BEHAVIOUR_NOTE] the web shows as `<code>`. */
+    const val BEHAVIOUR_NOTE_CODE = "~/.claude/CLAUDE.md"
+
     /** The card's lead note (web `permissionsCardHtml`'s head). */
     const val NOTE = "Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat " +
         "that held a session, grouped with the allow rule that would retire it. Follows the header's " +

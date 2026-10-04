@@ -11,6 +11,14 @@ import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.SemanticsProperties
+import androidx.compose.ui.test.SemanticsMatcher
+import androidx.compose.ui.test.assert
+import androidx.compose.ui.test.getBoundsInRoot
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.dp
 import com.xerktech.turma.core.Permissions
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
@@ -20,11 +28,13 @@ import com.xerktech.turma.model.PermissionSummary
 import com.xerktech.turma.vm.UsageViewModel
 import kotlinx.coroutines.runBlocking
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
+import org.robolectric.annotation.GraphicsMode
 
 /**
  * The "Permission prompts (7 days)" section (XERK-1576), composed in isolation
@@ -97,6 +107,35 @@ class PermissionsSectionTest {
         compose.waitForIdle()
         val clip = (hub.app.getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager).primaryClip
         assertEquals("Bash(git status:*)", clip?.getItemAt(0)?.text?.toString())
+    }
+
+    // Real text metrics: legacy graphics measures text with stub fonts, so sizes there mean nothing.
+    @GraphicsMode(GraphicsMode.Mode.NATIVE)
+    @Test
+    fun `Copy is a compact button no taller than the rule box beside it`() {
+        // The web's `.perm-copy` sits level with the rule's code box; a Material
+        // button's 40dp minimum would stand twice its height and gap the stats line.
+        show(UsageViewModel.PermissionsUi(view = populated))
+        val copy = compose.onNodeWithText("Copy").performScrollTo().getBoundsInRoot()
+        val rule = compose.onNodeWithText(Permissions.ruleDisplay("Bash(git status:*)")).getBoundsInRoot()
+        val copyH = copy.bottom - copy.top
+        // The rule node's bounds are its text; its box adds 2dp of padding above and below.
+        val ruleH = rule.bottom - rule.top + 4.dp
+        assertTrue("Copy $copy vs rule $rule", copyH <= ruleH + 1.dp)
+        assertTrue("Copy $copyH is a 40dp Material button", copyH < 32.dp)
+        compose.onNodeWithText("Copy").assert(SemanticsMatcher.expectValue(SemanticsProperties.Role, Role.Button))
+    }
+
+    @Test
+    fun `the ask note shows the CLAUDE md path as code, as the web does`() {
+        show(UsageViewModel.PermissionsUi(view = populated))
+        val text = compose.onNodeWithText("Asked in chat has no setting to copy", substring = true)
+            .fetchSemanticsNode().config[SemanticsProperties.Text].single()
+        val at = text.text.indexOf(Permissions.BEHAVIOUR_NOTE_CODE)
+        assertTrue(at > 0)
+        val mono = text.spanStyles.filter { it.item.fontFamily == FontFamily.Monospace }
+        assertEquals(listOf(at to at + Permissions.BEHAVIOUR_NOTE_CODE.length), mono.map { it.start to it.end })
+        assertTrue(text.spanStyles.any { it.item.fontWeight == FontWeight.Bold && it.start == 0 })
     }
 
     @Test
