@@ -23936,6 +23936,20 @@ test("XERK-1575: a message to a sleeper whose pause was handed over is refused, 
   assert.equal(ok.status, 200);
   assert.equal(sleeperCmds(host, "pauseSleeper").length, 0);
   assert.deepEqual(sleeperCmds(host, "input").map((c) => c.sessionId), ["x"]);
+  // Acked: x reads as a paused closed record, so a stale client's message is
+  // refused with the hub's words instead of being dropped on the agent.
+  agents[host].commands = [];
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [], closedSessions: [{ id: "x", repo: "Turma", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: Date.now() + 3600_000, wakeReason: "check later", at: Date.now() } }] });
+  const paused = await send();
+  assert.equal(paused.status, 409);
+  assert.match(paused.body.error, /Resume now/);
+  assert.equal(sleeperCmds(host, "input").length, 0);
+  // An ordinary killed record (no pause) is not this refusal.
+  await asBeat(host, SLEEP_SITE, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [], closedSessions: [{ id: "x", repo: "Turma", closedAt: "2026-10-01T01:00:00Z" }] });
+  assert.equal((await send()).status, 200);
   ticketQueue.length = 0; delete agents[host];
 });
 

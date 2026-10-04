@@ -26879,8 +26879,8 @@ class SessionManager:
     def _stage_sleeper_job(self, job, busy):
         """Queue `job` for the lifecycle worker, marking its sid busy, and wake
         (or start) the worker. MUST NOT raise onto the beat: a failed
-        Thread.start() (pids_limit, XERK-402) leaves the job queued for the next
-        stage to retry — `_stage_close_ticket_work`'s shape."""
+        Thread.start() (pids_limit, XERK-402) leaves the job queued, and every
+        beat's `_apply_sleeper_landed` re-arms the worker while jobs wait."""
         with self._sleeper_lock:
             self._sleeper_busy[job["sid"]] = busy
             self._sleeper_jobs.append(job)
@@ -27003,7 +27003,13 @@ class SessionManager:
         """Beat: finish each wake resume whose worktree the worker re-added. A
         record no longer paused (the operator killed it, or the hub unpaused it)
         or gone (deleted) is not resumed; a failed re-add leaves an ordinary
-        killed record that Resume brings back, and says why."""
+        killed record that Resume brings back, and says why. Also re-arms the
+        worker while jobs wait: a failed Thread.start() would otherwise strand a
+        teardown, leaving an unmanaged tmux in a slot reported free."""
+        with self._sleeper_lock:
+            pending = bool(self._sleeper_jobs)
+        if pending:
+            self._start_sleeper_worker()
         with self._sleeper_lock:
             if not self._sleeper_landed:
                 return

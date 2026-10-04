@@ -13317,6 +13317,16 @@ function sleeperPauseHandedOver(host, sid) {
   }
   return handed;
 }
+// Is `sid` already paused on `host` — acked, so it reads as a paused closed record
+// and runs nowhere on that host? The agent would drop a message to it with only a
+// log line, so the input route refuses instead.
+function sleeperAlreadyPaused(host, sid) {
+  const a = agents[host];
+  if (!a) return false;
+  if ((Array.isArray(a.sessions) ? a.sessions : []).some((s) => s && s.id === sid)) return false;
+  return (Array.isArray(a.closedSessions) ? a.closedSessions : []).some((c) =>
+    c && c.id === sid && wirePaused(c.paused) !== null);
+}
 // The operator stops a session: an automated wake of it still waiting to be handed
 // over is withdrawn, so the agent never relaunches it only to kill it again.
 function withdrawSleeperWake(host, sid) {
@@ -19347,6 +19357,13 @@ const server = http.createServer(async (req, res) => {
           return json(res, 409, {
             error: "this session is being paused to free its slot for queued work — "
               + "send again in a moment",
+          });
+        // Already paused (acked): no session runs to take it — the operator
+        // resumes it first. A client a beat stale still offers the composer.
+        if (sleeperAlreadyPaused(key, sessionId))
+          return json(res, 409, {
+            error: "this session was paused to free its slot for queued work — "
+              + "Resume now, then send again",
           });
         const cmd = { type: "input", sessionId, text };
         if (attached.length) cmd.uploads = attached;

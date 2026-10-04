@@ -17656,6 +17656,28 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(self._tmux_kills(sess)), 1)
         self.assertEqual(sm._sleeper_worker.name, "sleeper-lifecycle")
 
+    def test_a_failed_worker_start_is_re_armed_by_the_next_beat(self):
+        # pids_limit (XERK-402): the first Thread.start() raises. The teardown
+        # stays queued and the next beat's apply re-arms the worker, so no tmux
+        # is stranded in a slot the agent reports free.
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        sess = self._sleeper(sm)
+        self.run_calls.clear()
+        real_start = threading.Thread.start
+        with mock.patch.object(threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            self.assertTrue(sm.pause_sleeper(sess["id"], now_ms=self.NOW))
+        self.assertEqual(len(sm._sleeper_jobs), 1, "the job waits, not lost")
+        self.assertEqual(self._tmux_kills(sess), [])
+        self.assertIs(threading.Thread.start, real_start)
+        sm._apply_sleeper_landed()
+        deadline = time.time() + 10
+        while sm._sleeper_busy_kind(sess["id"]) and time.time() < deadline:
+            time.sleep(0.01)
+        self.assertIsNone(sm._sleeper_busy_kind(sess["id"]))
+        self.assertEqual(len(self._tmux_kills(sess)), 1)
+
     def test_a_wake_resume_re_adds_a_vanished_worktree_off_the_beat(self):
         # A prune swept the paused sleeper's worktree: the `git worktree add`
         # runs on the worker, the slot stays reserved meanwhile, and the beat
