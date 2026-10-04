@@ -8888,6 +8888,12 @@ function coerceLiveSignals(live) {
       live.loop = { repeats: l.repeats, tool: l.tool.slice(0, 64), since: l.since };
     } else delete live.loop;
   }
+  // The wait-classifier edge the agent sees now (XERK-1572): epoch ms, the
+  // `edgeTs` of the attentionHints row that answers it. Absent = no edge or can't
+  // tell, and then no verdict is folded.
+  if ("attentionEdgeTs" in live && !(Number.isSafeInteger(live.attentionEdgeTs) && live.attentionEdgeTs > 0)) {
+    delete live.attentionEdgeTs;
+  }
   coerceStringList(live, "questionOptions");
   coerceStringList(live, "newPrUrls");
   coerceObjectList(live, "questionOptionsRich"); // QuestionOption leaves are all Strings
@@ -11461,7 +11467,10 @@ function sessionAttention(session, working, wait, now) {
 // edge, and ships the verdict as an `attentionHints` row: {key: "<sid>:<edge-ts>",
 // sessionId, edge, edgeTs, label, why, suggestedAnswer?}. Whitelisted here
 // (strict label + edge enums, texts capped), folded into that session's attention
-// as `attention.hint` while the state it answers holds.
+// as `attention.hint` while the state it answers holds AND the agent still reports
+// that edge: the session's live `attentionEdgeTs` names the edge the agent sees
+// now, so a second wait of the same kind (back-to-back dialogs, a turn shorter
+// than a beat) never wears the first one's verdict.
 const ATTENTION_HINT_LABELS = new Set([
   "rubber-stamp", "design-decision", "needs-human-test", "blocked-on-host", "looping",
   "waiting-external",
@@ -11481,9 +11490,10 @@ function normalizeAttentionHint(h) {
   const sid = h.sessionId;
   if (typeof sid !== "string" || !sid || sid.length > 128) return null;
   if (!Object.hasOwn(ATTENTION_HINT_EDGE_STATES, h.edge) || !ATTENTION_HINT_LABELS.has(h.label)) return null;
+  if (!(Number.isSafeInteger(h.edgeTs) && h.edgeTs > 0)) return null;
   const why = hintText(h.why);
   if (!why) return null;
-  const out = { sessionId: sid, edge: h.edge, label: h.label, why };
+  const out = { sessionId: sid, edge: h.edge, edgeTs: h.edgeTs, label: h.label, why };
   const ans = hintText(h.suggestedAnswer);
   if (ans) out.suggestedAnswer = ans;
   return out;
@@ -11704,9 +11714,12 @@ function heartbeatAlerts(key, prev, next, hints = []) {
   // several Claude sessions a host runs at once.
   alerts.sessions = alerts.sessions || {};
   const liveIds = new Set();
-  // The wait classifier's verdicts this beat delivered (XERK-1572), by session.
+  // The wait classifier's verdicts this beat delivered (XERK-1572), by session +
+  // the edge each answers, so a late row for an edge already left is never taken.
   const hintFor = new Map();
-  for (const h of Array.isArray(hints) ? hints : []) if (h && typeof h.sessionId === "string") hintFor.set(h.sessionId, h);
+  for (const h of Array.isArray(hints) ? hints : []) {
+    if (h && typeof h.sessionId === "string") hintFor.set(`${h.sessionId}\x00${h.edgeTs}`, h);
+  }
   for (const session of next.sessions || []) {
     liveIds.add(session.id);
     const sa = (alerts.sessions[session.id] = alerts.sessions[session.id] || { prSeen: [] });
@@ -11803,10 +11816,12 @@ function heartbeatAlerts(key, prev, next, hints = []) {
     const prevAttn = sa.attn;
     const carried = prevAttn && sameAttentionEdge(prevAttn.state, base.state) && prevAttn.since;
     // The classifier's verdict (XERK-1572) is held on `sa.hint` and folded while
-    // the state it answers holds; one that answers nothing current is dropped.
-    const incoming = hintFor.get(session.id);
+    // the state it answers holds and the agent still reports ITS edge
+    // (`attentionEdgeTs`); one that answers nothing current is dropped.
+    const edgeTs = Number.isSafeInteger(s.attentionEdgeTs) ? s.attentionEdgeTs : null;
+    const incoming = edgeTs ? hintFor.get(`${session.id}\x00${edgeTs}`) : null;
     if (incoming) sa.hint = incoming;
-    const folded = sa.hint ? attentionWithHint(base, sa.hint) : null;
+    const folded = sa.hint && sa.hint.edgeTs === edgeTs ? attentionWithHint(base, sa.hint) : null;
     if (sa.hint && !folded) delete sa.hint;
     const attn = folded || base;
     sa.attn = { ...attn, since: carried ? prevAttn.since : now };
@@ -14176,7 +14191,12 @@ function attentionNudgeSweep(now = Date.now()) {
       const reason = attn.cause === "loop" ? "loop" : "stalled";
       const nk = host + "\x00" + s.id + "\x00" + reason;
       const rec = attentionNudged.get(nk);
-      const count = rec && rec.since === attn.since ? rec.count : 0;
+      // A loop's stall is the RUN, not the beat it was entered: a nudge (or the
+      // operator's prompt) re-arms the agent's count but keeps the run's `since`,
+      // so the same failure resumed is the same stall and the cap still holds.
+      const loopSince = s.session && s.session.loop && s.session.loop.since;
+      const since = reason === "loop" && Number.isSafeInteger(loopSince) ? loopSince : attn.since;
+      const count = rec && rec.since === since ? rec.count : 0;
       if (count >= ATTENTION_NUDGE_MAX) continue;
       if (rec && now - rec.at < ATTENTION_NUDGE_BACKOFF_MS) continue;
       const text = attentionNudgeText(reason, s);
@@ -14184,7 +14204,7 @@ function attentionNudgeSweep(now = Date.now()) {
       // `source: "nudge"`: the hub's own words, not the operator answering —
       // the agent's permission ledger must not close an ask-in-chat row on it.
       queueCommand(host, { type: "input", sessionId: s.id, text, source: "nudge" });
-      const next = { at: now, count: count + 1, since: attn.since };
+      const next = { at: now, count: count + 1, since };
       attentionNudged.set(nk, next);
       guardStoreSet("attentionNudged", nk, next);
     }

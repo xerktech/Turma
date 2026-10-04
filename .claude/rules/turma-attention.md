@@ -119,6 +119,10 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   `stalled` one only on a wait stall). The first beat it answers nothing current it is deleted —
   so a later wait of the same kind never shows the last one's verdict. A flicker back onto the SAME
   edge is healed by the AGENT re-sending its cached verdict, not by the hub keeping it.
+- **A hint also answers ONE EDGE**: the state name alone cannot tell two back-to-back dialogs or
+  questions (or a turn shorter than a beat) apart, so the session's live `attentionEdgeTs` (the
+  agent's current edge, coerced by name in `coerceLiveSignals`) must equal the hint's `edgeTs`, or
+  nothing folds. A row is taken only for that edge (a late one is ignored); absent = can't tell.
 - `wireAttention` rebuilds `hint` field by field (label in the set, why non-empty) or omits it;
   Android types it (`AttentionHint`), so a corrupt `state.json` must not reach the wire.
 - **Surfaces** — one wording (`HINT_KIND`: "decision · …", "needs a human test · …", then
@@ -143,6 +147,9 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   `ATTENTION_NUDGE_BACKOFF_MIN` (20) while the SAME stall (`since`) holds; after
   `ATTENTION_NUDGE_MAX` (2) the session stays stalled and the operator decides. A new stall edge
   restarts the count, still behind the backoff. `ATTENTION_NUDGES=0` turns the sweep off.
+- **A loop's stall is its RUN** (`loop.since`), not the beat the state was entered: a nudge re-arms
+  the agent's count, so the session reads working before it loops again; keying on the attention
+  `since` would let a session that loops after every nudge be nudged forever.
 - Tests: the `XERK-1572:` cases in `server.test.js`, `attention:` in `sessions.test.js`, the loop +
   State-row cases in `dashboard-livestate.test.js`, android `SessionsTest`/`AgentDecodeTest`, glasses
   `sessions.test.ts`/`phone/render.test.ts`.

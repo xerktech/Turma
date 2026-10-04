@@ -11357,14 +11357,22 @@ def _scan_loop_entry(entry, state):
     remembered until its result lands; a result with `is_error` either extends
     the run (same tool + input digest as the run's) or starts a new one, and any
     other result — a success — ends it. A sub-agent's sidechain is not this
-    session's own loop."""
+    session's own loop. A new prompt (`_loop_new_turn`) re-arms the run: its
+    count restarts but its `since` is kept, so the same failure resumed after an
+    answer — the operator's or the hub's nudge — is still the SAME stall to the
+    hub, whose two-nudge cap is keyed on `since`."""
     if not isinstance(entry, dict) or entry.get("isSidechain") is True:
         return
     msg = entry.get("message")
     content = msg.get("content") if isinstance(msg, dict) else None
+    etype = entry.get("type")
+    if etype == "user" and _loop_new_turn(entry, content):
+        run = state.get("loop")
+        if run:
+            run["repeats"] = 0
+        return
     if not isinstance(content, list):
         return
-    etype = entry.get("type")
     if etype == "assistant":
         pend = state.setdefault("loopCalls", {})
         for block in content:
@@ -11395,6 +11403,24 @@ def _scan_loop_entry(entry, state):
                 since = ts if isinstance(ts, int) and 0 < ts <= _MAX_SAFE_INT else None
                 state["loop"] = {"tool": tool, "digest": dig, "repeats": 1,
                                  "since": since or int(time.time() * 1000)}
+
+
+def _loop_new_turn(entry, content):
+    """Is this user entry a new PROMPT (typed text, not a tool result)? A meta
+    or compaction entry and a background task's `<task-notification>` are not."""
+    if entry.get("isMeta") is True or entry.get("isCompactSummary") is True:
+        return False
+    if isinstance(content, str):
+        texts = [content]
+    elif isinstance(content, list):
+        if any(isinstance(b, dict) and b.get("type") == "tool_result" for b in content):
+            return False
+        texts = [b.get("text") for b in content
+                 if isinstance(b, dict) and b.get("type") == "text"]
+    else:
+        return False
+    texts = [t for t in texts if isinstance(t, str) and t.strip()]
+    return bool(texts) and not any(TASK_NOTIFICATION_RE.match(t) for t in texts)
 
 
 def loop_report(state):
@@ -13478,7 +13504,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # never reach a transcript this beat), so a session with agents still in
         # flight keeps reporting them on a beat that appended nothing.
         report["agents"] = live_agents_report(state)
-        report["loop"] = loop_report(state)
+        # Only while the turn runs: a session that ended its turn after a loop
+        # (a `Host blocker:` line, say) is waiting on the operator, and that
+        # end-of-turn wait is what the hub and the classifier must read.
+        report["loop"] = loop_report(state) if report.get("paneBusy") is not False else None
         # The ask.py PreToolUse bridge publishes a request file for exactly as
         # long as a question is actually blocking the tool call, so it's the
         # authoritative pending signal — prefer it over the transcript scan
@@ -30115,7 +30144,12 @@ class SessionManager:
         already read (no I/O): note a NEW needs-you/stalled edge on the session's
         record (`attentionHint`), which `_stage_attention_hint` then classifies.
         The record is the ledger: an edge it already holds — a manager restart,
-        a state that flickered away and back — is never asked again."""
+        a state that flickered away and back — is never asked again.
+
+        The edge's `edgeTs` rides the live signals as `attentionEdgeTs`, every
+        beat the session is on it: the hub folds a verdict only while that names
+        the verdict's edge, so a NEW wait of the same kind (a second dialog, a
+        turn shorter than a beat) sheds the old verdict at once."""
         sid = sess.get("id")
         if not isinstance(sid, str) or not self._attention_classifies(sess):
             return
@@ -30123,21 +30157,23 @@ class SessionManager:
         self._attn_signals[sid] = signals
         edge = attention_edge(signals, now_ms)
         key = None if edge is None else f"{edge[0]}|{edge[1]}"
-        if sid in self._attn_edge and self._attn_edge[sid] == key:
-            return
-        self._attn_edge[sid] = key
-        if key is None:
-            return
+        if not (sid in self._attn_edge and self._attn_edge[sid] == key):
+            self._attn_edge[sid] = key
+            if key is not None:
+                rec = sess.get("attentionHint")
+                if isinstance(rec, dict) and rec.get("edge") == key:
+                    # Back on an edge already answered: the hub dropped its copy
+                    # of the verdict the beat the state left, so ship the CACHED
+                    # one again (never re-asked). Same edgeTs, one verdict.
+                    if rec.get("done") and rec.get("label") in ATTENTION_HINT_LABELS:
+                        self._queue_attention_hint_row(sid, rec)
+                else:
+                    sess["attentionHint"] = {"edge": key, "kind": edge[0], "edgeTs": now_ms,
+                                             "attempts": 0}
         rec = sess.get("attentionHint")
-        if isinstance(rec, dict) and rec.get("edge") == key:
-            # Back on an edge already answered: the hub dropped its copy of the
-            # verdict the beat the state left, so ship the CACHED one again
-            # (never re-asked). Same key, so the hub reads one verdict.
-            if rec.get("done") and rec.get("label") in ATTENTION_HINT_LABELS:
-                self._queue_attention_hint_row(sid, rec)
-            return
-        sess["attentionHint"] = {"edge": key, "kind": edge[0], "edgeTs": now_ms,
-                                 "attempts": 0}
+        if (key is not None and isinstance(signals, dict) and isinstance(rec, dict)
+                and rec.get("edge") == key and isinstance(rec.get("edgeTs"), int)):
+            signals["attentionEdgeTs"] = rec["edgeTs"]
 
     def _queue_attention_hint_row(self, sid, rec):
         """Put one verdict on the heartbeat outbox as an `attentionHints` row

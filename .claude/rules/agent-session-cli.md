@@ -124,6 +124,9 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   as `attentionHint {edge, kind, edgeTs, attempts}`; the RECORD is the ledger, so an edge it already
   holds (a restart, a flicker back) is never asked again — but re-entering one it ANSWERED re-ships
   the cached verdict (same `<sid>:<edgeTs>` key): the hub drops its copy the beat the state leaves.
+- **The current edge rides the live signals as `attentionEdgeTs`** (that record's `edgeTs`, every
+  beat the session is on it): the hub folds a verdict only for the edge it answers, so a second
+  dialog or question of the same kind never shows the first one's verdict.
 - **A sleeping session is no edge** (`wakeAt` in the future): the hub reads `sleeping` ahead of
   review/stalled. `ATTENTION_WAIT_STALL_MIN` is read agent-side under the hub's env name and must
   MATCH the hub's — a mismatch asks about a stall the hub does not read (its hint is dropped).
@@ -143,6 +146,10 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   different call resets it; sidechains ignored; pending calls ≤64, count capped. `session_report`
   reports `loop: {repeats, tool, since}` from `LOOP_REPEATS_MIN` (4), else null. A restart primes
   offsets to EOF, so a loop is re-counted from new calls (failure direction: none reported).
+- **`loop` is reported only while the turn runs** (`paneBusy` not False): a session that ended its
+  turn after a loop is the operator's wait (review, classified). **A new prompt** (user text, not a
+  tool result, meta, compaction or `<task-notification>`) **re-arms the run**: count to 0, `since`
+  kept, so the same failure resumed after a nudge is the same stall to the hub's two-nudge cap.
 - Tests: `TestAttentionHints`, `TestLoopSignal`, `TestSessionReportLoop`.
 - **Real-host spike (not yet run)**: the classifier against the real login on a few archived prompts
   (assert schema conformance, not text), and a looping transcript + a stalled shell through `verify`.

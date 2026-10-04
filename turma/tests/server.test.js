@@ -22782,9 +22782,10 @@ test("XERK-1572: normalizeAttentionHint whitelists label, edge and capped texts"
   const n = hub.normalizeAttentionHint;
   const ok = { key: "s1:1000", sessionId: "s1", edge: "review", edgeTs: 1000,
     label: "rubber-stamp", why: "Asks to push.", suggestedAnswer: "Yes, push it." };
-  assert.deepEqual(n(ok), { sessionId: "s1", edge: "review", label: "rubber-stamp",
+  assert.deepEqual(n(ok), { sessionId: "s1", edge: "review", edgeTs: 1000, label: "rubber-stamp",
     why: "Asks to push.", suggestedAnswer: "Yes, push it." });
   for (const bad of [null, "x", [], { ...ok, label: "maybe" }, { ...ok, label: "Rubber-Stamp" },
+    { ...ok, edgeTs: undefined }, { ...ok, edgeTs: "1000" }, { ...ok, edgeTs: 0 }, { ...ok, edgeTs: 1.5 },
     { ...ok, edge: "idle" }, { ...ok, edge: "__proto__" }, { ...ok, why: "  " }, { ...ok, why: 7 },
     { ...ok, sessionId: 5 }, { ...ok, sessionId: "" }, { ...ok, sessionId: "x".repeat(129) }]) {
     assert.equal(n(bad), null, JSON.stringify(bad));
@@ -22808,11 +22809,13 @@ test("XERK-1572: a hint folds into attention while the state it answers holds", 
     };
   })();
   const t0 = Date.now();
+  // The agent's live edge (`attentionEdgeTs`) is 1 for the first wait, then 2.
   const sess = (live) => ({ sessions: [{ id: "s1", rcName: "nas-repo-s1", status: "running",
-    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
-  const hint = (extra) => [hub.normalizeAttentionHint({ sessionId: "s1", edge: "review",
+    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false,
+      attentionEdgeTs: 1, ...live } }] });
+  const hint = (extra) => [hub.normalizeAttentionHint({ sessionId: "s1", edge: "review", edgeTs: 1,
     label: "design-decision", why: "Pick schema v2 or v3.", suggestedAnswer: "Go with v3.", ...extra })];
-  beat(sess({ paneBusy: true }), t0);
+  beat(sess({ paneBusy: true, attentionEdgeTs: undefined }), t0);
   let rec = beat(sess({}), t0 + 20000);                         // review edge
   assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
   rec = beat(sess({}), t0 + 40000, hint());                     // the verdict lands
@@ -22830,20 +22833,20 @@ test("XERK-1572: a hint folds into attention while the state it answers holds", 
   assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:test");
   assert.equal(rec.alerts.sessions.s1.attn.since, t0 + 20000);
   // The session works again: the hint is gone with the state it answered.
-  rec = beat(sess({ paneBusy: true }), t0 + 100000);
+  rec = beat(sess({ paneBusy: true, attentionEdgeTs: undefined }), t0 + 100000);
   assert.equal(rec.alerts.sessions.s1.hint, undefined);
   assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
-  rec = beat(sess({}), t0 + 120000);
+  rec = beat(sess({ attentionEdgeTs: 2 }), t0 + 120000);
   assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
   assert.equal(rec.alerts.sessions.s1.attn.hint, undefined, "a new wait carries no old verdict");
   // A verdict for another state is never folded (a question hint on a review).
-  rec = beat(sess({}), t0 + 140000, hint({ edge: "question" }));
+  rec = beat(sess({ attentionEdgeTs: 2 }), t0 + 140000, hint({ edge: "question", edgeTs: 2 }));
   assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
   // A loop verdict folds only on a LOOP stall, a wait verdict only on a wait stall.
-  const loopy = sess({ paneBusy: true, loop: { repeats: 4, tool: "Bash", since: t0 } });
-  rec = beat(loopy, t0 + 160000, hint({ edge: "stalled", label: "waiting-external" }));
+  const loopy = sess({ paneBusy: true, attentionEdgeTs: 3, loop: { repeats: 4, tool: "Bash", since: t0 } });
+  rec = beat(loopy, t0 + 160000, hint({ edge: "stalled", edgeTs: 3, label: "waiting-external" }));
   assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
-  rec = beat(loopy, t0 + 180000, hint({ edge: "loop", label: "looping", why: "Retries npm ci." }));
+  rec = beat(loopy, t0 + 180000, hint({ edge: "loop", edgeTs: 3, label: "looping", why: "Retries npm ci." }));
   assert.equal(rec.alerts.sessions.s1.attn.hint.why, "Retries npm ci.");
 });
 
@@ -22861,19 +22864,82 @@ test("XERK-1572: a flicker drops the hint for a beat; the agent's re-sent verdic
   };
   const t0 = Date.now();
   const sess = (live) => ({ sessions: [{ id: "s1", status: "running",
-    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false, ...live } }] });
-  const row = [hub.normalizeAttentionHint({ sessionId: "s1", edge: "review",
+    session: { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false,
+      attentionEdgeTs: 7, ...live } }] });
+  const row = [hub.normalizeAttentionHint({ sessionId: "s1", edge: "review", edgeTs: 7,
     label: "rubber-stamp", why: "Asks to deploy.", suggestedAnswer: "Yes, deploy it." })];
-  beat(sess({ paneBusy: true }), t0);
+  beat(sess({ paneBusy: true, attentionEdgeTs: undefined }), t0);
   beat(sess({}), t0 + 20000);
   let rec = beat(sess({}), t0 + 40000, row);
   assert.equal(rec.alerts.sessions.s1.attn.hint.why, "Asks to deploy.");
-  rec = beat(sess({ paneBusy: true }), t0 + 60000);          // a one-beat busy flicker
+  rec = beat(sess({ paneBusy: true, attentionEdgeTs: undefined }), t0 + 60000);   // a one-beat busy flicker
   assert.equal(rec.alerts.sessions.s1.attn.hint, undefined);
   rec = beat(sess({}), t0 + 80000, row);                      // the agent re-sends it
   assert.equal(rec.alerts.sessions.s1.attn.state, "needs-you:review");
   assert.deepEqual(rec.alerts.sessions.s1.attn.hint,
     { label: "rubber-stamp", why: "Asks to deploy.", suggestedAnswer: "Yes, deploy it." });
+});
+
+test("XERK-1572: a second wait of the same kind never wears the first one's verdict", () => {
+  // Back-to-back permission dialogs and back-to-back questions: no working beat
+  // between them, so the attention STATE never changes. The agent's live
+  // `attentionEdgeTs` names the new edge, and the old verdict is dropped at once.
+  const alerts = {};
+  let prev = {};
+  const beat = (live, at, hints) => {
+    const next = { sessions: [{ id: "s1", status: "running", session: { paneBusy: true,
+      transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: true, ...live } }], lastSeen: at, alerts };
+    heartbeatAlerts("host-b2b", prev, next, hints);
+    prev = next;
+    return next.alerts.sessions.s1.attn;
+  };
+  const row = (edge, edgeTs, why, extra) => [hub.normalizeAttentionHint({ sessionId: "s1", edge, edgeTs,
+    label: "rubber-stamp", why, suggestedAnswer: "Yes", ...extra })];
+  const t0 = Date.now();
+  const dialog = (detail, ts) => ({ panePrompt: { prompt: "Bash command", detail }, attentionEdgeTs: ts });
+  beat(dialog("git status", 100), t0);
+  let attn = beat(dialog("git status", 100), t0 + 20000, row("permission", 100, "Wants to run git status."));
+  assert.equal(attn.state, "needs-you:permission");
+  assert.equal(attn.hint.why, "Wants to run git status.");
+  // Dialog B, straight after A: no hint row for it yet.
+  attn = beat(dialog("git push --force origin main", 200), t0 + 40000);
+  assert.equal(attn.state, "needs-you:permission");
+  assert.equal(attn.hint, undefined, "dialog B carries no verdict for dialog A");
+  assert.equal(alerts.sessions.s1.hint, undefined);
+  attn = beat(dialog("git push --force origin main", 200), t0 + 60000);
+  assert.equal(attn.hint, undefined, "and does not on the beat after");
+  // A LATE row for dialog A (the outbox delivered it after B opened) is never taken.
+  attn = beat(dialog("git push --force origin main", 200), t0 + 80000, row("permission", 100, "Wants to run git status."));
+  assert.equal(attn.hint, undefined);
+  // B's own verdict folds.
+  attn = beat(dialog("git push --force origin main", 200), t0 + 100000,
+    row("permission", 200, "Wants to force-push main.", { label: "design-decision", suggestedAnswer: "" }));
+  assert.deepEqual(attn.hint, { label: "design-decision", why: "Wants to force-push main." });
+  // Two questions in a row, the same way.
+  const ask = (q, ts) => ({ question: q, attentionEdgeTs: ts });
+  attn = beat(ask("Use v2?", 300), t0 + 120000, row("question", 300, "Asks whether to use v2."));
+  assert.equal(attn.state, "needs-you:question");
+  assert.equal(attn.hint.why, "Asks whether to use v2.");
+  attn = beat(ask("Delete the old table?", 400), t0 + 140000);
+  assert.equal(attn.state, "needs-you:question");
+  assert.equal(attn.hint, undefined, "question B carries no verdict for question A");
+  // An agent that stops reporting the edge (can't tell) folds nothing either.
+  attn = beat(ask("Delete the old table?", undefined), t0 + 160000, row("question", 400, "Asks to drop it."));
+  assert.equal(attn.hint, undefined);
+});
+
+test("XERK-1572: attentionEdgeTs is coerced by name and never repaired", async () => {
+  const host = "edge-coerce";
+  const vals = [1700000000000, "1700000000000", 0, -5, 1.5, { t: 1 }, null];
+  const r = await request("POST", "/api/heartbeat", {
+    headers: agentHeaders,
+    body: { device: host, sessions: vals.map((attentionEdgeTs, i) => ({ id: `s${i}`, status: "running",
+      session: { paneBusy: true, transcriptAgeSec: 1, attentionEdgeTs } })) },
+  });
+  assert.equal(r.status, 200);
+  const got = agents[host].sessions.map((s) => s.session.attentionEdgeTs);
+  assert.equal(got[0], 1700000000000);
+  for (const i of [1, 2, 3, 4, 5, 6]) assert.equal(got[i], undefined, `case ${i}`);
 });
 
 test("XERK-1572: a forged or corrupt stored hint never reaches the wire", () => {
@@ -22887,7 +22953,8 @@ test("XERK-1572: a forged or corrupt stored hint never reaches the wire", () => 
 
 test("XERK-1572: attentionHints ride the heartbeat into the served attention", async () => {
   const host = "hint-wire";
-  const live = { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false };
+  const live = { paneBusy: false, transcriptAgeSec: 1, lastRole: "assistant", lastHasToolUse: false,
+    attentionEdgeTs: 1 };
   const post = (body) => request("POST", "/api/heartbeat", { headers: agentHeaders, body: { device: host, ...body } });
   await post({ sessions: [{ id: "s1", status: "running", session: { ...live, paneBusy: true } }] });
   await post({ sessions: [{ id: "s1", status: "running", session: live }] });
@@ -22968,6 +23035,34 @@ test("XERK-1572: a looping session is nudged under its own reason; nothing else 
   hub.attentionNudged.clear();
   delete agents[host];
   delete agents[off];
+});
+
+test("XERK-1572: a loop resumed after a nudge is the same stall, so the two-nudge cap holds", () => {
+  // The nudge (or the operator's prompt) re-arms the agent's count, so the session
+  // reads working for a while and then stalled again on a NEW attention edge; the
+  // run's own `since` is unchanged, and the cap is keyed on it.
+  hub.attentionNudged.clear();
+  const host = "nudge-loop-cap";
+  const t0 = Date.now();
+  const loop = { repeats: 4, tool: "Bash", since: t0 - 60000 };
+  const a = nudgeHost(host, [{ session: { id: "s1", status: "running", session: { paneBusy: true, loop } },
+    attn: { state: "needs-you:stalled", cause: "loop", since: t0 } }], t0);
+  const sweep = (t) => { a.lastSeen = t; hub.attentionNudgeSweep(t); };
+  sweep(t0);
+  assert.equal(nudges(host).length, 1);
+  const B = hub.ATTENTION_NUDGE_BACKOFF_MS;
+  a.alerts.sessions.s1.attn = { state: "needs-you:stalled", cause: "loop", since: t0 + B / 2 };
+  sweep(t0 + B);
+  assert.equal(nudges(host).length, 2);
+  a.alerts.sessions.s1.attn = { state: "needs-you:stalled", cause: "loop", since: t0 + 2 * B };
+  sweep(t0 + 3 * B);
+  assert.equal(nudges(host).length, hub.ATTENTION_NUDGE_MAX, "the same run is never nudged a third time");
+  // A DIFFERENT run (a new `since`) is a new stall.
+  a.sessions[0].session.loop = { repeats: 4, tool: "Bash", since: t0 + 3 * B };
+  sweep(t0 + 4 * B);
+  assert.equal(nudges(host).length, 3);
+  hub.attentionNudged.clear();
+  delete agents[host];
 });
 
 test("XERK-1572: attentionNudged writes through and hydrates back, so a failover re-sends nothing", async () => {

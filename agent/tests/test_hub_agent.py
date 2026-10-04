@@ -38038,6 +38038,45 @@ class TestLoopSignal(unittest.TestCase):
             self.call(state, f"t{i}", tool="mcp__" + "x" * 200)
         self.assertEqual(len(ha.loop_report(state)["tool"]), ha.LOOP_TOOL_MAX)
 
+    def prompt(self, state, content, **extra):
+        ha._scan_loop_entry(dict({"type": "user", "message": {"role": "user", "content": content}},
+                                 **extra), state)
+
+    def test_a_new_prompt_rearms_the_run_but_keeps_its_since(self):
+        # The loop, then the turn ends (a `Host blocker:` line) and the operator
+        # answers: the next turn is not still looping. The same failure resumed
+        # later is the SAME run (its `since` kept), so the hub's two-nudge cap,
+        # keyed on it, still holds across the hub's own nudge.
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"t{i}")
+        since = ha.loop_report(state)["since"]
+        ha._scan_loop_entry({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Host blocker: npm ci cannot reach the registry."}]}}, state)
+        self.assertIsNotNone(ha.loop_report(state), "an assistant line is not a new turn")
+        self.prompt(state, "ok, leave it")
+        self.assertIsNone(ha.loop_report(state), "a new prompt is a new turn")
+        for i in range(ha.LOOP_REPEATS_MIN - 1):
+            self.call(state, f"u{i}", ts="2026-10-03T11:00:00Z")
+        self.assertIsNone(ha.loop_report(state))
+        self.call(state, "u9", ts="2026-10-03T11:00:00Z")
+        self.assertEqual(ha.loop_report(state),
+                         {"repeats": ha.LOOP_REPEATS_MIN, "tool": "Bash", "since": since})
+        # A list-content prompt re-arms too; a tool result, a meta entry, a
+        # compaction summary and a background task's notification do not.
+        self.prompt(state, [{"type": "text", "text": "try again"}])
+        self.assertIsNone(ha.loop_report(state))
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"v{i}")
+        for content, extra in (
+                ("<local-command-caveat>x</local-command-caveat>", {"isMeta": True}),
+                ("This session is being continued…", {"isCompactSummary": True}),
+                ("<task-notification><status>completed</status></task-notification>", {}),
+                ([{"type": "tool_result", "tool_use_id": "nope", "content": "x"}], {}),
+                ("   ", {})):
+            self.prompt(state, content, **extra)
+            self.assertIsNotNone(ha.loop_report(state), repr(content))
+
     def test_a_sidechain_is_not_the_sessions_own_loop(self):
         state = {}
         for i in range(ha.LOOP_REPEATS_MIN + 1):
@@ -38072,6 +38111,12 @@ class TestSessionReportLoop(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["loop"]["tool"], "Bash")
         # A beat that appended nothing still reports it (accumulated in state).
         self.assertEqual(ha.session_report(self.WORKDIR, state)["loop"], rep["loop"])
+        # Only while the turn runs: an ended turn (paneBusy False) is the
+        # operator's wait to read, not a loop; can't-tell (None) keeps it.
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+            self.assertIsNone(ha.session_report(self.WORKDIR, state, "agent-x")["loop"])
+        with mock.patch.object(ha, "_pane_status", return_value=(True, "auto", None)):
+            self.assertEqual(ha.session_report(self.WORKDIR, state, "agent-x")["loop"], rep["loop"])
 
 
 class TestAttentionHints(ManagerMixin, unittest.TestCase):
@@ -38206,6 +38251,35 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         self.beat(self.ended(ts="2026-10-03T10:09:00Z"), at=6000)
         self.assertEqual(self.sess["attentionHint"]["edgeTs"], 6000)
         self.assertNotIn("done", self.sess["attentionHint"])
+
+    def test_the_live_signals_name_the_current_edge(self):
+        # `attentionEdgeTs` rides the session's live signals every beat the session
+        # is on an edge, so the hub folds a verdict only on the edge it answers:
+        # a second dialog straight after the first gets a NEW one.
+        dialog = lambda detail: self.ended(paneBusy=True, panePrompt={
+            "prompt": "Do you want to proceed?", "detail": f"Bash command\n{detail}"})
+        a = dialog("git status")
+        self.beat(a, at=1000)
+        self.assertEqual(a["attentionEdgeTs"], 1000)
+        a2 = dialog("git status")
+        self.beat(a2, at=2000)
+        self.assertEqual(a2["attentionEdgeTs"], 1000, "the same dialog is the same edge")
+        b = dialog("git push --force origin main")
+        self.beat(b, at=3000)
+        self.assertEqual(b["attentionEdgeTs"], 3000)
+        busy = self.ended(paneBusy=True)
+        self.beat(busy, at=4000)
+        self.assertNotIn("attentionEdgeTs", busy, "no edge, nothing named")
+        # Back on the answered edge after a flicker: its own edgeTs again, which
+        # is the key the re-sent cached verdict carries.
+        b2 = dialog("git push --force origin main")
+        self.beat(b2, at=5000)
+        self.assertEqual(b2["attentionEdgeTs"], 3000)
+        # A session the classifier does not run for names nothing.
+        with mock.patch.object(ha, "ATTENTION_HINTS_ON", False):
+            off = dialog("ls")
+            self.beat(off, at=6000)
+        self.assertNotIn("attentionEdgeTs", off)
 
     def test_a_sleeping_session_is_no_edge(self):
         # Ended its turn to sleep through the session CLI's `wake`: the hub reads
