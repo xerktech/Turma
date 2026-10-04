@@ -12,8 +12,8 @@ paths:
 
 What the operator would otherwise open every session to learn, one card per org: what finished,
 what waits on them and why, what waits on time, what is stalled, what starts next and why, what a
-session closed as stale, and the subscription spend. **v1 is STRUCTURED — no model.** The narrative
-paragraph and the per-org decisions log are XERK-1574.
+session closed as stale, and the subscription spend. **The brief itself is STRUCTURED — no model.**
+v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisions log.
 
 ## One hub sweep, per-org records
 
@@ -127,3 +127,51 @@ paragraph and the per-org decisions log are XERK-1574.
   reported once, a merged PR + its Done ticket counting ONE row, the `briefDur` page parity, hold/reject + offline-host exclusion, the cadence + retention, the route, the
   sanitizer + restart restore); `nav.test.js`;
   `test_full_issue` (`resolved`) in `test_hub_agent.py`; android `BriefTest`, `AgentDecodeTest`.
+
+## v2: the narrative (XERK-1574)
+
+- **The hub has no model access, so an org HOST writes it.** `briefSweep` ends in
+  `requestBriefNarrative`: ONE online host of the org (`jiraHostPool`, so declared AND bound)
+  reporting `briefRender.available` gets `{type:"renderBrief", siteKey, briefAt, brief}`. The input
+  is `briefNarrativeInput` — the served brief minus ids/links — never a transcript. Agent side
+  (worker, lockdown, bounds): `agent-session-cli.md`.
+- **One request per org in flight** (`briefRenders`, in memory): a newer brief drops the older
+  undelivered command. A row is taken only from the host ASKED, for the brief ASKED about, while
+  that host is still decided into the org (`ingestBriefNarratives`) — a host cannot write another
+  org's summary, or one nobody asked for. A hub restart/failover mid-render just loses it.
+- **`sanitizeBrief` whitelists it**: `cleanBriefNarrative` (fences, tags, link syntax,
+  `* \` # ~ | < > [ ]`, list bullets and control/bidi chars stripped, whitespace collapsed, cut at
+  1200 on a word with "…"). A FIXED POINT, so a sanitized brief stays one (HA echo dedup). Empty =
+  absent, never "". `narrativeAt` rides only with a narrative.
+- **Strictly additive**: no capable host, a failed render, or an older agent = the brief stands as
+  v1. `briefWire` strips it from earlier briefs (headline-only). The push does not carry it (it
+  lands after the push fires).
+- **Both clients show it ABOVE the sections, labelled "Summary · written by a model from the
+  sections below"** (web `narrativeHtml`, Android `BriefBody`).
+
+## v2: the decisions log (XERK-1574)
+
+- **Store**: `/data/decisions.json` (`DECISIONS_FILE`), siteKey → oldest-first entries, 200 kept
+  (`DECISIONS_KEEP`, oldest evicted). Appended ONLY by operator actions — human rate, so a
+  `registerExternalStore` is right; HA rewrites ≤200 short rows per org per answer, not per beat.
+  `sanitizeDecision` is the one whitelist (`source` question|permission|note; `question` ≤300,
+  `answer` ≤200, `text` ≤500; inline literals; null-proto map; a coerce fixed point).
+- **Writers, always under the DECIDED org (`decidedOrgOf`), never the claimed siteKey**:
+  - the answer route → `{question, answer}` = the session's served `question` + the picked
+    `questionOptions` labels (1-based "option N" fallback) + any typed answer;
+  - the pane-prompt route → the dialog's prompt + `permissionWhy` + the picked option's label;
+  - `POST /api/orgs/<site>/decisions {text}` (operator-authed, 400 empty / 413 >500 / 404 an org no
+    host is decided into, minting no key).
+  - Nothing is logged for a drifted/unbound host, an unknown session, or no pending question. It is
+    logged at the ANSWER, so an answer the agent later drops as stale is still recorded.
+- **Delivery**: top-level `decisions` on `/api/agents` + its `decisions` SSE frame (each org's
+  newest 20, `decisionsWire`), and on EVERY heartbeat reply as `decisions:{org, entries}` (the
+  decided org's newest 30; `org:""` + none for a host in no decided org, which removes its file).
+- **`briefTick` drops an org's log** `BRIEF_RETAIN_MS` past its newest entry once no host is in it.
+- **Android TYPES both** (`OrgDecision`, `OrgBrief.narrative`, every field defaulted) — a new field
+  is a `sanitizeDecision`/`sanitizeBrief` line AND a Kotlin field in the same change.
+- **Surfaces**: web `decisionsHtml` (newest 10, newest first, the note box for a live org; a draft
+  survives repaints via `drafts` + a focus restore); Android `BriefDecisions` read-only (composer
+  web-only, `android/PARITY.md`).
+- Tests: the `XERK-1574:` cases in `server.test.js`, `brief-page.test.js`, android `BriefTest`,
+  `AgentDecodeTest`.

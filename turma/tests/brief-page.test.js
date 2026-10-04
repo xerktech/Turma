@@ -62,3 +62,66 @@ test("brief.html: an unraced snapshot still replaces the briefs", async () => {
   await done;
   assert.equal(p.getCache().briefs["a.net"][0].id, 3);
 });
+
+// ---- XERK-1574: the narrative + the decisions log on the page ------------------
+
+function loadDecisionsPage() {
+  const refreshSrc = slice("let briefsClock = 0;", "\n  if (cache) render(cache);\n}\n");
+  const handler = slice('es.addEventListener("decisions", (e) => {', "\n  });");
+  const handlerFn = handler.slice('es.addEventListener("decisions", '.length, -");".length);
+  let pending = null;
+  const fetch = () => new Promise((resolve) => {
+    pending = (body) => resolve({ status: 200, json: async () => body });
+  });
+  const factory = new Function("fetch", "render", "location", `
+    let cache = null;
+    ${refreshSrc}
+    const onDecisions = ${handlerFn};
+    return { refresh, onDecisions, setCache: (c) => { cache = c; }, getCache: () => cache };`);
+  const page = factory(fetch, () => {}, {});
+  page.answer = (body) => pending(body);
+  return page;
+}
+
+test("brief.html: a decisions frame that lands mid-fetch survives the older snapshot (XERK-1574)", async () => {
+  const p = loadDecisionsPage();
+  p.setCache({ agents: [], briefs: {}, decisions: { "a.net": [{ text: "old" }] } });
+  const done = p.refresh();
+  p.onDecisions({ data: JSON.stringify({ "a.net": [{ text: "new" }] }) });
+  p.answer({ agents: [], briefs: {}, decisions: { "a.net": [{ text: "old" }] } });
+  await done;
+  assert.equal(p.getCache().decisions["a.net"][0].text, "new");
+});
+
+function loadRenderers() {
+  const src = slice("function narrativeHtml(b) {", "\n// `live` = a host is decided");
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  return new Function("esc", "ago", "drafts", "noteBusy",
+    `${src}\nreturn { narrativeHtml, decisionsHtml };`)(
+    esc, (ms, now) => `${Math.round((now - ms) / 1000)}s`,
+    new Map([["a.net", "half <typed>"]]), new Set());
+}
+
+test("brief.html: the summary is labelled, escaped, and absent without a narrative (XERK-1574)", () => {
+  const { narrativeHtml } = loadRenderers();
+  assert.equal(narrativeHtml({}), "");
+  assert.equal(narrativeHtml(null), "");
+  const html = narrativeHtml({ narrative: "Two <b>shipped</b>." });
+  assert.match(html, /Summary · written by a model/);
+  assert.ok(html.includes("Two &#60;b&#62;shipped&#60;/b&#62;."));
+});
+
+test("brief.html: the decisions tail is newest first, escaped, a composer only for a live org (XERK-1574)", () => {
+  const { decisionsHtml } = loadRenderers();
+  const list = [
+    { at: 1000, source: "question", question: "Which <DB>?", answer: "PG", ticket: "X-1", host: "h" },
+    { at: 2000, source: "note", text: "No infra merges." },
+  ];
+  const html = decisionsHtml("a.net", list, 5000, true);
+  assert.ok(html.indexOf("No infra merges.") < html.indexOf("Which &#60;DB&#62;?"), "newest first");
+  assert.match(html, /data-note="a\.net"/);
+  assert.ok(html.includes('value="half &#60;typed&#62;"'), "the draft survives a repaint");
+  assert.equal(decisionsHtml("a.net", list, 5000, false).includes("data-note"), false);
+  assert.equal(decisionsHtml("a.net", [], 5000, false), "", "nothing to show, nowhere to add");
+  assert.match(decisionsHtml("a.net", [], 5000, true), /No decisions recorded yet/);
+});

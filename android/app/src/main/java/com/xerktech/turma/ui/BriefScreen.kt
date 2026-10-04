@@ -35,8 +35,10 @@ import com.xerktech.turma.core.briefSection
 import com.xerktech.turma.core.briefSectionCount
 import com.xerktech.turma.core.briefSpendWindow
 import com.xerktech.turma.core.orgName
+import com.xerktech.turma.core.briefDecisionLines
 import com.xerktech.turma.model.BriefItem
 import com.xerktech.turma.model.OrgBrief
+import com.xerktech.turma.model.OrgDecision
 import com.xerktech.turma.ui.theme.TurmaColors
 import com.xerktech.turma.vm.BriefViewModel
 
@@ -86,6 +88,7 @@ fun BriefScreen(
                     busy = site in busy,
                     canBrief = site in live,
                     error = errors[site],
+                    decisions = fleet.decisions[site].orEmpty(),
                     onBriefNow = { vm.briefNow(site) },
                     onOpenChat = onOpenChat,
                     onOpenEnded = onOpenEnded,
@@ -104,6 +107,7 @@ private fun OrgBriefCard(
     busy: Boolean,
     canBrief: Boolean,
     error: String?,
+    decisions: List<OrgDecision>,
     onBriefNow: () -> Unit,
     onOpenChat: (String, String) -> Unit,
     onOpenEnded: (String, String) -> Unit,
@@ -147,6 +151,31 @@ private fun OrgBriefCard(
             } else {
                 BriefBody(brief, earlier, now, onOpenChat, onOpenEnded)
             }
+            BriefDecisions(decisions, now)
+        }
+    }
+}
+
+/**
+ * The org's decisions log (XERK-1574) — web `decisionsHtml`: the newest few,
+ * newest first. Read-only here; recording a note is web-only (android/PARITY.md).
+ */
+@Composable
+private fun BriefDecisions(decisions: List<OrgDecision>, now: Long) {
+    if (decisions.isEmpty()) return
+    Column {
+        Text(
+            "DECISIONS  ${decisions.size}",
+            style = MaterialTheme.typography.labelMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
+        )
+        for ((title, meta) in briefDecisionLines(decisions, now)) {
+            Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+                Text(title, style = MaterialTheme.typography.bodyMedium)
+                Text(meta, style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
     }
 }
@@ -161,6 +190,20 @@ private fun BriefBody(
     onOpenEnded: (String, String) -> Unit,
 ) {
     Column {
+        // The model-written summary (XERK-1574), labelled as such, above the
+        // sections it was written from — web `narrativeHtml`.
+        val narrative = brief.narrative
+        if (!narrative.isNullOrBlank()) {
+            Column(Modifier.fillMaxWidth().padding(top = 10.dp)) {
+                Text(
+                    "SUMMARY · WRITTEN BY A MODEL FROM THE SECTIONS BELOW",
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(narrative, style = MaterialTheme.typography.bodyMedium,
+                    modifier = Modifier.padding(top = 2.dp))
+            }
+        }
         FlowRow(
             Modifier.fillMaxWidth().padding(top = 10.dp),
             horizontalArrangement = Arrangement.spacedBy(18.dp),

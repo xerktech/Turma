@@ -595,6 +595,11 @@ const EPIC_BUILDERS_FILE = process.env.EPIC_BUILDERS_FILE || "/data/epic-builder
 // write per org per BRIEF_INTERVAL_MIN, plus an operator's on-demand one), so it
 // is a registerExternalStore like epicRuns, not a high-churn ledger.
 const BRIEFS_FILE = process.env.BRIEFS_FILE || "/data/briefs.json";
+// The per-org decisions log (XERK-1574): siteKey -> its last 200 operator
+// decisions. Appended only by OPERATOR actions (an answered question, an answered
+// permission dialog, a typed note) — human-rate writes, so it is a
+// registerExternalStore like briefs; the churn rule bites per-beat data.
+const DECISIONS_FILE = process.env.DECISIONS_FILE || "/data/decisions.json";
 const OFFLINE_AFTER_MS = 75 * 1000; // heartbeats arrive every ~20s
 // An agent about to restart for an EXPECTED reason (an image update recreating
 // its container, or the native updater swapping files) POSTs /updating just
@@ -3250,6 +3255,14 @@ function sanitizeBrief(v) {
     out[k] = (Array.isArray(v[k]) ? v[k] : []).map(sanitizeBriefItem).filter(Boolean).slice(0, 10);
   }
   out.spend = (Array.isArray(v.spend) ? v.spend : []).map(sanitizeBriefSpend).filter(Boolean).slice(0, 10);
+  // The model-written summary (XERK-1574), when a host rendered one: plain text
+  // only, re-cleaned here on every write/restore (cleanBriefNarrative is a fixed
+  // point), and absent — never "" — when there is none, so v1 renders unchanged.
+  const narrative = cleanBriefNarrative(v.narrative);
+  if (narrative) {
+    out.narrative = narrative;
+    if (Number.isSafeInteger(v.narrativeAt) && v.narrativeAt > 0) out.narrativeAt = v.narrativeAt;
+  }
   // Hub-internal bookkeeping, never on the wire (briefWire strips both): the
   // digest of the FULL needs-you set (the push compares it — the lists above are
   // cut at 10), and every merged PR URL a brief already reported, carried forward
@@ -3275,8 +3288,38 @@ function briefWire(b, full) {
   if (!full) {
     for (const k of BRIEF_SECTIONS) out[k] = [];
     out.spend = [];
+    delete out.narrative;
+    delete out.narrativeAt;
   }
   return out;
+}
+// The brief's model-written summary (XERK-1574), as the hub keeps and serves it:
+// ONE paragraph of plain text, at most 1200 characters. The agent cleans its
+// model's reply the same way, but the hub is the whitelist — markup (fences,
+// tags, link syntax, emphasis/heading/table characters, list bullets) and
+// control/bidi characters go, whitespace collapses to single spaces, and an
+// over-long text is cut on a word with "…". A FIXED POINT (cleaning a cleaned
+// text changes nothing), so a sanitized brief stays one for HA's echo dedup.
+// Inline literals: sanitizeBrief runs at module-init (TDZ).
+function cleanBriefNarrative(v) {
+  if (typeof v !== "string" || !v) return "";
+  let s = v.slice(0, 20000)
+    .replace(/```[^\n]*/g, " ")
+    .replace(/<[^>\n]*>/g, " ")
+    .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
+    .replace(/[*`#~|<>[\]]/g, "")
+    .split("\n")
+    .map((l) => l.replace(/^\s*(?:(?:[-+]|\d+[.)])(?:\s+|$))+/, ""))
+    .join(" ")
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (s.length > 1200) {
+    const cut = s.slice(0, 1199);
+    const sp = cut.lastIndexOf(" ");
+    s = `${(sp > 900 ? cut.slice(0, sp) : cut).trimEnd()}…`;
+  }
+  return s;
 }
 function briefsWire() {
   const out = {};
@@ -3298,6 +3341,50 @@ let briefs = briefsCoerce(readJsonFile(BRIEFS_FILE));
 const persistBriefs = registerExternalStore({
   name: "briefs", file: BRIEFS_FILE,
   coerce: briefsCoerce, read: () => briefs, install: (v) => { briefs = v; },
+});
+
+// ---- the per-org decisions log (XERK-1574) ------------------------------------
+// siteKey -> that org's last 200 operator decisions, OLDEST FIRST. Appended by the
+// answer-question and pane-prompt routes (the question + the chosen option) and by
+// a typed note (POST /api/orgs/<site>/decisions), always under the answering
+// host's DECIDED org. A human-rate store (one write per operator action), so a
+// registerExternalStore is the right home — the churn rule bites per-beat data,
+// and HA's whole-value rewrite of ≤200 short rows per org is cheap at that rate.
+// sanitizeDecision is the ONE whitelist (compose, restore, a remote watch); inline
+// literal bounds (module-init TDZ); null-prototype map (XERK-1451).
+const DECISION_SOURCES = new Set(["question", "permission", "note"]);
+function sanitizeDecision(v) {
+  if (!v || typeof v !== "object" || Array.isArray(v)) return null;
+  if (!Number.isSafeInteger(v.at) || v.at <= 0) return null;
+  if (typeof v.source !== "string" || !DECISION_SOURCES.has(v.source)) return null;
+  const str = (x, n) => (typeof x === "string" ? x.slice(0, n).trim() : "");
+  const out = { at: v.at, source: v.source };
+  const id = str(v.id, 32);
+  if (/^[0-9a-f]{1,32}$/.test(id)) out.id = id;
+  for (const [k, n] of [["question", 300], ["answer", 200], ["text", 500], ["host", 200],
+    ["sessionId", 100], ["ticket", 64], ["label", 200]]) {
+    const s = str(v[k], n);
+    if (s) out[k] = s;
+  }
+  // A note IS its text; an answer is a question and what was chosen.
+  if (out.source === "note" ? !out.text : !(out.question && out.answer)) return null;
+  return out;
+}
+const decisionsCoerce = (raw) => {
+  const out = Object.create(null);
+  if (raw && typeof raw === "object" && !Array.isArray(raw)) {
+    for (const [site, list] of Object.entries(raw).slice(0, 100)) {
+      if (!site || site.length > 200 || !Array.isArray(list)) continue;
+      const kept = list.map(sanitizeDecision).filter(Boolean).slice(-200);
+      if (kept.length) out[site] = kept;
+    }
+  }
+  return out;
+};
+let decisions = decisionsCoerce(readJsonFile(DECISIONS_FILE));
+const persistDecisions = registerExternalStore({
+  name: "decisions", file: DECISIONS_FILE,
+  coerce: decisionsCoerce, read: () => decisions, install: (v) => { decisions = v; },
 });
 // Which hosts of an org report a repo by name — CLONED (on-disk `repos[]`) OR
 // merely LISTED among the org's triaged `jira.repoOptions` (a gh-clonable repo no
@@ -4992,6 +5079,10 @@ function buildAgentsCache() {
     // TYPES it; clients scope it by the header org filter like every org surface.
     // The newest brief per org in full, earlier ones as headlines (briefWire).
     briefs: briefsWire(),
+    // The per-org decisions log (XERK-1574): siteKey -> its newest operator
+    // decisions, oldest first (decisionsWire's tail). Hub-owned, sanitized on every
+    // write/restore (sanitizeDecision) because Android TYPES it.
+    decisions: decisionsWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -7020,6 +7111,21 @@ function normalizeCloseTicket(payload) {
   payload.closeTicket = { available: t.available === true };
 }
 
+// The brief-narrative (XERK-1574) capability block: whether this host's manager
+// runs a `renderBrief` command. Only a host reporting it is asked to write an
+// org's summary — an older agent would ack the command and never answer. Coerced
+// like normalizeCloseTicket: strictly boolean, unusable becomes NULL, ABSENT stays
+// absent ("this host can't").
+function normalizeBriefRender(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.briefRender;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("briefRender" in payload) payload.briefRender = null;
+    return;
+  }
+  payload.briefRender = { available: t.available === true };
+}
+
 // This host's EFFECTIVE default runtime for an unpinned spawn (XERK-521), coerced
 // at ingest exactly like normalizeQwen/normalizeDsh and for the same reason: it
 // is agent-supplied, a client may TYPE it, and `/api/agents` decodes atomically
@@ -8389,6 +8495,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
   "spawnFailures", "epicBuilderStatus", "permissionEvents", "attentionHints",
+  "briefRender", "briefNarratives",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -8778,6 +8885,7 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeTriage(a);
   normalizeTrajectory(a);
   normalizeCloseTicket(a);
+  normalizeBriefRender(a);
   normalizeDefaultRuntime(a);
   normalizeHostOs(a);
   normalizeTokenRoll(a);
@@ -14859,7 +14967,163 @@ function briefSweep(siteKey, trigger = "scheduled", now = Date.now()) {
   invalidateAgentsCache();
   sseBroadcast("briefs", briefsWire());
   briefPush(brief, prevList[0] || null);
+  requestBriefNarrative(brief);
   return brief;
+}
+
+// ---- the brief's narrative (XERK-1574) ----------------------------------------
+// The hub has no model access, so a fresh brief asks ONE online host of its org
+// (one reporting `briefRender.available`) to write a short plain-text summary of
+// it: a `renderBrief` command carrying the structured brief alone — never a
+// transcript — which the agent runs through a locked-down Haiku `claude -p` off
+// its beat and hands back as a `briefNarratives` row. ONE request per org in
+// flight (a newer brief replaces an undelivered older one); only the host asked,
+// for the brief asked about, still in that org, can answer it. No capable host,
+// a failed render, or a hub restart mid-render just leaves the brief without one.
+const briefRenders = new Map(); // siteKey -> {host, at, cmdId}
+
+// The structured brief the model summarises: the served shape minus the ids and
+// links a summary has no use for (they cost tokens and invite the model to quote
+// them).
+function briefNarrativeInput(b) {
+  const out = briefWire(b, true);
+  delete out.narrative;
+  delete out.narrativeAt;
+  for (const k of BRIEF_SECTIONS) {
+    out[k] = out[k].map((it) => {
+      const o = { ...it };
+      for (const drop of ["url", "prUrl", "sessionId", "transcriptId"]) delete o[drop];
+      return o;
+    });
+  }
+  return out;
+}
+
+function requestBriefNarrative(brief) {
+  const siteKey = brief.siteKey;
+  const host = jiraHostPool(siteKey, true).find((k) => {
+    const a = agents[k];
+    return a && a.briefRender && a.briefRender.available === true;
+  });
+  const prev = briefRenders.get(siteKey);
+  if (prev) dropQueuedCommand(prev.host, prev.cmdId, "renderBrief");
+  briefRenders.delete(siteKey);
+  if (!host) return null;
+  const cmdId = queueCommand(host, { type: "renderBrief", siteKey, briefAt: brief.at,
+    brief: briefNarrativeInput(brief) });
+  briefRenders.set(siteKey, { host, at: brief.at, cmdId });
+  return cmdId;
+}
+
+// Fold the agents' `briefNarratives` rows onto their briefs. A row is taken only
+// from the host the hub asked, for the brief it asked about, while that host is
+// still decided into the org — so no host can write another org's summary, or a
+// summary nobody asked for. The text is re-cleaned (sanitizeBrief is the
+// whitelist); an empty one leaves the brief as it was.
+function ingestBriefNarratives(key, rows, now = Date.now()) {
+  if (!Array.isArray(rows)) return false;
+  let changed = false;
+  for (const r of rows.slice(0, 5)) {
+    if (!r || typeof r !== "object" || Array.isArray(r)) continue;
+    const { siteKey, briefAt } = r;
+    if (typeof siteKey !== "string" || !Number.isSafeInteger(briefAt)) continue;
+    const want = briefRenders.get(siteKey);
+    if (!want || want.host !== key || want.at !== briefAt) continue;
+    if (!agents[key] || decidedOrgOf(agents[key]) !== siteKey) continue;
+    briefRenders.delete(siteKey);
+    const list = briefs[siteKey] || [];
+    const i = list.findIndex((b) => b.at === briefAt);
+    if (i < 0) continue;
+    const next = sanitizeBrief({ ...list[i], narrative: r.text, narrativeAt: now });
+    if (!next || !next.narrative) continue;
+    briefs[siteKey] = list.map((b, j) => (j === i ? next : b));
+    changed = true;
+  }
+  if (changed) {
+    persistBriefs();
+    invalidateAgentsCache();
+    sseBroadcast("briefs", briefsWire());
+  }
+  return changed;
+}
+
+// ---- the decisions log's writers + readers (XERK-1574) ------------------------
+const DECISIONS_KEEP = 200;        // decisionsCoerce inlines the same 200 (module-init TDZ)
+const DECISIONS_WIRE_TAIL = 20;    // per org on /api/agents + the SSE frame
+const DECISIONS_REPLY_TAIL = 30;   // per heartbeat reply, rendered agent-side
+const DECISION_NOTE_MAX = 500;
+
+// Append one decision to an org's log (oldest evicted past DECISIONS_KEEP). The
+// caller decided the org — always a DECIDED org, never a claimed siteKey.
+function appendDecision(siteKey, entry, now = Date.now()) {
+  if (typeof siteKey !== "string" || !siteKey) return null;
+  const d = sanitizeDecision({ ...entry, id: crypto.randomBytes(6).toString("hex"), at: now });
+  if (!d) return null;
+  decisions[siteKey] = [...(decisions[siteKey] || []), d].slice(-DECISIONS_KEEP);
+  persistDecisions();
+  invalidateAgentsCache();
+  sseBroadcast("decisions", decisionsWire());
+  return d;
+}
+
+// What an operator answer to a session records: the question as the hub saw it on
+// the session's last beat, and the option the operator chose. Nothing is recorded
+// for a host in no decided org, a session the hub cannot see, or a session with
+// no pending question/dialog — the log holds what the operator decided, never a
+// guess. Logged at the answer, so an answer the agent then drops as stale (the
+// dialog moved on) is still the operator's decision.
+function recordAnswerDecision(key, sessionId, kind, answer) {
+  const a = agents[key];
+  const org = a ? decidedOrgOf(a) : "";
+  if (!org) return null;
+  const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
+  if (!s) return null;
+  const live = s.session && typeof s.session === "object" ? s.session : {};
+  let question = "";
+  if (kind === "question") {
+    question = typeof live.question === "string" ? live.question : "";
+  } else {
+    const pp = live.panePrompt;
+    const prompt = pp && typeof pp.prompt === "string" ? pp.prompt : "";
+    const why = prompt ? permissionWhy(pp) : "";
+    question = why && why !== prompt ? `${prompt} — ${why}` : prompt;
+  }
+  if (!question || !answer) return null;
+  const ticket = s.ticket && typeof s.ticket.key === "string" ? s.ticket.key : undefined;
+  const label = typeof s.summary === "string" && s.summary ? s.summary
+    : (typeof s.label === "string" ? s.label : undefined);
+  return appendDecision(org, { source: kind, question, answer, host: key, sessionId, ticket, label });
+}
+
+// The chosen option's own words: the labels the session offered for each picked
+// index (1-based fallback when a label is missing), then any typed answer.
+function questionAnswerText(a, sessionId, picks, custom) {
+  const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
+  const labels = s && s.session && Array.isArray(s.session.questionOptions) ? s.session.questionOptions : [];
+  const out = picks.map((i) => (typeof labels[i] === "string" && labels[i] ? labels[i] : `option ${i + 1}`));
+  if (custom.trim()) out.push(custom.trim());
+  return out.join("; ");
+}
+function panePromptAnswerText(a, sessionId, n) {
+  const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
+  const pp = s && s.session && s.session.panePrompt;
+  const opt = pp && Array.isArray(pp.options) ? pp.options.find((o) => o && o.number === n) : null;
+  return opt && typeof opt.label === "string" && opt.label ? opt.label : `option ${n}`;
+}
+
+// The served log: each org's newest DECISIONS_WIRE_TAIL, oldest first.
+function decisionsWire() {
+  const out = {};
+  for (const [site, list] of Object.entries(decisions)) out[site] = list.slice(-DECISIONS_WIRE_TAIL);
+  return out;
+}
+
+// What one heartbeat reply hands the agent to render as its org's decisions file:
+// its DECIDED org (never the claimed siteKey) and that org's newest entries. A host
+// in no decided org gets `org: ""` and no entries, so its file goes away.
+function decisionsReplyFor(key) {
+  const org = agents[key] ? decidedOrgOf(agents[key]) : "";
+  return { org, entries: org ? (decisions[org] || []).slice(-DECISIONS_REPLY_TAIL) : [] };
 }
 
 // The cadence gate, on the leader's orchestration tick: an org gets a fresh brief
@@ -14881,6 +15145,20 @@ function briefTick(now = Date.now()) {
     persistBriefs();
     invalidateAgentsCache();
     sseBroadcast("briefs", briefsWire());
+  }
+  // The decisions log ages out the same way (XERK-1574): kept BRIEF_RETAIN_MS past
+  // its newest entry once no host is decided into the org.
+  let prunedDecisions = false;
+  for (const [siteKey, list] of Object.entries(decisions)) {
+    const newest = (list && list.length && list[list.length - 1].at) || 0;
+    if (orgs.has(siteKey) || now - newest < BRIEF_RETAIN_MS) continue;
+    delete decisions[siteKey];
+    prunedDecisions = true;
+  }
+  if (prunedDecisions) {
+    persistDecisions();
+    invalidateAgentsCache();
+    sseBroadcast("decisions", decisionsWire());
   }
   for (const siteKey of orgs) {
     const last = (briefs[siteKey] || [])[0];
@@ -17211,6 +17489,10 @@ const server = http.createServer(async (req, res) => {
       // into each session's attention by heartbeatAlerts, never stored raw.
       const attentionHints = normalizeAttentionHints(payload.attentionHints);
       delete payload.attentionHints;
+      // The brief narratives this host rendered (XERK-1574) — folded onto their
+      // briefs below (ingestBriefNarratives checks the hub asked), never stored.
+      const briefNarratives = payload.briefNarratives;
+      delete payload.briefNarratives;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -17509,6 +17791,12 @@ const server = http.createServer(async (req, res) => {
         enforceCacheTotalBudget();
       }
       heartbeatAlerts(key, prev, next, attentionHints);
+      // A brief summary this host was asked for (XERK-1574). Never worth the beat.
+      try {
+        ingestBriefNarratives(key, briefNarratives);
+      } catch (e) {
+        console.error(`brief narrative ingest failed: ${e && e.message}`);
+      }
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
       // the handoff (kill source, mark done) now rather than waiting out the
@@ -17573,11 +17861,14 @@ const server = http.createServer(async (req, res) => {
       // should ship a cheap INVENTORY and let the hub choose what to push, rather
       // than guess with an in-RAM rotation. A hub rollback (marker gone) reverts
       // the agent to the manifest path within one refresh beat.
+      // The org's decisions log (XERK-1574) rides every reply like the roster,
+      // keyed on the DECIDED org; the agent renders it to ~/.turma/decisions-<org>.md.
+      const decisionsTail = decisionsReplyFor(key);
       return json(res, 200, archiveHave
-        ? { commands: reply, peers, bodyMax, archiveOffer: "hub", archiveHave,
-            archiveShed, archiveFull, archiveRawHave, archiveRawSkip,
+        ? { commands: reply, peers, decisions: decisionsTail, bodyMax, archiveOffer: "hub",
+            archiveHave, archiveShed, archiveFull, archiveRawHave, archiveRawSkip,
             archiveChunkMax: ARCHIVE_CHUNK_BODY_MAX }
-        : { commands: reply, peers, bodyMax, archiveOffer: "hub" });
+        : { commands: reply, peers, decisions: decisionsTail, bodyMax, archiveOffer: "hub" });
     }
 
     // POST /api/agents/<host>/updating — an agent announcing an EXPECTED restart
@@ -19051,6 +19342,11 @@ const server = http.createServer(async (req, res) => {
         if (optionIndices && optionIndices.length) cmd.optionIndices = optionIndices;
         if (custom) cmd.custom = custom;
         const cmdId = queueCommand(key, cmd);
+        // The org's decisions log (XERK-1574): the question + what was chosen.
+        const picks = optionIndices && optionIndices.length ? optionIndices
+          : (optionIndex >= 0 ? [optionIndex] : []);
+        recordAnswerDecision(key, sessionId, "question",
+          questionAnswerText(agents[key], sessionId, picks, custom));
         return json(res, 200, { ok: true, cmdId });
       }
       // POST /api/agents/<host>/sessions/<id>/pane-prompt -> answer the blocking
@@ -19066,6 +19362,9 @@ const server = http.createServer(async (req, res) => {
           return json(res, 400, { error: "optionNumber 1-9 required" });
         }
         const cmdId = queueCommand(key, { type: "answerPanePrompt", sessionId, optionNumber });
+        // The org's decisions log (XERK-1574): the dialog + the option picked.
+        recordAnswerDecision(key, sessionId, "permission",
+          panePromptAnswerText(agents[key], sessionId, optionNumber));
         return json(res, 200, { ok: true, cmdId });
       }
       // GET /api/agents/<host>/sessions/<id>/history -> that session's recent
@@ -20043,6 +20342,29 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, { ok: true, brief: briefWire(briefSweep(siteKey, "manual"), true) });
     }
 
+    // POST /api/orgs/<siteKey>/decisions {text} — record an operator decision in
+    // that org's log by hand (XERK-1574), beside the ones the answer routes record.
+    // Operator-authed, authoritative on the 200 (returns the entry; it also rides
+    // /api/agents + the `decisions` SSE frame and the org's next heartbeat replies).
+    // The org must be one a host is DECIDED into, so a refusal mints no store key.
+    if (req.method === "POST" && parts[0] === "api" && parts[1] === "orgs" &&
+        parts.length === 4 && parts[3] === "decisions") {
+      const siteKey = decodeURIComponent(parts[2]);
+      const body = JSON.parse((await readBody(req)) || "{}");
+      const text = typeof body.text === "string" ? body.text.trim() : "";
+      if (!text) return json(res, 400, { error: "text required" });
+      if (text.length > DECISION_NOTE_MAX) {
+        return json(res, 413, {
+          error: `note too long — ${text.length.toLocaleString("en-US")} characters, the limit is ${DECISION_NOTE_MAX}`,
+          limit: DECISION_NOTE_MAX,
+        });
+      }
+      if (!briefOrgs().has(siteKey)) {
+        return json(res, 404, { error: "no host is in that org" });
+      }
+      return json(res, 200, { ok: true, decision: appendDecision(siteKey, { source: "note", text }) });
+    }
+
     // POST /api/jira/<siteKey>/automerge — flip an org's hands-off auto-merge
     // opt-in (XERK-550). Body: {enabled:true|false}. Same posture as /autostart:
     // hub-owned durable state, authoritative on return, the org must be one the
@@ -20796,6 +21118,7 @@ if (process.env.TURMA_TEST) {
       epicRuns: () => epicRuns,
       epicBuilders: () => epicBuilders,
       briefs: () => briefs,
+      decisions: () => decisions,
     },
     // XERK-756: the HA fleet-registry externalization. Exported so tests can
     // inject a FileLiveStore as the shared store (a real Valkey can't run in CI),
@@ -20891,6 +21214,7 @@ if (process.env.TURMA_TEST) {
     normalizeTriage,
     normalizeTrajectory,
     normalizeCloseTicket,
+    normalizeBriefRender,
     autoCloseMergedMessage,
     ingestTrajectoryTails,
     liveSessionForTranscript,
@@ -21249,6 +21573,9 @@ if (process.env.TURMA_TEST) {
     // The per-org brief (XERK-1573). `briefs` is a getter: a restore/watch
     // install REPLACES the map.
     getBriefs: () => briefs,
+    getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
+    decisionsWire, decisionsReplyFor, cleanBriefNarrative, requestBriefNarrative,
+    ingestBriefNarratives, briefRenders, briefNarrativeInput,
     briefsCoerce, sanitizeBrief, compileBrief, briefSweep, briefTick, briefNeedsYouSig,
     briefDur, briefNextReason,
     autoStartCandidates, BRIEF_INTERVAL_MS,

@@ -4876,7 +4876,11 @@ test("http: command queue rides the reply until acked", async () => {
   // `archiveOffer:"hub"` rides EVERY reply (XERK-431) so a fresh agent learns to
   // ship an inventory and let the hub choose what to archive, before its first
   // archive beat — present even with no archiveHave, as here.
-  assert.deepEqual(Object.keys(res.body).sort(), ["archiveOffer", "bodyMax", "commands", "peers"]);
+  // `decisions` rides every reply too (XERK-1574): the host's decided org's log
+  // tail, `org: ""` here — an absent key would remove the agent's file anyway.
+  assert.deepEqual(Object.keys(res.body).sort(),
+    ["archiveOffer", "bodyMax", "commands", "decisions", "peers"]);
+  assert.deepEqual(res.body.decisions, { org: "", entries: [] });
   assert.equal(res.body.archiveOffer, "hub");
   assert.deepEqual(res.body.commands, []);
   assert.deepEqual(res.body.peers, []);
@@ -23306,6 +23310,223 @@ test("XERK-1573: briefTick drops an org with no host once its briefs are old", a
   assert.equal(hub.getBriefs()[S].length, 1, "kept a while: a quiet host may come back");
   hub.briefTick(now + 31 * 24 * 3600 * 1000);
   assert.equal(S in hub.getBriefs(), false, "dropped past the retention");
+  for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
+});
+
+// ---- XERK-1574: the brief narrative + the per-org decisions log ---------------
+
+// One host's beat in an org, with whatever else the test needs on it.
+async function beat1574(device, site, extra = {}) {
+  return request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device,
+    jira: { available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+      fetchedAt: new Date().toISOString(), tickets: [] },
+    ...extra,
+  } });
+}
+const renderCmds = (host) => (agents[host].commands || []).filter((c) => c.type === "renderBrief");
+
+test("XERK-1574: a brief asks ONE capable host of its org for a narrative, and only its answer lands", async () => {
+  const S = "nrA1574.atlassian.net";
+  const T = "nrB1574.atlassian.net";
+  await beat1574("nrCapable", S, { briefRender: { available: true } });
+  await beat1574("nrOld", S);                                       // no capability
+  await beat1574("nrOther", T, { briefRender: { available: true } });
+  const b = hub.briefSweep(S, "manual");
+  assert.equal(renderCmds("nrOld").length, 0, "an agent that cannot answer is never asked");
+  assert.equal(renderCmds("nrOther").length, 0, "another org's host is never asked");
+  const [cmd] = renderCmds("nrCapable");
+  assert.equal(cmd.siteKey, S);
+  assert.equal(cmd.briefAt, b.at);
+  // The input is the structured brief alone — no ids/links, never a transcript.
+  assert.equal(cmd.brief.siteKey, S);
+  assert.deepEqual(Object.keys(cmd.brief.counts).sort(), Object.keys(b.counts).sort());
+  assert.ok(!JSON.stringify(cmd.brief).includes("sessionId"));
+  assert.equal("narrative" in cmd.brief, false);
+
+  const row = (text, extra = {}) => ({ siteKey: S, briefAt: b.at, text, ...extra });
+  // Another org's host, a wrong brief, and a forged siteKey are all ignored.
+  await beat1574("nrOther", T, { briefNarratives: [row("forged by another org")] });
+  await beat1574("nrCapable", S, { briefNarratives: [row("wrong brief", { briefAt: b.at - 1 })] });
+  assert.equal("narrative" in hub.getBriefs()[S][0], false);
+  // The asked host's answer lands, cleaned to one plain paragraph.
+  await beat1574("nrCapable", S, { briefNarratives: [row("## Brief\n- **XERK-1** shipped.\n<script>x</script>")] });
+  const kept = hub.getBriefs()[S][0];
+  assert.equal(kept.narrative, "Brief XERK-1 shipped. x");
+  assert.ok(Number.isSafeInteger(kept.narrativeAt));
+  assert.equal((await fleet()).briefs[S][0].narrative, "Brief XERK-1 shipped. x");
+  // Answered once: a second row for the same brief changes nothing.
+  await beat1574("nrCapable", S, { briefNarratives: [row("again")] });
+  assert.equal(hub.getBriefs()[S][0].narrative, "Brief XERK-1 shipped. x");
+  // A newer brief replaces the request; the earlier brief's narrative leaves the wire.
+  hub.briefSweep(S, "manual", Date.now() + 1000);
+  assert.equal(renderCmds("nrCapable").length, 1, "one request per org in flight");
+  const wire = (await fleet()).briefs[S];
+  assert.equal("narrative" in wire[1], false, "an earlier brief is served headline-only");
+  assert.equal(hub.getBriefs()[S][1].narrative, "Brief XERK-1 shipped. x", "kept in the store");
+  for (const h of ["nrCapable", "nrOld", "nrOther"]) delete agents[h];
+  for (const k of [S, T]) delete hub.getBriefs()[k];
+  hub.briefRenders.clear();
+});
+
+test("XERK-1574: a brief with no capable host stands without a narrative", async () => {
+  const S = "nrC1574.atlassian.net";
+  await beat1574("nrNone", S);
+  const b = hub.briefSweep(S, "manual");
+  assert.equal(hub.requestBriefNarrative(b), null);
+  assert.equal(hub.briefRenders.has(S), false);
+  assert.equal("narrative" in hub.getBriefs()[S][0], false);
+  delete agents.nrNone;
+  delete hub.getBriefs()[S];
+});
+
+test("XERK-1574: the narrative is whitelisted — plain, bounded, a coerce fixed point", () => {
+  const C = hub.cleanBriefNarrative;
+  assert.equal(C("```js\ncode\n```\n# Head\n1. one\n- two\n[link](http://x) a\u202eb"), "code Head one two link a b");
+  assert.equal(C(42), "");
+  const long = C("word ".repeat(600));
+  assert.ok(long.length <= 1200 && long.endsWith("…"));
+  for (const t of ["*a* `b`", long, "1.\nnext", "[[a](x)](y)"]) assert.equal(C(C(t)), C(t), t);
+  const raw = { "o.atlassian.net": [{ siteKey: "o.atlassian.net", at: 2000,
+    narrative: "## Title\n**bold**", narrativeAt: 2500 },
+  { siteKey: "o.atlassian.net", at: 1000, narrative: "   ", narrativeAt: 1500 }] };
+  const out = hub.briefsCoerce(JSON.parse(JSON.stringify(raw)));
+  assert.equal(out["o.atlassian.net"][0].narrative, "Title bold");
+  assert.equal(out["o.atlassian.net"][0].narrativeAt, 2500);
+  assert.equal("narrative" in out["o.atlassian.net"][1], false, "an empty narrative is absent");
+  assert.equal("narrativeAt" in out["o.atlassian.net"][1], false);
+  assert.deepEqual(hub.briefsCoerce(JSON.parse(JSON.stringify(out))), out);
+});
+
+test("XERK-1574: the briefRender capability is coerced strictly", () => {
+  const n = (v) => { const a = { briefRender: v }; hub.normalizeBriefRender(a); return a.briefRender; };
+  assert.deepEqual(n({ available: true }), { available: true });
+  assert.deepEqual(n({ available: "yes", junk: 1 }), { available: false });
+  assert.equal(n("yes"), null);
+  const absent = {};
+  hub.normalizeBriefRender(absent);
+  assert.equal("briefRender" in absent, false, "absent stays absent");
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("briefRender"));
+  assert.ok(hub.HEARTBEAT_KNOWN_KEYS.has("briefNarratives"));
+});
+
+test("XERK-1574: POST /api/orgs/<site>/decisions records a note; refusals mint nothing", async () => {
+  const S = "dcA1574.atlassian.net";
+  await beat1574("dcHostA", S);
+  const post = (site, body, headers = userHeaders) =>
+    request("POST", `/api/orgs/${site}/decisions`, { body, headers });
+  assert.equal((await post(S, { text: "x" }, {})).status, 401);
+  assert.equal((await post(S, { text: "   " })).status, 400);
+  const tooLong = await post(S, { text: "y".repeat(501) });
+  assert.equal(tooLong.status, 413);
+  assert.match(tooLong.body.error, /the limit is 500/);
+  const phantom = await post("nobody.atlassian.net", { text: "x" });
+  assert.equal(phantom.status, 404);
+  assert.equal("nobody.atlassian.net" in hub.getDecisions(), false);
+  assert.equal(S in hub.getDecisions(), false, "a refusal mints no store key");
+  const ok = await post(S, { text: "  Never auto-merge infra.  " });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.body.decision.source, "note");
+  assert.equal(ok.body.decision.text, "Never auto-merge infra.");
+  assert.deepEqual((await fleet()).decisions[S], [ok.body.decision]);
+  // The org's hosts get it on their next reply, keyed on the DECIDED org.
+  const reply = await beat1574("dcHostA", S);
+  assert.deepEqual(reply.body.decisions, { org: S, entries: [ok.body.decision] });
+  delete agents.dcHostA;
+  delete hub.getDecisions()[S];
+});
+
+test("XERK-1574: answering a question or a permission dialog appends to the org's log", async () => {
+  const S = "dcB1574.atlassian.net";
+  const sessions = [
+    { id: "q1", status: "running", summary: "db work", ticket: { key: "XERK-9", siteKey: S },
+      session: { question: "Which DB?", questionOptions: ["Postgres", "SQLite"] } },
+    { id: "p1", status: "running", label: "lbl",
+      session: { panePrompt: { prompt: "Do you want to proceed?", detail: "Bash command\nnpm test",
+        options: [{ number: 1, label: "Yes" }, { number: 2, label: "No" }] } } },
+    { id: "idle", status: "running" },
+  ];
+  await beat1574("dcHostB", S, { sessions });
+  const ans = (sid, body) => request("POST", `/api/agents/dcHostB/sessions/${sid}/answer`,
+    { body, headers: userHeaders });
+  assert.equal((await ans("q1", { optionIndex: 0 })).status, 200);
+  assert.equal((await ans("q1", { optionIndices: [0, 1, 5], custom: "and backups" })).status, 200);
+  assert.equal((await ans("idle", { custom: "hello" })).status, 200, "no question: nothing recorded");
+  const pp = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
+    { body: { optionNumber: 1 }, headers: userHeaders });
+  assert.equal(pp.status, 200);
+  const log = hub.getDecisions()[S].map(({ id, at, ...rest }) => rest);
+  assert.deepEqual(log, [
+    { source: "question", question: "Which DB?", answer: "Postgres", host: "dcHostB",
+      sessionId: "q1", ticket: "XERK-9", label: "db work" },
+    { source: "question", question: "Which DB?", answer: "Postgres; SQLite; option 6; and backups",
+      host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
+    { source: "permission", question: "Do you want to proceed? — Bash: npm test", answer: "Yes",
+      host: "dcHostB", sessionId: "p1", label: "lbl" },
+  ]);
+  // A drifted host (bound to S, now declaring another org) is in NO org: its
+  // answers are not logged, and its reply carries no org's log.
+  await beat1574("dcHostB", "elsewhere1574.atlassian.net", { sessions });
+  const before = hub.getDecisions()[S].length;
+  assert.equal((await ans("q1", { optionIndex: 1 })).status, 200);
+  assert.equal(hub.getDecisions()[S].length, before);
+  const reply = await beat1574("dcHostB", "elsewhere1574.atlassian.net", { sessions });
+  assert.deepEqual(reply.body.decisions, { org: "", entries: [] });
+  delete agents.dcHostB;
+  delete hub.getDecisions()[S];
+});
+
+test("XERK-1574: the log is a bounded tail — 200 kept, 20 served, 30 on a reply", async () => {
+  const S = "dcC1574.atlassian.net";
+  await beat1574("dcHostC", S);
+  for (let i = 0; i < 205; i++) hub.appendDecision(S, { source: "note", text: `n${i}` }, 1000 + i);
+  const kept = hub.getDecisions()[S];
+  assert.equal(kept.length, 200);
+  assert.equal(kept[0].text, "n5", "oldest evicted");
+  assert.equal((await fleet()).decisions[S].length, 20);
+  assert.equal((await fleet()).decisions[S][19].text, "n204");
+  const reply = await beat1574("dcHostC", S);
+  assert.equal(reply.body.decisions.entries.length, 30);
+  assert.equal(reply.body.decisions.entries[29].text, "n204");
+  assert.equal(hub.appendDecision("", { source: "note", text: "x" }), null);
+  assert.equal(hub.appendDecision(S, { source: "bogus", text: "x" }), null);
+  delete agents.dcHostC;
+  delete hub.getDecisions()[S];
+});
+
+test("XERK-1574: the decisions store coerces to the typed shape and survives a restart", () => {
+  const good = { id: "abc123", at: 5, source: "question", question: " Q? ", answer: "A",
+    host: 7, sessionId: "s1", ticket: "X-1", extra: "dropped" };
+  const raw = { "o.atlassian.net": [good, { at: 6, source: "note" }, { at: -1, source: "note", text: "t" },
+    { at: 7, source: "note", text: "t", id: "NOT-HEX" }, "junk"], "x.atlassian.net": "nope" };
+  const out = hub.decisionsCoerce(JSON.parse(JSON.stringify(raw)));
+  assert.equal(Object.getPrototypeOf(out), null);
+  assert.deepEqual(Object.keys(out), ["o.atlassian.net"]);
+  assert.deepEqual(out["o.atlassian.net"], [
+    { at: 5, source: "question", id: "abc123", question: "Q?", answer: "A", sessionId: "s1", ticket: "X-1" },
+    { at: 7, source: "note", text: "t" },
+  ]);
+  assert.deepEqual(hub.decisionsCoerce(JSON.parse(JSON.stringify(out))), out, "a fixed point");
+  const file = path.join(os.tmpdir(), `turma-test-decisions-restore-${process.pid}.json`);
+  fs.writeFileSync(file, JSON.stringify(raw));
+  try {
+    const mod = freshServerModule((env) => { env.DECISIONS_FILE = file; });
+    assert.equal(mod.getDecisions()["o.atlassian.net"].length, 2);
+  } finally {
+    fs.unlinkSync(file);
+  }
+});
+
+test("XERK-1574: briefTick drops an org's log once no host is in it and it is old", async () => {
+  const S = "dcD1574.atlassian.net";
+  const now = Date.now();
+  await beat1574("dcHostD", S);
+  hub.appendDecision(S, { source: "note", text: "keep me a while" }, now);
+  delete agents.dcHostD;
+  hub.briefTick(now + 24 * 3600 * 1000);
+  assert.equal(hub.getDecisions()[S].length, 1, "kept a while: a quiet host may come back");
+  hub.briefTick(now + 31 * 24 * 3600 * 1000);
+  assert.equal(S in hub.getDecisions(), false);
   for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
 });
 

@@ -3,6 +3,7 @@ package com.xerktech.turma.core
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.BriefItem
 import com.xerktech.turma.model.OrgBrief
+import com.xerktech.turma.model.OrgDecision
 
 /**
  * The per-org brief (XERK-1573) — pure reads behind `ui/BriefScreen.kt`, the
@@ -153,3 +154,26 @@ fun briefItemMeta(section: String, item: BriefItem, now: Long): String {
     if (host != null && section != "nextUp") parts += host
     return parts.joinToString(" · ")
 }
+
+/** How many decisions the Brief screen shows — web brief.html `DECISIONS_SHOWN`. */
+const val BRIEF_DECISIONS_SHOWN = 10
+
+/** A decision's kind as the brief words it — web brief.html `DECISION_KIND`. */
+val BRIEF_DECISION_KIND = mapOf("question" to "answered", "permission" to "permission", "note" to "note")
+
+/**
+ * The org's decisions log (XERK-1574) as (title, meta) lines, newest first, the
+ * newest [BRIEF_DECISIONS_SHOWN] only — web brief.html `decisionsHtml`: a note's
+ * text, or "<question> → <answer>"; then its kind, ticket, age and host.
+ */
+fun briefDecisionLines(decisions: List<OrgDecision>, now: Long): List<Pair<String, String>> =
+    decisions.takeLast(BRIEF_DECISIONS_SHOWN).asReversed().map { d ->
+        val title = if (d.source == "note") d.text.orEmpty() else "${d.question.orEmpty()} → ${d.answer.orEmpty()}"
+        val meta = mutableListOf(BRIEF_DECISION_KIND[d.source] ?: d.source)
+        val ticket = d.ticket
+        val host = d.host
+        if (ticket != null) meta += ticket
+        if (d.at > 0L) meta += "${briefDur(now - d.at)} ago"
+        if (host != null) meta += host
+        title to meta.joinToString(" · ")
+    }

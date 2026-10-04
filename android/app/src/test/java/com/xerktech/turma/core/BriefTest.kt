@@ -5,6 +5,7 @@ import com.xerktech.turma.model.BriefCounts
 import com.xerktech.turma.model.BriefItem
 import com.xerktech.turma.model.JiraBlock
 import com.xerktech.turma.model.OrgBrief
+import com.xerktech.turma.model.OrgDecision
 import org.junit.Assert.assertEquals
 import org.junit.Test
 
@@ -114,5 +115,28 @@ class BriefTest {
         val b = OrgBrief(counts = BriefCounts(needsYou = 15), needsYou = rows, waiting = rows.take(2))
         assertEquals(15L, briefSectionCount(b, "needsYou"))
         assertEquals("a count the hub left 0 reads as the rows", 2L, briefSectionCount(b, "waiting"))
+    }
+
+    @Test fun `briefDecisionLines is the newest few, newest first, worded as the web does`() {
+        val now = 10_000_000L
+        val log = listOf(
+            OrgDecision(at = now - 7_200_000, source = "question", question = "Which DB?",
+                answer = "Postgres", ticket = "O-1", host = "h"),
+            OrgDecision(at = now - 60_000, source = "note", text = "No infra merges."),
+            OrgDecision(at = 0, source = "permission", question = "Proceed?", answer = "Yes"),
+        )
+        assertEquals(
+            listOf(
+                "Proceed? → Yes" to "permission",
+                "No infra merges." to "note · 60s ago",
+                "Which DB? → Postgres" to "answered · O-1 · 2h ago · h",
+            ),
+            briefDecisionLines(log, now),
+        )
+        val many = (1..15).map { OrgDecision(at = it.toLong(), source = "note", text = "n$it") }
+        val lines = briefDecisionLines(many, 100)
+        assertEquals(BRIEF_DECISIONS_SHOWN, lines.size)
+        assertEquals("n15", lines.first().first)
+        assertEquals("n6", lines.last().first)
     }
 }

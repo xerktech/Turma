@@ -85,6 +85,10 @@ data class FleetState(
     // The per-org brief (XERK-1573), siteKey -> newest-first briefs; the Brief
     // screen reads it. Refreshed by the poll and the "briefs" SSE event.
     val briefs: Map<String, List<com.xerktech.turma.model.OrgBrief>> = emptyMap(),
+    // The per-org decisions log (XERK-1574), siteKey -> its newest entries,
+    // oldest first; the Brief screen reads it. Refreshed by the poll and the
+    // "decisions" SSE event.
+    val decisions: Map<String, List<com.xerktech.turma.model.OrgDecision>> = emptyMap(),
 )
 
 class FleetRepository(
@@ -161,6 +165,7 @@ class FleetRepository(
             epicRuns = resp.epicRuns
             epicBuilders = resp.epicBuilders
             briefs = resp.briefs
+            decisions = resp.decisions
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -215,6 +220,9 @@ class FleetRepository(
     @Volatile
     private var briefs: Map<String, List<com.xerktech.turma.model.OrgBrief>> = emptyMap()
 
+    @Volatile
+    private var decisions: Map<String, List<com.xerktech.turma.model.OrgDecision>> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -234,6 +242,7 @@ class FleetRepository(
             epicRuns = epicRuns,
             epicBuilders = epicBuilders,
             briefs = briefs,
+            decisions = decisions,
         )
     }
 
@@ -322,6 +331,11 @@ class FleetRepository(
                     "briefs" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, List<com.xerktech.turma.model.OrgBrief>>>(data)
                     }.getOrNull()?.let { briefs = it; emit(_state.value.now, null) }
+                    // An org's decisions log changed (XERK-1574); the event
+                    // carries every org's served tail, like "briefs".
+                    "decisions" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, List<com.xerktech.turma.model.OrgDecision>>>(data)
+                    }.getOrNull()?.let { decisions = it; emit(_state.value.now, null) }
                 }
             }
 
