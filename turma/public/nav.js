@@ -40,6 +40,10 @@
       icon: `<rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/>`,
     },
     {
+      id: "brief", href: "/brief", label: "Brief",
+      icon: `<path d="M9 4h6"/><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 10h6"/><path d="M9 14h6"/><path d="M9 18h3"/>`,
+    },
+    {
       id: "sessions", href: "/sessions", label: "Sessions",
       icon: `<rect x="2" y="4" width="20" height="16" rx="2"/><path d="M7 9l3 3-3 3"/><path d="M13 15h4"/>`,
       join: `stroke-linejoin="round"`,
@@ -51,10 +55,6 @@
     {
       id: "usage", href: "/usage", label: "Usage",
       icon: `<path d="M5 20V12"/><path d="M12 20V5"/><path d="M19 20v-5"/>`,
-    },
-    {
-      id: "brief", href: "/brief", label: "Brief",
-      icon: `<path d="M9 4h6"/><rect x="5" y="4" width="14" height="17" rx="2"/><path d="M9 10h6"/><path d="M9 14h6"/><path d="M9 18h3"/>`,
     },
   ];
 

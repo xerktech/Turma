@@ -22922,6 +22922,27 @@ test("XERK-1573: a brief composes every section from hub data, scoped to the DEC
   resetAutoStart();
 });
 
+test("XERK-1573: the hub words a brief duration by the page's own rule (hours from the hour on)", () => {
+  // The screenshot pass caught "Starts next" saying "created 61m ago" (fmtDur)
+  // beside rows the page words "1h". The hub's briefDur and brief.html's dur are
+  // ONE rule: run the page's own function over the same sweep.
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "brief.html"), "utf8");
+  const a = src.indexOf("function dur(ms) {");
+  assert.ok(a >= 0, "brief.html has dur");
+  const b = src.indexOf("\n}\n", a);
+  const pageDur = vm.runInNewContext(`(${src.slice(a, b + 2)})`);
+  const M = 60000, H = 60 * M;
+  for (const ms of [-5000, 0, 89000, 90000, 3569000, 3570000, H, 61 * M, 89 * M, 90 * M, 2 * H,
+    47 * H, 48 * H, 3 * 24 * H, 60 * 24 * H]) {
+    assert.equal(hub.briefDur(ms), pageDur(ms), `${ms}ms`);
+  }
+  assert.equal(hub.briefDur(61 * M), "1h");
+  assert.equal(hub.briefDur(59 * M), "59m");
+  const now = Date.UTC(2026, 9, 4, 12);
+  const t = { created: new Date(now - 61 * M).toISOString() };
+  assert.equal(hub.briefNextReason(t, null, now), "oldest first · created 1h ago");
+});
+
 test("XERK-1573: spend reads a shared subscription's fleet-wide freshest reading, as its pause does", async () => {
   resetAutoStart();
   const A = "spA1573.atlassian.net";

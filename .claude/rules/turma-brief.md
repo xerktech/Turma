@@ -110,6 +110,12 @@ paragraph and the per-org decisions log are XERK-1574.
 - **An org no host is decided into keeps its briefs `BRIEF_RETAIN_MS` (30 days)** past its newest,
   then `briefTick` drops the key (a quiet host may return); until then both clients show it with
   "no host in this org" IN PLACE of Brief now, which the route would 404.
+- **The Brief tab sits between Dashboard and Sessions** (operator review): `nav.js` `PAGES` (web
+  header + phone bottom nav) and Android's `TopDest` declare the same order; `nav.test.js` and
+  `BottomNavTabTest` pin it.
+- **Every brief duration is ONE rule** — the hub's `briefDur` (the nextUp reasons' ages and
+  backoffs), `brief.html` `dur`, Android `briefDur`: minutes below the hour, hours to two days, then
+  days. Never `fmtDur` (it says "61m" beside a row the page words "1h").
 - `brief.html` (nav `brief`): every org a host is decided into (the served `org`) plus any org with
   a kept brief, so an org with none yet still offers **Brief now**. Refusals toast the hub's words.
 - Android `BriefScreen` (bottom-nav `Brief`) renders the same off `FleetState.briefs`; `core/Brief.kt`
@@ -118,6 +124,6 @@ paragraph and the per-org decisions log are XERK-1574.
   differences in `android/PARITY.md`.
 - Tests: the `XERK-1573:` cases in `server.test.js` (composition + decided-org scoping, bounds +
   keep + the headline-only wire, the push dedupe/retract + a newcomer past the cut, a merged PR
-  reported once, a merged PR + its Done ticket counting ONE row, hold/reject + offline-host exclusion, the cadence + retention, the route, the
+  reported once, a merged PR + its Done ticket counting ONE row, the `briefDur` page parity, hold/reject + offline-host exclusion, the cadence + retention, the route, the
   sanitizer + restart restore); `nav.test.js`;
   `test_full_issue` (`resolved`) in `test_hub_agent.py`; android `BriefTest`, `AgentDecodeTest`.

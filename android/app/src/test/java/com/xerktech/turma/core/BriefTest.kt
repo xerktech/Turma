@@ -47,7 +47,10 @@ class BriefTest {
         assertEquals("89s", briefDur(89_000))
         assertEquals("2m", briefDur(90_000))
         assertEquals("59m", briefDur(3_569_000))
+        assertEquals("1h", briefDur(3_570_000))
         assertEquals("1h", briefDur(3_600_000))
+        // 61 minutes: the hub's "Starts next" reason says the same (XERK-1573).
+        assertEquals("1h", briefDur(61 * 60_000L))
         assertEquals("1h", briefDur(5_399_000))
         assertEquals("2h", briefDur(7_200_000))
         assertEquals("3d", briefDur(3 * 86_400_000L))

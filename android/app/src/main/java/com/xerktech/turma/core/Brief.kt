@@ -85,7 +85,10 @@ fun briefOrgs(
 fun briefLiveOrgs(agents: List<AgentInfo>): Set<String> =
     agents.mapNotNull { a -> a.org?.takeIf { it.isNotEmpty() } }.toSet()
 
-/** A duration as the brief words it — web brief.html `dur`, same thresholds. */
+/**
+ * A duration as the brief words it — web brief.html `dur` and the hub's `briefDur`
+ * (which words the "Starts next" reasons), one rule: hours from the hour on.
+ */
 fun briefDur(ms: Long): String {
     val s = Math.round(ms.coerceAtLeast(0) / 1000.0)
     return when {

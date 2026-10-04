@@ -21,13 +21,16 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.unit.dp
 
-/** The top-level destinations — mirrors the web's phone bottom-nav (nav.js PAGES). */
+/**
+ * The top-level destinations, in bottom-nav order — mirrors the web's phone bottom-nav
+ * (nav.js PAGES): Brief sits between Dashboard and Sessions (XERK-1573).
+ */
 enum class TopDest(val route: String, val label: String, val icon: ImageVector) {
     DASHBOARD("dashboard", "Dashboard", Icons.Filled.GridView),
+    BRIEF("brief", "Brief", Icons.Filled.Summarize),
     SESSIONS("sessions", "Sessions", Icons.Filled.Terminal),
     BOARD("board", "Board", Icons.Filled.ViewKanban),
     USAGE("usage", "Usage", Icons.Filled.Analytics),
-    BRIEF("brief", "Brief", Icons.Filled.Summarize),
 }
 
 /**

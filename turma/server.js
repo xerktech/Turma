@@ -14267,9 +14267,16 @@ function briefOrgs() {
   return out;
 }
 
-function briefAge(ms) {
-  const d = Math.floor(ms / 86400000);
-  return d >= 1 ? `${d}d` : fmtDur(ms);
+// A duration as the brief words it — ONE rule with brief.html `dur` and Android
+// `briefDur` (pinned by the XERK-1573 parity test): minutes stop below the hour
+// (3570s rounds to 60m), so a 61-minute-old ticket reads "1h" here exactly as the
+// page's own ages do, never fmtDur's "61m"; hours run to two days, then days.
+function briefDur(ms) {
+  const s = Math.max(0, Math.round(ms / 1000));
+  if (s < 90) return `${s}s`;
+  if (s < 3570) return `${Math.round(s / 60)}m`;
+  if (s < 172800) return `${Math.round(s / 3600)}h`;
+  return `${Math.round(s / 86400)}d`;
 }
 
 // Why this ticket is next in the auto-start order — the triageSortKey terms, in
@@ -14280,7 +14287,7 @@ function briefNextReason(t, repo, now) {
   const created = t && typeof t.created === "string" ? Date.parse(t.created) : NaN;
   const parts = [tr && tr.priority === "P0" ? "P0 preempts the line" : "oldest first"];
   parts.push(Number.isFinite(created)
-    ? `created ${briefAge(Math.max(0, now - created))} ago` : "no created date");
+    ? `created ${briefDur(Math.max(0, now - created))} ago` : "no created date");
   if (tr && typeof tr.type === "string" && tr.type) parts.push(`type ${tr.type}`);
   const tier = repoTier(repo);
   if (tier !== DEFAULT_REPO_TIER) parts.push(`${tier} repo`);
@@ -14414,7 +14421,7 @@ function compileBrief(siteKey, now, trigger, prevList) {
       // The sweep holds a ticket in its retry backoff: still in line, but say so.
       const prior = autoStarted.get(siteKey + "\x00" + t.key);
       const backoff = prior && now < prior.nextAt
-        ? ` · retrying in ${briefAge(prior.nextAt - now)}` : "";
+        ? ` · retrying in ${briefDur(prior.nextAt - now)}` : "";
       nextUp.push({ kind: "ticket", key: t.key, title: t.summary || t.key, url: t.url,
         reason: briefNextReason(t, repo, now) + backoff });
     }
@@ -20937,6 +20944,7 @@ if (process.env.TURMA_TEST) {
     // install REPLACES the map.
     getBriefs: () => briefs,
     briefsCoerce, sanitizeBrief, compileBrief, briefSweep, briefTick, briefNeedsYouSig,
+    briefDur, briefNextReason,
     autoStartCandidates, BRIEF_INTERVAL_MS,
     ticketQueueOrder,
     TRIAGE_PRIORITY_RANK,

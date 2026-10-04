@@ -44,4 +44,14 @@ class BottomNavTabTest {
         assertEquals("pops back to the Dashboard root", TopDest.DASHBOARD.route, opts.popUpToRoute)
         assertFalse("keeps the Dashboard root itself", opts.isPopUpToInclusive())
     }
+
+    @Test fun tabsFollowTheWebNavOrder() {
+        // Mirrors nav.js PAGES (pinned by turma/tests/nav.test.js): the operator put
+        // Brief between Dashboard and Sessions (XERK-1573), and the bar renders
+        // TopDest.entries in declaration order.
+        assertEquals(
+            listOf("dashboard", "brief", "sessions", "board", "usage"),
+            TopDest.entries.map { it.route },
+        )
+    }
 }

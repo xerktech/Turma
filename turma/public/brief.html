@@ -101,9 +101,10 @@ const STALE_LABEL = { "not-reproducible": "not reproducible", "already-fixed": "
 // it (a PR carries no merge time). Android `BRIEF_FINISHED_VERB`.
 const FINISHED_VERB = { ticket: "done", pr: "merged", session: "ended" };
 
-// A duration as the brief words it (Android `briefDur`, same thresholds). Minutes
-// stop below the hour (3570s rounds to 60m), so an hour-old row reads "1h", not
-// "60m" beside its "2h" neighbours.
+// A duration as the brief words it — ONE rule with the hub's `briefDur` (which
+// words the "Starts next" reasons) and Android `briefDur`, pinned by a parity
+// test in server.test.js. Minutes stop below the hour (3570s rounds to 60m), so an
+// hour-old row reads "1h", not "60m" beside its "2h" neighbours.
 function dur(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 90) return `${s}s`;
