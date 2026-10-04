@@ -2,11 +2,24 @@ package com.xerktech.turma.vm
 
 import android.app.Application
 import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
 import java.util.Locale
+import java.util.concurrent.atomic.AtomicInteger
 import com.xerktech.turma.TurmaApplication
+import com.xerktech.turma.core.Permissions
+import com.xerktech.turma.model.PermissionSummary
 import com.xerktech.turma.model.UsageBucket
 import com.xerktech.turma.model.UsageInfo
 import com.xerktech.turma.net.FleetState
+import com.xerktech.turma.net.hubErrorMessage
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
 
 /**
  * Persistent token usage derived from the agents' usage aggregates (repoUsage /
@@ -23,6 +36,95 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     val orgFilter get() = container.org.stored
 
     fun start() = container.fleet.start()
+
+    // ---- Permission prompts (XERK-1576, web usage.html refreshPermissions) ----
+
+    /**
+     * The "Permission prompts" card. [view] is the hub's answer for the CURRENT
+     * org scope, or null while that scope loads; [error] is why a read with no
+     * view for this scope failed, in the hub's own words (XERK-264).
+     */
+    data class PermissionsUi(
+        val view: PermissionSummary? = null,
+        val error: String? = null,
+    )
+
+    private val _permissions = MutableStateFlow(PermissionsUi())
+    val permissions: StateFlow<PermissionsUi> = _permissions
+
+    private val permSeq = AtomicInteger()
+
+    /** The keys the card was last fetched for (web `permFetchedKeys`); null = never. */
+    @Volatile private var permKeys: List<String>? = null
+
+    /** The scope [_permissions]' current value (view OR error) belongs to. */
+    @Volatile private var permStateScope: String? = null
+
+    /** True once a fleet snapshot has landed, so the org keys mean something. */
+    @Volatile private var fleetReady = false
+
+    /**
+     * Keep the card fetched for the header's org scope while the screen shows it
+     * (the caller's scope — the screen's `LaunchedEffect` — bounds it): fetch on
+     * entry, refetch whenever the scope moves, and every [Permissions.REFRESH_MS].
+     * The first fetch waits for a delivered fleet snapshot — before one, no org
+     * is known, so the keys would read "every org" under a scoped header (the web
+     * waits for its first render's `TurmaOrg.update` for the same reason).
+     */
+    suspend fun watchPermissions(): Unit = coroutineScope {
+        // Re-entering the screen re-reads; the same scope's view stays up meanwhile.
+        permKeys = null
+        launch {
+            combine(container.fleet.state, container.org.stored) { f, o -> f to o }
+                .collect { (f, o) ->
+                    if (!f.loading && f.error == null) fleetReady = true
+                    if (fleetReady) syncPermissions(Permissions.scope(f.agents, o))
+                }
+        }
+        while (isActive) {
+            delay(Permissions.REFRESH_MS)
+            permKeys?.let { refreshPermissions(it) }
+        }
+    }
+
+    /** Refetch only when [keys] differ from the scope last fetched (web `syncPermissionsScope`). */
+    fun syncPermissions(keys: List<String>) {
+        if (permKeys != keys) refreshPermissions(keys)
+    }
+
+    /**
+     * Read `GET /api/permissions` for [keys] (empty = every org). A scope change
+     * drops the previous org's view AT ONCE, so the card says loading rather than
+     * showing org A's prompts under org B's pick, and an answer for a scope the
+     * operator has since left is discarded. A failed refresh keeps this scope's
+     * last view silently; with none, the card says why it failed.
+     */
+    fun refreshPermissions(keys: List<String>): Job {
+        val seq = permSeq.incrementAndGet()
+        val scope = keys.joinToString(",")
+        permKeys = keys
+        if (permStateScope != scope) {
+            permStateScope = null
+            _permissions.value = PermissionsUi()
+        }
+        return viewModelScope.launch {
+            val resp = runCatching {
+                container.client.api.permissions(Permissions.DAYS, scope.ifEmpty { null })
+            }.getOrNull()
+            val body = resp?.takeIf { it.isSuccessful }?.body()
+            if (seq != permSeq.get()) return@launch          // the scope moved under this answer
+            if (body != null) {
+                permStateScope = scope
+                _permissions.value = PermissionsUi(view = body)
+                return@launch
+            }
+            if (_permissions.value.view != null && permStateScope == scope) return@launch
+            val why = if (resp != null && !resp.isSuccessful) hubErrorMessage(resp)
+                      else "no readable answer from the hub"
+            permStateScope = scope
+            _permissions.value = PermissionsUi(error = why)
+        }
+    }
 
     /**
      * The all-time cache split behind a token total (web usage.html

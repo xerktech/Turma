@@ -12,7 +12,7 @@ Every permission prompt a session hit, how long it held the session, and the all
 retire it — so an allow-list change is measured, not guessed. Agent half in `hub-agent.py`
 (`_permission_edges`, the hook-log tail) + `agent/hooks/permlog.py`; hub half in
 `turma/permission-ledger.js` + `server.js` (`permissionEvents` ingest, `GET /api/permissions`,
-`/metrics`); surface on `usage.html`. Android has only a `PARITY.md` line (XERK-1576 adds the screen).
+`/metrics`); surface on `usage.html`, ported to Android's Usage screen (XERK-1576, `android.md`).
 This file is the HUB + web half; the agent half (row kinds, dialog edges, the hook merge, the
 beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent files it governs.
 

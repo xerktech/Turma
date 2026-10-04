@@ -84,8 +84,12 @@ private data class UsageSeries(
 @Composable
 fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel()) {
     LaunchedEffect(Unit) { vm.start() }
+    // The permission card's own fetch (XERK-1576), org-scoped and refreshed
+    // while this screen is composed; it never rides the /api/agents decode.
+    LaunchedEffect(Unit) { vm.watchPermissions() }
     val fleet by vm.fleet.collectAsStateWithLifecycle()
     val org by vm.orgFilter.collectAsStateWithLifecycle()
+    val perms by vm.permissions.collectAsStateWithLifecycle()
     // Scoped by the header's org control (XERK-62) before the totals are built,
     // so both groupings stay consistent: "By host" drops the other orgs' hosts,
     // and "By repo" charts only what the scoped org's hosts spent — a repo two
@@ -205,6 +209,9 @@ fun UsageScreen(modifier: Modifier = Modifier, vm: UsageViewModel = viewModel())
                     color = MaterialTheme.colorScheme.onSurfaceVariant,
                 )
             }
+            // Permission prompts (XERK-1563 on web): below the grouping's rows,
+            // outside the tabs — it follows the header's org filter only.
+            item(key = "permissions") { PermissionsSection(perms) }
             // The descriptive footer the web moved from the dashboard to here.
             item {
                 Text(
