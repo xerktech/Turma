@@ -3536,6 +3536,26 @@ test("http: a refused archive chunk is 413 AND recorded for the operator", async
   assert.equal((await request("GET", "/api/archive/trover", { headers: userHeaders })).status, 200);
 });
 
+test("XERK-1283: a missing transcript's 404 says when archive ingest closed, and only while it is", async () => {
+  // Three days of a wedged HA hydrate 503'd every push while the ended pane kept
+  // promising "a few minutes". The 404 is where the pane learns the truth.
+  const archive = require("../archive.js");
+  const before = Date.now();
+  try {
+    archive.setHydrating(true);
+    const r = await request("GET", "/api/archive/never-arrives", { headers: userHeaders });
+    assert.equal(r.status, 404);
+    assert.equal(r.body.error, "unknown transcript");   // unchanged for older readers
+    assert.ok(r.body.ingestClosed.since >= before && r.body.ingestClosed.since <= Date.now(),
+      "since is when the gate closed, on the hub's clock");
+  } finally {
+    archive.setHydrating(false);
+  }
+  const open = await request("GET", "/api/archive/never-arrives", { headers: userHeaders });
+  assert.equal(open.status, 404);
+  assert.equal(open.body.ingestClosed, undefined, "an open gate says nothing — plain not-here-yet");
+});
+
 // ---- the archive's raw layer (XERK-338) -------------------------------------
 //
 // Beside the rendered entries above, agents push a byte-for-byte copy of the

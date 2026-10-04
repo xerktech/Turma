@@ -506,31 +506,60 @@ data class ArchiveRefusal(
     val error: String = "",
 )
 
+/** When the hub closed archive ingest (XERK-1283), epoch ms on its clock. */
+@Serializable
+data class ArchiveIngestClosed(val since: Double = 0.0)
+
 /** The 404 body `GET /api/archive/<id>` answers with when it knows why. */
 @Serializable
 private data class ArchiveMissing(
     val error: String = "",
     val refused: ArchiveRefusal? = null,
+    val ingestClosed: ArchiveIngestClosed? = null,
 )
 
 /**
- * Why an archived transcript is missing, in the hub's own words, when its 404
- * carries them (XERK-356) — else null, meaning the ordinary "not here yet".
+ * Why an archived transcript could not be shown, in the hub's own words when it
+ * gave any — else null, meaning the ordinary 404 "not here yet", the one case
+ * where "it syncs within a few minutes" is the right thing to tell the operator.
  *
- * The distinction is the point: a refused push never arrives, so the reassuring
- * "it syncs within a few minutes" the ended view falls back to is a promise that
- * will not be kept, and the operator would go on waiting for it. Web twin:
- * `archiveRefusalNote` in sessions.html.
+ * Every other case is a promise nothing will keep, so it is said instead:
+ * - a REFUSED push never arrives (XERK-356);
+ * - while the hub holds archive ingest closed, no push lands (XERK-1283 — an HA
+ *   hydrate once held it shut for three days);
+ * - a non-404 or no answer at all is a failed LOAD, not "not synced yet",
+ *   worded like every other hub refusal (XERK-264).
+ * Web twin: `archiveMissingNote` in sessions.html.
  */
-fun archiveRefusalMessage(e: Throwable): String? {
-    val resp = (e as? HttpException)?.response() ?: return null
-    if (resp.code() != 404) return null
+fun archiveMissingMessage(e: Throwable, nowMs: Long = System.currentTimeMillis()): String? {
+    val resp = (e as? HttpException)?.response()
+        ?: return "Couldn\u2019t load this conversation from the hub."
+    if (resp.code() != 404) return "Couldn\u2019t load this conversation \u2014 ${hubErrorMessage(resp)}."
     val body = runCatching { resp.errorBody()?.string() }.getOrNull().orEmpty()
-    val r = runCatching { TurmaJson.decodeFromString<ArchiveMissing>(body).refused }.getOrNull()
-        ?: return null
-    if (r.error.isBlank()) return null
-    return "${r.host.ifBlank { "The agent" }}\u2019s last push of this conversation " +
-        "to the archive was refused: ${r.error}."
+    val m = runCatching { TurmaJson.decodeFromString<ArchiveMissing>(body) }.getOrNull() ?: return null
+    val refused = m.refused?.takeIf { it.error.isNotBlank() }?.let { r ->
+        "${r.host.ifBlank { "The agent" }}\u2019s last push of this conversation " +
+            "to the archive was refused: ${r.error}."
+    }
+    val closed = m.ingestClosed?.since?.takeIf { it.isFinite() && it > 0 }?.toLong()?.let { since ->
+        val at = java.text.DateFormat.getDateTimeInstance(
+            java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT,
+        ).format(java.util.Date(since))
+        "The hub has not been accepting archive pushes since $at (${agoText(nowMs - since)}), " +
+            "so this conversation can\u2019t reach the archive until it does."
+    }
+    return listOfNotNull(refused, closed).joinToString(" ").ifEmpty { null }
+}
+
+/** sessions.html `ago`, so both clients word an elapsed time alike. */
+private fun agoText(ms: Long): String {
+    val s = (ms / 1000).coerceAtLeast(0)
+    return when {
+        s < 60 -> "${s}s ago"
+        s < 3600 -> "${s / 60}m ago"
+        s < 86400 -> "${s / 3600}h ${(s % 3600) / 60}m ago"
+        else -> "${s / 86400}d ago"
+    }
 }
 
 @Serializable

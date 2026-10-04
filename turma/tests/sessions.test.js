@@ -2749,6 +2749,57 @@ test("an archive push the hub refused is worded as a refusal, not as 'not yet'",
   assert.match(els.trScroll.innerHTML, /Resume still works/);
 });
 
+// XERK-1283. Two more ways "it syncs within a few minutes" is untrue: the hub's
+// ingest is closed (an HA hydrate once held it shut for three days), or the load
+// itself failed — neither is "not synced yet", and only the plain 404 is.
+test("ended pane: closed ingest and failed loads are not worded as 'not synced yet'", async () => {
+  const { beat, openEndedSession, els, setGet } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [closed("33333", "Killed", "2026-07-15T09:00:00Z", { transcriptId: "t-abc" })];
+  beat({ now, agents: [h] });
+  const open = async (resp) => {
+    setGet((url) => url.startsWith("/api/archive/") ? resp() : null);
+    openEndedSession("33333");
+    await new Promise((r) => setImmediate(r));
+    return els.trScroll.innerHTML;
+  };
+
+  const since = Date.now() - 3 * 86400e3;
+  let html = await open(() => ({ ok: false, status: 404,
+    json: async () => ({ error: "unknown transcript", ingestClosed: { since } }) }));
+  assert.match(html, /has not been accepting archive pushes since/);
+  assert.match(html, /3d ago/);
+  assert.doesNotMatch(html, /within a few minutes/);
+  assert.match(html, /Resume still works/);
+
+  // A refusal AND a closed gate: both are said.
+  html = await open(() => ({ ok: false, status: 404, json: async () => ({
+    refused: { host: "nas", error: "too big" }, ingestClosed: { since } }) }));
+  assert.match(html, /nas&rsquo;s last push/);
+  assert.match(html, /not been accepting archive pushes/);
+
+  // A garbage `since` is not a date to print — fall back to plain not-here-yet.
+  html = await open(() => ({ ok: false, status: 404,
+    json: async () => ({ ingestClosed: { since: "<b>x</b>" } }) }));
+  assert.match(html, /hasn't reached the archive yet/);
+
+  // A 5xx is a failed LOAD, in the hub's words when it has some (XERK-264)...
+  html = await open(() => ({ ok: false, status: 503,
+    json: async () => ({ error: "archive index is still syncing on this replica — retry" }) }));
+  assert.match(html, /Couldn&rsquo;t load this conversation &mdash; archive index is still syncing/);
+  assert.doesNotMatch(html, /within a few minutes/);
+  // ...and the status when it has none, escaped either way.
+  html = await open(() => ({ ok: false, status: 502, json: async () => { throw new Error("html"); } }));
+  assert.match(html, /the hub answered HTTP 502/);
+  html = await open(() => ({ ok: false, status: 500, json: async () => ({ error: "<img src=x>" }) }));
+  assert.doesNotMatch(html, /<img/);
+
+  // No answer at all (a dead socket) says the load failed, not "not yet".
+  html = await open(() => { throw new TypeError("Failed to fetch"); });
+  assert.match(html, /Couldn&rsquo;t load this conversation from the hub/);
+  assert.doesNotMatch(html, /within a few minutes/);
+});
+
 test("the ended-session bar is cleared when the pane is reused for an archive transcript", () => {
   const { beat, openEndedSession, openTranscript, els } = loadPage();
   const { now, host: h } = host([]);
