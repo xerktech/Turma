@@ -20,22 +20,31 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.geometry.CornerRadius
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.TextLayoutResult
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.em
 import androidx.compose.ui.unit.sp
 import com.xerktech.turma.core.Permissions
 import com.xerktech.turma.model.PermissionGroup
@@ -108,7 +117,9 @@ internal fun PermissionsSection(
 
 /**
  * The asks note as the web renders `PERM_BEHAVIOUR_NOTE`: the lead-in bold and
- * the `~/.claude/CLAUDE.md` path in mono, the rest plain.
+ * the `~/.claude/CLAUDE.md` path in mono, the rest plain. The path is joined
+ * with word joiners ([Permissions.unbreakable]) so a phone never splits it
+ * after a `/` — it moves to the next line whole, as the web's `<code>` does.
  */
 private fun behaviourNote(): AnnotatedString = buildAnnotatedString {
     val lead = "Asked in chat"
@@ -120,14 +131,14 @@ private fun behaviourNote(): AnnotatedString = buildAnnotatedString {
         append(body)
     } else {
         append(body.substring(0, at))
-        withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(code) }
+        withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(Permissions.unbreakable(code)) }
         append(body.substring(at + code.length))
     }
 }
 
 /** The kind chip: a classifier block reads critical, an ask warning, the rest plain. */
 @Composable
-private fun PermKindChip(kind: String, dialogKind: String?) {
+private fun PermKindChip(kind: String, dialogKind: String?, modifier: Modifier = Modifier) {
     val color = when (Permissions.kindStyle(kind)) {
         "classifier-denied" -> TurmaColors.critical
         "ask-in-chat" -> TurmaColors.warning
@@ -139,28 +150,98 @@ private fun PermKindChip(kind: String, dialogKind: String?) {
         fontSize = 11.sp,
         fontWeight = FontWeight.SemiBold,
         color = color,
-        modifier = Modifier
+        modifier = modifier
             .border(1.dp, if (plain) MaterialTheme.colorScheme.outlineVariant else color, RoundedCornerShape(50))
             .background(if (plain) MaterialTheme.colorScheme.background else Color.Transparent, RoundedCornerShape(50))
             .padding(horizontal = 7.dp, vertical = 1.dp),
     )
 }
 
-/** A command/tool subject is mono; an ask's question is prose with its `code` spans rendered. */
+/** Marks an inline-code chip's range (its padding included) in an ask's rendered question. */
+internal const val PERM_CODE_TAG = "perm-code"
+
+/** The chip's inner padding: a narrow no-break space each side (web `.perm-subj code`'s `0 4px`). */
+internal const val PERM_CODE_PAD = "\u202F"
+
+/**
+ * An ask's question as the web's `permProseHtml` renders it: each `code` run
+ * mono at 0.92em, wrapped in a narrow no-break space each side (the chip's
+ * padding) and tagged [PERM_CODE_TAG] so [codeChipRects] can box it; bold
+ * markers already dropped by [Permissions.proseRuns].
+ */
+internal fun permProseText(text: String): AnnotatedString = buildAnnotatedString {
+    for ((run, code) in Permissions.proseRuns(text)) {
+        if (!code) { append(run); continue }
+        pushStringAnnotation(PERM_CODE_TAG, run)
+        append(PERM_CODE_PAD)
+        withStyle(SpanStyle(fontFamily = FontFamily.Monospace, fontSize = 0.92.em)) { append(run) }
+        append(PERM_CODE_PAD)
+        pop()
+    }
+}
+
+/**
+ * One box per line each [PERM_CODE_TAG] range covers (a code run that wraps
+ * gets a box on each line), from the laid-out text: glyph edges horizontally,
+ * the line inset by [insetY] vertically so boxes on adjacent lines never touch.
+ */
+internal fun codeChipRects(layout: TextLayoutResult, insetY: Float): List<Rect> {
+    val text = layout.layoutInput.text
+    val out = mutableListOf<Rect>()
+    for (a in text.getStringAnnotations(PERM_CODE_TAG, 0, text.length)) {
+        if (a.end <= a.start) continue
+        val first = layout.getLineForOffset(a.start)
+        val last = layout.getLineForOffset(a.end - 1)
+        for (line in first..last) {
+            val left = if (line == first) layout.getBoundingBox(a.start).left else layout.getLineLeft(line)
+            val right = if (line == last) layout.getBoundingBox(a.end - 1).right else layout.getLineRight(line)
+            val top = layout.getLineTop(line) + insetY
+            val bottom = layout.getLineBottom(line) - insetY
+            if (right > left && bottom > top) out.add(Rect(left, top, right, bottom))
+        }
+    }
+    return out
+}
+
+/**
+ * A command/tool subject is mono; an ask's question is prose with its `code`
+ * spans drawn as the web's `.perm-subj code` chip: page background, hairline
+ * border, small radius — painted behind the text from its layout, since a
+ * span style can fill a run but never border or round it.
+ */
 @Composable
 private fun PermSubject(kind: String, head: String?, text: String, modifier: Modifier = Modifier) {
     val prose = Permissions.subjectIsProse(kind, head)
-    val annotated = if (prose) buildAnnotatedString {
-        for ((run, code) in Permissions.proseRuns(text)) {
-            if (code) withStyle(SpanStyle(fontFamily = FontFamily.Monospace)) { append(run) } else append(run)
+    val annotated = if (prose) permProseText(text) else AnnotatedString(text)
+    val fill = MaterialTheme.colorScheme.background
+    val hairline = MaterialTheme.colorScheme.outlineVariant
+    var layout by remember { mutableStateOf<TextLayoutResult?>(null) }
+    val chips = if (prose && annotated.hasStringAnnotations(PERM_CODE_TAG, 0, annotated.length)) {
+        Modifier.drawBehind {
+            val l = layout ?: return@drawBehind
+            val stroke = 1.dp.toPx()
+            val radius = CornerRadius(4.dp.toPx())
+            for (r in codeChipRects(l, 1.dp.toPx())) {
+                drawRoundRect(fill, r.topLeft, r.size, radius)
+                // Inset half the stroke so the hairline sits inside the box, not across its edge.
+                val h = stroke / 2
+                drawRoundRect(
+                    hairline,
+                    Offset(r.left + h, r.top + h),
+                    Size(r.width - stroke, r.height - stroke),
+                    radius,
+                    style = Stroke(stroke),
+                )
+            }
         }
-    } else AnnotatedString(text)
+    } else Modifier
     Text(
         annotated,
         fontSize = if (prose) 13.sp else 12.sp,
         fontFamily = if (prose) null else FontFamily.Monospace,
         color = MaterialTheme.colorScheme.onSurface,
-        modifier = modifier,
+        onTextLayout = { layout = it },
+        modifier = modifier.then(chips),
     )
 }
 
@@ -287,12 +368,12 @@ private fun RecentPrompts(
         recent.forEachIndexed { i, r ->
             if (i > 0) HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.outlineVariant)
             Column(Modifier.fillMaxWidth().padding(vertical = 7.dp)) {
-                FlowRow(
-                    horizontalArrangement = Arrangement.spacedBy(10.dp),
-                    verticalArrangement = Arrangement.spacedBy(4.dp),
-                ) {
-                    PermKindChip(r.kind, r.dialogKind)
-                    PermSubject(r.kind, r.head, Permissions.subject(r))
+                // The subject sits BESIDE the chip and wraps in the width left
+                // over (web phone `.perm-recent .perm-subj { flex: 1 1 0 }`) —
+                // never dropped to a line of its own, an ask's question included.
+                Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                    PermKindChip(r.kind, r.dialogKind, Modifier.alignByBaseline())
+                    PermSubject(r.kind, r.head, Permissions.subject(r), Modifier.weight(1f).alignByBaseline())
                 }
                 // Host · wait/answer · age on a line of their own, host first.
                 FlowRow(

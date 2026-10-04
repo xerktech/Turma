@@ -32,6 +32,16 @@ class PermissionsTest {
         assertFalse(Permissions.subjectIsProse("dialog", null))
     }
 
+    @Test fun `a path is joined so no line breaker can split it, and reads back unchanged`() {
+        val wj = Permissions.WORD_JOINER
+        assertEquals("~$wj/$wj.${wj}c", Permissions.unbreakable("~/.c"))
+        val path = Permissions.unbreakable(Permissions.BEHAVIOUR_NOTE_CODE)
+        assertEquals(Permissions.BEHAVIOUR_NOTE_CODE, path.replace(wj, ""))
+        // Every slash and dot is held on both sides (the break the phone made was after a `/`).
+        assertFalse(Regex("[^\u2060][/.]|[/.][^\u2060]").containsMatchIn(path))
+        assertEquals("", Permissions.unbreakable(""))
+    }
+
     @Test fun `an ask's markdown renders code spans and drops bold markers in one pass`() {
         assertEquals(
             listOf("Delete " to false, "legacy/" to true, " " to false, "now" to false),

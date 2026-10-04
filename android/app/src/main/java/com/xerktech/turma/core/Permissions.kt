@@ -143,6 +143,14 @@ object Permissions {
     /** The path inside [BEHAVIOUR_NOTE] the web shows as `<code>`. */
     const val BEHAVIOUR_NOTE_CODE = "~/.claude/CLAUDE.md"
 
+    /**
+     * [s] with a WORD JOINER (U+2060, invisible) between every character, so a
+     * line breaker never splits it: a path like `~/.claude/CLAUDE.md` otherwise
+     * breaks after a `/` at phone widths. Compose has no per-span "nowrap".
+     */
+    fun unbreakable(s: String): String = s.toList().joinToString(WORD_JOINER)
+    const val WORD_JOINER = "\u2060"
+
     /** The card's lead note (web `permissionsCardHtml`'s head). */
     const val NOTE = "Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat " +
         "that held a session, grouped with the allow rule that would retire it. Follows the header's " +
