@@ -229,6 +229,16 @@ class SessionsTest {
         val quiet = finished.copy(session = finished.session!!.copy(lastRole = "user"))
         assertEquals(false, inReview(quiet, LiveState.IDLE))
         assertEquals(true, inReview(quiet.copy(attention = att("needs-you:stalled", now)), LiveState.IDLE))
+        // An OFFLINE host's attention is frozen at its last beat: a stale "working"
+        // or "waiting" must not keep its stranded finished work out of review (the
+        // local rule decides), while a needs-you it last reported stays listed.
+        val dead = now - 600_000L
+        assertEquals(true, inReview(finished.copy(attention = att("working", dead)), LiveState.IDLE, dead, now))
+        assertEquals(true, inReview(finished.copy(attention = att("waiting", dead)), LiveState.IDLE, dead, now))
+        assertEquals(false, inReview(quiet.copy(attention = att("working", dead)), LiveState.IDLE, dead, now))
+        assertEquals(true, inReview(quiet.copy(attention = att("needs-you:stalled", dead)), LiveState.IDLE, dead, now))
+        // Online, a "working" still keeps the finished turn out.
+        assertEquals(false, inReview(finished.copy(attention = att("working", now)), LiveState.IDLE, now, now))
     }
 
     @Test fun `attentionFor is the one age a needs-you fleet card shows`() {

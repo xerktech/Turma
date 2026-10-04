@@ -2431,10 +2431,15 @@ function attentionWhy(s, now) {
 // DECIDES (XERK-1571): every needs-you:* session is listed — a question, a
 // permission, a review, a stall — and nothing else, so the section is exactly
 // the set the dashboard's "Ready for review" tile counts. An older hub serves
-// none, and this page's own readyForReview mirror decides, as before.
+// none, and this page's own readyForReview mirror decides, as before. On an
+// OFFLINE host the hub's state is frozen at its last beat, so a non-needs-you
+// one ("working", "waiting") must not keep the host's stranded work out: the
+// local rule decides it too (XERK-235).
 function inReview(x) {
   const st = x.s.attention?.state;
-  if (typeof st === "string" && st) return st.startsWith("needs-you:");
+  if (typeof st === "string" && st.startsWith("needs-you:")) return true;
+  if (!x.a.online) return readyForReview(x.s, x.live);
+  if (typeof st === "string" && st) return false;
   return readyForReview(x.s, x.live);
 }
 

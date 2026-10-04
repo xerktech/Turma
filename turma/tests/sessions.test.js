@@ -476,6 +476,23 @@ test("attention: Ready for review lists every hub needs-you session, oldest firs
   const r2 = els2.review.innerHTML;
   assert.ok(r2.includes('<div class="state stalled">stalled · Watch CI'), r2);
   assert.ok(r2.includes('<span class="dot stalled"></span>'), r2);
+  // The reverse: a dead host's LAST non-needs-you state ("working", "waiting")
+  // is frozen, never re-judged, so it must not keep that host's stranded
+  // finished work out of review — the page's own rule decides it (XERK-235).
+  const { render: render3, els: els3 } = loadPage();
+  const { now: n3, host: h3 } = host([
+    { ...running("76666", "Died Mid Turn", { paneBusy: true, transcriptAgeSec: 700,
+        lastRole: "assistant", lastHasToolUse: false }), ...att("working", 12) },
+    { ...finished("77777", "Died Waiting"), ...att("waiting", 12) },
+  ]);
+  render3({ now: n3, agents: [{ ...h3, online: false, lastSeen: n3 - 10 * 60 * 1000 }] });
+  const r3 = els3.review.innerHTML;
+  assert.ok(r3.includes("Died Mid Turn") && r3.includes("Died Waiting"), r3);
+  // Online, the hub's "working" still decides: the finished turn is not listed.
+  const { render: render4, els: els4 } = loadPage();
+  const { now: n4, host: h4 } = host([{ ...finished("78888", "Hub Says Working"), ...att("working", 1) }]);
+  render4({ now: n4, agents: [h4] });
+  assert.ok(!els4.review.innerHTML.includes("Hub Says Working"), els4.review.innerHTML);
 });
 
 // XERK-1571 screenshot pass. A permission card says it waits for PERMISSION and

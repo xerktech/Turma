@@ -152,9 +152,16 @@ export function readyForReview(
 // needs-you:* session is listed (question, permission, review, stalled) and
 // nothing else — the set the dashboard's Ready-for-review tile counts. From an
 // older hub (no attention) the local readyForReview port decides, as before.
+// On an OFFLINE host the hub's state is frozen at its last beat, so a
+// non-needs-you one must not keep stranded work out: the local rule decides
+// it too (XERK-235).
 export function inReview(s: SessionInfo, hostLastSeen?: number, now?: number): boolean {
   const st = s.attention?.state;
-  if (typeof st === "string" && st) return st.startsWith("needs-you:");
+  if (typeof st === "string" && st.startsWith("needs-you:")) return true;
+  if (hostLastSeen != null && (now ?? Date.now()) - hostLastSeen >= OFFLINE_AFTER_MS) {
+    return readyForReview(s, hostLastSeen, now);
+  }
+  if (typeof st === "string" && st) return false;
   return readyForReview(s, hostLastSeen, now);
 }
 

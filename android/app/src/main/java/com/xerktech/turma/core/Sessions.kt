@@ -160,10 +160,22 @@ fun needsYou(session: SessionInfo): Boolean =
  * state it decides: every `needs-you:*` session is listed (question, permission,
  * review, stalled) and nothing else, so the group is the set the dashboard tile
  * counts. From an older hub (no attention) the local [readyForReview] port decides.
+ * On an OFFLINE host the hub's state is frozen at its last beat, so a non-needs-you
+ * one must not keep stranded work out: the local rule decides it too (XERK-235).
+ * A null [agentLastSeen] (a caller that cannot supply it) trusts the served state.
  */
-fun inReview(session: SessionInfo, state: LiveState): Boolean {
+fun inReview(
+    session: SessionInfo,
+    state: LiveState,
+    agentLastSeen: Long? = null,
+    now: Long = 0L,
+): Boolean {
     val att = session.attention?.state.orEmpty()
-    if (att.isNotEmpty()) return needsYouChip(att) != null
+    if (needsYouChip(att) != null) return true
+    if (agentLastSeen != null && now - agentLastSeen >= OFFLINE_AFTER_MS) {
+        return readyForReview(session, state)
+    }
+    if (att.isNotEmpty()) return false
     return readyForReview(session, state)
 }
 
