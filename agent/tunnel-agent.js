@@ -7,9 +7,9 @@
 // control endpoint. When a browser opens a session's terminal in the Turma,
 // the hub sends {"open":<ch>,"port":<ttydPort>} on that control channel; we then
 // dial back a data WebSocket for <ch> and bridge it to THAT session's local ttyd
-// (its owner-only UNIX socket, keyed by <port>; XERK-1588). The host multiplexes N per-session ttyds (one per port,
-// allocated from TTYD_PORT_BASE by the manager); data channels fan out to them
-// by port while the single control channel stays per-host. Because every
+// (its owner-only UNIX socket, keyed by <port>; XERK-1588). The host
+// multiplexes N per-session ttyds (one per port, allocated from TTYD_PORT_BASE by
+// the manager); data channels fan out to them by port while the single control channel stays per-host. Because every
 // connection here is outbound to TURMA_URL, the hub and this container can live on
 // different hosts/networks — no inbound reachability required.
 //
