@@ -161,6 +161,15 @@ class FleetTest {
         assertEquals(Int.MAX_VALUE, fleetSummary(listOf(a, b)).maxSessions)
     }
 
+    @Test fun `max sessions is null when the hub dropped every host's maxSessions`() {
+        // XERK-1485: a capacity block whose maxSessions the hub dropped (malformed or
+        // negative) must not read "N / 0" — web index.html shows the count alone.
+        val a = agent("h1", capacity = Capacity(running = 0, free = 0))
+        assertEquals(null, fleetSummary(listOf(a)).maxSessions)
+        val b = agent("h2", capacity = Capacity(maxSessions = 3))
+        assertEquals(3, fleetSummary(listOf(a, b)).maxSessions)
+    }
+
     @Test fun `max sessions sums only the hosts that report a capacity block`() {
         val a = agent("h1", capacity = Capacity(maxSessions = 4))
         val b = agent("old") // pre-capacity agent, no ceiling reported

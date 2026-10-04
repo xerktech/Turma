@@ -255,6 +255,8 @@ class SessionsFlattenTest {
         // No ceiling reported (pre-capacity agent) → no label, never "0 / 0".
         assertEquals(null, hostCapLabel(null))
         assertEquals(null, hostCapLabel(Capacity()))
+        // A 0 ceiling hides the label too, as the web's hostCapHtml `!(max > 0)` does.
+        assertEquals(null, hostCapLabel(Capacity(maxSessions = 0)))
     }
 
     // ---- collectSessions (the web collect(): queued + 3-channel ended) -------

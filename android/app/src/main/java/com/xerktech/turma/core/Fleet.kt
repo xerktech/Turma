@@ -89,9 +89,10 @@ fun fleetSummary(
     val spenders = agents + retired
     val sessions = agents.flatMap { it.sessions }
     // MAX_SESSIONS is per-agent, so the scoped fleet's ceiling is the sum across
-    // hosts that report a capacity block; null when none do (pre-capacity fleet),
-    // so the tile shows the running count alone rather than a misleading "/ 0".
-    val capHosts = agents.mapNotNull { it.capacity }
+    // hosts that report a usable maxSessions; null when none do (pre-capacity fleet,
+    // or the hub dropped a malformed one — XERK-1485), so the tile shows the running
+    // count alone rather than a misleading "/ 0". Same filter as index.html's capHosts.
+    val capHosts = agents.mapNotNull { it.capacity?.maxSessions }
     return FleetSummary(
         hostsOnline = agents.count { it.online },
         hostsTotal = agents.size,
@@ -101,7 +102,7 @@ fun fleetSummary(
         // Summed as Long and saturated: two hosts near Int.MAX_VALUE (the hub only
         // drops NEGATIVE counts, XERK-1479) would otherwise wrap to a negative ceiling.
         maxSessions = if (capHosts.isEmpty()) null
-            else capHosts.sumOf { it.maxSessions.toLong() }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
+            else capHosts.sumOf { it.toLong() }.coerceAtMost(Int.MAX_VALUE.toLong()).toInt(),
         // The SAME set the Sessions screen's Ready for review group lists
         // (XERK-1571, web index.html): every running session the hub serves a
         // needs-you:* attention for.
