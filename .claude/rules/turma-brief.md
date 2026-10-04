@@ -177,8 +177,11 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
     label) + `, plus a typed answer` for free text
     (`(a typed answer)` alone with no pick) — never its words: the log reaches every same-org
     session, and text typed for one must not;
-  - the pane-prompt route → `permissionWhy` FIRST, then the dialog's prompt (mostly a generic
-    "Do you want to proceed?"), + the picked option's label;
+  - the pane-prompt route → `permissionDecisionQuestion`: `permissionWhy` (the subject), + the
+    picked option's label;
+  - the dialog's question rides after the subject ONLY when it is not boilerplate —
+    `GENERIC_DIALOG_Q_RE` drops "Do you want to …?" / "Would you like to proceed?", which only pad
+    the line; with no subject (no `detail`) the question is all there is, generic or not.
   - `POST /api/orgs/<site>/decisions {text}` (operator-authed, 400 empty / 413 >500 / 404 an org no
     host is decided into, minting no key).
   - Nothing is logged for a drifted/unbound host, an unknown session, or no pending question. It is
@@ -193,8 +196,11 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
 - **Android TYPES both** (`OrgDecision`, `OrgBrief.narrative`, every field defaulted) — a new field
   is a `sanitizeDecision`/`sanitizeBrief` line AND a Kotlin field in the same change.
 - **Surfaces**: web `decisionsHtml` (newest 10, newest first, the note box for a live org; a draft
-  survives repaints via `drafts` + a focus restore); Android `BriefDecisions` read-only (composer
+  survives repaints via `drafts` + a focus restore); Android `OrgDecisionsCard` read-only (composer
   web-only, `android/PARITY.md`).
+  - **Its OWN card, after the org's brief card** (both clients) — the log is the org's, not part
+    of one brief's period, so it never sits among Spend / Earlier briefs. No rows + no note box = no
+    card. Test: the "own card AFTER the brief's" case in `brief-page.test.js`.
   - A row's meta names its session (`label`, clipped to 60 chars) — the only tie back for an
     answer with no ticket. Web `DECISION_LABEL_MAX` = Kotlin `BRIEF_DECISION_LABEL_MAX`.
 - Tests: the `XERK-1574:` cases in `server.test.js`, `brief-page.test.js`, android `BriefTest`,

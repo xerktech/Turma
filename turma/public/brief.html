@@ -68,6 +68,10 @@
   .brief-narrative-label { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 4px; }
   .brief-narrative p { margin: 0; font-size: 14px; line-height: 1.5; overflow-wrap: anywhere; }
   /* XERK-1574: the org's decisions log tail + the note composer. */
+  /* An org-level log, so its own card after the brief's (never inside the
+     brief's period). */
+  .brief-decisions .brief-org-name .n { color: var(--muted); font-weight: 400; font-size: 15px; }
+  .brief-decisions .brief-sec { margin-top: 0; }
   .brief-decision .kind { color: var(--ink-2); }
   .brief-note { display: flex; gap: 8px; margin-top: 8px; }
   .brief-note input {
@@ -223,14 +227,16 @@ function narrativeHtml(b) {
     + `<p>${esc(b.narrative)}</p></div>`;
 }
 
-// The org's decisions log (XERK-1574): the newest DECISIONS_SHOWN, newest first,
-// then — for an org a host is decided into — the note composer. `count` is how
-// many the org keeps (the hub's `decisionCounts`); the served list is only its
-// newest few, so it is a floor (an older hub sends no count).
+// The org's decisions log (XERK-1574) as its OWN card, after the brief's: it is
+// the org's log, not part of one brief's period. The newest DECISIONS_SHOWN,
+// newest first, then — for an org a host is decided into — the note composer.
+// `count` is how many the org keeps (the hub's `decisionCounts`); the served list
+// is only its newest few, so it is a floor (an older hub sends no count). `name`
+// is the org's display name, which ties the card to its brief.
 const DECISIONS_SHOWN = 10;
 const DECISION_LABEL_MAX = 60;   // the session's name in a row's meta line
 const DECISION_KIND = { question: "answered", permission: "permission", note: "note" };
-function decisionsHtml(site, list, now, live, count) {
+function decisionsHtml(site, list, now, live, count, name) {
   const rows = (Array.isArray(list) ? list : []).slice(-DECISIONS_SHOWN).reverse();
   if (!rows.length && !live) return "";
   const item = (d) => {
@@ -264,7 +270,10 @@ function decisionsHtml(site, list, now, live, count) {
       + ` placeholder="Record a decision for this org…" value="${esc(drafts.get(site) || "")}">`
       + `<button type="submit"${noteBusy.has(site) ? " disabled" : ""}>${noteBusy.has(site) ? "Adding…" : "Add"}</button></form>`
     : "";
-  return `<div class="brief-sec decisions"><h3>Decisions <span class="n">${total}</span></h3>${body}${form}</div>`;
+  return `<section class="brief-org brief-decisions"><div class="brief-head">`
+    + `<span class="brief-org-name">Decisions <span class="n">${total}</span></span>`
+    + `<span class="brief-when">${esc(name || site)} · the org's log, across every brief</span></div>`
+    + `<div class="brief-sec decisions">${body}${form}</div></section>`;
 }
 
 // `live` = a host is decided into this org; only then can the hub compile a brief
@@ -285,7 +294,7 @@ function orgHtml(site, list, now, live, decisions, decisionCount) {
   if (!b) {
     return `<section class="brief-org">${headHtml(site, name, "", live)}`
       + `<div class="brief-none">No brief yet — the hub compiles one every few hours, or press Brief now.</div>`
-      + decisionsHtml(site, decisions, now, live, decisionCount) + `</section>`;
+      + `</section>` + decisionsHtml(site, decisions, now, live, decisionCount, name);
   }
   const secs = SECTIONS.map(([k, label, cls]) => {
     const items = b[k] || [];
@@ -306,9 +315,8 @@ function orgHtml(site, list, now, live, decisions, decisionCount) {
     + (b.trigger === "manual" ? " · on demand" : "");
   return `<section class="brief-org">` + headHtml(site, name, when, live)
     + narrativeHtml(b) + countsHtml(b) + secs + spendHtml(b, now)
-    + decisionsHtml(site, decisions, now, live, decisionCount)
     + (earlier ? `<details class="brief-earlier"><summary>Earlier briefs (${list.length - 1})</summary><ul class="brief-list">${earlier}</ul></details>` : "")
-    + `</section>`;
+    + `</section>` + decisionsHtml(site, decisions, now, live, decisionCount, name);
 }
 
 function render(data) {

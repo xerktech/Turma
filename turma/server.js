@@ -15127,18 +15127,32 @@ function recordAnswerDecision(key, sessionId, kind, answer) {
   if (kind === "question") {
     question = typeof live.question === "string" ? live.question : "";
   } else {
-    // What was asked for first ("Bash: npm test"), then the dialog's own wording,
-    // which is mostly a generic "Do you want to proceed?".
-    const pp = live.panePrompt;
-    const prompt = pp && typeof pp.prompt === "string" ? pp.prompt : "";
-    const why = prompt ? permissionWhy(pp) : "";
-    question = why && why !== prompt ? `${why} — ${prompt}` : prompt;
+    question = permissionDecisionQuestion(live.panePrompt);
   }
   if (!question || !answer) return null;
   const ticket = s.ticket && typeof s.ticket.key === "string" ? s.ticket.key : undefined;
   const label = typeof s.summary === "string" && s.summary ? s.summary
     : (typeof s.label === "string" ? s.label : undefined);
   return appendDecision(org, { source: kind, question, answer, host: key, sessionId, ticket, label });
+}
+
+// A permission dialog's line in the decisions log: what was asked for first
+// ("Bash: npm test"), then the dialog's own question only when it says something.
+// Claude Code's questions are boilerplate — "Do you want to proceed?", "Do you
+// want to make this edit to <file>?", the plan approval's "Would you like to
+// proceed?" — and next to the subject they only pad the line, so they are
+// dropped; a question that is not one of those is kept, and with no subject the
+// question is all there is. Pure; "" for a dialog with no question.
+const GENERIC_DIALOG_Q_RE =
+  /^(?:claude has written up a plan and is ready to execute\.\s*)?(?:do you want to|would you like to)\b[^?\n]*\?$/i;
+function permissionDecisionQuestion(pp) {
+  const prompt = pp && typeof pp.prompt === "string" ? pp.prompt.trim() : "";
+  if (!prompt) return "";
+  // No detail = no subject: permissionWhy would only echo (or clip) the question.
+  if (typeof pp.detail !== "string" || !pp.detail.trim()) return prompt;
+  const why = permissionWhy(pp);
+  if (!why || why === prompt) return prompt;
+  return GENERIC_DIALOG_Q_RE.test(prompt.replace(/\s+/g, " ")) ? why : `${why} — ${prompt}`;
 }
 
 // The chosen option's own words: the labels the session offered for each picked
@@ -21645,7 +21659,7 @@ if (process.env.TURMA_TEST) {
     // install REPLACES the map.
     getBriefs: () => briefs,
     getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
-    decisionsWire, decisionCountsWire, decisionsReplyFor, cleanBriefNarrative, requestBriefNarrative,
+    decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, cleanBriefNarrative, requestBriefNarrative,
     ingestBriefNarratives, briefRenders, briefNarrativeInput,
     briefsCoerce, sanitizeBrief, compileBrief, briefSweep, briefTick, briefNeedsYouSig,
     briefDur, briefNextReason,

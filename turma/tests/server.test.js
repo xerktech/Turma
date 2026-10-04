@@ -23507,7 +23507,7 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
       sessionId: "q1", ticket: "XERK-9", label: "db work" },
     { source: "question", question: "Which DB?", answer: "Postgres; SQLite, plus a typed answer",
       host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
-    { source: "permission", question: "Bash: npm test — Do you want to proceed?", answer: "Yes",
+    { source: "permission", question: "Bash: npm test", answer: "Yes",
       host: "dcHostB", sessionId: "p1", label: "lbl" },
   ]);
   // A drifted host (bound to S, now declaring another org) is in NO org: its
@@ -23532,6 +23532,31 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
   delete agents.dcHostE;
   delete hub.getDecisions()[S];
   delete hub.getDecisions()[E];
+});
+
+test("XERK-1574: a permission's log line drops the dialog's boilerplate question beside its subject", () => {
+  const q = (prompt, detail) => hub.permissionDecisionQuestion({ prompt, detail });
+  // The subject says what was asked for; the TUI's stock questions add nothing.
+  assert.equal(q("Do you want to proceed?", "Bash command\nnpm test -- --runInBand"),
+    "Bash: npm test -- --runInBand");
+  assert.equal(q("Do you want to make this edit to server.js?", "Edit file\nturma/server.js"),
+    "Edit file: turma/server.js");
+  assert.equal(q("Do you want to create\n notes.md?", "Create file\nnotes.md"), "Create file: notes.md",
+    "a question the pane wrapped is still the stock one");
+  assert.equal(q("Do you want to allow Claude to fetch this content?", "Fetch\nhttps://example.com"),
+    "Fetch: https://example.com");
+  assert.equal(q("Claude has written up a plan and is ready to execute. Would you like to proceed?",
+    "Ship the brief page"), "Ship the brief page");
+  // A question that is not boilerplate stays, after the subject.
+  assert.equal(q("Allow access to the staging database?", "Bash command\npsql staging"),
+    "Bash: psql staging — Allow access to the staging database?");
+  assert.equal(q("Do you want to proceed? This deletes 40 files.", "Bash command\nrm -rf build"),
+    "Bash: rm -rf build — Do you want to proceed? This deletes 40 files.");
+  // No subject: the question is all there is, generic or not.
+  assert.equal(q("Do you want to proceed?", ""), "Do you want to proceed?");
+  assert.equal(q("Do you want to proceed?", undefined), "Do you want to proceed?");
+  assert.equal(q("", "Bash command\nnpm test"), "", "no question, nothing to log");
+  assert.equal(hub.permissionDecisionQuestion(undefined), "");
 });
 
 test("XERK-1574: the log is a bounded tail — 200 kept, 20 served, 30 on a reply", async () => {

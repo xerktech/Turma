@@ -81,20 +81,29 @@ fun BriefScreen(
             }
             items(sites.size, key = { sites[it] }) { i ->
                 val site = sites[i]
-                OrgBriefCard(
-                    site = site,
-                    brief = fleet.briefs[site]?.firstOrNull(),
-                    earlier = (fleet.briefs[site]?.size ?: 1) - 1,
-                    now = maxOf(fleet.now, System.currentTimeMillis()),
-                    busy = site in busy,
-                    canBrief = site in live,
-                    error = errors[site],
-                    decisions = fleet.decisions[site].orEmpty(),
-                    decisionCount = fleet.decisionCounts[site],
-                    onBriefNow = { vm.briefNow(site) },
-                    onOpenChat = onOpenChat,
-                    onOpenEnded = onOpenEnded,
-                )
+                val now = maxOf(fleet.now, System.currentTimeMillis())
+                // The brief's card, then the org's decisions log as its OWN card
+                // (XERK-1574) — the log is the org's, not part of one brief's period.
+                Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                    OrgBriefCard(
+                        site = site,
+                        brief = fleet.briefs[site]?.firstOrNull(),
+                        earlier = (fleet.briefs[site]?.size ?: 1) - 1,
+                        now = now,
+                        busy = site in busy,
+                        canBrief = site in live,
+                        error = errors[site],
+                        onBriefNow = { vm.briefNow(site) },
+                        onOpenChat = onOpenChat,
+                        onOpenEnded = onOpenEnded,
+                    )
+                    OrgDecisionsCard(
+                        site = site,
+                        decisions = fleet.decisions[site].orEmpty(),
+                        count = fleet.decisionCounts[site],
+                        now = now,
+                    )
+                }
             }
         }
     }
@@ -109,8 +118,6 @@ private fun OrgBriefCard(
     busy: Boolean,
     canBrief: Boolean,
     error: String?,
-    decisions: List<OrgDecision>,
-    decisionCount: Int?,
     onBriefNow: () -> Unit,
     onOpenChat: (String, String) -> Unit,
     onOpenEnded: (String, String) -> Unit,
@@ -154,37 +161,47 @@ private fun OrgBriefCard(
             } else {
                 BriefBody(brief, earlier, now, onOpenChat, onOpenEnded)
             }
-            BriefDecisions(decisions, decisionCount, now)
         }
     }
 }
 
 /**
- * The org's decisions log (XERK-1574) — web `decisionsHtml`: the newest few,
- * newest first. Read-only here; recording a note is web-only (android/PARITY.md).
+ * The org's decisions log (XERK-1574) as its own card after the brief's — web
+ * `decisionsHtml`: the count, the newest few newest first, "+N earlier". Read-only
+ * here; recording a note is web-only (android/PARITY.md). Nothing logged = no card.
  */
 @Composable
-private fun BriefDecisions(decisions: List<OrgDecision>, count: Int?, now: Long) {
+private fun OrgDecisionsCard(site: String, decisions: List<OrgDecision>, count: Int?, now: Long) {
     if (decisions.isEmpty()) return
     val total = briefDecisionTotal(decisions.size, count)
     val lines = briefDecisionLines(decisions, now)
-    Column {
-        Text(
-            "DECISIONS  $total",
-            style = MaterialTheme.typography.labelMedium,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
-        )
-        for ((title, meta) in lines) {
-            Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
-                Text(title, style = MaterialTheme.typography.bodyMedium)
-                Text(meta, style = MaterialTheme.typography.bodySmall,
+    TurmaCard(Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(14.dp)) {
+            Row(verticalAlignment = Alignment.Bottom) {
+                Text("Decisions", style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
+                Text(
+                    "  $total",
+                    style = MaterialTheme.typography.titleMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            Text(
+                "${orgName(site)} · the org's log, across every brief",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.padding(bottom = 4.dp),
+            )
+            for ((title, meta) in lines) {
+                Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
+                    Text(title, style = MaterialTheme.typography.bodyMedium)
+                    Text(meta, style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant)
+                }
+            }
+            if (total > lines.size) {
+                Text("+${total - lines.size} earlier", style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
-        }
-        if (total > lines.size) {
-            Text("+${total - lines.size} earlier", style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

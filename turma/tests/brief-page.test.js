@@ -169,3 +169,39 @@ test("brief.html: a decision row names the session it came from (XERK-1574)", ()
   assert.ok(html.includes(`${"x".repeat(59)}…`));
   assert.equal(html.includes("x".repeat(60)), false, "a long label is clipped");
 });
+
+// The whole org renderer (SECTIONS → orgHtml), with the page's globals stubbed.
+function loadOrgHtml() {
+  const end = "\nfunction render(data) {";
+  const src = slice("const SECTIONS = [", end).slice(0, -end.length);
+  const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
+  return new Function("esc", "TurmaBoard", "busy", "drafts", "noteBusy",
+    `${src}\nreturn orgHtml;`)(esc, { orgName: (s) => `Org ${s}` }, new Set(), new Map(), new Set());
+}
+
+test("brief.html: the decisions log is its own card AFTER the brief's, not inside its period (XERK-1574)", () => {
+  const orgHtml = loadOrgHtml();
+  const brief = { at: 9000, since: 1000, counts: { needsYou: 0 }, needsYou: [],
+    spend: [{ host: "h", fiveHourPct: 10 }] };
+  const older = { at: 4000, since: 1000, counts: {} };
+  const decs = [{ at: 1000, source: "note", text: "No infra merges.", label: "infra work" }];
+  const html = orgHtml("a.net", [brief, older], 9500, true, decs, 12);
+  const cards = html.split('<section class="brief-org').slice(1);
+  assert.equal(cards.length, 2, "one brief card, then one decisions card");
+  assert.equal(cards[0].includes("No infra merges."), false, "the brief card holds no decision");
+  assert.ok(cards[0].includes("Earlier briefs (1)"), "earlier briefs stay in the brief card");
+  assert.ok(cards[0].includes("<h3>Spend"));
+  assert.ok(cards[1].startsWith(' brief-decisions">'));
+  assert.ok(cards[1].includes("Org a.net"), "the card names its org");
+  assert.match(cards[1], /Decisions <span class="n">12<\/span>/);
+  assert.match(cards[1], /\+11 earlier/);
+  assert.ok(cards[1].includes("infra work"), "a row still names its session");
+  assert.match(cards[1], /data-note="a\.net"/, "the note box rides the decisions card");
+  // An org with no brief yet still gets its decisions card after the placeholder.
+  const none = orgHtml("a.net", [], 9500, true, decs, 1).split('<section class="brief-org').slice(1);
+  assert.equal(none.length, 2);
+  assert.ok(none[0].includes("No brief yet"));
+  assert.ok(none[1].includes("No infra merges."));
+  // Nothing logged and nowhere to add one: no decisions card at all.
+  assert.equal(orgHtml("a.net", [brief], 9500, false, [], 0).split('<section class="brief-org').length, 2);
+});
