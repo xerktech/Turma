@@ -2474,16 +2474,23 @@ class TestLoadTmuxConfig(unittest.TestCase):
         # `-f <conf> start-server` starts the server WITH the config (cold boot);
         # `source-file` applies it to an already-running server (warm/adopted).
         # Both on the agent's own server (XERK-1078), never the host's default.
-        self.assertEqual(calls[0], ["tmux", "-L", "turma", "-f", ha._TMUX_CONF, "start-server"])
-        self.assertEqual(calls[1], ["tmux", "-L", "turma", "source-file", ha._TMUX_CONF])
+        # First, a warm server's global env loses the agent's secrets (XERK-1577).
+        self.assertEqual(calls[0][:3], ["tmux", "-L", "turma"])
+        self.assertEqual([calls[0][i + 3] for i, w in enumerate(calls[0])
+                          if w == "set-environment"], list(ha._AGENT_SECRET_ENV))
+        self.assertEqual(calls[1], ["tmux", "-L", "turma", "-f", ha._TMUX_CONF, "start-server"])
+        self.assertEqual(calls[2], ["tmux", "-L", "turma", "source-file", ha._TMUX_CONF])
 
-    def test_skips_and_runs_no_tmux_when_the_conf_is_absent(self):
+    def test_skips_the_conf_but_still_strips_secrets_when_the_conf_is_absent(self):
         calls = []
         with mock.patch.object(ha.os.path, "exists", lambda p: False), \
              mock.patch.object(ha, "run_ok",
                                lambda cmd, **k: calls.append(cmd) or (0, "")):
             ha.load_tmux_config()
-        self.assertEqual(calls, [])
+        # Only the XERK-1577 unset: no config load, and nothing that starts a server.
+        self.assertEqual(len(calls), 1)
+        self.assertIn("set-environment", calls[0])
+        self.assertNotIn("start-server", calls[0])
 
     def test_never_raises_on_a_tmux_failure(self):
         with mock.patch.object(ha.os.path, "exists", lambda p: True), \
@@ -7290,7 +7297,7 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
     def test_a_probe_that_cannot_even_launch_backs_off_too(self):
         sm = self.make_manager()
 
-        def failing_launch(cmd, cwd=None, timeout=None):
+        def failing_launch(cmd, cwd=None, timeout=None, env=None):
             self.run_ok_calls.append(cmd)
             return 1, "tmux: command not found"
 
@@ -7450,7 +7457,8 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
             return 4321   # the published pty-host pid
 
         trust = []
-        with mock.patch.object(ha, "IS_WINDOWS", True), \
+        with mock.patch.dict(os.environ, {"TURMA_TOKEN": "s3cret"}), \
+                mock.patch.object(ha, "IS_WINDOWS", True), \
                 mock.patch.object(ha, "LIMITS_PROBE_TIMEOUT_SEC", 0), \
                 mock.patch.object(ha, "LIMITS_PROBE_TRUST_WAIT_SEC", 5), \
                 mock.patch.object(ha, "LIMITS_PROBE_TRUST_POLL_SEC", 0), \
@@ -7485,6 +7493,8 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # `VAR=x` prefix), and the failover endpoint is never sourced.
         self.assertEqual(captured["env"]["TURMA_LIMITS_PATH"], ha.LIMITS_PATH)
         self.assertNotIn("ANTHROPIC_BASE_URL", captured["env"])
+        # XERK-1577: the probe's claude never holds the agent's own token.
+        self.assertNotIn("TURMA_TOKEN", captured["env"])
         # It drove the trust-folder modal over the control channel (navigating to
         # accept, not blind-Enter), and always tears the pty-host down afterwards.
         self.assertEqual(trust, [ha.LIMITS_TMUX])
@@ -36949,6 +36959,61 @@ class TestAgentTmuxSocket(unittest.TestCase):
         # An operator's own CLAUDE_CODE_* setting survives.
         self.assertTrue("\nCLAUDE_CODE_USE_BEDROCK=1" in dumped)
 
+    def _pane_env_names(self, name):
+        env_dump = os.path.join(self.tmp, f"{name}.env")
+        sess = {"tmuxName": name, "worktreePath": self.tmp}
+        ha.SessionManager._spawn_in_tmux(
+            None, sess, f"env > {env_dump}.tmp; mv {env_dump}.tmp {env_dump}; "
+                        "exec sleep 30")
+        for _ in range(50):
+            if os.path.exists(env_dump):
+                break
+            time.sleep(0.1)
+        # Names only: never put a pane's env (tokens included) in a CI log.
+        return {ln.split("=", 1)[0] for ln in open(env_dump).read().splitlines()
+                if "=" in ln}
+
+    def test_a_polluted_warm_server_cannot_hand_a_pane_the_agents_token(self):
+        # XERK-1577: a server cold-started by a manager before the fix holds the
+        # whole turma-agent.env as its GLOBAL env; the per-pane unset is what
+        # keeps a session from reading TURMA_TOKEN out of it.
+        start = subprocess.run(
+            ["tmux", "-L", ha.TMUX_SOCKET, "new-session", "-d", "-s", "seed",
+             "sleep 30"], capture_output=True)
+        self.assertEqual(start.returncode, 0, start.stderr)
+        for k in ha._AGENT_SECRET_ENV + ("JIRA_TOKEN", "GITLAB_TOKEN"):
+            subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "set-environment",
+                            "-g", k, "s3cret"], check=True)
+        names = self._pane_env_names("agent-k3")
+        self.assertEqual(sorted(names & set(ha._AGENT_SECRET_ENV)), [])
+        # Board creds stay: sessions file and transition tickets with them.
+        self.assertLessEqual({"JIRA_TOKEN", "GITLAB_TOKEN"}, names)
+        # The pane unset alone leaves `tmux show-environment -g` able to hand
+        # them back; the manager's boot-time config load drops them from the
+        # warm server's global env too.
+        ha.load_tmux_config()
+        out = subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "show-environment",
+                              "-g"], capture_output=True, text=True)
+        glob = {ln.split("=", 1)[0] for ln in out.stdout.splitlines()}
+        self.assertEqual(sorted(glob & set(ha._AGENT_SECRET_ENV)), [])
+        self.assertIn("JIRA_TOKEN", glob)
+
+    def test_a_cold_started_server_never_holds_the_agents_token(self):
+        # The manager-side half: the server's global env is a copy of whatever
+        # started it, so load_tmux_config cold-starts it with the session env.
+        secrets = {k: "s3cret" for k in ha._AGENT_SECRET_ENV}
+        with mock.patch.dict(os.environ, dict(secrets, JIRA_TOKEN="j"),
+                             clear=False):
+            ha.load_tmux_config()
+            self.assertEqual(os.environ["TURMA_TOKEN"], "s3cret",
+                             "the manager keeps its own token")
+        out = subprocess.run(["tmux", "-L", ha.TMUX_SOCKET, "show-environment",
+                              "-g"], capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        names = {ln.split("=", 1)[0] for ln in out.stdout.splitlines()}
+        self.assertEqual(sorted(names & set(ha._AGENT_SECRET_ENV)), [])
+        self.assertIn("JIRA_TOKEN", names)
+
 
 class TestScrubClaudeSessionEnv(unittest.TestCase):
     """A manager started from inside a Claude session drops that session's
@@ -36982,6 +37047,36 @@ class TestScrubClaudeSessionEnv(unittest.TestCase):
         # The one that switches transcript saving off (Claude Code 2.1.285).
         self.assertIn("CLAUDE_CODE_CHILD_SESSION", ha._CLAUDE_SESSION_ENV)
         self.assertIn("CLAUDE_CODE_CHILD_SESSION", ha._TMUX_ENV_STRIP)
+
+    def test_every_pane_unsets_the_agents_own_secrets(self):
+        # XERK-1577: a pane never holds the agent's own token.
+        unset = ha._TMUX_ENV_STRIP.split(";")[0].split()
+        for k in ("TURMA_TOKEN", "TURMA_AGENT_TOKEN", "LOCAL_MODEL_API_KEY"):
+            self.assertIn(k, ha._AGENT_SECRET_ENV)
+            self.assertIn(k, unset)
+        # A NAMED list: the launch's own TURMA_* exports and the board creds
+        # sessions use by design are never stripped.
+        for k in ("TURMA_SESSION_ID", "TURMA_QUESTIONS_DIR", "TURMA_SESSION_CLI",
+                  "JIRA_TOKEN", "AZDO_TOKEN", "GITLAB_TOKEN"):
+            self.assertNotIn(k, unset)
+
+    def test_every_new_session_starts_tmux_with_the_session_env(self):
+        # Whichever `new-session` runs first after a server died cold-starts it,
+        # and the server's global env is a copy of that client's: each call site
+        # must hand tmux `_session_env()`, never the manager's own env.
+        src = inspect.getsource(ha)
+        calls = re.findall(r'run_ok\(_tmux\(\s*"new-session".*?\)\)?,?\s*env=(\w+)\(\)',
+                           src, re.S)
+        self.assertEqual(src.count('"new-session", "-d"'), 3)
+        self.assertEqual(calls, ["_session_env"] * 3)
+
+    def test_session_env_drops_secrets_and_markers_without_touching_its_base(self):
+        base = {k: "x" for k in ha._AGENT_SECRET_ENV + ha._CLAUDE_SESSION_ENV}
+        base.update({"PATH": "/bin", "JIRA_TOKEN": "j", "TURMA_URL": "u"})
+        before = dict(base)
+        self.assertEqual(ha._session_env(base),
+                         {"PATH": "/bin", "JIRA_TOKEN": "j", "TURMA_URL": "u"})
+        self.assertEqual(base, before)
 
 
 
@@ -37772,6 +37867,32 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         # The Windows path recorded NO token fingerprint at all, so nothing could
         # tell that a roll had moved the token under a surviving pty-host.
         self.assertEqual(sess["ttydTokenFp"], ha._token_fp("tok"))
+        # XERK-1577: node-pty hands claude this whole dict — no agent token.
+        self.assertNotIn("TURMA_TOKEN", captured["env"])
+
+    def test_spawn_pty_host_keeps_the_agent_secrets_out_of_the_session(self):
+        sm = self.make_manager()
+        sess = {"id": "w1", "tmuxName": "agent-w1", "ttydPort": 7742,
+                "worktreePath": self.tmp}
+        captured = {}
+
+        def fake_task(tmux_name, cmd, cwd, env, log_path):
+            captured.update(env=env)
+            self._write_state("agent-w1", pid=1234, ctrlPort=55000, termPort=7742)
+        secrets = {k: "s3cret" for k in ha._AGENT_SECRET_ENV}
+        with mock.patch.dict(os.environ, dict(secrets, JIRA_TOKEN="j")), \
+             mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha.shutil, "which", return_value=r"C:\claude.exe"), \
+             mock.patch.object(ha, "_pty_teardown"), \
+             mock.patch.object(ha, "_pty_task_cleanup"), \
+             mock.patch.object(ha, "_launch_pty_via_task", side_effect=fake_task):
+            # Failover's model credential arrives explicitly, so it survives.
+            sm._spawn_pty_host(sess, ["--session-id", "abc"],
+                               {"ANTHROPIC_AUTH_TOKEN": "gw"})
+        env = captured["env"]
+        self.assertEqual(sorted(set(env) & set(ha._AGENT_SECRET_ENV)), [])
+        self.assertEqual((env["JIRA_TOKEN"], env["ANTHROPIC_AUTH_TOKEN"]),
+                         ("j", "gw"))
 
     def test_spawn_pty_host_windows_raises_and_reaps_via_state_on_timeout(self):
         # On Windows the task-launched pty-host is NOT our child, so there is no
