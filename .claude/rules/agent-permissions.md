@@ -125,7 +125,8 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
   `<sid>.<nonce>.judge.req.json` (the WHOLE command, ≤ `JUDGE_COMMAND_MAX`; the random nonce lets
   parallel calls not clobber each other) and polls `.judge.ans.json` for at most `JUDGE_WAIT_SEC`
   (75s, under the hook's 90s timeout). It waits only while `judge.alive` is fresh — the worker
-  touches it every 10s and REMOVES it with no policy, so a stood-down judge costs no wait.
+  re-marks it before each request and model attempt (≤5s throttle) and REMOVES it with no
+  policy, so a stood-down judge costs no wait and a long pass never ages it out.
   `allow` → `retry: true` (PermissionDenied) or `decision.behavior: allow` (PermissionRequest);
   stand / no answer / a malformed one → prints nothing. The names are mirrored in hub-agent.py
   (parity-tested).
@@ -140,27 +141,38 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
 - **Requests are session-written**: read only via `_read_untrusted_json`, removed once read, name
   and every field re-validated; anything addressable but unusable (not Bash, not a running Claude
   session, too old, too long) is answered `stand` so its hook returns at once.
-- **Order**: `judge_never_reason` FIRST (force/mirror/deleting push, a push naming main/master,
-  branch deletion, PR merge/complete, mutating `gh api`, terraform apply/destroy, mutating
-  kubectl/helm/argocd, AWS/docker deletes, sudo, pipe-to-shell, Turma's/Claude's own state, and the
-  guard's own destructive/policy categories via `_guard_module`) → `stand`, no model call. kubectl
-  is stood in EVERY namespace (the worktree's namespaces are not knowable here). A guard that cannot
-  load stands everything. Else, with a policy, `claude -p --model haiku --tools ""
-  --strict-mcp-config` (list argv, cwd `REGISTRY_DIR`, no `--settings`, stdin DEVNULL,
-  `JUDGE_TIMEOUT_SEC` 20s, at most `JUDGE_ATTEMPTS`) over `JUDGE_INSTRUCTION` + the policy + the
-  request JSON-encoded as untrusted data.
+- **Order**: `judge_never_reason` FIRST (the never-list below) → `stand`, no model call. Else,
+  with a policy, `claude -p --model haiku --tools "" --strict-mcp-config` (list argv, cwd
+  `REGISTRY_DIR`, no `--settings`, stdin DEVNULL, `JUDGE_TIMEOUT_SEC` 20s, at most
+  `JUDGE_ATTEMPTS`) over `JUDGE_INSTRUCTION` + the policy + the request JSON-encoded as untrusted
+  data.
 - **The judge gets NO tools and NO MCP servers** — its input is ADVERSARIAL (text a session wrote
   to win an approval) and no guard runs in that process, so an injected instruction must have
   nothing to call (verified: the init event lists `tools: []`, `mcp_servers: []`). `--tools` is
   variadic: the boolean `--strict-mcp-config` must sit between it and the prompt.
-- **The never-list's flag/ref ends are shell punctuation too** (`_JUDGE_END`): `(git push
-  --mirror)`, `git push -f&&…`, `bash -c 'git push -f'` all stand. guard.py allows these, so the
-  never-list is the only layer in front of the model for them.
-- **git long options match by PREFIX** (`_judge_long_opt`): git takes any unique abbreviation, so
-  `--mirr`, `--del`, `--prun`, `--al` really push. A refspec or ref may sit behind a quote
-  (`'+feat'`, `'main'`). Also stood: `gh api …/merges`/`…/merge`/`refs/heads/main`, `gh repo sync
-  --force`, and a `remote.*.mirror|push` config (`git -c …`, `git config …`). Pin each new form in
-  `test_the_never_list_stands_before_any_model_call`.
+- **The never-list FAILS CLOSED by command FAMILY, never by flag spelling** (coordinator decision,
+  2026-10-04: three review rounds each found one more spelling — `--mirr`, a quoted `'+feat'`, a
+  glob refspec, REST `/merges`, GraphQL `mergePullRequest`, a curl to api.github.com). Stood whole:
+  - ANY `git push` (also `send-pack`/`http-push`/`hub push`) — auto mode already allows pushing a
+    session's own branch, so the judge never needs to approve one;
+  - git ref rewrites: `branch` with any delete/move/copy/force option or prefix, `update-ref`,
+    `symbolic-ref`, `tag -d/-f`, a `remote.*.push|mirror` / `alias.*` config, and any git
+    subcommand not in `_JUDGE_GIT_KNOWN` (an alias defined elsewhere can be `push`);
+  - ANY `gh|glab pr|mr merge`; ANY `gh api` with `-f/-F/--field/--raw-field/--input/-X/--method`
+    (any long prefix, any short cluster) and EVERY `graphql` call; `gh repo sync|delete|…`,
+    `release delete`, `workflow run`, any gh `delete`; `az repos pr update|complete`;
+  - any curl/wget/http/httpie/xh/Invoke-WebRequest to github.com or api.github.com;
+  - terraform/tofu apply/destroy/import/state-rm; mutating kubectl/oc (every namespace), helm,
+    argocd; AWS/docker deletes, sudo, pipe-to-shell, Turma's/Claude's own state; the guard's
+    own destructive/policy categories (`_guard_module`; one that cannot load stands everything).
+- **Two layers, either stands.** `_JUDGE_NEVER` matches the RAW text case-insensitively, so a
+  MENTION stands (`python -c "os.system('git push')"`). `_judge_family_reason` reads head +
+  subcommand of every command guard.py's `_expand_both` unwraps (bash -c, eval, xargs, env, sudo,
+  subshells, `$( )`), lower-cased, `.exe` dropped. A segment shlex cannot parse, a too-deep nest,
+  or a program/family word that is a `$VAR` or substitution also stands. Pin every family + the
+  spellings found in `NEVER_FAMILIES` (`test_the_never_list_stands_before_any_model_call`), and
+  the family layer alone in `test_the_family_layer_stands_without_the_raw_text_layer`. Never
+  narrow a family back to a list of dangerous flags.
 - **`parse_judge_verdict` is STRICT**: exactly one JSON object (one ``` fence tolerated) with
   exactly `verdict` (allow|stand) + non-empty `reason`. Anything else retries, then stands.
 - **On allow for a PermissionDenied**: the one-shot grant (`_write_grant`, `GRANTS_DIR/<sid>/

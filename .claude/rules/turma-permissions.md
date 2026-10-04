@@ -48,6 +48,7 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
 | Bash | `Bash(<head>:*)`; NONE for an interpreter/wrapper/keyword head, a bare subcommand CLI, a malformed one |
 | MCP | the full `mcp__<server>__<tool>` |
 | WebFetch | `WebFetch(domain:<d>)` |
+| `judged` (XERK-1566) | none — the prompt's own dialog/classifier row carries the rule; a stood one must never offer an allow |
 | a plan approval, a file path, anything else | none |
 
 - **A classifier block with no tool rule gets NO rule** — a sentence lifted from its deny reason

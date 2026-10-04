@@ -188,6 +188,11 @@ test("suggestedRule: the deterministic table", () => {
     [{ kind: "dialog", tool: "Edit", head: "/repo/a.py" }, null],
     [{ kind: "dialog", tool: "WebFetch", head: "not a host" }, null],
     [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "pytest" }, "Bash(pytest:*)"],
+    // XERK-1566: a judged row is the judge's verdict on a prompt whose own
+    // dialog/classifier row already carries the rule — none here, a STOOD one
+    // above all (a Copy-able allow for a never-listed command would mislead).
+    [{ kind: "judged", tool: "Bash", head: "npm run" }, null],
+    [{ kind: "judged", tool: "Bash", head: "git push", verdict: "stand" }, null],
   ];
   for (const [g, want] of cases) assert.equal(suggestedRule(g), want, JSON.stringify(g));
 });

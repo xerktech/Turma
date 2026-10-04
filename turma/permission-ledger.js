@@ -350,10 +350,16 @@ function toolRule(tool, head) {
  *                                      head outside a plain command shape (null)
  *   MCP                              → the full mcp__<server>__<tool>
  *   WebFetch                         → WebFetch(domain:<d>)
+ *   judged (XERK-1566)               → null: the judge's verdict on a prompt whose
+ *                                      own dialog/classifier row already carries
+ *                                      the actionable rule (a second Copy for the
+ *                                      same prompt, or one for a STOOD command,
+ *                                      would only mislead)
  *   anything else                    → null (no rule retires it)
  */
 function suggestedRule(g) {
   if (!g) return null;
+  if (g.kind === "judged") return null;
   if (g.kind === "ask-in-chat") return "model behaviour: see CLAUDE.md step 0";
   if (g.dialogKind === "sandbox" && g.head && HOST_RE.test(g.head)) {
     return `sandbox.network.allowedDomains: ${g.head}`;

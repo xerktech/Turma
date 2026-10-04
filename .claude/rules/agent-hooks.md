@@ -414,6 +414,13 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     path/protocol is never named in any reason or prompt a model reads; every judgement is a ledger
     row (`kind: judged`); the hard denies still win; the never-list stands any command naming
     `.turma/grants`. Never describe the judge as un-forgeable.
+  - **The judge's never-list is FAMILY-level and fails closed** — it stands (before any model call)
+    ANY `git push`, any git ref rewrite (branch delete/move/force, update-ref, tag -d, symbolic-ref,
+    a push/mirror config or alias), ANY `gh pr merge`, ANY `gh api` that is not a plain read
+    (any field/input/method flag, every `graphql`), any HTTP client to github.com, and terraform/
+    kubectl/helm/argocd mutators — matched on head + subcommand AFTER this file's own unwrapping
+    (`_expand_both`), and on anything shlex cannot parse. Never a list of flag spellings: each
+    review round found one more. Families + tests: `agent-permissions.md`.
   - **Real-host spike NOT run** (no agent host here): does `PermissionDenied`'s `retry: true`
     re-enter `PreToolUse` on the retried call, with the grant honoured? And what does the TUI show
     for a classifier block? If the retry never reaches guard.py, the grant goes unconsumed, expires

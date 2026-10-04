@@ -22571,7 +22571,9 @@ test("XERK-1566: a judged ledger row keeps its verdict and reason", async () => 
   assert.deepEqual([byId["j-s1-aa"].verdict, byId["j-s1-aa"].judgeReason],
     ["allow", "tests are pre-authorised"]);
   assert.equal(byId["j-s1-bb"].verdict, undefined, "an unknown verdict is dropped, never guessed");
-  assert.equal(view.body.top.find((g) => g.kind === "judged").count, 2);
+  const judged = view.body.top.find((g) => g.kind === "judged");
+  assert.equal(judged.count, 2);
+  assert.equal(judged.suggestedRule, null, "a judged group offers no rule to copy");
   delete agents["x1566-judged"];
 });
 

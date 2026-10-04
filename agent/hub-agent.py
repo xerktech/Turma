@@ -11544,70 +11544,102 @@ _JUDGE_TOOL_USE_ID_RE = re.compile(r"[A-Za-z0-9._:-]{1,128}")
 JUDGE_VERDICTS = ("allow", "stand")
 
 # What is NEVER auto-approved, whatever the policy text says: each stands (the
-# classifier's block, or the human's dialog, holds). Matched over the RAW
-# command text, so a mention inside a quoted message also stands — erring to
-# "a human decides", which is exactly today's behaviour. `[^\n;&|]*` keeps a
-# match inside one command segment. The guard's own destructive/policy
-# categories are checked too (`judge_never_reason`).
+# classifier's block, or the human's dialog, holds) before any model call.
+# The rule is FAMILY-level and fails closed: a whole command family stands
+# (ANY `git push`, ANY `gh pr merge`, ANY `gh api` call that is not a plain
+# read…), never a list of dangerous flag spellings — three review rounds each
+# found one more spelling (`--mirr`, a quoted `'+feat'`, a glob refspec, REST
+# `/merges`, GraphQL `mergePullRequest`, a curl to api.github.com). Auto mode
+# already allows pushing a session's own branch, so no push needs the judge.
+#
+# Two layers, either one standing:
+#   1. `_JUDGE_NEVER` over the RAW text, case-insensitive: a MENTION stands
+#      (`python -c "os.system('git push …')"`, `git submodule foreach 'git
+#      push'`), erring to "a human decides" — exactly today's behaviour.
+#   2. `_judge_family_reason` over every command guard.py's `_expand_both`
+#      unwraps (bash -c, eval, xargs, env, sudo, subshells, `$( )`): head and
+#      subcommand after that unwrapping, lower-cased. A segment shlex cannot
+#      parse, a program name that is a substitution or variable, or a family
+#      word that is one, stands too.
+# The guard's own destructive/policy categories are checked last.
 _JUDGE_SEG = r"[^\n;&|]*"
-# Where a flag or ref ENDS: whitespace, the end, or shell punctuation — so
-# `(git push --mirror)`, `git push -f&&…` and a quoted `bash -c` form match too.
+# Where a flag ends: whitespace, the end, or shell punctuation.
 _JUDGE_END = r"(?=[\s'\"`;&|()<>]|$)"
 # Where an abbreviated long option ends (also `=`, its value).
 _JUDGE_OPT_END = r"(?=[=\s'\"`;&|()<>]|$)"
-# A ref or refspec may sit behind quotes (`'+feat'`, `"main"`, `$'…'`).
-_JUDGE_QUOTE = r"\$?['\"]*"
 
 
 def _judge_long_opt(*names):
     """`--<any non-empty prefix of a name>`. git accepts a unique prefix of a
-    long option (`--mirr`, `--del`, `--prun`), so matching only the full word
-    misses ordinary forms. A prefix git would call ambiguous matches too —
-    erring to "a human decides"."""
+    long option (`--del`, `--mo`), so matching only the full word misses
+    ordinary forms. A prefix git would call ambiguous matches too — erring to
+    "a human decides"."""
     alts = sorted({n[:i] for n in names for i in range(1, len(n) + 1)},
                   key=len, reverse=True)
     return r"\s--(?:" + "|".join(re.escape(a) for a in alts) + ")" + _JUDGE_OPT_END
 
 
+def _judge_re(pattern):
+    return re.compile(pattern, re.IGNORECASE)
+
+
+_JUDGE_HTTP_HEADS = ("curl", "wget", "http", "https", "httpie", "xh", "xhs", "curlie",
+                     "aria2c", "lwp-request", "invoke-webrequest", "invoke-restmethod",
+                     "iwr", "irm")
+
 _JUDGE_NEVER = (
-    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bpush\b{_JUDGE_SEG}"
-                r"(?:\s--force\S*" + _JUDGE_END +
-                "|" + _judge_long_opt("force", "mirror", "all", "delete", "prune") +
-                r"|\s-[A-Za-z0-9]*[fd][A-Za-z0-9]*" + _JUDGE_END +
-                r"|[\s=]" + _JUDGE_QUOTE + r"[+:]\S)"),
-     "a force, mirror, all-branch, pruning or deleting push"),
-    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bpush\b{_JUDGE_SEG}[\s:/]" + _JUDGE_QUOTE +
-                r"(?:main|master)(?=[\s'\"`;&|()<>:]|$)"),
-     "a push naming main or master"),
-    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bbranch\b{_JUDGE_SEG}"
-                r"(?:\s-[A-Za-z]*[dD][A-Za-z]*" + _JUDGE_END +
-                "|" + _judge_long_opt("delete") + ")"),
-     "deleting a branch"),
-    # A remote's mirror/push config (`git -c remote.origin.mirror=true push`,
-    # `git config remote.origin.push '+refs/*'`) turns a plain push into one.
-    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bremote\.[^\s=]*\.(?:mirror|push)\b", re.IGNORECASE),
-     "a remote's mirror or push config"),
-    (re.compile(r"\b(?:gh|glab)\s+(?:pr|mr)\s+merge\b"), "merging a PR/MR"),
-    (re.compile(r"\baz\s+repos\s+pr\s+(?:update|complete)\b"), "completing a PR"),
-    (re.compile(rf"\bgh\s+api\b{_JUDGE_SEG}(?:-X|--method)[\s=]*['\"]?(?:DELETE|PUT|PATCH)\b",
-                re.IGNORECASE), "a mutating gh api call"),
-    # A merge through the REST API (`…/merges` — `-f` alone makes gh POST —
-    # `…/pulls/N/merge`, `…/merge-upstream`) or any call naming the default
-    # branch's ref.
-    (re.compile(rf"\bgh\s+api\b{_JUDGE_SEG}(?:/merges?\b|\brefs/heads/(?:main|master)\b)"),
-     "a merge or default-branch change through gh api"),
-    (re.compile(rf"\bgh\s+repo\s+sync\b{_JUDGE_SEG}\s--force\b"), "a forced gh repo sync"),
-    (re.compile(r"\bgh\s+(?:repo|release|secret|variable|run|cache)\s+delete\b"),
+    (_judge_re(rf"\b(?:git|hub)\b{_JUDGE_SEG}\b(?:push|send-pack|http-push)\b"), "a git push"),
+    (_judge_re(rf"\b(?:git|hub)\b{_JUDGE_SEG}\b(?:update-ref|symbolic-ref)\b"),
+     "a git ref rewrite"),
+    (_judge_re(rf"\bgit\b{_JUDGE_SEG}\bbranch\b{_JUDGE_SEG}"
+               r"(?:\s-[A-Za-z]*[dmcf][A-Za-z]*" + _JUDGE_END +
+               "|" + _judge_long_opt("delete", "move", "copy", "force") + ")"),
+     "deleting, moving or forcing a branch"),
+    (_judge_re(rf"\bgit\b{_JUDGE_SEG}\btag\b{_JUDGE_SEG}"
+               r"(?:\s-[A-Za-z]*[df][A-Za-z]*" + _JUDGE_END +
+               "|" + _judge_long_opt("delete", "force") + ")"),
+     "deleting or forcing a tag"),
+    # A remote's mirror/push config (`git -c remote.origin.mirror=true …`,
+    # `git config remote.origin.push '+refs/*'`), a push rewrite, or an alias
+    # (which can name any subcommand) turns an innocent command into a push.
+    (_judge_re(rf"\bgit\b{_JUDGE_SEG}(?:\bremote\.[^\s=]*\.(?:mirror|push|pushurl)\b|"
+               r"\balias\.|\burl\.[^\s=]*\.pushinsteadof\b)"),
+     "a git push/mirror config or alias"),
+    (_judge_re(rf"\b(?:gh|glab|hub)\b{_JUDGE_SEG}\b(?:pr|mr)\b{_JUDGE_SEG}\bmerge\b"),
+     "merging a PR/MR"),
+    (_judge_re(rf"\baz\b{_JUDGE_SEG}\brepos\b{_JUDGE_SEG}\bpr\s+(?:update|complete)\b"),
+     "completing a PR"),
+    # `gh api` is a plain read only with no field, input or method flag, and
+    # never through `graphql` (whose mutations merge and rewrite refs).
+    (_judge_re(rf"\b(?:gh|glab|hub)\b{_JUDGE_SEG}\bapi\b{_JUDGE_SEG}"
+               r"(?:\bgraphql\b|\s-[A-Za-z]*[fx]|" +
+               _judge_long_opt("field", "raw-field", "input", "method") + ")"),
+     "a gh api call that is not a plain read"),
+    (_judge_re(r"\b(?:mergePullRequest|enablePullRequestAutoMerge|mergeBranch|deleteRef|"
+               r"updateRefs?|createRef|updatePullRequestBranch|deleteRepository|"
+               r"(?:create|update|delete)BranchProtectionRule)\b"),
+     "a GitHub GraphQL mutation"),
+    (_judge_re(r"\bapi\.github\.com\b"), "a request to GitHub's API"),
+    (_judge_re(r"(?:^|[\s;&|(`'\"])(?:curl|wget|httpie|xh|xhs|curlie|aria2c|"
+               rf"invoke-webrequest|invoke-restmethod)\b{_JUDGE_SEG}github\.com\b"),
+     "a request to github.com"),
+    (_judge_re(rf"\bgh\b{_JUDGE_SEG}\b(?:repo\s+(?:sync|delete|archive|rename|edit)|"
+               r"release\s+delete|workflow\s+run)\b"),
+     "a gh repo/release/workflow change"),
+    (_judge_re(r"\bgh\s+(?:repo|release|secret|variable|run|cache|label|ruleset)\s+delete\b"),
      "a gh delete"),
-    (re.compile(rf"\b(?:terraform|tofu|terragrunt)\b{_JUDGE_SEG}"
-                r"\b(?:apply|destroy|import|taint)\b|\bterraform\s+state\s+(?:rm|mv|push)\b"),
-     "terraform apply/destroy"),
-    (re.compile(rf"\bkubectl\b{_JUDGE_SEG}\b(?:apply|delete|patch|replace|scale|edit|"
-                r"drain|cordon|uncordon|rollout|create|set|annotate|label|taint|exec|cp)\b"),
+    (_judge_re(rf"\b(?:terraform|tofu|terragrunt)\b{_JUDGE_SEG}"
+               r"\b(?:apply|destroy|import|taint|untaint|force-unlock)\b|"
+               r"\b(?:terraform|tofu)\s+state\s+(?:rm|mv|push|replace-provider)\b"),
+     "terraform apply/destroy/import"),
+    (_judge_re(rf"\bkubectl\b{_JUDGE_SEG}\b(?:apply|delete|patch|replace|scale|edit|"
+               r"drain|cordon|uncordon|rollout|create|set|annotate|label|taint|exec|cp|"
+               r"run|expose|autoscale|debug|attach)\b"),
      "a mutating kubectl call"),
-    (re.compile(rf"\bhelm\b{_JUDGE_SEG}\b(?:install|upgrade|uninstall|delete|rollback)\b"),
+    (_judge_re(rf"\bhelm\b{_JUDGE_SEG}\b(?:install|upgrade|uninstall|delete|rollback)\b"),
      "a helm release change"),
-    (re.compile(rf"\bargocd\b{_JUDGE_SEG}\b(?:sync|delete|set|rollback|terminate-op)\b"),
+    (_judge_re(rf"\bargocd\b{_JUDGE_SEG}\b(?:sync|delete|set|unset|rollback|terminate-op|"
+               r"patch|create|edit)\b"),
      "an argocd change"),
     (re.compile(rf"\baws\b{_JUDGE_SEG}(?:\s(?:rb|rm)\b|\bdelete-|\bterminate-)"),
      "an AWS delete"),
@@ -11622,6 +11654,165 @@ _JUDGE_NEVER = (
                 r"/home/[^/\s]+)/\.(?:turma|claude)\b|\.claude\.json\b"),
      "Turma's or Claude Code's own state"),
 )
+
+# --- layer 2: the command families, over guard.py's unwrapped commands -------
+# A program name or family word the judge cannot read: a `$VAR`, a backtick,
+# or guard.py's stand-in for a substitution whose output is unknown.
+_JUDGE_OPAQUE_RE = re.compile(r"[$`]|turma_substituted_value")
+_JUDGE_PROG_EXT_RE = re.compile(r"\.(?:exe|cmd|bat|com|ps1)$")
+_JUDGE_GIT_PUSHES = frozenset(("push", "send-pack", "http-push"))
+_JUDGE_GIT_REF_WRITERS = frozenset(("update-ref", "symbolic-ref"))
+_JUDGE_GIT_CONFIG_RE = _judge_re(r"(?:^|[=\s])(?:remote\.\S*\.(?:mirror|push|pushurl)\b|"
+                                 r"alias\.|url\.\S*\.pushinsteadof\b)")
+# The git subcommands the judge knows. Any other — an alias defined outside
+# this command, a typo, a future builtin — stands: an alias can be `push`.
+_JUDGE_GIT_KNOWN = frozenset((
+    "add", "am", "annotate", "apply", "archive", "bisect", "blame", "branch", "bundle",
+    "cat-file", "check-attr", "check-ignore", "check-ref-format", "checkout",
+    "cherry", "cherry-pick", "clean", "clone", "commit", "commit-tree", "config",
+    "count-objects", "describe", "diff", "diff-files", "diff-index", "diff-tree",
+    "difftool", "fetch", "for-each-ref", "format-patch", "fsck", "gc", "grep",
+    "hash-object", "help", "init", "interpret-trailers", "lfs", "log", "ls-files",
+    "ls-remote", "ls-tree", "maintenance", "merge", "merge-base", "merge-file",
+    "merge-tree", "mergetool", "mv", "name-rev", "notes", "prune", "pull",
+    "range-diff", "read-tree", "rebase", "reflog", "remote", "repack", "replace",
+    "rerere", "reset", "restore", "rev-list", "rev-parse", "revert", "rm",
+    "shortlog", "show", "show-branch", "show-ref", "sparse-checkout", "stash",
+    "status", "stripspace", "submodule", "switch", "tag", "update-index", "var",
+    "verify-commit", "verify-pack", "verify-tag", "version", "whatchanged",
+    "worktree", "write-tree", "--version", "--help", "-h"))
+_JUDGE_GH_PAIRS = {
+    ("pr", "merge"): "merging a PR/MR", ("mr", "merge"): "merging a PR/MR",
+    ("repo", "sync"): "a gh repo/release/workflow change",
+    ("repo", "delete"): "a gh repo/release/workflow change",
+    ("repo", "archive"): "a gh repo/release/workflow change",
+    ("repo", "rename"): "a gh repo/release/workflow change",
+    ("repo", "edit"): "a gh repo/release/workflow change",
+    ("release", "delete"): "a gh repo/release/workflow change",
+    ("workflow", "run"): "a gh repo/release/workflow change",
+    ("secret", "set"): "a gh repo/release/workflow change",
+    ("variable", "set"): "a gh repo/release/workflow change",
+}
+_JUDGE_FAMILY_VERBS = (
+    (frozenset(("terraform", "tofu", "terragrunt")),
+     frozenset(("apply", "destroy", "import", "taint", "untaint", "force-unlock")),
+     "terraform apply/destroy/import"),
+    (frozenset(("kubectl", "oc", "kubecolor")),
+     frozenset(("apply", "create", "delete", "edit", "patch", "replace", "scale", "rollout",
+                "annotate", "label", "drain", "cordon", "uncordon", "set", "taint", "exec",
+                "cp", "run", "expose", "autoscale", "debug", "attach")),
+     "a mutating kubectl call"),
+    (frozenset(("helm",)),
+     frozenset(("install", "upgrade", "uninstall", "delete", "rollback")),
+     "a helm release change"),
+    (frozenset(("argocd",)),
+     frozenset(("sync", "delete", "set", "unset", "rollback", "terminate-op", "patch",
+                "create", "edit")),
+     "an argocd change"),
+)
+
+
+def _judge_prog(token):
+    """A program name as the never-list compares it: basename, lower-cased
+    (`GIT`, `/usr/bin/Git.exe` are git where the filesystem folds case)."""
+    return _JUDGE_PROG_EXT_RE.sub("", re.split(r"[\\/]", token)[-1].lower())
+
+
+def _judge_opt_hits(token, longs, shorts):
+    """`token` is an option naming one of `longs` (any prefix, `=value` too)
+    or a short cluster carrying one of `shorts` (`-iXPUT`, `-fkey=v`)."""
+    if token.startswith("--"):
+        name = token[2:].split("=", 1)[0].lower()
+        return bool(name) and any(n.startswith(name) for n in longs)
+    return token.startswith("-") and len(token) > 1 and any(c in shorts for c in token[1:])
+
+
+def _judge_git_reason(guard, tokens):
+    lowered = [t.lower() for t in tokens[1:]]
+    if any(t in _JUDGE_GIT_PUSHES for t in lowered):
+        return "a git push"
+    if any(t in _JUDGE_GIT_REF_WRITERS for t in lowered):
+        return "a git ref rewrite"
+    if any(_JUDGE_GIT_CONFIG_RE.search(t) for t in tokens[1:]):
+        return "a git push/mirror config or alias"
+    args = guard._git_args(tokens)
+    if not args:
+        return None
+    sub = args[0].lower()
+    if _JUDGE_OPAQUE_RE.search(sub):
+        return "a git command the judge cannot read"
+    if sub not in _JUDGE_GIT_KNOWN:
+        return "a git command the judge does not know (an alias?)"
+    opaque = any(_JUDGE_OPAQUE_RE.search(t) for t in args[1:])
+    if sub == "branch":
+        if opaque or any(_judge_opt_hits(t, ("delete", "move", "copy", "force"), "dDmMcCf")
+                         for t in args[1:]):
+            return "deleting, moving or forcing a branch"
+    if sub == "tag":
+        if opaque or any(_judge_opt_hits(t, ("delete", "force"), "df") for t in args[1:]):
+            return "deleting or forcing a tag"
+    if sub == "config" and opaque:
+        return "a git config the judge cannot read"
+    return None
+
+
+def _judge_gh_reason(prog, rest):
+    pos = [t.lower() for t in rest if not t.startswith("-")]
+    if any(_JUDGE_OPAQUE_RE.search(p) for p in pos[:2]):
+        return f"a {prog} command the judge cannot read"
+    for pair in zip(pos, pos[1:]):
+        if pair in _JUDGE_GH_PAIRS:
+            return _JUDGE_GH_PAIRS[pair]
+    if any(p in ("delete", "delete-asset") for p in pos):
+        return "a gh delete"
+    if prog == "az" and (("pr", "update") in zip(pos, pos[1:])
+                         or ("pr", "complete") in zip(pos, pos[1:])):
+        return "completing a PR"
+    if "api" in pos and prog != "az":
+        after = rest[[t.lower() for t in rest].index("api") + 1:]
+        for t in after:
+            low = t.lower()
+            if "graphql" in low:
+                return "a GraphQL call through gh api"
+            if _JUDGE_OPAQUE_RE.search(t) \
+                    or _judge_opt_hits(t, ("field", "raw-field", "input", "method"), "fFX"):
+                return "a gh api call that is not a plain read"
+    return None
+
+
+def _judge_family_reason(guard, tokens):
+    """Why one unwrapped command (`tokens`, after guard.py's prefix strip)
+    is on the never-list by its FAMILY, or None."""
+    if _JUDGE_OPAQUE_RE.search(tokens[0]):
+        return "a command whose program the judge cannot read"
+    prog = _judge_prog(tokens[0])
+    rest = tokens[1:]
+    if prog in ("git", "hub"):
+        reason = _judge_git_reason(guard, tokens) if prog == "git" else None
+        if prog == "hub":
+            lowered = [t.lower() for t in rest]
+            if any(t in _JUDGE_GIT_PUSHES | _JUDGE_GIT_REF_WRITERS for t in lowered):
+                reason = "a git push"
+        if reason:
+            return reason
+    if prog in ("gh", "glab", "hub", "az"):
+        return _judge_gh_reason(prog, rest)
+    if prog in _JUDGE_HTTP_HEADS:
+        if any("github.com" in t.lower() or _JUDGE_OPAQUE_RE.search(t) for t in rest):
+            return "a request to github.com"
+        return None
+    for progs, verbs, label in _JUDGE_FAMILY_VERBS:
+        if prog in progs:
+            pos = [t.lower() for t in rest if not t.startswith("-")]
+            if any(p in verbs or _JUDGE_OPAQUE_RE.search(p) for p in pos):
+                return label
+            if prog in ("terraform", "tofu") and "state" in pos:
+                state_verbs = {"rm", "mv", "push", "replace-provider"}
+                if state_verbs & set(pos):
+                    return label
+            return None
+    return None
+
 
 _GUARD_MODULE = None
 
@@ -11653,9 +11844,11 @@ def judge_grant_key(command):
 
 def judge_never_reason(command):
     """Why `command` is never auto-approved, or None. The deterministic half of
-    the judge: runs BEFORE any model call. A guard that cannot load or classify
-    fails CLOSED here (a reason), since a model must never be asked about a
-    command the guard could not vet."""
+    the judge: runs BEFORE any model call, and FAILS CLOSED — a raw mention of
+    a never-list family, any unwrapped command in one (`_judge_family_reason`),
+    a segment shlex cannot parse, a nesting too deep to read, a guard that
+    cannot load or classify: each is a reason, since a model must never be
+    asked about a command the guard could not vet."""
     for pattern, label in _JUDGE_NEVER:
         if pattern.search(command):
             return label
@@ -11663,6 +11856,16 @@ def judge_never_reason(command):
     if guard is None:
         return "the safety guard is unavailable"
     try:
+        for tokens, segment, *_flags in guard._expand_both(command):
+            if tokens[0] == guard._TOO_DEEP:
+                return "a command nested too deeply to read"
+            try:
+                shlex.split(segment, comments=True)
+            except ValueError:
+                return "a command the judge could not parse"
+            family = _judge_family_reason(guard, tokens)
+            if family:
+                return family
         if guard.is_destructive(command):
             return "the safety guard's destructive category"
         if guard.policy_reason(command):

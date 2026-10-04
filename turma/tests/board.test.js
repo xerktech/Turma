@@ -3204,6 +3204,25 @@ test("XERK-1566: the permission policy panel loads, saves and resets the org's t
   assert.match(panel(), /data-perm-default="1" disabled/);
 });
 
+test("XERK-1566: a refused permission-policy save keeps the operator's edit", async () => {
+  let refuse = false;
+  const fetch = async (url) => {
+    if (!url.includes("/permission-policy")) return new Promise(() => {});   // the boot poll
+    if (refuse) return { ok: false, status: 413, json: async () => ({ error: "text too long" }) };
+    return { ok: true, status: 200, json: async () => ({ text: "Allow tests.", isDefault: false }) };
+  };
+  const page = loadBoardPage({ fetch });
+  page.setSites([{ siteKey: "acme.atlassian.net", orgName: "" }]);
+  page.openPermissionPanel();
+  await new Promise((r) => setImmediate(r));
+  refuse = true;
+  await page.savePermissionPolicy("My long draft");
+  const panel = page.els("permissionRulesPanel").innerHTML;
+  assert.match(panel, /data-perm-text="1"[^>]*>My long draft<\/textarea>/,
+    "the busy/refusal repaints rebuild the textarea from the draft, not the served text");
+  assert.doesNotMatch(panel, />Allow tests\.<\/textarea>/);
+});
+
 test("XERK-1566: the permission policy modal never uses a bare policy* id (XERK-587)", () => {
   assert.ok(BOARD_HTML.includes('id="permissionRulesBackdrop"'));
   assert.ok(BOARD_HTML.includes('id="permissionRulesPanel"'));
