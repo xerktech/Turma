@@ -3917,10 +3917,16 @@ def _await_unix_sock(path, proc, timeout=2.0):
     """Wait for a just-launched ttyd's socket to appear. ttyd that cannot bind
     keeps running bound to nothing rather than exiting, so its pid alone proves
     nothing. It binds in milliseconds; stops early if the process exits."""
+    def is_sock():
+        try:
+            return stat.S_ISSOCK(os.lstat(path).st_mode)
+        except OSError:
+            return False
+
     deadline = time.monotonic() + timeout
-    while not os.path.exists(path):
+    while not is_sock():
         if proc.poll() is not None or time.monotonic() >= deadline:
-            return os.path.exists(path)
+            return is_sock()
         time.sleep(0.05)
     return True
 
@@ -24289,8 +24295,7 @@ class SessionManager:
                 return  # already serving (e.g. an in-process restart keeps ttyd up)
             log(f"ttyd for {sess['id']}: attached to another tmux server; "
                 "relaunching it on the session's")
-            self._kill_ttyd(sess["id"])
-            self._await_port_free(sess.get("ttydPort"))
+            self._kill_and_await_ttyd(sess)
         # Adopt a ttyd of OURS that outlived a *manager* restart: ttyd is its own
         # daemon, so on a native in-place update (systemd KillMode=process /
         # manager-only kill) the old ttyd keeps holding this session's stable
@@ -24320,8 +24325,7 @@ class SessionManager:
                 else:
                     log(f"ttyd for {sess['id']}: a surviving ttyd predates the owner-only "
                         "socket (XERK-1588); relaunching it there")
-                self._kill_ttyd(sess["id"])
-                self._await_port_free(sess.get("ttydPort"))
+                self._kill_and_await_ttyd(sess)
         if len(os.fsencode(sock)) > _UNIX_SOCK_PATH_MAX:
             raise RuntimeError(f"ttyd launch failed: socket path too long ({sock})")
         try:
@@ -24382,6 +24386,40 @@ class SessionManager:
         if not _await_unix_sock(sock, proc):
             self._kill_ttyd(sess["id"])
             raise RuntimeError(f"ttyd launch failed: it never listened on {sock}")
+
+    def _kill_and_await_ttyd(self, sess):
+        """Kill a session's ttyd and wait for it to EXIT before a relaunch binds.
+
+        A socket ttyd unlinks its socket file as it exits (XERK-1588), so one
+        that dies after its replacement bound would delete the NEW socket and
+        leave the terminal dead; a TCP one (an older agent's) must release its
+        port. Bounded: a ttyd still running after the wait is SIGKILLed, which
+        unlinks nothing."""
+        proc = self.ttyd.get(sess["id"])
+        pid = sess.get("ttydPid")
+        self._kill_ttyd(sess["id"])
+
+        def alive():
+            if proc is not None and proc.poll() is None:
+                return True
+            return bool(pid) and (proc is None or proc.pid != pid) and _pid_alive(pid)
+
+        for _ in range(40):
+            if not alive():
+                break
+            time.sleep(0.05)
+        else:
+            for target in {proc.pid if proc is not None else None, pid} - {None}:
+                try:
+                    os.kill(int(target), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+            if proc is not None:
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+        self._await_port_free(sess.get("ttydPort"))
 
     @staticmethod
     def _await_port_free(port):

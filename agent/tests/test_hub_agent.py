@@ -10706,7 +10706,9 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         sess["ttydPid"] = 5150
         sess["ttydSock"] = ha._ttyd_sock_path(7700)
         ports = iter([True, False])  # open at the adopt check, freed after kill
-        with mock.patch.object(ha, "_pid_alive", return_value=True), \
+        alive = iter([True])          # alive at the adopt check, exited after kill
+        with mock.patch.object(ha, "_pid_alive",
+                               side_effect=lambda *a, **k: next(alive, False)), \
              mock.patch.object(ha, "_port_open",
                                side_effect=lambda *a, **k: next(ports, False)), \
              mock.patch.object(ha, "time"), \
@@ -38322,8 +38324,10 @@ class TestTtydUnixSocket(unittest.TestCase):
         sess = self._sess(ttydPid=4242, ttydTmuxSocket=ha.TMUX_SOCKET,
                           ttydTokenFp=ha._token_fp("tok"))
         ports = iter([True, False])  # open at the adopt check, freed after kill
+        alive = iter([True])          # alive at the adopt check, exited after kill
         with mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
-             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_pid_alive",
+                               side_effect=lambda *a, **k: next(alive, False)), \
              mock.patch.object(ha, "_port_open",
                                side_effect=lambda *a, **k: next(ports, False)), \
              mock.patch.object(ha, "_await_unix_sock", return_value=True), \
@@ -38338,6 +38342,41 @@ class TestTtydUnixSocket(unittest.TestCase):
         self.assertNotIn("-c", argv)
         self.assertEqual(sess["ttydSock"], ha._ttyd_sock_path(7700))
         self.assertNotIn("ttydTokenFp", sess)
+
+    def test_a_relaunch_waits_for_the_old_ttyd_to_exit(self):
+        # A socket ttyd unlinks its socket as it exits: one dying AFTER its
+        # replacement bound would delete the new socket and kill the terminal.
+        sm = self._mgr()
+        old = mock.Mock(pid=4242)
+        old.poll.side_effect = [None, None, None, 0, 0, 0]  # exits after 3 looks
+        sm.ttyd["s1"] = old
+        sess = self._sess(ttydPid=4242)
+        with mock.patch.object(sm, "_kill_ttyd"), \
+             mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.time, "sleep") as sleep, \
+             mock.patch.object(ha.os, "kill") as kill:
+            sm._kill_and_await_ttyd(sess)
+        self.assertEqual(sleep.call_count, 3)
+        kill.assert_not_called()
+
+    def test_a_ttyd_that_will_not_exit_is_sigkilled(self):
+        # SIGKILL leaves the socket file alone, so the new ttyd's survives.
+        sm = self._mgr()
+        old = mock.Mock(pid=4242)
+        old.poll.return_value = None
+        sm.ttyd["s1"] = old
+        sess = self._sess(ttydPid=4242)
+        with mock.patch.object(sm, "_kill_ttyd"), \
+             mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.time, "sleep"), \
+             mock.patch.object(ha.os, "kill") as kill:
+            sm._kill_and_await_ttyd(sess)
+        kill.assert_called_once_with(4242, signal.SIGKILL)
+
+    def test_await_unix_sock_wants_a_socket_not_any_file(self):
+        path = os.path.join(self.tmp, "d.sock")
+        os.mkdir(path)   # a directory there leaves ttyd bound to nothing
+        self.assertFalse(ha._await_unix_sock(path, mock.Mock(poll=lambda: 0)))
 
     def test_never_signals_a_recycled_pid(self):
         # Pid alive but nothing answers on the socket or port: not our ttyd.
