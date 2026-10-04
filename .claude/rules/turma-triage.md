@@ -89,6 +89,9 @@ machinery is in `.claude/rules/turma-board.md`.
   uBlock — invisible to page JS, so the panel builds its content and the backdrop dims but the panel
   never shows (Brave-only "screen dims, nothing there"). The match is exact-id; the JS names stay
   `$policyPanel`/`policyPanelHtml` (not DOM-visible). Do not rename the ids back to `policy*`.
+- **The "Permission policy" modal beside it (XERK-1566) follows the same id rule**
+  (`permissionRulesBackdrop`/`permissionRulesPanel`). It edits the org's permission-judge text via
+  its own route, never `/api/agents`; contract in `turma-permissions.md`.
 
 ## Gate ordering (autoStartSweep → drainTicketQueue)
 

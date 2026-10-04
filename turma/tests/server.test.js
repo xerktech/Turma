@@ -105,6 +105,11 @@ process.env.PERMISSION_LEDGER_FILE = path.join(
   os.tmpdir(),
   `turma-test-permission-ledger-${process.pid}.json`
 );
+// The per-org permission policy text (XERK-1566), an externalized /data store.
+process.env.PERMISSION_POLICIES_FILE = path.join(
+  os.tmpdir(),
+  `turma-test-permission-policies-${process.pid}.json`
+);
 // The migration relay spools transcript bundles to disk (XERK-263) and sweeps
 // its whole directory at boot, so it gets a throwaway one of its own — sharing
 // /data/migrations, or one dir across test files, would have each sweep delete
@@ -4876,10 +4881,12 @@ test("http: command queue rides the reply until acked", async () => {
   // `archiveOffer:"hub"` rides EVERY reply (XERK-431) so a fresh agent learns to
   // ship an inventory and let the hub choose what to archive, before its first
   // archive beat — present even with no archiveHave, as here.
+  // `permissionPolicy` rides every reply too (XERK-1566): the agent's judge
+  // decides against it, and a reply without one stands the judge down.
   // `decisions` rides every reply too (XERK-1574): the host's decided org's log
   // tail, `org: ""` here — an absent key would remove the agent's file anyway.
   assert.deepEqual(Object.keys(res.body).sort(),
-    ["archiveOffer", "bodyMax", "commands", "decisions", "peers"]);
+    ["archiveOffer", "bodyMax", "commands", "decisions", "peers", "permissionPolicy"]);
   assert.deepEqual(res.body.decisions, { org: "", entries: [] });
   assert.equal(res.body.archiveOffer, "hub");
   assert.deepEqual(res.body.commands, []);
@@ -23313,6 +23320,114 @@ test("XERK-1573: briefTick drops an org with no host once its briefs are old", a
   hub.briefTick(now + 31 * 24 * 3600 * 1000);
   assert.equal(S in hub.getBriefs(), false, "dropped past the retention");
   for (const k of Object.keys(hub.getBriefs())) delete hub.getBriefs()[k];
+});
+
+// ---- the permission judge's policy text (XERK-1566) ---------------------------
+
+test("XERK-1566: the org's permission policy rides every heartbeat reply", async () => {
+  const site = "x1566a.atlassian.net";
+  hub.setPermissionPolicy(site, null);
+  let r = await asBeat("x1566-host", site);
+  assert.equal(r.status, 200);
+  assert.deepEqual(r.body.permissionPolicy,
+    { site, text: hub.DEFAULT_PERMISSION_POLICY, isDefault: true });
+  const set = await request("POST", `/api/jira/${site}/permission-policy`,
+    { body: { text: "Only the repo's own tests." }, headers: userHeaders });
+  assert.equal(set.status, 200);
+  assert.deepEqual([set.body.text, set.body.isDefault], ["Only the repo's own tests.", false]);
+  r = await asBeat("x1566-host", site);
+  assert.deepEqual(r.body.permissionPolicy,
+    { site, text: "Only the repo's own tests.", isDefault: false });
+  // Another org's host still gets the default — the text is per DECIDED org.
+  r = await asBeat("x1566-other", "x1566b.atlassian.net");
+  assert.equal(r.body.permissionPolicy.text, hub.DEFAULT_PERMISSION_POLICY);
+  // An empty text is stored (the judge stands down); null drops back to the default.
+  await request("POST", `/api/jira/${site}/permission-policy`, { body: { text: "" }, headers: userHeaders });
+  r = await asBeat("x1566-host", site);
+  assert.deepEqual([r.body.permissionPolicy.text, r.body.permissionPolicy.isDefault], ["", false]);
+  const reset = await request("POST", `/api/jira/${site}/permission-policy`,
+    { body: { text: null }, headers: userHeaders });
+  assert.equal(reset.body.isDefault, true);
+  const got = await request("GET", `/api/jira/${site}/permission-policy`, { headers: userHeaders });
+  assert.deepEqual([got.status, got.body.text, got.body.defaultText],
+    [200, hub.DEFAULT_PERMISSION_POLICY, hub.DEFAULT_PERMISSION_POLICY]);
+  for (const h of ["x1566-host", "x1566-other"]) delete agents[h];
+});
+
+test("XERK-1566: a host with no decided org gets NO policy text, so its judge stands down", async () => {
+  const site = "x1566c.atlassian.net";
+  const other = "x1566d.atlassian.net";
+  await asBeat("x1566-bound", site);
+  hub.setPermissionPolicy(site, "acme only");
+  // A host bound to ANOTHER org that now CLAIMS this one is drifted: its decided
+  // org is "", so it reads neither this org's text NOR the looser default —
+  // fail NARROW, like the peer roster.
+  await asBeat("x1566-drift", other);
+  let r = await asBeat("x1566-drift", site);
+  assert.deepEqual(r.body.permissionPolicy, { site: null, text: "", isDefault: false });
+  // Its OWN org turned the judge off ("") — a drift must not switch it back
+  // on with the default.
+  hub.setPermissionPolicy(other, "");
+  r = await asBeat("x1566-drift", site);
+  assert.equal(r.body.permissionPolicy.text, "");
+  // A never-bound host (no tracker block at all) gets no text either.
+  const bare = await request("POST", "/api/heartbeat",
+    { body: { device: "x1566-bare", repos: [], sessions: [] }, headers: agentHeaders });
+  assert.equal(bare.status, 200);
+  assert.deepEqual(bare.body.permissionPolicy, { site: null, text: "", isDefault: false });
+  assert.deepEqual(hub.permissionPolicyReply({}), { site: null, text: "", isDefault: false });
+  // The bound host still reads its org's text; an org with no entry reads the default.
+  r = await asBeat("x1566-bound", site);
+  assert.equal(r.body.permissionPolicy.text, "acme only");
+  hub.setPermissionPolicy(site, null);
+  r = await asBeat("x1566-bound", site);
+  assert.deepEqual(r.body.permissionPolicy,
+    { site, text: hub.DEFAULT_PERMISSION_POLICY, isDefault: true });
+  hub.setPermissionPolicy(other, null);
+  for (const h of ["x1566-bound", "x1566-drift", "x1566-bare"]) delete agents[h];
+});
+
+test("XERK-1566: the permission-policy route refuses bad bodies, phantom orgs and anonymous callers", async () => {
+  const site = "x1566e.atlassian.net";
+  await asBeat("x1566-route", site);
+  for (const body of [{}, { text: 5 }, { text: ["x"] }]) {
+    const r = await request("POST", `/api/jira/${site}/permission-policy`, { body, headers: userHeaders });
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  const big = await request("POST", `/api/jira/${site}/permission-policy`,
+    { body: { text: "x".repeat(hub.PERMISSION_POLICY_MAX + 1) }, headers: userHeaders });
+  assert.equal(big.status, 413);
+  assert.equal(big.body.limit, hub.PERMISSION_POLICY_MAX);
+  assert.equal(hub.permissionPolicies()[site], undefined, "no partial state on refusal");
+  const phantom = await request("GET", "/api/jira/nobody1566.atlassian.net/permission-policy",
+    { headers: userHeaders });
+  assert.equal(phantom.status, 404);
+  const anon = await request("GET", `/api/jira/${site}/permission-policy`);
+  assert.equal(anon.status, 401);
+  delete agents["x1566-route"];
+});
+
+test("XERK-1566: a judged ledger row keeps its verdict and reason", async () => {
+  hub.permissionLedger._internals.reset();
+  const now = Date.now();
+  const r = await request("POST", "/api/heartbeat", { headers: agentHeaders, body: {
+    device: "x1566-judged", jira: { siteKey: "acme.atlassian.net" },
+    permissionEvents: [
+      { id: "j-s1-aa", sessionId: "s1", kind: "judged", tool: "Bash", head: "npm run",
+        openedAt: now - 1000, closedAt: now, answer: "allow", verdict: "allow",
+        judgeReason: "tests are pre-authorised" },
+      { id: "j-s1-bb", sessionId: "s1", kind: "judged", tool: "Bash", head: "npm run",
+        openedAt: now - 900, closedAt: now, answer: "deny", verdict: "maybe" }] } });
+  assert.equal(r.status, 200);
+  const view = await request("GET", "/api/permissions", { headers: userHeaders });
+  const byId = Object.fromEntries(view.body.recent.map((x) => [x.id, x]));
+  assert.deepEqual([byId["j-s1-aa"].verdict, byId["j-s1-aa"].judgeReason],
+    ["allow", "tests are pre-authorised"]);
+  assert.equal(byId["j-s1-bb"].verdict, undefined, "an unknown verdict is dropped, never guessed");
+  const judged = view.body.top.find((g) => g.kind === "judged");
+  assert.equal(judged.count, 2);
+  assert.equal(judged.suggestedRule, null, "a judged group offers no rule to copy");
+  delete agents["x1566-judged"];
 });
 
 // ---- XERK-1574: the brief narrative + the per-org decisions log ---------------

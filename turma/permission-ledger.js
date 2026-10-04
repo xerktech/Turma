@@ -76,7 +76,9 @@ const TOP_MAX = 50;
 const RECENT_MAX = 50;
 
 // ---- ingest bounds: every field whitelisted, strict enums, capped strings ----
-const KINDS = new Set(["dialog", "classifier-denied", "ask-in-chat"]);
+// `judged`: the agent's permission judge decided a Bash prompt (XERK-1566).
+const KINDS = new Set(["dialog", "classifier-denied", "ask-in-chat", "judged"]);
+const VERDICTS = new Set(["allow", "stand"]);
 const DIALOG_KINDS = new Set(["permission", "plan", "sandbox", "other"]);
 const ANSWERS = new Set(["allow", "deny", "unknown"]);
 const VIA = new Set(["turma", "terminal", "unknown"]);
@@ -85,6 +87,7 @@ const SID_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const HOST_RE = /^(?=.{1,253}$)(?:[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$/i;
 const STR_CAPS = {
   tool: 128, head: 200, digest: 400, toolUseId: 128, prompt: 300, denyReason: 300,
+  judgeReason: 300,
 };
 // A wait longer than the retention window is not a wait this ledger can hold.
 const WAIT_MAX_MS = DAYS * DAY_MS;
@@ -136,6 +139,7 @@ function sanitizePermissionEvent(raw, now = Date.now()) {
     row.answerNumber = raw.answerNumber;
   }
   if (VIA.has(raw.via)) row.via = raw.via;
+  if (raw.kind === "judged" && VERDICTS.has(raw.verdict)) row.verdict = raw.verdict;
   return row;
 }
 
@@ -466,12 +470,18 @@ function toolVerdict(tool, head) {
  *                                      (MCP_TOOL_RE); a bare server or a
  *                                      wildcard gets none, with a reason
  *   WebFetch                         → WebFetch(domain:<d>)
+ *   judged (XERK-1566)               → null: the judge's verdict on a prompt whose
+ *                                      own dialog/classifier row already carries
+ *                                      the actionable rule (a second Copy for the
+ *                                      same prompt, or one for a STOOD command,
+ *                                      would only mislead)
  *   anything else                    → null (no rule retires it)
  * Returns `{rule, reason}`: `reason` only for a Bash head, an MCP name or a
  * sandbox prompt that gets no rule.
  */
 function ruleVerdict(g) {
   if (!g) return { rule: null };
+  if (g.kind === "judged") return { rule: null };
   if (g.kind === "ask-in-chat") return { rule: "model behaviour: see CLAUDE.md step 0" };
   if (g.dialogKind === "sandbox") {
     // No tool allow rule retires a sandbox NETWORK prompt, so one whose host
@@ -575,7 +585,8 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
     .map(({ host, row }) => {
       const out = { host };
       for (const k of ["id", "sessionId", "kind", "dialogKind", "tool", "head", "prompt",
-        "denyReason", "answer", "via", "waitedMs", "openedAt", "closedAt"]) {
+        "denyReason", "answer", "via", "waitedMs", "openedAt", "closedAt",
+        "verdict", "judgeReason"]) {
         if (row[k] !== undefined) out[k] = row[k];
       }
       // An ask is answered in prose, never allow/deny: its stored "unknown" is

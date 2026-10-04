@@ -30,7 +30,7 @@ for (const v of [
   "TICKET_PLATFORMS_FILE", "AUTOSTART_ORGS_FILE", "AUTOMERGE_ORGS_FILE", "TRIAGE_ACTIONS_FILE",
   "TRIAGE_POLICIES_FILE", "PRIORITY_WRITEBACK_ORGS_FILE", "DEDUPE_LINK_ORGS_FILE",
   "ORG_COLORS_FILE", "REPO_TIERS_FILE", "EPIC_RUNS_FILE", "EPIC_BUILDERS_FILE",
-  "USAGE_LEDGER_FILE", "STATE_FILE",
+  "USAGE_LEDGER_FILE", "STATE_FILE", "PERMISSION_POLICIES_FILE",
 ]) {
   process.env[v] = tmp(v.toLowerCase());
 }
@@ -57,6 +57,8 @@ test("XERK-757: every listed store maps to a policy: key and a /data file", () =
     // XERK-769 — the epic-run/-builder stores joined the externalized set so HA
     // replicas share them and they survive a pod restart.
     "epicRuns", "epicBuilders",
+    // XERK-1566: the per-org permission policy text (operator-set, low churn).
+    "permissionPolicies",
   ]) {
     assert.ok(names.has(n), `store ${n} is registered`);
   }
@@ -345,4 +347,21 @@ test("XERK-1451: an org named like an Object.prototype member is not read as ena
     }
   }
   assert.equal(srv.repoTier("constructor"), "active", "an unset repo named constructor is the default tier");
+});
+
+test("XERK-1566: the permission policy store keeps a __proto__ org and reads no prototype member", () => {
+  const desc = X.list().find((d) => d.name === "permissionPolicies");
+  srv.setPermissionPolicy("__proto__", "only tests");
+  const mirror = desc.read();
+  assert.ok(Object.hasOwn(mirror, "__proto__"));
+  assert.equal(desc.coerce(JSON.parse(JSON.stringify(mirror)))["__proto__"].text, "only tests");
+  assert.equal(srv.permissionPolicyText("__proto__"), "only tests");
+  srv.setPermissionPolicy("__proto__", null);
+  for (const k of ["constructor", "toString"]) {
+    assert.equal(srv.permissionPolicyText(k), srv.DEFAULT_PERMISSION_POLICY, `${k} reads the default`);
+  }
+  // The coerce is a whitelist: a non-string text drops the org, an over-long one is cut.
+  const c = desc.coerce({ a: { text: 5 }, b: { text: "x".repeat(srv.PERMISSION_POLICY_MAX + 9) }, c: "s" });
+  assert.deepEqual(Object.keys(c), ["b"]);
+  assert.equal(c.b.text.length, srv.PERMISSION_POLICY_MAX);
 });

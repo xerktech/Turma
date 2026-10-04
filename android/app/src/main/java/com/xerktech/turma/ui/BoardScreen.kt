@@ -222,6 +222,9 @@ fun BoardScreen(
     // The per-org triage policy sheet (XERK-486), opened from the header — the
     // board bar's "Triage policy" button on the web.
     var policyOpen by remember { mutableStateOf(false) }
+    // The per-org permission policy sheet (XERK-1566), opened from the header —
+    // the board bar's "Permission policy" button on the web.
+    var permissionOpen by remember { mutableStateOf(false) }
     // The "✨ New epic" composer (XERK-731), opened from the header — the board
     // bar's "New epic" button on the web.
     var epicComposerOpen by remember { mutableStateOf(false) }
@@ -246,7 +249,20 @@ fun BoardScreen(
     }
 
     Column(modifier.fillMaxSize()) {
-        ScreenHeader("Board") {
+        ScreenHeader(
+            "Board",
+            // The permission policy (XERK-1566) is a labelled ⋮ entry, not a header
+            // icon: a fourth icon squeezed the org filter to a bare "…" on a phone.
+            // The web folds it behind its ⋯ menu the same way. Org-less = absent.
+            menuItems = { closeMenu ->
+                if (sites.isNotEmpty()) {
+                    DropdownMenuItem(
+                        text = { Text("Permission policy") },
+                        onClick = { closeMenu(); permissionOpen = true },
+                    )
+                }
+            },
+        ) {
             // The New-ticket button moved into the shared ScreenHeader (XERK-150),
             // so it's on every screen — see NewTicketAction. Refresh and the
             // triage policy are board-specific now.
@@ -493,6 +509,17 @@ fun BoardScreen(
             initialSiteKey = shown.first().siteKey,
             vm = vm,
             onDismiss = { policyOpen = false },
+        )
+    }
+
+    // The permission policy sheet edits the same in-scope orgs (the web's
+    // openPermissionPanel bails with no policySites — an org-less view).
+    if (permissionOpen && shown.isNotEmpty()) {
+        PermissionPolicySheet(
+            shown,
+            initialSiteKey = shown.first().siteKey,
+            vm = vm,
+            onDismiss = { permissionOpen = false },
         )
     }
 
@@ -2216,6 +2243,116 @@ private fun ErrorRow(text: String) {
 @Composable
 private fun DimRow(text: String) {
     Text(text, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+}
+
+/**
+ * The permission policy sheet's explanation — word-for-word board.html's
+ * `permissionRules*` note. It claims only what the deterministic refusal does
+ * ("commands it recognises"), never that such work is never auto-approved.
+ */
+internal const val PERMISSION_POLICY_EXPLANATION =
+    "When a session's Bash command is stopped for permission, the host's " +
+        "permission judge auto-approves it only if this text clearly covers it. " +
+        "Commands it recognises as force pushes, merges, pushes to main or production " +
+        "changes are refused before the model is asked, whatever this text says. " +
+        "Save it empty to turn the judge off for this org."
+
+/** The hub's PERMISSION_POLICY_MAX (server.js) — board.html's textarea maxlength. */
+internal const val PERMISSION_POLICY_MAX = 16000
+
+/**
+ * The per-org permission policy sheet (XERK-1566): the text the agent-side
+ * permission judge decides a session's blocked Bash command against. A port of
+ * board.html's `permissionRules*` panel. Hub-owned on its OWN route (never the
+ * `/api/agents` payload), so the sheet GETs the org's text on open / org change,
+ * "Save policy" POSTs it ("" turns the judge off for the org) and "Use default"
+ * POSTs null. Only the hub's 200 changes what the sheet shows; a refusal shows
+ * the hub's own words (XERK-264) and keeps the operator's edit. Save waits for a
+ * successful load, so a failed GET can never be saved over the org's real text.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun PermissionPolicySheet(
+    sites: List<BoardSite>,
+    initialSiteKey: String,
+    vm: BoardViewModel,
+    onDismiss: () -> Unit,
+) {
+    val ui by vm.permission.collectAsStateWithLifecycle()
+    // Every way out clears the VM's sheet state, so a reopen never paints (or
+    // acts on) the last visit's answer.
+    val close = { vm.closePermissionPolicy(); onDismiss() }
+    // Load on open; an org pick reloads (the VM drops a stale org's answer).
+    LaunchedEffect(Unit) { vm.loadPermissionPolicy(initialSiteKey) }
+    // A landed Save closes the sheet, like the triage sheet.
+    LaunchedEffect(ui.done) { if (ui.done && vm.permission.value.done) close() }
+    // The operator's draft: reset to the hub's text whenever the hub's answer
+    // replaces it (a load or a successful save bumps `rev`), and ONLY then — a
+    // refused save leaves the edit standing.
+    var text by remember(ui.siteKey, ui.rev) { mutableStateOf(ui.text) }
+    val siteKey = ui.siteKey.ifEmpty { initialSiteKey }
+    val loading = ui.loading || ui.siteKey.isEmpty()
+    val busy = ui.busy
+    val isDefault = ui.isDefault
+    val loaded = ui.loaded
+    val error = ui.error
+
+    val sheet = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    ModalBottomSheet(onDismissRequest = close, sheetState = sheet) {
+        Column(
+            Modifier.fillMaxWidth().verticalScroll(rememberScrollState()).padding(20.dp, 0.dp, 20.dp, 32.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("Permission policy", style = MaterialTheme.typography.titleMedium)
+            if (sites.size > 1) {
+                CreatePicker(
+                    "Org",
+                    sites.map { it.siteKey to (orgName(it.siteKey, it.orgName) + if (!it.online) " (offline)" else "") },
+                    siteKey,
+                ) { if (!busy && it != siteKey) vm.loadPermissionPolicy(it) }
+            }
+            // The explanation, then the status as its OWN short line (board.html's
+            // `data-perm-status` paragraph) — never appended mid-explanation.
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text(
+                    PERMISSION_POLICY_EXPLANATION,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    if (isDefault) "Showing the default policy." else "A custom policy.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+            OutlinedTextField(
+                if (loading) "Loading…" else text,
+                { text = it.take(PERMISSION_POLICY_MAX) },
+                label = { Text("Policy") },
+                enabled = !loading,
+                // bodyMedium, not the field's default bodyLarge: closer to the
+                // web textarea's density for a long free-text policy.
+                textStyle = MaterialTheme.typography.bodyMedium,
+                minLines = 8,
+                maxLines = 16,
+                modifier = Modifier.fillMaxWidth(),
+            )
+            if (error.isNotBlank()) ErrorRow(error)
+            Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                TextButton(
+                    onClick = { vm.savePermissionPolicy(null, close = false) },
+                    enabled = loaded && !busy && !loading && !isDefault,
+                ) { Text("Use default") }
+                TextButton(onClick = close, enabled = !busy) { Text("Cancel") }
+                Spacer(Modifier.weight(1f))
+                PrimaryButton(
+                    if (busy) "Saving…" else "Save policy",
+                    enabled = loaded && !busy && !loading,
+                    onClick = { vm.savePermissionPolicy(text, close = true) },
+                )
+            }
+        }
+    }
 }
 
 /** The triage types the hub's classifier can emit (agent hub-agent.py TRIAGE_TYPES). */

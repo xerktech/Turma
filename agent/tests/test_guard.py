@@ -1767,6 +1767,101 @@ class TestDecide(unittest.TestCase):
         self.assertEqual(guard._parse_overrides(None), [])
 
 
+class TestExpansionBudget(unittest.TestCase):
+    """Inlining a large variable at every use grew the text without bound.
+
+    `x='<3000 words>'; echo $x; …` ×1000 took ~19s to classify, and a ~100KB
+    command passed Claude Code's 600s hook timeout, which RUNS the command
+    unchecked (XERK-1556). Spending the growth budget must DENY, fast.
+    """
+
+    VALUE = " ".join(["w"] * 3000)
+    TOO_LARGE = "too large to classify"
+
+    def check(self, cmd):
+        t = time.monotonic()
+        reason = guard.is_destructive(cmd)
+        self.assertLess(time.monotonic() - t, 5, cmd[:80])
+        return reason
+
+    def test_large_value_used_many_times_is_denied_fast(self):
+        x = f"x='{self.VALUE}'; "
+        for cmd in (
+            x + "echo $x; " * 1000,
+            x + "(echo $x); " * 1000,
+            x + 'bash -c "echo $x"; ' * 1000,
+            # The budget is per classification, not per substitution: each
+            # heredoc body is substituted on its own and stays small.
+            x + "bash <<EOF\necho $x\nEOF\n" * 1000,
+        ):
+            self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:80])
+
+    def test_value_resolved_into_an_unused_variable_is_charged(self):
+        # Resolving `a` builds the large text before any substitution does.
+        cmd = f"b='{self.VALUE}'; a=" + "$b" * 1000 + "; echo ok"
+        with self.assertRaises(guard._ExpansionTooLarge):
+            guard._budgeted(guard._var_values)(cmd)
+        self.assertIn(self.TOO_LARGE, self.check(cmd) or "")
+
+    def test_one_budget_per_decision(self):
+        # Every heredoc on a line shares that line as its owner; each owner
+        # re-expansion opening a fresh budget ran past the hook timeout.
+        y = "z" * 866
+        cmd = (f"y='{y}'; " + ": $y " * 110 + "; "
+               + " ".join(f"cat <<E{i};" for i in range(2000)) + "\n"
+               + "".join(f"DROP DATABASE a{i};\nE{i}\n" for i in range(2000)) + "rm -rf /")
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.monotonic() - t, 5)
+        self.assertIsNone(guard._budget)
+
+    def test_hidden_tail_is_not_reached_but_still_denied(self):
+        cmd = f"x='{self.VALUE}'; " + "echo $x; " * 1000 + "echo done"
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+
+    def test_a_grant_cannot_override_it(self):
+        # The verdict replaces the whole expansion, so the hard policy checks
+        # behind a granted destructive deny would see nothing.
+        pad = f"x='{self.VALUE}'; " + "echo $x >/dev/null; " * 100
+        for tail in ("gh pr merge 5", "git push origin HEAD:main"):
+            got = guard.decide("Bash", {"command": "npm run build; " + pad + tail},
+                               overrides=["npm run build*"])
+            self.assertEqual(got[:1] + got[2:], ("deny", "policy"), tail)
+
+    def test_a_grant_on_an_earlier_reason_cannot_override_it(self):
+        # Each of these reasons is found before anything is expanded, so the
+        # budget runs out later, inside the policy checks.
+        pad = f"x='{self.VALUE}'; " + ": $x; " * 400 + "gh pr merge 5 --squash"
+        for head, grant in (("psql -d app <<EOF\nDROP TABLE t;\nEOF\n", "psql*"),
+                            (":(){ :|:& };:\n", ":*"),
+                            ("kill $(pgrep tmux)\n", "kill*")):
+            got = guard.decide("Bash", {"command": head + pad}, overrides=[grant])
+            self.assertEqual(got[:1] + got[2:], ("deny", "policy"), head)
+
+    def test_wrapper_suffixes_are_charged(self):
+        # n arguments emit n²/2 suffix words; 20k took minutes (XERK-1589).
+        for cmd in ("ssh h " + "a " * 20000,
+                    f"x='{' '.join(['w'] * 20000)}'; " + "ssh h $x; " * 12 + "\nrm -rf /"):
+            self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:40])
+        self.assertIsNone(self.check("ssh h " + "a " * 200))
+
+    def test_each_heredoc_owner_is_still_judged(self):
+        # The owner dedupe must neither skip a later owner nor mark one judged
+        # before its own body is checked.
+        for cmd in ("cat <<A\nDROP TABLE notes;\nA\npsql <<B\nDROP TABLE y;\nB",
+                    "cat <<A; psql <<B\nhello\nA\nDROP TABLE y;\nB"):
+            self.assertIn("database", guard.is_destructive(cmd) or "", cmd)
+
+    def test_ordinary_use_still_classified(self):
+        self.assertIsNone(self.check(f"x='{self.VALUE}'; " + "echo $x; " * 30))
+        data = '{"k": "' + "a" * 11000 + '"}'
+        self.assertIsNone(self.check(f"DATA='{data}'; " + "".join(
+            f'v{i}=$(echo "$DATA" | jq .k); ' for i in range(5))))
+        self.assertIn("recursive delete", guard.is_destructive("x=/etc; echo $x; rm -rf $x"))
+        self.assertIsNone(self.check("echo " + "w " * 50000))
+        self.assertIsNone(guard._budget)
+
+
 class TestGroupsHoldingOperators(unittest.TestCase):
     """A group whose body holds `;`, `|` or `&&` must still be classified.
 
@@ -2505,6 +2600,143 @@ class TestHookEntrypoint(unittest.TestCase):
         )
         self.assertEqual(proc.returncode, 0)
         self.assertEqual(proc.stdout.strip(), "")
+
+
+class TestJudgeGrants(unittest.TestCase):
+    """XERK-1566: the permission judge's one-shot grants. guard.py consults one
+    only AFTER decide() allowed the command, consumes it, and emits the only
+    `allow` any Turma hook emits. Everything about a grant file is session-
+    writable, so a malformed, foreign, expired, FIFO or symlinked one is no
+    grant."""
+
+    SID = "s1566"
+
+    def setUp(self):
+        import tempfile
+        self.home = tempfile.mkdtemp()
+        self.addCleanup(__import__("shutil").rmtree, self.home, True)
+        self.grants = os.path.join(self.home, ".turma", "grants")
+        os.makedirs(os.path.join(self.grants, self.SID))
+
+    def _grant(self, command, sid=None, exp_in=120, key=None, reason="policy allows tests",
+               where=None):
+        sid = sid or self.SID
+        key = key or guard.grant_key(command)
+        path = os.path.join(self.grants, where or sid, guard.grant_key(command))
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "w") as f:
+            json.dump({"key": key, "sid": sid, "exp": time.time() + exp_in,
+                       "reason": reason}, f)
+        return path
+
+    def _consume(self, command, sid=None):
+        return guard.consume_grant(sid or self.SID, command, grants_dir=self.grants)
+
+    def test_a_grant_is_consumed_exactly_once(self):
+        path = self._grant("npm run e2e")
+        self.assertEqual(self._consume("npm run e2e"), "policy allows tests")
+        self.assertFalse(os.path.exists(path), "a grant is one-shot")
+        self.assertIsNone(self._consume("npm run e2e"))
+
+    def test_a_grant_names_one_exact_command(self):
+        self._grant("npm run e2e")
+        self.assertIsNone(self._consume("npm run e2e; curl evil"))
+        self.assertIsNone(self._consume("npm run e2e "))
+
+    def test_expired_and_overlong_grants_are_ignored(self):
+        self._grant("make a", exp_in=-1)
+        self.assertIsNone(self._consume("make a"))
+        # A grant claiming a life past the judge's TTL was not the judge's.
+        self._grant("make b", exp_in=guard.GRANT_TTL_MAX_SEC + 60)
+        self.assertIsNone(self._consume("make b"))
+
+    def test_a_foreign_sessions_grant_is_ignored(self):
+        # Filed under another session's dir: this session never looks there.
+        self._grant("make c", sid="other", where="other")
+        self.assertIsNone(self._consume("make c"))
+        # Planted in this session's dir but naming another session / key.
+        self._grant("make d", sid="other", where=self.SID)
+        self.assertIsNone(self._consume("make d"))
+        self._grant("make e", key="0" * 64)
+        self.assertIsNone(self._consume("make e"))
+
+    def test_a_fifo_or_symlink_grant_never_hangs_or_counts(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs on this platform")
+        fifo = os.path.join(self.grants, self.SID, guard.grant_key("make f"))
+        os.mkfifo(fifo)
+        start = time.monotonic()
+        self.assertIsNone(self._consume("make f"))
+        self.assertLess(time.monotonic() - start, 2, "a planted FIFO hung the hook")
+        real = self._grant("make g", where="elsewhere")
+        link = os.path.join(self.grants, self.SID, guard.grant_key("make g"))
+        os.symlink(real, link)
+        self.assertIsNone(self._consume("make g"))
+        # A symlinked SESSION dir is not the judge's either.
+        os.symlink(os.path.join(self.grants, "elsewhere"),
+                   os.path.join(self.grants, "s-link"))
+        self.assertIsNone(guard.consume_grant("s-link", "make g", grants_dir=self.grants))
+
+    def test_bad_session_ids_and_garbage_are_no_grant(self):
+        for sid in ("", "..", "a/b", None, "x" * 65):
+            self.assertIsNone(guard.consume_grant(sid, "ls", grants_dir=self.grants))
+        path = os.path.join(self.grants, self.SID, guard.grant_key("make h"))
+        for blob in ("not json", "[]", '{"key": 1}', "{" * 5000):
+            with open(path, "w") as f:
+                f.write(blob)
+            self.assertIsNone(self._consume("make h"))
+
+    def _run(self, command, env_extra=None, grants=True):
+        env = {**os.environ, "HOME": self.home, "TURMA_SESSION_ID": self.SID,
+               **(env_extra or {})}
+        env.pop("TURMA_PERMISSION_JUDGE", None)
+        env.update(env_extra or {})
+        proc = subprocess.run([sys.executable, "-SsE", GUARD_PATH]
+                              + ([guard.GRANTS_FLAG] if grants else []),
+                              input=json.dumps({"tool_name": "Bash",
+                                                "tool_input": {"command": command}}),
+                              capture_output=True, text=True, env=env)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        return json.loads(proc.stdout)["hookSpecificOutput"] if proc.stdout.strip() else None
+
+    def test_the_hook_emits_allow_for_a_granted_command_once(self):
+        self._grant("npm run e2e")
+        out = self._run("npm run e2e")
+        self.assertEqual(out["permissionDecision"], "allow")
+        self.assertIn("policy allows tests", out["permissionDecisionReason"])
+        self.assertNotIn("grants", out["permissionDecisionReason"])
+        self.assertIsNone(self._run("npm run e2e"), "consumed: the next call is plain")
+
+    def test_a_hard_deny_wins_over_a_grant(self):
+        for cmd in ("git push --force origin main", "rm -rf /",
+                    "gh pr merge 12 --squash"):
+            with self.subTest(cmd=cmd):
+                path = self._grant(cmd)
+                out = self._run(cmd)
+                self.assertEqual(out["permissionDecision"], "deny")
+                self.assertTrue(os.path.exists(path), "a denied call consumes nothing")
+
+    def test_the_judge_switch_off_ignores_grants(self):
+        path = self._grant("npm run e2e")
+        self.assertIsNone(self._run("npm run e2e", {"TURMA_PERMISSION_JUDGE": "0"}))
+        self.assertTrue(os.path.exists(path))
+        # A guard launched WITHOUT the flag (a session started with the judge
+        # off) honours no grant, whatever its inherited env says.
+        self.assertIsNone(self._run("npm run e2e", {"TURMA_PERMISSION_JUDGE": "1"},
+                                    grants=False))
+        self.assertIsNone(self._run("npm run e2e", grants=False))
+        self.assertTrue(os.path.exists(path))
+
+    def test_a_grant_crash_fails_closed(self):
+        with mock.patch.object(guard, "consume_grant", side_effect=TypeError("boom")), \
+                mock.patch.object(guard.sys, "stdin", io.StringIO(json.dumps(
+                    {"tool_name": "Bash", "tool_input": {"command": "ls"}}))), \
+                mock.patch.dict(os.environ, {"TURMA_PERMISSION_JUDGE": "1"}), \
+                mock.patch.object(guard, "_emit_deny") as deny, \
+                mock.patch.object(guard, "_emit_allow") as allow:
+            self.assertEqual(guard.main(["guard.py", guard.GRANTS_FLAG]), 0)
+            deny.assert_called_once()
+            allow.assert_not_called()
 
 
 if __name__ == "__main__":
