@@ -1304,25 +1304,103 @@
   //   - no transcript at all -> not a link. A session killed before its first
   //     turn has no conversation to open, and an <a> to nothing is worse than
   //     plain text saying so.
-  function sessionChipHtml(s) {
+  // Why a session closed its OWN ticket (XERK-1569): the agent stamps
+  // `ticket.outcome = {kind, at, note?}` when the session's `close-ticket` lands.
+  // The words for each kind the hub lets through (coerceTicketOutcome); "" = the
+  // session did not close it (or an unknown kind, which says nothing).
+  function ticketOutcomeWords(kind) {
+    return kind === "not-reproducible" ? "not reproducible"
+      : kind === "already-fixed" ? "already fixed"
+      : kind === "done" ? "done" : "";
+  }
+
+  // The chip label of a session that closed its own ticket: the reason alone,
+  // "not reproducible" / "already fixed", or plain "closed" for `done`. The
+  // neutral dot already says closed, so there is no "closed ·" prefix: the label
+  // must fit the chip's name cap on one line, or the card's org tag wraps onto a
+  // row of its own.
+  function ticketOutcomeLabel(s) {
+    const o = s && s.ticket && s.ticket.outcome;
+    const words = ticketOutcomeWords(o && o.kind);
+    return !words ? "" : words === "done" ? "closed" : words;
+  }
+
+  // The ticket's NEWEST session (ticketSessionsOf, oldest first) when it closed
+  // the ticket, as {kind, at, note, session}; null otherwise. Only the newest
+  // counts: a reopened ticket worked by a fresh session must not still read
+  // "closed". The detail panel's "Closed by" row reads it. `note` is the
+  // session's evidence, "" when the hub served none (never invented).
+  function ticketOutcomeOf(sessions) {
+    const s = (sessions || [])[(sessions || []).length - 1];
+    const o = s && s.ticket && s.ticket.outcome;
+    return o && ticketOutcomeWords(o.kind)
+      ? { kind: o.kind, at: o.at, note: typeof o.note === "string" ? o.note : "", session: s }
+      : null;
+  }
+
+  // The "Closed by" row's value: the closing session's name, "XERK-12-fix — not
+  // reproducible · 3h ago", then the evidence note the session gave, clamped to
+  // three lines on screen. The note is a <details> whose summary IS the note, so
+  // a tap (a phone has no hover) or a click unclamps it to the full text —
+  // Android's tap-to-expand; the tooltip still carries it for a mouse. `at` is
+  // epoch ms (wireLong-coerced by the hub); a missing one just drops the age.
+  function ticketOutcomeFieldHtml(outcome, now) {
+    if (!outcome) return "";
+    const at = Number.isFinite(outcome.at) ? new Date(outcome.at) : null;
+    const iso = at && !Number.isNaN(at.getTime()) ? at.toISOString() : "";
+    const age = iso ? ageStr(iso, now) : "";
+    const when = !age ? "" : age === "now" ? " · just now" : ` · ${age} ago`;
+    const title = iso ? ` title="${esc(iso)}"` : "";
+    const who = outcome.session ? sessionChipName(outcome.session) : "session";
+    const note = outcome.note
+      ? `<details class="td-outcome-note"><summary title="${esc(outcome.note)}">`
+        + `<span class="td-outcome-note-text">${esc(outcome.note)}</span></summary></details>`
+      : "";
+    return `<span class="td-outcome"${title}><span class="td-outcome-who">${esc(who)}</span>`
+      + ` — ${esc(ticketOutcomeWords(outcome.kind))}${esc(when)}</span>${note}`;
+  }
+
+  // Where a session's chip links (see above): live chat while running, the
+  // read-only view once it has a transcript, nowhere otherwise.
+  function sessionHref(s) {
+    return s.status === "running" && s.id
+      ? `/sessions?session=${encodeURIComponent(s.id)}`
+      : (s.transcriptId ? `/sessions?ended=${encodeURIComponent(s.transcriptId)}` : null);
+  }
+
+  // A ticket session's NAME (see above): the operator's rename, else its branch,
+  // else whatever names it. The chip and the "Closed by" row both say it.
+  function sessionChipName(s) {
     const branch = (s.git && s.git.branch) || (s.ticket && s.ticket.branch);
     const renamed = s.summaryManual ? s.summary : null;
-    const label = renamed || branch || s.summary || s.label || s.id
+    return renamed || branch || s.summary || s.label || s.id
       || (s.ticket && s.ticket.key) || "session";
+  }
+
+  function sessionChipHtml(s) {
+    const branch = (s.git && s.git.branch) || (s.ticket && s.ticket.branch);
+    const name = sessionChipName(s);
     const stopped = s.status !== "running";
     const state = s.status === "error" ? "failed"
       : s.status === "queued" ? "queued"
       : (stopped ? "stopped" : "running");
-    const tip = [s.summary || s.label, branch && branch !== label ? "branch " + branch : "", state]
+    // A session that closed its own ticket says so INSIDE its chip, in place of
+    // its name: "not reproducible" in the chip's normal ink, with a
+    // neutral dot. Its run state stops mattering to the card — the session may
+    // still be running, but the ticket's work is over — so the state and the
+    // name move to the tooltip rather than a green "running" dot beside "closed".
+    const closed = ticketOutcomeLabel(s);
+    const label = closed || name;
+    const tip = [s.summary || s.label, closed ? name : "",
+      branch && branch !== name ? "branch " + branch : "", state]
       .filter(Boolean).join(" · ");
-    const cls = "kc-sess" + (s.status === "error" ? " kc-sess-err" : stopped ? " kc-sess-off" : "");
+    const cls = "kc-sess" + (closed ? " kc-sess-closed"
+      : s.status === "error" ? " kc-sess-err" : stopped ? " kc-sess-off" : "");
     // The label is its own element so it can ellipsise: .kc-sess is a flex
     // container, and text-overflow can't touch anonymous flex content — it would
     // hard-cut mid-letter. As a flex ITEM this span is blockified, so it can.
     const body = `<span class="kc-sess-dot"></span><span class="kc-sess-name">${esc(label)}</span>`;
-    const href = !stopped && s.id
-      ? `/sessions?session=${encodeURIComponent(s.id)}`
-      : (s.transcriptId ? `/sessions?ended=${encodeURIComponent(s.transcriptId)}` : null);
+    const href = sessionHref(s);
     if (!href) {
       return `<span class="${cls}" title="${esc(tip ? tip + " · no conversation" : label)}"
         >${body}</span>`;
@@ -1495,7 +1573,7 @@
     if (isEpicTicket(t)) {
       const chips = (o.sessions || []).map(sessionChipHtml).join("");
       bits.push(chips + epicCardControlHtml(t, o.epicRun));
-    } else {
+    } else if (!ticketOutcomeOf(o.sessions)) {
       const start = ticketStartHtml(t, o.sessions, o.start, o.queued);
       if (start) bits.push(start);
     }
@@ -1503,7 +1581,18 @@
     // one shows why on the card (same inline convention as the start-error note).
     if (o.moving) bits.push(`<span class="kc-moving">moving…</span>`);
     else if (o.moveError) bits.push(`<span class="kc-move-err" title="${esc(o.moveError)}">couldn't move</span>`);
-    bits.push(`<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`);
+    const org = `<span class="kc-org" style="--org:${esc(color)}" title="${esc(site && site.siteKey || "")}">${esc(t.project || "")}</span>`;
+    if (!isEpicTicket(t) && ticketOutcomeOf(o.sessions)) {
+      // A ticket its newest session closed (XERK-1569): that session's chip, the
+      // start control after it and the org tag wrap as ONE unit (.kc-tail), so
+      // the org tag never lands on a row of its own under the meta pills.
+      // Earlier sessions' chips stay loose ahead of it, as on any other card.
+      const ss = o.sessions;
+      bits.push(ss.slice(0, -1).map(sessionChipHtml).join(""));
+      bits.push(`<span class="kc-tail">${ticketStartHtml(t, ss.slice(-1), o.start, o.queued)}${org}</span>`);
+    } else {
+      bits.push(org);
+    }
     // The card itself opens the detail view (data-* carry what the click
     // handler needs to route the fetch: the issue and its owning org). It's a
     // div, not a button, because it contains the kc-key link out to Jira, the
@@ -1572,9 +1661,10 @@
     });
   }
 
-  function fieldRow(label, valueHtml) {
+  // `cls` adds a class to the cell (e.g. td-field-wide, a row of its own).
+  function fieldRow(label, valueHtml, cls) {
     if (!valueHtml) return "";
-    return `<div class="td-field"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
+    return `<div class="td-field${cls ? " " + cls : ""}"><dt>${esc(label)}</dt><dd>${valueHtml}</dd></div>`;
   }
 
   // The triaged repo, for the detail panel's field list: the same three states as
@@ -2081,6 +2171,12 @@
     const labels = Array.isArray(d.labels) && d.labels.length ? d.labels
       : (Array.isArray(t.labels) ? t.labels : []);
     const fields = [
+      // A session that closed this ticket itself (XERK-1569), and why. The card's
+      // chip says why too; only this row has room for which session, when, and
+      // the evidence it gave. It is the one tall cell, so it spans the whole grid
+      // row (td-field-wide) and leads: in a cell of the 3-column grid it
+      // stretched its row and left an empty band under its neighbours.
+      fieldRow("Closed by", ticketOutcomeFieldHtml(ticketOutcomeOf(o.sessions), now), "td-field-wide"),
       // The one editable board field that writes back to Jira/Azure (XERK-138):
       // `statusEditing` swaps the pill for the picker of `statusOptions`, and a
       // pick pushes the change. Editable only once the detail (hence its options)
@@ -2561,6 +2657,8 @@
     epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
     boardColumnOf, moveSweepVerdict,
     ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
+    ticketOutcomeWords, ticketOutcomeLabel, ticketOutcomeOf, ticketOutcomeFieldHtml,
+    sessionChipName,
     queuedTicketOf, queuedLabel, queuedTip,
     newestFetchedAt, jiraRefreshPending, jiraRefreshFailed, startSweepVerdict,
   };
