@@ -20,6 +20,7 @@ process.env.PERMISSION_LEDGER_FILE = path.join(dir, "permission-ledger.json");
 process.env.PERMISSION_LEDGER_MAX_ROWS = "40";
 process.env.PERMISSION_LEDGER_HOST_MAX_ROWS = "30";
 process.env.PERMISSION_LEDGER_FILE_MAX = "400000";
+process.env.PERMISSION_LEDGER_SAVE_CHUNK = "2048";   // every save spans many chunks
 
 const ledger = require("../permission-ledger.js");
 const { sanitizePermissionEvent: sanitize, suggestedRule, aggregate } = ledger;
@@ -244,8 +245,8 @@ test("suggestedRule: the deterministic table", () => {
     [{ kind: "dialog", tool: "WebFetch", head: "docs.example.com" }, "WebFetch(domain:docs.example.com)"],
     [{ kind: "dialog", dialogKind: "sandbox", tool: "Bash", head: "registry.npmjs.org" },
       "sandbox.network.allowedDomains: registry.npmjs.org"],
-    [{ kind: "classifier-denied", tool: "Bash", head: "gh pr" },
-      "autoMode.environment: allow Bash(gh pr:*)"],
+    [{ kind: "classifier-denied", tool: "Bash", head: "git rev-parse" },
+      "autoMode.environment: allow Bash(git rev-parse:*)"],
     [{ kind: "classifier-denied", tool: "Bash", head: "git push" }, null],
     // No tool rule → NO rule: a sentence lifted from the deny reason pastes nowhere.
     [{ kind: "classifier-denied", tool: "Edit", head: "/x", denyReason: "Writing outside the repo. Refused" },
@@ -360,6 +361,37 @@ test("suggestedRule: a head off the allowlist gets no rule — unknown, runner o
   }
 });
 
+test("suggestedRule: a subcommand group whose verbs write, merge or run hooks gets no rule", () => {
+  // The head is two words, so its rule covers EVERY verb under it: `gh pr merge
+  // --admin` (past branch protection), `gh pr checkout -R` (another repo's hooks),
+  // `gh run download -D` (any directory), `git commit`/`switch` (editable hooks).
+  const reason = "not on the known read-only list, so its arguments may run code";
+  for (const head of ["gh pr", "glab mr", "gh run", "gh issue", "glab issue", "git commit",
+    "git switch", "git add", "git branch", "make build", "make test", "make install"]) {
+    assertNoBashRule(head);
+    assert.equal(ledger.ruleVerdict({ kind: "dialog", tool: "Bash", head }).reason, reason, head);
+    assert.equal(ledger.BASH_SAFE_SUBCOMMANDS.has(head), false, head);
+  }
+});
+
+test("suggestedRule: each no-rule Bash branch serves its own reason", () => {
+  const reasonOf = (head) => ledger.ruleVerdict({ kind: "dialog", tool: "Bash", head }).reason;
+  // The never-list, matched on the whole head, its first word, a path's base
+  // name and a versioned binary's family.
+  for (const head of ["docker run", "npx tsx", "/usr/bin/python3", "python3.11", "pkexec"]) {
+    assert.equal(reasonOf(head), "runs whatever follows it", head);
+  }
+  for (const head of ["/usr/bin/ls", "./ls", "/tmp/x/cat", "bin/tool"]) {
+    assert.equal(reasonOf(head), "a path runs whatever binary sits there", head);
+  }
+  for (const cli of ["git", "gh", "docker", "make", "npm"]) {
+    assert.equal(reasonOf(cli), `no subcommand recorded, and a bare ${cli} rule allows every one`, cli);
+  }
+  for (const head of ["(cd", "rm*", "x;y", ""]) {
+    assert.equal(reasonOf(head), "not a plain command name", JSON.stringify(head));
+  }
+});
+
 test("suggestedRule: every allowlisted head keeps its rule, and no allowlisted head is an exec", () => {
   const safe = [...ledger.BASH_SAFE_HEADS, ...ledger.BASH_SAFE_SUBCOMMANDS];
   assert.ok(safe.length > 20);
@@ -453,15 +485,15 @@ test("aggregate: a classifier block with no rule carries its deny reason", () =>
   ledger.ingest("h1", [
     row("c1", { kind: "classifier-denied", dialogKind: undefined, tool: "Write",
       head: "/home/u/.ssh/config", denyReason: "Writing to SSH configuration", answer: "deny" }),
-    row("c2", { kind: "classifier-denied", dialogKind: undefined, head: "gh pr",
+    row("c2", { kind: "classifier-denied", dialogKind: undefined, head: "git rev-parse",
       denyReason: "push is outside scope", answer: "deny" }),
   ], NOW);
   const { top } = aggregate({ now: NOW });
   const write = top.find((g) => g.tool === "Write");
   assert.equal(write.suggestedRule, null);
   assert.equal(write.denyReason, "Writing to SSH configuration");
-  const push = top.find((g) => g.head === "gh pr");
-  assert.equal(push.suggestedRule, "autoMode.environment: allow Bash(gh pr:*)");
+  const push = top.find((g) => g.head === "git rev-parse");
+  assert.equal(push.suggestedRule, "autoMode.environment: allow Bash(git rev-parse:*)");
   assert.deepEqual([push.allowed, push.denied], [0, 1]);
   // A dialog group never carries a deny reason or a prompt.
   ledger.ingest("h1", [row("d1")], NOW);
@@ -520,7 +552,9 @@ test("bytes: the store is bounded in BYTES too, oldest first, and the file it wr
 });
 
 test("bytes: the budget is a fraction of the container limit, never above the file budget", () => {
-  assert.equal(ledger.setMemoryLimit(2 << 20), (2 << 20) / 16);
+  // A sixty-fourth: 8 MiB at the deployed 512m, sized from the XERK-287 margin.
+  assert.equal(ledger.setMemoryLimit(8 << 20), (8 << 20) / 64);
+  assert.equal(ledger.setMemoryLimit(1 << 20), 64 << 10);             // the floor
   assert.equal(ledger.setMemoryLimit(1 << 30), Math.floor(400000 * 0.9));
   assert.equal(ledger.setMemoryLimit(null), Math.floor(400000 * 0.9));
 });
@@ -542,6 +576,25 @@ test("bytes: a model over the file ceiling is trimmed before it is written, neve
   ledger._internals.load();
   assert.ok(ledger._internals.rowCount() > 0);
   assert.ok(ledger._internals.hosts().get("h1").has("g39"));
+});
+
+test("file backend: a save streams in chunks through a temp file, and overlapping saves all land", async () => {
+  const now = Date.now();
+  ledger.ingest("h1", Array.from({ length: 15 }, (_, i) => row(`s${i}`, { openedAt: now - (20 - i) * MIN,
+    closedAt: undefined, waitedMs: undefined, answer: undefined, prompt: "p".repeat(300) })), now);
+  ledger.ingest("h-2", Array.from({ length: 10 }, (_, i) => row(`t${i}`, { openedAt: now - (10 - i) * MIN,
+    closedAt: undefined, waitedMs: undefined, answer: undefined })), now);
+  const want = JSON.stringify([...ledger._internals.hosts()].map(([h, m]) => [h, [...m.values()]]));
+  // Three saves asked for at once: one in flight, the rest answered by ONE follow-up.
+  const results = await Promise.all([0, 1, 2].map(() => new Promise((r) => ledger.flush(r))));
+  assert.deepEqual(results, [null, null, null]);
+  assert.equal(fs.existsSync(`${ledger.LEDGER_FILE}.tmp`), false);
+  const onDisk = JSON.parse(fs.readFileSync(ledger.LEDGER_FILE, "utf8"));
+  assert.equal(onDisk.version, 1);
+  assert.ok(fs.statSync(ledger.LEDGER_FILE).size > 3 * 2048, "the file spans several chunks");
+  ledger._internals.load();
+  assert.equal(JSON.stringify([...ledger._internals.hosts()].map(([h, m]) => [h, [...m.values()]])),
+    want);
 });
 
 test("file backend: an unreadable file starts empty, never throws", () => {

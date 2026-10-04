@@ -40,10 +40,15 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
     closed-unknown until the agent's own close arrives.
 - **And a BYTE budget**, oldest first: every cap is in chars, so a row reaches ~15 KB of UTF-8 and
   20000 of them would be a file `load()` refuses (the ledger lost at the next boot). The budget is
-  the smaller of 0.9 x `PERMISSION_LEDGER_FILE_MAX` and a sixteenth of the container limit
-  (`setMemoryLimit`, from server.js's `containerMemoryLimit()`, logged at boot);
-  `PERMISSION_LEDGER_MAX_BYTES` may only lower it. `writeNow` trims before writing as a backstop, so a
-  written file always loads.
+  the smaller of 0.9 x `PERMISSION_LEDGER_FILE_MAX` (16 MiB) and a SIXTY-FOURTH of the container
+  limit (`setMemoryLimit`, from server.js's `containerMemoryLimit()`, logged at boot; an unknown limit
+  is budgeted as the deployed 512m); `PERMISSION_LEDGER_MAX_BYTES` may only lower it. `writeNow` trims
+  before writing as a backstop (`fileBytes`, from the cached row sizes), so a written file always loads.
+  - **Sized from the XERK-287 margin, not the container** (`turma-limits.md`): 8 MiB at 512m. At 1/16
+    the store plus a save's whole-file string was ~69 MiB — the whole margin. Typical rows fit ~8k.
+  - **A save streams**: `writeSnapshot` writes chunks (`SAVE_CHUNK_CHARS`) to `<file>.tmp` and renames
+    it over the ledger, so no second whole copy sits on the heap and a crash mid-save keeps the old
+    file. One save at a time; saves asked for meanwhile share ONE follow-up save.
 
 ## The suggestedRule table — deterministic, never a judgement
 
@@ -64,7 +69,7 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
     table (`PERM_BEHAVIOUR_NOTE`) names the fix: step 0 of "Delivering work" in each host's global
     `~/.claude/CLAUDE.md`. The hub's terse pointer repeated per row told the operator nothing.
 - **Never an allow-everything Bash rule, by construction: a POSITIVE allowlist.** `BASH_SAFE_HEADS`
-  (single words: `ls`, `cat`, `grep`, `jq`…) and `BASH_SAFE_SUBCOMMANDS` (`git status`, `gh pr`,
+  (single words: `ls`, `cat`, `grep`, `jq`…) and `BASH_SAFE_SUBCOMMANDS` (`git status`, `gh search`,
   `docker ps`…) are the ONLY Bash heads that get `Bash(<head>:*)`. A prefix rule allows the head with
   ANY arguments, so a head is listed only when no argument it takes can run code. Every other head —
   an interpreter, shell, wrapper, runner, unknown CLI, a path to a binary — gets `null`.
@@ -77,6 +82,11 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
     `--script-shell`), `go test` (`-exec`), `cargo` (`--config`), `make` (variable overrides), `find`,
     `rg` (`--pre`), `sort` (`--compress-program`). Add a head only with its argument surface checked,
     and a test row. Missing one only withholds a suggestion.
+  - **A subcommand GROUP is off too**: a two-word head's rule covers every verb under it. `gh pr`/
+    `glab mr` (`merge --admin` past branch protection, `checkout -R` runs another repo's hooks),
+    `gh run` (`download -D` writes any dir), `gh issue`/`glab issue` (tracker writes), `git commit`/
+    `switch`/`add`/`branch` (session-editable hooks, `branch -D`). A per-verb rule (`gh pr view`)
+    needs a three-word head permlog.py does not emit yet.
   - **A no-rule Bash group serves `noRuleReason`**, WHY there is none (runs whatever follows it / a
     path / a bare subcommand CLI / not on the read-only list / not a plain command name). The card
     shows "no safe rule — review it" over the reason, with NO Copy button. Groups with
@@ -93,8 +103,9 @@ beat discipline) is `.claude/rules/agent-permissions.md`, scoped to the agent fi
     heads as `git`.
 
 `head` = the Bash command's first word, two for a subcommand CLI (`git push`, `npm test`), leading
-`VAR=x` skipped; the file path; the MCP tool name; the WebFetch domain. The LLM judge (XERK-1566)
-consumes this table; it does not replace it.
+`VAR=x` and leading `cd <dir>` segments skipped (`cd` only when nothing follows); the file path;
+the MCP tool name; the WebFetch domain. The LLM judge (XERK-1566) consumes this table; it does not
+replace it.
 
 ## Persistence
 

@@ -1274,8 +1274,8 @@ const permView = {
   top: [
     { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "git status", count: 12,
       allowed: 11, denied: 1, medianWaitMs: 95000, lastAt: PERM_NOW, suggestedRule: "Bash(git status:*)" },
-    { kind: "classifier-denied", tool: "Bash", head: "gh pr", count: 3, allowed: 0, denied: 3,
-      medianWaitMs: null, lastAt: PERM_NOW, suggestedRule: "autoMode.environment: allow Bash(gh pr:*)" },
+    { kind: "classifier-denied", tool: "Bash", head: "git rev-parse", count: 3, allowed: 0, denied: 3,
+      medianWaitMs: null, lastAt: PERM_NOW, suggestedRule: "autoMode.environment: allow Bash(git rev-parse:*)" },
     { kind: "dialog", dialogKind: "plan", tool: "ExitPlanMode", head: "ExitPlanMode", count: 1,
       allowed: 1, denied: 0, medianWaitMs: 4000, lastAt: PERM_NOW, suggestedRule: null },
   ],

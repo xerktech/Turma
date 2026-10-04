@@ -46,19 +46,30 @@ const DAY_MS = 86400000;
 // trusts that it did.
 const EVENTS_PER_BEAT = 200;
 // The file is measured before it is read (an oversized one is an OOM at boot,
-// every boot); ~1 KiB a row puts the ceiling well past MAX_ROWS.
-const FILE_MAX_BYTES = positiveEnv("PERMISSION_LEDGER_FILE_MAX", 64 << 20);
+// every boot). The byte budget below keeps a written file far under this.
+const FILE_MAX_BYTES = positiveEnv("PERMISSION_LEDGER_FILE_MAX", 16 << 20);
 // The store is bounded in BYTES as well as rows: every cap above is in chars, so
 // a row can serialize to ~15 KB of UTF-8 and MAX_ROWS of them would be a file
-// load() refuses (the whole ledger lost at the next boot) and a heap the
-// container cannot hold. The budget is the smaller of nine tenths of the file
-// ceiling (so a written file always loads) and a FRACTION of the container's
-// memory limit (CLAUDE.md: memory ceilings are fractions, never fixed numbers) —
-// server.js hands that limit in through setMemoryLimit() at boot.
+// load() refuses and a heap the container cannot hold. The budget is the smaller
+// of nine tenths of the file ceiling (so a written file always loads) and a
+// FRACTION of the container's memory limit (CLAUDE.md: memory ceilings are
+// fractions, never fixed numbers) — server.js hands that limit in through
+// setMemoryLimit() at boot. The fraction is sized from the ~68 MiB XERK-287
+// co-peak MARGIN, not the container: a sixty-fourth (8 MiB of JSON at 512m) is
+// ~9 MiB of retained heap, and a save streams the file in chunks rather than
+// building a second whole copy (turma-limits.md records it in that margin).
 const FILE_BUDGET_BYTES = Math.floor(FILE_MAX_BYTES * 0.9);
 const BYTES_ENV = positiveEnv("PERMISSION_LEDGER_MAX_BYTES", 0);
-const MEMORY_FRACTION = 16;               // 32 MiB at the deployed 512m
-let maxBytes = BYTES_ENV ? Math.min(BYTES_ENV, FILE_BUDGET_BYTES) : FILE_BUDGET_BYTES;
+const MEMORY_FRACTION = 64;               // 8 MiB at the deployed 512m
+// An unknown limit (no cgroup) is budgeted as the deployed container.
+const ASSUMED_MEMORY_LIMIT = 512 << 20;
+function byteBudget(limit) {
+  let b = FILE_BUDGET_BYTES;
+  if (BYTES_ENV) b = Math.min(b, BYTES_ENV);
+  const mem = Number.isFinite(limit) && limit > 0 ? limit : ASSUMED_MEMORY_LIMIT;
+  return Math.min(b, Math.max(64 << 10, Math.floor(mem / MEMORY_FRACTION)));
+}
+let maxBytes = byteBudget(null);
 const SAVE_DEBOUNCE_MS = positiveEnv("PERMISSION_LEDGER_SAVE_MS", 5000);
 const TOP_MAX = 50;
 const RECENT_MAX = 50;
@@ -149,13 +160,11 @@ function totalBytes() {
   return n;
 }
 
-/** The container's memory limit in bytes (null = unknown): the byte budget becomes
- * the smaller of the file budget and a sixteenth of it. */
+/** The container's memory limit in bytes (null = unknown, budgeted as the
+ * deployed 512m): the byte budget becomes the smaller of the file budget and a
+ * sixty-fourth of it. */
 function setMemoryLimit(limit) {
-  let b = FILE_BUDGET_BYTES;
-  if (BYTES_ENV) b = Math.min(b, BYTES_ENV);
-  if (Number.isFinite(limit) && limit > 0) b = Math.min(b, Math.max(64 << 10, Math.floor(limit / MEMORY_FRACTION)));
-  maxBytes = b;
+  maxBytes = byteBudget(limit);
   return maxBytes;
 }
 
@@ -332,10 +341,15 @@ const BASH_SAFE_HEADS = new Set([
 // `git rebase` (`--exec`), `kubectl get` (`--kubeconfig` names an exec plugin),
 // `npm test`/`run` (`--node-options`, `--script-shell`), `go test` (`-exec`),
 // `cargo` (`--config` sets a runner), `make` (variable overrides run anything).
+// Also out: a subcommand GROUP whose verbs differ in kind — the head is two words,
+// so the rule covers every verb under it. `gh pr`/`glab mr` (`merge --admin`
+// lands on main past branch protection; `checkout -R` pulls any repo's tree and
+// runs its hooks), `gh run` (`download -R … -D <dir>` writes any directory),
+// `gh issue`/`glab issue` (writes to the tracker), and `git commit`/`switch`/
+// `add`/`branch` (hooks a session can edit; `branch -D` deletes work).
 const BASH_SAFE_SUBCOMMANDS = new Set([
-  "git status", "git branch", "git rev-parse", "git ls-files", "git blame", "git describe",
-  "git add", "git commit", "git switch",
-  "gh pr", "gh issue", "gh run", "gh search", "gh status", "glab mr", "glab issue",
+  "git status", "git rev-parse", "git ls-files", "git blame", "git describe",
+  "gh search", "gh status",
   "docker ps", "docker images", "docker logs", "docker inspect",
   "npm ls", "npm view", "npm outdated", "systemctl status",
 ]);
@@ -607,23 +621,21 @@ function load() {
   }
 }
 
-function serialize() {
-  try {
-    const out = {};
-    for (const [host, m] of hosts) out[host] = [...m.values()];
-    return JSON.stringify({ version: 1, hosts: out });
-  } catch (e) {
-    // Throwing out of a save TIMER is an uncaught exception that exits the hub.
-    console.error(`permission ledger save skipped — could not serialize: ${e.message}`);
-    return null;
+// What the file would weigh, from the row sizes measured once on entry: exact for
+// the rows (each counted with its comma), an upper bound for the framing.
+function fileBytes() {
+  let n = 24;                                        // {"version":1,"hosts":{ … }}
+  for (const [host, m] of hosts) {
+    n += Buffer.byteLength(JSON.stringify(host), "utf8") + 4;
+    for (const row of m.values()) n += bytesOf(row);
   }
+  return n;
 }
 
 // Never write a file load() would refuse: past FILE_MAX_BYTES (the byte budget
 // keeps the model under it; this is the backstop) the oldest rows go first.
-function serializeLoadable() {
-  let blob = serialize();
-  while (blob !== null && Buffer.byteLength(blob, "utf8") > FILE_MAX_BYTES && rowCount()) {
+function trimToFileCeiling() {
+  while (rowCount() && fileBytes() > FILE_MAX_BYTES) {
     const all = [];
     for (const [host, m] of hosts) for (const row of m.values()) all.push({ host, row });
     all.sort((a, b) => a.row.openedAt - b.row.openedAt);
@@ -633,20 +645,68 @@ function serializeLoadable() {
       if (!m.size) hosts.delete(host);
     }
     console.error("permission ledger: file past its ceiling; dropped the oldest tenth before writing");
-    blob = serialize();
   }
-  return blob;
+}
+
+// A save STREAMS the file in chunks of about this many chars rather than building
+// it whole: a whole-file string is a second copy of the store on the heap, which
+// at the byte budget doubles what the ledger holds (XERK-287 margin).
+const SAVE_CHUNK_CHARS = positiveEnv("PERMISSION_LEDGER_SAVE_CHUNK", 256 << 10);
+
+// Writes `snapshot` ([host, rows[]] pairs, references only) to a temp file and
+// renames it over the ledger, so a crash mid-save leaves the previous file whole.
+async function writeSnapshot(snapshot) {
+  await fs.promises.mkdir(path.dirname(LEDGER_FILE), { recursive: true });
+  const tmp = `${LEDGER_FILE}.tmp`;
+  const fh = await fs.promises.open(tmp, "w");
+  try {
+    let buf = "{\"version\":1,\"hosts\":{";
+    for (let h = 0; h < snapshot.length; h++) {
+      const [host, rows] = snapshot[h];
+      buf += `${h ? "," : ""}${JSON.stringify(host)}:[`;
+      for (let i = 0; i < rows.length; i++) {
+        buf += (i ? "," : "") + JSON.stringify(rows[i]);
+        if (buf.length >= SAVE_CHUNK_CHARS) { await fh.writeFile(buf, "utf8"); buf = ""; }
+      }
+      buf += "]";
+    }
+    await fh.writeFile(`${buf}}}`, "utf8");
+  } catch (e) {
+    await fh.close().catch(() => {});
+    await fs.promises.unlink(tmp).catch(() => {});
+    throw e;
+  }
+  await fh.close();
+  await fs.promises.rename(tmp, LEDGER_FILE);
 }
 
 let saveTimer = null;
+// One save at a time (they share the temp file). A save asked for while one is
+// in flight runs once after it, and answers every caller that asked meanwhile.
+let writing = false;
+let writeWaiters = null;
 function writeNow(done) {
-  const blob = serializeLoadable();
-  if (blob === null) return void (done && done(new Error("not serializable")));
-  fs.mkdir(path.dirname(LEDGER_FILE), { recursive: true }, () => {
-    fs.writeFile(LEDGER_FILE, blob, (err) => {
-      if (err) console.error(`permission ledger save failed: ${err.message}`);
-      if (done) done(err || null);
-    });
+  if (writing) {
+    (writeWaiters || (writeWaiters = [])).push(done);
+    return;
+  }
+  writing = true;
+  trimToFileCeiling();
+  const snapshot = [];
+  for (const [host, m] of hosts) snapshot.push([host, [...m.values()]]);
+  let err = null;
+  // Never rejects out: a rejection out of a save TIMER would exit the hub.
+  writeSnapshot(snapshot).catch((e) => {
+    err = e;
+    console.error(`permission ledger save failed: ${(e && e.message) || e}`);
+  }).then(() => {
+    writing = false;
+    if (writeWaiters) {
+      const cbs = writeWaiters;
+      writeWaiters = null;
+      writeNow((e) => { for (const cb of cbs) if (cb) cb(e); });
+    }
+    if (done) done(err);
   });
 }
 function scheduleSave() {

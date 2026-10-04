@@ -76,20 +76,34 @@ def _cap(value, limit):
     return value if len(value) <= limit else value[:limit]
 
 
-def bash_head(command):
-    """The first command's first word — two for a CLI whose subcommand is the
-    decision (``git push``, ``npm test``). Leading ``VAR=value`` assignments are
-    skipped (they are not the command). ``""`` when nothing parses."""
-    if not isinstance(command, str):
-        return ""
-    first = _SEGMENT_SPLIT_RE.split(command.strip(), maxsplit=1)[0].strip()
+def _segment_words(segment):
     try:
-        words = shlex.split(first)
+        words = shlex.split(segment)
     except ValueError:
-        words = first.split()
+        words = segment.split()
     words = [w for w in words if w]
     while words and _ENV_ASSIGN_RE.match(words[0]):
         words.pop(0)
+    return words
+
+
+def bash_head(command):
+    """The first command's first word — two for a CLI whose subcommand is the
+    decision (``git push``, ``npm test``). Leading ``VAR=value`` assignments are
+    skipped (they are not the command), and so are leading ``cd <dir>`` segments:
+    ``cd /repo && npm test`` is about ``npm test``, and heading every such call
+    ``cd`` would merge them all into one group that names no command. ``cd`` stays
+    the head only when nothing follows it. ``""`` when nothing parses."""
+    if not isinstance(command, str):
+        return ""
+    words = []
+    for segment in _SEGMENT_SPLIT_RE.split(command.strip()):
+        seg_words = _segment_words(segment.strip())
+        if not seg_words:
+            continue
+        words = seg_words
+        if words[0] != "cd":
+            break
     if not words:
         return ""
     head = words[0]
