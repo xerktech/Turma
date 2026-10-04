@@ -1685,12 +1685,17 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # runs every line of it. Expand those bodies as commands; bodies fed to
         # anything else stay data (see _destructive_database for the psql case).
         owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
-        if owner not in owner_pipes_to_shell:
-            # So is one an owner PIPES into a shell: `cat <<'EOF' | bash` (XERK-1539).
-            owner_pipes_to_shell[owner] = any(
-                _reads_stdin_script(st) for st in _split_segments(owner)[1:])
+        def _owner_feeds_shell() -> bool:
+            # So is one an owner that PIPES into a shell: `cat <<'EOF' | bash`
+            # (XERK-1539). Memoised on the owner string (every heredoc on a line
+            # shares it) and reached only when the cheap head check below misses,
+            # so a `bash <<EOF` owner never pays for this scan.
+            if owner not in owner_pipes_to_shell:
+                owner_pipes_to_shell[owner] = any(
+                    _reads_stdin_script(st) for st in _split_segments(owner)[1:])
+            return owner_pipes_to_shell[owner]
         if (owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."})
-                or owner_pipes_to_shell[owner]):
+                or _owner_feeds_shell()):
             out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, every_cd))
         elif not quoted:
             # ...but data behind an UNQUOTED delimiter is expanded first, so its
@@ -1732,7 +1737,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # every earlier stage per reader was O(stages²) and a 60 KB `echo|sh` chain
     # took 15 min — past the hook timeout, which fails OPEN. De-duping and the
     # fed-text cap bound the work; a reader past the cap is a miss, never a hang.
-    for pipeline in _split_on_operators(command, include_pipe=False):
+    # Nothing feeds a shell a script without a pipe, here-string or `<(…)`
+    # somewhere, so the whole scan (an extra full-command split) is skipped when
+    # the line has none — a line of 1000 `bash <<EOF` heredocs otherwise paid
+    # for it (the body is a script by the heredoc path above, not this one).
+    feeds_a_shell = "|" in command or "<<<" in command or "<(" in command
+    for pipeline in _split_on_operators(command, include_pipe=False) if feeds_a_shell else ():
+        # A single-stage "pipeline" with no here-string or `<(…)` has nothing
+        # feeding it either, so skip its per-stage scan too.
+        if "|" not in pipeline and "<<<" not in pipeline and "<(" not in pipeline:
+            continue
         producers: list[str] = []       # distinct printed/here-string texts so far
         seen_texts: set[str] = set()
         def _feed(text: str) -> None:
