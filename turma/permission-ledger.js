@@ -38,7 +38,8 @@ function positiveEnv(name, fallback) {
 
 const LEDGER_FILE = process.env.PERMISSION_LEDGER_FILE || "/data/permission-ledger.json";
 const MAX_ROWS = positiveEnv("PERMISSION_LEDGER_MAX_ROWS", 20000);
-// One host may hold at most this share, so a flooding host cannot evict the fleet.
+// One host may hold at most this share of the rows AND of the byte budget (see
+// evict), so a flooding host cannot evict the fleet.
 const HOST_MAX_ROWS = positiveEnv("PERMISSION_LEDGER_HOST_MAX_ROWS", Math.max(1, Math.floor(MAX_ROWS / 4)));
 const DAYS = positiveEnv("PERMISSION_LEDGER_DAYS", 30);
 const DAY_MS = 86400000;
@@ -46,19 +47,30 @@ const DAY_MS = 86400000;
 // trusts that it did.
 const EVENTS_PER_BEAT = 200;
 // The file is measured before it is read (an oversized one is an OOM at boot,
-// every boot); ~1 KiB a row puts the ceiling well past MAX_ROWS.
-const FILE_MAX_BYTES = positiveEnv("PERMISSION_LEDGER_FILE_MAX", 64 << 20);
+// every boot). The byte budget below keeps a written file far under this.
+const FILE_MAX_BYTES = positiveEnv("PERMISSION_LEDGER_FILE_MAX", 16 << 20);
 // The store is bounded in BYTES as well as rows: every cap above is in chars, so
 // a row can serialize to ~15 KB of UTF-8 and MAX_ROWS of them would be a file
-// load() refuses (the whole ledger lost at the next boot) and a heap the
-// container cannot hold. The budget is the smaller of nine tenths of the file
-// ceiling (so a written file always loads) and a FRACTION of the container's
-// memory limit (CLAUDE.md: memory ceilings are fractions, never fixed numbers) —
-// server.js hands that limit in through setMemoryLimit() at boot.
+// load() refuses and a heap the container cannot hold. The budget is the smaller
+// of nine tenths of the file ceiling (so a written file always loads) and a
+// FRACTION of the container's memory limit (CLAUDE.md: memory ceilings are
+// fractions, never fixed numbers) — server.js hands that limit in through
+// setMemoryLimit() at boot. The fraction is sized from the ~68 MiB XERK-287
+// co-peak MARGIN, not the container: a sixty-fourth (8 MiB of JSON at 512m) is
+// ~9 MiB of retained heap, and a save streams the file in chunks rather than
+// building a second whole copy (turma-limits.md records it in that margin).
 const FILE_BUDGET_BYTES = Math.floor(FILE_MAX_BYTES * 0.9);
 const BYTES_ENV = positiveEnv("PERMISSION_LEDGER_MAX_BYTES", 0);
-const MEMORY_FRACTION = 16;               // 32 MiB at the deployed 512m
-let maxBytes = BYTES_ENV ? Math.min(BYTES_ENV, FILE_BUDGET_BYTES) : FILE_BUDGET_BYTES;
+const MEMORY_FRACTION = 64;               // 8 MiB at the deployed 512m
+// An unknown limit (no cgroup) is budgeted as the deployed container.
+const ASSUMED_MEMORY_LIMIT = 512 << 20;
+function byteBudget(limit) {
+  let b = FILE_BUDGET_BYTES;
+  if (BYTES_ENV) b = Math.min(b, BYTES_ENV);
+  const mem = Number.isFinite(limit) && limit > 0 ? limit : ASSUMED_MEMORY_LIMIT;
+  return Math.min(b, Math.max(64 << 10, Math.floor(mem / MEMORY_FRACTION)));
+}
+let maxBytes = byteBudget(null);
 const SAVE_DEBOUNCE_MS = positiveEnv("PERMISSION_LEDGER_SAVE_MS", 5000);
 const TOP_MAX = 50;
 const RECENT_MAX = 50;
@@ -76,6 +88,8 @@ const STR_CAPS = {
 };
 // A wait longer than the retention window is not a wait this ledger can hold.
 const WAIT_MAX_MS = DAYS * DAY_MS;
+// A row still open past this is one the agent lost; ageOut closes it as unknown.
+const OPEN_MAX_MS = DAY_MS;
 
 function capStr(v, max) {
   if (typeof v !== "string") return "";
@@ -147,13 +161,11 @@ function totalBytes() {
   return n;
 }
 
-/** The container's memory limit in bytes (null = unknown): the byte budget becomes
- * the smaller of the file budget and a sixteenth of it. */
+/** The container's memory limit in bytes (null = unknown, budgeted as the
+ * deployed 512m): the byte budget becomes the smaller of the file budget and a
+ * sixty-fourth of it. */
 function setMemoryLimit(limit) {
-  let b = FILE_BUDGET_BYTES;
-  if (BYTES_ENV) b = Math.min(b, BYTES_ENV);
-  if (Number.isFinite(limit) && limit > 0) b = Math.min(b, Math.max(64 << 10, Math.floor(limit / MEMORY_FRACTION)));
-  maxBytes = b;
+  maxBytes = byteBudget(limit);
   return maxBytes;
 }
 
@@ -174,8 +186,18 @@ function evict(now = Date.now()) {
   const dropped = [];
   for (const [host, m] of hosts) {
     for (const [id, row] of m) if (row.openedAt < cutoff) { m.delete(id); dropped.push([host, id]); }
-    if (m.size > HOST_MAX_ROWS) {
-      for (const row of oldestFirst([...m.values()]).slice(0, m.size - HOST_MAX_ROWS)) {
+    // The row share alone is not enough: the binding limit is bytes, and a
+    // host's row share of max-size rows would fill most of it. So a host also
+    // keeps at most a quarter of the byte budget, oldest dropped first.
+    let hostBytes = 0;
+    for (const row of m.values()) hostBytes += bytesOf(row);
+    const hostMaxBytes = Math.floor(maxBytes / 4);
+    if (m.size > HOST_MAX_ROWS || hostBytes > hostMaxBytes) {
+      let overRows = m.size - HOST_MAX_ROWS;
+      for (const row of oldestFirst([...m.values()])) {
+        if (overRows <= 0 && hostBytes <= hostMaxBytes) break;
+        overRows -= 1;
+        hostBytes -= bytesOf(row);
         m.delete(row.id);
         dropped.push([host, row.id]);
       }
@@ -218,34 +240,77 @@ function ingest(host, events, now = Date.now()) {
   if (!m) hosts.set(host, (m = new Map()));
   for (const row of kept) m.set(row.id, row);
   const closed = closeSuperseded(m, kept);
+  const aged = ageOut(now);
   evict(now);
-  backend.onChange(host, closed.length ? [...kept.filter((r) => m.get(r.id) === r), ...closed] : kept);
+  const mine = [...kept, ...closed, ...(aged.get(host) || [])].filter((r) => m.get(r.id) === r);
+  backend.onChange(host, mine);
+  for (const [h, rows] of aged) {
+    if (h === host) continue;
+    const hm = hosts.get(h);
+    const live = hm ? rows.filter((r) => hm.get(r.id) === r) : [];
+    if (live.length) backend.onChange(h, live);
+  }
   return kept.length;
 }
 
-// A session shows ONE dialog at a time, and the agent closes its open row before
-// it opens the next — so a newer dialog row for a session means any older row of
-// that session still open here has ended. It stays open only when the agent
-// lost it (a manager restart forgets its open rows, and files the still-showing
-// prompt again under a new id), and would otherwise read "open" for the whole
-// retention window. Closed with the answer and wait unknown — the hub never saw
-// either. A real closed copy arriving later replaces this one by id.
+// Still holding its session: no close and no answer of any kind.
+function isOpen(row) {
+  return typeof row.closedAt !== "number" && !row.answer;
+}
+
+// A row the agent lost stays open here until something closes it. The agent closes
+// a row before it opens the session's next one of the same kind, and an ask once
+// the session moves past it — so only a LOST row (a manager restart forgets its
+// open rows) can still be open behind a newer one:
+//   - a newer DIALOG row for a session closes that session's older open dialog row
+//     (a pane shows one dialog at a time);
+//   - ANY newer row for a session closes that session's older open ASK (the
+//     session ran on, so it moved past the turn that asked).
+// Closed with the answer and wait unknown — the hub never saw either. A real
+// closed copy arriving later replaces this one by id. A classifier block is
+// complete on arrival and never open.
 function closeSuperseded(m, kept) {
-  const newest = new Map();      // sessionId -> openedAt of this beat's newest dialog row
+  const newestDialog = new Map();   // sessionId -> openedAt of this beat's newest dialog row
+  const newestAny = new Map();      // sessionId -> openedAt of this beat's newest row
   for (const r of kept) {
-    if (r.kind !== "dialog" || !r.sessionId) continue;
-    if (!(newest.get(r.sessionId) >= r.openedAt)) newest.set(r.sessionId, r.openedAt);
+    if (!r.sessionId) continue;
+    if (!(newestAny.get(r.sessionId) >= r.openedAt)) newestAny.set(r.sessionId, r.openedAt);
+    if (r.kind === "dialog" && !(newestDialog.get(r.sessionId) >= r.openedAt)) {
+      newestDialog.set(r.sessionId, r.openedAt);
+    }
   }
-  if (!newest.size) return [];
+  if (!newestAny.size) return [];
   const closed = [];
   for (const row of m.values()) {
-    const at = newest.get(row.sessionId);
-    if (at === undefined || row.kind !== "dialog" || row.openedAt >= at) continue;
-    if (typeof row.closedAt === "number" || row.answer) continue;
+    if (!row.sessionId || !isOpen(row)) continue;
+    const at = row.kind === "dialog" ? newestDialog.get(row.sessionId)
+      : row.kind === "ask-in-chat" ? newestAny.get(row.sessionId) : undefined;
+    if (at === undefined || row.openedAt >= at) continue;
     closed.push(track({ ...row, closedAt: at, answer: "unknown", via: "unknown" }));
   }
   for (const row of closed) m.set(row.id, row);
   return closed;
+}
+
+// A row open longer than OPEN_MAX_MS is closed as unknown — whichever host it is
+// on, at every ingest and every load/rescan. Nothing above closes a lost row whose
+// session never files another (a session deleted while the manager was down, or a
+// host that went away), and it would read "open" for the whole retention window.
+// `closedAt` is when the hub gave up; no `waitedMs` (the wait is unknown). A real
+// closed copy arriving later replaces it by id. Returns Map(host -> closed rows).
+function ageOut(now = Date.now()) {
+  const cutoff = now - OPEN_MAX_MS;
+  const out = new Map();
+  for (const [host, m] of hosts) {
+    for (const row of m.values()) {
+      if (row.openedAt >= cutoff || !isOpen(row)) continue;
+      const done = track({ ...row, closedAt: now, answer: "unknown", via: "unknown" });
+      m.set(row.id, done);
+      if (!out.has(host)) out.set(host, []);
+      out.get(host).push(done);
+    }
+  }
+  return out;
 }
 
 // ---- reads ---------------------------------------------------------------------
@@ -263,41 +328,70 @@ function median(nums) {
   return s.length % 2 ? s[mid] : Math.round((s[mid - 1] + s[mid]) / 2);
 }
 
-// Bash heads a `Bash(<head>:*)` rule must never be offered for: an interpreter,
-// shell, wrapper or shell keyword runs WHATEVER follows it, so its prefix rule
-// allows arbitrary code. A head outside a plain command shape (`(cd`, a glob, a
-// paren) would be a malformed rule. Either way the card says no rule retires it.
+// The Bash heads a `Bash(<head>:*)` rule IS offered for — a POSITIVE allowlist,
+// the only thing that makes a Bash rule safe to paste. A prefix rule allows the
+// head with ANY arguments, so a head is listed only when no argument it takes can
+// run code: read-only inspection tools, and a few subcommands of a CLI whose own
+// flags exec nothing. Everything else — an interpreter, shell, wrapper, runner, a
+// tool with an exec flag (`find -exec`, `rg --pre`, `sort --compress-program`,
+// `git fetch --upload-pack`, `go test -exec`, `npm test --node-options`), a path
+// to a binary, an unknown CLI — gets NO rule and a reason: the card says "no
+// safe rule, review it". Missing a safe head only withholds a suggestion;
+// listing an unsafe one hands out an allow-everything rule. Add a head only with
+// its argument surface checked, and a test row.
+const BASH_SAFE_HEADS = new Set([
+  "ls", "cat", "head", "tail", "wc", "grep", "egrep", "fgrep", "stat", "file", "du", "df",
+  "pwd", "which", "whoami", "uname", "id", "date", "echo", "printf", "diff", "cmp", "comm",
+  "cut", "tr", "jq", "realpath", "dirname", "basename", "readlink", "nl", "tac", "rev",
+  "md5sum", "sha1sum", "sha256sum", "sha512sum", "cksum", "ps", "free", "uptime", "seq",
+  "od", "hexdump", "strings", "column", "paste", "join", "fold", "true", "false",
+]);
+// A subcommand CLI's head is two words (`git status`); only these get a rule. Left
+// out on purpose: `git diff`/`log`/`show` (`--output=<file>` writes any file),
+// `git fetch`/`pull`/`push` (`--upload-pack`/`--receive-pack` run a command),
+// `git rebase` (`--exec`), `kubectl get` (`--kubeconfig` names an exec plugin),
+// `npm test`/`run` (`--node-options`, `--script-shell`), `go test` (`-exec`),
+// `cargo` (`--config` sets a runner), `make` (variable overrides run anything).
+// Also out: a subcommand GROUP whose verbs differ in kind — the head is two words,
+// so the rule covers every verb under it. `gh pr`/`glab mr` (`merge --admin`
+// lands on main past branch protection; `checkout -R` pulls any repo's tree and
+// runs its hooks), `gh run` (`download -R … -D <dir>` writes any directory),
+// `gh issue`/`glab issue` (writes to the tracker), and `git commit`/`switch`/
+// `add`/`branch` (hooks a session can edit; `branch -D` deletes work).
+const BASH_SAFE_SUBCOMMANDS = new Set([
+  "git status", "git rev-parse", "git ls-files", "git blame", "git describe",
+  "gh search", "gh status",
+  "docker ps", "docker images", "docker logs", "docker inspect",
+  "npm ls", "npm view", "npm outdated", "systemctl status",
+]);
+// A SECOND check, not what keeps the table safe (the allowlist is): heads known
+// to run whatever follows them. An allowlisted head listed here still gets no
+// rule, and a listed head's reason says why.
 const BASH_NEVER_HEADS = new Set([
   "bash", "sh", "zsh", "dash", "fish", "ksh", "csh", "tcsh", "pwsh", "powershell",
-  "python", "python2", "python3", "node", "deno", "ruby", "perl", "php", "lua",
-  "osascript", "sudo", "su", "doas", "env", "xargs", "timeout", "nohup", "nice",
-  "time", "watch", "exec", "eval", "source", ".", "command", "builtin", "for", "while",
-  "until", "if", "case", "select", "function", "do", "then", "npx", "bunx", "uvx",
+  "ash", "mksh", "yash", "xonsh", "nu", "elvish",
+  "python", "python2", "python3", "py", "pythonw", "node", "deno", "ruby", "perl", "php",
+  "lua", "R", "swift", "scala", "groovy", "erl", "ghci", "jshell", "racket", "guile", "sbcl",
+  "osascript", "sudo", "su", "doas", "pkexec", "env", "xargs", "timeout", "gtimeout", "nohup",
+  "nice", "time", "watch", "exec", "eval", "source", ".", "command", "builtin", "for",
+  "while", "until", "if", "case", "select", "function", "do", "then", "npx", "bunx", "uvx",
   "npm exec", "pnpm exec", "pnpm dlx", "yarn dlx", "uv run", "docker run",
-  "docker exec", "kubectl exec", "ssh", "awk", "find", "parallel", "script",
-  // The SAME exec under another spelling: an alias or a parent noun whose own
-  // subcommand is the exec (`docker container run`, `docker compose run` head
-  // as `docker container` / `docker compose`, covering `docker run` itself).
+  "docker exec", "kubectl exec", "podman exec", "nerdctl exec", "bundle exec", "ssh", "awk",
+  "find", "parallel", "script", "sed",
   "docker container", "docker compose", "npm x", "bun x", "bun run", "yarn exec",
   "go run", "cargo run", "dotnet run", "kubectl run", "kubectl debug",
-  // Wrappers that run their argument, and interpreters/runners whose head is
-  // the bare CLI (not a SUBCOMMAND_CLIS member, so `poetry run x` heads `poetry`).
-  "stdbuf", "setsid", "chroot", "unshare", "nsenter", "strace", "ltrace", "busybox",
-  "flock", "taskset", "ionice", "chrt", "runuser", "setpriv", "systemd-run",
-  "unbuffer", "expect", "xvfb-run", "dbus-run-session", "tsx", "ts-node",
+  "stdbuf", "setsid", "chroot", "unshare", "nsenter", "strace", "ltrace", "busybox", "toybox",
+  "flock", "taskset", "ionice", "chrt", "runuser", "setpriv", "systemd-run", "fakeroot",
+  "proot", "bwrap", "firejail", "torsocks", "proxychains", "chpst", "sg", "valgrind", "perf",
+  "caffeinate", "unbuffer", "expect", "xvfb-run", "dbus-run-session", "tsx", "ts-node",
   "poetry", "pipx", "pdm", "hatch", "conda", "mamba", "micromamba", "nix", "nix-shell",
   "mise", "asdf", "direnv", "java", "julia", "Rscript", "tclsh",
   "cmd", "cmd.exe", "powershell.exe", "pwsh.exe", "wsl", "wsl.exe",
-  // Other names for a listed interpreter or exec: a distro/alternate binary
-  // (`nodejs`, `pypy`, `gawk`), a REPL, and a runner verb the lists above missed
-  // (`pnpx` = `pnpm dlx`, `uv tool run` = `uvx`, `yarn node`, `dotnet exec`).
   "nodejs", "pypy", "ipython", "bpython", "luajit", "gawk", "mawk", "nawk", "pnpx",
   "uv tool", "yarn node", "dotnet exec",
 ]);
-// A versioned interpreter binary (`python3.11`, `php8.2`, `perl5.36`, `node22`) or
-// a Windows `.exe` runs exactly what its family does, so the never-list is also
-// checked against the name with that suffix cut. Over-matching only withholds a
-// suggestion; under-matching hands out an allow-everything rule.
+// A versioned interpreter binary (`python3.11`, `php8.2`, `node22`) or a Windows
+// `.exe` is its family — for the never-list's reason only; neither is allowlisted.
 function bashFamily(base) {
   const name = base.replace(/\.exe$/i, "");
   const m = /^(.*?[A-Za-z])[\d.]+$/.exec(name);
@@ -307,57 +401,95 @@ const BASH_HEAD_RE = /^[A-Za-z0-9._/-]+( [A-Za-z0-9._-]+)?$/;
 // MIRRORS `SUBCOMMAND_CLIS` in agent/hooks/permlog.py (parity-tested): CLIs whose
 // subcommand is the decision. permlog keeps the subcommand in the head only when
 // it is the second word, so a leading global flag (`git -C /repo push`,
-// `kubectl -n prod exec`, `docker -H x run`) leaves the BARE CLI — and its
-// prefix rule (`Bash(git:*)`) would allow every subcommand, the never-listed
-// ones (`docker run`, `kubectl exec`) and `git -c alias.x='!sh'` included.
+// `kubectl -n prod exec`) leaves the BARE CLI — which says nothing about what ran.
 const SUBCOMMAND_CLIS = new Set([
   "git", "gh", "glab", "az", "npm", "pnpm", "yarn", "npx", "bun", "docker",
   "kubectl", "helm", "cargo", "go", "uv", "pip", "pip3", "terraform", "make",
   "systemctl", "brew", "apt", "apt-get", "dotnet", "gradle", "./gradlew",
 ]);
 
-function toolRule(tool, head) {
-  if (tool === "Bash" && head) {
-    const word = head.split(" ")[0];
-    const base = word.slice(word.lastIndexOf("/") + 1);
-    if (!BASH_HEAD_RE.test(head) || BASH_NEVER_HEADS.has(head)
-        || BASH_NEVER_HEADS.has(word) || BASH_NEVER_HEADS.has(base)
-        || BASH_NEVER_HEADS.has(bashFamily(base))) return null;
-    if (word === head && (SUBCOMMAND_CLIS.has(word) || SUBCOMMAND_CLIS.has(base))) return null;
-    return `Bash(${head}:*)`;
+// `{rule}` for an allowlisted Bash head, else `{rule: null, reason}` — the reason
+// is WHY there is no safe rule; the card shows it under "no safe rule — review it".
+function bashVerdict(head) {
+  if (!head || !BASH_HEAD_RE.test(head)) {
+    return { rule: null, reason: "not a plain command name" };
   }
-  if (typeof tool === "string" && tool.startsWith("mcp__")) return tool;
-  if (tool === "WebFetch" && head && HOST_RE.test(head)) return `WebFetch(domain:${head})`;
-  return null;
+  const word = head.split(" ")[0];
+  const base = word.slice(word.lastIndexOf("/") + 1);
+  if (BASH_NEVER_HEADS.has(head) || BASH_NEVER_HEADS.has(word) || BASH_NEVER_HEADS.has(base)
+      || BASH_NEVER_HEADS.has(bashFamily(base))) {
+    return { rule: null, reason: "runs whatever follows it" };
+  }
+  if (word.includes("/")) {
+    return { rule: null, reason: "a path runs whatever binary sits there" };
+  }
+  if (word === head && SUBCOMMAND_CLIS.has(word)) {
+    return { rule: null,
+      reason: `no subcommand recorded, and a bare ${word} rule allows every one` };
+  }
+  if (word === head ? BASH_SAFE_HEADS.has(head) : BASH_SAFE_SUBCOMMANDS.has(head)) {
+    return { rule: `Bash(${head}:*)` };
+  }
+  return { rule: null,
+    reason: "not on the known read-only list, so its arguments may run code" };
+}
+
+// A FULL MCP tool name, `mcp__<server>__<tool>`, no wildcard. `tool` is
+// agent-supplied (a session can write its own hook log with Bash), and a bare
+// `mcp__github` or `mcp__github__*` would allow every tool on that server.
+const MCP_TOOL_RE = /^mcp__[A-Za-z0-9_-]+__[A-Za-z0-9_-]+$/;
+
+function toolVerdict(tool, head) {
+  if (tool === "Bash") return bashVerdict(head);
+  if (typeof tool === "string" && tool.startsWith("mcp__")) {
+    return MCP_TOOL_RE.test(tool) ? { rule: tool } : { rule: null, reason: "not a full MCP tool name" };
+  }
+  if (tool === "WebFetch" && head && HOST_RE.test(head)) return { rule: `WebFetch(domain:${head})` };
+  return { rule: null };
 }
 
 /**
  * The allow rule that would retire a prompt — DETERMINISTIC, a table, never a
- * judgement (the LLM judge is a later child):
+ * judgement (the LLM judge, XERK-1566, consumes it):
  *   ask-in-chat                      → "model behaviour: see CLAUDE.md step 0"
- *   a sandbox dialog naming a host   → sandbox.network.allowedDomains: <host>
+ *   a sandbox dialog naming a host   → sandbox.network.allowedDomains: <host>;
+ *                                      one with no readable host gets none
  *   classifier-denied                → an autoMode.environment allow line for the
  *                                      call's tool rule; NONE when the call has no
  *                                      tool rule (a sentence lifted from the deny
  *                                      reason is not a line anything accepts)
- *   Bash                             → Bash(<head>:*), except an interpreter /
- *                                      wrapper / shell-keyword head, a bare
- *                                      subcommand CLI (`git`, `docker`), or a
- *                                      head outside a plain command shape (null)
- *   MCP                              → the full mcp__<server>__<tool>
+ *   Bash                             → Bash(<head>:*) ONLY for a head on the
+ *                                      allowlist (BASH_SAFE_HEADS /
+ *                                      BASH_SAFE_SUBCOMMANDS); any other head gets
+ *                                      none, with a reason
+ *   MCP                              → the full mcp__<server>__<tool> ONLY
+ *                                      (MCP_TOOL_RE); a bare server or a
+ *                                      wildcard gets none, with a reason
  *   WebFetch                         → WebFetch(domain:<d>)
  *   anything else                    → null (no rule retires it)
+ * Returns `{rule, reason}`: `reason` only for a Bash head, an MCP name or a
+ * sandbox prompt that gets no rule.
  */
-function suggestedRule(g) {
-  if (!g) return null;
-  if (g.kind === "ask-in-chat") return "model behaviour: see CLAUDE.md step 0";
-  if (g.dialogKind === "sandbox" && g.head && HOST_RE.test(g.head)) {
-    return `sandbox.network.allowedDomains: ${g.head}`;
+function ruleVerdict(g) {
+  if (!g) return { rule: null };
+  if (g.kind === "ask-in-chat") return { rule: "model behaviour: see CLAUDE.md step 0" };
+  if (g.dialogKind === "sandbox") {
+    // No tool allow rule retires a sandbox NETWORK prompt, so one whose host
+    // could not be read gets no rule, never the call's own Bash rule.
+    return g.head && HOST_RE.test(g.head)
+      ? { rule: `sandbox.network.allowedDomains: ${g.head}` }
+      : { rule: null, reason: "no host recorded for this sandbox prompt" };
   }
-  const rule = toolRule(g.tool, g.head);
-  if (g.kind === "classifier-denied") return rule ? `autoMode.environment: allow ${rule}` : null;
-  if (g.dialogKind === "plan") return null;
-  return rule;
+  const v = toolVerdict(g.tool, g.head);
+  if (g.kind === "classifier-denied") {
+    return v.rule ? { rule: `autoMode.environment: allow ${v.rule}` } : v;
+  }
+  if (g.dialogKind === "plan") return { rule: null };
+  return v;
+}
+
+function suggestedRule(g) {
+  return ruleVerdict(g).rule || null;
 }
 
 function scopedRows(hostSet, days, now) {
@@ -404,7 +536,7 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
     if (row.answer === "deny") g.denied += 1;
     // Still holding its session: not closed and no answer of any kind yet. A
     // group whose every row is open has no answer to show, which 0/0 would hide.
-    if (typeof row.closedAt !== "number" && !row.answer) g.open += 1;
+    if (isOpen(row)) g.open += 1;
     if (typeof row.waitedMs === "number") g.waits.push(row.waitedMs);
     if (row.openedAt >= g.lastAt) {
       g.lastAt = row.openedAt;
@@ -419,8 +551,12 @@ function aggregate({ hosts: hostSet = null, days = 7, now = Date.now() } = {}) {
       const out = {
         kind: g.kind, dialogKind: g.dialogKind, tool: g.tool, head: g.head,
         count: g.count, allowed: g.allowed, denied: g.denied, open: g.open,
-        medianWaitMs: median(g.waits), lastAt: g.lastAt, suggestedRule: suggestedRule(g),
+        medianWaitMs: median(g.waits), lastAt: g.lastAt, suggestedRule: null,
       };
+      const verdict = ruleVerdict(g);
+      out.suggestedRule = verdict.rule || null;
+      // A Bash head with no safe rule says why: "review it", never a guess.
+      if (!out.suggestedRule && verdict.reason) out.noRuleReason = verdict.reason;
       // An ask-in-chat group's subject is its newest question. Nobody answers
       // an ask with allow/deny, so its allowed/denied are null ("can't tell"),
       // never a 0/0 that reads as "asked and ignored".
@@ -485,7 +621,9 @@ function load() {
       }
       if (m.size) hosts.set(host, m);
     }
+    const aged = ageOut(now);
     evict(now);
+    if (aged.size) scheduleSave();
   } catch (e) {
     if (!e || e.code !== "ENOENT") {
       hosts = new Map();
@@ -494,23 +632,21 @@ function load() {
   }
 }
 
-function serialize() {
-  try {
-    const out = {};
-    for (const [host, m] of hosts) out[host] = [...m.values()];
-    return JSON.stringify({ version: 1, hosts: out });
-  } catch (e) {
-    // Throwing out of a save TIMER is an uncaught exception that exits the hub.
-    console.error(`permission ledger save skipped — could not serialize: ${e.message}`);
-    return null;
+// What the file would weigh, from the row sizes measured once on entry: exact for
+// the rows (each counted with its comma), an upper bound for the framing.
+function fileBytes() {
+  let n = 24;                                        // {"version":1,"hosts":{ … }}
+  for (const [host, m] of hosts) {
+    n += Buffer.byteLength(JSON.stringify(host), "utf8") + 4;
+    for (const row of m.values()) n += bytesOf(row);
   }
+  return n;
 }
 
 // Never write a file load() would refuse: past FILE_MAX_BYTES (the byte budget
 // keeps the model under it; this is the backstop) the oldest rows go first.
-function serializeLoadable() {
-  let blob = serialize();
-  while (blob !== null && Buffer.byteLength(blob, "utf8") > FILE_MAX_BYTES && rowCount()) {
+function trimToFileCeiling() {
+  while (rowCount() && fileBytes() > FILE_MAX_BYTES) {
     const all = [];
     for (const [host, m] of hosts) for (const row of m.values()) all.push({ host, row });
     all.sort((a, b) => a.row.openedAt - b.row.openedAt);
@@ -520,20 +656,73 @@ function serializeLoadable() {
       if (!m.size) hosts.delete(host);
     }
     console.error("permission ledger: file past its ceiling; dropped the oldest tenth before writing");
-    blob = serialize();
   }
-  return blob;
+}
+
+// A save STREAMS the file in chunks of about this many chars rather than building
+// it whole: a whole-file string is a second copy of the store on the heap, which
+// at the byte budget doubles what the ledger holds (XERK-287 margin).
+const SAVE_CHUNK_CHARS = positiveEnv("PERMISSION_LEDGER_SAVE_CHUNK", 256 << 10);
+
+// Writes `snapshot` ([host, rows[]] pairs, references only) to a temp file and
+// renames it over the ledger, so a crash mid-save leaves the previous file whole.
+async function writeSnapshot(snapshot) {
+  await fs.promises.mkdir(path.dirname(LEDGER_FILE), { recursive: true });
+  const tmp = `${LEDGER_FILE}.tmp`;
+  const fh = await fs.promises.open(tmp, "w");
+  try {
+    let buf = "{\"version\":1,\"hosts\":{";
+    for (let h = 0; h < snapshot.length; h++) {
+      const [host, rows] = snapshot[h];
+      buf += `${h ? "," : ""}${JSON.stringify(host)}:[`;
+      for (let i = 0; i < rows.length; i++) {
+        buf += (i ? "," : "") + JSON.stringify(rows[i]);
+        if (buf.length >= SAVE_CHUNK_CHARS) { await fh.writeFile(buf, "utf8"); buf = ""; }
+      }
+      buf += "]";
+    }
+    await fh.writeFile(`${buf}}}`, "utf8");
+  } catch (e) {
+    await fh.close().catch(() => {});
+    await fs.promises.unlink(tmp).catch(() => {});
+    throw e;
+  }
+  await fh.close();
+  try {
+    await fs.promises.rename(tmp, LEDGER_FILE);
+  } catch (e) {
+    await fs.promises.unlink(tmp).catch(() => {});
+    throw e;
+  }
 }
 
 let saveTimer = null;
+// One save at a time (they share the temp file). A save asked for while one is
+// in flight runs once after it, and answers every caller that asked meanwhile.
+let writing = false;
+let writeWaiters = null;
 function writeNow(done) {
-  const blob = serializeLoadable();
-  if (blob === null) return void (done && done(new Error("not serializable")));
-  fs.mkdir(path.dirname(LEDGER_FILE), { recursive: true }, () => {
-    fs.writeFile(LEDGER_FILE, blob, (err) => {
-      if (err) console.error(`permission ledger save failed: ${err.message}`);
-      if (done) done(err || null);
-    });
+  if (writing) {
+    (writeWaiters || (writeWaiters = [])).push(done);
+    return;
+  }
+  writing = true;
+  trimToFileCeiling();
+  const snapshot = [];
+  for (const [host, m] of hosts) snapshot.push([host, [...m.values()]]);
+  let err = null;
+  // Never rejects out: a rejection out of a save TIMER would exit the hub.
+  writeSnapshot(snapshot).catch((e) => {
+    err = e;
+    console.error(`permission ledger save failed: ${(e && e.message) || e}`);
+  }).then(() => {
+    writing = false;
+    if (writeWaiters) {
+      const cbs = writeWaiters;
+      writeWaiters = null;
+      writeNow((e) => { for (const cb of cbs) if (cb) cb(e); });
+    }
+    if (done) done(err);
   });
 }
 function scheduleSave() {
@@ -660,6 +849,7 @@ class PermissionLedgerPgStore {
       }
       m.set(row.id, track(row));
     }
+    for (const [host, rows] of ageOut(now)) for (const row of rows) stale.push([host, row]);
     evict(now);
     // A LIMIT-truncated read says nothing about rows older than its oldest.
     const floor = got.length >= MAX_ROWS ? oldest : since;
@@ -791,10 +981,10 @@ function flush(done) { backend.flush(done); }
 load();
 
 module.exports = {
-  ingest, aggregate, kindTotals, sanitizePermissionEvent, suggestedRule, configure,
+  ingest, aggregate, kindTotals, sanitizePermissionEvent, suggestedRule, ruleVerdict, configure,
   rehydrate, flush, setMemoryLimit,
-  LEDGER_FILE, MAX_ROWS, HOST_MAX_ROWS, DAYS, EVENTS_PER_BEAT, T_EVENT,
-  SUBCOMMAND_CLIS, PermissionLedgerPgStore,
+  LEDGER_FILE, MAX_ROWS, HOST_MAX_ROWS, DAYS, EVENTS_PER_BEAT, T_EVENT, OPEN_MAX_MS,
+  SUBCOMMAND_CLIS, BASH_SAFE_HEADS, BASH_SAFE_SUBCOMMANDS, PermissionLedgerPgStore,
   _internals: {
     hosts: () => hosts,
     rowCount, load, writeNow, totalBytes, maxBytes: () => maxBytes,

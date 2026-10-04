@@ -241,7 +241,22 @@
     background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
     padding: 2px 6px; word-break: normal; overflow-wrap: anywhere; display: inline-block; max-width: 100%;
   }
+  /* The rule and its Copy share one line: the rule shrinks and wraps inside its
+     box, Copy stays beside it — a long rule never drops Copy below it. */
+  .perm-rule-line { display: flex; align-items: center; gap: 6px; }
+  .perm-rule-line code { flex: 0 1 auto; min-width: 0; }
+  .perm-rule-line .perm-copy { flex: none; margin-left: 0; }
   .perm-rule .none { color: var(--muted); }
+  /* Inline code inside an ask's question (`legacy/`), rendered — never raw backticks. */
+  .perm-subj code {
+    font-family: var(--font-mono); font-size: 0.92em; padding: 0 4px;
+    background: var(--page); border: 1px solid var(--hairline); border-radius: var(--radius-sm);
+    overflow-wrap: anywhere;
+  }
+  /* The note sits below the table at the same gap as "Recent prompts" (12px), so it never
+     reads as part of the last row. `.models-card .note`'s -4px top would otherwise win. */
+  .models-card .note.perm-foot { margin-top: 12px; }
+  .perm-foot code { font-family: var(--font-mono); font-size: 0.92em; }
   .perm-why { color: var(--muted); font-size: 11.5px; margin-top: 3px; word-break: normal; overflow-wrap: break-word; }
   .perm-na { color: var(--muted); }
   .perm-copy {
@@ -287,9 +302,8 @@
     .perm-card tbody td.perm-stat { flex: none; font-size: 12px; color: var(--ink-2); white-space: nowrap; }
     .perm-card tbody td.perm-stat::before { content: attr(data-label) " "; color: var(--muted); }
     .perm-card tbody td.perm-rule { flex: 1 1 100%; min-width: 0; margin-top: 2px; }
-    /* A rule long enough to wrap pushes Copy to its own line: flush left, not indented. */
-    .perm-card tbody td.perm-rule:has(.perm-copy) { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; }
-    .perm-card tbody td.perm-rule .perm-copy { margin-left: 0; }
+    /* No allow/deny answer exists for an ask: a bare "—" under a label says nothing. */
+    .perm-card tbody td.perm-stat.perm-stat-na { display: none; }
     /* Recent prompts: kind + subject on the first line, then host · wait · age
        always on a line of their own, host first. */
     .perm-recent .perm-subj { flex: 1 1 0; }
@@ -1640,6 +1654,7 @@ const PERM_DAYS = 7;
 const PERM_REFRESH_MS = 60000;
 const PERM_KIND = { dialog: "Dialog", "classifier-denied": "Classifier block", "ask-in-chat": "Asked in chat" };
 let permView = null;
+let permLoadError = null;
 let permFetchSeq = 0;
 // The card is fetched only once a render has run TurmaOrg.update: before that
 // org.js knows no sites, so getKeys() is [] and an unscoped fetch would show
@@ -1647,6 +1662,10 @@ let permFetchSeq = 0;
 // the card was last fetched for — a render whose keys differ refetches it.
 let permScoped = false;
 let permFetchedKeys = null;
+// The key set `permView` itself was fetched for. A failed read keeps the last
+// view only when it is THAT scope's view — another org's view is never shown
+// under the new selection, not even while the new one loads or after it fails.
+let permViewKeys = null;
 // The last string painted, compared instead of $perms.innerHTML: a browser
 // re-serializes innerHTML (`open` reads back `open=""`), so that never matched.
 let permPainted = null;
@@ -1673,7 +1692,18 @@ function permSubject(g) {
 // mid-token; an ask's question is prose and wraps only between words.
 function permSubjectHtml(g, tag) {
   const prose = !g.head && g.kind === "ask-in-chat";
-  return `<${tag} class="perm-subj${prose ? "" : " cmd"}">${esc(permSubject(g))}</${tag}>`;
+  const text = prose ? permProseHtml(permSubject(g)) : esc(permSubject(g));
+  return `<${tag} class="perm-subj${prose ? "" : " cmd"}">${text}</${tag}>`;
+}
+// An ask's question is the session's own markdown: `code` spans render as code
+// and **bold** markers drop, so no literal backticks or asterisks show. ONE
+// pass, so a code span's own text (`**kwargs`) is never re-read as bold; `__`
+// is left alone (`__init__.py` is a name, not emphasis). Escaped FIRST (esc
+// leaves ` and * alone), so a span only wraps text that is already safe; an
+// unpaired marker (a question cut at its cap) stays as typed.
+function permProseHtml(text) {
+  return esc(text).replace(/`([^`\n]+)`|\*\*([^*\n]+)\*\*/g,
+    (m, code, bold) => (code !== undefined ? `<code>${code}</code>` : bold));
 }
 function permNum(n) { return typeof n === "number" && Number.isFinite(n) ? n : 0; }
 // Allowed / denied, or "—" when no answer is knowable: an ask in chat is
@@ -1684,39 +1714,71 @@ function permAnswers(g) {
   const known = (n) => typeof n === "number" && Number.isFinite(n);
   const open = known(g.open) && g.open > 0 ? g.open : 0;
   if (open && open >= permNum(g.count)) {
-    return `<span class="perm-na" title="Still waiting for an answer">open</span>`;
+    return `<span class="perm-na" title="Still waiting for an answer">still open</span>`;
   }
   if (g.kind === "ask-in-chat" || !known(g.allowed) || !known(g.denied)) {
     return `<span class="perm-na" title="No allow/deny answer is recorded for this kind of prompt">—</span>`;
   }
   return `${g.allowed} / ${g.denied}` + (open ? ` <span class="perm-na">· ${open} open</span>` : "");
 }
-// The rule cell. A pasteable rule gets a Copy button; the ask-in-chat entry is
-// a pointer, not a setting, so it is shown as text; no rule says so — and a
+// An ask that is no longer open has no allow/deny answer to show at all (its
+// cell reads "—"); on a phone that cell is hidden rather than labelled.
+function permAnswerless(g) {
+  const open = typeof g.open === "number" && g.open > 0 && g.open >= permNum(g.count);
+  return !open && g.kind === "ask-in-chat";
+}
+// The rule cell. A pasteable rule gets a Copy button beside it; the ask-in-chat
+// entry is a pointer, not a setting — its row says so in a few words and ONE
+// note under the table says where the fix lives (`PERM_BEHAVIOUR_NOTE`), rather
+// than the hub's terse pointer repeated on every ask; no rule says so — and a
 // classifier block says why it was blocked, the one thing to go on.
 const PERM_BEHAVIOUR_RE = /^model behaviour:\s*/;
+function permIsBehaviour(g) {
+  return typeof g.suggestedRule === "string" && PERM_BEHAVIOUR_RE.test(g.suggestedRule);
+}
+const PERM_BEHAVIOUR_NOTE = `<div class="note perm-foot"><b>Asked in chat</b> has no setting to copy: ` +
+  `the session ended its turn to ask in prose, and only its instructions change that. The fix is ` +
+  `step 0 of “Delivering work” in the global <code>~/.claude/CLAUDE.md</code> on each host: the ` +
+  `session runs unattended and never waits for a human to approve, continue, push or open a PR.</div>`;
+// A rule shown in its box: a narrow column wraps it after `(` or a `:` that
+// starts a value (`WebFetch(` / `domain:docs.example.com)`), never mid-name
+// where a natural break exists. Display only — Copy copies the raw rule.
+function permRuleCodeHtml(rule) {
+  return esc(rule).replace(/([(:])(?=[A-Za-z0-9])/g, "$1<wbr>");
+}
 function permRuleHtml(g) {
   const rule = typeof g.suggestedRule === "string" && g.suggestedRule ? g.suggestedRule : "";
-  if (rule && PERM_BEHAVIOUR_RE.test(rule)) {
-    return `<span class="none">Model behaviour, not a setting — ${esc(rule.replace(PERM_BEHAVIOUR_RE, ""))}</span>`;
+  if (rule && permIsBehaviour(g)) {
+    return `<span class="none">Instructions, not a setting — see the note below</span>`;
   }
   if (rule) {
-    return `<code>${esc(rule)}</code><button type="button" class="perm-copy" data-perm-rule="${esc(rule)}" title="Copy this rule">Copy</button>`;
+    return `<span class="perm-rule-line"><code>${permRuleCodeHtml(rule)}</code><button type="button" class="perm-copy" data-perm-rule="${esc(rule)}" title="Copy this rule">Copy</button></span>`;
   }
   const why = g.kind === "classifier-denied" && typeof g.denyReason === "string" && g.denyReason
     ? `<div class="perm-why">Blocked: ${esc(g.denyReason)}</div>` : "";
+  // A Bash head off the hub's safe list: no rule to copy, and the hub's reason.
+  // A classifier block's why is its deny reason ALONE: the allowlist reason is
+  // about Bash allow rules and says nothing of why the classifier said no.
+  if (typeof g.noRuleReason === "string" && g.noRuleReason) {
+    return `<span class="none">no safe rule — review it</span>` +
+      (why || `<div class="perm-why">${esc(g.noRuleReason)}</div>`);
+  }
   return `<span class="none">no rule retires this</span>${why}`;
 }
 
 // The whole card, as markup — pure over the hub's `{days, top, recent}`. Every
 // field is agent-supplied text, so every one is escaped (a rule or a command can
 // carry anything).
-function permissionsCardHtml(view, now, recentOpen = false) {
+function permissionsCardHtml(view, now, recentOpen = false, loadError = null) {
   const days = view && permNum(view.days) > 0 ? permNum(view.days) : PERM_DAYS;
   const head = `<h2>Permission prompts (${days} days)</h2>` +
     `<div class="note">Every permission dialog, auto-mode classifier block and ask-for-permission-in-chat ` +
     `that held a session, grouped with the allow rule that would retire it. Follows the header's org ` +
     `filter only — the chart's series toggles above do not apply here.</div>`;
+  // A first fetch that failed says so; "Loading…" there would wait forever.
+  if (!view && typeof loadError === "string" && loadError) {
+    return head + `<div class="perm-empty">Could not load permission prompts (${esc(loadError)}).</div>`;
+  }
   if (!view) return head + `<div class="perm-empty">Loading…</div>`;
   const top = Array.isArray(view.top) ? view.top.filter((g) => g && typeof g === "object") : [];
   const recent = Array.isArray(view.recent) ? view.recent.filter((r) => r && typeof r === "object") : [];
@@ -1729,7 +1791,7 @@ function permissionsCardHtml(view, now, recentOpen = false) {
     return `<tr>
       <td>${permKindHtml(g)}${permSubjectHtml(g, "div")}${tool}</td>
       <td class="perm-stat" data-label="Count">${permNum(g.count)}</td>
-      <td class="perm-stat" data-label="Allowed / denied">${permAnswers(g)}</td>
+      <td class="perm-stat${permAnswerless(g) ? " perm-stat-na" : ""}" data-label="Allowed / denied">${permAnswers(g)}</td>
       <td class="perm-stat" data-label="Median wait">${esc(permWait(g.medianWaitMs))}</td>
       <td class="perm-rule">${permRuleHtml(g)}</td>
     </tr>`;
@@ -1758,11 +1820,12 @@ function permissionsCardHtml(view, now, recentOpen = false) {
   const list = items
     ? `<details class="table-view perm-recent-view"${recentOpen ? " open" : ""}><summary>Recent prompts (${recent.length})</summary><ul class="perm-recent">${items}</ul></details>`
     : "";
-  return head + table + list;
+  const note = top.some(permIsBehaviour) ? PERM_BEHAVIOUR_NOTE : "";
+  return head + table + note + list;
 }
 
 function paintPermissions() {
-  const html = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now(), permRecentOpen)}</div>`;
+  const html = `<div class="models-card perm-card">${permissionsCardHtml(permView, Date.now(), permRecentOpen, permLoadError)}</div>`;
   if (html === permPainted) return;
   permPainted = html;
   // A recurring innerHTML repaint: preserveScroll keeps the table's sideways
@@ -1782,17 +1845,37 @@ function syncPermissionsScope() {
 async function refreshPermissions() {
   const seq = ++permFetchSeq;
   const keys = permKeys();
-  permFetchedKeys = keys.join(",");
+  const scope = keys.join(",");
+  permFetchedKeys = scope;
   const q = new URLSearchParams({ days: String(PERM_DAYS) });
-  if (keys.length) q.set("org", keys.join(","));
+  if (keys.length) q.set("org", scope);
+  // A scope change drops the previous org's view at once: the card says
+  // loading rather than showing org A's prompts under org B's selection.
+  if (permView && permViewKeys !== scope) {
+    permView = null;
+    permViewKeys = null;
+    permLoadError = null;
+    paintPermissions();
+  }
+  // A failed read keeps this scope's last view; with none, the card says it failed.
+  const failed = (why) => {
+    if (seq !== permFetchSeq) return;
+    if (permView && permViewKeys === scope) return;
+    permView = null;
+    permViewKeys = null;
+    permLoadError = why;
+    paintPermissions();
+  };
   try {
     const r = await fetch("/api/permissions?" + q.toString());
-    if (!r.ok) return;
+    if (!r.ok) return failed(`HTTP ${r.status}`);
     const body = await r.json();
     if (seq !== permFetchSeq) return;        // an org change raced this answer
     permView = body;
+    permViewKeys = scope;
+    permLoadError = null;
     paintPermissions();
-  } catch { /* keep the last view */ }
+  } catch { failed("no readable answer from the hub"); }
 }
 
 // `toggle` does not bubble, so the disclosure's open state is caught on capture.

@@ -22662,8 +22662,11 @@ test("XERK-1563: permissionEvents fold into the ledger and never ride the record
   const view = await request("GET", "/api/permissions", { headers: userHeaders });
   assert.equal(view.status, 200);
   const g = view.body.top.find((x) => x.head === "npm test");
+  // `npm test` is off the safe-head list (its arguments can run code): no rule,
+  // and the reason rides the group.
   assert.deepEqual([g.count, g.allowed, g.denied, g.medianWaitMs, g.suggestedRule],
-    [2, 1, 1, 5000, "Bash(npm test:*)"]);
+    [2, 1, 1, 5000, null]);
+  assert.match(g.noRuleReason, /not on the known read-only list/);
   assert.equal(view.body.recent.length, 2);
   assert.equal(view.body.recent[0].host, host);
   delete agents[host];
