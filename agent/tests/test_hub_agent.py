@@ -20581,9 +20581,6 @@ class TestListGithubRepos(unittest.TestCase):
             self.assertEqual(ha.list_github_repos(), [])
 
 
-_REAL_POPEN = subprocess.Popen
-
-
 @contextlib.contextmanager
 def _patch_clone_popen(**kw):
     """Fake ONLY clone()'s `git clone` Popen; yield the mock that receives it.
@@ -20592,13 +20589,18 @@ def _patch_clone_popen(**kw):
     patch also catches every Popen another thread makes while it is in place —
     a worker an earlier test left running, say. Its args then overwrite what the
     fake captured, so the test asserts against a stranger's call (XERK-1493).
-    Every other caller gets the real Popen and never touches the mock."""
+    Every other caller gets whatever Popen was installed before — ManagerMixin's
+    guarded one, so a stray `claude` still can't spawn — and never the mock.
+    Any git argv naming `clone` goes to the fake, so a reshaped clone command
+    (`git -c ... clone`) fails the test instead of starting a real network clone."""
     fake = mock.MagicMock(**kw)
+    prior = ha.subprocess.Popen
 
     def route(args, *a, **k):
-        if list(args[:2]) == ["git", "clone"]:
+        argv = list(args) if isinstance(args, (list, tuple)) else [args]
+        if argv[:1] == ["git"] and "clone" in argv:
             return fake(args, *a, **k)
-        return _REAL_POPEN(args, *a, **k)
+        return prior(args, *a, **k)
 
     with mock.patch.object(ha.subprocess, "Popen", side_effect=route):
         yield fake
