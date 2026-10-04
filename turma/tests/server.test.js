@@ -18022,8 +18022,8 @@ const settleMigration = (mid) => {
   if (m) { m.phase = "done"; m.at = Date.now(); }
 };
 
-const beatAs = (device, headers) =>
-  request("POST", "/api/heartbeat", { body: { device }, headers: { ...headers, "content-type": "application/json" } });
+const beatAs = (device, headers, extra = {}) =>
+  request("POST", "/api/heartbeat", { body: { ...extra, device }, headers: { ...headers, "content-type": "application/json" } });
 
 test("XERK-268: a host's token names its host and proves that name", () => {
   // Stable (the hub re-derives it per request rather than storing a map),
@@ -18510,6 +18510,28 @@ test("XERK-268: ttyd is proxied with the token that host actually runs", async (
   const legacy = fleet.body.agents.find((a) => a.key === "ttLegacy");
   assert.equal(bound && bound.tokenBound, true);
   assert.equal(legacy && legacy.tokenBound, false);
+});
+
+test("XERK-1588: a termSessionAuth host's ttyd gets the per-session derived credential", async () => {
+  // ttyd takes `-c` only on argv (world-readable via /proc), so a host reporting
+  // termSessionAuth runs each ttyd on HMAC(token, "ttyd:<id>") — never the token.
+  const crypto = require("crypto");
+  const derive = (tok, sid) => crypto.createHmac("sha256", tok).update(`ttyd:${sid}`).digest("hex");
+  const cred = (h, sid) => Buffer.from(ttydAuth(h, sid).slice(6), "base64").toString();
+  await beatAs("tsBound", asHost("tsBound"), { termSessionAuth: true });
+  await beatAs("tsLegacy", { authorization: "Bearer agenttok" }, { termSessionAuth: true });
+  await beatAs("tsOld", asHost("tsOld"));
+  const bt = hostAgentToken("tsBound");
+  assert.equal(cred("tsBound", "s1"), `term:${derive(bt, "s1")}`);
+  assert.notEqual(cred("tsBound", "s1"), cred("tsBound", "s2"), "per session");
+  assert.ok(!cred("tsBound", "s1").includes(bt), "never the raw token");
+  // A half-rolled host still derives from the token its ttyd actually runs on.
+  assert.equal(cred("tsLegacy", "s1"), `term:${derive("agenttok", "s1")}`);
+  // An older agent (or a Windows host) reports nothing: the raw token, as before.
+  assert.equal(cred("tsOld", "s1"), `term:${hostAgentToken("tsOld")}`);
+  // Only a literal true counts; anything else is dropped at ingest.
+  await beatAs("tsOld", asHost("tsOld"), { termSessionAuth: "yes" });
+  assert.equal(cred("tsOld", "s1"), `term:${hostAgentToken("tsOld")}`);
 });
 
 test("XERK-578: roll-token mints this host's derived token and queues one setToken", async () => {

@@ -15,6 +15,7 @@
 // silently breaks the terminal, so they are pinned against the capture in tests.
 
 import { timingSafeEqual } from 'node:crypto';
+import { lstatSync, readFileSync } from 'node:fs';
 
 // ---- command bytes (ttyd 1.7.x protocol.h; direction-specific) ---------------
 // client -> server (first byte of each frame)
@@ -164,6 +165,22 @@ export function installFatalErrorHandlers(emitters, onFatal) {
 // is what actually rolled), so a stale acceptor on one local port for the life of
 // one session is a far better trade than an unreachable session or a manager
 // locked out of its own pty.
+// The baked token for a pty-host launched with only `--auth-token-file`
+// (XERK-1588: the manager keeps the host credential off the command line). The
+// same hardening as the per-check read — a non-regular file (a planted FIFO would
+// block forever) or one over `maxBytes` is refused — and every failure is '',
+// which the pty-host's startup guard turns into "refuse to run unauthenticated".
+export function readTokenFileAtStart(path, maxBytes = 4096) {
+  if (!path) return '';
+  try {
+    const st = lstatSync(path);
+    if (!st.isFile() || st.size > maxBytes) return '';
+    return readFileSync(path, 'utf8').trim();
+  } catch {
+    return '';
+  }
+}
+
 export function authTokensInForce(fileText, baked) {
   const out = [];
   if (typeof fileText === 'string') {

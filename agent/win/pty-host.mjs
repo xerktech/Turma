@@ -51,12 +51,17 @@ const BASE = arg('base-path', `/term/${SESSION}`);
 const TERM_PORT = parseInt(arg('term-port', '0'), 10);   // 0 = ephemeral; manager allocates off TTYD_PORT_BASE
 const CTRL_PORT = parseInt(arg('ctrl-port', '0'), 10);   // 0 = ephemeral; published in state
 const STATE = arg('state', join(HERE, `pty-host-${SESSION}.state.json`));
-const BAKED_TOKEN = arg('auth-token', '');               // the `term:<TOKEN>` basic-auth password
 // The manager-owned file holding the token CURRENTLY in force. Re-read per auth
 // check so a hub token roll needs no relaunch (see authTokensInForce's comment) —
 // which on Windows would mean killing the operator's live claude, the pty-host
 // being both the terminal and the pty. Empty/absent = the baked token, unchanged.
 const TOKEN_FILE = arg('auth-token-file', '');
+// The `term:<TOKEN>` basic-auth password this pty-host was launched with. The
+// manager no longer passes `--auth-token` (XERK-1588: a process command line is
+// readable by other local users, and this is the host's hub credential), so the
+// baked token is the file's content AT START — the manager writes it just before
+// spawning. `--auth-token` is still honoured for an older manager.
+const BAKED_TOKEN = arg('auth-token', '') || T.readTokenFileAtStart(TOKEN_FILE);
 const COLS = parseInt(arg('cols', '80'), 10);
 const ROWS = parseInt(arg('rows', '24'), 10);
 const RING_MAX = parseInt(arg('scrollback', String(256 * 1024)), 10);
@@ -86,7 +91,7 @@ const START = new Date().toISOString();
 // (`_launch_ttyd` passes `-c term:{TURMA_TOKEN or 'changeme'}`), so an empty token
 // is a misconfiguration, not a mode — refuse to start rather than run open.
 if (BAKED_TOKEN === '' || BAKED_TOKEN == null) {
-  process.stderr.write('pty-host: --auth-token is required (refusing to run the terminal + control channel unauthenticated)\n');
+  process.stderr.write('pty-host: --auth-token or a readable --auth-token-file is required (refusing to run the terminal + control channel unauthenticated)\n');
   process.exit(2);
 }
 

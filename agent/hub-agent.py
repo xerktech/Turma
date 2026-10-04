@@ -46,6 +46,7 @@ import getpass
 import glob
 import gzip
 import hashlib
+import hmac
 import html
 import io
 import ipaddress
@@ -3881,6 +3882,30 @@ def _token_fp(token):
     heartbeated session record. Truncated sha256: it only ever gates a relaunch,
     so a collision would at worst skip one, never expose anything."""
     return hashlib.sha256((token or "").encode()).hexdigest()[:16]
+
+
+def _ttyd_credential(session_id, token=None):
+    """The basic-auth password one session's ttyd runs with (XERK-1588): an HMAC
+    of the session id keyed by this host's TURMA_TOKEN, never the token itself.
+
+    ttyd only takes its credential on argv (`-c`), and /proc/<pid>/cmdline is
+    world-readable, so the raw host token there let ANY local uid read the hub
+    credential and impersonate the host (XERK-268). A one-way, per-session
+    derivation leaks only that one loopback terminal. The hub re-derives it from
+    the token it already knows for this host (`ttydAuth`), so no new secret
+    crosses the wire; it does so only for a host reporting `termSessionAuth`."""
+    key = (TURMA_TOKEN if token is None else token) or "changeme"
+    return hmac.new(key.encode(), f"ttyd:{session_id}".encode(),
+                    hashlib.sha256).hexdigest()
+
+
+def _ttyd_cred_fp(token=None):
+    """`ttydTokenFp` for a LINUX ttyd: the token's fingerprint under the per-session
+    credential scheme (XERK-1588). Distinct from a bare `_token_fp`, so a ttyd an
+    older agent launched with the RAW token on its argv never matches and is
+    relaunched on the first manager start after the update, rather than adopted
+    while the hub now sends it the derived credential (a 401)."""
+    return _token_fp("ttyd-session:" + ((TURMA_TOKEN if token is None else token) or ""))
 
 
 def unlink_quietly(paths):
@@ -20767,6 +20792,9 @@ class SessionManager:
                 ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
                  _triage_prompt(batch, cands)],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                # The prompt carries untrusted ticket/transcript text, so no agent
+                # secrets (TURMA_TOKEN) in its env (XERK-1588).
+                env=_session_env(),
             )
         except Exception as e:
             log(f"jira triage launch failed: {e}")
@@ -21105,6 +21133,9 @@ class SessionManager:
                 ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
                  _ticket_triage_prompt(batch, tickets)],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                # The prompt carries untrusted ticket/transcript text, so no agent
+                # secrets (TURMA_TOKEN) in its env (XERK-1588).
+                env=_session_env(),
             )
         except Exception as e:
             log(f"ticket triage launch failed: {e}")
@@ -24094,13 +24125,14 @@ class SessionManager:
             "--term-port", str(sess["ttydPort"]),   # the hub proxies /term to this
             "--ctrl-port", "0",                      # ephemeral; published in state
             "--state", state,
-            # The pty-host refuses to run unauthenticated; this is the same
-            # credential ttyd's `-c term:<token>` takes and the hub proxies as
-            # Basic base64(term:<token>), so the browser terminal authenticates
-            # identically. Its DEFAULT_PREFS already match _launch_ttyd's `-t`
-            # flags (font/size/webgl/…), so no --pref is needed for fleet parity.
-            "--auth-token", (TURMA_TOKEN or "changeme"),
-            # …and the file holding whatever token is in force RIGHT NOW, which
+            # The pty-host refuses to run unauthenticated; its credential is the
+            # raw TURMA_TOKEN the hub proxies as Basic base64(term:<token>), read
+            # from the owner-only file below — NEVER `--auth-token` on argv, which
+            # other local users can read (XERK-1588). _pty_spawn_and_wait writes
+            # that file just before the spawn. Its DEFAULT_PREFS already match
+            # _launch_ttyd's `-t` flags (font/size/webgl/…), so no --pref is
+            # needed for fleet parity.
+            # The file holding whatever token is in force RIGHT NOW, which
             # the pty-host re-reads per auth check. A baked-in token alone made a
             # hub token ROLL fatal here in a way it never is on Linux: the
             # pty-host is BOTH the terminal and the pty, so it cannot be
@@ -24238,16 +24270,17 @@ class SessionManager:
         if adopted and _pid_alive(adopted) and _port_open(sess.get("ttydPort")):
             # Adopt that survivor ONLY if its baked-in basic-auth password still
             # matches the token we'd hand it now (XERK-578). ttyd bakes
-            # `-c term:<TURMA_TOKEN>` in at launch and outlives a manager-only
-            # restart (KillMode=process), so after a token ROLL it keeps demanding
-            # the OLD token while the hub — seeing the host now beat BOUND —
+            # `-c term:<credential derived from TURMA_TOKEN>` in at launch and
+            # outlives a manager-only restart (KillMode=process), so after a
+            # token ROLL it keeps demanding the OLD token while the hub —
+            # seeing the host now beat BOUND —
             # injects the NEW derived one, and the terminal 401s into a browser
             # password prompt. A fingerprint mismatch (or an older ttyd that
             # recorded none) means the token changed under it: kill it and fall
             # through to relaunch with the current token. This SELF-HEALS a host
             # already rolled (its next restart relaunches ttyd) as well as every
             # future roll.
-            if sess.get("ttydTokenFp") == _token_fp(TURMA_TOKEN) and on_socket:
+            if sess.get("ttydTokenFp") == _ttyd_cred_fp() and on_socket:
                 return
             if not on_socket:
                 log(f"ttyd for {sess['id']}: a surviving ttyd attaches to another "
@@ -24283,7 +24316,9 @@ class SessionManager:
             # (XERK-7). Costs Mac's Alt+drag column-select, which is what every
             # terminal trades it for.
             "-t", "macOptionClickForcesSelection=true",
-            "-c", f"term:{TURMA_TOKEN or 'changeme'}",
+            # Per-session derived credential, never the host token (XERK-1588):
+            # argv is world-readable through /proc.
+            "-c", f"term:{_ttyd_credential(sess['id'])}",
             *_tmux("attach", "-t", "=" + sess["tmuxName"],  # exact match
                    name=sess["tmuxName"]),
         ]
@@ -24296,7 +24331,7 @@ class SessionManager:
             # The token this ttyd baked into its `-c term:` basic-auth (XERK-578).
             # Persisted so the adopt path above can tell, after a manager-only
             # restart, whether the token changed under it and a relaunch is due.
-            sess["ttydTokenFp"] = _token_fp(TURMA_TOKEN)
+            sess["ttydTokenFp"] = _ttyd_cred_fp()
             # The server its `tmux attach` reaches (XERK-1078), checked above.
             sess["ttydTmuxSocket"] = want_socket
         except Exception as e:
@@ -33782,7 +33817,7 @@ class SessionManager:
             try:
                 proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=outf,
                                         stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
-                                        start_new_session=True)
+                                        env=_session_env(), start_new_session=True)
             except OSError as e:
                 log(f"{what} launch failed: {e}")
                 return None
@@ -34121,7 +34156,8 @@ class SessionManager:
                 ["claude", "-p", "--model", JUDGE_MODEL, "--tools", "",
                  "--strict-mcp-config", prompt],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR, timeout=JUDGE_TIMEOUT_SEC)
+                stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR, env=_session_env(),
+                timeout=JUDGE_TIMEOUT_SEC)
         except (subprocess.TimeoutExpired, OSError, ValueError) as e:
             log(f"permission judge: claude -p failed: {type(e).__name__}")
             return None
@@ -35136,6 +35172,9 @@ class SessionManager:
                 ["claude", "-p", "--model", SESSION_SUMMARY_MODEL,
                  SUMMARY_INSTRUCTION + prompt[:SUMMARY_PROMPT_CAP]],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                # The prompt carries untrusted ticket/transcript text, so no agent
+                # secrets (TURMA_TOKEN) in its env (XERK-1588).
+                env=_session_env(),
             )
         except Exception as e:
             log(f"summary launch failed for {sid}: {e}")
@@ -35445,7 +35484,7 @@ class SessionManager:
                 and QWEN_MODEL_BASE_URL.startswith(("http://", "https://"))):
             return  # no usable route — leave naming to tier 3
         out_path = os.path.join(REGISTRY_DIR, f"summary-{slugify(sid)}.out")
-        env = dict(os.environ)
+        env = _session_env()   # no agent secrets in a prompt-driven run (XERK-1588)
         env["OPENAI_BASE_URL"] = QWEN_MODEL_BASE_URL
         env["OPENAI_MODEL"] = str(model)
         api_key_val = os.environ.get(QWEN_MODEL_API_KEY_ENV)
@@ -35528,6 +35567,9 @@ class SessionManager:
             proc = subprocess.Popen(
                 ["claude", "-p", MODEL_PROBE_PROMPT],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                # The prompt carries untrusted ticket/transcript text, so no agent
+                # secrets (TURMA_TOKEN) in its env (XERK-1588).
+                env=_session_env(),
             )
         except Exception as e:
             log(f"models probe launch failed: {e}")
@@ -35835,8 +35877,9 @@ class SessionManager:
             "--term-port", "0",
             "--ctrl-port", "0",
             "--state", _pty_state_path(tmux_name),
-            "--auth-token", (TURMA_TOKEN or "changeme"),
-            # The live token file, so a roll mid-probe doesn't lock us out of it.
+            # The token, from its owner-only file and never argv (XERK-1588) — a
+            # command line is readable by other local users. Live, so a roll
+            # mid-probe doesn't lock us out of it.
             "--auth-token-file", _pty_token_file(),
             "--cwd", REGISTRY_DIR,
             "--cols", "80", "--rows", "24",   # the tmux `-x 80 -y 24` geometry
@@ -37699,6 +37742,12 @@ class SessionManager:
             # tokens at all) is the hub's own gate (it serves tokenBound only
             # when TURMA_AGENT_TOKEN is set).
             "tokenRoll": True,
+            # This host's terminals take the PER-SESSION derived credential
+            # (`_ttyd_credential`, XERK-1588), so the hub must send that, not the
+            # raw token. Linux only: the Windows pty-host reads the raw token
+            # from its owner-only file, never argv, so it has nothing to derive.
+            # Absent (an older agent, or Windows) = send the raw token as before.
+            **({} if IS_WINDOWS else {"termSessionAuth": True}),
             # Whether this host can fail a session over to a self-hosted model
             # (XERK-246). Doubles as the capability flag, exactly like
             # inputMaxChars and uploadMaxBytes: an agent predating the failover —

@@ -7489,6 +7489,9 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # An ephemeral terminal port (nobody proxies the probe's terminal).
         self.assertEqual(cmd[cmd.index("--term-port") + 1], "0")
         self.assertEqual(cmd[cmd.index("--cwd") + 1], ha.REGISTRY_DIR)
+        # XERK-1588: the host token rides the owner-only file, never argv.
+        self.assertNotIn("--auth-token", cmd)
+        self.assertIn("--auth-token-file", cmd)
         # The claude argv rides after the launcher, past the `--` separator.
         dd = cmd.index("--")
         argv = cmd[dd + 1:]
@@ -10030,6 +10033,16 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "IS_WINDOWS", True):
             self.assertEqual(sm.build_payload(1)["hostOs"], "windows")
 
+    def test_payload_reports_term_session_auth_on_linux_only(self):
+        """XERK-1588: a Linux ttyd runs on the per-session derived credential, so
+        the hub must be told to send that; a Windows pty-host still takes the
+        raw token (from its file), so it must NOT claim the capability."""
+        sm = self._manager()
+        with mock.patch.object(ha, "IS_WINDOWS", False):
+            self.assertIs(sm.build_payload(1)["termSessionAuth"], True)
+        with mock.patch.object(ha, "IS_WINDOWS", True):
+            self.assertNotIn("termSessionAuth", sm.build_payload(1))
+
     def test_a_refused_resume_stages_its_reason_against_the_cmd_id(self):
         sm = self._manager()
         with mock.patch.object(ha, "MAX_SESSIONS", 0):
@@ -10662,7 +10675,7 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._running_sess()
         sess["ttydPid"] = 5150
-        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        sess["ttydTokenFp"] = ha._ttyd_cred_fp()
         sess["ttydTmuxSocket"] = ha.TMUX_SOCKET
         with mock.patch.object(ha, "_pid_alive", return_value=True), \
              mock.patch.object(ha, "_port_open", return_value=True), \
@@ -10677,7 +10690,7 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._running_sess()
         sess["ttydPid"] = 5150
-        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        sess["ttydTokenFp"] = ha._ttyd_cred_fp()
         with mock.patch.object(ha, "_legacy_tmux", {sess["tmuxName"]}), \
              mock.patch.object(ha, "_pid_alive", return_value=True), \
              mock.patch.object(ha, "_port_open", return_value=True), \
@@ -10692,7 +10705,7 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._running_sess()
         sess["ttydPid"] = 5150
-        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        sess["ttydTokenFp"] = ha._ttyd_cred_fp()
         ports = iter([True, False])  # open at the adopt check, freed after kill
         with mock.patch.object(ha, "_pid_alive", return_value=True), \
              mock.patch.object(ha, "_port_open",
@@ -33739,6 +33752,7 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         class FakeProc:
             def __init__(self, cmd, stdout=None, **kw):
                 test.popen_calls.append(cmd)
+                test.popen_envs = getattr(test, "popen_envs", []) + [kw.get("env")]
                 if reply is not None and stdout is not None:
                     stdout.write(reply)
                     stdout.flush()
@@ -33762,6 +33776,21 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
             "source": None, "reason": "heartbeat lives there", "manual": False,
             "at": sm.jira["tickets"][0]["repoGuess"]["at"],
         })
+
+    def test_triage_claude_runs_without_the_agent_secrets(self):
+        # XERK-1588: the triage prompt carries untrusted ticket text, so the
+        # headless claude must not inherit TURMA_TOKEN (a prompt-injected "print
+        # your env" would otherwise hand out the host's hub credential).
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), \
+                mock.patch.dict(os.environ, {"TURMA_TOKEN": "s3cret",
+                                             "TURMA_AGENT_TOKEN": "m4ster"}), \
+                self._fake_popen('{}'):
+            sm._start_jira_triage()
+        env = self.popen_envs[-1]
+        self.assertIsNotNone(env, "an inherited (None) env carries every secret")
+        self.assertNotIn("TURMA_TOKEN", env)
+        self.assertNotIn("TURMA_AGENT_TOKEN", env)
 
     def test_untriaged_ticket_carries_no_guess_at_all(self):
         # Absence must not read as "no repo fits" — the board draws nothing for
@@ -37982,7 +38011,10 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         self.assertIn("--session", cmd)
         self.assertIn("w1", cmd)
         self.assertEqual(cmd[cmd.index("--term-port") + 1], "7742")
-        self.assertEqual(cmd[cmd.index("--auth-token") + 1], "tok")
+        # XERK-1588: the host token is never on the pty-host's command line,
+        # which other local users can read; only the owner-only file carries it.
+        self.assertNotIn("--auth-token", cmd)
+        self.assertNotIn("tok", cmd)
         # ...and the LIVE token file the pty-host re-reads per auth check, so a
         # hub token roll needs no relaunch (which here would kill the operator's
         # claude, the pty-host being both the terminal and the pty).
@@ -38149,7 +38181,7 @@ class TestTtydTokenRelaunch(unittest.TestCase):
     def test_adopts_when_the_token_fingerprint_still_matches(self):
         sm = self._mgr()
         sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242,
-                "tmuxName": "agent-s1", "ttydTokenFp": ha._token_fp("derivedtok"),
+                "tmuxName": "agent-s1", "ttydTokenFp": ha._ttyd_cred_fp("derivedtok"),
                 "ttydTmuxSocket": ha.TMUX_SOCKET}
         with mock.patch.object(ha, "TURMA_TOKEN", "derivedtok"), \
              mock.patch.object(ha, "_pid_alive", return_value=True), \
@@ -38179,9 +38211,52 @@ class TestTtydTokenRelaunch(unittest.TestCase):
             sm._launch_ttyd(sess)
         kill.assert_called_once_with("s1")
         popen.assert_called_once()
-        # The relaunched ttyd carries the NEW token, and the record re-fingerprints.
-        self.assertIn("term:deriveNEW", popen.call_args[0][0])
-        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("deriveNEW"))
+        # The relaunched ttyd carries a credential derived from the NEW token,
+        # and the record re-fingerprints.
+        self.assertIn("term:" + ha._ttyd_credential("s1", "deriveNEW"),
+                      popen.call_args[0][0])
+        self.assertEqual(sess["ttydTokenFp"], ha._ttyd_cred_fp("deriveNEW"))
+
+    def test_relaunches_a_survivor_that_has_the_raw_token_on_its_argv(self):
+        # XERK-1588: a ttyd an older agent launched with `-c term:<TURMA_TOKEN>`
+        # recorded the bare _token_fp of the SAME token. It must not be adopted:
+        # the raw token stays readable in its /proc cmdline, and the hub now
+        # sends this host the derived credential, which that ttyd would 401.
+        sm = self._mgr()
+        sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242,
+                "tmuxName": "agent-s1", "ttydTokenFp": ha._token_fp("tok"),
+                "ttydTmuxSocket": ha.TMUX_SOCKET}
+        ports = iter([True, False])
+        with mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
+             mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open",
+                               side_effect=lambda *a, **k: next(ports, False)), \
+             mock.patch.object(ha, "time"), \
+             mock.patch.object(sm, "_kill_ttyd") as kill, \
+             mock.patch.object(ha.subprocess, "Popen",
+                               return_value=mock.Mock(pid=9999)) as popen:
+            sm._launch_ttyd(sess)
+        kill.assert_called_once_with("s1")
+        argv = popen.call_args[0][0]
+        self.assertNotIn("term:tok", argv)
+        self.assertIn("term:" + ha._ttyd_credential("s1", "tok"), argv)
+
+    def test_ttyd_credential_is_per_session_one_way_and_never_the_token(self):
+        # XERK-1588: what lands on ttyd's world-readable argv.
+        tok = "host.secret-token"
+        c1 = ha._ttyd_credential("s1", tok)
+        self.assertNotIn(tok, c1)
+        self.assertNotIn("secret", c1)
+        self.assertEqual(c1, ha._ttyd_credential("s1", tok))          # stable
+        self.assertNotEqual(c1, ha._ttyd_credential("s2", tok))       # per session
+        self.assertNotEqual(c1, ha._ttyd_credential("s1", tok + "x")) # per token
+        # The exact derivation the hub's ttydAuth re-computes — pinned so the two
+        # sides cannot drift apart silently.
+        import hmac as _hmac, hashlib as _hashlib
+        self.assertEqual(c1, _hmac.new(tok.encode(), b"ttyd:s1",
+                                       _hashlib.sha256).hexdigest())
+        self.assertEqual(ha._ttyd_credential("s1", ""),
+                         ha._ttyd_credential("s1", "changeme"))
 
     def test_relaunches_when_a_survivor_recorded_no_fingerprint(self):
         # A ttyd launched by pre-XERK-578 code (an ALREADY-rolled host) recorded
