@@ -90,7 +90,7 @@ fun briefDur(ms: Long): String {
     val s = Math.round(ms.coerceAtLeast(0) / 1000.0)
     return when {
         s < 90 -> "${s}s"
-        s < 5400 -> "${Math.round(s / 60.0)}m"
+        s < 3570 -> "${Math.round(s / 60.0)}m"
         s < 172800 -> "${Math.round(s / 3600.0)}h"
         else -> "${Math.round(s / 86400.0)}d"
     }

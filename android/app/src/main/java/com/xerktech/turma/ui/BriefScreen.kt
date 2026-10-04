@@ -115,7 +115,7 @@ private fun OrgBriefCard(
                     Text(orgName(site), style = MaterialTheme.typography.titleMedium, fontWeight = FontWeight.SemiBold)
                     if (brief != null) {
                         Text(
-                            "${briefDur(now - brief.at)} ago · covers the ${briefDur(brief.at - brief.since)} before" +
+                            "${briefDur(now - brief.at)} ago · covers the last ${briefDur(brief.at - brief.since)}" +
                                 if (brief.trigger == "manual") " · on demand" else "",
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,

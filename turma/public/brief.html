@@ -22,6 +22,8 @@
   .brief-org-name { font-family: var(--font-display); font-size: 18px; font-weight: 600; }
   .brief-when { color: var(--muted); font-size: 12px; }
   .brief-head .spacer { flex: 1; }
+  /* The trailing control keeps right-aligned when it wraps onto its own line (phone). */
+  .brief-head > :last-child { margin-left: auto; }
   .brief-now {
     font: inherit; font-size: 12px; border: 1px solid var(--border); border-radius: var(--radius-sm);
     background: var(--field); color: var(--ink); padding: 4px 10px; cursor: pointer;
@@ -99,11 +101,13 @@ const STALE_LABEL = { "not-reproducible": "not reproducible", "already-fixed": "
 // it (a PR carries no merge time). Android `BRIEF_FINISHED_VERB`.
 const FINISHED_VERB = { ticket: "done", pr: "merged", session: "ended" };
 
-// A duration as the brief words it (Android `briefDur`, same thresholds).
+// A duration as the brief words it (Android `briefDur`, same thresholds). Minutes
+// stop below the hour (3570s rounds to 60m), so an hour-old row reads "1h", not
+// "60m" beside its "2h" neighbours.
 function dur(ms) {
   const s = Math.max(0, Math.round(ms / 1000));
   if (s < 90) return `${s}s`;
-  if (s < 5400) return `${Math.round(s / 60)}m`;
+  if (s < 3570) return `${Math.round(s / 60)}m`;
   if (s < 172800) return `${Math.round(s / 3600)}h`;
   return `${Math.round(s / 86400)}d`;
 }
@@ -223,7 +227,7 @@ function orgHtml(site, list, now, live) {
     const c = e.counts || {};
     return `<li>${esc(clock(e.at))} — ${c.needsYou || 0} needed you · ${c.stalled || 0} stalled · ${c.finished || 0} finished${e.trigger === "manual" ? " · on demand" : ""}</li>`;
   }).join("");
-  const when = `${esc(clock(b.at))} · covers the ${esc(ago(b.since, b.at))} before`
+  const when = `${esc(clock(b.at))} · covers the last ${esc(ago(b.since, b.at))}`
     + (b.trigger === "manual" ? " · on demand" : "");
   return `<section class="brief-org">` + headHtml(site, name, when, live)
     + countsHtml(b) + secs + spendHtml(b, now)
