@@ -23804,6 +23804,7 @@ const sleeperCmds = (host, type) => (agents[host].commands || []).filter((c) => 
 const resetSleepers = () => {
   hub.sleeperPauseTried.clear();
   hub.sleeperWakeTried.clear();
+  hub.sleeperUnpauseTried.clear();
   hub.sleeperResumeHold.clear();
 };
 
@@ -23874,7 +23875,7 @@ test("XERK-1575: only a quiet sleeper, ten minutes out, on a capable full host t
   delete agents.slpIdle;
 });
 
-test("XERK-1575: a due paused sleeper takes the freed slot ahead of the queue, auto-stop stood down", async () => {
+test("XERK-1575: a due paused sleeper takes the freed slot ahead of the queue, never auto-stop-exempt", async () => {
   resetAutoStart(); resetSleepers();
   const host = "slpWake";
   const site = "slpwake.atlassian.net";
@@ -23894,18 +23895,43 @@ test("XERK-1575: a due paused sleeper takes the freed slot ahead of the queue, a
   const now = Date.now();
   await asBeat(host, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 }, tickets,
     pauseSleepers: { available: true },
-    closedSessions: [paused("later", now + 3600_000, "ENG-6"), paused("due", now - 1000, "ENG-7")] });
+    closedSessions: [paused("later", now + 3600_000, "ENG-6"), paused("due", now - 1000, "ENG-8"),
+      paused("doneDue", now - 5000, "ENG-7")] });
   assert.deepEqual(sleeperCmds(host, "resume").map((c) => [c.sessionId, c.wake]), [["due", true]]);
   assert.equal(sleeperCmds(host, "spawnTicket").length, 0, "the woken sleeper holds the slot");
   assert.equal(queuedTicket(site, "ENG-5").reason, "capacity");
-  // Its ticket went Done while it slept: the resume is exempt from the re-kill.
-  assert.ok(autoStopResumeExempt.has(host + "\x00due"));
-  // The in-flight resume is not re-sent by the next pass.
+  // An automatic wake is not the operator overriding auto-stop (XERK-561).
+  assert.ok(!autoStopResumeExempt.has(host + "\x00due"));
+  // Its ticket went Done while it slept: never woken (auto-stop would have
+  // killed it awake), unpaused instead so it is an ordinary ended session.
+  assert.ok(!autoStopResumeExempt.has(host + "\x00doneDue"));
+  assert.deepEqual(sleeperCmds(host, "unpauseSleeper").map((c) => c.sessionId), ["doneDue"]);
+  // The in-flight resume and unpause are not re-sent by the next pass.
   hub.wakePausedSleepers(Date.now());
   drainTicketQueue();
   assert.equal(sleeperCmds(host, "resume").length, 1);
-  autoStopResumeExempt.delete(host + "\x00due");
+  assert.equal(sleeperCmds(host, "unpauseSleeper").length, 1);
   ticketQueue.length = 0; delete agents[host];
+});
+
+test("XERK-1575: a paused sleeper whose conversation already runs again is unpaused, never woken", () => {
+  resetSleepers();
+  const now = Date.now();
+  const rec = (id, extra) => ({ id, repo: "Turma", paused: { wakeAt: now - 1 }, ...extra });
+  const running = (id, extra) => ({ id, status: "running", repo: "Turma", ...extra });
+  const free = { maxSessions: 4, running: 2, queued: 0, free: 2 };
+  // The operator's Resume picker resumed transcript T1 as a NEW session (S2) in
+  // the same worktree, leaving the paused record P behind.
+  agents.slpHeld = { lastSeen: now, capacity: free, commands: [],
+    sessions: [running("S2", { transcriptId: "T1", worktreePath: "/w/x" })],
+    closedSessions: [rec("P", { transcriptId: "T1", worktreePath: "/w/other" }),
+      rec("Q", { transcriptId: "T9", worktreePath: "/w/x" }),
+      // Root sessions all share REPOS_ROOT: only the transcript ties them.
+      rec("R", { root: true, transcriptId: "T7", worktreePath: "/w/x" })] };
+  hub.wakePausedSleepers(now);
+  assert.deepEqual(sleeperCmds("slpHeld", "unpauseSleeper").map((c) => c.sessionId), ["P", "Q"]);
+  assert.deepEqual(sleeperCmds("slpHeld", "resume").map((c) => c.sessionId), ["R"]);
+  delete agents.slpHeld;
 });
 
 test("XERK-1575: the orchestration pass wakes a due sleeper with an empty queue, never on a full or offline host", () => {

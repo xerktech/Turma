@@ -224,7 +224,7 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   (`sleeperResumeHold`, set by the resume route): the carried wake makes it a sleeper again, and
   the next drain would otherwise pause it while the operator reads it.
 - **A refused or unacted command is not re-sent for `SLEEPER_RETRY_MS`** (`sleeperPauseTried`/
-  `sleeperWakeTried`, in-memory, bounded): an agent that disagreed acks and keeps the session.
+  `sleeperWakeTried`/`sleeperUnpauseTried`, in-memory, bounded): an agent that disagreed acks and keeps the session.
 - **The capability gates the pause** (`normalizePauseSleepers`, strict boolean, a
   `HEARTBEAT_KNOWN_KEYS` member): an older agent would ack the unknown command and free nothing.
   `TURMA_PAUSE_SLEEPERS=0` reports false. The RESUME is not gated — any agent knows `resume`.
@@ -234,8 +234,15 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 - **A due sleeper takes a freed slot AHEAD of the queue**: `wakePausedSleepers` runs before the
   drain dispatches, one resume per host per pass, oldest wake first, and `pendingSpawnCount` counts
   a `resume` with `wake:true`, so the drain never hands that slot to a ticket. Starving it would
-  turn a pause into a kill. It calls `markResumedTicketAutoStopExempt` like the resume route, or
-  `autoStopSweep` re-kills a sleeper whose ticket went Done while it slept.
+  turn a pause into a kill.
+- **A wake is never auto-stop-exempt.** `markResumedTicketAutoStopExempt` (XERK-561) is the
+  operator's resume route only; exempting an automatic wake made a paused sleeper immune to
+  auto-stop and kept a Done ticket's session holding a slot forever.
+- **Two paused records are UNPAUSED (`unpauseSleeper`), never woken**: one whose ticket the board
+  shows Done (`doneTicketKeys`, the set `autoStopSweep` reads — it kills an unpaused sleeper there),
+  and one whose conversation already runs on the host (`pausedSleeperHeldLive`: a live session with
+  its `transcriptId`, or in its worktree unless root — the Resume picker resumes by transcript and
+  leaves the record behind). Unpaused, it is an ordinary ended, resumable session.
 - **The brief reads it as asleep, never finished** (`compileBrief`): a closed record carrying a
   valid `paused` is no Finished row (its merged PRs still count) and is a Waiting row on an online
   host, `state:"sleeping"`, `eta` its wake, `why` its reason. A live copy of the id wins.

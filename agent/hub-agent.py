@@ -23704,6 +23704,17 @@ class SessionManager:
         if self._slots_used() >= MAX_SESSIONS:
             log(f"resume refused: at MAX_SESSIONS ({MAX_SESSIONS})")
             return
+        # The same refusal as _resume_at_cwd: two claudes on one conversation in
+        # one worktree collide. The Resume picker resumes by transcript (a NEW id)
+        # and leaves this record behind, so a later `resume` of it — the hub's
+        # sleeper wake (XERK-1575) included — must not start a second one. That
+        # conversation is back, so a pause on the record is over too.
+        holder = self._conversation_holder(rec)
+        if holder is not None:
+            self._unpause_closed(rec)
+            self._refuse_start(f"a session is already running in "
+                               f"{holder.get('worktreePath')}", cmd_id=cmd_id)
+            return
         sess = {
             "id": sid,
             "repo": rec.get("repo"),
@@ -23779,6 +23790,47 @@ class SessionManager:
             log(f"resumed closed session {sid} for {sess['repo']} on :{sess['ttydPort']}")
         except Exception as e:
             self._set_error(sess, e)
+
+    def _conversation_holder(self, rec):
+        """The running session already holding a closed record's conversation, or
+        None: one with its pinned transcript, or — for a non-root record — one in
+        its worktree (root sessions all share REPOS_ROOT on purpose, so only the
+        transcript ties them). The same "one live session per non-root cwd" rule
+        _resume_at_cwd enforces."""
+        tids = {t for t in (rec.get("claudeSessionId"), rec.get("transcriptId"))
+                if isinstance(t, str) and t}
+        wt = rec.get("worktreePath")
+        wt = (os.path.normpath(wt) if not rec.get("root")
+              and isinstance(wt, str) and wt else None)
+        for s in self.registry:
+            if s.get("id") == rec.get("id") or s.get("status") != "running":
+                continue
+            if tids and s.get("claudeSessionId") in tids:
+                return s
+            swt = s.get("worktreePath")
+            if wt and isinstance(swt, str) and os.path.normpath(swt) == wt:
+                return s
+        return None
+
+    def _unpause_closed(self, rec):
+        """Drop a closed record's sleeper pause (XERK-1575), leaving an ordinary
+        killed, resumable session: no longer exempt from the closed-history cap,
+        never woken by the hub. True when there was one."""
+        if not isinstance(rec, dict) or "paused" not in rec:
+            return False
+        rec.pop("paused", None)
+        log(f"unpaused closed session {rec.get('id')}: it is no longer waiting to wake")
+        return True
+
+    def unpause_sleeper(self, sid):
+        """The hub's `unpauseSleeper` (XERK-1575): a paused sleeper that must not
+        be woken — its ticket went Done, or its conversation already runs again —
+        stays an ordinary killed session that Resume brings back."""
+        rec = next((c for c in self.closed if c.get("id") == sid), None)
+        if rec is None:
+            log(f"unpause: no closed session {sid}")
+            return False
+        return self._unpause_closed(rec)
 
     def _carry_paused_wake(self, sess, paused, now_ms=None):
         """Bring a paused sleeper's wake back onto its resumed record
@@ -23884,7 +23936,22 @@ class SessionManager:
                   "summary": closed.get("summary"),
                   "summaryManual": closed.get("summaryManual")}
                  if closed else None)
-        self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
+        back = self._resume_at_cwd(transcript_id, cwd, cmd_id=cmd_id, extra=extra)
+        if back is None:
+            return
+        # This conversation runs again, so a closed record of it paused as a
+        # sleeper (XERK-1575) is not waiting to wake any more: unpaused, the hub
+        # never resumes it into a second claude beside this one. Root records
+        # share REPOS_ROOT, so only their transcript ties them.
+        wt = os.path.normpath(back.get("worktreePath") or "")
+        for c in self.closed:
+            if not c.get("paused"):
+                continue
+            cwt = c.get("worktreePath")
+            if (transcript_id in (c.get("claudeSessionId"), c.get("transcriptId"))
+                    or (not c.get("root") and isinstance(cwt, str) and cwt
+                        and os.path.normpath(cwt) == wt)):
+                self._unpause_closed(c)
 
     def _refuse_start(self, reason, *, cmd_id=None, migration_id=None,
                       context="resume"):
@@ -33585,6 +33652,10 @@ class SessionManager:
                     self.pause_sleeper(
                         cmd.get("sessionId"),
                         operator_pending=cmd.get("sessionId") in pane_sids)
+                elif ctype == "unpauseSleeper":
+                    # A paused sleeper the hub will not wake (XERK-1575): its
+                    # ticket went Done, or its conversation runs again.
+                    self.unpause_sleeper(cmd.get("sessionId"))
                 elif ctype == "start":
                     self.start(cmd.get("sessionId"))
                 elif ctype == "restart":

@@ -124,6 +124,12 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   `_deliver_due_wakes` stages `wake_text` through the operator input path only once
   `WAKE_RESUME_SETTLE_MS` has passed AND the last beat read an idle composer — never a timed paste
   into a booting TUI. A wake still ahead (an early operator Resume) is simply asleep again.
+- **`resume()` refuses a conversation that already runs** (`_conversation_holder`: a running
+  session with its transcript, or in its worktree unless root), reported via `_refuse_start` — the
+  `_resume_at_cwd` rule. It also unpauses the record. Else a wake starts a second claude beside one
+  the Resume picker started (`resume_transcript` unpauses matching closed records on success).
+- **`unpauseSleeper` → `unpause_sleeper`** drops `paused` from a closed record (any switch state):
+  the hub sends it for a Done ticket or a conversation already running again.
 - **A NEW wake.json drops `wakeResumedAt`** (`_ingest_wake_request`): the settle gate belongs to
   the carried wake only.
 - **`TURMA_RESUME_WAKE_PROMPT=1` rides a DUE wake on the launch instead** (`claude --resume <id> --

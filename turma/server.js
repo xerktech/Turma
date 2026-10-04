@@ -13208,6 +13208,7 @@ const SLEEPER_TRIED_MAX = 500;
 // a restart forgets them, which costs at most one repeat command.
 const sleeperPauseTried = new Map();
 const sleeperWakeTried = new Map();
+const sleeperUnpauseTried = new Map();
 function sleeperTriedRecently(map, host, sid, now) {
   const at = map.get(host + "\x00" + sid);
   return at != null && now - at < SLEEPER_RETRY_MS;
@@ -13270,23 +13271,60 @@ function pausedSleeperDue(c, now) {
     && c.paused.wakeAt <= now;
 }
 
+// Is this paused sleeper's conversation already running on its host? The
+// operator's Resume picker resumes by TRANSCRIPT (a new session id), which leaves
+// the paused record behind; waking it too would start a second claude on one
+// conversation in one worktree. Matched on the transcript, and on the worktree
+// for a non-root record (root sessions all share REPOS_ROOT).
+function pausedSleeperHeldLive(a, c) {
+  return (Array.isArray(a.sessions) ? a.sessions : []).some((s) => s && s.id !== c.id
+    && (s.status === "running" || s.status === "queued")
+    && ((typeof c.transcriptId === "string" && c.transcriptId && s.transcriptId === c.transcriptId)
+      || (c.root !== true && typeof c.worktreePath === "string" && c.worktreePath
+        && s.worktreePath === c.worktreePath)));
+}
+// Is this paused sleeper's ticket Done on the board (the set autoStopSweep reads)?
+function pausedSleeperTicketDone(c, doneKeys) {
+  const t = objectish(c.ticket) ? c.ticket : null;
+  return !!(t && typeof t.key === "string" && t.key
+    && doneKeys().has(ticketQueueKey(typeof t.siteKey === "string" ? t.siteKey : "", t.key)));
+}
+
 // Resume every due paused sleeper on an online host with a free slot, one per
 // host per pass (the drain's own rule), oldest wake first. A wake resume in
-// flight holds its slot (pendingSpawnCount), so the queue never takes it. Like
-// the resume route, it stands auto-stop down for a ticket that went Done while it
-// slept (XERK-561) — or the sweep would re-kill the session it just woke.
+// flight holds its slot (pendingSpawnCount), so the queue never takes it.
+// Two paused records are never woken, and are UNPAUSED instead (left as an
+// ordinary killed, resumable session): one whose conversation already runs on
+// the host (the operator resumed it), and one whose ticket the board shows Done
+// — auto-stop kills a sleeper that was not paused there, so a paused one stays
+// stopped. A wake is never auto-stop-exempt (XERK-561 is the operator's resume
+// route only): a ticket that goes Done after the wake still stops it.
 function wakePausedSleepers(now = Date.now()) {
+  let done = null;
+  const doneKeys = () => done || (done = doneTicketKeys());
   for (const [host, a] of Object.entries(agents)) {
     if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
-    const due = (Array.isArray(a.closedSessions) ? a.closedSessions : [])
-      .filter((c) => pausedSleeperDue(c, now) && typeof c.id === "string"
-        && !sleeperTriedRecently(sleeperWakeTried, host, c.id, now))
-      .sort((x, y) => x.paused.wakeAt - y.paused.wakeAt);
+    const live = new Set((Array.isArray(a.sessions) ? a.sessions : []).map((s) => s && s.id));
+    const due = [];
+    for (const c of Array.isArray(a.closedSessions) ? a.closedSessions : []) {
+      if (!c || typeof c.id !== "string" || live.has(c.id) || !wirePaused(c.paused)) continue;
+      if (pausedSleeperHeldLive(a, c) || pausedSleeperTicketDone(c, doneKeys)) {
+        if (sleeperTriedRecently(sleeperUnpauseTried, host, c.id, now)) continue;
+        queueCommand(host, { type: "unpauseSleeper", sessionId: c.id });
+        noteSleeperTried(sleeperUnpauseTried, host, c.id, now);
+        console.log(`sleeper slot: unpausing ${logName(c.id)} on ${logName(host)}`
+          + " (already running, or its ticket is Done)");
+        continue;
+      }
+      if (pausedSleeperDue(c, now) && !sleeperTriedRecently(sleeperWakeTried, host, c.id, now)) {
+        due.push(c);
+      }
+    }
+    due.sort((x, y) => x.paused.wakeAt - y.paused.wakeAt);
     if (!due.length || !hostHasFreeSlot(a)) continue;
     const c = due[0];
     queueCommand(host, { type: "resume", sessionId: c.id, wake: true });
     noteSleeperTried(sleeperWakeTried, host, c.id, now);
-    markResumedTicketAutoStopExempt(host, c.id);
     console.log(`sleeper slot: waking ${logName(c.id)} on ${logName(host)}`);
   }
 }
@@ -13976,6 +14014,19 @@ registerGuardMirror("autoStopResumeExempt", {
   apply: (dk) => autoStopResumeExempt.add(dk),
 });
 
+// "<siteKey>\x00<issueKey>" of every ticket the board shows Done, across every
+// reporting org (fleetTicketRows' union-and-rank). autoStopSweep and the paused
+// sleeper wake (XERK-1575) read the same set, so they agree on what Done means.
+function doneTicketKeys(rows = fleetTicketRows()) {
+  const doneKeys = new Set();
+  for (const { row: t, siteKey } of rows.values()) {
+    if (t && t.key && t.statusCategory === "done") {
+      doneKeys.add(ticketQueueKey(siteKey, t.key));
+    }
+  }
+  return doneKeys;
+}
+
 function autoStopSweep() {
   // The set of now-Done tickets across EVERY reporting org — no opt-in gate —
   // read off `fleetTicketRows()`, the same union-and-rank the board renders, so
@@ -13988,12 +14039,7 @@ function autoStopSweep() {
   // Done the board plainly displayed whenever an org's hosts poll as different
   // Jira users. Withholding a stop is the better failure of the two, but neither
   // is correct.
-  const doneKeys = new Set(); // "<siteKey>\x00<issueKey>"
-  for (const { row: t, siteKey } of fleetTicketRows().values()) {
-    if (t && t.key && t.statusCategory === "done") {
-      doneKeys.add(ticketQueueKey(siteKey, t.key));
-    }
-  }
+  const doneKeys = doneTicketKeys(fleetTicketRows());
   if (!doneKeys.size) return;
   for (const [host, a] of Object.entries(agents)) {
     for (const s of a.sessions || []) {
@@ -21119,7 +21165,8 @@ if (process.env.TURMA_TEST) {
     normalizeCloseTicket,
     // XERK-1575: slot policy v2 (pause a sleeper, resume it at its wake).
     normalizePauseSleepers, wirePaused, sleeperPausable, wakePausedSleepers,
-    pauseSleepersFor, sleeperPauseTried, sleeperWakeTried, sleeperResumeHold, SLEEPER_PAUSE_MIN_AHEAD_MS,
+    pauseSleepersFor, sleeperPauseTried, sleeperWakeTried, sleeperUnpauseTried, sleeperResumeHold,
+    SLEEPER_PAUSE_MIN_AHEAD_MS,
     autoCloseMergedMessage,
     ingestTrajectoryTails,
     liveSessionForTranscript,

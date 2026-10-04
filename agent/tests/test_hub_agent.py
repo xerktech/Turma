@@ -17808,6 +17808,62 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sm._deliver_due_wakes(now_ms=self.NOW + 120_000)
         self.assertEqual(sm.input_queue, [], "still asleep until its wake")
 
+    def test_a_picker_resume_unpauses_and_a_later_wake_is_refused(self):
+        # The Resume picker resumes by TRANSCRIPT (a new session id) and leaves
+        # the paused record behind; the hub's wake of that record must not start
+        # a second claude on the same conversation.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid, tid = sess["id"], sess["claudeSessionId"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        sm.resume_transcript(tid, self.tmp, cmd_id="rt1")
+        back = sm.registry[-1]
+        self.assertNotEqual(back["id"], sid)
+        self.assertEqual(back["claudeSessionId"], tid)
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertNotIn("paused", rec, "its conversation runs again: no wake")
+        rec["paused"] = {"wakeAt": self.NOW}   # a wake the hub sent first
+        launches = len([c for c in self.run_ok_calls if "new-session" in c])
+        sm.resume(sid, cmd_id="w1")
+        self.assertIsNone(sm._find(sid))
+        self.assertEqual(len([c for c in self.run_ok_calls if "new-session" in c]), launches)
+        self.assertNotIn("paused", rec)
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["w1"])
+        self.assertIn("already running", sm.spawn_failures[0]["error"])
+
+    def test_a_resume_into_a_worktree_a_session_runs_in_is_refused(self):
+        sm = self._manager()
+        wt = os.path.join(self.tmp, "wt-busy")
+        sm.registry.append({"id": "live1", "status": "running", "repo": "r",
+                            "worktreePath": wt + "/"})
+        sm.closed.append({"id": "old1", "repo": "r", "worktreePath": wt,
+                          "claudeSessionId": "other", "paused": {"wakeAt": self.NOW}})
+        # A ROOT record shares REPOS_ROOT with every root session: only its
+        # transcript ties it, so a running root session does not block it.
+        sm.registry.append({"id": "live2", "status": "running", "repo": "r",
+                            "root": True, "worktreePath": self.tmp})
+        sm.resume("old1", cmd_id="w2")
+        self.assertIsNone(sm._find("old1"))
+        self.assertNotIn("paused", sm.closed[-1])
+        self.assertEqual([f["cmdId"] for f in sm.spawn_failures], ["w2"])
+        root_rec = {"id": "r1", "root": True, "worktreePath": self.tmp,
+                    "claudeSessionId": "t-r1"}
+        self.assertIsNone(sm._conversation_holder(root_rec))
+        sm.registry[-1]["claudeSessionId"] = "t-r1"
+        self.assertEqual(sm._conversation_holder(root_rec)["id"], "live2")
+
+    def test_the_unpause_command_leaves_an_ordinary_ended_session(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        sm.pause_sleeper(sid, now_ms=self.NOW)
+        sm.handle_commands([{"cmdId": "u1", "type": "unpauseSleeper", "sessionId": sid}])
+        self.assertIn("u1", sm.acked)
+        rec = next(c for c in sm.closed if c["id"] == sid)
+        self.assertNotIn("paused", rec)
+        self.assertIsNone(next(c for c in sm._closed_payload() if c["id"] == sid)["paused"])
+        self.assertFalse(sm.unpause_sleeper("nope"))
+
     def test_the_capability_rides_the_heartbeat(self):
         sm = self._manager()
         with mock.patch.object(sm, "_session_git", return_value=({}, {})):
