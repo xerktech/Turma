@@ -168,9 +168,13 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
   `registerExternalStore` is right; HA rewrites ≤200 short rows per org per answer, not per beat.
   `sanitizeDecision` is the one whitelist (`source` question|permission|note; `question` ≤300,
   `answer` ≤200, `text` ≤500; inline literals; null-proto map; a coerce fixed point).
+- **No lone surrogate leaves the whitelist**: a cap through an emoji drops the stranded high half,
+  any other becomes U+FFFD (`permissionWhy`'s clip too). The agent writes UTF-8, which cannot
+  encode one; `_decision_cell` also replaces them, so one bad row never wedges the file.
 - **Writers, always under the DECIDED org (`decidedOrgOf`), never the claimed siteKey**:
   - the answer route → `{question, answer}` = the session's served `question` + the picked
-    `questionOptions` labels (1-based "option N" fallback) + `, plus a typed answer` for free text
+    `questionOptions` labels (an index past them is dropped; "option N" only for a missing
+    label) + `, plus a typed answer` for free text
     (`(a typed answer)` alone with no pick) — never its words: the log reaches every same-org
     session, and text typed for one must not;
   - the pane-prompt route → `permissionWhy` FIRST, then the dialog's prompt (mostly a generic

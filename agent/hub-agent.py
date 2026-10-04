@@ -11901,7 +11901,7 @@ def clean_brief_narrative(text):
 # flattened and capped, written only when it changed, atomically through a fresh
 # mkstemp (a session-writable dir: never a fixed temp name). File-edit tools are
 # denied on it like peers.tsv; Bash can still write it (the ~/.turma residual),
-# and the next beat restores it from the hub's copy (an mtime check).
+# and the next beat restores it from the hub's copy (a byte comparison).
 DECISIONS_FILE_PREFIX = "decisions-"
 DECISIONS_MAX_ROWS = 30          # the hub's reply tail; re-applied (it crossed the wire)
 DECISIONS_CELL_MAX = 300
@@ -11925,7 +11925,10 @@ def decisions_path_for(org):
 
 
 def _decision_cell(value, cap=DECISIONS_CELL_MAX):
-    return " ".join(str(value if value is not None else "").split())[:cap]
+    # A lone surrogate (half an emoji a hub cut through) becomes "?": the file is
+    # UTF-8, which cannot encode one, and one bad row must never fail the render.
+    text = " ".join(str(value if value is not None else "").split())
+    return text.encode("utf-8", "replace").decode("utf-8")[:cap]
 
 
 def render_decisions(org, entries):
@@ -18817,8 +18820,7 @@ class SessionManager:
         self._brief_want = None
         self.brief_narratives = []
         # The org's decisions file (XERK-1574): the path it was last rendered to
-        # (found on disk at boot, so a session launched before the first reply is
-        # still told about it) and the text written there.
+        # and the text written there.
         # Named only once THIS manager has rendered it from a hub reply — never
         # found on disk at boot, where ~/.turma is session-writable and a lone
         # planted decisions-*.md would be named, fixed for a session's lifetime,

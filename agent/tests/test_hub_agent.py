@@ -39812,6 +39812,22 @@ class TestDecisionsFile(ManagerMixin, unittest.TestCase):
         self.assertEqual(len(rows), ha.DECISIONS_MAX_ROWS)
         self.assertTrue(all(len(r) < 600 for r in rows))
 
+    def test_a_lone_surrogate_from_the_hub_never_fails_the_render(self):
+        # Half an emoji (a hub cut through a pair) arrives as a lone surrogate:
+        # unencodable in UTF-8, so it must not wedge the file for every reply.
+        q = "a" * 299 + "\ud83d"
+        reply = {"org": self.ORG, "entries": [
+            {"at": 1_700_000_000_000, "source": "question", "question": q,
+             "answer": "ok \udc00"}]}
+        with mock.patch.object(ha, "log") as log:
+            self.sm._ingest_decisions(reply)
+            self.sm._ingest_decisions(reply)
+        self.assertFalse([c for c in log.call_args_list if "decisions" in str(c)])
+        self.assertEqual(self.sm.decisions_path, self._path())
+        with open(self._path(), encoding="utf-8") as f:
+            text = f.read()
+        self.assertIn("a" * 299 + "? → answered: ok ?", text)
+
     def test_the_file_is_written_only_on_change_and_restored_if_tampered(self):
         reply = {"org": self.ORG, "entries": self.ENTRIES}
         self.sm._ingest_decisions(reply)

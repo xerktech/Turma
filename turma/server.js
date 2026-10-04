@@ -3390,7 +3390,13 @@ function sanitizeDecision(v) {
   if (!v || typeof v !== "object" || Array.isArray(v)) return null;
   if (!Number.isSafeInteger(v.at) || v.at <= 0) return null;
   if (typeof v.source !== "string" || !DECISION_SOURCES.has(v.source)) return null;
-  const str = (x, n) => (typeof x === "string" ? x.slice(0, n).trim() : "");
+  // Bounded in UTF-16 units, but never left holding HALF a surrogate pair: a cut
+  // through an emoji drops its stranded high half, and any other lone surrogate
+  // becomes U+FFFD. The agent writes these to a UTF-8 file, which cannot encode
+  // one (the whole render would fail every reply). A coerce fixed point.
+  const str = (x, n) => (typeof x === "string"
+    ? x.slice(0, n).replace(/[\uD800-\uDBFF]$/, "").replace(/\p{Surrogate}/gu, "\uFFFD").trim()
+    : "");
   const out = { at: v.at, source: v.source };
   const id = str(v.id, 32);
   if (/^[0-9a-f]{1,32}$/.test(id)) out.id = id;
@@ -11767,7 +11773,9 @@ function permissionWhy(pp) {
     why = `${lines[0].replace(/ command$/i, "")}: ${lines[1]}`;
   }
   if (!why) why = String(pp.prompt || "");
-  return why.length > PERMISSION_WHY_MAX ? why.slice(0, PERMISSION_WHY_MAX - 1) + "…" : why;
+  // The clip never strands half a surrogate pair (it feeds the decisions log).
+  return why.length > PERMISSION_WHY_MAX
+    ? why.slice(0, PERMISSION_WHY_MAX - 1).replace(/[\uD800-\uDBFF]$/, "") + "…" : why;
 }
 
 // One session's attention (XERK-1571): {state, eta?, why?} — `since` is added
@@ -15134,14 +15142,17 @@ function recordAnswerDecision(key, sessionId, kind, answer) {
 }
 
 // The chosen option's own words: the labels the session offered for each picked
-// index (1-based fallback when a label is missing), then a MARKER for a typed
+// index (1-based fallback only when the session served no labels or one is
+// missing; an index past the served options is dropped, since the agent will not
+// act on it and the log would record a choice nobody made), then a MARKER for a typed
 // answer, never its words: the log reaches every same-org session's decisions
 // file, and free text typed for one session (a URL, a pasted secret) must not.
 // A note the operator wants shared goes through the explicit decisions POST.
 function questionAnswerText(a, sessionId, picks, custom) {
   const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
   const labels = s && s.session && Array.isArray(s.session.questionOptions) ? s.session.questionOptions : [];
-  const picked = picks.map((i) => (typeof labels[i] === "string" && labels[i] ? labels[i] : `option ${i + 1}`))
+  const picked = picks.filter((i) => !labels.length || i < labels.length)
+    .map((i) => (typeof labels[i] === "string" && labels[i] ? labels[i] : `option ${i + 1}`))
     .join("; ");
   if (!custom.trim()) return picked;
   // Worded as a phrase, not a "; (…)" list item, which read like a glitch.

@@ -23501,7 +23501,7 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
   assert.deepEqual(log, [
     { source: "question", question: "Which DB?", answer: "Postgres", host: "dcHostB",
       sessionId: "q1", ticket: "XERK-9", label: "db work" },
-    { source: "question", question: "Which DB?", answer: "Postgres; SQLite; option 6, plus a typed answer",
+    { source: "question", question: "Which DB?", answer: "Postgres; SQLite, plus a typed answer",
       host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
     { source: "permission", question: "Bash: npm test — Do you want to proceed?", answer: "Yes",
       host: "dcHostB", sessionId: "p1", label: "lbl" },
@@ -23555,7 +23555,9 @@ test("XERK-1574: an auto-appended decision is capped — question 300, chosen op
   const S = "dcD1574.atlassian.net";
   const longQ = "Q".repeat(400) + "?";
   await beat1574("dcHostD", S, { sessions: [{ id: "lq", status: "running",
-    session: { question: longQ, questionOptions: ["A"] } }] });
+    session: { question: longQ, questionOptions: ["A"] } },
+  { id: "lp", status: "running", session: { panePrompt: { prompt: "Proceed?",
+    detail: "x".repeat(118) + "\u{1F600}yyyy", options: [{ number: 1, label: "Yes" }] } } }] });
   const custom = "z".repeat(3000);                  // within the legacy input cap
   const res = await request("POST", "/api/agents/dcHostD/sessions/lq/answer",
     { body: { custom }, headers: userHeaders });
@@ -23563,11 +23565,29 @@ test("XERK-1574: an auto-appended decision is capped — question 300, chosen op
   const [entry] = hub.getDecisions()[S];
   assert.equal(entry.question, "Q".repeat(300));
   assert.equal(entry.answer, "(a typed answer)", "a typed answer is logged as a marker, never its words");
+  // The permission line's 120-unit clip lands inside an emoji: no half pair.
+  assert.equal((await request("POST", "/api/agents/dcHostD/sessions/lp/pane-prompt",
+    { body: { optionNumber: 1 }, headers: userHeaders })).status, 200);
+  assert.equal(hub.getDecisions()[S][1].question, "x".repeat(118) + "… — Proceed?");
   const direct = hub.sanitizeDecision({ at: 1, source: "question", question: "q".repeat(5000),
     answer: "a".repeat(5000), text: "t".repeat(5000) });
   assert.equal(direct.question.length, 300);
   assert.equal(direct.answer.length, 200);
   assert.equal(direct.text.length, 500);
+  // A cap through an emoji never strands half its surrogate pair (the agent
+  // writes these to a UTF-8 file, which cannot encode one); a lone surrogate
+  // elsewhere becomes U+FFFD. Still a coerce fixed point.
+  const emoji = hub.sanitizeDecision({ at: 1, source: "question",
+    question: "a".repeat(299) + "\u{1F600}tail", answer: "b".repeat(199) + "\u{1F600}",
+    label: "ok \uDC00 \uD83D" });
+  assert.equal(emoji.question, "a".repeat(299));
+  assert.equal(emoji.answer, "b".repeat(199));
+  assert.equal(emoji.label, "ok \uFFFD");
+  const wellFormed = (s) => !/\p{Surrogate}/u.test(s);
+  assert.ok([emoji.question, emoji.answer, emoji.label].every(wellFormed));
+  assert.deepEqual(hub.sanitizeDecision(emoji), emoji);
+  const kept = hub.sanitizeDecision({ at: 1, source: "note", text: "x".repeat(498) + "\u{1F600}" });
+  assert.equal(kept.text, "x".repeat(498) + "\u{1F600}", "a pair that fits is kept whole");
   delete agents.dcHostD;
   delete hub.getDecisions()[S];
 });
