@@ -125,10 +125,13 @@ function orgTintStyle(colorMap: Map<string, string>, siteKey: string): string {
   return c ? ` style="--org:${c}"` : "";
 }
 
-// "14:05" — the local wall-clock time a sleeping session wakes at.
-function clockTime(ms: number): string {
+// "14:05" — the local wall-clock time a sleeping session wakes at, "14:05 +2d"
+// when that is a later day (a wake may be up to 7d out), so it never reads as today.
+export function clockTime(ms: number, now: number = Date.now()): string {
   const d = new Date(ms), p = (n: number) => String(n).padStart(2, "0");
-  return `${p(d.getHours())}:${p(d.getMinutes())}`;
+  const day = (t: number) => { const x = new Date(t); return new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime(); };
+  const days = Math.round((day(ms) - day(now)) / 864e5);
+  return `${p(d.getHours())}:${p(d.getMinutes())}${days > 0 ? `\u00a0+${days}d` : ""}`;
 }
 
 function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, current: boolean,
@@ -151,7 +154,7 @@ function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, cur
   const stallWhy = typeof s.attention?.why === "string" ? s.attention.why : "";
   const label = stalled ? ["stalled", stallWhy].filter(Boolean).join(" · ")
     : st === "holding" && sleeping(s.session, now ?? Date.now()) && typeof wakeAt === "number"
-    ? `sleeping until ${clockTime(wakeAt)}${wakeWhy ? ` · ${wakeWhy}` : ""}` : STATE_LABEL[st];
+    ? `sleeping until ${clockTime(wakeAt, now ?? Date.now())}${wakeWhy ? ` · ${wakeWhy}` : ""}` : STATE_LABEL[st];
   const stateRow =
     `<span class="ph-state-row">` +
     `<span class="ph-state st-${stalled ? "stalled" : st}">${esc(label)}</span>` +

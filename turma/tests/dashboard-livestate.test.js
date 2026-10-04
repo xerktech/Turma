@@ -133,14 +133,23 @@ test("dashboard liveState: waiting shells hold, stall, and never read working", 
 test("dashboard liveState: a wait with no ETA says how long it has waited", () => {
   const { liveState } = loadDashboard();
   const ci = { type: "shell", label: "Watch CI on PR #412", kind: "wait-external", startedAt: NOW - 12 * 60 * 1000 };
-  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [ci] }), onlineHost, NOW).label,
-    "⏳ waiting · Watch CI on PR #412 · 12m");
+  const ciCard = liveState(sess({ paneBusy: false, transcriptAgeSec: 12 * 60, agents: [ci] }), onlineHost, NOW);
+  assert.equal(ciCard.label, "⏳ waiting · Watch CI on PR #412 · 12m");
+  // Screenshot defect: "· 12m · last write 12m ago" was two ages for one wait.
+  // The wait's own age is the card's one clock.
+  assert.equal(ciCard.detail, "");
   const two = [{ ...ci, label: "" }, { type: "shell", kind: "wait-timed", startedAt: NOW - 20 * 60 * 1000 }];
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: two }), onlineHost, NOW).label,
     "⏳ waiting on 2 background shells · 20m");
   const timed = { ...ci, kind: "wait-timed", eta: NOW + 11 * 60 * 1000 };
-  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [timed] }), onlineHost, NOW).label,
-    "⏳ waiting · Watch CI on PR #412 · 11m left");
+  const timedCard = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [timed] }), onlineHost, NOW);
+  assert.equal(timedCard.label, "⏳ waiting · Watch CI on PR #412 · 11m left");
+  // Time LEFT is not an age: the last write still shows beside it.
+  assert.match(timedCard.detail, /^last write 5s/);
+  // A wait row with no startedAt (an older agent): the last write is its only clock.
+  const { startedAt, ...noStart } = ci;
+  assert.match(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [noStart] }), onlineHost, NOW).detail,
+    /^last write 5s/);
   // Stalled: no start age — the stall's own age (the hub's `since`) is the
   // State row's, and a second number here read as a second stall length.
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW).label,
@@ -157,7 +166,8 @@ test("dashboard liveState: a stall shows one age, the hub's since", () => {
   const stalled = liveState({ session: s,
     attention: { state: "needs-you:stalled", since: NOW - 31 * 60 * 1000, why: "Watch CI" } }, onlineHost, NOW);
   assert.equal(stalled.label, "stalled · Watch CI");
-  assert.equal(stalled.detail, "for 31m");
+  // The age is glued to its word by a no-break space, so "31m" never wraps alone.
+  assert.equal(stalled.detail, "for\u00a031m");
   assert.equal(stalled.cls, "sess-stalled");
   // The hub is a beat behind (still "waiting"): no second number at all.
   assert.equal(liveState({ session: s, attention: { state: "waiting", since: NOW - 60_000 } }, onlineHost, NOW).detail, "");
@@ -176,7 +186,28 @@ test("dashboard liveState: a permission names what it asks for", () => {
   assert.equal(withWhy.label, "waiting for your permission");
   assert.equal(withWhy.ask, "Bash: kubectl rollout restart");
   assert.equal(withWhy.question, undefined);
+  // Screenshot defect: the State row showed an age for review and stalled but
+  // not here, where the Sessions page shows "for 4m". Now it does.
+  const asked = liveState({ session: pp,
+    attention: { state: "needs-you:permission", since: NOW - 4 * 60 * 1000, why: "Bash: ls" } }, onlineHost, NOW);
+  assert.equal(asked.detail, "for\u00a04m");
   assert.equal(liveState({ session: pp }, onlineHost, NOW).ask, "Do you want to proceed?");
+});
+
+// XERK-1571 screenshot defect: a question card's State row carries how long it
+// has waited, like every other needs-you card and the Sessions page's "for 22m".
+test("dashboard liveState: a question card says how long it has waited", () => {
+  const { liveState } = loadDashboard();
+  const q = { paneBusy: false, transcriptAgeSec: 5, question: "Ship it?" };
+  const card = liveState({ session: q,
+    attention: { state: "needs-you:question", since: NOW - 22 * 60 * 1000 } }, onlineHost, NOW);
+  assert.equal(card.label, "waiting for your answer");
+  assert.equal(card.detail, "for\u00a022m");
+  // The hub a beat behind (still "review"): not the review's age under a question.
+  assert.equal(liveState({ session: q,
+    attention: { state: "needs-you:review", since: NOW - 47 * 60 * 1000 } }, onlineHost, NOW).detail, "");
+  // An older hub: no age, as before.
+  assert.equal(liveState({ session: q }, onlineHost, NOW).detail, "");
 });
 
 // XERK-1571: a card the hub says needs the operator never reads "idle" — its
@@ -189,7 +220,7 @@ test("dashboard liveState: a needs-you session reads its attention, never idle",
   assert.equal(review.label, "review · PR open · CI passing");
   assert.equal(review.cls, "sess-review");
   // How long it has waited is the hub's since — one age, not the last write.
-  assert.equal(review.detail, "for 1m");
+  assert.equal(review.detail, "for\u00a01m");
   const stalled = liveState({ session: done,
     attention: { state: "needs-you:stalled", since: NOW - 60_000, why: "Watch CI" } }, onlineHost, NOW);
   assert.equal(stalled.label, "stalled · Watch CI");
@@ -204,6 +235,19 @@ test("dashboard liveState: a needs-you session reads its attention, never idle",
 
 // XERK-1571: a session-CLI wake still ahead reads sleeping (holding style), "until
 // HH:MM" in local time; a due wake no longer does.
+// A wake on a later day (up to 7d out) says so, so it never reads as today.
+test("dashboard liveState: a wake on a later day carries +Nd", () => {
+  const { liveState } = loadDashboard();
+  const today = new Date(2026, 9, 4, 10, 0).getTime();
+  const wakeAt = new Date(2026, 9, 6, 14, 5).getTime();
+  const host = { online: true, lastSeen: today };
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt, wakeReason: "check CI" }), host, today).label,
+    "💤 sleeping until 14:05\u00a0+2d · check CI");
+  const tomorrow = new Date(2026, 9, 5, 9, 30).getTime();
+  assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, wakeAt: tomorrow }), host, today).label,
+    "💤 sleeping until 09:30\u00a0+1d");
+});
+
 test("dashboard liveState: a pending wake reads sleeping until its time", () => {
   const { liveState } = loadDashboard();
   const wakeAt = NOW + 30 * 60 * 1000;

@@ -293,7 +293,7 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         // <reason>": what it will check when it wakes, when the session said.
         live?.wakeAt?.takeIf { it > now }?.let {
             val why = live?.wakeReason?.trim().orEmpty()
-            return "💤 sleeping until ${com.xerktech.turma.core.clockTime(it)}" + if (why.isEmpty()) "" else " · $why"
+            return "💤 sleeping until ${com.xerktech.turma.core.clockTime(it, now)}" + if (why.isEmpty()) "" else " · $why"
         }
         val waits = live?.agents.orEmpty().filter(::isWaitAgent)
         val eta = waits.mapNotNull { it.eta }.maxOrNull()

@@ -66,11 +66,15 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
     permission, review, stalled (a stall whose own turn never finished included) — and a session
     it says is anything else is not. **No attention (an older hub) falls back to the page's own
     `readyForReview` mirror**, so the five-mirror rule still decides there.
+  - **A session on an OFFLINE host falls back to `readyForReview` too** (its hub state is frozen
+    at the last beat); a needs-you state it last had still lists it.
   - Sorted by `since`, oldest first (`bySince`, Android `sortedBySince`, glasses phone
     `render.ts`); a card with no `since` keeps its createdAt place after them.
 - **The dashboard tile is "Ready for review"** (worded as that section, hint "sessions waiting on
   you"), counting the SAME set off one helper (`needsYou(sess).length`; Android `fleetSummary`
   `waiting` via `needsYou`) — a questions-only count said 2 above a list of 4. Tiles don't link.
+  - **Same set for ONLINE hosts only**: the tile has no offline fallback, so an offline-host
+    session the local rule calls finished is listed but not counted (offline-host follow-up).
 - **A fleet card never reads "idle" for a needs-you session**: where liveState would say idle, it
   says `attentionLabel` ("review · PR open · CI passing", "stalled · Watch CI", "waiting for your
   permission"; Android same name).
@@ -78,6 +82,10 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   State row and Android's Fleet card, "stalled 31m" on the review card's why line). The dashboard's
   "last write" beside it read as a second, different stall length; it stays only for an older hub
   serving no attention. A stalled wait LABEL carries no start age either.
+- **Every needs-you fleet card's State row carries that age**, a question/permission card too
+  ("waiting for your answer · for 22m") — only when the served state IS that question/permission,
+  never a lagging review's age. A wait with no ETA ahead shows its own start age ("· 12m") and NO
+  "last write" beside it; a timed wait's "11m left" is not an age, so its last write stays.
 - **Permission `why` is the pending COMMAND, not the dialog's question** (`permissionWhy`): the
   question is nearly always "Do you want to proceed?", so a leading dialog title + next line of
   `panePrompt.detail` becomes "Bash: touch /tmp/x" (first line alone if no title; capped at 120).

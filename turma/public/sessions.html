@@ -2224,7 +2224,7 @@ function liveState(sess, host, now) {
   // re-prompted then, so it is "holding" — never Ready for review — like the
   // hub's sessionSleeping (no host-online gate there either).
   if (sleepingUntil(s, now))
-    return { kind: "holding", label: sleepLabel(s), detail: "last write " + ago(age) };
+    return { kind: "holding", label: sleepLabel(s, now), detail: "last write " + ago(age) };
   // Every live row is a wait: "holding" while it waits (never Ready for review),
   // or — past its ETA, or silent too long — "stalled", which reads as idle so a
   // dead shell surfaces like any finished session. Mirrors the hub's sessionWait.
@@ -2259,16 +2259,19 @@ function permissionAsk(sess) {
 function sleepingUntil(s, now) {
   return Number.isSafeInteger(s?.wakeAt) && s.wakeAt > now;
 }
-// "14:05" — the local wall-clock time a sleeping session wakes at.
-function clockTime(ms) {
+// "14:05" — the local wall-clock time a sleeping session wakes at, "14:05 +2d"
+// when that is a later day (a wake may be up to 7d out), so it never reads as today.
+function clockTime(ms, now = Date.now()) {
   const d = new Date(ms), p = (n) => String(n).padStart(2, "0");
-  return p(d.getHours()) + ":" + p(d.getMinutes());
+  const day = (t) => { const x = new Date(t); return new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime(); };
+  const days = Math.round((day(ms) - day(now)) / 864e5);
+  return p(d.getHours()) + ":" + p(d.getMinutes()) + (days > 0 ? "\u00a0+" + days + "d" : "");
 }
 // "💤 sleeping until 14:05 · check CI" — a session-CLI wake and, when the
 // session gave one, what it will check then (XERK-1571). Same as index.html.
-function sleepLabel(s) {
+function sleepLabel(s, now) {
   const why = typeof s.wakeReason === "string" ? s.wakeReason.trim() : "";
-  return "💤 sleeping until " + clockTime(s.wakeAt) + (why ? " · " + why : "");
+  return "💤 sleeping until " + clockTime(s.wakeAt, now) + (why ? " · " + why : "");
 }
 function liveWorkRows(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).filter(a => !isWaitRow(a));
@@ -2462,10 +2465,15 @@ function attentionWhy(s, now) {
 // DECIDES (XERK-1571): every needs-you:* session is listed — a question, a
 // permission, a review, a stall — and nothing else, so the section is exactly
 // the set the dashboard's "Ready for review" tile counts. An older hub serves
-// none, and this page's own readyForReview mirror decides, as before.
+// none, and this page's own readyForReview mirror decides, as before. On an
+// OFFLINE host the hub's state is frozen at its last beat, so a non-needs-you
+// one ("working", "waiting") must not keep the host's stranded work out: the
+// local rule decides it too (XERK-235).
 function inReview(x) {
   const st = x.s.attention?.state;
-  if (typeof st === "string" && st) return st.startsWith("needs-you:");
+  if (typeof st === "string" && st.startsWith("needs-you:")) return true;
+  if (!x.a.online) return readyForReview(x.s, x.live);
+  if (typeof st === "string" && st) return false;
   return readyForReview(x.s, x.live);
 }
 

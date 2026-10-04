@@ -17402,6 +17402,21 @@ class TestWakeRequest(ManagerMixin, unittest.TestCase):
         self.assertEqual(payload["session"]["wakeAt"], 1_786_400_000_000)
         self.assertEqual(payload["session"]["wakeReason"], "check CI")
 
+    def test_a_wake_past_the_cli_cap_is_no_request(self):
+        """A hand-written wake.json further out than the CLI's 7d cap (plus an
+        hour of slack) is ignored, so a session cannot sleep out of review
+        indefinitely; one inside the cap is read."""
+        sm = self.make_manager()
+        sess = self._sess(sm)
+        now_ms = 1_786_400_000_000
+        with mock.patch.object(ha.time, "time", return_value=now_ms / 1000):
+            self._write({"wakeAt": now_ms + ha.WAKE_MAX_AHEAD_MS + 1, "reason": "r"})
+            self.assertIsNone(ha.read_wake_request(self.SID))
+            self.assertNotIn("wakeAt", self._payload(sm, sess)["session"])
+            ok = now_ms + 7 * 24 * 3600 * 1000
+            self._write({"wakeAt": ok, "reason": "r"})
+            self.assertEqual(ha.read_wake_request(self.SID)["wakeAt"], ok)
+
     def test_no_request_serves_no_fields(self):
         sm = self.make_manager()
         sess = self._sess(sm)

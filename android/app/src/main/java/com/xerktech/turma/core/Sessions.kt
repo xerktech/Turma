@@ -126,14 +126,28 @@ fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState =
 /** A session-CLI wake still in the future (XERK-1571) — the hub's `sessionSleeping`. */
 fun sessionSleeping(session: SessionInfo, now: Long): Boolean = (session.session?.wakeAt ?: 0L) > now
 
-/** "14:05" — the local wall-clock time a sleeping session wakes at. */
-fun clockTime(ms: Long): String {
+/**
+ * "14:05" — the local wall-clock time a sleeping session wakes at, "14:05 +2d" when
+ * that is a later day (a wake may be up to 7d out), so it never reads as today. Web
+ * `clockTime`.
+ */
+fun clockTime(ms: Long, now: Long = System.currentTimeMillis()): String {
     val c = java.util.Calendar.getInstance().apply { timeInMillis = ms }
-    return String.format(
+    val time = String.format(
         java.util.Locale.ROOT, "%02d:%02d",
         c.get(java.util.Calendar.HOUR_OF_DAY), c.get(java.util.Calendar.MINUTE),
     )
+    val days = Math.round((localMidnight(ms) - localMidnight(now)) / 86_400_000.0)
+    return if (days > 0) "$time\u00a0+${days}d" else time
 }
+
+private fun localMidnight(ms: Long): Long = java.util.Calendar.getInstance().apply {
+    timeInMillis = ms
+    set(java.util.Calendar.HOUR_OF_DAY, 0)
+    set(java.util.Calendar.MINUTE, 0)
+    set(java.util.Calendar.SECOND, 0)
+    set(java.util.Calendar.MILLISECOND, 0)
+}.timeInMillis
 
 /** The chip word for a `needs-you:*` attention state (XERK-1571), else null. */
 fun needsYouChip(state: String): String? = when (state) {
@@ -160,22 +174,35 @@ fun needsYou(session: SessionInfo): Boolean =
  * state it decides: every `needs-you:*` session is listed (question, permission,
  * review, stalled) and nothing else, so the group is the set the dashboard tile
  * counts. From an older hub (no attention) the local [readyForReview] port decides.
+ * On an OFFLINE host the hub's state is frozen at its last beat, so a non-needs-you
+ * one must not keep stranded work out: the local rule decides it too (XERK-235).
+ * A null [agentLastSeen] (a caller that cannot supply it) trusts the served state.
  */
-fun inReview(session: SessionInfo, state: LiveState): Boolean {
+fun inReview(
+    session: SessionInfo,
+    state: LiveState,
+    agentLastSeen: Long? = null,
+    now: Long = 0L,
+): Boolean {
     val att = session.attention?.state.orEmpty()
-    if (att.isNotEmpty()) return needsYouChip(att) != null
+    if (needsYouChip(att) != null) return true
+    if (agentLastSeen != null && now - agentLastSeen >= OFFLINE_AFTER_MS) {
+        return readyForReview(session, state)
+    }
+    if (att.isNotEmpty()) return false
     return readyForReview(session, state)
 }
 
 /**
  * How long the hub says a needs-you session has waited, for a fleet card's State
  * row (XERK-1571, web index.html `attentionFor`): "for 31m" off the attention
- * `since` — the ONE age a stalled card shows. "" when there is none.
+ * `since` — the ONE age a stalled card shows. The age is glued to its word by a
+ * no-break space, as on the web, so "31m" never wraps alone. "" when there is none.
  */
 fun attentionFor(att: Attention?, now: Long): String {
     val since = att?.since ?: return ""
     if (needsYouChip(att.state) == null) return ""
-    return "for ${waitLeftText(now - since)}"
+    return "for\u00A0${waitLeftText(now - since)}"
 }
 
 /**
@@ -204,7 +231,7 @@ fun attentionWhy(att: Attention?, now: Long): String {
             "needs-you:question", "needs-you:permission" -> "for"
             else -> "waiting"
         }
-        bits.add("$word ${waitLeftText(now - it)}")
+        bits.add("$word\u00A0${waitLeftText(now - it)}")
     }
     return bits.joinToString(" · ")
 }

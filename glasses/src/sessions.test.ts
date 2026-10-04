@@ -121,6 +121,17 @@ describe("liveState", () => {
     expect(inReview({ ...finished, attention: { state: "idle", since: now } }, now, now)).toBe(false);
     expect(inReview(quiet, now, now)).toBe(false);
     expect(inReview({ ...quiet, attention: { state: "needs-you:stalled", since: now } }, now, now)).toBe(true);
+    // An OFFLINE host's attention is frozen at its last beat: a stale "working"
+    // or "waiting" must not keep its stranded finished work out of review (the
+    // local rule decides), while a needs-you it last reported stays listed.
+    const dead = now - 10 * 60_000;
+    const busy = session({ session: signals({ paneBusy: true, transcriptAgeSec: 600, lastRole: "assistant" }) });
+    expect(inReview({ ...busy, attention: { state: "working", since: dead } }, dead, now)).toBe(true);
+    expect(inReview({ ...finished, attention: { state: "waiting", since: dead } }, dead, now)).toBe(true);
+    expect(inReview({ ...quiet, attention: { state: "working", since: dead } }, dead, now)).toBe(false);
+    expect(inReview({ ...quiet, attention: { state: "needs-you:stalled", since: dead } }, dead, now)).toBe(true);
+    // Online, a "working" still keeps the finished turn out.
+    expect(inReview({ ...finished, attention: { state: "working", since: now } }, now, now)).toBe(false);
   });
 
   it("is 'error' when status is error, regardless of session signals", () => {

@@ -542,8 +542,14 @@ private fun SessionCard(
                         // session is busy (XERK-1572) — speaks over "working" too.
                         val needs = if (state == LiveState.IDLE || com.xerktech.turma.core.attentionStalled(session.attention)) com.xerktech.turma.core.attentionLabel(session.attention) else null
                         val needsFor = com.xerktech.turma.core.attentionFor(session.attention, now)
+                        // A question card carries its age too (web "waiting for your
+                        // answer · for 22m"), but only the question's own — never a
+                        // review's the hub has not caught up from.
+                        val askedFor = if (state == LiveState.WAITING && session.attention?.state == "needs-you:question") needsFor else ""
+                        val stateFor = if (needs != null) needsFor else askedFor
+                        val stateLabel = needs ?: liveStateLabel(state, session.session)
                         Text(
-                            needs?.let { if (needsFor.isEmpty()) it else "$it · $needsFor" } ?: liveStateLabel(state, session.session),
+                            if (stateFor.isEmpty()) stateLabel else "$stateLabel · $stateFor",
                             style = MaterialTheme.typography.bodySmall,
                             color = if (needs != null && com.xerktech.turma.core.attentionStalled(session.attention)) MaterialTheme.colorScheme.error else muted,
                             maxLines = 1,

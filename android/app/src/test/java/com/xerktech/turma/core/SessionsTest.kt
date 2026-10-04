@@ -185,12 +185,12 @@ class SessionsTest {
         assertEquals(LiveState.HOLDING, liveState(asleep, now, now))
         assertEquals(false, readyForReview(asleep, liveState(asleep, now, now)))
         assertEquals(
-            "💤 sleeping until ${clockTime(wakeAt)}",
+            "💤 sleeping until ${clockTime(wakeAt, now)}",
             com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, asleep.session, now),
         )
         // The wake reason, when the session gave one, says what it will check.
         assertEquals(
-            "💤 sleeping until ${clockTime(wakeAt)} · check CI on PR #412",
+            "💤 sleeping until ${clockTime(wakeAt, now)} · check CI on PR #412",
             com.xerktech.turma.ui.liveStateLabel(
                 LiveState.HOLDING, asleep.session!!.copy(wakeReason = "check CI on PR #412"), now),
         )
@@ -199,7 +199,23 @@ class SessionsTest {
         val busy = asleep.copy(session = asleep.session!!.copy(paneBusy = true))
         assertEquals(LiveState.WORKING, liveState(busy, now, now))
         // "14:05"-shaped local clock time.
-        assertEquals(true, Regex("^\\d\\d:\\d\\d$").matches(clockTime(wakeAt)))
+        assertEquals(true, Regex("^\\d\\d:\\d\\d$").matches(clockTime(wakeAt, now)))
+    }
+
+    @Test fun `a wake on a later day says how many days out`() {
+        fun at(day: Int, hour: Int, minute: Int) = java.util.Calendar.getInstance().apply {
+            clear()
+            set(2026, java.util.Calendar.OCTOBER, day, hour, minute)
+        }.timeInMillis
+        val today = at(4, 10, 0)
+        assertEquals("14:05", clockTime(at(4, 14, 5), today))
+        assertEquals("09:30\u00a0+1d", clockTime(at(5, 9, 30), today))
+        assertEquals("14:05\u00a0+2d", clockTime(at(6, 14, 5), today))
+        val asleep = LiveSignals(wakeAt = at(6, 14, 5))
+        assertEquals(
+            "💤 sleeping until 14:05\u00a0+2d",
+            com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, asleep, today),
+        )
     }
 
     private fun att(state: String, since: Long?, why: String? = null) =
@@ -229,23 +245,33 @@ class SessionsTest {
         val quiet = finished.copy(session = finished.session!!.copy(lastRole = "user"))
         assertEquals(false, inReview(quiet, LiveState.IDLE))
         assertEquals(true, inReview(quiet.copy(attention = att("needs-you:stalled", now)), LiveState.IDLE))
+        // An OFFLINE host's attention is frozen at its last beat: a stale "working"
+        // or "waiting" must not keep its stranded finished work out of review (the
+        // local rule decides), while a needs-you it last reported stays listed.
+        val dead = now - 600_000L
+        assertEquals(true, inReview(finished.copy(attention = att("working", dead)), LiveState.IDLE, dead, now))
+        assertEquals(true, inReview(finished.copy(attention = att("waiting", dead)), LiveState.IDLE, dead, now))
+        assertEquals(false, inReview(quiet.copy(attention = att("working", dead)), LiveState.IDLE, dead, now))
+        assertEquals(true, inReview(quiet.copy(attention = att("needs-you:stalled", dead)), LiveState.IDLE, dead, now))
+        // Online, a "working" still keeps the finished turn out.
+        assertEquals(false, inReview(finished.copy(attention = att("working", now)), LiveState.IDLE, now, now))
     }
 
     @Test fun `attentionFor is the one age a needs-you fleet card shows`() {
-        assertEquals("for 31m", attentionFor(att("needs-you:stalled", now - 31 * 60_000L), now))
+        assertEquals("for\u00A031m", attentionFor(att("needs-you:stalled", now - 31 * 60_000L), now))
         assertEquals("", attentionFor(att("needs-you:stalled", null), now))
         assertEquals("", attentionFor(att("waiting", now - 60_000L), now))
         assertEquals("", attentionFor(null, now))
     }
 
     @Test fun `attentionWhy says why and for how long`() {
-        assertEquals("PR open · CI passing · waiting 12m",
+        assertEquals("PR open · CI passing · waiting\u00A012m",
             attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
         // A question/permission already reads "waiting"; a stall says it stalled.
-        assertEquals("Ship it? · for 3m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
-        assertEquals("Bash: rm -rf build · for 3m",
+        assertEquals("Ship it? · for\u00A03m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("Bash: rm -rf build · for\u00A03m",
             attentionWhy(att("needs-you:permission", now - 3 * 60_000L, "Bash: rm -rf build"), now))
-        assertEquals("stalled 3m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
+        assertEquals("stalled\u00A03m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
         assertEquals("", attentionWhy(att("working", now), now))
         assertEquals("", attentionWhy(null, now))
     }
