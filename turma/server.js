@@ -4833,14 +4833,16 @@ function sanitizeRestoredCommands(reg) {
 // does not walk commands) would 400 that host's every beat with the internal
 // error text, and serve every dashboard a stale payload from `lastGoodAgentsCache`
 // for as long as the record lived. That is XERK-235's loop, from a one-word gap.
-const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite"];
+// `pauseFor` is the queue key of the waiting ticket a `pauseSleeper` answers
+// (XERK-1575): hub-only bookkeeping, like the two ticket stamps.
+const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite", "pauseFor"];
 function publicCommands(cmds) {
   const internal = (c) => c && typeof c === "object"
     && INTERNAL_COMMAND_FIELDS.some((f) => f in c);
   if (!cmds || !cmds.some(internal)) return cmds;
   return cmds.map((c) => {
     if (!internal(c)) return c;
-    const { deliveredAt, ticketSource, ticketSite, ...rest } = c;
+    const { deliveredAt, ticketSource, ticketSite, pauseFor, ...rest } = c;
     return rest;
   });
 }
@@ -13405,20 +13407,41 @@ function wakePausedSleepers(now = Date.now()) {
 
 // Free ONE slot per still-waiting ticket by pausing a sleeper on a full host that
 // could run it — the farthest wake first, since that slot sits idle longest.
-// Pauses already in flight (an unacked `pauseSleeper`) count against the need, so
-// a beat-by-beat drain never pauses a second sleeper for the same ticket.
+// Each pause is ATTRIBUTED to the ticket it answers (`pauseFor`), so a drain every
+// beat never pauses a second sleeper for the same ticket, and a ticket queued
+// while another's pause is still in flight gets its own. A pause in flight whose
+// ticket no longer waits (dispatched elsewhere, cancelled, or one queued before
+// the stamp) is adopted by a waiting ticket that could run on that host, rather
+// than pausing another sleeper for it.
 function pauseSleepersFor(waiting, now = Date.now(), rows) {
   if (!waiting.length) return;
-  let need = waiting.length;
+  const waitingKeys = new Set(waiting.map(({ e }) => ticketQueueKey(e.siteKey, e.issueKey)));
+  const answered = new Set();
+  const orphans = [];
   // Only an ONLINE host's pause can free a slot soon; one stranded on a host that
   // went quiet must not starve the tickets waiting elsewhere (reclaim withdraws
   // it if it was never handed over).
-  for (const a of Object.values(agents)) {
+  for (const [host, a] of Object.entries(agents)) {
     if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
-    need -= (a.commands || []).filter((c) => c && c.type === "pauseSleeper").length;
+    for (const c of a.commands || []) {
+      if (!c || c.type !== "pauseSleeper") continue;
+      if (typeof c.pauseFor === "string" && waitingKeys.has(c.pauseFor)
+          && !answered.has(c.pauseFor)) answered.add(c.pauseFor);
+      else orphans.push({ host, c });
+    }
   }
   for (const { e, repo } of waiting) {
-    if (need <= 0) return;
+    const key = ticketQueueKey(e.siteKey, e.issueKey);
+    if (answered.has(key)) continue;
+    const fits = (host) => findTicketHost(e.siteKey, repo, e.issueKey,
+      { auto: e.source === "auto", onlyHost: host, rows }).host === host;
+    const adopt = orphans.findIndex((o) => fits(o.host));
+    if (adopt >= 0) {
+      orphans[adopt].c.pauseFor = key;
+      orphans.splice(adopt, 1);
+      answered.add(key);
+      continue;
+    }
     let best = null;
     for (const [host, a] of Object.entries(agents)) {
       if (!pauseSleepersAvailable(a) || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
@@ -13428,18 +13451,15 @@ function pauseSleepersFor(waiting, now = Date.now(), rows) {
         && !sleeperResumeHeld(host, s.id, now)
         && !sleeperHasQueuedPaneCommand(a, s.id)
         && !sleeperMigrating(host, a, s.id));
-      if (!sleepers.length) continue;
-      const fit = findTicketHost(e.siteKey, repo, e.issueKey,
-        { auto: e.source === "auto", onlyHost: host, rows });
-      if (fit.host !== host) continue;
+      if (!sleepers.length || !fits(host)) continue;
       for (const s of sleepers) {
         if (!best || s.session.wakeAt > best.s.session.wakeAt) best = { host, s };
       }
     }
     if (!best) continue;
-    queueCommand(best.host, { type: "pauseSleeper", sessionId: best.s.id });
+    queueCommand(best.host, { type: "pauseSleeper", sessionId: best.s.id, pauseFor: key });
     noteSleeperTried(sleeperPauseTried, best.host, best.s.id, now);
-    need -= 1;
+    answered.add(key);
     console.log(`sleeper slot: pausing ${logName(best.s.id)} on ${logName(best.host)}`
       + ` for ${logName(e.issueKey)}`);
   }

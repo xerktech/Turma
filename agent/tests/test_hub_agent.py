@@ -17866,6 +17866,41 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         sm._note_quiet(sid, {"paneBusy": False})
         sm._deliver_due_wakes(now_ms=self.NOW + 120_000)
         self.assertEqual(sm.input_queue, [], "still asleep until its wake")
+        # The operator chose to look at it: never paused again ahead of that wake,
+        # even by a hub that restarted and forgot its own in-memory hold.
+        sm._note_quiet(sid, {"paneBusy": False, "agents": [], "loop": None})
+        self.assertFalse(sm.pause_sleeper(sid, now_ms=self.NOW + 180_000))
+        self.assertIs(sm._find(sid), back)
+        # A wake it asks for itself is an ordinary sleep again: pausable.
+        sm._ingest_wake_request(back, {"wakeAt": self.NOW + 7200_000, "wakeReason": "new"})
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW + 180_000))
+
+    def test_a_resumed_sleeper_does_not_read_its_finished_shell_as_live(self):
+        # The post-resume back-scan starts from a fresh scan state and re-reads the
+        # whole transcript: a background shell that finished before the pause must
+        # come back finished, not as live work that would hold the session busy.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        path = os.path.join(self.proj, f"{sess['claudeSessionId']}.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES + [
+            {"type": "queue-operation", "operation": "enqueue",
+             "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                        "<status>completed</status>\n</task-notification>"}])
+        def probe(rec):
+            with mock.patch.object(ha, "_pane_status", return_value=(False, None, None)), \
+                    mock.patch.object(sm, "_session_git", return_value=({}, {})):
+                return sm._session_payload(rec, refresh=False)
+        probe(sess)
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+        due = self.NOW + 3600_000
+        with mock.patch.object(ha.time, "time", return_value=due / 1000):
+            sm.resume(sid)
+        back = sm._find(sid)
+        self.assertEqual(back["status"], "running")
+        first = probe(back)
+        self.assertEqual(first["session"]["agents"], [])
+        self.assertEqual(sm._quiet[sid], (True, True))
 
     def test_a_picker_resume_unpauses_and_a_later_wake_is_refused(self):
         # The Resume picker resumes by TRANSCRIPT (a new session id) and leaves

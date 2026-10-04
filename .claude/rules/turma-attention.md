@@ -204,8 +204,13 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   and every `masterOrchestrationTick`, since the drain returns early on an empty queue) queue
   ordinary commands: `pauseSleeper` and `resume` + `wake:true`. Never a kill/resume on the beat.
 - **One pause per still-waiting ticket.** Waiting = entries the drain just held `capacity`
-  (`waitingFull`). Unacked `pauseSleeper` commands on ONLINE hosts count against that need, so a
-  drain every beat never pauses a second sleeper for the same ticket.
+  (`waitingFull`). Each pause is stamped with the ticket it answers (`pauseFor`, its queue key,
+  hub-only like `ticketSite` — `INTERNAL_COMMAND_FIELDS`), and a ticket with an unacked pause on
+  an ONLINE host is skipped, so a drain every beat never pauses a second sleeper for it.
+  - **Never a fleet-wide count**: subtracting all pauses in flight let the FIRST waiting ticket
+    take a second sleeper while a newer one (another org, another repo) got none.
+  - **An orphan pause is adopted, not duplicated**: one whose ticket no longer waits (dispatched,
+    cancelled, unstamped) is re-stamped to a waiting ticket that fits its host.
 - **A pause never handed to a host that went offline is withdrawn** (`reclaimStrandedTicketSpawns`,
   no `deliveredAt`): the demand it answered may be gone when the host returns, and the agent
   re-checks only the sleeper, never the queue. A delivered one is left (it has likely run).
@@ -223,6 +228,8 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
 - **An operator Resume on a paused row holds off re-pausing until that wake**
   (`sleeperResumeHold`, set by the resume route): the carried wake makes it a sleeper again, and
   the next drain would otherwise pause it while the operator reads it.
+  - That map is in-memory, so the AGENT holds it too (`wakeResumedAt` refuses a pause): a hub
+    restart or leader handover then costs one refused pause per `SLEEPER_RETRY_MS`, never a kill.
 - **A refused or unacted command is not re-sent for `SLEEPER_RETRY_MS`** (`sleeperPauseTried`/
   `sleeperWakeTried`/`sleeperUnpauseTried`, in-memory, bounded): an agent that disagreed acks and keeps the session.
 - **The capability gates the pause** (`normalizePauseSleepers`, strict boolean, a

@@ -26691,6 +26691,12 @@ class SessionManager:
             return "it is not sleeping"
         if at - now_ms < PAUSE_SLEEPER_MIN_AHEAD_MS:
             return "its wake is less than 10 minutes away"
+        # Resumed from a pause AHEAD of its carried wake: an operator chose to look
+        # at it. The hub holds it too, but only in memory — this record outlives a
+        # hub restart or leader handover. A new wake request or the carried wake
+        # firing clears the mark.
+        if sess.get("wakeResumedAt") is not None:
+            return "it was resumed ahead of its wake"
         quiet = self._quiet.get(sess.get("id"))
         if not quiet or not quiet[0]:
             return "its pane is busy or shows a question or dialog"

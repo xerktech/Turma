@@ -23833,6 +23833,44 @@ test("XERK-1575: a full host pauses its FARTHEST quiet sleeper, one per waiting 
   ticketQueue.length = 0; delete agents[host];
 });
 
+test("XERK-1575: each pause answers ONE ticket — a second ticket queued mid-pause gets its own", async () => {
+  resetAutoStart(); resetSleepers();
+  const siteA = "slptwoa.atlassian.net", siteB = "slptwob.atlassian.net";
+  const sleepy = { autoStart: false, capacity: FULL, pauseSleepers: { available: true } };
+  const triaged = (key) => ({ key, summary: "Fix it", statusCategory: "todo",
+    repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } });
+  await asBeat("slpTwoA", siteA, { ...sleepy, tickets: [triaged("ENG-5"), triaged("ENG-6")],
+    sessions: [sleeperSession("a1", 60 * 60_000), sleeperSession("a2", 3 * 60 * 60_000)] });
+  await asBeat("slpTwoB", siteB, { ...sleepy,
+    sessions: [sleeperSession("b1", 60 * 60_000), sleeperSession("b2", 3 * 60 * 60_000)] });
+  await startTicket(siteA, "ENG-5");
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds("slpTwoA", "pauseSleeper").map((c) => c.sessionId), ["a2"]);
+  // Org B's ticket arrives while A's pause is still unacked: B's host pauses for
+  // it, and A's ticket — already answered — never gets a second sleeper. (The
+  // fleet-wide count paused a1 for A here and nothing for B.)
+  assert.equal((await startTicket(siteB, "ENG-5")).body.queued, true);
+  drainTicketQueue();
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds("slpTwoA", "pauseSleeper").map((c) => c.sessionId), ["a2"]);
+  assert.deepEqual(sleeperCmds("slpTwoB", "pauseSleeper").map((c) => c.sessionId), ["b2"]);
+  // The attribution is hub-only: never on the wire.
+  invalidateAgentsCache();
+  const r = await request("GET", "/api/agents", { headers: userHeaders });
+  const wire = JSON.parse(r.raw).agents.find((a) => a.key === "slpTwoA");
+  assert.ok(wire.commands.some((c) => c.type === "pauseSleeper"));
+  assert.ok(wire.commands.every((c) => !("pauseFor" in c)));
+  // A pause whose ticket no longer waits (cancelled here) is ADOPTED by the next
+  // ticket that fits its host, rather than pausing another sleeper for it.
+  ticketQueue.splice(0, ticketQueue.length, ...ticketQueue.filter((e) => e.issueKey !== "ENG-5"));
+  await startTicket(siteA, "ENG-6");
+  drainTicketQueue();
+  assert.deepEqual(sleeperCmds("slpTwoA", "pauseSleeper").map((c) => [c.sessionId, c.pauseFor]),
+    [["a2", `${siteA}\x00ENG-6`]]);
+  ticketQueue.length = 0; delete agents.slpTwoA; delete agents.slpTwoB;
+});
+
 test("XERK-1575: only a quiet sleeper, ten minutes out, on a capable full host that could run the ticket", async () => {
   const cases = {
     "wake too soon": { s: sleeperSession("x", 9 * 60_000) },

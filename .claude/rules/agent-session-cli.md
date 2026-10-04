@@ -119,6 +119,9 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   (`_exporting`, marked before the thread starts, cleared in `_export_session_tracked`'s finally),
   and an `exportSession` in the same batch counts like a pane command. Paused mid-move, the record
   here would be woken while the moved copy runs on the target — two claudes on one conversation.
+- **Never one resumed AHEAD of its carried wake**: `wakeResumedAt` still set (cleared when that wake
+  fires or a new wake.json lands) means an operator chose to look at it. This survives a hub
+  restart; the hub's own hold (`sleeperResumeHold`) does not.
 - **`TURMA_PAUSE_SLEEPERS=0`** refuses every pause and reports `pauseSleepers: {available:false}`.
 - **A paused record is exempt from `CLOSED_PER_REPO`** (up to `PAUSED_KEEP_MAX`, newest kept) and
   from the prune's closed-record sweep (`_poll_prunes`): evicted, it could never be woken; a
@@ -135,8 +138,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 - **`unpauseSleeper` → `unpause_sleeper`** drops `paused` from a closed record (any switch state):
   the hub sends it for a Done ticket, a conversation already running again (here or on another
   host), or a move/restore of it that handed off.
-- **A NEW wake.json drops `wakeResumedAt`** (`_ingest_wake_request`): the settle gate belongs to
-  the carried wake only.
+- **A NEW wake.json drops `wakeResumedAt`** (`_ingest_wake_request`): the settle gate and the
+  early-resume pause refusal belong to the carried wake only.
 - **`TURMA_RESUME_WAKE_PROMPT=1` rides a DUE wake on the launch instead** (`claude --resume <id> --
   <text>`, `_launch_tmux`'s positional prompt). OFF until a real pane proves `--resume` submits it.
 - The resume's `resumeRelaunch` stamp applies: a doomed `--resume` relaunches fresh, and that fresh
