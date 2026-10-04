@@ -274,7 +274,7 @@ test("dashboard liveState: a looping session reads stalled, not working", () => 
   const st = liveState({ session: live, attention }, onlineHost, NOW);
   assert.equal(st.label, "stalled · repeating Bash ×5");
   assert.equal(st.cls, "sess-stalled");
-  assert.equal(st.detail, "for 3m");
+  assert.equal(st.detail, "for\u00a03m");
   assert.equal(liveState({ session: { ...live, loop: undefined }, attention }, onlineHost, NOW).label, "working");
 });
 
