@@ -1451,6 +1451,79 @@ else
 fi
 rm -rf "$root"
 
+# 34b. A killed run runs no RETURN trap, so its staging dir (and any downloaded
+#      tarball) is left in TMPDIR; the next run of the same prefix sweeps it —
+#      never another prefix's, another user's, or a still-live updater's, and
+#      also through a symlinked TMPDIR (XERK-1489).
+root="$(mktemp -d)"; prefix="$root/prefix"; bin="$prefix/bin"; mkdir -p "$bin" "$root/realtmp"
+ln -s "$root/realtmp" "$root/tmp"
+cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
+echo "0.3.0" >"$prefix/VERSION"
+install_fake_restart "$bin"; install_hanging_gh "$bin"
+tag="$(prefix_tag "$prefix")"
+mkdir "$root/tmp/turma-update.othertag0000.1.keepme"
+# A live updater's stage (a process whose cmdline names this updater).
+bash -c 'sleep 60; :' turma-agent-update & live_pid=$!
+mkdir "$root/tmp/turma-update.$tag.$live_pid.livexx"
+# Another user's same-tag entry; only plantable as root (the case that matters).
+foreign=""
+if [ "$(id -u)" = 0 ] && id nobody >/dev/null 2>&1; then
+  foreign="$root/tmp/turma-update.$tag.1.foreign"
+  mkdir "$foreign"; chown nobody "$foreign"
+fi
+stage_run() {
+  HOME="$root/home" TMPDIR="$root/tmp" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+    TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=2 TURMA_RUN_KILL_GRACE=1 \
+    "$bin/turma-agent-update" --boot >/dev/null 2>&1 || true
+  rm -f "$root/home/.turma/last-update-check."* 2>/dev/null || true  # unthrottle the next --boot
+}
+own_stages() {
+  find "$root/realtmp" -mindepth 1 -maxdepth 1 -name "turma-update.$tag.*" \
+    ! -name "*.livexx" ! -name "*.foreign" -printf "%f\n"
+}
+stage_run; first="$(own_stages)"
+stage_run; second="$(own_stages)"
+if [ -n "$first" ] && [ ! -e "$root/tmp/$first" ] && [ "$(printf '%s\n' "$second" | wc -l)" = 1 ]; then
+  pass "a killed run's staging dir is swept by the next run, via a symlinked TMPDIR ($first -> $second)"
+else
+  fail "killed runs' staging dirs accumulate (first='$first' now='$second')"
+fi
+if [ -d "$root/tmp/turma-update.othertag0000.1.keepme" ]; then
+  pass "the sweep leaves another prefix's staging dir alone"
+else
+  fail "the sweep removed another prefix's staging dir"
+fi
+if [ -d "$root/tmp/turma-update.$tag.$live_pid.livexx" ]; then
+  pass "the sweep leaves a still-live updater's staging dir alone"
+else
+  fail "the sweep removed a live updater's staging dir"
+fi
+if [ -n "$foreign" ]; then
+  if [ -d "$foreign" ]; then
+    pass "the sweep leaves another user's same-prefix dir alone"
+  else
+    fail "the sweep removed another user's dir"
+  fi
+fi
+kill "$live_pid" 2>/dev/null || true; wait "$live_pid" 2>/dev/null || true
+# The updater's OWN stage must name a pid that stays alive while the run does,
+# or the skip above never protects a real run (a $BASHPID read inside the
+# mktemp substitution named the dead substitution child).
+HOME="$root/home" TMPDIR="$root/tmp" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
+  TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_RUN_DEADLINE=20 TURMA_RUN_KILL_GRACE=1 \
+  "$bin/turma-agent-update" --boot >/dev/null 2>&1 &
+run_pid=$!
+cur=""; i=0
+while [ -z "$cur" ] && [ "$i" -lt 50 ]; do sleep 0.2; cur="$(own_stages)"; i=$((i + 1)); done
+stage_pid="${cur#turma-update."$tag".}"; stage_pid="${stage_pid%%.*}"
+if [ -n "$cur" ] && kill -0 "$stage_pid" 2>/dev/null; then
+  pass "a running updater's stage names its own live pid ($stage_pid)"
+else
+  fail "a running updater's stage names a dead pid (stage='$cur')"
+fi
+stop_loop "$run_pid" "$bin"
+rm -rf "$root"
+
 # 35. A holder that is ALREADY wedged (deadline disabled, so only the reclaim can
 #     save it) is detected by age, killed, and the lock retaken — and the
 #     reclaiming check then completes a real update. This is the end-to-end path

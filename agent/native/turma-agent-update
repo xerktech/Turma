@@ -925,17 +925,52 @@ try_legacy() {  # <cur> <stage>
   verify_and_install "$dl" "$latest" || true
 }
 
+# Remove the staging dirs earlier runs of this prefix left when they were
+# killed (XERK-1489). Each stage is named turma-update.<tag>.<pid>.<rand> by the
+# run_once that made it; one whose pid is still a live updater is skipped, since
+# the lock alone doesn't prove it dead: a different $HOME means a different
+# lock, and a reclaim kills only the holder, not its `( dispatch_locked )`
+# subshell. A glob, not find: find never descends a symlinked TMPDIR. Only real
+# dirs we own are touched — /tmp is shared and a root updater must never delete
+# another user's entry.
+sweep_stages() {
+  local base="${TMPDIR:-/tmp}" d pid
+  for d in "$base/turma-update.$PREFIX_TAG".*; do
+    if [ ! -d "$d" ] || [ -L "$d" ] || [ ! -O "$d" ]; then continue; fi
+    pid="${d#"$base/turma-update.$PREFIX_TAG."}"; pid="${pid%%.*}"
+    case "$pid" in
+      ''|*[!0-9]*) ;;
+      *) if kill -0 "$pid" 2>/dev/null; then
+           # PID-reuse guard as in reclaim_stale_lock; without /proc, assume live.
+           [ -r "/proc/$pid/cmdline" ] || continue
+           tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null \
+             | grep -q 'turma-agent-update' && continue
+         fi ;;
+    esac
+    rm -rf "$d" 2>/dev/null || true
+  done
+}
+
 # The agent self-update. Claude Code and dsh are NOT part of this — see the
 # Claude Code / dsh sections for why they only ever run at agent start.
 run_once() {
-  local cur stage
+  local cur stage me
   # Stamp FIRST, so a run that then wedges or dies still bounds the next
   # start-fired check.
   stamp_now "$STAMP"
   refresh_update_timer "$PREFIX"
 
   cur="$(installed_version)"
-  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.XXXXXX")"
+  # A RETURN trap never fires on a kill, so a run the watchdog, a lock reclaim
+  # or `systemctl stop` terminates would leave its stage (and any downloaded
+  # tarball) in TMPDIR forever (XERK-1489). No TERM trap instead: bash defers a
+  # trapped signal until its foreground child exits, so a TERM to a run wedged
+  # on a hung child would no longer end it, and a KILL runs no trap anyway.
+  sweep_stages
+  # Read OUTSIDE the $(...): inside it, $BASHPID is the short-lived substitution
+  # child, and a stage named for a dead pid is swept from under a live run.
+  me="$BASHPID"
+  stage="$(mktemp -d "${TMPDIR:-/tmp}/turma-update.$PREFIX_TAG.$me.XXXXXX")"
   # shellcheck disable=SC2064
   trap "rm -rf '$stage' '$PREFIX.update'" RETURN
 

@@ -155,6 +155,14 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
     - Telemetry: `note_agent_check` counts consecutive skipped/errored agent checks
       (`update-skip-count`) and logs a WARNING every `TURMA_UPDATE_STRAND_WARN_AT` (default 3) so a
       stuck poller shows in `update.log` without a live pod inspection.
+  - **Each run sweeps the staging dirs killed runs left (XERK-1489)** — a killed run (watchdog
+    `-k` KILL, reclaim, `systemctl stop`) runs no RETURN trap and leaked `$TMPDIR/turma-update.*` with
+    its tarball. Stages are `turma-update.<tag>.<pid>.*`; `sweep_stages` skips a live updater's pid
+    because the lock does not prove it dead (another `$HOME` = another lock; a reclaim kills the
+    holder, not its `( dispatch_locked )` subshell). It uses a glob, not find, because find won't
+    descend a symlinked TMPDIR. It only touches our own real dirs.
+    - Don't swap the sweep for a TERM trap: bash defers a trapped TERM until its foreground child
+      exits, so a TERMed run wedged on a hung child would no longer end. Test: 34b.
   - `install_payload` **requires `hooks/` in the payload before swapping** — the swap deletes
     installed hooks first, and a missing hook command is a non-blocking hook (guard fails open
     silently while VERSION/restart/log all report clean).
