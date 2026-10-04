@@ -4,6 +4,8 @@ paths:
   - "agent/tests/test_hub_agent.py"
   - "agent/hooks/permlog.py"
   - "agent/tests/test_permlog.py"
+  - "agent/hooks/guard.py"
+  - "agent/tests/test_guard.py"
 ---
 
 # The permission ledger — agent half (XERK-1563, epic XERK-1560)
@@ -217,6 +219,10 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
   - Pinned: `PLAIN_GATE_PROBES` + `JUDGEABLE` (`test_only_plain_commands_reach_the_model`; npm ci,
     pytest -q, docker build, cargo test pass). Residual: a script's contents (`npm test`, `./x`
     written by an EARLIER call) are not on the command line; the model sees only its name.
+  - **Known open gap: XERK-1595** (shipped by operator decision, 2026-10-04). A quoted option value
+    some programs hand to a shell (`tar --to-command`, `make --eval`, `git -c core.sshCommand`, …)
+    reads as plain, so a command hidden there can reach the model. Until it is fixed the model's
+    own reading is the last check; never describe the gate as complete.
 - **The never-list FAILS CLOSED by command FAMILY, never by flag spelling** (coordinator decision,
   2026-10-04: three review rounds each found one more spelling — `--mirr`, a quoted `'+feat'`, a
   glob refspec, REST `/merges`, GraphQL `mergePullRequest`, a curl to api.github.com). Stood whole:
@@ -297,3 +303,35 @@ FIFO/symlink, rotation, `-SsE`, the judge req/ans dance); `TestPermissionLedgerE
 grants/permissions dir cases, pick order, the per-sid call cap, and the REAL `run_forever` loop
 feeding `permissionPolicy` from both replies); the `test_guard_settings.py`
 pins (deny equality, every-hook-event `-SsE`, the PreToolUse matcher list, `--judge` wiring).
+
+## The judge's one-shot grant (guard.py)
+
+- **The judge's one-shot grant is guard.py's ONLY `allow`** (XERK-1566, `consume_grant`). Consulted
+  only AFTER `decide()` allowed the command (every hard deny wins), only for Bash, inside main()'s
+  fail-CLOSED try. `~/.turma/grants/<TURMA_SESSION_ID>/<sha256(command)>` must be a regular file
+  (`O_NONBLOCK|O_NOFOLLOW`, bounded; the session dir not a symlink) naming this session + exact
+  command, unexpired (`exp` at most `GRANT_TTL_MAX_SEC` out). Unlinked BEFORE allowing, so one
+  grant allows one call. Honoured ONLY by a guard launched with `--grants`, which
+  `build_guard_settings` adds while the judge is on — the switch rides each launch's settings, since
+  a session's env comes from the long-lived tmux server, not the manager. A session launched before
+  `TURMA_PERMISSION_JUDGE=0` keeps the flag until relaunched (the judge then writes no grant).
+  - **Accepted residual: the grant dir is same-uid and Bash can write it.** A model that learns the
+    protocol can self-grant one command past the auto-mode classifier — or drop a judge answer that
+    makes permlog.py allow a PermissionRequest dialog — the same class as `echo >
+    ~/.turma/qwen-guard.json`. Mitigations, none sealing it: `Edit(~/.turma/grants/**)` and
+    `Edit(~/.turma/permission-policy.md)` denies (file tools only, in the equality pin); the grant
+    path/protocol is never named in any reason or prompt a model reads; every judgement is a ledger
+    row (`kind: judged`); the hard denies still win; the never-list stands any command naming
+    `.turma/grants`. Never describe the judge as un-forgeable. A session can also plant a request
+    under ANOTHER running session's sid (capped per sid, `agent-permissions.md`); the manager
+    never follows a link in the grant dir it sweeps.
+  - **Before any model call the judge stands non-plain commands and never-list FAMILIES** (any push,
+    ref rewrite, PR merge, non-read `gh api`, prod mutators), matched AFTER guard.py's `_expand_both`
+    unwrapping, so a change to that unwrapping changes what the judge sees. Rules + tests: the
+    never-list and plain-command sections above. Never describe the gate as complete.
+  - **Real-host spike NOT run** (no agent host here): does `PermissionDenied`'s `retry: true`
+    re-enter `PreToolUse` on the retried call, with the grant honoured? And what does the TUI show
+    for a classifier block? If the retry never reaches guard.py, the grant goes unconsumed, expires
+    (120s) and is swept; the classifier blocks again — nothing runs that did not before. The
+    fallback is then the PermissionRequest path alone plus the ledger's allow rules. Record the
+    answers here. Tests: `TestJudgeGrants` (`test_guard.py`).

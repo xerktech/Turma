@@ -417,46 +417,5 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `agent-permissions.md`.
   - With `--judge` (XERK-1566, unless `TURMA_PERMISSION_JUDGE=0`) it also hands a Bash call to the
     manager's permission judge and waits (timeout 90s); judge contract in `agent-permissions.md`.
-- **The judge's one-shot grant is guard.py's ONLY `allow`** (XERK-1566, `consume_grant`). Consulted
-  only AFTER `decide()` allowed the command (every hard deny wins), only for Bash, inside main()'s
-  fail-CLOSED try. `~/.turma/grants/<TURMA_SESSION_ID>/<sha256(command)>` must be a regular file
-  (`O_NONBLOCK|O_NOFOLLOW`, bounded; the session dir not a symlink) naming this session + exact
-  command, unexpired (`exp` at most `GRANT_TTL_MAX_SEC` out). Unlinked BEFORE allowing, so one
-  grant allows one call. Honoured ONLY by a guard launched with `--grants`, which
-  `build_guard_settings` adds while the judge is on — the switch rides each launch's settings, since
-  a session's env comes from the long-lived tmux server, not the manager. A session launched before
-  `TURMA_PERMISSION_JUDGE=0` keeps the flag until relaunched (the judge then writes no grant).
-  - **Accepted residual: the grant dir is same-uid and Bash can write it.** A model that learns the
-    protocol can self-grant one command past the auto-mode classifier — or drop a judge answer that
-    makes permlog.py allow a PermissionRequest dialog — the same class as `echo >
-    ~/.turma/qwen-guard.json`. Mitigations, none sealing it: `Edit(~/.turma/grants/**)` and
-    `Edit(~/.turma/permission-policy.md)` denies (file tools only, in the equality pin); the grant
-    path/protocol is never named in any reason or prompt a model reads; every judgement is a ledger
-    row (`kind: judged`); the hard denies still win; the never-list stands any command naming
-    `.turma/grants`. Never describe the judge as un-forgeable. A session can also plant a request
-    under ANOTHER running session's sid (capped per sid, `agent-permissions.md`); the manager
-    never follows a link in the grant dir it sweeps.
-  - **The judge's never-list is FAMILY-level and fails closed** — it stands (before any model call)
-    ANY `git push`, any git ref rewrite (branch delete/move/force, update-ref, tag -d, symbolic-ref,
-    a push/mirror config or alias, local `checkout -B`/fetch refspecs), ANY `gh pr merge`, ANY gh
-    alias/extension (an unknown first word), ANY `gh api` that is not a plain read (any
-    field/input/method flag, every `graphql`), any HTTP client to github.com or to a destination
-    from a file/stdin, and terraform/
-    kubectl/helm/argocd mutators — matched on head + subcommand AFTER this file's own unwrapping
-    (`_expand_both`), and on anything shlex cannot parse. Never a list of flag spellings: each
-    review round found one more. Families + tests: `agent-permissions.md`.
-  - **Only plain commands reach the model** (`_judge_plain_reason`, in front of the families): a
-    deny list cannot cover what bash can spell (`/usr/bin/g[i]t`, `hash -p`, `ln -s`, `gh pr
-    merg*`, a flag between noun and verb). A command the strict lexer cannot fully read stands
-    before any model call, as does one running a program from an argument (`ssh h '…'`, `docker
-    exec c sh -c …`, `uv run …`) — rules + tests in `agent-permissions.md`.
-  - **A family stands however its words ARRIVE or are SPELLED**: fed from stdin/a file (`… | xargs
-    git`, `xargs -a f gh`, any `parallel`) — `_expand_both` leaves only a bare `git` there — and an
-    HTTP host a client would rewrite (percent-encoded, IDN dots, full-width, a curl glob) or route
-    past (`--connect-to`, `--resolve`, `-H @file`). Both stand before any model call.
-  - **Real-host spike NOT run** (no agent host here): does `PermissionDenied`'s `retry: true`
-    re-enter `PreToolUse` on the retried call, with the grant honoured? And what does the TUI show
-    for a classifier block? If the retry never reaches guard.py, the grant goes unconsumed, expires
-    (120s) and is swept; the classifier blocks again — nothing runs that did not before. The
-    fallback is then the PermissionRequest path alone plus the ledger's allow rules. Record the
-    answers here. Tests: `TestJudgeGrants` (`test_guard.py`).
+- **The judge's one-shot grant is guard.py's ONLY `allow`** (XERK-1566, `consume_grant`, `--grants`):
+  the grant contract, the same-uid residual and the judge's gate live in `agent-permissions.md`.
