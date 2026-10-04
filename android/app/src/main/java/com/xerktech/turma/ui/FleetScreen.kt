@@ -546,8 +546,10 @@ private fun SessionCard(
                         val askedFor = if (state == LiveState.WAITING && session.attention?.state == "needs-you:question") needsFor else ""
                         val stateFor = if (needs != null) needsFor else askedFor
                         val stateLabel = needs ?: liveStateLabel(state, session.session)
+                        // The age's "·" is glued by no-break spaces (web index.html
+                        // stateAge), so a line never ends on a dangling "·".
                         Text(
-                            if (stateFor.isEmpty()) stateLabel else "$stateLabel · $stateFor",
+                            if (stateFor.isEmpty()) stateLabel else "$stateLabel\u00A0·\u00A0$stateFor",
                             style = MaterialTheme.typography.bodySmall,
                             color = if (needs != null && com.xerktech.turma.core.attentionStalled(session.attention)) MaterialTheme.colorScheme.error else muted,
                             maxLines = 1,

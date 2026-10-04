@@ -48,7 +48,7 @@ function loadDashboard() {
   const fn = new Function(
     "localStorage", "document", "window", "EventSource", "fetch",
     "setInterval", "clearInterval", "setTimeout", "clearTimeout", "location", "matchMedia", "TurmaOrg", "globalThis",
-    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens };\n;globalThis.__setRender = (f) => { render = f; };"
+    src + "\n;globalThis.__dash = { liveState, prBadgeHtml, fmtTokens, stateAge };\n;globalThis.__setRender = (f) => { render = f; };"
   );
   fn(g.localStorage, g.document, g.window, g.EventSource, g.fetch,
      g.setInterval, g.clearInterval, g.setTimeout, g.clearTimeout, g.location, g.matchMedia, g.TurmaOrg, g);
@@ -111,7 +111,7 @@ test("dashboard liveState: waiting shells hold, stall, and never read working", 
   assert.notEqual(held.busy, true);
   const timed = liveState(sess({ paneBusy: false, transcriptAgeSec: 5,
     agents: [{ type: "shell", kind: "wait-timed", eta: NOW + 5 * 60 * 1000 }] }), onlineHost, NOW);
-  assert.equal(timed.label, "⏳ waiting · 5m left");
+  assert.equal(timed.label, "⏳ waiting\u00a0·\u00a05m left");
   const stalled = liveState(sess({ paneBusy: false, transcriptAgeSec: 50 * 60, agents: [ci] }), onlineHost, NOW);
   assert.equal(stalled.label, "stalled · Watch CI");
   // XERK-1571: the danger tone it has on every surface.
@@ -134,16 +134,16 @@ test("dashboard liveState: a wait with no ETA says how long it has waited", () =
   const { liveState } = loadDashboard();
   const ci = { type: "shell", label: "Watch CI on PR #412", kind: "wait-external", startedAt: NOW - 12 * 60 * 1000 };
   const ciCard = liveState(sess({ paneBusy: false, transcriptAgeSec: 12 * 60, agents: [ci] }), onlineHost, NOW);
-  assert.equal(ciCard.label, "⏳ waiting · Watch CI on PR #412 · 12m");
+  assert.equal(ciCard.label, "⏳ waiting · Watch CI on PR #412\u00a0·\u00a012m");
   // Screenshot defect: "· 12m · last write 12m ago" was two ages for one wait.
   // The wait's own age is the card's one clock.
   assert.equal(ciCard.detail, "");
   const two = [{ ...ci, label: "" }, { type: "shell", kind: "wait-timed", startedAt: NOW - 20 * 60 * 1000 }];
   assert.equal(liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: two }), onlineHost, NOW).label,
-    "⏳ waiting on 2 background shells · 20m");
+    "⏳ waiting on 2 background shells\u00a0·\u00a020m");
   const timed = { ...ci, kind: "wait-timed", eta: NOW + 11 * 60 * 1000 };
   const timedCard = liveState(sess({ paneBusy: false, transcriptAgeSec: 5, agents: [timed] }), onlineHost, NOW);
-  assert.equal(timedCard.label, "⏳ waiting · Watch CI on PR #412 · 11m left");
+  assert.equal(timedCard.label, "⏳ waiting · Watch CI on PR #412\u00a0·\u00a011m left");
   // Time LEFT is not an age: the last write still shows beside it.
   assert.match(timedCard.detail, /^last write 5s/);
   // A wait row with no startedAt (an older agent): the last write is its only clock.
@@ -376,4 +376,18 @@ test("dashboard fmtTokens: the unit boundary is inclusive, as everywhere else", 
   assert.equal(fmtTokens(1_000), "1.0k");
   assert.equal(fmtTokens(1_000_000), "1.0M");
   assert.equal(fmtTokens(1_000_000_000), "1.0B");
+});
+
+// Operator screenshot review (XERK-1571): a State row broke at its " · ", leaving
+// a line ending on a dangling "·" and the age alone on the next. The dot is glued
+// to the label's last word by a no-break space and to the age by a no-wrap span.
+test("dashboard stateAge: the age's dot never ends a line", () => {
+  const { stateAge } = loadDashboard();
+  assert.equal(stateAge("for\u00a022m"), '\u00a0<span class="state-age">·\u00a0for\u00a022m</span>');
+  assert.equal(stateAge("last write <1m ago"), '\u00a0<span class="state-age">·\u00a0last write &lt;1m ago</span>');
+  assert.equal(stateAge(""), "");
+  const html = fs.readFileSync(path.join(__dirname, "..", "public", "index.html"), "utf8");
+  assert.ok(html.includes("${stateAge(live.detail)}"), "the State row uses it");
+  assert.ok(!html.includes('live.detail ? " · "'), "no breakable separator left");
+  assert.match(html, /\.state-age \{ white-space: nowrap; \}/);
 });

@@ -295,6 +295,8 @@
      Ready-for-review accent, stalled in the danger colour it has everywhere. */
   .sess-review { color: var(--accent-text); }
   .sess-stalled { color: var(--critical-text); }
+  /* A State row's "· for 22m" never breaks at its dot (XERK-1571): see stateAge. */
+  .state-age { white-space: nowrap; }
 
   .sess-dying { color: var(--critical); }
 
@@ -1175,6 +1177,13 @@ function attentionFor(att, now, state) {
 }
 // "💤 sleeping until 14:05 · check CI" — a session-CLI wake and, when the
 // session gave one, what it will check then. Same as sessions.html.
+// A State row's age after its label: " · for 22m", glued so a narrow card never
+// ends a line on a dangling "·" with the age alone on the next (XERK-1571). The
+// no-break space before the dot keeps it on the label's last word; the no-wrap
+// span keeps "· for 22m" whole. "" for no age.
+function stateAge(text) {
+  return text ? `\u00a0<span class="state-age">·\u00a0${esc(text)}</span>` : "";
+}
 function sleepLabel(s, now) {
   const why = typeof s.wakeReason === "string" ? s.wakeReason.trim() : "";
   return "💤 sleeping until " + clockTime(s.wakeAt, now) + (why ? " · " + why : "");
@@ -1213,14 +1222,15 @@ function backgroundWaitLabel(rows, wait, now) {
   const word = wait.state === "stalled" ? "stalled" : "⏳ waiting";
   // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
   const what = waits.length === 1 && waits[0].label ? " · " + waits[0].label : "";
-  if (wait.eta != null && wait.eta > now) return word + what + " · " + ago(wait.eta - now).replace(/ ago$/, "") + " left";
+  // The age's "·" is glued by no-break spaces (XERK-1571): a line never ends on it.
+  if (wait.eta != null && wait.eta > now) return word + what + "\u00a0·\u00a0" + ago(wait.eta - now).replace(/ ago$/, "") + " left";
   // No ETA: how long it has been waiting, off the oldest wait row's startedAt
   // (XERK-1571) — a CI watch with no duration reads as if it just began. Not on
   // a STALL: how long it has been stalled is the hub's attention `since`, which
   // the card's State row shows; a second, different age here read as two stall
   // lengths for one session.
   const started = waitStarted(waits, now);
-  const since = started == null || wait.state === "stalled" ? "" : " · " + ago(now - started).replace(/ ago$/, "");
+  const since = started == null || wait.state === "stalled" ? "" : "\u00a0·\u00a0" + ago(now - started).replace(/ ago$/, "");
   if (what) return word + what + since;
   return word + " on " + waits.length + " background shell" + (waits.length === 1 ? "" : "s") + since;
 }
@@ -1993,8 +2003,8 @@ function sessCard(a, s, now) {
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${killing
         ? `<dt>State</dt><dd><b class="sess-dying">shutting down…</b></dd>`
-        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${live.detail ? " · " + esc(live.detail) : ""}</dd>`
-        : st === "queued" ? `<dt>State</dt><dd><b class="sess-queued">${esc(queuedReasonText(s.queuedReason))}</b>${s.queuedAt ? " · " + esc(ago(now - Date.parse(s.queuedAt))) : ""}</dd>`
+        : live ? `<dt>State</dt><dd><b class="${live.cls}">${esc(live.label)}</b>${stateAge(live.detail)}</dd>`
+        : st === "queued" ? `<dt>State</dt><dd><b class="sess-queued">${esc(queuedReasonText(s.queuedReason))}</b>${s.queuedAt ? stateAge(ago(now - Date.parse(s.queuedAt))) : ""}</dd>`
         : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
       ${live && live.ask ? `<dt>Permission</dt><dd>${esc(live.ask)}</dd>` : ""}
