@@ -4874,6 +4874,12 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     # the fix. The flags are the fix.
     # The hooks are stdlib-only by contract, so neither flag can break them.
     guard_command = f'"{python_exe}" -SsE "{guard_path}"'
+    # The judge's one-shot grants (XERK-1566) are honoured only by a guard
+    # launched with this flag, so TURMA_PERMISSION_JUDGE=0 reaches every
+    # session launched after it — the session's env would not (the tmux server
+    # keeps the env it started with).
+    if PERMISSION_JUDGE:
+        guard_command += " --grants"
     fileguard_path = fileguard_path or fileguard_script_path()
     ask_command = f'"{python_exe}" -SsE "{ask_path}"'
     fileguard_command = f'"{python_exe}" -SsE "{fileguard_path}"'
@@ -11503,8 +11509,21 @@ JUDGE_POLL_SEC = 0.5
 # A request older than this is one its hook has (nearly) given up on: stood
 # without a model call. permlog.JUDGE_WAIT_SEC is 75.
 JUDGE_REQ_MAX_AGE_SEC = 60
+# A verdict must land within this many seconds of the request's `ts`, or it
+# stands: no model call starts that could finish past it. Under the hook's own
+# wait (permlog.JUDGE_WAIT_SEC, 75), so an `allow` is one the hook READ — the
+# ledger then knows that prompt never reached a human.
+JUDGE_ANSWER_BY_SEC = 70
 JUDGE_REQ_MAX_BYTES = 32 * 1024
 JUDGE_REQS_PER_PASS = 8
+# At most this many of one session's requests per pass (oldest first), so a
+# session that plants request files cannot starve every other session's.
+JUDGE_REQS_PER_SID = 2
+# The (sid, nonce) of recent `allow`s, read by the beat to keep a judge-
+# approved prompt from being counted as a human dialog. Bounded by count and
+# by age (past the beat's hook hold window an entry can match nothing).
+JUDGE_ALLOWED_MAX = 512
+JUDGE_ALLOWED_KEEP_SEC = 600
 JUDGE_OUTPUT_MAX = 8192
 JUDGE_REASON_MAX = 300
 JUDGE_ALIVE_EVERY_SEC = 10
@@ -11529,15 +11548,19 @@ JUDGE_VERDICTS = ("allow", "stand")
 # match inside one command segment. The guard's own destructive/policy
 # categories are checked too (`judge_never_reason`).
 _JUDGE_SEG = r"[^\n;&|]*"
+# Where a flag or ref ENDS: whitespace, the end, or shell punctuation — so
+# `(git push --mirror)`, `git push -f&&…` and a quoted `bash -c` form match too.
+_JUDGE_END = r"(?=[\s'\"`;&|()<>]|$)"
 _JUDGE_NEVER = (
     (re.compile(rf"\bgit\b{_JUDGE_SEG}\bpush\b{_JUDGE_SEG}"
-                r"(?:\s(?:--force\S*|-f|--mirror|--all|--delete|-d|--prune)(?=\s|$)"
-                r"|\s-[A-Za-z]*f[A-Za-z]*(?=\s|$)|\s[+:]\S)"),
+                r"(?:\s(?:--force\S*|-f|--mirror|--all|--delete|-d|--prune)" + _JUDGE_END +
+                r"|\s-[A-Za-z]*f[A-Za-z]*" + _JUDGE_END + r"|\s[+:]\S)"),
      "a force, mirror, all-branch, pruning or deleting push"),
-    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bpush\b{_JUDGE_SEG}[\s:/](?:main|master)(?=\s|$|:)"),
+    (re.compile(rf"\bgit\b{_JUDGE_SEG}\bpush\b{_JUDGE_SEG}[\s:/](?:main|master)"
+                r"(?=[\s'\"`;&|()<>:]|$)"),
      "a push naming main or master"),
     (re.compile(rf"\bgit\b{_JUDGE_SEG}\bbranch\b{_JUDGE_SEG}"
-                r"\s(?:-[A-Za-z]*[dD][A-Za-z]*|--delete)(?=\s|$)"),
+                r"\s(?:-[A-Za-z]*[dD][A-Za-z]*|--delete)" + _JUDGE_END),
      "deleting a branch"),
     (re.compile(r"\b(?:gh|glab)\s+(?:pr|mr)\s+merge\b"), "merging a PR/MR"),
     (re.compile(r"\baz\s+repos\s+pr\s+(?:update|complete)\b"), "completing a PR"),
@@ -11930,6 +11953,11 @@ def parse_permission_log_lines(blob, session_id):
             rules = row.get("rulesMatched")
             out["rulesMatched"] = [r[:200] for r in rules[:8] if isinstance(r, str)] \
                 if isinstance(rules, list) else []
+        # The judge request this prompt was handed over as (XERK-1566). It only
+        # ever HIDES a row the judge itself allowed, never approves anything.
+        nonce = row.get("judgeNonce")
+        if isinstance(nonce, str) and _JUDGE_NONCE_RE.fullmatch(nonce):
+            out["judgeNonce"] = nonce
         rows.append(out)
     return rows, end
 
@@ -18189,6 +18217,12 @@ class SessionManager:
         self._judge_lock = threading.Lock()
         self._judge_alive_at = None
         self._judge_swept_at = None
+        # (sid, nonce) -> when the judge ALLOWED it. Written by the judge
+        # worker, read by the beat's hook-row fold; `_judge_allowed_lock` is
+        # held across each side's check-or-record AND its ledger emit, so a
+        # classifier row's deny and its judge-corrected allow land in order.
+        self._judge_allowed = {}
+        self._judge_allowed_lock = threading.Lock()
         # GitHub clone-into-root state: the cached availability/repo-list block
         # (refreshed on a slow cadence, reported every beat) and in-flight/recent
         # clone jobs keyed by dest name (the Popen lives here; only a serializable
@@ -29852,17 +29886,15 @@ class SessionManager:
         for sid, rows in fetched.items():
             requests = []
             for hook in rows:
-                tuid = hook.get("toolUseId") or ""
                 if hook["event"] != "PermissionDenied":
-                    requests.append(hook)
+                    # A prompt the judge allowed never opened a dialog: its
+                    # `judged` row is the record, not a human `dialog` row.
+                    if not self._judge_was_allowed(sid, hook):
+                        requests.append(hook)
                     continue
-                self._emit_permission({
-                    "id": f"c-{sid}-{tuid or hook['ts']}", "sessionId": sid,
-                    "kind": "classifier-denied", "tool": hook["tool"],
-                    "head": hook["head"], "digest": hook["digest"],
-                    "toolUseId": tuid, "denyReason": hook.get("denyReason", ""),
-                    "openedAt": hook["ts"], "closedAt": hook["ts"],
-                    "answer": "deny"})
+                with self._judge_allowed_lock:
+                    self._emit_permission(self._classifier_row(
+                        sid, hook, self._judge_was_allowed(sid, hook)))
             for hook in sorted(requests, key=lambda h: h["ts"], reverse=True):
                 target = self._perm_open.get(sid)
                 fit = self._hook_fit(target, hook)
@@ -29885,6 +29917,27 @@ class SessionManager:
                 self._emit_unclaimed_request(sid, pend.pop(key)[0])
             if not pend:
                 del self._perm_hook_pending[sid]
+
+    def _judge_was_allowed(self, sid, hook):
+        """Whether the judge ALLOWED the request this hook row was handed over
+        as — the row's `judgeNonce` against the judge worker's record. Only
+        ever used to drop or correct a row, never to approve anything."""
+        nonce = hook.get("judgeNonce")
+        return bool(nonce) and (sid, nonce) in self._judge_allowed
+
+    @staticmethod
+    def _classifier_row(sid, hook, judged):
+        """The `classifier-denied` row for a PermissionDenied hook row. One the
+        judge then allowed ran after all (its `judged` row says by whom), so
+        its answer is allow. The hub upserts by id, so a correction re-sent
+        under the same id replaces a deny the beat already sent."""
+        tuid = hook.get("toolUseId") or ""
+        return {"id": f"c-{sid}-{tuid or hook['ts']}", "sessionId": sid,
+                "kind": "classifier-denied", "tool": hook["tool"],
+                "head": hook["head"], "digest": hook["digest"],
+                "toolUseId": tuid, "denyReason": hook.get("denyReason", ""),
+                "openedAt": hook["ts"], "closedAt": hook["ts"],
+                "answer": "allow" if judged else "deny"}
 
     @staticmethod
     def _hook_fit(row, hook):
@@ -29946,6 +29999,8 @@ class SessionManager:
                 row[key] = hook[key]
 
     def _emit_unclaimed_request(self, sid, hook):
+        if self._judge_was_allowed(sid, hook):
+            return                  # the judge answered it; no dialog opened
         self._emit_permission({
             "id": f"r-{sid}-{hook.get('toolUseId') or hook['ts']}", "sessionId": sid,
             "kind": "dialog", "dialogKind": "permission", "tool": hook["tool"],
@@ -30245,21 +30300,46 @@ class SessionManager:
 
     def _judge_pass(self, now=None):
         """One pass: refresh the alive marker the hook checks, answer what
-        requests are waiting (at most JUDGE_REQS_PER_PASS, oldest name first),
-        and sweep leftovers on its own cadence."""
-        now = time.time() if now is None else now
+        requests are waiting (`_judge_pick`), and sweep leftovers on its own
+        cadence. A pass of serial model calls can run minutes, so each request
+        reads the clock afresh (`now` pins it, for tests only)."""
+        start = time.time() if now is None else now
         policy = self.permission_policy
-        self._judge_mark_alive(bool(policy), now)
+        self._judge_mark_alive(bool(policy), start)
         try:
             names = os.listdir(PERMISSIONS_DIR)
         except OSError:
             names = []
-        for name in sorted(n for n in names if n.endswith(JUDGE_REQ_SUFFIX))[
-                :JUDGE_REQS_PER_PASS]:
+        for name in self._judge_pick(names):
             self._judge_request_file(name, policy, now)
-        if self._judge_swept_at is None or now - self._judge_swept_at >= JUDGE_SWEEP_EVERY_SEC:
-            self._judge_swept_at = now
-            self._judge_sweep(now)
+        if self._judge_swept_at is None or start - self._judge_swept_at >= JUDGE_SWEEP_EVERY_SEC:
+            self._judge_swept_at = start
+            self._judge_sweep(start)
+
+    @staticmethod
+    def _judge_pick(names):
+        """The request files this pass answers: oldest first (by mtime, then
+        name), at most JUDGE_REQS_PER_SID per session and JUDGE_REQS_PER_PASS
+        in all — so one session that plants many cannot starve the rest."""
+        found = []
+        for name in names:
+            if not name.endswith(JUDGE_REQ_SUFFIX):
+                continue
+            try:
+                mtime = os.lstat(os.path.join(PERMISSIONS_DIR, name)).st_mtime
+            except OSError:
+                continue
+            found.append((mtime, name))
+        picked, per_sid = [], {}
+        for _mtime, name in sorted(found):
+            sid = name[:-len(JUDGE_REQ_SUFFIX)].rpartition(".")[0]
+            if per_sid.get(sid, 0) >= JUDGE_REQS_PER_SID:
+                continue
+            per_sid[sid] = per_sid.get(sid, 0) + 1
+            picked.append(name)
+            if len(picked) >= JUDGE_REQS_PER_PASS:
+                break
+        return picked
 
     def _judge_mark_alive(self, on, now):
         """The marker hooks/permlog.py checks before it waits: present (and
@@ -30283,12 +30363,14 @@ class SessionManager:
         if _write_json_replace(path, {"at": int(now)}):
             self._judge_alive_at = now
 
-    def _judge_request_file(self, name, policy, now):
+    def _judge_request_file(self, name, policy, now=None):
         """Answer one `<sid>.<nonce>.judge.req.json`. The file is SESSION-
         written (Bash can plant one), so it is read only via
         `_read_untrusted_json`, removed once read whatever it said, and its
         name and every field are re-validated. Anything addressable but
         unusable is answered `stand`, so its hook returns at once."""
+        pinned = now is not None          # tests pin the clock; otherwise read it fresh
+        now = time.time() if now is None else now
         path = os.path.join(PERMISSIONS_DIR, name)
         req = _read_untrusted_json(path, JUDGE_REQ_MAX_BYTES)
         try:
@@ -30323,13 +30405,19 @@ class SessionManager:
             verdict, reason = "stand", "the request was too old to judge"
         else:
             verdict, reason = self._judge(command, cwd[:1024], deny[:PERMISSION_TEXT_MAX],
-                                          event, policy)
+                                          event, policy,
+                                          answer_by=ts / 1000 + JUDGE_ANSWER_BY_SEC)
+            if not pinned:          # the model calls took time: stamp what follows fresh
+                now = time.time()
+                now_ms = int(now * 1000)
         if verdict == "allow" and event == "PermissionDenied" \
                 and not self._write_grant(sid, command, reason, now):
             verdict, reason = "stand", "the approval could not be recorded"
-        self._write_judge_answer(sid, nonce, verdict)
+        answered = self._write_judge_answer(sid, nonce, verdict)
         head, digest = _permission_head_digest("Bash", {"command": command})
         tuid = req.get("toolUseId")
+        if verdict == "allow" and answered:
+            self._note_judge_allowed(sid, nonce, event, req, now)
         self._emit_permission({
             "id": f"j-{sid}-{nonce}", "sessionId": sid, "kind": "judged",
             "tool": "Bash", "head": head, "digest": digest,
@@ -30343,10 +30431,12 @@ class SessionManager:
                        "deny" if event == "PermissionDenied" else "unknown"),
             "verdict": verdict, "judgeReason": reason})
 
-    def _judge(self, command, cwd, deny_reason, event, policy):
+    def _judge(self, command, cwd, deny_reason, event, policy, answer_by=None):
         """`(verdict, reason)`: the never-list first, then — only with a policy
         — the model, JUDGE_ATTEMPTS times at most. Anything short of a strict,
-        parseable answer stands."""
+        parseable answer stands. No model call starts that could end past
+        `answer_by` (epoch seconds): its hook would have stopped waiting, so
+        an `allow` then would approve a prompt a human is already looking at."""
         never = judge_never_reason(command)
         if never:
             return "stand", f"never auto-approved: {never}"
@@ -30354,6 +30444,8 @@ class SessionManager:
             return "stand", "no permission policy for this host's org"
         prompt = judge_prompt(policy, command, cwd, deny_reason, event)
         for _attempt in range(JUDGE_ATTEMPTS):
+            if answer_by is not None and time.time() + JUDGE_TIMEOUT_SEC > answer_by:
+                return "stand", "no time left to judge before the prompt moved on"
             parsed = parse_judge_verdict(self._run_judge_model(prompt))
             if parsed is not None:
                 return parsed
@@ -30363,10 +30455,20 @@ class SessionManager:
         """One `claude -p` call, the `_start_summary` discipline: a list argv
         (no shell), cwd REGISTRY_DIR, no `--settings`, stdin DEVNULL (`claude -p`
         reads stdin when it is not a tty), bounded by JUDGE_TIMEOUT_SEC. The
-        reply text, or None on any failure."""
+        reply text, or None on any failure.
+
+        Unlike the summary/triage callers its input is ADVERSARIAL (text a
+        session wrote to win an approval) and nothing guards this process, so
+        it gets NO tools: `--tools ""` removes every built-in and
+        `--strict-mcp-config` every MCP server (the init event then lists
+        `tools: []`, `mcp_servers: []`). An injected instruction has nothing to
+        call; the judge only has to print one JSON verdict. `--tools` is
+        variadic, so the boolean `--strict-mcp-config` ends it before the
+        prompt."""
         try:
             proc = subprocess.run(
-                ["claude", "-p", "--model", JUDGE_MODEL, prompt],
+                ["claude", "-p", "--model", JUDGE_MODEL, "--tools", "",
+                 "--strict-mcp-config", prompt],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
                 stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR, timeout=JUDGE_TIMEOUT_SEC)
         except (subprocess.TimeoutExpired, OSError, ValueError) as e:
@@ -30375,6 +30477,31 @@ class SessionManager:
         if proc.returncode != 0:
             return None
         return proc.stdout[:JUDGE_OUTPUT_MAX].decode("utf-8", "replace")
+
+    def _note_judge_allowed(self, sid, nonce, event, req, now):
+        """Record an `allow` for the beat's hook-row fold (`_judge_was_allowed`):
+        the prompt's PermissionRequest row is then not a human `dialog`, and a
+        PermissionDenied's `classifier-denied` row is corrected to allow — sent
+        here too, under the same lock, for the case the beat sent the deny
+        first. Bounded by age and count."""
+        with self._judge_allowed_lock:
+            allowed = {k: at for k, at in self._judge_allowed.items()
+                       if now - at < JUDGE_ALLOWED_KEEP_SEC}
+            allowed[(sid, nonce)] = now
+            while len(allowed) > JUDGE_ALLOWED_MAX:
+                del allowed[min(allowed, key=allowed.get)]
+            self._judge_allowed = allowed
+            tuid = req.get("toolUseId")
+            if event == "PermissionDenied" and isinstance(tuid, str) \
+                    and _JUDGE_TOOL_USE_ID_RE.fullmatch(tuid):
+                def cap(key, limit):
+                    v = req.get(key)
+                    return v[:limit] if isinstance(v, str) else ""
+                self._emit_permission(self._classifier_row(sid, {
+                    "toolUseId": tuid, "tool": "Bash", "head": cap("head", 200),
+                    "digest": cap("digest", 400),
+                    "denyReason": cap("denyReason", PERMISSION_TEXT_MAX),
+                    "ts": int(req["ts"])}, True))
 
     def _write_grant(self, sid, command, reason, now):
         """The one-shot grant hooks/guard.py consumes on the retried call:
@@ -30393,7 +30520,7 @@ class SessionManager:
             "key": key, "sid": sid, "exp": now + JUDGE_GRANT_TTL_SEC, "reason": reason})
 
     def _write_judge_answer(self, sid, nonce, verdict):
-        _write_json_replace(os.path.join(PERMISSIONS_DIR, f"{sid}.{nonce}{JUDGE_ANS_SUFFIX}"),
+        return _write_json_replace(os.path.join(PERMISSIONS_DIR, f"{sid}.{nonce}{JUDGE_ANS_SUFFIX}"),
                             {"nonce": nonce, "verdict": verdict})
 
     def _judge_sweep(self, now):

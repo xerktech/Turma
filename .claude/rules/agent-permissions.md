@@ -130,7 +130,11 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
   stand / no answer / a malformed one → prints nothing. The names are mirrored in hub-agent.py
   (parity-tested).
 - **A DEDICATED worker** (`_judge_worker_loop`, the `_input_worker_loop` shape; polls every 0.5s,
-  at most `JUDGE_REQS_PER_PASS` a pass). Never the beat, never the slow-refresh worker — a request
+  at most `JUDGE_REQS_PER_PASS` a pass, oldest mtime first, at most `JUDGE_REQS_PER_SID` per
+  session so one that plants request files cannot starve the rest). Each request reads the clock
+  afresh (a pass of serial model calls runs minutes). No model call starts that could end past
+  `ts + JUDGE_ANSWER_BY_SEC` (70s, under the hook's 75s wait) — that request stands — so an `allow`
+  is one the hook read. Never the beat, never the slow-refresh worker — a request
   behind a gh sweep would blow the hook's deadline. Off with `TURMA_PERMISSION_JUDGE=0` (also drops
   `--judge` from the hook). `ManagerMixin` patches it off for the suite.
 - **Requests are session-written**: read only via `_read_untrusted_json`, removed once read, name
@@ -141,9 +145,17 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
   kubectl/helm/argocd, AWS/docker deletes, sudo, pipe-to-shell, Turma's/Claude's own state, and the
   guard's own destructive/policy categories via `_guard_module`) → `stand`, no model call. kubectl
   is stood in EVERY namespace (the worktree's namespaces are not knowable here). A guard that cannot
-  load stands everything. Else, with a policy, `claude -p --model haiku` (list argv, cwd
-  `REGISTRY_DIR`, no `--settings`, stdin DEVNULL, `JUDGE_TIMEOUT_SEC` 20s, at most `JUDGE_ATTEMPTS`)
-  over `JUDGE_INSTRUCTION` + the policy + the request JSON-encoded as untrusted data.
+  load stands everything. Else, with a policy, `claude -p --model haiku --tools ""
+  --strict-mcp-config` (list argv, cwd `REGISTRY_DIR`, no `--settings`, stdin DEVNULL,
+  `JUDGE_TIMEOUT_SEC` 20s, at most `JUDGE_ATTEMPTS`) over `JUDGE_INSTRUCTION` + the policy + the
+  request JSON-encoded as untrusted data.
+- **The judge gets NO tools and NO MCP servers** — its input is ADVERSARIAL (text a session wrote
+  to win an approval) and no guard runs in that process, so an injected instruction must have
+  nothing to call (verified: the init event lists `tools: []`, `mcp_servers: []`). `--tools` is
+  variadic: the boolean `--strict-mcp-config` must sit between it and the prompt.
+- **The never-list's flag/ref ends are shell punctuation too** (`_JUDGE_END`): `(git push
+  --mirror)`, `git push -f&&…`, `bash -c 'git push -f'` all stand. guard.py allows these, so the
+  never-list is the only layer in front of the model for them.
 - **`parse_judge_verdict` is STRICT**: exactly one JSON object (one ``` fence tolerated) with
   exactly `verdict` (allow|stand) + non-empty `reason`. Anything else retries, then stands.
 - **On allow for a PermissionDenied**: the one-shot grant (`_write_grant`, `GRANTS_DIR/<sid>/
@@ -154,6 +166,13 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
 - **Every judgement is a ledger row** — `kind: judged`, id `j-<sid>-<nonce>`, `verdict`,
   `judgeReason`, `answer` (allow; a stood classifier block `deny`; a stood dialog `unknown`), staged
   via `_emit_permission` (lock-guarded) for the beat to ship.
+- **A judge-allowed prompt is NOT a human dialog in the ledger.** permlog.py writes the hand-off's
+  nonce into its OWN ledger line (`judgeNonce`) before waiting; the worker records each `allow`
+  (`_note_judge_allowed`, bounded). The beat's fold (`_judge_was_allowed`) then drops that
+  PermissionRequest row instead of holding it into a `dialog`/`unknown` row, and a PermissionDenied's
+  `classifier-denied` row reads `answer: allow` (re-sent by the worker under the same id if the beat
+  sent the deny first; one lock spans each side's check and emit, so the allow lands last). The
+  nonce only ever HIDES a row the judge itself allowed — never approves anything.
 - **Policy text is hub-owned** (`turma-permissions.md`): `permissionPolicy` rides every heartbeat
   reply; `_ingest_permission_policy` keeps it in memory for the worker and renders
   `~/.turma/permission-policy.md` on change. A reply without one FORGETS it (judge stands down);

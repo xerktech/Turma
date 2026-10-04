@@ -237,7 +237,15 @@ class PermlogTest(unittest.TestCase):
         self.assertEqual(req["denyReason"], "Pushing to a remote is outside scope")
         self.assertEqual(req["event"], "PermissionDenied")
         self.assertEqual(self.judge_files(), [], "req and ans are both cleaned up")
-        self.assertEqual(len(self.rows()), 1, "the ledger row is still written")
+        row, = self.rows()
+        # The ledger line names the hand-off, so the manager can tell a prompt
+        # its judge allowed from one that reached a human.
+        self.assertEqual(row["judgeNonce"], req["nonce"])
+
+    def test_a_logged_only_event_carries_no_judge_nonce(self):
+        # No judge up (or not Bash): nothing was handed over, nothing to name.
+        self.assertEqual(self.run_judge(denied()), (0, ""))
+        self.assertNotIn("judgeNonce", self.rows()[0])
 
     def test_an_allowed_permission_request_is_allowed(self):
         self._alive()

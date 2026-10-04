@@ -3342,6 +3342,13 @@ def grant_key(command: str) -> str:
     return hashlib.sha256(command.encode("utf-8", "surrogatepass")).hexdigest()
 
 
+# The argv flag the manager's `build_guard_settings` adds to this hook's command
+# only while the permission judge is on. Without it no grant is ever honoured:
+# the switch rides each session's own settings (written per launch), not an env
+# var the long-lived tmux server would keep from whenever it started.
+GRANTS_FLAG = "--grants"
+
+
 def _grants_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".turma", "grants")
 
@@ -3430,6 +3437,9 @@ def _emit_deny(reason: str) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    argv = sys.argv if argv is None else argv
+    grants_on = GRANTS_FLAG in argv[1:] \
+        and os.environ.get("TURMA_PERMISSION_JUDGE", "1") != "0"
     try:
         raw = sys.stdin.read()
         event = json.loads(raw) if raw.strip() else {}
@@ -3459,10 +3469,10 @@ def main(argv: list[str] | None = None) -> int:
         granted = None
         # A judge grant (XERK-1566) is consulted only once decide() ALLOWED the
         # command — every hard deny wins — and only for Bash, the one tool this
-        # hook's matcher covers. Inside this fail-closed try on purpose.
-        if decision == "allow" and tool_name == "Bash" \
-                and isinstance(tool_input, dict) \
-                and os.environ.get("TURMA_PERMISSION_JUDGE", "1") != "0":
+        # hook's matcher covers. Inside this fail-closed try on purpose. Only
+        # when this session was launched with the judge on (GRANTS_FLAG).
+        if grants_on and decision == "allow" and tool_name == "Bash" \
+                and isinstance(tool_input, dict):
             granted = consume_grant(os.environ.get("TURMA_SESSION_ID"),
                                     tool_input.get("command"))
     except Exception as exc:  # noqa: BLE001 - any classifier bug

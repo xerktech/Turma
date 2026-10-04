@@ -402,7 +402,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   fail-CLOSED try. `~/.turma/grants/<TURMA_SESSION_ID>/<sha256(command)>` must be a regular file
   (`O_NONBLOCK|O_NOFOLLOW`, bounded; the session dir not a symlink) naming this session + exact
   command, unexpired (`exp` at most `GRANT_TTL_MAX_SEC` out). Unlinked BEFORE allowing, so one
-  grant allows one call. `TURMA_PERMISSION_JUDGE=0` in the hook's env ignores grants.
+  grant allows one call. Honoured ONLY by a guard launched with `--grants`, which
+  `build_guard_settings` adds while the judge is on — the switch rides each launch's settings, since
+  a session's env comes from the long-lived tmux server, not the manager. A session launched before
+  `TURMA_PERMISSION_JUDGE=0` keeps the flag until relaunched (the judge then writes no grant).
   - **Accepted residual: the grant dir is same-uid and Bash can write it.** A model that learns the
     protocol can self-grant one command past the auto-mode classifier — or drop a judge answer that
     makes permlog.py allow a PermissionRequest dialog — the same class as `echo >

@@ -156,7 +156,10 @@ consumes this table; it does not replace it.
 - **It rides EVERY heartbeat reply** as `permissionPolicy: {site, text, isDefault}`, keyed on the
   host's DECIDED org (`decidedOrgOf`) — never the claimed `jira.siteKey`: the text decides what a
   session may run unprompted, the same boundary as the peer roster. A drifted or never-bound host
-  gets the default. The agent forgets the text on a reply without the key (an older hub).
+  gets EMPTY text (`{site: null, text: "", isDefault: false}`), so its judge stands down — fail
+  NARROW: the default must never replace an org's own "" or stricter text because one host drifted,
+  and an unbound host has no org whose operator could turn it off. Only a host BOUND to an org with
+  no entry reads the default. The agent forgets the text on a reply without the key (an older hub).
 - **`GET|POST /api/jira/<site>/permission-policy`** (user-authed, placed BEFORE the
   `/api/jira/<site>/<issueKey>` detail route, which would read it as an issue key): GET →
   `{text, isDefault, defaultText}`; POST `{text: string}` sets, `{text: null}` resets; 400 on any

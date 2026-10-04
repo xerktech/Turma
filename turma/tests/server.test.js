@@ -22501,18 +22501,37 @@ test("XERK-1566: the org's permission policy rides every heartbeat reply", async
   for (const h of ["x1566-host", "x1566-other"]) delete agents[h];
 });
 
-test("XERK-1566: a host the hub has not bound to the org is served the default, not the org's", async () => {
+test("XERK-1566: a host with no decided org gets NO policy text, so its judge stands down", async () => {
   const site = "x1566c.atlassian.net";
+  const other = "x1566d.atlassian.net";
   await asBeat("x1566-bound", site);
   hub.setPermissionPolicy(site, "acme only");
   // A host bound to ANOTHER org that now CLAIMS this one is drifted: its decided
-  // org is "", so it never reads this org's text.
-  await asBeat("x1566-drift", "x1566d.atlassian.net");
-  const r = await asBeat("x1566-drift", site);
-  assert.equal(r.body.permissionPolicy.site, null);
-  assert.equal(r.body.permissionPolicy.text, hub.DEFAULT_PERMISSION_POLICY);
+  // org is "", so it reads neither this org's text NOR the looser default —
+  // fail NARROW, like the peer roster.
+  await asBeat("x1566-drift", other);
+  let r = await asBeat("x1566-drift", site);
+  assert.deepEqual(r.body.permissionPolicy, { site: null, text: "", isDefault: false });
+  // Its OWN org turned the judge off ("") — a drift must not switch it back
+  // on with the default.
+  hub.setPermissionPolicy(other, "");
+  r = await asBeat("x1566-drift", site);
+  assert.equal(r.body.permissionPolicy.text, "");
+  // A never-bound host (no tracker block at all) gets no text either.
+  const bare = await request("POST", "/api/heartbeat",
+    { body: { device: "x1566-bare", repos: [], sessions: [] }, headers: agentHeaders });
+  assert.equal(bare.status, 200);
+  assert.deepEqual(bare.body.permissionPolicy, { site: null, text: "", isDefault: false });
+  assert.deepEqual(hub.permissionPolicyReply({}), { site: null, text: "", isDefault: false });
+  // The bound host still reads its org's text; an org with no entry reads the default.
+  r = await asBeat("x1566-bound", site);
+  assert.equal(r.body.permissionPolicy.text, "acme only");
   hub.setPermissionPolicy(site, null);
-  for (const h of ["x1566-bound", "x1566-drift"]) delete agents[h];
+  r = await asBeat("x1566-bound", site);
+  assert.deepEqual(r.body.permissionPolicy,
+    { site, text: hub.DEFAULT_PERMISSION_POLICY, isDefault: true });
+  hub.setPermissionPolicy(other, null);
+  for (const h of ["x1566-bound", "x1566-drift", "x1566-bare"]) delete agents[h];
 });
 
 test("XERK-1566: the permission-policy route refuses bad bodies, phantom orgs and anonymous callers", async () => {

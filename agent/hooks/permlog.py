@@ -349,12 +349,18 @@ def _read_answer(path):
     return data if isinstance(data, dict) else None
 
 
+def new_nonce():
+    return os.urandom(8).hex()
+
+
 def await_verdict(directory, session_id, req, wait_sec=JUDGE_WAIT_SEC,
-                  poll_sec=JUDGE_POLL_SEC, clock=time.monotonic, sleep=time.sleep):
+                  poll_sec=JUDGE_POLL_SEC, clock=time.monotonic, sleep=time.sleep,
+                  nonce=None):
     """Hand `req` to the manager's judge and wait for its verdict: "allow",
     "stand", or None (no answer in time, or a malformed one). The request is
-    removed on the way out whatever happened, and the answer once read."""
-    nonce = os.urandom(8).hex()
+    removed on the way out whatever happened, and the answer once read.
+    `nonce` names the hand-off (the ledger row carries it too)."""
+    nonce = nonce or new_nonce()
     base = os.path.join(directory, f"{session_id}.{nonce}")
     req_path, ans_path = base + JUDGE_REQ_SUFFIX, base + JUDGE_ANS_SUFFIX
     if not _write_new(req_path, dict(req, nonce=nonce)):
@@ -410,14 +416,24 @@ def main(argv=None):
         return 0
     if row is None:
         return 0
+    req = None
+    if judge:
+        try:
+            req = judge_request(event, row)
+            if req is not None and not judge_alive(directory):
+                req = None
+        except Exception:        # noqa: BLE001 — the judge is best-effort too
+            req = None
+    if req is not None:
+        # The ledger row names the hand-off BEFORE it is made: should the judge
+        # allow it, the manager then knows this prompt never reached a human.
+        row["judgeNonce"] = new_nonce()
     append_row(directory, session_id, row)
-    if not judge:
+    if req is None:
         return 0
     try:
-        req = judge_request(event, row)
-        if req is None or not judge_alive(directory):
-            return 0
-        out = decision_output(row["event"], await_verdict(directory, session_id, req))
+        out = decision_output(row["event"], await_verdict(
+            directory, session_id, req, nonce=row["judgeNonce"]))
     except Exception:            # noqa: BLE001 — the judge is best-effort too
         return 0
     if out is not None:

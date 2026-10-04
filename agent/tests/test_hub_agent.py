@@ -37990,6 +37990,12 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
                 "echo '{}' > ~/.turma/grants/judge1/abc",
                 "cat /home/u/.claude/.credentials.json",
                 "rm -rf /",                       # the guard's destructive category
+                # A flag/ref followed by shell punctuation, not whitespace.
+                "(git push --mirror)", "(git push --all)",
+                "(cd sub && git push origin feat -f)", "git push -f&&echo ok",
+                "bash -c 'git push -f'", "bash -c \"git push origin main\"",
+                "(git push origin master)", "(git branch -D old)",
+                "git push origin feat -f;echo done", "git push -f>/dev/null",
         )):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(ha.judge_never_reason(cmd), cmd)
@@ -38093,6 +38099,104 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         self.assertFalse(os.path.exists(ha.GRANTS_DIR))
         self.assertEqual(self.rows()[0]["answer"], "allow")
 
+    def hook_row(self, event, nonce, ts=None, tuid=""):
+        # permlog.py's ledger line for the same prompt, as the tail parses it.
+        mod = ha._permlog_module()
+        row = mod.build_row({"hook_event_name": event, "tool_name": "Bash",
+                             "tool_use_id": tuid or None,
+                             "tool_input": {"command": "npm run e2e"},
+                             "reason": "outside the task"},
+                            now_ms=ts or int(time.time() * 1000))
+        row["judgeNonce"] = nonce
+        line = (json.dumps(row) + "\n").encode()
+        parsed, _ = ha.parse_permission_log_lines(line, self.SID)
+        return parsed[0]
+
+    def test_a_judge_allowed_permission_request_is_never_a_human_dialog(self):
+        # The hook row lands on the beat BEFORE the verdict, is held, and is
+        # dropped once the judge has allowed it — no `dialog`/`unknown` row.
+        allowed = self.hook_row("PermissionRequest", "ab12cd34")
+        self.assertEqual(allowed["judgeNonce"], "ab12cd34")
+        self.sm._permission_rows_fetched = {self.SID: [allowed]}
+        self.sm._apply_permission_hook_rows(mono=0)
+        self.req(event="PermissionRequest")
+        self.sm._judge_pass()
+        self.assertEqual(self.answer(), "allow")
+        # A second prompt the judge STOOD still becomes a dialog row.
+        self.run_model.return_value = '{"verdict": "stand", "reason": "no"}'
+        self.req(event="PermissionRequest", nonce="cdcdcdcd")
+        self.sm._judge_pass()
+        self.sm._permission_rows_fetched = {
+            self.SID: [self.hook_row("PermissionRequest", "cdcdcdcd")]}
+        self.sm._apply_permission_hook_rows(mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.sm._apply_permission_hook_rows(mono=2 * ha.PERMISSION_HOOK_HOLD_SEC + 2)
+        dialogs = [r for r in self.sm.permission_events if r["kind"] == "dialog"]
+        self.assertEqual(len(dialogs), 1)
+        self.assertEqual(dialogs[0]["answer"], "unknown")
+        # And one tailed AFTER the allow is dropped at once, never held.
+        self.req(event="PermissionRequest", nonce="efefefef")
+        self.run_model.return_value = '{"verdict": "allow", "reason": "ok"}'
+        self.sm._judge_pass()
+        self.sm._permission_rows_fetched = {
+            self.SID: [self.hook_row("PermissionRequest", "efefefef")]}
+        self.sm._apply_permission_hook_rows(mono=0)
+        self.assertEqual(self.sm._perm_hook_pending.get(self.SID), None)
+
+    def test_a_judge_allowed_classifier_block_reads_allow_in_either_order(self):
+        # Beat first: it sends the deny, then the judge's correction (same id).
+        self.sm._permission_rows_fetched = {
+            self.SID: [self.hook_row("PermissionDenied", "ab12cd34", tuid="toolu_9")]}
+        self.sm._apply_permission_hook_rows(mono=0)
+        self.req()
+        self.sm._judge_pass()
+        cid = f"c-{self.SID}-toolu_9"
+        latest = {r["id"]: r for r in self.sm.permission_events}   # the hub's upsert
+        self.assertEqual(latest[cid]["answer"], "allow")
+        # Judge first: the beat's own row already reads allow.
+        self.sm.permission_events.clear()
+        self.req(nonce="cdcdcdcd", toolUseId="toolu_8")
+        self.sm._judge_pass()
+        self.sm._permission_rows_fetched = {
+            self.SID: [self.hook_row("PermissionDenied", "cdcdcdcd", tuid="toolu_8")]}
+        self.sm._apply_permission_hook_rows(mono=0)
+        rows = [r for r in self.sm.permission_events if r["id"] == f"c-{self.SID}-toolu_8"]
+        self.assertTrue(rows and all(r["answer"] == "allow" for r in rows))
+
+    def test_a_forged_or_foreign_nonce_hides_nothing(self):
+        self.req()
+        self.sm._judge_pass()                                  # allows ab12cd34
+        # The same nonce in ANOTHER session's ledger hides nothing there.
+        row = dict(self.hook_row("PermissionRequest", "ab12cd34"), sessionId="other")
+        self.sm._permission_rows_fetched = {"other": [row]}
+        self.sm._apply_permission_hook_rows(mono=ha.PERMISSION_HOOK_HOLD_SEC + 1)
+        self.sm._apply_permission_hook_rows(mono=2 * ha.PERMISSION_HOOK_HOLD_SEC + 2)
+        self.assertEqual(len([r for r in self.sm.permission_events
+                              if r["kind"] == "dialog"]), 1)
+        bad, _ = ha.parse_permission_log_lines(
+            b'{"event": "PermissionRequest", "ts": 1, "tool": "Bash", '
+            b'"judgeNonce": "../../x"}\n', self.SID)
+        self.assertNotIn("judgeNonce", bad[0])
+
+    def test_no_model_call_starts_that_would_answer_past_the_hooks_wait(self):
+        ts = int((time.time() - ha.JUDGE_ANSWER_BY_SEC + ha.JUDGE_TIMEOUT_SEC - 3) * 1000)
+        self.req(ts=ts)                     # young enough for the age check
+        self.sm._judge_pass()
+        self.run_model.assert_not_called()
+        self.assertEqual(self.answer(), "stand")
+        self.assertIn("no time left", self.rows()[0]["judgeReason"])
+        self.assertLess(ha.JUDGE_ANSWER_BY_SEC, ha._permlog_module().JUDGE_WAIT_SEC)
+
+    def test_one_session_cannot_starve_the_rest(self):
+        other = "judge2"
+        self.sm.registry.append({"id": other, "status": "running"})
+        for i in range(5):
+            self.req(nonce=f"{i:08x}")
+        self.req(nonce="0000000f", sid=other)
+        self.sm._judge_pass()
+        left = [n for n in os.listdir(ha.PERMISSIONS_DIR) if n.endswith(ha.JUDGE_REQ_SUFFIX)]
+        self.assertEqual(len(left), 5 - ha.JUDGE_REQS_PER_SID)
+        self.assertEqual(self.answer("0000000f", other), "allow")
+
     def test_a_stood_request_is_logged_by_event(self):
         self.run_model.return_value = '{"verdict": "stand", "reason": "not covered"}'
         self.req(event="PermissionDenied", nonce="aaaaaaaa")
@@ -38121,7 +38225,8 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         self.req(nonce="00000004", command="x" * (ha.JUDGE_COMMAND_MAX + 1))
         self.req(nonce="00000005", ts=int(time.time() * 1000) - 3600_000)   # stale
         self.req(nonce="00000006", event="PreToolUse")
-        self.sm._judge_pass()
+        for _ in range(4):          # JUDGE_REQS_PER_SID a pass
+            self.sm._judge_pass()
         for nonce, sid in (("00000001", None), ("00000002", "nosuch"),
                            ("00000003", "dshsess"), ("00000004", None),
                            ("00000005", None), ("00000006", None)):
@@ -38208,7 +38313,12 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
             self.assertIs(kwargs["stdin"], ha.subprocess.DEVNULL)
             self.assertEqual(kwargs["timeout"], ha.JUDGE_TIMEOUT_SEC)
             self.assertEqual(kwargs["cwd"], ha.REGISTRY_DIR)
-            self.assertEqual(run.call_args.args[0][:4], ["claude", "-p", "--model", "haiku"])
+            # No tools and no MCP servers: the prompt is adversarial and
+            # nothing guards this process. The prompt rides LAST, after the
+            # boolean flag that ends `--tools`' variadic list.
+            self.assertEqual(run.call_args.args[0],
+                             ["claude", "-p", "--model", "haiku", "--tools", "",
+                              "--strict-mcp-config", "p"])
             run.side_effect = ha.subprocess.TimeoutExpired("claude", 20)
             self.assertIsNone(self.sm._run_judge_model("p"))
         self.model.start()

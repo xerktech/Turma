@@ -2523,12 +2523,13 @@ class TestJudgeGrants(unittest.TestCase):
                 f.write(blob)
             self.assertIsNone(self._consume("make h"))
 
-    def _run(self, command, env_extra=None):
+    def _run(self, command, env_extra=None, grants=True):
         env = {**os.environ, "HOME": self.home, "TURMA_SESSION_ID": self.SID,
                **(env_extra or {})}
         env.pop("TURMA_PERMISSION_JUDGE", None)
         env.update(env_extra or {})
-        proc = subprocess.run([sys.executable, "-SsE", GUARD_PATH],
+        proc = subprocess.run([sys.executable, "-SsE", GUARD_PATH]
+                              + ([guard.GRANTS_FLAG] if grants else []),
                               input=json.dumps({"tool_name": "Bash",
                                                 "tool_input": {"command": command}}),
                               capture_output=True, text=True, env=env)
@@ -2556,14 +2557,21 @@ class TestJudgeGrants(unittest.TestCase):
         path = self._grant("npm run e2e")
         self.assertIsNone(self._run("npm run e2e", {"TURMA_PERMISSION_JUDGE": "0"}))
         self.assertTrue(os.path.exists(path))
+        # A guard launched WITHOUT the flag (a session started with the judge
+        # off) honours no grant, whatever its inherited env says.
+        self.assertIsNone(self._run("npm run e2e", {"TURMA_PERMISSION_JUDGE": "1"},
+                                    grants=False))
+        self.assertIsNone(self._run("npm run e2e", grants=False))
+        self.assertTrue(os.path.exists(path))
 
     def test_a_grant_crash_fails_closed(self):
         with mock.patch.object(guard, "consume_grant", side_effect=TypeError("boom")), \
                 mock.patch.object(guard.sys, "stdin", io.StringIO(json.dumps(
                     {"tool_name": "Bash", "tool_input": {"command": "ls"}}))), \
+                mock.patch.dict(os.environ, {"TURMA_PERMISSION_JUDGE": "1"}), \
                 mock.patch.object(guard, "_emit_deny") as deny, \
                 mock.patch.object(guard, "_emit_allow") as allow:
-            self.assertEqual(guard.main(), 0)
+            self.assertEqual(guard.main(["guard.py", guard.GRANTS_FLAG]), 0)
             deny.assert_called_once()
             allow.assert_not_called()
 

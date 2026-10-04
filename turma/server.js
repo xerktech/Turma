@@ -2925,9 +2925,15 @@ function setPermissionPolicy(siteKey, text) {
   persistPermissionPolicies();
 }
 // What a heartbeat reply carries: the decided org's text (or the default).
+// A host with NO decided org (never bound, or actively drifted) gets EMPTY
+// text, so its judge stands down — fail NARROW like the peer roster: the
+// default must never replace an org's own choice (an empty "off", or a
+// stricter text) just because one of its hosts drifted, and an unbound host
+// has no org whose operator could turn it off.
 function permissionPolicyReply(a) {
   const site = (a && decidedOrgOf(a)) || "";
-  return { site: site || null, text: permissionPolicyText(site), isDefault: !storedPermissionPolicy(site) };
+  if (!site) return { site: null, text: "", isDefault: false };
+  return { site, text: permissionPolicyText(site), isDefault: !storedPermissionPolicy(site) };
 }
 
 // ---- epic auto-orchestration run records (XERK-635, epic XERK-633) ----------
