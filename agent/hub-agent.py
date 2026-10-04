@@ -13,7 +13,7 @@ multiplexer:
     is a git *worktree* of a repo in DETACHED HEAD (the app creates no branch;
     the running agent branches its own work when ready) forked off the latest
     default branch, running its own `claude --remote-control` inside its own tmux
-    (agent-<id>) served by its own ttyd (127.0.0.1:<ttydPort>, base /term/<id>).
+    (agent-<id>) served by its own ttyd (~/.turma/ttyd/<ttydPort>.sock, base /term/<id>).
   - Executes hub-issued commands (spawn / kill / start / restart / delete /
     resume) that ride back on the heartbeat reply, with at-least-once cmdId
     de-dup.
@@ -3881,6 +3881,67 @@ def _token_fp(token):
     heartbeated session record. Truncated sha256: it only ever gates a relaunch,
     so a collision would at worst skip one, never expose anything."""
     return hashlib.sha256((token or "").encode()).hexdigest()[:16]
+
+
+# Where each Linux ttyd listens (XERK-1588): a UNIX socket in an owner-only dir,
+# never a loopback TCP port. ttyd takes its basic-auth credential only on argv
+# (`-c`), which any local uid reads through /proc/<pid>/cmdline, and a loopback
+# port is reachable by every local uid — so a credential there opened a WRITABLE
+# terminal (code execution as the agent user) to anyone on the host. The 0700 dir
+# is the boundary instead, so ttyd runs with no `-c` and no secret on argv. Keyed
+# by the session's stable `ttydPort`, which the hub still sends as the channel's
+# target; tunnel-agent.js's `ttydSockPath` must name the same file.
+TTYD_SOCK_DIR = os.path.join(REGISTRY_DIR, "ttyd")
+# sun_path is 108 bytes on Linux (104 on BSD/macOS). A longer path does NOT make
+# ttyd fail: it logs an error and keeps running bound to nothing, so it is checked.
+_UNIX_SOCK_PATH_MAX = 103
+
+
+def _ttyd_sock_path(port):
+    return os.path.join(TTYD_SOCK_DIR, f"{int(port)}.sock")
+
+
+def _ensure_ttyd_sock_dir():
+    """Create TTYD_SOCK_DIR owner-only, or raise. It is the ONLY thing keeping
+    other local uids off the terminals, so a symlink, a non-directory or a dir
+    another uid owns is refused rather than used, and its mode is re-asserted."""
+    os.makedirs(TTYD_SOCK_DIR, mode=0o700, exist_ok=True)
+    st = os.lstat(TTYD_SOCK_DIR)
+    if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.geteuid():
+        raise RuntimeError(f"{TTYD_SOCK_DIR} is not a directory this user owns")
+    if stat.S_IMODE(st.st_mode) != 0o700:
+        os.chmod(TTYD_SOCK_DIR, 0o700)
+
+
+def _await_unix_sock(path, proc, timeout=2.0):
+    """Wait for a just-launched ttyd's socket to appear. ttyd that cannot bind
+    keeps running bound to nothing rather than exiting, so its pid alone proves
+    nothing. It binds in milliseconds; stops early if the process exits."""
+    def is_sock():
+        try:
+            return stat.S_ISSOCK(os.lstat(path).st_mode)
+        except OSError:
+            return False
+
+    deadline = time.monotonic() + timeout
+    while not is_sock():
+        if proc.poll() is not None or time.monotonic() >= deadline:
+            return is_sock()
+        time.sleep(0.05)
+    return True
+
+
+def _unix_sock_open(path, timeout=0.3):
+    """Whether something accepts connections on the UNIX socket at `path`."""
+    s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    s.settimeout(timeout)
+    try:
+        s.connect(path)
+        return True
+    except OSError:
+        return False
+    finally:
+        s.close()
 
 
 def unlink_quietly(paths):
@@ -14402,8 +14463,8 @@ def _ws_read_json(sock, initial, timeout):
 def _pty_control(tmux_name, op, timeout=PTY_CONTROL_TIMEOUT_SEC, **extra):
     """Drive one control op on a session's pty-host, the tmux-CLI replacement.
     Reads the ctrlPort from the state file and authenticates with the same token
-    the pty-host was minted with (`--auth-token`, = the value ttyd's `-c` takes),
-    so no per-session secret has to be tracked here. Returns the reply dict (with
+    the pty-host was minted with (read from `_pty_token_file`, which this
+    process writes from its own TURMA_TOKEN), so no per-session secret has to be tracked here. Returns the reply dict (with
     `ok`), or None when there is no live terminal / the call failed."""
     st = _pty_read_state(tmux_name)
     if not st or not st.get("ctrlPort"):
@@ -14870,8 +14931,12 @@ def _pty_spawn_and_wait(tmux_name, cmd, cwd, env, log_path):
     reaped = _pty_teardown(tmux_name)         # clean slate (tmux kill-session)
     os.makedirs(PTY_HOST_DIR, exist_ok=True)
     # Publish the current auth token before the pty-host starts, so it reads the
-    # live value on its very first request (XERK-578 roll self-heal).
-    _write_pty_token_file()
+    # live value on its very first request (XERK-578 roll self-heal). It is ALSO
+    # the token the pty-host bakes in at start (XERK-1588: never on argv), so a
+    # failed write would bake a stale older file and lock this manager's
+    # TURMA_TOKEN-authed control channel out — refuse to spawn instead.
+    if not _write_pty_token_file():
+        raise RuntimeError("pty-host: could not write the auth token file")
     # Wait for the old pty-host to RELEASE THE TERMINAL PORT before the new one
     # rebinds it, exactly as the Linux ttyd relaunch waits (a SIGTERM'd process
     # exits promptly, but not synchronously). Without this the respawn raced the
@@ -20767,6 +20832,9 @@ class SessionManager:
                 ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
                  _triage_prompt(batch, cands)],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                # The prompt carries untrusted ticket/transcript text, so no agent
+                # secrets (TURMA_TOKEN) in its env (XERK-1588).
+                env=_session_env(),
             )
         except Exception as e:
             log(f"jira triage launch failed: {e}")
@@ -21105,6 +21173,9 @@ class SessionManager:
                 ["claude", "-p", "--model", JIRA_TRIAGE_MODEL,
                  _ticket_triage_prompt(batch, tickets)],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                # The prompt carries untrusted ticket/transcript text, so no agent
+                # secrets (TURMA_TOKEN) in its env (XERK-1588).
+                env=_session_env(),
             )
         except Exception as e:
             log(f"ticket triage launch failed: {e}")
@@ -24094,13 +24165,14 @@ class SessionManager:
             "--term-port", str(sess["ttydPort"]),   # the hub proxies /term to this
             "--ctrl-port", "0",                      # ephemeral; published in state
             "--state", state,
-            # The pty-host refuses to run unauthenticated; this is the same
-            # credential ttyd's `-c term:<token>` takes and the hub proxies as
-            # Basic base64(term:<token>), so the browser terminal authenticates
-            # identically. Its DEFAULT_PREFS already match _launch_ttyd's `-t`
-            # flags (font/size/webgl/…), so no --pref is needed for fleet parity.
-            "--auth-token", (TURMA_TOKEN or "changeme"),
-            # …and the file holding whatever token is in force RIGHT NOW, which
+            # The pty-host refuses to run unauthenticated; its credential is the
+            # raw TURMA_TOKEN the hub proxies as Basic base64(term:<token>), read
+            # from the owner-only file below — NEVER `--auth-token` on argv, which
+            # other local users can read (XERK-1588). _pty_spawn_and_wait writes
+            # that file just before the spawn. Its DEFAULT_PREFS already match
+            # _launch_ttyd's `-t` flags (font/size/webgl/…), so no --pref is
+            # needed for fleet parity.
+            # The file holding whatever token is in force RIGHT NOW, which
             # the pty-host re-reads per auth check. A baked-in token alone made a
             # hub token ROLL fatal here in a way it never is on Linux: the
             # pty-host is BOTH the terminal and the pty, so it cannot be
@@ -24223,8 +24295,7 @@ class SessionManager:
                 return  # already serving (e.g. an in-process restart keeps ttyd up)
             log(f"ttyd for {sess['id']}: attached to another tmux server; "
                 "relaunching it on the session's")
-            self._kill_ttyd(sess["id"])
-            self._await_port_free(sess.get("ttydPort"))
+            self._kill_and_await_ttyd(sess)
         # Adopt a ttyd of OURS that outlived a *manager* restart: ttyd is its own
         # daemon, so on a native in-place update (systemd KillMode=process /
         # manager-only kill) the old ttyd keeps holding this session's stable
@@ -24234,31 +24305,43 @@ class SessionManager:
         # Gate on OUR persisted `ttydPid` still being alive (not the bare port):
         # a fresh spawn has no ttydPid, so a port just freed by a killed session
         # and reallocated here can't be mistaken for a survivor to adopt.
+        sock = _ttyd_sock_path(sess["ttydPort"])
         adopted = sess.get("ttydPid")
-        if adopted and _pid_alive(adopted) and _port_open(sess.get("ttydPort")):
-            # Adopt that survivor ONLY if its baked-in basic-auth password still
-            # matches the token we'd hand it now (XERK-578). ttyd bakes
-            # `-c term:<TURMA_TOKEN>` in at launch and outlives a manager-only
-            # restart (KillMode=process), so after a token ROLL it keeps demanding
-            # the OLD token while the hub — seeing the host now beat BOUND —
-            # injects the NEW derived one, and the terminal 401s into a browser
-            # password prompt. A fingerprint mismatch (or an older ttyd that
-            # recorded none) means the token changed under it: kill it and fall
-            # through to relaunch with the current token. This SELF-HEALS a host
-            # already rolled (its next restart relaunches ttyd) as well as every
-            # future roll.
-            if sess.get("ttydTokenFp") == _token_fp(TURMA_TOKEN) and on_socket:
+        if adopted and _pid_alive(adopted):
+            # Adopt that survivor ONLY if it listens on this session's owner-only
+            # socket (XERK-1588). A ttyd an older agent launched is on a loopback
+            # TCP port with the host token on its argv (`-c term:<TURMA_TOKEN>`):
+            # adopting it would keep that credential readable to every local uid,
+            # so it is killed and relaunched on the socket. Because the socket
+            # carries no credential, a token ROLL no longer needs a relaunch here.
+            if sess.get("ttydSock") == sock and on_socket and _unix_sock_open(sock):
                 return
-            if not on_socket:
-                log(f"ttyd for {sess['id']}: a surviving ttyd attaches to another "
-                    "tmux server; relaunching it on the session's")
-            else:
-                log(f"ttyd for {sess['id']}: basic-auth token changed under a "
-                    "surviving ttyd (post-roll); relaunching with the current token")
-            self._kill_ttyd(sess["id"])
-            self._await_port_free(sess.get("ttydPort"))
+            # Only kill what still answers where OUR ttyd would: a dead-and-recycled
+            # pid must never be signalled.
+            if _unix_sock_open(sock) or _port_open(sess.get("ttydPort")):
+                if not on_socket:
+                    log(f"ttyd for {sess['id']}: a surviving ttyd attaches to another "
+                        "tmux server; relaunching it on the session's")
+                else:
+                    log(f"ttyd for {sess['id']}: a surviving ttyd predates the owner-only "
+                        "socket (XERK-1588); relaunching it there")
+                self._kill_and_await_ttyd(sess)
+        if len(os.fsencode(sock)) > _UNIX_SOCK_PATH_MAX:
+            raise RuntimeError(f"ttyd launch failed: socket path too long ({sock})")
+        try:
+            _ensure_ttyd_sock_dir()
+            # A ttyd killed hard leaves its socket file behind, and binding over
+            # it fails. Only a socket is removed — never whatever else is there.
+            if stat.S_ISSOCK(os.lstat(sock).st_mode):
+                os.unlink(sock)
+        except FileNotFoundError:
+            pass
+        except (OSError, RuntimeError) as e:
+            raise RuntimeError(f"ttyd launch failed: {e}")
         args = [
-            "ttyd", "-p", str(sess["ttydPort"]), "-i", "127.0.0.1",
+            # The owner-only UNIX socket, not a loopback port, and no `-c`
+            # (XERK-1588): see TTYD_SOCK_DIR.
+            "ttyd", "-i", sock,
             "-b", f"/term/{sess['id']}", "-W", "-m", "8",
             "-t", 'fontFamily=JBMNerd, "JetBrainsMono Nerd Font Mono", "DejaVu Sans Mono", monospace',
             # 12px at operator request (2026-08-31): smaller terminal text.
@@ -24283,7 +24366,6 @@ class SessionManager:
             # (XERK-7). Costs Mac's Alt+drag column-select, which is what every
             # terminal trades it for.
             "-t", "macOptionClickForcesSelection=true",
-            "-c", f"term:{TURMA_TOKEN or 'changeme'}",
             *_tmux("attach", "-t", "=" + sess["tmuxName"],  # exact match
                    name=sess["tmuxName"]),
         ]
@@ -24293,14 +24375,51 @@ class SessionManager:
             )
             self.ttyd[sess["id"]] = proc
             sess["ttydPid"] = proc.pid  # persisted so a later manager can reap it
-            # The token this ttyd baked into its `-c term:` basic-auth (XERK-578).
-            # Persisted so the adopt path above can tell, after a manager-only
-            # restart, whether the token changed under it and a relaunch is due.
-            sess["ttydTokenFp"] = _token_fp(TURMA_TOKEN)
+            # Where it listens, so the adopt path above can tell a socket ttyd
+            # from one an older agent left on a TCP port (XERK-1588).
+            sess["ttydSock"] = sock
+            sess.pop("ttydTokenFp", None)   # a credential-less ttyd has no token
             # The server its `tmux attach` reaches (XERK-1078), checked above.
             sess["ttydTmuxSocket"] = want_socket
         except Exception as e:
             raise RuntimeError(f"ttyd launch failed: {e}")
+        if not _await_unix_sock(sock, proc):
+            self._kill_ttyd(sess["id"])
+            raise RuntimeError(f"ttyd launch failed: it never listened on {sock}")
+
+    def _kill_and_await_ttyd(self, sess):
+        """Kill a session's ttyd and wait for it to EXIT before a relaunch binds.
+
+        A socket ttyd unlinks its socket file as it exits (XERK-1588), so one
+        that dies after its replacement bound would delete the NEW socket and
+        leave the terminal dead; a TCP one (an older agent's) must release its
+        port. Bounded: a ttyd still running after the wait is SIGKILLed, which
+        unlinks nothing."""
+        proc = self.ttyd.get(sess["id"])
+        pid = sess.get("ttydPid")
+        self._kill_ttyd(sess["id"])
+
+        def alive():
+            if proc is not None and proc.poll() is None:
+                return True
+            return bool(pid) and (proc is None or proc.pid != pid) and _pid_alive(pid)
+
+        for _ in range(40):
+            if not alive():
+                break
+            time.sleep(0.05)
+        else:
+            for target in {proc.pid if proc is not None else None, pid} - {None}:
+                try:
+                    os.kill(int(target), signal.SIGKILL)
+                except (OSError, ValueError):
+                    pass
+            if proc is not None:
+                try:
+                    proc.wait(timeout=1)
+                except Exception:
+                    pass
+        self._await_port_free(sess.get("ttydPort"))
 
     @staticmethod
     def _await_port_free(port):
@@ -33782,7 +33901,7 @@ class SessionManager:
             try:
                 proc = subprocess.Popen(argv, stdin=subprocess.DEVNULL, stdout=outf,
                                         stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
-                                        start_new_session=True)
+                                        env=_session_env(), start_new_session=True)
             except OSError as e:
                 log(f"{what} launch failed: {e}")
                 return None
@@ -34121,7 +34240,8 @@ class SessionManager:
                 ["claude", "-p", "--model", JUDGE_MODEL, "--tools", "",
                  "--strict-mcp-config", prompt],
                 stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR, timeout=JUDGE_TIMEOUT_SEC)
+                stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR, env=_session_env(),
+                timeout=JUDGE_TIMEOUT_SEC)
         except (subprocess.TimeoutExpired, OSError, ValueError) as e:
             log(f"permission judge: claude -p failed: {type(e).__name__}")
             return None
@@ -35136,6 +35256,9 @@ class SessionManager:
                 ["claude", "-p", "--model", SESSION_SUMMARY_MODEL,
                  SUMMARY_INSTRUCTION + prompt[:SUMMARY_PROMPT_CAP]],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                # The prompt carries untrusted ticket/transcript text, so no agent
+                # secrets (TURMA_TOKEN) in its env (XERK-1588).
+                env=_session_env(),
             )
         except Exception as e:
             log(f"summary launch failed for {sid}: {e}")
@@ -35445,7 +35568,7 @@ class SessionManager:
                 and QWEN_MODEL_BASE_URL.startswith(("http://", "https://"))):
             return  # no usable route — leave naming to tier 3
         out_path = os.path.join(REGISTRY_DIR, f"summary-{slugify(sid)}.out")
-        env = dict(os.environ)
+        env = _session_env()   # no agent secrets in a prompt-driven run (XERK-1588)
         env["OPENAI_BASE_URL"] = QWEN_MODEL_BASE_URL
         env["OPENAI_MODEL"] = str(model)
         api_key_val = os.environ.get(QWEN_MODEL_API_KEY_ENV)
@@ -35528,6 +35651,9 @@ class SessionManager:
             proc = subprocess.Popen(
                 ["claude", "-p", MODEL_PROBE_PROMPT],
                 stdout=outf, stderr=subprocess.DEVNULL, cwd=REGISTRY_DIR,
+                # The prompt carries untrusted ticket/transcript text, so no agent
+                # secrets (TURMA_TOKEN) in its env (XERK-1588).
+                env=_session_env(),
             )
         except Exception as e:
             log(f"models probe launch failed: {e}")
@@ -35835,8 +35961,9 @@ class SessionManager:
             "--term-port", "0",
             "--ctrl-port", "0",
             "--state", _pty_state_path(tmux_name),
-            "--auth-token", (TURMA_TOKEN or "changeme"),
-            # The live token file, so a roll mid-probe doesn't lock us out of it.
+            # The token, from its owner-only file and never argv (XERK-1588) — a
+            # command line is readable by other local users. Live, so a roll
+            # mid-probe doesn't lock us out of it.
             "--auth-token-file", _pty_token_file(),
             "--cwd", REGISTRY_DIR,
             "--cols", "80", "--rows", "24",   # the tmux `-x 80 -y 24` geometry

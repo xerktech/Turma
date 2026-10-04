@@ -514,3 +514,20 @@ test('C14: EL/ED at the pending-wrap column do not grow the row past `cols`', ()
     }
   }
 });
+
+test('XERK-1588: readTokenFileAtStart bakes the token from the file, never argv', async () => {
+  const { mkdtempSync, writeFileSync, mkdirSync } = await import('node:fs');
+  const { tmpdir } = await import('node:os');
+  const { join } = await import('node:path');
+  const d = mkdtempSync(join(tmpdir(), 'ptytok-'));
+  const f = join(d, 'auth-token');
+  writeFileSync(f, 'host-token\n');
+  assert.equal(T.readTokenFileAtStart(f), 'host-token');
+  // Every unusable shape is '' — the startup guard refuses to run unauthenticated.
+  assert.equal(T.readTokenFileAtStart(''), '');
+  assert.equal(T.readTokenFileAtStart(join(d, 'missing')), '');
+  mkdirSync(join(d, 'dir'));
+  assert.equal(T.readTokenFileAtStart(join(d, 'dir')), '', 'not a regular file');
+  writeFileSync(join(d, 'big'), 'x'.repeat(5000));
+  assert.equal(T.readTokenFileAtStart(join(d, 'big')), '', 'over the size cap');
+});

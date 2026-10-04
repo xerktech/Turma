@@ -7489,6 +7489,9 @@ class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
         # An ephemeral terminal port (nobody proxies the probe's terminal).
         self.assertEqual(cmd[cmd.index("--term-port") + 1], "0")
         self.assertEqual(cmd[cmd.index("--cwd") + 1], ha.REGISTRY_DIR)
+        # XERK-1588: the host token rides the owner-only file, never argv.
+        self.assertNotIn("--auth-token", cmd)
+        self.assertIn("--auth-token-file", cmd)
         # The claude argv rides after the launcher, past the `--` separator.
         dd = cmd.index("--")
         argv = cmd[dd + 1:]
@@ -10555,6 +10558,13 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
     itself (restart just this manager) without stopping active sessions. When
     the tmux is gone it falls back to today's --resume relaunch."""
 
+    def setUp(self):
+        super().setUp()
+        # Popen is faked here, so no ttyd ever creates its socket (XERK-1588).
+        p = mock.patch.object(ha, "_await_unix_sock", return_value=True)
+        p.start()
+        self.addCleanup(p.stop)
+
     def _running_sess(self):
         return {
             "id": "aaaaa", "status": "running", "ttydPort": 7700,
@@ -10657,14 +10667,15 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
     def test_launch_ttyd_adopts_our_surviving_ttyd(self):
         # A ttyd WE launched that survived a manager restart still holds the port
         # and its pid is alive. _launch_ttyd must adopt it (no rebind, no Popen) —
-        # PROVIDED its baked-in token still matches (XERK-578: a mismatch, e.g.
-        # after a token roll, forces a relaunch instead; covered separately).
+        # PROVIDED it listens on the session's owner-only socket (XERK-1588; an
+        # older TCP ttyd is relaunched instead, covered separately).
         sm = self.make_manager()
         sess = self._running_sess()
         sess["ttydPid"] = 5150
-        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        sess["ttydSock"] = ha._ttyd_sock_path(7700)
         sess["ttydTmuxSocket"] = ha.TMUX_SOCKET
         with mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_unix_sock_open", return_value=True), \
              mock.patch.object(ha, "_port_open", return_value=True), \
              mock.patch.object(ha.subprocess, "Popen") as popen:
             sm._launch_ttyd(sess)
@@ -10677,9 +10688,10 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._running_sess()
         sess["ttydPid"] = 5150
-        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        sess["ttydSock"] = ha._ttyd_sock_path(7700)
         with mock.patch.object(ha, "_legacy_tmux", {sess["tmuxName"]}), \
              mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_unix_sock_open", return_value=True), \
              mock.patch.object(ha, "_port_open", return_value=True), \
              mock.patch.object(ha.subprocess, "Popen") as popen:
             sm._launch_ttyd(sess)
@@ -10692,9 +10704,11 @@ class TestResumeOnBootAdopt(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._running_sess()
         sess["ttydPid"] = 5150
-        sess["ttydTokenFp"] = ha._token_fp(ha.TURMA_TOKEN)
+        sess["ttydSock"] = ha._ttyd_sock_path(7700)
         ports = iter([True, False])  # open at the adopt check, freed after kill
-        with mock.patch.object(ha, "_pid_alive", return_value=True), \
+        alive = iter([True])          # alive at the adopt check, exited after kill
+        with mock.patch.object(ha, "_pid_alive",
+                               side_effect=lambda *a, **k: next(alive, False)), \
              mock.patch.object(ha, "_port_open",
                                side_effect=lambda *a, **k: next(ports, False)), \
              mock.patch.object(ha, "time"), \
@@ -33739,6 +33753,7 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
         class FakeProc:
             def __init__(self, cmd, stdout=None, **kw):
                 test.popen_calls.append(cmd)
+                test.popen_envs = getattr(test, "popen_envs", []) + [kw.get("env")]
                 if reply is not None and stdout is not None:
                     stdout.write(reply)
                     stdout.flush()
@@ -33762,6 +33777,38 @@ class TestJiraTriage(ManagerMixin, unittest.TestCase):
             "source": None, "reason": "heartbeat lives there", "manual": False,
             "at": sm.jira["tickets"][0]["repoGuess"]["at"],
         })
+
+    def test_triage_claude_runs_without_the_agent_secrets(self):
+        # XERK-1588: the triage prompt carries untrusted ticket text, so the
+        # headless claude must not inherit TURMA_TOKEN (a prompt-injected "print
+        # your env" would otherwise hand out the host's hub credential).
+        sm = self._manager([{"key": "ENG-1", "summary": "x"}])
+        with self._configured(), \
+                mock.patch.dict(os.environ, {"TURMA_TOKEN": "s3cret",
+                                             "TURMA_AGENT_TOKEN": "m4ster"}), \
+                self._fake_popen('{}'):
+            sm._start_jira_triage()
+        env = self.popen_envs[-1]
+        self.assertIsNotNone(env, "an inherited (None) env carries every secret")
+        self.assertNotIn("TURMA_TOKEN", env)
+        self.assertNotIn("TURMA_AGENT_TOKEN", env)
+
+    def test_every_headless_claude_run_gets_the_scrubbed_env(self):
+        # XERK-1588: pins EVERY prompt-driven `claude -p` launch, not just the
+        # triage one above — each prompt carries untrusted ticket/transcript text.
+        # A launch either passes env=_session_env() itself or hands its argv to
+        # the one lockdown runner, which does.
+        import inspect
+        src = inspect.getsource(ha)
+        sites = [m.start() for m in re.finditer(r'\["claude", "-p"', src)]
+        self.assertGreaterEqual(len(sites), 7)
+        for at in sites:
+            window = src[at:at + 900]
+            routed = '"argv": ["claude", "-p"' in src[at - 12:at + 30]
+            self.assertTrue(routed or "env=_session_env()" in window,
+                            src[at:at + 120])
+        runner = inspect.getsource(ha.SessionManager._run_lockdown_oneshot)
+        self.assertIn("env=_session_env()", runner)
 
     def test_untriaged_ticket_carries_no_guess_at_all(self):
         # Absence must not read as "no repo fits" — the board draws nothing for
@@ -37811,6 +37858,19 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         self.assertEqual(pid, 1234)
         self.assertEqual(probes[:3], [7742, 7742, 7742])
 
+    def test_spawn_refuses_when_the_token_file_cannot_be_written(self):
+        """XERK-1588: the pty-host bakes its token from the file at start (it is
+        no longer on argv), so spawning over a failed write would bake whatever
+        older token the file still holds and lock the manager's TURMA_TOKEN-authed
+        control channel out of its own pty-host."""
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_teardown", return_value=True), \
+             mock.patch.object(ha, "_write_pty_token_file", return_value=False), \
+             mock.patch.object(ha, "_launch_pty_via_task") as launch:
+            with self.assertRaises(RuntimeError):
+                ha._pty_spawn_and_wait("agent-w1", ["node"], self.tmp, {}, None)
+        launch.assert_not_called()
+
     def test_spawn_refuses_while_the_old_pty_host_still_holds_the_port(self):
         """A reap that failed AND a port still held means the relaunch cannot
         succeed anyway — starting it would put a second claude on the worktree.
@@ -37982,7 +38042,10 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         self.assertIn("--session", cmd)
         self.assertIn("w1", cmd)
         self.assertEqual(cmd[cmd.index("--term-port") + 1], "7742")
-        self.assertEqual(cmd[cmd.index("--auth-token") + 1], "tok")
+        # XERK-1588: the host token is never on the pty-host's command line,
+        # which other local users can read; only the owner-only file carries it.
+        self.assertNotIn("--auth-token", cmd)
+        self.assertNotIn("tok", cmd)
         # ...and the LIVE token file the pty-host re-reads per auth check, so a
         # hub token roll needs no relaunch (which here would kill the operator's
         # claude, the pty-host being both the terminal and the pty).
@@ -38134,73 +38197,209 @@ class TestWindowsTerminalBackendManager(ManagerMixin, unittest.TestCase):
         self.assertNotIn("secretkey", " ".join(captured["argv"]))
 
 
-class TestTtydTokenRelaunch(unittest.TestCase):
-    """XERK-578 follow-up: ttyd bakes its basic-auth token in at launch and
-    outlives a manager-only restart (KillMode=process), so after a token ROLL the
-    adopt path must RELAUNCH it (not adopt the stale-password survivor) or the
-    hub's now-derived credential 401s the terminal into a browser password
-    prompt."""
+class TestTtydUnixSocket(unittest.TestCase):
+    """XERK-1588: ttyd took its basic-auth credential (`-c term:<TURMA_TOKEN>`) on
+    argv, world-readable through /proc, and listened on a loopback port every
+    local uid can reach — so any local user could read the hub credential AND
+    attach a writable terminal. Each ttyd now listens on a UNIX socket in an
+    owner-only dir and carries no credential at all."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="ttyd-sock-")
+        self.addCleanup(shutil.rmtree, self.tmp, ignore_errors=True)
+        p = mock.patch.object(ha, "TTYD_SOCK_DIR", os.path.join(self.tmp, "ttyd"))
+        p.start()
+        self.addCleanup(p.stop)
 
     def _mgr(self):
         sm = ha.SessionManager.__new__(ha.SessionManager)
         sm.ttyd = {}
+        sm.registry = []
         return sm
 
-    def test_adopts_when_the_token_fingerprint_still_matches(self):
+    def _sess(self, **kw):
+        return {"id": "s1", "ttydPort": 7700, "tmuxName": "agent-s1", **kw}
+
+    def test_ttyd_listens_on_the_owner_only_socket_with_no_secret_on_argv(self):
         sm = self._mgr()
-        sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242,
-                "tmuxName": "agent-s1", "ttydTokenFp": ha._token_fp("derivedtok"),
-                "ttydTmuxSocket": ha.TMUX_SOCKET}
-        with mock.patch.object(ha, "TURMA_TOKEN", "derivedtok"), \
-             mock.patch.object(ha, "_pid_alive", return_value=True), \
-             mock.patch.object(ha, "_port_open", return_value=True), \
+        sess = self._sess()
+        with mock.patch.object(ha, "TURMA_TOKEN", "host.secret-token"), \
+             mock.patch.object(ha, "_await_unix_sock", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen",
+                               return_value=mock.Mock(pid=9999)) as popen:
+            sm._launch_ttyd(sess)
+        argv = popen.call_args[0][0]
+        sock = os.path.join(self.tmp, "ttyd", "7700.sock")
+        self.assertEqual(argv[argv.index("-i") + 1], sock)
+        self.assertNotIn("-c", argv)
+        self.assertNotIn("-p", argv)           # no TCP listener at all
+        self.assertFalse(any("secret" in a for a in argv))
+        self.assertEqual(sess["ttydSock"], sock)
+        st = os.lstat(os.path.dirname(sock))
+        self.assertEqual(stat.S_IMODE(st.st_mode), 0o700)
+
+    def test_a_loosened_socket_dir_is_tightened_back(self):
+        os.makedirs(ha.TTYD_SOCK_DIR, mode=0o755)
+        os.chmod(ha.TTYD_SOCK_DIR, 0o755)
+        ha._ensure_ttyd_sock_dir()
+        self.assertEqual(stat.S_IMODE(os.lstat(ha.TTYD_SOCK_DIR).st_mode), 0o700)
+
+    def test_a_symlinked_socket_dir_is_refused(self):
+        target = os.path.join(self.tmp, "elsewhere")
+        os.makedirs(target)
+        os.symlink(target, ha.TTYD_SOCK_DIR)
+        with self.assertRaises(RuntimeError):
+            ha._ensure_ttyd_sock_dir()
+
+    def test_a_ttyd_that_never_listens_is_killed_and_reported(self):
+        # ttyd that cannot bind keeps running bound to nothing — its pid proves
+        # nothing, so a missing socket is a failed launch, not a live terminal.
+        sm = self._mgr()
+        sess = self._sess()
+        with mock.patch.object(ha, "_await_unix_sock", return_value=False), \
+             mock.patch.object(sm, "_kill_ttyd") as kill, \
+             mock.patch.object(ha.subprocess, "Popen", return_value=mock.Mock(pid=9999)):
+            with self.assertRaises(RuntimeError):
+                sm._launch_ttyd(sess)
+        kill.assert_called_once_with("s1")
+
+    def test_an_overlong_socket_path_is_refused_before_launch(self):
+        sm = self._mgr()
+        with mock.patch.object(ha, "TTYD_SOCK_DIR", "/" + "x" * 120), \
+             mock.patch.object(ha.subprocess, "Popen") as popen:
+            with self.assertRaises(RuntimeError):
+                sm._launch_ttyd(self._sess())
+        popen.assert_not_called()
+
+    def test_a_stale_socket_file_is_cleared_but_nothing_else_is(self):
+        sm = self._mgr()
+        ha._ensure_ttyd_sock_dir()
+        sock = ha._ttyd_sock_path(7700)
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        srv.bind(sock)
+        srv.close()                     # leaves the socket file behind
+        with mock.patch.object(ha, "_await_unix_sock", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=mock.Mock(pid=1)):
+            sm._launch_ttyd(self._sess())
+        self.assertFalse(os.path.exists(sock))
+        # A regular file at that path is not ours to delete.
+        with open(sock, "w") as f:
+            f.write("x")
+        with mock.patch.object(ha, "_await_unix_sock", return_value=True), \
+             mock.patch.object(ha.subprocess, "Popen", return_value=mock.Mock(pid=1)):
+            sm._launch_ttyd(self._sess())
+        self.assertTrue(os.path.isfile(sock))
+
+    def test_adopts_a_survivor_on_its_socket(self):
+        sm = self._mgr()
+        sess = self._sess(ttydPid=4242, ttydSock=ha._ttyd_sock_path(7700),
+                          ttydTmuxSocket=ha.TMUX_SOCKET)
+        with mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_unix_sock_open", return_value=True), \
              mock.patch.object(sm, "_kill_ttyd") as kill, \
              mock.patch.object(ha.subprocess, "Popen") as popen:
             sm._launch_ttyd(sess)
-        # An unchanged token -> adopt the survivor, no kill, no relaunch.
         kill.assert_not_called()
         popen.assert_not_called()
 
-    def test_relaunches_when_the_token_changed_under_a_survivor(self):
+    def test_a_token_roll_no_longer_relaunches_a_socket_ttyd(self):
+        # The socket ttyd carries no credential, so a roll has nothing to update.
         sm = self._mgr()
-        # ttyd was launched with the OLD (master) token; TURMA_TOKEN is now the
-        # rolled derived one, so the survivor's baked-in password is stale.
-        sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242,
-                "tmuxName": "agent-s1", "ttydTokenFp": ha._token_fp("oldmaster")}
-        ports = iter([True, False])  # open at the adopt check, freed after kill
+        sess = self._sess(ttydPid=4242, ttydSock=ha._ttyd_sock_path(7700),
+                          ttydTmuxSocket=ha.TMUX_SOCKET,
+                          ttydTokenFp=ha._token_fp("oldmaster"))
         with mock.patch.object(ha, "TURMA_TOKEN", "deriveNEW"), \
              mock.patch.object(ha, "_pid_alive", return_value=True), \
-             mock.patch.object(ha, "_port_open",
-                               side_effect=lambda *a, **k: next(ports, False)), \
-             mock.patch.object(ha, "time"), \
+             mock.patch.object(ha, "_unix_sock_open", return_value=True), \
              mock.patch.object(sm, "_kill_ttyd") as kill, \
-             mock.patch.object(ha.subprocess, "Popen",
-                               return_value=mock.Mock(pid=9999)) as popen:
+             mock.patch.object(ha.subprocess, "Popen") as popen:
             sm._launch_ttyd(sess)
-        kill.assert_called_once_with("s1")
-        popen.assert_called_once()
-        # The relaunched ttyd carries the NEW token, and the record re-fingerprints.
-        self.assertIn("term:deriveNEW", popen.call_args[0][0])
-        self.assertEqual(sess["ttydTokenFp"], ha._token_fp("deriveNEW"))
+        kill.assert_not_called()
+        popen.assert_not_called()
 
-    def test_relaunches_when_a_survivor_recorded_no_fingerprint(self):
-        # A ttyd launched by pre-XERK-578 code (an ALREADY-rolled host) recorded
-        # no fingerprint, so it must relaunch to pick up the current token —
-        # this is what self-heals hosts rolled before the fix shipped.
+    def test_relaunches_an_older_agents_tcp_ttyd_onto_the_socket(self):
+        # An older agent's ttyd is on a loopback port with the host token on its
+        # argv; adopting it would keep both exposed, so it is replaced.
         sm = self._mgr()
-        sess = {"id": "s1", "ttydPort": 7700, "ttydPid": 4242, "tmuxName": "agent-s1"}
-        ports = iter([True, False])
-        with mock.patch.object(ha, "TURMA_TOKEN", "derivedtok"), \
-             mock.patch.object(ha, "_pid_alive", return_value=True), \
+        sess = self._sess(ttydPid=4242, ttydTmuxSocket=ha.TMUX_SOCKET,
+                          ttydTokenFp=ha._token_fp("tok"))
+        ports = iter([True, False])  # open at the adopt check, freed after kill
+        alive = iter([True])          # alive at the adopt check, exited after kill
+        with mock.patch.object(ha, "TURMA_TOKEN", "tok"), \
+             mock.patch.object(ha, "_pid_alive",
+                               side_effect=lambda *a, **k: next(alive, False)), \
              mock.patch.object(ha, "_port_open",
                                side_effect=lambda *a, **k: next(ports, False)), \
-             mock.patch.object(ha, "time"), \
+             mock.patch.object(ha, "_await_unix_sock", return_value=True), \
+             mock.patch.object(ha.time, "sleep"), \
              mock.patch.object(sm, "_kill_ttyd") as kill, \
              mock.patch.object(ha.subprocess, "Popen",
                                return_value=mock.Mock(pid=9999)) as popen:
             sm._launch_ttyd(sess)
         kill.assert_called_once_with("s1")
-        popen.assert_called_once()
+        argv = popen.call_args[0][0]
+        self.assertNotIn("term:tok", argv)
+        self.assertNotIn("-c", argv)
+        self.assertEqual(sess["ttydSock"], ha._ttyd_sock_path(7700))
+        self.assertNotIn("ttydTokenFp", sess)
+
+    def test_a_relaunch_waits_for_the_old_ttyd_to_exit(self):
+        # A socket ttyd unlinks its socket as it exits: one dying AFTER its
+        # replacement bound would delete the new socket and kill the terminal.
+        sm = self._mgr()
+        old = mock.Mock(pid=4242)
+        old.poll.side_effect = [None, None, None, 0, 0, 0]  # exits after 3 looks
+        sm.ttyd["s1"] = old
+        sess = self._sess(ttydPid=4242)
+        with mock.patch.object(sm, "_kill_ttyd"), \
+             mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.time, "sleep") as sleep, \
+             mock.patch.object(ha.os, "kill") as kill:
+            sm._kill_and_await_ttyd(sess)
+        self.assertEqual(sleep.call_count, 3)
+        kill.assert_not_called()
+
+    def test_a_ttyd_that_will_not_exit_is_sigkilled(self):
+        # SIGKILL leaves the socket file alone, so the new ttyd's survives.
+        sm = self._mgr()
+        old = mock.Mock(pid=4242)
+        old.poll.return_value = None
+        sm.ttyd["s1"] = old
+        sess = self._sess(ttydPid=4242)
+        with mock.patch.object(sm, "_kill_ttyd"), \
+             mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha.time, "sleep"), \
+             mock.patch.object(ha.os, "kill") as kill:
+            sm._kill_and_await_ttyd(sess)
+        kill.assert_called_once_with(4242, signal.SIGKILL)
+
+    def test_await_unix_sock_wants_a_socket_not_any_file(self):
+        path = os.path.join(self.tmp, "d.sock")
+        os.mkdir(path)   # a directory there leaves ttyd bound to nothing
+        self.assertFalse(ha._await_unix_sock(path, mock.Mock(poll=lambda: 0)))
+
+    def test_never_signals_a_recycled_pid(self):
+        # Pid alive but nothing answers on the socket or port: not our ttyd.
+        sm = self._mgr()
+        sess = self._sess(ttydPid=4242, ttydSock=ha._ttyd_sock_path(7700))
+        with mock.patch.object(ha, "_pid_alive", return_value=True), \
+             mock.patch.object(ha, "_port_open", return_value=False), \
+             mock.patch.object(ha, "_await_unix_sock", return_value=True), \
+             mock.patch.object(sm, "_kill_ttyd") as kill, \
+             mock.patch.object(ha.subprocess, "Popen", return_value=mock.Mock(pid=1)):
+            sm._launch_ttyd(sess)
+        kill.assert_not_called()
+
+    def test_await_unix_sock_against_a_real_listener(self):
+        path = os.path.join(self.tmp, "a.sock")
+        proc = mock.Mock(poll=mock.Mock(return_value=0))   # already exited
+        self.assertFalse(ha._await_unix_sock(path, proc, timeout=0.2))
+        srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.addCleanup(srv.close)
+        srv.bind(path)
+        srv.listen(1)
+        self.assertTrue(ha._await_unix_sock(path, mock.Mock(poll=lambda: None)))
+        self.assertTrue(ha._unix_sock_open(path))
 
     def test_token_fp_is_short_one_way_and_never_the_token(self):
         fp = ha._token_fp("some.secret-token")
