@@ -42,11 +42,15 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     /**
      * The "Permission prompts" card. [view] is the hub's answer for the CURRENT
      * org scope, or null while that scope loads; [error] is why a read with no
-     * view for this scope failed, in the hub's own words (XERK-264).
+     * view for this scope failed, in the hub's own words (XERK-264). [at] is
+     * the wall clock the view landed at — the "N ago" ages' now, as the web takes
+     * `Date.now()` on each paint. It also makes every refresh EMIT: an unchanged
+     * ledger is an equal value the StateFlow would drop, freezing the ages.
      */
     data class PermissionsUi(
         val view: PermissionSummary? = null,
         val error: String? = null,
+        val at: Long = 0L,
     )
 
     private val _permissions = MutableStateFlow(PermissionsUi())
@@ -79,6 +83,10 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
                 .collect { (f, o) ->
                     if (!f.loading && f.error == null) fleetReady = true
                     if (fleetReady) syncPermissions(Permissions.scope(f.agents, o))
+                    // No fleet yet and the fleet read failed: say why rather than
+                    // "Loading…" with no end. The first good snapshot clears it.
+                    else if (f.error != null && permStateScope == null)
+                        _permissions.value = PermissionsUi(error = f.error)
                 }
         }
         while (isActive) {
@@ -115,7 +123,7 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
             if (seq != permSeq.get()) return@launch          // the scope moved under this answer
             if (body != null) {
                 permStateScope = scope
-                _permissions.value = PermissionsUi(view = body)
+                _permissions.value = PermissionsUi(view = body, at = System.currentTimeMillis())
                 return@launch
             }
             if (_permissions.value.view != null && permStateScope == scope) return@launch

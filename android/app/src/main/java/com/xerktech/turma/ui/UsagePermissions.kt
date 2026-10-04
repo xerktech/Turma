@@ -53,7 +53,7 @@ import com.xerktech.turma.vm.UsageViewModel
 @Composable
 internal fun PermissionsSection(
     ui: UsageViewModel.PermissionsUi,
-    nowMs: Long = System.currentTimeMillis(),
+    nowMs: Long = ui.at.takeIf { it > 0 } ?: System.currentTimeMillis(),
 ) {
     val view = ui.view
     val days = view?.days?.takeIf { it > 0 } ?: Permissions.DAYS

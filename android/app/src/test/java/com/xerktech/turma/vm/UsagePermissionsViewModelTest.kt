@@ -10,6 +10,7 @@ import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import org.junit.After
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
@@ -150,5 +151,43 @@ class UsagePermissionsViewModelTest {
         assertNull(vm.permissions.value.error)
         assertNotNull(vm.permissions.value.view)
         assertTrue(vm.permissions.value.view!!.recent.isEmpty())
+    }
+
+    @Test
+    fun `a failed fleet read before any snapshot says why instead of loading forever`() {
+        routeByOrg()
+        hub.container.org.set(setOf("acme"))
+        hub.route("/api/agents") { MockResponse().setResponseCode(500) }
+        runBlocking { hub.container.fleet.refresh() }
+        val fleetError = hub.container.fleet.state.value.error
+        assertNotNull(fleetError)
+        val vm = UsageViewModel(hub.app)
+        startWatching(vm)
+        hub.awaitFlow(vm.permissions) { it.error != null }
+        assertEquals(fleetError, vm.permissions.value.error)
+        // Still nothing fetched: no org is known yet.
+        assertNull(hub.findRequestOrNull("/api/permissions", timeoutMs = 500))
+
+        // The first good snapshot clears it and fetches the scoped card.
+        hub.seedFleet(fleet)
+        hub.awaitFlow(vm.permissions) { it.view != null }
+        assertEquals("acme-cmd", headOf(vm))
+        assertNull(vm.permissions.value.error)
+    }
+
+    @Test
+    fun `an unchanged ledger still re-emits on refresh, so the ages keep moving`() {
+        hub.json("/api/permissions", summary("git status"))
+        val vm = UsageViewModel(hub.app)
+        runBlocking { vm.refreshPermissions(emptyList()).join() }
+        val first = vm.permissions.value
+        assertTrue("the view carries the time it landed", first.at > 0)
+        Thread.sleep(5)
+        runBlocking { vm.refreshPermissions(emptyList()).join() }
+        val second = vm.permissions.value
+        assertEquals(first.view, second.view)
+        // An equal value is dropped by the StateFlow; the stamp makes it a new one.
+        assertNotEquals(first, second)
+        assertTrue(second.at > first.at)
     }
 }
