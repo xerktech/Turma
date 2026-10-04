@@ -295,6 +295,9 @@
      Ready-for-review accent, stalled in the danger colour it has everywhere. */
   .sess-review { color: var(--accent-text); }
   .sess-stalled { color: var(--critical-text); }
+  /* The wait classifier's verdict under a needs-you State row (XERK-1572). */
+  .sess-hint { font-size: 12px; color: var(--ink); margin-top: 2px; }
+  .sess-hint.answer { color: var(--ink-2); font-style: italic; }
   /* A State row's "· for 22m" never breaks at its dot (XERK-1571): see stateAge. */
   .state-age { white-space: nowrap; }
 
@@ -1142,11 +1145,12 @@ const NEEDS_YOU_CHIP = {
   "needs-you:question": ["question", "question"],
   "needs-you:permission": ["permission", "permission"],
   "needs-you:review": ["review", "review"],
-  "needs-you:test": ["review", "test"],
+  "needs-you:test": ["review", "awaiting your test"],
   "needs-you:stalled": ["stalled", "stalled"],
 };
 // A card's State row for a session the hub says needs the operator, or null:
-// "review · PR open · CI passing", "stalled · Watch CI". liveState falls back to
+// "review · PR open · CI passing", "awaiting your test · PR open" (the headline
+// the Sessions page's card gives it too), "stalled · Watch CI". liveState falls back to
 // it where it would otherwise say "idle" — a session Ready for review lists must
 // not read idle on its own card.
 function attentionLabel(att) {
@@ -1157,6 +1161,22 @@ function attentionLabel(att) {
   if (cls === "permission") return { label: "waiting for your permission", cls: "sess-wait" };
   return { label: [word, att.why].filter(Boolean).join(" · "),
            cls: cls === "stalled" ? "sess-stalled" : "sess-review" };
+}
+// The wait classifier's verdict (XERK-1572): "decision · Pick schema v2 or v3"
+// plus the answer it suggests, from the hub's `attention.hint` — an unlabelled
+// row on a needs-you card, under the State and any Question / Permission row it
+// answers. Same words and order as sessions.html.
+const HINT_KIND = {
+  "rubber-stamp": "go-ahead", "design-decision": "decision", "needs-human-test": "needs a human test",
+  "blocked-on-host": "blocked on the host", "looping": "looping", "waiting-external": "waiting on something outside",
+};
+function attentionHintHtml(att) {
+  const h = att && NEEDS_YOU_CHIP[att.state] ? att.hint : null;
+  if (!h || typeof h.why !== "string" || !h.why) return "";
+  const kind = HINT_KIND[h.label] ? `<b>${esc(HINT_KIND[h.label])}</b>\u00a0·\u00a0` : "";
+  const ans = typeof h.suggestedAnswer === "string" && h.suggestedAnswer
+    ? `<div class="sess-hint answer">Suggested: ${esc(h.suggestedAnswer)}</div>` : "";
+  return `<div class="sess-hint">${kind}${esc(h.why)}</div>${ans}`;
 }
 function needsYou(sess) {
   return sess
@@ -1259,6 +1279,10 @@ function liveState(sess, host, now) {
     return { label: "waiting for your permission", cls: "sess-wait",
              ask: permissionAsk(sess), busy: true,
              detail: attentionFor(sess.attention, now, "needs-you:permission") };
+  // LOOPING (XERK-1572): busy, but the hub says it is stuck repeating one failing
+  // call — "stalled · repeating Bash ×5", never "working". Same as sessions.html.
+  if (s && s.loop && sess.attention?.state === "needs-you:stalled")
+    return { ...attentionLabel(sess.attention), detail: attentionFor(sess.attention, now), busy: true };
   if (!s || s.transcriptAgeSec == null) return { label: "no transcript yet", cls: "" };
   const age = s.transcriptAgeSec * 1000 + Math.max(0, now - host.lastSeen);
   // Background agents, which paneBusy cannot see: a session that delegated work
@@ -1985,6 +2009,11 @@ function sessCard(a, s, now) {
     ? `<dt>PRs</dt><dd class="pr-list">${prItems.map(prBadgeHtml).join("")}</dd>`
     : "";
 
+  // The wait classifier's verdict (XERK-1572) is its own row AFTER the Question
+  // / Permission one: it answers that question or command, so it reads below it,
+  // the order the Sessions page's Ready-for-review card uses.
+  const hint = live && !killing ? attentionHintHtml(s.attention) : "";
+
   return `<div class="sess ${st}${killing ? " killing" : ""}">
     <div class="sess-hd">
       <span class="sid">${id}</span>
@@ -2008,6 +2037,7 @@ function sessCard(a, s, now) {
         : ""}
       ${live && live.question ? `<dt>Question</dt><dd>${esc(live.question)}</dd>` : ""}
       ${live && live.ask ? `<dt>Permission</dt><dd>${esc(live.ask)}</dd>` : ""}
+      ${hint ? `<dt></dt><dd>${hint}</dd>` : ""}
       ${st === "error" && s.errorMsg ? `<dt>Error</dt><dd class="errmsg">${esc(s.errorMsg)}</dd>` : ""}
       ${prs}
       <dt>Created</dt><dd>${s.createdAt ? esc(ago(now - Date.parse(s.createdAt))) : "–"}${s.stoppedAt ? " · stopped " + esc(ago(now - Date.parse(s.stoppedAt))) : ""}</dd>

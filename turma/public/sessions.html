@@ -137,6 +137,11 @@
   /* Why a Ready-for-review card is the operator's, and for how long — the
      hub's attention read (XERK-1571). */
   .s-card .why { font-size: 11px; color: var(--ink-2); margin-top: 3px; }
+  /* What the wait classifier says the session waits on, and the answer it
+     suggests (XERK-1572) — a review card's third and fourth lines. */
+  .s-card .att-hint { font-size: 11px; color: var(--ink); margin-top: 3px; }
+  .s-card .att-hint .hint-kind { font-weight: 600; }
+  .s-card .att-hint.answer { color: var(--ink-2); font-style: italic; }
   /* A card in the Ready-for-review section says why it is there instead of the
      bare "idle" it would otherwise read (XERK-224). */
   .s-card .state.review { color: var(--accent-text); font-weight: 600; }
@@ -2397,16 +2402,42 @@ function readyForReview(s, live) {
 // "idle" under a heading that says they are not, so they say why they qualified.
 function reviewState(s, live, now) {
   const why = attentionWhy(s, now);
-  if (live.kind !== "idle") return { ...live, why };
+  const hint = attentionHint(s.attention);
+  // A LOOPING session is busy, so this page reads it working — but the hub says
+  // it is stuck repeating one failing call (XERK-1572): the hub's read, in the
+  // danger tone, like any stall.
+  if (live.kind === "working" && s.attention?.state === "needs-you:stalled")
+    return { ...live, kind: "review", stalled: true, hint,
+             label: ["stalled", s.attention.why].filter(Boolean).join(" · "), why };
+  if (live.kind !== "idle") return { ...live, why, hint };
   // A stalled background wait keeps its own reason — it is why it is here.
-  if (live.stalled) return { ...live, kind: "review", why };
+  if (live.stalled) return { ...live, kind: "review", why, hint };
   // The hub says it stalled where this page can't judge silence (XERK-1571: the
   // host just went quiet) — the hub's read, in the danger tone it has anywhere.
   if (s.attention?.state === "needs-you:stalled")
-    return { ...live, kind: "review", stalled: true,
+    return { ...live, kind: "review", stalled: true, hint,
              label: ["stalled", s.attention.why].filter(Boolean).join(" · "), why };
-  const label = (s.prs || []).some(p => !prLanded(p)) ? "PR awaiting review" : "finished · awaiting review";
-  return { ...live, kind: "review", label, detail: live.detail, why };
+  // A review the classifier says needs a human TEST (XERK-1572) says so in its
+  // headline, the dashboard card's State row word, so it never reads as a plain
+  // review whose only difference is its third line.
+  const label = s.attention?.state === "needs-you:test" ? "awaiting your test"
+    : (s.prs || []).some(p => !prLanded(p)) ? "PR awaiting review" : "finished · awaiting review";
+  return { ...live, kind: "review", label, detail: live.detail, why, hint };
+}
+
+// The wait classifier's verdict on a needs-you card (XERK-1572): what kind of
+// wait it is and why, and the answer it suggests — the hub's `attention.hint`,
+// null when it serves none. Same words on the dashboard (index.html), Android
+// (`attentionHintLine`) and the glasses phone card.
+const HINT_KIND = {
+  "rubber-stamp": "go-ahead", "design-decision": "decision", "needs-human-test": "needs a human test",
+  "blocked-on-host": "blocked on the host", "looping": "looping", "waiting-external": "waiting on something outside",
+};
+function attentionHint(att) {
+  const h = att?.hint;
+  if (!h || typeof h.why !== "string" || !h.why) return null;
+  return { kind: HINT_KIND[h.label] || "", why: h.why,
+           answer: typeof h.suggestedAnswer === "string" ? h.suggestedAnswer : "" };
 }
 
 // The hub's attention read (XERK-1571), as a review card's second line: WHY the
@@ -2872,6 +2903,8 @@ function activeCard({ a, s, live }) {
         ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
         ${live.ask ? `<div class="question ask">${esc(live.ask)}</div>` : ""}
         ${live.why ? `<div class="why">${esc(live.why)}</div>` : ""}
+        ${live.hint ? `<div class="att-hint">${live.hint.kind ? `<span class="hint-kind">${esc(live.hint.kind)}</span>\u00a0·\u00a0` : ""}${esc(live.hint.why)}</div>` : ""}
+        ${live.hint?.answer ? `<div class="att-hint answer">Suggested: ${esc(live.hint.answer)}</div>` : ""}
         ${moving}
       </span>
     </div>

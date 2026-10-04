@@ -8260,7 +8260,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "historyResults", "trajectoryTailResults", "subagentHistoryResults", "jiraIssueResults",
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
-  "spawnFailures", "epicBuilderStatus", "permissionEvents",
+  "spawnFailures", "epicBuilderStatus", "permissionEvents", "attentionHints",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -8914,6 +8914,23 @@ function coerceLiveSignals(live) {
   if ("wakeReason" in live) {
     if (typeof live.wakeReason === "string") live.wakeReason = live.wakeReason.slice(0, 200);
     else delete live.wakeReason;
+  }
+  // The loop signal (XERK-1572): a run of the same failing call. Rebuilt to its
+  // three named fields — `repeats` a positive int32, `tool` a non-empty string
+  // capped at 64, `since` epoch ms — else omitted (the agent sends null when
+  // there is no loop). Never repaired: a wrong `loop` is no loop.
+  if ("loop" in live) {
+    const l = live.loop;
+    if (objectish(l) && wireInt32(l.repeats) && l.repeats > 0 && typeof l.tool === "string" &&
+        l.tool && Number.isSafeInteger(l.since) && l.since > 0) {
+      live.loop = { repeats: l.repeats, tool: l.tool.slice(0, 64), since: l.since };
+    } else delete live.loop;
+  }
+  // The wait-classifier edge the agent sees now (XERK-1572): epoch ms, the
+  // `edgeTs` of the attentionHints row that answers it. Absent = no edge or can't
+  // tell, and then no verdict is folded.
+  if ("attentionEdgeTs" in live && !(Number.isSafeInteger(live.attentionEdgeTs) && live.attentionEdgeTs > 0)) {
+    delete live.attentionEdgeTs;
   }
   coerceStringList(live, "questionOptions");
   coerceStringList(live, "newPrUrls");
@@ -11433,9 +11450,8 @@ function sessionSleeping(live, now) {
 }
 
 // The attention states (XERK-1571), served as `session.attention.state`. The
-// `needs-you:*` ones are the operator's; `needs-you:test` is RESERVED for the
-// wait classifier (XERK-1572) — nothing produces it yet, so such a session
-// still reads `needs-you:review`.
+// `needs-you:*` ones are the operator's; `needs-you:test` is a review the wait
+// classifier (XERK-1572) says asks a person to test something by hand.
 const ATTENTION_STATES = new Set([
   "needs-you:question", "needs-you:permission", "needs-you:review", "needs-you:test",
   "needs-you:stalled", "working", "waiting", "sleeping", "idle",
@@ -11485,9 +11501,14 @@ function permissionWhy(pp) {
 // One session's attention (XERK-1571): {state, eta?, why?} — `since` is added
 // by the caller from the edge it keeps in alerts.sessions. Pure; `working` and
 // `wait` are the caller's sessionWorking/sessionWait reads. Precedence, highest
-// first: question > permission > working > sleeping > waiting > stalled >
-// review > idle. A question outranks stalled and review, so a pending question
-// suppresses both alerts.
+// first: question > permission > looping > working > sleeping > waiting >
+// stalled > review > idle. A question outranks stalled and review, so a pending
+// question suppresses both alerts.
+//
+// LOOPING (XERK-1572) is the agent's `loop` signal — the same failing call run
+// LOOP_REPEATS_MIN+ times in a row — and reads needs-you:stalled with `cause:
+// "loop"` (internal: it picks the nudge text and is never served). It outranks
+// working on purpose: a looping session is busy, which is exactly how it hides.
 function sessionAttention(session, working, wait, now) {
   if (session.status !== "running") return { state: "idle" };
   const s = session.session || {};
@@ -11495,6 +11516,10 @@ function sessionAttention(session, working, wait, now) {
   const eta = (t) => (Number.isSafeInteger(t) && t > 0 ? { eta: t } : {});
   if (s.question) return { state: "needs-you:question", ...why(s.question) };
   if (s.panePrompt && s.panePrompt.prompt) return { state: "needs-you:permission", ...why(permissionWhy(s.panePrompt)) };
+  const loop = s.loop;
+  if (loop && Number.isSafeInteger(loop.repeats) && typeof loop.tool === "string" && loop.tool) {
+    return { state: "needs-you:stalled", cause: "loop", ...why(`repeating ${loop.tool} ×${loop.repeats}`) };
+  }
   if (working) return { state: "working" };
   if (sessionSleeping(s, now)) return { state: "sleeping", ...eta(s.wakeAt), ...why(s.wakeReason) };
   if (wait) {
@@ -11503,6 +11528,71 @@ function sessionAttention(session, working, wait, now) {
   }
   if (readyForReview(session, working, wait, now)) return { state: "needs-you:review", ...why(reviewWhy(session)) };
   return { state: "idle" };
+}
+
+// ---- the wait classifier's verdict (XERK-1572) --------------------------------
+// The agent asks a `claude -p` WHY a session waits, once per new needs-you/stalled
+// edge, and ships the verdict as an `attentionHints` row: {key: "<sid>:<edge-ts>",
+// sessionId, edge, edgeTs, label, why, suggestedAnswer?}. Whitelisted here
+// (strict label + edge enums, texts capped), folded into that session's attention
+// as `attention.hint` while the state it answers holds AND the agent still reports
+// that edge: the session's live `attentionEdgeTs` names the edge the agent sees
+// now, so a second wait of the same kind (back-to-back dialogs, a turn shorter
+// than a beat) never wears the first one's verdict.
+const ATTENTION_HINT_LABELS = new Set([
+  "rubber-stamp", "design-decision", "needs-human-test", "blocked-on-host", "looping",
+  "waiting-external",
+]);
+const ATTENTION_HINT_TEXT_MAX = 300;
+const ATTENTION_HINTS_MAX = 50;
+// Which attention state a hint's agent-side edge answers.
+const ATTENTION_HINT_EDGE_STATES = {
+  question: "needs-you:question", permission: "needs-you:permission",
+  review: "needs-you:review", stalled: "needs-you:stalled", loop: "needs-you:stalled",
+};
+function hintText(v) {
+  return typeof v === "string" ? v.replace(/\s+/g, " ").trim().slice(0, ATTENTION_HINT_TEXT_MAX) : "";
+}
+function normalizeAttentionHint(h) {
+  if (!objectish(h)) return null;
+  const sid = h.sessionId;
+  if (typeof sid !== "string" || !sid || sid.length > 128) return null;
+  if (!Object.hasOwn(ATTENTION_HINT_EDGE_STATES, h.edge) || !ATTENTION_HINT_LABELS.has(h.label)) return null;
+  if (!(Number.isSafeInteger(h.edgeTs) && h.edgeTs > 0)) return null;
+  const why = hintText(h.why);
+  if (!why) return null;
+  const out = { sessionId: sid, edge: h.edge, edgeTs: h.edgeTs, label: h.label, why };
+  // A hand test needs a real person, so no suggested reply (it could only claim
+  // a test nobody ran) — dropped here too for an agent that still sends one.
+  const ans = h.label === "needs-human-test" ? "" : hintText(h.suggestedAnswer);
+  if (ans) out.suggestedAnswer = ans;
+  return out;
+}
+function normalizeAttentionHints(list) {
+  if (!Array.isArray(list)) return [];
+  return list.slice(0, ATTENTION_HINTS_MAX).map(normalizeAttentionHint).filter(Boolean);
+}
+// Review and test are one edge: the verdict that turns a review into a test must
+// not restart how long it has waited.
+const REVIEW_ATTENTION = new Set(["needs-you:review", "needs-you:test"]);
+function sameAttentionEdge(a, b) {
+  return a === b || (REVIEW_ATTENTION.has(a) && REVIEW_ATTENTION.has(b));
+}
+// The attention with `sa.hint` folded in, or null when the hint does not answer
+// THIS state: its edge names another state, or it is a loop hint on a wait stall
+// (or the reverse). The caller drops a hint the first beat it answers nothing,
+// so a later wait of the same kind never inherits it. `needs-human-test` on a
+// review is needs-you:test.
+function attentionWithHint(attn, hint) {
+  if (!hint || typeof hint !== "object" || !ATTENTION_HINT_LABELS.has(hint.label)) return null;
+  if (ATTENTION_HINT_EDGE_STATES[hint.edge] !== attn.state) return null;
+  if (attn.state === "needs-you:stalled" && (hint.edge === "loop") !== (attn.cause === "loop")) return null;
+  const folded = { label: hint.label, why: hintText(hint.why) };
+  const ans = hintText(hint.suggestedAnswer);
+  if (ans) folded.suggestedAnswer = ans;
+  const out = { ...attn, hint: folded };
+  if (hint.label === "needs-human-test" && attn.state === "needs-you:review") out.state = "needs-you:test";
+  return out;
 }
 
 // The attention a session is SERVED with: a strict rebuild of the edge record
@@ -11514,6 +11604,13 @@ function wireAttention(attn) {
   const out = { state: attn.state, since: attn.since };
   if (wireEpochMs(attn.eta)) out.eta = attn.eta;
   if (typeof attn.why === "string" && attn.why) out.why = attn.why.slice(0, ATTENTION_WHY_MAX);
+  // The classifier's verdict (XERK-1572): {label, why, suggestedAnswer?}, each
+  // field re-checked, the whole object dropped unless label + why survive.
+  const h = attn.hint;
+  if (h && typeof h === "object" && ATTENTION_HINT_LABELS.has(h.label) && hintText(h.why)) {
+    out.hint = { label: h.label, why: hintText(h.why) };
+    if (hintText(h.suggestedAnswer)) out.hint.suggestedAnswer = hintText(h.suggestedAnswer);
+  }
   return out;
 }
 
@@ -11614,7 +11711,7 @@ function alertRecovered(key, rec, now) {
   return true;
 }
 
-function heartbeatAlerts(key, prev, next) {
+function heartbeatAlerts(key, prev, next, hints = []) {
   const now = next.lastSeen;
   const alerts = next.alerts;
   const where = next.device ? ` on ${next.device}` : "";
@@ -11687,6 +11784,12 @@ function heartbeatAlerts(key, prev, next) {
   // several Claude sessions a host runs at once.
   alerts.sessions = alerts.sessions || {};
   const liveIds = new Set();
+  // The wait classifier's verdicts this beat delivered (XERK-1572), by session +
+  // the edge each answers, so a late row for an edge already left is never taken.
+  const hintFor = new Map();
+  for (const h of Array.isArray(hints) ? hints : []) {
+    if (h && typeof h.sessionId === "string") hintFor.set(`${h.sessionId}\x00${h.edgeTs}`, h);
+  }
   for (const session of next.sessions || []) {
     liveIds.add(session.id);
     const sa = (alerts.sessions[session.id] = alerts.sessions[session.id] || { prSeen: [] });
@@ -11779,9 +11882,19 @@ function heartbeatAlerts(key, prev, next) {
     // The session's attention (XERK-1571), with `since` = the beat its state
     // last CHANGED — the `reviewAt` pattern: kept on `sa`, so it persists with
     // `alerts` and is swept with the session by the liveIds cleanup below.
-    const attn = sessionAttention(session, working, waitRead, now);
+    const base = sessionAttention(session, working, waitRead, now);
     const prevAttn = sa.attn;
-    sa.attn = { ...attn, since: prevAttn && prevAttn.state === attn.state && prevAttn.since ? prevAttn.since : now };
+    const carried = prevAttn && sameAttentionEdge(prevAttn.state, base.state) && prevAttn.since;
+    // The classifier's verdict (XERK-1572) is held on `sa.hint` and folded while
+    // the state it answers holds and the agent still reports ITS edge
+    // (`attentionEdgeTs`); one that answers nothing current is dropped.
+    const edgeTs = Number.isSafeInteger(s.attentionEdgeTs) ? s.attentionEdgeTs : null;
+    const incoming = edgeTs ? hintFor.get(`${session.id}\x00${edgeTs}`) : null;
+    if (incoming) sa.hint = incoming;
+    const folded = sa.hint && sa.hint.edgeTs === edgeTs ? attentionWithHint(base, sa.hint) : null;
+    if (sa.hint && !folded) delete sa.hint;
+    const attn = folded || base;
+    sa.attn = { ...attn, since: carried ? prevAttn.since : now };
     const stalled = attn.state === "needs-you:stalled";
     // Only PRs still in play are worth naming — one merged while the alert was
     // held has answered itself.
@@ -11843,7 +11956,10 @@ function heartbeatAlerts(key, prev, next) {
     const stalledKey = `stalled:${key}:${session.id}`;
     if (stalled && !sa.stalledAlerted && prevAttn && prevAttn.state !== "needs-you:stalled" && !recovered) {
       const repo = session.git?.repoName ? ` · ${session.git.repoName}@${session.git.branch}` : "";
-      notify(`${label} has stalled`, `No progress waiting on ${attn.why || "a background shell"}${repo}`, {
+      const body = attn.cause === "loop"
+        ? `${attn.why} with the same failure${repo}`
+        : `No progress waiting on ${attn.why || "a background shell"}${repo}`;
+      notify(`${label} has stalled`, body, {
         tags: "hourglass",
         route,
         notifKey: stalledKey,
@@ -14092,6 +14208,105 @@ function autoCloseSweep() {
   }
 }
 
+// ---- attention nudges (XERK-1572) ---------------------------------------------
+// A session the hub reads as needs-you:stalled — a background wait gone silent, or
+// the agent's loop signal — is typed ONE message, in the operator's voice (an
+// `input` command, like autoCloseMergedMessage: the inbox is peer-framed and a
+// session is told peer text is never instruction), per (session, reason). A
+// second is sent only after ATTENTION_NUDGE_BACKOFF_MS and only while the SAME
+// stall holds; after ATTENTION_NUDGE_MAX unanswered the session stays
+// needs-you:stalled and the operator decides. A new stall edge (the session moved
+// on, then stalled again) starts its count over, still behind the backoff.
+// `attentionNudged` is keyed "<host>\x00<sid>\x00<reason>" -> {at, count, since}
+// (the autoCloseNotified shape), HA-mirrored so a failover re-sends nothing, and
+// copied onto the session's alerts edge (`sa.nudged`) so a restart forgets nothing.
+const ATTENTION_NUDGES_ON = process.env.ATTENTION_NUDGES !== "0";
+const ATTENTION_NUDGE_BACKOFF_MS = positiveEnv("ATTENTION_NUDGE_BACKOFF_MIN", 20) * 60 * 1000;
+const ATTENTION_NUDGE_MAX = 2;
+const ATTENTION_NUDGE_STATE_MAX = 500;
+const attentionNudged = new Map();
+registerGuardMirror("attentionNudged", {
+  apply: (nk, rec) => {
+    if (rec && typeof rec.at === "number" && Number.isSafeInteger(rec.count)) {
+      attentionNudged.set(nk, { at: rec.at, count: rec.count, since: rec.since });
+    }
+  },
+});
+// Session text is interpolated into an operator-voice message, so only a bounded,
+// one-line, backtick-free copy of it ever is: a shell label is the session's own
+// command/description, a tool name is restricted to the characters tool names use.
+function nudgeLabel(t) {
+  return String(t || "").replace(/[`\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 80);
+}
+function nudgeTool(t) {
+  return String(t || "").replace(/[^A-Za-z0-9_.:-]/g, "").slice(0, 64);
+}
+// The message for one stalled session, or null when there is nothing to say.
+function attentionNudgeText(reason, session) {
+  const s = session.session || {};
+  if (reason === "loop") {
+    const tool = nudgeTool(s.loop && s.loop.tool);
+    const n = s.loop && Number.isSafeInteger(s.loop.repeats) ? s.loop.repeats : 0;
+    if (!tool || !n) return null;
+    return `You have run \`${tool}\` ${n} times with the same failure. Stop, write down what you know `
+      + "on the ticket, and either take a different approach or end the turn with a `Host blocker:` line.";
+  }
+  const waits = (Array.isArray(s.agents) ? s.agents : []).filter(isWaitRow);
+  const label = waits.length === 1 ? nudgeLabel(waits[0].label) : "";
+  const subject = label ? `Your background shell \`${label}\` has`
+    : waits.length > 1 ? `Your ${waits.length} background shells have` : "Your background shell has";
+  const mins = Number.isFinite(s.transcriptAgeSec) ? Math.max(1, Math.round(s.transcriptAgeSec / 60)) : null;
+  const quiet = mins ? `produced nothing for ${mins} minute${mins === 1 ? "" : "s"}` : "gone quiet";
+  return `${subject} ${quiet}. Check whether it is still doing anything; if it is waiting on `
+    + "something with a known duration, stop it and use the session CLI's `wake`; if it is dead, "
+    + "say what you know and end the turn.";
+}
+// LEADER-ONLY (masterOrchestrationTick): reads the attention each beat decided.
+function attentionNudgeSweep(now = Date.now()) {
+  if (!ATTENTION_NUDGES_ON) return;
+  for (const [host, a] of Object.entries(agents)) {
+    if (!a || now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    const sas = (a.alerts && a.alerts.sessions) || {};
+    for (const s of a.sessions || []) {
+      if (!s || s.status !== "running" || typeof s.id !== "string") continue;
+      const sa = sas[s.id];
+      const attn = sa && sa.attn;
+      if (!attn || attn.state !== "needs-you:stalled") continue;
+      const reason = attn.cause === "loop" ? "loop" : "stalled";
+      const nk = host + "\x00" + s.id + "\x00" + reason;
+      // The map is memory (plus the HA guard store); the same record also rides the
+      // session's alerts edge (`sa.nudged`, persisted in state.json), so a non-HA
+      // restart or deploy never forgets a nudge and re-sends past the cap.
+      const kept = sa.nudged && sa.nudged[reason];
+      const rec = attentionNudged.get(nk)
+        || (kept && typeof kept.at === "number" && Number.isSafeInteger(kept.count) ? kept : undefined);
+      // A loop's stall is the RUN, not the beat it was entered: a nudge (or the
+      // operator's prompt) re-arms the agent's count but keeps the run's `since`,
+      // so the same failure resumed is the same stall and the cap still holds.
+      const loopSince = s.session && s.session.loop && s.session.loop.since;
+      const since = reason === "loop" && Number.isSafeInteger(loopSince) ? loopSince : attn.since;
+      const count = rec && rec.since === since ? rec.count : 0;
+      if (count >= ATTENTION_NUDGE_MAX) continue;
+      if (rec && now - rec.at < ATTENTION_NUDGE_BACKOFF_MS) continue;
+      const text = attentionNudgeText(reason, s);
+      if (!text) continue;
+      // `source: "nudge"`: the hub's own words, not the operator answering —
+      // the agent's permission ledger must not close an ask-in-chat row on it.
+      queueCommand(host, { type: "input", sessionId: s.id, text, source: "nudge" });
+      const next = { at: now, count: count + 1, since };
+      attentionNudged.set(nk, next);
+      guardStoreSet("attentionNudged", nk, next);
+      sa.nudged = { ...(sa.nudged && typeof sa.nudged === "object" ? sa.nudged : {}), [reason]: next };
+    }
+  }
+  if (attentionNudged.size > ATTENTION_NUDGE_STATE_MAX) {
+    const over = attentionNudged.size - ATTENTION_NUDGE_STATE_MAX;
+    for (const [k] of [...attentionNudged].sort((x, y) => x[1].at - y[1].at).slice(0, over)) {
+      attentionNudged.delete(k);
+    }
+  }
+}
+
 // PHASE 3 (XERK-637): complete an epic run. Once EVERY child in an armed run has
 // reached Done — whether the child self-closed after its PR landed (XERK-705, the
 // message autoCloseSweep sends) or a human moved it out of band — move the EPIC
@@ -14200,6 +14415,8 @@ function masterOrchestrationTick() {
   // though the close normally waits a beat for the PR poll to read MERGED.
   autoMergeSweep();
   autoCloseSweep();
+  // One nudge for a stalled or looping session (XERK-1572); no-op with none.
+  attentionNudgeSweep();
   // Epic completion (XERK-637): after autoCloseSweep has produced any child Done
   // edges this tick, move an all-children-Done epic to Done and retire its run.
   epicRunCompleteSweep();
@@ -16469,6 +16686,10 @@ const server = http.createServer(async (req, res) => {
       // stored on the record (they would ride every /api/agents body).
       const permissionEvents = payload.permissionEvents;
       delete payload.permissionEvents;
+      // The wait classifier's verdicts (XERK-1572) — whitelisted here and folded
+      // into each session's attention by heartbeatAlerts, never stored raw.
+      const attentionHints = normalizeAttentionHints(payload.attentionHints);
+      delete payload.attentionHints;
       // Archive sync manifest (see hub-agent.py _archive_manifest): the inactive
       // transcripts this host could ship. We upsert their metadata rows and hand
       // back a byte-cursor map so the agent knows what deltas to push. Kept off
@@ -16766,7 +16987,7 @@ const server = http.createServer(async (req, res) => {
         enforceCacheHostBudget(next);
         enforceCacheTotalBudget();
       }
-      heartbeatAlerts(key, prev, next);
+      heartbeatAlerts(key, prev, next, attentionHints);
       rearmMovedWatches(key, prev, next);
       // A migration finishes the instant its target session heartbeats in — do
       // the handoff (kill source, mark done) now rather than waiting out the
@@ -20370,6 +20591,15 @@ if (process.env.TURMA_TEST) {
     autoMergeState,
     autoCloseNotified,
     ingestMergeResults,
+    // Attention nudges + the wait classifier's verdict (XERK-1572).
+    attentionNudgeSweep,
+    attentionNudged,
+    attentionNudgeText,
+    ATTENTION_NUDGE_BACKOFF_MS,
+    ATTENTION_NUDGE_MAX,
+    normalizeAttentionHint,
+    normalizeAttentionHints,
+    attentionWithHint,
     // The capability-gap resolver and its wait TTL. Exported so a test can hold
     // the mergePr-specific rule directly: an ACK whose async worker-thread result
     // lands a LATER beat must NOT stamp `unsupported.mergePr` (that false gap

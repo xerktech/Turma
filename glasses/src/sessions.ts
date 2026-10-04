@@ -165,6 +165,24 @@ export function inReview(s: SessionInfo, hostLastSeen?: number, now?: number): b
   return readyForReview(s, hostLastSeen, now);
 }
 
+// The wait classifier's verdict on a needs-you card (XERK-1572, web sessions.html
+// `attentionHint`): "decision · Pick v2 or v3" and the answer it suggests. Empty
+// strings when the hub serves none, or the session no longer needs the operator.
+const HINT_KIND: Record<string, string> = {
+  "rubber-stamp": "go-ahead", "design-decision": "decision", "needs-human-test": "needs a human test",
+  "blocked-on-host": "blocked on the host", looping: "looping", "waiting-external": "waiting on something outside",
+};
+export function attentionHint(s: SessionInfo): { line: string; answer: string } {
+  const att = s.attention;
+  const h = att?.hint;
+  if (!att || !att.state.startsWith("needs-you:") || !h || typeof h.why !== "string" || !h.why) {
+    return { line: "", answer: "" };
+  }
+  const kind = HINT_KIND[h.label] ?? "";
+  return { line: kind ? `${kind} · ${h.why}` : h.why,
+           answer: typeof h.suggestedAnswer === "string" ? h.suggestedAnswer : "" };
+}
+
 // Leading status icon on each home-menu session row — chosen to be
 // glanceable on the G2's tiny monochrome display, with the two states the
 // user acts on made loud: "!" = actively working, "?" = a question from

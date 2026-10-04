@@ -8510,6 +8510,8 @@ class TestReconcileOrphanTranscripts(ManagerMixin, unittest.TestCase):
                             for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
         self.assertTrue(any(ha.SUMMARY_INSTRUCTION.startswith(s)
                             for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
+        self.assertTrue(any(ha.ATTENTION_HINT_INSTRUCTION.startswith(s)
+                            for s in ha.INTERNAL_TOOL_PROMPT_SIGS))
 
 
 class TestSanitizeJunkRepoEntries(ManagerMixin, unittest.TestCase):
@@ -37682,6 +37684,12 @@ class TestPermissionLedgerEdges(ManagerMixin, unittest.TestCase):
         os.makedirs(os.path.dirname(self.tpath))
         self.lines = []
         self.sm._perm_first_beat_done = True
+        # These pin the XERK-1563 regex, which is now the FALLBACK where the wait
+        # classifier does not run (XERK-1572); TestAttentionHints covers the
+        # classifier deciding the ask-in-chat row.
+        p = mock.patch.object(ha, "ATTENTION_HINTS_ON", False)
+        p.start()
+        self.addCleanup(p.stop)
 
     # --- helpers --------------------------------------------------------------
 
@@ -38829,6 +38837,730 @@ class TestPermissionLogTail(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "_permissions_dir_planted", return_value=False):
             self.sm._sweep_permission_logs(set())   # the O_NOFOLLOW open refuses
         self.assertTrue(os.path.exists(transcript))
+
+
+class TestLoopSignal(unittest.TestCase):
+    """The loop signal (XERK-1572): consecutive failing calls with the same tool
+    + input digest, counted in the beat's incremental scan, reported as
+    `loop: {repeats, tool, since}` from LOOP_REPEATS_MIN on."""
+
+    T0 = "2026-10-03T10:00:00Z"
+
+    def call(self, state, tuid, inp=None, tool="Bash", ok=False, ts=None):
+        for entry in (
+                {"type": "assistant", "timestamp": ts or self.T0,
+                 "message": {"role": "assistant", "content": [
+                     {"type": "tool_use", "id": tuid, "name": tool,
+                      "input": inp if inp is not None else {"command": "npm test"}}]}},
+                {"type": "user", "message": {"role": "user", "content": [
+                    {"type": "tool_result", "tool_use_id": tuid,
+                     "content": "ok" if ok else "Exit code 1", "is_error": not ok}]}}):
+            ha._scan_entry_line(json.dumps(entry).encode(), state, {})
+
+    def test_the_threshold(self):
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN - 1):
+            self.call(state, f"t{i}")
+        self.assertIsNone(ha.loop_report(state))
+        self.call(state, "t9")
+        self.assertEqual(ha.loop_report(state), {
+            "repeats": ha.LOOP_REPEATS_MIN, "tool": "Bash",
+            "since": ha._ts_ms(self.T0)})
+        self.call(state, "t10", ts="2026-10-03T10:05:00Z")
+        rep = ha.loop_report(state)
+        self.assertEqual(rep["repeats"], ha.LOOP_REPEATS_MIN + 1)
+        self.assertEqual(rep["since"], ha._ts_ms(self.T0), "since is the run's first call")
+
+    def test_a_success_resets_it(self):
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"t{i}")
+        self.assertIsNotNone(ha.loop_report(state))
+        self.call(state, "ok", inp={"command": "ls"}, ok=True)
+        self.assertIsNone(ha.loop_report(state))
+        self.assertNotIn("loop", state)
+
+    def test_a_different_failing_call_starts_a_new_run(self):
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN - 1):
+            self.call(state, f"t{i}")
+        self.call(state, "other", inp={"command": "npm run lint"})
+        for i in range(ha.LOOP_REPEATS_MIN - 2):
+            self.call(state, f"u{i}")
+        self.assertIsNone(ha.loop_report(state), "the run restarted at the other call")
+        self.assertEqual(state["loop"]["repeats"], ha.LOOP_REPEATS_MIN - 2)
+        # Same input but another tool is another call too.
+        self.call(state, "edit", tool="Edit")
+        self.assertEqual((state["loop"]["tool"], state["loop"]["repeats"]), ("Edit", 1))
+
+    def test_it_is_bounded(self):
+        state = {}
+        for i in range(ha.LOOP_PENDING_MAX + 20):   # calls whose results never land
+            ha._scan_loop_entry({"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": f"p{i}", "name": "Bash", "input": {}}]}}, state)
+        self.assertEqual(len(state["loopCalls"]), ha.LOOP_PENDING_MAX)
+        self.assertNotIn("p0", state["loopCalls"], "oldest dropped")
+        state = {"loop": {"tool": "Bash", "digest": ha._loop_digest({"command": "npm test"}),
+                          "repeats": ha.LOOP_REPEATS_CAP, "since": 1}}
+        self.call(state, "x")
+        self.assertEqual(state["loop"]["repeats"], ha.LOOP_REPEATS_CAP)
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"t{i}", tool="mcp__" + "x" * 200)
+        self.assertEqual(len(ha.loop_report(state)["tool"]), ha.LOOP_TOOL_MAX)
+
+    def prompt(self, state, content, **extra):
+        ha._scan_loop_entry(dict({"type": "user", "message": {"role": "user", "content": content}},
+                                 **extra), state)
+
+    def test_a_new_prompt_rearms_the_run_but_keeps_its_since(self):
+        # The loop, then the turn ends (a `Host blocker:` line) and the operator
+        # answers: the next turn is not still looping. The same failure resumed
+        # later is the SAME run (its `since` kept), so the hub's two-nudge cap,
+        # keyed on it, still holds across the hub's own nudge.
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"t{i}")
+        since = ha.loop_report(state)["since"]
+        ha._scan_loop_entry({"type": "assistant", "message": {"content": [
+            {"type": "text", "text": "Host blocker: npm ci cannot reach the registry."}]}}, state)
+        self.assertIsNotNone(ha.loop_report(state), "an assistant line is not a new turn")
+        self.prompt(state, "ok, leave it")
+        self.assertIsNone(ha.loop_report(state), "a new prompt is a new turn")
+        for i in range(ha.LOOP_REPEATS_MIN - 1):
+            self.call(state, f"u{i}", ts="2026-10-03T11:00:00Z")
+        self.assertIsNone(ha.loop_report(state))
+        self.call(state, "u9", ts="2026-10-03T11:00:00Z")
+        self.assertEqual(ha.loop_report(state),
+                         {"repeats": ha.LOOP_REPEATS_MIN, "tool": "Bash", "since": since})
+        # A list-content prompt re-arms too; a tool result, a meta entry, a
+        # compaction summary and a background task's notification do not.
+        self.prompt(state, [{"type": "text", "text": "try again"}])
+        self.assertIsNone(ha.loop_report(state))
+        for i in range(ha.LOOP_REPEATS_MIN):
+            self.call(state, f"v{i}")
+        for content, extra in (
+                ("<local-command-caveat>x</local-command-caveat>", {"isMeta": True}),
+                ("This session is being continued…", {"isCompactSummary": True}),
+                ("<task-notification><status>completed</status></task-notification>", {}),
+                ([{"type": "tool_result", "tool_use_id": "nope", "content": "x"}], {}),
+                ("   ", {})):
+            self.prompt(state, content, **extra)
+            self.assertIsNotNone(ha.loop_report(state), repr(content))
+
+    def test_a_sidechain_is_not_the_sessions_own_loop(self):
+        state = {}
+        for i in range(ha.LOOP_REPEATS_MIN + 1):
+            for entry in (
+                    {"type": "assistant", "isSidechain": True, "message": {"content": [
+                        {"type": "tool_use", "id": f"s{i}", "name": "Bash", "input": {}}]}},
+                    {"type": "user", "isSidechain": True, "message": {"content": [
+                        {"type": "tool_result", "tool_use_id": f"s{i}", "is_error": True}]}}):
+                ha._scan_loop_entry(entry, state)
+        self.assertIsNone(ha.loop_report(state))
+
+
+class TestSessionReportLoop(ProjectDirMixin, unittest.TestCase):
+    def test_session_report_carries_the_loop(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "user", "message": {"content": "go"}}])
+        state = {}
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertIsNone(rep["loop"])
+        lines = []
+        for i in range(ha.LOOP_REPEATS_MIN):
+            lines += [
+                {"type": "assistant", "timestamp": "2026-10-03T10:00:00Z", "message": {
+                    "content": [{"type": "tool_use", "id": f"t{i}", "name": "Bash",
+                                 "input": {"command": "make"}}]}},
+                {"type": "user", "message": {"content": [
+                    {"type": "tool_result", "tool_use_id": f"t{i}", "is_error": True,
+                     "content": "make: *** Error 2"}]}}]
+        write_jsonl(path, lines)
+        rep = ha.session_report(self.WORKDIR, state)
+        self.assertEqual(rep["loop"]["repeats"], ha.LOOP_REPEATS_MIN)
+        self.assertEqual(rep["loop"]["tool"], "Bash")
+        # A beat that appended nothing still reports it (accumulated in state).
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["loop"], rep["loop"])
+        # Only while the turn runs: an ended turn (paneBusy False) is the
+        # operator's wait to read, not a loop; can't-tell (None) keeps it.
+        with mock.patch.object(ha, "_pane_status", return_value=(False, "auto", None)):
+            self.assertIsNone(ha.session_report(self.WORKDIR, state, "agent-x")["loop"])
+        with mock.patch.object(ha, "_pane_status", return_value=(True, "auto", None)):
+            self.assertEqual(ha.session_report(self.WORKDIR, state, "agent-x")["loop"], rep["loop"])
+
+
+class TestAttentionHints(ManagerMixin, unittest.TestCase):
+    """The wait classifier (XERK-1572): a `claude -p` per NEW needs-you/stalled
+    edge, on its own worker, bounded retries, cached on the session record;
+    its verdict rides `attentionHints` and decides the ask-in-chat row."""
+
+    SID = "hint1"
+    CLAUDE_SID = "1c9f2c1e-1111-4222-8333-444455556666"
+    TS = "2026-10-03T10:00:00Z"
+
+    def setUp(self):
+        super().setUp()
+        self.sm = self.make_manager()
+        self.wt = os.path.join(self.tmp, "worktrees", "repo", "wt1")
+        os.makedirs(self.wt)
+        self.sess = {"id": self.SID, "status": "running", "tmuxName": "agent-hint1",
+                     "worktreePath": self.wt, "repoPath": self.wt,
+                     "claudeSessionId": self.CLAUDE_SID}
+        self.sm.registry = [self.sess]
+        self.tpath = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.wt),
+                                  f"{self.CLAUDE_SID}.jsonl")
+        os.makedirs(os.path.dirname(self.tpath))
+        self.sm._perm_first_beat_done = True
+        p = mock.patch.object(ha, "ATTENTION_HINTS_ON", True)
+        p.start()
+        self.addCleanup(p.stop)
+        # Never start the real worker thread here: the stage is inspected, and a
+        # verdict is handed back as the worker would stage it.
+        self.started = []
+        p = mock.patch.object(ha.threading, "Thread", self._fake_thread)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def _fake_thread(self, target=None, name=None, daemon=None):
+        t = mock.Mock()
+        t.is_alive.return_value = True
+        self.started.append(name)
+        return t
+
+    def ended(self, ts=None, text="All done — the PR is up.", **extra):
+        ts = ts or self.TS
+        with open(self.tpath, "a") as f:
+            f.write(json.dumps({"type": "assistant", "timestamp": ts, "message": {
+                "role": "assistant", "content": [{"type": "text", "text": text}]}}) + "\n")
+        sig = {"paneBusy": False, "panePrompt": None, "question": None, "agents": [],
+               "lastRole": "assistant", "lastHasToolUse": False, "lastActivityTs": ts,
+               "transcriptAgeSec": 5,
+               "tail": [{"role": "user", "text": "deploy it"},
+                        {"role": "assistant", "text": text}]}
+        sig.update(extra)
+        return sig
+
+    def beat(self, sig, at=1000):
+        self.sm._permission_edges(self.sess, sig, now_ms=at)
+        self.sm._attention_edge(self.sess, sig, now_ms=at)
+
+    def verdict(self, hint):
+        job = self.sm._attn_request
+        self.assertIsNotNone(job, "a job was staged")
+        self.sm._attn_request = None
+        self.sm._attn_results = [dict(job, hint=hint)]
+        self.sm._apply_attention_hints()
+
+    # --- edges ----------------------------------------------------------------
+
+    def test_attention_edge_reads_each_kind_in_precedence(self):
+        now = 10 ** 12
+        base = {"paneBusy": False, "lastRole": "assistant", "lastHasToolUse": False,
+                "lastActivityTs": self.TS, "transcriptAgeSec": 5, "agents": []}
+        edge = lambda **kw: ha.attention_edge(dict(base, **kw), now)
+        self.assertEqual(edge(), ("review", self.TS))
+        self.assertEqual(edge(question="Ship it?")[0], "question")
+        self.assertEqual(edge(panePrompt={"prompt": "Do you want to proceed?",
+                                          "detail": "Bash command\nls"})[0], "permission")
+        loop = {"repeats": 4, "tool": "Bash", "since": 5}
+        self.assertEqual(edge(loop=loop, paneBusy=True), ("loop", "Bash@5"))
+        self.assertIsNone(edge(paneBusy=True))
+        self.assertIsNone(edge(paneBusy=None), "can't tell is not an edge")
+        self.assertIsNone(edge(lastHasToolUse=True))
+        ci = {"type": "shell", "label": "Watch CI", "kind": "wait-external"}
+        self.assertIsNone(edge(agents=[ci]), "waiting, not stalled")
+        self.assertEqual(edge(agents=[ci], transcriptAgeSec=46 * 60)[0], "stalled")
+        timed = {"type": "shell", "kind": "wait-timed", "eta": now - 3 * 60 * 1000}
+        self.assertEqual(edge(agents=[timed], transcriptAgeSec=10 * 60)[0], "stalled")
+        self.assertIsNone(edge(agents=[ci, {"type": "agent", "label": "x"}],
+                               transcriptAgeSec=46 * 60), "work is running")
+        # A rewrapped dialog is the same edge.
+        a = edge(panePrompt={"prompt": "Do you want to proceed?", "detail": "Bash command\nls -la"})
+        b = edge(panePrompt={"prompt": "Do you want to\nproceed?", "detail": "Bash  command ls\n-la"})
+        self.assertEqual(a, b)
+
+    def test_only_a_new_edge_is_classified(self):
+        sig = self.ended()
+        self.beat(sig, at=1000)
+        rec = self.sess["attentionHint"]
+        self.assertEqual((rec["edge"], rec["kind"], rec["edgeTs"], rec["attempts"]),
+                         (f"review|{self.TS}", "review", 1000, 0))
+        self.sm._stage_attention_hint(now=1)
+        job = self.sm._attn_request
+        self.assertEqual(job["argv"][:4], ["claude", "-p", "--model", ha.ATTENTION_HINT_MODEL])
+        # No tool and no MCP server: its input is the session's own (steerable)
+        # text. The equals form, since a variadic `--tools ""` eats the prompt.
+        # And user settings only: its cwd (~/.turma) is session-writable, so a
+        # planted project .claude/settings.json hook or CLAUDE.md must not load.
+        self.assertEqual(job["argv"][4:-1],
+                         ["--tools=", "--strict-mcp-config", "--setting-sources=user"])
+        self.assertEqual(list(ha.ATTENTION_HINT_LOCKDOWN), job["argv"][4:-1])
+        self.assertTrue(job["argv"][-1].startswith(ha.ATTENTION_HINT_INSTRUCTION))
+        self.assertIn("deploy it", job["argv"][-1])
+        self.assertEqual(self.started, ["wait-classifier"])
+        # The same state on later beats asks nothing more.
+        self.beat(sig, at=2000)
+        self.beat(sig, at=3000)
+        self.assertEqual(self.sess["attentionHint"]["edgeTs"], 1000)
+        self.verdict({"label": "design-decision", "why": "Picks a schema version."})
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(self.sm._attn_request, "answered: nothing more to ask")
+        # Working, then back on the SAME finished turn (a flicker): no re-ask —
+        # but the CACHED verdict ships again, under the same key, because the
+        # hub dropped its copy the beat the state left.
+        self.assertEqual(len(self.sm.attention_hints), 1)
+        self.beat(dict(sig, paneBusy=True), at=4000)
+        self.beat(sig, at=5000)
+        self.assertTrue(self.sess["attentionHint"]["done"])
+        self.assertEqual(self.sess["attentionHint"]["edgeTs"], 1000)
+        first, again = self.sm.attention_hints
+        self.assertEqual(again, first)
+        self.assertEqual(again["key"], f"{self.SID}:1000")
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(self.sm._attn_request, "re-sent, never re-asked")
+        self.beat(sig, at=5500)
+        self.assertEqual(len(self.sm.attention_hints), 2, "a steady state re-sends nothing")
+        # A NEW finished turn is a new edge.
+        self.beat(self.ended(ts="2026-10-03T10:09:00Z"), at=6000)
+        self.assertEqual(self.sess["attentionHint"]["edgeTs"], 6000)
+        self.assertNotIn("done", self.sess["attentionHint"])
+
+    def test_the_live_signals_name_the_current_edge(self):
+        # `attentionEdgeTs` rides the session's live signals every beat the session
+        # is on an edge, so the hub folds a verdict only on the edge it answers:
+        # a second dialog straight after the first gets a NEW one.
+        dialog = lambda detail: self.ended(paneBusy=True, panePrompt={
+            "prompt": "Do you want to proceed?", "detail": f"Bash command\n{detail}"})
+        a = dialog("git status")
+        self.beat(a, at=1000)
+        self.assertEqual(a["attentionEdgeTs"], 1000)
+        a2 = dialog("git status")
+        self.beat(a2, at=2000)
+        self.assertEqual(a2["attentionEdgeTs"], 1000, "the same dialog is the same edge")
+        b = dialog("git push --force origin main")
+        self.beat(b, at=3000)
+        self.assertEqual(b["attentionEdgeTs"], 3000)
+        busy = self.ended(paneBusy=True)
+        self.beat(busy, at=4000)
+        self.assertNotIn("attentionEdgeTs", busy, "no edge, nothing named")
+        # Back on the answered edge after a flicker: its own edgeTs again, which
+        # is the key the re-sent cached verdict carries.
+        b2 = dialog("git push --force origin main")
+        self.beat(b2, at=5000)
+        self.assertEqual(b2["attentionEdgeTs"], 3000)
+        # A session the classifier does not run for names nothing.
+        with mock.patch.object(ha, "ATTENTION_HINTS_ON", False):
+            off = dialog("ls")
+            self.beat(off, at=6000)
+        self.assertNotIn("attentionEdgeTs", off)
+
+    def test_a_sleeping_session_is_no_edge(self):
+        # Ended its turn to sleep through the session CLI's `wake`: the hub reads
+        # `sleeping` (ahead of review), so asking about a "review" is a wasted call.
+        now = 10 ** 12
+        sig = self.ended(wakeAt=now + 60_000)
+        self.assertIsNone(ha.attention_edge(sig, now))
+        self.assertEqual(ha.attention_edge(dict(sig, wakeAt=now - 1), now)[0], "review")
+        self.assertEqual(ha.attention_edge(dict(sig, wakeAt=True), now)[0], "review")
+        self.beat(sig, at=now)
+        self.assertNotIn("attentionHint", self.sess)
+
+    def test_an_unexplained_edge_is_never_re_sent(self):
+        # Exhausted with no verdict: re-entering the edge ships nothing.
+        sig = self.ended()
+        self.beat(sig, at=1000)
+        for t in (1, 10 ** 9):
+            self.sm._stage_attention_hint(now=t)
+            self.verdict(None)
+        self.assertTrue(self.sess["attentionHint"]["done"])
+        self.beat(dict(sig, paneBusy=True), at=4000)
+        self.beat(sig, at=5000)
+        self.assertEqual(self.sm.attention_hints, [])
+
+    def test_a_restart_never_reasks_an_answered_edge(self):
+        sig = self.ended()
+        self.beat(sig, at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to deploy."})
+        self.sm.save()
+        sm2 = self.make_manager()
+        sess2 = sm2._find(self.SID)
+        self.assertTrue(sess2["attentionHint"]["done"], "the verdict is persisted")
+        sm2._attention_edge(sess2, sig, now_ms=9000)
+        sm2._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(sm2._attn_request)
+        self.assertEqual(sess2["attentionHint"]["edgeTs"], 1000)
+
+    def test_dsh_and_qwen_sessions_are_not_classified(self):
+        for runtime in ("dsh", "qwen"):
+            self.sess["agentType"] = runtime
+            self.sess.pop("attentionHint", None)
+            self.beat(self.ended(), at=1000)
+            self.assertNotIn("attentionHint", self.sess)
+
+    # --- the job --------------------------------------------------------------
+
+    def test_retries_are_bounded_and_backed_off(self):
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=100)
+        rec = self.sess["attentionHint"]
+        self.assertEqual((rec["attempts"], rec["retryAt"]),
+                         (1, 100 + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC))
+        self.verdict(None)                      # no verdict: retry owed
+        self.assertNotIn("done", rec)
+        self.sm._stage_attention_hint(now=101)
+        self.assertIsNone(self.sm._attn_request, "inside the backoff")
+        self.sm._stage_attention_hint(now=100 + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC)
+        self.assertEqual(rec["attempts"], 2)
+        self.verdict(None)
+        self.assertTrue(rec["done"], "exhausted")
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.assertIsNone(self.sm._attn_request)
+        self.assertEqual(ha.ATTENTION_HINT_MAX_ATTEMPTS, 2)
+
+    def test_a_lost_job_is_freed_but_never_past_the_attempt_budget(self):
+        # The worker never answers (it died): past the timeout the slot frees and
+        # the next try runs — but a lost LAST attempt is not followed by another.
+        self.beat(self.ended(), at=1000)
+        t = 100
+        for _ in range(ha.ATTENTION_HINT_MAX_ATTEMPTS + 2):
+            self.sm._stage_attention_hint(now=t)
+            t += ha.ATTENTION_HINT_TIMEOUT_SEC + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC * 10
+        self.assertEqual(self.sess["attentionHint"]["attempts"], ha.ATTENTION_HINT_MAX_ATTEMPTS)
+        self.assertIsNone(self.sm._attn_job, "the lost last job was freed")
+
+    def test_one_job_in_flight(self):
+        other = dict(self.sess, id="hint2", tmuxName="agent-hint2")
+        self.sm.registry.append(other)
+        self.beat(self.ended(), at=1000)
+        self.sm._attention_edge(other, self.ended(ts="2026-10-03T10:01:00Z"), now_ms=2000)
+        self.sm._stage_attention_hint(now=1)
+        self.assertEqual(self.sm._attn_request["sid"], self.SID, "oldest edge first")
+        self.sm._attn_request = None
+        self.sm._stage_attention_hint(now=2)
+        self.assertIsNone(self.sm._attn_request, "one in flight")
+        self.sm._attn_results = [dict(self.sm._attn_job, hint=None)]
+        self.sm._apply_attention_hints()
+        self.sm._stage_attention_hint(now=3)
+        self.assertEqual(self.sm._attn_request["sid"], "hint2")
+
+    def test_a_late_answer_never_frees_a_newer_job(self):
+        # The watchdog dropped a job that never answered; a newer one for the
+        # same session runs. The old one's late answer must not free the slot.
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=100)
+        old = self.sm._attn_request
+        self.sm._attn_request = None
+        self.sm._stage_attention_hint(now=100 + ha.ATTENTION_HINT_TIMEOUT_SEC + 31
+                                      + ha.ATTENTION_HINT_RETRY_BACKOFF_SEC)
+        new = self.sm._attn_job
+        self.assertIsNotNone(new)
+        self.assertNotEqual(new["stagedAt"], old["stagedAt"])
+        self.sm._attn_results = [dict(old, hint=None)]
+        self.sm._apply_attention_hints()
+        self.assertIs(self.sm._attn_job, new, "the late answer is not the job in flight")
+        self.sm._attn_results = [dict(new, hint=None)]
+        self.sm._apply_attention_hints()
+        self.assertIsNone(self.sm._attn_job)
+
+    def test_an_edge_the_session_left_is_not_asked_and_its_verdict_dropped(self):
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        job = self.sm._attn_request
+        self.beat(self.ended(ts="2026-10-03T10:09:00Z"), at=2000)   # a newer turn
+        self.sm._attn_results = [dict(job, hint={"label": "looping", "why": "x"})]
+        self.sm._apply_attention_hints()
+        self.assertEqual(self.sm.attention_hints, [], "a stale verdict is dropped")
+        self.assertIsNone(self.sm._attn_job)
+
+    def _fake_popen(self, out=b"", rc=0, hang=False):
+        """A Popen stand-in: writes `out` to the stdout FILE it is handed (the
+        run writes to a file, never a pipe) and exits `rc` — or never exits."""
+        calls = []
+
+        def popen(argv, **kw):
+            kw["stdout"].write(out)
+            proc = mock.Mock(pid=4242)
+            if hang:
+                proc.wait.side_effect = [ha.subprocess.TimeoutExpired("claude", 1), None]
+            else:
+                proc.wait.return_value = rc
+            calls.append((argv, kw, proc))
+            return proc
+        return popen, calls
+
+    def test_the_run_is_the_summary_posture_and_strictly_parsed(self):
+        out = json.dumps({"label": "rubber-stamp", "why": "Asks to push.",
+                          "suggestedAnswer": "Yes, push it."}).encode()
+        popen, calls = self._fake_popen(out)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
+            hint = self.sm._run_attention_hint(["claude", "-p", "x"])
+        self.assertEqual(hint, {"label": "rubber-stamp", "why": "Asks to push.",
+                                "suggestedAnswer": "Yes, push it."})
+        (argv, kw, proc), = calls
+        self.assertEqual((kw["cwd"], kw["stdin"], kw["start_new_session"]),
+                         (ha.REGISTRY_DIR, ha.subprocess.DEVNULL, True))
+        self.assertNotEqual(kw["stdout"], ha.subprocess.PIPE, "a file, never a pipe")
+        proc.wait.assert_called_once_with(timeout=ha.ATTENTION_HINT_TIMEOUT_SEC)
+        self.assertEqual([n for n in os.listdir(ha.REGISTRY_DIR)
+                          if n.startswith("attention-hint")], [],
+                         "the output file is removed")
+        popen, _ = self._fake_popen(out, rc=1)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
+            self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=OSError("no claude")):
+            self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+
+    @unittest.skipUnless(hasattr(os, "mkfifo"), "POSIX FIFOs")
+    def test_a_planted_fifo_or_symlink_never_blocks_or_truncates(self):
+        # ~/.turma is session-writable: the reply file is a fresh mkstemp, so a
+        # FIFO or symlink planted at the old fixed name is never opened.
+        os.makedirs(ha.REGISTRY_DIR, exist_ok=True)
+        os.mkfifo(os.path.join(ha.REGISTRY_DIR, "attention-hint.out"))
+        victim = os.path.join(self.tmp_victim_dir(), "victim")
+        with open(victim, "w") as f:
+            f.write("keep")
+        os.symlink(victim, os.path.join(ha.REGISTRY_DIR, "attention-hint-x.out"))
+        out = json.dumps({"label": "looping", "why": "Same error."}).encode()
+        popen, calls = self._fake_popen(out)
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen):
+            hint = self.sm._run_attention_hint(["claude"])
+        self.assertEqual(hint, {"label": "looping", "why": "Same error."})
+        self.assertEqual(len(calls), 1)
+        with open(victim) as f:
+            self.assertEqual(f.read(), "keep")
+
+    def tmp_victim_dir(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        return d
+
+    def test_a_hung_run_kills_its_whole_group_and_never_waits_unbounded(self):
+        # A grandchild holding stdout must not wedge the one worker: the run
+        # writes to a file, and a timeout kills the process GROUP, then reaps
+        # it with a bound.
+        popen, calls = self._fake_popen(hang=True)
+        killpg = mock.Mock()
+        with mock.patch.object(ha.subprocess, "Popen", side_effect=popen), \
+                mock.patch.object(ha.os, "killpg", killpg, create=True):
+            self.assertIsNone(self.sm._run_attention_hint(["claude"]))
+        (_argv, _kw, proc), = calls
+        killpg.assert_called_once_with(4242, ha.signal.SIGKILL)
+        self.assertEqual(proc.wait.call_args_list[-1], mock.call(timeout=5))
+
+    def test_strict_parse(self):
+        P = ha.parse_attention_hint
+        ok = {"label": "needs-human-test", "why": "Wants the login flow clicked through."}
+        self.assertEqual(P(json.dumps(ok)), ok)
+        self.assertEqual(P("```json\n" + json.dumps(ok) + "\n```"), ok)
+        self.assertEqual(P(json.dumps(dict(ok, extra=1, suggestedAnswer=""))), ok)
+        for bad in (None, "", "no json here", "{", '["x"]',
+                    json.dumps(dict(ok, label="maybe")),
+                    json.dumps(dict(ok, label="Rubber-Stamp")),
+                    json.dumps(dict(ok, why="  ")),
+                    json.dumps(dict(ok, why=7)),
+                    json.dumps({"label": "looping"}),
+                    json.dumps(dict(ok, suggestedAnswer=["yes"]))):
+            self.assertIsNone(P(bad), bad)
+        long = P(json.dumps({"label": "looping", "why": "w" * 900,
+                             "suggestedAnswer": "a\n" * 400}))
+        self.assertEqual(len(long["why"]), ha.ATTENTION_HINT_TEXT_MAX)
+        self.assertLessEqual(len(long["suggestedAnswer"]), ha.ATTENTION_HINT_TEXT_MAX)
+        self.assertNotIn("\n", long["suggestedAnswer"])
+
+    def test_a_hand_test_never_carries_a_suggested_answer(self):
+        # A suggested reply to "please test this by hand" could only claim a
+        # test nobody ran, so the parse drops it and the prompt forbids it.
+        got = ha.parse_attention_hint(json.dumps({
+            "label": "needs-human-test", "why": "Wants the swipe checked on a phone.",
+            "suggestedAnswer": "I've tested it on my phone, go ahead and merge."}))
+        self.assertEqual(got, {"label": "needs-human-test",
+                               "why": "Wants the swipe checked on a phone."})
+        self.assertIn("never says the operator tested", ha.ATTENTION_HINT_INSTRUCTION)
+        kept = ha.parse_attention_hint(json.dumps({
+            "label": "rubber-stamp", "why": "Asks to push.", "suggestedAnswer": "Yes."}))
+        self.assertEqual(kept["suggestedAnswer"], "Yes.")
+
+    def test_the_edge_survives_a_tail_that_fills_the_budget(self):
+        tail = [{"role": "assistant" if i % 2 else "user", "text": "word " * 400}
+                for i in range(6)]
+        cases = {
+            "question": ({"question": "Ship the migration now or wait for Monday?"},
+                         "Ship the migration now or wait for Monday?"),
+            "permission": ({"panePrompt": {"prompt": "Do you want to run rm -rf build?",
+                                           "options": [{"label": "Yes"}]}},
+                           "A permission dialog is open: Do you want to run rm -rf build?"),
+            "loop": ({"loop": {"tool": "Bash", "repeats": 6}},
+                     "has run Bash 6 times in a row"),
+        }
+        for kind, (signals, needle) in cases.items():
+            text = ha.attention_hint_input(kind, dict(signals, tail=tail))
+            self.assertLessEqual(len(text), ha.ATTENTION_HINT_INPUT_MAX, kind)
+            self.assertIn(needle, text, kind)
+            # The newest row's end is still there; the tail was cut at its front.
+            self.assertTrue(text.endswith("word"), kind)
+        huge = ha.attention_hint_input("question", {"question": "q" * 9000, "tail": tail})
+        self.assertEqual(len(huge), ha.ATTENTION_HINT_INPUT_MAX)
+
+    def test_the_worker_runs_the_job_off_the_beat(self):
+        sm = self.make_manager()
+        job = {"sid": "s", "edge": "review|t", "edgeTs": 1, "argv": ["claude"]}
+        with mock.patch.object(sm, "_run_attention_hint",
+                               return_value={"label": "looping", "why": "x"}):
+            sm._attn_request = job
+            # Drive one loop iteration on this thread: the wake is set, the job
+            # taken, the verdict staged by REBINDING the results list.
+            sm._attn_wake.set()
+            before = sm._attn_results
+            with mock.patch.object(sm._attn_wake, "wait",
+                                   side_effect=[True, KeyboardInterrupt]):
+                with self.assertRaises(KeyboardInterrupt):
+                    sm._attention_hint_worker_loop()
+        self.assertIsNot(sm._attn_results, before, "rebound, never mutated")
+        self.assertEqual(sm._attn_results[0]["hint"], {"label": "looping", "why": "x"})
+        self.assertIsNone(sm._attn_request)
+
+    # --- the wire -------------------------------------------------------------
+
+    def test_a_verdict_rides_the_heartbeat_keyed_by_its_edge_and_clears_by_identity(self):
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "needs-human-test", "why": "Wants the UI checked.",
+                      "suggestedAnswer": "Checked, ship it."})
+        row, = self.sm.attention_hints
+        self.assertEqual(row, {"key": f"{self.SID}:1000", "sessionId": self.SID,
+                               "edge": "review", "edgeTs": 1000,
+                               "label": "needs-human-test", "why": "Wants the UI checked.",
+                               "suggestedAnswer": "Checked, ship it."})
+        self.assertEqual(self.sess["attentionHint"]["label"], "needs-human-test")
+        self.sm.registry = []
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(payload["attentionHints"], [row])
+        late = {"key": "late"}
+        self.sm.attention_hints.append(late)
+        self.sm._clear_delivered_staged(payload)
+        self.assertEqual(self.sm.attention_hints, [late])
+
+    def test_the_outbox_is_bounded(self):
+        for i in range(ha.ATTENTION_HINT_OUTBOX_MAX + 3):
+            self.sm.attention_hints.append({"key": str(i)})
+        self.beat(self.ended(), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "looping", "why": "x"})
+        self.assertEqual(len(self.sm.attention_hints), ha.ATTENTION_HINT_OUTBOX_MAX)
+        self.assertEqual(self.sm.attention_hints[-1]["sessionId"], self.SID)
+        self.sm.registry = []
+        payload = self.sm.build_payload(1, light=True)
+        self.assertEqual(len(payload["attentionHints"]), ha.ATTENTION_HINTS_MAX)
+
+    # --- the ask-in-chat ledger row -------------------------------------------
+
+    def test_a_rubber_stamp_verdict_writes_the_ask_in_chat_row(self):
+        self.beat(self.ended(text="Tests pass. May I push the branch?"), at=1000)
+        self.assertEqual(self.sm.permission_events, [], "waits on the classifier")
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
+        row, = self.sm.permission_events
+        # Named by the session's OWN asking sentence (the verbatim text the
+        # ledger's rule work reads), not the classifier's paraphrase.
+        asked = ha._permission_ask_prompt("Tests pass. May I push the branch?")
+        self.assertIn("push the branch", asked)
+        self.assertEqual((row["kind"], row["prompt"], row["openedAt"]),
+                         ("ask-in-chat", asked[:ha.PERMISSION_TEXT_MAX], 1000))
+        # Closed on the operator's next input, as before.
+        self.sm.handle_commands([{"cmdId": "c1", "type": "input",
+                                  "sessionId": self.SID, "text": "yes"}])
+        self.assertEqual(self.sm.permission_events[-1]["via"], "turma")
+
+    def test_a_rubber_stamp_the_regex_cannot_name_takes_the_classifiers_why(self):
+        text = "Everything is staged and green."
+        self.assertIsNone(ha._permission_ask_prompt(text))
+        self.beat(self.ended(text=text), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Waits for a go-ahead to push."})
+        row, = self.sm.permission_events
+        self.assertEqual(row["prompt"], "Waits for a go-ahead to push.")
+
+    def test_the_hubs_own_nudge_is_not_the_operator_answering(self):
+        # A loop/stall nudge is an `input` the HUB typed (`source: "nudge"`): it
+        # must neither settle a pending ask nor close an open row as answered.
+        self.beat(self.ended(text="Tests pass. May I push the branch?"), at=1000)
+        self.sm.handle_commands([{"cmdId": "n1", "type": "input", "sessionId": self.SID,
+                                  "text": "You have run `Bash` 4 times...", "source": "nudge"}])
+        self.assertEqual(self.sm.permission_events, [])
+        self.assertIn(self.SID, self.sm._perm_ask_pending)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push."})
+        row, = self.sm.permission_events
+        self.sm.handle_commands([{"cmdId": "n2", "type": "input", "sessionId": self.SID,
+                                  "text": "nudge again", "source": "nudge"}])
+        self.assertEqual(self.sm.permission_events, [row], "still open")
+        self.sm.handle_commands([{"cmdId": "c3", "type": "input", "sessionId": self.SID,
+                                  "text": "yes"}])
+        self.assertEqual(self.sm.permission_events[-1]["via"], "turma")
+
+    def test_the_classifier_overrules_the_regex(self):
+        # The regex would file this ("should I proceed"); the classifier says it is
+        # a real decision, so no permission row is written.
+        self.beat(self.ended(text="Two designs fit. Should I proceed with B?"), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "design-decision", "why": "Choose design A or B."})
+        self.assertEqual(self.sm.permission_events, [])
+        self.assertEqual(self.sm._perm_ask_pending, {})
+
+    def test_no_verdict_falls_back_to_the_regex(self):
+        self.beat(self.ended(text="Build ready. Should I proceed with the deploy?"), at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict(None)
+        self.assertEqual(self.sm.permission_events, [])
+        self.sm._stage_attention_hint(now=10 ** 9)
+        self.verdict(None)                       # exhausted
+        row, = self.sm.permission_events
+        self.assertIn("Should I proceed", row["prompt"])
+        self.assertEqual(row["openedAt"], 1000)
+
+    def restarted(self):
+        # A fresh manager over the same persisted record: in-memory ask state
+        # gone, and its first beat primes rather than re-reads.
+        sm = self.make_manager()
+        sm.registry = [self.sess]
+        sm._perm_first_beat_done = False
+        self.sm = sm
+        return sm
+
+    def test_a_restart_mid_classification_still_files_the_rubber_stamp(self):
+        sig = self.ended(text="Tests pass. May I push the branch?")
+        self.beat(sig, at=1000)
+        self.sm._stage_attention_hint(now=1)       # attempt 1 in flight, then a restart
+        sm = self.restarted()
+        self.assertEqual(sm._perm_ask_pending, {})
+        self.beat(sig, at=2000)
+        sm._perm_first_beat_done = True
+        self.assertIn(self.SID, sm._perm_ask_pending, "the undecided turn waits again")
+        sm._stage_attention_hint(now=10 ** 9)       # the persisted record re-stages
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
+        row, = sm.permission_events
+        self.assertEqual((row["kind"], row["openedAt"]), ("ask-in-chat", 2000))
+        self.assertIn("push the branch", row["prompt"])
+
+    def test_a_restart_after_the_verdict_does_not_re_file(self):
+        sig = self.ended(text="Tests pass. May I push the branch?")
+        self.beat(sig, at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
+        sm = self.restarted()
+        self.beat(sig, at=2000)
+        self.assertEqual(sm._perm_ask_pending, {})
+        self.assertEqual(sm.permission_events, [])
+
+    def test_an_ask_answered_before_the_verdict_is_still_counted(self):
+        self.beat(self.ended(text="May I merge it?"), at=1000)
+        self.sm.handle_commands([{"cmdId": "c1", "type": "input",
+                                  "sessionId": self.SID, "text": "go"}])
+        opened, closed = self.sm.permission_events
+        self.assertEqual((opened["kind"], closed["via"]), ("ask-in-chat", "turma"))
+        self.assertEqual(self.sm._perm_ask_pending, {})
 
 
 if __name__ == "__main__":

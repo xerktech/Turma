@@ -1032,9 +1032,13 @@ private fun SessionListCard(
             // A STALLED background wait takes the danger colour it has on every
             // surface (XERK-1571, web `.dot.stalled`), never the review accent —
             // also where the hub says stalled but the host just went quiet, so this
-            // screen can't judge the silence itself (web `reviewState`).
-            val stalled = dotState == com.xerktech.turma.core.LiveState.IDLE &&
-                (com.xerktech.turma.core.sessionWait(r.session, r.hostLastSeen, now)?.stalled == true ||
+            // screen can't judge the silence itself (web `reviewState`). A session
+            // LOOPING on one failing call is busy, so its own dot would read working;
+            // the hub's stall counts there too (XERK-1572).
+            val stalled = (dotState == com.xerktech.turma.core.LiveState.IDLE &&
+                com.xerktech.turma.core.sessionWait(r.session, r.hostLastSeen, now)?.stalled == true) ||
+                ((dotState == com.xerktech.turma.core.LiveState.IDLE ||
+                    dotState == com.xerktech.turma.core.LiveState.WORKING) &&
                     com.xerktech.turma.core.attentionStalled(r.session.attention))
             if (stalled) {
                 StatusLight(com.xerktech.turma.ui.theme.TurmaColors.critical)
@@ -1071,6 +1075,27 @@ private fun SessionListCard(
                             style = MaterialTheme.typography.bodySmall,
                             color = MaterialTheme.colorScheme.onSurfaceVariant,
                             maxLines = 1,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    // The wait classifier's verdict and the answer it suggests
+                    // (XERK-1572, web sessions.html `.att-hint`).
+                    val hint = com.xerktech.turma.core.attentionHintLine(r.session.attention)
+                    if (hint.isNotEmpty()) {
+                        Text(
+                            hint,
+                            style = MaterialTheme.typography.bodySmall,
+                            maxLines = 2,
+                            overflow = TextOverflow.Ellipsis,
+                        )
+                    }
+                    val suggested = com.xerktech.turma.core.attentionSuggested(r.session.attention)
+                    if (suggested.isNotEmpty()) {
+                        Text(
+                            suggested,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 2,
                             overflow = TextOverflow.Ellipsis,
                         )
                     }

@@ -222,6 +222,28 @@ class AgentDecodeTest {
         assertNull(s[2].attention)
     }
 
+    // XERK-1572: the wait classifier's verdict rides attention as a typed `hint`;
+    // absent decodes to null, a missing suggestedAnswer to null.
+    @Test fun `an attention hint decodes, null when absent`() {
+        val body = """
+            { "now": 1, "agents": [ { "key": "h", "device": "h", "online": true,
+                "sessions": [
+                  { "id": "s1", "attention": { "state": "needs-you:test", "since": 1700000000000,
+                      "hint": { "label": "needs-human-test", "why": "Wants the login checked.",
+                                "suggestedAnswer": "Checked, ship it." } } },
+                  { "id": "s2", "attention": { "state": "needs-you:review", "since": 1700000000000,
+                      "hint": { "label": "looping", "why": "Retries npm ci." } } },
+                  { "id": "s3", "attention": { "state": "needs-you:review", "since": 1700000000000 } }
+                ] } ] }
+        """.trimIndent()
+        val s = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].sessions
+        assertEquals("needs-human-test", s[0].attention!!.hint!!.label)
+        assertEquals("Wants the login checked.", s[0].attention!!.hint!!.why)
+        assertEquals("Checked, ship it.", s[0].attention!!.hint!!.suggestedAnswer)
+        assertNull(s[1].attention!!.hint!!.suggestedAnswer)
+        assertNull(s[2].attention!!.hint)
+    }
+
     // XERK-544: the hub-derived auto-start-paused flag. Emitted only when true,
     // so the default `false` must cover an absent field (an older hub, or any
     // host not past the weekly pace line) — typing it makes a wrong value

@@ -538,7 +538,9 @@ private fun SessionCard(
                         // a session Ready for review lists never reads idle here. Its
                         // one age is the hub's `since` ("stalled · Watch CI · for 31m").
                         // A stall takes the danger colour it has on every surface.
-                        val needs = if (state == LiveState.IDLE) com.xerktech.turma.core.attentionLabel(session.attention) else null
+                        // A stall the hub reads where this read does not — a LOOPING
+                        // session is busy (XERK-1572) — speaks over "working" too.
+                        val needs = if (state == LiveState.IDLE || com.xerktech.turma.core.attentionStalled(session.attention)) com.xerktech.turma.core.attentionLabel(session.attention) else null
                         val needsFor = com.xerktech.turma.core.attentionFor(session.attention, now)
                         // A question card carries its age too (web "waiting for your
                         // answer · for 22m"), but only the question's own — never a
@@ -588,6 +590,19 @@ private fun SessionCard(
                             overflow = TextOverflow.Ellipsis,
                         )
                     }
+                // The wait classifier's verdict and suggested answer (XERK-1572, web
+                // index.html `.sess-hint` row), on a running needs-you card, AFTER the
+                // question / permission it answers, as on both web pages.
+                if (st == "running" && !killing) {
+                    val hint = com.xerktech.turma.core.attentionHintLine(session.attention)
+                    if (hint.isNotEmpty()) {
+                        Text(hint, style = MaterialTheme.typography.bodySmall, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                    val suggested = com.xerktech.turma.core.attentionSuggested(session.attention)
+                    if (suggested.isNotEmpty()) {
+                        Text(suggested, style = MaterialTheme.typography.bodySmall, color = muted, maxLines = 2, overflow = TextOverflow.Ellipsis)
+                    }
+                }
                 if (st == "error" && session.errorMsg.isNotBlank()) {
                     Text(session.errorMsg, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error, maxLines = 2)
                 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { __setDshEnabled, flattenSessions, glyph, inReview, isDsh, liveState, readyForReview } from "./sessions.ts";
+import { __setDshEnabled, attentionHint, flattenSessions, glyph, inReview, isDsh, liveState, readyForReview } from "./sessions.ts";
 import type { AgentInfo, LiveSignals, SessionInfo } from "./types.ts";
 
 function signals(overrides: Partial<LiveSignals> = {}): LiveSignals {
@@ -201,6 +201,24 @@ describe("liveState", () => {
   it("is 'idle' when transcriptAgeSec is null", () => {
     const s = session({ status: "running", session: signals({ transcriptAgeSec: null }) });
     expect(liveState(s)).toBe("idle");
+  });
+});
+
+describe("attentionHint (XERK-1572)", () => {
+  const sess = (attention: SessionInfo["attention"]): SessionInfo =>
+    ({ id: "s", repo: "r", status: "running", attention } as unknown as SessionInfo);
+  it("reads the classifier's verdict as the web does", () => {
+    const hint = { label: "needs-human-test", why: "Wants the login checked.", suggestedAnswer: "Checked." };
+    expect(attentionHint(sess({ state: "needs-you:test", since: 1, hint })))
+      .toEqual({ line: "needs a human test · Wants the login checked.", answer: "Checked." });
+    expect(attentionHint(sess({ state: "needs-you:review", since: 1, hint: { label: "odd", why: "x" } })))
+      .toEqual({ line: "x", answer: "" });
+  });
+  it("is empty without a verdict or once the session no longer needs you", () => {
+    const hint = { label: "looping", why: "Retries npm ci." };
+    expect(attentionHint(sess({ state: "working", since: 1, hint }))).toEqual({ line: "", answer: "" });
+    expect(attentionHint(sess({ state: "needs-you:review", since: 1 }))).toEqual({ line: "", answer: "" });
+    expect(attentionHint(sess(null))).toEqual({ line: "", answer: "" });
   });
 });
 

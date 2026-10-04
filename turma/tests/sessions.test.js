@@ -526,6 +526,56 @@ test("attention: permission names its command, a stall shows one age, a timed wa
   assert.ok(a.includes("⏳ waiting · Wait for the rollout\u00a0·\u00a011m left"), a);
 });
 
+// XERK-1572. A needs-you card carries the wait classifier's verdict under its
+// why line — what kind of wait and why, then the answer it suggests — escaped;
+// and a LOOPING session (busy, but the hub says it is stuck) sits in Ready for
+// review as stalled in the danger tone, never as "working".
+test("attention: the classifier's why and suggested answer, and a loop reads stalled", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const { now, host: h } = host([
+    finished("81111", "Schema Pick", { attention: { state: "needs-you:review", since: t - 5 * 60 * 1000,
+      why: "finished · nothing to merge",
+      hint: { label: "design-decision", why: "Pick <v2> or v3.", suggestedAnswer: "Go with v3." } } }),
+    { ...running("82222", "Retry Loop", { paneBusy: true, transcriptAgeSec: 2,
+        loop: { repeats: 6, tool: "Bash", since: t - 60000 } }),
+      attention: { state: "needs-you:stalled", since: t - 2 * 60 * 1000, why: "repeating Bash ×6",
+        hint: { label: "looping", why: "Retries npm ci against a dead registry." } } },
+    finished("83333", "Plain Review", { attention: { state: "needs-you:review", since: t - 60000,
+      why: "finished · nothing to merge" } }),
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML;
+  assert.ok(r.includes('<div class="att-hint"><span class="hint-kind">decision</span>\u00a0·\u00a0Pick &lt;v2&gt; or v3.</div>'), r);
+  assert.ok(r.includes('<div class="att-hint answer">Suggested: Go with v3.</div>'), r);
+  assert.ok(r.includes('<div class="state stalled">stalled · repeating Bash ×6'), r);
+  assert.ok(r.includes('<span class="hint-kind">looping</span>\u00a0·\u00a0Retries npm ci against a dead registry.'), r);
+  assert.ok(!els.active.innerHTML.includes("Retry Loop"), "a loop is not Active work");
+  // Only the two cards with a verdict carry hint lines (Plain Review has none).
+  assert.equal(r.split('class="att-hint').length - 1, 3, r);
+});
+
+// XERK-1572 screenshot pass: a review the classifier says needs a human TEST
+// names that in its headline, the dashboard State row's word, instead of reading
+// as a plain "PR awaiting review" whose only difference was its third line.
+test("attention: a needs-you:test card's headline says it awaits your test", () => {
+  const { render, els } = loadPage();
+  const t = Date.now();
+  const pr = [{ url: "https://github.com/o/r/pull/7", state: "OPEN" }];
+  const { now, host: h } = host([
+    { ...finished("84444", "Login Page", { attention: { state: "needs-you:test", since: t - 40 * 60 * 1000,
+      why: "PR open · CI passing",
+      hint: { label: "needs-human-test", why: "Wants the login page checked." } } }), prs: pr },
+    { ...finished("85555", "Plain PR", { attention: { state: "needs-you:review", since: t - 60000,
+      why: "PR open · CI passing" } }), prs: pr },
+  ]);
+  render({ now, agents: [h] });
+  const r = els.review.innerHTML;
+  assert.ok(r.includes('<div class="state review">awaiting your test'), r);
+  assert.ok(r.includes('<div class="state review">PR awaiting review'), r);
+  assert.equal(r.split("PR awaiting review").length - 1, 1, "only the plain review reads PR awaiting review");
+});
+
 // XERK-735. The card's second line reads repo · related ticket · pc name ·
 // session id, one line, and the ticket key links to that ticket's detail on the
 // board rather than out to Jira.

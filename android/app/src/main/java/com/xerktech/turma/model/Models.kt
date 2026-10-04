@@ -1012,10 +1012,10 @@ data class SessionInfo(
 
 /**
  * One session's attention (XERK-1571). [state] is `needs-you:question` |
- * `needs-you:permission` | `needs-you:review` | `needs-you:test` (reserved) |
+ * `needs-you:permission` | `needs-you:review` | `needs-you:test` |
  * `needs-you:stalled` | `working` | `waiting` | `sleeping` | `idle`; [since] the
  * epoch ms it last changed; [eta] epoch ms for a wait/sleep with a known end;
- * [why] the one-line reason.
+ * [why] the one-line reason; [hint] the wait classifier's verdict (XERK-1572).
  */
 @Serializable
 data class Attention(
@@ -1023,6 +1023,21 @@ data class Attention(
     val since: Long? = null,
     val eta: Long? = null,
     val why: String? = null,
+    val hint: AttentionHint? = null,
+)
+
+/**
+ * The wait classifier's verdict on a needs-you session (XERK-1572, server.js
+ * `wireAttention`): [label] is `rubber-stamp` | `design-decision` |
+ * `needs-human-test` | `blocked-on-host` | `looping` | `waiting-external`, [why]
+ * what it waits on, [suggestedAnswer] the reply it suggests. The hub rebuilds it
+ * strictly (label from the fixed set, texts capped at 300) or omits it.
+ */
+@Serializable
+data class AttentionHint(
+    val label: String = "",
+    val why: String = "",
+    val suggestedAnswer: String? = null,
 )
 
 @Serializable

@@ -10,7 +10,7 @@
 // view; Board is a placeholder tab (Phase 2).
 import type { AppState } from "../app.ts";
 import type { AgentInfo, PrInfo, SessionInfo } from "../types.ts";
-import { filterAgents, inReview, liveState, sessionName, siteKeyOf, sleeping, type LiveState } from "../sessions.ts";
+import { attentionHint, filterAgents, inReview, liveState, sessionName, siteKeyOf, sleeping, type LiveState } from "../sessions.ts";
 import { LIVE_TURN_ID } from "../render.ts";
 import { Board } from "../vendor/engines.ts";
 
@@ -142,25 +142,35 @@ function sessionCardHtml(hostKey: string, hostLabel: string, s: SessionInfo, cur
   const st = liveState(s, hostLastSeen, now);
   const name = sessionName(s);
   const q = s.session?.question;
+  const hint = attentionHint(s);
   // A holding session ASLEEP until a session-CLI wake (XERK-1571) says until when,
   // and what it will check then when the session said (web "· <reason>").
   const wakeAt = s.session?.wakeAt;
   const wakeWhy = typeof s.session?.wakeReason === "string" ? s.session.wakeReason.trim() : "";
-  const label = st === "holding" && sleeping(s.session, now ?? Date.now()) && typeof wakeAt === "number"
+  // The hub says it STALLED (XERK-1571/1572, web `reviewState`): a background wait
+  // gone silent, or a session LOOPING on one failing call — which is busy, so its
+  // own liveState would read "working". The hub's read, in the danger tone.
+  const stalled = s.attention?.state === "needs-you:stalled";
+  const stallWhy = typeof s.attention?.why === "string" ? s.attention.why : "";
+  const label = stalled ? ["stalled", stallWhy].filter(Boolean).join(" · ")
+    : st === "holding" && sleeping(s.session, now ?? Date.now()) && typeof wakeAt === "number"
     ? `sleeping until ${clockTime(wakeAt, now ?? Date.now())}${wakeWhy ? ` · ${wakeWhy}` : ""}` : STATE_LABEL[st];
   const stateRow =
     `<span class="ph-state-row">` +
-    `<span class="ph-state st-${st}">${esc(label)}</span>` +
+    `<span class="ph-state st-${stalled ? "stalled" : st}">${esc(label)}</span>` +
     prChips(s) +
     `</span>`;
   return (
     `<button class="ph-card ph-sess${current ? " cur" : ""}"${tint} data-enter="${esc(s.id)}" data-host="${esc(hostKey)}">` +
-    `<span class="ph-dot st-${st}" aria-hidden="true"></span>` +
+    `<span class="ph-dot st-${stalled ? "stalled" : st}" aria-hidden="true"></span>` +
     `<span class="ph-card-body">` +
     `<span class="ph-card-title">${esc(name)}</span>` +
     `<span class="ph-card-meta">${metaLine(hostLabel, s)}</span>` +
     stateRow +
     (st === "waiting" && q ? `<span class="ph-card-q">${esc(q)}</span>` : "") +
+    // The wait classifier's verdict and suggested answer (XERK-1572, web `.att-hint`).
+    (hint.line ? `<span class="ph-card-hint">${esc(hint.line)}</span>` : "") +
+    (hint.answer ? `<span class="ph-card-hint answer">Suggested: ${esc(hint.answer)}</span>` : "") +
     `</span>` +
     `</button>`
   );
