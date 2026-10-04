@@ -14136,7 +14136,8 @@ function autoCloseSweep() {
 // needs-you:stalled and the operator decides. A new stall edge (the session moved
 // on, then stalled again) starts its count over, still behind the backoff.
 // `attentionNudged` is keyed "<host>\x00<sid>\x00<reason>" -> {at, count, since}
-// (the autoCloseNotified shape), HA-mirrored so a failover re-sends nothing.
+// (the autoCloseNotified shape), HA-mirrored so a failover re-sends nothing, and
+// copied onto the session's alerts edge (`sa.nudged`) so a restart forgets nothing.
 const ATTENTION_NUDGES_ON = process.env.ATTENTION_NUDGES !== "0";
 const ATTENTION_NUDGE_BACKOFF_MS = positiveEnv("ATTENTION_NUDGE_BACKOFF_MIN", 20) * 60 * 1000;
 const ATTENTION_NUDGE_MAX = 2;
@@ -14186,11 +14187,17 @@ function attentionNudgeSweep(now = Date.now()) {
     const sas = (a.alerts && a.alerts.sessions) || {};
     for (const s of a.sessions || []) {
       if (!s || s.status !== "running" || typeof s.id !== "string") continue;
-      const attn = sas[s.id] && sas[s.id].attn;
+      const sa = sas[s.id];
+      const attn = sa && sa.attn;
       if (!attn || attn.state !== "needs-you:stalled") continue;
       const reason = attn.cause === "loop" ? "loop" : "stalled";
       const nk = host + "\x00" + s.id + "\x00" + reason;
-      const rec = attentionNudged.get(nk);
+      // The map is memory (plus the HA guard store); the same record also rides the
+      // session's alerts edge (`sa.nudged`, persisted in state.json), so a non-HA
+      // restart or deploy never forgets a nudge and re-sends past the cap.
+      const kept = sa.nudged && sa.nudged[reason];
+      const rec = attentionNudged.get(nk)
+        || (kept && typeof kept.at === "number" && Number.isSafeInteger(kept.count) ? kept : undefined);
       // A loop's stall is the RUN, not the beat it was entered: a nudge (or the
       // operator's prompt) re-arms the agent's count but keeps the run's `since`,
       // so the same failure resumed is the same stall and the cap still holds.
@@ -14207,6 +14214,7 @@ function attentionNudgeSweep(now = Date.now()) {
       const next = { at: now, count: count + 1, since };
       attentionNudged.set(nk, next);
       guardStoreSet("attentionNudged", nk, next);
+      sa.nudged = { ...(sa.nudged && typeof sa.nudged === "object" ? sa.nudged : {}), [reason]: next };
     }
   }
   if (attentionNudged.size > ATTENTION_NUDGE_STATE_MAX) {

@@ -11307,7 +11307,12 @@ ATTENTION_HINT_TIMEOUT_SEC = _env_int("TURMA_ATTENTION_HINT_TIMEOUT_SEC", 60, mi
 # repo content and tool output can steer, so the one-shot runs with NO tool and NO
 # MCP server: it only has to print one JSON object. The equals form on purpose —
 # `--tools` is variadic, so `--tools ""` would swallow the prompt after it.
-ATTENTION_HINT_LOCKDOWN = ("--tools=", "--strict-mcp-config")
+# `--setting-sources=user` also skips PROJECT and LOCAL settings and project
+# CLAUDE.md (cwd and every ancestor): the cwd is REGISTRY_DIR, which any session
+# can write, so a planted ~/.turma/.claude/settings.json would otherwise run its
+# hooks as the MANAGER on every ended turn, and a planted CLAUDE.md would steer
+# every verdict shown on other sessions' cards. Verified on the installed CLI.
+ATTENTION_HINT_LOCKDOWN = ("--tools=", "--strict-mcp-config", "--setting-sources=user")
 ATTENTION_HINT_MAX_ATTEMPTS = 2        # tries per edge before it goes unexplained
 ATTENTION_HINT_RETRY_BACKOFF_SEC = 60  # base gap between tries; grows with the count
 ATTENTION_HINT_LABELS = ("rubber-stamp", "design-decision", "needs-human-test",
@@ -30399,8 +30404,8 @@ class SessionManager:
 
     def _run_attention_hint(self, argv):
         """The `claude -p` itself, OFF THE BEAT: headless, cwd REGISTRY_DIR, no
-        --settings, no tool and no MCP server (ATTENTION_HINT_LOCKDOWN, in the
-        argv), stdin closed, bounded by ATTENTION_HINT_TIMEOUT_SEC. The prompt is
+        --settings, no tool, no MCP server and no project/local settings or
+        CLAUDE.md (ATTENTION_HINT_LOCKDOWN, in the argv), stdin closed, bounded by ATTENTION_HINT_TIMEOUT_SEC. The prompt is
         an argv element, never a shell string. Output goes to a FILE, not a pipe
         (the _start_summary shape), and the child leads its own process group,
         killed whole on a timeout: a pipe read waits for EOF without bound, so a

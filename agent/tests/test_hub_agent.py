@@ -38367,7 +38367,10 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         self.assertEqual(job["argv"][:4], ["claude", "-p", "--model", ha.ATTENTION_HINT_MODEL])
         # No tool and no MCP server: its input is the session's own (steerable)
         # text. The equals form, since a variadic `--tools ""` eats the prompt.
-        self.assertEqual(job["argv"][4:-1], ["--tools=", "--strict-mcp-config"])
+        # And user settings only: its cwd (~/.turma) is session-writable, so a
+        # planted project .claude/settings.json hook or CLAUDE.md must not load.
+        self.assertEqual(job["argv"][4:-1],
+                         ["--tools=", "--strict-mcp-config", "--setting-sources=user"])
         self.assertEqual(list(ha.ATTENTION_HINT_LOCKDOWN), job["argv"][4:-1])
         self.assertTrue(job["argv"][-1].startswith(ha.ATTENTION_HINT_INSTRUCTION))
         self.assertIn("deploy it", job["argv"][-1])

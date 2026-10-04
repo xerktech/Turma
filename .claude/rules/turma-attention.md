@@ -162,6 +162,9 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   `ATTENTION_NUDGE_BACKOFF_MIN` (20) while the SAME stall (`since`) holds; after
   `ATTENTION_NUDGE_MAX` (2) the session stays stalled and the operator decides. A new stall edge
   restarts the count, still behind the backoff. `ATTENTION_NUDGES=0` turns the sweep off.
+- **The same record rides the session's alerts edge** (`sa.nudged[reason]`, persisted in
+  `state.json` beside `sa.attn`) and is read when the map has none: a non-HA restart or deploy empties
+  the map but restores the stalled `attn` with its `since`, so without it the cap reset every deploy.
 - **A loop's stall is its RUN** (`loop.since`), not the beat the state was entered: a nudge re-arms
   the agent's count, so the session reads working before it loops again; keying on the attention
   `since` would let a session that loops after every nudge be nudged forever.

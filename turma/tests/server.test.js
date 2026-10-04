@@ -23068,6 +23068,31 @@ test("XERK-1572: a loop resumed after a nudge is the same stall, so the two-nudg
   delete agents[host];
 });
 
+test("XERK-1572: a non-HA restart forgets no nudge: the record rides the persisted alerts edge", () => {
+  // `attentionNudged` is memory; a restart empties it while state.json restores the
+  // session's alerts edge (attn AND nudged), so the backoff and the cap still hold.
+  hub.attentionNudged.clear();
+  const host = "nudge-restart";
+  const t0 = Date.now();
+  const B = hub.ATTENTION_NUDGE_BACKOFF_MS;
+  const a = nudgeHost(host, [{ session: { id: "s1", status: "running", session: { transcriptAgeSec: 3000,
+    agents: [{ type: "shell", label: "sleep", kind: "wait-timed" }] } },
+    attn: { state: "needs-you:stalled", since: t0 } }], t0);
+  const sweep = (t) => { a.lastSeen = t; hub.attentionNudgeSweep(t); };
+  sweep(t0);
+  assert.deepEqual(a.alerts.sessions.s1.nudged, { stalled: { at: t0, count: 1, since: t0 } });
+  hub.attentionNudged.clear();                          // the restart
+  sweep(t0 + 1000);
+  assert.equal(nudges(host).length, 1, "backoff still holds after the restart");
+  sweep(t0 + B);
+  assert.equal(nudges(host).length, 2);
+  hub.attentionNudged.clear();                          // another restart
+  sweep(t0 + 3 * B);
+  assert.equal(nudges(host).length, hub.ATTENTION_NUDGE_MAX, "the cap still holds after the restart");
+  hub.attentionNudged.clear();
+  delete agents[host];
+});
+
 test("XERK-1572: attentionNudged writes through and hydrates back, so a failover re-sends nothing", async () => {
   await withGuardStore(async (store) => {
     hub.attentionNudged.clear();
