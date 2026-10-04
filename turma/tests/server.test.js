@@ -23076,6 +23076,34 @@ test("XERK-1573: a merged PR is finished in ONE brief, past the 10-row cut and B
   delete hub.getBriefs()[S];
 });
 
+test("XERK-1573: a full PR memory keeps the still-visible PR; an over-long URL is skipped", async () => {
+  const S = "brJ1573.atlassian.net";
+  const now = Date.now();
+  const H = 3600 * 1000;
+  const V = "https://github.com/x/y/pull/9";
+  const LONG = "https://github.com/x/y/pull/" + "1".repeat(600);
+  await asBeat("brHostJ", S, { autoStart: false, sessions: [{ id: "j1", status: "running",
+    prs: [{ url: V, state: "MERGED", title: "Visible" }, { url: LONG, state: "MERGED", title: "Long" }] }] });
+  const b1 = hub.briefSweep(S, "scheduled", now);
+  assert.equal(b1.counts.finished, 1, "the visible PR once; the over-long URL is never finished");
+  assert.deepEqual(b1.prsReported, [V]);
+  // The memory is at its 500 cap with the visible PR LAST, and no stored
+  // `finished` row remembers it: the cut must drop the no-longer-visible ones.
+  const old = [];
+  for (let i = 0; i < 500; i++) old.push(`https://github.com/x/old/pull/${i}`);
+  const kept = hub.getBriefs()[S];
+  kept[0].prsReported = [...old, V];
+  kept[0].finished = [];
+  const b2 = hub.briefSweep(S, "scheduled", now + 3 * H);
+  assert.equal(b2.counts.finished, 0);
+  assert.equal(b2.prsReported.length, 500);
+  assert.ok(b2.prsReported.includes(V), "the still-visible PR survives the cut");
+  const b3 = hub.briefSweep(S, "scheduled", now + 6 * H);
+  assert.equal(b3.counts.finished, 0, "the visible PR is not finished again");
+  delete agents.brHostJ;
+  delete hub.getBriefs()[S];
+});
+
 test("XERK-1573: a newcomer past the 10-row needs-you cut still pushes", async () => {
   const S = "brH1573.atlassian.net";
   const now = Date.now();

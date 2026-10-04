@@ -14319,8 +14319,12 @@ function compileBrief(siteKey, now, trigger, prevList) {
   const seenPrs = new Set(reported);
   const newPrs = [];
   const visiblePrs = new Set();   // every MERGED PR the org's sessions still carry
+  // A URL past sanitizeBrief's 500-char cap could never be remembered (the
+  // memory drops it, the `finished` row cuts it), so it would be finished in
+  // every brief; no real GitHub/GitLab/ADO PR URL is that long — skip it.
   const mergedOf = (s) => (Array.isArray(s && s.prs) ? s.prs : []).filter((p) =>
-    p && typeof p.url === "string" && p.url && String(p.state || "").toUpperCase() === "MERGED");
+    p && typeof p.url === "string" && p.url && p.url.length <= 500
+    && String(p.state || "").toUpperCase() === "MERGED");
   const addPrs = (key, s) => {
     for (const p of mergedOf(s)) {
       if (seenPrs.has(p.url)) continue;
