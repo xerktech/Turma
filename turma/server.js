@@ -15191,7 +15191,22 @@ function panePromptAnswerText(a, sessionId, n) {
   // A number the dialog does not offer is dropped (the agent will not act on it),
   // as questionAnswerText drops a pick past the served options.
   if (options.length && !opt) return "";
-  return opt && typeof opt.label === "string" && opt.label ? opt.label : `option ${n}`;
+  return permissionAnswerKind(opt && typeof opt.label === "string" ? opt.label : "") || `option ${n}`;
+}
+
+// A permission option's KIND, never its words: the TUI's labels can carry the
+// subject ("Yes, and don't ask again for docker compose commands in this
+// project", "… for <host>"), and the log reaches every same-org session — the
+// reason permissionDecisionQuestion cuts the command. "Yes" / "Yes, don't ask
+// again" (any standing grant: don't ask again, allow all edits, auto-accept) /
+// "No"; "" for a label of no known shape, which the caller words "option N".
+const STANDING_GRANT_RE = /don'?t ask again|\ballow all\b|auto-accept|\balways\b|during this session/i;
+function permissionAnswerKind(label) {
+  const t = typeof label === "string" ? label.trim() : "";
+  const head = /^(yes|no)\b/i.exec(t);
+  if (!head) return "";
+  if (head[1].toLowerCase() === "no") return "No";
+  return STANDING_GRANT_RE.test(t) ? "Yes, don't ask again" : "Yes";
 }
 
 // The served log: each org's newest DECISIONS_WIRE_TAIL, oldest first.
@@ -21679,7 +21694,7 @@ if (process.env.TURMA_TEST) {
     // install REPLACES the map.
     getBriefs: () => briefs,
     getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
-    decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, cleanBriefNarrative, requestBriefNarrative,
+    decisionsWire, decisionCountsWire, decisionsReplyFor, permissionDecisionQuestion, permissionAnswerKind, cleanBriefNarrative, requestBriefNarrative,
     ingestBriefNarratives, briefRenders, briefNarrativeInput,
     briefsCoerce, sanitizeBrief, compileBrief, briefSweep, briefTick, briefNeedsYouSig,
     briefDur, briefNextReason,

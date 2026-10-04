@@ -188,7 +188,9 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
     (`(a typed answer)` alone with no pick) — never its words: the log reaches every same-org
     session, and text typed for one must not;
   - the pane-prompt route → `permissionDecisionQuestion`: the dialog's TOOL title ("Bash",
-    "Edit file"; `DIALOG_TITLE_RE`), + the picked option's label;
+    "Edit file"; `DIALOG_TITLE_RE`), + the picked option's KIND (`permissionAnswerKind`: "Yes" /
+    "Yes, don't ask again" / "No", else "option N") — never the label, which can name the command
+    or host ("… don't ask again for docker compose commands");
   - **never the subject's body** (command line, path, URL): it is session content and can carry a
     secret (`curl -H "Authorization: Bearer …"`), cut for the reason a typed answer's words are.
     Do not switch this to `permissionWhy` — that serves the body for the attention line only;

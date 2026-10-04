@@ -23511,7 +23511,9 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
       session: { question: "Which DB?", questionOptions: ["Postgres", "SQLite"] } },
     { id: "p1", status: "running", label: "lbl",
       session: { panePrompt: { prompt: "Do you want to proceed?", detail: "Bash command\nnpm test",
-        options: [{ number: 1, label: "Yes" }, { number: 2, label: "No" }] } } },
+        options: [{ number: 1, label: "Yes" },
+          { number: 2, label: "Yes, and don't ask again for npm test commands in this project" },
+          { number: 3, label: "No" }] } } },
     { id: "idle", status: "running" },
   ];
   await beat1574("dcHostB", S, { sessions });
@@ -23523,7 +23525,11 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
   const pp = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
     { body: { optionNumber: 1 }, headers: userHeaders });
   assert.equal(pp.status, 200);
-  // A number the two-option dialog does not offer is not logged as a choice.
+  // The standing grant's label names the command; only its kind is logged.
+  const ppGrant = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
+    { body: { optionNumber: 2 }, headers: userHeaders });
+  assert.equal(ppGrant.status, 200);
+  // A number the three-option dialog does not offer is not logged as a choice.
   const pp7 = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
     { body: { optionNumber: 7 }, headers: userHeaders });
   assert.equal(pp7.status, 200);
@@ -23534,6 +23540,8 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
     { source: "question", question: "Which DB?", answer: "Postgres; SQLite, plus a typed answer",
       host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
     { source: "permission", question: "Bash", answer: "Yes",
+      host: "dcHostB", sessionId: "p1", label: "lbl" },
+    { source: "permission", question: "Bash", answer: "Yes, don't ask again",
       host: "dcHostB", sessionId: "p1", label: "lbl" },
   ]);
   // A drifted host (bound to S, now declaring another org) is in NO org: its
@@ -23586,6 +23594,22 @@ test("XERK-1574: a permission's log line names the tool, never the command, and 
   assert.equal(q("", "Bash command\nnpm test"), "", "no question, nothing to log");
   assert.ok(!q("Do you want to proceed?", "Bash command\nexport TOKEN=abc").includes("TOKEN"));
   assert.equal(hub.permissionDecisionQuestion(undefined), "");
+});
+
+test("XERK-1574: a permission answer logs the option's kind, never its label's subject", () => {
+  const k = hub.permissionAnswerKind;
+  assert.equal(k("Yes"), "Yes");
+  assert.equal(k("Yes, and don't ask again for docker compose commands in this project"),
+    "Yes, don't ask again");
+  assert.equal(k("Yes, and don't ask again for internal.example.com"), "Yes, don't ask again");
+  assert.equal(k("Yes, allow all edits during this session (shift+tab)"), "Yes, don't ask again");
+  assert.equal(k("Yes, and auto-accept edits"), "Yes, don't ask again");
+  assert.equal(k("Yes, and manually approve edits"), "Yes");
+  assert.equal(k("No, and tell Claude what to do differently (esc)"), "No");
+  assert.equal(k("No, keep planning"), "No");
+  assert.equal(k("Yesterday's build"), "", "a word that merely starts with yes is no kind");
+  assert.equal(k("Deploy to staging"), "");
+  assert.equal(k(undefined), "");
 });
 
 test("XERK-1574: the log is a bounded tail — 200 kept, 20 served, 30 on a reply", async () => {
