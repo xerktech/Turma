@@ -28,8 +28,7 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   - `wake <duration> <reason…>` → `{wakeAt (epoch ms), reason, requestedAt}`. Durations are
     `20m`/`2h`/`1h30m`-style (`s`/`m`/`h`/`d`), above zero, at most 7 days; reason ≤200 chars.
   - `close-ticket <done|not-reproducible|already-fixed> --note "<evidence>"` →
-    `{resolution, note, requestedAt}`, note ≤2000 chars. **Only WRITTEN here** — its reader is the
-    close-ticket child (XERK-1569).
+    `{resolution, note, requestedAt}`, note ≤2000 chars. Read by the close-ticket worker below.
 - Exit 0 + one confirmation line on success; **2** on a refusal (usage, a bound, no
   `TURMA_SESSION_ID`, an id that is not a plain name), saying why and writing nothing; 1 on an
   I/O error.
@@ -161,7 +160,63 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - **Real-host spike (not yet run)**: the classifier against the real login on a few archived prompts
   (assert schema conformance, not text), and a looping transcript + a stalled shell through `verify`.
 
+## Close-ticket delivery (XERK-1569)
+
+- **A WORKER reads it, never the beat**: the two tracker writes are network (XERK-395).
+  `_stage_close_ticket_work` wakes `_close_ticket_worker_loop` on every full beat (never raises; a
+  failed `Thread.start` retries next beat); `_process_close_ticket_requests` walks a registry
+  snapshot and writes nothing to it. The beat's `_apply_closed_tickets` drains `_close_ticket_landed`
+  (rebound under `_close_ticket_lock`), stamps `ticket.outcome` (REBINDS the ticket dict, which the
+  worker reads) + the ledger, `save()`s, and stages `ticket_outcome_results`. The PR-comment split.
+- **Served only for a RUNNING session, NOT dsh/qwen** (no CLI there), on this host's board. The
+  tracker half (comment, Done mapping, `ticket.outcome`): `agent-board.md`.
+- **A request from a session with NO ticket key is REFUSED, never skipped** ("this session has no
+  ticket"): the CLI promised a message if the manager cannot close it, so silence would leave a
+  bare or not-yet-adopted session believing the close is under way. The file is consumed.
+- `read_close_ticket_request`: `_read_untrusted_json` (None = no request: missing/FIFO/symlink/
+  oversize); a parsed file breaking the contract (resolution outside `CLOSE_TICKET_KINDS`, note
+  empty/non-string/over `CLOSE_TICKET_NOTE_MAX`) is `{error}` → staged `refused: …` and dropped.
+- **One bounded retry**: `CLOSE_TICKET_ATTEMPTS` (2), the second `CLOSE_TICKET_RETRY_SEC` later. A
+  failure stages `ok:false, final:false` and LEAVES the file; the retry skips a comment that already
+  landed (`_close_ticket_tries[sid].commented`). A final outcome drops the file unless the session
+  has since written a DIFFERENT request (identity = kind/note/requestedAt). Progress is worker-owned
+  and in-memory: a manager restart re-tries a file still there, which can re-post its comment.
+- **A FINAL failure or refusal is messaged to the session** (`notify_session`, on the beat): the CLI
+  returns before the tracker is touched, so this is what lets the "tracker CLI/MCP else" fallback
+  run. Its reply says so ("…and message you if it cannot close the ticket").
+- Kill/delete/restart clears the dir (`_clear_session_requests`) — an unread request dies with it.
+- **Start drops close-ticket.json** (`_drop_close_ticket_request`, beside `_reopened_ticket`): a
+  request left from before the stop (a non-final failure, or a crash first) must not re-close the
+  ticket the operator just brought back. Only that file — a wake request still stands.
+- **Residual: a session can close a SIBLING's ticket.** The worker trusts the `<sid>` dir name, and
+  Bash (the `~/.turma` residual above) can write any sibling's dir, so a session can make the
+  manager comment on and close another same-host session's ticket with the host's tracker creds.
+  Accepted: same host, same org/board (siteKey-gated), and Done is reversible with the comment as
+  the audit trail. A sid stamped in the file would not help — the forger writes it too.
+- **An ADOPTED ticket is refused** (`ticket.adopted` / `ticketAdopted`, via `_served_ticket`): its
+  block came from the session's own branch name (`_maybe_adopt_ticket`), so any collected ticket is
+  one branch away, and its close gets every session on it killed org-wide by the hub's auto-stop.
+  The XERK-1440 provenance reason. The refusal reaches the session, which uses its tracker tool.
+  So `_session_directive` teaches an adopted block `TICKET_CLOSE_ADOPTED_PROMPT` (tracker tool
+  only), never the CLI the reader then refuses.
+- **A session killed before the beat applies a success** has its newest `self.closed` record (and
+  its ledger entry) stamped instead, so the board still says why the ticket closed.
+- **Taught by three directives**, each "session CLI first, the host's tracker CLI/MCP else":
+  `TICKET_CLOSE_STALE_CLAUSE` (bug prompt + `TICKET_CLOSE_PROMPT` in `_session_directive`) and the
+  hub's `autoCloseMergedMessage`. All spell `"$TURMA_SESSION_CLI"` — see the open question below.
+  Each is gated on runtime: a dsh/qwen session gets tracker-tool wording only (`session_cli=False`
+  agent-side; `autoCloseMergedMessage(urls, s.agentType, cli)` hub-side).
+- **The hub names the CLI only for a host reporting `closeTicket: {available: true}`** (heartbeat
+  capability, `normalizeCloseTicket`). The hub deploys on merge, agents update later: an agent with
+  the XERK-1564 CLI but no reader would accept the request and never act. Absent = tracker wording.
+- Tests: `TestCloseTicketRequest`, `TestTicketClosingDirectives`; hub `XERK-1569` cases.
+
 ## Real-host spike (not yet run)
+
+- **close-ticket (XERK-1569)**: on a scratch bug ticket, `close-ticket not-reproducible --note "…"`
+  → comment + Done within a minute, the auto-stop kill within a Jira poll (`JIRA_REFRESH_EVERY`),
+  the chip reading "not reproducible" on the board and a "Closed by" panel row naming the session
+  with its note. Not yet run; record the answer here.
 
 - In a worktree session run `python3 -SsE "$TURMA_SESSION_CLI" wake 2m test`: the request file
   appears, no permission prompt, and two minutes later the pane receives the wake-up input.
@@ -174,3 +229,6 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
   `python3` there is the Microsoft Store stub. The directive child must spell the interpreter that
   works there, or export it (e.g. `TURMA_SESSION_PYTHON=sys.executable`) and build the allow rule
   from it, as `build_guard_settings` does for the hooks.
+- **XERK-1569 inherits both questions**: `TICKET_CLOSE_STALE_CLAUSE`, `TICKET_CLOSE_PROMPT` and the
+  hub's `autoCloseMergedMessage` all teach `python3 -SsE "$TURMA_SESSION_CLI"`; the spike's answer
+  must update all three (a failed or prompted command degrades to the tracker-CLI/MCP fallback).

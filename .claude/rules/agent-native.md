@@ -29,7 +29,7 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   `--preflight`, `--tunnel-supervisor`; `-h/--help` → usage. A fall-through (`--help`) reaped the live
   tunnel and exec'd a second manager outside `turma-agentctl`'s pidfile. New modes join that `case`.
 - **A no-arg start REFUSES when a manager for this `$PREFIX` is already running (XERK-938)** —
-  `pgrep -f "$PREFIX/hub-agent.py"`, `TURMA_ALLOW_SECOND_MANAGER=1` opts out. No-args is the legit
+  `pgrep -xf` on the manager's WHOLE argv, `TURMA_ALLOW_SECOND_MANAGER=1` opts out. No-args is the legit
   systemd/turma-agentctl entry point (can't be rejected like an unknown arg, XERK-937), but a HAND
   run would reap the live tunnel and exec a SECOND hub-agent.py — two managers beating as one host,
   and `turma-agentctl restart` (pidfile-scoped) can't reap the stray. Safe against real restarts:
@@ -39,9 +39,13 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   default 15s)** before `start`. A fixed SHORT wait was a regression: the manager's SIGTERM handler
   can block a few seconds on the hub announce (`UPDATING_ANNOUNCE_TIMEOUT_SEC`, 4s), so the new
   launcher saw the still-dying old manager, the guard refused, and the host went DARK (zero managers,
-  no self-heal on non-systemd). The `--enroll` probe shares the pgrep path, so a CONCURRENT enroll can
-  spuriously refuse a start — rare, and fails loud (retryable), never dark. Tests:
-  `test_turma_agent.sh`, `test_turma_agentctl.sh`.
+  no self-heal on non-systemd). Tests: `test_turma_agent.sh`, `test_turma_agentctl.sh`.
+- **The duplicate-manager match is anchored to the exec'd argv, never a substring** (XERK-1552):
+  `^([^ ]*/)?python[0-9.]*t?( -[^ ]+)* <escaped $PREFIX>/hub-agent\.py$` (loose interpreter, exact tail).
+  `pgrep -f "$PREFIX/hub-agent.py"`
+  also matched any grep/tail/editor/session Bash command naming the path, refused an auto-update's
+  restart, and left the host stopped. Keep it in step with the `exec python3 …` line; the test stub
+  `exec -a python3`s a real python so its argv matches the real manager's.
 - Launcher exports `TURMA_MANAGER_PID=$$` so the tunnel's `pokeHeartbeat` signals the right process.
 - `install.sh` — idempotent (`--verify`/`--uninstall`): apt + npm + pinned static ttyd + pinned
   static glab (best-effort; a session's MR gets no chip without it), lays files keeping
