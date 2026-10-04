@@ -1311,6 +1311,29 @@ test("XERK-1566: a judged row is labelled and says what the judge decided, escap
   assert.match(html, /judge: allow — tests &lt;b&gt;ok&lt;\/b&gt;/);
 });
 
+test("XERK-1566: a long judge reason wraps inside the card; host, wait and age stay unbroken", () => {
+  const reason = "the command only runs the project's own unit tests against a scratch directory and touches nothing outside the worktree";
+  const html = H.permissionsCardHtml({ days: 7,
+    top: [{ kind: "judged", tool: "Bash", head: "npm test", count: 1, allowed: 1, denied: 0 }],
+    recent: [{ kind: "judged", tool: "Bash", head: "npm test", host: "nas01", answer: "allow", waitedMs: 4000,
+      verdict: "allow", judgeReason: reason, openedAt: PERM_NOW - 60000, closedAt: PERM_NOW }] },
+  PERM_NOW);
+  // The judge line is its OWN span, so the no-break wait span stays short and
+  // the host still leads the group.
+  assert.match(html, new RegExp('<span class="perm-meta"><span class="meta">nas01</span>' +
+    '<span class="meta">waited 4s · allow</span>' +
+    `<span class="meta meta-judge">judge: allow — ${reason.replace("'", "&#39;")}</span>` +
+    '<span class="meta">1m ago</span></span>'));
+  // Only that span may wrap: every other meta keeps white-space: nowrap.
+  const src = fs.readFileSync(path.join(__dirname, "..", "public", "usage.html"), "utf8");
+  assert.match(src, /\.perm-recent \.meta \{[^}]*white-space: nowrap;/);
+  const rule = src.match(/\.perm-recent \.meta\.meta-judge \{([^}]*)\}/);
+  assert.ok(rule, "a wrapping rule for the judge span");
+  assert.match(rule[1], /white-space: normal;/);
+  assert.match(rule[1], /overflow-wrap: break-word;/);
+  assert.match(rule[1], /min-width: 0;/);
+});
+
 test("XERK-1563: a group still waiting on its only answer reads 'open', never 0 / 0", () => {
   const g = { kind: "dialog", dialogKind: "permission", tool: "Bash", head: "terraform apply",
     suggestedRule: "Bash(terraform apply:*)", medianWaitMs: null };
