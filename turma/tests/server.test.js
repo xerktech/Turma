@@ -23100,7 +23100,9 @@ test("XERK-1572: attentionHints ride the heartbeat into the served attention", a
   await post({ sessions: [{ id: "s1", status: "running", session: live }] });
   const r = await post({ sessions: [{ id: "s1", status: "running", session: live }],
     attentionHints: [{ key: "s1:1", sessionId: "s1", edge: "review", edgeTs: 1, label: "needs-human-test",
-      why: "Asks for a manual check of the login page." }, { junk: true }] });
+      why: "Asks for a manual check of the login page.",
+      // A hand test never ships a suggested reply: it could only claim a test nobody ran.
+      suggestedAnswer: "I checked it, merge." }, { junk: true }] });
   assert.equal(r.status, 200);
   assert.equal("attentionHints" in agents[host], false, "never stored raw on the record");
   const served = hub.serializeAgent(host, agents[host], Date.now());

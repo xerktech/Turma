@@ -39369,6 +39369,40 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         self.assertLessEqual(len(long["suggestedAnswer"]), ha.ATTENTION_HINT_TEXT_MAX)
         self.assertNotIn("\n", long["suggestedAnswer"])
 
+    def test_a_hand_test_never_carries_a_suggested_answer(self):
+        # A suggested reply to "please test this by hand" could only claim a
+        # test nobody ran, so the parse drops it and the prompt forbids it.
+        got = ha.parse_attention_hint(json.dumps({
+            "label": "needs-human-test", "why": "Wants the swipe checked on a phone.",
+            "suggestedAnswer": "I've tested it on my phone, go ahead and merge."}))
+        self.assertEqual(got, {"label": "needs-human-test",
+                               "why": "Wants the swipe checked on a phone."})
+        self.assertIn("never says the operator tested", ha.ATTENTION_HINT_INSTRUCTION)
+        kept = ha.parse_attention_hint(json.dumps({
+            "label": "rubber-stamp", "why": "Asks to push.", "suggestedAnswer": "Yes."}))
+        self.assertEqual(kept["suggestedAnswer"], "Yes.")
+
+    def test_the_edge_survives_a_tail_that_fills_the_budget(self):
+        tail = [{"role": "assistant" if i % 2 else "user", "text": "word " * 400}
+                for i in range(6)]
+        cases = {
+            "question": ({"question": "Ship the migration now or wait for Monday?"},
+                         "Ship the migration now or wait for Monday?"),
+            "permission": ({"panePrompt": {"prompt": "Do you want to run rm -rf build?",
+                                           "options": [{"label": "Yes"}]}},
+                           "A permission dialog is open: Do you want to run rm -rf build?"),
+            "loop": ({"loop": {"tool": "Bash", "repeats": 6}},
+                     "has run Bash 6 times in a row"),
+        }
+        for kind, (signals, needle) in cases.items():
+            text = ha.attention_hint_input(kind, dict(signals, tail=tail))
+            self.assertLessEqual(len(text), ha.ATTENTION_HINT_INPUT_MAX, kind)
+            self.assertIn(needle, text, kind)
+            # The newest row's end is still there; the tail was cut at its front.
+            self.assertTrue(text.endswith("word"), kind)
+        huge = ha.attention_hint_input("question", {"question": "q" * 9000, "tail": tail})
+        self.assertEqual(len(huge), ha.ATTENTION_HINT_INPUT_MAX)
+
     def test_the_worker_runs_the_job_off_the_beat(self):
         sm = self.make_manager()
         job = {"sid": "s", "edge": "review|t", "edgeTs": 1, "argv": ["claude"]}
@@ -39485,6 +39519,40 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         row, = self.sm.permission_events
         self.assertIn("Should I proceed", row["prompt"])
         self.assertEqual(row["openedAt"], 1000)
+
+    def restarted(self):
+        # A fresh manager over the same persisted record: in-memory ask state
+        # gone, and its first beat primes rather than re-reads.
+        sm = self.make_manager()
+        sm.registry = [self.sess]
+        sm._perm_first_beat_done = False
+        self.sm = sm
+        return sm
+
+    def test_a_restart_mid_classification_still_files_the_rubber_stamp(self):
+        sig = self.ended(text="Tests pass. May I push the branch?")
+        self.beat(sig, at=1000)
+        self.sm._stage_attention_hint(now=1)       # attempt 1 in flight, then a restart
+        sm = self.restarted()
+        self.assertEqual(sm._perm_ask_pending, {})
+        self.beat(sig, at=2000)
+        sm._perm_first_beat_done = True
+        self.assertIn(self.SID, sm._perm_ask_pending, "the undecided turn waits again")
+        sm._stage_attention_hint(now=10 ** 9)       # the persisted record re-stages
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
+        row, = sm.permission_events
+        self.assertEqual((row["kind"], row["openedAt"]), ("ask-in-chat", 2000))
+        self.assertIn("push the branch", row["prompt"])
+
+    def test_a_restart_after_the_verdict_does_not_re_file(self):
+        sig = self.ended(text="Tests pass. May I push the branch?")
+        self.beat(sig, at=1000)
+        self.sm._stage_attention_hint(now=1)
+        self.verdict({"label": "rubber-stamp", "why": "Asks to push the branch."})
+        sm = self.restarted()
+        self.beat(sig, at=2000)
+        self.assertEqual(sm._perm_ask_pending, {})
+        self.assertEqual(sm.permission_events, [])
 
     def test_an_ask_answered_before_the_verdict_is_still_counted(self):
         self.beat(self.ended(text="May I merge it?"), at=1000)

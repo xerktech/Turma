@@ -123,6 +123,7 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   needs-human-test | blocked-on-host | looping | waiting-external, `edge` ∈ question | permission |
   review | stalled | loop (an own-key lookup, so `__proto__` is no edge), `why` required, `why`/
   `suggestedAnswer` one-lined and capped at 300, ≤50 rows a beat. Anything else is dropped whole.
+  A `needs-human-test` hint loses its `suggestedAnswer` (it could only claim a test nobody ran).
 - **Folded as `attention.hint = {label, why, suggestedAnswer?}`, beside the hub's own `why`**, never
   over it: the computed why ("PR open · CI passing", the wait's label) still drives the labels.
 - **A hint answers ONE state run** (`attentionWithHint`): kept on `sa.hint` (persists with `alerts`)

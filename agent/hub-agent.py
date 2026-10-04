@@ -11563,7 +11563,9 @@ ATTENTION_HINT_INSTRUCTION = (
     'something outside: CI, a deploy, another person or service); "why": one '
     'sentence under 200 characters saying what it is waiting on; '
     '"suggestedAnswer": the short reply the operator could send, or leave it out '
-    "when there is none}.\n\nDATA\n"
+    "when there is none}. A suggestedAnswer never says the operator tested, "
+    "checked, verified or approved anything; leave it out for needs-human-test."
+    "\n\nDATA\n"
 )
 # A session looping on ONE failing call: this many consecutive failures of the
 # same tool + input reports `loop`, which the hub reads as needs-you:stalled.
@@ -11749,16 +11751,22 @@ def attention_hint_input(kind, signals):
                      "have gone quiet: " + "; ".join(x for x in labels if x))
     else:
         lines.append("The session ended its turn.")
+    # The edge description is the classifier's primary input, so it is kept
+    # whole (to the overall cap) and the tail gets only what is left of the
+    # budget, cut from its FRONT so the newest rows survive.
+    edge = "\n".join(lines)[:ATTENTION_HINT_INPUT_MAX]
     rows = [r for r in (signals.get("tail") or []) if isinstance(r, dict)
             and isinstance(r.get("text"), str) and r["text"].strip()]
-    if rows:
-        lines.append("Recent conversation, oldest first:")
-        for r in rows[-ATTENTION_HINT_TURNS:]:
-            text = r["text"].strip()
-            if len(text) > ATTENTION_HINT_TURN_CHARS:
-                text = "…" + text[-ATTENTION_HINT_TURN_CHARS:]
-            lines.append(f"[{r.get('role') or '?'}] {text}")
-    return "\n".join(lines)[-ATTENTION_HINT_INPUT_MAX:]
+    tail = ["Recent conversation, oldest first:"] if rows else []
+    for r in rows[-ATTENTION_HINT_TURNS:]:
+        text = r["text"].strip()
+        if len(text) > ATTENTION_HINT_TURN_CHARS:
+            text = "…" + text[-ATTENTION_HINT_TURN_CHARS:]
+        tail.append(f"[{r.get('role') or '?'}] {text}")
+    budget = ATTENTION_HINT_INPUT_MAX - len(edge) - 1
+    if not tail or budget <= 0:
+        return edge
+    return edge + "\n" + "\n".join(tail)[-budget:]
 
 
 def parse_attention_hint(raw):
@@ -11786,7 +11794,9 @@ def parse_attention_hint(raw):
         if not isinstance(ans, str):
             return None
         ans = " ".join(ans.split())[:ATTENTION_HINT_TEXT_MAX]
-        if ans:
+        # A hand test needs a real person: a suggested reply there could only
+        # claim a test nobody ran, so it is never shipped.
+        if ans and obj["label"] != "needs-human-test":
             out["suggestedAnswer"] = ans
     return out
 
@@ -30863,8 +30873,18 @@ class SessionManager:
             return
         seen = self._perm_ask_seen.get(sid)
         self._perm_ask_seen[sid] = ts
-        if seen == ts or (seen is None and not self._perm_first_beat_done):
+        if seen == ts:
             return
+        if seen is None and not self._perm_first_beat_done:
+            # Primed, not re-read — UNLESS the wait classifier was still deciding
+            # this very turn when the manager restarted: its persisted record
+            # (undone, same anchor) means no row was settled before the restart,
+            # and the verdict it re-stages must find the turn waiting for it.
+            rec = sess.get("attentionHint")
+            if not (isinstance(rec, dict) and not rec.get("done")
+                    and rec.get("edge") == f"review|{ts}"
+                    and self._attention_classifies(sess)):
+                return
         if sid in self._perm_ask or sid in self._perm_ask_pending:
             return
         path = _session_transcript_path(sess)

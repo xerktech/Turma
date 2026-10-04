@@ -145,6 +145,10 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - **Strict parse** (`parse_attention_hint`): one JSON object (a code fence tolerated), label from the
   fixed set, `why` a non-empty string, `suggestedAnswer` a string if present; anything else is no
   verdict, never a repaired one. A verdict for an edge the session has left is dropped.
+- **A `needs-human-test` verdict never carries `suggestedAnswer`** (prompt rule + parse drop + hub
+  drop): a suggested reply there could only claim a hand test nobody ran.
+- **The edge description is kept whole in the input**; only the tail is cut (from its front) to fit
+  `ATTENTION_HINT_INPUT_MAX`, so long tail rows never push the question/dialog/loop line out.
 - **The wire**: `attentionHints` rows `{key:"<sid>:<edgeTs>", …}`, ≤`ATTENTION_HINTS_MAX` a beat,
   cleared BY IDENTITY in `_clear_delivered_staged`, never shed; the outbox is bounded.
 - **The loop signal needs no model**: `_scan_loop_entry` (in `_scan_entry_line`) counts consecutive

@@ -11562,7 +11562,9 @@ function normalizeAttentionHint(h) {
   const why = hintText(h.why);
   if (!why) return null;
   const out = { sessionId: sid, edge: h.edge, edgeTs: h.edgeTs, label: h.label, why };
-  const ans = hintText(h.suggestedAnswer);
+  // A hand test needs a real person, so no suggested reply (it could only claim
+  // a test nobody ran) — dropped here too for an agent that still sends one.
+  const ans = h.label === "needs-human-test" ? "" : hintText(h.suggestedAnswer);
   if (ans) out.suggestedAnswer = ans;
   return out;
 }

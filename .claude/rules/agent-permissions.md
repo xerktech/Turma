@@ -91,6 +91,9 @@ hook-log tail) + `agent/hooks/permlog.py`.
     `_perm_ask_pending` and a `rubber-stamp` label opens the row (prompt = the session's asking
     sentence via the regex, else the classifier's `why`; `openedAt` = the edge); any other label
     opens none, even where the regex would have matched.
+  - **A manager restart mid-classification does not lose the ask**: the first beat primes, EXCEPT
+    a turn whose persisted `attentionHint` is the same `review|<ts>` edge and not yet `done` — that
+    one goes back into `_perm_ask_pending`, so the re-staged verdict still files it.
   - **The hub's own stall/loop nudge is not an answer**: it rides `input` with `source:"nudge"`,
     which skips `_permission_close_ask` — no pending ask is settled, no open row closed `via:"turma"`.
   - **The regex (`PERMISSION_ASK_RE`, `_permission_ask_prompt`) is the FALLBACK**: a dsh/qwen
