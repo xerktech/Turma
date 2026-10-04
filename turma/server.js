@@ -3308,14 +3308,21 @@ function cleanBriefNarrative(v) {
     .replace(/<[^>\n]*>/g, " ")
     .replace(/!?\[([^\]\n]*)\]\([^)\n]*\)/g, "$1")
     .replace(/[*`#~|<>[\]]/g, "")
+    // Control/bidi/zero-width (all but the newline), then every other
+    // non-newline whitespace, become spaces BEFORE the per-line bullet strip \u2014
+    // a leading one would hide a bullet from this pass and expose it to the
+    // next. Explicit ASCII classes after that, so the agent's Python mirror
+    // (wider \s and \d) agrees exactly.
+    .replace(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ")
+    .replace(/[^\S\n]/g, " ")
     .split("\n")
-    .map((l) => l.replace(/^\s*(?:(?:[-+]|\d+[.)])(?:\s+|$))+/, ""))
+    .map((l) => l.replace(/^ *(?:(?:[-+]|[0-9]+[.)])(?: +|$))+/, ""))
     .join(" ")
-    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim();
+    .replace(/ +/g, " ")
+    .replace(/^ | $/g, "");
   if (s.length > 1200) {
-    const cut = s.slice(0, 1199);
+    let cut = s.slice(0, 1199);
+    if (/[\ud800-\udbff]$/.test(cut)) cut = cut.slice(0, -1); // never half a surrogate pair
     const sp = cut.lastIndexOf(" ");
     s = `${(sp > 900 ? cut.slice(0, sp) : cut).trimEnd()}…`;
   }

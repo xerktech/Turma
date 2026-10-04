@@ -3,6 +3,9 @@ paths:
   - "turma/server.js"
   - "turma/public/brief.html"
   - "turma/tests/server.test.js"
+  - "turma/tests/brief-page.test.js"
+  - "android/app/src/main/java/com/xerktech/turma/model/Models.kt"
+  - "android/app/src/main/java/com/xerktech/turma/net/FleetRepository.kt"
   - "android/app/src/main/java/com/xerktech/turma/ui/BriefScreen.kt"
   - "android/app/src/main/java/com/xerktech/turma/core/Brief.kt"
   - "android/app/src/main/java/com/xerktech/turma/vm/BriefViewModel.kt"
@@ -143,6 +146,9 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
   `* \` # ~ | < > [ ]`, list bullets and control/bidi chars stripped, whitespace collapsed, cut at
   1200 on a word with "…"). A FIXED POINT, so a sanitized brief stays one (HA echo dedup). Empty =
   absent, never "". `narrativeAt` rides only with a narrative.
+- **Control/bidi chars and non-newline whitespace become spaces BEFORE the per-line bullet strip**
+  — else a leading one hides a bullet from the first pass (not a fixed point). After that only
+  explicit ASCII classes, so the agent's `clean_brief_narrative` gives the same answer.
 - **Strictly additive**: no capable host, a failed render, or an older agent = the brief stands as
   v1. `briefWire` strips it from earlier briefs (headline-only). The push does not carry it (it
   lands after the push fires).

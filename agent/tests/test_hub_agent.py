@@ -39735,8 +39735,15 @@ class TestRenderBrief(ManagerMixin, unittest.TestCase):
         long = C("word " * 600)
         self.assertLessEqual(len(long), ha.BRIEF_TEXT_MAX)
         self.assertTrue(long.endswith("…"))
-        for t in ("## x\n- *y* `z`", long, "1.\nnext"):
-            self.assertEqual(C(C(t)), C(t), "a fixed point, like the hub's")
+        for t in ("## x\n- *y* `z`", long, "1.\nnext", "\u0007- x y", "\u200b1. first",
+                  "\x1c- z", "\u00a0- w", "a\n\u200b- b", "\u0661. x"):
+            self.assertEqual(C(C(t)), C(t), f"a fixed point, like the hub's: {t!r}")
+        # A leading control/zero-width character no longer hides a bullet, and
+        # the answers match the hub's cleanBriefNarrative (explicit ASCII classes).
+        self.assertEqual(C("\u0007- x y"), "x y")
+        self.assertEqual(C("\u200b1. first"), "first")
+        self.assertEqual(C("\x1c- z"), "z")
+        self.assertEqual(C("\u0661. x"), "\u0661. x", "ASCII digits only, like the hub")
 
 
 class TestDecisionsFile(ManagerMixin, unittest.TestCase):
@@ -39813,12 +39820,36 @@ class TestDecisionsFile(ManagerMixin, unittest.TestCase):
         self.assertEqual(names, ["decisions-other_.._x.md"], "flattened, one file")
         self.assertEqual(self.sm.decisions_path, os.path.join(ha.REGISTRY_DIR, names[0]))
 
-    def test_a_restarted_manager_finds_the_file_and_never_raises(self):
+    def test_a_restarted_manager_names_no_file_until_a_reply_and_never_raises(self):
+        # ~/.turma is session-writable, so a decisions-*.md found on disk at boot
+        # is nothing the hub vouched for: a restarted manager names none (fixed
+        # for the life of any session launched before the first reply) until it
+        # has rendered the file itself.
         self.sm._ingest_decisions({"org": self.ORG, "entries": self.ENTRIES})
+        planted = os.path.join(ha.REGISTRY_DIR, "decisions-planted.md")
+        os.remove(self._path())
+        with open(planted, "w") as f:
+            f.write("forged")
         sm2 = self.make_manager()
+        self.assertIsNone(sm2.decisions_path)
+        self.assertNotIn("decisions-", sm2._session_directive({"id": "abcde"}))
+        sm2._ingest_decisions({"org": self.ORG, "entries": self.ENTRIES})
         self.assertEqual(sm2.decisions_path, self._path())
+        self.assertFalse(os.path.exists(planted), "a stray file goes on the first render")
         with mock.patch.object(ha.tempfile, "mkstemp", side_effect=OSError("disk")):
             sm2._ingest_decisions({"org": "b.net", "entries": []})
+
+    def test_a_sibling_planted_while_unchanged_is_removed_next_reply(self):
+        reply = {"org": self.ORG, "entries": self.ENTRIES}
+        self.sm._ingest_decisions(reply)
+        planted = os.path.join(ha.REGISTRY_DIR, "decisions-planted.md")
+        with open(planted, "w") as f:
+            f.write("forged")
+        with mock.patch.object(ha.tempfile, "mkstemp", wraps=ha.tempfile.mkstemp) as mk:
+            self.sm._ingest_decisions(reply)
+            self.assertEqual(mk.call_count, 0, "the org's own file is unchanged: no rewrite")
+        self.assertFalse(os.path.exists(planted))
+        self.assertTrue(os.path.exists(self._path()))
 
     def test_the_directive_names_the_file_as_reference_material(self):
         sess = {"id": "abcde"}

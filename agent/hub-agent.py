@@ -11837,9 +11837,15 @@ BRIEF_RENDER_INSTRUCTION = (
     "no preamble."
     "\n\nDATA\n"
 )
+# Every control/bidi/zero-width character EXCEPT the newline (the bullet strip
+# is per line), and then every whitespace but the newline, become a space BEFORE
+# bullets are stripped — else a leading one hides a bullet on the first pass and
+# the second removes it (not a fixed point). After that, explicit ASCII classes
+# (` `, `[0-9]`) so Python's wider \s/\d cannot disagree with the hub's JS.
 _BRIEF_CTRL_RE = re.compile(
-    "[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
-_BRIEF_BULLET_RE = re.compile(r"^\s*(?:(?:[-+]|\d+[.)])(?:\s+|$))+")
+    "[\u0000-\u0009\u000b-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2060-\u2069\ufeff]")
+_BRIEF_SPACE_RE = re.compile(r"[^\S\n]")
+_BRIEF_BULLET_RE = re.compile(r"^ *(?:(?:[-+]|[0-9]+[.)])(?: +|$))+")
 
 
 def clean_brief_narrative(text):
@@ -11856,9 +11862,9 @@ def clean_brief_narrative(text):
     s = re.sub(r"<[^>\n]*>", " ", s)
     s = re.sub(r"!?\[([^\]\n]*)\]\([^)\n]*\)", r"\1", s)
     s = re.sub(r"[*`#~|<>\[\]]", "", s)
+    s = _BRIEF_SPACE_RE.sub(" ", _BRIEF_CTRL_RE.sub(" ", s))
     s = " ".join(_BRIEF_BULLET_RE.sub("", line) for line in s.split("\n"))
-    s = _BRIEF_CTRL_RE.sub(" ", s)
-    s = " ".join(s.split())
+    s = re.sub(" +", " ", s).strip(" ")
     if len(s) > BRIEF_TEXT_MAX:
         cut = s[:BRIEF_TEXT_MAX - 1]
         sp = cut.rfind(" ")
@@ -18794,7 +18800,12 @@ class SessionManager:
         # The org's decisions file (XERK-1574): the path it was last rendered to
         # (found on disk at boot, so a session launched before the first reply is
         # still told about it) and the text written there.
-        self.decisions_path = self._discover_decisions_path()
+        # Named only once THIS manager has rendered it from a hub reply — never
+        # found on disk at boot, where ~/.turma is session-writable and a lone
+        # planted decisions-*.md would be named, fixed for a session's lifetime,
+        # to every session launched before the first reply. Fails narrow: a boot
+        # relaunch before that reply simply is not pointed at the log.
+        self.decisions_path = None
         self._decisions_text = None
         self._decisions_mtime = None
         # GitHub clone-into-root state: the cached availability/repo-list block
@@ -31344,13 +31355,15 @@ class SessionManager:
         return [os.path.join(REGISTRY_DIR, n) for n in names
                 if n.startswith(DECISIONS_FILE_PREFIX) and n.endswith(".md")]
 
-    def _discover_decisions_path(self):
-        """The decisions file a previous manager rendered, if exactly one is on
-        disk — so a session launched before this manager's first reply is still
-        pointed at it. More than one (an org change mid-crash) names none; the
-        next reply settles it."""
-        found = [p for p in self._decisions_files() if os.path.isfile(p)]
-        return found[0] if len(found) == 1 else None
+    def _remove_other_decisions(self, keep):
+        """Remove every decisions file but `keep` — a stale org's, or one a
+        session planted with Bash (only the Edit tools are denied)."""
+        for p in self._decisions_files():
+            if p != keep:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
 
     def _ingest_decisions(self, raw):
         """Render the hub's decisions tail for this host's DECIDED org to
@@ -31376,8 +31389,10 @@ class SessionManager:
             if path == self.decisions_path and text == self._decisions_text:
                 # Unchanged — unless something rewrote or removed the file since
                 # (Bash walks past the Edit deny): one stat, then it is restored.
+                # A planted sibling goes either way, not only on a rewrite.
                 try:
                     if os.stat(path).st_mtime_ns == self._decisions_mtime:
+                        self._remove_other_decisions(path)
                         return
                 except OSError:
                     pass
@@ -31395,12 +31410,7 @@ class SessionManager:
                 except OSError:
                     pass
                 raise
-            for p in self._decisions_files():
-                if p != path:
-                    try:
-                        os.remove(p)
-                    except OSError:
-                        pass
+            self._remove_other_decisions(path)
             self.decisions_path = path
             self._decisions_text = text
             try:

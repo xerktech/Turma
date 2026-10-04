@@ -230,6 +230,8 @@ Hub side (the request, the store, the routes, the page): `turma-brief.md`.
   brief JSON alone — never a transcript. Never give it a second runner.
 - **`clean_brief_narrative` mirrors the hub's `cleanBriefNarrative`** (one plain paragraph,
   ≤`BRIEF_TEXT_MAX`, a fixed point); the hub re-cleans regardless — it is the whitelist.
+  Same step order and EXPLICIT ASCII classes (` `, `[0-9]`) as the JS, since Python's `\s`/`\d`
+  are wider; change both together.
 - **The result rides `briefNarratives`**, cleared BY IDENTITY like `attentionHints`; the capability
   is `briefRender:{available:true}` (an older agent acks `renderBrief` and never answers).
 - **`_ingest_decisions` renders the reply's `decisions:{org, entries}` to
@@ -240,9 +242,15 @@ Hub side (the request, the store, the routes, the page): `turma-brief.md`.
   without a usable block REMOVES it — fails narrow like the roster. Never raises.
 - **Guard**: `Read(~/.turma/decisions-*.md)` allowed (the directive points at it),
   `Edit(~/.turma/decisions-*.md)` denied and pinned in `EXPECTED_DENY_RULES`.
-- **`_session_directive` names the file only once one exists** (`decisions_path`, found on disk at
-  boot) — `DECISIONS_SYSTEM_PROMPT` words it as reference material about what was decided, not
-  instructions, and says its questions were written by other sessions. Fixed at launch like peers.
+- **`_session_directive` names the file only once THIS manager rendered it from a reply**
+  (`decisions_path`) — `DECISIONS_SYSTEM_PROMPT` words it as reference material about what was
+  decided, not instructions, and says its questions were written by other sessions. Fixed at launch
+  like peers.
+- **Never discover it on disk at boot**: `~/.turma` is Bash-writable, so a lone planted
+  `decisions-*.md` would be named, for life, to every session launched before the first reply. A
+  boot relaunch before that reply is simply not pointed at the log (fails narrow).
+- **Every reply removes every OTHER `decisions-*.md`** (`_remove_other_decisions`), on the unchanged
+  path too — a planted sibling never outlives one beat.
 - **Residual**: the questions in the file are SESSION-written (an AskUserQuestion's text), so one
   session can plant text another session reads. The directive frames it as data; an org boundary
   (decided org) still bounds who sees it.

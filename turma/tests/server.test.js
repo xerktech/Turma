@@ -23348,7 +23348,11 @@ test("XERK-1574: a brief asks ONE capable host of its org for a narrative, and o
   // Another org's host, a wrong brief, and a forged siteKey are all ignored.
   await beat1574("nrOther", T, { briefNarratives: [row("forged by another org")] });
   await beat1574("nrCapable", S, { briefNarratives: [row("wrong brief", { briefAt: b.at - 1 })] });
+  // A same-org host the hub never asked cannot write the org's summary either.
+  const asked = JSON.stringify(hub.briefRenders.get(S));
+  await beat1574("nrOld", S, { briefNarratives: [row("not asked")] });
   assert.equal("narrative" in hub.getBriefs()[S][0], false);
+  assert.equal(JSON.stringify(hub.briefRenders.get(S)), asked, "the request still waits on the asked host");
   // The asked host's answer lands, cleaned to one plain paragraph.
   await beat1574("nrCapable", S, { briefNarratives: [row("## Brief\n- **XERK-1** shipped.\n<script>x</script>")] });
   const kept = hub.getBriefs()[S][0];
@@ -23386,7 +23390,18 @@ test("XERK-1574: the narrative is whitelisted — plain, bounded, a coerce fixed
   assert.equal(C(42), "");
   const long = C("word ".repeat(600));
   assert.ok(long.length <= 1200 && long.endsWith("…"));
-  for (const t of ["*a* `b`", long, "1.\nnext", "[[a](x)](y)"]) assert.equal(C(C(t)), C(t), t);
+  for (const t of ["*a* `b`", long, "1.\nnext", "[[a](x)](y)",
+    "\u0007- x y", "​1. first", "\x1c- z", " - w", "a\n​- b", "١. x"]) {
+    assert.equal(C(C(t)), C(t), JSON.stringify(t));
+  }
+  // A leading control/zero-width character no longer hides a bullet.
+  assert.equal(C("\u0007- x y"), "x y");
+  assert.equal(C("​1. first"), "first");
+  assert.equal(C("\x1c- z"), "z", "the same answer the agent's Python mirror gives");
+  assert.equal(C("١. x"), "١. x", "ASCII digits only, like the Python mirror");
+  // A cut never leaves half a surrogate pair.
+  const astral = C(`${"a".repeat(1198)}\u{1F600}${" b".repeat(10)}`);
+  assert.ok(!/[\ud800-\udbff](?![\udc00-\udfff])/.test(astral), "no lone high surrogate");
   const raw = { "o.atlassian.net": [{ siteKey: "o.atlassian.net", at: 2000,
     narrative: "## Title\n**bold**", narrativeAt: 2500 },
   { siteKey: "o.atlassian.net", at: 1000, narrative: "   ", narrativeAt: 1500 }] };
@@ -23465,15 +23480,27 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
       host: "dcHostB", sessionId: "p1", label: "lbl" },
   ]);
   // A drifted host (bound to S, now declaring another org) is in NO org: its
-  // answers are not logged, and its reply carries no org's log.
-  await beat1574("dcHostB", "elsewhere1574.atlassian.net", { sessions });
+  // answers are not logged — not under S, and NOT under the org it claims,
+  // whose real hosts would otherwise read them — and its reply carries no log.
+  const E = "elsewhere1574.atlassian.net";
+  await beat1574("dcHostE", E);                     // a host genuinely decided into E
+  await beat1574("dcHostB", E, { sessions });
   const before = hub.getDecisions()[S].length;
   assert.equal((await ans("q1", { optionIndex: 1 })).status, 200);
+  const pp2 = await request("POST", "/api/agents/dcHostB/sessions/p1/pane-prompt",
+    { body: { optionNumber: 2 }, headers: userHeaders });
+  assert.equal(pp2.status, 200);
   assert.equal(hub.getDecisions()[S].length, before);
-  const reply = await beat1574("dcHostB", "elsewhere1574.atlassian.net", { sessions });
+  assert.equal(E in hub.getDecisions(), false, "never keyed on the claimed org");
+  const reply = await beat1574("dcHostB", E, { sessions });
   assert.deepEqual(reply.body.decisions, { org: "", entries: [] });
+  const replyE = await beat1574("dcHostE", E);
+  assert.deepEqual(replyE.body.decisions, { org: E, entries: [] },
+    "the claimed org's own hosts never see the drifted host's answers");
   delete agents.dcHostB;
+  delete agents.dcHostE;
   delete hub.getDecisions()[S];
+  delete hub.getDecisions()[E];
 });
 
 test("XERK-1574: the log is a bounded tail — 200 kept, 20 served, 30 on a reply", async () => {
