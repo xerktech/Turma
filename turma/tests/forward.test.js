@@ -1430,3 +1430,115 @@ test("XERK-919 QA3: a leader in dial cooldown is never fresh — fresh entry or 
   assert.equal(f.remoteLeaderFresh(), false, "the dial proof is recent, but the leader is in cooldown: no hand-back");
   srv.close(); f.close();
 });
+
+// A leader that answers 413 off the head alone, never reading the body, and lingers
+// itself (XERK-1076) — so any reset the client sees is the FOLLOWER's.
+// urllib exactly: NOTHING is read off the socket until the whole body is written (or the
+// write fails), so an answer sitting in the receive buffer is lost to a reset, as it is
+// for the agent. postLikeUrllib reads as it writes and can win that race.
+function writeThenRead(port, path, size) {
+  return new Promise((resolve) => {
+    const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+    let got = "";
+    s.pause();
+    s.on("data", (d) => { got += d; });
+    s.on("error", (e) => resolve(got ? got.split("\r\n")[0] : "err:" + e.code));
+    s.on("close", () => resolve(got.split("\r\n")[0] || "closed"));
+    s.on("end", () => { s.destroy(); resolve(got.split("\r\n")[0] || "closed"); });
+    s.on("connect", () => {
+      s.write(`POST ${path} HTTP/1.1\r\nHost: x\r\nContent-Length: ${size}\r\n\r\n`);
+      s.write(Buffer.alloc(size, 120), () => s.resume());
+    });
+  });
+}
+
+async function earlyRefusingLeader() {
+  const leader = http.createServer((rq, rs) => {
+    rs.writeHead(413, { "content-type": "application/json", connection: "close" });
+    rs.end('{"error":"body too large","limit":1}');
+    rq.socket.destroySoon = () => { rq.socket.end(); rq.resume(); };
+  });
+  return { leader, port: await listen(leader) };
+}
+
+test("XERK-1090: a leader's early refusal reaches a still-writing client as the 413 — the relay lingers, no reset", async () => {
+  const { leader, port: lport } = await earlyRefusingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, { drainLingerMs: 2000 });
+  const { srv, port } = await followerServer(f);
+  // 20 MiB, written whole before any read (urllib): past every socket buffer, so the
+  // client is still writing when the answer comes back.
+  const got = await Promise.all([1, 2, 3].map(() => writeThenRead(port, "/api/heartbeat", 20 << 20)));
+  for (const g of got) assert.match(g, /^HTTP\/1\.1 413 /, `got ${g}`);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-1090: relay lingers are capped at drainMax and bounded by drainLingerMs", async () => {
+  const { leader, port: lport } = await earlyRefusingLeader();
+  const { f } = await follower(`127.0.0.1:${lport}`, { drainMax: 1, drainLingerMs: 300 });
+  const { srv, port } = await followerServer(f);
+  // A client that never stops writing and never closes: lingered, then cut on time.
+  const open = () => {
+    const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+    s.got = ""; s.ended = false;
+    s.on("data", (d) => { s.got += d; });
+    s.on("end", () => { s.ended = true; });
+    s.on("error", () => {});
+    s.closed2 = new Promise((r) => s.on("close", r));
+    s.on("connect", () => {
+      s.write("POST /api/heartbeat HTTP/1.1\r\nHost: x\r\nContent-Length: 99999999\r\n\r\n");
+      s.timer = setInterval(() => { if (!s.destroyed) s.write(Buffer.alloc(1000)); }, 10);
+    });
+    return s;
+  };
+  const a = open();
+  await sleep(150);
+  assert.match(a.got, / 413 /);
+  assert.match(a.got, /connection: close/i, "a lingering relay announces the close");
+  assert.ok(a.ended && !a.destroyed, "FIN sent, still draining");
+  // The one slot is held, so a second relay answers without the linger.
+  const b = open();
+  await sleep(150);
+  assert.match(b.got, / 413 /);
+  assert.doesNotMatch(b.got, /connection: close/i, "past drainMax the relay does not linger");
+  assert.equal(await Promise.race([a.closed2.then(() => "cut"), sleep(2000).then(() => "open")]), "cut",
+    "a client that never closes is cut after drainLingerMs");
+  // The slot is free again.
+  const c = open();
+  await sleep(150);
+  assert.match(c.got, /connection: close/i, "the slot frees on close");
+  for (const s of [a, b, c]) { clearInterval(s.timer); s.destroy(); }
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-1090: a leader that RESETS mid-body reaches a still-writing client as the follower's 502, not a reset", async () => {
+  const leader = net.createServer((sock) => {
+    sock.on("error", () => {});
+    sock.once("data", () => setTimeout(() => sock.resetAndDestroy(), 30));
+  });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`);
+  const { srv, port } = await followerServer(f);
+  const got = await writeThenRead(port, "/api/heartbeat", 20 << 20);
+  assert.match(got, /^HTTP\/1\.1 502 /, `got ${got}`);
+  srv.close(); leader.close(); f.close();
+});
+
+test("XERK-1090: an early 2xx (a stream) is never lingered — only a refusal is", async () => {
+  const leader = http.createServer((rq, rs) => { rs.writeHead(200); rs.write("streaming"); });
+  const lport = await listen(leader);
+  const { f } = await follower(`127.0.0.1:${lport}`, { drainLingerMs: 100 });
+  const { srv, port } = await followerServer(f);
+  const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+  let got = "";
+  s.on("data", (d) => { got += d; });
+  s.on("error", () => {});
+  const closed = new Promise((r) => s.on("close", r));
+  await new Promise((r) => s.on("connect", r));
+  s.write("POST /x HTTP/1.1\r\nHost: x\r\nContent-Length: 999999\r\n\r\nabc");
+  await sleep(50);
+  assert.match(got, / 200 /);
+  assert.doesNotMatch(got, /connection: close/i);
+  assert.equal(await Promise.race([closed.then(() => "cut"), sleep(400).then(() => "open")]), "open",
+    "not cut at drainLingerMs");
+  s.destroy(); srv.close(); leader.close(); f.close();
+});
