@@ -117,8 +117,9 @@ Not the CLI, but the other half of "why is this session waiting": hub half in `t
 - **Output goes to a FILE and the child leads its own process group** (`start_new_session`), killed
   whole on a timeout and reaped with a bound — a pipe read waits for EOF unbounded, so a grandchild
   holding stdout would wedge the one worker. Only the job's OWN answer (same edge + `stagedAt`) frees
-  `_attn_job`; a late answer from a watchdog-dropped job does not. `TURMA_ATTENTION_HINTS=0` turns it off; dsh/qwen skip it (no
-  Claude login assumed, like naming).
+  `_attn_job`; a late answer from a watchdog-dropped job does not.
+- `TURMA_ATTENTION_HINTS=0` turns the classifier off; dsh/qwen skip it (no Claude login assumed,
+  like naming).
 - **Only a NEW edge is classified** (`attention_edge`, a pure read of the beat's signals: question |
   permission | loop | stalled | review, with an anchor). `_attention_edge` notes it on the record
   as `attentionHint {edge, kind, edgeTs, attempts}`; the RECORD is the ledger, so an edge it already
