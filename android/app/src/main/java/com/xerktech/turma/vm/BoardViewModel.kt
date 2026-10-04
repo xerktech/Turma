@@ -626,8 +626,9 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
      * it ("" switches the judge off for the org), null drops back to the hub's
      * default ("Use default"). Nothing reads as saved until the hub's 200 says so
      * — then the sheet shows what the hub STORED (and closes when [close]); a
-     * refusal leaves the operator's edit alone and shows the hub's words. A save
-     * waits for a successful load, so a failed GET is never saved over.
+     * refusal leaves the operator's edit alone and shows the hub's words (as a
+     * message when the sheet was dismissed mid-save). A save waits for a
+     * successful load, so a failed GET is never saved over.
      */
     fun savePermissionPolicy(text: String?, close: Boolean): Job? {
         val cur0 = _permission.value
@@ -641,9 +642,11 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             } catch (_: Exception) {
                 PermissionPolicyResult(error = "the hub is unreachable")
             }
+            var shown = false
             _permission.update { cur ->
+                shown = cur.siteKey == siteKey
                 when {
-                    cur.siteKey != siteKey -> cur
+                    !shown -> cur
                     r.error != null -> cur.copy(busy = false, error = r.error)
                     else -> cur.copy(busy = false, text = r.text, isDefault = r.isDefault,
                         rev = cur.rev + 1, done = close)
@@ -651,6 +654,11 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
             }
             if (r.error == null) {
                 _messages.tryEmit(if (text == null) "✓ permission policy reset to default" else "✓ permission policy saved")
+            } else if (!shown) {
+                // The sheet was dismissed mid-save (swipe/back), so its error
+                // line is gone: the refusal still reaches the operator, in the
+                // hub's words (XERK-264), as board.html's permissionRequest toasts.
+                _messages.tryEmit("✗ ${r.error}")
             }
         }
     }

@@ -21,8 +21,10 @@ import androidx.compose.ui.test.performTextReplacement
 import com.xerktech.turma.harness.HubHarness
 import com.xerktech.turma.harness.MainDispatcherRule
 import com.xerktech.turma.vm.BoardViewModel
+import com.xerktech.turma.vm.PermissionPolicyUi
 import okhttp3.mockwebserver.MockResponse
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertNotNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
 import org.junit.Test
@@ -30,13 +32,16 @@ import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.CountDownLatch
+import java.util.concurrent.TimeUnit
 
 /**
  * Call-site tests for the board's permission policy sheet (XERK-1566) — the
  * Android port of board.html's `permissionRules*` panel. The text rides its OWN
  * route (`GET|POST /api/jira/<site>/permission-policy`), never `/api/agents`, so
  * these drive that route over the real HTTP stack: the load, a save, the hub's
- * refusal words (XERK-264) with the operator's edit kept, "Use default" as
+ * refusal words (XERK-264) with the operator's edit kept (or as a message once
+ * the sheet was dismissed mid-save), "Use default" as
  * `{text:null}`, an absent-field body, and the org-less view with no button.
  */
 @RunWith(RobolectricTestRunner::class)
@@ -236,6 +241,36 @@ class BoardPermissionPolicyTest {
         compose.onNodeWithText("Use default").assertIsNotEnabled()
         assertTrue(posts.isEmpty())
         closeSheet()
+    }
+
+    @Test
+    fun `a refusal landing after the sheet was dismissed still reaches the operator`() {
+        // The sheet can be swiped away / backed out of mid-save; its error line
+        // goes with it, so the hub's words must arrive as a message instead
+        // (board.html's permissionRequest toasts a refusal open or closed).
+        val gate = CountDownLatch(1)
+        serve(
+            get = { json(200, """{"ok":true,"text":"old","isDefault":true}""") },
+            post = {
+                gate.await(WAIT_MS, TimeUnit.MILLISECONDS)
+                HubHarness.refusal("policy text is longer than 16000 characters", code = 413)
+            },
+        )
+        hub.json("/api/ws-token", """{"token":"t"}""")
+        hub.seedFleet(HubHarness.fleetJson(host = "nas01", jira = jiraBlock))
+        val vm = BoardViewModel(hub.app)
+        vm.loadPermissionPolicy("acme")
+        hub.awaitFlow(vm.permission) { it.loaded }
+
+        val message = hub.expectMessage(vm.messages) { it.startsWith("✗") }
+        assertNotNull(vm.savePermissionPolicy("my edit", close = true))
+        hub.awaitValue { posts.firstOrNull() }
+        vm.closePermissionPolicy()
+        gate.countDown()
+
+        assertEquals("✗ policy text is longer than 16000 characters", message())
+        // The dismissed sheet's state stays reset: a reopen starts clean.
+        assertEquals(PermissionPolicyUi(), vm.permission.value)
     }
 
     @Test
