@@ -143,6 +143,11 @@ back to a tracker, deciding which repo a ticket belongs to, and spawning a sessi
     is offered only the board's OTHER Done statuses, so a plain close's sole option may be "Won't
     Do". Before taking an option the kind did not ask for, the status is read; already Done → `ok`,
     no move. Never drop that read: it rewrote correctly closed tickets as abandoned.
+  - **An OPEN ticket offered only a negative Done is REFUSED for finished work**: `done` and
+    `already-fixed` whose sole Done option reads won't-do/cancelled/duplicate/not-reproducible
+    (a global "Won't Do" edge, Done only from In Review) are refused, final, no comment, after
+    the already-in-Done read. Shipped work recorded as abandoned is the harm; the session uses
+    its tracker tool. `not-reproducible` may take it (no change was made, which those say).
   - **A FAILED status read fails the attempt** (raises, so the bounded retry runs), never "not
     in Done": that would move a ticket already in Done into the fallback after all.
   - **The target is resolved BEFORE the comment posts**, so a workflow with no edge into Done

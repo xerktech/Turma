@@ -15637,7 +15637,9 @@ def _close_ticket_option(options, kind):
     another exists, preferring one named Done/Closed/Resolved/Fixed. So a board
     listing "Cannot Reproduce" ahead of "Done" never closes finished work as
     Cannot Reproduce. Only when every Done option carries such a name does the
-    first one stand — the ticket still leaves the board's open columns."""
+    first one come back; that is a fallback (`_close_ticket_is_fallback`), which
+    the caller takes only for a not-reproducible close and refuses for finished
+    work on an open ticket."""
     done = [o for o in options or []
             if _board_column(o.get("name"), o.get("category")) == "done"]
     if not done:
@@ -22505,6 +22507,10 @@ class SessionManager:
                 self._worktree_add(sess, base_ref=sess.get("baseRef"))
             if sess.get("ticket") is not None:
                 sess["ticket"] = _reopened_ticket(sess["ticket"])
+            # A close request left from before the stop (a non-final failure, or
+            # written just before a crash) must not re-close the ticket the
+            # operator just brought back. Only that file: a wake still stands.
+            self._drop_close_ticket_request(sid)
             self._launch_tmux(sess, resume=True)
             self._launch_ttyd(sess)
             sess["status"] = "running"
@@ -25473,6 +25479,18 @@ class SessionManager:
                     option = None
                 elif option is None:
                     raise RuntimeError("nothing can move it to Done")
+                elif req["kind"] != "not-reproducible":
+                    # An OPEN ticket whose only Done option reads won't-do /
+                    # cancelled / duplicate / not-reproducible (common: a global
+                    # "Won't Do" edge while Done is reachable only from In
+                    # Review). Finished work is never recorded as abandoned, so
+                    # refuse — final, nothing posted — and the session closes
+                    # it with its tracker tool. A not-reproducible close may
+                    # take it: no change was made, which is what those say.
+                    log(f"close-ticket for {sid}: refused: only {option['name']} offered")
+                    return land(f"refused: no plain Done transition is offered from "
+                                f"its current status, only {option['name']}; finished "
+                                f"work is never closed as {option['name']}")
             if not st["commented"]:
                 add_board_comment(key, _close_ticket_comment(req))
                 st["commented"] = True
@@ -25487,6 +25505,17 @@ class SessionManager:
             return land(str(e) or type(e).__name__, final=final)
         log(f"close-ticket: {key} -> {option['name']} ({req['kind']})")
         land(status=option["name"])
+
+    def _drop_close_ticket_request(self, sid):
+        """Remove a session's close-ticket.json unread (Start: relaunching the
+        session reopens its ticket). os.remove unlinks a planted symlink itself,
+        never its target. Best-effort."""
+        folder = session_request_dir(sid)
+        if folder:
+            try:
+                os.remove(os.path.join(folder, "close-ticket.json"))
+            except OSError:
+                pass
 
     def _drop_close_ticket_file(self, sid, ident):
         """Remove a handled close-ticket.json — unless the session has since

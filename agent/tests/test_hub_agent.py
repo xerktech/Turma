@@ -17816,18 +17816,43 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._transitions(), [])
         self.assertEqual((r["ok"], r["status"]), (True, "Cannot Reproduce"))
 
-    def test_an_open_ticket_still_takes_the_fallback_done_status(self):
-        # The current-status read only spares a ticket ALREADY in Done: an open
-        # ticket on a board whose only Done option is "Won't Do" still leaves
-        # the open columns (as does a read that names no status at all).
-        todo = {"id": "1", "name": "To Do", "category": "todo"}
-        neg = {"id": "41", "name": "Won't Do", "category": "done"}
-        for current in (("In Progress", "indeterminate"), None):
-            with self.subTest(current=current):
-                self.calls.clear()
-                _, r = self._close_from([todo, neg], "done", current)
-                self.assertEqual(self._transitions(), [{"transition": {"id": "41"}}])
-                self.assertEqual((r["ok"], r["status"]), (True, "Won't Do"))
+    def test_finished_work_on_an_open_ticket_is_never_closed_as_abandoned(self):
+        # A common workflow: a global "Won't Do"/"Cancelled" edge from any
+        # status, while Done is reachable only from In Review. A `done` or
+        # `already-fixed` close on an open ticket must NOT record shipped work
+        # as abandoned: it is refused (final, no comment, no move) and the
+        # session is told to use its tracker tool. So is a read naming no status.
+        todo = {"id": "1", "name": "In Review", "category": "inprogress"}
+        for kind, negs in (("done", [{"id": "41", "name": "Won't Do", "category": "done"}]),
+                           ("done", [{"id": "42", "name": "Cancelled", "category": "done"},
+                                     {"id": "43", "name": "Duplicate", "category": "done"}]),
+                           ("already-fixed", [{"id": "44", "name": "Duplicate",
+                                               "category": "done"}]),
+                           ("already-fixed", [{"id": "45", "name": "Cannot Reproduce",
+                                               "category": "done"}])):
+            for current in (("In Progress", "indeterminate"), None):
+                with self.subTest(kind=kind, neg=negs[0]["name"], current=current):
+                    self.calls.clear()
+                    self.notified.clear()
+                    sess, r = self._close_from([todo] + negs, kind, current)
+                    self.assertEqual(self._transitions(), [])
+                    self.assertEqual(self._comments(), [])
+                    self.assertEqual((r["ok"], r["final"]), (False, True))
+                    self.assertIn("refused: no plain Done transition", r["error"])
+                    self.assertIn(f"only {negs[0]['name']}", r["error"])
+                    self.assertNotIn("outcome", sess["ticket"])
+                    self.assertFalse(os.path.exists(self._path()))
+                    [(_, text)] = self.notified
+                    self.assertIn("It was not moved to Done", text)
+                    self.assertIn("tracker CLI/MCP this host gives you", text)
+        # A not-reproducible close may take such a status (no change was made,
+        # which is what it says), and only after the already-in-Done read.
+        self.calls.clear()
+        _, r = self._close_from([todo, {"id": "41", "name": "Won't Do", "category": "done"}],
+                                "not-reproducible", ("In Progress", "indeterminate"))
+        self.assertIn(f"/rest/api/3/issue/{self.KEY}", [p for p, _ in self.calls])
+        self.assertEqual(self._transitions(), [{"transition": {"id": "41"}}])
+        self.assertEqual((r["ok"], r["status"]), (True, "Won't Do"))
         # The exact match is taken without reading the current status at all.
         self.calls.clear()
         self._close_from([todo, {"id": "31", "name": "Done", "category": "done"}],
@@ -17976,6 +18001,26 @@ class TestCloseTicketRequest(ManagerMixin, unittest.TestCase):
         self.assertEqual(ha._reopened_ticket(None), None)
         t = {"key": "K-1"}
         self.assertIs(ha._reopened_ticket(t), t)
+
+    def test_start_drops_a_close_request_left_from_before_the_stop(self):
+        # A request whose first attempt failed (not final), or written just
+        # before the session crashed to `error`, must not re-close the ticket
+        # the operator just brought back. A wake request still stands.
+        sm = self.make_manager()
+        self._sess(sm, status="error", ttydPort=7701)
+        self._req()
+        wake = os.path.join(os.path.dirname(self._path()), "wake.json")
+        with open(wake, "w") as fh:
+            json.dump({"wakeAt": 1, "reason": "r"}, fh)
+        with mock.patch.object(sm, "_launch_tmux"), \
+                mock.patch.object(sm, "_launch_ttyd"), \
+                mock.patch.object(ha.os.path, "isdir", return_value=True):
+            sm.start(self.SID)
+        self.assertFalse(os.path.exists(self._path()))
+        self.assertTrue(os.path.exists(wake))
+        sm._process_close_ticket_requests(now=1000.0)
+        self.assertEqual((self._comments(), self._transitions()), ([], []))
+        sm.start(self.SID)          # nothing left to drop: still quiet
 
     def test_a_ticket_from_another_board_is_refused(self):
         sm = self.make_manager()

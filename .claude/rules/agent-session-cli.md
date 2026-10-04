@@ -112,6 +112,9 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   returns before the tracker is touched, so this is what lets the "tracker CLI/MCP else" fallback
   run. Its reply says so ("…and message you if it cannot close the ticket").
 - Kill/delete/restart clears the dir (`_clear_session_requests`) — an unread request dies with it.
+- **Start drops close-ticket.json** (`_drop_close_ticket_request`, beside `_reopened_ticket`): a
+  request left from before the stop (a non-final failure, or a crash first) must not re-close the
+  ticket the operator just brought back. Only that file — a wake request still stands.
 - **Residual: a session can close a SIBLING's ticket.** The worker trusts the `<sid>` dir name, and
   Bash (the `~/.turma` residual above) can write any sibling's dir, so a session can make the
   manager comment on and close another same-host session's ticket with the host's tracker creds.
