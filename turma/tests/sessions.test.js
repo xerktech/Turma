@@ -2782,6 +2782,10 @@ test("ended pane: closed ingest and failed loads are not worded as 'not synced y
   html = await open(() => ({ ok: false, status: 404,
     json: async () => ({ ingestClosed: { since: "<b>x</b>" } }) }));
   assert.match(html, /hasn't reached the archive yet/);
+  for (const bad of [-5000, 1e20]) {
+    html = await open(() => ({ ok: false, status: 404, json: async () => ({ ingestClosed: { since: bad } }) }));
+    assert.match(html, /hasn't reached the archive yet/, `since ${bad} is no date`);
+  }
 
   // A 5xx is a failed LOAD, in the hub's words when it has some (XERK-264)...
   html = await open(() => ({ ok: false, status: 503,

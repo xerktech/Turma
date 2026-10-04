@@ -18,6 +18,8 @@ import com.xerktech.turma.model.TurmaJson
 import com.xerktech.turma.model.WsTokenResponse
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.decodeFromString
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.decodeFromJsonElement
 import retrofit2.HttpException
 import retrofit2.Response
 import retrofit2.http.Body
@@ -510,14 +512,6 @@ data class ArchiveRefusal(
 @Serializable
 data class ArchiveIngestClosed(val since: Double = 0.0)
 
-/** The 404 body `GET /api/archive/<id>` answers with when it knows why. */
-@Serializable
-private data class ArchiveMissing(
-    val error: String = "",
-    val refused: ArchiveRefusal? = null,
-    val ingestClosed: ArchiveIngestClosed? = null,
-)
-
 /**
  * Why an archived transcript could not be shown, in the hub's own words when it
  * gave any — else null, meaning the ordinary 404 "not here yet", the one case
@@ -536,12 +530,21 @@ fun archiveMissingMessage(e: Throwable, nowMs: Long = System.currentTimeMillis()
         ?: return "Couldn\u2019t load this conversation from the hub."
     if (resp.code() != 404) return "Couldn\u2019t load this conversation \u2014 ${hubErrorMessage(resp)}."
     val body = runCatching { resp.errorBody()?.string() }.getOrNull().orEmpty()
-    val m = runCatching { TurmaJson.decodeFromString<ArchiveMissing>(body) }.getOrNull() ?: return null
-    val refused = m.refused?.takeIf { it.error.isNotBlank() }?.let { r ->
-        "${r.host.ifBlank { "The agent" }}\u2019s last push of this conversation " +
-            "to the archive was refused: ${r.error}."
+    // Each reason decodes on its own, so a malformed one can't take the other
+    // down with it and fall back to the few-minutes promise.
+    val obj = runCatching { TurmaJson.parseToJsonElement(body) as? JsonObject }.getOrNull() ?: return null
+    val r = obj["refused"]?.let {
+        runCatching { TurmaJson.decodeFromJsonElement<ArchiveRefusal>(it) }.getOrNull()
     }
-    val closed = m.ingestClosed?.since?.takeIf { it.isFinite() && it > 0 }?.toLong()?.let { since ->
+    val c = obj["ingestClosed"]?.let {
+        runCatching { TurmaJson.decodeFromJsonElement<ArchiveIngestClosed>(it) }.getOrNull()
+    }
+    val refused = r?.takeIf { it.error.isNotBlank() }?.let {
+        "${it.host.ifBlank { "The agent" }}\u2019s last push of this conversation " +
+            "to the archive was refused: ${it.error}."
+    }
+    // Same range as the web twin: a real epoch-ms stamp a date can print.
+    val closed = c?.since?.takeIf { it > 0 && it < 8.64e15 }?.toLong()?.let { since ->
         val at = java.text.DateFormat.getDateTimeInstance(
             java.text.DateFormat.MEDIUM, java.text.DateFormat.SHORT,
         ).format(java.util.Date(since))

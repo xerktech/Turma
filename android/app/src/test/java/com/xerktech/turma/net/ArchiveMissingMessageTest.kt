@@ -87,6 +87,15 @@ class ArchiveMissingMessageTest {
             assertNull(since, archiveMissingMessage(missing(404, """{"ingestClosed":{"since":$since}}""")))
         }
         assertNull(archiveMissingMessage(missing(404, """{"ingestClosed":"yes"}""")))
+        assertNull(archiveMissingMessage(missing(404, """{"ingestClosed":{"since":1e20}}""")))
+    }
+
+    @Test fun `a malformed ingestClosed never takes the refusal down with it`() {
+        for (closed in listOf("\"yes\"", "{\"since\":\"<b>x</b>\"}", "{\"since\":{}}")) {
+            val msg = archiveMissingMessage(missing(404,
+                """{"refused":{"host":"nas","error":"too big"},"ingestClosed":$closed}"""))
+            assertEquals(closed, "nas\u2019s last push of this conversation to the archive was refused: too big.", msg)
+        }
     }
 
     @Test fun `a malformed or surprising body degrades instead of throwing`() {
