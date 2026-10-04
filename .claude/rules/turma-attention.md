@@ -243,6 +243,18 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   and one whose conversation already runs on the host (`pausedSleeperHeldLive`: a live session with
   its `transcriptId`, or in its worktree unless root — the Resume picker resumes by transcript and
   leaves the record behind). Unpaused, it is an ordinary ended, resumable session.
+- **A sleeper being MOVED is never paused** (`sleeperMigrating`: the `srcSessionId` of an
+  exporting/importing migration on that host, or an `exportSession` still queued for it). Paused
+  mid-move, its record was woken at its wake while the moved copy ran on the target.
+- **A paused record whose conversation lives on ANOTHER host is unpaused, never woken**
+  (`pausedSleeperHeldElsewhere`): an online host in the same DECIDED org runs its `transcriptId`
+  (the org scope stops another org's host from holding a sleeper asleep by naming the id), or it
+  is the source of a `done` move, or a `done` restore carried its transcript.
+  - **A move/restore still in flight holds the wake** (`pausedSleeperMoving`): neither woken nor
+    unpaused until it settles — done unpauses, failed wakes as usual.
+  - **The handoff itself unpauses** (`unpauseMovedSleepers` in `advanceMigrations`): the move's
+    source record, and ANY host's paused record of a restored transcript — a restore is not
+    org-scoped, so after its done record retires the org-scoped check would miss it.
 - **The brief reads it as asleep, never finished** (`compileBrief`): a closed record carrying a
   valid `paused` is no Finished row (its merged PRs still count) and is a Waiting row on an online
   host, `state:"sleeping"`, `eta` its wake, `why` its reason. A live copy of the id wins.

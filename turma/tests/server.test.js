@@ -23934,6 +23934,114 @@ test("XERK-1575: a paused sleeper whose conversation already runs again is unpau
   delete agents.slpHeld;
 });
 
+test("XERK-1575: a sleeper being moved is never paused, and its paused record is never woken beside the moved copy", async () => {
+  // The review-round-3 probe: a full host A holds sleeper S (transcript T1)
+  // while the operator moves S to B and a ticket waits. Paused mid-move, S's
+  // record on A was woken at its wake while the moved copy ran T1 on B.
+  resetAutoStart(); resetSleepers();
+  const site = "slpmig.atlassian.net";
+  const A = "slpMigA", B = "slpMigB";
+  const sleeper = { ...sleeperSession("S", 60 * 60_000), transcriptId: "T1" };
+  await asBeat(B, site, { autoStart: false, capacity: FULL });
+  await asBeat(A, site, { autoStart: false, capacity: FULL, pauseSleepers: { available: true },
+    sessions: [sleeper] });
+  const mig = { id: "slp-mig-1", srcHost: A, srcSessionId: "S", targetHost: B, transcriptId: "T1",
+    repo: "Turma", phase: "exporting", importCmdId: null, startedAt: Date.now(), at: Date.now() };
+  migrations.set(mig.id, mig);
+  try {
+    await startTicket(site, "ENG-5");
+    drainTicketQueue();
+    assert.equal(sleeperCmds(A, "pauseSleeper").length, 0, "a sleeper mid-move is never paused");
+    // Nor while its exportSession is still queued, before the record exists.
+    migrations.delete(mig.id);
+    agents[A].commands = [{ cmdId: "ex1", type: "exportSession", sessionId: "S", migrationId: mig.id }];
+    drainTicketQueue();
+    assert.equal(sleeperCmds(A, "pauseSleeper").length, 0, "an export still queued holds it too");
+    // The control: with neither, the same sleeper IS paused.
+    agents[A].commands = [];
+    drainTicketQueue();
+    assert.deepEqual(sleeperCmds(A, "pauseSleeper").map((c) => c.sessionId), ["S"]);
+    agents[A].commands = [];
+    ticketQueue.length = 0;
+
+    // Say it was paused anyway (an older hub): after the handoff A is free, and
+    // B runs the moved copy of T1.
+    const now = Date.now();
+    const paused = { id: "S", repo: "Turma", transcriptId: "T1", closedAt: "2026-10-01T01:00:00Z",
+      paused: { wakeAt: now - 1000, wakeReason: "check S", at: now - 3600_000 } };
+    await asBeat(A, site, { autoStart: false, capacity: { ...FULL, running: 1, free: 1 },
+      pauseSleepers: { available: true }, closedSessions: [paused] });
+    await asBeat(B, site, { autoStart: false, capacity: FULL,
+      sessions: [{ id: "S2", status: "running", repo: "Turma", transcriptId: "T1" }] });
+    agents[A].commands = [];
+
+    // While the move is still settling, the wake waits: neither woken nor unpaused.
+    mig.phase = "importing";
+    migrations.set(mig.id, mig);
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds(A, "resume").length, 0, "never woken while its move is in flight");
+    assert.equal(sleeperCmds(A, "unpauseSleeper").length, 0);
+
+    // Settled (done): unpaused, never woken.
+    mig.phase = "done";
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds(A, "resume").length, 0, "never woken beside the moved copy");
+    assert.deepEqual(sleeperCmds(A, "unpauseSleeper").map((c) => c.sessionId), ["S"]);
+
+    // The done record retired: B running T1 in the same org still holds it.
+    migrations.delete(mig.id);
+    resetSleepers(); agents[A].commands = [];
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds(A, "resume").length, 0, "the transcript running on B holds it");
+    assert.deepEqual(sleeperCmds(A, "unpauseSleeper").map((c) => c.sessionId), ["S"]);
+
+    // Another org's host reporting T1 does not hold it (it cannot keep a
+    // sleeper asleep by naming its id); the wake proceeds.
+    resetSleepers(); agents[A].commands = [];
+    agents[B].orgBound = "rival.atlassian.net";
+    agents[B].jira = { ...(agents[B].jira || {}), siteKey: "rival.atlassian.net" };
+    hub.wakePausedSleepers(now);
+    assert.deepEqual(sleeperCmds(A, "resume").map((c) => c.sessionId), ["S"]);
+  } finally {
+    migrations.delete(mig.id);
+    ticketQueue.length = 0; delete agents[A]; delete agents[B];
+  }
+});
+
+test("XERK-1575: an archive restore holds a paused sleeper's wake, and its handoff unpauses it", () => {
+  resetSleepers();
+  const now = Date.now();
+  const free = { maxSessions: 4, running: 2, queued: 0, free: 2 };
+  const rec = (id, tid) => ({ id, repo: "Turma", transcriptId: tid,
+    paused: { wakeAt: now - 1, wakeReason: `check ${id}`, at: now - 60_000 } });
+  // A restore is not org-scoped: the target may be any host, so the handoff
+  // itself unpauses every paused record of the restored transcript.
+  agents.slpRstSrc = { lastSeen: now, capacity: free, commands: [], sessions: [],
+    closedSessions: [rec("P", "T5"), { ...rec("O", "T6"), paused: { wakeAt: now + 3600_000 } }] };
+  agents.slpRstTgt = { lastSeen: now, capacity: free, commands: [], closedSessions: [], sessions: [] };
+  const rst = { id: "slp-rst-1", restore: true, srcHost: null, srcSessionId: null,
+    targetHost: "slpRstTgt", transcriptId: "T5", repo: "Turma", phase: "importing",
+    importCmdId: "rst-ic", startedAt: now, at: now };
+  migrations.set(rst.id, rst);
+  try {
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds("slpRstSrc", "resume").length, 0, "a restore in flight holds the wake");
+    assert.equal(sleeperCmds("slpRstSrc", "unpauseSleeper").length, 0);
+    agents.slpRstTgt.sessions = [{ id: "N", status: "running", repo: "Turma", transcriptId: "T5",
+      spawnCmdId: "rst-ic" }];
+    advanceMigrations();
+    assert.equal(rst.phase, "done");
+    assert.deepEqual(sleeperCmds("slpRstSrc", "unpauseSleeper").map((c) => c.sessionId), ["P"]);
+    // And the next wake pass neither wakes it nor re-sends the unpause.
+    hub.wakePausedSleepers(now);
+    assert.equal(sleeperCmds("slpRstSrc", "resume").length, 0);
+    assert.equal(sleeperCmds("slpRstSrc", "unpauseSleeper").length, 1);
+  } finally {
+    migrations.delete(rst.id);
+    delete agents.slpRstSrc; delete agents.slpRstTgt;
+  }
+});
+
 test("XERK-1575: the orchestration pass wakes a due sleeper with an empty queue, never on a full or offline host", () => {
   resetSleepers();
   const now = Date.now();

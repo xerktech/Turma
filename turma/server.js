@@ -6130,6 +6130,27 @@ function startArchiveRestore(row, files, targetHost) {
   return m;
 }
 
+// A move or restore just handed off (XERK-1575): every paused sleeper record of
+// its conversation — the move's own source, or any record with the restored
+// transcript, on whatever host (a restore is not org-scoped) — is unpaused, left
+// an ordinary ended, resumable session. Only records the hub sees paused.
+function unpauseMovedSleepers(m, now = Date.now()) {
+  for (const [host, a] of Object.entries(agents)) {
+    for (const c of Array.isArray(a && a.closedSessions) ? a.closedSessions : []) {
+      if (!c || typeof c.id !== "string" || !wirePaused(c.paused)) continue;
+      const mine = m.srcHost === host && m.srcSessionId === c.id;
+      const restored = m.restore && typeof c.transcriptId === "string" && c.transcriptId
+        && c.transcriptId === m.transcriptId;
+      if (!mine && !restored) continue;
+      if (sleeperTriedRecently(sleeperUnpauseTried, host, c.id, now)) continue;
+      queueCommand(host, { type: "unpauseSleeper", sessionId: c.id });
+      noteSleeperTried(sleeperUnpauseTried, host, c.id, now);
+      console.log(`sleeper slot: unpausing ${logName(c.id)} on ${logName(host)}`
+        + " (its conversation moved)");
+    }
+  }
+}
+
 // Drive every in-flight migration one step (called from the target's heartbeat
 // for a fast handoff, and from the sweep interval for timeouts/cleanup). Pure
 // bookkeeping over `migrations` + the fleet — safe to call often.
@@ -6151,6 +6172,9 @@ function advanceMigrations() {
         if (agents[m.srcHost]) {
           queueCommand(m.srcHost, { type: "kill", sessionId: m.srcSessionId });
         }
+        // The conversation runs on the target now: a sleeper paused on its old
+        // host (XERK-1575) must never be woken there.
+        unpauseMovedSleepers(m, now);
         publishMigrations();
         continue;
       }
@@ -13265,6 +13289,19 @@ function sleeperHasQueuedPaneCommand(a, sid) {
     c && c.sessionId === sid && SLEEPER_PANE_COMMANDS.has(c.type));
 }
 
+// Is this session being MOVED off its host (XERK-101)? A move in flight, or its
+// `exportSession` still queued. Paused mid-move, its record here would later be
+// woken while the moved copy runs on the target: two claudes on one
+// conversation and one ticket.
+function sleeperMigrating(host, a, sid) {
+  for (const m of migrations.values()) {
+    if ((m.phase === "exporting" || m.phase === "importing")
+        && m.srcHost === host && m.srcSessionId === sid) return true;
+  }
+  return (Array.isArray(a && a.commands) ? a.commands : []).some((c) =>
+    c && c.sessionId === sid && c.type === "exportSession");
+}
+
 // A paused sleeper whose wake has come (served on the closed channel).
 function pausedSleeperDue(c, now) {
   return objectish(c && c.paused) && Number.isSafeInteger(c.paused.wakeAt)
@@ -13282,6 +13319,41 @@ function pausedSleeperHeldLive(a, c) {
     && ((typeof c.transcriptId === "string" && c.transcriptId && s.transcriptId === c.transcriptId)
       || (c.root !== true && typeof c.worktreePath === "string" && c.worktreePath
         && s.worktreePath === c.worktreePath)));
+}
+// Does this paused sleeper's conversation run on ANOTHER host? A move or an
+// archive restore carries the transcript id, so a session running it on any
+// online host in the same decided org — or a settled move whose source this
+// record is, or a settled restore of this transcript — means the conversation
+// lives elsewhere now: waking the record would run a second claude on it. The
+// org scope keeps another org's host from holding a sleeper asleep by
+// reporting its id; a cross-org restore is caught by the restore record, and
+// unpaused at its handoff (advanceMigrations).
+function pausedSleeperHeldElsewhere(host, a, c, now) {
+  for (const m of migrations.values()) {
+    if (m.phase !== "done") continue;
+    if (m.srcHost === host && m.srcSessionId === c.id) return true;
+    if (m.restore && c.transcriptId && m.transcriptId === c.transcriptId) return true;
+  }
+  if (typeof c.transcriptId !== "string" || !c.transcriptId) return false;
+  for (const [h, b] of Object.entries(agents)) {
+    if (!b || h === host || now - (b.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    if (!sameDecidedOrg(a, b)) continue;
+    if ((Array.isArray(b.sessions) ? b.sessions : []).some((s) => s
+        && (s.status === "running" || s.status === "queued")
+        && s.transcriptId === c.transcriptId)) return true;
+  }
+  return false;
+}
+// Is a move of this record, or a restore of its transcript, still in flight?
+// Its outcome decides: the wake waits — neither woken nor unpaused — until the
+// move settles (done: unpaused above; failed: woken as usual).
+function pausedSleeperMoving(host, c) {
+  for (const m of migrations.values()) {
+    if (m.phase !== "exporting" && m.phase !== "importing") continue;
+    if (m.srcHost === host && m.srcSessionId === c.id) return true;
+    if (m.restore && c.transcriptId && m.transcriptId === c.transcriptId) return true;
+  }
+  return false;
 }
 // Is this paused sleeper's ticket Done on the board (the set autoStopSweep reads)?
 function pausedSleeperTicketDone(c, doneKeys) {
@@ -13308,12 +13380,14 @@ function wakePausedSleepers(now = Date.now()) {
     const due = [];
     for (const c of Array.isArray(a.closedSessions) ? a.closedSessions : []) {
       if (!c || typeof c.id !== "string" || live.has(c.id) || !wirePaused(c.paused)) continue;
-      if (pausedSleeperHeldLive(a, c) || pausedSleeperTicketDone(c, doneKeys)) {
+      if (pausedSleeperMoving(host, c)) continue;
+      if (pausedSleeperHeldLive(a, c) || pausedSleeperHeldElsewhere(host, a, c, now)
+          || pausedSleeperTicketDone(c, doneKeys)) {
         if (sleeperTriedRecently(sleeperUnpauseTried, host, c.id, now)) continue;
         queueCommand(host, { type: "unpauseSleeper", sessionId: c.id });
         noteSleeperTried(sleeperUnpauseTried, host, c.id, now);
         console.log(`sleeper slot: unpausing ${logName(c.id)} on ${logName(host)}`
-          + " (already running, or its ticket is Done)");
+          + " (already running here or elsewhere, or its ticket is Done)");
         continue;
       }
       if (pausedSleeperDue(c, now) && !sleeperTriedRecently(sleeperWakeTried, host, c.id, now)) {
@@ -13352,7 +13426,8 @@ function pauseSleepersFor(waiting, now = Date.now(), rows) {
       const sleepers = (a.sessions || []).filter((s) => sleeperPausable(s, now)
         && !sleeperTriedRecently(sleeperPauseTried, host, s.id, now)
         && !sleeperResumeHeld(host, s.id, now)
-        && !sleeperHasQueuedPaneCommand(a, s.id));
+        && !sleeperHasQueuedPaneCommand(a, s.id)
+        && !sleeperMigrating(host, a, s.id));
       if (!sleepers.length) continue;
       const fit = findTicketHost(e.siteKey, repo, e.issueKey,
         { auto: e.source === "auto", onlyHost: host, rows });
@@ -21166,6 +21241,7 @@ if (process.env.TURMA_TEST) {
     // XERK-1575: slot policy v2 (pause a sleeper, resume it at its wake).
     normalizePauseSleepers, wirePaused, sleeperPausable, wakePausedSleepers,
     pauseSleepersFor, sleeperPauseTried, sleeperWakeTried, sleeperUnpauseTried, sleeperResumeHold,
+    unpauseMovedSleepers,
     SLEEPER_PAUSE_MIN_AHEAD_MS,
     autoCloseMergedMessage,
     ingestTrajectoryTails,

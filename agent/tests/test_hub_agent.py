@@ -10056,9 +10056,18 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
             self.assertTrue(sm.handle_commands([{
                 "cmdId": "e1", "type": "exportSession",
                 "sessionId": "s", "migrationId": "mig1"}]))
-        self.assertEqual(started["target"], sm.export_session)
+        # The thread runs export_session through a wrapper that clears the
+        # in-flight export mark however it ends (XERK-1575).
+        self.assertEqual(started["target"], sm._export_session_tracked)
         self.assertEqual(started["args"], ("s", "mig1"))
         self.assertTrue(started["started"])
+        self.assertTrue(sm._export_running("s"))
+        ran = []
+        with mock.patch.object(sm, "export_session",
+                               side_effect=lambda *a: ran.append(a)):
+            started["target"](*started["args"])
+        self.assertEqual(ran, [("s", "mig1")])
+        self.assertFalse(sm._export_running("s"))
         self.assertEqual(sm.acked, {"e1"})           # acked regardless
         self.assertEqual(sm.spawn_failures, [])      # nothing refused inline
 
@@ -17693,6 +17702,56 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
                 self.assertEqual(sm.closed, [])
                 self.assertEqual(sm.input_queue, [(sess["id"], "are you there?", None)])
                 self.assertEqual({"i1", "p1"} & set(sm.acked), {"i1", "p1"})
+
+    def test_a_running_export_refuses_the_pause(self):
+        # A sleeper mid-move: pausing it would leave a paused record here, later
+        # woken while the moved copy runs on the target (two claudes on one
+        # conversation). The refusal lasts exactly as long as the export thread.
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        sid = sess["id"]
+        started, release = threading.Event(), threading.Event()
+
+        def slow_export(session_id, migration_id):
+            started.set()
+            release.wait(10)
+        sm.export_session = slow_export
+        sm._export_session_async(sid, "mig1")
+        self.assertTrue(started.wait(5))
+        self.assertTrue(sm._export_running(sid))
+        self.assertFalse(sm.pause_sleeper(sid, now_ms=self.NOW))
+        self.assertIs(sm._find(sid), sess)
+        self.assertEqual(sm.closed, [])
+        release.set()
+        for t in [t for t in threading.enumerate() if t.name == "migration-export"]:
+            t.join(5)
+        self.assertFalse(sm._export_running(sid))
+        self.assertTrue(sm.pause_sleeper(sid, now_ms=self.NOW))
+
+    def test_a_move_in_the_same_batch_keeps_the_session(self):
+        # Either order: the export marked first, or the pause ahead of it.
+        for order in ("export-first", "pause-first"):
+            with self.subTest(order):
+                sm = self._manager()
+                sess = self._sleeper(sm)
+                exported = []
+                sm._export_session_async = lambda sid, mid: exported.append(sid)
+                exp = {"cmdId": "e1", "type": "exportSession", "sessionId": sess["id"],
+                       "migrationId": "mig1"}
+                pause = {"cmdId": "p1", "type": "pauseSleeper", "sessionId": sess["id"]}
+                cmds = [exp, pause] if order == "export-first" else [pause, exp]
+                with mock.patch.object(ha.time, "time", return_value=self.NOW / 1000):
+                    sm.handle_commands(cmds)
+                self.assertIs(sm._find(sess["id"]), sess)
+                self.assertEqual(sm.closed, [])
+                self.assertEqual(exported, [sess["id"]])
+
+    def test_a_failed_export_thread_start_clears_the_mark(self):
+        sm = self._manager()
+        sess = self._sleeper(sm)
+        with mock.patch.object(ha.threading, "Thread", side_effect=RuntimeError("pids")):
+            sm._export_session_async(sess["id"], "mig1")
+        self.assertFalse(sm._export_running(sess["id"]))
 
     def test_an_undelivered_message_refuses_the_pause(self):
         cases = {

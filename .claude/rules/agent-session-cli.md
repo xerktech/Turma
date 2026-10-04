@@ -115,6 +115,10 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   worker (`input_inflight`), landed but not recorded, or on the `pendingInputs` outbox
   (`_input_undelivered`). `handle_commands` pre-scans its batch for `SLEEPER_PANE_COMMANDS` on the
   session, so a pause listed BEFORE the input is refused too. Killing would drop the message.
+- **Never mid-move**: `_export_running(sid)` refuses while a migration export thread runs for it
+  (`_exporting`, marked before the thread starts, cleared in `_export_session_tracked`'s finally),
+  and an `exportSession` in the same batch counts like a pane command. Paused mid-move, the record
+  here would be woken while the moved copy runs on the target — two claudes on one conversation.
 - **`TURMA_PAUSE_SLEEPERS=0`** refuses every pause and reports `pauseSleepers: {available:false}`.
 - **A paused record is exempt from `CLOSED_PER_REPO`** (up to `PAUSED_KEEP_MAX`, newest kept) and
   from the prune's closed-record sweep (`_poll_prunes`): evicted, it could never be woken; a
@@ -129,7 +133,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
   `_resume_at_cwd` rule. It also unpauses the record. Else a wake starts a second claude beside one
   the Resume picker started (`resume_transcript` unpauses matching closed records on success).
 - **`unpauseSleeper` → `unpause_sleeper`** drops `paused` from a closed record (any switch state):
-  the hub sends it for a Done ticket or a conversation already running again.
+  the hub sends it for a Done ticket, a conversation already running again (here or on another
+  host), or a move/restore of it that handed off.
 - **A NEW wake.json drops `wakeResumedAt`** (`_ingest_wake_request`): the settle gate belongs to
   the carried wake only.
 - **`TURMA_RESUME_WAKE_PROMPT=1` rides a DUE wake on the launch instead** (`claude --resume <id> --

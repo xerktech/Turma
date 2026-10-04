@@ -18765,6 +18765,12 @@ class SessionManager:
         # A failed probe drops the entry ("can't tell" = not quiet). In-memory
         # only; the next beat re-learns it.
         self._quiet = {}
+        # sids whose migration export thread is running (XERK-1575): a pause
+        # then would kill a session mid-move, leaving its paused record to be
+        # woken on this host while the moved copy runs on the target. Written by
+        # the beat (add) and the export thread (discard), under its own lock.
+        self._exporting = set()
+        self._exporting_lock = threading.Lock()
         # The close-ticket reader (XERK-1569): a worker does the tracker HTTP off
         # the beat (XERK-395) and stages each outcome on `_close_ticket_landed`
         # under the lock; the BEAT drains it, stamps `ticket.outcome` on the
@@ -24184,13 +24190,34 @@ class SessionManager:
         the move learns why instead of sitting in `exporting` until
         MIGRATE_TIMEOUT_MS. Fire-and-forget: migrations are single-flight per
         session hub-side, so no tracking/join is needed."""
+        # Marked BEFORE the thread starts, so a `pauseSleeper` later in the same
+        # command batch already sees the export (XERK-1575).
+        with self._exporting_lock:
+            self._exporting.add(session_id)
         try:
             threading.Thread(
-                target=self.export_session, args=(session_id, migration_id),
+                target=self._export_session_tracked, args=(session_id, migration_id),
                 name="migration-export", daemon=True).start()
         except Exception as e:
+            self._export_done(session_id)
             self._refuse_start(f"could not start the export worker: {e}",
                                migration_id=migration_id, context="exportSession")
+
+    def _export_session_tracked(self, session_id, migration_id):
+        """export_session, clearing the in-flight export mark however it ends."""
+        try:
+            self.export_session(session_id, migration_id)
+        finally:
+            self._export_done(session_id)
+
+    def _export_done(self, session_id):
+        with self._exporting_lock:
+            self._exporting.discard(session_id)
+
+    def _export_running(self, session_id):
+        """Is a migration export thread running for this session (XERK-1575)?"""
+        with self._exporting_lock:
+            return session_id in self._exporting
 
     def export_session(self, session_id, migration_id):
         """Source half of a migration: snapshot this running session's raw
@@ -26655,6 +26682,10 @@ class SessionManager:
             return "no such session"
         if sess.get("status") != "running":
             return "it is not running"
+        # Mid-move: the paused record here would later be woken while the moved
+        # copy runs on the target — two claudes on one conversation and ticket.
+        if self._export_running(sess.get("id")):
+            return "it is being migrated to another host"
         at = sess.get("wakeAt")
         if isinstance(at, bool) or not isinstance(at, int):
             return "it is not sleeping"
@@ -33612,11 +33643,14 @@ class SessionManager:
         did = False
         # Sessions an operator command in THIS batch talks to (XERK-1575): a
         # `pauseSleeper` ahead of it in the list must not kill the session the
-        # message is for, whichever order the hub queued the two in.
+        # message is for, whichever order the hub queued the two in. An
+        # `exportSession` (the operator's Move) counts too: a pause ahead of it
+        # would leave a paused record here while the session moves away.
         pane_sids = {c.get("sessionId") for c in commands or []
                      if isinstance(c, dict) and c.get("cmdId")
                      and c.get("cmdId") not in self.acked
-                     and c.get("type") in SLEEPER_PANE_COMMANDS}
+                     and (c.get("type") in SLEEPER_PANE_COMMANDS
+                          or c.get("type") == "exportSession")}
         for cmd in commands or []:
             if not isinstance(cmd, dict):
                 continue
