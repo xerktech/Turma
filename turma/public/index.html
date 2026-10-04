@@ -1173,7 +1173,7 @@ const HINT_KIND = {
 function attentionHintHtml(att) {
   const h = att && NEEDS_YOU_CHIP[att.state] ? att.hint : null;
   if (!h || typeof h.why !== "string" || !h.why) return "";
-  const kind = HINT_KIND[h.label] ? `<b>${esc(HINT_KIND[h.label])}</b> · ` : "";
+  const kind = HINT_KIND[h.label] ? `<b>${esc(HINT_KIND[h.label])}</b>\u00a0·\u00a0` : "";
   const ans = typeof h.suggestedAnswer === "string" && h.suggestedAnswer
     ? `<div class="sess-hint answer">Suggested: ${esc(h.suggestedAnswer)}</div>` : "";
   return `<div class="sess-hint">${kind}${esc(h.why)}</div>${ans}`;

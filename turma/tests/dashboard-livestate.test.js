@@ -285,7 +285,7 @@ test("dashboard State row: the classifier's why and suggested answer", () => {
   const { sessCard, attentionHintHtml } = loadDashboard();
   const hint = { label: "design-decision", why: "Pick <v2> or v3.", suggestedAnswer: "Go with v3." };
   assert.equal(attentionHintHtml({ state: "needs-you:review", since: NOW, hint }),
-    '<div class="sess-hint"><b>decision</b> · Pick &lt;v2&gt; or v3.</div>'
+    '<div class="sess-hint"><b>decision</b>\u00a0·\u00a0Pick &lt;v2&gt; or v3.</div>'
     + '<div class="sess-hint answer">Suggested: Go with v3.</div>');
   assert.equal(attentionHintHtml({ state: "working", since: NOW, hint }), "");
   assert.equal(attentionHintHtml({ state: "needs-you:review", since: NOW }), "");
@@ -297,7 +297,7 @@ test("dashboard State row: the classifier's why and suggested answer", () => {
   // The test state is named on the State row, the Sessions card's headline word.
   assert.ok(state.includes('<b class="sess-review">awaiting your test</b>'), state);
   assert.ok(!state.includes("sess-hint"), "the verdict is its own row, not inside State");
-  assert.ok(card.includes('<dt></dt><dd><div class="sess-hint"><b>needs a human test</b> · Wants the login page checked.</div></dd>'), card);
+  assert.ok(card.includes('<dt></dt><dd><div class="sess-hint"><b>needs a human test</b>\u00a0·\u00a0Wants the login page checked.</div></dd>'), card);
 });
 
 // XERK-1572 screenshot pass: the verdict answers a question or a permission, so

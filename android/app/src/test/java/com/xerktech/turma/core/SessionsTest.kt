@@ -294,9 +294,9 @@ class SessionsTest {
     @Test fun `attentionHintLine and attentionSuggested read the classifier's verdict`() {
         val hinted = com.xerktech.turma.model.Attention(state = "needs-you:review", since = now,
             hint = com.xerktech.turma.model.AttentionHint("design-decision", "Pick v2 or v3.", "Go with v3."))
-        assertEquals("decision · Pick v2 or v3.", attentionHintLine(hinted))
+        assertEquals("decision\u00A0·\u00A0Pick v2 or v3.", attentionHintLine(hinted))
         assertEquals("Suggested: Go with v3.", attentionSuggested(hinted))
-        assertEquals("needs a human test · x", attentionHintLine(hinted.copy(state = "needs-you:test",
+        assertEquals("needs a human test\u00A0·\u00A0x", attentionHintLine(hinted.copy(state = "needs-you:test",
             hint = com.xerktech.turma.model.AttentionHint("needs-human-test", "x"))))
         assertEquals("", attentionSuggested(hinted.copy(hint = hinted.hint!!.copy(suggestedAnswer = null))))
         // Only while the session needs the operator, and only with a why.

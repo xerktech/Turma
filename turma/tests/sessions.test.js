@@ -546,10 +546,10 @@ test("attention: the classifier's why and suggested answer, and a loop reads sta
   ]);
   render({ now, agents: [h] });
   const r = els.review.innerHTML;
-  assert.ok(r.includes('<div class="att-hint"><span class="hint-kind">decision</span> · Pick &lt;v2&gt; or v3.</div>'), r);
+  assert.ok(r.includes('<div class="att-hint"><span class="hint-kind">decision</span>\u00a0·\u00a0Pick &lt;v2&gt; or v3.</div>'), r);
   assert.ok(r.includes('<div class="att-hint answer">Suggested: Go with v3.</div>'), r);
   assert.ok(r.includes('<div class="state stalled">stalled · repeating Bash ×6'), r);
-  assert.ok(r.includes('<span class="hint-kind">looping</span> · Retries npm ci against a dead registry.'), r);
+  assert.ok(r.includes('<span class="hint-kind">looping</span>\u00a0·\u00a0Retries npm ci against a dead registry.'), r);
   assert.ok(!els.active.innerHTML.includes("Retry Loop"), "a loop is not Active work");
   // Only the two cards with a verdict carry hint lines (Plain Review has none).
   assert.equal(r.split('class="att-hint').length - 1, 3, r);

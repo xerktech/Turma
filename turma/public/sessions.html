@@ -2903,7 +2903,7 @@ function activeCard({ a, s, live }) {
         ${live.question ? `<div class="question">“${esc(live.question)}”</div>` : ""}
         ${live.ask ? `<div class="question ask">${esc(live.ask)}</div>` : ""}
         ${live.why ? `<div class="why">${esc(live.why)}</div>` : ""}
-        ${live.hint ? `<div class="att-hint">${live.hint.kind ? `<span class="hint-kind">${esc(live.hint.kind)}</span> · ` : ""}${esc(live.hint.why)}</div>` : ""}
+        ${live.hint ? `<div class="att-hint">${live.hint.kind ? `<span class="hint-kind">${esc(live.hint.kind)}</span>\u00a0·\u00a0` : ""}${esc(live.hint.why)}</div>` : ""}
         ${live.hint?.answer ? `<div class="att-hint answer">Suggested: ${esc(live.hint.answer)}</div>` : ""}
         ${moving}
       </span>

@@ -275,7 +275,7 @@ fun attentionHintLine(att: Attention?): String {
     val h = att.hint ?: return ""
     if (h.why.isBlank()) return ""
     val kind = hintKind(h.label)
-    return if (kind.isEmpty()) h.why else "$kind · ${h.why}"
+    return if (kind.isEmpty()) h.why else "$kind\u00A0·\u00A0${h.why}"
 }
 
 /** The answer the classifier suggests, as "Suggested: …" (XERK-1572), or "". */
