@@ -158,13 +158,24 @@ fun briefItemMeta(section: String, item: BriefItem, now: Long): String {
 /** How many decisions the Brief screen shows — web brief.html `DECISIONS_SHOWN`. */
 const val BRIEF_DECISIONS_SHOWN = 10
 
+/** How much of a decision's session name its meta line shows — web `DECISION_LABEL_MAX`. */
+const val BRIEF_DECISION_LABEL_MAX = 60
+
+/**
+ * The count the Decisions header shows — web `decisionsHtml`'s `total`: how many
+ * the org keeps (the hub's `decisionCounts`), never fewer than the served tail
+ * (an older hub sends no count).
+ */
+fun briefDecisionTotal(served: Int, count: Int?): Int = maxOf(served, count ?: 0)
+
 /** A decision's kind as the brief words it — web brief.html `DECISION_KIND`. */
 val BRIEF_DECISION_KIND = mapOf("question" to "answered", "permission" to "permission", "note" to "note")
 
 /**
  * The org's decisions log (XERK-1574) as (title, meta) lines, newest first, the
  * newest [BRIEF_DECISIONS_SHOWN] only — web brief.html `decisionsHtml`: a note's
- * text, or "<question> → <answer>"; then its kind, ticket, age and host.
+ * text, or "<question> → <answer>"; then its kind, ticket, session name (clipped
+ * to [BRIEF_DECISION_LABEL_MAX] characters), age and host.
  */
 fun briefDecisionLines(decisions: List<OrgDecision>, now: Long): List<Pair<String, String>> =
     decisions.takeLast(BRIEF_DECISIONS_SHOWN).asReversed().map { d ->
@@ -172,7 +183,17 @@ fun briefDecisionLines(decisions: List<OrgDecision>, now: Long): List<Pair<Strin
         val meta = mutableListOf(BRIEF_DECISION_KIND[d.source] ?: d.source)
         val ticket = d.ticket
         val host = d.host
+        val label = d.label
         if (ticket != null) meta += ticket
+        if (!label.isNullOrEmpty()) {
+            meta += if (label.length > BRIEF_DECISION_LABEL_MAX) {
+                val cut = label.take(BRIEF_DECISION_LABEL_MAX - 1)
+                // never half a surrogate pair
+                (if (cut.last().isHighSurrogate()) cut.dropLast(1) else cut) + "…"
+            } else {
+                label
+            }
+        }
         if (d.at > 0L) meta += "${briefDur(now - d.at)} ago"
         if (host != null) meta += host
         title to meta.joinToString(" · ")

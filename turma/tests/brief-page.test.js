@@ -93,6 +93,28 @@ test("brief.html: a decisions frame that lands mid-fetch survives the older snap
   assert.equal(p.getCache().decisions["a.net"][0].text, "new");
 });
 
+test("brief.html: a decisionCounts frame that lands mid-fetch survives with its tail (XERK-1574)", async () => {
+  const handler = slice('es.addEventListener("decisionCounts", (e) => {', "\n  });");
+  const handlerFn = handler.slice('es.addEventListener("decisionCounts", '.length, -");".length);
+  const refreshSrc = slice("let briefsClock = 0;", "\n  if (cache) render(cache);\n}\n");
+  let pending = null;
+  const fetch = () => new Promise((resolve) => {
+    pending = (body) => resolve({ status: 200, json: async () => body });
+  });
+  const p = new Function("fetch", "render", "location", `
+    let cache = null;
+    ${refreshSrc}
+    const onCounts = ${handlerFn};
+    return { refresh, onCounts, setCache: (c) => { cache = c; }, getCache: () => cache };`)(
+    fetch, () => {}, {});
+  p.setCache({ agents: [], decisions: {}, decisionCounts: { "a.net": 3 } });
+  const done = p.refresh();
+  p.onCounts({ data: JSON.stringify({ "a.net": 4 }) });
+  pending({ agents: [], decisions: {}, decisionCounts: { "a.net": 3 } });
+  await done;
+  assert.equal(p.getCache().decisionCounts["a.net"], 4);
+});
+
 function loadRenderers() {
   const src = slice("function narrativeHtml(b) {", "\n// `live` = a host is decided");
   const esc = (s) => String(s).replace(/[&<>"']/g, (c) => `&#${c.charCodeAt(0)};`);
@@ -124,4 +146,26 @@ test("brief.html: the decisions tail is newest first, escaped, a composer only f
   assert.equal(decisionsHtml("a.net", list, 5000, false).includes("data-note"), false);
   assert.equal(decisionsHtml("a.net", [], 5000, false), "", "nothing to show, nowhere to add");
   assert.match(decisionsHtml("a.net", [], 5000, true), /No decisions recorded yet/);
+});
+
+test("brief.html: the decisions count is the org's, not the served tail's (XERK-1574)", () => {
+  const { decisionsHtml } = loadRenderers();
+  const tail = Array.from({ length: 20 }, (_, i) => ({ at: 1000 + i, source: "note", text: `n${i}` }));
+  const html = decisionsHtml("a.net", tail, 5000, false, 50);
+  assert.match(html, /Decisions <span class="n">50<\/span>/);
+  assert.match(html, /\+40 earlier/);
+  // An older hub sends no count: the served list is the floor.
+  assert.match(decisionsHtml("a.net", tail, 5000, false), /Decisions <span class="n">20<\/span>/);
+  assert.match(decisionsHtml("a.net", tail, 5000, false, 3), /Decisions <span class="n">20<\/span>/);
+});
+
+test("brief.html: a decision row names the session it came from (XERK-1574)", () => {
+  const { decisionsHtml } = loadRenderers();
+  const html = decisionsHtml("a.net", [
+    { at: 1000, source: "question", question: "Q?", answer: "A", label: "archive <index> work", host: "h" },
+    { at: 2000, source: "question", question: "Q2?", answer: "B", label: "x".repeat(80) },
+  ], 5000, false);
+  assert.ok(html.includes("answered</span> · archive &#60;index&#62; work · 4s ago · h"));
+  assert.ok(html.includes(`${"x".repeat(59)}…`));
+  assert.equal(html.includes("x".repeat(60)), false, "a long label is clipped");
 });

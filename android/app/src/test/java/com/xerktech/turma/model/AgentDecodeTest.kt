@@ -866,7 +866,8 @@ class AgentDecodeTest {
               "decisions": { "o.atlassian.net": [
                 { "id": "ab12", "at": 1000, "source": "question", "question": "Which DB?",
                   "answer": "Postgres", "host": "h", "sessionId": "s1", "ticket": "O-1" },
-                { "at": 1100, "source": "note", "text": "No infra merges." } ] } }
+                { "at": 1100, "source": "note", "text": "No infra merges." } ] },
+              "decisionCounts": { "o.atlassian.net": 57 } }
         """.trimIndent()
         val resp = TurmaJson.decodeFromString<AgentsResponse>(body)
         val b = resp.briefs.getValue("o.atlassian.net").single()
@@ -877,7 +878,9 @@ class AgentDecodeTest {
         assertEquals("O-1", log[0].ticket)
         assertEquals("note", log[1].source)
         assertNull(log[1].question)
+        assertEquals(57, resp.decisionCounts["o.atlassian.net"])
         val older = TurmaJson.decodeFromString<AgentsResponse>("""{ "now": 1, "agents": [ $plainHost ] }""")
         assertTrue(older.decisions.isEmpty())
+        assertTrue(older.decisionCounts.isEmpty())
     }
 }

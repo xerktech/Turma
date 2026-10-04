@@ -89,6 +89,9 @@ data class FleetState(
     // oldest first; the Brief screen reads it. Refreshed by the poll and the
     // "decisions" SSE event.
     val decisions: Map<String, List<com.xerktech.turma.model.OrgDecision>> = emptyMap(),
+    // siteKey -> how many decisions the org keeps (the tail above is capped).
+    // Refreshed by the poll and the "decisionCounts" SSE event.
+    val decisionCounts: Map<String, Int> = emptyMap(),
 )
 
 class FleetRepository(
@@ -166,6 +169,7 @@ class FleetRepository(
             epicBuilders = resp.epicBuilders
             briefs = resp.briefs
             decisions = resp.decisions
+            decisionCounts = resp.decisionCounts
             // Don't let a late/stale poll drag the clock backward under the
             // records we just kept fresh (XERK-812) — same upward coercion upsert
             // uses for an SSE event.
@@ -223,6 +227,9 @@ class FleetRepository(
     @Volatile
     private var decisions: Map<String, List<com.xerktech.turma.model.OrgDecision>> = emptyMap()
 
+    @Volatile
+    private var decisionCounts: Map<String, Int> = emptyMap()
+
     private fun emit(now: Long, error: String?) {
         val list = synchronized(byKey) { byKey.values.sortedBy { it.key } }
         _state.value = FleetState(
@@ -243,6 +250,7 @@ class FleetRepository(
             epicBuilders = epicBuilders,
             briefs = briefs,
             decisions = decisions,
+            decisionCounts = decisionCounts,
         )
     }
 
@@ -336,6 +344,10 @@ class FleetRepository(
                     "decisions" -> runCatching {
                         TurmaJson.decodeFromString<Map<String, List<com.xerktech.turma.model.OrgDecision>>>(data)
                     }.getOrNull()?.let { decisions = it; emit(_state.value.now, null) }
+                    // How many each org keeps; sent just before "decisions".
+                    "decisionCounts" -> runCatching {
+                        TurmaJson.decodeFromString<Map<String, Int>>(data)
+                    }.getOrNull()?.let { decisionCounts = it; emit(_state.value.now, null) }
                 }
             }
 

@@ -5090,6 +5090,9 @@ function buildAgentsCache() {
     // decisions, oldest first (decisionsWire's tail). Hub-owned, sanitized on every
     // write/restore (sanitizeDecision) because Android TYPES it.
     decisions: decisionsWire(),
+    // siteKey -> how many decisions that org keeps (the tail above is capped), so
+    // a client's count is the org's, not the served tail's. Hub-computed ints.
+    decisionCounts: decisionCountsWire(),
     // Tickets waiting for a host to free up (XERK-296). Hub-owned like the pins
     // above — a queued ticket has no host and no session, so this payload is the
     // only place it exists.
@@ -15069,7 +15072,7 @@ function appendDecision(siteKey, entry, now = Date.now()) {
   decisions[siteKey] = [...(decisions[siteKey] || []), d].slice(-DECISIONS_KEEP);
   persistDecisions();
   invalidateAgentsCache();
-  sseBroadcast("decisions", decisionsWire());
+  broadcastDecisions();
   return d;
 }
 
@@ -15090,10 +15093,12 @@ function recordAnswerDecision(key, sessionId, kind, answer) {
   if (kind === "question") {
     question = typeof live.question === "string" ? live.question : "";
   } else {
+    // What was asked for first ("Bash: npm test"), then the dialog's own wording,
+    // which is mostly a generic "Do you want to proceed?".
     const pp = live.panePrompt;
     const prompt = pp && typeof pp.prompt === "string" ? pp.prompt : "";
     const why = prompt ? permissionWhy(pp) : "";
-    question = why && why !== prompt ? `${prompt} — ${why}` : prompt;
+    question = why && why !== prompt ? `${why} — ${prompt}` : prompt;
   }
   if (!question || !answer) return null;
   const ticket = s.ticket && typeof s.ticket.key === "string" ? s.ticket.key : undefined;
@@ -15123,6 +15128,19 @@ function decisionsWire() {
   const out = {};
   for (const [site, list] of Object.entries(decisions)) out[site] = list.slice(-DECISIONS_WIRE_TAIL);
   return out;
+}
+// How many decisions each org KEEPS (up to DECISIONS_KEEP). The served tail is
+// only the newest DECISIONS_WIRE_TAIL, so a client counting it would under-state.
+function decisionCountsWire() {
+  const out = {};
+  for (const [site, list] of Object.entries(decisions)) out[site] = Array.isArray(list) ? list.length : 0;
+  return out;
+}
+// Both frames, each the shape its /api/agents key has; the count goes first so a
+// page that repaints on the tail already holds the count it goes with.
+function broadcastDecisions() {
+  sseBroadcast("decisionCounts", decisionCountsWire());
+  sseBroadcast("decisions", decisionsWire());
 }
 
 // What one heartbeat reply hands the agent to render as its org's decisions file:
@@ -15165,7 +15183,7 @@ function briefTick(now = Date.now()) {
   if (prunedDecisions) {
     persistDecisions();
     invalidateAgentsCache();
-    sseBroadcast("decisions", decisionsWire());
+    broadcastDecisions();
   }
   for (const siteKey of orgs) {
     const last = (briefs[siteKey] || [])[0];
@@ -21581,7 +21599,7 @@ if (process.env.TURMA_TEST) {
     // install REPLACES the map.
     getBriefs: () => briefs,
     getDecisions: () => decisions, decisionsCoerce, sanitizeDecision, appendDecision,
-    decisionsWire, decisionsReplyFor, cleanBriefNarrative, requestBriefNarrative,
+    decisionsWire, decisionCountsWire, decisionsReplyFor, cleanBriefNarrative, requestBriefNarrative,
     ingestBriefNarratives, briefRenders, briefNarrativeInput,
     briefsCoerce, sanitizeBrief, compileBrief, briefSweep, briefTick, briefNeedsYouSig,
     briefDur, briefNextReason,

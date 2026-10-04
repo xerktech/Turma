@@ -165,7 +165,8 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
 - **Writers, always under the DECIDED org (`decidedOrgOf`), never the claimed siteKey**:
   - the answer route → `{question, answer}` = the session's served `question` + the picked
     `questionOptions` labels (1-based "option N" fallback) + any typed answer;
-  - the pane-prompt route → the dialog's prompt + `permissionWhy` + the picked option's label;
+  - the pane-prompt route → `permissionWhy` FIRST, then the dialog's prompt (mostly a generic
+    "Do you want to proceed?"), + the picked option's label;
   - `POST /api/orgs/<site>/decisions {text}` (operator-authed, 400 empty / 413 >500 / 404 an org no
     host is decided into, minting no key).
   - Nothing is logged for a drifted/unbound host, an unknown session, or no pending question. It is
@@ -173,11 +174,16 @@ v2 (XERK-1574, below) adds a model-written summary on top and the per-org decisi
 - **Delivery**: top-level `decisions` on `/api/agents` + its `decisions` SSE frame (each org's
   newest 20, `decisionsWire`), and on EVERY heartbeat reply as `decisions:{org, entries}` (the
   decided org's newest 30; `org:""` + none for a host in no decided org, which removes its file).
+- **A count is `decisionCounts`, never the served list's length** — the tail is capped at 20 of
+  200 kept. Top-level on `/api/agents` + its own SSE frame (sent just before `decisions`); clients
+  show `max(count, served)` so an older hub's absent count degrades to the tail.
 - **`briefTick` drops an org's log** `BRIEF_RETAIN_MS` past its newest entry once no host is in it.
 - **Android TYPES both** (`OrgDecision`, `OrgBrief.narrative`, every field defaulted) — a new field
   is a `sanitizeDecision`/`sanitizeBrief` line AND a Kotlin field in the same change.
 - **Surfaces**: web `decisionsHtml` (newest 10, newest first, the note box for a live org; a draft
   survives repaints via `drafts` + a focus restore); Android `BriefDecisions` read-only (composer
   web-only, `android/PARITY.md`).
+  - A row's meta names its session (`label`, clipped to 60 chars) — the only tie back for an
+    answer with no ticket. Web `DECISION_LABEL_MAX` = Kotlin `BRIEF_DECISION_LABEL_MAX`.
 - Tests: the `XERK-1574:` cases in `server.test.js`, `brief-page.test.js`, android `BriefTest`,
   `AgentDecodeTest`.

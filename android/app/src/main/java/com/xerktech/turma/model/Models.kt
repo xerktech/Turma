@@ -96,6 +96,10 @@ data class AgentsResponse(
     // sanitized on every write/restore (sanitizeDecision); every field below is
     // defaulted, so an older hub (absent) reads as "no decisions yet".
     val decisions: Map<String, List<OrgDecision>> = emptyMap(),
+    // siteKey -> how many decisions that org KEEPS (XERK-1574). The tail above is
+    // capped, so this is the count to show; hub-computed ints. Absent on an older
+    // hub, where the served tail is the floor.
+    val decisionCounts: Map<String, Int> = emptyMap(),
 )
 
 /**

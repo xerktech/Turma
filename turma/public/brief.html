@@ -224,10 +224,13 @@ function narrativeHtml(b) {
 }
 
 // The org's decisions log (XERK-1574): the newest DECISIONS_SHOWN, newest first,
-// then — for an org a host is decided into — the note composer.
+// then — for an org a host is decided into — the note composer. `count` is how
+// many the org keeps (the hub's `decisionCounts`); the served list is only its
+// newest few, so it is a floor (an older hub sends no count).
 const DECISIONS_SHOWN = 10;
+const DECISION_LABEL_MAX = 60;   // the session's name in a row's meta line
 const DECISION_KIND = { question: "answered", permission: "permission", note: "note" };
-function decisionsHtml(site, list, now, live) {
+function decisionsHtml(site, list, now, live, count) {
   const rows = (Array.isArray(list) ? list : []).slice(-DECISIONS_SHOWN).reverse();
   if (!rows.length && !live) return "";
   const item = (d) => {
@@ -235,12 +238,23 @@ function decisionsHtml(site, list, now, live) {
       : `${esc(d.question || "")} → <b>${esc(d.answer || "")}</b>`;
     const meta = [`<span class="kind">${esc(DECISION_KIND[d.source] || d.source || "")}</span>`];
     if (d.ticket) meta.push(`<span class="key">${esc(d.ticket)}</span>`);
+    // Which session it came from — the only tie back for an answer with no ticket.
+    if (d.label) {
+      let l = d.label;
+      if (l.length > DECISION_LABEL_MAX) {
+        l = l.slice(0, DECISION_LABEL_MAX - 1);
+        if (/[\ud800-\udbff]$/.test(l)) l = l.slice(0, -1);   // never half a surrogate pair
+        l += "…";
+      }
+      meta.push(esc(l));
+    }
     if (typeof d.at === "number") meta.push(`${esc(ago(d.at, now))} ago`);
     if (d.host) meta.push(esc(d.host));
     return `<li class="brief-item brief-decision"><div class="brief-title">${title}</div>`
       + `<div class="brief-meta">${meta.join(" · ")}</div></li>`;
   };
-  const total = Array.isArray(list) ? list.length : 0;
+  const served = Array.isArray(list) ? list.length : 0;
+  const total = Math.max(served, Number.isSafeInteger(count) ? count : 0);
   const body = rows.length
     ? `<ul class="brief-list">${rows.map(item).join("")}</ul>`
       + (total > rows.length ? `<div class="brief-more">+${total - rows.length} earlier</div>` : "")
@@ -265,13 +279,13 @@ function headHtml(site, name, when, live) {
     + `</div>`;
 }
 
-function orgHtml(site, list, now, live, decisions) {
+function orgHtml(site, list, now, live, decisions, decisionCount) {
   const b = list[0];
   const name = TurmaBoard.orgName ? TurmaBoard.orgName(site) : site;
   if (!b) {
     return `<section class="brief-org">${headHtml(site, name, "", live)}`
       + `<div class="brief-none">No brief yet — the hub compiles one every few hours, or press Brief now.</div>`
-      + decisionsHtml(site, decisions, now, live) + `</section>`;
+      + decisionsHtml(site, decisions, now, live, decisionCount) + `</section>`;
   }
   const secs = SECTIONS.map(([k, label, cls]) => {
     const items = b[k] || [];
@@ -292,7 +306,7 @@ function orgHtml(site, list, now, live, decisions) {
     + (b.trigger === "manual" ? " · on demand" : "");
   return `<section class="brief-org">` + headHtml(site, name, when, live)
     + narrativeHtml(b) + countsHtml(b) + secs + spendHtml(b, now)
-    + decisionsHtml(site, decisions, now, live)
+    + decisionsHtml(site, decisions, now, live, decisionCount)
     + (earlier ? `<details class="brief-earlier"><summary>Earlier briefs (${list.length - 1})</summary><ul class="brief-list">${earlier}</ul></details>` : "")
     + `</section>`;
 }
@@ -303,6 +317,7 @@ function render(data) {
   const now = Date.now();
   const all = data.briefs && typeof data.briefs === "object" ? data.briefs : {};
   const decs = data.decisions && typeof data.decisions === "object" ? data.decisions : {};
+  const decCounts = data.decisionCounts && typeof data.decisionCounts === "object" ? data.decisionCounts : {};
   const keys = TurmaOrg.getKeys();
   // Every org a host is decided into (the served `org`), plus any org with a kept
   // brief — so an org with none yet still offers Brief now.
@@ -313,7 +328,7 @@ function render(data) {
   for (const s of Object.keys(decs)) if (Array.isArray(decs[s]) && decs[s].length) orgs.add(s);
   const sites = [...orgs].filter((s) => !keys.length || keys.includes(s)).sort();
   const html = sites.length
-    ? sites.map((s) => orgHtml(s, Array.isArray(all[s]) ? all[s] : [], now, live.has(s), decs[s])).join("")
+    ? sites.map((s) => orgHtml(s, Array.isArray(all[s]) ? all[s] : [], now, live.has(s), decs[s], decCounts[s])).join("")
     : `<div class="brief-empty">No org to brief — no host reports a tracker org yet.</div>`;
   // A repaint must not cost a half-typed note its focus or caret (the draft text
   // itself rides `drafts`).
@@ -340,7 +355,10 @@ async function refresh() {
     if (r.status === 401) return void (location.href = "/login");
     const body = await r.json();
     if (cache && briefsClock !== since) body.briefs = cache.briefs;
-    if (cache && decisionsClock !== dsince) body.decisions = cache.decisions;
+    if (cache && decisionsClock !== dsince) {
+      body.decisions = cache.decisions;
+      body.decisionCounts = cache.decisionCounts;
+    }
     cache = body;
   } catch { /* keep the last render */ }
   if (cache) render(cache);
@@ -424,6 +442,14 @@ function connectSSE() {
     decisionsClock++;
     cache.decisions = d;
     render(cache);
+  });
+  // How many each org keeps (the tail above is capped); sent just before it.
+  es.addEventListener("decisionCounts", (e) => {
+    let n;
+    try { n = JSON.parse(e.data); } catch { return; }
+    if (!cache) return void refresh();
+    decisionsClock++;
+    cache.decisionCounts = n;
   });
   TurmaOrg.sse(es);
   es.onerror = () => {

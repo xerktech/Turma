@@ -23476,7 +23476,7 @@ test("XERK-1574: answering a question or a permission dialog appends to the org'
       sessionId: "q1", ticket: "XERK-9", label: "db work" },
     { source: "question", question: "Which DB?", answer: "Postgres; SQLite; option 6; and backups",
       host: "dcHostB", sessionId: "q1", ticket: "XERK-9", label: "db work" },
-    { source: "permission", question: "Do you want to proceed? — Bash: npm test", answer: "Yes",
+    { source: "permission", question: "Bash: npm test — Do you want to proceed?", answer: "Yes",
       host: "dcHostB", sessionId: "p1", label: "lbl" },
   ]);
   // A drifted host (bound to S, now declaring another org) is in NO org: its
@@ -23512,6 +23512,9 @@ test("XERK-1574: the log is a bounded tail — 200 kept, 20 served, 30 on a repl
   assert.equal(kept[0].text, "n5", "oldest evicted");
   assert.equal((await fleet()).decisions[S].length, 20);
   assert.equal((await fleet()).decisions[S][19].text, "n204");
+  // The count a client shows is the org's (200 kept), not the served tail's 20.
+  assert.equal((await fleet()).decisionCounts[S], 200);
+  assert.equal(hub.decisionCountsWire()[S], 200);
   const reply = await beat1574("dcHostC", S);
   assert.equal(reply.body.decisions.entries.length, 30);
   assert.equal(reply.body.decisions.entries[29].text, "n204");

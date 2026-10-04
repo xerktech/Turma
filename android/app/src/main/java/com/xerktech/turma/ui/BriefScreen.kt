@@ -36,6 +36,7 @@ import com.xerktech.turma.core.briefSectionCount
 import com.xerktech.turma.core.briefSpendWindow
 import com.xerktech.turma.core.orgName
 import com.xerktech.turma.core.briefDecisionLines
+import com.xerktech.turma.core.briefDecisionTotal
 import com.xerktech.turma.model.BriefItem
 import com.xerktech.turma.model.OrgBrief
 import com.xerktech.turma.model.OrgDecision
@@ -89,6 +90,7 @@ fun BriefScreen(
                     canBrief = site in live,
                     error = errors[site],
                     decisions = fleet.decisions[site].orEmpty(),
+                    decisionCount = fleet.decisionCounts[site],
                     onBriefNow = { vm.briefNow(site) },
                     onOpenChat = onOpenChat,
                     onOpenEnded = onOpenEnded,
@@ -108,6 +110,7 @@ private fun OrgBriefCard(
     canBrief: Boolean,
     error: String?,
     decisions: List<OrgDecision>,
+    decisionCount: Int?,
     onBriefNow: () -> Unit,
     onOpenChat: (String, String) -> Unit,
     onOpenEnded: (String, String) -> Unit,
@@ -151,7 +154,7 @@ private fun OrgBriefCard(
             } else {
                 BriefBody(brief, earlier, now, onOpenChat, onOpenEnded)
             }
-            BriefDecisions(decisions, now)
+            BriefDecisions(decisions, decisionCount, now)
         }
     }
 }
@@ -161,21 +164,27 @@ private fun OrgBriefCard(
  * newest first. Read-only here; recording a note is web-only (android/PARITY.md).
  */
 @Composable
-private fun BriefDecisions(decisions: List<OrgDecision>, now: Long) {
+private fun BriefDecisions(decisions: List<OrgDecision>, count: Int?, now: Long) {
     if (decisions.isEmpty()) return
+    val total = briefDecisionTotal(decisions.size, count)
+    val lines = briefDecisionLines(decisions, now)
     Column {
         Text(
-            "DECISIONS  ${decisions.size}",
+            "DECISIONS  $total",
             style = MaterialTheme.typography.labelMedium,
             color = MaterialTheme.colorScheme.onSurfaceVariant,
             modifier = Modifier.padding(top = 12.dp, bottom = 2.dp),
         )
-        for ((title, meta) in briefDecisionLines(decisions, now)) {
+        for ((title, meta) in lines) {
             Column(Modifier.fillMaxWidth().padding(vertical = 5.dp)) {
                 Text(title, style = MaterialTheme.typography.bodyMedium)
                 Text(meta, style = MaterialTheme.typography.bodySmall,
                     color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
+        }
+        if (total > lines.size) {
+            Text("+${total - lines.size} earlier", style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant)
         }
     }
 }

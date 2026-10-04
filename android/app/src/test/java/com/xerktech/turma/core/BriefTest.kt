@@ -139,4 +139,21 @@ class BriefTest {
         assertEquals("n15", lines.first().first)
         assertEquals("n6", lines.last().first)
     }
+
+    @Test fun `a decision's meta names its session, clipped like the web`() {
+        val now = 10_000_000L
+        val lines = briefDecisionLines(listOf(
+            OrgDecision(at = now - 3_000_000, source = "question", question = "Q?", answer = "A",
+                label = "archive index work", host = "devbox"),
+            OrgDecision(at = 0, source = "question", question = "Q2?", answer = "B", label = "x".repeat(80)),
+        ), now)
+        assertEquals("answered · ${"x".repeat(59)}…", lines[0].second)
+        assertEquals("answered · archive index work · 50m ago · devbox", lines[1].second)
+    }
+
+    @Test fun `the decisions count is the org's, the served tail its floor`() {
+        assertEquals(50, briefDecisionTotal(20, 50))
+        assertEquals("an older hub sends no count", 20, briefDecisionTotal(20, null))
+        assertEquals(20, briefDecisionTotal(20, 3))
+    }
 }
