@@ -2373,37 +2373,60 @@ def _heading_present(body: str, pattern: str) -> bool:
 
 
 # Forge CLIs, the subcommand group, the verbs that open one (`new` is a
-# documented alias of `create` for both gh and glab), and the flags that carry
-# a description. A short flag may be glued to its value (`-bTEXT`).
+# documented alias of `create` for both gh and glab), the long flags that carry
+# a description, and the SHORTHAND letters that do (az has none).
 _PR_CLIS = {
-    "gh": ("pr", ("create", "new"), ("-b", "--body", "-F", "--body-file")),
-    "glab": ("mr", ("create", "new"), ("-d", "--description")),
-    "az": ("pr", ("create",), ("--description",)),
+    "gh": ("pr", ("create", "new"), ("--body", "--body-file"), "bF"),
+    "glab": ("mr", ("create", "new"), ("--description",), "d"),
+    "az": ("pr", ("create",), ("--description",), ""),
 }
+# The description sources that name a FILE rather than carry the text.
+_PR_FILE_FLAGS = ("--body-file", "F")
 
 
 def _flag_value(arg: str, flags: tuple[str, ...]) -> tuple[str, str | None] | None:
-    """``(flag, glued value or None)`` if ``arg`` is one of ``flags``."""
+    """``(flag, glued value or None)`` if ``arg`` is one of the long ``flags``."""
     for f in flags:
         if arg == f:
             return f, None
-        if f.startswith("--") and arg.startswith(f + "="):
+        if arg.startswith(f + "="):
             return f, arg[len(f) + 1:]
-        if not f.startswith("--") and arg.startswith(f) and len(arg) > len(f):
-            return f, arg[len(f):]
     return None
 
 
-def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
-    """``(inline bodies, body files)`` if this simple command opens a PR/MR or
-    rewrites its description, else None. ``create`` always carries one; an
-    ``edit``/``update`` only counts when it sets one (``gh pr edit --add-label``
-    is not a description change). Help invocations are not PRs."""
+def _shorthand_value(arg: str, letters: str) -> tuple[str, str | None] | None:
+    """``(letter, glued value or None)`` if the single-dash ``arg`` holds a
+    description shorthand. pflag reads `-dF x` as a CLUSTER — `-d -F x` — and
+    the rest of the cluster after a value-taking letter is its value (`-dFx`,
+    `-dF=x`), so a lone `-F`/`-Fx` is just the one-letter case. ANY earlier
+    letter is assumed boolean: a glued value holding the letter (`-Rbob/r`)
+    over-counts, the safe way, while stopping at a value-taking letter we
+    misjudge would let `-dF hosts.yml` slip past the one-source rule."""
+    if not letters or not arg.startswith("-") or arg.startswith("--"):
+        return None
+    for j, ch in enumerate(arg[1:], start=1):
+        if ch in letters:
+            value = arg[j + 1:]
+            if value.startswith("="):
+                value = value[1:]
+            return ch, (value or None)
+        if not ch.isalpha():
+            # Shorthands are letters: past a non-letter this is a value.
+            return None
+    return None
+
+
+def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str], int] | None:
+    """``(inline bodies, body files, description-flag count)`` if this simple
+    command opens a PR/MR or rewrites its description, else None. ``create``
+    always carries one; an ``edit``/``update`` only counts when it sets one
+    (``gh pr edit --add-label`` is not a description change). Help invocations
+    are not PRs."""
     spec = _PR_CLIS.get(_basename(tokens[0]))
     rest = tokens[1:]
     if not spec or spec[0] not in rest:
         return None
-    group, creates, body_flags = spec
+    group, creates, body_flags, letters = spec
     head = rest[:rest.index(group)]
     if (rest[:1] == ["help"]
             or (_basename(tokens[0]) == "az" and "repos" not in head)):
@@ -2419,19 +2442,21 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
     bodies: list[str] = []
     files: list[str] = []
     seen_flag = False
+    sources = 0
     prev_bare = False  # the previous token was a flag that may take a value
     i = 0
     while i < len(args):
         arg = args[i]
-        hit = _flag_value(arg, body_flags)
+        hit = _flag_value(arg, body_flags) or _shorthand_value(arg, letters)
         if hit:
             seen_flag = True
+            sources += 1
             flag, value = hit
             if value is None and i + 1 < len(args):
                 i += 1
                 value = args[i]
             if value is not None:
-                (files if flag in ("-F", "--body-file") else bodies).append(value)
+                (files if flag in _PR_FILE_FLAGS else bodies).append(value)
             prev_bare = False
         elif arg in ("-h", "--help") and not prev_bare:
             # Help prints wherever it sits — unless it is the previous flag's
@@ -2452,26 +2477,236 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str]] | None:
             prev_bare = False
         i += 1
     if verb in creates or (verb in ("edit", "update") and seen_flag):
-        return bodies, [f for f in files if f and f != "-"]
+        return bodies, [f for f in files if f], sources
     return None
 
 
-def _read_text(path: str) -> str:
-    """A bounded read of a REGULAR file, else "". ``O_NONBLOCK`` + the fstat
+# The names gh's own stdin goes by. Any OTHER /dev or /proc name is a device or
+# a file descriptor the shell sets up (`/dev/stderr` + `2<hosts.yml`,
+# `//dev/fd/3` + `3<hosts.yml`), which the hook cannot see, so it is refused
+# rather than enumerated (XERK-1565: four rounds of one-path-at-a-time fixes).
+_PR_STDIN_PATHS = ("/dev/stdin", "/dev/fd/0", "/proc/self/fd/0")
+_PR_MAX_LINKS = 40
+
+
+def _collapse_root(path: str) -> str:
+    """POSIX lets `//` lead a path with its own meaning, so normpath keeps it;
+    Linux reads it as `/`, and so must the check (`//dev/fd/3`)."""
+    return "/" + path.lstrip("/") if path.startswith("//") else path
+
+
+def _pr_full_path(cwd: str, path: str) -> str:
+    return _collapse_root(os.path.normpath(os.path.abspath(_join_path(cwd, path))))
+
+
+def _pr_kernel_path(path: str) -> bool:
+    return path in ("/dev", "/proc") or path.startswith(("/dev/", "/proc/"))
+
+
+def _pr_description_file(cwd: str, path: str) -> tuple[str, str | None]:
+    """What a description FILE argument really is, failing CLOSED:
+    ``("stdin", None)`` for `-` or a name that resolves to gh's stdin,
+    ``("file", text)`` for a readable regular file outside /dev and /proc,
+    ``("missing", None)`` when nothing is there yet, else ``("device", None)``
+    (any other /dev or /proc name) or ``("bad", None)`` (anything else: a FIFO,
+    a socket, a directory, an unreadable or looping path).
+
+    Symlinks are resolved one component at a time and NEVER through /dev or
+    /proc: `os.path.realpath` would follow the hook's OWN /proc/self/fd links,
+    which name different fds in gh."""
+    if path == "-":
+        return "stdin", None
+    full = _pr_full_path(cwd, path)
+    if os.name != "posix":
+        # Git Bash maps /dev and /proc itself; the Windows path never says so.
+        raw = _collapse_root(posixpath.normpath(path.replace("\\", "/")))
+        if raw in _PR_STDIN_PATHS:
+            return "stdin", None
+        if _pr_kernel_path(raw):
+            return "device", None
+        if not os.path.lexists(full):
+            return "missing", None
+        text = _read_regular(os.path.realpath(full))
+        return ("file", text) if text is not None else ("bad", None)
+    parts = [c for c in full.split("/") if c]
+    resolved = "/"
+    links = 0
+    while parts:
+        name = parts.pop(0)
+        if name == ".":
+            continue
+        if name == "..":
+            resolved = os.path.dirname(resolved)
+            continue
+        cand = os.path.join(resolved, name)
+        if _pr_kernel_path(cand):
+            rest = _collapse_root(os.path.normpath(os.path.join(cand, *parts)))
+            return ("stdin" if rest in _PR_STDIN_PATHS else "device"), None
+        try:
+            st = os.lstat(cand)
+        except FileNotFoundError:
+            return "missing", None
+        except (OSError, ValueError):
+            return "bad", None
+        if stat.S_ISLNK(st.st_mode):
+            links += 1
+            try:
+                target = os.readlink(cand)
+            except OSError:
+                return "bad", None
+            if links > _PR_MAX_LINKS:
+                return "bad", None
+            if target.startswith("/"):
+                resolved = "/"
+            parts = [c for c in target.split("/") if c] + parts
+            continue
+        if parts and not stat.S_ISDIR(st.st_mode):
+            return "bad", None
+        resolved = cand
+    text = _read_regular(resolved)
+    return ("file", text) if text is not None else ("bad", None)
+
+
+# A redirect word as the tokenizer leaves it: an optional fd (or `&`), the
+# operator, and a target either glued on or in the next token.
+_REDIR_WORD = re.compile(r"^(\d*|&)(<<<|<<-|<<|<>|<&|>&|>>|>\||<|>)")
+
+
+def _drop_leading_redirects(tokens: list[str]) -> list[str]:
+    """`< hosts.yml gh pr create -F -` is a PR command too: bash takes a
+    redirect before the command word, so the check must look past it."""
+    i = 0
+    while i < len(tokens):
+        m = _REDIR_WORD.match(tokens[i])
+        if not m:
+            break
+        i += 1 if tokens[i][m.end():] else 2
+    return tokens[i:]
+
+
+# Commands that only read, test, print or remove their operands: naming the
+# body file (`rm -f b.md; cat > b.md <<EOF …`, `echo using b.md`) cannot put
+# other content behind it; nor can `git add`, which only stages it. Their
+# OUTPUT redirects still count.
+_PR_PATH_READERS = frozenset(("cat", "head", "tail", "wc", "ls", "stat", "test", "[",
+                              "grep", "rm", "unlink", "echo", "printf"))
+
+
+def _note_paths(tokens: list[str], segment: str, cwd: str,
+                written: set[str], named: set[str]) -> None:
+    """Record what a NON-PR segment of the command does to paths — before or
+    after the PR command, run or not: expansion keeps no source order or
+    condition. ``written``: a heredoc-only writer's outputs — `cat > f <<EOF`,
+    `cat >> f`, `tee [-a] f <<EOF` with no other input — the one way a
+    description file may be filled by the same command (which is why an
+    existing one must still pass alone). ``named``: every other path it mentions
+    (`ln -sf /dev/stdin f`, `cp hosts.yml f`, `cat hosts.yml <<EOF > f`)."""
+    words: list[str] = []
+    outs: list[str] = []
+    i = 0
+    while i < len(tokens):
+        tok = tokens[i]
+        m = _REDIR_WORD.match(tok)
+        if not m:
+            words.append(tok)
+            i += 1
+            continue
+        fd, op = m.group(1), m.group(2)
+        target = tok[m.end():]
+        if not target and i + 1 < len(tokens):
+            i += 1
+            target = tokens[i]
+        i += 1
+        if op in ("<<", "<<-", "<<<") or (op in ("<&", ">&") and
+                                          (target.isdigit() or target == "-")):
+            continue  # a heredoc delimiter, a here-string, an fd dup
+        if op in (">", ">>", ">|", ">&") and fd in ("", "1", "&"):
+            outs.append(target)
+        elif target:
+            named.add(_pr_full_path(cwd, target))
+    here, other = _stdin_redirects(segment)
+    cmd = _basename(words[0]) if words else ""
+    writer = here == 1 and other == 0 and (
+        (cmd == "cat" and all(w == "-" for w in words[1:])) or cmd == "tee")
+    if writer and cmd == "tee":
+        outs += [w for w in words[1:] if not w.startswith("-")]
+        words = words[:1]
+    elif cmd in _PR_PATH_READERS or (cmd == "git" and words[1:2] == ["add"]):
+        words = words[:1]  # it reads or removes its operands, never fills one
+    for out in outs:
+        (written if writer else named).add(_pr_full_path(cwd, out))
+    for word in words[1:]:
+        named.add(_pr_full_path(cwd, word))
+
+
+def _stdin_redirects(segment: str, any_fd: bool = False) -> tuple[int, int]:
+    """``(heredocs, other inputs)`` redirected onto fd 0 by ``segment``'s own
+    text — onto ANY fd with ``any_fd``. Other inputs are `<`, `<>`, `<&` and
+    the here-string `<<<`; a `0<`-style prefix counts, `3<` only with
+    ``any_fd``. Quotes are skipped, and a `<` glued into a word (`-F-<h`)
+    still counts, as bash parses it."""
+    here = other = 0
+    i, n = 0, len(segment)
+    while i < n:
+        ch = segment[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'":
+            end = segment.find("'", i + 1)
+            i = n if end < 0 else end + 1
+            continue
+        if ch == '"':
+            j = i + 1
+            while j < n and segment[j] != '"':
+                j += 2 if segment[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch != "<":
+            i += 1
+            continue
+        j = i
+        while j > 0 and segment[j - 1].isdigit():
+            j -= 1
+        # Digits are the fd only when they are the whole word (`a0<x` is the
+        # word `a0` and a redirect of fd 0).
+        word_start = j == 0 or segment[j - 1].isspace() or segment[j - 1] in ";&|()<>"
+        on_zero = any_fd or j == i or not word_start or int(segment[j:i]) == 0
+        if segment.startswith("<<<", i):
+            other += on_zero
+            i += 3
+        elif segment.startswith("<<", i):
+            here += on_zero
+            i += 2
+        elif segment.startswith("<(", i):
+            i += 2  # process substitution: a path, not a redirect
+        else:
+            other += on_zero
+            i += 1
+    return here, other
+
+
+def _read_regular(path: str) -> str | None:
+    """A bounded read of a REGULAR file, else None. ``O_NONBLOCK`` + the fstat
     check keep a FIFO planted at the path from hanging the hook, which Claude
     Code would then time out and let the command through unchecked."""
     try:
         fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
     except (OSError, ValueError):
-        return ""
+        return None
     try:
         if not stat.S_ISREG(os.fstat(fd).st_mode):
-            return ""
+            return None
         return os.read(fd, _PR_BODY_MAX_READ).decode("utf-8", "replace")
     except OSError:
-        return ""
+        return None
     finally:
         os.close(fd)
+
+
+def _read_text(path: str) -> str:
+    """`_read_regular`, with "" for anything it can't read."""
+    return _read_regular(path) or ""
 
 
 def _repo_root(start: str) -> str | None:
@@ -2523,11 +2758,17 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     """A reason if ``command`` opens a PR/MR (or rewrites its description)
     whose description is missing a required section.
 
-    The description is what the command would actually send: the inline
-    ``--body``/``--description`` values, any ``--body-file`` (resolved against
-    ``cwd`` as moved by a preceding ``cd``), and the command's heredoc bodies —
-    which covers ``$(cat <<EOF …)``, ``-F - <<EOF`` and a body file the same
-    command writes first (it does not exist yet when the hook runs). The rest of
+    The description is the ONE source the command would actually send: a
+    regular ``--body-file`` (resolved against ``cwd`` as moved by a preceding
+    ``cd``) is checked alone; a stdin body against each heredoc on its own; an
+    inline ``--body``/``--description`` value, or a body file a heredoc writer
+    in the same command fills, together with the command's heredoc bodies —
+    which covers ``$(cat <<EOF …)`` and ``cat > f <<EOF; … -F f``. A stdin
+    description must be the PR command's own heredoc — a `< file`, `<<<`, pipe
+    or sibling heredoc is what gh would read instead. A description FILE fails
+    closed: a regular file outside /dev and /proc, or one a heredoc writer
+    in the command fills (an existing one must ALSO pass alone, since the
+    writer may append, not run, or run after gh); any other path is refused. The rest of
     the command text (titles, comments) never counts. A description pulled from
     somewhere else (``--fill``, the editor, ``$(cat file)``) can't be checked,
     so it is refused with a reason saying how to pass it."""
@@ -2537,49 +2778,186 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
         except OSError:
             cwd = "/"
     heredocs = None
-    for tokens, _segment, *_flags in _expand_both(command):
+    written: set[str] = set()  # description files a heredoc writer creates first
+    named: set[str] = set()  # every other path an earlier segment mentions
+    for tokens, segment, *_flags in _expand_both(command):
         if _basename(tokens[0]) == "cd" and len(tokens) > 1:
             cwd = _join_path(cwd, tokens[1])
             continue
-        hit = _pr_body_command(tokens)
+        command_tokens = _drop_leading_redirects(tokens)
+        hit = _pr_body_command(command_tokens) if command_tokens else None
         if not hit:
+            _note_paths(tokens, segment, cwd, written, named)
             continue
-        bodies, files = hit
-        if heredocs is None:
-            # Every heredoc counts. Matching a heredoc to the command it feeds
-            # (owner line, redirect target) refused 26% of real compliant PR
-            # commands — `git push && gh pr create … <<EOF`, `cd x && …`,
-            # `cat > "$S/b.md"` — so an unrelated heredoc in the same command
-            # counts too: the accepted residual, since it takes a model gaming
-            # its own guard. (`<<` in quotes/comments is not a heredoc to the
-            # XERK-1256 lexer, so it never counts.)
-            heredocs = [b for _owner, b, _quoted in _split_heredocs(command)[1]]
-        body = "\n".join(bodies + heredocs + [_read_text(_join_path(cwd, f)) for f in files])
-        sections = _repo_template_sections(_repo_root(cwd))
-        if sections is not None:
-            # A template with no headings asks for prose; there is nothing to check.
-            missing = [name for name, pat in sections if not _heading_present(body, pat)]
-            if missing:
+        bodies, files, sources = hit
+        if sources > 1:
+            # The check below reads the UNION of every description source,
+            # but gh/glab/az send only ONE (gh's pflag keeps the last), so
+            # `--body-file ok.md --body-file ~/.config/gh/hosts.yml` passed on
+            # ok.md's sections and posted the other file (XERK-1565).
+            return (
+                "the command passes the description more than once "
+                "(--body/-b, --body-file/-F, --description/-d, a letter in a "
+                "flag cluster such as -dF counts too) — the CLI sends only one of "
+                "them, so the description that is checked may not be the one "
+                "that is sent. Pass the description exactly once."
+            )
+        if files and _stdin_redirects(segment, any_fd=True)[1]:
+            # The heredoc check below reads every heredoc, but `-F - <<EOF
+            # < hosts.yml` (or `0<`, `<<<`, `<&3`) hands gh the LAST fd-0
+            # input — the token file — while the heredoc passes; and a file
+            # name can turn into an fd (`-F /dev/stderr 2<hosts.yml`), so an
+            # input redirect on ANY fd counts (XERK-1565).
+            return (
+                "the description is read from a file while the command also "
+                "redirects an input (<, N<, <<<, <&) — the input gh reads may "
+                "not be the description that is checked. Pass the description "
+                "with --body-file <path>, or as a heredoc on the PR command "
+                "itself (-F - <<'EOF') with no other input redirect."
+            )
+        stdin = False
+        texts: list[str] = []
+        current: list[tuple[str, str]] = []  # a writer's file as it is NOW
+        from_writer = False
+        for f in files:
+            # FAIL CLOSED (XERK-1565): `-`/stdin under the own-heredoc rule, a
+            # regular file outside /dev and /proc, or a file a heredoc writer
+            # in this command creates first. Nothing else is a description.
+            kind, text = _pr_description_file(cwd, f)
+            # Path STRINGS only: another spelling of the same file ("$PWD/f",
+            # /proc/self/cwd/f, a glob, a symlinked dir made in this line)
+            # gets past it — a documented residual (agent-hooks.md), not a
+            # credential filter.
+            if kind != "stdin" and _pr_full_path(cwd, f) in named:
                 return (
-                    "this repo has its own PR template — the description is missing "
-                    f"its section(s): {', '.join(missing)}. Follow that template, "
-                    "and pass the description inline (--body/--description, or a "
-                    "heredoc) or with --body-file so it can be checked."
+                    "another part of the command names the description file "
+                    f"({f}) — it can replace or relink it before gh reads it, so "
+                    "the file that is checked may not be the one that is sent. "
+                    "Write it with cat > <path> <<'EOF' (or in an earlier step) "
+                    "and pass --body-file <path>, or use a heredoc."
                 )
-            return None
-        missing = [name for name, pat in _PR_SECTIONS if not _heading_present(body, pat)]
-        if not _PR_SUMMARY_LINE.search(body):
-            missing.insert(0, "a '**Summary:**' first line")
+            if kind == "stdin":
+                stdin = True
+            elif kind in ("file", "missing") and _pr_full_path(cwd, f) in written:
+                # A heredoc writer in this command fills it, so its heredoc
+                # is checked (below). But `written` keeps no order or
+                # condition: an APPENDING writer (`>>`, `tee -a`), one gated
+                # by `false &&`, or one in a later `(…)`/`$(…)` (expanded
+                # first) leaves what is there NOW in what gh reads, so an
+                # existing file must pass ALONE too — or `cat >> .env <<EOF`
+                # posted .env on the heredoc's sections (XERK-1565).
+                from_writer = True
+                if kind == "file":
+                    current.append((f, text or ""))
+            elif kind == "file":
+                texts.append(text or "")
+            elif kind == "device":
+                return (
+                    f"the description is read from a device or file-descriptor "
+                    f"path ({f}) the check can't see — only - or /dev/stdin "
+                    "(as a heredoc on the PR command) is. Pass it with "
+                    "--body-file <path>, inline (--body/--description) or as a "
+                    "heredoc."
+                )
+            elif kind == "missing":
+                return (
+                    f"the description file ({f}) does not exist and is not "
+                    "written by a heredoc earlier in this command (cat > <path> "
+                    "<<'EOF'), so the check can't see what gh will read. Write "
+                    "it first, pass it inline (--body/--description) or as a "
+                    "heredoc."
+                )
+            else:
+                return (
+                    f"the description file ({f}) is not a readable regular file "
+                    "(a FIFO, socket, directory or unreadable path), so the check "
+                    "can't see what gh will read. Pass it with --body-file <path> "
+                    "to a regular file, inline (--body/--description) or as a "
+                    "heredoc."
+                )
+        if stdin and _stdin_redirects(segment)[0] != 1:
+            # A stdin description must BE the PR command's own heredoc: one
+            # fed by a pipe, an inherited stdin or a sibling segment's heredoc
+            # (`gh pr create -F - < f; gh pr view 1 <<EOF`) is not what is
+            # checked.
+            return (
+                "the description is read from standard input, but not from a "
+                "heredoc on the PR command itself — the input gh reads may not "
+                "be the description that is checked. Use -F - <<'EOF' on the "
+                "PR command, --body \"$(cat <<'EOF' …)\", or --body-file <path>."
+            )
+        if heredocs is None:
+            heredocs = [b for _owner, b, _quoted in _split_heredocs(command)[1]]
+        # What gh sends — exactly one source by now (XERK-1565):
+        # - a regular FILE is checked ALONE: a heredoc gh never reads must not
+        #   vouch for it (`--body-file hosts.yml <<EOF …`);
+        # - STDIN is its own heredoc, but which one that is in a multi-heredoc
+        #   command is not mapped, so EVERY heredoc must pass on its own (two
+        #   `gh pr edit N -F - <<EOF` pass; a good sibling can't vouch for a
+        #   bad one);
+        # - an inline body or a file a heredoc writer fills is checked with
+        #   every heredoc (and an existing such file alone too, after this).
+        #   Matching a heredoc to the command it feeds (owner line, redirect
+        #   target) refused 26% of real compliant PR commands —
+        #   `git push && gh pr create … <<EOF`, `cd x && …`, `cat > "$S/b.md"`
+        #   — so an unrelated heredoc counts there: the accepted residual,
+        #   since it takes a model gaming its own guard. (`<<` in
+        #   quotes/comments is not a heredoc to the XERK-1256 lexer.)
+        # With no source at all (--fill, the editor) nothing is checked
+        # against, so it is refused.
+        if texts:
+            candidates = texts
+        elif stdin:
+            candidates = heredocs or [""]
+        elif bodies or from_writer:
+            candidates = ["\n".join(bodies + heredocs)]
+        else:
+            candidates = [""]
+        for body in candidates:
+            reason = _pr_body_reason(body, cwd)
+            if reason:
+                return reason
+        for f, body in current:
+            reason = _pr_body_reason(body, cwd)
+            if reason:
+                return (
+                    f"the description file ({f}) already exists and its current "
+                    "text fails the check — a heredoc in this command writes it, "
+                    "but an appending (>>, tee -a), conditional or later writer "
+                    "leaves that text in what gh reads. Remove it in an earlier "
+                    "step or write the description to a new path. " + reason
+                )
+    return None
+
+
+def _pr_body_reason(body: str, cwd: str) -> str | None:
+    """Why ``body`` misses the repo's PR template (or, with none, the Turma
+    PR summary standard), else None."""
+    sections = _repo_template_sections(_repo_root(cwd))
+    if sections is not None:
+        # A template with no headings asks for prose; there is nothing to check.
+        missing = [name for name, pat in sections if not _heading_present(body, pat)]
         if missing:
             return (
-                "the PR description does not follow the Turma PR summary standard — "
-                f"missing: {', '.join(missing)}. Required, in order: a "
-                "'**Summary:**' line, then '## Why', '## What changed', '## Risk', "
-                "'## Testing', '## Follow-ups' (see the PR summary standard in your "
-                "system prompt). Pass the description inline (--body/--description, "
-                "or a heredoc) or with --body-file so it can be checked — --fill and "
-                "the editor can't be."
+                "this repo has its own PR template — the description is missing "
+                f"its section(s): {', '.join(missing)}. Follow that template, "
+                "and pass the description inline (--body/--description, or a "
+                "heredoc) or with --body-file so it can be checked."
             )
+        return None
+    missing = [name for name, pat in _PR_SECTIONS if not _heading_present(body, pat)]
+    if not _PR_SUMMARY_LINE.search(body):
+        missing.insert(0, "a '**Summary:**' first line")
+    if missing:
+        return (
+            "the PR description does not follow the Turma PR summary standard — "
+            f"missing: {', '.join(missing)}. Required, in order: a "
+            "'**Summary:**' line, then '## Why', '## What changed', '## Risk', "
+            "'## Testing', '## Follow-ups' (see the PR summary standard in your "
+            "system prompt). Pass the description inline (--body/--description, "
+            "or a heredoc) or with --body-file so it can be checked — --fill and "
+            "the editor can't be."
+        )
     return None
 
 
