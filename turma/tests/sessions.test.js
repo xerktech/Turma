@@ -2264,11 +2264,36 @@ test("XERK-1575: a sleeper paused for its slot reads asleep until its wake, neve
     closed("44444", "Plain Kill", "2026-07-15T08:00:00Z"),
   ];
   beat({ now, agents: [h] });
-  const e = els.ended.innerHTML;
-  const nap = e.slice(e.indexOf("Napping"), e.indexOf("Plain Kill"));
-  assert.ok(nap.includes(`<div class="state">💤 paused until ${hhmm} · check CI</div>`), nap);
+  // Its own open Paused section, never folded into the collapsed Ended history.
+  const nap = els.paused.innerHTML;
+  assert.match(nap, /<h2>Paused <span class="count">1<\/span><\/h2>/);
+  assert.ok(!/<details/.test(nap), "the Paused section is never collapsed");
+  assert.ok(nap.includes("Napping"), nap);
+  assert.ok(nap.includes(`<div class="state holding">💤 paused until ${hhmm} · check CI</div>`), nap);
   assert.ok(!nap.includes("killed"), nap);
+  assert.ok(!nap.includes("Plain Kill"), nap);
+  const e = els.ended.innerHTML;
+  assert.ok(!e.includes("Napping"), "a paused sleeper is not ended history");
+  assert.match(e, /Ended sessions <span class="count">1<\/span>/);
   assert.match(e.slice(e.indexOf("Plain Kill")), /<div class="state">killed/);
+
+  // Woken (no longer a paused record): the Paused section goes away.
+  h.closedSessions = [closed("44444", "Plain Kill", "2026-07-15T08:00:00Z")];
+  beat({ now, agents: [h] });
+  assert.equal(els.paused.innerHTML, "");
+});
+
+test("XERK-1575: Paused lists the soonest wake first", () => {
+  const { beat, els } = loadPage();
+  const { now, host: h } = host([]);
+  h.closedSessions = [
+    closed("55555", "Late Nap", "2026-07-15T10:00:00Z", { paused: { wakeAt: now + 5 * 3600e3, at: now } }),
+    closed("66666", "Early Nap", "2026-07-15T09:00:00Z", { paused: { wakeAt: now + 3600e3, at: now } }),
+  ];
+  beat({ now, agents: [h] });
+  const p = els.paused.innerHTML;
+  assert.ok(p.indexOf("Early Nap") < p.indexOf("Late Nap"), p);
+  assert.equal(els.ended.innerHTML, "", "no other ended sessions -> no Ended section");
 });
 
 test("Ended sessions is collapsed by default and hidden when there are none", () => {

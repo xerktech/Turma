@@ -30,6 +30,9 @@ data class FleetSummary(
     // Whether a removed host's spend is inside the three token totals, so the
     // tiles can say so (index.html's `retiredNote`).
     val retiredCounted: Boolean = false,
+    // Sleepers the hub paused to free their slot (XERK-1575): no slot, so not in
+    // [running], but said beside it (index.html `pausedCount`).
+    val paused: Int = 0,
 )
 
 private fun bucket(u: UsageInfo, w: UsageWindow) = when (w) {
@@ -110,5 +113,6 @@ fun fleetSummary(
         // Said on the tiles rather than left to be discovered: a total larger
         // than the hosts on screen can account for reads as a bug otherwise.
         retiredCounted = retired.isNotEmpty(),
+        paused = agents.sumOf { pausedSleepers(it).size },
     )
 }

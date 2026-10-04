@@ -433,7 +433,7 @@
   #searchResults { display: none; }
   body.searching #searchResults { display: block; }
   body.searching #review, body.searching #active, body.searching #idle,
-  body.searching #ended, body.searching #spawn { display: none; }
+  body.searching #paused, body.searching #ended, body.searching #spawn { display: none; }
   .sr-hint { color: var(--muted); font-size: 12px; padding: 6px 2px; }
   .sr-group { margin: 10px 0 4px; }
   .sr-group > .grp-h {
@@ -1234,6 +1234,7 @@
       <div id="review"></div>
       <div id="active"></div>
       <div id="idle"></div>
+      <div id="paused"></div>
       <div id="ended"></div>
     </aside>
 
@@ -1398,6 +1399,7 @@
 const $review = document.getElementById("review");
 const $active = document.getElementById("active");
 const $idle = document.getElementById("idle");
+const $paused = document.getElementById("paused");
 const $ended = document.getElementById("ended");
 const $spawn = document.getElementById("spawn");
 const $queued = document.getElementById("queued");
@@ -2281,6 +2283,12 @@ function pausedLabel(p, now) {
   const why = typeof p.wakeReason === "string" ? p.wakeReason.trim() : "";
   return "💤 paused until " + clockTime(p.wakeAt, now) + (why ? " · " + why : "");
 }
+// An ended entry that is really a paused sleeper: its own always-open Paused
+// section, never folded into the collapsed Ended history (XERK-1575).
+function isPausedEntry(e) {
+  const p = e && e.kind === "closed" && e.s ? e.s.paused : null;
+  return !!p && Number.isSafeInteger(p.wakeAt);
+}
 function liveWorkRows(s) {
   return (Array.isArray(s?.agents) ? s.agents : []).filter(a => !isWaitRow(a));
 }
@@ -2788,13 +2796,25 @@ function render(data) {
        <div class="s-list">${idle.map(x => activeCard(x)).join("")}</div>`
     : "";
 
+  // Paused: sleepers the hub paused to free their slot for queued work
+  // (XERK-1575). Ended for now, but each resumes on its own at its wake, so it
+  // is shown open above the history rather than hidden in the collapsed Ended
+  // list among killed sessions. Soonest wake first. Hidden when empty.
+  const paused = ended.filter(isPausedEntry)
+    .sort((x, y) => (x.s.paused.wakeAt - y.s.paused.wakeAt) || String(x.id).localeCompare(String(y.id)));
+  const history = ended.filter(x => !isPausedEntry(x));
+  $paused.innerHTML = paused.length
+    ? `<h2>Paused <span class="count">${paused.length}</span></h2>
+       <div class="s-list">${paused.map(x => endedRow(x)).join("")}</div>`
+    : "";
+
   // Ended sessions: collapsed by default (they're history, not the work at
   // hand), and re-collapsing on its own would fight the operator, so the open
   // state rides `endedOpen` across the beat re-render like every other panel.
-  $ended.innerHTML = ended.length
+  $ended.innerHTML = history.length
     ? `<details class="ended-wrap-sec" ${endedOpen ? "open" : ""} ontoggle="endedOpen = this.open">
-         <summary><h2>Ended sessions <span class="count">${ended.length}</span></h2></summary>
-         <div class="s-list">${ended.map(x => endedRow(x)).join("")}</div>
+         <summary><h2>Ended sessions <span class="count">${history.length}</span></h2></summary>
+         <div class="s-list">${history.map(x => endedRow(x)).join("")}</div>
        </details>`
     : "";
 
@@ -2992,13 +3012,16 @@ function endedRow(e) {
   const when = e.endedMs ? ago(Date.now() - e.endedMs) : "";
   // A resumable row is a bare transcript: nothing recorded WHY it ended, only
   // that it did, so it says the one thing that's true of all of them.
-  const state = (kind === "closed" && pausedLabel(s.paused, Date.now()))
+  // A paused sleeper (XERK-1575) reads like the sleeping label it had in Active
+  // (the `holding` tone), with no ended-ago age: it is waiting, not history.
+  const paused = isPausedEntry(e) ? pausedLabel(s.paused, Date.now()) : null;
+  const state = paused
     || (kind === "closed" ? "killed"
       : kind === "resumable" ? "ended"
       : (s.status === "error" ? "failed" : "stopped"))
     + (when ? " " + when : "");
   return `<div class="s-card-wrap ended-wrap"${orgTintStyle(a)}>
-    <div class="s-card ended ${cur ? "cur" : ""}">
+    <div class="s-card ended${paused ? " paused" : ""} ${cur ? "cur" : ""}">
       <button class="s-hit" aria-label="${esc("Open session " + sessTitle(s))}"
           onclick="openEndedSession('${escJs(e.id)}')"></button>
       <span class="dot"></span>
@@ -3006,7 +3029,7 @@ function endedRow(e) {
         <div class="title" title="${esc(sessTitle(s))}">${esc(sessTitle(s))}</div>
         ${cardMeta(a, s, endedRowId(e))}
         <div class="state-row">
-          <div class="state">${esc(state)}</div>
+          <div class="state${paused ? " holding" : ""}">${esc(state)}</div>
           ${s.modelSource === "local" ? `<span class="local-mark" title="${
             esc("Ran on this host's self-hosted model, not the Claude subscription")
           }">🏠 local</span>` : ""}

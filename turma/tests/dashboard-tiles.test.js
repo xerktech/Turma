@@ -573,3 +573,44 @@ test("dashboard: an in-flight snapshot does not clobber a newer orgColors SSE pa
   assert.deepEqual(D.getCache().orgColors, { o: "green" },
     "an unraced snapshot still replaces orgColors");
 });
+
+// XERK-1575: a sleeper the hub paused to free its slot is a killed record with a
+// `paused` wake. It holds no slot, so it is not in the running count — but it
+// comes back on its own, so the host card keeps a card for it in its repo and
+// the tile and host meta say how many are paused, rather than letting it vanish
+// as if killed.
+test("dashboard: a paused sleeper keeps a card in its repo and is counted as paused", () => {
+  const D = loadDashboard();
+  const now = Date.now();
+  const wakeAt = now + 2 * 3600e3;
+  const d = new Date(wakeAt), p = (n) => String(n).padStart(2, "0");
+  const hhmm = `${p(d.getHours())}:${p(d.getMinutes())}`;
+  const h = {
+    ...liveHost("vm", 1),
+    capacity: { maxSessions: 6 },
+    repos: [{ name: "Turma", branch: "main" }],
+    sessions: [{ id: "s1", summary: "Busy One", status: "running", repo: "Turma" }],
+    closedSessions: [
+      { id: "s2", summary: "Napping", repo: "Turma", worktreePath: "/r/.turma/worktrees/brave-otter",
+        closedAt: new Date(now - 60_000).toISOString(),
+        paused: { wakeAt, wakeReason: "check CI on PR #412", at: now - 60_000 } },
+      { id: "s3", summary: "Plain Kill", repo: "Turma", closedAt: new Date(now).toISOString() },
+    ],
+  };
+  D.render({ now, agents: [h] });
+  assert.deepEqual(tileOf(D.els.tiles.innerHTML, "Running sessions"),
+    { value: "1 / 6", hint: "1 total · 1 paused" });
+  const g = D.els.groups.innerHTML;
+  assert.match(g, /<b>1<\/b> running · 1 total · 1 paused/);
+  assert.ok(g.includes('<div class="sess paused">'), "the paused sleeper has a card");
+  assert.ok(g.includes(`💤 paused until ${hhmm} · check CI on PR #412`), g);
+  assert.ok(g.includes("brave-otter"), "its worktree is named");
+  assert.ok(g.includes("Resume now"), "it can be resumed early");
+  assert.ok(!g.includes("Plain Kill"), "an ordinary kill stays off the card grid");
+
+  // Nothing paused: no note anywhere.
+  const D2 = loadDashboard();
+  D2.render({ now, agents: [{ ...h, closedSessions: [h.closedSessions[1]] }] });
+  assert.equal(tileOf(D2.els.tiles.innerHTML, "Running sessions").hint, "1 total");
+  assert.ok(!D2.els.groups.innerHTML.includes("paused"));
+});

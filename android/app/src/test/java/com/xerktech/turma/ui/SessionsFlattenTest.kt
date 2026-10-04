@@ -400,4 +400,26 @@ class SessionsFlattenTest {
         )
         assertEquals("killed", endedStateText(ended.getValue("kill"), now))
     }
+
+    // XERK-1575: paused sleepers leave the collapsed Ended list for their own
+    // Paused section, soonest wake first (web sessions.html `$paused`).
+    @Test fun `paused sleepers split out of Ended, soonest wake first`() {
+        val a = AgentInfo(
+            key = "h1", device = "BOX", online = true,
+            closedSessions = listOf(
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "late", transcriptId = "t1",
+                    paused = com.xerktech.turma.model.PausedSleep(wakeAt = 9_000L),
+                ),
+                com.xerktech.turma.model.ClosedSessionInfo(id = "kill", transcriptId = "t2"),
+                com.xerktech.turma.model.ClosedSessionInfo(
+                    id = "early", transcriptId = "t3",
+                    paused = com.xerktech.turma.model.PausedSleep(wakeAt = 5_000L),
+                ),
+            ),
+        )
+        val ended = collectSessions(listOf(a), "").ended
+        assertEquals(listOf("early", "late"), pausedEnded(ended).map { it.id })
+        assertEquals(listOf("kill"), ended.filterNot(::isPausedEnded).map { it.id })
+    }
 }

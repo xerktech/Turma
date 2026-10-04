@@ -271,8 +271,16 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   resumed session starts a fresh `sa` with no `reviewAt`/`prevAttn`, so neither review nor stalled
   fires off the resume itself. `startedTicketKeys` reads closed records, so auto-start never
   re-dispatches its ticket meanwhile.
-- **Every Ended list shows it asleep, never "killed"**: "💤 paused until 14:05 · <reason>" (web
-  `pausedLabel` in `endedRow`, Android `endedStateText`, glasses phone `pausedLabel` in
-  `endedCardHtml`), with no "ended N ago" beside it. Resume on that row is an early wake.
-- Tests: the `XERK-1575:` cases in `server.test.js` and `sessions.test.js`, glasses
-  `phone/render.test.ts`, android `SessionsFlattenTest`/`AgentDecodeTest`.
+- **It reads asleep, never "killed"**: "💤 paused until 14:05 · <reason>" (web `pausedLabel`,
+  Android `core/Sessions.kt` `pausedLabel`, glasses phone `pausedLabel`), in the sleeping
+  label's muted tone, with no "ended N ago" beside it. Resume on its row is an early wake.
+- **It is never hidden in the collapsed Ended history.** The Sessions list gives paused
+  sleepers their own always-open **Paused** section above Ended, soonest wake first (web
+  `isPausedEntry` → `#paused`, Android `pausedEnded`, glasses `Paused` section).
+- **The dashboard keeps its card.** The host card's repo grid shows a `pausedCard` (Android
+  `PausedCard`) beside the running ones, and the Running-sessions tile and host meta say
+  "· N paused" (`pausedSleepers`; Android `FleetSummary.paused`). It holds no slot, so it
+  is never in the running count — but a session must not vanish there as if killed.
+- Tests: the `XERK-1575:` cases in `server.test.js`, `sessions.test.js` and
+  `dashboard-tiles.test.js`, glasses `phone/render.test.ts`, android
+  `SessionsFlattenTest`/`AgentDecodeTest`/`FleetTest`.

@@ -141,6 +141,22 @@ fun clockTime(ms: Long, now: Long = System.currentTimeMillis()): String {
     return if (days > 0) "$time\u00a0+${days}d" else time
 }
 
+/**
+ * A sleeper the hub paused to free its slot (XERK-1575): a killed record whose
+ * `paused` carries a wake. Web `isPausedEntry` (sessions.html) / `pausedSleepers`
+ * (index.html).
+ */
+fun isPausedSleeper(c: com.xerktech.turma.model.ClosedSessionInfo): Boolean = (c.paused?.wakeAt ?: 0L) > 0L
+
+/** A host's paused sleepers, soonest wake first — web index.html `pausedSleepers`. */
+fun pausedSleepers(a: AgentInfo): List<com.xerktech.turma.model.ClosedSessionInfo> =
+    a.closedSessions.filter(::isPausedSleeper).sortedBy { it.paused?.wakeAt ?: 0L }
+
+/** "💤 paused until 14:05 · reason" — web `pausedLabel` (index.html, sessions.html). */
+fun pausedLabel(p: com.xerktech.turma.model.PausedSleep, now: Long = System.currentTimeMillis()): String =
+    "💤 paused until " + clockTime(p.wakeAt, now) +
+        p.wakeReason.trim().let { if (it.isNotEmpty()) " · $it" else "" }
+
 private fun localMidnight(ms: Long): Long = java.util.Calendar.getInstance().apply {
     timeInMillis = ms
     set(java.util.Calendar.HOUR_OF_DAY, 0)

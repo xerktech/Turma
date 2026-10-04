@@ -166,4 +166,20 @@ class FleetTest {
         val b = agent("old") // pre-capacity agent, no ceiling reported
         assertEquals(4, fleetSummary(listOf(a, b)).maxSessions)
     }
+
+    // XERK-1575: a sleeper the hub paused for its slot is counted as paused beside
+    // the running count (index.html `pausedCount`), and listed soonest wake first.
+    @Test fun `paused sleepers are counted and ordered by wake`() {
+        val late = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "late", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 2_000L))
+        val early = com.xerktech.turma.model.ClosedSessionInfo(
+            id = "early", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 1_000L))
+        val kill = com.xerktech.turma.model.ClosedSessionInfo(id = "kill")
+        val a = agent("h1", sessions = listOf(session("running"))).copy(closedSessions = listOf(late, kill, early))
+        assertEquals(listOf("early", "late"), pausedSleepers(a).map { it.id })
+        val s = fleetSummary(listOf(a, agent("h2")))
+        assertEquals(2, s.paused)
+        assertEquals(1, s.running)
+        assertEquals(0, fleetSummary(listOf(agent("h2"))).paused)
+    }
 }

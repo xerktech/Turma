@@ -255,8 +255,7 @@ fun queuedReasonText(reason: String): String = when (reason) {
 fun endedStateText(e: EndedSession, now: Long = System.currentTimeMillis()): String = when {
     // A sleeper paused for its slot (XERK-1575) wakes on its own: web `pausedLabel`.
     e.kind == EndedKind.CLOSED && e.paused != null && e.paused.wakeAt > 0 ->
-        "💤 paused until " + com.xerktech.turma.core.clockTime(e.paused.wakeAt, now) +
-            e.paused.wakeReason.trim().let { if (it.isNotEmpty()) " · $it" else "" }
+        com.xerktech.turma.core.pausedLabel(e.paused, now)
     e.kind == EndedKind.CLOSED -> "killed"
     // A resumable row is a bare transcript: nothing recorded WHY it ended, only
     // that it did, so it says the one thing that's true of all of them.
@@ -555,7 +554,11 @@ fun SessionsListPane(
     val groups = remember(lists, now) { rankRunning(lists.running, now) }
     val (review, active, idle) = groups
     val queued = lists.queued
-    val ended = lists.ended
+    // Paused sleepers (XERK-1575) wake on their own, so they get their own
+    // always-open section above the collapsed Ended history, soonest wake first
+    // (web sessions.html `$paused`); Ended keeps the rest.
+    val pausedRows = remember(lists) { pausedEnded(lists.ended) }
+    val ended = remember(lists) { lists.ended.filterNot(::isPausedEnded) }
     var endedOpen by rememberSaveable { mutableStateOf(false) }
     // A filtered Ended list is a search RESULT, so searching opens the section —
     // a match hiding behind a collapsed header reads as "nothing matched". Only
@@ -585,7 +588,7 @@ fun SessionsListPane(
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             val anyRows = lists.running.isNotEmpty() || queued.isNotEmpty()
-            if (!anyRows && ended.isEmpty()) {
+            if (!anyRows && ended.isEmpty() && pausedRows.isEmpty()) {
                 item {
                     Text(
                         when {
@@ -635,7 +638,7 @@ fun SessionsListPane(
             // Active: sessions still working. The header shows even when empty, so
             // "nothing active right now" reads as a state rather than a missing
             // section — matching the web sidebar.
-            if (anyRows || ended.isNotEmpty()) {
+            if (anyRows || ended.isNotEmpty() || pausedRows.isNotEmpty()) {
                 item(key = "active-header") { SectionLabel("Active (${active.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
                 if (active.isEmpty()) {
                     item(key = "active-empty") {
@@ -677,6 +680,21 @@ fun SessionsListPane(
                         onRename = { name -> vm.setSummary(r.flat.host, r.flat.session.id, name) },
                         onMove = { target -> vm.migrate(r.flat.host, r.flat.session.id, target) },
                         onClick = { onSelect(r.flat.host, r.flat.session.id) },
+                    )
+                }
+            }
+            // Paused: sleepers the hub paused for queued work (XERK-1575). Never
+            // collapsed — each resumes on its own at its wake — and the same row
+            // as Ended, whose Resume brings one back early.
+            if (pausedRows.isNotEmpty()) {
+                item(key = "paused-header") { SectionLabel("Paused (${pausedRows.size})", Modifier.padding(top = 6.dp, bottom = 2.dp)) }
+                items(pausedRows, key = { "paused:" + it.host + "/" + it.id }) { e ->
+                    EndedSessionRow(
+                        e, now,
+                        tint = hostTint[e.host],
+                        selected = selectedKey == e.host + "/" + e.transcriptId,
+                        onOpen = { onSelectEnded(e.host, e.transcriptId) },
+                        onResume = { resumeEnded(vm, e); onSelect(e.host, e.id) },
                     )
                 }
             }
@@ -786,6 +804,13 @@ fun SessionsListPane(
         )
     }
 }
+
+/** An Ended row that is a paused sleeper (XERK-1575) — web sessions.html `isPausedEntry`. */
+fun isPausedEnded(e: EndedSession): Boolean = e.kind == EndedKind.CLOSED && (e.paused?.wakeAt ?: 0L) > 0L
+
+/** The Paused section's rows, soonest wake first (web sessions.html `$paused`). */
+fun pausedEnded(ended: List<EndedSession>): List<EndedSession> =
+    ended.filter(::isPausedEnded).sortedWith(compareBy({ it.paused?.wakeAt ?: 0L }, { it.id }))
 
 fun closedName(c: ClosedSessionInfo): String =
     c.summary.ifBlank { c.label.ifBlank { c.branch.ifBlank { c.id.take(6) } } }

@@ -179,6 +179,7 @@ fun FleetScreen(
                         onOpenSession = onOpenChat,
                         onSessionActions = { host, s -> actionsFor = host to s },
                         onCancelQueued = { host, s -> vm.kill(host, s.id) },
+                        onResumePaused = { host, c -> vm.resume(host, c.id) },
                     )
                 }
             }
@@ -278,6 +279,7 @@ private fun HostSection(
     onOpenSession: (String, String) -> Unit,
     onSessionActions: (String, SessionInfo) -> Unit,
     onCancelQueued: (String, SessionInfo) -> Unit,
+    onResumePaused: (String, com.xerktech.turma.model.ClosedSessionInfo) -> Unit = { _, _ -> },
 ) {
     TurmaCard(Modifier.fillMaxWidth(), tint = orgTint) {
         Column(Modifier.fillMaxWidth()) {
@@ -360,10 +362,14 @@ private fun HostSection(
             AnimatedVisibility(expanded) {
                 Column(Modifier.fillMaxWidth().padding(bottom = 4.dp)) {
                     CloneBar(agent, onClone = { repo, source -> onClone(agent.key, repo, source) })
+                    // Sleepers the hub paused for their slot (XERK-1575) keep a card
+                    // in their repo — they resume on their own at their wake.
+                    val pausedAll = com.xerktech.turma.core.pausedSleepers(agent)
                     for (repo in agent.repos) {
                         val sessions = agent.sessions.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
+                        val paused = pausedAll.filter { if (repo.root) it.root else (!it.root && it.repo == repo.name) }
                         RepoSection(
-                            repo = repo, sessions = sessions, now = now, hostLastSeen = agent.lastSeen,
+                            repo = repo, sessions = sessions, paused = paused, now = now, hostLastSeen = agent.lastSeen,
                             hostKey = agent.key, pending = pending,
                             onComposeSpawn = { onComposeSpawn(agent.key, repo.name, repo.root) },
                             onResume = { onResume(agent.key, repo) },
@@ -371,6 +377,8 @@ private fun HostSection(
                             onOpenSession = { s -> onOpenSession(agent.key, s.id) },
                             onSessionActions = { s -> onSessionActions(agent.key, s) },
                             onCancelQueued = { s -> onCancelQueued(agent.key, s) },
+                            onResumePaused = { c -> onResumePaused(agent.key, c) },
+                            hostOnline = agent.online,
                         )
                     }
                 }
@@ -393,6 +401,9 @@ private fun RepoSection(
     onOpenSession: (SessionInfo) -> Unit,
     onSessionActions: (SessionInfo) -> Unit,
     onCancelQueued: (SessionInfo) -> Unit,
+    paused: List<com.xerktech.turma.model.ClosedSessionInfo> = emptyList(),
+    onResumePaused: (com.xerktech.turma.model.ClosedSessionInfo) -> Unit = {},
+    hostOnline: Boolean = true,
 ) {
     Column(Modifier.fillMaxWidth().padding(horizontal = 10.dp)) {
         Row(
@@ -423,6 +434,76 @@ private fun RepoSection(
                     onActions = { onSessionActions(s) },
                     onCancelQueued = { onCancelQueued(s) },
                 )
+            }
+            for (c in paused) {
+                PausedCard(
+                    c, now,
+                    pendingKind = FleetViewModel.sessPending(pending, hostKey, c.id),
+                    canResume = hostOnline,
+                    onResume = { onResumePaused(c) },
+                )
+            }
+        }
+    }
+}
+
+/**
+ * A sleeper the hub paused to free its slot (XERK-1575) — web index.html
+ * `pausedCard`. Ended for now, but resumed by the hub at its wake, so it keeps a
+ * card in its repo, reading asleep (the HOLDING dot and muted label a sleeping
+ * session has) rather than vanishing as if killed. Its one action resumes it early.
+ */
+@Composable
+private fun PausedCard(
+    c: com.xerktech.turma.model.ClosedSessionInfo,
+    now: Long,
+    pendingKind: String?,
+    canResume: Boolean,
+    onResume: () -> Unit,
+) {
+    val muted = MaterialTheme.colorScheme.onSurfaceVariant
+    val p = c.paused ?: return
+    TurmaCard(Modifier.fillMaxWidth()) {
+        Row(
+            Modifier.fillMaxWidth().padding(start = 10.dp, end = 4.dp, top = 6.dp, bottom = 6.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            StateDot(LiveState.HOLDING)
+            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                    Text(
+                        closedName(c),
+                        fontWeight = FontWeight.SemiBold,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.weight(1f, fill = false),
+                    )
+                    Pill("paused", dashed = true)
+                }
+                Text(
+                    c.id + if (c.root) " · repos root (no worktree)" else "",
+                    style = MaterialTheme.typography.bodySmall,
+                    fontFamily = FontFamily.Monospace,
+                    color = muted,
+                    maxLines = 1,
+                )
+                Text(
+                    com.xerktech.turma.core.pausedLabel(p, now),
+                    style = MaterialTheme.typography.bodySmall,
+                    fontStyle = androidx.compose.ui.text.font.FontStyle.Italic,
+                    color = muted,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                if (c.prs.isNotEmpty()) {
+                    Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) { c.prs.forEach { PrBadge(it) } }
+                }
+            }
+            if (pendingKind != null) {
+                Text("Resuming…", style = MaterialTheme.typography.labelMedium, color = muted, modifier = Modifier.padding(end = 6.dp))
+            } else if (canResume) {
+                GhostButton("Resume now", onResume)
             }
         }
     }
@@ -724,7 +805,7 @@ private fun FleetTiles(s: FleetSummary) {
             s.devices.joinToString(", ").ifBlank { "no devices yet" }, tileMod)
         SummaryTile("Running sessions",
             if (s.maxSessions != null) "${s.running} / ${s.maxSessions}" else s.running.toString(),
-            "${s.totalSessions} total", tileMod)
+            "${s.totalSessions} total" + if (s.paused > 0) " · ${s.paused} paused" else "", tileMod)
         // The needs-you count (XERK-1571), worded as the Sessions screen's section
         // that lists exactly those sessions.
         SummaryTile("Ready for review", s.waiting.toString(), "sessions waiting on you", tileMod)

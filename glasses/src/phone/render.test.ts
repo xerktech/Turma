@@ -208,6 +208,12 @@ describe("phone render", () => {
     const nap = html.slice(html.indexOf("napping one"), html.indexOf("killed one"));
     expect(nap).toContain(`<span class="ph-state st-holding">paused until ${clockTime(wakeAt, now)} · check CI</span>`);
     expect(html.slice(html.indexOf("killed one"))).not.toContain("paused until");
+    // Its own Paused section above Ended, never inside the capped Ended list.
+    const pausedAt = html.indexOf(`<div class="ph-section-label">Paused <span class="ph-count">1</span></div>`);
+    const endedAt = html.indexOf(`<div class="ph-section-label">Ended <span class="ph-count">1</span></div>`);
+    expect(pausedAt).toBeGreaterThanOrEqual(0);
+    expect(endedAt).toBeGreaterThan(html.indexOf("napping one"));
+    expect(pausedAt).toBeLessThan(html.indexOf("napping one"));
     expect(pausedLabel({ paused: { wakeAt: "soon" } } as never)).toBeNull();
   });
 
