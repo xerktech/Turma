@@ -24,6 +24,7 @@ import re
 import shlex
 import socket
 import subprocess
+import atexit
 import shutil
 import signal
 import socket
@@ -47,6 +48,21 @@ spec = importlib.util.spec_from_file_location("hub_agent", MODULE_PATH)
 ha = importlib.util.module_from_spec(spec)
 sys.modules["hub_agent"] = ha
 spec.loader.exec_module(ha)
+# Every module path under the host's REAL ~/.turma, re-pointed at a throwaway dir
+# for the whole suite. ManagerMixin patches its own per-test copies, but a test
+# that builds a bare SessionManager() (TestDshWeb, TestDshLivenessSeam, ...)
+# would otherwise read and WRITE the live agent's state: on an agent host it
+# rewrote usage-baseline.json with this shell's hostname as the device, so the
+# manager's next restart read it as a rename and cut its countFrom to that
+# moment, dropping every earlier token from its usage report (XERK-1286).
+_LIVE_REGISTRY_DIR = ha.REGISTRY_DIR
+_SUITE_REGISTRY_DIR = tempfile.mkdtemp(prefix="hub-agent-tests-")
+for _name, _value in list(vars(ha).items()):
+    if _name.isupper() and isinstance(_value, str) and (
+            _value == _LIVE_REGISTRY_DIR
+            or _value.startswith(_LIVE_REGISTRY_DIR + os.sep)):
+        setattr(ha, _name, _SUITE_REGISTRY_DIR + _value[len(_LIVE_REGISTRY_DIR):])
+atexit.register(shutil.rmtree, _SUITE_REGISTRY_DIR, ignore_errors=True)
 # The real run(), before ManagerMixin fakes it — for the tests that need git.
 _ORIG_RUN = ha.run
 
@@ -40431,6 +40447,22 @@ class TestAttentionHints(ManagerMixin, unittest.TestCase):
         self.assertEqual((opened["kind"], closed["via"]), ("ask-in-chat", "turma"))
         self.assertEqual(self.sm._perm_ask_pending, {})
 
+class TestSuiteNeverTouchesTheLiveRegistry(unittest.TestCase):
+    """The redirect at import (XERK-1286): nothing under the host's real
+    ~/.turma is reachable from the module this suite drives."""
+
+    def test_no_module_path_points_at_the_live_registry(self):
+        live = [n for n, v in vars(ha).items()
+                if n.isupper() and isinstance(v, str)
+                and (v == _LIVE_REGISTRY_DIR
+                     or v.startswith(_LIVE_REGISTRY_DIR + os.sep))]
+        self.assertEqual(live, [])
+
+    def test_a_bare_manager_saves_its_baseline_off_host(self):
+        sm = ha.SessionManager()
+        self.assertTrue(ha.USAGE_BASELINE_PATH.startswith(_SUITE_REGISTRY_DIR))
+        self.assertEqual(sm.usage_baseline["device"], sm.device)
+        self.assertTrue(os.path.exists(ha.USAGE_BASELINE_PATH))
 
 if __name__ == "__main__":
     unittest.main()
