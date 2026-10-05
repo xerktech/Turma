@@ -1414,7 +1414,11 @@ class TestScriptChannels(unittest.TestCase):
                     # ...nested, piped inside, or behind a substituted shell name,
                     f"cat <(cat <(echo {R})) | bash", f"cat <(echo {R} | cat) | bash",
                     f'bash -c ". <(cat <(echo {R}))"', f'$(echo bash) -c ". <(echo {R})"',
-                    f"bash < <(cat <(echo {R}))",
+                    f"bash < <(cat <(echo {R}))", f"cat <(echo {R}; true) | bash",
+                    f"bash < <(echo hi; echo {R})", f"cat <(eval echo {R}) | bash",
+                    f"cat <(bash -c 'echo {R}') | bash",
+                    # ...an ANSI-C string behind an escaped BACKSLASH, still live,
+                    f"bash -c \\\\$'{R}'", f"eval \\\\$'{R}'", f"echo \\\\$'{R}' | bash",
                     # ...an escaped ANSI-C string the inner shell decodes,
                     f'bash -c ". <(echo \\$\'{R}\')"', f'bash -c "eval \\$\'{R}\'"',
                     # ...and `-c --`, where bash drops the `--` and runs the next word.
@@ -1426,6 +1430,8 @@ class TestScriptChannels(unittest.TestCase):
         self.assertAllowed('bash -c "source <(kubectl completion bash); kubectl get po"')
         self.assertAllowed('cat <(echo "rm -rf build") | wc -l')
         self.assertAllowed('bash -c -- "echo hi"')
+        self.assertAllowed('cat <(echo hello; true) | grep h')
+        self.assertAllowed('while read l; do echo $l; done < <(git ls-files; echo x)')
 
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R

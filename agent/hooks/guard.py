@@ -760,10 +760,11 @@ def _spend(added: int) -> None:
 # `rm -rf /etc`.
 
 _IFS_RE = re.compile(r"\$\{IFS\}|\$IFS")
-# Not after a backslash: `"\$'…'"` is a literal `$` to this parse and an
-# ANSI-C string only to a shell that re-parses it (`bash -c`); decoding it here
-# ate the `$` that re-parse needs (XERK-1611).
-_ANSI_C_RE = re.compile(r"(?<!\\)\$'((?:[^'\\]|\\.)*)'")
+# With the backslash run before it: after an ODD run (`"\$'…'"`) the `$` is
+# literal to this parse and the string ANSI-C only to a shell that re-parses it
+# (`bash -c`), so decoding it here ate the `$` that re-parse needs. After an
+# EVEN run (`\\$'…'`) it is still a live ANSI-C string (XERK-1611).
+_ANSI_C_RE = re.compile(r"(?<!\\)(\\*)\$'((?:[^'\\]|\\.)*)'")
 # A `{…}` word; it expands only when a `,` follows its first character. Testing
 # that in the regex (`[^{}\s]+,[^{}\s]*`) backtracked over every comma of an
 # unclosed `{a,a,…`: quadratic, and a hook that times out runs the command
@@ -869,8 +870,10 @@ def _decode_ansi_c(command: str) -> str:
     """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token."""
 
     def rep(m: "re.Match[str]") -> str:
+        if len(m.group(1)) % 2:
+            return m.group(0)
         try:
-            return shlex.quote(m.group(1).encode().decode("unicode_escape"))
+            return m.group(1) + shlex.quote(m.group(2).encode().decode("unicode_escape"))
         except (UnicodeDecodeError, UnicodeEncodeError):
             return m.group(0)
 
@@ -1744,17 +1747,28 @@ def _proc_subst_texts(body: str, depth: int = 0) -> list[str]:
     stage of it prints and what each `<(…)` inside it does, since `cat`, `tee`
     and the like pass those through — `<(cat <(echo …))`, `<(echo … | cat)`
     (XERK-1611). Over-reads on purpose: a reader fed too much fails closed."""
+    segments = _split_segments(_unwrap_group(body))
     printed = _body_printed(body, _SPLICE_RAW[0])[0]
-    if printed is not None:
+    # One echo/printf prints its words; `echo …; true` does not print `; true`.
+    if printed is not None and len(segments) == 1:
         return [printed]
     if depth >= _MAX_EXPAND_DEPTH:
         return []
     out = []
-    for seg in _split_segments(_unwrap_group(body)):
-        out.append(_printed_text(_sub_substs(_unwrap_group(seg), _subst_text)) or "")
+    for seg in segments:
+        seg = _unwrap_group(seg)
+        out.append(_printed_text(_sub_substs(seg, _subst_text)) or "")
         for m in _find_substs(seg):
             if m.group(0).startswith("<("):
                 out.extend(_proc_subst_texts(_subst_inner(m), depth + 1))
+        # ...and what an `eval` or a `sh -c` in it prints: `<(eval echo …)`.
+        words = _strip_prefixes(_tokenize(seg))
+        if len(words) > 1 and _basename(words[0]) == "eval":
+            out.extend(_proc_subst_texts(" ".join(words[1:]), depth + 1))
+        elif words and _basename(words[0]) in _SHELL_PROGS:
+            script = _shell_c_script(words[1:])
+            if script:
+                out.extend(_proc_subst_texts(script, depth + 1))
     return [t for t in out if t.strip()]
 
 
@@ -1762,7 +1776,12 @@ def _reads_stdin_script(stage: str) -> bool:
     """Whether the command in ``stage`` runs its stdin (or an inherited fd) as
     a SCRIPT: a shell with no `-c` and no script file (`… | sh`, `bash -s`,
     `sh <<< '…'`), or `source`/`.` of such a path (`. <(echo …)`)."""
-    tokens = _strip_prefixes(_tokenize(_sub_substs(stage, _proc_subst_path)))
+    text = _sub_substs(stage, _proc_subst_path)
+    # A `<(` left is one the (not paren-aware) split cut off from its `)`:
+    # `bash < <(echo hi; echo …)` reaches here as `bash < <(echo hi`.
+    if "<(" in text:
+        text = text[:text.index("<(")] + "/dev/fd/63"
+    tokens = _strip_prefixes(_tokenize(text))
     # `sh<<<'…'` tokenises as one word; the program is the part before it.
     if tokens and "<" in tokens[0] and not tokens[0].startswith("<"):
         head, _, tail = tokens[0].partition("<")
@@ -2039,6 +2058,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # the line has none — a line of 1000 `bash <<EOF` heredocs otherwise paid
     # for it (the body is a script by the heredoc path above, not this one).
     feeds_a_shell = "|" in command or "<<<" in command or "<(" in command
+    # A `<(…)` operand is a FILE its stage reads, and `cat`, `tee`, `head` and
+    # the like pass a file through: `cat <(echo <cmd>) | bash` runs <cmd>
+    # (XERK-1611). Fed to EVERY reader on the line, whatever the program and
+    # wherever the reader sits — failing closed — since the splits below are
+    # not paren-aware and cut at a `|` or `;` inside one (`<(echo …; true)`).
+    proc_subst_texts = [text for m in _find_substs(command) if m.group(0).startswith("<(")
+                        for text in _proc_subst_texts(_subst_inner(m))] if "<(" in command else []
     for pipeline in _split_on_operators(command, include_pipe=False) if feeds_a_shell else ():
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
         # feeding it either, so skip its per-stage scan too.
@@ -2051,15 +2077,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     and len(seen_texts) < _FED_TEXT_CAP:
                 seen_texts.add(text)
                 producers.append(text)
-        # A `<(…)` operand is a FILE its stage reads, and `cat`, `tee`, `head`
-        # and the like pass a file through: `cat <(echo <cmd>) | bash` runs
-        # <cmd> (XERK-1611). Read off the whole pipeline, whatever the program
-        # and wherever the reader sits — failing closed — since the stage split
-        # below cuts at a `|` inside one (`cat <(echo … | cat) | bash`).
-        for m in _find_substs(pipeline):
-            if m.group(0).startswith("<("):
-                for text in _proc_subst_texts(_subst_inner(m)):
-                    _feed(text)
+        for text in proc_subst_texts:
+            _feed(text)
         for stage in _split_segments(pipeline):
             ustage = _unwrap_group(stage)
             if _reads_stdin_script(ustage):
