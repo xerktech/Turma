@@ -6016,6 +6016,14 @@ def git_info_cheap(cwd, strict=False):
     }
 
 
+def _peer_branch(git):
+    """The peer-roster branch cell from a session payload's `git` dict: its
+    `branch`, or None when the worktree is detached ("HEAD") or unknown. Mirrors
+    server.js `peerBranch` (XERK-1540)."""
+    branch = git.get("branch") if isinstance(git, dict) else None
+    return branch if isinstance(branch, str) and branch and branch != "HEAD" else None
+
+
 def git_info_slow(cwd):
     """Slow-changing worktree facts, cached across beats: the repo name (from the
     remote ".../xerktech/DockerOps.git" -> "DockerOps", else the checkout's dir),
@@ -21767,8 +21775,11 @@ class SessionManager:
                 self.device,
                 s.get("repo"),
                 # The branch the agent named for itself, not the record's
-                # `branch` (always None — the app owns no branch).
-                (s.get("git") or {}).get("liveBranch"),
+                # `branch` (always None — the app owns no branch). The payload's
+                # `git.branch` is `rev-parse --abbrev-ref HEAD`, so a detached
+                # worktree reads "HEAD"; `liveBranch` lives only in session_facts
+                # and never reaches the payload (XERK-1540).
+                _peer_branch(s.get("git")),
                 task,
             ))
         return rows
