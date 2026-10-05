@@ -49,6 +49,9 @@ spec = importlib.util.spec_from_file_location("hub_agent", MODULE_PATH)
 ha = importlib.util.module_from_spec(spec)
 sys.modules["hub_agent"] = ha
 spec.loader.exec_module(ha)
+# Never let a test sweep the REAL host's processes: resume_on_boot reaps
+# pre-XERK-1588 ttyds, which on a live agent host would signal real terminals.
+ha.PROC_ROOT = tempfile.mkdtemp(prefix="hub-agent-noproc-")
 # Every module path under the host's REAL ~/.turma, re-pointed at a throwaway dir
 # for the whole suite. ManagerMixin patches its own per-test copies, but a test
 # that builds a bare SessionManager() (TestDshWeb, TestDshLivenessSeam, ...)
@@ -38422,6 +38425,42 @@ class TestTtydUnixSocket(unittest.TestCase):
         srv.listen(1)
         self.assertTrue(ha._await_unix_sock(path, mock.Mock(poll=lambda: None)))
         self.assertTrue(ha._unix_sock_open(path))
+
+    def _fake_proc(self, pid, argv):
+        d = os.path.join(self.tmp, "proc", str(pid))
+        os.makedirs(d)
+        with open(os.path.join(d, "cmdline"), "wb") as f:
+            f.write(b"\0".join(a.encode() for a in argv) + b"\0")
+
+    def test_boot_sweep_finds_only_pre_fix_credential_ttyds(self):
+        # A pre-XERK-1588 ttyd orphaned by a close/relaunch that never reaped it
+        # keeps the host token on its argv forever; boot must find exactly those.
+        self._fake_proc(101, ["ttyd", "-p", "7705", "-i", "127.0.0.1", "-b", "/term/411b1",
+                              "-W", "-c", "term:tok", "tmux", "attach"])
+        self._fake_proc(102, ["/usr/bin/ttyd", "-p", "7702", "-b", "/term/63368",
+                              "-c", "term:tok", "tmux"])
+        self._fake_proc(103, ["ttyd", "-i", "/r/.turma/ttyd/7700.sock", "-b", "/term/aa",
+                              "-W", "tmux"])                       # new: no -c
+        self._fake_proc(104, ["ttyd", "-p", "9000", "-c", "user:pw", "bash"])  # not Turma's
+        self._fake_proc(105, ["bash", "-c", "term:x", "-b", "/term/x"])     # not ttyd
+        os.makedirs(os.path.join(self.tmp, "proc", "self"))
+        root = os.path.join(self.tmp, "proc")
+        self.assertEqual(sorted(ha._credential_ttyd_pids(root)), [101, 102])
+
+    def test_boot_sweep_skips_another_users_process(self):
+        self._fake_proc(201, ["ttyd", "-b", "/term/x", "-c", "term:tok"])
+        with mock.patch.object(ha.os, "geteuid", return_value=os.geteuid() + 1):
+            self.assertEqual(ha._credential_ttyd_pids(os.path.join(self.tmp, "proc")), [])
+
+    def test_resume_on_boot_reaps_credential_ttyds(self):
+        with mock.patch.object(ha, "_credential_ttyd_pids", return_value=[4493, 4552]), \
+             mock.patch.object(ha, "IS_WINDOWS", False), \
+             mock.patch.object(ha.os, "kill") as kill:
+            ha._reap_credential_ttyds()
+        self.assertEqual(kill.call_args_list,
+                         [mock.call(4493, signal.SIGTERM), mock.call(4552, signal.SIGTERM)])
+        src = inspect.getsource(ha.SessionManager.resume_on_boot)
+        self.assertIn("_reap_credential_ttyds()", src)
 
     def test_token_fp_is_short_one_way_and_never_the_token(self):
         fp = ha._token_fp("some.secret-token")
