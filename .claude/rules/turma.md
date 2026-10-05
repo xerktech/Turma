@@ -12,11 +12,11 @@ makes an `android/` change part of the same PR) live there.
 ## Shared site chrome (`turma/public/nav.js`)
 
 - One module (`nav.js`) builds the header + phone bottom-nav **identically on every page** — pages
-  hand-roll neither. Mount: `<header class="site-header" id="siteHeader" data-page="…"
-  data-sub="…">` + `<nav class="bottom-nav" id="bottomNav">` + `<script src="/nav.js">`; `data-page`
-  lights that page's tab in both navs.
-- Page content fills `#hdrSub` (static) / `#hdrMeta` (dynamic); an unfilled slot collapses. Two more
-  slots are filled by SHARED modules, not pages, and collapse when empty: `#hdrNewTicket`
+  hand-roll neither. Mount: `<header class="site-header" id="siteHeader" data-page="…">` +
+  `<nav class="bottom-nav" id="bottomNav">` + `<script src="/nav.js">`; `data-page` lights that
+  page's tab in both navs.
+- The header carries NO per-page subtitle text (removed on operator request; the active tab names
+  the page). Its only slots are filled by SHARED modules and collapse when empty: `#hdrNewTicket`
   (`newticket.js`) and `#hdrOrg` (`org.js`'s org filter).
 - Header is full-bleed; `.site-header-in` caps its row at `--wrap` and centres it so every page's
   chrome lands in the same column as page content (`sessions.html`'s `.sess-shell` too, XERK-28).

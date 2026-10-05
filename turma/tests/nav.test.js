@@ -33,27 +33,22 @@ test("nav: exactly one tab is marked active, and only the named one", () => {
   assert.equal((tabsHtml("").match(/class="active"/g) || []).length, 0);
 });
 
-test("nav: the header is identical across pages apart from the active tab and the sub slot", () => {
-  const norm = h => h.replace(/ class="active"/g, "").replace(/<span class="sub" id="hdrSub">[^<]*</, "<span class=\"sub\" id=\"hdrSub\"><");
-  const rendered = PAGES.map(p => norm(siteHeaderHtml(p.id, "whatever " + p.id)));
+test("nav: the header is identical across pages apart from the active tab", () => {
+  const rendered = PAGES.map(p => siteHeaderHtml(p.id).replace(/ class="active"/g, ""));
   for (const html of rendered) assert.equal(html, rendered[0]);
 });
 
-test("nav: the header carries both slots on every page, empty by default", () => {
-  for (const p of PAGES) {
-    const html = siteHeaderHtml(p.id, "");
-    for (const id of ["hdrSub", "hdrMeta"]) {
-      assert.match(html, new RegExp(`<span class="sub" id="${id}"></span>`),
-        `${p.id} is missing an empty #${id} slot`);
-    }
-  }
+// The header carries no per-page descriptor text — the active tab already names
+// the page, so a subtitle beside the wordmark was redundant chrome.
+test("nav: the header carries no sub-header text slot", () => {
+  for (const p of PAGES) assert.doesNotMatch(siteHeaderHtml(p.id), /class="sub"|hdrSub|hdrMeta/);
 });
 
 // The header ends at the tabs. A right-hand slot existed only to carry an
 // "updated <time>" stamp on dashboard/sessions; that was dropped, so the slot
 // would be dead DOM on all four pages.
 test("nav: the header carries no slot after the tabs", () => {
-  const html = siteHeaderHtml("dashboard", "Session hosts");
+  const html = siteHeaderHtml("dashboard");
   assert.doesNotMatch(html, /hdrStatus/);
   assert.match(html, /<\/nav>\s*<\/div>$/, "the tabs must be the last thing in the header row");
 });
@@ -64,12 +59,6 @@ test("nav: no page paints a last-refreshed stamp into the header", () => {
     assert.doesNotMatch(src, /hdrStatus/, `${f} references the removed status slot`);
     assert.doesNotMatch(src, /"updated "/, `${f} still paints an "updated <time>" stamp`);
   }
-});
-
-test("nav: the sub slot is escaped — it is page-authored text, not markup", () => {
-  const html = siteHeaderHtml("board", '<img src=x onerror="alert(1)">');
-  assert.doesNotMatch(html, /<img src=x/);
-  assert.match(html, /&lt;img src=x onerror=&quot;alert\(1\)&quot;&gt;/);
 });
 
 test("nav: the bottom nav mirrors the tab list, in order, with the same active page", () => {
@@ -83,12 +72,11 @@ test("nav: the bottom nav mirrors the tab list, in order, with the same active p
 
 test("nav: mount fills the header and bottom-nav placeholders from the header's data attrs", () => {
   const els = {
-    siteHeader: { dataset: { page: "board", sub: "Jira board" }, innerHTML: "" },
+    siteHeader: { dataset: { page: "board" }, innerHTML: "" },
     bottomNav: { innerHTML: "" },
   };
   mount({ getElementById: id => els[id] || null });
   assert.match(els.siteHeader.innerHTML, /<a href="\/board" class="active">Board<\/a>/);
-  assert.match(els.siteHeader.innerHTML, /id="hdrSub">Jira board</);
   assert.match(els.bottomNav.innerHTML, /<a href="\/board" class="active">/);
 });
 
@@ -230,18 +218,14 @@ test("nav: scroll keys with nothing focused scroll the page pane, never move foc
   assert.equal(pane.scrollTop, 700);
 });
 
-test("nav: each page declares its own sub-header text and its own tab", () => {
-  const subs = new Map();
+test("nav: each page declares its own tab and no sub-header text", () => {
   for (const f of PAGE_FILES) {
     const src = fs.readFileSync(path.join(PUBLIC, f), "utf8");
     const page = /data-page="([^"]+)"/.exec(src);
     assert.ok(page, `${f} has no data-page`);
     assert.ok(PAGES.some(p => p.id === page[1]), `${f} names an unknown page "${page[1]}"`);
-    const sub = /data-sub="([^"]*)"/.exec(src);
-    assert.ok(sub && sub[1].trim(), `${f} has no page-specific sub-header text`);
-    subs.set(f, sub[1]);
+    assert.doesNotMatch(src, /data-sub=/, `${f} still declares sub-header text`);
   }
-  assert.equal(new Set(subs.values()).size, PAGE_FILES.length, "two pages share a sub-header");
 });
 
 // --- preserveScroll: the one wrapper every recurring innerHTML repaint goes
