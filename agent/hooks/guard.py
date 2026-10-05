@@ -2775,17 +2775,30 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
 _SCRIPT_READERS = _SHELL_PROGS | {"eval", "source", "."}
 
 
+_HEREDOC_OP_RE = re.compile(r"(?<!<)<<(?!<)")
+# What ends a compound command whose redirect feeds every command in it:
+# `(…)<<EOF`, `{ …; }<<EOF`, `fi <<EOF`, `done<<EOF`, `esac <<EOF`.
+_GROUP_CLOSE_RE = re.compile(r"(?:[)}]|(?:^|[\s;&|])(?:fi|done|esac))$")
+
+
 def _ungrouped(segment: str) -> str:
     """``segment`` without the group marks a split left on it: `(bash`,
-    `(bash)`, `{ bash`. Only for asking which program it runs."""
+    `(bash)`, `{ bash`, and `(bash)<<EOF` cut at its heredoc. Only for asking
+    which program it runs."""
+    op = _HEREDOC_OP_RE.search(segment)
+    if op and segment[:op.start()].rstrip().endswith((")", "}")):
+        segment = segment[:op.start()]
     return segment.strip().lstrip("({ \t").rstrip(");} \t")
 
 
 def _heredoc_segment_program(segment: str) -> str:
     """The program a segment holding a heredoc operator runs: `bash` for
-    `bash<<EOF` (one shlex word), `(bash <<EOF`, `x=1 bash<<-EOF` and
-    `<<EOF bash`; "" when there is none."""
-    tokens = _strip_prefixes(_tokenize(_ungrouped(_SUBST_RE.sub(" ", segment))))
+    `bash<<EOF` (one shlex word), `(bash <<EOF`, `(bash)<<EOF`, `x=1
+    bash<<-EOF`, `<<EOF bash` and `x=$(bash <<EOF`; "" when there is none."""
+    # A substitution still open on this line is where the heredoc's command
+    # starts: `echo "$(bash<<EOF`, `cat <(sh <<EOF`.
+    text = re.split(r"[$<>]\(", _SUBST_RE.sub(" ", segment))[-1]
+    tokens = _strip_prefixes(_tokenize(_ungrouped(text)))
     # A redirection may come first, and its target may be a word of its own.
     while tokens and re.match(r"\d*[<>]", tokens[0]):
         tok = tokens.pop(0)
@@ -2811,10 +2824,12 @@ def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
             continue
         if _heredoc_segment_program(seg) in _SCRIPT_READERS:
             return True
-        if seg.lstrip()[:1] in ("}", ")"):
-            # The group may open lines earlier (`{` / `bash` / `} <<EOF`), and
-            # finding its `{` lost to bash's grammar elsewhere, so any reader
-            # on the whole command counts. That only ever denies more.
+        op = _HEREDOC_OP_RE.search(seg)
+        if op and _GROUP_CLOSE_RE.search(seg[:op.start()].rstrip()):
+            # A compound command's redirect feeds every reader in it, and the
+            # group may open lines earlier (`{` / `bash` / `} <<EOF`); finding
+            # its start lost to bash's grammar elsewhere, so any reader on the
+            # whole command counts. That only ever denies more.
             if commands_feed_shell():
                 return True
     # `cat <<EOF | bash`, and `| (bash)` / `| { bash; }` alike.

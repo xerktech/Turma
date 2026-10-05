@@ -1399,12 +1399,19 @@ class TestScriptChannels(unittest.TestCase):
                     f"if bash<<EOF\n{R}\nEOF\nthen :; fi", f"<<EOF bash\n{R}\nEOF",
                     f"{{ bash; }} <<EOF\n{R}\nEOF", f"( bash ) <<EOF\n{R}\nEOF",
                     f"{{\nbash\n}} <<EOF\n{R}\nEOF", f"{{ cat; sh; }} <<EOF\n{R}\nEOF",
-                    f"cat <<EOF | (bash)\n{R}\nEOF"):
+                    f"cat <<EOF | (bash)\n{R}\nEOF", f"(bash)<<EOF\n{R}\nEOF",
+                    f"(bash) <<-EOF\n{R}\nEOF", f"(echo hi; bash)<<EOF\n{R}\nEOF",
+                    f"( (bash) ) <<EOF\n{R}\nEOF", f"{{\n(bash)\n}} <<EOF\n{R}\nEOF",
+                    f"x=$(bash <<EOF\n{R}\nEOF\n)", f"echo \"$(sh<<EOF\n{R}\nEOF\n)\"",
+                    f"if true\nthen bash\nfi <<EOF\n{R}\nEOF",
+                    f"for i in 1\ndo bash\ndone<<EOF\n{R}\nEOF",
+                    f"case x in\nx) bash;;\nesac <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in (f"cat<<EOF\n{R}\nEOF", f"(cat <<EOF\n{R}\nEOF\n)",
                     f"{{ cat; }} <<EOF\n{R}\nEOF", f"{{ grep x; wc -l; }} <<EOF\n{R}\nEOF",
-                    f"cat <<EOF | (wc -l)\n{R}\nEOF"):
+                    f"cat <<EOF | (wc -l)\n{R}\nEOF", f"(cat)<<EOF\n{R}\nEOF",
+                    f"x=$(cat <<EOF\n{R}\nEOF\n)", f"for f in a\ndo cat\ndone <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
