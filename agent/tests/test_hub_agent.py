@@ -25079,6 +25079,30 @@ class TestLightBeatCost(ManagerMixin, unittest.TestCase):
             run_held_cheap_refreshes(sm, staged)
             self.assertEqual(calls, ["/x/A", "/x/A"])
 
+    def test_an_unread_repo_reports_unknown_dirt_not_clean(self):
+        """XERK-1547: before the worker's first read a repo row said "clean",
+        because the placeholder claimed dirtyFiles 0. It must say "can't tell"
+        (None) until a real read lands — and then carry that read, 0 included."""
+        sm = self.make_manager()
+        staged = hold_cheap_refreshes(self, sm)
+        with mock.patch.object(ha, "scan_repos",
+                               return_value=[{"name": "A", "path": "/x/A"}]), \
+             mock.patch.object(ha, "repo_cheap_facts",
+                               lambda path, strict=False: {"branch": "main",
+                                                           "dirtyFiles": 0}), \
+             mock.patch.object(ha, "repo_slow_facts", return_value={}), \
+             mock.patch.object(ha, "root_repo_entry",
+                               side_effect=lambda remote=None, cheap=None: {"name": "(root)"}), \
+             mock.patch.object(sm, "_root_repo_remote", return_value=""):
+            first = next(e for e in sm._sorted_repo_entries(refresh=False)
+                         if e["name"] == "A")
+            self.assertIn("dirtyFiles", first)
+            self.assertIsNone(first["dirtyFiles"])
+            run_held_cheap_refreshes(sm, staged)
+            read = next(e for e in sm._sorted_repo_entries(refresh=False)
+                        if e["name"] == "A")
+            self.assertEqual(read["dirtyFiles"], 0)
+
     def test_a_vanished_repo_drops_out_of_the_cheap_cache(self):
         sm = self.make_manager()
         sm.repo_cheap = {"/x/gone": {"branch": "main", "dirtyFiles": 0}}

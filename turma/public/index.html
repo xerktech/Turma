@@ -1760,6 +1760,13 @@ function cloneBody(a, sources, hid) {
   </div>`;
 }
 
+// A repo the agent has not read yet reports dirtyFiles null (XERK-1547): say
+// nothing rather than "clean", which only a real read of 0 may claim.
+function repoDirtyText(dirty) {
+  if (dirty == null) return "";
+  return dirty ? ` · ${dirty} dirty` : " · clean";
+}
+
 function repoBlock(a, repo, sessList, now, pausedList = []) {
   const rkey = a.key + "::" + repo.name;
   const collapsed = collapsedRepos.has(rkey);
@@ -1767,7 +1774,7 @@ function repoBlock(a, repo, sessList, now, pausedList = []) {
     ? `<span class="r-meta">runs at the repos root · spans every repo · one at a time</span>`
     : repo.missing
     ? `<span class="r-meta">repo not currently found · usage retained</span>`
-    : `<span class="r-meta"><b>${esc(repo.branch || "–")}</b>${repo.dirtyFiles ? ` · ${repo.dirtyFiles} dirty` : " · clean"}</span>`;
+    : `<span class="r-meta"><b>${esc(repo.branch || "–")}</b>${repoDirtyText(repo.dirtyFiles)}</span>`;
   // Only one root session may run at a time (they share REPOS_ROOT), so once one
   // is live the root block stops offering "+ New session".
   const rootBusy = repo.isRoot && sessList.some(s => s.status === "running");

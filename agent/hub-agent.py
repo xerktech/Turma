@@ -37583,7 +37583,10 @@ class SessionManager:
             path = r["path"]
             cheap = self._cheap_read("repo_cheap", path, repo_cheap_facts, path,
                                      refresh=not light,
-                                     default={"branch": "", "dirtyFiles": 0})
+                                     # Not read yet: dirtyFiles None ("can't
+                                     # tell"), never 0 — clients render 0 as
+                                     # "clean" (XERK-1547).
+                                     default={"branch": "", "dirtyFiles": None})
             entries.append(repo_entry(r, self._repo_slow_facts(path, refresh),
                                       cheap))
         # Drop cache entries for repos that are gone (renamed/removed).

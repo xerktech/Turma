@@ -117,3 +117,17 @@ test("another repo's prune does not touch this one", () => {
   assert.doesNotMatch(html, /Pruning…/);
   assert.doesNotMatch(html, /prune-note/);
 });
+
+// XERK-1547: the agent reports dirtyFiles null for a repo it has not read yet;
+// only a real read of 0 may say "clean".
+test("a repo row says clean only for a real read of zero dirty files", () => {
+  const { repoBlock } = loadDashboard();
+  const meta = (dirtyFiles) =>
+    repoBlock(host([]), { ...REPO, dirtyFiles }, [], Date.now()).match(/<span class="r-meta">.*?<\/span>/)[0];
+  assert.match(meta(0), / · clean/);
+  assert.match(meta(3), / · 3 dirty/);
+  for (const unknown of [null, undefined]) {
+    assert.doesNotMatch(meta(unknown), /clean|dirty/);
+    assert.match(meta(unknown), /<b>main<\/b>/);
+  }
+});
