@@ -1409,6 +1409,10 @@ class TestScriptChannels(unittest.TestCase):
                     f"{{ bash; }} 2>/dev/null <<EOF\n{R}\nEOF", f"{{ bash; }} 0<<EOF\n{R}\nEOF",
                     f"(bash)2>&1<<EOF\n{R}\nEOF", f"(bash) >/dev/null 0<<EOF\n{R}\nEOF",
                     f"( echo; bash ) 2>&1 <<EOF\n{R}\nEOF", f"{{ bash; }} &>/dev/null <<EOF\n{R}\nEOF",
+                    f"{{ bash; }} >|/tmp/x <<EOF\n{R}\nEOF", f"(bash) 2>\"/tmp/q 3\" <<EOF\n{R}\nEOF",
+                    f"(bash) 2>'q;)3' <<EOF\n{R}\nEOF", f"(bash) <<<\"a b\" <<EOF\n{R}\nEOF",
+                    f"(bash){{fd}}>/dev/null<<EOF\n{R}\nEOF", f"{{ bash; }} \\\n2>/dev/null <<EOF\n{R}\nEOF",
+                    f"true && bash 2>&1 <<EOF\n{R}\nEOF", f"true && bash >|f <<EOF\n{R}\nEOF",
                     f"{{\nbash\n}} < /dev/null <<EOF\n{R}\nEOF",
                     f"for i in 1\ndo bash\ndone 2>&1 <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
@@ -2094,6 +2098,13 @@ class TestExpansionBudget(unittest.TestCase):
         reason = guard.is_destructive(cmd)
         self.assertLess(time.monotonic() - t, 5, cmd[:80])
         return reason
+
+    def test_redirect_runs_on_a_heredoc_line_stay_linear(self):
+        # XERK-1618: stripping trailing redirects one at a time before a
+        # heredoc was quadratic; 100KB of `1<` took 973s through the hook.
+        for cmd in ("rm -rf / ; cat " + "1<" * 16000, "cat " + ">" * 32000,
+                    "1" * 32000, "(bash) " + "2>/dev/null " * 3000 + "<<EOF\nx\nEOF"):
+            self.check(cmd)
 
     def test_large_value_used_many_times_is_denied_fast(self):
         x = f"x='{self.VALUE}'; "
