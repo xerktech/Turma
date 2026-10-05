@@ -1632,6 +1632,12 @@ class TestScriptChannels(unittest.TestCase):
         self.assertEqual(guard._group_core("(a) 2>'x y' <\"p q\" >a\\ b"), "(a)")
         self.assertIsNone(guard._group_core("(a) 2>'x y"))
         self.assertEqual(guard._group_core('(a) 2>"x\\"y z"'), "(a)")
+        # The escape inside "…" skips exactly one character, and an unclosed
+        # quote reads as a plain character, never as "not a redirect".
+        self.assertEqual(guard._group_core('(a) 2>"x\\\\" 2>"y z"'), "(a)")
+        self.assertEqual(guard._group_core("(a) 2>a'b"), "(a)")
+        self.assertEqual(guard._group_core('(a) 2>a"b'), "(a)")
+        self.assertIsNone(guard._group_core("(a) 2>a'b c"))
         self.assertEqual(guard._split_segments("a |& b"), ["a", "b"])
         self.assertEqual(guard._split_on_operators("a |& b", include_pipe=False), ["a |& b"])
         self.assertEqual(guard._split_on_operators("{ a; b; } | (c; d) && e <(f; g)", groups=True),
