@@ -41425,7 +41425,7 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "git -c sequence.editor=x rebase -i", "git -c include.path=/tmp/c status",
         "git --config-env=core.pager=P log", "git config core.editor vim",
         "git config --global credential.helper store",
-        "sed '1e touch x' f", "sed -i 's/a/b/e' f", "sed -e '$e touch x' f", "gsed 's/a/b/ge' f",
+        "sed '1e touch x' f", "sed -i 's/a/b/e' f", "sed -e '$e touch x' f", "gsed 's/a/b/ge' f", "sed 's/a/b/g e' f", "sed 's|a|b|I\te' f",
         "zip -TT 'touch x' a.zip f", "zip -rTT x a.zip d", "zip --unzip-c=x -T a.zip f",
     )
 

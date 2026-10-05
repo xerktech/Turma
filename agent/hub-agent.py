@@ -13112,7 +13112,7 @@ _JUDGE_GIT_SHELL_KEY_RE = re.compile(
 # A GNU sed `e` command (`1e cmd`, `$e`, `e cmd`) or an `s///e` flag.
 _JUDGE_SED_EXEC_RE = re.compile(
     r"(?:^|[;\n{}!0-9$/,])\s*e(?:[\s;}]|$)|"
-    r"(?:^|[;\n{}!0-9$\s])s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImM0-9]*e")
+    r"(?:^|[;\n{}!0-9$\s])s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImM0-9\s]*e")
 
 
 def _judge_shell_option_reason(prog, args):
