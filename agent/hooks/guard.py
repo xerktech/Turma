@@ -2765,10 +2765,54 @@ def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
     # redirect re-reading returns `>&1` among the parts of `>&1` (XERK-1616),
     # and re-splitting it ran to the depth cap, which says "reads".
     whole = stage.strip()
-    return any(_command_reads_stdin(part, depth) if part == whole
-               else _reads_stdin_script(part, depth + 1)
-               for part in _split_on_operators(_unwrap_group(stage), keep_redirects=True,
-                                               groups=True))
+    for part in _split_on_operators(_unwrap_group(stage), keep_redirects=True, groups=True):
+        core = _group_core(part) if part == whole else part
+        if (_command_reads_stdin(part, depth) if core is None or core == whole
+                else _reads_stdin_script(core, depth + 1)):
+            return True
+    return False
+
+
+# Words that may stand before a group without being its command, and the
+# redirections that may follow one: `do (…)`, `! (…)`, `time -p { …; }`,
+# `(…) 2>&1`.
+_GROUP_LEAD_RE = re.compile(r"\A(?:(?:do|then|else|elif|if|while|until|time|!|-p)[ \t\n]+)+")
+_GROUP_TRAIL_RE = re.compile(r"(?:[ \t]+\d*(?:>>?|<|&>>?|>&|<&|>\|)[ \t]*[^\s;&|()<>]+)+[ \t]*\Z")
+
+
+def _group_core(part: str) -> str | None:
+    """The group ``part`` runs once its leading keywords and trailing
+    redirections are dropped, or None. `_unwrap_group` opens only a group that
+    IS the segment, and a group-aware split keeps `do (true; echo …)` whole,
+    so the producer inside was never read (XERK-1614)."""
+    core = _GROUP_TRAIL_RE.sub("", _GROUP_LEAD_RE.sub("", part.strip()))
+    return core if core[:1] in ("(", "{") and core[-1:] in (")", "}") else None
+
+
+def _walked_pipelines(command: str) -> list[str]:
+    """The pipelines the stdin-feed walk reads, each once: split keeping groups
+    whole, so `{ echo …; } | sh` stays one pipeline; split the plain way too, as
+    before groups were kept, so a group the scan keeps but cannot open (`do (a;
+    echo …) | sh`) hides nothing the plain split found; and the pipelines inside
+    a group that is a whole pipeline — `{ echo … | (a; bash); }` — down to
+    `_MAX_EXPAND_DEPTH` levels (XERK-1614)."""
+    out = dict.fromkeys(_split_on_operators(command, include_pipe=False, keep_redirects=True,
+                                            groups=True)
+                        + _split_on_operators(command, include_pipe=False, keep_redirects=True))
+    level = list(out)
+    for _ in range(_MAX_EXPAND_DEPTH):
+        inner = []
+        for pipeline in level:
+            core = _group_core(pipeline)
+            if core:
+                inner += [p for p in _split_on_operators(_unwrap_group(core), include_pipe=False,
+                                                         keep_redirects=True, groups=True)
+                          if p not in out]
+        if not inner:
+            break
+        out.update(dict.fromkeys(inner))
+        level = inner
+    return list(out)
 
 
 def _simple_commands(stage: str, depth: int = 0) -> list[str]:
@@ -2781,7 +2825,8 @@ def _simple_commands(stage: str, depth: int = 0) -> list[str]:
     whole = stage.strip()
     out = []
     for part in _split_on_operators(_unwrap_group(stage), keep_redirects=True, groups=True):
-        out.extend([part] if part == whole else _simple_commands(part, depth + 1))
+        core = _group_core(part) if part == whole else part
+        out.extend([part] if core is None or core == whole else _simple_commands(core, depth + 1))
     return out
 
 
@@ -3323,9 +3368,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     proc_subst_texts = list(dict.fromkeys(proc_subst_texts))[:_FED_TEXT_CAP]
     # Split keeping groups whole: a cut inside `{ echo …; }` or `X=<(a; b)`
     # severs a producer from its reader (XERK-1614).
-    for pipeline in (_split_on_operators(command, include_pipe=False, keep_redirects=True,
-                                         groups=True)
-                     if feeds_a_shell else ()):
+    # ...and ALSO split the plain way, as before groups were kept whole: a group
+    # the scan keeps whole but cannot open (`{ (a; echo …) | sh; }`, `do (…)`)
+    # hid a pipeline the plain split cut out. Reading both, the walk finds at
+    # least what it found before; identical pipelines are walked once.
+    for pipeline in (_walked_pipelines(command) if feeds_a_shell else ()):
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
         # feeding it either, so skip its per-stage scan too — unless the line
         # opened an fd it may read (`exec 3< <(…); bash <&3`).

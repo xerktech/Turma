@@ -1586,14 +1586,23 @@ class TestScriptChannels(unittest.TestCase):
                     f": ${{#x}}; x=${{y:-(}}; echo {R} | sh",
                     # A producer in a group inside a list (`_simple_commands`).
                     f"(true; (echo {R}; true)) | sh", f"{{ {{ echo {R}; }} 2>&1; true; }} | sh",
-                    f"(true; {{ echo {R}; }}) | sh"):
+                    f"(true; {{ echo {R}; }}) | sh",
+                    # A group behind a keyword or with a trailing redirect, which
+                    # a group-aware split keeps whole (QA regression: main's plain
+                    # split cut `echo …)` out of it), and pipelines inside a group.
+                    f"for i in 1; do (true; echo {R}) | sh; done", f"! (true; echo {R}) | sh",
+                    f"time (true; echo {R}) | sh", f"if true; then (true; (echo {R})) | sh; fi",
+                    f"{{ (true; echo {R}) | sh; }}", f"(echo {R}) 2>&1 | sh",
+                    f"echo {R} | time (true; bash)", f"{{ echo {R} | (true; bash); }}",
+                    f"for i in 1; do {{ true; {{ echo {R}; }}; }} | sh; done"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("echo hi |& cat", "make 2>&1 | tee log", "echo hi | bash -c 'grep h'",
                     "bash -c 'echo hi' < /dev/null", "x=$(cat <(echo hi)); echo $x",
                     "{ echo a; echo b; } | sort", "exec 3< <(echo hi); cat <&3",
                     f"cat <(echo hi) | bash -c 'echo {R} > notes'", f"echo {R} | bash -c 'wc -l'",
-                    f"(echo {R}; true) | grep rm",
+                    f"(echo {R}; true) | grep rm", "time (make) 2>&1 | tee log",
+                    "{ (true; echo hi) | sh; }", "for i in 1; do (true; echo hi) | sh; done",
                     # A redirect re-read as its own part must not loop to the
                     # depth cap, which reads as a reader (replay false deny).
                     f"git push -u origin x 2>&1 | tail -4 && cat > pr.md <<'EOF'\n| sh `{R}`\nEOF",

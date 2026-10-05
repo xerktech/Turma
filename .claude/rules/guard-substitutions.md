@@ -45,6 +45,11 @@ paths:
     re-splits without `groups`: an unclosed "group" swallowed every later pipe (a QA regression).
   - Producers are flattened by `_simple_commands` (recursive, groups on): a single plain split
     cut a deep `{ { …; }; }` apart. A `{` right after an opener counts at any depth.
+  - The walk reads pipelines from BOTH splits plus each whole-group pipeline's interior
+    (`_walked_pipelines`): a group kept whole but not opened (`do (a; echo …) | sh`) hid what
+    the plain split had cut out — a QA regression. Never walk the group split alone.
+  - `_group_core` opens a group behind keywords (`do`, `then`, `!`, `time`) or before trailing
+    redirections (`(…) 2>&1`); `_unwrap_group` opens only a group that IS the segment.
 - **`_reads_stdin_script` recurses** into a group/list and a `-c` script: `bash -c bash` and
   `(cat | bash)` read the stdin they inherit. Past `_MAX_EXPAND_DEPTH` it says "reads" (closed).
   - A part equal to its stage goes to `_command_reads_stdin`, never re-split: the redirect
