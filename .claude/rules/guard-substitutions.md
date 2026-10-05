@@ -52,16 +52,43 @@ paths:
     `for … in`/`select` word list, where the output is data. Residual (safe-direction, rollup):
     an array element `arr=($(ls; echo y))` is read as a subshell group, so its unread-leading
     output still over-denies — rare, absent from the 35k-command replay.
-  - Left opaque (as on main, documented residuals): a conditional/backgrounded/control-flow body
-    (`&&`, `||`, `&`, `if`/`while`/`case`), an assignment VALUE (stored, not run — splicing it also
+  - Left opaque (as on main, documented residuals): a backgrounded/control-flow body
+    (`&`, `if`/`while`/`case`), an assignment VALUE (stored, not run — splicing it also
     made shlex quadratic), a here-string a consuming command reads (`grep -q`/`read`), and a stdout
     redirect (`>/dev/null`, `>&2`). A filter that rewrites harmless text into a dangerous command
     (`rev`, `sed s,/x,,`) still slips: accepted.
-  - The line pass rebuilds the whole command in ONE `_sub_substs` sweep (cut bodies), so N statements
+  - A body's OWN substitutions resolve to their taint first (`_taint_nested`, XERK-1617); an
+    opaque one becomes `_UNREAD_OUTPUT`. Tokenising `echo $(cat <<< '…')` unresolved dropped the
+    inner `)` and quotes, so `$(echo $(cat <<< 'rm …'))` ran unread. A nested conditional uses
+    its every-statement-ran reading only (residual).
+  - A `&&`/`||` body may skip any statement, so its taint is a TUPLE: every suffix of its
+    statements (XERK-1617). `_taint_readings` splices each in separately, so the words after
+    the substitution follow every suffix (newline-joining them lost those args: a bypass).
+    - Past `_MAX_TAINT_STARTS` statements: the all-run reading plus one led by `_UNREAD_OUTPUT`.
+    - Accepted over-deny: any `$(lookup || echo fallback)` in program position
+      (`$(command -v gsed || echo sed) -i`, `"$(which node || echo node)" app.js`): the unread
+      lookup may lead with the fallback's text as args — indistinguishable from
+      `ls -d …/rm || echo -rf /`. Two unread branches (`$(command -v a || command -v b)`) allow.
+  - A `grep` that prints its lines is a rewriting filter too (`_greps_lines`); one with
+    `-q`/`-c`/`-l`/`-L` (or long forms) prints none of the text, so it stays unread. Options are
+    PARSED, not pattern-matched: an option's value (`-e -q`, `-elib`) or a word after `--` is a
+    pattern, and reading it as `-q` left a line-printing grep opaque.
+  - A `$((…))` runs no command, only its substitutions, whose output is an operand. Read as a
+    command, a taint reading there was an unread PROGRAM (4 replay false denies,
+    `$(( $(stat … || echo 0)/1M ))`), so BOTH taint passes skip it:
+    - the bodies loop expands the interior as `: <expr>` (`_arith_interior`);
+    - the line/segment passes leave a substitution inside `$((` opaque (`_subst_in_arith`) —
+      `N=$(( $(nproc || echo 2) ))` is read in place there. Nothing there tracks quoting, so the
+      text from `$((` to the substitution and on to `))` must be plain arithmetic
+      (`_ARITH_GAP_RE`): a quoted `$((` decoy (`echo '$((' ; $(…) ; echo '))'`) hid a deny.
+    - A printed `a[$(…)]` subscript (bash re-expands it) is still caught by the printed reading.
+  - The line pass rebuilds the whole command in ONE `_sub_substs` sweep per suffix reading, so N statements
     stay linear; the pathological-input envelope is `_statements_printed`'s, unchanged by this.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
+  `test_a_nested_or_conditional_body_runs_as_its_producers_text`,
+  `test_a_large_conditional_or_nested_taint_body_stays_fast`,
   `test_a_large_filtered_body_classifies_without_timing_out`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).
