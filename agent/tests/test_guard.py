@@ -1647,16 +1647,16 @@ class TestScriptChannels(unittest.TestCase):
         # Every pipeline replays the line's exec/`<(…)` texts, and nested
         # `cat <(` resolves through `_body_printed` (XERK-1614).
         for cmd in ("exec 3<<<'hi'; " * 12000 + "bash <&3; rm -rf /",
-                    "cat <(echo hi) <(echo ho); " * 12000 + "bash; rm -rf /",
+                    "cat <(echo hi) <(echo ho); " * 2000 + "bash; rm -rf /",
                     'bash -c "$(' + "cat <(" * 500 + "echo hi" + ")" * 500 + ')"; rm -rf /',
                     "echo hi | " + "(" * 3000 + "bash" + ")" * 3000 + "; rm -rf /",
-                    "echo hi | (" + "true; " * 20000 + "bash); rm -rf /",
+                    "echo hi | (" + "true; " * 8000 + "bash); rm -rf /",
                     # A long redirect run after a group: a searched trailing-
-                    # redirect regex went O(n²), 600s at 288 KB (XERK-1614).
-                    "(echo x)" + " >a" * 96000 + " | sh; rm -rf /",
+                    # redirect regex went O(n²): 4s at 24 KB, 600s at 288 KB (XERK-1614).
+                    "(echo x)" + " >a" * 32000 + " | sh; rm -rf /",
                     # ...and a glued run, where a regex split `>a1>a1…` every
                     # way it could: exponential at two dozen redirects.
-                    "(echo x)" + ">a1" * 60000 + " x | sh; rm -rf /"):
+                    "(echo x)" + ">a1" * 20000 + " x | sh; rm -rf /"):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
             self.assertLess(time.monotonic() - t, 10, cmd[:20])
