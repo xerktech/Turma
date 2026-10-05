@@ -560,9 +560,9 @@ def _body_printed(body: str, raw: bool, multi: bool = True) -> tuple[str | None,
     before = _SPLICES_ESCAPED[0]
     resolved = _sub_substs(body, lambda m: _subst_text(m, multi=multi))
     unwrapped = _unwrap_group(resolved)
-    if multi and _SEGMENT_SPLIT.search(unwrapped):
-        printed = _statements_printed(resolved)
-    else:
+    printed = _statements_printed(resolved) \
+        if multi and _SEGMENT_SPLIT.search(unwrapped) else None
+    if printed is None:
         printed = _printed_text(unwrapped)
     return printed, _SPLICES_ESCAPED[0] - before
 
@@ -1009,12 +1009,11 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         if value.startswith("(") and value.endswith(")"):
             # An array, `a=(rm -rf *)`: its words, which `"${a[@]}"` runs.
             value = value[1:-1].strip()
+        # ...and the value as read before XERK-1609 (see `_body_printed`),
+        # which `_substitute_vars` joins after it.
         value = _dequote_value(value)
-        vals.setdefault(m.group(1), []).append(_produced_text(value))
-        # ...and the value as read before XERK-1609 (see `_body_printed`).
-        base = _produced_text(value, multi=False)
-        if base != vals[m.group(1)][-1]:
-            vals[m.group(1)].append(base)
+        base, produced = _produced_text(value, multi=False), _produced_text(value)
+        vals.setdefault(m.group(1), []).extend([produced] if produced == base else [produced, base])
     for m in _FOR_IN_RE.finditer(command):
         words = [w for w in m.group(2).split() if w != "do"]
         if words:
@@ -2024,7 +2023,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # finding where such a body ends lost to bash's grammar twice (a stack of
     # open bodies, then a region scanner: `done=1`, `f() if …`, `${a:-${b}}`).
     # So any sign of one, anywhere, makes the whole line order-blind.
-    every_cd = _cd_targets(_sub_substs(_prenormalise(raw_commands), _subst_text), cwds)
+    every_cd = _cd_readings(_prenormalise(raw_commands), cwds)
     if every_cd != cwds and _REPLAYS_RE.search(command):
         cwds = every_cd
     bodies, suspect = _balanced_groups(raw_commands)
@@ -2071,7 +2070,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if every_cd != cwds:
             # The `cd`s written before the group are the ones it runs after.
             head = raw_commands[:max(raw_commands.find(body), 0)]
-            before = _cd_targets(_sub_substs(_prenormalise(head), _subst_text), cwds)
+            before = _cd_readings(_prenormalise(head), cwds)
         body = _substitute_vars(body, raw_vals)
         expanded.add((body, before))
         out.extend(_expand_segments(body, depth + 1, before))
@@ -2155,11 +2154,14 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 # ...and with its substitutions run: tokenising first split a
                 # nested backtick at its escaped inner opener (XERK-1605).
                 _feed(_printed_text(_sub_substs(seg, _subst_text)) or "")
+                # ...and as read before XERK-1609 (see `_body_printed`).
+                _feed(_printed_text(_sub_substs(
+                    seg, lambda m: _subst_text(m, multi=False))) or "")
                 for hs in _herestrings(seg):
                     _feed(hs)
     for raw in segments:
         if every_cd != cwds:
-            cwds = _cd_targets(_sub_substs(raw, _subst_text), cwds)
+            cwds = _cd_readings(raw, cwds)
         if suspect:
             # The group scan lost track, so a body it should have found may
             # sit here split in half (see _balanced_groups): classify the
@@ -2415,6 +2417,15 @@ _REPLAYS_RE = re.compile(
     r"\b(?:while|until|for|select|function|alias|trap|eval|coproc|BASH_EXECUTION_STRING)\b"
     r"|\(\s*\)")
 
+
+
+def _cd_readings(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
+    """`_cd_targets` of ``text`` with its substitutions read both as several
+    statements and as before XERK-1609 (see `_body_printed`): `cd "$(echo / |
+    grep /)"` names `/` only in the second."""
+    found = _cd_targets(_sub_substs(text, _subst_text), inherited)
+    base = _cd_targets(_sub_substs(text, lambda m: _subst_text(m, multi=False)), inherited)
+    return found + tuple(c for c in base if c not in found)
 
 
 def _cd_targets(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:

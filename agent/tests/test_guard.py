@@ -2313,7 +2313,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "eval \"$(true; echo '${x#a}')rm -rf /etc\"",
                     "eval \"$(true; echo '${a[@]}')rm -rf /etc\"",
                     "bash -c \"$(true; echo '${x%a}')rm -rf /etc\"",
-                    "eval \"$(true; echo '${x}\\')rm -rf /etc\""):
+                    "eval \"$(true; echo '${x}\\')rm -rf /etc\"",
+                    # ...in a pipe feeding a shell, a cd target and a value too.
+                    'echo "$(echo rm -rf /etc | grep .)" | sh',
+                    'cd "$(echo / | grep /)"; rm -rf *', "x=$(echo / | grep /); cd $x; rm -rf *",
+                    "x=$(echo /etc | grep /); rm -rf $x"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         # A body printing nothing known stays opaque, never the empty root word.
