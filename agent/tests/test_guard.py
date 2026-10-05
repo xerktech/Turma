@@ -1424,6 +1424,8 @@ class TestScriptChannels(unittest.TestCase):
                 self.assertAllowed(cmd)
         self.assertAllowed("ls >/dev/null 2>&1 &")
         self.assertAllowed("cmd 2>&1 | grep rm")
+        # An ODD run escapes the `>`: the `&` backgrounds echo, and sh reads nothing.
+        self.assertAllowed(f"echo '{R} #' {B16}\\>&1 | sh")
 
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R
