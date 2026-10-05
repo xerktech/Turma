@@ -512,7 +512,8 @@ def _statements_printed(body: str) -> str | None:
     Reading only a body that is ONE echo/printf let `$(true; echo rm -rf /etc)`
     and `$(echo rm -rf /etc | cat)` stand as the harmless placeholder while bash
     ran their output as a command (XERK-1609). Each statement's text is
-    concatenated as bash prints it (`echo -n r; echo m` is `rm`), a pipeline
+    concatenated as bash prints it — `echo -n r; echo m` is `rm`, and lines
+    stay lines, which `eval "$(echo true; echo rm …)"` runs one by one; a pipeline
     counts when every stage after its producer passes its input on, and a
     statement that prints something unknown adds nothing. A body with NO known
     printing statement stays opaque (None): `$(mktemp -d)` must not read as an
@@ -525,7 +526,7 @@ def _statements_printed(body: str) -> str | None:
         stmt = _unwrap_group(stmt).lstrip("( \t").rstrip(") \t")
         known = _stmt_printed(stmt)
         if known is not None:
-            out += known[0] + (" " if known[1] else "")
+            out += known[0] + ("\n" if known[1] else "")
         elif _strip_prefixes(_tokenize(stmt)):
             all_known = False
     out = out.strip()
@@ -538,11 +539,12 @@ def _literal(text: str) -> str:
     """``text`` escaped to read as the literal WORD bash splices in.
 
     A printed `"` closed the string around its substitution, so `echo "$(true;
-    echo '"')"; rm -rf /` read the `rm` as quoted text (XERK-1609). A shell that
+    echo '"')"; rm -rf /` read the `rm` as quoted text (XERK-1609). A printed
+    line break splits words, never commands, so it reads as a blank. A shell that
     re-parses the text (`bash -c "$(…)"`) does strip those quotes, so this is
     one reading of two, never a replacement for the plain one.
     """
-    return re.sub(r'([\\"\'`$])', r"\\\1", text)
+    return re.sub(r'([\\"\'`$])', r"\\\1", text).replace("\n", " ")
 
 
 @functools.lru_cache(maxsize=1024)
@@ -2117,9 +2119,14 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             for whole in ("$(" + body + ")", "`" + body + "`"):
                 printed_line = printed_line.replace(whole, printed)
     if printed_line != raw_commands:
+        # Its lines are commands to a shell that re-parses them, and words
+        # where the line word-splits them (`$(echo rm -rf; echo /etc)`).
         seen = set(segments)
-        segments += [seg for seg in _split_segments(_prenormalise(printed_line))
-                     if seg not in seen]
+        for line in dict.fromkeys((printed_line, printed_line.replace("\n", " "))):
+            for seg in _split_segments(_prenormalise(line)):
+                if seg not in seen:
+                    seen.add(seg)
+                    segments.append(seg)
         # Those segments run AFTER the ones they came from, so a `cd` among
         # them (`cd $(echo /; true); rm -rf *`) moves the whole line, in order
         # or not: the half-segment `cd $(echo /` named no directory.

@@ -2321,7 +2321,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # A value is read one way per pass, never both joined.
                     "x=$(echo sh; true); echo 'rm -rf /etc' | $x",
                     "x=$(echo bash | cat); echo 'rm -rf /etc' | env $x",
-                    'cd "$(echo /; echo x)"; rm -rf *', "cd $(echo /; true); rm -rf *"):
+                    'cd "$(echo /; echo x)"; rm -rf *', "cd $(echo /; true); rm -rf *",
+                    # Printed lines are lines to a shell that re-parses them.
+                    'eval "$(echo true; echo rm -rf /etc)"', 'bash -c "$(echo :; echo rm -rf /etc)"',
+                    'echo "$(echo true; echo rm -rf /etc)" | bash'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         # A body printing nothing known stays opaque, never the empty root word.
