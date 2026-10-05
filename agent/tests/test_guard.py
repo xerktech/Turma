@@ -2511,6 +2511,168 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         self.assertLess(time.time() - start, 30)
 
+    def test_a_sibling_or_an_empty_expansion_does_not_hide_the_command(self):
+        # XERK-1615: a sibling substitution printing a quote decided the one
+        # reading of the whole segment, and an expansion that may be EMPTY was
+        # read as text, though bash then runs the word after it.
+        for cmd in ('bash -c "$(echo "\'\'rm -rf /etc")" "$(echo \'"\')"',
+                    'X="$(echo \'"\')" bash -c "$(echo "\'\'rm -rf /etc")"',
+                    'eval "$(true; echo "\'\'rm -rf /etc")" "$(true; echo \'#"\')"',
+                    # Glued to word text: any unset expansion, a backslash too.
+                    "${x}\\rm -rf /etc", '"$x"\\rm -rf /etc', "$@\\rm -rf /etc",
+                    '$""rm -rf /etc', "${x#a}rm -rf /etc", "${x%a}rm -rf /etc",
+                    "${x/a/}rm -rf /etc", "${x,,}rm -rf /etc", "${a[@]}rm -rf /etc",
+                    '"${a[@]}"rm -rf /etc', "${a[0]}rm -rf /etc", "${a[*]}rm -rf /etc",
+                    "${!a@}rm -rf /etc", "${x}${y}rm -rf /etc",
+                    "eval \"$(echo '${x#a}')rm -rf /etc\"",
+                    # The whole command word: an unset name, an unknown output.
+                    "$x rm -rf /etc", '"${a[@]}" rm -rf /etc', "sudo $x rm -rf /etc",
+                    "$x $y rm -rf /etc", "$(true) rm -rf /etc", "`true` rm -rf /etc",
+                    "R=$(command -v ruff); $R rm -rf /etc", "$x format c:",
+                    'eval "$(true; echo "\\$(true) rm -rf /etc")"',
+                    # A quoted LIST expansion is no word, whatever its operator.
+                    '"${@:1}" rm -rf /etc', '"${a[@]/x}" rm -rf /etc', '"${!a[@]}" rm -rf /etc',
+                    '"${@@Q}" rm -rf /etc', '"$@""$@" rm -rf /etc', '"$@"$x rm -rf /etc',
+                    # Adjacent unknown outputs, in printed or re-parsed text too.
+                    "$(true)$(true) rm -rf /etc",
+                    'eval "$(true; echo "\\$(true)\\$(true) rm -rf /etc")"',
+                    'eval "$(true; echo "\\`true\\`\\`true\\` rm -rf /etc")"',
+                    # A double-quoted script unescapes `\$` before it re-parses.
+                    'eval "\\$x rm -rf /etc"', 'bash -c "\\$x rm -rf /etc"',
+                    'sh -c "\\$1 rm -rf /etc"', 'eval "\\"\\$@\\" rm -rf /etc"',
+                    # ...as does an unquoted heredoc fed to a shell.
+                    "bash <<EOF\n\\$x rm -rf /etc\nEOF", "cat <<EOF | sh\n\\$1 rm -rf /etc\nEOF",
+                    # ...dropping `\\` before `\\` and a newline there too.
+                    "bash <<EOF\n\\$x \\\nrm -rf /etc\nEOF",
+                    'bash <<EOF\neval "\\\\\\$x rm -rf /etc"\nEOF',
+                    'bash <<EOF\nbash -c "\\\\\\$x rm -rf /etc"\nEOF',
+                    # ...and a here-string, whose quotes bash removes.
+                    'bash <<< "\\$x rm -rf /etc"', 'sh <<< "\\$1 rm -rf /etc"',
+                    'bash <<<"\\$x rm -rf /etc"', 'cat <<< "\\$x rm -rf /etc" | bash',
+                    # ...whose `\\\\` and `\\<newline>` drop too (QA pass 4).
+                    'bash <<EOF\nx=\nbash -c "\\\\\\$x rm -rf /etc"\nEOF',
+                    "bash <<EOF\n\\$\\\nx rm -rf /etc\nEOF", "bash <<EOF\ne\\\nval \\$x rm -rf /etc\nEOF",
+                    # A `\\<newline>` is removed, never glued to the next word.
+                    "time \\\nrm -rf /etc", "sudo \\\n  rm -rf /etc", "rm \\\n-rf /etc",
+                    "$x \\\nrm -rf /etc", '"$@" \\\nrm -rf /etc', "$(true) \\\nrm -rf /etc",
+                    'bash -c "\\$x \\\nrm -rf /etc"', 'eval "\\$x \\\nrm -rf /etc"',
+                    'bash <<< "\\$x \\\nrm -rf /etc"', 'echo "\\$x \\\nrm -rf /etc" | bash',
+                    'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
+                    # ...whatever came before: a comment's apostrophe, a quote.
+                    "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',
+                    "echo \"$(echo \"it's\")\"\nx=\"\\\nrm -rf /etc\"; $x",
+                    'env X="\\"\'" \\\nrm -rf /etc',
+                    'echo "`echo "it\'s"`"\ny="time \\\nrm -rf /etc"; eval "$y"',
+                    'x="`echo "it\'s"`"; y="\\$z \\\nrm -rf /etc"; bash <<< "$y"',
+                    'echo "`echo # it\'s`"; y="time \\\nrm -rf /etc"; eval "$y"',
+                    'echo "`true # x`" "it\'s"; y="\\\nrm -rf /etc"; $y',
+                    "echo \"x\\\\`echo it's`\"\ny=\"time \\\nrm -rf /etc\"; eval \"$y\"",
+                    "x=`echo # a` \\\nrm -rf /etc", 'x=`echo # a`; y="\\\nrm -rf /etc"; $y',
+                    'echo `true # x` "it\'s"; y="time \\\nrm -rf /etc"; eval "$y"',
+                    # An unset name glued to a substitution, read before inlining.
+                    "$x$(echo rm -rf /etc)", "$x`echo rm -rf /etc`", "$x${y:-rm -rf /etc}",
+                    "time $x$(true; echo rm -rf /etc)", "$x$y$(echo rm -rf /etc)",
+                    # ...in an assigned value, before ANSI-C decoding, in a string.
+                    "a=$x$(echo rm -rf /etc); $a", "a=$x`echo rm -rf /etc`; $a",
+                    'y="rm -rf /etc"; a=$x$y; $a', "$x$'\\x65val' 'rm -rf /etc'",
+                    "$x$'bash' -c 'rm -rf /etc'", 'bash -c "$x`echo rm -rf /etc`"',
+                    # ...and in quoted or escaped text a `-c` script re-parses.
+                    "bash -c '$x$(echo rm -rf /etc)'", "sh -c '$x`echo rm -rf /etc`'",
+                    'bash -c "\\$x\\$(echo rm -rf /etc)"', "timeout 5 bash -c '$x$(echo rm -rf /etc)'",
+                    # An escaped `$` before the name is literal; the name is live.
+                    "eval \\$$x$(echo 'y rm -rf /etc')", 'bash -c "\\$$x$(echo \'y rm -rf /etc\')"',
+                    # An escaped name glued to a live output re-parses as ONE name.
+                    "eval \\$x$(echo 'y rm -rf /etc')", 'bash -c "\\$x$(echo \'y rm -rf /etc\')"',
+                    "eval \\$x`echo 'y rm -rf /etc'`",
+                    # ...in a string, and a level down, where the text alone
+                    # cannot say which level the substitution runs at.
+                    'eval "\\$x$(echo y) rm -rf /etc"', 'eval "\\$x"$(echo \'y rm -rf /etc\')',
+                    'bash -c "eval \\\\\\$x\\$(echo \'y rm -rf /etc\')"',
+                    # An escaped backtick does not close the body it sits in.
+                    'echo "`echo \\`echo "it\'s"\\``"; y="time \\\nrm -rf /etc"; eval "$y"',
+                    # Past the word cap: denied, never a partial reading.
+                    "$x " * 70 + "rm -rf /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        # A tool path before its `format` subcommand, a whole-word argument
+        # (an empty target reads as the root), a length, an ordinary idiom,
+        # and a quoted empty word, which bash runs as the command `""`.
+        for cmd in ("R=$(command -v ruff); $R format --check .",
+                    "$(command -v ruff) format --check .", 'rm -rf "$d"', "rm -rf $d",
+                    '"$PYTHON" -m pytest', "$EDITOR notes.txt", "echo ${#x}rm",
+                    'printf "%s\\n" "$(echo "x\\"y")" "$(echo "q\'")"',
+                    'echo "${x,,}" {a,b}', '"$x" rm -rf /etc', '"$*" rm -rf /etc',
+                    "echo hi $x rm -rf /etc", "sudo -u root $EDITOR notes.txt",
+                    "bash <<'EOF'\necho \\$x rm -rf /etc\nEOF",
+                    "ls \\\n  -la \\\n  /tmp", "echo 'rm -rf /etc \\\n'",
+                    "docker run \\\n  --rm \\\n  img",
+                    " ".join(f"V{i}=1" for i in range(70)) + " make test"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        # Past the cap, one reading per substitution fails closed.
+        many = 'echo ' + ' '.join(['"$(echo \'"\')"'] * (guard._MAX_DECOY_SUBSTS + 1))
+        self.assertEqual(guard.decide("Bash", {"command": many}, cwd="/tmp")[0], "deny")
+
+    def test_a_decision_past_its_deadline_denies(self):
+        # XERK-1615 QA: the growth budget counts characters, not time, and a
+        # 98 KB nested eval re-expanded per reading ran past the hook timeout,
+        # which RUNS the command. Out of time, a decision denies as too large.
+        cmd = 'eval "eval \\"echo ' + "\\$x\\$y " * 2000 + '\\""'
+        with mock.patch.object(guard, "_MAX_DECIDE_SECONDS", 0):
+            self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[:2],
+                             ("deny", guard._TOO_LARGE_REASON))
+        self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        # A POLICY deny, so no destructive-override grant lifts it.
+        with mock.patch.object(guard, "_MAX_DECIDE_SECONDS", 0):
+            self.assertEqual(guard.decide("Bash", {"command": cmd}, overrides=["eval *"],
+                                          cwd="/tmp")[::2], ("deny", "policy"))
+
+    def test_a_continuation_is_dropped_only_where_bash_drops_it(self):
+        # Outside single quotes, a live `\\<newline>` is nothing; an escaped
+        # backslash, a single-quoted one and a comment's are kept (XERK-1615).
+        j = guard._join_continuations
+        self.assertEqual(j("a \\\nb"), "a b")
+        self.assertEqual(j('a "x \\\ny"'), 'a "x y"')
+        self.assertEqual(j("a 'x \\\ny'"), "a 'x \\\ny'")
+        self.assertEqual(j("a \\\\\nb"), "a \\\\\nb")
+        self.assertEqual(j("# it's \\\nb \\\nc"), "# it's \\\nb c")
+        self.assertEqual(j("echo \"it's\" \\\nb"), "echo \"it's\" b")
+        # A substitution's body restarts quoting, a backtick's too (QA pass 6).
+        self.assertEqual(j('echo "$(echo "it\'s")" \\\nb'), 'echo "$(echo "it\'s")" b')
+        self.assertEqual(j('echo "`echo "it\'s"`" \\\nb'), 'echo "`echo "it\'s"`" b')
+        # ...and ends at the next backtick, whatever `'` or `#` is inside it.
+        self.assertEqual(j('echo "`echo # it\'s`" \\\nb'), 'echo "`echo # it\'s`" b')
+        self.assertEqual(j("echo \"x\\\\`echo it's`\" \\\nb"), "echo \"x\\\\`echo it's`\" b")
+        self.assertEqual(j("x=`echo # a` \\\nb"), "x=`echo # a` b")
+
+    def test_added_readings_are_budgeted_without_the_deadline(self):
+        # The deadline is the backstop, not the plan: past the word cap a line
+        # is too deep at once, and each added reading is charged (QA pass 3).
+        with mock.patch.object(guard, "_MAX_DECIDE_SECONDS", 10 ** 6):
+            self.assertEqual(guard._empty_program_dropped("$x " * 70 + "rm"), guard._TOO_DEEP)
+            self.assertIsNone(guard._empty_program_dropped("A=1 " * 70 + "rm"))
+            for fn, text in ((guard._unset_readings, "${x}rm -rf /tmp/a"),
+                             (guard._script_readings, "\\$x rm -rf /tmp/a"),
+                             (guard._heredoc_readings, "\\$x rm -rf /tmp/a")):
+                with self.subTest(fn=fn.__name__), \
+                        mock.patch.object(guard, "_spend") as spend:
+                    readings = fn(text)
+                    self.assertEqual(len(readings), 2 if fn is not guard._unset_readings else 1)
+                    spend.assert_called()
+
+    def test_empty_expansion_readings_stay_linear(self):
+        # XERK-1615 QA: rebuilding the text per removal and tokenising each
+        # word's prefix ran a 30 KB line past the hook timeout, which fails
+        # OPEN. Each of these took 14-130s; linear, they take well under 10s.
+        for cmd in ("echo" + " $x" * 16000, " $(true)" * 4000, "$" * 16000 + "x",
+                    "rm -rf /etc; " + "$x" * 9000, "${x}" * 10000 + "rm -rf /etc",
+                    '"$@" ' * 5000 + "echo",
+                    "$x " * 70 + "echo; rm -rf /etc"):
+            with self.subTest(cmd=cmd[:30]):
+                start = time.monotonic()
+                guard.decide("Bash", {"command": cmd}, cwd="/tmp")
+                self.assertLess(time.monotonic() - start, 10)
+
     def test_only_a_command_substitution_has_a_literal_word_reading(self):
         # A `<(…)` hands its reader a path; escaping what it prints shifted the
         # quoting of a real transcript's line and exposed quoted text (XERK-1609).

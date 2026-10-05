@@ -84,11 +84,49 @@ paths:
     - A printed `a[$(…)]` subscript (bash re-expands it) is still caught by the printed reading.
   - The line pass rebuilds the whole command in ONE `_sub_substs` sweep per suffix reading, so N statements
     stay linear; the pathological-input envelope is `_statements_printed`'s, unchanged by this.
+- **Each substitution gets its own plain reading, its siblings literal** (`_decoy_readings`,
+  XERK-1615): one reading for the whole segment let a sibling printing `"` decide it.
+  - One reading per substitution, never every combination; past `_MAX_DECOY_SUBSTS` → too deep.
+  - Each costs a whole-segment expansion, charged to the growth budget (`_spend`).
+- **An expansion that may be EMPTY is also read as empty** (`_unset_readings`, `_param_spans`).
+  - Glued to word text (a word char, `\`, another `$`) by a lexer, not a spelling list.
+  - As a whole command word of unquoted names, unknown outputs and quoted LIST expansions
+    (`$x rm`, `$(true)$(true) rm`, `"${@:2}" rm`). A quoted `"$x"` is a word (bash runs `""`);
+    a whole-word ARGUMENT is never dropped, since an empty target reads as the root.
+  - A bare name glued to another expansion is braced FIRST, everywhere (`_brace_glued_names`, at
+    `_expand`/`_prenormalise` entry, quotes and escapes included): inlining `$x$(echo rm …)`
+    read `$xrm`, a longer name that swallowed the command, at any re-parse depth.
+  - The brace is an ADDED reading (`_expand` also reads the text unbraced, `_BRACE_GLUED` off):
+    `eval "\$x$(echo y) rm …"` runs `$xy rm`; which level a substitution runs at is not in the
+    text, and every parity rule tried for it left a shape open.
+  - A name the line assigns is spliced first, never read empty. A revealed `format` counts only
+    with a drive letter: `$R format --check .` (ruff, black, cargo) is the clash.
+  - `_expand_braces` skips `${x,,}`: brace-expanding it read `${x,,}rm` as `$xrm $rm $rm`.
+  - Both passes must stay LINEAR (`test_empty_expansion_readings_stay_linear`): rebuilding the
+    text per removal, or tokenising every word's prefix, ran 30 KB past the 60s hook timeout.
+  - Past `_MAX_EMPTY_PROGRAM_WORDS` with a word dropped → too deep: a partial reading was re-read
+    64 words at a time at every depth, unbudgeted, past the hook timeout.
+  - `_script_readings` unescapes every `\$` before a parameter: shlex keeps it in `"…"`, bash
+    drops it, so `eval "\$x rm …"` reached the re-parse with a literal `$x`. Every text fed to
+    a stdin shell (here-string, producer) gets it too; a shell-fed UNQUOTED heredoc gets bash's
+    own heredoc unescape (`_heredoc_readings`: `\` before `\`, `$`, backtick, newline).
+- **A `\<newline>` is dropped before shlex sees it** (`_join_continuations`, in the tokenizer and
+  `_var_values`), outside single quotes, as bash does. shlex glued the newline to the NEXT word,
+  so `time \<newline>rm -rf /etc` read as program `\nrm`.
+  - It reads `_quote_states`, which restarts quoting inside `$(…)` AND a backtick body: an own
+    scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
+  - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
+    its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
+- **A decision has a wall-clock deadline** (`_MAX_DECIDE_SECONDS`, checked in `_expand`): out of
+  time it denies as too large. The growth budget counts characters, not time; readings re-expanded
+  per eval level ran 98 KB past the 60s hook timeout, which RUNS the command.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
   `test_a_nested_or_conditional_body_runs_as_its_producers_text`,
   `test_a_large_conditional_or_nested_taint_body_stays_fast`,
   `test_a_large_filtered_body_classifies_without_timing_out`,
+  `test_a_sibling_or_an_empty_expansion_does_not_hide_the_command`,
+  `test_a_decision_past_its_deadline_denies`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).
