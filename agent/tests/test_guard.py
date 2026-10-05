@@ -1495,7 +1495,13 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <<EOF | $SHELL\n{R}\nEOF", f"/bin/ba?h <<EOF\n{R}\nEOF",
                     f"/usr/bin/da*h <<EOF\n{R}\nEOF", f"(X=')' /bin/bas[h])<<EOF\n{R}\nEOF",
                     f"(X=')' $'bas\\x68')<<EOF\n{R}\nEOF", f"cat <<EOF | /bin/ba?h\n{R}\nEOF",
-                    f"f() {{ bash; }}; cat <<EOF | f\n{R}\nEOF", "coproc rm -rf /"):
+                    f"f() {{ bash; }}; cat <<EOF | f\n{R}\nEOF", "coproc rm -rf /",
+                    # Bash globs, which Python's fnmatch reads differently.
+                    f"/bin/ba[^x]h <<EOF\n{R}\nEOF", f"/bin/bas[[:alpha:]] <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | /bin/ba[^x]h\n{R}\nEOF",
+                    # Any word bash takes as a function name, defined lines earlier.
+                    f"f+() {{ bash; }}\nf+ <<EOF\n{R}\nEOF", f"f]() {{ bash; }}\nf] <<EOF\n{R}\nEOF",
+                    f"alias a=b 'c=bash'\nc <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # A variable this line resolves to a non-shell, a glob matching none,
@@ -2186,7 +2192,11 @@ class TestExpansionBudget(unittest.TestCase):
         for cmd in ("rm -rf / ; cat " + "1<" * 16000, "cat " + ">" * 32000,
                     "1" * 32000, "(bash) " + "2>/dev/null " * 3000 + "<<EOF\nx\nEOF",
                     "(X=" + "'a)'\"${b:-)}\"" * 3000 + " bash) <<EOF\nx\nEOF",
-                    "cat <<EOF | (" + "(" * 16000 + "\nx\nEOF"):
+                    "cat <<EOF | (" + "(" * 16000 + "\nx\nEOF",
+                    # XERK-1624 QA: the defined-name scan restarted inside a
+                    # long word; 64KB of either took 45-107s.
+                    "echo " + ":" * 32000 + "; $x <<EOF\nx\nEOF",
+                    "alias " + "a" * 32000 + "; cat <<EOF\nx\nEOF"):
             self.check(cmd)
 
     def test_large_value_used_many_times_is_denied_fast(self):

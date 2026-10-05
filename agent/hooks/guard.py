@@ -2831,15 +2831,20 @@ def _heredoc_segment_programs(segment: str):
 
 
 # A function or alias the command defines: `f() {`, `function f {`, `alias b=…`.
-_FUNC_NAME_RE = re.compile(r"(?<![\w$-])([\w.:-]+)[ \t]*\([ \t]*\)|(?<![\w.-])function[ \t]+([^\s(){};|&]+)")
-_ALIAS_RE = re.compile(r"(?<![\w.-])alias((?:[ \t]+[^\s;&|]+)+)")
+# Bash takes nearly any word as a function name (`f+`, `f]`, `f@`), so a name
+# is a whole word up to `()`. Both patterns start only at a word's start and
+# never restart inside one, so a long word costs one pass, not its square.
+_FUNC_NAME_RE = re.compile(
+    r"(?:^|(?<=[\s;&|(){}]))([^\s;&|()<>'\"`$]+)[ \t]*\([ \t]*\)"
+    r"|(?<![\w.-])function[ \t]+([^\s(){};|&]+)")
+_ALIAS_RE = re.compile(r"(?<![\w.-])alias([^;&|\n]*)")
 
 
 def _defined_names(command: str) -> frozenset[str]:
     """Names ``command`` defines as a function or alias, which can run a shell."""
     names = {a or b for a, b in _FUNC_NAME_RE.findall(command)}
     for words in _ALIAS_RE.findall(command):
-        names.update(m.group(1) for m in re.finditer(r"['\"]?([^\s='\"]+)=", words))
+        names.update(w.split("=", 1)[0].strip("'\"") for w in words.split() if "=" in w)
     return frozenset(n.lower() for n in names)
 
 
@@ -2862,8 +2867,14 @@ def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
     name = _basename(word)
     if name in _SCRIPT_READERS or name in defined:
         return True
-    return bool(_GLOB_CHARS.search(name)) and any(
-        fnmatch.fnmatchcase(shell, name) for shell in _SCRIPT_READERS)
+    if not _GLOB_CHARS.search(name):
+        return False
+    # Python's fnmatch is not bash's glob: it reads `[^x]` as a literal `^`
+    # and has no `[[:alpha:]]` class. Negate as bash does; fail closed on a class.
+    if "[:" in name:
+        return True
+    pattern = name.replace("[^", "[!")
+    return any(fnmatch.fnmatchcase(shell, pattern) for shell in _SCRIPT_READERS)
 
 
 def _stage_may_read_stdin(stage: str, vals: dict[str, list[str]],
