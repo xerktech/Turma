@@ -484,6 +484,48 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
     return _OPAQUE_SUBST
 
 
+
+def _sub_substs(text: str, repl) -> str:
+    """`_SUBST_RE.sub(repl, text)`, reading an ESCAPED substitution
+    (`\\$(…)`, `` \\`…\\` ``) as the parse it sits in does: literal text.
+
+    Substituting it left its backslash to escape whatever came next, so
+    `"\\"\\$(true)\\""` closed the string early and the rest of it was read
+    as commands (XERK-1543). The escape holds for ONE parse — `bash -c "rm -rf
+    \\$(echo /etc)"` runs it at the next — so a skip also asks `_expand_both`
+    for its every-expansion-live reading, which reads the text as that next
+    parse would: escaped openers and backticks unescaped, then substituted.
+    Its body is classified as if it ran either way, by the caller's own pass
+    over every match.
+    """
+    if _SPLICE_RAW[0]:
+        return _SUBST_RE.sub(repl, _SUBST_ESCAPE_RE.sub("", text))
+    out: list[str] = []
+    last = 0
+    for m in _SUBST_RE.finditer(text):
+        k = m.start()
+        while k > 0 and text[k - 1] == "\\":
+            k -= 1
+        if (m.start() - k) % 2:
+            _SPLICES_ESCAPED[0] += 1
+            continue
+        out.append(text[last:m.start()])
+        out.append(repl(m))
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
+
+
+# The backslashes before a backtick or `$(`. The raw reading drops them all,
+# so a substitution escaped for ANY re-parse depth reads as live
+# (`bash -c "bash -c \"\\\`…\\\`\""`); one that was only ever literal
+# then classifies more, never less.
+# Anchored to the START of a run (the lookbehind) so each run is tried once:
+# unanchored, a long run with no opener after it was O(n²) — past the hook
+# timeout, which fails OPEN.
+_SUBST_ESCAPE_RE = re.compile(r"(?<!\\)\\+(?=`|\$\()")
+
+
 # How deep the expansion recurses before giving up. Exhausting it DENIES
 # (`_TOO_DEEP`): a group body is only reachable by recursing, so returning
 # nothing let `(true; (true; … rm -rf /))` seven deep through (XERK-1083).
@@ -1728,7 +1770,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # finding where such a body ends lost to bash's grammar twice (a stack of
     # open bodies, then a region scanner: `done=1`, `f() if …`, `${a:-${b}}`).
     # So any sign of one, anywhere, makes the whole line order-blind.
-    every_cd = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(raw_commands)), cwds)
+    every_cd = _cd_targets(_sub_substs(_prenormalise(raw_commands), _subst_text), cwds)
     if every_cd != cwds and _REPLAYS_RE.search(command):
         cwds = every_cd
     bodies, suspect = _balanced_groups(raw_commands)
@@ -1771,7 +1813,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if every_cd != cwds:
             # The `cd`s written before the group are the ones it runs after.
             head = raw_commands[:max(raw_commands.find(body), 0)]
-            before = _cd_targets(_SUBST_RE.sub(_subst_text, _prenormalise(head)), cwds)
+            before = _cd_targets(_sub_substs(_prenormalise(head), _subst_text), cwds)
         out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, before))
     command = _prenormalise(raw_commands)
     segments = _split_segments(command)
@@ -1834,7 +1876,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     _feed(hs)
     for raw in segments:
         if every_cd != cwds:
-            cwds = _cd_targets(_SUBST_RE.sub(_subst_text, raw), cwds)
+            cwds = _cd_targets(_sub_substs(raw, _subst_text), cwds)
         if suspect:
             # The group scan lost track, so a body it should have found may
             # sit here split in half (see _balanced_groups): classify the
@@ -1849,9 +1891,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # A substitution also CONTRIBUTES text where it sits — `$(echo …)` is
         # what `eval "$(echo rm -rf /etc)"` runs and what `rm -rf $(echo /etc)`
         # deletes. Both fall out of substituting rather than erasing.
-        seg = _unwrap_group(_SUBST_RE.sub(_subst_text, raw))
+        seg = _unwrap_group(_sub_substs(raw, _subst_text))
         # ...and one that printed nothing leaves the word it is glued to.
-        bare = _unwrap_group(_SUBST_RE.sub(lambda m: _subst_text(m, glued_empty=True), raw))
+        bare = _unwrap_group(_sub_substs(raw, lambda m: _subst_text(m, glued_empty=True)))
         if bare != seg and bare:
             out.extend(_expand_segments(bare, depth + 1, cwds))
         # An `eval`'s words joined as eval re-parses them, read off the RAW
@@ -3703,7 +3745,8 @@ def _destructive_database(command: str) -> str | None:
         if owner in judged or not _DB_DESTRUCTION.search(body):
             continue
         judged.add(owner)
-        for tokens, _seg, *_flags in _expand_segments(owner):
+        # Both readings: an escaped `\$(…)` program is live once `bash -c` re-parses.
+        for tokens, _seg, *_flags in _expand_both(owner):
             if _stage_executes_sql(tokens):
                 return "refusing database/schema destruction (DROP DATABASE/TABLE)"
     return None

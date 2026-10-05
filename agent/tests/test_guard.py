@@ -1492,6 +1492,48 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         self.assertAllowed("eval echo 'rm -rf /etc'")
         self.assertAllowed("echo '$(' rm -rf / ')'")
 
+    def test_an_escaped_substitution_keeps_the_string_closed(self):
+        # XERK-1543: substituting `\$(true)` left its backslash to escape the
+        # next `\"`, which closed the string; its quoted tail read as commands.
+        for payload in ("rm -rf /", "cd /tmp && gh pr create -t x -b junk"):
+            for subst in ("\\$(true)", "\\`true\\`"):
+                cmd = f"python3 -c \"x='\\\"{subst}\\\"','{payload}'\""
+                with self.subTest(cmd=cmd):
+                    self.assertAllowed(cmd)
+                    self.assertIsNone(guard.pr_summary_reason(cmd, "/tmp"), cmd)
+        # Text after the string still runs, and a shell re-parsing the string
+        # one escape level down runs the substitution.
+        for cmd in ('echo "\\"\\$(true)\\"" ; rm -rf /',
+                    'bash -c "rm -rf \\$(echo /etc)"',
+                    'eval "rm -rf \\$(echo /etc)"',
+                    'bash -c "x=\\"\\$(true)\\"; rm -rf /"',
+                    'echo "\\$(rm -rf /)"'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # An escaped backtick pair inside a re-parsed string is a live
+        # substitution at the next parse; reading `rm\` off its escaped
+        # closer glued the program to its flags (`rm -rf` as one word).
+        for cmd in ('bash -c "\\`printf rm\\` -rf /"',
+                    'sh -c "\\`echo rm\\` -rf /etc"',
+                    'sh -c "\\`echo rm -rf /etc\\`"',
+                    'eval "\\`printf rm\\` -rf /"',
+                    # ...at any re-parse depth.
+                    'bash -c "bash -c \\"\\\\\\`echo rm -rf /\\\\\\`\\""',
+                    'sh -c "sh -c \\"\\\\\\`printf rm\\\\\\` -rf /\\""',
+                    # A heredoc's owner is read both ways too.
+                    'bash -c "\\$(echo psql)" <<EOF\nDROP DATABASE prod;\nEOF',
+                    'eval "\\$(echo mysql) -u root" <<EOF\nDROP TABLE users;\nEOF'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed('bash -c "echo \\`date\\`"')
+
+    def test_the_escaped_reading_is_linear_in_backslashes(self):
+        # Any `\$(` triggers the raw reading; its unescape was O(n²) over a
+        # long backslash run, and a hook past its timeout fails OPEN.
+        started = time.monotonic()
+        self.assertDenied("echo \"\\$(x)\"; : '" + "\\" * 200_000 + "'; rm -rf /")
+        self.assertLess(time.monotonic() - started, 5)
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):

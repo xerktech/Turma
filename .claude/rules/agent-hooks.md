@@ -222,6 +222,12 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     runs the rest; a subshell's `)#` read as text only classifies more.
   - **An opaque substitution glued to a word is also read as EMPTY** (`glued_empty`): `$(true)rm`
     runs `rm`. A standalone one stays the placeholder — an empty word reads as the root.
+  - **An escaped substitution is literal where it sits** (`_sub_substs`, XERK-1543): replacing
+    `\$(…)` left its `\` to escape the next `\"`, closing the string and running its tail.
+    - The skip triggers `_expand_both`'s raw reading, which unescapes `\$(`/`` \` `` first
+      (the next parse's view: `bash -c "\`printf rm\` -rf /"`). Never skip without it.
+    - Accepted cost: 1 of 34.6k replayed commands (an `ssh '… sh -c "…\$(…)…"'` beside
+      python parens) now misreads into `_TOO_DEEP`. Nested backticks: XERK-1605.
   - **A variable a producer filled holds that producer's OUTPUT** (XERK-1549): an assignment
     value is read whole (quoted runs, nested `$(…)`), and `printf -v x FMT ARGS` binds the
     rendered text (`_render_printf`: escapes, `\c`, precision, width, `*`, `%b`, `%c`; out of
