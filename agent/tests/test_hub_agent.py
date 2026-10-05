@@ -38443,6 +38443,10 @@ class TestTtydUnixSocket(unittest.TestCase):
                               "-W", "tmux"])                       # new: no -c
         self._fake_proc(104, ["ttyd", "-p", "9000", "-c", "user:pw", "bash"])  # not Turma's
         self._fake_proc(105, ["bash", "-c", "term:x", "-b", "/term/x"])     # not ttyd
+        # Each half of the match pinned on its own:
+        self._fake_proc(106, ["ttyd", "-b", "/term/x", "-c", "user:pw"])    # not term:
+        self._fake_proc(107, ["ttyd", "-W", "-c", "term:x", "bash"])         # no /term/
+        self._fake_proc(108, ["ttyd", "-b", "/terminal", "-c", "term:x"])   # not /term/
         os.makedirs(os.path.join(self.tmp, "proc", "self"))
         root = os.path.join(self.tmp, "proc")
         self.assertEqual(sorted(ha._credential_ttyd_pids(root)), [101, 102])
