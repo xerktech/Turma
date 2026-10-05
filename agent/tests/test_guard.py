@@ -2316,6 +2316,68 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         "t=\\$(ffprobe \\\"\\$f\\\"); n=\\$((n+1)); done; echo \\$n\"'",
     ]
 
+    def test_a_multi_statement_body_prints_the_command(self):
+        # XERK-1609: what such a body PRINTS was never read, so its output ran
+        # as a command behind the opaque placeholder.
+        for cmd in ("$(true; echo rm -rf /etc)", "$(echo rm -rf /etc;)",
+                    "$(echo rm -rf /etc | cat)", "$( (echo rm -rf /etc); )",
+                    "$( { echo rm -rf /etc; } )", "$( (echo rm -rf; echo /etc) )",
+                    "$(ls; echo rm -rf /etc)", "`true; echo rm -rf /etc`",
+                    "rm -rf $(true; echo /etc)", 'rm -rf "$(echo /etc | tee x)"',
+                    'bash -c "\\$(true; echo rm -rf /etc)"',
+                    # The substitution read in place, not only the split line:
+                    "x=$(true; echo rm -rf /etc); $x", "sh -c '$(true; echo rm -rf /etc)'",
+                    "bash -c '`true; echo rm -rf /etc`'",
+                    # Output runs across statements, and through filters.
+                    "$(echo -n r; echo m -rf /etc)", "$(printf r; echo m -rf /etc)",
+                    "$(echo rm -rf /etc | head -1)",
+                    # A printed quote is literal text, never a closing quote.
+                    "echo \"$(true; echo '\"')\"; rm -rf /etc",
+                    "echo \"$(echo '\"')\" && rm -rf /etc",
+                    # ...yet a shell re-parsing it strips the quotes it prints.
+                    "bash -c \"$(echo \"''rm -rf /etc\")\"",
+                    "bash -c \"$(true; echo \"''rm -rf /etc\")\"",
+                    "x=$(true; echo \"''rm -rf /etc\"); eval \"$x\"",
+                    # An unset variable glued to a word leaves that word.
+                    "${x}rm -rf /etc", '"$x"rm -rf /etc', '$x""rm -rf /etc', "$@rm -rf /etc",
+                    "eval \"$(true; echo '${x}')rm -rf /etc\"",
+                    # ...and the reading from before several statements were
+                    # read is kept: its opaque body was denied (QA pass 4).
+                    "eval \"$(true; echo '${x#a}')rm -rf /etc\"",
+                    "eval \"$(true; echo '${a[@]}')rm -rf /etc\"",
+                    "bash -c \"$(true; echo '${x%a}')rm -rf /etc\"",
+                    "eval \"$(true; echo '${x}\\')rm -rf /etc\"",
+                    # ...in a pipe feeding a shell, a cd target and a value too.
+                    'echo "$(echo rm -rf /etc | grep .)" | sh',
+                    'cd "$(echo / | grep /)"; rm -rf *', "x=$(echo / | grep /); cd $x; rm -rf *",
+                    "x=$(echo /etc | grep /); rm -rf $x",
+                    # A value is read one way per pass, never both joined.
+                    "x=$(echo sh; true); echo 'rm -rf /etc' | $x",
+                    "x=$(echo bash | cat); echo 'rm -rf /etc' | env $x",
+                    'cd "$(echo /; echo x)"; rm -rf *', "cd $(echo /; true); rm -rf *",
+                    # Printed lines are lines to a shell that re-parses them.
+                    'eval "$(echo true; echo rm -rf /etc)"', 'bash -c "$(echo :; echo rm -rf /etc)"',
+                    'echo "$(echo true; echo rm -rf /etc)" | bash',
+                    # ...and words to an unquoted `$x`, lines to `eval "$x"`.
+                    "x=$(echo -rf; echo /etc); rm $x", "x=$(echo rm; echo -rf /etc); $x",
+                    'x=$(echo true; echo rm -rf /etc); eval "$x"'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        # A body printing nothing known stays opaque, never the empty root word.
+        for cmd in ('rm -rf "$(cd x; mktemp -d)"', 'echo "$(git rev-parse HEAD; echo ok)"',
+                    "x=$(true; echo hi); echo $x", 'rm -rf "$(mktemp -d | tr -d x)"',
+                    'rm -rf "$dir"/*', "ls ${dir}/sub", "$R format --check .",
+                    'rm -rf "$repo".git', 'rm -rf ./"${name}".git'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_only_a_command_substitution_has_a_literal_word_reading(self):
+        # A `<(…)` hands its reader a path; escaping what it prints shifted the
+        # quoting of a real transcript's line and exposed quoted text (XERK-1609).
+        lit = lambda c: guard._subst_text(next(guard._SUBST_RE.finditer(c)), literal=True)
+        self.assertEqual(lit("cat <(echo '\"')"), '"')
+        self.assertEqual(lit("cat $(echo '\"')"), '\\"')
+
     def test_unclosed_group_yields_nothing(self):
         # Reading an unclosed group to the end of the line swallowed the
         # commands after it (`$R format` read as a disk format).

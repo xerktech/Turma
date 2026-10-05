@@ -375,6 +375,15 @@ def _subst_inner(m: "re.Match[str]") -> str:
 # filesystem root — refusing the standard temp-dir cleanup idiom.
 _OPAQUE_SUBST = "turma_substituted_value"
 
+# An expansion of a variable this line never set, GLUED to word text after it:
+# `${x}rm`, `"$x"rm`, `$x""rm`, `$@rm`. Unset, it is nothing, and the word is
+# that text — `${x}rm -rf /etc` runs `rm` (XERK-1609). A plain `$name` is
+# matched only before a quote, since a letter after it extends the name. Only
+# a word character is glue: `rm -rf "$dir"/*` and `"$repo".git` are paths.
+_GLUED_PARAM_RE = re.compile(
+    r"""(?:\$\{(?:[A-Za-z_]\w*|[@*0-9])\}|\$[@*0-9])(?=["']*\w)"""
+    r"""|\$[A-Za-z_]\w*(?=["']+\w)""")
+
 
 def _quote_states(command: str) -> list[str]:
     """How each character of ``command`` is quoted: `'` inside a single-quoted
@@ -469,19 +478,98 @@ _MAX_SUBST_DEPTH = 32
 _SUBST_DEPTH = [0]
 
 
+# Pipeline stages whose output is (a part of) their input, so a body
+# `echo … | head -1` still prints the producer's words.
+_PASS_THROUGH = {"cat", "tee", "head", "tail", "sort", "uniq"}
+
+
+def _passes_input(stage: str) -> bool:
+    """Whether a pipeline stage prints (part of) what it reads, not a file's."""
+    toks = _strip_prefixes(_tokenize(_unwrap_group(stage)))
+    if not toks:
+        return False
+    prog = _basename(toks[0])
+    return prog in _PASS_THROUGH and (prog != "cat" or all(t == "-" for t in toks[1:]))
+
+
+def _stmt_printed(stmt: str) -> tuple[str, bool] | None:
+    """What one statement prints and whether it ends a line, else None."""
+    stages = _split_segments(stmt)
+    if not stages or not all(_passes_input(st) for st in stages[1:]):
+        return None
+    toks = _strip_prefixes(_tokenize(_unwrap_group(stages[0])))
+    text = _printed_from_tokens(toks)
+    if text is None:
+        return None
+    if _basename(toks[0]) == "printf":
+        return text, text.endswith("\n")
+    return text, not any(re.match(r"^-[neE]*n", t) for t in toks[1:3])
+
+
+def _statements_printed(body: str) -> str | None:
+    """What a body of several statements, or a pipeline, prints.
+
+    Reading only a body that is ONE echo/printf let `$(true; echo rm -rf /etc)`
+    and `$(echo rm -rf /etc | cat)` stand as the harmless placeholder while bash
+    ran their output as a command (XERK-1609). Each statement's text is
+    concatenated as bash prints it — `echo -n r; echo m` is `rm`, and lines
+    stay lines, which `eval "$(echo true; echo rm …)"` runs one by one; a pipeline
+    counts when every stage after its producer passes its input on, and a
+    statement that prints something unknown adds nothing. A body with NO known
+    printing statement stays opaque (None): `$(mktemp -d)` must not read as an
+    empty word, which is the root.
+    """
+    out, all_known = "", True
+    for stmt in _split_on_operators(body, include_pipe=False):
+        # The splitter cuts inside a `( …; … )` / `{ …; }` group, so a
+        # statement can carry half a group's wrapper.
+        stmt = _unwrap_group(stmt).lstrip("( \t").rstrip(") \t")
+        known = _stmt_printed(stmt)
+        if known is not None:
+            out += known[0] + ("\n" if known[1] else "")
+        elif _strip_prefixes(_tokenize(stmt)):
+            all_known = False
+    out = out.strip()
+    if out:
+        return out
+    return "" if all_known else None
+
+
+def _literal(text: str) -> str:
+    """``text`` escaped to read as the literal WORD bash splices in.
+
+    A printed `"` closed the string around its substitution, so `echo "$(true;
+    echo '"')"; rm -rf /` read the `rm` as quoted text (XERK-1609). A shell that
+    re-parses the text (`bash -c "$(…)"`) does strip those quotes, so this is
+    one reading of two, never a replacement for the plain one.
+    """
+    return re.sub(r'([\\"\'`$])', r"\\\1", text)
+
+
 @functools.lru_cache(maxsize=1024)
-def _body_printed(body: str, raw: bool) -> tuple[str | None, int]:
+def _body_printed(body: str, raw: bool, multi: bool = True) -> tuple[str | None, int]:
     """`_printed_text` of a substitution body once its own substitutions are
     resolved, and the escaped ones that skipped (replayed by the caller, as
     `_memo` does). Memoised: every pass over a line re-resolves each nesting
     level beneath it, which on thousands of levels runs past the hook timeout,
-    which fails OPEN. ``raw`` is `_SPLICE_RAW`, which the resolution reads."""
+    which fails OPEN. ``raw`` is `_SPLICE_RAW`, which the resolution reads.
+
+    ``multi`` also reads a body of several statements (`_statements_printed`).
+    Without it a body is read as it was before XERK-1609, a reading callers
+    keep as well: an opaque body was denied where its printed text is not
+    (`eval "$(true; echo '${x#a}')rm …"`), so dropping it lost denies."""
     before = _SPLICES_ESCAPED[0]
-    printed = _printed_text(_unwrap_group(_sub_substs(body, _subst_text)))
+    resolved = _sub_substs(body, lambda m: _subst_text(m, multi=multi))
+    unwrapped = _unwrap_group(resolved)
+    printed = _statements_printed(resolved) \
+        if multi and _SEGMENT_SPLIT.search(unwrapped) else None
+    if printed is None:
+        printed = _printed_text(unwrapped)
     return printed, _SPLICES_ESCAPED[0] - before
 
 
-def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
+def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = False,
+                multi: bool = True) -> str:
     """What a substitution CONTRIBUTES to the command line around it.
 
     `rm -rf $(echo /etc)` deletes /etc, and erasing the substitution erased the
@@ -494,6 +582,10 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
     and `` `true`rm -rf / `` run `rm`, which the placeholder alone hid as the
     program `turma_substituted_valuerm` (XERK-1256). A standalone one stays
     opaque: an empty WORD reads as the root (see `_OPAQUE_SUBST`).
+
+    ``literal`` escapes a `$(…)`'s printed text as the WORD bash splices in; the
+    plain text is what a shell re-parsing it runs. A `<(…)` hands its reader a
+    path, so it has no word reading. ``multi`` is `_body_printed`'s.
     """
     # The body's own substitutions run first, and a subshell prints what its
     # body prints: `` `echo \\`echo …\\`` `` and `$( (echo …) )` print the
@@ -502,12 +594,12 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
         return _OPAQUE_SUBST
     _SUBST_DEPTH[0] += 1
     try:
-        printed, escaped = _body_printed(_subst_inner(m), _SPLICE_RAW[0])
+        printed, escaped = _body_printed(_subst_inner(m), _SPLICE_RAW[0], multi)
     finally:
         _SUBST_DEPTH[0] -= 1
     _SPLICES_ESCAPED[0] += escaped
     if printed is not None:
-        return printed
+        return _literal(printed) if literal and m.group(0)[0] in "$`" else printed
     if glued_empty and not _subst_standalone(m):
         return ""
     return _OPAQUE_SUBST
@@ -720,6 +812,8 @@ def _budgeted(fn):
         if _budget is not None:
             return fn(*args, **kwargs)
         _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}}
+        # Lives as long as the memo that may skip re-reading the values.
+        _VALUES_DIFFER[0] = False
         try:
             return fn(*args, **kwargs)
         finally:
@@ -732,7 +826,7 @@ def _memo(kind: str, key, fn, *args):
     """``fn(*args)``, made once per decision. A hit replays the escaping
     splices it counted, which is what makes `_expand_both` take its raw pass."""
     memo = _budget[kind]
-    key = (key, _SPLICE_RAW[0])
+    key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -924,7 +1018,21 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         if value.startswith("(") and value.endswith(")"):
             # An array, `a=(rm -rf *)`: its words, which `"${a[@]}"` runs.
             value = value[1:-1].strip()
-        vals.setdefault(m.group(1), []).append(_produced_text(_dequote_value(value)))
+        # Read as before XERK-1609 unless `_expand_both` is on its pass for
+        # several statements (see `_body_printed`). Both in one list was no
+        # good: `_substitute_vars` joins a name's values into ONE word list,
+        # and `x=$(echo sh; true); echo P | $x` read as `sh sh; true`.
+        # Its printed lines are words to `$x`, which bash word-splits; read
+        # as lines they split `rm $x` into two commands.
+        value = _dequote_value(value)
+        produced = _produced_text(value)
+        if _VALUES_MULTI[0]:
+            produced = produced.replace("\n", " ")
+        else:
+            base = _produced_text(value, multi=False)
+            _VALUES_DIFFER[0] |= produced != base
+            produced = base
+        vals.setdefault(m.group(1), []).append(produced)
     for m in _FOR_IN_RE.finditer(command):
         words = [w for w in m.group(2).split() if w != "do"]
         if words:
@@ -988,7 +1096,7 @@ def _dequote_value(value: str) -> str:
     return "".join(out)
 
 
-def _produced_text(value: str) -> str:
+def _produced_text(value: str, multi: bool = True) -> str:
     """``value`` with each substitution replaced by what it prints.
 
     The substitution's own command is classified where it sits; the variable
@@ -1003,7 +1111,7 @@ def _produced_text(value: str) -> str:
     last = 0
     for m in _find_substs(value):
         out.append(value[last:m.start()])
-        out.append(_subst_text(m))
+        out.append(_subst_text(m, multi=multi))
         last = m.end()
     out.append(value[last:])
     return "".join(out)
@@ -1263,6 +1371,10 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
 # Set while `_expand_both` takes its raw reading; counts escaping splices.
 _SPLICE_RAW = [False]
 _SPLICES_ESCAPED = [0]
+# Set while `_expand_both` reads assigned values as several statements print
+# them; and whether any value this decision read differs that way (XERK-1609).
+_VALUES_MULTI = [False]
+_VALUES_DIFFER = [False]
 
 
 def _quote_literal(value: str, state: str) -> str:
@@ -1915,7 +2027,21 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     """`_expand_segments`, and — when a spliced value needed escaping, or an
     expansion was read as escaped — again with every value spliced raw and
     every expansion live (see `_quote_literal`, `_live_dollar`). Neither
-    reading is right at every re-parse depth; together they fail closed."""
+    reading is right at every re-parse depth; together they fail closed.
+
+    Assigned values are read as before XERK-1609, and once more as several
+    statements print them when that differs (`_assigned_values`)."""
+    out = _expand_raw_too(command)
+    if _VALUES_DIFFER[0]:
+        _VALUES_MULTI[0] = True
+        try:
+            out = out + _expand_raw_too(command)
+        finally:
+            _VALUES_MULTI[0] = False
+    return out
+
+
+def _expand_raw_too(command: str) -> list[tuple[list[str], str]]:
     _SPLICES_ESCAPED[0] = 0
     out = _expand_segments(command)
     if _SPLICES_ESCAPED[0]:
@@ -1983,7 +2109,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # finding where such a body ends lost to bash's grammar twice (a stack of
     # open bodies, then a region scanner: `done=1`, `f() if …`, `${a:-${b}}`).
     # So any sign of one, anywhere, makes the whole line order-blind.
-    every_cd = _cd_targets(_sub_substs(_prenormalise(raw_commands), _subst_text), cwds)
+    every_cd = _cd_readings(_prenormalise(raw_commands), cwds)
     if every_cd != cwds and _REPLAYS_RE.search(command):
         cwds = every_cd
     bodies, suspect = _balanced_groups(raw_commands)
@@ -2030,12 +2156,41 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if every_cd != cwds:
             # The `cd`s written before the group are the ones it runs after.
             head = raw_commands[:max(raw_commands.find(body), 0)]
-            before = _cd_targets(_sub_substs(_prenormalise(head), _subst_text), cwds)
+            before = _cd_readings(_prenormalise(head), cwds)
         body = _substitute_vars(body, raw_vals)
         expanded.add((body, before))
         out.extend(_expand_segments(body, depth + 1, before))
     command = _prenormalise(raw_commands)
     segments = _split_segments(command)
+    # ...and what a substitution whose body holds an operator PRINTS is text
+    # the line runs, but segmenting cut it in half (`$(true` / `echo rm -rf
+    # /etc)`) before `_subst_text` could read it (XERK-1609). So the line is
+    # also split with each such substitution replaced by its output, adding
+    # only the segments that differ. A printed text holding a substitution is
+    # left to the bodies' own pass: re-reading it here re-expanded every level
+    # of a nest again and multiplied the cost by its depth.
+    printed_line = raw_commands
+    for body in bodies:
+        if not _SEGMENT_SPLIT.search(body):
+            continue
+        printed, escaped = _body_printed(body, _SPLICE_RAW[0])
+        _SPLICES_ESCAPED[0] += escaped
+        if printed and "$(" not in printed and "`" not in printed:
+            for whole in ("$(" + body + ")", "`" + body + "`"):
+                printed_line = printed_line.replace(whole, printed)
+    if printed_line != raw_commands:
+        # Its lines are commands to a shell that re-parses them, and words
+        # where the line word-splits them (`$(echo rm -rf; echo /etc)`).
+        seen = set(segments)
+        for line in dict.fromkeys((printed_line, printed_line.replace("\n", " "))):
+            for seg in _split_segments(_prenormalise(line)):
+                if seg not in seen:
+                    seen.add(seg)
+                    segments.append(seg)
+        # Those segments run AFTER the ones they came from, so a `cd` among
+        # them (`cd $(echo /; true); rm -rf *`) moves the whole line, in order
+        # or not: the half-segment `cd $(echo /` named no directory.
+        cwds = _cd_readings(_prenormalise(printed_line), cwds)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
@@ -2105,7 +2260,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     _feed(hs)
     for raw in segments:
         if every_cd != cwds:
-            cwds = _cd_targets(_sub_substs(raw, _subst_text), cwds)
+            cwds = _cd_readings(raw, cwds)
         if suspect:
             # The group scan lost track, so a body it should have found may
             # sit here split in half (see _balanced_groups): classify the
@@ -2125,6 +2280,20 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         bare = _unwrap_group(_sub_substs(raw, lambda m: _subst_text(m, glued_empty=True)))
         if bare != seg and bare:
             out.extend(_expand_segments(bare, depth + 1, cwds))
+        # XERK-1609's extra readings of the same segment, each only ADDED:
+        # the two above as read before several statements were (see
+        # `_body_printed`); printed text as the literal word bash splices in,
+        # so a printed `"` cannot close the string around it; and an unset
+        # variable glued to a word read as that word.
+        readings = {
+            _unwrap_group(_sub_substs(raw, lambda m: _subst_text(m, multi=False))),
+            _unwrap_group(_sub_substs(
+                raw, lambda m: _subst_text(m, glued_empty=True, multi=False))),
+            _unwrap_group(_sub_substs(raw, lambda m: _subst_text(m, literal=True))),
+            _GLUED_PARAM_RE.sub("", seg),
+        }
+        for reading in readings - {seg, bare, ""}:
+            out.extend(_expand_segments(reading, depth + 1, cwds))
         # An `eval`'s words joined as eval re-parses them, read off the RAW
         # segment (XERK-1585). The substitution pass above swallowed a QUOTED
         # `'$('` that the join makes live (`eval echo '$(' rm -rf / ')'`), and
@@ -2360,6 +2529,15 @@ _REPLAYS_RE = re.compile(
     r"\b(?:while|until|for|select|function|alias|trap|eval|coproc|BASH_EXECUTION_STRING)\b"
     r"|\(\s*\)")
 
+
+
+def _cd_readings(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
+    """`_cd_targets` of ``text`` with its substitutions read both as several
+    statements and as before XERK-1609 (see `_body_printed`): `cd "$(echo / |
+    grep /)"` names `/` only in the second."""
+    found = _cd_targets(_sub_substs(text, _subst_text), inherited)
+    base = _cd_targets(_sub_substs(text, lambda m: _subst_text(m, multi=False)), inherited)
+    return found + tuple(c for c in base if c not in found)
 
 
 def _cd_targets(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
