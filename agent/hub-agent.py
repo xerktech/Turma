@@ -3913,6 +3913,59 @@ def _ensure_ttyd_sock_dir():
         os.chmod(TTYD_SOCK_DIR, 0o700)
 
 
+# Where the boot sweep looks for processes. A module constant so the test suite
+# can point it away from the real host — a sweep there would signal live ttyds.
+PROC_ROOT = "/proc"
+
+
+def _credential_ttyd_pids(proc_root=None):
+    """This uid's ttyd processes that still carry a `-c term:<token>` credential.
+
+    Only an agent from before XERK-1588 launched those (ttyd now runs with no
+    `-c`), and a session closed or relaunched without its ttyd being reaped left
+    them running for good — the host token readable on their world-readable argv
+    and a loopback terminal open to every local uid. Matched narrowly: argv[0] is
+    ttyd, `-b /term/...` (Turma's base path) and `-c term:...`, owned by us."""
+    pids = []
+    euid = os.geteuid()
+    proc_root = proc_root or PROC_ROOT
+    try:
+        entries = os.listdir(proc_root)
+    except OSError:
+        return pids
+    for name in entries:
+        if not name.isdigit():
+            continue
+        try:
+            if os.stat(os.path.join(proc_root, name)).st_uid != euid:
+                continue
+            with open(os.path.join(proc_root, name, "cmdline"), "rb") as f:
+                argv = f.read().split(b"\0")
+        except OSError:
+            continue
+        if not argv or os.path.basename(argv[0]) != b"ttyd":
+            continue
+        pairs = list(zip(argv, argv[1:]))
+        if any(a == b"-b" and v.startswith(b"/term/") for a, v in pairs) \
+                and any(a == b"-c" and v.startswith(b"term:") for a, v in pairs):
+            pids.append(int(name))
+    return pids
+
+
+def _reap_credential_ttyds():
+    """SIGTERM every `_credential_ttyd_pids` orphan. Linux only (no ttyd on
+    Windows); best-effort, logged."""
+    if IS_WINDOWS:
+        return
+    for pid in _credential_ttyd_pids():
+        try:
+            os.kill(pid, signal.SIGTERM)
+            log(f"ttyd pid {pid}: reaped an orphan carrying the host token on its "
+                "argv (pre-XERK-1588)")
+        except OSError:
+            pass
+
+
 def _await_unix_sock(path, proc, timeout=2.0):
     """Wait for a just-launched ttyd's socket to appear. ttyd that cannot bind
     keeps running bound to nothing rather than exiting, so its pid alone proves
@@ -36477,6 +36530,10 @@ class SessionManager:
         # whole point of staging: the drain re-clones cleanly instead of
         # dead-ending. Guarded against a still-writing orphan by mtime.
         self._sweep_clone_tmp()
+        # Every running session's ttyd is on its socket by now (the loop above
+        # relaunched the old ones), so any ttyd still carrying a `-c` credential
+        # is an orphan from before XERK-1588 with the host token on its argv.
+        _reap_credential_ttyds()
         self.save()
 
     # --- command handling (heartbeat reply) -------------------------------

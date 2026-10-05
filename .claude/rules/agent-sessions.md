@@ -44,6 +44,9 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
     was a writable terminal for anyone. `tunnel-agent.js` `ttydSockPath` must name the same file.
     - A too-long socket path does NOT fail ttyd (it runs bound to nothing): length is checked and
       the socket awaited after launch. Headless `claude -p` runs take `_session_env()`.
+    - Boot reaps any of our ttyds still carrying `-c term:` (`_reap_credential_ttyds`): pre-fix
+      orphans a close/relaunch never reaped. Tests point `PROC_ROOT` at an empty dir — never scan
+      the real `/proc` from a test, it signals live terminals on an agent host.
   - A ttyd runs `tmux attach` per browser connection, so it keeps reaching the server it was
     started for: `_launch_ttyd` records `ttydTmuxSocket` and relaunches a ttyd whose socket differs
     from the session's (absent = default, i.e. a pre-XERK-1078 ttyd).
