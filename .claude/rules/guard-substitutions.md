@@ -149,6 +149,52 @@ paths:
     scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
   - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
+- **A `${…}` inside `"…"` is a quoting frame of its own** (XERK-1621, `_quote_states`'s `{"`):
+  a `"` there nests a string, never closes the outer one. Read flat, `"${y:-"it's"}"; rm …` left
+  the `'` open and hid the `rm`.
+  - The operator splitter jumps such a `${…}` whole via `_brace_end(…, quoted=True)`; a spliced
+    default there drops its own `"` delimiters (`_dq_default`), or `""it's""` reopens the quote.
+  - A `'` directly in that frame is SHELL-DEPENDENT: bash pairs it (its text still expands),
+    zsh and dash read it as a plain character. Sessions run either, so a line holding one is
+    read both ways (`_BRACE_OTHER_SHELL`, an added reading in `_expand_both`); `_closers` and
+    `_memo` key on it.
+- **`_find_substs` pairs a `)` only with a `(` quoted the same way** (`_quote_states`): blind,
+  the `)` in `"$(echo ")'")"` ended the body and its `'` hid the line. The splitter also jumps
+  a `$(…)` inside `"…"` whole. An escaped `\$(` in a string is string text end to end, so it
+  still pairs as before.
+- **A bad substitution (`${` naming no parameter) prints nothing**: `_printed_text` and
+  `_stmt_printed` read such a body as unknown, so the empty-glue reading still runs `rm`.
+  - Shells PARSE one differently (`_bad_brace`): bash nests quotes in it; dash skips its name
+    and ONE operator character, quote or not, then reads on as usual (`_dash_bad_body`:
+    `${''}'}` closes at the second `}`). The other-shell reading (`_BRACE_OTHER_SHELL`, with
+    zsh/dash's literal `'`) applies that in `_quote_states`, `_brace_end` and the splitter.
+- **The pre-XERK-1621 flat parse is kept as a reading** (`_MAIN_PARSE`): no `${…}` frames, parens
+  paired blind. Taken when the parsers can differ (`_MAIN_PARSE_SEEN`: a quote in a `${…}`, a
+  paren skipped as quoted, a quoted `$(…)` jumped, a bad `${`). Every new rule models some
+  shell, and fuzzing kept finding a malformed line one shell recovers from that the new parse
+  allowed and the old one denied; ADDED, the old denies survive. Accepted cost: ~2x on such lines.
+  - Every memo a reading feeds keys on it: `_memo`, `_closers`, and `_reading()` for
+    `_body_printed`/`_body_tainted_at`. A body memoised under one reading was replayed in another.
+  - Those lru caches are cleared when a decision's budget opens: a hit skips the SEEN side effects,
+    so a body cached by an earlier in-process decision never asked for this one's readings.
+- **A pipe-to-shell producer is also read with an unknown glued output as empty**
+  (`glued_empty`): `$(true)echo rm … | sh` runs `echo`.
+- **An assigned value's `${y:-…}` default is applied at assignment, as an ADDED value**
+  (`_assigned_values`; `y` may be set after all). It resolves OTHER names (`z=$y` chains) but
+  never a value of its own name: there `x=; x=${x-a}"rm …"; $x` (x set-empty) read as `arm …` in
+  every reading. Gating on "the line assigns the name" instead lost `x=${x:-"rm …"}`; keeping it
+  out of every resolution lost `y=${x:-"rm …"}; z=$y; $z`. It counts for the per-value readings,
+  not toward the assignment cap; those readings have their own cap (`_MAX_VALUE_PASSES`), since
+  16 names × 16 `x=${D:-…}` ran 30s at 2× readings.
+  - Past either cap `_budget["capped"]` is set, and `decide` refuses it as a POLICY deny like a
+    spent budget: before the grant AND after the policy checks, since a grantable reason found
+    first (a DB drop, a fork bomb) returns before the cap is met. Granted, the policy checks ran
+    without the per-value readings: `x=ls; <17 x=…>; x="gh pr merge 1"; $x` passed `x=ls *`. `_assign_value_end` extends a value whose
+  `${…}` closes past the regex's flat quote pairing (`x="${y:-"rm …"}"`).
+- **A name assigned more than once is also read with each value on its own** (`_picked`,
+  XERK-1621): joined, `x=a; x="rm …"; $x` ran the program `a`. Added readings, never swapped.
+  - One whole-line reading per value; more than `_MAX_VALUE_READINGS` assignments to one name
+    deny as too large. `for` list words are not counted (data, and lists run long).
 - **A decision has a wall-clock deadline** (`_MAX_DECIDE_SECONDS`, checked in `_expand`): out of
   time it denies as too large. The growth budget counts characters, not time; readings re-expanded
   per eval level ran 98 KB toward the hook timeout, which RUNS the command.
@@ -169,6 +215,7 @@ paths:
   `test_a_large_conditional_or_nested_taint_body_stays_fast`,
   `test_a_large_filtered_body_classifies_without_timing_out`,
   `test_a_sibling_or_an_empty_expansion_does_not_hide_the_command`,
+  `test_a_nested_quote_or_a_reassigned_value_does_not_hide_the_command`,
   `test_a_decision_past_its_deadline_denies`, `test_a_decision_past_the_hook_deadline_denies`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).
