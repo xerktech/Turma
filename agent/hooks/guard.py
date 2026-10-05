@@ -760,7 +760,11 @@ def _spend(added: int) -> None:
 # `rm -rf /etc`.
 
 _IFS_RE = re.compile(r"\$\{IFS\}|\$IFS")
-_ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
+# With the backslash run before it: after an ODD run (`"\$'…'"`) the `$` is
+# literal to this parse and the string ANSI-C only to a shell that re-parses it
+# (`bash -c`), so decoding it here ate the `$` that re-parse needs. After an
+# EVEN run (`\\$'…'`) it is still a live ANSI-C string (XERK-1611).
+_ANSI_C_RE = re.compile(r"(?<!\\)(\\*)\$'((?:[^'\\]|\\.)*)'")
 # A `{…}` word; it expands only when a `,` follows its first character. Testing
 # that in the regex (`[^{}\s]+,[^{}\s]*`) backtracked over every comma of an
 # unclosed `{a,a,…`: quadratic, and a hook that times out runs the command
@@ -866,8 +870,10 @@ def _decode_ansi_c(command: str) -> str:
     """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token."""
 
     def rep(m: "re.Match[str]") -> str:
+        if len(m.group(1)) % 2:
+            return m.group(0)
         try:
-            return shlex.quote(m.group(1).encode().decode("unicode_escape"))
+            return m.group(1) + shlex.quote(m.group(2).encode().decode("unicode_escape"))
         except (UnicodeDecodeError, UnicodeEncodeError):
             return m.group(0)
 
@@ -1778,11 +1784,48 @@ def _proc_subst_path(m: "re.Match[str]") -> str:
     return "/dev/fd/63" if m.group(0).startswith("<(") else _subst_text(m)
 
 
+def _proc_subst_texts(body: str, depth: int = 0) -> list[str]:
+    """Every text a `<(…)` body may print: its own echo/printf, else what each
+    stage of it prints and what each `<(…)` inside it does, since `cat`, `tee`
+    and the like pass those through — `<(cat <(echo …))`, `<(echo … | cat)`
+    (XERK-1611). Over-reads on purpose: a reader fed too much fails closed."""
+    segments = _split_segments(_unwrap_group(body))
+    printed = _body_printed(body, _SPLICE_RAW[0])[0]
+    # One echo/printf prints its words; `echo …; true` does not print `; true`.
+    if printed is not None and len(segments) == 1:
+        return [printed]
+    if depth >= _MAX_EXPAND_DEPTH:
+        return []
+    out = []
+    for seg in segments:
+        seg = _unwrap_group(seg)
+        out.append(_printed_text(_sub_substs(seg, _subst_text)) or "")
+        for m in _find_substs(seg):
+            if m.group(0).startswith("<("):
+                out.extend(_proc_subst_texts(_subst_inner(m), depth + 1))
+        # ...and what an `eval` or a `sh -c` in it prints: `<(eval echo …)`.
+        words = _strip_prefixes(_tokenize(seg))
+        if len(words) > 1 and _basename(words[0]) == "eval":
+            # bash's eval takes (and drops) `--`.
+            args = words[2:] if words[1] == "--" else words[1:]
+            out.extend(_proc_subst_texts(" ".join(args), depth + 1))
+        elif words and _basename(words[0]) in _SHELL_PROGS:
+            script = _shell_c_script(words[1:])
+            if script:
+                out.extend(_proc_subst_texts(script, depth + 1))
+    return [t for t in out if t.strip()]
+
+
 def _reads_stdin_script(stage: str) -> bool:
     """Whether the command in ``stage`` runs its stdin (or an inherited fd) as
     a SCRIPT: a shell with no `-c` and no script file (`… | sh`, `bash -s`,
     `sh <<< '…'`), or `source`/`.` of such a path (`. <(echo …)`)."""
-    tokens = _strip_prefixes(_tokenize(_sub_substs(stage, _proc_subst_path)))
+    text = _sub_substs(stage, _proc_subst_path)
+    # A `<(` left is one the (not paren-aware) split cut off from its `)`:
+    # `bash < <(echo hi; echo …)` reaches here as `bash < <(echo hi`.
+    if "<(" in text:
+        text = text[:text.index("<(")] + "/dev/fd/63"
+    tokens = _strip_prefixes(_tokenize(text))
     # `sh<<<'…'` tokenises as one word; the program is the part before it.
     if tokens and "<" in tokens[0] and not tokens[0].startswith("<"):
         head, _, tail = tokens[0].partition("<")
@@ -1888,6 +1931,18 @@ def _shell_c_index(rest: list[str]) -> int:
     return -1
 
 
+def _shell_c_script(rest: list[str]) -> str | None:
+    """The script a shell's `-c` runs, or None. Bash takes (and drops) a `--`
+    after `-c`, so `bash -c -- '<cmd>'` runs <cmd>, not `--` (XERK-1611)."""
+    i = _shell_c_index(rest)
+    if i < 0:
+        return None
+    i += 1
+    if i < len(rest) and rest[i] == "--":
+        i += 1
+    return rest[i] if i < len(rest) else None
+
+
 def _find_roots(tokens: list[str]) -> list[str]:
     """The paths a `find` invocation walks (its operands before any predicate)."""
     roots = []
@@ -1918,11 +1973,11 @@ def _script_readings(script: str) -> list[str]:
     """``script`` as a word shlex produced, and again with `\\${` unescaped.
     Inside `"…"` bash drops that backslash and shlex keeps it, so
     `bash -c "echo \\${a:-'}' #}; rm -rf /"` reached the re-parse with an
-    escaped `$` and its `#` read as a comment (XERK-1585). The token no longer
+    escaped `$` and its `#` read as a comment (XERK-1585); `\\$'…'` likewise (XERK-1611). The token no longer
     says which quoting it came from; reading both fails closed. Only `${`: an
     escaped `$(` or backtick is already classified where it sits, and
     unescaping those too nested real scripts past _MAX_EXPAND_DEPTH."""
-    plain = script.replace("\\${", "${")
+    plain = script.replace("\\${", "${").replace("\\$'", "$'")
     return [script] if plain == script else [script, plain]
 
 
@@ -2047,6 +2102,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # the line has none — a line of 1000 `bash <<EOF` heredocs otherwise paid
     # for it (the body is a script by the heredoc path above, not this one).
     feeds_a_shell = "|" in command or "<<<" in command or "<(" in command
+    # A `<(…)` operand is a FILE its stage reads, and `cat`, `tee`, `head` and
+    # the like pass a file through: `cat <(echo <cmd>) | bash` runs <cmd>
+    # (XERK-1611). Fed to EVERY reader on the line, whatever the program and
+    # wherever the reader sits — failing closed — since the splits below are
+    # not paren-aware and cut at a `|` or `;` inside one (`<(echo …; true)`).
+    proc_subst_texts = [text for m in _find_substs(command) if m.group(0).startswith("<(")
+                        for text in _proc_subst_texts(_subst_inner(m))] if "<(" in command else []
     for pipeline in (_split_on_operators(command, include_pipe=False, keep_redirects=True)
                      if feeds_a_shell else ()):
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
@@ -2060,6 +2122,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     and len(seen_texts) < _FED_TEXT_CAP:
                 seen_texts.add(text)
                 producers.append(text)
+        for text in proc_subst_texts:
+            _feed(text)
         for stage in _split_on_operators(pipeline, keep_redirects=True):
             ustage = _unwrap_group(stage)
             if _reads_stdin_script(ustage):
@@ -2067,9 +2131,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 fed.extend(_herestrings(ustage))
                 for m in _find_substs(ustage):
                     if m.group(0).startswith("<("):
-                        printed = _body_printed(_subst_inner(m), _SPLICE_RAW[0])[0]
-                        if printed:
-                            fed.append(printed)
+                        fed.extend(_proc_subst_texts(_subst_inner(m)))
                 for text in fed:
                     if text.strip():
                         out.extend(_expand_segments(text, depth + 1, every_cd))
@@ -2117,6 +2179,19 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if len(words) > 1 and _basename(words[0]) == "eval":
             for script in _script_readings(" ".join(words[1:])):
                 out.extend(_expand_segments(script, depth + 1, every_cd))
+        # `seg` ran the line's substitutions, which turned a quoted `<(…)` —
+        # literal to the outer shell — into the text it prints, so `bash -c
+        # ". <(echo <cmd>)"` reached the inner parse as `. <cmd>`, a source of a
+        # file named <cmd>. Re-read a shell's `-c` script with every `<(…)` left
+        # as written, where the inner shell sees it (XERK-1611). Before the
+        # operator split below: its `continue` skips a script holding `;`.
+        if "<(" in raw:
+            kept = _strip_prefixes(_tokenize(_unwrap_group(_sub_substs(
+                raw, lambda m: m.group(0) if m.group(0).startswith("<(") else _subst_text(m)))))
+            script = _shell_c_script(kept[1:]) if kept and _basename(kept[0]) in _SHELL_PROGS else None
+            if script and "<(" in script:
+                for reading in _script_readings(script):
+                    out.extend(_expand_segments(reading, depth + 1, every_cd))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
             if _SEGMENT_SPLIT.search(seg):
@@ -2135,10 +2210,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if joined != rest:
                     out.append(([tokens[0], *joined], seg, False, cwd))
         if prog in _SHELL_PROGS:
-            i = _shell_c_index(rest)
-            if i >= 0 and i + 1 < len(rest):
-                for script in _script_readings(rest[i + 1]):
-                    out.extend(_expand_segments(script, depth + 1, every_cd))
+            script = _shell_c_script(rest)
+            if script is not None:
+                for reading in _script_readings(script):
+                    out.extend(_expand_segments(reading, depth + 1, every_cd))
         elif prog == "eval" and rest:
             # `eval eval eval … rm -rf /etc` is valid shell. Collapse the chain
             # ITERATIVELY — recursing once per `eval` burned the depth budget,
@@ -3900,9 +3975,9 @@ def _stage_executes_sql(tokens: list[str], depth: int = 0) -> bool:
         # A shell is only an executor of whatever it is GIVEN. Concluding from
         # the shell alone denied `sh -c 'grep "DROP TABLE" schema.sql'`, which
         # runs grep. With no `-c` it reads stdin, so a pipeline into it does.
-        i = _shell_c_index(tokens[1:])
-        if i >= 0 and i + 1 < len(tokens[1:]):
-            return _stage_executes_sql(_tokenize(tokens[1:][i + 1]), depth + 1)
+        script = _shell_c_script(tokens[1:])
+        if script is not None:
+            return _stage_executes_sql(_tokenize(script), depth + 1)
         return True
     if prog in _EXEC_WRAPPERS:
         # Skip the wrapper's own options and target, then classify the command it

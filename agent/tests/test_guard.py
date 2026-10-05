@@ -1427,6 +1427,39 @@ class TestScriptChannels(unittest.TestCase):
         # An ODD run escapes the `>`: the `&` backgrounds echo, and sh reads nothing.
         self.assertAllowed(f"echo '{R} #' {B16}\\>&1 | sh")
 
+    def test_a_proc_subst_passed_through_or_sourced_in_a_c_script(self):
+        # XERK-1611: `cat <(…)` passes its file through to a shell downstream,
+        # and a quoted `<(…)` in a `-c` script is the INNER shell's to run.
+        R = self.R
+        for cmd in (f"cat <(echo {R}) | bash", f"head -n1 <(printf '{R}') | sh",
+                    f"cat <( (echo {R}) ) | sh", f'bash -c ". <(echo {R})"',
+                    f'sudo sh -c "source <(echo {R})"', f"bash -c '. <(echo {R})'",
+                    # ...in a multi-statement script, which the operator split
+                    # used to `continue` past before the shell branch,
+                    f"bash -c '. <(echo {R}); true'", f'bash -c "x=1 && . <(echo {R})"',
+                    f"bash -c 'cat <(echo {R}) | bash'",
+                    # ...nested, piped inside, or behind a substituted shell name,
+                    f"cat <(cat <(echo {R})) | bash", f"cat <(echo {R} | cat) | bash",
+                    f'bash -c ". <(cat <(echo {R}))"', f'$(echo bash) -c ". <(echo {R})"',
+                    f"bash < <(cat <(echo {R}))", f"cat <(echo {R}; true) | bash",
+                    f"bash < <(echo hi; echo {R})", f"cat <(eval echo {R}) | bash", f"bash < <(eval -- echo {R})",
+                    f"cat <(bash -c 'echo {R}') | bash",
+                    # ...an ANSI-C string behind an escaped BACKSLASH, still live,
+                    f"bash -c \\\\$'{R}'", f"eval \\\\$'{R}'", f"echo \\\\$'{R}' | bash",
+                    # ...an escaped ANSI-C string the inner shell decodes,
+                    f'bash -c ". <(echo \\$\'{R}\')"', f'bash -c "eval \\$\'{R}\'"',
+                    # ...and `-c --`, where bash drops the `--` and runs the next word.
+                    f"bash -c -- '{R}'", f"sh -c -- '. <(echo {R})'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("cat <(echo hello) | grep h")
+        self.assertAllowed('bash -c "diff <(ls a) <(ls b)"')
+        self.assertAllowed('bash -c "source <(kubectl completion bash); kubectl get po"')
+        self.assertAllowed('cat <(echo "rm -rf build") | wc -l')
+        self.assertAllowed('bash -c -- "echo hi"')
+        self.assertAllowed('cat <(echo hello; true) | grep h')
+        self.assertAllowed('while read l; do echo $l; done < <(git ls-files; echo x)')
+
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R
         for cmd in (f"eval -- '{R}'", f"eval -- eval -- '{R}'", f"builtin eval '{R}'",
