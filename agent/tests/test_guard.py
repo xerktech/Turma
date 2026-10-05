@@ -1426,6 +1426,12 @@ class TestScriptChannels(unittest.TestCase):
                     # A quoted or escaped closer before the group's own, and one after it.
                     f"(X='a)b' bash) 2>'err)' <<EOF\n{R}\nEOF", f"(X=\\)\\}} bash) 3>\\)\\}} <<EOF\n{R}\nEOF",
                     f"(X=\"${{A:-)}}\" bash) 3>')}}' <<EOF\n{R}\nEOF", f"cat <<EOF | (X=')}}' bash) 3>')}}'\n{R}\nEOF",
+                    # Literal `{`, `\\$'`, a backtick in "…", a case `)`: text a
+                    # paren-matcher would misread, so any shell named counts.
+                    f"(X={{ Y=')' bash)<<EOF\n{R}\nEOF", f"(X=\\$'a\\' Y=')' bash) <<EOF\n{R}\nEOF",
+                    f"(X=\"`echo \")\"`\" bash) 2>')' <<EOF\n{R}\nEOF",
+                    f"(X=$(case a in a) echo;; esac) bash)<<EOF\n{R}\nEOF",
+                    f"cat <<EOF | (X={{ Y=')' bash) 2>')'\n{R}\nEOF",
                     f"{{\nbash\n}} < /dev/null <<EOF\n{R}\nEOF",
                     f"for i in 1\ndo bash\ndone 2>&1 <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):

@@ -2784,58 +2784,22 @@ _SCRIPT_READERS = _SHELL_PROGS | {"eval", "source", "."}
 _GROUP_CLOSER_RE = re.compile(r"[)}]|(?<![\w.-])(?:fi|done|esac)(?![\w.-])")
 
 
-def _group_close(text: str) -> int:
-    """Index of the first `)` or `}` in ``text`` outside quotes, escapes and
-    any `(…)`, `{…}`, `$(…)` or `${…}` opened in it; -1 when there is none.
-    Linear: one pass, each character visited once."""
-    stack: list[str] = []  # '"' a double-quoted string, or an open '(' / '{'
-    i, n = 0, len(text)
-    while i < n:
-        ch = text[i]
-        if ch == "\\":
-            i += 2
-            continue
-        top = stack[-1] if stack else ""
-        if top == '"':
-            if ch == '"':
-                stack.pop()
-            elif ch == "$" and text[i + 1:i + 2] in ("(", "{"):
-                stack.append(text[i + 1])
-                i += 1
-            i += 1
-            continue
-        if ch == "'":
-            j = i + 1
-            ansi = text[i - 1:i] == "$"
-            while j < n and text[j] != "'":
-                j += 2 if ansi and text[j] == "\\" else 1
-            i = j + 1
-            continue
-        if ch == "`":
-            end = text.find("`", i + 1)
-            i = n if end < 0 else end + 1
-            continue
-        if ch in "\"({":
-            stack.append(ch)
-        elif ch in ")}":
-            if not stack:
-                return i
-            stack.pop()
-        i += 1
-    return -1
-
-
 def _ungrouped(segment: str) -> tuple[str, ...]:
-    """``segment`` without the group marks a split left on it, read several
-    ways: trimmed at its ends (`(bash`, `{ bash`, `X=$(pwd) bash)`), cut at
-    its first closer (`(bash)<<EOF`, `(bash){fd}>f`), and cut at the closer
-    found past quotes and nesting (`(X='a)' bash) 2>')' <<EOF`). The plain
-    cuts alone each lost a shape another reads; any reading counts. Only for
-    asking which program it runs."""
+    """``segment`` without the group marks a split left on it, read two ways:
+    trimmed at its ends (`(bash`, `{ bash`, `X=$(pwd) bash)`) and cut at its
+    first closer (`(bash)<<EOF`, `(bash){fd}>f`). Neither knows quoting, so
+    each alone lost a shape the other reads; either counts. Only for asking
+    which program it runs."""
     seg = segment.strip().lstrip("({ \t")
-    cuts = [i for i in (seg.find(")"), seg.find("}"), _group_close(seg)) if i >= 0]
+    cuts = [i for i in (seg.find(")"), seg.find("}")) if i >= 0]
     return tuple(dict.fromkeys([seg.rstrip(");} \t")]
                                + [seg[:i].rstrip("; \t") for i in cuts]))
+
+
+# A shell named anywhere on a line, as a word: `/bin/sh`, `X=')' bash`.
+_SHELL_WORD_RE = re.compile(
+    r"(?<![\w.-])(?:bash|sh|zsh|ksh|dash|ash|busybox|su|eval|source)(?![\w.-])"
+    r"|(?:^|(?<=[\s;&|({]))\.(?=\s)")
 
 
 def _reads_stdin_grouped(segment: str) -> bool:
@@ -2876,11 +2840,12 @@ def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
     if any("<<" in seg and not _SCRIPT_READERS.isdisjoint(_heredoc_segment_programs(seg))
            for seg in segments):
         return True
-    # A compound command's redirect feeds every reader in it, and the group
+    # A compound command's redirect feeds every command in it, and the group
     # may open lines earlier (`{` / `bash` / `} <<EOF`). Finding where it
-    # starts, or which redirects stand between its closer and `<<`, lost to
-    # bash's grammar each time, so any closer on the line and any reader on
-    # the whole command counts. That only ever denies more.
+    # starts, which redirects stand between its closer and `<<`, or which of
+    # its parens are quoted (`(X='a)' bash) 2>')' <<EOF`) lost to bash's
+    # grammar each time. So any closer on the line and any shell named on the
+    # whole command counts. That only ever denies more.
     if _GROUP_CLOSER_RE.search(owner) and commands_feed_shell():
         return True
     # `cat <<EOF | bash`, and `| (bash)` / `| { bash; }` alike.
@@ -3012,8 +2977,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
 
     def _commands_feed_shell() -> bool:
         if not line_feeds_shell:
-            line_feeds_shell.append(any(_reads_stdin_grouped(st)
-                                        for st in _split_segments(raw_commands)))
+            line_feeds_shell.append(bool(_SHELL_WORD_RE.search(raw_commands)) or any(
+                _reads_stdin_grouped(st) for st in _split_segments(raw_commands)))
         return line_feeds_shell[0]
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
