@@ -1390,6 +1390,24 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_heredoc_owner_shell_behind_a_glue_subshell_or_group(self):
+        # XERK-1618: the line's first word was the only owner checked, so each
+        # body below read as data while bash ran it.
+        R = self.R
+        for cmd in (f"bash<<EOF\n{R}\nEOF", f"x=1 sh<<-'EOF'\n{R}\nEOF",
+                    f"(bash <<EOF\n{R}\nEOF\n)", f"( ( sh<<EOF\n{R}\nEOF\n) )",
+                    f"if bash<<EOF\n{R}\nEOF\nthen :; fi", f"<<EOF bash\n{R}\nEOF",
+                    f"{{ bash; }} <<EOF\n{R}\nEOF", f"( bash ) <<EOF\n{R}\nEOF",
+                    f"{{\nbash\n}} <<EOF\n{R}\nEOF", f"{{ cat; sh; }} <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | (bash)\n{R}\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in (f"cat<<EOF\n{R}\nEOF", f"(cat <<EOF\n{R}\nEOF\n)",
+                    f"{{ cat; }} <<EOF\n{R}\nEOF", f"{{ grep x; wc -l; }} <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | (wc -l)\n{R}\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_here_strings_and_process_substitution_fed_to_a_shell(self):
         R = self.R
         for cmd in (f"sh <<< '{R}'", f"sh<<<'{R}'", f"bash -s <<< '{R}'",

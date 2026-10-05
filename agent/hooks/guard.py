@@ -2772,6 +2772,55 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     return out
 
 
+_SCRIPT_READERS = _SHELL_PROGS | {"eval", "source", "."}
+
+
+def _ungrouped(segment: str) -> str:
+    """``segment`` without the group marks a split left on it: `(bash`,
+    `(bash)`, `{ bash`. Only for asking which program it runs."""
+    return segment.strip().lstrip("({ \t").rstrip(");} \t")
+
+
+def _heredoc_segment_program(segment: str) -> str:
+    """The program a segment holding a heredoc operator runs: `bash` for
+    `bash<<EOF` (one shlex word), `(bash <<EOF`, `x=1 bash<<-EOF` and
+    `<<EOF bash`; "" when there is none."""
+    tokens = _strip_prefixes(_tokenize(_ungrouped(_SUBST_RE.sub(" ", segment))))
+    # A redirection may come first, and its target may be a word of its own.
+    while tokens and re.match(r"\d*[<>]", tokens[0]):
+        tok = tokens.pop(0)
+        if tokens and re.fullmatch(r"\d*(<<-?|<|>>?|[<>]&|&>>?)", tok):
+            tokens.pop(0)
+    if not tokens:
+        return ""
+    return _basename(re.split(r"[<>]", tokens[0], maxsplit=1)[0])
+
+
+def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
+    """Whether a heredoc opened on ``owner`` reaches a shell that runs it as a
+    script (XERK-1618). ``commands_feed_shell()`` says whether any command on
+    the heredoc-free line reads its stdin as one; the caller memoises it.
+
+    The line's first word alone missed three owners bash runs the body for:
+    `bash<<EOF` (one word), `(bash <<EOF` (a subshell) and `{ bash; } <<EOF`
+    (a group's redirect feeds every reader in it).
+    """
+    segments = _split_segments(owner)
+    for seg in segments:
+        if "<<" not in seg:
+            continue
+        if _heredoc_segment_program(seg) in _SCRIPT_READERS:
+            return True
+        if seg.lstrip()[:1] in ("}", ")"):
+            # The group may open lines earlier (`{` / `bash` / `} <<EOF`), and
+            # finding its `{` lost to bash's grammar elsewhere, so any reader
+            # on the whole command counts. That only ever denies more.
+            if commands_feed_shell():
+                return True
+    # `cat <<EOF | bash`, and `| (bash)` / `| { bash; }` alike.
+    return any(_reads_stdin_script(_ungrouped(st)) for st in segments[1:])
+
+
 def _expand_raw_too(command: str) -> list[tuple[list[str], str]]:
     _SPLICES_ESCAPED[0] = 0
     out = _expand_segments(command)
@@ -2891,21 +2940,32 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # pipes-into-a-shell scan below is memoised on the owner string — re-running
     # it per heredoc was O(heredocs × stages) and hung a 2000-heredoc line.
     owner_pipes_to_shell: dict[str, bool] = {}
+    # ...and so is the whole-line scan a group redirect falls back to, which is
+    # the same for every owner: per owner it was O(heredocs × segments).
+    line_feeds_shell: list[bool] = []
+
+    def _commands_feed_shell() -> bool:
+        if not line_feeds_shell:
+            line_feeds_shell.append(any(_reads_stdin_script(_ungrouped(st))
+                                        for st in _split_segments(raw_commands)))
+        return line_feeds_shell[0]
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
         # runs every line of it. Expand those bodies as commands; bodies fed to
         # anything else stay data (see _destructive_database for the psql case).
         owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
         def _owner_feeds_shell() -> bool:
-            # So is one an owner that PIPES into a shell: `cat <<'EOF' | bash`
-            # (XERK-1539). Memoised on the owner string (every heredoc on a line
-            # shares it) and reached only when the cheap head check below misses,
-            # so a `bash <<EOF` owner never pays for this scan.
+            # So is one whose `<<` sits on a shell further in than the line's
+            # first word, one that PIPES into a shell (`cat <<'EOF' | bash`,
+            # XERK-1539), or one on a group holding a shell (XERK-1618).
+            # Memoised on the owner string (every heredoc on a line shares it)
+            # and reached only when the cheap head check below misses, so a
+            # `bash <<EOF` owner never pays for this scan.
             if owner not in owner_pipes_to_shell:
-                owner_pipes_to_shell[owner] = any(
-                    _reads_stdin_script(st) for st in _split_segments(owner)[1:])
+                owner_pipes_to_shell[owner] = _heredoc_owner_feeds_shell(
+                    owner, _commands_feed_shell)
             return owner_pipes_to_shell[owner]
-        if (owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."})
+        if (owner_tokens and _basename(owner_tokens[0]) in _SCRIPT_READERS
                 or _owner_feeds_shell()):
             for script in ([body] if quoted else _heredoc_readings(body)):
                 out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
