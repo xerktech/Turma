@@ -483,7 +483,7 @@ def _unset_readings_of(seg: str) -> list[str]:
     formatter needs.
 
     Both passes are linear in ``seg``: rebuilding the text per removal, or
-    tokenising every word's prefix, ran a 30 KB line past the hook's 60s
+    tokenising every word's prefix, ran a 30 KB line toward the hook's
     timeout, which fails OPEN (XERK-1615 QA).
     """
     spans = _param_spans(seg)
@@ -1408,7 +1408,7 @@ _MAX_SUBST_GROWTH = 1024 * 1024
 
 # How long one decision may spend expanding before it DENIES as too large. The
 # growth budget counts characters, not time, and a long line re-expanded once
-# per reading at every eval / `-c` level ran past Claude Code's 60s hook
+# per reading at every eval / `-c` level ran toward Claude Code's hook
 # timeout, which RUNS the command unchecked (XERK-1615 QA). Real commands
 # take well under a second.
 _MAX_DECIDE_SECONDS = 30
@@ -5435,9 +5435,10 @@ def _emit_deny(reason: str) -> None:
     sys.stdout.flush()
 
 
-# How long the hook may spend before it denies outright. Claude Code's default
-# hook timeout is 60s and an expired hook RUNS the command unchecked; this
-# leaves room for interpreter start-up and a slow host.
+# How long the hook may spend before it denies outright. Past Claude Code's hook
+# timeout (600s for a command hook, unless its settings entry sets one) the
+# command RUNS unchecked, and a session stalls the whole time; real commands
+# take well under a second.
 _HOOK_DEADLINE_SECONDS = 45
 _OVERRUN_REASON = ("refusing a command that took too long to classify (it is too large or too "
                    "convoluted) — split it, or put the data in a file")
@@ -5502,13 +5503,17 @@ def main(argv: list[str] | None = None) -> int:
 
     # Out of time, deny (XERK-1619). The in-decide deadline is checked only
     # between expansions, and one frame — shlex on one huge word is quadratic —
-    # overshot it past Claude Code's 60s hook timeout, which RUNS the command.
+    # overshot it, quadratically, toward the hook timeout, which RUNS the command.
     # A thread, not SIGALRM: this hook also runs on the Windows agent.
     worker = threading.Thread(target=classify, daemon=True)
     worker.start()
     worker.join(_HOOK_DEADLINE_SECONDS)
     if not verdict:
-        _emit_deny(_OVERRUN_REASON)
+        # Still running is slow; dead without a verdict is a crash past the
+        # `except Exception` (SystemExit, KeyboardInterrupt). Both deny.
+        _emit_deny(_OVERRUN_REASON if worker.is_alive() else (
+            "the safety guard could not classify this command; refusing it rather "
+            "than letting it run unchecked."))
         sys.stdout.flush()
         _hard_exit(0)  # the worker cannot be stopped; leaving waits on nothing
         return 0

@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -29,6 +30,18 @@ spec = importlib.util.spec_from_file_location("guard", GUARD_PATH)
 guard = importlib.util.module_from_spec(spec)
 sys.modules["guard"] = guard
 spec.loader.exec_module(guard)
+
+
+class _HardExit(BaseException):
+    """What `guard._hard_exit` raises in-process: the real `os._exit` would end
+    the whole test run with rc 0, so a regression read as a green suite."""
+
+
+def _no_hard_exit(code):
+    raise _HardExit(code)
+
+
+guard._hard_exit = _no_hard_exit
 
 
 # --- destructive: must be blocked ----------------------------------------
@@ -3442,6 +3455,26 @@ class TestHookEntrypoint(unittest.TestCase):
         out = json.loads(proc.stdout)["hookSpecificOutput"]
         self.assertEqual((out["permissionDecision"], out["permissionDecisionReason"]),
                          ("deny", guard._OVERRUN_REASON))
+
+    def test_an_overrun_denies_and_exits_with_the_classifier_still_running(self):
+        # The exit is what stops a classifier still running from holding the
+        # process past the deadline; a worker that died is a crash, not slow.
+        release = threading.Event()
+        cases = (("slow", lambda *a, **k: release.wait(5) and ("allow", "", None),
+                  guard._OVERRUN_REASON),
+                 ("died", mock.Mock(side_effect=SystemExit(3)), "could not classify"))
+        for name, decide, reason in cases:
+            with self.subTest(name), \
+                    mock.patch.object(guard, "decide", decide), \
+                    mock.patch.object(guard, "_HOOK_DEADLINE_SECONDS", 0.2), \
+                    mock.patch.object(guard.sys, "stdin", io.StringIO(json.dumps(
+                        {"tool_name": "Bash", "tool_input": {"command": "ls"}}))), \
+                    mock.patch.object(guard, "_emit_deny") as emit:
+                with self.assertRaises(_HardExit):
+                    guard.main()
+                emit.assert_called_once()
+                self.assertIn(reason, emit.call_args[0][0])
+        release.set()
 
     def test_a_decision_inside_the_hook_deadline_is_its_own(self):
         # The watchdog changes nothing for a decision that finishes.
