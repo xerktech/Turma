@@ -18,5 +18,10 @@ paths:
   - `_subst_text` resolves a body's own substitutions (memoised `_body_printed`), and `_expand`
     never expands one body twice at the same cwds: without both, deep nesting went 2^depth.
   - Still on `_SUBST_RE` (blanking only): the heredoc owner and the DB scan.
-- Tests: `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
+- **A `<(…)` is a file its stage reads, so the producers walk feeds its printed body downstream**
+  whatever the program: `cat <(echo …) | bash` runs it (`cat`/`head`/`tee` pass a file through).
+- **A shell `-c` script is ALSO re-read off the RAW words when it holds `<(`** (XERK-1611): the
+  substituted segment turned the quoted `<(…)` into its text, so `. <(echo …)` became `. <cmd>`.
+- Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
+  `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).

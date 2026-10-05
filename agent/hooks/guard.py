@@ -2041,6 +2041,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 _feed(_printed_text(_sub_substs(seg, _subst_text)) or "")
                 for hs in _herestrings(seg):
                     _feed(hs)
+                # A `<(…)` operand is a FILE this stage reads, and `cat`,
+                # `tee`, `head` and the like pass a file through: `cat <(echo
+                # <cmd>) | bash` runs <cmd> (XERK-1611). Fed whatever the
+                # stage's program, which fails closed.
+                for m in _find_substs(seg):
+                    if m.group(0).startswith("<("):
+                        _feed(_body_printed(_subst_inner(m), _SPLICE_RAW[0])[0] or "")
     for raw in segments:
         if every_cd != cwds:
             cwds = _cd_targets(_sub_substs(raw, _subst_text), cwds)
@@ -2095,6 +2102,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             i = _shell_c_index(rest)
             if i >= 0 and i + 1 < len(rest):
                 for script in _script_readings(rest[i + 1]):
+                    out.extend(_expand_segments(script, depth + 1, every_cd))
+            # `seg` already ran the line's substitutions, which turned a
+            # quoted `<(…)` — literal to the outer shell — into the text it
+            # prints, so `bash -c ". <(echo <cmd>)"` reached the inner parse as
+            # `. <cmd>`, a source of a file named <cmd>. Re-read the script off
+            # the RAW words, where the inner shell still sees `<(` (XERK-1611).
+            j = _shell_c_index(words[1:]) if words and _basename(words[0]) == prog else -1
+            if 0 <= j and j + 2 < len(words) and "<(" in words[j + 2]:
+                for script in _script_readings(words[j + 2]):
                     out.extend(_expand_segments(script, depth + 1, every_cd))
         elif prog == "eval" and rest:
             # `eval eval eval … rm -rf /etc` is valid shell. Collapse the chain

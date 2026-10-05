@@ -1400,6 +1400,18 @@ class TestScriptChannels(unittest.TestCase):
         # A script FILE reads its own stdin; the here-string is its data.
         self.assertAllowed(f"bash script.sh <<< '{R}'")
 
+    def test_a_proc_subst_passed_through_or_sourced_in_a_c_script(self):
+        # XERK-1611: `cat <(…)` passes its file through to a shell downstream,
+        # and a quoted `<(…)` in a `-c` script is the INNER shell's to run.
+        R = self.R
+        for cmd in (f"cat <(echo {R}) | bash", f"head -n1 <(printf '{R}') | sh",
+                    f"cat <( (echo {R}) ) | sh", f'bash -c ". <(echo {R})"',
+                    f'sudo sh -c "source <(echo {R})"', f"bash -c '. <(echo {R})'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("cat <(echo hello) | grep h")
+        self.assertAllowed('bash -c "diff <(ls a) <(ls b)"')
+
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R
         for cmd in (f"eval -- '{R}'", f"eval -- eval -- '{R}'", f"builtin eval '{R}'",
