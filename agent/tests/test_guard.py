@@ -1992,6 +1992,21 @@ class TestExpansionBudget(unittest.TestCase):
             self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:40])
         self.assertIsNone(self.check("ssh h " + "a " * 200))
 
+    def test_unclosed_brace_lists_and_grep_runs_classify_fast(self):
+        # `{a,a,…` backtracked over every comma, and `grep grep …` rescanned its
+        # piece from every grep: both quadratic (XERK-1596).
+        for cmd in ("echo {" + "a," * 20000 + "; rm -rf /", "grep " * 16000 + "\nrm -rf /"):
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
+            self.assertLess(time.monotonic() - t, 5, cmd[:20])
+        self.assertEqual(guard._expand_braces("rm {,a} {a} {a,b}"), "rm {,a} {a} a b")
+        self.assertEqual(guard._expand_braces("rm {a, b}"), "rm {a, b}")
+        # The grep and the tmux must share one `;`/`&`/newline piece, grep first.
+        self.assertTrue(guard._greps_for_tmux("ps | grep -w tmux"))
+        for text in ("tmux ls | grep x", "grep x; tmux ls", "grep x\ntmux", "grep x & tmux",
+                     "grep tmuxx", "egrep tmux"):
+            self.assertFalse(guard._greps_for_tmux(text), text)
+
     def test_many_unclosed_brace_defaults_classify_fast(self):
         # Each `${a:-$(` scanned to the end of the line for its closing `}`:
         # O(matches × length), ~95s for this 40 KB line (XERK-1596).

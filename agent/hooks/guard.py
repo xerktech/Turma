@@ -581,7 +581,11 @@ def _spend(added: int) -> None:
 
 _IFS_RE = re.compile(r"\$\{IFS\}|\$IFS")
 _ANSI_C_RE = re.compile(r"\$'((?:[^'\\]|\\.)*)'")
-_BRACE_RE = re.compile(r"\{([^{}\s]+,[^{}\s]*)\}")
+# A `{…}` word; it expands only when a `,` follows its first character. Testing
+# that in the regex (`[^{}\s]+,[^{}\s]*`) backtracked over every comma of an
+# unclosed `{a,a,…`: quadratic, and a hook that times out runs the command
+# (XERK-1596).
+_BRACE_RE = re.compile(r"\{([^{}\s]+)\}")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
 # inlined as `eval 'rm` (XERK-1256).
 # A value is read WHOLE, quoted runs and substitutions included: cut at its
@@ -701,7 +705,7 @@ def _expand_braces(command: str) -> str:
         if not m:
             break
         start, end = m.span()
-        if states[start]:
+        if states[start] or "," not in m.group(1)[1:]:
             pos = start + 1
             continue
         expansions += 1
@@ -2551,6 +2555,19 @@ def _destructive_agent_tmux(tokens: list[str]) -> str | None:
     return None
 
 
+def _greps_for_tmux(command: str) -> bool:
+    """A `pgrep`/`pidof`/`grep` followed by `tmux` in one `;`/`&`/newline piece.
+
+    One regex (`grep[^;&\n]*tmux`) rescanned the piece from every `grep` in it:
+    quadratic, and a hook that times out runs the command (XERK-1596).
+    """
+    for piece in re.split(r"[;&\n]", command):
+        m = re.search(r"\b(pgrep|pidof|grep)\b", piece)
+        if m and re.search(r"\btmux\b", piece[m.end():]):
+            return True
+    return False
+
+
 def _destructive_tmux_pid_kill(command: str) -> str | None:
     """`kill $(pgrep tmux)` / `pgrep tmux | xargs kill` — `pkill tmux` by PID.
 
@@ -2559,9 +2576,7 @@ def _destructive_tmux_pid_kill(command: str) -> str | None:
     tighter rule reopened those. `pgrep tmux; echo kill` is denied too — the
     accepted, fail-safe cost.
     """
-    if re.search(
-        r"\b(pgrep|pidof|grep)\b[^;&\n]*\btmux\b", re.sub(r"[\[\]]", "", command)
-    ) and re.search(r"(^|[\s;&|(`/'\"\\])kill([\s;&|)`'\"<>]|$)", command):
+    if _greps_for_tmux(re.sub(r"[\[\]]", "", command)) and re.search(r"(^|[\s;&|(`/'\"\\])kill([\s;&|)`'\"<>]|$)", command):
         return "refusing to kill tmux by PID — " + _TMUX_HOST_REASON
     return None
 
