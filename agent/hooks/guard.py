@@ -1499,9 +1499,14 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
     # character made a long blank pattern quadratic (XERK-1601).
     blank_n = 0
 
+    twin = ""
+
     def flush() -> None:
-        nonlocal buf, blank_n
+        nonlocal buf, blank_n, twin
         out.append("".join(buf))
+        if twin:
+            out.append(twin + out[-1])
+            twin = ""
         buf = []
         blank_n = 0
 
@@ -1602,16 +1607,17 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
             flush()
             i += 2
             continue
-        # The `&` of `2>&1`, `<&0` and `&>log`, and the `|` of `>|f`, belong
-        # to a redirection: splitting there cut `>/dev/null 2>&1 rm -rf /etc`
-        # into `… 2>` and `1 rm -rf /etc` (XERK-1616).
-        if (ch == "&" and (buf and buf[-1].endswith(("<", ">")) or command[i + 1:i + 2] == ">")
-                or ch == "|" and buf and buf[-1].endswith(">")):
-            buf.append(ch)
-            i += 1
-            continue
         if ch in (";", "\n", "&") or (include_pipe and ch == "|"):
+            # The `&` of `2>&1` and the `|` of `>|f` may belong to a
+            # redirection, which splitting cuts: `>/dev/null 2>&1 rm -rf /etc`
+            # became `… 2>` and `1 rm -rf /etc`. Whether it does, the text
+            # cannot say — `\>&` and an expansion that printed `>` leave a real
+            # operator — so read the next segment BOTH ways: as split, and with
+            # the redirection rebuilt (`>&1 rm -rf /etc`) (XERK-1616).
+            redirected = ch in "&|" and bool(buf) and buf[-1].endswith(("<", ">"))
             flush()
+            if redirected:
+                twin = ">" + ch
             i += 1
             continue
         buf.append(ch)
@@ -1744,7 +1750,7 @@ _STDIN_SCRIPT_RE = re.compile(r"^(?:-|/dev/stdin|/dev/fd/\d+|/proc/(?:self|\d+)/
 _SHELL_OPTS_WITH_VALUE = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
 # A redirection word: `2>&1`, `>/dev/null`, `<`, `<<<`. Its target follows
 # when the operator stands alone.
-_REDIRECT_RE = re.compile(r"^\d*(?:<<<|<<-?|<>|<&|>&|&>>?|>>?|<)(.*)$", re.S)
+_REDIRECT_RE = re.compile(r"^\d*(?:<<<|<<-?|<>|<&|>&|&>>?|>[|>]?|<)(.*)$", re.S)
 
 
 def _proc_subst_path(m: "re.Match[str]") -> str:

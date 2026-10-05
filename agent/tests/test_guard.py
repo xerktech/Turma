@@ -1402,21 +1402,24 @@ class TestScriptChannels(unittest.TestCase):
 
     def test_a_redirection_before_the_program(self):
         # XERK-1616: bash takes redirections anywhere in a simple command, so
-        # `2>/dev/null rm -rf /` runs rm; and the `&` of `2>&1` / `&>` is no
-        # operator, so it must not split the line there.
+        # `2>/dev/null rm -rf /` runs rm. The `&` of `2>&1` and `|` of `>|` are
+        # split on AND read rebuilt: an escaped or expanded `>` leaves a real
+        # operator (`echo a\\>&rm …`, dash's `true &>/dev/null rm …`).
         R = self.R
         for cmd in (f"2>/dev/null {R}", f"2> /dev/null {R}", f">/dev/null {R}",
                     f"&>/dev/null {R}", f">/dev/null 2>&1 {R}", f"2>&1 {R}",
                     f"</dev/null bash -c '{R}'", f"echo x | 2>/dev/null bash -c '{R}'",
-                    f"echo x >| f; {R}"):
+                    f"echo x >| f; {R}", f">| f {R}", f"echo a\\>&{R}", f"echo a\\>|{R}",
+                    f"echo ${{x:->}}&{R}", f"x='>'; echo $x&{R}",
+                    f"sh -c 'true &>/dev/null {R}'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("2>/dev/null ls /etc", "> out echo hi", "ls 2>&1 | tail",
                     "make &> build.log", "rm -rf build >/dev/null 2>&1"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
-        self.assertEqual(guard._split_segments("ls >/dev/null 2>&1 | tail"),
-                         ["ls >/dev/null 2>&1", "tail"])
+        self.assertAllowed("ls >/dev/null 2>&1 &")
+        self.assertAllowed("cmd 2>&1 | grep rm")
 
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R
