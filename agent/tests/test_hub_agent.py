@@ -11724,6 +11724,15 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         self.assertEqual(row.split("\t")[4], "detached")
         self.assertEqual(row.split("\t")[5], "XERK-9 Do the thing")
 
+    def test_peer_branch_matches_the_hub_on_odd_shapes(self):
+        """XERK-1540: the fallback roster reads the payload's `git.branch`; a
+        detached "HEAD", a non-dict `git` or a non-string branch is no branch —
+        the same "" the hub's peerBranch serves."""
+        for git in (None, "x", [1], {}, {"branch": "HEAD"}, {"branch": 123},
+                    {"branch": ""}):
+            self.assertIsNone(ha._peer_branch(git), git)
+        self.assertEqual(ha._peer_branch({"branch": "XERK-1540"}), "XERK-1540")
+
     def test_a_beat_publishes_the_roster(self):
         """The wiring, not just the writer: a heartbeat leaves the roster on disk
         naming this host's running sessions, since that file is the only thing a

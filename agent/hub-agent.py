@@ -5967,8 +5967,8 @@ def _peer_branch(git):
     """The peer-roster branch cell from a session payload's `git` dict: its
     `branch`, or None when the worktree is detached ("HEAD") or unknown. Mirrors
     server.js `peerBranch` (XERK-1540)."""
-    branch = (git or {}).get("branch")
-    return None if not branch or branch == "HEAD" else branch
+    branch = git.get("branch") if isinstance(git, dict) else None
+    return branch if isinstance(branch, str) and branch and branch != "HEAD" else None
 
 
 def git_info_slow(cwd):
