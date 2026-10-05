@@ -7028,9 +7028,68 @@ class TestUsageLedger(ManagerMixin, unittest.TestCase):
                         "worktreePath": "/w/.turma/worktrees/Turma/aaa"}]
         sm.closed = [{"id": "b", "repo": "DockerOps", "repoPath": "/w/DockerOps",
                       "worktreePath": "/w/.turma/worktrees/DockerOps/bbb"}]
+        self._proj_for("/w/.turma/worktrees/Turma/aaa")
+        self._proj_for("/w/.turma/worktrees/DockerOps/bbb")
         sm._backfill_ledger()
         self.assertIn("/w/.turma/worktrees/Turma/aaa", sm.usage_ledger)
         self.assertIn("/w/.turma/worktrees/DockerOps/bbb", sm.usage_ledger)
+
+    def test_backfill_skips_records_whose_transcripts_are_gone(self):
+        """XERK-1536: a record with no projects dir was re-added by the backfill
+        and dropped by the prune in the SAME pass, so every slow beat re-spawned
+        its `git remote get-url` inline on the beat thread. It must not be
+        added (or read) at all; a record with a transcript is read once."""
+        sm = self.make_manager()
+        wt_live = "/w/.turma/worktrees/Turma/live"
+        wt_gone = "/w/.turma/worktrees/Turma/gone"
+        self._proj_for(wt_live)
+        sm.registry = [{"id": "a", "repo": "Turma", "repoPath": "/w/Turma",
+                        "worktreePath": wt_live}]
+        sm.closed = [{"id": "b", "repo": "Turma", "repoPath": "/w/Turma",
+                      "worktreePath": wt_gone}]
+        gits = []
+        with mock.patch.object(ha, "run", lambda cmd, cwd=None, **kw:
+                               gits.append(cwd) or "git@x:o/Turma.git"):
+            sm._backfill_ledger()
+            sm._prune_ledger()
+            sm._backfill_ledger()
+            sm._prune_ledger()
+        self.assertNotIn(wt_gone, sm.usage_ledger)
+        self.assertEqual(sm.usage_ledger[wt_live]["remote"], "git@x:o/Turma.git")
+        self.assertEqual(gits, ["/w/Turma"])
+
+    def test_backfill_takes_the_cached_repo_remote(self):
+        """XERK-1536: the worker-filled repo_facts remote is used instead of
+        spawning git; a cold-start placeholder "" falls back to the read."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        self._proj_for(wt)
+        sm.registry = [{"id": "a", "repo": "Turma", "repoPath": "/w/Turma",
+                        "worktreePath": wt}]
+        sm.repo_facts = {"/w/Turma": {"remote": "git@x:o/Turma.git"}}
+        with mock.patch.object(ha, "run", side_effect=AssertionError("git")):
+            sm._backfill_ledger()
+        self.assertEqual(sm.usage_ledger[wt]["remote"], "git@x:o/Turma.git")
+        sm.usage_ledger = {}
+        sm.repo_facts = {"/w/Turma": {"remote": ""}}
+        with mock.patch.object(ha, "run", lambda *a, **kw: "git@y:o/T.git"):
+            sm._backfill_ledger()
+        self.assertEqual(sm.usage_ledger[wt]["remote"], "git@y:o/T.git")
+
+    def test_backfill_skips_a_slug_reconcile_already_adopted(self):
+        """XERK-1536: a closed record whose transcript dir appeared after the
+        backfill skipped it is adopted by _reconcile_orphan_transcripts under
+        its projects dir; the next backfill must not add it a second time."""
+        sm = self.make_manager()
+        wt = "/w/.turma/worktrees/Turma/late"
+        proj = self._proj_for(wt)
+        slug = ha._project_slug(wt)
+        sm.usage_ledger = {proj: {"repo": "Turma", "remote": "", "slug": slug}}
+        sm.closed = [{"id": "b", "repo": "Turma", "repoPath": "/w/Turma",
+                      "worktreePath": wt}]
+        with mock.patch.object(ha, "run", side_effect=AssertionError("git")):
+            sm._backfill_ledger()
+        self.assertEqual(list(sm.usage_ledger), [proj])
 
     def test_prune_drops_entries_whose_transcripts_gone(self):
         sm = self.make_manager()
