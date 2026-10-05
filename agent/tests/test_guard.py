@@ -1406,11 +1406,26 @@ class TestScriptChannels(unittest.TestCase):
         R = self.R
         for cmd in (f"cat <(echo {R}) | bash", f"head -n1 <(printf '{R}') | sh",
                     f"cat <( (echo {R}) ) | sh", f'bash -c ". <(echo {R})"',
-                    f'sudo sh -c "source <(echo {R})"', f"bash -c '. <(echo {R})'"):
+                    f'sudo sh -c "source <(echo {R})"', f"bash -c '. <(echo {R})'",
+                    # ...in a multi-statement script, which the operator split
+                    # used to `continue` past before the shell branch,
+                    f"bash -c '. <(echo {R}); true'", f'bash -c "x=1 && . <(echo {R})"',
+                    f"bash -c 'cat <(echo {R}) | bash'",
+                    # ...nested, piped inside, or behind a substituted shell name,
+                    f"cat <(cat <(echo {R})) | bash", f"cat <(echo {R} | cat) | bash",
+                    f'bash -c ". <(cat <(echo {R}))"', f'$(echo bash) -c ". <(echo {R})"',
+                    f"bash < <(cat <(echo {R}))",
+                    # ...an escaped ANSI-C string the inner shell decodes,
+                    f'bash -c ". <(echo \\$\'{R}\')"', f'bash -c "eval \\$\'{R}\'"',
+                    # ...and `-c --`, where bash drops the `--` and runs the next word.
+                    f"bash -c -- '{R}'", f"sh -c -- '. <(echo {R})'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         self.assertAllowed("cat <(echo hello) | grep h")
         self.assertAllowed('bash -c "diff <(ls a) <(ls b)"')
+        self.assertAllowed('bash -c "source <(kubectl completion bash); kubectl get po"')
+        self.assertAllowed('cat <(echo "rm -rf build") | wc -l')
+        self.assertAllowed('bash -c -- "echo hi"')
 
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R
