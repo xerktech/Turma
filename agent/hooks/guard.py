@@ -2538,7 +2538,10 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
                 if "=" not in opt and opt in takes_value and out:
                     out.pop(0)
             # `timeout 5s cmd` / `nice 10 cmd`: a bare duration/priority operand.
-            if wrapper in ("timeout", "nice") and out and re.match(r"^[0-9]", out[0]):
+            # timeout's is REQUIRED, so it goes whatever it looks like: kept,
+            # `timeout ${T:-5} bash` read as the program `${T:-5}` (XERK-1618).
+            if out and (wrapper == "timeout"
+                        or wrapper == "nice" and re.match(r"^[0-9]", out[0])):
                 out.pop(0)
             continue
         break
@@ -2772,6 +2775,83 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     return out
 
 
+_SCRIPT_READERS = _SHELL_PROGS | {"eval", "source", "."}
+
+
+# A closer on a heredoc's line means the heredoc may be a compound command's
+# redirect, which feeds every command in it: `(…)<<EOF`, `{ …; } 2>&1 <<EOF`,
+# `fi <<EOF`, `done >|f <<EOF`, `esac <<EOF`.
+_GROUP_CLOSER_RE = re.compile(r"[)}]|(?<![\w.-])(?:fi|done|esac)(?![\w.-])")
+
+
+def _ungrouped(segment: str) -> tuple[str, ...]:
+    """``segment`` without the group marks a split left on it, read two ways:
+    trimmed at its ends (`(bash`, `{ bash`, `X=$(pwd) bash)`) and cut at its
+    first closer (`(bash)<<EOF`, `(bash){fd}>f`). Neither knows quoting, so
+    each alone lost a shape the other reads; either counts. Only for asking
+    which program it runs."""
+    seg = segment.strip().lstrip("({ \t")
+    cuts = [i for i in (seg.find(")"), seg.find("}")) if i >= 0]
+    return tuple(dict.fromkeys([seg.rstrip(");} \t")]
+                               + [seg[:i].rstrip("; \t") for i in cuts]))
+
+
+# A shell named anywhere on a line, as a word: `/bin/sh`, `X=')' bash`.
+_SHELL_WORD_RE = re.compile(
+    r"(?<![\w.-])(?:bash|sh|zsh|ksh|dash|ash|busybox|su|eval|source)(?![\w.-])"
+    r"|(?:^|(?<=[\s;&|({]))\.(?=\s)")
+
+
+def _reads_stdin_grouped(segment: str) -> bool:
+    return any(_reads_stdin_script(text) for text in _ungrouped(segment))
+
+
+def _heredoc_segment_programs(segment: str):
+    """The programs a segment holding a heredoc operator may run: `bash` for
+    `bash<<EOF` (one shlex word), `(bash <<EOF`, `(bash)<<EOF`, `x=1
+    bash<<-EOF`, `<<EOF bash` and `x=$(bash <<EOF`, one per reading."""
+    # A substitution still open on this line is where the heredoc's command
+    # starts: `echo "$(bash<<EOF`, `cat <(sh <<EOF`.
+    text = re.split(r"[$<>]\(", _SUBST_RE.sub(" ", segment))[-1]
+    for reading in _ungrouped(text):
+        tokens = _strip_prefixes(_tokenize(reading))
+        # A redirection may come first, and its target may be a word of its own.
+        while tokens and re.match(r"\d*[<>]", tokens[0]):
+            tok = tokens.pop(0)
+            if tokens and re.fullmatch(r"\d*(<<-?|<|>>?|[<>]&|&>>?)", tok):
+                tokens.pop(0)
+        if tokens:
+            yield _basename(re.split(r"[<>]", tokens[0], maxsplit=1)[0])
+
+
+def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
+    """Whether a heredoc opened on ``owner`` reaches a shell that runs it as a
+    script (XERK-1618). ``commands_feed_shell()`` says whether any command on
+    the heredoc-free line reads its stdin as one; the caller memoises it.
+
+    The line's first word alone missed three owners bash runs the body for:
+    `bash<<EOF` (one word), `(bash <<EOF` (a subshell) and `{ bash; } <<EOF`
+    (a group's redirect feeds every reader in it).
+    """
+    # The splitter reads the `&` of `2>&1` / `&>f` as a background operator
+    # and the `|` of `>|f` as a pipe, which cut `bash 2>&1 <<EOF` away from
+    # its program. Only the program is asked of these segments, so both go.
+    segments = _split_segments(re.sub(r"[<>]&|&>|>\|", lambda m: m[0].strip("&|"), owner))
+    if any("<<" in seg and not _SCRIPT_READERS.isdisjoint(_heredoc_segment_programs(seg))
+           for seg in segments):
+        return True
+    # A compound command's redirect feeds every command in it, and the group
+    # may open lines earlier (`{` / `bash` / `} <<EOF`). Finding where it
+    # starts, which redirects stand between its closer and `<<`, or which of
+    # its parens are quoted (`(X='a)' bash) 2>')' <<EOF`) lost to bash's
+    # grammar each time. So any closer on the line and any shell named on the
+    # whole command counts. That only ever denies more.
+    if _GROUP_CLOSER_RE.search(owner) and commands_feed_shell():
+        return True
+    # `cat <<EOF | bash`, and `| (bash)` / `| { bash; }` alike.
+    return any(_reads_stdin_grouped(st) for st in segments[1:])
+
+
 def _expand_raw_too(command: str) -> list[tuple[list[str], str]]:
     _SPLICES_ESCAPED[0] = 0
     out = _expand_segments(command)
@@ -2926,21 +3006,35 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # pipes-into-a-shell scan below is memoised on the owner string — re-running
     # it per heredoc was O(heredocs × stages) and hung a 2000-heredoc line.
     owner_pipes_to_shell: dict[str, bool] = {}
+    # ...and so is the whole-line scan a group redirect falls back to, which is
+    # the same for every owner: per owner it was O(heredocs × segments).
+    line_feeds_shell: list[bool] = []
+
+    def _commands_feed_shell() -> bool:
+        if not line_feeds_shell:
+            # Quotes, escapes and line continuations joined: bash runs `bas''h`,
+            # `b\ash`, `bas$''h` and `bas\` / `h` as `bash`.
+            joined = re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", raw_commands)
+            line_feeds_shell.append(any(map(_SHELL_WORD_RE.search, (raw_commands, joined))) or any(
+                _reads_stdin_grouped(st) for st in _split_segments(raw_commands)))
+        return line_feeds_shell[0]
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
         # runs every line of it. Expand those bodies as commands; bodies fed to
         # anything else stay data (see _destructive_database for the psql case).
         owner_tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(" ", owner)))
         def _owner_feeds_shell() -> bool:
-            # So is one an owner that PIPES into a shell: `cat <<'EOF' | bash`
-            # (XERK-1539). Memoised on the owner string (every heredoc on a line
-            # shares it) and reached only when the cheap head check below misses,
-            # so a `bash <<EOF` owner never pays for this scan.
+            # So is one whose `<<` sits on a shell further in than the line's
+            # first word, one that PIPES into a shell (`cat <<'EOF' | bash`,
+            # XERK-1539), or one on a group holding a shell (XERK-1618).
+            # Memoised on the owner string (every heredoc on a line shares it)
+            # and reached only when the cheap head check below misses, so a
+            # `bash <<EOF` owner never pays for this scan.
             if owner not in owner_pipes_to_shell:
-                owner_pipes_to_shell[owner] = any(
-                    _reads_stdin_script(st) for st in _split_segments(owner)[1:])
+                owner_pipes_to_shell[owner] = _heredoc_owner_feeds_shell(
+                    owner, _commands_feed_shell)
             return owner_pipes_to_shell[owner]
-        if (owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."})
+        if (owner_tokens and _basename(owner_tokens[0]) in _SCRIPT_READERS
                 or _owner_feeds_shell()):
             for script in ([body] if quoted else _heredoc_readings(body)):
                 out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
