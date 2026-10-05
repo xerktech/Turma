@@ -1443,6 +1443,7 @@ def _budgeted(fn):
                    "until": time.monotonic() + _MAX_DECIDE_SECONDS}
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
+        _VALUES_TAINT_N[0] = 0
         try:
             return fn(*args, **kwargs)
         finally:
@@ -1455,7 +1456,7 @@ def _memo(kind: str, key, fn, *args):
     """``fn(*args)``, made once per decision. A hit replays the escaping
     splices it counted, which is what makes `_expand_both` take its raw pass."""
     memo = _budget[kind]
-    key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _BRACE_GLUED[0])
+    key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -1660,7 +1661,16 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         # as lines they split `rm $x` into two commands.
         value = _dequote_value(value)
         produced = _produced_text(value)
-        if _VALUES_MULTI[0]:
+        # The taint reading of a filtered or conditional body, which neither
+        # reading above reads (XERK-1625): `a=$(false || echo rm -rf / | grep
+        # .); $a`. Its own pass, one per suffix reading, never joined to them.
+        readings = _value_taint_readings(value)
+        _VALUES_TAINT_N[0] = max(_VALUES_TAINT_N[0], len(readings))
+        if _VALUES_TAINT[0] >= 0:
+            if readings:
+                produced = readings[min(_VALUES_TAINT[0], len(readings) - 1)]
+            produced = produced.replace("\n", " ")
+        elif _VALUES_MULTI[0]:
             produced = produced.replace("\n", " ")
         else:
             base = _produced_text(value, multi=False)
@@ -1692,6 +1702,28 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         return value
 
     return {k: [_var_sub(resolve, v) for v in vs] for k, vs in vals.items()}
+
+
+def _value_taint_readings(value: str) -> tuple[str, ...]:
+    """``value`` with each substitution `_body_tainted` reads replaced by its
+    taint, one string per suffix reading (`_body_tainted_at`); empty when no
+    substitution in it has a taint reading."""
+    parts: list[str | tuple[str, ...]] = []
+    last, n = 0, 0
+    for m in _find_substs(value):
+        parts.append(value[last:m.start()])
+        taint = None
+        if m.group(0)[0] in "$`" and not _subst_in_arith(m):
+            taint = _body_tainted(_subst_inner(m))
+        if taint is None:
+            parts.append(_subst_text(m))
+        else:
+            parts.append(taint)
+            n = max(n, len(taint))
+        last = m.end()
+    parts.append(value[last:])
+    return tuple("".join(p if isinstance(p, str) else p[min(k, len(p) - 1)]
+                         for p in parts) for k in range(n))
 
 
 def _dequote_value(value: str) -> str:
@@ -2039,6 +2071,10 @@ _SPLICES_ESCAPED = [0]
 # them; and whether any value this decision read differs that way (XERK-1609).
 _VALUES_MULTI = [False]
 _VALUES_DIFFER = [False]
+# Which taint reading of the assigned values `_expand_both` is on (-1: none),
+# and how many readings the values of this decision have (XERK-1625).
+_VALUES_TAINT = [-1]
+_VALUES_TAINT_N = [0]
 
 
 def _quote_literal(value: str, state: str) -> str:
@@ -2764,7 +2800,8 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     reading is right at every re-parse depth; together they fail closed.
 
     Assigned values are read as before XERK-1609, and once more as several
-    statements print them when that differs (`_assigned_values`)."""
+    statements print them when that differs (`_assigned_values`), and once
+    per taint reading the values have (`_value_taint_readings`)."""
     out = _expand_raw_too(command)
     if _VALUES_DIFFER[0]:
         _VALUES_MULTI[0] = True
@@ -2772,6 +2809,14 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
             out = out + _expand_raw_too(command)
         finally:
             _VALUES_MULTI[0] = False
+    k = 0
+    while k < min(_VALUES_TAINT_N[0], _MAX_TAINT_STARTS):
+        _VALUES_TAINT[0] = k
+        try:
+            out = out + _expand_raw_too(command)
+        finally:
+            _VALUES_TAINT[0] = -1
+        k += 1
     return out
 
 

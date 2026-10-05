@@ -2589,6 +2589,37 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
+    def test_an_assigned_filtered_or_conditional_body_runs_as_its_text(self):
+        # XERK-1625: the taint reading never reached an assignment value, so
+        # `$a` ran what a filtered `&&`/`||` body printed, unread.
+        for cmd in ("a=$(false || echo rm -rf / | grep .); $a",
+                    "a=$(false || echo rm -rf / | sed ''); $a",
+                    "a=$(true && echo rm -rf / | grep .); $a",
+                    "b=$(false || echo rm -rf / | grep .); eval $b",
+                    "a=$(false || echo rm | tr a a); $a -rf /etc",
+                    # Every suffix reading, not only the every-statement one.
+                    "a=$(echo safe || echo rm -rf /etc | sed ''); $a",
+                    "a=`false || echo rm -rf / | grep .`; $a"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        for cmd in ("a=$(false || echo rm -rf / | grep -q .); $a",
+                    "a=$(git rev-parse HEAD || echo none | tr a-z A-Z); echo $a",
+                    "d=$(mktemp -d || echo /tmp/x | sed ''); ls $d",
+                    "N=$(( $(nproc || echo 2 | sed s/x//) * 2 )); echo $N"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_many_assigned_taint_bodies_stay_fast(self):
+        # XERK-1625: the taint passes over assigned values are capped at
+        # `_MAX_TAINT_STARTS`, whatever the values hold.
+        import time
+        for cmd in ("a=$(" + "ls || " * 20000 + "echo a | sed ''); $a",
+                    "a=$(false || echo a | sed ''); " * 2000 + "$a"):
+            with self.subTest(n=len(cmd)):
+                start = time.time()
+                guard.decide("Bash", {"command": cmd}, cwd="/tmp")
+                self.assertLess(time.time() - start, 30)
+
     def test_a_large_conditional_or_nested_taint_body_stays_fast(self):
         # XERK-1617: suffix readings are capped, and nested taint resolution is
         # memoised per body, so neither goes quadratic/exponential.
