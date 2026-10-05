@@ -206,16 +206,13 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
    Full-bleed, with its row capped at --wrap and centred, so it lands in the
    same 1180px column as a page's content and reads identically everywhere —
    including sessions.html, whose shell below is full-bleed while its header
-   row is not. Page-specific text lives only in the #hdrSub/#hdrMeta slots; an
-   unfilled slot collapses so it costs no gap. It stays put because no page
+   row is not. It carries no page-specific text. It stays put because no page
    scrolls its document — see `.app-shell` in Base. */
 .site-header { flex: none; margin-bottom: 20px; }
 .site-header-in {
   max-width: var(--wrap); margin: 0 auto; padding: 24px 20px 0;
   display: flex; align-items: center; gap: 8px 14px; flex-wrap: wrap;
 }
-.site-header .sub { color: var(--muted); font-size: 13px; }
-.site-header .sub:empty { display: none; }
 .site-header .spacer { flex: 1; }
 
 /* ---- New ticket (#hdrNewTicket, built by newticket.js) -------------------
@@ -236,7 +233,7 @@ h1 { font-size: 20px; margin: 0; font-weight: 600; letter-spacing: -0.01em; }
 /* ---- Org filter (#hdrOrg, built by org.js) -------------------------------
    The one org-scoping control, in the chrome because every page obeys it
    (XERK-62) — it replaced the board-only chip strip. Collapses to nothing when
-   no host reports a tracker org, like the .sub slots above. */
+   no host reports a tracker org. */
 .site-header .org-slot:empty { display: none; }
 .org-filter { position: relative; display: inline-flex; }
 .org-btn {

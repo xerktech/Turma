@@ -4,14 +4,12 @@
 // four bottom-nav icons were duplicated four times and drifted (sessions grew
 // its own full-width bar; only some pages carried a status slot).
 //
-// The header markup this builds is IDENTICAL on every page. Everything a page
-// wants to say about itself goes in the two slots — #hdrSub (the static
-// descriptor) and #hdrMeta (dynamic) — which the page's own script fills. An
-// unfilled slot collapses (`.sub:empty` in app.css), so pages using fewer slots
-// still ship the same DOM.
+// The header markup this builds is IDENTICAL on every page: wordmark, then the
+// tabs. It carries no per-page descriptor text — the active tab already says
+// which page you're on.
 //
-// Two more slots follow the same "filled by a shared module, not by any page"
-// rule and sit after the spacer so they right-align beside the tabs:
+// Two slots are "filled by a shared module, not by any page" and sit after the
+// spacer so they right-align beside the tabs:
 //   #hdrNewTicket — org.js's sibling, filled by newticket.js with the "New
 //     ticket" button + its create modal, so a ticket can be created from any
 //     page (XERK-150), not only the board. Collapses until the fleet reports an
@@ -72,11 +70,9 @@
 
   // The header's inner row. Capped and centred by .site-header-in (app.css) so
   // it lines up with each page's own content column.
-  function siteHeaderHtml(active, sub) {
+  function siteHeaderHtml(active) {
     return `<div class="site-header-in">
     <a class="wordmark" href="/"><img src="/favicon.svg" alt="" width="26" height="26"><span>Turma</span></a>
-    <span class="sub" id="hdrSub">${esc(sub ?? "")}</span>
-    <span class="sub" id="hdrMeta"></span>
     <span class="spacer"></span>
     <span class="newticket-slot" id="hdrNewTicket"></span>
     <span class="org-slot" id="hdrOrg"></span>
@@ -91,13 +87,13 @@
   </a>`).join("\n  ");
   }
 
-  // Mount into the page's placeholders. `data-page` picks the active tab and
-  // `data-sub` seeds the descriptor slot; both live on the <header>.
+  // Mount into the page's placeholders. `data-page` on the <header> picks the
+  // active tab.
   function mount(doc) {
     const header = doc.getElementById("siteHeader");
     if (!header) return;
     const active = header.dataset.page || "";
-    header.innerHTML = siteHeaderHtml(active, header.dataset.sub || "");
+    header.innerHTML = siteHeaderHtml(active);
     const bottom = doc.getElementById("bottomNav");
     if (bottom) bottom.innerHTML = bottomNavHtml(active);
     const pane = doc.querySelector && doc.querySelector(".page-scroll");
