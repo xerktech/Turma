@@ -1457,7 +1457,8 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
     return "".join(kept), bodies
 
 
-def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
+def _split_on_operators(command: str, include_pipe: bool = True,
+                        keep_redirects: bool = False) -> list[str]:
     """Split on shell operators that are NOT inside quotes.
 
     Splitting the raw string severed a quoted script mid-quote, so a shell's
@@ -1615,6 +1616,15 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
             # operator — so read the next segment BOTH ways: as split, and with
             # the redirection rebuilt (`>&1 rm -rf /etc`) (XERK-1616).
             redirected = ch in "&|" and bool(buf) and buf[-1].endswith(("<", ">"))
+            if redirected and keep_redirects:
+                # ...except where a caller reads STAGES (the pipe-to-shell walk):
+                # there the extra segments sat between `echo … 2>&1` and `| sh`
+                # and hid the producer. An escaped `\>` is no redirection.
+                tail = "".join(buf[-16:])[:-1]
+                if (len(tail) - len(tail.rstrip("\\"))) % 2 == 0:
+                    buf.append(ch)
+                    i += 1
+                    continue
             flush()
             if redirected:
                 twin = ">" + ch
@@ -1750,7 +1760,8 @@ _STDIN_SCRIPT_RE = re.compile(r"^(?:-|/dev/stdin|/dev/fd/\d+|/proc/(?:self|\d+)/
 _SHELL_OPTS_WITH_VALUE = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
 # A redirection word: `2>&1`, `>/dev/null`, `<`, `<<<`. Its target follows
 # when the operator stands alone.
-_REDIRECT_RE = re.compile(r"^\d*(?:<<<|<<-?|<>|<&|>&|&>>?|>[|>]?|<)(.*)$", re.S)
+# `{fd}>f` names the fd it opens; `2>f` numbers it.
+_REDIRECT_RE = re.compile(r"^(?:\d*|\{[A-Za-z_]\w*\})(?:<<<|<<-?|<>|<&|>&|&>>?|>[|>]?|<)(.*)$", re.S)
 
 
 def _proc_subst_path(m: "re.Match[str]") -> str:
@@ -2028,7 +2039,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # the line has none — a line of 1000 `bash <<EOF` heredocs otherwise paid
     # for it (the body is a script by the heredoc path above, not this one).
     feeds_a_shell = "|" in command or "<<<" in command or "<(" in command
-    for pipeline in _split_on_operators(command, include_pipe=False) if feeds_a_shell else ():
+    for pipeline in (_split_on_operators(command, include_pipe=False, keep_redirects=True)
+                     if feeds_a_shell else ()):
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
         # feeding it either, so skip its per-stage scan too.
         if "|" not in pipeline and "<<<" not in pipeline and "<(" not in pipeline:
@@ -2040,7 +2052,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     and len(seen_texts) < _FED_TEXT_CAP:
                 seen_texts.add(text)
                 producers.append(text)
-        for stage in _split_segments(pipeline):
+        for stage in _split_on_operators(pipeline, keep_redirects=True):
             ustage = _unwrap_group(stage)
             if _reads_stdin_script(ustage):
                 fed = list(producers)
@@ -2056,7 +2068,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # This stage's own contribution to readers DOWNSTREAM of it. A
             # producer behind a prefix (`sudo echo …`, `time printf …`) still
             # prints, so strip them before reading what it emits.
-            for seg in _split_segments(ustage):
+            for seg in _split_on_operators(ustage, keep_redirects=True):
                 seg = _unwrap_group(seg)
                 _feed(_printed_from_tokens(_strip_prefixes(_tokenize(seg))) or "")
                 # ...and with its substitutions run: tokenising first split a
