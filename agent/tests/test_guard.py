@@ -1992,6 +1992,52 @@ class TestExpansionBudget(unittest.TestCase):
             self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:40])
         self.assertIsNone(self.check("ssh h " + "a " * 200))
 
+    def test_many_unclosed_brace_defaults_classify_fast(self):
+        # Each `${a:-$(` scanned to the end of the line for its closing `}`:
+        # O(matches × length), ~95s for this 40 KB line (XERK-1596).
+        for unit in ("${a:-$(}", '${a:-"}', "${a:-${", "${a:-`"):
+            cmd = "echo '" + unit * 5000 + "'; rm -rf /"
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", unit)
+            self.assertLess(time.monotonic() - t, 5, unit)
+        # Deeply nested expansions that DO close scanned their tails again too.
+        cmd = "echo " + "${a:-" * 3000 + "x" + "}" * 3000 + "; rm -rf /"
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.monotonic() - t, 5)
+
+    def test_brace_end_matches_a_fresh_scan_in_any_order(self):
+        # Remembered closers must give what a scan from scratch would.
+        cases = {"${a:-'}'}": 0, "${a:-$(echo })}": 0, '${a:-"${b}"}': 0,
+                 "${a:-${b:-x}}": 0, "${a:-`}`}": 0, "${a:-$(}": -1, "${a:-\\}}": 0}
+        for cmd, want in cases.items():
+            guard._closers.cache_clear()
+            ends = {i: guard._brace_end(cmd, i) for i in reversed(range(len(cmd)))
+                    if cmd.startswith("${", i)}
+            self.assertEqual(ends[0], len(cmd) - 1 if want == 0 else -1, cmd)
+            guard._closers.cache_clear()
+            self.assertEqual(guard._brace_end(cmd, 0), ends[0], cmd)
+        # A later scan jumping over a remembered quote must land past its closer.
+        cmd = "${a:-'${c:-\\'\"}\"}"
+        guard._closers.cache_clear()
+        self.assertEqual((guard._brace_end(cmd, 6), guard._brace_end(cmd, 0)), (16, 16))
+
+    def test_many_braces_past_the_last_close_classify_fast(self):
+        # `${NAME[^}]*}` rescanned to the end of the line from every `${` after
+        # its last `}` — quadratic in the regex itself (XERK-1596).
+        for unit in ("${a", "${a:-`${a:-", "${a:-\"'${a:-'\"", "\\${a:-\\\\${a:-$("):
+            cmd = "echo } " + unit * (60000 // len(unit)) + "\nrm -rf /"
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", unit)
+            self.assertLess(time.monotonic() - t, 5, unit)
+
+    def test_var_sub_matches_the_regex(self):
+        for text in ("${a}${b:-x} $c", "x=$a; ${b", "}$a${b", "${a:-}} ${b $c", "$", ""):
+            self.assertEqual([m.span() for m in guard._var_uses(text)],
+                             [m.span() for m in guard._VAR_USE_RE.finditer(text)], text)
+            self.assertEqual(guard._var_sub(lambda m: "<%s>" % m.group(0), text),
+                             guard._VAR_USE_RE.sub(lambda m: "<%s>" % m.group(0), text), text)
+
     def test_each_heredoc_owner_is_still_judged(self):
         # The owner dedupe must neither skip a later owner nor mark one judged
         # before its own body is checked.
