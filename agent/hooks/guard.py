@@ -375,22 +375,246 @@ def _subst_inner(m: "re.Match[str]") -> str:
 # filesystem root — refusing the standard temp-dir cleanup idiom.
 _OPAQUE_SUBST = "turma_substituted_value"
 
-# An expansion of a variable this line never set, GLUED to word text after it:
-# `${x}rm`, `"$x"rm`, `$x""rm`, `$@rm`. Unset, it is nothing, and the word is
-# that text — `${x}rm -rf /etc` runs `rm` (XERK-1609). A plain `$name` is
-# matched only before a quote, since a letter after it extends the name. Only
-# a word character is glue: `rm -rf "$dir"/*` and `"$repo".git` are paths.
-_GLUED_PARAM_RE = re.compile(
-    r"""(?:\$\{(?:[A-Za-z_]\w*|[@*0-9])\}|\$[@*0-9])(?=["']*\w)"""
-    r"""|\$[A-Za-z_]\w*(?=["']+\w)""")
+# The special parameters that can expand to NOTHING: positional ones and `$!`
+# with no background job. `$$`, `$#`, `$?`, `$-` and `$0` always print text.
+_MAYBE_EMPTY_SPECIAL = set("@*123456789!")
+
+
+def _param_spans(text: str) -> list[tuple[int, int, str]]:
+    """Every live parameter expansion still in ``text``, as (start, end, kind).
+
+    By the time a segment is read, `_substitute_vars` has spliced each name the
+    line assigns, so whatever is left is one this line never set: `"param"`
+    (`$x`, `${x#a}`, `${a[@]}`, `${!a@}`, `$@`), `"locale"` for the `$` of a
+    bare `$"…"` (a translated string, which reads as the string), and
+    `"opaque"` for `_OPAQUE_SUBST`, a substitution whose output is unknown.
+    `${#x}` (a length) never expands to nothing, so it is not one.
+
+    One pass: only the LAST `$` of a run can start a name (the others pair
+    into `$$`), so liveness is asked once per run. Asking per `$` rescanned
+    the run each time, quadratic in a line of `$`s past the hook timeout.
+    """
+    if "$" not in text and _OPAQUE_SUBST not in text:
+        return []
+    states = _quote_states(text)
+    out: list[tuple[int, int, str]] = []
+    n, i = len(text), 0
+    opaque = text.find(_OPAQUE_SUBST)
+    while i < n:
+        if i == opaque:
+            out.append((i, i + len(_OPAQUE_SUBST), "opaque"))
+            i += len(_OPAQUE_SUBST)
+            opaque = text.find(_OPAQUE_SUBST, i)
+            continue
+        if text[i] != "$":
+            # Straight to the next `$` or placeholder: a per-character scan
+            # was most of a long line's time.
+            dollar = text.find("$", i)
+            i = n if dollar < 0 else dollar
+            if 0 <= opaque < i:
+                i = opaque
+            continue
+        while i + 1 < n and text[i + 1] == "$":
+            i += 1
+        if i + 1 >= n or states[i] in ("'", "\\") or not _live_dollar(text, i):
+            i += 1
+            continue
+        nxt = text[i + 1]
+        end = -1
+        if nxt == "{" and not text.startswith("${#", i):
+            close = _brace_end(text, i)
+            end = close + 1 if close > 0 else -1
+        elif nxt.isalpha() or nxt == "_":
+            end = i + 2
+            while end < n and (text[end].isalnum() or text[end] == "_"):
+                end += 1
+        elif nxt in _MAYBE_EMPTY_SPECIAL:
+            end = i + 2
+        elif nxt == '"' and states[i] == "":
+            out.append((i, i + 1, "locale"))
+        if end > 0:
+            out.append((i, end, "param"))
+            i = end
+        else:
+            i += 1
+    return out
+
+
+# A list expansion: NO word at all when empty, even quoted — `"$@"`,
+# `"${@:2}"`, `"${a[@]/x}"`, `"${!a[@]}"`, `"${!a@}"`. `"$*"` is one word.
+_QUOTED_NO_WORDS_RE = re.compile(
+    r"^\$(?:@|\{(?:!?(?:@|[A-Za-z_]\w*\[@\])|![A-Za-z_]\w*@)[^}]*\})$")
+
+# How many leading words `_unset_readings` reads before it finds the program:
+# each costs a tokenise of the words before it. Past it, a line that dropped
+# an empty word is too deep (denied); one that dropped none has no reading.
+_MAX_EMPTY_PROGRAM_WORDS = 64
+
+
+def _unset_readings(seg: str) -> list[str]:
+    """`_unset_readings_of`, each reading charged to the growth budget: every
+    one is re-expanded, at every depth an eval or `-c` adds, so unbudgeted
+    their fan-out ran a 98 KB line past the hook timeout (XERK-1615 QA)."""
+    out = _unset_readings_of(seg)
+    _spend(sum(map(len, out)))
+    return out
+
+
+def _unset_readings_of(seg: str) -> list[str]:
+    """``seg`` with each expansion that may be EMPTY read as empty, where the
+    empty reading runs a different command (XERK-1609, XERK-1615).
+
+    Two readings, each only ADDED to the ones the caller already has:
+    - Glued: an unset name glued to word text leaves that text, so `${x#a}rm`,
+      `"$x"\\rm`, `$@rm` and `$""rm` all run `rm`. Only a word character, a
+      backslash or another expansion is glue: `"$dir"/*` and `"$repo".git` are
+      paths, and reading them as `/*` and `.git` denied ordinary cleanup.
+    - Program: a COMMAND word made only of unquoted unset names, unknown-output
+      substitutions and quoted list expansions is no word at all, and bash runs
+      the next one as the program: `$x rm`, `$(true)$(true) rm`, `"$@" rm`.
+      A quoted `"$x"` is a word (bash runs `""`). A whole-word argument is
+      left alone: `rm -rf "$d"` passes an empty argument, and the guard reads
+      an empty target as the root.
+    A name this line assigns is never read empty: `R=$(command -v ruff); $R
+    check` names whatever R holds. The one clash is a tool path followed by
+    its `format` subcommand (ruff, black, cargo, terraform, clang-format), so
+    a revealed `format` counts only with the drive letter the Windows
+    formatter needs.
+
+    Both passes are linear in ``seg``: rebuilding the text per removal, or
+    tokenising every word's prefix, ran a 30 KB line past the hook's 60s
+    timeout, which fails OPEN (XERK-1615 QA).
+    """
+    spans = _param_spans(seg)
+    if not spans:
+        return []
+    # Glued, right to left: `nxt` is the first character after a span once
+    # quotes and the removed spans after it are skipped, so `${x}${y}rm`
+    # sees `${x}` glued once `${y}` is gone.
+    removed: list[tuple[int, int]] = []
+    nxt, nxt_at = "", len(seg)
+    for start, end, kind in reversed(spans):
+        j = end
+        while j < len(seg) and seg[j] in "\"'":
+            j += 1
+        after = nxt if j == nxt_at else seg[j:j + 1]
+        if kind == "locale" or (kind == "param" and (after.isalnum() or after in ("_", "\\", "$", "`"))):
+            removed.append((start, end))
+            nxt, nxt_at = after, start
+            continue
+        nxt, nxt_at = seg[start], start
+    pieces, last = [], 0
+    for start, end in reversed(removed):
+        pieces.append(seg[last:start])
+        last = end
+    pieces.append(seg[last:])
+    cur = "".join(pieces)
+    out = [cur] if cur != seg else []
+    # Program, over the segment as written and as glued: removing glued
+    # spans first turned `"$@""$@" rm` into `"""$@" rm`, which is a word.
+    for text in dict.fromkeys((seg, cur)):
+        prog = _empty_program_dropped(text)
+        if prog is None or prog in out:
+            continue
+        if prog == _TOO_DEEP:
+            return [_TOO_DEEP]
+        toks = _strip_prefixes(_tokenize(prog))
+        if not (toks and _basename(toks[0]) == "format"
+                and not any(re.match(r"^[A-Za-z]:", t) for t in toks[1:])):
+            out.append(prog)
+    return out
+
+
+def _empty_program_dropped(cur: str) -> str | None:
+    """``cur`` with its leading words that may be EMPTY dropped, else None
+    (see `_unset_readings`). Left to right over the words at the front of the
+    command: an empty one is dropped, a prefix word (`sudo`, `env a=1`) kept,
+    and the first real program word ends the walk."""
+    at = {start: (end, kind) for start, end, kind in _param_spans(cur)}
+    states = _quote_states(cur)
+    n, pos, dropped = len(cur), 0, False
+    words: list[str] = []
+    kept: list[str] = []
+    for _ in range(_MAX_EMPTY_PROGRAM_WORDS):
+        a = pos
+        while a < n and cur[a] in " \t":
+            a += 1
+        if a >= n:
+            break
+        p = a
+        while p < n:
+            if p in at and at[p][1] != "locale" and states[p] == "":
+                p = at[p][0]
+            elif cur[p] == '"' and p + 1 in at and at[p + 1][0] < n \
+                    and cur[at[p + 1][0]] == '"' \
+                    and _QUOTED_NO_WORDS_RE.match(cur[p + 1:at[p + 1][0]]):
+                p = at[p + 1][0] + 1
+            else:
+                break
+        if p > a and (p == n or (cur[p] in _WORD_END and states[p] == "")):
+            kept.append(cur[pos:a])
+            pos, dropped = p, True
+            continue
+        e = a
+        while e < n and not (cur[e] in " \t\n" and states[e] == ""):
+            e += 1
+        words.extend(_tokenize(cur[a:e]))
+        if _strip_prefixes(words):
+            break
+        kept.append(cur[pos:e])
+        pos = e
+    else:
+        # Out of words to read with no program found. A partial reading here
+        # re-read the next 64 at every depth, unbudgeted, past the hook
+        # timeout (XERK-1615 QA); no one writes 64 empty words, so deny.
+        # 64 plain prefix words (`A=1 B=2 …`) with none dropped are no reading.
+        return _TOO_DEEP if dropped else None
+    return "".join(kept) + cur[pos:] if dropped else None
+
+
+# How many substitutions in one segment may each get a reading of their own
+# (see `_decoy_readings`); a segment with more is read as too deep, which denies.
+_MAX_DECOY_SUBSTS = 16
+
+
+def _decoy_readings(raw: str) -> list[str]:
+    """``raw`` read once per substitution whose printed text differs as the
+    literal word (`_literal`): that one read plain, every other one literal.
+
+    The plain reading is what a shell re-parsing the text runs, and the
+    literal one is the word bash splices in. Reading a whole segment one way
+    let a SIBLING decide it (XERK-1615): in `bash -c "$(echo "''rm …")" "$(echo
+    '"')"` the plain reading leaves the second's `"` to unbalance the line, and
+    the literal one escapes the first's `''` that `bash -c` would strip. One
+    reading per substitution covers each being the re-parsed one without
+    trying every combination. More than `_MAX_DECOY_SUBSTS` fails closed.
+    """
+    if raw.count("$(") + raw.count("`") < 2:
+        return []
+    found = _find_substs(raw)
+    if len(found) < 2:
+        return []
+    differ = [m.start() for m in found
+              if _subst_text(m) != _subst_text(m, literal=True)]
+    if len(differ) < 2:
+        # The caller's all-plain and all-literal readings already cover it.
+        return []
+    if len(differ) > _MAX_DECOY_SUBSTS:
+        return [_TOO_DEEP]
+    # Each reading re-expands the whole segment: charged to the growth budget,
+    # so a long line of them is too large, never past the hook timeout.
+    _spend(len(raw) * len(differ))
+    return [_unwrap_group(_sub_substs(
+        raw, lambda m, plain=start: _subst_text(m, literal=m.start() != plain)))
+        for start in differ]
 
 
 def _quote_states(command: str) -> list[str]:
     """How each character of ``command`` is quoted: `'` inside a single-quoted
     literal, `"` inside a double-quoted string, `\\` escaped, "" bare.
 
-    A `$(…)` inside a string restarts quoting, as bash does, so the `'…'` in
-    `"$(echo 'a')"` is a real single-quoted literal again. A `#` comment is
+    A `$(…)` or backtick body inside a string restarts quoting, as bash does,
+    so the `'…'` in `"$(echo 'a')"` is a real single-quoted literal again. A `#` comment is
     `#` to its line's end: the apostrophe in `# don't` opened a "quote" that
     every later character was read inside (XERK-1549).
     """
@@ -414,6 +638,20 @@ def _quote_states(command: str) -> list[str]:
             stack.append("(")
             i += 2
             continue
+        if ch == "`":
+            # A backtick body ends at the next unescaped backtick, whatever
+            # quote or `#` is inside it, and its quoting is its own: in
+            # `"\`echo "it's"\`"` the apostrophe is in the body's string, and
+            # in `"\`echo # it's\`"` the comment ends at the closer. A frame
+            # left open let either swallow the closer (XERK-1615 QA). One
+            # never closed is a syntax error to bash; read it as text.
+            j = i + 1
+            while j < n and command[j] != "`":
+                j += 2 if command[j] == "\\" else 1
+            if j < n:
+                out[i + 1:j] = _quote_states(command[i + 1:j])
+                i = j + 1
+                continue
         if top == '"':
             out[i] = '"'
             if ch == '"':
@@ -1167,6 +1405,13 @@ _UNREAD_PROG = "\x00turma-unread-program"
 # spend at most ~10 KiB.
 _MAX_SUBST_GROWTH = 1024 * 1024
 
+# How long one decision may spend expanding before it DENIES as too large. The
+# growth budget counts characters, not time, and a long line re-expanded once
+# per reading at every eval / `-c` level ran past Claude Code's 60s hook
+# timeout, which RUNS the command unchecked (XERK-1615 QA). Real commands
+# take well under a second.
+_MAX_DECIDE_SECONDS = 30
+
 # The program name `_expand_segments` reports once the growth budget is spent.
 _TOO_LARGE = "\x00turma-too-large"
 _TOO_LARGE_REASON = ("refusing a command too large to classify (its variables or wrapped "
@@ -1194,7 +1439,8 @@ def _budgeted(fn):
         global _budget
         if _budget is not None:
             return fn(*args, **kwargs)
-        _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}}
+        _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {},
+                   "until": time.monotonic() + _MAX_DECIDE_SECONDS}
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
         try:
@@ -1209,7 +1455,7 @@ def _memo(kind: str, key, fn, *args):
     """``fn(*args)``, made once per decision. A hit replays the escaping
     splices it counted, which is what makes `_expand_both` take its raw pass."""
     memo = _budget[kind]
-    key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0])
+    key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _BRACE_GLUED[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -1372,7 +1618,10 @@ def _expand_braces(command: str) -> str:
         if not m:
             break
         start, end = m.span()
-        if states[start] or "," not in m.group(1)[1:]:
+        # `${x,,}` is a case-modifying parameter expansion, never a brace
+        # list: expanded, `${x,,}rm` read as `$xrm $rm $rm` (XERK-1615).
+        if states[start] or "," not in m.group(1)[1:] \
+                or (start and command[start - 1] == "$" and _live_dollar(command, start - 1)):
             pos = start + 1
             continue
         expansions += 1
@@ -1391,7 +1640,9 @@ def _expand_braces(command: str) -> str:
 @_budgeted
 def _var_values(command: str) -> dict[str, list[str]]:
     """Values this command line itself assigns to a variable."""
-    return _memo("vals", command, _assigned_values, command)
+    # A `\\<newline>` inside a value is no part of it: unjoined, it cut
+    # `x="… \\<newline>rm …"` to an empty value (XERK-1615).
+    return _memo("vals", command, _assigned_values, _join_continuations(command))
 
 
 def _assigned_values(command: str) -> dict[str, list[str]]:
@@ -1693,6 +1944,35 @@ def _live_dollar(command: str, i: int) -> bool:
     return live % 2 == 1
 
 
+# A bare name glued to another expansion: `$x$(…)`, `$x${y}`, `` $x`…` ``,
+# `\$x\$(…)`. Even after a `$`: `\$$x` is a literal `$` then a live `$x`, and
+# skipping it let `eval \$$x$(echo 'y rm …')` through (XERK-1615 QA); `$$x`
+# braced as `$${x}` is still the PID, then text.
+_GLUED_NAME_RE = re.compile(r"\$([A-Za-z_]\w*)(?=[$`\\])")
+
+
+def _brace_glued_names(text: str) -> str:
+    """``text`` with each bare `$name` glued to another expansion braced,
+    `${name}`, which bash reads the same. Inlined first, the expansion after
+    it extended the name: `$x$(echo rm …)` read as `$xrm …`, an unset name
+    that swallowed the command bash runs when x is unset (XERK-1615 QA).
+
+    Quoted or escaped ones too: the inliner splices into single-quoted and
+    escaped text a `-c` script re-parses (`bash -c '$x$(echo rm …)'`), and
+    in text nothing re-parses the rewrite changes only data.
+
+    The brace is right only where the name and the expansion re-parse at the
+    same level, which the text alone cannot say: `eval \\$x$(echo 'y rm …')`
+    runs `$xy rm …`. So `_expand` also reads the text unbraced."""
+    if "$" not in text or not _BRACE_GLUED[0]:
+        return text
+    return _GLUED_NAME_RE.sub(r"${\1}", text)
+
+
+# Off while `_expand` takes its unbraced reading (see `_brace_glued_names`).
+_BRACE_GLUED = [True]
+
+
 @_budgeted
 def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> str:
     """Inline variables the command line sets itself.
@@ -1702,6 +1982,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     from an enclosing command line instead (a group body sees its parent's).
     """
     # NB: no early return on an empty map — `${nope:-/etc}` needs no assignment.
+    command = _brace_glued_names(command)
     if vals is None:
         vals = _var_values(command)
 
@@ -1795,6 +2076,8 @@ def _escape_value(value: str, state: str) -> str:
 
 
 def _prenormalise(command: str) -> str:
+    # Braced before ANSI-C decoding, which glued `$x$'eval'` into `$xeval`.
+    command = _brace_glued_names(command)
     return _substitute_vars(_expand_braces(_IFS_RE.sub(" ", _decode_ansi_c(command))))
 
 
@@ -2159,8 +2442,31 @@ def _unwrap_group(segment: str) -> str:
     return seg
 
 
+def _join_continuations(segment: str) -> str:
+    """``segment`` with each `\\<newline>` bash removes dropped: everywhere
+    but inside single quotes. shlex instead kept the newline as text glued to
+    the NEXT word, so `time \\<newline>rm -rf /etc` ran a program it read as
+    `\\nrm`, and `$x \\<newline>rm` hid the `rm` from every reading (XERK-1615)."""
+    if "\\\n" not in segment:
+        return segment
+    # `_quote_states` marks a live escape's backslash AND the character it
+    # escapes; it knows `#` comments and the quoting `$(…)` restarts. A scan
+    # of its own lost both: an apostrophe in `# don't` opened a "quote" and
+    # every later continuation was kept (XERK-1615 QA).
+    states = _quote_states(segment)
+    out, last, i = [], 0, segment.find("\\\n")
+    while i >= 0:
+        if states[i] == states[i + 1] == "\\":
+            out.append(segment[last:i])
+            last = i + 2
+        i = segment.find("\\\n", i + 1)
+    out.append(segment[last:])
+    return "".join(out)
+
+
 @functools.lru_cache(maxsize=512)
 def _tokenize_cached(segment: str) -> tuple[str, ...]:
+    segment = _join_continuations(segment)
     try:
         return tuple(shlex.split(segment, posix=True))
     except ValueError:
@@ -2479,15 +2785,41 @@ def _expand_raw_too(command: str) -> list[tuple[list[str], str]]:
 
 
 def _script_readings(script: str) -> list[str]:
-    """``script`` as a word shlex produced, and again with `\\${` unescaped.
+    """``script`` as a word shlex produced, and again with each `\\$` before a
+    parameter unescaped.
     Inside `"…"` bash drops that backslash and shlex keeps it, so
     `bash -c "echo \\${a:-'}' #}; rm -rf /"` reached the re-parse with an
-    escaped `$` and its `#` read as a comment (XERK-1585); `\\$'…'` likewise (XERK-1611). The token no longer
-    says which quoting it came from; reading both fails closed. Only `${`: an
-    escaped `$(` or backtick is already classified where it sits, and
-    unescaping those too nested real scripts past _MAX_EXPAND_DEPTH."""
-    plain = script.replace("\\${", "${").replace("\\$'", "$'")
-    return [script] if plain == script else [script, plain]
+    escaped `$` and its `#` read as a comment (XERK-1585); `\\$'…'` likewise
+    (XERK-1611); and `eval "\\$x rm …"` with a literal `$x` as its program,
+    never an unset one (XERK-1615).
+    The token no longer says which quoting it came from; reading both fails
+    closed. Only a parameter: an escaped `$(` or backtick is already
+    classified where it sits, and unescaping those too nested real scripts
+    past _MAX_EXPAND_DEPTH."""
+    plain = _ESCAPED_PARAM_RE.sub("$", script).replace("\\$'", "$'")
+    if plain == script:
+        return [script]
+    # A second whole expansion at every eval / `-c` level: charged, so a long
+    # nest of them is too large rather than past the hook timeout.
+    _spend(len(plain))
+    return [script, plain]
+
+
+def _heredoc_readings(body: str) -> list[str]:
+    """An UNQUOTED heredoc body as written, and as the shell it feeds reads
+    it: bash drops a `\\` before `\\`, `$`, a backtick or a newline there, so
+    `bash <<EOF` / `\\$x rm …` runs an unset `$x`, `\\<newline>` joins two
+    lines, and `\\\\\\$x` is one escape level down (XERK-1615). Charged to the
+    growth budget like the other added readings."""
+    plain = re.sub(r"\\([\\$`\n])", lambda m: "" if m.group(1) == "\n" else m.group(1), body)
+    if plain == body:
+        return [body]
+    _spend(len(plain))
+    return [body, plain]
+
+
+# A `\$` before a parameter, which a double-quoted `-c`/eval script unescapes.
+_ESCAPED_PARAM_RE = re.compile(r"(?<!\\)\\\$(?=[{A-Za-z_@*0-9!])")
 
 
 def _expand_segments(command: str, depth: int = 0,
@@ -2517,6 +2849,23 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     out: list[tuple[list[str], str]] = []
     if depth > _MAX_EXPAND_DEPTH:
         return [([_TOO_DEEP], command)]
+    if _budget is not None and time.monotonic() > _budget["until"]:
+        _budget["left"] = -1
+        raise _ExpansionTooLarge
+    # Before any reader: an assigned value read first kept `a=$x$(echo rm …)`
+    # as `$xrm …` (see `_brace_glued_names`). An ADDED reading, never swapped
+    # in: a re-parse can join what the brace split — `eval "\$x$(echo y) rm …"`
+    # runs `$xy rm …`, its substitution already run a level up — so the text
+    # is also read unbraced, with no bracing beneath (XERK-1615 QA).
+    braced = _brace_glued_names(command)
+    if braced != command:
+        _spend(len(command))
+        _BRACE_GLUED[0] = False
+        try:
+            out.extend(_expand(command, depth, cwds))
+        finally:
+            _BRACE_GLUED[0] = True
+        command = braced
     # Groups first, over the whole command: splitting below would sever any
     # group whose body holds an operator (see _balanced_groups). Scanned
     # BEFORE pre-normalisation, whose brace expansion ignores quoting and can
@@ -2558,7 +2907,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             return owner_pipes_to_shell[owner]
         if (owner_tokens and _basename(owner_tokens[0]) in (_SHELL_PROGS | {"eval", "source", "."})
                 or _owner_feeds_shell()):
-            out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, every_cd))
+            for script in ([body] if quoted else _heredoc_readings(body)):
+                out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
+                                            every_cd))
         elif not quoted:
             # ...but data behind an UNQUOTED delimiter is expanded first, so its
             # `$(…)` and backticks run whoever reads it: `cat <<EOF` / `$(rm -rf
@@ -2601,7 +2952,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # only the segments that differ. A printed text holding a substitution is
     # left to the bodies' own pass: re-reading it here re-expanded every level
     # of a nest again and multiplied the cost by its depth.
-    printed_line = raw_commands
+    unprinted = printed_line = _brace_glued_names(raw_commands)
     for body in bodies:
         if not _SEGMENT_SPLIT.search(body):
             continue
@@ -2610,7 +2961,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if printed and "$(" not in printed and "`" not in printed:
             for whole in ("$(" + body + ")", "`" + body + "`"):
                 printed_line = printed_line.replace(whole, printed)
-    if printed_line != raw_commands:
+    if printed_line != unprinted:
         # Its lines are commands to a shell that re-parses them, and words
         # where the line word-splits them (`$(echo rm -rf; echo /etc)`).
         seen = set(segments)
@@ -2690,7 +3041,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                         fed.extend(_proc_subst_texts(_subst_inner(m)))
                 for text in fed:
                     if text.strip():
-                        out.extend(_expand_segments(text, depth + 1, every_cd))
+                        # shlex keeps a double-quoted `\\$` bash drops: `bash
+                        # <<< "\\$x rm …"` runs an unset `$x` (XERK-1615).
+                        for script in _script_readings(text):
+                            out.extend(_expand_segments(script, depth + 1, every_cd))
             # This stage's own contribution to readers DOWNSTREAM of it. A
             # producer behind a prefix (`sudo echo …`, `time printf …`) still
             # prints, so strip them before reading what it emits.
@@ -2734,12 +3088,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             _unwrap_group(_sub_substs(
                 raw, lambda m: _subst_text(m, glued_empty=True, multi=False))),
             _unwrap_group(_sub_substs(raw, lambda m: _subst_text(m, literal=True))),
-            _GLUED_PARAM_RE.sub("", seg),
             # ...and a filtered or partly-unread substitution read as the text
             # its producers emit (XERK-1613); a non-cut one is read here, a cut
             # one by the line pass above.
             *(_unwrap_group(t) for t in _taint_readings(raw, _taint_subst)),
         }
+        readings.update(_unset_readings(seg))
+        readings.update(_decoy_readings(raw))
         for reading in readings - {seg, bare, ""}:
             out.extend(_expand_segments(reading, depth + 1, cwds))
         # An `eval`'s words joined as eval re-parses them, read off the RAW
