@@ -1424,7 +1424,9 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
                 pat_parens -= 1
             elif ch == ")":
                 in_pattern = False
-                pattern = re.sub(r"\s*\|\s*", "|", "".join(buf).strip())
+                # Split, not `\s*\|\s*`: that regex rescanned a blank run
+                # from each of its blanks (XERK-1601).
+                pattern = "|".join(alt.strip() for alt in "".join(buf).split("|"))
                 if re.search(r"\s|\$\(|`|[<>]\(", pattern):
                     flush()
                 else:

@@ -2098,13 +2098,20 @@ class TestExpansionBudget(unittest.TestCase):
         # and past the hook timeout the command ran unchecked (XERK-1601).
         for cmd in ("echo" + " " * 72000 + "x; rm -rf /",
                     "case x in" + " " * 72000 + "a) rm -rf / ;; esac",
-                    "case x in a)" + " " * 72000 + "esac; rm -rf /"):
+                    "case x in a)" + " " * 72000 + "esac; rm -rf /",
+                    "case x in a" + " \t" * 36000 + "b) rm -rf / ;; esac"):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:12])
             self.assertLess(time.monotonic() - t, 5, cmd[:12])
         self.assertEqual(guard._assigned_values("a=1  b=2;c=3 echo d=4")["d"], ["4"])
         self.assertNotIn("b", guard._assigned_values("a=(x)b=1"))
         self.assertEqual(guard._split_segments("case x in   (a|b) ls;; esac"), ["case x in", "ls", "esac"])
+        # A tab is blank before an opener, and a new segment's blanks are its
+        # own: `ab esac)` is a pattern, not the case's end.
+        self.assertEqual(guard._split_segments("case x in a) :;; \t(b|c) ls;; esac"),
+                         ["case x in", ":", "ls", "esac"])
+        self.assertEqual(guard.decide("Bash", {"command": "case x in a) :;;  \nab esac) rm -rf /;; esac"})[0],
+                         "deny")
 
     def test_brace_end_matches_a_fresh_scan_in_any_order(self):
         # Remembered closers must give what a scan from scratch would.
