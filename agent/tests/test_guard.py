@@ -1400,6 +1400,24 @@ class TestScriptChannels(unittest.TestCase):
         # A script FILE reads its own stdin; the here-string is its data.
         self.assertAllowed(f"bash script.sh <<< '{R}'")
 
+    def test_a_redirection_before_the_program(self):
+        # XERK-1616: bash takes redirections anywhere in a simple command, so
+        # `2>/dev/null rm -rf /` runs rm; and the `&` of `2>&1` / `&>` is no
+        # operator, so it must not split the line there.
+        R = self.R
+        for cmd in (f"2>/dev/null {R}", f"2> /dev/null {R}", f">/dev/null {R}",
+                    f"&>/dev/null {R}", f">/dev/null 2>&1 {R}", f"2>&1 {R}",
+                    f"</dev/null bash -c '{R}'", f"echo x | 2>/dev/null bash -c '{R}'",
+                    f"echo x >| f; {R}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("2>/dev/null ls /etc", "> out echo hi", "ls 2>&1 | tail",
+                    "make &> build.log", "rm -rf build >/dev/null 2>&1"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertEqual(guard._split_segments("ls >/dev/null 2>&1 | tail"),
+                         ["ls >/dev/null 2>&1", "tail"])
+
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R
         for cmd in (f"eval -- '{R}'", f"eval -- eval -- '{R}'", f"builtin eval '{R}'",

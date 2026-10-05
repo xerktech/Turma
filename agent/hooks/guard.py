@@ -1602,6 +1602,14 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
             flush()
             i += 2
             continue
+        # The `&` of `2>&1`, `<&0` and `&>log`, and the `|` of `>|f`, belong
+        # to a redirection: splitting there cut `>/dev/null 2>&1 rm -rf /etc`
+        # into `… 2>` and `1 rm -rf /etc` (XERK-1616).
+        if (ch == "&" and (buf and buf[-1].endswith(("<", ">")) or command[i + 1:i + 2] == ">")
+                or ch == "|" and buf and buf[-1].endswith(">")):
+            buf.append(ch)
+            i += 1
+            continue
         if ch in (";", "\n", "&") or (include_pipe and ch == "|"):
             flush()
             i += 1
@@ -1661,6 +1669,15 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             continue
         if _FUNC_DEF_RE.match(head) or _CASE_PATTERN_RE.match(head):
             out.pop(0)
+            continue
+        # A redirection may come before the program: `2>/dev/null rm -rf /etc`
+        # runs `rm` (XERK-1616). Its target goes too when the operator stands
+        # alone. `<(…)`/`>(…)` is a process substitution, not a redirection.
+        redirect = None if head[:2] in ("<(", ">(") else _REDIRECT_RE.match(head)
+        if redirect:
+            out.pop(0)
+            if not redirect.group(1) and out:
+                out.pop(0)
             continue
         if head == "function":
             out.pop(0)
