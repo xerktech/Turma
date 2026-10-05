@@ -2783,7 +2783,7 @@ _TRAIL_WORD_END = frozenset(" \t\n;&|()<>")
 
 def _only_redirects(text: str, i: int) -> bool:
     """Whether ``text[i:]`` is nothing but redirections (`2>&1`, `>f`, `{fd}>f`,
-    `<<<w`, `<>f`, a heredoc's `<<EOF`, glued or not). One greedy pass, as bash reads them: a regex for
+    `<<<w`, `<>f`, a heredoc's `<<EOF`, glued or not, quoted targets too). One greedy pass, as bash reads them: a regex for
     this backtracked over every way to split `>a1>a1…` — exponential, past the
     hook timeout, which fails open (XERK-1614)."""
     n = len(text)
@@ -2810,6 +2810,14 @@ def _only_redirects(text: str, i: int) -> bool:
             i += 1
         start = i
         while i < n and text[i] not in _TRAIL_WORD_END:
+            # A quoted span is part of the word, blanks and all: `2>'a b'`.
+            if text[i] in ("'", '"'):
+                close = text.find(text[i], i + 1)
+                if close < 0:
+                    return False
+                i = close
+            elif text[i] == "\\":
+                i += 1
             i += 1
         if i == start:
             return False
