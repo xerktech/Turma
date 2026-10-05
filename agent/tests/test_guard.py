@@ -2317,7 +2317,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # ...in a pipe feeding a shell, a cd target and a value too.
                     'echo "$(echo rm -rf /etc | grep .)" | sh',
                     'cd "$(echo / | grep /)"; rm -rf *', "x=$(echo / | grep /); cd $x; rm -rf *",
-                    "x=$(echo /etc | grep /); rm -rf $x"):
+                    "x=$(echo /etc | grep /); rm -rf $x",
+                    # A value is read one way per pass, never both joined.
+                    "x=$(echo sh; true); echo 'rm -rf /etc' | $x",
+                    "x=$(echo bash | cat); echo 'rm -rf /etc' | env $x",
+                    'cd "$(echo /; echo x)"; rm -rf *', "cd $(echo /; true); rm -rf *"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         # A body printing nothing known stays opaque, never the empty root word.

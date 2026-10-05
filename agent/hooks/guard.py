@@ -811,6 +811,8 @@ def _budgeted(fn):
         if _budget is not None:
             return fn(*args, **kwargs)
         _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}}
+        # Lives as long as the memo that may skip re-reading the values.
+        _VALUES_DIFFER[0] = False
         try:
             return fn(*args, **kwargs)
         finally:
@@ -823,7 +825,7 @@ def _memo(kind: str, key, fn, *args):
     """``fn(*args)``, made once per decision. A hit replays the escaping
     splices it counted, which is what makes `_expand_both` take its raw pass."""
     memo = _budget[kind]
-    key = (key, _SPLICE_RAW[0])
+    key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -1009,11 +1011,15 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         if value.startswith("(") and value.endswith(")"):
             # An array, `a=(rm -rf *)`: its words, which `"${a[@]}"` runs.
             value = value[1:-1].strip()
-        # ...and the value as read before XERK-1609 (see `_body_printed`),
-        # which `_substitute_vars` joins after it.
+        # Read as before XERK-1609 unless `_expand_both` is on its pass for
+        # several statements (see `_body_printed`). Both in one list was no
+        # good: `_substitute_vars` joins a name's values into ONE word list,
+        # and `x=$(echo sh; true); echo P | $x` read as `sh sh; true`.
         value = _dequote_value(value)
-        base, produced = _produced_text(value, multi=False), _produced_text(value)
-        vals.setdefault(m.group(1), []).extend([produced] if produced == base else [produced, base])
+        produced = _produced_text(value, multi=_VALUES_MULTI[0])
+        if not _VALUES_MULTI[0] and _produced_text(value) != produced:
+            _VALUES_DIFFER[0] = True
+        vals.setdefault(m.group(1), []).append(produced)
     for m in _FOR_IN_RE.finditer(command):
         words = [w for w in m.group(2).split() if w != "do"]
         if words:
@@ -1352,6 +1358,10 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
 # Set while `_expand_both` takes its raw reading; counts escaping splices.
 _SPLICE_RAW = [False]
 _SPLICES_ESCAPED = [0]
+# Set while `_expand_both` reads assigned values as several statements print
+# them; and whether any value this decision read differs that way (XERK-1609).
+_VALUES_MULTI = [False]
+_VALUES_DIFFER = [False]
 
 
 def _quote_literal(value: str, state: str) -> str:
@@ -1955,7 +1965,21 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     """`_expand_segments`, and — when a spliced value needed escaping, or an
     expansion was read as escaped — again with every value spliced raw and
     every expansion live (see `_quote_literal`, `_live_dollar`). Neither
-    reading is right at every re-parse depth; together they fail closed."""
+    reading is right at every re-parse depth; together they fail closed.
+
+    Assigned values are read as before XERK-1609, and once more as several
+    statements print them when that differs (`_assigned_values`)."""
+    out = _expand_raw_too(command)
+    if _VALUES_DIFFER[0]:
+        _VALUES_MULTI[0] = True
+        try:
+            out = out + _expand_raw_too(command)
+        finally:
+            _VALUES_MULTI[0] = False
+    return out
+
+
+def _expand_raw_too(command: str) -> list[tuple[list[str], str]]:
     _SPLICES_ESCAPED[0] = 0
     out = _expand_segments(command)
     if _SPLICES_ESCAPED[0]:
@@ -2096,6 +2120,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         seen = set(segments)
         segments += [seg for seg in _split_segments(_prenormalise(printed_line))
                      if seg not in seen]
+        # Those segments run AFTER the ones they came from, so a `cd` among
+        # them (`cd $(echo /; true); rm -rf *`) moves the whole line, in order
+        # or not: the half-segment `cd $(echo /` named no directory.
+        cwds = _cd_readings(_prenormalise(printed_line), cwds)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
@@ -2154,9 +2182,6 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 # ...and with its substitutions run: tokenising first split a
                 # nested backtick at its escaped inner opener (XERK-1605).
                 _feed(_printed_text(_sub_substs(seg, _subst_text)) or "")
-                # ...and as read before XERK-1609 (see `_body_printed`).
-                _feed(_printed_text(_sub_substs(
-                    seg, lambda m: _subst_text(m, multi=False))) or "")
                 for hs in _herestrings(seg):
                     _feed(hs)
     for raw in segments:
