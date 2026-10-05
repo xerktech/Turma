@@ -1400,6 +1400,33 @@ class TestScriptChannels(unittest.TestCase):
         # A script FILE reads its own stdin; the here-string is its data.
         self.assertAllowed(f"bash script.sh <<< '{R}'")
 
+    def test_a_redirection_before_the_program(self):
+        # XERK-1616: bash takes redirections anywhere in a simple command, so
+        # `2>/dev/null rm -rf /` runs rm. The `&` of `2>&1` and `|` of `>|` are
+        # split on AND read rebuilt: an escaped or expanded `>` leaves a real
+        # operator (`echo a\\>&rm …`, dash's `true &>/dev/null rm …`).
+        R = self.R
+        B16 = "\\" * 16  # an EVEN run: the `>` after it is a live redirection
+        for cmd in (f"2>/dev/null {R}", f"2> /dev/null {R}", f">/dev/null {R}",
+                    f"&>/dev/null {R}", f">/dev/null 2>&1 {R}", f"2>&1 {R}",
+                    f"</dev/null bash -c '{R}'", f"echo x | 2>/dev/null bash -c '{R}'",
+                    f"echo x >| f; {R}", f">| f {R}", f"echo a\\>&{R}", f"echo a\\>|{R}",
+                    f"echo ${{x:->}}&{R}", f"x='>'; echo $x&{R}",
+                    f"sh -c 'true &>/dev/null {R}'", f"<&- {R}", f"{{fd}}>/dev/null {R}",
+                    # ...and a producer's own `2>&1` still feeds the shell after it.
+                    f"echo '{R} #' 2>&1 | sh", f"echo '{R} #' {B16}>&1 | sh", f"echo '{R}' 2>&1 | tee /dev/null | sh",
+                    f"bash <(echo '{R}' 2>&1)"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("2>/dev/null ls /etc", "> out echo hi", "ls 2>&1 | tail",
+                    "make &> build.log", "rm -rf build >/dev/null 2>&1"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertAllowed("ls >/dev/null 2>&1 &")
+        self.assertAllowed("cmd 2>&1 | grep rm")
+        # An ODD run escapes the `>`: the `&` backgrounds echo, and sh reads nothing.
+        self.assertAllowed(f"echo '{R} #' {B16}\\>&1 | sh")
+
     def test_a_proc_subst_passed_through_or_sourced_in_a_c_script(self):
         # XERK-1611: `cat <(…)` passes its file through to a shell downstream,
         # and a quoted `<(…)` in a `-c` script is the INNER shell's to run.
