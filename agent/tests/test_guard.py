@@ -1415,7 +1415,7 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <(cat <(echo {R})) | bash", f"cat <(echo {R} | cat) | bash",
                     f'bash -c ". <(cat <(echo {R}))"', f'$(echo bash) -c ". <(echo {R})"',
                     f"bash < <(cat <(echo {R}))", f"cat <(echo {R}; true) | bash",
-                    f"bash < <(echo hi; echo {R})", f"cat <(eval echo {R}) | bash",
+                    f"bash < <(echo hi; echo {R})", f"cat <(eval echo {R}) | bash", f"bash < <(eval -- echo {R})",
                     f"cat <(bash -c 'echo {R}') | bash",
                     # ...an ANSI-C string behind an escaped BACKSLASH, still live,
                     f"bash -c \\\\$'{R}'", f"eval \\\\$'{R}'", f"echo \\\\$'{R}' | bash",

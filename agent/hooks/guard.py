@@ -1764,7 +1764,9 @@ def _proc_subst_texts(body: str, depth: int = 0) -> list[str]:
         # ...and what an `eval` or a `sh -c` in it prints: `<(eval echo …)`.
         words = _strip_prefixes(_tokenize(seg))
         if len(words) > 1 and _basename(words[0]) == "eval":
-            out.extend(_proc_subst_texts(" ".join(words[1:]), depth + 1))
+            # bash's eval takes (and drops) `--`.
+            args = words[2:] if words[1] == "--" else words[1:]
+            out.extend(_proc_subst_texts(" ".join(args), depth + 1))
         elif words and _basename(words[0]) in _SHELL_PROGS:
             script = _shell_c_script(words[1:])
             if script:
