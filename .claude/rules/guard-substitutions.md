@@ -103,7 +103,7 @@ paths:
     with a drive letter: `$R format --check .` (ruff, black, cargo) is the clash.
   - `_expand_braces` skips `${x,,}`: brace-expanding it read `${x,,}rm` as `$xrm $rm $rm`.
   - Both passes must stay LINEAR (`test_empty_expansion_readings_stay_linear`): rebuilding the
-    text per removal, or tokenising every word's prefix, ran 30 KB past the 60s hook timeout.
+    text per removal, or tokenising every word's prefix, ran 30 KB toward the hook timeout.
   - Past `_MAX_EMPTY_PROGRAM_WORDS` with a word dropped → too deep: a partial reading was re-read
     64 words at a time at every depth, unbudgeted, past the hook timeout.
   - `_script_readings` unescapes every `\$` before a parameter: shlex keeps it in `"…"`, bash
@@ -119,7 +119,15 @@ paths:
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
 - **A decision has a wall-clock deadline** (`_MAX_DECIDE_SECONDS`, checked in `_expand`): out of
   time it denies as too large. The growth budget counts characters, not time; readings re-expanded
-  per eval level ran 98 KB past the 60s hook timeout, which RUNS the command.
+  per eval level ran 98 KB toward the hook timeout, which RUNS the command.
+- **main() has a hard deadline too** (`_HOOK_DEADLINE_SECONDS`, XERK-1619): `decide` runs on a
+  daemon thread; past it the hook prints a deny and `os._exit`s. The in-decide check never runs
+  inside one frame — shlex on one 300 KB word took 126-181s, quadratic in its length. The hook
+  timeout is Claude Code's 600s default (`build_guard_settings` sets none).
+  - Tests must never reach the real `os._exit`: it ends the run with rc 0, a truncated green
+    suite. `test_guard.py` swaps `_hard_exit` for one that raises, module-wide.
+  - A thread, not SIGALRM: the hook also runs on the Windows agent.
+  - Residual: one C call holding the GIL (a backtracking regex) still blocks the watchdog.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
@@ -127,6 +135,6 @@ paths:
   `test_a_large_conditional_or_nested_taint_body_stays_fast`,
   `test_a_large_filtered_body_classifies_without_timing_out`,
   `test_a_sibling_or_an_empty_expansion_does_not_hide_the_command`,
-  `test_a_decision_past_its_deadline_denies`,
+  `test_a_decision_past_its_deadline_denies`, `test_a_decision_past_the_hook_deadline_denies`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).
