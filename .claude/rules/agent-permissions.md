@@ -219,10 +219,16 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
   - Pinned: `PLAIN_GATE_PROBES` + `JUDGEABLE` (`test_only_plain_commands_reach_the_model`; npm ci,
     pytest -q, docker build, cargo test pass). Residual: a script's contents (`npm test`, `./x`
     written by an EARLIER call) are not on the command line; the model sees only its name.
-  - **Known open gap: XERK-1595** (shipped by operator decision, 2026-10-04). A quoted option value
-    some programs hand to a shell (`tar --to-command`, `make --eval`, `git -c core.sshCommand`, …)
-    reads as plain, so a command hidden there can reach the model. Until it is fixed the model's
-    own reading is the last check; never describe the gate as complete.
+  - (b″) shell-handing options stand outright, disguised or not (`_judge_shell_option_reason`,
+    XERK-1595): tar `--to-command`/`--checkpoint-action`/`-I`/`-F`…, make `--eval`/`-E`/`SHELL=`,
+    zip `-TT`/`--unzip-command`, a GNU sed `e` command or `s///e`, and a git config key git runs
+    (`core.sshCommand`/`fsmonitor`/`editor`/`pager`, `credential.*helper`, `*.textconv`,
+    `filter.*`, `include.*`…) via `-c`, `--config-env` or `git config`. Long names match any
+    GNU abbreviation (`--to-com`).
+  - (b‴) a quoted word with whitespace that also holds an inner quote, a backslash, a `$`/backtick,
+    a glob or a brace list stands (`_JUDGE_PAYLOAD_DISGUISE_RE`): an UNKNOWN shell-handing option
+    could turn `g""it pu""sh` back into a push the raw never-list cannot see. Shell operators alone
+    do not stand (they hide no word), so `-m 'feat(x): a; b'` stays judgeable; `-m "don't"` stands.
 - **The never-list FAILS CLOSED by command FAMILY, never by flag spelling** (coordinator decision,
   2026-10-04: three review rounds each found one more spelling — `--mirr`, a quoted `'+feat'`, a
   glob refspec, REST `/merges`, GraphQL `mergePullRequest`, a curl to api.github.com). Stood whole:

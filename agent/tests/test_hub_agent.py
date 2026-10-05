@@ -41399,6 +41399,34 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "rsync --rsh=ssh a b:c", "tool --entrypoint=sh", "git -c core.sshCommand=sh fetch",
         "tool 'bash -c \"ls *\"'", "tool 'cd /x && sh y'", "tool 'ssh h ls'",
         "tool 'timeout 5 g'", "make CMD='docker run img'", "tool x python3",
+        # A quoted payload some program hands /bin/sh (XERK-1595): an inner
+        # quote, escape or glob turns its words back into a push or a glob
+        # the raw never-list and the lexer never see.
+        "tar -xf a.tar --to-command='g\"\"it pu\"\"sh origin HEAD:main'",
+        "make --eval='all: ; g\"\"it pu\"\"sh origin HEAD:main'",
+        "git -c core.sshCommand='g\"\"it pu\"\"sh origin HEAD:main;:' fetch",
+        "git -c core.fsmonitor='g\"\"it pu\"\"sh origin HEAD:main' status",
+        "git -c credential.helper='!g\"\"it pu\"\"sh' fetch",
+        "sed 'e g\"\"it pu\"\"sh' f",
+        "zip a.zip f -T --unzip-command='g\"\"it pu\"\"sh'",
+        "tar -xf a.tar --to-command='ls *'", "make --eval='x: ; ls *' x",
+        "git -c core.editor='ls *' commit", "tool --x='g\\it pu\\sh origin main'",
+        "tool 'gi? pu?h origin main'", "tool '/usr/bin/g[i]t status'",
+        # ...and the known shell-handing options stand outright, disguised or not.
+        "tar -xf a.tar --to-command='touch x'", "tar -xf a.tar --to-com='touch x'",
+        "tar -c --checkpoint-action=exec=touch d", "tar -I 'touch x' -cf a.tar d",
+        "tar xIf zstd a.tar", "tar --use-compress-program=zstd -cf a.tar d",
+        "make --eval='x: ; touch y' x", "make --ev='x: ; touch y' x", "make -E 'x: ; touch y' x",
+        "make -kE 'x: ; touch y' x", "make SHELL=/tmp/s x", "gmake --eval=x",
+        "git -c core.sshCommand=touch fetch", "git -c core.pager=less log",
+        "git -c CORE.HOOKSPATH=/tmp/h commit -m x", "git -c core.askPass=x fetch",
+        "git -c credential.helper=x fetch", "git -c diff.external=x diff",
+        "git -c diff.x.textconv=x diff", "git -c filter.x.clean=x add f",
+        "git -c sequence.editor=x rebase -i", "git -c include.path=/tmp/c status",
+        "git --config-env=core.pager=P log", "git config core.editor vim",
+        "git config --global credential.helper store",
+        "sed '1e touch x' f", "sed -i 's/a/b/e' f", "sed -e '$e touch x' f", "gsed 's/a/b/ge' f",
+        "zip -TT 'touch x' a.zip f", "zip -rTT x a.zip d", "zip --unzip-c=x -T a.zip f",
     )
 
     # Ordinary commands a model may judge: the gate passes them.
@@ -41409,7 +41437,12 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
                  "cargo run --release", "docker compose build", "docker ps", "go test ./...",
                  "poetry install", "jq '.items[] | .name' f.json", "make CMD=build",
                  "git commit -m 'fix env loading for the cmd flag'",
-                 "git commit -m 'feat(x): set up CI; go faster'")
+                 "git commit -m 'feat(x): set up CI; go faster'",
+                 "tar -xf a.tar", "tar -czf a.tgz d", "tar xzf a.tgz", "make -C x test",
+                 "sed -n 's/a/b/p' f", "sed -e 's/e/x/g' f", "sed -i 's/one/two/' f",
+                 "git -c color.ui=never log", "zip -r a.zip d", "zip -T a.zip f",
+                 "git config user.name", "git add filter.py pager.js",
+                 "git -C x log -- include.h", "git commit -m 'fix the env loading: one, two'")
 
     def test_only_plain_commands_reach_the_model(self):
         for cmd in self.PLAIN_GATE_PROBES:
