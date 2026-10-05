@@ -1581,7 +1581,12 @@ class TestScriptChannels(unittest.TestCase):
                     f": ${{x#(}}; echo {R} | sh", f": ${{x//(/}}; sh <<< '{R}'",
                     f": ${{x%%(*}}; echo {R} |& bash", f": ${{x#(}}; {{ echo {R}; }} | sh",
                     f": ${{x#(}}\necho {R} | sh", f": ${{x:-$( (a; b) )}}; echo {R} | sh",
-                    f"( : ${{x#)}}; echo {R} ) | sh"):
+                    f"( : ${{x#)}}; echo {R} ) | sh",
+                    # ...and an unclosed one past them, which re-splits without groups.
+                    f": ${{#x}}; x=${{y:-(}}; echo {R} | sh",
+                    # A producer in a group inside a list (`_simple_commands`).
+                    f"(true; (echo {R}; true)) | sh", f"{{ {{ echo {R}; }} 2>&1; true; }} | sh",
+                    f"(true; {{ echo {R}; }}) | sh"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("echo hi |& cat", "make 2>&1 | tee log", "echo hi | bash -c 'grep h'",
