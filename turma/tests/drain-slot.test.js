@@ -128,7 +128,7 @@ test("XERK-291: an honest over-cap beat still gets its 413 after a refusal flood
 // that is the case the lingering close exists for. It closes only once it sees the hub's
 // FIN. Resolves on close with what was read, whether the whole body went out, any socket
 // error, and how long after the status arrived the hub's FIN came.
-function postWhileWriting(declared, route = "/api/heartbeat", auth = "Bearer agenttok") {
+function postWhileWriting(declared, route = "/api/heartbeat", auth = "Bearer agenttok", method = "POST") {
   const net = require("net");
   const { port } = server.address();
   return new Promise((resolve) => {
@@ -145,7 +145,7 @@ function postWhileWriting(declared, route = "/api/heartbeat", auth = "Bearer age
     sock.on("end", () => { finOpen = false; finMs = Date.now() - statusAt; closeIfDone(); });
     sock.on("error", (e) => { err = e.code; });
     sock.on("close", () => resolve({ got, err, wroteAll: sent >= declared, finMs }));
-    sock.write(`POST ${route} HTTP/1.1\r\nhost: x\r\nauthorization: ${auth}\r\n` +
+    sock.write(`${method} ${route} HTTP/1.1\r\nhost: x\r\nauthorization: ${auth}\r\n` +
       `content-type: application/json\r\ncontent-length: ${declared}\r\n\r\n`);
     const chunk = Buffer.alloc(256 * 1024, 0x79);
     (function pump() {
@@ -327,22 +327,64 @@ test("XERK-1091: the hydrate-gate 503 on both archive routes closes rather than 
 // pre-body 400 — must close the connection too. Left keep-alive, Node dumps the whole
 // unread body once the response finishes: unbudgeted read churn, and for the 401 with
 // no credential at all.
-for (const [label, route, auth, status] of [
+for (const [label, route, auth, status, method] of [
   ["agent-gate 401 (no credential)", "/api/agents/arch1598/archive/t1/raw/a.jsonl", "Bearer nope", 401],
   ["heartbeat-gate 401", "/api/heartbeat", "Bearer nope", 401],
   ["user-gate 401", "/api/agents/arch1598/uploads?name=a.bin", "Bearer nope", 401],
   ["pre-body 400 (bad transcriptId)", "/api/agents/arch1598/archive/t%20x/raw/a.jsonl", "Bearer agenttok", 400],
   ["pre-body 400 (bad file)", "/api/agents/arch1598/archive/t1/raw/..%2Fx", "Bearer agenttok", 400],
+  ["GET with a body (raw-writeHead login redirect)", "/", "Bearer nope", 400, "GET"],
 ]) {
   test(`XERK-1598: a ${label} closes rather than dump the unread body`, async () => {
-    const r = await postWhileWriting(4 << 20, route, auth);
+    const r = await postWhileWriting(4 << 20, route, auth, method);
     assert.equal(r.err, null, `the connection was reset (${r.err}) instead of closing cleanly`);
     assert.match(r.got, new RegExp(`^HTTP/1\\.1 ${status} `), `the ${status} reached the client`);
     assert.match(r.got, /\r\nconnection: close\r\n/i, "the refusal announces the close");
-    for (let i = 0; i < 40 && hub.refusalsLingering; i++) await sleep(50);
-    assert.equal(hub.refusalsLingering, 0, "lingering refusal released on close");
+    for (let i = 0; i < 40 && hub.preBodyLingering; i++) await sleep(50);
+    assert.equal(hub.preBodyLingering, 0, "lingering refusal released on close");
   });
 }
+
+test("XERK-1598: a CHUNKED unread body (no declared length) closes too", async () => {
+  const { port } = server.address();
+  const got = await new Promise((resolve) => {
+    const sock = require("net").connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+    let buf = "";
+    sock.on("error", () => {});
+    sock.on("data", (c) => (buf += c));
+    sock.on("end", () => sock.end());
+    sock.on("close", () => resolve(buf));
+    sock.write("POST /api/heartbeat HTTP/1.1\r\nhost: x\r\nauthorization: Bearer nope\r\n" +
+      "transfer-encoding: chunked\r\n\r\n4\r\nyyyy\r\n");
+  });
+  assert.match(got, /^HTTP\/1\.1 401 /);
+  assert.match(got, /\r\nconnection: close\r\n/i, "a chunked unread body closes");
+});
+
+test("XERK-1598: anonymous pre-body refusals cannot take an agent refusal's linger slot", async () => {
+  const net = require("net");
+  // More anonymous 401s than their pool holds, each declaring a big body and then
+  // neither sending nor closing — so each would hold a linger to the time bound.
+  const socks = [];
+  try {
+    for (let i = 0; i < hub.PREBODY_LINGER_MAX + hub.REFUSE_LINGER_MAX; i++) {
+      const s = net.connect({ port: server.address().port, host: "127.0.0.1", allowHalfOpen: true });
+      s.on("error", () => {});
+      s.write(`POST /api/heartbeat HTTP/1.1\r\nhost: x\r\nauthorization: Bearer nope\r\n` +
+        `content-type: application/json\r\ncontent-length: ${1 << 30}\r\n\r\n`);
+      socks.push(s);
+    }
+    for (let i = 0; i < 40 && hub.preBodyLingering < hub.PREBODY_LINGER_MAX; i++) await sleep(25);
+    assert.equal(hub.preBodyLingering, hub.PREBODY_LINGER_MAX, "the anonymous pool is full");
+    assert.equal(hub.refusalsLingering, 0, "and none of them took an agent-refusal slot");
+    // A real agent's no-drain 413 still lingers, so it reads its status, not a reset.
+    const r = await postWhileWriting(40 << 20, "/api/agents/arch1598/archive/t1/raw/a.jsonl");
+    assert.equal(r.err, null, `the agent's refusal was reset (${r.err})`);
+    assert.match(r.got, /^HTTP\/1\.1 413 /);
+  } finally {
+    for (const s of socks) s.destroy();
+  }
+});
 
 test("XERK-1598: a refusal of a SMALL unread body keeps the connection", async () => {
   const { port } = server.address();

@@ -10751,21 +10751,21 @@ const refusedPaused = (e) => !!(e && (e.budgetExceeded || e.noDrain));
  * cost above, so at most REFUSE_LINGER_MAX refusals linger at once; past that a
  * refusal falls back to the immediate destroy (a reset the caller retries).
  */
-function endRefusedConnection(req, res) {
+function endRefusedConnection(req, res, pool = refusedLingers) {
   try { req.pause(); } catch {}
   const sock = req.socket;
   if (!sock || sock.destroyed) return;
   const kill = () => { try { sock.destroy(); } catch {} };
-  if (refusalsLingering >= REFUSE_LINGER_MAX) {
+  if (pool.n >= pool.max) {
     if (res.writableFinished) kill();
     else res.once("finish", kill);
     return;
   }
-  refusalsLingering++;
+  pool.n++;
   // Bounded from here, so a response that never flushes cannot hold the slot either.
   const t = setTimeout(kill, REFUSE_LINGER_MS);
   if (t.unref) t.unref();
-  sock.once("close", () => { clearTimeout(t); refusalsLingering--; });
+  sock.once("close", () => { clearTimeout(t); pool.n--; });
   const linger = () => {
     try { sock.end(); req.resume(); sock.resume(); } catch { kill(); }
   };
@@ -10785,7 +10785,13 @@ function endRefusedConnection(req, res) {
 // body) none of this runs — it is for clients that reach the hub directly.
 const REFUSE_LINGER_MAX = positiveEnv("REFUSE_LINGER_MAX", 4);
 const REFUSE_LINGER_MS = 2000;
-let refusalsLingering = 0;
+const refusedLingers = { n: 0, max: REFUSE_LINGER_MAX };
+// Refusals made BEFORE the body is read (json() below) linger from their OWN slots
+// (XERK-1598). They include the auth gates' 401 to a caller with no credential, so
+// sharing the pool above would let four anonymous trickling sockets pin every slot
+// and turn a real agent's 413/503 into a reset. Kept small for the same churn cost.
+const PREBODY_LINGER_MAX = positiveEnv("PREBODY_LINGER_MAX", 2);
+const preBodyLingers = { n: 0, max: PREBODY_LINGER_MAX };
 
 // Collect a request body straight into a FILE, never the heap (XERK-263), and
 // resolve with the byte count. For the migration relay, whose bundle can be 65
@@ -10893,7 +10899,7 @@ function json(res, code, obj) {
     ...(close ? { Connection: "close" } : {}),
   });
   res.end(body);
-  if (close) endRefusedConnection(res.req, res);
+  if (close) endRefusedConnection(res.req, res, preBodyLingers);
 }
 
 // Whether a request still carries a body nothing has started reading, large or of
@@ -17380,6 +17386,14 @@ const server = http.createServer(async (req, res) => {
     // req.headers to an agent's ttyd, which could then echo them — XERK-936 QA).
     stripForwardHeaders(req);
 
+    // No GET/HEAD/OPTIONS route reads a body, and several answer one through a raw
+    // writeHead (the login redirect, static assets) that json() never sees — so a
+    // large body on one is refused here, closing rather than dumped (XERK-1598).
+    if ((req.method === "GET" || req.method === "HEAD" || req.method === "OPTIONS") &&
+        bodyLeftUnread(req)) {
+      return json(res, 400, { error: `a ${req.method} request carries no body` });
+    }
+
     // CORS for the cross-origin glasses WebView client: only /api/* and
     // /term/* opt in, and only when the request actually carries an Origin
     // (same-origin requests — the dashboard UI itself — never send one, so
@@ -21938,7 +21952,8 @@ if (process.env.TURMA_TEST) {
     // (budget-refused ones especially) release their slot instead of leaking it.
     get drainingNow() { return drainingNow; },
     // XERK-1076: refused connections lingering to a FIN-close, and their cap.
-    REFUSE_LINGER_MAX, REFUSE_LINGER_MS, get refusalsLingering() { return refusalsLingering; },
+    REFUSE_LINGER_MAX, REFUSE_LINGER_MS, get refusalsLingering() { return refusedLingers.n; },
+    PREBODY_LINGER_MAX, get preBodyLingering() { return preBodyLingers.n; },
     // XERK-235 heartbeat/record bounds — a QA pass removed each of these
     // and the suite stayed green, so they are exported to be pinned.
     sanitizeHeartbeat, agentRecordSize, safeAgentsCache,
