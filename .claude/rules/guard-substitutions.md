@@ -37,6 +37,18 @@ paths:
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
   ANSI-C only to a `-c` re-parse; an even run (`\\$'…'`) is still live. A bare lookbehind bypassed.
+- **The stdin-feed walk splits with `groups=True`** (XERK-1614): a cut inside `{ echo …; }` or
+  `X=<(a; b)` severed producer from reader. Only that walk: every other caller keeps the old
+  split and relies on `_expand`'s group pass to read bodies.
+  - `|&` is one pipe, in every split; `2>&1` is XERK-1616's `keep_redirects`, which the walk also passes.
+- **`_reads_stdin_script` recurses** into a group/list and a `-c` script: `bash -c bash` and
+  `(cat | bash)` read the stdin they inherit. Past `_MAX_EXPAND_DEPTH` it says "reads" (closed).
+  - A part equal to its stage goes to `_command_reads_stdin`, never re-split: the redirect
+    re-reading returns `>&1` among `>&1`'s own parts, and looping hit the cap (a false deny).
+- **An `exec`'s here-string joins the line-wide `<(…)` texts**, and a line with any of them scans
+  every pipeline: `exec 3< <(…); bash <&3` has no pipe. De-duped + capped once, else O(n²).
+- **`cat`/`tac`/`tee` of only `<(…)` operands prints their texts** (`_cat_printed`), bounded by
+  `_SUBST_DEPTH`; a real file operand stays opaque.
 - **A filtered or partly-unread body gets a TAINT reading too** (XERK-1613, `_body_tainted`): the
   text its producers emit — echo/printf args, or a here-string — carried through any pass-through or
   rewriting filter (sed/tr/awk/cut/rev…) as if it passed unchanged. ADDED beside the opaque reading,
@@ -121,6 +133,7 @@ paths:
   time it denies as too large. The growth budget counts characters, not time; readings re-expanded
   per eval level ran 98 KB past the 60s hook timeout, which RUNS the command.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
+  `test_stdin_routes_into_a_shell`, `test_stdin_route_shapes_classify_fast`,
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
   `test_a_nested_or_conditional_body_runs_as_its_producers_text`,

@@ -803,7 +803,47 @@ def _body_printed(body: str, raw: bool, multi: bool = True) -> tuple[str | None,
         if multi and _SEGMENT_SPLIT.search(unwrapped) else None
     if printed is None:
         printed = _printed_text(unwrapped)
+    if printed is None and "<(" in body:
+        printed = _cat_printed(body)
     return printed, _SPLICES_ESCAPED[0] - before
+
+
+# Programs that print the files they are given, unchanged.
+_CAT_PROGS = {"cat", "tac", "tee"}
+
+
+def _cat_printed(body: str) -> str | None:
+    """What `cat <(…) …` prints: each `<(…)` operand's text, in order, so
+    `bash -c "$(cat <(echo <cmd>))"` runs <cmd> (XERK-1614). None when any
+    operand is something else — a real file's content is unknowable."""
+    texts: list[list[str]] = []
+
+    def mark(m: "re.Match[str]") -> str:
+        if not m.group(0).startswith("<("):
+            return _subst_text(m)
+        # Each level recurses through `_body_printed`; deeper reads as opaque.
+        if _SUBST_DEPTH[0] >= _MAX_SUBST_DEPTH:
+            return _OPAQUE_SUBST
+        _SUBST_DEPTH[0] += 1
+        try:
+            texts.append(_proc_subst_texts(_subst_inner(m)))
+        finally:
+            _SUBST_DEPTH[0] -= 1
+        return f"\x00turma-proc-{len(texts) - 1}"
+
+    words = _strip_prefixes(_tokenize(_unwrap_group(_sub_substs(body, mark))))
+    if not words or _basename(words[0]) not in _CAT_PROGS:
+        return None
+    out = []
+    for word in words[1:]:
+        if word.startswith("-") and len(word) > 1:
+            continue
+        m = re.fullmatch(r"\x00turma-proc-(\d+)", word)
+        if not m:
+            return None
+        # Every text the body may print, one per line: over-reading fails closed.
+        out.extend(texts[int(m.group(1))])
+    return "\n".join(out) if out else None
 
 
 def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = False,
@@ -2242,7 +2282,7 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
 
 
 def _split_on_operators(command: str, include_pipe: bool = True,
-                        keep_redirects: bool = False) -> list[str]:
+                        keep_redirects: bool = False, groups: bool = False) -> list[str]:
     """Split on shell operators that are NOT inside quotes.
 
     Splitting the raw string severed a quoted script mid-quote, so a shell's
@@ -2263,6 +2303,17 @@ def _split_on_operators(command: str, include_pipe: bool = True,
     - the `|` between `case` pattern alternatives: `reboot|shutdown) …` read
       as the power command `reboot`. A plain pattern is dropped, not emitted —
       it is never a command — unless it holds a substitution, which runs.
+
+    `|&` is ONE operator, a pipe that carries stderr too, and the `&` of a
+    redirection (`2>&1`, `<&3`, `&>f`) none at all: cutting either severed a
+    producer from the shell it feeds — `echo … |& bash`, `echo … 2>&1 | sh`
+    (XERK-1614).
+
+    ``groups`` keeps every `( … )`, `$( … )`, `<( … )`, `>( … )` and `{ …; }`
+    whole, as the shell does. Only the stdin-feed walk asks for it: there a
+    cut inside a group severs a producer from its reader (`{ echo …; } | sh`,
+    `echo … | X=<(a; b) bash`); every other caller relies on the group pass in
+    `_expand`, which reads bodies itself.
     """
     out: list[str] = []
     buf: list[str] = []
@@ -2277,6 +2328,8 @@ def _split_on_operators(command: str, include_pipe: bool = True,
     # is text, so `${y:- #}; rm -rf /` must not hide the `rm` as a comment, and
     # the `}` in `${a:-$(echo }) #}` closes nothing (XERK-1585).
     braces: list[str] = []
+    # With ``groups``: the open `(`/`{` groups, innermost last.
+    opened: list[str] = []
     i, n = 0, len(command)
 
     # How many leading chunks of `buf` are known blank: `buf` only grows
@@ -2337,6 +2390,16 @@ def _split_on_operators(command: str, include_pipe: bool = True,
             braces.pop()
         elif braces and ch == ")" and braces[-1] == "(":
             braces.pop()
+        elif groups and not in_pattern and ch == "(":
+            opened.append("(")
+        elif groups and opened and ch == ")" and opened[-1] == "(":
+            opened.pop()
+        elif (groups and ch == "{" and command[i + 1:i + 2] in (" ", "\t", "\n")
+              and _at_command_start(command, i)):
+            opened.append("{")
+        elif (groups and opened and ch == "}" and opened[-1] == "{"
+              and command[i - 1:i] in (" ", "\t", "\n", ";")):
+            opened.pop()
         elif ch == "#" and not braces and _is_comment(command, i):
             end = command.find("\n", i)
             i = n if end < 0 else end
@@ -2388,8 +2451,19 @@ def _split_on_operators(command: str, include_pipe: bool = True,
             continue
         elif case_depth and _word_at(command, i, "esac") and _esac_closes(command, i):
             case_depth -= 1
+        if opened:
+            buf.append(ch)
+            i += 1
+            continue
         if command[i:i + 2] in ("&&", "||"):
             flush()
+            i += 2
+            continue
+        if command.startswith("|&", i):
+            if include_pipe:
+                flush()
+            else:
+                buf.append("|&")
             i += 2
             continue
         if ch in (";", "\n", "&") or (include_pipe and ch == "|"):
@@ -2620,10 +2694,28 @@ def _proc_subst_texts(body: str, depth: int = 0) -> list[str]:
     return [t for t in out if t.strip()]
 
 
-def _reads_stdin_script(stage: str) -> bool:
+def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
     """Whether the command in ``stage`` runs its stdin (or an inherited fd) as
     a SCRIPT: a shell with no `-c` and no script file (`… | sh`, `bash -s`,
-    `sh <<< '…'`), or `source`/`.` of such a path (`. <(echo …)`)."""
+    `sh <<< '…'`), `source`/`.` of such a path (`. <(echo …)`), or a shell
+    whose `-c` script holds one — the script's commands inherit the shell's
+    stdin, so `echo … | bash -c bash` and `bash -c '. /dev/stdin'` run what
+    they are fed (XERK-1614). A group or list reads if any command in it
+    does: `echo … | (cat | bash)`."""
+    if depth > _MAX_EXPAND_DEPTH:
+        return True  # a reader fed too much fails closed
+    # A part equal to the stage is read as one command, never split again: the
+    # redirect re-reading returns `>&1` among the parts of `>&1` (XERK-1616),
+    # and re-splitting it ran to the depth cap, which says "reads".
+    whole = stage.strip()
+    return any(_command_reads_stdin(part, depth) if part == whole
+               else _reads_stdin_script(part, depth + 1)
+               for part in _split_on_operators(_unwrap_group(stage), keep_redirects=True,
+                                               groups=True))
+
+
+def _command_reads_stdin(stage: str, depth: int) -> bool:
+    """`_reads_stdin_script` for one simple command (no list, no group)."""
     text = _sub_substs(stage, _proc_subst_path)
     # A `<(` left is one the (not paren-aware) split cut off from its `)`:
     # `bash < <(echo hi; echo …)` reaches here as `bash < <(echo hi`.
@@ -2651,8 +2743,11 @@ def _reads_stdin_script(stage: str) -> bool:
     if prog in ("source", "."):
         operands = [t for t in rest if not _REDIRECT_RE.match(t)]
         return bool(operands) and bool(_STDIN_SCRIPT_RE.match(operands[0]))
-    if prog not in _SHELL_PROGS or _shell_c_index(rest) >= 0:
+    if prog not in _SHELL_PROGS:
         return False
+    if _shell_c_index(rest) >= 0:
+        script = _shell_c_script(rest)
+        return bool(script) and _reads_stdin_script(script, depth + 1)
     if prog == "su":
         return True  # its operands name a USER; without `-c` the shell reads stdin
     i = 0
@@ -3145,11 +3240,25 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # not paren-aware and cut at a `|` or `;` inside one (`<(echo …; true)`).
     proc_subst_texts = [text for m in _find_substs(command) if m.group(0).startswith("<(")
                         for text in _proc_subst_texts(_subst_inner(m))] if "<(" in command else []
-    for pipeline in (_split_on_operators(command, include_pipe=False, keep_redirects=True)
+    # ...and so is what an `exec` opens on an fd for the rest of the line:
+    # `exec 3<<<'<cmd>'; bash /dev/fd/3` (XERK-1614). Its `<(…)` is above.
+    if "<<<" in command:
+        proc_subst_texts += [hs for raw in segments
+                             if _tokenize(raw)[:1] == ["exec"]
+                             for hs in _herestrings(raw)]
+    # Every pipeline replays these, so de-dupe and cap them once, here: one
+    # per `exec` made a line of n of them O(n²) (XERK-1614).
+    proc_subst_texts = list(dict.fromkeys(proc_subst_texts))[:_FED_TEXT_CAP]
+    # Split keeping groups whole: a cut inside `{ echo …; }` or `X=<(a; b)`
+    # severs a producer from its reader (XERK-1614).
+    for pipeline in (_split_on_operators(command, include_pipe=False, keep_redirects=True,
+                                         groups=True)
                      if feeds_a_shell else ()):
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
-        # feeding it either, so skip its per-stage scan too.
-        if "|" not in pipeline and "<<<" not in pipeline and "<(" not in pipeline:
+        # feeding it either, so skip its per-stage scan too — unless the line
+        # opened an fd it may read (`exec 3< <(…); bash <&3`).
+        if (not proc_subst_texts and "|" not in pipeline and "<<<" not in pipeline
+                and "<(" not in pipeline):
             continue
         producers: list[str] = []       # distinct printed/here-string texts so far
         seen_texts: set[str] = set()
@@ -3160,7 +3269,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 producers.append(text)
         for text in proc_subst_texts:
             _feed(text)
-        for stage in _split_on_operators(pipeline, keep_redirects=True):
+        for stage in _split_on_operators(pipeline, keep_redirects=True, groups=True):
             ustage = _unwrap_group(stage)
             if _reads_stdin_script(ustage):
                 fed = list(producers)

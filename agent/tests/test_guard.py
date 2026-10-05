@@ -1550,6 +1550,53 @@ class TestScriptChannels(unittest.TestCase):
         self.assertAllowed('cat <(echo hello; true) | grep h')
         self.assertAllowed('while read l; do echo $l; done < <(git ls-files; echo x)')
 
+    def test_stdin_routes_into_a_shell(self):
+        # XERK-1614: other routes a printed script takes into a shell's stdin.
+        # Each ran its payload as nobody under guard_differential.py.
+        R = self.R
+        for cmd in (f"echo {R} |& bash", f"echo {R} |& cat | sh", f"echo {R} 2>&1 | sh",
+                    # ...a `-c` script whose own command reads the stdin it inherits,
+                    f"echo {R} | bash -c '. /dev/stdin'", f"echo {R} | bash -c bash",
+                    f"bash -c '. /dev/stdin' < <(echo {R})", f"echo {R} | sh -c 'cat | bash'",
+                    f"echo {R} | (cat | bash)", f"echo {R} | bash -c 'bash -c bash'",
+                    # ...a `cat` of a `<(…)` whose output a substitution hands on,
+                    f'bash -c "$(cat <(echo {R}))"', f'x=$(cat <(echo {R})); eval "$x"',
+                    f'eval "$(cat -- <(cat <(echo {R})))"',
+                    # ...a group the split cut in two,
+                    f"echo {R} | env X=<(true; true) bash", f"echo {R} | X=<(true; true) bash",
+                    f"{{ echo {R}; }} | sh", f"{{ echo {R}; }} 2>&1 | sh", f"(echo {R}; true) | sh",
+                    # ...and an fd an `exec` opened earlier on the line.
+                    f"exec 3< <(echo {R}); bash <&3", f"exec 3<<<'{R}'; bash /dev/fd/3"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("echo hi |& cat", "make 2>&1 | tee log", "echo hi | bash -c 'grep h'",
+                    "bash -c 'echo hi' < /dev/null", "x=$(cat <(echo hi)); echo $x",
+                    "{ echo a; echo b; } | sort", "exec 3< <(echo hi); cat <&3",
+                    f"cat <(echo hi) | bash -c 'echo {R} > notes'", f"echo {R} | bash -c 'wc -l'",
+                    f"(echo {R}; true) | grep rm",
+                    # A redirect re-read as its own part must not loop to the
+                    # depth cap, which reads as a reader (replay false deny).
+                    f"git push -u origin x 2>&1 | tail -4 && cat > pr.md <<'EOF'\n| sh `{R}`\nEOF",
+                    f'jira comment X "\\`while read l; do eval \\"\\$l\\"; done < <(echo {R})\\`" 2>&1 | tail -2'):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertEqual(guard._split_segments("a |& b"), ["a", "b"])
+        self.assertEqual(guard._split_on_operators("a |& b", include_pipe=False), ["a |& b"])
+        self.assertEqual(guard._split_on_operators("{ a; b; } | (c; d) && e <(f; g)", groups=True),
+                         ["{ a; b; }", "(c; d)", "e <(f; g)"])
+
+    def test_stdin_route_shapes_classify_fast(self):
+        # Every pipeline replays the line's exec/`<(…)` texts, and nested
+        # `cat <(` resolves through `_body_printed` (XERK-1614).
+        for cmd in ("exec 3<<<'hi'; " * 12000 + "bash <&3; rm -rf /",
+                    "cat <(echo hi) <(echo ho); " * 12000 + "bash; rm -rf /",
+                    'bash -c "$(' + "cat <(" * 500 + "echo hi" + ")" * 500 + ')"; rm -rf /',
+                    "echo hi | " + "(" * 3000 + "bash" + ")" * 3000 + "; rm -rf /",
+                    "echo hi | (" + "true; " * 20000 + "bash); rm -rf /"):
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
+            self.assertLess(time.monotonic() - t, 10, cmd[:20])
+
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R
         for cmd in (f"eval -- '{R}'", f"eval -- eval -- '{R}'", f"builtin eval '{R}'",
