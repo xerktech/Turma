@@ -2777,13 +2777,13 @@ def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
 # redirections that may follow one: `do (…)`, `! (…)`, `time -p { …; }`,
 # `(…) 2>&1`.
 _GROUP_LEAD_RE = re.compile(r"\A(?:(?:do|then|else|elif|if|while|until|time|!|-p)[ \t\n]+)+")
-_TRAIL_OPS = ("<<<", "&>>", ">>", "&>", ">&", "<&", ">|", ">", "<")
+_TRAIL_OPS = ("<<<", "<<-", "<<", "&>>", ">>", "&>", ">&", "<&", ">|", "<>", ">", "<")
 _TRAIL_WORD_END = frozenset(" \t\n;&|()<>")
 
 
 def _only_redirects(text: str, i: int) -> bool:
     """Whether ``text[i:]`` is nothing but redirections (`2>&1`, `>f`, `{fd}>f`,
-    `<<<w`, glued or not). One greedy pass, as bash reads them: a regex for
+    `<<<w`, `<>f`, a heredoc's `<<EOF`, glued or not). One greedy pass, as bash reads them: a regex for
     this backtracked over every way to split `>a1>a1…` — exponential, past the
     hook timeout, which fails open (XERK-1614)."""
     n = len(text)
