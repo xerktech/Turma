@@ -1480,6 +1480,32 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_heredoc_owner_named_through_a_variable_glob_function_or_alias(self):
+        # XERK-1624: the owner's literal word was the only one checked, so each
+        # body below read as data while bash ran it (each ran as nobody).
+        R = self.R
+        for cmd in (f"b=bash; $b<<EOF\n{R}\nEOF", f"b=bash; $b <<EOF\n{R}\nEOF",
+                    f"b=bash; ${{b}}<<EOF\n{R}\nEOF", f"$(echo bash)<<EOF\n{R}\nEOF",
+                    f"`echo bash`<<EOF\n{R}\nEOF", f"f() {{ bash; }}; f<<EOF\n{R}\nEOF",
+                    f"function f {{ bash; }}\nf <<EOF\n{R}\nEOF", f"alias b=bash\nb<<EOF\n{R}\nEOF",
+                    f"coproc bash<<EOF\n{R}\nEOF", f"S=bash; cat <<EOF | $S\n{R}\nEOF",
+                    f"J=bash; $J <<'EOF'\n{R}\nEOF", f"J=bash; $J - <<'EOF'\n{R}\nEOF",
+                    f"(J=bash; $J) <<EOF\n{R}\nEOF", f"$x bash <<EOF\n{R}\nEOF",
+                    f"x=; $x bash <<EOF\n{R}\nEOF", f"$SHELL <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | $SHELL\n{R}\nEOF", f"/bin/ba?h <<EOF\n{R}\nEOF",
+                    f"/usr/bin/da*h <<EOF\n{R}\nEOF", f"(X=')' /bin/bas[h])<<EOF\n{R}\nEOF",
+                    f"(X=')' $'bas\\x68')<<EOF\n{R}\nEOF", f"cat <<EOF | /bin/ba?h\n{R}\nEOF",
+                    f"f() {{ bash; }}; cat <<EOF | f\n{R}\nEOF", "coproc rm -rf /"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A variable this line resolves to a non-shell, a glob matching none,
+        # and a benign body behind any owner stay allowed.
+        for cmd in (f"x=cat; $x <<EOF\n{R}\nEOF", f"x=cat; cat <<EOF | $x\n{R}\nEOF",
+                    f"cat <<EOF | /bin/ca?\n{R}\nEOF", f"alias ll='ls -l'; cat <<EOF\n{R}\nEOF",
+                    "cat <<EOF | $PAGER\nhello\nEOF", "f() { cat; }; f <<EOF\nhello\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_here_strings_and_process_substitution_fed_to_a_shell(self):
         R = self.R
         for cmd in (f"sh <<< '{R}'", f"sh<<<'{R}'", f"bash -s <<< '{R}'",
