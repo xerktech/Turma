@@ -1789,6 +1789,15 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
             json.dump(body, f)
         self.assertEqual(self._report({})["agents"], [])   # back-scan fallback
 
+    def test_a_mid_line_offset_is_never_published(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        state = {"liveAgents": {"bsh1": {"type": "shell", "label": "x"}}}
+        ha._publish_live_agents(self.SID, path, os.path.getsize(path) - 3, state)
+        self.assertFalse(os.path.exists(os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")))
+        ha._publish_live_agents(self.SID, path, os.path.getsize(path), state)
+        self.assertTrue(os.path.exists(os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")))
+
     def test_restored_rows_are_retyped(self):
         path, _ = self._launch_then_restart()
         snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")
