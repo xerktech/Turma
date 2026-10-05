@@ -68,6 +68,7 @@ import re
 import shlex
 import stat
 import sys
+import threading
 import time
 
 # --- command segmentation ------------------------------------------------
@@ -5434,6 +5435,17 @@ def _emit_deny(reason: str) -> None:
     sys.stdout.flush()
 
 
+# How long the hook may spend before it denies outright. Claude Code's default
+# hook timeout is 60s and an expired hook RUNS the command unchecked; this
+# leaves room for interpreter start-up and a slow host.
+_HOOK_DEADLINE_SECONDS = 45
+_OVERRUN_REASON = ("refusing a command that took too long to classify (it is too large or too "
+                   "convoluted) — split it, or put the data in a file")
+# `os._exit`, so a classifier still running cannot hold the process past the
+# deadline. A seam for tests, which must not exit the runner.
+_hard_exit = os._exit
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = sys.argv if argv is None else argv
     grants_on = GRANTS_FLAG in argv[1:] \
@@ -5455,34 +5467,52 @@ def main(argv: list[str] | None = None) -> int:
     pr_summary = os.environ.get("TURMA_PR_SUMMARY", "1") != "0"
     cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
 
-    try:
-        decision, reason, _category = decide(
-            tool_name,
-            tool_input if isinstance(tool_input, dict) else {},
-            overrides=overrides,
-            no_attribution=no_attribution,
-            pr_summary=pr_summary,
-            cwd=cwd,
-        )
+    verdict: list = []
+
+    def classify() -> None:
         granted = None
-        # A judge grant (XERK-1566) is consulted only once decide() ALLOWED the
-        # command — every hard deny wins — and only for Bash, the one tool this
-        # hook's matcher covers. Inside this fail-closed try on purpose. Only
-        # when this session was launched with the judge on (GRANTS_FLAG).
-        if grants_on and decision == "allow" and tool_name == "Bash" \
-                and isinstance(tool_input, dict):
-            granted = consume_grant(os.environ.get("TURMA_SESSION_ID"),
-                                    tool_input.get("command"))
-    except Exception as exc:  # noqa: BLE001 - any classifier bug
-        # Fail CLOSED here, unlike a malformed event above: a traceback exits 1,
-        # which Claude Code treats as non-blocking, so a crash on one segment
-        # ran the whole command unclassified (XERK-1080).
-        decision = "deny"
-        reason = (
-            f"the safety guard could not classify this command ({type(exc).__name__}); "
-            "refusing it rather than letting it run unchecked. Rephrase it (a grant "
-            "cannot help: the crash happens before grants are consulted)."
-        )
+        try:
+            decision, reason, _category = decide(
+                tool_name,
+                tool_input if isinstance(tool_input, dict) else {},
+                overrides=overrides,
+                no_attribution=no_attribution,
+                pr_summary=pr_summary,
+                cwd=cwd,
+            )
+            # A judge grant (XERK-1566) is consulted only once decide() ALLOWED the
+            # command — every hard deny wins — and only for Bash, the one tool this
+            # hook's matcher covers. Inside this fail-closed try on purpose. Only
+            # when this session was launched with the judge on (GRANTS_FLAG).
+            if grants_on and decision == "allow" and tool_name == "Bash" \
+                    and isinstance(tool_input, dict):
+                granted = consume_grant(os.environ.get("TURMA_SESSION_ID"),
+                                        tool_input.get("command"))
+        except Exception as exc:  # noqa: BLE001 - any classifier bug
+            # Fail CLOSED here, unlike a malformed event above: a traceback exits 1,
+            # which Claude Code treats as non-blocking, so a crash on one segment
+            # ran the whole command unclassified (XERK-1080).
+            decision = "deny"
+            reason = (
+                f"the safety guard could not classify this command ({type(exc).__name__}); "
+                "refusing it rather than letting it run unchecked. Rephrase it (a grant "
+                "cannot help: the crash happens before grants are consulted)."
+            )
+        verdict.append((decision, reason, granted))
+
+    # Out of time, deny (XERK-1619). The in-decide deadline is checked only
+    # between expansions, and one frame — shlex on one huge word is quadratic —
+    # overshot it past Claude Code's 60s hook timeout, which RUNS the command.
+    # A thread, not SIGALRM: this hook also runs on the Windows agent.
+    worker = threading.Thread(target=classify, daemon=True)
+    worker.start()
+    worker.join(_HOOK_DEADLINE_SECONDS)
+    if not verdict:
+        _emit_deny(_OVERRUN_REASON)
+        sys.stdout.flush()
+        _hard_exit(0)  # the worker cannot be stopped; leaving waits on nothing
+        return 0
+    decision, reason, granted = verdict[0]
     if decision == "deny" and reason:
         _emit_deny(reason)
     elif decision == "allow" and granted:

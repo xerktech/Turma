@@ -3424,6 +3424,39 @@ class TestHookEntrypoint(unittest.TestCase):
                 emit.assert_called_once()
                 self.assertIn("could not classify", emit.call_args[0][0])
 
+    def test_a_decision_past_the_hook_deadline_denies(self):
+        # XERK-1619: shlex on one huge word never returns to the in-decide
+        # deadline check, and past the hook timeout Claude Code RUNS the
+        # command. The real hook, deadline shortened: out of time it denies and
+        # exits even though the classifier is still running.
+        cmd = "echo " + "`x`" * 100000 + "; rm -rf /etc"
+        script = (f"import sys; sys.path.insert(0, {os.path.dirname(GUARD_PATH)!r}); "
+                  "import guard; guard._HOOK_DEADLINE_SECONDS = 1; sys.exit(guard.main())")
+        started = time.monotonic()
+        proc = subprocess.run([sys.executable, "-SsE", "-c", script], capture_output=True,
+                              text=True, timeout=30,
+                              input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd},
+                                                "cwd": "/tmp"}))
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        out = json.loads(proc.stdout)["hookSpecificOutput"]
+        self.assertEqual((out["permissionDecision"], out["permissionDecisionReason"]),
+                         ("deny", guard._OVERRUN_REASON))
+
+    def test_a_decision_inside_the_hook_deadline_is_its_own(self):
+        # The watchdog changes nothing for a decision that finishes.
+        for cmd, denied in (("ls", False), ("rm -rf /etc", True)):
+            with self.subTest(cmd=cmd), \
+                    mock.patch.object(guard.sys, "stdin", io.StringIO(json.dumps(
+                        {"tool_name": "Bash", "tool_input": {"command": cmd}}))), \
+                    mock.patch.object(guard, "_hard_exit") as hard_exit, \
+                    mock.patch.object(guard, "_emit_deny") as emit:
+                self.assertEqual(guard.main(), 0)
+                hard_exit.assert_not_called()
+                self.assertEqual(emit.called, denied)
+                if denied:
+                    self.assertNotEqual(emit.call_args[0][0], guard._OVERRUN_REASON)
+
     def test_unparseable_envelopes_fail_open_cleanly(self):
         # A 5000-digit int (ValueError) or very deep JSON (RecursionError) is a
         # malformed EVENT: allow with rc 0, not a traceback (XERK-1080).

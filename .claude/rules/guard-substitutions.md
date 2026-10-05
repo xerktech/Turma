@@ -120,6 +120,11 @@ paths:
 - **A decision has a wall-clock deadline** (`_MAX_DECIDE_SECONDS`, checked in `_expand`): out of
   time it denies as too large. The growth budget counts characters, not time; readings re-expanded
   per eval level ran 98 KB past the 60s hook timeout, which RUNS the command.
+- **main() has a hard deadline too** (`_HOOK_DEADLINE_SECONDS`, XERK-1619): `decide` runs on a
+  daemon thread; past it the hook prints a deny and `os._exit`s. The in-decide check never runs
+  inside one frame — shlex on one 300 KB word took 126s.
+  - A thread, not SIGALRM: the hook also runs on the Windows agent.
+  - Residual: one C call holding the GIL (a backtracking regex) still blocks the watchdog.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
@@ -127,6 +132,6 @@ paths:
   `test_a_large_conditional_or_nested_taint_body_stays_fast`,
   `test_a_large_filtered_body_classifies_without_timing_out`,
   `test_a_sibling_or_an_empty_expansion_does_not_hide_the_command`,
-  `test_a_decision_past_its_deadline_denies`,
+  `test_a_decision_past_its_deadline_denies`, `test_a_decision_past_the_hook_deadline_denies`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).
