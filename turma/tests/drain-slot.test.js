@@ -334,6 +334,8 @@ for (const [label, route, auth, status, method] of [
   ["pre-body 400 (bad transcriptId)", "/api/agents/arch1598/archive/t%20x/raw/a.jsonl", "Bearer agenttok", 400],
   ["pre-body 400 (bad file)", "/api/agents/arch1598/archive/t1/raw/..%2Fx", "Bearer agenttok", 400],
   ["GET with a body (raw-writeHead login redirect)", "/", "Bearer nope", 400, "GET"],
+  ["HEAD with a body (raw-writeHead login page)", "/login", "Bearer nope", 400, "HEAD"],
+  ["OPTIONS with a body", "/api/agents", "Bearer nope", 400, "OPTIONS"],
 ]) {
   test(`XERK-1598: a ${label} closes rather than dump the unread body`, async () => {
     const r = await postWhileWriting(4 << 20, route, auth, method);

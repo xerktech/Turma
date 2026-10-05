@@ -10911,6 +10911,8 @@ function bodyLeftUnread(req) {
   if (!req || req.complete || req.readableFlowing !== null) return false;
   const declared = req.headers["content-length"];
   if (declared !== undefined) return Number(declared) > UNREAD_BODY_KEEPALIVE_MAX;
+  // Chunked counts whatever it turns out to hold: the handler runs once the headers
+  // are in, before even an empty `0\r\n\r\n` is parsed. No client of ours sends one.
   return !!req.headers["transfer-encoding"];
 }
 
