@@ -20179,7 +20179,8 @@ class SessionManager:
         # The slow facts above, and these, are served from cache the same way
         # and read on the same worker (XERK-1262) — so the beat reads no
         # per-repo/per-session git fact itself, not on cold start, not on the
-        # slow cadence. (_backfill_ledger's remote lookup is not yet: XERK-1536.)
+        # slow cadence. (_backfill_ledger reads the remote from repo_facts, and
+        # inline only once per new record: XERK-1536.)
         self.root_remote = {}                    # REPOS_ROOT -> origin remote (slow)
         # session id -> the open-PR poller's fresh read (None = staged, pending).
         self.nudge_reads = {}
@@ -36718,23 +36719,42 @@ class SessionManager:
     def _backfill_ledger(self):
         """Ensure live and recently-closed sessions are in the attribution
         ledger — covers the first run after upgrade (ledger empty but transcripts
-        already on disk) and any session predating _remember_usage."""
+        already on disk) and any session predating _remember_usage.
+
+        Runs on the beat thread (XERK-1536), so it never adds a record whose
+        transcript dir is gone: _prune_ledger drops it in the same pass, and the
+        next slow beat would re-add it and re-spawn its git read — forever. The
+        remote comes from the worker-filled repo_facts cache when it holds a real
+        answer; only a miss (or the cold-start "" placeholder, which must not be
+        persisted as the answer) pays the one-time inline read."""
         changed = False
+        # A slug _reconcile_orphan_transcripts already adopted (keyed by its
+        # projects dir, the worktree being gone) is not added again under the
+        # worktree path — two entries for one slug would count its usage twice.
+        known = {(m or {}).get("slug") or _project_slug(p)
+                 for p, m in self.usage_ledger.items()}
         for s in list(self.registry) + list(self.closed):
             path = s.get("worktreePath")
             if not path or path in self.usage_ledger:
                 continue
-            remote = ""
-            try:
-                remote = run(["git", "remote", "get-url", "origin"],
-                             cwd=s.get("repoPath") or path) or ""
-            except Exception:
-                pass
+            slug = _project_slug(path)
+            if slug in known or not os.path.isdir(
+                    os.path.join(PROJECTS_ROOT, slug)):
+                continue
+            cwd = s.get("repoPath") or path
+            remote = (self.repo_facts.get(cwd) or {}).get("remote") or ""
+            if not remote:
+                try:
+                    remote = run(["git", "remote", "get-url", "origin"],
+                                 cwd=cwd) or ""
+                except Exception:
+                    pass
             self.usage_ledger[path] = {
                 "repo": s.get("repo"),
                 "remote": remote,
-                "slug": _project_slug(path),
+                "slug": slug,
             }
+            known.add(slug)
             changed = True
         if changed:
             self._save_ledger()
