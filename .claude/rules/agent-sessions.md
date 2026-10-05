@@ -198,6 +198,19 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
   tmux recreate its socket. Never read that stderr as empty without the listener check, or every
   session on the server is reaped while its agents keep running unmanaged. No `/proc` = old reading.
   Tests: `test_a_live_server_whose_socket_was_deleted_is_not_swept_and_is_repaired`.
+- **A listing that SUCCEEDS can still miss a live server** (XERK-1544): a NEW server (the agent's
+  own next `new-session`) can bind the path the orphan lost, so the listing omits the orphan's
+  sessions. Two LISTENING entries for one path is that shape; `_shadowed_tmux_sessions` then spares
+  a missing session whose id/worktree still runs under either server, and still reaps the rest.
+  - Attribute the servers' DESCENDANTS only: a server keeps the cwd/env of whoever started it.
+  - Look only on the session's own server: a shadowed default server must not spare a turma one.
+  - `_live_tmux_panes` never forgets an unlisted legacy name while the default path has two
+    listeners, or the next beat would look for it on (and address it to) the wrong server.
+  - Never SIGUSR1 here: the orphan would steal the path and shadow the new server instead.
+  - Read lazily, only when a session is missing, so a normal beat pays nothing for it.
+  - Tests: `test_a_session_on_a_server_shadowed_by_a_new_one_is_not_swept`,
+    `test_a_session_under_a_shadowed_server_is_never_reaped`,
+    `test_a_legacy_session_on_a_shadowed_default_server_stays_managed`.
 - Otherwise conservative by construction, because a false positive ENDS a live session: every OTHER
   nonzero rc, and a failure to launch tmux at all, is **"can't tell"**; a `queued` record has no
   tmux by design; and a name must be missing `DEAD_TMUX_STRIKES` CONSECUTIVE beats, since the
