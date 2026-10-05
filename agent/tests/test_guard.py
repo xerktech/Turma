@@ -2256,14 +2256,25 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # ...yet a shell re-parsing it strips the quotes it prints.
                     "bash -c \"$(echo \"''rm -rf /etc\")\"",
                     "bash -c \"$(true; echo \"''rm -rf /etc\")\"",
-                    "x=$(true; echo \"''rm -rf /etc\"); eval \"$x\""):
+                    "x=$(true; echo \"''rm -rf /etc\"); eval \"$x\"",
+                    # An unset variable glued to a word leaves that word.
+                    "${x}rm -rf /etc", '"$x"rm -rf /etc', '$x""rm -rf /etc', "$@rm -rf /etc",
+                    "eval \"$(true; echo '${x}')rm -rf /etc\""):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         # A body printing nothing known stays opaque, never the empty root word.
         for cmd in ('rm -rf "$(cd x; mktemp -d)"', 'echo "$(git rev-parse HEAD; echo ok)"',
-                    "x=$(true; echo hi); echo $x", 'rm -rf "$(mktemp -d | tr -d x)"'):
+                    "x=$(true; echo hi); echo $x", 'rm -rf "$(mktemp -d | tr -d x)"',
+                    'rm -rf "$dir"/*', "ls ${dir}/sub", "$R format --check ."):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_only_a_command_substitution_has_a_literal_word_reading(self):
+        # A `<(…)` hands its reader a path; escaping what it prints shifted the
+        # quoting of a real transcript's line and exposed quoted text (XERK-1609).
+        lit = lambda c: guard._subst_text(next(guard._SUBST_RE.finditer(c)), literal=True)
+        self.assertEqual(lit("cat <(echo '\"')"), '"')
+        self.assertEqual(lit("cat $(echo '\"')"), '\\"')
 
     def test_unclosed_group_yields_nothing(self):
         # Reading an unclosed group to the end of the line swallowed the

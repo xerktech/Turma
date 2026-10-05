@@ -375,6 +375,16 @@ def _subst_inner(m: "re.Match[str]") -> str:
 # filesystem root — refusing the standard temp-dir cleanup idiom.
 _OPAQUE_SUBST = "turma_substituted_value"
 
+# An expansion of a variable this line never set, GLUED to the text after it:
+# `${x}rm`, `"$x"rm`, `$x""rm`, `$@rm`. Unset, it is nothing, and the word is
+# that text — `${x}rm -rf /etc` runs `rm` (XERK-1609 QA). A plain `$name` is
+# matched only before a quote, since a letter after it extends the name. A
+# `/` after it is no glue: `rm -rf "$dir"/*` is a path idiom, not this.
+_GLUED_PARAM_RE = re.compile(
+    r"""(?:"(?:\$\{(?:[A-Za-z_]\w*|[@*0-9])\}|\$[A-Za-z_]\w*|\$[@*0-9])"|"""
+    r"""\$\{(?:[A-Za-z_]\w*|[@*0-9])\}|\$[@*0-9])(?=["']*[\w.-])"""
+    r"""|\$[A-Za-z_]\w*(?=["']+[\w.-])""")
+
 
 def _quote_states(command: str) -> list[str]:
     """How each character of ``command`` is quoted: `'` inside a single-quoted
@@ -548,7 +558,8 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
     """
     printed = _body_printed(_subst_inner(m))
     if printed is not None:
-        return _literal(printed) if literal else printed
+        # A `<(…)` is a file path to its reader, so it has no word reading.
+        return _literal(printed) if literal and m.group(0)[0] in "$`" else printed
     if glued_empty and not _subst_standalone(m):
         return ""
     return _OPAQUE_SUBST
@@ -1911,20 +1922,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # only the segments that differ. A printed text holding a substitution is
     # left to the bodies' own pass: re-reading it here re-expanded every level
     # of a nest again and multiplied the cost by its depth.
-    # Both readings of the text, as `_subst_text` explains.
-    printed_lines = [raw_commands, raw_commands]
+    printed_line = raw_commands
     for body in bodies:
         printed = _body_printed(body) if _SEGMENT_SPLIT.search(body) else None
         if printed and "$(" not in printed and "`" not in printed:
             for whole in ("$(" + body + ")", "`" + body + "`"):
-                printed_lines = [printed_lines[0].replace(whole, printed),
-                                 printed_lines[1].replace(whole, _literal(printed))]
-    seen = set(segments)
-    for printed_line in printed_lines if printed_lines[0] != raw_commands else ():
-        for seg in _split_segments(_prenormalise(printed_line)):
-            if seg not in seen:
-                seen.add(seg)
-                segments.append(seg)
+                printed_line = printed_line.replace(whole, printed)
+    if printed_line != raw_commands:
+        seen = set(segments)
+        segments += [seg for seg in _split_segments(_prenormalise(printed_line))
+                     if seg not in seen]
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
@@ -2009,6 +2016,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         lit = _unwrap_group(_sub_substs(raw, lambda m: _subst_text(m, literal=True)))
         if lit != seg and lit:
             out.extend(_expand_segments(lit, depth + 1, cwds))
+        # ...and an unset variable glued to a word leaves that word.
+        glued = _GLUED_PARAM_RE.sub("", seg)
+        if glued != seg and glued.strip():
+            out.extend(_expand_segments(glued, depth + 1, cwds))
         # An `eval`'s words joined as eval re-parses them, read off the RAW
         # segment (XERK-1585). The substitution pass above swallowed a QUOTED
         # `'$('` that the join makes live (`eval echo '$(' rm -rf / ')'`), and
