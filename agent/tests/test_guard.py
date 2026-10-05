@@ -2401,13 +2401,78 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                 # so an unread-leading substitution there is not refused.
                 "for f in $(ls; echo y); do echo $f; done",
                 "select x in $(ls; echo y); do break; done",
-                # A conditional/backgrounded body is left opaque, as on main.
+                # A conditional body's every suffix reads harmless here.
                 "$(false && echo x; echo safe)",
                 # An assignment value is stored, not run.
                 "x=$(cat <<< 'rm -rf /etc'); echo done",
                 "RUNAGENT=$(for p in 1 2; do echo $p; done); echo ok"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_a_nested_or_conditional_body_runs_as_its_producers_text(self):
+        # XERK-1617: a nested wrapper hid the inner producer (the echo argument
+        # was tokenised with the inner `$(…)` still in it), and a `&&`/`||` body
+        # was left opaque, so a skipped statement let a later one lead.
+        for cmd in ("$(echo $(cat <<< 'rm -rf /etc'))",
+                    "$(echo $(basename /x/rm) -rf /etc | sed '')",
+                    "$(echo $(echo rm) -rf /etc | sed '')",
+                    "$(ls -d /usr/bin/rm /nope 2>/dev/null || echo -rf /etc)",
+                    "$(ls -d /usr/bin/rm /nope 2>/dev/null && echo -rf /etc)",
+                    "$(false || echo rm -rf / | sed '')",
+                    "$(false && echo x || echo rm -rf / | sed '')",
+                    # A grep that prints its lines filters like `sed`.
+                    "$(false || echo rm -rf / | grep .)",
+                    "$(ls /x || echo rm -rf /etc | grep rm)",
+                    # A quoted `$((` is not arithmetic around a later substitution.
+                    "X=\"$((\" $(false || echo rm -rf /etc) \"))\"",
+                    "echo '$((' ; $(ls -d /usr/bin/rm /nope || echo -rf /etc) ; echo '))'",
+                    # A grep option's VALUE that looks like -q/-c/-l is a pattern.
+                    "$(false || echo rm -rf /etc | grep -e -q)",
+                    "$(false || echo rm -rf /etc | grep -- -c)",
+                    "$(false || echo rm -rf /etc | grep -elib)",
+                    "$(false || echo rm -rf /etc | grep --regexp -q)",
+                    # Every suffix keeps the words after the substitution.
+                    "$(true && echo foo || echo rm | sed '') -rf /etc",
+                    "$(echo rm || echo x | sed '') -rf /etc",
+                    # A substitution inside `$((…))` still runs, and an array
+                    # subscript in what it prints is expanded again.
+                    "echo $(( $( $(false || cat <<< 'rm -rf /etc') ) ))",
+                    "echo $(( $(false || echo 'a[$(rm -rf /etc)]') ))",
+                    # Past `_MAX_TAINT_STARTS` statements an unread one may lead.
+                    "$(" + "true && echo a | sed ''; " * 9 + "ls /x || echo -rf /etc)"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        for cmd in ('cd "$(git rev-parse --show-toplevel 2>/dev/null || echo .)" && ls',
+                    "echo $(git describe --tags 2>/dev/null || echo none)",
+                    "$(command -v python3 || command -v python) script.py",
+                    "for f in $(ls *.py || echo none); do echo $f; done",
+                    "x=$(foo || echo bar | tr a b); echo $x",
+                    "echo $(echo $(date) | sed s/a/b/)",
+                    # Inside `$((…))` the output is an operand, never a program.
+                    "echo $(( $(stat -c%s f 2>/dev/null||echo 0)/1048576 ))",
+                    "echo $(( $(cat f; echo 0) ))",
+                    "N=$(( $(nproc || echo 2) * 2 )); echo $N",
+                    "x=$(( $(nproc||echo 2) )) y=1 echo $x",
+                    "echo $(( $(echo rm -rf /etc | sed '') ))",
+                    "bash -c 'echo $(( $(cat f || echo 0) ))'",
+                    # A grep printing a count or nothing is not the text.
+                    "$(ls /x || echo rm -rf /etc | grep -c rm)",
+                    "$(ls /x || echo rm -rf /etc | grep -q rm)",
+                    # A backgrounded body's order is unknown: left opaque.
+                    "$(sleep 1 & echo x | sed '')"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_a_large_conditional_or_nested_taint_body_stays_fast(self):
+        # XERK-1617: suffix readings are capped, and nested taint resolution is
+        # memoised per body, so neither goes quadratic/exponential.
+        import time
+        for cmd in ("$(" + "ls || " * 20000 + "echo a | sed '') x",
+                    "$(echo " * 200 + "rm -rf /etc" + " | sed '')" * 200):
+            with self.subTest(n=len(cmd)):
+                start = time.time()
+                guard.decide("Bash", {"command": cmd}, cwd="/tmp")
+                self.assertLess(time.time() - start, 30)
 
     def test_a_large_filtered_body_classifies_without_timing_out(self):
         # XERK-1613 QA: the taint reading must not make the guard quadratic —

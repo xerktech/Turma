@@ -618,6 +618,50 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
 _REWRITE_FILTERS = {"sed", "tr", "awk", "gawk", "mawk", "nawk", "cut", "rev",
                     "tac", "nl", "fold", "expand", "unexpand"}
 
+# A grep prints the lines it selects, so it filters like `sed` — unless a flag
+# makes it print nothing, a count or file names instead (XERK-1617 QA:
+# `$(false || echo rm -rf / | grep .)`).
+_GREP_PROGS = {"grep", "egrep", "fgrep"}
+# Short and long options that print no line text, and those taking a value
+# (the value is skipped, so `-e -q` is a pattern, not quiet).
+_GREP_NO_LINES = set("qclL")
+_GREP_NO_LINES_LONG = {"--quiet", "--silent", "--count", "--files-with-matches",
+                       "--files-without-match"}
+_GREP_VALUE_SHORT = set("efmABCdD")
+_GREP_VALUE_LONG = {"--regexp", "--file", "--max-count", "--after-context",
+                    "--before-context", "--context", "--directories", "--devices",
+                    "--label", "--include", "--exclude", "--exclude-dir",
+                    "--exclude-from", "--binary-files", "--color", "--colour"}
+
+
+def _greps_lines(toks: list[str]) -> bool:
+    """Whether ``toks`` is a grep that re-emits the lines it reads: no option
+    makes it print nothing, a count or file names instead."""
+    if _basename(toks[0]) not in _GREP_PROGS:
+        return False
+    i = 1
+    while i < len(toks):
+        t = toks[i]
+        i += 1
+        if t == "--":
+            break
+        if t.startswith("--"):
+            name = t.split("=", 1)[0]
+            if name in _GREP_NO_LINES_LONG:
+                return False
+            if "=" not in t and name in _GREP_VALUE_LONG - {"--color", "--colour"}:
+                i += 1
+        elif t.startswith("-") and len(t) > 1:
+            for k, c in enumerate(t[1:], 1):
+                if c in _GREP_NO_LINES:
+                    return False
+                if c in _GREP_VALUE_SHORT:
+                    if k == len(t) - 1:
+                        i += 1      # the value is the next word
+                    break           # the rest of the cluster is the value
+    return True
+
+
 # Builtins/commands that print nothing to stdout, so an unknown such statement
 # owes no unread-output mark (`$(cd x; echo …)` runs no unknown program).
 _SILENT_PROGS = {"true", "false", ":", "cd", "pushd", "popd", "export", "unset",
@@ -655,16 +699,67 @@ def _subst_is_assign_value(m: "re.Match[str]") -> bool:
     return bool(_ASSIGN_VALUE_RE.match(s[j:a]))
 
 
+def _arith_interior(body: str) -> str | None:
+    """The expression of a `$((…))` whose `$(` group body is ``body`` — `(` at
+    its start closing at its end — else None (`$((a) (b))` is a subshell)."""
+    if not (body.startswith("(") and body.endswith(")")):
+        return None
+    depth = 0
+    for i, ch in enumerate(body):
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth == 0:
+            return body[1:-1] if i == len(body) - 1 else None
+    return None
+
+
+# What may sit between a `$((` and a substitution inside it, and between the
+# substitution and the `))`, for `_subst_in_arith` to call it arithmetic:
+# operands and operators only. A quote, `#`, backslash, `;`, `|`, `&` or
+# newline means the `$((` may be a decoy (`echo '$((' ; $(…) ; echo '))'`).
+_ARITH_GAP_RE = re.compile(r"[\w \t$+\-*/%<>=!~^?:,(){}\[\].]*\Z")
+
+
+def _subst_in_arith(m: "re.Match[str]") -> bool:
+    """Whether the substitution sits inside a `$((…))` of the text it was
+    found in, where its output is an arithmetic OPERAND, never a program. The
+    line pass reads a `$((…))` assignment value or env prefix in place:
+    `N=$(( $(nproc || echo 2) * 2 ))` was refused as an unread program (XERK-1617
+    QA). Neither this nor `_find_substs` tracks quoting, so the text around the
+    substitution up to the `$((` and the `))` must be plain arithmetic
+    (`_ARITH_GAP_RE`); anything else reads as not arithmetic, the deny side."""
+    s, a, b = m.string, m.start(), m.end()
+    p = s.rfind("$((", 0, a)
+    if p < 0 or (p and s[p - 1] == "\\"):
+        return False
+    depth = 2
+    for ch in s[p + 3:a]:
+        depth += {"(": 1, ")": -1}.get(ch, 0)
+        if depth < 2:
+            return False    # that `$((` closed before the substitution
+    j = b
+    while j < len(s) and depth:
+        depth += {"(": 1, ")": -1}.get(s[j], 0)
+        j += 1
+        if depth == 1 and s[j:j + 1] != ")":
+            return False    # `((` closed apart: `$( (…) (…) )`, a subshell
+    return (depth == 0 and bool(_ARITH_GAP_RE.match(s[p + 3:a]))
+            and bool(_ARITH_GAP_RE.match(s[b:j])))
+
+
 def _has_conditional(body: str) -> bool:
-    """Whether ``body`` joins statements with `&&`, `||` or a backgrounding
-    `&`, so which statement's output prints, and in what order, is unknown."""
+    """Whether ``body`` joins statements with `&&` or `||`, so any of them may
+    be skipped and a LATER one's output may come first."""
+    q = _quote_states(body)
+    return any(q[i] == "" and body[i:i + 2] in ("&&", "||") for i in range(len(body)))
+
+
+def _has_background(body: str) -> bool:
+    """Whether ``body`` backgrounds a statement with `&`, so the order its
+    output interleaves with the others' is unknown."""
     q = _quote_states(body)
     for i in range(len(body)):
-        if q[i] != "":
-            continue
-        if body[i:i + 2] in ("&&", "||"):
-            return True
-        if body[i] == "&" and body[i:i + 2] != "&>" and (i == 0 or body[i - 1] not in "&>|"):
+        if q[i] == "" and body[i] == "&" and body[i:i + 2] not in ("&&", "&>") \
+                and (i == 0 or body[i - 1] not in "&>|"):
             return True
     return False
 
@@ -690,7 +785,8 @@ def _stmt_tainted(stmt: str) -> tuple[str, bool] | None:
         return None
     for st in stages[1:]:
         toks = _strip_prefixes(_tokenize(_unwrap_group(st)))
-        if not toks or not (_passes_input(st) or _basename(toks[0]) in _REWRITE_FILTERS):
+        if not toks or not (_passes_input(st) or _basename(toks[0]) in _REWRITE_FILTERS
+                            or _greps_lines(toks)):
             return None
     first = _strip_prefixes(_tokenize(_unwrap_group(stages[0])))
     text = _printed_from_tokens(first)
@@ -711,9 +807,50 @@ def _stmt_tainted(stmt: str) -> tuple[str, bool] | None:
     return None
 
 
+# A conditional body holding more statements than this is read as if its
+# output could start with an unread one, rather than as every suffix: each
+# suffix is a re-expansion of the whole segment.
+_MAX_TAINT_STARTS = 8
+
+# Which of a conditional body's suffix readings `_taint_subst` and
+# `_taint_line_repl` splice in (`_TAINT_START`), and whether any substitution
+# they read had a reading past it (`_TAINT_MORE`), so the caller knows to ask
+# for the next one.
+_TAINT_START = [0]
+_TAINT_MORE = [False]
+
+
+def _taint_nested(m: "re.Match[str]") -> str:
+    """What one of a taint body's OWN substitutions prints, for reading the
+    body after them: its taint, else `_UNREAD_OUTPUT` (it runs and prints
+    something). `$(echo $(cat <<< 'rm …'))` had its echo argument tokenised
+    with the inner `$(…)` still in it, which dropped its `)` and quotes, so the
+    inner producer was never read (XERK-1617). A `<(…)` is a path and an
+    assignment value is stored, so both stay the opaque placeholder."""
+    if m.group(0)[0] not in "$`" or _subst_is_assign_value(m):
+        return _OPAQUE_SUBST
+    if _SUBST_DEPTH[0] >= _MAX_SUBST_DEPTH:
+        return _UNREAD_OUTPUT
+    _SUBST_DEPTH[0] += 1
+    try:
+        taint = _body_tainted(_subst_inner(m))
+    finally:
+        _SUBST_DEPTH[0] -= 1
+    # The every-statement-ran reading; a nested conditional's skipped ones are
+    # a residual (guard-substitutions.md).
+    return taint[0] if taint is not None else _UNREAD_OUTPUT
+
+
+def _body_tainted(body: str) -> tuple[str, ...] | None:
+    """The taint readings of a substitution body, or None to leave it opaque.
+    Its own substitutions resolve the way the enclosing parse does (escaped
+    ones kept literal unless `_SPLICE_RAW`), so the memo is keyed on that."""
+    return _body_tainted_at(body, _SPLICE_RAW[0])
+
+
 @functools.lru_cache(maxsize=512)
-def _body_tainted(body: str) -> str | None:
-    """The taint reading of a substitution body, or None to leave it opaque.
+def _body_tainted_at(body: str, raw: bool) -> tuple[str, ...] | None:
+    """`_body_tainted` for one `_SPLICE_RAW` setting.
 
     A rewriting filter, a non-echo producer, or an unread statement left the
     body opaque while bash ran its output (XERK-1613):
@@ -723,11 +860,26 @@ def _body_tainted(body: str) -> str | None:
     failing closed denies `$(command -v tool) args`); a statement that still
     prints something UNKNOWN contributes `_UNREAD_OUTPUT`, so its output naming
     the program is refused. None for a LONE unknown statement (that IS
-    `$(command -v tool)`), and for a conditional, control-flow or backgrounded
-    body whose printing order is unknown (left opaque, as on main). A rewrite
-    that makes harmless text dangerous (`echo /etc/x | sed s,/x,,`) still slips.
+    `$(command -v tool)`), and for a control-flow or backgrounded body whose
+    printing order is unknown (left opaque, as on main). A rewrite that makes
+    harmless text dangerous (`echo /etc/x | sed s,/x,,`) still slips.
+
+    The body's own substitutions are resolved first (`_taint_nested`), as
+    `_body_printed` does. A `&&`/`||` body may skip any statement, so whichever
+    runs first takes the program slot: `$(ls -d /usr/bin/rm /x || echo -rf
+    /etc)` prints `/usr/bin/rm -rf /etc` when ls fails having printed. Its
+    readings are every SUFFIX of its statements (XERK-1617), each spliced in
+    on its own so the words after the substitution follow every one; a
+    statement skipped mid-way only drops words, never the program.
     """
-    if _has_conditional(body):
+    before = _SPLICES_ESCAPED[0]
+    try:
+        body = _sub_substs(body, _taint_nested)
+    finally:
+        # A separate reading: its escaped skips must not ask the caller for
+        # an every-expansion-live pass the plain reading did not.
+        _SPLICES_ESCAPED[0] = before
+    if _has_background(body):
         return None
     out: list[str] = []
     producers = False
@@ -754,7 +906,40 @@ def _body_tainted(body: str) -> str | None:
     # that turned a later arg into a phantom program (XERK-1613 QA). An unread
     # statement after a producer is thus a trailing WORD, not the program —
     # only a leading one takes the program slot (`_UNREAD_PROG`).
-    return " ".join(x for x in out if x) or None
+    out = [x for x in out if x]
+    if not out:
+        return None
+    if not _has_conditional(body) or len(out) == 1:
+        return (" ".join(out),)
+    if len(out) > _MAX_TAINT_STARTS:
+        # Too many to read each: any of them may lead, unread or not.
+        return (" ".join(out), _UNREAD_OUTPUT + " " + " ".join(out))
+    return tuple(" ".join(out[i:]) for i in range(len(out)))
+
+
+def _taint_pick(readings: tuple[str, ...]) -> str:
+    """The reading `_TAINT_START` asks for, noting whether one lies past it."""
+    k = _TAINT_START[0]
+    if len(readings) > k + 1:
+        _TAINT_MORE[0] = True
+    return readings[min(k, len(readings) - 1)]
+
+
+def _taint_readings(text: str, repl) -> list[str]:
+    """``text`` with its substitutions replaced by ``repl`` (`_taint_subst` or
+    `_taint_line_repl`) once per suffix reading a conditional body has; one
+    sweep for a line holding none."""
+    out: list[str] = []
+    saved = _TAINT_START[0], _TAINT_MORE[0]
+    try:
+        for k in range(_MAX_TAINT_STARTS):
+            _TAINT_START[0], _TAINT_MORE[0] = k, False
+            out.append(_sub_substs(text, repl))
+            if not _TAINT_MORE[0]:
+                break
+    finally:
+        _TAINT_START[0], _TAINT_MORE[0] = saved
+    return out
 
 
 def _taint_in_command_pos(seg: str) -> bool:
@@ -774,10 +959,10 @@ def _taint_subst(m: "re.Match[str]") -> str:
     """`_subst_text`'s taint sibling for a segment-level pass: a substitution's
     taint reading where one exists, else the opaque placeholder. An assignment
     VALUE stays opaque (its output is stored, not run)."""
-    if m.group(0)[0] not in "$`" or _subst_is_assign_value(m):
+    if m.group(0)[0] not in "$`" or _subst_is_assign_value(m) or _subst_in_arith(m):
         return _OPAQUE_SUBST
     taint = _body_tainted(_subst_inner(m))
-    return taint if taint is not None else _OPAQUE_SUBST
+    return _taint_pick(taint) if taint is not None else _OPAQUE_SUBST
 
 
 def _taint_line_repl(m: "re.Match[str]") -> str:
@@ -788,9 +973,12 @@ def _taint_line_repl(m: "re.Match[str]") -> str:
     untouched, so only a real taint changes the line."""
     body = _subst_inner(m)
     if (not _SEGMENT_SPLIT.search(body) or m.group(0)[0] not in "$`"
-            or _subst_is_assign_value(m)):
+            or _subst_is_assign_value(m) or _subst_in_arith(m)):
         return m.group(0)
     taint = _body_tainted(body)
+    if taint is None:
+        return m.group(0)
+    taint = _taint_pick(taint)
     if taint and "$(" not in taint and "`" not in taint:
         return taint
     return m.group(0)
@@ -2347,6 +2535,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     for body in bodies:
         if _ARITH_BODY_RE.match(body):
             continue
+        interior = _arith_interior(body)
+        if interior is not None and "$(" + body + ")" in raw_commands:
+            # `$((…))` runs no command of its own, only the substitutions in
+            # it, whose output is an operand: read as `:`'s ARGUMENTS, so a
+            # taint reading there is never a program (XERK-1617 replay:
+            # `$(( $(stat -c%s f || echo 0)/1048576 ))`).
+            body = ": " + interior
         before = cwds
         if every_cd != cwds:
             # The `cd`s written before the group are the ones it runs after.
@@ -2388,9 +2583,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         cwds = _cd_readings(_prenormalise(printed_line), cwds)
     # The TAINT reading of every operator-holding substitution the splitter cut
     # (XERK-1613), rebuilt in ONE pass so a body of N statements stays linear.
-    tainted_line = _sub_substs(raw_commands, _taint_line_repl)
-    if tainted_line != raw_commands:
-        seen = set(segments)
+    seen = set(segments)
+    for tainted_line in _taint_readings(raw_commands, _taint_line_repl):
+        if tainted_line == raw_commands:
+            continue
         for line in dict.fromkeys((tainted_line, tainted_line.replace("\n", " "))):
             for seg in _split_segments(_prenormalise(line)):
                 if seg not in seen:
@@ -2499,7 +2695,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # ...and a filtered or partly-unread substitution read as the text
             # its producers emit (XERK-1613); a non-cut one is read here, a cut
             # one by the line pass above.
-            _unwrap_group(_sub_substs(raw, _taint_subst)),
+            *(_unwrap_group(t) for t in _taint_readings(raw, _taint_subst)),
         }
         for reading in readings - {seg, bare, ""}:
             out.extend(_expand_segments(reading, depth + 1, cwds))
