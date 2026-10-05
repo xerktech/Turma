@@ -23258,6 +23258,12 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         p = mock.patch.object(ha, "_orphaned_tmux_server", return_value=False)
         p.start()
         self.addCleanup(p.stop)
+        self.shadowed, self.shadow_bases = None, []
+        p = mock.patch.object(ha, "_shadowed_tmux_sessions",
+                              lambda bases: self.shadow_bases.append(bases)
+                              or self.shadowed)
+        p.start()
+        self.addCleanup(p.stop)
         p = mock.patch.object(ha.SessionManager, "_kill_ttyd",
                               lambda self, sid: self and self.killed_ttyd.append(sid))
         p.start()
@@ -23375,6 +23381,36 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
                     sm._sweep_dead_sessions()
             self.assertEqual(sess["status"], "running")
             self.assertEqual(sm.killed_ttyd, [])
+
+    def test_a_session_under_a_shadowed_server_is_never_reaped(self):
+        # XERK-1544: the listing succeeded against a NEWER server on the same
+        # socket path, so it omits an older server's live sessions. One still
+        # running there (by id or by worktree) is spared; a truly dead one on
+        # the same host is reaped as before.
+        sm = self.make_manager()
+        by_id = self._sess(id="a", tmuxName="agent-a", worktreePath="/w/a")
+        by_wt = self._sess(id="b", tmuxName="agent-b", worktreePath="/w/b")
+        dead = self._sess(id="c", tmuxName="agent-c", worktreePath="/w/c")
+        sm.registry = [by_id, by_wt, dead]
+        self.shadowed = ({"a"}, {"/w/b"})
+        for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+            sm._sweep_dead_sessions()
+        self.assertEqual((by_id["status"], by_wt["status"]), ("running", "running"))
+        self.assertEqual(dead["status"], "error")
+        self.assertEqual(sm.killed_ttyd, ["c"])
+        # Only the agent's own server is looked at: no session was legacy, so
+        # a shadowed DEFAULT server (the operator's own tmux) spares nothing.
+        self.assertEqual({tuple(b) for bs in self.shadow_bases for b in bs},
+                         {("tmux", "-L", ha.TMUX_SOCKET)})
+
+    def test_a_beat_listing_every_session_never_reads_proc_for_shadows(self):
+        # XERK-1544: the shadow check is lazy — a beat where every running
+        # session is listed pays nothing for it.
+        sm = self.make_manager()
+        sm.registry = [self._sess(tmuxName="agent-alive")]
+        with mock.patch.object(ha, "_shadowed_tmux_sessions") as shadow:
+            sm._sweep_dead_sessions()
+        shadow.assert_not_called()
 
     def test_a_queued_session_is_never_reaped(self):
         # A queued record has no tmux BY DESIGN — _drain_queue provisions it later.
@@ -37162,6 +37198,93 @@ class TestAgentTmuxSocket(unittest.TestCase):
         self.assertTrue(os.path.exists(sock), "SIGUSR1 did not recreate the socket")
         live = ha.SessionManager._live_tmux_panes(mgr)
         self.assertEqual(set(live), {"agent-s"})
+
+    def test_a_session_on_a_server_shadowed_by_a_new_one_is_not_swept(self):
+        # XERK-1544, the ticket's repro: the first server loses its socket file,
+        # a second server binds the same path, and the listing SUCCEEDS against
+        # it without the first server's sessions. Those still running there are
+        # spared — found by a GRANDCHILD's worktree cwd (x) or a pane's
+        # TURMA_SESSION_ID (r) — and nobody is signalled. d is truly dead and is
+        # reaped although the old SERVER's own cwd is d's worktree (it keeps the
+        # cwd of whoever started it, so it must not count).
+        os.environ.pop("TURMA_SESSION_ID", None)
+        root = os.path.join(self.tmp, "wt")
+        wt = {k: os.path.join(root, "repo", k) for k in "xd"}
+        for d in wt.values():
+            os.makedirs(d)
+        p = mock.patch.object(ha, "WORKTREES_ROOT", root)
+        p.start()
+        self.addCleanup(p.stop)
+        base = ["tmux", "-L", ha.TMUX_SOCKET]
+        # x's pane stays in self.tmp; only its subshell's child enters x's worktree.
+        subprocess.run(base + ["new-session", "-d", "-s", "agent-x", "-c", self.tmp,
+                               f"sh -c '(cd {wt['x']} && exec sleep 30); true'"],
+                       check=True, cwd=wt["d"])
+        subprocess.run(base + ["new-session", "-d", "-s", "agent-r", "-c", self.tmp,
+                               "env TURMA_SESSION_ID=r sleep 30"], check=True)
+        old_pid = int(subprocess.run(base + ["display", "-p", "#{pid}"],
+                                     capture_output=True, text=True,
+                                     check=True).stdout)
+        self.addCleanup(lambda: ha._pid_alive(old_pid)
+                        and os.kill(old_pid, signal.SIGTERM))
+        os.unlink(os.path.join(self.tmp, f"tmux-{os.getuid()}", ha.TMUX_SOCKET))
+        self.assertIsNone(ha._shadowed_tmux_sessions([base]))
+        self._orphanable_session("agent-y")
+        mgr = types.SimpleNamespace(
+            registry=[{"id": k, "status": "running", "tmuxName": f"agent-{k}",
+                       "worktreePath": wt.get(k, self.tmp)}
+                      for k in "xrd"],
+            save=lambda: None, _kill_ttyd=mock.Mock(),
+            _set_error=lambda sess, msg: sess.update(status="error"))
+        mgr._live_tmux_panes = lambda: ha.SessionManager._live_tmux_panes(mgr)
+        self.assertEqual(set(mgr._live_tmux_panes()), {"agent-y"})
+        want = ({"r"}, {wt["x"]})
+        for _ in range(50):      # x's subshell may not have cd'd yet
+            if ha._shadowed_tmux_sessions([base]) == want:
+                break
+            time.sleep(0.1)
+        self.assertEqual(ha._shadowed_tmux_sessions([base]), want)
+        for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+            ha.SessionManager._sweep_dead_sessions(mgr)
+        self.assertEqual({s["id"]: s["status"] for s in mgr.registry},
+                         {"x": "running", "r": "running", "d": "error"})
+        mgr._kill_ttyd.assert_called_once_with("d")
+        self.assertTrue(ha._pid_alive(old_pid))
+
+    def test_a_legacy_session_on_a_shadowed_default_server_stays_managed(self):
+        # XERK-1544 on the DEFAULT server: a legacy session's server loses its
+        # socket and a new default server (the operator's own `tmux`) takes the
+        # path. The session is spared on every beat — not just the first — and
+        # stays legacy, so it is still looked for (and addressed) there.
+        os.environ.pop("TURMA_SESSION_ID", None)
+        self._default("new-session", "-d", "-s", "agent-l", "-c", self.tmp,
+                      "env TURMA_SESSION_ID=l sleep 30")
+        old_pid = int(self._default("display", "-p", "#{pid}").stdout)
+        self.addCleanup(lambda: ha._pid_alive(old_pid)
+                        and os.kill(old_pid, signal.SIGTERM))
+        ha._probe_legacy_tmux({"agent-l"})
+        os.unlink(os.path.join(self.tmp, f"tmux-{os.getuid()}", "default"))
+        self._default("new-session", "-d", "-s", "mine", "sleep 30")
+        mgr = types.SimpleNamespace(
+            registry=[{"id": "l", "status": "running", "tmuxName": "agent-l",
+                       "worktreePath": self.tmp}],
+            save=lambda: None, _kill_ttyd=mock.Mock(),
+            _set_error=lambda sess, msg: sess.update(status="error"))
+        mgr._live_tmux_panes = lambda: ha.SessionManager._live_tmux_panes(mgr)
+        for _ in range(ha.DEAD_TMUX_STRIKES + 2):
+            ha.SessionManager._sweep_dead_sessions(mgr)
+        self.assertEqual(mgr.registry[0]["status"], "running")
+        mgr._kill_ttyd.assert_not_called()
+        self.assertEqual(ha._legacy_tmux, {"agent-l"})
+
+    def test_an_orphaned_server_is_signalled_once(self):
+        # XERK-1259: one SIGUSR1 per lost socket — a second tmux listening on
+        # the path would steal it back and orphan the first (XERK-1544).
+        with mock.patch.object(ha, "_unix_listener_inodes", return_value={"1", "2"}), \
+                mock.patch.object(ha, "_tmux_listener_pids", return_value=[11, 22]), \
+                mock.patch.object(ha.os, "kill") as kill:
+            self.assertTrue(ha._orphaned_tmux_server(["tmux", "-L", ha.TMUX_SOCKET]))
+        kill.assert_called_once_with(11, signal.SIGUSR1)
 
     def test_only_a_listening_socket_marks_a_server_orphaned(self):
         # A CONNECTED socket can carry the same path (/proc/net/unix shows it on

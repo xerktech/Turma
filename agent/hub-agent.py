@@ -1513,27 +1513,118 @@ def _orphaned_tmux_server(base):
         return False
     # Every listener on the path: one that is not tmux must not hide the
     # tmux server that also lost its socket there.
+    for pid in _tmux_listener_pids(inodes):
+        try:
+            os.kill(pid, signal.SIGUSR1)
+        except OSError:
+            continue        # it exited since the scan
+        log(f"tmux: server {pid} lost its socket {path}; told it to "
+            f"recreate it (SIGUSR1)")
+        break
+    else:
+        log(f"tmux: a live server lost its socket {path} and its pid was not "
+            f"found; its sessions can't be listed")
+    return True
+
+
+def _tmux_listener_pids(inodes):
+    """Pids of the TMUX processes holding one of the listening sockets
+    `inodes`. Only a tmux: SIGUSR1's default action is to terminate, so some
+    other process bound to tmux's path must never be signalled."""
     targets = {f"socket:[{i}]" for i in inodes}
+    pids = []
     for fd_dir in glob.glob("/proc/[0-9]*/fd"):
         try:
             if any(os.readlink(os.path.join(fd_dir, fd)) in targets
                    for fd in os.listdir(fd_dir)):
                 pid = int(fd_dir.split("/")[2])
-                # SIGUSR1's default action is to terminate: signal only a
-                # tmux, never some other process bound to tmux's path.
                 with open(f"/proc/{pid}/comm") as f:
-                    if not f.read().startswith("tmux"):
-                        continue
-                os.kill(pid, signal.SIGUSR1)
-                log(f"tmux: server {pid} lost its socket {path}; told it to "
-                    f"recreate it (SIGUSR1)")
-                break
+                    if f.read().startswith("tmux"):
+                        pids.append(pid)
         except (OSError, ValueError):
             continue        # another uid's process, or it exited mid-scan
-    else:
-        log(f"tmux: a live server lost its socket {path} and its pid was not "
-            f"found; its sessions can't be listed")
-    return True
+    return pids
+
+
+_shadowed_tmux_logged = frozenset()
+
+
+def _shadowed_tmux_sessions(bases):
+    """(session ids, worktree paths) of the sessions running under a tmux server
+    that a NEWER server shadows on the same socket path (XERK-1544), else None.
+
+    The XERK-1259 orphan check runs on `no server running` only. If a new
+    server (the agent's own next `new-session`) binds the path after the old
+    server's socket file was deleted, the listing SUCCEEDS against the new one
+    and simply omits the old one's sessions — alive, but reading as dead. Two
+    LISTENING entries for one path is that shape. Neither server is signalled:
+    SIGUSR1 would make the old one steal the path and shadow the new one.
+    Instead every process under any server on the path is attributed to its
+    session (cwd inside a worktree, else TURMA_SESSION_ID, as the memory guard
+    does), so the sweep spares exactly the sessions still running and keeps
+    reaping the truly dead. Read only when a session is missing from a
+    listing, so the beat pays nothing for it otherwise."""
+    global _shadowed_tmux_logged
+    if IS_WINDOWS:
+        return None
+    servers = set()
+    for base in bases:
+        inodes = _unix_listener_inodes(_tmux_socket_path(base))
+        if inodes and len(inodes) > 1:
+            servers.update(_tmux_listener_pids(inodes))
+    if not servers:
+        _shadowed_tmux_logged = frozenset()
+        return None
+    if servers != _shadowed_tmux_logged:
+        _shadowed_tmux_logged = frozenset(servers)
+        log(f"tmux: servers {sorted(servers)} share one socket path — an older "
+            f"one lost its socket file and a newer one took the path; sessions "
+            f"still running under either are left alone (XERK-1544)")
+    children = {}
+    for name in os.listdir("/proc"):
+        if not (name.isascii() and name.isdigit()):
+            continue
+        try:
+            with open(f"/proc/{name}/stat", "rb") as f:
+                raw = f.read()
+            # comm may hold spaces or ')': ppid follows the LAST ')'.
+            ppid = int(raw[raw.rindex(b")") + 2:].split()[1])
+        except (OSError, ValueError, IndexError):
+            continue
+        children.setdefault(ppid, []).append(int(name))
+    # Only the servers' DESCENDANTS: a server keeps the cwd and environment of
+    # the client that started it — possibly a session's — which would keep that
+    # session alive forever. And only they have cwd/environ read, so the beat
+    # never touches (or contends the mmap lock of) the host's other processes.
+    wt_root = WORKTREES_ROOT.rstrip(os.sep) + os.sep
+    sids, worktrees, seen = set(), set(), set()
+    stack = [c for pid in servers for c in children.get(pid, ())]
+    while stack:
+        pid = stack.pop()
+        if pid in seen:
+            continue
+        seen.add(pid)
+        stack.extend(children.get(pid, ()))
+        try:
+            cwd = os.readlink(f"/proc/{pid}/cwd")
+            if cwd.startswith(wt_root):
+                parts = cwd[len(wt_root):].split(os.sep)
+                if len(parts) >= 2 and parts[0] and parts[1]:
+                    worktrees.add(os.path.join(wt_root, parts[0], parts[1]))
+                    continue
+        except OSError:
+            pass
+        try:
+            with open(f"/proc/{pid}/environ", "rb") as f:
+                env = f.read(MEMGUARD_ENVIRON_MAX)
+        except OSError:
+            continue
+        for kv in env.split(b"\0"):
+            m = MEMGUARD_SID_RE.fullmatch(kv)
+            if m:
+                sids.add(m.group(1).decode())
+                break
+    return sids, worktrees
 
 
 def _tmux_list_panes(base, fmt, timeout=5, empty=_TMUX_EMPTY_ERRS):
@@ -28242,7 +28333,13 @@ class SessionManager:
                 if owns(name):
                     live.setdefault(name, set()).add(pane)
             if base == ["tmux"]:
-                _forget_legacy_tmux(n for n in set(_legacy_tmux) if n not in live)
+                gone = [n for n in set(_legacy_tmux) if n not in live]
+                # Not while a newer default server shadows the one they ran on
+                # (XERK-1544): they may be alive there, and forgetting them would
+                # route the sweep's shadow check to the wrong server next beat.
+                if gone and len(_unix_listener_inodes(_tmux_socket_path(base))
+                                or ()) < 2:
+                    _forget_legacy_tmux(gone)
         return live
 
     def _sweep_dead_sessions(self):
@@ -28300,6 +28397,7 @@ class SessionManager:
             on_legacy: set().union(*(ps for n, ps in (live or {}).items()
                                      if (n in legacy) == on_legacy))
             for on_legacy in (False, True)}
+        shadowed = {}            # per server, read lazily: only a missing session needs it
         for sess in list(self.registry):
             if sess.get("status") != "running":
                 sess.pop("deadTmuxStrikes", None)
@@ -28327,6 +28425,19 @@ class SessionManager:
                 # (An ordinary later crash then reports normally.)
                 sess.pop("resumeRelaunch", None)
                 continue
+            # XERK-1544: a session missing from a listing that SUCCEEDED may be
+            # running under an older server a newer one shadows on the same
+            # socket path. Still running there is alive, never a strike.
+            if not leftover:
+                on_legacy = tmux in legacy
+                if on_legacy not in shadowed:
+                    shadowed[on_legacy] = _shadowed_tmux_sessions(
+                        [["tmux"] if on_legacy else ["tmux", "-L", TMUX_SOCKET]])
+                held = shadowed[on_legacy]
+                if held and (sid in held[0]
+                             or sess.get("worktreePath") in held[1]):
+                    sess.pop("deadTmuxStrikes", None)
+                    continue
             strikes = int(sess.get("deadTmuxStrikes") or 0) + 1
             sess["deadTmuxStrikes"] = strikes
             self.save()
