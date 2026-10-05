@@ -2822,6 +2822,41 @@ def _heredoc_readings(body: str) -> list[str]:
 _ESCAPED_PARAM_RE = re.compile(r"(?<!\\)\\\$(?=[{A-Za-z_@*0-9!])")
 
 
+# `$1`, `${12}`, `$@`, `${*}` — a shell's positional parameters.
+_POSITIONAL_RE = re.compile(r"\$(?:\{([0-9]+|[@*])\}|([0-9@*]))")
+
+
+def _bind_positionals(script: str, args: list[str]) -> str:
+    """``script`` with the positional parameters ``sh -c '<script>' <args>``
+    gives it spliced in: ``args[0]`` is `$0`, the rest `$1`… and `$@`/`$*`.
+
+    `find /etc -exec sh -c 'rm -rf "$1"' _ {} +` hands the path to the script
+    as `$1`, so classifying the script alone saw only `rm -rf "$1"` (XERK-1600).
+    A parameter with no argument is left as written, never guessed at."""
+    if not args or "$" not in script:
+        return script
+    states = _quote_states(script)
+
+    def rep(m: "re.Match[str]") -> str:
+        if not _live_dollar(script, m.start()):
+            return m.group(0)
+        name = m.group(1) or m.group(2)
+        if name in ("@", "*"):
+            if len(args) < 2:
+                return m.group(0)
+            value = " ".join(args[1:])
+        elif int(name) < len(args):
+            value = args[int(name)]
+        else:
+            return m.group(0)
+        state = states[m.start()] if m.start() < len(states) else ""
+        out = _quote_literal(value, state)
+        _spend(len(out))
+        return out
+
+    return _POSITIONAL_RE.sub(rep, script)
+
+
 def _expand_segments(command: str, depth: int = 0,
                      cwds: tuple[str, ...] = ()) -> list[tuple[list[str], str]]:
     """`_expand`, reporting a spent growth budget as `_TOO_LARGE`."""
@@ -3147,7 +3182,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if prog in _SHELL_PROGS:
             script = _shell_c_script(rest)
             if script is not None:
-                for reading in _script_readings(script):
+                scripts = _script_readings(script)
+                # ...and again with its arguments bound, where it reads them.
+                j = _shell_c_index(rest) + 1
+                args = rest[j + 1 + (rest[j] == "--"):]
+                scripts += [b for b in (_bind_positionals(sc, args) for sc in scripts)
+                            if b not in scripts]
+                for reading in scripts:
                     out.extend(_expand_segments(reading, depth + 1, every_cd))
         elif prog == "eval" and rest:
             # `eval eval eval … rm -rf /etc` is valid shell. Collapse the chain
@@ -3259,8 +3300,20 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # that takes a SEPARATE value must consume it, else `-I {} rm -rf {}`
             # left `{}` as the command and classified nothing.
             inner = list(rest)
+            # The replace-string (`-I R`, `-iR`, `--replace=R`; `-i` and
+            # `--replace` alone mean `{}`), which xargs substitutes ANYWHERE in
+            # an argument — inside `sh -c 'rm -rf {}'` too (XERK-1600).
+            replstr = ""
             while inner and inner[0].startswith("-"):
                 opt = inner.pop(0)
+                if opt == "-I" and inner:
+                    replstr = inner[0]
+                elif opt.startswith("-I"):
+                    replstr = opt[2:]
+                elif opt.startswith("-i"):
+                    replstr = opt[2:] or "{}"
+                elif opt == "--replace" or opt.startswith("--replace="):
+                    replstr = opt.partition("=")[2] or "{}"
                 if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
                     inner.pop(0)
             if inner:
@@ -3273,12 +3326,20 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                         _spend(piped_chars)
                     expanded.extend(piped_operands if tok == "{}" else [tok])
                 _spend(piped_chars)
-                argv = _strip_prefixes(expanded + piped_operands)
-                out.append((argv, seg))
-                # ...and expanded again, so a shell/eval/wrapper it runs is
-                # unwrapped: `xargs sh -c '<cmd>'` (XERK-1539).
-                out.extend(_expand_segments(
-                    " ".join(shlex.quote(t) for t in argv), depth + 1, cwds))
+                argvs = [_strip_prefixes(expanded + piped_operands)]
+                # A replace-string embedded in an argument becomes ONE operand
+                # per run, so each operand is a run of its own.
+                if replstr and any(replstr in t and t != replstr for t in inner):
+                    for operand in piped_operands:
+                        run = [t.replace(replstr, operand) for t in inner]
+                        _spend(sum(len(t) + 1 for t in run))
+                        argvs.append(_strip_prefixes(run))
+                for argv in argvs:
+                    out.append((argv, seg))
+                    # ...and expanded again, so a shell/eval/wrapper it runs is
+                    # unwrapped: `xargs sh -c '<cmd>'` (XERK-1539).
+                    out.extend(_expand_segments(
+                        " ".join(shlex.quote(t) for t in argv), depth + 1, cwds))
         elif prog == "find":
             roots = _find_roots(tokens) or ["."]
             # Relative roots from inside a protected cwd: `cd /; find . -delete`.
@@ -3303,13 +3364,22 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 for i, flag_tok in enumerate(rest):
                     if flag_tok != flag:
                         continue
+                    toks = rest[i + 1:ends[i]]
                     run = []
-                    for tok in rest[i + 1:ends[i]]:
+                    for tok in toks:
                         # `{}` stands for each path found — i.e. the roots.
                         if tok == "{}":
                             _spend(roots_chars)
                         run.extend(roots if tok == "{}" else [tok])
-                    if run:
+                    runs = [run]
+                    # GNU find replaces a `{}` INSIDE an argument too —
+                    # `-exec sh -c 'rm -rf {}' \;` — with one path per run
+                    # (XERK-1600), so each root is a run of its own.
+                    if any("{}" in t and t != "{}" for t in toks):
+                        for root in roots:
+                            runs.append([t.replace("{}", root) for t in toks])
+                            _spend(sum(len(t) + 1 for t in runs[-1]))
+                    for run in filter(None, runs):
                         # Every run is classified with the whole segment, and
                         # checkers rescan that text per entry: 5000 runs took
                         # 30s (XERK-1589), so each run charges the segment.

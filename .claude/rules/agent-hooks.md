@@ -288,6 +288,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - The producer→shell link is lost where `_split_on_operators` severs the pipeline — the
       `&` in `2>&1`/`|&`, the `;` inside `{ …; }` — a pre-existing splitter limit this relies
       on; wrapped forms (`echo P | ssh h sh`, `| docker exec -i c sh`) are residuals too.
+    - **The path reaches the script** (XERK-1600): find and `xargs -I R`/`-i`/`--replace` replace
+      `{}`/R INSIDE an argument (`sh -c 'rm -rf {}'`), one run per root/operand; and
+      `sh -c '<script>' <name> <args>` binds `$0…$n`/`$@`/`$*` (`_bind_positionals`). The
+      unbound script is classified too; an unset positional is left as written, never guessed.
   - **Variable inlining has a growth budget** (`_MAX_SUBST_GROWTH`, XERK-1556): each `$x` inlines
     the whole value, so size × uses took minutes, and a hook past Claude Code's timeout RUNS the
     command. Spent → DENY (`_TOO_LARGE`), never an early return, never grantable (`decide`
