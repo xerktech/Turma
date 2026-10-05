@@ -1413,6 +1413,11 @@ class TestScriptChannels(unittest.TestCase):
                     f"(bash) 2>'q;)3' <<EOF\n{R}\nEOF", f"(bash) <<<\"a b\" <<EOF\n{R}\nEOF",
                     f"(bash){{fd}}>/dev/null<<EOF\n{R}\nEOF", f"{{ bash; }} \\\n2>/dev/null <<EOF\n{R}\nEOF",
                     f"true && bash 2>&1 <<EOF\n{R}\nEOF", f"true && bash >|f <<EOF\n{R}\nEOF",
+                    # The closer cut alone read these as `X=$(pwd` / `sudo -u "${U`.
+                    f"cat <<EOF | X=$(pwd) bash\n{R}\nEOF", f"cat <<EOF | sudo -u \"${{U}}\" bash\n{R}\nEOF",
+                    f"cat <<EOF | ssh \"${{H}}\" bash\n{R}\nEOF", f"cat <<EOF | X=')' sh\n{R}\nEOF",
+                    f"{{ X=${{HOME:-x}} bash; }} <<EOF\n{R}\nEOF",
+                    f"if true\nthen X=${{HOME}} bash\nfi <<EOF\n{R}\nEOF",
                     f"{{\nbash\n}} < /dev/null <<EOF\n{R}\nEOF",
                     f"for i in 1\ndo bash\ndone 2>&1 <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):

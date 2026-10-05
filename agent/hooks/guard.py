@@ -2781,31 +2781,37 @@ _SCRIPT_READERS = _SHELL_PROGS | {"eval", "source", "."}
 _GROUP_CLOSER_RE = re.compile(r"[)}]|(?<![\w.-])(?:fi|done|esac)(?![\w.-])")
 
 
-def _ungrouped(segment: str) -> str:
-    """``segment`` without the group marks a split left on it, cut at its
-    first closer: `(bash`, `{ bash`, `(bash)<<EOF`, `(bash){fd}>f`. Only for
-    asking which program it runs."""
+def _ungrouped(segment: str) -> tuple[str, ...]:
+    """``segment`` without the group marks a split left on it, read two ways:
+    trimmed at its ends (`(bash`, `{ bash`, `X=$(pwd) bash)`) and cut at its
+    first closer (`(bash)<<EOF`, `(bash){fd}>f`). The cut ignores quoting
+    and nesting, so it alone lost `X=$(pwd) bash`; either reading counts.
+    Only for asking which program it runs."""
     seg = segment.strip().lstrip("({ \t")
     cut = min((i for i in (seg.find(")"), seg.find("}")) if i >= 0), default=len(seg))
-    return seg[:cut].rstrip("; \t")
+    return tuple(dict.fromkeys((seg.rstrip(");} \t"), seg[:cut].rstrip("; \t"))))
 
 
-def _heredoc_segment_program(segment: str) -> str:
-    """The program a segment holding a heredoc operator runs: `bash` for
+def _reads_stdin_grouped(segment: str) -> bool:
+    return any(_reads_stdin_script(text) for text in _ungrouped(segment))
+
+
+def _heredoc_segment_programs(segment: str):
+    """The programs a segment holding a heredoc operator may run: `bash` for
     `bash<<EOF` (one shlex word), `(bash <<EOF`, `(bash)<<EOF`, `x=1
-    bash<<-EOF`, `<<EOF bash` and `x=$(bash <<EOF`; "" when there is none."""
+    bash<<-EOF`, `<<EOF bash` and `x=$(bash <<EOF`, one per reading."""
     # A substitution still open on this line is where the heredoc's command
     # starts: `echo "$(bash<<EOF`, `cat <(sh <<EOF`.
     text = re.split(r"[$<>]\(", _SUBST_RE.sub(" ", segment))[-1]
-    tokens = _strip_prefixes(_tokenize(_ungrouped(text)))
-    # A redirection may come first, and its target may be a word of its own.
-    while tokens and re.match(r"\d*[<>]", tokens[0]):
-        tok = tokens.pop(0)
-        if tokens and re.fullmatch(r"\d*(<<-?|<|>>?|[<>]&|&>>?)", tok):
-            tokens.pop(0)
-    if not tokens:
-        return ""
-    return _basename(re.split(r"[<>]", tokens[0], maxsplit=1)[0])
+    for reading in _ungrouped(text):
+        tokens = _strip_prefixes(_tokenize(reading))
+        # A redirection may come first, and its target may be a word of its own.
+        while tokens and re.match(r"\d*[<>]", tokens[0]):
+            tok = tokens.pop(0)
+            if tokens and re.fullmatch(r"\d*(<<-?|<|>>?|[<>]&|&>>?)", tok):
+                tokens.pop(0)
+        if tokens:
+            yield _basename(re.split(r"[<>]", tokens[0], maxsplit=1)[0])
 
 
 def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
@@ -2821,7 +2827,7 @@ def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
     # and the `|` of `>|f` as a pipe, which cut `bash 2>&1 <<EOF` away from
     # its program. Only the program is asked of these segments, so both go.
     segments = _split_segments(re.sub(r"[<>]&|&>|>\|", lambda m: m[0].strip("&|"), owner))
-    if any("<<" in seg and _heredoc_segment_program(seg) in _SCRIPT_READERS
+    if any("<<" in seg and not _SCRIPT_READERS.isdisjoint(_heredoc_segment_programs(seg))
            for seg in segments):
         return True
     # A compound command's redirect feeds every reader in it, and the group
@@ -2832,7 +2838,7 @@ def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
     if _GROUP_CLOSER_RE.search(owner) and commands_feed_shell():
         return True
     # `cat <<EOF | bash`, and `| (bash)` / `| { bash; }` alike.
-    return any(_reads_stdin_script(_ungrouped(st)) for st in segments[1:])
+    return any(_reads_stdin_grouped(st) for st in segments[1:])
 
 
 def _expand_raw_too(command: str) -> list[tuple[list[str], str]]:
@@ -2960,7 +2966,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
 
     def _commands_feed_shell() -> bool:
         if not line_feeds_shell:
-            line_feeds_shell.append(any(_reads_stdin_script(_ungrouped(st))
+            line_feeds_shell.append(any(_reads_stdin_grouped(st)
                                         for st in _split_segments(raw_commands)))
         return line_feeds_shell[0]
     for owner, body, quoted in heredocs:
