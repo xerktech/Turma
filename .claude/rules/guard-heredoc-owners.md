@@ -34,6 +34,6 @@ paths:
     defines anywhere (`_defined_names`) may run a shell, whatever its body says;
   - `coproc` is a prefix word. A false deny still needs a destructive body.
 - Not covered (open tickets): empty substitution or brace expansion (XERK-1629), data later run as
-  code (XERK-1555).
+  code (XERK-1555), the same non-literal names on the `-c` and plain-pipe paths (XERK-1632).
 - Tests: `TestScriptChannels.test_a_heredoc_owner_shell_behind_a_glue_subshell_or_group`,
   `test_a_heredoc_owner_named_through_a_variable_glob_function_or_alias`.
