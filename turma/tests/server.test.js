@@ -22095,7 +22095,7 @@ test("a row carries the ticket, the live branch and the host", () => {
     peerSession("s1", {
       ticket: { key: "XERK-348", summary: "Scope messaging" },
       summary: "ignored when a ticket names it",
-      git: { liveBranch: "XERK-348" },
+      git: { branch: "XERK-348", dirtyFiles: 0 },
     }),
   ]);
   try {
@@ -22103,6 +22103,20 @@ test("a row carries the ticket, the live branch and the host", () => {
     assert.equal(row.host, "nasA");
     assert.equal(row.branch, "XERK-348");
     assert.equal(row.task, "XERK-348 Scope messaging");
+  } finally {
+    dropPeerHosts("nasA");
+  }
+});
+
+test("a detached session's branch cell is empty, never \"HEAD\" (XERK-1540)", () => {
+  // The payload's git.branch is `rev-parse --abbrev-ref HEAD`; the agent renders
+  // "" as `detached`, so "HEAD" must not pass through as a branch name.
+  peerHost("nasA", "acme.atlassian.net", [
+    peerSession("d", { git: { branch: "HEAD", dirtyFiles: 0 } }),
+    peerSession("n"),
+  ]);
+  try {
+    assert.deepEqual(orgPeers("nasA").map((p) => p.branch), ["", ""]);
   } finally {
     dropPeerHosts("nasA");
   }
@@ -22230,7 +22244,7 @@ test("every roster cell is capped on the wire, not just the free-text one", () =
       rcName: "n".repeat(200000),
       repo: "r".repeat(9000),
       summary: "t".repeat(9000),
-      git: { liveBranch: "b".repeat(9000) },
+      git: { branch: "b".repeat(9000) },
     }),
   ]);
   try {

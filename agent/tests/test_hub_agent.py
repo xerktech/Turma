@@ -11698,7 +11698,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
         sm._write_peers_file([
             {"id": "aaaaa", "rcName": "nas-Turma-XERK-1", "repo": "Turma",
              "status": "running", "summary": "live one",
-             "git": {"liveBranch": "XERK-1"}},
+             "git": {"branch": "XERK-1", "dirtyFiles": 0}},
             {"id": "bbbbb", "rcName": "nas-Turma-q", "repo": "Turma",
              "status": "queued", "summary": "waiting"},
             {"id": "ccccc", "rcName": "nas-Turma-s", "repo": "Turma",
@@ -11717,7 +11717,7 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             {"id": "aaaaa", "rcName": "nas-Turma-XERK-9", "repo": "Turma",
              "status": "running", "summary": "seeded name",
              "ticket": {"key": "XERK-9", "summary": "Do the thing"},
-             "git": {"liveBranch": None}},
+             "git": {"branch": "HEAD", "dirtyFiles": 0}},
         ])
         row = [r for r in open(ha.PEERS_FILE).read().splitlines()
                if not r.startswith("#")][0]

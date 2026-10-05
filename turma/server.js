@@ -6077,6 +6077,15 @@ function sameDecidedOrg(src, tgt) {
   return !!org && org === decidedOrgOf(tgt);
 }
 
+// A session payload's `git.branch` is `rev-parse --abbrev-ref HEAD`, so a
+// detached worktree reads "HEAD" — the roster's "" (rendered "detached"). There
+// is no `git.liveBranch` on the wire; that lives only in the agent's
+// session_facts cache. Mirrors hub-agent.py `_peer_branch` (XERK-1540).
+function peerBranch(git) {
+  const b = git && typeof git.branch === "string" ? git.branch : "";
+  return b === "HEAD" ? "" : b;
+}
+
 // One host's running sessions, appended until the roster is FULL. The cap has to
 // bound what is BUILT, not what is returned: capping cell width alone left the
 // row COUNT unbounded, and nothing limits how many running sessions a heartbeat
@@ -6096,7 +6105,7 @@ function pushPeerRows(rows, host, a) {
       host: peerCell(host),
       repo: peerCell(s.repo),
       // The branch the agent named for itself; "" reads as detached agent-side.
-      branch: peerCell((s.git && s.git.liveBranch) || ""),
+      branch: peerCell(peerBranch(s.git)),
       task: peerCell(task),
     });
   }
