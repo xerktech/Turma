@@ -462,6 +462,45 @@ def _printed_from_tokens(toks: list[str]) -> str | None:
     return None
 
 
+def _passes_input(stage: str) -> bool:
+    """Whether a pipeline stage prints what it reads: `cat`/`cat -`, `tee`."""
+    toks = _strip_prefixes(_tokenize(_unwrap_group(stage)))
+    if not toks:
+        return False
+    prog = _basename(toks[0])
+    return prog == "tee" or (prog == "cat" and all(t == "-" for t in toks[1:]))
+
+
+def _body_printed(body: str) -> str | None:
+    """What a substitution's body prints, when some statement of it is known.
+
+    Reading only a body that is ONE echo/printf let `$(true; echo rm -rf /etc)`
+    and `$(echo rm -rf /etc | cat)` stand as the harmless placeholder while bash
+    ran their output as a command (XERK-1609). Each statement's printed text is
+    joined, a pipeline counts when every stage after its producer passes its
+    input on, and a statement that prints something unknown adds nothing. A body
+    with NO known printing statement stays opaque (None): `$(mktemp -d)` must
+    not read as an empty word, which is the root.
+    """
+    texts: list[str] = []
+    all_known = True
+    for stmt in _split_on_operators(body, include_pipe=False):
+        # The splitter cuts inside a `( …; … )` / `{ …; }` group, so a
+        # statement can carry half a group's wrapper.
+        stmt = _unwrap_group(stmt).lstrip("( \t").rstrip(") \t")
+        stages = _split_segments(stmt)
+        text = _printed_from_tokens(_strip_prefixes(_tokenize(_unwrap_group(stages[0])))) \
+            if stages else ""
+        if text is not None and all(_passes_input(st) for st in stages[1:]):
+            if text:
+                texts.append(text)
+        elif _strip_prefixes(_tokenize(stmt)):
+            all_known = False
+    if texts:
+        return " ".join(texts)
+    return "" if all_known else None
+
+
 def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
     """What a substitution CONTRIBUTES to the command line around it.
 
@@ -476,7 +515,7 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False) -> str:
     program `turma_substituted_valuerm` (XERK-1256). A standalone one stays
     opaque: an empty WORD reads as the root (see `_OPAQUE_SUBST`).
     """
-    printed = _printed_text(_subst_inner(m))
+    printed = _body_printed(_subst_inner(m))
     if printed is not None:
         return printed
     if glued_empty and not _subst_standalone(m):
@@ -1832,6 +1871,18 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             head = raw_commands[:max(raw_commands.find(body), 0)]
             before = _cd_targets(_sub_substs(_prenormalise(head), _subst_text), cwds)
         out.extend(_expand_segments(_substitute_vars(body, raw_vals), depth + 1, before))
+    # ...and what a substitution whose body holds an operator PRINTS is text
+    # the line runs, but segmenting below cuts it in half (`$(true` / `echo
+    # rm -rf /etc)`) before `_subst_text` can read it (XERK-1609). So read the
+    # whole line once more with each such substitution replaced by its output.
+    printed_line = raw_commands
+    for body in bodies:
+        printed = _body_printed(body) if _SEGMENT_SPLIT.search(body) else None
+        if printed:
+            for whole in ("$(" + body + ")", "`" + body + "`"):
+                printed_line = printed_line.replace(whole, printed)
+    if printed_line != raw_commands:
+        out.extend(_expand_segments(_substitute_vars(printed_line, raw_vals), depth + 1, cwds))
     command = _prenormalise(raw_commands)
     segments = _split_segments(command)
     # `xargs` takes its operands from the PIPE, not its own argv, so
