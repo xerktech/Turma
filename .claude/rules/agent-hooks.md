@@ -227,7 +227,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - The skip triggers `_expand_both`'s raw reading, which unescapes `\$(`/`` \` `` first
       (the next parse's view: `bash -c "\`printf rm\` -rf /"`). Never skip without it.
     - Accepted cost: 1 of 34.6k replayed commands (an `ssh '… sh -c "…\$(…)…"'` beside
-      python parens) now misreads into `_TOO_DEEP`. Nested backticks: XERK-1605.
+      python parens) now misreads into `_TOO_DEEP`.
+  - **Substitutions are found by a balanced scan** (`_find_substs`, XERK-1605) — invariants in
+    `guard-substitutions.md`.
   - **A variable a producer filled holds that producer's OUTPUT** (XERK-1549): an assignment
     value is read whole (quoted runs, nested `$(…)`), and `printf -v x FMT ARGS` binds the
     rendered text (`_render_printf`: escapes, `\c`, precision, width, `*`, `%b`, `%c`; out of
