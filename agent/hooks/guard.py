@@ -3709,9 +3709,28 @@ def _destructive_database(command: str) -> str | None:
     return None
 
 
+# The one line a single-quoted `$(…)`/backtick is let through as text
+# (XERK-1541): a bare `git commit` whose messages are single-quoted literals.
+# Matched on the RAW line, never shlex words — every scoping of "nothing runs
+# it" through the parser leaked (XERK-1256: pipes, `printf -v GIT_EDITOR`,
+# `--trailer` and its abbreviations, `$"…"`, globs, multi-word expansions).
+# Outside the quotes only fixed words and blanks may appear, so there is no
+# `$`, backtick, `"`, backslash, glob, operator, redirect, newline, env
+# prefix, wrapper or other option for bash to act on; `-m` is required, so git never
+# starts GIT_EDITOR, and no option here hands the message to a shell.
+_COMMIT_FLAG = r"[ \t]+(?:-a|--all|-s|--signoff|-q|--quiet|-n|--no-verify|--amend|--allow-empty)"
+_COMMIT_MSG = r"[ \t]+-a?m[ \t]+'[^']*'"
+# The first `-m` is the required one, so no `-m` can be matched two ways.
+_LITERAL_COMMIT_RE = re.compile(
+    rf"[ \t]*git[ \t]+commit(?:{_COMMIT_FLAG})*{_COMMIT_MSG}"
+    rf"(?:{_COMMIT_FLAG}|{_COMMIT_MSG})*[ \t]*\n?")
+
+
 @_budgeted
 def is_destructive(command: str) -> str | None:
     """Return a human reason if ``command`` is catastrophic, else ``None``."""
+    if _LITERAL_COMMIT_RE.fullmatch(command):
+        return None
     # Fork bombs contain the `;`/`|` we segment on, so match the whole string.
     reason = _destructive_forkbomb(command)
     if reason:

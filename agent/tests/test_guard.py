@@ -1017,7 +1017,8 @@ class TestParserGaps(unittest.TestCase):
 
     def test_a_single_quoted_substitution_is_still_classified(self):
         """A single-quoted `$(…)` is classified as if it ran, even where bash
-        reads it as text (`git commit -m '$(…)'` — a known false deny).
+        reads it as text (`echo '$(…)'` — a known false deny). The one line let
+        through is `test_literal_git_commit_message_is_text`.
 
         Treating it as text was tried and backed out (XERK-1256): every way of
         scoping "only where nothing runs it" leaked — pipes, `printf -v`, a
@@ -1027,7 +1028,7 @@ class TestParserGaps(unittest.TestCase):
         """
         self.assertAllowed("echo \\$\\(rm -rf /\\)")
         R = self.R
-        for cmd in (f"git commit -m '$({R})'", f"gh pr create --title t --body '$({R})'",
+        for cmd in (f"echo '$({R})'", f"gh pr create --title t --body '$({R})'",
                     f"bash -c 'echo $({R})'", f"eval 'echo $({R})'",
                     f"echo \"'$({R})'\"", f"x='$({R})'; eval $x",
                     f"x='{R}'; eval $x", f"echo 'x $({R})' | sh",
@@ -1066,6 +1067,34 @@ class TestParserGaps(unittest.TestCase):
                     f"for i in 1; do printf '$({R})'; done | sh"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
+
+    def test_literal_git_commit_message_is_text(self):
+        """XERK-1541: a bare `git commit` whose messages are single-quoted
+        literals runs nothing, so a quoted `$(…)` in them is not a deny."""
+        R = self.R
+        for cmd in (f"git commit -m '$({R})'", f"git commit -am 'x `{R}`'",
+                    f"  git  commit -a --no-verify -m 'a' -m 'b $({R})' -s\n",
+                    f"git commit --amend --allow-empty -m 'line1\n$({R})\nline3'",
+                    f"git commit -m '$({R})'  "):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # Anything beyond that shape goes back through the full classifier.
+        for cmd in (f"git commit -m 'x' '$({R})'", f"git commit '$({R})' -m x",
+                    f"git commit -m 'x' --trailer 'k:$({R})'",
+                    f"git commit -m 'x''$({R})'", f"git commit -m 'x' $'$({R})'",
+                    f"git commit -m 'x'; {R}", f"git commit -m 'x'\n{R}",
+                    f"git commit -m 'x' -m \"$({R})\"", f"git commit -e -m '$({R})'",
+                    f"git commit -m '$({R})' -ax", f"git commit -m '$({R})' > f",
+                    f"x=1 git commit -m '$({R})'", f"command git commit -m '$({R})'",
+                    f"git commit -m '$({R})' &", f"git commit -m '$({R})'\r"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+
+    def test_literal_commit_shape_matches_in_linear_time(self):
+        line = "git commit" + " -m 'x'" * 20000 + " -z"
+        start = time.monotonic()
+        self.assertIsNone(guard._LITERAL_COMMIT_RE.fullmatch(line))
+        self.assertLess(time.monotonic() - start, 1.0)
 
     def test_quoted_braces_are_not_expanded(self):
         self.assertEqual(guard._expand_braces("awk '{print $2,$4}' f"),
