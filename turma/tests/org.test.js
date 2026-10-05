@@ -536,7 +536,7 @@ test("org: every page loads board.js, nav.js and org.js, in that order", () => {
 
 test("org: the header carries the #hdrOrg slot, before the tabs", () => {
   const nav = require("../public/nav.js");
-  const html = nav.siteHeaderHtml("board", "sub");
+  const html = nav.siteHeaderHtml("board");
   assert.match(html, /id="hdrOrg"/);
   assert.ok(html.indexOf('id="hdrOrg"') < html.indexOf("<nav class=\"nav-tabs\">"),
     "the org slot must sit before the tabs — the header ends at the tabs");

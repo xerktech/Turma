@@ -247,7 +247,7 @@ test("newticket: the hub actually serves every /*.js the pages load", () => {
 
 test("newticket: the header carries the #hdrNewTicket slot, before the tabs", () => {
   const nav = require("../public/nav.js");
-  const html = nav.siteHeaderHtml("board", "sub");
+  const html = nav.siteHeaderHtml("board");
   assert.match(html, /id="hdrNewTicket"/);
   assert.ok(html.indexOf('id="hdrNewTicket"') < html.indexOf('<nav class="nav-tabs">'),
     "the new-ticket slot must sit before the tabs — the header ends at the tabs");
