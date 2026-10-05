@@ -2995,6 +2995,21 @@ test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", (
     snap(over);
     assert.equal(mod.restoreLiveAgents("s1", p, fresh(), dir), false, JSON.stringify(over));
   }
+  // A mid-line offset is refused (it would skip that line's fragment).
+  snap({ offset: offset - 3 });
+  assert.equal(mod.restoreLiveAgents("s1", p, fresh(), dir), false);
+  // A line still being written is left for the tail, never half-folded; forged
+  // row fields are retyped to the scan's own shape.
+  fs.appendFileSync(p, '{"type":"queue-operation","content":"<task-notification>');
+  snap({ liveAgents: { a: { type: "shell", label: "L".repeat(5000), kind: { x: 1 },
+                            startedAt: "1", eta: [1] },
+                       b: { type: 3, label: "bad" },
+                       c: { type: "general-purpose", label: "ok", kind: "wait-timed", startedAt: 5 } } });
+  st = fresh();
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.deepEqual(mod.liveAgentsReport(st), [
+    { type: "shell", label: "L".repeat(200) },
+    { type: "general-purpose", label: "ok", kind: "wait-timed", startedAt: 5 }]);
   assert.equal(mod.restoreLiveAgents("nope", p, fresh(), dir), false);
   assert.equal(mod.restoreLiveAgents("../s1", p, fresh(), dir), false);
 });

@@ -1408,11 +1408,24 @@ const LIVE_AGENTS_DIR = path.join(os.homedir(), ".turma", "live-agents");
 const LIVE_SNAPSHOT_GAP_MAX = 1 << 24;
 const LIVE_SNAPSHOT_MAX_BYTES = 1 << 18;
 
+// Mirror of hub-agent.py _snapshot_row: a restored row in the shape
+// scanAgentEntry builds, or null — the file is outside this process.
+function snapshotRow(v) {
+  if (!v || typeof v !== "object" || typeof v.type !== "string" || !v.type
+      || typeof v.label !== "string") return null;
+  const row = { type: v.type.slice(0, 200), label: v.label.slice(0, 200) };
+  if (["work", "wait-timed", "wait-external"].includes(v.kind)) row.kind = v.kind;
+  for (const k of ["startedAt", "eta"]) {
+    if (Number.isSafeInteger(v[k]) && v[k] >= 0) row[k] = v[k];
+  }
+  return row;
+}
+
 // Mirror of hub-agent.py _restore_live_agents: seed `state` from the session's
 // snapshot and fold the bytes written since its offset, or return false (the
 // caller falls back to backscanLiveAgents). Revalidated the same way: it must
-// name THIS transcript, its offset must lie inside it, the gap must be
-// re-readable.
+// name THIS transcript, its offset must lie inside it on a line boundary, the
+// gap must be re-readable; only complete lines are folded.
 function restoreLiveAgents(sessionId, p, state, dir = LIVE_AGENTS_DIR) {
   if (!sessionId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(sessionId)) return false;
   let snap, fd, buf;
@@ -1438,6 +1451,11 @@ function restoreLiveAgents(sessionId, p, state, dir = LIVE_AGENTS_DIR) {
     fd = fs.openSync(p, "r");
     const size = fs.fstatSync(fd).size;
     if (off > size || size - off > LIVE_SNAPSHOT_GAP_MAX) return false;
+    if (off > 0) {
+      const prev = Buffer.alloc(1);
+      fs.readSync(fd, prev, 0, 1, off - 1);
+      if (prev[0] !== 0x0a) return false;
+    }
     buf = Buffer.alloc(size - off);
     fs.readSync(fd, buf, 0, buf.length, off);
   } catch {
@@ -1446,13 +1464,14 @@ function restoreLiveAgents(sessionId, p, state, dir = LIVE_AGENTS_DIR) {
     if (fd !== undefined) try { fs.closeSync(fd); } catch {}
   }
   state.live = new Map(Object.entries(snap.liveAgents)
-    .filter(([, v]) => isObj(v) && typeof v.type === "string" && typeof v.label === "string")
+    .map(([k, v]) => [k, snapshotRow(v)]).filter(([, v]) => v)
     .slice(0, LIVE_AGENTS_MAX));
   state.tasks = new Map(Object.entries(snap.agentTasks).filter(([, v]) => typeof v === "string"));
   state.shells = new Map(Object.entries(snap.shellCalls).filter(([, v]) => isObj(v)));
   state.stopped = new Set(snap.stoppedAgents.filter((t) => typeof t === "string")
     .slice(-LIVE_AGENTS_MAX * 4));
-  for (const line of buf.toString("utf8").split("\n")) {
+  const end = buf.lastIndexOf(0x0a) + 1; // a line still being written waits for the tail
+  for (const line of buf.toString("utf8", 0, end).split("\n")) {
     let entry;
     try { entry = JSON.parse(line); } catch { continue; }
     if (entry && typeof entry === "object") scanAgentEntry(entry, state);

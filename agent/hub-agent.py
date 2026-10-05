@@ -9806,7 +9806,11 @@ def _backscan_live_agents(path, state):
     background agent/shell launched before the restart: the session read idle
     until that work finished, while the chat bar (tunnel-agent's tail-window
     scan) listed it as running. Only `_scan_agent_entry` runs here, so no other
-    per-beat scan sees old lines."""
+    per-beat scan sees old lines.
+
+    Returns the end of the last COMPLETE line it read (or None): the caller
+    resumes the incremental scan there, so a line claude was still writing at
+    the restart is read whole next beat instead of lost behind the EOF prime."""
     try:
         size = os.stat(path).st_size
         start = max(0, size - AGENT_BACKSCAN_BYTES)
@@ -9815,7 +9819,7 @@ def _backscan_live_agents(path, state):
             f.seek(lead)
             raw = f.read(size - lead)
     except OSError:
-        return
+        return None
     lead_in = {}  # scratch state: its launches are discarded, its stops kept
     pos = lead
     for i, line in enumerate(raw.split(b"\n")):
@@ -9838,6 +9842,8 @@ def _backscan_live_agents(path, state):
             del state["stoppedAgents"][:-LIVE_AGENTS_MAX * 4]
             lead_in = {}
         _scan_agent_entry(entry, state)
+    nl = raw.rfind(b"\n")
+    return lead + nl + 1 if nl >= 0 else None
 
 
 # A published snapshot is re-written once its offset trails the transcript by
@@ -9881,6 +9887,11 @@ def _publish_live_agents(session_id, path, offset, state):
     # the tunnel builds with its own join and need not spell identically.
     body.update(v=1, transcript=os.path.basename(path), offset=offset)
     try:
+        # The incremental scan's offset is mid-line only when its 4 MiB backlog
+        # cap cut a line and nothing has completed since; publish next beat.
+        with open(path, "rb") as f:
+            if not _at_line_start(f, offset):
+                return
         os.makedirs(LIVE_AGENTS_DIR, exist_ok=True)
     except OSError:
         return
@@ -9888,52 +9899,90 @@ def _publish_live_agents(session_id, path, offset, state):
         state["liveSnapshot"] = {"path": path, "fp": fp, "offset": offset}
 
 
+def _at_line_start(f, offset):
+    """True when `offset` in the open file `f` begins a line (0, or just past a
+    newline). A snapshot is only ever true at a line boundary: a mid-line offset
+    would skip that line's fragment, and a stop on it would be lost for good."""
+    if offset == 0:
+        return True
+    f.seek(offset - 1)
+    return f.read(1) == b"\n"
+
+
+def _snapshot_row(row):
+    """A restored live row in the SAME shape _scan_agent_entry builds, or None:
+    the file is outside this process, so nothing it holds reaches the
+    heartbeat or the resolvers untyped."""
+    if not isinstance(row, dict) or not isinstance(row.get("type"), str) \
+            or not isinstance(row.get("label"), str) or not row["type"]:
+        return None
+    out = {"type": row["type"][:200], "label": row["label"][:200]}
+    rid = row.get("resolveId")
+    out["resolveId"] = rid[:200] if isinstance(rid, str) else ""
+    if row.get("kind") in (SHELL_KIND_WORK, SHELL_KIND_WAIT_TIMED, SHELL_KIND_WAIT_EXTERNAL):
+        out["kind"] = row["kind"]
+    for k in ("startedAt", "eta"):
+        v = row.get(k)
+        if isinstance(v, int) and not isinstance(v, bool) and 0 <= v <= _MAX_SAFE_INT:
+            out[k] = v
+    return out
+
+
 def _restore_live_agents(session_id, path, state):
     """Seed the live-agent scan from this session's published snapshot and fold
     the bytes written since its offset, or return False to leave the caller to
     _backscan_live_agents. Revalidated, never trusted: the snapshot must name
     THIS conversation, its offset must still lie inside it, and the gap must be
-    re-readable (LIVE_SNAPSHOT_GAP_MAX) — every stop written while the manager
+    re-readable (LIVE_SNAPSHOT_GAP_MAX), and it must sit on a line boundary —
+    every stop written while the manager
     was down is in that gap, so a launch that ended is never resurrected. A
     launch whose stop is NEVER written (claude itself died) is expired by
-    `_launch_tmux`, which drops the snapshot: background work dies with claude."""
+    `_launch_tmux`, which drops the snapshot: background work dies with claude.
+
+    Returns the end of the last complete line read (the caller resumes the
+    incremental scan there, as for _backscan_live_agents), or None to refuse."""
     target = _live_snapshot_path(session_id)
     snap = _read_untrusted_json(target, LIVE_SNAPSHOT_MAX_BYTES) if target else None
     if not isinstance(snap, dict) or snap.get("v") != 1 \
             or snap.get("transcript") != os.path.basename(path):
-        return False
+        return None
     offset = snap.get("offset")
     maps = [snap.get(k) for k in _LIVE_SNAPSHOT_MAPS]
     stopped = snap.get("stoppedAgents")
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0 \
             or not all(isinstance(m, dict) for m in maps) or not isinstance(stopped, list):
-        return False
-    live = {str(k): v for k, v in maps[0].items()
-            if isinstance(v, dict) and isinstance(v.get("type"), str)
-            and isinstance(v.get("label"), str)}
+        return None
+    live = {}
+    for k, v in maps[0].items():
+        row = _snapshot_row(v)
+        if row and len(live) < LIVE_AGENTS_MAX:
+            live[str(k)] = row
     try:
         size = os.stat(path).st_size
         if offset > size or size - offset > LIVE_SNAPSHOT_GAP_MAX:
-            return False
+            return None
         with open(path, "rb") as f:
+            if not _at_line_start(f, offset):
+                return None
             f.seek(offset)
             raw = f.read(size - offset)
     except OSError:
-        return False
-    state["liveAgents"] = dict(list(live.items())[:LIVE_AGENTS_MAX])
+        return None
+    state["liveAgents"] = live
     state["agentTasks"] = {str(k): v for k, v in maps[1].items() if isinstance(v, str)}
     state["shellCalls"] = {str(k): v for k, v in maps[2].items() if isinstance(v, dict)}
     state["stoppedAgents"] = [t for t in stopped if isinstance(t, str)][-LIVE_AGENTS_MAX * 4:]
-    # The offset is a line boundary (the incremental scan only consumes whole
-    # lines), so every line here is complete but a still-being-written last one.
-    for line in raw.split(b"\n"):
+    # Only COMPLETE lines: a last one still being written is left for the
+    # incremental scan, which resumes at the returned end.
+    end = raw.rfind(b"\n") + 1
+    for line in raw[:end].split(b"\n"):
         try:
             entry = json.loads(line)
         except (ValueError, RecursionError):
             continue
         if isinstance(entry, dict):
             _scan_agent_entry(entry, state)
-    return True
+    return offset + end
 
 
 def live_agents_report(state):
@@ -15960,8 +16009,15 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
-    if not primed and not _restore_live_agents(session_id, newest, state):
-        _backscan_live_agents(newest, state)
+    if not primed:
+        # The prime set this transcript's offset to EOF, possibly mid-line;
+        # resume at the last complete line instead, so a line being written
+        # across the restart (a stop, say) is read whole rather than skipped.
+        end = _restore_live_agents(session_id, newest, state)
+        if end is None:
+            end = _backscan_live_agents(newest, state)
+        if end is not None and end <= offsets.get(newest, end):
+            offsets[newest] = end
 
     entry = _last_entry(newest)
     if entry:

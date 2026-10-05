@@ -1762,6 +1762,52 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                 # The back-scan still reads the (in-window) launch.
                 self.assertEqual(len(self._report({})["agents"]), 1)
 
+    def test_a_stop_written_across_the_restart_is_not_lost(self):
+        # The prime puts the offset at EOF; a line claude is still writing there
+        # must be read whole once it completes, not skipped — or its stop is lost
+        # and the snapshot persists the launch as a phantom (XERK-1587 QA).
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        self._report({})
+        line = json.dumps(self.STOP_BSH1) + "\n"
+        with open(path, "a") as f:
+            f.write(line[:40])
+        state = {}
+        self.assertEqual(len(self._report(state)["agents"]), 1)   # restart, mid-line
+        with open(path, "a") as f:
+            f.write(line[40:])
+        self.assertEqual(self._report(state)["agents"], [])
+        self.assertEqual(self._report({})["agents"], [])           # and the next restart
+
+    def test_a_mid_line_snapshot_offset_is_refused(self):
+        path, _ = self._launch_then_restart()
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")
+        with open(snap) as f:
+            body = json.load(f)
+        body["offset"] -= 3
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        self.assertEqual(self._report({})["agents"], [])   # back-scan fallback
+
+    def test_restored_rows_are_retyped(self):
+        path, _ = self._launch_then_restart()
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")
+        with open(snap) as f:
+            body = json.load(f)
+        body["liveAgents"] = {
+            "a": {"type": "shell", "label": "L" * 5000, "kind": {"x": 1}, "startedAt": "1",
+                  "eta": [1], "resolveId": 7},
+            "b": {"type": 3, "label": "bad"},
+            "c": {"type": "general-purpose", "label": "ok", "resolveId": "../../etc",
+                  "kind": "wait-timed", "startedAt": 5}}
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        state = {}
+        self.assertEqual(self._report(state)["agents"], [
+            {"type": "shell", "label": "L" * 200},
+            {"type": "general-purpose", "label": "ok", "kind": "wait-timed", "startedAt": 5}])
+        self.assertEqual(state["liveAgents"]["a"]["resolveId"], "")
+
     def test_an_unchanged_set_is_not_rewritten_every_beat(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, SHELL_LAUNCH_ENTRIES)
@@ -16546,6 +16592,16 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         sm._launch_tmux(sess)
         self.assertFalse(os.path.exists(snap))
         self.assertNotIn("liveAgents", sm.sess_state[sess["id"]])
+
+    def test_teardown_drops_the_live_agent_snapshot(self):
+        sm = self.make_manager()
+        sess = self._session(sm)
+        os.makedirs(ha.LIVE_AGENTS_DIR, exist_ok=True)
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{sess['id']}.json")
+        with open(snap, "w") as f:
+            f.write("{}")
+        sm._forget_session_caches(sess["id"])
+        self.assertFalse(os.path.exists(snap))
 
     def test_local_session_launches_against_the_local_endpoint(self):
         sm = self.make_manager()
