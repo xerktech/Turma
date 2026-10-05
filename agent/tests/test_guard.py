@@ -2243,7 +2243,16 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "$( { echo rm -rf /etc; } )", "$( (echo rm -rf; echo /etc) )",
                     "$(ls; echo rm -rf /etc)", "`true; echo rm -rf /etc`",
                     "rm -rf $(true; echo /etc)", 'rm -rf "$(echo /etc | tee x)"',
-                    'bash -c "\\$(true; echo rm -rf /etc)"'):
+                    'bash -c "\\$(true; echo rm -rf /etc)"',
+                    # The substitution read in place, not only the split line:
+                    "x=$(true; echo rm -rf /etc); $x", "sh -c '$(true; echo rm -rf /etc)'",
+                    "bash -c '`true; echo rm -rf /etc`'",
+                    # Output runs across statements, and through filters.
+                    "$(echo -n r; echo m -rf /etc)", "$(printf r; echo m -rf /etc)",
+                    "$(echo rm -rf /etc | head -1)",
+                    # A printed quote is literal text, never a closing quote.
+                    "echo \"$(true; echo '\"')\"; rm -rf /etc",
+                    "echo \"$(echo '\"')\" && rm -rf /etc"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         # A body printing nothing known stays opaque, never the empty root word.
