@@ -2785,14 +2785,17 @@ _GROUP_CLOSER_RE = re.compile(r"[)}]|(?<![\w.-])(?:fi|done|esac)(?![\w.-])")
 
 
 def _ungrouped(segment: str) -> tuple[str, ...]:
-    """``segment`` without the group marks a split left on it, read two ways:
-    trimmed at its ends (`(bash`, `{ bash`, `X=$(pwd) bash)`) and cut at its
-    first closer (`(bash)<<EOF`, `(bash){fd}>f`). The cut ignores quoting
-    and nesting, so it alone lost `X=$(pwd) bash`; either reading counts.
-    Only for asking which program it runs."""
+    """``segment`` without the group marks a split left on it, read several
+    ways: trimmed at its ends (`(bash`, `{ bash`, `X=$(pwd) bash)`), and cut
+    at its first closer (`(bash)<<EOF`, `(bash){fd}>f`) or its last `)` or
+    `}` (`(X=${HOME} bash)<<EOF`). No cut knows quoting or nesting, so each
+    alone lost a shape another reads; any reading counts. Only for asking
+    which program it runs."""
     seg = segment.strip().lstrip("({ \t")
-    cut = min((i for i in (seg.find(")"), seg.find("}")) if i >= 0), default=len(seg))
-    return tuple(dict.fromkeys((seg.rstrip(");} \t"), seg[:cut].rstrip("; \t"))))
+    cuts = [i for i in (seg.find(")"), seg.find("}"), seg.rfind(")"), seg.rfind("}"))
+            if i >= 0]
+    return tuple(dict.fromkeys([seg.rstrip(");} \t")]
+                               + [seg[:i].rstrip("; \t") for i in cuts]))
 
 
 def _reads_stdin_grouped(segment: str) -> bool:

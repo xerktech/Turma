@@ -1419,6 +1419,10 @@ class TestScriptChannels(unittest.TestCase):
                     f"{{ X=${{HOME:-x}} bash; }} <<EOF\n{R}\nEOF",
                     f"if true\nthen X=${{HOME}} bash\nfi <<EOF\n{R}\nEOF",
                     f"cat <<EOF | timeout ${{T:-5}} bash\n{R}\nEOF", f"(timeout $T bash)<<EOF\n{R}\nEOF",
+                    # Each reading of `_ungrouped` alone misses one of these.
+                    f"(X=${{HOME}} bash)<<EOF\n{R}\nEOF", f"(X='a)b' bash) 2>/dev/null <<EOF\n{R}\nEOF",
+                    f"(timeout ${{T:-5}} bash)<<EOF\n{R}\nEOF", f"(X=$(pwd) bash)<<EOF\n{R}\nEOF",
+                    f"cat <<EOF | (bash)2>/dev/null\n{R}\nEOF", f"cat <<EOF | (bash){{fd}}>/dev/null\n{R}\nEOF",
                     f"{{\nbash\n}} < /dev/null <<EOF\n{R}\nEOF",
                     f"for i in 1\ndo bash\ndone 2>&1 <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
