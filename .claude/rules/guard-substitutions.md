@@ -26,6 +26,18 @@ paths:
     Neither alone is safe; escaping in place opened `bash -c "$(echo "''rm …")"`.
   - Segmenting cuts `$(a; b)` in half, so `_expand` re-splits the line with each such body
     replaced by its output. Re-expanding the whole line per level instead made nesting ~10x
-    slower, past the hook's 60s timeout, which fails OPEN.
-- Tests: `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
+    slower toward the hook's timeout, which fails OPEN.
+- **A `<(…)` is a file its stage reads** (XERK-1611): every `<(…)` in a pipeline feeds its readers
+  whatever the program — `cat <(echo …) | bash` runs it. `_proc_subst_texts` over-reads its body.
+  - Found off the WHOLE line, fed to every reader: the splits are not paren-aware and cut
+    `<(echo … | cat)` and `<(echo …; true)`; `_reads_stdin_script` reads a cut-off `<(` as a path.
+- **A shell `-c` script holding `<(` is re-read with every `<(…)` left raw** — the substituted
+  segment had turned `. <(echo …)` into `. <cmd>`. It sits BEFORE the operator-split `continue`,
+  which otherwise skips any shell branch whose `-c` script holds `;`, `&&` or `|`.
+- **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
+- **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
+  ANSI-C only to a `-c` re-parse; an even run (`\\$'…'`) is still live. A bare lookbehind bypassed.
+- Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
+  `test_a_multi_statement_body_prints_the_command`,
+  `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).
