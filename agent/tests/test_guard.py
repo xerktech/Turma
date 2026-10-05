@@ -2252,7 +2252,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "$(echo rm -rf /etc | head -1)",
                     # A printed quote is literal text, never a closing quote.
                     "echo \"$(true; echo '\"')\"; rm -rf /etc",
-                    "echo \"$(echo '\"')\" && rm -rf /etc"):
+                    "echo \"$(echo '\"')\" && rm -rf /etc",
+                    # ...yet a shell re-parsing it strips the quotes it prints.
+                    "bash -c \"$(echo \"''rm -rf /etc\")\"",
+                    "bash -c \"$(true; echo \"''rm -rf /etc\")\"",
+                    "x=$(true; echo \"''rm -rf /etc\"); eval \"$x\""):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         # A body printing nothing known stays opaque, never the empty root word.
