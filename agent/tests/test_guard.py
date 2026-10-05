@@ -1423,6 +1423,9 @@ class TestScriptChannels(unittest.TestCase):
                     f"(X=${{HOME}} bash)<<EOF\n{R}\nEOF", f"(X='a)b' bash) 2>/dev/null <<EOF\n{R}\nEOF",
                     f"(timeout ${{T:-5}} bash)<<EOF\n{R}\nEOF", f"(X=$(pwd) bash)<<EOF\n{R}\nEOF",
                     f"cat <<EOF | (bash)2>/dev/null\n{R}\nEOF", f"cat <<EOF | (bash){{fd}}>/dev/null\n{R}\nEOF",
+                    # A quoted or escaped closer before the group's own, and one after it.
+                    f"(X='a)b' bash) 2>'err)' <<EOF\n{R}\nEOF", f"(X=\\)\\}} bash) 3>\\)\\}} <<EOF\n{R}\nEOF",
+                    f"(X=\"${{A:-)}}\" bash) 3>')}}' <<EOF\n{R}\nEOF", f"cat <<EOF | (X=')}}' bash) 3>')}}'\n{R}\nEOF",
                     f"{{\nbash\n}} < /dev/null <<EOF\n{R}\nEOF",
                     f"for i in 1\ndo bash\ndone 2>&1 <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
@@ -1431,7 +1434,8 @@ class TestScriptChannels(unittest.TestCase):
                     f"{{ cat; }} <<EOF\n{R}\nEOF", f"{{ grep x; wc -l; }} <<EOF\n{R}\nEOF",
                     f"cat <<EOF | (wc -l)\n{R}\nEOF", f"(cat)<<EOF\n{R}\nEOF",
                     f"x=$(cat <<EOF\n{R}\nEOF\n)",
-                    f"(cat) 2>/dev/null <<EOF\n{R}\nEOF", f"{{ cat; }} 2>&1 <<EOF\n{R}\nEOF", f"for f in a\ndo cat\ndone <<EOF\n{R}\nEOF"):
+                    f"(cat) 2>/dev/null <<EOF\n{R}\nEOF", f"{{ cat; }} 2>&1 <<EOF\n{R}\nEOF",
+                    f"(X=')' cat) 2>')' <<EOF\n{R}\nEOF", f"for f in a\ndo cat\ndone <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
@@ -2113,7 +2117,9 @@ class TestExpansionBudget(unittest.TestCase):
         # XERK-1618: stripping trailing redirects one at a time before a
         # heredoc was quadratic; 100KB of `1<` took 973s through the hook.
         for cmd in ("rm -rf / ; cat " + "1<" * 16000, "cat " + ">" * 32000,
-                    "1" * 32000, "(bash) " + "2>/dev/null " * 3000 + "<<EOF\nx\nEOF"):
+                    "1" * 32000, "(bash) " + "2>/dev/null " * 3000 + "<<EOF\nx\nEOF",
+                    "(X=" + "'a)'\"${b:-)}\"" * 3000 + " bash) <<EOF\nx\nEOF",
+                    "cat <<EOF | (" + "(" * 16000 + "\nx\nEOF"):
             self.check(cmd)
 
     def test_large_value_used_many_times_is_denied_fast(self):

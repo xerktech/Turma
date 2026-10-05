@@ -2784,16 +2784,56 @@ _SCRIPT_READERS = _SHELL_PROGS | {"eval", "source", "."}
 _GROUP_CLOSER_RE = re.compile(r"[)}]|(?<![\w.-])(?:fi|done|esac)(?![\w.-])")
 
 
+def _group_close(text: str) -> int:
+    """Index of the first `)` or `}` in ``text`` outside quotes, escapes and
+    any `(…)`, `{…}`, `$(…)` or `${…}` opened in it; -1 when there is none.
+    Linear: one pass, each character visited once."""
+    stack: list[str] = []  # '"' a double-quoted string, or an open '(' / '{'
+    i, n = 0, len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        top = stack[-1] if stack else ""
+        if top == '"':
+            if ch == '"':
+                stack.pop()
+            elif ch == "$" and text[i + 1:i + 2] in ("(", "{"):
+                stack.append(text[i + 1])
+                i += 1
+            i += 1
+            continue
+        if ch == "'":
+            j = i + 1
+            ansi = text[i - 1:i] == "$"
+            while j < n and text[j] != "'":
+                j += 2 if ansi and text[j] == "\\" else 1
+            i = j + 1
+            continue
+        if ch == "`":
+            end = text.find("`", i + 1)
+            i = n if end < 0 else end + 1
+            continue
+        if ch in "\"({":
+            stack.append(ch)
+        elif ch in ")}":
+            if not stack:
+                return i
+            stack.pop()
+        i += 1
+    return -1
+
+
 def _ungrouped(segment: str) -> tuple[str, ...]:
     """``segment`` without the group marks a split left on it, read several
-    ways: trimmed at its ends (`(bash`, `{ bash`, `X=$(pwd) bash)`), and cut
-    at its first closer (`(bash)<<EOF`, `(bash){fd}>f`) or its last `)` or
-    `}` (`(X=${HOME} bash)<<EOF`). No cut knows quoting or nesting, so each
-    alone lost a shape another reads; any reading counts. Only for asking
-    which program it runs."""
+    ways: trimmed at its ends (`(bash`, `{ bash`, `X=$(pwd) bash)`), cut at
+    its first closer (`(bash)<<EOF`, `(bash){fd}>f`), and cut at the closer
+    found past quotes and nesting (`(X='a)' bash) 2>')' <<EOF`). The plain
+    cuts alone each lost a shape another reads; any reading counts. Only for
+    asking which program it runs."""
     seg = segment.strip().lstrip("({ \t")
-    cuts = [i for i in (seg.find(")"), seg.find("}"), seg.rfind(")"), seg.rfind("}"))
-            if i >= 0]
+    cuts = [i for i in (seg.find(")"), seg.find("}"), _group_close(seg)) if i >= 0]
     return tuple(dict.fromkeys([seg.rstrip(");} \t")]
                                + [seg[:i].rstrip("; \t") for i in cuts]))
 
