@@ -10881,11 +10881,31 @@ function spoolRawBody(req, cap, filePath) {
 
 function json(res, code, obj) {
   const body = JSON.stringify(obj);
+  // A response to a request whose body nobody read — a pre-body refusal: the auth
+  // gates' 401, a route's 400 on a bad path segment — closes the connection,
+  // since keep-alive would have Node dump the whole unread body once this
+  // finishes: unbudgeted read churn, for the 401 with no credential at all
+  // (XERK-1598). A caller that already chose (`Connection` set) has its own close.
+  const close = !res.hasHeader("connection") && bodyLeftUnread(res.req);
   res.writeHead(code, {
     "Content-Type": "application/json",
     "Cache-Control": "no-store",
+    ...(close ? { Connection: "close" } : {}),
   });
   res.end(body);
+  if (close) endRefusedConnection(res.req, res);
+}
+
+// Whether a request still carries a body nothing has started reading, large or of
+// unknown length. A small one stays keep-alive: dumping it is cheap, and a close
+// would spend a REFUSE_LINGER_MAX slot (or reset the client past them) for nothing.
+// `readableFlowing` null = never consumed; a paused mid-read refusal sets its own close.
+const UNREAD_BODY_KEEPALIVE_MAX = 64 * 1024;
+function bodyLeftUnread(req) {
+  if (!req || req.complete || req.readableFlowing !== null) return false;
+  const declared = req.headers["content-length"];
+  if (declared !== undefined) return Number(declared) > UNREAD_BODY_KEEPALIVE_MAX;
+  return !!req.headers["transfer-encoding"];
 }
 
 function safeEqual(a, b) {
@@ -17621,8 +17641,7 @@ const server = http.createServer(async (req, res) => {
         res.writeHead(302, { Location: humanLoginRedirect(url.pathname + url.search), "Cache-Control": "no-store" });
         return res.end();
       }
-      res.writeHead(401, { "Content-Type": "application/json", "Cache-Control": "no-store" });
-      return res.end(JSON.stringify({ error: "unauthorized" }));
+      return json(res, 401, { error: "unauthorized" });
     }
 
     // Login form (public). Already-authenticated visitors skip straight in.

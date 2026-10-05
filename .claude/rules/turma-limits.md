@@ -95,6 +95,13 @@ with `restart: unless-stopped`
   (`endRefusedConnection`, after `finish`).
 - **A refused body must be CLOSED, not paused** — Node dumps (reads) an unread body when the response
   finishes to keep the connection alive, so a pause still reads the whole thing into memory.
+- **A refusal made BEFORE the body is read closes too, and `json()` does it** (XERK-1598): the
+  auth gates' 401 and a route's pre-body 400 never touch the body, so keep-alive dumped all of it —
+  for the 401 with no credential. `json()` closes when `bodyLeftUnread(res.req)` (never-consumed,
+  incomplete, > 64 KiB or chunked) unless the caller already set `Connection`.
+  - A small unread body stays keep-alive: a close would burn a linger slot (or reset past them).
+  - Answer a pre-body refusal through `json()`, never a raw `writeHead`, or it skips this.
+  - Tests: `XERK-1598: …` in `drain-slot.test.js`.
 - **That close is a LINGERING close, never an immediate destroy** (XERK-1076). A destroy under
   unread bytes sends an RST that erases the 413/503 before a still-writing urllib client reads it
   (repro: 100% ECONNRESET). FIN after `finish`, discard until the client closes, destroy after

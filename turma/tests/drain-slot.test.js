@@ -322,3 +322,47 @@ test("XERK-1091: the hydrate-gate 503 on both archive routes closes rather than 
     archive.setHydrating(false);
   }
 });
+
+// XERK-1598: a refusal answered BEFORE the body is read — the auth gates' 401, a route's
+// pre-body 400 — must close the connection too. Left keep-alive, Node dumps the whole
+// unread body once the response finishes: unbudgeted read churn, and for the 401 with
+// no credential at all.
+for (const [label, route, auth, status] of [
+  ["agent-gate 401 (no credential)", "/api/agents/arch1598/archive/t1/raw/a.jsonl", "Bearer nope", 401],
+  ["heartbeat-gate 401", "/api/heartbeat", "Bearer nope", 401],
+  ["user-gate 401", "/api/agents/arch1598/uploads?name=a.bin", "Bearer nope", 401],
+  ["pre-body 400 (bad transcriptId)", "/api/agents/arch1598/archive/t%20x/raw/a.jsonl", "Bearer agenttok", 400],
+  ["pre-body 400 (bad file)", "/api/agents/arch1598/archive/t1/raw/..%2Fx", "Bearer agenttok", 400],
+]) {
+  test(`XERK-1598: a ${label} closes rather than dump the unread body`, async () => {
+    const r = await postWhileWriting(4 << 20, route, auth);
+    assert.equal(r.err, null, `the connection was reset (${r.err}) instead of closing cleanly`);
+    assert.match(r.got, new RegExp(`^HTTP/1\\.1 ${status} `), `the ${status} reached the client`);
+    assert.match(r.got, /\r\nconnection: close\r\n/i, "the refusal announces the close");
+    for (let i = 0; i < 40 && hub.refusalsLingering; i++) await sleep(50);
+    assert.equal(hub.refusalsLingering, 0, "lingering refusal released on close");
+  });
+}
+
+test("XERK-1598: a refusal of a SMALL unread body keeps the connection", async () => {
+  const { port } = server.address();
+  const got = await new Promise((resolve) => {
+    const sock = require("net").connect(port, "127.0.0.1");
+    let buf = "";
+    sock.on("error", () => {});
+    sock.on("data", (c) => {
+      buf += c;
+      if (/^HTTP\/1\.1 401 [\s\S]*\r\n\r\n[\s\S]*\}/.test(buf) && !sock.sentGet) {
+        sock.sentGet = true;
+        sock.write("GET /healthz HTTP/1.1\r\nhost: x\r\n\r\n");
+      }
+      if (/HTTP\/1\.1 200 /.test(buf)) sock.destroy();
+    });
+    sock.on("close", () => resolve(buf));
+    sock.write("POST /api/heartbeat HTTP/1.1\r\nhost: x\r\nauthorization: Bearer nope\r\n" +
+      "content-type: application/json\r\ncontent-length: 2\r\n\r\n{}");
+  });
+  assert.match(got, /^HTTP\/1\.1 401 /);
+  assert.doesNotMatch(got, /\r\nconnection: close\r\n/i, "a small refused body does not close");
+  assert.match(got, /HTTP\/1\.1 200 /, "the same socket served the next request");
+});
