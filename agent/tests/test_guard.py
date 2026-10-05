@@ -1432,6 +1432,10 @@ class TestScriptChannels(unittest.TestCase):
                     f"(X=\"`echo \")\"`\" bash) 2>')' <<EOF\n{R}\nEOF",
                     f"(X=$(case a in a) echo;; esac) bash)<<EOF\n{R}\nEOF",
                     f"cat <<EOF | (X={{ Y=')' bash) 2>')'\n{R}\nEOF",
+                    f"(X=')' bas''h)<<EOF\n{R}\nEOF", f"(X=')' \"bas\"h) <<EOF\n{R}\nEOF",
+                    f"(X=')' command das\\h)<<EOF\n{R}\nEOF",
+                    f"(X=\"`echo \")\"`\" source /dev/stdin)<<EOF\n{R}\nEOF",
+                    f"(X=\"`echo \")\"`\" . /dev/stdin)<<EOF\n{R}\nEOF",
                     f"{{\nbash\n}} < /dev/null <<EOF\n{R}\nEOF",
                     f"for i in 1\ndo bash\ndone 2>&1 <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
