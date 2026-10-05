@@ -1594,7 +1594,15 @@ class TestScriptChannels(unittest.TestCase):
                     f"time (true; echo {R}) | sh", f"if true; then (true; (echo {R})) | sh; fi",
                     f"{{ (true; echo {R}) | sh; }}", f"(echo {R}) 2>&1 | sh",
                     f"echo {R} | time (true; bash)", f"{{ echo {R} | (true; bash); }}",
-                    f"for i in 1; do {{ true; {{ echo {R}; }}; }} | sh; done"):
+                    f"for i in 1; do {{ true; {{ echo {R}; }}; }} | sh; done",
+                    # ...a glued `do(` the group split cannot open: only the plain
+                    # half of `_walked_pipelines` finds it,
+                    f"for i in 1; do(true; echo {R})|sh; done", f"time(true; echo {R})|sh",
+                    f"f() {{ (true; echo {R}) | sh; }}; f",
+                    # ...pipelines two group levels down,
+                    f"{{ true; {{ true; echo {R} | (true; bash); }}; }}",
+                    # ...and glued and `{{fd}}` redirects after a group.
+                    f"(true; echo {R})2>/dev/null | sh", f"{{ true; echo {R}; }} {{fd}}>/dev/null | sh"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("echo hi |& cat", "make 2>&1 | tee log", "echo hi | bash -c 'grep h'",
@@ -1623,7 +1631,10 @@ class TestScriptChannels(unittest.TestCase):
                     "cat <(echo hi) <(echo ho); " * 12000 + "bash; rm -rf /",
                     'bash -c "$(' + "cat <(" * 500 + "echo hi" + ")" * 500 + ')"; rm -rf /',
                     "echo hi | " + "(" * 3000 + "bash" + ")" * 3000 + "; rm -rf /",
-                    "echo hi | (" + "true; " * 20000 + "bash); rm -rf /"):
+                    "echo hi | (" + "true; " * 20000 + "bash); rm -rf /",
+                    # A long redirect run after a group: a searched trailing-
+                    # redirect regex went O(n²), 600s at 288 KB (XERK-1614).
+                    "(echo x)" + " >a" * 96000 + " | sh; rm -rf /"):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
             self.assertLess(time.monotonic() - t, 10, cmd[:20])

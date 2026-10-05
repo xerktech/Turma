@@ -50,6 +50,8 @@ paths:
     the plain split had cut out — a QA regression. Never walk the group split alone.
   - `_group_core` opens a group behind keywords (`do`, `then`, `!`, `time`) or before trailing
     redirections (`(…) 2>&1`); `_unwrap_group` opens only a group that IS the segment.
+  - Its trailing-redirect regex is only ever `fullmatch`ed from the group's closer: searched
+    (`re.sub(…\Z)`), it rescanned from every start, O(n²) — a 288 KB line ran past the hook timeout.
 - **`_reads_stdin_script` recurses** into a group/list and a `-c` script: `bash -c bash` and
   `(cat | bash)` read the stdin they inherit. Past `_MAX_EXPAND_DEPTH` it says "reads" (closed).
   - A part equal to its stage goes to `_command_reads_stdin`, never re-split: the redirect

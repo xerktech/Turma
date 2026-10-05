@@ -2777,7 +2777,12 @@ def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
 # redirections that may follow one: `do (…)`, `! (…)`, `time -p { …; }`,
 # `(…) 2>&1`.
 _GROUP_LEAD_RE = re.compile(r"\A(?:(?:do|then|else|elif|if|while|until|time|!|-p)[ \t\n]+)+")
-_GROUP_TRAIL_RE = re.compile(r"(?:[ \t]+\d*(?:>>?|<|&>>?|>&|<&|>\|)[ \t]*[^\s;&|()<>]+)+[ \t]*\Z")
+# Matched from a fixed position only (`fullmatch(text, pos)`): searched for,
+# it rescanned from every start and a long redirect run went O(n²) — past the
+# hook timeout, which fails open (XERK-1614). Glued (`)2>x`), `{fd}>x` and
+# `<<<word` forms count too.
+_GROUP_TRAIL_RE = re.compile(
+    r"(?:[ \t]*(?:\d*|\{\w+\})(?:<<<|>>?|<|&>>?|>&|<&|>\|)[ \t]*[^\s;&|()<>]+)*[ \t]*")
 
 
 def _group_core(part: str) -> str | None:
@@ -2785,8 +2790,20 @@ def _group_core(part: str) -> str | None:
     redirections are dropped, or None. `_unwrap_group` opens only a group that
     IS the segment, and a group-aware split keeps `do (true; echo …)` whole,
     so the producer inside was never read (XERK-1614)."""
-    core = _GROUP_TRAIL_RE.sub("", _GROUP_LEAD_RE.sub("", part.strip()))
-    return core if core[:1] in ("(", "{") and core[-1:] in (")", "}") else None
+    core = _GROUP_LEAD_RE.sub("", part.strip())
+    if core[:1] not in ("(", "{"):
+        return None
+    closer = ")" if core[0] == "(" else "}"
+    # A `{fd}>x` redirect holds a `}` of its own, so of the last few closers
+    # the group's is the leftmost one followed only by redirections.
+    found, end = None, len(core)
+    for _ in range(4):
+        end = core.rfind(closer, 0, end)
+        if end < 0:
+            break
+        if _GROUP_TRAIL_RE.fullmatch(core, end + 1):
+            found = core[:end + 1]
+    return found
 
 
 def _walked_pipelines(command: str) -> list[str]:
