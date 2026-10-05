@@ -79,8 +79,8 @@ paths:
     an array element `arr=($(ls; echo y))` is read as a subshell group, so its unread-leading
     output still over-denies — rare, absent from the 35k-command replay.
   - Left opaque (as on main, documented residuals): a backgrounded/control-flow body
-    (`&`, `if`/`while`/`case`), an assignment VALUE (stored, not run — splicing it also
-    made shlex quadratic), a here-string a consuming command reads (`grep -q`/`read`), and a stdout
+    (`&`, `if`/`while`/`case`), an assignment VALUE where it sits (stored, not run — splicing
+    it also made shlex quadratic), a here-string a consuming command reads (`grep -q`/`read`), and a stdout
     redirect (`>/dev/null`, `>&2`). A filter that rewrites harmless text into a dangerous command
     (`rev`, `sed s,/x,,`) still slips: accepted.
   - A body's OWN substitutions resolve to their taint first (`_taint_nested`, XERK-1617); an
@@ -108,6 +108,12 @@ paths:
       text from `$((` to the substitution and on to `))` must be plain arithmetic
       (`_ARITH_GAP_RE`): a quoted `$((` decoy (`echo '$((' ; $(…) ; echo '))'`) hid a deny.
     - A printed `a[$(…)]` subscript (bash re-expands it) is still caught by the printed reading.
+  - An assignment VALUE's taint reaches its later `$a`/`eval $a` through `_assigned_values`
+    (XERK-1625): `_expand_both` adds one pass per suffix reading (`_VALUES_TAINT`, capped at
+    `_MAX_TAINT_STARTS`), never joined into the plain values — `_substitute_vars` joins a
+    name's values into ONE word list, so a second value would trail the placeholder program.
+    - The lookup-or-fallback over-deny above reaches the assigned form too:
+      `CC=$(command -v clang || echo gcc); $CC …` denies, as `$(command -v clang || echo gcc) …` does.
   - The line pass rebuilds the whole command in ONE `_sub_substs` sweep per suffix reading, so N statements
     stay linear; the pathological-input envelope is `_statements_printed`'s, unchanged by this.
 - **Each substitution gets its own plain reading, its siblings literal** (`_decoy_readings`,
@@ -159,6 +165,7 @@ paths:
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
   `test_a_nested_or_conditional_body_runs_as_its_producers_text`,
+  `test_an_assigned_filtered_or_conditional_body_runs_as_its_text`,
   `test_a_large_conditional_or_nested_taint_body_stays_fast`,
   `test_a_large_filtered_body_classifies_without_timing_out`,
   `test_a_sibling_or_an_empty_expansion_does_not_hide_the_command`,
