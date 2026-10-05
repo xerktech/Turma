@@ -1418,6 +1418,7 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <<EOF | ssh \"${{H}}\" bash\n{R}\nEOF", f"cat <<EOF | X=')' sh\n{R}\nEOF",
                     f"{{ X=${{HOME:-x}} bash; }} <<EOF\n{R}\nEOF",
                     f"if true\nthen X=${{HOME}} bash\nfi <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | timeout ${{T:-5}} bash\n{R}\nEOF", f"(timeout $T bash)<<EOF\n{R}\nEOF",
                     f"{{\nbash\n}} < /dev/null <<EOF\n{R}\nEOF",
                     f"for i in 1\ndo bash\ndone 2>&1 <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):

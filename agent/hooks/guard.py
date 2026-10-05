@@ -2538,7 +2538,10 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
                 if "=" not in opt and opt in takes_value and out:
                     out.pop(0)
             # `timeout 5s cmd` / `nice 10 cmd`: a bare duration/priority operand.
-            if wrapper in ("timeout", "nice") and out and re.match(r"^[0-9]", out[0]):
+            # timeout's is REQUIRED, so it goes whatever it looks like: kept,
+            # `timeout ${T:-5} bash` read as the program `${T:-5}` (XERK-1618).
+            if out and (wrapper == "timeout"
+                        or wrapper == "nice" and re.match(r"^[0-9]", out[0])):
                 out.pop(0)
             continue
         break
