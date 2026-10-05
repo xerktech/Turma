@@ -2779,6 +2779,20 @@ _HEREDOC_OP_RE = re.compile(r"(?<!<)<<(?!<)")
 # What ends a compound command whose redirect feeds every command in it:
 # `(…)<<EOF`, `{ …; }<<EOF`, `fi <<EOF`, `done<<EOF`, `esac <<EOF`.
 _GROUP_CLOSE_RE = re.compile(r"(?:[)}]|(?:^|[\s;&|])(?:fi|done|esac))$")
+# One redirection at the end of that text: `2>/dev/null`, `2>&1`, `< f`, or the
+# fd number of the heredoc itself (`} 0<<EOF`).
+_TRAILING_REDIR_RE = re.compile(
+    r"(?:(?<=[\s)}])\d+|\d*(?:&>>?|>>|<>|>\||[<>]&?)\s*[^\s<>;&|()}]*)$")
+
+
+def _before_heredoc(segment: str, op: re.Match) -> str:
+    """``segment``'s text before its heredoc operator ``op``, less the
+    redirections between: the group in `{ bash; } 2>/dev/null <<EOF` still
+    takes the heredoc, as the later stdin redirect wins."""
+    pre = segment[:op.start()].rstrip()
+    while (m := _TRAILING_REDIR_RE.search(pre)) and m.start() < len(pre):
+        pre = pre[:m.start()].rstrip()
+    return pre
 
 
 def _ungrouped(segment: str) -> str:
@@ -2786,8 +2800,8 @@ def _ungrouped(segment: str) -> str:
     `(bash)`, `{ bash`, and `(bash)<<EOF` cut at its heredoc. Only for asking
     which program it runs."""
     op = _HEREDOC_OP_RE.search(segment)
-    if op and segment[:op.start()].rstrip().endswith((")", "}")):
-        segment = segment[:op.start()]
+    if op and (pre := _before_heredoc(segment, op)).endswith((")", "}")):
+        segment = pre
     return segment.strip().lstrip("({ \t").rstrip(");} \t")
 
 
@@ -2818,14 +2832,17 @@ def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
     `bash<<EOF` (one word), `(bash <<EOF` (a subshell) and `{ bash; } <<EOF`
     (a group's redirect feeds every reader in it).
     """
-    segments = _split_segments(owner)
+    # The splitter reads the `&` of `2>&1` / `&>f` as a background operator,
+    # which cut `(bash) 2>&1 <<EOF` away from its group. Only the program is
+    # asked of these segments, so the fd-dup's `&` can go.
+    segments = _split_segments(re.sub(r"[<>]&|&>", lambda m: m[0].replace("&", ""), owner))
     for seg in segments:
         if "<<" not in seg:
             continue
         if _heredoc_segment_program(seg) in _SCRIPT_READERS:
             return True
         op = _HEREDOC_OP_RE.search(seg)
-        if op and _GROUP_CLOSE_RE.search(seg[:op.start()].rstrip()):
+        if op and _GROUP_CLOSE_RE.search(_before_heredoc(seg, op)):
             # A compound command's redirect feeds every reader in it, and the
             # group may open lines earlier (`{` / `bash` / `} <<EOF`); finding
             # its start lost to bash's grammar elsewhere, so any reader on the
