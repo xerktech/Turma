@@ -86,6 +86,8 @@ paths:
     (XERK-1625): `_expand_both` adds one pass per suffix reading (`_VALUES_TAINT`, capped at
     `_MAX_TAINT_STARTS`), never joined into the plain values — `_substitute_vars` joins a
     name's values into ONE word list, so a second value would trail the placeholder program.
+    - The lookup-or-fallback over-deny above reaches the assigned form too:
+      `CC=$(command -v clang || echo gcc); $CC …` denies, as `$(command -v clang || echo gcc) …` does.
   - The line pass rebuilds the whole command in ONE `_sub_substs` sweep per suffix reading, so N statements
     stay linear; the pathological-input envelope is `_statements_printed`'s, unchanged by this.
 - **Each substitution gets its own plain reading, its siblings literal** (`_decoy_readings`,

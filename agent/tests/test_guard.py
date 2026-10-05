@@ -2599,7 +2599,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "a=$(false || echo rm | tr a a); $a -rf /etc",
                     # Every suffix reading, not only the every-statement one.
                     "a=$(echo safe || echo rm -rf /etc | sed ''); $a",
-                    "a=`false || echo rm -rf / | grep .`; $a"):
+                    "a=`false || echo rm -rf / | grep .`; $a",
+                    # Printed lines are words to `$a`, joined with a space.
+                    "a=$(false || printf '%s\\n' rm -rf / | grep .); $a",
+                    "a=$(false || echo -e 'rm\\n-rf /' | sed ''); $a"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         for cmd in ("a=$(false || echo rm -rf / | grep -q .); $a",
