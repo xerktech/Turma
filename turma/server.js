@@ -19122,7 +19122,12 @@ const server = http.createServer(async (req, res) => {
         const body = r
           ? { error: "unknown transcript", refused: { host: r.host, at: r.at, error: r.error } }
           : { error: "unknown transcript" };
-        if (archive.isHydrating()) body.ingestClosed = { since: Date.now() - archive.hydratingForMs() };
+        // One clock read: `hydratingForMs()` reading its own `Date.now()` could land a
+        // millisecond later and put `since` before the gate actually closed.
+        if (archive.isHydrating()) {
+          const now = Date.now();
+          body.ingestClosed = { since: now - archive.hydratingForMs(now) };
+        }
         return json(res, 404, body);
       }
       return json(res, 200, t);

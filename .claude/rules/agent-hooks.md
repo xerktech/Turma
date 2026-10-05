@@ -288,8 +288,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - ONE budget per decision (`@_budgeted`): a per-call budget let N re-expansions spend it N times.
     - Whole top-level expansions are memoised per decision; substitutions are NOT — identical bodies
       at N places are N times the work, and memoising them let 1000 heredocs through uncharged.
-    - The exec-wrapper suffix pass charges the words it emits (n args → n²/2); `find -exec` and
-      `xargs` still scale superlinearly in work, not growth (XERK-1589).
+    - The exec-wrapper suffix pass charges the words it emits (n args → n²/2).
+    - Emitted WORK is charged too, not just growth (XERK-1589): each `find -exec` run charges its
+      whole segment (every checker rescans `seg` per entry), each `xargs` the piped operands.
   - Verify parser changes with a replay of every real Bash command in `~/.claude/projects` (old vs
     new guard): 0 diffs is the bar, or each diff explained. Unit cases missed every false deny above.
   - Keep in sync with the twin hook outside this repo.

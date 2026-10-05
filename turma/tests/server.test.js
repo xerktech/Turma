@@ -17,6 +17,12 @@ const fs = require("fs");
 const path = require("path");
 const { mkdtemp } = require("./tmpdirs");
 const http = require("http");
+// One fresh connection per test request (XERK-1095). Node >=19's global agent keeps
+// sockets alive, and the hub closes an idle one after its 5s keepAliveTimeout. A test
+// that blocks the event loop past 5s (the fat-payload queueCommand loop, or a loaded
+// box) wakes with that timer due AND the next request picking the pooled socket, so
+// the request is written onto a socket the hub is closing: `read ECONNRESET`.
+http.globalAgent = new http.Agent({ keepAlive: false });
 const net = require("net");
 const crypto = require("crypto");
 const zlib = require("zlib");
@@ -3554,6 +3560,26 @@ test("XERK-1283: a missing transcript's 404 says when archive ingest closed, and
   const open = await request("GET", "/api/archive/never-arrives", { headers: userHeaders });
   assert.equal(open.status, 404);
   assert.equal(open.body.ingestClosed, undefined, "an open gate says nothing — plain not-here-yet");
+});
+
+test("XERK-1283: ingestClosed.since is exactly when the gate closed, however the clock ticks", async () => {
+  // A clock read twice ("now - (now' - closedAt)") lands `since` before the gate
+  // closed whenever the second read is later — a load flake in the test above
+  // (XERK-1095). Tick the clock on every read so that gap is always there.
+  const archive = require("../archive.js");
+  const realNow = Date.now;
+  let t = realNow();
+  try {
+    Date.now = () => (t += 1);
+    archive.setHydrating(true);
+    const closedAt = -archive.hydratingForMs(0);   // hydratingForMs(now) = now - closedAt
+    const r = await request("GET", "/api/archive/never-arrives", { headers: userHeaders });
+    assert.equal(r.status, 404);
+    assert.equal(r.body.ingestClosed.since, closedAt);
+  } finally {
+    Date.now = realNow;
+    archive.setHydrating(false);
+  }
 });
 
 // ---- the archive's raw layer (XERK-338) -------------------------------------
@@ -18973,24 +18999,27 @@ test("term: the idle window is REAL on a tunnel channel, not just a number", () 
     d.setTimeout = () => d;              // the channelDuplex no-op stub
     return armChannelIdleTimeout(d);
   };
+  // The window is wide against the 5ms keep-busy tick so a loaded box (timers
+  // starved for tens of ms) cannot let `b` go idle long enough to fire.
+  const WINDOW = 100;
 
   // 1. It fires after the idle window with no traffic.
   const fired = [];
   const a = mk();
   a.on("timeout", () => fired.push("a"));
-  a.setTimeout(20);
+  a.setTimeout(WINDOW);
   // 2. Traffic in EITHER direction rearms it — inbound bytes go through `push`
   //    (never a 'data' listener, which would flip the duplex into flowing mode
   //    and steal bytes from the HTTP parser), outbound through `write`.
   const b = mk();
   b.on("timeout", () => fired.push("b"));
-  b.setTimeout(20);
+  b.setTimeout(WINDOW);
   const busy = setInterval(() => { b.push(Buffer.from("x")); b.write("y"); }, 5);
   // 3. setTimeout(0) — what the Agent calls when it takes a socket back OUT of
   //    the free pool — disarms it, so an in-flight request is never killed.
   const c = mk();
   c.on("timeout", () => fired.push("c"));
-  c.setTimeout(20);
+  c.setTimeout(WINDOW);
   c.setTimeout(0);
 
   // ...and it is actually WIRED UP. Testing the helper alone leaves the bug
@@ -19010,7 +19039,7 @@ test("term: the idle window is REAL on a tunnel channel, not just a number", () 
     // The reader still works: wrapping `push` must not have eaten the bytes.
     assert.equal(b.read().length > 0, true, "pushed bytes must still be readable");
     resolve();
-  }, 60));
+  }, WINDOW * 2.5));
 });
 
 test("term: a replayed terminal request ADVANCES its attempt counter", () => {
@@ -21798,6 +21827,12 @@ test("control WS: a non-string session id is refused, not used as a property key
   const token = await issueToken();
   const live = await wsConnect(`/live/${host}/pk1?auth=${token}`);
   assert.match(live.statusLine, /^HTTP\/1\.1 101/);
+  // On a loaded box this test can outlast the hub's (test-mode) 1s tunnel-silence
+  // drop, which resets the control socket. wsConnect stops listening for errors
+  // once the upgrade lands, so that reset would surface as an uncaught `read
+  // ECONNRESET` (XERK-1095). It is not what this test checks: the hub staying up is.
+  ctrl.socket.on("error", () => {});
+  live.socket.on("error", () => {});
 
   for (const frame of [
     { turn: UNSTRINGIFIABLE, text: "hi" },

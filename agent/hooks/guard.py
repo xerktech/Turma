@@ -619,6 +619,29 @@ _FOR_IN_RE = re.compile(r"\bfor\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)")
 _VAR_USE_RE = re.compile(
     r"\$\{([A-Za-z_][A-Za-z0-9_]*)([^}]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
 )
+# The same groups, but `${…}` never matches: past a line's last `}` it can't,
+# and letting `[^}]*` find that out rescans to the end of the line from every
+# `${` there — quadratic, and a hook that times out runs the command (XERK-1596).
+_VAR_BARE_RE = re.compile(
+    r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?!)([^}]*)\}|\$([A-Za-z_][A-Za-z0-9_]*)"
+)
+
+
+def _var_uses(text: str):
+    """``_VAR_USE_RE.finditer(text)``, in time linear in ``text``."""
+    k = text.rfind("}") + 1
+    yield from _VAR_USE_RE.finditer(text, 0, k)
+    yield from _VAR_BARE_RE.finditer(text, k)
+
+
+def _var_sub(repl, text: str) -> str:
+    """``_VAR_USE_RE.sub(repl, text)``, in time linear in ``text``."""
+    out, last = [], 0
+    for m in _var_uses(text):
+        out += (text[last:m.start()], repl(m))
+        last = m.end()
+    out.append(text[last:])
+    return "".join(out)
 
 # The expansion operators, longest spelling first so `##` never matches as `#`.
 _VAR_OP_RE = re.compile(r"^(##|#|%%|%|:-|:=|:\+|-|=|\+|//|/|:)(.*)$", re.DOTALL)
@@ -736,7 +759,7 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         _spend(len(value) - len(m.group(0)))
         return value
 
-    return {k: [_VAR_USE_RE.sub(resolve, v) for v in vs] for k, vs in vals.items()}
+    return {k: [_var_sub(resolve, v) for v in vs] for k, vs in vals.items()}
 
 
 def _dequote_value(value: str) -> str:
@@ -891,7 +914,13 @@ def _printf_v(tokens: list[str]) -> tuple[str, str] | None:
 
 
 def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
-    return any((m.group(1) or m.group(3)) in vals for m in _VAR_USE_RE.finditer(value))
+    return any((m.group(1) or m.group(3)) in vals for m in _var_uses(value))
+
+
+@functools.lru_cache(maxsize=16)
+def _closers(command: str) -> dict[int, int]:
+    """Per command line: where each opener `_brace_end` has scanned closes."""
+    return {}
 
 
 def _brace_end(command: str, i: int) -> int:
@@ -899,29 +928,48 @@ def _brace_end(command: str, i: int) -> int:
 
     Quotes, `$(…)`, backticks and nested `${…}` inside the braces hide a `}`,
     as they do from bash: `${a:-'}'}` and `${a:-$(echo })}` are one expansion.
+
+    Where an opener closes depends only on the text after it, so every opener
+    the scan passes is remembered per command line and skipped on the next
+    scan. Without that, each of N unclosed `${a:-$(` ran to the end of the
+    line: O(N × length), minutes for a 40 KB command, and a hook that times
+    out lets the command run unchecked (XERK-1596).
     """
-    stack = ["{"]
+    memo = _closers(command)
+    if i in memo:
+        return memo[i]
+    stack = [("{", i)]
     j, n = i + 2, len(command)
+
+    def opened(kind: str) -> int:
+        """Push the opener at ``j``; a remembered one is skipped instead.
+        Returns where the scan resumes, or -1 once the outer one can't close."""
+        end = memo.get(j)
+        if end is None:
+            stack.append((kind, j))
+            return j + (1 if kind in ('"', "`") else 2)
+        return end + 1 if end >= 0 else -1
+
     while j < n:
         ch = command[j]
-        top = stack[-1]
+        top = stack[-1][0]
         if ch == "\\":
             j += 2
             continue
-        if top == "`":
-            if ch == "`":
-                stack.pop()
-            j += 1
-            continue
-        if top == '"':
-            if ch == '"':
-                stack.pop()
-            elif command.startswith(("${", "$("), j):
-                stack.append(command[j + 1])
+        if top == "`" or top == '"':
+            if ch == top:
+                memo[stack.pop()[1]] = j
+                if not stack:
+                    return j
                 j += 1
-            elif ch == "`":
-                stack.append("`")
-            j += 1
+            elif top == '"' and command.startswith(("${", "$("), j):
+                j = opened(command[j + 1])
+            elif top == '"' and ch == "`":
+                j = opened("`")
+            else:
+                j += 1
+            if j < 0:
+                break
             continue
         if ch == "'" or command.startswith("$'", j):
             ansi = ch == "$"
@@ -931,16 +979,20 @@ def _brace_end(command: str, i: int) -> int:
             j += 1
             continue
         if command.startswith(("${", "$("), j):
-            stack.append(command[j + 1])
-            j += 2
-            continue
-        if ch in ('"', "`"):
-            stack.append(ch)
+            j = opened(command[j + 1])
+        elif ch in ('"', "`"):
+            j = opened(ch)
         elif (ch == "}" and top == "{") or (ch == ")" and top == "("):
-            stack.pop()
+            memo[stack.pop()[1]] = j
             if not stack:
                 return j
-        j += 1
+            j += 1
+        else:
+            j += 1
+        if j < 0:
+            break
+    for _, start in stack:
+        memo[start] = -1
     return -1
 
 
@@ -1014,7 +1066,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         _spend(len(out) - len(m.group(0)))
         return out
 
-    return _VAR_USE_RE.sub(rep, command)
+    return _var_sub(rep, command)
 
 
 # Set while `_expand_both` takes its raw reading; counts escaping splices.
@@ -1732,6 +1784,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         for tok in _tokenize(raw):
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
+    piped_chars = sum(len(t) + 1 for t in piped_operands)
     # A shell that reads its SCRIPT from stdin runs whatever the pipeline,
     # a here-string or a `<(…)` feeds it — `echo '<cmd>' | sh`, `sh <<< '<cmd>'`,
     # `. <(echo '<cmd>')` — none of which is an argv of its own (XERK-1539).
@@ -1949,10 +2002,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
                     inner.pop(0)
             if inner:
-                # `{}` stands for whatever the pipeline feeds in.
+                # `{}` stands for whatever the pipeline feeds in. Every xargs
+                # carries EVERY operand on the line, so n segments emit n²
+                # words: 4096 took 18s (XERK-1589), so they share the budget.
                 expanded: list[str] = []
                 for tok in inner:
+                    if tok == "{}":
+                        _spend(piped_chars)
                     expanded.extend(piped_operands if tok == "{}" else [tok])
+                _spend(piped_chars)
                 argv = _strip_prefixes(expanded + piped_operands)
                 out.append((argv, seg))
                 # ...and expanded again, so a shell/eval/wrapper it runs is
@@ -1970,22 +2028,35 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 for cwd, joined in by_cwd:
                     out.append((["rm", "-r", *joined], seg, False, cwd))
             roots += [r for _, joined in by_cwd for r in joined]
+            # Each flag's run ends at the next terminator, found in ONE
+            # backward pass: rescanning and re-slicing `rest` per `-exec` was
+            # quadratic (XERK-1589).
+            ends, end = [0] * len(rest), len(rest)
+            for i in range(len(rest) - 1, -1, -1):
+                if rest[i] in (";", "+", "\\;"):
+                    end = i
+                ends[i] = end
+            roots_chars = sum(len(r) + 1 for r in roots)
             for flag in ("-exec", "-execdir", "-ok", "-okdir"):
-                while flag in rest:
-                    i = rest.index(flag)
+                for i, flag_tok in enumerate(rest):
+                    if flag_tok != flag:
+                        continue
                     run = []
-                    for tok in rest[i + 1:]:
-                        if tok in (";", "+", "\\;"):
-                            break
+                    for tok in rest[i + 1:ends[i]]:
                         # `{}` stands for each path found — i.e. the roots.
+                        if tok == "{}":
+                            _spend(roots_chars)
                         run.extend(roots if tok == "{}" else [tok])
                     if run:
+                        # Every run is classified with the whole segment, and
+                        # checkers rescan that text per entry: 5000 runs took
+                        # 30s (XERK-1589), so each run charges the segment.
+                        _spend(len(seg))
                         argv = _strip_prefixes(run)
                         out.append((argv, seg))
                         # `find . -exec sh -c '<cmd>' \;` (XERK-1539).
                         out.extend(_expand_segments(
                             " ".join(shlex.quote(t) for t in argv), depth + 1, cwds))
-                    rest = rest[i + 1:]
     # An unwrap can leave nothing behind (`$(x | xargs kill)`); every checker
     # reads tokens[0], and a crash there let the WHOLE command through (XERK-1080).
     return [entry for entry in out if entry[0]]

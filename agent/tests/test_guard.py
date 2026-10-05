@@ -1897,6 +1897,52 @@ class TestExpansionBudget(unittest.TestCase):
         ):
             self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:80])
 
+    def test_find_exec_and_xargs_runs_are_denied_fast(self):
+        # Their emitted WORK grew faster than linearly, not their text: 5000
+        # `-exec` runs took 30s and 4096 xargs segments 18s (XERK-1589).
+        for cmd in (
+            "find . " + "-exec true {} + " * 5000,
+            'x="-exec true {} +"; find . ' + "$x " * 10000,
+            " | ".join(["xargs echo a/b"] * 4096),
+            'x="xargs echo a/b"; ' + " | ".join(["$x"] * 8192),
+        ):
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:80])
+            # xargs re-expands each argv (XERK-1539) until the budget is
+            # spent: ~2.5s idle, so leave a shared CI runner headroom.
+            self.assertLess(time.monotonic() - t, 10, cmd[:80])
+
+    def test_ordinary_find_exec_and_xargs_stay_allowed(self):
+        for cmd in (
+            "find . -name '*.pyc' -exec rm {} + -o -name x -execdir echo {} \\;",
+            "find src -type f -exec grep -l foo {} \\; -exec wc -l {} +",
+            "find . -type f | xargs -I {} cp {} /tmp/x",
+        ):
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow", cmd)
+        # A run stops at its terminator, `+` included.
+        runs = [e[0] for e in guard._budgeted(guard._expand_segments)(
+            "find . -exec echo {} + -name x -execdir ls {} \\; -print")]
+        self.assertIn(["echo", "."], runs)
+        self.assertIn(["ls", "."], runs)
+        # Many roots × many `{}` builds roots² words in one run; it is charged.
+        roots = " ".join(f"a/{i}" for i in range(2000))
+        cmd = f"find {roots} -exec echo " + "{} " * 2000 + "\\;"
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.monotonic() - t, 5)
+        # ...and so does xargs: n piped operands × n `{}`.
+        cmd = f"echo {roots} | xargs -I {{}} echo " + "{} " * 2000
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.monotonic() - t, 5)
+        # An earlier flag's run before a later `-exec` was skipped: re-slicing
+        # past each `-exec` dropped every `-execdir`/`-ok` in front of it.
+        for flag in ("-execdir", "-ok", "-okdir"):
+            cmd = f"find . {flag} rm -rf / \\; -exec true \\;"
+            self.assertIsNotNone(guard.is_destructive(cmd), cmd)
+        # Every flag still opens a run, nested inside another run included.
+        self.assertIsNotNone(guard.is_destructive("find . -exec sh -c x -exec rm -rf / \\;"))
+
     def test_value_resolved_into_an_unused_variable_is_charged(self):
         # Resolving `a` builds the large text before any substitution does.
         cmd = f"b='{self.VALUE}'; a=" + "$b" * 1000 + "; echo ok"
@@ -1960,6 +2006,52 @@ class TestExpansionBudget(unittest.TestCase):
         for text in ("tmux ls | grep x", "grep x; tmux ls", "grep x\ntmux", "grep x & tmux",
                      "grep tmuxx", "egrep tmux"):
             self.assertFalse(guard._greps_for_tmux(text), text)
+
+    def test_many_unclosed_brace_defaults_classify_fast(self):
+        # Each `${a:-$(` scanned to the end of the line for its closing `}`:
+        # O(matches × length), ~95s for this 40 KB line (XERK-1596).
+        for unit in ("${a:-$(}", '${a:-"}', "${a:-${", "${a:-`"):
+            cmd = "echo '" + unit * 5000 + "'; rm -rf /"
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", unit)
+            self.assertLess(time.monotonic() - t, 5, unit)
+        # Deeply nested expansions that DO close scanned their tails again too.
+        cmd = "echo " + "${a:-" * 3000 + "x" + "}" * 3000 + "; rm -rf /"
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.monotonic() - t, 5)
+
+    def test_brace_end_matches_a_fresh_scan_in_any_order(self):
+        # Remembered closers must give what a scan from scratch would.
+        cases = {"${a:-'}'}": 0, "${a:-$(echo })}": 0, '${a:-"${b}"}': 0,
+                 "${a:-${b:-x}}": 0, "${a:-`}`}": 0, "${a:-$(}": -1, "${a:-\\}}": 0}
+        for cmd, want in cases.items():
+            guard._closers.cache_clear()
+            ends = {i: guard._brace_end(cmd, i) for i in reversed(range(len(cmd)))
+                    if cmd.startswith("${", i)}
+            self.assertEqual(ends[0], len(cmd) - 1 if want == 0 else -1, cmd)
+            guard._closers.cache_clear()
+            self.assertEqual(guard._brace_end(cmd, 0), ends[0], cmd)
+        # A later scan jumping over a remembered quote must land past its closer.
+        cmd = "${a:-'${c:-\\'\"}\"}"
+        guard._closers.cache_clear()
+        self.assertEqual((guard._brace_end(cmd, 6), guard._brace_end(cmd, 0)), (16, 16))
+
+    def test_many_braces_past_the_last_close_classify_fast(self):
+        # `${NAME[^}]*}` rescanned to the end of the line from every `${` after
+        # its last `}` — quadratic in the regex itself (XERK-1596).
+        for unit in ("${a", "${a:-`${a:-", "${a:-\"'${a:-'\"", "\\${a:-\\\\${a:-$("):
+            cmd = "echo } " + unit * (60000 // len(unit)) + "\nrm -rf /"
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", unit)
+            self.assertLess(time.monotonic() - t, 5, unit)
+
+    def test_var_sub_matches_the_regex(self):
+        for text in ("${a}${b:-x} $c", "x=$a; ${b", "}$a${b", "${a:-}} ${b $c", "$", ""):
+            self.assertEqual([m.span() for m in guard._var_uses(text)],
+                             [m.span() for m in guard._VAR_USE_RE.finditer(text)], text)
+            self.assertEqual(guard._var_sub(lambda m: "<%s>" % m.group(0), text),
+                             guard._VAR_USE_RE.sub(lambda m: "<%s>" % m.group(0), text), text)
 
     def test_each_heredoc_owner_is_still_judged(self):
         # The owner dedupe must neither skip a later owner nor mark one judged
