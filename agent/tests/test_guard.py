@@ -1605,7 +1605,8 @@ class TestScriptChannels(unittest.TestCase):
                     f"(true; echo {R})2>/dev/null | sh", f"{{ true; echo {R}; }} {{fd}}>/dev/null | sh",
                     f"(true; echo {R}) <>/dev/null | sh", f"(true; echo {R}) <<EOF | sh\nx\nEOF",
                     f"(true; echo {R}) <<-EOF | sh\n\tx\nEOF", f"(true; echo {R}) <<- EOF | sh\n\tx\nEOF",
-                    f"(true; echo {R}) <<'E F' | sh\nx\nE F", f"{{ true; echo {R}; }} 2>'/tmp/a b' | sh"):
+                    f"(true; echo {R}) <<'E F' | sh\nx\nE F", f"{{ true; echo {R}; }} 2>'/tmp/a b' | sh",
+                    f'(true; echo {R}) 2>"/tmp/a\\"e" | sh'):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("echo hi |& cat", "make 2>&1 | tee log", "echo hi | bash -c 'grep h'",
@@ -1630,6 +1631,7 @@ class TestScriptChannels(unittest.TestCase):
         self.assertEqual(guard._group_core("{ a; } {fd}>x"), "{ a; }")
         self.assertEqual(guard._group_core("(a) 2>'x y' <\"p q\" >a\\ b"), "(a)")
         self.assertIsNone(guard._group_core("(a) 2>'x y"))
+        self.assertEqual(guard._group_core('(a) 2>"x\\"y z"'), "(a)")
         self.assertEqual(guard._split_segments("a |& b"), ["a", "b"])
         self.assertEqual(guard._split_on_operators("a |& b", include_pipe=False), ["a |& b"])
         self.assertEqual(guard._split_on_operators("{ a; b; } | (c; d) && e <(f; g)", groups=True),

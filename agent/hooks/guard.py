@@ -2810,12 +2810,20 @@ def _only_redirects(text: str, i: int) -> bool:
             i += 1
         start = i
         while i < n and text[i] not in _TRAIL_WORD_END:
-            # A quoted span is part of the word, blanks and all: `2>'a b'`.
-            if text[i] in ("'", '"'):
-                close = text.find(text[i], i + 1)
-                if close < 0:
-                    return False
-                i = close
+            # A quoted span is part of the word, blanks and all: `2>'a b'`. An
+            # unclosed quote is read as a plain character, as before quotes were
+            # read at all, so reading them never opens fewer groups (XERK-1614).
+            if text[i] == "'":
+                close = text.find("'", i + 1)
+                if close >= 0:
+                    i = close
+            elif text[i] == '"':
+                # ...where a backslash escapes the next character: `"a\"b"`.
+                j = i + 1
+                while j < n and text[j] != '"':
+                    j += 2 if text[j] == "\\" else 1
+                if j < n:
+                    i = j
             elif text[i] == "\\":
                 i += 1
             i += 1
