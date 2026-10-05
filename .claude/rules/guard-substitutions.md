@@ -37,7 +37,31 @@ paths:
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
   ANSI-C only to a `-c` re-parse; an even run (`\\$'…'`) is still live. A bare lookbehind bypassed.
+- **A filtered or partly-unread body gets a TAINT reading too** (XERK-1613, `_body_tainted`): the
+  text its producers emit — echo/printf args, or a here-string — carried through any pass-through or
+  rewriting filter (sed/tr/awk/cut/rev…) as if it passed unchanged. ADDED beside the opaque reading,
+  never swapped. Operator decision: neither model each filter (partial) nor fail closed (that denies
+  `$(command -v tool) args`).
+  - A statement whose output is UNKNOWN but non-silent contributes `_UNREAD_OUTPUT`; as the PROGRAM
+    word of the output it is refused (`_UNREAD_PROG`) — `$(basename /x/rm; echo -rf /etc)`. A LONE
+    unknown statement returns None (that IS `$(command -v tool)`), staying opaque.
+  - Output is joined with SPACE, not newline: a command substitution's output is word-split, so a
+    trailing unread statement is an argument, never a phantom program (a newline forged a command
+    boundary that over-denied arg-position substitutions).
+  - `_UNREAD_PROG` fires only in true PROGRAM position (`_taint_in_command_pos`): not in a
+    `for … in`/`select` word list, where the output is data. Residual (safe-direction, rollup):
+    an array element `arr=($(ls; echo y))` is read as a subshell group, so its unread-leading
+    output still over-denies — rare, absent from the 35k-command replay.
+  - Left opaque (as on main, documented residuals): a conditional/backgrounded/control-flow body
+    (`&&`, `||`, `&`, `if`/`while`/`case`), an assignment VALUE (stored, not run — splicing it also
+    made shlex quadratic), a here-string a consuming command reads (`grep -q`/`read`), and a stdout
+    redirect (`>/dev/null`, `>&2`). A filter that rewrites harmless text into a dangerous command
+    (`rev`, `sed s,/x,,`) still slips: accepted.
+  - The line pass rebuilds the whole command in ONE `_sub_substs` sweep (cut bodies), so N statements
+    stay linear; the pathological-input envelope is `_statements_printed`'s, unchanged by this.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
   `test_a_multi_statement_body_prints_the_command`,
+  `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
+  `test_a_large_filtered_body_classifies_without_timing_out`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).

@@ -2371,6 +2371,54 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
+    def test_a_filtered_or_unread_body_runs_as_its_producers_text(self):
+        # XERK-1613: a here-string producer, a rewriting filter, or an unread
+        # statement left the body opaque while bash ran its output.
+        for cmd in ("$(true; cat <<< 'rm -rf /etc')", "$(cat <<< 'rm -rf /etc')",
+                    "$(tr a a <<< 'rm -rf /etc')", "$(sed '' <<< 'rm -rf /etc')",
+                    "$(head -1 <<< 'rm -rf /etc')", "$(basename /x/rm; echo -rf /etc)",
+                    "$(basename /x/rm; echo -rf /etc) foo",
+                    "rm -rf $(true; echo /etc)", "eval \"$(cat <<< 'rm -rf /etc')\"",
+                    # An unread/suppressed statement never hides a later producer.
+                    "$(echo x >/dev/null; echo rm -rf /etc | sed '')",
+                    "$(echo x >&2; echo rm -rf /etc | sed '')",
+                    "$(grep -q a <<< b; echo rm -rf /etc | sed '')",
+                    "$(echo x | grep -q x; echo rm -rf /etc | sed '')"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        for cmd in (
+                # A lone unknown statement IS `$(command -v tool)` — stays opaque.
+                "$(command -v tool) --version", "$(which python3) x.py",
+                "$(git rev-parse --show-toplevel)/x.sh", "rm -rf \"$(mktemp -d)\"",
+                # A here-string a consuming command reads prints nothing.
+                "$(grep -q x <<< y)", "$(read v <<< z; echo ok)",
+                # A command substitution's output is word-split, so a trailing
+                # unread statement is an argument, never a phantom program.
+                "echo $(echo a | sed ''; ls)",
+                "echo $(echo a | sed ''; ls) $(echo a | sed ''; ls)",
+                "echo $(date; echo hi)", "$(echo tool; ls) --version",
+                # A `for … in`/`select` word list is data, not a program slot,
+                # so an unread-leading substitution there is not refused.
+                "for f in $(ls; echo y); do echo $f; done",
+                "select x in $(ls; echo y); do break; done",
+                # A conditional/backgrounded body is left opaque, as on main.
+                "$(false && echo x; echo safe)",
+                # An assignment value is stored, not run.
+                "x=$(cat <<< 'rm -rf /etc'); echo done",
+                "RUNAGENT=$(for p in 1 2; do echo $p; done); echo ok"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_a_large_filtered_body_classifies_without_timing_out(self):
+        # XERK-1613 QA: the taint reading must not make the guard quadratic —
+        # an assignment value is left to the segment pass, not spliced as one
+        # giant word, and a non-assignment body is walked once.
+        import time
+        cmd = "x=$(" + "ls; " * 40000 + "echo a); rm -rf /etc"
+        start = time.time()
+        self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        self.assertLess(time.time() - start, 30)
+
     def test_only_a_command_substitution_has_a_literal_word_reading(self):
         # A `<(…)` hands its reader a path; escaping what it prints shifted the
         # quoting of a real transcript's line and exposed quoted text (XERK-1609).

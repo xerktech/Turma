@@ -605,6 +605,196 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
     return _OPAQUE_SUBST
 
 
+# XERK-1613 — the TAINT reading of a substitution whose output `_body_printed`
+# leaves opaque: text its producers emit, carried through any rewriting filter
+# as if it passed unchanged. A SEPARATE reading that is ADDED beside the opaque
+# one, never swapped in (guard-substitutions.md), and confined to pure
+# `;`/pipeline bodies — a conditional, control-flow or backgrounded one is left
+# opaque, exactly as main reads it.
+
+# Filters that always re-emit their (transformed) stdin, so a producer's text
+# survives them. Unlike `grep -q`, `read` or `wc`, which print nothing or a
+# count, these never suppress the line.
+_REWRITE_FILTERS = {"sed", "tr", "awk", "gawk", "mawk", "nawk", "cut", "rev",
+                    "tac", "nl", "fold", "expand", "unexpand"}
+
+# Builtins/commands that print nothing to stdout, so an unknown such statement
+# owes no unread-output mark (`$(cd x; echo …)` runs no unknown program).
+_SILENT_PROGS = {"true", "false", ":", "cd", "pushd", "popd", "export", "unset",
+                 "set", "shopt", "umask", "local", "declare", "readonly",
+                 "typeset", "trap", "wait", "read", "hash", "ulimit", "alias",
+                 "unalias", "test", "["}
+
+# Shell control-flow words: a body using them runs statements conditionally, so
+# which output prints is unknown — the taint reading gives up and stays opaque.
+_CONTROL_WORDS = {"if", "then", "elif", "else", "fi", "for", "while", "until",
+                  "do", "done", "case", "esac", "in", "select", "{", "}", "function"}
+
+# A bare stdout redirect sends a statement's output to a file or another fd, so
+# it prints NOTHING the substitution sees (`echo x >/dev/null; echo P` is P).
+# `2>&1` keeps `2` before the `>` so the lookbehind skips it.
+_STDOUT_REDIR_RE = re.compile(r"(?<![0-9&>|])(?:&>>?|1?>>?|>&)")
+
+# Stands in for the output of a statement the taint reading cannot read but
+# that still runs and prints something unknown. As the PROGRAM word of a
+# command (`$(basename /x/rm; echo -rf /etc)`) it is refused (`_UNREAD_PROG`);
+# it carries `_OPAQUE_SUBST`, so a path check reads it as the placeholder.
+_UNREAD_OUTPUT = _OPAQUE_SUBST + "_unread"
+
+_ASSIGN_VALUE_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?\+?=\S*\Z")
+
+
+def _subst_is_assign_value(m: "re.Match[str]") -> bool:
+    """Whether the substitution is the VALUE of a `NAME=`/`NAME+=` assignment,
+    whose output bash STORES rather than runs (so its taint must not splice in
+    as a runnable word — a later `$NAME` is read on its own)."""
+    s, a = m.string, m.start()
+    j = a
+    while j > 0 and s[j - 1] not in " \t\n;|&()<>\"'`":
+        j -= 1
+    return bool(_ASSIGN_VALUE_RE.match(s[j:a]))
+
+
+def _has_conditional(body: str) -> bool:
+    """Whether ``body`` joins statements with `&&`, `||` or a backgrounding
+    `&`, so which statement's output prints, and in what order, is unknown."""
+    q = _quote_states(body)
+    for i in range(len(body)):
+        if q[i] != "":
+            continue
+        if body[i:i + 2] in ("&&", "||"):
+            return True
+        if body[i] == "&" and body[i:i + 2] != "&>" and (i == 0 or body[i - 1] not in "&>|"):
+            return True
+    return False
+
+
+def _stdout_redirected(stmt: str) -> bool:
+    """Whether ``stmt`` sends its stdout off the substitution — a file,
+    `/dev/null` or another fd (`>&2`); a here-string `<<<` is input, not this."""
+    masked = "".join(" " if st in ("'", '"', "#") else ch
+                     for ch, st in zip(stmt, _quote_states(stmt)))
+    return bool(_STDOUT_REDIR_RE.search(masked))
+
+
+def _stmt_tainted(stmt: str) -> tuple[str, bool] | None:
+    """What one statement's PRODUCER emits as taint — echo/printf arguments, or
+    a here-string — carried through any pass-through or rewriting filter, plus
+    whether it ends a line. None where the output is unknown or thrown away: a
+    stage that is neither pass-through nor a rewriting filter (`grep -q`, a bare
+    command), or a stdout redirect."""
+    if _stdout_redirected(stmt):
+        return None
+    stages = _split_segments(stmt)
+    if not stages:
+        return None
+    for st in stages[1:]:
+        toks = _strip_prefixes(_tokenize(_unwrap_group(st)))
+        if not toks or not (_passes_input(st) or _basename(toks[0]) in _REWRITE_FILTERS):
+            return None
+    first = _strip_prefixes(_tokenize(_unwrap_group(stages[0])))
+    text = _printed_from_tokens(first)
+    if text is not None:
+        if first and _basename(first[0]) == "printf":
+            return text, text.endswith("\n")
+        return text, not any(re.match(r"^-[neE]*n", t) for t in first[1:3])
+    # A here-string PRODUCER, but only where the command it feeds re-emits it:
+    # `cat`/`tr`/`sed <<< X` print X, `grep -q`/`read <<< X` print nothing.
+    for st in stages:
+        ust = _unwrap_group(st)
+        hs = _herestrings(ust)
+        if hs:
+            toks = _strip_prefixes(_tokenize(ust))
+            if toks and _basename(toks[0]) in (_PASS_THROUGH | _REWRITE_FILTERS):
+                return hs[0], True   # `<<<` appends a trailing newline
+            return None
+    return None
+
+
+@functools.lru_cache(maxsize=512)
+def _body_tainted(body: str) -> str | None:
+    """The taint reading of a substitution body, or None to leave it opaque.
+
+    A rewriting filter, a non-echo producer, or an unread statement left the
+    body opaque while bash ran its output (XERK-1613):
+    `$(echo rm -rf / | sed '')`, `$(true; cat <<< 'rm -rf /')`,
+    `$(basename /x/rm; echo -rf /etc)`. Each statement contributes its
+    producer's text (a filter assumed identity — modelling each is partial, and
+    failing closed denies `$(command -v tool) args`); a statement that still
+    prints something UNKNOWN contributes `_UNREAD_OUTPUT`, so its output naming
+    the program is refused. None for a LONE unknown statement (that IS
+    `$(command -v tool)`), and for a conditional, control-flow or backgrounded
+    body whose printing order is unknown (left opaque, as on main). A rewrite
+    that makes harmless text dangerous (`echo /etc/x | sed s,/x,,`) still slips.
+    """
+    if _has_conditional(body):
+        return None
+    out: list[str] = []
+    producers = False
+    for stmt in _split_on_operators(body, include_pipe=False):
+        stmt = _unwrap_group(stmt).lstrip("( \t").rstrip(") \t")
+        toks = _strip_prefixes(_tokenize(stmt))
+        if not toks:
+            continue
+        if _basename(toks[0]) in _CONTROL_WORDS:
+            return None
+        known = _stmt_tainted(stmt)
+        if known is not None:
+            producers = True
+            out.append(known[0])
+        elif _stdout_redirected(stmt) or _basename(toks[0]) in _SILENT_PROGS:
+            continue
+        else:
+            out.append(_UNREAD_OUTPUT)
+    if not producers:
+        return None
+    # Joined with SPACE, never newline: a command substitution's output is
+    # word-split on IFS, so `$(basename /x/rm; echo -rf /etc)` is the ONE
+    # command `rm -rf /etc`, and a newline here would forge a command boundary
+    # that turned a later arg into a phantom program (XERK-1613 QA). An unread
+    # statement after a producer is thus a trailing WORD, not the program —
+    # only a leading one takes the program slot (`_UNREAD_PROG`).
+    return " ".join(x for x in out if x) or None
+
+
+def _taint_in_command_pos(seg: str) -> bool:
+    """Whether a taint segment's `_UNREAD_OUTPUT` sits in PROGRAM position, not
+    in a `for … in`/`select` word list or an array — where the substitution's
+    output is DATA, so `$(ls; echo y)` as a list element must not be refused
+    (XERK-1613 QA). `_strip_prefixes` peels `for f in`, exposing the first word,
+    so the raw tokens before the marker are what tell the two apart."""
+    raw = _tokenize(seg)
+    pos = next((k for k, t in enumerate(raw) if _UNREAD_OUTPUT in t), -1)
+    before = raw[:pos]
+    return not (any(_basename(t) in _WORDLIST_HEADS for t in before)
+                or any("=(" in t for t in before))
+
+
+def _taint_subst(m: "re.Match[str]") -> str:
+    """`_subst_text`'s taint sibling for a segment-level pass: a substitution's
+    taint reading where one exists, else the opaque placeholder. An assignment
+    VALUE stays opaque (its output is stored, not run)."""
+    if m.group(0)[0] not in "$`" or _subst_is_assign_value(m):
+        return _OPAQUE_SUBST
+    taint = _body_tainted(_subst_inner(m))
+    return taint if taint is not None else _OPAQUE_SUBST
+
+
+def _taint_line_repl(m: "re.Match[str]") -> str:
+    """Line-level taint: segmenting cuts `$(true; cat <<< …)` in half before
+    `_taint_subst` can read it, so the whole line is rebuilt once with each
+    OPERATOR-holding substitution replaced by its taint. A non-cut one is left
+    for the segment pass; an assignment value and an opaque body are left
+    untouched, so only a real taint changes the line."""
+    body = _subst_inner(m)
+    if (not _SEGMENT_SPLIT.search(body) or m.group(0)[0] not in "$`"
+            or _subst_is_assign_value(m)):
+        return m.group(0)
+    taint = _body_tainted(body)
+    if taint and "$(" not in taint and "`" not in taint:
+        return taint
+    return m.group(0)
+
 
 def _sub_substs(text: str, repl) -> str:
     """Every substitution `_find_substs` sees in ``text`` replaced by
@@ -771,6 +961,11 @@ _ARITH_BODY_RE = re.compile(r"\([^\s$`]*\)\Z")
 
 # The program name `_expand_segments` reports once the depth budget is spent.
 _TOO_DEEP = "\x00turma-too-deep"
+
+# ...and the one it reports for a program named by a substitution's unread
+# output, handed the arguments a statement beside it printed (see
+# `_body_tainted`): `$(basename /x/rm; echo -rf /etc)`.
+_UNREAD_PROG = "\x00turma-unread-program"
 
 # How many characters inlining variables may ADD across one decision (an exec
 # wrapper's suffix pass charges the words it emits here too).
@@ -2191,6 +2386,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # them (`cd $(echo /; true); rm -rf *`) moves the whole line, in order
         # or not: the half-segment `cd $(echo /` named no directory.
         cwds = _cd_readings(_prenormalise(printed_line), cwds)
+    # The TAINT reading of every operator-holding substitution the splitter cut
+    # (XERK-1613), rebuilt in ONE pass so a body of N statements stays linear.
+    tainted_line = _sub_substs(raw_commands, _taint_line_repl)
+    if tainted_line != raw_commands:
+        seen = set(segments)
+        for line in dict.fromkeys((tainted_line, tainted_line.replace("\n", " "))):
+            for seg in _split_segments(_prenormalise(line)):
+                if seg not in seen:
+                    seen.add(seg)
+                    segments.append(seg)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
@@ -2291,6 +2496,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 raw, lambda m: _subst_text(m, glued_empty=True, multi=False))),
             _unwrap_group(_sub_substs(raw, lambda m: _subst_text(m, literal=True))),
             _GLUED_PARAM_RE.sub("", seg),
+            # ...and a filtered or partly-unread substitution read as the text
+            # its producers emit (XERK-1613); a non-cut one is read here, a cut
+            # one by the line pass above.
+            _unwrap_group(_sub_substs(raw, _taint_subst)),
         }
         for reading in readings - {seg, bare, ""}:
             out.extend(_expand_segments(reading, depth + 1, cwds))
@@ -2325,6 +2534,12 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 continue
         tokens = _strip_prefixes(_tokenize(seg))
         if not tokens:
+            continue
+        if _UNREAD_OUTPUT in tokens[0] and len(tokens) > 1 and _taint_in_command_pos(seg):
+            # A substitution's unread output names the program its printed words
+            # are handed to (`$(basename /x/rm; echo -rf /etc)`): unknowable, so
+            # refused rather than read as the harmless placeholder.
+            out.append(([_UNREAD_PROG], seg))
             continue
         out.append((tokens, seg))
         prog = _basename(tokens[0])
@@ -4207,6 +4422,9 @@ def is_destructive(command: str) -> str | None:
     for tokens, segment, *flags in _expand_both(command):
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"
+        if tokens[0] == _UNREAD_PROG:
+            return ("refusing a command whose program name is the output of a substitution the "
+                    "guard cannot read, given printed arguments — name the program directly")
         if tokens[0] == _TOO_LARGE:
             return _TOO_LARGE_REASON
         # A candidate recovered by the wrapper SUFFIX pass is a guess at where
