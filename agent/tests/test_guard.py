@@ -1563,6 +1563,36 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         self.assertDenied("echo \"\\$(x)\"; : '" + "\\" * 200_000 + "'; rm -rf /")
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_a_nested_substitution_in_a_reparsed_string_is_classified(self):
+        # XERK-1605: `_SUBST_RE` could not nest, so nested backticks paired
+        # wrongly and a `$(…)` whose body holds parens matched nothing — each
+        # ran the printed command at the next parse unclassified.
+        for cmd in (r'''bash -c "\`echo \\\`echo rm -rf /etc\\\`\`"''',
+                    r'''bash -c "\`echo \\\`echo \\\\\\\`echo rm -rf /etc\\\\\\\`\\\`\`"''',
+                    r'''eval "\`echo \\\`echo rm -rf /etc\\\`\`"''',
+                    r'''`echo \`echo rm -rf /etc\``''',
+                    r'''bash -c "\$( (echo rm -rf /etc) )"''',
+                    r'''bash -c "\$( { echo rm -rf /etc; } )"''',
+                    r'''bash -c "\$(echo \$( (echo rm -rf /etc) ))"''',
+                    r'''bash -c 'bash -c "\$( (echo rm -rf /etc) )"' ''',
+                    r'''$(echo $(echo rm -rf /etc))'''):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Printed, never run; and `$((…))` is arithmetic.
+        for cmd in (r'''echo `echo \`echo rm -rf /etc\``''',
+                    r'''echo '$( (echo rm -rf /etc) )' ''',
+                    r'''bash -c "echo \$((1+(2)))"'''):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_deep_substitution_nesting_stays_fast(self):
+        # Each level's printed text resolves the levels beneath it; unmemoised,
+        # and with the group and substitution passes both recursing into the
+        # same body, 3000 levels ran 30s — past the hook timeout, failing OPEN.
+        started = time.monotonic()
+        self.assertDenied("echo " + "$(echo " * 3000 + "x" + ")" * 3000)
+        self.assertLess(time.monotonic() - started, 5)
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
