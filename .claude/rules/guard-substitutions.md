@@ -41,14 +41,21 @@ paths:
   `X=<(a; b)` severed producer from reader. Only that walk: every other caller keeps the old
   split and relies on `_expand`'s group pass to read bodies.
   - `|&` is one pipe, in every split; `2>&1` is XERK-1616's `keep_redirects`, which the walk also passes.
+  - No group opens inside `${…}` (`${x#(}` is pattern text), and a group still open at the end
+    re-splits without `groups`: an unclosed "group" swallowed every later pipe (a QA regression).
+  - Producers are flattened by `_simple_commands` (recursive, groups on): a single plain split
+    cut a deep `{ { …; }; }` apart. A `{` right after an opener counts at any depth.
 - **`_reads_stdin_script` recurses** into a group/list and a `-c` script: `bash -c bash` and
   `(cat | bash)` read the stdin they inherit. Past `_MAX_EXPAND_DEPTH` it says "reads" (closed).
   - A part equal to its stage goes to `_command_reads_stdin`, never re-split: the redirect
     re-reading returns `>&1` among `>&1`'s own parts, and looping hit the cap (a false deny).
 - **An `exec`'s here-string joins the line-wide `<(…)` texts**, and a line with any of them scans
   every pipeline: `exec 3< <(…); bash <&3` has no pipe. De-duped + capped once, else O(n²).
-- **`cat`/`tac`/`tee` of only `<(…)` operands prints their texts** (`_cat_printed`), bounded by
-  `_SUBST_DEPTH`; a real file operand stays opaque.
+- **`cat`/`tac`/`tee`/`head`/`tail` of only `<(…)` operands prints their texts** (`_cat_printed`),
+  as does `< <(…)` and bash's `$(< <(…))`; redirects, `-` and `/dev/null` are skipped, a real file
+  operand stays opaque. Bounded by `_SUBST_DEPTH`.
+  - `_proc_subst_texts` is memoised per decision (`_memo("proc")`) and skips the split for a body
+    with no operator or `#`: each `cat <(` level re-split its body, 7.5x main on a deep nest.
 - **A filtered or partly-unread body gets a TAINT reading too** (XERK-1613, `_body_tainted`): the
   text its producers emit — echo/printf args, or a here-string — carried through any pass-through or
   rewriting filter (sed/tr/awk/cut/rev…) as if it passed unchanged. ADDED beside the opaque reading,

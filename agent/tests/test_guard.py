@@ -1566,7 +1566,22 @@ class TestScriptChannels(unittest.TestCase):
                     f"echo {R} | env X=<(true; true) bash", f"echo {R} | X=<(true; true) bash",
                     f"{{ echo {R}; }} | sh", f"{{ echo {R}; }} 2>&1 | sh", f"(echo {R}; true) | sh",
                     # ...and an fd an `exec` opened earlier on the line.
-                    f"exec 3< <(echo {R}); bash <&3", f"exec 3<<<'{R}'; bash /dev/fd/3"):
+                    f"exec 3< <(echo {R}); bash <&3", f"exec 3<<<'{R}'; bash /dev/fd/3",
+                    f"command exec 3<<<'{R}'; bash <&3",
+                    # ...a `cat` read with redirects, `-`, `/dev/null`, `<` or `head`,
+                    f'bash -c "$(cat <(echo {R}) 2>/dev/null)"', f'bash -c "$(cat - <(echo {R}))"',
+                    f'bash -c "$(cat < <(echo {R}))"', f'bash -c "$(< <(echo {R}))"',
+                    f'bash -c "$(cat <(echo {R}) /dev/null)"', f'bash -c "$(head -n1 <(echo {R}))"',
+                    # ...a producer nested past `_at_command_start`'s hop limit,
+                    "{ " * 6 + f"echo {R}; " + "}; " * 5 + "} | sh",
+                    # ...a reader nested past the depth cap (`_expand`'s own cap denies too),
+                    f"echo {R} | " + "(true; " * 10 + "bash" + ")" * 10,
+                    # ...and a `(` inside `${…}`, which opens no group: read as one,
+                    # it kept every later pipe whole and hid it (QA regression).
+                    f": ${{x#(}}; echo {R} | sh", f": ${{x//(/}}; sh <<< '{R}'",
+                    f": ${{x%%(*}}; echo {R} |& bash", f": ${{x#(}}; {{ echo {R}; }} | sh",
+                    f": ${{x#(}}\necho {R} | sh", f": ${{x:-$( (a; b) )}}; echo {R} | sh",
+                    f"( : ${{x#)}}; echo {R} ) | sh"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("echo hi |& cat", "make 2>&1 | tee log", "echo hi | bash -c 'grep h'",
@@ -1580,6 +1595,8 @@ class TestScriptChannels(unittest.TestCase):
                     f'jira comment X "\\`while read l; do eval \\"\\$l\\"; done < <(echo {R})\\`" 2>&1 | tail -2'):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        # Past its depth cap a stage reads as a reader: fails closed.
+        self.assertTrue(guard._reads_stdin_script("true", guard._MAX_EXPAND_DEPTH + 1))
         self.assertEqual(guard._split_segments("a |& b"), ["a", "b"])
         self.assertEqual(guard._split_on_operators("a |& b", include_pipe=False), ["a |& b"])
         self.assertEqual(guard._split_on_operators("{ a; b; } | (c; d) && e <(f; g)", groups=True),
