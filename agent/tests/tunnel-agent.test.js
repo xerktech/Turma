@@ -2955,3 +2955,61 @@ test("backscanLiveAgents: a stop in the lead-in before the window still wins", (
   mod.backscanLiveAgents(early, leadState, eb.length - (eb.indexOf("backgroundTaskId") + 600));
   assert.deepEqual(mod.liveAgentsReport(leadState), []);
 });
+
+// XERK-1587: a watch seeds from the manager's published live-agent scan, so a
+// launch further back than AGENT_BACKSCAN_BYTES still reaches the bar. The
+// snapshot here is hand-built in hub-agent.py's _publish_live_agents shape.
+test("restoreLiveAgents: seeds from the manager's snapshot and folds the gap", () => {
+  const mod = require("../tunnel-agent.js");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "live-snap-"));
+  const p = path.join(dir, "conv.jsonl");
+  const pad = JSON.stringify({ type: "user", message: { content: "x".repeat(10000) } }) + "\n";
+  // The launch's lines, then > a back-scan window of chatter.
+  fs.writeFileSync(p, pad.repeat(460));
+  const offset = fs.statSync(p).size;
+  const snap = (over = {}) => fs.writeFileSync(path.join(dir, "s1.json"), JSON.stringify({
+    v: 1, transcript: "conv.jsonl", offset,
+    liveAgents: { bsh1: { type: "shell", label: "Watch CI", resolveId: "", kind: "wait-external" } },
+    agentTasks: {}, shellCalls: {}, stoppedAgents: [], ...over }));
+  snap();
+  const fresh = () => ({ live: new Map(), tasks: new Map() });
+  let st = fresh();
+  // The bounded window alone misses it — the bug.
+  mod.backscanLiveAgents(p, st);
+  assert.deepEqual(mod.liveAgentsReport(st), []);
+  st = fresh();
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.deepEqual(mod.liveAgentsReport(st), [{ type: "shell", label: "Watch CI", kind: "wait-external" }]);
+
+  // A stop written after the snapshot's offset is applied.
+  fs.appendFileSync(p, JSON.stringify({ type: "queue-operation", operation: "enqueue", content:
+    "<task-notification>\n<task-id>bsh1</task-id>\n<status>completed</status>\n</task-notification>" }) + "\n");
+  st = fresh();
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.deepEqual(mod.liveAgentsReport(st), []);
+
+  // Revalidation: another conversation, an offset past EOF, a malformed body,
+  // a missing file or an unsafe id each refuse, leaving the back-scan.
+  for (const over of [{ transcript: "other.jsonl" }, { offset: offset * 10 }, { offset: "0" },
+                      { liveAgents: [] }, { v: 2 }]) {
+    snap(over);
+    assert.equal(mod.restoreLiveAgents("s1", p, fresh(), dir), false, JSON.stringify(over));
+  }
+  // A mid-line offset is refused (it would skip that line's fragment).
+  snap({ offset: offset - 3 });
+  assert.equal(mod.restoreLiveAgents("s1", p, fresh(), dir), false);
+  // A line still being written is left for the tail, never half-folded; forged
+  // row fields are retyped to the scan's own shape.
+  fs.appendFileSync(p, '{"type":"queue-operation","content":"<task-notification>');
+  snap({ liveAgents: { a: { type: "shell", label: "L".repeat(5000), kind: { x: 1 },
+                            startedAt: "1", eta: [1] },
+                       b: { type: 3, label: "bad" },
+                       c: { type: "general-purpose", label: "ok", kind: "wait-timed", startedAt: 5 } } });
+  st = fresh();
+  assert.equal(mod.restoreLiveAgents("s1", p, st, dir), true);
+  assert.deepEqual(mod.liveAgentsReport(st), [
+    { type: "shell", label: "L".repeat(200) },
+    { type: "general-purpose", label: "ok", kind: "wait-timed", startedAt: 5 }]);
+  assert.equal(mod.restoreLiveAgents("nope", p, fresh(), dir), false);
+  assert.equal(mod.restoreLiveAgents("../s1", p, fresh(), dir), false);
+});
