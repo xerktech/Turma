@@ -149,6 +149,14 @@ def _word_before(command: str, j: int) -> tuple[str, int]:
     return command[k + 1:j + 1], k + 1
 
 
+def _char_before(command: str, i: int) -> str:
+    """The last non-blank character before ``i`` ("" at the start)."""
+    j = i - 1
+    while j >= 0 and command[j] in " \t":
+        j -= 1
+    return command[j] if j >= 0 else ""
+
+
 def _at_command_start(command: str, i: int, hops: int = 0) -> bool:
     """Whether the word at ``i`` is where a command begins.
 
@@ -804,7 +812,72 @@ def _body_printed(body: str, raw: bool, multi: bool = True) -> tuple[str | None,
         if multi and _SEGMENT_SPLIT.search(unwrapped) else None
     if printed is None:
         printed = _printed_text(unwrapped)
+    if printed is None and "<(" in body:
+        printed = _cat_printed(body)
     return printed, _SPLICES_ESCAPED[0] - before
+
+
+# Programs that print the files they are given, unchanged.
+_CAT_PROGS = {"cat", "tac", "tee", "head", "tail"}
+# Their options that take the NEXT word as a value (`head -n 1`).
+_CAT_OPTS_WITH_VALUE = {"-n", "-c", "--lines", "--bytes"}
+
+
+def _cat_printed(body: str) -> str | None:
+    """What `cat <(…) …` prints: each `<(…)` operand's text, in order, so
+    `bash -c "$(cat <(echo <cmd>))"` runs <cmd> (XERK-1614). So does `< <(…)`,
+    with or without `cat` (`$(< <(…))`); `head`/`tail` are read as printing it
+    all. None when any operand is something else — a real file's content is
+    unknowable. `-` and `/dev/null` add nothing knowable and are skipped."""
+    texts: list[list[str]] = []
+
+    def mark(m: "re.Match[str]") -> str:
+        if not m.group(0).startswith("<("):
+            return _subst_text(m)
+        # Each level recurses through `_body_printed`; deeper reads as opaque.
+        if _SUBST_DEPTH[0] >= _MAX_SUBST_DEPTH:
+            return _OPAQUE_SUBST
+        _SUBST_DEPTH[0] += 1
+        try:
+            texts.append(_proc_subst_texts(_subst_inner(m)))
+        finally:
+            _SUBST_DEPTH[0] -= 1
+        return f"\x00turma-proc-{len(texts) - 1}"
+
+    words = _tokenize(_unwrap_group(_sub_substs(body, mark)))
+    marker = re.compile(r"\x00turma-proc-(\d+)")
+    # `$(< file)` is bash's `cat file`.
+    if words and not _REDIRECT_RE.match(words[0]):
+        words = _strip_prefixes(words)
+        if not words or _basename(words[0]) not in _CAT_PROGS:
+            return None
+        words = words[1:]
+    out = []
+    i = 0
+    while i < len(words):
+        word = words[i]
+        i += 1
+        redirect = _REDIRECT_RE.match(word)
+        if redirect:
+            target = redirect.group(1)
+            if not target and i < len(words):
+                target, i = words[i], i + 1
+            m = marker.fullmatch(target)
+            # Only an input redirect feeds the printer; any other is skipped.
+            if m and re.match(r"^\d*<(?![<>&])", word):
+                out.extend(texts[int(m.group(1))])
+            continue
+        if word in _CAT_OPTS_WITH_VALUE:
+            i += 1
+            continue
+        if (word.startswith("-") and len(word) > 1) or word in ("-", "/dev/null"):
+            continue
+        m = marker.fullmatch(word)
+        if not m:
+            return None
+        # Every text the body may print, one per line: over-reading fails closed.
+        out.extend(texts[int(m.group(1))])
+    return "\n".join(out) if out else None
 
 
 def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = False,
@@ -1440,7 +1513,7 @@ def _budgeted(fn):
         global _budget
         if _budget is not None:
             return fn(*args, **kwargs)
-        _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {},
+        _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}, "proc": {},
                    "until": time.monotonic() + _MAX_DECIDE_SECONDS}
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
@@ -2243,7 +2316,7 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
 
 
 def _split_on_operators(command: str, include_pipe: bool = True,
-                        keep_redirects: bool = False) -> list[str]:
+                        keep_redirects: bool = False, groups: bool = False) -> list[str]:
     """Split on shell operators that are NOT inside quotes.
 
     Splitting the raw string severed a quoted script mid-quote, so a shell's
@@ -2264,6 +2337,17 @@ def _split_on_operators(command: str, include_pipe: bool = True,
     - the `|` between `case` pattern alternatives: `reboot|shutdown) …` read
       as the power command `reboot`. A plain pattern is dropped, not emitted —
       it is never a command — unless it holds a substitution, which runs.
+
+    `|&` is ONE operator, a pipe that carries stderr too, and the `&` of a
+    redirection (`2>&1`, `<&3`, `&>f`) none at all: cutting either severed a
+    producer from the shell it feeds — `echo … |& bash`, `echo … 2>&1 | sh`
+    (XERK-1614).
+
+    ``groups`` keeps every `( … )`, `$( … )`, `<( … )`, `>( … )` and `{ …; }`
+    whole, as the shell does. Only the stdin-feed walk asks for it: there a
+    cut inside a group severs a producer from its reader (`{ echo …; } | sh`,
+    `echo … | X=<(a; b) bash`); every other caller relies on the group pass in
+    `_expand`, which reads bodies itself.
     """
     out: list[str] = []
     buf: list[str] = []
@@ -2278,6 +2362,8 @@ def _split_on_operators(command: str, include_pipe: bool = True,
     # is text, so `${y:- #}; rm -rf /` must not hide the `rm` as a comment, and
     # the `}` in `${a:-$(echo }) #}` closes nothing (XERK-1585).
     braces: list[str] = []
+    # With ``groups``: the open `(`/`{` groups, innermost last.
+    opened: list[str] = []
     i, n = 0, len(command)
 
     # How many leading chunks of `buf` are known blank: `buf` only grows
@@ -2338,6 +2424,21 @@ def _split_on_operators(command: str, include_pipe: bool = True,
             braces.pop()
         elif braces and ch == ")" and braces[-1] == "(":
             braces.pop()
+        # No group opens inside a `${…}`: its `(` is pattern text (`${x#(}`),
+        # and an open "group" there swallowed every pipe after it (XERK-1614).
+        elif groups and not braces and not in_pattern and ch == "(":
+            opened.append("(")
+        elif groups and not braces and opened and ch == ")" and opened[-1] == "(":
+            opened.pop()
+        elif (groups and not braces and ch == "{" and command[i + 1:i + 2] in (" ", "\t", "\n")
+              and (_char_before(command, i) in ("", "{", "(", ";", "&", "|", "\n")
+                   or _at_command_start(command, i))):
+            # A `{` right after an opener starts a command at any depth;
+            # `_at_command_start` stops after four keyword hops.
+            opened.append("{")
+        elif (groups and not braces and opened and ch == "}" and opened[-1] == "{"
+              and command[i - 1:i] in (" ", "\t", "\n", ";")):
+            opened.pop()
         elif ch == "#" and not braces and _is_comment(command, i):
             end = command.find("\n", i)
             i = n if end < 0 else end
@@ -2389,8 +2490,19 @@ def _split_on_operators(command: str, include_pipe: bool = True,
             continue
         elif case_depth and _word_at(command, i, "esac") and _esac_closes(command, i):
             case_depth -= 1
+        if opened:
+            buf.append(ch)
+            i += 1
+            continue
         if command[i:i + 2] in ("&&", "||"):
             flush()
+            i += 2
+            continue
+        if command.startswith("|&", i):
+            if include_pipe:
+                flush()
+            else:
+                buf.append("|&")
             i += 2
             continue
         if ch in (";", "\n", "&") or (include_pipe and ch == "|"):
@@ -2426,6 +2538,10 @@ def _split_on_operators(command: str, include_pipe: bool = True,
         buf.append(ch)
         i += 1
     flush()
+    if opened:
+        # A group never closed is one this scan misread, and keeping it whole
+        # would hide every operator after it: split as if ``groups`` were off.
+        return _split_on_operators(command, include_pipe, keep_redirects)
     return [seg.strip() for seg in out if seg.strip()]
 
 
@@ -2593,8 +2709,23 @@ def _proc_subst_texts(body: str, depth: int = 0) -> list[str]:
     """Every text a `<(…)` body may print: its own echo/printf, else what each
     stage of it prints and what each `<(…)` inside it does, since `cat`, `tee`
     and the like pass those through — `<(cat <(echo …))`, `<(echo … | cat)`
-    (XERK-1611). Over-reads on purpose: a reader fed too much fails closed."""
-    segments = _split_segments(_unwrap_group(body))
+    (XERK-1611). Over-reads on purpose: a reader fed too much fails closed.
+
+    Memoised per decision: `_cat_printed` reaches it once per level of a
+    `cat <(cat <(…))` nest, and each pass re-splitting every level's body made
+    a deep nest 8x slower than without it (XERK-1614)."""
+    if _budget is None:
+        return _proc_subst_texts_uncached(body, depth)
+    return list(_memo("proc", (body, depth),
+                      lambda: tuple(_proc_subst_texts_uncached(body, depth))))
+
+
+def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
+    # A body with no operator or comment character is one statement: splitting
+    # it anyway re-read every level of a deep `cat <(cat <(…))` nest (XERK-1614).
+    unwrapped = _unwrap_group(body).strip()
+    segments = (_split_segments(unwrapped) if "#" in unwrapped or _SEGMENT_SPLIT.search(unwrapped)
+                else [unwrapped] if unwrapped else [])
     printed = _body_printed(body, _SPLICE_RAW[0])[0]
     # One echo/printf prints its words; `echo …; true` does not print `; true`.
     if printed is not None and len(segments) == 1:
@@ -2621,10 +2752,150 @@ def _proc_subst_texts(body: str, depth: int = 0) -> list[str]:
     return [t for t in out if t.strip()]
 
 
-def _reads_stdin_script(stage: str) -> bool:
+def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
     """Whether the command in ``stage`` runs its stdin (or an inherited fd) as
     a SCRIPT: a shell with no `-c` and no script file (`… | sh`, `bash -s`,
-    `sh <<< '…'`), or `source`/`.` of such a path (`. <(echo …)`)."""
+    `sh <<< '…'`), `source`/`.` of such a path (`. <(echo …)`), or a shell
+    whose `-c` script holds one — the script's commands inherit the shell's
+    stdin, so `echo … | bash -c bash` and `bash -c '. /dev/stdin'` run what
+    they are fed (XERK-1614). A group or list reads if any command in it
+    does: `echo … | (cat | bash)`."""
+    if depth > _MAX_EXPAND_DEPTH:
+        return True  # a reader fed too much fails closed
+    # A part equal to the stage is read as one command, never split again: the
+    # redirect re-reading returns `>&1` among the parts of `>&1` (XERK-1616),
+    # and re-splitting it ran to the depth cap, which says "reads".
+    whole = stage.strip()
+    for part in _split_on_operators(_unwrap_group(stage), keep_redirects=True, groups=True):
+        core = _group_core(part) if part == whole else part
+        if (_command_reads_stdin(part, depth) if core is None or core == whole
+                else _reads_stdin_script(core, depth + 1)):
+            return True
+    return False
+
+
+# Words that may stand before a group without being its command, and the
+# redirections that may follow one: `do (…)`, `! (…)`, `time -p { …; }`,
+# `(…) 2>&1`.
+_GROUP_LEAD_RE = re.compile(r"\A(?:(?:do|then|else|elif|if|while|until|time|!|-p)[ \t\n]+)+")
+_TRAIL_OPS = ("<<<", "<<-", "<<", "&>>", ">>", "&>", ">&", "<&", ">|", "<>", ">", "<")
+_TRAIL_WORD_END = frozenset(" \t\n;&|()<>")
+
+
+def _only_redirects(text: str, i: int) -> bool:
+    """Whether ``text[i:]`` is nothing but redirections (`2>&1`, `>f`, `{fd}>f`,
+    `<<<w`, `<>f`, a heredoc's `<<EOF`, glued or not, quoted targets too). One greedy pass, as bash reads them: a regex for
+    this backtracked over every way to split `>a1>a1…` — exponential, past the
+    hook timeout, which fails open (XERK-1614)."""
+    n = len(text)
+    while True:
+        while i < n and text[i] in " \t":
+            i += 1
+        if i >= n:
+            return True
+        if text[i] == "{":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            if j == i + 1 or j >= n or text[j] != "}":
+                return False
+            i = j + 1
+        else:
+            while i < n and text[i].isdigit():
+                i += 1
+        op = next((o for o in _TRAIL_OPS if text.startswith(o, i)), None)
+        if op is None:
+            return False
+        i += len(op)
+        while i < n and text[i] in " \t":
+            i += 1
+        start = i
+        while i < n and text[i] not in _TRAIL_WORD_END:
+            # A quoted span is part of the word, blanks and all: `2>'a b'`. An
+            # unclosed quote is read as a plain character, as before quotes were
+            # read at all, so reading them never opens fewer groups (XERK-1614).
+            if text[i] == "'":
+                close = text.find("'", i + 1)
+                if close >= 0:
+                    i = close
+            elif text[i] == '"':
+                # ...where a backslash escapes the next character: `"a\"b"`.
+                j = i + 1
+                while j < n and text[j] != '"':
+                    j += 2 if text[j] == "\\" else 1
+                if j < n:
+                    i = j
+            elif text[i] == "\\":
+                i += 1
+            i += 1
+        if i == start:
+            return False
+
+
+def _group_core(part: str) -> str | None:
+    """The group ``part`` runs once its leading keywords and trailing
+    redirections are dropped, or None. `_unwrap_group` opens only a group that
+    IS the segment, and a group-aware split keeps `do (true; echo …)` whole,
+    so the producer inside was never read (XERK-1614)."""
+    core = _GROUP_LEAD_RE.sub("", part.strip())
+    if core[:1] not in ("(", "{"):
+        return None
+    closer = ")" if core[0] == "(" else "}"
+    # A `{fd}>x` redirect holds a `}` of its own, so of the last few closers
+    # the group's is the leftmost one followed only by redirections.
+    found, end = None, len(core)
+    for _ in range(4):
+        end = core.rfind(closer, 0, end)
+        if end < 0:
+            break
+        if _only_redirects(core, end + 1):
+            found = core[:end + 1]
+    return found
+
+
+def _walked_pipelines(command: str) -> list[str]:
+    """The pipelines the stdin-feed walk reads, each once: split keeping groups
+    whole, so `{ echo …; } | sh` stays one pipeline; split the plain way too, as
+    before groups were kept, so a group the scan keeps but cannot open (`do (a;
+    echo …) | sh`) hides nothing the plain split found; and the pipelines inside
+    a group that is a whole pipeline — `{ echo … | (a; bash); }` — down to
+    `_MAX_EXPAND_DEPTH` levels (XERK-1614)."""
+    out = dict.fromkeys(_split_on_operators(command, include_pipe=False, keep_redirects=True,
+                                            groups=True)
+                        + _split_on_operators(command, include_pipe=False, keep_redirects=True))
+    level = list(out)
+    for _ in range(_MAX_EXPAND_DEPTH):
+        inner = []
+        for pipeline in level:
+            core = _group_core(pipeline)
+            if core:
+                inner += [p for p in _split_on_operators(_unwrap_group(core), include_pipe=False,
+                                                         keep_redirects=True, groups=True)
+                          if p not in out]
+        if not inner:
+            break
+        out.update(dict.fromkeys(inner))
+        level = inner
+    return list(out)
+
+
+def _simple_commands(stage: str, depth: int = 0) -> list[str]:
+    """The simple commands in ``stage``, every group and list opened, so a
+    producer nested in groups still prints: `{ { echo …; }; } | sh`. One split
+    without groups cut a deep nest's braces apart (XERK-1614). Past
+    `_MAX_EXPAND_DEPTH` the rest is split the old way."""
+    if depth > _MAX_EXPAND_DEPTH:
+        return [_unwrap_group(seg) for seg in _split_on_operators(stage, keep_redirects=True)]
+    whole = stage.strip()
+    out = []
+    for part in _split_on_operators(_unwrap_group(stage), keep_redirects=True, groups=True):
+        core = _group_core(part) if part == whole else part
+        out.extend([part] if core is None or core == whole else _simple_commands(core, depth + 1))
+    return out
+
+
+def _command_reads_stdin(stage: str, depth: int) -> bool:
+    """`_reads_stdin_script` for one simple command (no list, no group)."""
     text = _sub_substs(stage, _proc_subst_path)
     # A `<(` left is one the (not paren-aware) split cut off from its `)`:
     # `bash < <(echo hi; echo …)` reaches here as `bash < <(echo hi`.
@@ -2652,8 +2923,11 @@ def _reads_stdin_script(stage: str) -> bool:
     if prog in ("source", "."):
         operands = [t for t in rest if not _REDIRECT_RE.match(t)]
         return bool(operands) and bool(_STDIN_SCRIPT_RE.match(operands[0]))
-    if prog not in _SHELL_PROGS or _shell_c_index(rest) >= 0:
+    if prog not in _SHELL_PROGS:
         return False
+    if _shell_c_index(rest) >= 0:
+        script = _shell_c_script(rest)
+        return bool(script) and _reads_stdin_script(script, depth + 1)
     if prog == "su":
         return True  # its operands name a USER; without `-c` the shell reads stdin
     i = 0
@@ -3146,11 +3420,28 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # not paren-aware and cut at a `|` or `;` inside one (`<(echo …; true)`).
     proc_subst_texts = [text for m in _find_substs(command) if m.group(0).startswith("<(")
                         for text in _proc_subst_texts(_subst_inner(m))] if "<(" in command else []
-    for pipeline in (_split_on_operators(command, include_pipe=False, keep_redirects=True)
-                     if feeds_a_shell else ()):
+    # ...and so is what an `exec` opens on an fd for the rest of the line:
+    # `exec 3<<<'<cmd>'; bash /dev/fd/3` (XERK-1614). Its `<(…)` is above.
+    if "<<<" in command:
+        proc_subst_texts += [hs for raw in segments
+                             if [t for t in _tokenize(raw) if t not in ("command", "builtin")][:1]
+                             == ["exec"]
+                             for hs in _herestrings(raw)]
+    # Every pipeline replays these, so de-dupe and cap them once, here: one
+    # per `exec` made a line of n of them O(n²) (XERK-1614).
+    proc_subst_texts = list(dict.fromkeys(proc_subst_texts))[:_FED_TEXT_CAP]
+    # Split keeping groups whole: a cut inside `{ echo …; }` or `X=<(a; b)`
+    # severs a producer from its reader (XERK-1614).
+    # ...and ALSO split the plain way, as before groups were kept whole: a group
+    # the scan keeps whole but cannot open (`{ (a; echo …) | sh; }`, `do (…)`)
+    # hid a pipeline the plain split cut out. Reading both, the walk finds at
+    # least what it found before; identical pipelines are walked once.
+    for pipeline in (_walked_pipelines(command) if feeds_a_shell else ()):
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
-        # feeding it either, so skip its per-stage scan too.
-        if "|" not in pipeline and "<<<" not in pipeline and "<(" not in pipeline:
+        # feeding it either, so skip its per-stage scan too — unless the line
+        # opened an fd it may read (`exec 3< <(…); bash <&3`).
+        if (not proc_subst_texts and "|" not in pipeline and "<<<" not in pipeline
+                and "<(" not in pipeline):
             continue
         producers: list[str] = []       # distinct printed/here-string texts so far
         seen_texts: set[str] = set()
@@ -3161,7 +3452,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 producers.append(text)
         for text in proc_subst_texts:
             _feed(text)
-        for stage in _split_on_operators(pipeline, keep_redirects=True):
+        for stage in _split_on_operators(pipeline, keep_redirects=True, groups=True):
             ustage = _unwrap_group(stage)
             if _reads_stdin_script(ustage):
                 fed = list(producers)
@@ -3178,8 +3469,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # This stage's own contribution to readers DOWNSTREAM of it. A
             # producer behind a prefix (`sudo echo …`, `time printf …`) still
             # prints, so strip them before reading what it emits.
-            for seg in _split_on_operators(ustage, keep_redirects=True):
-                seg = _unwrap_group(seg)
+            for seg in _simple_commands(ustage):
                 _feed(_printed_from_tokens(_strip_prefixes(_tokenize(seg))) or "")
                 # ...and with its substitutions run: tokenising first split a
                 # nested backtick at its escaped inner opener (XERK-1605).

@@ -37,6 +37,32 @@ paths:
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
   ANSI-C only to a `-c` re-parse; an even run (`\\$'…'`) is still live. A bare lookbehind bypassed.
+- **The stdin-feed walk splits with `groups=True`** (XERK-1614): a cut inside `{ echo …; }` or
+  `X=<(a; b)` severed producer from reader. Only that walk: every other caller keeps the old
+  split and relies on `_expand`'s group pass to read bodies.
+  - `|&` is one pipe, in every split; `2>&1` is XERK-1616's `keep_redirects`, which the walk also passes.
+  - No group opens inside `${…}` (`${x#(}` is pattern text), and a group still open at the end
+    re-splits without `groups`: an unclosed "group" swallowed every later pipe (a QA regression).
+  - Producers are flattened by `_simple_commands` (recursive, groups on): a single plain split
+    cut a deep `{ { …; }; }` apart. A `{` right after an opener counts at any depth.
+  - The walk reads pipelines from BOTH splits plus each whole-group pipeline's interior
+    (`_walked_pipelines`): a group kept whole but not opened (`do (a; echo …) | sh`) hid what
+    the plain split had cut out — a QA regression. Never walk the group split alone.
+  - `_group_core` opens a group behind keywords (`do`, `then`, `!`, `time`) or before trailing
+    redirections (`(…) 2>&1`); `_unwrap_group` opens only a group that IS the segment.
+  - Its trailing redirections are read by `_only_redirects`, one greedy pass from the closer. Not a
+    regex: searched it went O(n²), and anchored it split `>a1>a1…` every way — exponential.
+- **`_reads_stdin_script` recurses** into a group/list and a `-c` script: `bash -c bash` and
+  `(cat | bash)` read the stdin they inherit. Past `_MAX_EXPAND_DEPTH` it says "reads" (closed).
+  - A part equal to its stage goes to `_command_reads_stdin`, never re-split: the redirect
+    re-reading returns `>&1` among `>&1`'s own parts, and looping hit the cap (a false deny).
+- **An `exec`'s here-string joins the line-wide `<(…)` texts**, and a line with any of them scans
+  every pipeline: `exec 3< <(…); bash <&3` has no pipe. De-duped + capped once, else O(n²).
+- **`cat`/`tac`/`tee`/`head`/`tail` of only `<(…)` operands prints their texts** (`_cat_printed`),
+  as does `< <(…)` and bash's `$(< <(…))`; redirects, `-` and `/dev/null` are skipped, a real file
+  operand stays opaque. Bounded by `_SUBST_DEPTH`.
+  - `_proc_subst_texts` is memoised per decision (`_memo("proc")`) and skips the split for a body
+    with no operator or `#`: each `cat <(` level re-split its body, 7.5x main on a deep nest.
 - **A filtered or partly-unread body gets a TAINT reading too** (XERK-1613, `_body_tainted`): the
   text its producers emit — echo/printf args, or a here-string — carried through any pass-through or
   rewriting filter (sed/tr/awk/cut/rev…) as if it passed unchanged. ADDED beside the opaque reading,
@@ -129,6 +155,7 @@ paths:
   - A thread, not SIGALRM: the hook also runs on the Windows agent.
   - Residual: one C call holding the GIL (a backtracking regex) still blocks the watchdog.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
+  `test_stdin_routes_into_a_shell`, `test_stdin_route_shapes_classify_fast`,
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
   `test_a_nested_or_conditional_body_runs_as_its_producers_text`,
