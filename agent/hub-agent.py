@@ -13079,6 +13079,68 @@ _JUDGE_QUOTED_SEPS = frozenset((";", "&&", "||", "|", "&", "!", "then", "do", "e
                                 "-exec", "-execdir", "--"))
 
 
+# In a quoted command line some program may hand /bin/sh (`--to-command=…`,
+# `-c core.pager=…`), what lets a word hide from the raw never-list and the
+# lexer: an inner quote or escape (`g""it pu""sh`), an expansion, a glob
+# (`gi? pu?h`) or a brace list or range. Shell operators alone hide nothing — every
+# word stays readable — so a `-m 'feat(x): a; b'` message stays judgeable.
+_JUDGE_PAYLOAD_DISGUISE_RE = re.compile(r"['\"\\$`*?]|\[[^\]\s]+\]|\{[^}\s]*(?:,|\.\.)[^}\s]*\}")
+# Options that hand their value (or a script) to /bin/sh. They stand outright,
+# disguised or not, since the value is a command line the gate never reads.
+# Long names match any GNU-style abbreviation (`--to-com`).
+_JUDGE_SHELL_LONG_OPTS = {
+    **dict.fromkeys(("tar", "gtar", "gnutar", "bsdtar"),
+                    ("to-command", "checkpoint-action", "use-compress-program", "rsh-command",
+                     "info-script", "new-volume-script")),
+    **dict.fromkeys(("make", "gmake"), ("eval",)),
+    "zip": ("unzip-command",),
+}
+_JUDGE_SHELL_SHORT_RE = {
+    **dict.fromkeys(("tar", "gtar", "gnutar", "bsdtar"), re.compile(r"-[A-Za-z]*[IF]")),
+    **dict.fromkeys(("make", "gmake"), re.compile(r"-[A-Za-z]*E|\.?SHELL(?:FLAGS)?=")),
+    "zip": re.compile(r"-[A-Za-z]*TT"),
+}
+# git config keys whose value git runs (mostly through /bin/sh), or that pull
+# in another config file: as `-c k=v`, `--config-env=k=…` or `git config k v`.
+_JUDGE_GIT_SHELL_KEY_RE = re.compile(
+    r"(?:--config-env=)?(?:core\.(?:sshcommand|fsmonitor|editor|pager|askpass|hookspath|"
+    r"gitproxy|alternaterefscommand)|sequence\.editor|credential\.(?:\S*\.)?helper|"
+    r"diff\.(?:\S*\.)?(?:external|command)|\S*\.textconv|filter\.|merge\.\S*\.driver|"
+    r"mergetool\.|difftool\.|gpg\.(?:\S*\.)?program|pager\.|uploadpack\.packobjectshook|"
+    r"ssh\.variant|interactive\.difffilter|include\.|includeif\.|protocol\.|"
+    r"remote\.\S*\.(?:uploadpack|receivepack|vcs)|url\.)", re.IGNORECASE)
+# A GNU sed `e` command (`1e cmd`, `$e`, `e cmd`) or an `s///e` flag.
+_JUDGE_SED_EXEC_RE = re.compile(
+    r"(?:^|[;\n{}!0-9$/,])\s*e(?:[\s;}]|$)|"
+    r"(?:^|[;\n{}!0-9$\s])s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImM0-9\s]*e")
+
+
+def _judge_shell_option_reason(prog, args):
+    """Why a `prog` argument hands a command line to /bin/sh, or None."""
+    longs = _JUDGE_SHELL_LONG_OPTS.get(prog, ())
+    short = _JUDGE_SHELL_SHORT_RE.get(prog)
+    git_config = False                  # past `git config`: every word is a key or value
+    for n, w in enumerate(args):
+        v = w["value"]
+        opt = v.split("=", 1)[0]
+        if v.startswith("--") and len(v) > 2 and any(
+                o.startswith(opt[2:].lower()) for o in longs):
+            return f"{prog} {opt} runs a shell command"
+        # `tar xIf zstd a.tar`: tar's old-style first word is short options too.
+        if short and (short.match(v) or n == 0 and "tar" in prog
+                      and re.fullmatch(r"[A-Za-z]*[IF][A-Za-z]*", v)):
+            return f"{prog} {opt} runs a shell command"
+        if prog == "git":
+            prev = args[n - 1]["value"] if n else ""
+            if (git_config or prev in ("-c", "--config-env") or v.startswith("--config-env=")) \
+                    and _JUDGE_GIT_SHELL_KEY_RE.match(v.removeprefix("--config-env=")):
+                return "a git config key whose value git runs"
+            git_config = git_config or v == "config"
+        if prog in ("sed", "gsed") and _JUDGE_SED_EXEC_RE.search(v):
+            return "a sed script that runs a shell command"
+    return None
+
+
 def _judge_value_parts(text):
     """The parts of one word that could name a program: the value of a
     `name=value` (never the name — `CMD=x` is not `cmd`), split on `,`."""
@@ -13094,6 +13156,8 @@ def _judge_runs_another(w):
     executor or interpreter."""
     value = w["value"]
     if w.get("quoted") and re.search(r"\s", value):
+        if _JUDGE_PAYLOAD_DISGUISE_RE.search(value):
+            return "a quoted command line with an inner quote, escape, expansion or glob"
         prev = None
         toks = value.split()
         for n, tok in enumerate(toks):
@@ -13377,6 +13441,9 @@ def _judge_plain_reason(command):
                     break
             if hit:
                 return f"not a plain command: {hit} runs another program"
+        reason = _judge_shell_option_reason(prog, args)
+        if reason:
+            return f"not a plain command: {reason}"
         for w in args + cmd["targets"]:
             reason = _judge_runs_another(w)
             if reason:
