@@ -641,8 +641,10 @@ for _ in range(8):  # parentheses nested this deep inside one `$(…)`
 _ASSIGN_SUBST = r"\$\(" + _ASSIGN_NEST + r"\)|`[^`]*`"
 _ASSIGN_SUBST_RE = re.compile(_ASSIGN_SUBST)
 _VAR_ASSIGN_RE = re.compile(
-    r"(?:^|[;\n&|\s])"
-    r"\s*([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\s]*\])?\+?="
+    # A lookbehind, not a consumed lead-in plus `\s*`: that re-scanned a
+    # whitespace run from each of its blanks, quadratic in its length (XERK-1601).
+    r"(?<![^;\n&|\s])"
+    r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\s]*\])?\+?="
     r"(\([^()]*\)|(?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])*)"
 )
 # printf's conversions — flags, `*`/digit width, `.`/`.*`/digit precision —
@@ -1351,10 +1353,22 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
     braces: list[str] = []
     i, n = 0, len(command)
 
+    # How many leading chunks of `buf` are known blank: `buf` only grows
+    # between resets, so this scans each chunk once. Re-joining `buf` per
+    # character made a long blank pattern quadratic (XERK-1601).
+    blank_n = 0
+
     def flush() -> None:
-        nonlocal buf
+        nonlocal buf, blank_n
         out.append("".join(buf))
         buf = []
+        blank_n = 0
+
+    def buf_blank() -> bool:
+        nonlocal blank_n
+        while blank_n < len(buf) and not buf[blank_n].strip():
+            blank_n += 1
+        return blank_n == len(buf)
 
     while i < n:
         ch = command[i]
@@ -1397,7 +1411,7 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
             i = n if end < 0 else end
             continue
         if in_pattern:
-            if not "".join(buf).strip() and _word_at(command, i, "esac"):
+            if buf_blank() and _word_at(command, i, "esac"):
                 case_depth -= 1
                 in_pattern = False
                 buf.append("esac")
@@ -1405,16 +1419,19 @@ def _split_on_operators(command: str, include_pipe: bool = True) -> list[str]:
                 continue
             if ch == "(":
                 # The optional opener `(a|b)` is no extglob paren.
-                pat_parens += 1 if "".join(buf).strip() else 0
+                pat_parens += 0 if buf_blank() else 1
             elif ch == ")" and pat_parens:
                 pat_parens -= 1
             elif ch == ")":
                 in_pattern = False
-                pattern = re.sub(r"\s*\|\s*", "|", "".join(buf).strip())
+                # Split, not `\s*\|\s*`: that regex rescanned a blank run
+                # from each of its blanks (XERK-1601).
+                pattern = "|".join(alt.strip() for alt in "".join(buf).split("|"))
                 if re.search(r"\s|\$\(|`|[<>]\(", pattern):
                     flush()
                 else:
                     buf = []
+                    blank_n = 0
                 i += 1
                 continue
             elif ch == "|":
