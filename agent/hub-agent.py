@@ -397,6 +397,10 @@ PERMISSION_POLICY_FILE = os.path.join(REGISTRY_DIR, "permission-policy.md")
 # files are SESSION-WRITTEN, so they are read only via _read_untrusted_json.
 # See .claude/rules/agent-session-cli.md.
 SESSION_REQUESTS_DIR = os.path.join(REGISTRY_DIR, "session-requests")
+# The manager's published live-agent scan, one `<sessionId>.json` per session
+# (XERK-1587): what a restarted manager and a freshly armed chat watch seed from
+# instead of a bounded tail window. tunnel-agent.js reads the same files.
+LIVE_AGENTS_DIR = os.path.join(REGISTRY_DIR, "live-agents")
 # The same plain-name rule session_cli.py applies before joining an id on a path.
 SESSION_REQUEST_SID_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,63}")
 # One request file is a few hundred bytes; the CLI caps its own text fields.
@@ -9836,6 +9840,102 @@ def _backscan_live_agents(path, state):
         _scan_agent_entry(entry, state)
 
 
+# A published snapshot is re-written once its offset trails the transcript by
+# this much, even with no change to the set, so the gap a restart must re-read
+# stays small (see LIVE_SNAPSHOT_GAP_MAX).
+LIVE_SNAPSHOT_REFRESH_BYTES = 1 << 20
+# The most a restart (or a watch arming) re-reads past a snapshot's offset. A
+# longer gap — the manager down through a very chatty stretch — drops the
+# snapshot for the bounded back-scan, the documented "empty" failure direction.
+# Read once per restart, never per beat (XERK-395's budget).
+LIVE_SNAPSHOT_GAP_MAX = 1 << 24
+# A snapshot is a few bounded maps (LIVE_AGENTS_MAX * 4 entries of short rows).
+LIVE_SNAPSHOT_MAX_BYTES = 1 << 18
+# The agent-scan keys a snapshot carries — everything _scan_agent_entry reads, so
+# a launch past the offset still finds the call (its label, type) before it.
+_LIVE_SNAPSHOT_MAPS = ("liveAgents", "agentTasks", "shellCalls")
+
+
+def _live_snapshot_path(session_id):
+    if not isinstance(session_id, str) or not SESSION_REQUEST_SID_RE.fullmatch(session_id):
+        return None
+    return os.path.join(LIVE_AGENTS_DIR, f"{session_id}.json")
+
+
+def _publish_live_agents(session_id, path, offset, state):
+    """Persist the live-agent scan as of `offset` in `path` (XERK-1587), when it
+    changed or its offset fell LIVE_SNAPSHOT_REFRESH_BYTES behind. The scan
+    itself spans the whole conversation (it is incremental from the first beat),
+    so this is what lets a restart see a launch the 4 MiB back-scan cannot."""
+    target = _live_snapshot_path(session_id)
+    if not target:
+        return
+    body = {k: state.get(k) or {} for k in _LIVE_SNAPSHOT_MAPS}
+    body["stoppedAgents"] = list(state.get("stoppedAgents") or [])
+    fp = json.dumps(body, sort_keys=True)
+    last = state.get("liveSnapshot") or {}
+    if last.get("path") == path and last.get("fp") == fp \
+            and 0 <= offset - last.get("offset", 0) < LIVE_SNAPSHOT_REFRESH_BYTES:
+        return
+    # The file NAME (the conversation's id) binds it, not the full path, which
+    # the tunnel builds with its own join and need not spell identically.
+    body.update(v=1, transcript=os.path.basename(path), offset=offset)
+    try:
+        os.makedirs(LIVE_AGENTS_DIR, exist_ok=True)
+    except OSError:
+        return
+    if _write_json_replace(target, body):
+        state["liveSnapshot"] = {"path": path, "fp": fp, "offset": offset}
+
+
+def _restore_live_agents(session_id, path, state):
+    """Seed the live-agent scan from this session's published snapshot and fold
+    the bytes written since its offset, or return False to leave the caller to
+    _backscan_live_agents. Revalidated, never trusted: the snapshot must name
+    THIS conversation, its offset must still lie inside it, and the gap must be
+    re-readable (LIVE_SNAPSHOT_GAP_MAX) — every stop written while the manager
+    was down is in that gap, so a launch that ended is never resurrected. A
+    launch whose stop is NEVER written (claude itself died) is expired by
+    `_launch_tmux`, which drops the snapshot: background work dies with claude."""
+    target = _live_snapshot_path(session_id)
+    snap = _read_untrusted_json(target, LIVE_SNAPSHOT_MAX_BYTES) if target else None
+    if not isinstance(snap, dict) or snap.get("v") != 1 \
+            or snap.get("transcript") != os.path.basename(path):
+        return False
+    offset = snap.get("offset")
+    maps = [snap.get(k) for k in _LIVE_SNAPSHOT_MAPS]
+    stopped = snap.get("stoppedAgents")
+    if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0 \
+            or not all(isinstance(m, dict) for m in maps) or not isinstance(stopped, list):
+        return False
+    live = {str(k): v for k, v in maps[0].items()
+            if isinstance(v, dict) and isinstance(v.get("type"), str)
+            and isinstance(v.get("label"), str)}
+    try:
+        size = os.stat(path).st_size
+        if offset > size or size - offset > LIVE_SNAPSHOT_GAP_MAX:
+            return False
+        with open(path, "rb") as f:
+            f.seek(offset)
+            raw = f.read(size - offset)
+    except OSError:
+        return False
+    state["liveAgents"] = dict(list(live.items())[:LIVE_AGENTS_MAX])
+    state["agentTasks"] = {str(k): v for k, v in maps[1].items() if isinstance(v, str)}
+    state["shellCalls"] = {str(k): v for k, v in maps[2].items() if isinstance(v, dict)}
+    state["stoppedAgents"] = [t for t in stopped if isinstance(t, str)][-LIVE_AGENTS_MAX * 4:]
+    # The offset is a line boundary (the incremental scan only consumes whole
+    # lines), so every line here is complete but a still-being-written last one.
+    for line in raw.split(b"\n"):
+        try:
+            entry = json.loads(line)
+        except (ValueError, RecursionError):
+            continue
+        if isinstance(entry, dict):
+            _scan_agent_entry(entry, state)
+    return True
+
+
 def live_agents_report(state):
     """`state["liveAgents"]` as the heartbeat's [{type, label, kind?, startedAt?,
     eta?}] (no ids: they are internal, and the chat resolves a row back to its
@@ -13616,7 +13716,7 @@ def _write_json_replace(path, data):
         os.replace(tmp, path)
         return True
     except Exception as e:          # noqa: BLE001
-        log(f"permission judge: could not write {path}: {e}")
+        log(f"could not write {path}: {e}")
         try:
             os.unlink(tmp)
         except OSError:
@@ -15860,7 +15960,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
-    if not primed:
+    if not primed and not _restore_live_agents(session_id, newest, state):
         _backscan_live_agents(newest, state)
 
     entry = _last_entry(newest)
@@ -15916,6 +16016,7 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
                     _scan_entry_line(line, state, report)
             consumed = start + end
         offsets[newest] = consumed
+        _publish_live_agents(session_id, newest, consumed, state)
     except OSError:
         pass
     return _finish()
@@ -24123,6 +24224,7 @@ class SessionManager:
         # each caller. [A] establishes the field, the flag and the whole wire
         # path; the dsh LAUNCHER is XERK-466, which fills in _launch_dsh — the
         # swap is that method's body alone, this dispatch line stays.
+        self._forget_live_agents(sess.get("id"))
         if sess.get("agentType") == "dsh":
             self._launch_dsh(sess, resume=resume, prompt=prompt, resume_id=resume_id)
             return
@@ -24761,6 +24863,19 @@ class SessionManager:
                         os.path.join(DSH_SOCKET_DIR, f"{sid}.env"),
                         os.path.join(DSH_SOCKET_DIR, f"{sid}-prompt.txt")])
 
+    def _forget_live_agents(self, sid):
+        """Background work dies with the runtime that ran it, and a killed one
+        never writes the stop — so every (re)launch and every teardown drops the
+        session's live-agent set and its published snapshot (XERK-1587), or the
+        snapshot would carry that launch as a phantom across manager restarts."""
+        st = self.sess_state.get(sid)
+        if st:
+            st.pop("liveAgents", None)
+            st.pop("liveSnapshot", None)
+        target = _live_snapshot_path(sid)
+        if target:
+            unlink_quietly([target])
+
     def _forget_session_caches(self, sid):
         # Safety net for any teardown path that reaches here without the explicit
         # clean-kill call (kill/delete/restart do it first, so this is a no-op
@@ -24770,6 +24885,7 @@ class SessionManager:
         # here (kill/delete/restart all reach this) so it doesn't keep tailing a
         # dead session's native log (XERK-509 [Qwen C]).
         self._teardown_qwen(sid)
+        self._forget_live_agents(sid)
         self.sess_state.pop(sid, None)
         self.dsh_status.pop(sid, None)  # dsh liveness dies with the session (XERK-468)
         # Drop any peer traffic still staged for this session (XERK-476): a send

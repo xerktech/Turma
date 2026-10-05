@@ -1400,6 +1400,66 @@ function backscanLiveAgents(p, state, windowBytes = AGENT_BACKSCAN_BYTES,
   }
 }
 
+// The manager's published live-agent scan (hub-agent.py LIVE_AGENTS_DIR /
+// _publish_live_agents, XERK-1587). It spans the whole conversation, so seeding
+// from it is what lets the bar see a launch further back than the window above.
+const LIVE_AGENTS_DIR = path.join(os.homedir(), ".turma", "live-agents");
+// = hub-agent.py LIVE_SNAPSHOT_GAP_MAX / LIVE_SNAPSHOT_MAX_BYTES.
+const LIVE_SNAPSHOT_GAP_MAX = 1 << 24;
+const LIVE_SNAPSHOT_MAX_BYTES = 1 << 18;
+
+// Mirror of hub-agent.py _restore_live_agents: seed `state` from the session's
+// snapshot and fold the bytes written since its offset, or return false (the
+// caller falls back to backscanLiveAgents). Revalidated the same way: it must
+// name THIS transcript, its offset must lie inside it, the gap must be
+// re-readable.
+function restoreLiveAgents(sessionId, p, state, dir = LIVE_AGENTS_DIR) {
+  if (!sessionId || !/^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/.test(sessionId)) return false;
+  let snap, fd, buf;
+  try {
+    // nosemgrep: javascript.lang.security.audit.path-traversal.path-join-resolve-traversal.path-join-resolve-traversal
+    fd = fs.openSync(path.join(dir, `${sessionId}.json`),
+      fs.constants.O_RDONLY | (fs.constants.O_NONBLOCK || 0) | (fs.constants.O_NOFOLLOW || 0));
+    const st = fs.fstatSync(fd);
+    if (!st.isFile() || st.size > LIVE_SNAPSHOT_MAX_BYTES) return false;
+    snap = JSON.parse(fs.readFileSync(fd, "utf8"));
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+    fd = undefined;
+  }
+  const isObj = (v) => v && typeof v === "object" && !Array.isArray(v);
+  if (!isObj(snap) || snap.v !== 1 || snap.transcript !== path.basename(p)) return false;
+  const off = snap.offset;
+  if (!Number.isInteger(off) || off < 0 || !isObj(snap.liveAgents) || !isObj(snap.agentTasks)
+      || !isObj(snap.shellCalls) || !Array.isArray(snap.stoppedAgents)) return false;
+  try {
+    fd = fs.openSync(p, "r");
+    const size = fs.fstatSync(fd).size;
+    if (off > size || size - off > LIVE_SNAPSHOT_GAP_MAX) return false;
+    buf = Buffer.alloc(size - off);
+    fs.readSync(fd, buf, 0, buf.length, off);
+  } catch {
+    return false;
+  } finally {
+    if (fd !== undefined) try { fs.closeSync(fd); } catch {}
+  }
+  state.live = new Map(Object.entries(snap.liveAgents)
+    .filter(([, v]) => isObj(v) && typeof v.type === "string" && typeof v.label === "string")
+    .slice(0, LIVE_AGENTS_MAX));
+  state.tasks = new Map(Object.entries(snap.agentTasks).filter(([, v]) => typeof v === "string"));
+  state.shells = new Map(Object.entries(snap.shellCalls).filter(([, v]) => isObj(v)));
+  state.stopped = new Set(snap.stoppedAgents.filter((t) => typeof t === "string")
+    .slice(-LIVE_AGENTS_MAX * 4));
+  for (const line of buf.toString("utf8").split("\n")) {
+    let entry;
+    try { entry = JSON.parse(line); } catch { continue; }
+    if (entry && typeof entry === "object") scanAgentEntry(entry, state);
+  }
+  return true;
+}
+
 // The raw strings on one entry that could BE a `<task-notification>`: a
 // queue-operation's content, and any string/text-block message content.
 function entryTextsForScan(entry) {
@@ -2151,11 +2211,13 @@ function startWatch(sessionId, worktreePath, transcriptId) {
   if (w.dshEvents) {
     try { w.dshOffset = fs.statSync(w.dshEvents).size; } catch { /* missing */ }
   }
-  // Seed the live agents from the same window the manager's card reads, not
-  // just the per-poll tail (XERK-1421); the tail's re-fold of the same lines
-  // is idempotent.
+  // Seed the live agents from the manager's published scan (XERK-1587), else
+  // from the same window its restart back-scan reads (XERK-1421) — never just
+  // the per-poll tail; the tail's re-fold of the same lines is idempotent.
   const seedPath = sessionTranscript(worktreePath, w.transcriptId);
-  if (seedPath) backscanLiveAgents(seedPath, w.agentState);
+  if (seedPath && !restoreLiveAgents(sessionId, seedPath, w.agentState)) {
+    backscanLiveAgents(seedPath, w.agentState);
+  }
   watchers.set(sessionId, w);
   w.timer = setInterval(() => pollWatcher(sessionId), LIVE_TAIL_MS);
   armTranscriptWatch(sessionId, w);
@@ -2567,7 +2629,7 @@ if (require.main === module) {
   log(`starting; hub=${WS_BASE} name=${NAME}`);
   connectControl();
 } else {
-  module.exports = { ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, backscanLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
+  module.exports = { ttydSockPath, ttydTarget, projectSlug, newestTranscript, sessionTranscript, entryText, entryBlocks, entryRole, entryToolSource, transcriptTail, pokeHeartbeat, parsePaneLiveTurn, liveTurnDecision, parseTaskNotification, parseLocalCommand, parsePaneStatus, isStatusLine, isHintLine, isChecklistLine, cleanHint, stripActivityTail, committedDupe, resolveLiveText, parseAgentList, scanAgentEntry, backscanLiveAgents, restoreLiveAgents, liveAgentsReport, shellKind, shellTailFollow, tsMs, dshEventsPath, foldDshView, pollDshTurn,
     startWatch, stopWatch, pollWatcher, __setControlSink: (f) => { controlSink = f; },
     __setPaneCapture: (f) => { paneCapture = f || captureLiveTurn; },
     captureLiveTurn,

@@ -35,6 +35,22 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   record, `<task-notification>`/`TaskStop` on stop), **never from the TUI's footer rows** — those
   are forgeable pane content and linger ~24s past completion. Mechanics: `agent.md`.
 
+## The published live-agent set survives a restart (XERK-1587)
+
+- The manager publishes its whole-conversation scan to `~/.turma/live-agents/<sessionId>.json`
+  (`_publish_live_agents`): the live/stopped sets + call maps, bound to the transcript FILE NAME
+  and the byte offset they are true at. Rewritten on change or every 1 MiB of offset drift.
+- A restarted manager (`_restore_live_agents`) and a newly armed chat watch (`restoreLiveAgents`)
+  seed from it and fold offset→EOF, so card and bar read ONE source and a launch far older than
+  the 4 MiB back-scan stays live. Every stop written while down lies in that gap, so it applies.
+- **Revalidate, never trust**: wrong conversation, offset past EOF, gap > 16 MiB
+  (`LIVE_SNAPSHOT_GAP_MAX`) or a malformed body → the bounded back-scan (failure stays EMPTY).
+- **Expiry is the relaunch**: background work dies with the runtime and its stop is never written,
+  so `_launch_tmux` and teardown drop the snapshot AND the in-memory set
+  (`_forget_live_agents`). Remove that and a killed shell is a phantom across restarts.
+- Tests: `TestSessionReport` (`test_a_restart_sees_a_launch_older_than…` and siblings),
+  `test_a_launch_drops_the_live_agent_snapshot`, `restoreLiveAgents` in `tunnel-agent.test.js`.
+
 ## Background shells carry a `kind`; only WORK counts (XERK-1570)
 
 - A background shell row is `{type:"shell", label, kind, startedAt?, eta?}`. `kind` is classified

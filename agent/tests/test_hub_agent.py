@@ -864,6 +864,10 @@ class ProjectDirMixin:
         qpatcher = mock.patch.object(ha, "QUESTIONS_DIR", self.questions_dir)
         qpatcher.start()
         self.addCleanup(qpatcher.stop)
+        # A report given a session id publishes its live-agent snapshot (XERK-1587).
+        lpatcher = mock.patch.object(ha, "LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents"))
+        lpatcher.start()
+        self.addCleanup(lpatcher.stop)
         self.proj = os.path.join(self.tmp, ha._project_slug(self.WORKDIR))
         os.makedirs(self.proj)
 
@@ -1663,6 +1667,119 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                                 "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
                                            "<status>completed</status>\n</task-notification>"}) + "\n")
         self.assertEqual(ha.session_report(self.WORKDIR, state)["agents"], [])
+
+    # XERK-1587: the restart seeds from the manager's published snapshot, so a
+    # launch further back than AGENT_BACKSCAN_BYTES is still seen.
+    SID = "s1"
+    STOP_BSH1 = {"type": "queue-operation", "operation": "enqueue",
+                 "content": "<task-notification>\n<task-id>bsh1</task-id>\n"
+                            "<status>completed</status>\n</task-notification>"}
+
+    def _append(self, path, entries):
+        with open(path, "a") as f:
+            for e in entries:
+                f.write(json.dumps(e) + "\n")
+
+    def _chatter(self, path, n_bytes=(1 << 22) + (1 << 19)):
+        pad = {"type": "user", "message": {"content": "x" * 10000}}
+        self._append(path, [pad] * (n_bytes // 10000 + 1))
+
+    def _report(self, state):
+        return ha.session_report(self.WORKDIR, state, session_id=self.SID)
+
+    def _launch_then_restart(self, between=()):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        state = {}
+        self.assertEqual(len(self._report(state)["agents"]), 1)
+        self._chatter(path)
+        self.assertEqual(len(self._report(state)["agents"]), 1)   # still live in-process
+        self._append(path, list(between))
+        return path, self._report({})                              # a fresh manager
+
+    def test_a_restart_sees_a_launch_older_than_the_back_scan_window(self):
+        _, rep = self._launch_then_restart()
+        self.assertEqual(rep["agents"], [{"type": "shell", "label": "Watch CI",
+                                          "kind": "wait-external"}])
+        # The bounded back-scan alone (no snapshot) misses it — the bug.
+        self.assertEqual(ha.session_report(self.WORKDIR, {})["agents"], [])
+
+    def test_a_stop_written_while_the_manager_was_down_is_applied(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        state = {}
+        self._report(state)
+        self._chatter(path)
+        self._report(state)
+        # Down: the stop lands, then more than a back-scan window of chatter, so
+        # the bounded window could not see the stop either.
+        self._append(path, [self.STOP_BSH1])
+        self._chatter(path)
+        self.assertEqual(self._report({})["agents"], [])
+
+    def test_a_launch_written_while_the_manager_was_down_is_seen(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [{"type": "user", "message": {"content": "hi"}}])
+        state = {}
+        self._report(state)
+        self._append(path, SHELL_LAUNCH_ENTRIES)
+        self.assertEqual(len(self._report({})["agents"]), 1)
+
+    def test_a_snapshot_for_another_conversation_is_ignored(self):
+        path, _ = self._launch_then_restart()
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")
+        with open(snap) as f:
+            body = json.load(f)
+        body["transcript"] = "other.jsonl"
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        self.assertEqual(self._report({})["agents"], [])   # back-scan fallback
+
+    def test_an_offset_past_the_end_or_an_overlong_gap_falls_back(self):
+        path, _ = self._launch_then_restart()
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json")
+        with open(snap) as f:
+            body = json.load(f)
+        body["offset"] = os.path.getsize(path) + 1
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        self.assertEqual(self._report({})["agents"], [])
+        self._report({})   # (that fallback did not republish over the bad one)
+        with mock.patch.object(ha, "LIVE_SNAPSHOT_GAP_MAX", 0):
+            self._chatter(path, 1000)
+            self.assertEqual(self._report({})["agents"], [])
+
+    def test_a_malformed_snapshot_falls_back(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        os.makedirs(ha.LIVE_AGENTS_DIR)
+        for bad in ("[]", "{", '{"v": 1, "transcript": "s.jsonl", "offset": "0"}',
+                    '{"v": 1, "transcript": "s.jsonl", "offset": 0, "liveAgents": [],'
+                    ' "agentTasks": {}, "shellCalls": {}, "stoppedAgents": []}'):
+            with self.subTest(bad=bad):
+                with open(os.path.join(ha.LIVE_AGENTS_DIR, f"{self.SID}.json"), "w") as f:
+                    f.write(bad)
+                # The back-scan still reads the (in-window) launch.
+                self.assertEqual(len(self._report({})["agents"]), 1)
+
+    def test_an_unchanged_set_is_not_rewritten_every_beat(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        state = {}
+        self._report(state)
+        with mock.patch.object(ha, "_write_json_replace") as w:
+            self._append(path, [{"type": "user", "message": {"content": "small"}}])
+            self._report(state)
+            w.assert_not_called()
+            self._append(path, [self.STOP_BSH1])
+            self._report(state)
+            w.assert_called_once()
+
+    def test_no_session_id_publishes_nothing(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, SHELL_LAUNCH_ENTRIES)
+        ha.session_report(self.WORKDIR, {})
+        self.assertFalse(os.path.exists(ha.LIVE_AGENTS_DIR))
 
     def test_the_restart_back_scan_runs_once(self):
         path = os.path.join(self.proj, "s.jsonl")
@@ -5001,6 +5118,8 @@ class ManagerMixin:
             # Derived from REGISTRY_DIR at import; kill/delete rmtree a session's
             # request dir (XERK-1564), so it must never be the host's real one.
             ("SESSION_REQUESTS_DIR", os.path.join(self.tmp, "session-requests")),
+            # XERK-1587: every launch/teardown unlinks the session's snapshot.
+            ("LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
@@ -16413,6 +16532,20 @@ class TestLocalModelFailover(ManagerMixin, unittest.TestCase):
         out = subprocess.run(["sh", "-c", probe], stdout=subprocess.PIPE,
                              stderr=subprocess.DEVNULL, text=True).stdout
         return [ln for ln in out.splitlines() if ln.strip()]
+
+    def test_a_launch_drops_the_live_agent_snapshot(self):
+        # XERK-1587: background work dies with claude and its stop is never
+        # written, so a relaunch must not carry the old set (or its snapshot).
+        sm = self.make_manager()
+        sess = self._session(sm)
+        os.makedirs(ha.LIVE_AGENTS_DIR, exist_ok=True)
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, f"{sess['id']}.json")
+        with open(snap, "w") as f:
+            f.write("{}")
+        sm.sess_state[sess["id"]] = {"liveAgents": {"bsh1": {"type": "shell", "label": "x"}}}
+        sm._launch_tmux(sess)
+        self.assertFalse(os.path.exists(snap))
+        self.assertNotIn("liveAgents", sm.sess_state[sess["id"]])
 
     def test_local_session_launches_against_the_local_endpoint(self):
         sm = self.make_manager()
