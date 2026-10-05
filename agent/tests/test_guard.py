@@ -1575,13 +1575,31 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                     r'''bash -c "\$( { echo rm -rf /etc; } )"''',
                     r'''bash -c "\$(echo \$( (echo rm -rf /etc) ))"''',
                     r'''bash -c 'bash -c "\$( (echo rm -rf /etc) )"' ''',
-                    r'''$(echo $(echo rm -rf /etc))'''):
+                    r'''$(echo $(echo rm -rf /etc))''',
+                    # `$((…) )` is a subshell, not arithmetic: its `(` closes early.
+                    r'''bash -c "\$((echo rm -rf /etc) )"''',
+                    # A substitution inside arithmetic still runs.
+                    r'''echo $(( $(rm -rf /etc) ))''',
+                    # The same output through a variable, a pipe or a `<(…)`.
+                    r'''x=`echo \`echo rm -rf /etc\``; $x''',
+                    r'''x=`echo \`echo rm -rf /etc\``; bash -c "$x"''',
+                    r'''x=$( (echo rm -rf /etc) ); eval "$x"''',
+                    r'''echo `echo \`echo rm -rf /etc\`` | sh''',
+                    r'''source <( (echo rm -rf /etc) )''',
+                    r'''bash <(echo `echo \`echo rm -rf /etc\``)''',
+                    # `command`/`exec`/`builtin echo` print just the same.
+                    r'''$(command echo rm -rf /etc)''',
+                    r'''$( (exec echo rm -rf /etc) )'''):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # Printed, never run; and `$((…))` is arithmetic.
         for cmd in (r'''echo `echo \`echo rm -rf /etc\``''',
                     r'''echo '$( (echo rm -rf /etc) )' ''',
-                    r'''bash -c "echo \$((1+(2)))"'''):
+                    r'''bash -c "echo \$((1+(2)))"''',
+                    r'''echo $((1+$(echo 2)))''',
+                    # From the replay corpus: refused as too deep when arithmetic
+                    # was skipped whole rather than scanned into.
+                    r'''kubectl exec pod -- sh -c 'echo $(( $(echo $(echo 1)) )); echo "$(pwd)"' '''):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

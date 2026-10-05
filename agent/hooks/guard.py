@@ -440,8 +440,9 @@ def _subst_standalone(m: "re.Match[str]") -> bool:
 
 def _printed_text(command: str) -> str | None:
     """What ``command`` prints when it only prints its arguments (echo, or
-    printf rendered as printf would), else None."""
-    return _printed_from_tokens(_tokenize(command))
+    printf rendered as printf would), else None. `command echo`, `exec echo`
+    and the like print just the same."""
+    return _printed_from_tokens(_strip_prefixes(_tokenize(command)))
 
 
 def _printed_from_tokens(toks: list[str]) -> str | None:
@@ -578,7 +579,8 @@ def _find_substs(text: str) -> list[_Subst]:
     and `` \\`echo \\\\\\`echo …\\\\\\`\\` `` paired the wrong backticks —
     each ran a printed command unclassified at the next parse (XERK-1605).
     - Parens pair by depth (an escaped one is text). `$((…))` whose inner
-      `(` closes at the end is arithmetic, which bash never runs.
+      `(` closes at the end is arithmetic, which bash never runs — but the
+      substitutions inside it do, so the scan goes on into it.
     - A backtick closes the open one with the SAME backslash run before it,
       else opens another: nesting is written by escaping deeper, at any
       re-parse depth (`` `a \\`b\\`` `` and `` \\`a \\\\\\`b\\\\\\`\\` ``). Its body has
@@ -640,8 +642,10 @@ def _find_substs(text: str) -> list[_Subst]:
                 continue
             body = text[i + 2:end]
             inner = close_paren.get(i + 2) if body.startswith("(") else None
-            if not (ch == "$" and inner == end - 1):
-                out.append(_Subst(text, i, end + 1, body))
+            if ch == "$" and inner == end - 1:
+                i += 3  # arithmetic: only the substitutions inside it run
+                continue
+            out.append(_Subst(text, i, end + 1, body))
             i = end + 1
             continue
         if ch == "`" and i in tick_at:
@@ -772,7 +776,9 @@ _BRACE_RE = re.compile(r"\{([^{}\s]+)\}")
 _ASSIGN_NEST = r"[^()]*"
 for _ in range(8):  # parentheses nested this deep inside one `$(…)`
     _ASSIGN_NEST = r"(?:[^()]|\(" + _ASSIGN_NEST + r"\))*"
-_ASSIGN_SUBST = r"\$\(" + _ASSIGN_NEST + r"\)|`[^`]*`"
+# A backtick body ends at the first UNESCAPED backtick: `[^`]*` cut
+# x=`echo \`echo …\`` at the inner opener and kept only `echo` (XERK-1605).
+_ASSIGN_SUBST = r"\$\(" + _ASSIGN_NEST + r"\)|`(?:[^`\\]|\\.)*`"
 _ASSIGN_SUBST_RE = re.compile(_ASSIGN_SUBST)
 _VAR_ASSIGN_RE = re.compile(
     # A lookbehind, not a consumed lead-in plus `\s*`: that re-scanned a
@@ -983,17 +989,18 @@ def _produced_text(value: str) -> str:
     holds only its OUTPUT. Inlining the `$(…)` text instead re-classified it
     at every use, and a long line of `$x`s took minutes (XERK-1549) — past
     Claude Code's hook timeout, which lets the command through. Innermost
-    first, so `$(echo $(echo rm) …)` resolves too; bounded like the braces.
+    first: `_subst_text` resolves `$(echo $(echo rm) …)` and nested backticks
+    itself (XERK-1605). An escaped one is replaced too — the value may be
+    re-parsed, and reading it as output only ever classifies more.
     """
-    for _ in range(9):
-        new = _SUBST_RE.sub(_subst_text, value)
-        if new == value:
-            break
-        value = new
-    # ...and one whose body holds parentheses `_SUBST_RE` cannot match.
-    return _ASSIGN_SUBST_RE.sub(lambda m: _printed_text(
-        m.group(0)[2:-1] if m.group(0).startswith("$(") else m.group(0)[1:-1]
-    ) or _OPAQUE_SUBST, value)
+    out: list[str] = []
+    last = 0
+    for m in _find_substs(value):
+        out.append(value[last:m.start()])
+        out.append(_subst_text(m))
+        last = m.end()
+    out.append(value[last:])
+    return "".join(out)
 
 
 def _printf_unescape(text: str) -> str:
@@ -1733,7 +1740,7 @@ def _reads_stdin_script(stage: str) -> bool:
     """Whether the command in ``stage`` runs its stdin (or an inherited fd) as
     a SCRIPT: a shell with no `-c` and no script file (`… | sh`, `bash -s`,
     `sh <<< '…'`), or `source`/`.` of such a path (`. <(echo …)`)."""
-    tokens = _strip_prefixes(_tokenize(_SUBST_RE.sub(_proc_subst_path, stage)))
+    tokens = _strip_prefixes(_tokenize(_sub_substs(stage, _proc_subst_path)))
     # `sh<<<'…'` tokenises as one word; the program is the part before it.
     if tokens and "<" in tokens[0] and not tokens[0].startswith("<"):
         head, _, tail = tokens[0].partition("<")
@@ -2015,9 +2022,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             if _reads_stdin_script(ustage):
                 fed = list(producers)
                 fed.extend(_herestrings(ustage))
-                for m in _SUBST_RE.finditer(ustage):
+                for m in _find_substs(ustage):
                     if m.group(0).startswith("<("):
-                        printed = _printed_text(_subst_inner(m))
+                        printed = _body_printed(_subst_inner(m), _SPLICE_RAW[0])[0]
                         if printed:
                             fed.append(printed)
                 for text in fed:
@@ -2029,6 +2036,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             for seg in _split_segments(ustage):
                 seg = _unwrap_group(seg)
                 _feed(_printed_from_tokens(_strip_prefixes(_tokenize(seg))) or "")
+                # ...and with its substitutions run: tokenising first split a
+                # nested backtick at its escaped inner opener (XERK-1605).
+                _feed(_printed_text(_sub_substs(seg, _subst_text)) or "")
                 for hs in _herestrings(seg):
                     _feed(hs)
     for raw in segments:
