@@ -2324,7 +2324,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'cd "$(echo /; echo x)"; rm -rf *', "cd $(echo /; true); rm -rf *",
                     # Printed lines are lines to a shell that re-parses them.
                     'eval "$(echo true; echo rm -rf /etc)"', 'bash -c "$(echo :; echo rm -rf /etc)"',
-                    'echo "$(echo true; echo rm -rf /etc)" | bash'):
+                    'echo "$(echo true; echo rm -rf /etc)" | bash',
+                    # ...and words to an unquoted `$x`, lines to `eval "$x"`.
+                    "x=$(echo -rf; echo /etc); rm $x", "x=$(echo rm; echo -rf /etc); $x",
+                    'x=$(echo true; echo rm -rf /etc); eval "$x"'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         # A body printing nothing known stays opaque, never the empty root word.

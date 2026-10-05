@@ -539,12 +539,11 @@ def _literal(text: str) -> str:
     """``text`` escaped to read as the literal WORD bash splices in.
 
     A printed `"` closed the string around its substitution, so `echo "$(true;
-    echo '"')"; rm -rf /` read the `rm` as quoted text (XERK-1609). A printed
-    line break splits words, never commands, so it reads as a blank. A shell that
+    echo '"')"; rm -rf /` read the `rm` as quoted text (XERK-1609). A shell that
     re-parses the text (`bash -c "$(…)"`) does strip those quotes, so this is
     one reading of two, never a replacement for the plain one.
     """
-    return re.sub(r'([\\"\'`$])', r"\\\1", text).replace("\n", " ")
+    return re.sub(r'([\\"\'`$])', r"\\\1", text)
 
 
 @functools.lru_cache(maxsize=1024)
@@ -813,8 +812,8 @@ def _budgeted(fn):
         if _budget is not None:
             return fn(*args, **kwargs)
         _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}}
-        # Lives as long as the memo that may skip re-reading the values.
-        _VALUES_DIFFER[0] = False
+        # Live as long as the memo that may skip re-reading the values.
+        _VALUES_DIFFER[0] = _VALUES_LINES[0] = False
         try:
             return fn(*args, **kwargs)
         finally:
@@ -1017,10 +1016,17 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         # several statements (see `_body_printed`). Both in one list was no
         # good: `_substitute_vars` joins a name's values into ONE word list,
         # and `x=$(echo sh; true); echo P | $x` read as `sh sh; true`.
+        # Its printed lines are words to `$x` (bash word-splits them) and
+        # lines to `eval "$x"`, so the lines get a pass of their own.
         value = _dequote_value(value)
-        produced = _produced_text(value, multi=_VALUES_MULTI[0])
-        if not _VALUES_MULTI[0] and _produced_text(value) != produced:
-            _VALUES_DIFFER[0] = True
+        produced = _produced_text(value)
+        if _VALUES_MULTI[0] == 0:
+            base = _produced_text(value, multi=False)
+            _VALUES_DIFFER[0] |= produced != base
+            produced = base
+        elif _VALUES_MULTI[0] == 1:
+            _VALUES_LINES[0] |= "\n" in produced
+            produced = produced.replace("\n", " ")
         vals.setdefault(m.group(1), []).append(produced)
     for m in _FOR_IN_RE.finditer(command):
         words = [w for w in m.group(2).split() if w != "do"]
@@ -1362,8 +1368,9 @@ _SPLICE_RAW = [False]
 _SPLICES_ESCAPED = [0]
 # Set while `_expand_both` reads assigned values as several statements print
 # them; and whether any value this decision read differs that way (XERK-1609).
-_VALUES_MULTI = [False]
+_VALUES_MULTI = [0]  # 0 as main reads values; 1 as statements print them, 2 keeping lines
 _VALUES_DIFFER = [False]
+_VALUES_LINES = [False]
 
 
 def _quote_literal(value: str, state: str) -> str:
@@ -1972,12 +1979,14 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     Assigned values are read as before XERK-1609, and once more as several
     statements print them when that differs (`_assigned_values`)."""
     out = _expand_raw_too(command)
-    if _VALUES_DIFFER[0]:
-        _VALUES_MULTI[0] = True
+    for mode, needed in ((1, _VALUES_DIFFER), (2, _VALUES_LINES)):
+        if not needed[0]:
+            break
+        _VALUES_MULTI[0] = mode
         try:
             out = out + _expand_raw_too(command)
         finally:
-            _VALUES_MULTI[0] = False
+            _VALUES_MULTI[0] = 0
     return out
 
 
