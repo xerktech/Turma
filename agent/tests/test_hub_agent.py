@@ -41411,7 +41411,7 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         "zip a.zip f -T --unzip-command='g\"\"it pu\"\"sh'",
         "tar -xf a.tar --to-command='ls *'", "make --eval='x: ; ls *' x",
         "git -c core.editor='ls *' commit", "tool --x='g\\it pu\\sh origin main'",
-        "tool 'gi? pu?h origin main'", "tool '/usr/bin/g[i]t status'",
+        "tool 'gi? pu?h origin main'", "tool 'git pus{h..h} origin main'", "tool '/usr/bin/g[i]t status'",
         # ...and the known shell-handing options stand outright, disguised or not.
         "tar -xf a.tar --to-command='touch x'", "tar -xf a.tar --to-com='touch x'",
         "tar -c --checkpoint-action=exec=touch d", "tar -I 'touch x' -cf a.tar d",
@@ -41439,7 +41439,7 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
                  "git commit -m 'fix env loading for the cmd flag'",
                  "git commit -m 'feat(x): set up CI; go faster'",
                  "tar -xf a.tar", "tar -czf a.tgz d", "tar xzf a.tgz", "make -C x test",
-                 "sed -n 's/a/b/p' f", "sed -e 's/e/x/g' f", "sed -i 's/one/two/' f",
+                 "sed -n 's/a/b/p' f", "sed -e 's/e/x/g' f", "sed -i 's/one/two/' f", "sed 's/a/b/w changes.txt' f",
                  "git -c color.ui=never log", "zip -r a.zip d", "zip -T a.zip f",
                  "git config user.name", "git add filter.py pager.js",
                  "git -C x log -- include.h", "git commit -m 'fix the env loading: one, two'")

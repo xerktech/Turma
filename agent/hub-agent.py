@@ -13082,9 +13082,9 @@ _JUDGE_QUOTED_SEPS = frozenset((";", "&&", "||", "|", "&", "!", "then", "do", "e
 # In a quoted command line some program may hand /bin/sh (`--to-command=…`,
 # `-c core.pager=…`), what lets a word hide from the raw never-list and the
 # lexer: an inner quote or escape (`g""it pu""sh`), an expansion, a glob
-# (`gi? pu?h`) or a brace list. Shell operators alone hide nothing — every
+# (`gi? pu?h`) or a brace list or range. Shell operators alone hide nothing — every
 # word stays readable — so a `-m 'feat(x): a; b'` message stays judgeable.
-_JUDGE_PAYLOAD_DISGUISE_RE = re.compile(r"['\"\\$`*?]|\[[^\]\s]+\]|\{[^}\s]*,[^}\s]*\}")
+_JUDGE_PAYLOAD_DISGUISE_RE = re.compile(r"['\"\\$`*?]|\[[^\]\s]+\]|\{[^}\s]*(?:,|\.\.)[^}\s]*\}")
 # Options that hand their value (or a script) to /bin/sh. They stand outright,
 # disguised or not, since the value is a command line the gate never reads.
 # Long names match any GNU-style abbreviation (`--to-com`).
@@ -13112,7 +13112,7 @@ _JUDGE_GIT_SHELL_KEY_RE = re.compile(
 # A GNU sed `e` command (`1e cmd`, `$e`, `e cmd`) or an `s///e` flag.
 _JUDGE_SED_EXEC_RE = re.compile(
     r"(?:^|[;\n{}!0-9$/,])\s*e(?:[\s;}]|$)|"
-    r"(?:^|[;\n{}!0-9$\s])s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[^;\n}]*e")
+    r"(?:^|[;\n{}!0-9$\s])s(.)(?:\\.|(?!\1).)*\1(?:\\.|(?!\1).)*\1[gpiImM0-9]*e")
 
 
 def _judge_shell_option_reason(prog, args):
