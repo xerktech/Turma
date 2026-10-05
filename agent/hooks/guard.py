@@ -2977,8 +2977,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
 
     def _commands_feed_shell() -> bool:
         if not line_feeds_shell:
-            # Quotes and escapes joined: bash runs `bas''h` / `b\ash` as `bash`.
-            joined = re.sub(r"[\\'\"]", "", raw_commands)
+            # Quotes, escapes and line continuations joined: bash runs `bas''h`,
+            # `b\ash`, `bas$''h` and `bas\` / `h` as `bash`.
+            joined = re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", raw_commands)
             line_feeds_shell.append(any(map(_SHELL_WORD_RE.search, (raw_commands, joined))) or any(
                 _reads_stdin_grouped(st) for st in _split_segments(raw_commands)))
         return line_feeds_shell[0]

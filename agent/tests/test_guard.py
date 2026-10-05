@@ -1434,6 +1434,7 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <<EOF | (X={{ Y=')' bash) 2>')'\n{R}\nEOF",
                     f"(X=')' bas''h)<<EOF\n{R}\nEOF", f"(X=')' \"bas\"h) <<EOF\n{R}\nEOF",
                     f"(X=')' command das\\h)<<EOF\n{R}\nEOF",
+                    f"(X=')' bas\\\nh)<<EOF\n{R}\nEOF", f"(X=')' bas$''h)<<EOF\n{R}\nEOF",
                     f"(X=\"`echo \")\"`\" source /dev/stdin)<<EOF\n{R}\nEOF",
                     f"(X=\"`echo \")\"`\" . /dev/stdin)<<EOF\n{R}\nEOF",
                     f"{{\nbash\n}} < /dev/null <<EOF\n{R}\nEOF",
