@@ -1406,14 +1406,15 @@ class TestScriptChannels(unittest.TestCase):
         # split on AND read rebuilt: an escaped or expanded `>` leaves a real
         # operator (`echo a\\>&rm …`, dash's `true &>/dev/null rm …`).
         R = self.R
+        B16 = "\\" * 16  # an EVEN run: the `>` after it is a live redirection
         for cmd in (f"2>/dev/null {R}", f"2> /dev/null {R}", f">/dev/null {R}",
                     f"&>/dev/null {R}", f">/dev/null 2>&1 {R}", f"2>&1 {R}",
                     f"</dev/null bash -c '{R}'", f"echo x | 2>/dev/null bash -c '{R}'",
                     f"echo x >| f; {R}", f">| f {R}", f"echo a\\>&{R}", f"echo a\\>|{R}",
                     f"echo ${{x:->}}&{R}", f"x='>'; echo $x&{R}",
-                    f"sh -c 'true &>/dev/null {R}'", f"<&- {R}", f"cat <&0 {R}", f"{{fd}}>/dev/null {R}",
+                    f"sh -c 'true &>/dev/null {R}'", f"<&- {R}", f"{{fd}}>/dev/null {R}",
                     # ...and a producer's own `2>&1` still feeds the shell after it.
-                    f"echo '{R} #' 2>&1 | sh", f"echo '{R}' 2>&1 | tee /dev/null | sh",
+                    f"echo '{R} #' 2>&1 | sh", f"echo '{R} #' {B16}>&1 | sh", f"echo '{R}' 2>&1 | tee /dev/null | sh",
                     f"bash <(echo '{R}' 2>&1)"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)

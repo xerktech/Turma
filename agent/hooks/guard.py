@@ -1620,8 +1620,16 @@ def _split_on_operators(command: str, include_pipe: bool = True,
                 # ...except where a caller reads STAGES (the pipe-to-shell walk):
                 # there the extra segments sat between `echo … 2>&1` and `| sh`
                 # and hid the producer. An escaped `\>` is no redirection.
-                tail = "".join(buf[-16:])[:-1]
-                if (len(tail) - len(tail.rstrip("\\"))) % 2 == 0:
+                slashes, k = 0, len(buf) - 1
+                chunk = buf[k][:-1]
+                while True:
+                    stripped = chunk.rstrip("\\")
+                    slashes += len(chunk) - len(stripped)
+                    if stripped or k == 0:
+                        break
+                    k -= 1
+                    chunk = buf[k]
+                if slashes % 2 == 0:
                     buf.append(ch)
                     i += 1
                     continue
