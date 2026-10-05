@@ -1619,6 +1619,8 @@ class TestScriptChannels(unittest.TestCase):
                 self.assertAllowed(cmd)
         # Past its depth cap a stage reads as a reader: fails closed.
         self.assertTrue(guard._reads_stdin_script("true", guard._MAX_EXPAND_DEPTH + 1))
+        self.assertEqual(guard._group_core("(a)>a1>a1 2>&1 {fd}>/dev/null <<<w"), "(a)")
+        self.assertIsNone(guard._group_core("(a)>a1>a1 x"))
         self.assertEqual(guard._split_segments("a |& b"), ["a", "b"])
         self.assertEqual(guard._split_on_operators("a |& b", include_pipe=False), ["a |& b"])
         self.assertEqual(guard._split_on_operators("{ a; b; } | (c; d) && e <(f; g)", groups=True),
@@ -1634,7 +1636,10 @@ class TestScriptChannels(unittest.TestCase):
                     "echo hi | (" + "true; " * 20000 + "bash); rm -rf /",
                     # A long redirect run after a group: a searched trailing-
                     # redirect regex went O(n²), 600s at 288 KB (XERK-1614).
-                    "(echo x)" + " >a" * 96000 + " | sh; rm -rf /"):
+                    "(echo x)" + " >a" * 96000 + " | sh; rm -rf /",
+                    # ...and a glued run, where a regex split `>a1>a1…` every
+                    # way it could: exponential at two dozen redirects.
+                    "(echo x)" + ">a1" * 60000 + " x | sh; rm -rf /"):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
             self.assertLess(time.monotonic() - t, 10, cmd[:20])

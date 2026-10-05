@@ -2777,12 +2777,42 @@ def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
 # redirections that may follow one: `do (…)`, `! (…)`, `time -p { …; }`,
 # `(…) 2>&1`.
 _GROUP_LEAD_RE = re.compile(r"\A(?:(?:do|then|else|elif|if|while|until|time|!|-p)[ \t\n]+)+")
-# Matched from a fixed position only (`fullmatch(text, pos)`): searched for,
-# it rescanned from every start and a long redirect run went O(n²) — past the
-# hook timeout, which fails open (XERK-1614). Glued (`)2>x`), `{fd}>x` and
-# `<<<word` forms count too.
-_GROUP_TRAIL_RE = re.compile(
-    r"(?:[ \t]*(?:\d*|\{\w+\})(?:<<<|>>?|<|&>>?|>&|<&|>\|)[ \t]*[^\s;&|()<>]+)*[ \t]*")
+_TRAIL_OPS = ("<<<", "&>>", ">>", "&>", ">&", "<&", ">|", ">", "<")
+_TRAIL_WORD_END = frozenset(" \t\n;&|()<>")
+
+
+def _only_redirects(text: str, i: int) -> bool:
+    """Whether ``text[i:]`` is nothing but redirections (`2>&1`, `>f`, `{fd}>f`,
+    `<<<w`, glued or not). One greedy pass, as bash reads them: a regex for
+    this backtracked over every way to split `>a1>a1…` — exponential, past the
+    hook timeout, which fails open (XERK-1614)."""
+    n = len(text)
+    while True:
+        while i < n and text[i] in " \t":
+            i += 1
+        if i >= n:
+            return True
+        if text[i] == "{":
+            j = i + 1
+            while j < n and (text[j].isalnum() or text[j] == "_"):
+                j += 1
+            if j == i + 1 or j >= n or text[j] != "}":
+                return False
+            i = j + 1
+        else:
+            while i < n and text[i].isdigit():
+                i += 1
+        op = next((o for o in _TRAIL_OPS if text.startswith(o, i)), None)
+        if op is None:
+            return False
+        i += len(op)
+        while i < n and text[i] in " \t":
+            i += 1
+        start = i
+        while i < n and text[i] not in _TRAIL_WORD_END:
+            i += 1
+        if i == start:
+            return False
 
 
 def _group_core(part: str) -> str | None:
@@ -2801,7 +2831,7 @@ def _group_core(part: str) -> str | None:
         end = core.rfind(closer, 0, end)
         if end < 0:
             break
-        if _GROUP_TRAIL_RE.fullmatch(core, end + 1):
+        if _only_redirects(core, end + 1):
             found = core[:end + 1]
     return found
 
