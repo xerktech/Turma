@@ -1376,6 +1376,36 @@ class TestScriptChannels(unittest.TestCase):
         self.assertAllowed("find . -exec sh -c 'echo {}' \\;")
         self.assertAllowed("xargs -I{} sh -c 'ls {}'")
 
+    def test_the_found_path_reaches_the_script_it_runs(self):
+        """XERK-1600: find and `xargs -I` replace `{}` INSIDE an argument, and
+        `sh -c '<script>' <name> <args>` hands the script its args as `$1`…"""
+        for cmd in ("find / -maxdepth 0 -exec sh -c 'rm -rf {}' \\;",
+                    "find /etc -exec sh -c 'rm -rf \"$1\"' _ {} \\;",
+                    "find /etc -exec sh -c 'rm -rf \"${1}\"' _ {} \\;",
+                    "find /etc -exec sh -c 'rm -rf \"$@\"' _ {} +",
+                    "find /etc -exec bash -c 'for f; do :; done; rm -rf $*' sh {} +",
+                    "find /etc -exec rm -rf {}/ \\;",
+                    "find / /tmp -maxdepth 0 -exec sh -c 'rm -rf {}' \\;",
+                    "echo /etc | xargs -I{} sh -c 'rm -rf {}'",
+                    "echo /etc | xargs -I % sh -c 'rm -rf %'",
+                    "echo /etc | xargs -i sh -c 'rm -rf {}'",
+                    "echo /etc | xargs --replace=@ sh -c 'rm -rf @'",
+                    "echo /etc | xargs sh -c 'rm -rf \"$@\"' _",
+                    "sh -c 'rm -rf \"$1\"' _ /etc",
+                    "bash -lc 'rm -rf $2' a b /"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("find . -name '*.pyc' -exec sh -c 'rm -f {}' \\;",
+                    "find . -exec sh -c 'echo \"$1\"' _ {} \\;",
+                    "find build -exec sh -c 'rm -rf \"$1\"' _ {} \\;",
+                    "echo /etc | xargs -I{} sh -c 'ls {}'",
+                    "sh -c 'echo \"$1\"' _ /etc",
+                    # An escaped `$1` is text, and a missing argument is not guessed.
+                    "sh -c 'echo \\$1; rm -rf \"$3\"' _ a",
+                    "echo /etc | xargs -I{} cp {} {}.bak"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_shell_reading_its_script_from_stdin(self):
         R = self.R
         for cmd in (f"echo '{R}' | sh", f"printf '%s' '{R}' | bash",
