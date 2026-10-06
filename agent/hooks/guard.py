@@ -117,8 +117,12 @@ _SHELL_KEYWORDS = {
 _WORDLIST_HEADS = {"for", "case", "select"}
 
 # `f()` in `f() { rm -rf /etc; }`, and `x)` in a case arm. Both lead a segment
-# whose real command follows them.
-_FUNC_DEF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
+# whose real command follows them. bash (outside POSIX mode) takes any word as a
+# function name — `a-b`, `1f`, `f/g` — and zsh takes none at all: `() { …; }` is
+# an anonymous function run on the spot. A narrower name class let those headers
+# hide the body (XERK-1633). zsh even takes a quoted one — `'f g'(){ …; }` —
+# so any word ending in `()` counts: dropping one only uncovers more to read.
+_FUNC_DEF_RE = re.compile(r".*\(\)$", re.DOTALL)
 _CASE_PATTERN_RE = re.compile(r"^[^()\s]+\)$")
 
 # Interpreters whose `-c <string>` argument is a whole command line of its own.
@@ -2904,6 +2908,76 @@ def _join_continuations(segment: str) -> str:
     return "".join(out)
 
 
+# A bare `(` `)` pair, blanks allowed around and inside: in a simple command it
+# can only be a function header, so `_glue_func_parens` closes it up.
+_FUNC_PARENS_RE = re.compile(r"[ \t]*\([ \t]*\)")
+# A character that may stand in a function name: no blank, operator, quote,
+# expansion or brace.
+_FUNC_NAME_CHARS = re.compile(r"[^\s()<>|&;'\"\\`$={}]")
+
+
+def _glue_func_parens(segment: str) -> str:
+    """``segment`` with every BARE `()` header closed up to `name()`.
+
+    `()` is an operator, so the shell splits `f(){`, `f ( ) {` and `f (){` where
+    shlex does not, and read glued the header hid the body's first word
+    (XERK-1633). It is done on the raw text because shlex drops quoting: joined
+    after it, `rm -rf / '()'` read as a header and hid the `rm` (XERK-1633 QA).
+    Its result is only ever an ADDED reading (see `_expand`): a printed `()`
+    (`` rm -rf /etc `echo '()'` ``) or an extglob `@()` is bare here and is
+    no header to bash, so the unglued text is still read as well.
+    zsh's `f g () { …; }` defines every name before the `()`, so each bare word
+    there becomes a header of its own. `$(`, `<(`, `=(` and `((` stay put."""
+    if "(" not in segment:
+        return segment
+    # `f \<newline>() {` is `f () {` to the shell (XERK-1633 QA).
+    segment = _join_continuations(segment)
+    if not _FUNC_PARENS_RE.search(segment):
+        return segment
+    states = _quote_states(segment)
+
+    def bare(i: int) -> bool:
+        return not states[i] and bool(_FUNC_NAME_CHARS.match(segment[i]))
+
+    out, last = [], 0
+    for m in _FUNC_PARENS_RE.finditer(segment):
+        open_at = segment.index("(", m.start())
+        close_at = m.end() - 1
+        before = segment[m.start() - 1] if m.start() else ""
+        if (before and before in "$<>=(") or segment[close_at + 1:close_at + 2] == ")":
+            continue
+        if states[open_at] or states[close_at] or m.start() < last:
+            continue
+        # The name glued to the `()`, then any further bare names before it.
+        name_at = m.start()
+        while name_at > last and bare(name_at - 1):
+            name_at -= 1
+        names, pos = [], name_at
+        while True:
+            gap = pos
+            while gap > last and segment[gap - 1] in " \t":
+                gap -= 1
+            word = gap
+            while word > last and bare(word - 1):
+                word -= 1
+            if gap == pos or word == gap or (
+                    word > 0 and segment[word - 1] not in " \t\n;&|(){}"):
+                break
+            if segment[word:gap] in _SHELL_KEYWORDS or segment[word:gap] == "function":
+                break
+            names.append(segment[word:gap])
+            pos = word
+        out.append(segment[last:pos])
+        out.extend(name + "() " for name in reversed(names))
+        # Idempotent: a glued header is left as it is, so the reading
+        # `_expand` adds settles in one step.
+        after = segment[m.end():m.end() + 1]
+        out.append(segment[name_at:m.start()] + ("()" if not after or after.isspace() else "() "))
+        last = m.end()
+    out.append(segment[last:])
+    return "".join(out)
+
+
 @functools.lru_cache(maxsize=512)
 def _tokenize_cached(segment: str) -> tuple[str, ...]:
     segment = _join_continuations(segment)
@@ -2954,6 +3028,12 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             out.pop(0)
             if out:
                 out.pop(0)  # the function's name
+            # zsh's `function f g { …; }` names several; drop them up to the
+            # body's opener — only when one follows, or the body's own words go.
+            opener = next((i for i, t in enumerate(out)
+                           if t in ("{", "(") or "()" in t), None)
+            if opener is not None:
+                del out[:opener]
             continue
         if head in _WORDLIST_HEADS:
             out.pop(0)
@@ -3866,6 +3946,17 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     for raw in segments:
         if every_cd != cwds:
             cwds = _cd_readings(raw, cwds)
+        # Function headers closed up (`f ( ) {` → `f() {`), as one more ADDED
+        # reading: in place, an extglob `@()`, or a `()` the guard itself
+        # splices in from a printed `` `echo '()'` ``, read as a header and hid
+        # the command before it. Off the RAW segment, before any substitution
+        # is spliced in, and per segment: re-reading the whole line doubled
+        # the work at every nesting level (XERK-1633 QA).
+        glued = _glue_func_parens(raw)
+        if glued != raw:
+            _spend(len(raw))
+            out.extend(_expand_segments(
+                glued, depth if _glue_func_parens(glued) == glued else depth + 1, cwds))
         if suspect:
             # The group scan lost track, so a body it should have found may
             # sit here split in half (see _balanced_groups): classify the

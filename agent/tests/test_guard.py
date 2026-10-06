@@ -254,6 +254,19 @@ BYPASS_DESTRUCTIVE = [
     'eval "$(echo rm -rf /etc)"',
     # A function body, and a case arm, each lead with a token of their own.
     "f() { rm -rf /etc; }; f",
+    # `()` is an operator: glued or spaced, the header still ends at it (XERK-1633).
+    "f(){ rm -rf /etc; }; f", "f ( ) { rm -rf /etc; }; f", "f () { rm -rf /etc; }; f",
+    "f( ) { rm -rf /etc; }; f", "f (){ rm -rf /etc; }; f",
+    # Any word names a bash function; zsh takes several names, or none.
+    "a-b(){ rm -rf /etc; }; a-b", "1f () { rm -rf /etc; }; 1f", "f/g(){ rm -rf /etc; }; f/g",
+    "() { rm -rf /etc; }", "f g () { rm -rf /etc; }; g", "f g(){ rm -rf /etc; }; g",
+    "f+(){ rm -rf /etc; }; f+", "function f g { rm -rf /etc; }; g",
+    # A QUOTED `()` is an argument, never a header, so the command still shows.
+    "rm -rf /etc '()'", 'rm -rf /etc "(){"', "rm '()' -rf /etc", "rm -rf /etc \\(\\)",
+    "rm -rf /etc $'()'", "sudo rm -rf /etc x'()'", "find / -delete '()'",
+    # ...nor a printed one, nor an extglob: both are bare only to the guard.
+    "rm -rf /etc `echo '()'`", 'sudo rm -rf /etc `echo "()"`', "rm -rf /etc @()",
+    "shopt -s extglob\nrm -rf /etc !()",
     "case x in x) rm -rf /etc;; esac",
     # The loop variable is assigned by the very command that uses it.
     "for d in /etc; do rm -rf $d; done",
@@ -954,6 +967,28 @@ class TestParserGaps(unittest.TestCase):
     def assertAllowed(self, cmd):
         self.assertIsNone(guard.is_destructive(cmd), cmd)
 
+    def test_a_function_header_in_any_spelling_leads_to_its_body(self):
+        # XERK-1633: `()` is an operator, so a continuation can split the
+        # header, and zsh takes a quoted name.
+        R = self.R
+        for cmd in (f"f \\\n() {{ {R}; }}; f", f"f (\\\n) {{ {R}; }}; f",
+                    f"x=1; f \\\n(){{ {R}; }}; f", f"'f g'(){{ {R}; }}; 'f g'",
+                    f'"f g"(){{ {R}; }}', f"f\\ g () {{ {R}; }}", f"'f;g'(){{ {R}; }}",
+                    # A printed `()` in the body is an argument, not a header.
+                    f"f(){{ {R} `echo '()'`; }}; f", f"f () {{ {R} $(echo '()'); }}; f"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # An assignment's or a substitution's parens are no header.
+        for text in ("a=( ); x $( ) <( ) =( )", "(( ))", "echo '()' \"()\""):
+            with self.subTest(text=text):
+                self.assertEqual(guard._glue_func_parens(text), text)
+        # A script of many small functions is still read whole, not refused as
+        # too large: the closed-up reading is per segment (XERK-1633 QA).
+        script = "\n".join(f"f{i}(){{ echo {i} | grep -q x || mkdir -p /tmp/d{i}; }}"
+                            for i in range(300))
+        self.assertAllowed(f"bash <<'EOF'\n{script}\nEOF")
+        self.assertAllowed(script)
+
     def test_an_unquoted_heredoc_body_runs_its_substitutions(self):
         R = self.R
         for cmd in (f"cat <<EOF\n$({R})\nEOF", f"cat <<EOF\n`{R}`\nEOF",
@@ -1209,6 +1244,7 @@ class TestProducedScripts(unittest.TestCase):
                     "f() { { :; }; rm -rf *; }; cd /; f",
                     "f() { for i in 1; do :; done; rm -rf *; }; cd /; f",
                     "function f { rm -rf *; }; cd /; f", "f() ( rm -rf * ); cd /; f",
+                    "f(){ rm -rf *; }; cd /; f", "f ( ) { rm -rf *; }; cd /; f",
                     "f() { echo ${x}; rm -rf *; }; cd /; f",
                     "f() { echo $(date); rm -rf *; }; cd /; f",
                     "for i in 1 2; do (rm -rf *); cd /; done",
