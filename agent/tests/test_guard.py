@@ -2906,7 +2906,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # A body printing nothing known stays opaque, never the empty root word.
         for cmd in ('rm -rf "$(cd x; mktemp -d)"', 'echo "$(git rev-parse HEAD; echo ok)"',
                     "x=$(true; echo hi); echo $x", 'rm -rf "$(mktemp -d | tr -d x)"',
-                    'rm -rf "$dir"/*', "ls ${dir}/sub", "$R format --check .",
+                    'rm -rf "$dir"/out', "ls ${dir}/sub", "$R format --check .",
                     'rm -rf "$repo".git', 'rm -rf ./"${name}".git'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
@@ -3058,6 +3058,72 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         self.assertLess(time.time() - start, 30)
 
+    def test_an_unset_name_leading_a_target_is_read_empty(self):
+        # XERK-1639: bash reads an unset leading name as empty, so `"$x"/etc`
+        # deletes /etc. Only a protected remainder denies: `"$build"/out`
+        # reads `/out`, an ordinary root child, and stays allowed.
+        for cmd in ("rm -rf $x/etc", 'rm -rf "$x"/etc', "rm -rf ${x}/usr", "rm -rf ${x}${y}/etc",
+                    'rm -rf "$STEAMROOT/"*', 'rm -rf "$dir"/*', "rm -rf $x/", 'rm -rf "$x"/home',
+                    'rm -rf "$out"/.',
+                    'chmod -R 777 "$x"/etc', 'chown -R me "$x"/usr',
+                    # The name is found before normpath folds `$x/..` away.
+                    'rm -rf "$x"/../etc', "rm -rf $x/a/../../etc", 'rm -rf "$x"/../*', "rm -rf $x/..",
+                    # An operator leaves it empty too, unless it supplies a word.
+                    'rm -rf "${dir%/}"/*', 'rm -rf "${STEAMROOT%/}/"*', "rm -rf ${x#./}/etc",
+                    "rm -rf ${x:+$x}/etc", "rm -rf ${x/a/b}/etc", "rm -rf ${x:0:3}/etc",
+                    "rm -rf ${!x}/etc", "rm -rf ${x[0]}/etc", "rm -rf ${x[@]}/etc", "rm -rf ${x:-}/etc",
+                    # A nested `${…}` is one expansion, and an all-names default is empty too.
+                    'rm -rf "${x:+${y}}"/etc', 'rm -rf "${x:-${y}}"/etc', 'rm -rf "${x:-"${y}"}"/etc',
+                    'rm -rf "${x:-${y%/}}"/etc', "rm -rf ${x:+${y}}/*", 'rm -rf "${y}${x:+${y}}"/etc'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ('rm -rf "$build"/out', "rm -rf $x/tmp/foo", 'rm -rf "$d".bak',
+                    # The rest is read as written, never with XERK-1623's trailing names
+                    # dropped too: `"$a/$b"` read fully empty is XERK-1652's call.
+                    'rm -rf "$TMP/$x"', 'rm -rf "$x"/$y/',
+                    'rm -rf "$x"*', "rm -rf $HOME/etc", "rm -rf $PWD/usr", "rm -rf ${HOME%/}/etc",
+                    'rm -rf ./"$x"/etc', 'rm -rf "./$x/etc"', "rm -rf ${#x}/etc",
+                    # Assigned, defaulted or `:?`-guarded names are never empty.
+                    "x=/tmp; rm -rf $x/etc", 'd=$(mktemp -d); rm -rf "$d"/*',
+                    'rm -rf "${x:-/tmp}"/etc', "rm -rf ${x:-a}/etc", 'rm -rf "${x:?}"/etc',
+                    "rm -rf ${x-a}/etc", "rm -rf ${x:=a}/etc", 'rm -rf "${x:-${y}/b}"/etc',
+                    'chmod -R 755 "$x"/out',
+                    # Positionals are often bound where the guard cannot see it.
+                    "rm -rf $0/etc", "bash -c 'rm -rf \"$1\"/*' _ /tmp/x",
+                    "find /tmp/x -type d -exec sh -c 'rm -rf \"$1\"/*' _ {} \\;",
+                    'clean() { rm -rf "$1"/*; }; clean /tmp/build'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_leading_names_are_one_run_and_scan_linearly(self):
+        # XERK-1639: every name in the run is read empty, not just the first,
+        # and an unclosed `${` stops the scan instead of backtracking (QA).
+        self.assertEqual(guard._leading_names_end("$a${b%/}/etc"), len("$a${b%/}"))
+        self.assertEqual(guard._leading_names_end("$a${b:-c}/etc"), 0)
+        self.assertEqual(guard._leading_names_end("${x:-${HOME}}/etc"), 0)
+        for word in ("${HOME%/}", "${HOME#/}", "${HOME:+x}", "${HOME+x}", "${HOME:-}", "${HOME-x}",
+                     "${HOME^^}", "${HOME,,}", "${HOME@Q}", "${HOME:?}"):
+            with self.subTest(word=word):
+                self.assertEqual(guard._leading_names_end(word + "/etc"), 0)
+        # ...but an operator can still empty an always-set name (QA pass 4).
+        for word in ("${x:-${HOME:+}}", "${x:-${HOME+}}", "${x:-${y:+$HOME}}", "${x:-${y:+${HOME}}}",
+                     "${x:-${HOME#$HOME}}", "${x:-${HOME:0:0}}", "${x:-${PWD:+}}", "${x:=${HOME:+}}",
+                     "${HOME:+}", "${HOME#$HOME}", "${PWD:0:0}", "${HOME/*/}", "${HOME%%*}",
+                     "${HOME+}", "${HOME+$y}", "${x:-$HOMEDIR}", "${HOME[1]}", "${PWD[1]}",
+                     "${HOME#/root}", "${HOME%root}", "${HOME/root}", "${HOME:1}"):
+            with self.subTest(word=word):
+                self.assertEqual(guard._leading_names_end(word + "/etc"), len(word))
+        for depth in (2, 17, 30):
+            with self.subTest(depth=depth):
+                word = "${a:-" * depth + "${y}" + "}" * depth
+                self.assertEqual(guard._leading_names_end(word + "/etc"), len(word))
+        start = time.monotonic()
+        self.assertEqual(guard._leading_names_end("${a}" * 20000 + "x"), 0)
+        self.assertLess(time.monotonic() - start, 1)
+        start = time.monotonic()
+        self.assertEqual(guard._leading_names_end("${" + "a" * 200000), 0)
+        self.assertLess(time.monotonic() - start, 1)
+
     def test_a_sibling_or_an_empty_expansion_does_not_hide_the_command(self):
         # XERK-1615: a sibling substitution printing a quote decided the one
         # reading of the whole segment, and an expansion that may be EMPTY was
@@ -3177,14 +3243,15 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'rm -rf /etc${x:-"${y}"}'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
-        # A harmless prefix, a whole-word or LEADING name, a default that prints
+        # A harmless prefix, a whole-word name, a leading one before a plain path
+        # (a leading one before `/*` or `/.` is XERK-1639's), a default that prints
         # text, a length, and a tilde prefix bash leaves unexpanded (`~$USER`).
         for cmd in ("rm -rf /tmp/build$x", 'rm -rf "$d"', 'rm -rf "$dir"/build',
                     "rm -rf build$x", "rm -rf ./$x", 'rm -rf "$TMP/$x"',
                     "rm -rf /${DIR:-build}", "rm -rf /etc${x:-foo}", "rm -rf /etc${#x}",
                     "rm -rf ~$USER", "rm -rf ~$USER/build", "d=build; rm -rf /tmp/$d",
-                    "rm -f /etc$x", 'rm -rf ./"${name}".git', "rm -rf /$x/build", "rm -rf build$x.bak", 'rm -rf "$out"/.',
-                    'rm -rf "$dir"/*', "rm -rf /tmp/$x/*", "rm -rf build$x*.bak",
+                    "rm -f /etc$x", 'rm -rf ./"${name}".git', "rm -rf /$x/build", "rm -rf build$x.bak",
+                    "rm -rf /tmp/$x/*", "rm -rf build$x*.bak",
                     "rm -rf ./$x*.log", "rm -rf /tmp/$x*foo"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")

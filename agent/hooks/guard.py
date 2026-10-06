@@ -5138,8 +5138,8 @@ def _trailing_unset_dropped(tok: str) -> str | None:
     return "".join(pieces)
 
 
-def _is_dangerous_path(tok: str) -> bool:
-    dropped = _trailing_unset_dropped(tok)
+def _is_dangerous_path(tok: str, trailing: bool = True) -> bool:
+    dropped = _trailing_unset_dropped(tok) if trailing else None
     if dropped is not None and _is_dangerous_path(dropped):
         return True
     raw = _norm_path(tok)
@@ -5214,6 +5214,98 @@ def _is_home_ssh(tok: str) -> bool:
     return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent)))
 
 
+# A target that STARTS with names: by here every name this line assigns or
+# defaults is substituted, so these are unknown, and bash reads an unset one as
+# empty — `rm -rf "$x"/etc` deletes /etc (XERK-1639). Only a name directly
+# before a `/` counts, so `"$x"*` and `"$x".bak` stay relative. A `${…}` with an
+# operator is empty too (`"${dir%/}"/*`, `${x:+$x}/etc`), unless it is a length
+# or supplies a non-empty default or error (`${x:-a}`, `${x:?}`).
+_PLAIN_NAME_RE = re.compile(r"\$([A-Za-z_]\w*)")
+# The name opening a `${…}` body: `x`, `!x`, `x[0]`. A `#` (length) never matches.
+_BRACED_NAME_RE = re.compile(r"!?([A-Za-z_]\w*)(?:\[[^\]{}]*\])?")
+_EXPANSIONS_RE = re.compile(r"\$\{[^{}]*\}|\$[A-Za-z_]\w*")
+# Set in every shell an agent runs, so never read empty: `$HOME/.cache` is not `/.cache`.
+# Positionals (`$1`, `$@`) are left out on purpose: inside `bash -c '…' _ /tmp/x`,
+# `find -exec sh -c` or a function they are bound, which this check cannot see.
+_ALWAYS_SET_NAMES = {"HOME", "PWD"}
+_ALWAYS_SET_RE = re.compile(r"\$(?:HOME|PWD)(?!\w)|\$\{(?:HOME|PWD)\}")
+
+
+def _only_expansions(word: str) -> bool:
+    """True if ``word`` is nothing but quotes, blanks and names, so it can be
+    empty too: the default in `${x:-${y}}` or `${x:-"$y"}`."""
+    # A bare always-set name is text; under an operator (`${HOME:+}`,
+    # `${y:+$HOME}`) it can still be empty, so it is only kept as a letter.
+    word = _ALWAYS_SET_RE.sub("H", word.replace('"', "").replace("'", ""))
+    for _ in range(16):  # one pass per nesting level; deeper reads as empty
+        word, n = _EXPANSIONS_RE.subn("", word)
+        if not n:
+            return not word.strip()
+    return True
+
+
+def _empties_a_set_path(op: str) -> bool:
+    """Whether `${HOME<op>}` can be empty though HOME holds a path. Only the
+    operators that cannot are listed: a default or `?` (unused, HOME is set),
+    a case change or `@` transform, and stripping one `/`. Any other pattern
+    can match the whole path, a literal one too (`${HOME#/root}`)."""
+    if op[:2] == ":+" or op[:1] == "+":
+        return _only_expansions(op[2 if op[0] == ":" else 1:])
+    return not (op == "" or op[:1] in ("-", "=", "?", "^", ",", "@")
+                or op[:2] in (":-", ":=", ":?") or op in ("%/", "#/"))
+
+
+def _leading_names_end(raw: str) -> int:
+    """Where the run of possibly-empty names opening ``raw`` ends, if a `/`
+    follows it, else 0. A `${…}` is closed by `_brace_end`, so a nested one
+    (`${x:+${y}}`) is one expansion, and an unclosed one stops the scan."""
+    pos = 0
+    while raw.startswith("$", pos):
+        if m := _PLAIN_NAME_RE.match(raw, pos):
+            name, op, end = m.group(1), "", m.end()
+        elif raw.startswith("${", pos):
+            # Unquoted: the token is dequoted, and looking its quotes up rescans
+            # the whole word per `${`, quadratic in a run of names (QA).
+            close = _brace_end(raw, pos, False)
+            head = _BRACED_NAME_RE.match(raw, pos + 2, close) if close > 0 else None
+            if head is None:
+                return 0
+            name, op, end = head.group(1), raw[head.end():close], close + 1
+            if head.group(0) != name:
+                name = ""  # `${HOME[1]}` and `${!HOME}` are not HOME's value
+        else:
+            return 0
+        # `?` errors and a default or assigned word is used; only an empty one
+        # leaves it empty. HOME and PWD are set, so only another operator
+        # (`${HOME:+}`, `${HOME#$HOME}`) can empty them.
+        body = op[1:] if op.startswith(":") else op
+        if body[:1] == "?" or (body[:1] in ("-", "=") and not _only_expansions(body[1:])):
+            return 0
+        if name in _ALWAYS_SET_NAMES and not _empties_a_set_path(op):
+            return 0
+        pos = end
+    return pos if raw.startswith("/", pos) else 0
+
+
+def _dangerous_target(tok: str) -> str | None:
+    """Why ``tok`` names a protected path, or None. Besides the target as
+    written, its leading unknown names are read as empty, but that reading is
+    judged by `_is_dangerous_path` like any other: `"$build"/out` reads `/out`,
+    an ordinary root child, and stays allowed (owner decision on XERK-1639).
+    The names are found before `_norm_path`, whose normpath folds `$x/../etc`
+    into `etc` and `./$x/etc` into `$x/etc`."""
+    if _is_dangerous_path(tok):
+        return f"({tok!r})"
+    raw = tok.strip().strip('"').strip("'")
+    end = _leading_names_end(raw)
+    # The rest is judged as written: reading its trailing names empty as well
+    # (XERK-1623) would read `"$TMP/$x"` as `/`. That also leaves `$x/etc$y`
+    # (both ends empty) allowed; both are XERK-1652's call.
+    if end and _is_dangerous_path(raw[end:], trailing=False):
+        return f"({tok!r}, which is {_norm_path(raw[end:])!r} when {raw[:end]} is unset)"
+    return None
+
+
 def _rm_is_recursive(flags: str) -> bool:
     """`-r` alone already deletes a tree.
 
@@ -5243,8 +5335,11 @@ def _destructive_rm(tokens: list[str]) -> str | None:
     if prog == "rm" and not _rm_is_recursive(flags):
         return None
     for tgt in targets:
-        if _is_dangerous_path(tgt) or _is_home_ssh(tgt):
+        if _is_home_ssh(tgt):
             return f"refusing recursive delete of a protected path ({tgt!r})"
+        why = _dangerous_target(tgt)
+        if why:
+            return f"refusing recursive delete of a protected path {why}"
     return None
 
 
@@ -5663,8 +5758,9 @@ def _destructive_chmod_chown(tokens: list[str]) -> str | None:
     for tok in tokens[1:]:
         if tok.startswith("-"):
             continue
-        if _is_dangerous_path(tok):
-            return f"refusing recursive {prog} on a protected path ({tok!r})"
+        why = _dangerous_target(tok)
+        if why:
+            return f"refusing recursive {prog} on a protected path {why}"
     return None
 
 
