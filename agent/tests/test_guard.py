@@ -1245,6 +1245,10 @@ class TestProducedScripts(unittest.TestCase):
                     "ls ${a:-${b#x}}", 'a="${x:-${y:-ls}}"; $a'):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        # Each level charges only its own growth: re-charging the inner
+        # splice per level denied a benign large value as "too large" (QA).
+        big = 'x="' + "A" * 150_000 + '"; echo "' + "${a:-" * 4 + "${x}" + "}" * 4 + '"'
+        self.assertAllowed(big)
         # A quoted `}` still keeps the expansion one word (XERK-1585).
         self.assertEqual(guard._substitute_vars("${a:-'}' #}", {}), "${a:-'}' #}")
         self.assertEqual(guard._substitute_vars("${x:-${y:-$(echo P)}}", {}), "$(echo P)")

@@ -2487,6 +2487,8 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             _SPLICES_ESCAPED[0] += 1
             return m.group(0), m.end()
         rest, end = m.group(2) or "", m.end()
+        # What the splice replaces: the inner uses already charged their own growth.
+        replaced = end - m.start()
         if m.group(1):
             close = _brace_end(command, m.start(), states[m.start()] == '"')
             if close != end - 1:
@@ -2505,6 +2507,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                     raise _ExpansionTooLarge
                 rest = sub(m.start() + 2 + len(m.group(1)), close, depth + 1)
                 end = close + 1
+                replaced = 3 + len(m.group(1)) + len(rest)
         name = m.group(1) or m.group(3) or ""
         got = vals.get(name)
         op = _VAR_OP_RE.match(rest)
@@ -2533,7 +2536,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 out = _dq_default(out)
         else:
             return command[m.start():end], end
-        _spend(len(out) - (end - m.start()))
+        _spend(len(out) - replaced)
         return out, end
 
     def sub(lo: int, hi: int, depth: int) -> str:
