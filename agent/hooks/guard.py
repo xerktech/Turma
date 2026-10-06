@@ -4471,14 +4471,8 @@ def _command_reads_stdin_as(stage: str, depth: int) -> bool:
         # is only positional params, so that is not a read (XERK-1628). But a
         # replace-string (`-I@`/`-i`/`--replace`) substitutes the text INTO the
         # command, so `-I@ sh -c '@'` IS a read.
-        inner = list(rest)
-        replace = False
-        while inner and inner[0].startswith("-") and len(inner[0]) > 1:
-            opt = inner.pop(0)
-            if opt in ("-I", "-i", "--replace") or opt.startswith(("-I", "-i", "--replace=")):
-                replace = True
-            if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
-                inner.pop(0)
+        cut, replstr = _xargs_options(rest)
+        inner, replace = rest[cut:], bool(replstr)
         if inner and _basename(inner[0]) in _SHELL_PROGS:
             r2 = inner[1:]
             return replace or (_shell_c_index(r2) >= 0 and not _shell_c_script(r2))
@@ -4552,8 +4546,47 @@ def _basename(prog: str) -> str:
 _XARGS_OPTS_WITH_VALUE = {
     "-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a",
     "--max-args", "--max-lines", "--max-procs", "--max-chars",
-    "--delimiter", "--arg-file",
+    "--delimiter", "--arg-file", "--process-slot-var",
 }
+# xargs short options taking a REQUIRED value (attached or the next word), and
+# those whose OPTIONAL value must be attached (`-i{}`, `-l2`, `-eEOF`).
+_XARGS_SHORT_VALUE = set("adEILnPs")
+_XARGS_SHORT_OPTIONAL = set("eil")
+
+
+def _xargs_options(rest: list[str]) -> tuple[int, str]:
+    """Where xargs' own options end in ``rest`` (the index of its command)
+    and the replace-string they set ("" for none). Short options CLUSTER as
+    getopt reads them: `-rn 1` is `-r -n 1` and `-0I {}` is `-0 -I {}`, so a
+    walk taking a cluster as one word put `1` or `{}` in command position and
+    `xargs -rn 1 rm -rf /` classified a program named `1` (XERK-1649)."""
+    i, replstr = 0, ""
+    while i < len(rest) and rest[i].startswith("-") and len(rest[i]) > 1:
+        opt = rest[i]
+        i += 1
+        if opt == "--":
+            break
+        if opt.startswith("--"):
+            name, eq, val = opt.partition("=")
+            if name == "--replace":
+                replstr = val or "{}"
+            elif not eq and name in _XARGS_OPTS_WITH_VALUE and i < len(rest):
+                i += 1
+            continue
+        for k, c in enumerate(opt[1:], 1):
+            attached = opt[k + 1:]
+            if c in _XARGS_SHORT_VALUE:
+                if not attached and i < len(rest):
+                    attached = rest[i]
+                    i += 1
+                if c == "I":
+                    replstr = attached
+                break
+            if c in _XARGS_SHORT_OPTIONAL:
+                if c == "i":
+                    replstr = attached or "{}"
+                break
+    return i, replstr
 
 
 def _shell_c_index(rest: list[str]) -> int:
@@ -4605,10 +4638,7 @@ def _raw_shell_c_scripts(kept: list[str], depth: int = 0) -> list[str]:
         return [] if script is None else _raw_script_texts(script)
     runs: list[list[str]] = []
     if prog == "xargs":
-        i = 1
-        while i < len(kept) and kept[i].startswith("-"):
-            i += 1 + ("=" not in kept[i] and kept[i] in _XARGS_OPTS_WITH_VALUE)
-        runs.append(kept[i:])
+        runs.append(kept[1 + _xargs_options(kept[1:])[0]:])
     elif prog == "find":
         runs += [kept[i + 1:] for i, t in enumerate(kept)
                  if t in ("-exec", "-execdir", "-ok", "-okdir")]
@@ -4622,11 +4652,23 @@ def _raw_script_texts(script: str) -> list[str]:
     if plain != script:
         _spend(len(plain))
         out.append(plain)
-    body = script.strip()
-    substs = _find_substs(body) if body.startswith(("$(", "`")) else []
-    if len(substs) == 1 and substs[0].start() == 0 and substs[0].end() == len(body):
-        out += [t for t in _proc_subst_texts(_subst_inner(substs[0])) if t not in out]
+    # A `$(echo …)` anywhere in it splices in the text it prints, quoted
+    # `$(…)` kept: `bash -c "true; $(echo 'a=$(…); $a')"`.
+    if "$(" in script or "`" in script:
+        spliced = _sub_substs(script, _kept_subst_text)
+        if spliced not in out:
+            _spend(len(spliced))
+            out.append(spliced)
     return out
+
+
+def _kept_subst_text(m: "re.Match[str]") -> str:
+    """A `$(…)`/backtick as the text it prints with quoted `$(…)` kept (the
+    first such `_proc_subst_texts` reading), else left as written."""
+    if m.group(0).startswith(("<(", ">(")):
+        return m.group(0)
+    return next((t for t in _proc_subst_texts(_subst_inner(m)) if "$(" in t or "`" in t),
+                m.group(0))
 
 
 def _find_roots(tokens: list[str]) -> list[str]:
@@ -5900,7 +5942,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # _MAX_EXPAND_DEPTH, which fails closed).
         words = _strip_prefixes(_tokenize(_unwrap_group(raw)))
         if len(words) > 1 and _basename(words[0]) == "eval":
-            joined = " ".join(words[1:])
+            # bash's eval takes (and drops) `--`.
+            joined = " ".join(words[2:] if words[1] == "--" else words[1:])
             # `eval "$(echo 'a=$(…); $a')"` runs the printed text (XERK-1649).
             for script in dict.fromkeys([*_script_readings(joined), *_raw_script_texts(joined)[1:]]):
                 out.extend(_expand_segments(script, depth + 1, every_cd))
@@ -6076,23 +6119,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # then append what the pipeline will feed it as operands. An option
             # that takes a SEPARATE value must consume it, else `-I {} rm -rf {}`
             # left `{}` as the command and classified nothing.
-            inner = list(rest)
             # The replace-string (`-I R`, `-iR`, `--replace=R`; `-i` and
             # `--replace` alone mean `{}`), which xargs substitutes ANYWHERE in
             # an argument — inside `sh -c 'rm -rf {}'` too (XERK-1600).
-            replstr = ""
-            while inner and inner[0].startswith("-"):
-                opt = inner.pop(0)
-                if opt == "-I" and inner:
-                    replstr = inner[0]
-                elif opt.startswith("-I"):
-                    replstr = opt[2:]
-                elif opt.startswith("-i"):
-                    replstr = opt[2:] or "{}"
-                elif opt == "--replace" or opt.startswith("--replace="):
-                    replstr = opt.partition("=")[2] or "{}"
-                if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
-                    inner.pop(0)
+            cut, replstr = _xargs_options(rest)
+            inner = list(rest[cut:])
             if inner:
                 # `{}` stands for whatever the pipeline feeds in. Every xargs
                 # carries EVERY operand on the line, so n segments emit n²

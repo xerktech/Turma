@@ -1323,7 +1323,12 @@ class TestProducedScripts(unittest.TestCase):
                     f"eval \"$(echo 'a=$(echo {R}); $a')\"",
                     f"bash <(echo 'a=$(echo {R})'; echo '$a')",
                     f"bash <(echo 'a=$(echo {R}); $a' | cat)",
-                    f'bash <(echo "a=\\`echo {R}\\`; \\$a")'):
+                    f'bash <(echo "a=\\`echo {R}\\`; \\$a")',
+                    # A wrapper xargs runs; a `$(echo …)` among other text (QA).
+                    f"xargs env bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"bash -c \"true; $(echo 'a=$(echo {R}); $a')\"",
+                    f"eval -- \"$(echo 'a=$(echo {R}); $a')\"",
+                    f"eval \"$(echo 'a=$(echo {R})')\"'; $a'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("xargs bash -c 'a=$(echo hi); echo $a' <<< x",
@@ -1334,6 +1339,20 @@ class TestProducedScripts(unittest.TestCase):
                     # A shell word a printer is handed is text, not a runner.
                     f"xargs echo bash -c 'a=$(echo {R}); $a'",
                     f"find . -name sh -exec echo sh -c 'a=$(echo {R}); $a' \\;"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_xargs_clustered_short_options_take_their_value(self):
+        # XERK-1649 QA: `-rn 1` is `-r -n 1`; read as one word, `1` was the command.
+        R = self.R
+        for cmd in (f"xargs -rn 1 {R} <<< x", f"xargs -0I {{}} {R} {{}} <<< x",
+                    f"xargs -rn 1 bash -c '{R}' <<< x", f"xargs -tI {{}} sh -c 'rm -rf {{}}' <<< /",
+                    f"xargs -0P 2 bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"xargs --process-slot-var V {R} <<< x", f"xargs -rL1 {R} <<< x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("xargs -rn 1 echo <<< x", "xargs -0I {} cp {} /tmp/out <<< x",
+                    "xargs -i echo {} <<< x", "xargs -l echo <<< x"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
