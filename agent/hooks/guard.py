@@ -1949,10 +1949,8 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
                 vals.setdefault(bound[0], []).append(bound[1])
     if "read" in command and "<<<" in command:
         for seg in _split_segments(command):
-            bound = _read_herestring(seg)
-            if bound:
-                for name in bound[0]:
-                    vals.setdefault(name, []).append(bound[1])
+            for name, value in _read_herestring(seg, whole="IFS" in command):
+                vals.setdefault(name, []).append(value)
     # How many values one name is ASSIGNED, so `_expand_both` reads each on
     # its own. Not a `for` list's words: those are a loop's data, and a long
     # list would cost a whole reading per word.
@@ -1965,8 +1963,14 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
     for m in _FOR_IN_RE.finditer(command):
         # Whole words, dequoted as bash binds them: split on blanks, `for v in
         # "$(echo rm -rf /)"` bound `"rm`, `-rf`, `/"` (XERK-1622).
-        words = [_dequote_value(w.group(0)) for w in _ASSIGN_WORD_RE.finditer(m.group(2))
-                 if w.group(0) and w.group(0) != "do"]
+        # A `${x:-…}` word is read with its default applied too, as an
+        # assignment's is.
+        words = []
+        for w in _ASSIGN_WORD_RE.finditer(m.group(2)):
+            if w.group(0) and w.group(0) != "do":
+                words.append(_dequote_value(w.group(0)))
+                if "${" in w.group(0) and not _MAIN_PARSE[0]:
+                    words.append(_dequote_value(_substitute_vars(w.group(0), {})))
         if words:
             vals.setdefault(m.group(1), []).extend(words)
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
@@ -2175,36 +2179,62 @@ _READ_OPTS_WITH_VALUE = set("adinNptu")
 _HERESTRING_RE = re.compile(r"<<<[ \t]*")
 
 
-def _read_herestring(seg: str) -> tuple[list[str], str] | None:
-    """`read [opts] NAME… <<< WORD` assigns WORD's text, so `read -r a <<<
-    "$(echo rm -rf /)"; $a` runs it (XERK-1622). Every name is given the
-    WHOLE text: bash splits it across them, and each `$name` spliced in
-    order rebuilds the same words."""
-    tokens = _strip_prefixes(_tokenize(seg))
+def _read_herestring(seg: str, whole: bool = False) -> list[tuple[str, str]]:
+    """The `(name, value)`s `read [opts] NAME… <<< WORD` binds, so `read -r a
+    <<< "$(echo rm -rf /)"; $a` runs it (XERK-1622). Split as bash does under
+    the default IFS — each name a word, the last the remainder — or, with
+    ``whole`` (the line sets IFS) or for `-a`, every name the whole text.
+    A WORD with a `${…}` default is read with it applied too."""
+    m = _HERESTRING_RE.search(seg)
+    if not m:
+        return []
+    end = _word_end(seg, m.end())
+    end = end if end >= 0 else len(seg)
+    word = seg[m.end():end]
+    # Names are read with the word cut out: shlex splits an unquoted
+    # `<<<$(echo rm …)` and its `rm` read as one more name.
+    tokens = _strip_prefixes(_tokenize(seg[:m.end()] + seg[end:]))
     if not tokens or tokens[0] != "read":
-        return None
-    names, i = [], 1
+        return []
+    names, arrays, i = [], [], 1
     while i < len(tokens):
         tok = tokens[i]
         if "<" in tok or ">" in tok:
-            # A redirection; a detached `<<<` takes the next word with it.
-            i += 2 if tok in ("<<<", "<", ">", ">>", "<<") else 1
+            # A redirection, maybe glued to the name before it (`a<<<"…"`);
+            # a detached operator takes the next word with it (the `<<<`
+            # word is already cut out).
+            glued = re.match(r"([A-Za-z_][A-Za-z0-9_]*)[<>&]", tok)
+            if glued:
+                names.append(glued.group(1))
+            i += 2 if tok in ("<", ">", ">>", "<<") else 1
             continue
         if tok.startswith("-") and len(tok) > 1 and tok != "--":
             if tok[-1] in _READ_OPTS_WITH_VALUE and i + 1 < len(tokens):
                 if tok[-1] == "a":
-                    names.append(tokens[i + 1])
+                    # Its name, maybe glued to the redirection (`-a arr<<<"…"`).
+                    arrays.append(re.match(r"[^<>&]*", tokens[i + 1]).group(0))
                 i += 1
         elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok):
             names.append(tok)
         i += 1
-    m = _HERESTRING_RE.search(seg)
-    names = [n for n in names if re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", n)] or ["REPLY"]
-    if not m:
-        return None
-    end = _word_end(seg, m.end())
-    word = seg[m.end():end if end >= 0 else len(seg)]
-    return names, _produced_text(_dequote_value(word), multi=_VALUES_MULTI[0]).replace("\n", " ")
+    texts = [_dequote_value(word)]
+    if "${" in word:
+        texts.append(_dequote_value(_substitute_vars(word, {})))
+    names = [n for n in names if _ASSIGN_NAME_RE.fullmatch(n)]
+    arrays = [n for n in arrays if _ASSIGN_NAME_RE.fullmatch(n)]
+    if not names and not arrays:
+        names = ["REPLY"]
+    out = []
+    for text in dict.fromkeys(texts):
+        text = _produced_text(text, multi=_VALUES_MULTI[0]).replace("\n", " ")
+        out.extend((n, text) for n in arrays)
+        if whole or len(names) == 1:
+            out.extend((n, text) for n in names)
+        elif names:
+            words = text.split()
+            out.extend((n, words[k] if k < len(words) else "") for k, n in enumerate(names[:-1]))
+            out.append((names[-1], " ".join(words[len(names) - 1:])))
+    return out
 
 
 def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:

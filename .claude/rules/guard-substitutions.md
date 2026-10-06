@@ -38,10 +38,13 @@ paths:
   (XERK-1622): the inner shell runs it, so `bash -c 'a=$(echo rm …); $a'` assigns the output whole;
   the outer splice made it `a=rm …; $a`, where `$a` is just `rm`. Added, never swapped.
 - **Values bound outside `NAME=` reach `$name` too** (XERK-1622, `_assigned_values`): a `for` list
-  is read in whole dequoted words (`"$(echo rm …)"` is one), and `read NAMES <<< WORD` gives every
-  name the word's whole text (`_read_herestring`). Residual: a multi-word list joins its words, so
-  `for v in a 'rm …'; do $v; done` runs program `a` in the guard's reading.
-  (XERK-1647)
+  is read in whole dequoted words (`"$(echo rm …)"` is one), and `read NAMES <<< WORD` binds them
+  as bash splits it — a word each, the last the remainder (`_read_herestring`); every name gets
+  the whole text when the line sets IFS, and `-a`'s array always does. A `${x:-…}` word is read
+  with its default applied too, as an assignment's is.
+  - A name can be glued to the `<<<` (`read a<<<"…"`): shlex keeps it in the redirection token.
+  - Residual: a multi-word list joins its words, so `for v in a 'rm …'; do $v; done` runs program
+    `a` in the guard's reading (XERK-1647).
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.

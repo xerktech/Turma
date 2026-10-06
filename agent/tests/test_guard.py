@@ -1208,6 +1208,12 @@ class TestProducedScripts(unittest.TestCase):
                     f'read -ra arr <<< "$(echo {R})"; ${{arr[@]}}',
                     f'read <<< "$(echo {R})"; $REPLY',
                     f"read a <<<$(echo {R}); $a",
+                    # Glued to the name, a later name's remainder, a default (QA).
+                    f'read -r a<<<"$(echo {R})"; $a', f"read a<<<'{R}'; $a",
+                    f'read -ra arr<<<"$(echo {R})"; ${{arr[@]}}',
+                    f'read -r _ a <<< "x {R}"; $a', f'read -r a b <<< "x {R}"; $b',
+                    f'read -r a <<< "${{x:-$(echo {R})}}"; $a',
+                    f'for v in "${{x:-$(echo {R})}}"; do $v; done',
                     f"{{,}}$(echo {R})", f"{{,}}`echo {R}`",
                     f"bash -c 'a=$(echo {R}); $a'", f"sh -c 'a=`echo {R}`; $a'"):
             with self.subTest(cmd=cmd):
@@ -1215,7 +1221,8 @@ class TestProducedScripts(unittest.TestCase):
         for cmd in ('for v in "$(ls)"; do echo "$v"; done',
                     'read -r l <<< "$(git log -1 --oneline)"; echo "$l"',
                     f"read a <<< '{R}'; echo \"$a\"", "echo {a,b}$(date)",
-                    "bash -c 'x=$(git rev-parse HEAD); echo $x'"):
+                    "bash -c 'x=$(git rev-parse HEAD); echo $x'",
+                    'read -r cmd <<< "ls -la"; $cmd', 'read -r a b <<< "1 2"; echo $a $b'):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
