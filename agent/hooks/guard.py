@@ -5299,7 +5299,8 @@ def _dangerous_target(tok: str) -> str | None:
     raw = tok.strip().strip('"').strip("'")
     end = _leading_names_end(raw)
     # The rest is judged as written: reading its trailing names empty as well
-    # (XERK-1623) would read `"$TMP/$x"` as `/`, a call XERK-1652 owns.
+    # (XERK-1623) would read `"$TMP/$x"` as `/`. That also leaves `$x/etc$y`
+    # (both ends empty) allowed; both are XERK-1652's call.
     if end and _is_dangerous_path(raw[end:], trailing=False):
         return f"({tok!r}, which is {_norm_path(raw[end:])!r} when {raw[:end]} is unset)"
     return None
