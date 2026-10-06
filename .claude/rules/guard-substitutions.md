@@ -285,12 +285,15 @@ paths:
   - Resolving once, against values naming none, read `q=/etc; d=$q; r=$d` as `r` empty. Rounds
     were tried too: a link naming a cycle (`d=$q$c; c=$c`) stalled the chain, and a name with one
     plain and one chained value (`q=/tmp; q=$e; d=$q`) was read before its second value.
-  - A cycle (an SCC, or a name using itself) re-reads a value each time a member it uses changes,
-    at most 1 + (members it uses) times: a seed then reaches every member however the names sort
-    (`b=/etc; c=$b; a=$c; b=$a`). Read once in sorted order, that read `a` empty (QA). A value
-    never re-reads for its OWN name (`d=/; d=$d/etc` stays `//etc`). An unreached member reads
-    empty, as an unset name. Accepted: a dense cycle (a 30-name clique) grows its joined values
-    past the budget and is denied as too large.
+  - A cycle (an SCC, or a name using itself) reads each value ONCE, as soon as every other member
+    it uses has a value; stuck, the next value in line is read with unknown members empty (as an
+    unset name). A seed then reaches every member however the names sort (`b=/etc; c=$b; a=$c;
+    b=$a`); read once in sorted order, that read `a` empty (QA). A value reads its OWN name as it
+    is (`d=/; d=$d/etc` stays `//etc`).
+    - Never re-read on each change: each lap nested the last one's text, and a test loop's
+      `n=$((n + ${m:-0}))` counters were refused as too deep (real-command replay).
+    - Accepted: a dense cycle (a 30-name clique) doubles its text per member and is denied as too
+      large, as a doubling chain is.
   - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`); names in a
     `:+`/`+` alternative are expanded by the caller's `expand` (both `_assigned_values` and
     `_substitute_vars`) and count as dependencies (`_names_used`). Spliced raw, `${x:+$x}` ran

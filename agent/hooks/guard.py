@@ -2117,39 +2117,38 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
                 got = out[k][i] = settle(k, i)
                 (known if i < own[k] else defaults)[k].append(got)
             continue
-        # A cycle (`a=$b; b=$a`, `d=/; d=$d/etc`): a value is re-read each
-        # time a member it uses changes, up to once more per member it uses
-        # (each lap of the cycle grows the joined values), so a seed
-        # reaches every member however the names sort (`b=/etc; c=$b; a=$c;
-        # b=$a; $a`). Unreached, a member reads empty, as an unset name.
-        base = {k: (list(known[k]), list(defaults[k])) for k in group}
-        got: dict[tuple[str, int], str] = {}
+        # A cycle (`a=$b; b=$a`, `d=/; d=$d/etc`): each value is read ONCE, as
+        # soon as every other member it uses has a value, so a seed reaches
+        # every member however the names sort (`b=/etc; c=$b; a=$c; b=$a;
+        # $a`). Stuck, the next value in line is read with what is known, an
+        # unknown member empty, as an unset name. Re-reading on each change
+        # nested every lap's text into the next: a loop's `n=$((n + ${m:-0}))`
+        # counters were refused as too deep.
+        waiting = {}
         users: dict[str, list[tuple[str, int]]] = {}
-        most = {(k, i): 1 + len(names & (group - {k})) for k, i, names in slots}
         for k, i, names in slots:
-            # Not its own name: `d=$d/etc` reads d as it was before.
-            for n in names & (group - {k}):
+            # Not its own name: `d=$d/etc` reads d as it is.
+            need = {n for n in names & group if n != k and not known[n]}
+            waiting[k, i] = len(need)
+            for n in need:
                 users.setdefault(n, []).append((k, i))
-        queue = collections.deque((k, i) for k, i, _names in slots)
-        queued = set(queue)
-        reads = collections.Counter()
-        while queue:
-            k, i = slot = queue.popleft()
-            queued.discard(slot)
-            if reads[slot] > most[slot]:
+        ready = collections.deque(slot for slot, n in waiting.items() if not n)
+        line = iter(list(waiting))
+        while waiting:
+            slot = ready.popleft() if ready else next(s for s in line if s in waiting)
+            if slot not in waiting:
                 continue
-            reads[slot] += 1
-            value = settle(k, i)
-            if got.get(slot) == value:
-                continue
-            got[slot] = out[k][i] = value
-            mine = [(j, got[k, j]) for j, _n in linked[k] if (k, j) in got]
-            known[k] = base[k][0] + [v for j, v in mine if j < own[k]]
-            defaults[k] = base[k][1] + [v for j, v in mine if j >= own[k]]
-            for user in users.get(k, ()):
-                if user not in queued:
-                    queue.append(user)
-                    queued.add(user)
+            del waiting[slot]
+            k, i = slot
+            had = bool(known[k])
+            got = out[k][i] = settle(k, i)
+            (known if i < own[k] else defaults)[k].append(got)
+            if not had and known[k]:
+                for user in users.pop(k, ()):
+                    if user in waiting:
+                        waiting[user] -= 1
+                        if not waiting[user]:
+                            ready.append(user)
     return out
 
 

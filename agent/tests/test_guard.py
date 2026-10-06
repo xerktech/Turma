@@ -1207,6 +1207,23 @@ class TestParserGaps(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
+    def test_a_cycle_of_assignments_is_read_once(self):
+        """Re-read on every change, each lap of a cycle nested the last one's
+        text: a test loop's counters were refused as too deep (a replayed
+        false deny)."""
+        cmd = ('files=$(ls tests/*.js)\ntotal_pass=0; total_fail=0; failed=""\n'
+               'for f in $files; do\n'
+               '  res=$(node --test "$f" 2>&1)\n'
+               '  fail=$(echo "$res" | grep -oE "fail [0-9]+" | grep -oE "[0-9]+" | tail -1)\n'
+               '  pass=$(echo "$res" | grep -oE "pass [0-9]+" | grep -oE "[0-9]+" | tail -1)\n'
+               '  total_pass=$((total_pass + ${pass:-0}))\n'
+               '  total_fail=$((total_fail + ${fail:-0}))\n'
+               '  if [ "${fail:-0}" != "0" ]; then failed="$failed $f($fail)"; fi\n'
+               'done\necho "TOTAL pass=$total_pass fail=$total_fail"\necho "FAILED:$failed"')
+        vals = guard._budgeted(guard._var_values)(cmd)
+        self.assertLessEqual(max(v.count("$((") for vs in vals.values() for v in vs), 2, vals)
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
+
     def test_a_cycle_of_assignments_stays_bounded(self):
         """A cycle reads empty, as an unset name. A long chain resolves in
         linear time, and one that doubles is charged to the budget."""
