@@ -1256,7 +1256,11 @@ class TestProducedScripts(unittest.TestCase):
                     f'r\'\'ead a <<< "$(echo {R})"; $a',
                     f"echo {R} | {{ read -p '<<<' a; $a; }}",
                     f"echo {R} | {{ read -ar arr; ${{r[@]}}; }}",
-                    f'while :; do select v in a; do $REPLY; done; done <<< "$(echo {R})"'):
+                    f'while :; do select v in a; do $REPLY; done; done <<< "$(echo {R})"',
+                    # An echo piped straight into a bare reader (`lastpipe`).
+                    f"shopt -s lastpipe; echo {R} | read a b c; $a $b $c",
+                    f'case x in x) read a; $a;; esac <<< "$(echo {R})"',
+                    f'{{ echo \')\'; read a; $a; }} <<< "$(echo {R})"'):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ('git ls-files | while read -r f; do echo "$f"; done',
