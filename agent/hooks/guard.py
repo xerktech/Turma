@@ -5995,6 +5995,39 @@ def _norm_path(tok: str) -> str:
     return t
 
 
+def _shell_fnmatch(name: str, pattern: str) -> bool:
+    """fnmatch read as bash globs (XERK-1654).
+
+    Python's fnmatch reads `[^x]` as a literal `^` and has no `[[:alpha:]]`
+    class, so `/e[[:alpha:]]c` and `/[^x]tc` never matched `/etc`. Negate as
+    bash does. With a class, equivalence class or collating symbol anywhere,
+    the text from the first `[` to the last `]` becomes `*`: whatever brackets
+    bash finds in it, the string it matches there is one `*` matches too, so
+    the match can only widen (fail closed) and no bracket is parsed at all —
+    a parse started inside an outer bracket, or one that backtracks, is how
+    such a rewrite reopens a hole.
+    """
+    if re.search(r"\[[:=.]", pattern):
+        start, end = pattern.find("["), pattern.rfind("]")
+        pattern = pattern[:start] + "*" + pattern[end + 1:]
+    return fnmatch.fnmatch(name, pattern.replace("[^", "[!"))
+
+
+def _glob_names_home(word: str) -> bool:
+    """A home token straight followed by a glob that may match the home itself
+    (`$HOME*`, `${HOME}?`), as literal `/root*` may match /root (XERK-1654).
+    A `~` is left out: bash expands no tilde in `~*`, which globs the cwd.
+    A glob that may match `/root` itself counts too (`/root*/.ssh`)."""
+    if word.startswith("/") and _GLOB_CHARS.search(word) and _shell_fnmatch("/root", word):
+        return True
+    for home in _HOME_TOKENS:
+        rest = word[len(home):]
+        if (not home.startswith("~") and word.startswith(home) and _GLOB_CHARS.search(rest)
+                and (_shell_fnmatch("", rest) or _shell_fnmatch("/", rest))):
+            return True
+    return False
+
+
 def _glob_hits_system_root(pattern: str) -> bool:
     """True if an absolute glob could expand onto a system root.
 
@@ -6007,7 +6040,7 @@ def _glob_hits_system_root(pattern: str) -> bool:
         return False
     for root in _SYSTEM_ROOTS:
         bare = root.rstrip("/") or "/"
-        if fnmatch.fnmatch(bare, pattern) or fnmatch.fnmatch(bare + "/", pattern):
+        if _shell_fnmatch(bare, pattern) or _shell_fnmatch(bare + "/", pattern):
             return True
     return False
 
@@ -6085,8 +6118,11 @@ def _is_dangerous_path(tok: str, trailing: bool = True) -> bool:
     # A glob straight under a home directory that can match its dotfiles
     # (`~/*`, `~/.*`, `~/.[!.]*`) takes `.ssh` and the rest with it.
     parent, _, leaf = low.rpartition("/")
-    if (_GLOB_CHARS.search(leaf) and (parent in _HOME_TOKENS or _HOME_USER_RE.match(parent))
-            and fnmatch.fnmatch(".ssh", leaf)):
+    if (_GLOB_CHARS.search(leaf) and (parent in _HOME_TOKENS or _HOME_USER_RE.match(parent)
+                                      or _glob_names_home(parent))
+            and _shell_fnmatch(".ssh", leaf)):
+        return True
+    if _glob_names_home(low):
         return True
     # `~root` / `~someuser` expand to that account's home, and `/root` is itself
     # a system root.
@@ -6125,7 +6161,8 @@ def _is_home_ssh(tok: str) -> bool:
     if dropped is not None and _is_home_ssh(dropped):
         return True
     parent, _, leaf = _norm_path(tok).lower().rstrip("/").rpartition("/")
-    return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent)))
+    return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent))
+                               or _glob_names_home(parent))
 
 
 # A target that STARTS with names: by here every name this line assigns or

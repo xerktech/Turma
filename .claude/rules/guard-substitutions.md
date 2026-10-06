@@ -175,6 +175,14 @@ paths:
   - A name the line assigns is spliced first, never read empty. A revealed `format` counts only
     with a drive letter: `$R format --check .` (ruff, black, cargo) is the clash.
   - `_expand_braces` skips `${x,,}`: brace-expanding it read `${x,,}rm` as `$xrm $rm $rm`.
+  - Protected-path globs go through `_shell_fnmatch`, never bare `fnmatch` (XERK-1654): it
+    rewrites `[^` to `[!`; with any `[:`/`[=`/`[.`, first `[` to last `]` becomes `*`.
+    - That only WIDENS (fail closed; accepted over-deny `/e[[:digit:]]c`). Never parse brackets
+      here: a regex bracket parse reopened `/e[t[:]c` and backtracked exponentially (hook stall).
+  - A glob straight after a `$HOME` token is judged as possibly the home itself (`$HOME*`,
+    `$HOME?`, `$HOME*/.ssh`, and `/root*/.ssh`; `_glob_names_home`).
+    Not `~*`: bash expands no tilde there.
+    Tests: `test_a_bash_only_glob_class_or_a_glob_after_home_is_judged`.
   - A destructive OPERAND (rm/chmod/chown/find roots, and rm's `~/.ssh` check) is also read with
     the unset names ENDING it dropped (`_trailing_unset_dropped`, XERK-1623): `/etc$x`,
     `$HOME$x`, `/$x`, `/etc$x/.`, `/e$x*c`. "Ending" = only `/` and `.` follow, or text holding
