@@ -1496,7 +1496,7 @@ def _find_substs(text: str) -> list[_Subst]:
     openers stay linear: a scan per opener is O(n²), past the hook timeout.
     - A `)` closes only a `(` quoted the same way (`_quote_states`): read
       blind, the `)` in `$(echo ")'")` ended the body there and its `'` hid
-      the rest of the line (XERK-1621). An escaped `\$(` inside `"…"` is
+      the rest of the line (XERK-1621). An escaped `\\$(` inside `"…"` is
       string text throughout, so it still pairs as it did.
     """
     n = len(text)
@@ -5008,7 +5008,47 @@ def _glob_hits_system_root(pattern: str) -> bool:
     return False
 
 
+# `${x:-w}`, `${x=w}` and the like print ``w`` when x is unset, never nothing.
+_DEFAULTED_PARAM_RE = re.compile(r"^\$\{(?:[A-Za-z_]\w*|\d+)(?:\[[^]]*\])?:?[-=][^}]")
+
+
+def _trailing_unset_dropped(tok: str) -> str | None:
+    """``tok`` with every unset name glued AFTER its text read as empty, else
+    None (XERK-1623).
+
+    `rm -rf /etc$x` deletes /etc when x is unset, and `$HOME$x` the home
+    directory. Only the names ENDING the word (nothing but `/` after them)
+    with text before them are dropped: a whole-word `"$d"` is left alone,
+    since an empty target reads as the root, as is a name before more text
+    (`"$dir"/build`, `./"$name".git`), which is a path built from it.
+    A name inside a tilde prefix (`~$USER`) is kept: bash does not expand
+    that tilde, so the word never names a home.
+    """
+    if "$" not in tok:
+        return None
+    tilde_end = (tok.find("/") % (len(tok) + 1)) if tok.startswith("~") else 0
+    spans = []
+    tail = len(tok)
+    for start, end, kind in reversed(_param_spans(tok)):
+        if kind != "param" or start <= tilde_end or tok[end:tail].strip("/") \
+                or _DEFAULTED_PARAM_RE.match(tok[start:end]):
+            break
+        spans.insert(0, (start, end))
+        tail = start
+    if not spans:
+        return None
+    pieces, last = [], 0
+    for start, end in spans:
+        pieces.append(tok[last:start])
+        last = end
+    pieces.append(tok[last:])
+    return "".join(pieces)
+
+
 def _is_dangerous_path(tok: str) -> bool:
+    dropped = _trailing_unset_dropped(tok)
+    if dropped is not None and _is_dangerous_path(dropped):
+        return True
     raw = _norm_path(tok)
     low = raw.lower().rstrip("/").rstrip("\\")
     bare = raw.lower()
