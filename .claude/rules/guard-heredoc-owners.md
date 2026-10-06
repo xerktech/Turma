@@ -43,9 +43,9 @@ paths:
   - a glob is matched against the shell names (`/bin/ba?h`); a function or alias the command
     defines anywhere (`_defined_names`) may run a shell, whatever its body says;
   - `coproc` is a prefix word. A false deny still needs a destructive body.
-  - A substitution in the owner word is replaced by what it prints when known (`$(echo bash)`,
-    a silent `$(:)` → nothing, so `cat$(:) <<EOF` stays data), else a placeholder that fails closed
-    (`_owner_substs`).
+  - An expansion's OUTPUT is never trusted (IFS splits it; `true`/`echo` may be redefined): a word
+    still holding one is judged by its literal prefix — `cat$(:)` can only run `cat…` — and fails
+    closed when the prefix is empty, holds a `/` or a glob, or begins a shell/function/alias name.
   - Globs are matched with `fnmatch`, which is not bash: `[^` is rewritten to `[!` and any `[:`
     class fails closed. `_defined_names` starts only at word starts, so it stays linear.
   - Accepted over-deny (0 in a 19k-command replay): `"$EDITOR" <<EOF`, `${PAGER:-less}`,

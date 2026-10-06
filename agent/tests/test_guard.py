@@ -1554,14 +1554,24 @@ class TestScriptChannels(unittest.TestCase):
                     f"{{{{f() {{ bash; }}\ncat <<EOF | {{{{f\n{R}\nEOF",
                     f"{{{{(){{ bash; }}\n{{{{ <<EOF\n{R}\nEOF", f"{{{{{{(){{ bash; }}\ncat <<EOF | {{{{{{\n{R}\nEOF",
                     f"function {{{{f {{ bash; }}\n{{{{f <<EOF\n{R}\nEOF", f"function {{f {{ bash; }}\n{{f <<EOF\n{R}\nEOF",
-                    f"alias a=b 'c=bash'\nc <<EOF\n{R}\nEOF"):
+                    f"alias a=b 'c=bash'\nc <<EOF\n{R}\nEOF",
+                    # An expansion's output is never trusted: IFS splits it, and
+                    # `true`/`echo` may be redefined; only a literal prefix rules it out.
+                    f"IFS=x; $(echo bashx-s) <<EOF\n{R}\nEOF", f"IFS=x; a=bashx-s; $a <<EOF\n{R}\nEOF",
+                    f"IFS=x; cat <<EOF | $(echo bashx-s)\n{R}\nEOF",
+                    f"true(){{ command echo bas; }}; $(true)h <<EOF\n{R}\nEOF",
+                    f"echo(){{ command printf bas; }}; $(echo x)h <<EOF\n{R}\nEOF",
+                    f"/usr$(echo /bin/bash) <<EOF\n{R}\nEOF", f"ba$(:)sh <<EOF\n{R}\nEOF",
+                    f"foo(){{ bash; }}; fo$(:)o <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # A variable this line resolves to a non-shell, a glob matching none,
         # and a benign body behind any owner stay allowed.
         for cmd in (f"x=cat; $x <<EOF\n{R}\nEOF", f"x=cat; cat <<EOF | $x\n{R}\nEOF",
                     f"cat <<EOF | /bin/ca?\n{R}\nEOF", f"alias ll='ls -l'; cat <<EOF\n{R}\nEOF",
-                    "cat <<EOF | $PAGER\nhello\nEOF", "f() { cat; }; f <<EOF\nhello\nEOF"):
+                    "cat <<EOF | $PAGER\nhello\nEOF", "f() { cat; }; f <<EOF\nhello\nEOF",
+                    f"cat$(:) <<EOF\n{R}\nEOF", f"x=cat; $x$(:) <<EOF\n{R}\nEOF",
+                    f"x=cat; ${{x}}<<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

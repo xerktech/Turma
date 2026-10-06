@@ -3618,22 +3618,12 @@ def _reads_stdin_grouped(segment: str) -> bool:
     return any(_reads_stdin_script(text) for text in _ungrouped(segment))
 
 
-# Substitution bodies known to print nothing: `cat$(:) <<EOF` runs `cat`.
-_SILENT_BODIES = {"", ":", "true", "false"}
-
-
 def _owner_substs(text: str) -> str:
-    """``text`` with each complete substitution replaced by what it prints
-    when that is known (`$(echo bash)` → `bash`, `$(:)` → nothing), else by a
-    backtick placeholder `_owner_word_may_be_shell` fails closed on: its
-    output may form any program name (XERK-1624)."""
-    def repl(m) -> str:
-        inner = _subst_inner(m).strip()
-        if m.group(0)[0] not in "$`":
-            return "`s`"  # a `<(…)`/`>(…)` is a path, never a name
-        printed = "" if inner in _SILENT_BODIES else _printed_text(inner)
-        return "`s`" if printed is None else printed
-    return _sub_substs(text, repl)
+    """``text`` with each complete substitution replaced by a backtick
+    placeholder: its output is never trusted (IFS splits it, and `true` or
+    `echo` may be redefined), so `_owner_word_may_be_shell` reads the word by
+    its literal prefix alone (XERK-1624)."""
+    return _sub_substs(text, lambda m: "`s`")
 
 
 def _heredoc_segment_programs(segment: str):
@@ -3680,6 +3670,11 @@ def _defined_names(command: str) -> frozenset[str]:
     return frozenset(n.lower() for n in names)
 
 
+# A shell name starting a value or a path component in it.
+_SHELL_PREFIX_RE = re.compile(
+    r"(?:^|/)(?:" + "|".join(re.escape(n) for n in sorted(_SCRIPT_READERS)) + ")")
+
+
 def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
                              defined: frozenset[str]) -> bool:
     """Whether program word ``word`` may run a shell (XERK-1624). A literal
@@ -3688,14 +3683,32 @@ def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
     unset `$x`, `$SHELL`, a substitution or `$'bas\\x68'` may be any program.
     A glob matching a shell's name (`/bin/ba?h`) and a function or alias the
     line defines (`f() { bash; }`) may be one too."""
-    if "`" in word:
-        return True
     if "$" in word:
-        resolved = _substitute_vars(word, vals)
+        # `_ungrouped` cuts at the first `}`, even a `${x}`'s: close it again.
+        if word.count("${") > word.count("}"):
+            word += "}"
+        word = _substitute_vars(word, vals)
         # An empty value shifts the program to the next word: `$x bash`.
-        if "$" in resolved or "`" in resolved or not resolved.split():
+        if not word.split():
             return True
-        return any(_owner_word_may_be_shell(w, {}, defined) for w in resolved.split())
+        # A set IFS splits a value anywhere, so its program may be any prefix
+        # of it: `IFS=x; a=bashx-s; $a` runs `bash -s`.
+        if "IFS" in vals and (_SHELL_PREFIX_RE.search(word.lower())
+                              or any(word.lower().startswith(n) for n in defined)):
+            return True
+        if "$" not in word and "`" not in word:
+            return any(_owner_word_may_be_shell(w, {}, defined) for w in word.split())
+        # A value that word-splits: the program is its first word.
+        word = word.split()[0]
+    if "$" in word or "`" in word:
+        # An expansion left: its text is unknown, but it is GLUED after the
+        # literal text before it, so the program starts with that prefix —
+        # `cat$(:)` runs `cat…`, never a shell. Fails closed unless the prefix
+        # rules every shell, function and alias out; a `/` lets the expansion
+        # name any file (`/usr$(echo /bin/bash)`).
+        prefix = re.split(r"[$`]", word, maxsplit=1)[0].lower()
+        return (not prefix or "/" in prefix or bool(_GLOB_CHARS.search(prefix))
+                or any(n.startswith(prefix) for n in (*_SCRIPT_READERS, *defined)))
     name = _basename(word)
     # A defined name may hold a `/` (`f/g() { bash; }`), so match it whole too.
     if name in _SCRIPT_READERS or name in defined or word.lower() in defined:
@@ -3724,11 +3737,13 @@ def _stage_may_read_stdin(stage: str, vals: dict[str, list[str]],
         word = tokens[0]
         if "$" in word or "`" in word:
             resolved = _substitute_vars(word, vals)
-            # Unresolved, a substitution or empty: any program, so fail closed.
-            if "$" in resolved or "`" in resolved or not resolved.split():
-                return True
-            if _reads_stdin_grouped(_substitute_vars(reading, vals)):
-                return True
+            if (resolved.split() and "IFS" not in vals
+                    and "$" not in resolved and "`" not in resolved):
+                # Resolved to literal words: read the stage they make.
+                if _reads_stdin_grouped(_substitute_vars(reading, vals)):
+                    return True
+            elif _owner_word_may_be_shell(word, vals, defined):
+                return True  # unknown text that may still name a shell
         elif _basename(word) not in _SCRIPT_READERS and _owner_word_may_be_shell(
                 word, vals, defined):
             return True  # a glob matching a shell, or a function or alias
