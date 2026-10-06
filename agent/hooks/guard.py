@@ -58,6 +58,7 @@ as cwd, so it cannot rely on any package being importable.
 
 from __future__ import annotations
 
+import ast
 import bisect
 import fnmatch
 import functools
@@ -1864,45 +1865,384 @@ _VAR_OP_RE = re.compile(r"^(##|#|%%|%|:-|:=|:\+|-|=|\+|//|/|:)(.*)$", re.DOTALL)
 # assignment anywhere, so `rm -rf ${nope:-/etc}` names /etc outright.
 _VAR_DEFAULT_OPS = {":-", "-", ":=", "="}
 
+# A bash glob as `_glob_tokens` reads it: `*`, `?`, a literal character, or a
+# bracket class (a compiled one-character regex). Objects, never strings, so a
+# literal `\*` can't read as the wildcard.
+_GLOB_STAR, _GLOB_ANY = object(), object()
+_POSIX_CLASSES = {
+    "alpha": "a-zA-Z", "digit": "0-9", "alnum": "a-zA-Z0-9", "upper": "A-Z",
+    "lower": "a-z", "space": r" \t\n\r\f\v", "blank": r" \t", "xdigit": "0-9A-Fa-f",
+    "punct": re.escape("!\"#$%&'()*+,-./:;<=>?@[\\]^_`{|}~"), "cntrl": r"\x00-\x1f\x7f",
+    "print": r"\x20-\x7e", "graph": r"\x21-\x7e", "word": r"\w",
+}
+# What a trim or replace may cost: matching is O(value x pattern) per start,
+# and a replace tries every start. Past these the pattern counts as unreadable.
+_VAR_OP_TRIM_COST = 1 << 18
+_VAR_OP_REPLACE_COST = 1 << 16
 
-def _apply_var_op(value: str, op: str, arg: str, expand=None) -> str:
+
+def _glob_class(pat: str, i: int):
+    """The bracket class opening at ``pat[i]`` (`[`) and the index past its `]`,
+    or None when it never closes (bash then reads the `[` literally)."""
+    j = i + 1
+    neg = j < len(pat) and pat[j] in "!^"
+    j += neg
+    parts, first = [], True
+    while j < len(pat):
+        c = pat[j]
+        if c == "]" and not first:
+            body = "".join(parts)
+            return re.compile("[" + "^" * neg + body + "]" if body else "[^\\s\\S]"), j + 1
+        first = False
+        if c == "[" and pat.startswith("[:", j):
+            k = pat.find(":]", j + 2)
+            name = pat[j + 2:k] if k > 0 else ""
+            if name in _POSIX_CLASSES:
+                parts.append(_POSIX_CLASSES[name])
+                j = k + 2
+                continue
+        if c == "\\" and j + 1 < len(pat):
+            j += 1
+            c = pat[j]
+        if c == "-" and parts and j + 1 < len(pat) and pat[j + 1] != "]":
+            parts.append("-")
+        else:
+            parts.append(re.escape(c))
+        j += 1
+    return None
+
+
+def _glob_tokens(pat: str) -> list | None:
+    """A `${v#pat}`-style pattern as bash matches it — quotes and `\` make text
+    literal, `[...]` takes POSIX classes — or None when it can't be read here:
+    an expansion still in it, or an extglob `@(…)`."""
+    toks: list = []
+    i = 0
+    while i < len(pat):
+        c = pat[i]
+        if c in "$`":
+            return None
+        if c in "?*+@!" and pat.startswith("(", i + 1):
+            return None
+        if c == "\\":
+            toks.append(pat[i + 1] if i + 1 < len(pat) else "\\")
+            i += 2
+            continue
+        if c == "'":
+            k = pat.find("'", i + 1)
+            if k < 0:
+                return None
+            toks.extend(pat[i + 1:k])
+            i = k + 1
+            continue
+        if c == '"':
+            i += 1
+            while i < len(pat) and pat[i] != '"':
+                if pat[i] in "$`":
+                    return None
+                if pat[i] == "\\" and i + 1 < len(pat) and pat[i + 1] in '$`"\\':
+                    i += 1
+                toks.append(pat[i])
+                i += 1
+            if i >= len(pat):
+                return None
+            i += 1
+            continue
+        if c == "*":
+            if not toks or toks[-1] is not _GLOB_STAR:
+                toks.append(_GLOB_STAR)
+        elif c == "?":
+            toks.append(_GLOB_ANY)
+        elif c == "[" and _glob_class(pat, i):
+            cls, i = _glob_class(pat, i)
+            toks.append(cls)
+            continue
+        else:
+            toks.append(c)
+        i += 1
+    return toks
+
+
+def _glob_ends(toks: list, value: str, start: int) -> list[int]:
+    """Every end ``e`` with ``value[start:e]`` matching ``toks``, ascending.
+    A state set run, so it costs O(len(value) x len(toks)), whatever the stars."""
+    n = len(toks)
+
+    def closure(states: set) -> set:
+        for j in sorted(states):
+            while j < n and toks[j] is _GLOB_STAR:
+                j += 1
+                states.add(j)
+        return states
+
+    states, ends = closure({0}), []
+    for e in range(start, len(value) + 1):
+        if n in states:
+            ends.append(e)
+        if e == len(value) or not states:
+            break
+        c, nxt = value[e], set()
+        for j in states:
+            if j == n:
+                continue
+            t = toks[j]
+            if t is _GLOB_STAR:
+                nxt.add(j)
+            elif t is _GLOB_ANY or (t == c if isinstance(t, str) else t.match(c)):
+                nxt.add(j + 1)
+        states = closure(nxt)
+    return ends
+
+
+def _split_replace(arg: str) -> tuple[str, str]:
+    """`${v/pat/rep}`'s ``arg`` cut at the `/` that ends the pattern — not an
+    escaped one, nor one in quotes or a bracket class."""
+    i = 0
+    while i < len(arg):
+        c = arg[i]
+        if c == "\\":
+            i += 2
+            continue
+        if c in "'\"":
+            k = arg.find(c, i + 1)
+            i = len(arg) if k < 0 else k + 1
+            continue
+        if c == "[" and _glob_class(arg, i):
+            i = _glob_class(arg, i)[1]
+            continue
+        if c == "/" and i:
+            return arg[:i], arg[i + 1:]
+        i += 1
+    return arg, ""
+
+
+def _unreadable_op(value: str) -> str:
+    """What an op the guard can't evaluate yields. Left whole, a value holding
+    blanks stays ONE quoted word, so `"${a%%[[:space:]]*}"` hid `rm`
+    (XERK-1651): led by `_UNREAD_OUTPUT`, as a program it is refused, and its
+    words still reach a path rule. A value with no blank is kept as it is."""
+    return _UNREAD_OUTPUT + " " + value if re.search(r"\s", value) else value
+
+
+_PATTERN_SUBST_RE = re.compile(r"\$\([^()]*\)|`[^`]*`")
+_CASE_OPS = {",,": str.lower, "^^": str.upper,
+             ",": lambda v: v[:1].lower() + v[1:], "^": lambda v: v[:1].upper() + v[1:]}
+
+
+def _pattern_vars(arg: str, vals: dict[str, list[str]], keep: bool = False) -> str:
+    """The names in an op's pattern, replacement or offset spliced in as text,
+    where they then act as pattern (or, quoted, literal) as bash reads them:
+    `"${a%%$s*}"`, `${a#"${a%% *}"}`. An unassigned `IFS` is bash's default.
+    A name not assigned here, and a `$(…)`, read EMPTY — or with ``keep``, stay
+    as written (see `_brace_trailing`): bash may fill them (`$HOME`, `$PWD`), so `_op_readings` takes
+    both."""
+    if "$" not in arg and "`" not in arg:
+        return arg
+
+    def rep(u: "re.Match[str]") -> str:
+        name = u.group(1) or u.group(3)
+        got = vals.get(name) or ([" \t\n"] if name == "IFS" else None)
+        tail = u.group(2) or ""
+        op = _VAR_OP_RE.match(tail)
+        if not got:
+            if op and op.group(1) in _VAR_DEFAULT_OPS and not keep:
+                return _pattern_vars(op.group(2), vals)
+            return u.group(0) if keep else ""
+        value = _picked(got)
+        if tail in _CASE_OPS:
+            return _CASE_OPS[tail](value)
+        if tail.startswith("["):  # an element: read as the value
+            return value
+        if tail and not op:
+            return u.group(0)
+        if op and op.group(1) not in _VAR_DEFAULT_OPS:
+            value = _op_readings(value, op.group(1), op.group(2), vals)[0]
+        return value
+    out = _var_sub(rep, arg)
+    return out if keep else _PATTERN_SUBST_RE.sub("", out)
+
+
+def _brace_trailing(word: str) -> str:
+    """``word`` with a bare name ending it braced, so text spliced after it
+    stays text: `${a/xx/$nope}` on `xxrm` would name `$noperm`. Only the
+    trailing one: one mid-word is already cut off by what follows it."""
+    return re.sub(r"(?<!\\)\$([A-Za-z_]\w*)\Z", r"${\1}", word)
+
+
+def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> list[str]:
+    """What `${v<op><arg>}` may yield, for ``value``: one string when its
+    pattern is known. A name it can't resolve, or a `$(…)`, may be unset or
+    hold anything bash knows (`$PWD`, `$HOME`), and no one reading is safe:
+    read empty, `${a#$PWD}` kept `/tmp` on the path; kept whole, `${a#${nope}xx}`
+    hid `/etc` (XERK-1651). So it yields each reading — empty, the `$(…)` read
+    as what it prints, and the value untouched — for `_splice_readings`."""
+    if op in (":+", "+"):
+        # An alternative is a word, not a pattern: an unknown in it stays live
+        # text, as in a replacement. Read empty, `${q:+$HOME}` lost the path.
+        return [_apply_var_op(value, op, _brace_trailing(_pattern_vars(arg, vals, keep=True)))]
+    if op in ("/", "//"):
+        pat, rep = _split_replace(arg)
+        # An unknown stays live text.
+        rep = _brace_trailing(_pattern_vars(rep, vals, keep=True))
+    else:
+        pat, rep = arg, None
+    known = _pattern_vars(pat, vals, keep=True)
+
+    def apply(p: str) -> str:
+        return _apply_var_op(value, op, p) if rep is None else _replace_op(value, op, p, rep)
+
+    if "$" not in known and "`" not in known:
+        return [apply(known)]
+    printed = _PATTERN_SUBST_RE.sub(lambda m: _produced_text(m.group(0)).strip(), pat)
+    out = []
+    for got in (apply(_pattern_vars(pat, vals)), apply(_pattern_vars(printed, vals)), value):
+        if got not in out:
+            out.append(got)
+    # Ambiguous even when every reading agrees, `${a#$PWD}` being unknown:
+    # a value with blanks is led by the unread marker, as `_unreadable_op` does.
+    return out if len(out) > 1 or not re.search(r"\s", value) else out * 2
+
+
+def _splice_readings(readings: list[str], state: str) -> str:
+    """Several readings of one expansion spliced as words led by
+    `_UNREAD_OUTPUT`: as a program it is refused, and each reading still
+    reaches the path rules — inside `"…"` too, as separate words."""
+    if len(readings) == 1:
+        return _quote_literal(readings[0], state)
+    words = [_quote_literal(w, state) for w in (_UNREAD_OUTPUT, *readings)]
+    return ('" "' if state == '"' else " ").join(words)
+
+
+def _arith_offset(text: str) -> int | None:
+    """An `${a:off:len}` part as bash's arithmetic reads it, for the plain
+    cases (`(2)`, `1+1`, `-3/2`, empty); None for anything else. Bash
+    truncates `/` and `%` toward zero, as C does — never Python's floor."""
+    text = text.strip()
+    if not text:
+        return 0
+    if len(text) > 64 or not re.fullmatch(r"[\d\s+\-*/%()]+", text):
+        return None
+    try:
+        tree = ast.parse(text, mode="eval").body
+    except (SyntaxError, ValueError, RecursionError):
+        return None
+
+    def ev(node) -> int:
+        if isinstance(node, ast.Constant) and type(node.value) is int:
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+            v = ev(node.operand)
+            return -v if isinstance(node.op, ast.USub) else v
+        if isinstance(node, ast.BinOp):
+            x, y = ev(node.left), ev(node.right)
+            if isinstance(node.op, ast.Add):
+                return x + y
+            if isinstance(node.op, ast.Sub):
+                return x - y
+            if isinstance(node.op, ast.Mult) and abs(x) < 1 << 62 and abs(y) < 1 << 62:
+                return x * y
+            if isinstance(node.op, (ast.Div, ast.Mod)) and y:
+                q = abs(x) // abs(y) * (1 if (x < 0) == (y < 0) else -1)
+                return q if isinstance(node.op, ast.Div) else x - y * q
+        raise ValueError
+
+    try:
+        return ev(tree)
+    except (ValueError, RecursionError):
+        return None
+
+
+@functools.lru_cache(maxsize=256)  # one line repeats an op on one value
+def _apply_var_op(value: str, op: str, arg: str) -> str:
     """Apply a `${name<op><arg>}` expansion to a known value.
 
-    Only the literal cases are modelled — enough that a one-character operator
-    cannot walk around a path rule (`${d%/}` was exactly that). A pattern we
-    cannot evaluate leaves the value alone rather than guessing.
+    Trims and replaces match their pattern as a bash glob (XERK-1651):
+    dropping its `*`s left `"${a%% *}"` whole, one quoted word that hid `rm`.
+    A pattern that can't be read here yields `_unreadable_op`.
     """
-    arg = arg.strip("'\"")
-    if op in ("#", "##"):
-        pat = arg.replace("*", "")
-        return value[len(pat):] if pat and value.startswith(pat) else value
-    if op in ("%", "%%"):
-        pat = arg.replace("*", "")
-        return value[: -len(pat)] if pat and value.endswith(pat) else value
+    if op in ("#", "##", "%", "%%"):
+        toks = _glob_tokens(arg)
+        if toks is None or len(value) * (len(toks) + 1) > _VAR_OP_TRIM_COST:
+            return _unreadable_op(value)
+        if op[0] == "#":
+            ends = _glob_ends(toks, value, 0)
+            return value[(ends[0] if op == "#" else ends[-1]):] if ends else value
+        # A suffix is a prefix of the reversed value under the reversed pattern.
+        ends = _glob_ends(toks[::-1], value[::-1], 0)
+        return value[:len(value) - (ends[0] if op == "%" else ends[-1])] if ends else value
     if op in ("/", "//"):
-        # `\/` is a slash in the pattern, not its end: `${q/tmp\/a/etc}`.
-        cut = re.search(r"(?<!\\)/", arg)
-        pat, rep = (arg[:cut.start()], arg[cut.end():]) if cut else (arg, "")
-        pat, rep = pat.replace("\\/", "/"), rep.replace("\\/", "/")
-        return value.replace(pat, rep, -1 if op == "//" else 1) if pat else value
+        return _replace_op(value, op, *_split_replace(arg))
     if op in (":+", "+"):
         # The alternative replaces a set value: `${q:+/etc}` is /etc. Names in
-        # it are expanded by ``expand``; spliced raw, `${x:+$x}` ran as the
-        # literal text `$x`. With no ``expand`` such an alternative is left as
-        # the value it would replace.
-        if not (value or op == "+"):
-            return value
-        if "$" in arg or "`" in arg:
-            return expand(arg) if expand else value
-        return arg
+        # it were expanded by `_op_readings`; one it can't resolve leaves it
+        # ambiguous there.
+        return arg if value or op == "+" else value
     if op == ":":
-        bits = arg.split(":")
-        try:
-            start = int(bits[0])
-            return value[start: start + int(bits[1])] if len(bits) > 1 else value[start:]
-        except (ValueError, IndexError):
-            return value
+        # `${a:off}`, `${a:off:len}`: an empty part is 0 (`"${a::2}"` is `rm`,
+        # XERK-1651), a negative offset counts from the end, a negative length
+        # is an end offset.
+        nums = [_arith_offset(b) for b in arg.split(":")[:2]]
+        if None in nums:
+            return _unreadable_op(value)
+        start = nums[0] if nums[0] >= 0 else max(len(value) + nums[0], 0)
+        if len(nums) == 1:
+            return value[start:]
+        end = start + nums[1] if nums[1] >= 0 else len(value) + nums[1]
+        return value[start:end] if end >= start else _unreadable_op(value)
     return value
+
+
+# A replacement's quoting: `\x`, `'…'`, `"…"` (its own escapes), else a char.
+_REP_QUOTE_RE = re.compile(r"""\\(.)|'([^']*)'|"((?:[^"\\]|\\.)*)"|(.)""", re.S)
+
+
+def _dequote_rep(rep: str) -> str:
+    """A replacement after quote removal: it is never a glob."""
+    def one(m: "re.Match[str]") -> str:
+        if m.group(3) is not None:
+            return re.sub(r'\\([$`"\\\n])', r"\1", m.group(3))
+        return next(g for g in (m.group(1), m.group(2), m.group(4)) if g is not None)
+    return _REP_QUOTE_RE.sub(one, rep)
+
+
+@functools.lru_cache(maxsize=256)
+def _replace_op(value: str, op: str, pat: str, rep: str) -> str:
+    """`${v/pat/rep}` (`op` `/` or `//`), its pattern a bash glob; `#`/`%`
+    anchor it. A replacement still holding a `$` stays as written, live text
+    the reading of the line then expands (`${a/X/$HOME}`)."""
+    anchor = pat[0] if op == "/" and pat[:1] in ("#", "%") else ""
+    toks = _glob_tokens(pat[len(anchor):])
+    if toks is None:
+        return _unreadable_op(value)
+    if "$" not in rep and "`" not in rep:
+        rep = _dequote_rep(rep)
+    if not toks and not anchor:
+        return value
+    if all(isinstance(t, str) and len(t) == 1 for t in toks) and not anchor:
+        return value.replace("".join(toks), rep, -1 if op == "//" else 1)
+    if anchor == "%":
+        ends = _glob_ends(toks[::-1], value[::-1], 0)
+        return value[:len(value) - ends[-1]] + rep if ends else value
+    if len(value) ** 2 * (len(toks) + 1) > _VAR_OP_REPLACE_COST:
+        return _unreadable_op(value)
+    # Replaced at the longest match from the first place it matches.
+    out, i = [], 0
+    while i <= len(value):
+        ends = _glob_ends(toks, value, i)
+        end = ends[-1] if ends else -1
+        if end > i or end == i and (anchor or not value):
+            out.append(rep)
+            # An empty match ends it, as `//` would otherwise never move.
+            if op == "/" or end == i:
+                i = end
+                break
+            i = end
+            continue
+        if anchor == "#" or i == len(value):
+            break
+        out.append(value[i])
+        i += 1
+    return "".join(out) + value[i:]
 
 
 def _decode_ansi_c(command: str) -> str:
@@ -1985,7 +2325,25 @@ def _var_values(command: str) -> dict[str, list[str]]:
     return _memo("vals", command, _assigned_values, _join_continuations(command))
 
 
-def _assigned_values(command: str) -> dict[str, list[str]]:
+def _eval_named(word: str, known: dict[str, list[str]]) -> bool:
+    """Whether names spell `eval` in ``word``, through a few hops of names
+    holding names (`x=eval; z=$x; $z`): values here are not yet resolved."""
+    for _ in range(3):
+        if _basename(_pattern_vars(word, known)) == "eval":  # unknowns empty
+            return True
+        word = _pattern_vars(word, known, keep=True)
+        if "$" not in word:
+            break
+    return _basename(word) == "eval"
+
+
+# How deep an `eval`'s own assignments are read: `x='eval "$x"'; eval "$x"`
+# would otherwise re-read itself forever.
+_EVAL_ASSIGN_DEPTH = 3
+
+
+def _assigned_values(command: str, depth: int = 0,
+                     env: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
     vals: dict[str, list[str]] = {}
     states = _quote_states(command) if "${" in command else []
     applied: dict[str, list[str]] = {}
@@ -2040,6 +2398,45 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         # Gated on the text with quotes cut: `r''ead a` is `read a`.
         for name, value in _reader_values(command):
             vals.setdefault(name, []).append(value)
+    if depth < _EVAL_ASSIGN_DEPTH:
+        # An assignment `eval` runs binds the name for the rest of the line:
+        # `eval "a=\$(echo rm -rf /)"; $a` runs it, though no `a=` starts a
+        # word here (XERK-1651). Eval's words joined, as it re-parses them,
+        # wherever an `eval` word sits (`f(){ eval …`, `command eval`), however
+        # it is spelled (`e\val`), and with the names and output in them read.
+        for seg in _split_segments(command):
+            if "al" not in seg and "$" not in seg:
+                continue
+            words = _tokenize(seg)
+            known = {**(env or {}), **vals}
+            for k, w in enumerate(words):
+                # ...or spelled by names: `x=eval; $x "a=…"`, `${x}al`, `${x,,}`.
+                if _basename(w) != "eval" and not ("$" in w and _eval_named(w, known)):
+                    continue
+                rest = words[k + 1:]
+                while rest and (_basename(rest[0]) == "eval" or rest[0] == "--"):
+                    rest = rest[1:]
+                script = " ".join(rest)
+                scripts = {script}
+                if "$" in script:
+                    spliced = _var_sub(lambda u: _picked(known[u.group(1) or u.group(3)])
+                                       if (u.group(1) or u.group(3)) in known and not u.group(2)
+                                       else u.group(0), script)
+                    _spend(len(spliced) - len(script))
+                    scripts.add(spliced)
+                # ...and what a `$(…)` handed to it prints, read off the raw
+                # words: tokenized, its inner quotes were lost.
+                for sub in _find_substs(seg) if "$(" in seg or "`" in seg else ():
+                    printed = _printed_text(_subst_inner(sub))
+                    if printed:
+                        scripts.add(printed)
+                for sc in scripts:
+                    for name, got in _assigned_values(sc, depth + 1, known).items():
+                        # Each value once: two readings of one script binding
+                        # it twice halved the line's value headroom.
+                        have = vals.setdefault(name, [])
+                        have.extend(v for v in got if v not in have)
+                break
     # How many values one name is ASSIGNED, so `_expand_both` reads each on
     # its own. Not a `for` list's words: those are a loop's data, and a long
     # list would cost a whole reading per word.
@@ -2084,6 +2481,11 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         if name not in vals:
             return m.group(0)
         value = _picked(plain[name] if name == owner else others.get(name, plain[name]))
+        # Its trim too: `b=${a%% *}; "$b"` runs the first word (XERK-1651).
+        op = _VAR_OP_RE.match(m.group(2) or "")
+        if op and op.group(1) not in _VAR_DEFAULT_OPS:
+            got = _op_readings(value, op.group(1), op.group(2), plain)
+            value = got[0] if len(got) == 1 else " ".join((_UNREAD_OUTPUT, *got))
         _spend(len(value) - len(m.group(0)))
         return value
 
@@ -2127,9 +2529,11 @@ def _chain_values(vals: dict[str, list[str]], applied: dict[str, list[str]],
         got = known[name] if name == owner or not defaults[name] else known[name] + defaults[name]
         value = _picked(got)
         op = _VAR_OP_RE.match(m.group(2) or "")
-        if op:
-            value = _apply_var_op(value, op.group(1), op.group(2),
-                                  lambda t: _var_sub(lambda u: link(u, owner), t))
+        if op and op.group(1) not in _VAR_DEFAULT_OPS:
+            # Names in its pattern or alternative read from what is known so far.
+            got = _op_readings(value, op.group(1), op.group(2),
+                               {n: known[n] + defaults[n] for n in known if known[n] or defaults[n]})
+            value = got[0] if len(got) == 1 else " ".join((_UNREAD_OUTPUT, *got))
         _spend(len(value) - len(m.group(0)))
         return value
 
@@ -2839,15 +3243,17 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 # `a=(x /etc); rm -rf "${a[1]}"` read `"x /etc"` (XERK-1626).
                 out = '"' + _quote_literal(value, "") + '"'
             else:
-                if op:
-                    value = _apply_var_op(value, op.group(1), op.group(2), lambda t: _var_sub(
-                        lambda u: _picked(vals.get(u.group(1) or u.group(3)) or [u.group(0)]), t))
-                out = _quote_literal(value, state)
+                # A name in an op's pattern is expanded first: `"${a%%$s*}"`.
+                out = _splice_readings(_op_readings(value, op.group(1), op.group(2), vals)
+                                       if op else [value], state)
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
             # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
             # the `rm` a comment. The `#` was a word inside the braces; keep it
             # one (XERK-1585). Quotes and `$(…)` in the default stay live.
             out = re.sub(r"(?<!\\)#", r"\\#", op.group(2))
+            # A bare name in it braced, so text after the `}` stays text:
+            # `${a#${b:-$nope}x}` read the pattern as `$nopex` (XERK-1651).
+            out = re.sub(r"(?<!\\)\$([A-Za-z_]\w*)", r"${\1}", out)
             if states and states[m.start()] == '"':
                 out = _dq_default(out)
         else:

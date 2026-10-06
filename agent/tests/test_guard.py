@@ -15,6 +15,7 @@ so no package layout is assumed.
 import importlib.util
 import io
 import json
+import shlex
 import os
 import subprocess
 import sys
@@ -1685,6 +1686,141 @@ class TestScriptChannels(unittest.TestCase):
                     "echo /etc | xargs -I{} cp {} {}.bak"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+
+    def test_eval_assignments_and_glob_trims_reach_the_command(self):
+        """XERK-1651: a name `eval` assigns is bound for the rest of the line,
+        and a `${a%% *}`-style trim is a glob, matched as bash matches it;
+        each ran its payload as nobody, reaching rm as `/etc`."""
+        for cmd in ("eval \"a=\\$(echo rm -rf /etc)\"; $a",
+                    "bash -c 'eval \"a=\\$(echo rm -rf /etc)\"; $a'",
+                    "eval 'a=$(echo rm -rf /etc)'; $a",
+                    "eval -- a='\"rm -rf /etc\"'; $a",
+                    "eval x=/etc; rm -rf \"$x\"",
+                    "bash -c 'a=$(echo rm -rf /etc); \"${a%% *}\" ${a#* }'",
+                    "a='rm -rf /etc'; \"${a%%[ ]*}\" ${a#r? }",
+                    "a='rm -rf /etc'; \"${a%%[^a-z]*}\" ${a#*[^-a-z]}",
+                    "a='rm -rf /etc'; \"${a/ */}\" ${a#* }",
+                    "f=/etc/x; rm -rf \"${f%/*}\"",
+                    "f=/etc/x; rm -rf \"${f/%?x/}\"",
+                    # QA: eval respelled, named by a variable, in a function,
+                    # or fed by a name, a `read`, a `printf -v`, a `$(…)`.
+                    "e\\val \"a='rm -rf /etc'\"; $a",
+                    "ev''al \"a='rm -rf /etc'\"; $a",
+                    "x=eval; $x \"a='rm -rf /etc'\"; $a",
+                    "f(){ eval \"a='rm -rf /etc'\"; }; f; $a",
+                    "x=\"a='rm -rf /etc'\"; eval \"$x\"; $a",
+                    "eval \"read a <<< 'rm -rf /etc'\"; $a",
+                    "eval \"printf -v a %s 'rm -rf /etc'\"; $a",
+                    "eval \"$(echo \"a='rm -rf /etc'\")\"; $a",
+                    # QA: a trim one assignment away, a quoted, escaped,
+                    # POSIX-class or variable pattern, a nested one, extglob.
+                    "a='rm -rf /etc'; b=${a%% *}; \"$b\" ${a#* }",
+                    "a='rm -rf /etc'; \"${a%%[[:space:]]*}\" ${a#*[[:space:]]}",
+                    "a='rm -rf /etc'; \"${a%%\\ *}\" ${a#*' '}",
+                    "a='rm -rf /etc'; \"${a/%\" \"*/}\" ${a#* }",
+                    "s=' '; a='rm -rf /etc'; \"${a%%\"$s\"*}\" ${a#*$s}",
+                    "a='rm -rf /etc'; \"${a%%${IFS:0:1}*}\" ${a#* }",
+                    "a='rm -rf /etc'; \"${a%% *}\" ${a#\"${a%% *}\"}",
+                    "a='rm -rf /etc'; \"${a::2}\" ${a:3}",
+                    "a='Qrm -rf /etc'; ${a#[[:upper:]]}",
+                    "a='rm -rf /etcXY'; ${a%X\\Y}",
+                    # QA delta: a replacement or pattern naming an unset name
+                    # (read empty, as bash does), eval spelled by names, nested
+                    # eval, arithmetic offsets.
+                    "a='xx/etc'; rm -rf \"${a/xx/$nope}\"",
+                    "a='xx/etc'; rm -rf \"${a//x/$(true)}\"",
+                    "a='xx/etc'; rm -rf ${a#${nope}xx}",
+                    "a='xxrm'; ${a#$nope'xx'} -rf /etc",
+                    "a='xxrm'; ${a:(2)} -rf /etc",
+                    "a='xxrm'; ${a:1+1} -rf /etc",
+                    "x=ev; ${x}al \"a='rm -rf /etc'\"; $a",
+                    "e=e; v=val; $e$v \"a='rm -rf /etc'\"; $a",
+                    "x=EVAL; ${x,,} \"a='rm -rf /etc'\"; $a",
+                    "x=(eval); ${x[0]} \"a='rm -rf /etc'\"; $a",
+                    "x=eval; y='$x'; eval \"$y \\\"a='rm -rf /etc'\\\"\"; $a",
+                    "eval \"eval \\\"a='rm -rf /etc'\\\"\"; $a",
+                    # QA delta 3: a name bash fills itself, or a `$(…)`, in a
+                    # pattern or replacement; bash's truncating arithmetic;
+                    # a replace one assignment away; eval through two names.
+                    "a=X; rm -rf \"${a/X/$(echo /etc)}\"",
+                    "a=X; rm -rf \"${a/X/`echo /etc`}\"",
+                    "a='xxrm'; ${a/xx/$nope} -rf /etc",
+                    "a='Qrm -rf /etc'; ${a#$(echo Q)}",
+                    "cd /tmp && a='/tmprm -rf /etc' && ${a#$PWD}",
+                    "a='XXrm -rf /etc'; ${a:(-3/2+3)}",
+                    "a='XXrm -rf /etc'; ${a:(-1%3+3)}",
+                    "a='xx/etc'; b=${a/xx/$nope}; rm -rf $b",
+                    "x=eval; z=$x; $z \"a='rm -rf /etc'\"; $a",
+                    "${x:-eval} \"a='rm -rf /etc'\"; $a",
+                    "e$(true)val \"a='rm -rf /etc'\"; $a",
+                    # QA delta 5: a nested default glued to pattern text; a
+                    # one-hop op with a name in its pattern; the second `$(…)`
+                    # an eval is handed.
+                    "a=x/etc; rm -rf \"${a#${b:-$nope}x}\"",
+                    "s=x; a='x/etc'; b=\"${a#$s}\"; rm -rf $b",
+                    "s=Q; a='Q/etc'; b=${a/$s/}; rm -rf \"$b\"",
+                    "eval \"$(echo x=1)\" \"$(echo \"a='rm -rf /etc'\")\"; $a",
+                    "eval \"$(echo x=1); $(echo \"a='rm -rf /etc'\")\"; $a",
+                    # QA delta 6: an alternative keeps a name bash sets; ops
+                    # along a chain of names (XERK-1648's resolver).
+                    "q=1; rm -rf ${q:+$HOME}",
+                    "q=1; y=${q:+$HOME}; rm -rf \"$y\"",
+                    "q=/etcx; d=$q; r=${d%x}; rm -rf $r",
+                    "q=/tmp; d=$q; r=${d/tmp/etc}; rm -rf $r",
+                    "x=1; y=${x:+/etc}; z=$y; rm -rf $z",
+                    "q=1; a=/etc; y=${q:+$a}; z=$y; rm -rf $z"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("eval 'a=$(echo /tmp/x)'; rm -rf \"$a\"",
+                    "x='eval \"$x\"'; eval \"$x\"; ls",
+                    " ".join(['eval \"$(echo a=1)\";'] * 10) + " ls",
+                    "x=1; env ${x:+A=$nope} ls",
+                    "f(){ x=$1; env ${x:+A=$x} ls; }; f a",
+                    "eval \"$(ssh-agent -s)\"; ssh-add",
+                    "p=/usr/local/bin/tool; echo \"${p##*/}\" \"${p%/*}\"",
+                    "a='  x  '; a=\"${a#\"${a%%[![:space:]]*}\"}\"; echo \"$a\"",
+                    "f=/etc/x.txt; echo \"${f%.*}\"",
+                    "a='rm -rf /etc'; echo \"${a%% *}\" ${a#* }"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_an_op_too_costly_to_match_is_unreadable_not_kept_whole(self):
+        """XERK-1651 QA: the cost caps are what keep one op from running past
+        the hook's deadline; past them a value with blanks is led by the
+        unread marker (refused as a program), never returned whole."""
+        value = "rm -rf /etc " * 400
+        for op, arg in (("#", "*" + "?" * 100), ("/", "x*" + "?" * 10 + "/")):
+            with self.subTest(op=op):
+                got = guard._apply_var_op(value, op, arg)
+                self.assertTrue(got.startswith(guard._UNREAD_OUTPUT), got[:40])
+        self.assertEqual(guard._apply_var_op("/etc/x" * 2000, "#", "*" + "?" * 100),
+                         "/etc/x" * 2000)
+
+    def test_an_eval_splice_is_charged_to_the_budget(self):
+        """XERK-1651 QA: a name spliced into an eval's script many times is
+        refused as too large, never read for minutes."""
+        cmd = "x='" + "a=b " * 2000 + "'; eval " + " ".join(["$x"] * 4000) + "; ls"
+        started = time.monotonic()
+        self.assertIn("too large", guard.decide("Bash", {"command": cmd})[1] or "")
+        self.assertLess(time.monotonic() - started, 20)
+
+    def test_glob_trims_match_bash(self):
+        """XERK-1651: `_apply_var_op`'s glob cases agree with bash itself."""
+        cases = [(v, op, pat) for v in ("", "a", "rm -rf /", "aXbXc", "/etc/x", "X/Y*")
+                 for op, pats in (("#", ("*", "?", "a*", "* ", "[!a]*", "\\*", "'r'?")),
+                                  ("##", ("*", "*X", "*/", "*[[:space:]]")),
+                                  ("%", ("*", "X*", "/*", " *", "\\X", '"X"?')),
+                                  ("%%", ("*", "X*", " *", "[^a-z]*", "[[:blank:]]*")),
+                                  ("/", ("X*/-", "#*/-", "%?/-", "#/-", " */", "\\ */")),
+                                  ("//", ("X/-", "?/-", "*/-", "[ab]/-", "X\\/Y/-")))
+                 for pat in pats]
+        script = "".join(f"v={shlex.quote(v)}; printf '%s\\0' \"${{v{op}{pat}}}\"\n"
+                         for v, op, pat in cases)
+        want = subprocess.run(["bash", "-c", script], capture_output=True,
+                              text=True, check=True).stdout.split("\0")
+        for (v, op, pat), exp in zip(cases, want):
+            with self.subTest(value=v, op=op, pat=pat):
+                self.assertEqual(guard._apply_var_op(v, op, pat), exp)
 
     def test_a_function_call_and_set_bind_the_positionals(self):
         """XERK-1626: a function's `$1`… are its call's words, a `set --` sets
