@@ -3023,6 +3023,18 @@ def _split_on_operators(command: str, include_pipe: bool = True,
                 buf.append("|&")
             i += 2
             continue
+        if command.startswith("&>", i):
+            # `&> >(sh)`/`&>> >(sh)` is a bash redirect to a process substitution
+            # (dash has no `>(`), so keep it with the stage to feed the sub
+            # (XERK-1628). The op is read FIRST so the `>(` gate skips past the
+            # whole `&>>`, not just `&>`. A plain `&>file` falls through to the
+            # `&` split, keeping dash's reading (`&` background + `>file`), which
+            # catches `true &>/dev/null rm …`.
+            op = "&>>" if command.startswith("&>>", i) else "&>"
+            if command[i + len(op):].lstrip().startswith(">("):
+                buf.append(op)
+                i += len(op)
+                continue
         if ch in (";", "\n", "&") or (include_pipe and ch == "|"):
             # The `&` of `2>&1` and the `|` of `>|f` may belong to a
             # redirection, which splitting cuts: `>/dev/null 2>&1 rm -rf /etc`
@@ -3070,20 +3082,74 @@ def _split_segments(command: str) -> list[str]:
 def _unwrap_group(segment: str) -> str:
     """Strip subshell/group wrappers so `(rm -rf /)` classifies as `rm -rf /`.
 
-    The cheap first/last-char strip is right unless a trailing redirect or
-    escape leaves a `)`/`}` at the end that is NOT the opener's match
-    (`(a) 2>/tmp/f\\)`, XERK-1628); only then is a quote-aware scan worth its
-    cost. Without the gate the scan ran per layer, making a 3000-deep `(…)`
-    nest O(n²) at every recursion level (XERK-1628 QA)."""
+    Only brackets that WRAP the whole segment are stripped — `(a) 2>/tmp/f\\)`
+    and `(a) | (b)` end in a closer that is not the opener's, so stripping `(`
+    and the final `)` severed the real command (XERK-1628). One quote/escape/
+    `$(…)`-aware scan records every opener's close; the concentric prefix is
+    then peeled in O(n), not O(n²) per layer (XERK-1628 QA)."""
     seg = segment.strip()
-    risky = any(c in seg for c in "<>&\\")
-    while len(seg) >= 2 and (
-        (seg[0] == "(" and seg[-1] == ")") or (seg[0] == "{" and seg[-1] == "}")
-    ):
-        if risky and _group_close(seg) != len(seg) - 1:
+    if seg[:1] not in ("(", "{"):
+        return seg
+    if not any(c in seg for c in "<>&\\'\"`"):
+        # No redirect/escape/quote can hide a non-matching closer, so matched
+        # first/last pairs are safe to strip directly.
+        while len(seg) >= 2 and (
+            (seg[0] == "(" and seg[-1] == ")") or (seg[0] == "{" and seg[-1] == "}")
+        ):
+            seg = seg[1:-1].strip().rstrip(";").strip()
+        return seg
+    # One pass recording each opener's matching close (`(`/`$(` → `)`, `{ `/
+    # `${` → `}`), skipping quotes and escapes.
+    close_of: dict[int, int] = {}
+    stack: list[tuple[str, int]] = []
+    i, n, q = 0, len(seg), None
+    while i < n:
+        c = seg[i]
+        if q:
+            if c == "\\" and q != "'" and i + 1 < n:
+                i += 2
+                continue
+            if c == q:
+                q = None
+            i += 1
+            continue
+        if c == "\\":
+            i += 2
+            continue
+        if c in ("'", '"', "`"):
+            q = c
+            i += 1
+            continue
+        if seg.startswith(("$(", "${"), i):
+            stack.append((")" if seg[i + 1] == "(" else "}", i))
+            i += 2
+            continue
+        if c == "(":
+            stack.append((")", i))
+        elif c == "{" and seg[i + 1:i + 2] in (" ", "\t", "\n"):
+            stack.append(("}", i))
+        elif c in (")", "}") and stack and stack[-1][0] == c:
+            close_of[stack.pop()[1]] = i
+        i += 1
+    # Peel concentric wrappers: each layer's opener must sit at the front
+    # (only whitespace before) and its close at the back (only whitespace/`;`
+    # after) of the span still being stripped.
+    lo, hi = 0, n
+    while True:
+        while lo < hi and seg[lo] in " \t\n":
+            lo += 1
+        if lo >= hi or seg[lo] not in ("(", "{"):
             break
-        seg = seg[1:-1].strip().rstrip(";").strip()
-    return seg
+        ci = close_of.get(lo)
+        if ci is None or ci >= hi:
+            break
+        k = ci + 1
+        while k < hi and seg[k] in " \t\n;":
+            k += 1
+        if k != hi:
+            break
+        lo, hi = lo + 1, ci
+    return seg[lo:hi].strip().rstrip(";").strip()
 
 
 def _join_continuations(segment: str) -> str:
@@ -3738,6 +3804,9 @@ def _reads_stdin_script_as(stage: str, depth: int) -> bool:
 # redirections that may follow one: `do (…)`, `! (…)`, `time -p { …; }`,
 # `(…) 2>&1`.
 _GROUP_LEAD_RE = re.compile(r"\A(?:(?:do|then|else|elif|if|while|until|time|!|-p)[ \t\n]+)+")
+# The leads that are NOT themselves compound openers, so a compound behind them
+# (`time if …; fi`) is reached without eating its `if`/`while`/`until` opener.
+_NONCOMPOUND_LEAD_RE = re.compile(r"\A(?:(?:do|then|else|elif|time|!|-p)[ \t\n]+)+")
 _TRAIL_OPS = ("<<<", "<<-", "<<", "&>>", ">>", "&>", ">&", "<&", ">|", "<>", ">", "<")
 _TRAIL_WORD_END = frozenset(" \t\n;&|()<>")
 
@@ -3860,6 +3929,11 @@ def _group_core(part: str) -> str | None:
     # keywords too (`if (…)`), so `_GROUP_LEAD_RE` would eat the opener.
     if _compound_opener(stripped, 0):
         return _compound_body(stripped)
+    # A compound behind a `time`/`!`/`do` keyword prefix (`time if …; fi | sh`);
+    # strip only non-opener leads so the `if`/`while`/`until` opener survives.
+    led = _NONCOMPOUND_LEAD_RE.sub("", stripped)
+    if _compound_opener(led, 0):
+        return _compound_body(led)
     core = _GROUP_LEAD_RE.sub("", stripped)
     if core[:1] in ("(", "{"):
         end = _group_close(core)
@@ -3892,8 +3966,12 @@ def _compound_body(text: str) -> str:
     depth = 0           # inner `(`/`{` groups and nested compounds
     quote: str | None = None
     want_in = kw in ("for", "select", "case")  # a header to skip up to `in`
+    # C-style `for ((…)); do …; done` has no `in`; its header is the `((…))`.
+    if kw in ("for", "select") and text[len(kw):].lstrip()[:2] == "((":
+        want_in = False
     is_case = kw == "case"
     pat = False         # dropping a `case` pattern up to its `)`
+    pat_lead = False    # the next non-blank `(` is the optional pattern opener
     pat_paren = 0
 
     def flush() -> None:
@@ -3929,7 +4007,17 @@ def _compound_body(text: str) -> str:
             i += 1
             continue
         if pat:
-            # Drop a case pattern (and its optional `(a|b)` opener) up to `)`.
+            # Drop a case pattern up to its `)`. A leading `(` is the OPTIONAL
+            # pattern-list opener (`(x)`, `(a|b)`), matched by that `)`; it must
+            # not be counted, or the pattern never ends (XERK-1628).
+            if pat_lead and ch in " \t":
+                i += 1
+                continue
+            if pat_lead and ch == "(":
+                pat_lead = False
+                i += 1
+                continue
+            pat_lead = False
             if ch == "(":
                 pat_paren += 1
             elif ch == ")":
@@ -3944,7 +4032,7 @@ def _compound_body(text: str) -> str:
                 want_in = False
                 buf.clear()  # the `for X`/`case W` header is not a command
                 if is_case:
-                    pat = True
+                    pat = pat_lead = True
                 i += 2
                 continue
             i += 1  # still in the header
@@ -3989,7 +4077,7 @@ def _compound_body(text: str) -> str:
                 continue
             if is_case and text.startswith(";;", i):
                 flush()
-                pat = True
+                pat = pat_lead = True
                 i += 3 if text.startswith(";;&", i) else 2
                 continue
             if text.startswith(("&&", "||"), i):
@@ -4098,21 +4186,30 @@ def _command_reads_stdin_as(stage: str, depth: int) -> bool:
             raw = raw[1:]
         script = " ".join(raw)
         for m in _find_substs(script):
-            if m.group(0)[0] in "$`" and _passes_input(_subst_inner(m)):
+            body = _subst_inner(m)
+            # `$(cat)` or `$(</dev/stdin)` captures the inherited stdin as the
+            # script bash then runs.
+            if m.group(0)[0] in "$`" and (_passes_input(body)
+                    or re.match(r"\s*<\s*(/dev/stdin|/dev/fd/0|/proc/self/fd/0)\s*$", body)):
                 return True
         return bool(script) and _reads_stdin_script(script, depth + 1, fresh=True)
     if prog == "xargs":
         # `xargs … sh -c` hands the piped text to the shell's `-c` as its
         # SCRIPT (`… | xargs -0 sh -c`); with a script already present the text
-        # is only positional params, so that is not a read (XERK-1628).
+        # is only positional params, so that is not a read (XERK-1628). But a
+        # replace-string (`-I@`/`-i`/`--replace`) substitutes the text INTO the
+        # command, so `-I@ sh -c '@'` IS a read.
         inner = list(rest)
+        replace = False
         while inner and inner[0].startswith("-") and len(inner[0]) > 1:
             opt = inner.pop(0)
+            if opt in ("-I", "-i", "--replace") or opt.startswith(("-I", "-i", "--replace=")):
+                replace = True
             if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
                 inner.pop(0)
         if inner and _basename(inner[0]) in _SHELL_PROGS:
             r2 = inner[1:]
-            return _shell_c_index(r2) >= 0 and not _shell_c_script(r2)
+            return replace or (_shell_c_index(r2) >= 0 and not _shell_c_script(r2))
         return False
     if prog not in _SHELL_PROGS:
         return False
@@ -4439,6 +4536,16 @@ def _function_bodies(command: str) -> dict[str, str]:
         j = m.end()
         while j < len(command) and command[j] in " \t\n":
             j += 1
+        # `function f ()` has a `()` the `function NAME` arm did not consume;
+        # skip it to reach the `{ … }`/`( … )` body (XERK-1628).
+        if m.group(2) and command[j:j + 1] == "(":
+            k = j + 1
+            while k < len(command) and command[k] in " \t":
+                k += 1
+            if command[k:k + 1] == ")":
+                j = k + 1
+                while j < len(command) and command[j] in " \t\n":
+                    j += 1
         if j < len(command) and command[j] in ("{", "("):
             end = _group_close(command[j:])
             if end >= 0:
@@ -4933,8 +5040,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     if unsplit_line and feeds_a_shell:
         # ...and the line read with its assignments cut (XERK-1620).
         pipelines = list(dict.fromkeys(pipelines + _walked_pipelines(unsplit_line)))
-    # Functions the line defines, so a bare call in a pipeline runs its body.
-    func_bodies = _function_bodies(command) if (feeds_a_shell and "(" in command) else {}
+    # Functions the line defines, so a call in a pipeline runs its body.
+    func_bodies = (_function_bodies(command)
+                   if feeds_a_shell and ("(" in command or "function" in command) else {})
     for pipeline in pipelines:
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
         # feeding it either, so skip its per-stage scan too — unless the line
@@ -4953,12 +5061,18 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             _feed(text)
         for stage in _split_on_operators(pipeline, keep_redirects=True, groups=True):
             ustage = _unwrap_group(stage)
-            # A bare call to a function the line defines runs its body, which
-            # may read stdin or print the fed text (XERK-1628).
-            if func_bodies:
+            # A call to a function the line defines runs its body, which may
+            # read stdin or print the fed text; arguments bind to `$1…` the
+            # body may ignore, so resolve whatever the call's args (XERK-1628).
+            # Chase a body that is itself a bare call (`f(){ g; }; g(){ bash; }`).
+            seen_fn = 0
+            while func_bodies and seen_fn <= _MAX_EXPAND_DEPTH:
                 call = _strip_prefixes(_tokenize(ustage))
-                if len(call) == 1 and _basename(call[0]) in func_bodies:
+                if call and _basename(call[0]) in func_bodies:
                     stage = ustage = func_bodies[_basename(call[0])]
+                    seen_fn += 1
+                else:
+                    break
             # `cmd > >(reader)`: the reader consumes this stage's stdout, so it
             # runs that output as a script — `echo … > >(sh)` (XERK-1628).
             for m in _find_substs(ustage):

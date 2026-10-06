@@ -1862,7 +1862,20 @@ class TestScriptChannels(unittest.TestCase):
                 f"{{ true; echo {R}; }} 2>'/tmp/x }}}}}}}}}}' | sh",
                 f'(true; echo {R}) 2>"/tmp/x$(echo \")\")" | sh',
                 f"(true; echo {R}) 2>/tmp/f\\) | sh",
-                f'x=$( (true; echo {R}) 2>/tmp/f); echo "$x" | sh'):
+                f'x=$( (true; echo {R}) 2>/tmp/f); echo "$x" | sh',
+                # Standard-syntax siblings of the classes above (XERK-1628 QA).
+                f"function f {{ bash; }}; echo {R} | f",
+                f"function f() {{ bash; }}; echo {R} | f", f"f() {{ bash; }}; echo {R} | f arg",
+                f"f() {{ g; }}; g() {{ bash; }}; echo {R} | f",
+                f"echo {R} | case x in (x) bash;; esac", f"case x in (x) echo {R};; esac | sh",
+                f"echo {R} | for ((n=0;n<1;n++)); do bash; done",
+                f"for ((n=0;n<1;n++)); do echo {R}; done | sh",
+                f"echo {R} | xargs -I@ sh -c '@'", f"echo {R} &> >(sh)",
+                f"echo {R} &>> >(sh)", f"echo {R} &>>>(sh)",
+                f"time if true; then echo {R}; fi | sh",
+                f"time -p if true; then echo {R}; fi | sh",
+                f"time for i in 1; do echo {R}; done | sh",
+                f"echo {R} | bash -c 'eval \"$(</dev/stdin)\"'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("if true; then echo hi; fi", "for f in *.txt; do cat \"$f\"; done",
@@ -1870,7 +1883,11 @@ class TestScriptChannels(unittest.TestCase):
                     "case $x in a) echo a;; esac | sort", "f() { echo hi; }; f | sort",
                     "eval echo hello", "echo x > >(cat)", "exec 3>/tmp/log; echo hi >&3",
                     "find . -name '*.py' | xargs grep foo", "time -p { make; } | tee log",
-                    "(echo x) 2>/tmp/f | grep y", "cat <<EOF\nhi\nEOF"):
+                    "(echo x) 2>/tmp/f | grep y", "cat <<EOF\nhi\nEOF",
+                    "function f { echo hi; }; f | sort", "case $x in (a) echo a;; esac | sort",
+                    "for ((i=0;i<3;i++)); do echo $i; done | sort", "echo hi &> /tmp/log",
+                    "echo hi | xargs -I@ echo @", "time if true; then echo hi; fi | sort",
+                    "echo hi &>> /tmp/log"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
