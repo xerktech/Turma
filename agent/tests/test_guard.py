@@ -3613,6 +3613,34 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
+    def test_a_bash_only_glob_class_or_a_glob_after_home_is_judged(self):
+        # XERK-1654: fnmatch has no `[[:alpha:]]` class and reads `[^x]` as a
+        # literal `^`, and a glob straight after `$HOME` may match the home itself.
+        for cmd in ("rm -rf /e[[:alpha:]]c", "rm -rf /[[:alpha:]]tc", "rm -rf /e[[:lower:]]c",
+                    "rm -rf /e$x[[:alpha:]]c", "rm -rf /[^x]tc", "rm -rf /e[![:digit:]]c",
+                    "rm -rf /e[[=t=]]c", "rm -rf ~/[[:punct:]]ssh", "rm -rf $HOME*",
+                    'rm -rf "$HOME"$x*', "rm -rf $HOME$x?", "rm -rf ${HOME}*",
+                    "chmod -R 777 $HOME*", "rm -rf $HOME*/.ssh", "rm -rf $HOME*/.[!.]*",
+                    "rm -rf /root*/.ssh", "rm -rf /r[o]ot/.ssh", "rm -rf /root[[:alpha:]]*/.ssh",
+                    # A class inside an outer bracket, which a bracket parse
+                    # started at the inner `[` turned back into a literal.
+                    "rm -rf /e[t[:]c", "rm -rf /e[[=t]c", "rm -rf /e[]t[:]c",
+                    "rm -rf /e[!a[:]c", "rm -rf /[a-z[:]tc", "rm -rf /bi[!r[=]",
+                    "rm -rf /[:[=b]in"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        # A class under a scratch dir, a glob below the home, a longer name, and
+        # `~*`, which bash leaves unexpanded and globs in the cwd.
+        for cmd in ("rm -rf /tmp/[[:alpha:]]*", "rm -rf build/[[:digit:]]*", "rm -rf ~*",
+                    "rm -rf $HOME/build*", "rm -rf $HOME*/build", "rm -rf $HOMEDIR*",
+                    "ls /e[[:alpha:]]c", "rm -rf /tmp/[^.]*"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        # An unclosed bracket of classes is not parsed, so it cannot backtrack.
+        start = time.monotonic()
+        guard.decide("Bash", {"command": "rm -rf /[" + "[:a:]" * 40 + " /tmp/x"}, cwd="/tmp")
+        self.assertLess(time.monotonic() - start, 2)
+
     def test_a_nested_quote_or_a_reassigned_value_does_not_hide_the_command(self):
         # XERK-1621: a `"…"` inside a string's `${…}` nests rather than closing
         # the string, and its `'` hid the rest of the line; a name assigned
