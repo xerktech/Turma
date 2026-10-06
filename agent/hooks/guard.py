@@ -2847,7 +2847,10 @@ def _defined_names(command: str) -> frozenset[str]:
     names = {a or b for a, b in _FUNC_NAME_RE.findall(command)}
     for words in _ALIAS_RE.findall(command):
         names.update(w.split("=", 1)[0].strip("'\"") for w in words.split() if "=" in w)
-    return frozenset(n.lower() for n in names)
+    # `_ungrouped` strips a leading `{` from the word it asks about, so `{f()`
+    # is also recorded as the `f` it will see when `{f <<EOF` calls it.
+    names |= {n.lstrip("{") for n in names}
+    return frozenset(n.lower() for n in names if n)
 
 
 def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],

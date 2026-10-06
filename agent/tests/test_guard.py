@@ -1501,7 +1501,8 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <<EOF | /bin/ba[^x]h\n{R}\nEOF",
                     # Any word bash takes as a function name, defined lines earlier.
                     f"f+() {{ bash; }}\nf+ <<EOF\n{R}\nEOF", f"f]() {{ bash; }}\nf] <<EOF\n{R}\nEOF",
-                    f"f/g() {{ bash; }}\nf/g <<EOF\n{R}\nEOF", f"{{ f{{() {{ bash; }}; }}\nf{{ <<EOF\n{R}\nEOF",
+                    f"f/g() {{ bash; }}\nf/g <<EOF\n{R}\nEOF", f"{{ f{{() {{ bash; }}; }}\nf{{ <<EOF\n{R}\nEOF", f"{{f(){{ bash; }}\n{{f <<EOF\n{R}\nEOF",
+                    f"{{{{f() {{ bash; }}\ncat <<EOF | {{{{f\n{R}\nEOF",
                     f"alias a=b 'c=bash'\nc <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
