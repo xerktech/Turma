@@ -2817,7 +2817,9 @@ def _heredoc_segment_programs(segment: str):
     # starts: `echo "$(bash<<EOF`, `cat <(sh <<EOF`. A closed one stays a word
     # of its own, so `$(echo bash)<<EOF` still names a program (XERK-1624).
     text = re.split(r"[$<>]\(", _SUBST_RE.sub("`s`", segment))[-1]
-    for reading in _ungrouped(text):
+    # ...and the text as written: `_ungrouped` strips a `{` glued to the word,
+    # and bash reads `{f` or `{{` as a function's whole name.
+    for reading in dict.fromkeys((text.strip(), *_ungrouped(text))):
         tokens = _strip_prefixes(_tokenize(reading))
         # A redirection may come first, and its target may be a word of its own.
         while tokens and re.match(r"\d*[<>]", tokens[0]):
@@ -2838,7 +2840,7 @@ def _heredoc_segment_programs(segment: str):
 # whitespace, so `{f()` names `{f`, as bash reads it).
 _FUNC_NAME_RE = re.compile(
     r"(?:^|(?<=[\s;&|()]))([^\s;&|()<>'\"`$]+)[ \t]*\([ \t]*\)"
-    r"|(?<![\w.-])function[ \t]+([^\s(){};|&]+)")
+    r"|(?<![\w.-])function[ \t]+([^\s();|&]+)")
 _ALIAS_RE = re.compile(r"(?<![\w.-])alias([^;&|\n]*)")
 
 
@@ -2847,10 +2849,7 @@ def _defined_names(command: str) -> frozenset[str]:
     names = {a or b for a, b in _FUNC_NAME_RE.findall(command)}
     for words in _ALIAS_RE.findall(command):
         names.update(w.split("=", 1)[0].strip("'\"") for w in words.split() if "=" in w)
-    # `_ungrouped` strips a leading `{` from the word it asks about, so `{f()`
-    # is also recorded as the `f` it will see when `{f <<EOF` calls it.
-    names |= {n.lstrip("{") for n in names}
-    return frozenset(n.lower() for n in names if n)
+    return frozenset(n.lower() for n in names)
 
 
 def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
@@ -2889,7 +2888,8 @@ def _stage_may_read_stdin(stage: str, vals: dict[str, list[str]],
     `_owner_word_may_be_shell` reads it: `cat <<EOF | $S` (XERK-1624)."""
     if _reads_stdin_grouped(stage):
         return True
-    for reading in _ungrouped(_SUBST_RE.sub("`s`", stage)):
+    stage = _SUBST_RE.sub("`s`", stage)
+    for reading in dict.fromkeys((stage.strip(), *_ungrouped(stage))):  # `| {f`, as above
         tokens = _strip_prefixes(_tokenize(reading))
         if not tokens:
             continue
