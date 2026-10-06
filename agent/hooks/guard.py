@@ -1563,11 +1563,15 @@ _IFS_RE = re.compile(r"\$\{IFS\}|\$IFS")
 # (`bash -c`), so decoding it here ate the `$` that re-parse needs. After an
 # EVEN run (`\\$'…'`) it is still a live ANSI-C string (XERK-1611).
 _ANSI_C_RE = re.compile(r"(?<!\\)(\\*)\$'((?:[^'\\]|\\.)*)'")
-# A `{…}` word; it expands only when a `,` follows its first character. Testing
-# that in the regex (`[^{}\s]+,[^{}\s]*`) backtracked over every comma of an
-# unclosed `{a,a,…`: quadratic, and a hook that times out runs the command
-# (XERK-1596).
+# A `{…}` word; it expands when it holds a `,` (`{,bash}` too: bash drops the
+# empty word) or is a sequence. Testing that in the regex (`[^{}\s]+,[^{}\s]*`)
+# backtracked over every comma of an unclosed `{a,a,…`: quadratic, and a hook
+# that times out runs the command (XERK-1596).
 _BRACE_RE = re.compile(r"\{([^{}\s]+)\}")
+# `{h..h}`, `{1..3}`, `{a..e..2}`: a sequence bash expands like a list (XERK-1629).
+_BRACE_SEQ_RE = re.compile(r"(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?")
+# The most words a sequence is expanded to; a longer one is left as written.
+_BRACE_SEQ_MAX = 64
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
 # inlined as `eval 'rm` (XERK-1256).
 # A value is read WHOLE, quoted runs and substitutions included: cut at its
@@ -1678,6 +1682,21 @@ def _decode_ansi_c(command: str) -> str:
     return _ANSI_C_RE.sub(rep, command)
 
 
+def _brace_sequence(body: str) -> list[str] | None:
+    """The words a `{x..y[..step]}` sequence expands to, or None."""
+    m = _BRACE_SEQ_RE.fullmatch(body)
+    if not m:
+        return None
+    a, b, step = m.group(1), m.group(2), abs(int(m.group(3) or 1)) or 1
+    if a.lstrip("-").isdigit() != b.lstrip("-").isdigit():
+        return None
+    lo, hi = (int(a), int(b)) if a.lstrip("-").isdigit() else (ord(a), ord(b))
+    if abs(hi - lo) // step >= _BRACE_SEQ_MAX:
+        return None
+    seq = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+    return [str(v) if a.lstrip("-").isdigit() else chr(v) for v in seq]
+
+
 def _expand_braces(command: str) -> str:
     """`rm -rf {/etc,/var}` → `rm -rf /etc /var` (prefix/suffix preserved).
 
@@ -1695,7 +1714,8 @@ def _expand_braces(command: str) -> str:
         start, end = m.span()
         # `${x,,}` is a case-modifying parameter expansion, never a brace
         # list: expanded, `${x,,}rm` read as `$xrm $rm $rm` (XERK-1615).
-        if states[start] or "," not in m.group(1)[1:] \
+        items = m.group(1).split(",") if "," in m.group(1) else _brace_sequence(m.group(1))
+        if states[start] or not items \
                 or (start and command[start - 1] == "$" and _live_dollar(command, start - 1)):
             pos = start + 1
             continue
@@ -1705,7 +1725,8 @@ def _expand_braces(command: str) -> str:
         if word_end == -1:
             word_end = len(command)
         prefix, suffix = command[word_start:start], command[end:word_end]
-        parts = [prefix + p.strip() + suffix for p in m.group(1).split(",")]
+        # An empty word goes, as in bash: `{,bash}` runs `bash`.
+        parts = [w for w in (prefix + p.strip() + suffix for p in items) if w]
         command = command[:word_start] + " ".join(parts) + command[word_end:]
         pos = word_start
         states = _quote_states(command)
@@ -3127,16 +3148,18 @@ _SHELL_WORD_RE = re.compile(
     r"|(?:^|(?<=[\s;&|({]))\.(?=\s)")
 
 
-# What may expand to nothing inside a word: `$@`, `$*` (no arguments at the
-# top level) and an empty `$''` / `$""`.
-_EMPTY_EXPANSION_RE = re.compile(r"\$(?:[@*]|\{[@*]\}|''|\"\")")
+# What may expand to nothing inside a word: `$@`, `$*`, `${@:-}`, `${*:1}` (no
+# arguments at the top level) and an empty `$''` / `$""`.
+_EMPTY_EXPANSION_RE = re.compile(r"\$(?:[@*]|\{[@*][^}]*\}|''|\"\")")
+# `$"…"` is a locale-translated string: untranslated, `$"bash"` runs `bash`.
+_LOCALE_STRING_RE = re.compile(r"\$(?=\")")
 
 
 def _name_readings(text: str) -> tuple[str, ...]:
     """``text``, and again as bash may form program names from it (XERK-1629):
     every `$(…)`/backtick substitution printing nothing, `$@`/`$*`/`$''`/`$""`
     empty, `$'\\x68'` decoded and `{a,b}` braces expanded. Bash runs `bas``h`,
-    `bas$(:)h`, `bas$@h`, `$'bas\\150'` as `bash`, and `{bas,-s}h` as `bash
+    `bas$(:)h`, `bas$@h`, `$'bas\\150'`, `$"bash"` as `bash`, and `{bas,-s}h` as `bash
     -sh`; shlex reads each as one other word. Only for asking which program a
     command runs: a substitution dropped here is still classified where it sits."""
     if "$" not in text and "`" not in text and "{" not in text:
@@ -3147,7 +3170,8 @@ def _name_readings(text: str) -> tuple[str, ...]:
             out.append(text[last:m.start()])
             last = m.end()
     out.append(text[last:])
-    formed = _expand_braces(_decode_ansi_c(_EMPTY_EXPANSION_RE.sub("", "".join(out))))
+    formed = _LOCALE_STRING_RE.sub("", _EMPTY_EXPANSION_RE.sub("", "".join(out)))
+    formed = _expand_braces(_decode_ansi_c(formed))
     return (text,) if formed == text else (text, formed)
 
 

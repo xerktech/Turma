@@ -27,12 +27,14 @@ paths:
   memoised per `_expand` call (per owner it was O(heredocs × segments)). Tests:
   `TestExpansionBudget.test_redirect_runs_on_a_heredoc_line_stay_linear`.
 - **A program name is asked of every way bash may form it** (`_name_readings`, XERK-1629): the
-  text as written, and with every `$(…)`/backtick, `$@`, `$*`, `$''`, `$""` dropped, ANSI-C
-  decoded and braces expanded (`bas``h`, `bas$(:)h`, `$'bas\150'`, `{bas,-s}h` = `bash -sh`).
+  text as written, and with every `$(…)`/backtick, `$@`, `$*`, `${@…}`, `$''`, `$""` dropped, `$"…"` unlocalised,
+  ANSI-C decoded and braces expanded (`bas``h`, `bas$(:)h`, `$'bas\150'`, `{bas,-s}h` = `bash -sh`).
   - Read at `_command_reads_stdin` (every pipe/heredoc reader) and over the whole owner in
     `_heredoc_owner_feeds_shell` and the closer scan — BEFORE `_ungrouped`, which strips a
     leading `{` and cut `{bas,-s}h` to `bas,-s`.
   - Dropping a substitution that prints text over-reads; it only ever adds a shell reading.
+  - `_expand_braces` expands a leading-comma list (`{,bash}` = `bash`, empty words dropped) and
+    a sequence (`bas{h..h}`), up to `_BRACE_SEQ_MAX` words; a longer one stays as written.
 - Not covered (open tickets): names via variable/glob/function/alias (XERK-1624), data later
   run as code (XERK-1555).
 - Tests: `TestScriptChannels.test_a_heredoc_owner_shell_behind_a_glue_subshell_or_group`,

@@ -1499,15 +1499,23 @@ class TestScriptChannels(unittest.TestCase):
         R = self.R
         for name in ("bas``h", "bas$()h", "bas$(:)h", "bas$( )h", "bas` `h", "b``a``s``h",
                      "bas$(true)h", "bas$''h", 'bas$""h', "bas$@h", "bas$*h", "bas${@}h",
+                     "bas${@:-}h", "bas${*:-}h", "bas${@:1}h",
+                     "{,bash}", "bas{h..h}", "{b..b}ash", '$"bash"', '$"bas"h',
+                     "bas${@:-}h", "bas${*:-}h", "bas${@:1}h",
                      "bas$'\\x68'", "$'bas\\150'", "{bas,-s}h", "/bin/bas``h"):
             for cmd in (f"{name} <<EOF\n{R}\nEOF", f"{name} <<'EOF'\n{R}\nEOF",
                         f"cat <<EOF | {name}\n{R}\nEOF", f"echo '{R}' | {name}",
                         f"{{ X=')' {name}; }} <<EOF\n{R}\nEOF", f"(X=')' {name})<<EOF\n{R}\nEOF"):
                 with self.subTest(cmd=cmd):
                     self.assertDenied(cmd)
-        # `bash sh` / `sh s` run a script FILE, not stdin.
+        # `bash sh` / `sh s` run a script FILE, not stdin; a sequence past
+        # `_BRACE_SEQ_MAX`, or a mixed one bash leaves literal, is not expanded.
+        for cmd in (f"echo x | {{,bash}} -c '{R}'", f"rm -rf /{{e..e}}tc"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
         for cmd in (f"echo '{R}' | {{ba,}}sh", f"echo '{R}' | s{{h,}}",
-                    f"cat$(:) <<EOF\n{R}\nEOF", f"echo '{R}' | ca``t"):
+                    f"cat$(:) <<EOF\n{R}\nEOF", f"echo '{R}' | ca``t", "echo {1..5}",
+                    "echo {1..99999}", "echo {a..1}", f"echo '{R}' | {{,c}}at"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
@@ -2419,7 +2427,7 @@ class TestExpansionBudget(unittest.TestCase):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
             self.assertLess(time.monotonic() - t, 5, cmd[:20])
-        self.assertEqual(guard._expand_braces("rm {,a} {a} {a,b}"), "rm {,a} {a} a b")
+        self.assertEqual(guard._expand_braces("rm {,a} {a} {a,b}"), "rm a {a} a b")
         self.assertEqual(guard._expand_braces("rm {a, b}"), "rm {a, b}")
         # The grep and the tmux must share one `;`/`&`/newline piece, grep first.
         self.assertTrue(guard._greps_for_tmux("ps | grep -w tmux"))
