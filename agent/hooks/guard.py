@@ -92,6 +92,7 @@ _ENV_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*?\])?\+?=.*\Z", re.DOTAL
 _PREFIX_WORDS = {
     "sudo", "doas", "runas", "command", "nohup", "time", "exec", "env",
     "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer", "builtin",
+    # `coproc cmd` runs cmd (XERK-1624).
     "coproc",
 }
 
@@ -3883,14 +3884,33 @@ def _reads_stdin_grouped(segment: str) -> bool:
     return any(_reads_stdin_script(text) for text in _ungrouped(segment))
 
 
+# Substitution bodies that print nothing, unless the line redefines them.
+_SILENT_BODIES = {"", ":", "true", "false"}
+
+
+def _owner_substs(text: str) -> str:
+    """``text`` with each complete substitution replaced by a placeholder:
+    `` `0` `` for a body that prints nothing (`$(:)`), `` `s` `` for any
+    other. Printed text is never trusted — IFS splits it, `echo` may be
+    redefined, and `en$(…)` printing `v bash` runs `env bash` — so
+    `_owner_word_may_be_shell` fails closed on `` `s` `` (XERK-1624)."""
+    # Idempotent: a placeholder already in ``text`` maps to itself.
+    return _sub_substs(text, lambda m: "`0`" if _subst_inner(m).strip() in (*_SILENT_BODIES, "0")
+                       else "`s`")
+
+
 def _heredoc_segment_programs(segment: str):
-    """The programs a segment holding a heredoc operator may run: `bash` for
-    `bash<<EOF` (one shlex word), `(bash <<EOF`, `(bash)<<EOF`, `x=1
-    bash<<-EOF`, `<<EOF bash` and `x=$(bash <<EOF`, one per reading."""
+    """The program words a segment holding a heredoc operator may run: `bash`
+    for `bash<<EOF` (one shlex word), `(bash <<EOF`, `(bash)<<EOF`, `x=1
+    bash<<-EOF`, `<<EOF bash` and `x=$(bash <<EOF`, one per reading. Words come
+    back as written (`/bin/ba?h`, `$b`); `_owner_word_may_be_shell` reads them."""
     # A substitution still open on this line is where the heredoc's command
-    # starts: `echo "$(bash<<EOF`, `cat <(sh <<EOF`.
-    text = re.split(r"[$<>]\(", _SUBST_RE.sub(" ", segment))[-1]
-    for reading in _ungrouped(text):
+    # starts: `echo "$(bash<<EOF`, `cat <(sh <<EOF`. A closed one stays a word
+    # of its own, so `$(echo bash)<<EOF` still names a program (XERK-1624).
+    text = re.split(r"[$<>]\(", _owner_substs(segment))[-1]
+    # ...and the text as written: `_ungrouped` strips a `{` glued to the word,
+    # and bash reads `{f` or `{{` as a function's whole name.
+    for reading in dict.fromkeys((text.strip(), *_ungrouped(text))):
         tokens = _strip_prefixes(_tokenize(reading))
         # A redirection may come first, and its target may be a word of its own.
         while tokens and re.match(r"\d*[<>]", tokens[0]):
@@ -3898,13 +3918,118 @@ def _heredoc_segment_programs(segment: str):
             if tokens and re.fullmatch(r"\d*(<<-?|<|>>?|[<>]&|&>>?)", tok):
                 tokens.pop(0)
         if tokens:
-            yield _basename(re.split(r"[<>]", tokens[0], maxsplit=1)[0])
+            # A closer glued on stays when a quoted one cut the reading
+            # first: `(X=')' /bin/bas[h])<<EOF`.
+            yield re.split(r"[<>]", tokens[0], maxsplit=1)[0].rstrip(");}")
 
 
-def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
+# A function or alias the command defines: `f() {`, `function f {`, `alias b=…`.
+# Bash takes nearly any word as a function name (`f+`, `f]`, `f@`), so a name
+# is a whole word up to `()`. Both patterns start only at a word's start and
+# never restart inside one, so a long word costs one pass, not its square: the
+# lookbehind and the name share no character (a `{` opens a group only before
+# whitespace, so `{f()` names `{f`, as bash reads it).
+_FUNC_NAME_RE = re.compile(
+    r"(?:^|(?<=[\s;&|()]))([^\s;&|()<>'\"`$]+)[ \t]*\([ \t]*\)"
+    r"|(?<![\w.-])function[ \t]+([^\s();|&]+)")
+_ALIAS_RE = re.compile(r"(?<![\w.-])alias([^;&|\n]*)")
+
+
+def _defined_names(command: str) -> frozenset[str]:
+    """Names ``command`` defines as a function or alias, which can run a shell."""
+    names = {a or b for a, b in _FUNC_NAME_RE.findall(command)}
+    for words in _ALIAS_RE.findall(command):
+        names.update(w.split("=", 1)[0].strip("'\"") for w in words.split() if "=" in w)
+    return frozenset(n.lower() for n in names)
+
+
+# A shell name starting a value or a path component in it.
+_SHELL_PREFIX_RE = re.compile(
+    r"(?:^|/)(?:" + "|".join(re.escape(n) for n in sorted(_SCRIPT_READERS)) + ")")
+
+
+def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
+                             defined: frozenset[str]) -> bool:
+    """Whether program word ``word`` may run a shell (XERK-1624). A literal
+    name is checked as written; a non-literal one fails closed unless it
+    resolves to something else: `$b` this line assigns is resolved, while an
+    unset `$x`, `$SHELL`, a substitution or `$'bas\\x68'` may be any program.
+    A glob matching a shell's name (`/bin/ba?h`) and a function or alias the
+    line defines (`f() { bash; }`) may be one too."""
+    if "`0`" in word:
+        # A silent substitution prints nothing — unless `:`/`true`/`false`
+        # are redefined on the line — so `cat$(:)` runs `cat`.
+        if not defined.isdisjoint(_SILENT_BODIES):
+            return True
+        word = word.replace("`0`", "")
+        if not word:
+            return True  # nothing left: the program is the next word
+    if "`" in word:
+        return True  # unknown output: it may split or form any path
+    if "$" in word:
+        # `_ungrouped` cuts at the first `}`, even a `${x}`'s: close it again.
+        if word.count("${") > word.count("}"):
+            word += "}"
+        word = _substitute_vars(word, vals)
+        # Unresolved, or empty (the program shifts to the next word: `$x bash`).
+        if "$" in word or "`" in word or not word.split():
+            return True
+        # A set IFS splits a value anywhere, so its program may be any prefix
+        # of it: `IFS=x; a=bashx-s; $a` runs `bash -s`.
+        if "IFS" in vals and (_SHELL_PREFIX_RE.search(word.lower())
+                              or any(word.lower().startswith(n) for n in defined)):
+            return True
+        return any(_owner_word_may_be_shell(w, {}, defined) for w in word.split())
+    name = _basename(word)
+    # A defined name may hold a `/` (`f/g() { bash; }`), so match it whole too.
+    if name in _SCRIPT_READERS or name in defined or word.lower() in defined:
+        return True
+    if not _GLOB_CHARS.search(name):
+        return False
+    # Python's fnmatch is not bash's glob: it reads `[^x]` as a literal `^`
+    # and has no `[[:alpha:]]` class. Negate as bash does; fail closed on a class.
+    if "[:" in name:
+        return True
+    pattern = name.replace("[^", "[!")
+    return any(fnmatch.fnmatchcase(shell, pattern) for shell in _SCRIPT_READERS)
+
+
+def _stage_may_read_stdin(stage: str, vals: dict[str, list[str]],
+                          defined: frozenset[str]) -> bool:
+    """`_reads_stdin_grouped`, with the program word read as
+    `_owner_word_may_be_shell` reads it: `cat <<EOF | $S` (XERK-1624)."""
+    if _reads_stdin_grouped(stage):
+        return True
+    stage = _owner_substs(stage)
+    for reading in dict.fromkeys((stage.strip(), *_ungrouped(stage))):  # `| {f`, as above
+        tokens = _strip_prefixes(_tokenize(reading))
+        if not tokens:
+            continue
+        word = tokens[0]
+        if "`0`" in word and not defined.isdisjoint(_SILENT_BODIES):
+            return True  # `:`/`true`/`false` redefined: not silent after all
+        if "$" in word or "`" in word:
+            resolved = _substitute_vars(word.replace("`0`", ""), vals)
+            if (resolved.split() and "IFS" not in vals
+                    and "$" not in resolved and "`" not in resolved):
+                # Resolved to literal words: read the stage they make.
+                if _reads_stdin_grouped(_substitute_vars(reading.replace("`0`", ""), vals)):
+                    return True
+            elif _owner_word_may_be_shell(word, vals, defined):
+                return True  # unknown text that may still name a shell
+        elif _basename(word) not in _SCRIPT_READERS and _owner_word_may_be_shell(
+                word, vals, defined):
+            return True  # a glob matching a shell, or a function or alias
+    return False
+
+
+def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell,
+                               may_be_shell=None, reads_stdin=None) -> bool:
     """Whether a heredoc opened on ``owner`` reaches a shell that runs it as a
     script (XERK-1618). ``commands_feed_shell()`` says whether any command on
     the heredoc-free line reads its stdin as one; the caller memoises it.
+    ``may_be_shell(word)`` and ``reads_stdin(stage)`` read a program word that
+    is not literal (XERK-1624); by default only literal shell names count.
 
     The line's first word alone missed three owners bash runs the body for:
     `bash<<EOF` (one word), `(bash <<EOF` (a subshell) and `{ bash; } <<EOF`
@@ -3912,16 +4037,29 @@ def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
     may form names on the line: `bas``h <<EOF`, `cat <<EOF | {bas,-s}h`
     (XERK-1629).
     """
-    return any(_heredoc_owner_reading_feeds_shell(text, commands_feed_shell)
+    if may_be_shell is None:
+        may_be_shell = lambda word: _basename(word) in _SCRIPT_READERS  # noqa: E731
+    if reads_stdin is None:
+        reads_stdin = _reads_stdin_grouped
+    return any(_heredoc_owner_reading_feeds_shell(text, commands_feed_shell,
+                                                  may_be_shell, reads_stdin)
                for text in _name_readings(owner))
 
 
-def _heredoc_owner_reading_feeds_shell(owner: str, commands_feed_shell) -> bool:
+def _heredoc_owner_reading_feeds_shell(owner: str, commands_feed_shell,
+                                       may_be_shell, reads_stdin) -> bool:
     # The splitter reads the `&` of `2>&1` / `&>f` as a background operator
     # and the `|` of `>|f` as a pipe, which cut `bash 2>&1 <<EOF` away from
     # its program. Only the program is asked of these segments, so both go.
-    segments = _split_segments(re.sub(r"[<>]&|&>|>\|", lambda m: m[0].strip("&|"), owner))
-    if any("<<" in seg and not _SCRIPT_READERS.isdisjoint(_heredoc_segment_programs(seg))
+    unredirected = re.sub(r"[<>]&|&>|>\|", lambda m: m[0].strip("&|"), owner)
+    segments = _split_segments(unredirected)
+    # ...and an operator inside a substitution cut its word apart too
+    # (`ba$(rev<<<hs;)`, `en$(… | rev)`), so the owner is also split with each
+    # one a placeholder, read as an unknown name (XERK-1624, XERK-1644).
+    blanked = _owner_substs(unredirected)
+    if blanked != unredirected:
+        segments = list(dict.fromkeys(segments + _split_segments(blanked)))
+    if any("<<" in seg and any(map(may_be_shell, _heredoc_segment_programs(seg)))
            for seg in segments):
         return True
     # A compound command's redirect feeds every command in it, and the group
@@ -3933,7 +4071,7 @@ def _heredoc_owner_reading_feeds_shell(owner: str, commands_feed_shell) -> bool:
     if _GROUP_CLOSER_RE.search(owner) and commands_feed_shell():
         return True
     # `cat <<EOF | bash`, and `| (bash)` / `| { bash; }` alike.
-    return any(_reads_stdin_grouped(st) for st in segments[1:])
+    return any(reads_stdin(st) for st in segments[1:])
 
 
 def _expand_raw_too(command: str) -> list[tuple[list[str], str]]:
@@ -4093,6 +4231,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # ...and so is the whole-line scan a group redirect falls back to, which is
     # the same for every owner: per owner it was O(heredocs × segments).
     line_feeds_shell: list[bool] = []
+    # Functions and aliases the line defines, which may run a shell (XERK-1624).
+    defined_names: list[frozenset[str]] = []
 
     def _commands_feed_shell() -> bool:
         if not line_feeds_shell:
@@ -4117,8 +4257,12 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # and reached only when the cheap head check below misses, so a
             # `bash <<EOF` owner never pays for this scan.
             if owner not in owner_pipes_to_shell:
+                if not defined_names:
+                    defined_names.append(_defined_names(raw_commands))
                 owner_pipes_to_shell[owner] = _heredoc_owner_feeds_shell(
-                    owner, _commands_feed_shell)
+                    owner, _commands_feed_shell,
+                    lambda w: _owner_word_may_be_shell(w, raw_vals, defined_names[0]),
+                    lambda st: _stage_may_read_stdin(st, raw_vals, defined_names[0]))
             return owner_pipes_to_shell[owner]
         if (owner_tokens and _basename(owner_tokens[0]) in _SCRIPT_READERS
                 or _owner_feeds_shell()):

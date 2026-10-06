@@ -1529,6 +1529,78 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_heredoc_owner_named_through_a_variable_glob_function_or_alias(self):
+        # XERK-1624: the owner's literal word was the only one checked, so each
+        # body below read as data while bash ran it (each ran as nobody).
+        R = self.R
+        for cmd in (f"b=bash; $b<<EOF\n{R}\nEOF", f"b=bash; $b <<EOF\n{R}\nEOF",
+                    f"b=bash; ${{b}}<<EOF\n{R}\nEOF", f"$(echo bash)<<EOF\n{R}\nEOF",
+                    f"`echo bash`<<EOF\n{R}\nEOF", f"f() {{ bash; }}; f<<EOF\n{R}\nEOF",
+                    f"function f {{ bash; }}\nf <<EOF\n{R}\nEOF", f"alias b=bash\nb<<EOF\n{R}\nEOF",
+                    f"coproc bash<<EOF\n{R}\nEOF", f"S=bash; cat <<EOF | $S\n{R}\nEOF",
+                    f"J=bash; $J <<'EOF'\n{R}\nEOF", f"J=bash; $J - <<'EOF'\n{R}\nEOF",
+                    f"(J=bash; $J) <<EOF\n{R}\nEOF", f"$x bash <<EOF\n{R}\nEOF",
+                    f"x=; $x bash <<EOF\n{R}\nEOF", f"$SHELL <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | $SHELL\n{R}\nEOF", f"/bin/ba?h <<EOF\n{R}\nEOF",
+                    f"/usr/bin/da*h <<EOF\n{R}\nEOF", f"(X=')' /bin/bas[h])<<EOF\n{R}\nEOF",
+                    f"(X=')' $'bas\\x68')<<EOF\n{R}\nEOF", f"cat <<EOF | /bin/ba?h\n{R}\nEOF",
+                    f"f() {{ bash; }}; cat <<EOF | f\n{R}\nEOF", "coproc rm -rf /",
+                    # Bash globs, which Python's fnmatch reads differently.
+                    f"/bin/ba[^x]h <<EOF\n{R}\nEOF", f"/bin/bas[[:alpha:]] <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | /bin/ba[^x]h\n{R}\nEOF",
+                    # Any word bash takes as a function name, defined lines earlier.
+                    f"f+() {{ bash; }}\nf+ <<EOF\n{R}\nEOF", f"f]() {{ bash; }}\nf] <<EOF\n{R}\nEOF",
+                    f"f/g() {{ bash; }}\nf/g <<EOF\n{R}\nEOF", f"{{ f{{() {{ bash; }}; }}\nf{{ <<EOF\n{R}\nEOF", f"{{f(){{ bash; }}\n{{f <<EOF\n{R}\nEOF",
+                    f"{{{{f() {{ bash; }}\ncat <<EOF | {{{{f\n{R}\nEOF",
+                    f"{{{{(){{ bash; }}\n{{{{ <<EOF\n{R}\nEOF", f"{{{{{{(){{ bash; }}\ncat <<EOF | {{{{{{\n{R}\nEOF",
+                    f"function {{{{f {{ bash; }}\n{{{{f <<EOF\n{R}\nEOF", f"function {{f {{ bash; }}\n{{f <<EOF\n{R}\nEOF",
+                    f"alias a=b 'c=bash'\nc <<EOF\n{R}\nEOF",
+                    # An expansion's output is never trusted: IFS splits it, and
+                    # `true`/`echo` may be redefined; only a literal prefix rules it out.
+                    f"IFS=x; $(echo bashx-s) <<EOF\n{R}\nEOF", f"IFS=x; a=bashx-s; $a <<EOF\n{R}\nEOF",
+                    f"IFS=x; cat <<EOF | $(echo bashx-s)\n{R}\nEOF",
+                    f"true(){{ command echo bas; }}; $(true)h <<EOF\n{R}\nEOF",
+                    f"echo(){{ command printf bas; }}; $(echo x)h <<EOF\n{R}\nEOF",
+                    f"/usr$(echo /bin/bash) <<EOF\n{R}\nEOF", f"ba$(:)sh <<EOF\n{R}\nEOF",
+                    f"foo(){{ bash; }}; fo$(:)o <<EOF\n{R}\nEOF",
+                    # Glued output word-splits (`env bash`) or forms a path (`../bin/bash`).
+                    f"en$(rev<<<'hsab v') <<EOF\n{R}\nEOF", f"cat <<EOF | en$(rev<<<'hsab v')\n{R}\nEOF",
+                    f"x=en; $x$(rev<<<'hsab v') <<EOF\n{R}\nEOF", f"en$(:)$(rev<<<'hsab v') <<EOF\n{R}\nEOF",
+                    f"..`echo /../../../bin/bash` <<EOF\n{R}\nEOF", f"cd /; usr$(rev<<<'hsab/nib/') <<EOF\n{R}\nEOF",
+                    f":(){{ echo v bash; }}; en$(:) <<EOF\n{R}\nEOF",
+                    f"true(){{ echo v bash; }}; cat <<EOF | en$(true)\n{R}\nEOF",
+                    # A redefined silent builtin whose output no other layer reads.
+                    f"true(){{ rev<<<'hsab v'; }}; cat <<EOF | en$(true)\n{R}\nEOF",
+                    f":(){{ rev<<<'hsab v'; }}; en$(:) <<EOF\n{R}\nEOF",
+                    f":(){{ rev<<<'hsab'; }}; $(:) <<EOF\n{R}\nEOF",
+                    # An operator inside the substitution cut the owner apart (XERK-1644).
+                    f"ba$(echo hs | rev) <<EOF\n{R}\nEOF", f"nice$(echo 'hsab ' | rev) <<EOF\n{R}\nEOF",
+                    f"en$(rev<<<'hsab v';)v <<EOF\n{R}\nEOF", f"cat <<EOF | ba$(echo hs | rev)\n{R}\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A variable this line resolves to a non-shell, a glob matching none,
+        # and a benign body behind any owner stay allowed.
+        for cmd in (f"x=cat; $x <<EOF\n{R}\nEOF", f"x=cat; cat <<EOF | $x\n{R}\nEOF",
+                    f"cat <<EOF | /bin/ca?\n{R}\nEOF", f"alias ll='ls -l'; cat <<EOF\n{R}\nEOF",
+                    "cat <<EOF | $PAGER\nhello\nEOF", "f() { cat; }; f <<EOF\nhello\nEOF",
+                    f"cat$(:) <<EOF\n{R}\nEOF", f"x=cat; $x$(:) <<EOF\n{R}\nEOF",
+                    f"x=cat; ${{x}}<<EOF\n{R}\nEOF", f"en`:`v <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | grep \"$(echo a | tr a b)\"\n{R}\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_an_owner_word_with_a_silent_substitution(self):
+        # XERK-1624: `$(:)` prints nothing — unless `:`/`true`/`false` are
+        # redefined — and an owner left empty shifts to the next word. The
+        # heredoc path also reaches these through the stage check, so pin
+        # them on the word itself.
+        may = guard._owner_word_may_be_shell
+        self.assertFalse(may("cat`0`", {}, frozenset()))
+        self.assertTrue(may("cat`0`", {}, frozenset({":"})))
+        self.assertTrue(may("cat`0`", {}, frozenset({"true"})))
+        self.assertTrue(may("`0`", {}, frozenset()))
+        self.assertTrue(may("cat`s`", {}, frozenset()))
+
     def test_a_shell_name_formed_by_an_empty_expansion_or_a_brace(self):
         # XERK-1629: bash forms `bash` from `bas``h`, `bas$(:)h`, `bas$@h`,
         # `$'bas\150'` and `bash -sh` from `{bas,-s}h`; shlex reads one other word.
@@ -2424,7 +2496,13 @@ class TestExpansionBudget(unittest.TestCase):
         for cmd in ("rm -rf / ; cat " + "1<" * 16000, "cat " + ">" * 32000,
                     "1" * 32000, "(bash) " + "2>/dev/null " * 3000 + "<<EOF\nx\nEOF",
                     "(X=" + "'a)'\"${b:-)}\"" * 3000 + " bash) <<EOF\nx\nEOF",
-                    "cat <<EOF | (" + "(" * 16000 + "\nx\nEOF"):
+                    "cat <<EOF | (" + "(" * 16000 + "\nx\nEOF",
+                    # XERK-1624 QA: the defined-name scan restarted inside a
+                    # long word; 64KB of either took 45-107s.
+                    "echo " + ":" * 32000 + "; $x <<EOF\nx\nEOF",
+                    "alias " + "a" * 32000 + "; cat <<EOF\nx\nEOF",
+                    "echo " + "{" * 32000 + "\n$x <<EOF\nx\nEOF",
+                    "echo " + "{a" * 16000 + "\n$x <<EOF\nx\nEOF"):
             self.check(cmd)
 
     def test_large_value_used_many_times_is_denied_fast(self):

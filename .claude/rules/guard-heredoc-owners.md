@@ -36,7 +36,31 @@ paths:
   - Dropping a substitution that prints text over-reads; it only ever adds a shell reading.
   - `_expand_braces` expands a leading-comma list (`{,bash}` = `bash`, empty words dropped) and
     a sequence (`bas{h..h}`), up to `_BRACE_SEQ_MAX` words; a longer one stays as written.
-- Not covered (open tickets): names via variable/glob/function/alias (XERK-1624), data later
-  run as code (XERK-1555).
+- **A non-literal owner word fails closed** (XERK-1624, `_owner_word_may_be_shell`, and
+  `_stage_may_read_stdin` for `cat <<EOF | $S`):
+  - a `$var` the line assigns is resolved (`x=cat; $x <<EOF` stays data); an unset one, `$SHELL`,
+    a substitution, `$'…'` or an empty value (`$x bash`) may be any program, so the body is a script;
+  - a glob is matched against the shell names (`/bin/ba?h`); a function or alias the command
+    defines anywhere (`_defined_names`) may run a shell, whatever its body says;
+  - `coproc` is a prefix word. A false deny still needs a destructive body.
+  - An expansion's OUTPUT is never trusted (`_owner_substs`): IFS splits it, `true`/`echo` may be
+    redefined, `en$(…)` printing `v bash` runs `env bash`, and a leading `/` makes the prefix a
+    directory (`..$(…)`). Only a provably silent `$()`/`$(:)`/`$(true)`/`$(false)` is dropped
+    (`cat$(:)` runs `cat`) — and not when the line redefines those. A literal-prefix rule was
+    tried and bypassed both ways; don't retry it.
+  - The owner is ALSO split with each substitution a placeholder (an added reading): an operator
+    inside one (`ba$(echo hs | rev) <<EOF`, `en$(…;)`) cut the word apart first (XERK-1644).
+    `_owner_substs` is idempotent (a placeholder maps to itself); it runs twice on that reading.
+  - A set `IFS` splits a resolved value anywhere: any shell name starting it or a path component
+    fails closed (`IFS=x; a=bashx-s; $a`).
+  - Globs are matched with `fnmatch`, which is not bash: `[^` is rewritten to `[!` and any `[:`
+    class fails closed. `_defined_names` starts only at word starts, so it stays linear.
+  - Accepted over-deny (0 in a 19k-command replay): `"$EDITOR" <<EOF`, `${PAGER:-less}`,
+    `f() { "$@"; }; f cat <<EOF` with a destructive body line.
+- Not covered (open tickets): data later run as code (XERK-1555), the same non-literal names
+  on the `-c` and plain-pipe paths (XERK-1632), names rebound by `read`/`hash -p`/`eval`
+  (XERK-1638).
 - Tests: `TestScriptChannels.test_a_heredoc_owner_shell_behind_a_glue_subshell_or_group`,
-  `test_a_shell_name_formed_by_an_empty_expansion_or_a_brace`.
+  `test_an_owner_word_with_a_silent_substitution`,
+  `test_a_shell_name_formed_by_an_empty_expansion_or_a_brace`,
+  `test_a_heredoc_owner_named_through_a_variable_glob_function_or_alias`.
