@@ -168,7 +168,9 @@ _SUBST_RE = re.compile(r"\$\(([^()]*)\)|`([^`]*)`|<\(([^()]*)\)|>\(([^()]*)\)")
 # Characters that end a shell word.
 _WORD_END = set(" \t\n;&|()<>")
 # Reserved words after which the next word is again a command position.
-_CMD_KEYWORDS = {"then", "do", "else", "elif", "if", "while", "until", "time", "!", "{"}
+# `-p` is `time`'s option, so `time -p { …; }` opens a group at command start
+# too (XERK-1628); a non-keyword word anywhere in the run still blocks it.
+_CMD_KEYWORDS = {"then", "do", "else", "elif", "if", "while", "until", "time", "!", "{", "-p"}
 _CASE_PATTERN_OPEN_RE = re.compile(r"(?:\bin|;;&?|;&)\s*$")
 
 
@@ -229,6 +231,36 @@ def _esac_closes(command: str, i: int) -> bool:
 def _word_at(command: str, i: int, word: str) -> bool:
     end = i + len(word)
     return command.startswith(word, i) and (end >= len(command) or command[end] in _WORD_END)
+
+
+# A compound command's opener keyword and the reserved word that closes it, so
+# the stdin-feed walk can keep `if …; then sh; fi` whole and open its body
+# (XERK-1628). `select` is listed for grouping only; the ticket's shapes are
+# `if`/`for`/`while`/`until`/`case`.
+_COMPOUND_OPENERS = {"if": "fi", "for": "done", "while": "done",
+                     "until": "done", "select": "done", "case": "esac"}
+_COMPOUND_FIRST = frozenset("fiwusc")  # first letters of the openers
+
+
+def _compound_opener(command: str, i: int) -> str:
+    """The compound-command keyword opening at ``i`` (`if`/`for`/…), or ""."""
+    if command[i:i + 1] not in _COMPOUND_FIRST:
+        return ""
+    for kw in _COMPOUND_OPENERS:
+        if _word_at(command, i, kw) and _at_command_start(command, i):
+            return kw
+    return ""
+
+
+def _compound_closes(command: str, i: int, closer: str) -> bool:
+    """Whether ``closer`` (`fi`/`done`/`esac`) at ``i`` ends its compound."""
+    if not _word_at(command, i, closer):
+        return False
+    if closer == "esac":
+        return _esac_closes(command, i)
+    # `fi`/`done` close only at a command boundary, as bash reads them
+    # (`then echo x; fi`, `do …; done >f`, a newline, a group's `)`/`}`).
+    return _char_before(command, i) in ("", ";", "&", "|", "\n", ")", "}")
 
 
 def _is_comment(command: str, i: int) -> bool:
@@ -890,6 +922,13 @@ def _statements_printed(body: str) -> str | None:
     printing statement stays opaque (None): `$(mktemp -d)` must not read as an
     empty word, which is the root.
     """
+    # A `(…)`/`{…}` group with trailing redirects prints what the group
+    # prints: open it first, so `x=$( (true; echo P) 2>/tmp/f )` reads P and
+    # not the split-apart `echo P) 2>/tmp/f` (XERK-1628).
+    if body.strip()[:1] in ("(", "{"):
+        core = _group_core(body)
+        if core is not None:
+            body = _unwrap_group(core)
     out, all_known = "", True
     for stmt in _split_on_operators(body, include_pipe=False):
         # The splitter cuts inside a `( …; … )` / `{ …; }` group, so a
@@ -2900,6 +2939,24 @@ def _split_on_operators(command: str, include_pipe: bool = True,
         elif (groups and not braces and opened and ch == "}" and opened[-1] == "{"
               and command[i - 1:i] in (" ", "\t", "\n", ";")):
             opened.pop()
+        elif (groups and not braces and not in_pattern and opened
+              and opened[-1] in ("fi", "done", "esac")
+              and _compound_closes(command, i, opened[-1])):
+            # `fi`/`done`/`esac` ends the compound command kept whole above.
+            closer = opened.pop()
+            buf.append(closer)
+            i += len(closer)
+            continue
+        elif (groups and not braces and not in_pattern
+              and (_compound_kw := _compound_opener(command, i))):
+            # `if`/`for`/`while`/`until`/`case` opens a compound command; keep
+            # it and its body (`;`-separated keywords and all) in one segment,
+            # as a `( )`/`{ }` group, so a pipe to or from it is not cut at the
+            # inner `;` (XERK-1628). The body is opened by `_group_core`.
+            opened.append(_COMPOUND_OPENERS[_compound_kw])
+            buf.append(_compound_kw)
+            i += len(_compound_kw)
+            continue
         elif ch == "#" and not braces and _is_comment(command, i):
             end = command.find("\n", i)
             i = n if end < 0 else end
@@ -3011,11 +3068,20 @@ def _split_segments(command: str) -> list[str]:
 
 
 def _unwrap_group(segment: str) -> str:
-    """Strip subshell/group wrappers so `(rm -rf /)` classifies as `rm -rf /`."""
+    """Strip subshell/group wrappers so `(rm -rf /)` classifies as `rm -rf /`.
+
+    The cheap first/last-char strip is right unless a trailing redirect or
+    escape leaves a `)`/`}` at the end that is NOT the opener's match
+    (`(a) 2>/tmp/f\\)`, XERK-1628); only then is a quote-aware scan worth its
+    cost. Without the gate the scan ran per layer, making a 3000-deep `(…)`
+    nest O(n²) at every recursion level (XERK-1628 QA)."""
     seg = segment.strip()
+    risky = any(c in seg for c in "<>&\\")
     while len(seg) >= 2 and (
         (seg[0] == "(" and seg[-1] == ")") or (seg[0] == "{" and seg[-1] == "}")
     ):
+        if risky and _group_close(seg) != len(seg) - 1:
+            break
         seg = seg[1:-1].strip().rstrip(";").strip()
     return seg
 
@@ -3568,7 +3634,12 @@ def _env_split_string(opt: str, rest: list[str]) -> str | None:
 
 # A script path that is the shell's own stdin or an inherited fd — what
 # `bash -`, `source /dev/stdin` and `. <(…)` (bash passes `/dev/fd/63`) read.
-_STDIN_SCRIPT_RE = re.compile(r"^(?:-|/dev/stdin|/dev/fd/\d+|/proc/(?:self|\d+)/fd/\d+)$")
+# A shell reading its script from stdin or an inherited fd. The fd may be a
+# literal number or a variable an `exec {fd}<<<…`/`exec N<<…` opened, left
+# unresolved (`bash /dev/fd/$fd`, XERK-1628); only reached once that line has
+# fed text, so a `$var` fd there fails closed.
+_STDIN_SCRIPT_RE = re.compile(
+    r"^(?:-|/dev/stdin|/dev/fd/(?:\d+|\$\{?\w+\}?)|/proc/(?:self|\d+)/fd/(?:\d+|\$\{?\w+\}?))$")
 # Shell options that consume the NEXT token, so it is not taken as the script.
 _SHELL_OPTS_WITH_VALUE = {"-o", "+o", "-O", "+O", "--rcfile", "--init-file"}
 # A redirection word: `2>&1`, `>/dev/null`, `<`, `<<<`. Its target follows
@@ -3721,25 +3792,224 @@ def _only_redirects(text: str, i: int) -> bool:
             return False
 
 
+def _group_close(core: str) -> int:
+    """Index of the closer matching the `(`/`{` group at ``core[0]``, or -1.
+
+    A quote-aware forward scan, as bash reads it: a closer inside `'…'`/`"…"`/
+    backticks, escaped (`\\)`), or held in a redirect target (`2>"/tmp/x )))))"`)
+    is not the group's (XERK-1628). Replaces a reverse search of the last few
+    closers, which a quoted or nested one defeated. `$(`/`${` and nested
+    `(`/`{` push their own closer so a `)`/`}` inside them is skipped; a `{` is
+    a command group only before a blank, and a group `}` only after one, so
+    `${x}` and `{fd}>f` inside the body are text."""
+    stack = ["P"] if core[0] == "(" else ["B"]  # P:( p:$( B:{ b:${
+    i, n, quote = 1, len(core), None
+    while i < n:
+        ch = core[i]
+        if quote:
+            if ch == "\\" and quote != "'" and i + 1 < n:
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            i += 1
+            continue
+        if core.startswith("$(", i):
+            stack.append("p")
+            i += 2
+            continue
+        if core.startswith("${", i):
+            stack.append("b")
+            i += 2
+            continue
+        if ch == "(":
+            stack.append("P")
+        elif ch == "{" and core[i + 1:i + 2] in (" ", "\t", "\n"):
+            stack.append("B")
+        elif ch == ")" and stack[-1] in ("P", "p"):
+            stack.pop()
+            if not stack:
+                return i
+        elif ch == "}" and (stack[-1] == "b"
+                            or (stack[-1] == "B" and core[i - 1] in " \t\n;")):
+            stack.pop()
+            if not stack:
+                return i
+        i += 1
+    return -1
+
+
 def _group_core(part: str) -> str | None:
     """The group ``part`` runs once its leading keywords and trailing
     redirections are dropped, or None. `_unwrap_group` opens only a group that
     IS the segment, and a group-aware split keeps `do (true; echo …)` whole,
-    so the producer inside was never read (XERK-1614)."""
-    core = _GROUP_LEAD_RE.sub("", part.strip())
-    if core[:1] not in ("(", "{"):
-        return None
-    closer = ")" if core[0] == "(" else "}"
-    # A `{fd}>x` redirect holds a `}` of its own, so of the last few closers
-    # the group's is the leftmost one followed only by redirections.
-    found, end = None, len(core)
-    for _ in range(4):
-        end = core.rfind(closer, 0, end)
-        if end < 0:
+    so the producer inside was never read (XERK-1614).
+
+    A compound command (`if …; then …; fi`, `for/while/until … done`,
+    `case … esac`) returns its inner commands with the skeleton keywords
+    dropped, so the producer or reader inside is read (XERK-1628)."""
+    stripped = part.strip()
+    # Before stripping leading keywords: `if`/`while`/`until` are group-lead
+    # keywords too (`if (…)`), so `_GROUP_LEAD_RE` would eat the opener.
+    if _compound_opener(stripped, 0):
+        return _compound_body(stripped)
+    core = _GROUP_LEAD_RE.sub("", stripped)
+    if core[:1] in ("(", "{"):
+        end = _group_close(core)
+        # Blank substitutions in the trailing text first: a `$(…)` in a quoted
+        # redirect target (`2>"/tmp/x$(echo ")")"`) holds quotes `_only_redirects`
+        # cannot pair (XERK-1628). `_find_substs` pairs them as bash does.
+        if end >= 0 and _only_redirects(_sub_substs(core[end + 1:], lambda m: "x"), 0):
+            return core[:end + 1]
+    return None
+
+
+_COMPOUND_CONNECTORS = ("then", "elif", "else", "do")
+
+
+def _compound_body(text: str) -> str:
+    """``text`` (a compound command) as its inner statements, joined by `;`,
+    for the stdin-feed walk to recurse into (XERK-1628).
+
+    The compound's OWN skeleton — the opener, `then`/`do`/`in`/`elif`/`else`,
+    the closer and `case` patterns (`x)`, `;;`) — is dropped; an inner group,
+    pipeline or nested compound is kept WHOLE so a `for …; do { echo …; } | sh;
+    done` still exposes its `{ … } | sh` to the walk. A plain split would cut
+    the inner group, and a group-aware one re-groups the whole compound."""
+    kw = _compound_opener(text, 0)
+    if not kw:
+        return text
+    n, i = len(text), len(kw)
+    stmts: list[str] = []
+    buf: list[str] = []
+    depth = 0           # inner `(`/`{` groups and nested compounds
+    quote: str | None = None
+    want_in = kw in ("for", "select", "case")  # a header to skip up to `in`
+    is_case = kw == "case"
+    pat = False         # dropping a `case` pattern up to its `)`
+    pat_paren = 0
+
+    def flush() -> None:
+        s = "".join(buf).strip()
+        if s and s not in ("fi", "done", "esac"):
+            stmts.append(s)
+        buf.clear()
+
+    while i < n:
+        ch = text[i]
+        if quote:
+            if not pat:
+                buf.append(ch)
+            if ch == "\\" and quote != "'" and i + 1 < n:
+                if not pat:
+                    buf.append(text[i + 1])
+                i += 2
+                continue
+            if ch == quote:
+                quote = None
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < n:
+            if not pat:
+                buf.append(ch)
+                buf.append(text[i + 1])
+            i += 2
+            continue
+        if ch in ("'", '"', "`"):
+            quote = ch
+            if not pat:
+                buf.append(ch)
+            i += 1
+            continue
+        if pat:
+            # Drop a case pattern (and its optional `(a|b)` opener) up to `)`.
+            if ch == "(":
+                pat_paren += 1
+            elif ch == ")":
+                if pat_paren:
+                    pat_paren -= 1
+                else:
+                    pat = False
+            i += 1
+            continue
+        if want_in:
+            if depth == 0 and _word_at(text, i, "in") and text[i - 1:i] in (" ", "\t", "\n"):
+                want_in = False
+                buf.clear()  # the `for X`/`case W` header is not a command
+                if is_case:
+                    pat = True
+                i += 2
+                continue
+            i += 1  # still in the header
+            continue
+        if ch == "(":
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if (ch == "{" and text[i + 1:i + 2] in (" ", "\t", "\n")
+                and _char_before(text, i) in ("", "{", "(", ";", "&", "|", "\n")):
+            depth += 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == ")" and depth > 0:
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "}" and depth > 0 and text[i - 1:i] in (" ", "\t", "\n", ";"):
+            depth -= 1
+            buf.append(ch)
+            i += 1
+            continue
+        closer = ("fi" if _word_at(text, i, "fi") else "done" if _word_at(text, i, "done")
+                  else "esac" if _word_at(text, i, "esac") else "")
+        if closer and _compound_closes(text, i, closer):
+            if depth > 0:
+                depth -= 1
+                buf.append(closer)
+                i += len(closer)
+                continue
+            flush()  # the outer closer ends the compound
             break
-        if _only_redirects(core, end + 1):
-            found = core[:end + 1]
-    return found
+        if depth == 0:
+            nested = _compound_opener(text, i)
+            if nested:
+                depth += 1
+                buf.append(nested)
+                i += len(nested)
+                continue
+            if is_case and text.startswith(";;", i):
+                flush()
+                pat = True
+                i += 3 if text.startswith(";;&", i) else 2
+                continue
+            if text.startswith(("&&", "||"), i):
+                flush()
+                i += 2
+                continue
+            if ch in (";", "\n", "&"):
+                flush()
+                i += 1
+                continue
+            conn = next((c for c in _COMPOUND_CONNECTORS
+                         if _word_at(text, i, c) and _at_command_start(text, i)), "")
+            if conn:
+                flush()
+                i += len(conn)
+                continue
+        buf.append(ch)
+        i += 1
+    flush()
+    return "; ".join(stmts)
 
 
 def _walked_pipelines(command: str) -> list[str]:
@@ -3818,10 +4088,43 @@ def _command_reads_stdin_as(stage: str, depth: int) -> bool:
     if prog in ("source", "."):
         operands = [t for t in rest if not _REDIRECT_RE.match(t)]
         return bool(operands) and bool(_STDIN_SCRIPT_RE.match(operands[0]))
+    if prog == "eval":
+        # `eval` runs its joined words as a script that inherits the shell's
+        # stdin (`… | eval bash`, `eval '{,bash}'`), and a `$(cat)` in them
+        # captures that stdin to BE the script (`eval "$(cat)"`) (XERK-1628).
+        # Read off the ORIGINAL stage: `text` already blanked the `$(cat)`.
+        raw = [t for t in _strip_prefixes(_tokenize(stage))[1:] if not _REDIRECT_RE.match(t)]
+        if raw and raw[0] == "--":
+            raw = raw[1:]
+        script = " ".join(raw)
+        for m in _find_substs(script):
+            if m.group(0)[0] in "$`" and _passes_input(_subst_inner(m)):
+                return True
+        return bool(script) and _reads_stdin_script(script, depth + 1, fresh=True)
+    if prog == "xargs":
+        # `xargs … sh -c` hands the piped text to the shell's `-c` as its
+        # SCRIPT (`… | xargs -0 sh -c`); with a script already present the text
+        # is only positional params, so that is not a read (XERK-1628).
+        inner = list(rest)
+        while inner and inner[0].startswith("-") and len(inner[0]) > 1:
+            opt = inner.pop(0)
+            if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
+                inner.pop(0)
+        if inner and _basename(inner[0]) in _SHELL_PROGS:
+            r2 = inner[1:]
+            return _shell_c_index(r2) >= 0 and not _shell_c_script(r2)
+        return False
     if prog not in _SHELL_PROGS:
         return False
     if _shell_c_index(rest) >= 0:
         script = _shell_c_script(rest)
+        # Read the `-c` script off the ORIGINAL stage where the shell is the
+        # first word: `text` blanked a `$(cat)` the script's own `eval` needs
+        # to be seen reading stdin (`bash -c 'eval "$(cat)"'`, XERK-1628).
+        raw_toks = _strip_prefixes(_tokenize(stage))
+        if (raw_toks and _basename(raw_toks[0]) == prog
+                and _shell_c_index(raw_toks[1:]) >= 0):
+            script = _shell_c_script(raw_toks[1:]) or script
         return bool(script) and _reads_stdin_script(script, depth + 1, fresh=True)
     if prog == "su":
         return True  # its operands name a USER; without `-c` the shell reads stdin
@@ -4122,6 +4425,25 @@ def _defined_names(command: str) -> frozenset[str]:
     for words in _ALIAS_RE.findall(command):
         names.update(w.split("=", 1)[0].strip("'\"") for w in words.split() if "=" in w)
     return frozenset(n.lower() for n in names)
+
+
+def _function_bodies(command: str) -> dict[str, str]:
+    """Each function ``command`` defines, mapped to its body (the `{ … }` or
+    `( … )` after the header, unwrapped), so a bare call to it in the stdin
+    walk runs that body — `f() { bash; }; echo … | f` (XERK-1628)."""
+    bodies: dict[str, str] = {}
+    for m in _FUNC_NAME_RE.finditer(command):
+        name = m.group(1) or m.group(2)
+        if not name:
+            continue
+        j = m.end()
+        while j < len(command) and command[j] in " \t\n":
+            j += 1
+        if j < len(command) and command[j] in ("{", "("):
+            end = _group_close(command[j:])
+            if end >= 0:
+                bodies[_basename(name)] = _unwrap_group(command[j:j + end + 1])
+    return bodies
 
 
 # A shell name starting a value or a path component in it.
@@ -4573,7 +4895,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # somewhere, so the whole scan (an extra full-command split) is skipped when
     # the line has none — a line of 1000 `bash <<EOF` heredocs otherwise paid
     # for it (the body is a script by the heredoc path above, not this one).
-    feeds_a_shell = "|" in command or "<<<" in command or "<(" in command
+    feeds_a_shell = ("|" in command or "<<<" in command or "<(" in command
+                     or ">(" in command)  # `cmd > >(sh)` feeds the sub too (XERK-1628)
     # A `<(…)` operand is a FILE its stage reads, and `cat`, `tee`, `head` and
     # the like pass a file through: `cat <(echo <cmd>) | bash` runs <cmd>
     # (XERK-1611). Fed to EVERY reader on the line, whatever the program and
@@ -4588,9 +4911,18 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                              if [t for t in _tokenize(raw) if t not in ("command", "builtin")][:1]
                              == ["exec"]
                              for hs in _herestrings(raw)]
+    # ...and a heredoc an `exec` holds on an fd for the rest of the line:
+    # `exec 3<<EOF … EOF; bash <&3` runs the body (XERK-1628).
+    for _owner, _body, _q in heredocs:
+        first = [t for t in _tokenize(_SUBST_RE.sub(" ", _owner))
+                 if t not in ("command", "builtin")][:1]
+        if first == ["exec"]:
+            proc_subst_texts.append(_body)
     # Every pipeline replays these, so de-dupe and cap them once, here: one
     # per `exec` made a line of n of them O(n²) (XERK-1614).
     proc_subst_texts = list(dict.fromkeys(proc_subst_texts))[:_FED_TEXT_CAP]
+    # A line that opens an fd an `exec` feeds (no pipe needed) must be walked.
+    feeds_a_shell = feeds_a_shell or bool(proc_subst_texts)
     # Split keeping groups whole: a cut inside `{ echo …; }` or `X=<(a; b)`
     # severs a producer from its reader (XERK-1614).
     # ...and ALSO split the plain way, as before groups were kept whole: a group
@@ -4601,12 +4933,14 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     if unsplit_line and feeds_a_shell:
         # ...and the line read with its assignments cut (XERK-1620).
         pipelines = list(dict.fromkeys(pipelines + _walked_pipelines(unsplit_line)))
+    # Functions the line defines, so a bare call in a pipeline runs its body.
+    func_bodies = _function_bodies(command) if (feeds_a_shell and "(" in command) else {}
     for pipeline in pipelines:
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
         # feeding it either, so skip its per-stage scan too — unless the line
         # opened an fd it may read (`exec 3< <(…); bash <&3`).
         if (not proc_subst_texts and "|" not in pipeline and "<<<" not in pipeline
-                and "<(" not in pipeline):
+                and "<(" not in pipeline and ">(" not in pipeline):
             continue
         producers: list[str] = []       # distinct printed/here-string texts so far
         seen_texts: set[str] = set()
@@ -4619,6 +4953,24 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             _feed(text)
         for stage in _split_on_operators(pipeline, keep_redirects=True, groups=True):
             ustage = _unwrap_group(stage)
+            # A bare call to a function the line defines runs its body, which
+            # may read stdin or print the fed text (XERK-1628).
+            if func_bodies:
+                call = _strip_prefixes(_tokenize(ustage))
+                if len(call) == 1 and _basename(call[0]) in func_bodies:
+                    stage = ustage = func_bodies[_basename(call[0])]
+            # `cmd > >(reader)`: the reader consumes this stage's stdout, so it
+            # runs that output as a script — `echo … > >(sh)` (XERK-1628).
+            for m in _find_substs(ustage):
+                if m.group(0).startswith(">(") and _reads_stdin_script(_subst_inner(m)):
+                    toks = _strip_prefixes(_tokenize(ustage))
+                    cut = next((k for k, t in enumerate(toks)
+                                if t.startswith(">(") or _REDIR_WORD.match(t)), len(toks))
+                    emitted = _printed_from_tokens(toks[:cut]) or ""
+                    for text in list(producers) + [emitted]:
+                        if text.strip():
+                            for script in _script_readings(text):
+                                out.extend(_expand_segments(script, depth + 1, every_cd))
             # Named as bash forms it before the group is unwrapped (XERK-1629).
             if any(_reads_stdin_script(_unwrap_group(t)) for t in _name_readings(stage)):
                 fed = list(producers)
