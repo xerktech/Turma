@@ -1572,6 +1572,8 @@ _BRACE_RE = re.compile(r"\{([^{}\s]+)\}")
 _BRACE_SEQ_RE = re.compile(r"(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?")
 # The most words a sequence is expanded to; a longer one is left as written.
 _BRACE_SEQ_MAX = 64
+_BRACE_WORD_END = frozenset(" \t\n;&|<>()")
+_BRACE_WORD_END_RE = re.compile(r"[ \t\n;&|<>()]")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
 # inlined as `eval 'rm` (XERK-1256).
 # A value is read WHOLE, quoted runs and substitutions included: cut at its
@@ -1720,10 +1722,13 @@ def _expand_braces(command: str) -> str:
             pos = start + 1
             continue
         expansions += 1
-        word_start = command.rfind(" ", 0, start) + 1
-        word_end = command.find(" ", end)
-        if word_end == -1:
-            word_end = len(command)
+        # A word ends at a blank or an operator: cut only at a space,
+        # `{,bash}|cat` read as `|cat bash|cat` (XERK-1629).
+        word_start = start
+        while word_start and command[word_start - 1] not in _BRACE_WORD_END:
+            word_start -= 1
+        m_end = _BRACE_WORD_END_RE.search(command, end)
+        word_end = m_end.start() if m_end else len(command)
         prefix, suffix = command[word_start:start], command[end:word_end]
         # An empty word goes, as in bash: `{,bash}` runs `bash`.
         parts = [w for w in (prefix + p.strip() + suffix for p in items) if w]
@@ -2820,7 +2825,10 @@ def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
     if depth > _MAX_EXPAND_DEPTH:
         return True  # a reader fed too much fails closed
     # Read as bash forms its names first: `_unwrap_group` takes `{,bash}` for
-    # a group and leaves `,bash` (XERK-1629).
+    # a group and leaves `,bash` (XERK-1629). At the top only: a reading per
+    # nested level doubled the work per level (the brace cap re-forms each).
+    if depth:
+        return _reads_stdin_script_as(stage, depth)
     return any(_reads_stdin_script_as(text, depth) for text in _name_readings(stage))
 
 
@@ -2970,10 +2978,11 @@ def _command_reads_stdin_as(stage: str, depth: int) -> bool:
     if "<(" in text:
         text = text[:text.index("<(")] + "/dev/fd/63"
     tokens = _strip_prefixes(_tokenize(text))
-    # `sh<<<'…'` tokenises as one word; the program is the part before it.
-    if tokens and "<" in tokens[0] and not tokens[0].startswith("<"):
-        head, _, tail = tokens[0].partition("<")
-        tokens = [head, "<" + tail, *tokens[1:]]
+    # `sh<<<'…'` and `bash>/dev/null` tokenise as one word; the program is the
+    # part before the redirection (XERK-1629: `>` was kept in the name).
+    m = re.search(r"[<>]", tokens[0]) if tokens else None
+    if m and m.start():
+        tokens = [tokens[0][:m.start()], tokens[0][m.start():], *tokens[1:]]
     if not tokens:
         return False
     prog, rest = _basename(tokens[0]), tokens[1:]
@@ -3156,9 +3165,9 @@ _SHELL_WORD_RE = re.compile(
 
 # What may expand to nothing inside a word: `$@`, `$*`, `${@:-}`, `${*:1}` (no
 # arguments at the top level) and an empty `$''` / `$""`.
-# `${@:-w}` / `${*-w}` is `w`. `[^}$]`, not `[^}]`: that restarted at every
+# `${@:-w}` / `${*-w}` is `w` (`${@:=w}` is an error). `[^}$]`, not `[^}]`: that restarted at every
 # unclosed `${@`, quadratic.
-_EMPTY_EXPANSION_RE = re.compile(r"\$(?:[@*]|\{[@*](?::?[-=]([^}$]*)|[^}$]*)\}|''|\"\")")
+_EMPTY_EXPANSION_RE = re.compile(r"\$(?:[@*]|\{[@*](?::?-([^}$]*)|[^}$]*)\}|''|\"\")")
 # `$"…"` is a locale-translated string: untranslated, `$"bash"` runs `bash`.
 _LOCALE_STRING_RE = re.compile(r"\$(?=\")")
 

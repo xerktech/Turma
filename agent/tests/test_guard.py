@@ -1512,7 +1512,12 @@ class TestScriptChannels(unittest.TestCase):
         # `bash sh` / `sh s` run a script FILE, not stdin; a sequence past
         # `_BRACE_SEQ_MAX`, or a mixed one bash leaves literal, is not expanded.
         for cmd in (f"echo x | {{,bash}} -c '{R}'", f"rm -rf /{{e..e}}tc",
-                    f"echo {{a,b}} {{a,b}} {{a,b}} {{a,b}} >/dev/null; echo '{R}' | {{,bash}}"):
+                    f"echo {{a,b}} {{a,b}} {{a,b}} {{a,b}} >/dev/null; echo '{R}' | {{,bash}}",
+                    f"echo '{R}' | ( echo {{a,b}} {{a,b}} {{a,b}} {{a,b}} >/dev/null; {{,bash}} )",
+                    f"echo '{R}' | {{,bash}}|cat", f"echo '{R}' | {{,bash}};",
+                    f"echo '{R}' | {{,bash}}&&true", f"echo '{R}' | ({{,bash}})",
+                    f"echo '{R}' | {{,bash}}>/dev/null", f"echo '{R}' | bash>/dev/null",
+                    f"echo '{R}' | bash>&2"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in (f"echo '{R}' | {{ba,}}sh", f"echo '{R}' | s{{h,}}",
@@ -2422,6 +2427,16 @@ class TestExpansionBudget(unittest.TestCase):
                     f"x='{' '.join(['w'] * 20000)}'; " + "ssh h $x; " * 12 + "\nrm -rf /"):
             self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:40])
         self.assertIsNone(self.check("ssh h " + "a " * 200))
+
+    def test_brace_words_in_nested_readers_stay_linear(self):
+        # XERK-1629 QA: a name reading taken at every nested reader doubled the
+        # work per level (the brace cap re-forms each), 53s at 21 KB.
+        cmd = "cat " + " ".join(["x{a,b}"] * 1000)
+        for _ in range(6):
+            cmd = f"cat | ( {cmd} )"
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": "echo hi | " + cmd})[0], "allow")
+        self.assertLess(time.monotonic() - t, 5)
 
     def test_unclosed_brace_lists_and_grep_runs_classify_fast(self):
         # `{a,a,…` backtracked over every comma, and `grep grep …` rescanned its
