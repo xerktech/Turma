@@ -1199,6 +1199,33 @@ class TestProducedScripts(unittest.TestCase):
         self.assertAllowed("printf -v x '%s' hello; echo $x")
         self.assertAllowed("printf -v x '%s/%s' /tmp build; rm -rf $x")
 
+    def test_a_value_bound_by_for_read_braces_or_a_c_script_runs(self):
+        # XERK-1622: each ran `rm -rf /etc` while the guard allowed it.
+        R = self.R
+        for cmd in (f'for v in "$(echo {R})"; do $v; done',
+                    f'read -r a <<< "$(echo {R})"; $a',
+                    f'read a b <<< "$(echo {R})"; $a $b',
+                    f'read -ra arr <<< "$(echo {R})"; ${{arr[@]}}',
+                    f'read <<< "$(echo {R})"; $REPLY',
+                    f"read a <<<$(echo {R}); $a",
+                    # Glued to the name, a later name's remainder, a default (QA).
+                    f'read -r a<<<"$(echo {R})"; $a', f"read a<<<'{R}'; $a",
+                    f'read -ra arr<<<"$(echo {R})"; ${{arr[@]}}',
+                    f'read -r _ a <<< "x {R}"; $a', f'read -r a b <<< "x {R}"; $b',
+                    f'read -r a <<< "${{x:-$(echo {R})}}"; $a',
+                    f'for v in "${{x:-$(echo {R})}}"; do $v; done',
+                    f"{{,}}$(echo {R})", f"{{,}}`echo {R}`",
+                    f"bash -c 'a=$(echo {R}); $a'", f"sh -c 'a=`echo {R}`; $a'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ('for v in "$(ls)"; do echo "$v"; done',
+                    'read -r l <<< "$(git log -1 --oneline)"; echo "$l"',
+                    f"read a <<< '{R}'; echo \"$a\"", "echo {a,b}$(date)",
+                    "bash -c 'x=$(git rev-parse HEAD); echo $x'",
+                    'read -r cmd <<< "ls -la"; $cmd', 'read -r a b <<< "1 2"; echo $a $b'):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_relative_rm_after_cd_into_a_root_names_that_root(self):
         for cmd in ("cd / && rm -rf *", "cd /; rm -rf *", "cd /etc; rm -rf ./*",
                     "cd /usr && rm -r lib", "cd ~ && rm -rf *", "cd; rm -rf *",

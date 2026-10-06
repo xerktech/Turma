@@ -1892,8 +1892,12 @@ def _expand_braces(command: str) -> str:
         word_start = start
         while word_start and command[word_start - 1] not in _BRACE_WORD_END:
             word_start -= 1
-        m_end = _BRACE_WORD_END_RE.search(command, end)
-        word_end = m_end.start() if m_end else len(command)
+        # A `$(…)`, backtick or quoted run glued on is the word's too: cut at
+        # its `(`, `{,}$(echo rm -rf /)` read as `$ $` (XERK-1622).
+        word_end = _word_end(command, end)
+        if word_end < 0:
+            m_end = _BRACE_WORD_END_RE.search(command, end)
+            word_end = m_end.start() if m_end else len(command)
         prefix, suffix = command[word_start:start], command[end:word_end]
         # An empty word goes, as in bash: `{,bash}` runs `bash`.
         parts = [w for w in (prefix + p.strip() + suffix for p in items) if w]
@@ -1961,6 +1965,10 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
             bound = _printf_v(_strip_prefixes(_tokenize(seg)))
             if bound:
                 vals.setdefault(bound[0], []).append(bound[1])
+    if "read" in command and "<<<" in command:
+        for seg in _split_segments(command):
+            for name, value in _read_herestring(seg, whole="IFS" in command):
+                vals.setdefault(name, []).append(value)
     # How many values one name is ASSIGNED, so `_expand_both` reads each on
     # its own. Not a `for` list's words: those are a loop's data, and a long
     # list would cost a whole reading per word.
@@ -1971,7 +1979,16 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         _VALUES_MOST[0] = max(_VALUES_MOST[0], len(got) + len(applied.get(k, ())))
         _VALUES_ASSIGNED[0] = max(_VALUES_ASSIGNED[0], len(got))
     for m in _FOR_IN_RE.finditer(command):
-        words = [w for w in m.group(2).split() if w != "do"]
+        # Whole words, dequoted as bash binds them: split on blanks, `for v in
+        # "$(echo rm -rf /)"` bound `"rm`, `-rf`, `/"` (XERK-1622).
+        # A `${x:-…}` word is read with its default applied too, as an
+        # assignment's is.
+        words = []
+        for w in _ASSIGN_WORD_RE.finditer(m.group(2)):
+            if w.group(0) and w.group(0) != "do":
+                words.append(_dequote_value(w.group(0)))
+                if "${" in w.group(0) and not _MAIN_PARSE[0]:
+                    words.append(_dequote_value(_substitute_vars(w.group(0), {})))
         if words:
             vals.setdefault(m.group(1), []).extend(words)
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
@@ -2173,6 +2190,69 @@ def _printf_v(tokens: list[str]) -> tuple[str, str] | None:
     if not m or not rest:
         return None  # `a[0]` is `$a` too
     return m.group(1), _render_printf(rest[0], rest[1:])
+
+
+# `read`'s options that take a value; `-a`'s value is the NAME it fills.
+_READ_OPTS_WITH_VALUE = set("adinNptu")
+_HERESTRING_RE = re.compile(r"<<<[ \t]*")
+
+
+def _read_herestring(seg: str, whole: bool = False) -> list[tuple[str, str]]:
+    """The `(name, value)`s `read [opts] NAME… <<< WORD` binds, so `read -r a
+    <<< "$(echo rm -rf /)"; $a` runs it (XERK-1622). Split as bash does under
+    the default IFS — each name a word, the last the remainder — or, with
+    ``whole`` (the line sets IFS) or for `-a`, every name the whole text.
+    A WORD with a `${…}` default is read with it applied too."""
+    m = _HERESTRING_RE.search(seg)
+    if not m:
+        return []
+    end = _word_end(seg, m.end())
+    end = end if end >= 0 else len(seg)
+    word = seg[m.end():end]
+    # Names are read with the word cut out: shlex splits an unquoted
+    # `<<<$(echo rm …)` and its `rm` read as one more name.
+    tokens = _strip_prefixes(_tokenize(seg[:m.end()] + seg[end:]))
+    if not tokens or tokens[0] != "read":
+        return []
+    names, arrays, i = [], [], 1
+    while i < len(tokens):
+        tok = tokens[i]
+        if "<" in tok or ">" in tok:
+            # A redirection, maybe glued to the name before it (`a<<<"…"`);
+            # a detached operator takes the next word with it (the `<<<`
+            # word is already cut out).
+            glued = re.match(r"([A-Za-z_][A-Za-z0-9_]*)[<>&]", tok)
+            if glued:
+                names.append(glued.group(1))
+            i += 2 if tok in ("<", ">", ">>", "<<") else 1
+            continue
+        if tok.startswith("-") and len(tok) > 1 and tok != "--":
+            if tok[-1] in _READ_OPTS_WITH_VALUE and i + 1 < len(tokens):
+                if tok[-1] == "a":
+                    # Its name, maybe glued to the redirection (`-a arr<<<"…"`).
+                    arrays.append(re.match(r"[^<>&]*", tokens[i + 1]).group(0))
+                i += 1
+        elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok):
+            names.append(tok)
+        i += 1
+    texts = [_dequote_value(word)]
+    if "${" in word and not _MAIN_PARSE[0]:
+        texts.append(_dequote_value(_substitute_vars(word, {})))
+    names = [n for n in names if _ASSIGN_NAME_RE.fullmatch(n)]
+    arrays = [n for n in arrays if _ASSIGN_NAME_RE.fullmatch(n)]
+    if not names and not arrays:
+        names = ["REPLY"]
+    out = []
+    for text in dict.fromkeys(texts):
+        text = _produced_text(text, multi=_VALUES_MULTI[0]).replace("\n", " ")
+        out.extend((n, text) for n in arrays)
+        if whole or len(names) == 1:
+            out.extend((n, text) for n in names)
+        elif names:
+            words = text.split()
+            out.extend((n, words[k] if k < len(words) else "") for k, n in enumerate(names[:-1]))
+            out.append((names[-1], " ".join(words[len(names) - 1:])))
+    return out
 
 
 def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
@@ -4641,6 +4721,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 raw, lambda m: m.group(0) if m.group(0).startswith("<(") else _subst_text(m)))))
             script = _shell_c_script(kept[1:]) if kept and _basename(kept[0]) in _SHELL_PROGS else None
             if script and "<(" in script:
+                for reading in _script_readings(script):
+                    out.extend(_expand_segments(reading, depth + 1, every_cd))
+        # ...and with EVERY substitution left as written. A single-quoted `-c`
+        # script runs its own `$(…)`, so `bash -c 'a=$(echo rm -rf /); $a'`
+        # assigns the output whole; spliced in by the outer read it became
+        # `a=rm -rf /; $a`, where `$a` is just `rm` (XERK-1622).
+        if "$(" in raw or "`" in raw:
+            kept = _strip_prefixes(_tokenize(_unwrap_group(raw)))
+            script = _shell_c_script(kept[1:]) if kept and _basename(kept[0]) in _SHELL_PROGS else None
+            if script and ("$(" in script or "`" in script):
                 for reading in _script_readings(script):
                     out.extend(_expand_segments(reading, depth + 1, every_cd))
         if seg != raw.strip() and seg:
