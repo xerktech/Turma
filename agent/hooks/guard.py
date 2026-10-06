@@ -5214,6 +5214,30 @@ def _is_home_ssh(tok: str) -> bool:
     return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent)))
 
 
+# A target that STARTS with names: by here every name this line assigns or
+# defaults is substituted, so these are unknown, and bash reads an unset one as
+# empty — `rm -rf "$x"/etc` deletes /etc (XERK-1639). Only a name directly
+# before a `/` counts, so `"$x"*` and `"$x".bak` stay relative.
+_LEADING_NAMES_RE = re.compile(r"^(?:\$(?:[A-Za-z_]\w*|[0-9]|\{(?:[A-Za-z_]\w*|[0-9]+)\}))+(?=/)")
+# Set in every shell an agent runs, so never read empty: `$HOME/.cache` is not `/.cache`.
+_ALWAYS_SET_NAMES = {"HOME", "PWD"}
+
+
+def _dangerous_target(tok: str) -> str | None:
+    """Why ``tok`` names a protected path, or None. Besides the target as
+    written, its leading unknown names are read as empty, but that reading is
+    judged by `_is_dangerous_path` like any other: `"$build"/out` reads `/out`,
+    an ordinary root child, and stays allowed (owner decision on XERK-1639)."""
+    if _is_dangerous_path(tok):
+        return f"({tok!r})"
+    m = _LEADING_NAMES_RE.match(_norm_path(tok))
+    if m and not _ALWAYS_SET_NAMES & set(re.findall(r"\w+", m.group(0))):
+        rest = _norm_path(tok)[m.end():]
+        if _is_dangerous_path(rest):
+            return f"({tok!r}, which is {rest!r} when {m.group(0)} is unset)"
+    return None
+
+
 def _rm_is_recursive(flags: str) -> bool:
     """`-r` alone already deletes a tree.
 
@@ -5243,8 +5267,11 @@ def _destructive_rm(tokens: list[str]) -> str | None:
     if prog == "rm" and not _rm_is_recursive(flags):
         return None
     for tgt in targets:
-        if _is_dangerous_path(tgt) or _is_home_ssh(tgt):
+        if _is_home_ssh(tgt):
             return f"refusing recursive delete of a protected path ({tgt!r})"
+        why = _dangerous_target(tgt)
+        if why:
+            return f"refusing recursive delete of a protected path {why}"
     return None
 
 
@@ -5663,8 +5690,9 @@ def _destructive_chmod_chown(tokens: list[str]) -> str | None:
     for tok in tokens[1:]:
         if tok.startswith("-"):
             continue
-        if _is_dangerous_path(tok):
-            return f"refusing recursive {prog} on a protected path ({tok!r})"
+        why = _dangerous_target(tok)
+        if why:
+            return f"refusing recursive {prog} on a protected path {why}"
     return None
 
 

@@ -2906,7 +2906,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # A body printing nothing known stays opaque, never the empty root word.
         for cmd in ('rm -rf "$(cd x; mktemp -d)"', 'echo "$(git rev-parse HEAD; echo ok)"',
                     "x=$(true; echo hi); echo $x", 'rm -rf "$(mktemp -d | tr -d x)"',
-                    'rm -rf "$dir"/*', "ls ${dir}/sub", "$R format --check .",
+                    'rm -rf "$dir"/out', "ls ${dir}/sub", "$R format --check .",
                     'rm -rf "$repo".git', 'rm -rf ./"${name}".git'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
@@ -3057,6 +3057,23 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         start = time.time()
         self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         self.assertLess(time.time() - start, 30)
+
+    def test_an_unset_name_leading_a_target_is_read_empty(self):
+        # XERK-1639: bash reads an unset leading name as empty, so `"$x"/etc`
+        # deletes /etc. Only a protected remainder denies: `"$build"/out`
+        # reads `/out`, an ordinary root child, and stays allowed.
+        for cmd in ("rm -rf $x/etc", 'rm -rf "$x"/etc', "rm -rf ${x}/usr", "rm -rf $1/var/lib",
+                    'rm -rf "$STEAMROOT/"*', 'rm -rf "$dir"/*', "rm -rf $x/", 'rm -rf "$x"/home',
+                    "rm -rf $a$b/etc", 'chmod -R 777 "$x"/etc', 'chown -R me "$x"/usr'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ('rm -rf "$build"/out', "rm -rf $x/tmp/foo", 'rm -rf "$d".bak',
+                    'rm -rf "$x"*', "rm -rf $HOME/etc", "rm -rf $PWD/usr",
+                    # Assigned, defaulted or `:?`-guarded names are never empty.
+                    "x=/tmp; rm -rf $x/etc", 'd=$(mktemp -d); rm -rf "$d"/*',
+                    'rm -rf "${x:-/tmp}"/etc', 'rm -rf "${x:?}"/etc', 'chmod -R 755 "$x"/out'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
 
     def test_a_sibling_or_an_empty_expansion_does_not_hide_the_command(self):
         # XERK-1615: a sibling substitution printing a quote decided the one
