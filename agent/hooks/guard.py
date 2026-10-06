@@ -3992,14 +3992,21 @@ def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
         # ...and, a quoted `$(…)` in them left as written: the reader runs it,
         # so `bash <(echo 'a=$(echo rm -rf /); $a')` assigns its output whole,
         # where the spliced text bound `a=rm` (XERK-1649).
-        kept = _printed_text(unwrapped) if "$(" in unwrapped or "`" in unwrapped else None
-        if kept and kept != printed and ("$(" in kept or "`" in kept):
+        kept = _kept_printed(unwrapped)
+        if kept and kept != printed:
             _spend(len(kept))
             return [printed, kept]
         return [printed]
     if depth >= _MAX_EXPAND_DEPTH:
         return []
     out = []
+    # The statements' texts with quoted `$(…)` kept, joined as the reader gets
+    # them: `<(echo 'a=$(…)'; echo '$a')` binds across lines (XERK-1649).
+    stmts = [_unwrap_group(seg) for seg in segments]
+    if any(map(_kept_printed, stmts)):
+        out.append("\n".join(filter(None, (_kept_printed(st) or _printed_text(st)
+                                            for st in stmts))))
+        _spend(len(out[-1]))
     for seg in segments:
         seg = _unwrap_group(seg)
         out.append(_printed_text(_sub_substs(seg, _subst_text)) or "")
@@ -4017,6 +4024,19 @@ def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
             if script:
                 out.extend(_proc_subst_texts(script, depth + 1))
     return [t for t in out if t.strip()]
+
+
+def _kept_printed(stmt: str) -> str | None:
+    """What ``stmt`` prints with every quoted `$(…)`/backtick left as written,
+    when that text holds one: its reader runs them (XERK-1649). An escaped
+    backtick reads unescaped too, as bash's `echo "\\`…\\`"` prints it."""
+    if "$(" not in stmt and "`" not in stmt:
+        return None
+    kept = _printed_text(stmt)
+    if kept is None:
+        return None
+    kept = kept.replace("\\`", "`")
+    return kept if "$(" in kept or "`" in kept else None
 
 
 def _reads_stdin_script(stage: str, depth: int = 0, fresh: bool = False) -> bool:
@@ -4569,30 +4589,43 @@ def _shell_c_script(rest: list[str]) -> str | None:
     return rest[i] if i < len(rest) else None
 
 
-def _raw_shell_c_scripts(kept: list[str]) -> list[str]:
+def _raw_shell_c_scripts(kept: list[str], depth: int = 0) -> list[str]:
     """Each `-c` script in a segment's unspliced words: the segment's own shell,
-    or one an `xargs` or `find -exec` runs (XERK-1649). A double-quoted script's
+    or one an `xargs` or `find -exec` runs (XERK-1649) — only a word in RUNNER
+    position, so `xargs echo bash -c '…'` prints it. A double-quoted script's
     escaped backticks are live to the shell it reaches, so `bash -c "a=\\`…\\`"`
-    is read with them unescaped too: shlex keeps that `\\` where bash drops it."""
-    if not kept:
+    is read with them unescaped too: shlex keeps that `\\` where bash drops it.
+    A script that is one `$(echo …)` runs the text it prints, read as
+    `_proc_subst_texts` does: `bash -c "$(echo 'a=$(…); $a')"`."""
+    if not kept or depth > _MAX_EXPAND_DEPTH:
         return []
     prog = _basename(kept[0])
     if prog in _SHELL_PROGS:
-        starts = [0]
-    elif prog in ("xargs", "find"):
-        starts = [i for i in range(1, len(kept)) if _basename(kept[i]) in _SHELL_PROGS]
-    else:
-        return []
-    out = []
-    for i in starts:
-        script = _shell_c_script(kept[i + 1:])
-        if script is None:
-            continue
-        out.append(script)
-        plain = script.replace("\\`", "`")
-        if plain != script:
-            _spend(len(plain))
-            out.append(plain)
+        script = _shell_c_script(kept[1:])
+        return [] if script is None else _raw_script_texts(script)
+    runs: list[list[str]] = []
+    if prog == "xargs":
+        i = 1
+        while i < len(kept) and kept[i].startswith("-"):
+            i += 1 + ("=" not in kept[i] and kept[i] in _XARGS_OPTS_WITH_VALUE)
+        runs.append(kept[i:])
+    elif prog == "find":
+        runs += [kept[i + 1:] for i, t in enumerate(kept)
+                 if t in ("-exec", "-execdir", "-ok", "-okdir")]
+    return [sc for run in runs for sc in _raw_shell_c_scripts(_strip_prefixes(run), depth + 1)]
+
+
+def _raw_script_texts(script: str) -> list[str]:
+    """`_raw_shell_c_scripts`' readings of one `-c` script."""
+    out = [script]
+    plain = script.replace("\\`", "`")
+    if plain != script:
+        _spend(len(plain))
+        out.append(plain)
+    body = script.strip()
+    substs = _find_substs(body) if body.startswith(("$(", "`")) else []
+    if len(substs) == 1 and substs[0].start() == 0 and substs[0].end() == len(body):
+        out += [t for t in _proc_subst_texts(_subst_inner(substs[0])) if t not in out]
     return out
 
 
@@ -5867,7 +5900,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # _MAX_EXPAND_DEPTH, which fails closed).
         words = _strip_prefixes(_tokenize(_unwrap_group(raw)))
         if len(words) > 1 and _basename(words[0]) == "eval":
-            for script in _script_readings(" ".join(words[1:])):
+            joined = " ".join(words[1:])
+            # `eval "$(echo 'a=$(…); $a')"` runs the printed text (XERK-1649).
+            for script in dict.fromkeys([*_script_readings(joined), *_raw_script_texts(joined)[1:]]):
                 out.extend(_expand_segments(script, depth + 1, every_cd))
         # `seg` ran the line's substitutions, which turned a quoted `<(…)` —
         # literal to the outer shell — into the text it prints, so `bash -c

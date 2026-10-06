@@ -1315,13 +1315,25 @@ class TestProducedScripts(unittest.TestCase):
                     f". <(printf '%s' 'a=$(echo {R}); $a')",
                     f"cat <(echo 'a=$(echo {R}); $a') | bash",
                     f'bash -c "a=\\`echo {R}\\`; \\$a"',
-                    f'xargs bash -c "a=\\`echo {R}\\`; \\$a" <<< x'):
+                    f'xargs bash -c "a=\\`echo {R}\\`; \\$a" <<< x',
+                    # A second `-exec`, a `$(echo …)` script, multi-statement `<(…)` (QA).
+                    f"find . -exec true \\; -exec bash -c 'a=$(echo {R}); $a' \\;",
+                    f"bash -c \"$(echo 'a=$(echo {R}); $a')\"",
+                    f"sh -c \"$(printf %s 'a=`echo {R}`; $a')\"",
+                    f"eval \"$(echo 'a=$(echo {R}); $a')\"",
+                    f"bash <(echo 'a=$(echo {R})'; echo '$a')",
+                    f"bash <(echo 'a=$(echo {R}); $a' | cat)",
+                    f'bash <(echo "a=\\`echo {R}\\`; \\$a")'):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("xargs bash -c 'a=$(echo hi); echo $a' <<< x",
                     "find . -exec bash -c 'x=$(basename {}); echo $x' \\;",
                     "find . -name '*.py' -exec sh -c 'n=$(wc -l < \"$1\"); echo $n' _ {} \\;",
-                    "bash <(echo 'a=$(date); echo $a')", 'bash -c "a=\\`date\\`; echo \\$a"'):
+                    "bash <(echo 'a=$(date); echo $a')", 'bash -c "a=\\`date\\`; echo \\$a"',
+                    "bash <(echo 'a=$(date)'; echo 'echo $a')", 'eval "$(ssh-agent -s)"',
+                    # A shell word a printer is handed is text, not a runner.
+                    f"xargs echo bash -c 'a=$(echo {R}); $a'",
+                    f"find . -name sh -exec echo sh -c 'a=$(echo {R}); $a' \\;"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
