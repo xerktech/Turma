@@ -3097,7 +3097,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(guard._leading_names_end("$a${b%/}/etc"), len("$a${b%/}"))
         self.assertEqual(guard._leading_names_end("$a${b:-c}/etc"), 0)
         self.assertEqual(guard._leading_names_end("${x:-${HOME}}/etc"), 0)
-        for word in ("${HOME%/}", "${HOME#/}", "${HOME:+x}", "${HOME:-}", "${HOME^^}", "${HOME@Q}"):
+        for word in ("${HOME%/}", "${HOME#/}", "${HOME:+x}", "${HOME+x}", "${HOME:-}", "${HOME-x}",
+                     "${HOME^^}", "${HOME,,}", "${HOME@Q}", "${HOME:?}"):
             with self.subTest(word=word):
                 self.assertEqual(guard._leading_names_end(word + "/etc"), 0)
         # ...but an operator can still empty an always-set name (QA pass 4).
