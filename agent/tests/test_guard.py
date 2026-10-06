@@ -1568,7 +1568,14 @@ class TestScriptChannels(unittest.TestCase):
                     f"x=en; $x$(rev<<<'hsab v') <<EOF\n{R}\nEOF", f"en$(:)$(rev<<<'hsab v') <<EOF\n{R}\nEOF",
                     f"..`echo /../../../bin/bash` <<EOF\n{R}\nEOF", f"cd /; usr$(rev<<<'hsab/nib/') <<EOF\n{R}\nEOF",
                     f":(){{ echo v bash; }}; en$(:) <<EOF\n{R}\nEOF",
-                    f"true(){{ echo v bash; }}; cat <<EOF | en$(true)\n{R}\nEOF"):
+                    f"true(){{ echo v bash; }}; cat <<EOF | en$(true)\n{R}\nEOF",
+                    # A redefined silent builtin whose output no other layer reads.
+                    f"true(){{ rev<<<'hsab v'; }}; cat <<EOF | en$(true)\n{R}\nEOF",
+                    f":(){{ rev<<<'hsab v'; }}; en$(:) <<EOF\n{R}\nEOF",
+                    f":(){{ rev<<<'hsab'; }}; $(:) <<EOF\n{R}\nEOF",
+                    # An operator inside the substitution cut the owner apart (XERK-1644).
+                    f"ba$(echo hs | rev) <<EOF\n{R}\nEOF", f"nice$(echo 'hsab ' | rev) <<EOF\n{R}\nEOF",
+                    f"en$(rev<<<'hsab v';)v <<EOF\n{R}\nEOF", f"cat <<EOF | ba$(echo hs | rev)\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # A variable this line resolves to a non-shell, a glob matching none,
@@ -1577,7 +1584,8 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <<EOF | /bin/ca?\n{R}\nEOF", f"alias ll='ls -l'; cat <<EOF\n{R}\nEOF",
                     "cat <<EOF | $PAGER\nhello\nEOF", "f() { cat; }; f <<EOF\nhello\nEOF",
                     f"cat$(:) <<EOF\n{R}\nEOF", f"x=cat; $x$(:) <<EOF\n{R}\nEOF",
-                    f"x=cat; ${{x}}<<EOF\n{R}\nEOF"):
+                    f"x=cat; ${{x}}<<EOF\n{R}\nEOF", f"en`:`v <<EOF\n{R}\nEOF",
+                    f"cat <<EOF | grep \"$(echo a | tr a b)\"\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

@@ -48,6 +48,9 @@ paths:
     directory (`..$(…)`). Only a provably silent `$()`/`$(:)`/`$(true)`/`$(false)` is dropped
     (`cat$(:)` runs `cat`) — and not when the line redefines those. A literal-prefix rule was
     tried and bypassed both ways; don't retry it.
+  - The owner is ALSO split with each substitution a placeholder (an added reading): an operator
+    inside one (`ba$(echo hs | rev) <<EOF`, `en$(…;)`) cut the word apart first (XERK-1644).
+    `_owner_substs` is idempotent (a placeholder maps to itself); it runs twice on that reading.
   - A set `IFS` splits a resolved value anywhere: any shell name starting it or a path component
     fails closed (`IFS=x; a=bashx-s; $a`).
   - Globs are matched with `fnmatch`, which is not bash: `[^` is rewritten to `[!` and any `[:`

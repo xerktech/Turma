@@ -3894,7 +3894,8 @@ def _owner_substs(text: str) -> str:
     other. Printed text is never trusted — IFS splits it, `echo` may be
     redefined, and `en$(…)` printing `v bash` runs `env bash` — so
     `_owner_word_may_be_shell` fails closed on `` `s` `` (XERK-1624)."""
-    return _sub_substs(text, lambda m: "`0`" if _subst_inner(m).strip() in _SILENT_BODIES
+    # Idempotent: a placeholder already in ``text`` maps to itself.
+    return _sub_substs(text, lambda m: "`0`" if _subst_inner(m).strip() in (*_SILENT_BODIES, "0")
                        else "`s`")
 
 
@@ -4050,7 +4051,14 @@ def _heredoc_owner_reading_feeds_shell(owner: str, commands_feed_shell,
     # The splitter reads the `&` of `2>&1` / `&>f` as a background operator
     # and the `|` of `>|f` as a pipe, which cut `bash 2>&1 <<EOF` away from
     # its program. Only the program is asked of these segments, so both go.
-    segments = _split_segments(re.sub(r"[<>]&|&>|>\|", lambda m: m[0].strip("&|"), owner))
+    unredirected = re.sub(r"[<>]&|&>|>\|", lambda m: m[0].strip("&|"), owner)
+    segments = _split_segments(unredirected)
+    # ...and an operator inside a substitution cut its word apart too
+    # (`ba$(rev<<<hs;)`, `en$(… | rev)`), so the owner is also split with each
+    # one a placeholder, read as an unknown name (XERK-1624, XERK-1644).
+    blanked = _owner_substs(unredirected)
+    if blanked != unredirected:
+        segments = list(dict.fromkeys(segments + _split_segments(blanked)))
     if any("<<" in seg and any(map(may_be_shell, _heredoc_segment_programs(seg)))
            for seg in segments):
         return True
