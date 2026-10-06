@@ -39,10 +39,23 @@ paths:
   the outer splice made it `a=rm …; $a`, where `$a` is just `rm`. Added, never swapped.
 - **Values bound outside `NAME=` reach `$name` too** (XERK-1622, `_assigned_values`): a `for` list
   is read in whole dequoted words (`"$(echo rm …)"` is one), and `read NAMES <<< WORD` binds them
-  as bash splits it — a word each, the last the remainder (`_read_herestring`); every name gets
+  as bash splits it — a word each, the last the remainder (`_reader_values`); every name gets
   the whole text when the line sets IFS, and `-a`'s array always does. A `${x:-…}` word is read
   with its default applied too, as an assignment's is.
   - A name can be glued to the `<<<` (`read a<<<"…"`): shlex keeps it in the redirection token.
+- **A reader with no here-string of its own takes the stdin feeds that reach it** (XERK-1650,
+  `_reader_feeds`): a here-string or `< <(…)` on a group it is in, and an `echo`/`printf`
+  (or a group of them) piped into it or into one of its groups.
+  - A feed on any OTHER command (`cat <<< … |`, `f <<< …` calling a reader function,
+    `exec < <(…)`, an echo piped into `cat`) feeds EVERY reader: its path can't be traced.
+  - Paired, never every feed to every reader: N `echo … | while read` loops read each name N
+    ways, N² readings, and a benign script was refused as too large.
+  - A multi-line text is one more value with its lines kept (each line a read), never a value
+    per line: N reads of an N-line here-string was N² readings again.
+  - `mapfile`/`readarray` bind an array (MAPFILE by default); `select` binds REPLY, its list as
+    `for` does. A reader's own `<(…)` words are cut before its names are read.
+  - Residuals: IFS/`-d` delimiters, `bash -c 'read …'`, `mapfile -C`, coproc, files, `yes`, and `read a <<E` (values are read with
+    heredoc bodies already cut) (XERK-1658)..
 - **A `${…}` nested in another resolves innermost first** (XERK-1653, `_substitute_vars`'s `sub`):
   `_VAR_USE_RE` stops at the inner `}`, so `${x:-${y:-$(echo rm …)}}` was left raw and ran unseen.
   - The inner ones splice over the WHOLE line's positions (quote states, `_brace_end` memo), never
@@ -50,8 +63,6 @@ paths:
   - Only when `_brace_end` closes past the match AND a `${` sits inside; a `}` merely quoted
     (`${a:-'}' #}`) stays raw as one word (XERK-1585). Past `_MAX_NESTED_VARS` → too large.
   - 0 decision changes over a 20.5k-command replay (636 holding `${`).
-  - Residual: a multi-word list joins its words, so `for v in a 'rm …'; do $v; done` runs program
-    `a` in the guard's reading (XERK-1647).
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
