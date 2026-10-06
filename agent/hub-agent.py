@@ -374,6 +374,12 @@ UPDATING_ANNOUNCE_TIMEOUT_SEC = _env_float("TURMA_UPDATING_ANNOUNCE_TIMEOUT_SEC"
 # question lives here as `<sessionId>.req.json`; the answer the glasses client
 # sends rides back as `<sessionId>.ans.json`. See _hook_question / answer_question.
 QUESTIONS_DIR = os.path.join(REGISTRY_DIR, "questions")
+# The claude launch's long text arguments — the session directive and the
+# initial prompt — written here per session and read back by the pane's shell
+# as `"$(cat <file>)"`. Inlined, they made the `tmux new-session` command, and
+# tmux refuses one past ~16 KiB ("command too long"): a ticket with a long
+# description plus the directive could never start.
+LAUNCH_TEXT_DIR = os.path.join(REGISTRY_DIR, "launch")
 # The permission ledger's hook rows (XERK-1563): hooks/permlog.py appends one
 # JSON line per PermissionRequest / PermissionDenied event to
 # `<sessionId>.jsonl` here (rotating to `.1` past 1 MiB), and a worker tails it.
@@ -4090,6 +4096,31 @@ def _unix_sock_open(path, timeout=0.3):
         return False
     finally:
         s.close()
+
+
+def write_launch_text(sid, kind, text):
+    """Write one long launch argument (`kind` = "system"/"prompt") for session
+    `sid` to LAUNCH_TEXT_DIR, 0600, and return the shell word that reads it
+    back. Only the file PATH reaches the tmux command line, which tmux caps at
+    ~16 KiB. The shell's `$(…)` drops trailing newlines, which neither the
+    directive nor a prompt needs. Raises RuntimeError on an IO failure, so the
+    launch is marked failed rather than run without its directive."""
+    path = os.path.join(LAUNCH_TEXT_DIR, f"{sid}-{kind}.txt")
+    try:
+        os.makedirs(LAUNCH_TEXT_DIR, exist_ok=True)
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
+                     | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write(text)
+    except OSError as e:
+        raise RuntimeError(f"launch {kind} file: {e}")
+    return f'"$(cat {shlex.quote(path)})"'
+
+
+def launch_text_paths(sid):
+    """The files write_launch_text may have left for session `sid`."""
+    return [os.path.join(LAUNCH_TEXT_DIR, f"{sid}-{kind}.txt")
+            for kind in ("system", "prompt")]
 
 
 def unlink_quietly(paths):
@@ -23427,11 +23458,12 @@ class SessionManager:
         # The initial prompt (spawn only) as qwen's prompt-interactive: run it as
         # the first turn and stay interactive — the race-free equivalent of
         # claude's positional `-- <prompt>`, with no send-keys timing to get
-        # wrong. A resume carries no fresh prompt (context continues).
-        if prompt and not resume:
-            parts += ["-i", prompt]
+        # wrong. A resume carries no fresh prompt (context continues). It rides
+        # a launch file like claude's, so a long ticket fits tmux's command cap.
         qwen_cmd = (f"set -a; . {shlex.quote(env_file)}; set +a; "
                     + shlex.join(parts))
+        if prompt and not resume:
+            qwen_cmd += " -i " + write_launch_text(sess["id"], "prompt", prompt)
         self._spawn_in_tmux(sess, qwen_cmd, "qwen")
         # 6. Confirm the session actually came up before recording it (XERK-492):
         # a started tmux is not proof qwen bound its session (a bad config, a
@@ -24270,7 +24302,8 @@ class SessionManager:
         prompt (spawn only, #11) is delivered as claude's positional initial
         prompt — the race-free path: it is submitted as the first user turn when
         the interactive RC session comes up, with no send-keys timing to get
-        wrong. It is shell-quoted (shlex.quote) and placed after `--` so a task
+        wrong. It rides a 0600 launch file (write_launch_text), read back as one
+        `"$(cat …)"` word placed after `--` so a task
         that happens to start with '-' can't be read as a flag. The per-session
         model (#12) and permission mode (#12) come from the validated fields on
         the session record; both fall back to today's behavior when unset."""
@@ -24448,11 +24481,16 @@ class SessionManager:
         # `_session_directive`, appended here via --append-system-prompt (qwen/dsh
         # deliver the same text through a file). Rides every launch including
         # resume: it's session policy, not spawn state.
+        # Both long texts reach claude through files (write_launch_text): the
+        # directive plus a ticket's description overran tmux's ~16 KiB command
+        # limit and the session never started. Windows argv takes them inline.
         policy = self._session_directive(sess)
-        parts.append(f"--append-system-prompt {shlex.quote(policy)}")
+        if not IS_WINDOWS:
+            parts.append("--append-system-prompt "
+                         + write_launch_text(sess["id"], "system", policy))
         claude_cmd = " ".join(parts)
-        if prompt:
-            claude_cmd += f" -- {shlex.quote(prompt)}"
+        if prompt and not IS_WINDOWS:
+            claude_cmd += " -- " + write_launch_text(sess["id"], "prompt", prompt)
         # The AskUserQuestion bridge (hooks/ask.py) reads these off the claude
         # process env to key its request/answer rendezvous files. Prefixed as
         # shell assignments so tmux's `sh -c` exports them to claude and its
@@ -24941,6 +24979,7 @@ class SessionManager:
         # here (kill/delete/restart all reach this) so it doesn't keep tailing a
         # dead session's native log (XERK-509 [Qwen C]).
         self._teardown_qwen(sid)
+        unlink_quietly(launch_text_paths(sid))
         self._forget_live_agents(sid)
         self.sess_state.pop(sid, None)
         self.dsh_status.pop(sid, None)  # dsh liveness dies with the session (XERK-468)

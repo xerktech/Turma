@@ -846,6 +846,20 @@ class TestSpawnOptionHelpers(unittest.TestCase):
                 ha.resolve_base_ref("/repo", "bad;ref")         # bad chars, never hits git
 
 
+def expand_launch_text(cmd):
+    """A claude launch command with each `"$(cat <launch file>)"` replaced by
+    the shell-quoted text the pane's shell reads from that file — the command
+    as it was before the long texts moved to files, for content assertions.
+    A file a later teardown removed is left unexpanded."""
+    def expand(m):
+        try:
+            with open(shlex.split(m.group(1))[0], encoding="utf-8") as f:
+                return shlex.quote(f.read())
+        except FileNotFoundError:
+            return m.group(0)
+    return re.sub(r'"\$\(cat (\S+)\)"', expand, cmd)
+
+
 class ProjectDirMixin:
     """Temp PROJECTS_ROOT + a project dir for a fake worktree path."""
 
@@ -5158,6 +5172,7 @@ class ManagerMixin:
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("QUESTIONS_DIR", os.path.join(self.tmp, "questions")),
+            ("LAUNCH_TEXT_DIR", os.path.join(self.tmp, "launch")),
             # Derived from REGISTRY_DIR at import (XERK-1563): the permission
             # ledger's hook-log tail would otherwise read the real host's logs.
             ("PERMISSIONS_DIR", os.path.join(self.tmp, "permissions")),
@@ -5559,7 +5574,9 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         self.assertIn(f"--session-id {cid}", cmd)
         # Initial prompt delivered race-free via prompt-interactive, not send-keys.
         self.assertIn("-i", shlex.split(cmd.split("set +a; ", 1)[1]))
-        self.assertIn("do the thing", cmd)
+        # ...through a launch file, so a long ticket fits tmux's command cap.
+        self.assertNotIn("do the thing", cmd)
+        self.assertIn("-i 'do the thing'", expand_launch_text(cmd))
         # settings.json + the context file are written into the worktree.
         with open(os.path.join(self.wt, ".qwen", "settings.json")) as f:
             settings = json.load(f)
@@ -11587,10 +11604,12 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
     def _worktree_add_cmd(self):
         return next(c for c in self.run_ok_calls if "worktree" in c and "add" in c)
 
-    def _claude_cmd(self):
-        """The claude command line _launch_tmux hands to `tmux new-session`."""
+    def _claude_cmd(self, raw=False):
+        """The claude command line _launch_tmux hands to `tmux new-session`,
+        with each `"$(cat <launch file>)"` expanded to the shell-quoted text the
+        pane's shell reads from it (raw=True: exactly what tmux was given)."""
         newsess = next(c for c in self.run_ok_calls if "new-session" in c)
-        return newsess[-1]
+        return newsess[-1] if raw else expand_launch_text(newsess[-1])
 
     def test_spawn_no_options_keeps_todays_command_shape(self):
         """Regression guard: a bare spawn adds a DETACHED worktree (no -b, no
@@ -18531,7 +18550,8 @@ class TestSleeperSlot(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "RESUME_WAKE_PROMPT_ARG", True), \
                 mock.patch.object(ha.time, "time", return_value=due / 1000):
             sm.resume(sid)
-        launch = [c[-1] for c in self.run_ok_calls if "new-session" in c][-1]
+        launch = expand_launch_text(
+            [c[-1] for c in self.run_ok_calls if "new-session" in c][-1])
         self.assertIn(f"--resume {sess['claudeSessionId']}", launch)
         self.assertIn("-- 'Wake-up: check CI on PR #412. Check it and continue.'", launch)
         self.assertNotIn("wakeAt", sm._find(sid), "never delivered twice")
@@ -35687,8 +35707,12 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         d.update(over)
         return d
 
-    def _launches(self):
-        return [c for c in self.run_ok_calls if c and c[0] == "tmux" and "new-session" in c]
+    def _launches(self, raw=False):
+        """Each claude launch's tmux argv; the command (last element) has its
+        launch files expanded unless raw (see expand_launch_text)."""
+        return [c if raw else c[:-1] + [expand_launch_text(c[-1])]
+                for c in self.run_ok_calls
+                if c and c[0] == "tmux" and "new-session" in c]
 
     def test_a_mid_clone_repo_defers_the_branch_reservation(self):
         # Reserving needs a `git fetch` and a ref scan, and a repo whose clone
@@ -36021,18 +36045,64 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm = self.make_ticket_manager()
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: detail):
             sm.spawn_ticket("PROJ-7")
-        cmd = self._launches()[-1][-1]
-        # The payload rides as DATA, with every quote it carries neutralised.
-        self.assertIn("touch /tmp/pwned", cmd)
-        self.assertIn("'\"'\"'", cmd, "shlex.quote's escaped-quote form")
-        # The proof it can't ESCAPE is the round trip, not a substring search
-        # (the escaped form '"'"'; touch … happens to CONTAIN the raw payload):
-        # the command parses back into shell words with the whole prompt as
-        # exactly one of them, byte-for-byte what we built...
-        words = shlex.split(cmd)
-        self.assertEqual(words[-1], ha.build_ticket_prompt(detail))
-        # ...so nothing the ticket carried ever became a word of its own.
-        self.assertNotIn("touch", words)
+        # The ticket text never reaches the command line at all: the prompt
+        # rides a launch file, read back as ONE double-quoted `$(cat …)` word.
+        cmd = self._launches(raw=True)[-1][-1]
+        self.assertNotIn("touch", cmd)
+        prompt_word = shlex.split(cmd, posix=False)[-1]
+        self.assertRegex(prompt_word, r'^"\$\(cat \S+\)"$')
+        # Run that word through a real shell: it expands to exactly one
+        # argument, byte-for-byte the prompt we built, and nothing ran.
+        out = subprocess.run(
+            ["sh", "-c", f"set -- {prompt_word}; echo $#; printf %s \"$1\""],
+            capture_output=True, text=True, check=True).stdout
+        count, _, arg = out.partition("\n")
+        self.assertEqual(count, "1")
+        self.assertEqual(arg, ha.build_ticket_prompt(detail).rstrip("\n"))
+        self.assertFalse(os.path.exists("/tmp/pwned"))
+
+    def test_a_long_ticket_keeps_the_tmux_command_short(self):
+        # tmux refuses a command past ~16 KiB ("command too long"), so a ticket
+        # whose description plus the session directive passed that never
+        # started. Both texts now ride 0600 launch files, so the command's
+        # length no longer depends on them — and deleting the session drops them.
+        detail = self._detail(description="x" * 40000)
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: detail):
+            sm.spawn_ticket("PROJ-7")
+        sess = sm.registry[-1]
+        self.assertEqual(sess["status"], "running")
+        cmd = self._launches(raw=True)[-1][-1]
+        self.assertLess(len(cmd), 4096)
+        self.assertNotIn("xxxx", cmd)
+        self.assertIn("x" * 40000, self._launches()[-1][-1])
+        files = ha.launch_text_paths(sess["id"])
+        for path in files:
+            self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
+        sm._forget_session_caches(sess["id"])
+        self.assertFalse(any(os.path.exists(p) for p in files))
+
+    def test_the_launch_file_path_is_shell_quoted(self):
+        # The path sits on a shell command line, and REGISTRY_DIR is the host's
+        # $HOME: a space or quote in it must not split or break the word.
+        odd = os.path.join(self.tmp, "it's a dir")
+        with mock.patch.object(ha, "LAUNCH_TEXT_DIR", odd):
+            word = ha.write_launch_text("s1", "prompt", "hello\nworld")
+        out = subprocess.run(["sh", "-c", f"set -- {word}; echo $#; printf %s \"$1\""],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out, "1\nhello\nworld")
+
+    def test_an_unwritable_launch_dir_refuses_the_launch(self):
+        # Launching without the directive would run a session with no branch,
+        # peer or PR policy: a failed write must fail the launch, never go bare.
+        blocker = os.path.join(self.tmp, "not-a-dir")
+        open(blocker, "w").close()
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "LAUNCH_TEXT_DIR", blocker), \
+             mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry[-1]["status"], "error")
+        self.assertEqual(self._launches(), [])
 
     def test_spawns_an_azure_work_item(self):
         """An Azure host spawns a numeric-id work item through the SAME path,
