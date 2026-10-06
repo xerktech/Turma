@@ -1529,6 +1529,43 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_shell_name_formed_by_an_empty_expansion_or_a_brace(self):
+        # XERK-1629: bash forms `bash` from `bas``h`, `bas$(:)h`, `bas$@h`,
+        # `$'bas\150'` and `bash -sh` from `{bas,-s}h`; shlex reads one other word.
+        R = self.R
+        for name in ("bas``h", "bas$()h", "bas$(:)h", "bas$( )h", "bas` `h", "b``a``s``h",
+                     "bas$(true)h", "bas$''h", 'bas$""h', "bas$@h", "bas$*h", "bas${@}h",
+                     "bas${@:-}h", "bas${*:-}h", "bas${@:1}h",
+                     "{,bash}", "bas{h..h}", "{b..b}ash", '$"bash"', '$"bas"h',
+                     "bas${@:-h}", "ba${*-s}h",
+                     "bas${@:-}h", "bas${*:-}h", "bas${@:1}h",
+                     "bas$'\\x68'", "$'bas\\150'", "{bas,-s}h", "/bin/bas``h"):
+            for cmd in (f"{name} <<EOF\n{R}\nEOF", f"{name} <<'EOF'\n{R}\nEOF",
+                        f"cat <<EOF | {name}\n{R}\nEOF", f"echo '{R}' | {name}",
+                        f"{{ X=')' {name}; }} <<EOF\n{R}\nEOF", f"(X=')' {name})<<EOF\n{R}\nEOF"):
+                with self.subTest(cmd=cmd):
+                    self.assertDenied(cmd)
+        # `bash sh` / `sh s` run a script FILE, not stdin; a sequence past
+        # `_BRACE_SEQ_MAX`, or a mixed one bash leaves literal, is not expanded.
+        for cmd in (f"echo x | {{,bash}} -c '{R}'", f"rm -rf /{{e..e}}tc",
+                    f"echo {{a,b}} {{a,b}} {{a,b}} {{a,b}} >/dev/null; echo '{R}' | {{,bash}}",
+                    f"echo '{R}' | ( echo {{a,b}} {{a,b}} {{a,b}} {{a,b}} >/dev/null; {{,bash}} )",
+                    f"echo '{R}' | {{,bash}}|cat", f"echo '{R}' | {{,bash}};",
+                    f"echo '{R}' | {{,bash}}&&true", f"echo '{R}' | ({{,bash}})",
+                    f"echo '{R}' | {{,bash}}>/dev/null", f"echo '{R}' | bash>/dev/null",
+                    f"echo '{R}' | bash>&2", f"echo '{R}' | bash -c '{{,bash}}'",
+                    f"echo '{R}' | bash -c \"(cat | {{,bash}})\"",
+                    f"bash -c '(cat | {{,bash}})' <<< '{R}'",
+                    f"echo '{R}' | bash -c 'bash -c \"{{,bash}}\"'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in (f"echo '{R}' | {{ba,}}sh", f"echo '{R}' | s{{h,}}",
+                    f"cat$(:) <<EOF\n{R}\nEOF", f"echo '{R}' | ca``t", "echo {1..5}",
+                    "echo {1..99999}", "echo {a..1}", f"echo '{R}' | {{,c}}at",
+                    f"echo '{R}' | ba${{@:-zz}}sh"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_here_strings_and_process_substitution_fed_to_a_shell(self):
         R = self.R
         for cmd in (f"sh <<< '{R}'", f"sh<<<'{R}'", f"bash -s <<< '{R}'",
@@ -2430,6 +2467,16 @@ class TestExpansionBudget(unittest.TestCase):
             self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:40])
         self.assertIsNone(self.check("ssh h " + "a " * 200))
 
+    def test_brace_words_in_nested_readers_stay_linear(self):
+        # XERK-1629 QA: a name reading taken at every nested reader doubled the
+        # work per level (the brace cap re-forms each), 53s at 21 KB.
+        cmd = "cat " + " ".join(["x{a,b}"] * 1000)
+        for _ in range(6):
+            cmd = f"cat | ( {cmd} )"
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": "echo hi | " + cmd})[0], "allow")
+        self.assertLess(time.monotonic() - t, 5)
+
     def test_unclosed_brace_lists_and_grep_runs_classify_fast(self):
         # `{a,a,…` backtracked over every comma, and `grep grep …` rescanned its
         # piece from every grep: both quadratic (XERK-1596).
@@ -2437,7 +2484,7 @@ class TestExpansionBudget(unittest.TestCase):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
             self.assertLess(time.monotonic() - t, 5, cmd[:20])
-        self.assertEqual(guard._expand_braces("rm {,a} {a} {a,b}"), "rm {,a} {a} a b")
+        self.assertEqual(guard._expand_braces("rm {,a} {a} {a,b}"), "rm a {a} a b")
         self.assertEqual(guard._expand_braces("rm {a, b}"), "rm {a, b}")
         # The grep and the tmux must share one `;`/`&`/newline piece, grep first.
         self.assertTrue(guard._greps_for_tmux("ps | grep -w tmux"))

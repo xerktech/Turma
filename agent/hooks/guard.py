@@ -1680,11 +1680,17 @@ _IFS_RE = re.compile(r"\$\{IFS\}|\$IFS")
 # (`bash -c`), so decoding it here ate the `$` that re-parse needs. After an
 # EVEN run (`\\$'…'`) it is still a live ANSI-C string (XERK-1611).
 _ANSI_C_RE = re.compile(r"(?<!\\)(\\*)\$'((?:[^'\\]|\\.)*)'")
-# A `{…}` word; it expands only when a `,` follows its first character. Testing
-# that in the regex (`[^{}\s]+,[^{}\s]*`) backtracked over every comma of an
-# unclosed `{a,a,…`: quadratic, and a hook that times out runs the command
-# (XERK-1596).
+# A `{…}` word; it expands when it holds a `,` (`{,bash}` too: bash drops the
+# empty word) or is a sequence. Testing that in the regex (`[^{}\s]+,[^{}\s]*`)
+# backtracked over every comma of an unclosed `{a,a,…`: quadratic, and a hook
+# that times out runs the command (XERK-1596).
 _BRACE_RE = re.compile(r"\{([^{}\s]+)\}")
+# `{h..h}`, `{1..3}`, `{a..e..2}`: a sequence bash expands like a list (XERK-1629).
+_BRACE_SEQ_RE = re.compile(r"(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?")
+# The most words a sequence is expanded to; a longer one is left as written.
+_BRACE_SEQ_MAX = 64
+_BRACE_WORD_END = frozenset(" \t\n;&|<>()")
+_BRACE_WORD_END_RE = re.compile(r"[ \t\n;&|<>()]")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
 # inlined as `eval 'rm` (XERK-1256).
 # A value is read WHOLE, quoted runs and substitutions included: cut at its
@@ -1815,6 +1821,21 @@ def _decode_ansi_c(command: str) -> str:
     return _ANSI_C_RE.sub(rep, command)
 
 
+def _brace_sequence(body: str) -> list[str] | None:
+    """The words a `{x..y[..step]}` sequence expands to, or None."""
+    m = _BRACE_SEQ_RE.fullmatch(body)
+    if not m:
+        return None
+    a, b, step = m.group(1), m.group(2), abs(int(m.group(3) or 1)) or 1
+    if a.lstrip("-").isdigit() != b.lstrip("-").isdigit():
+        return None
+    lo, hi = (int(a), int(b)) if a.lstrip("-").isdigit() else (ord(a), ord(b))
+    if abs(hi - lo) // step >= _BRACE_SEQ_MAX:
+        return None
+    seq = range(lo, hi + 1, step) if lo <= hi else range(lo, hi - 1, -step)
+    return [str(v) if a.lstrip("-").isdigit() else chr(v) for v in seq]
+
+
 def _expand_braces(command: str) -> str:
     """`rm -rf {/etc,/var}` → `rm -rf /etc /var` (prefix/suffix preserved).
 
@@ -1832,17 +1853,22 @@ def _expand_braces(command: str) -> str:
         start, end = m.span()
         # `${x,,}` is a case-modifying parameter expansion, never a brace
         # list: expanded, `${x,,}rm` read as `$xrm $rm $rm` (XERK-1615).
-        if states[start] or "," not in m.group(1)[1:] \
+        items = m.group(1).split(",") if "," in m.group(1) else _brace_sequence(m.group(1))
+        if states[start] or not items \
                 or (start and command[start - 1] == "$" and _live_dollar(command, start - 1)):
             pos = start + 1
             continue
         expansions += 1
-        word_start = command.rfind(" ", 0, start) + 1
-        word_end = command.find(" ", end)
-        if word_end == -1:
-            word_end = len(command)
+        # A word ends at a blank or an operator: cut only at a space,
+        # `{,bash}|cat` read as `|cat bash|cat` (XERK-1629).
+        word_start = start
+        while word_start and command[word_start - 1] not in _BRACE_WORD_END:
+            word_start -= 1
+        m_end = _BRACE_WORD_END_RE.search(command, end)
+        word_end = m_end.start() if m_end else len(command)
         prefix, suffix = command[word_start:start], command[end:word_end]
-        parts = [prefix + p.strip() + suffix for p in m.group(1).split(",")]
+        # An empty word goes, as in bash: `{,bash}` runs `bash`.
+        parts = [w for w in (prefix + p.strip() + suffix for p in items) if w]
         command = command[:word_start] + " ".join(parts) + command[word_end:]
         pos = word_start
         states = _quote_states(command)
@@ -3155,7 +3181,7 @@ def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
     return [t for t in out if t.strip()]
 
 
-def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
+def _reads_stdin_script(stage: str, depth: int = 0, fresh: bool = False) -> bool:
     """Whether the command in ``stage`` runs its stdin (or an inherited fd) as
     a SCRIPT: a shell with no `-c` and no script file (`… | sh`, `bash -s`,
     `sh <<< '…'`), `source`/`.` of such a path (`. <(echo …)`), or a shell
@@ -3165,6 +3191,17 @@ def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
     does: `echo … | (cat | bash)`."""
     if depth > _MAX_EXPAND_DEPTH:
         return True  # a reader fed too much fails closed
+    # Read as bash forms its names first: `_unwrap_group` takes `{,bash}` for
+    # a group and leaves `,bash` (XERK-1629). Once per script TEXT — the top,
+    # and each ``fresh`` `-c` script, whose quoted braces the outer reading
+    # left alone — never per group level: that doubled the work per level
+    # (the brace cap re-forms each).
+    if depth and not fresh:
+        return _reads_stdin_script_as(stage, depth)
+    return any(_reads_stdin_script_as(text, depth) for text in _name_readings(stage))
+
+
+def _reads_stdin_script_as(stage: str, depth: int) -> bool:
     # A part equal to the stage is read as one command, never split again: the
     # redirect re-reading returns `>&1` among the parts of `>&1` (XERK-1616),
     # and re-splitting it ran to the depth cap, which says "reads".
@@ -3298,17 +3335,23 @@ def _simple_commands(stage: str, depth: int = 0) -> list[str]:
 
 
 def _command_reads_stdin(stage: str, depth: int) -> bool:
-    """`_reads_stdin_script` for one simple command (no list, no group)."""
+    """`_reads_stdin_script` for one simple command (no list, no group), in
+    every way bash may form its program name (`_name_readings`)."""
+    return any(_command_reads_stdin_as(text, depth) for text in _name_readings(stage))
+
+
+def _command_reads_stdin_as(stage: str, depth: int) -> bool:
     text = _sub_substs(stage, _proc_subst_path)
     # A `<(` left is one the (not paren-aware) split cut off from its `)`:
     # `bash < <(echo hi; echo …)` reaches here as `bash < <(echo hi`.
     if "<(" in text:
         text = text[:text.index("<(")] + "/dev/fd/63"
     tokens = _strip_prefixes(_tokenize(text))
-    # `sh<<<'…'` tokenises as one word; the program is the part before it.
-    if tokens and "<" in tokens[0] and not tokens[0].startswith("<"):
-        head, _, tail = tokens[0].partition("<")
-        tokens = [head, "<" + tail, *tokens[1:]]
+    # `sh<<<'…'` and `bash>/dev/null` tokenise as one word; the program is the
+    # part before the redirection (XERK-1629: `>` was kept in the name).
+    m = re.search(r"[<>]", tokens[0]) if tokens else None
+    if m and m.start():
+        tokens = [tokens[0][:m.start()], tokens[0][m.start():], *tokens[1:]]
     if not tokens:
         return False
     prog, rest = _basename(tokens[0]), tokens[1:]
@@ -3330,7 +3373,7 @@ def _command_reads_stdin(stage: str, depth: int) -> bool:
         return False
     if _shell_c_index(rest) >= 0:
         script = _shell_c_script(rest)
-        return bool(script) and _reads_stdin_script(script, depth + 1)
+        return bool(script) and _reads_stdin_script(script, depth + 1, fresh=True)
     if prog == "su":
         return True  # its operands name a USER; without `-c` the shell reads stdin
     i = 0
@@ -3539,6 +3582,36 @@ _SHELL_WORD_RE = re.compile(
     r"|(?:^|(?<=[\s;&|({]))\.(?=\s)")
 
 
+# What may expand to nothing inside a word: `$@`, `$*`, `${@:-}`, `${*:1}` (no
+# arguments at the top level) and an empty `$''` / `$""`.
+# `${@:-w}` / `${*-w}` is `w` (`${@:=w}` is an error). `[^}$]`, not `[^}]`: that restarted at every
+# unclosed `${@`, quadratic.
+_EMPTY_EXPANSION_RE = re.compile(r"\$(?:[@*]|\{[@*](?::?-([^}$]*)|[^}$]*)\}|''|\"\")")
+# `$"…"` is a locale-translated string: untranslated, `$"bash"` runs `bash`.
+_LOCALE_STRING_RE = re.compile(r"\$(?=\")")
+
+
+def _name_readings(text: str) -> tuple[str, ...]:
+    """``text``, and again as bash may form program names from it (XERK-1629):
+    every `$(…)`/backtick substitution printing nothing, `$@`/`$*`/`$''`/`$""`
+    empty, `$'\\x68'` decoded and `{a,b}` braces expanded. Bash runs `bas``h`,
+    `bas$(:)h`, `bas$@h`, `$'bas\\150'`, `$"bash"` as `bash`, and `{bas,-s}h` as `bash
+    -sh`; shlex reads each as one other word. Only for asking which program a
+    command runs: a substitution dropped here is still classified where it sits."""
+    if "$" not in text and "`" not in text and "{" not in text:
+        return (text,)
+    out, last = [], 0
+    for m in _find_substs(text):
+        if m.group(0)[0] in "$`":
+            out.append(text[last:m.start()])
+            last = m.end()
+    out.append(text[last:])
+    formed = _LOCALE_STRING_RE.sub("", _EMPTY_EXPANSION_RE.sub(lambda m: m[1] or "",
+                                                               "".join(out)))
+    formed = _expand_braces(_decode_ansi_c(formed))
+    return (text,) if formed == text else (text, formed)
+
+
 def _reads_stdin_grouped(segment: str) -> bool:
     return any(_reads_stdin_script(text) for text in _ungrouped(segment))
 
@@ -3568,8 +3641,15 @@ def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
 
     The line's first word alone missed three owners bash runs the body for:
     `bash<<EOF` (one word), `(bash <<EOF` (a subshell) and `{ bash; } <<EOF`
-    (a group's redirect feeds every reader in it).
+    (a group's redirect feeds every reader in it). Asked of every way bash
+    may form names on the line: `bas``h <<EOF`, `cat <<EOF | {bas,-s}h`
+    (XERK-1629).
     """
+    return any(_heredoc_owner_reading_feeds_shell(text, commands_feed_shell)
+               for text in _name_readings(owner))
+
+
+def _heredoc_owner_reading_feeds_shell(owner: str, commands_feed_shell) -> bool:
     # The splitter reads the `&` of `2>&1` / `&>f` as a background operator
     # and the `|` of `>|f` as a pipe, which cut `bash 2>&1 <<EOF` away from
     # its program. Only the program is asked of these segments, so both go.
@@ -3751,9 +3831,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if not line_feeds_shell:
             # Quotes, escapes and line continuations joined: bash runs `bas''h`,
             # `b\ash`, `bas$''h` and `bas\` / `h` as `bash`.
-            joined = re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", raw_commands)
-            line_feeds_shell.append(any(map(_SHELL_WORD_RE.search, (raw_commands, joined))) or any(
-                _reads_stdin_grouped(st) for st in _split_segments(raw_commands)))
+            # ...and names formed by an empty substitution or a brace (XERK-1629).
+            texts = _name_readings(raw_commands)
+            joined = [re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", t) for t in texts]
+            line_feeds_shell.append(any(map(_SHELL_WORD_RE.search, (*texts, *joined))) or any(
+                _reads_stdin_grouped(st) for t in texts for st in _split_segments(t)))
         return line_feeds_shell[0]
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
@@ -3916,7 +3998,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             _feed(text)
         for stage in _split_on_operators(pipeline, keep_redirects=True, groups=True):
             ustage = _unwrap_group(stage)
-            if _reads_stdin_script(ustage):
+            # Named as bash forms it before the group is unwrapped (XERK-1629).
+            if any(_reads_stdin_script(_unwrap_group(t)) for t in _name_readings(stage)):
                 fed = list(producers)
                 fed.extend(_herestrings(ustage))
                 for m in _find_substs(ustage):
