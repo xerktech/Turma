@@ -1752,11 +1752,20 @@ class TestScriptChannels(unittest.TestCase):
                     "a='xx/etc'; b=${a/xx/$nope}; rm -rf $b",
                     "x=eval; z=$x; $z \"a='rm -rf /etc'\"; $a",
                     "${x:-eval} \"a='rm -rf /etc'\"; $a",
-                    "e$(true)val \"a='rm -rf /etc'\"; $a"):
+                    "e$(true)val \"a='rm -rf /etc'\"; $a",
+                    # QA delta 5: a nested default glued to pattern text; a
+                    # one-hop op with a name in its pattern; the second `$(…)`
+                    # an eval is handed.
+                    "a=x/etc; rm -rf \"${a#${b:-$nope}x}\"",
+                    "s=x; a='x/etc'; b=\"${a#$s}\"; rm -rf $b",
+                    "s=Q; a='Q/etc'; b=${a/$s/}; rm -rf \"$b\"",
+                    "eval \"$(echo x=1)\" \"$(echo \"a='rm -rf /etc'\")\"; $a",
+                    "eval \"$(echo x=1); $(echo \"a='rm -rf /etc'\")\"; $a"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("eval 'a=$(echo /tmp/x)'; rm -rf \"$a\"",
                     "x='eval \"$x\"'; eval \"$x\"; ls",
+                    " ".join(['eval \"$(echo a=1)\";'] * 10) + " ls",
                     "eval \"$(ssh-agent -s)\"; ssh-add",
                     "p=/usr/local/bin/tool; echo \"${p##*/}\" \"${p%/*}\"",
                     "a='  x  '; a=\"${a#\"${a%%[![:space:]]*}\"}\"; echo \"$a\"",

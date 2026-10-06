@@ -2424,7 +2424,10 @@ def _assigned_values(command: str, depth: int = 0,
                         scripts.add(printed)
                 for sc in scripts:
                     for name, got in _assigned_values(sc, depth + 1, known).items():
-                        vals.setdefault(name, []).extend(got)
+                        # Each value once: two readings of one script binding
+                        # it twice halved the line's value headroom.
+                        have = vals.setdefault(name, [])
+                        have.extend(v for v in got if v not in have)
                 break
     # How many values one name is ASSIGNED, so `_expand_both` reads each on
     # its own. Not a `for` list's words: those are a loop's data, and a long
@@ -3240,6 +3243,9 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # the `rm` a comment. The `#` was a word inside the braces; keep it
             # one (XERK-1585). Quotes and `$(…)` in the default stay live.
             out = re.sub(r"(?<!\\)#", r"\\#", op.group(2))
+            # A bare name in it braced, so text after the `}` stays text:
+            # `${a#${b:-$nope}x}` read the pattern as `$nopex` (XERK-1651).
+            out = re.sub(r"(?<!\\)\$([A-Za-z_]\w*)", r"${\1}", out)
             if states and states[m.start()] == '"':
                 out = _dq_default(out)
         else:
