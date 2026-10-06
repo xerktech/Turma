@@ -1351,7 +1351,7 @@ class TestProducedScripts(unittest.TestCase):
                     f"xargs --process-slot-var V {R} <<< x", f"xargs -rL1 {R} <<< x",
                     # getopt_long prefixes; `--max-lines` takes no next word.
                     f"xargs --max-a 1 {R} <<< x", f"xargs --delim '\\n' {R} <<< x",
-                    f"xargs --max-lines {R} <<< x",
+                    f"xargs --max-lines {R} <<< x", f"xargs --max-args=1 {R} <<< x",
                     f"xargs --max-lines bash -c 'a=$(echo {R}); $a' <<< x"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
