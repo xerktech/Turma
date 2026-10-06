@@ -2117,38 +2117,53 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
                 got = out[k][i] = settle(k, i)
                 (known if i < own[k] else defaults)[k].append(got)
             continue
-        # A cycle (`a=$b; b=$a`, `d=/; d=$d/etc`): each value is read ONCE, as
-        # soon as every other member it uses has a value, so a seed reaches
-        # every member however the names sort (`b=/etc; c=$b; a=$c; b=$a;
-        # $a`). Stuck, the next value in line is read with what is known, an
-        # unknown member empty, as an unset name. Re-reading on each change
-        # nested every lap's text into the next: a loop's `n=$((n + ${m:-0}))`
-        # counters were refused as too deep.
-        waiting = {}
+        # A cycle (`a=$b; b=$a`, `d=/; d=$d/etc`): each value is read once
+        # every other member it uses is COMPLETE, so a seed reaches every
+        # member however the names sort (`b=/etc; c=$b; a=$c; b=$a; $a`), and
+        # a member's other value is no decoy (`x=/tmp; x=$q; y=$x`). Stuck,
+        # the first value in line is read with what is known, an unknown
+        # member empty (an unset name), and read once more at the end.
+        # Re-reading on every change nested each lap's text into the next: a
+        # loop's `n=$((n + ${m:-0}))` counters were refused as too deep.
+        # Sorted, so no verdict hangs on set order (the hash seed).
+        slots.sort(key=lambda slot: slot[:2])
+        left = collections.Counter(k for k, _i, _names in slots)
+        waiting: dict[tuple[str, int], int] = {}
         users: dict[str, list[tuple[str, int]]] = {}
         for k, i, names in slots:
             # Not its own name: `d=$d/etc` reads d as it is.
-            need = {n for n in names & group if n != k and not known[n]}
+            need = sorted(n for n in names & group if n != k)
             waiting[k, i] = len(need)
             for n in need:
                 users.setdefault(n, []).append((k, i))
         ready = collections.deque(slot for slot, n in waiting.items() if not n)
         line = iter(list(waiting))
+        early: list[tuple[str, int]] = []
+        at: dict[tuple[str, int], tuple[list[str], int]] = {}
         while waiting:
-            slot = ready.popleft() if ready else next(s for s in line if s in waiting)
+            if ready:
+                slot = ready.popleft()
+            else:
+                slot = next(s for s in line if s in waiting)
+                early.append(slot)
             if slot not in waiting:
                 continue
             del waiting[slot]
             k, i = slot
-            had = bool(known[k])
-            got = out[k][i] = settle(k, i)
-            (known if i < own[k] else defaults)[k].append(got)
-            if not had and known[k]:
+            store = known[k] if i < own[k] else defaults[k]
+            store.append(settle(k, i))
+            at[slot] = (store, len(store) - 1)
+            out[k][i] = store[-1]
+            left[k] -= 1
+            if not left[k]:
                 for user in users.pop(k, ()):
                     if user in waiting:
                         waiting[user] -= 1
                         if not waiting[user]:
                             ready.append(user)
+        for k, i in early:
+            store, n = at[k, i]
+            store[n] = out[k][i] = settle(k, i)
     return out
 
 
@@ -2180,7 +2195,7 @@ def _dependency_order(waits: dict[str, set[str]]) -> list[set[str]]:
         index[root] = low[root] = len(index)
         stack.append(root)
         on_stack.add(root)
-        work = [(root, iter(waits[root]))]
+        work = [(root, iter(sorted(waits[root])))]
         while work:
             node, edges = work[-1]
             for nxt in edges:
@@ -2188,7 +2203,7 @@ def _dependency_order(waits: dict[str, set[str]]) -> list[set[str]]:
                     index[nxt] = low[nxt] = len(index)
                     stack.append(nxt)
                     on_stack.add(nxt)
-                    work.append((nxt, iter(waits[nxt])))
+                    work.append((nxt, iter(sorted(waits[nxt]))))
                     break
                 if nxt in on_stack:
                     low[node] = min(low[node], index[nxt])

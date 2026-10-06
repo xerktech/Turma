@@ -285,13 +285,15 @@ paths:
   - Resolving once, against values naming none, read `q=/etc; d=$q; r=$d` as `r` empty. Rounds
     were tried too: a link naming a cycle (`d=$q$c; c=$c`) stalled the chain, and a name with one
     plain and one chained value (`q=/tmp; q=$e; d=$q`) was read before its second value.
-  - A cycle (an SCC, or a name using itself) reads each value ONCE, as soon as every other member
-    it uses has a value; stuck, the next value in line is read with unknown members empty (as an
-    unset name). A seed then reaches every member however the names sort (`b=/etc; c=$b; a=$c;
-    b=$a`); read once in sorted order, that read `a` empty (QA). A value reads its OWN name as it
-    is (`d=/; d=$d/etc` stays `//etc`).
+  - A cycle (an SCC, or a name using itself) reads each value once every OTHER member it uses is
+    COMPLETE (all its values read), so a seed reaches every member however the names sort
+    (`b=/etc; c=$b; a=$c; b=$a`) and a member's other value is no decoy (`x=/tmp; x=$q; y=$x`).
+    Stuck, the first value in line is read with unknown members empty (an unset name) and read
+    once more at the end. A value reads its OWN name as it is (`d=/; d=$d/etc` stays `//etc`).
     - Never re-read on each change: each lap nested the last one's text, and a test loop's
       `n=$((n + ${m:-0}))` counters were refused as too deep (real-command replay).
+    - Slots and Tarjan edges are SORTED: in set order a verdict changed with PYTHONHASHSEED,
+      which the hook draws afresh per call (`test_assignment_resolution_does_not_hang_on_the_hash_seed`).
     - Accepted: a dense cycle (a 30-name clique) doubles its text per member and is denied as too
       large, as a doubling chain is.
   - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`); names in a
@@ -300,7 +302,8 @@ paths:
     as the literal `$x` — a bypass of `rm -rf ${x:+$x}`.
   - Not modelled: ORDER (`d=$q$c; c=x` reads c as x; bash has it unset there) — XERK-1660.
   - Tests: `test_a_chain_of_assignments_resolves_every_link`,
-    `test_a_cycle_of_assignments_stays_bounded`.
+    `test_a_cycle_of_assignments_stays_bounded`, `test_a_cycle_of_assignments_is_read_once`,
+    `test_names_in_an_operator_argument_are_dependencies`.
 - **A name assigned more than once is also read with each value on its own** (`_picked`,
   XERK-1621): joined, `x=a; x="rm …"; $x` ran the program `a`. Added readings, never swapped.
   - One whole-line reading per value; more than `_MAX_VALUE_READINGS` assignments to one name

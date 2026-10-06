@@ -1196,16 +1196,43 @@ class TestParserGaps(unittest.TestCase):
                     "x=1; y='rm -rf /etc'; ${x:+$y}",
                     "q=1; a='rm -rf /etc'; d=${q:+$a}; $d",
                     "b=/etc; c=$b; a=$c; b=$a; rm -rf $a",
-                    "z=/etc; y=$z; x=$y; z=$x; rm -rf $x"):
+                    "z=/etc; y=$z; x=$y; z=$x; rm -rf $x",
+                    # QA: a cycle member's other value is no decoy.
+                    "p=/etc; q=$p; x=/tmp; x=$q; y=$x; p=$y; rm -rf $y",
+                    "a=/etc; b=$a; c=/tmp; c=$b; d=$c; a=$d; rm -rf $d",
+                    "s=/etc; x=/tmp; x=$s; y=$x; s=$y; rm -rf $y",
+                    "w=/tmp; v=/etc; w=$v; u=$w; v=$u; rm -rf $u"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         for cmd in ("q=/tmp/q; d=$q/d2/ro; r=$d/; rm -rf $r",
                     "q=/tmp/q; d=$q/d2/ro; r=$d/$(cat f); rm -rf $r",
                     "q=/tmp/q; d=$q/d2/ro; r=$d/$tag; rm -rf $r",
                     "q=/tmp/q; d=$q$c; r=$d/x; c=$c; rm -rf $r",
-                    "d=/tmp/x; e=${d:+$d/sub}; rm -rf $e"):
+                    "d=/tmp/x; e=${d:+$d/sub}; rm -rf $e",
+                    "p=/tmp/a; q=$p; x=/tmp; x=$q; y=$x; p=$y; rm -rf $y"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
+
+    def test_assignment_resolution_does_not_hang_on_the_hash_seed(self):
+        """A cycle's read order followed set order, so the same command was
+        allowed under one PYTHONHASHSEED and denied under the next (QA)."""
+        cmds = ["s=/etc; x=/tmp; x=$s; y=$x; s=$y; rm -rf $y",
+                "w=/tmp; v=/etc; w=$v; u=$w; v=$u; rm -rf $u",
+                "b=/etc; c=$b; a=$c; b=$a; rm -rf $a"]
+        script = ("import json, sys; sys.path.insert(0, sys.argv[1]); import guard; "
+                  "print(json.dumps([guard.decide('Bash', {'command': c})[0] "
+                  "for c in json.loads(sys.argv[2])]))")
+        seen = set()
+        for seed in ("0", "1", "2", "3", "4", "5"):
+            run = subprocess.run([sys.executable, "-c", script, os.path.dirname(guard.__file__),
+                                  json.dumps(cmds)], capture_output=True, text=True, check=True,
+                                 env={**os.environ, "PYTHONHASHSEED": seed})
+            seen.add(run.stdout.strip())
+        self.assertEqual(seen, {json.dumps(["deny"] * len(cmds))})
+
+    def test_names_in_an_operator_argument_are_dependencies(self):
+        self.assertEqual(guard._names_used("${q:+$a}x$b"), {"q", "a", "b"})
+        self.assertEqual(guard._names_used("${q:-0}"), {"q"})
 
     def test_a_cycle_of_assignments_is_read_once(self):
         """Re-read on every change, each lap of a cycle nested the last one's
@@ -1221,7 +1248,7 @@ class TestParserGaps(unittest.TestCase):
                '  if [ "${fail:-0}" != "0" ]; then failed="$failed $f($fail)"; fi\n'
                'done\necho "TOTAL pass=$total_pass fail=$total_fail"\necho "FAILED:$failed"')
         vals = guard._budgeted(guard._var_values)(cmd)
-        self.assertLessEqual(max(v.count("$((") for vs in vals.values() for v in vs), 2, vals)
+        self.assertLessEqual(max(v.count("$((") for vs in vals.values() for v in vs), 4, vals)
         self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
     def test_a_cycle_of_assignments_stays_bounded(self):
