@@ -1468,6 +1468,7 @@ class TestScriptChannels(unittest.TestCase):
                     "echo /etc | xargs --replace=@ sh -c 'rm -rf @'",
                     "echo /etc | xargs sh -c 'rm -rf \"$@\"' _",
                     "sh -c 'rm -rf \"$1\"' _ /etc",
+                    "sh -c 'rm -rf \"$0\"' /etc",
                     "bash -lc 'rm -rf $2' a b /"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
@@ -1481,6 +1482,223 @@ class TestScriptChannels(unittest.TestCase):
                     "echo /etc | xargs -I{} cp {} {}.bak"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+
+    def test_a_function_call_and_set_bind_the_positionals(self):
+        """XERK-1626: a function's `$1`… are its call's words, a `set --` sets
+        the line's; each ran its payload as nobody, reaching rm as `/etc`."""
+        for cmd in ("f() { rm -rf \"$1\"; }; f /etc",
+                    "bash -c 'f() { rm -rf \"$1\"; }; f \"$2\"' _ x /etc",
+                    "set -- /etc; rm -rf \"$1\"",
+                    "set -eu -- /etc; rm -rf \"$1\"",
+                    "set -- /etc; a=(\"$@\"); rm -rf \"${a[0]}\"",
+                    "a=(x /etc); rm -rf \"${a[1]}\"",
+                    "sh -c 'a=(\"$@\"); rm -rf \"${a[1]}\"' _ x /etc",
+                    "sh -c 'rm -rf \"${1:-}\"' _ /etc",
+                    "sh -c 'for p; do rm -rf \"$p\"; done' _ /etc",
+                    "sh -c 'shift; rm -rf \"$1\"' _ x /etc",
+                    "f() { shift; rm -rf \"$1\"; }; f x /etc",
+                    "f() { for p; do rm -rf \"$p\"; done; }; f /etc",
+                    "f() { g \"$@\"; }; g() { rm -rf \"$1\"; }; f /etc",
+                    "function f { local d=$1; rm -rf \"$d\"; }; f /etc",
+                    "f() ( rm -rf \"$1\" ); f /etc",
+                    "f() { rm -rf \"$1\"; }; x=$(f /etc)",
+                    "f() { rm -rf $1; }; f $(echo /etc); true",
+                    "f() { g \"$1\"; }; g() { f \"$1\"; rm -rf \"$1\"; }; f /etc",
+                    "set /etc; f() { rm -rf \"$1\"; }; f \"$1\"",
+                    "f() { \"$1\" -rf \"$2\"; }; f rm /etc",
+                    "for i in 1 2; do rm -rf \"$1\"; set -- /etc; done",
+                    "for i in 1 2; do rm -rf \"$1\"; set -- \"$@\" /etc; done",
+                    "for i in 1 2; do set -- \"$@\" /etc; rm -rf \"$1\"; done",
+                    "r() { tag=$1; shift; \"$@\"; }; r t rm -rf /etc",
+                    # Padding past the per-call readings still reaches the call.
+                    "f() { rm -rf \"$1\"; }; " + "; ".join(f"f ./b{i}" for i in range(300))
+                    + "; f /etc",
+                    "; ".join(f"set -- a{i}; echo \"$1\"" for i in range(200))
+                    + "; set -- /etc; rm -rf \"$1\""):
+            with self.subTest(cmd=cmd[:80]):
+                self.assertDenied(cmd)
+        for cmd in ("f() { echo \"$1\"; }; f /etc",
+                    "f() { rm -rf \"$1\"; }; f /tmp/build",
+                    "set -o pipefail; rm -rf \"$1\"",
+                    "set -- a b; echo \"$1 $2\"",
+                    # A `set` in a loop re-bound itself per level ("too deep", replayed).
+                    "for v in \"B . 1\" \"P p 2\"; do set -- $v; R=/r; [ $2 != . ] && R=$PWD/$2; "
+                    "TAG=$1 REPO=$R PORT=$3 node t.js; done",
+                    "for c in a b; do set -- \"$@\" \"x/${c}\"; done; echo \"$# $*\"",
+                    # A quoted `|` is no end of the call's words (a replayed false deny).
+                    "run() { sh -c \"chown -R abc /tmp/x; su abc -s /bin/sh -c '/p \\\"$1\\\"'\"; }; "
+                    "run \"A B|C D\"",
+                    "f() { if [ \"$1\" -gt 0 ]; then f $(( $1 - 1 )); fi; }; f 10"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_qa_positional_shapes(self):
+        """XERK-1626 QA: renumbered `set` words, computed/recursive shifts,
+        a multi-word `for` list, redirected/quoted/escaped calls, calls in case
+        arms, backticks and after `eval`/`coproc`, a `}` word in a body, and
+        `${1:-"x"}`. Each ran as nobody and reached rm as `/etc`."""
+        for cmd in (
+            "set -- a; set -- \"$@\" /etc; rm -rf \"$2\"",
+            "set -- \"$1\" /etc; rm -rf \"$2\"",
+            "set -- \"${1:-a}\" /etc; rm -rf \"$2\"",
+            "set -- \"$0\" /etc; rm -rf \"$2\"",
+            "for i in 1 2 3; do set -- \"$@\" \"/etc\"; done; rm -rf \"$2\"",
+            "for i in 1 2; do rm -rf \"$1\"; set -- \"$@\" /etc; done",
+            "for i in 1 2; do set -- \"$@\" /etc; rm -rf \"$1\"; done",
+            "set -- a b /etc; shift $((2)); rm -rf \"$1\"",
+            "set -- a b /etc; n=2; shift $n; rm -rf \"$1\"",
+            "set -- a b /etc; shift \"2\"; rm -rf \"$1\"",
+            "set -- a b /etc; shift '2'; rm -rf \"$1\"",
+            "set -- a b /etc; shift \\2; rm -rf \"$1\"",
+            "set -- a b /etc; shift $(echo 2); rm -rf \"$1\"",
+            "set -- a b /etc; shift -- 2; rm -rf \"$1\"",
+            "set -- a b /etc; s=shift; $s; $s; rm -rf \"$1\"",
+            "f() { shift $((2)); rm -rf \"$1\"; }; f a b /etc",
+            "bash -c 'n=2; shift $n; rm -rf \"$1\"' _ a b /etc",
+            "f() { rm -rf \"$1\"; shift; [ $# -gt 0 ] && f \"$@\"; }; f a b /etc",
+            "f() { if [ $# -gt 1 ]; then shift; f \"$@\"; else rm -rf \"$1\"; fi; }; f a b /etc",
+            "bash -c 'rm -rf \"$@\"' _ a /etc",
+            "set -- a b c /etc; while [ $# -gt 1 ]; do shift; done; rm -rf \"$1\"",
+            "f() { shift 2; rm -rf \"$1\"; }; f a b /etc",
+            "for p in a /etc; do rm -rf \"$p\"; done",
+            "f() { for p; do rm -rf \"$p\"; done; }; f a /etc",
+            "bash -c 'for p; do rm -rf \"$p\"; done' _ a /etc",
+            "set -- a /etc; for p; do rm -rf \"$p\"; done",
+            "for p in a /etc; do (rm -rf \"$p\"); done",
+            "for p in a /etc; do x=$(rm -rf \"$p\"); done",
+            "for p in a /etc; do { rm -rf \"$p\"; }; done",
+            "for p in a /etc; do bash -c \"rm -rf $p\"; done",
+            "f() { for p do rm -rf \"$p\"; done; }; f a /etc",
+            "f() { rm -rf \"$1\"; }; f 2>/dev/null /etc",
+            "f() { rm -rf \"$1\"; }; f >/dev/null /etc",
+            "f() { rm -rf \"$1\"; }; f </dev/null /etc",
+            "f() { rm -rf \"$1\"; }; f</dev/null /etc",
+            "f() { rm -rf \"$1\"; }; f 2>&1 /etc",
+            "f() { rm -rf \"$1\"; }; f > out.txt /etc",
+            "f() { rm -rf \"$1\"; }; 'f' /etc",
+            "f() { rm -rf \"$1\"; }; \"f\" /etc",
+            "f() { rm -rf \"$1\"; }; \\f /etc",
+            "f() { rm -rf \"$1\"; }; eval f /etc",
+            "f() { rm -rf \"$1\"; }; case x in x) f /etc;; esac",
+            "f() { rm -rf \"$1\"; }; case x in (x) f /etc;; esac",
+            "f() { rm -rf \"$1\"; }; x=`f /etc`",
+            "f() { rm -rf \"$1\"; }; coproc f /etc; wait",
+            "f() { echo }; rm -rf \"$1\"; }; f /etc",
+            "f() { echo {; rm -rf \"$1\"; }; f /etc",
+            "f() { case $1 in *}) :;; esac; rm -rf \"$1\"; }; f /etc",
+            "builtin set -- /etc; rm -rf \"$1\"",
+            "command set -- /etc; rm -rf \"$1\"",
+            "eval set -- /etc; rm -rf \"$1\"",
+            "f() { { rm -rf \"$1\"; }; }; f /etc",
+            "f() { rm -rf \"${1:-$x}\"; }; f /etc",
+            "f() { rm -rf \"${1:-\"x\"}\"; }; f /etc",
+            "f() { rm -rf \"${1:-'x'}\"; }; f /etc",
+            "f() { rm -rf \"${1:-${HOME}}\"; }; f /etc",
+            "f() { rm -rf \"$1\"; }; f \"$@\" /etc",
+            "f() { rm -rf \"$2\"; }; f <(echo a) /etc",
+            "f() { [ -n \"$2\" ] && f \"$2\"; rm -rf \"$1\"; }; f a /etc",
+            "f() { rm -rf \"$1\" # c\\\n}; f /etc",
+            "f() { rm -rf \"$1\"; # c\\\\\\\n}; f /etc",
+            "f() { if true; then rm -rf \"$1\"; fi # \\\n}; f /etc",
+            "echo {set -- /etc; rm -rf \"$1\"}; eval 'set -- /etc; rm -rf \"$1\"'",
+            "echo ${x+(set -- /etc; rm -rf \"$1\")}; eval 'set -- /etc; rm -rf \"$1\"'",
+            "echo ${x+{set -- /etc; rm -rf \"$1\"}}; eval 'set -- /etc; rm -rf \"$1\"'",
+            "true set -- /etc; rm -rf \"$1\"; eval 'set -- /etc; rm -rf \"$1\"'",
+            "echo set -- /etc; rm -rf \"$1\"; eval 'set -- /etc; rm -rf \"$1\"'",
+            "f() { echo \\; fi }; rm -rf \"$1\"; }; f /etc",
+            "f() { echo \\& done }; rm -rf \"$1\"; }; f /etc",
+            "f() { echo x >& fi }; rm -rf \"$1\"; }; f /etc",
+            "f() { echo \\; }; rm -rf \"$1\"; }; f /etc",
+            "f() { echo x >& }; rm -rf \"$1\"; }; f /etc",
+            "f() { echo a\\\n fi }; rm -rf \"$1\"; }; f /etc",
+            "for i in 1 2 3; do set -- x \"$@\"; done; set -- \"$@\" /etc; rm -rf \"$4\"",
+            "for i in 1 2 3 4; do set -- \"$@\" /etc; done; rm -rf \"$4\"",
+            "set -- a; set -- \"$@\" b; set -- \"$@\" /etc; rm -rf \"$3\"",
+            "set -- a; set -- \"$1\" b; set -- \"$1\" \"$2\" /etc; rm -rf \"$3\"",
+            "set -- a b; set -- \"$@\" \"$@\" /etc; rm -rf \"$5\"",
+            "set -- \"\" /etc; set -- \"$@\"; rm -rf \"$2\"",
+            "set -- '' ''/etc; rm -rf \"$2\"",
+            "f() { if true; then rm -rf \"$1\"; fi }; f /etc",
+            "f() { (rm -rf \"$1\") }; f /etc",
+            "f() { { rm -rf \"$1\"; } }; f /etc",
+            "f() { case x in x) rm -rf \"$1\";; esac }; f /etc",
+            "f() { while true; do rm -rf \"$1\"; break; done }; f /etc",
+            "function f { if true; then rm -rf \"$1\"; fi }; f /etc",
+            "f() { for p; do rm -rf \"$p\"; done }; f a /etc",
+            "f() { echo done }; rm -rf \"$1\"; }; f /etc",
+            "f() { echo $(true) }; rm -rf \"$1\"; }; f /etc",
+            "f() { echo ${x} }; rm -rf \"$1\"; }; f /etc",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in (
+            "for p in a b; do echo \"$p\"; done",
+            "for d in build dist; do rm -rf \"./$d\"; done",
+            "f() { echo \"$1\"; }; f > /tmp/x /etc",
+            "f() { echo }; }; f /etc",
+            "f() { (echo hi) }; f /etc",
+            "for f in *.log; do rm -f \"$f\"; done",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_a_backslash_ending_comment_is_no_continuation(self):
+        """XERK-1626 QA: `# c\\` NL `# d` is two comments. Read as `a\\`-newline
+        `#`, the second `#` was a word: a function body stayed open, and its `'`
+        hid the commands after it — `rm -rf /etc` itself, on main too."""
+        for cmd in (
+            "f() { rm -rf \"$1\" # c\\\n# d\\\n}; f /etc",
+            "f() { rm -rf \"$1\" # c\\\n#d\\\n}; f /etc",
+            "f() { rm -rf \"$1\" # c\\\n # d\\\n}; f /etc",
+            "f() { rm -rf \"$1\"; #\\\n#\\\n}; f /etc",
+            "f() { rm -rf \"$1\" # c\\\n# d\n}; f /etc",
+            "f() { rm -rf \"$1\" # c\\\n# d\\\n# e\n}; f /etc",
+            "f() { rm -rf \"$1\" # c\\\n# d\\\n# e\\\n}; f /etc",
+            "f() { if :; then rm -rf \"$1\" # c\\\n# d\\\nfi }; f /etc",
+            "f() { rm -rf \"$1\" # c\n# d\\\n}; f /etc",
+            "f() { rm -rf \"$1\"\n# c\\\n# d\\\n}; f /etc",
+            "set -- /etc # c\\\n# d\\\nrm -rf \"$1\"",
+            "set -- /etc; f() { : # c\\\n# d\\\n}; rm -rf \"$1\"",
+            "f() # c\\\n{ rm -rf \"$1\"; }; f /etc",
+            "f() # c\n{ rm -rf \"$1\"; }; f /etc",
+            "f()\n{ rm -rf \"$1\"; }; f /etc",
+            "function f # c\n{ rm -rf \"$1\"; }; f /etc",
+            "f() { rm -rf \"$1\" # c\\\n}; f /etc",
+            ": # c\\\n# it's\nrm -rf /etc\n# '",
+            ": # c\\\n# it's\nrm -rf /etc",
+            "# c\\\n# don't\nrm -rf /etc\n: '",
+            ": # it's\nrm -rf /etc",
+            ": # c\\\n# $(\nrm -rf /etc\n# )",
+            ": # c\\\n# `\nrm -rf /etc\n# `",
+            "echo a\\\\ # it's\nrm -rf /etc",
+            "echo a\\\\\t# it's\nrm -rf /etc",
+            "echo \\\\ # it's\nrm -rf /etc",
+            "echo a\\\\\\\\ # it's\nrm -rf /etc",
+            ": \\\\ # don't\nrm -rf /etc",
+            "echo a\\\\ # c\"\nrm -rf /etc\n# \"",
+            "f() { rm -rf \"$1\"; : \\\\ # it's\n}; f /etc",
+            "echo a\\\\\n# it's\nrm -rf /etc",
+            ": # a\\\n# b\\\n# <<E\nrm -rf /etc\nE",
+            "cat <<E\n$( : # c\\\n# it's\nrm -rf /etc\n)\nE",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A real continuation joins: `a\<newline>#b` is one word.
+        for cmd in ["echo a\\\n#b", "echo a\\ #b"]:
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_positional_readings_stay_linear(self):
+        """XERK-1626: readings are bodies and spans, never the line per call —
+        a per-call re-expansion of the line is quadratic and timed the hook out."""
+        for cmd in ("log() { echo \"$1\"; }; " + "; ".join(f"log \"s {i}\"" for i in range(2000)),
+                    "; ".join(f"set -- a{i}; echo \"$1\"" for i in range(500)),
+                    "for x in 1; do " + "; ".join(f"set -- a{i}; echo \"$1\"" for i in range(500))
+                    + "; done"):
+            with self.subTest(cmd=cmd[:40]):
+                started = time.monotonic()
+                self.assertAllowed(cmd)
+                self.assertLess(time.monotonic() - started, 10)
 
     def test_a_shell_reading_its_script_from_stdin(self):
         R = self.R
