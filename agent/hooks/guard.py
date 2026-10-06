@@ -2218,7 +2218,7 @@ def _read_herestring(seg: str, whole: bool = False) -> list[tuple[str, str]]:
             names.append(tok)
         i += 1
     texts = [_dequote_value(word)]
-    if "${" in word:
+    if "${" in word and not _MAIN_PARSE[0]:
         texts.append(_dequote_value(_substitute_vars(word, {})))
     names = [n for n in names if _ASSIGN_NAME_RE.fullmatch(n)]
     arrays = [n for n in arrays if _ASSIGN_NAME_RE.fullmatch(n)]
