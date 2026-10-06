@@ -1704,6 +1704,7 @@ def _budgeted(fn):
                    "until": time.monotonic() + _MAX_DECIDE_SECONDS}
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
+        _CHAIN_DIFFERS[0] = False
         _VALUES_TAINT_N[0] = 0
         _VALUES_MOST[0] = 1
         _VALUES_ASSIGNED[0] = 1
@@ -1730,7 +1731,7 @@ def _memo(kind: str, key, fn, *args):
     splices it counted, which is what makes `_expand_both` take its raw pass."""
     memo = _budget[kind]
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
-           _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0])
+           _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -2088,21 +2089,16 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
 
     once = {k: [_var_sub(lambda m, k=k: resolve(m, k), v) for v in vs] for k, vs in vals.items()}
     # Resolved once, a chain read empty: `q=/etc; d=$q; r=$d` left `r` empty
-    # and `rm -rf $r` passed (XERK-1648). Each chain-resolved value that reads
-    # differently is ADDED after the name's values, never swapped in: swapped,
-    # a name's new values moved which value each per-value reading picks
-    # (`b=$b/; x=1; b=/e; x=${b}tc`), and a later assignment was read into an
-    # earlier use whose empty reading had been bash's (`c=$p/; p=1`).
+    # and `rm -rf $r` passed (XERK-1648). The chain-resolved values are a
+    # reading of their OWN (`_expand_both`), never mixed into these: appended,
+    # they moved which value each per-value pass picks, so main's pairing of
+    # two names' last values was lost (`a=$p; a=eval; b=x; b='rm …'; $a "$b"`);
+    # swapped in, a later assignment was read into an earlier use whose empty
+    # reading is bash's (`c=$p/; p=1`).
     chained = _chain_values(vals, applied, own)
-    for k, vs in once.items():
-        extra = [v for i, v in enumerate(chained[k]) if v != vs[i] and v not in vs]
-        if extra:
-            vs.extend(dict.fromkeys(extra))
-            if k not in _FOR_NAMES:
-                # A `for` list's words are data, read joined, and not
-                # counted: a list naming `$M` doubled past the pass cap.
-                _VALUES_MOST[0] = max(_VALUES_MOST[0], len(vs))
-    return once
+    if chained != once:
+        _CHAIN_DIFFERS[0] = True
+    return chained if _VALUES_CHAINED[0] else once
 
 
 def _chain_values(vals: dict[str, list[str]], applied: dict[str, list[str]],
@@ -2930,6 +2926,10 @@ _VALUES_DIFFER = [False]
 # and how many readings the values of this decision have (XERK-1625).
 _VALUES_TAINT = [-1]
 _VALUES_TAINT_N = [0]
+# Set while `_expand_both` reads assigned values resolved through their whole
+# chain; and whether any name of this decision reads differently so (XERK-1648).
+_VALUES_CHAINED = [False]
+_CHAIN_DIFFERS = [False]
 # Set while `_expand_both` reads each of a name's values on its own: which one.
 # And the most values this decision saw one name assigned (XERK-1621).
 _VALUE_PICK: list[int | None] = [None]
@@ -4840,7 +4840,10 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     and control flow, and joined they run only the first (XERK-1621).
 
     A `'` in a string's `${…}` splits the line differently in bash than in
-    zsh or dash (`_quote_states`), so a line holding one is read both ways."""
+    zsh or dash (`_quote_states`), so a line holding one is read both ways.
+
+    And with every assigned value resolved through its whole chain, when
+    that differs from resolving it once (XERK-1648)."""
     out = _expand_picks(command)
     if _BRACE_OTHER_SEEN[0]:
         _BRACE_OTHER_SHELL[0] = True
@@ -4854,6 +4857,14 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
             out = out + _expand_values(command)
         finally:
             _MAIN_PARSE[0] = False
+    if _CHAIN_DIFFERS[0]:
+        # Every value resolved through its whole chain, per value too
+        # (`_assigned_values`): an added reading, as the others are.
+        _VALUES_CHAINED[0] = True
+        try:
+            out = out + _expand_picks(command)
+        finally:
+            _VALUES_CHAINED[0] = False
     return out
 
 

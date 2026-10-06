@@ -1171,12 +1171,17 @@ class TestParserGaps(unittest.TestCase):
 
     def test_a_chain_of_assignments_resolves_every_link(self):
         """XERK-1648: a value naming a name whose own value names another was
-        read empty, so `r=$d` hid `/etc`. The chain's value is ADDED beside
-        the empty reading, which stays: it is bash's when the chain is
-        assigned after the use (`c=$p/; p=1`), so `r=$d/` still reads `/`
-        too (order is XERK-1660)."""
-        self.assertEqual(guard._var_values("q=/tmp/q; d=$q/d2/ro; r=$d/$tag")["r"],
-                         ["/$tag", "/tmp/q/d2/ro/$tag"])
+        read empty, so `r=$d` hid `/etc`. The chain's values are a reading of
+        their own beside the resolve-once one, which stays: it is bash's when
+        the chain is assigned after the use (`c=$p/; p=1`), so `r=$d/` still
+        reads `/` too (order is XERK-1660)."""
+        cmd = "q=/tmp/q; d=$q/d2/ro; r=$d/$tag"
+        self.assertEqual(guard._var_values(cmd)["r"], ["/$tag"])
+        guard._VALUES_CHAINED[0] = True
+        try:
+            self.assertEqual(guard._var_values(cmd)["r"], ["/tmp/q/d2/ro/$tag"])
+        finally:
+            guard._VALUES_CHAINED[0] = False
         for cmd in ("q=/etc; d=$q; r=$d; rm -rf $r",
                     "q=/etc; d=$q; r=$d; s=$r; t=$s; rm -rf $t",
                     'y=${x:-"rm -rf /etc"}; z=$y; w=$z; $w',
@@ -1200,12 +1205,18 @@ class TestParserGaps(unittest.TestCase):
                     # values moved the per-value picks, and a later assignment
                     # was read into an earlier use.
                     'b=$b/; x=1; b=/e; x=${b}tc; rm -rf "$x"',
-                    'c=$p/; x=${c:-$d}; p=${d:+$d}; d=1; rm -rf "$c"'):
+                    'c=$p/; x=${c:-$d}; p=${d:+$d}; d=1; rm -rf "$c"',
+                    # QA: appended, a chained value moved main's pairing of
+                    # two names' last values.
+                    "p=$q; q=true; a=:; a=$p; a=eval; b=x; b=x; b=x; b='rm -rf /etc'; $a \"$b\""):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         for cmd in ("q=/tmp/q; d=$q/d2/ro; r=$d/x; rm -rf $r",
                     "q=/tmp/q; d=$q$c; r=$d/x; c=$c; rm -rf $r",
-                    "d=/tmp/x; e=${d:+$d/sub}; rm -rf $e"):
+                    "d=/tmp/x; e=${d:+$d/sub}; rm -rf $e",
+                    # QA: a chained value per reassignment doubled past the
+                    # pass cap ("too large").
+                    "R=/tmp/w; D=$R/build; " + "f=$D/part0.log; echo x > $f; " * 14 + "ls $D"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 

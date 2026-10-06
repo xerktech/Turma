@@ -282,15 +282,18 @@ paths:
   `_chain_values`): names resolved in dependency order (`_dependency_order`, Tarjan SCCs, edges
   sorted), each value read ONCE against what is known before its group, then stored resolved —
   never re-inlined per recursion level (that grew the text to "too deep").
-  - Main's resolve-once reading (against values naming none; an unresolved name empty) stays
-    FIRST; a chained value that differs is APPENDED and counted in `_VALUES_MOST`. Swapped in,
-    a QA oracle (bash's real value of each target, 6k random graphs) found bypasses main denied:
-    new values moved which value each per-value reading picks (`b=$b/; x=1; b=/e; x=${b}tc`),
-    and a later assignment was read into an earlier use (`c=$p/; … p=1`), whose empty reading
-    is bash's. Added: 0 such regressions, 26 dangerous commands main allowed now denied.
+  - The chained values are a READING of their own (`_VALUES_CHAINED`, keyed in `_memo`): when any
+    name reads differently (`_CHAIN_DIFFERS`), `_expand_both` re-runs `_expand_picks` with every
+    value chain-resolved. Main's resolve-once values (against values naming none; an unresolved
+    name empty) stay the values of every other pass. Both lists have one value per assignment,
+    so pass counts and caps are unchanged.
+    - Swapped in, a QA oracle (bash's real value of each target) found a later assignment read
+      into an earlier use (`c=$p/; … p=1`), whose empty reading is bash's.
+    - Appended to the values, they moved which value each per-value pass picks, losing main's
+      pairing of two names' last values (`a=$p; a=eval; …; b='rm …'; $a "$b"`, a QA bypass), and
+      doubled reassigned names past `_MAX_VALUE_PASSES` ("too large").
   - Cost: the empty reading stays, so `q=/tmp/q; d=$q; r=$d/; rm -rf $r` still reads `/` and
-    is denied — telling it from `r=$d/; d=…` needs ORDER (XERK-1660). A `for` name's extras never
-    raise `_VALUES_MOST` (list words are data; a list naming `$M` doubled past the pass cap).
+    is denied — telling it from `r=$d/; d=…` needs ORDER (XERK-1660).
   - Resolving once alone read `q=/etc; d=$q; r=$d` as `r` empty, and a link naming a cycle
     (`d=$q$c; c=$c`) and a name with a plain and a chained value (`q=/tmp; q=$e; d=$q`) the same.
   - Inside a cycle (an SCC, or a name using itself) a member reads another's unlinked values only
