@@ -1245,14 +1245,29 @@ class TestProducedScripts(unittest.TestCase):
                     f"mapfile -t a < <(echo {R}); ${{a[0]}}",
                     # A later line of the text is its own read.
                     f"printf 'x\\n{R}\\n' | while read -r a; do $a; done",
-                    f"printf 'x\\n{R}\\n' | {{ mapfile -t a; ${{a[1]}}; }}"):
+                    f"printf 'x\\n{R}\\n' | {{ mapfile -t a; ${{a[1]}}; }}",
+                    # QA: its own `< <(…)`'s words are no names; a subshell or
+                    # passthrough producer; a function fed; quoted spellings.
+                    f"read a < <(echo {R}); $a", f"read a b < <(echo x {R}); $b",
+                    f'read a <<<"$(echo x)" < <(echo {R}); $a',
+                    f"(echo x; echo {R}) | while read a; do $a; done",
+                    f"echo {R} | cat | while read a; do $a; done",
+                    f'f(){{ read a; $a; }}; f <<< "$(echo {R})"',
+                    f'r\'\'ead a <<< "$(echo {R})"; $a',
+                    f"echo {R} | {{ read -p '<<<' a; $a; }}",
+                    f"echo {R} | {{ read -ar arr; ${{r[@]}}; }}",
+                    f'while :; do select v in a; do $REPLY; done; done <<< "$(echo {R})"'):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ('git ls-files | while read -r f; do echo "$f"; done',
                     'while read -r l; do echo "$l"; done <<< "hello world"',
                     'mapfile -t files < <(ls); echo "${files[@]}"',
                     f"echo '{R}' | while read -r l; do echo \"$l\"; done",
-                    'echo ls | while read -r c; do $c; done'):
+                    'echo ls | while read -r c; do $c; done',
+                    # Feeds are paired with their readers: N loops stay cheap.
+                    "; ".join(f"echo w{i} | while read a{i}; do echo $a{i}; done"
+                              for i in range(60)),
+                    'echo "$HOME"; ls | while read f; do rm -rf "./$f"; done'):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

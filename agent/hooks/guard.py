@@ -2021,7 +2021,9 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
             bound = _printf_v(_strip_prefixes(_tokenize(seg)))
             if bound:
                 vals.setdefault(bound[0], []).append(bound[1])
-    if "read" in command or "select" in command or "mapfile" in command:
+    bare = command.replace("'", "").replace('"', "").replace("\\", "")
+    if "read" in bare or "select" in bare or "mapfile" in bare:
+        # Gated on the text with quotes cut: `r''ead a` is `read a`.
         for name, value in _reader_values(command):
             vals.setdefault(name, []).append(value)
     # How many values one name is ASSIGNED, so `_expand_both` reads each on
@@ -2254,7 +2256,7 @@ _HERESTRING_RE = re.compile(r"<<<[ \t]*")
 
 
 # `select v in …` reads the chosen line into REPLY; `v` is its list's.
-_SELECT_RE = re.compile(r"[\s!{(]*select\s")
+_SELECT_RE = re.compile(r"[\s!{(]*(?:(?:do|then|else|elif|if|while|until)\s+)*select\s")
 # `mapfile`/`readarray`'s options that take a value; `-t` is a flag there.
 _MAPFILE_OPTS_WITH_VALUE = set("dnOsuCc")
 
@@ -2262,6 +2264,10 @@ _MAPFILE_OPTS_WITH_VALUE = set("dnOsuCc")
 def _herestring(seg: str) -> tuple[str, str] | None:
     """The `<<< WORD` in ``seg``: its word, and ``seg`` with the word cut out."""
     m = _HERESTRING_RE.search(seg)
+    if m and ("'" in seg or '"' in seg or "\\" in seg):
+        # Only an unquoted one: `read -p '<<<' a` has none of its own.
+        states = _quote_states(seg)
+        m = next((h for h in _HERESTRING_RE.finditer(seg) if not states[h.start()]), None)
     if not m:
         return None
     end = _word_end(seg, m.end())
@@ -2294,11 +2300,16 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
             i += 2 if tok in ("<", ">", ">>", "<<") else 1
             continue
         if tok.startswith("-") and len(tok) > 1 and tok != "--":
-            if tok[-1] in opts and i + 1 < len(tokens):
-                if prog == "read" and tok[-1] == "a":
-                    # Its name, maybe glued to the redirection (`-a arr<<<"…"`).
-                    arrays.append(re.match(r"[^<>&]*", tokens[i + 1]).group(0))
+            # A cluster's first option taking a value takes the rest of it, or
+            # the next word: `-ra arr`, but `-ar arr` fills the array `r`.
+            at = next((c for c, ch in enumerate(tok[1:], 1) if ch in opts), 0)
+            value = tok[at + 1:] if at else ""
+            if at and not value and i + 1 < len(tokens):
                 i += 1
+                value = tokens[i]
+            if prog == "read" and at and tok[at] == "a":
+                # Its name, maybe glued to the redirection (`-a arr<<<"…"`).
+                arrays.append(re.match(r"[^<>&]*", value).group(0))
         elif re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", tok):
             names.append(tok)
         i += 1
@@ -2312,56 +2323,146 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
     return names, arrays
 
 
-def _line_feeds(segs: list[str]) -> list[str]:
-    """What a reader on this line may get as its stdin from ELSEWHERE on it:
-    any here-string word (on a `{ …; }`, loop or `if` it reads), a `< <(…)`,
-    or a piped `echo`/`printf`'s output (XERK-1650). Not paired with the
-    reader it feeds: a destructive text fed to SOME reader is enough."""
-    feeds = []
+_GROUP_OPENERS = {"while", "until", "if", "for", "select", "case"}
+_GROUP_CLOSERS = {"done", "fi", "esac"}
+_FUNC_HEADER_RE = re.compile(r"^(?:function\s+)?[A-Za-z_][\w-]*\s*\(\)\s*")
+
+
+def _seg_groups(segs: list[str]) -> list[tuple[int, int]]:
+    """The `(opener, closer)` segment indexes of each `{ … }`, `( … )` and
+    loop/`if`/`case` on a split line, so a reader is fed only through its own
+    groups (XERK-1650). Approximate on purpose: an unclosed group runs to the
+    end, and a stray closer closes nothing."""
+    stack: list[int] = []
+    groups: list[tuple[int, int]] = []
+    for k, seg in enumerate(segs):
+        t = seg.strip()
+        while True:
+            t = re.sub(r"^(?:!|do|then|else|elif)\s+", "", t)
+            t = _FUNC_HEADER_RE.sub("", t)
+            if t[:1] in ("{", "("):
+                stack.append(k)
+                t = t[1:].lstrip()
+                continue
+            if t.split(" ", 1)[0] in _GROUP_OPENERS:
+                stack.append(k)
+            break
+        in_case = any(segs[o].lstrip(" !({").startswith("case") for o in stack)
+        closes = 0
+        while t[:1] in ("}", ")") or t.split(" ", 1)[0] in _GROUP_CLOSERS:
+            closes += 1
+            t = t[1:].lstrip() if t[:1] in ("}", ")") else t.split(" ", 1)[-1] \
+                if " " in t else ""
+        if not in_case:
+            closes += max(0, t.count(")") - t.count("("))
+        for _ in range(closes):
+            if stack:
+                groups.append((stack.pop(), k))
+    groups.extend((o, len(segs) - 1) for o in stack)
+    return groups
+
+
+def _reader_feeds(command: str, segs: list[str], readers: dict[int, object]) -> dict[int, list[str]]:
+    """What each reader (by segment index) may get as its stdin from elsewhere
+    on the line (XERK-1650): a here-string or `< <(…)` on a
+    group it is in (`{ read a; } <<< …`, `while read …; done < <(…)`), or a
+    PIPED `echo`/`printf` (or a group of them) into it or one of its groups.
+    A feed on any other command — `cat <<< … |`, `f <<< …` calling a reader
+    function, `exec < <(…)`, an echo piped into `cat` — is unaccounted for,
+    so it feeds EVERY reader. Paired, not every feed to every reader: a line
+    of N `echo … | while read` loops read each name N ways (N² readings)."""
+    own: list[list[str]] = []
+    echo: list[str | None] = []
+    piped: list[bool] = []
+    pos = 0
     for seg in segs:
+        feeds = []
         here = _herestring(seg)
         if here:
             feeds.append(here[0])
         if "<(" in seg:
             feeds.extend("$" + m.group(0)[1:] for m in _find_substs(seg)
                          if m.group(0).startswith("<("))
-        tokens = _strip_prefixes(_tokenize(seg))
-        if tokens and tokens[0] in _ECHO_PROGS and tokens[0] in seg:
-            feeds.append("$(" + seg[seg.index(tokens[0]):] + ")")
-    return feeds
+        own.append(feeds)
+        at = command.find(seg, pos)
+        if at >= 0:
+            pos = at + len(seg)
+        # A segment the split rewrote can't be placed, so it counts as piped.
+        piped.append(at < 0 or bool(re.match(r"[\s)]*\|(?!\|)", command[pos:])))
+        tokens = _strip_prefixes(_tokenize(seg.lstrip("({ \t")))
+        echo.append("$(" + seg[seg.index(tokens[0]):].rstrip(") \t") + ")"
+                    if tokens and tokens[0] in _ECHO_PROGS and tokens[0] in seg else None)
+    groups = _seg_groups(segs)
+    closers = {c for _, c in groups}
+    openers = {o for o, _ in groups}
+    orphans: list[str] = []
+    for k in range(len(segs)):
+        if k not in readers and k not in closers:
+            orphans.extend(own[k])
+        if echo[k] and piped[k] and k + 1 < len(segs) \
+                and k + 1 not in readers and k + 1 not in openers:
+            orphans.append(echo[k])
+
+    def into(o: int) -> list[str]:
+        """What is piped into segment ``o``: an echo, or a group's echoes."""
+        if o == 0 or not piped[o - 1]:
+            return []
+        lo = min([g for g, c in groups if c == o - 1], default=o - 1)
+        return [e for e in echo[lo:o] if e]
+
+    out = {}
+    for k in readers:
+        feeds = own[k] + into(k)
+        for o, c in groups:
+            if o <= k <= c:
+                feeds += own[c] + into(o)
+        out[k] = list(dict.fromkeys(feeds + orphans))
+    return out
 
 
 def _reader_values(command: str) -> list[tuple[str, str]]:
     """The `(name, value)`s the line's readers bind: `read [opts] NAME… <<<
     WORD` (XERK-1622), and a `read`, `mapfile`/`readarray` or `select` fed
-    by a group's or loop's here-string, a `< <(…)` or a pipe (XERK-1650).
-    Split as bash does under the default IFS — each name a word, the last
-    the remainder — or, when the line sets IFS or for an array, every name
-    the whole text. Each line of a multi-line text is read on its own too,
-    as `while read` and `mapfile` take it. A WORD with a `${…}` default is
-    read with it applied too."""
+    by a group's or loop's here-string, a `< <(…)` or a pipe
+    (XERK-1650, `_reader_feeds`). Split as bash does under the default IFS —
+    each name a word, the last the remainder — or, when the line sets IFS or
+    for an array, every name the whole text. Each line of a multi-line text
+    is read on its own too, as `while read` and `mapfile` take it. A WORD
+    with a `${…}` default is read with it applied too."""
     segs = _split_segments(command)
     whole = "IFS" in command
-    feeds: list[str] | None = None
-    out: list[tuple[str, str]] = []
-    for seg in segs:
-        here = _herestring(seg)
+    readers: dict[int, tuple[list[str], list[str]]] = {}
+    for k, seg in enumerate(segs):
         if _SELECT_RE.match(seg):
             # `_strip_prefixes` drops `select v in` as a compound's head.
-            got = (["REPLY"], [])
-        else:
-            got = _reader_names(_strip_prefixes(_tokenize(here[1] if here else seg)))
-        if not got:
+            readers[k] = (["REPLY"], [])
             continue
-        if here:
-            words = [here[0]]
-        else:
-            if feeds is None:
-                feeds = _line_feeds(segs)
-            words = feeds
+        here = _herestring(seg)
+        text = here[1] if here else seg
+        if "<(" in text:
+            # Its words are no names: `read a < <(echo rm …)` bound `rm`.
+            for m in reversed(_find_substs(text)):
+                text = text[:m.start()] + "/dev/fd/63" + text[m.end():]
+        # A function's body opens on its header: `f(){ read a`.
+        text = _FUNC_HEADER_RE.sub("", text.lstrip())
+        got = _reader_names(_strip_prefixes(_tokenize(text)))
+        if got:
+            readers[k] = got
+    if not readers:
+        return []
+    feeds = _reader_feeds(command, segs, readers)
+    out: list[tuple[str, str]] = []
+    for k, got in readers.items():
+        here = _herestring(segs[k])
+        # Its own here-string is what it reads (or a `< <(…)` after it, the
+        # last redirection winning); the rest is a group's stdin.
+        words = feeds[k]
+        if here and not _SELECT_RE.match(segs[k]):
+            words = [here[0]] + [f for f in feeds[k]
+                                 if f.startswith("$(") and "<(" + f[2:] in segs[k]]
         for word in words:
             out.extend(_bind_read(*got, word, whole))
-    return out
+    return list(dict.fromkeys(out))
 
 
 def _bind_read(names: list[str], arrays: list[str], word: str,
@@ -2373,16 +2474,21 @@ def _bind_read(names: list[str], arrays: list[str], word: str,
     for text in dict.fromkeys(texts):
         produced = _produced_text(text, multi=_VALUES_MULTI[0])
         lines = [ln for ln in produced.split("\n") if ln.strip()]
-        joined = produced.replace("\n", " ")
-        for text in dict.fromkeys([joined] + (lines if len(lines) > 1 else [])):
+        # Each line is its own read (`while read`, `mapfile`): one value with
+        # the lines kept, which a use splits into commands, not a value per
+        # line — N reads of an N-line text was N² readings (XERK-1650).
+        readings = [[" ".join(lines)]] + ([lines] if len(lines) > 1 else [])
+        for got in readings:
+            text = "\n".join(got)
             out.extend((n, text) for n in arrays)
             if whole or len(names) == 1:
                 out.extend((n, text) for n in names)
             elif names:
-                words = text.split()
-                out.extend((n, words[k] if k < len(words) else "")
+                split = [ln.split() for ln in got]
+                out.extend((n, "\n".join(w[k] if k < len(w) else "" for w in split))
                            for k, n in enumerate(names[:-1]))
-                out.append((names[-1], " ".join(words[len(names) - 1:])))
+                out.append((names[-1], "\n".join(" ".join(w[len(names) - 1:])
+                                                  for w in split)))
     return out
 
 

@@ -43,14 +43,19 @@ paths:
   the whole text when the line sets IFS, and `-a`'s array always does. A `${x:-…}` word is read
   with its default applied too, as an assignment's is.
   - A name can be glued to the `<<<` (`read a<<<"…"`): shlex keeps it in the redirection token.
-- **A reader with no here-string of its own takes ANY stdin feed on the line** (XERK-1650,
-  `_reader_values`): a here-string on a `{ …; }`, `( … )`, loop or `if`, a `< <(…)`, or a piped
-  `echo`/`printf`. `mapfile`/`readarray` bind an array (MAPFILE by default), `select` binds REPLY
-  and its list as `for` does. Each line of a multi-line text is its own value, as `while read` takes it.
-  - Feeds aren't paired with the reader they reach: over-binding only adds readings, and a split
-    of segments loses the pipe/group structure that pairing would need.
-  - Residual: a multi-word list joins its words, so `for v in a 'rm …'; do $v; done` runs program
-    `a` in the guard's reading (XERK-1647).
+- **A reader with no here-string of its own takes the stdin feeds that reach it** (XERK-1650,
+  `_reader_feeds`): a here-string or `< <(…)` on a group it is in, and an `echo`/`printf`
+  (or a group of them) piped into it or into one of its groups.
+  - A feed on any OTHER command (`cat <<< … |`, `f <<< …` calling a reader function,
+    `exec < <(…)`, an echo piped into `cat`) feeds EVERY reader: its path can't be traced.
+  - Paired, never every feed to every reader: N `echo … | while read` loops read each name N
+    ways, N² readings, and a benign script was refused as too large.
+  - A multi-line text is one more value with its lines kept (each line a read), never a value
+    per line: N reads of an N-line here-string was N² readings again.
+  - `mapfile`/`readarray` bind an array (MAPFILE by default); `select` binds REPLY, its list as
+    `for` does. A reader's own `<(…)` words are cut before its names are read.
+  - Residuals: IFS/`-d` delimiters, `bash -c 'read …'`, `mapfile -C`, coproc, files, `yes`, and `read a <<E` (values are read with
+    heredoc bodies already cut) (XERK-1658)..
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
