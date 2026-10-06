@@ -71,6 +71,34 @@ paths:
     re-reading returns `>&1` among `>&1`'s own parts, and looping hit the cap (a false deny).
 - **An `exec`'s here-string joins the line-wide `<(…)` texts**, and a line with any of them scans
   every pipeline: `exec 3< <(…); bash <&3` has no pipe. De-duped + capped once, else O(n²).
+- **More stdin-to-shell routes the walk now reaches** (XERK-1628), each still a producer→reader pair:
+  - A COMPOUND command (`if…fi`, `for/while/until/select…done`, `case…esac`) is kept whole in
+    `groups=True` splits (as `( )`/`{ }`), so a pipe to/from it is not cut at its inner `;`
+    (`echo … | if true; then bash; fi`, `if …; then echo …; fi | sh`). `_compound_opener` detects
+    the head at a command start; `_group_core` opens the body via `_compound_body`, a scanner that
+    drops the skeleton keywords and `case` patterns but keeps inner groups and PIPELINES whole
+    (a plain split cut the inner group, a group-aware one re-groups the whole compound). `time -p
+    { …; }` opens because `-p` is a `_CMD_KEYWORDS` keyword-arg.
+  - `_group_core` finds a group's closer by a quote/escape/`$(…)`-aware FORWARD scan (`_group_close`),
+    not a reverse search of the last few closers, so a closer quoted (`2>"/tmp/x )))))"`),
+    substituted (`2>"…$(echo \")\")…"`) or escaped (`2>/tmp/f\)`) in a trailing redirect target is
+    not mistaken for the group's. Substitutions in that target are blanked before `_only_redirects`.
+  - `_unwrap_group` strips only a bracket that WRAPS the whole segment (`(a) 2>f\)` and `(a)|(b)` are
+    left alone); the verifying scan runs ONLY when a redirect/escape char is present, so a 3000-deep
+    `(…)` nest stays O(n) per call, not O(n²) at every recursion level.
+  - `eval` reads stdin as a script (`_command_reads_stdin_as`): its joined words run inheriting
+    stdin (`… | eval bash`, `eval '{,bash}'`, `eval 'cat | {,bash}'`), and a `$(cat)` in them
+    (`_passes_input`) captures that stdin to BE the script (`bash -c 'eval "$(cat)"'`). The `-c`
+    script is re-read off the raw stage so its `$(cat)` survives the placeholder pass.
+  - `xargs … sh -c` with no script arg runs the piped text as the shell's `-c` script.
+  - An output process substitution `cmd > >(reader)` feeds the reader this stage's stdout
+    (`>(` joins `feeds_a_shell` and the single-stage-skip exemption).
+  - A bare call to a function the line defines runs its body in the walk (`_function_bodies`):
+    `f() { bash; }; echo … | f` and `f() { echo …; }; f | sh`.
+  - A named/variable fd reader is a stdin-script read (`_STDIN_SCRIPT_RE` matches `/dev/fd/$fd`),
+    and a heredoc an `exec` holds on an fd joins the fed texts (`exec 3<<EOF…EOF; bash <&3`).
+  - 0 decision changes over a 33.9k-command real-Bash replay; `_compound_body` must keep inner
+    pipelines whole (a nested `{…} | sh` regressed when it over-flattened).
 - **`cat`/`tac`/`tee`/`head`/`tail` of only `<(…)` operands prints their texts** (`_cat_printed`),
   as does `< <(…)` and bash's `$(< <(…))`; redirects, `-` and `/dev/null` are skipped, a real file
   operand stays opaque. Bounded by `_SUBST_DEPTH`.
@@ -230,7 +258,8 @@ paths:
   - A thread, not SIGALRM: the hook also runs on the Windows agent.
   - Residual: one C call holding the GIL (a backtracking regex) still blocks the watchdog.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
-  `test_stdin_routes_into_a_shell`, `test_stdin_route_shapes_classify_fast`,
+  `test_stdin_routes_into_a_shell`, `test_compound_eval_fd_and_output_subst_routes`,
+  `test_stdin_route_shapes_classify_fast`,
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
   `test_a_nested_or_conditional_body_runs_as_its_producers_text`,

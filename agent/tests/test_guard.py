@@ -2046,6 +2046,69 @@ class TestScriptChannels(unittest.TestCase):
         self.assertEqual(guard._split_on_operators("{ a; b; } | (c; d) && e <(f; g)", groups=True),
                          ["{ a; b; }", "(c; d)", "e <(f; g)"])
 
+    def test_compound_eval_fd_and_output_subst_routes(self):
+        # XERK-1628: more stdin-to-shell routes XERK-1614's fixes did not reach.
+        # Each ran its payload as nobody under guard_differential.py.
+        R = self.R
+        for cmd in (
+                # A compound command as reader or producer (its `;` no longer
+                # cuts the pipe), for every compound head.
+                f"echo {R} | if true; then bash; fi", f"if true; then echo {R}; fi | sh",
+                f"echo {R} | for i in 1; do bash; done", f"for i in 1; do echo {R}; done | sh",
+                f"echo {R} | while true; do bash; break; done",
+                f"while true; do echo {R}; break; done | sh",
+                f"echo {R} | until false; do bash; break; done",
+                f"until false; do echo {R}; break; done | sh",
+                f"echo {R} | case x in x) bash;; esac", f"case x in x) echo {R};; esac | sh",
+                f"time -p {{ echo {R}; }} | sh", f"case x in x) {{ true; echo {R}; }} | sh;; esac",
+                # A function the line defines, called bare in a pipeline.
+                f"f() {{ bash; }}; echo {R} | f", f"f() {{ echo {R}; }}; f | sh",
+                # `eval` of a shell, a brace-formed name, a pipeline, or a
+                # `$(cat)` that captures stdin as the script.
+                f"echo {R} | eval bash", f"echo {R} | eval '{{,bash}}'",
+                f"echo {R} | eval 'cat | {{,bash}}'", f"echo {R} | bash -c 'eval \"$(cat)\"'",
+                # `xargs … sh -c`, which runs the piped text as the `-c` script.
+                f"(true; echo {R}) | xargs -0 sh -c",
+                # An output process substitution whose body reads the stdout.
+                f"echo {R} > >(sh)", f"echo {R} > >(bash)",
+                # A named fd, and a heredoc held on an fd, read later.
+                f"exec {{fd}}<<<'{R}'; bash /dev/fd/$fd",
+                f"exec 3<<EOF\n{R}\nEOF\nbash <&3", f"exec {{fd}}<<EOF\n{R}\nEOF\nbash <&$fd",
+                # A group with a quoted/substituted/escaped closer in a trailing
+                # redirect target, and a redirect inside the substitution.
+                f'(true; echo {R}) 2>"/tmp/x )))))" | sh',
+                f"{{ true; echo {R}; }} 2>'/tmp/x }}}}}}}}}}' | sh",
+                f'(true; echo {R}) 2>"/tmp/x$(echo \")\")" | sh',
+                f"(true; echo {R}) 2>/tmp/f\\) | sh",
+                f'x=$( (true; echo {R}) 2>/tmp/f); echo "$x" | sh',
+                # Standard-syntax siblings of the classes above (XERK-1628 QA).
+                f"function f {{ bash; }}; echo {R} | f",
+                f"function f() {{ bash; }}; echo {R} | f", f"f() {{ bash; }}; echo {R} | f arg",
+                f"f() {{ g; }}; g() {{ bash; }}; echo {R} | f",
+                f"echo {R} | case x in (x) bash;; esac", f"case x in (x) echo {R};; esac | sh",
+                f"echo {R} | for ((n=0;n<1;n++)); do bash; done",
+                f"for ((n=0;n<1;n++)); do echo {R}; done | sh",
+                f"echo {R} | xargs -I@ sh -c '@'", f"echo {R} &> >(sh)",
+                f"echo {R} &>> >(sh)", f"echo {R} &>>>(sh)",
+                f"time if true; then echo {R}; fi | sh",
+                f"time -p if true; then echo {R}; fi | sh",
+                f"time for i in 1; do echo {R}; done | sh",
+                f"echo {R} | bash -c 'eval \"$(</dev/stdin)\"'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("if true; then echo hi; fi", "for f in *.txt; do cat \"$f\"; done",
+                    "echo hi | while read l; do echo $l; done",
+                    "case $x in a) echo a;; esac | sort", "f() { echo hi; }; f | sort",
+                    "eval echo hello", "echo x > >(cat)", "exec 3>/tmp/log; echo hi >&3",
+                    "find . -name '*.py' | xargs grep foo", "time -p { make; } | tee log",
+                    "(echo x) 2>/tmp/f | grep y", "cat <<EOF\nhi\nEOF",
+                    "function f { echo hi; }; f | sort", "case $x in (a) echo a;; esac | sort",
+                    "for ((i=0;i<3;i++)); do echo $i; done | sort", "echo hi &> /tmp/log",
+                    "echo hi | xargs -I@ echo @", "time if true; then echo hi; fi | sort",
+                    "echo hi &>> /tmp/log"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_stdin_route_shapes_classify_fast(self):
         # Every pipeline replays the line's exec/`<(…)` texts, and nested
         # `cat <(` resolves through `_body_printed` (XERK-1614).
