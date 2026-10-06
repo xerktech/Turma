@@ -1169,6 +1169,37 @@ class TestParserGaps(unittest.TestCase):
         self.assertAllowed(cmd)
         self.assertEqual(guard._var_values("d=/; d=$d/etc")["d"], ["/", "//etc"])
 
+    def test_a_chain_of_assignments_resolves_every_link(self):
+        """XERK-1648: a value naming a name whose own value names another was
+        read empty, so `r=$d` hid `/etc` and `r=$d/` read as `/`."""
+        self.assertEqual(guard._var_values("q=/tmp/q; d=$q/d2/ro; r=$d/$tag")["r"],
+                         ["/tmp/q/d2/ro/$tag"])
+        for cmd in ("q=/etc; d=$q; r=$d; rm -rf $r",
+                    "q=/etc; d=$q; r=$d; s=$r; t=$s; rm -rf $t",
+                    'y=${x:-"rm -rf /etc"}; z=$y; w=$z; $w'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        for cmd in ("q=/tmp/q; d=$q/d2/ro; r=$d/; rm -rf $r",
+                    "q=/tmp/q; d=$q/d2/ro; r=$d/$(cat f); rm -rf $r",
+                    "q=/tmp/q; d=$q/d2/ro; r=$d/$tag; rm -rf $r"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
+
+    def test_a_cycle_of_assignments_stays_bounded(self):
+        """A cycle never resolves; it reads empty, as an unset name. A chain
+        that doubles is charged to the budget, and one past the round cap is
+        refused rather than read empty."""
+        self.assertEqual(guard._var_values("a=$b; b=$a"), {"a": [""], "b": [""]})
+        self.assertEqual(guard.decide("Bash", {"command": "a=$b; b=$a; echo $a"})[0], "allow")
+        doubling = "a0=xxxxxxxx; " + "".join(f"a{i + 1}=$a{i}$a{i}; " for i in range(40))
+        long = "a0=/etc; " + "".join(f"a{i + 1}=$a{i}; " for i in range(guard._CHAIN_ROUNDS + 5))
+        for cmd in (doubling + "echo $a40", long + f"rm -rf $a{guard._CHAIN_ROUNDS + 5}"):
+            with self.subTest(cmd=cmd[:40]):
+                start = time.monotonic()
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+                self.assertLess(time.monotonic() - start, 5)
+        self.assertEqual(guard.decide("Bash", {"command": long[:600] + "ls"})[0], "allow")
+
 
 class TestProducedScripts(unittest.TestCase):
     """XERK-1549: a payload carried into execution by a variable a substitution

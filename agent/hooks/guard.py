@@ -1971,6 +1971,11 @@ def _var_values(command: str) -> dict[str, list[str]]:
     return _memo("vals", command, _assigned_values, _join_continuations(command))
 
 
+# Links of an assignment chain `_assigned_values` resolves (one per round);
+# a longer chain still resolving is refused as too large.
+_CHAIN_ROUNDS = 64
+
+
 def _assigned_values(command: str) -> dict[str, list[str]]:
     vals: dict[str, list[str]] = {}
     states = _quote_states(command) if "${" in command else []
@@ -2050,11 +2055,41 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
             vals.setdefault(m.group(1), []).extend(words)
             _FOR_NAMES.add(m.group(1))
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
-    # HERE, once, against the values that name none. Left in, every recursion
+    # HERE, once, against values that name none. Left in, every recursion
     # level re-inlined it, the text grew each time, and an ordinary command
-    # was refused as nested too deeply. An unresolvable one is empty, as bash
-    # reads an unset name.
+    # was refused as nested too deeply. A chain (`q=/etc; d=$q; r=$d`) is
+    # resolved a link per round, each value once its names have values: one
+    # round read `r` empty and `rm -rf $r` passed (XERK-1648). What never
+    # resolves (a cycle) is empty, as bash reads an unset name; a chain past
+    # the round cap is refused, never read empty.
     plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
+    pending = {(k, i): (v, {m.group(1) or m.group(3) for m in _var_uses(v)} & vals.keys())
+               for k, vs in vals.items() for i, v in enumerate(vs) if v not in plain[k]}
+    done: dict[tuple[str, int], str] = {}
+    # A name's applied defaults (below) resolve the OTHER names a link names.
+    defaults = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in applied.items()}
+
+    def chained(m: "re.Match[str]", owner: str, known: dict[str, list[str]]) -> str:
+        name = m.group(1) or m.group(3)
+        if name not in known:
+            return m.group(0)
+        value = _picked(known[name] + (defaults.get(name, []) if name != owner else []))
+        _spend(len(value) - len(m.group(0)))
+        return value
+
+    for _ in range(_CHAIN_ROUNDS):
+        known = {k: list(vs) for k, vs in plain.items()}
+        ready = [key for key, (_v, names) in pending.items()
+                 if all(known[n] or (n != key[0] and defaults.get(n)) for n in names)]
+        for key in ready:
+            got = done[key] = _var_sub(lambda m: chained(m, key[0], known), pending.pop(key)[0])
+            if not _names_assigned(got, vals):
+                plain[key[0]].append(got)
+        if not ready:
+            break
+    else:
+        if pending and _budget is not None:
+            _budget["capped"] = True
     # An applied default is one more value of its name, and resolves OTHER
     # names (`y=${x:-"rm …"}; z=$y; $z`), never its own: there it took
     # `x=; x=${x-a}"rm …"; $x` (the `${x-a}` empty, x set) to `arm …` in
@@ -2072,7 +2107,8 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         _spend(len(value) - len(m.group(0)))
         return value
 
-    return {k: [_var_sub(lambda m, k=k: resolve(m, k), v) for v in vs]
+    return {k: [done.get((k, i)) if (k, i) in done
+                else _var_sub(lambda m, k=k: resolve(m, k), v) for i, v in enumerate(vs)]
             for k, vs in vals.items()}
 
 

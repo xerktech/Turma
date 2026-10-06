@@ -278,6 +278,14 @@ paths:
     first (a DB drop, a fork bomb) returns before the cap is met. Granted, the policy checks ran
     without the per-value readings: `x=ls; <17 x=…>; x="gh pr merge 1"; $x` passed `x=ls *`. `_assign_value_end` extends a value whose
   `${…}` closes past the regex's flat quote pairing (`x="${y:-"rm …"}"`).
+- **A value naming another assigned name resolves through the whole chain** (XERK-1648,
+  `_assigned_values`): one link per round, each value once every name it uses has a value, then
+  stored resolved — never re-inlined per recursion level (that grew the text to "too deep").
+  - Resolving once read `q=/etc; d=$q; r=$d` as `r` empty: `rm -rf $r` passed.
+  - A cycle (`a=$b; b=$a`) never resolves and reads empty, as an unset name. A chain still
+    resolving past `_CHAIN_ROUNDS` links sets `capped` (denied), never reads empty.
+  - Tests: `test_a_chain_of_assignments_resolves_every_link`,
+    `test_a_cycle_of_assignments_stays_bounded`.
 - **A name assigned more than once is also read with each value on its own** (`_picked`,
   XERK-1621): joined, `x=a; x="rm …"; $x` ran the program `a`. Added readings, never swapped.
   - One whole-line reading per value; more than `_MAX_VALUE_READINGS` assignments to one name
