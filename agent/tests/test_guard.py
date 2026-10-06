@@ -254,6 +254,19 @@ BYPASS_DESTRUCTIVE = [
     'eval "$(echo rm -rf /etc)"',
     # A function body, and a case arm, each lead with a token of their own.
     "f() { rm -rf /etc; }; f",
+    # `()` is an operator: glued or spaced, the header still ends at it (XERK-1633).
+    "f(){ rm -rf /etc; }; f", "f ( ) { rm -rf /etc; }; f", "f () { rm -rf /etc; }; f",
+    "f( ) { rm -rf /etc; }; f", "f (){ rm -rf /etc; }; f",
+    # Any word names a bash function; zsh takes several names, or none.
+    "a-b(){ rm -rf /etc; }; a-b", "1f () { rm -rf /etc; }; 1f", "f/g(){ rm -rf /etc; }; f/g",
+    "() { rm -rf /etc; }", "f g () { rm -rf /etc; }; g", "f g(){ rm -rf /etc; }; g",
+    "f+(){ rm -rf /etc; }; f+", "function f g { rm -rf /etc; }; g",
+    # A QUOTED `()` is an argument, never a header, so the command still shows.
+    "rm -rf /etc '()'", 'rm -rf /etc "(){"', "rm '()' -rf /etc", "rm -rf /etc \\(\\)",
+    "rm -rf /etc $'()'", "sudo rm -rf /etc x'()'", "find / -delete '()'",
+    # ...nor a printed one, nor an extglob: both are bare only to the guard.
+    "rm -rf /etc `echo '()'`", 'sudo rm -rf /etc `echo "()"`', "rm -rf /etc @()",
+    "shopt -s extglob\nrm -rf /etc !()",
     "case x in x) rm -rf /etc;; esac",
     # The loop variable is assigned by the very command that uses it.
     "for d in /etc; do rm -rf $d; done",
@@ -954,6 +967,28 @@ class TestParserGaps(unittest.TestCase):
     def assertAllowed(self, cmd):
         self.assertIsNone(guard.is_destructive(cmd), cmd)
 
+    def test_a_function_header_in_any_spelling_leads_to_its_body(self):
+        # XERK-1633: `()` is an operator, so a continuation can split the
+        # header, and zsh takes a quoted name.
+        R = self.R
+        for cmd in (f"f \\\n() {{ {R}; }}; f", f"f (\\\n) {{ {R}; }}; f",
+                    f"x=1; f \\\n(){{ {R}; }}; f", f"'f g'(){{ {R}; }}; 'f g'",
+                    f'"f g"(){{ {R}; }}', f"f\\ g () {{ {R}; }}", f"'f;g'(){{ {R}; }}",
+                    # A printed `()` in the body is an argument, not a header.
+                    f"f(){{ {R} `echo '()'`; }}; f", f"f () {{ {R} $(echo '()'); }}; f"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # An assignment's or a substitution's parens are no header.
+        for text in ("a=( ); x $( ) <( ) =( )", "(( ))", "echo '()' \"()\""):
+            with self.subTest(text=text):
+                self.assertEqual(guard._glue_func_parens(text), text)
+        # A script of many small functions is still read whole, not refused as
+        # too large: the closed-up reading is per segment (XERK-1633 QA).
+        script = "\n".join(f"f{i}(){{ echo {i} | grep -q x || mkdir -p /tmp/d{i}; }}"
+                            for i in range(300))
+        self.assertAllowed(f"bash <<'EOF'\n{script}\nEOF")
+        self.assertAllowed(script)
+
     def test_an_unquoted_heredoc_body_runs_its_substitutions(self):
         R = self.R
         for cmd in (f"cat <<EOF\n$({R})\nEOF", f"cat <<EOF\n`{R}`\nEOF",
@@ -1209,6 +1244,7 @@ class TestProducedScripts(unittest.TestCase):
                     "f() { { :; }; rm -rf *; }; cd /; f",
                     "f() { for i in 1; do :; done; rm -rf *; }; cd /; f",
                     "function f { rm -rf *; }; cd /; f", "f() ( rm -rf * ); cd /; f",
+                    "f(){ rm -rf *; }; cd /; f", "f ( ) { rm -rf *; }; cd /; f",
                     "f() { echo ${x}; rm -rf *; }; cd /; f",
                     "f() { echo $(date); rm -rf *; }; cd /; f",
                     "for i in 1 2; do (rm -rf *); cd /; done",
@@ -2936,6 +2972,80 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # Past the cap, one reading per substitution fails closed.
         many = 'echo ' + ' '.join(['"$(echo \'"\')"'] * (guard._MAX_DECOY_SUBSTS + 1))
         self.assertEqual(guard.decide("Bash", {"command": many}, cwd="/tmp")[0], "deny")
+
+    def test_a_nested_quote_or_a_reassigned_value_does_not_hide_the_command(self):
+        # XERK-1621: a `"…"` inside a string's `${…}` nests rather than closing
+        # the string, and its `'` hid the rest of the line; a name assigned
+        # twice was read as both values joined, `a rm -rf /etc`.
+        deny = ('echo "${y:-"it\'s"}"; time rm -rf /etc',
+                'echo "${HOME:+"it\'s"}" && env rm -rf /etc',
+                'printf "%s" "${1:-"don\'t"}"; nohup rm -rf /etc',
+                'echo "${a:-${b:-"it\'s"}}"; rm -rf /etc',
+                # A `'` there pairs in bash, and is a plain character in zsh/dash.
+                'echo "${y:-\'"\'}"; rm -rf /etc', 'echo "${y#\'"\'}"; rm -rf /etc',
+                'echo "${y:-it\'s}" \'}\'; rm -rf /etc',
+                'x=a; x="rm -rf /etc"; $x', 'x=a; x=b; x="rm -rf /etc"; $x',
+                'x=a; x="rm -rf /etc"; eval "$x"', 'x=a; x="rm -rf /etc"; eval $x',
+                'x=a; x="rm -rf /etc"; bash <<< "$x"', 'x=a; x="rm -rf /etc"; bash -c "$x"',
+                'x=a; x="rm -rf /etc"; y=$x; $y',
+                # A `)`, `'` or `#` in a string inside `$(…)` in a string
+                # closes nothing (QA: the `${…}` frame had leaned on it).
+                'echo "$(echo "${a-")\'"}")"; rm -rf /etc', 'echo "$(echo ")\'")"; rm -rf /etc',
+                'echo "$(echo " #")"; rm -rf /etc', 'echo "$(echo " #}")" && rm -rf /etc',
+                'echo "${a#"\'"}$(echo ")\'")"; sh -c "rm -rf /etc"',
+                # A bad substitution prints nothing; an unknown output may be empty.
+                '"$(echo "${";}"}")"rm -rf /etc', '$(true)echo "rm -rf /etc" | sh',
+                '"$("${a-";"}\'")"echo "rm -rf /etc"|sh',
+                # dash ends a bad `${` at its first `}`; bash nests in it.
+                '"$(true "${";}")"rm -rf /etc', '"$(echo "${a";}")"rm -rf /etc',
+                '"$(echo ${";})"rm -rf /etc', '"$(echo "${";}")"echo "rm -rf /etc" | sh',
+                # ...after its name and one operator character: `${''}'}`.
+                ": $(echo ${''}'}); rm -rf /etc", ": $(echo ${'x'}'}); rm -rf /etc",
+                'echo ;$(echo ${;#})rm -rf /etc', 'echo ;"$(echo ${a";})"rm -rf /etc',
+                # Shells recover from a bad `${` their own ways: the old flat
+                # parse is kept as a reading (fuzz, QA pass 3).
+                'echo "$(echo ${})";"$(echo ${ ${"${";}})${b:-}}})"rm -rf /etc',
+                # A reassigned value with a taint reading.
+                "a=true; a=$(false || echo 'rm -rf /etc' | grep .); $a",
+                # A default applies when the value is assigned.
+                'x="${y:-"rm -rf /etc"}"; eval "$x"', 'x=${y:-"rm -rf /etc"}; $x',
+                'export x="${y:-"rm -rf /etc"}"; bash -c "$x"',
+                'x=${x:-"rm -rf /etc"}; $x', 'y=; x=${y:-"rm -rf /etc"}; $x',
+                'y=; x=a; x+=${y:-"; rm -rf /etc"}; eval "$x"',
+                # ...which reaches other names through a chain.
+                'y=${x:-"rm -rf /etc"}; z=$y; $z', 'y=${x:-"rm -rf /etc"}; z=${y#x}; eval "$z"',
+                # ...an added value of its own name, never resolving the others:
+                # set-empty, `${x-a}` is empty.
+                'x=${x-$x}"rm -rf /etc"; $x', 'x=; x=${x-a}"rm -rf /etc"; $x',
+                'a=; a=${a=x}"rm -rf /etc"; $a', "bash -c 'x=; x=${x-a}\"rm -rf /etc\"; $x'",
+                # Past the cap, a reading per value fails closed.
+                "".join(f"x={i}; " for i in range(guard._MAX_VALUE_READINGS + 1)) + "$x")
+        for cmd in deny:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        # Past either cap: too large, and no grant lifts it — the policy
+        # checks would otherwise run without the per-value readings.
+        merge = 'x="gh pr merge 1"; $x'
+        # ...a grantable reason found FIRST (database, fork bomb) included.
+        leads = ("".join(f"x={i}; " for i in range(guard._MAX_VALUE_READINGS + 1)),
+                 "".join(f"x=${{D:-/tmp/a{i}}}; " for i in range(13)))
+        for tail in ("", "; echo 'DROP TABLE t' | psql", "; :(){ :|:& };:"):
+            for lead in leads:
+                with self.subTest(lead=lead[:20], tail=tail):
+                    cmd = "x=ls; " + lead + merge + tail
+                    self.assertEqual(guard.decide("Bash", {"command": cmd},
+                                                  overrides=["x=ls *"], cwd="/tmp"),
+                                     ("deny", guard._TOO_LARGE_REASON, "policy"))
+        for cmd in ('echo "${y:-"it\'s"}"; ls', 'echo "${line#\'# \'}" done',
+                    'f=a.txt; f=b.txt; cat "$f"', 'x=1; x=2; echo "$x"',
+                    'echo "${y:-"$(date)"}"', "".join(f"x={i}; " for i in range(16)) + "$x",
+                    'x=${HOME:-/tmp}; ls "$x"', 'echo "$(echo ")it\'s")"',
+                    # A `for` list's words are data, not counted toward the cap.
+                    "for f in " + " ".join("abcdefghijklmnopqrst") + "; do echo $f; done",
+                    # Applied defaults count toward the looser values cap only.
+                    "".join(f"x=${{D:-/tmp/a{i}}}; " for i in range(12)) + 'ls "$x"'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
     def test_a_decision_past_its_deadline_denies(self):
         # XERK-1615 QA: the growth budget counts characters, not time, and a

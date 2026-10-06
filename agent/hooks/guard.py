@@ -126,8 +126,12 @@ _PREFIX_KEYWORDS = _SHELL_KEYWORDS | {"time"}
 _WORDLIST_HEADS = {"for", "case", "select"}
 
 # `f()` in `f() { rm -rf /etc; }`, and `x)` in a case arm. Both lead a segment
-# whose real command follows them.
-_FUNC_DEF_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*\(\)$")
+# whose real command follows them. bash (outside POSIX mode) takes any word as a
+# function name — `a-b`, `1f`, `f/g` — and zsh takes none at all: `() { …; }` is
+# an anonymous function run on the spot. A narrower name class let those headers
+# hide the body (XERK-1633). zsh even takes a quoted one — `'f g'(){ …; }` —
+# so any word ending in `()` counts: dropping one only uncovers more to read.
+_FUNC_DEF_RE = re.compile(r".*\(\)$", re.DOTALL)
 _CASE_PATTERN_RE = re.compile(r"^[^()\s]+\)$")
 
 # Interpreters whose `-c <string>` argument is a whole command line of its own.
@@ -440,7 +444,7 @@ def _param_spans(text: str) -> list[tuple[int, int, str]]:
         nxt = text[i + 1]
         end = -1
         if nxt == "{" and not text.startswith("${#", i):
-            close = _brace_end(text, i)
+            close = _brace_end(text, i, states[i] == '"')
             end = close + 1 if close > 0 else -1
         elif nxt.isalpha() or nxt == "_":
             end = i + 2
@@ -627,6 +631,10 @@ def _decoy_readings(raw: str) -> list[str]:
         for start in differ]
 
 
+# Every character `_quote_states` treats specially.
+_QUOTE_STATE_CHARS = frozenset("#\\$}`'\"()")
+
+
 def _quote_states(command: str) -> list[str]:
     """How each character of ``command`` is quoted: `'` inside a single-quoted
     literal, `"` inside a double-quoted string, `\\` escaped, "" bare.
@@ -635,6 +643,14 @@ def _quote_states(command: str) -> list[str]:
     so the `'…'` in `"$(echo 'a')"` is a real single-quoted literal again. A `#` comment is
     `#` to its line's end: the apostrophe in `# don't` opened a "quote" that
     every later character was read inside (XERK-1549).
+
+    A `${…}` nests a string too: in `"${y:-"it's"}"` the inner `"…"` is a
+    string of its own, not the outer one closing. Read flat, its `'` opened a
+    quote that hid every command after it (XERK-1621). Frames: `{` for a bare
+    `${`, `{"` for one inside a string. A `'` directly in a `{"` frame is
+    shell-dependent (`_BRACE_OTHER_SHELL`): bash pairs it, hiding a `"` or `}`
+    up to the next `'` (its text still expands), while zsh and dash read it
+    as a plain character.
     """
     out = [""] * len(command)
     stack: list[str] = []
@@ -642,7 +658,13 @@ def _quote_states(command: str) -> list[str]:
     while i < n:
         ch = command[i]
         top = stack[-1] if stack else ""
-        if ch == "#" and top != '"' and _is_comment(command, i):
+        if ch not in _QUOTE_STATE_CHARS:
+            # Plain text is quoted as its frame is: most of a long line.
+            if top in ('"', '{"'):
+                out[i] = '"'
+            i += 1
+            continue
+        if ch == "#" and top in ("", "(") and _is_comment(command, i):
             end = command.find("\n", i)
             end = n if end < 0 else end
             out[i:end] = ["#"] * (end - i)
@@ -655,6 +677,24 @@ def _quote_states(command: str) -> list[str]:
         if command.startswith("$(", i):
             stack.append("(")
             i += 2
+            continue
+        if command.startswith("${", i) and not _MAIN_PARSE[0] and _live_dollar(command, i):
+            quoted = top in ('"', '{"')
+            if _bad_brace(command, i) and _BRACE_OTHER_SHELL[0]:
+                end = _brace_end(command, i, quoted)
+                end = n - 1 if end < 0 else end
+                out[i:end + 1] = ['"' if quoted else ""] * (end + 1 - i)
+                i = end + 1
+                continue
+            stack.append('{"' if quoted else "{")
+            out[i:i + 2] = ['"' if quoted else ""] * 2
+            i += 2
+            continue
+        if ch == "}" and top in ("{", '{"'):
+            # (`_MAIN_PARSE` pushes no such frame.)
+            out[i] = '"' if top == '{"' else ""
+            stack.pop()
+            i += 1
             continue
         if ch == "`":
             # A backtick body ends at the next unescaped backtick, whatever
@@ -676,6 +716,25 @@ def _quote_states(command: str) -> list[str]:
                 stack.pop()
             i += 1
             continue
+        if top in ("{", '{"') and ch in "'\"":
+            _MAIN_PARSE_SEEN[0] = True
+        if top == '{"':
+            # Inside a string's `${…}`: a nested `"…"` quotes, and a `'`
+            # pairs in bash. Either way the text stays string text: bash
+            # still expands `$x` and `$(…)` between those `'`.
+            if ch == "'":
+                _BRACE_OTHER_SEEN[0] = True
+            if ch == "'" and not _BRACE_OTHER_SHELL[0]:
+                end = command.find("'", i + 1)
+                end = n - 1 if end < 0 else end
+                out[i:end + 1] = ['"'] * (end + 1 - i)
+                i = end + 1
+                continue
+            out[i] = '"'
+            if ch == '"':
+                stack.append('"')
+            i += 1
+            continue
         if ch == "'":
             end = command.find("'", i + 1)
             end = n - 1 if end < 0 else end
@@ -685,7 +744,7 @@ def _quote_states(command: str) -> list[str]:
         if ch == '"':
             out[i] = '"'
             stack.append('"')
-        elif ch == "(":
+        elif ch == "(" and top != "{":
             stack.append("(")
         elif ch == ")" and top == "(":
             stack.pop()
@@ -706,7 +765,10 @@ def _subst_standalone(m: "re.Match[str]") -> bool:
 def _printed_text(command: str) -> str | None:
     """What ``command`` prints when it only prints its arguments (echo, or
     printf rendered as printf would), else None. `command echo`, `exec echo`
-    and the like print just the same."""
+    and the like print just the same. A bad substitution prints nothing
+    (see `_stmt_printed`)."""
+    if "${" in command and not _MAIN_PARSE[0] and _BAD_SUBST_RE.search(command):
+        return None
     return _printed_from_tokens(_strip_prefixes(_tokenize(command)))
 
 
@@ -748,8 +810,43 @@ def _passes_input(stage: str) -> bool:
     return prog in _PASS_THROUGH and (prog != "cat" or all(t == "-" for t in toks[1:]))
 
 
+# A `${` naming no parameter: bash fails the command ("bad substitution").
+_BAD_SUBST_RE = re.compile(r"\$\{(?![#!]?(?:[A-Za-z_]|[0-9@*#?$!-]))")
+# A `${` naming a parameter and going on to an operator or its `}`.
+_GOOD_BRACE_RE = re.compile(r"\$\{[#!]?(?:[A-Za-z_]\w*|[0-9]+|[@*#?$!-])[}:\-=+?#%/^,\[@]")
+
+
+_DASH_NAME_RE = re.compile(r"[#!]?(?:[A-Za-z_]\w*|[0-9]+|[@*#?$!-])?")
+
+
+def _dash_bad_body(command: str, i: int) -> int:
+    """Where dash goes on reading the bad `${` at ``i``: past its name and
+    the one character it takes as the operator, quote or not. So `${''}'}`
+    closes at the second `}` (the `'}'` is quoted) and `${a";}"` at the first
+    (XERK-1621 QA, measured: dash runs both)."""
+    return _DASH_NAME_RE.match(command, i + 2).end() + 1
+
+
+def _bad_brace(command: str, i: int) -> bool:
+    """Whether the `${` at ``i`` is a bad substitution, which shells PARSE
+    differently: bash nests quotes inside it as in any `${…}`, dash ends it
+    at its first `}`. So `"$(true "${";}")"rm …` splits at the `;` in bash
+    and runs `rm` in dash (XERK-1621 QA). Seeing one asks `_expand_both` for
+    the other-shell reading (`_BRACE_OTHER_SHELL`), which reads it flat."""
+    if _GOOD_BRACE_RE.match(command, i):
+        return False
+    _BRACE_OTHER_SEEN[0] = True
+    return True
+
+
 def _stmt_printed(stmt: str) -> tuple[str, bool] | None:
-    """What one statement prints and whether it ends a line, else None."""
+    """What one statement prints and whether it ends a line, else None.
+
+    A bad substitution prints nothing, so its text is no output: read as
+    printed, `"$(echo "${";}")"rm -rf /` hid the `rm` glued to it
+    (XERK-1621). Unknown instead, it may be empty."""
+    if "${" in stmt and not _MAIN_PARSE[0] and _BAD_SUBST_RE.search(stmt):
+        return None
     stages = _split_segments(stmt)
     if not stages or not all(_passes_input(st) for st in stages[1:]):
         return None
@@ -803,12 +900,12 @@ def _literal(text: str) -> str:
 
 
 @functools.lru_cache(maxsize=1024)
-def _body_printed(body: str, raw: bool, multi: bool = True) -> tuple[str | None, int]:
+def _body_printed(body: str, raw: tuple, multi: bool = True) -> tuple[str | None, int]:
     """`_printed_text` of a substitution body once its own substitutions are
     resolved, and the escaped ones that skipped (replayed by the caller, as
     `_memo` does). Memoised: every pass over a line re-resolves each nesting
     level beneath it, which on thousands of levels runs past the hook timeout,
-    which fails OPEN. ``raw`` is `_SPLICE_RAW`, which the resolution reads.
+    which fails OPEN. ``raw`` is `_reading()`, the flags the resolution reads.
 
     ``multi`` also reads a body of several statements (`_statements_printed`).
     Without it a body is read as it was before XERK-1609, a reading callers
@@ -915,7 +1012,7 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
         return _OPAQUE_SUBST
     _SUBST_DEPTH[0] += 1
     try:
-        printed, escaped = _body_printed(_subst_inner(m), _SPLICE_RAW[0], multi)
+        printed, escaped = _body_printed(_subst_inner(m), _reading(), multi)
     finally:
         _SUBST_DEPTH[0] -= 1
     _SPLICES_ESCAPED[0] += escaped
@@ -1166,12 +1263,12 @@ def _body_tainted(body: str) -> tuple[str, ...] | None:
     """The taint readings of a substitution body, or None to leave it opaque.
     Its own substitutions resolve the way the enclosing parse does (escaped
     ones kept literal unless `_SPLICE_RAW`), so the memo is keyed on that."""
-    return _body_tainted_at(body, _SPLICE_RAW[0])
+    return _body_tainted_at(body, _reading())
 
 
 @functools.lru_cache(maxsize=512)
-def _body_tainted_at(body: str, raw: bool) -> tuple[str, ...] | None:
-    """`_body_tainted` for one `_SPLICE_RAW` setting.
+def _body_tainted_at(body: str, raw: tuple) -> tuple[str, ...] | None:
+    """`_body_tainted` for one `_reading()`.
 
     A rewriting filter, a non-echo producer, or an unread statement left the
     body opaque while bash ran its output (XERK-1613):
@@ -1379,10 +1476,17 @@ def _find_substs(text: str) -> list[_Subst]:
       the next backtick, as `_SUBST_RE` did.
     Both pairings are one stack pass over the whole text, so unclosed
     openers stay linear: a scan per opener is O(n²), past the hook timeout.
+    - A `)` closes only a `(` quoted the same way (`_quote_states`): read
+      blind, the `)` in `$(echo ")'")` ended the body there and its `'` hid
+      the rest of the line (XERK-1621). An escaped `\$(` inside `"…"` is
+      string text throughout, so it still pairs as it did.
     """
     n = len(text)
     close_paren: dict[int, int] = {}
     parens: list[int] = []
+    # With no quote or comment in the text every paren is bare: skip the scan.
+    states = _quote_states(text) if "(" in text and not _MAIN_PARSE[0] and (
+        "'" in text or '"' in text or "#" in text) else []
     ticks: list[tuple[int, int]] = []     # (index, backslashes before it)
     i = 0
     while i < n:
@@ -1402,8 +1506,10 @@ def _find_substs(text: str) -> list[_Subst]:
             ticks.append((i, 0))
         elif ch == "(":
             parens.append(i)
-        elif ch == ")" and parens:
+        elif ch == ")" and parens and (not states or states[parens[-1]] == states[i]):
             close_paren[parens.pop()] = i
+        elif ch == ")" and parens:
+            _MAIN_PARSE_SEEN[0] = True
         i += 1
     close_tick: dict[int, int] = {}
     stack: list[tuple[int, int]] = []
@@ -1522,11 +1628,21 @@ def _budgeted(fn):
         global _budget
         if _budget is not None:
             return fn(*args, **kwargs)
-        _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}, "proc": {},
+        _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}, "capped": False, "proc": {},
                    "until": time.monotonic() + _MAX_DECIDE_SECONDS}
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
         _VALUES_TAINT_N[0] = 0
+        _VALUES_MOST[0] = 1
+        _VALUES_ASSIGNED[0] = 1
+        _BRACE_OTHER_SEEN[0] = False
+        _MAIN_PARSE_SEEN[0] = False
+        # These memos set the readings' SEEN flags as they fill, and a hit
+        # skips that: a body cached by an earlier decision in this process
+        # never asked for this one's extra readings.
+        _closers.cache_clear()
+        _body_printed.cache_clear()
+        _body_tainted_at.cache_clear()
         try:
             return fn(*args, **kwargs)
         finally:
@@ -1539,7 +1655,8 @@ def _memo(kind: str, key, fn, *args):
     """``fn(*args)``, made once per decision. A hit replays the escaping
     splices it counted, which is what makes `_expand_both` take its raw pass."""
     memo = _budget[kind]
-    key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0])
+    key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
+           _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -1591,13 +1708,33 @@ for _ in range(8):  # parentheses nested this deep inside one `$(…)`
 # x=`echo \`echo …\`` at the inner opener and kept only `echo` (XERK-1605).
 _ASSIGN_SUBST = r"\$\(" + _ASSIGN_NEST + r"\)|`(?:[^`\\]|\\.)*`"
 _ASSIGN_SUBST_RE = re.compile(_ASSIGN_SUBST)
+_ASSIGN_WORD = r"(?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])*"
 _VAR_ASSIGN_RE = re.compile(
     # A lookbehind, not a consumed lead-in plus `\s*`: that re-scanned a
     # whitespace run from each of its blanks, quadratic in its length (XERK-1601).
     r"(?<![^;\n&|\s])"
     r"([A-Za-z_][A-Za-z0-9_]*)(?:\[[^\]\s]*\])?\+?="
-    r"(\([^()]*\)|(?:" + _ASSIGN_SUBST + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|[^\s;|&\n'\"`])*)"
+    r"(\([^()]*\)|" + _ASSIGN_WORD + r")"
 )
+_ASSIGN_WORD_RE = re.compile(_ASSIGN_WORD)
+
+
+def _assign_value_end(command: str, states: list[str], start: int, end: int) -> int:
+    """Where an assignment's value really ends: past any `${…}` in it that
+    closes beyond the regex's match. The regex pairs `"` flat, so it cut
+    `x="${y:-"rm -rf /"}"` at the inner quote (XERK-1621). After the `}`,
+    the rest of the string it sits in (``states``, `_quote_states`) is the
+    value's too, then any word text glued on."""
+    i = command.find("${", start, end)
+    while 0 <= i < end:
+        close = _brace_end(command, i, states[i] == '"') if _live_dollar(command, i) else -1
+        if close >= end:
+            j = close + 1
+            while j < len(command) and states[j] in ('"', "'", "\\"):
+                j += 1
+            end = _ASSIGN_WORD_RE.match(command, j).end()
+        i = command.find("${", max(i + 2, close + 1), end)
+    return end
 # printf's conversions — flags, `*`/digit width, `.`/`.*`/digit precision —
 # and the backslash escapes it decodes in a format (and in a `%b` argument).
 _PRINTF_SPEC_RE = re.compile(r"%(%|[-+ #0']*(\*|\d+)?(?:\.(\*|\d*))?[hlLqjzt]*([a-zA-Z]))")
@@ -1731,11 +1868,16 @@ def _var_values(command: str) -> dict[str, list[str]]:
 
 def _assigned_values(command: str) -> dict[str, list[str]]:
     vals: dict[str, list[str]] = {}
+    states = _quote_states(command) if "${" in command else []
+    applied: dict[str, list[str]] = {}
     for m in _VAR_ASSIGN_RE.finditer(command):
         value = m.group(2)
+        if "${" in value and not _MAIN_PARSE[0]:
+            value = command[m.start(2):_assign_value_end(command, states, m.start(2), m.end(2))]
         if value.startswith("(") and value.endswith(")"):
             # An array, `a=(rm -rf *)`: its words, which `"${a[@]}"` runs.
             value = value[1:-1].strip()
+        raw = value
         # Read as before XERK-1609 unless `_expand_both` is on its pass for
         # several statements (see `_body_printed`). Both in one list was no
         # good: `_substitute_vars` joins a name's values into ONE word list,
@@ -1760,31 +1902,58 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
             _VALUES_DIFFER[0] |= produced != base
             produced = base
         vals.setdefault(m.group(1), []).append(produced)
-    for m in _FOR_IN_RE.finditer(command):
-        words = [w for w in m.group(2).split() if w != "do"]
-        if words:
-            vals.setdefault(m.group(1), []).extend(words)
+        if "${" in raw and not _MAIN_PARSE[0]:
+            # Bash applies a `${y:-…}` default when it assigns, so `$x` runs
+            # it; stored unapplied, `x=${y:-"rm -rf /"}; $x` spliced a word
+            # nothing re-reads (XERK-1621). Added, never swapped: `y` may be
+            # set after all — so kept out of `plain` below.
+            with_default = _dequote_value(_substitute_vars(raw, {}))
+            if with_default != value:
+                applied.setdefault(m.group(1), []).append(
+                    _produced_text(with_default, multi=_VALUES_MULTI[0]))
     if "printf" in command and "-v" in command:
         for seg in _split_segments(command):
             bound = _printf_v(_strip_prefixes(_tokenize(seg)))
             if bound:
                 vals.setdefault(bound[0], []).append(bound[1])
+    # How many values one name is ASSIGNED, so `_expand_both` reads each on
+    # its own. Not a `for` list's words: those are a loop's data, and a long
+    # list would cost a whole reading per word.
+    # Applied defaults are read per value too. Assignments have their cap,
+    # and all of a name's values a looser one (`_expand_picks`): a line of
+    # nine `x=${D:-…}` is nine assignments, eighteen values.
+    for k, got in vals.items():
+        _VALUES_MOST[0] = max(_VALUES_MOST[0], len(got) + len(applied.get(k, ())))
+        _VALUES_ASSIGNED[0] = max(_VALUES_ASSIGNED[0], len(got))
+    for m in _FOR_IN_RE.finditer(command):
+        words = [w for w in m.group(2).split() if w != "do"]
+        if words:
+            vals.setdefault(m.group(1), []).extend(words)
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
     # HERE, once, against the values that name none. Left in, every recursion
     # level re-inlined it, the text grew each time, and an ordinary command
     # was refused as nested too deeply. An unresolvable one is empty, as bash
     # reads an unset name.
     plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
+    # An applied default is one more value of its name, and resolves OTHER
+    # names (`y=${x:-"rm …"}; z=$y; $z`), never its own: there it took
+    # `x=; x=${x-a}"rm …"; $x` (the `${x-a}` empty, x set) to `arm …` in
+    # every reading.
+    for k, vs in applied.items():
+        vals.setdefault(k, []).extend(vs)
+    others = {k: plain.get(k, []) + [v for v in vs if not _names_assigned(v, vals)]
+              for k, vs in applied.items()}
 
-    def resolve(m: "re.Match[str]") -> str:
+    def resolve(m: "re.Match[str]", owner: str) -> str:
         name = m.group(1) or m.group(3) or ""
         if name not in vals:
             return m.group(0)
-        value = " ".join(plain[name])
+        value = _picked(plain[name] if name == owner else others.get(name, plain[name]))
         _spend(len(value) - len(m.group(0)))
         return value
 
-    return {k: [_var_sub(resolve, v) for v in vs] for k, vs in vals.items()}
+    return {k: [_var_sub(lambda m, k=k: resolve(m, k), v) for v in vs]
+            for k, vs in vals.items()}
 
 
 def _value_taint_readings(value: str) -> tuple[str, ...]:
@@ -1966,16 +2135,19 @@ def _names_assigned(value: str, vals: dict[str, list[str]]) -> bool:
 
 
 @functools.lru_cache(maxsize=16)
-def _closers(command: str) -> dict[int, int]:
-    """Per command line: where each opener `_brace_end` has scanned closes."""
+def _closers(command: str, reading: tuple[bool, bool]) -> dict[int, int]:
+    """Per command line (and `'` reading): where each opener `_brace_end` has
+    scanned closes."""
     return {}
 
 
-def _brace_end(command: str, i: int) -> int:
+def _brace_end(command: str, i: int, quoted: bool | None = None) -> int:
     """Index of the `}` closing the `${` at ``i``, or -1 if it never closes.
 
     Quotes, `$(…)`, backticks and nested `${…}` inside the braces hide a `}`,
     as they do from bash: `${a:-'}'}` and `${a:-$(echo })}` are one expansion.
+    In a `${…}` inside `"…"` (``quoted``; looked up when not given) a nested
+    `"…"` quotes, and a `'` pairs unless `_BRACE_OTHER_SHELL` (XERK-1621).
 
     Where an opener closes depends only on the text after it, so every opener
     the scan passes is remembered per command line and skipped on the next
@@ -1983,17 +2155,30 @@ def _brace_end(command: str, i: int) -> int:
     line: O(N × length), minutes for a 40 KB command, and a hook that times
     out lets the command run unchecked (XERK-1596).
     """
-    memo = _closers(command)
+    memo = _closers(command, (_BRACE_OTHER_SHELL[0], _MAIN_PARSE[0]))
     if i in memo:
         return memo[i]
-    stack = [("{", i)]
+    if _MAIN_PARSE[0]:
+        quoted = False
+    elif quoted is None:
+        quoted = _quote_states(command)[i] == '"'
+    stack = [('{"' if quoted else "{", i)]
     j, n = i + 2, len(command)
+    if _bad_brace(command, i) and _BRACE_OTHER_SHELL[0]:
+        j = _dash_bad_body(command, i)
 
     def opened(kind: str) -> int:
         """Push the opener at ``j``; a remembered one is skipped instead.
         Returns where the scan resumes, or -1 once the outer one can't close."""
         end = memo.get(j)
+        if end is None and kind == "{" and _bad_brace(command, j) \
+                and _BRACE_OTHER_SHELL[0]:
+            # As above: dash skips its name and operator character.
+            stack.append(('{"' if stack[-1][0] in ('"', '{"') else "{", j))
+            return _dash_bad_body(command, j)
         if end is None:
+            if kind == "{" and stack[-1][0] in ('"', '{"') and not _MAIN_PARSE[0]:
+                kind = '{"'
             stack.append((kind, j))
             return j + (1 if kind in ('"', "`") else 2)
         return end + 1 if end >= 0 else -1
@@ -2019,6 +2204,11 @@ def _brace_end(command: str, i: int) -> int:
             if j < 0:
                 break
             continue
+        if top == '{"' and ch == "'":
+            _BRACE_OTHER_SEEN[0] = True
+            if _BRACE_OTHER_SHELL[0]:
+                j += 1
+                continue
         if ch == "'" or command.startswith("$'", j):
             ansi = ch == "$"
             j += 2 if ansi else 1
@@ -2030,7 +2220,7 @@ def _brace_end(command: str, i: int) -> int:
             j = opened(command[j + 1])
         elif ch in ('"', "`"):
             j = opened(ch)
-        elif (ch == "}" and top == "{") or (ch == ")" and top == "("):
+        elif (ch == "}" and top in ("{", '{"')) or (ch == ")" and top == "("):
             memo[stack.pop()[1]] = j
             if not stack:
                 return j
@@ -2101,7 +2291,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     if vals is None:
         vals = _var_values(command)
 
-    states = _quote_states(command) if vals and "$" in command else []
+    states = _quote_states(command) if (vals and "$" in command) or "${" in command else []
 
     def rep(m: "re.Match[str]") -> str:
         if not _SPLICE_RAW[0] and not _live_dollar(command, m.start()):
@@ -2114,7 +2304,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # splice-everything reading.
             _SPLICES_ESCAPED[0] += 1
             return m.group(0)
-        if m.group(1) and _brace_end(command, m.start()) != m.end() - 1:
+        if m.group(1) and _brace_end(command, m.start(), states[m.start()] == '"') != m.end() - 1:
             # `[^}]*` stopped at a `}` that is quoted or nested — in
             # `${a:-'}' #}` the expansion runs on to the last `}`. Splicing the
             # short match left the `#` bare, a comment hiding the rest of the
@@ -2124,7 +2314,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         got = vals.get(name)
         op = _VAR_OP_RE.match(m.group(2) or "")
         if got:
-            value = got[0] if len(got) == 1 else " ".join(got)
+            value = _picked(got)
             state = states[m.start()] if m.start() < len(states) else ""
             if state == '"' and (m.group(2) or "").startswith(("[@]", "[*]")):
                 # `"${a[@]}"` is one word PER element, even mid-word: close
@@ -2139,12 +2329,50 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # the `rm` a comment. The `#` was a word inside the braces; keep it
             # one (XERK-1585). Quotes and `$(…)` in the default stay live.
             out = re.sub(r"(?<!\\)#", r"\\#", op.group(2))
+            if states and states[m.start()] == '"':
+                out = _dq_default(out)
         else:
             return m.group(0)
         _spend(len(out) - len(m.group(0)))
         return out
 
     return _var_sub(rep, command)
+
+
+def _dq_default(text: str) -> str:
+    """A `${x:-…}` default inside `"…"`, as text spliced into that string.
+
+    There a `"…"` in the default is a string nested in the string, so
+    spliced as written `"${y:-"it's"}"` became `""it's""`, its `'` an open
+    quote hiding the rest of the line (XERK-1621). Its own `"` delimiters are
+    dropped; an escaped one, and any inside a substitution or a nested
+    `${…}`, stay as written."""
+    if '"' not in text or _MAIN_PARSE[0]:
+        return text
+    spans = {m.start(): m.end() for m in _find_substs(text)}
+    out, i, n = [], 0, len(text)
+    while i < n:
+        end = spans.get(i)
+        if end is None and text.startswith("${", i):
+            close = _brace_end(text, i, True)
+            end = close + 1 if close >= 0 else None
+        if end is not None:
+            out.append(text[i:end])
+            i = end
+        elif text[i] == "\\":
+            out.append(text[i:i + 2])
+            i += 2
+        else:
+            if text[i] != '"':
+                out.append(text[i])
+            i += 1
+    return "".join(out)
+
+
+def _reading() -> tuple:
+    """The reading flags a body's resolution reads, as a memo key: a body
+    memoised under one reading was replayed under another (XERK-1621)."""
+    return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0])
 
 
 # Set while `_expand_both` takes its raw reading; counts escaping splices.
@@ -2158,6 +2386,38 @@ _VALUES_DIFFER = [False]
 # and how many readings the values of this decision have (XERK-1625).
 _VALUES_TAINT = [-1]
 _VALUES_TAINT_N = [0]
+# Set while `_expand_both` reads each of a name's values on its own: which one.
+# And the most values this decision saw one name assigned (XERK-1621).
+_VALUE_PICK: list[int | None] = [None]
+_VALUES_MOST = [1]
+_VALUES_ASSIGNED = [1]
+# Set while `_expand_both` reads a `'` in a string's `${…}` as zsh and dash do,
+# as a plain character; bash pairs it. And whether this decision saw one.
+_BRACE_OTHER_SHELL = [False]
+_BRACE_OTHER_SEEN = [False]
+# Set while `_expand_both` reads the line with quoting parsed flat, as before
+# XERK-1621 (no `${…}` frames, parens paired blind); and whether this decision
+# saw text the two parsers read differently. Every new rule above is a model
+# of some shell, and a malformed `${` each shell recovers from its own way,
+# so the old parse's denies are KEPT as a reading rather than replaced.
+_MAIN_PARSE = [False]
+_MAIN_PARSE_SEEN = [False]
+# Past this many assignments to one name, a line is too large to read.
+_MAX_VALUE_READINGS = 16
+# ...and past this many values of one name, applied defaults included.
+_MAX_VALUE_PASSES = 24
+
+
+def _picked(got: list[str]) -> str:
+    """A name's values as one reading splices them: all of them joined, as
+    before XERK-1621, or the one `_expand_both` is on. Joined alone,
+    `x=a; x="rm -rf /"; $x` ran `a rm -rf /` — the program `a`."""
+    k = _VALUE_PICK[0]
+    if len(got) <= 1:
+        return got[0] if got else ""
+    if k is None:
+        return " ".join(got)
+    return got[min(k, len(got) - 1)]
 
 
 def _quote_literal(value: str, state: str) -> str:
@@ -2409,6 +2669,7 @@ def _split_on_operators(command: str, include_pipe: bool = True,
     braces: list[str] = []
     # With ``groups``: the open `(`/`{` groups, innermost last.
     opened: list[str] = []
+    substs: dict[int, int] | None = None
     i, n = 0, len(command)
 
     # How many leading chunks of `buf` are known blank: `buf` only grows
@@ -2444,6 +2705,28 @@ def _split_on_operators(command: str, include_pipe: bool = True,
                 buf.append(command[i + 1])
                 i += 2
                 continue
+            if quote == '"' and command.startswith("$(", i) and not _MAIN_PARSE[0] \
+                    and _live_dollar(command, i):
+                # Its body quotes afresh: `"$(echo ")'")"; rm -rf /` (XERK-1621).
+                if substs is None:
+                    substs = {m.start(): m.end() for m in _find_substs(command)}
+                end = substs.get(i, 0)
+                if end > i + 2:
+                    if '"' in command[i:end] or "'" in command[i:end]:
+                        _MAIN_PARSE_SEEN[0] = True
+                    buf.append(command[i + 1:end])
+                    i = end
+                    continue
+            if quote == '"' and command.startswith("${", i) and not _MAIN_PARSE[0] \
+                    and _live_dollar(command, i):
+                # A `"` inside a string's `${…}` nests, never closes the
+                # string: `"${y:-"it's"}"; rm -rf /` read its `'` as an open
+                # quote that hid the `rm` (XERK-1621).
+                close = _brace_end(command, i, True)
+                if close > 0:
+                    buf.append(command[i + 1:close + 1])
+                    i = close + 1
+                    continue
             if ch == quote:
                 quote = None
             i += 1
@@ -2457,6 +2740,14 @@ def _split_on_operators(command: str, include_pipe: bool = True,
             buf.append(ch)
             buf.append(command[i + 1])
             i += 2
+            continue
+        if command.startswith("${", i) and _BRACE_OTHER_SHELL[0] \
+                and _live_dollar(command, i) and _bad_brace(command, i):
+            # Read as dash reads it (see `_bad_brace`, `_brace_end`).
+            close = _brace_end(command, i, False)
+            close = n - 1 if close < 0 else close
+            buf.append(command[i:close + 1])
+            i = close + 1
             continue
         if command.startswith(("$$", "${", "$("), i) and (braces or command[i + 1] in "{$"):
             # `$$` is the PID, so `$${` opens nothing.
@@ -2653,7 +2944,8 @@ def _word_end(s: str, i: int, stop: str | None = None) -> int:
             i = j + 1
             continue
         if s.startswith("${", i):
-            j = _brace_end(s, i)
+            # Quoting is known here; looked up, it is a whole-line scan per `${`.
+            j = _brace_end(s, i, quoted=stop == '"')
         elif s.startswith(("$(", "$["), i):
             j = _word_end(s, i + 2, ")" if s[i + 1] == "(" else "]")
         elif stop == '"':
@@ -2878,6 +3170,76 @@ def _dq_unescaped(text: str) -> tuple[str, list[int]]:
     return "".join(out), at
 
 
+# A bare `(` `)` pair, blanks allowed around and inside: in a simple command it
+# can only be a function header, so `_glue_func_parens` closes it up.
+_FUNC_PARENS_RE = re.compile(r"[ \t]*\([ \t]*\)")
+# A character that may stand in a function name: no blank, operator, quote,
+# expansion or brace.
+_FUNC_NAME_CHARS = re.compile(r"[^\s()<>|&;'\"\\`$={}]")
+
+
+def _glue_func_parens(segment: str) -> str:
+    """``segment`` with every BARE `()` header closed up to `name()`.
+
+    `()` is an operator, so the shell splits `f(){`, `f ( ) {` and `f (){` where
+    shlex does not, and read glued the header hid the body's first word
+    (XERK-1633). It is done on the raw text because shlex drops quoting: joined
+    after it, `rm -rf / '()'` read as a header and hid the `rm` (XERK-1633 QA).
+    Its result is only ever an ADDED reading (see `_expand`): a printed `()`
+    (`` rm -rf /etc `echo '()'` ``) or an extglob `@()` is bare here and is
+    no header to bash, so the unglued text is still read as well.
+    zsh's `f g () { …; }` defines every name before the `()`, so each bare word
+    there becomes a header of its own. `$(`, `<(`, `=(` and `((` stay put."""
+    if "(" not in segment:
+        return segment
+    # `f \<newline>() {` is `f () {` to the shell (XERK-1633 QA).
+    segment = _join_continuations(segment)
+    if not _FUNC_PARENS_RE.search(segment):
+        return segment
+    states = _quote_states(segment)
+
+    def bare(i: int) -> bool:
+        return not states[i] and bool(_FUNC_NAME_CHARS.match(segment[i]))
+
+    out, last = [], 0
+    for m in _FUNC_PARENS_RE.finditer(segment):
+        open_at = segment.index("(", m.start())
+        close_at = m.end() - 1
+        before = segment[m.start() - 1] if m.start() else ""
+        if (before and before in "$<>=(") or segment[close_at + 1:close_at + 2] == ")":
+            continue
+        if states[open_at] or states[close_at] or m.start() < last:
+            continue
+        # The name glued to the `()`, then any further bare names before it.
+        name_at = m.start()
+        while name_at > last and bare(name_at - 1):
+            name_at -= 1
+        names, pos = [], name_at
+        while True:
+            gap = pos
+            while gap > last and segment[gap - 1] in " \t":
+                gap -= 1
+            word = gap
+            while word > last and bare(word - 1):
+                word -= 1
+            if gap == pos or word == gap or (
+                    word > 0 and segment[word - 1] not in " \t\n;&|(){}"):
+                break
+            if segment[word:gap] in _SHELL_KEYWORDS or segment[word:gap] == "function":
+                break
+            names.append(segment[word:gap])
+            pos = word
+        out.append(segment[last:pos])
+        out.extend(name + "() " for name in reversed(names))
+        # Idempotent: a glued header is left as it is, so the reading
+        # `_expand` adds settles in one step.
+        after = segment[m.end():m.end() + 1]
+        out.append(segment[name_at:m.start()] + ("()" if not after or after.isspace() else "() "))
+        last = m.end()
+    out.append(segment[last:])
+    return "".join(out)
+
+
 @functools.lru_cache(maxsize=512)
 def _tokenize_cached(segment: str) -> tuple[str, ...]:
     segment = _join_continuations(segment)
@@ -2928,6 +3290,12 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             out.pop(0)
             if out:
                 out.pop(0)  # the function's name
+            # zsh's `function f g { …; }` names several; drop them up to the
+            # body's opener — only when one follows, or the body's own words go.
+            opener = next((i for i, t in enumerate(out)
+                           if t in ("{", "(") or "()" in t), None)
+            if opener is not None:
+                del out[:opener]
             continue
         if head in _WORDLIST_HEADS:
             out.pop(0)
@@ -3028,7 +3396,7 @@ def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
     unwrapped = _unwrap_group(body).strip()
     segments = (_split_segments(unwrapped) if "#" in unwrapped or _SEGMENT_SPLIT.search(unwrapped)
                 else [unwrapped] if unwrapped else [])
-    printed = _body_printed(body, _SPLICE_RAW[0])[0]
+    printed = _body_printed(body, _reading())[0]
     # One echo/printf prints its words; `echo …; true` does not print `; true`.
     if printed is not None and len(segments) == 1:
         return [printed]
@@ -3342,7 +3710,57 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
 
     Assigned values are read as before XERK-1609, and once more as several
     statements print them when that differs (`_assigned_values`), and once
-    per taint reading the values have (`_value_taint_readings`)."""
+    per taint reading the values have (`_value_taint_readings`).
+
+    A name assigned more than once is also read with each value on its own
+    (`_picked`), a reading per value: which assignment a use sees is order
+    and control flow, and joined they run only the first (XERK-1621).
+
+    A `'` in a string's `${…}` splits the line differently in bash than in
+    zsh or dash (`_quote_states`), so a line holding one is read both ways."""
+    out = _expand_picks(command)
+    if _BRACE_OTHER_SEEN[0]:
+        _BRACE_OTHER_SHELL[0] = True
+        try:
+            out = out + _expand_picks(command)
+        finally:
+            _BRACE_OTHER_SHELL[0] = False
+    if _MAIN_PARSE_SEEN[0] or _BRACE_OTHER_SEEN[0]:
+        _MAIN_PARSE[0] = True
+        try:
+            out = out + _expand_values(command)
+        finally:
+            _MAIN_PARSE[0] = False
+    return out
+
+
+def _expand_picks(command: str) -> list[tuple[list[str], str]]:
+    """`_expand_values`, and once per value of a name assigned more than once
+    (see `_expand_both`)."""
+    out = _expand_values(command)
+    most = _VALUES_MOST[0]
+    # Assignments are capped, and so are the readings applied defaults add:
+    # each is a whole-line expansion, and 16 names × 16 `x=${D:-…}` ran 30s.
+    if _VALUES_ASSIGNED[0] > _MAX_VALUE_READINGS or most > _MAX_VALUE_PASSES:
+        # Recorded on the decision, as a spent budget is: `decide` must
+        # refuse it whichever reason it meets first (see there).
+        if _budget is not None:
+            _budget["capped"] = True
+        return out + [([_TOO_LARGE], command)]
+    for k in range(most if most > 1 else 0):
+        _VALUE_PICK[0] = k
+        try:
+            out = out + _expand_values(command)
+        finally:
+            _VALUE_PICK[0] = None
+    return out
+
+
+def _expand_values(command: str) -> list[tuple[list[str], str]]:
+    """`_expand_raw_too`, and again with values read as several statements
+    print them, and per taint reading, when those differ (see `_expand_both`).
+    Per value too: on the all-values pass alone, `a=true; a=$(false || echo
+    rm … | grep .); $a` never read the tainted value as the program."""
     out = _expand_raw_too(command)
     if _VALUES_DIFFER[0]:
         _VALUES_MULTI[0] = True
@@ -3681,7 +4099,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     for body in bodies:
         if not _SEGMENT_SPLIT.search(body):
             continue
-        printed, escaped = _body_printed(body, _SPLICE_RAW[0])
+        printed, escaped = _body_printed(body, _reading())
         _SPLICES_ESCAPED[0] += escaped
         if printed and "$(" not in printed and "`" not in printed:
             for whole in ("$(" + body + ")", "`" + body + "`"):
@@ -3814,11 +4232,27 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 # ...and with its substitutions run: tokenising first split a
                 # nested backtick at its escaped inner opener (XERK-1605).
                 _feed(_printed_text(_sub_substs(seg, _subst_text)) or "")
+                # ...and with an unknown one glued to its program read as
+                # empty: `$(true)echo rm -rf / | sh` runs `echo` (XERK-1621).
+                if "$(" in seg or "`" in seg:
+                    _feed(_printed_text(_sub_substs(
+                        seg, lambda m: _subst_text(m, glued_empty=True))) or "")
                 for hs in _herestrings(seg):
                     _feed(hs)
     for raw in segments:
         if every_cd != cwds:
             cwds = _cd_readings(raw, cwds)
+        # Function headers closed up (`f ( ) {` → `f() {`), as one more ADDED
+        # reading: in place, an extglob `@()`, or a `()` the guard itself
+        # splices in from a printed `` `echo '()'` ``, read as a header and hid
+        # the command before it. Off the RAW segment, before any substitution
+        # is spliced in, and per segment: re-reading the whole line doubled
+        # the work at every nesting level (XERK-1633 QA).
+        glued = _glue_func_parens(raw)
+        if glued != raw:
+            _spend(len(raw))
+            out.extend(_expand_segments(
+                glued, depth if _glue_func_parens(glued) == glued else depth + 1, cwds))
         if suspect:
             # The group scan lost track, so a body it should have found may
             # sit here split in half (see _balanced_groups): classify the
@@ -5910,7 +6344,12 @@ def decide(
         return ("allow", None, None)
 
     reason = is_destructive(command)
-    if _budget["left"] < 0:
+    # A line too large to read is never grantable: a spent budget, or a cap
+    # on readings (`_expand_picks`). Past a cap the policy checks below see
+    # none of the per-value readings, so a grant let `x=ls; <17 x=…>;
+    # x="gh pr merge 1"; $x` through (XERK-1621 QA) — checked here and again
+    # last, since a grantable reason found first returns before the cap.
+    if _budget["left"] < 0 or _budget["capped"] or reason == _TOO_LARGE_REASON:
         return ("deny", _TOO_LARGE_REASON, "policy")
     if reason and not command_overridden(command, overrides):
         return ("deny", reason, "destructive")
@@ -5935,7 +6374,8 @@ def decide(
     # above saw nothing. A granted reason found before any expansion (a heredoc
     # fed to psql, a fork bomb) let it run out inside them, and `gh pr merge`
     # through — so it is checked here, last, as well as before the grant.
-    if _budget["left"] < 0:
+    # Likewise a cap on readings.
+    if _budget["left"] < 0 or _budget["capped"]:
         return ("deny", _TOO_LARGE_REASON, "policy")
     return ("allow", None, None)
 
