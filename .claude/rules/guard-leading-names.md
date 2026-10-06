@@ -29,6 +29,8 @@ paths:
   `find -exec sh -c` and functions, where reading them empty denied the common idiom.
 - Only the LEADING run is read empty. `"$a/$b"/*` (→ `//*`) is open: reading later
   components empty would deny the everyday `rm -rf "$dir/$f"` (decision pending, XERK-1652).
+- The rest is judged with `trailing=False`: XERK-1623's trailing-name reading on top would
+  read `"$TMP/$x"` as `/` — the both-ends case XERK-1652 owns.
 - Cost, measured: 0 new denies over a 35.7k-command real corpus replay vs main.
 - Tests: `test_an_unset_name_leading_a_target_is_read_empty`,
   `test_leading_names_are_one_run_and_scan_linearly`.

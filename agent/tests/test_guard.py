@@ -3064,6 +3064,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # reads `/out`, an ordinary root child, and stays allowed.
         for cmd in ("rm -rf $x/etc", 'rm -rf "$x"/etc', "rm -rf ${x}/usr", "rm -rf ${x}${y}/etc",
                     'rm -rf "$STEAMROOT/"*', 'rm -rf "$dir"/*', "rm -rf $x/", 'rm -rf "$x"/home',
+                    'rm -rf "$out"/.',
                     'chmod -R 777 "$x"/etc', 'chown -R me "$x"/usr',
                     # The name is found before normpath folds `$x/..` away.
                     'rm -rf "$x"/../etc', "rm -rf $x/a/../../etc", 'rm -rf "$x"/../*', "rm -rf $x/..",
@@ -3077,6 +3078,9 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$build"/out', "rm -rf $x/tmp/foo", 'rm -rf "$d".bak',
+                    # The rest is read as written, never with XERK-1623's trailing names
+                    # dropped too: `"$a/$b"` read fully empty is XERK-1652's call.
+                    'rm -rf "$TMP/$x"', 'rm -rf "$x"/$y/',
                     'rm -rf "$x"*', "rm -rf $HOME/etc", "rm -rf $PWD/usr", "rm -rf ${HOME%/}/etc",
                     'rm -rf ./"$x"/etc', 'rm -rf "./$x/etc"', "rm -rf ${#x}/etc",
                     # Assigned, defaulted or `:?`-guarded names are never empty.
@@ -3239,14 +3243,15 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'rm -rf /etc${x:-"${y}"}'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
-        # A harmless prefix, a whole-word or LEADING name, a default that prints
+        # A harmless prefix, a whole-word name, a leading one before a plain path
+        # (a leading one before `/*` or `/.` is XERK-1639's), a default that prints
         # text, a length, and a tilde prefix bash leaves unexpanded (`~$USER`).
         for cmd in ("rm -rf /tmp/build$x", 'rm -rf "$d"', 'rm -rf "$dir"/build',
                     "rm -rf build$x", "rm -rf ./$x", 'rm -rf "$TMP/$x"',
                     "rm -rf /${DIR:-build}", "rm -rf /etc${x:-foo}", "rm -rf /etc${#x}",
                     "rm -rf ~$USER", "rm -rf ~$USER/build", "d=build; rm -rf /tmp/$d",
-                    "rm -f /etc$x", 'rm -rf ./"${name}".git', "rm -rf /$x/build", "rm -rf build$x.bak", 'rm -rf "$out"/.',
-                    'rm -rf "$dir"/*', "rm -rf /tmp/$x/*", "rm -rf build$x*.bak",
+                    "rm -f /etc$x", 'rm -rf ./"${name}".git', "rm -rf /$x/build", "rm -rf build$x.bak",
+                    "rm -rf /tmp/$x/*", "rm -rf build$x*.bak",
                     "rm -rf ./$x*.log", "rm -rf /tmp/$x*foo"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")

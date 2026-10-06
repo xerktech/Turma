@@ -5138,8 +5138,8 @@ def _trailing_unset_dropped(tok: str) -> str | None:
     return "".join(pieces)
 
 
-def _is_dangerous_path(tok: str) -> bool:
-    dropped = _trailing_unset_dropped(tok)
+def _is_dangerous_path(tok: str, trailing: bool = True) -> bool:
+    dropped = _trailing_unset_dropped(tok) if trailing else None
     if dropped is not None and _is_dangerous_path(dropped):
         return True
     raw = _norm_path(tok)
@@ -5298,7 +5298,9 @@ def _dangerous_target(tok: str) -> str | None:
         return f"({tok!r})"
     raw = tok.strip().strip('"').strip("'")
     end = _leading_names_end(raw)
-    if end and _is_dangerous_path(raw[end:]):
+    # The rest is judged as written: reading its trailing names empty as well
+    # (XERK-1623) would read `"$TMP/$x"` as `/`, a call XERK-1652 owns.
+    if end and _is_dangerous_path(raw[end:], trailing=False):
         return f"({tok!r}, which is {_norm_path(raw[end:])!r} when {raw[:end]} is unset)"
     return None
 
