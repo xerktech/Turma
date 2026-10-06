@@ -15,5 +15,13 @@ paths:
   assigned name empty — that denied ordinary `d=$(mktemp -d); rm -rf "$d"/*`.
 - `$HOME`/`$PWD` are never read empty (always set); a name not directly before `/` is left
   alone (`"$x"*`, `"$d".bak` stay relative).
+- Match the names on the token BEFORE `_norm_path`: normpath folds `"$x"/../etc` to `etc`
+  and hid the bypass; the remainder is normalised by `_is_dangerous_path` itself.
+- A `${…}` with an operator is empty too (`"${dir%/}"/*`, `${x:+$x}`); only a length
+  (`${#x}`) or a non-empty default/error (`${x:-a}`, `${x:?}`) is never empty.
+- Positionals (`$0`-`$9`, `$@`, `$*`) are left out: bound in `bash -c '…' _ /tmp/x`,
+  `find -exec sh -c` and functions, where reading them empty denied the common idiom.
+- Only the LEADING run is read empty. `"$a/$b"/*` (→ `//*`) is open: reading later
+  components empty would deny the everyday `rm -rf "$dir/$f"` (decision pending, XERK-1652).
 - Cost, measured: 0 new denies over a 35.7k-command real corpus replay vs main.
 - Tests: `test_an_unset_name_leading_a_target_is_read_empty`.

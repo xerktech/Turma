@@ -3062,16 +3062,28 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # XERK-1639: bash reads an unset leading name as empty, so `"$x"/etc`
         # deletes /etc. Only a protected remainder denies: `"$build"/out`
         # reads `/out`, an ordinary root child, and stays allowed.
-        for cmd in ("rm -rf $x/etc", 'rm -rf "$x"/etc', "rm -rf ${x}/usr", "rm -rf $1/var/lib",
+        for cmd in ("rm -rf $x/etc", 'rm -rf "$x"/etc', "rm -rf ${x}/usr", "rm -rf ${x}${y}/etc",
                     'rm -rf "$STEAMROOT/"*', 'rm -rf "$dir"/*', "rm -rf $x/", 'rm -rf "$x"/home',
-                    "rm -rf $a$b/etc", 'chmod -R 777 "$x"/etc', 'chown -R me "$x"/usr'):
+                    'chmod -R 777 "$x"/etc', 'chown -R me "$x"/usr',
+                    # The name is found before normpath folds `$x/..` away.
+                    'rm -rf "$x"/../etc', "rm -rf $x/a/../../etc", 'rm -rf "$x"/../*', "rm -rf $x/..",
+                    # An operator leaves it empty too, unless it supplies a word.
+                    'rm -rf "${dir%/}"/*', 'rm -rf "${STEAMROOT%/}/"*', "rm -rf ${x#./}/etc",
+                    "rm -rf ${x:+$x}/etc", "rm -rf ${x/a/b}/etc", "rm -rf ${x:0:3}/etc",
+                    "rm -rf ${!x}/etc", "rm -rf ${x[0]}/etc", "rm -rf ${x[@]}/etc", "rm -rf ${x:-}/etc"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$build"/out', "rm -rf $x/tmp/foo", 'rm -rf "$d".bak',
-                    'rm -rf "$x"*', "rm -rf $HOME/etc", "rm -rf $PWD/usr",
+                    'rm -rf "$x"*', "rm -rf $HOME/etc", "rm -rf $PWD/usr", "rm -rf ${HOME%/}/etc",
+                    'rm -rf ./"$x"/etc', 'rm -rf "./$x/etc"', "rm -rf ${#x}/etc",
                     # Assigned, defaulted or `:?`-guarded names are never empty.
                     "x=/tmp; rm -rf $x/etc", 'd=$(mktemp -d); rm -rf "$d"/*',
-                    'rm -rf "${x:-/tmp}"/etc', 'rm -rf "${x:?}"/etc', 'chmod -R 755 "$x"/out'):
+                    'rm -rf "${x:-/tmp}"/etc', "rm -rf ${x:-a}/etc", 'rm -rf "${x:?}"/etc',
+                    'chmod -R 755 "$x"/out',
+                    # Positionals are often bound where the guard cannot see it.
+                    "rm -rf $0/etc", "bash -c 'rm -rf \"$1\"/*' _ /tmp/x",
+                    "find /tmp/x -type d -exec sh -c 'rm -rf \"$1\"/*' _ {} \\;",
+                    'clean() { rm -rf "$1"/*; }; clean /tmp/build'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 

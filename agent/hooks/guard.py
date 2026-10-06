@@ -5217,24 +5217,42 @@ def _is_home_ssh(tok: str) -> bool:
 # A target that STARTS with names: by here every name this line assigns or
 # defaults is substituted, so these are unknown, and bash reads an unset one as
 # empty — `rm -rf "$x"/etc` deletes /etc (XERK-1639). Only a name directly
-# before a `/` counts, so `"$x"*` and `"$x".bak` stay relative.
-_LEADING_NAMES_RE = re.compile(r"^(?:\$(?:[A-Za-z_]\w*|[0-9]|\{(?:[A-Za-z_]\w*|[0-9]+)\}))+(?=/)")
+# before a `/` counts, so `"$x"*` and `"$x".bak` stay relative. A `${…}` with an
+# operator is empty too (`"${dir%/}"/*`, `${x:+$x}/etc`), unless it is a length
+# or supplies a non-empty default or error (`${x:-a}`, `${x:?}`).
+_LEADING_NAME_RE = re.compile(r"\$(?:([A-Za-z_]\w*)|\{!?([A-Za-z_]\w*)(\[[^\]{}]*\])?([^{}]*)\})")
+_NEVER_EMPTY_OP_RE = re.compile(r"^:?[-=]\S|^:?\?")
 # Set in every shell an agent runs, so never read empty: `$HOME/.cache` is not `/.cache`.
+# Positionals (`$1`, `$@`) are left out on purpose: inside `bash -c '…' _ /tmp/x`,
+# `find -exec sh -c` or a function they are bound, which this check cannot see.
 _ALWAYS_SET_NAMES = {"HOME", "PWD"}
+
+
+def _leading_names_end(raw: str) -> int:
+    """Where the run of possibly-empty names opening ``raw`` ends, if a `/`
+    follows it, else 0."""
+    pos = 0
+    while m := _LEADING_NAME_RE.match(raw, pos):
+        name = m.group(1) or m.group(2)
+        if name in _ALWAYS_SET_NAMES or (m.group(4) and _NEVER_EMPTY_OP_RE.match(m.group(4))):
+            return 0
+        pos = m.end()
+    return pos if raw.startswith("/", pos) else 0
 
 
 def _dangerous_target(tok: str) -> str | None:
     """Why ``tok`` names a protected path, or None. Besides the target as
     written, its leading unknown names are read as empty, but that reading is
     judged by `_is_dangerous_path` like any other: `"$build"/out` reads `/out`,
-    an ordinary root child, and stays allowed (owner decision on XERK-1639)."""
+    an ordinary root child, and stays allowed (owner decision on XERK-1639).
+    The names are found before `_norm_path`, whose normpath folds `$x/../etc`
+    into `etc` and `./$x/etc` into `$x/etc`."""
     if _is_dangerous_path(tok):
         return f"({tok!r})"
-    m = _LEADING_NAMES_RE.match(_norm_path(tok))
-    if m and not _ALWAYS_SET_NAMES & set(re.findall(r"\w+", m.group(0))):
-        rest = _norm_path(tok)[m.end():]
-        if _is_dangerous_path(rest):
-            return f"({tok!r}, which is {rest!r} when {m.group(0)} is unset)"
+    raw = tok.strip().strip('"').strip("'")
+    end = _leading_names_end(raw)
+    if end and _is_dangerous_path(raw[end:]):
+        return f"({tok!r}, which is {_norm_path(raw[end:])!r} when {raw[:end]} is unset)"
     return None
 
 
