@@ -3070,7 +3070,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # An operator leaves it empty too, unless it supplies a word.
                     'rm -rf "${dir%/}"/*', 'rm -rf "${STEAMROOT%/}/"*', "rm -rf ${x#./}/etc",
                     "rm -rf ${x:+$x}/etc", "rm -rf ${x/a/b}/etc", "rm -rf ${x:0:3}/etc",
-                    "rm -rf ${!x}/etc", "rm -rf ${x[0]}/etc", "rm -rf ${x[@]}/etc", "rm -rf ${x:-}/etc"):
+                    "rm -rf ${!x}/etc", "rm -rf ${x[0]}/etc", "rm -rf ${x[@]}/etc", "rm -rf ${x:-}/etc",
+                    # A nested `${…}` is one expansion, and an all-names default is empty too.
+                    'rm -rf "${x:+${y}}"/etc', 'rm -rf "${x:-${y}}"/etc', 'rm -rf "${x:-"${y}"}"/etc',
+                    'rm -rf "${x:-${y%/}}"/etc', "rm -rf ${x:+${y}}/*", 'rm -rf "${y}${x:+${y}}"/etc'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$build"/out', "rm -rf $x/tmp/foo", 'rm -rf "$d".bak',
@@ -3079,6 +3082,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # Assigned, defaulted or `:?`-guarded names are never empty.
                     "x=/tmp; rm -rf $x/etc", 'd=$(mktemp -d); rm -rf "$d"/*',
                     'rm -rf "${x:-/tmp}"/etc', "rm -rf ${x:-a}/etc", 'rm -rf "${x:?}"/etc',
+                    "rm -rf ${x-a}/etc", "rm -rf ${x:=a}/etc", 'rm -rf "${x:-${y}/b}"/etc',
                     'chmod -R 755 "$x"/out',
                     # Positionals are often bound where the guard cannot see it.
                     "rm -rf $0/etc", "bash -c 'rm -rf \"$1\"/*' _ /tmp/x",
@@ -3086,6 +3090,15 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'clean() { rm -rf "$1"/*; }; clean /tmp/build'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_leading_names_are_one_run_and_scan_linearly(self):
+        # XERK-1639: every name in the run is read empty, not just the first,
+        # and an unclosed `${` stops the scan instead of backtracking (QA).
+        self.assertEqual(guard._leading_names_end("$a${b%/}/etc"), len("$a${b%/}"))
+        self.assertEqual(guard._leading_names_end("$a${b:-c}/etc"), 0)
+        start = time.monotonic()
+        self.assertEqual(guard._leading_names_end("${" + "a" * 200000), 0)
+        self.assertLess(time.monotonic() - start, 1)
 
     def test_a_sibling_or_an_empty_expansion_does_not_hide_the_command(self):
         # XERK-1615: a sibling substitution printing a quote decided the one

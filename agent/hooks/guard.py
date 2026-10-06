@@ -5220,23 +5220,50 @@ def _is_home_ssh(tok: str) -> bool:
 # before a `/` counts, so `"$x"*` and `"$x".bak` stay relative. A `${…}` with an
 # operator is empty too (`"${dir%/}"/*`, `${x:+$x}/etc`), unless it is a length
 # or supplies a non-empty default or error (`${x:-a}`, `${x:?}`).
-_LEADING_NAME_RE = re.compile(r"\$(?:([A-Za-z_]\w*)|\{!?([A-Za-z_]\w*)(\[[^\]{}]*\])?([^{}]*)\})")
-_NEVER_EMPTY_OP_RE = re.compile(r"^:?[-=]\S|^:?\?")
+_PLAIN_NAME_RE = re.compile(r"\$([A-Za-z_]\w*)")
+# The name opening a `${…}` body: `x`, `!x`, `x[0]`. A `#` (length) never matches.
+_BRACED_NAME_RE = re.compile(r"!?([A-Za-z_]\w*)(?:\[[^\]{}]*\])?")
+_EXPANSIONS_RE = re.compile(r"\$\{[^{}]*\}|\$[A-Za-z_]\w*")
 # Set in every shell an agent runs, so never read empty: `$HOME/.cache` is not `/.cache`.
 # Positionals (`$1`, `$@`) are left out on purpose: inside `bash -c '…' _ /tmp/x`,
 # `find -exec sh -c` or a function they are bound, which this check cannot see.
 _ALWAYS_SET_NAMES = {"HOME", "PWD"}
 
 
+def _only_expansions(word: str) -> bool:
+    """True if ``word`` is nothing but quotes, blanks and names, so it can be
+    empty too: the default in `${x:-${y}}` or `${x:-"$y"}`."""
+    word = word.replace('"', "").replace("'", "")
+    for _ in range(16):  # one pass per nesting level; deeper reads as empty
+        word, n = _EXPANSIONS_RE.subn("", word)
+        if not n:
+            break
+    return not word.strip()
+
+
 def _leading_names_end(raw: str) -> int:
     """Where the run of possibly-empty names opening ``raw`` ends, if a `/`
-    follows it, else 0."""
+    follows it, else 0. A `${…}` is closed by `_brace_end`, so a nested one
+    (`${x:+${y}}`) is one expansion, and an unclosed one stops the scan."""
     pos = 0
-    while m := _LEADING_NAME_RE.match(raw, pos):
-        name = m.group(1) or m.group(2)
-        if name in _ALWAYS_SET_NAMES or (m.group(4) and _NEVER_EMPTY_OP_RE.match(m.group(4))):
+    while raw.startswith("$", pos):
+        if m := _PLAIN_NAME_RE.match(raw, pos):
+            name, op, end = m.group(1), "", m.end()
+        elif raw.startswith("${", pos):
+            close = _brace_end(raw, pos)
+            head = _BRACED_NAME_RE.match(raw, pos + 2, close) if close > 0 else None
+            if head is None:
+                return 0
+            name, op, end = head.group(1), raw[head.end():close], close + 1
+        else:
             return 0
-        pos = m.end()
+        if name in _ALWAYS_SET_NAMES:
+            return 0
+        # `?` errors and a default or assigned word is used; only an empty one leaves it empty.
+        body = op[1:] if op.startswith(":") else op
+        if body[:1] == "?" or (body[:1] in ("-", "=") and not _only_expansions(body[1:])):
+            return 0
+        pos = end
     return pos if raw.startswith("/", pos) else 0
 
 
