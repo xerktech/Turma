@@ -1302,6 +1302,29 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_an_assigned_substitution_in_a_script_xargs_find_or_proc_subst_runs(self):
+        # XERK-1649: each ran `rm -rf /etc` while the guard allowed it.
+        R = self.R
+        for cmd in (f"xargs bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"xargs -I{{}} bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"xargs -0 sh -c 'a=`echo {R}`; $a' <<< x",
+                    f"nohup xargs bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"find . -maxdepth 0 -exec bash -c 'a=$(echo {R}); $a' \\;",
+                    f"find . -execdir sh -c 'a=`echo {R}`; $a' \\;",
+                    f"bash <(echo 'a=$(echo {R}); $a')", f"source <(echo 'a=$(echo {R}); $a')",
+                    f". <(printf '%s' 'a=$(echo {R}); $a')",
+                    f"cat <(echo 'a=$(echo {R}); $a') | bash",
+                    f'bash -c "a=\\`echo {R}\\`; \\$a"',
+                    f'xargs bash -c "a=\\`echo {R}\\`; \\$a" <<< x'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("xargs bash -c 'a=$(echo hi); echo $a' <<< x",
+                    "find . -exec bash -c 'x=$(basename {}); echo $x' \\;",
+                    "find . -name '*.py' -exec sh -c 'n=$(wc -l < \"$1\"); echo $n' _ {} \\;",
+                    "bash <(echo 'a=$(date); echo $a')", 'bash -c "a=\\`date\\`; echo \\$a"'):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_relative_rm_after_cd_into_a_root_names_that_root(self):
         for cmd in ("cd / && rm -rf *", "cd /; rm -rf *", "cd /etc; rm -rf ./*",
                     "cd /usr && rm -r lib", "cd ~ && rm -rf *", "cd; rm -rf *",

@@ -37,6 +37,10 @@ paths:
 - **A shell `-c` script holding `$(`/backtick is ALSO re-read with every substitution left raw**
   (XERK-1622): the inner shell runs it, so `bash -c 'a=$(echo rm …); $a'` assigns the output whole;
   the outer splice made it `a=rm …; $a`, where `$a` is just `rm`. Added, never swapped.
+- **The same raw reading covers every route a script text arrives by** (XERK-1649): a `-c`
+  script an `xargs`/`find -exec` runs (`_raw_shell_c_scripts`, which also unescapes a double-
+  quoted `\``), and a `<(echo …)` body's printed text with its quoted `$(…)` unspliced
+  (`_proc_subst_texts`). A new script route needs this reading too, or `a=$(…); $a` hides there.
 - **Values bound outside `NAME=` reach `$name` too** (XERK-1622, `_assigned_values`): a `for` list
   is read in whole dequoted words (`"$(echo rm …)"` is one), and `read NAMES <<< WORD` binds them
   as bash splits it — a word each, the last the remainder (`_reader_values`); every name gets

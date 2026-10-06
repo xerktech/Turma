@@ -3989,6 +3989,13 @@ def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
     printed = _body_printed(body, _reading())[0]
     # One echo/printf prints its words; `echo …; true` does not print `; true`.
     if printed is not None and len(segments) == 1:
+        # ...and, a quoted `$(…)` in them left as written: the reader runs it,
+        # so `bash <(echo 'a=$(echo rm -rf /); $a')` assigns its output whole,
+        # where the spliced text bound `a=rm` (XERK-1649).
+        kept = _printed_text(unwrapped) if "$(" in unwrapped or "`" in unwrapped else None
+        if kept and kept != printed and ("$(" in kept or "`" in kept):
+            _spend(len(kept))
+            return [printed, kept]
         return [printed]
     if depth >= _MAX_EXPAND_DEPTH:
         return []
@@ -4560,6 +4567,33 @@ def _shell_c_script(rest: list[str]) -> str | None:
     if i < len(rest) and rest[i] == "--":
         i += 1
     return rest[i] if i < len(rest) else None
+
+
+def _raw_shell_c_scripts(kept: list[str]) -> list[str]:
+    """Each `-c` script in a segment's unspliced words: the segment's own shell,
+    or one an `xargs` or `find -exec` runs (XERK-1649). A double-quoted script's
+    escaped backticks are live to the shell it reaches, so `bash -c "a=\\`…\\`"`
+    is read with them unescaped too: shlex keeps that `\\` where bash drops it."""
+    if not kept:
+        return []
+    prog = _basename(kept[0])
+    if prog in _SHELL_PROGS:
+        starts = [0]
+    elif prog in ("xargs", "find"):
+        starts = [i for i in range(1, len(kept)) if _basename(kept[i]) in _SHELL_PROGS]
+    else:
+        return []
+    out = []
+    for i in starts:
+        script = _shell_c_script(kept[i + 1:])
+        if script is None:
+            continue
+        out.append(script)
+        plain = script.replace("\\`", "`")
+        if plain != script:
+            _spend(len(plain))
+            out.append(plain)
+    return out
 
 
 def _find_roots(tokens: list[str]) -> list[str]:
@@ -5852,12 +5886,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # script runs its own `$(…)`, so `bash -c 'a=$(echo rm -rf /); $a'`
         # assigns the output whole; spliced in by the outer read it became
         # `a=rm -rf /; $a`, where `$a` is just `rm` (XERK-1622).
+        # The same script handed over by `xargs` or `find -exec` (XERK-1649).
         if "$(" in raw or "`" in raw:
             kept = _strip_prefixes(_tokenize(_unwrap_group(raw)))
-            script = _shell_c_script(kept[1:]) if kept and _basename(kept[0]) in _SHELL_PROGS else None
-            if script and ("$(" in script or "`" in script):
-                for reading in _script_readings(script):
-                    out.extend(_expand_segments(reading, depth + 1, every_cd))
+            for script in _raw_shell_c_scripts(kept):
+                if "$(" in script or "`" in script:
+                    for reading in _script_readings(script):
+                        out.extend(_expand_segments(reading, depth + 1, every_cd))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
             if _SEGMENT_SPLIT.search(seg):
