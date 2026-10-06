@@ -17,7 +17,10 @@ paths:
     splices lost `x=$(echo true; echo rm …); eval "$x"`, which the split reading catches.
   - Only the segments that differ are added (as `printed_line` does). Re-expanding the whole line
     re-read every nested body once per level: 0.5s → 17s at 5 levels.
-  - Memoised (`lru_cache`): `_expand` calls it on the same line many times per decision.
+  - Memoised per READING (`_unsplit_cuts_at`, keyed on `_reading()`, cleared per decision):
+    `_brace_end` parses a `${…}` per shell, and a cut cached under bash's hid dash's.
+  - `_word_end` passes its known quoting to `_brace_end`; looked up, that is a whole-line
+    `_quote_states` per `${` — quadratic.
   - The cut line's pipelines feed the pipe-to-shell scan too (`echo 'X=${v:-a b} rm …' | bash`).
 - A standalone assignment (`R=$(command -v ruff); $R format`) is never cut: it sets the shell's
   variable, and cutting it read `$R` empty — a false deny.
@@ -26,9 +29,11 @@ paths:
 - After a `_PREFIX_WORDS` wrapper, EVERY assignment-shaped word to the end of the command is cut:
   env/sudo run them, and a flag's value (`env -u N`, `timeout -s KILL 5`, `coproc N {`) would
   otherwise end command-start. Over-cutting an argument is safe: the reading is only added.
+- `function NAME` keeps command-start: its `{` body opens a command (`function f { X=… cmd; }`).
 - Quoted strings are scanned as scripts (`bash -c '…'`, `eval '…'`), since the outer `${v:-a b}`
   splice reaches the script before its re-parse does. A `"…"` script is read with its escapes
-  removed (`bash -c "X=\$((1 + 2)) …"`) and each cut mapped back (`_dq_unescaped`).
+  removed (`bash -c "X=\$((1 + 2)) …"`) and each cut mapped back (`_dq_unescaped`). A script
+  spread over several quoted pieces (`sh -c 'X=…"'"'"'…'`) is dequoted and cut whole.
 - A shell-fed heredoc script is cut BEFORE `_substitute_vars`, for the same reason. Nested heredocs
   that each need a cut double the cost per level (accepted: the deadline denies). Never add a flag
   that skips the nested cut: a heredoc needing its cut then hid the next one.

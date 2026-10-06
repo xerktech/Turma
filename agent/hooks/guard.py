@@ -1461,7 +1461,7 @@ _BACKTICK_UNESCAPE_RE = re.compile(r"\\([\\`$])")
 
 
 def _find_substs(text: str) -> list[_Subst]:
-    """The outermost `$(…)`, `<(…)`, `>(…)` and backtick substitutions in
+    r"""The outermost `$(…)`, `<(…)`, `>(…)` and backtick substitutions in
     ``text``, escaped or not, each with the body bash would run.
 
     `_SUBST_RE` cannot nest, so `\\$( (echo rm -rf /etc) )` matched nothing
@@ -1644,6 +1644,7 @@ def _budgeted(fn):
         _closers.cache_clear()
         _body_printed.cache_clear()
         _body_tainted_at.cache_clear()
+        _unsplit_cuts_at.cache_clear()
         try:
             return fn(*args, **kwargs)
         finally:
@@ -3027,7 +3028,6 @@ def _prefix_assignment_end(s: str, i: int) -> int:
     return _word_end(s, j + 1)
 
 
-@functools.lru_cache(maxsize=64)
 def _unsplit_assignments(command: str, depth: int = 0) -> str:
     out, last = [], 0
     for start, end, name in _unsplit_cuts(command, depth):
@@ -3037,8 +3037,15 @@ def _unsplit_assignments(command: str, depth: int = 0) -> str:
     return "".join(out)
 
 
-@functools.lru_cache(maxsize=64)
 def _unsplit_cuts(command: str, depth: int = 0) -> tuple[tuple[int, int, str], ...]:
+    """`_unsplit_cuts_at` under the current reading: `_brace_end` parses a
+    `${…}` per reading, so a cut cached under bash's hid dash's (XERK-1620 QA)."""
+    return _unsplit_cuts_at(command, depth, _reading())
+
+
+@functools.lru_cache(maxsize=64)
+def _unsplit_cuts_at(command: str, depth: int,
+                     reading: tuple) -> tuple[tuple[int, int, str], ...]:
     """``command`` with each assignment word that prefixes a command, and that
     holds an unquoted blank or operator character, cut down to its `NAME=`.
 
@@ -3111,6 +3118,14 @@ def _unsplit_cuts(command: str, depth: int = 0) -> tuple[tuple[int, int, str], .
                 wrapped = True
                 cuts += pending
                 pending = []
+            elif at_start and word == "function":
+                # `function f { X=… cmd; }`: the name is no command; the
+                # body's `{` opens one (XERK-1620 QA).
+                j = end
+                while j < n and command[j] in " \t":
+                    j += 1
+                i = max(_word_end(command, j), j)
+                continue
             elif word not in _PREFIX_KEYWORDS:
                 at_start = False
                 cuts += pending
@@ -3152,7 +3167,18 @@ def _unquoted_text(word: str) -> str:
 
 
 def _unsplit_quoted(command: str, i: int, end: int, depth: int) -> list[tuple[int, int, str]]:
-    """Cuts inside each `'…'`/`"…"` script in the word ``command[i:end]``."""
+    """Cuts inside each `'…'`/`"…"` script in the word ``command[i:end]``.
+
+    A script spread over several quoted pieces (`sh -c 'X=…"'"'"'…'`) is cut
+    whole: dequoted, and the word replaced by its cut text in one `'…'`.
+    Each piece alone may not close, and nothing is cut (XERK-1620 QA)."""
+    word = command[i:end]
+    if "=" in word and len(re.findall(r"['\"]", word)) > 2:
+        script = _bash_dequoted(word)
+        if script is not None:
+            cut = _unsplit_assignments(script, depth + 1)
+            if cut != script:
+                return [(i, end, shlex.quote(cut))]
     cuts = []
     while i < end:
         ch = command[i]
@@ -3182,6 +3208,37 @@ def _unsplit_quoted(command: str, i: int, end: int, depth: int) -> list[tuple[in
                          for start, stop, name in _unsplit_cuts(inner, depth + 1)]
         i = close + 1
     return cuts
+
+
+def _bash_dequoted(word: str) -> str | None:
+    """The one word ``word`` is to bash, quotes removed, or None if it is not
+    one plain word. Not shlex: shlex keeps the `\\` of `"\\$((…))"`, which
+    bash drops, and that hid the assignment behind it (XERK-1620 QA)."""
+    out, i, n = [], 0, len(word)
+    while i < n:
+        ch = word[i]
+        if ch == "\\":
+            if word[i + 1:i + 2] != "\n":  # a `\<newline>` continues the line
+                out.append(word[i + 1:i + 2])
+            i += 2
+        elif ch == "'":
+            close = word.find("'", i + 1)
+            if close < 0:
+                return None
+            out.append(word[i + 1:close])
+            i = close + 1
+        elif ch == '"':
+            close = _word_end(word, i + 1, '"')
+            if close < 0:
+                return None
+            out.append(_dq_unescaped(word[i + 1:close])[0])
+            i = close + 1
+        elif ch in " \t\n" or word.startswith("$'", i) or word.startswith('$"', i):
+            return None
+        else:
+            out.append(ch)
+            i += 1
+    return "".join(out)
 
 
 def _dq_unescaped(text: str) -> tuple[str, list[int]]:
