@@ -1731,7 +1731,8 @@ def _memo(kind: str, key, fn, *args):
     splices it counted, which is what makes `_expand_both` take its raw pass."""
     memo = _budget[kind]
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
-           _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0])
+           _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0],
+           _FOR_PICK[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -1800,6 +1801,103 @@ _VAR_ASSIGN_RE = re.compile(
 _ASSIGN_WORD_RE = re.compile(_ASSIGN_WORD)
 
 
+def _for_lists(command: str) -> list[tuple[str, int, int, list[str], bool]]:
+    """`_for_lists_of`, cached per text AND the parse flags `_quote_states`
+    reads: keyed on the text alone, a flagged reading got the plain one's."""
+    return _for_lists_of(command, (_BRACE_OTHER_SHELL[0], _MAIN_PARSE[0]))
+
+
+@functools.lru_cache(maxsize=32)
+def _for_lists_of(command: str, _flags: tuple) -> list[tuple[str, int, int, list[str], bool]]:
+    """Each `for NAME in LIST`: its name, the list's span, its raw words, and
+    whether a `do` (or bash's `{`) follows it as a shell loop's must. The list
+    is read word by word, quotes and `$(…)` whole, so a quoted `;` is part of
+    a word: cut at it, `for v in a 'x;y' 'rm …'` bound only `a` (XERK-1647).
+    Python's `for f in a if …` in a quoted script has no `do`, and is read
+    as before, to the `;` or newline: scanned whole, its words ran on into
+    the quotes around it and nested too deeply (QA). Cached: every reading
+    of the line asks again, and callers only read the result."""
+    found = []
+    states = _quote_states(command) if "${" in command else []
+    # A `for` inside a shell list already read is one of its words, as bash
+    # reads it. One inside another language's `for … in` text is still read:
+    # it may be the line's real loop (`echo for x in y && for v in …`, QA).
+    # Where a text scan ended is cached per word start it passed (`_for_scan`),
+    # so a run of `for … in` with no `do` is scanned once, not once per `for`.
+    shell_after, text_after, scanned = 0, 0, {}
+    for m in _FOR_IN_RE.finditer(command):
+        if m.start() < shell_after:
+            continue
+        end, words, visited, known = _for_scan(command, m.end(), states, scanned)
+        if known is not None:
+            # Ran into an earlier text scan: the rest is that scan's.
+            end, shell = known
+            words = []
+        else:
+            shell = bool(_FOR_DO_RE.match(command, end))
+        if not shell:
+            # A shell list's own `for` words are skipped above, so only
+            # these are ever reached again.
+            for p in visited:
+                scanned[p] = (end, shell)
+        if shell:
+            shell_after = end
+        elif m.start() < text_after:
+            # Bound as before XERK-1647, by one regex pass: a `for` inside an
+            # earlier match's text binds nothing. Rebound each, it was O(n²).
+            end, words = text_after, []
+        else:
+            end = m.end() + len(re.match(r"[^;\n]*", command[m.end():]).group(0))
+            words = [w.group(0) for w in _ASSIGN_WORD_RE.finditer(command, m.end(), end)
+                     if w.group(0) and w.group(0) != "do"]
+            text_after = end
+        found.append((m.group(1), m.end(), end, words, shell))
+    return found
+
+
+def _for_scan(command: str, pos: int, states: list[str], scanned: dict
+              ) -> tuple[int, list[str], list[int], tuple[int, bool] | None]:
+    """A shell `for` list from ``pos``: where it ends, its words, and the word
+    starts it passed — or, once it reaches a word start an earlier scan of
+    ``scanned`` passed, that scan's end and verdict (a scan from a position
+    goes on the same whatever reached it, and stopping there keeps a line of
+    `for … in` linear, even one inside `${…}` that is no word start, QA). A
+    `${…}` holding `;` or a newline is read through, as an assignment's value
+    is (`_assign_value_end`): `for v in a ${x:-;} 'rm …'` cut there."""
+    end, words, visited = pos, [], []
+    while pos < len(command):
+        if pos in scanned:
+            return end, words, visited, scanned[pos]
+        visited.append(pos)
+        # `do` in the list is a word like any (`for v in a do 'rm …'`).
+        w = _FOR_WORD_RE.match(command, pos)
+        if not w.group(0):
+            break
+        stop = w.end()
+        if "${" in w.group(0):
+            stop = _assign_value_end(command, states, pos, stop)
+            while stop < len(command) and command[stop] not in " \t\n;|&":
+                more = _FOR_WORD_RE.match(command, stop).end()
+                if more == stop:
+                    break
+                stop = _assign_value_end(command, states, stop, more)
+        words.append(command[pos:stop])
+        pos = end = stop
+        while pos < len(command) and command[pos] in " \t":
+            pos += 1
+    return end, words, visited, None
+
+
+# A `for` list word: an assignment's, plus `$'…'` with its `\'` and a
+# backslash-escaped character (`x\;y` is one word). Read as an assignment's,
+# `for v in $'it\'s' 'x;y' 'rm …'` paired the quotes wrong and cut the list.
+_FOR_WORD_RE = re.compile(r"(?:\$'(?:[^'\\]|\\.)*'|" + _ASSIGN_SUBST
+                          + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.|[^\s;|&\n'\"`\\])*", re.S)
+# What may sit between a shell `for` list and its `do` (or `{`): blanks,
+# `;`, newlines, comments.
+_FOR_DO_RE = re.compile(r"(?:[ \t;\n]|#[^\n]*)*(?:\bdo\b|\{)")
+
+
 def _assign_value_end(command: str, states: list[str], start: int, end: int) -> int:
     """Where an assignment's value really ends: past any `${…}` in it that
     closes beyond the regex's match. The regex pairs `"` flat, so it cut
@@ -1826,7 +1924,7 @@ _PRINTF_MAX_WIDTH = 256
 _PRINTF_ESCAPES = {"c": _PRINTF_STOP, "n": "\n", "t": "\t", "r": "\r", "a": "\a", "b": "\b", "e": "\x1b",
                    "f": "\f", "v": "\v", "\\": "\\", "'": "'", '"': '"'}
 # `select` binds its list as `for` does (XERK-1650).
-_FOR_IN_RE = re.compile(r"\b(?:for|select)\s+([A-Za-z_][A-Za-z0-9_]*)\s+in\s+([^;\n]+)")
+_FOR_IN_RE = re.compile(r"\b(?:for|select)\s+([A-Za-z_][A-Za-z0-9_]*)\s+in[ \t]+")
 # `$NAME`, `${NAME}`, and the operator forms — `${d%/}`, `${d#x}`, `${d:0:4}`,
 # `${nope:-/etc}`. The operator matters less than the value it operates on: a
 # one-character `${d%/}` was enough to walk around the loop-variable fix.
@@ -2049,20 +2147,33 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
     for k, got in vals.items():
         _VALUES_MOST[0] = max(_VALUES_MOST[0], len(got) + len(applied.get(k, ())))
         _VALUES_ASSIGNED[0] = max(_VALUES_ASSIGNED[0], len(got))
-    for m in _FOR_IN_RE.finditer(command):
+    lists = _for_lists(command)
+    pick = _FOR_PICK[0]
+    if pick is not None and sum(1 for f in lists if f[0] == pick[0]) <= pick[1]:
+        pick = None
+    if pick is not None:
+        # A per-word reading (`_for_word_lines`): the loop's name holds that
+        # word alone, as its iteration does. Any other binding joined in
+        # made `v=a; for v in 'rm …'; do $v; done` run program `a`.
+        vals.pop(pick[0], None)
+        applied.pop(pick[0], None)
+    seen_of: dict[str, int] = {}
+    for name, _start, _end, raw_words, _shell in lists:
+        nth = seen_of[name] = seen_of.get(name, -1) + 1
+        if pick is not None and name == pick[0] and nth != pick[1]:
+            continue
         # Whole words, dequoted as bash binds them: split on blanks, `for v in
         # "$(echo rm -rf /)"` bound `"rm`, `-rf`, `/"` (XERK-1622).
         # A `${x:-…}` word is read with its default applied too, as an
         # assignment's is.
         words = []
-        for w in _ASSIGN_WORD_RE.finditer(m.group(2)):
-            if w.group(0) and w.group(0) != "do":
-                words.append(_dequote_value(w.group(0)))
-                if "${" in w.group(0) and not _MAIN_PARSE[0]:
-                    words.append(_dequote_value(_substitute_vars(w.group(0), {})))
+        for raw_word in raw_words:
+            words.append(_dequote_value(raw_word))
+            if "${" in raw_word and not _MAIN_PARSE[0]:
+                words.append(_dequote_value(_substitute_vars(raw_word, {})))
         if words:
-            vals.setdefault(m.group(1), []).extend(words)
-            _FOR_NAMES.add(m.group(1))
+            vals.setdefault(name, []).extend(words)
+            _FOR_NAMES.add(name)
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
     # HERE, once, against the values that name none. Left in, every recursion
     # level re-inlined it, the text grew each time, and an ordinary command
@@ -2933,6 +3044,9 @@ _CHAIN_DIFFERS = [False]
 # Set while `_expand_both` reads each of a name's values on its own: which one.
 # And the most values this decision saw one name assigned (XERK-1621).
 _VALUE_PICK: list[int | None] = [None]
+# Set while `_expand_both` reads one word of a `for` list (`_for_word_lines`):
+# the loop's name and which of that name's `for` lists it is.
+_FOR_PICK: list[tuple[str, int] | None] = [None]
 _VALUES_MOST = [1]
 _VALUES_ASSIGNED = [1]
 # Set while `_expand_both` reads a `'` in a string's `${…}` as zsh and dash do,
@@ -4843,7 +4957,93 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     zsh or dash (`_quote_states`), so a line holding one is read both ways.
 
     And with every assigned value resolved through its whole chain, when
-    that differs from resolving it once (XERK-1648)."""
+    that differs from resolving it once (XERK-1648).
+
+    A `for` list runs its words one per iteration, so a list of several is
+    also read once per distinct word with the list cut down to that word
+    (`_for_word_lines`, XERK-1647)."""
+    out = _expand_readings(command)
+    # A values pass is one reading, again when values print differently, and
+    # once per taint reading: sixteen tainted `x=$(…)` made each 9x the cost.
+    weight = 1 + bool(_VALUES_DIFFER[0]) + min(_VALUES_TAINT_N[0], _MAX_TAINT_STARTS)
+    # ...and once more chained (XERK-1648): a word naming `R=$Q` was empty.
+    chained = (False, True) if _CHAIN_DIFFERS[0] else (False,)
+    weight *= len(chained)
+    lines, too_large = _for_word_lines(command, weight)
+    if too_large:
+        return out + [([_TOO_LARGE], command)]
+    for line, pick in lines:
+        # Values only: the per-value, brace and old-parse passes would
+        # multiply the readings by the words (XERK-1647 QA). Their joined
+        # readings above still see every word.
+        _FOR_PICK[0] = pick
+        try:
+            for chain in chained:
+                _VALUES_CHAINED[0] = chain
+                out = out + _expand_values(line)
+        finally:
+            _FOR_PICK[0] = None
+            _VALUES_CHAINED[0] = False
+    return out
+
+
+# How many characters of line the per-word `for` readings may re-read in one
+# decision (`_for_word_lines`), each weighted by its passes. Characters, not
+# time: a wall clock denied a real command on a busy host only (XERK-1647 QA);
+# `_MAX_DECIDE_SECONDS` still bounds the whole decision. Each reads
+# the WHOLE line less its list: a loop read alone lost what the line set up
+# before it (`x=…; for v in a eval; do $v "$x"`) or took out of it through
+# another name (XERK-1647 QA). Past this the line is too large (a deny, before
+# reading any of them) — a line of hundreds of loops, or a long list beside a
+# very long body.
+_MAX_FOR_WORD_CHARS = 768 * 1024
+
+
+@_budgeted
+def _for_word_lines(command: str, weight: int) -> tuple[list[tuple[str, tuple[str, int]]], bool]:
+    """``command`` once per distinct word of each `for` list, that list
+    replaced by the word alone, with the `_FOR_PICK` to read it under; and
+    whether there were too many to read. Joined, `for v in a 'rm -rf /'; do
+    $v; done` read program `a` (XERK-1647); a reading per word with the whole
+    list re-read was quadratic in it. One loop at a time: nested lists are not
+    read as a product. A one-word list too: another binding of its name was
+    joined in. Each line is charged its length times ``weight``, the passes
+    `_expand_values` makes over it."""
+    return _memo("vals", ("for", command, weight), _for_word_lines_of, command, weight)
+
+
+def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, tuple[str, int]]], bool]:
+    lines: list[tuple[str, tuple[str, int]]] = []
+    seen: set[tuple[str, tuple[str, int]]] = set()
+    left = _MAX_FOR_WORD_CHARS
+    nth: dict[str, int] = {}
+    # As `_var_values` reads it: a `\<newline>` in a list is no word of it.
+    command = _join_continuations(command)
+    for name, start, end, words, shell in _for_lists(command):
+        nth[name] = nth.get(name, -1) + 1
+        if not shell or not re.search(r"\$\{?!?" + name + r"\b", command):
+            # No `do`, or never expanded, so no word of it runs: most such
+            # lists are another language's `for` in a quoted or heredoc
+            # script, and read per word a 10 KB Python heredoc was too
+            # large, its words cut out of their quoting too deep (QA).
+            continue
+        for word in words:
+            entry = (command[:start] + word + command[end:], (name, nth[name]))
+            if entry in seen:
+                continue
+            left -= len(entry[0]) * weight
+            if left < 0:
+                # Recorded on the decision, as `_expand_picks`'s cap is.
+                if _budget is not None:
+                    _budget["capped"] = True
+                return [], True
+            seen.add(entry)
+            lines.append(entry)
+    return lines, False
+
+
+def _expand_readings(command: str) -> list[tuple[list[str], str]]:
+    """`_expand_both` for one line: the readings its values and quoting need."""
     out = _expand_picks(command)
     if _BRACE_OTHER_SEEN[0]:
         _BRACE_OTHER_SHELL[0] = True

@@ -73,6 +73,32 @@ paths:
   - Only when `_brace_end` closes past the match AND a `${` sits inside; a `}` merely quoted
     (`${a:-'}' #}`) stays raw as one word (XERK-1585). Past `_MAX_NESTED_VARS` → too large.
   - 0 decision changes over a 20.5k-command replay (636 holding `${`).
+- **Each `for` list is also read once per distinct word** (XERK-1647, `_for_word_lines`): joined,
+  `for v in a 'rm …'; do $v; done` ran program `a`. The list is cut to that word, and `_FOR_PICK`
+  makes the name hold it ALONE — an earlier `v=a` or another `for v` joined in hid it too.
+  - Lists are read by `_for_lists`, word by word (`_FOR_WORD_RE`: `$'…\'…'`, `\;`, and a `do` word
+    are list words; a `${…}` is read through by `_assign_value_end`): `[^;\n]+` cut
+    `for v in a 'x;' 'rm …'` at the `;`.
+  - A `for` inside a SHELL list already read is a word (skipped); one inside another `for … in`
+    text is still scanned — it may be the real loop (`echo for x in y && for v in …`) — but binds
+    nothing, as main's regex didn't. A text scan's end is cached per word start it passed, and a
+    later scan stops on reaching one (`_for_scan`): a run of `for … in` with no `do` was rescanned
+    to the line's end once each (quadratic). `_for_lists` is cached per text AND parse flags
+    (`_quote_states` reads them): keyed on text alone, a flagged reading got the plain one's.
+  - Only a shell loop's list — `do` or `{` follows it (`_FOR_DO_RE`) — whose name is expanded
+    somewhere (`$v`, `${v…}`, `${!v}`) is read per word. Python's `for f in a if …` in a quoted
+    script matches too: read per word, real 10 KB rigs went too large or nested too deeply.
+  - A list with no `do` keeps the old `[^;\n]*` binding: scanned word by word, its words ran on
+    into the quotes around it.
+  - Values pass only (`_expand_values`): the per-value/brace/old-parse passes multiplied by the words
+    made a 600-char line hit the 30 s deadline. The joined readings still run every pass.
+    The chained reading (XERK-1648) DOES run per word when values chain: a word `"$R"` naming
+    `R=$Q` was empty without it.
+  - Each reading is the WHOLE line less its list — never just the loop: that lost what the line set
+    before it (`x=…; for v in a eval; do $v "$x"`) or took out through another name.
+  - Budget: `_MAX_FOR_WORD_CHARS` of line × passes (taint readings multiply); past it the line is
+    `_TOO_LARGE` (a deny) — e.g. ~200 loops on one line. Characters, never a wall clock: that
+    denied a real command only on a busy host. Nested lists are no product.
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.

@@ -1286,6 +1286,50 @@ class TestProducedScripts(unittest.TestCase):
                     f"bash -c 'a=$(echo {R}); $a'", f"sh -c 'a=`echo {R}`; $a'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
+        # XERK-1647: each word of a longer list runs too, not just the first.
+        for cmd in (f"for v in a '{R}'; do $v; done", f'for v in a "$(echo {R})" b; do $v; done',
+                    "for v in a rm; do $v -rf /; done", f"for v in a b '{R}'; do $v; done",
+                    f"for v in a '{R}'; do :; done; $v",
+                    f"bash -c 'for v in a \"{R}\"; do $v; done'",
+                    f'for x in 1 2; do for v in a "{R}"; do $v; done; done',
+                    # A quoted `;` is part of its word, not the list's end;
+                    # and another binding of the name is not joined in (QA).
+                    f"for v in a 'x;' '{R}'; do $v; done", f'for v in "a;b" "{R}"; do $v; done',
+                    f"v=a; for v in c '{R}'; do $v; done", f"v=a; for v in '{R}'; do $v; done",
+                    f"for v in a b; do :; done; for v in c '{R}'; do $v; done",
+                    f"for v in a b; do for v in c '{R}'; do $v; done; done",
+                    f"for v in a '{R}'; do ${{v}}; done", f"for v in a '{R}'; {{ $v; }}",
+                    f"for v in a \\\n '{R}'; do $v; done", f"for v in a '{R}' # c\ndo $v; done",
+                    f"for v in a 'x;y' '{R}'; # c\n do $v; done",
+                    # A `do` word, an ANSI-C `\'` and an escaped `;` in the list.
+                    f"for v in a do '{R}'; do $v; done", f"for v in $'it\\'s' 'x;y' '{R}'; do $v; done",
+                    f"for v in a x\\;y '{R}'; do $v; done",
+                    # A real loop after another language's (or echoed) `for … in`.
+                    f"echo for x in y && for v in a '{R}'; do $v; done",
+                    f"python3 -c \"for x in 'y': pass\" && {{ for v in a '{R}'; do $v; done; }}",
+                    f"echo for a in b c && echo for c in d && for v in a '{R}'; do $v; done",
+                    # A word naming a chained value (XERK-1648), and one only the
+                    # brace-other-shell reading's list sees (cache keyed on it).
+                    f"Q='{R}'; R=$Q; for v in a b \"$R\"; do $v; done",
+                    f"Q='{R}'; D=$Q; R=$D; for v in a 'x;y' \"$R\"; do eval \"$v\"; done",
+                    'x="${y:-\'}"; for v in "${x:-"rm -rf /etc"}" ; { $v; }',
+                    # A `${…}` holding `;` or a newline, and a newline in `$'…'`.
+                    f"for v in a ${{x:-;}} '{R}'; do $v; done", f"for v in a ${{x//;/}} '{R}'; do $v; done",
+                    f'for v in a "${{x:-"x;y"}}" \'{R}\'; do $v; done',
+                    f"for v in a ${{x:-x\ny}} '{R}'; do $v; done", f"for v in $'x\\\n\\'' '{R}'; do $v; done",
+                    # What the line set before the loop, or takes out of it
+                    # through another name, past any length (QA).
+                    "echo " + "x" * 6000 + f"; x='{R}'; for v in a eval; do $v \"$x\"; done",
+                    "echo " + "x" * 6000 + f"; for v in a '{R}'; do export w=$v; done; bash -c \"$w\"",
+                    "echo " + "x" * 6000 + "; cd /; for v in a 'rm -rf etc'; do $v; done"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ('for v in a b c; do $v --version; done',
+                    'for f in a.txt b.txt; do rm -rf "$f"; done',
+                    "for v in 'ls -la' 'git status'; do $v; done",
+                    "for v in a do b; do echo $v; done", "for f in $'a\\tb' c\\ d; do echo \"$f\"; done"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
         for cmd in ('for v in "$(ls)"; do echo "$v"; done',
                     'read -r l <<< "$(git log -1 --oneline)"; echo "$l"',
                     f"read a <<< '{R}'; echo \"$a\"", "echo {a,b}$(date)",
@@ -3050,6 +3094,46 @@ class TestExpansionBudget(unittest.TestCase):
                     "echo " + "{" * 32000 + "\n$x <<EOF\nx\nEOF",
                     "echo " + "{a" * 16000 + "\n$x <<EOF\nx\nEOF"):
             self.check(cmd)
+
+    def test_long_for_lists_are_read_per_word_fast(self):
+        # XERK-1647: a reading per list word drops the rest of the list, so
+        # it stays linear in it; past the budget the line is denied unread.
+        words = " ".join(f"f{i}" for i in range(1000))
+        self.assertIsNone(self.check(f'for f in {words}; do echo "$f"; done'))
+        self.assertIn("protected path", self.check(f"for f in {words} 'rm -rf /'; do $f; done") or "")
+        # Several loops, or a long body elsewhere on the line, stay in budget
+        # (XERK-1647 QA: a too-large deny at 128 KB unweighted).
+        commit = "\n".join(f"line {i} of a commit message" for i in range(600))
+        for cmd in ("; ".join(f"for v in x{i} y; do echo $v; done" for i in range(40)),
+                    "for d in a b c d e f g h; do mkdir -p $d; done; git commit -m \"$(cat <<'EOF'\n"
+                    + commit + "\nEOF\n)\""):
+            self.assertIsNone(self.check(cmd), cmd[:80])
+        # Many `for … in` with no `do` are scanned once, not once each (QA).
+        for cmd in (("for v in a " * 4000) + "'", "for v in $'x " * 4000,
+                    # ...a header inside `${…}` is no word start of an earlier scan.
+                    'echo for x in "${y:-for z in w} "' * 3000):
+            self.assertIsNone(self.check(cmd), cmd[:40])
+        body = " && ".join(f'cp "$f" /tmp/o{i}/' for i in range(40))
+        self.assertIn(self.TOO_LARGE, self.check(f"for f in {words}; do {body}; done") or "")
+
+    def test_for_word_readings_are_charged_their_passes(self):
+        # XERK-1647 QA: each per-word reading costs its line once per values
+        # pass (taint readings multiply it). Characters, never a clock: that
+        # denied a real command only on a busy host.
+        plain = "for f in a b c d; do echo $f; done"
+        tainted = "x=$(echo a | grep .); for f in a b c d; do echo $f; done"
+        # Four lines of the tainted one fit once over, not twice.
+        with mock.patch.object(guard, "_MAX_FOR_WORD_CHARS", 4 * len(tainted)):
+            self.assertIsNone(self.check(plain))
+            self.assertIn(self.TOO_LARGE, self.check(tainted) or "")
+        # Not read per word: a list with no `do` (Python's, in a quoted
+        # script), or whose name is never expanded.
+        with mock.patch.object(guard, "_MAX_FOR_WORD_CHARS", 0):
+            self.assertIn(self.TOO_LARGE, self.check(plain) or "")
+            for cmd in ("python3 - <<'EOF'\nfor s in a, b:\n    print(s)\nEOF",
+                        "ssh h \"python3 -c 'print([f for f in a if f])'; ls \\$f\"",
+                        "for f in a b; do echo hi; done"):
+                self.assertIsNone(self.check(cmd), cmd)
 
     def test_large_value_used_many_times_is_denied_fast(self):
         x = f"x='{self.VALUE}'; "
