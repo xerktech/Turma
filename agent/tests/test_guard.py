@@ -2303,6 +2303,54 @@ class TestScriptChannels(unittest.TestCase):
         # An ODD run escapes the `>`: the `&` backgrounds echo, and sh reads nothing.
         self.assertAllowed(f"echo '{R} #' {B16}\\>&1 | sh")
 
+    def test_xerk_1641_remaining_bypasses(self):
+        # XERK-1641: redirects between a command's words, shells named through
+        # `$SHELL`/globs/aliases, options after `-c`, name rebinds, positional
+        # operators, find/xargs one path per run, and values set by arrays,
+        # `:=`, `:+`, `${!a}`, a substitution's own assignments, and text
+        # written to a file a later `sh f` runs.
+        R = self.R
+        P = "rm -rf /etc"
+        for cmd in ("rm -rf 2>&1 /", "rm -rf >&2 /etc", "rm -rf &>/dev/null /etc",
+                    f"$SHELL -c '{R}'", f"$x -c '{R}'", f"/bin/ba?h -c '{R}'",
+                    f"echo '{R}' | $SHELL", f"echo '{R}' | /bin/ba?h",
+                    f"alias b=bash; b -c '{R}'", f"bash -c -e '{R}'",
+                    f"bash -c -o errexit '{R}'",
+                    f"hash -p /bin/bash cat; cat <<EOF\n{R}\nEOF",
+                    f"command_not_found_handle() {{ bash; }}\nnosuchprog <<EOF\n{R}\nEOF",
+                    f"BASH_ALIASES[b]=bash\nb <<EOF\n{R}\nEOF",
+                    f'eval "ali""as b=bash"\nb <<EOF\n{R}\nEOF',
+                    f"cat <<EOF | sh -c 'x=bash; $x'\n{R}\nEOF",
+                    "rm -rf \"${1:-/etc}\"", "sh -c 'rm -rf \"${1:-/etc}\"' _",
+                    "sh -c 'rm -rf \"${1:-/etc}\"' _ ''", "sh -c 'rm -rf \"${@/tmp/etc}\"' _ /tmp",
+                    "sh -c 'rm -rf \"${!#}\"' _ /etc",
+                    "find /tmp /etc -maxdepth 0 -exec sh -c 'rm -rf \"$1\"' _ {} \\;",
+                    "printf '%s\\n' /tmp /etc | xargs -n1 sh -c 'rm -rf \"$1\"' _",
+                    "find -L / -delete", "find -H /etc -exec rm -rf {} +",
+                    f'xargs -0 sh -c <<< "{P}"',
+                    f'x=(a "{P}"); eval "${{x[1]}}"', f'unset x; : ${{x:="{P}"}}; eval "$x"',
+                    f'a=x; b="{P}"; a=b; eval "${{!a}}"',
+                    f'y=$(x=a; x="{P}"; echo "$x"); eval "$y"',
+                    f'c="{P}"; p=true; p=bash; $p -c "$c"; c=ls',
+                    f'for v in "${{PATH:+$(echo {P})}}"; do $v; done',
+                    f'read -r a <<< "${{PATH:+$(echo {P})}}"; $a',
+                    f"echo '{P}' > /tmp/x.sh; sh /tmp/x.sh", f"echo '{P}' > /tmp/x.sh; . /tmp/x.sh",
+                    f"cat > /tmp/y.sh <<'E'\n{P}\nE\nbash /tmp/y.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("ls 2>&1 /tmp", "make &>/dev/null all", "$SHELL -c 'ls'",
+                    "alias b=bash; b -c 'echo hi'", "bash -c -e 'make test'",
+                    "sh -c 'echo \"${1:-x}\"' _", "find -L . -name '*.py'",
+                    "x=(a b); echo \"${x[1]}\"", "a=b; b=1; echo \"${!a}\"",
+                    "echo hi > /tmp/z.sh; sh /tmp/z.sh", "echo 'ls' | $SHELL"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # Two names past the pass cap keep the same-index reading only, and stay fast.
+        many = "; ".join(f"v{i}=a; v{i}=b" for i in range(12)) + "; echo $v0"
+        start = time.monotonic()
+        self.assertAllowed(many)
+        self.assertLess(time.monotonic() - start, 10)
+
     def test_a_proc_subst_passed_through_or_sourced_in_a_c_script(self):
         # XERK-1611: `cat <(…)` passes its file through to a shell downstream,
         # and a quoted `<(…)` in a `-c` script is the INNER shell's to run.
@@ -3289,8 +3337,10 @@ class TestExpansionBudget(unittest.TestCase):
         for cmd in (
             "find . " + "-exec true {} + " * 5000,
             'x="-exec true {} +"; find . ' + "$x " * 10000,
-            " | ".join(["xargs echo a/b"] * 4096),
-            'x="xargs echo a/b"; ' + " | ".join(["$x"] * 8192),
+            # Distinct operands: each xargs carries every one (XERK-1641
+            # de-duplicates repeats, which made identical ones linear).
+            " | ".join(f"xargs echo a/b{i}" for i in range(4096)),
+            'x="xargs echo"; ' + " | ".join(f"$x a/b{i}" for i in range(8192)),
         ):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:80])

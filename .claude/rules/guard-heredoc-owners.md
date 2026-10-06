@@ -57,9 +57,8 @@ paths:
     class fails closed. `_defined_names` starts only at word starts, so it stays linear.
   - Accepted over-deny (0 in a 19k-command replay): `"$EDITOR" <<EOF`, `${PAGER:-less}`,
     `f() { "$@"; }; f cat <<EOF` with a destructive body line.
-- Not covered (open tickets): data later run as code (XERK-1555), the same non-literal names
-  on the `-c` and plain-pipe paths (XERK-1632), names rebound by `read`/`hash -p`/`eval`
-  (XERK-1638).
+- The same non-literal-name rule now covers the `-c` and plain-pipe paths, and name rebinds
+  (`hash -p`, `BASH_ALIASES`, `eval`'d aliases): `guard-value-sources.md` (XERK-1641).
 - Tests: `TestScriptChannels.test_a_heredoc_owner_shell_behind_a_glue_subshell_or_group`,
   `test_an_owner_word_with_a_silent_substitution`,
   `test_a_shell_name_formed_by_an_empty_expansion_or_a_brace`,
