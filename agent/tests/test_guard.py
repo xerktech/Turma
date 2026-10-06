@@ -2066,6 +2066,13 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "coproc X=$((1 + 2)) rm -rf /etc",
         "coproc NAME { rm -rf /etc; }",
         "coproc N { X=$((1 + 2)) rm -rf /etc; }",
+        "function f { X=$((1 + 2)) rm -rf /etc; }; f",
+        "g() { :; }; function f { X=${nope:-a b} rm -rf /etc; }; f",
+        'bash -c "Z=\\$((1 + 2)) rm -rf /etc; "\'X=$((1 + 2)) true\'',
+        'sh -c \'X=$((1 + 2)) true; \'"Z=\\$((1 + 2)) rm -rf /etc"',
+        'echo \'X=$((1 + 2)) true; \'"Z=\\$((1 + 2)) rm -rf /etc" | bash',
+        "dash <<'E'\nX=${nope:-a b}\"${nope:-'}\" rm -rf /etc; : '}\"'\nE",
+        "sh -c 'X=${nope:-a b}\"${nope:-'\"'\"'}\" rm -rf /etc; : '\"'\"'}\"'\"'\"''",
         "bash <<'E'\nX=${nope:-a b} bash <<F\nY=\\${nope:-a b} rm -rf /etc\nF\nE",
         "env -u N X=$((1 + 2)) rm -rf /etc",
         "timeout -s KILL 5 env X=$((1 + 2)) rm -rf /etc",
@@ -2098,6 +2105,7 @@ class TestWrapperUnwrapping(unittest.TestCase):
         'bash -c "X=\\$((1 + 2)) make"',
         "coproc NAME { cat; }",
         "env -i PATH=/x X=$((1 + 2)) ls",
+        "function build { X=$((1 + 2)) make -j$(nproc); }",
         "nice -n 5 X=$(echo a b) ls",
     ]
 
