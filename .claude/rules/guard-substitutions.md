@@ -289,7 +289,8 @@ paths:
     and a later assignment was read into an earlier use (`c=$p/; … p=1`), whose empty reading
     is bash's. Added: 0 such regressions, 26 dangerous commands main allowed now denied.
   - Cost: the empty reading stays, so `q=/tmp/q; d=$q; r=$d/; rm -rf $r` still reads `/` and
-    is denied — telling it from `r=$d/; d=…` needs ORDER (XERK-1660).
+    is denied — telling it from `r=$d/; d=…` needs ORDER (XERK-1660). A `for` name's extras never
+    raise `_VALUES_MOST` (list words are data; a list naming `$M` doubled past the pass cap).
   - Resolving once alone read `q=/etc; d=$q; r=$d` as `r` empty, and a link naming a cycle
     (`d=$q$c; c=$c`) and a name with a plain and a chained value (`q=/tmp; q=$e; d=$q`) the same.
   - Inside a cycle (an SCC, or a name using itself) a member reads another's unlinked values only

@@ -2098,7 +2098,10 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         extra = [v for i, v in enumerate(chained[k]) if v != vs[i] and v not in vs]
         if extra:
             vs.extend(dict.fromkeys(extra))
-            _VALUES_MOST[0] = max(_VALUES_MOST[0], len(vs))
+            if k not in _FOR_NAMES:
+                # A `for` list's words are data, read joined, and not
+                # counted: a list naming `$M` doubled past the pass cap.
+                _VALUES_MOST[0] = max(_VALUES_MOST[0], len(vs))
     return once
 
 

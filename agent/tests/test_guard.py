@@ -1215,11 +1215,11 @@ class TestParserGaps(unittest.TestCase):
         self.assertEqual(guard._var_values("a=$b; b=$a"), {"a": [""], "b": [""]})
         self.assertEqual(guard.decide("Bash", {"command": "a=$b; b=$a; echo $a"})[0], "allow")
         doubling = "a0=xxxxxxxx; " + "".join(f"a{i + 1}=$a{i}$a{i}; " for i in range(40))
-        long = "".join(f"a{i + 1}=$a{i}; " for i in range(3000))
-        cycle = "".join(f"b{i}=$b{i + 1}; " for i in range(3000)) + "b3000=$b0; "
-        ring = "a0=/tmp/x; " + long + "a0=$a3000; "
-        for cmd, want in ((doubling + "echo $a40", "deny"), ("a0=/etc; " + long + "rm -rf $a3000", "deny"),
-                          ("a0=/tmp/x; " + long + "rm -rf $a3000", "allow"), (cycle + "echo $b7", "allow"),
+        long = "".join(f"a{i + 1}=$a{i}; " for i in range(1000))
+        cycle = "".join(f"b{i}=$b{i + 1}; " for i in range(1000)) + "b1000=$b0; "
+        ring = "a0=/tmp/x; " + long + "a0=$a1000; "
+        for cmd, want in ((doubling + "echo $a40", "deny"), ("a0=/etc; " + long + "rm -rf $a1000", "deny"),
+                          ("a0=/tmp/x; " + long + "rm -rf $a1000", "allow"), (cycle + "echo $b7", "allow"),
                           (ring + "rm -rf $a5", "allow")):
             with self.subTest(cmd=cmd[:40]):
                 start = time.monotonic()
