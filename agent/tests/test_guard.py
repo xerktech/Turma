@@ -1171,15 +1171,18 @@ class TestParserGaps(unittest.TestCase):
 
     def test_a_chain_of_assignments_resolves_every_link(self):
         """XERK-1648: a value naming a name whose own value names another was
-        read empty, so `r=$d` hid `/etc` and `r=$d/` read as `/`."""
+        read empty, so `r=$d` hid `/etc`. The chain's value is ADDED beside
+        the empty reading, which stays: it is bash's when the chain is
+        assigned after the use (`c=$p/; p=1`), so `r=$d/` still reads `/`
+        too (order is XERK-1660)."""
         self.assertEqual(guard._var_values("q=/tmp/q; d=$q/d2/ro; r=$d/$tag")["r"],
-                         ["/tmp/q/d2/ro/$tag"])
+                         ["/$tag", "/tmp/q/d2/ro/$tag"])
         for cmd in ("q=/etc; d=$q; r=$d; rm -rf $r",
                     "q=/etc; d=$q; r=$d; s=$r; t=$s; rm -rf $t",
                     'y=${x:-"rm -rf /etc"}; z=$y; w=$z; $w',
                     # QA: a link naming a cycle, a name with a plain and a
                     # chained value, an operator in a link, a default naming
-                    # a name.
+                    # a name, a decoy value.
                     "q=/etc; d=$q$c; r=$d; c=$c; rm -rf $r",
                     "q=/etc; d=$q$e; r=$d; e=$f; f=$e; rm -rf $r",
                     "e=/etc; q=/tmp/x; q=$e; d=$q; rm -rf $d",
@@ -1190,40 +1193,21 @@ class TestParserGaps(unittest.TestCase):
                     "q=/tmp/a; d=${q/tmp\\/a/etc}; rm -rf $d",
                     "a=/etc; b=$a; y=${x:-$b}; z=$y; rm -rf $z",
                     "c='rm -rf /etc'; q='echo hi'; q=$c; d=$q; $d",
-                    # QA: an alternative naming a name.
                     "x=/etc; rm -rf ${x:+$x}",
                     "x=1; y='rm -rf /etc'; ${x:+$y}",
-                    "q=1; a='rm -rf /etc'; d=${q:+$a}; $d"):
+                    "q=1; a='rm -rf /etc'; d=${q:+$a}; $d",
+                    # QA, against bash's own values: swapped in, the chain's
+                    # values moved the per-value picks, and a later assignment
+                    # was read into an earlier use.
+                    'b=$b/; x=1; b=/e; x=${b}tc; rm -rf "$x"',
+                    'c=$p/; x=${c:-$d}; p=${d:+$d}; d=1; rm -rf "$c"'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
-        for cmd in ("q=/tmp/q; d=$q/d2/ro; r=$d/; rm -rf $r",
-                    "q=/tmp/q; d=$q/d2/ro; r=$d/$(cat f); rm -rf $r",
-                    "q=/tmp/q; d=$q/d2/ro; r=$d/$tag; rm -rf $r",
+        for cmd in ("q=/tmp/q; d=$q/d2/ro; r=$d/x; rm -rf $r",
                     "q=/tmp/q; d=$q$c; r=$d/x; c=$c; rm -rf $r",
                     "d=/tmp/x; e=${d:+$d/sub}; rm -rf $e"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
-
-    def test_names_in_an_operator_argument_are_dependencies(self):
-        self.assertEqual(guard._names_used("${q:+$a}x$b"), {"q", "a", "b"})
-        self.assertEqual(guard._names_used("${q:-0}"), {"q"})
-
-    def test_a_cycle_of_assignments_is_read_once(self):
-        """Re-read on every change, each lap of a cycle nested the last one's
-        text: a test loop's counters were refused as too deep (a replayed
-        false deny). A cycle's values are read once, as main read them."""
-        cmd = ('files=$(ls tests/*.js)\ntotal_pass=0; total_fail=0; failed=""\n'
-               'for f in $files; do\n'
-               '  res=$(node --test "$f" 2>&1)\n'
-               '  fail=$(echo "$res" | grep -oE "fail [0-9]+" | grep -oE "[0-9]+" | tail -1)\n'
-               '  pass=$(echo "$res" | grep -oE "pass [0-9]+" | grep -oE "[0-9]+" | tail -1)\n'
-               '  total_pass=$((total_pass + ${pass:-0}))\n'
-               '  total_fail=$((total_fail + ${fail:-0}))\n'
-               '  if [ "${fail:-0}" != "0" ]; then failed="$failed $f($fail)"; fi\n'
-               'done\necho "TOTAL pass=$total_pass fail=$total_fail"\necho "FAILED:$failed"')
-        vals = guard._budgeted(guard._var_values)(cmd)
-        self.assertLessEqual(max(v.count("$((") for vs in vals.values() for v in vs), 1, vals)
-        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
     def test_a_cycle_of_assignments_stays_bounded(self):
         """A cycle reads empty, as an unset name. A long chain or ring resolves

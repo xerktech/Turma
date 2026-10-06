@@ -2063,21 +2063,50 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
             vals.setdefault(m.group(1), []).extend(words)
             _FOR_NAMES.add(m.group(1))
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
-    # HERE, once, and stored resolved. Left in, every recursion level
-    # re-inlined it, the text grew each time, and an ordinary command was
-    # refused as nested too deeply.
-    # Names are resolved in dependency order (`_dependency_order`), each once
-    # every name it uses has ALL its values: resolving once against the values
-    # that name none read `q=/etc; d=$q; r=$d` as `r` empty, and `rm -rf $r`
-    # passed (XERK-1648). Inside a cycle (`a=$b; b=$a`) a name not yet resolved
-    # reads empty, as bash reads an unset name.
+    # HERE, once, against the values that name none. Left in, every recursion
+    # level re-inlined it, the text grew each time, and an ordinary command
+    # was refused as nested too deeply. An unresolvable one is empty, as bash
+    # reads an unset name.
+    plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
+    own = {k: len(vs) for k, vs in vals.items()}
     # An applied default is one more value of its name, and resolves OTHER
     # names (`y=${x:-"rm …"}; z=$y; $z`), never its own: there it took
     # `x=; x=${x-a}"rm …"; $x` (the `${x-a}` empty, x set) to `arm …` in
     # every reading.
-    own = {k: len(vs) for k, vs in vals.items()}
     for k, vs in applied.items():
         vals.setdefault(k, []).extend(vs)
+    others = {k: plain.get(k, []) + [v for v in vs if not _names_assigned(v, vals)]
+              for k, vs in applied.items()}
+
+    def resolve(m: "re.Match[str]", owner: str) -> str:
+        name = m.group(1) or m.group(3) or ""
+        if name not in vals:
+            return m.group(0)
+        value = _picked(plain[name] if name == owner else others.get(name, plain[name]))
+        _spend(len(value) - len(m.group(0)))
+        return value
+
+    once = {k: [_var_sub(lambda m, k=k: resolve(m, k), v) for v in vs] for k, vs in vals.items()}
+    # Resolved once, a chain read empty: `q=/etc; d=$q; r=$d` left `r` empty
+    # and `rm -rf $r` passed (XERK-1648). Each chain-resolved value that reads
+    # differently is ADDED after the name's values, never swapped in: swapped,
+    # a name's new values moved which value each per-value reading picks
+    # (`b=$b/; x=1; b=/e; x=${b}tc`), and a later assignment was read into an
+    # earlier use whose empty reading had been bash's (`c=$p/; p=1`).
+    chained = _chain_values(vals, applied, own)
+    for k, vs in once.items():
+        extra = [v for i, v in enumerate(chained[k]) if v != vs[i] and v not in vs]
+        if extra:
+            vs.extend(dict.fromkeys(extra))
+            _VALUES_MOST[0] = max(_VALUES_MOST[0], len(vs))
+    return once
+
+
+def _chain_values(vals: dict[str, list[str]], applied: dict[str, list[str]],
+                  own: dict[str, int]) -> dict[str, list[str]]:
+    """``vals`` with every value naming an assigned name resolved through its
+    whole chain, in dependency order (`_dependency_order`): each value is read
+    once every name it uses outside its group has ALL its values."""
     known: dict[str, list[str]] = {k: [] for k in vals}
     defaults: dict[str, list[str]] = {k: [] for k in vals}
     waits: dict[str, set[str]] = {k: set() for k in vals}

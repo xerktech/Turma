@@ -278,13 +278,20 @@ paths:
     first (a DB drop, a fork bomb) returns before the cap is met. Granted, the policy checks ran
     without the per-value readings: `x=ls; <17 x=…>; x="gh pr merge 1"; $x` passed `x=ls *`. `_assign_value_end` extends a value whose
   `${…}` closes past the regex's flat quote pairing (`x="${y:-"rm …"}"`).
-- **A value naming another assigned name resolves through the whole chain** (XERK-1648,
-  `_assigned_values`): names are resolved in dependency order (`_dependency_order`, Tarjan SCCs,
-  edges sorted), each value read ONCE against what is known before its group, then stored
-  resolved — never re-inlined per recursion level (that grew the text to "too deep").
-  - Resolving once, against values naming none, read `q=/etc; d=$q; r=$d` as `r` empty; a link
-    naming a cycle (`d=$q$c; c=$c`) and a name with a plain and a chained value
-    (`q=/tmp; q=$e; d=$q`) failed the same way. A name used OUTSIDE its group is complete.
+- **A value naming another assigned name also gets its whole chain's value** (XERK-1648,
+  `_chain_values`): names resolved in dependency order (`_dependency_order`, Tarjan SCCs, edges
+  sorted), each value read ONCE against what is known before its group, then stored resolved —
+  never re-inlined per recursion level (that grew the text to "too deep").
+  - Main's resolve-once reading (against values naming none; an unresolved name empty) stays
+    FIRST; a chained value that differs is APPENDED and counted in `_VALUES_MOST`. Swapped in,
+    a QA oracle (bash's real value of each target, 6k random graphs) found bypasses main denied:
+    new values moved which value each per-value reading picks (`b=$b/; x=1; b=/e; x=${b}tc`),
+    and a later assignment was read into an earlier use (`c=$p/; … p=1`), whose empty reading
+    is bash's. Added: 0 such regressions, 26 dangerous commands main allowed now denied.
+  - Cost: the empty reading stays, so `q=/tmp/q; d=$q; r=$d/; rm -rf $r` still reads `/` and
+    is denied — telling it from `r=$d/; d=…` needs ORDER (XERK-1660).
+  - Resolving once alone read `q=/etc; d=$q; r=$d` as `r` empty, and a link naming a cycle
+    (`d=$q$c; c=$c`) and a name with a plain and a chained value (`q=/tmp; q=$e; d=$q`) the same.
   - Inside a cycle (an SCC, or a name using itself) a member reads another's unlinked values only
     and an unknown one empty, as main did: `d=/; d=$d/etc` is `//etc`. What a cycle holds
     depends on ORDER, which this reading does not model (XERK-1660, with the seeded-cycle
