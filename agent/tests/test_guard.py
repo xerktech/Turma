@@ -1302,6 +1302,65 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_an_assigned_substitution_in_a_script_xargs_find_or_proc_subst_runs(self):
+        # XERK-1649: each ran `rm -rf /etc` while the guard allowed it.
+        R = self.R
+        for cmd in (f"xargs bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"xargs -I{{}} bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"xargs -0 sh -c 'a=`echo {R}`; $a' <<< x",
+                    f"nohup xargs bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"find . -maxdepth 0 -exec bash -c 'a=$(echo {R}); $a' \\;",
+                    f"find . -execdir sh -c 'a=`echo {R}`; $a' \\;",
+                    f"bash <(echo 'a=$(echo {R}); $a')", f"source <(echo 'a=$(echo {R}); $a')",
+                    f". <(printf '%s' 'a=$(echo {R}); $a')",
+                    f"cat <(echo 'a=$(echo {R}); $a') | bash",
+                    f'bash -c "a=\\`echo {R}\\`; \\$a"',
+                    f'xargs bash -c "a=\\`echo {R}\\`; \\$a" <<< x',
+                    # A second `-exec`, a `$(echo …)` script, multi-statement `<(…)` (QA).
+                    f"find . -exec true \\; -exec bash -c 'a=$(echo {R}); $a' \\;",
+                    f"bash -c \"$(echo 'a=$(echo {R}); $a')\"",
+                    f"sh -c \"$(printf %s 'a=`echo {R}`; $a')\"",
+                    f"eval \"$(echo 'a=$(echo {R}); $a')\"",
+                    f"bash <(echo 'a=$(echo {R})'; echo '$a')",
+                    f"bash <(echo 'a=$(echo {R}); $a' | cat)",
+                    f'bash <(echo "a=\\`echo {R}\\`; \\$a")',
+                    # A wrapper xargs runs; a `$(echo …)` among other text (QA).
+                    f"xargs env bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"bash -c \"true; $(echo 'a=$(echo {R}); $a')\"",
+                    f"eval -- \"$(echo 'a=$(echo {R}); $a')\"",
+                    f"eval \"$(echo 'a=$(echo {R})')\"'; $a'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("xargs bash -c 'a=$(echo hi); echo $a' <<< x",
+                    "find . -exec bash -c 'x=$(basename {}); echo $x' \\;",
+                    "find . -name '*.py' -exec sh -c 'n=$(wc -l < \"$1\"); echo $n' _ {} \\;",
+                    "bash <(echo 'a=$(date); echo $a')", 'bash -c "a=\\`date\\`; echo \\$a"',
+                    "bash <(echo 'a=$(date)'; echo 'echo $a')", 'eval "$(ssh-agent -s)"',
+                    # A shell word a printer is handed is text, not a runner.
+                    f"xargs echo bash -c 'a=$(echo {R}); $a'",
+                    f"find . -name sh -exec echo sh -c 'a=$(echo {R}); $a' \\;"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_xargs_clustered_short_options_take_their_value(self):
+        # XERK-1649 QA: `-rn 1` is `-r -n 1`; read as one word, `1` was the command.
+        R = self.R
+        for cmd in (f"xargs -rn 1 {R} <<< x", f"xargs -0I {{}} {R} {{}} <<< x",
+                    f"xargs -rn 1 bash -c '{R}' <<< x", f"xargs -tI {{}} sh -c 'rm -rf {{}}' <<< /",
+                    f"xargs -0P 2 bash -c 'a=$(echo {R}); $a' <<< x",
+                    f"xargs --process-slot-var V {R} <<< x", f"xargs -rL1 {R} <<< x",
+                    # getopt_long prefixes; `--max-lines` takes no next word.
+                    f"xargs --max-a 1 {R} <<< x", f"xargs --delim '\\n' {R} <<< x",
+                    f"xargs --max-lines {R} <<< x", f"xargs --max-args=1 {R} <<< x",
+                    f"xargs --max-lines bash -c 'a=$(echo {R}); $a' <<< x"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("xargs -rn 1 echo <<< x", "xargs -0I {} cp {} /tmp/out <<< x",
+                    "xargs -i echo {} <<< x", "xargs -l echo <<< x",
+                    "xargs --max-a 1 echo <<< x", "xargs --null --max-lines=2 echo <<< x"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_relative_rm_after_cd_into_a_root_names_that_root(self):
         for cmd in ("cd / && rm -rf *", "cd /; rm -rf *", "cd /etc; rm -rf ./*",
                     "cd /usr && rm -r lib", "cd ~ && rm -rf *", "cd; rm -rf *",

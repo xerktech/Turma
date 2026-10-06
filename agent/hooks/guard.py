@@ -3989,10 +3989,24 @@ def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
     printed = _body_printed(body, _reading())[0]
     # One echo/printf prints its words; `echo …; true` does not print `; true`.
     if printed is not None and len(segments) == 1:
+        # ...and, a quoted `$(…)` in them left as written: the reader runs it,
+        # so `bash <(echo 'a=$(echo rm -rf /); $a')` assigns its output whole,
+        # where the spliced text bound `a=rm` (XERK-1649).
+        kept = _kept_printed(unwrapped)
+        if kept and kept != printed:
+            _spend(len(kept))
+            return [printed, kept]
         return [printed]
     if depth >= _MAX_EXPAND_DEPTH:
         return []
     out = []
+    # The statements' texts with quoted `$(…)` kept, joined as the reader gets
+    # them: `<(echo 'a=$(…)'; echo '$a')` binds across lines (XERK-1649).
+    stmts = [_unwrap_group(seg) for seg in segments]
+    if any(map(_kept_printed, stmts)):
+        out.append("\n".join(filter(None, (_kept_printed(st) or _printed_text(st)
+                                            for st in stmts))))
+        _spend(len(out[-1]))
     for seg in segments:
         seg = _unwrap_group(seg)
         out.append(_printed_text(_sub_substs(seg, _subst_text)) or "")
@@ -4010,6 +4024,19 @@ def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
             if script:
                 out.extend(_proc_subst_texts(script, depth + 1))
     return [t for t in out if t.strip()]
+
+
+def _kept_printed(stmt: str) -> str | None:
+    """What ``stmt`` prints with every quoted `$(…)`/backtick left as written,
+    when that text holds one: its reader runs them (XERK-1649). An escaped
+    backtick reads unescaped too, as bash's `echo "\\`…\\`"` prints it."""
+    if "$(" not in stmt and "`" not in stmt:
+        return None
+    kept = _printed_text(stmt)
+    if kept is None:
+        return None
+    kept = kept.replace("\\`", "`")
+    return kept if "$(" in kept or "`" in kept else None
 
 
 def _reads_stdin_script(stage: str, depth: int = 0, fresh: bool = False) -> bool:
@@ -4444,14 +4471,8 @@ def _command_reads_stdin_as(stage: str, depth: int) -> bool:
         # is only positional params, so that is not a read (XERK-1628). But a
         # replace-string (`-I@`/`-i`/`--replace`) substitutes the text INTO the
         # command, so `-I@ sh -c '@'` IS a read.
-        inner = list(rest)
-        replace = False
-        while inner and inner[0].startswith("-") and len(inner[0]) > 1:
-            opt = inner.pop(0)
-            if opt in ("-I", "-i", "--replace") or opt.startswith(("-I", "-i", "--replace=")):
-                replace = True
-            if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
-                inner.pop(0)
+        cut, replstr = _xargs_options(rest)
+        inner, replace = rest[cut:], bool(replstr)
         if inner and _basename(inner[0]) in _SHELL_PROGS:
             r2 = inner[1:]
             return replace or (_shell_c_index(r2) >= 0 and not _shell_c_script(r2))
@@ -4516,17 +4537,61 @@ def _basename(prog: str) -> str:
     return re.split(r"[\\/]", prog)[-1].lower()
 
 
-# xargs options that consume the NEXT token as their value.
-#
-# `-i` and `-e` are deliberately NOT here, and neither are `--replace`/`--eof`:
-# their values are OPTIONAL and must be ATTACHED (`-i{}`, `--replace={}`), so
-# `xargs -i rm -rf {}` passes `rm` as the COMMAND. Listing them ate the `rm` and
-# reopened the very bypass the `-I` fix closed.
-_XARGS_OPTS_WITH_VALUE = {
-    "-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a",
-    "--max-args", "--max-lines", "--max-procs", "--max-chars",
-    "--delimiter", "--arg-file",
+# GNU xargs' long options, True where a value is REQUIRED (attached or the next
+# word). `--eof`, `--replace` and `--max-lines` take an OPTIONAL value, which
+# must be ATTACHED (`--replace={}`): `xargs --max-lines rm -rf /` runs `rm`.
+_XARGS_LONG_OPTS = {
+    "--arg-file": True, "--delimiter": True, "--max-args": True, "--max-procs": True,
+    "--max-chars": True, "--process-slot-var": True,
+    "--null": False, "--eof": False, "--replace": False, "--max-lines": False,
+    "--open-tty": False, "--interactive": False, "--no-run-if-empty": False,
+    "--verbose": False, "--show-limits": False, "--exit": False,
+    "--help": False, "--version": False,
 }
+# xargs short options taking a REQUIRED value (attached or the next word), and
+# those whose OPTIONAL value must be attached (`-i{}`, `-l2`, `-eEOF`). `-i`
+# and `-e` taking the next word ate the `rm` of `xargs -i rm -rf {}` and
+# reopened the very bypass the `-I` fix closed.
+_XARGS_SHORT_VALUE = set("adEILnPs")
+_XARGS_SHORT_OPTIONAL = set("eil")
+
+
+def _xargs_options(rest: list[str]) -> tuple[int, str]:
+    """Where xargs' own options end in ``rest`` (the index of its command)
+    and the replace-string they set ("" for none). Short options CLUSTER as
+    getopt reads them: `-rn 1` is `-r -n 1` and `-0I {}` is `-0 -I {}`, so a
+    walk taking a cluster as one word put `1` or `{}` in command position and
+    `xargs -rn 1 rm -rf /` classified a program named `1` (XERK-1649)."""
+    i, replstr = 0, ""
+    while i < len(rest) and rest[i].startswith("-") and len(rest[i]) > 1:
+        opt = rest[i]
+        i += 1
+        if opt == "--":
+            break
+        if opt.startswith("--"):
+            name, eq, val = opt.partition("=")
+            # getopt_long takes any unambiguous prefix: `--max-a 1` is `--max-args 1`.
+            hits = [n for n in _XARGS_LONG_OPTS if n.startswith(name)]
+            name = name if name in _XARGS_LONG_OPTS else hits[0] if len(hits) == 1 else name
+            if name == "--replace":
+                replstr = val or "{}"
+            elif not eq and _XARGS_LONG_OPTS.get(name) and i < len(rest):
+                i += 1
+            continue
+        for k, c in enumerate(opt[1:], 1):
+            attached = opt[k + 1:]
+            if c in _XARGS_SHORT_VALUE:
+                if not attached and i < len(rest):
+                    attached = rest[i]
+                    i += 1
+                if c == "I":
+                    replstr = attached
+                break
+            if c in _XARGS_SHORT_OPTIONAL:
+                if c == "i":
+                    replstr = attached or "{}"
+                break
+    return i, replstr
 
 
 def _shell_c_index(rest: list[str]) -> int:
@@ -4560,6 +4625,55 @@ def _shell_c_script(rest: list[str]) -> str | None:
     if i < len(rest) and rest[i] == "--":
         i += 1
     return rest[i] if i < len(rest) else None
+
+
+def _raw_shell_c_scripts(kept: list[str], depth: int = 0) -> list[str]:
+    """Each `-c` script in a segment's unspliced words: the segment's own shell,
+    or one an `xargs` or `find -exec` runs (XERK-1649) — only a word in RUNNER
+    position, so `xargs echo bash -c '…'` prints it. A double-quoted script's
+    escaped backticks are live to the shell it reaches, so `bash -c "a=\\`…\\`"`
+    is read with them unescaped too: shlex keeps that `\\` where bash drops it.
+    A script that is one `$(echo …)` runs the text it prints, read as
+    `_proc_subst_texts` does: `bash -c "$(echo 'a=$(…); $a')"`."""
+    if not kept or depth > _MAX_EXPAND_DEPTH:
+        return []
+    prog = _basename(kept[0])
+    if prog in _SHELL_PROGS:
+        script = _shell_c_script(kept[1:])
+        return [] if script is None else _raw_script_texts(script)
+    runs: list[list[str]] = []
+    if prog == "xargs":
+        runs.append(kept[1 + _xargs_options(kept[1:])[0]:])
+    elif prog == "find":
+        runs += [kept[i + 1:] for i, t in enumerate(kept)
+                 if t in ("-exec", "-execdir", "-ok", "-okdir")]
+    return [sc for run in runs for sc in _raw_shell_c_scripts(_strip_prefixes(run), depth + 1)]
+
+
+def _raw_script_texts(script: str) -> list[str]:
+    """`_raw_shell_c_scripts`' readings of one `-c` script."""
+    out = [script]
+    plain = script.replace("\\`", "`")
+    if plain != script:
+        _spend(len(plain))
+        out.append(plain)
+    # A `$(echo …)` anywhere in it splices in the text it prints, quoted
+    # `$(…)` kept: `bash -c "true; $(echo 'a=$(…); $a')"`.
+    if "$(" in script or "`" in script:
+        spliced = _sub_substs(script, _kept_subst_text)
+        if spliced not in out:
+            _spend(len(spliced))
+            out.append(spliced)
+    return out
+
+
+def _kept_subst_text(m: "re.Match[str]") -> str:
+    """A `$(…)`/backtick as the text it prints with quoted `$(…)` kept (the
+    first such `_proc_subst_texts` reading), else left as written."""
+    if m.group(0).startswith(("<(", ">(")):
+        return m.group(0)
+    return next((t for t in _proc_subst_texts(_subst_inner(m)) if "$(" in t or "`" in t),
+                m.group(0))
 
 
 def _find_roots(tokens: list[str]) -> list[str]:
@@ -5833,7 +5947,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # _MAX_EXPAND_DEPTH, which fails closed).
         words = _strip_prefixes(_tokenize(_unwrap_group(raw)))
         if len(words) > 1 and _basename(words[0]) == "eval":
-            for script in _script_readings(" ".join(words[1:])):
+            # bash's eval takes (and drops) `--`.
+            joined = " ".join(words[2:] if words[1] == "--" else words[1:])
+            # `eval "$(echo 'a=$(…); $a')"` runs the printed text (XERK-1649).
+            for script in dict.fromkeys([*_script_readings(joined), *_raw_script_texts(joined)[1:]]):
                 out.extend(_expand_segments(script, depth + 1, every_cd))
         # `seg` ran the line's substitutions, which turned a quoted `<(…)` —
         # literal to the outer shell — into the text it prints, so `bash -c
@@ -5852,12 +5969,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # script runs its own `$(…)`, so `bash -c 'a=$(echo rm -rf /); $a'`
         # assigns the output whole; spliced in by the outer read it became
         # `a=rm -rf /; $a`, where `$a` is just `rm` (XERK-1622).
+        # The same script handed over by `xargs` or `find -exec` (XERK-1649).
         if "$(" in raw or "`" in raw:
             kept = _strip_prefixes(_tokenize(_unwrap_group(raw)))
-            script = _shell_c_script(kept[1:]) if kept and _basename(kept[0]) in _SHELL_PROGS else None
-            if script and ("$(" in script or "`" in script):
-                for reading in _script_readings(script):
-                    out.extend(_expand_segments(reading, depth + 1, every_cd))
+            for script in _raw_shell_c_scripts(kept):
+                if "$(" in script or "`" in script:
+                    for reading in _script_readings(script):
+                        out.extend(_expand_segments(reading, depth + 1, every_cd))
         if seg != raw.strip() and seg:
             # A group/substitution-stripped body can itself hold operators.
             if _SEGMENT_SPLIT.search(seg):
@@ -6006,23 +6124,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # then append what the pipeline will feed it as operands. An option
             # that takes a SEPARATE value must consume it, else `-I {} rm -rf {}`
             # left `{}` as the command and classified nothing.
-            inner = list(rest)
             # The replace-string (`-I R`, `-iR`, `--replace=R`; `-i` and
             # `--replace` alone mean `{}`), which xargs substitutes ANYWHERE in
             # an argument — inside `sh -c 'rm -rf {}'` too (XERK-1600).
-            replstr = ""
-            while inner and inner[0].startswith("-"):
-                opt = inner.pop(0)
-                if opt == "-I" and inner:
-                    replstr = inner[0]
-                elif opt.startswith("-I"):
-                    replstr = opt[2:]
-                elif opt.startswith("-i"):
-                    replstr = opt[2:] or "{}"
-                elif opt == "--replace" or opt.startswith("--replace="):
-                    replstr = opt.partition("=")[2] or "{}"
-                if "=" not in opt and opt in _XARGS_OPTS_WITH_VALUE and inner:
-                    inner.pop(0)
+            cut, replstr = _xargs_options(rest)
+            inner = list(rest[cut:])
             if inner:
                 # `{}` stands for whatever the pipeline feeds in. Every xargs
                 # carries EVERY operand on the line, so n segments emit n²
