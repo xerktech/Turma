@@ -3140,7 +3140,13 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "rm -rf /etc${x}", 'rm -rf /etc"$x"', "rm -rf /usr$x/", "rm -rf /etc$1",
                     "rm -rf /etc$@", "rm -rf /etc$x$y", "rm -rf $HOME/$x", "rm -r /usr${x#a}",
                     'rm -rf "$repo/.git$x"', "chmod -R 777 /etc$x", "chown -R me /etc$x",
-                    "find /etc$x -delete", "bash -c 'rm -rf /etc$x'"):
+                    "find /etc$x -delete", "bash -c 'rm -rf /etc$x'",
+                    # A `.`, `/.` or glob after the name names the same root.
+                    "find /etc$x/. -delete", "chmod -R 777 /etc$x/.", "chown -R me /etc$x/./",
+                    "rm -rf /e$x*", "rm -rf /etc$x*",
+                    # ...as does the `~/.ssh` check, and a default that is itself unset.
+                    "rm -rf ~/.ssh$x", "rm -rf $HOME/.ssh$x", "rm -rf /etc${x:-${y}}",
+                    'rm -rf /etc${x:-"${y}"}'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         # A harmless prefix, a whole-word or LEADING name, a default that prints
@@ -3149,7 +3155,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "rm -rf build$x", "rm -rf ./$x", 'rm -rf "$TMP/$x"',
                     "rm -rf /${DIR:-build}", "rm -rf /etc${x:-foo}", "rm -rf /etc${#x}",
                     "rm -rf ~$USER", "rm -rf ~$USER/build", "d=build; rm -rf /tmp/$d",
-                    "rm -f /etc$x", 'rm -rf ./"${name}".git', "rm -rf /$x/build"):
+                    "rm -f /etc$x", 'rm -rf ./"${name}".git', "rm -rf /$x/build", "rm -rf build$x.bak", 'rm -rf "$out"/.',
+                    'rm -rf "$dir"/*', "rm -rf /tmp/$x/*"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 

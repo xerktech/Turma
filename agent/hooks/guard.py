@@ -5008,30 +5008,32 @@ def _glob_hits_system_root(pattern: str) -> bool:
     return False
 
 
-# `${x:-w}`, `${x=w}` and the like print ``w`` when x is unset, never nothing.
-_DEFAULTED_PARAM_RE = re.compile(r"^\$\{(?:[A-Za-z_]\w*|\d+)(?:\[[^]]*\])?:?[-=][^}]")
+# What may follow the names a word ends with: separators, `.` and glob
+# characters, none of which make the path it names any deeper.
+_TRAILING_PATH_TAIL_RE = re.compile(r"[/.*?]*")
 
 
 def _trailing_unset_dropped(tok: str) -> str | None:
-    """``tok`` with every unset name glued AFTER its text read as empty, else
-    None (XERK-1623).
+    """``tok`` with the unset names ENDING it read as empty, else None
+    (XERK-1623).
 
-    `rm -rf /etc$x` deletes /etc when x is unset, and `$HOME$x` the home
-    directory. Only the names ENDING the word (nothing but `/` after them)
-    with text before them are dropped: a whole-word `"$d"` is left alone,
-    since an empty target reads as the root, as is a name before more text
-    (`"$dir"/build`, `./"$name".git`), which is a path built from it.
+    `rm -rf /etc$x` deletes /etc when x is unset, `$HOME$x` the home
+    directory, and `find /etc$x/. -delete` or `rm -rf /e$x*` the same root.
+    A name counts as ending the word when only `/`, `.` and glob characters
+    follow it, and only with text before it: a whole-word `"$d"` is left
+    alone, since an empty target reads as the root, as is a name before more
+    text (`"$dir"/build`, `./"$name".git`), which is a path built from it.
     A name inside a tilde prefix (`~$USER`) is kept: bash does not expand
-    that tilde, so the word never names a home.
+    that tilde, so the word never names a home. A `${x:-w}` default is
+    spliced before this sees the word.
     """
     if "$" not in tok:
         return None
     tilde_end = (tok.find("/") % (len(tok) + 1)) if tok.startswith("~") else 0
     spans = []
     tail = len(tok)
-    for start, end, kind in reversed(_param_spans(tok)):
-        if kind != "param" or start <= tilde_end or tok[end:tail].strip("/") \
-                or _DEFAULTED_PARAM_RE.match(tok[start:end]):
+    for start, end, _kind in reversed(_param_spans(tok)):
+        if start <= tilde_end or not _TRAILING_PATH_TAIL_RE.fullmatch(tok, end, tail):
             break
         spans.insert(0, (start, end))
         tail = start
@@ -5114,6 +5116,9 @@ def _is_dangerous_path(tok: str) -> bool:
 def _is_home_ssh(tok: str) -> bool:
     """`~/.ssh` itself — deleting it loses the keys, though `chmod -R 700` of
     it is the routine permission fix, so only `rm` asks this."""
+    dropped = _trailing_unset_dropped(tok)
+    if dropped is not None and _is_home_ssh(dropped):
+        return True
     parent, _, leaf = _norm_path(tok).lower().rstrip("/").rpartition("/")
     return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent)))
 
