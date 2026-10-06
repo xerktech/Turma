@@ -3160,6 +3160,35 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         many = 'echo ' + ' '.join(['"$(echo \'"\')"'] * (guard._MAX_DECOY_SUBSTS + 1))
         self.assertEqual(guard.decide("Bash", {"command": many}, cwd="/tmp")[0], "deny")
 
+    def test_an_unset_name_after_a_protected_target_is_read_empty(self):
+        # XERK-1623: an unset name glued AFTER an operand's text expands to
+        # nothing, so `rm -rf /etc$x` deletes /etc.
+        for cmd in ("rm -rf /etc$x", "rm -rf $HOME$x", "rm -rf /$x", 'rm -rf "/etc$x"',
+                    "rm -rf /etc${x}", 'rm -rf /etc"$x"', "rm -rf /usr$x/", "rm -rf /etc$1",
+                    "rm -rf /etc$@", "rm -rf /etc$x$y", "rm -rf $HOME/$x", "rm -r /usr${x#a}",
+                    'rm -rf "$repo/.git$x"', "chmod -R 777 /etc$x", "chown -R me /etc$x",
+                    "find /etc$x -delete", "bash -c 'rm -rf /etc$x'",
+                    # A `.`, `/.` or glob after the name names the same root.
+                    "find /etc$x/. -delete", "chmod -R 777 /etc$x/.", "chown -R me /etc$x/./",
+                    "rm -rf /e$x*", "rm -rf /etc$x*", "rm -rf /e$x*c", "rm -rf /e$x?c",
+                    "rm -rf /e$x[t]c", "rm -rf /$x?tc", "chmod -R 777 /e$x?c",
+                    # ...as does the `~/.ssh` check, and a default that is itself unset.
+                    "rm -rf ~/.ssh$x", "rm -rf $HOME/.ssh$x", "rm -rf /etc${x:-${y}}",
+                    'rm -rf /etc${x:-"${y}"}'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        # A harmless prefix, a whole-word or LEADING name, a default that prints
+        # text, a length, and a tilde prefix bash leaves unexpanded (`~$USER`).
+        for cmd in ("rm -rf /tmp/build$x", 'rm -rf "$d"', 'rm -rf "$dir"/build',
+                    "rm -rf build$x", "rm -rf ./$x", 'rm -rf "$TMP/$x"',
+                    "rm -rf /${DIR:-build}", "rm -rf /etc${x:-foo}", "rm -rf /etc${#x}",
+                    "rm -rf ~$USER", "rm -rf ~$USER/build", "d=build; rm -rf /tmp/$d",
+                    "rm -f /etc$x", 'rm -rf ./"${name}".git', "rm -rf /$x/build", "rm -rf build$x.bak", 'rm -rf "$out"/.',
+                    'rm -rf "$dir"/*', "rm -rf /tmp/$x/*", "rm -rf build$x*.bak",
+                    "rm -rf ./$x*.log", "rm -rf /tmp/$x*foo"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
     def test_a_nested_quote_or_a_reassigned_value_does_not_hide_the_command(self):
         # XERK-1621: a `"…"` inside a string's `${…}` nests rather than closing
         # the string, and its `'` hid the rest of the line; a name assigned

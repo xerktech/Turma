@@ -147,6 +147,16 @@ paths:
   - A name the line assigns is spliced first, never read empty. A revealed `format` counts only
     with a drive letter: `$R format --check .` (ruff, black, cargo) is the clash.
   - `_expand_braces` skips `${x,,}`: brace-expanding it read `${x,,}rm` as `$xrm $rm $rm`.
+  - A destructive OPERAND (rm/chmod/chown/find roots, and rm's `~/.ssh` check) is also read with
+    the unset names ENDING it dropped (`_trailing_unset_dropped`, XERK-1623): `/etc$x`,
+    `$HOME$x`, `/$x`, `/etc$x/.`, `/e$x*c`. "Ending" = only `/` and `.` follow, or text holding
+    a glob char (judged by the glob check).
+    Only in `_is_dangerous_path`/`_is_home_ssh`, never segment-wide. Kept: a leading or
+    whole-word name, one before more text (`./"$name".git` is a path built from it, a deliberate
+    allow), and a name in a tilde prefix (`~$USER`: bash leaves it literal). `${x:-w}` defaults
+    are spliced upstream, so a default that is itself unset (`${x:-${y}}`) drops too.
+    Accepted over-deny: `rm -rf /$sub` with sub unset by this line; a literal `'/etc$x'`
+    (tokens arrive dequoted).
   - Both passes must stay LINEAR (`test_empty_expansion_readings_stay_linear`): rebuilding the
     text per removal, or tokenising every word's prefix, ran 30 KB toward the hook timeout.
   - Past `_MAX_EMPTY_PROGRAM_WORDS` with a word dropped → too deep: a partial reading was re-read
@@ -228,6 +238,7 @@ paths:
   `test_a_large_conditional_or_nested_taint_body_stays_fast`,
   `test_a_large_filtered_body_classifies_without_timing_out`,
   `test_a_sibling_or_an_empty_expansion_does_not_hide_the_command`,
+  `test_an_unset_name_after_a_protected_target_is_read_empty`,
   `test_a_nested_quote_or_a_reassigned_value_does_not_hide_the_command`,
   `test_a_decision_past_its_deadline_denies`, `test_a_decision_past_the_hook_deadline_denies`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,

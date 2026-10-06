@@ -1496,7 +1496,7 @@ def _find_substs(text: str) -> list[_Subst]:
     openers stay linear: a scan per opener is O(n²), past the hook timeout.
     - A `)` closes only a `(` quoted the same way (`_quote_states`): read
       blind, the `)` in `$(echo ")'")` ended the body there and its `'` hid
-      the rest of the line (XERK-1621). An escaped `\$(` inside `"…"` is
+      the rest of the line (XERK-1621). An escaped `\\$(` inside `"…"` is
       string text throughout, so it still pairs as it did.
     """
     n = len(text)
@@ -5098,7 +5098,50 @@ def _glob_hits_system_root(pattern: str) -> bool:
     return False
 
 
+# What may follow the names a word ends with: separators and `.`, which make
+# the path it names no deeper, or any text holding a glob character, which
+# may match a root itself (`/e$x*c` is `/etc`) and is judged as a glob.
+_TRAILING_PATH_TAIL_RE = re.compile(r"[/.]*|.*[*?\[].*", re.DOTALL)
+
+
+def _trailing_unset_dropped(tok: str) -> str | None:
+    """``tok`` with the unset names ENDING it read as empty, else None
+    (XERK-1623).
+
+    `rm -rf /etc$x` deletes /etc when x is unset, `$HOME$x` the home
+    directory, and `find /etc$x/. -delete` or `rm -rf /e$x*` the same root.
+    A name counts as ending the word when only `/` and `.` follow it, or
+    text holding a glob character (`/e$x*c`), and only with text before it: a whole-word `"$d"` is left
+    alone, since an empty target reads as the root, as is a name before more
+    text (`"$dir"/build`, `./"$name".git`), which is a path built from it.
+    A name inside a tilde prefix (`~$USER`) is kept: bash does not expand
+    that tilde, so the word never names a home. A `${x:-w}` default is
+    spliced before this sees the word.
+    """
+    if "$" not in tok:
+        return None
+    tilde_end = (tok.find("/") % (len(tok) + 1)) if tok.startswith("~") else 0
+    spans = []
+    tail = len(tok)
+    for start, end, _kind in reversed(_param_spans(tok)):
+        if start <= tilde_end or not _TRAILING_PATH_TAIL_RE.fullmatch(tok, end, tail):
+            break
+        spans.insert(0, (start, end))
+        tail = start
+    if not spans:
+        return None
+    pieces, last = [], 0
+    for start, end in spans:
+        pieces.append(tok[last:start])
+        last = end
+    pieces.append(tok[last:])
+    return "".join(pieces)
+
+
 def _is_dangerous_path(tok: str) -> bool:
+    dropped = _trailing_unset_dropped(tok)
+    if dropped is not None and _is_dangerous_path(dropped):
+        return True
     raw = _norm_path(tok)
     low = raw.lower().rstrip("/").rstrip("\\")
     bare = raw.lower()
@@ -5164,6 +5207,9 @@ def _is_dangerous_path(tok: str) -> bool:
 def _is_home_ssh(tok: str) -> bool:
     """`~/.ssh` itself — deleting it loses the keys, though `chmod -R 700` of
     it is the routine permission fix, so only `rm` asks this."""
+    dropped = _trailing_unset_dropped(tok)
+    if dropped is not None and _is_home_ssh(dropped):
+        return True
     parent, _, leaf = _norm_path(tok).lower().rstrip("/").rpartition("/")
     return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent)))
 
