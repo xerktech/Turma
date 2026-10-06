@@ -13,7 +13,8 @@ paths:
 - By the time a target reaches it, every name the line assigns or defaults (`x=…;`,
   `${x:-…}`) is already substituted; what still starts with `$` is unknown. Don't read an
   assigned name empty — that denied ordinary `d=$(mktemp -d); rm -rf "$d"/*`.
-- `$HOME`/`$PWD` are never read empty (always set); a name not directly before `/` is left
+- `$HOME`/`$PWD` are never read empty (always set) unless an operator can empty them
+  (`${HOME:+}`, `${HOME#$HOME}`, `:0:0`) — exempt by operator, never by name match; a name not directly before `/` is left
   alone (`"$x"*`, `"$d".bak` stay relative).
 - Match the names on the token BEFORE `_norm_path`: normpath folds `"$x"/../etc` to `etc`
   and hid the bypass; the remainder is normalised by `_is_dangerous_path` itself.

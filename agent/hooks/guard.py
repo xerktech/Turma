@@ -5228,19 +5228,31 @@ _EXPANSIONS_RE = re.compile(r"\$\{[^{}]*\}|\$[A-Za-z_]\w*")
 # Positionals (`$1`, `$@`) are left out on purpose: inside `bash -c '…' _ /tmp/x`,
 # `find -exec sh -c` or a function they are bound, which this check cannot see.
 _ALWAYS_SET_NAMES = {"HOME", "PWD"}
+_ALWAYS_SET_RE = re.compile(r"\$(?:HOME|PWD)(?!\w)|\$\{(?:HOME|PWD)\}")
 
 
 def _only_expansions(word: str) -> bool:
     """True if ``word`` is nothing but quotes, blanks and names, so it can be
     empty too: the default in `${x:-${y}}` or `${x:-"$y"}`."""
-    word = word.replace('"', "").replace("'", "")
-    if re.search(r"\$\{?(?:HOME|PWD)\b", word):
-        return False
+    # A bare always-set name is text; under an operator (`${HOME:+}`,
+    # `${y:+$HOME}`) it can still be empty, so it is only kept as a letter.
+    word = _ALWAYS_SET_RE.sub("H", word.replace('"', "").replace("'", ""))
     for _ in range(16):  # one pass per nesting level; deeper reads as empty
         word, n = _EXPANSIONS_RE.subn("", word)
         if not n:
             return not word.strip()
     return True
+
+
+def _empties_a_set_path(op: str) -> bool:
+    """Whether `${HOME<op>}` can be empty though HOME holds a path: `:+`/`+`
+    with an empty word, a substring (`:0:0`), or a removal or replacement
+    whose pattern can match the whole path (`#$HOME`, `/*/`). `%/` cannot."""
+    if op[:2] == ":+" or op[:1] == "+":
+        return _only_expansions(op[2 if op[0] == ":" else 1:])
+    if op[:1] == ":" and op[1:2] not in ("-", "=", "?"):
+        return True
+    return op[:1] in ("#", "%", "/") and bool(re.search(r"[*?\[$`]", op))
 
 
 def _leading_names_end(raw: str) -> int:
@@ -5261,11 +5273,13 @@ def _leading_names_end(raw: str) -> int:
             name, op, end = head.group(1), raw[head.end():close], close + 1
         else:
             return 0
-        if name in _ALWAYS_SET_NAMES:
-            return 0
-        # `?` errors and a default or assigned word is used; only an empty one leaves it empty.
+        # `?` errors and a default or assigned word is used; only an empty one
+        # leaves it empty. HOME and PWD are set, so only another operator
+        # (`${HOME:+}`, `${HOME#$HOME}`) can empty them.
         body = op[1:] if op.startswith(":") else op
         if body[:1] == "?" or (body[:1] in ("-", "=") and not _only_expansions(body[1:])):
+            return 0
+        if name in _ALWAYS_SET_NAMES and not _empties_a_set_path(op):
             return 0
         pos = end
     return pos if raw.startswith("/", pos) else 0
