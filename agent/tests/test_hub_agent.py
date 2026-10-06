@@ -5574,7 +5574,9 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         self.assertIn(f"--session-id {cid}", cmd)
         # Initial prompt delivered race-free via prompt-interactive, not send-keys.
         self.assertIn("-i", shlex.split(cmd.split("set +a; ", 1)[1]))
-        self.assertIn("do the thing", cmd)
+        # ...through a launch file, so a long ticket fits tmux's command cap.
+        self.assertNotIn("do the thing", cmd)
+        self.assertIn("-i 'do the thing'", expand_launch_text(cmd))
         # settings.json + the context file are written into the worktree.
         with open(os.path.join(self.wt, ".qwen", "settings.json")) as f:
             settings = json.load(f)
@@ -36079,6 +36081,28 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
         sm._forget_session_caches(sess["id"])
         self.assertFalse(any(os.path.exists(p) for p in files))
+
+    def test_the_launch_file_path_is_shell_quoted(self):
+        # The path sits on a shell command line, and REGISTRY_DIR is the host's
+        # $HOME: a space or quote in it must not split or break the word.
+        odd = os.path.join(self.tmp, "it's a dir")
+        with mock.patch.object(ha, "LAUNCH_TEXT_DIR", odd):
+            word = ha.write_launch_text("s1", "prompt", "hello\nworld")
+        out = subprocess.run(["sh", "-c", f"set -- {word}; echo $#; printf %s \"$1\""],
+                             capture_output=True, text=True, check=True).stdout
+        self.assertEqual(out, "1\nhello\nworld")
+
+    def test_an_unwritable_launch_dir_refuses_the_launch(self):
+        # Launching without the directive would run a session with no branch,
+        # peer or PR policy: a failed write must fail the launch, never go bare.
+        blocker = os.path.join(self.tmp, "not-a-dir")
+        open(blocker, "w").close()
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "LAUNCH_TEXT_DIR", blocker), \
+             mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7")
+        self.assertEqual(sm.registry[-1]["status"], "error")
+        self.assertEqual(self._launches(), [])
 
     def test_spawns_an_azure_work_item(self):
         """An Azure host spawns a numeric-id work item through the SAME path,

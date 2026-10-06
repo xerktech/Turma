@@ -23458,11 +23458,12 @@ class SessionManager:
         # The initial prompt (spawn only) as qwen's prompt-interactive: run it as
         # the first turn and stay interactive — the race-free equivalent of
         # claude's positional `-- <prompt>`, with no send-keys timing to get
-        # wrong. A resume carries no fresh prompt (context continues).
-        if prompt and not resume:
-            parts += ["-i", prompt]
+        # wrong. A resume carries no fresh prompt (context continues). It rides
+        # a launch file like claude's, so a long ticket fits tmux's command cap.
         qwen_cmd = (f"set -a; . {shlex.quote(env_file)}; set +a; "
                     + shlex.join(parts))
+        if prompt and not resume:
+            qwen_cmd += " -i " + write_launch_text(sess["id"], "prompt", prompt)
         self._spawn_in_tmux(sess, qwen_cmd, "qwen")
         # 6. Confirm the session actually came up before recording it (XERK-492):
         # a started tmux is not proof qwen bound its session (a bad config, a
