@@ -279,28 +279,25 @@ paths:
     without the per-value readings: `x=ls; <17 x=…>; x="gh pr merge 1"; $x` passed `x=ls *`. `_assign_value_end` extends a value whose
   `${…}` closes past the regex's flat quote pairing (`x="${y:-"rm …"}"`).
 - **A value naming another assigned name resolves through the whole chain** (XERK-1648,
-  `_assigned_values`): names are resolved in dependency order (`_dependency_order`, Tarjan SCCs),
-  each once every name it uses has ALL its values, then stored resolved — never re-inlined per
-  recursion level (that grew the text to "too deep").
-  - Resolving once, against values naming none, read `q=/etc; d=$q; r=$d` as `r` empty. Rounds
-    were tried too: a link naming a cycle (`d=$q$c; c=$c`) stalled the chain, and a name with one
-    plain and one chained value (`q=/tmp; q=$e; d=$q`) was read before its second value.
-  - A cycle (an SCC, or a name using itself) reads each value once every OTHER member it uses is
-    COMPLETE (all its values read), so a seed reaches every member however the names sort
-    (`b=/etc; c=$b; a=$c; b=$a`) and a member's other value is no decoy (`x=/tmp; x=$q; y=$x`).
-    Stuck, the first value in line is read with unknown members empty (an unset name) and read
-    once more at the end. A value reads its OWN name as it is (`d=/; d=$d/etc` stays `//etc`).
-    - Never re-read on each change: each lap nested the last one's text, and a test loop's
-      `n=$((n + ${m:-0}))` counters were refused as too deep (real-command replay).
-    - Slots and Tarjan edges are SORTED: in set order a verdict changed with PYTHONHASHSEED,
-      which the hook draws afresh per call (`test_assignment_resolution_does_not_hang_on_the_hash_seed`).
-    - Accepted: a dense cycle (a 30-name clique) doubles its text per member and is denied as too
-      large, as a doubling chain is.
+  `_assigned_values`): names are resolved in dependency order (`_dependency_order`, Tarjan SCCs,
+  edges sorted), each value read ONCE against what is known before its group, then stored
+  resolved — never re-inlined per recursion level (that grew the text to "too deep").
+  - Resolving once, against values naming none, read `q=/etc; d=$q; r=$d` as `r` empty; a link
+    naming a cycle (`d=$q$c; c=$c`) and a name with a plain and a chained value
+    (`q=/tmp; q=$e; d=$q`) failed the same way. A name used OUTSIDE its group is complete.
+  - Inside a cycle (an SCC, or a name using itself) a member reads another's unlinked values only
+    and an unknown one empty, as main did: `d=/; d=$d/etc` is `//etc`. What a cycle holds
+    depends on ORDER, which this reading does not model (XERK-1660, with the seeded-cycle
+    shapes). Do not add propagation inside a cycle — four QA passes broke each variant:
+    - re-reading on each change nested every lap's text, and a real test loop's
+      `n=$((n + ${m:-0}))` counters were refused as too deep (replay); a 3000-member wheel 33s;
+    - reading once in seed order let a stuck read's partial value leak into members that never
+      re-read it, and in set order the verdict changed with PYTHONHASHSEED.
   - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`); names in a
     `:+`/`+` alternative are expanded by the caller's `expand` (both `_assigned_values` and
     `_substitute_vars`) and count as dependencies (`_names_used`). Spliced raw, `${x:+$x}` ran
-    as the literal `$x` — a bypass of `rm -rf ${x:+$x}`.
-  - Not modelled: ORDER (`d=$q$c; c=x` reads c as x; bash has it unset there) — XERK-1660.
+    as the literal `$x` — a bypass of `rm -rf ${x:+$x}`. `${q:+${a}}` (brace in an argument),
+    an unset `${Q:-$A}` and `$b'tc'` are XERK-1661.
   - Tests: `test_a_chain_of_assignments_resolves_every_link`,
     `test_a_cycle_of_assignments_stays_bounded`, `test_a_cycle_of_assignments_is_read_once`,
     `test_names_in_an_operator_argument_are_dependencies`.

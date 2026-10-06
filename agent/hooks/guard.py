@@ -59,7 +59,6 @@ as cwd, so it cannot rely on any package being importable.
 from __future__ import annotations
 
 import bisect
-import collections
 import fnmatch
 import functools
 import hashlib
@@ -2110,60 +2109,19 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         return _var_sub(lambda m: link(m, k), vals[k][i])
 
     for group in _dependency_order(waits):
-        slots = [(k, i, names) for k in group for i, names in linked.get(k, ())]
-        if not any(names & group for _k, _i, names in slots):
-            # Every name used is resolved already.
-            for k, i, _names in slots:
-                got = out[k][i] = settle(k, i)
-                (known if i < own[k] else defaults)[k].append(got)
-            continue
-        # A cycle (`a=$b; b=$a`, `d=/; d=$d/etc`): each value is read once
-        # every other member it uses is COMPLETE, so a seed reaches every
-        # member however the names sort (`b=/etc; c=$b; a=$c; b=$a; $a`), and
-        # a member's other value is no decoy (`x=/tmp; x=$q; y=$x`). Stuck,
-        # the first value in line is read with what is known, an unknown
-        # member empty (an unset name), and read once more at the end.
-        # Re-reading on every change nested each lap's text into the next: a
-        # loop's `n=$((n + ${m:-0}))` counters were refused as too deep.
-        # Sorted, so no verdict hangs on set order (the hash seed).
-        slots.sort(key=lambda slot: slot[:2])
-        left = collections.Counter(k for k, _i, _names in slots)
-        waiting: dict[tuple[str, int], int] = {}
-        users: dict[str, list[tuple[str, int]]] = {}
-        for k, i, names in slots:
-            # Not its own name: `d=$d/etc` reads d as it is.
-            need = sorted(n for n in names & group if n != k)
-            waiting[k, i] = len(need)
-            for n in need:
-                users.setdefault(n, []).append((k, i))
-        ready = collections.deque(slot for slot, n in waiting.items() if not n)
-        line = iter(list(waiting))
-        early: list[tuple[str, int]] = []
-        at: dict[tuple[str, int], tuple[list[str], int]] = {}
-        while waiting:
-            if ready:
-                slot = ready.popleft()
-            else:
-                slot = next(s for s in line if s in waiting)
-                early.append(slot)
-            if slot not in waiting:
-                continue
-            del waiting[slot]
-            k, i = slot
-            store = known[k] if i < own[k] else defaults[k]
-            store.append(settle(k, i))
-            at[slot] = (store, len(store) - 1)
-            out[k][i] = store[-1]
-            left[k] -= 1
-            if not left[k]:
-                for user in users.pop(k, ()):
-                    if user in waiting:
-                        waiting[user] -= 1
-                        if not waiting[user]:
-                            ready.append(user)
-        for k, i in early:
-            store, n = at[k, i]
-            store[n] = out[k][i] = settle(k, i)
+        # Each value is read ONCE, against what is known before its group:
+        # every name a group uses outside it is resolved whole. Inside a
+        # cycle (`a=$b; b=$a`, `d=/; d=$d/etc`) a member reads another's
+        # unlinked values only, and an unknown member is empty, as an unset
+        # name. What a cycle really holds depends on ORDER, which this
+        # order-blind reading does not model (XERK-1660); every propagation
+        # tried traded one shape for another — re-reading on each change
+        # nested every lap's text until a test loop's `n=$((n + ${m:-0}))`
+        # counters were refused as too deep, and reading in seed order let a
+        # stuck read's value leak into members that never re-read it.
+        for k, i, got in [(k, i, settle(k, i)) for k in group for i, _names in linked.get(k, ())]:
+            out[k][i] = got
+            (known if i < own[k] else defaults)[k].append(got)
     return out
 
 
