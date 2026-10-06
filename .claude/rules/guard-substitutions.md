@@ -136,7 +136,8 @@ paths:
   - `_expand_braces` skips `${x,,}`: brace-expanding it read `${x,,}rm` as `$xrm $rm $rm`.
   - A destructive OPERAND (rm/chmod/chown/find roots, and rm's `~/.ssh` check) is also read with
     the unset names ENDING it dropped (`_trailing_unset_dropped`, XERK-1623): `/etc$x`,
-    `$HOME$x`, `/$x`, `/etc$x/.`, `/e$x*`. "Ending" = only `/`, `.` and glob chars follow.
+    `$HOME$x`, `/$x`, `/etc$x/.`, `/e$x*c`. "Ending" = only `/` and `.` follow, or text holding
+    a glob char (judged by the glob check).
     Only in `_is_dangerous_path`/`_is_home_ssh`, never segment-wide. Kept: a leading or
     whole-word name, one before more text (`./"$name".git` is a path built from it, a deliberate
     allow), and a name in a tilde prefix (`~$USER`: bash leaves it literal). `${x:-w}` defaults

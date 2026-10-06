@@ -5008,9 +5008,10 @@ def _glob_hits_system_root(pattern: str) -> bool:
     return False
 
 
-# What may follow the names a word ends with: separators, `.` and glob
-# characters, none of which make the path it names any deeper.
-_TRAILING_PATH_TAIL_RE = re.compile(r"[/.*?]*")
+# What may follow the names a word ends with: separators and `.`, which make
+# the path it names no deeper, or any text holding a glob character, which
+# may match a root itself (`/e$x*c` is `/etc`) and is judged as a glob.
+_TRAILING_PATH_TAIL_RE = re.compile(r"[/.]*|.*[*?\[].*", re.DOTALL)
 
 
 def _trailing_unset_dropped(tok: str) -> str | None:
@@ -5019,8 +5020,8 @@ def _trailing_unset_dropped(tok: str) -> str | None:
 
     `rm -rf /etc$x` deletes /etc when x is unset, `$HOME$x` the home
     directory, and `find /etc$x/. -delete` or `rm -rf /e$x*` the same root.
-    A name counts as ending the word when only `/`, `.` and glob characters
-    follow it, and only with text before it: a whole-word `"$d"` is left
+    A name counts as ending the word when only `/` and `.` follow it, or
+    text holding a glob character (`/e$x*c`), and only with text before it: a whole-word `"$d"` is left
     alone, since an empty target reads as the root, as is a name before more
     text (`"$dir"/build`, `./"$name".git`), which is a path built from it.
     A name inside a tilde prefix (`~$USER`) is kept: bash does not expand
