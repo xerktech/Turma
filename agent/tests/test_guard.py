@@ -1348,11 +1348,16 @@ class TestProducedScripts(unittest.TestCase):
         for cmd in (f"xargs -rn 1 {R} <<< x", f"xargs -0I {{}} {R} {{}} <<< x",
                     f"xargs -rn 1 bash -c '{R}' <<< x", f"xargs -tI {{}} sh -c 'rm -rf {{}}' <<< /",
                     f"xargs -0P 2 bash -c 'a=$(echo {R}); $a' <<< x",
-                    f"xargs --process-slot-var V {R} <<< x", f"xargs -rL1 {R} <<< x"):
+                    f"xargs --process-slot-var V {R} <<< x", f"xargs -rL1 {R} <<< x",
+                    # getopt_long prefixes; `--max-lines` takes no next word.
+                    f"xargs --max-a 1 {R} <<< x", f"xargs --delim '\\n' {R} <<< x",
+                    f"xargs --max-lines {R} <<< x",
+                    f"xargs --max-lines bash -c 'a=$(echo {R}); $a' <<< x"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("xargs -rn 1 echo <<< x", "xargs -0I {} cp {} /tmp/out <<< x",
-                    "xargs -i echo {} <<< x", "xargs -l echo <<< x"):
+                    "xargs -i echo {} <<< x", "xargs -l echo <<< x",
+                    "xargs --max-a 1 echo <<< x", "xargs --null --max-lines=2 echo <<< x"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

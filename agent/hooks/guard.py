@@ -4537,19 +4537,21 @@ def _basename(prog: str) -> str:
     return re.split(r"[\\/]", prog)[-1].lower()
 
 
-# xargs options that consume the NEXT token as their value.
-#
-# `-i` and `-e` are deliberately NOT here, and neither are `--replace`/`--eof`:
-# their values are OPTIONAL and must be ATTACHED (`-i{}`, `--replace={}`), so
-# `xargs -i rm -rf {}` passes `rm` as the COMMAND. Listing them ate the `rm` and
-# reopened the very bypass the `-I` fix closed.
-_XARGS_OPTS_WITH_VALUE = {
-    "-I", "-n", "-L", "-P", "-s", "-d", "-E", "-a",
-    "--max-args", "--max-lines", "--max-procs", "--max-chars",
-    "--delimiter", "--arg-file", "--process-slot-var",
+# GNU xargs' long options, True where a value is REQUIRED (attached or the next
+# word). `--eof`, `--replace` and `--max-lines` take an OPTIONAL value, which
+# must be ATTACHED (`--replace={}`): `xargs --max-lines rm -rf /` runs `rm`.
+_XARGS_LONG_OPTS = {
+    "--arg-file": True, "--delimiter": True, "--max-args": True, "--max-procs": True,
+    "--max-chars": True, "--process-slot-var": True,
+    "--null": False, "--eof": False, "--replace": False, "--max-lines": False,
+    "--open-tty": False, "--interactive": False, "--no-run-if-empty": False,
+    "--verbose": False, "--show-limits": False, "--exit": False,
+    "--help": False, "--version": False,
 }
 # xargs short options taking a REQUIRED value (attached or the next word), and
-# those whose OPTIONAL value must be attached (`-i{}`, `-l2`, `-eEOF`).
+# those whose OPTIONAL value must be attached (`-i{}`, `-l2`, `-eEOF`). `-i`
+# and `-e` taking the next word ate the `rm` of `xargs -i rm -rf {}` and
+# reopened the very bypass the `-I` fix closed.
 _XARGS_SHORT_VALUE = set("adEILnPs")
 _XARGS_SHORT_OPTIONAL = set("eil")
 
@@ -4568,9 +4570,12 @@ def _xargs_options(rest: list[str]) -> tuple[int, str]:
             break
         if opt.startswith("--"):
             name, eq, val = opt.partition("=")
+            # getopt_long takes any unambiguous prefix: `--max-a 1` is `--max-args 1`.
+            hits = [n for n in _XARGS_LONG_OPTS if n.startswith(name)]
+            name = name if name in _XARGS_LONG_OPTS else hits[0] if len(hits) == 1 else name
             if name == "--replace":
                 replstr = val or "{}"
-            elif not eq and name in _XARGS_OPTS_WITH_VALUE and i < len(rest):
+            elif not eq and _XARGS_LONG_OPTS.get(name) and i < len(rest):
                 i += 1
             continue
         for k, c in enumerate(opt[1:], 1):
