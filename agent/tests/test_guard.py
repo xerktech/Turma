@@ -1562,7 +1562,13 @@ class TestScriptChannels(unittest.TestCase):
                     f"true(){{ command echo bas; }}; $(true)h <<EOF\n{R}\nEOF",
                     f"echo(){{ command printf bas; }}; $(echo x)h <<EOF\n{R}\nEOF",
                     f"/usr$(echo /bin/bash) <<EOF\n{R}\nEOF", f"ba$(:)sh <<EOF\n{R}\nEOF",
-                    f"foo(){{ bash; }}; fo$(:)o <<EOF\n{R}\nEOF"):
+                    f"foo(){{ bash; }}; fo$(:)o <<EOF\n{R}\nEOF",
+                    # Glued output word-splits (`env bash`) or forms a path (`../bin/bash`).
+                    f"en$(rev<<<'hsab v') <<EOF\n{R}\nEOF", f"cat <<EOF | en$(rev<<<'hsab v')\n{R}\nEOF",
+                    f"x=en; $x$(rev<<<'hsab v') <<EOF\n{R}\nEOF", f"en$(:)$(rev<<<'hsab v') <<EOF\n{R}\nEOF",
+                    f"..`echo /../../../bin/bash` <<EOF\n{R}\nEOF", f"cd /; usr$(rev<<<'hsab/nib/') <<EOF\n{R}\nEOF",
+                    f":(){{ echo v bash; }}; en$(:) <<EOF\n{R}\nEOF",
+                    f"true(){{ echo v bash; }}; cat <<EOF | en$(true)\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # A variable this line resolves to a non-shell, a glob matching none,

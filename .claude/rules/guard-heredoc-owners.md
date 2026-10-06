@@ -43,9 +43,13 @@ paths:
   - a glob is matched against the shell names (`/bin/ba?h`); a function or alias the command
     defines anywhere (`_defined_names`) may run a shell, whatever its body says;
   - `coproc` is a prefix word. A false deny still needs a destructive body.
-  - An expansion's OUTPUT is never trusted (IFS splits it; `true`/`echo` may be redefined): a word
-    still holding one is judged by its literal prefix — `cat$(:)` can only run `cat…` — and fails
-    closed when the prefix is empty, holds a `/` or a glob, or begins a shell/function/alias name.
+  - An expansion's OUTPUT is never trusted (`_owner_substs`): IFS splits it, `true`/`echo` may be
+    redefined, `en$(…)` printing `v bash` runs `env bash`, and a leading `/` makes the prefix a
+    directory (`..$(…)`). Only a provably silent `$()`/`$(:)`/`$(true)`/`$(false)` is dropped
+    (`cat$(:)` runs `cat`) — and not when the line redefines those. A literal-prefix rule was
+    tried and bypassed both ways; don't retry it.
+  - A set `IFS` splits a resolved value anywhere: any shell name starting it or a path component
+    fails closed (`IFS=x; a=bashx-s; $a`).
   - Globs are matched with `fnmatch`, which is not bash: `[^` is rewritten to `[!` and any `[:`
     class fails closed. `_defined_names` starts only at word starts, so it stays linear.
   - Accepted over-deny (0 in a 19k-command replay): `"$EDITOR" <<EOF`, `${PAGER:-less}`,
