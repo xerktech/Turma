@@ -23,8 +23,10 @@ paths:
   - Pattern/offset: `_op_readings` yields every reading (unknowns empty, `$(…)` as printed, value
     untouched); `_splice_readings` splices them as separate words led by `_UNREAD_OUTPUT`.
     Reading unknowns empty alone let `${a#$PWD}` through; keeping the value alone, `${a#${nope}xx}`.
-  - Replacement: an unknown stays live text, braced (`${nope}`) so glued text stays text; the line's
-    reading then expands it, as for any `$x`. Stripped, `${a/X/$(echo /etc)}` lost `/etc`.
+  - Replacement and `:+`/`+` alternative: words, not patterns. An unknown stays live text (a
+    trailing name braced, `_brace_trailing`, so glued text stays text); the line's reading then
+    expands it, as for any `$x`. Stripped, `${a/X/$(echo /etc)}` lost `/etc`; read empty,
+    `${q:+$HOME}` lost `$HOME`.
   - Cost: a benign command-position op with an unknown pattern (`${cmd%$x}`) is refused. Accepted.
 - `${a:off:len}` arithmetic (`_arith_offset`) truncates `/` and `%` toward zero as bash/C do.
 - Extglob (`+(x)`) is unreadable on purpose: its meaning depends on `shopt -s extglob`, which the

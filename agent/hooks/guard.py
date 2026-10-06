@@ -2034,7 +2034,7 @@ def _pattern_vars(arg: str, vals: dict[str, list[str]], keep: bool = False) -> s
     where they then act as pattern (or, quoted, literal) as bash reads them:
     `"${a%%$s*}"`, `${a#"${a%% *}"}`. An unassigned `IFS` is bash's default.
     A name not assigned here, and a `$(…)`, read EMPTY — or with ``keep``, stay
-    as written: bash may fill them (`$HOME`, `$PWD`), so `_op_readings` takes
+    as written (see `_brace_trailing`): bash may fill them (`$HOME`, `$PWD`), so `_op_readings` takes
     both."""
     if "$" not in arg and "`" not in arg:
         return arg
@@ -2047,11 +2047,7 @@ def _pattern_vars(arg: str, vals: dict[str, list[str]], keep: bool = False) -> s
         if not got:
             if op and op.group(1) in _VAR_DEFAULT_OPS and not keep:
                 return _pattern_vars(op.group(2), vals)
-            if not keep:
-                return ""
-            # Braced, so text glued after it stays text: `$nope` + `rm` would
-            # name `$noperm`.
-            return u.group(0) if u.group(1) else "${" + name + "}"
+            return u.group(0) if keep else ""
         value = _picked(got)
         if tail in _CASE_OPS:
             return _CASE_OPS[tail](value)
@@ -2066,6 +2062,13 @@ def _pattern_vars(arg: str, vals: dict[str, list[str]], keep: bool = False) -> s
     return out if keep else _PATTERN_SUBST_RE.sub("", out)
 
 
+def _brace_trailing(word: str) -> str:
+    """``word`` with a bare name ending it braced, so text spliced after it
+    stays text: `${a/xx/$nope}` on `xxrm` would name `$noperm`. Only the
+    trailing one: one mid-word is already cut off by what follows it."""
+    return re.sub(r"(?<!\\)\$([A-Za-z_]\w*)\Z", r"${\1}", word)
+
+
 def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> list[str]:
     """What `${v<op><arg>}` may yield, for ``value``: one string when its
     pattern is known. A name it can't resolve, or a `$(…)`, may be unset or
@@ -2073,9 +2076,14 @@ def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> l
     read empty, `${a#$PWD}` kept `/tmp` on the path; kept whole, `${a#${nope}xx}`
     hid `/etc` (XERK-1651). So it yields each reading — empty, the `$(…)` read
     as what it prints, and the value untouched — for `_splice_readings`."""
+    if op in (":+", "+"):
+        # An alternative is a word, not a pattern: an unknown in it stays live
+        # text, as in a replacement. Read empty, `${q:+$HOME}` lost the path.
+        return [_apply_var_op(value, op, _brace_trailing(_pattern_vars(arg, vals, keep=True)))]
     if op in ("/", "//"):
         pat, rep = _split_replace(arg)
-        rep = _pattern_vars(rep, vals, keep=True)  # an unknown stays live text
+        # An unknown stays live text.
+        rep = _brace_trailing(_pattern_vars(rep, vals, keep=True))
     else:
         pat, rep = arg, None
     known = _pattern_vars(pat, vals, keep=True)

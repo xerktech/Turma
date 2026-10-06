@@ -1760,12 +1760,22 @@ class TestScriptChannels(unittest.TestCase):
                     "s=x; a='x/etc'; b=\"${a#$s}\"; rm -rf $b",
                     "s=Q; a='Q/etc'; b=${a/$s/}; rm -rf \"$b\"",
                     "eval \"$(echo x=1)\" \"$(echo \"a='rm -rf /etc'\")\"; $a",
-                    "eval \"$(echo x=1); $(echo \"a='rm -rf /etc'\")\"; $a"):
+                    "eval \"$(echo x=1); $(echo \"a='rm -rf /etc'\")\"; $a",
+                    # QA delta 6: an alternative keeps a name bash sets; ops
+                    # along a chain of names (XERK-1648's resolver).
+                    "q=1; rm -rf ${q:+$HOME}",
+                    "q=1; y=${q:+$HOME}; rm -rf \"$y\"",
+                    "q=/etcx; d=$q; r=${d%x}; rm -rf $r",
+                    "q=/tmp; d=$q; r=${d/tmp/etc}; rm -rf $r",
+                    "x=1; y=${x:+/etc}; z=$y; rm -rf $z",
+                    "q=1; a=/etc; y=${q:+$a}; z=$y; rm -rf $z"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("eval 'a=$(echo /tmp/x)'; rm -rf \"$a\"",
                     "x='eval \"$x\"'; eval \"$x\"; ls",
                     " ".join(['eval \"$(echo a=1)\";'] * 10) + " ls",
+                    "x=1; env ${x:+A=$nope} ls",
+                    "f(){ x=$1; env ${x:+A=$x} ls; }; f a",
                     "eval \"$(ssh-agent -s)\"; ssh-add",
                     "p=/usr/local/bin/tool; echo \"${p##*/}\" \"${p%/*}\"",
                     "a='  x  '; a=\"${a#\"${a%%[![:space:]]*}\"}\"; echo \"$a\"",
