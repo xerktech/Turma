@@ -5245,14 +5245,14 @@ def _only_expansions(word: str) -> bool:
 
 
 def _empties_a_set_path(op: str) -> bool:
-    """Whether `${HOME<op>}` can be empty though HOME holds a path: `:+`/`+`
-    with an empty word, a substring (`:0:0`), or a removal or replacement
-    whose pattern can match the whole path (`#$HOME`, `/*/`). `%/` cannot."""
+    """Whether `${HOME<op>}` can be empty though HOME holds a path. Only the
+    operators that cannot are listed: a default or `?` (unused, HOME is set),
+    a case change or `@` transform, and stripping one `/`. Any other pattern
+    can match the whole path, a literal one too (`${HOME#/root}`)."""
     if op[:2] == ":+" or op[:1] == "+":
         return _only_expansions(op[2 if op[0] == ":" else 1:])
-    if op[:1] == ":" and op[1:2] not in ("-", "=", "?"):
-        return True
-    return op[:1] in ("#", "%", "/") and bool(re.search(r"[*?\[$`]", op))
+    return not (op == "" or op[:1] in ("-", "=", "?", "^", ",", "@")
+                or op[:2] in (":-", ":=", ":?") or op in ("%/", "#/"))
 
 
 def _leading_names_end(raw: str) -> int:
@@ -5271,6 +5271,8 @@ def _leading_names_end(raw: str) -> int:
             if head is None:
                 return 0
             name, op, end = head.group(1), raw[head.end():close], close + 1
+            if head.group(0) != name:
+                name = ""  # `${HOME[1]}` and `${!HOME}` are not HOME's value
         else:
             return 0
         # `?` errors and a default or assigned word is used; only an empty one

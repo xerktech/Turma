@@ -3097,11 +3097,15 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(guard._leading_names_end("$a${b%/}/etc"), len("$a${b%/}"))
         self.assertEqual(guard._leading_names_end("$a${b:-c}/etc"), 0)
         self.assertEqual(guard._leading_names_end("${x:-${HOME}}/etc"), 0)
-        self.assertEqual(guard._leading_names_end("${HOME%/}/etc"), 0)
+        for word in ("${HOME%/}", "${HOME#/}", "${HOME:+x}", "${HOME:-}", "${HOME^^}", "${HOME@Q}"):
+            with self.subTest(word=word):
+                self.assertEqual(guard._leading_names_end(word + "/etc"), 0)
         # ...but an operator can still empty an always-set name (QA pass 4).
         for word in ("${x:-${HOME:+}}", "${x:-${HOME+}}", "${x:-${y:+$HOME}}", "${x:-${y:+${HOME}}}",
                      "${x:-${HOME#$HOME}}", "${x:-${HOME:0:0}}", "${x:-${PWD:+}}", "${x:=${HOME:+}}",
-                     "${HOME:+}", "${HOME#$HOME}", "${PWD:0:0}", "${HOME/*/}", "${HOME%%*}"):
+                     "${HOME:+}", "${HOME#$HOME}", "${PWD:0:0}", "${HOME/*/}", "${HOME%%*}",
+                     "${HOME+}", "${HOME+$y}", "${x:-$HOMEDIR}", "${HOME[1]}", "${PWD[1]}",
+                     "${HOME#/root}", "${HOME%root}", "${HOME/root}", "${HOME:1}"):
             with self.subTest(word=word):
                 self.assertEqual(guard._leading_names_end(word + "/etc"), len(word))
         for depth in (2, 17, 30):
