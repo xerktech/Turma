@@ -3096,6 +3096,14 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # and an unclosed `${` stops the scan instead of backtracking (QA).
         self.assertEqual(guard._leading_names_end("$a${b%/}/etc"), len("$a${b%/}"))
         self.assertEqual(guard._leading_names_end("$a${b:-c}/etc"), 0)
+        self.assertEqual(guard._leading_names_end("${x:-${HOME}}/etc"), 0)
+        for depth in (2, 17, 30):
+            with self.subTest(depth=depth):
+                word = "${a:-" * depth + "${y}" + "}" * depth
+                self.assertEqual(guard._leading_names_end(word + "/etc"), len(word))
+        start = time.monotonic()
+        self.assertEqual(guard._leading_names_end("${a}" * 20000 + "x"), 0)
+        self.assertLess(time.monotonic() - start, 1)
         start = time.monotonic()
         self.assertEqual(guard._leading_names_end("${" + "a" * 200000), 0)
         self.assertLess(time.monotonic() - start, 1)

@@ -5234,11 +5234,13 @@ def _only_expansions(word: str) -> bool:
     """True if ``word`` is nothing but quotes, blanks and names, so it can be
     empty too: the default in `${x:-${y}}` or `${x:-"$y"}`."""
     word = word.replace('"', "").replace("'", "")
+    if re.search(r"\$\{?(?:HOME|PWD)\b", word):
+        return False
     for _ in range(16):  # one pass per nesting level; deeper reads as empty
         word, n = _EXPANSIONS_RE.subn("", word)
         if not n:
-            break
-    return not word.strip()
+            return not word.strip()
+    return True
 
 
 def _leading_names_end(raw: str) -> int:
@@ -5250,7 +5252,9 @@ def _leading_names_end(raw: str) -> int:
         if m := _PLAIN_NAME_RE.match(raw, pos):
             name, op, end = m.group(1), "", m.end()
         elif raw.startswith("${", pos):
-            close = _brace_end(raw, pos)
+            # Unquoted: the token is dequoted, and looking its quotes up rescans
+            # the whole word per `${`, quadratic in a run of names (QA).
+            close = _brace_end(raw, pos, False)
             head = _BRACED_NAME_RE.match(raw, pos + 2, close) if close > 0 else None
             if head is None:
                 return 0
