@@ -2931,7 +2931,12 @@ def _simple_commands(stage: str, depth: int = 0) -> list[str]:
 
 
 def _command_reads_stdin(stage: str, depth: int) -> bool:
-    """`_reads_stdin_script` for one simple command (no list, no group)."""
+    """`_reads_stdin_script` for one simple command (no list, no group), in
+    every way bash may form its program name (`_name_readings`)."""
+    return any(_command_reads_stdin_as(text, depth) for text in _name_readings(stage))
+
+
+def _command_reads_stdin_as(stage: str, depth: int) -> bool:
     text = _sub_substs(stage, _proc_subst_path)
     # A `<(` left is one the (not paren-aware) split cut off from its `)`:
     # `bash < <(echo hi; echo …)` reaches here as `bash < <(echo hi`.
@@ -3122,6 +3127,30 @@ _SHELL_WORD_RE = re.compile(
     r"|(?:^|(?<=[\s;&|({]))\.(?=\s)")
 
 
+# What may expand to nothing inside a word: `$@`, `$*` (no arguments at the
+# top level) and an empty `$''` / `$""`.
+_EMPTY_EXPANSION_RE = re.compile(r"\$(?:[@*]|\{[@*]\}|''|\"\")")
+
+
+def _name_readings(text: str) -> tuple[str, ...]:
+    """``text``, and again as bash may form program names from it (XERK-1629):
+    every `$(…)`/backtick substitution printing nothing, `$@`/`$*`/`$''`/`$""`
+    empty, `$'\\x68'` decoded and `{a,b}` braces expanded. Bash runs `bas``h`,
+    `bas$(:)h`, `bas$@h`, `$'bas\\150'` as `bash`, and `{bas,-s}h` as `bash
+    -sh`; shlex reads each as one other word. Only for asking which program a
+    command runs: a substitution dropped here is still classified where it sits."""
+    if "$" not in text and "`" not in text and "{" not in text:
+        return (text,)
+    out, last = [], 0
+    for m in _find_substs(text):
+        if m.group(0)[0] in "$`":
+            out.append(text[last:m.start()])
+            last = m.end()
+    out.append(text[last:])
+    formed = _expand_braces(_decode_ansi_c(_EMPTY_EXPANSION_RE.sub("", "".join(out))))
+    return (text,) if formed == text else (text, formed)
+
+
 def _reads_stdin_grouped(segment: str) -> bool:
     return any(_reads_stdin_script(text) for text in _ungrouped(segment))
 
@@ -3151,8 +3180,15 @@ def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell) -> bool:
 
     The line's first word alone missed three owners bash runs the body for:
     `bash<<EOF` (one word), `(bash <<EOF` (a subshell) and `{ bash; } <<EOF`
-    (a group's redirect feeds every reader in it).
+    (a group's redirect feeds every reader in it). Asked of every way bash
+    may form names on the line: `bas``h <<EOF`, `cat <<EOF | {bas,-s}h`
+    (XERK-1629).
     """
+    return any(_heredoc_owner_reading_feeds_shell(text, commands_feed_shell)
+               for text in _name_readings(owner))
+
+
+def _heredoc_owner_reading_feeds_shell(owner: str, commands_feed_shell) -> bool:
     # The splitter reads the `&` of `2>&1` / `&>f` as a background operator
     # and the `|` of `>|f` as a pipe, which cut `bash 2>&1 <<EOF` away from
     # its program. Only the program is asked of these segments, so both go.
@@ -3334,9 +3370,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if not line_feeds_shell:
             # Quotes, escapes and line continuations joined: bash runs `bas''h`,
             # `b\ash`, `bas$''h` and `bas\` / `h` as `bash`.
-            joined = re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", raw_commands)
-            line_feeds_shell.append(any(map(_SHELL_WORD_RE.search, (raw_commands, joined))) or any(
-                _reads_stdin_grouped(st) for st in _split_segments(raw_commands)))
+            # ...and names formed by an empty substitution or a brace (XERK-1629).
+            texts = _name_readings(raw_commands)
+            joined = [re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", t) for t in texts]
+            line_feeds_shell.append(any(map(_SHELL_WORD_RE.search, (*texts, *joined))) or any(
+                _reads_stdin_grouped(st) for t in texts for st in _split_segments(t)))
         return line_feeds_shell[0]
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`

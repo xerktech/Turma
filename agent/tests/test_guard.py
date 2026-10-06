@@ -1493,6 +1493,24 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_shell_name_formed_by_an_empty_expansion_or_a_brace(self):
+        # XERK-1629: bash forms `bash` from `bas``h`, `bas$(:)h`, `bas$@h`,
+        # `$'bas\150'` and `bash -sh` from `{bas,-s}h`; shlex reads one other word.
+        R = self.R
+        for name in ("bas``h", "bas$()h", "bas$(:)h", "bas$( )h", "bas` `h", "b``a``s``h",
+                     "bas$(true)h", "bas$''h", 'bas$""h', "bas$@h", "bas$*h", "bas${@}h",
+                     "bas$'\\x68'", "$'bas\\150'", "{bas,-s}h", "/bin/bas``h"):
+            for cmd in (f"{name} <<EOF\n{R}\nEOF", f"{name} <<'EOF'\n{R}\nEOF",
+                        f"cat <<EOF | {name}\n{R}\nEOF", f"echo '{R}' | {name}",
+                        f"{{ X=')' {name}; }} <<EOF\n{R}\nEOF", f"(X=')' {name})<<EOF\n{R}\nEOF"):
+                with self.subTest(cmd=cmd):
+                    self.assertDenied(cmd)
+        # `bash sh` / `sh s` run a script FILE, not stdin.
+        for cmd in (f"echo '{R}' | {{ba,}}sh", f"echo '{R}' | s{{h,}}",
+                    f"cat$(:) <<EOF\n{R}\nEOF", f"echo '{R}' | ca``t"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_here_strings_and_process_substitution_fed_to_a_shell(self):
         R = self.R
         for cmd in (f"sh <<< '{R}'", f"sh<<<'{R}'", f"bash -s <<< '{R}'",
