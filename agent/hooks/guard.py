@@ -2814,7 +2814,7 @@ def _proc_subst_texts_uncached(body: str, depth: int) -> list[str]:
     return [t for t in out if t.strip()]
 
 
-def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
+def _reads_stdin_script(stage: str, depth: int = 0, fresh: bool = False) -> bool:
     """Whether the command in ``stage`` runs its stdin (or an inherited fd) as
     a SCRIPT: a shell with no `-c` and no script file (`… | sh`, `bash -s`,
     `sh <<< '…'`), `source`/`.` of such a path (`. <(echo …)`), or a shell
@@ -2825,9 +2825,11 @@ def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
     if depth > _MAX_EXPAND_DEPTH:
         return True  # a reader fed too much fails closed
     # Read as bash forms its names first: `_unwrap_group` takes `{,bash}` for
-    # a group and leaves `,bash` (XERK-1629). At the top only: a reading per
-    # nested level doubled the work per level (the brace cap re-forms each).
-    if depth:
+    # a group and leaves `,bash` (XERK-1629). Once per script TEXT — the top,
+    # and each ``fresh`` `-c` script, whose quoted braces the outer reading
+    # left alone — never per group level: that doubled the work per level
+    # (the brace cap re-forms each).
+    if depth and not fresh:
         return _reads_stdin_script_as(stage, depth)
     return any(_reads_stdin_script_as(text, depth) for text in _name_readings(stage))
 
@@ -3004,7 +3006,7 @@ def _command_reads_stdin_as(stage: str, depth: int) -> bool:
         return False
     if _shell_c_index(rest) >= 0:
         script = _shell_c_script(rest)
-        return bool(script) and _reads_stdin_script(script, depth + 1)
+        return bool(script) and _reads_stdin_script(script, depth + 1, fresh=True)
     if prog == "su":
         return True  # its operands name a USER; without `-c` the shell reads stdin
     i = 0

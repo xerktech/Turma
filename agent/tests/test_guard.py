@@ -1517,7 +1517,10 @@ class TestScriptChannels(unittest.TestCase):
                     f"echo '{R}' | {{,bash}}|cat", f"echo '{R}' | {{,bash}};",
                     f"echo '{R}' | {{,bash}}&&true", f"echo '{R}' | ({{,bash}})",
                     f"echo '{R}' | {{,bash}}>/dev/null", f"echo '{R}' | bash>/dev/null",
-                    f"echo '{R}' | bash>&2"):
+                    f"echo '{R}' | bash>&2", f"echo '{R}' | bash -c '{{,bash}}'",
+                    f"echo '{R}' | bash -c \"(cat | {{,bash}})\"",
+                    f"bash -c '(cat | {{,bash}})' <<< '{R}'",
+                    f"echo '{R}' | bash -c 'bash -c \"{{,bash}}\"'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in (f"echo '{R}' | {{ba,}}sh", f"echo '{R}' | s{{h,}}",
