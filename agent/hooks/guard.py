@@ -59,6 +59,7 @@ as cwd, so it cannot rely on any package being importable.
 from __future__ import annotations
 
 import bisect
+import collections
 import fnmatch
 import functools
 import hashlib
@@ -1864,7 +1865,7 @@ _VAR_OP_RE = re.compile(r"^(##|#|%%|%|:-|:=|:\+|-|=|\+|//|/|:)(.*)$", re.DOTALL)
 _VAR_DEFAULT_OPS = {":-", "-", ":=", "="}
 
 
-def _apply_var_op(value: str, op: str, arg: str) -> str:
+def _apply_var_op(value: str, op: str, arg: str, expand=None) -> str:
     """Apply a `${name<op><arg>}` expansion to a known value.
 
     Only the literal cases are modelled — enough that a one-character operator
@@ -1885,8 +1886,15 @@ def _apply_var_op(value: str, op: str, arg: str) -> str:
         pat, rep = pat.replace("\\/", "/"), rep.replace("\\/", "/")
         return value.replace(pat, rep, -1 if op == "//" else 1) if pat else value
     if op in (":+", "+"):
-        # The alternative replaces a set value: `${q:+/etc}` is /etc.
-        return arg if value or op == "+" else value
+        # The alternative replaces a set value: `${q:+/etc}` is /etc. Names in
+        # it are expanded by ``expand``; spliced raw, `${x:+$x}` ran as the
+        # literal text `$x`. With no ``expand`` such an alternative is left as
+        # the value it would replace.
+        if not (value or op == "+"):
+            return value
+        if "$" in arg or "`" in arg:
+            return expand(arg) if expand else value
+        return arg
     if op == ":":
         bits = arg.split(":")
         try:
@@ -2077,7 +2085,7 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
     linked: dict[str, list[tuple[int, set[str]]]] = {}
     for k, vs in vals.items():
         for i, v in enumerate(vs):
-            names = {m.group(1) or m.group(3) for m in _var_uses(v)} & vals.keys()
+            names = _names_used(v) & vals.keys()
             if names:
                 waits[k] |= names
                 linked.setdefault(k, []).append((i, names))
@@ -2093,17 +2101,67 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         value = _picked(got)
         op = _VAR_OP_RE.match(m.group(2) or "")
         if op:
-            value = _apply_var_op(value, op.group(1), op.group(2))
+            value = _apply_var_op(value, op.group(1), op.group(2),
+                                  lambda t: _var_sub(lambda u: link(u, owner), t))
         _spend(len(value) - len(m.group(0)))
         return value
 
+    def settle(k: str, i: int) -> str:
+        return _var_sub(lambda m: link(m, k), vals[k][i])
+
     for group in _dependency_order(waits):
-        # Values naming no other member first: `d=$x; d=$d/y` reads `$d` as $x's.
-        todo = [(len(names & group) > 0, k, i) for k in group for i, names in linked.get(k, ())]
-        for _cyclic, k, i in sorted(todo):
-            got = out[k][i] = _var_sub(lambda m: link(m, k), vals[k][i])
-            (known if i < own[k] else defaults)[k].append(got)
+        slots = [(k, i, names) for k in group for i, names in linked.get(k, ())]
+        if not any(names & group for _k, _i, names in slots):
+            # Every name used is resolved already.
+            for k, i, _names in slots:
+                got = out[k][i] = settle(k, i)
+                (known if i < own[k] else defaults)[k].append(got)
+            continue
+        # A cycle (`a=$b; b=$a`, `d=/; d=$d/etc`): a value is re-read each
+        # time a member it uses changes, up to once more per member it uses
+        # (each lap of the cycle grows the joined values), so a seed
+        # reaches every member however the names sort (`b=/etc; c=$b; a=$c;
+        # b=$a; $a`). Unreached, a member reads empty, as an unset name.
+        base = {k: (list(known[k]), list(defaults[k])) for k in group}
+        got: dict[tuple[str, int], str] = {}
+        users: dict[str, list[tuple[str, int]]] = {}
+        most = {(k, i): 1 + len(names & (group - {k})) for k, i, names in slots}
+        for k, i, names in slots:
+            # Not its own name: `d=$d/etc` reads d as it was before.
+            for n in names & (group - {k}):
+                users.setdefault(n, []).append((k, i))
+        queue = collections.deque((k, i) for k, i, _names in slots)
+        queued = set(queue)
+        reads = collections.Counter()
+        while queue:
+            k, i = slot = queue.popleft()
+            queued.discard(slot)
+            if reads[slot] > most[slot]:
+                continue
+            reads[slot] += 1
+            value = settle(k, i)
+            if got.get(slot) == value:
+                continue
+            got[slot] = out[k][i] = value
+            mine = [(j, got[k, j]) for j, _n in linked[k] if (k, j) in got]
+            known[k] = base[k][0] + [v for j, v in mine if j < own[k]]
+            defaults[k] = base[k][1] + [v for j, v in mine if j >= own[k]]
+            for user in users.get(k, ()):
+                if user not in queued:
+                    queue.append(user)
+                    queued.add(user)
     return out
+
+
+def _names_used(text: str) -> set[str]:
+    """Every name ``text`` expands, those in an operator's argument included
+    (`${q:+$a}` uses `a`)."""
+    names: set[str] = set()
+    for m in _var_uses(text):
+        names.add(m.group(1) or m.group(3))
+        if m.group(2) and "$" in m.group(2):
+            names |= _names_used(m.group(2))
+    return names
 
 
 def _dependency_order(waits: dict[str, set[str]]) -> list[set[str]]:
@@ -2782,7 +2840,8 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 out = '"' + _quote_literal(value, "") + '"'
             else:
                 if op:
-                    value = _apply_var_op(value, op.group(1), op.group(2))
+                    value = _apply_var_op(value, op.group(1), op.group(2), lambda t: _var_sub(
+                        lambda u: _picked(vals.get(u.group(1) or u.group(3)) or [u.group(0)]), t))
                 out = _quote_literal(value, state)
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
             # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and

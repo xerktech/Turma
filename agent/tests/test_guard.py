@@ -1189,13 +1189,21 @@ class TestParserGaps(unittest.TestCase):
                     "q=/tmp; d=${q:+/etc}; rm -rf $d",
                     "q=/tmp/a; d=${q/tmp\\/a/etc}; rm -rf $d",
                     "a=/etc; b=$a; y=${x:-$b}; z=$y; rm -rf $z",
-                    "c='rm -rf /etc'; q='echo hi'; q=$c; d=$q; $d"):
+                    "c='rm -rf /etc'; q='echo hi'; q=$c; d=$q; $d",
+                    # QA: an alternative naming a name, and a cycle seeded two
+                    # hops from its use, against the names' sort order.
+                    "x=/etc; rm -rf ${x:+$x}",
+                    "x=1; y='rm -rf /etc'; ${x:+$y}",
+                    "q=1; a='rm -rf /etc'; d=${q:+$a}; $d",
+                    "b=/etc; c=$b; a=$c; b=$a; rm -rf $a",
+                    "z=/etc; y=$z; x=$y; z=$x; rm -rf $x"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         for cmd in ("q=/tmp/q; d=$q/d2/ro; r=$d/; rm -rf $r",
                     "q=/tmp/q; d=$q/d2/ro; r=$d/$(cat f); rm -rf $r",
                     "q=/tmp/q; d=$q/d2/ro; r=$d/$tag; rm -rf $r",
-                    "q=/tmp/q; d=$q$c; r=$d/x; c=$c; rm -rf $r"):
+                    "q=/tmp/q; d=$q$c; r=$d/x; c=$c; rm -rf $r",
+                    "d=/tmp/x; e=${d:+$d/sub}; rm -rf $e"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
@@ -1207,8 +1215,10 @@ class TestParserGaps(unittest.TestCase):
         doubling = "a0=xxxxxxxx; " + "".join(f"a{i + 1}=$a{i}$a{i}; " for i in range(40))
         long = "".join(f"a{i + 1}=$a{i}; " for i in range(3000))
         cycle = "".join(f"b{i}=$b{i + 1}; " for i in range(3000)) + "b3000=$b0; "
+        ring = "a0=/tmp/x; " + long + "a0=$a3000; "
         for cmd, want in ((doubling + "echo $a40", "deny"), ("a0=/etc; " + long + "rm -rf $a3000", "deny"),
-                          ("a0=/tmp/x; " + long + "rm -rf $a3000", "allow"), (cycle + "echo $b7", "allow")):
+                          ("a0=/tmp/x; " + long + "rm -rf $a3000", "allow"), (cycle + "echo $b7", "allow"),
+                          (ring + "rm -rf $a5", "allow"), (ring.replace("/tmp/x", "/etc") + "rm -rf $a5", "deny")):
             with self.subTest(cmd=cmd[:40]):
                 start = time.monotonic()
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], want)

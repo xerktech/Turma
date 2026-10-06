@@ -285,10 +285,17 @@ paths:
   - Resolving once, against values naming none, read `q=/etc; d=$q; r=$d` as `r` empty. Rounds
     were tried too: a link naming a cycle (`d=$q$c; c=$c`) stalled the chain, and a name with one
     plain and one chained value (`q=/tmp; q=$e; d=$q`) was read before its second value.
-  - Inside a cycle a member not yet resolved reads empty, as an unset name; the rest of the
-    cycle's members still resolve, and so does everything using the cycle.
-  - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`).
-  - Not modelled: ORDER (`d=$q$c; c=x` reads c as x; bash has it unset at that point).
+  - A cycle (an SCC, or a name using itself) re-reads a value each time a member it uses changes,
+    at most 1 + (members it uses) times: a seed then reaches every member however the names sort
+    (`b=/etc; c=$b; a=$c; b=$a`). Read once in sorted order, that read `a` empty (QA). A value
+    never re-reads for its OWN name (`d=/; d=$d/etc` stays `//etc`). An unreached member reads
+    empty, as an unset name. Accepted: a dense cycle (a 30-name clique) grows its joined values
+    past the budget and is denied as too large.
+  - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`); names in a
+    `:+`/`+` alternative are expanded by the caller's `expand` (both `_assigned_values` and
+    `_substitute_vars`) and count as dependencies (`_names_used`). Spliced raw, `${x:+$x}` ran
+    as the literal `$x` — a bypass of `rm -rf ${x:+$x}`.
+  - Not modelled: ORDER (`d=$q$c; c=x` reads c as x; bash has it unset there) — XERK-1660.
   - Tests: `test_a_chain_of_assignments_resolves_every_link`,
     `test_a_cycle_of_assignments_stays_bounded`.
 - **A name assigned more than once is also read with each value on its own** (`_picked`,
