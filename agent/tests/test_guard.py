@@ -1501,6 +1501,7 @@ class TestScriptChannels(unittest.TestCase):
                      "bas$(true)h", "bas$''h", 'bas$""h', "bas$@h", "bas$*h", "bas${@}h",
                      "bas${@:-}h", "bas${*:-}h", "bas${@:1}h",
                      "{,bash}", "bas{h..h}", "{b..b}ash", '$"bash"', '$"bas"h',
+                     "bas${@:-h}", "ba${*-s}h",
                      "bas${@:-}h", "bas${*:-}h", "bas${@:1}h",
                      "bas$'\\x68'", "$'bas\\150'", "{bas,-s}h", "/bin/bas``h"):
             for cmd in (f"{name} <<EOF\n{R}\nEOF", f"{name} <<'EOF'\n{R}\nEOF",
@@ -1510,12 +1511,14 @@ class TestScriptChannels(unittest.TestCase):
                     self.assertDenied(cmd)
         # `bash sh` / `sh s` run a script FILE, not stdin; a sequence past
         # `_BRACE_SEQ_MAX`, or a mixed one bash leaves literal, is not expanded.
-        for cmd in (f"echo x | {{,bash}} -c '{R}'", f"rm -rf /{{e..e}}tc"):
+        for cmd in (f"echo x | {{,bash}} -c '{R}'", f"rm -rf /{{e..e}}tc",
+                    f"echo {{a,b}} {{a,b}} {{a,b}} {{a,b}} >/dev/null; echo '{R}' | {{,bash}}"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in (f"echo '{R}' | {{ba,}}sh", f"echo '{R}' | s{{h,}}",
                     f"cat$(:) <<EOF\n{R}\nEOF", f"echo '{R}' | ca``t", "echo {1..5}",
-                    "echo {1..99999}", "echo {a..1}", f"echo '{R}' | {{,c}}at"):
+                    "echo {1..99999}", "echo {a..1}", f"echo '{R}' | {{,c}}at",
+                    f"echo '{R}' | ba${{@:-zz}}sh"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

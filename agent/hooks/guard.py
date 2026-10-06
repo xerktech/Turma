@@ -2819,6 +2819,12 @@ def _reads_stdin_script(stage: str, depth: int = 0) -> bool:
     does: `echo … | (cat | bash)`."""
     if depth > _MAX_EXPAND_DEPTH:
         return True  # a reader fed too much fails closed
+    # Read as bash forms its names first: `_unwrap_group` takes `{,bash}` for
+    # a group and leaves `,bash` (XERK-1629).
+    return any(_reads_stdin_script_as(text, depth) for text in _name_readings(stage))
+
+
+def _reads_stdin_script_as(stage: str, depth: int) -> bool:
     # A part equal to the stage is read as one command, never split again: the
     # redirect re-reading returns `>&1` among the parts of `>&1` (XERK-1616),
     # and re-splitting it ran to the depth cap, which says "reads".
@@ -3150,7 +3156,9 @@ _SHELL_WORD_RE = re.compile(
 
 # What may expand to nothing inside a word: `$@`, `$*`, `${@:-}`, `${*:1}` (no
 # arguments at the top level) and an empty `$''` / `$""`.
-_EMPTY_EXPANSION_RE = re.compile(r"\$(?:[@*]|\{[@*][^}]*\}|''|\"\")")
+# `${@:-w}` / `${*-w}` is `w`. `[^}$]`, not `[^}]`: that restarted at every
+# unclosed `${@`, quadratic.
+_EMPTY_EXPANSION_RE = re.compile(r"\$(?:[@*]|\{[@*](?::?[-=]([^}$]*)|[^}$]*)\}|''|\"\")")
 # `$"…"` is a locale-translated string: untranslated, `$"bash"` runs `bash`.
 _LOCALE_STRING_RE = re.compile(r"\$(?=\")")
 
@@ -3170,7 +3178,8 @@ def _name_readings(text: str) -> tuple[str, ...]:
             out.append(text[last:m.start()])
             last = m.end()
     out.append(text[last:])
-    formed = _LOCALE_STRING_RE.sub("", _EMPTY_EXPANSION_RE.sub("", "".join(out)))
+    formed = _LOCALE_STRING_RE.sub("", _EMPTY_EXPANSION_RE.sub(lambda m: m[1] or "",
+                                                               "".join(out)))
     formed = _expand_braces(_decode_ansi_c(formed))
     return (text,) if formed == text else (text, formed)
 
@@ -3561,7 +3570,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             _feed(text)
         for stage in _split_on_operators(pipeline, keep_redirects=True, groups=True):
             ustage = _unwrap_group(stage)
-            if _reads_stdin_script(ustage):
+            # Named as bash forms it before the group is unwrapped (XERK-1629).
+            if any(_reads_stdin_script(_unwrap_group(t)) for t in _name_readings(stage)):
                 fed = list(producers)
                 fed.extend(_herestrings(ustage))
                 for m in _find_substs(ustage):
