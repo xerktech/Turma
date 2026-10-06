@@ -3217,7 +3217,8 @@ def _bash_dequoted(word: str) -> str | None:
     while i < n:
         ch = word[i]
         if ch == "\\":
-            out.append(word[i + 1:i + 2])
+            if word[i + 1:i + 2] != "\n":  # a `\<newline>` continues the line
+                out.append(word[i + 1:i + 2])
             i += 2
         elif ch == "'":
             close = word.find("'", i + 1)

@@ -2071,6 +2071,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         'bash -c "Z=\\$((1 + 2)) rm -rf /etc; "\'X=$((1 + 2)) true\'',
         'sh -c \'X=$((1 + 2)) true; \'"Z=\\$((1 + 2)) rm -rf /etc"',
         'echo \'X=$((1 + 2)) true; \'"Z=\\$((1 + 2)) rm -rf /etc" | bash',
+        "bash -c 'X=${nope:-a'\\ 'b} rm -rf /etc'",
+        "bash -c 'X=1 true; Y'\\\n'=${nope:-a b} rm -rf /etc'",
         "dash <<'E'\nX=${nope:-a b}\"${nope:-'}\" rm -rf /etc; : '}\"'\nE",
         "sh -c 'X=${nope:-a b}\"${nope:-'\"'\"'}\" rm -rf /etc; : '\"'\"'}\"'\"'\"''",
         "bash <<'E'\nX=${nope:-a b} bash <<F\nY=\\${nope:-a b} rm -rf /etc\nF\nE",
