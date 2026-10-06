@@ -1169,6 +1169,74 @@ class TestParserGaps(unittest.TestCase):
         self.assertAllowed(cmd)
         self.assertEqual(guard._var_values("d=/; d=$d/etc")["d"], ["/", "//etc"])
 
+    def test_a_chain_of_assignments_resolves_every_link(self):
+        """XERK-1648: a value naming a name whose own value names another was
+        read empty, so `r=$d` hid `/etc`. The chain's values are a reading of
+        their own beside the resolve-once one, which stays: it is bash's when
+        the chain is assigned after the use (`c=$p/; p=1`), so `r=$d/` still
+        reads `/` too (order is XERK-1660)."""
+        cmd = "q=/tmp/q; d=$q/d2/ro; r=$d/$tag"
+        self.assertEqual(guard._var_values(cmd)["r"], ["/$tag"])
+        guard._VALUES_CHAINED[0] = True
+        try:
+            self.assertEqual(guard._var_values(cmd)["r"], ["/tmp/q/d2/ro/$tag"])
+        finally:
+            guard._VALUES_CHAINED[0] = False
+        for cmd in ("q=/etc; d=$q; r=$d; rm -rf $r",
+                    "q=/etc; d=$q; r=$d; s=$r; t=$s; rm -rf $t",
+                    'y=${x:-"rm -rf /etc"}; z=$y; w=$z; $w',
+                    # QA: a link naming a cycle, a name with a plain and a
+                    # chained value, an operator in a link, a default naming
+                    # a name, a decoy value.
+                    "q=/etc; d=$q$c; r=$d; c=$c; rm -rf $r",
+                    "q=/etc; d=$q$e; r=$d; e=$f; f=$e; rm -rf $r",
+                    "e=/etc; q=/tmp/x; q=$e; d=$q; rm -rf $d",
+                    "d=; d=/etc$d; r=$d; rm -rf $r",
+                    "d=/e; d=${d}tc; r=$d; rm -rf $r",
+                    "q=/etcx; d=${q%x}; rm -rf $d",
+                    "q=/tmp; d=${q:+/etc}; rm -rf $d",
+                    "q=/tmp/a; d=${q/tmp\\/a/etc}; rm -rf $d",
+                    "a=/etc; b=$a; y=${x:-$b}; z=$y; rm -rf $z",
+                    "c='rm -rf /etc'; q='echo hi'; q=$c; d=$q; $d",
+                    "x=/etc; rm -rf ${x:+$x}",
+                    "x=1; y='rm -rf /etc'; ${x:+$y}",
+                    "q=1; a='rm -rf /etc'; d=${q:+$a}; $d",
+                    # QA, against bash's own values: swapped in, the chain's
+                    # values moved the per-value picks, and a later assignment
+                    # was read into an earlier use.
+                    'b=$b/; x=1; b=/e; x=${b}tc; rm -rf "$x"',
+                    'c=$p/; x=${c:-$d}; p=${d:+$d}; d=1; rm -rf "$c"',
+                    # QA: appended, a chained value moved main's pairing of
+                    # two names' last values.
+                    "p=$q; q=true; a=:; a=$p; a=eval; b=x; b=x; b=x; b='rm -rf /etc'; $a \"$b\""):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        for cmd in ("q=/tmp/q; d=$q/d2/ro; r=$d/x; rm -rf $r",
+                    "q=/tmp/q; d=$q$c; r=$d/x; c=$c; rm -rf $r",
+                    "d=/tmp/x; e=${d:+$d/sub}; rm -rf $e",
+                    # QA: a chained value per reassignment doubled past the
+                    # pass cap ("too large").
+                    "R=/tmp/w; D=$R/build; " + "f=$D/part0.log; echo x > $f; " * 14 + "ls $D"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
+
+    def test_a_cycle_of_assignments_stays_bounded(self):
+        """A cycle reads empty, as an unset name. A long chain or ring resolves
+        in linear time, and one that doubles is charged to the budget."""
+        self.assertEqual(guard._var_values("a=$b; b=$a"), {"a": [""], "b": [""]})
+        self.assertEqual(guard.decide("Bash", {"command": "a=$b; b=$a; echo $a"})[0], "allow")
+        doubling = "a0=xxxxxxxx; " + "".join(f"a{i + 1}=$a{i}$a{i}; " for i in range(40))
+        long = "".join(f"a{i + 1}=$a{i}; " for i in range(1000))
+        cycle = "".join(f"b{i}=$b{i + 1}; " for i in range(1000)) + "b1000=$b0; "
+        ring = "a0=/tmp/x; " + long + "a0=$a1000; "
+        for cmd, want in ((doubling + "echo $a40", "deny"), ("a0=/etc; " + long + "rm -rf $a1000", "deny"),
+                          ("a0=/tmp/x; " + long + "rm -rf $a1000", "allow"), (cycle + "echo $b7", "allow"),
+                          (ring + "rm -rf $a5", "allow")):
+            with self.subTest(cmd=cmd[:40]):
+                start = time.monotonic()
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], want)
+                self.assertLess(time.monotonic() - start, 5)
+
 
 class TestProducedScripts(unittest.TestCase):
     """XERK-1549: a payload carried into execution by a variable a substitution

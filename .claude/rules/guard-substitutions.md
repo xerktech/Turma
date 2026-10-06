@@ -278,6 +278,40 @@ paths:
     first (a DB drop, a fork bomb) returns before the cap is met. Granted, the policy checks ran
     without the per-value readings: `x=ls; <17 x=…>; x="gh pr merge 1"; $x` passed `x=ls *`. `_assign_value_end` extends a value whose
   `${…}` closes past the regex's flat quote pairing (`x="${y:-"rm …"}"`).
+- **A value naming another assigned name also gets its whole chain's value** (XERK-1648,
+  `_chain_values`): names resolved in dependency order (`_dependency_order`, Tarjan SCCs, edges
+  sorted), each value read ONCE against what is known before its group, then stored resolved —
+  never re-inlined per recursion level (that grew the text to "too deep").
+  - The chained values are a READING of their own (`_VALUES_CHAINED`, keyed in `_memo`): when any
+    name reads differently (`_CHAIN_DIFFERS`), `_expand_both` re-runs `_expand_picks` with every
+    value chain-resolved. Main's resolve-once values (against values naming none; an unresolved
+    name empty) stay the values of every other pass. Both lists have one value per assignment,
+    so pass counts and caps are unchanged.
+    - Swapped in, a QA oracle (bash's real value of each target) found a later assignment read
+      into an earlier use (`c=$p/; … p=1`), whose empty reading is bash's.
+    - Appended to the values, they moved which value each per-value pass picks, losing main's
+      pairing of two names' last values (`a=$p; a=eval; …; b='rm …'; $a "$b"`, a QA bypass), and
+      doubled reassigned names past `_MAX_VALUE_PASSES` ("too large").
+  - Cost: the empty reading stays, so `q=/tmp/q; d=$q; r=$d/; rm -rf $r` still reads `/` and
+    is denied — telling it from `r=$d/; d=…` needs ORDER (XERK-1660).
+  - Resolving once alone read `q=/etc; d=$q; r=$d` as `r` empty, and a link naming a cycle
+    (`d=$q$c; c=$c`) and a name with a plain and a chained value (`q=/tmp; q=$e; d=$q`) the same.
+  - Inside a cycle (an SCC, or a name using itself) a member reads another's unlinked values only
+    and an unknown one empty, as main did: `d=/; d=$d/etc` is `//etc`. What a cycle holds
+    depends on ORDER, which this reading does not model (XERK-1660, with the seeded-cycle
+    shapes). Do not add propagation inside a cycle — four QA passes broke each variant:
+    - re-reading on each change nested every lap's text, and a real test loop's
+      `n=$((n + ${m:-0}))` counters were refused as too deep (replay); a 3000-member wheel 33s;
+    - reading once in seed order let a stuck read's partial value leak into members that never
+      re-read it, and in set order the verdict changed with PYTHONHASHSEED.
+  - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`); names in a
+    `:+`/`+` alternative are expanded by the caller's `expand` (both `_assigned_values` and
+    `_substitute_vars`) and count as dependencies (`_names_used`). Spliced raw, `${x:+$x}` ran
+    as the literal `$x` — a bypass of `rm -rf ${x:+$x}`. `${q:+${a}}` (brace in an argument),
+    an unset `${Q:-$A}` and `$b'tc'` are XERK-1661.
+  - Tests: `test_a_chain_of_assignments_resolves_every_link`,
+    `test_a_cycle_of_assignments_stays_bounded`, `test_a_cycle_of_assignments_is_read_once`,
+    `test_names_in_an_operator_argument_are_dependencies`.
 - **A name assigned more than once is also read with each value on its own** (`_picked`,
   XERK-1621): joined, `x=a; x="rm …"; $x` ran the program `a`. Added readings, never swapped.
   - One whole-line reading per value; more than `_MAX_VALUE_READINGS` assignments to one name

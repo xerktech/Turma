@@ -1704,6 +1704,7 @@ def _budgeted(fn):
                    "until": time.monotonic() + _MAX_DECIDE_SECONDS}
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
+        _CHAIN_DIFFERS[0] = False
         _VALUES_TAINT_N[0] = 0
         _VALUES_MOST[0] = 1
         _VALUES_ASSIGNED[0] = 1
@@ -1730,7 +1731,7 @@ def _memo(kind: str, key, fn, *args):
     splices it counted, which is what makes `_expand_both` take its raw pass."""
     memo = _budget[kind]
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
-           _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0])
+           _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -1864,7 +1865,7 @@ _VAR_OP_RE = re.compile(r"^(##|#|%%|%|:-|:=|:\+|-|=|\+|//|/|:)(.*)$", re.DOTALL)
 _VAR_DEFAULT_OPS = {":-", "-", ":=", "="}
 
 
-def _apply_var_op(value: str, op: str, arg: str) -> str:
+def _apply_var_op(value: str, op: str, arg: str, expand=None) -> str:
     """Apply a `${name<op><arg>}` expansion to a known value.
 
     Only the literal cases are modelled — enough that a one-character operator
@@ -1879,8 +1880,21 @@ def _apply_var_op(value: str, op: str, arg: str) -> str:
         pat = arg.replace("*", "")
         return value[: -len(pat)] if pat and value.endswith(pat) else value
     if op in ("/", "//"):
-        pat, _, rep = arg.partition("/")
+        # `\/` is a slash in the pattern, not its end: `${q/tmp\/a/etc}`.
+        cut = re.search(r"(?<!\\)/", arg)
+        pat, rep = (arg[:cut.start()], arg[cut.end():]) if cut else (arg, "")
+        pat, rep = pat.replace("\\/", "/"), rep.replace("\\/", "/")
         return value.replace(pat, rep, -1 if op == "//" else 1) if pat else value
+    if op in (":+", "+"):
+        # The alternative replaces a set value: `${q:+/etc}` is /etc. Names in
+        # it are expanded by ``expand``; spliced raw, `${x:+$x}` ran as the
+        # literal text `$x`. With no ``expand`` such an alternative is left as
+        # the value it would replace.
+        if not (value or op == "+"):
+            return value
+        if "$" in arg or "`" in arg:
+            return expand(arg) if expand else value
+        return arg
     if op == ":":
         bits = arg.split(":")
         try:
@@ -2055,6 +2069,7 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
     # was refused as nested too deeply. An unresolvable one is empty, as bash
     # reads an unset name.
     plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
+    own = {k: len(vs) for k, vs in vals.items()}
     # An applied default is one more value of its name, and resolves OTHER
     # names (`y=${x:-"rm …"}; z=$y; $z`), never its own: there it took
     # `x=; x=${x-a}"rm …"; $x` (the `${x-a}` empty, x set) to `arm …` in
@@ -2072,8 +2087,127 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
         _spend(len(value) - len(m.group(0)))
         return value
 
-    return {k: [_var_sub(lambda m, k=k: resolve(m, k), v) for v in vs]
-            for k, vs in vals.items()}
+    once = {k: [_var_sub(lambda m, k=k: resolve(m, k), v) for v in vs] for k, vs in vals.items()}
+    # Resolved once, a chain read empty: `q=/etc; d=$q; r=$d` left `r` empty
+    # and `rm -rf $r` passed (XERK-1648). The chain-resolved values are a
+    # reading of their OWN (`_expand_both`), never mixed into these: appended,
+    # they moved which value each per-value pass picks, so main's pairing of
+    # two names' last values was lost (`a=$p; a=eval; b=x; b='rm …'; $a "$b"`);
+    # swapped in, a later assignment was read into an earlier use whose empty
+    # reading is bash's (`c=$p/; p=1`).
+    chained = _chain_values(vals, applied, own)
+    if chained != once:
+        _CHAIN_DIFFERS[0] = True
+    return chained if _VALUES_CHAINED[0] else once
+
+
+def _chain_values(vals: dict[str, list[str]], applied: dict[str, list[str]],
+                  own: dict[str, int]) -> dict[str, list[str]]:
+    """``vals`` with every value naming an assigned name resolved through its
+    whole chain, in dependency order (`_dependency_order`): each value is read
+    once every name it uses outside its group has ALL its values."""
+    known: dict[str, list[str]] = {k: [] for k in vals}
+    defaults: dict[str, list[str]] = {k: [] for k in vals}
+    waits: dict[str, set[str]] = {k: set() for k in vals}
+    linked: dict[str, list[tuple[int, set[str]]]] = {}
+    for k, vs in vals.items():
+        for i, v in enumerate(vs):
+            names = _names_used(v) & vals.keys()
+            if names:
+                waits[k] |= names
+                linked.setdefault(k, []).append((i, names))
+            else:
+                (known if i < own[k] else defaults)[k].append(v)
+    out = {k: list(vs) for k, vs in vals.items()}
+
+    def link(m: "re.Match[str]", owner: str) -> str:
+        name = m.group(1) or m.group(3)
+        if name not in vals:
+            return m.group(0)
+        got = known[name] if name == owner or not defaults[name] else known[name] + defaults[name]
+        value = _picked(got)
+        op = _VAR_OP_RE.match(m.group(2) or "")
+        if op:
+            value = _apply_var_op(value, op.group(1), op.group(2),
+                                  lambda t: _var_sub(lambda u: link(u, owner), t))
+        _spend(len(value) - len(m.group(0)))
+        return value
+
+    def settle(k: str, i: int) -> str:
+        return _var_sub(lambda m: link(m, k), vals[k][i])
+
+    for group in _dependency_order(waits):
+        # Each value is read ONCE, against what is known before its group:
+        # every name a group uses outside it is resolved whole. Inside a
+        # cycle (`a=$b; b=$a`, `d=/; d=$d/etc`) a member reads another's
+        # unlinked values only, and an unknown member is empty, as an unset
+        # name. What a cycle really holds depends on ORDER, which this
+        # order-blind reading does not model (XERK-1660); every propagation
+        # tried traded one shape for another — re-reading on each change
+        # nested every lap's text until a test loop's `n=$((n + ${m:-0}))`
+        # counters were refused as too deep, and reading in seed order let a
+        # stuck read's value leak into members that never re-read it.
+        for k, i, got in [(k, i, settle(k, i)) for k in group for i, _names in linked.get(k, ())]:
+            out[k][i] = got
+            (known if i < own[k] else defaults)[k].append(got)
+    return out
+
+
+def _names_used(text: str) -> set[str]:
+    """Every name ``text`` expands, those in an operator's argument included
+    (`${q:+$a}` uses `a`)."""
+    names: set[str] = set()
+    for m in _var_uses(text):
+        names.add(m.group(1) or m.group(3))
+        if m.group(2) and "$" in m.group(2):
+            names |= _names_used(m.group(2))
+    return names
+
+
+def _dependency_order(waits: dict[str, set[str]]) -> list[set[str]]:
+    """The names of ``waits`` (name → names its values use) in groups, each
+    after every group it uses: Tarjan's strongly connected components, which
+    come out dependencies first. A group of more than one name, or a name
+    using itself, is a cycle. Iterative, so a long chain cannot overflow the
+    stack."""
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    groups: list[set[str]] = []
+    for root in waits:
+        if root in index:
+            continue
+        index[root] = low[root] = len(index)
+        stack.append(root)
+        on_stack.add(root)
+        work = [(root, iter(sorted(waits[root])))]
+        while work:
+            node, edges = work[-1]
+            for nxt in edges:
+                if nxt not in index:
+                    index[nxt] = low[nxt] = len(index)
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(sorted(waits[nxt]))))
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+            else:
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    low[parent] = min(low[parent], low[node])
+                if low[node] == index[node]:
+                    group = set()
+                    while True:
+                        name = stack.pop()
+                        on_stack.discard(name)
+                        group.add(name)
+                        if name == node:
+                            break
+                    groups.append(group)
+    return groups
 
 
 def _value_taint_readings(value: str) -> tuple[str, ...]:
@@ -2706,7 +2840,8 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 out = '"' + _quote_literal(value, "") + '"'
             else:
                 if op:
-                    value = _apply_var_op(value, op.group(1), op.group(2))
+                    value = _apply_var_op(value, op.group(1), op.group(2), lambda t: _var_sub(
+                        lambda u: _picked(vals.get(u.group(1) or u.group(3)) or [u.group(0)]), t))
                 out = _quote_literal(value, state)
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
             # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
@@ -2791,6 +2926,10 @@ _VALUES_DIFFER = [False]
 # and how many readings the values of this decision have (XERK-1625).
 _VALUES_TAINT = [-1]
 _VALUES_TAINT_N = [0]
+# Set while `_expand_both` reads assigned values resolved through their whole
+# chain; and whether any name of this decision reads differently so (XERK-1648).
+_VALUES_CHAINED = [False]
+_CHAIN_DIFFERS = [False]
 # Set while `_expand_both` reads each of a name's values on its own: which one.
 # And the most values this decision saw one name assigned (XERK-1621).
 _VALUE_PICK: list[int | None] = [None]
@@ -4701,7 +4840,10 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     and control flow, and joined they run only the first (XERK-1621).
 
     A `'` in a string's `${…}` splits the line differently in bash than in
-    zsh or dash (`_quote_states`), so a line holding one is read both ways."""
+    zsh or dash (`_quote_states`), so a line holding one is read both ways.
+
+    And with every assigned value resolved through its whole chain, when
+    that differs from resolving it once (XERK-1648)."""
     out = _expand_picks(command)
     if _BRACE_OTHER_SEEN[0]:
         _BRACE_OTHER_SHELL[0] = True
@@ -4715,6 +4857,14 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
             out = out + _expand_values(command)
         finally:
             _MAIN_PARSE[0] = False
+    if _CHAIN_DIFFERS[0]:
+        # Every value resolved through its whole chain, per value too
+        # (`_assigned_values`): an added reading, as the others are.
+        _VALUES_CHAINED[0] = True
+        try:
+            out = out + _expand_picks(command)
+        finally:
+            _VALUES_CHAINED[0] = False
     return out
 
 
