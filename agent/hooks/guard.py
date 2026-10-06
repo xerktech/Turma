@@ -2833,9 +2833,11 @@ def _heredoc_segment_programs(segment: str):
 # A function or alias the command defines: `f() {`, `function f {`, `alias b=…`.
 # Bash takes nearly any word as a function name (`f+`, `f]`, `f@`), so a name
 # is a whole word up to `()`. Both patterns start only at a word's start and
-# never restart inside one, so a long word costs one pass, not its square.
+# never restart inside one, so a long word costs one pass, not its square: the
+# lookbehind and the name share no character (a `{` opens a group only before
+# whitespace, so `{f()` names `{f`, as bash reads it).
 _FUNC_NAME_RE = re.compile(
-    r"(?:^|(?<=[\s;&|(){}]))([^\s;&|()<>'\"`$]+)[ \t]*\([ \t]*\)"
+    r"(?:^|(?<=[\s;&|()]))([^\s;&|()<>'\"`$]+)[ \t]*\([ \t]*\)"
     r"|(?<![\w.-])function[ \t]+([^\s(){};|&]+)")
 _ALIAS_RE = re.compile(r"(?<![\w.-])alias([^;&|\n]*)")
 
@@ -2865,7 +2867,8 @@ def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
             return True
         return any(_owner_word_may_be_shell(w, {}, defined) for w in resolved.split())
     name = _basename(word)
-    if name in _SCRIPT_READERS or name in defined:
+    # A defined name may hold a `/` (`f/g() { bash; }`), so match it whole too.
+    if name in _SCRIPT_READERS or name in defined or word.lower() in defined:
         return True
     if not _GLOB_CHARS.search(name):
         return False

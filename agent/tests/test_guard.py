@@ -1501,6 +1501,7 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <<EOF | /bin/ba[^x]h\n{R}\nEOF",
                     # Any word bash takes as a function name, defined lines earlier.
                     f"f+() {{ bash; }}\nf+ <<EOF\n{R}\nEOF", f"f]() {{ bash; }}\nf] <<EOF\n{R}\nEOF",
+                    f"f/g() {{ bash; }}\nf/g <<EOF\n{R}\nEOF", f"{{ f{{() {{ bash; }}; }}\nf{{ <<EOF\n{R}\nEOF",
                     f"alias a=b 'c=bash'\nc <<EOF\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
@@ -2196,7 +2197,9 @@ class TestExpansionBudget(unittest.TestCase):
                     # XERK-1624 QA: the defined-name scan restarted inside a
                     # long word; 64KB of either took 45-107s.
                     "echo " + ":" * 32000 + "; $x <<EOF\nx\nEOF",
-                    "alias " + "a" * 32000 + "; cat <<EOF\nx\nEOF"):
+                    "alias " + "a" * 32000 + "; cat <<EOF\nx\nEOF",
+                    "echo " + "{" * 32000 + "\n$x <<EOF\nx\nEOF",
+                    "echo " + "{a" * 16000 + "\n$x <<EOF\nx\nEOF"):
             self.check(cmd)
 
     def test_large_value_used_many_times_is_denied_fast(self):
