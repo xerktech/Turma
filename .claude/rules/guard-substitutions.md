@@ -37,6 +37,32 @@ paths:
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
   ANSI-C only to a `-c` re-parse; an even run (`\\$'…'`) is still live. A bare lookbehind bypassed.
+- **The stdin-feed walk splits with `groups=True`** (XERK-1614): a cut inside `{ echo …; }` or
+  `X=<(a; b)` severed producer from reader. Only that walk: every other caller keeps the old
+  split and relies on `_expand`'s group pass to read bodies.
+  - `|&` is one pipe, in every split; `2>&1` is XERK-1616's `keep_redirects`, which the walk also passes.
+  - No group opens inside `${…}` (`${x#(}` is pattern text), and a group still open at the end
+    re-splits without `groups`: an unclosed "group" swallowed every later pipe (a QA regression).
+  - Producers are flattened by `_simple_commands` (recursive, groups on): a single plain split
+    cut a deep `{ { …; }; }` apart. A `{` right after an opener counts at any depth.
+  - The walk reads pipelines from BOTH splits plus each whole-group pipeline's interior
+    (`_walked_pipelines`): a group kept whole but not opened (`do (a; echo …) | sh`) hid what
+    the plain split had cut out — a QA regression. Never walk the group split alone.
+  - `_group_core` opens a group behind keywords (`do`, `then`, `!`, `time`) or before trailing
+    redirections (`(…) 2>&1`); `_unwrap_group` opens only a group that IS the segment.
+  - Its trailing redirections are read by `_only_redirects`, one greedy pass from the closer. Not a
+    regex: searched it went O(n²), and anchored it split `>a1>a1…` every way — exponential.
+- **`_reads_stdin_script` recurses** into a group/list and a `-c` script: `bash -c bash` and
+  `(cat | bash)` read the stdin they inherit. Past `_MAX_EXPAND_DEPTH` it says "reads" (closed).
+  - A part equal to its stage goes to `_command_reads_stdin`, never re-split: the redirect
+    re-reading returns `>&1` among `>&1`'s own parts, and looping hit the cap (a false deny).
+- **An `exec`'s here-string joins the line-wide `<(…)` texts**, and a line with any of them scans
+  every pipeline: `exec 3< <(…); bash <&3` has no pipe. De-duped + capped once, else O(n²).
+- **`cat`/`tac`/`tee`/`head`/`tail` of only `<(…)` operands prints their texts** (`_cat_printed`),
+  as does `< <(…)` and bash's `$(< <(…))`; redirects, `-` and `/dev/null` are skipped, a real file
+  operand stays opaque. Bounded by `_SUBST_DEPTH`.
+  - `_proc_subst_texts` is memoised per decision (`_memo("proc")`) and skips the split for a body
+    with no operator or `#`: each `cat <(` level re-split its body, 7.5x main on a deep nest.
 - **A filtered or partly-unread body gets a TAINT reading too** (XERK-1613, `_body_tainted`): the
   text its producers emit — echo/printf args, or a here-string — carried through any pass-through or
   rewriting filter (sed/tr/awk/cut/rev…) as if it passed unchanged. ADDED beside the opaque reading,
@@ -53,8 +79,8 @@ paths:
     an array element `arr=($(ls; echo y))` is read as a subshell group, so its unread-leading
     output still over-denies — rare, absent from the 35k-command replay.
   - Left opaque (as on main, documented residuals): a backgrounded/control-flow body
-    (`&`, `if`/`while`/`case`), an assignment VALUE (stored, not run — splicing it also
-    made shlex quadratic), a here-string a consuming command reads (`grep -q`/`read`), and a stdout
+    (`&`, `if`/`while`/`case`), an assignment VALUE where it sits (stored, not run — splicing
+    it also made shlex quadratic), a here-string a consuming command reads (`grep -q`/`read`), and a stdout
     redirect (`>/dev/null`, `>&2`). A filter that rewrites harmless text into a dangerous command
     (`rev`, `sed s,/x,,`) still slips: accepted.
   - A body's OWN substitutions resolve to their taint first (`_taint_nested`, XERK-1617); an
@@ -82,6 +108,12 @@ paths:
       text from `$((` to the substitution and on to `))` must be plain arithmetic
       (`_ARITH_GAP_RE`): a quoted `$((` decoy (`echo '$((' ; $(…) ; echo '))'`) hid a deny.
     - A printed `a[$(…)]` subscript (bash re-expands it) is still caught by the printed reading.
+  - An assignment VALUE's taint reaches its later `$a`/`eval $a` through `_assigned_values`
+    (XERK-1625): `_expand_both` adds one pass per suffix reading (`_VALUES_TAINT`, capped at
+    `_MAX_TAINT_STARTS`), never joined into the plain values — `_substitute_vars` joins a
+    name's values into ONE word list, so a second value would trail the placeholder program.
+    - The lookup-or-fallback over-deny above reaches the assigned form too:
+      `CC=$(command -v clang || echo gcc); $CC …` denies, as `$(command -v clang || echo gcc) …` does.
   - The line pass rebuilds the whole command in ONE `_sub_substs` sweep per suffix reading, so N statements
     stay linear; the pathological-input envelope is `_statements_printed`'s, unchanged by this.
 - **Each substitution gets its own plain reading, its siblings literal** (`_decoy_readings`,
@@ -103,7 +135,7 @@ paths:
     with a drive letter: `$R format --check .` (ruff, black, cargo) is the clash.
   - `_expand_braces` skips `${x,,}`: brace-expanding it read `${x,,}rm` as `$xrm $rm $rm`.
   - Both passes must stay LINEAR (`test_empty_expansion_readings_stay_linear`): rebuilding the
-    text per removal, or tokenising every word's prefix, ran 30 KB past the 60s hook timeout.
+    text per removal, or tokenising every word's prefix, ran 30 KB toward the hook timeout.
   - Past `_MAX_EMPTY_PROGRAM_WORDS` with a word dropped → too deep: a partial reading was re-read
     64 words at a time at every depth, unbudgeted, past the hook timeout.
   - `_script_readings` unescapes every `\$` before a parameter: shlex keeps it in `"…"`, bash
@@ -117,16 +149,73 @@ paths:
     scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
   - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
+- **A `${…}` inside `"…"` is a quoting frame of its own** (XERK-1621, `_quote_states`'s `{"`):
+  a `"` there nests a string, never closes the outer one. Read flat, `"${y:-"it's"}"; rm …` left
+  the `'` open and hid the `rm`.
+  - The operator splitter jumps such a `${…}` whole via `_brace_end(…, quoted=True)`; a spliced
+    default there drops its own `"` delimiters (`_dq_default`), or `""it's""` reopens the quote.
+  - A `'` directly in that frame is SHELL-DEPENDENT: bash pairs it (its text still expands),
+    zsh and dash read it as a plain character. Sessions run either, so a line holding one is
+    read both ways (`_BRACE_OTHER_SHELL`, an added reading in `_expand_both`); `_closers` and
+    `_memo` key on it.
+- **`_find_substs` pairs a `)` only with a `(` quoted the same way** (`_quote_states`): blind,
+  the `)` in `"$(echo ")'")"` ended the body and its `'` hid the line. The splitter also jumps
+  a `$(…)` inside `"…"` whole. An escaped `\$(` in a string is string text end to end, so it
+  still pairs as before.
+- **A bad substitution (`${` naming no parameter) prints nothing**: `_printed_text` and
+  `_stmt_printed` read such a body as unknown, so the empty-glue reading still runs `rm`.
+  - Shells PARSE one differently (`_bad_brace`): bash nests quotes in it; dash skips its name
+    and ONE operator character, quote or not, then reads on as usual (`_dash_bad_body`:
+    `${''}'}` closes at the second `}`). The other-shell reading (`_BRACE_OTHER_SHELL`, with
+    zsh/dash's literal `'`) applies that in `_quote_states`, `_brace_end` and the splitter.
+- **The pre-XERK-1621 flat parse is kept as a reading** (`_MAIN_PARSE`): no `${…}` frames, parens
+  paired blind. Taken when the parsers can differ (`_MAIN_PARSE_SEEN`: a quote in a `${…}`, a
+  paren skipped as quoted, a quoted `$(…)` jumped, a bad `${`). Every new rule models some
+  shell, and fuzzing kept finding a malformed line one shell recovers from that the new parse
+  allowed and the old one denied; ADDED, the old denies survive. Accepted cost: ~2x on such lines.
+  - Every memo a reading feeds keys on it: `_memo`, `_closers`, and `_reading()` for
+    `_body_printed`/`_body_tainted_at`. A body memoised under one reading was replayed in another.
+  - Those lru caches are cleared when a decision's budget opens: a hit skips the SEEN side effects,
+    so a body cached by an earlier in-process decision never asked for this one's readings.
+- **A pipe-to-shell producer is also read with an unknown glued output as empty**
+  (`glued_empty`): `$(true)echo rm … | sh` runs `echo`.
+- **An assigned value's `${y:-…}` default is applied at assignment, as an ADDED value**
+  (`_assigned_values`; `y` may be set after all). It resolves OTHER names (`z=$y` chains) but
+  never a value of its own name: there `x=; x=${x-a}"rm …"; $x` (x set-empty) read as `arm …` in
+  every reading. Gating on "the line assigns the name" instead lost `x=${x:-"rm …"}`; keeping it
+  out of every resolution lost `y=${x:-"rm …"}; z=$y; $z`. It counts for the per-value readings,
+  not toward the assignment cap; those readings have their own cap (`_MAX_VALUE_PASSES`), since
+  16 names × 16 `x=${D:-…}` ran 30s at 2× readings.
+  - Past either cap `_budget["capped"]` is set, and `decide` refuses it as a POLICY deny like a
+    spent budget: before the grant AND after the policy checks, since a grantable reason found
+    first (a DB drop, a fork bomb) returns before the cap is met. Granted, the policy checks ran
+    without the per-value readings: `x=ls; <17 x=…>; x="gh pr merge 1"; $x` passed `x=ls *`. `_assign_value_end` extends a value whose
+  `${…}` closes past the regex's flat quote pairing (`x="${y:-"rm …"}"`).
+- **A name assigned more than once is also read with each value on its own** (`_picked`,
+  XERK-1621): joined, `x=a; x="rm …"; $x` ran the program `a`. Added readings, never swapped.
+  - One whole-line reading per value; more than `_MAX_VALUE_READINGS` assignments to one name
+    deny as too large. `for` list words are not counted (data, and lists run long).
 - **A decision has a wall-clock deadline** (`_MAX_DECIDE_SECONDS`, checked in `_expand`): out of
   time it denies as too large. The growth budget counts characters, not time; readings re-expanded
-  per eval level ran 98 KB past the 60s hook timeout, which RUNS the command.
+  per eval level ran 98 KB toward the hook timeout, which RUNS the command.
+- **main() has a hard deadline too** (`_HOOK_DEADLINE_SECONDS`, XERK-1619): `decide` runs on a
+  daemon thread; past it the hook prints a deny and `os._exit`s. The in-decide check never runs
+  inside one frame — shlex on one 300 KB word took 126-181s, quadratic in its length. The hook
+  timeout is Claude Code's 600s default (`build_guard_settings` sets none).
+  - Tests must never reach the real `os._exit`: it ends the run with rc 0, a truncated green
+    suite. `test_guard.py` swaps `_hard_exit` for one that raises, module-wide.
+  - A thread, not SIGALRM: the hook also runs on the Windows agent.
+  - Residual: one C call holding the GIL (a backtracking regex) still blocks the watchdog.
 - Tests: `test_a_proc_subst_passed_through_or_sourced_in_a_c_script`,
+  `test_stdin_routes_into_a_shell`, `test_stdin_route_shapes_classify_fast`,
   `test_a_multi_statement_body_prints_the_command`,
   `test_a_filtered_or_unread_body_runs_as_its_producers_text`,
   `test_a_nested_or_conditional_body_runs_as_its_producers_text`,
+  `test_an_assigned_filtered_or_conditional_body_runs_as_its_text`,
   `test_a_large_conditional_or_nested_taint_body_stays_fast`,
   `test_a_large_filtered_body_classifies_without_timing_out`,
   `test_a_sibling_or_an_empty_expansion_does_not_hide_the_command`,
-  `test_a_decision_past_its_deadline_denies`,
+  `test_a_nested_quote_or_a_reassigned_value_does_not_hide_the_command`,
+  `test_a_decision_past_its_deadline_denies`, `test_a_decision_past_the_hook_deadline_denies`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
   `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).

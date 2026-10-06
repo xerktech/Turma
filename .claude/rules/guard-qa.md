@@ -19,3 +19,11 @@ paths:
     line with `{P}`, `##` comments. Prints BYPASS / falsedeny / timeout / CHANGED.
   - Multi-line templates (heredocs) are out of its scope; any extra rig must drop privileges the
     same way.
+- **A rewrite of the command text is an ADDED reading, never an in-place swap** (XERK-1633).
+  - Gluing function headers in place hid the command before a quoted `'()'`, a printed
+    `` `echo '()'` ``, or an extglob `@()` — each read as a header. The unglued text must
+    still be classified.
+  - Rewrite the RAW segment (before substitutions are spliced in), per segment: a whole-line
+    re-read doubled the work per nesting level and turned big benign scripts into "too large".
+  - Probe any token-joining or header change with quoted/escaped/printed `()`, extglob args,
+    `\`-newline splits, zsh quoted names (`'f g'(){`), and timing on nested `eval`s full of functions.

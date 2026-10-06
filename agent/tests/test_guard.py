@@ -18,6 +18,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import time
 import unittest
 from unittest import mock
@@ -29,6 +30,18 @@ spec = importlib.util.spec_from_file_location("guard", GUARD_PATH)
 guard = importlib.util.module_from_spec(spec)
 sys.modules["guard"] = guard
 spec.loader.exec_module(guard)
+
+
+class _HardExit(BaseException):
+    """What `guard._hard_exit` raises in-process: the real `os._exit` would end
+    the whole test run with rc 0, so a regression read as a green suite."""
+
+
+def _no_hard_exit(code):
+    raise _HardExit(code)
+
+
+guard._hard_exit = _no_hard_exit
 
 
 # --- destructive: must be blocked ----------------------------------------
@@ -241,6 +254,19 @@ BYPASS_DESTRUCTIVE = [
     'eval "$(echo rm -rf /etc)"',
     # A function body, and a case arm, each lead with a token of their own.
     "f() { rm -rf /etc; }; f",
+    # `()` is an operator: glued or spaced, the header still ends at it (XERK-1633).
+    "f(){ rm -rf /etc; }; f", "f ( ) { rm -rf /etc; }; f", "f () { rm -rf /etc; }; f",
+    "f( ) { rm -rf /etc; }; f", "f (){ rm -rf /etc; }; f",
+    # Any word names a bash function; zsh takes several names, or none.
+    "a-b(){ rm -rf /etc; }; a-b", "1f () { rm -rf /etc; }; 1f", "f/g(){ rm -rf /etc; }; f/g",
+    "() { rm -rf /etc; }", "f g () { rm -rf /etc; }; g", "f g(){ rm -rf /etc; }; g",
+    "f+(){ rm -rf /etc; }; f+", "function f g { rm -rf /etc; }; g",
+    # A QUOTED `()` is an argument, never a header, so the command still shows.
+    "rm -rf /etc '()'", 'rm -rf /etc "(){"', "rm '()' -rf /etc", "rm -rf /etc \\(\\)",
+    "rm -rf /etc $'()'", "sudo rm -rf /etc x'()'", "find / -delete '()'",
+    # ...nor a printed one, nor an extglob: both are bare only to the guard.
+    "rm -rf /etc `echo '()'`", 'sudo rm -rf /etc `echo "()"`', "rm -rf /etc @()",
+    "shopt -s extglob\nrm -rf /etc !()",
     "case x in x) rm -rf /etc;; esac",
     # The loop variable is assigned by the very command that uses it.
     "for d in /etc; do rm -rf $d; done",
@@ -941,6 +967,28 @@ class TestParserGaps(unittest.TestCase):
     def assertAllowed(self, cmd):
         self.assertIsNone(guard.is_destructive(cmd), cmd)
 
+    def test_a_function_header_in_any_spelling_leads_to_its_body(self):
+        # XERK-1633: `()` is an operator, so a continuation can split the
+        # header, and zsh takes a quoted name.
+        R = self.R
+        for cmd in (f"f \\\n() {{ {R}; }}; f", f"f (\\\n) {{ {R}; }}; f",
+                    f"x=1; f \\\n(){{ {R}; }}; f", f"'f g'(){{ {R}; }}; 'f g'",
+                    f'"f g"(){{ {R}; }}', f"f\\ g () {{ {R}; }}", f"'f;g'(){{ {R}; }}",
+                    # A printed `()` in the body is an argument, not a header.
+                    f"f(){{ {R} `echo '()'`; }}; f", f"f () {{ {R} $(echo '()'); }}; f"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # An assignment's or a substitution's parens are no header.
+        for text in ("a=( ); x $( ) <( ) =( )", "(( ))", "echo '()' \"()\""):
+            with self.subTest(text=text):
+                self.assertEqual(guard._glue_func_parens(text), text)
+        # A script of many small functions is still read whole, not refused as
+        # too large: the closed-up reading is per segment (XERK-1633 QA).
+        script = "\n".join(f"f{i}(){{ echo {i} | grep -q x || mkdir -p /tmp/d{i}; }}"
+                            for i in range(300))
+        self.assertAllowed(f"bash <<'EOF'\n{script}\nEOF")
+        self.assertAllowed(script)
+
     def test_an_unquoted_heredoc_body_runs_its_substitutions(self):
         R = self.R
         for cmd in (f"cat <<EOF\n$({R})\nEOF", f"cat <<EOF\n`{R}`\nEOF",
@@ -1196,6 +1244,7 @@ class TestProducedScripts(unittest.TestCase):
                     "f() { { :; }; rm -rf *; }; cd /; f",
                     "f() { for i in 1; do :; done; rm -rf *; }; cd /; f",
                     "function f { rm -rf *; }; cd /; f", "f() ( rm -rf * ); cd /; f",
+                    "f(){ rm -rf *; }; cd /; f", "f ( ) { rm -rf *; }; cd /; f",
                     "f() { echo ${x}; rm -rf *; }; cd /; f",
                     "f() { echo $(date); rm -rf *; }; cd /; f",
                     "for i in 1 2; do (rm -rf *); cd /; done",
@@ -1516,6 +1565,43 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_shell_name_formed_by_an_empty_expansion_or_a_brace(self):
+        # XERK-1629: bash forms `bash` from `bas``h`, `bas$(:)h`, `bas$@h`,
+        # `$'bas\150'` and `bash -sh` from `{bas,-s}h`; shlex reads one other word.
+        R = self.R
+        for name in ("bas``h", "bas$()h", "bas$(:)h", "bas$( )h", "bas` `h", "b``a``s``h",
+                     "bas$(true)h", "bas$''h", 'bas$""h', "bas$@h", "bas$*h", "bas${@}h",
+                     "bas${@:-}h", "bas${*:-}h", "bas${@:1}h",
+                     "{,bash}", "bas{h..h}", "{b..b}ash", '$"bash"', '$"bas"h',
+                     "bas${@:-h}", "ba${*-s}h",
+                     "bas${@:-}h", "bas${*:-}h", "bas${@:1}h",
+                     "bas$'\\x68'", "$'bas\\150'", "{bas,-s}h", "/bin/bas``h"):
+            for cmd in (f"{name} <<EOF\n{R}\nEOF", f"{name} <<'EOF'\n{R}\nEOF",
+                        f"cat <<EOF | {name}\n{R}\nEOF", f"echo '{R}' | {name}",
+                        f"{{ X=')' {name}; }} <<EOF\n{R}\nEOF", f"(X=')' {name})<<EOF\n{R}\nEOF"):
+                with self.subTest(cmd=cmd):
+                    self.assertDenied(cmd)
+        # `bash sh` / `sh s` run a script FILE, not stdin; a sequence past
+        # `_BRACE_SEQ_MAX`, or a mixed one bash leaves literal, is not expanded.
+        for cmd in (f"echo x | {{,bash}} -c '{R}'", f"rm -rf /{{e..e}}tc",
+                    f"echo {{a,b}} {{a,b}} {{a,b}} {{a,b}} >/dev/null; echo '{R}' | {{,bash}}",
+                    f"echo '{R}' | ( echo {{a,b}} {{a,b}} {{a,b}} {{a,b}} >/dev/null; {{,bash}} )",
+                    f"echo '{R}' | {{,bash}}|cat", f"echo '{R}' | {{,bash}};",
+                    f"echo '{R}' | {{,bash}}&&true", f"echo '{R}' | ({{,bash}})",
+                    f"echo '{R}' | {{,bash}}>/dev/null", f"echo '{R}' | bash>/dev/null",
+                    f"echo '{R}' | bash>&2", f"echo '{R}' | bash -c '{{,bash}}'",
+                    f"echo '{R}' | bash -c \"(cat | {{,bash}})\"",
+                    f"bash -c '(cat | {{,bash}})' <<< '{R}'",
+                    f"echo '{R}' | bash -c 'bash -c \"{{,bash}}\"'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in (f"echo '{R}' | {{ba,}}sh", f"echo '{R}' | s{{h,}}",
+                    f"cat$(:) <<EOF\n{R}\nEOF", f"echo '{R}' | ca``t", "echo {1..5}",
+                    "echo {1..99999}", "echo {a..1}", f"echo '{R}' | {{,c}}at",
+                    f"echo '{R}' | ba${{@:-zz}}sh"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_here_strings_and_process_substitution_fed_to_a_shell(self):
         R = self.R
         for cmd in (f"sh <<< '{R}'", f"sh<<<'{R}'", f"bash -s <<< '{R}'",
@@ -1585,6 +1671,117 @@ class TestScriptChannels(unittest.TestCase):
         self.assertAllowed('bash -c -- "echo hi"')
         self.assertAllowed('cat <(echo hello; true) | grep h')
         self.assertAllowed('while read l; do echo $l; done < <(git ls-files; echo x)')
+
+    def test_stdin_routes_into_a_shell(self):
+        # XERK-1614: other routes a printed script takes into a shell's stdin.
+        # Each ran its payload as nobody under guard_differential.py.
+        R = self.R
+        for cmd in (f"echo {R} |& bash", f"echo {R} |& cat | sh", f"echo {R} 2>&1 | sh",
+                    # ...a `-c` script whose own command reads the stdin it inherits,
+                    f"echo {R} | bash -c '. /dev/stdin'", f"echo {R} | bash -c bash",
+                    f"bash -c '. /dev/stdin' < <(echo {R})", f"echo {R} | sh -c 'cat | bash'",
+                    f"echo {R} | (cat | bash)", f"echo {R} | bash -c 'bash -c bash'",
+                    # ...a `cat` of a `<(…)` whose output a substitution hands on,
+                    f'bash -c "$(cat <(echo {R}))"', f'x=$(cat <(echo {R})); eval "$x"',
+                    f'eval "$(cat -- <(cat <(echo {R})))"',
+                    # ...a group the split cut in two,
+                    f"echo {R} | env X=<(true; true) bash", f"echo {R} | X=<(true; true) bash",
+                    f"{{ echo {R}; }} | sh", f"{{ echo {R}; }} 2>&1 | sh", f"(echo {R}; true) | sh",
+                    # ...and an fd an `exec` opened earlier on the line.
+                    f"exec 3< <(echo {R}); bash <&3", f"exec 3<<<'{R}'; bash /dev/fd/3",
+                    f"command exec 3<<<'{R}'; bash <&3",
+                    # ...a `cat` read with redirects, `-`, `/dev/null`, `<` or `head`,
+                    f'bash -c "$(cat <(echo {R}) 2>/dev/null)"', f'bash -c "$(cat - <(echo {R}))"',
+                    f'bash -c "$(cat < <(echo {R}))"', f'bash -c "$(< <(echo {R}))"',
+                    f'bash -c "$(cat <(echo {R}) /dev/null)"', f'bash -c "$(head -n1 <(echo {R}))"',
+                    # ...a producer nested past `_at_command_start`'s hop limit,
+                    "{ " * 6 + f"echo {R}; " + "}; " * 5 + "} | sh",
+                    # ...a reader nested past the depth cap (`_expand`'s own cap denies too),
+                    f"echo {R} | " + "(true; " * 10 + "bash" + ")" * 10,
+                    # ...and a `(` inside `${…}`, which opens no group: read as one,
+                    # it kept every later pipe whole and hid it (QA regression).
+                    f": ${{x#(}}; echo {R} | sh", f": ${{x//(/}}; sh <<< '{R}'",
+                    f": ${{x%%(*}}; echo {R} |& bash", f": ${{x#(}}; {{ echo {R}; }} | sh",
+                    f": ${{x#(}}\necho {R} | sh", f": ${{x:-$( (a; b) )}}; echo {R} | sh",
+                    f"( : ${{x#)}}; echo {R} ) | sh",
+                    # ...and an unclosed one past them, which re-splits without groups.
+                    f": ${{#x}}; x=${{y:-(}}; echo {R} | sh",
+                    # A producer in a group inside a list (`_simple_commands`).
+                    f"(true; (echo {R}; true)) | sh", f"{{ {{ echo {R}; }} 2>&1; true; }} | sh",
+                    f"(true; {{ echo {R}; }}) | sh",
+                    # A group behind a keyword or with a trailing redirect, which
+                    # a group-aware split keeps whole (QA regression: main's plain
+                    # split cut `echo …)` out of it), and pipelines inside a group.
+                    f"for i in 1; do (true; echo {R}) | sh; done", f"! (true; echo {R}) | sh",
+                    f"time (true; echo {R}) | sh", f"if true; then (true; (echo {R})) | sh; fi",
+                    f"{{ (true; echo {R}) | sh; }}", f"(echo {R}) 2>&1 | sh",
+                    f"echo {R} | time (true; bash)", f"{{ echo {R} | (true; bash); }}",
+                    f"for i in 1; do {{ true; {{ echo {R}; }}; }} | sh; done",
+                    # ...a glued `do(` the group split cannot open: only the plain
+                    # half of `_walked_pipelines` finds it,
+                    f"for i in 1; do(true; echo {R})|sh; done", f"time(true; echo {R})|sh",
+                    f"f() {{ (true; echo {R}) | sh; }}; f",
+                    # ...pipelines two group levels down,
+                    f"{{ true; {{ true; echo {R} | (true; bash); }}; }}",
+                    # ...and glued and `{{fd}}` redirects after a group.
+                    f"(true; echo {R})2>/dev/null | sh", f"{{ true; echo {R}; }} {{fd}}>/dev/null | sh",
+                    f"(true; echo {R}) <>/dev/null | sh", f"(true; echo {R}) <<EOF | sh\nx\nEOF",
+                    f"(true; echo {R}) <<-EOF | sh\n\tx\nEOF", f"(true; echo {R}) <<- EOF | sh\n\tx\nEOF",
+                    f"(true; echo {R}) <<'E F' | sh\nx\nE F", f"{{ true; echo {R}; }} 2>'/tmp/a b' | sh",
+                    f'(true; echo {R}) 2>"/tmp/a\\"e" | sh'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("echo hi |& cat", "make 2>&1 | tee log", "echo hi | bash -c 'grep h'",
+                    "bash -c 'echo hi' < /dev/null", "x=$(cat <(echo hi)); echo $x",
+                    "{ echo a; echo b; } | sort", "exec 3< <(echo hi); cat <&3",
+                    f"cat <(echo hi) | bash -c 'echo {R} > notes'", f"echo {R} | bash -c 'wc -l'",
+                    f"(echo {R}; true) | grep rm", "time (make) 2>&1 | tee log",
+                    "{ (true; echo hi) | sh; }", "for i in 1; do (true; echo hi) | sh; done",
+                    # A redirect re-read as its own part must not loop to the
+                    # depth cap, which reads as a reader (replay false deny).
+                    f"git push -u origin x 2>&1 | tail -4 && cat > pr.md <<'EOF'\n| sh `{R}`\nEOF",
+                    f'jira comment X "\\`while read l; do eval \\"\\$l\\"; done < <(echo {R})\\`" 2>&1 | tail -2'):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # Past its depth cap a stage reads as a reader: fails closed.
+        self.assertTrue(guard._reads_stdin_script("true", guard._MAX_EXPAND_DEPTH + 1))
+        self.assertEqual(guard._group_core("(a)>a1>a1 2>&1 {fd}>/dev/null <<<w"), "(a)")
+        self.assertIsNone(guard._group_core("(a)>a1>a1 x"))
+        # An empty target, a target cut at an operator, and a `}` inside `{fd}`.
+        self.assertIsNone(guard._group_core("(a) >"))
+        self.assertIsNone(guard._group_core("(a) >x;y"))
+        self.assertEqual(guard._group_core("{ a; } {fd}>x"), "{ a; }")
+        self.assertEqual(guard._group_core("(a) 2>'x y' <\"p q\" >a\\ b"), "(a)")
+        self.assertIsNone(guard._group_core("(a) 2>'x y"))
+        self.assertEqual(guard._group_core('(a) 2>"x\\"y z"'), "(a)")
+        # The escape inside "…" skips exactly one character, and an unclosed
+        # quote reads as a plain character, never as "not a redirect".
+        self.assertEqual(guard._group_core('(a) 2>"x\\\\" 2>"y z"'), "(a)")
+        self.assertEqual(guard._group_core("(a) 2>a'b"), "(a)")
+        self.assertEqual(guard._group_core('(a) 2>a"b'), "(a)")
+        self.assertIsNone(guard._group_core("(a) 2>a'b c"))
+        self.assertEqual(guard._split_segments("a |& b"), ["a", "b"])
+        self.assertEqual(guard._split_on_operators("a |& b", include_pipe=False), ["a |& b"])
+        self.assertEqual(guard._split_on_operators("{ a; b; } | (c; d) && e <(f; g)", groups=True),
+                         ["{ a; b; }", "(c; d)", "e <(f; g)"])
+
+    def test_stdin_route_shapes_classify_fast(self):
+        # Every pipeline replays the line's exec/`<(…)` texts, and nested
+        # `cat <(` resolves through `_body_printed` (XERK-1614).
+        for cmd in ("exec 3<<<'hi'; " * 12000 + "bash <&3; rm -rf /",
+                    "cat <(echo hi) <(echo ho); " * 2000 + "bash; rm -rf /",
+                    'bash -c "$(' + "cat <(" * 500 + "echo hi" + ")" * 500 + ')"; rm -rf /',
+                    "echo hi | " + "(" * 3000 + "bash" + ")" * 3000 + "; rm -rf /",
+                    "echo hi | (" + "true; " * 8000 + "bash); rm -rf /",
+                    # A long redirect run after a group: a searched trailing-
+                    # redirect regex went O(n²): 4s at 24 KB, 600s at 288 KB (XERK-1614).
+                    "(echo x)" + " >a" * 32000 + " | sh; rm -rf /",
+                    # ...and a glued run, where a regex split `>a1>a1…` every
+                    # way it could: exponential at two dozen redirects.
+                    "(echo x)" + ">a1" * 20000 + " x | sh; rm -rf /"):
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
+            self.assertLess(time.monotonic() - t, 10, cmd[:20])
 
     def test_eval_double_dash_flock_and_env_split_string(self):
         R = self.R
@@ -2312,6 +2509,16 @@ class TestExpansionBudget(unittest.TestCase):
             self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:40])
         self.assertIsNone(self.check("ssh h " + "a " * 200))
 
+    def test_brace_words_in_nested_readers_stay_linear(self):
+        # XERK-1629 QA: a name reading taken at every nested reader doubled the
+        # work per level (the brace cap re-forms each), 53s at 21 KB.
+        cmd = "cat " + " ".join(["x{a,b}"] * 1000)
+        for _ in range(6):
+            cmd = f"cat | ( {cmd} )"
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": "echo hi | " + cmd})[0], "allow")
+        self.assertLess(time.monotonic() - t, 5)
+
     def test_unclosed_brace_lists_and_grep_runs_classify_fast(self):
         # `{a,a,…` backtracked over every comma, and `grep grep …` rescanned its
         # piece from every grep: both quadratic (XERK-1596).
@@ -2319,7 +2526,7 @@ class TestExpansionBudget(unittest.TestCase):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:20])
             self.assertLess(time.monotonic() - t, 5, cmd[:20])
-        self.assertEqual(guard._expand_braces("rm {,a} {a} {a,b}"), "rm {,a} {a} a b")
+        self.assertEqual(guard._expand_braces("rm {,a} {a} {a,b}"), "rm a {a} a b")
         self.assertEqual(guard._expand_braces("rm {a, b}"), "rm {a, b}")
         # The grep and the tmux must share one `;`/`&`/newline piece, grep first.
         self.assertTrue(guard._greps_for_tmux("ps | grep -w tmux"))
@@ -2631,6 +2838,40 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
+    def test_an_assigned_filtered_or_conditional_body_runs_as_its_text(self):
+        # XERK-1625: the taint reading never reached an assignment value, so
+        # `$a` ran what a filtered `&&`/`||` body printed, unread.
+        for cmd in ("a=$(false || echo rm -rf / | grep .); $a",
+                    "a=$(false || echo rm -rf / | sed ''); $a",
+                    "a=$(true && echo rm -rf / | grep .); $a",
+                    "b=$(false || echo rm -rf / | grep .); eval $b",
+                    "a=$(false || echo rm | tr a a); $a -rf /etc",
+                    # Every suffix reading, not only the every-statement one.
+                    "a=$(echo safe || echo rm -rf /etc | sed ''); $a",
+                    "a=`false || echo rm -rf / | grep .`; $a",
+                    # Printed lines are words to `$a`, joined with a space.
+                    "a=$(false || printf '%s\\n' rm -rf / | grep .); $a",
+                    "a=$(false || echo -e 'rm\\n-rf /' | sed ''); $a"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        for cmd in ("a=$(false || echo rm -rf / | grep -q .); $a",
+                    "a=$(git rev-parse HEAD || echo none | tr a-z A-Z); echo $a",
+                    "d=$(mktemp -d || echo /tmp/x | sed ''); ls $d",
+                    "N=$(( $(nproc || echo 2 | sed s/x//) * 2 )); echo $N"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_many_assigned_taint_bodies_stay_fast(self):
+        # XERK-1625: the taint passes over assigned values are capped at
+        # `_MAX_TAINT_STARTS`, whatever the values hold.
+        import time
+        for cmd in ("a=$(" + "ls || " * 20000 + "echo a | sed ''); $a",
+                    "a=$(false || echo a | sed ''); " * 2000 + "$a"):
+            with self.subTest(n=len(cmd)):
+                start = time.time()
+                guard.decide("Bash", {"command": cmd}, cwd="/tmp")
+                self.assertLess(time.time() - start, 30)
+
     def test_a_large_conditional_or_nested_taint_body_stays_fast(self):
         # XERK-1617: suffix readings are capped, and nested taint resolution is
         # memoised per body, so neither goes quadratic/exponential.
@@ -2753,6 +2994,80 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # Past the cap, one reading per substitution fails closed.
         many = 'echo ' + ' '.join(['"$(echo \'"\')"'] * (guard._MAX_DECOY_SUBSTS + 1))
         self.assertEqual(guard.decide("Bash", {"command": many}, cwd="/tmp")[0], "deny")
+
+    def test_a_nested_quote_or_a_reassigned_value_does_not_hide_the_command(self):
+        # XERK-1621: a `"…"` inside a string's `${…}` nests rather than closing
+        # the string, and its `'` hid the rest of the line; a name assigned
+        # twice was read as both values joined, `a rm -rf /etc`.
+        deny = ('echo "${y:-"it\'s"}"; time rm -rf /etc',
+                'echo "${HOME:+"it\'s"}" && env rm -rf /etc',
+                'printf "%s" "${1:-"don\'t"}"; nohup rm -rf /etc',
+                'echo "${a:-${b:-"it\'s"}}"; rm -rf /etc',
+                # A `'` there pairs in bash, and is a plain character in zsh/dash.
+                'echo "${y:-\'"\'}"; rm -rf /etc', 'echo "${y#\'"\'}"; rm -rf /etc',
+                'echo "${y:-it\'s}" \'}\'; rm -rf /etc',
+                'x=a; x="rm -rf /etc"; $x', 'x=a; x=b; x="rm -rf /etc"; $x',
+                'x=a; x="rm -rf /etc"; eval "$x"', 'x=a; x="rm -rf /etc"; eval $x',
+                'x=a; x="rm -rf /etc"; bash <<< "$x"', 'x=a; x="rm -rf /etc"; bash -c "$x"',
+                'x=a; x="rm -rf /etc"; y=$x; $y',
+                # A `)`, `'` or `#` in a string inside `$(…)` in a string
+                # closes nothing (QA: the `${…}` frame had leaned on it).
+                'echo "$(echo "${a-")\'"}")"; rm -rf /etc', 'echo "$(echo ")\'")"; rm -rf /etc',
+                'echo "$(echo " #")"; rm -rf /etc', 'echo "$(echo " #}")" && rm -rf /etc',
+                'echo "${a#"\'"}$(echo ")\'")"; sh -c "rm -rf /etc"',
+                # A bad substitution prints nothing; an unknown output may be empty.
+                '"$(echo "${";}"}")"rm -rf /etc', '$(true)echo "rm -rf /etc" | sh',
+                '"$("${a-";"}\'")"echo "rm -rf /etc"|sh',
+                # dash ends a bad `${` at its first `}`; bash nests in it.
+                '"$(true "${";}")"rm -rf /etc', '"$(echo "${a";}")"rm -rf /etc',
+                '"$(echo ${";})"rm -rf /etc', '"$(echo "${";}")"echo "rm -rf /etc" | sh',
+                # ...after its name and one operator character: `${''}'}`.
+                ": $(echo ${''}'}); rm -rf /etc", ": $(echo ${'x'}'}); rm -rf /etc",
+                'echo ;$(echo ${;#})rm -rf /etc', 'echo ;"$(echo ${a";})"rm -rf /etc',
+                # Shells recover from a bad `${` their own ways: the old flat
+                # parse is kept as a reading (fuzz, QA pass 3).
+                'echo "$(echo ${})";"$(echo ${ ${"${";}})${b:-}}})"rm -rf /etc',
+                # A reassigned value with a taint reading.
+                "a=true; a=$(false || echo 'rm -rf /etc' | grep .); $a",
+                # A default applies when the value is assigned.
+                'x="${y:-"rm -rf /etc"}"; eval "$x"', 'x=${y:-"rm -rf /etc"}; $x',
+                'export x="${y:-"rm -rf /etc"}"; bash -c "$x"',
+                'x=${x:-"rm -rf /etc"}; $x', 'y=; x=${y:-"rm -rf /etc"}; $x',
+                'y=; x=a; x+=${y:-"; rm -rf /etc"}; eval "$x"',
+                # ...which reaches other names through a chain.
+                'y=${x:-"rm -rf /etc"}; z=$y; $z', 'y=${x:-"rm -rf /etc"}; z=${y#x}; eval "$z"',
+                # ...an added value of its own name, never resolving the others:
+                # set-empty, `${x-a}` is empty.
+                'x=${x-$x}"rm -rf /etc"; $x', 'x=; x=${x-a}"rm -rf /etc"; $x',
+                'a=; a=${a=x}"rm -rf /etc"; $a', "bash -c 'x=; x=${x-a}\"rm -rf /etc\"; $x'",
+                # Past the cap, a reading per value fails closed.
+                "".join(f"x={i}; " for i in range(guard._MAX_VALUE_READINGS + 1)) + "$x")
+        for cmd in deny:
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        # Past either cap: too large, and no grant lifts it — the policy
+        # checks would otherwise run without the per-value readings.
+        merge = 'x="gh pr merge 1"; $x'
+        # ...a grantable reason found FIRST (database, fork bomb) included.
+        leads = ("".join(f"x={i}; " for i in range(guard._MAX_VALUE_READINGS + 1)),
+                 "".join(f"x=${{D:-/tmp/a{i}}}; " for i in range(13)))
+        for tail in ("", "; echo 'DROP TABLE t' | psql", "; :(){ :|:& };:"):
+            for lead in leads:
+                with self.subTest(lead=lead[:20], tail=tail):
+                    cmd = "x=ls; " + lead + merge + tail
+                    self.assertEqual(guard.decide("Bash", {"command": cmd},
+                                                  overrides=["x=ls *"], cwd="/tmp"),
+                                     ("deny", guard._TOO_LARGE_REASON, "policy"))
+        for cmd in ('echo "${y:-"it\'s"}"; ls', 'echo "${line#\'# \'}" done',
+                    'f=a.txt; f=b.txt; cat "$f"', 'x=1; x=2; echo "$x"',
+                    'echo "${y:-"$(date)"}"', "".join(f"x={i}; " for i in range(16)) + "$x",
+                    'x=${HOME:-/tmp}; ls "$x"', 'echo "$(echo ")it\'s")"',
+                    # A `for` list's words are data, not counted toward the cap.
+                    "for f in " + " ".join("abcdefghijklmnopqrst") + "; do echo $f; done",
+                    # Applied defaults count toward the looser values cap only.
+                    "".join(f"x=${{D:-/tmp/a{i}}}; " for i in range(12)) + 'ls "$x"'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
     def test_a_decision_past_its_deadline_denies(self):
         # XERK-1615 QA: the growth budget counts characters, not time, and a
@@ -3465,6 +3780,59 @@ class TestHookEntrypoint(unittest.TestCase):
                 self.assertEqual(guard.main(), 0)
                 emit.assert_called_once()
                 self.assertIn("could not classify", emit.call_args[0][0])
+
+    def test_a_decision_past_the_hook_deadline_denies(self):
+        # XERK-1619: shlex on one huge word never returns to the in-decide
+        # deadline check, and past the hook timeout Claude Code RUNS the
+        # command. The real hook, deadline shortened: out of time it denies and
+        # exits even though the classifier is still running.
+        cmd = "echo " + "`x`" * 100000 + "; rm -rf /etc"
+        script = (f"import sys; sys.path.insert(0, {os.path.dirname(GUARD_PATH)!r}); "
+                  "import guard; guard._HOOK_DEADLINE_SECONDS = 1; sys.exit(guard.main())")
+        started = time.monotonic()
+        proc = subprocess.run([sys.executable, "-SsE", "-c", script], capture_output=True,
+                              text=True, timeout=30,
+                              input=json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd},
+                                                "cwd": "/tmp"}))
+        self.assertLess(time.monotonic() - started, 20)
+        self.assertEqual(proc.returncode, 0, proc.stderr[-300:])
+        out = json.loads(proc.stdout)["hookSpecificOutput"]
+        self.assertEqual((out["permissionDecision"], out["permissionDecisionReason"]),
+                         ("deny", guard._OVERRUN_REASON))
+
+    def test_an_overrun_denies_and_exits_with_the_classifier_still_running(self):
+        # The exit is what stops a classifier still running from holding the
+        # process past the deadline; a worker that died is a crash, not slow.
+        release = threading.Event()
+        cases = (("slow", lambda *a, **k: release.wait(5) and ("allow", "", None),
+                  guard._OVERRUN_REASON),
+                 ("died", mock.Mock(side_effect=SystemExit(3)), "could not classify"))
+        for name, decide, reason in cases:
+            with self.subTest(name), \
+                    mock.patch.object(guard, "decide", decide), \
+                    mock.patch.object(guard, "_HOOK_DEADLINE_SECONDS", 0.2), \
+                    mock.patch.object(guard.sys, "stdin", io.StringIO(json.dumps(
+                        {"tool_name": "Bash", "tool_input": {"command": "ls"}}))), \
+                    mock.patch.object(guard, "_emit_deny") as emit:
+                with self.assertRaises(_HardExit):
+                    guard.main()
+                emit.assert_called_once()
+                self.assertIn(reason, emit.call_args[0][0])
+        release.set()
+
+    def test_a_decision_inside_the_hook_deadline_is_its_own(self):
+        # The watchdog changes nothing for a decision that finishes.
+        for cmd, denied in (("ls", False), ("rm -rf /etc", True)):
+            with self.subTest(cmd=cmd), \
+                    mock.patch.object(guard.sys, "stdin", io.StringIO(json.dumps(
+                        {"tool_name": "Bash", "tool_input": {"command": cmd}}))), \
+                    mock.patch.object(guard, "_hard_exit") as hard_exit, \
+                    mock.patch.object(guard, "_emit_deny") as emit:
+                self.assertEqual(guard.main(), 0)
+                hard_exit.assert_not_called()
+                self.assertEqual(emit.called, denied)
+                if denied:
+                    self.assertNotEqual(emit.call_args[0][0], guard._OVERRUN_REASON)
 
     def test_unparseable_envelopes_fail_open_cleanly(self):
         # A 5000-digit int (ValueError) or very deep JSON (RecursionError) is a

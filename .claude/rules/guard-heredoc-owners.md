@@ -26,6 +26,16 @@ paths:
 - Every scan here must stay linear: one `_SHELL_WORD_RE` pass, the whole-command reader scan is
   memoised per `_expand` call (per owner it was O(heredocs × segments)). Tests:
   `TestExpansionBudget.test_redirect_runs_on_a_heredoc_line_stay_linear`.
+- **A program name is asked of every way bash may form it** (`_name_readings`, XERK-1629): the
+  text as written, and with every `$(…)`/backtick, `$@`, `$*`, `${@…}`, `$''`, `$""` dropped,
+  `$"…"` unlocalised, ANSI-C decoded and braces expanded (`bas``h`, `bas$(:)h`, `$'bas\150'`,
+  `{bas,-s}h` = `bash -sh`).
+  - Read at `_command_reads_stdin` (every pipe/heredoc reader) and over the whole owner in
+    `_heredoc_owner_feeds_shell` and the closer scan — BEFORE `_ungrouped`, which strips a
+    leading `{` and cut `{bas,-s}h` to `bas,-s`.
+  - Dropping a substitution that prints text over-reads; it only ever adds a shell reading.
+  - `_expand_braces` expands a leading-comma list (`{,bash}` = `bash`, empty words dropped) and
+    a sequence (`bas{h..h}`), up to `_BRACE_SEQ_MAX` words; a longer one stays as written.
 - **A non-literal owner word fails closed** (XERK-1624, `_owner_word_may_be_shell`, and
   `_stage_may_read_stdin` for `cat <<EOF | $S`):
   - a `$var` the line assigns is resolved (`x=cat; $x <<EOF` stays data); an unset one, `$SHELL`,
@@ -33,11 +43,16 @@ paths:
   - a glob is matched against the shell names (`/bin/ba?h`); a function or alias the command
     defines anywhere (`_defined_names`) may run a shell, whatever its body says;
   - `coproc` is a prefix word. A false deny still needs a destructive body.
+  - A substitution in the owner word is replaced by what it prints when known (`$(echo bash)`,
+    a silent `$(:)` → nothing, so `cat$(:) <<EOF` stays data), else a placeholder that fails closed
+    (`_owner_substs`).
   - Globs are matched with `fnmatch`, which is not bash: `[^` is rewritten to `[!` and any `[:`
     class fails closed. `_defined_names` starts only at word starts, so it stays linear.
   - Accepted over-deny (0 in a 19k-command replay): `"$EDITOR" <<EOF`, `${PAGER:-less}`,
     `f() { "$@"; }; f cat <<EOF` with a destructive body line.
-- Not covered (open tickets): empty substitution or brace expansion (XERK-1629), data later run as
-  code (XERK-1555), the same non-literal names on the `-c` and plain-pipe paths (XERK-1632).
+- Not covered (open tickets): data later run as code (XERK-1555), the same non-literal names
+  on the `-c` and plain-pipe paths (XERK-1632), names rebound by `read`/`hash -p`/`eval`
+  (XERK-1638).
 - Tests: `TestScriptChannels.test_a_heredoc_owner_shell_behind_a_glue_subshell_or_group`,
+  `test_a_shell_name_formed_by_an_empty_expansion_or_a_brace`,
   `test_a_heredoc_owner_named_through_a_variable_glob_function_or_alias`.
