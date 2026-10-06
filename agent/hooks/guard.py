@@ -100,17 +100,34 @@ _PREFIX_WORDS = {
 # `sudo -u root rm -rf /` strips down to `rm -rf /` rather than stopping at
 # `-u` and classifying nothing. Scoped per wrapper: `env -i` takes no value,
 # and treating it as if it did swallowed the `rm` that followed.
+# Read the way getopt reads them (`_opt_takes_next`): a short cluster takes
+# the next token when its LAST value letter ends it (`sudo -nu root`), and a
+# long option may be abbreviated (`timeout --kill 1`) — matching only whole
+# spellings left the value read as the program (XERK-1627).
 _PREFIX_OPTS_WITH_VALUE = {
-    "sudo": {"-u", "-g", "-p", "-C", "-h", "-R", "-U", "-r", "-t"},
-    "doas": {"-u", "-C"},
+    "sudo": {"-u", "-g", "-p", "-C", "-h", "-R", "-U", "-r", "-t", "-D", "-T",
+             "-a", "-c", "--user", "--group", "--prompt", "--close-from",
+             "--host", "--chroot", "--other-user", "--role", "--type", "--chdir",
+             "--command-timeout", "--auth-type", "--login-class"},
+    "doas": {"-u", "-C", "-a"},
     "env": {"-u", "--unset", "-C", "--chdir"},
     "timeout": {"-s", "--signal", "-k", "--kill-after"},
     "nice": {"-n", "--adjustment"},
-    "ionice": {"-c", "-n", "-p"},
-    "chrt": {"-p"},
-    "stdbuf": {"-i", "-o", "-e"},
+    "ionice": {"-c", "-n", "-p", "-P", "-u", "--class", "--classdata", "--pid",
+               "--pgid", "--uid"},
+    "chrt": {"-p", "-T", "-P", "-D", "--sched-runtime", "--sched-period",
+             "--sched-deadline"},
+    "stdbuf": {"-i", "-o", "-e", "--input", "--output", "--error"},
     "setsid": set(),
+    # GNU `/usr/bin/time -o FILE`, and `exec -a NAME cmd`.
+    "time": {"-f", "--format", "-o", "--output"},
+    "exec": {"-a"},
 }
+
+# Valueless long options that PREFIX a value-taking one: getopt_long takes an
+# exact match over the longer option, so `sudo --login rm` runs `rm` — read as
+# `--login-class`, it swallowed the program (XERK-1627 QA).
+_PREFIX_LONG_FLAGS = {"sudo": {"--login"}}
 
 # Shell keywords that can lead a segment once `for`/`if`/`while` bodies are
 # split on `;` — without these, `do`/`then` becomes the classified program.
@@ -3393,7 +3410,8 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             out.pop(0)
             # The wrapper's own flags, plus any value they consume.
             takes_value = _PREFIX_OPTS_WITH_VALUE.get(wrapper, set())
-            while out and out[0].startswith("-") and len(out[0]) > 1:
+            # `env -` is `env -i`: a bare dash is env's option, not its program.
+            while out and out[0].startswith("-") and (len(out[0]) > 1 or wrapper == "env"):
                 opt = out.pop(0)
                 split = _env_split_string(opt, out) if wrapper == "env" else None
                 if split is not None:
@@ -3401,13 +3419,19 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
                     # LINE, which classified as one unknown program (XERK-1539).
                     out[:0] = _tokenize(split)
                     continue
-                if "=" not in opt and opt in takes_value and out:
+                if opt == "--":
+                    break
+                if (opt not in _PREFIX_LONG_FLAGS.get(wrapper, ())
+                        and _opt_takes_next(opt, takes_value) and out):
                     out.pop(0)
             # `timeout 5s cmd` / `nice 10 cmd`: a bare duration/priority operand.
             # timeout's is REQUIRED, so it goes whatever it looks like: kept,
             # `timeout ${T:-5} bash` read as the program `${T:-5}` (XERK-1618).
+            # chrt's priority is positional too (`chrt -o 0 cmd`); a newer chrt
+            # may omit it, so only a number or an expansion is taken for it.
             if out and (wrapper == "timeout"
-                        or wrapper == "nice" and re.match(r"^[0-9]", out[0])):
+                        or wrapper == "nice" and re.match(r"^[0-9]", out[0])
+                        or wrapper == "chrt" and re.match(r"^[-+]?[0-9]|^[$`]", out[0])):
                 out.pop(0)
             # `coproc NAME { cmd; }`: a name only ever precedes a compound
             # command, whose body runs (XERK-1620 QA).
@@ -3417,6 +3441,26 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             continue
         break
     return out
+
+
+def _opt_takes_next(opt: str, takes_value: set[str]) -> bool:
+    """Whether a wrapper option consumes the NEXT token, read as getopt does.
+
+    `-nu`: a short cluster's value letter takes the rest of the token, or the
+    next token when it ends the cluster. `--kill`: getopt_long accepts any
+    unambiguous prefix of a long option; an ambiguous one aborts the wrapper,
+    so taking the value then hides nothing that runs. An exact valueless
+    long option that prefixes a value one is the caller's to exclude
+    (`_PREFIX_LONG_FLAGS`)."""
+    if opt.startswith("--"):
+        if "=" in opt:
+            return False
+        return opt in takes_value or any(
+            v.startswith(opt) for v in takes_value if v.startswith("--"))
+    for j in range(1, len(opt)):
+        if "-" + opt[j] in takes_value:
+            return j == len(opt) - 1
+    return False
 
 
 def _env_split_string(opt: str, rest: list[str]) -> str | None:
