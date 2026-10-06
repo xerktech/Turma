@@ -43,6 +43,13 @@ paths:
   the whole text when the line sets IFS, and `-a`'s array always does. A `${x:-…}` word is read
   with its default applied too, as an assignment's is.
   - A name can be glued to the `<<<` (`read a<<<"…"`): shlex keeps it in the redirection token.
+- **A `${…}` nested in another resolves innermost first** (XERK-1653, `_substitute_vars`'s `sub`):
+  `_VAR_USE_RE` stops at the inner `}`, so `${x:-${y:-$(echo rm …)}}` was left raw and ran unseen.
+  - The inner ones splice over the WHOLE line's positions (quote states, `_brace_end` memo), never
+    a re-substitution pass over the output: that would re-expand `$` a spliced value carries.
+  - Only when `_brace_end` closes past the match AND a `${` sits inside; a `}` merely quoted
+    (`${a:-'}' #}`) stays raw as one word (XERK-1585). Past `_MAX_NESTED_VARS` → too large.
+  - 0 decision changes over a 20.5k-command replay (636 holding `${`).
   - Residual: a multi-word list joins its words, so `for v in a 'rm …'; do $v; done` runs program
     `a` in the guard's reading (XERK-1647).
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
@@ -271,4 +278,4 @@ paths:
   `test_a_nested_quote_or_a_reassigned_value_does_not_hide_the_command`,
   `test_a_decision_past_its_deadline_denies`, `test_a_decision_past_the_hook_deadline_denies`,
   `test_a_nested_substitution_in_a_reparsed_string_is_classified`,
-  `test_deep_substitution_nesting_stays_fast` (`test_guard.py`).
+  `test_deep_substitution_nesting_stays_fast`, `test_a_default_nested_in_a_default_applies` (`test_guard.py`).

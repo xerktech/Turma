@@ -2474,7 +2474,8 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
 
     states = _quote_states(command) if (vals and "$" in command) or "${" in command else []
 
-    def rep(m: "re.Match[str]") -> str:
+    def rep(m: "re.Match[str]", depth: int) -> tuple[str, int]:
+        """What the use ``m`` splices, and where the text after it resumes."""
         if not _SPLICE_RAW[0] and not _live_dollar(command, m.start()):
             # `\${a:-\"}` is literal text to bash, and `$${` is the PID then a
             # brace. Splicing either's "default" shifted the quoting under the
@@ -2484,23 +2485,36 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # strips a backslash level first — so `_expand_both` also takes the
             # splice-everything reading.
             _SPLICES_ESCAPED[0] += 1
-            return m.group(0)
-        if m.group(1) and _brace_end(command, m.start(), states[m.start()] == '"') != m.end() - 1:
-            # `[^}]*` stopped at a `}` that is quoted or nested — in
-            # `${a:-'}' #}` the expansion runs on to the last `}`. Splicing the
-            # short match left the `#` bare, a comment hiding the rest of the
-            # line (XERK-1585); the raw text is read as one word instead.
-            return m.group(0)
+            return m.group(0), m.end()
+        rest, end = m.group(2) or "", m.end()
+        if m.group(1):
+            close = _brace_end(command, m.start(), states[m.start()] == '"')
+            if close != end - 1:
+                if close < end or "${" not in command[m.start() + 2:close]:
+                    # `[^}]*` stopped at a `}` that is quoted — in
+                    # `${a:-'}' #}` the expansion runs on to the last `}`.
+                    # Splicing the short match left the `#` bare, a comment
+                    # hiding the rest of the line (XERK-1585); the raw text is
+                    # read as one word instead.
+                    return m.group(0), end
+                # A nested `${…}` closed first: `${x:-${y:-$(echo …)}}`. Left
+                # raw, `$a` read the whole line's text as one word and a
+                # default inside a default ran unseen (XERK-1653). The inner
+                # ones resolve first, then this one over what they spliced.
+                if depth >= _MAX_NESTED_VARS:
+                    raise _ExpansionTooLarge
+                rest = sub(m.start() + 2 + len(m.group(1)), close, depth + 1)
+                end = close + 1
         name = m.group(1) or m.group(3) or ""
         got = vals.get(name)
-        op = _VAR_OP_RE.match(m.group(2) or "")
+        op = _VAR_OP_RE.match(rest)
         if got:
             value = _picked(got)
             state = states[m.start()] if m.start() < len(states) else ""
-            if state == '"' and ((m.group(2) or "").startswith("[")
+            if state == '"' and (rest.startswith("[")
                                  or name in _FOR_NAMES
                                  and command[m.start() - 1:m.start()] == '"'
-                                 and command[m.end():m.end() + 1] == '"'):
+                                 and command[end:end + 1] == '"'):
                 # `"${a[@]}"` is one word PER element, even mid-word: close
                 # the quote around them, as bash's expansion does. So is any
                 # subscript, read as every element: the values are joined, so
@@ -2518,11 +2532,27 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             if states and states[m.start()] == '"':
                 out = _dq_default(out)
         else:
-            return m.group(0)
-        _spend(len(out) - len(m.group(0)))
-        return out
+            return command[m.start():end], end
+        _spend(len(out) - (end - m.start()))
+        return out, end
 
-    return _var_sub(rep, command)
+    def sub(lo: int, hi: int, depth: int) -> str:
+        """``command[lo:hi]`` with its uses spliced; positions stay the
+        whole line's, so quoting and brace ends are read where they are."""
+        out, last = [], lo
+        k = max(command.rfind("}", lo, hi) + 1, lo)
+        # As `_var_uses`: no `${…}` match past the range's last `}` (XERK-1596).
+        for m in itertools.chain(_VAR_USE_RE.finditer(command, lo, k),
+                                 _VAR_BARE_RE.finditer(command, k, hi)):
+            if m.start() < last:
+                continue  # inside a nested use already spliced
+            text, end = rep(m, depth)
+            out += (command[last:m.start()], text)
+            last = end
+        out.append(command[last:hi])
+        return "".join(out)
+
+    return sub(0, len(command), 0)
 
 
 def _dq_default(text: str) -> str:
@@ -2593,6 +2623,8 @@ _BRACE_OTHER_SEEN = [False]
 # so the old parse's denies are KEPT as a reading rather than replaced.
 _MAIN_PARSE = [False]
 _MAIN_PARSE_SEEN = [False]
+# Past this many `${…}` nested in one another, a line is too large to read.
+_MAX_NESTED_VARS = 200
 # Past this many assignments to one name, a line is too large to read.
 _MAX_VALUE_READINGS = 16
 # ...and past this many values of one name, applied defaults included.
