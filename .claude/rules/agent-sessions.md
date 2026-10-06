@@ -356,6 +356,8 @@ runtime detail. `.claude/rules/agent.md` carries the process model and command t
 - It's `--append-system-prompt` (settings.json has no instruction field) as a **directive, not
   manager-side enforcement**, since only the agent knows when "new work" begins. Tests:
   `TestSessionLifecycle`.
+- The directive and the initial prompt reach claude via 0600 launch files (`write_launch_text`),
+  never inline: tmux refuses a command past ~16 KiB. Test: `test_a_long_ticket_keeps_the_tmux_…`.
 - The same append carries **`PR_SUMMARY_SYSTEM_PROMPT`**, the PR summary standard (a plain-English
   `**Summary:**` line, then Why / What changed / Risk / Testing / Follow-ups; a repo template wins).
   Unlike the branching policy it IS enforced: `hooks/guard.py` refuses a PR/MR missing a section
