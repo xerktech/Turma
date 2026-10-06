@@ -29,8 +29,14 @@ paths:
   used in program position or eval'd (`_PROGRAM_USE`) and the product ≤ `_MAX_CROSS_PASSES`;
   each pass is a whole-line expansion and 23 of them timed real lines out (replayed).
 - **Text written to a file a later `sh f`/`. f`/`source f` runs is a script** (`_written_scripts`,
-  XERK-1555): a printer redirected (`echo … > f`) or a heredoc `cat`/`tee` writes. Paths match
-  after `normpath` only; `cd` between them, a variable path or `cp` are not followed.
+  XERK-1555): a printer redirected (`echo … > f`), a `tee f` fed by a printer, or a heredoc
+  `cat`/`tee` writes. Paths match after `normpath` only; `cd` between them, a variable path or
+  `cp` are not followed.
+  - Each file is read ONCE per line (`written.pop`): per run, N appends and N runs were
+    quadratic and a 24 KB benign line hit the deadline (QA).
+- An alias use runs its VALUE with the use's words after it (`_alias_values`): `alias b='bash
+  -c'; b '<cmd>'`. The `alias` branch alone read `bash -c` with no script.
+- An array element written with its index (`([1]=w)`) is the element `w`.
 - **A program word that is not literal may be a shell on the `-c` and pipe paths too**
   (XERK-1632, `_owner_word_may_be_shell`). Gated on `_NONLITERAL_RE`/defined names before the
   call: asking every stage of every pipeline doubled the walk.

@@ -2335,14 +2335,22 @@ class TestScriptChannels(unittest.TestCase):
                     f'for v in "${{PATH:+$(echo {P})}}"; do $v; done',
                     f'read -r a <<< "${{PATH:+$(echo {P})}}"; $a',
                     f"echo '{P}' > /tmp/x.sh; sh /tmp/x.sh", f"echo '{P}' > /tmp/x.sh; . /tmp/x.sh",
-                    f"cat > /tmp/y.sh <<'E'\n{P}\nE\nbash /tmp/y.sh"):
+                    f"cat > /tmp/y.sh <<'E'\n{P}\nE\nbash /tmp/y.sh",
+                    # QA variants: an alias carrying `-c`, an indexed array, tee writers.
+                    f"alias b='bash -c'; b '{P}'", f'x=([0]=a [1]="{P}"); eval "${{x[1]}}"',
+                    f"echo '{P}' | tee /tmp/x.sh; sh /tmp/x.sh",
+                    f"tee /tmp/x.sh <<'E'\n{P}\nE\nsh /tmp/x.sh",
+                    "rm -rf 3>&1 1>&2 2>&3 /etc", "find -D tree /etc -delete",
+                    "printf '%s\\0' a /etc | xargs -0 -n 1 sh -c 'rm -rf \"$1\"' _"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("ls 2>&1 /tmp", "make &>/dev/null all", "$SHELL -c 'ls'",
                     "alias b=bash; b -c 'echo hi'", "bash -c -e 'make test'",
                     "sh -c 'echo \"${1:-x}\"' _", "find -L . -name '*.py'",
                     "x=(a b); echo \"${x[1]}\"", "a=b; b=1; echo \"${!a}\"",
-                    "echo hi > /tmp/z.sh; sh /tmp/z.sh", "echo 'ls' | $SHELL"):
+                    "echo hi > /tmp/z.sh; sh /tmp/z.sh", "echo 'ls' | $SHELL",
+                    "alias ll='ls -la'; ll /etc", "echo hi | tee /tmp/z.sh; sh /tmp/z.sh",
+                    "find /tmp/a /tmp/b -exec sh -c 'echo \"$1\"' _ {} \\;"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
         # Two names past the pass cap keep the same-index reading only, and stay fast.

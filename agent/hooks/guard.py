@@ -2496,7 +2496,9 @@ def _assigned_values(command: str, depth: int = 0,
             value = value[1:-1].strip()
             # ...and each element on its own, which `"${a[1]}"` runs
             # (XERK-1634); a few, as each is a reading.
-            elements = [w.group(0) for w in _ASSIGN_WORD_RE.finditer(value) if w.group(0)]
+            # `([1]=w …)` names its index; the element is `w`.
+            elements = [re.sub(r"\A\[[^]]*\]\+?=", "", w.group(0))
+                        for w in _ASSIGN_WORD_RE.finditer(value) if w.group(0)]
             if 1 < len(elements) <= _MAX_VALUE_READINGS // 2:
                 for element in elements:
                     vals.setdefault(m.group(1), []).append(
@@ -5844,6 +5846,22 @@ def _defined_names(command: str) -> frozenset[str]:
     return frozenset(n.lower() for n in names)
 
 
+def _alias_values(command: str) -> dict[str, list[str]]:
+    """Each alias ``command`` defines, mapped to its values (dequoted)."""
+    out: dict[str, list[str]] = {}
+    for words in _ALIAS_RE.findall(command):
+        try:
+            toks = shlex.split(words)
+        except ValueError:
+            toks = words.split()
+        for w in toks:
+            if "=" in w:
+                name, value = w.split("=", 1)
+                if value:
+                    out.setdefault(name, []).append(value)
+    return out
+
+
 def _function_bodies(command: str) -> dict[str, str]:
     """Each function ``command`` defines, mapped to its body (the `{ … }` or
     `( … )` after the header, unwrapped), so a bare call to it in the stdin
@@ -6139,7 +6157,7 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
             out = " ".join(words)
             if state == '"':
                 out = '"' + out + '"'
-        elif state == '"' and name == "@":
+        elif state == '"' and (name == "@" or every):
             # `"$@"` is one word per argument, not one word of them all.
             out = '" "'.join(_quote_literal(w, state) for w in words)
         else:
@@ -6545,13 +6563,19 @@ def _written_scripts(segments: list[str],
     > f`) and a heredoc `cat`/`tee` writes (`cat > f <<EOF`), by path. A
     later `sh f` / `. f` runs it as a script (XERK-1555)."""
     written: dict[str, list[str]] = {}
-    for raw in segments:
-        if ">" not in raw:
-            continue
-        words, outs = _stdout_targets(_strip_prefixes(_tokenize(raw)))
-        text = _printed_from_tokens(words) if outs and words else None
-        for path in outs if text else ():
-            written.setdefault(path, []).append(text)
+    for pipeline in segments:
+        # ...and what a `tee f` stage is fed: `echo … | tee f` (XERK-1641 QA).
+        fed: str | None = None
+        for stage in _split_on_operators(pipeline):
+            words, outs = _stdout_targets(_strip_prefixes(_tokenize(stage)))
+            prog = _basename(words[0]) if words else ""
+            text = _printed_from_tokens(words) if words else None
+            if prog == "tee" and fed:
+                outs = outs + [posixpath.normpath(w) for w in words[1:] if not w.startswith("-")]
+                text = fed
+            for path in outs if text else ():
+                written.setdefault(path, []).append(text)
+            fed = text if text else (fed if prog in _PASS_THROUGH else None)
     for owner, body, _quoted in heredocs:
         for seg in _split_segments(owner):
             if "<<" not in seg:
@@ -6946,9 +6970,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                         seg, lambda m: _subst_text(m, glued_empty=True))) or "")
                 for hs in _herestrings(seg):
                     _feed(hs)
+    aliases = _alias_values(raw_commands) if "alias" in raw_commands else {}
     # Files the line writes text into, which a later `sh f` runs (XERK-1555).
-    written = _written_scripts(segments, heredocs) if (
-        ">" in command and ("sh" in command or "." in command or "source" in command)) else {}
+    written = _written_scripts(_split_on_operators(command, include_pipe=False), heredocs) if (
+        (">" in command or "tee" in command)
+        and ("sh" in command or "." in command or "source" in command)) else {}
     for raw in segments:
         if every_cd != cwds:
             cwds = _cd_readings(raw, cwds)
@@ -7061,8 +7087,17 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
+        if aliases and tokens[0] in aliases:
+            # An alias runs its value with the use's words after it, so
+            # `alias b='bash -c'; b '<cmd>'` runs `bash -c '<cmd>'` (XERK-1641 QA).
+            tail = " ".join(shlex.quote(t) for t in rest)
+            for value in aliases[tokens[0]]:
+                _spend(len(value) + len(tail))
+                out.extend(_expand_segments(value + " " + tail, depth + 1, every_cd))
         if written and (prog in _SHELL_PROGS or prog in ("source", ".")):
-            for text in written.get(_script_file(prog, rest) or "", ()):
+            # Each file once per line, however often it is run: per run, N
+            # writes and N runs were quadratic (XERK-1641 QA).
+            for text in written.pop(_script_file(prog, rest) or "", ()):
                 for script in _script_readings(text):
                     out.extend(_expand_segments(script, depth + 1, every_cd))
         if prog in ("rm", "unlink", "chmod", "chown"):
@@ -7088,6 +7123,14 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                                         for sc in (*scripts, *bound)
                                         for a in _shifted(args, sc))
                             if b not in scripts]
+                # ...and once with every parameter read as every argument:
+                # `find a b -exec sh -c '… "$1"' _ {} \;` and `xargs -n1` run
+                # it once per path, so `$1` may be any of them (XERK-1636). One
+                # reading, never one per path: that grew with the paths.
+                if len(args) > 2:
+                    every = _bind_positionals(script, args, every=True)
+                    if every not in scripts:
+                        scripts.append(every)
                 for reading in scripts:
                     out.extend(_expand_segments(reading, depth + 1, every_cd))
         elif prog == "eval" and rest:
@@ -7217,14 +7260,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 argvs = [_strip_prefixes(expanded + piped_operands)]
                 # A replace-string embedded in an argument becomes ONE operand
                 # per run, so each operand is a run of its own.
-                # ...and so is each operand fed to a shell, whose `$1` is one
-                # path per run under `-n1`/`-L1` (XERK-1636).
-                shell_run = (len(piped_operands) > 1 and argvs[0]
-                             and _basename(argvs[0][0]) in _SHELL_PROGS)
-                if (replstr and any(replstr in t and t != replstr for t in inner)) or shell_run:
+                if replstr and any(replstr in t and t != replstr for t in inner):
                     for operand in piped_operands:
-                        run = ([t.replace(replstr, operand) for t in inner] if replstr
-                               else [*inner, operand])
+                        run = [t.replace(replstr, operand) for t in inner]
                         _spend(sum(len(t) + 1 for t in run))
                         argvs.append(_strip_prefixes(run))
                 for argv in argvs:
@@ -7268,12 +7306,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     # GNU find replaces a `{}` INSIDE an argument too —
                     # `-exec sh -c 'rm -rf {}' \;` — with one path per run
                     # (XERK-1600), so each root is a run of its own.
-                    # ...and so does a `{}` handed to a shell, whose `$1` is
-                    # one root per run under `\;` (XERK-1636).
-                    lead = _strip_prefixes(run)[:1]
-                    if any("{}" in t and t != "{}" for t in toks) or (
-                            len(roots) > 1 and "{}" in toks and lead
-                            and _basename(lead[0]) in _SHELL_PROGS):
+                    if any("{}" in t and t != "{}" for t in toks):
                         for root in roots:
                             runs.append([t.replace("{}", root) for t in toks])
                             _spend(sum(len(t) + 1 for t in runs[-1]))
