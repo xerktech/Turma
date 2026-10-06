@@ -1226,6 +1226,33 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_default_nested_in_a_default_applies(self):
+        # XERK-1653: each ran `rm -rf /etc` while the guard allowed it — the
+        # outer `${…}` stopped at the inner one's `}` and was left raw.
+        R = self.R
+        for cmd in (f'a="${{x:-${{y:-$(echo {R})}}}}"; $a',
+                    f'for v in "${{x:-${{y:-$(echo {R})}}}}"; do $v; done',
+                    f'read -r a <<< "${{x:-${{y:-$(echo {R})}}}}"; $a',
+                    f'a="${{x-${{y-$(echo {R})}}}}"; $a',
+                    f'a="${{x:-${{y:-{R}}}}}"; $a', f"${{x:-${{y:-{R}}}}}",
+                    f'a="${{x:-${{y}}$(echo {R})}}"; $a',
+                    f'a="${{x:-${{y:-${{z:-$(echo {R})}}}}}}"; $a',
+                    # Past the nesting cap the line is too large, never allowed.
+                    'a="' + "${x:-" * 300 + f"$(echo {R})" + "}" * 300 + '"; $a'):
+            with self.subTest(cmd=cmd[:80]):
+                self.assertDenied(cmd)
+        for cmd in ("echo ${HOME:-${PWD}}", 'echo "${x:-${y:-safe}}"',
+                    "ls ${a:-${b#x}}", 'a="${x:-${y:-ls}}"; $a'):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # Each level charges only its own growth: re-charging the inner
+        # splice per level denied a benign large value as "too large" (QA).
+        big = 'x="' + "A" * 150_000 + '"; echo "' + "${a:-" * 4 + "${x}" + "}" * 4 + '"'
+        self.assertAllowed(big)
+        # A quoted `}` still keeps the expansion one word (XERK-1585).
+        self.assertEqual(guard._substitute_vars("${a:-'}' #}", {}), "${a:-'}' #}")
+        self.assertEqual(guard._substitute_vars("${x:-${y:-$(echo P)}}", {}), "$(echo P)")
+
     def test_a_value_a_grouped_or_looped_reader_takes_from_stdin_runs(self):
         # XERK-1650: each ran `rm -rf /etc` while the guard allowed it.
         R = self.R
