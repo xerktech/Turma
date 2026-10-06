@@ -79,14 +79,20 @@ import time
 # exactly like `;` does, so leaving it out let `sleep 0 & rm -rf /etc` past.
 _SEGMENT_SPLIT = re.compile(r"&&|\|\||[;\n|&]")
 
-# A leading `FOO=bar` environment assignment on a command.
-_ENV_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=\S*$")
+# A leading `FOO=bar` environment assignment on a command. It is matched
+# against the DEQUOTED token, so the value may hold anything — whitespace and
+# newlines included (`CFLAGS="-O2 -g" make`, XERK-1620). `\S*` left such a
+# token as the program word and hid the real command behind it. `+=` and a
+# subscript (`a[0]=x`, `a[b[1]]=x`) are assignment words too: bash still runs
+# the command.
+_ENV_ASSIGN = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[.*?\])?\+?=.*\Z", re.DOTALL)
 
 # Privilege-escalation prefixes we strip before classifying the real command
 # (a destructive command is destructive with or without `sudo`).
 _PREFIX_WORDS = {
     "sudo", "doas", "runas", "command", "nohup", "time", "exec", "env",
     "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer", "builtin",
+    "coproc",
 }
 
 # Options of those wrappers that consume the NEXT token as their value, so
@@ -111,6 +117,9 @@ _SHELL_KEYWORDS = {
     "do", "done", "then", "else", "elif", "fi", "in", "esac", "!",
     "{", "}", "(", ")", ";;", "if", "while", "until",
 }
+
+# Words that may come before a command's leading assignments: `time X=… cmd`.
+_PREFIX_KEYWORDS = _SHELL_KEYWORDS | {"time"}
 
 # Compound-statement heads whose word list runs up to `in` — without skipping
 # it, `case x in x) rm -rf /etc;; esac` classified as the program `x`.
@@ -2934,6 +2943,259 @@ def _join_continuations(segment: str) -> str:
     return "".join(out)
 
 
+def _word_end(s: str, i: int, stop: str | None = None) -> int:
+    """Where the bash word starting at ``i`` ends (``stop`` None), or the
+    index of the ``stop`` character closing the construct whose body starts
+    at ``i`` (`)`, `]` or `"`); -1 when something never closes.
+
+    Unlike shlex it keeps whitespace inside `${…}`, `$(…)`, `$((…))`, `$[…]`,
+    backticks and nested brackets in the word, as bash does.
+    """
+    n = len(s)
+    while i < n:
+        ch = s[i]
+        if stop is None and ch in " \t\n;&|<>()":
+            return i
+        if ch == stop:
+            return i
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "`":
+            j = i + 1
+            while j < n and s[j] != "`":
+                j += 2 if s[j] == "\\" else 1
+            if j >= n:
+                return -1
+            i = j + 1
+            continue
+        if s.startswith("${", i):
+            # Quoting is known here; looked up, it is a whole-line scan per `${`.
+            j = _brace_end(s, i, quoted=stop == '"')
+        elif s.startswith(("$(", "$["), i):
+            j = _word_end(s, i + 2, ")" if s[i + 1] == "(" else "]")
+        elif stop == '"':
+            i += 1
+            continue
+        elif ch == '"':
+            j = _word_end(s, i + 1, '"')
+        elif ch == "'" or s.startswith("$'", i):
+            j = i + 1 if ch == "'" else i + 2
+            while j < n and s[j] != "'":
+                j += 2 if ch == "$" and s[j] == "\\" else 1
+            j = j if j < n else -1
+        elif (stop, ch) in ((")", "("), ("]", "[")):
+            j = _word_end(s, i + 1, stop)
+        else:
+            i += 1
+            continue
+        if j < 0:
+            return -1
+        i = j + 1
+    return n if stop is None else -1
+
+
+# The NAME of an assignment word; its subscript and `+=`/`=` are checked by
+# `_prefix_assignment_end`.
+_ASSIGN_NAME_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A redirection operator, with its fd: `>`, `2>&`, `{fd}>`, `&>>`, `<<<`, `<<-`.
+_REDIRECT_AT_RE = re.compile(r"(?:\d+|\{[A-Za-z_]\w*\})?(?:&>>?|<<<|<<-?|<>|>>|>\||[<>]&?)")
+# How many quoted levels `_unsplit_assignments` reads as scripts.
+_MAX_UNSPLIT_DEPTH = 4
+# What some reader of the line splits a word at: shlex at a blank, the
+# splitter and a spliced `${v:-a;b}` at an operator.
+_ASSIGN_SPLITS_RE = re.compile(r"[\s;&|<>]")
+
+
+def _prefix_assignment_end(s: str, i: int) -> int:
+    """End of the assignment word (`NAME=…`, `NAME+=…`, `NAME[sub]=…`) at
+    ``i``, or -1 if none starts there or it never closes."""
+    m = _ASSIGN_NAME_RE.match(s, i)
+    if not m:
+        return -1
+    j = m.end()
+    if s.startswith("[", j):
+        j = _word_end(s, j + 1, "]")
+        if j < 0:
+            return -1
+        j += 1
+    if s.startswith("+=", j):
+        j += 1
+    if not s.startswith("=", j) or s.startswith("=(", j):
+        return -1
+    return _word_end(s, j + 1)
+
+
+@functools.lru_cache(maxsize=64)
+def _unsplit_assignments(command: str, depth: int = 0) -> str:
+    out, last = [], 0
+    for start, end, name in _unsplit_cuts(command, depth):
+        out += (command[last:start], name)
+        last = end
+    out.append(command[last:])
+    return "".join(out)
+
+
+@functools.lru_cache(maxsize=64)
+def _unsplit_cuts(command: str, depth: int = 0) -> tuple[tuple[int, int, str], ...]:
+    """``command`` with each assignment word that prefixes a command, and that
+    holds an unquoted blank or operator character, cut down to its `NAME=`.
+
+    bash keeps `X=${v:-a b}`, `X=$((1 + 2))`, `X=$(echo a; echo b)` and
+    `a[1 + 1]=x` ONE word, so the command after it runs; shlex and the
+    splitter cut it at the blank or `;`, leaving a fragment (`b}`, `+`) as the
+    program word and the command unclassified (XERK-1620). Only an ADDED
+    reading: the scan below is not bash, and where it misjudges a word's end
+    the line's own reading still stands. A substitution's body is skipped
+    whole here; its own commands are read when it is expanded. A quoted
+    string is scanned as a script too (`bash -c '…'`, `eval '…'`,
+    `echo '…' | bash`), since the splice of `${v:-a b}` reaches it first.
+    """
+    cuts: list[tuple[int, int, str]] = []
+    pending: list[tuple[int, int, str]] = []
+    i, n, at_start, wrapped = 0, len(command), True, False
+    try:
+        while i < n:
+            ch = command[i]
+            if ch in " \t":
+                i += 1
+                continue
+            redirect = _REDIRECT_AT_RE.match(command, i)
+            if redirect:
+                # `>/dev/null X=… cmd`: a redirection and its target may come
+                # anywhere, before the assignments too (`{fd}>`, `2>&1`, `&>`).
+                i = redirect.end()
+                while i < n and command[i] in " \t":
+                    i += 1
+                # The target, a here-string's word or a heredoc's delimiter. A
+                # here-string may be a script (`bash <<< 'X=… cmd'`).
+                end = _word_end(command, i)
+                if end < 0:
+                    break
+                if depth < _MAX_UNSPLIT_DEPTH:
+                    cuts += _unsplit_quoted(command, i, end, depth)
+                i = max(end, i)
+                continue
+            if ch in ";&|\n()":
+                # Assignments with no command after them set the SHELL's
+                # variables (`R=$(command -v ruff); $R …`): never cut those.
+                at_start, wrapped, pending = True, False, []
+                i += 1
+                continue
+            if ch == "#":
+                end = command.find("\n", i)
+                i = n if end < 0 else end
+                continue
+            if at_start or wrapped:
+                end = _prefix_assignment_end(command, i)
+                if end > i:
+                    word = command[i:end]
+                    if _ASSIGN_SPLITS_RE.search(_unquoted_text(word)):
+                        cut = (i, end, _ASSIGN_NAME_RE.match(word).group(0) + "=")
+                        (cuts if wrapped else pending).append(cut)
+                    i = end
+                    continue
+            end = _word_end(command, i)
+            if end <= i:
+                break
+            word = command[i:end]
+            if depth < _MAX_UNSPLIT_DEPTH:
+                cuts += _unsplit_quoted(command, i, end, depth)
+            if at_start and _basename(word) in _PREFIX_WORDS:
+                # A wrapper (`env -u N X=… cmd`, `sudo -u root X=… cmd`,
+                # `timeout 5 env X=…`, `coproc N { X=… cmd; }`): every
+                # assignment-shaped word to the end of the command is cut, flag
+                # values and names included. Only an added reading, so cutting
+                # an argument costs nothing the line's own reading had.
+                wrapped = True
+                cuts += pending
+                pending = []
+            elif word not in _PREFIX_KEYWORDS:
+                at_start = False
+                cuts += pending
+                pending = []
+            i = end
+    except RecursionError:
+        return ()
+    kept, last = [], 0
+    for start, end, name in sorted(cuts):
+        if start >= last:
+            kept.append((start, end, name))
+            last = end
+    return tuple(kept)
+
+
+def _unquoted_text(word: str) -> str:
+    """``word`` without its quoted runs: a blank in `X='a b'` splits nothing,
+    so that assignment needs no cut (`_ENV_ASSIGN` reads it whole)."""
+    out, i, n = [], 0, len(word)
+    while i < n:
+        ch = word[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'" or word.startswith("$'", i):
+            j = i + 1 if ch == "'" else i + 2
+            while j < n and word[j] != "'":
+                j += 2 if ch == "$" and word[j] == "\\" else 1
+        elif ch == '"':
+            j = _word_end(word, i + 1, '"')
+        else:
+            out.append(ch)
+            i += 1
+            continue
+        if j < 0 or j >= n:
+            return word
+        i = j + 1
+    return "".join(out)
+
+
+def _unsplit_quoted(command: str, i: int, end: int, depth: int) -> list[tuple[int, int, str]]:
+    """Cuts inside each `'…'`/`"…"` script in the word ``command[i:end]``."""
+    cuts = []
+    while i < end:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+            continue
+        close = -1
+        if ch == "'":
+            close = command.find("'", i + 1)
+        elif ch == '"':
+            close = _word_end(command, i + 1, '"')
+        if close < 0 or close >= end:
+            i += 1
+            continue
+        inner = command[i + 1:close]
+        if "=" in inner:
+            if ch == '"':
+                # A re-parse reads the string with its escapes removed:
+                # `bash -c "X=\$((1 + 2)) rm …"` runs `X=$((1 + 2)) rm …`.
+                # Each cut is mapped back through them.
+                text, at = _dq_unescaped(inner)
+                for start, stop, name in _unsplit_cuts(text, depth + 1):
+                    cuts.append((i + 1 + at[start], i + 1 + at[stop - 1] + 1,
+                                 re.sub(r'([$`"\\])', r"\\\1", name)))
+            else:
+                cuts += [(i + 1 + start, i + 1 + stop, name)
+                         for start, stop, name in _unsplit_cuts(inner, depth + 1)]
+        i = close + 1
+    return cuts
+
+
+def _dq_unescaped(text: str) -> tuple[str, list[int]]:
+    """``text`` as bash reads it inside `"…"` (`\\` before `$`, a backtick,
+    `"`, `\\` or a newline dropped), and where each character came from."""
+    out, at, i = [], [], 0
+    while i < len(text):
+        if text[i] == "\\" and i + 1 < len(text) and text[i + 1] in '$`"\\\n':
+            i += 1
+        out.append(text[i])
+        at.append(i)
+        i += 1
+    return "".join(out), at
+
+
 # A bare `(` `)` pair, blanks allowed around and inside: in a simple command it
 # can only be a function header, so `_glue_func_parens` closes it up.
 _FUNC_PARENS_RE = re.compile(r"[ \t]*\([ \t]*\)")
@@ -3088,6 +3350,11 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
             # `timeout ${T:-5} bash` read as the program `${T:-5}` (XERK-1618).
             if out and (wrapper == "timeout"
                         or wrapper == "nice" and re.match(r"^[0-9]", out[0])):
+                out.pop(0)
+            # `coproc NAME { cmd; }`: a name only ever precedes a compound
+            # command, whose body runs (XERK-1620 QA).
+            if wrapper == "coproc" and len(out) > 1 and out[1] in ("{", "(", "while", "until",
+                                                                    "if", "for", "case"):
                 out.pop(0)
             continue
         break
@@ -3856,6 +4123,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if (owner_tokens and _basename(owner_tokens[0]) in _SCRIPT_READERS
                 or _owner_feeds_shell()):
             for script in ([body] if quoted else _heredoc_readings(body)):
+                # ...and cut, before the splice runs a value together (XERK-1620).
+                # Nested, each level doubles the cost; that is accepted, since it
+                # needs a cuttable assignment at every level and the deadline
+                # denies. A flag to skip nested cuts let one heredoc that needs
+                # its cut hide the next (XERK-1620 QA).
+                unsplit = _unsplit_assignments(script)
+                if unsplit != script:
+                    _spend(len(unsplit))
+                    out.extend(_expand_segments(_substitute_vars(unsplit, raw_vals), depth + 1,
+                                                every_cd))
                 out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
                                             every_cd))
         elif not quoted:
@@ -3922,6 +4199,21 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         # them (`cd $(echo /; true); rm -rf *`) moves the whole line, in order
         # or not: the half-segment `cd $(echo /` named no directory.
         cwds = _cd_readings(_prenormalise(printed_line), cwds)
+    # A leading assignment shlex would split hides the command after it, so
+    # the line's segments are ALSO read with each cut to its `NAME=`, adding
+    # only those that differ (XERK-1620). Never the whole line re-expanded:
+    # its bodies are unchanged, and re-reading them at every nesting level
+    # doubled the cost per level.
+    unsplit = _unsplit_assignments(raw_commands)
+    unsplit_line = ""
+    if unsplit != raw_commands:
+        _spend(len(unsplit))
+        unsplit_line = _prenormalise(unsplit)
+        seen = set(segments)
+        for seg in _split_segments(unsplit_line):
+            if seg not in seen:
+                seen.add(seg)
+                segments.append(seg)
     # The TAINT reading of every operator-holding substitution the splitter cut
     # (XERK-1613), rebuilt in ONE pass so a body of N statements stays linear.
     seen = set(segments)
@@ -3980,7 +4272,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # the scan keeps whole but cannot open (`{ (a; echo …) | sh; }`, `do (…)`)
     # hid a pipeline the plain split cut out. Reading both, the walk finds at
     # least what it found before; identical pipelines are walked once.
-    for pipeline in (_walked_pipelines(command) if feeds_a_shell else ()):
+    pipelines = _walked_pipelines(command) if feeds_a_shell else []
+    if unsplit_line and feeds_a_shell:
+        # ...and the line read with its assignments cut (XERK-1620).
+        pipelines = list(dict.fromkeys(pipelines + _walked_pipelines(unsplit_line)))
+    for pipeline in pipelines:
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
         # feeding it either, so skip its per-stage scan too — unless the line
         # opened an fd it may read (`exec 3< <(…); bash <&3`).

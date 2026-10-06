@@ -26,6 +26,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `guard-qa.md` | `agent/hooks/guard.py`, its tests + rig | guard QA: cases run as nobody via `guard_differential.py` (XERK-1590) |
 | `guard-substitutions.md` | `agent/hooks/guard.py`, `test_guard.py` | guard: balanced substitution scan, every parser on it, arithmetic, nesting cost (XERK-1605) |
 | `guard-heredoc-owners.md` | `guard.py`, `test_guard.py` | guard: which heredoc owners are shells; the broad closer rule (XERK-1618) |
+| `guard-prefix-assignments.md` | `guard.py`, `test_guard.py` | guard: leading `X='a b' cmd` assignments, the added unsplit reading (XERK-1620) |
 | `agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
 | `agent-native-windows.md` | `agent/native/README-windows.md`, `docs/windows-agent-adr.md` | Windows agent (XERK-666) MAP: component→rules-file, invariant pointers, operator guide |
 | `windows-agent.md` | `agent/hub-agent.py` | native Windows portability: paths, %APPDATA%, icacls ACL, liveness/degradation (XERK-670); ADR `docs/windows-agent-adr.md` |
