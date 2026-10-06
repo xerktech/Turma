@@ -1879,8 +1879,14 @@ def _apply_var_op(value: str, op: str, arg: str) -> str:
         pat = arg.replace("*", "")
         return value[: -len(pat)] if pat and value.endswith(pat) else value
     if op in ("/", "//"):
-        pat, _, rep = arg.partition("/")
+        # `\/` is a slash in the pattern, not its end: `${q/tmp\/a/etc}`.
+        cut = re.search(r"(?<!\\)/", arg)
+        pat, rep = (arg[:cut.start()], arg[cut.end():]) if cut else (arg, "")
+        pat, rep = pat.replace("\\/", "/"), rep.replace("\\/", "/")
         return value.replace(pat, rep, -1 if op == "//" else 1) if pat else value
+    if op in (":+", "+"):
+        # The alternative replaces a set value: `${q:+/etc}` is /etc.
+        return arg if value or op == "+" else value
     if op == ":":
         bits = arg.split(":")
         try:
@@ -1971,11 +1977,6 @@ def _var_values(command: str) -> dict[str, list[str]]:
     return _memo("vals", command, _assigned_values, _join_continuations(command))
 
 
-# Links of an assignment chain `_assigned_values` resolves (one per round);
-# a longer chain still resolving is refused as too large.
-_CHAIN_ROUNDS = 64
-
-
 def _assigned_values(command: str) -> dict[str, list[str]]:
     vals: dict[str, list[str]] = {}
     states = _quote_states(command) if "${" in command else []
@@ -2055,61 +2056,100 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
             vals.setdefault(m.group(1), []).extend(words)
             _FOR_NAMES.add(m.group(1))
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
-    # HERE, once, against values that name none. Left in, every recursion
-    # level re-inlined it, the text grew each time, and an ordinary command
-    # was refused as nested too deeply. A chain (`q=/etc; d=$q; r=$d`) is
-    # resolved a link per round, each value once its names have values: one
-    # round read `r` empty and `rm -rf $r` passed (XERK-1648). What never
-    # resolves (a cycle) is empty, as bash reads an unset name; a chain past
-    # the round cap is refused, never read empty.
-    plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
-    pending = {(k, i): (v, {m.group(1) or m.group(3) for m in _var_uses(v)} & vals.keys())
-               for k, vs in vals.items() for i, v in enumerate(vs) if v not in plain[k]}
-    done: dict[tuple[str, int], str] = {}
-    # A name's applied defaults (below) resolve the OTHER names a link names.
-    defaults = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in applied.items()}
-
-    def chained(m: "re.Match[str]", owner: str, known: dict[str, list[str]]) -> str:
-        name = m.group(1) or m.group(3)
-        if name not in known:
-            return m.group(0)
-        value = _picked(known[name] + (defaults.get(name, []) if name != owner else []))
-        _spend(len(value) - len(m.group(0)))
-        return value
-
-    for _ in range(_CHAIN_ROUNDS):
-        known = {k: list(vs) for k, vs in plain.items()}
-        ready = [key for key, (_v, names) in pending.items()
-                 if all(known[n] or (n != key[0] and defaults.get(n)) for n in names)]
-        for key in ready:
-            got = done[key] = _var_sub(lambda m: chained(m, key[0], known), pending.pop(key)[0])
-            if not _names_assigned(got, vals):
-                plain[key[0]].append(got)
-        if not ready:
-            break
-    else:
-        if pending and _budget is not None:
-            _budget["capped"] = True
+    # HERE, once, and stored resolved. Left in, every recursion level
+    # re-inlined it, the text grew each time, and an ordinary command was
+    # refused as nested too deeply.
+    # Names are resolved in dependency order (`_dependency_order`), each once
+    # every name it uses has ALL its values: resolving once against the values
+    # that name none read `q=/etc; d=$q; r=$d` as `r` empty, and `rm -rf $r`
+    # passed (XERK-1648). Inside a cycle (`a=$b; b=$a`) a name not yet resolved
+    # reads empty, as bash reads an unset name.
     # An applied default is one more value of its name, and resolves OTHER
     # names (`y=${x:-"rm …"}; z=$y; $z`), never its own: there it took
     # `x=; x=${x-a}"rm …"; $x` (the `${x-a}` empty, x set) to `arm …` in
     # every reading.
+    own = {k: len(vs) for k, vs in vals.items()}
     for k, vs in applied.items():
         vals.setdefault(k, []).extend(vs)
-    others = {k: plain.get(k, []) + [v for v in vs if not _names_assigned(v, vals)]
-              for k, vs in applied.items()}
+    known: dict[str, list[str]] = {k: [] for k in vals}
+    defaults: dict[str, list[str]] = {k: [] for k in vals}
+    waits: dict[str, set[str]] = {k: set() for k in vals}
+    linked: dict[str, list[tuple[int, set[str]]]] = {}
+    for k, vs in vals.items():
+        for i, v in enumerate(vs):
+            names = {m.group(1) or m.group(3) for m in _var_uses(v)} & vals.keys()
+            if names:
+                waits[k] |= names
+                linked.setdefault(k, []).append((i, names))
+            else:
+                (known if i < own[k] else defaults)[k].append(v)
+    out = {k: list(vs) for k, vs in vals.items()}
 
-    def resolve(m: "re.Match[str]", owner: str) -> str:
-        name = m.group(1) or m.group(3) or ""
+    def link(m: "re.Match[str]", owner: str) -> str:
+        name = m.group(1) or m.group(3)
         if name not in vals:
             return m.group(0)
-        value = _picked(plain[name] if name == owner else others.get(name, plain[name]))
+        got = known[name] if name == owner or not defaults[name] else known[name] + defaults[name]
+        value = _picked(got)
+        op = _VAR_OP_RE.match(m.group(2) or "")
+        if op:
+            value = _apply_var_op(value, op.group(1), op.group(2))
         _spend(len(value) - len(m.group(0)))
         return value
 
-    return {k: [done.get((k, i)) if (k, i) in done
-                else _var_sub(lambda m, k=k: resolve(m, k), v) for i, v in enumerate(vs)]
-            for k, vs in vals.items()}
+    for group in _dependency_order(waits):
+        # Values naming no other member first: `d=$x; d=$d/y` reads `$d` as $x's.
+        todo = [(len(names & group) > 0, k, i) for k in group for i, names in linked.get(k, ())]
+        for _cyclic, k, i in sorted(todo):
+            got = out[k][i] = _var_sub(lambda m: link(m, k), vals[k][i])
+            (known if i < own[k] else defaults)[k].append(got)
+    return out
+
+
+def _dependency_order(waits: dict[str, set[str]]) -> list[set[str]]:
+    """The names of ``waits`` (name → names its values use) in groups, each
+    after every group it uses: Tarjan's strongly connected components, which
+    come out dependencies first. A group of more than one name, or a name
+    using itself, is a cycle. Iterative, so a long chain cannot overflow the
+    stack."""
+    index: dict[str, int] = {}
+    low: dict[str, int] = {}
+    stack: list[str] = []
+    on_stack: set[str] = set()
+    groups: list[set[str]] = []
+    for root in waits:
+        if root in index:
+            continue
+        index[root] = low[root] = len(index)
+        stack.append(root)
+        on_stack.add(root)
+        work = [(root, iter(waits[root]))]
+        while work:
+            node, edges = work[-1]
+            for nxt in edges:
+                if nxt not in index:
+                    index[nxt] = low[nxt] = len(index)
+                    stack.append(nxt)
+                    on_stack.add(nxt)
+                    work.append((nxt, iter(waits[nxt])))
+                    break
+                if nxt in on_stack:
+                    low[node] = min(low[node], index[nxt])
+            else:
+                work.pop()
+                if work:
+                    parent = work[-1][0]
+                    low[parent] = min(low[parent], low[node])
+                if low[node] == index[node]:
+                    group = set()
+                    while True:
+                        name = stack.pop()
+                        on_stack.discard(name)
+                        group.add(name)
+                        if name == node:
+                            break
+                    groups.append(group)
+    return groups
 
 
 def _value_taint_readings(value: str) -> tuple[str, ...]:

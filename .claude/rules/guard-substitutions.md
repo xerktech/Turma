@@ -279,11 +279,16 @@ paths:
     without the per-value readings: `x=ls; <17 x=…>; x="gh pr merge 1"; $x` passed `x=ls *`. `_assign_value_end` extends a value whose
   `${…}` closes past the regex's flat quote pairing (`x="${y:-"rm …"}"`).
 - **A value naming another assigned name resolves through the whole chain** (XERK-1648,
-  `_assigned_values`): one link per round, each value once every name it uses has a value, then
-  stored resolved — never re-inlined per recursion level (that grew the text to "too deep").
-  - Resolving once read `q=/etc; d=$q; r=$d` as `r` empty: `rm -rf $r` passed.
-  - A cycle (`a=$b; b=$a`) never resolves and reads empty, as an unset name. A chain still
-    resolving past `_CHAIN_ROUNDS` links sets `capped` (denied), never reads empty.
+  `_assigned_values`): names are resolved in dependency order (`_dependency_order`, Tarjan SCCs),
+  each once every name it uses has ALL its values, then stored resolved — never re-inlined per
+  recursion level (that grew the text to "too deep").
+  - Resolving once, against values naming none, read `q=/etc; d=$q; r=$d` as `r` empty. Rounds
+    were tried too: a link naming a cycle (`d=$q$c; c=$c`) stalled the chain, and a name with one
+    plain and one chained value (`q=/tmp; q=$e; d=$q`) was read before its second value.
+  - Inside a cycle a member not yet resolved reads empty, as an unset name; the rest of the
+    cycle's members still resolve, and so does everything using the cycle.
+  - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`).
+  - Not modelled: ORDER (`d=$q$c; c=x` reads c as x; bash has it unset at that point).
   - Tests: `test_a_chain_of_assignments_resolves_every_link`,
     `test_a_cycle_of_assignments_stays_bounded`.
 - **A name assigned more than once is also read with each value on its own** (`_picked`,

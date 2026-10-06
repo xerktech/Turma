@@ -1176,29 +1176,43 @@ class TestParserGaps(unittest.TestCase):
                          ["/tmp/q/d2/ro/$tag"])
         for cmd in ("q=/etc; d=$q; r=$d; rm -rf $r",
                     "q=/etc; d=$q; r=$d; s=$r; t=$s; rm -rf $t",
-                    'y=${x:-"rm -rf /etc"}; z=$y; w=$z; $w'):
+                    'y=${x:-"rm -rf /etc"}; z=$y; w=$z; $w',
+                    # QA: a link naming a cycle, a name with a plain and a
+                    # chained value, an operator in a link, a default naming
+                    # a name.
+                    "q=/etc; d=$q$c; r=$d; c=$c; rm -rf $r",
+                    "q=/etc; d=$q$e; r=$d; e=$f; f=$e; rm -rf $r",
+                    "e=/etc; q=/tmp/x; q=$e; d=$q; rm -rf $d",
+                    "d=; d=/etc$d; r=$d; rm -rf $r",
+                    "d=/e; d=${d}tc; r=$d; rm -rf $r",
+                    "q=/etcx; d=${q%x}; rm -rf $d",
+                    "q=/tmp; d=${q:+/etc}; rm -rf $d",
+                    "q=/tmp/a; d=${q/tmp\\/a/etc}; rm -rf $d",
+                    "a=/etc; b=$a; y=${x:-$b}; z=$y; rm -rf $z",
+                    "c='rm -rf /etc'; q='echo hi'; q=$c; d=$q; $d"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         for cmd in ("q=/tmp/q; d=$q/d2/ro; r=$d/; rm -rf $r",
                     "q=/tmp/q; d=$q/d2/ro; r=$d/$(cat f); rm -rf $r",
-                    "q=/tmp/q; d=$q/d2/ro; r=$d/$tag; rm -rf $r"):
+                    "q=/tmp/q; d=$q/d2/ro; r=$d/$tag; rm -rf $r",
+                    "q=/tmp/q; d=$q$c; r=$d/x; c=$c; rm -rf $r"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
     def test_a_cycle_of_assignments_stays_bounded(self):
-        """A cycle never resolves; it reads empty, as an unset name. A chain
-        that doubles is charged to the budget, and one past the round cap is
-        refused rather than read empty."""
+        """A cycle reads empty, as an unset name. A long chain resolves in
+        linear time, and one that doubles is charged to the budget."""
         self.assertEqual(guard._var_values("a=$b; b=$a"), {"a": [""], "b": [""]})
         self.assertEqual(guard.decide("Bash", {"command": "a=$b; b=$a; echo $a"})[0], "allow")
         doubling = "a0=xxxxxxxx; " + "".join(f"a{i + 1}=$a{i}$a{i}; " for i in range(40))
-        long = "a0=/etc; " + "".join(f"a{i + 1}=$a{i}; " for i in range(guard._CHAIN_ROUNDS + 5))
-        for cmd in (doubling + "echo $a40", long + f"rm -rf $a{guard._CHAIN_ROUNDS + 5}"):
+        long = "".join(f"a{i + 1}=$a{i}; " for i in range(3000))
+        cycle = "".join(f"b{i}=$b{i + 1}; " for i in range(3000)) + "b3000=$b0; "
+        for cmd, want in ((doubling + "echo $a40", "deny"), ("a0=/etc; " + long + "rm -rf $a3000", "deny"),
+                          ("a0=/tmp/x; " + long + "rm -rf $a3000", "allow"), (cycle + "echo $b7", "allow")):
             with self.subTest(cmd=cmd[:40]):
                 start = time.monotonic()
-                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], want)
                 self.assertLess(time.monotonic() - start, 5)
-        self.assertEqual(guard.decide("Bash", {"command": long[:600] + "ls"})[0], "allow")
 
 
 class TestProducedScripts(unittest.TestCase):
