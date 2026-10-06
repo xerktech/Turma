@@ -1841,6 +1841,31 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_wrapper_option_cluster_and_abbreviation_take_their_value(self):
+        # XERK-1627: a cluster ending in a value letter (`-nu root`) and an
+        # abbreviated long option (`--kill 1`) consume the next token; reading
+        # only whole spellings left the value as the program. chrt's priority
+        # is a positional operand. Each ran the marker in real bash as nobody.
+        R = self.R
+        for cmd in (f"timeout -vk 1 5 {R}", f"env -iu X {R}", f"ionice -tc 3 {R}",
+                    f"chrt -o 0 {R}", f"chrt 0 {R}", f"chrt -f 10 {R}",
+                    f"sudo -nu root {R}", f"sudo -Eu root {R}", f"doas -nu root {R}",
+                    f"sudo --user root {R}", f"sudo -D /tmp {R}", f"timeout --kill 1 5 {R}",
+                    f"timeout --sig KILL 5 {R}", f"env --uns X {R}", f"ionice --class 3 {R}",
+                    f"stdbuf --output L {R}", f"exec -a x {R}", f"/usr/bin/time -o f {R}",
+                    # `--` ends the options; it prefixes every value long option.
+                    f"sudo -- {R}", f"env -- {R}", f"timeout -- 5 {R}",
+                    f"sudo -c cls {R}", f"env - {R}", f"env -i - {R}",
+                    # An exact `--login` is not an abbreviation of `--login-class`.
+                    f"sudo --login {R}", f"sudo --login -u root {R}",
+                    f"sudo --login --user root {R}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("sudo -nu root ls", "timeout -vk 1 5 pytest", "env -iu X ls",
+                    "chrt -o 0 make", "sudo -nuroot ls", "ionice -c3 make"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_shell_option_parsing_on_the_stdin_reader(self):
         # Glued `-o` takes `pipefail`, so it is not the script file; a `-c` after
         # `--` is positional, not the flag; `flock` fronting a shell still reads
