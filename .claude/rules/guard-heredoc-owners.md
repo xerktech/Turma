@@ -61,5 +61,6 @@ paths:
   on the `-c` and plain-pipe paths (XERK-1632), names rebound by `read`/`hash -p`/`eval`
   (XERK-1638).
 - Tests: `TestScriptChannels.test_a_heredoc_owner_shell_behind_a_glue_subshell_or_group`,
+  `test_an_owner_word_with_a_silent_substitution`,
   `test_a_shell_name_formed_by_an_empty_expansion_or_a_brace`,
   `test_a_heredoc_owner_named_through_a_variable_glob_function_or_alias`.

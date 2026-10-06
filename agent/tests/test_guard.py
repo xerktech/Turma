@@ -1589,6 +1589,18 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_an_owner_word_with_a_silent_substitution(self):
+        # XERK-1624: `$(:)` prints nothing — unless `:`/`true`/`false` are
+        # redefined — and an owner left empty shifts to the next word. The
+        # heredoc path also reaches these through the stage check, so pin
+        # them on the word itself.
+        may = guard._owner_word_may_be_shell
+        self.assertFalse(may("cat`0`", {}, frozenset()))
+        self.assertTrue(may("cat`0`", {}, frozenset({":"})))
+        self.assertTrue(may("cat`0`", {}, frozenset({"true"})))
+        self.assertTrue(may("`0`", {}, frozenset()))
+        self.assertTrue(may("cat`s`", {}, frozenset()))
+
     def test_a_shell_name_formed_by_an_empty_expansion_or_a_brace(self):
         # XERK-1629: bash forms `bash` from `bas``h`, `bas$(:)h`, `bas$@h`,
         # `$'bas\150'` and `bash -sh` from `{bas,-s}h`; shlex reads one other word.
