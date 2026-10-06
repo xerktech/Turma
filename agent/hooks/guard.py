@@ -58,9 +58,11 @@ as cwd, so it cannot rely on any package being importable.
 
 from __future__ import annotations
 
+import bisect
 import fnmatch
 import functools
 import hashlib
+import itertools
 import json
 import os
 import posixpath
@@ -231,8 +233,13 @@ def _word_at(command: str, i: int, word: str) -> bool:
     return command.startswith(word, i) and (end >= len(command) or command[end] in _WORD_END)
 
 
-def _is_comment(command: str, i: int) -> bool:
-    """`#` starts a comment only at the start of an UNESCAPED word."""
+def _is_comment(command: str, i: int, comment_nl: int = -1) -> bool:
+    """`#` starts a comment only at the start of an UNESCAPED word.
+
+    ``comment_nl`` is where the caller's last comment ended: a `\\` there was
+    the comment's text, never a continuation, so `# c\\` NL `# d` is two
+    comments. Read as `a\\<newline>#`, the second `#` was a word and its
+    `'` a quote that hid the commands after it (`rm -rf /etc`, QA)."""
     if i == 0:
         return True
     prev = command[i - 1]
@@ -242,7 +249,13 @@ def _is_comment(command: str, i: int) -> bool:
     if prev in ";&|(":
         return True
     # `a\ #` is one word, `a\<newline>#` is `a#`: an escaped blank is no break.
-    return prev in " \t\n" and not (i >= 2 and command[i - 2] == "\\")
+    # An EVEN backslash run before the blank is literal text, then a break (QA).
+    if prev not in " \t\n":
+        return False
+    k = i - 2
+    while k >= 0 and command[k] == "\\":
+        k -= 1
+    return (i - 2 - k) % 2 == 0 or i - 1 == comment_nl
 
 
 def _balanced_groups(command: str, heredoc: bool = False) -> tuple[list[str], bool]:
@@ -301,6 +314,7 @@ def _balanced_groups(command: str, heredoc: bool = False) -> tuple[list[str], bo
             start = j
         stack.append("(")
 
+    comment_nl = -1  # where the last comment ended (`_is_comment`)
     while i < n:
         ch = command[i]
         top = stack[-1] if stack else ""
@@ -352,9 +366,9 @@ def _balanced_groups(command: str, heredoc: bool = False) -> tuple[list[str], bo
                 continue
             i += 1
             continue
-        if ch == "#" and _is_comment(command, i):
+        if ch == "#" and _is_comment(command, i, comment_nl):
             end = command.find("\n", i)
-            i = n if end < 0 else end
+            i = comment_nl = n if end < 0 else end
             continue
         if _word_at(command, i, "[[") and _at_command_start(command, i):
             stack.append("[")
@@ -673,6 +687,7 @@ def _quote_states(command: str) -> list[str]:
     out = [""] * len(command)
     stack: list[str] = []
     i, n = 0, len(command)
+    comment_nl = -1  # where the last comment ended (`_is_comment`)
     while i < n:
         ch = command[i]
         top = stack[-1] if stack else ""
@@ -682,9 +697,9 @@ def _quote_states(command: str) -> list[str]:
                 out[i] = '"'
             i += 1
             continue
-        if ch == "#" and top in ("", "(") and _is_comment(command, i):
+        if ch == "#" and top in ("", "(") and _is_comment(command, i, comment_nl):
             end = command.find("\n", i)
-            end = n if end < 0 else end
+            end = comment_nl = n if end < 0 else end
             out[i:end] = ["#"] * (end - i)
             i = end
             continue
@@ -1655,6 +1670,7 @@ def _budgeted(fn):
         _VALUES_ASSIGNED[0] = 1
         _BRACE_OTHER_SEEN[0] = False
         _MAIN_PARSE_SEEN[0] = False
+        _FOR_NAMES.clear()
         # These memos set the readings' SEEN flags as they fill, and a hit
         # skips that: a body cached by an earlier decision in this process
         # never asked for this one's extra readings.
@@ -1991,6 +2007,7 @@ def _assigned_values(command: str) -> dict[str, list[str]]:
                     words.append(_dequote_value(_substitute_vars(w.group(0), {})))
         if words:
             vals.setdefault(m.group(1), []).extend(words)
+            _FOR_NAMES.add(m.group(1))
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
     # HERE, once, against the values that name none. Left in, every recursion
     # level re-inlined it, the text grew each time, and an ordinary command
@@ -2441,9 +2458,14 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         if got:
             value = _picked(got)
             state = states[m.start()] if m.start() < len(states) else ""
-            if state == '"' and (m.group(2) or "").startswith(("[@]", "[*]")):
+            if state == '"' and ((m.group(2) or "").startswith("[")
+                                 or name in _FOR_NAMES
+                                 and command[m.start() - 1:m.start()] == '"'
+                                 and command[m.end():m.end() + 1] == '"'):
                 # `"${a[@]}"` is one word PER element, even mid-word: close
-                # the quote around them, as bash's expansion does.
+                # the quote around them, as bash's expansion does. So is any
+                # subscript, read as every element: the values are joined, so
+                # `a=(x /etc); rm -rf "${a[1]}"` read `"x /etc"` (XERK-1626).
                 out = '"' + _quote_literal(value, "") + '"'
             else:
                 if op:
@@ -2500,6 +2522,11 @@ def _reading() -> tuple:
     return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0])
 
 
+# Names a `for NAME in …` sets this decision. Its words are joined as the
+# name's values, so a quoted `"$p"` read `for p in a /etc` as ONE word
+# `a /etc`: a whole `"$p"` word splices each as a word of its own (XERK-1626
+# QA); mid-string (`bash -c "rm -rf $p"`) they stay joined, a script's text.
+_FOR_NAMES: set[str] = set()
 # Set while `_expand_both` takes its raw reading; counts escaping splices.
 _SPLICE_RAW = [False]
 _SPLICES_ESCAPED = [0]
@@ -2640,6 +2667,7 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
     stack: list[str] = []
     line_start = 0  # index into ``kept`` of the current line's first piece
     i, n = 0, len(command)
+    comment_nl = -1  # where the last comment ended (`_is_comment`)
     while i < n:
         ch = command[i]
         top = stack[-1] if stack else ""
@@ -2693,9 +2721,9 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
             stack.pop()
         elif ch == "}" and top == "p":
             stack.pop()
-        elif ch == "#" and top != "p" and _is_comment(command, i):
+        elif ch == "#" and top != "p" and _is_comment(command, i, comment_nl):
             end = command.find("\n", i)
-            end = n if end < 0 else end
+            end = comment_nl = n if end < 0 else end
             kept.append(command[i:end])
             i = end
             continue
@@ -2819,6 +2847,7 @@ def _split_on_operators(command: str, include_pipe: bool = True,
             blank_n += 1
         return blank_n == len(buf)
 
+    comment_nl = -1  # where the last comment ended (`_is_comment`)
     while i < n:
         ch = command[i]
         if quote:
@@ -2900,9 +2929,9 @@ def _split_on_operators(command: str, include_pipe: bool = True,
         elif (groups and not braces and opened and ch == "}" and opened[-1] == "{"
               and command[i - 1:i] in (" ", "\t", "\n", ";")):
             opened.pop()
-        elif ch == "#" and not braces and _is_comment(command, i):
+        elif ch == "#" and not braces and _is_comment(command, i, comment_nl):
             end = command.find("\n", i)
-            i = n if end < 0 else end
+            i = comment_nl = n if end < 0 else end
             continue
         if in_pattern:
             if buf_blank() and _word_at(command, i, "esac"):
@@ -4305,39 +4334,442 @@ def _heredoc_readings(body: str) -> list[str]:
 _ESCAPED_PARAM_RE = re.compile(r"(?<!\\)\\\$(?=[{A-Za-z_@*0-9!])")
 
 
-# `$1`, `${12}`, `$@`, `${*}` — a shell's positional parameters.
-_POSITIONAL_RE = re.compile(r"\$(?:\{([0-9]+|[@*])\}|([0-9@*]))")
+# `$1`, `${12}`, `$@`, `${*}` — a shell's positional parameters — and their
+# operator forms (`${1:-x}`, `${@:2}`, `${1%/}`, `${1:-"$x"}`), read as the whole value.
+_POSITIONAL_RE = re.compile(
+    r"\$(?:\{([0-9]+|[@*])(?:[^{}'\"`$]|\$\{[^{}]*\}|\$\w|\"[^\"]*\"|'[^']*')*\}|([0-9@*]))")
+# `for p; do` / `for p do` loops over "$@".
+_IMPLICIT_FOR_RE = re.compile(r"\bfor([ \t]+[A-Za-z_]\w*)(?=[ \t]*(?:;|\n|(do\b)))")
+# A `shift` moves every positional down; this many shifts are read.
+_MAX_SHIFTS = 8
+_SHIFT_RE = re.compile(r"(?<![\w.-])shift(?![\w.-])(?:[ \t]+([0-9]+))?")
+_LOOP_RE = re.compile(r"\b(?:while|until|for|select)\b")
 
 
-def _bind_positionals(script: str, args: list[str]) -> str:
+class _BoundTooLong(Exception):
+    """A bound reading past the ``limit`` `_bind_positionals` was given."""
+
+
+def _bind_positionals(script: str, args: list, raw: bool = False,
+                      every: bool = False, limit: int | None = None) -> str:
     """``script`` with the positional parameters ``sh -c '<script>' <args>``
     gives it spliced in: ``args[0]`` is `$0`, the rest `$1`… and `$@`/`$*`.
 
     `find /etc -exec sh -c 'rm -rf "$1"' _ {} +` hands the path to the script
     as `$1`, so classifying the script alone saw only `rm -rf "$1"` (XERK-1600).
-    A parameter with no argument is left as written, never guessed at."""
+    A parameter with no argument (or a None `$0`) is left as written, never
+    guessed at.
+
+    ``raw`` args are shell TEXT from the line that passed them (a function
+    call's or `set --`'s words, XERK-1626), spliced as written so a `"$2"` the
+    caller holds stays live for its own binding. ``every`` reads each
+    parameter as ALL the args: the one reading for calls past the cap.
+
+    With a ``limit``, the splices are not charged to the growth budget (the
+    caller's own byte budget bounds them) and a reading growing past it
+    raises `_BoundTooLong`."""
     if not args or "$" not in script:
         return script
+    script = _IMPLICIT_FOR_RE.sub(
+        lambda m: f'for{m.group(1)} in "$@"' + (";" if m.group(2) else ""), script)
     states = _quote_states(script)
+    grown = [len(script)]
 
     def rep(m: "re.Match[str]") -> str:
         if not _live_dollar(script, m.start()):
             return m.group(0)
         name = m.group(1) or m.group(2)
-        if name in ("@", "*"):
+        state = states[m.start()] if m.start() < len(states) else ""
+        if name in ("@", "*") or every and name != "0":
             if len(args) < 2:
                 return m.group(0)
-            value = " ".join(args[1:])
-        elif int(name) < len(args):
-            value = args[int(name)]
+            words = args[1:]
+        elif int(name) < len(args) and args[int(name)] is not None:
+            words = [args[int(name)]]
         else:
             return m.group(0)
-        state = states[m.start()] if m.start() < len(states) else ""
-        out = _quote_literal(value, state)
-        _spend(len(out))
+        if raw:
+            if state == "'":
+                return m.group(0)  # the function's shell never expands it
+            out = " ".join(words)
+            if state == '"':
+                out = '"' + out + '"'
+        elif state == '"' and name == "@":
+            # `"$@"` is one word per argument, not one word of them all.
+            out = '" "'.join(_quote_literal(w, state) for w in words)
+        else:
+            out = " ".join(_quote_literal(w, state) for w in words)
+        if limit is None:
+            _spend(len(out))
+        else:
+            grown[0] += len(out)
+            if grown[0] > limit:
+                raise _BoundTooLong
         return out
 
     return _POSITIONAL_RE.sub(rep, script)
+
+
+def _shifted(args: list, text: str, every: bool = False) -> list[list]:
+    """``args`` (`$0` first), and as each `shift` in ``text`` leaves them: one
+    list per literal `shift [N]`, in order. Every count when a loop or a
+    recursive call (``every``) may repeat one, or a count is computed
+    (`shift $n`, `shift $((2))`, `s=shift; $s`)."""
+    if len(args) < 3:
+        return [args]
+    shifts = []
+    for m in _SHIFT_RE.finditer(text):
+        rest = text[m.end():].lstrip(" \t")
+        if (m.start() and text[m.start() - 1] not in " \t;&|\n({`"
+                or not m.group(1) and rest[:1] not in ("", ";", "&", "|", "\n", ")", "}", "#")):
+            every = True
+        shifts.append(int(m.group(1) or 1))
+    if not shifts:
+        return [args]
+    if every or _LOOP_RE.search(text):
+        counts = range(min(len(args) - 1, _MAX_SHIFTS + 1))
+    else:
+        counts = [0, *itertools.accumulate(shifts)][:_MAX_SHIFTS + 1]
+    return [[args[0], *args[1 + k:]] for k in dict.fromkeys(counts) if k < len(args) - 1]
+
+
+# A function definition up to its body's opener: `f() {`, `function f {`,
+# `function f() (`, comment lines between allowed (`f() # c` NL `{`). Bodies of other
+# shapes (`f() if …`) are not read here.
+_FUNC_BODY_RE = re.compile(
+    r"(?:^|(?<=[\s;&|()]))(?:function[ \t]+([^\s();|&<>'\"`$]+)(?:[ \t]*\([ \t]*\))?"
+    r"|([^\s;&|()<>'\"`$]+)[ \t]*\([ \t]*\))(?:\s|#[^\n]*\n)*([{(])")
+# What may stand before a command word: keywords, a group opener, assignments.
+_CALL_LEAD = (r"(?:^|(?<=[;&|()`{\n]))[ \t]*"
+              r"(?:(?:then|do|else|elif|if|while|until|time|eval|coproc|builtin|command"
+              r"|!|\{|\()[ \t]+"
+              r"|[A-Za-z_]\w*=[^\s;&|]*[ \t]+)*")
+_SET_RE = re.compile(_CALL_LEAD + r"(set)(?=[ \t])")
+# A word the union reading leaves out: no path, glob, option, quote or expansion.
+_PLAIN_WORD_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.,:+=@%-]*")
+# Per-call (and per-`set`) readings stop once they total this many times the
+# line's length (plus a floor); the calls past that share one reading.
+_POSITIONAL_READ_FACTOR = 2
+_POSITIONAL_READ_FLOOR = 4096
+
+
+def _word_breaks(text: str, states: list[str], i: int, stops: str):
+    """Indices from ``i`` of characters in ``stops`` outside quotes and outside
+    any `(…)`/`$(…)`/backticks — where a word or a command ends. A backtick
+    in ``stops`` is one that closes a body the text started inside."""
+    depth, tick = 0, False
+    for j in range(i, len(text)):
+        ch = text[j]
+        if states[j]:
+            continue
+        if ch == "`" and not tick and not depth and "`" in stops:
+            yield j
+        elif ch == "`":
+            tick = not tick
+        elif tick:
+            continue
+        elif ch == "(":
+            depth += 1
+        elif ch == ")" and depth:
+            depth -= 1
+        elif not depth and ch in stops and not (
+                ch == "&" and (text[j - 1:j] in (">", "<") or text[j + 1:j + 2] == ">")):
+            # (`2>&1`, `&>f` and `<&3` are redirections, not a `&`.)
+            yield j
+
+
+def _args_end(text: str, states: list[str], i: int, in_tick: bool = False) -> int:
+    """Where the command whose words start at ``i`` ends."""
+    return next(_word_breaks(text, states, i, ";&|\n)" + "`" * in_tick), len(text))
+
+
+# A redirection word: its target is glued (`2>/dev/null`) or the next word.
+_REDIRECT_WORD_RE = re.compile(r"(?:[0-9]+|&)?(?:>>?|<<?<?|>&|<&|>\||<>)(?!\()(.*)", re.DOTALL)
+
+
+def _call_words(text: str) -> list[str]:
+    """A call's argument words, its redirections left out: `f 2>/dev/null
+    /etc` hands `/etc` to the function as `$1`."""
+    words, skip = [], False
+    for w in _raw_words(text):
+        if skip:
+            skip = False
+            continue
+        m = _REDIRECT_WORD_RE.fullmatch(w)
+        if m:
+            skip = not m.group(1)
+            continue
+        words.append(w)
+    return words
+
+
+def _raw_words(text: str) -> list[str]:
+    """``text`` split into words as written, quotes kept: `""/etc""` is one."""
+    words, start = [], 0
+    for j in (*_word_breaks(text, _quote_states(text), 0, " \t"), len(text)):
+        if j > start:
+            words.append(text[start:j])
+        start = j + 1
+    return words
+
+
+def _set_positionals(words: list[str]) -> list[str] | None:
+    """The words `set <words>` assigns, or None if it assigns none."""
+    i = 0
+    while i < len(words) and words[i][:1] in ("-", "+"):
+        if words[i] in ("--", "-"):
+            i += 1
+            break
+        i += 2 if words[i] in ("-o", "+o") else 1
+    return words[i:] or None
+
+
+_EMPTY_WORD_RE = re.compile(r"(?:''|\"\")+")
+
+
+def _set_lists(words: list[str], prev: list[tuple[list[str], bool]],
+               again: bool) -> list[tuple[list[str], bool]]:
+    """The lists a `set` of ``words`` may assign after ``prev``'s, each with
+    whether its positions are unknown (read with EVERY parameter bound to
+    every word).
+
+    A word naming a positional (`set -- "$@" x`, `set -- "$1" x`) is bound to
+    the previous `set`'s words, and any left unbound becomes a one-word slot,
+    also read dropped (`"$@"` of none is no word). Kept raw, each level bound
+    it to itself and the reading grew; dropped outright, it renumbered every
+    word after it. Where a loop may repeat it (``again``), or the previous
+    list's positions are already unknown, no pass count is right
+    (`for …; do set -- x "$@"; done`): its words, at every position."""
+    if not any(_POSITIONAL_RE.search(w) for w in words):
+        return [(words, False)]
+    out: list[list[str]] = []
+    for cur, _ in prev[:2]:
+        text = " ".join(_bind_positionals(w, [None, *cur], raw=True) for w in words)
+        cur = _raw_words(_POSITIONAL_RE.sub("", text))
+        out += [cur, [w for w in cur if not _EMPTY_WORD_RE.fullmatch(w)]]
+    if again or any(every for _, every in prev):
+        merged = [w for ws in out for w in ws if not _EMPTY_WORD_RE.fullmatch(w)]
+        return [(list(dict.fromkeys(merged)), True)] if merged else []
+    return [(list(ws), False) for ws in dict.fromkeys(map(tuple, out)) if ws][:2]
+
+
+# A body read to each `}` that may or may not close it, up to this many.
+_MAX_BODY_ENDS = 4
+
+
+def _closes_body(text: str, i: int, states: list[str]) -> bool | str:
+    """Whether the `}` at ``i`` stands where a command has ended: after `;`,
+    `&`, a newline, or `fi`/`done`/`esac` as a command — `fi }` closes a body
+    as surely as `; }` does (a QA bypass when only `;&\\n` counted). After
+    `)` or `}`, "maybe": a group's closer or a word's (`$(x) }`)."""
+    j = i - 1
+    while j >= 0 and text[j] in " \t":
+        j -= 1
+    if j < 0:
+        return False
+    if _separates(text, j, states):
+        return True
+    if text[j] in ")}":
+        return "maybe"
+    for kw in ("fi", "done", "esac"):
+        # ...a keyword only where IT stands as a command: `echo done }`'s `}`
+        # is a word.
+        k = j + 1 - len(kw)
+        if k >= 0 and text.startswith(kw, k):
+            k -= 1
+            while k >= 0 and text[k] in " \t":
+                k -= 1
+            if k < 0 or _separates(text, k, states):
+                return True
+    return False
+
+
+def _separates(text: str, j: int, states: list[str]) -> bool:
+    """Whether ``text[j]`` ends a command: an unescaped `;`, `&` or newline,
+    never `\\;`, a `\\`-newline continuation or the `&` of `>&`/`<&` (QA:
+    `echo \\; fi }` closed a body bash keeps open)."""
+    if text[j] not in ";&\n":
+        return False
+    if text[j] == "\n" and j and states[j - 1] == "#":
+        return True  # a comment's end, whatever it ends in (`# c\\`)
+    k = j - 1
+    while k >= 0 and text[k] == "\\":
+        k -= 1
+    if (j - 1 - k) % 2:
+        return False
+    return not (text[j] == "&" and j and text[j - 1] in "<>")
+
+
+
+def _positional_readings(text: str) -> list[str]:
+    """Texts ``text`` runs with positional parameters bound (XERK-1626).
+
+    `_bind_positionals` covers `sh -c '<script>' <args>`; a function's `$1`…
+    are its call's arguments and a `set -- <words>` sets the line's, so
+    `f() { rm -rf "$1"; }; f /etc` and `set -- /etc; rm -rf "$1"` reached the
+    classifier as a literal `"$1"`. Returned, each read beside the text:
+    - each defined function's BODY bound to each call's words, calls found in
+      those bodies too (`f() { g "$@"; }`);
+    - the text from each `set` to the next bound to its words, and on a line
+      that can replay text (a loop, function, trap…) the whole text too;
+    - each bound body bound again to each `set`'s words.
+    Only bodies and spans are read, never the whole line per call: that is
+    quadratic, and made a XERK-1600 attempt time out the hook. Readings past
+    the byte budget give way to ONE per function binding every parameter to
+    every remaining call's words — `$1`-as-program past it is a residual.
+
+    Over-reads on purpose: binding ignores where a call or `set` sits."""
+    if "$" not in text or ("(" not in text and "function" not in text and "set" not in text):
+        return []
+    states = _quote_states(text)
+    defs: dict[str, list[str]] = {}
+    for m in _FUNC_BODY_RE.finditer(text):
+        if states[m.start()]:
+            continue
+        opener = m.start(3)
+        brace = text[opener] == "{"
+        close = "}" if brace else ")"
+        name = m.group(1) or m.group(2)
+        depth, maybes = 0, 0
+
+        def keep(body: str) -> None:
+            if _POSITIONAL_RE.search(body) or _IMPLICIT_FOR_RE.search(body):
+                defs.setdefault(name, []).append(body)
+
+        for i in range(opener, len(text)):
+            if states[i]:
+                continue
+            if text[i] == text[opener] and (
+                    i == opener or not brace or text[i + 1:i + 2] in (" ", "\t", "\n")):
+                depth += 1
+            elif text[i] == close:
+                # `}` closes only after a command ends: `echo }`, `${x}` and
+                # a `*})` case pattern are words (QA). After `)` or `}` it may
+                # be either (`(cmd) }` vs `echo $(x) }`): both are read.
+                ends = _closes_body(text, i, states) if brace else True
+                if ends == "maybe" and depth == 1:
+                    if maybes < _MAX_BODY_ENDS:
+                        maybes += 1
+                        keep(text[opener + 1:i])
+                    continue
+                if ends:
+                    depth -= 1
+                    if not depth:
+                        keep(text[opener + 1:i])
+                        break
+    out: list[str] = []
+    seen = {text}
+    room = [_POSITIONAL_READ_FACTOR * len(text) + _POSITIONAL_READ_FLOOR]
+
+    def add(reading: str, budgeted: bool = True) -> bool:
+        """Keep ``reading``; False if it is a repeat, or over the budget."""
+        if reading in seen or (budgeted and len(reading) > room[0]):
+            return False
+        if budgeted:
+            room[0] -= len(reading)
+        seen.add(reading)
+        out.append(reading)
+        return True
+
+    if defs:
+        # `'f'`, `"f"` and `\f` call the function too.
+        call_re = re.compile(_CALL_LEAD + r"((['\"]?)\\?(" + "|".join(map(re.escape, defs))
+                             + r")\2)(?=[ \t;&|)<>\n`]|$)")
+        union: dict[str, list[str]] = {}
+        # Each reading with the functions it was bound inside: a call back
+        # into one of them (recursion) is followed once, never again — every
+        # pass nested `$(( $1 - 1 ))` deeper until "too deep".
+        work: list[tuple[str, tuple[str, ...]]] = [(text, ())]
+        while work:
+            t, path = work.pop()
+            t_states = states if t is text else _quote_states(t)
+            ticks = [j for j in range(len(t)) if t[j] == "`" and not t_states[j]] if "`" in t else []
+            for m in call_re.finditer(t):
+                name = m.group(3)
+                # The name's own quote or escape is its only quoting allowed.
+                if t_states[m.start(1)] not in ("", m.group(2) or "\\") or path.count(name) > 1:
+                    continue
+                # Inside a backtick body, its closer ends the words too.
+                in_tick = bisect.bisect_left(ticks, m.start(1)) % 2 == 1
+                arg_text = t[m.end(1):_args_end(t, t_states, m.end(1), in_tick)]
+                words = _call_words(arg_text)
+                if not words or arg_text.lstrip()[:1] == "(":
+                    continue
+                # A word naming the caller's own positionals (`f "$@" /etc`,
+                # unknown here) may be no word at all: also read without it.
+                lists = [words, [w for w in words if not _POSITIONAL_RE.search(w)]]
+                if lists[1] == words or not lists[1]:
+                    lists.pop()
+                for body in defs[name]:
+                    if len(body) > room[0]:
+                        # Spent: not even bound, or binding alone is quadratic.
+                        union.setdefault(name, []).extend(words)
+                        continue
+                    # A body calling itself may shift any number of times.
+                    for args in (shifted for ws in lists for shifted in _shifted(
+                            [None, *ws], body, bool(re.search(
+                                r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])", body)))):
+                        try:
+                            reading = _bind_positionals(body, args, raw=True, limit=room[0])
+                        except _BoundTooLong:
+                            union.setdefault(name, []).extend(words)
+                            continue
+                        if reading == body or reading in seen:
+                            continue
+                        if add(reading):
+                            work.append((reading, path + (name,)))
+                        else:
+                            union.setdefault(name, []).extend(words)
+        for name, words in union.items():
+            # Only words that can name a path or option: every word at every
+            # parameter is (refs × calls), and plain names (`a0`…`a400`) made
+            # a benign 5 KB line "too large" (QA).
+            words = [w for w in dict.fromkeys(words) if not _PLAIN_WORD_RE.fullmatch(w)]
+            if not words:
+                continue
+            for body in defs[name]:
+                add(_bind_positionals(body, [None, *words], raw=True, every=True), False)
+    replays = bool(_REPLAYS_RE.search(text))
+    sets, prev = [], [([], False)]
+    for m in _SET_RE.finditer(text):
+        if states[m.start(1)]:
+            continue
+        end = _args_end(text, states, m.end(1))
+        words = _set_positionals(_raw_words(text[m.end(1):end]))
+        if words:
+            prev = _set_lists(words, prev, replays) or [([], False)]
+            sets.append((m.start(), m.end(1), end, prev))
+    if sets:
+        bodies = list(out)
+        # A loop may run text BEFORE a `set` after it (`for …; do rm -rf "$1";
+        # set -- /etc; done`), so on a line that can replay text, the text up
+        # to each `set` is bound too — every `set` in it emptied (`set --`):
+        # left in, each level re-bound the line to its own words and grew it
+        # until "too deep".
+        blanked, prev = "", 0
+        for k, (start, args_at, end, lists) in enumerate(sets):
+            nxt = sets[k + 1][0] if k + 1 < len(sets) else len(text)
+            span = text[end:nxt]
+            before = blanked + text[prev:start] if replays else ""
+            blanked += text[prev:args_at] + " --"
+            prev = end
+            for words, every in lists:
+                for args in _shifted([None, *words], span):
+                    bound = _bind_positionals(span, args, raw=True, every=every)
+                    if bound != span:
+                        add(bound, False)
+                for target in (before, *bodies):
+                    for args in _shifted([None, *words], target):
+                        # Checked before binding, which alone would be quadratic.
+                        if target and len(target) <= room[0]:
+                            try:
+                                bound = _bind_positionals(target, args, raw=True, every=every,
+                                                          limit=room[0])
+                            except _BoundTooLong:
+                                continue
+                            if bound != target:
+                                add(bound)
+    return out
 
 
 def _expand_segments(command: str, depth: int = 0,
@@ -4493,6 +4925,17 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         body = _substitute_vars(body, raw_vals)
         expanded.add((body, before))
         out.extend(_expand_segments(body, depth + 1, before))
+    # A function's `$1`… bound to each call's words and the line's to each
+    # `set --`'s (XERK-1626): read beside the unbound text, never instead.
+    # Its own assignments win: the line's `d=$1` is the unbound value.
+    # Memoised per decision: every re-reading of the line (each splice,
+    # value and taint pass) yields the same bound span again, and a looped
+    # `set -- "$@" x` re-expanded one 104 times (6x main).
+    for reading in _positional_readings(raw_commands):
+        vals = {**raw_vals, **_var_values(reading)}
+        reading = _substitute_vars(reading, vals)
+        out.extend(_memo("expand", ("positional", reading, depth, every_cd),
+                         _expand_segments, reading, depth + 1, every_cd))
     command = _prenormalise(raw_commands)
     segments = _split_segments(command)
     # ...and what a substitution whose body holds an operator PRINTS is text
@@ -4763,7 +5206,12 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 # ...and again with its arguments bound, where it reads them.
                 j = _shell_c_index(rest) + 1
                 args = rest[j + 1 + (rest[j] == "--"):]
-                scripts += [b for b in (_bind_positionals(sc, args) for sc in scripts)
+                # Each function call and `set` in it bound first (XERK-1626), so
+                # `f() { rm -rf "$1"; }; f "$2"` reads `rm -rf "$2"`, then `/etc`.
+                bound = [r for sc in scripts for r in _positional_readings(sc)]
+                scripts += [b for b in (_bind_positionals(sc, a)
+                                        for sc in (*scripts, *bound)
+                                        for a in _shifted(args, sc))
                             if b not in scripts]
                 for reading in scripts:
                     out.extend(_expand_segments(reading, depth + 1, every_cd))
