@@ -1226,6 +1226,36 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_value_a_grouped_or_looped_reader_takes_from_stdin_runs(self):
+        # XERK-1650: each ran `rm -rf /etc` while the guard allowed it.
+        R = self.R
+        for cmd in (f'{{ read a; }} <<< "$(echo {R})"; $a',
+                    f'while read -r a; do $a; done <<< "$(echo {R})"',
+                    f'mapfile -t a <<< "$(echo {R})"; ${{a[0]}}',
+                    f'readarray -t a <<< "$(echo {R})"; ${{a[0]}}',
+                    f'mapfile -t <<< "$(echo {R})"; ${{MAPFILE[0]}}',
+                    f'select v in "$(echo {R})"; do $v; break; done <<< 1',
+                    f'select v in x; do $REPLY; break; done <<< "$(echo {R})"',
+                    f'( read a; $a ) <<< "$(echo {R})"',
+                    f'if read a; then $a; fi <<< "$(echo {R})"',
+                    # A pipe or `< <(…)` feeds it as surely as a here-string.
+                    f"echo {R} | while read -r a; do $a; done",
+                    f"echo {R} | {{ read a; $a; }}",
+                    f"while read -r a; do $a; done < <(echo {R})",
+                    f"mapfile -t a < <(echo {R}); ${{a[0]}}",
+                    # A later line of the text is its own read.
+                    f"printf 'x\\n{R}\\n' | while read -r a; do $a; done",
+                    f"printf 'x\\n{R}\\n' | {{ mapfile -t a; ${{a[1]}}; }}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ('git ls-files | while read -r f; do echo "$f"; done',
+                    'while read -r l; do echo "$l"; done <<< "hello world"',
+                    'mapfile -t files < <(ls); echo "${files[@]}"',
+                    f"echo '{R}' | while read -r l; do echo \"$l\"; done",
+                    'echo ls | while read -r c; do $c; done'):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_relative_rm_after_cd_into_a_root_names_that_root(self):
         for cmd in ("cd / && rm -rf *", "cd /; rm -rf *", "cd /etc; rm -rf ./*",
                     "cd /usr && rm -r lib", "cd ~ && rm -rf *", "cd; rm -rf *",
