@@ -17,6 +17,28 @@ paths:
   - Bash parity: `test_glob_trims_match_bash` runs real bash; extend it with any new spelling.
 - **A name an `eval` assigns is bound for the whole line** (`_assigned_values`, depth-capped):
   any `eval` word in the segment, a `$x` holding `eval`, and the raw `$(…)` it is handed.
+  - The eval word resolves through `${!x}` (ops/elements too, in `_pattern_vars`) and `for`
+    names (XERK-1666); quotes and `\` are removed before comparing (`_spells_eval`).
+  - `for` words join `known` for this scan only, never `vals`: list words are data, not counted values.
+  - Build that map ONCE per line: rebuilt per segment it was segments × words, 45s on a long line.
+  - A literal multi-word list is separated by `_for_word_lines`, not here; only a word-split
+    `$x` list word is tried field by field. Trying every multi-valued name per value was 3.5x
+    slower and changed no verdict.
+  - A word holding `${!` or an `@X` transform is read AS an eval (`_MAYBE_EVAL_RE`): x's value
+    can be built in ways no reading follows (`$'\x79'`, `${z#a}`, a loop name), and `@E`/`@P`
+    decode escapes. Cost: such a word with a destructive assignment in its args is refused.
+  - `@E` decodes (`_decode_escapes`, cut at a NUL as bash does) in every value resolver and the
+    main splice: the word rule above never sees `z=${y@E}; $z`. `@P` is a prompt expansion
+    (`\s`, `$(…)` run): a value with `\`/`$`/backtick is marker-led, never decoded as `@E`.
+  - Match `@E`/`@P` with `_decoding_op`, never `tail == "@E"`: a subscript makes it `[0]@E`.
+    It scans ONE subscript as bash finds its `]` (quotes, `\`, `$(…)`, `${…}`, backticks): a loose
+    `\[.*\]` took the trim `${y[0]%]@E}` as `@E` and the NUL cut hid the script; quotes alone
+    missed `${y[\"]@E}`. Keeping the text past a NUL instead split `bash -c "…"`'s script word.
+  - Case ops (`^^`, `@U`) stay unapplied in the main splice: on a case-blind disk `/ETC` is `/etc`.
+  - Never key loop readings on `${!` instead: keyed on every loop it made plain loops "too large",
+    keyed on the name's spelling it missed built names (QA, 3 passes).
+  - Not modelled: `for e in $(echo $x)`, `set -- $x; for e` (XERK-1726); namerefs (XERK-1722);
+    glued array elements `${y[0]}${y[1]}` (XERK-1730).
   - The `$(…)` is read as printed AND by its taint readings (`cat <<<…`, pipes), and each script
     with the line's names spliced (`v=a; eval "$(echo "$v=…")"`) (XERK-1668).
   - `printf %q` prints its argument shell-quoted; printed bare, the eval bound `a=rm`.

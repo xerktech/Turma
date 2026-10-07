@@ -2315,7 +2315,90 @@ def _unreadable_op(value: str) -> str:
 
 _PATTERN_SUBST_RE = re.compile(r"\$\([^()]*\)|`[^`]*`")
 _CASE_OPS = {",,": str.lower, "^^": str.upper,
-             ",": lambda v: v[:1].lower() + v[1:], "^": lambda v: v[:1].upper() + v[1:]}
+             ",": lambda v: v[:1].lower() + v[1:], "^": lambda v: v[:1].upper() + v[1:],
+             # bash 5's transforms: `y=EVAL; ${y@L}` is `eval` (XERK-1666).
+             # `@E` decodes escapes: `y='\x65val'; z=${y@E}; $z` runs eval.
+             "@L": str.lower, "@U": str.upper, "@u": lambda v: v[:1].upper() + v[1:],
+             "@E": lambda v: _decode_escapes(v), "@P": lambda v: _prompt_expanded(v)}
+
+
+def _decoding_op(tail: str | None) -> str | None:
+    """`@E` / `@P` when ``tail`` (what follows a name in `${…}`) is one,
+    after one balanced subscript too: `${y[0]@E}`, `${y[i[0]]@P}`,
+    `${y[']']@E}` (XERK-1666 QA). Never an op whose word ends so:
+    `${y[0]%]@E}` is a trim by the pattern `]@E`."""
+    if not tail or "@" not in tail:
+        return None
+    k = 0
+    if tail[0] == "[":
+        # Bash's own search for the closing `]`: quotes, a `\\`-escaped
+        # character, and a `$(…)` / `${…}` / backtick span hide one.
+        depth, quote, n = 0, "", len(tail)
+        spans = {m.start(): m.end() for m in _find_substs(tail)} if "$(" in tail or "`" in tail else {}
+        while k < n:
+            c = tail[k]
+            if quote == "'":
+                quote = "" if c == "'" else quote
+            elif c == "\\":
+                k += 1
+            elif quote == '"' and c == '"':
+                quote = ""
+            elif c in "'\"" and not quote:
+                quote = c
+            elif k in spans:
+                k = spans[k] - 1
+            elif tail.startswith("${", k):
+                # Quoting passed in: looked up, it was re-read per span (QA).
+                k = _brace_end(tail, k, quote == '"')
+                if k < 0:
+                    return None
+            elif quote:
+                pass
+            elif c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if not depth:
+                    break
+            k += 1
+        else:
+            return None
+        k += 1
+    return tail[k:] if tail[k:] in ("@E", "@P") else None
+
+
+_ESCAPE_RE = re.compile(r"\\(x[0-9A-Fa-f]{1,2}|u[0-9A-Fa-f]{1,4}|U[0-9A-Fa-f]{1,8}|[0-7]{1,3}|c.|.)",
+                        re.DOTALL)
+_ESCAPE_CHARS = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
+                 "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"'}
+
+
+def _decode_escapes(value: str) -> str:
+    """``value`` with its backslash escapes decoded, as `$'…'` and `@E` do."""
+    def one(m: "re.Match[str]") -> str:
+        e = m.group(1)
+        if e[0] == "c" and len(e) == 2:
+            return chr(ord(e[1]) & 0x1F)  # `\cX` is control-X; `\c@` a NUL
+        try:
+            if e[0] in "xuU" and len(e) > 1:
+                return chr(int(e[1:], 16))
+            if e[0] in "01234567":
+                return chr(int(e, 8) & 0xFF)
+        except ValueError:
+            return m.group(0)
+        return _ESCAPE_CHARS.get(e, m.group(0))
+    if "\\" not in value:
+        return value
+    # Bash ends the value at a decoded NUL: `eval\0x` is `eval`.
+    return _ESCAPE_RE.sub(one, value).split("\0", 1)[0]
+
+
+def _prompt_expanded(value: str) -> str:
+    r"""`${y@P}`: a prompt expansion, which reads `\s`, `\u`, `\w` as the
+    shell, user, cwd and runs a `$(…)` in the value. Not modelled: a value
+    with any `\`, `$` or backtick is unreadable, led by `_UNREAD_OUTPUT`
+    so as a program it is refused, its text kept for path rules."""
+    return _UNREAD_OUTPUT + " " + value if re.search(r"[\\$`]", value) else value
 
 
 def _pattern_vars(arg: str, vals: dict[str, list[str]], keep: bool = False) -> str:
@@ -2327,6 +2410,17 @@ def _pattern_vars(arg: str, vals: dict[str, list[str]], keep: bool = False) -> s
     both."""
     if "$" not in arg and "`" not in arg:
         return arg
+    if "${!" in arg:
+        # `${!x}` is the variable x's value names: `y=eval; x=y; ${!x}` is
+        # `eval` (XERK-1666), with any op or element applied to that name
+        # (`${!x,,}`, `${!x[0]}`, x='y[0]'). A value that is no name is left
+        # as written, as is `${!x[@]}` / `${!x*}`: those list names, not values.
+        def indirect(m: "re.Match[str]") -> str:
+            target = _picked(vals.get(m.group(1)) or [""], m.group(1))
+            if not _INDIRECT_TARGET_RE.fullmatch(target):
+                return m.group(0)
+            return "${" + target + m.group(3) + "}"
+        arg = _INDIRECT_OP_RE.sub(indirect, arg)
 
     def rep(u: "re.Match[str]") -> str:
         name = u.group(1) or u.group(3)
@@ -2340,6 +2434,8 @@ def _pattern_vars(arg: str, vals: dict[str, list[str]], keep: bool = False) -> s
         value = _picked(got, name)
         if tail in _CASE_OPS:
             return _CASE_OPS[tail](value)
+        if _decoding_op(tail):  # an element's `@E` too: `${y[0]@E}`
+            return _CASE_OPS[_decoding_op(tail)](value)
         if tail.startswith("["):  # an element: read as the value
             return value
         if tail and not op:
@@ -2689,16 +2785,54 @@ def _var_values(command: str) -> dict[str, list[str]]:
     return _memo("vals", command, _assigned_values, _join_continuations(command))
 
 
-def _eval_named(word: str, known: dict[str, list[str]]) -> bool:
+def _eval_named(word: str, known: dict[str, list[str]],
+                split: dict[str, list[str]] | None = None) -> bool:
     """Whether names spell `eval` in ``word``, through a few hops of names
-    holding names (`x=eval; z=$x; $z`): values here are not yet resolved."""
+    holding names (`x=eval; z=$x; $z`, `x=y; ${!x}`): values here are not yet
+    resolved. A name with several values is also read with each alone, as
+    bash binds one at a time: joined, `for e in ls eval` read `ls eval`."""
+    split = split or {}
+    if _eval_named_joined(word, known):
+        return True
+    # A `for` list word that splits into fields binds each in turn (`x='ls
+    # eval'; for e in $x`), which no per-word reading separates: each alone.
+    several = [n for n in dict.fromkeys(u.group(1) or u.group(3) for u in _var_uses(word))
+               if n in split][:4]
+    for n in several:
+        for v in split[n]:
+            if _eval_named_joined(word, {**known, n: [v]}):
+                return True
+    return False
+
+
+def _eval_named_joined(word: str, known: dict[str, list[str]]) -> bool:
     for _ in range(3):
-        if _basename(_pattern_vars(word, known)) == "eval":  # unknowns empty
+        if _spells_eval(_pattern_vars(word, known)):  # unknowns empty
             return True
         word = _pattern_vars(word, known, keep=True)
         if "$" not in word:
             break
-    return _basename(word) == "eval"
+    return _spells_eval(word)
+
+
+def _unquoted_dollar(word: str) -> bool:
+    """Whether a `$` in ``word`` stands outside quotes, where bash splits
+    what it expands."""
+    states = _quote_states(word)
+    return any(c == "$" and not states[k] for k, c in enumerate(word))
+
+
+def _spells_eval(text: str) -> bool:
+    """Whether ``text``, a resolved command word, is `eval` as bash reads it:
+    its quotes and backslashes removed (`ev'al'`, a value `ev\\al`, XERK-1666)."""
+    if _basename(text) == "eval":
+        return True
+    # Only removal can make it `eval`, so its letters must end the text with
+    # quotes cut: a cheap test before dequoting a large spliced value.
+    if not re.sub(r"['\"\\]", "", text).lower().endswith("eval"):
+        return False
+    bare = re.sub(r"\\(.)", r"\1", _dequote_value(text))
+    return bare != text and _basename(bare) == "eval"
 
 
 # How deep an `eval`'s own assignments are read: `x='eval "$x"'; eval "$x"`
@@ -2709,6 +2843,28 @@ _EVAL_ASSIGN_DEPTH = 3
 _ASSIGN_DEFAULT_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?=")
 # `${!name}`: the variable ``name``'s value names (XERK-1634).
 _INDIRECT_RE = re.compile(r"\$\{!([A-Za-z_][A-Za-z0-9_]*)\}")
+# ...and with an element or op after it: `${!x[0]}`, `${!x,,}` (XERK-1666).
+# Not `${!x[@]}` / `${!x*}` / `${!x@}`: those list keys or names; `${!x@L}` is
+# x's target transformed.
+_INDIRECT_OP_RE = re.compile(
+    r"\$\{!([A-Za-z_][A-Za-z0-9_]*)(\[(?![@*]\])[^]]*\])?((?![*@]\})[^}]*)\}")
+# A bare `$name` a quote ends, `$q'al'`, `$q$"al"`: braced so its quotes, once gone,
+# can't extend the name.
+_QUOTE_GLUED_NAME_RE = re.compile(r"(?<!\\)\$([A-Za-z_][A-Za-z0-9_]*)(?=\$?['\"])")
+def _brace_quote_glued(seg: str) -> str:
+    """``seg`` with each `$name` a quote ends braced, outside `'…'` only:
+    there `'a=$b't` is eval's `$bt`, never `${b}t` (XERK-1661)."""
+    if "$" not in seg:
+        return seg
+    states = _quote_states(seg)
+    return _QUOTE_GLUED_NAME_RE.sub(
+        lambda m: m.group(0) if states[m.start()] == "'" else "${" + m.group(1) + "}", seg)
+
+
+_MAYBE_EVAL_RE = re.compile(r"\$\{!|@[A-Za-z]\}")
+_LOCALE_QUOTE_RE = re.compile(r'(?<![\\$])\$(?=")')
+# What an indirection may name: a variable, or one element of one.
+_INDIRECT_TARGET_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*(?:\[[^]]*\])?")
 
 
 _ALTERNATIVE_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?\+")
@@ -2837,6 +2993,7 @@ def _assigned_values(command: str, depth: int = 0,
         for name, value in _reader_values(command):
             vals.setdefault(name, []).append(value)
             where.setdefault(name, []).append(None)
+
     def bind(scripts: set[str], known: dict[str, list[str]]) -> None:
         """Bind the names each script assigns, its line's names spliced in
         too: `v=a; eval "$(echo "$v='rm …'")"` assigns `a` (XERK-1668)."""
@@ -2856,7 +3013,37 @@ def _assigned_values(command: str, depth: int = 0,
                 have.extend(new)
                 where.setdefault(name, []).extend([None] * len(new))
 
+    lists = _for_lists(command)
     if depth < _EVAL_ASSIGN_DEPTH:
+        # A `for` name holds its list's words: `for e in eval; do $e "a=…"`
+        # runs that eval (XERK-1666). Read for this scan only, never into
+        # ``vals``: a list's words are data, not counted values. Built once:
+        # per segment it was segments × words, and a long line timed out.
+        for_known: dict[str, list[str]] = {}
+        for_split: dict[str, list[str]] = {}
+        for name, _s, _e, raw_words, _shell in lists:
+            for w in raw_words:
+                if "$" in w and _unquoted_dollar(w):
+                    # An unquoted expansion, glued quotes or not (`$x''`):
+                    # bash splits it into fields. A name may be an outer
+                    # loop's (`for y in 'ls eval'; do for e in $y`).
+                    fields = _dequote_value(_pattern_vars(w, {**vals, **for_known})).split()
+                    if len(fields) > 1:
+                        have = for_split.setdefault(name, [])
+                        # The first few, every piece of `eval` itself, and a
+                        # few more holding it (trimmed: `xeval`), wherever they
+                        # sit in a long list. Each costs a reading per use.
+                        seen, more = set(have), 0
+                        for k, f in enumerate(dict.fromkeys(fields)):
+                            low = f.lower()
+                            if f in seen:
+                                continue
+                            if k >= _MAX_VALUE_READINGS and low not in "eval":
+                                if "eval" not in low or more >= _MAX_VALUE_READINGS:
+                                    continue
+                                more += 1
+                            have.append(f)
+                for_known.setdefault(name, []).append(_dequote_value(w))
         # An assignment `eval` runs binds the name for the rest of the line:
         # `eval "a=\$(echo rm -rf /)"; $a` runs it, though no `a=` starts a
         # word here (XERK-1651). Eval's words joined, as it re-parses them,
@@ -2865,11 +3052,21 @@ def _assigned_values(command: str, depth: int = 0,
         for seg in _split_segments(command):
             if "al" not in seg and "$" not in seg:
                 continue
-            words = _tokenize(seg)
+            # A name glued to a quote braced first: tokenized, the quotes go
+            # and `$p$q'al'` read as the name `qal` (XERK-1666).
+            # A `$"…"` locale string is a plain `"…"` here: tokenized, its `$`
+            # stayed and `$p$"al"` read the name `al`.
+            words = _tokenize(_LOCALE_QUOTE_RE.sub("", _brace_quote_glued(seg)))
             known = {**(env or {}), **vals}
+            for name, got in for_known.items():
+                known[name] = known.get(name, []) + got
             for k, w in enumerate(words):
                 # ...or spelled by names: `x=eval; $x "a=…"`, `${x}al`, `${x,,}`.
-                if _basename(w) != "eval" and not ("$" in w and _eval_named(w, known)):
+                # A `${!x}` or `@E`/`@P`/`@a`… word may be eval however x's value is
+                # built (`$'\x79'`, `${n%z}`, a loop name), which no reading
+                # of it can follow: its words are read as eval's (XERK-1666).
+                if _basename(w) != "eval" and not ("$" in w and (
+                        _MAYBE_EVAL_RE.search(w) or _eval_named(w, known, for_split))):
                     continue
                 rest = words[k + 1:]
                 while rest and (_basename(rest[0]) == "eval" or rest[0] == "--"):
@@ -2923,7 +3120,6 @@ def _assigned_values(command: str, depth: int = 0,
         _VALUES_MOST[0] = max(_VALUES_MOST[0], len(got) + len(applied.get(k, ())))
         _VALUE_COUNTS[k] = max(_VALUE_COUNTS.get(k, 0), len(got) + len(applied.get(k, ())))
         _VALUES_ASSIGNED[0] = max(_VALUES_ASSIGNED[0], len(got))
-    lists = _for_lists(command)
     # A per-word reading (`_for_word_lines`): each picked loop's name holds
     # that word alone, as its iteration does. Any other binding joined in
     # made `v=a; for v in 'rm …'; do $v; done` run program `a`. A pick whose
@@ -2981,6 +3177,9 @@ def _assigned_values(command: str, depth: int = 0,
         if name not in vals:
             return m.group(0)
         value = _picked(plain[name] if name == owner else others.get(name, plain[name]), name)
+        if _decoding_op(m.group(2)):
+            # Decoded, or unreadable: `z=${y@E}; $z` (XERK-1666).
+            value = _CASE_OPS[_decoding_op(m.group(2))](value)
         # Its trim too: `b=${a%% *}; "$b"` runs the first word (XERK-1651).
         op = _VAR_OP_RE.match(m.group(2) or "")
         if op and op.group(1) not in _VAR_DEFAULT_OPS:
@@ -3080,6 +3279,8 @@ def _ordered_values(vals: dict[str, list[str]], where: dict[str, list[int | None
             return m.group(0)
         held = owner[1] if name == owner[0] else current
         value = _picked(held.get(name, []) + fixed[name], name)
+        if _decoding_op(m.group(2)):
+            value = _CASE_OPS[_decoding_op(m.group(2))](value)  # as `resolve` (XERK-1666)
         op = _VAR_OP_RE.match(m.group(2) or "")
         if op and op.group(1) not in _VAR_DEFAULT_OPS:
             got = _op_readings(value, op.group(1), op.group(2),
@@ -3272,6 +3473,8 @@ def _chain_values(vals: dict[str, list[str]], applied: dict[str, list[str]],
             return m.group(0)
         got = known[name] if name == owner or not defaults[name] else known[name] + defaults[name]
         value = _picked(got, name)
+        if _decoding_op(m.group(2)):
+            value = _CASE_OPS[_decoding_op(m.group(2))](value)  # as `resolve` (XERK-1666)
         op = _VAR_OP_RE.match(m.group(2) or "")
         if op and op.group(1) not in _VAR_DEFAULT_OPS:
             # Names in its pattern or alternative read from what is known so far.
@@ -4110,6 +4313,15 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             out = sep.join((_quote_literal(_UNREAD_OUTPUT, state),
                             _quote_literal(_picked(got, name), state),
                             default(arg, m.start())))
+        elif got and _decoding_op(rest):
+            # Decoded (`@E`) or unreadable (`@P`, marker-led): raw, a stored
+            # `z=${y@E}` kept `\x65val` and `$z` ran eval (XERK-1666). Case
+            # ops stay unapplied here: `${x^^}` on a case-blind disk is x.
+            value = _CASE_OPS[_decoding_op(rest)](_picked(got, name))
+            state = states[m.start()] if m.start() < len(states) else ""
+            marked = value.startswith(_UNREAD_OUTPUT + " ")
+            out = _splice_readings([value[len(_UNREAD_OUTPUT) + 1:]] * 2 if marked else [value],
+                                   state)
         elif got:
             value = _picked(got, name)
             state = states[m.start()] if m.start() < len(states) else ""
