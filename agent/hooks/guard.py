@@ -2890,7 +2890,9 @@ def _assigned_values(command: str, depth: int = 0,
                 words = _tokenize(seg)
                 # Wherever the reader sits (`f(){ source <(…)`), as for `eval`.
                 # Its file a `<(…)` (a word `_tokenize` splits) or stdin.
-                files = [words[j + 1] for j, w in enumerate(words[:-1]) if w in (".", "source")]
+                # `source -- FILE` takes its `--` as bash does.
+                files = [words[j + 2] if words[j + 1] == "--" and j + 2 < len(words) else words[j + 1]
+                         for j, w in enumerate(words[:-1]) if w in (".", "source")]
                 if any(_STDIN_SCRIPT_RE.match(f.rstrip(";")) for f in files):
                     stdin_readers[k] = None
                 if any(f.startswith("<(") for f in files):

@@ -2083,6 +2083,8 @@ class TestScriptChannels(unittest.TestCase):
                     "v=a; source <(echo \"$v='rm -rf /etc'\"); $a",
                     "f(){ source <(echo \"a='rm -rf /etc'\"); }; f; $a",
                     ". /dev/stdin <<<\"a='rm -rf /etc'\"; $a",
+                    "source -- <(echo \"a='rm -rf /etc'\"); $a",
+                    ". -- /dev/stdin <<<\"a='rm -rf /etc'\"; $a",
                     "source /dev/fd/0 <<<\"a='rm -rf /etc'\"; $a",
                     "{ . /dev/stdin; } <<<\"a='rm -rf /etc'\"; $a",
                     ". /dev/stdin < <(echo \"a='rm -rf /etc'\"); $a",
