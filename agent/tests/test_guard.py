@@ -3048,6 +3048,14 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "bash <<E\n$(echo 'X=${nope:-a b}') rm -rf /etc\nE",
         "cat <<E | bash\n`echo 'X=${nope:-a b}'` rm -rf /etc\nE",
         "bash -c \"$(echo 'X=${nope:-a')\"' b} rm -rf /etc'",
+        "\\eval $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "ev''al $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "$'eval' $(echo 'X=${nope:-a b}') rm -rf /etc",
+        # ...one re-parse level down, where the script arrives substituted.
+        "bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        "bash <<'E'\nbash -c \"$(echo 'X=${nope:-a b}') rm -rf /etc\"\nE",
+        "eval 'bash -c \"$(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc\"'",
+        "bash -c \"bash -c \\\"\\$(echo 'X=\\${nope:-a b}') rm -rf /etc\\\"\"",
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
@@ -3081,7 +3089,6 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "R=$(echo 'X=${n:-a b}'); echo \"$R\"",
         "eval \"$(ssh-agent -s)\"",
         "eval X=1 ls",
-        "cat <<'E' | bash\n$(echo 'X=${nope:-a b}') rm -rf /etc\nE",
     ]
 
     def test_shell_wrapped_destructive_blocked(self):

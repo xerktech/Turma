@@ -4401,7 +4401,8 @@ def _unsplit_cuts_at(command: str, depth: int,
             word = command[i:end]
             if depth < _MAX_UNSPLIT_DEPTH:
                 cuts += _unsplit_quoted(command, i, end, depth)
-            if at_start and (_basename(word) in _PREFIX_WORDS or word == "eval"):
+            if at_start and (_basename(word) in _PREFIX_WORDS
+                             or _bash_dequoted(_decode_ansi_c(word)) == "eval"):
                 # A wrapper (`env -u N X=… cmd`, `sudo -u root X=… cmd`,
                 # `timeout 5 env X=…`, `coproc N { X=… cmd; }`): every
                 # assignment-shaped word to the end of the command is cut, flag
@@ -6950,11 +6951,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     _spend(len(unsplit))
                     out.extend(_expand_segments(_substitute_vars(unsplit, raw_vals), depth + 1,
                                                 every_cd))
-                # ...and so is an assignment its substitutions print (XERK-1645 QA).
-                if not quoted:
-                    for cut in _printed_unsplit(script, unsplit):
-                        out.extend(_expand_segments(_substitute_vars(cut, raw_vals), depth + 1,
-                                                    every_cd))
+                # ...and so is an assignment its substitutions print (XERK-1645
+                # QA), whichever shell runs them: a quoted body's own shell does.
+                for cut in _printed_unsplit(script, unsplit):
+                    out.extend(_expand_segments(_substitute_vars(cut, raw_vals), depth + 1,
+                                                every_cd))
                 out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
                                             every_cd))
         elif not quoted:
@@ -7052,7 +7053,24 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # the re-parse substitutes `a b` before its own cut can see it (XERK-1645).
     # So the line with each substitution's printed text spliced in is cut too,
     # adding its segments and pipelines only where the raw line's cut missed.
-    if bodies:
+    # ...and in each `-c`/eval script the line runs, read off the RAW text: a
+    # nested level is handed its script with `${…}` already substituted, so
+    # `bash -c 'eval $(echo …X=${v:-a b}…) rm …'` reached it as `X=a b`.
+    if "$(" in raw_commands or "`" in raw_commands:
+        for raw_seg in _split_segments(raw_commands):
+            if "$(" not in raw_seg and "`" not in raw_seg:
+                continue
+            words = _strip_prefixes(_tokenize(_unwrap_group(raw_seg)))
+            if not words:
+                continue
+            if _basename(words[0]) == "eval":
+                scripts = [" ".join(words[2:] if words[1:2] == ["--"] else words[1:])]
+            else:
+                scripts = _raw_shell_c_scripts(words)[:1]
+            for script in scripts:
+                for reading in _script_readings(script):
+                    for cut in _printed_unsplit(reading):
+                        out.extend(_expand_segments(cut, depth + 1, every_cd))
         for cut in _printed_unsplit(raw_commands, unsplit):
             cut_line = _prenormalise(cut)
             unsplit_line = f"{unsplit_line}\n{cut_line}" if unsplit_line else cut_line

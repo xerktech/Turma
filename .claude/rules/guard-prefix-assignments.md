@@ -48,10 +48,14 @@ paths:
     (`$(v=X; echo "$v=…")`) are therefore unread: XERK-1684.
   - Added only when it differs from the raw line's cut spliced the same way, so a written
     assignment is not cut twice; its pipelines join `unsplit_line`'s.
-  - The heredoc site runs it on the body BEFORE `_substitute_vars`, which expands `${…}` inside
-    a body's `'…'` too.
-- `eval` counts as a wrapper for the cut: its words are re-joined, so a printed `X=${v:-a` `b}`
-  is one assignment again (`eval $(echo 'X=${v:-a b}') rm …`).
+  - Every re-parse level is handed its script `${…}`-substituted (`_substitute_vars` expands
+    inside `'…'` too), so the cut must run on RAW text one level up: the heredoc site cuts the
+    body (quoted delimiter too), and `_expand` cuts each `-c`/eval script of its raw segments
+    (`bash -c 'eval $(…) rm …'`, `bash <<'E'` / `bash -c "$(…) rm …"`).
+  - Accepted over-deny, as base already does for `$(echo 'X=1 Y=2') rm …`: printed text at
+    command start is read as re-parsed (`$(echo 'X=${v:-a b}') rm …` runs no `rm`).
+- `eval` counts as a wrapper for the cut, any spelling bash dequotes to it (`\eval`, `ev''al`,
+  `$'eval'`): its words re-join, so a printed `X=${v:-a` `b}` is one assignment again.
 - Only LEADING words: an argument's expansion IS word-split (`rm -rf X=${v:- /etc}` deletes /etc).
 - Replayed against ~33k real Bash commands: 0 decision changes.
 - Tests: `TestWrapperUnwrapping` (`PREFIX_WRAPPED`, `WRAPPED_SAFE`) in `test_guard.py`.
