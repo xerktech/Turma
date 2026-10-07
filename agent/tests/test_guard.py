@@ -2158,6 +2158,88 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_eval_named_by_indirection_or_a_for_word_binds_its_assignment(self):
+        """XERK-1666: an eval word spelled by `${!x}` or by a `for` name binds
+        what it assigns, as a literal eval does; each ran as nobody."""
+        for cmd in ("y=eval; x=y; ${!x} \"a='rm -rf /etc'\"; $a",
+                    "y=eval; x=y; \"${!x}\" \"a='rm -rf /etc'\"; $a",
+                    "for e in eval; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for e in ls eval; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for e in 'eval'; do \"$e\" \"a='rm -rf /etc'\"; done; $a",
+                    "for e in ev; do ${e}al \"a='rm -rf /etc'\"; done; $a",
+                    "y=eval; for x in y; do ${!x} \"a='rm -rf /etc'\"; $a; done",
+                    # QA: indirection to a loop name, a word-split list, a
+                    # name glued to a quote, an op or element on `${!x}`,
+                    # a backslash in the value.
+                    "for y in ls eval; do x=y; ${!x} \"a='rm -rf /etc'\"; done; $a",
+                    "x='ls eval'; for e in $x; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for p in e x; do for q in v y; do $p$q'al' \"a='rm -rf /etc'\"; done; done; $a",
+                    "y=EVAL; x=y; ${!x,,} \"a='rm -rf /etc'\"; $a",
+                    "y=evalz; x=y; ${!x%%z} \"a='rm -rf /etc'\"; $a",
+                    "y=eval; x=(y); ${!x[0]} \"a='rm -rf /etc'\"; $a",
+                    "y=(eval); x='y[0]'; ${!x} \"a='rm -rf /etc'\"; $a",
+                    "e=ev\\al; $e \"a='rm -rf /etc'\"; $a",
+                    # QA delta: transforms, glued-quote and nested split
+                    # lists, eval past a long split list, `$"…"` glue.
+                    "y=EVAL; x=y; ${!x@L} \"a='rm -rf /etc'\"; $a",
+                    "y=EVAL; ${y@L} \"a='rm -rf /etc'\"; $a",
+                    "x='ls eval'; for e in $x''; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for y in 'ls eval'; do for e in $y; do $e \"a='rm -rf /etc'\"; done; done; $a",
+                    "x='" + " ".join(f"w{i}" for i in range(20)) + " eval'; "
+                    "for e in $x; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for p in ev; do $p$\"al\" \"a='rm -rf /etc'\"; done; $a",
+                    # QA delta 3: a `${!x}` whose x no reading follows, and
+                    # transforms that decode or prefix the value.
+                    "for y in ls eval; do x=$'\\x79'; ${!x} \"a='rm -rf /etc'\"; done; $a",
+                    "for y in ls eval; do z=ay; x=${z#a}; ${!x} \"a='rm -rf /etc'\"; done; $a",
+                    "y='\\x65val'; ${y@E} \"a='rm -rf /etc'\"; $a",
+                    "y=EVAL; ${y@a}${y@L} \"a='rm -rf /etc'\"; $a",
+                    # QA delta 4: the decoded value stored, then run.
+                    "y='\\x65val'; z=${y@E}; $z \"a='rm -rf /etc'\"; $a",
+                    "y='\\145val'; z=${y@P}; $z \"a='rm -rf /etc'\"; $a",
+                    "y='\\x65val'; for z in ${y@E}; do $z \"a='rm -rf /etc'\"; done; $a",
+                    # QA delta 5: bash ends `@E` at a NUL; `@P` is a prompt
+                    # expansion (`\s` is the shell), read as unreadable.
+                    "y='eval\\0x'; z=${y@E}; $z \"a='rm -rf /etc'\"; $a",
+                    "y='eval\\c x'; z=${y@E}; $z \"a='rm -rf /etc'\"; $a",
+                    "y='\\s'; z=${y@P}; $z -c 'rm -rf /etc'",
+                    "y='\\s'; z=${y@P}; w=$z; $w -c 'rm -rf /etc'",
+                    "y='\\x65val'; z=${y@E}; w=$z; $w \"a='rm -rf /etc'\"; $a",
+                    # QA delta 6: the transform spliced in place, and on an
+                    # array element.
+                    "y='\\x62ash'; ${y@E} -c 'rm -rf /etc'",
+                    "y='\\x62ash'; \"${y@E}\" -c 'rm -rf /etc'",
+                    "y='\\s'; \"${y@P}\" -c 'rm -rf /etc'",
+                    "y=('\\x65val'); z=${y[0]@E}; $z \"a='rm -rf /etc'\"; $a",
+                    "y=('\\x62ash'); \"${y[@]@E}\" -c 'rm -rf /etc'",
+                    "y=('\\s'); z=${y[0]@P}; $z -c 'rm -rf /etc'",
+                    "y=('\\x62ash'); i=(0); ${y[i[0]]@E} -c 'rm -rf /etc'",
+                    # QA delta 8: `%]@E` is a trim, never decoded (the NUL
+                    # cut would hide the script).
+                    "y=('true \\0; rm -rf /etc'); bash -c \"${y[0]%]@E}\"",
+                    "y=('true \\0; rm -rf /etc'); z=${y[0]//x/]@E}; bash -c \"$z\"",
+                    # QA delta 9: an escaped quote in the subscript.
+                    "declare -A y; y[\\\"]='\\x62ash'; ${y[\\\"]@E} -c 'rm -rf /etc'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("for e in eval; do echo \"$e\"; done",
+                    "y=echo; x=y; ${!x} \"a=hi\"; echo $a",
+                    "for f in a b; do echo \"$f\"; done",
+                    "x='ls echo'; for e in $x; do $e \"a=hi\"; done; echo $a",
+                    "y=1; x=y; echo ${!x[@]} ${!y*}",
+                    "for y in a b; do x=y; echo \"${!x}\"; done",
+                    "x='a b'; printf '%s' \"${x@Q}\" \"${x@E}\"",
+                    "y='a\\tb'; echo \"${y@E}\" \"${y@P}\"",
+                    # Plain loops beside an unrelated `${!x}` stay cheap,
+                    # their name reused too (QA).
+                    "; ".join("for v in " + " ".join(f"f{i}" for i in range(30)) + "; do echo v; done"
+                              for _ in range(15)) + "; x=HOME; echo \"${!x}\"",
+                    "x=HOME; echo \"${!x}\"; " + "; ".join(
+                        f"for v{j} in " + " ".join(f"w{i}" for i in range(20)) + "; do :; done"
+                        for j in range(12))):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_an_op_too_costly_to_match_is_unreadable_not_kept_whole(self):
         """XERK-1651 QA: the cost caps are what keep one op from running past
         the hook's deadline; past them a value with blanks is led by the
