@@ -6096,7 +6096,7 @@ def _find_roots(tokens: list[str]) -> list[str]:
     return roots
 
 
-def _expand_both(command: str) -> list[tuple[list[str], str]]:
+def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]:
     """`_expand_segments`, and — when a spliced value needed escaping, or an
     expansion was read as escaped — again with every value spliced raw and
     every expansion live (see `_quote_literal`, `_live_dollar`). Neither
@@ -6129,6 +6129,8 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
             out = out + _expand_readings(command)
         finally:
             _HOME_KEPT[0] = False
+    for reading in _home_tilde_readings(command) if home else ():
+        out = out + _expand_both(reading)
     # A values pass is one reading, again when values print differently, and
     # once per taint reading: sixteen tainted `x=$(…)` made each 9x the cost.
     weight = 1 + bool(_VALUES_DIFFER[0]) + min(_VALUES_TAINT_N[0], _MAX_TAINT_STARTS)
@@ -6151,6 +6153,140 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
             _FOR_PICK[0] = None
             _VALUES_CHAINED[0] = False
     return out
+
+
+# A `~` bash expands to $HOME (`~+` to $PWD): opening a word, or after an
+# assignment's `=` or `:`, and followed by a `/` or the word's end. Quotes are
+# not read, so one inside a `bash -c '…'` script is found too; this only adds
+# a reading.
+_HOME_TILDE_RE = re.compile(r"(?:(?<=^)|(?<=[\s;&|()<>=:{,`]))~(\+?)(?=[/\s;&|()<>:},`]|$)")
+# ...and the word of a `${y:-~/x}`, `${y-~}`, `${y:+~/x}`, `${y:=~}`, `${y:?~}`,
+# which bash tilde-expands too. Its own pattern: a lookbehind cannot vary in width.
+# A name may be a multi-digit positional (`${10:-~}`).
+_PARAM_NAME = r"\$\{(?:[A-Za-z_]\w*|[0-9]+|[@*#?!$-])"
+_PARAM_TILDE_RE = re.compile("(" + _PARAM_NAME + r":?[-+=?])~(\+?)(?=[/}])")
+# ...and the replacement of a `${y/pat/~/x}`, found by `_replacement_tildes`.
+_PARAM_REPLACE_RE = re.compile(_PARAM_NAME + "//?")
+
+
+def _replacement_tildes(text: str) -> list[tuple[int, bool]]:
+    """Where a `~` (and whether `~+`) opens the replacement word of a
+    `${y/pat/…}` in ``text``. The pattern may hold `\\x`, `'…'`, `"…"` and a
+    `${…}` (quotes and escapes in it too), as bash allows. Linear: one
+    right-to-left pass gives, for each position, where a pattern read from
+    there ends; a regex retried at every `${y/` was quadratic, exponential
+    once its alternatives overlapped, and one search holds the GIL past the
+    hook's deadline, which runs the command (QA)."""
+    starts = [m.end() for m in _PARAM_REPLACE_RE.finditer(text)]
+    if not starts or "~" not in text:
+        return []
+    n = len(text)
+    # For a body starting at i: next_sq, the closing `'`; next_ansi, the
+    # closing `'` of a `$'…'` (escapes read); next_dq, the closing `"` (escapes
+    # and a nested `${…}` read); next_brace, the `}` closing a `${…}`. ends[i]:
+    # the `/` ending a pattern read from i. -1: none. `step` is where the unit
+    # opening at i ends: an escape, a quote, a `${…}`, else one character. A
+    # bare `{` is a character: bash closes `${z:-{}` at its first `}`.
+    size = n + 3
+    next_sq, next_ansi, next_dq = [-1] * size, [-1] * size, [-1] * size
+    next_brace, ends = [-1] * size, [-1] * size
+
+    def step(i: int) -> int:
+        ch = text[i]
+        if ch == "\\":
+            return i + 2
+        if ch == "'":
+            q = next_sq[i + 1]
+        elif ch == '"':
+            q = next_dq[i + 1]
+        elif ch == "$" and text.startswith("$'", i):
+            q = next_ansi[i + 2]
+        elif ch == "$" and text.startswith("${", i):
+            q = next_brace[i + 2]
+        else:
+            return i + 1
+        return q + 1 if q >= 0 else -1
+
+    for i in range(n - 1, -1, -1):
+        ch = text[i]
+        next_sq[i] = i if ch == "'" else next_sq[i + 1]
+        next_ansi[i] = i if ch == "'" else next_ansi[i + 2] if ch == "\\" else next_ansi[i + 1]
+        if ch == '"':
+            next_dq[i] = i
+        elif ch == "\\":
+            next_dq[i] = next_dq[i + 2]
+        elif ch == "$" and text.startswith("${", i):
+            q = next_brace[i + 2]
+            next_dq[i] = next_dq[q + 1] if q >= 0 else -1
+        else:
+            next_dq[i] = next_dq[i + 1]
+        if ch == "}":
+            next_brace[i], ends[i] = i, -1
+            continue
+        after = step(i)
+        next_brace[i] = next_brace[after] if after >= 0 else -1
+        ends[i] = i if ch == "/" else ends[after] if after >= 0 else -1
+    out = []
+    for start in starts:
+        end = ends[start]
+        if end < 0 or not text.startswith("~", end + 1):
+            continue
+        plus = text.startswith("~+", end + 1)
+        after = end + 2 + plus
+        if after < n and text[after] in "/}":
+            out.append((end + 1, plus))
+    return out
+
+
+_BARE_CD_RE = re.compile(r"((?:^|(?<=[\s;&|(){`]))cd)(?=[ \t]*(?:[;&|)}\n`]|$))")
+# What a line that may bind HOME holds: the name (`HOM{E,}`, `H\OME`, `H$x`
+# with `x=OME`) or an `eval` that can build it.
+_HOME_HINT_RE = re.compile(r"HOM|OME|\beval\b")
+def _home_tilde_readings(command: str) -> list[str]:
+    """``command`` with each `~` read as `$HOME` and each `~+` as `$PWD`, when
+    the line may bind HOME (`_HOME_HINT_RE`); none if that changes nothing
+    (XERK-1685). Bash expands `~` from HOME's CURRENT value, so `HOME=/; rm
+    -rf ~/etc` deletes /etc, while `~` alone reads as the session's home.
+    Every `~` is spliced, a program's too: telling command position from an
+    argument (`rm -rf do ~/etc`, `a=(~/etc)`) needs a parse. A spliced program
+    stays literal: `_owner_word_may_be_shell` reads an unassigned `$HOME/…` as
+    `~/…`.
+
+    A `~` opening a `${y:-…}` word is read both braced (`${HOME}`: an unbraced
+    name ending a default word is not resolved, `${y:-$x}`, XERK-1670) and
+    bare (`${y/$z/${HOME}/x}` is not resolved either). Elsewhere bare: a
+    braced one is not resolved inside `{a,b}` (XERK-1694)."""
+    if "~" not in command and "cd" not in command:
+        return []
+    home = bool(_HOME_HINT_RE.search(command))
+    if not home and "~+" not in command:
+        return []
+
+    def splice(m: "re.Match[str]") -> str:
+        if m.group(1):
+            return "$PWD"
+        return "$HOME" if home else m.group(0)
+
+    out = _HOME_TILDE_RE.sub(splice, command)
+    if home:
+        # ...and a bare `cd`, which goes to $HOME: `HOME=/; cd; rm -rf etc`.
+        out = _BARE_CD_RE.sub(r"\1 $HOME", out)
+    readings = [out]
+    if "${" in out:
+        spots = [(m.end(1), bool(m.group(2))) for m in _PARAM_TILDE_RE.finditer(out)]
+        spots += _replacement_tildes(out)
+        if spots:
+            def param(form: str) -> str:
+                pieces, last = [], 0
+                for at, plus in sorted(spots):
+                    word = "PWD" if plus else "HOME" if home else ""
+                    if word:
+                        pieces += (out[last:at], form % word)
+                        last = at + 1 + plus
+                pieces.append(out[last:])
+                return "".join(pieces)
+            readings = [param("${%s}"), param("$%s")]
+    return [r for r in dict.fromkeys(readings) if r != command]
 
 
 # How many characters of line the per-word `for` readings may re-read in one
@@ -6632,6 +6768,9 @@ def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
             word += "}"
         # An unset positional takes its default: `ba${@:-zz}sh` is `bazzsh`.
         word = _substitute_vars(_bind_positionals(word, [None]), vals)
+        # HOME is always set: a program under an unassigned `$HOME` is as
+        # literal as `~/bin/x` (XERK-1685, where `~` is also read as `$HOME`).
+        word = _HOME_LEAD_RE.sub("~", word, count=1)
         # Unresolved, or empty (the program shifts to the next word: `$x bash`).
         if "$" in word or "`" in word or not word.split():
             return True
@@ -6653,6 +6792,11 @@ def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
         return True
     pattern = name.replace("[^", "[!")
     return any(fnmatch.fnmatchcase(shell, pattern) for shell in _SCRIPT_READERS)
+
+
+# Only a path UNDER it: a bare `$HOME` program is HOME's value, which a binding
+# the values pass misses (`declare H\\OME=/bin/bash`) can make a shell.
+_HOME_LEAD_RE = re.compile(r"\A\$(?:HOME|\{HOME\})(?=/)")
 
 
 # A program word that may not be literal: an expansion, a glob, a substitution.
@@ -8318,12 +8462,22 @@ def _is_exact_root(path: str) -> bool:
     return low in _HOME_TOKENS or low in _SYSTEM_ROOTS or bool(_HOME_USER_RE.match(low))
 
 
+_PWD_LEAD_RE = re.compile(r"\$(?:PWD|\{PWD\})(?=/|$)")
+
+
 def _under_cwd(tok: str, cwd: str) -> str:
     """An `rm` operand read from inside ``cwd``. Inside an exact protected root
     every relative operand is joined (`cd /etc; rm -rf ./*` is `/etc/*`).
     Deeper, only one climbing out with `..` is (`cd /tmp; rm -rf ../*` is
     `/*`): joining the rest would refuse `cd /usr/src/app && rm -rf build`,
     which names nothing an absolute rm would not, for a cwd that may be stale."""
+    if m := _PWD_LEAD_RE.match(tok):
+        # `$PWD` is the directory `cd` left, read as a relative operand is:
+        # `cd /; rm -rf $PWD/etc` (XERK-1685).
+        rest = tok[m.end():].lstrip("/")
+        if _is_exact_root(cwd) or ".." in rest.split("/"):
+            return (cwd.rstrip("/") + "/" + rest).rstrip("/") or "/"
+        return tok
     if tok.startswith(("-", "/", "~", "$", _OPAQUE_SUBST)):
         return tok
     if _is_exact_root(cwd) or ".." in tok.split("/"):
@@ -9899,7 +10053,9 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     heredocs = None
     written: set[str] = set()  # description files a heredoc writer creates first
     named: set[str] = set()  # every other path an earlier segment mentions
-    for tokens, segment, *_flags in _expand_both(command):
+    # Without the `~` reading (XERK-1685): it repeats the line, and a writer
+    # read twice is "another part" naming the file it wrote.
+    for tokens, segment, *_flags in _expand_both(command, home=False):
         if _basename(tokens[0]) == "cd" and len(tokens) > 1:
             cwd = _join_path(cwd, tokens[1])
             continue
