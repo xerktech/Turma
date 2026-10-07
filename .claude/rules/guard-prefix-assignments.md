@@ -47,7 +47,7 @@ paths:
     inside a `${…}` frame and the multi-piece dequote never closed.
   - With `assigns=False` (`_body_printed`): applying the body's own assignments also expanded the
     `${…}` it prints (`echo 'X=${v:-a b} Y=1'`, `echo $(echo 'X=…')`). Body-bound names
-    (`$(v=X; echo "$v=…")`) are therefore unread: XERK-1684.
+    (`$(v=X; echo "$v=…")`) are read by the glued reading below (XERK-1684).
   - Added only when it differs from the raw line's cut spliced the same way, so a written
     assignment is not cut twice; its pipelines join `unsplit_line`'s.
   - Every re-parse level is handed its script `${…}`-substituted (`_substitute_vars` expands
@@ -68,12 +68,35 @@ paths:
   - The walk also reads its text ANSI-C decoded BEFORE splitting and its `$(` gate: split raw, a
     `$'…\'…'` ended at the `\'` and `; …` after it cut the script (`\x24(` is a `$(`).
   - Decoded is an ADDED reading, never the only one: `_ANSI_C_RE` is quote-blind, so a quoted
-    `"$'\'"` decoy read as one swallowed the rest of the line. Not yet a here-string a pipe carries to a shell
-    (`cat <<< '…' | bash`): XERK-1684.
+    `"$'\'"` decoy read as one swallowed the rest of the line. A here-string a pipe carries to a shell
+    (`cat <<< '…' | bash`) is left to the glued reading below (XERK-1684).
   - Accepted over-deny, as base already does for `$(echo 'X=1 Y=2') rm …`: printed text at
     command start is read as re-parsed (`$(echo 'X=${v:-a b}') rm …` runs no `rm`).
 - `eval` counts as a wrapper for the cut, any spelling bash dequotes to it (`\eval`, `ev''al`,
   `$'eval'`): its words re-join, so a printed `X=${v:-a` `b}` is one assignment again.
+- **A value that reaches the command through a re-parse is glued, not cut** (XERK-1684,
+  `_glued_param_values`): `_substitute_vars` splices `${v:-a b}` (even inside `'…'`) before any
+  eval/pipe/printed/`source <(…)` join puts `X=` and the command in one script, so no cut sees it.
+  - The line is also read with each `${…}` (found by brace depth, quoting ignored, `$''{`/`$'"{`
+    spellings too) holding its blanks/operators as `_`, and each use of a name whose value holds
+    one (`s='a b'; X=$s cmd`) as `_`. The value's content is the line's own reading's job; spliced
+    here, one long value bloated every segment it reached.
+  - Only an expansion after some `=` or `\` on the line is glued (any, quoted or not; an escape
+    can print a `=`: `printf 'X\x3d$s'`). Never gate on where the `=`'s WORD ends: that needs
+    bash's lexer, and each hand scan dropped a glue (`X="$(echo "a b")"$s`, `<(…)`; 3 QA passes).
+  - `${…}` closes are matched in ONE stack pass; an unclosed `${` is skipped, never a stop
+    (stopping hid every later use). Scanning on per opener was quadratic (`${a:-${` × 2000).
+  - A nested span recurses on its text, so past `_MAX_NESTED_VARS` levels it is too large.
+  - Added like the cut line: only differing segments, pipelines and `<(…)` texts. A whole-line
+    `_expand` of the glued text covered the same cases at 2-6x on real nested scripts.
+  - Also read ANSI-C decoded (`a'$'\t''b`), never only: decoding drops the `$` of `$''{`.
+  - A value holding any `\` counts as holding a blank: `_var_values` keeps `s=$'a\tb'` as
+    `$a\tb`, its quotes gone, so it can't be decoded there (QA).
+  - An indirect `${!n}` is glued whole: its value is another name's, not on its own text (QA).
+  - Replayed against 37.3k real Bash commands: 0 decision changes once deadline flips under host
+    load are re-run. ~2x on assignment-dense scripts (200 in one eval: 2.8s → 5.9s).
+  - Covers every channel at once; per-channel cuts (eval join, pipe producer, printed body)
+    each left the next channel open.
 - Only LEADING words: an argument's expansion IS word-split (`rm -rf X=${v:- /etc}` deletes /etc).
 - Replayed against ~33k real Bash commands: 0 decision changes.
-- Tests: `TestWrapperUnwrapping` (`PREFIX_WRAPPED`, `WRAPPED_SAFE`) in `test_guard.py`.
+- Tests: `TestWrapperUnwrapping` (`PREFIX_WRAPPED`, `WRAPPED_SAFE`, XERK-1684 block) in `test_guard.py`.
