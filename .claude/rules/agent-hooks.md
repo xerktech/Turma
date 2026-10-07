@@ -355,8 +355,7 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
       shipped broken once — denies nothing; don't repeat that mistake). A literal `?` has no working
       escape, so `runtime_code_deny_rules` refuses to emit a rule for such a path and warns instead.
     - **Every hook runs `python3 -SI`** — security flags, not style (`-I` = `-sE` + no script dir).
-      `-S` is the one that closes the
-      class: a plain start runs `site` before the hook's own code, so a planted `.pth`/
+      `-S` is the one that closes the class: a plain start runs `site` before the hook's own code, so a planted `.pth`/
       `sitecustomize.py` in the interpreter's OWN site-packages (not just the user one `-s` alone
       blocks) disables the hook — measured to allow `rm -rf /`. `-E` kills `PYTHONPATH`/
       `PYTHONHOME`/`PYTHONSTARTUP`. PATH shadowing is separately closed by an absolute

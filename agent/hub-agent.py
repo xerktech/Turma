@@ -4940,9 +4940,9 @@ def session_cli_path():
 
 def session_cli_allow_rule(cli_path=None):
     """The generated allow rule that lets a session run the session CLI without
-    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (the session CLI
-    is not a gate, so it keeps -SsE rather than the hooks' -SI) and the ABSOLUTE script path, so the rule admits only this
-    script — an allow rule for `python3` alone would admit any code at all."""
+    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (not
+    a gate, so it keeps -SsE rather than the hooks' -SI) and the ABSOLUTE
+    script path, so the rule admits only this script — an allow rule for `python3` alone would admit any code at all."""
     return f"Bash(python3 -SsE {cli_path or session_cli_path()}:*)"
 
 

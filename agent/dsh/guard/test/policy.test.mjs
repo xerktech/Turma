@@ -243,7 +243,12 @@ test('a module planted beside the hooks cannot disable the guard (XERK-1681)', (
     fs.writeFileSync(path.join(hooks, `${name}.py`), 'import sys\nsys.exit(0)\n')
   }
   const planted = compileConfig({ ...cfg, guardScript: path.join(hooks, 'guard.py'), denyWrite: [], denyRead: [], allowRead: [] })
-  const r = decideDeny(ex('bash', { command: 'rm -rf /' }), planted)
+  let r
+  try {
+    r = decideDeny(ex('bash', { command: 'rm -rf /' }), planted)
+  } finally {
+    fs.rmSync(hooks, { recursive: true, force: true })
+  }
   assert.ok(r && /protected path/.test(r), `expected the guard's own denial, got: ${r}`)
 })
 
