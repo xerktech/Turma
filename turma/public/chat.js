@@ -1378,11 +1378,11 @@
   // bubble drops the tag lines and keeps what they wrap. Run AFTER messageOrigin,
   // which classifies a system turn by its leading tag. Keep in step with
   // ChatItems.kt `stripFraming`.
-  const FRAMING_TAG_RE = /^[ \t]*<\/?(?:pasted_content(?: id="[^"\n]*")?|system-reminder)>[ \t]*(?:\n|$)/gm;
+  const FRAMING_TAG_RE = /^[ \t]*<\/?(?:pasted_content(?: id="[^"\n]*")?|system-reminder)>[ \t]*(?:\r?\n|$)/gm;
   function stripFraming(text) {
     const t = String(text == null ? "" : text);
     if (t.indexOf("<") === -1) return t;
-    return t.replace(FRAMING_TAG_RE, "").replace(/^\n+|\n+$/g, "");
+    return t.replace(FRAMING_TAG_RE, "").replace(/^[\r\n]+|[\r\n]+$/g, "");
   }
 
   // ---- build display items from rich entries --------------------------------
@@ -1448,7 +1448,8 @@
             msg.origin = messageOrigin(msg.text);
             msg.text = stripFraming(msg.text);
           }
-          items.push(msg);
+          // A turn that was nothing but framing tags has nothing to show.
+          if (msg.text.trim()) items.push(msg);
           msg = null;
         }
       };

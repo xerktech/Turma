@@ -202,10 +202,12 @@ fun buildItems(
             // Any thoughts already folded come BEFORE this bubble in the stream
             // (the web pushes the msg item after the thinking items it followed),
             // so drain the fold first.
-            if (!text.isNullOrBlank()) {
+            // Stripped before the blank check, so a turn that was nothing but
+            // framing tags shows no empty bubble.
+            val shown = if (entry.role == "user" && text != null) stripFraming(text) else text
+            if (!shown.isNullOrBlank()) {
                 flushFold()
-                val origin = if (entry.role == "user") messageOrigin(text) else "operator"
-                val shown = if (entry.role == "user") stripFraming(text) else text
+                val origin = if (entry.role == "user") messageOrigin(text!!) else "operator"
                 out.add(ChatItem.Bubble(entry.key, entry.role, shown, clipped, origin))
             }
         }
@@ -339,7 +341,7 @@ fun messageOrigin(text: String): String {
 }
 
 private val FRAMING_TAG_RE =
-    Regex("(?m)^[ \\t]*</?(?:pasted_content(?: id=\"[^\"\\n]*\")?|system-reminder)>[ \\t]*(?:\\n|$)")
+    Regex("(?m)^[ \\t]*</?(?:pasted_content(?: id=\"[^\"\\n]*\")?|system-reminder)>[ \\t]*(?:\\r?\\n|$)")
 
 /**
  * Claude Code's own framing tags on a user turn, each on a line of its own —
@@ -350,7 +352,7 @@ private val FRAMING_TAG_RE =
  */
 fun stripFraming(text: String): String {
     if (!text.contains('<')) return text
-    return text.replace(FRAMING_TAG_RE, "").trim('\n')
+    return text.replace(FRAMING_TAG_RE, "").trim('\r', '\n')
 }
 
 /**

@@ -37,6 +37,7 @@ import types
 import threading
 import tracemalloc
 import time
+import unicodedata
 import unittest
 import urllib.error
 import urllib.request
@@ -12413,33 +12414,34 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
             ["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Enter"],
         ])
 
-    def test_input_is_never_bracketed(self):
+    def test_chat_sized_input_is_never_bracketed(self):
         # `-p` adds the bracketed-paste markers, which is how an application
         # RECOGNISES a paste — and Claude Code records the turn as
-        # `<pasted_content id=...>…</pasted_content id=...>`: shown literally in
-        # the chat, and handed to the model as pasted DATA rather than as the
-        # operator's words. So no message is bracketed, multi-line included;
-        # `-r` keeps each LF as LF (Ctrl+J, a line break in Claude Code's
-        # composer) instead of tmux's CR, which would submit per line.
+        # `<pasted_content id=...>…</pasted_content id=...>`, handed to the model
+        # as pasted DATA rather than as the operator's words. So a chat-sized
+        # message is typed, multi-line included; `-r` keeps each LF as LF
+        # (Ctrl+J, a line break in Claude Code's composer) instead of tmux's CR,
+        # which would submit per line.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "just one line")
         sm.send_input(sess["id"], "first\nsecond")
         for call in self.run_ok_calls:
-            self.assertNotIn("-p", call, "no message may be bracketed as a paste")
+            self.assertNotIn("-p", call, "a chat-sized message must not be bracketed")
             self.assertIn("-r", call, "LF must not become CR (a submit)")
         self.assertEqual(self.run_stdin_calls[-1][1], "first\nsecond")
 
-    def test_a_long_message_arrives_whole_in_sub_threshold_slices(self):
+    def test_a_chat_sized_message_arrives_whole_in_sub_threshold_slices(self):
         # Claude Code also reads one input burst past ~800 chars as a paste and
-        # tags it, so a long message goes in PASTE_CHUNK_CHARS slices — every
+        # tags it, so the message goes in PASTE_CHUNK_CHARS slices — every
         # character still arrives, in order, and only the final Enter submits.
         sm = self.make_manager()
         sess = self._running_session(sm)
-        text = "".join(chr(97 + i % 26) for i in range(59996)) + "\nend"
+        text = "".join(chr(97 + i % 26) for i in range(ha.PASTE_SLICED_MAX_CHARS - 4)) + "\nend"
         with mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
             sm.send_input(sess["id"], text)
         sent = [d for _c, d in self.run_stdin_calls]
+        self.assertGreater(len(sent), 1)
         self.assertEqual("".join(sent), text)
         self.assertTrue(all(len(d) <= ha.PASTE_CHUNK_CHARS for d in sent))
         self.assertLess(ha.PASTE_CHUNK_CHARS, 800)
@@ -12447,6 +12449,69 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual(self.run_calls,
                          [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Enter"]])
         self.assertEqual(sess["pendingInputs"][0]["text"], text)
+
+    def test_a_long_or_emoji_message_keeps_the_one_bracketed_paste(self):
+        # Past PASTE_SLICED_MAX_CHARS the slices would cost too many tmux calls
+        # (this also runs on the beat), and Claude Code corrupts TYPED dense
+        # emoji, so both go as ONE paste — bracketed when multi-line, as before.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        for text in ("x" * (ha.PASTE_SLICED_MAX_CHARS + 1) + "\ny",
+                     "family \U0001F468\u200d\U0001F469\u200d\U0001F467\nnext"):
+            self.run_stdin_calls.clear()
+            self.run_ok_calls.clear()
+            sm.send_input(sess["id"], text)
+            self.assertEqual([d for _c, d in self.run_stdin_calls], [text])
+            self.assertIn("-p", self.run_ok_calls[0])
+
+    def test_typed_tabs_become_spaces(self):
+        # A typed TAB is Claude Code's autocomplete key (a leading one was
+        # dropped); a pasted one renders as four spaces, so type that instead.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.send_input(sess["id"], "\tindented\ta")
+        self.assertEqual(self.run_stdin_calls[0][1], "    indented    a")
+
+    def test_a_slice_never_starts_on_a_combining_mark(self):
+        n = ha.PASTE_CHUNK_CHARS
+        text = "a" * (n - 1) + "e\u0301" + "b" * 10
+        slices = ha._input_slices(text)
+        self.assertEqual("".join(slices), text)
+        self.assertFalse(any(unicodedata.combining(sl[0]) for sl in slices))
+
+    def test_two_writers_never_interleave_on_one_pane(self):
+        # The input worker and the beat (resend, qwen peer) can type into the
+        # same pane at once; each message's slices must land together.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        n = ha.PASTE_CHUNK_CHARS
+        real = self.pane_io.append
+        def slow_stdin(cmd, data, timeout=None):
+            self.run_stdin_calls.append((cmd, data))
+            real(data)
+            time.sleep(0.002)
+            return True
+        msgs = ["A" * (n * 3), "B" * (n * 3)]
+        with mock.patch.object(ha, "run_stdin", side_effect=slow_stdin), \
+                mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
+            ts = [threading.Thread(target=ha._type_into_pane, args=("agent-abcde", m))
+                  for m in msgs]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        self.assertEqual(sorted(self._typed()), msgs)
+
+    def _typed(self):
+        out, cur = [], []
+        for item in self.pane_io:
+            if item is None:
+                if cur:
+                    out.append("".join(cur))
+                cur = []
+            else:
+                cur.append(item)
+        return out
 
     def test_a_paste_failing_midway_types_only_the_rest(self):
         # Slices already in the composer must not be typed a second time by the
@@ -12477,13 +12542,13 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
     def test_control_bytes_are_stripped(self):
         # A control byte would be read as a KEYSTROKE (an ESC starts a key
         # sequence) — and the text isn't always the operator's own (a PR review
-        # comment is typed in the same way). Tab and newline are content and
-        # survive.
+        # comment is typed in the same way). Tab (typed as spaces) and newline
+        # are content and survive.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "safe\x1b[201~rm -rf /\x00\x07 end\tkept\nkept")
         self.assertEqual(self.run_stdin_calls[0][1],
-                         "safe[201~rm -rf / end\tkept\nkept")
+                         "safe[201~rm -rf / end    kept\nkept")
 
     def test_falls_back_to_send_keys_when_the_paste_fails(self):
         # A tmux too old for load-buffer/paste-buffer must still deliver a short

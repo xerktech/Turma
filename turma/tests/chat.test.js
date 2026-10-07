@@ -2901,6 +2901,9 @@ test("buildItems: Claude Code's framing tags never reach a user bubble", () => {
     { id: "mx", role: "user", blocks: [{ t: "text",
       text: 'look at this\n\n<pasted_content id="ab">\nlog <tail>\n</pasted_content id="ab">' }] },
     { id: "lt", role: "user", blocks: [{ t: "text", text: "keep <b> and a <system-reminder> mid-line" }] },
+    { id: "cr", role: "user", blocks: [{ t: "text",
+      text: '<pasted_content id="c">\r\nwindows\r\n</pasted_content id="c">' }] },
+    { id: "em", role: "user", blocks: [{ t: "text", text: "<system-reminder>\n</system-reminder>" }] },
   ];
   const items = buildItems(entries);
   const byId = Object.fromEntries(items.map((i) => [i.id, i]));
@@ -2912,4 +2915,7 @@ test("buildItems: Claude Code's framing tags never reach a user bubble", () => {
   assert.equal(byId.mx.text, "look at this\n\nlog <tail>");
   // Only a tag on a line of its own is framing; inline text is left alone.
   assert.equal(byId.lt.text, "keep <b> and a <system-reminder> mid-line");
+  assert.equal(byId.cr.text, "windows");
+  // A turn that was only tags leaves no empty bubble.
+  assert.equal(byId.em, undefined);
 });

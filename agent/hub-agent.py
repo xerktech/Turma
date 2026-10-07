@@ -14427,11 +14427,39 @@ INPUT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 SENDKEYS_MAX_CHARS = 4000
 # Claude Code reads one input burst longer than ~800 chars as a PASTE and wraps
 # the turn in `<pasted_content>` tags (measured on 2.1.292: 800 typed, 900 tagged),
-# so the paste path delivers in slices well under that, with a short gap so two
-# slices don't coalesce into one read. Delivery runs on the input worker, never
-# the beat, so the gap's cost (~2.5s per 100k chars) is off the beat budget.
+# so a message is typed in slices well under that, with a short gap so two slices
+# don't coalesce into one read.
 PASTE_CHUNK_CHARS = 400
 PASTE_CHUNK_GAP_SEC = 0.01
+# Slicing is for ordinary chat-sized text only; anything longer goes as ONE
+# bracketed paste, as before (tagged in the transcript; chat.js hides the tags).
+# Two reasons, both measured: a sliced message costs ~2 tmux calls per slice and
+# _type_into_pane also runs ON THE BEAT (the compaction resend, qwen peer
+# delivery), so the cap bounds that at ~10 slices; and past ~10K chars of dense
+# emoji, sliced input stops submitting and arrives corrupted.
+PASTE_SLICED_MAX_CHARS = 4000
+# Text Claude Code mishandles when it is TYPED rather than pasted: astral chars
+# (emoji, flags), zero-width joiners, variation selectors and the keycap mark.
+# Sliced emoji were tagged anyway and ZWJ runs corrupted, so these go bracketed.
+_SLICE_UNSAFE_RE = re.compile("[\U00010000-\U0010FFFF\u200d\ufe0e\ufe0f\u20e3]")
+# One writer per pane at a time: the input worker and the beat (resend, qwen
+# peer) can type into the same pane, and slices from two messages must never
+# interleave. They share one tmux buffer name too.
+_PANE_TYPE_LOCKS = {}
+_PANE_TYPE_LOCKS_GUARD = threading.Lock()
+
+
+def _input_slices(text):
+    """Cut `text` into PASTE_CHUNK_CHARS slices, never starting a slice on a
+    combining mark (it would be typed detached from its base character)."""
+    out, i = [], 0
+    while i < len(text):
+        j = min(i + PASTE_CHUNK_CHARS, len(text))
+        while i + 1 < j < len(text) and unicodedata.combining(text[j]):
+            j -= 1
+        out.append(text[i:j])
+        i = j
+    return out or [""]
 
 
 def _clean_input_text(text):
@@ -14564,16 +14592,17 @@ def _type_into_pane(tmux_name, text):
     they sent whole must never arrive with its end quietly missing. Returns True
     when the text was pasted.
 
-    No message is ever BRACKETED (`-p`). Bracketing is how an application
-    recognises a paste, and Claude Code records the whole turn as
-    `<pasted_content id=...>...</pasted_content id=...>` -- shown literally in
-    the chat, and handed to the model as pasted DATA rather than as the
-    operator's own words. Instead each chunk is pasted RAW with `-r`, so a
-    newline arrives as LF (Ctrl+J), which Claude Code's composer reads as a line
-    break rather than a submit; only the Enter at the end submits. Claude Code
-    also treats one input burst past ~800 chars as a paste and tags it the same
-    way, so the text goes in PASTE_CHUNK_CHARS slices, PASTE_CHUNK_GAP_SEC apart.
-    The BUFFER is still used for every slice (XERK-227's argv limit, unrelated).
+    A chat-sized message is not BRACKETED (`-p`). Bracketing is how an
+    application recognises a paste, and Claude Code records the whole turn as
+    `<pasted_content id=...>...</pasted_content id=...>` -- handed to the model
+    as pasted DATA rather than as the operator's own words. So text up to
+    PASTE_SLICED_MAX_CHARS with nothing in _SLICE_UNSAFE_RE is TYPED: pasted RAW
+    with `-r`, so a newline arrives as LF (Ctrl+J), which Claude Code's composer
+    reads as a line break rather than a submit, in PASTE_CHUNK_CHARS slices (one
+    burst past ~800 chars is read as a paste too). A tab becomes four spaces, as
+    Claude Code renders a pasted one: a typed tab is autocomplete. Longer or
+    emoji-bearing text keeps the single bracketed paste (see the constants).
+    The BUFFER carries every paste (XERK-227's argv limit, unrelated).
 
     On Windows the pty-host stands in for tmux (XERK-697): `_pty_inject` delivers
     the text as a bracketed paste over the control channel, the direct analog of
@@ -14584,9 +14613,25 @@ def _type_into_pane(tmux_name, text):
         return _pty_inject(tmux_name, text)
     if not tmux_name:
         return False
+    with _PANE_TYPE_LOCKS_GUARD:
+        lock = _PANE_TYPE_LOCKS.setdefault(tmux_name, threading.Lock())
+    with lock:
+        return _type_into_tmux_pane(tmux_name, text)
+
+
+def _type_into_tmux_pane(tmux_name, text):
+    """_type_into_pane's tmux half, run under that pane's lock."""
     buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
-    slices = [text[i:i + PASTE_CHUNK_CHARS]
-              for i in range(0, len(text), PASTE_CHUNK_CHARS)] or [""]
+    sliced = len(text) <= PASTE_SLICED_MAX_CHARS and not _SLICE_UNSAFE_RE.search(text)
+    if sliced:
+        text = text.replace("\t", "    ")
+        slices = _input_slices(text)
+        # -r keeps LF as LF (tmux would otherwise turn it into CR, a submit).
+        flags = ["-d", "-r"]
+    else:
+        slices = [text]
+        # Bracket a multi-line one so it stays ONE message, not a turn per line.
+        flags = ["-d", "-p"] if "\n" in text else ["-d"]
     sent = 0
     pasted = True
     for n, piece in enumerate(slices):
@@ -14597,9 +14642,8 @@ def _type_into_pane(tmux_name, text):
             pasted = False
             break
         # -d drops the buffer once pasted, so a message never sits in tmux's
-        # paste history; -r keeps LF as LF (tmux would otherwise turn it into
-        # CR, which submits). No -p: see the docstring.
-        rc, _err = run_ok(_tmux("paste-buffer", "-d", "-r", "-b", buf,
+        # paste history waiting to be re-pasted by hand.
+        rc, _err = run_ok(_tmux("paste-buffer", *flags, "-b", buf,
                                 "-t", _tmux_pane(tmux_name), name=tmux_name),
                           timeout=15)
         if rc != 0:
