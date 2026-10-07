@@ -4359,10 +4359,17 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
         words = _strip_prefixes(_tokenize(seg))
         if not words:
             continue
-        if _bash_dequoted(_decode_ansi_c(words[0])) == "eval":
+        prog = _bash_dequoted(_decode_ansi_c(words[0]))
+        if prog == "eval":
             scripts = [" ".join(words[2:] if words[1:2] == ["--"] else words[1:])]
+        elif prog == "trap":
+            # The action string runs on the trap (`trap '…' EXIT`).
+            scripts = words[2:3] if words[1:2] == ["--"] else words[1:2]
         else:
             scripts = _raw_shell_c_scripts(words)
+            # A shell's here-string is its script (`bash <<< '…'`).
+            if _basename(words[0]) in _SHELL_PROGS or prog in (".", "source"):
+                scripts += _herestrings(seg)
         for script in scripts:
             for reading in _script_readings(script):
                 cuts += _printed_unsplit(reading)

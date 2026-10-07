@@ -3063,6 +3063,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "cat <<E\n$(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')\nE",
         "f(){ bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'; }; f",
         "find . -exec sh -c true \\; -exec sh -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc' \\;",
+        "trap 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc' EXIT",
+        "bash <<< 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
@@ -3098,6 +3100,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "eval X=1 ls",
         "f(){ bash -c 'eval $(opam env) make'; }; f",
         ": $(bash -c 'X=$(date) ls')",
+        "trap 'rm -f \"$tmp\"' EXIT",
+        "bash <<< 'eval $(opam env) make'",
     ]
 
     def test_shell_wrapped_destructive_blocked(self):

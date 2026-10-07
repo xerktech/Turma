@@ -55,6 +55,8 @@ paths:
     (`: $(bash -c 'eval $(…) rm …')`). Read the raw line BEFORE `_expand` rebinds `command`.
   - A segment's leading `f(){`/`function f {`/`{`/`(` is dropped first (`_RAW_SEG_OPENER_RE`):
     `_tokenize` keeps `f(){` as one word. Every `-exec` script counts, not the first.
+  - Its scripts: an eval join, every `-c` script, a `trap` action, and a shell's or `.`'s
+    here-string. A here-string fed to anything else is data (`grep x <<< …`).
   - Accepted over-deny, as base already does for `$(echo 'X=1 Y=2') rm …`: printed text at
     command start is read as re-parsed (`$(echo 'X=${v:-a b}') rm …` runs no `rm`).
 - `eval` counts as a wrapper for the cut, any spelling bash dequotes to it (`\eval`, `ev''al`,
