@@ -1245,13 +1245,22 @@ class TestParserGaps(unittest.TestCase):
                     "for i in 1 2 3 4; do z=$a; a=$m; m=$n; n=$z; n=/etc; done; rm -rf $z",
                     "for i in 1 2; do for j in 1 2; do z=$a; a=/etc; done; done; rm -rf $z",
                     "a=ev; b=$a; a=${b}al; $a 'rm -rf /etc'",
-                    "f(){ x=$y; }; y=/etc; f; rm -rf $x"):
+                    "f(){ x=$y; }; y=/etc; f; rm -rf $x",
+                    # QA: `done` as an argument is no keyword; a value naming
+                    # itself is read again with its name as it entered the loop.
+                    "for i in 1 2; do z=$a$c; echo done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$a$c; x=done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$z$a$c; a='rm -rf /etc'; done; c=x; $z"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         for cmd in ("c=$p/; p=1; rm -rf $c/x",
                     's=; for f in a b c d e f g h; do s="$s $f"; done; echo $s',
                     "while read l; do prev=$cur; cur=$l; done < f; rm -rf /tmp/w/$prev",
-                    "for i in 1 2 3; do echo 'done'; x=$y; y=/tmp; done; rm -rf $x/z"):
+                    "for i in 1 2 3; do echo 'done'; x=$y; y=/tmp; done; rm -rf $x/z",
+                    # QA: a long `for` list is data, never counted per value;
+                    # a value read on past its statement stays order-blind.
+                    "for f in " + " ".join(f"f{i}" for i in range(30)) + "; do b=$a; a=$f; done; echo $b",
+                    "for m in 'a|b' 'c|d'; do n=${m%%|*}; r=${m#*|}\npython3 - $r $n <<'E'\nprint(1)\nE\ndone"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
