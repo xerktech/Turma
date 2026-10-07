@@ -70,6 +70,7 @@ import os
 import posixpath
 import re
 import shlex
+import string
 import stat
 import sys
 import threading
@@ -701,6 +702,22 @@ def _decoy_readings(raw: str) -> list[str]:
 _QUOTE_STATE_CHARS = frozenset("#\\$}`'\"()")
 
 
+def _ansi_c_dollar(command: str, i: int) -> bool:
+    """Whether the `$` at ``i`` (before a `'`) opens an ANSI-C string: not the
+    second half of a `$$` (the PID, then a plain `'…'`). bash pairs a `$` run
+    left to right, after an escaped first `$` (XERK-1693 QA: `$$'a\\'; rm …`)."""
+    j = i
+    while j > 0 and command[j - 1] == "$":
+        j -= 1
+    run = i - j + 1
+    k = j
+    while k > 0 and command[k - 1] == "\\":
+        k -= 1
+    if (j - k) % 2:
+        run -= 1  # `\$` is a literal dollar
+    return run % 2 == 1
+
+
 def _quote_states(command: str) -> list[str]:
     """How each character of ``command`` is quoted: `'` inside a single-quoted
     literal, `"` inside a double-quoted string, `\\` escaped, "" bare.
@@ -777,6 +794,17 @@ def _quote_states(command: str) -> list[str]:
                 out[i + 1:j] = _quote_states(command[i + 1:j])
                 i = j + 1
                 continue
+        if command.startswith("$'", i) and top in ("", "(", "{") and _ansi_c_dollar(command, i):
+            # An ANSI-C string: `\` escapes the next character, so the `\'`
+            # in `$'it\'s'` is text, not its close. Read as a plain `'…'`, its
+            # `s'` opened a quote that hid every later `$'…'` (XERK-1693 QA).
+            j = i + 2
+            while j < n and command[j] != "'":
+                j += 2 if command[j] == "\\" else 1
+            end = min(j, n - 1)
+            out[i + 1:end + 1] = ["'"] * (end - i)
+            i = end + 1
+            continue
         if top == '"':
             out[i] = '"'
             if ch == '"':
@@ -2352,15 +2380,83 @@ def _replace_op(value: str, op: str, pat: str, rep: str) -> str:
 def _decode_ansi_c(command: str) -> str:
     """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token."""
 
-    def rep(m: "re.Match[str]") -> str:
+    out, pos, states = [], 0, None
+    while (m := _ANSI_C_RE.search(command, pos)) is not None:
+        start = m.start() + len(m.group(1))  # the `$`
         if len(m.group(1)) % 2:
-            return m.group(0)
-        try:
-            return m.group(1) + shlex.quote(m.group(2).encode().decode("unicode_escape"))
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            return m.group(0)
+            out.append(command[pos:start + 2])
+            pos = start + 2
+            continue
+        # Inside `"…"`, `'…'` or a `#` comment a `$'` is literal to bash:
+        # decoded there, a `$'\x27'` became quote characters that unbalanced
+        # the line, and a comment's `$'\nx'` ended the comment and opened a
+        # quote over the next line (XERK-1693 QA). Always asked: a shortcut
+        # on the line holding a quote skipped the comment case. Step past
+        # its `$'` only: the match may run over a real `$'…'` after it.
+        if states is None:
+            states = _quote_states(command)
+        if states[start] or not _ansi_c_dollar(command, start):
+            out.append(command[pos:start + 2])
+            pos = start + 2
+            continue
+        out += (command[pos:start], shlex.quote(_ansi_c_text(m.group(2))))
+        pos = m.end()
+    out.append(command[pos:])
+    return "".join(out)
 
-    return _ANSI_C_RE.sub(rep, command)
+
+# bash's `$'…'` single-character escapes.
+_ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
+                  "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+# `\xHH`, `\uHHHH`, `\UHHHHHHHH`: how many hex digits each takes at most.
+_ANSI_C_HEX = {"x": 2, "u": 4, "U": 8}
+
+
+def _ansi_c_text(body: str) -> str:
+    """The text bash makes of a `$'…'` body, by bash's rules, never failing.
+
+    Python's `unicode_escape` raised on escapes bash accepts (a bare `\\x`,
+    `\\x4`, `\\u41`), and the string was then left undecoded, so one such
+    escape hid the whole script: `bash -c $'rm -rf /etc; : \\x'` (XERK-1693).
+    An unknown escape keeps its backslash; a NUL ends the string, as in bash."""
+    out, i, n = [], 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        esc = body[i + 1]
+        i += 2
+        if esc in _ANSI_C_SIMPLE:
+            out.append(_ANSI_C_SIMPLE[esc])
+        elif esc in "01234567":
+            j = i
+            while j < n and j < i + 2 and body[j] in "01234567":
+                j += 1
+            out.append(chr(int(esc + body[i:j], 8) & 0xFF))
+            i = j
+        elif esc in _ANSI_C_HEX:
+            j = i
+            while j < n and j < i + _ANSI_C_HEX[esc] and body[j] in string.hexdigits:
+                j += 1
+            if j == i:
+                out.append("\\" + esc)
+            else:
+                code = int(body[i:j], 16)
+                out.append(chr(code) if code <= 0x10FFFF else "\ufffd")
+            i = j
+        elif esc == "c" and i < n:
+            # `\cX` is control-X; `\c\\` takes the escaped backslash. bash
+            # takes X's first UTF-8 byte and keeps its others (`\cé` = 03 a9).
+            x = body[i]
+            i += 2 if x == "\\" and body[i + 1:i + 2] == "\\" else 1
+            lead, *rest = x.encode("utf-8", "surrogatepass")
+            out.append("\x7f" if x == "?" else chr(lead & 0x1F) + bytes(rest).decode("latin-1"))
+        else:
+            out.append("\\" + esc)
+    text = "".join(out)
+    return text.split("\0", 1)[0]
 
 
 def _brace_sequence(body: str) -> list[str] | None:

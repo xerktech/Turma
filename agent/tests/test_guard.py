@@ -1866,6 +1866,42 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(value=v, op=op, pat=pat):
                 self.assertEqual(guard._apply_var_op(v, op, pat), exp)
 
+    def test_ansi_c_strings_decode_as_bash_does(self):
+        """XERK-1693: `$'…'` is decoded by bash's rules, never given up on: a
+        `\\x` Python's decoder rejected left the whole script unread."""
+        bodies = ["\\x", "\\x4", "\\x41", "\\x414", "\\xg", "\\u41", "\\u0041x", "\\U0000003b",
+                  "\\101", "\\0101", "\\1", "\\8", "\\q", "\\cA", "\\c?", "\\c\\\\x", "\\cé", "\\cŀx", "\\e[0m",
+                  "\\'", '\\"', "\\?", "a\\tb\\nc", "\\\\", "\\z\\y", "x\\0y", "\\x00z"]
+        # A bash string holds no NUL (one ends it), so `\1\2` fences each case.
+        # Bytes compare as latin-1: `\cé` is the bytes 03 a9, as the guard reads it.
+        # (A `\u` past ASCII is locale-dependent in bash; the guard reads the character.)
+        script = "".join(f"printf '%s\\1\\2' $'{b}'\n" for b in bodies)
+        out = subprocess.run(["bash", "-c", script], capture_output=True, check=True,
+                             env={**os.environ, "LC_ALL": "C.UTF-8"}).stdout.decode("latin-1")
+        want = out.split("\1\2")[:-1]
+        self.assertEqual(len(want), len(bodies))
+        for body, exp in zip(bodies, want):
+            with self.subTest(body=body):
+                self.assertEqual(guard._ansi_c_text(body), exp)
+        # A `$'` inside quotes is literal: decoded, `\x27` unbalanced the line.
+        self.assertEqual(guard._decode_ansi_c("echo \"$'\\x27'\" 'x$'\\' $'\\x41'"),
+                         "echo \"$'\\x27'\" 'x$'\\' A")
+        # `$$'a'` is the PID then a plain `'a'`; an odd `$` run or `\$$'` is ANSI-C.
+        self.assertEqual(guard._decode_ansi_c("echo $$'a' \\$$'\\x41' $$$'\\x41'"),
+                         "echo $$'a' \\$A $$A")
+        for cmd in ("bash -c $'rm -rf /etc; : \\x'", "bash -c $'rm -rf /etc; : \\u41'",
+                    "bash -c $'rm -rf /etc; : \\x4'", "echo \"$'\\x27'\"; rm -rf /etc",
+                    "bash -c \"echo $'\\x27'; rm -rf /etc\"", "eval \"echo $'\\''\"; rm -rf /etc\"",
+                    "echo 'x$'\\' $'\\x41'; rm -rf /etc", ": # $'\\nx'\nrm -rf /etc",
+                    "echo $'it\\'s'; bash -c $'rm -rf /etc'",
+                    "echo $'it\\'s'; bash -c $'\\x72m -rf /etc'",
+                    "echo \"$'\\x27'\"; echo $'it\\'s'; bash -c $'rm -rf /etc'",
+                    "echo $$'a\\'; rm -rf /etc #'", ": $$'\\'; rm -rf /etc #'",
+                    "echo $$'a\\'; bash -c $'rm -rf /etc'",
+                    "bash -c ': # $'\"'\"'\\nx'\"'\"'\nrm -rf /etc'"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("recursive delete", guard.is_destructive(cmd) or "")
+
     def test_a_function_call_and_set_bind_the_positionals(self):
         """XERK-1626: a function's `$1`… are its call's words, a `set --` sets
         the line's; each ran its payload as nobody, reaching rm as `/etc`."""
