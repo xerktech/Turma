@@ -3130,6 +3130,19 @@ class TestWrapperUnwrapping(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
 
+    def test_printed_assignment_walk_memo_is_per_owner_and_linear(self):
+        """XERK-1645 QA: the walk memoises each heredoc owner; a memo keyed
+        wrong reused a non-shell owner's answer for a shell-fed one, and none
+        at all made a 250-heredoc line quadratic, past the deadline."""
+        body = "bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'"
+        cmd = f"bash <<'O'\ncat <<'A' >/dev/null\nx\nA\ncat <<'B' | bash\n{body}\nB\nO"
+        self.assertIsNotNone(guard.is_destructive(cmd))
+        many = "x=$(date); " + "; ".join(f"cat <<'E{i}' >/dev/null" for i in range(250)) \
+            + "\n" + "".join(f"b\nE{i}\n" for i in range(250))
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": many}, cwd="/tmp")[0], "allow")
+        self.assertLess(time.monotonic() - t, 10)
+
     def test_wrapped_safe_still_allowed(self):
         for cmd in self.WRAPPED_SAFE:
             with self.subTest(cmd=cmd):
