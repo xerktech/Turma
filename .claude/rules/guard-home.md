@@ -25,7 +25,8 @@ paths:
   - A new reading flag joins `_memo`'s key and `_reading()`, or the memo replays the old pass.
   - The pass doubles the line's cost, so it runs only when the first pass found a command
     whose target it can change (`_HOME_TARGET_PROGS`); a default in heredoc data doubled a
-    4.7 KB command past the deadline (QA).
+    4.7 KB command past the deadline (QA). A line holding both a target command and a
+    default still pays twice; it fails closed (rollup, XERK-1584).
 - An op sees HOME as written (`${HOME%root/}etc` is /etc when HOME=/root/); only the
   map-back normalises it.
 - Only person homes map back (session HOME, /root, /home/*, /Users/*): `~bin/x` is /bin/x.

@@ -3540,7 +3540,9 @@ _MAIN_PARSE_SEEN = [False]
 # can unset it, so the default spliced is kept as a reading of its own.
 _HOME_KEPT = [False]
 _HOME_DEFAULT_RE = re.compile(r"\$\{HOME:?[-=]")
-_HOME_TARGET_PROGS = {"rm", "unlink", "chmod", "chown", "chgrp", "find", "cd", "pushd"}
+# `cd` and `find` are left out: a `cd` matters only to a later target, whose
+# command is listed, and a `find -delete` is read as an `rm -r` entry.
+_HOME_TARGET_PROGS = {"rm", "unlink", "chmod", "chown", "chgrp"}
 # Past this many `${…}` nested in one another, a line is too large to read.
 _MAX_NESTED_VARS = 200
 # Past this many assignments to one name, a line is too large to read.

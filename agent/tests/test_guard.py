@@ -3970,6 +3970,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                         # HOME can be unset, so its default is a reading too.
                         'unset HOME; rm -rf "${HOME:-/}"etc', "env -i bash -c 'rm -rf \"${HOME:-/}\"etc'",
                         'read HOME </dev/null; rm -rf "${HOME:-/}"etc',
+                        # Each command a kept default can reach (`_HOME_TARGET_PROGS`).
+                        'chown -R nobody "${HOME:-/tmp}"', 'chgrp -R nobody "${HOME:-/tmp}"',
+                        'chmod -R 000 "${HOME:-/tmp}"/', 'unlink "${HOME:-/tmp}"/.ssh',
+                        'find "${HOME:-/tmp}" -delete', 'cd "${HOME:-/tmp}"/..; rm -rf *',
                         "f(){ local HOME; ${HOME:-rm} -rf /; }; f"):
                 with self.subTest(cmd=cmd):
                     self.assertIsNotNone(guard.is_destructive(cmd))
