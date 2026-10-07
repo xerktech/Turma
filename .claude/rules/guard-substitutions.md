@@ -262,10 +262,13 @@ paths:
     scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
   - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
-- **A lone `\` ending a segment is read both ways** (XERK-1646, `_trailing_escape_readings`):
+- **A lone `\` ending a text is read both ways** (XERK-1646, `_trailing_escape_readings`):
   shlex raises on it, and the whitespace split it falls back to kept a `-c`/`eval` script's
-  quotes, so `bash -c 'rm …'\` was never re-read. ADDED segments: escaped (bash keeps a
-  literal `\`) and dropped (zsh: `git push origin main\` pushes main).
+  quotes, so `bash -c 'rm …'\` was never re-read. ADDED whole-line readings at `_expand`'s
+  entry: escaped (bash keeps a literal `\`) and dropped (zsh: `git push origin main\` pushes
+  main; bash's here-string hands its reader `text\` + newline, a continuation).
+  - Whole-line, never per segment: the pipe, here-string and `<(…)` feeds read the raw line
+    and missed per-segment readings (QA). A lone `\` can only end the line or a body.
   - Never swap the fallback out: `_expand_braces` joins `{/etc,/var}\` into `/etc\ /var\`,
     which shlex alone reads as ONE word — the split reading is what denies it (QA).
 - **A `${…}` inside `"…"` is a quoting frame of its own** (XERK-1621, `_quote_states`'s `{"`):

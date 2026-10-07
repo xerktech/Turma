@@ -4094,6 +4094,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "git push origin main\\", "bash -c 'git push origin main'\\",
                     "eval 'reboot'\\", "bash -c 'find / -delete'\\",
                     "rm -rf {/etc,/var}\\", "rm -rf /{etc,var}\\", "rm -rf {/,x}\\",
+                    # ...on the routes that feed a shell its stdin too.
+                    "bash <<< 'rm -rf /etc'\\", "echo 'rm -rf /etc' | sh\\",
+                    "bash <(echo 'rm -rf /etc')\\", "cat <(echo 'rm -rf /etc') | sh\\",
+                    "source <(echo 'rm -rf /etc')\\", "# don't\nbash -c 'rm -rf /etc'\\",
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',

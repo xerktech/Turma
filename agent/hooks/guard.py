@@ -4575,23 +4575,24 @@ def _glue_func_parens(segment: str) -> str:
     return "".join(out)
 
 
-def _trailing_escape_readings(segment: str) -> tuple[str, ...]:
-    """bash's and zsh's readings of ``segment`` when it ends in a lone `\\`
+def _trailing_escape_readings(text: str) -> tuple[str, ...]:
+    """bash's and zsh's readings of ``text`` when it ends in a lone `\\`
     that shlex cannot read: kept as a literal (bash, dash), or dropped (zsh).
-    Empty when shlex reads the segment as it is (XERK-1646)."""
-    if not segment.endswith("\\"):
+    Empty when shlex reads the text as it is (XERK-1646). Neither reading
+    ends in a lone `\\` again, so a caller re-expanding them stops."""
+    if not text.endswith("\\"):
         return ()
     try:
-        shlex.split(segment, posix=True)
+        shlex.split(text, comments=True, posix=True)
         return ()
     except ValueError:
         pass
     try:
-        shlex.split(segment + "\\", posix=True)
+        shlex.split(text + "\\", comments=True, posix=True)
     except ValueError:
         # Not the trailing escape (an open quote): nothing to add.
         return ()
-    return (segment + "\\", segment[:-1])
+    return (text + "\\", text[:-1])
 
 
 @functools.lru_cache(maxsize=512)
@@ -6805,6 +6806,17 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # in: a re-parse can join what the brace split — `eval "\$x$(echo y) rm …"`
     # runs `$xy rm …`, its substitution already run a level up — so the text
     # is also read unbraced, with no bracing beneath (XERK-1615 QA).
+    # A lone `\` ending the text makes shlex raise, and the whitespace split it
+    # falls back to keeps a `-c`/`eval` script's quotes, so the script was
+    # never re-read (XERK-1646). bash keeps that `\` as a literal, zsh drops
+    # it (and bash feeds a here-string's `text\` to its reader as a line
+    # continuation): both are ADDED whole-line readings, so the pipe,
+    # here-string and `<(…)` routes see them too. The text's own reading
+    # stays: the brace pass joins `{/etc,/var}\` into `/etc\ /var\`, which
+    # shlex alone reads as one harmless word, and only the split denies it.
+    for reading in _trailing_escape_readings(command):
+        _spend(len(reading))
+        out.extend(_expand(reading, depth, cwds))
     braced = _brace_glued_names(command)
     if braced != command:
         _spend(len(command))
@@ -6994,17 +7006,6 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if seg not in seen:
                     seen.add(seg)
                     segments.append(seg)
-    # A lone `\` ending a segment makes shlex raise, and the whitespace split
-    # it falls back to keeps a `-c`/`eval` script's quotes, so the script was
-    # never re-read (XERK-1646). bash keeps that `\` as a literal, zsh drops
-    # it: both readings are ADDED. The fallback's own reading stays, since the
-    # brace expansion before it joins `{/etc,/var}\` into `/etc\ /var\`, which
-    # shlex alone reads as one harmless word.
-    for seg in list(segments):
-        for reading in _trailing_escape_readings(seg):
-            if reading not in seen:
-                seen.add(reading)
-                segments.append(reading)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
