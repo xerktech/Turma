@@ -1883,8 +1883,12 @@ class TestScriptChannels(unittest.TestCase):
         for body, exp in zip(bodies, want):
             with self.subTest(body=body):
                 self.assertEqual(guard._ansi_c_text(body), exp)
+        # A `$'` inside quotes is literal: decoded, `\x27` unbalanced the line.
+        self.assertEqual(guard._decode_ansi_c("echo \"$'\\x27'\" 'x$'\\' $'\\x41'"),
+                         "echo \"$'\\x27'\" 'x$'\\' A")
         for cmd in ("bash -c $'rm -rf /etc; : \\x'", "bash -c $'rm -rf /etc; : \\u41'",
-                    "bash -c $'rm -rf /etc; : \\x4'"):
+                    "bash -c $'rm -rf /etc; : \\x4'", "echo \"$'\\x27'\"; rm -rf /etc",
+                    "bash -c \"echo $'\\x27'; rm -rf /etc\"", "eval \"echo $'\\''\"; rm -rf /etc\""):
             with self.subTest(cmd=cmd):
                 self.assertIn("recursive delete", guard.is_destructive(cmd) or "")
 

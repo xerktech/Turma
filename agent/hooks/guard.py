@@ -2353,12 +2353,28 @@ def _replace_op(value: str, op: str, pat: str, rep: str) -> str:
 def _decode_ansi_c(command: str) -> str:
     """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token."""
 
-    def rep(m: "re.Match[str]") -> str:
+    out, pos, states = [], 0, None
+    while (m := _ANSI_C_RE.search(command, pos)) is not None:
+        start = m.start() + len(m.group(1))  # the `$`
         if len(m.group(1)) % 2:
-            return m.group(0)
-        return m.group(1) + shlex.quote(_ansi_c_text(m.group(2)))
-
-    return _ANSI_C_RE.sub(rep, command)
+            out.append(command[pos:start + 2])
+            pos = start + 2
+            continue
+        # Inside `"…"` or `'…'` a `$'` is literal to bash: decoded there, a
+        # `$'\x27'` became quote characters that unbalanced the line and hid
+        # the rest of it (`echo "$'\x27'"; rm -rf /etc`, XERK-1693 QA). Step
+        # past its `$'` only: the match may run over a real `$'…'` after it.
+        if '"' in command or "'" in command[:start]:
+            if states is None:
+                states = _quote_states(command)
+            if states[start]:
+                out.append(command[pos:start + 2])
+                pos = start + 2
+                continue
+        out += (command[pos:start], shlex.quote(_ansi_c_text(m.group(2))))
+        pos = m.end()
+    out.append(command[pos:])
+    return "".join(out)
 
 
 # bash's `$'…'` single-character escapes.
