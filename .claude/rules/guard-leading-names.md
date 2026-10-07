@@ -33,11 +33,23 @@ paths:
   - in the last component, only a trailing run glued to text: `$x/etc$y` → `/etc`.
   - Kept: the rest of the last component. Reading it empty denied the everyday
     `"$dir/$f"`, `"$TMP/$x"` (→ `/`) and `"$dir/$name.$ext"` (→ `/.`); so `$x/$y` stays allowed.
+  - That kept rest is for GNU `rm` only, whose preserve-root refuses `/` (XERK-1687). Every
+    other tree-walker reads it empty too (`keep_last=False`): `chmod`/`chown`/`chgrp -R`,
+    `rm --no-preserve-root`, `busybox rm` (no preserve-root), `find -delete` (emitted as
+    `rm -r --no-preserve-root`), and a `find -exec`'s `{}` (each root's empty reading is
+    added to the roots, since find walks `/` child by child).
+  - Same for a `find` feeding `xargs`: its roots' empty readings join `piped_operands`.
+  - `busybox` is a `_PREFIX_WORDS` wrapper (its `rm` gets `--no-preserve-root`): every
+    pipe/stdin/xargs reader sees the applet. Its shells `hush`/`msh` are in `_SHELL_PROGS`.
+  - The strip lost busybox ITSELF as a `-c` shell (`busybox script -qc '…'`), so `_expand`
+    adds a reading of the words from `busybox` on with it as `sh`. Keep both: an applet-only
+    added reading (no strip) lost the pipe readers; the strip alone lost `-c` (3 QA passes).
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top
   would read `"$TMP/$x"` as `/`.
 - Cost, measured: 0 new denies over a 36.7k-command real corpus replay vs main (XERK-1652).
 - Tests: `test_an_unset_name_leading_a_target_is_read_empty`,
+  `test_a_last_component_of_names_is_read_empty_without_preserve_root`,
   `test_every_unset_name_component_is_read_empty`,
   `test_leading_names_are_one_run_and_scan_linearly`.

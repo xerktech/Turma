@@ -4525,6 +4525,35 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             guard._unset_names_dropped(word)
             self.assertLess(time.monotonic() - start, 2)
 
+    def test_a_last_component_of_names_is_read_empty_without_preserve_root(self):
+        # XERK-1687: GNU rm refuses `/`, so `rm -rf "$x/$y"` keeps its last
+        # component's names; nothing else that walks a tree refuses it.
+        for cmd in ('chmod -R 777 "$x/$y"', 'chown -R nobody "$x/$y"', 'chgrp -R x "$TMP/$y"',
+                    'find "$x/$y" -delete', "find $x/$y -exec rm -rf {} +",
+                    'find "$x/$y" -exec sh -c "rm -rf {}" \\;', 'find "$dir/$name.$ext" -delete',
+                    'rm -rf --no-preserve-root "$x/$y"', 'busybox rm -rf "$x/$y"',
+                    "busybox rm -rf /etc", "busybox chmod -R 777 /", "busybox find / -delete",
+                    "cd /; busybox rm -rf *", 'find "$x/$y" | xargs rm -rf',
+                    'find "$x/$y" -print0 | xargs -0 rm -rf',
+                    # `busybox` is stripped, so its shells must still be shells (QA).
+                    "busybox hush -c 'rm -rf /'", "busybox msh -c 'rm -rf /etc'",
+                    "busybox hush <<'E'\nrm -rf /etc\nE",
+                    # ...and busybox itself stays one to `-c` (QA).
+                    "busybox script -qc 'rm -rf /etc' /dev/null", "busybox -- rm -rf /etc",
+                    # ...and a pipe still reaches the applet (QA).
+                    "echo 'rm -rf /etc' | busybox env sh", "echo /etc | busybox xargs rm -rf",
+                    "echo 'rm -rf /etc' | busybox xargs -0 busybox hush -c",
+                    'busybox find "$x/$y" | xargs rm -rf'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
+                    'find "$dir/$f" -exec grep -l x {} +', 'chmod -R 755 "$dir"/build',
+                    'find "$d"/out -delete', 'busybox rm -rf "$dir"/build', "busybox ls /",
+                    'find "$dir"/out -name "*.o" | xargs rm -f', "busybox tar -czf x.tgz dir",
+                    "echo hi | busybox hush"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
     def test_a_target_built_from_home_is_read_with_the_real_home(self):
         # XERK-1656: `$HOME`, `~` and `${HOME<op>}` are expanded against the
         # session's HOME, so a target that leaves the home through `..`, a
