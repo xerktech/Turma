@@ -778,6 +778,17 @@ def _quote_states(command: str) -> list[str]:
                 out[i + 1:j] = _quote_states(command[i + 1:j])
                 i = j + 1
                 continue
+        if command.startswith("$'", i) and top in ("", "(", "{"):
+            # An ANSI-C string: `\` escapes the next character, so the `\'`
+            # in `$'it\'s'` is text, not its close. Read as a plain `'…'`, its
+            # `s'` opened a quote that hid every later `$'…'` (XERK-1693 QA).
+            j = i + 2
+            while j < n and command[j] != "'":
+                j += 2 if command[j] == "\\" else 1
+            end = min(j, n - 1)
+            out[i + 1:end + 1] = ["'"] * (end - i)
+            i = end + 1
+            continue
         if top == '"':
             out[i] = '"'
             if ch == '"':
@@ -2350,11 +2361,8 @@ def _replace_op(value: str, op: str, pat: str, rep: str) -> str:
     return "".join(out) + value[i:]
 
 
-def _decode_ansi_c(command: str, aware: bool = True) -> str:
-    """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token. ``aware=False``
-    decodes every match, quoted or not: `_quote_states` misreads a `\\'` inside
-    a real `$'…'` (`$'it\\'s'`) and the aware skip then hid every later one, so
-    `_expand` also reads the line decoded blind (XERK-1693 QA)."""
+def _decode_ansi_c(command: str) -> str:
+    """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token."""
 
     out, pos, states = [], 0, None
     while (m := _ANSI_C_RE.search(command, pos)) is not None:
@@ -2369,9 +2377,9 @@ def _decode_ansi_c(command: str, aware: bool = True) -> str:
         # quote over the next line (XERK-1693 QA). Always asked: a shortcut
         # on the line holding a quote skipped the comment case. Step past
         # its `$'` only: the match may run over a real `$'…'` after it.
-        if aware and states is None:
+        if states is None:
             states = _quote_states(command)
-        if aware and states[start]:
+        if states[start]:
             out.append(command[pos:start + 2])
             pos = start + 2
             continue
@@ -6872,13 +6880,6 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # BEFORE pre-normalisation, whose brace expansion ignores quoting and can
     # unbalance them (`awk '{print $2, $4}'`); each body gets the variables
     # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
-    if "$'" in command:
-        # Decoded blind as well as quote-aware (see `_decode_ansi_c`): an ADDED
-        # reading, so neither model's misread of a `$'…'` hides the line.
-        blind = _decode_ansi_c(command, aware=False)
-        if blind != _decode_ansi_c(command):
-            _spend(len(blind))
-            out.extend(_expand(blind, depth + 1, cwds))
     raw_commands, heredocs = _split_heredocs(command)
     raw_vals = _var_values(raw_commands)
     # Every directory a `cd` before a command (on this line or an enclosing
