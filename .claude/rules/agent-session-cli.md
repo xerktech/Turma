@@ -23,7 +23,8 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
 - **Lives under `agent/hooks/`** because only `agent/hooks/*.py` is globbed by the native install,
   the updater and release staging on BOTH OSes; `bin/` is an explicit list and the Windows zip is
   `.ps1`-only. Do not move it.
-- Stdlib only, run with `-SsE` (the hook security flags, `agent-hooks.md`).
+- Stdlib only, run with `-SsE`. Not a gate, so it keeps that spelling, not the hooks' `-SI`
+  (`agent-hooks.md`, XERK-1681): its allow rule and taught commands match it.
 - Subcommands, each writing `~/.turma/session-requests/<TURMA_SESSION_ID>/<subcommand>.json`:
   - `wake <duration> <reason…>` → `{wakeAt (epoch ms), reason, requestedAt}`. Durations are
     `20m`/`2h`/`1h30m`-style (`s`/`m`/`h`/`d`), above zero, at most 7 days; reason ≤200 chars.

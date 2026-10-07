@@ -4940,8 +4940,8 @@ def session_cli_path():
 
 def session_cli_allow_rule(cli_path=None):
     """The generated allow rule that lets a session run the session CLI without
-    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (the hook
-    security flags) and the ABSOLUTE script path, so the rule admits only this
+    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (the session CLI
+    is not a gate, so it keeps -SsE rather than the hooks' -SI) and the ABSOLUTE script path, so the rule admits only this
     script — an allow rule for `python3` alone would admit any code at all."""
     return f"Bash(python3 -SsE {cli_path or session_cli_path()}:*)"
 
@@ -5340,7 +5340,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
     ask_path = ask_path or ask_script_path()
-    # `-SsE` are SECURITY flags here, not tidiness. A plain interpreter start
+    # `-SI` are SECURITY flags here, not tidiness. A plain interpreter start
     # imports user-site `usercustomize` before the hook's own code, so one Write
     # to ~/.local/lib/pythonX/site-packages/usercustomize.py neutralises EVERY
     # hook on the host — measured: with such a payload the Bash guard allowed
@@ -5626,7 +5626,7 @@ def build_dsh_guard_config(python_exe=None, guard_path=None, fileguard_path=None
 # Code's, ported (the G0 spike, docs/qwen-g0-spike.md crit. 5) — a `command` hook
 # reads the tool call on stdin and denies with the same JSON Claude reads, or by
 # exiting 2. So qwen reuses the shared deny policy even more directly than dsh:
-# the SAME guard.py / fileguard.py are shelled out to (`python3 -SsE <hook>`),
+# the SAME guard.py / fileguard.py are shelled out to (`python3 -SI <hook>`),
 # never a second copy of the policy.
 #
 # The one mismatch qwen introduces is TOOL NAMES: guard.py keys on

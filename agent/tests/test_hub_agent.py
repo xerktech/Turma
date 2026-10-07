@@ -5608,6 +5608,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         # The turma-peer MCP server is registered beside turma-ask.
         peer_mcp = settings["mcpServers"]["turma-peer"]
         self.assertEqual(peer_mcp["args"][-1], ha.qwen_peer_mcp_path())
+        self.assertIn("-SI", peer_mcp["args"])  # XERK-1681: no script dir on sys.path
         self.assertEqual(peer_mcp["env"]["TURMA_SESSION_ID"], "q1")
         self.assertEqual(peer_mcp["env"]["TURMA_QWEN_PEER_DIR"], ha.QWEN_PEER_DIR)
 

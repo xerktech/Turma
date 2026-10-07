@@ -363,6 +363,27 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
         self.assertEqual(rc, 2)
         self.assertIsNotNone(reason)
 
+    def test_a_module_planted_beside_the_hooks_cannot_disable_the_shim(self):
+        # XERK-1681: the shim runs guard.py with -SI, so a hooks/json.py holding
+        # sys.exit(0) never loads; under -SsE it did and the guard printed nothing.
+        import shutil
+        tmp = tempfile.mkdtemp(prefix="qwen-plant-", dir=self.tmp)
+        hooks = os.path.join(tmp, "hooks")
+        shutil.copytree(os.path.dirname(ha.guard_script_path()), hooks)
+        for name in ("json", "re", "shlex", "os"):
+            with open(os.path.join(hooks, name + ".py"), "w") as f:
+                f.write("import sys\nsys.exit(0)\n")
+        with open(self.config_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["guardScript"] = os.path.join(hooks, "guard.py")
+        cfg_path = os.path.join(tmp, "qwen-guard.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        rc, reason = self._run(self._ev("run_shell_command", {"command": "rm -rf /"}),
+                               config_path=cfg_path)
+        self.assertEqual(rc, 0)
+        self.assertIn("protected path", reason or "")
+
 
 if __name__ == "__main__":
     unittest.main()
