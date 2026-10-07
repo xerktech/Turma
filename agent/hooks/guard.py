@@ -4354,19 +4354,33 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
     return list(dict.fromkeys(cuts))
 
 
-def _walk_owner_feeds_shell(text: str, owner: str) -> bool:
+def _walk_owner_feeds_shell(text: str, owner: str, memo: dict | None = None) -> bool:
     """Whether the heredoc on ``owner`` (of heredoc-free ``text``) feeds a
     shell, judged as `_expand`'s heredoc site judges it (`bash<<'E'`,
     `{ bash; } <<'E'`, `$x <<'E'`, `cat <<'E'|bash|cat`), plus a shell, `.` or
-    `source` named anywhere on the owner line (an added, over-reading test)."""
+    `source` named anywhere on the owner line (an added, over-reading test).
+    ``memo`` holds one walk's per-line facts and per-owner answers: every
+    heredoc on a line shares both, and recomputing them per heredoc made a
+    250-heredoc line quadratic, past the deadline (XERK-1645 QA)."""
+    memo = {} if memo is None else memo
+    if owner in memo:
+        return memo[owner]
     if any(_basename(t) in _SHELL_PROGS or t in (".", "source")
            for t in (w.strip("(){};&|") for w in _tokenize(_SUBST_RE.sub(" ", owner)))):
+        memo[owner] = True
         return True
-    vals, defined = _var_values(text), _defined_names(text)
-    return _heredoc_owner_feeds_shell(
-        owner, lambda: _line_feeds_shell(text),
-        lambda w: _owner_word_may_be_shell(w, vals, defined),
+    if "\0facts" not in memo:
+        memo["\0facts"] = (_var_values(text), _defined_names(text))
+    vals, defined = memo["\0facts"]
+
+    def feeds() -> bool:
+        if "\0feeds" not in memo:
+            memo["\0feeds"] = _line_feeds_shell(text)
+        return memo["\0feeds"]
+    memo[owner] = _heredoc_owner_feeds_shell(
+        owner, feeds, lambda w: _owner_word_may_be_shell(w, vals, defined),
         lambda st: _stage_may_read_stdin(st, vals, defined))
+    return memo[owner]
 
 
 def _raw_printed_walk(command: str, depth: int) -> list[str]:
@@ -4375,12 +4389,13 @@ def _raw_printed_walk(command: str, depth: int) -> list[str]:
     if "$(" not in command and "`" not in command:
         return cuts
     text, heredocs = _split_heredocs(command)
+    owners: dict = {}
     for owner, body, quoted in heredocs:
         if not quoted:
             # As the shell reads it too: `\$'` there is a live ANSI-C string.
             for reading in _heredoc_readings(body):
                 cuts += _raw_printed_cuts(reading, depth + 1)
-        elif _walk_owner_feeds_shell(text, owner):
+        elif _walk_owner_feeds_shell(text, owner, owners):
             # A quoted body a shell runs (`bash <<'E'`, `cat <<'E' | bash`),
             # nested in another; a non-shell owner's (`cat <<'E' > f.sh`) is data.
             cuts += _raw_printed_cuts(body, depth + 1)
