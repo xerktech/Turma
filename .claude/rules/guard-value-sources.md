@@ -50,10 +50,15 @@ paths:
   group writes ALL its statements' text (`_statements_printed`, never its first-word reading:
   `_strip_prefixes` drops the `{`); a lone `cat`/pass-through relays what it is fed.
 - A file is run by a shell operand, `.`/`source`, a shell's stdin redirect (`bash < f`) or its
-  own path (`./f`) — `_script_file` / `script_path`. Run with arguments it is read bound as a
-  `sh -c` script is (`set --`/`shift` applied) BESIDE the unbound text, once per distinct
-  argument list (`_script_file_readings`, `_MAX_SCRIPT_RUNS`). Bound alone lost the script's own
-  `set --`; once per line read only the first run's arguments (QA).
+  own path (`./f`) — `_script_file` / `script_path`. Every run is RECORDED in the segment loop
+  and the file read once after it (`_script_file_readings`), all runs known:
+  - a run with arguments is read bound as a `sh -c` script is (`set --`/`shift` applied), per
+    distinct list; bound alone without `_positional_readings` lost the script's own `set --` (QA);
+  - unbound only for a run with none: both doubled a real script's cost toward "too large";
+  - past `_MAX_SCRIPT_RUNS` lists, ONE reading binds every parameter to every argument of every
+    run, a word each, beside the unbound text and its `set --` readings (alone it lost a default,
+    the script's `set --` and a glued `/$1`, QA). Read as runs arrived, the 10th was dropped.
+    Residual (XERK-1674): past the cap a glued `"$1/$2"` is not read per run (main too).
   - Its contents are judged like any command: a written script doing `rm -rf /var/tmp/x` is
     refused as that command typed directly is (1 replayed diff, explained).
 - `_alias_values` takes only `alias NAME=…` with a name bash accepts (`_ALIAS_NAME_RE`):

@@ -2399,6 +2399,26 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         self.assertAllowed("echo 'rm -rf \"$1\"' > x.sh; sh x.sh ./build; sh x.sh ./dist")
+        # Past the cap of distinct argument lists every run is still read
+        # (QA 5: the 10th and later were dropped, the 9th joined into one word).
+        for n in (8, 9, 12, 40):
+            runs = "; ".join(f"sh x.sh ./b{i}" for i in range(n))
+            for body in ('rm -rf "$1"', "rm -rf $1"):
+                with self.subTest(n=n, body=body):
+                    self.assertDenied(f"echo '{body}' > x.sh; {runs}; sh x.sh /etc")
+        self.assertAllowed("echo 'rm -rf \"$1\"' > x.sh; "
+                           + "; ".join(f"sh x.sh ./b{i}" for i in range(12)))
+        # ...and past the cap the unbound text and the script's own `set --`
+        # are read too: a default, a `set --` and a glued `/$1` (QA 6).
+        for n in (3, 12):
+            one = "; ".join(f"sh x.sh ./b{i}" for i in range(n))
+            two = "; ".join(f"sh x.sh ./b{i} ./c{i}" for i in range(n))
+            bare = "; ".join(f"sh x.sh b{i}" for i in range(n))
+            for cmd in (f"echo 'set -- /etc; rm -rf \"$1\"' > x.sh; {one}; sh x.sh a",
+                        f"echo 'rm -rf \"${{2:-/etc}}\"' > x.sh; {two}; sh x.sh a",
+                        f"echo 'rm -rf /$1' > x.sh; {bare}; sh x.sh etc"):
+                with self.subTest(n=n, cmd=cmd[:40]):
+                    self.assertDenied(cmd)
         # Only `alias NAME=` with a name bash accepts defines one.
         self.assertEqual(guard._alias_values("alias={'a': 1}"), {})
         self.assertEqual(guard._alias_values("alias =x"), {})
@@ -3337,10 +3357,10 @@ class TestExpansionBudget(unittest.TestCase):
     VALUE = " ".join(["w"] * 3000)
     TOO_LARGE = "too large to classify"
 
-    def check(self, cmd):
+    def check(self, cmd, limit=5):
         t = time.monotonic()
         reason = guard.is_destructive(cmd)
-        self.assertLess(time.monotonic() - t, 5, cmd[:80])
+        self.assertLess(time.monotonic() - t, limit, cmd[:80])
         return reason
 
     def test_redirect_runs_on_a_heredoc_line_stay_linear(self):
@@ -3408,7 +3428,10 @@ class TestExpansionBudget(unittest.TestCase):
             # heredoc body is substituted on its own and stays small.
             x + "bash <<EOF\necho $x\nEOF\n" * 1000,
         ):
-            self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:80])
+            # The heredoc line takes ~4s idle (each body is read as a script);
+            # a shared CI runner needs headroom, as the xargs test below has.
+            limit = 10 if "<<EOF" in cmd else 5
+            self.assertIn(self.TOO_LARGE, self.check(cmd, limit) or "", cmd[:80])
 
     def test_find_exec_and_xargs_runs_are_denied_fast(self):
         # Their emitted WORK grew faster than linearly, not their text: 5000
