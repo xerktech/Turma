@@ -3410,7 +3410,14 @@ class TestExpansionBudget(unittest.TestCase):
                     f"f(){{ x=$1; $x; }}; f '{R}'", f"f(){{ local x=$1; bash -c \"$x\"; }}; f '{R}'",
                     f"set -- '{R}'; x=$1; $x", f"f(){{ $1; }}; f $'{R}'",
                     f"v='{R}'; eval '$''v'", f"for v in a '{R}'; do eval '$''v'; done",
-                    f"d='$'; v='{R}'; eval $d'v'", f"sh -c 'x=$1; $x' _ '{R}'"):
+                    f"d='$'; v='{R}'; eval $d'v'", f"sh -c 'x=$1; $x' _ '{R}'",
+                    # ...but `env x=$1` passes an argument, and `x=case $1`
+                    # runs `$1`: both split (QA). Brace-form eval rebuilds,
+                    # and a real `$'…'` after a quoted `'$'` (QA).
+                    "sh -c 'env x=$1' _ 'a rm -rf /'", f"sh -c 'x=case $1' _ '{R}'",
+                    f"f(){{ env -i x=$1; }}; f 'a {R}'",
+                    f"v='{R}'; eval '${{'v'}}'", f"for v in a '{R}'; do eval '${{v'}}; done",
+                    ": '$'; rm -rf $'/etc'", f": '$'; eval $'{R}'"):
             with self.subTest(cmd=cmd):
                 reason = self.check(cmd)
                 self.assertIsNotNone(reason)
@@ -3429,9 +3436,16 @@ class TestExpansionBudget(unittest.TestCase):
             self.assertIsNone(self.check(cmd), cmd)
         # Glued names are found in linear time on a long blank-free run (QA).
         self.assertTrue(guard._glued_name_pairs("x" * 60000 + "$a" + "$b" * 3, {"a", "b"}))
-        # A brace list past its cap is too large, never read short (QA).
-        self.assertIn(self.TOO_LARGE, self.check(
-            "for v in {a,}{a,}{a,}{a,}{a,}{a,}{a,}{z,'rm -rf /'}; do $v; done") or "")
+        # Only uses touching (quotes between at most) are a product: a path
+        # `$d/$f` is read per list, as on main (QA: 2x on real loops).
+        self.assertEqual(guard._glued_name_pairs('$d/$f "$a""$b" $c\'$\'e', set("abcdef")),
+                         {frozenset("ab"), frozenset("ce")})
+        # Past its cap a brace list's items are each read, never cut short or
+        # refused (a long brace in heredoc text nothing runs, QA).
+        self.assertIsNotNone(self.check(
+            "for v in {a,}{a,}{a,}{a,}{a,}{a,}{a,}{z,'rm -rf /'}; do $v; done"))
+        self.assertIsNone(self.check(
+            "for f in {a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}; do echo $f; done"))
         # A product past `_MAX_FOR_PRODUCT` readings is too large, never slow.
         words = " ".join(f"w{i}" for i in range(17))
         self.assertIn(self.TOO_LARGE, self.check(

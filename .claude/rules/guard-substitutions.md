@@ -99,25 +99,28 @@ paths:
   - Budget: `_MAX_FOR_WORD_CHARS` of line × passes (taint readings multiply); past it the line is
     `_TOO_LARGE` (a deny) — e.g. ~200 loops on one line. Characters, never a wall clock: that
     denied a real command only on a busy host.
-  - Two lists whose names share one blank-free word (`$a$b`, `"${a}"/$b`) are also read as their
-    PRODUCT (XERK-1657, `_glued_name_pairs`): one at a time, `$a$b` never formed `rm`. Past
+  - Two lists whose uses TOUCH (quotes between at most: `$a$b`, `"${a}""$b"`, `$a'$'b`) are also
+    read as their PRODUCT (XERK-1657, `_glued_name_pairs`): one at a time, `$a$b` never formed
+    `rm`. Not across literal text (`$d/$f`): that doubled real directory loops' cost (QA). Past
     `_MAX_FOR_PRODUCT` readings the line is too large (60×60 words took 8 s). Unglued nested lists
     stay one at a time; three glued names are read pairwise only (residual).
   - Shell-list words are brace-expanded first (`_brace_words`): `_expand_braces` skips a list
-    holding a blank, so `for v in a {'rm …',b}` bound one word. Past `_BRACE_SEQ_MAX` words the
-    list is too large (a deny): read short, a later item ran unread. `$"…"` dequotes as `"…"`,
+    holding a blank, so `for v in a {'rm …',b}` bound one word. Past `_BRACE_SEQ_MAX` words each
+    item of each list is a word too (`_brace_items_flat`): read short, a later item ran unread;
+    refused, a long brace in heredoc text nothing runs was denied (QA). `$"…"` dequotes as `"…"`,
     `$'…'` as its decoded text.
   - Cost accepted: each word now read (brace items, product) is a whole-line reading, as a literal
     list of that length already was; a heavy line can reach the deadline (fails closed).
-  - A whole `"$v"` of a multi-word list splices each word as its OWN quoted word; spliced bare,
-    `for v in c 'rm …'; do bash -c "$v"` handed `-c` the word `rm` (XERK-1657).
+  - A one-word list's whole `"$v"` (each per-word reading) splices quoted; bare, as the joined
+    multi-word reading splices it, `for v in 'rm …'; do bash -c "$v"` handed `-c` `rm` (XERK-1657).
   - A loop over positionals (`set -- …; for v; do`, `f(){ for v in "$@"; …}; f …`) is read per
     word on each bound reading in `_expand` too, `_FOR_PICK` saved and restored around it.
   - An `eval` whose joined words rebuild a use (`eval '$'v`, `eval "$"v`) is re-read with the
     line's values substituted — only when quotes split a `$` from its name in the raw segment
-    (`_QUOTE_SPLIT_USE_RE`): on every eval it cost ~5x. The per-word scan counts `'$'v` as a use.
+    (`_QUOTE_SPLIT_USE_RE`, brace forms `'${'v'}'`/`'${v'}` too): on every eval it cost ~5x.
   - `_decode_ansi_c` skips a `$` inside `'…'`: there the next `'` closes the string, so
-    `eval '$''v'` is `eval $v`; decoded as `$''` it lost the `$`.
+    `eval '$''v'` is `eval $v`; decoded as `$''` it lost the `$`. The search resumes right after
+    a skipped `$`, never past its match, which ran on into a real `$'…'` (`: '$'; rm $'/etc'`).
     Tests: `test_loop_words_reach_a_script_positional_or_eval_alone`.
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.

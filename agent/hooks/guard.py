@@ -1902,8 +1902,8 @@ def _brace_words(word: str) -> list[str]:
     """A raw ``word`` as bash brace-expands it: a word per item of each
     unquoted `{a,b}` / `{x..y}`, its items' quotes kept for `_dequote_value`.
     `_expand_braces` reads no list holding a blank, which a quoted item may
-    (`{'rm -rf /etc',b}`). Past `_BRACE_SEQ_MAX` words it ends with
-    `_TOO_LARGE`: kept as written, a later item ran unread."""
+    (`{'rm -rf /etc',b}`). Past `_BRACE_SEQ_MAX` words each item of each list
+    is added as a word of its own (`_brace_items_flat`)."""
     if "{" not in word:
         return [word]
     out, todo = [], [word]
@@ -1911,14 +1911,30 @@ def _brace_words(word: str) -> list[str]:
         w = todo.pop()
         span = _brace_list(w)
         if span is not None and len(out) + len(todo) >= _BRACE_SEQ_MAX:
-            # Truncated, a later item went unread (XERK-1657 QA): the list
-            # is too large to read, which `_for_word_lines` denies.
-            return [*out, w, *todo, _TOO_LARGE]
+            # Past the cap every item is read as a word of its own: kept as
+            # written, a later item ran unread (XERK-1657 QA); refused as too
+            # large, a long brace in heredoc text nothing runs was denied.
+            return [*out, *todo, *_brace_items_flat(word)]
         if span is None:
             out.append(w)
             continue
         start, end, items = span
         todo.extend(w[:start] + item + w[end:] for item in reversed(items))
+    return out
+
+
+def _brace_items_flat(word: str, depth: int = 0) -> list[str]:
+    """Every item of every brace list in ``word``, each a word, nested lists
+    flattened a few levels: the cap's reading, linear in the word."""
+    out, pos = [], 0
+    while depth < 4:
+        span = _brace_list(word[pos:])
+        if span is None:
+            break
+        start, end, items = span
+        for item in items:
+            out.extend(_brace_items_flat(item, depth + 1) if "{" in item else [item])
+        pos += end
     return out
 
 
@@ -2449,7 +2465,23 @@ def _decode_ansi_c(command: str) -> str:
         except (UnicodeDecodeError, UnicodeEncodeError):
             return m.group(0)
 
-    return _ANSI_C_RE.sub(rep, command)
+    if not states:
+        return _ANSI_C_RE.sub(rep, command)
+    # Searched on from the skipped `$`, never past its match: that match ran
+    # on into a REAL `$'…'` (`: '$'; rm -rf $'/etc'`) and left it undecoded.
+    out, pos, done = [], 0, 0
+    while True:
+        m = _ANSI_C_RE.search(command, pos)
+        if not m:
+            break
+        got = rep(m)
+        if got == m.group(0):
+            pos = m.start() + len(m.group(1)) + 1
+            continue
+        out += (command[done:m.start()], got)
+        pos = done = m.end()
+    out.append(command[done:])
+    return "".join(out)
 
 
 def _brace_sequence(body: str) -> list[str] | None:
@@ -3510,19 +3542,17 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         if got:
             value = _picked(got, name)
             state = states[m.start()] if m.start() < len(states) else ""
-            whole = (command[m.start() - 1:m.start()] == '"' and command[end:end + 1] == '"')
-            if state == '"' and name in _FOR_NAMES and whole and not rest.startswith("[") \
-                    and not op and len(got) > 1 and _VALUE_PICK[0] is None:
-                # A whole `"$p"` is one word per `for` word, each kept whole:
-                # spliced bare, `for v in c 'rm …'; do bash -c "$v"` handed
-                # `-c` the word `rm` (XERK-1657). One word read alone (a
-                # per-word pass) is an ordinary quoted splice, below.
-                out = '" "'.join(_quote_literal(v, '"') for v in got)
-            elif state == '"' and rest.startswith("["):
+            if state == '"' and (rest.startswith("[")
+                                 or name in _FOR_NAMES and len(got) > 1
+                                 and command[m.start() - 1:m.start()] == '"'
+                                 and command[end:end + 1] == '"'):
                 # `"${a[@]}"` is one word PER element, even mid-word: close
                 # the quote around them, as bash's expansion does. So is any
                 # subscript, read as every element: the values are joined, so
                 # `a=(x /etc); rm -rf "${a[1]}"` read `"x /etc"` (XERK-1626).
+                # A one-word list (a per-word reading) is a plain quoted
+                # splice: bare, `for v in 'rm …'; do bash -c "$v"` handed
+                # `-c` the word `rm` (XERK-1657).
                 out = '"' + _quote_literal(value, "") + '"'
             else:
                 # A name in an op's pattern is expanded first: `"${a%%$s*}"`.
@@ -5723,10 +5753,6 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForP
             # script, and read per word a 10 KB Python heredoc was too
             # large, its words cut out of their quoting too deep (QA).
             continue
-        if _TOO_LARGE in words:
-            if _budget is not None:
-                _budget["capped"] = True
-            return [], True
         read.append((name, nth[name], start, end, list(dict.fromkeys(words))))
     picks = [(((name, k),), ((start, end, word),))
              for name, k, start, end, words in read for word in words]
@@ -5760,20 +5786,25 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForP
 
 
 def _glued_name_pairs(command: str, names: set[str]) -> set[frozenset[str]]:
-    """Each pair of ``names`` used in one blank-free run of ``command``
-    (`$a$b`, `"${a}"/$b`), as a product of their values may form a word."""
+    """Each pair of ``names`` whose uses touch in one word, nothing but quotes
+    between them (`$a$b`, `"${a}""$b"`), as a product of their values may
+    form one word. Not across literal text (`$d/$f`): read per path, real
+    loops over directories cost 2x for a shape that forms no program word."""
     if len(names) < 2:
         return set()
     pairs = set()
-    # Runs first, then the uses in each: one regex spanning two `$`s
-    # backtracked quadratically over a long blank-free run (XERK-1657 QA).
-    for run in re.finditer(r"[^\s;|&<>()]+", command):
-        if run.group(0).count("$") < 2:
-            continue
-        used = {u for u in re.findall(r"\$['\"]*\{?!?['\"]*([A-Za-z_]\w*)", run.group(0))
-                if u in names}
-        pairs.update(frozenset(p) for p in itertools.combinations(sorted(used), 2))
+    last = None
+    for use in _GLUE_USE_RE.finditer(command):
+        name = use.group(1)
+        if last is not None and last[0] != name and last[0] in names and name in names \
+                and re.fullmatch(r"['\"]*", command[last[1]:use.start()]):
+            pairs.add(frozenset((last[0], name)))
+        last = (name, use.end())
     return pairs
+
+
+# A use `_glued_name_pairs` reads: `$a`, `${a}`, `'$'a` (an eval joins it).
+_GLUE_USE_RE = re.compile(r"\$['\"]*\{?!?['\"]*([A-Za-z_]\w*)['\"]*\}?")
 
 
 def _expand_readings(command: str) -> list[tuple[list[str], str]]:
@@ -6417,19 +6448,34 @@ _ASSIGN_HEAD_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^]]*\])?\+?=")
 
 # A `$` and the name it expands split by quotes (`'$'v`, `"$"'v'`, `\$\v`):
 # only an `eval`'s join makes it a use (XERK-1657).
-_QUOTE_SPLIT_USE_RE = re.compile(r"\$(?:['\"\\]+)\{?[A-Za-z_]")
+_QUOTE_SPLIT_USE_RE = re.compile(
+    r"\$(?:['\"\\]+\{?|\{['\"\\]|\{!?[A-Za-z_]\w*['\"\\])")
 
 
 def _in_assignment_word(text: str, pos: int) -> bool:
-    """Whether ``pos`` sits in an assignment word (`x=$1`, `local x=a$1`) or a
-    `case` word, where bash never splits an expansion: escaped there,
-    `f(){ x=$1; $x; }; f 'rm …'` read `x=rm` (XERK-1657 QA)."""
+    """Whether ``pos`` sits in an ASSIGNMENT (`x=$1`, `local x=a$1`), where
+    bash never splits an expansion: escaped there, `f(){ x=$1; $x; }; f 'rm
+    …'` read `x=rm` (XERK-1657 QA). Only a command's leading assignments and
+    a declaring builtin's words count: `env x=$1` passes an ARGUMENT, split,
+    and in `x=case $1` the `$1` is the program (XERK-1657 QA)."""
     start = pos
     while start and text[start - 1] not in " \t\n;&|()`":
         start -= 1
-    if _ASSIGN_HEAD_RE.match(text, start):
-        return True
-    return text[:start].rstrip().endswith(("case", "[["))
+    if not _ASSIGN_HEAD_RE.match(text, start):
+        return False
+    before = re.split(r"[;&|(){}`\n]", text[:start])[-1].split()
+    k = 0
+    while k < len(before) and (before[k] in _CMD_START_WORDS or _ASSIGN_HEAD_RE.match(before[k])):
+        k += 1
+    if k < len(before) and before[k] in _DECLARERS:
+        k += 1
+        while k < len(before) and (before[k].startswith("-") or _ASSIGN_HEAD_RE.match(before[k])):
+            k += 1
+    return k == len(before)
+
+
+_DECLARERS = frozenset(("local", "export", "declare", "readonly", "typeset"))
+_CMD_START_WORDS = frozenset(("then", "do", "else", "elif", "if", "while", "until", "!", "time"))
 
 
 def _shifted(args: list, text: str, every: bool = False) -> list[list]:
