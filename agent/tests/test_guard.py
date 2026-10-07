@@ -1175,14 +1175,14 @@ class TestParserGaps(unittest.TestCase):
         read empty, so `r=$d` hid `/etc`. The chain's values are a reading of
         their own beside the resolve-once one, which stays: it is bash's when
         the chain is assigned after the use (`c=$p/; p=1`), so `r=$d/` still
-        reads `/` too (order is XERK-1660)."""
+        reads `/` too; the ordered reading is XERK-1660's."""
         cmd = "q=/tmp/q; d=$q/d2/ro; r=$d/$tag"
         self.assertEqual(guard._var_values(cmd)["r"], ["/$tag"])
-        guard._VALUES_CHAINED[0] = True
+        guard._VALUES_CHAINED[0] = 1
         try:
             self.assertEqual(guard._var_values(cmd)["r"], ["/tmp/q/d2/ro/$tag"])
         finally:
-            guard._VALUES_CHAINED[0] = False
+            guard._VALUES_CHAINED[0] = 0
         for cmd in ("q=/etc; d=$q; r=$d; rm -rf $r",
                     "q=/etc; d=$q; r=$d; s=$r; t=$s; rm -rf $t",
                     'y=${x:-"rm -rf /etc"}; z=$y; w=$z; $w',
@@ -1218,6 +1218,63 @@ class TestParserGaps(unittest.TestCase):
                     # QA: a chained value per reassignment doubled past the
                     # pass cap ("too large").
                     "R=/tmp/w; D=$R/build; " + "f=$D/part0.log; echo x > $f; " * 14 + "ls $D"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
+
+    def test_assignments_are_also_read_in_order(self):
+        """XERK-1660: read order-blind, a later assignment reached an earlier
+        use bash reads unset (`d=$q$c; c=x` read `/etcx`), and a cycle built
+        on a prefix read as a join. The ordered reading is ADDED: a function
+        body runs where it is called, which only the order-blind ones read."""
+        guard._VALUES_CHAINED[0] = 2
+        try:
+            self.assertEqual(guard._var_values("q=/etc; d=$q$c; c=x")["d"], ["/etc"])
+            self.assertEqual(guard._var_values("a=/e; b=$a; a=${b}tc")["a"], ["/e", "/etc"])
+            # A loop's body is read again until it settles.
+            self.assertIn("/etc", guard._var_values(
+                "while :; do z=$a; a=$m; m=/etc; done")["z"])
+        finally:
+            guard._VALUES_CHAINED[0] = 0
+        for cmd in ("q=/etc; d=$q$c; c=x; rm -rf $d",
+                    "C='rm -rf /etc'; D=$C$E; R=$D; E=x; $R",
+                    "a=/e; b=$a; a=${b}tc; rm -rf $a",
+                    "b=/etc; c=$b; a=$c; b=$a; rm -rf $a",
+                    "p=/etc; q=$p; x=/tmp; x=$q; y=$x; p=$y; rm -rf $y",
+                    "s=/etc; x=/tmp; x=$s; y=$x; s=$y; rm -rf $y",
+                    "a0=/etc; " + "".join(f"a{i + 1}=$a{i}; " for i in range(6)) + "a0=$a6; rm -rf $a5",
+                    "for i in 1 2 3 4; do z=$a; a=$m; m=$n; n=$z; n=/etc; done; rm -rf $z",
+                    "for i in 1 2; do for j in 1 2; do z=$a; a=/etc; done; done; rm -rf $z",
+                    "a=ev; b=$a; a=${b}al; $a 'rm -rf /etc'",
+                    "f(){ x=$y; }; y=/etc; f; rm -rf $x",
+                    # QA: `done` as an argument is no keyword; a value naming
+                    # itself is read again with its name as it entered the loop.
+                    "for i in 1 2; do z=$a$c; echo done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$a$c; x=done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$z$a$c; a='rm -rf /etc'; done; c=x; $z",
+                    # QA delta: a `do`/`done` closing or opening an expansion
+                    # is no keyword, so the body is not cut short at it.
+                    "for i in 1 2; do z=$a$c; echo ${q} done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$a$c; echo $(true) done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$a$c; echo $((1)) done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$a$c; x=(done); a='rm -rf /etc'; done; c=x; $z",
+                    # QA delta: a quoted/literal separator in a value is part of
+                    # it and read in order, not a statement that ends it.
+                    'q=\'rm -rf /etc\'; d="$q$c ;"; c=x; $d',
+                    'q=\'rm -rf /etc\'; d="$q$c >x"; c=x; $d'):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        for cmd in ("c=$p/; p=1; rm -rf $c/x",
+                    's=; for f in a b c d e f g h; do s="$s $f"; done; echo $s',
+                    "while read l; do prev=$cur; cur=$l; done < f; rm -rf /tmp/w/$prev",
+                    "for i in 1 2 3; do echo 'done'; x=$y; y=/tmp; done; rm -rf $x/z",
+                    # QA: a long `for` list is data, never counted per value;
+                    # a value read on past its statement stays order-blind.
+                    "for f in " + " ".join(f"f{i}" for i in range(30)) + "; do b=$a; a=$f; done; echo $b",
+                    # QA delta: a long list beside an order-differing body must
+                    # not be read as too large (D1): the body's own values are
+                    # read per value, the list's words are not.
+                    "for f in " + " ".join(f"f{i}" for i in range(31)) + "; do z=$a$c; a=$f; done; c=x; echo $z",
+                    "for m in 'a|b' 'c|d'; do n=${m%%|*}; r=${m#*|}\npython3 - $r $n <<'E'\nprint(1)\nE\ndone"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
