@@ -5113,9 +5113,14 @@ class ManagerMixin:
         # message's text to the pane (XERK-227).
         self.run_stdin_calls = []
         self.run_stdin_ok = True
+        # Paste slices and Enter sends in order, so typed_messages() can join a
+        # message's PASTE_CHUNK_CHARS slices back into the one message it was.
+        self.pane_io = []
 
         def fake_run(cmd, cwd=None, timeout=None):
             self.run_calls.append(cmd)
+            if cmd[-1:] == ["Enter"]:
+                self.pane_io.append(None)
             return ""
 
         def fake_run_ok(cmd, cwd=None, timeout=None, env=None):
@@ -5124,6 +5129,7 @@ class ManagerMixin:
 
         def fake_run_stdin(cmd, data, timeout=None):
             self.run_stdin_calls.append((cmd, data))
+            self.pane_io.append(data)
             return self.run_stdin_ok
 
         # Ports the test wants _alloc_port to see as already bound. Real probing
@@ -12286,6 +12292,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.run_calls.clear()
         self.run_ok_calls.clear()
         self.run_stdin_calls.clear()
+        self.pane_io.clear()
         return sm
 
     def _running_session(self, sm, sid="abcde", status="running"):
@@ -12391,7 +12398,7 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
     def test_message_is_pasted_then_submitted(self):
         # The text rides tmux's paste buffer over STDIN — never an argv element,
         # which tmux refuses past ~16 KiB (XERK-227) — and Enter submits it.
-        # A SINGLE LINE is pasted WITHOUT `-p`: see the bracketing test below.
+        # Pasted RAW (`-r`, never `-p`): see the bracketing test below.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "hello")
@@ -12399,65 +12406,79 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
             (["tmux", "-L", "turma", "load-buffer", "-b", "turma-input-agent-abcde", "-"], "hello"),
         ])
         self.assertEqual(self.run_ok_calls, [
-            ["tmux", "-L", "turma", "paste-buffer", "-d", "-b", "turma-input-agent-abcde",
+            ["tmux", "-L", "turma", "paste-buffer", "-d", "-r", "-b", "turma-input-agent-abcde",
              "-t", "=agent-abcde:"],
         ])
         self.assertEqual(self.run_calls, [
             ["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Enter"],
         ])
 
-    def test_only_multi_line_input_is_bracketed(self):
+    def test_input_is_never_bracketed(self):
         # `-p` adds the bracketed-paste markers, which is how an application
-        # RECOGNISES a paste — and Claude Code tags one in the transcript as
-        # `<pasted_content id=...>…</pasted_content id=...>`. Bracketing every
-        # message wrapped ordinary one-line chat turns in those tags: they
-        # rendered literally in the chat view, and reached the model framed as
-        # pasted DATA rather than as something the operator typed.
-        #
-        # Multi-line still brackets — that is what keeps it ONE message instead
-        # of submitting a turn per line — so both directions are pinned here.
+        # RECOGNISES a paste — and Claude Code records the turn as
+        # `<pasted_content id=...>…</pasted_content id=...>`: shown literally in
+        # the chat, and handed to the model as pasted DATA rather than as the
+        # operator's words. So no message is bracketed, multi-line included;
+        # `-r` keeps each LF as LF (Ctrl+J, a line break in Claude Code's
+        # composer) instead of tmux's CR, which would submit per line.
         sm = self.make_manager()
         sess = self._running_session(sm)
-
         sm.send_input(sess["id"], "just one line")
-        self.assertNotIn("-p", self.run_ok_calls[0],
-                         "a single line must not be bracketed as a paste")
-
-        self.run_ok_calls.clear()
         sm.send_input(sess["id"], "first\nsecond")
-        self.assertIn("-p", self.run_ok_calls[0],
-                      "multi-line must stay bracketed or it submits per line")
+        for call in self.run_ok_calls:
+            self.assertNotIn("-p", call, "no message may be bracketed as a paste")
+            self.assertIn("-r", call, "LF must not become CR (a submit)")
+        self.assertEqual(self.run_stdin_calls[-1][1], "first\nsecond")
 
-        # The buffer (XERK-227's argv limit) is used either way — only the
-        # markers are conditional.
-        self.assertTrue(all(c[0][:4] == ["tmux", "-L", "turma", "load-buffer"]
-                            for c in self.run_stdin_calls))
-
-    def test_a_long_message_is_pasted_whole(self):
-        # The point of the paste path: a message far past what a send-keys
-        # command line could carry reaches the pane intact, in one go.
+    def test_a_long_message_arrives_whole_in_sub_threshold_slices(self):
+        # Claude Code also reads one input burst past ~800 chars as a paste and
+        # tags it, so a long message goes in PASTE_CHUNK_CHARS slices — every
+        # character still arrives, in order, and only the final Enter submits.
         sm = self.make_manager()
         sess = self._running_session(sm)
-        text = "x" * 60000
-        sm.send_input(sess["id"], text)
-        self.assertEqual(self.run_stdin_calls[0][1], text)
+        text = "".join(chr(97 + i % 26) for i in range(59996)) + "\nend"
+        with mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
+            sm.send_input(sess["id"], text)
+        sent = [d for _c, d in self.run_stdin_calls]
+        self.assertEqual("".join(sent), text)
+        self.assertTrue(all(len(d) <= ha.PASTE_CHUNK_CHARS for d in sent))
+        self.assertLess(ha.PASTE_CHUNK_CHARS, 800)
+        self.assertEqual(len(self.run_ok_calls), len(sent))
+        self.assertEqual(self.run_calls,
+                         [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "Enter"]])
         self.assertEqual(sess["pendingInputs"][0]["text"], text)
 
+    def test_a_paste_failing_midway_types_only_the_rest(self):
+        # Slices already in the composer must not be typed a second time by the
+        # fallback — it sends only what had not landed.
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        n = ha.PASTE_CHUNK_CHARS
+        text = "a" * n + "b" * n + "c" * 10
+        real = self.run_stdin_calls.append
+        def fail_second(cmd, data, timeout=None):
+            real((cmd, data))
+            return len(self.run_stdin_calls) < 2
+        with mock.patch.object(ha, "run_stdin", side_effect=fail_second), \
+                mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
+            sm.send_input(sess["id"], text)
+        typed = [c[-1] for c in self.run_calls[:-1]]
+        self.assertEqual("".join(typed), "b" * n + "c" * 10)
+
     def test_newlines_survive_the_paste(self):
-        # A pasted log or spec keeps its line breaks: paste-buffer -p brackets
-        # the text for an application that asked for bracketed paste (Claude Code
-        # does), so the whole thing lands as ONE message rather than submitting a
-        # turn per line. CR and CRLF normalize to LF.
+        # A pasted log or spec keeps its line breaks, delivered as LF so the
+        # whole thing lands as ONE message rather than submitting a turn per
+        # line. CR and CRLF normalize to LF.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "line1\r\nline2\rline3\nline4")
         self.assertEqual(self.run_stdin_calls[0][1], "line1\nline2\nline3\nline4")
 
     def test_control_bytes_are_stripped(self):
-        # A control byte inside a bracketed paste would end the paste early and
-        # have what follows read as KEYSTROKES — and the text isn't always the
-        # operator's own (a PR review comment is typed in the same way). Tab and
-        # newline are content and survive.
+        # A control byte would be read as a KEYSTROKE (an ESC starts a key
+        # sequence) — and the text isn't always the operator's own (a PR review
+        # comment is typed in the same way). Tab and newline are content and
+        # survive.
         sm = self.make_manager()
         sess = self._running_session(sm)
         sm.send_input(sess["id"], "safe\x1b[201~rm -rf /\x00\x07 end\tkept\nkept")
@@ -14315,6 +14336,7 @@ class TestNotifySession(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm = super().make_manager()
         self.run_calls.clear()
         self.run_stdin_calls.clear()
+        self.pane_io.clear()
         return sm
 
     def _session(self, sm, status="running"):
@@ -14972,8 +14994,17 @@ class TestPollPrComments(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         return sess
 
     def _typed(self):
-        # The texts delivered into the pane — send_input pastes them (XERK-227).
-        return [data for _cmd, data in self.run_stdin_calls]
+        # The messages delivered into the pane — send_input pastes each one in
+        # slices (XERK-227), submitted by an Enter.
+        out, cur = [], []
+        for item in self.pane_io:
+            if item is None:
+                if cur:
+                    out.append("".join(cur))
+                cur = []
+            else:
+                cur.append(item)
+        return out
 
     def _events(self, *events):
         return mock.patch.object(ha, "_pr_comment_events",
@@ -15130,8 +15161,17 @@ class TestPollPrConflicts(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         return sess
 
     def _typed(self):
-        # The texts delivered into the pane — send_input pastes them (XERK-227).
-        return [data for _cmd, data in self.run_stdin_calls]
+        # The messages delivered into the pane — send_input pastes each one in
+        # slices (XERK-227), submitted by an Enter.
+        out, cur = [], []
+        for item in self.pane_io:
+            if item is None:
+                if cur:
+                    out.append("".join(cur))
+                cur = []
+            else:
+                cur.append(item)
+        return out
 
     def test_conflict_is_delivered_once_per_episode(self):
         sm = self.make_manager()
@@ -15285,7 +15325,17 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         sm._poll_open_pr_nudges(stage=False)
 
     def _typed(self):
-        return [data for _cmd, data in self.run_stdin_calls]
+        # The messages delivered into the pane — send_input pastes each one in
+        # slices (XERK-227), submitted by an Enter.
+        out, cur = [], []
+        for item in self.pane_io:
+            if item is None:
+                if cur:
+                    out.append("".join(cur))
+                cur = []
+            else:
+                cur.append(item)
+        return out
 
     def test_idle_undelivered_work_is_nudged_once(self):
         sm = self.make_manager()
@@ -15355,6 +15405,7 @@ class TestPollOpenPrNudges(InboxRegistryMixin, ManagerMixin, unittest.TestCase):
         for pushed, ahead in ((True, None), (None, None)):
             with self.subTest(pushed=pushed):
                 self.run_stdin_calls.clear()
+                self.pane_io.clear()
                 sm = self.make_manager()
                 sess = self._session(sm, dirty=0, pushed=pushed,
                                      ahead_remote=ahead)

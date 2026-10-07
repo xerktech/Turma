@@ -14425,6 +14425,13 @@ INPUT_CTRL_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]")
 # CHUNKS of this size rather than being clipped to it: a message the operator
 # believes they sent whole must never arrive with its end missing (XERK-227).
 SENDKEYS_MAX_CHARS = 4000
+# Claude Code reads one input burst longer than ~800 chars as a PASTE and wraps
+# the turn in `<pasted_content>` tags (measured on 2.1.292: 800 typed, 900 tagged),
+# so the paste path delivers in slices well under that, with a short gap so two
+# slices don't coalesce into one read. Delivery runs on the input worker, never
+# the beat, so the gap's cost (~2.5s per 100k chars) is off the beat budget.
+PASTE_CHUNK_CHARS = 400
+PASTE_CHUNK_GAP_SEC = 0.01
 
 
 def _clean_input_text(text):
@@ -14557,14 +14564,16 @@ def _type_into_pane(tmux_name, text):
     they sent whole must never arrive with its end quietly missing. Returns True
     when the text was pasted.
 
-    `-p` (the bracketed-paste markers) is applied ONLY to multi-line text.
-    Bracketing is how an application RECOGNISES a paste, and Claude Code tags one
-    in the transcript as `<pasted_content id=...>...</pasted_content id=...>`, so
-    bracketing every message wrapped ordinary one-line chat turns in those tags
-    -- rendered literally in the chat, and reaching the model framed as pasted
-    DATA rather than as something the operator typed. The BUFFER is still used
-    for every message (that is XERK-227's argv limit, unrelated); only the
-    markers are conditional, and a single line arrives identically without them.
+    No message is ever BRACKETED (`-p`). Bracketing is how an application
+    recognises a paste, and Claude Code records the whole turn as
+    `<pasted_content id=...>...</pasted_content id=...>` -- shown literally in
+    the chat, and handed to the model as pasted DATA rather than as the
+    operator's own words. Instead each chunk is pasted RAW with `-r`, so a
+    newline arrives as LF (Ctrl+J), which Claude Code's composer reads as a line
+    break rather than a submit; only the Enter at the end submits. Claude Code
+    also treats one input burst past ~800 chars as a paste and tags it the same
+    way, so the text goes in PASTE_CHUNK_CHARS slices, PASTE_CHUNK_GAP_SEC apart.
+    The BUFFER is still used for every slice (XERK-227's argv limit, unrelated).
 
     On Windows the pty-host stands in for tmux (XERK-697): `_pty_inject` delivers
     the text as a bracketed paste over the control channel, the direct analog of
@@ -14576,29 +14585,32 @@ def _type_into_pane(tmux_name, text):
     if not tmux_name:
         return False
     buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
-    # The buffer is per-SERVER, so load and paste must address the same one.
-    pasted = run_stdin(_tmux("load-buffer", "-b", buf, "-", name=tmux_name), text)
-    if pasted:
-        # -d drops the buffer once it has been pasted, so a message never sits
-        # in tmux's paste history waiting to be re-pasted by hand.
-        # `-p` (bracketed paste) ONLY when the text needs it. The markers are
-        # how an application RECOGNISES a paste, and Claude Code tags one in the
-        # transcript as `<pasted_content id=...>…</pasted_content id=...>` — so
-        # bracketing every message wrapped ordinary one-line chat turns in those
-        # tags. They rendered literally in the chat, and reached the model framed
-        # as pasted DATA rather than as something the operator typed. A line with
-        # no newlines needs no bracketing: it arrives as the same characters and
-        # the Enter below submits it either way. Multi-line still brackets, which
-        # is what keeps it ONE message instead of a turn per line.
-        flags = ["-d", "-p"] if "\n" in text else ["-d"]
-        rc, _err = run_ok(_tmux("paste-buffer", *flags, "-b", buf,
+    slices = [text[i:i + PASTE_CHUNK_CHARS]
+              for i in range(0, len(text), PASTE_CHUNK_CHARS)] or [""]
+    sent = 0
+    pasted = True
+    for n, piece in enumerate(slices):
+        if n:
+            time.sleep(PASTE_CHUNK_GAP_SEC)   # keep each burst under the paste threshold
+        # The buffer is per-SERVER, so load and paste must address the same one.
+        if not run_stdin(_tmux("load-buffer", "-b", buf, "-", name=tmux_name), piece):
+            pasted = False
+            break
+        # -d drops the buffer once pasted, so a message never sits in tmux's
+        # paste history; -r keeps LF as LF (tmux would otherwise turn it into
+        # CR, which submits). No -p: see the docstring.
+        rc, _err = run_ok(_tmux("paste-buffer", "-d", "-r", "-b", buf,
                                 "-t", _tmux_pane(tmux_name), name=tmux_name),
                           timeout=15)
-        pasted = rc == 0
-        if not pasted:
+        if rc != 0:
             run(_tmux("delete-buffer", "-b", buf, name=tmux_name))
+            pasted = False
+            break
+        sent += len(piece)
     if not pasted:
-        flat = text.replace("\n", " ")
+        # Type only what did NOT already land, so a paste that failed midway
+        # never duplicates the part before it.
+        flat = text[sent:].replace("\n", " ")
         chunks = [flat[i:i + SENDKEYS_MAX_CHARS]
                   for i in range(0, len(flat), SENDKEYS_MAX_CHARS)] or [""]
         log(f"paste into {tmux_name} failed; falling back to send-keys "

@@ -1371,6 +1371,20 @@
     return "operator";
   }
 
+  // Claude Code's own framing tags on a user turn, each on a line of its own:
+  // `<pasted_content id="…">` / `</pasted_content id="…">` round any bracketed
+  // paste, `<system-reminder>` / `</system-reminder>` round its injected notices.
+  // They are wire markup for the MODEL, never something to show a reader, so a
+  // bubble drops the tag lines and keeps what they wrap. Run AFTER messageOrigin,
+  // which classifies a system turn by its leading tag. Keep in step with
+  // ChatItems.kt `stripFraming`.
+  const FRAMING_TAG_RE = /^[ \t]*<\/?(?:pasted_content(?: id="[^"\n]*")?|system-reminder)>[ \t]*(?:\n|$)/gm;
+  function stripFraming(text) {
+    const t = String(text == null ? "" : text);
+    if (t.indexOf("<") === -1) return t;
+    return t.replace(FRAMING_TAG_RE, "").replace(/^\n+|\n+$/g, "");
+  }
+
   // ---- build display items from rich entries --------------------------------
   // Items: {kind:"msg",role,text,truncated,id,origin} | {kind:"thinking",text,truncated,id}
   //        | {kind:"action", id, name, input, inputTrunc, result:{text,isError,truncated}|null, entryId}
@@ -1430,7 +1444,10 @@
           // the pane/inbox, and Claude Code records them as user turns too.
           // Classify by their delivery framing so the renderer can set them
           // apart from real operator input (blue, right) — see messageOrigin.
-          if (msg.role === "user") msg.origin = messageOrigin(msg.text);
+          if (msg.role === "user") {
+            msg.origin = messageOrigin(msg.text);
+            msg.text = stripFraming(msg.text);
+          }
           items.push(msg);
           msg = null;
         }

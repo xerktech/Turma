@@ -205,7 +205,8 @@ fun buildItems(
             if (!text.isNullOrBlank()) {
                 flushFold()
                 val origin = if (entry.role == "user") messageOrigin(text) else "operator"
-                out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped, origin))
+                val shown = if (entry.role == "user") stripFraming(text) else text
+                out.add(ChatItem.Bubble(entry.key, entry.role, shown, clipped, origin))
             }
         }
         for (block in blocks) {
@@ -335,6 +336,21 @@ fun messageOrigin(text: String): String {
     if (t.startsWith("[Image:")) return "system"
     if (t == "Continue from where you left off.") return "system"
     return "operator"
+}
+
+private val FRAMING_TAG_RE =
+    Regex("(?m)^[ \\t]*</?(?:pasted_content(?: id=\"[^\"\\n]*\")?|system-reminder)>[ \\t]*(?:\\n|$)")
+
+/**
+ * Claude Code's own framing tags on a user turn, each on a line of its own —
+ * `<pasted_content id="…">` round a bracketed paste, `<system-reminder>` round
+ * its injected notices — are wire markup for the model, never shown: drop the
+ * tag lines, keep what they wrap. Run AFTER [messageOrigin], which classifies a
+ * system turn by its leading tag. A port of chat.js `stripFraming`.
+ */
+fun stripFraming(text: String): String {
+    if (!text.contains('<')) return text
+    return text.replace(FRAMING_TAG_RE, "").trim('\n')
 }
 
 /**

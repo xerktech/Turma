@@ -396,6 +396,17 @@ class ChatItemsTest {
         assertTrue("linear scan should be well under a second (was ${elapsedMs}ms)", elapsedMs < 2_000)
     }
 
+    @Test fun `stripFraming drops Claude Code's tag lines and keeps their body`() {
+        assertEquals("line one\nline two",
+            stripFraming("<pasted_content id=\"3dcc\">\nline one\nline two\n</pasted_content id=\"3dcc\">\n"))
+        assertEquals("The user named this session.",
+            stripFraming("<system-reminder>\nThe user named this session.\n</system-reminder>"))
+        assertEquals("look at this\n\nlog <tail>",
+            stripFraming("look at this\n\n<pasted_content id=\"ab\">\nlog <tail>\n</pasted_content id=\"ab\">"))
+        assertEquals("keep <b> and a <system-reminder> mid-line",
+            stripFraming("keep <b> and a <system-reminder> mid-line"))
+    }
+
     // ---- messageOrigin: a user turn's real source (web parity) --------------
 
     @Test fun `messageOrigin classifies each relay framing, operator by default`() {
