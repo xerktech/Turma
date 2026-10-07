@@ -4654,6 +4654,24 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/etc"))
             self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
 
+    def test_a_program_or_flag_built_from_home_is_read_with_the_real_home(self):
+        # XERK-1686: HOME is set, so `${HOME:+r}` is `r` and `${HOME/*/rm}` is
+        # `rm`; kept as written, the program and flag words hid `rm -rf /`.
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cmd in ("${HOME:+r}m -rf /", "${HOME/*/rm} -rf /", "rm ${HOME:+-rf} /",
+                        "${HOME:+eval} 'rm -rf /'", "${HOME/*/eval} 'rm -rf /'",
+                        '"${HOME:+rm}" -rf /', "${HOME:+rm -rf /}", "${HOME+r}m -rf /etc",
+                        "${HOME//*/rm} -rf /", "${HOME:+'rm'} -rf /",
+                        "bash -c '${HOME:+r}m -rf /'"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNotNone(guard.is_destructive(cmd))
+            # A reading inside the home still maps back to `$HOME…`.
+            for cmd in ("rm -rf ${HOME:+$HOME/.cache}", 'rm -rf "${HOME%/}/.cache"',
+                        "echo ${HOME:+hi}", "${HOME#/}x rm -rf /", '"${HOME:+rm -rf /}"',
+                        'cp a "${HOME%/}/b"', "${HOME%/*}/bin/x"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNone(guard.is_destructive(cmd))
+
     def test_home_readings_are_bounded(self):
         # XERK-1656: each pattern op costs a match per substring of HOME, so
         # past `_MAX_HOME_OPS` the target reads as `/` instead of being timed.

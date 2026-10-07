@@ -4144,6 +4144,15 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # runs: spliced, `"${HOME:-/tmp}"/*` read `/tmp/*` and hid the
             # home wipe (XERK-1656). Kept, `_home_reading` judges it.
             return "${" + name + rest + "}", end
+        elif (name == "HOME" and rest and not (op and op.group(1) in _VAR_DEFAULT_OPS)
+              and (home := _home_reading("${HOME" + rest + "}")) is not None):
+            # HOME is set where an agent runs, so its op reads the session's
+            # HOME: kept as written, `${HOME:+r}m -rf /` hid the program and
+            # `rm ${HOME:+-rf} /` the flag (XERK-1686). A reading inside the
+            # home comes back as `$HOME…`, which the home rules judge; the
+            # unset-HOME reading is the unset-names one, as for any name.
+            state = states[m.start()] if m.start() < len(states) else ""
+            out = _splice_readings([home], state)
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
             out = default(op.group(2), m.start())
         else:
