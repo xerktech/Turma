@@ -3070,6 +3070,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "bash -c $'eval $(echo \\'X=${nope:-a b}\\') rm -rf /etc; echo done'",
         "sh <<< $'eval \\x24(echo \\'X=${nope:-a b}\\') rm -rf /etc'",
         "bash <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
+        "bash <<'E'\nbash <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "bash <<E\nbash -c \\$'eval \\$(echo \\\\'X=\\${nope:-a b}\\\\') rm -rf /etc'\nE",
         # ...and a quoted `$'` decoy is no ANSI-C string: read raw too.
         "echo \"$'\\'\"; eval $(echo 'X=${nope:-a b}') rm -rf /etc #'",
         "echo 'x$' \"\\'\"; eval $(echo 'X=${nope:-a b}') rm -rf /etc #'",
@@ -3108,6 +3110,7 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "eval X=1 ls",
         "f(){ bash -c 'eval $(opam env) make'; }; f",
         ": $(bash -c 'X=$(date) ls')",
+        "cat <<'E' > f.sh\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
         "trap 'rm -f \"$tmp\"' EXIT",
         "bash <<< 'eval $(opam env) make'",
     ]
