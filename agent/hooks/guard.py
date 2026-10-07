@@ -4581,7 +4581,17 @@ def _tokenize_cached(segment: str) -> tuple[str, ...]:
     try:
         return tuple(shlex.split(segment, posix=True))
     except ValueError:
-        return tuple(segment.split())
+        pass
+    # bash reads a lone backslash ending the input as a literal `\`; shlex
+    # raises on it instead. The whitespace split below keeps the quotes on a
+    # `-c`/`eval` script, so `bash -c 'rm -rf /etc '\` was never re-read
+    # (XERK-1646). Escaping it gives bash's own reading.
+    if segment.endswith("\\"):
+        try:
+            return tuple(shlex.split(segment + "\\", posix=True))
+        except ValueError:
+            pass
+    return tuple(segment.split())
 
 
 def _tokenize(segment: str) -> list[str]:

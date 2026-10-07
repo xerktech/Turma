@@ -4084,6 +4084,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "$x \\\nrm -rf /etc", '"$@" \\\nrm -rf /etc', "$(true) \\\nrm -rf /etc",
                     'bash -c "\\$x \\\nrm -rf /etc"', 'eval "\\$x \\\nrm -rf /etc"',
                     'bash <<< "\\$x \\\nrm -rf /etc"', 'echo "\\$x \\\nrm -rf /etc" | bash',
+                    # A lone trailing `\` is a literal `\` to bash; shlex raised on
+                    # it and the fallback kept the script's quotes (XERK-1646).
+                    "bash -c 'rm -rf /etc '\\", "bash -c 'rm -rf /etc'\\",
+                    "sh -c 'rm -rf /etc'\\", "eval 'rm -rf /etc'\\",
+                    "bash -c 'X=${nope:-a b} rm -rf /etc '\\",
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',
