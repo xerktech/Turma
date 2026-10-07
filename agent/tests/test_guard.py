@@ -1511,6 +1511,10 @@ class TestProducedScripts(unittest.TestCase):
                     "q=; rm -rf ${q-/etc}", "q=x; rm -rf ${q:-/etc}"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        # An element default's resolved names are charged once, as a scalar's (QA).
+        for use in ("${y[0]:-$a}", "${q:-$a}"):
+            cmd = "a=" + "x" * 2000 + "; y=(); echo " + " ".join([use] * 100)
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow", use)
         self.assertEqual(guard._dequote_value("$b'tc'"), "${b}tc")
         self.assertEqual(guard._dequote_value('"$b"tc'), "${b}tc")
         self.assertEqual(guard._dequote_value("$'tc'"), "tc")
