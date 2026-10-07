@@ -36,5 +36,34 @@ paths:
   replay vs main; 200 targets of 64 HOME ops decide as fast as main.
 - Cost bound: past `_MAX_HOME_OPS` operators on HOME in one target, the reading is `/`.
 - Open: an unquoted `${x: -5}` is split at its space before any of this (XERK-1680).
+- `~` and `$PWD` follow the LINE, not the session (XERK-1685): `HOME=/; rm -rf ~/etc` is //etc.
+  - `_home_tilde_reading` adds a reading with every word-start `~` (and a bare `cd`) as `$HOME`
+    when the raw text holds `HOM`, `OME` or `eval` (`HOM{E,}`, `H\OME`, `x=OME; …H$x`).
+    `~+` always reads as `$PWD`.
+  - A `~` opening a `${y:-…}`/`-`/`:+`/`:=`/`:?` word (`_PARAM_TILDE_RE`) or a `${y/pat/…}`
+    replacement (`_replacement_tildes`) is spliced too, read both braced (`${HOME}`: an
+    unbraced name ending a default word is unresolved, XERK-1670) and bare. Never add `-`/`+`
+    to the word-start lookbehind: it would splice `a-~/x`.
+  - The replacement is found by a one-pass right-to-left scan, never a regex: a pattern may
+    hold `\x`, quotes, `$'…'` and nested `${…}` (a bare `{` is a character), and every regex
+    for it was exponential, then quadratic. One `re.search` holds the GIL past the hook's 45s
+    deadline, so the 600s hook timeout fires and the command RUNS. Keep it linear (timing test).
+  - `pr_summary_reason` reads `_expand_both(command, home=False)`: the reading repeats the line,
+    and a heredoc writer read twice was "another part naming the description file".
+  - A textual gate, never the line's values: those miss a `bash -c` script's own `HOME=`,
+    `HOME[0]=`, `read HOME`; each inner level's values pass resolves the spliced `$HOME`.
+  - `$HOME`, never `${HOME}` or `${HOME:-~}`: braced, it is not resolved inside `{a,b}`, and a
+    default is applied at the OUTER level, before a `bash -c` script's own HOME is known.
+  - Every `~` is spliced, a program's too. Any "command position" test by the text before it
+    reopened the bypass (`rm -rf do ~/etc`, `rm -rf \; ~/etc`, `a=(~/etc)`): that needs a parse.
+  - A spliced program stays literal: `_owner_word_may_be_shell` reads an unassigned
+    `$HOME/…` as `~/…` (HOME is always set; a bare `$HOME` program stays unresolved), so
+    `~/.claude/bin/jira … <<'EOF'` notes stay data. Every gate-side workaround (command-position skip, dropping data bodies from the
+    gate) reopened a bypass; fix false denies at the owner test, never by narrowing the splice.
+  - Added, never swapped: the `~` reading is what catches `rm -rf ~` itself.
+  - `_under_cwd` reads `$PWD` as a relative operand is (exact root or `..` only).
+  - Known false deny: `HOME=/ rm -rf ~/etc` (a prefix binding; bash expands `~` first),
+    as `$HOME` already is there.
+  - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`.
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,
   `test_home_readings_are_bounded`.

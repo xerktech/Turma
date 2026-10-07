@@ -1762,6 +1762,133 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_tilde_and_pwd_follow_the_line_s_own_home_and_cd(self):
+        """XERK-1685: bash expands `~` from HOME's current value and `$PWD` is
+        where a `cd` left it, so each of these reached rm as /etc (nobody rig)."""
+        for cmd in ("HOME=/; rm -rf ~/etc",
+                    "export HOME=/; rm -rf ~/etc",
+                    "read HOME <<< /; rm -rf ~/etc",
+                    "read H''OME <<< /; rm -rf ~/etc",
+                    "printf -v HOME /; rm -rf ~/etc",
+                    "for HOME in /; do rm -rf ~/etc; done",
+                    "HOME+=/..; rm -rf ~/etc",
+                    "cd /; HOME=$PWD; rm -rf ~/etc",
+                    "bash -c 'HOME=/; rm -rf ~/etc'",
+                    "HOME=/; x=~/etc; rm -rf $x",
+                    "HOME=/; cd ~; rm -rf etc",
+                    "HOME=/; cd; rm -rf etc",
+                    "cd /; rm -rf $PWD/etc",
+                    "cd /etc; rm -rf \"${PWD}\"",
+                    "cd /tmp; rm -rf $PWD/..",
+                    # QA: a brace list, HOME assigned by a name built at run
+                    # time, and `~+` (= $PWD).
+                    "HOME=/; rm -rf {~/etc,/tmp/zz}",
+                    "x=HO; eval \"${x}ME=/\"; rm -rf ~/etc",
+                    "eval $'HOM\\x45=/'; rm -rf ~/etc",
+                    "cd /etc; rm -rf ~+",
+                    "cd /; rm -rf ~+/etc",
+                    # QA: an argument ending in a keyword's letters is no keyword.
+                    "HOME=/; rm -rf undo ~/etc",
+                    "HOME=/; rm -rf --else ~/etc",
+                    "HOME=/; rm -rf -rthen ~/etc",
+                    # ...nor is a whole-word keyword argument or an escaped operator.
+                    "HOME=/; rm -rf do ~/etc",
+                    "HOME=/; rm -rf then ~/etc",
+                    "HOME=/; rm -rf \\; ~/etc",
+                    "HOME=/; rm -rf x\\& ~/etc",
+                    # QA: HOME bound where only an inner level's values see it.
+                    "bash -c 'HOME[0]=/; rm -rf ~/etc'",
+                    "bash -c 'read HOME <<< /; rm -rf ~/etc'",
+                    "bash -c 'printf -v HOME /; rm -rf ~/etc'",
+                    "unset HOME; : ${HOME:=/}; rm -rf ~/etc",
+                    "declare {HOME,X}=/; rm -rf ~/etc",
+                    "declare HOM{E,}=/; rm -rf ~/etc",
+                    "rm -rf ~; HOME=/tmp",
+                    # ...and an argument `~` on a line with a quoted heredoc.
+                    "HOME=/; rm -rf do ~/etc <<'E'\nE",
+                    "HOME=/; rm -rf \\; ~/etc <<'E'\nE",
+                    "HOME=/; rm -rf x \\\n~/etc <<'E'\nE",
+                    # ...an array element, beside a `<<` that is a comment or data,
+                    "HOME=/; a=(~/etc); rm -rf \"${a[@]}\" # <<'x'",
+                    "HOME=/; a=(\n~/etc\n); rm -rf \"${a[@]}\"; cat <<'E'\nE",
+                    # ...and HOME bound in a heredoc a shell runs.
+                    "bash <<'E'\nHOME=/; rm -rf ~/etc\nE",
+                    "X=bash; $X <<'E'\nHOME=/; rm -rf ~/etc\nE",
+                    "cat <<'E' | sh\nHOME=/; rm -rf ~/etc\nE",
+                    "cat <<E\n$(HOME=/; rm -rf ~/etc)\nE",
+                    # ...or in a file or fd a shell runs.
+                    "cat > w/f <<'E'\nHOME=/; rm -rf ~/etc\nE\nbash w/f",
+                    "exec 3<<'E'\nHOME=/; rm -rf ~/etc\nE\nbash <&3",
+                    # A shell under $HOME is still a shell.
+                    "$HOME/bin/bash <<'E'\nrm -rf /etc\nE",
+                    "HOME=/bin; ~/bash <<'E'\nrm -rf /etc\nE",
+                    # ...and HOME itself may be one, bound or not where seen.
+                    "HOME=/bin/bash; $HOME <<'E'\nrm -rf /etc\nE",
+                    "declare H\\OME=/bin/bash; $HOME <<'E'\nrm -rf /etc\nE",
+                    "declare H\\OME=/bin/bash; $HOME -c 'rm -rf /etc'",
+                    # QA: bash tilde-expands a `${y:-word}` word too.
+                    "HOME=/; rm -rf ${y:-~/etc}",
+                    "HOME=/; rm -rf ${y-~}/etc",
+                    "HOME=/; y=1; rm -rf ${y:+~/etc}",
+                    "HOME=/; a=${y:-~/etc}; rm -rf $a",
+                    "HOME=/; rm -rf ${y:-${z:-~/etc}}",
+                    "cd /; rm -rf ${y:-~+/etc}",
+                    # ...a multi-digit positional, a replacement.
+                    "HOME=/; rm -rf ${10:-~/etc}",
+                    "HOME=/; y=x; rm -rf ${y/x/~/etc}",
+                    "HOME=/; y=x; rm -rf ${y//x/~/etc}",
+                    # ...whose pattern holds a `/` or a `${…}`, or is a bare name.
+                    "HOME=/; y=a/b; rm -rf ${y/a\\/b/~/etc}",
+                    "HOME=/; y=a/b; rm -rf ${y/\"a/b\"/~/etc}",
+                    "HOME=/; y=a/b; rm -rf ${y/'a/b'/~/etc}",
+                    "HOME=/; y=x; z=x; rm -rf ${y/${z:-x}/~/etc}",
+                    "HOME=/; y=a/b; z=a/b; rm -rf ${y/$z/~/etc}",
+                    # ...and a nested `${…}` holding quotes, escapes or another.
+                    "HOME=/; y=x; z=x; rm -rf ${y/${z:-'x'}/~/etc}",
+                    "HOME=/; y=x; z=x; rm -rf ${y/${z:-\\x}/~/etc}",
+                    "HOME=/; y=x; z=x; rm -rf ${y/${z#'q'}/~/etc}",
+                    "HOME=/; y=x; z=x; w=x; rm -rf ${y/${z:-${w}}/~/etc}",
+                    "HOME=/; y='}'; rm -rf ${y/${z:-'}'}/~/etc}",
+                    # QA: bash closes `${z:-{}` at its first `}`; `$'\''` is one quote;
+                    # a `"…"` holds a `${…}` with its own `"`.
+                    "HOME=/; y='{'; rm -rf ${y/${z:-{}/~/etc}",
+                    "HOME=/; y=\"'x\"; rm -rf ${y/$'\\'x'/~/etc}",
+                    "HOME=/; y='}'; rm -rf ${y/\"${z:-\"}\"}\"/~/etc}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # QA: a regex for the replacement backtracked exponentially, then
+        # quadratically, and one search holds the GIL past the hook deadline,
+        # which runs the command. The scan is one pass; ~120 KB each here.
+        for unit in ("${\\}", "~\\}${", "${a", "\"\\", "\\${", "${\\'${'${y/", "'\\'${y/"):
+            start = time.monotonic()
+            guard._replacement_tildes("${y/" + unit * 20000 + "/~")
+            guard._PARAM_TILDE_RE.search("${y:-" + unit * 20000)
+            self.assertLess(time.monotonic() - start, 5, unit)
+        # A HOME named only in a data body binds nothing, so `~` stays `~`.
+        self.assertAllowed("~/.claude/bin/jira comment K - <<'EOF'\n"
+                           "QA: HOME=/; rm -rf ~/etc used to be allowed\nEOF")
+        self.assertAllowed("cd /tmp && ~/bin/x <<\"EOF\"\nHOME=/; rm -rf ~/etc\nEOF")
+        self.assertAllowed("pushd /tmp; rm -rf build")
+        # HOME named on the line too: the program reads as `$HOME/…`, which is
+        # as literal as `~/…` while HOME holds no value of the line's.
+        self.assertAllowed("echo HOME; ~/.claude/bin/jira comment K - <<'EOF'\nrm -rf /etc\nEOF")
+        self.assertAllowed("~/bin/x --title \"guard: eval\" <<'EOF'\nrm -rf /etc\nEOF")
+        self.assertAllowed("$HOME/bin/x <<'EOF'\nrm -rf /etc\nEOF")
+        # QA: a program spelled `~/…` stays a program, so its quoted heredoc
+        # stays data (the jira-helper habit, denied when it read as `$HOME/…`).
+        body = "A (`rm -rf \"${x:-${HOME}}\"/*`) B"
+        self.assertAllowed("~/.claude/bin/jira comment K - <<'EOF'\n" + body + "\nEOF")
+        self.assertAllowed("HOME=/tmp/h; ~/bin/x <<'EOF'\n" + body + "\nEOF")
+        for cmd in ("HOME=/tmp/h; rm -rf ~/x",
+                    "HOME=/; rm -rf '~/etc'",
+                    "HOME=/tmp/h; cd; rm -rf build",
+                    "cd /usr/src/app; rm -rf $PWD/build",
+                    "cd /tmp; rm -rf $PWD/x",
+                    "cd /tmp; rm -rf ~+/x",
+                    "HOME=/tmp/h; rm -rf {~/a,~/b}"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_eval_assignments_and_glob_trims_reach_the_command(self):
         """XERK-1651: a name `eval` assigns is bound for the rest of the line,
         and a `${a%% *}`-style trim is a glob, matched as bash matches it;
@@ -4790,6 +4917,21 @@ class TestPrSummary(unittest.TestCase):
 
     def reason(self, command, cwd=None):
         return guard.pr_summary_reason(command, cwd or self.repo)
+
+    def test_a_tilde_reading_is_not_another_part_naming_the_file(self):
+        """XERK-1685 QA: a body naming `~/…` and `eval` made the `~` reading
+        repeat the writer, read as another part naming the description file."""
+        # Reduced from a real PR body (delta-debugged).
+        body = ("**Summary:** The guard stops refusing an escaped `$(…)` in a quoted string.\n"
+                "## Why\n## What changed\n"
+                "- A skipped escape also triggers the second reading, as a later `bash -c`"
+                " or `eval` re-parse would.\n"
+                "## Risk\n## Testing\n"
+                "- Replay of real Bash commands from `~/.claude/projects`: 2 diffs.\n"
+                "## Follow-ups\n")
+        self.assertIsNone(self.reason(
+            "S=/tmp/qa-s && cat > $S/pr.md <<'EOF'\n" + body
+            + "EOF\ngh pr create -t \"x: escaped \\$(…)\" --body-file $S/pr.md", "/tmp"))
 
     def test_a_conforming_inline_body_is_allowed(self):
         cmd = "gh pr create --title 'XERK-1: Stop duplicate lines' --body " + \
