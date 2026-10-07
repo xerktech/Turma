@@ -974,7 +974,8 @@ def _literal(text: str) -> str:
 
 
 @functools.lru_cache(maxsize=1024)
-def _body_printed(body: str, raw: tuple, multi: bool = True) -> tuple[str | None, int]:
+def _body_printed(body: str, raw: tuple, multi: bool = True,
+                  assigns: bool = True) -> tuple[str | None, int]:
     """`_printed_text` of a substitution body once its own substitutions are
     resolved, and the escaped ones that skipped (replayed by the caller, as
     `_memo` does). Memoised: every pass over a line re-resolves each nesting
@@ -984,10 +985,14 @@ def _body_printed(body: str, raw: tuple, multi: bool = True) -> tuple[str | None
     ``multi`` also reads a body of several statements (`_statements_printed`).
     Without it a body is read as it was before XERK-1609, a reading callers
     keep as well: an opaque body was denied where its printed text is not
-    (`eval "$(true; echo '${x#a}')rm …"`), so dropping it lost denies."""
+    (`eval "$(true; echo '${x#a}')rm …"`), so dropping it lost denies.
+
+    ``assigns=False`` leaves the body's own assignments unapplied: applying
+    them also expands a `${…}` the body only PRINTS (`echo 'X=${v:-a b}
+    Y=1'`), which hid the assignment cut of XERK-1645."""
     before = _SPLICES_ESCAPED[0]
-    resolved = _sub_substs(body, lambda m: _subst_text(m, multi=multi))
-    if "=" in resolved and "$" in resolved and _VAR_ASSIGN_RE.search(resolved):
+    resolved = _sub_substs(body, lambda m: _subst_text(m, multi=multi, assigns=assigns))
+    if assigns and "=" in resolved and "$" in resolved and _VAR_ASSIGN_RE.search(resolved):
         # The body's own assignments are its uses' values: `$(x='rm …';
         # echo "$x")` prints `rm …`, not `$x` (XERK-1634).
         resolved = _substitute_vars(resolved)
@@ -1065,7 +1070,7 @@ def _cat_printed(body: str) -> str | None:
 
 
 def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = False,
-                multi: bool = True) -> str:
+                multi: bool = True, assigns: bool = True) -> str:
     """What a substitution CONTRIBUTES to the command line around it.
 
     `rm -rf $(echo /etc)` deletes /etc, and erasing the substitution erased the
@@ -1081,7 +1086,7 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
 
     ``literal`` escapes a `$(…)`'s printed text as the WORD bash splices in; the
     plain text is what a shell re-parsing it runs. A `<(…)` hands its reader a
-    path, so it has no word reading. ``multi`` is `_body_printed`'s.
+    path, so it has no word reading. ``multi`` and ``assigns`` are `_body_printed`'s.
     """
     # The body's own substitutions run first, and a subshell prints what its
     # body prints: `` `echo \\`echo …\\`` `` and `$( (echo …) )` print the
@@ -1090,7 +1095,7 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
         return _OPAQUE_SUBST
     _SUBST_DEPTH[0] += 1
     try:
-        printed, escaped = _body_printed(_subst_inner(m), _reading(), multi)
+        printed, escaped = _body_printed(_subst_inner(m), _reading(), multi, assigns)
     finally:
         _SUBST_DEPTH[0] -= 1
     _SPLICES_ESCAPED[0] += escaped
@@ -7006,6 +7011,29 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             if seg not in seen:
                 seen.add(seg)
                 segments.append(seg)
+    # ...and one a substitution PRINTS: `bash -c "$(echo 'X=${v:-a b}') rm …"`
+    # re-parses `X=${v:-a b} rm …`, but the cut above ran on the raw line and
+    # the re-parse substitutes `a b` before its own cut can see it (XERK-1645).
+    # So the line with each substitution's printed text spliced in is cut too,
+    # adding its segments and pipelines only where the raw line's cut missed.
+    # The body's own assignments stay unapplied (`assigns=False`): applied,
+    # they expanded the `${…}` it prints before this cut could see it.
+    if bodies:
+        def printed(m: "re.Match[str]") -> str:
+            return _subst_text(m, assigns=False)
+        spliced = _sub_substs(raw_commands, printed)
+        if spliced != raw_commands and "=" in spliced:
+            cut = _unsplit_assignments(spliced)
+            if cut != spliced and cut != (_sub_substs(unsplit, printed)
+                                          if unsplit != raw_commands else spliced):
+                _spend(len(cut))
+                cut_line = _prenormalise(cut)
+                unsplit_line = f"{unsplit_line}\n{cut_line}" if unsplit_line else cut_line
+                seen = set(segments)
+                for seg in _split_segments(cut_line):
+                    if seg not in seen:
+                        seen.add(seg)
+                        segments.append(seg)
     # The TAINT reading of every operator-holding substitution the splitter cut
     # (XERK-1613), rebuilt in ONE pass so a body of N statements stays linear.
     seen = set(segments)

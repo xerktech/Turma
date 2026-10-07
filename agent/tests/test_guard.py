@@ -3032,6 +3032,17 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "timeout -s KILL 5 env X=$((1 + 2)) rm -rf /etc",
         "nice -n 5 env X=${nope:-a;b} rm -rf /etc",
         "sudo -u root X=$((1 + 2)) rm -rf /etc",
+        # ...or only in a substitution's PRINTED text, re-parsed (XERK-1645).
+        "bash -c \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"`echo 'X=${nope:-a b}'` rm -rf /etc\"",
+        "bash -c \"$(printf %s 'X=${nope:-a b}') rm -rf /etc\"",
+        "eval \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "echo \"$(echo 'X=${nope:-a b}') rm -rf /etc\" | bash",
+        "bash <<< \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"$(echo 'X=${nope:-a b} Y=${n:-c d}') rm -rf /etc\"",
+        "bash -c \"$(echo $(echo 'X=${nope:-a b}')) rm -rf /etc\"",
+        "bash -c \"Y=1 $(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"$(printf 'X\\x3d${nope:-a b}') rm -rf /etc\"",
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
@@ -3061,6 +3072,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "env -i PATH=/x X=$((1 + 2)) ls",
         "function build { X=$((1 + 2)) make -j$(nproc); }",
         "nice -n 5 X=$(echo a b) ls",
+        "bash -c \"$(echo 'X=${nope:-a b}') make\"",
+        "R=$(echo 'X=${n:-a b}'); echo \"$R\"",
     ]
 
     def test_shell_wrapped_destructive_blocked(self):

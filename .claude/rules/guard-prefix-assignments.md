@@ -37,6 +37,13 @@ paths:
 - A shell-fed heredoc script is cut BEFORE `_substitute_vars`, for the same reason. Nested heredocs
   that each need a cut double the cost per level (accepted: the deadline denies). Never add a flag
   that skips the nested cut: a heredoc needing its cut then hid the next one.
+- An assignment only a substitution PRINTS is cut on the line with that printed text spliced in
+  (XERK-1645): `bash -c "$(echo 'X=${v:-a b}') rm …"`, eval, here-string, `| bash`. The raw cut
+  never sees it, and the re-parse substitutes `a b` before its own cut runs.
+  - Spliced with `assigns=False` (`_body_printed`): applying the body's own assignments also
+    expanded the `${…}` it prints (`echo 'X=${v:-a b} Y=1'`, `echo $(echo 'X=…')`).
+  - Added only when it differs from the raw line's cut spliced the same way, so a written
+    assignment is not cut twice; its pipelines join `unsplit_line`'s.
 - Only LEADING words: an argument's expansion IS word-split (`rm -rf X=${v:- /etc}` deletes /etc).
 - Replayed against ~33k real Bash commands: 0 decision changes.
 - Tests: `TestWrapperUnwrapping` (`PREFIX_WRAPPED`, `WRAPPED_SAFE`) in `test_guard.py`.
