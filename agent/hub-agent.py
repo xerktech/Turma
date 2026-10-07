@@ -5104,6 +5104,125 @@ def fileguard_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "fileguard.py")
 
 
+# Hook integrity (XERK-1643). The updater records the installed hooks' hashes in
+# `<prefix>/hooks.sha256` and reinstalls the current release when they drift, but
+# it runs hourly; a session that stubbed guard.py had every Bash call on the host
+# allowed until then. So the beat re-checks the same baseline and, on a
+# mismatch, logs it and starts that updater run now. Inert where no baseline
+# exists (a repo checkout, the Windows agent, an install from before this).
+HOOK_REPAIR_MIN_INTERVAL = 600   # seconds between updater kicks for one mismatch
+
+
+HOOK_MAX_BYTES = 8 << 20          # a hook bigger than this is not one we shipped
+
+
+def _read_regular(path, cap):
+    """The bytes of ``path`` when it is a regular, non-symlink file of at most
+    ``cap`` bytes, else None; never raises OSError and never leaks the fd. The
+    open is O_NONBLOCK|O_NOFOLLOW and the type is checked on the open fd: a
+    session can swap a hook or the baseline for a FIFO (a plain open blocks the
+    beat forever), a symlink to /dev/zero (a read never ends) or a directory
+    (``python3 guard.py`` runs its ``__main__.py``)."""
+    try:
+        # Windows has neither flag (and writes no baseline, so nothing reaches here
+        # but the baseline read itself).
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > cap:
+            return None
+        chunks, total = [], 0
+        while total <= cap:
+            chunk = os.read(fd, min(1 << 16, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return None if total > cap else b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _hook_digest(path):
+    """sha256 of a hook that `_read_regular` accepts, else None."""
+    data = _read_regular(path, HOOK_MAX_BYTES)
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def hook_integrity_failures(script_dir=None):
+    """The ``hooks/`` entries that no longer match the baseline, sorted; ``[]``
+    when all match, ``None`` when there is no readable baseline (nothing to check
+    against). A listed hook that is gone counts as a mismatch (a missing hook
+    command is a NON-blocking hook, i.e. a guard failing open), and so does any
+    entry the baseline does NOT list: hooks run as ``python3 <hooks>/x.py``, so
+    their dir is first on sys.path and a planted ``hooks/bisect.py`` replaces the
+    stdlib module guard.py imports."""
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    raw = _read_regular(os.path.join(script_dir, "hooks.sha256"), 1 << 20)
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except (AttributeError, UnicodeDecodeError):     # None: no usable baseline
+        return None
+    expected = {}
+    for line in lines:
+        digest, _, rel = line.partition("  ")
+        # Only the sha256sum lines install_payload writes; anything else (and any
+        # path escaping hooks/) is ignored rather than trusted.
+        if re.fullmatch(r"[0-9a-f]{64}", digest) and re.fullmatch(
+                r"hooks/[A-Za-z0-9_.-]+\.py", rel):
+            expected[rel] = digest
+    if not expected:
+        return None
+    bad = [rel for rel, digest in expected.items()
+           if _hook_digest(os.path.join(script_dir, rel)) != digest]
+    try:
+        present = os.listdir(os.path.join(script_dir, "hooks"))
+    except OSError:
+        present = []
+    # __pycache__ is legitimate: the manager imports permlog.py/guard.py as
+    # modules and writes their bytecode. A HOOK run as a script never imports
+    # from it (no sourceless import from __pycache__), so it cannot shadow the
+    # stdlib for guard.py; the manager's own loaders do read it, but that uid can
+    # already rewrite hub-agent.py itself.
+    bad += [f"hooks/{name}" for name in present
+            if f"hooks/{name}" not in expected and name != "__pycache__"]
+    return sorted(bad)
+
+
+def check_hook_integrity(state, script_dir=None, now=None, spawn=None):
+    """Beat-time half of the check above. ``state`` is a dict the caller keeps
+    across beats (last kick time + last reported set). Returns the mismatched
+    list (or None). Kicks ``bin/turma-agent-update`` detached at most once per
+    HOOK_REPAIR_MIN_INTERVAL; that run takes the update lock, reinstalls the
+    current version and restarts this manager with sessions preserved."""
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    bad = hook_integrity_failures(script_dir)
+    if not bad:
+        state.pop("reported", None)
+        return bad
+    now = time.time() if now is None else now
+    if state.get("reported") != bad:
+        log(f"WARNING: installed safety hooks do not match {script_dir}/hooks.sha256 "
+            f"(tampered or truncated): {', '.join(bad)} — starting the updater to restore them")
+        state["reported"] = bad
+    updater = os.path.join(script_dir, "bin", "turma-agent-update")
+    if now - state.get("kicked", 0) < HOOK_REPAIR_MIN_INTERVAL or not os.path.isfile(updater):
+        return bad
+    state["kicked"] = now
+    try:
+        (spawn or subprocess.Popen)(
+            [updater], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError as e:
+        log(f"hook repair: could not start {updater}: {e}")
+    return bad
+
+
 def permlog_script_path():
     """Absolute path to the bundled permission-ledger hook (``hooks/permlog.py``,
     XERK-1563), resolved the same way as ``guard_script_path``."""
@@ -20652,6 +20771,8 @@ class SessionManager:
         # cmdId is what the UI followed the spawn by; the migrationId is what the
         # hub's migration bookkeeping keys on.
         self.spawn_failures = []
+        # check_hook_integrity's memory across beats (XERK-1643).
+        self._hook_integrity = {}
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -38133,6 +38254,11 @@ class SessionManager:
                 self._deliver_pr_comments()
             except Exception as e:
                 log(f"pr comment delivery failed: {e}")
+        if not light:
+            try:
+                check_hook_integrity(self.__dict__.setdefault("_hook_integrity", {}))
+            except Exception as e:  # never worth a beat
+                log(f"hook integrity check failed: {e}")
         self._poll_clones()
         self._poll_prunes()
         # Start any queued session that can now run — a freed slot or a
