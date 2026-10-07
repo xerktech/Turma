@@ -4367,8 +4367,10 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
             scripts = words[2:3] if words[1:2] == ["--"] else words[1:2]
         else:
             scripts = _raw_shell_c_scripts(words)
-            # A shell's here-string is its script (`bash <<< '…'`).
-            if _basename(words[0]) in _SHELL_PROGS or prog in (".", "source"):
+            # A shell's here-string is its script (`bash <<< '…'`), its name
+            # glued to it or not (`sh<<<'…'`).
+            name = words[0].split("<<<", 1)[0]
+            if _basename(name) in _SHELL_PROGS or _bash_dequoted(name) in (".", "source"):
                 scripts += _herestrings(seg)
         for script in scripts:
             for reading in _script_readings(script):
