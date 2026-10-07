@@ -38,4 +38,8 @@ paths:
     real `}` (`${a#\}}`), its `#` kept a word. Left raw, `eval "${a#\}}"` ran unread.
   - `printf -v` arguments are also read with their defaults applied, as `x=${y:-…}` is.
   - Inside `"…"` a `\}` in a default or `:+` word is a plain `}` (`_dq_unescape_brace`), as in bash.
+  - An ASSIGNED array element's default op is read as the values AND the default, marker-led
+    (top level only: inside another op's pattern the marker would hide its trim).
+    Cost: `y=(ls -la); "${y[@]:-ls}"` is refused as a program. Accepted.
+  - A quoted-`}` op on an assigned array element stays raw text, as before (XERK-1700).
   - Cost, measured: 0 changed decisions over a 38k-command real corpus replay vs main.

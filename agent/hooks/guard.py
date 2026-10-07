@@ -3601,6 +3601,23 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
 
     states = _quote_states(command) if (vals and "$" in command) or "${" in command else []
 
+    def default(text: str, at: int) -> str:
+        """A `${x:-…}` default at ``at``, spliced as the text bash reads."""
+        # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
+        # the `rm` a comment. The `#` was a word inside the braces; keep it
+        # one (XERK-1585). Quotes and `$(…)` in the default stay live.
+        out = re.sub(r"(?<!\\)#", r"\\#", text)
+        # A bare name in it braced, so text after the `}` stays text:
+        # `${a#${b:-$nope}x}` read the pattern as `$nopex` (XERK-1651).
+        out = re.sub(r"(?<!\\)\$([A-Za-z_]\w*)", r"${\1}", out)
+        if states and states[at] == '"':
+            out = _dq_default(out)
+            # In `"…"` bash drops the `\` before a `}` in a default; kept,
+            # `"${a#"${b:-\}}"}"` read the pattern as a literal `\}`
+            # and never trimmed (XERK-1659 QA).
+            out = _dq_unescape_brace(out)
+        return out
+
     def rep(m: "re.Match[str]", depth: int) -> tuple[str, int]:
         """What the use ``m`` splices, and where the text after it resumes."""
         if not _SPLICE_RAW[0] and not _live_dollar(command, m.start()):
@@ -3619,7 +3636,12 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         if m.group(1):
             close = _brace_end(command, m.start(), states[m.start()] == '"')
             if close != end - 1:
-                if close < end:
+                if close < end or vals.get(m.group(1)) \
+                        and command.startswith("[", m.start() + 2 + len(m.group(1))):
+                    # An assigned array's element is read as all its values
+                    # joined, so its op read past a quoted `}` lost the
+                    # default: raw, its `${` keeps an outer op unread, as
+                    # before XERK-1659 (XERK-1700 tracks reading elements).
                     return m.group(0), end
                 if "${" not in command[m.start() + 2:close]:
                     # `[^}]*` stopped at a `}` that is quoted — in
@@ -3655,7 +3677,22 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # does: read as the empty value, `x=; ${x:-rm -rf /}` ran unseen
             # (XERK-1659).
             got = None
-        if got:
+        elem_op = None
+        # Not inside another op: the marker in its pattern would hide its trim.
+        if got and depth == 0 and rest.startswith("[") and rest.find("]") > 0:
+            elem_op = _VAR_OP_RE.match(rest[rest.find("]") + 1:])
+        if got and elem_op and elem_op.group(1) in _VAR_DEFAULT_OPS:
+            # An assigned array's element may be empty or unset all the same
+            # (`y=()`, `y=(a); ${y[1]:-…}`), which the joined values can't
+            # say: read as the values AND as the default, led by the unread
+            # marker. The values alone, `y=(); ${y[0]:-rm -rf /}` ran unseen
+            # (XERK-1659).
+            state = states[m.start()] if m.start() < len(states) else ""
+            sep = '" "' if state == '"' else " "
+            out = sep.join((_quote_literal(_UNREAD_OUTPUT, state),
+                            _quote_literal(_picked(got, name), state),
+                            default(elem_op.group(2), m.start())))
+        elif got:
             value = _picked(got, name)
             state = states[m.start()] if m.start() < len(states) else ""
             if state == '"' and (rest.startswith("[")
@@ -3683,19 +3720,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # home wipe (XERK-1656). Kept, `_home_reading` judges it.
             return "${" + name + rest + "}", end
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
-            # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
-            # the `rm` a comment. The `#` was a word inside the braces; keep it
-            # one (XERK-1585). Quotes and `$(…)` in the default stay live.
-            out = re.sub(r"(?<!\\)#", r"\\#", op.group(2))
-            # A bare name in it braced, so text after the `}` stays text:
-            # `${a#${b:-$nope}x}` read the pattern as `$nopex` (XERK-1651).
-            out = re.sub(r"(?<!\\)\$([A-Za-z_]\w*)", r"${\1}", out)
-            if states and states[m.start()] == '"':
-                out = _dq_default(out)
-                # In `"…"` bash drops the `\` before a `}` in a default; kept,
-                # `"${a#"${b:-\}}"}"` read the pattern as a literal `\}`
-                # and never trimmed (XERK-1659 QA).
-                out = _dq_unescape_brace(out)
+            out = default(op.group(2), m.start())
         else:
             return command[m.start():end], end
         _spend(len(out) - replaced)
