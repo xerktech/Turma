@@ -86,6 +86,8 @@ paths:
     bash's lexer, and each hand scan dropped a glue (`X="$(echo "a b")"$s`, `<(…)`; 3 QA passes).
   - `${…}` closes are matched in ONE stack pass; an unclosed `${` is skipped, never a stop
     (stopping hid every later use). Scanning on per opener was quadratic (`${a:-${` × 2000).
+  - Only a `${` opener nests, as in bash: `${v:-a { b}` closes at the first `}`. Pairing the
+    bare `{` read it as unclosed and glued nothing (QA).
   - A nested span recurses on its text, so past `_MAX_NESTED_VARS` levels it is too large.
   - Added like the cut line: only differing segments, pipelines and `<(…)` texts. A whole-line
     `_expand` of the glued text covered the same cases at 2-6x on real nested scripts.

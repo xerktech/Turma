@@ -4786,7 +4786,7 @@ def _glue_spans(command: str, glue: set[str], in_value: int) -> str:
     lines that only use one. Any `=` earlier on the line counts, quoted or
     not: a scan for where its WORD ends had to be bash's own lexer, and each
     misread (`"$(echo "a b")"`, a case `)`, `<(…)`) dropped a glue (QA)."""
-    if in_value > _MAX_NESTED_VARS:
+    if in_value > _MAX_NESTED_VARS + 1:
         # As deep as `_substitute_vars` refuses; each level rescans its text.
         raise _ExpansionTooLarge
     out, last = [], 0
@@ -4798,14 +4798,17 @@ def _glue_spans(command: str, glue: set[str], in_value: int) -> str:
         return bool(in_value) or 0 <= first_eq < at
 
     # Each `${`'s closing `}`, matched in ONE pass: scanning on from each
-    # opener rescanned the line per unclosed one (`${a:-${` × 2000, QA).
+    # opener rescanned the line per unclosed one (`${a:-${` × 2000, QA). As
+    # in bash, only a `${` nests: a bare `{` is text, so `${v:-a { b}` closes
+    # at the first `}` (paired with the `{`, it read as unclosed, QA).
+    opens = {m.end() - 1 for m in _PARAM_OPEN_RE.finditer(command) if m.group(1) is None}
     closes, stack, i, n = {}, [], 0, len(command)
     while i < n:
         ch = command[i]
         if ch == "\\":
             i += 2
             continue
-        if ch == "{":
+        if i in opens:
             stack.append(i)
         elif ch == "}" and stack:
             closes[stack.pop()] = i

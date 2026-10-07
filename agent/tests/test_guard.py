@@ -3159,6 +3159,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "s='a b'; X=<(true)$s rm -rf /etc",
         "for s in 'a b'; do printf 'X\\x3d$s rm -rf /etc\\n' | bash; done",
         "echo '${'; s='a b'; X=$s rm -rf /etc",
+        "eval 'X=${nope:-{a b}' 'rm -rf /etc'",
+        "echo 'X=${nope:-a { b}' 'rm -rf /etc' | bash",
     ]
 
     # Same wrappers, harmless payloads: the unwrapping must not over-block.
