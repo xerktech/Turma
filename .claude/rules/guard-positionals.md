@@ -106,6 +106,21 @@ paths:
     those only spent budget and false-denied big QA scripts as "too large".
   - `bash -c "$(declare -f f); f /etc"`: `$(declare -f f)` is spliced as f's definition
     (`_DECLARE_F_RE`), so the child's `-c` script is read with f defined and its call binds.
+- **These inline readings are a CPU-blowup hotspot — the gates below are load-bearing** (XERK-1655 QA
+  found 10-23x process-time blowups that tripped the 30s deadline → false-deny on real QA rigs, which
+  this fleet constantly generates). A blowup needs an inlined whole-command/script reading that gets
+  re-expanded per value pass, compounding when it carries nested `$(…)`. Keep all of:
+  - `_positional_readings` is MEMOISED per decision (`_memo("posread", …)`): `_expand` re-reads the
+    same line once per value pass, and recomputing the inlining each time was ~10x.
+  - A body/action/definition that itself holds `$(…)`/backtick is NEVER inlined (call, `declare -f`,
+    eval): splicing it into a `$(…)` re-expands that nest on every reading.
+  - A `$(f)` capture is inlined ONLY when it FEEDS a destructive command (`_capture_feeds_destructive`,
+    `_OUTPUT_TARGET_PROGS`) — `id=$(f)`/benign pipelines are data, and inlining them only re-expands
+    the line (2.5x+). This loses `$(f)` output used by a NON-destructive program, by design.
+  - An `eval` action that is only positional parameters (`eval "$@"`, redirections stripped via
+    `_call_words`) is skipped: it reveals no hidden call/set and binding `$@` per call was 6-11x.
+  - Verify ANY change here with a process_time (NOT wall-clock) replay of the function+`$(f)`+eval
+    corpus subset — the deadline is wall-clock and load-dependent, so a blowup hides under load.
 - Not covered (XERK-1655 residual): `source`/`.` of a written file carrying a positional, a function
   defined in one substitution and called in another, an `eval` of a value read from an untraceable
   source past the reader machinery, and past the byte budget `$1` as a PROGRAM word.

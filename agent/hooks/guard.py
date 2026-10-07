@@ -1707,7 +1707,7 @@ def _budgeted(fn):
         if _budget is not None:
             return fn(*args, **kwargs)
         _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}, "capped": False, "proc": {},
-                   "until": time.monotonic() + _MAX_DECIDE_SECONDS}
+                   "posread": {}, "until": time.monotonic() + _MAX_DECIDE_SECONDS}
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
         _CHAIN_DIFFERS[0] = False
@@ -6536,6 +6536,26 @@ _MAX_CALL_INLINE = 4
 # `$(declare -f NAME)` / `` `typeset -f NAME` `` prints NAME's definition.
 _DECLARE_F_RE = re.compile(r"[$`]\(?\s*(?:declare|typeset)\s+-f[A-Za-z]*\s+"
                            r"([^\s();|&'\"`$]+)\s*[)`]")
+# Programs a captured function output is only WORTH inlining in front of —
+# where it names a path that is deleted/rechmod'd. Elsewhere `$(f)` output is
+# data, so inlining it only re-expands the line (XERK-1655 QA deadline).
+_OUTPUT_TARGET_PROGS = frozenset({"rm", "unlink", "rmdir", "chmod", "chown", "chgrp",
+                                  "shred", "truncate", "dd", "mkfs", "mv", "cp"})
+
+
+def _capture_feeds_destructive(text: str, states: list[str], at: int) -> bool:
+    """Whether the substitution starting at ``at`` is an operand of a
+    destructive program (its enclosing simple command's first word)."""
+    j = at - 1
+    while j >= 0 and not (states[j] == "" and (text[j] in ";&|\n(`"
+                                               or (text[j] == "{" and text[j + 1:j + 2] in " \t"))):
+        j -= 1
+    words = _raw_words(text[j + 1:at])
+    k = 0
+    while k < len(words) and ("=" in words[k] and _ENV_ASSIGN.match(words[k])
+                              or words[k][:1] in "<>" or words[k] in ("!", "time")):
+        k += 1
+    return k < len(words) and _basename(words[k].strip("'\"\\")) in _OUTPUT_TARGET_PROGS
 
 
 def _eval_inlined_lines(text: str) -> list[str]:
@@ -6554,7 +6574,9 @@ def _eval_inlined_lines(text: str) -> list[str]:
             continue
         kind = m.group(1)
         end = _args_end(text, states, m.end(1))
-        words = _raw_words(text[m.end(1):end])
+        # `_call_words` drops `eval`'s own redirections (`eval "$@" 2>&1`), so a
+        # pure args-passthrough action reads as just `$@` and is skipped below.
+        words = _call_words(text[m.end(1):end])
         while words and words[0] == "--":
             words = words[1:]
         if kind == "trap":
@@ -6570,6 +6592,18 @@ def _eval_inlined_lines(text: str) -> list[str]:
                 continue
             action = " ".join(_dequote_value(w) for w in words)
         action = _substitute_vars(action, vals)
+        # A substitution in the action re-expands on every reading once spliced
+        # into the line; skip it (the direct call/set shapes carry none) so a
+        # substitution-heavy eval does not blow the decide deadline (XERK-1655 QA).
+        if "$(" in action or "`" in action:
+            continue
+        # An action that is ONLY positional parameters (`eval "$@"`, the
+        # args-passthrough idiom) reveals no hidden call/set — it just re-runs
+        # the args, which binding already covers — and splicing `$@` binds it
+        # per call, 6-11x on real QA rigs that call such a function many times
+        # (XERK-1655 QA deadline). The ticket's eval shapes all carry a literal.
+        if not _POSITIONAL_RE.sub("", action).strip():
+            continue
         if action.strip() and action != text[m.start(1):end]:
             pieces.append((m.start(1), end, action))
     if not pieces:
@@ -6591,14 +6625,24 @@ def _eval_inlined_lines(text: str) -> list[str]:
 
 def _positional_readings(text: str, _eval_depth: int = 0) -> list[str]:
     """`_positional_readings_core`, plus readings where `eval`/`trap` action
-    strings are inlined so a call or `set` hidden in one binds too (XERK-1655)."""
+    strings are inlined so a call or `set` hidden in one binds too (XERK-1655).
+
+    Memoised per decision at the top level: `_expand` re-reads the same line
+    once per value pass, and recomputing the inlining (`_find_substs` per pass)
+    turned a real function-defining QA rig 10x slower toward the deadline."""
+    if _eval_depth == 0 and _budget is not None:
+        return _memo("posread", text, _positional_readings_uncached, text, 0)
+    return _positional_readings_uncached(text, _eval_depth)
+
+
+def _positional_readings_uncached(text: str, _eval_depth: int = 0) -> list[str]:
     out = _positional_readings_core(text)
     if _eval_depth < _MAX_EVAL_INLINE and ("eval" in text or "trap" in text):
         for inlined in _eval_inlined_lines(text):
             if inlined == text:
                 continue
             out.append(inlined)
-            out.extend(_positional_readings(inlined, _eval_depth + 1))
+            out.extend(_positional_readings_uncached(inlined, _eval_depth + 1))
     return list(dict.fromkeys(out))
 
 
@@ -6699,8 +6743,12 @@ def _positional_readings_core(text: str) -> list[str]:
         # A self-recursive function is never inlined in place: its body holds a
         # call to itself, which would nest every pass (a plain countdown became
         # "too deep", XERK-1626 QA). The positional `work` loop handles those.
+        # Nor is a body that itself holds a `$(…)`/backtick: splicing it into a
+        # `$(…)` re-expands that nest on every reading, 10-23x on real QA rigs
+        # that `$(f)`-capture a substitution-heavy body (XERK-1655 QA, deadline).
         inlinable = {n: b for n, b in all_defs.items()
                      if not any(re.search(r"(?<![\w.-])" + re.escape(n) + r"(?![\w.-])", body)
+                                or "$(" in body or "`" in body
                                 for body in b)}
         inlined = text
         if inlinable:
@@ -6723,7 +6771,14 @@ def _positional_readings_core(text: str) -> list[str]:
                 for m in inline_re.finditer(inlined):
                     if st[m.start(1)] not in ("", m.group(2) or "\\") or m.group(3) in inlined_names:
                         continue
-                    if not any(s < m.start(1) < e for s, e in spans):
+                    span = next(((s, e) for s, e in spans if s < m.start(1) < e), None)
+                    if span is None:
+                        continue
+                    # Only inline a capture that FEEDS a destructive command
+                    # (`rm -rf "$(f)"`); elsewhere (`id=$(mkid)`, a benign
+                    # pipeline) the output is data and inlining just re-expands
+                    # the line — 10-23x on real QA rigs (XERK-1655 QA deadline).
+                    if not _capture_feeds_destructive(inlined, st, span[0]):
                         continue
                     end = _args_end(inlined, st, m.end(1))
                     cwords = _call_words(inlined[m.end(1):end])
@@ -6759,7 +6814,9 @@ def _positional_readings_core(text: str) -> list[str]:
         # f defined, and its call binds.
         def _declare_f(mm: "re.Match[str]") -> str:
             body = all_defs.get(mm.group(1))
-            return f"{mm.group(1)}() {{{body[0]}}}; " if body else mm.group(0)
+            if not body or "$(" in body[0] or "`" in body[0]:
+                return mm.group(0)  # a substitution-heavy body re-expands too far
+            return f"{mm.group(1)}() {{{body[0]}}}; "
 
         declared = _DECLARE_F_RE.sub(_declare_f, text)
         if declared != text:
