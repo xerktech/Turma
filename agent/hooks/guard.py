@@ -2488,14 +2488,30 @@ def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> l
         else out * 2
 
 
-def _splice_readings(readings: list[str], state: str) -> str:
+def _herestring_word(command: str, states: list[str], i: int) -> bool:
+    """Whether ``command[i]`` sits in the word a `<<<` takes: only that one
+    word is its text, so a splice there must stay one word."""
+    while i > 0 and (states[i - 1] if i - 1 < len(states) else "") or (
+            i > 0 and not command[i - 1].isspace() and command[i - 1] not in ";|&<>()"):
+        i -= 1
+    return command[:i].rstrip().endswith("<<<")
+
+
+def _splice_readings(readings: list[str], state: str, one_word: bool = False) -> str:
     """Several readings of one expansion spliced as words led by
     `_UNREAD_OUTPUT`: as a program it is refused, and each reading still
-    reaches the path rules — inside `"…"` too, as separate words."""
+    reaches the path rules — inside `"…"` too, as separate words. There the
+    first word holds them ALL, marker-led: a carrier reading one argument
+    (`bash -c "${a##+(x)}"`, `trap "…"`, `<<< "…"`) saw only the marker and
+    ran a script the guard never read (XERK-1664 QA). ``one_word`` (a `<<<`
+    operand, which takes one word) keeps only that joined word: the rest
+    became the shell's script-file arguments."""
     if len(readings) == 1:
         return _quote_literal(readings[0], state)
-    words = [_quote_literal(w, state) for w in (_UNREAD_OUTPUT, *readings)]
-    return ('" "' if state == '"' else " ").join(words)
+    if state == '"':
+        joined = " ".join((_UNREAD_OUTPUT, *readings))
+        return '" "'.join(_quote_literal(w, state) for w in (joined, *(() if one_word else readings)))
+    return " ".join(_quote_literal(w, state) for w in (_UNREAD_OUTPUT, *readings))
 
 
 def _arith_offset(text: str) -> int | None:
@@ -4194,7 +4210,8 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 if state == '"' and op and op.group(1) in (":+", "+"):
                     arg = _dq_unescape_brace(arg)  # as a default's, below
                 out = _splice_readings(_op_readings(value, op.group(1), arg, vals)
-                                       if op else [value], state)
+                                       if op else [value], state,
+                                       _herestring_word(command, states, m.start()))
         elif name == "HOME" and op and op.group(1) in _VAR_DEFAULT_OPS and _HOME_KEPT[0]:
             # The reading where HOME is set, as it is in every shell an agent
             # runs: spliced, `"${HOME:-/tmp}"/*` read `/tmp/*` and hid the

@@ -38,6 +38,10 @@ paths:
   - Never trust the on reading as THE text: bash's matcher has quirks it does not model
     (`${a#*@(x|)}` on `x/etc` is `/etc`; `[[ x == *!(x) ]]` is false). Path-form quirks: XERK-1714.
   - On `${HOME<op>}` an extglob op reads as `/`: a None there read the target as not-home.
+- **Inside `"…"`, `_splice_readings`' FIRST word holds every reading, marker-led**, then each
+  reading as its own word (path rules). Marker alone first, a one-argument carrier (`bash -c "…"`,
+  `trap "…"`) read only the marker and ran the rest unread. A `<<<` operand takes one word, so
+  there only the joined word is spliced (`_herestring_word`): the others became script args.
   - `_VAR_OP_EXT_STEPS` charges every range and union, not just positions: uncharged, one
     `+(*|*|…)` op ran 46s. Nesting past `_EXTGLOB_DEPTH` is unreadable (was a RecursionError).
   - Don't add `shopt` tracking instead: `shopt` is respelled as freely as any command, `bash -O`

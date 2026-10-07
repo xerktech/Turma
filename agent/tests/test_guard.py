@@ -2144,7 +2144,16 @@ class TestScriptChannels(unittest.TestCase):
                     "shopt -s extglob; a='xxrm -rf /etc'; c=zx; ${a#@(${c#@(z)}x)}",
                     # QA: an extglob op on HOME reads as the root.
                     "rm -rf ${HOME%+(?)}", "rm -rf \"${HOME/+(?)/}\"",
-                    "rm -rf \"${HOME%+(?)}\"/.ssh", "rm -rf ~/../../etc${HOME#+(?)}"):
+                    "rm -rf \"${HOME%+(?)}\"/.ssh", "rm -rf ~/../../etc${HOME#+(?)}",
+                    # QA delta: a carrier reading ONE argument or word gets
+                    # every reading, not just the marker.
+                    "shopt -s extglob; a='xxrm -rf /etc'; bash -c \"${a##+(x)}\"",
+                    "shopt -s extglob; a='xrm -rf /etc'; trap \"${a#*@(x|)}\" EXIT",
+                    "shopt -s extglob; a='xrm -rf /etc'; bash <<< \"${a#*@(x|)}\"",
+                    "shopt -s extglob; a='xxrm -rf /etc'; bash <<<\"${a//+(x)/}\"",
+                    "shopt -s extglob; a='xxrm -rf /etc'; xargs -0 bash -c <<< \"${a##+(x)}\"",
+                    "a='rm -rf /etc'; bash -c \"${a#$PWD}\"",
+                    "a='rm -rf /etc'; bash <<< \"${a%$nope}\""):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("shopt -s extglob; f=build.bak; rm -rf \"${f%+(.bak)}\"",
@@ -2157,7 +2166,7 @@ class TestScriptChannels(unittest.TestCase):
         star = "|".join(["*"] * 200)
         for v, op, pat in (("x" * 5000 + "/etc", "##", "*(!(y))"), ("x" * 2000, "##", f"+({star})"),
                            ("x" * 2000, "%%", f"*({star})"), ("x" * 500, "//", f"!({star})/-"),
-                           ("x" * 256, "##", "+(" * 300 + "x" + ")" * 300)):
+                           ("x" * 256, "##", "+(" * 3000 + "x" + ")" * 3000)):
             with self.subTest(pat=pat[:20]):
                 started = time.monotonic()
                 self.assertGreater(len(guard._var_op_readings(v, op, pat)), 1)
