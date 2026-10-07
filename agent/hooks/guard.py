@@ -702,6 +702,22 @@ def _decoy_readings(raw: str) -> list[str]:
 _QUOTE_STATE_CHARS = frozenset("#\\$}`'\"()")
 
 
+def _ansi_c_dollar(command: str, i: int) -> bool:
+    """Whether the `$` at ``i`` (before a `'`) opens an ANSI-C string: not the
+    second half of a `$$` (the PID, then a plain `'…'`). bash pairs a `$` run
+    left to right, after an escaped first `$` (XERK-1693 QA: `$$'a\\'; rm …`)."""
+    j = i
+    while j > 0 and command[j - 1] == "$":
+        j -= 1
+    run = i - j + 1
+    k = j
+    while k > 0 and command[k - 1] == "\\":
+        k -= 1
+    if (j - k) % 2:
+        run -= 1  # `\$` is a literal dollar
+    return run % 2 == 1
+
+
 def _quote_states(command: str) -> list[str]:
     """How each character of ``command`` is quoted: `'` inside a single-quoted
     literal, `"` inside a double-quoted string, `\\` escaped, "" bare.
@@ -778,7 +794,7 @@ def _quote_states(command: str) -> list[str]:
                 out[i + 1:j] = _quote_states(command[i + 1:j])
                 i = j + 1
                 continue
-        if command.startswith("$'", i) and top in ("", "(", "{"):
+        if command.startswith("$'", i) and top in ("", "(", "{") and _ansi_c_dollar(command, i):
             # An ANSI-C string: `\` escapes the next character, so the `\'`
             # in `$'it\'s'` is text, not its close. Read as a plain `'…'`, its
             # `s'` opened a quote that hid every later `$'…'` (XERK-1693 QA).
@@ -2379,7 +2395,7 @@ def _decode_ansi_c(command: str) -> str:
         # its `$'` only: the match may run over a real `$'…'` after it.
         if states is None:
             states = _quote_states(command)
-        if states[start]:
+        if states[start] or not _ansi_c_dollar(command, start):
             out.append(command[pos:start + 2])
             pos = start + 2
             continue

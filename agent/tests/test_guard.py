@@ -1886,6 +1886,9 @@ class TestScriptChannels(unittest.TestCase):
         # A `$'` inside quotes is literal: decoded, `\x27` unbalanced the line.
         self.assertEqual(guard._decode_ansi_c("echo \"$'\\x27'\" 'x$'\\' $'\\x41'"),
                          "echo \"$'\\x27'\" 'x$'\\' A")
+        # `$$'a'` is the PID then a plain `'a'`; an odd `$` run or `\$$'` is ANSI-C.
+        self.assertEqual(guard._decode_ansi_c("echo $$'a' \\$$'\\x41' $$$'\\x41'"),
+                         "echo $$'a' \\$A $$A")
         for cmd in ("bash -c $'rm -rf /etc; : \\x'", "bash -c $'rm -rf /etc; : \\u41'",
                     "bash -c $'rm -rf /etc; : \\x4'", "echo \"$'\\x27'\"; rm -rf /etc",
                     "bash -c \"echo $'\\x27'; rm -rf /etc\"", "eval \"echo $'\\''\"; rm -rf /etc\"",
@@ -1893,6 +1896,7 @@ class TestScriptChannels(unittest.TestCase):
                     "echo $'it\\'s'; bash -c $'rm -rf /etc'",
                     "echo $'it\\'s'; bash -c $'\\x72m -rf /etc'",
                     "echo \"$'\\x27'\"; echo $'it\\'s'; bash -c $'rm -rf /etc'",
+                    "echo $$'a\\'; rm -rf /etc #'", ": $$'\\'; rm -rf /etc #'",
                     "bash -c ': # $'\"'\"'\\nx'\"'\"'\nrm -rf /etc'"):
             with self.subTest(cmd=cmd):
                 self.assertIn("recursive delete", guard.is_destructive(cmd) or "")

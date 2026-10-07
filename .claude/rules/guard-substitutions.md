@@ -111,6 +111,8 @@ paths:
   - `_quote_states` reads a bare `$'…'` as one quote span whose `\` escapes the next character:
     read as `'…'`, the `\'` in `$'it\'s'` closed it and `s'` hid every later `$'…'` from the
     decode. A blind-decode reading beside it was tried and lost to one decoy per model.
+  - Only an ODD run of `$` before the `'` is ANSI-C (`_ansi_c_dollar`): `$$'a\'` is the PID and a
+    plain `'a\'`, which bash closes at the `\'`; read as ANSI-C it hid the command after it.
   - Divergence kept (no bypass found): bash decodes `$'…'` inside `"${x:-…}"` (extquote).
   Tests: `test_ansi_c_strings_decode_as_bash_does` (against real bash).
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
