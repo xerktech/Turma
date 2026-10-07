@@ -4500,13 +4500,18 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "busybox hush -c 'rm -rf /'", "busybox msh -c 'rm -rf /etc'",
                     "busybox hush <<'E'\nrm -rf /etc\nE",
                     # ...and busybox itself stays one to `-c` (QA).
-                    "busybox script -qc 'rm -rf /etc' /dev/null", "busybox -- rm -rf /etc"):
+                    "busybox script -qc 'rm -rf /etc' /dev/null", "busybox -- rm -rf /etc",
+                    # ...and a pipe still reaches the applet (QA).
+                    "echo 'rm -rf /etc' | busybox env sh", "echo /etc | busybox xargs rm -rf",
+                    "echo 'rm -rf /etc' | busybox xargs -0 busybox hush -c",
+                    'busybox find "$x/$y" | xargs rm -rf'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
                     'find "$dir/$f" -exec grep -l x {} +', 'chmod -R 755 "$dir"/build',
                     'find "$d"/out -delete', 'busybox rm -rf "$dir"/build', "busybox ls /",
-                    'find "$dir"/out -name "*.o" | xargs rm -f'):
+                    'find "$dir"/out -name "*.o" | xargs rm -f', "busybox tar -czf x.tgz dir",
+                    "echo hi | busybox hush"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 

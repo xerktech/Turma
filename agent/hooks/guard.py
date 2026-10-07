@@ -99,6 +99,9 @@ _PREFIX_WORDS = {
     "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer", "builtin",
     # `coproc cmd` runs cmd (XERK-1624).
     "coproc",
+    # `busybox rm -rf /etc` runs its applet; busybox's own `-c` reading is
+    # kept beside it in `_expand` (XERK-1687).
+    "busybox",
 }
 
 # Options of those wrappers that consume the NEXT token as their value, so
@@ -158,8 +161,8 @@ _FUNC_DEF_RE = re.compile(r".*\(\)$", re.DOTALL)
 _CASE_PATTERN_RE = re.compile(r"^[^()\s]+\)$")
 
 # Interpreters whose `-c <string>` argument is a whole command line of its own.
-# BusyBox's own shells are among them: `busybox hush -c '…'` is also read as
-# its applet alone (XERK-1687).
+# BusyBox's own shells are among them: `busybox` is a stripped wrapper, so
+# `busybox hush -c '…'` reaches here as `hush` (XERK-1687).
 _SHELL_PROGS = {"bash", "sh", "zsh", "ksh", "dash", "ash", "hush", "msh", "busybox", "su"}
 
 # Programs that merely PRINT their arguments. `eval "$(echo rm -rf /etc)"` runs
@@ -5535,6 +5538,10 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
                         or wrapper == "nice" and re.match(r"^[0-9]", out[0])
                         or wrapper == "chrt" and re.match(r"^[-+]?[0-9]|^[$`]", out[0])):
                 out.pop(0)
+            # BusyBox rm has no preserve-root: `busybox rm -rf "$x/$y"` empties
+            # `/`, so it is read as GNU rm told not to refuse it (XERK-1687).
+            if wrapper == "busybox" and out and _basename(out[0]) == "rm":
+                out.insert(1, "--no-preserve-root")
             # `coproc NAME { cmd; }`: a name only ever precedes a compound
             # command, whose body runs (XERK-1620 QA).
             if wrapper == "coproc" and len(out) > 1 and out[1] in ("{", "(", "while", "until",
@@ -8500,17 +8507,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
-        if prog == "busybox":
-            # `busybox rm -rf /etc` runs its applet: an ADDED reading, since
-            # busybox itself stays a shell to the `-c` readings (`busybox
-            # script -qc '…'`). BusyBox rm has no preserve-root, so it is read
-            # as GNU rm told not to refuse `/` (XERK-1687).
-            applet = rest[1:] if rest[:1] == ["--"] else rest
-            if applet and not applet[0].startswith("-"):
-                if _basename(applet[0]) == "rm":
-                    applet = [applet[0], "--no-preserve-root", *applet[1:]]
-                out.extend(_expand_segments(
-                    " ".join(shlex.quote(t) for t in applet), depth + 1, cwds))
+        # `busybox` is stripped as a wrapper, which lost busybox itself as a
+        # shell to the `-c` readings (`busybox script -qc '…'`). So the words
+        # from it on are also read with it as `sh`: an ADDED reading (XERK-1687).
+        raw_toks = _tokenize(seg)
+        bb = next((i for i, t in enumerate(raw_toks[:len(raw_toks) - len(tokens)])
+                   if _basename(t) == "busybox"), -1)
+        if bb >= 0:
+            out.extend(_expand_segments(
+                " ".join(shlex.quote(t) for t in ["sh", *raw_toks[bb + 1:]]), depth + 1, cwds))
         # The file a shell or `.` runs, or one run by its path (`./s.sh`).
         script_path = (_script_file(prog, rest) if prog in _SHELL_PROGS or prog in ("source", ".")
                        else posixpath.normpath(tokens[0]) if "/" in tokens[0] else None)
