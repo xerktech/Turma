@@ -33,14 +33,15 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `guard-order.md` | `guard.py`, `test_guard.py` | guard: values also read in order, loops replayed (XERK-1660) |
 | `guard-value-sources.md` | `guard.py`, `test_guard.py` | guard: redirect joins, value sources, files run as scripts (XERK-1641) |
 | `guard-positionals.md` | `guard.py`, `test_guard.py` | guard: `$1` bound by `sh -c`, a function call or `set` (XERK-1626) |
+| `guard-readers.md` | `guard.py`, `test_guard.py` | guard: what a reader binds: IFS/`-d`, heredocs, `-C` (XERK-1658) |
 | `agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
 | `agent-native-windows.md` | `agent/native/README-windows.md`, `docs/windows-agent-adr.md` | Windows agent (XERK-666) map: component→rules-file, invariants, operator guide |
 | `windows-agent.md` | `agent/hub-agent.py` | native Windows portability: paths, %APPDATA%, icacls ACL, liveness/degradation (XERK-670); ADR `docs/windows-agent-adr.md` |
-| `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher (turma-agent.ps1, XERK-669) + service/control (turma-agent.xml, turma-agentctl.ps1, XERK-671) + installer (install.ps1, XERK-672) + `irm\|iex` bootstrap (bootstrap.ps1, XERK-673) + self-updater (turma-agent-update.ps1, XERK-674): WinSW unit, control verbs, session-preserving restart, pidfile, update poller, asset seam |
+| `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher (XERK-669), service/control (XERK-671), installer (XERK-672), `irm\|iex` bootstrap (XERK-673), self-updater (XERK-674): WinSW unit, session-preserving restart, pidfile, update poller + payload swap, asset seam |
 | `windows-terminal.md` | `agent/win/**` | native Windows terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
 | `turma.md` | `turma/**` | chrome, org filter, org binding, dashboard, terminal proxy, auth |
 | `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |
-| `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js`, `turma/index-store.js` | HA archive of-record (XERK-759/780/793): object-store bytes + Postgres index of-record; under HA the local node:sqlite is RETIRED for an in-memory session map (hydrated from PG) + PG-direct search, the mirror/hydrate seam |
+| `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js`, `turma/index-store.js` | HA archive of-record (XERK-759/780/793): object-store bytes + Postgres index of-record; under HA local node:sqlite is RETIRED for an in-memory session map (PG-hydrated) + PG-direct search |
 | `turma-ha-postgres.md` | `turma/pgclient.js` | HA Postgres of-record spine (XERK-776): stdlib v3 wire client + SCRAM-SHA-256 + extended query + pool + GREATEST upsert; consumed by the ledger (XERK-779) + archive index (XERK-780) of-records; non-HA returns null |
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `turma-ha-registry.md` | `turma/server.js` | HA: the fleet registry + per-host command queues in the shared store (per-host write-through, hydration, watch); non-HA byte-identical (XERK-756) |
