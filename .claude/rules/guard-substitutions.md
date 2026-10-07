@@ -99,14 +99,16 @@ paths:
   - Budget: `_MAX_FOR_WORD_CHARS` of line × passes (taint readings multiply); past it the line is
     `_TOO_LARGE` (a deny) — e.g. ~200 loops on one line. Characters, never a wall clock: that
     denied a real command only on a busy host.
-  - Two lists whose uses TOUCH (quotes between at most: `$a$b`, `"${a}""$b"`, `$a'$'b`) are also
-    read as their PRODUCT (XERK-1657, `_glued_name_pairs`): one at a time, `$a$b` never formed
-    `rm`. Not across literal text (`$d/$f`): that doubled real directory loops' cost (QA). Past
+  - Two lists used in one word (`$a$b`, `${a}a$b`, `$a$z$b`, `$a'$'b`) are also read as their
+    PRODUCT (XERK-1657, `_glued_name_pairs`): one at a time, `$a$b` never formed `rm`. Not
+    across a `/` (`$d/$f`): that doubled real directory loops' cost (QA); quotes-only glue let
+    `${a}a$b` and an empty `$z` between through (QA). Past
     `_MAX_FOR_PRODUCT` readings the line is too large (60×60 words took 8 s). Unglued nested lists
     stay one at a time; three glued names are read pairwise only (residual).
   - Shell-list words are brace-expanded first (`_brace_words`): `_expand_braces` skips a list
     holding a blank, so `for v in a {'rm …',b}` bound one word. Past `_BRACE_SEQ_MAX` words each
-    item of each list is a word too (`_brace_items_flat`): read short, a later item ran unread;
+    item of each list is a word too (`_brace_items_flat`, `_BRACE_FLAT_DEPTH` levels, a deeper item
+    kept as written — at 4 levels a deeper payload was dropped): read short, a later item ran unread;
     refused, a long brace in heredoc text nothing runs was denied (QA). `$"…"` dequotes as `"…"`,
     `$'…'` as its decoded text.
   - Cost accepted: each word now read (brace items, product) is a whole-line reading, as a literal

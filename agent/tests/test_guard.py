@@ -3417,7 +3417,14 @@ class TestExpansionBudget(unittest.TestCase):
                     "sh -c 'env x=$1' _ 'a rm -rf /'", f"sh -c 'x=case $1' _ '{R}'",
                     f"f(){{ env -i x=$1; }}; f 'a {R}'",
                     f"v='{R}'; eval '${{'v'}}'", f"for v in a '{R}'; do eval '${{v'}}; done",
-                    ": '$'; rm -rf $'/etc'", f": '$'; eval $'{R}'"):
+                    ": '$'; rm -rf $'/etc'", f": '$'; eval $'{R}'",
+                    # QA: a product across literal text or an empty name; an
+                    # escaped separator is no command start; env takes any
+                    # `=` word; a brace payload nested past a few levels.
+                    f"for a in ech ev; do for b in o l; do ${{a}}a$b '{R}'; done; done",
+                    f"for a in ech eva; do for b in o l; do $a$z$b '{R}'; done; done",
+                    f"f(){{ env a\\;x=$1; }}; f 'a {R}'", f"env 'a;x=1' {R}",
+                    "for f in {x,{x,{x,{x,{x,'" + R + ";'}}}}}" + "{1,2}" * 6 + "; do eval $f; done"):
             with self.subTest(cmd=cmd):
                 reason = self.check(cmd)
                 self.assertIsNotNone(reason)

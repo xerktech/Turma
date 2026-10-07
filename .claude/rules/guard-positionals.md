@@ -55,7 +55,8 @@ paths:
   - Never in an ASSIGNMENT (`_in_assignment_word`): escaped, `f(){ x=$1; $x; }; f 'rm …'` read
     `x=rm` (a QA bypass of main's deny). Assignment = a command's leading `NAME=` words, or a
     declaring builtin's (`local`/`export`/…, after its options). `env x=$1` is an argument and
-    `x=case $1` runs `$1`: both split (QA). The `sh -c` binding keeps such a value whole too.
+    `x=case $1` runs `$1`: both split (QA). A separator that is quoted or escaped (`env a\;x=$1`)
+    starts no command, so that word splits too. The `sh -c` binding keeps such a value whole.
 - Every binding is an ADDED reading beside the unbound text, and ORDER-BLIND on purpose: a `set`
   binds bodies it never reaches; a call binds whatever body its name has.
 - `shift` in the bound text adds each shifted list (`_shifted`, up to `_MAX_SHIFTS`); `for p;`

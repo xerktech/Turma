@@ -22,6 +22,8 @@ paths:
   - `_word_end` passes its known quoting to `_brace_end`; looked up, that is a whole-line
     `_quote_states` per `${` — quadratic.
   - The cut line's pipelines feed the pipe-to-shell scan too (`echo 'X=${v:-a b} rm …' | bash`).
+- After `env` (and its options) EVERY word holding `=` is an assignment, a name bash would refuse
+  included: `env 'a;x=1' rm -rf /etc` runs `rm` (XERK-1657 QA; was allowed on main).
 - A standalone assignment (`R=$(command -v ruff); $R format`) is never cut: it sets the shell's
   variable, and cutting it read `$R` empty — a false deny.
 - Redirections and their targets may precede the assignments (`>/dev/null X=… cmd`, `{fd}>`,

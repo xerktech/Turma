@@ -1923,11 +1923,18 @@ def _brace_words(word: str) -> list[str]:
     return out
 
 
+# How deep `_brace_items_flat` opens nested lists: each level rescans its item,
+# so cost is depth × length; at 4, a payload 5 deep went unread (QA).
+_BRACE_FLAT_DEPTH = 64
+
+
 def _brace_items_flat(word: str, depth: int = 0) -> list[str]:
     """Every item of every brace list in ``word``, each a word, nested lists
-    flattened a few levels: the cap's reading, linear in the word."""
+    flattened: the cap's reading."""
+    if depth >= _BRACE_FLAT_DEPTH:
+        return [word]  # deeper still: the item as written, never dropped (QA)
     out, pos = [], 0
-    while depth < 4:
+    while True:
         span = _brace_list(word[pos:])
         if span is None:
             break
@@ -4784,6 +4791,10 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
                 if (opt not in _PREFIX_LONG_FLAGS.get(wrapper, ())
                         and _opt_takes_next(opt, takes_value) and out):
                     out.pop(0)
+            # env takes ANY word holding `=` as an assignment, a name bash would
+            # refuse included: `env 'a;x=1' rm -rf /etc` runs `rm` (XERK-1657 QA).
+            while wrapper == "env" and out and "=" in out[0] and not out[0].startswith("-"):
+                out.pop(0)
             # `timeout 5s cmd` / `nice 10 cmd`: a bare duration/priority operand.
             # timeout's is REQUIRED, so it goes whatever it looks like: kept,
             # `timeout ${T:-5} bash` read as the program `${T:-5}` (XERK-1618).
@@ -5786,18 +5797,20 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForP
 
 
 def _glued_name_pairs(command: str, names: set[str]) -> set[frozenset[str]]:
-    """Each pair of ``names`` whose uses touch in one word, nothing but quotes
-    between them (`$a$b`, `"${a}""$b"`), as a product of their values may
-    form one word. Not across literal text (`$d/$f`): read per path, real
-    loops over directories cost 2x for a shape that forms no program word."""
+    """Each pair of ``names`` used in one word, as a product of their values
+    may form it (`$a$b`, `${a}a$b`, `$a$z$b`, XERK-1657 QA). Not across a
+    `/` (`$d/$f`): read per path, real loops over directories cost 2x for a
+    shape that forms no program word."""
     if len(names) < 2:
         return set()
     pairs = set()
     last = None
     for use in _GLUE_USE_RE.finditer(command):
         name = use.group(1)
-        if last is not None and last[0] != name and last[0] in names and name in names \
-                and re.fullmatch(r"['\"]*", command[last[1]:use.start()]):
+        if name not in names:
+            continue  # another name may be empty: `$a$z$b`
+        if last is not None and last[0] != name \
+                and re.fullmatch(r"[^\s;|&<>()/]*", command[last[1]:use.start()]):
             pairs.add(frozenset((last[0], name)))
         last = (name, use.end())
     return pairs
@@ -6463,7 +6476,12 @@ def _in_assignment_word(text: str, pos: int) -> bool:
         start -= 1
     if not _ASSIGN_HEAD_RE.match(text, start):
         return False
-    before = re.split(r"[;&|(){}`\n]", text[:start])[-1].split()
+    head = re.split(r"[;&|(){}`\n]", text[:start])
+    # A quoted or escaped separator is no command start (`env a\;x=$1`,
+    # `env "a;"x=$1`, QA): any quote or `\` near it reads as an argument.
+    if len(head) > 1 and re.search(r"[\\'\"]", head[-2][-1:] + head[-1]):
+        return False
+    before = head[-1].split()
     k = 0
     while k < len(before) and (before[k] in _CMD_START_WORDS or _ASSIGN_HEAD_RE.match(before[k])):
         k += 1
