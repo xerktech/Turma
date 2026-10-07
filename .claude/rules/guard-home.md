@@ -10,7 +10,8 @@ paths:
   `${HOME<op>}` expanded against the session's REAL home (`_home_reading`).
   - As tokens, `$HOME/..` normpaths to `.` and `${HOME/root/etc}` hides the name, so
     `chmod -R 777 $HOME/..` (= `/`) and `rm -rf "${HOME/root/}"*` (= `/*`) were allowed.
-- A reading that stays inside a home is put back as `~…` / `~user…` before it is judged.
+- A reading that stays inside a home is put back as `$HOME…` / `~user…` before it is judged
+  (`$HOME`, not `~`: bash expands no tilde in `~*`, so `$HOME*/build` must stay `$HOME*`).
   - Never judge it as the absolute path: `/root/.cache` is a child of the /root system
     root, so every `$HOME/...` cleanup would deny.
 - Ops are evaluated by the guard's own `_apply_var_op` / `_replace_op`; an unset name in an

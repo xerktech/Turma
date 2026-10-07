@@ -7937,7 +7937,7 @@ def _user_home(name: str) -> str | None:
 def _home_reading(raw: str) -> str | None:
     """``raw`` read with the session's HOME expanded (and a `~user` prefix,
     as bash does), or None when it names no home or the reading cannot be
-    made. A reading that stays inside a home is put back as `~…`/`~user…`,
+    made. A reading that stays inside a home is put back as `$HOME…`/`~user…`,
     which the home rules judge (`$HOME/.cache` is not `/root/.cache`, a child
     of the /root system root); one that leaves it is an absolute path with its
     `..` folded (`$HOME/..` is `/` when HOME=/root)."""
@@ -7947,7 +7947,7 @@ def _home_reading(raw: str) -> str | None:
     home = _session_home()
     if home is None:
         return None
-    homes = [("~", home)]
+    homes = [("$HOME", home)]
     if tilde:
         user = _user_home(tilde.group(1))
         if user is None:
@@ -7962,10 +7962,11 @@ def _home_reading(raw: str) -> str | None:
     if path.startswith("/"):
         path = posixpath.normpath(path)
     for prefix, root in homes:
-        if path == root:
-            return prefix + slash
-        if path.startswith(root.rstrip("/") + "/"):
-            return prefix + "/" + path[len(root.rstrip("/")) + 1:] + slash
+        root = root.rstrip("/")
+        # A glob straight after the home stays one too: `$HOME*/build`.
+        if path.startswith(root) and path[len(root):len(root) + 1] in ("", "/", "*", "?", "["):
+            if path != "/" or not root:
+                return prefix + path[len(root):] + slash
     return path + slash
 
 
