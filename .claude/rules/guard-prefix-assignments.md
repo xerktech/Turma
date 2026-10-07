@@ -38,12 +38,20 @@ paths:
   that each need a cut double the cost per level (accepted: the deadline denies). Never add a flag
   that skips the nested cut: a heredoc needing its cut then hid the next one.
 - An assignment only a substitution PRINTS is cut on the line with that printed text spliced in
-  (XERK-1645): `bash -c "$(echo 'X=${v:-a b}') rm …"`, eval, here-string, `| bash`. The raw cut
-  never sees it, and the re-parse substitutes `a b` before its own cut runs.
-  - Spliced with `assigns=False` (`_body_printed`): applying the body's own assignments also
-    expanded the `${…}` it prints (`echo 'X=${v:-a b} Y=1'`, `echo $(echo 'X=…')`).
+  (`_printed_unsplit`, XERK-1645): `bash -c "$(echo 'X=${v:-a b}') rm …"`, eval, here-string,
+  `| bash`, an unquoted shell-fed heredoc. The raw cut never sees it, and the re-parse
+  substitutes `a b` before its own cut runs.
+  - Spliced plain AND literal (`_literal`): plain, `"$(echo 'X=${v:-a')"' b} rm …'` put a `"`
+    inside a `${…}` frame and the multi-piece dequote never closed.
+  - With `assigns=False` (`_body_printed`): applying the body's own assignments also expanded the
+    `${…}` it prints (`echo 'X=${v:-a b} Y=1'`, `echo $(echo 'X=…')`). Body-bound names
+    (`$(v=X; echo "$v=…")`) are therefore unread: XERK-1684.
   - Added only when it differs from the raw line's cut spliced the same way, so a written
     assignment is not cut twice; its pipelines join `unsplit_line`'s.
+  - The heredoc site runs it on the body BEFORE `_substitute_vars`, which expands `${…}` inside
+    a body's `'…'` too.
+- `eval` counts as a wrapper for the cut: its words are re-joined, so a printed `X=${v:-a` `b}`
+  is one assignment again (`eval $(echo 'X=${v:-a b}') rm …`).
 - Only LEADING words: an argument's expansion IS word-split (`rm -rf X=${v:- /etc}` deletes /etc).
 - Replayed against ~33k real Bash commands: 0 decision changes.
 - Tests: `TestWrapperUnwrapping` (`PREFIX_WRAPPED`, `WRAPPED_SAFE`) in `test_guard.py`.

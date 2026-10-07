@@ -4299,6 +4299,36 @@ def _unsplit_assignments(command: str, depth: int = 0) -> str:
     return "".join(out)
 
 
+def _printed_unsplit(command: str, unsplit: str | None = None) -> list[str]:
+    """``command`` with each substitution's PRINTED text spliced in, cut by
+    `_unsplit_assignments`, for each splice whose cut differs (XERK-1645):
+    `bash -c "$(echo 'X=${v:-a b}') rm …"` re-parses `X=${v:-a b} rm …`.
+
+    Spliced plain (what a re-parse runs) and literal (`_literal`: the word
+    bash splices in, so `"$(echo 'X=${v:-a')"' b} rm …'` stays one word).
+    The body's own assignments stay unapplied (`assigns=False`): applied, they
+    expanded the `${…}` it prints before the cut could see it. A cut equal to
+    ``unsplit`` (the raw line's own cut) spliced the same way is skipped: that
+    assignment was written, and is cut already."""
+    cuts: list[str] = []
+    if "$(" not in command and "`" not in command:
+        return cuts
+    if unsplit is None:
+        unsplit = _unsplit_assignments(command)
+    for literal in (False, True):
+        def printed(m: "re.Match[str]", literal: bool = literal) -> str:
+            return _subst_text(m, literal=literal, assigns=False)
+        spliced = _sub_substs(command, printed)
+        if spliced == command or "=" not in spliced:
+            continue
+        cut = _unsplit_assignments(spliced)
+        if cut != spliced and cut not in cuts and cut != (
+                _sub_substs(unsplit, printed) if unsplit != command else spliced):
+            _spend(len(cut))
+            cuts.append(cut)
+    return cuts
+
+
 def _unsplit_cuts(command: str, depth: int = 0) -> tuple[tuple[int, int, str], ...]:
     """`_unsplit_cuts_at` under the current reading: `_brace_end` parses a
     `${…}` per reading, so a cut cached under bash's hid dash's (XERK-1620 QA)."""
@@ -4371,11 +4401,12 @@ def _unsplit_cuts_at(command: str, depth: int,
             word = command[i:end]
             if depth < _MAX_UNSPLIT_DEPTH:
                 cuts += _unsplit_quoted(command, i, end, depth)
-            if at_start and _basename(word) in _PREFIX_WORDS:
+            if at_start and (_basename(word) in _PREFIX_WORDS or word == "eval"):
                 # A wrapper (`env -u N X=… cmd`, `sudo -u root X=… cmd`,
                 # `timeout 5 env X=…`, `coproc N { X=… cmd; }`): every
                 # assignment-shaped word to the end of the command is cut, flag
-                # values and names included. Only an added reading, so cutting
+                # values and names included. So after `eval`, which re-joins
+                # a printed `X=${v:-a` `b}` into one word (XERK-1645 QA). Only an added reading, so cutting
                 # an argument costs nothing the line's own reading had.
                 wrapped = True
                 cuts += pending
@@ -6919,6 +6950,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     _spend(len(unsplit))
                     out.extend(_expand_segments(_substitute_vars(unsplit, raw_vals), depth + 1,
                                                 every_cd))
+                # ...and so is an assignment its substitutions print (XERK-1645 QA).
+                if not quoted:
+                    for cut in _printed_unsplit(script, unsplit):
+                        out.extend(_expand_segments(_substitute_vars(cut, raw_vals), depth + 1,
+                                                    every_cd))
                 out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
                                             every_cd))
         elif not quoted:
@@ -7016,24 +7052,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # the re-parse substitutes `a b` before its own cut can see it (XERK-1645).
     # So the line with each substitution's printed text spliced in is cut too,
     # adding its segments and pipelines only where the raw line's cut missed.
-    # The body's own assignments stay unapplied (`assigns=False`): applied,
-    # they expanded the `${…}` it prints before this cut could see it.
     if bodies:
-        def printed(m: "re.Match[str]") -> str:
-            return _subst_text(m, assigns=False)
-        spliced = _sub_substs(raw_commands, printed)
-        if spliced != raw_commands and "=" in spliced:
-            cut = _unsplit_assignments(spliced)
-            if cut != spliced and cut != (_sub_substs(unsplit, printed)
-                                          if unsplit != raw_commands else spliced):
-                _spend(len(cut))
-                cut_line = _prenormalise(cut)
-                unsplit_line = f"{unsplit_line}\n{cut_line}" if unsplit_line else cut_line
-                seen = set(segments)
-                for seg in _split_segments(cut_line):
-                    if seg not in seen:
-                        seen.add(seg)
-                        segments.append(seg)
+        for cut in _printed_unsplit(raw_commands, unsplit):
+            cut_line = _prenormalise(cut)
+            unsplit_line = f"{unsplit_line}\n{cut_line}" if unsplit_line else cut_line
+            seen = set(segments)
+            for seg in _split_segments(cut_line):
+                if seg not in seen:
+                    seen.add(seg)
+                    segments.append(seg)
     # The TAINT reading of every operator-holding substitution the splitter cut
     # (XERK-1613), rebuilt in ONE pass so a body of N statements stays linear.
     seen = set(segments)

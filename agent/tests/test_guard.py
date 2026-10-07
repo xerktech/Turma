@@ -3043,6 +3043,11 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "bash -c \"$(echo $(echo 'X=${nope:-a b}')) rm -rf /etc\"",
         "bash -c \"Y=1 $(echo 'X=${nope:-a b}') rm -rf /etc\"",
         "bash -c \"$(printf 'X\\x3d${nope:-a b}') rm -rf /etc\"",
+        "eval $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "eval `echo 'X=${nope:-a b}'` rm -rf /etc",
+        "bash <<E\n$(echo 'X=${nope:-a b}') rm -rf /etc\nE",
+        "cat <<E | bash\n`echo 'X=${nope:-a b}'` rm -rf /etc\nE",
+        "bash -c \"$(echo 'X=${nope:-a')\"' b} rm -rf /etc'",
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
@@ -3074,6 +3079,9 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "nice -n 5 X=$(echo a b) ls",
         "bash -c \"$(echo 'X=${nope:-a b}') make\"",
         "R=$(echo 'X=${n:-a b}'); echo \"$R\"",
+        "eval \"$(ssh-agent -s)\"",
+        "eval X=1 ls",
+        "cat <<'E' | bash\n$(echo 'X=${nope:-a b}') rm -rf /etc\nE",
     ]
 
     def test_shell_wrapped_destructive_blocked(self):
