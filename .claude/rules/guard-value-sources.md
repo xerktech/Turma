@@ -56,7 +56,9 @@ paths:
     distinct list; bound alone without `_positional_readings` lost the script's own `set --` (QA);
   - unbound only for a run with none: both doubled a real script's cost toward "too large";
   - past `_MAX_SCRIPT_RUNS` lists, ONE reading binds every parameter to every argument of every
-    run, a word each. Read as runs arrived, the 10th was dropped and the 9th joined (QA bypass).
+    run, a word each, beside the unbound text and its `set --` readings (alone it lost a default,
+    the script's `set --` and a glued `/$1`, QA). Read as runs arrived, the 10th was dropped.
+    Residual (XERK-1674): past the cap a glued `"$1/$2"` is not read per run (main too).
   - Its contents are judged like any command: a written script doing `rm -rf /var/tmp/x` is
     refused as that command typed directly is (1 replayed diff, explained).
 - `_alias_values` takes only `alias NAME=…` with a name bash accepts (`_ALIAS_NAME_RE`):

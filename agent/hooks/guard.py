@@ -6683,13 +6683,18 @@ def _script_file_readings(path: str, runs: list[tuple[str, ...]],
     argful = [a for a in runs if a]
     for text in written.get(path, ()):
         scripts = _script_readings(text)
+        bound = [r for sc in scripts for r in _positional_readings(sc)]
+        if len(argful) > _MAX_SCRIPT_RUNS:
+            # Past the cap, the every-argument reading loses an unset
+            # parameter's default, the script's own `set --` and a glued
+            # `/$1`, so the unbound text and its `set --` readings are read
+            # too (QA 6).
+            every = list(dict.fromkeys(a for r in argful for a in r))
+            out += scripts + bound
+            out += [_bind_positionals(sc, [path, *every], every=True) for sc in (*scripts, *bound)]
+            continue
         if len(argful) < len(runs):
             out += scripts
-        if len(argful) > _MAX_SCRIPT_RUNS:
-            every = list(dict.fromkeys(a for r in argful for a in r))
-            out += [_bind_positionals(sc, [path, *every], every=True) for sc in scripts]
-            continue
-        bound = [r for sc in scripts for r in _positional_readings(sc)]
         for args in argful:
             argv = [path, *args]
             out += [b for b in dict.fromkeys(_bind_positionals(sc, a)

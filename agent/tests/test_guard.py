@@ -2408,6 +2408,17 @@ class TestScriptChannels(unittest.TestCase):
                     self.assertDenied(f"echo '{body}' > x.sh; {runs}; sh x.sh /etc")
         self.assertAllowed("echo 'rm -rf \"$1\"' > x.sh; "
                            + "; ".join(f"sh x.sh ./b{i}" for i in range(12)))
+        # ...and past the cap the unbound text and the script's own `set --`
+        # are read too: a default, a `set --` and a glued `/$1` (QA 6).
+        for n in (3, 12):
+            one = "; ".join(f"sh x.sh ./b{i}" for i in range(n))
+            two = "; ".join(f"sh x.sh ./b{i} ./c{i}" for i in range(n))
+            bare = "; ".join(f"sh x.sh b{i}" for i in range(n))
+            for cmd in (f"echo 'set -- /etc; rm -rf \"$1\"' > x.sh; {one}; sh x.sh a",
+                        f"echo 'rm -rf \"${{2:-/etc}}\"' > x.sh; {two}; sh x.sh a",
+                        f"echo 'rm -rf /$1' > x.sh; {bare}; sh x.sh etc"):
+                with self.subTest(n=n, cmd=cmd[:40]):
+                    self.assertDenied(cmd)
         # Only `alias NAME=` with a name bash accepts defines one.
         self.assertEqual(guard._alias_values("alias={'a': 1}"), {})
         self.assertEqual(guard._alias_values("alias =x"), {})
