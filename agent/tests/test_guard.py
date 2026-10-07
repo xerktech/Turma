@@ -4494,12 +4494,17 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'find "$x/$y" -exec sh -c "rm -rf {}" \\;', 'find "$dir/$name.$ext" -delete',
                     'rm -rf --no-preserve-root "$x/$y"', 'busybox rm -rf "$x/$y"',
                     "busybox rm -rf /etc", "busybox chmod -R 777 /", "busybox find / -delete",
-                    "cd /; busybox rm -rf *"):
+                    "cd /; busybox rm -rf *", 'find "$x/$y" | xargs rm -rf',
+                    'find "$x/$y" -print0 | xargs -0 rm -rf',
+                    # `busybox` is stripped, so its shells must still be shells (QA).
+                    "busybox hush -c 'rm -rf /'", "busybox msh -c 'rm -rf /etc'",
+                    "busybox hush <<'E'\nrm -rf /etc\nE"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
                     'find "$dir/$f" -exec grep -l x {} +', 'chmod -R 755 "$dir"/build',
-                    'find "$d"/out -delete', 'busybox rm -rf "$dir"/build', "busybox ls /"):
+                    'find "$d"/out -delete', 'busybox rm -rf "$dir"/build', "busybox ls /",
+                    'find "$dir"/out -name "*.o" | xargs rm -f'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 

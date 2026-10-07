@@ -38,6 +38,9 @@ paths:
     `rm --no-preserve-root`, `busybox rm` (no preserve-root), `find -delete` (emitted as
     `rm -r --no-preserve-root`), and a `find -exec`'s `{}` (each root's empty reading is
     added to the roots, since find walks `/` child by child).
+  - Same for a `find` feeding `xargs`: its roots' empty readings join `piped_operands`.
+  - `busybox` is a `_PREFIX_WORDS` wrapper, so its shells `hush`/`msh` must be in
+    `_SHELL_PROGS`: stripped, `busybox hush -c '…'` otherwise ran unread (QA).
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top

@@ -160,7 +160,9 @@ _FUNC_DEF_RE = re.compile(r".*\(\)$", re.DOTALL)
 _CASE_PATTERN_RE = re.compile(r"^[^()\s]+\)$")
 
 # Interpreters whose `-c <string>` argument is a whole command line of its own.
-_SHELL_PROGS = {"bash", "sh", "zsh", "ksh", "dash", "ash", "busybox", "su"}
+# BusyBox's own shells are among them: `busybox` is a stripped wrapper, so
+# `busybox hush -c '…'` reaches here as `hush` (XERK-1687).
+_SHELL_PROGS = {"bash", "sh", "zsh", "ksh", "dash", "ash", "hush", "msh", "busybox", "su"}
 
 # Programs that merely PRINT their arguments. `eval "$(echo rm -rf /etc)"` runs
 # what the substitution printed, so the echo has to be peeled off to see it.
@@ -6839,7 +6841,7 @@ def _ungrouped(segment: str) -> tuple[str, ...]:
 
 # A shell named anywhere on a line, as a word: `/bin/sh`, `X=')' bash`.
 _SHELL_WORD_RE = re.compile(
-    r"(?<![\w.-])(?:bash|sh|zsh|ksh|dash|ash|busybox|su|eval|source)(?![\w.-])"
+    r"(?<![\w.-])(?:bash|sh|zsh|ksh|dash|ash|hush|msh|busybox|su|eval|source)(?![\w.-])"
     r"|(?:^|(?<=[\s;&|({]))\.(?=\s)")
 
 
@@ -8220,9 +8222,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # be judged against what is actually going to be fed to it.
     piped_operands: list[str] = []
     for raw in segments:
-        for tok in _tokenize(raw):
+        toks = _tokenize(raw)
+        for tok in toks:
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
+        # find prints every path it walks, all of `/` under `"$x/$y"` with both
+        # unset, so `find "$x/$y" | xargs rm -rf` is fed `/`'s children (XERK-1687).
+        lead = _strip_prefixes(toks)
+        if lead and _basename(lead[0]) == "find":
+            piped_operands += filter(None, (_unset_names_dropped(t, keep_last=False)
+                                            for t in _find_roots(lead)))
     # Once each: a segment read several ways (a redirect joined and split,
     # XERK-1631) repeats its words.
     piped_operands = list(dict.fromkeys(piped_operands))
