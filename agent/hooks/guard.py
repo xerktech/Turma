@@ -4145,12 +4145,18 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # home wipe (XERK-1656). Kept, `_home_reading` judges it.
             return "${" + name + rest + "}", end
         elif (name == "HOME" and rest and not (op and op.group(1) in _VAR_DEFAULT_OPS)
+              and not re.search(r"[$`]", _HOME_USE_RE.sub("", rest))
+              and not ("$" in rest and re.search(r"['\"]", rest))
               and (home := _home_reading("${HOME" + rest + "}")) is not None):
             # HOME is set where an agent runs, so its op reads the session's
             # HOME: kept as written, `${HOME:+r}m -rf /` hid the program and
             # `rm ${HOME:+-rf} /` the flag (XERK-1686). A reading inside the
             # home comes back as `$HOME…`, which the home rules judge; the
             # unset-HOME reading is the unset-names one, as for any name.
+            # Only an op word with no other expansion: `_home_expanded` reads
+            # `$((…))`/`$(…)` empty, so `${HOME:$((0)):0}` read `$HOME` (QA).
+            # Nor a quoted `$HOME` in it: the quotes stay, so `"/root"/x`
+            # never mapped back and `${HOME:+"$HOME"/x}` cleanups denied (QA).
             state = states[m.start()] if m.start() < len(states) else ""
             out = _splice_readings([home], state)
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
@@ -4274,6 +4280,8 @@ _MAIN_PARSE_SEEN = [False]
 # can unset it, so the default spliced is kept as a reading of its own.
 _HOME_KEPT = [False]
 _HOME_DEFAULT_RE = re.compile(r"\$\{HOME:?[-=]")
+# `$HOME` / `${HOME}` in an op word: the one name `_home_expanded` reads.
+_HOME_USE_RE = re.compile(r"\$HOME(?!\w)|\$\{HOME\}")
 # `cd` and `find` are left out: a `cd` matters only to a later target, whose
 # command is listed, and a `find -delete` is read as an `rm -r` entry.
 _HOME_TARGET_PROGS = {"rm", "unlink", "chmod", "chown", "chgrp"}

@@ -4662,13 +4662,18 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                         "${HOME:+eval} 'rm -rf /'", "${HOME/*/eval} 'rm -rf /'",
                         '"${HOME:+rm}" -rf /', "${HOME:+rm -rf /}", "${HOME+r}m -rf /etc",
                         "${HOME//*/rm} -rf /", "${HOME:+'rm'} -rf /",
-                        "bash -c '${HOME:+r}m -rf /'"):
+                        "bash -c '${HOME:+r}m -rf /'",
+                        # An op word with another expansion stays as written,
+                        # as on main: read empty, `$((0))` made it `$HOME` (QA).
+                        '${HOME:0:$((0))}rm -rf /', 'rm -rf ${HOME:0:$((0))}/etc',
+                        '${HOME:$[0]:0}rm -rf /', '${HOME:0:$(echo 0)}rm -rf /'):
                 with self.subTest(cmd=cmd):
                     self.assertIsNotNone(guard.is_destructive(cmd))
             # A reading inside the home still maps back to `$HOME…`.
             for cmd in ("rm -rf ${HOME:+$HOME/.cache}", 'rm -rf "${HOME%/}/.cache"',
                         "echo ${HOME:+hi}", "${HOME#/}x rm -rf /", '"${HOME:+rm -rf /}"',
-                        'cp a "${HOME%/}/b"', "${HOME%/*}/bin/x"):
+                        'cp a "${HOME%/}/b"', "${HOME%/*}/bin/x",
+                        'rm -rf ${HOME:+"$HOME"/tmp/x}', 'rm -rf "${HOME:+"$HOME"/.cache}"'):
                 with self.subTest(cmd=cmd):
                     self.assertIsNone(guard.is_destructive(cmd))
 
