@@ -2067,6 +2067,45 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_eval_and_source_bind_names_from_output_they_read(self):
+        """XERK-1668: an `eval` of a `$(…)` whose output `_printed_text`
+        couldn't compute, a `source`/`.` of a `<(…)` or stdin, and an op whose
+        pattern or offset nests a `${…}` or `$((…))` hid the command; each
+        ran its payload as nobody."""
+        for cmd in ("v=a; eval \"$(echo \"$v='rm -rf /etc'\")\"; $a",
+                    "eval \"$(printf 'a=%q' 'rm -rf /etc')\"; $a",
+                    "eval \"$(printf '%s=%q' a 'rm -rf /etc')\"; $a",
+                    "eval \"$(cat <<<\"a='rm -rf /etc'\")\"; $a",
+                    "eval \"$(eval echo \"a=\\\\'rm -rf /etc\\\\'\")\"; $a",
+                    "eval \"$(eval echo 'rm -rf /etc')\"",
+                    "source <(echo \"a='rm -rf /etc'\"); $a",
+                    ". <(echo \"a='rm -rf /etc'\"); $a",
+                    "v=a; source <(echo \"$v='rm -rf /etc'\"); $a",
+                    "f(){ source <(echo \"a='rm -rf /etc'\"); }; f; $a",
+                    ". /dev/stdin <<<\"a='rm -rf /etc'\"; $a",
+                    "source -- <(echo \"a='rm -rf /etc'\"); $a",
+                    ". -- /dev/stdin <<<\"a='rm -rf /etc'\"; $a",
+                    "source /dev/fd/0 <<<\"a='rm -rf /etc'\"; $a",
+                    "{ . /dev/stdin; } <<<\"a='rm -rf /etc'\"; $a",
+                    ". /dev/stdin < <(echo \"a='rm -rf /etc'\"); $a",
+                    "a=x/etc; c=\"${a#${b:-x}}\"; rm -rf \"$c\"",
+                    "a=x/etc; c=\"${a#${b}x}\"; rm -rf \"$c\"",
+                    "a=xx/etc; rm -rf \"${a:$((1+1))}\"",
+                    "a=xx/etc; c=\"${a:$((1+1))}\"; rm -rf \"$c\"",
+                    # Corpus replay: an unread-output program keeps its marker.
+                    "R=$(ls -d ~/x || echo ruff); $R check",
+                    "R=$(ls -d ~/x || echo ruff); \"$R\" check"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("eval \"$(printf 'a=%q' 'x y')\"; echo \"$a\"",
+                    "source <(echo a=1); echo $a",
+                    ". /dev/stdin <<<'a=/tmp/x'; rm -rf \"$a\"",
+                    "a=x/tmp/q; c=\"${a#${b:-x}}\"; rm -rf \"$c\"",
+                    "a=xx/tmp; c=\"${a:$((1+1))}\"; ls \"$c\"",
+                    "source <(kubectl completion bash); kubectl get pods"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_an_op_too_costly_to_match_is_unreadable_not_kept_whole(self):
         """XERK-1651 QA: the cost caps are what keep one op from running past
         the hook's deadline; past them a value with blanks is led by the

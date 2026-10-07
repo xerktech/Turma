@@ -873,6 +873,16 @@ def _printed_from_tokens(toks: list[str]) -> str | None:
     if not toks:
         return None
     prog = _basename(toks[0])
+    for _ in range(_EVAL_ASSIGN_DEPTH):
+        if prog != "eval":
+            break
+        # `eval echo …` prints what the echo it re-reads prints: opaque,
+        # `eval "$(eval echo "a=\\'rm …\\'")"; $a` bound nothing (XERK-1668).
+        rest = toks[2:] if toks[1:2] == ["--"] else toks[1:]
+        toks = _strip_prefixes(_tokenize(" ".join(rest)))
+        if not toks:
+            return None
+        prog = _basename(toks[0])
     if prog == "printf":
         name, rest = _printf_args(toks)
         return _render_printf(rest[0], rest[1:]) if name is None and rest else ""
@@ -2093,10 +2103,40 @@ def _var_uses(text: str):
     yield from _VAR_BARE_RE.finditer(text, k)
 
 
-def _var_sub(repl, text: str) -> str:
-    """``_VAR_USE_RE.sub(repl, text)``, in time linear in ``text``."""
+class _NestedUse:
+    """A `${name…}` use whose operator holds a nested `${…}`, spanning to its
+    real `}` — the shape `_VAR_USE_RE` cuts at the inner one's `}`."""
+
+    def __init__(self, text: str, start: int, name: str, end: int):
+        self.string, self._start, self._end = text, start, end
+        self._groups = (text[start:end], name, text[start + 2 + len(name):end - 1], None)
+
+    def group(self, n: int = 0):
+        return self._groups[n]
+
+    def start(self) -> int:
+        return self._start
+
+    def end(self) -> int:
+        return self._end
+
+
+def _var_sub(repl, text: str, nested: bool = False) -> str:
+    """``_VAR_USE_RE.sub(repl, text)``, in time linear in ``text``.
+
+    With ``nested``, a use whose operator nests a `${…}` (`${a#${b:-x}}`) is
+    handed whole, to its real `}`, for a ``repl`` that reads the operator: cut
+    at the inner `}`, `c="${a#${b:-x}}"` bound `x/etc}` and `rm -rf "$c"` hid
+    `/etc` (XERK-1668). Past `_MAX_NESTED_VARS` levels it is cut as before:
+    each level is a recursion of the ``repl`` reading it."""
     out, last = [], 0
     for m in _var_uses(text):
+        if m.start() < last:
+            continue  # inside a nested use already handed whole
+        if nested and m.group(1) and "${" in m.group(2):
+            close = _brace_end(text, m.start(), False)
+            if close >= m.end() and text.count("${", m.start() + 2, close) <= _MAX_NESTED_VARS:
+                m = _NestedUse(text, m.start(), m.group(1), close + 1)
         out += (text[last:m.start()], repl(m))
         last = m.end()
     out.append(text[last:])
@@ -2335,7 +2375,7 @@ def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> l
     def apply(p: str) -> str:
         return _apply_var_op(value, op, p) if rep is None else _replace_op(value, op, p, rep)
 
-    if "$" not in known and "`" not in known:
+    if "$" not in known.replace("$((", "((") and "`" not in known:
         return [apply(known)]
     printed = _PATTERN_SUBST_RE.sub(lambda m: _produced_text(m.group(0)).strip(), pat)
     out = []
@@ -2361,7 +2401,8 @@ def _arith_offset(text: str) -> int | None:
     """An `${a:off:len}` part as bash's arithmetic reads it, for the plain
     cases (`(2)`, `1+1`, `-3/2`, empty); None for anything else. Bash
     truncates `/` and `%` toward zero, as C does — never Python's floor."""
-    text = text.strip()
+    # `$((…))` inside arithmetic is its own value: `${a:$((1+1))}` (XERK-1668).
+    text = text.strip().replace("$((", "((")
     if not text:
         return 0
     if len(text) > 64 or not re.fullmatch(r"[\d\s+\-*/%()]+", text):
@@ -2791,6 +2832,25 @@ def _assigned_values(command: str, depth: int = 0,
         for name, value in _reader_values(command):
             vals.setdefault(name, []).append(value)
             where.setdefault(name, []).append(None)
+    def bind(scripts: set[str], known: dict[str, list[str]]) -> None:
+        """Bind the names each script assigns, its line's names spliced in
+        too: `v=a; eval "$(echo "$v='rm …'")"` assigns `a` (XERK-1668)."""
+        for script in list(scripts):
+            if "$" in script:
+                spliced = _var_sub(lambda u: _picked(known[u.group(1) or u.group(3)], u.group(1) or u.group(3))
+                                   if (u.group(1) or u.group(3)) in known and not u.group(2)
+                                   else u.group(0), script)
+                _spend(len(spliced) - len(script))
+                scripts.add(spliced)
+        for sc in scripts:
+            for name, got in _assigned_values(sc, depth + 1, known).items():
+                # Each value once: two readings of one script binding
+                # it twice halved the line's value headroom.
+                have = vals.setdefault(name, [])
+                new = [v for v in dict.fromkeys(got) if v not in have]
+                have.extend(new)
+                where.setdefault(name, []).extend([None] * len(new))
+
     if depth < _EVAL_ASSIGN_DEPTH:
         # An assignment `eval` runs binds the name for the rest of the line:
         # `eval "a=\$(echo rm -rf /)"; $a` runs it, though no `a=` starts a
@@ -2809,29 +2869,45 @@ def _assigned_values(command: str, depth: int = 0,
                 rest = words[k + 1:]
                 while rest and (_basename(rest[0]) == "eval" or rest[0] == "--"):
                     rest = rest[1:]
-                script = " ".join(rest)
-                scripts = {script}
-                if "$" in script:
-                    spliced = _var_sub(lambda u: _picked(known[u.group(1) or u.group(3)], u.group(1) or u.group(3))
-                                       if (u.group(1) or u.group(3)) in known and not u.group(2)
-                                       else u.group(0), script)
-                    _spend(len(spliced) - len(script))
-                    scripts.add(spliced)
+                scripts = {" ".join(rest)}
                 # ...and what a `$(…)` handed to it prints, read off the raw
-                # words: tokenized, its inner quotes were lost.
+                # words: tokenized, its inner quotes were lost. Its taint
+                # readings too, which read pipes and here-strings
+                # (`eval "$(cat <<<"a='rm …'")"`, XERK-1668).
                 for sub in _find_substs(seg) if "$(" in seg or "`" in seg else ():
-                    printed = _printed_text(_subst_inner(sub))
-                    if printed:
-                        scripts.add(printed)
-                for sc in scripts:
-                    for name, got in _assigned_values(sc, depth + 1, known).items():
-                        # Each value once: two readings of one script binding
-                        # it twice halved the line's value headroom.
-                        have = vals.setdefault(name, [])
-                        new = [v for v in dict.fromkeys(got) if v not in have]
-                        have.extend(new)
-                        where.setdefault(name, []).extend([None] * len(new))
+                    inner = _subst_inner(sub)
+                    scripts.update(filter(None, (_printed_text(inner),
+                                                 *(_body_tainted(inner) or ()))))
+                bind(scripts, known)
                 break
+        # `source <(…)` and `. /dev/stdin <<<…` run their text as a script in
+        # THIS shell, binding its names as an `eval` does (XERK-1668).
+        if "." in command or "source" in command:
+            segs = _split_segments(command)
+            stdin_readers: dict[int, object] = {}
+            scripts = set()
+            for k, seg in enumerate(segs):
+                words = _tokenize(seg)
+                # Wherever the reader sits (`f(){ source <(…)`), as for `eval`.
+                # Its file a `<(…)` (a word `_tokenize` splits) or stdin.
+                # `source -- FILE` takes its `--` as bash does.
+                files = [words[j + 2] if words[j + 1] == "--" and j + 2 < len(words) else words[j + 1]
+                         for j, w in enumerate(words[:-1]) if w in (".", "source")]
+                if any(_STDIN_SCRIPT_RE.match(f.rstrip(";")) for f in files):
+                    stdin_readers[k] = None
+                if any(f.startswith("<(") for f in files):
+                    scripts.update(t for sub in _find_substs(seg) if sub.group(0).startswith("<(")
+                                   for t in _proc_subst_texts(_subst_inner(sub)))
+            if stdin_readers:
+                # Its stdin as a `read`'s is found: its own here-string, a
+                # group's (`{ . /dev/stdin; } <<<…`), a `< <(…)` or a pipe.
+                for feed in itertools.chain(*_reader_feeds(command, segs, stdin_readers).values()):
+                    if feed.startswith("$(") and feed.endswith(")"):
+                        scripts.update(_proc_subst_texts(feed[2:-1]))
+                    else:
+                        scripts.add(_dequote_value(feed))
+            if scripts:
+                bind(scripts, {**(env or {}), **vals})
     # How many values one name is ASSIGNED, so `_expand_both` reads each on
     # its own. Not a `for` list's words: those are a loop's data, and a long
     # list would cost a whole reading per word.
@@ -2908,7 +2984,7 @@ def _assigned_values(command: str, depth: int = 0,
         _spend(len(value) - len(m.group(0)))
         return value
 
-    once = {k: [_var_sub(lambda m, k=k: resolve(m, k), v) for v in vs] for k, vs in vals.items()}
+    once = {k: [_var_sub(lambda m, k=k: resolve(m, k), v, nested=True) for v in vs] for k, vs in vals.items()}
     # Resolved once, a chain read empty: `q=/etc; d=$q; r=$d` left `r` empty
     # and `rm -rf $r` passed (XERK-1648). The chain-resolved values are a
     # reading of their OWN (`_expand_both`), never mixed into these: appended,
@@ -3026,7 +3102,7 @@ def _ordered_values(vals: dict[str, list[str]], where: dict[str, list[int | None
                     # An over-captured value (``misparse``) is left order-blind.
                     if uses[k][i] and p in misparse:
                         raise _OrderUnread
-                    got.append(_var_sub(link, vals[k][i]) if uses[k][i] else vals[k][i])
+                    got.append(_var_sub(link, vals[k][i], nested=True) if uses[k][i] else vals[k][i])
                 except _OrderUnread:
                     got.append(base[k][i])
             for i, v in zip(idxs, got):
@@ -3201,7 +3277,7 @@ def _chain_values(vals: dict[str, list[str]], applied: dict[str, list[str]],
         return value
 
     def settle(k: str, i: int) -> str:
-        return _var_sub(lambda m: link(m, k), vals[k][i])
+        return _var_sub(lambda m: link(m, k), vals[k][i], nested=True)
 
     for group in _dependency_order(waits):
         # Each value is read ONCE, against what is known before its group:
@@ -3415,6 +3491,10 @@ def _render_printf(fmt: str, args: list[str]) -> str:
             arg = _printf_unescape(arg)
         elif kind == "c":
             arg = arg[:1]
+        elif kind in "qQ":
+            # Quoted for re-reading, as `eval "$(printf 'a=%q' 'rm …')"` does
+            # (XERK-1668): printed bare, the eval bound `a=rm` and ran `-rf`.
+            arg = shlex.quote(arg)
         if prec is not None and kind in "sb":
             try:
                 arg = arg[:max(int(prec or 0), 0)]
@@ -3990,8 +4070,15 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 arg = op.group(2) if op else ""
                 if state == '"' and op and op.group(1) in (":+", "+"):
                     arg = _dq_unescape_brace(arg)  # as a default's, below
-                out = _splice_readings(_op_readings(value, op.group(1), arg, vals)
-                                       if op else [value], state)
+                if not op and state == '"' and value.startswith(_UNREAD_OUTPUT + " "):
+                    # A value bound from several readings (`c="${a#${b:-x}}"`,
+                    # `_assigned_values`): its words, marker first, as a
+                    # direct `"${a#${b:-x}}"` splices them (XERK-1668). One
+                    # quoted word, `rm -rf "$c"` hid `/etc`.
+                    out = '" "'.join(_quote_literal(w, state) for w in value.split())
+                else:
+                    out = _splice_readings(_op_readings(value, op.group(1), arg, vals)
+                                           if op else [value], state)
         elif name == "HOME" and op and op.group(1) in _VAR_DEFAULT_OPS and _HOME_KEPT[0]:
             # The reading where HOME is set, as it is in every shell an agent
             # runs: spliced, `"${HOME:-/tmp}"/*` read `/tmp/*` and hid the
