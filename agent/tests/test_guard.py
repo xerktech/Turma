@@ -4498,7 +4498,9 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'find "$x/$y" -print0 | xargs -0 rm -rf',
                     # `busybox` is stripped, so its shells must still be shells (QA).
                     "busybox hush -c 'rm -rf /'", "busybox msh -c 'rm -rf /etc'",
-                    "busybox hush <<'E'\nrm -rf /etc\nE"):
+                    "busybox hush <<'E'\nrm -rf /etc\nE",
+                    # ...and busybox itself stays one to `-c` (QA).
+                    "busybox script -qc 'rm -rf /etc' /dev/null", "busybox -- rm -rf /etc"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
