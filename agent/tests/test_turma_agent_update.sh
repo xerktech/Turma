@@ -1733,6 +1733,7 @@ if [ -d /run/systemd/system ]; then
   cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
   echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
   mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+  ( cd "$prefix" && sha256sum hooks/*.py >hooks.sha256 )  # intact hooks: a genuine no-op run (XERK-1643)
   echo "0.5.0" >"$prefix/VERSION"
   echo "[Timer] # timer 0.5.0" >"$prefix/turma-agent-update.timer"
   install_fake_restart "$bin"; install_fake_gh "$bin"
@@ -1754,6 +1755,7 @@ if [ -d /run/systemd/system ]; then
   cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
   echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
   mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+  ( cd "$prefix" && sha256sum hooks/*.py >hooks.sha256 )  # intact hooks: a genuine no-op run (XERK-1643)
   echo "0.5.0" >"$prefix/VERSION"
   printf '[Timer]\nOnUnitActiveSec=1h\n' >"$prefix/turma-agent-update.timer"
   install_fake_restart "$bin"; install_fake_gh "$bin"
@@ -1786,6 +1788,7 @@ EOF2
   cp "$SCRIPT" "$bin/turma-agent-update"; chmod +x "$bin/turma-agent-update"
   echo "# old" >"$prefix/hub-agent.py"; echo "// old" >"$prefix/tunnel-agent.js"
   mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
+  ( cd "$prefix" && sha256sum hooks/*.py >hooks.sha256 )  # intact hooks: a genuine no-op run (XERK-1643)
   echo "0.5.0" >"$prefix/VERSION"; : >"$prefix/turma-agent-update.timer"
   install_fake_restart "$bin"; install_fake_gh "$bin"
   udir="$root/home/.config/systemd/user"; mkdir -p "$udir"
