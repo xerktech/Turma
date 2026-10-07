@@ -4345,10 +4345,18 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
     cuts: list[str] = []
     if depth > _MAX_UNSPLIT_DEPTH:
         return cuts
-    # `$'…'` decoded before the split and the gate: split raw, its `\'` ended
-    # the quote early (`bash -c $'eval $(echo \'X=…\') rm …; echo done'`),
-    # and a `\x24(` is a `$(`.
-    command = _decode_ansi_c(command)
+    # `$'…'` decoded before the split and the gate, as an ADDED reading: split
+    # raw, its `\'` ended the quote early (`bash -c $'eval $(echo \'X=…\') rm
+    # …; echo done'`) and a `\x24(` is no `$(`; but `_ANSI_C_RE` is quote-blind,
+    # and alone it read a quoted `"$'\'"` as one and swallowed the line after it.
+    for text in dict.fromkeys((command, _decode_ansi_c(command))):
+        cuts += _raw_printed_walk(text, depth)
+    return list(dict.fromkeys(cuts))
+
+
+def _raw_printed_walk(command: str, depth: int) -> list[str]:
+    """One reading of `_raw_printed_cuts`."""
+    cuts: list[str] = []
     if "$(" not in command and "`" not in command:
         return cuts
     text, heredocs = _split_heredocs(command)
@@ -4382,7 +4390,7 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
             for reading in _script_readings(script):
                 cuts += _printed_unsplit(reading)
                 cuts += _raw_printed_cuts(reading, depth + 1)
-    return list(dict.fromkeys(cuts))
+    return cuts
 
 
 def _unsplit_cuts(command: str, depth: int = 0) -> tuple[tuple[int, int, str], ...]:

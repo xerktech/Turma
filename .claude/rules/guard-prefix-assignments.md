@@ -57,8 +57,10 @@ paths:
     `_tokenize` keeps `f(){` as one word. Every `-exec` script counts, not the first.
   - Its scripts: an eval join, every `-c` script, a `trap` action, and a shell's or `.`'s
     here-string (name glued to `<<<` too).
-  - The walk ANSI-C decodes its text BEFORE splitting and before its `$(` gate: split raw, a
-    `$'…\'…'` ended at the `\'` and `; …` after it cut the script (`\x24(` is a `$(`). Not yet a here-string a pipe carries to a shell
+  - The walk also reads its text ANSI-C decoded BEFORE splitting and its `$(` gate: split raw, a
+    `$'…\'…'` ended at the `\'` and `; …` after it cut the script (`\x24(` is a `$(`).
+  - Decoded is an ADDED reading, never the only one: `_ANSI_C_RE` is quote-blind, so a quoted
+    `"$'\'"` decoy read as one swallowed the rest of the line. Not yet a here-string a pipe carries to a shell
     (`cat <<< '…' | bash`): XERK-1684.
   - Accepted over-deny, as base already does for `$(echo 'X=1 Y=2') rm …`: printed text at
     command start is read as re-parsed (`$(echo 'X=${v:-a b}') rm …` runs no `rm`).
