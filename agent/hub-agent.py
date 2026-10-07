@@ -5116,21 +5116,39 @@ HOOK_REPAIR_MIN_INTERVAL = 600   # seconds between updater kicks for one mismatc
 HOOK_MAX_BYTES = 8 << 20          # a hook bigger than this is not one we shipped
 
 
-def _hook_digest(path):
-    """sha256 of ``path`` when it is a regular, non-symlink file of at most
-    HOOK_MAX_BYTES, else None. The open is O_NONBLOCK|O_NOFOLLOW and the type is
-    checked on the open fd: a session can swap a hook for a FIFO (a plain read
-    blocks the beat forever) or a symlink to /dev/zero (a read never ends)."""
+def _read_regular(path, cap):
+    """The bytes of ``path`` when it is a regular, non-symlink file of at most
+    ``cap`` bytes, else None; never raises OSError and never leaks the fd. The
+    open is O_NONBLOCK|O_NOFOLLOW and the type is checked on the open fd: a
+    session can swap a hook or the baseline for a FIFO (a plain open blocks the
+    beat forever), a symlink to /dev/zero (a read never ends) or a directory
+    (``python3 guard.py`` runs its ``__main__.py``)."""
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         return None
-    with os.fdopen(fd, "rb") as fh:
-        st = os.fstat(fh.fileno())
-        if not stat.S_ISREG(st.st_mode) or st.st_size > HOOK_MAX_BYTES:
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > cap:
             return None
-        data = fh.read(HOOK_MAX_BYTES + 1)
-    return None if len(data) > HOOK_MAX_BYTES else hashlib.sha256(data).hexdigest()
+        chunks, total = [], 0
+        while total <= cap:
+            chunk = os.read(fd, min(1 << 16, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return None if total > cap else b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _hook_digest(path):
+    """sha256 of a hook that `_read_regular` accepts, else None."""
+    data = _read_regular(path, HOOK_MAX_BYTES)
+    return None if data is None else hashlib.sha256(data).hexdigest()
 
 
 def hook_integrity_failures(script_dir=None):
@@ -5142,10 +5160,10 @@ def hook_integrity_failures(script_dir=None):
     their dir is first on sys.path and a planted ``hooks/bisect.py`` replaces the
     stdlib module guard.py imports."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    raw = _read_regular(os.path.join(script_dir, "hooks.sha256"), 1 << 20)
     try:
-        with open(os.path.join(script_dir, "hooks.sha256"), encoding="utf-8") as fh:
-            lines = fh.read(1 << 20).splitlines()
-    except (OSError, UnicodeDecodeError):
+        lines = raw.decode("utf-8").splitlines()
+    except (AttributeError, UnicodeDecodeError):     # None: no usable baseline
         return None
     expected = {}
     for line in lines:
@@ -5164,8 +5182,10 @@ def hook_integrity_failures(script_dir=None):
     except OSError:
         present = []
     # __pycache__ is legitimate: the manager imports permlog.py/guard.py as
-    # modules and writes their bytecode. Python never imports from it without
-    # the matching source beside it, so it cannot carry a planted module.
+    # modules and writes their bytecode. A HOOK run as a script never imports
+    # from it (no sourceless import from __pycache__), so it cannot shadow the
+    # stdlib for guard.py; the manager's own loaders do read it, but that uid can
+    # already rewrite hub-agent.py itself.
     bad += [f"hooks/{name}" for name in present
             if f"hooks/{name}" not in expected and name != "__pycache__"]
     return sorted(bad)

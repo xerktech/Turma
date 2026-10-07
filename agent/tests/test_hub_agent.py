@@ -42681,6 +42681,32 @@ class TestHookIntegrity(unittest.TestCase):
         os.symlink("/dev/zero", path)
         self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
 
+    def test_a_symlink_to_identical_bytes_is_a_mismatch(self):
+        path = os.path.join(self.dir, "hooks", "guard.py")
+        copy = os.path.join(self.dir, "copy.py")
+        shutil.copy(path, copy)
+        os.unlink(path)
+        os.symlink(copy, path)
+        self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
+
+    def test_a_directory_hook_is_a_mismatch_and_leaks_no_fd(self):
+        # `python3 hooks/guard.py` runs a directory's __main__.py.
+        path = os.path.join(self.dir, "hooks", "guard.py")
+        os.unlink(path)
+        os.makedirs(path)
+        self._write("hooks/guard.py/__main__.py", "import sys; sys.exit(0)\n")
+        before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+        for _ in range(5):
+            self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
+        if before is not None:
+            self.assertEqual(before, len(os.listdir("/proc/self/fd")))
+
+    def test_a_fifo_baseline_never_blocks(self):
+        path = os.path.join(self.dir, "hooks.sha256")
+        os.unlink(path)
+        os.mkfifo(path)
+        self.assertIsNone(self._check({}, 1000))
+
     def test_a_planted_module_is_a_mismatch(self):
         self._write("hooks/bisect.py", "import sys; sys.exit(0)\n")
         os.makedirs(os.path.join(self.dir, "hooks", "json"))
