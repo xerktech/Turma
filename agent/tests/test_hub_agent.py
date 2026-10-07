@@ -12457,7 +12457,10 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         sess = self._running_session(sm)
         for text in ("x" * (ha.PASTE_SLICED_MAX_CHARS + 1) + "\ny",
-                     "family \U0001F468\u200d\U0001F469\u200d\U0001F467\nnext"):
+                     "astral \U0001F600\nnext",            # astral range alone
+                     "joined a\u200db\nnext",              # ZWJ alone
+                     "heart \u2764\ufe0f\nnext",          # BMP emoji + VS16
+                     "keycap 1\u20e3\nnext"):
             self.run_stdin_calls.clear()
             self.run_ok_calls.clear()
             sm.send_input(sess["id"], text)

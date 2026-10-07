@@ -14446,6 +14446,8 @@ _SLICE_UNSAFE_RE = re.compile("[\U00010000-\U0010FFFF\u200d\ufe0e\ufe0f\u20e3]")
 # peer) can type into the same pane, and slices from two messages must never
 # interleave. They share one tmux buffer name too.
 _PANE_TYPE_LOCKS = {}
+# A sliced message takes ~1s under load, so this only trips on a wedged tmux.
+PANE_TYPE_LOCK_WAIT_SEC = 5.0
 _PANE_TYPE_LOCKS_GUARD = threading.Lock()
 
 
@@ -14615,8 +14617,17 @@ def _type_into_pane(tmux_name, text):
         return False
     with _PANE_TYPE_LOCKS_GUARD:
         lock = _PANE_TYPE_LOCKS.setdefault(tmux_name, threading.Lock())
-    with lock:
+    # Bounded: the beat may be the waiter, and a wedged tmux can hold the other
+    # writer for its full timeouts. Past the bound, delivering beats ordering.
+    locked = lock.acquire(timeout=PANE_TYPE_LOCK_WAIT_SEC)
+    if not locked:
+        log(f"typing into {tmux_name}: another writer still busy after "
+            f"{PANE_TYPE_LOCK_WAIT_SEC}s; typing unserialized")
+    try:
         return _type_into_tmux_pane(tmux_name, text)
+    finally:
+        if locked:
+            lock.release()
 
 
 def _type_into_tmux_pane(tmux_name, text):
