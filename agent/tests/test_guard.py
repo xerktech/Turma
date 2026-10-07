@@ -2903,6 +2903,13 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_a_brace_word_drops_only_a_lone_trailing_backslash(self):
+        # XERK-1646: zsh drops a lone `\` ending the text before it expands;
+        # an escaped one (an even run) is text and stays on every word.
+        self.assertEqual(guard._prenormalise("rm -rf {/etc,/var}\\"), "rm -rf /etc /var")
+        self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\"), "rm -rf a\\\\ b\\\\")
+        self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\\\"), "rm -rf a\\\\ b\\\\")
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
