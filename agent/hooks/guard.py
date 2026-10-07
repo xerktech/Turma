@@ -8365,7 +8365,7 @@ def _glob_hits_system_root(pattern: str) -> bool:
 _TRAILING_PATH_TAIL_RE = re.compile(r"[/.]*|.*[*?\[].*", re.DOTALL)
 
 
-def _trailing_unset_dropped(tok: str) -> str | None:
+def _trailing_unset_dropped(tok: str, after_slash: bool = True) -> str | None:
     """``tok`` with the unset names ENDING it read as empty, else None
     (XERK-1623).
 
@@ -8389,7 +8389,9 @@ def _trailing_unset_dropped(tok: str) -> str | None:
             break
         spans.insert(0, (start, end))
         tail = start
-    if not spans:
+    # `after_slash=False` keeps a run that is a whole last component
+    # (`"$TMP/$x"`), for a reading that already dropped the leading names.
+    if not spans or (not after_slash and tok[spans[0][0] - 1] == "/"):
         return None
     pieces, last = [], 0
     for start, end in spans:
@@ -8523,36 +8525,90 @@ def _empties_a_set_path(op: str) -> bool:
                 or op[:2] in (":-", ":=", ":?") or op in ("%/", "#/"))
 
 
-def _leading_names_end(raw: str) -> int:
-    """Where the run of possibly-empty names opening ``raw`` ends, if a `/`
-    follows it, else 0. A `${…}` is closed by `_brace_end`, so a nested one
-    (`${x:+${y}}`) is one expansion, and an unclosed one stops the scan."""
-    pos = 0
-    while raw.startswith("$", pos):
-        if m := _PLAIN_NAME_RE.match(raw, pos):
-            name, op, end = m.group(1), "", m.end()
-        elif raw.startswith("${", pos):
-            # Unquoted: the token is dequoted, and looking its quotes up rescans
-            # the whole word per `${`, quadratic in a run of names (QA).
-            close = _brace_end(raw, pos, False)
-            head = _BRACED_NAME_RE.match(raw, pos + 2, close) if close > 0 else None
-            if head is None:
-                return 0
-            name, op, end = head.group(1), raw[head.end():close], close + 1
-            if head.group(0) != name:
-                name = ""  # `${HOME[1]}` and `${!HOME}` are not HOME's value
-        else:
-            return 0
-        # `?` errors and a default or assigned word is used; only an empty one
-        # leaves it empty. HOME and PWD are set, so only another operator
-        # (`${HOME:+}`, `${HOME#$HOME}`) can empty them.
-        body = op[1:] if op.startswith(":") else op
-        if body[:1] == "?" or (body[:1] in ("-", "=") and not _only_expansions(body[1:])):
-            return 0
-        if name in _ALWAYS_SET_NAMES and not _empties_a_set_path(op):
-            return 0
-        pos = end
-    return pos if raw.startswith("/", pos) else 0
+def _name_end(raw: str, pos: int) -> tuple[int, bool]:
+    """The end of the expansion at ``pos`` and whether it can be empty, or
+    ``(pos, False)`` if none starts there. A `${…}` is closed by `_brace_end`,
+    so a nested one (`${x:+${y}}`) is one expansion; an unclosed one is none."""
+    if m := _PLAIN_NAME_RE.match(raw, pos):
+        name, op, end = m.group(1), "", m.end()
+    elif raw.startswith("${", pos):
+        # Unquoted: the token is dequoted, and looking its quotes up rescans
+        # the whole word per `${`, quadratic in a run of names (QA).
+        close = _brace_end(raw, pos, False)
+        if close < 0:
+            return pos, False
+        head = _BRACED_NAME_RE.match(raw, pos + 2, close)
+        if head is None:
+            return close + 1, False
+        name, op, end = head.group(1), raw[head.end():close], close + 1
+        if head.group(0) != name:
+            name = ""  # `${HOME[1]}` and `${!HOME}` are not HOME's value
+    else:
+        return pos, False
+    # `?` errors and a default or assigned word is used; only an empty one
+    # leaves it empty. HOME and PWD are set, so only another operator
+    # (`${HOME:+}`, `${HOME#$HOME}`) can empty them.
+    body = op[1:] if op.startswith(":") else op
+    if body[:1] == "?" or (body[:1] in ("-", "=") and not _only_expansions(body[1:])):
+        return end, False
+    if name in _ALWAYS_SET_NAMES and not _empties_a_set_path(op):
+        return end, False
+    return end, True
+
+
+def _unset_names_dropped(raw: str) -> str | None:
+    """``raw`` with the unknown names bash would read as empty dropped, or
+    None if it has none (XERK-1639, XERK-1652). Every such name in a component
+    before the last is dropped: `/$x/etc` and `"$x/usr$y/lib"` are `/etc` and
+    `/usr/lib`, `"$a/$b"/*` is `//*`. In the last component only a trailing run
+    glued to text is (`$x/etc$y` is `/etc`): `"$dir/$f"`, `"$TMP/$x"` and
+    `"$dir/$name.$ext"` are the everyday idiom, `/` or `/.` only when all are
+    unset. A word that is one component counts as two when names alone
+    open it before a `/`: `$x/` is the root, `"$x"*` and `"$x".bak` stay."""
+    # (start, end) of each name that can be empty, and every `/` between them.
+    names, slashes, pos = [], [], 0
+    while pos < len(raw):
+        nxt = min((i for i in (raw.find("$", pos), raw.find("/", pos)) if i >= 0), default=-1)
+        if nxt < 0:
+            break
+        if raw[nxt] == "/":
+            slashes.append(nxt)
+            pos = nxt + 1
+            continue
+        end, empty = _name_end(raw, nxt)
+        if empty:
+            names.append((nxt, end))
+        pos = max(end, nxt + 1)
+    # The last component starts after the last `/` with more than `/`s after it.
+    last = len(raw.rstrip("/"))
+    seps = [i for i in slashes if i < last]
+    if seps:
+        cut = seps[-1]
+    elif slashes and names and names[0][0] == 0:
+        # One component before trailing `/`s: names alone must fill it.
+        cut = slashes[0]
+        filled = 0
+        for start, end in names:
+            if start != filled:
+                break
+            filled = end
+        if filled != cut:
+            cut = 0
+    else:
+        cut = 0
+    # A `~` prefix is not expanded once a name is in it (`~$USER`): keep them.
+    tilde = (raw.find("/") % (len(raw) + 1)) if raw.startswith("~") else -1
+    pieces, kept = [], 0
+    for start, end in names:
+        if end <= cut and start > tilde:
+            pieces.append(raw[kept:start])
+            kept = end
+    pieces.append(raw[kept:])
+    rest = "".join(pieces)
+    dropped = _trailing_unset_dropped(rest, after_slash=False)
+    if dropped is not None:
+        return dropped
+    return rest if kept else None
 
 
 # The session's own HOME, which bash expands `~` and `$HOME` to (XERK-1656).
@@ -8702,20 +8758,19 @@ def _home_reading(raw: str) -> str | None:
 
 def _dangerous_target(tok: str, home_read: bool = True) -> str | None:
     """Why ``tok`` names a protected path, or None. Besides the target as
-    written, its leading unknown names are read as empty, but that reading is
-    judged by `_is_dangerous_path` like any other: `"$build"/out` reads `/out`,
-    an ordinary root child, and stays allowed (owner decision on XERK-1639).
-    The names are found before `_norm_path`, whose normpath folds `$x/../etc`
-    into `etc` and `./$x/etc` into `$x/etc`."""
+    written, it is read with its unknown names empty (`_unset_names_dropped`),
+    and that reading is judged by `_is_dangerous_path` like any other:
+    `"$build"/out` reads `/out`, an ordinary root child, and stays allowed
+    (owner decision on XERK-1639). The names are found before `_norm_path`,
+    whose normpath folds `$x/../etc` into `etc` and `./$x/etc` into `$x/etc`."""
     if _is_dangerous_path(tok):
         return f"({tok!r})"
     raw = tok.strip().strip('"').strip("'")
-    end = _leading_names_end(raw)
-    # The rest is judged as written: reading its trailing names empty as well
-    # (XERK-1623) would read `"$TMP/$x"` as `/`. That also leaves `$x/etc$y`
-    # (both ends empty) allowed; both are XERK-1652's call.
-    if end and _is_dangerous_path(raw[end:], trailing=False):
-        return f"({tok!r}, which is {_norm_path(raw[end:])!r} when {raw[:end]} is unset)"
+    empty = _unset_names_dropped(raw)
+    # Judged as is: XERK-1623's trailing reading on top would read `"$TMP/$x"`
+    # as `/`; `_unset_names_dropped` already drops the trailing names it may.
+    if empty is not None and _is_dangerous_path(empty, trailing=False):
+        return f"({tok!r}, which is {_norm_path(empty)!r} when its unknown names are unset)"
     home = _home_reading(raw) if home_read else None
     if home is not None and _dangerous_target(home, home_read=False):
         return f"({tok!r}, which is {home!r} with the home expanded)"

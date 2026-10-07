@@ -4,7 +4,7 @@ paths:
   - "agent/tests/test_guard.py"
 ---
 
-# Guard: an unknown name at the START of a target (XERK-1639)
+# Guard: unknown names in a target read empty (XERK-1639, XERK-1652)
 
 - bash reads an unset leading name as empty: `rm -rf "$x"/etc` deletes /etc, `"$dir"/*` is `/*`.
 - `_dangerous_target` adds that reading for `rm` and recursive `chmod`/`chown`, judged by
@@ -27,10 +27,17 @@ paths:
     quadratic in a run of names.
 - Positionals (`$0`-`$9`, `$@`, `$*`) are left out: bound in `bash -c '…' _ /tmp/x`,
   `find -exec sh -c` and functions, where reading them empty denied the common idiom.
-- Only the LEADING run is read empty. `"$a/$b"/*` (→ `//*`) is open: reading later
-  components empty would deny the everyday `rm -rf "$dir/$f"` (decision pending, XERK-1652).
-- The rest is judged with `trailing=False`: XERK-1623's trailing-name reading on top would
-  read `"$TMP/$x"` as `/`. It also leaves `$x/etc$y` open; both-ends cases are XERK-1652's.
-- Cost, measured: 0 new denies over a 35.7k-command real corpus replay vs main.
+- Later names are read empty in the SAME reading (`_unset_names_dropped`, XERK-1652):
+  - every name in a component before the last, glued or not: `/$x/etc`, `"$a/$b"/*` → `//*`,
+    `"$x/usr$y/lib"` → `/usr/lib`, `"$x/.${y}/etc"` → `/./etc`.
+  - in the last component, only a trailing run glued to text: `$x/etc$y` → `/etc`.
+  - Kept: the rest of the last component. Reading it empty denied the everyday
+    `"$dir/$f"`, `"$TMP/$x"` (→ `/`) and `"$dir/$name.$ext"` (→ `/.`); so `$x/$y` stays allowed.
+  - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
+  - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
+- That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top
+  would read `"$TMP/$x"` as `/`.
+- Cost, measured: 0 new denies over a 36.7k-command real corpus replay vs main (XERK-1652).
 - Tests: `test_an_unset_name_leading_a_target_is_read_empty`,
+  `test_every_unset_name_component_is_read_empty`,
   `test_leading_names_are_one_run_and_scan_linearly`.
