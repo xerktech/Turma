@@ -381,11 +381,21 @@ paths:
   - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`); names in a
     `:+`/`+` alternative are expanded by the caller's `expand` (both `_assigned_values` and
     `_substitute_vars`) and count as dependencies (`_names_used`). Spliced raw, `${x:+$x}` ran
-    as the literal `$x` — a bypass of `rm -rf ${x:+$x}`. `${q:+${a}}` (brace in an argument),
-    an unset `${Q:-$A}` and `$b'tc'` are XERK-1661.
+    as the literal `$x` — a bypass of `rm -rf ${x:+$x}`.
+  - An unset name's default is resolved over the line's positions like a nested `${…}`
+    (XERK-1661): spliced raw, `a=/etc; rm -rf ${q:-$a}` left a `${a}` nothing expanded again.
+    Only the default's span, so an element's `${y[0]:-$a}` keeps its `[0]`.
+  - `_dequote_value` braces a name a quote ends (`$b'tc'`, `"$b"tc` → `${b}tc`): stored as
+    `$btc`, it read an unset name where bash appends `tc` to `$b` (XERK-1661).
+    `_brace_quote_ended` braces one in any text (`$(echo $b'tc')`), with NO unbraced re-read:
+    via `_GLUED_NAME_RE` that re-read doubled ~9% of real commands, 11 past the deadline (QA).
+    Left as written: an escaped `\$b'`, and `$b'` inside `'…'` (a `-c` re-parse joins them).
+  - A value that only MAY be empty (`q=$(true)`, `q=$nope`) is still read as set and never
+    takes its `:-` default: XERK-1705. (A literally empty one does, `guard-param-ops.md`.)
   - Tests: `test_a_chain_of_assignments_resolves_every_link`,
     `test_a_cycle_of_assignments_stays_bounded`, `test_a_cycle_of_assignments_is_read_once`,
-    `test_names_in_an_operator_argument_are_dependencies`.
+    `test_names_in_an_operator_argument_are_dependencies`,
+    `test_a_name_in_an_operator_argument_or_a_quote_join_expands`.
 - **A name assigned more than once is also read with each value on its own** (`_picked`,
   XERK-1621): joined, `x=a; x="rm …"; $x` ran the program `a`. Added readings, never swapped.
   - One whole-line reading per value; more than `_MAX_VALUE_READINGS` assignments to one name

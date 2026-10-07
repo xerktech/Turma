@@ -1478,6 +1478,51 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_name_in_an_operator_argument_or_a_quote_join_expands(self):
+        # XERK-1661: each ran `rm -rf /etc` (as nobody, guard_differential.py)
+        # while the guard allowed it.
+        R = "rm -rf /etc"
+        for cmd in (f"A='{R}'; ${{Q:-$A}}", "a=/etc; rm -rf ${q:-$a}",
+                    'a=/etc; rm -rf "${q:-$a}"', 'a=/etc; rm -rf "${q:-"$a"}"',
+                    "b=/e; a=$b'tc'; rm -rf $a", 'b=/e; a=$b"tc"; rm -rf $a',
+                    'b=/e; a="$b"tc; rm -rf $a', "a=/etc; rm -rf ${q-$a}",
+                    "a=/etc; rm -rf ${y[0]:-$a}", 'a=/etc; rm -rf "${y[@]:-$a}"',
+                    # A quote join inside a value's substitution (QA).
+                    "b=/e; a=$(echo $b'tc'); rm -rf $a", "b=/e; a=`echo $b'tc'`; rm -rf $a",
+                    'b=/e; a=$(echo "$b"tc); rm -rf $a', "B=r; a=$(echo $B'm'); $a -rf /etc",
+                    # An operator in the body: the brace applies with no re-read (QA).
+                    "b=/e; rm -rf $(true; echo $b'tc')", "r=r; $(echo $r'm' | cat) -rf /etc",
+                    # Inside `'…'` the `'` closes the quote: eval reads `$bt` (QA).
+                    "bt=/etc; eval 'a=$b't; rm -rf $a",
+                    # Set but empty takes a `:-`/`:=` default (QA).
+                    "q=; rm -rf ${q:-/etc}", "q=''; rm -rf ${q:=/etc}", f"q=; A='{R}'; ${{q:-$A}}",
+                    # The brace-argument forms (fixed by XERK-1653), pinned.
+                    f"Q=1; A='{R}'; D=${{Q:+${{A}}}}; $D", f"Q=1; A='{R}'; ${{Q:+${{A}}}}",
+                    'q=1; a=/etc; rm -rf ${q:+"${a}"}',
+                    f"x=1; y=1; z='{R}'; ${{x:+${{y:+$z}}}}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("A='ls -la'; ${Q:-$A}", "a=/tmp/x; rm -rf ${q:-$a}",
+                    "a=/etc; rm -rf ${q:-x$a}", "b=/tm; a=$b'p/x'; rm -rf $a",
+                    'b=/tm; a="$b"p/x; rm -rf $a', "b=/tm; a=$(echo $b'p/x'); rm -rf $a",
+                    "q=; rm -rf ${q-/etc}", "q=x; rm -rf ${q:-/etc}"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        self.assertEqual(guard._dequote_value("$b'tc'"), "${b}tc")
+        self.assertEqual(guard._dequote_value('"$b"tc'), "${b}tc")
+        self.assertEqual(guard._dequote_value("$'tc'"), "tc")
+        # A wrapper glued to `<<`: the shell after the delimiter runs the
+        # body (XERK-1661 QA; main allowed the literal spellings).
+        for owner in ("env<<'EOF' bash", "nice<<EOF bash", "F=env; ${F}<<'EOF' bash",
+                      "G=bash; env<<'EOF' ${G}", "env<<'EOF'x bash", "env<<E'O F' bash",
+                      'env<<"E F"x bash', "env<<E\\ F bash", "nice<<'EOF'x sh"):
+            self.assertDenied(owner + "\nrm -rf /etc\nEOF")
+        for owner in ("F=cat; ${F}<<'EOF' > out.txt", "cat<<'EOF' > bash.txt"):
+            self.assertAllowed(owner + "\nrm -rf /etc\nEOF")
+        # Left unbraced: an escaped `$`, and a `$b'` a `'…'` quote ends.
+        self.assertEqual(guard._brace_quote_ended("echo \\$b'tc' 'x $b'y \"$b\"c"),
+                         "echo \\$b'tc' 'x $b'y \"${b}\"c")
+
     def test_a_value_a_grouped_or_looped_reader_takes_from_stdin_runs(self):
         # XERK-1650: each ran `rm -rf /etc` while the guard allowed it.
         R = self.R
