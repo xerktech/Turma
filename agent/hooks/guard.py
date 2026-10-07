@@ -99,6 +99,8 @@ _PREFIX_WORDS = {
     "timeout", "nice", "ionice", "setsid", "stdbuf", "chrt", "unbuffer", "builtin",
     # `coproc cmd` runs cmd (XERK-1624).
     "coproc",
+    # `busybox rm -rf /etc` runs its applet (XERK-1687).
+    "busybox",
 }
 
 # Options of those wrappers that consume the NEXT token as their value, so
@@ -5533,6 +5535,10 @@ def _strip_prefixes(tokens: list[str]) -> list[str]:
                         or wrapper == "nice" and re.match(r"^[0-9]", out[0])
                         or wrapper == "chrt" and re.match(r"^[-+]?[0-9]|^[$`]", out[0])):
                 out.pop(0)
+            # BusyBox rm has no preserve-root: `busybox rm -rf "$x/$y"` empties
+            # `/`, so it is read as GNU rm told not to refuse it (XERK-1687).
+            if wrapper == "busybox" and out and _basename(out[0]) == "rm":
+                out.insert(1, "--no-preserve-root")
             # `coproc NAME { cmd; }`: a name only ever precedes a compound
             # command, whose body runs (XERK-1620 QA).
             if wrapper == "coproc" and len(out) > 1 and out[1] in ("{", "(", "while", "until",
@@ -8681,11 +8687,18 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             by_cwd = [(cwd, [_under_cwd(r, cwd) for r in roots]) for cwd in cwds]
             by_cwd = [(cwd, joined) for cwd, joined in by_cwd if joined != roots]
             if "-delete" in rest:
-                # Equivalent to a recursive delete of everything it walks.
-                out.append((["rm", "-r", *roots], seg))
+                # Equivalent to a recursive delete of everything it walks,
+                # with no preserve-root: `find / -delete` empties `/` (XERK-1687).
+                out.append((["rm", "-r", "--no-preserve-root", *roots], seg))
                 for cwd, joined in by_cwd:
-                    out.append((["rm", "-r", *joined], seg, False, cwd))
+                    out.append((["rm", "-r", "--no-preserve-root", *joined], seg, False, cwd))
             roots += [r for _, joined in by_cwd for r in joined]
+            # `{}` is every path find walks, and under `"$x/$y"` with both unset
+            # that is all of `/`: an `-exec rm -rf {} +` deletes it child by
+            # child, preserve-root or not. So each root is also read with all
+            # of its unknown names empty (XERK-1687).
+            roots += [r for r in dict.fromkeys(_unset_names_dropped(t, keep_last=False)
+                                               for t in roots) if r and r not in roots]
             # Each flag's run ends at the next terminator, found in ONE
             # backward pass: rescanning and re-slicing `rest` per `-exec` was
             # quadratic (XERK-1589).
@@ -9129,7 +9142,7 @@ def _name_end(raw: str, pos: int) -> tuple[int, bool]:
     return end, True
 
 
-def _unset_names_dropped(raw: str) -> str | None:
+def _unset_names_dropped(raw: str, keep_last: bool = True) -> str | None:
     """``raw`` with the unknown names bash would read as empty dropped, or
     None if it has none (XERK-1639, XERK-1652). Every such name in a component
     before the last is dropped: `/$x/etc` and `"$x/usr$y/lib"` are `/etc` and
@@ -9137,7 +9150,9 @@ def _unset_names_dropped(raw: str) -> str | None:
     glued to text is (`$x/etc$y` is `/etc`): `"$dir/$f"`, `"$TMP/$x"` and
     `"$dir/$name.$ext"` are the everyday idiom, `/` or `/.` only when all are
     unset. A word that is one component counts as two when names alone
-    open it before a `/`: `$x/` is the root, `"$x"*` and `"$x".bak` stay."""
+    open it before a `/`: `$x/` is the root, `"$x"*` and `"$x".bak` stay.
+    Without ``keep_last`` every name is dropped, the last component's too:
+    `"$x/$y"` is `/` (XERK-1687)."""
     # (start, end) of each name that can be empty, and every `/` between them.
     names, slashes, pos = [], [], 0
     while pos < len(raw):
@@ -9155,7 +9170,9 @@ def _unset_names_dropped(raw: str) -> str | None:
     # The last component starts after the last `/` with more than `/`s after it.
     last = len(raw.rstrip("/"))
     seps = [i for i in slashes if i < last]
-    if seps:
+    if not keep_last:
+        cut = len(raw)
+    elif seps:
         cut = seps[-1]
     elif slashes and names and names[0][0] == 0:
         # One component before trailing `/`s: names alone must fill it.
@@ -9329,23 +9346,25 @@ def _home_reading(raw: str) -> str | None:
     return path + slash
 
 
-def _dangerous_target(tok: str, home_read: bool = True) -> str | None:
+def _dangerous_target(tok: str, home_read: bool = True, keep_last: bool = True) -> str | None:
     """Why ``tok`` names a protected path, or None. Besides the target as
     written, it is read with its unknown names empty (`_unset_names_dropped`),
     and that reading is judged by `_is_dangerous_path` like any other:
     `"$build"/out` reads `/out`, an ordinary root child, and stays allowed
     (owner decision on XERK-1639). The names are found before `_norm_path`,
-    whose normpath folds `$x/../etc` into `etc` and `./$x/etc` into `$x/etc`."""
+    whose normpath folds `$x/../etc` into `etc` and `./$x/etc` into `$x/etc`.
+    ``keep_last`` keeps the names of the last component (`"$dir/$f"`), which
+    only GNU rm's preserve-root makes safe when they read `/` (XERK-1687)."""
     if _is_dangerous_path(tok):
         return f"({tok!r})"
     raw = tok.strip().strip('"').strip("'")
-    empty = _unset_names_dropped(raw)
+    empty = _unset_names_dropped(raw, keep_last)
     # Judged as is: XERK-1623's trailing reading on top would read `"$TMP/$x"`
     # as `/`; `_unset_names_dropped` already drops the trailing names it may.
     if empty is not None and _is_dangerous_path(empty, trailing=False):
         return f"({tok!r}, which is {_norm_path(empty)!r} when its unknown names are unset)"
     home = _home_reading(raw) if home_read else None
-    if home is not None and _dangerous_target(home, home_read=False):
+    if home is not None and _dangerous_target(home, home_read=False, keep_last=keep_last):
         return f"({tok!r}, which is {home!r} with the home expanded)"
     return None
 
@@ -9378,10 +9397,13 @@ def _destructive_rm(tokens: list[str]) -> str | None:
         targets.append(tok)
     if prog == "rm" and not _rm_is_recursive(flags):
         return None
+    # GNU rm refuses `/`, so a last component of names reading `/` is left
+    # alone (`"$dir/$f"`); without that refusal it is read empty (XERK-1687).
+    preserve_root = "--no-preserve-root" not in tokens
     for tgt in targets:
         if _is_home_ssh(tgt):
             return f"refusing recursive delete of a protected path ({tgt!r})"
-        why = _dangerous_target(tgt)
+        why = _dangerous_target(tgt, keep_last=preserve_root)
         if why:
             return f"refusing recursive delete of a protected path {why}"
     return None
@@ -9802,7 +9824,8 @@ def _destructive_chmod_chown(tokens: list[str]) -> str | None:
     for tok in tokens[1:]:
         if tok.startswith("-"):
             continue
-        why = _dangerous_target(tok)
+        # No preserve-root here: `"$x/$y"` is `/` when both are unset (XERK-1687).
+        why = _dangerous_target(tok, keep_last=False)
         if why:
             return f"refusing recursive {prog} on a protected path {why}"
     return None

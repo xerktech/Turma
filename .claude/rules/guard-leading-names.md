@@ -33,11 +33,17 @@ paths:
   - in the last component, only a trailing run glued to text: `$x/etc$y` → `/etc`.
   - Kept: the rest of the last component. Reading it empty denied the everyday
     `"$dir/$f"`, `"$TMP/$x"` (→ `/`) and `"$dir/$name.$ext"` (→ `/.`); so `$x/$y` stays allowed.
+  - That kept rest is for GNU `rm` only, whose preserve-root refuses `/` (XERK-1687). Every
+    other tree-walker reads it empty too (`keep_last=False`): `chmod`/`chown`/`chgrp -R`,
+    `rm --no-preserve-root`, `busybox rm` (no preserve-root), `find -delete` (emitted as
+    `rm -r --no-preserve-root`), and a `find -exec`'s `{}` (each root's empty reading is
+    added to the roots, since find walks `/` child by child).
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top
   would read `"$TMP/$x"` as `/`.
 - Cost, measured: 0 new denies over a 36.7k-command real corpus replay vs main (XERK-1652).
 - Tests: `test_an_unset_name_leading_a_target_is_read_empty`,
+  `test_a_last_component_of_names_is_read_empty_without_preserve_root`,
   `test_every_unset_name_component_is_read_empty`,
   `test_leading_names_are_one_run_and_scan_linearly`.
