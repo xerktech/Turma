@@ -4085,10 +4085,15 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'bash -c "\\$x \\\nrm -rf /etc"', 'eval "\\$x \\\nrm -rf /etc"',
                     'bash <<< "\\$x \\\nrm -rf /etc"', 'echo "\\$x \\\nrm -rf /etc" | bash',
                     # A lone trailing `\` is a literal `\` to bash; shlex raised on
-                    # it and the fallback kept the script's quotes (XERK-1646).
+                    # it and its fallback kept the script's quotes (XERK-1646).
                     "bash -c 'rm -rf /etc '\\", "bash -c 'rm -rf /etc'\\",
                     "sh -c 'rm -rf /etc'\\", "eval 'rm -rf /etc'\\",
                     "bash -c 'X=${nope:-a b} rm -rf /etc '\\",
+                    # zsh drops it instead; a brace expansion glued to it is
+                    # still read split (it was denied before the fix too).
+                    "git push origin main\\", "bash -c 'git push origin main'\\",
+                    "eval 'reboot'\\", "bash -c 'find / -delete'\\",
+                    "rm -rf {/etc,/var}\\", "rm -rf /{etc,var}\\", "rm -rf {/,x}\\",
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',

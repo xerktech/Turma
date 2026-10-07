@@ -4575,23 +4575,32 @@ def _glue_func_parens(segment: str) -> str:
     return "".join(out)
 
 
+def _trailing_escape_readings(segment: str) -> tuple[str, ...]:
+    """bash's and zsh's readings of ``segment`` when it ends in a lone `\\`
+    that shlex cannot read: kept as a literal (bash, dash), or dropped (zsh).
+    Empty when shlex reads the segment as it is (XERK-1646)."""
+    if not segment.endswith("\\"):
+        return ()
+    try:
+        shlex.split(segment, posix=True)
+        return ()
+    except ValueError:
+        pass
+    try:
+        shlex.split(segment + "\\", posix=True)
+    except ValueError:
+        # Not the trailing escape (an open quote): nothing to add.
+        return ()
+    return (segment + "\\", segment[:-1])
+
+
 @functools.lru_cache(maxsize=512)
 def _tokenize_cached(segment: str) -> tuple[str, ...]:
     segment = _join_continuations(segment)
     try:
         return tuple(shlex.split(segment, posix=True))
     except ValueError:
-        pass
-    # bash reads a lone backslash ending the input as a literal `\`; shlex
-    # raises on it instead. The whitespace split below keeps the quotes on a
-    # `-c`/`eval` script, so `bash -c 'rm -rf /etc '\` was never re-read
-    # (XERK-1646). Escaping it gives bash's own reading.
-    if segment.endswith("\\"):
-        try:
-            return tuple(shlex.split(segment + "\\", posix=True))
-        except ValueError:
-            pass
-    return tuple(segment.split())
+        return tuple(segment.split())
 
 
 def _tokenize(segment: str) -> list[str]:
@@ -6985,6 +6994,17 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if seg not in seen:
                     seen.add(seg)
                     segments.append(seg)
+    # A lone `\` ending a segment makes shlex raise, and the whitespace split
+    # it falls back to keeps a `-c`/`eval` script's quotes, so the script was
+    # never re-read (XERK-1646). bash keeps that `\` as a literal, zsh drops
+    # it: both readings are ADDED. The fallback's own reading stays, since the
+    # brace expansion before it joins `{/etc,/var}\` into `/etc\ /var\`, which
+    # shlex alone reads as one harmless word.
+    for seg in list(segments):
+        for reading in _trailing_escape_readings(seg):
+            if reading not in seen:
+                seen.add(reading)
+                segments.append(reading)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
