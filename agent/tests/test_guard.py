@@ -1648,6 +1648,203 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_value_a_split_heredoc_or_callback_reader_takes_runs(self):
+        # XERK-1658: each ran `rm -rf /etc` while the guard allowed it.
+        R = self.R
+        for cmd in (f'IFS=, read a b <<< "x,{R}"; $b',
+                    f"echo 'x,{R}' | {{ IFS=, read a b; $b; }}",
+                    f"echo 'x:{R}' | {{ IFS=: read -a arr; ${{arr[1]}}; }}",
+                    f"echo 'x,{R},' | while read -d , a; do $a; done",
+                    f"printf 'x\\0{R}\\0' | while read -d '' a; do $a; done",
+                    f"printf 'x\\0{R}\\0' | {{ mapfile -d '' -t a; ${{a[1]}}; }}",
+                    f'f() {{ $2; }}; mapfile -c 1 -C f -t a <<< "$(echo {R})"',
+                    f'yes "{R}" | head -1 | while read a; do $a; done',
+                    f"coproc {{ echo {R}; }}; read -u ${{COPROC[0]}} a; $a",
+                    f"echo {R} > /tmp/f; read a < /tmp/f; $a",
+                    f"$(echo echo) {R} | while read a; do $a; done",
+                    f'set -- "$(echo {R})"; select v; do $v; break; done <<< 1',
+                    # A heredoc straight into a reader.
+                    f"read a <<E\n{R}\nE\n$a",
+                    f"mapfile -t a <<'E'\nx\n{R}\nE\n${{a[1]}}",
+                    f"IFS=, read a b <<E\nx,{R}\nE\n$b",
+                    f"f() {{ $2; }}; mapfile -C f -t a <<E\n{R}\nE\n",
+                    # QA: a use is no producer (it bound `a` empty and hid
+                    # main's own deny); spellings of each claim.
+                    f"exec 3<<E\n{R}\nE\nread -u 3 a; $a",
+                    f"exec 3<<E\n{R}\nE\nmapfile -t -u 3 a; ${{a[0]}}",
+                    f"i=,; IFS=$i read a b <<< \"x,{R}\"; $b",
+                    f"IFS=${{x:-,}} read a b <<< \"x,{R}\"; $b",
+                    f"d=,; echo 'x,{R},' | while read -d \"$d\" a; do $a; done",
+                    f"command yes '{R}' | head -n1 | while read a; do $a; done",
+                    f"/usr/bin/yes -- '{R}' | head -n1 | while read a; do $a; done",
+                    f"'echo' {R} | while read a; do $a; done",
+                    f"e\\cho {R} | while read a; do $a; done",
+                    f"`echo echo` {R} | while read a; do $a; done",
+                    f"echo {R} > f; while read a; do $a; done < f",
+                    f"echo {R} > f; {{ read a; $a; }} < f",
+                    f"echo {R} > f; read a 0< f; $a",
+                    f"echo {R} > f; exec < f; read a; $a",
+                    f"cat > f <<'E'\n{R}\nE\nread a < f; $a",
+                    f"g=f; f() {{ $2; }}; mapfile -C \"$g\" -t a <<< \"$(echo {R})\"",
+                    f"<<E read a\n{R}\nE\n$a",
+                    f"read a <<A <<B\nx\nA\n{R}\nB\n$a",
+                    # Pass 12: blanks in IFS only trim; a split piece as a path.
+                    # Pass 13: a quoted `;`/`&&` on the reader's own command.
+                    f"read -d ';' a <<'E'\n{R};x\nE\n$a",
+                    f"IFS=';' read a b <<'E'\nx;{R}\nE\n$b",
+                    f"read -p 'go; ' a <<'E'\n{R}\nE\n$a",
+                    f"X=';' mapfile -t arr <<'E'\n{R}\nE\n${{arr[0]}}",
+                    'IFS=, read a b c d e <<< "1,2,3,4,/etc"; rm -rf "$e"',
+                    # Pass 14: quoted assignments before a reader in `"$(…)"`.
+                    f"x=\"$(IFS=';' read a b <<'E'\nx;{R}\nE\n$b)\"",
+                    f"x=\"$(X='a b' read a <<'E'\n{R}\nE\n$a)\"",
+                    f'IFS=", " read a b <<< "x,{R}"; $b',
+                    f"IFS=$'\\t' read a b <<< $'x\\t{R}'; $b",
+                    f"while IFS=', ' read -r a b; do $b; done <<< \"x,{R}\"",
+                    'IFS=, read d x <<< "/etc,a"; rm -rf "$d"',
+                    'IFS=, read x y <<< "/,etc"; rm -rf "$x/$y"',
+                    'read -d , d <<< "/etc,x"; rm -rf "$d"',
+                    f"while IFS=, read a b; do $b; done <<E\nx,{R}\nE",
+                    f"while read a\ndo\n$a\ndone <<E\n{R}\nE",
+                    f'exec 3<<E\n{R}\nE\nread -u 3 a; "$a"',
+                    f"exec 3<<'E'\n{R}\nE\nread -u 3 a; eval \"$a\"",
+                    f"tee f >/dev/null <<'E'\n{R}\nE\nread a < f; $a",
+                    # A spelled producer WITH words still writes the file.
+                    f"e=echo; $e '{R}' > f; read a < f; $a",
+                    f"`echo echo` '{R}' > f; while read a; do $a; done < f",
+                    # The file a heredoc writes, read back (pass 3).
+                    f"tee f <<'E'\n{R}\nE\nread a < f; $a",
+                    f"cat <<E | tee -a ./f\n{R}\nE\nread a < f; $a",
+                    f"cat > f <<E\n{R}\nE\n{{ read a; $a; }} < f",
+                    f"cat > f <<'E'\n{R}\nE\n( read a; $a ) < f",
+                    f"cat > $F <<E\n{R}\nE\nread a < g; $a",
+                    # Pass 4: another heredoc on the line, before or after;
+                    # `dd of=`, `&>`, `>|`; one file spelled two ways.
+                    f"cat > a <<'A'\nhello\nA\ncat > f <<'E'\n{R}\nE\nread x < f; $x",
+                    f"cat > f <<'E'\n{R}\nE\ncat > a <<'A'\nhello\nA\nread x < f; $x",
+                    f"cat <<'A'\nhi\nA\nread a <<'E'\n{R}\nE\n$a",
+                    f"dd of=f status=none <<'E'\n{R}\nE\nread a < f; $a",
+                    f"cat &> f <<E\n{R}\nE\nread x < f; $x",
+                    f"cat >| f <<E\n{R}\nE\nread x < f; $x",
+                    f"cd /tmp && cat > f <<E\n{R}\nE\nread x < /tmp/f; $x",
+                    f"S=/tmp; cat > $S/f <<E\n{R}\nE\nread x < $S/f; $x",
+                    f"cat > f <<E\n{R}\nE\nread x < f*; $x",
+                    f"read a <<A <<B\nx\nA\n{R}\nB\ncat <<'C'\nz\nC\n$a",
+                    # Pass 5: identical owner lines are two owners.
+                    f"cat <<'A'\nhello\nA\ncat <<'A'\nhi\nA\ncat > f <<'E'\n{R}\nE\nread x < f; $x",
+                    f"cat > f <<'E'\nhello\nE\ncat > f <<'E'\n{R}\nE\nread x < f; $x",
+                    f"read a <<'E'\nhello\nE\nread a <<'E'\n{R}\nE\n$a",
+                    # Pass 6: the operator where the lexer found it, never a
+                    # quoted/commented copy of its line, a shift or `$'\''`;
+                    # a reader inside `$(…)`.
+                    f"echo \"read a <<'E'\"\nread a <<'E'\n{R}\nE\n$a",
+                    f"# read a <<'E'\nread a <<'E'\n{R}\nE\n$a",
+                    f"echo \"cat > f <<'E'\"\ncat > f <<'E'\n{R}\nE\nread x < f; $x",
+                    f"x=$((1<<2)); read a <<'E'\n{R}\nE\n$a",
+                    f"echo $'\\''; read a <<'E'\n{R}\nE\n$a",
+                    f"x=\"$(cat <<'A'\nhi\nA\n)\"; read a <<'E'\n{R}\nE\n$a",
+                    f"x=$(read a <<'E'\n{R}\nE\n$a)",
+                    f"x=\"$(while read l; do $l; done <<'E'\n{R}\nE\n)\"",
+                    # Pass 8: any spelling, after a token the splitter misreads.
+                    f"echo $'\\'' ; time read a <<'E'\n{R}\nE\n$a",
+                    f"echo $'\\''\ncommand read a <<'E'\n{R}\nE\n$a",
+                    f"echo $'\\'' ; ! read a <<'E'\n{R}\nE\n$a",
+                    # Pass 10: a word-only reader's body keeps its assignments.
+                    f"echo $'\\'' ; read -r a <<'E'\nX=1 {R}\nE\neval \"$a\"",
+                    f"echo $'\\'' ; read -r -d '' a <<'E'\nc='{R}'\n$c\nE\neval \"$a\"",
+                    # Pass 11: a backticked command holding `=` still runs.
+                    f"echo $'\\'' ; read -r a <<'E'\n`x=1;{R}`\nE\neval \"$a\"",
+                    f"echo $'\\'' ; read -r a <<'E'\n`{R} # =`\nE\neval \"$a\"",
+                    f"echo $'\\'' ; read -r a <<'E'\n`X=1 {R}`\nE\neval \"$a\"",
+                    f"echo $'\\'' ; read -r a <<'E'\n`a=1` {R} `b=2`\nE\neval \"$a\"",
+                    f"echo \"$(\n\\read a <<'E'\n{R}\nE\n$a)\"",
+                    # A command in the body still runs where the value is run.
+                    f"read -r a <<'E'\n`{R}`\nE\neval \"$a\"",
+                    f"read -r a <<'E'\necho \"`{R}`\"\nE\neval \"$a\"",
+                    f"read -r a <<'E'\necho \"$({R})\"\nE\nbash -c \"$a\"",
+                    f"cat > f <<'E'\necho \"`{R}`\"\nE\nread -r a < f; eval \"$a\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ('IFS=, read a b <<< "x,ls"; $b',
+                    'while IFS=: read -r user _; do echo "$user"; done < /etc/passwd',
+                    "printf 'a\\0b\\0' | while read -d '' f; do echo \"$f\"; done",
+                    "read a <<E\nls\nE\n$a",
+                    "mapfile -t a <<E\nhello\nE\necho ${a[0]}",
+                    'f() { echo "$2"; }; mapfile -C f -t a <<< "$(ls)"',
+                    f"cat <<E\n{R}\nE",
+                    'set -- a b; select v; do echo "$v"; break; done <<< 1',
+                    # QA: a heredoc on another command never feeds a reader
+                    # of a pipe or `<(…)`; bound, distinct bodies spent the
+                    # budget ("too large") on real scripts.
+                    "read -r ans\n" + "".join(f"cat > f{i}.txt <<'EOF'\nbody {i} x\nEOF\n"
+                                               for i in range(24)),
+                    "while IFS= read -r f; do echo \"$f\"; done < <(find . -name x)\n"
+                    "python3 - <<'PY'\n" + "\n".join(f"print({i}, 'rm -rf /x{i}')"
+                                                       for i in range(20)) + "\nPY",
+                    # Only the file a reader reads feeds it (pass 3: 16 files
+                    # written beside a reader of one were "too large").
+                    "".join(f"cat > f{i}.txt <<'EOF'\nk{i}\nEOF\n" for i in range(40))
+                    + "while read l; do echo $l; done < f0.txt",
+                    f"cat > g <<'E'\n{R}\nE\nread a < f; $a",
+                    # Pass 4: a `$S/` directory is no wildcard for the file.
+                    "cat > $S/p.py <<'E'\n" + "\n".join(f"print('rm -rf /{i}')"
+                                                         for i in range(240))
+                    + "\nE\nwhile read l; do echo $l; done < $S/l.txt",
+                    # Pass 5: many bodies feed a reader as ONE value.
+                    "".join(f"cat > svc{i}/config.yaml <<'EOF'\na: 1\nb: 2\nc: 3\nEOF\n"
+                            for i in range(8))
+                    + 'while IFS= read -r l; do echo "$l"; done < base/config.yaml',
+                    "".join(f"cat > f{i} <<'EOF'\nk{i}\nEOF\n" for i in range(16))
+                    + 'while read l; do echo $l; done < "$1"',
+                    # Pass 7: "read" in a title, comment or message is no
+                    # reader; its markdown body stays data.
+                    f"gh issue create --title 'read path' --body-file - <<'EOF'\nRepro: `{R}`\nEOF",
+                    f"cat > f.md <<'EOF'  # read me\n- `{R}` is bad\nEOF",
+                    f"git commit -qm 'read it' && cat > f.md <<'EOF'\n- `{R}` is bad\nEOF",
+                    # Pass 14: a wide literal CSV read is not "too large".
+                    "IFS=, read -r " + " ".join(f"c{i}" for i in range(16)) + ' <<< "'
+                    + ",".join(f"x{i}" for i in range(16)) + '"; echo "$c0"',
+                    f"ssh host \"cd x; read a; echo ok\" <<'EOF'\n- `{R}` is bad\nEOF",
+                    # Pass 13: "read" after a keyword inside a quoted title.
+                    f"gh issue create --title 'while read loop stalls' --body-file - <<'EOF'\n"
+                    f"- `{R}` is bad\nEOF",
+                    # Pass 10: a reader on ANOTHER command of the line.
+                    f"read -p 'ok? ' x; gh issue create --title t --body-file - <<'EOF'\n"
+                    f"- never run `{R}` here\nEOF",
+                    # Pass 11: a group closer on ANOTHER command of the line.
+                    f"{{ echo; }}; gh x --title read --body-file - <<'EOF'\n- `{R}`\nEOF",
+                    # Pass 9: twenty `x=$y` notes in a body "read" names.
+                    "cat > read.md <<'EOF'\n" + "\n".join(
+                        f"- note {i}: set `x=$y_{i}` here" for i in range(20)) + "\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_a_file_reader_matches_only_the_heredocs_own_command(self):
+        # XERK-1658 QA pass 8: a write elsewhere on the owner line matched.
+        cmd = "./mk > keys.txt; cat > poll.sh <<'E'\nbody\nE\nread k < keys.txt"
+        commands, heredocs = guard._split_heredocs(cmd)
+        readings = guard._reader_extra_readings(cmd, commands, heredocs, {})
+        self.assertFalse(any("body" in r for r in readings), readings)
+
+    def test_many_backtick_assignments_before_a_heredoc_classify_fast(self):
+        # XERK-1658 QA pass 16: the reader-word value regex backtracked
+        # exponentially on a run of backtick/$() assignments before a
+        # heredoc, hanging the guard open past the hook timeout.
+        for prefix in ("".join(f"a{i}=`x` " for i in range(60)),
+                       "".join(f"A{i}=1 B{i}='x' C{i}=$(z) D{i}=`w` " for i in range(60))):
+            cmd = prefix + "cat <<EOF\nhi\nEOF"
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow", cmd[:60])
+            self.assertLess(time.monotonic() - t, 5, cmd[:60])
+
+    def test_a_file_reader_takes_each_written_line_once(self):
+        # XERK-1658 QA: a file written N times over was N copies to read.
+        line = "cat > d{}/f <<'E'\nsame line\nE\n"
+        cmd = "".join(line.format(i) for i in range(4)) + "while read l; do echo $l; done < f"
+        commands, heredocs = guard._split_heredocs(cmd)
+        readings = guard._reader_extra_readings(cmd, commands, heredocs, {})
+        self.assertEqual(sum(r.count("same line") for r in readings), 1, readings)
+
     def test_an_assigned_substitution_in_a_script_xargs_find_or_proc_subst_runs(self):
         # XERK-1649: each ran `rm -rf /etc` while the guard allowed it.
         R = self.R

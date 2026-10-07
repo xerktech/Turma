@@ -3822,6 +3822,13 @@ def _herestring(seg: str) -> tuple[str, str] | None:
 def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
     """The scalar names and array names a `read` or `mapfile`/`readarray`
     fills from its stdin, or None if ``tokens`` is neither."""
+    got = _reader_opts(tokens)
+    return got[:2] if got else None
+
+
+def _reader_opts(tokens: list[str]) -> tuple[list[str], list[str], dict[str, str]] | None:
+    """`_reader_names`, with the value of each option given one (`-d`, `-C`,
+    `-u`), dequoted (XERK-1658)."""
     if not tokens:
         return None
     prog = tokens[0]
@@ -3832,6 +3839,7 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
     else:
         return None
     names, arrays, i = [], [], 1
+    values: dict[str, str] = {}
     while i < len(tokens):
         tok = tokens[i]
         if "<" in tok or ">" in tok:
@@ -3841,7 +3849,8 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
             glued = re.match(r"([A-Za-z_][A-Za-z0-9_]*)[<>&]", tok)
             if glued:
                 names.append(glued.group(1))
-            i += 2 if tok in ("<", ">", ">>", "<<") else 1
+            # ...with its descriptor too: `read a 0< f` (XERK-1658 QA).
+            i += 2 if re.fullmatch(r"[0-9]*(?:<|>|>>|<<|<&|>&)", tok) else 1
             continue
         if tok.startswith("-") and len(tok) > 1 and tok != "--":
             # A cluster's first option taking a value takes the rest of it, or
@@ -3851,6 +3860,8 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
             if at and not value and i + 1 < len(tokens):
                 i += 1
                 value = tokens[i]
+            if at:
+                values[tok[at]] = _dequote_value(value)
             if prog == "read" and at and tok[at] == "a":
                 # Its name, maybe glued to the redirection (`-a arr<<<"…"`).
                 arrays.append(re.match(r"[^<>&]*", value).group(0))
@@ -3861,10 +3872,10 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
     arrays = [n for n in arrays if _ASSIGN_NAME_RE.fullmatch(n)]
     if prog != "read":
         # mapfile's one name is an array, MAPFILE when none is given.
-        return [], (names[:1] or ["MAPFILE"])
+        return [], (names[:1] or ["MAPFILE"]), values
     if not names and not arrays:
         names = ["REPLY"]
-    return names, arrays
+    return names, arrays, values
 
 
 _GROUP_OPENERS = {"while", "until", "if", "for", "select", "case"}
@@ -3906,7 +3917,8 @@ def _seg_groups(segs: list[str]) -> list[tuple[int, int]]:
     return groups
 
 
-def _reader_feeds(command: str, segs: list[str], readers: dict[int, object]) -> dict[int, list[str]]:
+def _reader_feeds(command: str, segs: list[str], readers: dict[int, object],
+                  blind: frozenset[int] = frozenset()) -> dict[int, list[str]]:
     """What each reader (by segment index) may get as its stdin from elsewhere
     on the line (XERK-1650): a here-string or `< <(…)` on a
     group it is in (`{ read a; } <<< …`, `while read …; done < <(…)`), or a
@@ -3914,7 +3926,11 @@ def _reader_feeds(command: str, segs: list[str], readers: dict[int, object]) -> 
     A feed on any other command — `cat <<< … |`, `f <<< …` calling a reader
     function, `exec < <(…)`, an echo piped into `cat` — is unaccounted for,
     so it feeds EVERY reader. Paired, not every feed to every reader: a line
-    of N `echo … | while read` loops read each name N ways (N² readings)."""
+    of N `echo … | while read` loops read each name N ways (N² readings).
+    A ``blind`` reader reads a file or descriptor (`read a < f`, `read -u
+    ${COPROC[0]}`) whatever wrote it, so every echo on the line feeds it.
+    A `yes WORDS` prints its words, and a program spelled by an expansion
+    (`$(echo echo) WORDS`) may be an echo, so both are read as one (XERK-1658)."""
     own: list[list[str]] = []
     echo: list[str | None] = []
     piped: list[bool] = []
@@ -3934,8 +3950,34 @@ def _reader_feeds(command: str, segs: list[str], readers: dict[int, object]) -> 
         # A segment the split rewrote can't be placed, so it counts as piped.
         piped.append(at < 0 or bool(re.match(r"[\s)]*\|(?!\|)", command[pos:])))
         tokens = _strip_prefixes(_tokenize(seg.lstrip("({ \t")))
-        echo.append("$(" + seg[seg.index(tokens[0]):].rstrip(") \t") + ")"
-                    if tokens and tokens[0] in _ECHO_PROGS and tokens[0] in seg else None)
+        start = seg.index(tokens[0]) if tokens and tokens[0] in seg else \
+            len(seg) - len(seg.lstrip("({ \t")) if tokens else -1
+        # The program word as written: `'echo'` tokenizes without its quote.
+        while start > 0 and seg[start - 1] in "'\"\\":
+            start -= 1
+        # Its output is the file's, which a blind reader reads anyway.
+        printed = _OUT_REDIRECT_RE.sub(" ", seg[start:]) if start >= 0 else ""
+        prog = _basename(tokens[0]) if tokens else ""
+        spelled = bool(tokens) and start >= 0 and seg[start] in "$`\"'" \
+            and not tokens[0][:1].isalpha()
+        if start >= 0 and tokens[0] in _ECHO_PROGS and seg.startswith(tokens[0] + " ", start):
+            echo.append("$(" + printed.rstrip(") \t") + ")")
+        elif start >= 0 and (prog in _ECHO_PROGS or prog == "yes" or spelled):
+            # `/bin/echo`, `'echo'`, `yes`, or a program an expansion spells
+            # (`$(echo echo)`, `` `echo echo` ``): its words, past the whole
+            # program word (`$(echo echo)` tokenizes in two).
+            end = _word_end(printed, 0)
+            seg = printed
+            words = seg[end:].strip().rstrip(") \t") if end > 0 else ""
+            # A group's closer is no word: `( read a; $a ) < f`.
+            words = re.split(r"(?:^|\s)[)}](?:\s|$)", words, maxsplit=1)[0].strip()
+            if prog == "yes" and words.startswith("--"):
+                words = words[2:].strip()
+            # A bare `$a` uses a value, it prints none: read as `echo` with
+            # no words it bound a reader to "" (XERK-1658 QA).
+            echo.append("$(echo " + words + ")" if words else None)
+        else:
+            echo.append(None)
     groups = _seg_groups(segs)
     closers = {c for _, c in groups}
     openers = {o for o, _ in groups}
@@ -3954,9 +3996,17 @@ def _reader_feeds(command: str, segs: list[str], readers: dict[int, object]) -> 
         lo = min([g for g, c in groups if c == o - 1], default=o - 1)
         return [e for e in echo[lo:o] if e]
 
+    # A reader in a group redirected from a file (`done < f`, `} < f`), or
+    # on a line whose stdin `exec < f` moves, is blind too.
+    blind = set(blind)
+    if any(re.match(r"\s*exec\b[^|;&]*?" + _FILE_INPUT_RE.pattern, sg) for sg in segs):
+        blind.update(readers)
+    for o, c in groups:
+        if _FILE_INPUT_RE.search(_HERESTRING_RE.sub(" ", segs[c].lstrip("}) \t"))):
+            blind.update(k for k in readers if o <= k <= c)
     out = {}
     for k in readers:
-        feeds = own[k] + into(k)
+        feeds = own[k] + into(k) + ([e for e in echo if e] if k in blind else [])
         for o, c in groups:
             if o <= k <= c:
                 feeds += own[c] + into(o)
@@ -3972,10 +4022,15 @@ def _reader_values(command: str) -> list[tuple[str, str]]:
     each name a word, the last the remainder — or, when the line sets IFS or
     for an array, every name the whole text. Each line of a multi-line text
     is read on its own too, as `while read` and `mapfile` take it. A WORD
-    with a `${…}` default is read with it applied too."""
+    with a `${…}` default is read with it applied too. A literal IFS the line
+    sets, or a reader's `-d`, also cuts the text into pieces, each bound to
+    every name (XERK-1658): `IFS=, read a b <<< "x,rm …"` binds `b`."""
     segs = _split_segments(command)
     whole = "IFS" in command
+    ifs = _split_chars(m.group(1) for m in _IFS_ASSIGN_RE.finditer(command))
     readers: dict[int, tuple[list[str], list[str]]] = {}
+    seps: dict[int, str] = {}
+    blind: set[int] = set()
     for k, seg in enumerate(segs):
         if _SELECT_RE.match(seg):
             # `_strip_prefixes` drops `select v in` as a compound's head.
@@ -3983,18 +4038,24 @@ def _reader_values(command: str) -> list[tuple[str, str]]:
             continue
         here = _herestring(seg)
         text = here[1] if here else seg
+        # A redirection may lead the command: `<<< w read a`.
+        text = re.sub(r"\A\s*[0-9]{0,4}<<<\s*", "", text)
         if "<(" in text:
             # Its words are no names: `read a < <(echo rm …)` bound `rm`.
             for m in reversed(_find_substs(text)):
                 text = text[:m.start()] + "/dev/fd/63" + text[m.end():]
         # A function's body opens on its header: `f(){ read a`.
         text = _FUNC_HEADER_RE.sub("", text.lstrip())
-        got = _reader_names(_strip_prefixes(_tokenize(text)))
+        got = _reader_opts(_strip_prefixes(_tokenize(text)))
         if got:
-            readers[k] = got
+            readers[k] = got[:2]
+            # `-d ''` delimits on NUL.
+            seps[k] = ifs + (_split_chars([got[2]["d"]]) or "\0" if "d" in got[2] else "")
+            if "u" in got[2] or _FILE_INPUT_RE.search(text):
+                blind.add(k)
     if not readers:
         return []
-    feeds = _reader_feeds(command, segs, readers)
+    feeds = _reader_feeds(command, segs, readers, frozenset(blind))
     out: list[tuple[str, str]] = []
     for k, got in readers.items():
         here = _herestring(segs[k])
@@ -4005,18 +4066,274 @@ def _reader_values(command: str) -> list[tuple[str, str]]:
             words = [here[0]] + [f for f in feeds[k]
                                  if f.startswith("$(") and "<(" + f[2:] in segs[k]]
         for word in words:
-            out.extend(_bind_read(*got, word, whole))
+            out.extend(_bind_read(*got, word, whole, seps.get(k, ifs)))
     return list(dict.fromkeys(out))
 
 
+def _reader_extra_readings(line: str, commands: str, heredocs: list[tuple[str, str, bool]],
+                           vals: dict[str, list[str]]) -> list[str]:
+    """Texts the line also runs as, for what a reader binds that `_reader_values`
+    cannot see from the heredoc-stripped ``commands`` (XERK-1658):
+    - a heredoc fed to a reader (`read a <<E` / body / `E`; `$a`) is read as
+      the here-string of its body, which `_reader_values` binds;
+    - `mapfile -C f` calls `f INDEX LINE` per line: read as those calls
+      written after it, so `f() { $2; }` binds `$2` to each line.
+    ADDED readings, each re-expanded whole: the main pass still reads the
+    bodies. Neither holds what made it, so the re-expansion stops there."""
+    out = []
+    # Only a heredoc's own rewrite needs the segment scan; without one it is
+    # the `mapfile -C` callbacks below that run, so skip it (a 30 KB line
+    # with no heredoc paid `_HEREDOC_OP_RE.sub` over it for nothing, QA pass 16).
+    reader_segs = [seg for seg in _split_segments(commands) if _reader_opts(_strip_prefixes(
+        _tokenize(_FUNC_HEADER_RE.sub("", _HEREDOC_OP_RE.sub(" ", seg).lstrip()))))] \
+        if heredocs else []
+    # Each operator where the LEXER found it, never by searching the text:
+    # a quoted or commented copy of an owner line, a `$((1<<2))` shift or a
+    # `$'\''` took the rewrite, the real `<<E` left to swallow the reading.
+    # Owners are per occurrence (identical lines are two), grouped by number.
+    # ...or a reader word in COMMAND position the splitter left inside one
+    # segment (`x=$(read a`, `"$(while read l`). Never a word anywhere: a
+    # body bound for "read" in a title cost seconds and denied as data, and
+    # binding it inert hid real commands (QA passes 7-12). A reader the
+    # splitter misses after a `$'\''` is that splitter's gap (XERK-1733).
+    reader_word = _READER_WORD_RE
+    trace: dict = {}
+    has_word = any(w in commands for w in ("read", "mapfile", "readarray"))
+    if heredocs and (reader_segs or (has_word and reader_word.search(commands))):
+        _split_heredocs(line, trace)
+    kept: list[str] = trace.get("kept", [])
+    groups: dict[int, list[list]] = {}
+    for op in trace.get("ops", []):
+        groups.setdefault(op[1], []).append(op)
+    # A reader of a file or descriptor (`read a < f`, `done < f`, `read -u 3`)
+    # may read what a heredoc wrote there (`cat > f <<E`, `exec 3<<E`): the
+    # file read is matched to the one written by name.
+    read_paths = {_path_key(m.group(1), vals) for m in _READ_PATH_RE.finditer(commands)} \
+        if groups else set()
+    fd_read = any(re.search(r"-u|<&", seg) for seg in reader_segs)
+    written: list[str] = []
+    # Each operator's text in the readings: a reader's `<<E` as a here-string,
+    # every other `<<E` cut — kept, it took the rest of the reading (the
+    # echoes printed beside included) as its body.
+    full: dict[int, str] = {}
+    last: dict[int, str] = {}
+    owner_of = {k: heredocs[k][0] for k in range(len(heredocs))}
+    k = 0
+    for number in sorted(groups):
+        ops = groups[number]
+        owner = owner_of.get(k, "")
+        k += len(ops)
+        texts = [op[2] if op[3] else _produced_text(op[2]) for op in ops]
+        # A heredoc reaches a reader on its own command or group (the
+        # heredoc may sit on a loop's `done` or lead: `<<E read a`). Never
+        # one on another command: fed to every reader, a script's bodies
+        # bound names that read a pipe and spent the budget (QA).
+        # Judged on the command holding the `<<` (and its pipeline), never
+        # the whole line: a `read -p` before `; gh … <<'EOF'` is not its reader.
+        own = _heredoc_command(owner)
+        own_states = _quote_states(own)
+        reaches = any(seg.strip() and seg.strip() in own for seg in reader_segs) \
+            or (has_word and any(not own_states[m.end() - 1]
+                                 for m in reader_word.finditer(own))) or any(
+                re.match(r"\s*(?:done\b|[})])", seg) for seg in _split_segments(own))
+        if not reaches:
+            # Only the command holding the `<<` (and its pipeline): a write
+            # elsewhere on the line matched a reader's file (QA pass 8).
+            wrote = _written_paths(own, vals)
+            if (fd_read and re.search(r"\bexec\b", owner)) or read_paths and wrote and (
+                    read_paths & wrote or "?" in read_paths or "?" in wrote):
+                written.extend(texts)
+            for op in ops:
+                full[op[0]] = last[op[0]] = " "
+            continue
+        # As written, so a command in it runs wherever the value is run
+        # (`eval "$a"` of `echo "$(rm …)"`, QA pass 9).
+        strings = ["<<< " + _ansi_c_quote(t) for t in texts]
+        for j, (op, h) in enumerate(zip(ops, strings)):
+            full[op[0]] = h
+            # `read a <<A <<B` reads B, the last: also read with only it.
+            last[op[0]] = h if j == len(ops) - 1 else " "
+
+    def placed(repl: dict[int, str]) -> str:
+        return "".join(repl.get(j, piece) for j, piece in enumerate(kept))
+    rewritten = last_only = commands
+    if written or any(t != " " for t in full.values()):
+        rewritten = placed(full)
+        if last != full:
+            last_only = placed(last)
+    if written:
+        # Printed beside, unpiped, so only a blind reader takes it; ONE
+        # text of their lines, each line once, as N values (one a body)
+        # spent the budget, and a file written N times over N copies.
+        lines = dict.fromkeys(ln for body in written for ln in body.split("\n") if ln.strip())
+        rewritten += "\necho " + shlex.quote("\n".join(lines))
+    if rewritten != commands:
+        out.append(rewritten)
+    if last_only != commands:
+        out.append(last_only)
+    calls = []
+    if "-C" in commands:
+        for seg in _split_segments(rewritten):
+            got = _reader_opts(_strip_prefixes(_tokenize(_FUNC_HEADER_RE.sub("", seg.lstrip()))))
+            if not got or not got[2].get("C") or not got[1]:
+                continue
+            got_vals = vals if rewritten == commands else _var_values(rewritten)
+            # A callback a name holds (`-C $g`) is each of its values.
+            callback = got[2]["C"]
+            named = re.fullmatch(r"\$\{?([A-Za-z_]\w*)\}?", callback)
+            for cb in got_vals.get(named.group(1), []) if named else [callback]:
+                for text in got_vals.get(got[1][0], []):
+                    for k, ln in enumerate(ln for ln in text.split("\n") if ln.strip()):
+                        calls.append(f"{cb} {k} {shlex.quote(ln)}")
+    calls = list(dict.fromkeys(calls))
+    if calls and not commands.endswith("\n".join(calls)):
+        out.append(rewritten + "\n" + "\n".join(calls))
+    return out
+
+
+# A path a command reads: `< f`, `0< f`, `done < f`, `exec 3< f`; never
+# `<<`, `<<<`, `< <(…)` or `<&N`.
+_READ_PATH_RE = re.compile(r"(?<!<)[0-9]{0,4}<(?![<&]|\s*\()[ \t]*([^\s;|&<>()]+)")
+_WRITE_PATH_RE = re.compile(r"(?<![<>])(?:&>>?|[0-9]{0,4}>[>|]?)(?!&)[ \t]*([^\s;|&<>()]+)")
+
+
+def _path_key(word: str, vals: dict[str, list[str]]) -> str:
+    """A path word as compared across a line: its file NAME, as `cd`s, `~`
+    and `$S/` directories make one file many spellings; "?" when an
+    expansion or glob spells the name. Over-matches on purpose: a `"?"` for
+    every `$S/f` re-fed each body to each reader and spent the budget."""
+    path = _dequote_value(word)
+    if path == "/dev/null":
+        return path
+    name = os.path.basename(os.path.normpath(path))
+    if "$" in name or "`" in name:
+        name = _dequote_value(_substitute_vars(name, vals)) if vals else name
+    return "?" if re.search(r"[$`*?\[]", name) else name
+
+
+def _written_paths(owner: str, vals: dict[str, list[str]]) -> set[str]:
+    """The files ``owner`` writes: its `>`/`>>`/`&>`/`>|` targets, `tee`'s
+    and `dd of=`'s."""
+    paths = {_path_key(m.group(1), vals) for m in _WRITE_PATH_RE.finditer(owner)}
+    for seg in _split_segments(owner):
+        words = _strip_prefixes(_tokenize(_HEREDOC_OP_RE.sub(" ", seg)))
+        if words and _basename(words[0]) == "tee":
+            paths.update(_path_key(w, vals) for w in words[1:] if not w.startswith("-"))
+        if words and _basename(words[0]) == "dd":
+            paths.update(_path_key(w[3:], vals) for w in words[1:] if w.startswith("of="))
+    paths.discard("/dev/null")
+    return paths
+
+
+def _ansi_c_quote(text: str) -> str:
+    """``text`` as one `$'…'` word."""
+    return "$'" + text.replace("\\", "\\\\").replace("'", "\\'").replace("\n", "\\n") + "'"
+
+
+def _heredoc_command(owner: str) -> str:
+    """The `;`/`&&`/`||` pieces of ``owner`` holding a `<<`, cut only where
+    those operators are unquoted: a quote-blind cut split `read -d ';'`,
+    `IFS=';' read` and `read -p 'go; '` from their own heredoc (QA pass 13).
+    A reader word must be unquoted there too, so "while read" in a title
+    binds no body (seconds per call, then "too large")."""
+    states = _quote_states(owner)
+    pieces, start, i, n = [], 0, 0, len(owner)
+    while i < n:
+        if not states[i] and (owner[i] == ";" or owner.startswith(("&&", "||"), i)):
+            pieces.append(owner[start:i])
+            i += 1 if owner[i] == ";" else 2
+            start = i
+            continue
+        i += 1
+    pieces.append(owner[start:])
+    return " ; ".join(p for p in pieces if "<<" in p)
+
+
+# A reader in command position: after an operator, a group or substitution
+# opener, a keyword or a prefix word, any assignments before it, maybe
+# escaped (`\read`).
+_READER_WORD_RE = re.compile(
+    r"(?:\A|[;|&({`\n]|\$\(|(?<![\w-])(?:do|then|else|elif|while|until|if|!|time|command"
+    r"|builtin|exec|nice|env|sudo|nohup))[ \t]*"
+    # Assignment values read with their quotes: `IFS=';' read` (QA pass 14).
+    # Each value unit has a distinct first char, and the catch-all excludes
+    # `` ` ``, `$`, `(`, `)` so a run of them is tokenized ONE way — an
+    # overlapping catch-all made `X=`x` `×20 backtrack exponentially and hang
+    # the guard open (QA pass 16).
+    # At most a few prefix assignments (`IFS=x LC_ALL=y read`): bounded so a
+    # long run of `a=\`x\`` before a reader word is O(n), not a quadratic
+    # finditer that holds the GIL past the hook deadline (QA pass 17).
+    r"(?:[A-Za-z_]\w*=(?:\$'(?:[^'\\]|\\.)*'|'[^']*'|\"[^\"]*\"|\$\([^)]*\)"
+    # The value's units are bounded too, or a long bare `` `x` ``-run as ONE
+    # value backtracked O(n) per start — a new quadratic finditer main lacks
+    # (QA pass 18). A real reader-prefix value is short.
+    r"|`[^`]*`|[^\s;|&'\"$()`]){0,64}[ \t]+){0,8}"
+    r"\\?(?:read|mapfile|readarray)(?![\w-])")
+# A heredoc operator and its delimiter word: `<<E`, `<<-'E'`, `<< "E"`.
+_HEREDOC_OP_RE = re.compile(r"(?<!<)<<-?[ \t]*(?:'[^']*'|\"[^\"]*\"|\\?[^\s;|&<>()'\"]+)(?!<)")
+
+
+# An output redirection on an echo: `> f`, `2>>f`, `>&2`.
+_OUT_REDIRECT_RE = re.compile(r"[0-9]{0,4}>>?&?[ \t]*[^\s;|&<>()]+")
+
+
+def _split_chars(words) -> str:
+    """The characters IFS/`-d` values ``words`` split on: each one's own, or
+    every punctuation character for one an expansion spells (`IFS=$i`)."""
+    out = ""
+    for word in words:
+        value = _dequote_value(word)
+        # Not a path's or option's own characters: split on, they cut the
+        # very command a piece would hold.
+        out += re.sub(r"[/._~-]", "", string.punctuation) + "\t" \
+            if "$" in value or "`" in value else value
+    return "".join(dict.fromkeys(out))
+
+
+# The most (name, piece) bindings a split adds before only the joined value
+# is read: covers a 5-field pad (25) and an 8-name read (64), not a wide CSV.
+_MAX_SPLIT_PAIRS = 64
+# `IFS=<word>` (or `IFS=$'…'`) that a later reader splits on (XERK-1658).
+_IFS_ASSIGN_RE = re.compile(r"(?<![\w$])IFS=(\$?'[^']*'|\"[^\"]*\"|\$\{[^}]*\}|[^\s;|&)'\"]+)")
+# A reader's stdin redirected from a file or descriptor, not a here-string,
+# heredoc or `<(…)` (XERK-1658: `read a < /tmp/f`).
+_FILE_INPUT_RE = re.compile(r"(?<!<)<(?!<|\s*\()")
+
+
 def _bind_read(names: list[str], arrays: list[str], word: str,
-               whole: bool) -> list[tuple[str, str]]:
-    texts = [_dequote_value(word)]
-    if "${" in word and not _MAIN_PARSE[0]:
+               whole: bool, seps: str = "", literal: bool = False) -> list[tuple[str, str]]:
+    """``word`` bound to a reader's names; ``literal`` = ``word`` is the text
+    itself (a quoted heredoc body), not shell text to dequote."""
+    texts = [word if literal else _dequote_value(word)]
+    if "${" in word and not _MAIN_PARSE[0] and not literal:
         texts.extend(_default_readings(word))
     out = []
     for text in dict.fromkeys(texts):
-        produced = _produced_text(text, multi=_VALUES_MULTI[0])
+        produced = text if literal else _produced_text(text, multi=_VALUES_MULTI[0])
+        # Blanks beside another separator split no piece of their own:
+        # `IFS=', '` hands the last name the whole `rm -rf /`. Alone they do.
+        cut = re.sub(r"[ \t]", "", seps) or seps
+        if cut:
+            # Over-reads on purpose: which piece a name gets depends on its
+            # place, so every name gets every piece. A few pieces each on its
+            # own too, so `rm -rf "$d"` sees one path (QA pass 12); always as
+            # ONE value of a piece per line, which a use reads as commands —
+            # a value per piece alone was too many readings for a long text.
+            pieces = list(dict.fromkeys(
+                p for p in re.split("[" + re.escape(cut) + "\n]", produced) if p.strip()))
+            split = "\n".join(pieces)
+            if split and split != produced:
+                out.extend((n, split) for n in names + arrays)
+                names_arrays = names + arrays
+                # Every piece to EVERY name: which field a name gets is
+                # bash's split, blanks/escapes/lines and all — modelling it
+                # bound the wrong field and ran a quoted `rm -rf "$b"` (QA
+                # pass 15). Over-read, but bounded by a pair budget: a
+                # 16-name × 16-field CSV read is 256 bindings, which tripped
+                # "too large" (pass 14). Past it, only the joined value — the
+                # same reading a 17+-field split already gets.
+                if len(pieces) * len(names_arrays) <= _MAX_SPLIT_PAIRS:
+                    out.extend((n, p) for p in pieces for n in names_arrays)
         lines = [ln for ln in produced.split("\n") if ln.strip()]
         # Each line is its own read (`while read`, `mapfile`): one value with
         # the lines kept, which a use splits into commands, not a value per
@@ -4648,7 +4965,7 @@ def _heredoc_word(command: str, j: int) -> tuple[str, bool, int]:
     return "".join(word), quoted, j
 
 
-def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
+def _split_heredocs(command: str, trace: dict | None = None) -> tuple[str, list[tuple[str, str, bool]]]:
     """Split ``command`` into (commands-only text, [(owner line, body, quoted)]).
 
     A lexer, not a per-line regex (XERK-1256): a regex found `<<` wherever it
@@ -4658,8 +4975,15 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
     outside quotes and comments opens one, and arithmetic `$((1<<2))` is a
     shift. ``quoted`` is whether the delimiter was, i.e. whether bash leaves
     the body literal or expands `$(…)` and backticks inside it.
+
+    A ``trace`` dict gets the kept pieces (`"kept"`) and each operator
+    (`"ops"`: [piece index, owner number, body, quoted]), so a rewrite can
+    replace an operator where the lexer found it (XERK-1658).
     """
     kept: list[str] = []
+    ops: list[list] = []
+    pending_ops: list[int] = []
+    owner_no = 0
     bodies: list[tuple[str, str, bool]] = []
     pending: list[tuple[str, bool, bool]] = []  # (delimiter, quoted, strip tabs)
     # '"' a double-quoted string, '(' a `$(…)`/`(…)` group (quoting restarts in
@@ -4742,6 +5066,8 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
             delim, quoted, end = _heredoc_word(command, j)
             if delim:
                 pending.append((delim, quoted, strip_tabs))
+                pending_ops.append(len(ops))
+                ops.append([len(kept), owner_no, "", quoted])
             kept.append(command[i:end])
             i = end
             continue
@@ -4750,7 +5076,7 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
             owner = "".join(kept[line_start:])
             kept.append("\n")
             i += 1
-            for delim, quoted, strip_tabs in pending:
+            for k, (delim, quoted, strip_tabs) in enumerate(pending):
                 body: list[str] = []
                 while i < n:
                     end = command.find("\n", i)
@@ -4763,13 +5089,18 @@ def _split_heredocs(command: str) -> tuple[str, list[tuple[str, str, bool]]]:
                         break
                     body.append(line)
                 bodies.append((owner, "\n".join(body), quoted))
+                ops[pending_ops[k]][2] = "\n".join(body)
             pending = []
+            pending_ops = []
+            owner_no += 1
             line_start = len(kept)
             continue
         if ch == "\n":
             line_start = len(kept) + 1
         kept.append(ch)
         i += 1
+    if trace is not None:
+        trace["kept"], trace["ops"] = kept, ops[:len(bodies)]
     return "".join(kept), bodies
 
 
@@ -7691,7 +8022,8 @@ _POSITIONAL_RE = re.compile(
     r"\$(?:\{([0-9]+|[@*])(?:[^{}'\"`$]|\$\{[^{}]*\}|\$\w|\"[^\"]*\"|'[^']*')*\}|([0-9@*])"
     r"|\{(!#)\})")
 # `for p; do` / `for p do` loops over "$@".
-_IMPLICIT_FOR_RE = re.compile(r"\bfor([ \t]+[A-Za-z_]\w*)(?=[ \t]*(?:;|\n|(do\b)))")
+# `select v; do` with no `in` lists `"$@"` as `for v; do` does (XERK-1658).
+_IMPLICIT_FOR_RE = re.compile(r"\b(for|select)([ \t]+[A-Za-z_]\w*)(?=[ \t]*(?:;|\n|(do\b)))")
 # A `shift` moves every positional down; this many shifts are read.
 _MAX_SHIFTS = 8
 _SHIFT_RE = re.compile(r"(?<![\w.-])shift(?![\w.-])(?:[ \t]+([0-9]+))?")
@@ -7723,7 +8055,7 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
     if not args or "$" not in script:
         return script
     script = _IMPLICIT_FOR_RE.sub(
-        lambda m: f'for{m.group(1)} in "$@"' + (";" if m.group(2) else ""), script)
+        lambda m: f'{m.group(1)}{m.group(2)} in "$@"' + (";" if m.group(3) else ""), script)
     states = _quote_states(script)
     grown = [len(script)]
 
@@ -8465,6 +8797,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     raw_line = command
     raw_commands, heredocs = _split_heredocs(command)
     raw_vals = _var_values(raw_commands)
+    for reading in _reader_extra_readings(raw_line, raw_commands, heredocs, raw_vals):
+        out.extend(_expand(reading, depth, cwds))
     # Every directory a `cd` before a command (on this line or an enclosing
     # one) may have moved it into. SCOPE-blind on purpose — a later `cd` never
     # clears one: it can fail, sit in a subshell or pipe, or be `cd -`, and
