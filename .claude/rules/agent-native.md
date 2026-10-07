@@ -221,6 +221,12 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   - Every install (`install_payload`, `install.sh`) records `$PREFIX/hooks.sha256`; a run whose release
     equals the installed version but whose hooks fail that baseline (or that has none) REINSTALLS it.
   - Never repair by downgrading: an installed build newer than the release is left alone.
+  - `hooks/` must hold EXACTLY the baselined files, each regular and not a symlink: hooks run as
+    `python3 <hooks>/x.py`, so a planted `hooks/bisect.py` shadows the stdlib (XERK-1681).
+    `__pycache__` is exempt — the manager imports permlog.py/guard.py and writes it; dropping the
+    exemption makes every host reinstall on every run.
+  - Every read on the beat goes through `_read_regular` (non-blocking, no-follow, type checked on the
+    fd, size-capped, fd always closed): a FIFO hook or baseline otherwise blocks the beat forever.
   - The manager re-checks the same baseline every full beat (`check_hook_integrity`) and kicks
     `bin/turma-agent-update` detached, at most once per `HOOK_REPAIR_MIN_INTERVAL` — exposure is one
     beat plus an update run, not up to an hour. Inert with no baseline (checkout, Windows).
