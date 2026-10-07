@@ -4759,7 +4759,8 @@ def _unsplit_cuts_at(command: str, depth: int,
 # A `${` opener, also spelled with empty or split quoting a re-parse joins
 # (`'X=$''{v:-a b}'`, `X='$'"{v:-a b}"`), or a bare `$name`.
 _PARAM_OPEN_RE = re.compile(r"\$['\"]*\{|\$([A-Za-z_]\w*)")
-def _glued_param_values(command: str, vals: dict[str, list[str]]) -> str:
+def _glued_param_values(command: str, vals: dict[str, list[str]],
+                        spelled: bool = True) -> str:
     """``command`` with every expansion that may hold a blank or operator
     character glued into one word, whatever quoting or nesting it sits in: a
     use of a name ``vals`` gives such a value becomes `_` (the line's own
@@ -4776,10 +4777,18 @@ def _glued_param_values(command: str, vals: dict[str, list[str]]) -> str:
     glue = {name for name, values in vals.items()
             # A `\` may be an ANSI-C escape kept undecoded: `s=$'a\tb'` holds a tab.
             if any(_ASSIGN_SPLITS_RE.search(v) or "\\" in v for v in values)}
-    return _glue_spans(command, glue, 0) if glue or "${" in command else command
+    return _glue_spans(command, glue, 0, spelled) if glue or "${" in command else command
 
 
-def _glue_spans(command: str, glue: set[str], in_value: int) -> str:
+def _odd_escapes_before(text: str, i: int) -> bool:
+    """Whether an odd run of `\\` ends at ``i`` (the character there is escaped)."""
+    j = i
+    while j > 0 and text[j - 1] == "\\":
+        j -= 1
+    return (i - j) % 2 == 1
+
+
+def _glue_spans(command: str, glue: set[str], in_value: int, spelled: bool) -> str:
     """`_glued_param_values` with its glued values worked out. Only an
     expansion after a `=` (or nested in a glued one: ``in_value`` levels) is glued:
     without one no assignment can hold it, and gluing every `$x` doubled
@@ -4801,7 +4810,11 @@ def _glue_spans(command: str, glue: set[str], in_value: int) -> str:
     # opener rescanned the line per unclosed one (`${a:-${` × 2000, QA). As
     # in bash, only a `${` nests: a bare `{` is text, so `${v:-a { b}` closes
     # at the first `}` (paired with the `{`, it read as unclosed, QA).
-    opens = {m.end() - 1 for m in _PARAM_OPEN_RE.finditer(command) if m.group(1) is None}
+    # ``spelled`` also opens `$''{`, `$'"{` and an escaped `\${`, as a re-parse
+    # may join them; read without it too, since to THIS parse they are text,
+    # and one before a span's `}` took it (`${v:-a b$"{"}`, QA).
+    opens = {m.end() - 1 for m in _PARAM_OPEN_RE.finditer(command) if m.group(1) is None
+             and (spelled or m.group(0) == "${" and not _odd_escapes_before(command, m.start()))}
     closes, stack, i, n = {}, [], 0, len(command)
     while i < n:
         ch = command[i]
@@ -4833,7 +4846,7 @@ def _glue_spans(command: str, glue: set[str], in_value: int) -> str:
             out += (command[last:m.start()], "_")
         else:
             # A use nested in it glued too: `${v:-a${s}b}` with `s=' '`.
-            inner = _glue_spans(command[m.end():j - 1], glue, in_value + 1)
+            inner = _glue_spans(command[m.end():j - 1], glue, in_value + 1, spelled)
             out += (command[last:m.end()], _ASSIGN_SPLITS_RE.sub("_", inner), "}")
         last = j
     if not out:
@@ -7632,8 +7645,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     glued_lines: list[str] = []
     for plain in dict.fromkeys((raw_commands, _decode_ansi_c(raw_commands)
                                 if "$'" in raw_commands else raw_commands)):
-        glued = _glued_param_values(plain, raw_vals)
-        if glued != plain:
+        for spelled in (True, False):
+            glued = _glued_param_values(plain, raw_vals, spelled)
+            if glued == plain or _prenormalise(glued) in glued_lines:
+                continue
             _spend(len(glued))
             glued_lines.append(_prenormalise(glued))
             seen = set(segments)

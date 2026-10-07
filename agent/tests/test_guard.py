@@ -3161,6 +3161,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "echo '${'; s='a b'; X=$s rm -rf /etc",
         "eval 'X=${nope:-{a b}' 'rm -rf /etc'",
         "echo 'X=${nope:-a { b}' 'rm -rf /etc' | bash",
+        "eval 'X=${nope:-a b$\"{\"}' 'rm -rf /etc'",
+        "eval 'X=${nope:-a b\\${}' 'rm -rf /etc'",
     ]
 
     # Same wrappers, harmless payloads: the unwrapping must not over-block.
@@ -3231,6 +3233,14 @@ class TestWrapperUnwrapping(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
                 self.assertIsNone(guard.policy_reason(cmd))
+
+    def test_glued_values_nest_as_deep_as_substitution(self):
+        # XERK-1684: the glued reading refuses a nest only where
+        # `_substitute_vars` does, so it adds no "too large" of its own.
+        def nest(k):
+            return "A=1; echo " + "${a:-" * k + "x" + "}" * k
+        self.assertEqual(guard.decide("Bash", {"command": nest(201)})[0], "allow")
+        self.assertEqual(guard.decide("Bash", {"command": nest(202)})[0], "deny")
 
     def test_policy_rules_also_unwrap(self):
         for cmd in (
