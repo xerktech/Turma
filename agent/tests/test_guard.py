@@ -4666,7 +4666,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                         # An op word with another expansion stays as written,
                         # as on main: read empty, `$((0))` made it `$HOME` (QA).
                         '${HOME:0:$((0))}rm -rf /', 'rm -rf ${HOME:0:$((0))}/etc',
-                        '${HOME:$[0]:0}rm -rf /', '${HOME:0:$(echo 0)}rm -rf /'):
+                        '${HOME:$[0]:0}rm -rf /', '${HOME:0:$(echo 0)}rm -rf /',
+                        '${HOME:0:`echo 0`}rm -rf /', 'rm -rf ${HOME:0:`echo 0`}/etc'):
                 with self.subTest(cmd=cmd):
                     self.assertIsNotNone(guard.is_destructive(cmd))
             # A reading inside the home still maps back to `$HOME…`.
