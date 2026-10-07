@@ -2540,7 +2540,9 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <<'EOF' | bash\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
-        for cmd in ("echo hi | sh", f"echo '{R}' | cat", f"echo '{R}' > n.txt; bash b.sh",
+        # `echo … > n.txt; bash b.sh` is refused: a file run that is not the
+        # written path fails closed (XERK-1674).
+        for cmd in ("echo hi | sh", f"echo '{R}' | cat", f"echo '{R}' > n.txt; python3 b.py",
                     "git log | sh -c 'wc -l'", f"cat <<'EOF' | python3\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
@@ -2897,6 +2899,56 @@ class TestScriptChannels(unittest.TestCase):
         start = time.monotonic()
         self.assertAllowed(many)
         self.assertLess(time.monotonic() - start, 10)
+
+    def test_xerk_1674_write_then_run_fails_closed(self):
+        # XERK-1674: a file the line writes, run by a route the guard cannot pin
+        # to the written path, reads every written file as a script.
+        P = "rm -rf /etc"
+        for cmd in (
+                # writers
+                f"echo '{P}' | cat - > f; sh f", f"echo '{P}' | cat -u > f; sh f",
+                f"cat > f <<< '{P}'; sh f", f"echo '{P}' | head -n1 > f; sh f",
+                f"echo '{P}' | tr a a > f; sh f", f"echo '{P}' | dd of=f; sh f",
+                f"echo '{P}' | cp /dev/stdin f; sh f", f"sh -c \"echo '{P}' > f\"; sh f",
+                f"eval \"echo '{P}' > f\"; sh ./f",
+                # runners
+                f"echo '{P}' > f; bash -s a < f", f"echo '{P}' > f; cat f | sh",
+                f"echo '{P}' > f; sh < <(cat f)", f"echo '{P}' > f; sh /dev/stdin < f",
+                f"echo '{P}' > f; sh -c 'sh < f'", f"echo '{P}' > f; bash -c 'bash f'",
+                # path spellings
+                f'echo \'{P}\' > f; sh "$PWD"/f', f"echo '{P}' > f; sh $(pwd)/f",
+                f"echo '{P}' > f; PATH=.:$PATH f", f"echo '{P}' > f; echo | xargs ./f",
+                f"echo '{P}' > f; find . -name f -exec {{}} \\;", f'echo \'{P}\' > f; "$PWD/f"',
+                # copies
+                f"echo '{P}' > f; cp f g; sh g", f"echo '{P}' > f; mv f g; sh g",
+                f"echo '{P}' > f; ln -s f g; sh g",
+                # the caller's positionals reaching a sourced or unnamed run
+                "echo 'rm -rf \"$1\"' > x.sh; set -- /etc; . ./x.sh",
+                "echo 'rm -rf \"$1\"' > x.sh; f() { . ./x.sh; }; f /etc",
+                "echo 'rm -rf \"$1\"' > x.sh; cp x.sh y.sh; sh y.sh /etc",
+                f"echo '{P}' > notes.txt; bash b.sh",
+                # a `-c` script naming the written file again, a `$S` spelling
+                f"echo '{P}' > f; bash -c ./f", f"echo '{P}' > f; sh -c \"$(cat f)\"",
+                f"S=.; echo '{P}' > $S/f; $S/f", f"echo '{P}' > f; cat f > g; sh g",
+                f"echo '{P}' > f; run(){{ sh f; }}; run", f"echo '{P}' > f; trap 'sh f' EXIT"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Past `_MAX_SCRIPT_RUNS`, a glued `"$1/$2"` is read per argument.
+        runs = "; ".join(f"sh x.sh a{i} b{i}" for i in range(9))
+        self.assertDenied(f"echo 'rm -rf \"$1/$2\"' > x.sh; {runs}; sh x.sh \"\" etc")
+        self.assertAllowed(f"echo 'rm -rf \"$1/$2\"' > x.sh; {runs}; sh x.sh tmp x")
+        for cmd in ("echo hello > out.txt; ./run.sh", "echo ls | cat - > f; sh f",
+                    f"cat <(echo hi) | bash -c 'echo {P} > notes'",
+                    # a note holding a command, beside a `.` argument or a path run
+                    f"echo '{P} is the repro' > notes.md; git add . && git commit -qm wip",
+                    f"cat > notes.md <<'EOF'\n{P}\nEOF\n./scripts/lint.sh",
+                    "echo hi > t.txt; trap 'rm -f t.txt' EXIT; cat t.txt",
+                    f"cat > n.md <<'EOF'\n{P}\nEOF\n~/.claude/bin/jira create -d \"$(cat n.md)\"",
+                    "git log --oneline > log.txt && bash scripts/check.sh",
+                    "echo 'rm -rf \"$1\"' > x.sh; sh x.sh build",
+                    "cat > a.sh <<'EOF'\nrm -rf build\nEOF\nchmod +x a.sh && ./a.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
 
     def test_a_proc_subst_passed_through_or_sourced_in_a_c_script(self):
         # XERK-1611: `cat <(…)` passes its file through to a shell downstream,

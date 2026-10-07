@@ -8176,22 +8176,40 @@ def _written_scripts(segments: list[str],
             words, outs = _stdout_targets(_strip_prefixes(_tokenize(stage)))
             prog = _basename(words[0]) if words else ""
             text = _printed_from_tokens(words) if words else None
+            # ...and one a `-c` script or `eval` makes: `sh -c 'echo … > f';
+            # sh f` (XERK-1674).
+            script = (_shell_c_script(words[1:]) if prog in _SHELL_PROGS
+                      else " ".join(words[1:]) if prog == "eval" else None)
+            if script and depth < _MAX_WRITE_NEST:
+                inner_text, inner_docs = _split_heredocs(script)
+                inner = _written_scripts(_split_on_operators(
+                    inner_text, include_pipe=False, groups=True), inner_docs, depth + 1)
+                for path, texts in inner.items():
+                    written.setdefault(path, []).extend(texts)
             if stage.lstrip()[:1] in ("{", "("):
                 # A group prints what ALL its statements print. Its first-word
                 # reading is not that: `_strip_prefixes` drops the `{`.
                 core = _group_core(stage)
                 text = _statements_printed(_unwrap_group(core if core else stage)) or None
-            elif prog in _PASS_THROUGH and prog != "tee" and len(words) == 1 and fed:
-                text = fed  # `… | cat > f` relays what it is fed
-            if prog == "tee":
-                # ...and a `tee f <<< '…'` writes its here-string.
-                fed = next(iter(_herestrings(stage)), None) or fed
+            elif text is None and prog not in _SCRIPT_READERS:
+                # Any other stage writes what it is fed or a here-string gives
+                # it, as near as the guard can tell: `… | cat - > f`, `| head
+                # > f`, `| tr a b > f`, `cat > f <<< '…'` (XERK-1674).
+                if "<<<" in stage:
+                    fed = next(iter(_herestrings(stage)), None) or fed
+                text = fed
+                if fed and prog == "dd":
+                    outs = outs + [posixpath.normpath(w[3:]) for w in words[1:]
+                                   if w.startswith("of=")]
+                elif fed and prog in ("cp", "install") and len(words) > 2 and any(
+                        w in _STDIN_PATHS for w in words[1:-1]):
+                    outs = outs + [posixpath.normpath(words[-1])]
             if prog == "tee" and fed:
                 outs = outs + [posixpath.normpath(w) for w in words[1:] if not w.startswith("-")]
                 text = fed
             for path in outs if text else ():
                 written.setdefault(path, []).append(text)
-            fed = text if text else (fed if prog in _PASS_THROUGH else None)
+            fed = text if text else None
     for owner, body, _quoted in heredocs:
         for seg in _split_segments(owner):
             if "<<" not in seg:
@@ -8205,6 +8223,36 @@ def _written_scripts(segments: list[str],
     return written
 
 
+# A word that can run a file (a shell, `.`/`source`, a path), gating the
+# write scan in `_expand`.
+_MAY_RUN_FILE_RE = re.compile(r"sh|source|\.|/|xargs|exec|eval|PATH")
+# What runs a file the guard cannot pin to a path the line writes, at a
+# command start (a `-c` script's or a pipe stage's too): a shell reading
+# stdin (`| sh`, `sh < f`, `bash -s`, `sh /dev/stdin`), `.`/`source`, `eval`,
+# `xargs`, `hash`; and anywhere, `find -exec` or a `PATH=` change. A shell
+# given a file is the segment loop's; a word elsewhere (`git add .`, "bash"
+# in a note) is text.
+_CMD_START = (r"(?:^|[;&|({`\n'\"]|\b(?:then|do|else|elif|if|while|until|exec|env|sudo|"
+              r"nohup|command|builtin|time|timeout\s+\S+)\s)\s*"
+              r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*")
+_RUNS_UNNAMED_RE = re.compile(
+    _CMD_START + r"(?:[^\s;&|'\"]*/)?(?:(?:(?:ba|da|z|k|a)?sh|busybox)"
+    r"(?=[ \t]*(?:$|[;&|)<'\"\n]|-[a-zA-Z]*s\b|-\s|/dev/|/proc/))"
+    r"|(?:source|\.|eval|xargs|hash)(?=$|[\s;&|)<'\"]))"
+    r"|\s-(?:exec|execdir|ok|okdir)\b|\bPATH\+?=")
+# A shell's `-c` script, an `eval`, a `trap` action or a function body,
+# whose runs the segment loop never pairs with this line's writes.
+_C_OR_EVAL_RE = re.compile(_CMD_START + r"(?:[^\s;&|'\"]*/)?(?:(?:ba|da|z|k|a)?sh\s[^;&|\n]*-[a-zA-Z]*c|eval)\b"
+                           r"|\(\s*\)\s*[{(]|\btrap\s")
+# A command that may copy a file to another path (`cp f g; ./g`).
+_COPIES_RE = re.compile(r"(?<![\w.-])(?:cp|mv|ln|install|rsync|dd|tar|unzip|gcp)(?![\w.-])"
+                        r"|\bcat\s+[^-\s<>|;&)][^;&|\n)]*(?:>|\|\s*tee\b)")
+# Words a sourced written file's parameters are bound to.
+_MAX_LINE_WORDS = 32
+# Two positional parameters in one word (`"$1/$2"`, `$1$2`).
+_GLUED_PARAMS_RE = re.compile(r"\$\{?[1-9@*]\}?[^\s;&|]*?\$\{?[1-9@*]")
+# Paths a writer reads its stdin through (`cp /dev/stdin f`).
+_STDIN_PATHS = {"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"}
 # How deep `_written_scripts` follows groups and compounds into their bodies.
 _MAX_WRITE_NEST = 8
 # Distinct argument lists one written file is read with, per line.
@@ -8212,14 +8260,21 @@ _MAX_SCRIPT_RUNS = 8
 
 
 def _script_file_readings(path: str, runs: list[tuple[str, ...]],
-                          written: dict[str, list[str]]) -> list[str]:
+                          written: dict[str, list[str]],
+                          line_words: tuple[str, ...] = ()) -> list[str]:
     """The texts the line's runs of written file ``path`` add, every run
     known (XERK-1641 QA). A run with no arguments reads the text as written;
     one with arguments reads it bound as a `sh -c` script is (its own `set
     --`/`shift` applied) — bound only, since unbound beside it doubled real
     scripts' cost toward "too large". Past `_MAX_SCRIPT_RUNS` distinct lists,
     ONE reading binds every parameter to every argument of every run, one
-    word each: dropping later runs let a run after nine benign ones through."""
+    word each: dropping later runs let a run after nine benign ones through.
+
+    A run with no arguments may still see the caller's: a sourced file
+    inherits `set -- …` and a function's `$@`, and a run the guard could not
+    name had its arguments unread. So its text is also read with every
+    parameter bound to every path-like word of the line (``line_words``,
+    XERK-1674)."""
     out: list[str] = []
     argful = [a for a in runs if a]
     for text in written.get(path, ()):
@@ -8233,9 +8288,25 @@ def _script_file_readings(path: str, runs: list[tuple[str, ...]],
             every = list(dict.fromkeys(a for r in argful for a in r))
             out += scripts + bound
             out += [_bind_positionals(sc, [path, *every], every=True) for sc in (*scripts, *bound)]
+            # ...and a glued `"$1/$2"` is not one word per parameter there, so
+            # each parameter it uses is read as each argument with the others
+            # empty: `sh x.sh "" etc` is `/etc` (XERK-1674). Charged: a
+            # budget past this is refused as too large.
+            for sc in scripts:
+                if not _GLUED_PARAMS_RE.search(sc):
+                    continue
+                for k in sorted({int(n) for n in re.findall(r"\$\{?([1-9])", sc)}):
+                    for word in every:
+                        _spend(len(sc))
+                        args = [path, *[""] * 9]
+                        args[k] = word
+                        out.append(_bind_positionals(sc, args))
             continue
         if len(argful) < len(runs):
             out += scripts
+            if line_words:
+                out += [_bind_positionals(sc, [path, *line_words], every=True)
+                        for sc in scripts if "$" in sc]
         for args in argful:
             argv = [path, *args]
             out += [b for b in dict.fromkeys(_bind_positionals(sc, a)
@@ -8756,8 +8827,12 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # Computed on the first segment that runs a script FILE: per `_expand`
     # call it re-split every line holding `>` and "sh" (most of them).
     written: dict[str, list[str]] | None = None if (
-        (">" in command or "tee" in command)
-        and ("sh" in command or "." in command or "source" in command)) else {}
+        (">" in command or "tee" in command or "of=" in command or "/dev/" in command)
+        and _MAY_RUN_FILE_RE.search(command)) else {}
+    # A run of a file that is not exactly a path the line writes (`sh "$PWD"/f`,
+    # `cp f g; sh g`): fails closed, every written file read (XERK-1674).
+    unresolved: dict[tuple[str, ...], None] = {}
+    sources = False
     for raw in segments:
         if every_cd != cwds:
             cwds = _cd_readings(raw, cwds, raw_vals)
@@ -8899,8 +8974,21 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             args = tuple(words[at + 1:] if at >= 0 else ())
             # Recorded here, read once after the loop: every run of the file
             # on the line must be known before deciding how to read it.
+            if script_path not in written:
+                # The written file of that name: `$S/run.sh` written and
+                # run with `$S` spliced, `"$PWD"/f`, or after a `cd`.
+                base = posixpath.basename(script_path)
+                script_path = next((w for w in written if posixpath.basename(w) == base),
+                                   script_path)
+            if prog in ("source", "."):
+                sources = True
             if script_path in written:
                 runs_seen.setdefault(script_path, {})[args] = None
+            elif prog in (*_SHELL_PROGS, "source", ".") or re.search(r"[*?\[]", script_path) \
+                    or _COPIES_RE.search(raw_commands):
+                # A run of some other file, which may be a copy of one the
+                # line wrote, or a path built from a value: fails closed.
+                unresolved.setdefault(args, None)
         if prog in ("rm", "unlink", "chmod", "chown"):
             # `cd /; rm -rf *` deletes `/*`, which `rm` alone never names.
             for cwd in cwds:
@@ -9132,9 +9220,33 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                         # `find . -exec sh -c '<cmd>' \;` (XERK-1539).
                         out.extend(_expand_segments(
                             " ".join(shlex.quote(t) for t in argv), depth + 1, cwds))
-    # Each written file the line runs, read once with all of its runs known.
+    # A file the line writes may run by a route the guard cannot name: a
+    # copy, a `$PWD`/`$(pwd)` path, `cat f | sh`, `sh -c 'sh < f'`, `xargs`,
+    # `find -exec`, `PATH=.`. Each spelling patched left a neighbour, so a
+    # line that writes text and runs ANY file it cannot pin to a written path
+    # reads every written file it has not read (XERK-1674).
+    unnamed = written != {} and bool(_RUNS_UNNAMED_RE.search(raw_commands))
+    if written is None and (unnamed or _C_OR_EVAL_RE.search(raw_commands)):
+        written = _written_scripts(
+            _split_on_operators(command, include_pipe=False, groups=True), heredocs)
+    if written and not (unresolved or unnamed) and _C_OR_EVAL_RE.search(raw_commands):
+        # A `-c` script or `eval` naming a written file again (`bash -c ./f`,
+        # `sh -c "$(cat f)"`): its runs are read a level down, without this
+        # line's writes.
+        unnamed = any(len(re.findall(r"(?<![\w.-])" + re.escape(posixpath.basename(w))
+                                     + r"(?![\w.-])", raw_commands)) > 1 for w in written)
+    if written and (unresolved or unnamed):
+        for path in written:
+            if path not in runs_seen:
+                runs_seen[path] = dict(unresolved) if unresolved else {(): None}
+    # A sourced file inherits the caller's `set --`/`$@`: each written file
+    # read with no arguments also binds them to the line's path-like words.
+    line_words = tuple(dict.fromkeys(
+        w for w in (t.rstrip(";&|") for t in _tokenize(raw_commands))
+        if w and not _PLAIN_WORD_RE.fullmatch(w) and posixpath.normpath(w) not in written)
+        )[:_MAX_LINE_WORDS] if sources and runs_seen and written else ()
     for path, runs in runs_seen.items():
-        for script in _script_file_readings(path, list(runs), written or {}):
+        for script in _script_file_readings(path, list(runs), written or {}, line_words):
             out.extend(_expand_segments(script, depth + 1, every_cd))
     # An unwrap can leave nothing behind (`$(x | xargs kill)`); every checker
     # reads tokens[0], and a crash there let the WHOLE command through (XERK-1080).
