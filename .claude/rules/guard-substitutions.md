@@ -98,10 +98,45 @@ paths:
     before it (`x=…; for v in a eval; do $v "$x"`) or took out through another name.
   - Budget: `_MAX_FOR_WORD_CHARS` of line × passes (taint readings multiply); past it the line is
     `_TOO_LARGE` (a deny) — e.g. ~200 loops on one line. Characters, never a wall clock: that
-    denied a real command only on a busy host. Nested lists are no product.
+    denied a real command only on a busy host.
+  - Two lists used in one word (`$a$b`, `${a}a$b`, `$a$z$b`, `$a'$'b`) are also read as their
+    PRODUCT (XERK-1657, `_glued_name_pairs`): one at a time, `$a$b` never formed `rm`. Not
+    across a `/` (`$d/$f`): that doubled real directory loops' cost (QA); quotes-only glue let
+    `${a}a$b` and an empty `$z` between through (QA). Past
+    `_MAX_FOR_PRODUCT` readings the line is too large (60×60 words took 8 s). Unglued nested lists
+    stay one at a time; three glued names are read pairwise only (residual).
+  - Shell-list words are brace-expanded first (`_brace_words`): `_expand_braces` skips a list
+    holding a blank, so `for v in a {'rm …',b}` bound one word. Past `_BRACE_SEQ_MAX` words each
+    item of each list is a word too (`_brace_items_flat`, `_BRACE_FLAT_DEPTH` levels, a deeper item
+    kept as written — at 4 levels a deeper payload was dropped): read short, a later item ran unread;
+    refused, a long brace in heredoc text nothing runs was denied (QA). `$"…"` dequotes as `"…"`,
+    `$'…'` as its decoded text.
+  - Cost accepted: each word now read (brace items, product) is a whole-line reading, as a literal
+    list of that length already was; a heavy line can reach the deadline (fails closed).
+  - A one-word list's whole `"$v"` (each per-word reading) splices quoted; bare, as the joined
+    multi-word reading splices it, `for v in 'rm …'; do bash -c "$v"` handed `-c` `rm` (XERK-1657).
+  - A loop over positionals (`set -- …; for v; do`, `f(){ for v in "$@"; …}; f …`) is read per
+    word on each bound reading in `_expand` too, `_FOR_PICK` saved and restored around it.
+  - An `eval` whose joined words rebuild a use (`eval '$'v`, `eval "$"v`) is re-read with the
+    line's values substituted — only when quotes split a `$` from its name in the raw segment
+    (`_QUOTE_SPLIT_USE_RE`, brace forms `'${'v'}'`/`'${v'}` too): on every eval it cost ~5x.
+    Tests: `test_loop_words_reach_a_script_positional_or_eval_alone`.
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
+- **`$'…'` is decoded by bash's rules** (`_ansi_c_text`, XERK-1693), never `unicode_escape`: that
+  raised on escapes bash takes (`\x`, `\x4`, `\u41`) and the string stayed undecoded, so one such
+  escape hid the whole script. Unknown escapes keep their `\`; a NUL ends the text.
+  - Only an UNQUOTED `$'` is decoded (`_quote_states` at the `$`, always computed): in `"…"`,
+    `'…'` or a `#` comment it is literal; decoded, `"$'\x27'"` unbalanced the line and a
+    comment's `$'\nx'` hid the next one. A skipped match steps past its `$'` only.
+  - `_quote_states` reads a bare `$'…'` as one quote span whose `\` escapes the next character:
+    read as `'…'`, the `\'` in `$'it\'s'` closed it and `s'` hid every later `$'…'` from the
+    decode. A blind-decode reading beside it was tried and lost to one decoy per model.
+  - Only an ODD run of `$` before the `'` is ANSI-C (`_ansi_c_dollar`): `$$'a\'` is the PID and a
+    plain `'a\'`, which bash closes at the `\'`; read as ANSI-C it hid the command after it.
+  - Divergence kept (no bypass found): bash decodes `$'…'` inside `"${x:-…}"` (extquote).
+  Tests: `test_ansi_c_strings_decode_as_bash_does` (against real bash).
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
   ANSI-C only to a `-c` re-parse; an even run (`\\$'…'`) is still live. A bare lookbehind bypassed.
 - **The stdin-feed walk splits with `groups=True`** (XERK-1614): a cut inside `{ echo …; }` or
@@ -262,6 +297,19 @@ paths:
     scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
   - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
+- **A lone `\` ending a text is read DROPPED** (XERK-1646, `_drop_trailing_escape`): shlex
+  raises on it, and the whitespace-split fallback kept a `-c`/`eval` script's quotes.
+  - The reading lives in the TOKENIZER (`_tokenize_cached`): every route tokenizes — the
+    stdin-feed walk's stages (`echo '…'\ | sh`), a segment whose escaped blank the split ate
+    (`'…'\ ; true`), a `\<newline>` split at its newline.
+  - Dropped, not bash's literal `\`: zsh drops it, so does a continuation (bash's here-string
+    `text\`+newline), and the literal only ever weakens the last word (`/etc\`, `sh\`). Never
+    add the literal as a second whole-line or per-segment reading: each level of a nested
+    `eval '…'\` re-expanded both, 4x per level, and 1 KB took 29s (QA).
+  - Detected by `_quote_states` + the run's parity, never shlex: `comments=True` read a glued
+    `'…'#\` as a comment; without it `# don't` is an open quote.
+  - `_expand_braces` drops it too, BEFORE joining (as zsh does): left on, `{/etc,/var}\` became
+    `/etc\ /var\`, ONE word to shlex.
 - **A `${…}` inside `"…"` is a quoting frame of its own** (XERK-1621, `_quote_states`'s `{"`):
   a `"` there nests a string, never closes the outer one. Read flat, `"${y:-"it's"}"; rm …` left
   the `'` open and hid the `rm`.

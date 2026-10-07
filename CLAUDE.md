@@ -28,6 +28,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `guard-heredoc-owners.md` | `guard.py`, `test_guard.py` | guard: which heredoc owners are shells; the broad closer rule (XERK-1618) |
 | `guard-prefix-assignments.md` | `guard.py`, `test_guard.py` | guard: leading `X='a b' cmd` assignments, the added unsplit reading (XERK-1620) |
 | `guard-leading-names.md` | `guard.py`, `test_guard.py` | guard: unknown names in a target read empty, protected reading only (XERK-1639/1652) |
+| `guard-home.md` | `guard.py`, `test_guard.py` | guard: `$HOME`/`~` targets read with the real home (XERK-1656) |
 | `guard-param-ops.md` | `guard.py`, `test_guard.py` | guard: `${v#pat}` ops as bash globs, unreadable → refused program, `eval` assignments (XERK-1651) |
 | `guard-value-sources.md` | `guard.py`, `test_guard.py` | guard: redirect joins, value sources, files run as scripts (XERK-1641) |
 | `guard-positionals.md` | `guard.py`, `test_guard.py` | guard: `$1` bound by `sh -c`, a function call or `set` (XERK-1626) |

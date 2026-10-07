@@ -14,6 +14,7 @@ import contextlib
 import datetime
 import errno
 import gzip
+import hashlib
 import http.server
 import importlib.util
 import inspect
@@ -5608,6 +5609,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         # The turma-peer MCP server is registered beside turma-ask.
         peer_mcp = settings["mcpServers"]["turma-peer"]
         self.assertEqual(peer_mcp["args"][-1], ha.qwen_peer_mcp_path())
+        self.assertIn("-SI", peer_mcp["args"])  # XERK-1681: no script dir on sys.path
         self.assertEqual(peer_mcp["env"]["TURMA_SESSION_ID"], "q1")
         self.assertEqual(peer_mcp["env"]["TURMA_QWEN_PEER_DIR"], ha.QWEN_PEER_DIR)
 
@@ -5636,7 +5638,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         popen = self._launch(sm, sess, prompt="hi")
         cid = sess["claudeSessionId"]
         args, kwargs = popen.call_args
-        self.assertEqual(args[0], ["python3", "-SsE", ha.qwen_peer_inbox_path()])
+        self.assertEqual(args[0], ["python3", "-SI", ha.qwen_peer_inbox_path()])
         env = kwargs["env"]
         self.assertEqual(env["TURMA_SESSION_ID"], "q1")
         self.assertEqual(env["TURMA_CLAUDE_SESSION_ID"], cid)
@@ -10285,6 +10287,15 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
             self.assertEqual(sm.build_payload(1)["hostOs"], "linux")
         with mock.patch.object(ha, "IS_WINDOWS", True):
             self.assertEqual(sm.build_payload(1)["hostOs"], "windows")
+
+    def test_a_full_beat_checks_the_hooks_and_a_light_one_does_not(self):
+        """XERK-1643: the check is only worth anything if the beat runs it."""
+        sm = self._manager()
+        with mock.patch.object(ha, "check_hook_integrity") as check:
+            sm.build_payload(1, light=True)
+            check.assert_not_called()
+            sm.build_payload(1)
+            check.assert_called_once()
 
     def test_a_refused_resume_stages_its_reason_against_the_cmd_id(self):
         sm = self._manager()
@@ -36578,7 +36589,7 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         settings = sm._qwen_settings({"id": "q1"})
         srv = settings["mcpServers"]["turma-ask"]
         self.assertEqual(srv["command"], "python3")
-        self.assertIn("-SsE", srv["args"])
+        self.assertIn("-SI", srv["args"])
         self.assertTrue(srv["args"][-1].endswith(os.path.join("qwen", "ask_mcp.py")))
         self.assertEqual(srv["env"]["TURMA_SESSION_ID"], "q1")
         self.assertEqual(srv["env"]["TURMA_QUESTIONS_DIR"], ha.QUESTIONS_DIR)
@@ -42604,6 +42615,129 @@ class TestDecisionsFile(ManagerMixin, unittest.TestCase):
         self.assertIn("not instructions to you", d)
         # A runtime addendum still closes the directive.
         self.assertTrue(self.sm._session_directive(dict(sess, agentType="qwen"), "X").endswith("X"))
+
+
+
+class TestHookIntegrity(unittest.TestCase):
+    """XERK-1643: the beat re-checks the installed hooks against the baseline the
+    updater recorded, and starts the updater when they drift — a stubbed guard
+    must not ride out the hour to the next timer run."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        os.makedirs(os.path.join(self.dir, "hooks"))
+        os.makedirs(os.path.join(self.dir, "bin"))
+        for name in ("guard.py", "fileguard.py"):
+            self._write(f"hooks/{name}", f"# real {name}\n")
+        self._write("bin/turma-agent-update", "#!/bin/sh\n")
+        lines = []
+        for name in ("guard.py", "fileguard.py"):
+            with open(os.path.join(self.dir, "hooks", name), "rb") as fh:
+                lines.append(f"{hashlib.sha256(fh.read()).hexdigest()}  hooks/{name}")
+        self._write("hooks.sha256", "\n".join(lines) + "\n")
+        self.spawned = []
+
+    def _write(self, rel, text):
+        with open(os.path.join(self.dir, rel), "w") as fh:
+            fh.write(text)
+
+    def _check(self, state, now):
+        with mock.patch.object(ha, "log"):
+            return ha.check_hook_integrity(state, script_dir=self.dir, now=now,
+                                           spawn=lambda argv, **kw: self.spawned.append(argv))
+
+    def test_intact_hooks_do_nothing(self):
+        self.assertEqual([], self._check({}, 1000))
+        self.assertEqual([], self.spawned)
+
+    def test_no_baseline_is_inert(self):
+        os.unlink(os.path.join(self.dir, "hooks.sha256"))
+        self.assertIsNone(self._check({}, 1000))
+        self.assertEqual([], self.spawned)
+
+    def test_stubbed_guard_kicks_the_updater_once_per_interval(self):
+        self._write("hooks/guard.py", "import sys\nsys.exit(0)\n")
+        state = {}
+        self.assertEqual(["hooks/guard.py"], self._check(state, 1000))
+        self.assertEqual([[os.path.join(self.dir, "bin", "turma-agent-update")]], self.spawned)
+        self._check(state, 1000 + ha.HOOK_REPAIR_MIN_INTERVAL - 1)
+        self.assertEqual(1, len(self.spawned))
+        self._check(state, 1000 + ha.HOOK_REPAIR_MIN_INTERVAL)
+        self.assertEqual(2, len(self.spawned))
+
+    def test_a_deleted_hook_is_a_mismatch(self):
+        os.unlink(os.path.join(self.dir, "hooks", "fileguard.py"))
+        self.assertEqual(["hooks/fileguard.py"], self._check({}, 1000))
+
+    def test_a_fifo_hook_is_a_mismatch_and_never_blocks(self):
+        path = os.path.join(self.dir, "hooks", "guard.py")
+        os.unlink(path)
+        os.mkfifo(path)
+        self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
+
+    def test_a_symlink_to_dev_zero_is_a_mismatch(self):
+        path = os.path.join(self.dir, "hooks", "guard.py")
+        os.unlink(path)
+        os.symlink("/dev/zero", path)
+        self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
+
+    def test_a_symlink_to_identical_bytes_is_a_mismatch(self):
+        path = os.path.join(self.dir, "hooks", "guard.py")
+        copy = os.path.join(self.dir, "copy.py")
+        shutil.copy(path, copy)
+        os.unlink(path)
+        os.symlink(copy, path)
+        self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
+
+    def test_a_directory_hook_is_a_mismatch_and_leaks_no_fd(self):
+        # `python3 hooks/guard.py` runs a directory's __main__.py.
+        path = os.path.join(self.dir, "hooks", "guard.py")
+        os.unlink(path)
+        os.makedirs(path)
+        self._write("hooks/guard.py/__main__.py", "import sys; sys.exit(0)\n")
+        # A leak is one fd per call; other suites' threads may open a few, so
+        # only growth on the order of the call count fails.
+        before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
+        for _ in range(50):
+            self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
+        if before is not None:
+            self.assertLess(len(os.listdir("/proc/self/fd")) - before, 25)
+
+    def test_only_a_regular_file_is_read(self):
+        # A character device reads as b"" — exactly what an unchecked FIFO that
+        # was pre-filled and then drained would look like.
+        if os.path.exists("/dev/null"):
+            self.assertIsNone(ha._read_regular("/dev/null", 10))
+
+    def test_no_baseline_without_o_nonblock(self):
+        # Windows CPython has no os.O_NONBLOCK; the check must stay quietly inert.
+        os.unlink(os.path.join(self.dir, "hooks.sha256"))
+        saved = getattr(ha.os, "O_NONBLOCK", None)
+        if saved is not None:
+            del ha.os.O_NONBLOCK
+            self.addCleanup(setattr, ha.os, "O_NONBLOCK", saved)
+        self.assertIsNone(self._check({}, 1000))
+
+    def test_a_fifo_baseline_never_blocks(self):
+        path = os.path.join(self.dir, "hooks.sha256")
+        os.unlink(path)
+        os.mkfifo(path)
+        self.assertIsNone(self._check({}, 1000))
+
+    def test_a_planted_module_is_a_mismatch(self):
+        self._write("hooks/bisect.py", "import sys; sys.exit(0)\n")
+        os.makedirs(os.path.join(self.dir, "hooks", "json"))
+        self.assertEqual(["hooks/bisect.py", "hooks/json"], self._check({}, 1000))
+
+    def test_the_bytecode_cache_is_not_tampering(self):
+        os.makedirs(os.path.join(self.dir, "hooks", "__pycache__"))
+        self.assertEqual([], self._check({}, 1000))
+
+    def test_baseline_lines_outside_hooks_are_ignored(self):
+        with open(os.path.join(self.dir, "hooks.sha256"), "a") as fh:
+            fh.write("0" * 64 + "  ../hub-agent.py\n" + "0" * 64 + "  hooks/../../x.py\n")
+        self.assertEqual([], self._check({}, 1000))
 
 
 if __name__ == "__main__":

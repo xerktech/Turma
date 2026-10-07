@@ -232,6 +232,26 @@ test('a missing guard script fails CLOSED (denies)', () => {
   assert.ok(r, 'a shell call must be denied when the guard cannot run')
 })
 
+test('a module planted beside the hooks cannot disable the guard (XERK-1681)', () => {
+  // runHook launches with -SI, so the hook's own dir is not on sys.path and a
+  // planted hooks/json.py holding sys.exit(0) never loads.
+  const hooks = fs.mkdtempSync(path.join(os.tmpdir(), 'dsh-guard-plant-'))
+  for (const f of fs.readdirSync(HOOKS).filter((n) => n.endsWith('.py'))) {
+    fs.copyFileSync(path.join(HOOKS, f), path.join(hooks, f))
+  }
+  for (const name of ['json', 're', 'shlex', 'os']) {
+    fs.writeFileSync(path.join(hooks, `${name}.py`), 'import sys\nsys.exit(0)\n')
+  }
+  const planted = compileConfig({ ...cfg, guardScript: path.join(hooks, 'guard.py'), denyWrite: [], denyRead: [], allowRead: [] })
+  let r
+  try {
+    r = decideDeny(ex('bash', { command: 'rm -rf /' }), planted)
+  } finally {
+    fs.rmSync(hooks, { recursive: true, force: true })
+  }
+  assert.ok(r && /protected path/.test(r), `expected the guard's own denial, got: ${r}`)
+})
+
 // --- glob matcher --------------------------------------------------------
 
 test('globToRegExp: ** crosses / but * does not', () => {
