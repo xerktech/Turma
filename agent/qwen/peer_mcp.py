@@ -26,7 +26,7 @@ Missing env means this MCP server was started outside a Turma session; it still
 serves the tool but a call returns a benign "no peers available" result rather
 than writing anywhere.
 
-Stdlib only: invoked by absolute path under ``python3 -SsE``, so nothing beyond
+Stdlib only: invoked by absolute path under ``python3 -SI``, so nothing beyond
 the standard library can be assumed importable.
 """
 

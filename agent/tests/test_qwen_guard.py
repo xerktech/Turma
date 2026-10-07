@@ -52,7 +52,7 @@ class TestBuildQwenGuardConfig(unittest.TestCase):
         self.assertEqual(len(pre), 1)
         hook = pre[0]["hooks"][0]
         self.assertEqual(hook["type"], "command")
-        self.assertIn("-SsE", hook["command"])
+        self.assertIn("-SI", hook["command"])
         self.assertIn("shim.py", hook["command"])
         self.assertIn("/tmp/qwen-guard-test.json", hook["command"])
         # G0 gotcha: qwen's timeout is MILLISECONDS, and a too-small value
@@ -150,7 +150,7 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
         cfg = config_path if config_path is not None else self.config_path
         payload = json.dumps(event) if event is not None else "{ not json"
         proc = subprocess.run(
-            [sys.executable, "-SsE", self.shim, cfg],
+            [sys.executable, "-SI", self.shim, cfg],
             input=payload, capture_output=True, text=True, timeout=30)
         reason = None
         out = (proc.stdout or "").strip()
@@ -329,7 +329,7 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
         self.assertIsNotNone(reason)
 
     def test_no_config_arg_fails_closed(self):
-        proc = subprocess.run([sys.executable, "-SsE", self.shim],
+        proc = subprocess.run([sys.executable, "-SI", self.shim],
                               input="{}", capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 2)
         self.assertIn("deny", proc.stdout)
@@ -362,6 +362,27 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
                                config_path=bad)
         self.assertEqual(rc, 2)
         self.assertIsNotNone(reason)
+
+    def test_a_module_planted_beside_the_hooks_cannot_disable_the_shim(self):
+        # XERK-1681: the shim runs guard.py with -SI, so a hooks/json.py holding
+        # sys.exit(0) never loads; under -SsE it did and the guard printed nothing.
+        import shutil
+        tmp = tempfile.mkdtemp(prefix="qwen-plant-", dir=self.tmp)
+        hooks = os.path.join(tmp, "hooks")
+        shutil.copytree(os.path.dirname(ha.guard_script_path()), hooks)
+        for name in ("json", "re", "shlex", "os"):
+            with open(os.path.join(hooks, name + ".py"), "w") as f:
+                f.write("import sys\nsys.exit(0)\n")
+        with open(self.config_path, encoding="utf-8") as f:
+            cfg = json.load(f)
+        cfg["guardScript"] = os.path.join(hooks, "guard.py")
+        cfg_path = os.path.join(tmp, "qwen-guard.json")
+        with open(cfg_path, "w", encoding="utf-8") as f:
+            json.dump(cfg, f)
+        rc, reason = self._run(self._ev("run_shell_command", {"command": "rm -rf /"}),
+                               config_path=cfg_path)
+        self.assertEqual(rc, 0)
+        self.assertIn("protected path", reason or "")
 
 
 if __name__ == "__main__":

@@ -4940,9 +4940,9 @@ def session_cli_path():
 
 def session_cli_allow_rule(cli_path=None):
     """The generated allow rule that lets a session run the session CLI without
-    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (the hook
-    security flags) and the ABSOLUTE script path, so the rule admits only this
-    script — an allow rule for `python3` alone would admit any code at all."""
+    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (not
+    a gate, so it keeps -SsE rather than the hooks' -SI) and the ABSOLUTE
+    script path, so the rule admits only this script — an allow rule for `python3` alone would admit any code at all."""
     return f"Bash(python3 -SsE {cli_path or session_cli_path()}:*)"
 
 
@@ -5459,7 +5459,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
     ask_path = ask_path or ask_script_path()
-    # `-SsE` are SECURITY flags here, not tidiness. A plain interpreter start
+    # `-SI` are SECURITY flags here, not tidiness. A plain interpreter start
     # imports user-site `usercustomize` before the hook's own code, so one Write
     # to ~/.local/lib/pythonX/site-packages/usercustomize.py neutralises EVERY
     # hook on the host — measured: with such a payload the Bash guard allowed
@@ -5475,8 +5475,13 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     # stop a plant via the file-editing TOOLS only; Bash walks past them like it
     # walks past every pattern (XERK-309), so they are a partial reduction, not
     # the fix. The flags are the fix.
-    # The hooks are stdlib-only by contract, so neither flag can break them.
-    guard_command = f'"{python_exe}" -SsE "{guard_path}"'
+    # `-I` (isolated: `-s` + `-E` + no script dir on sys.path), never `-SsE`:
+    # those keep the hook's OWN directory at sys.path[0], so a `hooks/json.py`
+    # holding `sys.exit(0)` ran on the guard's import and allowed every
+    # command (XERK-1681).
+    # The hooks are stdlib-only by contract and import no sibling module, so
+    # neither flag can break them.
+    guard_command = f'"{python_exe}" -SI "{guard_path}"'
     # The judge's one-shot grants (XERK-1566) are honoured only by a guard
     # launched with this flag, so TURMA_PERMISSION_JUDGE=0 reaches every
     # session launched after it — the session's env would not (the tmux server
@@ -5484,8 +5489,8 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     if PERMISSION_JUDGE:
         guard_command += " --grants"
     fileguard_path = fileguard_path or fileguard_script_path()
-    ask_command = f'"{python_exe}" -SsE "{ask_path}"'
-    fileguard_command = f'"{python_exe}" -SsE "{fileguard_path}"'
+    ask_command = f'"{python_exe}" -SI "{ask_path}"'
+    fileguard_command = f'"{python_exe}" -SI "{fileguard_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
     perms = {"deny": list(_GUARD_DENY_PATH_RULES) + _GUARD_DENY_TOOL_RULES
              + runtime_code_deny_rules()}
@@ -5534,7 +5539,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     # the command line so the hook and the manager's reader can never disagree.
     permlog_path = permlog_path or permlog_script_path()
     if os.path.exists(permlog_path):
-        permlog_command = f'"{python_exe}" -SsE "{permlog_path}" "{PERMISSIONS_DIR}"'
+        permlog_command = f'"{python_exe}" -SI "{permlog_path}" "{PERMISSIONS_DIR}"'
         # The judge hand-off (XERK-1566) is the same hook with `--judge`: it
         # then waits for the manager's verdict on a Bash call, so its timeout
         # must sit past permlog.JUDGE_WAIT_SEC.
@@ -5740,7 +5745,7 @@ def build_dsh_guard_config(python_exe=None, guard_path=None, fileguard_path=None
 # Code's, ported (the G0 spike, docs/qwen-g0-spike.md crit. 5) — a `command` hook
 # reads the tool call on stdin and denies with the same JSON Claude reads, or by
 # exiting 2. So qwen reuses the shared deny policy even more directly than dsh:
-# the SAME guard.py / fileguard.py are shelled out to (`python3 -SsE <hook>`),
+# the SAME guard.py / fileguard.py are shelled out to (`python3 -SI <hook>`),
 # never a second copy of the policy.
 #
 # The one mismatch qwen introduces is TOOL NAMES: guard.py keys on
@@ -5858,7 +5863,7 @@ def build_qwen_guard_config(python_exe=None, guard_path=None, fileguard_path=Non
         "allowRead": allow_read,
         "hookTimeoutMs": QWEN_SHIM_HOOK_TIMEOUT_MS,
     }
-    hook_cmd = (f"{shlex.quote(python_exe)} -SsE {shlex.quote(shim_path)} "
+    hook_cmd = (f"{shlex.quote(python_exe)} -SI {shlex.quote(shim_path)} "
                 f"{shlex.quote(config_path)}")
     hooks = {
         "PreToolUse": [{
@@ -5905,7 +5910,7 @@ def build_limits_settings(python_exe=None, statusline_path=None):
     return {
         "statusLine": {
             "type": "command",
-            "command": f'"{python_exe}" -SsE "{statusline_path}"',
+            "command": f'"{python_exe}" -SI "{statusline_path}"',
             "padding": 0,
         },
     }
@@ -23652,7 +23657,7 @@ class SessionManager:
             pass
         try:
             proc = subprocess.Popen(
-                ["python3", "-SsE", qwen_peer_inbox_path()],
+                ["python3", "-SI", qwen_peer_inbox_path()],
                 env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
@@ -23838,7 +23843,7 @@ class SessionManager:
         # the built-in gone the model selects this by the tool's DESCRIPTION, not
         # a bare name (no directive names one). The session id + rendezvous dir +
         # block timeout ride the server's own env block (per-session). `python3
-        # -SsE` matches the guard-hook security flags. (The `mcpServers`/
+        # -SI` matches the guard-hook security flags. (The `mcpServers`/
         # `tools.exclude` settings keys are host-proof-only — qwen is not
         # installed in CI; unit-tested via the server's JSON-RPC contract and the
         # settings builder. `tools.exclude` key + prefix confirmed against the
@@ -23846,7 +23851,7 @@ class SessionManager:
         settings["mcpServers"] = {
             "turma-ask": {
                 "command": "python3",
-                "args": ["-SsE", qwen_ask_mcp_path()],
+                "args": ["-SI", qwen_ask_mcp_path()],
                 "env": {
                     "TURMA_SESSION_ID": sess["id"],
                     "TURMA_QUESTIONS_DIR": QUESTIONS_DIR,
@@ -23862,7 +23867,7 @@ class SessionManager:
             # control socket.
             "turma-peer": {
                 "command": "python3",
-                "args": ["-SsE", qwen_peer_mcp_path()],
+                "args": ["-SI", qwen_peer_mcp_path()],
                 "env": {
                     "TURMA_SESSION_ID": sess["id"],
                     "TURMA_QWEN_PEER_DIR": QWEN_PEER_DIR,

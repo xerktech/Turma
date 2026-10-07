@@ -5609,6 +5609,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         # The turma-peer MCP server is registered beside turma-ask.
         peer_mcp = settings["mcpServers"]["turma-peer"]
         self.assertEqual(peer_mcp["args"][-1], ha.qwen_peer_mcp_path())
+        self.assertIn("-SI", peer_mcp["args"])  # XERK-1681: no script dir on sys.path
         self.assertEqual(peer_mcp["env"]["TURMA_SESSION_ID"], "q1")
         self.assertEqual(peer_mcp["env"]["TURMA_QWEN_PEER_DIR"], ha.QWEN_PEER_DIR)
 
@@ -5637,7 +5638,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         popen = self._launch(sm, sess, prompt="hi")
         cid = sess["claudeSessionId"]
         args, kwargs = popen.call_args
-        self.assertEqual(args[0], ["python3", "-SsE", ha.qwen_peer_inbox_path()])
+        self.assertEqual(args[0], ["python3", "-SI", ha.qwen_peer_inbox_path()])
         env = kwargs["env"]
         self.assertEqual(env["TURMA_SESSION_ID"], "q1")
         self.assertEqual(env["TURMA_CLAUDE_SESSION_ID"], cid)
@@ -36588,7 +36589,7 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         settings = sm._qwen_settings({"id": "q1"})
         srv = settings["mcpServers"]["turma-ask"]
         self.assertEqual(srv["command"], "python3")
-        self.assertIn("-SsE", srv["args"])
+        self.assertIn("-SI", srv["args"])
         self.assertTrue(srv["args"][-1].endswith(os.path.join("qwen", "ask_mcp.py")))
         self.assertEqual(srv["env"]["TURMA_SESSION_ID"], "q1")
         self.assertEqual(srv["env"]["TURMA_QUESTIONS_DIR"], ha.QUESTIONS_DIR)

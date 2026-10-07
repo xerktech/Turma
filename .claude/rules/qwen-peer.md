@@ -55,7 +55,7 @@ control socket — so both directions are FILE-RENDEZVOUS based and delivery is 
 
 - **`agent/qwen/peer_mcp.py` REGISTERS `send_message({to, message})` via MCP**, wired into
   `_qwen_settings`'s `mcpServers` as `turma-peer` beside `turma-ask` — the same mechanism [Qwen C]
-  used to give qwen an AskUserQuestion it does not natively have, and `python3 -SsE` matching the
+  used to give qwen an AskUserQuestion it does not natively have, and `python3 -SI` matching the
   guard-hook security flags. The tool NAME matches the dsh driver's and what `QWEN_PEERS_ADDENDUM`
   tells the model to call; all three must agree.
 - **It returns immediately (fire-and-forget)** rather than blocking for delivery, mirroring Claude

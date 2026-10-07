@@ -304,11 +304,11 @@ Claude sessions only: dsh/qwen have no Claude hooks, and the judge stands a dsh/
 ## Tests
 
 `test_permlog.py` (event shapes — the REAL PermissionRequest one, bounds, fail-open incl.
-FIFO/symlink, rotation, `-SsE`, the judge req/ans dance); `TestPermissionLedgerEdges` +
+FIFO/symlink, rotation, `-SI`, the judge req/ans dance); `TestPermissionLedgerEdges` +
 `TestPermissionLogTail` + `TestPermissionJudge` (`test_hub_agent.py`: incl. the symlinked
 grants/permissions dir cases, pick order, the per-sid call cap, and the REAL `run_forever` loop
 feeding `permissionPolicy` from both replies); the `test_guard_settings.py`
-pins (deny equality, every-hook-event `-SsE`, the PreToolUse matcher list, `--judge` wiring).
+pins (deny equality, every-hook-event `-SI`, the PreToolUse matcher list, `--judge` wiring).
 
 ## The judge's one-shot grant (guard.py)
 

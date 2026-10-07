@@ -14,7 +14,7 @@
 // trees" predicate are the hardest, most safety-critical logic in the fleet, and
 // they already exist, measured and tested, in `agent/hooks/guard.py` and
 // `agent/hooks/fileguard.py`. This module SHELLS OUT to those exact hooks — the
-// same binaries, invoked the same `python3 -SsE` way Claude Code invokes them —
+// same binaries, invoked the same `python3 -SI` way Claude Code invokes them —
 // so both runtimes share ONE deny policy and a change to it lands in one place.
 // What this module owns natively is only the flat path-glob rules (credential
 // stores, the runtime-code dir, the uploads/roster read carve-outs), which
@@ -170,7 +170,7 @@ function resolveTarget(p, cwd) {
 // --- the shared py deny policy (guard.py / fileguard.py) ------------------
 //
 // Invoke a Claude `PreToolUse` hook exactly as Claude Code does: the same
-// `python3 -SsE <hook>` command (the `-SsE` flags are the interpreter-injection
+// `python3 -SI <hook>` command (the `-SI` flags are the interpreter-injection
 // defence documented in agent-hooks.md), the PreToolUse JSON on stdin, the deny
 // JSON on stdout. Returns the denial reason, or null to allow.
 //
@@ -191,7 +191,7 @@ function runHook(cfg, script, toolName, toolInput, cwd) {
   })
   let out
   try {
-    out = execFileSync(cfg.pythonExe || 'python3', ['-SsE', script], {
+    out = execFileSync(cfg.pythonExe || 'python3', ['-SI', script], {
       input: payload,
       timeout: cfg.hookTimeoutMs || 5000,
       maxBuffer: 1 << 20,
