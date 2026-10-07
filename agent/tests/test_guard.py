@@ -3072,6 +3072,9 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "bash <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
         "bash <<'E'\nbash <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
         "{ bash; } <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
+        "bash <<'E'\n{ bash; } <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "bash <<'E'\nbash<<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "bash <<'E'\nx=bash; $x <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
         ": $(bash <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE\n)",
         "bash <<E\nbash -c \\$'eval \\$(echo \\\\'X=\\${nope:-a b}\\\\') rm -rf /etc'\nE",
         # ...and a quoted `$'` decoy is no ANSI-C string: read raw too.

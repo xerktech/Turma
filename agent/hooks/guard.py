@@ -4354,6 +4354,21 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
     return list(dict.fromkeys(cuts))
 
 
+def _walk_owner_feeds_shell(text: str, owner: str) -> bool:
+    """Whether the heredoc on ``owner`` (of heredoc-free ``text``) feeds a
+    shell, judged as `_expand`'s heredoc site judges it (`bash<<'E'`,
+    `{ bash; } <<'E'`, `$x <<'E'`, `cat <<'E'|bash|cat`), plus a shell, `.` or
+    `source` named anywhere on the owner line (an added, over-reading test)."""
+    if any(_basename(t) in _SHELL_PROGS or t in (".", "source")
+           for t in (w.strip("(){};&|") for w in _tokenize(_SUBST_RE.sub(" ", owner)))):
+        return True
+    vals, defined = _var_values(text), _defined_names(text)
+    return _heredoc_owner_feeds_shell(
+        owner, lambda: _line_feeds_shell(text),
+        lambda w: _owner_word_may_be_shell(w, vals, defined),
+        lambda st: _stage_may_read_stdin(st, vals, defined))
+
+
 def _raw_printed_walk(command: str, depth: int) -> list[str]:
     """One reading of `_raw_printed_cuts`."""
     cuts: list[str] = []
@@ -4365,8 +4380,7 @@ def _raw_printed_walk(command: str, depth: int) -> list[str]:
             # As the shell reads it too: `\$'` there is a live ANSI-C string.
             for reading in _heredoc_readings(body):
                 cuts += _raw_printed_cuts(reading, depth + 1)
-        elif any(_basename(t) in _SHELL_PROGS or t in (".", "source")
-                 for t in (w.strip("(){};&|") for w in _tokenize(_SUBST_RE.sub(" ", owner)))):
+        elif _walk_owner_feeds_shell(text, owner):
             # A quoted body a shell runs (`bash <<'E'`, `cat <<'E' | bash`),
             # nested in another; a non-shell owner's (`cat <<'E' > f.sh`) is data.
             cuts += _raw_printed_cuts(body, depth + 1)
@@ -6220,6 +6234,18 @@ def _stage_may_read_stdin(stage: str, vals: dict[str, list[str]],
     return False
 
 
+def _line_feeds_shell(raw_commands: str) -> bool:
+    """Whether any command on a heredoc-free line may read its stdin as a
+    script: `_heredoc_owner_feeds_shell`'s ``commands_feed_shell``."""
+    # Quotes, escapes and line continuations joined: bash runs `bas''h`,
+    # `b\ash`, `bas$''h` and `bas\` / `h` as `bash`.
+    # ...and names formed by an empty substitution or a brace (XERK-1629).
+    texts = _name_readings(raw_commands)
+    joined = [re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", t) for t in texts]
+    return any(map(_SHELL_WORD_RE.search, (*texts, *joined))) or any(
+        _reads_stdin_grouped(st) for t in texts for st in _split_segments(t))
+
+
 def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell,
                                may_be_shell=None, reads_stdin=None) -> bool:
     """Whether a heredoc opened on ``owner`` reaches a shell that runs it as a
@@ -6984,13 +7010,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
 
     def _commands_feed_shell() -> bool:
         if not line_feeds_shell:
-            # Quotes, escapes and line continuations joined: bash runs `bas''h`,
-            # `b\ash`, `bas$''h` and `bas\` / `h` as `bash`.
-            # ...and names formed by an empty substitution or a brace (XERK-1629).
-            texts = _name_readings(raw_commands)
-            joined = [re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", t) for t in texts]
-            line_feeds_shell.append(any(map(_SHELL_WORD_RE.search, (*texts, *joined))) or any(
-                _reads_stdin_grouped(st) for t in texts for st in _split_segments(t)))
+            line_feeds_shell.append(_line_feeds_shell(raw_commands))
         return line_feeds_shell[0]
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`

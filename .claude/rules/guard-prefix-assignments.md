@@ -54,8 +54,8 @@ paths:
     script, recursing into scripts, substitution bodies, `<(…)` and unquoted heredoc bodies
     (`: $(bash -c 'eval $(…) rm …')`). Read the raw line BEFORE `_expand` rebinds `command`.
   - Heredoc bodies in the walk: an unquoted one through `_heredoc_readings` (`\$'` is live
-    there); a quoted one only when its owner line names a shell, `.` or `source` (else data:
-    `cat <<'E' > f.sh`), at any nesting.
+    there); a quoted one when `_walk_owner_feeds_shell` (the site's `_heredoc_owner_feeds_shell`
+    plus a shell named on the owner line) says so, at any nesting; else data (`cat > f.sh`).
   - The heredoc SITE in `_expand` walks a quoted body too, gated by `_owner_feeds_shell`: the
     walk's owner-token check misses `bash<<'E'`, `{ bash; } <<'E'`, `$x <<'E'`, one in `$(…)`.
     Never drop either: the site sees owners, the walk sees nesting.
