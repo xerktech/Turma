@@ -6391,6 +6391,10 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
             out = " ".join(words)
             if state == '"':
                 out = '"' + out + '"'
+        elif not state and _in_assignment_word(script, m.start()):
+            # An assignment keeps the value whole: escaped bare, `sh -c 'x=$1;
+            # $x' _ 'rm …'` read `x=rm` (XERK-1657 QA).
+            out = '"' + '" "'.join(_quote_literal(w, '"') for w in words) + '"'
         elif state == '"' and (name == "@" or every):
             # ...and so is every argument a parameter may be (`every`).
             # `"$@"` is one word per argument, not one word of them all.

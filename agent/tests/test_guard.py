@@ -3410,7 +3410,7 @@ class TestExpansionBudget(unittest.TestCase):
                     f"f(){{ x=$1; $x; }}; f '{R}'", f"f(){{ local x=$1; bash -c \"$x\"; }}; f '{R}'",
                     f"set -- '{R}'; x=$1; $x", f"f(){{ $1; }}; f $'{R}'",
                     f"v='{R}'; eval '$''v'", f"for v in a '{R}'; do eval '$''v'; done",
-                    f"d='$'; v='{R}'; eval $d'v'"):
+                    f"d='$'; v='{R}'; eval $d'v'", f"sh -c 'x=$1; $x' _ '{R}'"):
             with self.subTest(cmd=cmd):
                 reason = self.check(cmd)
                 self.assertIsNotNone(reason)
@@ -3423,7 +3423,9 @@ class TestExpansionBudget(unittest.TestCase):
                     "for v in a b; do eval \"echo \\$v\"; done",
                     f"for v in a '{R}'; do echo '$'v; done",
                     "for v in a $\"hello world\"; do echo $v; done",
-                    "f(){ $1 --version; }; f 'git'", "f(){ x=$1; echo $x; }; f 'a b'", "for v in a b; do echo \"$v\" > s.txt; done; sh s.sh"):
+                    "f(){ $1 --version; }; f 'git'", "f(){ x=$1; echo $x; }; f 'a b'",
+                    # A whole `"$c"` is ONE argument: data here, never run.
+                    f"for c in '{R}' x; do python3 -c 'import sys' \"$c\"; done", "for v in a b; do echo \"$v\" > s.txt; done; sh s.sh"):
             self.assertIsNone(self.check(cmd), cmd)
         # Glued names are found in linear time on a long blank-free run (QA).
         self.assertTrue(guard._glued_name_pairs("x" * 60000 + "$a" + "$b" * 3, {"a", "b"}))
