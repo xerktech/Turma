@@ -31,3 +31,11 @@ paths:
 - `${a:off:len}` arithmetic (`_arith_offset`) truncates `/` and `%` toward zero as bash/C do.
 - Extglob (`+(x)`) is unreadable on purpose: its meaning depends on `shopt -s extglob`, which the
   guard does not track; reading it either way is a bypass the other way.
+- **A default applies wherever bash applies it, not only to an unassigned name** (XERK-1659):
+  - A name assigned empty takes its `:-`/`:=` default (`x=; ${x:-cmd}`); `-`/`=` keep the empty value.
+  - An unset array element takes its default as a scalar does (`${y[0]:-cmd}`, `[@]`, `[*]`).
+  - A `}` quoted or escaped inside the braces does not end them: the operator reads up to the
+    real `}` (`${a#\}}`), its `#` kept a word. Left raw, `eval "${a#\}}"` ran unread.
+  - `printf -v` arguments are also read with their defaults applied, as `x=${y:-…}` is.
+  - Inside `"…"` a `\}` in a default or `:+` word is a plain `}` (`_dq_unescape_brace`), as in bash.
+  - Cost, measured: 0 changed decisions over a 38k-command real corpus replay vs main.
