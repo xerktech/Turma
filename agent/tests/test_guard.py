@@ -1383,6 +1383,8 @@ class TestProducedScripts(unittest.TestCase):
                     f'a="}}{R}"; b=1; eval "${{a#"${{b:+\\}}}}"}}"',
                     f'a="}}{R}"; b=x; eval "${{a#"${{b+\\}}}}"}}"',
                     f"y=(); ${{y[0]:-{R}}}", f"y=(a); ${{y[1]:-{R}}}",
+                    # ...and its values still read: `/etc` is the element here.
+                    'y=(/etc); rm -rf "${y[0]:-x}"', 'y=(/); rm -rf ${y[0]:-.}/etc',
                     f'a="}}{R}"; y=(); eval "${{a#"${{y[0]:-\\}}}}"}}"',
                     f'a="}}{R}"; y=(); eval "${{a#"${{y[0]:-}}}}"}}"',
                     # `-`/`=` keep an empty value: the `echo` never runs.
