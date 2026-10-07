@@ -36,14 +36,26 @@ paths:
     quadratic and a 24 KB benign line hit the deadline (QA).
 - An alias use runs its VALUE with the use's words after it: `alias b='bash -c'; b '<cmd>'`,
   through a chain, an `eval "b …"`, or a pipe (`echo /etc | b`). `_aliased_readings` is an
-  ADDED whole-line reading with every use replaced (`_ALIAS_USE_RE`), `_ALIASES_ON` off inside.
+  ADDED whole-line reading with every use replaced, `_ALIASES_ON` off inside.
+  - `_ALIAS_USE_RE` matches the name as a WHOLE WORD anywhere, not a list of command positions:
+    each list missed one (`if b`, `! b`, `coproc b`, `x=1 b`, a value ending in a blank). An
+    argument replaced too only adds a reading. The growth is charged (`_spend`).
   - At most two: each name's FIRST and LAST value. One reading per use, then per value, was
     (definitions × uses) and a 3000-use line false-denied (QA). Off inside so `alias ls='ls
-    -l'` is not re-replaced per level until "too deep". Residual: a huge alias used hundreds
-    of times grows the line toward the growth budget.
+    -l'` is not re-replaced per level until "too deep". Accepted: a 2000-char alias used 500
+    times is refused as too large.
 - An array element written with its index (`([1]=w)`, `([k]=w)`, `+=`) is the element `w`,
   one element too.
-- A `tee f` stage writes a here-string (`tee f <<< …`) or a `{ … }` group's printed body.
+- A `tee f` stage writes a here-string (`tee f <<< …`) or what it is fed; a `{ …; }`/`( … )`
+  group writes ALL its statements' text (`_statements_printed`, never its first-word reading:
+  `_strip_prefixes` drops the `{`); a lone `cat`/pass-through relays what it is fed.
+- A file is run by a shell operand, `.`/`source`, a shell's stdin redirect (`bash < f`) or its
+  own path (`./f`) — `_script_file` / `script_path`. Run with arguments, its `$1…` are bound to
+  them (unbound, main's unset-trailing-name rule over-denied `go.sh tk`, replayed).
+  - Its contents are judged like any command: a written script doing `rm -rf /var/tmp/x` is
+    refused as that command typed directly is (1 replayed diff, explained).
+- `_alias_values` takes only `alias NAME=…` with a name bash accepts (`_ALIAS_NAME_RE`):
+  `alias={…}` in a heredoc's Python made an empty name that matched every word (replayed).
 - **A program word that is not literal may be a shell on the `-c` and pipe paths too**
   (XERK-1632, `_owner_word_may_be_shell`). Gated on `_NONLITERAL_RE`/defined names before the
   call: asking every stage of every pipeline doubled the walk.

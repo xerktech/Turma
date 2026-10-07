@@ -2367,6 +2367,29 @@ class TestScriptChannels(unittest.TestCase):
                 f"tee x.sh <<< '{P}'; sh x.sh", f"{{ echo '{P}'; }} | tee x.sh; sh x.sh"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
+        # Delta-QA 3: an alias in any word position and a reverse chain; the
+        # per-path cap ranked by danger, not length; groups, relays, stdin and
+        # a direct `./f` as writers/runners of a script file.
+        pad = " ".join(f"/t/{i:02}" for i in range(32))
+        for cmd in (f"alias b='bash -c'\nif b '{P}'; then :; fi", f"alias b='bash -c'\n! b '{P}'",
+                    f"alias b='bash -c'\nx=1 b '{P}'", f"alias b='bash -c'\ncoproc b '{P}'",
+                    f"alias s='nice '; alias b='bash -c'\ns b '{P}'",
+                    f"alias c='bash -c'; alias b=c; alias a=b; a '{P}'",
+                    f"find {pad} //////////etc -maxdepth 0 -exec sh -c 'rm -rf \"$1\"' _ {{}} \\;",
+                    f"{{ echo hi; echo '{P}'; }} | tee x.sh; sh x.sh",
+                    f"{{ echo hi; echo '{P}'; }} > x.sh; sh x.sh",
+                    f"echo '{P}' | cat > x.sh; sh x.sh", f"echo '{P}' > s.sh; bash < s.sh",
+                    f"echo '{P}' > s.sh; chmod +x s.sh; ./s.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("alias ll='ls -la'; ll; echo ll", "echo hi > s.sh; bash < s.sh",
+                    "{ echo a; echo b; } | tee x.sh; sh x.sh",
+                    # Replayed: `alias={…}` in a script's text is no definition, and
+                    # a written script run with arguments sees them as `$1…`.
+                    "python3 - <<'EOF'\nalias={'a': 'b'}\nprint(alias)\nEOF",
+                    "cat > /tmp/g.sh <<'EOF'\nrm -rf /tmp/q/audio-$1\nEOF\nsh /tmp/g.sh tk"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
         # A direct `sh -c` runs once: `$1` is exactly its first argument.
         for cmd in ("bash -c 'rm -rf \"$1\" && cp -r \"$2\" \"$1\"' _ ./build /usr/share/doc/x",
                     "sh -c 'test -d \"$2\" && rm -rf \"$1\"' _ ./out /",

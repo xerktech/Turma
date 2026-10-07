@@ -5492,7 +5492,10 @@ def _per_run_operands(operands: list[str]) -> list[str]:
     unique = list(dict.fromkeys(operands))
     if len(unique) <= _MAX_PER_RUN:
         return unique
-    return sorted(unique, key=lambda o: (not o.startswith(("/", "~")), len(o)))[:_MAX_PER_RUN]
+    # Ranked by the guard's own danger test first: by length alone, a padded
+    # spelling of a protected path was ranked out (XERK-1641 QA).
+    return sorted(unique, key=lambda o: (_dangerous_target(o) is None,
+                                         not o.startswith(("/", "~")), len(o)))[:_MAX_PER_RUN]
 
 
 def _find_roots(tokens: list[str]) -> list[str]:
@@ -5869,9 +5872,11 @@ def _defined_names(command: str) -> frozenset[str]:
 _ALIASES_ON = [True]
 # Chain hops followed when replacing alias uses.
 _ALIAS_HOPS = 3
-# A word in command position: after an operator, a group opener, a keyword,
-# or an `eval`/`xargs`/`exec` that runs its words (quoted too: `eval "b …"`).
-_ALIAS_USE_RE = r"((?:^|[;&|\n(){{}}`]|\b(?:then|do|else|eval|exec|xargs|command|builtin|time))[ \t\"']*){}(?=[ \t;&|\n)'\"]|$)"
+# A use of the alias NAME as a whole word anywhere: a list of command
+# positions kept missing one (`if`, `!`, `coproc`, a leading assignment, a
+# value ending in a blank) (XERK-1641 QA). An argument replaced too only adds
+# a reading; the definition's own `b=` is no use.
+_ALIAS_USE_RE = r"(^|(?<=[^\w./=$-])){}(?![\w./=-])"
 
 
 def _aliased_readings(command: str) -> list[str]:
@@ -5891,6 +5896,7 @@ def _aliased_readings(command: str) -> list[str]:
                 value = values[min(k, len(values) - 1)]
                 text = re.sub(_ALIAS_USE_RE.format(re.escape(name)),
                               lambda m: m.group(1) + value, text)
+            _spend(len(text) - len(before))
             if text == before:
                 break
         if text != command and text not in out:
@@ -5898,10 +5904,15 @@ def _aliased_readings(command: str) -> list[str]:
     return out
 
 
+_ALIAS_NAME_RE = re.compile(r"[^\s/$`=\'\"\\(){}<>|&;]+")
+
+
 def _alias_values(command: str) -> dict[str, list[str]]:
     """Each alias ``command`` defines, mapped to its values (dequoted)."""
     out: dict[str, list[str]] = {}
     for words in _ALIAS_RE.findall(command):
+        if not words[:1].isspace():
+            continue  # `alias={…}` in a script's text is no definition
         try:
             toks = shlex.split(words)
         except ValueError:
@@ -5909,6 +5920,9 @@ def _alias_values(command: str) -> dict[str, list[str]]:
         for w in toks:
             if "=" in w:
                 name, value = w.split("=", 1)
+                # A name bash accepts; an empty one matched every word.
+                if not _ALIAS_NAME_RE.fullmatch(name):
+                    continue
                 if value and value not in out.get(name, ()):
                     out.setdefault(name, []).append(value)
     return out
@@ -6622,9 +6636,13 @@ def _written_scripts(segments: list[str],
             words, outs = _stdout_targets(_strip_prefixes(_tokenize(stage)))
             prog = _basename(words[0]) if words else ""
             text = _printed_from_tokens(words) if words else None
-            if text is None and stage.lstrip()[:1] in ("{", "("):
-                # A `{ echo …; }` group prints what its body prints.
-                text = _statements_printed(_unwrap_group(stage)) or None
+            if stage.lstrip()[:1] in ("{", "("):
+                # A group prints what ALL its statements print. Its first-word
+                # reading is not that: `_strip_prefixes` drops the `{`.
+                core = _group_core(stage)
+                text = _statements_printed(_unwrap_group(core if core else stage)) or None
+            elif prog in _PASS_THROUGH and prog != "tee" and len(words) == 1 and fed:
+                text = fed  # `… | cat > f` relays what it is fed
             if prog == "tee":
                 # ...and a `tee f <<< '…'` writes its here-string.
                 fed = next(iter(_herestrings(stage)), None) or fed
@@ -6648,7 +6666,8 @@ def _written_scripts(segments: list[str],
 
 
 def _script_file(prog: str, rest: list[str]) -> str | None:
-    """The script file a shell (no `-c`) or `source`/`.` runs, normalised."""
+    """The script file a shell (no `-c`) or `source`/`.` runs, normalised; a
+    shell with no file operand reads the file redirected to its stdin."""
     words, _ = _stdout_targets(rest)
     if prog in ("source", "."):
         return posixpath.normpath(words[0]) if words else None
@@ -6660,7 +6679,15 @@ def _script_file(prog: str, rest: list[str]) -> str | None:
             i += 1
             break
         i += 2 if words[i] in _SHELL_OPTS_WITH_VALUE else 1
-    return posixpath.normpath(words[i]) if i < len(words) else None
+    if i < len(words):
+        return posixpath.normpath(words[i])
+    for k, tok in enumerate(rest):
+        if tok in ("<", "0<") and k + 1 < len(rest):
+            return posixpath.normpath(rest[k + 1])
+        m = re.match(r"0?<([^<&(>].*)", tok)
+        if m:
+            return posixpath.normpath(m.group(1))
+    return None
 
 
 def _expand_segments(command: str, depth: int = 0,
@@ -7158,15 +7185,25 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
-        if (written is None or written) and (prog in _SHELL_PROGS or prog in ("source", ".")) \
-                and _script_file(prog, rest):
+        # The file a shell or `.` runs, or one run by its path (`./s.sh`).
+        script_path = (_script_file(prog, rest) if prog in _SHELL_PROGS or prog in ("source", ".")
+                       else posixpath.normpath(tokens[0]) if "/" in tokens[0] else None)
+        if (written is None or written) and script_path:
             if written is None:
                 written = _written_scripts(
                     _split_on_operators(command, include_pipe=False, groups=True), heredocs)
             # Each file once per line, however often it is run: per run, N
             # writes and N runs were quadratic (XERK-1641 QA).
-            for text in written.pop(_script_file(prog, rest) or "", ()):
+            # Run with arguments, the file sees them as `$1…` and nothing
+            # else: an unbound `$1` read as unset over-denied `go.sh tk`.
+            words = _stdout_targets(tokens)[0]
+            at = next((k for k, w in enumerate(words) if k and posixpath.normpath(w) == script_path),
+                      0 if words and posixpath.normpath(words[0]) == script_path else -1)
+            args = words[at + 1:] if at >= 0 else []
+            for text in written.pop(script_path, ()):
                 for script in _script_readings(text):
+                    if args:
+                        script = _bind_positionals(script, [script_path, *args])
                     out.extend(_expand_segments(script, depth + 1, every_cd))
         if prog in ("rm", "unlink", "chmod", "chown"):
             # `cd /; rm -rf *` deletes `/*`, which `rm` alone never names.
