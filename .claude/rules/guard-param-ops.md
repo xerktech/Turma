@@ -38,7 +38,7 @@ paths:
   - Never key loop readings on `${!` instead: keyed on every loop it made plain loops "too large",
     keyed on the name's spelling it missed built names (QA, 3 passes).
   - Not modelled: `for e in $(echo $x)`, `set -- $x; for e` (XERK-1726); namerefs (XERK-1722);
-    glued array elements `${y[0]}${y[1]}` (XERK-1730).
+    glued array elements `${y[0]}${y[1]}` (XERK-1730); a named `source`, `eval \$x'al'` (XERK-1732).
   - The `$(…)` is read as printed AND by its taint readings (`cat <<<…`, pipes), and each script
     with the line's names spliced (`v=a; eval "$(echo "$v=…")"`) (XERK-1668).
   - `printf %q` prints its argument shell-quoted; printed bare, the eval bound `a=rm`.

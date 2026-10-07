@@ -2848,19 +2848,6 @@ _INDIRECT_RE = re.compile(r"\$\{!([A-Za-z_][A-Za-z0-9_]*)\}")
 # x's target transformed.
 _INDIRECT_OP_RE = re.compile(
     r"\$\{!([A-Za-z_][A-Za-z0-9_]*)(\[(?![@*]\])[^]]*\])?((?![*@]\})[^}]*)\}")
-# A bare `$name` a quote ends, `$q'al'`, `$q$"al"`: braced so its quotes, once gone,
-# can't extend the name.
-_QUOTE_GLUED_NAME_RE = re.compile(r"(?<!\\)\$([A-Za-z_][A-Za-z0-9_]*)(?=\$?['\"])")
-def _brace_quote_glued(seg: str) -> str:
-    """``seg`` with each `$name` a quote ends braced, outside `'…'` only:
-    there `'a=$b't` is eval's `$bt`, never `${b}t` (XERK-1661)."""
-    if "$" not in seg:
-        return seg
-    states = _quote_states(seg)
-    return _QUOTE_GLUED_NAME_RE.sub(
-        lambda m: m.group(0) if states[m.start()] == "'" else "${" + m.group(1) + "}", seg)
-
-
 _MAYBE_EVAL_RE = re.compile(r"\$\{!|@[A-Za-z]\}")
 _LOCALE_QUOTE_RE = re.compile(r'(?<![\\$])\$(?=")')
 # What an indirection may name: a variable, or one element of one.
@@ -3052,11 +3039,9 @@ def _assigned_values(command: str, depth: int = 0,
         for seg in _split_segments(command):
             if "al" not in seg and "$" not in seg:
                 continue
-            # A name glued to a quote braced first: tokenized, the quotes go
-            # and `$p$q'al'` read as the name `qal` (XERK-1666).
             # A `$"…"` locale string is a plain `"…"` here: tokenized, its `$`
-            # stayed and `$p$"al"` read the name `al`.
-            words = _tokenize(_LOCALE_QUOTE_RE.sub("", _brace_quote_glued(seg)))
+            # stayed and `$p$"al"` read the name `al` (XERK-1666).
+            words = _tokenize(_LOCALE_QUOTE_RE.sub("", seg))
             known = {**(env or {}), **vals}
             for name, got in for_known.items():
                 known[name] = known.get(name, []) + got
