@@ -10,7 +10,7 @@ paths:
   - Quotes and `\` make text literal, `[...]` takes POSIX classes; `fnmatch` does neither.
   - Never go back to "leave the value whole" for a pattern it can't read: a value with blanks
     stays ONE quoted word, so `"${a%% *}" ${a#* }` ran `rm` while the guard saw one word.
-  - Unreadable (extglob, an unknown `$` in the pattern, over the cost cap) → `_unreadable_op`:
+  - Unreadable (an unknown `$` in the pattern, over the cost cap) → `_unreadable_op`:
     `_UNREAD_OUTPUT` + the value, so as a program it is refused and its words still reach path rules.
   - `_glob_ends` is a state-set run, O(value × pattern) whatever the stars; fnmatch per cut
     blew one line past the hook deadline. The `_VAR_OP_*_COST` caps bound it; keep them.
@@ -29,8 +29,18 @@ paths:
     `${q:+$HOME}` lost `$HOME`.
   - Cost: a benign command-position op with an unknown pattern (`${cmd%$x}`) is refused. Accepted.
 - `${a:off:len}` arithmetic (`_arith_offset`) truncates `/` and `%` toward zero as bash/C do.
-- Extglob (`+(x)`) is unreadable on purpose: its meaning depends on `shopt -s extglob`, which the
-  guard does not track; reading it either way is a bypass the other way.
+- **An extglob pattern (`+(x)`) is read BOTH ways** (`_var_op_readings`, XERK-1664): its meaning
+  depends on `shopt -s extglob`, which the guard does not track, and either reading alone is a bypass.
+  - Off, it is plain glob; on, `_GlobExt` groups matched by `_ext_ends` (memoised, step-capped by
+    `_VAR_OP_EXT_STEPS`: `!(…)` makes it O(value² x pattern)).
+  - Differing readings splice marker-led, as `_op_readings`' others do: a blank-free value is no
+    longer kept whole (`${a##+(x)}` on `xx/etc` names `/etc`).
+  - Don't add `shopt` tracking instead: `shopt` is respelled as freely as any command, `bash -O`
+    and `BASHOPTS` set it too, and a missed spelling is a bypass. Reading both costs only refusing a
+    command-position op whose readings differ. Accepted.
+  - A replace's empty match at the value's end is read both ways too: bash's own matcher is not
+    consistent there (`${v/%!(x)/-}` is `x`, `${v/%?(x)/-}` is `xyz-`).
+  - Bash parity: `test_extglob_ops_read_both_ways_as_bash`, off exact, on within the readings.
 - **A default applies wherever bash applies it, not only to an unassigned name** (XERK-1659):
   - A name assigned empty takes its `:-`/`:=` default (`x=; ${x:-cmd}`); `-`/`=` keep the empty value.
   - An unset array element takes its default as a scalar does (`${y[0]:-cmd}`, `[@]`, `[*]`).

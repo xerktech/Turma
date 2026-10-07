@@ -75,6 +75,7 @@ import stat
 import sys
 import threading
 import time
+from typing import NamedTuple
 
 # --- command segmentation ------------------------------------------------
 
@@ -2123,6 +2124,9 @@ _POSIX_CLASSES = {
 # and a replace tries every start. Past these the pattern counts as unreadable.
 _VAR_OP_TRIM_COST = 1 << 18
 _VAR_OP_REPLACE_COST = 1 << 16
+# An extglob match's budget, in positions visited (`_ext_ends`): `!(…)` and a
+# star inside a group reach every later end, so it is O(value² x pattern).
+_VAR_OP_EXT_STEPS = 1 << 20
 
 
 def _glob_class(pat: str, i: int):
@@ -2156,18 +2160,72 @@ def _glob_class(pat: str, i: int):
     return None
 
 
-def _glob_tokens(pat: str) -> list | None:
+class _GlobExt(NamedTuple):
+    """An extglob group as `_glob_tokens` reads it with extglob on: its kind
+    (`?*+@!`) and each `|` alternative's tokens."""
+    kind: str
+    alts: tuple
+
+
+class _GlobTooCostly(Exception):
+    """An extglob match past its step budget (`_VAR_OP_EXT_STEPS`)."""
+
+
+_EXTGLOB_RE = re.compile(r"[?*+@!]\(")
+
+
+def _extglob_close(pat: str, i: int) -> tuple[list[str], int] | None:
+    """The alternatives of the extglob group whose `(` is ``pat[i]``, and the
+    index past its `)`; None when it never closes."""
+    alts, depth, j, last = [], 1, i + 1, i + 1
+    while j < len(pat):
+        c = pat[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c in "'\"":
+            k = pat.find(c, j + 1)
+            if k < 0:
+                return None
+            j = k + 1
+            continue
+        if c == "[" and _glob_class(pat, j):
+            j = _glob_class(pat, j)[1]
+            continue
+        if c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if not depth:
+                return alts + [pat[last:j]], j + 1
+        elif c == "|" and depth == 1:
+            alts.append(pat[last:j])
+            last = j + 1
+        j += 1
+    return None
+
+
+def _glob_tokens(pat: str, extglob: bool = False) -> list | None:
     """A `${v#pat}`-style pattern as bash matches it — quotes and `\\` make text
     literal, `[...]` takes POSIX classes — or None when it can't be read here:
-    an expansion still in it, or an extglob `@(…)`."""
+    an expansion still in it. With ``extglob`` (bash's `shopt -s extglob`) a
+    `+(a|b)`-style group is a `_GlobExt`; without it, its text is plain glob."""
     toks: list = []
     i = 0
     while i < len(pat):
         c = pat[i]
         if c in "$`":
             return None
-        if c in "?*+@!" and pat.startswith("(", i + 1):
-            return None
+        if extglob and c in "?*+@!" and pat.startswith("(", i + 1):
+            got = _extglob_close(pat, i + 1)
+            if got is None:
+                return None  # unclosed: bash neither matches it nor reads it literally
+            alts = [_glob_tokens(a, True) for a in got[0]]
+            if any(a is None for a in alts):
+                return None
+            toks.append(_GlobExt(c, tuple(tuple(a) for a in alts)))
+            i = got[1]
+            continue
         if c == "\\":
             toks.append(pat[i + 1] if i + 1 < len(pat) else "\\")
             i += 2
@@ -2207,9 +2265,21 @@ def _glob_tokens(pat: str) -> list | None:
     return toks
 
 
-def _glob_ends(toks: list, value: str, start: int) -> list[int]:
+def _glob_reversed(toks) -> list:
+    """``toks`` matching the reversed string: a suffix match is a prefix match
+    of the reversed value."""
+    return [_GlobExt(t.kind, tuple(tuple(_glob_reversed(a)) for a in t.alts))
+            if isinstance(t, _GlobExt) else t for t in reversed(toks)]
+
+
+def _glob_ends(toks: list, value: str, start: int, memo: dict | None = None) -> list[int]:
     """Every end ``e`` with ``value[start:e]`` matching ``toks``, ascending.
-    A state set run, so it costs O(len(value) x len(toks)), whatever the stars."""
+    A state set run, so it costs O(len(value) x len(toks)), whatever the stars.
+    An extglob group goes to `_ext_ends` (``memo`` shared across starts); past
+    its step budget that raises `_GlobTooCostly`."""
+    if any(isinstance(t, _GlobExt) for t in toks):
+        memo = {"steps": _VAR_OP_EXT_STEPS} if memo is None else memo
+        return sorted(_ext_ends(tuple(toks), value, start, memo))
     n = len(toks)
 
     def closure(states: set) -> set:
@@ -2236,6 +2306,62 @@ def _glob_ends(toks: list, value: str, start: int) -> list[int]:
                 nxt.add(j + 1)
         states = closure(nxt)
     return ends
+
+
+def _ext_ends(toks: tuple, value: str, start: int, memo: dict) -> set[int]:
+    """`_glob_ends` for tokens holding an extglob group: the ends as a set of
+    positions advanced token by token, each group's ends memoised per start."""
+    pos, n = {start}, len(value)
+    for t in toks:
+        if not pos:
+            break
+        memo["steps"] -= len(pos)
+        if memo["steps"] < 0:
+            raise _GlobTooCostly
+        if t is _GLOB_STAR:
+            pos = set(range(min(pos), n + 1))
+        elif isinstance(t, _GlobExt):
+            pos = set().union(*(_ext_group_ends(t, p, value, memo) for p in pos))
+        else:
+            pos = {p + 1 for p in pos if p < n and (
+                t is _GLOB_ANY or (t == value[p] if isinstance(t, str) else t.match(value[p])))}
+    return pos
+
+
+def _ext_group_ends(t: _GlobExt, p: int, value: str, memo: dict) -> frozenset:
+    """Where extglob group ``t`` matched from ``p`` may end, as bash reads it:
+    `@` one alternative, `?` at most one, `*`/`+` any/one-or-more in a row,
+    `!` anything from ``p`` no alternative matches."""
+    key = (id(t), p)
+    if key in memo:
+        return memo[key]
+
+    def alts(q: int) -> frozenset:
+        k = (id(t), "alt", q)
+        if k not in memo:
+            memo[k] = frozenset().union(*(_ext_ends(a, value, q, memo) for a in t.alts))
+        return memo[k]
+
+    if t.kind == "@":
+        got = set(alts(p))
+    elif t.kind == "?":
+        got = alts(p) | {p}
+    elif t.kind == "!":
+        got = set(range(p, len(value) + 1)) - alts(p)
+    else:
+        got = {p} if t.kind == "*" else set()
+        todo, seen = [p], {p}
+        while todo:
+            for e in alts(todo.pop()):
+                got.add(e)
+                if e not in seen:
+                    seen.add(e)
+                    todo.append(e)
+    memo["steps"] -= len(got)
+    if memo["steps"] < 0:
+        raise _GlobTooCostly
+    memo[key] = frozenset(got)
+    return memo[key]
 
 
 def _split_replace(arg: str) -> tuple[str, str]:
@@ -2332,14 +2458,14 @@ def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> l
         pat, rep = arg, None
     known = _pattern_vars(pat, vals, keep=True)
 
-    def apply(p: str) -> str:
-        return _apply_var_op(value, op, p) if rep is None else _replace_op(value, op, p, rep)
+    def apply(p: str) -> list[str]:
+        return _var_op_readings(value, op, p, rep)
 
     if "$" not in known and "`" not in known:
-        return [apply(known)]
+        return apply(known)
     printed = _PATTERN_SUBST_RE.sub(lambda m: _produced_text(m.group(0)).strip(), pat)
     out = []
-    for got in (apply(_pattern_vars(pat, vals)), apply(_pattern_vars(printed, vals)), value):
+    for got in (*apply(_pattern_vars(pat, vals)), *apply(_pattern_vars(printed, vals)), value):
         if got not in out:
             out.append(got)
     # Ambiguous even when every reading agrees, `${a#$PWD}` being unknown:
@@ -2396,26 +2522,57 @@ def _arith_offset(text: str) -> int | None:
         return None
 
 
+def _var_op_readings(value: str, op: str, arg: str, rep: str | None = None) -> list[str]:
+    """`${v<op><arg>}` on ``value`` read with bash's extglob off, then on when
+    its pattern holds an extglob group and that reading differs (XERK-1664).
+    The guard does not track `shopt -s extglob`, and either reading alone is
+    a bypass: `${a#+(x)}` on `xx/etc` is `xx/etc` off and `/etc` on.
+    ``rep`` set reads `${v<op><arg>/<rep>}`."""
+    def one(ext: int) -> str:
+        if rep is not None:
+            return _replace_op(value, op, arg, rep, ext)
+        return _apply_var_op(value, op, arg, ext)
+    out = [one(0)]
+    if op not in ("#", "##", "%", "%%", "/", "//") or not _EXTGLOB_RE.search(arg):
+        return out
+    for ext in (1, 2) if op[0] == "/" else (1,):
+        if (got := one(ext)) not in out:
+            out.append(got)
+    return out
+
+
+def _var_op_text(value: str, op: str, arg: str, rep: str | None = None) -> str:
+    """`_var_op_readings` as one text: several are led by `_UNREAD_OUTPUT`,
+    as `_op_readings`' callers splice them."""
+    got = _var_op_readings(value, op, arg, rep)
+    return got[0] if len(got) == 1 else " ".join((_UNREAD_OUTPUT, *got))
+
+
 @functools.lru_cache(maxsize=256)  # one line repeats an op on one value
-def _apply_var_op(value: str, op: str, arg: str) -> str:
+def _apply_var_op(value: str, op: str, arg: str, extglob: int = 0) -> str:
     """Apply a `${name<op><arg>}` expansion to a known value.
 
     Trims and replaces match their pattern as a bash glob (XERK-1651):
     dropping its `*`s left `"${a%% *}"` whole, one quoted word that hid `rm`.
-    A pattern that can't be read here yields `_unreadable_op`.
+    A pattern that can't be read here yields `_unreadable_op`. A nonzero
+    ``extglob`` reads it as bash does under `shopt -s extglob` (see
+    `_var_op_readings`; 2 is `_replace_matched`'s other end-match reading).
     """
     if op in ("#", "##", "%", "%%"):
-        toks = _glob_tokens(arg)
+        toks = _glob_tokens(arg, bool(extglob))
         if toks is None or len(value) * (len(toks) + 1) > _VAR_OP_TRIM_COST:
             return _unreadable_op(value)
-        if op[0] == "#":
-            ends = _glob_ends(toks, value, 0)
-            return value[(ends[0] if op == "#" else ends[-1]):] if ends else value
-        # A suffix is a prefix of the reversed value under the reversed pattern.
-        ends = _glob_ends(toks[::-1], value[::-1], 0)
+        try:
+            if op[0] == "#":
+                ends = _glob_ends(toks, value, 0)
+                return value[(ends[0] if op == "#" else ends[-1]):] if ends else value
+            # A suffix is a prefix of the reversed value under the reversed pattern.
+            ends = _glob_ends(_glob_reversed(toks), value[::-1], 0)
+        except _GlobTooCostly:
+            return _unreadable_op(value)
         return value[:len(value) - (ends[0] if op == "%" else ends[-1])] if ends else value
     if op in ("/", "//"):
-        return _replace_op(value, op, *_split_replace(arg))
+        return _replace_op(value, op, *_split_replace(arg), extglob)
     if op in (":+", "+"):
         # The alternative replaces a set value: `${q:+/etc}` is /etc. Names in
         # it were expanded by `_op_readings`; one it can't resolve leaves it
@@ -2450,30 +2607,58 @@ def _dequote_rep(rep: str) -> str:
 
 
 @functools.lru_cache(maxsize=256)
-def _replace_op(value: str, op: str, pat: str, rep: str) -> str:
+def _replace_op(value: str, op: str, pat: str, rep: str, extglob: int = 0) -> str:
     """`${v/pat/rep}` (`op` `/` or `//`), its pattern a bash glob; `#`/`%`
     anchor it. A replacement still holding a `$` stays as written, live text
     the reading of the line then expands (`${a/X/$HOME}`)."""
     anchor = pat[0] if op == "/" and pat[:1] in ("#", "%") else ""
-    toks = _glob_tokens(pat[len(anchor):])
+    toks = _glob_tokens(pat[len(anchor):], bool(extglob))
     if toks is None:
         return _unreadable_op(value)
+    try:
+        return _replace_matched(value, op, toks, anchor, rep, extglob == 2)
+    except _GlobTooCostly:
+        return _unreadable_op(value)
+
+
+def _replace_matched(value: str, op: str, toks: list, anchor: str, rep: str,
+                     end_empty: bool = False) -> str:
+    """`_replace_op` once its pattern is read into ``toks``. ``end_empty``
+    lets any pattern match empty at the value's end (see below)."""
     if "$" not in rep and "`" not in rep:
         rep = _dequote_rep(rep)
     if not toks and not anchor:
         return value
     if all(isinstance(t, str) and len(t) == 1 for t in toks) and not anchor:
         return value.replace("".join(toks), rep, -1 if op == "//" else 1)
+    # An empty match at the value's end counts for a pattern led by `*`
+    # (bash's `match_pattern_char`): `${v/%!(x)/-}` leaves `x` as it is. Bash's
+    # matcher is not consistent here (`${v/%?(x)/-}` is `xyz-`), so with an
+    # extglob `_var_op_readings` also takes the reading where any pattern may.
+    end_ok = end_empty or not toks or toks[0] is _GLOB_STAR or (
+        isinstance(toks[0], _GlobExt) and toks[0].kind == "*")
     if anchor == "%":
-        ends = _glob_ends(toks[::-1], value[::-1], 0)
+        ends = _glob_ends(_glob_reversed(toks), value[::-1], 0)
+        if ends == [0] and not end_ok:
+            return value
         return value[:len(value) - ends[-1]] + rep if ends else value
     if len(value) ** 2 * (len(toks) + 1) > _VAR_OP_REPLACE_COST:
         return _unreadable_op(value)
     # Replaced at the longest match from the first place it matches.
-    out, i = [], 0
+    out, i, memo = [], 0, {"steps": _VAR_OP_EXT_STEPS}
     while i <= len(value):
-        ends = _glob_ends(toks, value, i)
+        ends = _glob_ends(toks, value, i, memo)
         end = ends[-1] if ends else -1
+        if end == i == len(value) and not end_ok:
+            end = -1
+        if end == i and i < len(value) and not anchor:
+            # An empty match mid-value (only an extglob makes one, `*(x)`):
+            # bash puts the replacement there and steps over one character.
+            out.append(rep + value[i])
+            i += 1
+            if op == "/":
+                break
+            continue
         if end > i or end == i and (anchor or not value):
             out.append(rep)
             # An empty match ends it, as `//` would otherwise never move.
@@ -7315,7 +7500,7 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
             if op.group(1) in _VAR_DEFAULT_OPS:
                 words = [w if w or op.group(1)[:1] != ":" else op.group(2) for w in words]
             else:
-                words = [_apply_var_op(w, op.group(1), op.group(2)) for w in words]
+                words = [_var_op_text(w, op.group(1), op.group(2)) for w in words]
         if raw:
             if state == "'":
                 return m.group(0)  # the function's shell never expands it
@@ -9267,12 +9452,18 @@ def _home_expanded(raw: str, home: str, budget: list[int]) -> str | None:
             pat, rep = word(pat), word(rep)
             if pat is None or rep is None:
                 return None
-            value = _replace_op(home, op.group(1), pat, rep)
+            got = _var_op_readings(home, op.group(1), pat, rep)
+            if len(got) > 1:
+                return None  # extglob on or off reads differently
+            value = got[0]
         else:
             arg = word(op.group(2))
             if arg is None:
                 return None
-            value = _apply_var_op(home, op.group(1), arg)
+            got = _var_op_readings(home, op.group(1), arg)
+            if len(got) > 1:
+                return None  # extglob on or off reads differently
+            value = got[0]
         out.append(value)
         pos = close + 1
     out.append(raw[pos:])
