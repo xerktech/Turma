@@ -69,6 +69,18 @@ paths:
   - Residual: past the budget, a `$1` in PROGRAM position (`f() { "$1" -rf "$2"; }`) only sees
     the union, so a program word among many calls is not read per call.
   - A 3000-statement body using `$1` called 40 times takes ~5s (main: 0.6s; the deadline is 30s and fails closed).
+- A bound parameter's operator is APPLIED (`${@/tmp/etc}`, `${1%/}`), `${!#}` is the last arg,
+  and an unset one takes its default (`${1:-/etc}` with no arg or `''`) (XERK-1641).
+  - Unset ones are also read as an ADDED per-segment reading (`_bind_positionals(seg, [None])`),
+    which covers a top-level `rm -rf "${1:-/etc}"`. Never via `_VAR_USE_RE`: a script's text is
+    substituted before it is bound, so `sh -c '…"${1:-}"' _ /etc` read the default, not `/etc`.
+  - `find -L/-H/-P/-D x/-O3` options before the roots are skipped (`_find_roots`).
+  - A shell fed by `find … {} \;` / `xargs -n1` is read once PER PATH (`$1`, or `$0` when
+    `{}` comes first), capped at `_MAX_PER_RUN` paths, ranked by `_dangerous_target` first
+    (`_per_run_operands`): by length alone a padded `//////////etc` was ranked out (QA).
+  - One reading binding `$1` to every path lost `d="$1"`, `cd "$1"` and `$0`, and false-denied
+    a direct `sh -c` with 2+ args; all paths, uncapped, false-denied ~330 roots as too large
+    (QA). Residual: past the cap, 33+ paths the guard calls dangerous are not all read per run.
 - Not covered (XERK-1655): a quoted `eval 'set -- …'`, `trap`/alias calls, `f() if/for/while/[[`
   bodies, `${1#x}`/`${!#}`/`"${@:2}"` ops applied, an eval'd single-quoted `$1`, `"$(f /etc)"`
   output, `f ${HOME:+/etc}`, `f {a,b} …` brace words, `set -- $(…)`, a `while` shifting past

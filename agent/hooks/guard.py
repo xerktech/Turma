@@ -64,6 +64,7 @@ import fnmatch
 import functools
 import hashlib
 import itertools
+import math
 import json
 import os
 import posixpath
@@ -986,6 +987,10 @@ def _body_printed(body: str, raw: tuple, multi: bool = True) -> tuple[str | None
     (`eval "$(true; echo '${x#a}')rm …"`), so dropping it lost denies."""
     before = _SPLICES_ESCAPED[0]
     resolved = _sub_substs(body, lambda m: _subst_text(m, multi=multi))
+    if "=" in resolved and "$" in resolved and _VAR_ASSIGN_RE.search(resolved):
+        # The body's own assignments are its uses' values: `$(x='rm …';
+        # echo "$x")` prints `rm …`, not `$x` (XERK-1634).
+        resolved = _substitute_vars(resolved)
     unwrapped = _unwrap_group(resolved)
     printed = _statements_printed(resolved) \
         if multi and _SEGMENT_SPLIT.search(unwrapped) else None
@@ -1709,6 +1714,7 @@ def _budgeted(fn):
         _VALUES_TAINT_N[0] = 0
         _VALUES_MOST[0] = 1
         _VALUES_ASSIGNED[0] = 1
+        _VALUE_COUNTS.clear()
         _BRACE_OTHER_SEEN[0] = False
         _MAIN_PARSE_SEEN[0] = False
         _FOR_NAMES.clear()
@@ -2146,7 +2152,7 @@ def _pattern_vars(arg: str, vals: dict[str, list[str]], keep: bool = False) -> s
             if op and op.group(1) in _VAR_DEFAULT_OPS and not keep:
                 return _pattern_vars(op.group(2), vals)
             return u.group(0) if keep else ""
-        value = _picked(got)
+        value = _picked(got, name)
         if tail in _CASE_OPS:
             return _CASE_OPS[tail](value)
         if tail.startswith("["):  # an element: read as the value
@@ -2440,6 +2446,42 @@ def _eval_named(word: str, known: dict[str, list[str]]) -> bool:
 _EVAL_ASSIGN_DEPTH = 3
 
 
+_ASSIGN_DEFAULT_RE = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*):?=")
+# `${!name}`: the variable ``name``'s value names (XERK-1634).
+_INDIRECT_RE = re.compile(r"\$\{!([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+_ALTERNATIVE_RE = re.compile(r"\$\{[A-Za-z_][A-Za-z0-9_]*:?\+")
+
+
+def _alternatives_taken(word: str) -> str:
+    """``word`` with each `${x:+alt}` / `${x+alt}` read as ``alt``: x may be
+    set (`$PATH` always is), and with no value `_substitute_vars` never takes
+    that branch (XERK-1634 comment, routes: assignment, `for`, `read <<<`)."""
+    out, last = [], 0
+    for m in _ALTERNATIVE_RE.finditer(word):
+        if m.start() < last:
+            continue
+        close = _brace_end(word, m.start())
+        if close < m.end():
+            continue
+        out += (word[last:m.start()], word[m.end():close])
+        last = close + 1
+    out.append(word[last:])
+    return "".join(out)
+
+
+def _default_readings(word: str) -> list[str]:
+    """A `${…}` word's values with a default applied (`_substitute_vars` with
+    no values) and with an alternative taken (`_alternatives_taken`)."""
+    out = [_dequote_value(_substitute_vars(word, {}))]
+    if "+" in word:
+        taken = _alternatives_taken(word)
+        if taken != word:
+            out.append(_dequote_value(_substitute_vars(taken, {})))
+    return out
+
+
 def _assigned_values(command: str, depth: int = 0,
                      env: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
     vals: dict[str, list[str]] = {}
@@ -2452,6 +2494,17 @@ def _assigned_values(command: str, depth: int = 0,
         if value.startswith("(") and value.endswith(")"):
             # An array, `a=(rm -rf *)`: its words, which `"${a[@]}"` runs.
             value = value[1:-1].strip()
+            # ...and each element on its own, which `"${a[1]}"` runs
+            # (XERK-1634); a few, as each is a reading.
+            # `([1]=w …)` names its index; the element is `w`.
+            elements = [re.sub(r"\A\[[^]]*\]\+?=", "", w.group(0))
+                        for w in _ASSIGN_WORD_RE.finditer(value) if w.group(0)]
+            # One element too, when written with its index (`([k]=w)`).
+            if elements and len(elements) <= _MAX_VALUE_READINGS // 2 and (
+                    len(elements) > 1 or elements[0] != value):
+                for element in elements:
+                    vals.setdefault(m.group(1), []).append(
+                        _produced_text(_dequote_value(element), multi=_VALUES_MULTI[0]))
         raw = value
         # Read as before XERK-1609 unless `_expand_both` is on its pass for
         # several statements (see `_body_printed`). Both in one list was no
@@ -2482,10 +2535,10 @@ def _assigned_values(command: str, depth: int = 0,
             # it; stored unapplied, `x=${y:-"rm -rf /"}; $x` spliced a word
             # nothing re-reads (XERK-1621). Added, never swapped: `y` may be
             # set after all — so kept out of `plain` below.
-            with_default = _dequote_value(_substitute_vars(raw, {}))
-            if with_default != value:
-                applied.setdefault(m.group(1), []).append(
-                    _produced_text(with_default, multi=_VALUES_MULTI[0]))
+            for with_default in _default_readings(raw):
+                if with_default != value:
+                    applied.setdefault(m.group(1), []).append(
+                        _produced_text(with_default, multi=_VALUES_MULTI[0]))
     if "printf" in command and "-v" in command:
         for seg in _split_segments(command):
             bound = _printf_v(_strip_prefixes(_tokenize(seg)))
@@ -2517,7 +2570,7 @@ def _assigned_values(command: str, depth: int = 0,
                 script = " ".join(rest)
                 scripts = {script}
                 if "$" in script:
-                    spliced = _var_sub(lambda u: _picked(known[u.group(1) or u.group(3)])
+                    spliced = _var_sub(lambda u: _picked(known[u.group(1) or u.group(3)], u.group(1) or u.group(3))
                                        if (u.group(1) or u.group(3)) in known and not u.group(2)
                                        else u.group(0), script)
                     _spend(len(spliced) - len(script))
@@ -2543,6 +2596,7 @@ def _assigned_values(command: str, depth: int = 0,
     # nine `x=${D:-…}` is nine assignments, eighteen values.
     for k, got in vals.items():
         _VALUES_MOST[0] = max(_VALUES_MOST[0], len(got) + len(applied.get(k, ())))
+        _VALUE_COUNTS[k] = max(_VALUE_COUNTS.get(k, 0), len(got) + len(applied.get(k, ())))
         _VALUES_ASSIGNED[0] = max(_VALUES_ASSIGNED[0], len(got))
     lists = _for_lists(command)
     pick = _FOR_PICK[0]
@@ -2567,7 +2621,7 @@ def _assigned_values(command: str, depth: int = 0,
         for raw_word in raw_words:
             words.append(_dequote_value(raw_word))
             if "${" in raw_word and not _MAIN_PARSE[0]:
-                words.append(_dequote_value(_substitute_vars(raw_word, {})))
+                words.extend(_default_readings(raw_word))
         if words:
             vals.setdefault(name, []).extend(words)
             _FOR_NAMES.add(name)
@@ -2591,7 +2645,7 @@ def _assigned_values(command: str, depth: int = 0,
         name = m.group(1) or m.group(3) or ""
         if name not in vals:
             return m.group(0)
-        value = _picked(plain[name] if name == owner else others.get(name, plain[name]))
+        value = _picked(plain[name] if name == owner else others.get(name, plain[name]), name)
         # Its trim too: `b=${a%% *}; "$b"` runs the first word (XERK-1651).
         op = _VAR_OP_RE.match(m.group(2) or "")
         if op and op.group(1) not in _VAR_DEFAULT_OPS:
@@ -2638,7 +2692,7 @@ def _chain_values(vals: dict[str, list[str]], applied: dict[str, list[str]],
         if name not in vals:
             return m.group(0)
         got = known[name] if name == owner or not defaults[name] else known[name] + defaults[name]
-        value = _picked(got)
+        value = _picked(got, name)
         op = _VAR_OP_RE.match(m.group(2) or "")
         if op and op.group(1) not in _VAR_DEFAULT_OPS:
             # Names in its pattern or alternative read from what is known so far.
@@ -3118,7 +3172,7 @@ def _bind_read(names: list[str], arrays: list[str], word: str,
                whole: bool) -> list[tuple[str, str]]:
     texts = [_dequote_value(word)]
     if "${" in word and not _MAIN_PARSE[0]:
-        texts.append(_dequote_value(_substitute_vars(word, {})))
+        texts.extend(_default_readings(word))
     out = []
     for text in dict.fromkeys(texts):
         produced = _produced_text(text, multi=_VALUES_MULTI[0])
@@ -3301,6 +3355,13 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
     command = _brace_glued_names(command)
     if vals is None:
         vals = _var_values(command)
+    if "${!" in command and vals:
+        # `${!a}` is the variable a's value names: `a=b; eval "${!a}"` runs
+        # $b (XERK-1634). A value that is no name is left as written.
+        def indirect(m: "re.Match[str]") -> str:
+            target = _picked(vals.get(m.group(1)) or [""], m.group(1))
+            return "${" + target + "}" if _ASSIGN_NAME_RE.fullmatch(target) else m.group(0)
+        command = _INDIRECT_RE.sub(indirect, command)
 
     states = _quote_states(command) if (vals and "$" in command) or "${" in command else []
 
@@ -3342,7 +3403,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         got = vals.get(name)
         op = _VAR_OP_RE.match(rest)
         if got:
-            value = _picked(got)
+            value = _picked(got, name)
             state = states[m.start()] if m.start() < len(states) else ""
             if state == '"' and (rest.startswith("[")
                                  or name in _FOR_NAMES
@@ -3424,7 +3485,7 @@ def _dq_default(text: str) -> str:
 def _reading() -> tuple:
     """The reading flags a body's resolution reads, as a memo key: a body
     memoised under one reading was replayed under another (XERK-1621)."""
-    return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0])
+    return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUE_PICK[0])
 
 
 # Names a `for NAME in …` sets this decision. Its words are joined as the
@@ -3449,10 +3510,12 @@ _VALUES_CHAINED = [False]
 _CHAIN_DIFFERS = [False]
 # Set while `_expand_both` reads each of a name's values on its own: which one.
 # And the most values this decision saw one name assigned (XERK-1621).
-_VALUE_PICK: list[int | None] = [None]
+_VALUE_PICK: list = [None]
 # Set while `_expand_both` reads one word of a `for` list (`_for_word_lines`):
 # the loop's name and which of that name's `for` lists it is.
 _FOR_PICK: list[tuple[str, int] | None] = [None]
+# How many values each name was assigned, for the cross passes (XERK-1634).
+_VALUE_COUNTS: dict[str, int] = {}
 _VALUES_MOST = [1]
 _VALUES_ASSIGNED = [1]
 # Set while `_expand_both` reads a `'` in a string's `${…}` as zsh and dash do,
@@ -3474,15 +3537,18 @@ _MAX_VALUE_READINGS = 16
 _MAX_VALUE_PASSES = 24
 
 
-def _picked(got: list[str]) -> str:
+def _picked(got: list[str], name: str = "") -> str:
     """A name's values as one reading splices them: all of them joined, as
     before XERK-1621, or the one `_expand_both` is on. Joined alone,
-    `x=a; x="rm -rf /"; $x` ran `a rm -rf /` — the program `a`."""
+    `x=a; x="rm -rf /"; $x` ran `a rm -rf /` — the program `a`. On a cross
+    pass (a tuple of (name, index) pairs) each name takes its own index."""
     k = _VALUE_PICK[0]
     if len(got) <= 1:
         return got[0] if got else ""
     if k is None:
         return " ".join(got)
+    if isinstance(k, tuple):
+        k = dict(k).get(name, len(got) - 1)
     return got[min(k, len(got) - 1)]
 
 
@@ -3744,10 +3810,29 @@ def _split_on_operators(command: str, include_pipe: bool = True,
     # character made a long blank pattern quadratic (XERK-1601).
     blank_n = 0
 
-    twin = ""
+    # Where a redirection's `&`/`|` may instead be an operator: (index of that
+    # one-char chunk in `buf`, the twin prefix that rebuilds the redirection).
+    cuts: list[tuple[int, str]] = []
+    twin = ""  # the stage walk's: a split redirection, rebuilt on the next piece
 
     def flush() -> None:
         nonlocal buf, blank_n, twin
+        if cuts:
+            # Each piece as split, its twin, and the whole simple command as
+            # bash reads it — a redirection may sit between a command's words
+            # (`rm -rf 2>&1 /`, `rm -rf &>/dev/null /etc`) (XERK-1631). Pieces
+            # are slices of `buf`, so a run of cuts stays linear.
+            prev = 0
+            for idx, prefix in cuts:
+                out.append("".join(buf[prev:idx]))
+                if prev and cut_prefix:
+                    out.append(cut_prefix + out[-1])
+                cut_prefix = prefix
+                prev = idx + 1
+            out.append("".join(buf[prev:]))
+            if cut_prefix:
+                out.append(cut_prefix + out[-1])
+            cuts.clear()
         out.append("".join(buf))
         if twin:
             out.append(twin + out[-1])
@@ -3947,10 +4032,9 @@ def _split_on_operators(command: str, include_pipe: bool = True,
             # operator — so read the next segment BOTH ways: as split, and with
             # the redirection rebuilt (`>&1 rm -rf /etc`) (XERK-1616).
             redirected = ch in "&|" and bool(buf) and buf[-1].endswith(("<", ">"))
-            if redirected and keep_redirects:
-                # ...except where a caller reads STAGES (the pipe-to-shell walk):
-                # there the extra segments sat between `echo … 2>&1` and `| sh`
-                # and hid the producer. An escaped `\>` is no redirection.
+            live = False
+            if redirected:
+                # An escaped `\>` is no redirection.
                 slashes, k = 0, len(buf) - 1
                 chunk = buf[k][:-1]
                 while True:
@@ -3960,10 +4044,26 @@ def _split_on_operators(command: str, include_pipe: bool = True,
                         break
                     k -= 1
                     chunk = buf[k]
-                if slashes % 2 == 0:
-                    buf.append(ch)
-                    i += 1
-                    continue
+                live = slashes % 2 == 0
+            if redirected and live and (keep_redirects or (
+                    ch == "&" and _FD_DUP_RE.match(command, i + 1))):
+                # ...except where a caller reads STAGES (the pipe-to-shell walk):
+                # there the extra segments sat between `echo … 2>&1` and `| sh`
+                # and hid the producer. Nor is a live `>&2`/`>&-` cut: split,
+                # it only names a program `2` (an expansion that printed `>`
+                # leaves `&` before a word, `x='>'; echo $x&rm …`), and a third
+                # reading of every `2>&1` tripled real decisions (XERK-1631).
+                buf.append(ch)
+                i += 1
+                continue
+            if not keep_redirects and (redirected or (ch == "&" and command.startswith("&>", i))):
+                # Both readings: split here (dash's `&>`, an escaped `\>&`, an
+                # expansion that printed `>`) and joined (see `flush`). Not for
+                # the stage walk: joined, an escaped `\>&1 | sh` fed sh.
+                buf.append(ch)
+                cuts.append((len(buf) - 1, ">" + ch if redirected else ""))
+                i += 1
+                continue
             flush()
             if redirected:
                 twin = ">" + ch
@@ -3977,6 +4077,10 @@ def _split_on_operators(command: str, include_pipe: bool = True,
         # would hide every operator after it: split as if ``groups`` were off.
         return _split_on_operators(command, include_pipe, keep_redirects)
     return [seg.strip() for seg in out if seg.strip()]
+
+
+# What follows the `&` of a `>&`/`<&` that duplicates or closes an fd.
+_FD_DUP_RE = re.compile(r"(?:[0-9]+|-)(?=[\s;&|()<>]|\Z)")
 
 
 def _split_segments(command: str) -> list[str]:
@@ -5133,7 +5237,16 @@ def _command_reads_stdin_as(stage: str, depth: int) -> bool:
         cut, replstr = _xargs_options(rest)
         inner, replace = rest[cut:], bool(replstr)
         if inner and _basename(inner[0]) in _SHELL_PROGS:
-            r2 = inner[1:]
+            # Its redirections are no words: `xargs -0 sh -c <<< '<cmd>'` has
+            # no script but the here-string (XERK-1634).
+            r2, k = [], 1
+            while k < len(inner):
+                redirect = _REDIRECT_RE.match(inner[k])
+                if redirect:
+                    k += 1 if redirect.group(1) else 2
+                else:
+                    r2.append(inner[k])
+                    k += 1
             return replace or (_shell_c_index(r2) >= 0 and not _shell_c_script(r2))
         return False
     if prog not in _SHELL_PROGS:
@@ -5147,7 +5260,25 @@ def _command_reads_stdin_as(stage: str, depth: int) -> bool:
         if (raw_toks and _basename(raw_toks[0]) == prog
                 and _shell_c_index(raw_toks[1:]) >= 0):
             script = _shell_c_script(raw_toks[1:]) or script
-        return bool(script) and _reads_stdin_script(script, depth + 1, fresh=True)
+        if not script:
+            return False
+        if _reads_stdin_script(script, depth + 1, fresh=True):
+            return True
+        # ...and a program word the script names through its own variables, a
+        # glob or an alias, read as a heredoc owner's is: `sh -c 'x=bash; $x'`
+        # (XERK-1638).
+        if "$" in script or "alias" in script or _GLOB_CHARS.search(script):
+            defined = _defined_names(script)
+            # Only a stage whose program word may not be literal: the script
+            # itself was read above, and re-reading every stage of a long one
+            # per pipeline stage tripled real decisions.
+            stages = [st for st in _split_segments(script)
+                      if defined or _NONLITERAL_PROG_RE.match(st)]
+            if stages:
+                vals = _var_values(script)
+                return any(_stage_may_read_stdin(st, vals, defined, checked=True)
+                           for st in stages)
+        return False
     if prog == "su":
         return True  # its operands name a USER; without `-c` the shell reads stdin
     i = 0
@@ -5277,13 +5408,26 @@ def _shell_c_index(rest: list[str]) -> int:
 def _shell_c_script(rest: list[str]) -> str | None:
     """The script a shell's `-c` runs, or None. Bash takes (and drops) a `--`
     after `-c`, so `bash -c -- '<cmd>'` runs <cmd>, not `--` (XERK-1611)."""
+    i = _shell_c_script_index(rest)
+    return rest[i] if 0 <= i < len(rest) else None
+
+
+def _shell_c_script_index(rest: list[str]) -> int:
+    """Where `_shell_c_script`'s script sits in ``rest`` (maybe past its end),
+    or -1. The script is the first operand after `-c`, so options between
+    them are skipped: `bash -c -e '<cmd>'`, `bash -c -o errexit '<cmd>'`
+    (XERK-1641)."""
     i = _shell_c_index(rest)
     if i < 0:
-        return None
+        return -1
     i += 1
-    if i < len(rest) and rest[i] == "--":
-        i += 1
-    return rest[i] if i < len(rest) else None
+    while i < len(rest) and rest[i][:1] in "-+" and len(rest[i]) > 1:
+        if rest[i] == "--":
+            return i + 1
+        tok = rest[i]
+        i += 2 if (tok in _SHELL_OPTS_WITH_VALUE or (
+            tok[1] != "-" and tok[-1] in "oO")) else 1
+    return i
 
 
 def _raw_shell_c_scripts(kept: list[str], depth: int = 0) -> list[str]:
@@ -5335,10 +5479,35 @@ def _kept_subst_text(m: "re.Match[str]") -> str:
                 m.group(0))
 
 
+# How many paths a find/xargs-fed shell is read with one per run. Past it the
+# most dangerous-looking ones are kept: an absolute path, shortest first.
+_MAX_PER_RUN = 32
+
+
+def _per_run_operands(operands: list[str]) -> list[str]:
+    """The operands a shell fed one path per run is read with (XERK-1636).
+    Each run is an expansion of its own, so all of several hundred paths
+    false-denied as too large (XERK-1641 QA); one reading binding `$1` to
+    every path lost `d="$1"`, `cd "$1"` and `$0`."""
+    unique = list(dict.fromkeys(operands))
+    if len(unique) <= _MAX_PER_RUN:
+        return unique
+    # Ranked by the guard's own danger test first: by length alone, a padded
+    # spelling of a protected path was ranked out (XERK-1641 QA).
+    return sorted(unique, key=lambda o: (_dangerous_target(o) is None,
+                                         not o.startswith(("/", "~")), len(o)))[:_MAX_PER_RUN]
+
+
 def _find_roots(tokens: list[str]) -> list[str]:
     """The paths a `find` invocation walks (its operands before any predicate)."""
     roots = []
-    for tok in tokens[1:]:
+    # GNU find's own options come first: `-H`/`-L`/`-P`, `-D <opts>`, `-O<n>`
+    # (`find -L / -delete` walks `/`, XERK-1636).
+    i = 1
+    while i < len(tokens) and (tokens[i] in ("-H", "-L", "-P", "-D")
+                               or re.fullmatch(r"-O\d*", tokens[i])):
+        i += 2 if tokens[i] == "-D" else 1
+    for tok in tokens[i:]:
         if tok.startswith("-") or tok in ("(", ")", "!"):
             break
         roots.append(tok)
@@ -5451,6 +5620,13 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, tuple
 def _expand_readings(command: str) -> list[tuple[list[str], str]]:
     """`_expand_both` for one line: the readings its values and quoting need."""
     out = _expand_picks(command)
+    assigned = _default_assignments(command)
+    if assigned:
+        # `${x:=word}` assigns word to an unset x, which a later `$x` runs:
+        # `: ${x:='rm …'}; eval "$x"` (XERK-1634). An ADDED reading with each
+        # one written out as an assignment first; folded into the values, it
+        # shadowed the default at the `${…}` itself and the name's own value.
+        out = out + _expand_picks(assigned + command)
     if _BRACE_OTHER_SEEN[0]:
         _BRACE_OTHER_SHELL[0] = True
         try:
@@ -5474,6 +5650,25 @@ def _expand_readings(command: str) -> list[tuple[list[str], str]]:
     return out
 
 
+def _default_assignments(command: str) -> str:
+    """Each `${x:=word}` / `${x=word}` on the line as `x=word` statements."""
+    if "=" not in command or "${" not in command:
+        return ""
+    out = []
+    for m in _ASSIGN_DEFAULT_RE.finditer(command):
+        close = _brace_end(command, m.start())
+        if close > m.end():
+            out.append(f"{m.group(1)}={command[m.end():close]}\n")
+    _spend(sum(map(len, out)))
+    return "".join(out)
+
+
+# The most name × value combinations `_expand_picks` reads, and a use of a
+# name in program position (or eval'd) that makes them worth reading.
+_MAX_CROSS_PASSES = 8
+_PROGRAM_USE = r"(?:^|[;&|\n(){{}}`]|\b(?:then|do|else|eval|exec|command))[ \t\"']*\$\{{?{}\b"
+
+
 def _expand_picks(command: str) -> list[tuple[list[str], str]]:
     """`_expand_values`, and once per value of a name assigned more than once
     (see `_expand_both`)."""
@@ -5493,6 +5688,23 @@ def _expand_picks(command: str) -> list[tuple[list[str], str]]:
             out = out + _expand_values(command)
         finally:
             _VALUE_PICK[0] = None
+    # Same-index passes pair every name's k-th value, so `c='rm …'; p=true;
+    # p=bash; $p -c "$c"; c=ls` never read `bash` with `rm …`. Each name's
+    # values against the others' too, while the combinations fit the pass cap
+    # (XERK-1634); past it, the same-index passes above are all there is.
+    # Only where a value can be a PROGRAM (`$p -c "$c"`, `eval "$p …"`): every
+    # extra pass is a whole-line expansion, and 23 of them timed real lines out.
+    multi = sorted((n, c) for n, c in _VALUE_COUNTS.items() if c > 1)
+    if (len(multi) > 1 and math.prod(c for _, c in multi) <= _MAX_CROSS_PASSES
+            and any(re.search(_PROGRAM_USE.format(re.escape(n)), command) for n, _ in multi)):
+        for combo in itertools.product(*(range(c) for _, c in multi)):
+            if len(set(combo)) == 1:
+                continue  # a same-index pass already read it
+            _VALUE_PICK[0] = tuple(zip((n for n, _ in multi), combo))
+            try:
+                out = out + _expand_values(command)
+            finally:
+                _VALUE_PICK[0] = None
     return out
 
 
@@ -5631,12 +5843,89 @@ _FUNC_NAME_RE = re.compile(
 _ALIAS_RE = re.compile(r"(?<![\w.-])alias([^;&|\n]*)")
 
 
+# Ways to make ANY program name run something else, which no name check can
+# follow: `hash -p /bin/bash cat`, `BASH_ALIASES[b]=bash`, `BASH_CMDS[…]`, and a
+# `command_not_found_handle` an unknown name runs (XERK-1638).
+_REBIND_RE = re.compile(r"(?<![\w.-])hash[ \t]+(?:-\w+[ \t]+)*-\w*p|BASH_ALIASES|BASH_CMDS"
+                        r"|command_not_found_handle")
+# In `_defined_names`: every name may be rebound.
+_ANY_NAME = "\x00turma-any-name"
+
+
 def _defined_names(command: str) -> frozenset[str]:
-    """Names ``command`` defines as a function or alias, which can run a shell."""
-    names = {a or b for a, b in _FUNC_NAME_RE.findall(command)}
-    for words in _ALIAS_RE.findall(command):
-        names.update(w.split("=", 1)[0].strip("'\"") for w in words.split() if "=" in w)
+    """Names ``command`` defines as a function or alias, which can run a shell.
+    Also read with quotes and escapes dropped, as an `eval` joins them:
+    `eval "ali""as b=bash"` defines `b` (XERK-1638)."""
+    names: set[str] = set()
+    joined = re.sub(r"[\\'\"]", "", command)
+    for text in dict.fromkeys((command, joined)):
+        names.update(a or b for a, b in _FUNC_NAME_RE.findall(text))
+        for words in _ALIAS_RE.findall(text):
+            names.update(w.split("=", 1)[0].strip("'\"") for w in words.split() if "=" in w)
+        if _REBIND_RE.search(text):
+            names.add(_ANY_NAME)
     return frozenset(n.lower() for n in names)
+
+
+# Off while the line is read with its aliases replaced: `alias ls='ls -l'`
+# would otherwise replace itself once per nesting level until "too deep".
+_ALIASES_ON = [True]
+# Chain hops followed when replacing alias uses.
+_ALIAS_HOPS = 3
+# A use of the alias NAME as a whole word anywhere: a list of command
+# positions kept missing one (`if`, `!`, `coproc`, a leading assignment, a
+# value ending in a blank) (XERK-1641 QA). An argument replaced too only adds
+# a reading; the definition's own `b=` is no use.
+_ALIAS_USE_RE = r"(^|(?<=[^\w./=$-])){}(?![\w./=-])"
+
+
+def _aliased_readings(command: str) -> list[str]:
+    """``command`` with each alias it defines replaced by its value at every
+    use, once with each name's first value and once with its last, chains
+    followed a few hops."""
+    aliases = _alias_values(command)
+    out = []
+    most = max((len(v) for v in aliases.values()), default=0)
+    # Each name's first and last definition: every one was a whole-line
+    # reading apiece, and ten redefinitions of a name used 3000 times timed out.
+    for k in sorted({0, most - 1}) if most else ():
+        text = command
+        for _ in range(_ALIAS_HOPS):
+            before = text
+            for name, values in aliases.items():
+                value = values[min(k, len(values) - 1)]
+                text = re.sub(_ALIAS_USE_RE.format(re.escape(name)),
+                              lambda m: m.group(1) + value, text)
+            _spend(len(text) - len(before))
+            if text == before:
+                break
+        if text != command and text not in out:
+            out.append(text)
+    return out
+
+
+_ALIAS_NAME_RE = re.compile(r"[^\s/$`=\'\"\\(){}<>|&;]+")
+
+
+def _alias_values(command: str) -> dict[str, list[str]]:
+    """Each alias ``command`` defines, mapped to its values (dequoted)."""
+    out: dict[str, list[str]] = {}
+    for words in _ALIAS_RE.findall(command):
+        if not words[:1].isspace():
+            continue  # `alias={…}` in a script's text is no definition
+        try:
+            toks = shlex.split(words)
+        except ValueError:
+            toks = words.split()
+        for w in toks:
+            if "=" in w:
+                name, value = w.split("=", 1)
+                # A name bash accepts; an empty one matched every word.
+                if not _ALIAS_NAME_RE.fullmatch(name):
+                    continue
+                if value and value not in out.get(name, ()):
+                    out.setdefault(name, []).append(value)
+    return out
 
 
 def _function_bodies(command: str) -> dict[str, str]:
@@ -5680,7 +5969,10 @@ def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
     resolves to something else: `$b` this line assigns is resolved, while an
     unset `$x`, `$SHELL`, a substitution or `$'bas\\x68'` may be any program.
     A glob matching a shell's name (`/bin/ba?h`) and a function or alias the
-    line defines (`f() { bash; }`) may be one too."""
+    line defines (`f() { bash; }`) may be one too, and any name at all on a
+    line that rebinds names (`hash -p`, `BASH_ALIASES`, XERK-1638)."""
+    if _ANY_NAME in defined:
+        return True
     if "`0`" in word:
         # A silent substitution prints nothing — unless `:`/`true`/`false`
         # are redefined on the line — so `cat$(:)` runs `cat`.
@@ -5695,7 +5987,8 @@ def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
         # `_ungrouped` cuts at the first `}`, even a `${x}`'s: close it again.
         if word.count("${") > word.count("}"):
             word += "}"
-        word = _substitute_vars(word, vals)
+        # An unset positional takes its default: `ba${@:-zz}sh` is `bazzsh`.
+        word = _substitute_vars(_bind_positionals(word, [None]), vals)
         # Unresolved, or empty (the program shifts to the next word: `$x bash`).
         if "$" in word or "`" in word or not word.split():
             return True
@@ -5719,11 +6012,17 @@ def _owner_word_may_be_shell(word: str, vals: dict[str, list[str]],
     return any(fnmatch.fnmatchcase(shell, pattern) for shell in _SCRIPT_READERS)
 
 
+# A program word that may not be literal: an expansion, a glob, a substitution.
+_NONLITERAL_RE = re.compile(r"[$`*?\[]")
+_NONLITERAL_PROG_RE = re.compile(r"[\s({!]*(?:[A-Za-z_]\w*=\S*\s+)*[^\s;|&]*[$`*?\[]")
+
+
 def _stage_may_read_stdin(stage: str, vals: dict[str, list[str]],
-                          defined: frozenset[str]) -> bool:
+                          defined: frozenset[str], checked: bool = False) -> bool:
     """`_reads_stdin_grouped`, with the program word read as
-    `_owner_word_may_be_shell` reads it: `cat <<EOF | $S` (XERK-1624)."""
-    if _reads_stdin_grouped(stage):
+    `_owner_word_may_be_shell` reads it: `cat <<EOF | $S` (XERK-1624).
+    ``checked``: the caller already asked `_reads_stdin_script`."""
+    if not checked and _reads_stdin_grouped(stage):
         return True
     stage = _owner_substs(stage)
     for reading in dict.fromkeys((stage.strip(), *_ungrouped(stage))):  # `| {f`, as above
@@ -5851,8 +6150,10 @@ _ESCAPED_PARAM_RE = re.compile(r"(?<!\\)\\\$(?=[{A-Za-z_@*0-9!])")
 
 # `$1`, `${12}`, `$@`, `${*}` — a shell's positional parameters — and their
 # operator forms (`${1:-x}`, `${@:2}`, `${1%/}`, `${1:-"$x"}`), read as the whole value.
+# `${!#}` is the last one.
 _POSITIONAL_RE = re.compile(
-    r"\$(?:\{([0-9]+|[@*])(?:[^{}'\"`$]|\$\{[^{}]*\}|\$\w|\"[^\"]*\"|'[^']*')*\}|([0-9@*]))")
+    r"\$(?:\{([0-9]+|[@*])(?:[^{}'\"`$]|\$\{[^{}]*\}|\$\w|\"[^\"]*\"|'[^']*')*\}|([0-9@*])"
+    r"|\{(!#)\})")
 # `for p; do` / `for p do` loops over "$@".
 _IMPLICIT_FOR_RE = re.compile(r"\bfor([ \t]+[A-Za-z_]\w*)(?=[ \t]*(?:;|\n|(do\b)))")
 # A `shift` moves every positional down; this many shifts are read.
@@ -5893,16 +6194,29 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
     def rep(m: "re.Match[str]") -> str:
         if not _live_dollar(script, m.start()):
             return m.group(0)
-        name = m.group(1) or m.group(2)
+        name = m.group(1) or m.group(2) or m.group(3)
         state = states[m.start()] if m.start() < len(states) else ""
-        if name in ("@", "*") or every and name != "0":
+        # The operator applied, as bash does (XERK-1636): `${@/tmp/etc}`,
+        # and `${1:-/etc}` with `$1` unset or empty is `/etc`.
+        op = _VAR_OP_RE.match(m.group(0)[2 + len(name):-1]) if m.group(1) else None
+        if name == "!#":
+            words = [args[-1]] if args[-1] is not None else []
+        elif name in ("@", "*") or every and name != "0":
             if len(args) < 2:
-                return m.group(0)
+                return m.group(0) if not op or op.group(1) not in _VAR_DEFAULT_OPS \
+                    else op.group(2)
             words = args[1:]
         elif int(name) < len(args) and args[int(name)] is not None:
             words = [args[int(name)]]
+        elif op and op.group(1) in _VAR_DEFAULT_OPS:
+            return op.group(2)
         else:
             return m.group(0)
+        if op and not raw:
+            if op.group(1) in _VAR_DEFAULT_OPS:
+                words = [w if w or op.group(1)[:1] != ":" else op.group(2) for w in words]
+            else:
+                words = [_apply_var_op(w, op.group(1), op.group(2)) for w in words]
         if raw:
             if state == "'":
                 return m.group(0)  # the function's shell never expands it
@@ -6287,6 +6601,131 @@ def _positional_readings(text: str) -> list[str]:
     return out
 
 
+def _stdout_targets(tokens: list[str]) -> tuple[list[str], list[str]]:
+    """``tokens`` split into its words and the files its stdout is written to
+    (`> f`, `>>f`, `&>f`, `>|f`); other redirections are dropped."""
+    words: list[str] = []
+    outs: list[str] = []
+    i = 0
+    while i < len(tokens):
+        m = _REDIR_WORD.match(tokens[i])
+        if not m:
+            words.append(tokens[i])
+            i += 1
+            continue
+        target = tokens[i][m.end():]
+        if not target and i + 1 < len(tokens):
+            i += 1
+            target = tokens[i]
+        i += 1
+        if m.group(2) in (">", ">>", ">|") and m.group(1) in ("", "1", "&"):
+            outs.append(posixpath.normpath(target))
+    return words, outs
+
+
+def _written_scripts(segments: list[str],
+                     heredocs: list[tuple[str, str, bool]]) -> dict[str, list[str]]:
+    """Text the line writes to a file: a printer's output redirected (`echo …
+    > f`) and a heredoc `cat`/`tee` writes (`cat > f <<EOF`), by path. A
+    later `sh f` / `. f` runs it as a script (XERK-1555)."""
+    written: dict[str, list[str]] = {}
+    for pipeline in segments:
+        # ...and what a `tee f` stage is fed: `echo … | tee f` (XERK-1641 QA).
+        fed: str | None = None
+        for stage in _split_on_operators(pipeline, groups=True):
+            words, outs = _stdout_targets(_strip_prefixes(_tokenize(stage)))
+            prog = _basename(words[0]) if words else ""
+            text = _printed_from_tokens(words) if words else None
+            if stage.lstrip()[:1] in ("{", "("):
+                # A group prints what ALL its statements print. Its first-word
+                # reading is not that: `_strip_prefixes` drops the `{`.
+                core = _group_core(stage)
+                text = _statements_printed(_unwrap_group(core if core else stage)) or None
+            elif prog in _PASS_THROUGH and prog != "tee" and len(words) == 1 and fed:
+                text = fed  # `… | cat > f` relays what it is fed
+            if prog == "tee":
+                # ...and a `tee f <<< '…'` writes its here-string.
+                fed = next(iter(_herestrings(stage)), None) or fed
+            if prog == "tee" and fed:
+                outs = outs + [posixpath.normpath(w) for w in words[1:] if not w.startswith("-")]
+                text = fed
+            for path in outs if text else ():
+                written.setdefault(path, []).append(text)
+            fed = text if text else (fed if prog in _PASS_THROUGH else None)
+    for owner, body, _quoted in heredocs:
+        for seg in _split_segments(owner):
+            if "<<" not in seg:
+                continue
+            words, outs = _stdout_targets(_strip_prefixes(_tokenize(seg)))
+            if words and _basename(words[0]) == "tee":
+                outs += [posixpath.normpath(w) for w in words[1:] if not w.startswith("-")]
+            if words and _basename(words[0]) in ("cat", "tee"):
+                for path in outs:
+                    written.setdefault(path, []).append(body)
+    return written
+
+
+# Distinct argument lists one written file is read with, per line.
+_MAX_SCRIPT_RUNS = 8
+
+
+def _script_file_readings(path: str, args: tuple[str, ...], written: dict[str, list[str]],
+                          runs_seen: dict[str, set[tuple[str, ...]]]) -> list[str]:
+    """The texts a run of written file ``path`` with ``args`` adds: the
+    unbound text on its first run, and per DISTINCT argument list the text
+    bound as a `sh -c` script is (its own `set --`/`shift` applied). Once per
+    line, the second run's arguments were never read; per run, N writes and N
+    runs were quadratic; bound alone, the script's own `set --` was lost
+    (XERK-1641 QA). Past `_MAX_SCRIPT_RUNS` lists, one reading binds every
+    parameter to every argument seen."""
+    runs = runs_seen.setdefault(path, set())
+    if args in runs or len(runs) > _MAX_SCRIPT_RUNS:
+        return []
+    first = not runs
+    runs.add(args)
+    out: list[str] = []
+    for text in written.get(path, ()):
+        scripts = _script_readings(text)
+        if len(runs) > _MAX_SCRIPT_RUNS:
+            every = [a for r in runs for a in r]
+            out += [_bind_positionals(sc, [path, *every], every=True) for sc in scripts]
+            continue
+        if first:
+            out += scripts
+        if args:
+            argv = [path, *args]
+            bound = [r for sc in scripts for r in _positional_readings(sc)]
+            out += [b for b in dict.fromkeys(_bind_positionals(sc, a) for sc in (*scripts, *bound)
+                                             for a in _shifted(argv, sc))
+                    if b not in scripts]
+    return out
+
+
+def _script_file(prog: str, rest: list[str]) -> str | None:
+    """The script file a shell (no `-c`) or `source`/`.` runs, normalised; a
+    shell with no file operand reads the file redirected to its stdin."""
+    words, _ = _stdout_targets(rest)
+    if prog in ("source", "."):
+        return posixpath.normpath(words[0]) if words else None
+    if _shell_c_index(words) >= 0:
+        return None
+    i = 0
+    while i < len(words) and words[i][:1] in "-+" and len(words[i]) > 1:
+        if words[i] == "--":
+            i += 1
+            break
+        i += 2 if words[i] in _SHELL_OPTS_WITH_VALUE else 1
+    if i < len(words):
+        return posixpath.normpath(words[i])
+    for k, tok in enumerate(rest):
+        if tok in ("<", "0<") and k + 1 < len(rest):
+            return posixpath.normpath(rest[k + 1])
+        m = re.match(r"0?<([^<&(>].*)", tok)
+        if m:
+            return posixpath.normpath(m.group(1))
+    return None
+
+
 def _expand_segments(command: str, depth: int = 0,
                      cwds: tuple[str, ...] = ()) -> list[tuple[list[str], str]]:
     """`_expand`, reporting a spent growth budget as `_TOO_LARGE`."""
@@ -6362,6 +6801,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # Functions and aliases the line defines, which may run a shell (XERK-1624).
     defined_names: list[frozenset[str]] = []
 
+    def _defined() -> frozenset[str]:
+        if not defined_names:
+            defined_names.append(_defined_names(raw_commands))
+        return defined_names[0]
+
     def _commands_feed_shell() -> bool:
         if not line_feeds_shell:
             # Quotes, escapes and line continuations joined: bash runs `bas''h`,
@@ -6385,12 +6829,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # and reached only when the cheap head check below misses, so a
             # `bash <<EOF` owner never pays for this scan.
             if owner not in owner_pipes_to_shell:
-                if not defined_names:
-                    defined_names.append(_defined_names(raw_commands))
                 owner_pipes_to_shell[owner] = _heredoc_owner_feeds_shell(
                     owner, _commands_feed_shell,
-                    lambda w: _owner_word_may_be_shell(w, raw_vals, defined_names[0]),
-                    lambda st: _stage_may_read_stdin(st, raw_vals, defined_names[0]))
+                    lambda w: _owner_word_may_be_shell(w, raw_vals, _defined()),
+                    lambda st: _stage_may_read_stdin(st, raw_vals, _defined()))
             return owner_pipes_to_shell[owner]
         if (owner_tokens and _basename(owner_tokens[0]) in _SCRIPT_READERS
                 or _owner_feeds_shell()):
@@ -6517,6 +6959,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         for tok in _tokenize(raw):
             if not tok.startswith("-") and ("/" in tok or tok in ("~", ".", "..")):
                 piped_operands.append(tok)
+    # Once each: a segment read several ways (a redirect joined and split,
+    # XERK-1631) repeats its words.
+    piped_operands = list(dict.fromkeys(piped_operands))
     piped_chars = sum(len(t) + 1 for t in piped_operands)
     # A shell that reads its SCRIPT from stdin runs whatever the pipeline,
     # a here-string or a `<(…)` feeds it — `echo '<cmd>' | sh`, `sh <<< '<cmd>'`,
@@ -6615,7 +7060,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                             for script in _script_readings(text):
                                 out.extend(_expand_segments(script, depth + 1, every_cd))
             # Named as bash forms it before the group is unwrapped (XERK-1629).
-            if any(_reads_stdin_script(_unwrap_group(t)) for t in _name_readings(stage)):
+            # ...and a program word that is not literal read as the heredoc
+            # owner's is: `| $SHELL`, `| /bin/ba?h`, an alias (XERK-1632).
+            if any(_reads_stdin_script(_unwrap_group(t)) for t in _name_readings(stage)) \
+                    or ((_defined() or _NONLITERAL_RE.search(stage))
+                        and _stage_may_read_stdin(stage, raw_vals, _defined(), checked=True)):
                 fed = list(producers)
                 fed.extend(_herestrings(ustage))
                 for m in _find_substs(ustage):
@@ -6642,6 +7091,25 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                         seg, lambda m: _subst_text(m, glued_empty=True))) or "")
                 for hs in _herestrings(seg):
                     _feed(hs)
+    if _ALIASES_ON[0] and "alias" in raw_commands:
+        # An alias runs its VALUE with the use's words after it: `alias
+        # b='bash -c'; b '<cmd>'`, through a chain, an `eval "b …"` or a pipe
+        # (XERK-1641 QA). Read as ONE added reading of the line per value
+        # index, every use replaced; per use it was (definitions × uses).
+        for aliased in _aliased_readings(raw_commands):
+            _spend(len(aliased))
+            _ALIASES_ON[0] = False
+            try:
+                out.extend(_expand_segments(aliased, depth + 1, cwds))
+            finally:
+                _ALIASES_ON[0] = True
+    # Files the line writes text into, which a later `sh f` runs (XERK-1555).
+    runs_seen: dict[str, set[tuple[str, ...]]] = {}
+    # Computed on the first segment that runs a script FILE: per `_expand`
+    # call it re-split every line holding `>` and "sh" (most of them).
+    written: dict[str, list[str]] | None = None if (
+        (">" in command or "tee" in command)
+        and ("sh" in command or "." in command or "source" in command)) else {}
     for raw in segments:
         if every_cd != cwds:
             cwds = _cd_readings(raw, cwds)
@@ -6691,6 +7159,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             *(_unwrap_group(t) for t in _taint_readings(raw, _taint_subst)),
         }
         readings.update(_unset_readings(seg))
+        if "${" in seg:
+            # Positionals no binding reached are unset, so an operator's
+            # default is the word: `rm -rf "${1:-/etc}"` (XERK-1636). Added
+            # beside the bound readings, which see the text unapplied.
+            readings.add(_unwrap_group(_bind_positionals(seg, [None])))
         readings.update(_decoy_readings(raw))
         for reading in readings - {seg, bare, ""}:
             out.extend(_expand_segments(reading, depth + 1, cwds))
@@ -6749,19 +7222,35 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
+        # The file a shell or `.` runs, or one run by its path (`./s.sh`).
+        script_path = (_script_file(prog, rest) if prog in _SHELL_PROGS or prog in ("source", ".")
+                       else posixpath.normpath(tokens[0]) if "/" in tokens[0] else None)
+        if (written is None or written) and script_path:
+            if written is None:
+                written = _written_scripts(
+                    _split_on_operators(command, include_pipe=False, groups=True), heredocs)
+            words = _stdout_targets(tokens)[0]
+            at = next((k for k, w in enumerate(words) if k and posixpath.normpath(w) == script_path),
+                      0 if words and posixpath.normpath(words[0]) == script_path else -1)
+            args = tuple(words[at + 1:] if at >= 0 else ())
+            for script in _script_file_readings(script_path, args, written, runs_seen):
+                out.extend(_expand_segments(script, depth + 1, every_cd))
         if prog in ("rm", "unlink", "chmod", "chown"):
             # `cd /; rm -rf *` deletes `/*`, which `rm` alone never names.
             for cwd in cwds:
                 joined = [_under_cwd(t, cwd) for t in rest]
                 if joined != rest:
                     out.append(([tokens[0], *joined], seg, False, cwd))
-        if prog in _SHELL_PROGS:
+        # A shell named through `$SHELL`, an unset `$x`, a glob or an alias /
+        # function the line defines may run its `-c` script too (XERK-1632).
+        if prog in _SHELL_PROGS or (
+                prog not in _SCRIPT_READERS and _shell_c_index(rest) >= 0
+                and _owner_word_may_be_shell(tokens[0], raw_vals, _defined())):
             script = _shell_c_script(rest)
             if script is not None:
                 scripts = _script_readings(script)
                 # ...and again with its arguments bound, where it reads them.
-                j = _shell_c_index(rest) + 1
-                args = rest[j + 1 + (rest[j] == "--"):]
+                args = rest[_shell_c_script_index(rest) + 1:]
                 # Each function call and `set` in it bound first (XERK-1626), so
                 # `f() { rm -rf "$1"; }; f "$2"` reads `rm -rf "$2"`, then `/etc`.
                 bound = [r for sc in scripts for r in _positional_readings(sc)]
@@ -6898,9 +7387,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 argvs = [_strip_prefixes(expanded + piped_operands)]
                 # A replace-string embedded in an argument becomes ONE operand
                 # per run, so each operand is a run of its own.
-                if replstr and any(replstr in t and t != replstr for t in inner):
-                    for operand in piped_operands:
-                        run = [t.replace(replstr, operand) for t in inner]
+                # ...and so is each operand fed to a shell, whose `$1` is one
+                # path per run under `-n1`/`-L1` (XERK-1636), a few of them.
+                shell_run = (len(piped_operands) > 1 and argvs[0]
+                             and _basename(argvs[0][0]) in _SHELL_PROGS)
+                if (replstr and any(replstr in t and t != replstr for t in inner)) or shell_run:
+                    for operand in (_per_run_operands(piped_operands) if shell_run and not replstr
+                                    else piped_operands):
+                        run = ([t.replace(replstr, operand) for t in inner] if replstr
+                               else [*inner, operand])
                         _spend(sum(len(t) + 1 for t in run))
                         argvs.append(_strip_prefixes(run))
                 for argv in argvs:
@@ -6944,8 +7439,14 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     # GNU find replaces a `{}` INSIDE an argument too —
                     # `-exec sh -c 'rm -rf {}' \;` — with one path per run
                     # (XERK-1600), so each root is a run of its own.
-                    if any("{}" in t and t != "{}" for t in toks):
-                        for root in roots:
+                    # ...and so does a `{}` handed to a shell, whose `$1` (or
+                    # `$0`) is one root per run under `\;` (XERK-1636).
+                    lead = _strip_prefixes(run)[:1]
+                    shell_run = (len(roots) > 1 and "{}" in toks and lead
+                                 and _basename(lead[0]) in _SHELL_PROGS)
+                    if any("{}" in t and t != "{}" for t in toks) or shell_run:
+                        for root in (_per_run_operands(roots) if shell_run
+                                     and not any("{}" in t and t != "{}" for t in toks) else roots):
                             runs.append([t.replace("{}", root) for t in toks])
                             _spend(sum(len(t) + 1 for t in runs[-1]))
                     for run in filter(None, runs):

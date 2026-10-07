@@ -2303,6 +2303,133 @@ class TestScriptChannels(unittest.TestCase):
         # An ODD run escapes the `>`: the `&` backgrounds echo, and sh reads nothing.
         self.assertAllowed(f"echo '{R} #' {B16}\\>&1 | sh")
 
+    def test_xerk_1641_remaining_bypasses(self):
+        # XERK-1641: redirects between a command's words, shells named through
+        # `$SHELL`/globs/aliases, options after `-c`, name rebinds, positional
+        # operators, find/xargs one path per run, and values set by arrays,
+        # `:=`, `:+`, `${!a}`, a substitution's own assignments, and text
+        # written to a file a later `sh f` runs.
+        R = self.R
+        P = "rm -rf /etc"
+        for cmd in ("rm -rf 2>&1 /", "rm -rf >&2 /etc", "rm -rf &>/dev/null /etc",
+                    f"$SHELL -c '{R}'", f"$x -c '{R}'", f"/bin/ba?h -c '{R}'",
+                    f"echo '{R}' | $SHELL", f"echo '{R}' | /bin/ba?h",
+                    f"alias b=bash; b -c '{R}'", f"bash -c -e '{R}'",
+                    f"bash -c -o errexit '{R}'",
+                    f"hash -p /bin/bash cat; cat <<EOF\n{R}\nEOF",
+                    f"command_not_found_handle() {{ bash; }}\nnosuchprog <<EOF\n{R}\nEOF",
+                    f"BASH_ALIASES[b]=bash\nb <<EOF\n{R}\nEOF",
+                    f'eval "ali""as b=bash"\nb <<EOF\n{R}\nEOF',
+                    f"cat <<EOF | sh -c 'x=bash; $x'\n{R}\nEOF",
+                    "rm -rf \"${1:-/etc}\"", "sh -c 'rm -rf \"${1:-/etc}\"' _",
+                    "sh -c 'rm -rf \"${1:-/etc}\"' _ ''", "sh -c 'rm -rf \"${@/tmp/etc}\"' _ /tmp",
+                    "sh -c 'rm -rf \"${!#}\"' _ /etc",
+                    "find /tmp /etc -maxdepth 0 -exec sh -c 'rm -rf \"$1\"' _ {} \\;",
+                    "printf '%s\\n' /tmp /etc | xargs -n1 sh -c 'rm -rf \"$1\"' _",
+                    "find -L / -delete", "find -H /etc -exec rm -rf {} +",
+                    f'xargs -0 sh -c <<< "{P}"',
+                    f'x=(a "{P}"); eval "${{x[1]}}"', f'unset x; : ${{x:="{P}"}}; eval "$x"',
+                    f'a=x; b="{P}"; a=b; eval "${{!a}}"',
+                    f'y=$(x=a; x="{P}"; echo "$x"); eval "$y"',
+                    f'c="{P}"; p=true; p=bash; $p -c "$c"; c=ls',
+                    f'for v in "${{PATH:+$(echo {P})}}"; do $v; done',
+                    f'read -r a <<< "${{PATH:+$(echo {P})}}"; $a',
+                    f"echo '{P}' > /tmp/x.sh; sh /tmp/x.sh", f"echo '{P}' > /tmp/x.sh; . /tmp/x.sh",
+                    f"cat > /tmp/y.sh <<'E'\n{P}\nE\nbash /tmp/y.sh",
+                    # QA variants: an alias carrying `-c`, an indexed array, tee writers.
+                    f"alias b='bash -c'; b '{P}'", f'x=([0]=a [1]="{P}"); eval "${{x[1]}}"',
+                    f"echo '{P}' | tee /tmp/x.sh; sh /tmp/x.sh",
+                    f"tee /tmp/x.sh <<'E'\n{P}\nE\nsh /tmp/x.sh",
+                    "rm -rf 3>&1 1>&2 2>&3 /etc", "find -D tree /etc -delete",
+                    "printf '%s\\0' a /etc | xargs -0 -n 1 sh -c 'rm -rf \"$1\"' _"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("ls 2>&1 /tmp", "make &>/dev/null all", "$SHELL -c 'ls'",
+                    "alias b=bash; b -c 'echo hi'", "bash -c -e 'make test'",
+                    "sh -c 'echo \"${1:-x}\"' _", "find -L . -name '*.py'",
+                    "x=(a b); echo \"${x[1]}\"", "a=b; b=1; echo \"${!a}\"",
+                    "echo hi > /tmp/z.sh; sh /tmp/z.sh", "echo 'ls' | $SHELL",
+                    "alias ll='ls -la'; ll /etc", "echo hi | tee /tmp/z.sh; sh /tmp/z.sh",
+                    "find /tmp/a /tmp/b -exec sh -c 'echo \"$1\"' _ {} \\;"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # Delta-QA shapes: a find/xargs-fed shell read one path per run, where
+        # `$1` is assigned, `cd`'d into or is `$0`; aliases through a chain,
+        # `eval` or a pipe; indexed arrays; tee fed a here-string or a group.
+        for cmd in (
+                "find /tmp /etc -maxdepth 0 -exec sh -c 'd=\"$1\"; rm -rf \"$d\"' _ {} \\;",
+                "printf '%s\\n' /tmp /etc | xargs -n1 sh -c 'cd \"$1\" && rm -rf .' _",
+                "find /tmp /etc -maxdepth 0 -exec sh -c 'rm -rf \"$0\"' {} \\;",
+                f"alias a=b; alias b='bash -c'; a '{P}'", f"alias b='sh -c'; eval \"b '{P}'\"",
+                "alias b='xargs rm -rf'; echo /etc | b",
+                f"x=([5]='{P}'); eval \"${{x[5]}}\"", f"declare -A x=([k]='{P}'); eval \"${{x[k]}}\"",
+                f"x=(a); x+=([3]='{P}'); eval \"${{x[3]}}\"",
+                f"tee x.sh <<< '{P}'; sh x.sh", f"{{ echo '{P}'; }} | tee x.sh; sh x.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Delta-QA 3: an alias in any word position and a reverse chain; the
+        # per-path cap ranked by danger, not length; groups, relays, stdin and
+        # a direct `./f` as writers/runners of a script file.
+        pad = " ".join(f"/t/{i:02}" for i in range(32))
+        for cmd in (f"alias b='bash -c'\nif b '{P}'; then :; fi", f"alias b='bash -c'\n! b '{P}'",
+                    f"alias b='bash -c'\nx=1 b '{P}'", f"alias b='bash -c'\ncoproc b '{P}'",
+                    f"alias s='nice '; alias b='bash -c'\ns b '{P}'",
+                    f"alias c='bash -c'; alias b=c; alias a=b; a '{P}'",
+                    f"find {pad} //////////etc -maxdepth 0 -exec sh -c 'rm -rf \"$1\"' _ {{}} \\;",
+                    f"{{ echo hi; echo '{P}'; }} | tee x.sh; sh x.sh",
+                    f"{{ echo hi; echo '{P}'; }} > x.sh; sh x.sh",
+                    f"echo '{P}' | cat > x.sh; sh x.sh", f"echo '{P}' > s.sh; bash < s.sh",
+                    f"echo '{P}' > s.sh; chmod +x s.sh; ./s.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("alias ll='ls -la'; ll; echo ll", "echo hi > s.sh; bash < s.sh",
+                    "{ echo a; echo b; } | tee x.sh; sh x.sh",
+                    # Replayed: `alias={…}` in a script's text is no definition, and
+                    # a written script run with arguments sees them as `$1…`.
+                    "python3 - <<'EOF'\nalias={'a': 'b'}\nprint(alias)\nEOF",
+                    "cat > /tmp/g.sh <<'EOF'\nrm -rf /tmp/q/audio-$1\nEOF\nsh /tmp/g.sh tk"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # Delta-QA 4: a written file run with arguments is read bound AND
+        # unbound, its own `set --`/`shift` applied, once per argument list.
+        for cmd in ("echo 'set -- /etc; rm -rf \"$1\"' > x.sh; sh x.sh a",
+                    "echo 'shift; rm -rf \"$1\"' > x.sh; sh x.sh a /etc",
+                    "echo 'rm -rf \"$1\"' > x.sh; sh x.sh /tmp; sh x.sh /etc",
+                    "echo 'rm -rf \"$1\"' > x.sh; chmod +x x.sh; ./x.sh /tmp && ./x.sh /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("echo 'rm -rf \"$1\"' > x.sh; sh x.sh ./build; sh x.sh ./dist")
+        # Only `alias NAME=` with a name bash accepts defines one.
+        self.assertEqual(guard._alias_values("alias={'a': 1}"), {})
+        self.assertEqual(guard._alias_values("alias =x"), {})
+        self.assertEqual(guard._alias_values("alias b='bash -c'"), {"b": ["bash -c"]})
+        # The alias replacement is charged: a huge value used many times is
+        # refused as too large rather than read for seconds.
+        big = "alias b='echo " + "w" * 2000 + "'; " + "; ".join("b x" for _ in range(500))
+        self.assertIn("too large", guard.is_destructive(big) or "")
+        # A direct `sh -c` runs once: `$1` is exactly its first argument.
+        for cmd in ("bash -c 'rm -rf \"$1\" && cp -r \"$2\" \"$1\"' _ ./build /usr/share/doc/x",
+                    "sh -c 'test -d \"$2\" && rm -rf \"$1\"' _ ./out /",
+                    "alias ls='ls --color'; ls /etc", "alias a=b; alias b=a; a x"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # Each written file is read once per line, however often it runs, and
+        # alias uses / fed paths are not one reading apiece (QA: all quadratic).
+        for cmd in ("; ".join(f"echo 'echo {i}' >> /tmp/s.sh" for i in range(400))
+                    + "; " + "; ".join("sh /tmp/s.sh" for _ in range(400)),
+                    "; ".join(f"alias b='ls -{c}'" for c in "abcdefghij") + "; "
+                    + "; ".join("b x" for _ in range(1000)),
+                    "find " + " ".join(f"/tmp/d{i}" for i in range(400))
+                    + " -exec sh -c 'echo \"$1\"' _ {} \\;"):
+            start = time.monotonic()
+            self.assertAllowed(cmd)
+            self.assertLess(time.monotonic() - start, 10, cmd[:60])
+        # Two names past the pass cap keep the same-index reading only, and stay fast.
+        many = "; ".join(f"v{i}=a; v{i}=b" for i in range(12)) + "; echo $v0"
+        start = time.monotonic()
+        self.assertAllowed(many)
+        self.assertLess(time.monotonic() - start, 10)
+
     def test_a_proc_subst_passed_through_or_sourced_in_a_c_script(self):
         # XERK-1611: `cat <(…)` passes its file through to a shell downstream,
         # and a quoted `<(…)` in a `-c` script is the INNER shell's to run.
@@ -3289,8 +3416,10 @@ class TestExpansionBudget(unittest.TestCase):
         for cmd in (
             "find . " + "-exec true {} + " * 5000,
             'x="-exec true {} +"; find . ' + "$x " * 10000,
-            " | ".join(["xargs echo a/b"] * 4096),
-            'x="xargs echo a/b"; ' + " | ".join(["$x"] * 8192),
+            # Distinct operands: each xargs carries every one (XERK-1641
+            # de-duplicates repeats, which made identical ones linear).
+            " | ".join(f"xargs echo a/b{i}" for i in range(4096)),
+            'x="xargs echo"; ' + " | ".join(f"$x a/b{i}" for i in range(8192)),
         ):
             t = time.monotonic()
             self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:80])
