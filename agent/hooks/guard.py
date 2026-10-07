@@ -1849,6 +1849,9 @@ def _for_lists_of(command: str, _flags: tuple) -> list[tuple[str, int, int, list
                 scanned[p] = (end, shell)
         if shell:
             shell_after = end
+            # A brace word is a word per item, as bash expands it before the
+            # loop binds: `for v in a {'rm …',b}` runs `rm …` (XERK-1657).
+            words = [w for word in words for w in _brace_words(word) if w]
         elif m.start() < text_after:
             # Bound as before XERK-1647, by one regex pass: a `for` inside an
             # earlier match's text binds nothing. Rebound each, it was O(n²).
@@ -1893,6 +1896,81 @@ def _for_scan(command: str, pos: int, states: list[str], scanned: dict
         while pos < len(command) and command[pos] in " \t":
             pos += 1
     return end, words, visited, None
+
+
+def _brace_words(word: str) -> list[str]:
+    """A raw ``word`` as bash brace-expands it: a word per item of each
+    unquoted `{a,b}` / `{x..y}`, its items' quotes kept for `_dequote_value`.
+    `_expand_braces` reads no list holding a blank, which a quoted item may
+    (`{'rm -rf /etc',b}`). Past `_BRACE_SEQ_MAX` words the rest stay as written."""
+    if "{" not in word:
+        return [word]
+    out, todo = [], [word]
+    while todo:
+        w = todo.pop()
+        span = _brace_list(w) if len(out) + len(todo) < _BRACE_SEQ_MAX else None
+        if span is None:
+            out.append(w)
+            continue
+        start, end, items = span
+        todo.extend(w[:start] + item + w[end:] for item in reversed(items))
+    return out
+
+
+def _brace_list(word: str) -> tuple[int, int, list[str]] | None:
+    """The first unquoted brace list in ``word``: its span and items."""
+    i, n, quote = 0, len(word), ""
+    while i < n:
+        ch = word[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            elif ch == "\\" and quote == '"':
+                i += 1
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch in "'\"":
+            quote = ch
+        elif ch == "{" and not (i and word[i - 1] == "$"):
+            got = _brace_items(word, i)
+            if got is not None:
+                return i, got[0], got[1]
+        i += 1
+    return None
+
+
+def _brace_items(word: str, start: int) -> tuple[int, list[str]] | None:
+    """Where the `{` at ``start`` closes (past its `}`) and its items, when it
+    is a list (an unquoted `,` at its own depth) or a sequence."""
+    i, n, quote, depth, cut, items = start + 1, len(word), "", 0, start + 1, []
+    while i < n:
+        ch = word[i]
+        if quote:
+            if ch == quote:
+                quote = ""
+            elif ch == "\\" and quote == '"':
+                i += 1
+        elif ch == "\\":
+            i += 1
+        elif ch in "'\"":
+            quote = ch
+        elif ch == "{":
+            depth += 1
+        elif ch == "}" and depth:
+            depth -= 1
+        elif ch == "," and not depth:
+            items.append(word[cut:i])
+            cut = i + 1
+        elif ch == "}":
+            if items:
+                return i + 1, [*items, word[cut:i]]
+            seq = _brace_sequence(word[start + 1:i])
+            return (i + 1, seq) if seq else None
+        i += 1
+    return None
 
 
 # A `for` list word: an assignment's, plus `$'…'` with its `\'` and a
@@ -2599,19 +2677,19 @@ def _assigned_values(command: str, depth: int = 0,
         _VALUE_COUNTS[k] = max(_VALUE_COUNTS.get(k, 0), len(got) + len(applied.get(k, ())))
         _VALUES_ASSIGNED[0] = max(_VALUES_ASSIGNED[0], len(got))
     lists = _for_lists(command)
-    pick = _FOR_PICK[0]
-    if pick is not None and sum(1 for f in lists if f[0] == pick[0]) <= pick[1]:
-        pick = None
-    if pick is not None:
-        # A per-word reading (`_for_word_lines`): the loop's name holds that
-        # word alone, as its iteration does. Any other binding joined in
-        # made `v=a; for v in 'rm …'; do $v; done` run program `a`.
-        vals.pop(pick[0], None)
-        applied.pop(pick[0], None)
+    # A per-word reading (`_for_word_lines`): each picked loop's name holds
+    # that word alone, as its iteration does. Any other binding joined in
+    # made `v=a; for v in 'rm …'; do $v; done` run program `a`. A pick whose
+    # list this text does not hold is no pick here.
+    picks = {name: k for name, k in _FOR_PICK[0] or ()
+             if sum(1 for f in lists if f[0] == name) > k}
+    for name in picks:
+        vals.pop(name, None)
+        applied.pop(name, None)
     seen_of: dict[str, int] = {}
     for name, _start, _end, raw_words, _shell in lists:
         nth = seen_of[name] = seen_of.get(name, -1) + 1
-        if pick is not None and name == pick[0] and nth != pick[1]:
+        if name in picks and nth != picks[name]:
             continue
         # Whole words, dequoted as bash binds them: split on blanks, `for v in
         # "$(echo rm -rf /)"` bound `"rm`, `-rf`, `/"` (XERK-1622).
@@ -2813,6 +2891,11 @@ def _dequote_value(value: str) -> str:
             i = m.end()
             continue
         ch = value[i]
+        if ch == "$" and value.startswith('"', i + 1):
+            # `$"…"` is a locale string: the `"…"` with no `$` (XERK-1657).
+            # Kept, `for v in a $"rm …"` bound `$rm …`, a name read empty.
+            i += 1
+            continue
         if ch == "'":
             j = value.find("'", i + 1)
             j = n if j < 0 else j
@@ -3405,10 +3488,15 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         if got:
             value = _picked(got, name)
             state = states[m.start()] if m.start() < len(states) else ""
-            if state == '"' and (rest.startswith("[")
-                                 or name in _FOR_NAMES
-                                 and command[m.start() - 1:m.start()] == '"'
-                                 and command[end:end + 1] == '"'):
+            whole = (command[m.start() - 1:m.start()] == '"' and command[end:end + 1] == '"')
+            if state == '"' and name in _FOR_NAMES and whole and not rest.startswith("[") \
+                    and not op and len(got) > 1 and _VALUE_PICK[0] is None:
+                # A whole `"$p"` is one word per `for` word, each kept whole:
+                # spliced bare, `for v in c 'rm …'; do bash -c "$v"` handed
+                # `-c` the word `rm` (XERK-1657). One word read alone (a
+                # per-word pass) is an ordinary quoted splice, below.
+                out = '" "'.join(_quote_literal(v, '"') for v in got)
+            elif state == '"' and rest.startswith("["):
                 # `"${a[@]}"` is one word PER element, even mid-word: close
                 # the quote around them, as bash's expansion does. So is any
                 # subscript, read as every element: the values are joined, so
@@ -3512,8 +3600,8 @@ _CHAIN_DIFFERS = [False]
 # And the most values this decision saw one name assigned (XERK-1621).
 _VALUE_PICK: list = [None]
 # Set while `_expand_both` reads one word of a `for` list (`_for_word_lines`):
-# the loop's name and which of that name's `for` lists it is.
-_FOR_PICK: list[tuple[str, int] | None] = [None]
+# each picked loop's name and which of that name's `for` lists it is.
+_FOR_PICK: list[tuple[tuple[str, int], ...] | None] = [None]
 # How many values each name was assigned, for the cross passes (XERK-1634).
 _VALUE_COUNTS: dict[str, int] = {}
 _VALUES_MOST = [1]
@@ -5572,49 +5660,90 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
 # reading any of them) — a line of hundreds of loops, or a long list beside a
 # very long body.
 _MAX_FOR_WORD_CHARS = 768 * 1024
+# The most readings two glued lists' product may add (`_for_word_lines`): each
+# is a whole-line values pass, ~2 ms, and 60 × 60 words took 8 s. Past it the
+# line is too large (a deny); real loops gluing two names are a few words each.
+_MAX_FOR_PRODUCT = 256
+
+
+_ForPick = tuple[tuple[str, int], ...]
 
 
 @_budgeted
-def _for_word_lines(command: str, weight: int) -> tuple[list[tuple[str, tuple[str, int]]], bool]:
+def _for_word_lines(command: str, weight: int) -> tuple[list[tuple[str, _ForPick]], bool]:
     """``command`` once per distinct word of each `for` list, that list
     replaced by the word alone, with the `_FOR_PICK` to read it under; and
     whether there were too many to read. Joined, `for v in a 'rm -rf /'; do
     $v; done` read program `a` (XERK-1647); a reading per word with the whole
-    list re-read was quadratic in it. One loop at a time: nested lists are not
-    read as a product. A one-word list too: another binding of its name was
-    joined in. Each line is charged its length times ``weight``, the passes
+    list re-read was quadratic in it. One loop at a time, except two lists
+    whose names are glued in one word (`$a$b`), read as their product: one at
+    a time, `for a in x r; do for b in y m; do $a$b …` never read `rm`
+    (XERK-1657). A one-word list too: another binding of its name was joined
+    in. Each line is charged its length times ``weight``, the passes
     `_expand_values` makes over it."""
     return _memo("vals", ("for", command, weight), _for_word_lines_of, command, weight)
 
 
-def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, tuple[str, int]]], bool]:
-    lines: list[tuple[str, tuple[str, int]]] = []
-    seen: set[tuple[str, tuple[str, int]]] = set()
+def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForPick]], bool]:
+    lines: list[tuple[str, _ForPick]] = []
+    seen: set[tuple[str, _ForPick]] = set()
     left = _MAX_FOR_WORD_CHARS
     nth: dict[str, int] = {}
     # As `_var_values` reads it: a `\<newline>` in a list is no word of it.
     command = _join_continuations(command)
+    read = []
     for name, start, end, words, shell in _for_lists(command):
         nth[name] = nth.get(name, -1) + 1
-        if not shell or not re.search(r"\$\{?!?" + name + r"\b", command):
+        # `'$'v` / `"$"v` count: an `eval` joins them into `$v` (XERK-1657).
+        if not shell or not re.search(r"\$['\"]*\{?!?['\"]*" + name + r"\b", command):
             # No `do`, or never expanded, so no word of it runs: most such
             # lists are another language's `for` in a quoted or heredoc
             # script, and read per word a 10 KB Python heredoc was too
             # large, its words cut out of their quoting too deep (QA).
             continue
-        for word in words:
-            entry = (command[:start] + word + command[end:], (name, nth[name]))
-            if entry in seen:
-                continue
-            left -= len(entry[0]) * weight
-            if left < 0:
-                # Recorded on the decision, as `_expand_picks`'s cap is.
+        read.append((name, nth[name], start, end, list(dict.fromkeys(words))))
+    picks = [(((name, k),), ((start, end, word),))
+             for name, k, start, end, words in read for word in words]
+    glued = _glued_name_pairs(command, {r[0] for r in read if len(r[4]) > 1})
+    products = 0
+    for a, b in itertools.combinations(read, 2):
+        if a[0] != b[0] and frozenset((a[0], b[0])) in glued and len(a[4]) > 1 < len(b[4]):
+            products += len(a[4]) * len(b[4])
+            if products > _MAX_FOR_PRODUCT:
                 if _budget is not None:
                     _budget["capped"] = True
                 return [], True
-            seen.add(entry)
-            lines.append(entry)
+            picks += [(((a[0], a[1]), (b[0], b[1])), ((a[2], a[3], x), (b[2], b[3], y)))
+                      for x in a[4] for y in b[4]]
+    for pick, spans in picks:
+        line = command
+        for start, end, word in sorted(spans, reverse=True):
+            line = line[:start] + word + line[end:]
+        entry = (line, pick)
+        if entry in seen:
+            continue
+        left -= len(line) * weight
+        if left < 0:
+            # Recorded on the decision, as `_expand_picks`'s cap is.
+            if _budget is not None:
+                _budget["capped"] = True
+            return [], True
+        seen.add(entry)
+        lines.append(entry)
     return lines, False
+
+
+def _glued_name_pairs(command: str, names: set[str]) -> set[frozenset[str]]:
+    """Each pair of ``names`` used in one blank-free run of ``command``
+    (`$a$b`, `"${a}"/$b`), as a product of their values may form a word."""
+    if len(names) < 2:
+        return set()
+    pairs = set()
+    for run in re.finditer(r"[^\s;|&<>()]*\$[^\s;|&<>()]*\$[^\s;|&<>()]*", command):
+        used = {u for u in re.findall(r"\$['\"]*\{?!?['\"]*([A-Za-z_]\w*)", run.group(0))
+                if u in names}
+        pairs.update(frozenset(p) for p in itertools.combinations(sorted(used), 2))
+    return pairs
 
 
 def _expand_readings(command: str) -> list[tuple[list[str], str]]:
@@ -6220,6 +6349,15 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
         if raw:
             if state == "'":
                 return m.group(0)  # the function's shell never expands it
+            if not state:
+                # An unquoted use word-splits its value: `f(){ $1; }; f 'rm
+                # -rf /etc'` runs `rm` (XERK-1657). A quoted word is its text
+                # unquoted: plain text spliced as a `$x` value is, and one
+                # holding an expansion dequoted only, so `"$v"` stays live
+                # (and splits) for the line's own substitution.
+                words = [w if not re.search(r"['\"]", w)
+                         else _dequote_value(w) if re.search(r"[$`]", w)
+                         else _quote_literal(_dequote_value(w), "") for w in words]
             out = " ".join(words)
             if state == '"':
                 out = '"' + out + '"'
@@ -6625,7 +6763,7 @@ def _stdout_targets(tokens: list[str]) -> tuple[list[str], list[str]]:
 
 
 def _written_scripts(segments: list[str],
-                     heredocs: list[tuple[str, str, bool]]) -> dict[str, list[str]]:
+                     heredocs: list[tuple[str, str, bool]], depth: int = 0) -> dict[str, list[str]]:
     """Text the line writes to a file: a printer's output redirected (`echo …
     > f`) and a heredoc `cat`/`tee` writes (`cat > f <<EOF`), by path. A
     later `sh f` / `. f` runs it as a script (XERK-1555)."""
@@ -6634,6 +6772,15 @@ def _written_scripts(segments: list[str],
         # ...and what a `tee f` stage is fed: `echo … | tee f` (XERK-1641 QA).
         fed: str | None = None
         for stage in _split_on_operators(pipeline, groups=True):
+            # A write inside a group or compound writes too: `for v in …; do
+            # echo "$v" > f; done; sh f` (XERK-1657). Bounded by depth: each
+            # level re-splits its body.
+            core = _group_core(stage) if depth < _MAX_WRITE_NEST else None
+            if core:
+                inner = _written_scripts(_split_on_operators(
+                    _unwrap_group(core), include_pipe=False, groups=True), [], depth + 1)
+                for path, texts in inner.items():
+                    written.setdefault(path, []).extend(texts)
             words, outs = _stdout_targets(_strip_prefixes(_tokenize(stage)))
             prog = _basename(words[0]) if words else ""
             text = _printed_from_tokens(words) if words else None
@@ -6666,6 +6813,8 @@ def _written_scripts(segments: list[str],
     return written
 
 
+# How deep `_written_scripts` follows groups and compounds into their bodies.
+_MAX_WRITE_NEST = 8
 # Distinct argument lists one written file is read with, per line.
 _MAX_SCRIPT_RUNS = 8
 
@@ -6892,9 +7041,24 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # `set -- "$@" x` re-expanded one 104 times (6x main).
     for reading in _positional_readings(raw_commands):
         vals = {**raw_vals, **_var_values(reading)}
-        reading = _substitute_vars(reading, vals)
-        out.extend(_memo("expand", ("positional", reading, depth, every_cd),
-                         _expand_segments, reading, depth + 1, every_cd))
+        bound = _substitute_vars(reading, vals)
+        out.extend(_memo("expand", ("positional", bound, depth, every_cd),
+                         _expand_segments, bound, depth + 1, every_cd))
+        # A `for v; do $v` / `for v in "$@"` list is the bound words, each run
+        # alone as the top line's lists are (`_for_word_lines`): joined,
+        # `set -- a 'rm …'; for v; do $v; done` ran program `a` (XERK-1657).
+        lines, too_large = _for_word_lines(reading, 1) if _FOR_IN_RE.search(reading) else ([], False)
+        if too_large:
+            out.append(([_TOO_LARGE], reading))
+        for line, pick in lines:
+            outer = _FOR_PICK[0]
+            _FOR_PICK[0] = pick
+            try:
+                line = _substitute_vars(line, {**raw_vals, **_var_values(line)})
+                out.extend(_memo("expand", ("positional", line, depth, every_cd),
+                                 _expand_segments, line, depth + 1, every_cd))
+            finally:
+                _FOR_PICK[0] = outer
     command = _prenormalise(raw_commands)
     segments = _split_segments(command)
     # ...and what a substitution whose body holds an operator PRINTS is text
@@ -7183,6 +7347,13 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # `eval "$(echo 'a=$(…); $a')"` runs the printed text (XERK-1649).
             for script in dict.fromkeys([*_script_readings(joined), *_raw_script_texts(joined)[1:]]):
                 out.extend(_expand_segments(script, depth + 1, every_cd))
+                # ...with the line's values, where the join rebuilt a use the
+                # line's own splice never saw: `eval '$'v`, `eval "$"v` run $v
+                # (XERK-1657). The re-parse sees only this text, not the line.
+                if "$" in script and raw_vals:
+                    bound = _substitute_vars(script, raw_vals)
+                    if bound != script:
+                        out.extend(_expand_segments(bound, depth + 1, every_cd))
         # `seg` ran the line's substitutions, which turned a quoted `<(…)` —
         # literal to the outer shell — into the text it prints, so `bash -c
         # ". <(echo <cmd>)"` reached the inner parse as `. <cmd>`, a source of a

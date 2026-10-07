@@ -98,7 +98,20 @@ paths:
     before it (`x=…; for v in a eval; do $v "$x"`) or took out through another name.
   - Budget: `_MAX_FOR_WORD_CHARS` of line × passes (taint readings multiply); past it the line is
     `_TOO_LARGE` (a deny) — e.g. ~200 loops on one line. Characters, never a wall clock: that
-    denied a real command only on a busy host. Nested lists are no product.
+    denied a real command only on a busy host.
+  - Two lists whose names share one blank-free word (`$a$b`, `"${a}"/$b`) are also read as their
+    PRODUCT (XERK-1657, `_glued_name_pairs`): one at a time, `$a$b` never formed `rm`. Past
+    `_MAX_FOR_PRODUCT` readings the line is too large (60×60 words took 8 s). Unglued nested lists
+    stay one at a time; three glued names are read pairwise only (residual).
+  - Shell-list words are brace-expanded first (`_brace_words`): `_expand_braces` skips a list
+    holding a blank, so `for v in a {'rm …',b}` bound one word. `$"…"` dequotes as `"…"`.
+  - A whole `"$v"` of a multi-word list splices each word as its OWN quoted word; spliced bare,
+    `for v in c 'rm …'; do bash -c "$v"` handed `-c` the word `rm` (XERK-1657).
+  - A loop over positionals (`set -- …; for v; do`, `f(){ for v in "$@"; …}; f …`) is read per
+    word on each bound reading in `_expand` too, `_FOR_PICK` saved and restored around it.
+  - An `eval` whose joined words rebuild a use (`eval '$'v`, `eval "$"v`) is re-read with the
+    line's values substituted; the per-word scan counts `'$'v` as a use of `v`.
+    Tests: `test_loop_words_reach_a_script_positional_or_eval_alone`.
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
