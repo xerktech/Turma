@@ -2399,6 +2399,15 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         self.assertAllowed("echo 'rm -rf \"$1\"' > x.sh; sh x.sh ./build; sh x.sh ./dist")
+        # Past the cap of distinct argument lists every run is still read
+        # (QA 5: the 10th and later were dropped, the 9th joined into one word).
+        for n in (8, 9, 12, 40):
+            runs = "; ".join(f"sh x.sh ./b{i}" for i in range(n))
+            for body in ('rm -rf "$1"', "rm -rf $1"):
+                with self.subTest(n=n, body=body):
+                    self.assertDenied(f"echo '{body}' > x.sh; {runs}; sh x.sh /etc")
+        self.assertAllowed("echo 'rm -rf \"$1\"' > x.sh; "
+                           + "; ".join(f"sh x.sh ./b{i}" for i in range(12)))
         # Only `alias NAME=` with a name bash accepts defines one.
         self.assertEqual(guard._alias_values("alias={'a': 1}"), {})
         self.assertEqual(guard._alias_values("alias =x"), {})
