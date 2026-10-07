@@ -3969,7 +3969,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         for cmd in ('rm -rf "$dir/$f"', 'rm -rf "$TMP/$x"', 'rm -rf "$x"/$y/', "rm -rf $x/$y",
                     'rm -rf "/tmp/$x/etc"', 'rm -rf "$x/build$y"', "rm -rf /$HOME/etc",
                     "rm -rf /${x:-a}/etc", 'rm -rf "$x/$y/out"', 'rm -rf "$dir/$name.$ext"',
-                    "rm -rf ~$USER/x", 'rm -rf "$x".bak/etc'):
+                    "rm -rf ~$USER/x", 'rm -rf "$x".bak/etc',
+                    # A name in a `~` prefix is kept, and so is a lone component that
+                    # names alone do not fill: bash leaves `~` unexpanded there (QA).
+                    "rm -rf ~$x/*", "rm -rf ~$x/$y/*", "rm -rf $x~$y/", 'rm -rf "$x"~/'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
         for word in ("/${a" * 20000, "/${a}" * 20000 + "/x", "/$a" * 40000 + "/x",
