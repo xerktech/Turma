@@ -3056,6 +3056,13 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "bash <<'E'\nbash -c \"$(echo 'X=${nope:-a b}') rm -rf /etc\"\nE",
         "eval 'bash -c \"$(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc\"'",
         "bash -c \"bash -c \\\"\\$(echo 'X=\\${nope:-a b}') rm -rf /etc\\\"\"",
+        # ...inside a substitution body, a function, or a second `-exec`.
+        ": $(eval $(echo 'X=${nope:-a b}') rm -rf /etc)",
+        ": $(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')",
+        "cat <(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')",
+        "cat <<E\n$(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')\nE",
+        "f(){ bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'; }; f",
+        "find . -exec sh -c true \\; -exec sh -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc' \\;",
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
@@ -3089,6 +3096,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "R=$(echo 'X=${n:-a b}'); echo \"$R\"",
         "eval \"$(ssh-agent -s)\"",
         "eval X=1 ls",
+        "f(){ bash -c 'eval $(opam env) make'; }; f",
+        ": $(bash -c 'X=$(date) ls')",
     ]
 
     def test_shell_wrapped_destructive_blocked(self):

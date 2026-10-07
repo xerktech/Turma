@@ -50,8 +50,11 @@ paths:
     assignment is not cut twice; its pipelines join `unsplit_line`'s.
   - Every re-parse level is handed its script `${…}`-substituted (`_substitute_vars` expands
     inside `'…'` too), so the cut must run on RAW text one level up: the heredoc site cuts the
-    body (quoted delimiter too), and `_expand` cuts each `-c`/eval script of its raw segments
-    (`bash -c 'eval $(…) rm …'`, `bash <<'E'` / `bash -c "$(…) rm …"`).
+    body (quoted delimiter too), and `_raw_printed_cuts` walks the raw line for every `-c`/eval
+    script, recursing into scripts, substitution bodies, `<(…)` and unquoted heredoc bodies
+    (`: $(bash -c 'eval $(…) rm …')`). Read the raw line BEFORE `_expand` rebinds `command`.
+  - A segment's leading `f(){`/`function f {`/`{`/`(` is dropped first (`_RAW_SEG_OPENER_RE`):
+    `_tokenize` keeps `f(){` as one word. Every `-exec` script counts, not the first.
   - Accepted over-deny, as base already does for `$(echo 'X=1 Y=2') rm …`: printed text at
     command start is read as re-parsed (`$(echo 'X=${v:-a b}') rm …` runs no `rm`).
 - `eval` counts as a wrapper for the cut, any spelling bash dequotes to it (`\eval`, `ev''al`,

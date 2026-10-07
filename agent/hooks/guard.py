@@ -4329,6 +4329,47 @@ def _printed_unsplit(command: str, unsplit: str | None = None) -> list[str]:
     return cuts
 
 
+# A function header or group opener leading a segment (`f(){ …`, `function f {`,
+# `{ …`, `( …`), dropped before a raw segment's program word is read.
+_RAW_SEG_OPENER_RE = re.compile(
+    r"\s*(?:function\s+[^\s(){}]+\s*(?:\(\s*\))?\s*|[^\s(){}=]+\s*\(\s*\)\s*)?[{(]?\s*")
+
+
+def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
+    """`_printed_unsplit` cuts of every `-c`/eval script ``command`` runs, read
+    off its RAW text, at any nesting (XERK-1645 QA): a re-parse level is handed
+    its script `${…}`-substituted, so `bash -c 'eval $(echo …X=${v:-a b}…)
+    rm …'` reached the level that splices it as `X=a b`. Recurses into each
+    script, each substitution body (`: $(bash -c '…')`, backticks, `<(…)`)
+    and each unquoted heredoc body; each cut is a whole script to expand."""
+    cuts: list[str] = []
+    if depth > _MAX_UNSPLIT_DEPTH or ("$(" not in command and "`" not in command):
+        return cuts
+    text, heredocs = _split_heredocs(command)
+    for _owner, body, quoted in heredocs:
+        if not quoted:
+            cuts += _raw_printed_cuts(body, depth + 1)
+    for raw_seg in _split_segments(text):
+        if "$(" not in raw_seg and "`" not in raw_seg:
+            continue
+        for m in _find_substs(raw_seg):
+            cuts += _raw_printed_cuts(_subst_inner(m), depth + 1)
+        seg = _unwrap_group(raw_seg)
+        seg = seg[_RAW_SEG_OPENER_RE.match(seg).end():]
+        words = _strip_prefixes(_tokenize(seg))
+        if not words:
+            continue
+        if _bash_dequoted(_decode_ansi_c(words[0])) == "eval":
+            scripts = [" ".join(words[2:] if words[1:2] == ["--"] else words[1:])]
+        else:
+            scripts = _raw_shell_c_scripts(words)
+        for script in scripts:
+            for reading in _script_readings(script):
+                cuts += _printed_unsplit(reading)
+                cuts += _raw_printed_cuts(reading, depth + 1)
+    return list(dict.fromkeys(cuts))
+
+
 def _unsplit_cuts(command: str, depth: int = 0) -> tuple[tuple[int, int, str], ...]:
     """`_unsplit_cuts_at` under the current reading: `_brace_end` parses a
     `${…}` per reading, so a cut cached under bash's hid dash's (XERK-1620 QA)."""
@@ -6879,6 +6920,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # BEFORE pre-normalisation, whose brace expansion ignores quoting and can
     # unbalance them (`awk '{print $2, $4}'`); each body gets the variables
     # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
+    raw_line = command
     raw_commands, heredocs = _split_heredocs(command)
     raw_vals = _var_values(raw_commands)
     # Every directory a `cd` before a command (on this line or an enclosing
@@ -7056,21 +7098,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # ...and in each `-c`/eval script the line runs, read off the RAW text: a
     # nested level is handed its script with `${…}` already substituted, so
     # `bash -c 'eval $(echo …X=${v:-a b}…) rm …'` reached it as `X=a b`.
-    if "$(" in raw_commands or "`" in raw_commands:
-        for raw_seg in _split_segments(raw_commands):
-            if "$(" not in raw_seg and "`" not in raw_seg:
-                continue
-            words = _strip_prefixes(_tokenize(_unwrap_group(raw_seg)))
-            if not words:
-                continue
-            if _basename(words[0]) == "eval":
-                scripts = [" ".join(words[2:] if words[1:2] == ["--"] else words[1:])]
-            else:
-                scripts = _raw_shell_c_scripts(words)[:1]
-            for script in scripts:
-                for reading in _script_readings(script):
-                    for cut in _printed_unsplit(reading):
-                        out.extend(_expand_segments(cut, depth + 1, every_cd))
+    if "$(" in raw_line or "`" in raw_line:
+        for cut in _raw_printed_cuts(raw_line):
+            out.extend(_expand_segments(cut, depth + 1, every_cd))
         for cut in _printed_unsplit(raw_commands, unsplit):
             cut_line = _prenormalise(cut)
             unsplit_line = f"{unsplit_line}\n{cut_line}" if unsplit_line else cut_line
