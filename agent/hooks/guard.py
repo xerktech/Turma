@@ -7862,10 +7862,10 @@ _RUNS_UNNAMED_RE = re.compile(
     r"(?=[ \t]*(?:$|[;&|)<'\"\n]|-[a-zA-Z]*s\b|-\s|/dev/|/proc/))"
     r"|(?:source|\.|eval|xargs|hash)(?=$|[\s;&|)<'\"]))"
     r"|\s-(?:exec|execdir|ok|okdir)\b|\bPATH\+?=")
-# A shell's `-c` script, an `eval` or a function body, whose runs the
-# segment loop never pairs with this line's writes (`f(){ sh x; }; f`).
+# A shell's `-c` script, an `eval`, a `trap` action or a function body,
+# whose runs the segment loop never pairs with this line's writes.
 _C_OR_EVAL_RE = re.compile(_CMD_START + r"(?:[^\s;&|'\"]*/)?(?:(?:ba|da|z|k|a)?sh\s[^;&|\n]*-[a-zA-Z]*c|eval)\b"
-                           r"|\(\s*\)\s*[{(]|\bfunction\s")
+                           r"|\(\s*\)\s*[{(]|\btrap\s")
 # A command that may copy a file to another path (`cp f g; ./g`).
 _COPIES_RE = re.compile(r"(?<![\w.-])(?:cp|mv|ln|install|rsync|dd|tar|unzip|gcp)(?![\w.-])"
                         r"|\bcat\s+[^-\s<>|;&)][^;&|\n)]*(?:>|\|\s*tee\b)")

@@ -44,8 +44,11 @@ paths:
   - Fails closed on: a shell/`.`/`source` given a file that is not written; a path run that
     is not written when the line also copies (`_COPIES_RE`: cp/mv/ln/install/rsync/dd/tar,
     `cat f > g`) or names a glob; `_RUNS_UNNAMED_RE` at a COMMAND START (a shell reading stdin,
-    `.`/`source`, `eval`, `xargs`, `hash`) or `-exec`/`PATH=` anywhere; a `-c` script, `eval` or function
-    body when a written file's basename appears twice (`bash -c ./f`, `f(){ sh x; }; f`).
+    `.`/`source`, `eval`, `xargs`, `hash`) or `-exec`/`PATH=` anywhere; a `-c` script, `eval`, `trap`
+    action or function body when a written file's basename appears twice (`bash -c ./f`,
+    `f(){ sh x; }; f`, `trap 'sh f' EXIT`).
+  - Accepted over-deny (10 of 40k replayed): a note whose line STARTS with a destructive
+    command, named again beside a function/eval/trap (`f(){ git add n.md; }`).
   - Never match those words anywhere: `git add .`, "bash" in a note, `~/.claude/bin/jira -F
     notes.md` beside a written note denied 87 real commands (QA corpus replay).
   - Writers are read broadly too: any non-shell stage fed text or a here-string writes it

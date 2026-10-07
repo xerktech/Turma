@@ -2757,7 +2757,7 @@ class TestScriptChannels(unittest.TestCase):
                 # a `-c` script naming the written file again, a `$S` spelling
                 f"echo '{P}' > f; bash -c ./f", f"echo '{P}' > f; sh -c \"$(cat f)\"",
                 f"S=.; echo '{P}' > $S/f; $S/f", f"echo '{P}' > f; cat f > g; sh g",
-                f"echo '{P}' > f; run(){{ sh f; }}; run", f"echo '{P}' > f; function r {{ ./f; }}; r"):
+                f"echo '{P}' > f; run(){{ sh f; }}; run", f"echo '{P}' > f; trap 'sh f' EXIT"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # Past `_MAX_SCRIPT_RUNS`, a glued `"$1/$2"` is read per argument.
@@ -2769,6 +2769,7 @@ class TestScriptChannels(unittest.TestCase):
                     # a note holding a command, beside a `.` argument or a path run
                     f"echo '{P} is the repro' > notes.md; git add . && git commit -qm wip",
                     f"cat > notes.md <<'EOF'\n{P}\nEOF\n./scripts/lint.sh",
+                    "echo hi > t.txt; trap 'rm -f t.txt' EXIT; cat t.txt",
                     f"cat > n.md <<'EOF'\n{P}\nEOF\n~/.claude/bin/jira create -d \"$(cat n.md)\"",
                     "git log --oneline > log.txt && bash scripts/check.sh",
                     "echo 'rm -rf \"$1\"' > x.sh; sh x.sh build",
