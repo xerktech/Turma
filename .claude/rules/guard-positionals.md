@@ -75,10 +75,11 @@ paths:
     which covers a top-level `rm -rf "${1:-/etc}"`. Never via `_VAR_USE_RE`: a script's text is
     substituted before it is bound, so `sh -c '…"${1:-}"' _ /etc` read the default, not `/etc`.
   - `find -L/-H/-P/-D x/-O3` options before the roots are skipped (`_find_roots`).
-  - A `-c` script given 2+ arguments is also read ONCE with every parameter bound to every
-    argument (`every=True`, quoted `"$1"` closing per word as `"$@"` does): `find a b -exec sh -c
-    '… "$1"' _ {} \;` and `xargs -n1` run it per path. One run per path grew with the paths and
-    false-denied ~330 roots as "too large" (QA); don't reintroduce it.
+  - A shell fed by `find … {} \;` / `xargs -n1` is read once PER PATH (`$1`, or `$0` when
+    `{}` comes first), capped at `_MAX_PER_RUN` paths, absolute and shortest first
+    (`_per_run_operands`). One reading binding `$1` to every path lost `d="$1"`, `cd "$1"`
+    and `$0`, and false-denied a direct `sh -c` with 2+ args; all paths, uncapped, false-denied
+    ~330 roots as too large (QA). Residual: past the cap, a path ranked out is not read per run.
 - Not covered (XERK-1655): a quoted `eval 'set -- …'`, `trap`/alias calls, `f() if/for/while/[[`
   bodies, `${1#x}`/`${!#}`/`"${@:2}"` ops applied, an eval'd single-quoted `$1`, `"$(f /etc)"`
   output, `f ${HOME:+/etc}`, `f {a,b} …` brace words, `set -- $(…)`, a `while` shifting past

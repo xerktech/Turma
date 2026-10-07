@@ -2353,6 +2353,37 @@ class TestScriptChannels(unittest.TestCase):
                     "find /tmp/a /tmp/b -exec sh -c 'echo \"$1\"' _ {} \\;"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        # Delta-QA shapes: a find/xargs-fed shell read one path per run, where
+        # `$1` is assigned, `cd`'d into or is `$0`; aliases through a chain,
+        # `eval` or a pipe; indexed arrays; tee fed a here-string or a group.
+        for cmd in (
+                "find /tmp /etc -maxdepth 0 -exec sh -c 'd=\"$1\"; rm -rf \"$d\"' _ {} \\;",
+                "printf '%s\\n' /tmp /etc | xargs -n1 sh -c 'cd \"$1\" && rm -rf .' _",
+                "find /tmp /etc -maxdepth 0 -exec sh -c 'rm -rf \"$0\"' {} \\;",
+                f"alias a=b; alias b='bash -c'; a '{P}'", f"alias b='sh -c'; eval \"b '{P}'\"",
+                "alias b='xargs rm -rf'; echo /etc | b",
+                f"x=([5]='{P}'); eval \"${{x[5]}}\"", f"declare -A x=([k]='{P}'); eval \"${{x[k]}}\"",
+                f"x=(a); x+=([3]='{P}'); eval \"${{x[3]}}\"",
+                f"tee x.sh <<< '{P}'; sh x.sh", f"{{ echo '{P}'; }} | tee x.sh; sh x.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A direct `sh -c` runs once: `$1` is exactly its first argument.
+        for cmd in ("bash -c 'rm -rf \"$1\" && cp -r \"$2\" \"$1\"' _ ./build /usr/share/doc/x",
+                    "sh -c 'test -d \"$2\" && rm -rf \"$1\"' _ ./out /",
+                    "alias ls='ls --color'; ls /etc", "alias a=b; alias b=a; a x"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # Each written file is read once per line, however often it runs, and
+        # alias uses / fed paths are not one reading apiece (QA: all quadratic).
+        for cmd in ("; ".join(f"echo 'echo {i}' >> /tmp/s.sh" for i in range(400))
+                    + "; " + "; ".join("sh /tmp/s.sh" for _ in range(400)),
+                    "; ".join(f"alias b='ls -{c}'" for c in "abcdefghij") + "; "
+                    + "; ".join("b x" for _ in range(1000)),
+                    "find " + " ".join(f"/tmp/d{i}" for i in range(400))
+                    + " -exec sh -c 'echo \"$1\"' _ {} \\;"):
+            start = time.monotonic()
+            self.assertAllowed(cmd)
+            self.assertLess(time.monotonic() - start, 10, cmd[:60])
         # Two names past the pass cap keep the same-index reading only, and stay fast.
         many = "; ".join(f"v{i}=a; v{i}=b" for i in range(12)) + "; echo $v0"
         start = time.monotonic()

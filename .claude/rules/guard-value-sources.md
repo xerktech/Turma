@@ -34,9 +34,16 @@ paths:
   `cp` are not followed.
   - Each file is read ONCE per line (`written.pop`): per run, N appends and N runs were
     quadratic and a 24 KB benign line hit the deadline (QA).
-- An alias use runs its VALUE with the use's words after it (`_alias_values`): `alias b='bash
-  -c'; b '<cmd>'`. The `alias` branch alone read `bash -c` with no script.
-- An array element written with its index (`([1]=w)`) is the element `w`.
+- An alias use runs its VALUE with the use's words after it: `alias b='bash -c'; b '<cmd>'`,
+  through a chain, an `eval "b …"`, or a pipe (`echo /etc | b`). `_aliased_readings` is an
+  ADDED whole-line reading with every use replaced (`_ALIAS_USE_RE`), `_ALIASES_ON` off inside.
+  - At most two: each name's FIRST and LAST value. One reading per use, then per value, was
+    (definitions × uses) and a 3000-use line false-denied (QA). Off inside so `alias ls='ls
+    -l'` is not re-replaced per level until "too deep". Residual: a huge alias used hundreds
+    of times grows the line toward the growth budget.
+- An array element written with its index (`([1]=w)`, `([k]=w)`, `+=`) is the element `w`,
+  one element too.
+- A `tee f` stage writes a here-string (`tee f <<< …`) or a `{ … }` group's printed body.
 - **A program word that is not literal may be a shell on the `-c` and pipe paths too**
   (XERK-1632, `_owner_word_may_be_shell`). Gated on `_NONLITERAL_RE`/defined names before the
   call: asking every stage of every pipeline doubled the walk.
