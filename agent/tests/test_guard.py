@@ -3068,6 +3068,54 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "timeout -s KILL 5 env X=$((1 + 2)) rm -rf /etc",
         "nice -n 5 env X=${nope:-a;b} rm -rf /etc",
         "sudo -u root X=$((1 + 2)) rm -rf /etc",
+        # ...or only in a substitution's PRINTED text, re-parsed (XERK-1645).
+        "bash -c \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"`echo 'X=${nope:-a b}'` rm -rf /etc\"",
+        "bash -c \"$(printf %s 'X=${nope:-a b}') rm -rf /etc\"",
+        "eval \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "echo \"$(echo 'X=${nope:-a b}') rm -rf /etc\" | bash",
+        "bash <<< \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"$(echo 'X=${nope:-a b} Y=${n:-c d}') rm -rf /etc\"",
+        "bash -c \"$(echo $(echo 'X=${nope:-a b}')) rm -rf /etc\"",
+        "bash -c \"Y=1 $(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"$(printf 'X\\x3d${nope:-a b}') rm -rf /etc\"",
+        "eval $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "eval `echo 'X=${nope:-a b}'` rm -rf /etc",
+        "bash <<E\n$(echo 'X=${nope:-a b}') rm -rf /etc\nE",
+        "cat <<E | bash\n`echo 'X=${nope:-a b}'` rm -rf /etc\nE",
+        "bash -c \"$(echo 'X=${nope:-a')\"' b} rm -rf /etc'",
+        "\\eval $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "ev''al $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "$'eval' $(echo 'X=${nope:-a b}') rm -rf /etc",
+        # ...one re-parse level down, where the script arrives substituted.
+        "bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        "bash <<'E'\nbash -c \"$(echo 'X=${nope:-a b}') rm -rf /etc\"\nE",
+        "eval 'bash -c \"$(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc\"'",
+        "bash -c \"bash -c \\\"\\$(echo 'X=\\${nope:-a b}') rm -rf /etc\\\"\"",
+        # ...inside a substitution body, a function, or a second `-exec`.
+        ": $(eval $(echo 'X=${nope:-a b}') rm -rf /etc)",
+        ": $(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')",
+        "cat <(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')",
+        "cat <<E\n$(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')\nE",
+        "f(){ bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'; }; f",
+        "find . -exec sh -c true \\; -exec sh -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc' \\;",
+        "trap 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc' EXIT",
+        "bash <<< 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        "sh<<<'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        ". /dev/stdin <<< 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        "bash -c $'eval $(echo \\'X=${nope:-a b}\\') rm -rf /etc; echo done'",
+        "sh <<< $'eval \\x24(echo \\'X=${nope:-a b}\\') rm -rf /etc'",
+        "bash <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
+        "bash <<'E'\nbash <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "{ bash; } <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
+        "bash <<'E'\n{ bash; } <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "bash <<'E'\nbash<<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "bash <<'E'\nx=bash; $x <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        ": $(bash <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE\n)",
+        "bash <<E\nbash -c \\$'eval \\$(echo \\\\'X=\\${nope:-a b}\\\\') rm -rf /etc'\nE",
+        # ...and a quoted `$'` decoy is no ANSI-C string: read raw too.
+        "echo \"$'\\'\"; eval $(echo 'X=${nope:-a b}') rm -rf /etc #'",
+        "echo 'x$' \"\\'\"; eval $(echo 'X=${nope:-a b}') rm -rf /etc #'",
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
@@ -3097,6 +3145,15 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "env -i PATH=/x X=$((1 + 2)) ls",
         "function build { X=$((1 + 2)) make -j$(nproc); }",
         "nice -n 5 X=$(echo a b) ls",
+        "bash -c \"$(echo 'X=${nope:-a b}') make\"",
+        "R=$(echo 'X=${n:-a b}'); echo \"$R\"",
+        "eval \"$(ssh-agent -s)\"",
+        "eval X=1 ls",
+        "f(){ bash -c 'eval $(opam env) make'; }; f",
+        ": $(bash -c 'X=$(date) ls')",
+        "cat <<'E' > f.sh\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
+        "trap 'rm -f \"$tmp\"' EXIT",
+        "bash <<< 'eval $(opam env) make'",
     ]
 
     def test_shell_wrapped_destructive_blocked(self):
@@ -3108,6 +3165,19 @@ class TestWrapperUnwrapping(unittest.TestCase):
         for cmd in self.PREFIX_WRAPPED:
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_printed_assignment_walk_memo_is_per_owner_and_linear(self):
+        """XERK-1645 QA: the walk memoises each heredoc owner; a memo keyed
+        wrong reused a non-shell owner's answer for a shell-fed one, and none
+        at all made a 250-heredoc line quadratic, past the deadline."""
+        body = "bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'"
+        cmd = f"bash <<'O'\ncat <<'A' >/dev/null\nx\nA\ncat <<'B' | bash\n{body}\nB\nO"
+        self.assertIsNotNone(guard.is_destructive(cmd))
+        many = "x=$(date); " + "; ".join(f"cat <<'E{i}' >/dev/null" for i in range(250)) \
+            + "\n" + "".join(f"b\nE{i}\n" for i in range(250))
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": many}, cwd="/tmp")[0], "allow")
+        self.assertLess(time.monotonic() - t, 10)
 
     def test_wrapped_safe_still_allowed(self):
         for cmd in self.WRAPPED_SAFE:

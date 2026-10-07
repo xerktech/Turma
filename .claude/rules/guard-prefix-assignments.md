@@ -37,6 +37,41 @@ paths:
 - A shell-fed heredoc script is cut BEFORE `_substitute_vars`, for the same reason. Nested heredocs
   that each need a cut double the cost per level (accepted: the deadline denies). Never add a flag
   that skips the nested cut: a heredoc needing its cut then hid the next one.
+- An assignment only a substitution PRINTS is cut on the line with that printed text spliced in
+  (`_printed_unsplit`, XERK-1645): `bash -c "$(echo 'X=${v:-a b}') rm …"`, eval, here-string,
+  `| bash`, an unquoted shell-fed heredoc. The raw cut never sees it, and the re-parse
+  substitutes `a b` before its own cut runs.
+  - Spliced plain AND literal (`_literal`): plain, `"$(echo 'X=${v:-a')"' b} rm …'` put a `"`
+    inside a `${…}` frame and the multi-piece dequote never closed.
+  - With `assigns=False` (`_body_printed`): applying the body's own assignments also expanded the
+    `${…}` it prints (`echo 'X=${v:-a b} Y=1'`, `echo $(echo 'X=…')`). Body-bound names
+    (`$(v=X; echo "$v=…")`) are therefore unread: XERK-1684.
+  - Added only when it differs from the raw line's cut spliced the same way, so a written
+    assignment is not cut twice; its pipelines join `unsplit_line`'s.
+  - Every re-parse level is handed its script `${…}`-substituted (`_substitute_vars` expands
+    inside `'…'` too), so the cut must run on RAW text one level up: the heredoc site cuts the
+    body (quoted delimiter too), and `_raw_printed_cuts` walks the raw line for every `-c`/eval
+    script, recursing into scripts, substitution bodies, `<(…)` and unquoted heredoc bodies
+    (`: $(bash -c 'eval $(…) rm …')`). Read the raw line BEFORE `_expand` rebinds `command`.
+  - Heredoc bodies in the walk: an unquoted one through `_heredoc_readings` (`\$'` is live
+    there); a quoted one when `_walk_owner_feeds_shell` (the site's `_heredoc_owner_feeds_shell`
+    plus a shell named on the owner line) says so, at any nesting; else data (`cat > f.sh`).
+  - The heredoc SITE in `_expand` walks a quoted body too, gated by `_owner_feeds_shell`: the
+    walk's owner-token check misses `bash<<'E'`, `{ bash; } <<'E'`, `$x <<'E'`, one in `$(…)`.
+    Never drop either: the site sees owners, the walk sees nesting.
+  - A segment's leading `f(){`/`function f {`/`{`/`(` is dropped first (`_RAW_SEG_OPENER_RE`):
+    `_tokenize` keeps `f(){` as one word. Every `-exec` script counts, not the first.
+  - Its scripts: an eval join, every `-c` script, a `trap` action, and a shell's or `.`'s
+    here-string (name glued to `<<<` too).
+  - The walk also reads its text ANSI-C decoded BEFORE splitting and its `$(` gate: split raw, a
+    `$'…\'…'` ended at the `\'` and `; …` after it cut the script (`\x24(` is a `$(`).
+  - Decoded is an ADDED reading, never the only one: `_ANSI_C_RE` is quote-blind, so a quoted
+    `"$'\'"` decoy read as one swallowed the rest of the line. Not yet a here-string a pipe carries to a shell
+    (`cat <<< '…' | bash`): XERK-1684.
+  - Accepted over-deny, as base already does for `$(echo 'X=1 Y=2') rm …`: printed text at
+    command start is read as re-parsed (`$(echo 'X=${v:-a b}') rm …` runs no `rm`).
+- `eval` counts as a wrapper for the cut, any spelling bash dequotes to it (`\eval`, `ev''al`,
+  `$'eval'`): its words re-join, so a printed `X=${v:-a` `b}` is one assignment again.
 - Only LEADING words: an argument's expansion IS word-split (`rm -rf X=${v:- /etc}` deletes /etc).
 - Replayed against ~33k real Bash commands: 0 decision changes.
 - Tests: `TestWrapperUnwrapping` (`PREFIX_WRAPPED`, `WRAPPED_SAFE`) in `test_guard.py`.

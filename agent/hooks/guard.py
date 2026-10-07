@@ -1002,7 +1002,8 @@ def _literal(text: str) -> str:
 
 
 @functools.lru_cache(maxsize=1024)
-def _body_printed(body: str, raw: tuple, multi: bool = True) -> tuple[str | None, int]:
+def _body_printed(body: str, raw: tuple, multi: bool = True,
+                  assigns: bool = True) -> tuple[str | None, int]:
     """`_printed_text` of a substitution body once its own substitutions are
     resolved, and the escaped ones that skipped (replayed by the caller, as
     `_memo` does). Memoised: every pass over a line re-resolves each nesting
@@ -1012,10 +1013,14 @@ def _body_printed(body: str, raw: tuple, multi: bool = True) -> tuple[str | None
     ``multi`` also reads a body of several statements (`_statements_printed`).
     Without it a body is read as it was before XERK-1609, a reading callers
     keep as well: an opaque body was denied where its printed text is not
-    (`eval "$(true; echo '${x#a}')rm …"`), so dropping it lost denies."""
+    (`eval "$(true; echo '${x#a}')rm …"`), so dropping it lost denies.
+
+    ``assigns=False`` leaves the body's own assignments unapplied: applying
+    them also expands a `${…}` the body only PRINTS (`echo 'X=${v:-a b}
+    Y=1'`), which hid the assignment cut of XERK-1645."""
     before = _SPLICES_ESCAPED[0]
-    resolved = _sub_substs(body, lambda m: _subst_text(m, multi=multi))
-    if "=" in resolved and "$" in resolved and _VAR_ASSIGN_RE.search(resolved):
+    resolved = _sub_substs(body, lambda m: _subst_text(m, multi=multi, assigns=assigns))
+    if assigns and "=" in resolved and "$" in resolved and _VAR_ASSIGN_RE.search(resolved):
         # The body's own assignments are its uses' values: `$(x='rm …';
         # echo "$x")` prints `rm …`, not `$x` (XERK-1634).
         resolved = _substitute_vars(resolved)
@@ -1093,7 +1098,7 @@ def _cat_printed(body: str) -> str | None:
 
 
 def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = False,
-                multi: bool = True) -> str:
+                multi: bool = True, assigns: bool = True) -> str:
     """What a substitution CONTRIBUTES to the command line around it.
 
     `rm -rf $(echo /etc)` deletes /etc, and erasing the substitution erased the
@@ -1109,7 +1114,7 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
 
     ``literal`` escapes a `$(…)`'s printed text as the WORD bash splices in; the
     plain text is what a shell re-parsing it runs. A `<(…)` hands its reader a
-    path, so it has no word reading. ``multi`` is `_body_printed`'s.
+    path, so it has no word reading. ``multi`` and ``assigns`` are `_body_printed`'s.
     """
     # The body's own substitutions run first, and a subshell prints what its
     # body prints: `` `echo \\`echo …\\`` `` and `$( (echo …) )` print the
@@ -1118,7 +1123,7 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
         return _OPAQUE_SUBST
     _SUBST_DEPTH[0] += 1
     try:
-        printed, escaped = _body_printed(_subst_inner(m), _reading(), multi)
+        printed, escaped = _body_printed(_subst_inner(m), _reading(), multi, assigns)
     finally:
         _SUBST_DEPTH[0] -= 1
     _SPLICES_ESCAPED[0] += escaped
@@ -4390,6 +4395,136 @@ def _unsplit_assignments(command: str, depth: int = 0) -> str:
     return "".join(out)
 
 
+def _printed_unsplit(command: str, unsplit: str | None = None) -> list[str]:
+    """``command`` with each substitution's PRINTED text spliced in, cut by
+    `_unsplit_assignments`, for each splice whose cut differs (XERK-1645):
+    `bash -c "$(echo 'X=${v:-a b}') rm …"` re-parses `X=${v:-a b} rm …`.
+
+    Spliced plain (what a re-parse runs) and literal (`_literal`: the word
+    bash splices in, so `"$(echo 'X=${v:-a')"' b} rm …'` stays one word).
+    The body's own assignments stay unapplied (`assigns=False`): applied, they
+    expanded the `${…}` it prints before the cut could see it. A cut equal to
+    ``unsplit`` (the raw line's own cut) spliced the same way is skipped: that
+    assignment was written, and is cut already."""
+    cuts: list[str] = []
+    if "$(" not in command and "`" not in command:
+        return cuts
+    if unsplit is None:
+        unsplit = _unsplit_assignments(command)
+    for literal in (False, True):
+        def printed(m: "re.Match[str]", literal: bool = literal) -> str:
+            return _subst_text(m, literal=literal, assigns=False)
+        spliced = _sub_substs(command, printed)
+        if spliced == command or "=" not in spliced:
+            continue
+        cut = _unsplit_assignments(spliced)
+        if cut != spliced and cut not in cuts and cut != (
+                _sub_substs(unsplit, printed) if unsplit != command else spliced):
+            _spend(len(cut))
+            cuts.append(cut)
+    return cuts
+
+
+# A function header or group opener leading a segment (`f(){ …`, `function f {`,
+# `{ …`, `( …`), dropped before a raw segment's program word is read.
+_RAW_SEG_OPENER_RE = re.compile(
+    r"\s*(?:function\s+[^\s(){}]+\s*(?:\(\s*\))?\s*|[^\s(){}=]+\s*\(\s*\)\s*)?[{(]?\s*")
+
+
+def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
+    """`_printed_unsplit` cuts of every `-c`/eval script ``command`` runs, read
+    off its RAW text, at any nesting (XERK-1645 QA): a re-parse level is handed
+    its script `${…}`-substituted, so `bash -c 'eval $(echo …X=${v:-a b}…)
+    rm …'` reached the level that splices it as `X=a b`. Recurses into each
+    script, each substitution body (`: $(bash -c '…')`, backticks, `<(…)`)
+    and each unquoted heredoc body; each cut is a whole script to expand."""
+    cuts: list[str] = []
+    if depth > _MAX_UNSPLIT_DEPTH:
+        return cuts
+    # `$'…'` decoded before the split and the gate, as an ADDED reading: split
+    # raw, its `\'` ended the quote early (`bash -c $'eval $(echo \'X=…\') rm
+    # …; echo done'`) and a `\x24(` is no `$(`; but `_ANSI_C_RE` is quote-blind,
+    # and alone it read a quoted `"$'\'"` as one and swallowed the line after it.
+    for text in dict.fromkeys((command, _decode_ansi_c(command))):
+        cuts += _raw_printed_walk(text, depth)
+    return list(dict.fromkeys(cuts))
+
+
+def _walk_owner_feeds_shell(text: str, owner: str, memo: dict | None = None) -> bool:
+    """Whether the heredoc on ``owner`` (of heredoc-free ``text``) feeds a
+    shell, judged as `_expand`'s heredoc site judges it (`bash<<'E'`,
+    `{ bash; } <<'E'`, `$x <<'E'`, `cat <<'E'|bash|cat`), plus a shell, `.` or
+    `source` named anywhere on the owner line (an added, over-reading test).
+    ``memo`` holds one walk's per-line facts and per-owner answers: every
+    heredoc on a line shares both, and recomputing them per heredoc made a
+    250-heredoc line quadratic, past the deadline (XERK-1645 QA)."""
+    memo = {} if memo is None else memo
+    if owner in memo:
+        return memo[owner]
+    if any(_basename(t) in _SHELL_PROGS or t in (".", "source")
+           for t in (w.strip("(){};&|") for w in _tokenize(_SUBST_RE.sub(" ", owner)))):
+        memo[owner] = True
+        return True
+    if "\0facts" not in memo:
+        memo["\0facts"] = (_var_values(text), _defined_names(text))
+    vals, defined = memo["\0facts"]
+
+    def feeds() -> bool:
+        if "\0feeds" not in memo:
+            memo["\0feeds"] = _line_feeds_shell(text)
+        return memo["\0feeds"]
+    memo[owner] = _heredoc_owner_feeds_shell(
+        owner, feeds, lambda w: _owner_word_may_be_shell(w, vals, defined),
+        lambda st: _stage_may_read_stdin(st, vals, defined))
+    return memo[owner]
+
+
+def _raw_printed_walk(command: str, depth: int) -> list[str]:
+    """One reading of `_raw_printed_cuts`."""
+    cuts: list[str] = []
+    if "$(" not in command and "`" not in command:
+        return cuts
+    text, heredocs = _split_heredocs(command)
+    owners: dict = {}
+    for owner, body, quoted in heredocs:
+        if not quoted:
+            # As the shell reads it too: `\$'` there is a live ANSI-C string.
+            for reading in _heredoc_readings(body):
+                cuts += _raw_printed_cuts(reading, depth + 1)
+        elif _walk_owner_feeds_shell(text, owner, owners):
+            # A quoted body a shell runs (`bash <<'E'`, `cat <<'E' | bash`),
+            # nested in another; a non-shell owner's (`cat <<'E' > f.sh`) is data.
+            cuts += _raw_printed_cuts(body, depth + 1)
+    for raw_seg in _split_segments(text):
+        if "$(" not in raw_seg and "`" not in raw_seg:
+            continue
+        for m in _find_substs(raw_seg):
+            cuts += _raw_printed_cuts(_subst_inner(m), depth + 1)
+        seg = _unwrap_group(raw_seg)
+        seg = seg[_RAW_SEG_OPENER_RE.match(seg).end():]
+        words = _strip_prefixes(_tokenize(seg))
+        if not words:
+            continue
+        prog = _bash_dequoted(_decode_ansi_c(words[0]))
+        if prog == "eval":
+            scripts = [" ".join(words[2:] if words[1:2] == ["--"] else words[1:])]
+        elif prog == "trap":
+            # The action string runs on the trap (`trap '…' EXIT`).
+            scripts = words[2:3] if words[1:2] == ["--"] else words[1:2]
+        else:
+            scripts = _raw_shell_c_scripts(words)
+            # A shell's here-string is its script (`bash <<< '…'`), its name
+            # glued to it or not (`sh<<<'…'`).
+            name = words[0].split("<<<", 1)[0]
+            if _basename(name) in _SHELL_PROGS or _bash_dequoted(name) in (".", "source"):
+                scripts += _herestrings(seg)
+        for script in scripts:
+            for reading in _script_readings(script):
+                cuts += _printed_unsplit(reading)
+                cuts += _raw_printed_cuts(reading, depth + 1)
+    return cuts
+
+
 def _unsplit_cuts(command: str, depth: int = 0) -> tuple[tuple[int, int, str], ...]:
     """`_unsplit_cuts_at` under the current reading: `_brace_end` parses a
     `${…}` per reading, so a cut cached under bash's hid dash's (XERK-1620 QA)."""
@@ -4462,11 +4597,13 @@ def _unsplit_cuts_at(command: str, depth: int,
             word = command[i:end]
             if depth < _MAX_UNSPLIT_DEPTH:
                 cuts += _unsplit_quoted(command, i, end, depth)
-            if at_start and _basename(word) in _PREFIX_WORDS:
+            if at_start and (_basename(word) in _PREFIX_WORDS
+                             or _bash_dequoted(_decode_ansi_c(word)) == "eval"):
                 # A wrapper (`env -u N X=… cmd`, `sudo -u root X=… cmd`,
                 # `timeout 5 env X=…`, `coproc N { X=… cmd; }`): every
                 # assignment-shaped word to the end of the command is cut, flag
-                # values and names included. Only an added reading, so cutting
+                # values and names included. So after `eval`, which re-joins
+                # a printed `X=${v:-a` `b}` into one word (XERK-1645 QA). Only an added reading, so cutting
                 # an argument costs nothing the line's own reading had.
                 wrapped = True
                 cuts += pending
@@ -6208,6 +6345,18 @@ def _stage_may_read_stdin(stage: str, vals: dict[str, list[str]],
     return False
 
 
+def _line_feeds_shell(raw_commands: str) -> bool:
+    """Whether any command on a heredoc-free line may read its stdin as a
+    script: `_heredoc_owner_feeds_shell`'s ``commands_feed_shell``."""
+    # Quotes, escapes and line continuations joined: bash runs `bas''h`,
+    # `b\ash`, `bas$''h` and `bas\` / `h` as `bash`.
+    # ...and names formed by an empty substitution or a brace (XERK-1629).
+    texts = _name_readings(raw_commands)
+    joined = [re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", t) for t in texts]
+    return any(map(_SHELL_WORD_RE.search, (*texts, *joined))) or any(
+        _reads_stdin_grouped(st) for t in texts for st in _split_segments(t))
+
+
 def _heredoc_owner_feeds_shell(owner: str, commands_feed_shell,
                                may_be_shell=None, reads_stdin=None) -> bool:
     """Whether a heredoc opened on ``owner`` reaches a shell that runs it as a
@@ -6938,6 +7087,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # BEFORE pre-normalisation, whose brace expansion ignores quoting and can
     # unbalance them (`awk '{print $2, $4}'`); each body gets the variables
     # this line assigns, so `d=/etc; (true; rm -rf $d)` still resolves.
+    raw_line = command
     raw_commands, heredocs = _split_heredocs(command)
     raw_vals = _var_values(raw_commands)
     # Every directory a `cd` before a command (on this line or an enclosing
@@ -6971,13 +7121,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
 
     def _commands_feed_shell() -> bool:
         if not line_feeds_shell:
-            # Quotes, escapes and line continuations joined: bash runs `bas''h`,
-            # `b\ash`, `bas$''h` and `bas\` / `h` as `bash`.
-            # ...and names formed by an empty substitution or a brace (XERK-1629).
-            texts = _name_readings(raw_commands)
-            joined = [re.sub(r"\\\n|\$(?=['\"])|[\\'\"]", "", t) for t in texts]
-            line_feeds_shell.append(any(map(_SHELL_WORD_RE.search, (*texts, *joined))) or any(
-                _reads_stdin_grouped(st) for t in texts for st in _split_segments(t)))
+            line_feeds_shell.append(_line_feeds_shell(raw_commands))
         return line_feeds_shell[0]
     for owner, body, quoted in heredocs:
         # A heredoc fed to a SHELL is a script, not data — `bash <<EOF ... EOF`
@@ -7010,6 +7154,17 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                     _spend(len(unsplit))
                     out.extend(_expand_segments(_substitute_vars(unsplit, raw_vals), depth + 1,
                                                 every_cd))
+                # ...and so is an assignment its substitutions print (XERK-1645
+                # QA), whichever shell runs them: a quoted body's own shell does.
+                for cut in _printed_unsplit(script, unsplit):
+                    out.extend(_expand_segments(_substitute_vars(cut, raw_vals), depth + 1,
+                                                every_cd))
+                # ...and its own `-c`/eval scripts walked raw. Here the owner is
+                # judged by `_owner_feeds_shell` (`bash<<'E'`, `{ bash; } <<'E'`,
+                # `$x <<'E'`, a heredoc in `$(…)`); the line's walk sees nesting.
+                if quoted:
+                    for cut in _raw_printed_cuts(script):
+                        out.extend(_expand_segments(cut, depth + 1, every_cd))
                 out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
                                             every_cd))
         elif not quoted:
@@ -7102,6 +7257,25 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             if seg not in seen:
                 seen.add(seg)
                 segments.append(seg)
+    # ...and one a substitution PRINTS: `bash -c "$(echo 'X=${v:-a b}') rm …"`
+    # re-parses `X=${v:-a b} rm …`, but the cut above ran on the raw line and
+    # the re-parse substitutes `a b` before its own cut can see it (XERK-1645).
+    # So the line with each substitution's printed text spliced in is cut too,
+    # adding its segments and pipelines only where the raw line's cut missed.
+    # ...and in each `-c`/eval script the line runs, read off the RAW text: a
+    # nested level is handed its script with `${…}` already substituted, so
+    # `bash -c 'eval $(echo …X=${v:-a b}…) rm …'` reached it as `X=a b`.
+    if "$(" in raw_line or "`" in raw_line or "$'" in raw_line:
+        for cut in _raw_printed_cuts(raw_line):
+            out.extend(_expand_segments(cut, depth + 1, every_cd))
+        for cut in _printed_unsplit(raw_commands, unsplit):
+            cut_line = _prenormalise(cut)
+            unsplit_line = f"{unsplit_line}\n{cut_line}" if unsplit_line else cut_line
+            seen = set(segments)
+            for seg in _split_segments(cut_line):
+                if seg not in seen:
+                    seen.add(seg)
+                    segments.append(seg)
     # The TAINT reading of every operator-holding substitution the splitter cut
     # (XERK-1613), rebuilt in ONE pass so a body of N statements stays linear.
     seen = set(segments)
