@@ -4756,6 +4756,105 @@ def _unsplit_cuts_at(command: str, depth: int,
     return tuple(kept)
 
 
+# A `${` opener, also spelled with empty or split quoting a re-parse joins
+# (`'X=$''{v:-a b}'`, `X='$'"{v:-a b}"`), or a bare `$name`.
+_PARAM_OPEN_RE = re.compile(r"\$['\"]*\{|\$([A-Za-z_]\w*)")
+def _glued_param_values(command: str, vals: dict[str, list[str]],
+                        spelled: bool = True) -> str:
+    """``command`` with every expansion that may hold a blank or operator
+    character glued into one word, whatever quoting or nesting it sits in: a
+    use of a name ``vals`` gives such a value becomes `_` (the line's own
+    reading judges the value; spliced here, a long one bloated every segment
+    it reached); any other `${…}` keeps its text, those characters made `_`.
+
+    bash never splits an assignment's value, so `X=${v:-a b} <cmd>`, `s='a
+    b'; X=$s <cmd>` and their joins through `eval 'X=${v:-a b}' '<cmd>'`,
+    `echo 'X=…' '<cmd>' | bash`, a printed `$(echo 'X=…') <cmd>` or a `source
+    <(…)` run <cmd>, while the guard spliced the value first and read `X=a`
+    and the program `b` (XERK-1684). An ADDED reading only: a `${…}` span is
+    found by brace depth with quoting ignored, so it may cover real code
+    (`echo '${'; …; echo '}'`), which the line's own reading still reads."""
+    glue = {name for name, values in vals.items()
+            # A `\` may be an ANSI-C escape kept undecoded: `s=$'a\tb'` holds a tab.
+            if any(_ASSIGN_SPLITS_RE.search(v) or "\\" in v for v in values)}
+    return _glue_spans(command, glue, 0, spelled) if glue or "${" in command else command
+
+
+def _odd_escapes_before(text: str, i: int) -> bool:
+    """Whether an odd run of `\\` ends at ``i`` (the character there is escaped)."""
+    j = i
+    while j > 0 and text[j - 1] == "\\":
+        j -= 1
+    return (i - j) % 2 == 1
+
+
+def _glue_spans(command: str, glue: set[str], in_value: int, spelled: bool) -> str:
+    """`_glued_param_values` with its glued values worked out. Only an
+    expansion after a `=` (or nested in a glued one: ``in_value`` levels) is glued:
+    without one no assignment can hold it, and gluing every `$x` doubled
+    lines that only use one. Any `=` earlier on the line counts, quoted or
+    not: a scan for where its WORD ends had to be bash's own lexer, and each
+    misread (`"$(echo "a b")"`, a case `)`, `<(…)`) dropped a glue (QA)."""
+    if in_value > _MAX_NESTED_VARS + 1:
+        # As deep as `_substitute_vars` refuses; each level rescans its text.
+        raise _ExpansionTooLarge
+    out, last = [], 0
+    # A `\` counts as a `=` too: an escape can print one (`printf 'X\x3d$s'`, QA).
+    first_eq = -1 if in_value else min((i for i in (command.find("="), command.find("\\"))
+                                        if i >= 0), default=-1)
+
+    def in_assignment(at: int) -> bool:
+        return bool(in_value) or 0 <= first_eq < at
+
+    # Each `${`'s closing `}`, matched in ONE pass: scanning on from each
+    # opener rescanned the line per unclosed one (`${a:-${` × 2000, QA). As
+    # in bash, only a `${` nests: a bare `{` is text, so `${v:-a { b}` closes
+    # at the first `}` (paired with the `{`, it read as unclosed, QA).
+    # ``spelled`` also opens `$''{`, `$'"{` and an escaped `\${`, as a re-parse
+    # may join them; read without it too, since to THIS parse they are text,
+    # and one before a span's `}` took it (`${v:-a b$"{"}`, QA).
+    opens = {m.end() - 1 for m in _PARAM_OPEN_RE.finditer(command) if m.group(1) is None
+             and (spelled or m.group(0) == "${" and not _odd_escapes_before(command, m.start()))}
+    closes, stack, i, n = {}, [], 0, len(command)
+    while i < n:
+        ch = command[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if i in opens:
+            stack.append(i)
+        elif ch == "}" and stack:
+            closes[stack.pop()] = i
+        i += 1
+
+    for m in _PARAM_OPEN_RE.finditer(command):
+        if m.start() < last:
+            continue
+        if m.group(1) is not None:
+            if m.group(1) in glue and in_assignment(m.start()):
+                out += (command[last:m.start()], "_")
+                last = m.end()
+            continue
+        close = closes.get(m.end() - 1, -1)
+        j = close + 1
+        if close < 0 or not in_assignment(m.start()):
+            # Unclosed (`${v:-{}`): its text is no span, but a use after it still is.
+            continue
+        name = _ASSIGN_NAME_RE.match(command, m.end())
+        if name and name.group(0) in glue or command.startswith("!", m.end()):
+            # ...and an indirect `${!n}`, whose value is another name's (QA).
+            out += (command[last:m.start()], "_")
+        else:
+            # A use nested in it glued too: `${v:-a${s}b}` with `s=' '`.
+            inner = _glue_spans(command[m.end():j - 1], glue, in_value + 1, spelled)
+            out += (command[last:m.end()], _ASSIGN_SPLITS_RE.sub("_", inner), "}")
+        last = j
+    if not out:
+        return command
+    out.append(command[last:])
+    return "".join(out)
+
+
 def _unquoted_text(word: str) -> str:
     """``word`` without its quoted runs: a blank in `X='a b'` splits nothing,
     so that assignment needs no cut (`_ENV_ASSIGN` reads it whole)."""
@@ -7536,6 +7635,27 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if seg not in seen:
                     seen.add(seg)
                     segments.append(seg)
+    # ...and with each expansion's value glued into one word, before anything
+    # splices it: an eval, pipe, printed or `source <(…)` join of
+    # `X=${v:-a b}` with the command is one assignment to bash (XERK-1684).
+    # Only the segments, pipelines and `<(…)` texts that differ are added, as
+    # for the cut line: a whole-line re-read doubled real nested scripts.
+    # ANSI-C decoded too, so `${v:-a'$'\t''b}` shows its blank; not only,
+    # since decoding drops the `$` of `'X=$''{v:-a b}'`.
+    glued_lines: list[str] = []
+    for plain in dict.fromkeys((raw_commands, _decode_ansi_c(raw_commands)
+                                if "$'" in raw_commands else raw_commands)):
+        for spelled in (True, False):
+            glued = _glued_param_values(plain, raw_vals, spelled)
+            if glued == plain or _prenormalise(glued) in glued_lines:
+                continue
+            _spend(len(glued))
+            glued_lines.append(_prenormalise(glued))
+            seen = set(segments)
+            for seg in _split_segments(glued_lines[-1]):
+                if seg not in seen:
+                    seen.add(seg)
+                    segments.append(seg)
     # The TAINT reading of every operator-holding substitution the splitter cut
     # (XERK-1613), rebuilt in ONE pass so a body of N statements stays linear.
     seen = set(segments)
@@ -7580,8 +7700,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # (XERK-1611). Fed to EVERY reader on the line, whatever the program and
     # wherever the reader sits — failing closed — since the splits below are
     # not paren-aware and cut at a `|` or `;` inside one (`<(echo …; true)`).
-    proc_subst_texts = [text for m in _find_substs(command) if m.group(0).startswith("<(")
-                        for text in _proc_subst_texts(_subst_inner(m))] if "<(" in command else []
+    proc_subst_texts = [text for line in (command, *glued_lines) if "<(" in line
+                        for m in _find_substs(line) if m.group(0).startswith("<(")
+                        for text in _proc_subst_texts(_subst_inner(m))]
     # ...and so is what an `exec` opens on an fd for the rest of the line:
     # `exec 3<<<'<cmd>'; bash /dev/fd/3` (XERK-1614). Its `<(…)` is above.
     if "<<<" in command:
@@ -7611,6 +7732,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     if unsplit_line and feeds_a_shell:
         # ...and the line read with its assignments cut (XERK-1620).
         pipelines = list(dict.fromkeys(pipelines + _walked_pipelines(unsplit_line)))
+    for line in glued_lines if feeds_a_shell else ():
+        # ...and with its values glued (XERK-1684).
+        pipelines = list(dict.fromkeys(pipelines + _walked_pipelines(line)))
     # Functions the line defines, so a call in a pipeline runs its body.
     func_bodies = (_function_bodies(command)
                    if feeds_a_shell and ("(" in command or "function" in command) else {})

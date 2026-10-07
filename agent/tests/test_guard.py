@@ -3119,6 +3119,50 @@ class TestWrapperUnwrapping(unittest.TestCase):
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
+        # XERK-1684: a value joined with the command by a re-parse, or one
+        # an assigned name carries, is still one assignment to bash.
+        "eval 'X=${nope:-a b}' 'rm -rf /etc'",
+        "eval 'X=${nope:-a;b}' 'rm -rf /etc'",
+        "eval 'X=${nope:-a' 'b}' 'rm -rf /etc'",
+        "eval 'X=$''{nope:-a b}' 'rm -rf /etc'",
+        "eval X='$'\"{nope:-a b}\" 'rm -rf /etc'",
+        "eval 'X=${nope:-a'$'\\t''b}' 'rm -rf /etc'",
+        "echo 'X=${nope:-a b}' 'rm -rf /etc' | bash",
+        "printf '%s ' 'X=${nope:-a b}' 'rm -rf /etc' | bash",
+        "eval \"$(echo 'X=${nope:-a b}')\" \"rm -rf /etc\"",
+        "echo \"$(echo 'X=${nope:-a b}')\" 'rm -rf /etc' | bash",
+        "eval $(echo X='${nope:-a') 'b}' rm -rf /etc",
+        "bash -c \"$(v=X; echo \"$v=\"'${nope:-a b}') rm -rf /etc\"",
+        "eval \"$(v=X; echo \"$v=\"'${nope:-a b}') rm -rf /etc\"",
+        "source <(echo \"$(echo 'X=${nope:-a b}') rm -rf /etc\")",
+        ". <(echo 'X=${nope:-a b}' 'rm -rf /etc')",
+        "bash <<< \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "echo 'bash -c \"$(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc\"' | bash",
+        "s='a b'; X=$s rm -rf /etc",
+        "s='a b'; eval 'X=$s' 'rm -rf /etc'",
+        "s='a b'; echo 'X=$s' 'rm -rf /etc' | bash",
+        "s=' '; eval 'X=${nope:-a${s}b}' 'rm -rf /etc'",
+        "s=$'a\\tb'; X=$s rm -rf /etc",
+        "t='a b'; n=t; X=${!n} rm -rf /etc",
+        "t='a b'; n=t; eval 'X=${!n}' 'rm -rf /etc'",
+        # ...wherever bash keeps the word whole: quoted, escaped, substituted.
+        "s='a b'; X=\"a b\"$s rm -rf /etc",
+        "s='a b'; X=a\\ $s rm -rf /etc",
+        "s='a b'; X=$(true)$s rm -rf /etc",
+        "s='a b'; X=`true`$s rm -rf /etc",
+        "s='a b'; X=$((1))$s rm -rf /etc",
+        "s='a b'; X=$'('$s rm -rf /etc",
+        "s='a b'; eval 'X=$(true)$s' 'rm -rf /etc'",
+        "s='a b'; X=\"$(echo \"a b\")\"$s rm -rf /etc",
+        "s='a b'; X=\"${nope:-\"a b\"}\"$s rm -rf /etc",
+        "s='a b'; X=${nope:-{}$s rm -rf /etc",
+        "s='a b'; X=<(true)$s rm -rf /etc",
+        "for s in 'a b'; do printf 'X\\x3d$s rm -rf /etc\\n' | bash; done",
+        "echo '${'; s='a b'; X=$s rm -rf /etc",
+        "eval 'X=${nope:-{a b}' 'rm -rf /etc'",
+        "echo 'X=${nope:-a { b}' 'rm -rf /etc' | bash",
+        "eval 'X=${nope:-a b$\"{\"}' 'rm -rf /etc'",
+        "eval 'X=${nope:-a b\\${}' 'rm -rf /etc'",
     ]
 
     # Same wrappers, harmless payloads: the unwrapping must not over-block.
@@ -3154,6 +3198,11 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "cat <<'E' > f.sh\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
         "trap 'rm -f \"$tmp\"' EXIT",
         "bash <<< 'eval $(opam env) make'",
+        "eval 'X=${nope:-a b}' 'echo hi'",
+        "s='a b'; X=$s make",
+        "msg='fix: a; b'; git commit -m \"$msg\"",
+        "echo '${' ; echo '}'",
+        "t='a b'; n=t; X=${!n} make",
     ]
 
     def test_shell_wrapped_destructive_blocked(self):
@@ -3184,6 +3233,14 @@ class TestWrapperUnwrapping(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
                 self.assertIsNone(guard.policy_reason(cmd))
+
+    def test_glued_values_nest_as_deep_as_substitution(self):
+        # XERK-1684: the glued reading refuses a nest only where
+        # `_substitute_vars` does, so it adds no "too large" of its own.
+        def nest(k):
+            return "A=1; echo " + "${a:-" * k + "x" + "}" * k
+        self.assertEqual(guard.decide("Bash", {"command": nest(201)})[0], "allow")
+        self.assertEqual(guard.decide("Bash", {"command": nest(202)})[0], "deny")
 
     def test_policy_rules_also_unwrap(self):
         for cmd in (
