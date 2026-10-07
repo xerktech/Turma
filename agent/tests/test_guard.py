@@ -1362,9 +1362,40 @@ class TestProducedScripts(unittest.TestCase):
         # splice per level denied a benign large value as "too large" (QA).
         big = 'x="' + "A" * 150_000 + '"; echo "' + "${a:-" * 4 + "${x}" + "}" * 4 + '"'
         self.assertAllowed(big)
-        # A quoted `}` still keeps the expansion one word (XERK-1585).
-        self.assertEqual(guard._substitute_vars("${a:-'}' #}", {}), "${a:-'}' #}")
+        # A quoted `}` runs the expansion on to the real `}`, its `#` kept a
+        # word, never a comment (XERK-1585, XERK-1659).
+        self.assertEqual(guard._substitute_vars("${a:-'}' #}", {}), "'}' \\#")
         self.assertEqual(guard._substitute_vars("${x:-${y:-$(echo P)}}", {}), "$(echo P)")
+
+    def test_defaults_on_empty_subscripted_and_quoted_brace_names_apply(self):
+        # XERK-1659: each ran `rm -rf /` as nobody while the guard allowed it.
+        R = self.R
+        for cmd in (f"x=; ${{x:-{R}}}", f'x=""; ${{x:={R}}}', f"x=; ${{x:={R}}}; $x",
+                    f"${{y[0]:-{R}}}", f"${{y[@]:-{R}}}", f"${{y[*]-{R}}}",
+                    f"${{y[1]:={R}}}",
+                    f"printf -v a '%s' \"${{x:-$(echo {R})}}\"; $a",
+                    f"printf -v a '%s' \"${{x:-{R}}}\"; $a",
+                    f'a="}}{R}"; eval "${{a#\\}}}}"',
+                    f'a="}}{R}"; eval ${{a#[\\}}]}}',
+                    f'a="}}{R}"; eval "${{a#"${{b:-\\}}}}"}}"',
+                    f'a="{R}}}"; eval "${{a%"${{b:-\\}}}}"}}"',
+                    f'a="}}{R}"; eval "${{a#"${{y[0]:-\\}}}}"}}"',
+                    f'a="}}{R}"; b=1; eval "${{a#"${{b:+\\}}}}"}}"',
+                    f'a="}}{R}"; b=x; eval "${{a#"${{b+\\}}}}"}}"',
+                    f"y=(); ${{y[0]:-{R}}}", f"y=(a); ${{y[1]:-{R}}}",
+                    # ...and its values still read: `/etc` is the element here.
+                    'y=(/etc); rm -rf "${y[0]:-x}"', 'y=(/); rm -rf ${y[0]:-.}/etc',
+                    f'a="}}{R}"; y=(); eval "${{a#"${{y[0]:-\\}}}}"}}"',
+                    f'a="}}{R}"; y=(); eval "${{a#"${{y[0]:-}}}}"}}"',
+                    # `-`/`=` keep an empty value: the `echo` never runs.
+                    f"x=; ${{x-echo}} {R}", f'x=""; ${{x=echo}} {R}'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("x=; echo ${x:-safe}", "x=; ls ${x:-.}", "echo ${y[0]:-none}",
+                    'x=; "${x-ls}"', "printf -v a '%s' \"${x:-ls}\"; $a",
+                    'a="}ls"; eval "${a#\\}}"', "echo ${a:-'}' #}"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
 
     def test_a_value_a_grouped_or_looped_reader_takes_from_stdin_runs(self):
         # XERK-1650: each ran `rm -rf /etc` while the guard allowed it.

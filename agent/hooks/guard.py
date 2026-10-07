@@ -2757,6 +2757,13 @@ def _assigned_values(command: str, depth: int = 0,
             bound = _printf_v(_strip_prefixes(_tokenize(seg)))
             if bound:
                 vals.setdefault(bound[0], []).append(bound[1])
+                if "${" in seg and not _MAIN_PARSE[0]:
+                    # Its arguments' defaults applied too, as for `x=${y:-…}`:
+                    # unapplied, `printf -v a %s "${x:-rm -rf /}"; $a` spliced
+                    # the raw `${…}` text nothing re-reads (XERK-1659).
+                    with_default = _printf_v(_strip_prefixes(_tokenize(_substitute_vars(seg, {}))))
+                    if with_default and with_default != bound:
+                        applied.setdefault(with_default[0], []).append(with_default[1])
     bare = command.replace("'", "").replace('"', "").replace("\\", "")
     if "read" in bare or "select" in bare or "mapfile" in bare:
         # Gated on the text with quotes cut: `r''ead a` is `read a`.
@@ -3594,6 +3601,23 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
 
     states = _quote_states(command) if (vals and "$" in command) or "${" in command else []
 
+    def default(text: str, at: int) -> str:
+        """A `${x:-…}` default at ``at``, spliced as the text bash reads."""
+        # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
+        # the `rm` a comment. The `#` was a word inside the braces; keep it
+        # one (XERK-1585). Quotes and `$(…)` in the default stay live.
+        out = re.sub(r"(?<!\\)#", r"\\#", text)
+        # A bare name in it braced, so text after the `}` stays text:
+        # `${a#${b:-$nope}x}` read the pattern as `$nopex` (XERK-1651).
+        out = re.sub(r"(?<!\\)\$([A-Za-z_]\w*)", r"${\1}", out)
+        if states and states[at] == '"':
+            out = _dq_default(out)
+            # In `"…"` bash drops the `\` before a `}` in a default; kept,
+            # `"${a#"${b:-\}}"}"` read the pattern as a literal `\}`
+            # and never trimmed (XERK-1659 QA).
+            out = _dq_unescape_brace(out)
+        return out
+
     def rep(m: "re.Match[str]", depth: int) -> tuple[str, int]:
         """What the use ``m`` splices, and where the text after it resumes."""
         if not _SPLICE_RAW[0] and not _live_dollar(command, m.start()):
@@ -3612,26 +3636,63 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         if m.group(1):
             close = _brace_end(command, m.start(), states[m.start()] == '"')
             if close != end - 1:
-                if close < end or "${" not in command[m.start() + 2:close]:
+                if close < end or vals.get(m.group(1)) \
+                        and command.startswith("[", m.start() + 2 + len(m.group(1))):
+                    # An assigned array's element is read as all its values
+                    # joined, so its op read past a quoted `}` lost the
+                    # default: raw, its `${` keeps an outer op unread, as
+                    # before XERK-1659 (XERK-1700 tracks reading elements).
+                    return m.group(0), end
+                if "${" not in command[m.start() + 2:close]:
                     # `[^}]*` stopped at a `}` that is quoted — in
                     # `${a:-'}' #}` the expansion runs on to the last `}`.
                     # Splicing the short match left the `#` bare, a comment
-                    # hiding the rest of the line (XERK-1585); the raw text is
-                    # read as one word instead.
-                    return m.group(0), end
-                # A nested `${…}` closed first: `${x:-${y:-$(echo …)}}`. Left
-                # raw, `$a` read the whole line's text as one word and a
-                # default inside a default ran unseen (XERK-1653). The inner
-                # ones resolve first, then this one over what they spliced.
-                if depth >= _MAX_NESTED_VARS:
-                    raise _ExpansionTooLarge
-                rest = sub(m.start() + 2 + len(m.group(1)), close, depth + 1)
-                end = close + 1
-                replaced = 3 + len(m.group(1)) + len(rest)
+                    # hiding the rest of the line (XERK-1585). Left raw,
+                    # `eval "${a#\}}"` ran what the guard never read
+                    # (XERK-1659): the operator reads up to the real `}`.
+                    rest = command[m.start() + 2 + len(m.group(1)):close]
+                    end = close + 1
+                    replaced = end - m.start()
+                else:
+                    # A nested `${…}` closed first: `${x:-${y:-$(echo …)}}`. Left
+                    # raw, `$a` read the whole line's text as one word and a
+                    # default inside a default ran unseen (XERK-1653). The inner
+                    # ones resolve first, then this one over what they spliced.
+                    if depth >= _MAX_NESTED_VARS:
+                        raise _ExpansionTooLarge
+                    rest = sub(m.start() + 2 + len(m.group(1)), close, depth + 1)
+                    end = close + 1
+                    replaced = 3 + len(m.group(1)) + len(rest)
         name = m.group(1) or m.group(3) or ""
         got = vals.get(name)
         op = _VAR_OP_RE.match(rest)
-        if got:
+        if not got and not op and rest.startswith("["):
+            # An unset array's element takes its default as a scalar does:
+            # `${y[0]:-rm -rf /}` runs it (XERK-1659).
+            sub_end = rest.find("]")
+            op = _VAR_OP_RE.match(rest[sub_end + 1:]) if sub_end > 0 else None
+        if got and op and op.group(1) in (":-", ":=") and not _picked(got, name) \
+                and not rest.startswith("["):
+            # A name assigned empty takes its `:-`/`:=` default as an unset one
+            # does: read as the empty value, `x=; ${x:-rm -rf /}` ran unseen
+            # (XERK-1659).
+            got = None
+        elem_op = None
+        # Not inside another op: the marker in its pattern would hide its trim.
+        if got and depth == 0 and rest.startswith("[") and rest.find("]") > 0:
+            elem_op = _VAR_OP_RE.match(rest[rest.find("]") + 1:])
+        if got and elem_op and elem_op.group(1) in _VAR_DEFAULT_OPS:
+            # An assigned array's element may be empty or unset all the same
+            # (`y=()`, `y=(a); ${y[1]:-…}`), which the joined values can't
+            # say: read as the values AND as the default, led by the unread
+            # marker. The values alone, `y=(); ${y[0]:-rm -rf /}` ran unseen
+            # (XERK-1659).
+            state = states[m.start()] if m.start() < len(states) else ""
+            sep = '" "' if state == '"' else " "
+            out = sep.join((_quote_literal(_UNREAD_OUTPUT, state),
+                            _quote_literal(_picked(got, name), state),
+                            default(elem_op.group(2), m.start())))
+        elif got:
             value = _picked(got, name)
             state = states[m.start()] if m.start() < len(states) else ""
             if state == '"' and (rest.startswith("[")
@@ -3648,7 +3709,10 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 out = '"' + _quote_literal(value, "") + '"'
             else:
                 # A name in an op's pattern is expanded first: `"${a%%$s*}"`.
-                out = _splice_readings(_op_readings(value, op.group(1), op.group(2), vals)
+                arg = op.group(2) if op else ""
+                if state == '"' and op and op.group(1) in (":+", "+"):
+                    arg = _dq_unescape_brace(arg)  # as a default's, below
+                out = _splice_readings(_op_readings(value, op.group(1), arg, vals)
                                        if op else [value], state)
         elif name == "HOME" and op and op.group(1) in _VAR_DEFAULT_OPS and _HOME_KEPT[0]:
             # The reading where HOME is set, as it is in every shell an agent
@@ -3656,15 +3720,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # home wipe (XERK-1656). Kept, `_home_reading` judges it.
             return "${" + name + rest + "}", end
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
-            # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
-            # the `rm` a comment. The `#` was a word inside the braces; keep it
-            # one (XERK-1585). Quotes and `$(…)` in the default stay live.
-            out = re.sub(r"(?<!\\)#", r"\\#", op.group(2))
-            # A bare name in it braced, so text after the `}` stays text:
-            # `${a#${b:-$nope}x}` read the pattern as `$nopex` (XERK-1651).
-            out = re.sub(r"(?<!\\)\$([A-Za-z_]\w*)", r"${\1}", out)
-            if states and states[m.start()] == '"':
-                out = _dq_default(out)
+            out = default(op.group(2), m.start())
         else:
             return command[m.start():end], end
         _spend(len(out) - replaced)
@@ -3687,6 +3743,15 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         return "".join(out)
 
     return sub(0, len(command), 0)
+
+
+def _dq_unescape_brace(text: str) -> str:
+    r"""A `${x:-…}` default or `:+` word inside `"…"` with each `\}` read as
+    bash reads it there, a plain `}`. Kept, `"${a#"${b:-\}}"}"` read the
+    pattern as a literal `\}` and never trimmed (XERK-1659)."""
+    if "\\}" not in text:
+        return text
+    return re.sub(r"\\(.)", lambda e: "}" if e.group(1) == "}" else e.group(0), text, flags=re.S)
 
 
 def _dq_default(text: str) -> str:
