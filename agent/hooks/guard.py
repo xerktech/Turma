@@ -4106,6 +4106,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 if depth >= _MAX_NESTED_VARS:
                     raise _ExpansionTooLarge
                 arg = sub(end - 1 - len(arg), end - 1, depth + 1)
+                replaced += len(arg) - len(elem_op.group(2))  # `sub` charged it
             out = sep.join((_quote_literal(_UNREAD_OUTPUT, state),
                             _quote_literal(_picked(got, name), state),
                             default(arg, m.start())))
