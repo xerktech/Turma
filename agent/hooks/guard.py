@@ -4100,9 +4100,15 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # (XERK-1659).
             state = states[m.start()] if m.start() < len(states) else ""
             sep = '" "' if state == '"' else " "
+            arg = elem_op.group(2)
+            if "$" in arg and end == m.end():
+                # Names in it resolve as an unset name's default does (XERK-1661 QA).
+                if depth >= _MAX_NESTED_VARS:
+                    raise _ExpansionTooLarge
+                arg = sub(end - 1 - len(arg), end - 1, depth + 1)
             out = sep.join((_quote_literal(_UNREAD_OUTPUT, state),
                             _quote_literal(_picked(got, name), state),
-                            default(elem_op.group(2), m.start())))
+                            default(arg, m.start())))
         elif got:
             value = _picked(got, name)
             state = states[m.start()] if m.start() < len(states) else ""

@@ -384,7 +384,8 @@ paths:
     as the literal `$x` — a bypass of `rm -rf ${x:+$x}`.
   - An unset name's default is resolved over the line's positions like a nested `${…}`
     (XERK-1661): spliced raw, `a=/etc; rm -rf ${q:-$a}` left a `${a}` nothing expanded again.
-    Only the default's span, so an element's `${y[0]:-$a}` keeps its `[0]`.
+    Only the default's span, so an element's `${y[0]:-$a}` keeps its `[0]`; an ASSIGNED element's
+    marker-led default is resolved the same way. A quote in it stays raw (XERK-1700).
   - `_dequote_value` braces a name a quote ends (`$b'tc'`, `"$b"tc` → `${b}tc`): stored as
     `$btc`, it read an unset name where bash appends `tc` to `$b` (XERK-1661).
     `_brace_quote_ended` braces one in any text (`$(echo $b'tc')`), with NO unbraced re-read:

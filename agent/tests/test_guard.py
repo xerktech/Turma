@@ -1487,6 +1487,8 @@ class TestProducedScripts(unittest.TestCase):
                     "b=/e; a=$b'tc'; rm -rf $a", 'b=/e; a=$b"tc"; rm -rf $a',
                     'b=/e; a="$b"tc; rm -rf $a', "a=/etc; rm -rf ${q-$a}",
                     "a=/etc; rm -rf ${y[0]:-$a}", 'a=/etc; rm -rf "${y[@]:-$a}"',
+                    # A quote in an assigned element's default stays raw: XERK-1700.
+                    "a=/etc; y=(); rm -rf ${y[0]:-$a}", "a=/etc; y=(x); rm -rf ${y[1]-$a}",
                     # A quote join inside a value's substitution (QA).
                     "b=/e; a=$(echo $b'tc'); rm -rf $a", "b=/e; a=`echo $b'tc'`; rm -rf $a",
                     'b=/e; a=$(echo "$b"tc); rm -rf $a', "B=r; a=$(echo $B'm'); $a -rf /etc",
