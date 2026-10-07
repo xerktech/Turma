@@ -3075,6 +3075,23 @@ def _mask_expansions(command: str) -> str:
     for sub in _find_substs(command):
         for i in range(sub.start(), sub.end()):
             masked[i] = "."
+    # `$((…))` arithmetic: `_find_substs` scans INTO it but does not return it,
+    # so its `))` would read as a command closer (`$((1)) done`, QA). Masked by
+    # a balanced-paren span from `$((`.
+    for m in re.finditer(r"\$\(\(", command):
+        if states[m.start()]:
+            continue
+        depth, i = 0, m.end() - 2
+        while i < len(command):
+            if command[i] == "(":
+                depth += 1
+            elif command[i] == ")":
+                depth -= 1
+                if not depth:
+                    break
+            i += 1
+        for j in range(m.start(), min(i, len(command) - 1) + 1):
+            masked[j] = "."
     for m in re.finditer(r"\$\{", command):
         if states[m.start()]:
             continue

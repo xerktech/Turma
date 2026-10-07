@@ -1255,6 +1255,7 @@ class TestParserGaps(unittest.TestCase):
                     # is no keyword, so the body is not cut short at it.
                     "for i in 1 2; do z=$a$c; echo ${q} done; a='rm -rf /etc'; done; c=x; $z",
                     "for i in 1 2; do z=$a$c; echo $(true) done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$a$c; echo $((1)) done; a='rm -rf /etc'; done; c=x; $z",
                     "for i in 1 2; do z=$a$c; x=(done); a='rm -rf /etc'; done; c=x; $z",
                     # QA delta: a quoted/literal separator in a value is part of
                     # it and read in order, not a statement that ends it.
