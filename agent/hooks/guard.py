@@ -4343,7 +4343,13 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
     script, each substitution body (`: $(bash -c '…')`, backticks, `<(…)`)
     and each unquoted heredoc body; each cut is a whole script to expand."""
     cuts: list[str] = []
-    if depth > _MAX_UNSPLIT_DEPTH or ("$(" not in command and "`" not in command):
+    if depth > _MAX_UNSPLIT_DEPTH:
+        return cuts
+    # `$'…'` decoded before the split and the gate: split raw, its `\'` ended
+    # the quote early (`bash -c $'eval $(echo \'X=…\') rm …; echo done'`),
+    # and a `\x24(` is a `$(`.
+    command = _decode_ansi_c(command)
+    if "$(" not in command and "`" not in command:
         return cuts
     text, heredocs = _split_heredocs(command)
     for _owner, body, quoted in heredocs:
@@ -4354,8 +4360,7 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
             continue
         for m in _find_substs(raw_seg):
             cuts += _raw_printed_cuts(_subst_inner(m), depth + 1)
-        # `$'…'` decoded first: `bash -c $'eval $(echo \'X=…\') …'` is a script too.
-        seg = _unwrap_group(_decode_ansi_c(raw_seg))
+        seg = _unwrap_group(raw_seg)
         seg = seg[_RAW_SEG_OPENER_RE.match(seg).end():]
         words = _strip_prefixes(_tokenize(seg))
         if not words:
@@ -7108,7 +7113,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # ...and in each `-c`/eval script the line runs, read off the RAW text: a
     # nested level is handed its script with `${…}` already substituted, so
     # `bash -c 'eval $(echo …X=${v:-a b}…) rm …'` reached it as `X=a b`.
-    if "$(" in raw_line or "`" in raw_line:
+    if "$(" in raw_line or "`" in raw_line or "$'" in raw_line:
         for cut in _raw_printed_cuts(raw_line):
             out.extend(_expand_segments(cut, depth + 1, every_cd))
         for cut in _printed_unsplit(raw_commands, unsplit):

@@ -3067,7 +3067,8 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "bash <<< 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
         "sh<<<'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
         ". /dev/stdin <<< 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
-        "bash -c $'eval $(echo \\'X=${nope:-a b}\\') rm -rf /etc'",
+        "bash -c $'eval $(echo \\'X=${nope:-a b}\\') rm -rf /etc; echo done'",
+        "sh <<< $'eval \\x24(echo \\'X=${nope:-a b}\\') rm -rf /etc'",
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
