@@ -19,6 +19,12 @@ paths:
     side), a quote/nesting-aware scanner (literal `{`, `\$'`, backtick in `"…"`, case `)`).
   - Cost, measured: 0 new false denies over a 36k-command real corpus replay vs main. A false deny
     needs a closer, a shell word AND a destructive body on one command.
+- A wrapper glued to `<<` (`env<<'E' bash`): `_heredoc_segment_programs` also reads the owner
+  with each `<<DELIM` (a whole shell word, `_HEREDOC_OP_RE`) dropped, so `_strip_prefixes`
+  reaches `bash` (XERK-1661). Glued to a NON-literal word (`$F<<'E' bash`): XERK-1719.
+  - Never narrow the closer rule to skip `${NAME}`: its `}` is what denies `${F}<<'E' bash`
+    (F=env). Accepted instead: `cat > "$F" <<'E'` (braced to `"${F}"`) + a shell word anywhere
+    + a destructive-looking body over-denies, as `"${F}"` already did on main (rollup).
 - `_ungrouped` yields two readings (end-trimmed, cut at first `)`/`}`); either finding a shell
   counts. Each alone lost a shape the other reads (`X=$(pwd) bash` vs `(bash)<<EOF`).
 - `_split_segments` cuts `2>&1` at `&` and `>|f` at `|`; the owner text is normalised before it is

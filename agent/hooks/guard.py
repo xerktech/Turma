@@ -3392,6 +3392,13 @@ def _dequote_value(value: str) -> str:
             i = m.end()
             continue
         ch = value[i]
+        m = re.compile(r"\$([A-Za-z_]\w*)(?=['\"])").match(value, i)
+        if m:
+            # A name a quote ends, braced: stored as `$btc`, `$b'tc'` read an
+            # unset name where bash expands `$b` then appends `tc` (XERK-1661).
+            out.append("${" + m.group(1) + "}")
+            i = m.end()
+            continue
         if ch == "$" and value.startswith("'", i + 1):
             # `$'…'` is its ANSI-C decoded text (XERK-1657 QA: `f(){ $1; };
             # f $'rm …'` bound `$rm …`).
@@ -3419,6 +3426,11 @@ def _dequote_value(value: str) -> str:
                 m = _ASSIGN_SUBST_RE.match(value, j)
                 if m:
                     out.append(m.group(0))
+                    j = m.end()
+                    continue
+                m = re.compile(r"\$([A-Za-z_]\w*)(?=\")").match(value, j)
+                if m:  # `"$b"tc`, as above
+                    out.append("${" + m.group(1) + "}")
                     j = m.end()
                     continue
                 if value[j] == "\\" and j + 1 < n:
@@ -3918,6 +3930,8 @@ def _live_dollar(command: str, i: int) -> bool:
 # skipping it let `eval \$$x$(echo 'y rm …')` through (XERK-1615 QA); `$$x`
 # braced as `$${x}` is still the PID, then text.
 _GLUED_NAME_RE = re.compile(r"\$([A-Za-z_]\w*)(?=[$`\\])")
+# A bare name a quote ends: `$b'tc'`, `"$b"tc`, `$(echo $b'tc')`.
+_QUOTE_ENDED_NAME_RE = re.compile(r"\$([A-Za-z_]\w*)(?=['\"])")
 
 
 def _brace_glued_names(text: str) -> str:
@@ -3935,7 +3949,29 @@ def _brace_glued_names(text: str) -> str:
     runs `$xy rm …`. So `_expand` also reads the text unbraced."""
     if "$" not in text or not _BRACE_GLUED[0]:
         return text
-    return _GLUED_NAME_RE.sub(r"${\1}", text)
+    return _brace_quote_ended(_GLUED_NAME_RE.sub(r"${\1}", text))
+
+
+def _brace_quote_ended(text: str) -> str:
+    """``text`` with each live `$name` a quote ends braced: inlined as
+    `$btc`, `$(echo $b'tc')` read an unset name where bash appends `tc` to
+    `$b` (XERK-1661). Unlike a glued expansion the brace is right at any
+    re-parse level, so `_expand` takes no unbraced reading for it — that
+    second reading doubled the cost of ~9% of real commands (QA). Two
+    exceptions, left as written: an escaped `\\$b'…'` (an `eval` joins it
+    into `$b…`), and a `$b'` inside `'…'`, whose `'` closes the outer quote
+    so a `-c` re-parse reads `$b` joined to the text after it."""
+    if "'" not in text and '"' not in text or not _QUOTE_ENDED_NAME_RE.search(text):
+        return text
+    states = _quote_states(text)
+
+    def brace(m: "re.Match[str]") -> str:
+        i = m.start()
+        if states[i] == "\\" or not _live_dollar(text, i) \
+                or states[i] == "'" and text[m.end()] == "'":
+            return m.group(0)
+        return "${" + m.group(1) + "}"
+    return _QUOTE_ENDED_NAME_RE.sub(brace, text)
 
 
 # Off while `_expand` takes its unbraced reading (see `_brace_glued_names`).
@@ -4040,6 +4076,18 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # does: read as the empty value, `x=; ${x:-rm -rf /}` ran unseen
             # (XERK-1659).
             got = None
+        if op and not got and op.group(1) in _VAR_DEFAULT_OPS and "$" in op.group(2) \
+                and end == m.end():
+            # A bare name in an unset name's default resolves as one nested in
+            # braces does: spliced raw, `a=/etc; rm -rf ${q:-$a}` read the
+            # path as `${a}`, a name nothing expanded again (XERK-1661). Only
+            # the default's own span: an element's `[0]` stays as written.
+            if depth >= _MAX_NESTED_VARS:
+                raise _ExpansionTooLarge
+            lead = len(rest) - len(op.group(2))
+            rest = rest[:lead] + sub(m.start(2) + lead, end - 1, depth + 1)
+            op = _VAR_OP_RE.match(rest[rest.find("]") + 1:] if rest.startswith("[") else rest)
+            replaced = 3 + len(name) + len(rest)
         elem_op = None
         # Not inside another op: the marker in its pattern would hide its trim.
         if got and depth == 0 and rest.startswith("[") and rest.find("]") > 0:
@@ -4052,9 +4100,16 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # (XERK-1659).
             state = states[m.start()] if m.start() < len(states) else ""
             sep = '" "' if state == '"' else " "
+            arg = elem_op.group(2)
+            if "$" in arg and end == m.end():
+                # Names in it resolve as an unset name's default does (XERK-1661 QA).
+                if depth >= _MAX_NESTED_VARS:
+                    raise _ExpansionTooLarge
+                arg = sub(end - 1 - len(arg), end - 1, depth + 1)
+                replaced += len(arg) - len(elem_op.group(2))  # `sub` charged it
             out = sep.join((_quote_literal(_UNREAD_OUTPUT, state),
                             _quote_literal(_picked(got, name), state),
-                            default(elem_op.group(2), m.start())))
+                            default(arg, m.start())))
         elif got:
             value = _picked(got, name)
             state = states[m.start()] if m.start() < len(states) else ""
@@ -6982,6 +7037,12 @@ def _owner_substs(text: str) -> str:
                        else "`s`")
 
 
+# A heredoc operator and its delimiter word (not a `<<<` here-string).
+# The delimiter is a whole shell word: `'EOF'x`, `E'O F'`, `E\\ F` (QA).
+_HEREDOC_OP_RE = re.compile(
+    r"""\d*(?<!<)<<-?(?!<)\s*(?:'[^']*'|"(?:[^"\\]|\\.)*"|\\.|[^\s;&|<>()'"\\])+""", re.S)
+
+
 def _heredoc_segment_programs(segment: str):
     """The program words a segment holding a heredoc operator may run: `bash`
     for `bash<<EOF` (one shlex word), `(bash <<EOF`, `(bash)<<EOF`, `x=1
@@ -6993,7 +7054,14 @@ def _heredoc_segment_programs(segment: str):
     text = re.split(r"[$<>]\(", _owner_substs(segment))[-1]
     # ...and the text as written: `_ungrouped` strips a `{` glued to the word,
     # and bash reads `{f` or `{{` as a function's whole name.
-    for reading in dict.fromkeys((text.strip(), *_ungrouped(text))):
+    readings = [text.strip(), *_ungrouped(text)]
+    # ...and with each heredoc operator and its delimiter dropped: glued on,
+    # `env<<'E' bash` read the wrapper as the program and never stripped it
+    # to `bash` (XERK-1661 QA). An added reading.
+    unglued = _HEREDOC_OP_RE.sub(" ", text).strip()
+    if unglued != readings[0]:
+        readings += [unglued, *_ungrouped(unglued)]
+    for reading in dict.fromkeys(readings):
         tokens = _strip_prefixes(_tokenize(reading))
         # A redirection may come first, and its target may be a word of its own.
         while tokens and re.match(r"\d*[<>]", tokens[0]):
@@ -8036,14 +8104,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # runs `$xy rm …`, its substitution already run a level up — so the text
     # is also read unbraced, with no bracing beneath (XERK-1615 QA).
     braced = _brace_glued_names(command)
-    if braced != command:
+    # A quote-ended name's brace (`_brace_quote_ended`) needs no unbraced reading.
+    if braced != command and (not _BRACE_GLUED[0] or _GLUED_NAME_RE.search(command)):
         _spend(len(command))
         _BRACE_GLUED[0] = False
         try:
             out.extend(_expand(command, depth, cwds))
         finally:
             _BRACE_GLUED[0] = True
-        command = braced
+    command = braced
     # Groups first, over the whole command: splitting below would sever any
     # group whose body holds an operator (see _balanced_groups). Scanned
     # BEFORE pre-normalisation, whose brace expansion ignores quoting and can
