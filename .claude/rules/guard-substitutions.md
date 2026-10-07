@@ -367,12 +367,12 @@ paths:
       pairing of two names' last values (`a=$p; a=eval; …; b='rm …'; $a "$b"`, a QA bypass), and
       doubled reassigned names past `_MAX_VALUE_PASSES` ("too large").
   - Cost: the empty reading stays, so `q=/tmp/q; d=$q; r=$d/; rm -rf $r` still reads `/` and
-    is denied — telling it from `r=$d/; d=…` needs ORDER (XERK-1660).
+    is denied — the ordered reading (XERK-1660, `guard-order.md`) adds, never removes.
   - Resolving once alone read `q=/etc; d=$q; r=$d` as `r` empty, and a link naming a cycle
     (`d=$q$c; c=$c`) and a name with a plain and a chained value (`q=/tmp; q=$e; d=$q`) the same.
   - Inside a cycle (an SCC, or a name using itself) a member reads another's unlinked values only
     and an unknown one empty, as main did: `d=/; d=$d/etc` is `//etc`. What a cycle holds
-    depends on ORDER, which this reading does not model (XERK-1660, with the seeded-cycle
+    depends on ORDER, which the ordered reading reads (XERK-1660, `guard-order.md`; seeded-cycle
     shapes). Do not add propagation inside a cycle — four QA passes broke each variant:
     - re-reading on each change nested every lap's text, and a real test loop's
       `n=$((n + ${m:-0}))` counters were refused as too deep (replay); a 3000-member wheel 33s;

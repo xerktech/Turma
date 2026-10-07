@@ -30,12 +30,13 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `guard-leading-names.md` | `guard.py`, `test_guard.py` | guard: unknown names in a target read empty, protected reading only (XERK-1639/1652) |
 | `guard-home.md` | `guard.py`, `test_guard.py` | guard: `$HOME`/`~` targets read with the real home (XERK-1656) |
 | `guard-param-ops.md` | `guard.py`, `test_guard.py` | guard: `${v#pat}` ops as bash globs, unreadable → refused program, `eval` assignments (XERK-1651) |
+| `guard-order.md` | `guard.py`, `test_guard.py` | guard: values also read in order, loops replayed (XERK-1660) |
 | `guard-value-sources.md` | `guard.py`, `test_guard.py` | guard: redirect joins, value sources, files run as scripts (XERK-1641) |
 | `guard-positionals.md` | `guard.py`, `test_guard.py` | guard: `$1` bound by `sh -c`, a function call or `set` (XERK-1626) |
 | `agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
-| `agent-native-windows.md` | `agent/native/README-windows.md`, `docs/windows-agent-adr.md` | Windows agent (XERK-666) MAP: component→rules-file, invariant pointers, operator guide |
+| `agent-native-windows.md` | `agent/native/README-windows.md`, `docs/windows-agent-adr.md` | Windows agent (XERK-666) map: component→rules-file, invariants, operator guide |
 | `windows-agent.md` | `agent/hub-agent.py` | native Windows portability: paths, %APPDATA%, icacls ACL, liveness/degradation (XERK-670); ADR `docs/windows-agent-adr.md` |
-| `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher (turma-agent.ps1, XERK-669) + service/control surface (turma-agent.xml, turma-agentctl.ps1, XERK-671) + installer (install.ps1, XERK-672) + `irm\|iex` bootstrap (bootstrap.ps1, XERK-673) + self-updater (turma-agent-update.ps1, XERK-674): WinSW unit, start/stop/restart/status/logs, session-preserving restart, pidfile, the update poller + payload swap, windows asset name/component seam |
+| `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher (turma-agent.ps1, XERK-669) + service/control (turma-agent.xml, turma-agentctl.ps1, XERK-671) + installer (install.ps1, XERK-672) + `irm\|iex` bootstrap (bootstrap.ps1, XERK-673) + self-updater (turma-agent-update.ps1, XERK-674): WinSW unit, control verbs, session-preserving restart, pidfile, update poller, asset seam |
 | `windows-terminal.md` | `agent/win/**` | native Windows terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
 | `turma.md` | `turma/**` | chrome, org filter, org binding, dashboard, terminal proxy, auth |
 | `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |

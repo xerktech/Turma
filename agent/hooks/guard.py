@@ -1744,6 +1744,7 @@ def _budgeted(fn):
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
         _CHAIN_DIFFERS[0] = False
+        _ORDER_DIFFERS[0] = False
         _VALUES_TAINT_N[0] = 0
         _VALUES_MOST[0] = 1
         _VALUES_ASSIGNED[0] = 1
@@ -2700,6 +2701,11 @@ def _assigned_values(command: str, depth: int = 0,
     vals: dict[str, list[str]] = {}
     states = _quote_states(command) if "${" in command else []
     applied: dict[str, list[str]] = {}
+    # Where each value of ``vals`` / ``applied`` is assigned in ``command``,
+    # None where no one place does (`read`, `printf -v`, an `eval`'s), for the
+    # ordered reading (`_ordered_values`, XERK-1660).
+    where: dict[str, list[int | None]] = {}
+    applied_where: dict[str, list[int]] = {}
     for m in _VAR_ASSIGN_RE.finditer(command):
         value = m.group(2)
         if "${" in value and not _MAIN_PARSE[0]:
@@ -2718,6 +2724,7 @@ def _assigned_values(command: str, depth: int = 0,
                 for element in elements:
                     vals.setdefault(m.group(1), []).append(
                         _produced_text(_dequote_value(element), multi=_VALUES_MULTI[0]))
+                    where.setdefault(m.group(1), []).append(m.start())
         raw = value
         # Read as before XERK-1609 unless `_expand_both` is on its pass for
         # several statements (see `_body_printed`). Both in one list was no
@@ -2743,6 +2750,7 @@ def _assigned_values(command: str, depth: int = 0,
             _VALUES_DIFFER[0] |= produced != base
             produced = base
         vals.setdefault(m.group(1), []).append(produced)
+        where.setdefault(m.group(1), []).append(m.start())
         if "${" in raw and not _MAIN_PARSE[0]:
             # Bash applies a `${y:-…}` default when it assigns, so `$x` runs
             # it; stored unapplied, `x=${y:-"rm -rf /"}; $x` spliced a word
@@ -2752,16 +2760,19 @@ def _assigned_values(command: str, depth: int = 0,
                 if with_default != value:
                     applied.setdefault(m.group(1), []).append(
                         _produced_text(with_default, multi=_VALUES_MULTI[0]))
+                    applied_where.setdefault(m.group(1), []).append(m.start())
     if "printf" in command and "-v" in command:
         for seg in _split_segments(command):
             bound = _printf_v(_strip_prefixes(_tokenize(seg)))
             if bound:
                 vals.setdefault(bound[0], []).append(bound[1])
+                where.setdefault(bound[0], []).append(None)
     bare = command.replace("'", "").replace('"', "").replace("\\", "")
     if "read" in bare or "select" in bare or "mapfile" in bare:
         # Gated on the text with quotes cut: `r''ead a` is `read a`.
         for name, value in _reader_values(command):
             vals.setdefault(name, []).append(value)
+            where.setdefault(name, []).append(None)
     if depth < _EVAL_ASSIGN_DEPTH:
         # An assignment `eval` runs binds the name for the rest of the line:
         # `eval "a=\$(echo rm -rf /)"; $a` runs it, though no `a=` starts a
@@ -2799,7 +2810,9 @@ def _assigned_values(command: str, depth: int = 0,
                         # Each value once: two readings of one script binding
                         # it twice halved the line's value headroom.
                         have = vals.setdefault(name, [])
-                        have.extend(v for v in got if v not in have)
+                        new = [v for v in dict.fromkeys(got) if v not in have]
+                        have.extend(new)
+                        where.setdefault(name, []).extend([None] * len(new))
                 break
     # How many values one name is ASSIGNED, so `_expand_both` reads each on
     # its own. Not a `for` list's words: those are a loop's data, and a long
@@ -2821,8 +2834,10 @@ def _assigned_values(command: str, depth: int = 0,
     for name in picks:
         vals.pop(name, None)
         applied.pop(name, None)
+        where.pop(name, None)
+        applied_where.pop(name, None)
     seen_of: dict[str, int] = {}
-    for name, _start, _end, raw_words, _shell in lists:
+    for name, start, _end, raw_words, _shell in lists:
         nth = seen_of[name] = seen_of.get(name, -1) + 1
         if name in picks and nth != picks[name]:
             continue
@@ -2837,6 +2852,7 @@ def _assigned_values(command: str, depth: int = 0,
                 words.extend(_default_readings(raw_word))
         if words:
             vals.setdefault(name, []).extend(words)
+            where.setdefault(name, []).extend([start] * len(words))
             _FOR_NAMES.add(name)
     # A value naming an assigned variable (`d=$d/x`, `a=$b; b=$a`) is resolved
     # HERE, once, against the values that name none. Left in, every recursion
@@ -2851,6 +2867,7 @@ def _assigned_values(command: str, depth: int = 0,
     # every reading.
     for k, vs in applied.items():
         vals.setdefault(k, []).extend(vs)
+        where.setdefault(k, []).extend(applied_where[k])
     others = {k: plain.get(k, []) + [v for v in vs if not _names_assigned(v, vals)]
               for k, vs in applied.items()}
 
@@ -2878,7 +2895,137 @@ def _assigned_values(command: str, depth: int = 0,
     chained = _chain_values(vals, applied, own)
     if chained != once:
         _CHAIN_DIFFERS[0] = True
-    return chained if _VALUES_CHAINED[0] else once
+    # And in ORDER, each value read against what is assigned before it
+    # (XERK-1660): order-blind, `q=/etc; d=$q$c; c=x; rm -rf $d` read d as
+    # `/etcx`, a value bash never sees. Added beside the order-blind
+    # readings, never in place of them: a function body runs where it is
+    # CALLED, not written (`f(){ x=$y; }; y=/etc; f`), which this does not
+    # model and they read.
+    ordered = _ordered_values(vals, where, chained, _loop_bodies(command))
+    if ordered != once and ordered != chained:
+        _ORDER_DIFFERS[0] = True
+        # A loop's later laps may add values: read each on its own too.
+        for k, got in ordered.items():
+            _VALUE_COUNTS[k] = max(_VALUE_COUNTS.get(k, 0), len(got))
+            _VALUES_MOST[0] = max(_VALUES_MOST[0], len(got))
+    return (once, chained, ordered)[_VALUES_CHAINED[0]]
+
+
+# How many times `_ordered_values` reads a loop's body at most: enough for a
+# value to travel back through a few of its assignments (`z=$a; a=$m; m=/etc`).
+_ORDER_LAPS = 8
+
+
+def _ordered_values(vals: dict[str, list[str]], where: dict[str, list[int | None]],
+                    base: dict[str, list[str]], loops: list[tuple[int, int]]
+                    ) -> dict[str, list[str]]:
+    """``vals`` read in the order bash assigns them: each value is resolved
+    against the values its names hold where it is assigned — a name not yet
+    assigned there is empty, as unset. A value with no one place (``where``
+    None) keeps its ``base`` reading and is a value of its name everywhere.
+
+    A loop's body (``loops``) is read again, lap after lap until its values
+    settle, as bash runs it again: `for …; do z=$a; a=/etc; done` gives z
+    `/etc` from its second pass on. A later lap's different value is one more
+    value of its name. A value naming its own name (`s=$s$f`) is read on the
+    first lap only: re-read, it grew every lap and never settled."""
+    out = {k: list(vs) for k, vs in base.items()}
+    fixed = {k: [base[k][i] for i, p in enumerate(where[k]) if p is None] for k in vals}
+    grouped: dict[tuple[int, str], list[int]] = {}
+    for k, ps in where.items():
+        for i, p in enumerate(ps):
+            if p is not None:
+                grouped.setdefault((p, k), []).append(i)
+    uses = {k: [_names_used(v) & vals.keys() for v in vs] for k, vs in vals.items()}
+    if not any(uses[k][i] for k, i in ((k, i) for (_p, k), idxs in grouped.items() for i in idxs)):
+        return out
+    current: dict[str, list[str]] = {}
+    # Growth is charged only for a value that reads differently from
+    # ``base``, which is already charged; but checked as it builds, so a
+    # doubling value is refused before it is built (`_spend`).
+    growth = [0]
+
+    def link(m: "re.Match[str]") -> str:
+        name = m.group(1) or m.group(3)
+        if name not in vals:
+            return m.group(0)
+        value = _picked(current.get(name, []) + fixed[name], name)
+        op = _VAR_OP_RE.match(m.group(2) or "")
+        if op and op.group(1) not in _VAR_DEFAULT_OPS:
+            got = _op_readings(value, op.group(1), op.group(2),
+                               {n: current.get(n, []) + fixed[n] for n in vals
+                                if current.get(n) or fixed[n]})
+            value = got[0] if len(got) == 1 else " ".join((_UNREAD_OUTPUT, *got))
+        growth[0] += max(0, len(value) - len(m.group(0)))
+        if _budget is not None and growth[0] > _budget["left"]:
+            _spend(growth[0])
+        return value
+
+    extra: dict[tuple[str, int], str] = {}
+
+    def read(events: list[tuple[int, str]], lap: int) -> None:
+        for p, k in events:
+            idxs = grouped[(p, k)]
+            if lap and any(k in uses[k][i] for i in idxs):
+                continue
+            got = []
+            for i in idxs:
+                growth[0] = 0
+                v = _var_sub(link, vals[k][i]) if uses[k][i] else vals[k][i]
+                if v != base[k][i]:
+                    _spend(growth[0])
+                got.append(v)
+            for i, v in zip(idxs, got):
+                if not lap:
+                    out[k][i] = v
+                elif v not in out[k]:
+                    extra[(k, i)] = v
+            current[k] = got
+
+    # The events in order, a loop's together so its body can be read again.
+    runs: list[tuple[bool, list[tuple[int, str]]]] = []
+    for p, k in sorted(grouped):
+        body = next((span for span in loops if span[0] <= p < span[1]), None)
+        if runs and runs[-1][0] == body and body is not None:
+            runs[-1][1].append((p, k))
+        else:
+            runs.append((body, [(p, k)]))
+    for body, events in runs:
+        read(events, 0)
+        for lap in range(1, min(len(events), _ORDER_LAPS) if body is not None else 1):
+            before = {k: list(v) for k, v in current.items()}
+            read(events, lap)
+            if current == before:
+                break
+    for (k, _i), v in extra.items():
+        if v not in out[k]:
+            out[k].append(v)
+    return out
+
+
+# A `do` or `done` keyword: a loop body's bounds (`_loop_bodies`).
+_DO_DONE_RE = re.compile(r"(?<![\w.$-])(do|done)(?![\w.-])")
+
+
+def _loop_bodies(command: str) -> list[tuple[int, int]]:
+    """The span of each outermost `do … done` body in ``command``, bare
+    keywords only: one in quotes is text."""
+    if "done" not in command:
+        return []
+    states = _quote_states(command)
+    spans, depth, start = [], 0, 0
+    for m in _DO_DONE_RE.finditer(command):
+        if states[m.start()]:
+            continue
+        if m.group(1) == "do":
+            if not depth:
+                start = m.end()
+            depth += 1
+        elif depth:
+            depth -= 1
+            if not depth:
+                spans.append((start, m.start()))
+    return spans
 
 
 def _chain_values(vals: dict[str, list[str]], applied: dict[str, list[str]],
@@ -3744,8 +3891,11 @@ _VALUES_TAINT = [-1]
 _VALUES_TAINT_N = [0]
 # Set while `_expand_both` reads assigned values resolved through their whole
 # chain; and whether any name of this decision reads differently so (XERK-1648).
-_VALUES_CHAINED = [False]
+# 0 when not; 2 when the values are read in order instead (XERK-1660), and
+# whether any name reads differently so.
+_VALUES_CHAINED = [0]
 _CHAIN_DIFFERS = [False]
+_ORDER_DIFFERS = [False]
 # Set while `_expand_both` reads each of a name's values on its own: which one.
 # And the most values this decision saw one name assigned (XERK-1621).
 _VALUE_PICK: list = [None]
@@ -6067,8 +6217,9 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     # A values pass is one reading, again when values print differently, and
     # once per taint reading: sixteen tainted `x=$(…)` made each 9x the cost.
     weight = 1 + bool(_VALUES_DIFFER[0]) + min(_VALUES_TAINT_N[0], _MAX_TAINT_STARTS)
-    # ...and once more chained (XERK-1648): a word naming `R=$Q` was empty.
-    chained = (False, True) if _CHAIN_DIFFERS[0] else (False,)
+    # ...and once more chained (XERK-1648): a word naming `R=$Q` was empty;
+    # and in order (XERK-1660).
+    chained = (0,) + ((1,) if _CHAIN_DIFFERS[0] else ()) + ((2,) if _ORDER_DIFFERS[0] else ())
     weight *= len(chained)
     lines, too_large = _for_word_lines(command, weight)
     if too_large:
@@ -6084,7 +6235,7 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
                 out = out + _expand_values(line)
         finally:
             _FOR_PICK[0] = None
-            _VALUES_CHAINED[0] = False
+            _VALUES_CHAINED[0] = 0
     return out
 
 
@@ -6217,14 +6368,15 @@ def _expand_readings(command: str) -> list[tuple[list[str], str]]:
             out = out + _expand_values(command)
         finally:
             _MAIN_PARSE[0] = False
-    if _CHAIN_DIFFERS[0]:
-        # Every value resolved through its whole chain, per value too
-        # (`_assigned_values`): an added reading, as the others are.
-        _VALUES_CHAINED[0] = True
-        try:
-            out = out + _expand_picks(command)
-        finally:
-            _VALUES_CHAINED[0] = False
+    # Every value resolved through its whole chain, and in order, per value
+    # too (`_assigned_values`): added readings, as the others are.
+    for mode, differs in ((1, _CHAIN_DIFFERS[0]), (2, _ORDER_DIFFERS[0])):
+        if differs:
+            _VALUES_CHAINED[0] = mode
+            try:
+                out = out + _expand_picks(command)
+            finally:
+                _VALUES_CHAINED[0] = 0
     return out
 
 
