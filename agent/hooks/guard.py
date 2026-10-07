@@ -6665,6 +6665,42 @@ def _written_scripts(segments: list[str],
     return written
 
 
+# Distinct argument lists one written file is read with, per line.
+_MAX_SCRIPT_RUNS = 8
+
+
+def _script_file_readings(path: str, args: tuple[str, ...], written: dict[str, list[str]],
+                          runs_seen: dict[str, set[tuple[str, ...]]]) -> list[str]:
+    """The texts a run of written file ``path`` with ``args`` adds: the
+    unbound text on its first run, and per DISTINCT argument list the text
+    bound as a `sh -c` script is (its own `set --`/`shift` applied). Once per
+    line, the second run's arguments were never read; per run, N writes and N
+    runs were quadratic; bound alone, the script's own `set --` was lost
+    (XERK-1641 QA). Past `_MAX_SCRIPT_RUNS` lists, one reading binds every
+    parameter to every argument seen."""
+    runs = runs_seen.setdefault(path, set())
+    if args in runs or len(runs) > _MAX_SCRIPT_RUNS:
+        return []
+    first = not runs
+    runs.add(args)
+    out: list[str] = []
+    for text in written.get(path, ()):
+        scripts = _script_readings(text)
+        if len(runs) > _MAX_SCRIPT_RUNS:
+            every = [a for r in runs for a in r]
+            out += [_bind_positionals(sc, [path, *every], every=True) for sc in scripts]
+            continue
+        if first:
+            out += scripts
+        if args:
+            argv = [path, *args]
+            bound = [r for sc in scripts for r in _positional_readings(sc)]
+            out += [b for b in dict.fromkeys(_bind_positionals(sc, a) for sc in (*scripts, *bound)
+                                             for a in _shifted(argv, sc))
+                    if b not in scripts]
+    return out
+
+
 def _script_file(prog: str, rest: list[str]) -> str | None:
     """The script file a shell (no `-c`) or `source`/`.` runs, normalised; a
     shell with no file operand reads the file redirected to its stdin."""
@@ -7068,6 +7104,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             finally:
                 _ALIASES_ON[0] = True
     # Files the line writes text into, which a later `sh f` runs (XERK-1555).
+    runs_seen: dict[str, set[tuple[str, ...]]] = {}
     # Computed on the first segment that runs a script FILE: per `_expand`
     # call it re-split every line holding `>` and "sh" (most of them).
     written: dict[str, list[str]] | None = None if (
@@ -7192,19 +7229,12 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             if written is None:
                 written = _written_scripts(
                     _split_on_operators(command, include_pipe=False, groups=True), heredocs)
-            # Each file once per line, however often it is run: per run, N
-            # writes and N runs were quadratic (XERK-1641 QA).
-            # Run with arguments, the file sees them as `$1…` and nothing
-            # else: an unbound `$1` read as unset over-denied `go.sh tk`.
             words = _stdout_targets(tokens)[0]
             at = next((k for k, w in enumerate(words) if k and posixpath.normpath(w) == script_path),
                       0 if words and posixpath.normpath(words[0]) == script_path else -1)
-            args = words[at + 1:] if at >= 0 else []
-            for text in written.pop(script_path, ()):
-                for script in _script_readings(text):
-                    if args:
-                        script = _bind_positionals(script, [script_path, *args])
-                    out.extend(_expand_segments(script, depth + 1, every_cd))
+            args = tuple(words[at + 1:] if at >= 0 else ())
+            for script in _script_file_readings(script_path, args, written, runs_seen):
+                out.extend(_expand_segments(script, depth + 1, every_cd))
         if prog in ("rm", "unlink", "chmod", "chown"):
             # `cd /; rm -rf *` deletes `/*`, which `rm` alone never names.
             for cwd in cwds:

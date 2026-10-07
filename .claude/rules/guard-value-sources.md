@@ -50,8 +50,10 @@ paths:
   group writes ALL its statements' text (`_statements_printed`, never its first-word reading:
   `_strip_prefixes` drops the `{`); a lone `cat`/pass-through relays what it is fed.
 - A file is run by a shell operand, `.`/`source`, a shell's stdin redirect (`bash < f`) or its
-  own path (`./f`) — `_script_file` / `script_path`. Run with arguments, its `$1…` are bound to
-  them (unbound, main's unset-trailing-name rule over-denied `go.sh tk`, replayed).
+  own path (`./f`) — `_script_file` / `script_path`. Run with arguments it is read bound as a
+  `sh -c` script is (`set --`/`shift` applied) BESIDE the unbound text, once per distinct
+  argument list (`_script_file_readings`, `_MAX_SCRIPT_RUNS`). Bound alone lost the script's own
+  `set --`; once per line read only the first run's arguments (QA).
   - Its contents are judged like any command: a written script doing `rm -rf /var/tmp/x` is
     refused as that command typed directly is (1 replayed diff, explained).
 - `_alias_values` takes only `alias NAME=…` with a name bash accepts (`_ALIAS_NAME_RE`):
@@ -64,6 +66,7 @@ paths:
   - `hash -p`, `BASH_ALIASES`, `BASH_CMDS`, `command_not_found_handle` anywhere make EVERY name a
     possible shell (`_ANY_NAME`); `_defined_names` also reads quote-joined text (`eval "ali""as"`).
 - `bash -c -e '<cmd>'`: options between `-c` and the script are skipped (`_shell_c_script_index`).
-- Not covered: a `for` list's words given per-value passes (XERK-1647), cross passes past the cap.
+- Not covered (XERK-1674): further write-then-run spellings (`cat -`, `cp`/`mv`, `$PWD` paths,
+  `cat f | sh`, `bash -s … < f`); cross passes past the cap.
 - Tests: `TestScriptChannels.test_xerk_1641_remaining_bypasses`,
   `test_a_redirection_before_the_program`.

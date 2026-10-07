@@ -2390,6 +2390,23 @@ class TestScriptChannels(unittest.TestCase):
                     "cat > /tmp/g.sh <<'EOF'\nrm -rf /tmp/q/audio-$1\nEOF\nsh /tmp/g.sh tk"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        # Delta-QA 4: a written file run with arguments is read bound AND
+        # unbound, its own `set --`/`shift` applied, once per argument list.
+        for cmd in ("echo 'set -- /etc; rm -rf \"$1\"' > x.sh; sh x.sh a",
+                    "echo 'shift; rm -rf \"$1\"' > x.sh; sh x.sh a /etc",
+                    "echo 'rm -rf \"$1\"' > x.sh; sh x.sh /tmp; sh x.sh /etc",
+                    "echo 'rm -rf \"$1\"' > x.sh; chmod +x x.sh; ./x.sh /tmp && ./x.sh /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("echo 'rm -rf \"$1\"' > x.sh; sh x.sh ./build; sh x.sh ./dist")
+        # Only `alias NAME=` with a name bash accepts defines one.
+        self.assertEqual(guard._alias_values("alias={'a': 1}"), {})
+        self.assertEqual(guard._alias_values("alias =x"), {})
+        self.assertEqual(guard._alias_values("alias b='bash -c'"), {"b": ["bash -c"]})
+        # The alias replacement is charged: a huge value used many times is
+        # refused as too large rather than read for seconds.
+        big = "alias b='echo " + "w" * 2000 + "'; " + "; ".join("b x" for _ in range(500))
+        self.assertIn("too large", guard.is_destructive(big) or "")
         # A direct `sh -c` runs once: `$1` is exactly its first argument.
         for cmd in ("bash -c 'rm -rf \"$1\" && cp -r \"$2\" \"$1\"' _ ./build /usr/share/doc/x",
                     "sh -c 'test -d \"$2\" && rm -rf \"$1\"' _ ./out /",
