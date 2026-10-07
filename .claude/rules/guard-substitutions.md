@@ -105,8 +105,10 @@ paths:
 - **`$'…'` is decoded by bash's rules** (`_ansi_c_text`, XERK-1693), never `unicode_escape`: that
   raised on escapes bash takes (`\x`, `\x4`, `\u41`) and the string stayed undecoded, so one such
   escape hid the whole script. Unknown escapes keep their `\`; a NUL ends the text.
-  - Only an UNQUOTED `$'` is decoded (`_quote_states` at the `$`): in `"…"`/`'…'` it is literal,
-    and decoding `"$'\x27'"` made quote characters that hid the rest of the line.
+  - Only an UNQUOTED `$'` is decoded (`_quote_states` at the `$`, always computed): in `"…"`,
+    `'…'` or a `#` comment it is literal; decoded, `"$'\x27'"` unbalanced the line and a
+    comment's `$'\nx'` hid the next one. A skipped match steps past its `$'` only.
+  - Divergence kept (no bypass found): bash decodes `$'…'` inside `"${x:-…}"` (extquote).
   Tests: `test_ansi_c_strings_decode_as_bash_does` (against real bash).
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and
   ANSI-C only to a `-c` re-parse; an even run (`\\$'…'`) is still live. A bare lookbehind bypassed.

@@ -2360,17 +2360,18 @@ def _decode_ansi_c(command: str) -> str:
             out.append(command[pos:start + 2])
             pos = start + 2
             continue
-        # Inside `"…"` or `'…'` a `$'` is literal to bash: decoded there, a
-        # `$'\x27'` became quote characters that unbalanced the line and hid
-        # the rest of it (`echo "$'\x27'"; rm -rf /etc`, XERK-1693 QA). Step
-        # past its `$'` only: the match may run over a real `$'…'` after it.
-        if '"' in command or "'" in command[:start]:
-            if states is None:
-                states = _quote_states(command)
-            if states[start]:
-                out.append(command[pos:start + 2])
-                pos = start + 2
-                continue
+        # Inside `"…"`, `'…'` or a `#` comment a `$'` is literal to bash:
+        # decoded there, a `$'\x27'` became quote characters that unbalanced
+        # the line, and a comment's `$'\nx'` ended the comment and opened a
+        # quote over the next line (XERK-1693 QA). Always asked: a shortcut
+        # on the line holding a quote skipped the comment case. Step past
+        # its `$'` only: the match may run over a real `$'…'` after it.
+        if states is None:
+            states = _quote_states(command)
+        if states[start]:
+            out.append(command[pos:start + 2])
+            pos = start + 2
+            continue
         out += (command[pos:start], shlex.quote(_ansi_c_text(m.group(2))))
         pos = m.end()
     out.append(command[pos:])
