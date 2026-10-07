@@ -197,7 +197,7 @@ class TestCarryWindowHighWater(unittest.TestCase):
 
     def test_the_REAL_hook_floors_end_to_end_through_main(self):
         # Drives the ACTUAL hook exactly as Claude Code does — a blob on stdin,
-        # the same `python3 -SsE statusline.py` command line the probe wires —
+        # the same `python3 -SI statusline.py` command line the probe wires —
         # so it guards main()'s wiring of the floor, not just the helper in
         # isolation (removing the call from main() must fail a test).
         with tempfile.TemporaryDirectory() as tmp:
@@ -211,7 +211,7 @@ class TestCarryWindowHighWater(unittest.TestCase):
                 "seven_day": {"used_percentage": 0, "resets_at": 1_786_950_000},
             }})
             proc = subprocess.run(
-                [sys.executable, "-SsE", MODULE_PATH],
+                [sys.executable, "-SI", MODULE_PATH],
                 input=blob, capture_output=True, text=True,
                 env={**os.environ, "TURMA_LIMITS_PATH": path},
             )

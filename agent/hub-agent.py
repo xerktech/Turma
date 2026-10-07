@@ -4940,9 +4940,9 @@ def session_cli_path():
 
 def session_cli_allow_rule(cli_path=None):
     """The generated allow rule that lets a session run the session CLI without
-    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (the hook
-    security flags) and the ABSOLUTE script path, so the rule admits only this
-    script — an allow rule for `python3` alone would admit any code at all."""
+    a permission prompt. Narrow on purpose: the `python3 -SsE` spelling (not
+    a gate, so it keeps -SsE rather than the hooks' -SI) and the ABSOLUTE
+    script path, so the rule admits only this script — an allow rule for `python3` alone would admit any code at all."""
     return f"Bash(python3 -SsE {cli_path or session_cli_path()}:*)"
 
 
@@ -5102,6 +5102,125 @@ def fileguard_script_path():
     """Absolute path to the bundled file-write guard hook
     (``hooks/fileguard.py``), resolved the same way as ``guard_script_path``."""
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "fileguard.py")
+
+
+# Hook integrity (XERK-1643). The updater records the installed hooks' hashes in
+# `<prefix>/hooks.sha256` and reinstalls the current release when they drift, but
+# it runs hourly; a session that stubbed guard.py had every Bash call on the host
+# allowed until then. So the beat re-checks the same baseline and, on a
+# mismatch, logs it and starts that updater run now. Inert where no baseline
+# exists (a repo checkout, the Windows agent, an install from before this).
+HOOK_REPAIR_MIN_INTERVAL = 600   # seconds between updater kicks for one mismatch
+
+
+HOOK_MAX_BYTES = 8 << 20          # a hook bigger than this is not one we shipped
+
+
+def _read_regular(path, cap):
+    """The bytes of ``path`` when it is a regular, non-symlink file of at most
+    ``cap`` bytes, else None; never raises OSError and never leaks the fd. The
+    open is O_NONBLOCK|O_NOFOLLOW and the type is checked on the open fd: a
+    session can swap a hook or the baseline for a FIFO (a plain open blocks the
+    beat forever), a symlink to /dev/zero (a read never ends) or a directory
+    (``python3 guard.py`` runs its ``__main__.py``)."""
+    try:
+        # Windows has neither flag (and writes no baseline, so nothing reaches here
+        # but the baseline read itself).
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except OSError:
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode) or st.st_size > cap:
+            return None
+        chunks, total = [], 0
+        while total <= cap:
+            chunk = os.read(fd, min(1 << 16, cap + 1 - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return None if total > cap else b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _hook_digest(path):
+    """sha256 of a hook that `_read_regular` accepts, else None."""
+    data = _read_regular(path, HOOK_MAX_BYTES)
+    return None if data is None else hashlib.sha256(data).hexdigest()
+
+
+def hook_integrity_failures(script_dir=None):
+    """The ``hooks/`` entries that no longer match the baseline, sorted; ``[]``
+    when all match, ``None`` when there is no readable baseline (nothing to check
+    against). A listed hook that is gone counts as a mismatch (a missing hook
+    command is a NON-blocking hook, i.e. a guard failing open), and so does any
+    entry the baseline does NOT list: hooks run as ``python3 <hooks>/x.py``, so
+    their dir is first on sys.path and a planted ``hooks/bisect.py`` replaces the
+    stdlib module guard.py imports."""
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    raw = _read_regular(os.path.join(script_dir, "hooks.sha256"), 1 << 20)
+    try:
+        lines = raw.decode("utf-8").splitlines()
+    except (AttributeError, UnicodeDecodeError):     # None: no usable baseline
+        return None
+    expected = {}
+    for line in lines:
+        digest, _, rel = line.partition("  ")
+        # Only the sha256sum lines install_payload writes; anything else (and any
+        # path escaping hooks/) is ignored rather than trusted.
+        if re.fullmatch(r"[0-9a-f]{64}", digest) and re.fullmatch(
+                r"hooks/[A-Za-z0-9_.-]+\.py", rel):
+            expected[rel] = digest
+    if not expected:
+        return None
+    bad = [rel for rel, digest in expected.items()
+           if _hook_digest(os.path.join(script_dir, rel)) != digest]
+    try:
+        present = os.listdir(os.path.join(script_dir, "hooks"))
+    except OSError:
+        present = []
+    # __pycache__ is legitimate: the manager imports permlog.py/guard.py as
+    # modules and writes their bytecode. A HOOK run as a script never imports
+    # from it (no sourceless import from __pycache__), so it cannot shadow the
+    # stdlib for guard.py; the manager's own loaders do read it, but that uid can
+    # already rewrite hub-agent.py itself.
+    bad += [f"hooks/{name}" for name in present
+            if f"hooks/{name}" not in expected and name != "__pycache__"]
+    return sorted(bad)
+
+
+def check_hook_integrity(state, script_dir=None, now=None, spawn=None):
+    """Beat-time half of the check above. ``state`` is a dict the caller keeps
+    across beats (last kick time + last reported set). Returns the mismatched
+    list (or None). Kicks ``bin/turma-agent-update`` detached at most once per
+    HOOK_REPAIR_MIN_INTERVAL; that run takes the update lock, reinstalls the
+    current version and restarts this manager with sessions preserved."""
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    bad = hook_integrity_failures(script_dir)
+    if not bad:
+        state.pop("reported", None)
+        return bad
+    now = time.time() if now is None else now
+    if state.get("reported") != bad:
+        log(f"WARNING: installed safety hooks do not match {script_dir}/hooks.sha256 "
+            f"(tampered or truncated): {', '.join(bad)} — starting the updater to restore them")
+        state["reported"] = bad
+    updater = os.path.join(script_dir, "bin", "turma-agent-update")
+    if now - state.get("kicked", 0) < HOOK_REPAIR_MIN_INTERVAL or not os.path.isfile(updater):
+        return bad
+    state["kicked"] = now
+    try:
+        (spawn or subprocess.Popen)(
+            [updater], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError as e:
+        log(f"hook repair: could not start {updater}: {e}")
+    return bad
 
 
 def permlog_script_path():
@@ -5340,7 +5459,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     python_exe = python_exe or sys.executable or "python3"
     guard_path = guard_path or guard_script_path()
     ask_path = ask_path or ask_script_path()
-    # `-SsE` are SECURITY flags here, not tidiness. A plain interpreter start
+    # `-SI` are SECURITY flags here, not tidiness. A plain interpreter start
     # imports user-site `usercustomize` before the hook's own code, so one Write
     # to ~/.local/lib/pythonX/site-packages/usercustomize.py neutralises EVERY
     # hook on the host — measured: with such a payload the Bash guard allowed
@@ -5356,8 +5475,13 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     # stop a plant via the file-editing TOOLS only; Bash walks past them like it
     # walks past every pattern (XERK-309), so they are a partial reduction, not
     # the fix. The flags are the fix.
-    # The hooks are stdlib-only by contract, so neither flag can break them.
-    guard_command = f'"{python_exe}" -SsE "{guard_path}"'
+    # `-I` (isolated: `-s` + `-E` + no script dir on sys.path), never `-SsE`:
+    # those keep the hook's OWN directory at sys.path[0], so a `hooks/json.py`
+    # holding `sys.exit(0)` ran on the guard's import and allowed every
+    # command (XERK-1681).
+    # The hooks are stdlib-only by contract and import no sibling module, so
+    # neither flag can break them.
+    guard_command = f'"{python_exe}" -SI "{guard_path}"'
     # The judge's one-shot grants (XERK-1566) are honoured only by a guard
     # launched with this flag, so TURMA_PERMISSION_JUDGE=0 reaches every
     # session launched after it — the session's env would not (the tmux server
@@ -5365,8 +5489,8 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     if PERMISSION_JUDGE:
         guard_command += " --grants"
     fileguard_path = fileguard_path or fileguard_script_path()
-    ask_command = f'"{python_exe}" -SsE "{ask_path}"'
-    fileguard_command = f'"{python_exe}" -SsE "{fileguard_path}"'
+    ask_command = f'"{python_exe}" -SI "{ask_path}"'
+    fileguard_command = f'"{python_exe}" -SI "{fileguard_path}"'
     allow, deny = operator_local_permissions(local_settings_path)
     perms = {"deny": list(_GUARD_DENY_PATH_RULES) + _GUARD_DENY_TOOL_RULES
              + runtime_code_deny_rules()}
@@ -5415,7 +5539,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     # the command line so the hook and the manager's reader can never disagree.
     permlog_path = permlog_path or permlog_script_path()
     if os.path.exists(permlog_path):
-        permlog_command = f'"{python_exe}" -SsE "{permlog_path}" "{PERMISSIONS_DIR}"'
+        permlog_command = f'"{python_exe}" -SI "{permlog_path}" "{PERMISSIONS_DIR}"'
         # The judge hand-off (XERK-1566) is the same hook with `--judge`: it
         # then waits for the manager's verdict on a Bash call, so its timeout
         # must sit past permlog.JUDGE_WAIT_SEC.
@@ -5621,7 +5745,7 @@ def build_dsh_guard_config(python_exe=None, guard_path=None, fileguard_path=None
 # Code's, ported (the G0 spike, docs/qwen-g0-spike.md crit. 5) — a `command` hook
 # reads the tool call on stdin and denies with the same JSON Claude reads, or by
 # exiting 2. So qwen reuses the shared deny policy even more directly than dsh:
-# the SAME guard.py / fileguard.py are shelled out to (`python3 -SsE <hook>`),
+# the SAME guard.py / fileguard.py are shelled out to (`python3 -SI <hook>`),
 # never a second copy of the policy.
 #
 # The one mismatch qwen introduces is TOOL NAMES: guard.py keys on
@@ -5739,7 +5863,7 @@ def build_qwen_guard_config(python_exe=None, guard_path=None, fileguard_path=Non
         "allowRead": allow_read,
         "hookTimeoutMs": QWEN_SHIM_HOOK_TIMEOUT_MS,
     }
-    hook_cmd = (f"{shlex.quote(python_exe)} -SsE {shlex.quote(shim_path)} "
+    hook_cmd = (f"{shlex.quote(python_exe)} -SI {shlex.quote(shim_path)} "
                 f"{shlex.quote(config_path)}")
     hooks = {
         "PreToolUse": [{
@@ -5786,7 +5910,7 @@ def build_limits_settings(python_exe=None, statusline_path=None):
     return {
         "statusLine": {
             "type": "command",
-            "command": f'"{python_exe}" -SsE "{statusline_path}"',
+            "command": f'"{python_exe}" -SI "{statusline_path}"',
             "padding": 0,
         },
     }
@@ -20652,6 +20776,8 @@ class SessionManager:
         # cmdId is what the UI followed the spawn by; the migrationId is what the
         # hub's migration bookkeeping keys on.
         self.spawn_failures = []
+        # check_hook_integrity's memory across beats (XERK-1643).
+        self._hook_integrity = {}
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -23531,7 +23657,7 @@ class SessionManager:
             pass
         try:
             proc = subprocess.Popen(
-                ["python3", "-SsE", qwen_peer_inbox_path()],
+                ["python3", "-SI", qwen_peer_inbox_path()],
                 env=env, stdin=subprocess.DEVNULL,
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except OSError as e:
@@ -23717,7 +23843,7 @@ class SessionManager:
         # the built-in gone the model selects this by the tool's DESCRIPTION, not
         # a bare name (no directive names one). The session id + rendezvous dir +
         # block timeout ride the server's own env block (per-session). `python3
-        # -SsE` matches the guard-hook security flags. (The `mcpServers`/
+        # -SI` matches the guard-hook security flags. (The `mcpServers`/
         # `tools.exclude` settings keys are host-proof-only — qwen is not
         # installed in CI; unit-tested via the server's JSON-RPC contract and the
         # settings builder. `tools.exclude` key + prefix confirmed against the
@@ -23725,7 +23851,7 @@ class SessionManager:
         settings["mcpServers"] = {
             "turma-ask": {
                 "command": "python3",
-                "args": ["-SsE", qwen_ask_mcp_path()],
+                "args": ["-SI", qwen_ask_mcp_path()],
                 "env": {
                     "TURMA_SESSION_ID": sess["id"],
                     "TURMA_QUESTIONS_DIR": QUESTIONS_DIR,
@@ -23741,7 +23867,7 @@ class SessionManager:
             # control socket.
             "turma-peer": {
                 "command": "python3",
-                "args": ["-SsE", qwen_peer_mcp_path()],
+                "args": ["-SI", qwen_peer_mcp_path()],
                 "env": {
                     "TURMA_SESSION_ID": sess["id"],
                     "TURMA_QWEN_PEER_DIR": QWEN_PEER_DIR,
@@ -38133,6 +38259,11 @@ class SessionManager:
                 self._deliver_pr_comments()
             except Exception as e:
                 log(f"pr comment delivery failed: {e}")
+        if not light:
+            try:
+                check_hook_integrity(self.__dict__.setdefault("_hook_integrity", {}))
+            except Exception as e:  # never worth a beat
+                log(f"hook integrity check failed: {e}")
         self._poll_clones()
         self._poll_prunes()
         # Start any queued session that can now run — a freed slot or a

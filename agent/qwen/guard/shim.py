@@ -17,8 +17,8 @@ here. Destructive / policy / attribution shell classification and the "everythin
 under ~/.claude except the two agent-memory trees" predicate are the hardest,
 most safety-critical logic in the fleet, and they already exist — measured and
 tested — in ``agent/hooks/guard.py`` and ``agent/hooks/fileguard.py``. This shim
-SHELLS OUT to those exact scripts, invoked the same ``python3 -SsE <hook>`` way
-Claude Code and the dsh guard invoke them (the ``-SsE`` flags are the
+SHELLS OUT to those exact scripts, invoked the same ``python3 -SI <hook>`` way
+Claude Code and the dsh guard invoke them (the ``-SI`` flags are the
 interpreter-injection defence documented in ``.claude/rules/agent-hooks.md``), so
 all three runtimes share ONE deny policy and a change to it lands in one place.
 
@@ -246,7 +246,7 @@ def _run_hook(cfg, script, tool_name, tool_input, cwd, session_id):
     timeout = (cfg.get("hookTimeoutMs") or 5000) / 1000.0
     try:
         proc = subprocess.run(
-            [cfg.get("pythonExe") or "python3", "-SsE", script],
+            [cfg.get("pythonExe") or "python3", "-SI", script],
             input=payload, capture_output=True, text=True, timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError) as e:

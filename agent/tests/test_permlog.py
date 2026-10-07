@@ -4,7 +4,7 @@
 Claude Code runs it on PermissionRequest and PermissionDenied with the event on
 stdin; it appends one JSON line to `<dir>/<TURMA_SESSION_ID>.jsonl` and prints
 nothing. Driven through main() with a patched stdin/stdout, plus the real
-interpreter flags (`-SsE`) once end to end."""
+interpreter flags (`-SI`) once end to end."""
 
 import importlib.util
 import io
@@ -311,9 +311,9 @@ class PermlogTest(unittest.TestCase):
         self.assertIsNone(permlog._read_answer(fifo))   # must not hang
 
     def test_runs_under_the_security_flags(self):
-        # The settings file runs it as `python3 -SsE` — stdlib only, no site.
+        # The settings file runs it as `python3 -SI` — stdlib only, no site.
         proc = subprocess.run(
-            [sys.executable, "-SsE", MODULE_PATH, self.dir],
+            [sys.executable, "-SI", MODULE_PATH, self.dir],
             input=json.dumps(denied()), capture_output=True, text=True, timeout=30,
             env={**os.environ, "TURMA_SESSION_ID": self.sid})
         self.assertEqual((proc.returncode, proc.stdout), (0, ""), proc.stderr)

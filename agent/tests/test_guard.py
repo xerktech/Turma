@@ -1866,6 +1866,42 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(value=v, op=op, pat=pat):
                 self.assertEqual(guard._apply_var_op(v, op, pat), exp)
 
+    def test_ansi_c_strings_decode_as_bash_does(self):
+        """XERK-1693: `$'…'` is decoded by bash's rules, never given up on: a
+        `\\x` Python's decoder rejected left the whole script unread."""
+        bodies = ["\\x", "\\x4", "\\x41", "\\x414", "\\xg", "\\u41", "\\u0041x", "\\U0000003b",
+                  "\\101", "\\0101", "\\1", "\\8", "\\q", "\\cA", "\\c?", "\\c\\\\x", "\\cé", "\\cŀx", "\\e[0m",
+                  "\\'", '\\"', "\\?", "a\\tb\\nc", "\\\\", "\\z\\y", "x\\0y", "\\x00z"]
+        # A bash string holds no NUL (one ends it), so `\1\2` fences each case.
+        # Bytes compare as latin-1: `\cé` is the bytes 03 a9, as the guard reads it.
+        # (A `\u` past ASCII is locale-dependent in bash; the guard reads the character.)
+        script = "".join(f"printf '%s\\1\\2' $'{b}'\n" for b in bodies)
+        out = subprocess.run(["bash", "-c", script], capture_output=True, check=True,
+                             env={**os.environ, "LC_ALL": "C.UTF-8"}).stdout.decode("latin-1")
+        want = out.split("\1\2")[:-1]
+        self.assertEqual(len(want), len(bodies))
+        for body, exp in zip(bodies, want):
+            with self.subTest(body=body):
+                self.assertEqual(guard._ansi_c_text(body), exp)
+        # A `$'` inside quotes is literal: decoded, `\x27` unbalanced the line.
+        self.assertEqual(guard._decode_ansi_c("echo \"$'\\x27'\" 'x$'\\' $'\\x41'"),
+                         "echo \"$'\\x27'\" 'x$'\\' A")
+        # `$$'a'` is the PID then a plain `'a'`; an odd `$` run or `\$$'` is ANSI-C.
+        self.assertEqual(guard._decode_ansi_c("echo $$'a' \\$$'\\x41' $$$'\\x41'"),
+                         "echo $$'a' \\$A $$A")
+        for cmd in ("bash -c $'rm -rf /etc; : \\x'", "bash -c $'rm -rf /etc; : \\u41'",
+                    "bash -c $'rm -rf /etc; : \\x4'", "echo \"$'\\x27'\"; rm -rf /etc",
+                    "bash -c \"echo $'\\x27'; rm -rf /etc\"", "eval \"echo $'\\''\"; rm -rf /etc\"",
+                    "echo 'x$'\\' $'\\x41'; rm -rf /etc", ": # $'\\nx'\nrm -rf /etc",
+                    "echo $'it\\'s'; bash -c $'rm -rf /etc'",
+                    "echo $'it\\'s'; bash -c $'\\x72m -rf /etc'",
+                    "echo \"$'\\x27'\"; echo $'it\\'s'; bash -c $'rm -rf /etc'",
+                    "echo $$'a\\'; rm -rf /etc #'", ": $$'\\'; rm -rf /etc #'",
+                    "echo $$'a\\'; bash -c $'rm -rf /etc'",
+                    "bash -c ': # $'\"'\"'\\nx'\"'\"'\nrm -rf /etc'"):
+            with self.subTest(cmd=cmd):
+                self.assertIn("recursive delete", guard.is_destructive(cmd) or "")
+
     def test_a_function_call_and_set_bind_the_positionals(self):
         """XERK-1626: a function's `$1`… are its call's words, a `set --` sets
         the line's; each ran its payload as nobody, reaching rm as `/etc`."""
@@ -2893,6 +2929,23 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         self.assertDenied("echo " + "$(echo " * 3000 + "x" + ")" * 3000)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_a_trailing_backslash_costs_no_reading_per_level(self):
+        # XERK-1646 QA: a second reading of a lone trailing `\` at every
+        # level of a nested `eval '…'\` grew 4x per level (1 KB took 29s).
+        cmd = "; ".join(["echo a | sh"] * 50)
+        for _ in range(5):
+            cmd = "eval " + shlex.quote(cmd) + "\\"
+        started = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_brace_word_drops_only_a_lone_trailing_backslash(self):
+        # XERK-1646: zsh drops a lone `\` ending the text before it expands;
+        # an escaped one (an even run) is text and stays on every word.
+        self.assertEqual(guard._prenormalise("rm -rf {/etc,/var}\\"), "rm -rf /etc /var")
+        self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\"), "rm -rf a\\\\ b\\\\")
+        self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\\\"), "rm -rf a\\\\ b\\\\")
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
@@ -3015,6 +3068,54 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "timeout -s KILL 5 env X=$((1 + 2)) rm -rf /etc",
         "nice -n 5 env X=${nope:-a;b} rm -rf /etc",
         "sudo -u root X=$((1 + 2)) rm -rf /etc",
+        # ...or only in a substitution's PRINTED text, re-parsed (XERK-1645).
+        "bash -c \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"`echo 'X=${nope:-a b}'` rm -rf /etc\"",
+        "bash -c \"$(printf %s 'X=${nope:-a b}') rm -rf /etc\"",
+        "eval \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "echo \"$(echo 'X=${nope:-a b}') rm -rf /etc\" | bash",
+        "bash <<< \"$(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"$(echo 'X=${nope:-a b} Y=${n:-c d}') rm -rf /etc\"",
+        "bash -c \"$(echo $(echo 'X=${nope:-a b}')) rm -rf /etc\"",
+        "bash -c \"Y=1 $(echo 'X=${nope:-a b}') rm -rf /etc\"",
+        "bash -c \"$(printf 'X\\x3d${nope:-a b}') rm -rf /etc\"",
+        "eval $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "eval `echo 'X=${nope:-a b}'` rm -rf /etc",
+        "bash <<E\n$(echo 'X=${nope:-a b}') rm -rf /etc\nE",
+        "cat <<E | bash\n`echo 'X=${nope:-a b}'` rm -rf /etc\nE",
+        "bash -c \"$(echo 'X=${nope:-a')\"' b} rm -rf /etc'",
+        "\\eval $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "ev''al $(echo 'X=${nope:-a b}') rm -rf /etc",
+        "$'eval' $(echo 'X=${nope:-a b}') rm -rf /etc",
+        # ...one re-parse level down, where the script arrives substituted.
+        "bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        "bash <<'E'\nbash -c \"$(echo 'X=${nope:-a b}') rm -rf /etc\"\nE",
+        "eval 'bash -c \"$(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc\"'",
+        "bash -c \"bash -c \\\"\\$(echo 'X=\\${nope:-a b}') rm -rf /etc\\\"\"",
+        # ...inside a substitution body, a function, or a second `-exec`.
+        ": $(eval $(echo 'X=${nope:-a b}') rm -rf /etc)",
+        ": $(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')",
+        "cat <(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')",
+        "cat <<E\n$(bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc')\nE",
+        "f(){ bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'; }; f",
+        "find . -exec sh -c true \\; -exec sh -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc' \\;",
+        "trap 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc' EXIT",
+        "bash <<< 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        "sh<<<'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        ". /dev/stdin <<< 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
+        "bash -c $'eval $(echo \\'X=${nope:-a b}\\') rm -rf /etc; echo done'",
+        "sh <<< $'eval \\x24(echo \\'X=${nope:-a b}\\') rm -rf /etc'",
+        "bash <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
+        "bash <<'E'\nbash <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "{ bash; } <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
+        "bash <<'E'\n{ bash; } <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "bash <<'E'\nbash<<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        "bash <<'E'\nx=bash; $x <<'F'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nF\nE",
+        ": $(bash <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE\n)",
+        "bash <<E\nbash -c \\$'eval \\$(echo \\\\'X=\\${nope:-a b}\\\\') rm -rf /etc'\nE",
+        # ...and a quoted `$'` decoy is no ANSI-C string: read raw too.
+        "echo \"$'\\'\"; eval $(echo 'X=${nope:-a b}') rm -rf /etc #'",
+        "echo 'x$' \"\\'\"; eval $(echo 'X=${nope:-a b}') rm -rf /etc #'",
         # An ARGUMENT's expansion is word-split: this still deletes /etc.
         "rm -rf X=${n:- /etc}",
         "rm -rf A=1 X=$(echo a; echo /etc)",
@@ -3044,6 +3145,15 @@ class TestWrapperUnwrapping(unittest.TestCase):
         "env -i PATH=/x X=$((1 + 2)) ls",
         "function build { X=$((1 + 2)) make -j$(nproc); }",
         "nice -n 5 X=$(echo a b) ls",
+        "bash -c \"$(echo 'X=${nope:-a b}') make\"",
+        "R=$(echo 'X=${n:-a b}'); echo \"$R\"",
+        "eval \"$(ssh-agent -s)\"",
+        "eval X=1 ls",
+        "f(){ bash -c 'eval $(opam env) make'; }; f",
+        ": $(bash -c 'X=$(date) ls')",
+        "cat <<'E' > f.sh\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
+        "trap 'rm -f \"$tmp\"' EXIT",
+        "bash <<< 'eval $(opam env) make'",
     ]
 
     def test_shell_wrapped_destructive_blocked(self):
@@ -3055,6 +3165,19 @@ class TestWrapperUnwrapping(unittest.TestCase):
         for cmd in self.PREFIX_WRAPPED:
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
+
+    def test_printed_assignment_walk_memo_is_per_owner_and_linear(self):
+        """XERK-1645 QA: the walk memoises each heredoc owner; a memo keyed
+        wrong reused a non-shell owner's answer for a shell-fed one, and none
+        at all made a 250-heredoc line quadratic, past the deadline."""
+        body = "bash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'"
+        cmd = f"bash <<'O'\ncat <<'A' >/dev/null\nx\nA\ncat <<'B' | bash\n{body}\nB\nO"
+        self.assertIsNotNone(guard.is_destructive(cmd))
+        many = "x=$(date); " + "; ".join(f"cat <<'E{i}' >/dev/null" for i in range(250)) \
+            + "\n" + "".join(f"b\nE{i}\n" for i in range(250))
+        t = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": many}, cwd="/tmp")[0], "allow")
+        self.assertLess(time.monotonic() - t, 10)
 
     def test_wrapped_safe_still_allowed(self):
         for cmd in self.WRAPPED_SAFE:
@@ -4037,6 +4160,64 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
+    def test_a_target_built_from_home_is_read_with_the_real_home(self):
+        # XERK-1656: `$HOME`, `~` and `${HOME<op>}` are expanded against the
+        # session's HOME, so a target that leaves the home through `..`, a
+        # replace, a trim or an alternative names what bash deletes.
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cmd in ('rm -rf "${HOME/root/}"*', 'rm -rf "${HOME/root/etc}"', 'rm -rf "$HOME"/../etc',
+                        'rm -rf "${x:-${HOME}}"/*', 'rm -rf "${HOME:-/tmp}"/*', "rm -rf ${HOME:=/tmp}",
+                        'rm -rf "${x:-${HOME:-/tmp}}"/*', 'rm -rf "${HOME:+/etc}"', 'rm -rf "${HOME+/etc}"',
+                        'rm -rf "${HOME:+/}"etc', 'rm -rf "${HOME/root/$y}"', "chmod -R 777 ~/..",
+                        "chmod -R 777 $HOME/..", "chown -R nobody $HOME/..", "rm -rf ${HOME%/}",
+                        "rm -rf ${HOME:0}", "rm -rf ${HOME/x/x}", "rm -rf ${HOME%/}/.ssh", "rm -rf ${HOME,,}",
+                        'rm -rf "${HOME: -5}"', "rm -rf ~/x/..", "find ~/.. -delete", "rm -rf ~root/..",
+                        "chmod -R 777 ${HOME@E}/..", "rm -rf ${HOME@L}/../etc", "rm -rf ~bin/x",
+                        "cd ~/..; rm -rf *", "cd $HOME/..; rm -rf etc", "pushd ~/.. && rm -rf *",
+                        # Text on the line never switches the home reading off (QA).
+                        'echo env; rm -rf "${HOME:-/tmp}"/*', 'rm -rf "${HOME:-/tmp}"/* # unset',
+                        # HOME can be unset, so its default is a reading too.
+                        'unset HOME; rm -rf "${HOME:-/}"etc', "env -i bash -c 'rm -rf \"${HOME:-/}\"etc'",
+                        'read HOME </dev/null; rm -rf "${HOME:-/}"etc',
+                        # Each command a kept default can reach (`_HOME_TARGET_PROGS`).
+                        'chown -R nobody "${HOME:-/tmp}"', 'chgrp -R nobody "${HOME:-/tmp}"',
+                        'chmod -R 000 "${HOME:-/tmp}"/', 'unlink "${HOME:-/tmp}"/.ssh',
+                        'find "${HOME:-/tmp}" -delete', 'cd "${HOME:-/tmp}"/..; rm -rf *',
+                        "f(){ local HOME; ${HOME:-rm} -rf /; }; f"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNotNone(guard.is_destructive(cmd))
+            for cmd in ("rm -rf $HOME/.cache", "rm -rf ~/.cache/pip", 'rm -rf "$HOME/build"', "rm -rf ~/x/",
+                        'rm -rf "${HOME:-/tmp}"/.cache', "rm -rf ${HOME}/tmp/x", "chmod -R 755 ~/proj",
+                        "chmod -R 700 ~/.ssh", "rm -rf ~/../foo", "rm -rf ~root/x", "rm -rf ${HOME:1}",
+                        "rm -rf ${HOME//o/}", "rm -rf ${HOME@Q}", "rm -rf ~nosuchuser9/..",
+                        "rm -rf ${XDG_CACHE_HOME:-$HOME/.cache}/pip", "cd ~/proj && rm -rf build"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNone(guard.is_destructive(cmd))
+        # Another HOME moves the reading with it: `/root` is no longer the home.
+        with mock.patch.dict(os.environ, {"HOME": "/home/me"}):
+            self.assertIsNone(guard.is_destructive('rm -rf "${HOME/root/etc}"/x'))
+            self.assertIsNotNone(guard.is_destructive('rm -rf "${HOME%/me}"'))
+            self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/../../etc"))
+            self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
+        # An op sees HOME as written, trailing slash and all.
+        with mock.patch.dict(os.environ, {"HOME": "/root/"}):
+            self.assertIsNotNone(guard.is_destructive("rm -rf ${HOME%root/}etc"))
+            self.assertIsNone(guard.is_destructive("rm -rf ${HOME%root}etc"))
+        # With HOME=/ nothing maps back to the home: `$HOME/etc` is /etc.
+        with mock.patch.dict(os.environ, {"HOME": "/"}):
+            self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/etc"))
+            self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
+
+    def test_home_readings_are_bounded(self):
+        # XERK-1656: each pattern op costs a match per substring of HOME, so
+        # past `_MAX_HOME_OPS` the target reads as `/` instead of being timed.
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            word = "${HOME%/}" * (guard._MAX_HOME_OPS + 1)
+            self.assertEqual(guard._home_reading(word), "/")
+            self.assertEqual(guard._home_reading("${HOME[0]}/x"), None)
+            self.assertEqual(guard._home_reading("$HOMEDIR/x"), None)
+            self.assertEqual(guard._home_reading("${HOME}/../etc"), "/etc")
+
     def test_leading_names_are_one_run_and_scan_linearly(self):
         # XERK-1639: every name in the run is read empty, not just the first,
         # and an unclosed `${` stops the scan instead of backtracking (QA).
@@ -4112,6 +4293,27 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "$x \\\nrm -rf /etc", '"$@" \\\nrm -rf /etc', "$(true) \\\nrm -rf /etc",
                     'bash -c "\\$x \\\nrm -rf /etc"', 'eval "\\$x \\\nrm -rf /etc"',
                     'bash <<< "\\$x \\\nrm -rf /etc"', 'echo "\\$x \\\nrm -rf /etc" | bash',
+                    # A lone trailing `\` is a literal `\` to bash; shlex raised on
+                    # it and its fallback kept the script's quotes (XERK-1646).
+                    "bash -c 'rm -rf /etc '\\", "bash -c 'rm -rf /etc'\\",
+                    "sh -c 'rm -rf /etc'\\", "eval 'rm -rf /etc'\\",
+                    "bash -c 'X=${nope:-a b} rm -rf /etc '\\",
+                    # zsh drops it instead; a brace expansion glued to it is
+                    # still read split (it was denied before the fix too).
+                    "git push origin main\\", "bash -c 'git push origin main'\\",
+                    "eval 'reboot'\\", "bash -c 'find / -delete'\\",
+                    "rm -rf {/etc,/var}\\", "rm -rf /{etc,var}\\", "rm -rf {/,x}\\",
+                    # ...on the routes that feed a shell its stdin too.
+                    "bash <<< 'rm -rf /etc'\\", "echo 'rm -rf /etc' | sh\\",
+                    "bash <(echo 'rm -rf /etc')\\", "cat <(echo 'rm -rf /etc') | sh\\",
+                    "source <(echo 'rm -rf /etc')\\", "# don't\nbash -c 'rm -rf /etc'\\",
+                    # ...after a glued `#` (no comment), before a newline, and
+                    # where the split ate the escaped blank after it.
+                    "bash -c 'rm -rf /etc;'#\\", "sh <<< 'rm -rf /etc '#\\",
+                    "bash -c 'rm -rf /etc'\\\n", "bash -c 'rm -rf /etc'\\\n\nls",
+                    "sh <<< 'rm -rf /etc'\\\n", "bash -c 'rm -rf /etc '\\ ; true",
+                    "eval 'rm -rf /etc '\\ ; true", "echo 'rm -rf /etc;'\\ | sh",
+                    "{ bash -c 'rm -rf /etc'\\; }",
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',
@@ -4728,7 +4930,7 @@ class TestPrSummary(unittest.TestCase):
             with self.subTest(cmd=cmd[:50]):
                 ev = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd},
                                  "cwd": self.repo, "hook_event_name": "PreToolUse"})
-                out = subprocess.run([sys.executable, "-SsE", hook], input=ev,
+                out = subprocess.run([sys.executable, "-SI", hook], input=ev,
                                      capture_output=True, text=True, timeout=30).stdout
                 self.assertEqual("deny" if '"deny"' in out else "allow", want)
 
@@ -5176,7 +5378,7 @@ class TestJudgeGrants(unittest.TestCase):
                **(env_extra or {})}
         env.pop("TURMA_PERMISSION_JUDGE", None)
         env.update(env_extra or {})
-        proc = subprocess.run([sys.executable, "-SsE", GUARD_PATH]
+        proc = subprocess.run([sys.executable, "-SI", GUARD_PATH]
                               + ([guard.GRANTS_FLAG] if grants else []),
                               input=json.dumps({"tool_name": "Bash",
                                                 "tool_input": {"command": command}}),
