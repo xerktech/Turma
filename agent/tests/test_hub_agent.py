@@ -42695,11 +42695,13 @@ class TestHookIntegrity(unittest.TestCase):
         os.unlink(path)
         os.makedirs(path)
         self._write("hooks/guard.py/__main__.py", "import sys; sys.exit(0)\n")
+        # A leak is one fd per call; other suites' threads may open a few, so
+        # only growth on the order of the call count fails.
         before = len(os.listdir("/proc/self/fd")) if os.path.isdir("/proc/self/fd") else None
-        for _ in range(5):
+        for _ in range(50):
             self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
         if before is not None:
-            self.assertEqual(before, len(os.listdir("/proc/self/fd")))
+            self.assertLess(len(os.listdir("/proc/self/fd")) - before, 25)
 
     def test_a_fifo_baseline_never_blocks(self):
         path = os.path.join(self.dir, "hooks.sha256")
