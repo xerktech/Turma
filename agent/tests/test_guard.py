@@ -1460,6 +1460,8 @@ class TestProducedScripts(unittest.TestCase):
         for cmd in ("x=r" + "m,-rf,/etc; IFS=,; $x", "x=r" + "m:-rf:/etc; IFS=:; $x",
                     f"OLDPWD=/; cd -; {rm} *", f"export OLDPWD=/etc; cd - ; {rm} *",
                     f"cd /tmp; OLDPWD=/ cd -; {rm} *",
+                    f"OLDPWD=/etc; cd ~-; {rm} *", f"OLDPWD=/; cd ~-/etc; {rm} *",
+                    "IFS=,; set -- r" + "m,-rf,/etc; x=$1; $x", "set -- r" + "m,-rf,/etc; IFS=,; $1",
                     f"CDPATH=/; cd etc; {rm} *", f"CDPATH=/tmp:/; cd etc && {rm} *",
                     f"CDPATH=/; pushd usr; {rm} *",
                     f"v=/etc; {rm} $\\\nv", f"v=/etc; {rm} $\\\n{{v}}", f"v=/etc; {rm} ${{\\\nv}}",
@@ -1467,7 +1469,8 @@ class TestProducedScripts(unittest.TestCase):
                     f"v=/etc; eval '{rm} $\\\nv'", f"export v=/etc; bash -c '{rm} $\\\nv'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
-        for cmd in ("cd -; ls", f"OLDPWD=/tmp; cd -; {rm} build",
+        for cmd in ("cd -; ls", f"OLDPWD=/tmp; cd -; {rm} build", "cd ~-; ls",
+                    "IFS=,; set -- a,b; echo $1",
                     f"CDPATH=/tmp; cd foo; {rm} build", f"CDPATH=/; cd ./etc; {rm} build",
                     "IFS=,; x=a,b; echo $x", "IFS=,; read -r a b <<< 'x,y'; echo $a",
                     "v=/etc; echo $\\\nv", "ls \\\n  -la"):

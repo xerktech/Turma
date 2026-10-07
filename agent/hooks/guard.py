@@ -4178,15 +4178,20 @@ def _escape_value(value: str, state: str) -> str:
     return bare
 
 
-def _ifs_split_values(vals: dict[str, list[str]]) -> dict[str, list[str]]:
-    """``vals`` with every non-blank character of each IFS the line assigns
-    read as a blank, or {} when it assigns none: an unquoted expansion splits
-    there, so `IFS=,` makes `$x` of `rm,-rf,/etc` three words (XERK-1662).
-    Every IFS value at once, and quoted expansions too: both only widen."""
+def _ifs_split_re(vals: dict[str, list[str]]) -> "re.Pattern[str] | None":
+    """The non-blank characters of every IFS ``vals`` assigns, where an
+    unquoted expansion splits, or None when it assigns none (XERK-1662)."""
     chars = {c for v in vals.get("IFS", ()) for c in v if not c.isspace()}
-    if not chars:
+    return re.compile("[" + re.escape("".join(sorted(chars))) + "]") if chars else None
+
+
+def _ifs_split_values(vals: dict[str, list[str]]) -> dict[str, list[str]]:
+    """``vals`` with each `_ifs_split_re` character read as a blank, or {}:
+    `IFS=,` makes `$x` of `rm,-rf,/etc` three words (XERK-1662). Every IFS
+    value at once, and quoted expansions too: both only widen."""
+    split = _ifs_split_re(vals)
+    if split is None:
         return {}
-    split = re.compile("[" + re.escape("".join(sorted(chars))) + "]")
     return {name: [split.sub(" ", v) for v in vs] for name, vs in vals.items() if name != "IFS"}
 
 
@@ -8072,6 +8077,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         bound = _substitute_vars(reading, vals)
         out.extend(_memo("expand", ("positional", bound, depth, every_cd),
                          _expand_segments, bound, depth + 1, every_cd))
+        # A bound `$1` is spliced in as text, so a set IFS cannot split it
+        # there: `IFS=,; set -- rm,-rf,/etc; $1` (XERK-1662). Read with every
+        # IFS character a blank too — over-reads its literal text, and only
+        # on a line that sets IFS.
+        split = _ifs_split_re(vals)
+        if split is not None and split.search(bound):
+            bound = split.sub(" ", bound)
+            out.extend(_memo("expand", ("positional", bound, depth, every_cd),
+                             _expand_segments, bound, depth + 1, every_cd))
         # A `for v; do $v` / `for v in "$@"` list is the bound words, each run
         # alone as the top line's lists are (`_for_word_lines`): joined,
         # `set -- a 'rm …'; for v; do $v; done` ran program `a` (XERK-1657).
@@ -8772,12 +8786,14 @@ def _cd_targets(text: str, inherited: tuple[str, ...],
         # `cd -` goes to $OLDPWD, and a relative name is looked up in each
         # $CDPATH entry first: `CDPATH=/; cd etc` is `/etc` (XERK-1662). Only
         # values the line itself assigns; an inherited one stays unknown.
-        if ops and not ops[0].startswith(("/", "~")):
+        if ops and (ops[0] == "~-" or not ops[0].startswith(("/", "~"))
+                    or ops[0].startswith("~-/")):
             vals = {**(line_vals or {})}
             for name, vs in _var_values(text).items():
                 vals[name] = vals.get(name, []) + vs
-            if ops[0] == "-":
-                targets += vals.get("OLDPWD", [])
+            # `~-` is `$OLDPWD` too, wherever `cd` is given it.
+            if ops[0] in ("-", "~-") or ops[0].startswith("~-/"):
+                targets += [v + ops[0][2:] for v in vals.get("OLDPWD", [])]
             elif not ops[0].startswith("."):
                 targets += [entry.rstrip("/") + "/" + ops[0]
                             for cdpath in vals.get("CDPATH", ()) for entry in cdpath.split(":")
