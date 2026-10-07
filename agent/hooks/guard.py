@@ -2011,7 +2011,7 @@ def _glob_class(pat: str, i: int):
 
 
 def _glob_tokens(pat: str) -> list | None:
-    """A `${v#pat}`-style pattern as bash matches it — quotes and `\` make text
+    """A `${v#pat}`-style pattern as bash matches it — quotes and `\\` make text
     literal, `[...]` takes POSIX classes — or None when it can't be read here:
     an expansion still in it, or an extglob `@(…)`."""
     toks: list = []
