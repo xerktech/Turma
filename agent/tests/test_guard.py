@@ -1250,7 +1250,16 @@ class TestParserGaps(unittest.TestCase):
                     # itself is read again with its name as it entered the loop.
                     "for i in 1 2; do z=$a$c; echo done; a='rm -rf /etc'; done; c=x; $z",
                     "for i in 1 2; do z=$a$c; x=done; a='rm -rf /etc'; done; c=x; $z",
-                    "for i in 1 2; do z=$z$a$c; a='rm -rf /etc'; done; c=x; $z"):
+                    "for i in 1 2; do z=$z$a$c; a='rm -rf /etc'; done; c=x; $z",
+                    # QA delta: a `do`/`done` closing or opening an expansion
+                    # is no keyword, so the body is not cut short at it.
+                    "for i in 1 2; do z=$a$c; echo ${q} done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$a$c; echo $(true) done; a='rm -rf /etc'; done; c=x; $z",
+                    "for i in 1 2; do z=$a$c; x=(done); a='rm -rf /etc'; done; c=x; $z",
+                    # QA delta: a quoted/literal separator in a value is part of
+                    # it and read in order, not a statement that ends it.
+                    'q=\'rm -rf /etc\'; d="$q$c ;"; c=x; $d',
+                    'q=\'rm -rf /etc\'; d="$q$c >x"; c=x; $d'):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         for cmd in ("c=$p/; p=1; rm -rf $c/x",
@@ -1260,6 +1269,10 @@ class TestParserGaps(unittest.TestCase):
                     # QA: a long `for` list is data, never counted per value;
                     # a value read on past its statement stays order-blind.
                     "for f in " + " ".join(f"f{i}" for i in range(30)) + "; do b=$a; a=$f; done; echo $b",
+                    # QA delta: a long list beside an order-differing body must
+                    # not be read as too large (D1): the body's own values are
+                    # read per value, the list's words are not.
+                    "for f in " + " ".join(f"f{i}" for i in range(31)) + "; do z=$a$c; a=$f; done; c=x; echo $z",
                     "for m in 'a|b' 'c|d'; do n=${m%%|*}; r=${m#*|}\npython3 - $r $n <<'E'\nprint(1)\nE\ndone"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
