@@ -3069,6 +3069,7 @@ class TestWrapperUnwrapping(unittest.TestCase):
         ". /dev/stdin <<< 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'",
         "bash -c $'eval $(echo \\'X=${nope:-a b}\\') rm -rf /etc; echo done'",
         "sh <<< $'eval \\x24(echo \\'X=${nope:-a b}\\') rm -rf /etc'",
+        "bash <<'E'\nbash -c 'eval $(echo '\"'\"'X=${nope:-a b}'\"'\"') rm -rf /etc'\nE",
         # ...and a quoted `$'` decoy is no ANSI-C string: read raw too.
         "echo \"$'\\'\"; eval $(echo 'X=${nope:-a b}') rm -rf /etc #'",
         "echo 'x$' \"\\'\"; eval $(echo 'X=${nope:-a b}') rm -rf /etc #'",

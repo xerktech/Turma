@@ -53,6 +53,8 @@ paths:
     body (quoted delimiter too), and `_raw_printed_cuts` walks the raw line for every `-c`/eval
     script, recursing into scripts, substitution bodies, `<(…)` and unquoted heredoc bodies
     (`: $(bash -c 'eval $(…) rm …')`). Read the raw line BEFORE `_expand` rebinds `command`.
+  - A QUOTED shell-fed heredoc body is walked at the heredoc site (the line's walk skips quoted
+    bodies, which are data unless a shell owns them).
   - A segment's leading `f(){`/`function f {`/`{`/`(` is dropped first (`_RAW_SEG_OPENER_RE`):
     `_tokenize` keeps `f(){` as one word. Every `-exec` script counts, not the first.
   - Its scripts: an eval join, every `-c` script, a `trap` action, and a shell's or `.`'s

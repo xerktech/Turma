@@ -7021,6 +7021,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 for cut in _printed_unsplit(script, unsplit):
                     out.extend(_expand_segments(_substitute_vars(cut, raw_vals), depth + 1,
                                                 every_cd))
+                # ...and its own `-c`/eval scripts walked raw: an unquoted body is
+                # walked with the line, a quoted one only here.
+                if quoted:
+                    for cut in _raw_printed_cuts(script):
+                        out.extend(_expand_segments(cut, depth + 1, every_cd))
                 out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
                                             every_cd))
         elif not quoted:
