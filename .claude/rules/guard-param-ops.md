@@ -21,7 +21,7 @@ paths:
   bash's default). A name not assigned on the line may be unset OR hold what bash knows (`$PWD`,
   `$HOME`, `$_`), and a `$(…)` prints something: no single reading is safe either way.
   - Pattern/offset: `_op_readings` yields every reading (unknowns empty, `$(…)` as printed, value
-    untouched); `_splice_readings` splices them as separate words led by `_UNREAD_OUTPUT`.
+    untouched); `_splice_readings` splices them marker-led, each also read alone (see below).
     Reading unknowns empty alone let `${a#$PWD}` through; keeping the value alone, `${a#${nope}xx}`.
   - Replacement and `:+`/`+` alternative: words, not patterns. An unknown stays live text (a
     trailing name braced, `_brace_trailing`, so glued text stays text); the line's reading then
@@ -38,18 +38,11 @@ paths:
   - Never trust the on reading as THE text: bash's matcher has quirks it does not model
     (`${a#*@(x|)}` on `x/etc` is `/etc`; `[[ x == *!(x) ]]` is false). Path-form quirks: XERK-1714.
   - On `${HOME<op>}` an extglob op reads as `/`: a None there read the target as not-home.
-- **Inside `"…"`, `_splice_readings`' FIRST word holds every reading, marker-led**, then each
-  reading as its own word (path rules). Marker alone first, a one-argument carrier (`bash -c "…"`,
-  `trap "…"`) read only the marker and ran the rest unread. A `<<<` operand takes one word, so
-  there only the joined word is spliced (`_herestring_word`): the others became script args.
-  - `_VAR_OP_EXT_STEPS` charges every range and union, not just positions: uncharged, one
-    `+(*|*|…)` op ran 46s. Nesting past `_EXTGLOB_DEPTH` is unreadable (was a RecursionError).
-  - Don't add `shopt` tracking instead: `shopt` is respelled as freely as any command, `bash -O`
-    and `BASHOPTS` set it too, and a missed spelling is a bypass. Reading both costs only refusing a
-    command-position extglob op. Accepted.
-  - A replace's empty match at the value's end is read both ways too: bash's own matcher is not
-    consistent there (`${v/%!(x)/-}` is `x`, `${v/%?(x)/-}` is `xyz-`).
-  - Bash parity: `test_extglob_ops_read_both_ways_as_bash`, off exact, on within the readings.
+- **Each reading of a multi-reading op gets a whole-line pass** (`_READING_PICK`, `_expand_both`).
+  - The default pass splices them marker-led: bare as words, inside `"…"` as ONE word.
+  - Never split a quoted word into reading words: a one-argument carrier (`bash -c "…"`, `trap`,
+    `<<<`) then got the marker alone and the script's rest landed in `$0` (XERK-1664 QA).
+  - `_READING_PICK` is in `_memo`'s key: missing, a pick pass replayed the default pass's result.
 - **A default applies wherever bash applies it, not only to an unassigned name** (XERK-1659):
   - A name assigned empty takes its `:-`/`:=` default (`x=; ${x:-cmd}`); `-`/`=` keep the empty value.
   - An unset array element takes its default as a scalar does (`${y[0]:-cmd}`, `[@]`, `[*]`).

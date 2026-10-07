@@ -1752,6 +1752,7 @@ def _budgeted(fn):
         _VALUE_COUNTS.clear()
         _BRACE_OTHER_SEEN[0] = False
         _MAIN_PARSE_SEEN[0] = False
+        _READINGS_SEEN[0] = 0
         _FOR_NAMES.clear()
         # These memos set the readings' SEEN flags as they fill, and a hit
         # skips that: a body cached by an earlier decision in this process
@@ -1774,7 +1775,7 @@ def _memo(kind: str, key, fn, *args):
     memo = _budget[kind]
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
            _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0],
-           _FOR_PICK[0], _HOME_KEPT[0])
+           _FOR_PICK[0], _HOME_KEPT[0], _READING_PICK[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -2488,29 +2489,22 @@ def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> l
         else out * 2
 
 
-def _herestring_word(command: str, states: list[str], i: int) -> bool:
-    """Whether ``command[i]`` sits in the word a `<<<` takes: only that one
-    word is its text, so a splice there must stay one word."""
-    while i > 0 and (states[i - 1] if i - 1 < len(states) else "") or (
-            i > 0 and not command[i - 1].isspace() and command[i - 1] not in ";|&<>()"):
-        i -= 1
-    return command[:i].rstrip().endswith("<<<")
+def _splice_readings(readings: list[str], state: str) -> str:
+    """Several readings of one expansion, as the line's reading needs them.
 
-
-def _splice_readings(readings: list[str], state: str, one_word: bool = False) -> str:
-    """Several readings of one expansion spliced as words led by
-    `_UNREAD_OUTPUT`: as a program it is refused, and each reading still
-    reaches the path rules — inside `"…"` too, as separate words. There the
-    first word holds them ALL, marker-led: a carrier reading one argument
-    (`bash -c "${a##+(x)}"`, `trap "…"`, `<<< "…"`) saw only the marker and
-    ran a script the guard never read (XERK-1664 QA). ``one_word`` (a `<<<`
-    operand, which takes one word) keeps only that joined word: the rest
-    became the shell's script-file arguments."""
+    Each reading gets a whole-line pass of its own (`_READING_PICK`, set by
+    `_expand_both`), where it is spliced plainly. The default pass splices
+    them led by `_UNREAD_OUTPUT`, so as a program it is refused: bare as
+    words, and inside `"…"` as ONE word. Split there, a carrier reading one
+    argument (`bash -c "…"`, `trap "…"`, `<<< "…"`) got only the marker and
+    the script's rest landed in words nothing read (XERK-1664 QA)."""
     if len(readings) == 1:
         return _quote_literal(readings[0], state)
+    _READINGS_SEEN[0] = max(_READINGS_SEEN[0], len(readings))
+    if _READING_PICK[0] is not None:
+        return _quote_literal(readings[min(_READING_PICK[0], len(readings) - 1)], state)
     if state == '"':
-        joined = " ".join((_UNREAD_OUTPUT, *readings))
-        return '" "'.join(_quote_literal(w, state) for w in (joined, *(() if one_word else readings)))
+        return _quote_literal(" ".join((_UNREAD_OUTPUT, *readings)), state)
     return " ".join(_quote_literal(w, state) for w in (_UNREAD_OUTPUT, *readings))
 
 
@@ -4210,8 +4204,7 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 if state == '"' and op and op.group(1) in (":+", "+"):
                     arg = _dq_unescape_brace(arg)  # as a default's, below
                 out = _splice_readings(_op_readings(value, op.group(1), arg, vals)
-                                       if op else [value], state,
-                                       _herestring_word(command, states, m.start()))
+                                       if op else [value], state)
         elif name == "HOME" and op and op.group(1) in _VAR_DEFAULT_OPS and _HOME_KEPT[0]:
             # The reading where HOME is set, as it is in every shell an agent
             # runs: spliced, `"${HOME:-/tmp}"/*` read `/tmp/*` and hid the
@@ -4337,6 +4330,12 @@ _MAIN_PARSE_SEEN = [False]
 # HOME is set where an agent runs, but `local HOME`, `read HOME` or `exec -c`
 # can unset it, so the default spliced is kept as a reading of its own.
 _HOME_KEPT = [False]
+# Set while `_expand_both` reads the line with each multi-reading expansion
+# spliced as its Nth reading (`_splice_readings`); and the most readings one
+# expansion of this decision had (XERK-1664).
+_READING_PICK: list = [None]
+_READINGS_SEEN = [0]
+_MAX_READING_PICKS = 8
 _HOME_DEFAULT_RE = re.compile(r"\$\{HOME:?[-=]")
 # `cd` and `find` are left out: a `cd` matters only to a later target, whose
 # command is listed, and a `find -delete` is read as an `rm -r` entry.
@@ -6649,6 +6648,16 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
             _HOME_KEPT[0] = False
     for reading in _home_tilde_readings(command) if home else ():
         out = out + _expand_both(reading)
+    if _READINGS_SEEN[0] > 1 and _READING_PICK[0] is None:
+        # Each reading of a multi-reading op spliced plainly, line-wide
+        # (XERK-1664): marker-led, `"…; ${a##+(x)}; …"` kept them all in one
+        # word, which no path rule splits.
+        try:
+            for pick in range(min(_READINGS_SEEN[0], _MAX_READING_PICKS)):
+                _READING_PICK[0] = pick
+                out = out + _expand_readings(command)
+        finally:
+            _READING_PICK[0] = None
     # A values pass is one reading, again when values print differently, and
     # once per taint reading: sixteen tainted `x=$(…)` made each 9x the cost.
     weight = 1 + bool(_VALUES_DIFFER[0]) + min(_VALUES_TAINT_N[0], _MAX_TAINT_STARTS)

@@ -2153,10 +2153,18 @@ class TestScriptChannels(unittest.TestCase):
                     "shopt -s extglob; a='xxrm -rf /etc'; bash <<<\"${a//+(x)/}\"",
                     "shopt -s extglob; a='xxrm -rf /etc'; xargs -0 bash -c <<< \"${a##+(x)}\"",
                     "a='rm -rf /etc'; bash -c \"${a#$PWD}\"",
-                    "a='rm -rf /etc'; bash <<< \"${a%$nope}\""):
+                    "a='rm -rf /etc'; bash <<< \"${a%$nope}\"",
+                    # QA delta 3: text AFTER the splice in that one argument,
+                    # and a path glued to it, are read too.
+                    "x=xx1; bash -c \"echo ${x##+(x)}; rm -rf /etc\"",
+                    "x=xx1; sh -c \"echo ${x//+(x)/} && rm -rf /etc\"",
+                    "a=/eX; bash -c \"rm -rf ${a%@(X)}tc\"",
+                    "a=/eX; trap \"rm -rf ${a%@(X)}tc\" EXIT"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("shopt -s extglob; f=build.bak; rm -rf \"${f%+(.bak)}\"",
+                    "shopt -s extglob; t=' x '; eval \"echo ${t##+( )}\"",
+                    "shopt -s extglob; p=/repos/x/; cd \"${p%%+(/)}\"",
                     "shopt -s extglob; a='xx/tmp/y'; rm -rf \"${a##+(x)}\"",
                     "a=xxrm; echo ${a#@(xx)}"):
             with self.subTest(cmd=cmd):
