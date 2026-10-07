@@ -262,17 +262,19 @@ paths:
     scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
   - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
-- **A lone `\` ending a text is read both ways** (XERK-1646, `_trailing_escape_readings`).
-  shlex raises on it and the whitespace-split fallback kept a `-c`/`eval` script's quotes.
-  - bash's (a literal `\`) is the TOKENIZER's (`_tokenize_cached`): every route tokenizes, and
-    the stdin-feed walk reads stages (`echo '…'\ | sh`) no added segment reaches.
-  - zsh's (dropped; also bash's here-string `text\`+newline continuation) is ADDED in `_expand`:
-    per whole line (the feeds read the raw line) AND per segment (the split leaves a lone `\`
-    the line lacks: `'…'\ ; true` loses the escaped blank; `\<newline>` split at its newline).
+- **A lone `\` ending a text is read DROPPED** (XERK-1646, `_drop_trailing_escape`): shlex
+  raises on it, and the whitespace-split fallback kept a `-c`/`eval` script's quotes.
+  - The reading lives in the TOKENIZER (`_tokenize_cached`): every route tokenizes — the
+    stdin-feed walk's stages (`echo '…'\ | sh`), a segment whose escaped blank the split ate
+    (`'…'\ ; true`), a `\<newline>` split at its newline.
+  - Dropped, not bash's literal `\`: zsh drops it, so does a continuation (bash's here-string
+    `text\`+newline), and the literal only ever weakens the last word (`/etc\`, `sh\`). Never
+    add the literal as a second whole-line or per-segment reading: each level of a nested
+    `eval '…'\` re-expanded both, 4x per level, and 1 KB took 29s (QA).
   - Detected by `_quote_states` + the run's parity, never shlex: `comments=True` read a glued
     `'…'#\` as a comment; without it `# don't` is an open quote.
-  - `_expand_braces` escapes a lone `\` on every joined word but the last: unescaped,
-    `{/etc,/var}\` became `/etc\ /var\`, ONE word to shlex.
+  - `_expand_braces` drops it too, BEFORE joining (as zsh does): left on, `{/etc,/var}\` became
+    `/etc\ /var\`, ONE word to shlex.
 - **A `${…}` inside `"…"` is a quoting frame of its own** (XERK-1621, `_quote_states`'s `{"`):
   a `"` there nests a string, never closes the outer one. Read flat, `"${y:-"it's"}"; rm …` left
   the `'` open and hid the `rm`.

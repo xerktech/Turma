@@ -2893,6 +2893,16 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         self.assertDenied("echo " + "$(echo " * 3000 + "x" + ")" * 3000)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_a_trailing_backslash_costs_no_reading_per_level(self):
+        # XERK-1646 QA: a second reading of a lone trailing `\` at every
+        # level of a nested `eval '…'\` grew 4x per level (1 KB took 29s).
+        cmd = "; ".join(["echo a | sh"] * 50)
+        for _ in range(5):
+            cmd = "eval " + shlex.quote(cmd) + "\\"
+        started = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        self.assertLess(time.monotonic() - started, 5)
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):

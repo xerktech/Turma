@@ -2415,12 +2415,12 @@ def _expand_braces(command: str) -> str:
         prefix, suffix = command[word_start:start], command[end:word_end]
         # An empty word goes, as in bash: `{,bash}` runs `bash`.
         parts = [w for w in (prefix + p.strip() + suffix for p in items) if w]
-        # A suffix ending in a lone `\` (the word ends the text) would escape
-        # the blank joining two words: `{/etc,/var}\` read as ONE word
-        # `/etc /var\`. bash keeps each `\` literal, so all but the last are
-        # escaped here; the tokenizer reads the last one so (XERK-1646).
-        parts[:-1] = [w + "\\" if (len(w) - len(w.rstrip("\\"))) % 2 else w
-                      for w in parts[:-1]]
+        # A suffix ending in a lone `\` (the word ends the text) escaped the
+        # blank joining two words: `{/etc,/var}\` read as ONE word
+        # `/etc /var\`. zsh drops that `\` before it expands; bash keeps it
+        # literal on every word, which judges no worse (XERK-1646).
+        if suffix.endswith("\\") and _drop_trailing_escape(command[:word_end]) is not None:
+            parts = [w[:-1] for w in parts if w[:-1]]
         command = command[:word_start] + " ".join(parts) + command[word_end:]
         pos = word_start
         states = _quote_states(command)
@@ -4581,26 +4581,28 @@ def _glue_func_parens(segment: str) -> str:
     return "".join(out)
 
 
-def _trailing_escape_readings(text: str, *, keep: bool = True) -> tuple[str, ...]:
-    """bash's and zsh's readings of ``text`` when it ends in a lone live `\\`
-    (trailing blanks aside): kept as a literal (bash, dash; only with
-    ``keep``), or dropped (zsh, and a line continuation, which is also what
-    bash makes of a here-string's `text\\`). Empty when it ends otherwise
-    (XERK-1646).
+def _drop_trailing_escape(text: str) -> str | None:
+    """``text`` with the lone live `\\` ending it (trailing blanks aside)
+    dropped, or None when it ends otherwise (XERK-1646).
+
+    zsh drops that `\\`, and so does every shell reading it as a line
+    continuation (a here-string's `text\\` + newline, a `\\<newline>` split
+    at its newline). bash keeps it as a literal `\\` glued to the last word,
+    which only ever makes that word LESS than the dropped reading's (`/etc\\`,
+    `sh\\`, `*\\`): nothing follows it in this parse, and in any later
+    parse it ends the text again. So the dropped reading is the one to judge.
 
     Judged by `_quote_states` and the run's parity, never by shlex: shlex's
     `comments` takes a `#` glued to a word (`'…'#\\`) for a comment, and
-    without it `# don't` is an open quote. Neither reading ends in a lone
-    `\\` again, so a caller re-expanding them stops.
+    without it `# don't` is an open quote.
     """
     body = text.rstrip(" \t\n")
     if not body.endswith("\\"):
-        return ()
+        return None
     run = len(body) - len(body.rstrip("\\"))
     if run % 2 == 0 or _quote_states(body)[-1] != "\\":
-        return ()
-    dropped = body[:-1] + text[len(body):]
-    return (body + "\\" + text[len(body):], dropped) if keep else (dropped,)
+        return None
+    return body[:-1] + text[len(body):]
 
 
 @functools.lru_cache(maxsize=512)
@@ -4610,14 +4612,15 @@ def _tokenize_cached(segment: str) -> tuple[str, ...]:
         return tuple(shlex.split(segment, posix=True))
     except ValueError:
         pass
-    # bash reads a lone `\` ending the text as a literal `\`; shlex raises,
-    # and the whitespace split below kept a `-c`/`eval` script's quotes, so
-    # `bash -c 'rm …'\` was never re-read (XERK-1646). Every route tokenizes,
-    # so this is where bash's reading goes; zsh's (dropped) is an added
-    # reading in `_expand`.
-    for kept in _trailing_escape_readings(segment)[:1]:
+    # A lone `\` ending the text makes shlex raise, and the whitespace split
+    # below kept a `-c`/`eval` script's quotes, so `bash -c 'rm …'\` was
+    # never re-read (XERK-1646). Every route tokenizes — the stdin-feed walk's
+    # stages, a segment whose escaped blank the split ate — so the reading
+    # goes here, and costs nothing per nesting level.
+    dropped = _drop_trailing_escape(segment)
+    if dropped is not None:
         try:
-            return tuple(shlex.split(kept, posix=True))
+            return tuple(shlex.split(dropped, posix=True))
         except ValueError:
             pass
     return tuple(segment.split())
@@ -6825,13 +6828,6 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # in: a re-parse can join what the brace split — `eval "\$x$(echo y) rm …"`
     # runs `$xy rm …`, its substitution already run a level up — so the text
     # is also read unbraced, with no bracing beneath (XERK-1615 QA).
-    # A lone `\` ending the text: zsh drops it, and bash feeds a here-string's
-    # `text\` to its reader as a line continuation, so the pipe, here-string
-    # and `<(…)` routes, which read the whole line, need the line read with it
-    # dropped too (XERK-1646). ADDED: the text's own reading stays.
-    for reading in _trailing_escape_readings(command, keep=False):
-        _spend(len(reading))
-        out.extend(_expand(reading, depth, cwds))
     braced = _brace_glued_names(command)
     if braced != command:
         _spend(len(command))
@@ -7021,17 +7017,6 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if seg not in seen:
                     seen.add(seg)
                     segments.append(seg)
-    # A segment ending in a lone `\` is also read with it dropped, as zsh
-    # does (XERK-1646; bash's literal reading is the tokenizer's). Per segment,
-    # not only per line: the split leaves one where the line has none
-    # (`bash -c '…'\ ; true` loses the escaped blank, a `\<newline>` split at
-    # its newline keeps the `\`).
-    seen = set(segments)
-    for seg in list(segments):
-        for reading in _trailing_escape_readings(seg, keep=False):
-            if reading not in seen:
-                seen.add(reading)
-                segments.append(reading)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
