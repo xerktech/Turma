@@ -45,8 +45,18 @@ paths:
   An EVEN backslash run before the blank (`a\\ #`) is literal text, so `#` starts a comment.
 - A function header may have comment lines before its body (`f() # c` NL `{`).
 - A `for p in a /etc` list is the name's values JOINED, so a whole `"$p"` word splices each value
-  as its own word (`_FOR_NAMES`); mid-string (`bash -c "… $p"`) they stay joined.
+  as its own word (`_FOR_NAMES`); mid-string (`bash -c "… $p"`) they stay joined. A ONE-word
+  list (each per-word reading) splices quoted (XERK-1657); `for v;`/`"$@"` lists are read per
+  word too.
 - A raw word never lands inside `'…'` of the body: the function's shell does not expand it there.
+- An UNQUOTED use of a raw word splits it (XERK-1657): a quoted word is spliced dequoted, plain
+  text escaped as a `$x` value is (`f(){ $1; }; f 'rm …'` ran `rm`); one holding `$`/backtick only
+  dequoted, so `f "$v"` stays live for the line's substitution.
+  - Never in an ASSIGNMENT (`_in_assignment_word`): escaped, `f(){ x=$1; $x; }; f 'rm …'` read
+    `x=rm` (a QA bypass of main's deny). Assignment = a command's leading `NAME=` words, or a
+    declaring builtin's (`local`/`export`/…, after its options). `env x=$1` is an argument and
+    `x=case $1` runs `$1`: both split (QA). A separator that is quoted or escaped (`env a\;x=$1`)
+    starts no command, so that word splits too. The `sh -c` binding keeps such a value whole.
 - Every binding is an ADDED reading beside the unbound text, and ORDER-BLIND on purpose: a `set`
   binds bodies it never reaches; a call binds whatever body its name has.
 - `shift` in the bound text adds each shifted list (`_shifted`, up to `_MAX_SHIFTS`); `for p;`

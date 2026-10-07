@@ -34,6 +34,8 @@ paths:
   `cp` are not followed.
   - Each file is read ONCE per line (`written.pop`): per run, N appends and N runs were
     quadratic and a 24 KB benign line hit the deadline (QA).
+  - A write inside a group or compound (`{ echo … > f; }`, `if …; then …; fi`, a loop body) is
+    found too (XERK-1657): `_written_scripts` recurses into `_group_core`, `_MAX_WRITE_NEST` deep.
 - An alias use runs its VALUE with the use's words after it: `alias b='bash -c'; b '<cmd>'`,
   through a chain, an `eval "b …"`, or a pipe (`echo /etc | b`). `_aliased_readings` is an
   ADDED whole-line reading with every use replaced, `_ALIASES_ON` off inside.

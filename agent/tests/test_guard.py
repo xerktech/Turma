@@ -3501,6 +3501,92 @@ class TestExpansionBudget(unittest.TestCase):
                     "echo " + "{a" * 16000 + "\n$x <<EOF\nx\nEOF"):
             self.check(cmd)
 
+    def test_loop_words_reach_a_script_positional_or_eval_alone(self):
+        # XERK-1657: each ran `rm -rf /etc` as nobody while the guard allowed it.
+        R = "rm -rf /"
+        for cmd in (f"for v in c '{R}'; do bash -c \"$v\"; done",
+                    f"for v in c '{R}'; do sh -c \"$v\"; done",
+                    f"for v in '{R}'; do bash -c \"$v\"; done",
+                    # Positionals bound by `set` or a call, then looped.
+                    f"set -- a '{R}'; for v; do $v; done", f"set -- a '{R}'; for v do $v; done",
+                    f"set -- a '{R}'; for v in \"$@\"; do $v; done",
+                    f"f(){{ for v; do $v; done; }}; f a '{R}'",
+                    f"f(){{ for v in \"$@\"; do bash -c \"$v\"; done; }}; f a '{R}'",
+                    # A brace word, a locale string, an eval rebuilding `$v`.
+                    f"for v in a {{'{R}',b}}; do $v; done", f"for v in a $\"{R}\"; do $v; done",
+                    f"x=$\"{R}\"; $x",
+                    f"for v in a '{R}'; do eval '$'v; done", f"for v in a '{R}'; do eval \"$\"v; done",
+                    f"v='{R}'; eval '$'v",
+                    # Two loops glued into one word: their product.
+                    "for a in x r; do for b in y m; do $a$b -rf /etc; done; done",
+                    "for a in x r; do for b in y m; do \"${a}\"\"$b\" -rf /etc; done; done",
+                    # An unquoted `$1` splits a quoted argument; and a script
+                    # written inside a loop, group or compound, then run.
+                    f"f(){{ $1; }}; f '{R}'", f"v='{R}'; f(){{ $1; }}; f \"$v\"",
+                    f"for v in a '{R}'; do f(){{ $1; }}; f \"$v\"; done",
+                    f"for v in a '{R}'; do echo \"$v\" > s.sh; done; sh s.sh",
+                    f"{{ echo '{R}' > s.sh; }}; sh s.sh", f"(echo '{R}' > s.sh); sh s.sh",
+                    f"if true; then echo '{R}' > s.sh; fi; . s.sh",
+                    # QA: an assignment never splits (escaped, `x=$1` read
+                    # `x=rm`); `$'…'` args; a brace list past its cap; a `$`
+                    # inside `'…'` is no ANSI-C string (`'$''v'` is `$v`).
+                    f"f(){{ x=$1; $x; }}; f '{R}'", f"f(){{ local x=$1; bash -c \"$x\"; }}; f '{R}'",
+                    f"set -- '{R}'; x=$1; $x", f"f(){{ $1; }}; f $'{R}'",
+                    f"v='{R}'; eval '$''v'", f"for v in a '{R}'; do eval '$''v'; done",
+                    f"d='$'; v='{R}'; eval $d'v'", f"sh -c 'x=$1; $x' _ '{R}'",
+                    # ...but `env x=$1` passes an argument, and `x=case $1`
+                    # runs `$1`: both split (QA). Brace-form eval rebuilds,
+                    # and a real `$'…'` after a quoted `'$'` (QA).
+                    "sh -c 'env x=$1' _ 'a rm -rf /'", f"sh -c 'x=case $1' _ '{R}'",
+                    f"f(){{ env -i x=$1; }}; f 'a {R}'",
+                    f"v='{R}'; eval '${{'v'}}'", f"for v in a '{R}'; do eval '${{v'}}; done",
+                    ": '$'; rm -rf $'/etc'", f": '$'; eval $'{R}'",
+                    # QA: a product across literal text or an empty name; an
+                    # escaped separator is no command start; env takes any
+                    # `=` word; a brace payload nested past a few levels.
+                    f"for a in ech ev; do for b in o l; do ${{a}}a$b '{R}'; done; done",
+                    f"for a in ech eva; do for b in o l; do $a$z$b '{R}'; done; done",
+                    f"f(){{ env a\\;x=$1; }}; f 'a {R}'", f"env 'a;x=1' {R}",
+                    "for f in {x,{x,{x,{x,{x,'" + R + ";'}}}}}" + "{1,2}" * 6 + "; do eval $f; done"):
+            with self.subTest(cmd=cmd):
+                reason = self.check(cmd)
+                self.assertIsNotNone(reason)
+                self.assertNotIn(self.TOO_LARGE, reason)
+        for cmd in ("for f in a 'b c'; do echo \"$f\"; done",
+                    "for d in src lib; do for f in a b; do cat $d/$f; done; done",
+                    "for f in {a,b}.txt; do rm -f \"$f\"; done",
+                    "set -- a b; for v; do echo \"$v\"; done",
+                    "f(){ for x; do rm -rf \"$x\"; done; }; f build dist",
+                    "for v in a b; do eval \"echo \\$v\"; done",
+                    f"for v in a '{R}'; do echo '$'v; done",
+                    "for v in a $\"hello world\"; do echo $v; done",
+                    "f(){ $1 --version; }; f 'git'", "f(){ x=$1; echo $x; }; f 'a b'",
+                    # A whole `"$c"` is ONE argument: data here, never run.
+                    f"for c in '{R}' x; do python3 -c 'import sys' \"$c\"; done", "for v in a b; do echo \"$v\" > s.txt; done; sh s.sh"):
+            self.assertIsNone(self.check(cmd), cmd)
+        # Glued names are found in linear time on a long blank-free run (QA).
+        self.assertTrue(guard._glued_name_pairs("x" * 60000 + "$a" + "$b" * 3, {"a", "b"}))
+        # Only uses touching (quotes between at most) are a product: a path
+        # `$d/$f` is read per list, as on main (QA: 2x on real loops).
+        self.assertEqual(guard._glued_name_pairs('$d/$f "$a""$b" $c\'$\'e', set("abcdef")),
+                         {frozenset("ab"), frozenset("ce")})
+        # Past its cap a brace list's items are each read, never cut short or
+        # refused (a long brace in heredoc text nothing runs, QA).
+        self.assertIsNotNone(self.check(
+            "for v in {a,}{a,}{a,}{a,}{a,}{a,}{a,}{z,'rm -rf /'}; do $v; done"))
+        self.assertIsNone(self.check(
+            "for f in {a,b}{c,d}{e,f}{g,h}{i,j}{k,l}{m,n}; do echo $f; done"))
+        # A product past `_MAX_FOR_PRODUCT` readings is too large, never slow.
+        words = " ".join(f"w{i}" for i in range(17))
+        self.assertIn(self.TOO_LARGE, self.check(
+            f"for a in {words}; do for b in {words}; do echo $a$b; done; done") or "")
+        words = " ".join(f"w{i}" for i in range(16))
+        self.assertIsNone(self.check(f"for a in {words}; do for b in {words}; do echo $a$b; done; done"))
+        # Nested but never glued: no product read at all.
+        with mock.patch.object(guard, "_MAX_FOR_PRODUCT", 0):
+            self.assertIsNone(self.check(
+                f"for a in {words}; do for b in {words}; do echo $a $b; done; done"))
+
     def test_long_for_lists_are_read_per_word_fast(self):
         # XERK-1647: a reading per list word drops the rest of the list, so
         # it stays linear in it; past the budget the line is denied unread.
