@@ -3934,9 +3934,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$build"/out', "rm -rf $x/tmp/foo", 'rm -rf "$d".bak',
-                    # The rest is read as written, never with XERK-1623's trailing names
-                    # dropped too: `"$a/$b"` read fully empty is XERK-1652's call.
-                    'rm -rf "$TMP/$x"', 'rm -rf "$x"/$y/',
+                    # A last component of names is kept, as is a trailing name right after
+                    # a `/`: the everyday `"$dir/$f"` is `/` only when both are unset (XERK-1652).
+                    'rm -rf "$TMP/$x"', 'rm -rf "$x"/$y/', 'rm -rf "$dir/$f"', 'rm -rf $x/$y',
+                    'rm -rf "$out/$name/build"',
                     'rm -rf "$x"*', "rm -rf $HOME/etc", "rm -rf $PWD/usr", "rm -rf ${HOME%/}/etc",
                     'rm -rf ./"$x"/etc', 'rm -rf "./$x/etc"', "rm -rf ${#x}/etc",
                     # Assigned, defaulted or `:?`-guarded names are never empty.
@@ -3950,6 +3951,27 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'clean() { rm -rf "$1"/*; }; clean /tmp/build'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_every_unset_name_component_is_read_empty(self):
+        # XERK-1652: bash reads every unset name empty, not only the leading
+        # run: a whole component with more path after it, and a trailing run
+        # glued to text, are dropped in the same reading as the leading names.
+        for cmd in ('rm -rf "$x/$y"/*', "rm -rf /$x/etc", 'rm -rf "/$x"/etc', "rm -rf $x//$y//etc",
+                    "rm -rf $x/etc$y", 'rm -rf "$x/etc$y"', "rm -rf $x/*$y", "rm -rf $x/.$y",
+                    "rm -rf $x/e$y*", "rm -rf $x/usr$y/", 'rm -rf "$x$y/etc$z"', "rm -rf /${x%/}/usr",
+                    "chmod -R 777 $x/etc$y", "find $x/etc$y -delete", 'chown -R me "/$x/$y"/etc',
+                    'f() { rm -rf "$x$1$y"; }; f /etc'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ('rm -rf "$dir/$f"', 'rm -rf "$TMP/$x"', 'rm -rf "$x"/$y/', "rm -rf $x/$y",
+                    'rm -rf "/tmp/$x/etc"', 'rm -rf "$x/build$y"', "rm -rf /$HOME/etc",
+                    "rm -rf /${x:-a}/etc", 'rm -rf "$x/$y/out"'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+        for word in ("/${a" * 20000, "/${a}" * 20000 + "/x", "/$a" * 40000 + "/x"):
+            start = time.monotonic()
+            guard._unset_names_dropped(word)
+            self.assertLess(time.monotonic() - start, 2)
 
     def test_leading_names_are_one_run_and_scan_linearly(self):
         # XERK-1639: every name in the run is read empty, not just the first,

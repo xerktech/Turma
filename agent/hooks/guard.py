@@ -7638,7 +7638,7 @@ def _glob_hits_system_root(pattern: str) -> bool:
 _TRAILING_PATH_TAIL_RE = re.compile(r"[/.]*|.*[*?\[].*", re.DOTALL)
 
 
-def _trailing_unset_dropped(tok: str) -> str | None:
+def _trailing_unset_dropped(tok: str, after_slash: bool = True) -> str | None:
     """``tok`` with the unset names ENDING it read as empty, else None
     (XERK-1623).
 
@@ -7662,7 +7662,9 @@ def _trailing_unset_dropped(tok: str) -> str | None:
             break
         spans.insert(0, (start, end))
         tail = start
-    if not spans:
+    # `after_slash=False` keeps a run that is a whole last component
+    # (`"$TMP/$x"`), for a reading that already dropped the leading names.
+    if not spans or (not after_slash and tok[spans[0][0] - 1] == "/"):
         return None
     pieces, last = [], 0
     for start, end in spans:
@@ -7793,11 +7795,12 @@ def _empties_a_set_path(op: str) -> bool:
                 or op[:2] in (":-", ":=", ":?") or op in ("%/", "#/"))
 
 
-def _leading_names_end(raw: str) -> int:
-    """Where the run of possibly-empty names opening ``raw`` ends, if a `/`
-    follows it, else 0. A `${…}` is closed by `_brace_end`, so a nested one
-    (`${x:+${y}}`) is one expansion, and an unclosed one stops the scan."""
-    pos = 0
+def _names_run_end(raw: str, pos: int) -> int:
+    """Where the run of possibly-empty names starting at ``pos`` ends, or
+    ``pos`` if there is none or one of them cannot be empty. A `${…}` is closed
+    by `_brace_end`, so a nested one (`${x:+${y}}`) is one expansion, and an
+    unclosed one stops the scan."""
+    start = pos
     while raw.startswith("$", pos):
         if m := _PLAIN_NAME_RE.match(raw, pos):
             name, op, end = m.group(1), "", m.end()
@@ -7807,40 +7810,76 @@ def _leading_names_end(raw: str) -> int:
             close = _brace_end(raw, pos, False)
             head = _BRACED_NAME_RE.match(raw, pos + 2, close) if close > 0 else None
             if head is None:
-                return 0
+                return start
             name, op, end = head.group(1), raw[head.end():close], close + 1
             if head.group(0) != name:
                 name = ""  # `${HOME[1]}` and `${!HOME}` are not HOME's value
         else:
-            return 0
+            return start
         # `?` errors and a default or assigned word is used; only an empty one
         # leaves it empty. HOME and PWD are set, so only another operator
         # (`${HOME:+}`, `${HOME#$HOME}`) can empty them.
         body = op[1:] if op.startswith(":") else op
         if body[:1] == "?" or (body[:1] in ("-", "=") and not _only_expansions(body[1:])):
-            return 0
+            return start
         if name in _ALWAYS_SET_NAMES and not _empties_a_set_path(op):
-            return 0
+            return start
         pos = end
-    return pos if raw.startswith("/", pos) else 0
+    return pos
+
+
+def _leading_names_end(raw: str) -> int:
+    """Where the run of possibly-empty names opening ``raw`` ends, if a `/`
+    follows it, else 0."""
+    end = _names_run_end(raw, 0)
+    return end if raw.startswith("/", end) else 0
+
+
+def _unset_names_dropped(raw: str) -> str | None:
+    """``raw`` with the unknown names bash would read as empty dropped, or
+    None if it has none (XERK-1652). Every path component made only of such
+    names is dropped when more path follows it: `$x/etc` and `/$x/etc` are
+    `/etc`, `"$a/$b"/*` is `//*`. A last component is kept, as is a trailing
+    run of names right after a `/`: `"$dir/$f"` and `"$TMP/$x"` are the
+    everyday idiom, and `/` only when both are unset. A run glued to text is
+    dropped (`$x/etc$y` is `/etc`)."""
+    # A later component needs a non-`/` character after its `/` to have more
+    # path after it: `"$x"/$y/` names `$y`, not the root. The leading run
+    # needs only the `/`: `$x/` is the root (XERK-1639).
+    last = len(raw.rstrip("/"))
+    pieces, kept, pos = [], 0, 0
+    while pos < len(raw):
+        end = _names_run_end(raw, pos)
+        if pos < end < (last if pos else len(raw)) and raw[end] == "/":
+            pieces.append(raw[kept:pos])
+            kept = end
+        slash = raw.find("/", end)
+        if slash < 0:
+            break
+        pos = slash + 1
+    pieces.append(raw[kept:])
+    rest = "".join(pieces)
+    dropped = _trailing_unset_dropped(rest, after_slash=False)
+    if dropped is not None:
+        return dropped
+    return rest if kept else None
 
 
 def _dangerous_target(tok: str) -> str | None:
     """Why ``tok`` names a protected path, or None. Besides the target as
-    written, its leading unknown names are read as empty, but that reading is
-    judged by `_is_dangerous_path` like any other: `"$build"/out` reads `/out`,
-    an ordinary root child, and stays allowed (owner decision on XERK-1639).
-    The names are found before `_norm_path`, whose normpath folds `$x/../etc`
-    into `etc` and `./$x/etc` into `$x/etc`."""
+    written, it is read with its unknown names empty (`_unset_names_dropped`),
+    and that reading is judged by `_is_dangerous_path` like any other:
+    `"$build"/out` reads `/out`, an ordinary root child, and stays allowed
+    (owner decision on XERK-1639). The names are found before `_norm_path`,
+    whose normpath folds `$x/../etc` into `etc` and `./$x/etc` into `$x/etc`."""
     if _is_dangerous_path(tok):
         return f"({tok!r})"
     raw = tok.strip().strip('"').strip("'")
-    end = _leading_names_end(raw)
-    # The rest is judged as written: reading its trailing names empty as well
-    # (XERK-1623) would read `"$TMP/$x"` as `/`. That also leaves `$x/etc$y`
-    # (both ends empty) allowed; both are XERK-1652's call.
-    if end and _is_dangerous_path(raw[end:], trailing=False):
-        return f"({tok!r}, which is {_norm_path(raw[end:])!r} when {raw[:end]} is unset)"
+    empty = _unset_names_dropped(raw)
+    # Judged as is: XERK-1623's trailing reading on top would read `"$TMP/$x"`
+    # as `/`; `_unset_names_dropped` already drops the trailing names it may.
+    if empty is not None and _is_dangerous_path(empty, trailing=False):
+        return f"({tok!r}, which is {_norm_path(empty)!r} when its unknown names are unset)"
     return None
 
 
