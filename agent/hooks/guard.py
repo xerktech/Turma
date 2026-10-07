@@ -70,6 +70,7 @@ import os
 import posixpath
 import re
 import shlex
+import string
 import stat
 import sys
 import threading
@@ -2355,12 +2356,61 @@ def _decode_ansi_c(command: str) -> str:
     def rep(m: "re.Match[str]") -> str:
         if len(m.group(1)) % 2:
             return m.group(0)
-        try:
-            return m.group(1) + shlex.quote(m.group(2).encode().decode("unicode_escape"))
-        except (UnicodeDecodeError, UnicodeEncodeError):
-            return m.group(0)
+        return m.group(1) + shlex.quote(_ansi_c_text(m.group(2)))
 
     return _ANSI_C_RE.sub(rep, command)
+
+
+# bash's `$'…'` single-character escapes.
+_ANSI_C_SIMPLE = {"a": "\a", "b": "\b", "e": "\x1b", "E": "\x1b", "f": "\f", "n": "\n",
+                  "r": "\r", "t": "\t", "v": "\v", "\\": "\\", "'": "'", '"': '"', "?": "?"}
+# `\xHH`, `\uHHHH`, `\UHHHHHHHH`: how many hex digits each takes at most.
+_ANSI_C_HEX = {"x": 2, "u": 4, "U": 8}
+
+
+def _ansi_c_text(body: str) -> str:
+    """The text bash makes of a `$'…'` body, by bash's rules, never failing.
+
+    Python's `unicode_escape` raised on escapes bash accepts (a bare `\\x`,
+    `\\x4`, `\\u41`), and the string was then left undecoded, so one such
+    escape hid the whole script: `bash -c $'rm -rf /etc; : \\x'` (XERK-1693).
+    An unknown escape keeps its backslash; a NUL ends the string, as in bash."""
+    out, i, n = [], 0, len(body)
+    while i < n:
+        ch = body[i]
+        if ch != "\\" or i + 1 >= n:
+            out.append(ch)
+            i += 1
+            continue
+        esc = body[i + 1]
+        i += 2
+        if esc in _ANSI_C_SIMPLE:
+            out.append(_ANSI_C_SIMPLE[esc])
+        elif esc in "01234567":
+            j = i
+            while j < n and j < i + 2 and body[j] in "01234567":
+                j += 1
+            out.append(chr(int(esc + body[i:j], 8) & 0xFF))
+            i = j
+        elif esc in _ANSI_C_HEX:
+            j = i
+            while j < n and j < i + _ANSI_C_HEX[esc] and body[j] in string.hexdigits:
+                j += 1
+            if j == i:
+                out.append("\\" + esc)
+            else:
+                code = int(body[i:j], 16)
+                out.append(chr(code) if code <= 0x10FFFF else "\ufffd")
+            i = j
+        elif esc == "c" and i < n:
+            # `\cX` is control-X; `\c\\` takes the escaped backslash.
+            x = body[i]
+            i += 2 if x == "\\" and body[i + 1:i + 2] == "\\" else 1
+            out.append("\x7f" if x == "?" else chr(ord(x) & 0x1F))
+        else:
+            out.append("\\" + esc)
+    text = "".join(out)
+    return text.split("\0", 1)[0]
 
 
 def _brace_sequence(body: str) -> list[str] | None:
