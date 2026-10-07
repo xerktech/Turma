@@ -31,13 +31,18 @@ paths:
 - `${a:off:len}` arithmetic (`_arith_offset`) truncates `/` and `%` toward zero as bash/C do.
 - **An extglob pattern (`+(x)`) is read BOTH ways** (`_var_op_readings`, XERK-1664): its meaning
   depends on `shopt -s extglob`, which the guard does not track, and either reading alone is a bypass.
-  - Off, it is plain glob; on, `_GlobExt` groups matched by `_ext_ends` (memoised, step-capped by
-    `_VAR_OP_EXT_STEPS`: `!(…)` makes it O(value² x pattern)).
-  - Differing readings splice marker-led, as `_op_readings`' others do: a blank-free value is no
-    longer kept whole (`${a##+(x)}` on `xx/etc` names `/etc`).
+  - Off, it is plain glob; on, `_GlobExt` groups matched by `_ext_ends` (memoised, step-capped:
+    `!(…)` makes it O(value² x pattern)).
+  - It ALWAYS yields 2+ readings (equal ones repeated), spliced marker-led: as a program it is
+    refused, and each reading reaches the path rules (`${a##+(x)}` on `xx/etc` names `/etc`).
+  - Never trust the on reading as THE text: bash's matcher has quirks it does not model
+    (`${a#*@(x|)}` on `x/etc` is `/etc`; `[[ x == *!(x) ]]` is false). Path-form quirks: XERK-1714.
+  - On `${HOME<op>}` an extglob op reads as `/`: a None there read the target as not-home.
+  - `_VAR_OP_EXT_STEPS` charges every range and union, not just positions: uncharged, one
+    `+(*|*|…)` op ran 46s. Nesting past `_EXTGLOB_DEPTH` is unreadable (was a RecursionError).
   - Don't add `shopt` tracking instead: `shopt` is respelled as freely as any command, `bash -O`
     and `BASHOPTS` set it too, and a missed spelling is a bypass. Reading both costs only refusing a
-    command-position op whose readings differ. Accepted.
+    command-position extglob op. Accepted.
   - A replace's empty match at the value's end is read both ways too: bash's own matcher is not
     consistent there (`${v/%!(x)/-}` is `x`, `${v/%?(x)/-}` is `xyz-`).
   - Bash parity: `test_extglob_ops_read_both_ways_as_bash`, off exact, on within the readings.

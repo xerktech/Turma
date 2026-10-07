@@ -2136,7 +2136,15 @@ class TestScriptChannels(unittest.TestCase):
                     "shopt -s extglob; a='x/etc'; rm -rf \"${a##!(*/*)}\"",
                     "shopt -s extglob; a='xxeval'; ${a//+(x)/} \"a='rm -rf /etc'\"; $a",
                     "a='qq/etc'; b=${a##@(q|qq)}; rm -rf $b",
-                    "a='/'; rm -rf \"${a/%?(x)/etc}\""):
+                    "a='/'; rm -rf \"${a/%?(x)/etc}\"",
+                    # QA: bash-quirk patterns the on reading does not model,
+                    # and a nested op, are still never one trusted command.
+                    "shopt -s extglob; a='xrm -rf /etc'; ${a#*@(x|)}",
+                    "shopt -s extglob; a='rm -rf /etcx'; ${a%*@(x|)}",
+                    "shopt -s extglob; a='xxrm -rf /etc'; c=zx; ${a#@(${c#@(z)}x)}",
+                    # QA: an extglob op on HOME reads as the root.
+                    "rm -rf ${HOME%+(?)}", "rm -rf \"${HOME/+(?)/}\"",
+                    "rm -rf \"${HOME%+(?)}\"/.ssh", "rm -rf ~/../../etc${HOME#+(?)}"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("shopt -s extglob; f=build.bak; rm -rf \"${f%+(.bak)}\"",
@@ -2144,10 +2152,16 @@ class TestScriptChannels(unittest.TestCase):
                     "a=xxrm; echo ${a#@(xx)}"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
-        # A group whose matching blows up stops at its step budget.
-        started = time.monotonic()
-        guard._var_op_readings("x" * 5000 + "/etc", "##", "*(!(y))")
-        self.assertLess(time.monotonic() - started, 5)
+        # A group whose matching blows up stops at its step budget, and deep
+        # nesting is unreadable, never a RecursionError (XERK-1664 QA).
+        star = "|".join(["*"] * 200)
+        for v, op, pat in (("x" * 5000 + "/etc", "##", "*(!(y))"), ("x" * 2000, "##", f"+({star})"),
+                           ("x" * 2000, "%%", f"*({star})"), ("x" * 500, "//", f"!({star})/-"),
+                           ("x" * 256, "##", "+(" * 300 + "x" + ")" * 300)):
+            with self.subTest(pat=pat[:20]):
+                started = time.monotonic()
+                self.assertGreater(len(guard._var_op_readings(v, op, pat)), 1)
+                self.assertLess(time.monotonic() - started, 2)
 
     def test_ansi_c_strings_decode_as_bash_does(self):
         """XERK-1693: `$'…'` is decoded by bash's rules, never given up on: a

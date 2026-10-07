@@ -2126,7 +2126,9 @@ _VAR_OP_TRIM_COST = 1 << 18
 _VAR_OP_REPLACE_COST = 1 << 16
 # An extglob match's budget, in positions visited (`_ext_ends`): `!(…)` and a
 # star inside a group reach every later end, so it is O(value² x pattern).
-_VAR_OP_EXT_STEPS = 1 << 20
+_VAR_OP_EXT_STEPS = 1 << 18
+# How deep extglob groups nest before the pattern counts as unreadable.
+_EXTGLOB_DEPTH = 16
 
 
 def _glob_class(pat: str, i: int):
@@ -2205,7 +2207,7 @@ def _extglob_close(pat: str, i: int) -> tuple[list[str], int] | None:
     return None
 
 
-def _glob_tokens(pat: str, extglob: bool = False) -> list | None:
+def _glob_tokens(pat: str, extglob: bool = False, depth: int = 0) -> list | None:
     """A `${v#pat}`-style pattern as bash matches it — quotes and `\\` make text
     literal, `[...]` takes POSIX classes — or None when it can't be read here:
     an expansion still in it. With ``extglob`` (bash's `shopt -s extglob`) a
@@ -2218,9 +2220,9 @@ def _glob_tokens(pat: str, extglob: bool = False) -> list | None:
             return None
         if extglob and c in "?*+@!" and pat.startswith("(", i + 1):
             got = _extglob_close(pat, i + 1)
-            if got is None:
-                return None  # unclosed: bash neither matches it nor reads it literally
-            alts = [_glob_tokens(a, True) for a in got[0]]
+            if got is None or depth >= _EXTGLOB_DEPTH:
+                return None  # unclosed (bash reads it neither way), or too deep
+            alts = [_glob_tokens(a, True, depth + 1) for a in got[0]]
             if any(a is None for a in alts):
                 return None
             toks.append(_GlobExt(c, tuple(tuple(a) for a in alts)))
@@ -2319,9 +2321,14 @@ def _ext_ends(toks: tuple, value: str, start: int, memo: dict) -> set[int]:
         if memo["steps"] < 0:
             raise _GlobTooCostly
         if t is _GLOB_STAR:
+            memo["steps"] -= n + 1 - min(pos)
             pos = set(range(min(pos), n + 1))
         elif isinstance(t, _GlobExt):
-            pos = set().union(*(_ext_group_ends(t, p, value, memo) for p in pos))
+            ends = [_ext_group_ends(t, p, value, memo) for p in pos]
+            memo["steps"] -= sum(map(len, ends))
+            if memo["steps"] < 0:
+                raise _GlobTooCostly
+            pos = set().union(*ends)
         else:
             pos = {p + 1 for p in pos if p < n and (
                 t is _GLOB_ANY or (t == value[p] if isinstance(t, str) else t.match(value[p])))}
@@ -2339,7 +2346,11 @@ def _ext_group_ends(t: _GlobExt, p: int, value: str, memo: dict) -> frozenset:
     def alts(q: int) -> frozenset:
         k = (id(t), "alt", q)
         if k not in memo:
-            memo[k] = frozenset().union(*(_ext_ends(a, value, q, memo) for a in t.alts))
+            ends = [_ext_ends(a, value, q, memo) for a in t.alts]
+            memo["steps"] -= sum(map(len, ends))
+            if memo["steps"] < 0:
+                raise _GlobTooCostly
+            memo[k] = frozenset().union(*ends)
         return memo[k]
 
     if t.kind == "@":
@@ -2347,6 +2358,9 @@ def _ext_group_ends(t: _GlobExt, p: int, value: str, memo: dict) -> frozenset:
     elif t.kind == "?":
         got = alts(p) | {p}
     elif t.kind == "!":
+        memo["steps"] -= len(value) + 1 - p
+        if memo["steps"] < 0:
+            raise _GlobTooCostly
         got = set(range(p, len(value) + 1)) - alts(p)
     else:
         got = {p} if t.kind == "*" else set()
@@ -2470,7 +2484,8 @@ def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> l
             out.append(got)
     # Ambiguous even when every reading agrees, `${a#$PWD}` being unknown:
     # a value with blanks is led by the unread marker, as `_unreadable_op` does.
-    return out if len(out) > 1 or not re.search(r"\s", value) else out * 2
+    return out if len(out) > 1 or not (re.search(r"\s", value) or _EXTGLOB_RE.search(pat)) \
+        else out * 2
 
 
 def _splice_readings(readings: list[str], state: str) -> str:
@@ -2524,9 +2539,12 @@ def _arith_offset(text: str) -> int | None:
 
 def _var_op_readings(value: str, op: str, arg: str, rep: str | None = None) -> list[str]:
     """`${v<op><arg>}` on ``value`` read with bash's extglob off, then on when
-    its pattern holds an extglob group and that reading differs (XERK-1664).
-    The guard does not track `shopt -s extglob`, and either reading alone is
-    a bypass: `${a#+(x)}` on `xx/etc` is `xx/etc` off and `/etc` on.
+    its pattern holds an extglob group (XERK-1664). The guard does not track
+    `shopt -s extglob`, and either reading alone is a bypass: `${a##+(x)}` on
+    `xx/etc` is `xx/etc` off and `/etc` on. Such an op always yields two or
+    more readings, equal or not, so its callers splice it marker-led: bash's
+    own extglob matcher has quirks the on reading does not model
+    (`${a#*@(x|)}` on `x/etc` is `/etc`), so it is never one trusted text.
     ``rep`` set reads `${v<op><arg>/<rep>}`."""
     def one(ext: int) -> str:
         if rep is not None:
@@ -2538,7 +2556,7 @@ def _var_op_readings(value: str, op: str, arg: str, rep: str | None = None) -> l
     for ext in (1, 2) if op[0] == "/" else (1,):
         if (got := one(ext)) not in out:
             out.append(got)
-    return out
+    return out if len(out) > 1 else out * 2
 
 
 def _var_op_text(value: str, op: str, arg: str, rep: str | None = None) -> str:
@@ -9452,18 +9470,16 @@ def _home_expanded(raw: str, home: str, budget: list[int]) -> str | None:
             pat, rep = word(pat), word(rep)
             if pat is None or rep is None:
                 return None
-            got = _var_op_readings(home, op.group(1), pat, rep)
-            if len(got) > 1:
-                return None  # extglob on or off reads differently
-            value = got[0]
+            if _EXTGLOB_RE.search(pat):
+                return "/"  # an extglob op on HOME: read as the root (XERK-1664 QA)
+            value = _replace_op(home, op.group(1), pat, rep)
         else:
             arg = word(op.group(2))
             if arg is None:
                 return None
-            got = _var_op_readings(home, op.group(1), arg)
-            if len(got) > 1:
-                return None  # extglob on or off reads differently
-            value = got[0]
+            if _EXTGLOB_RE.search(arg):
+                return "/"  # an extglob op on HOME: read as the root (XERK-1664 QA)
+            value = _apply_var_op(home, op.group(1), arg)
         out.append(value)
         pos = close + 1
     out.append(raw[pos:])
