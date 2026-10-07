@@ -17,6 +17,18 @@ paths:
   - Bash parity: `test_glob_trims_match_bash` runs real bash; extend it with any new spelling.
 - **A name an `eval` assigns is bound for the whole line** (`_assigned_values`, depth-capped):
   any `eval` word in the segment, a `$x` holding `eval`, and the raw `$(…)` it is handed.
+  - The `$(…)` is read as printed AND by its taint readings (`cat <<<…`, pipes), and each script
+    with the line's names spliced (`v=a; eval "$(echo "$v=…")"`) (XERK-1668).
+  - `printf %q` prints its argument shell-quoted; printed bare, the eval bound `a=rm`.
+  - `eval echo …` prints what its echo prints (`_printed_from_tokens`), depth-capped.
+- **`source`/`.` bind names as `eval` does** (XERK-1668): a `<(…)` file, or a stdin file
+  (`/dev/stdin`, `/dev/fd/0`) fed as a `read` is (`_reader_feeds`: here-string, group, `< <(…)`).
+- **An op whose pattern nests a `${…}` is resolved whole** (`_var_sub(nested=True)`, the three
+  assignment resolvers only): cut at the inner `}`, `c="${a#${b:-x}}"` bound `x/etc}`.
+  - A value bound from several readings (marker-led) splices as words even inside `"$c"`.
+  - Only there: made global, a 3000-deep `${a:-${a:-…}}` blew Python's recursion limit.
+- `$((…))` in an offset is arithmetic (`_arith_offset`), so `${a:$((1+1))}` is read.
+- XERK-1668 cost, measured: 0 changed decisions over a 14.4k-command real corpus replay vs main.
 - Names in a pattern, replacement or offset are spliced by `_pattern_vars` (unassigned `IFS` =
   bash's default). A name not assigned on the line may be unset OR hold what bash knows (`$PWD`,
   `$HOME`, `$_`), and a `$(…)` prints something: no single reading is safe either way.
