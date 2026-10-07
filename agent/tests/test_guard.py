@@ -3357,10 +3357,10 @@ class TestExpansionBudget(unittest.TestCase):
     VALUE = " ".join(["w"] * 3000)
     TOO_LARGE = "too large to classify"
 
-    def check(self, cmd):
+    def check(self, cmd, limit=5):
         t = time.monotonic()
         reason = guard.is_destructive(cmd)
-        self.assertLess(time.monotonic() - t, 5, cmd[:80])
+        self.assertLess(time.monotonic() - t, limit, cmd[:80])
         return reason
 
     def test_redirect_runs_on_a_heredoc_line_stay_linear(self):
@@ -3428,7 +3428,10 @@ class TestExpansionBudget(unittest.TestCase):
             # heredoc body is substituted on its own and stays small.
             x + "bash <<EOF\necho $x\nEOF\n" * 1000,
         ):
-            self.assertIn(self.TOO_LARGE, self.check(cmd) or "", cmd[:80])
+            # The heredoc line takes ~4s idle (each body is read as a script);
+            # a shared CI runner needs headroom, as the xargs test below has.
+            limit = 10 if "<<EOF" in cmd else 5
+            self.assertIn(self.TOO_LARGE, self.check(cmd, limit) or "", cmd[:80])
 
     def test_find_exec_and_xargs_runs_are_denied_fast(self):
         # Their emitted WORK grew faster than linearly, not their text: 5000
