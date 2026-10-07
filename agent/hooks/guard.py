@@ -2403,10 +2403,12 @@ def _ansi_c_text(body: str) -> str:
                 out.append(chr(code) if code <= 0x10FFFF else "\ufffd")
             i = j
         elif esc == "c" and i < n:
-            # `\cX` is control-X; `\c\\` takes the escaped backslash.
+            # `\cX` is control-X; `\c\\` takes the escaped backslash. bash
+            # takes X's first UTF-8 byte and keeps its others (`\cé` = 03 a9).
             x = body[i]
             i += 2 if x == "\\" and body[i + 1:i + 2] == "\\" else 1
-            out.append("\x7f" if x == "?" else chr(ord(x) & 0x1F))
+            lead, *rest = x.encode("utf-8", "surrogatepass")
+            out.append("\x7f" if x == "?" else chr(lead & 0x1F) + bytes(rest).decode("latin-1"))
         else:
             out.append("\\" + esc)
     text = "".join(out)

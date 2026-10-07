@@ -1869,13 +1869,15 @@ class TestScriptChannels(unittest.TestCase):
     def test_ansi_c_strings_decode_as_bash_does(self):
         """XERK-1693: `$'…'` is decoded by bash's rules, never given up on: a
         `\\x` Python's decoder rejected left the whole script unread."""
-        bodies = ["\\x", "\\x4", "\\x41", "\\x414", "\\xg", "\\u41", "\\u0041x", "\\U1F600",
-                  "\\101", "\\0101", "\\1", "\\8", "\\q", "\\cA", "\\c?", "\\c\\\\x", "\\e[0m",
-                  "\\'", '\\"', "\\?", "a\\tb\\nc", "\\\\", "\\z\\y", "x\\0y", "\\x00z", "é\\x41"]
+        bodies = ["\\x", "\\x4", "\\x41", "\\x414", "\\xg", "\\u41", "\\u0041x", "\\U0000003b",
+                  "\\101", "\\0101", "\\1", "\\8", "\\q", "\\cA", "\\c?", "\\c\\\\x", "\\cé", "\\cŀx", "\\e[0m",
+                  "\\'", '\\"', "\\?", "a\\tb\\nc", "\\\\", "\\z\\y", "x\\0y", "\\x00z"]
         # A bash string holds no NUL (one ends it), so `\1\2` fences each case.
+        # Bytes compare as latin-1: `\cé` is the bytes 03 a9, as the guard reads it.
+        # (A `\u` past ASCII is locale-dependent in bash; the guard reads the character.)
         script = "".join(f"printf '%s\\1\\2' $'{b}'\n" for b in bodies)
         out = subprocess.run(["bash", "-c", script], capture_output=True, check=True,
-                             env={**os.environ, "LC_ALL": "C.UTF-8"}).stdout.decode()
+                             env={**os.environ, "LC_ALL": "C.UTF-8"}).stdout.decode("latin-1")
         want = out.split("\1\2")[:-1]
         self.assertEqual(len(want), len(bodies))
         for body, exp in zip(bodies, want):
