@@ -4366,7 +4366,7 @@ def _raw_printed_walk(command: str, depth: int) -> list[str]:
             for reading in _heredoc_readings(body):
                 cuts += _raw_printed_cuts(reading, depth + 1)
         elif any(_basename(t) in _SHELL_PROGS or t in (".", "source")
-                 for t in _tokenize(_SUBST_RE.sub(" ", owner))):
+                 for t in (w.strip("(){};&|") for w in _tokenize(_SUBST_RE.sub(" ", owner)))):
             # A quoted body a shell runs (`bash <<'E'`, `cat <<'E' | bash`),
             # nested in another; a non-shell owner's (`cat <<'E' > f.sh`) is data.
             cuts += _raw_printed_cuts(body, depth + 1)
@@ -7028,6 +7028,12 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 for cut in _printed_unsplit(script, unsplit):
                     out.extend(_expand_segments(_substitute_vars(cut, raw_vals), depth + 1,
                                                 every_cd))
+                # ...and its own `-c`/eval scripts walked raw. Here the owner is
+                # judged by `_owner_feeds_shell` (`bash<<'E'`, `{ bash; } <<'E'`,
+                # `$x <<'E'`, a heredoc in `$(…)`); the line's walk sees nesting.
+                if quoted:
+                    for cut in _raw_printed_cuts(script):
+                        out.extend(_expand_segments(cut, depth + 1, every_cd))
                 out.extend(_expand_segments(_substitute_vars(script, raw_vals), depth + 1,
                                             every_cd))
         elif not quoted:

@@ -56,6 +56,9 @@ paths:
   - Heredoc bodies in the walk: an unquoted one through `_heredoc_readings` (`\$'` is live
     there); a quoted one only when its owner line names a shell, `.` or `source` (else data:
     `cat <<'E' > f.sh`), at any nesting.
+  - The heredoc SITE in `_expand` walks a quoted body too, gated by `_owner_feeds_shell`: the
+    walk's owner-token check misses `bash<<'E'`, `{ bash; } <<'E'`, `$x <<'E'`, one in `$(…)`.
+    Never drop either: the site sees owners, the walk sees nesting.
   - A segment's leading `f(){`/`function f {`/`{`/`(` is dropped first (`_RAW_SEG_OPENER_RE`):
     `_tokenize` keeps `f(){` as one word. Every `-exec` script counts, not the first.
   - Its scripts: an eval join, every `-c` script, a `trap` action, and a shell's or `.`'s
