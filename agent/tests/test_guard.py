@@ -3963,14 +3963,21 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                         "chmod -R 777 $HOME/..", "chown -R nobody $HOME/..", "rm -rf ${HOME%/}",
                         "rm -rf ${HOME:0}", "rm -rf ${HOME/x/x}", "rm -rf ${HOME%/}/.ssh", "rm -rf ${HOME,,}",
                         'rm -rf "${HOME: -5}"', "rm -rf ~/x/..", "find ~/.. -delete", "rm -rf ~root/..",
-                        # HOME can be unset here, so its default is read too.
-                        "unset HOME; rm -rf ${HOME:-/etc}", "env -i bash -c 'rm -rf ${HOME:-/etc}'"):
+                        "chmod -R 777 ${HOME@E}/..", "rm -rf ${HOME@L}/../etc", "rm -rf ~bin/x",
+                        "cd ~/..; rm -rf *", "cd $HOME/..; rm -rf etc", "pushd ~/.. && rm -rf *",
+                        # Text on the line never switches the home reading off (QA).
+                        'echo env; rm -rf "${HOME:-/tmp}"/*', 'rm -rf "${HOME:-/tmp}"/* # unset',
+                        # HOME can be unset, so its default is a reading too.
+                        'unset HOME; rm -rf "${HOME:-/}"etc', "env -i bash -c 'rm -rf \"${HOME:-/}\"etc'",
+                        'read HOME </dev/null; rm -rf "${HOME:-/}"etc',
+                        "f(){ local HOME; ${HOME:-rm} -rf /; }; f"):
                 with self.subTest(cmd=cmd):
                     self.assertIsNotNone(guard.is_destructive(cmd))
             for cmd in ("rm -rf $HOME/.cache", "rm -rf ~/.cache/pip", 'rm -rf "$HOME/build"', "rm -rf ~/x/",
                         'rm -rf "${HOME:-/tmp}"/.cache', "rm -rf ${HOME}/tmp/x", "chmod -R 755 ~/proj",
                         "chmod -R 700 ~/.ssh", "rm -rf ~/../foo", "rm -rf ~root/x", "rm -rf ${HOME:1}",
-                        "rm -rf ${HOME//o/}", "rm -rf ${HOME@Q}", "rm -rf ~nosuchuser9/.."):
+                        "rm -rf ${HOME//o/}", "rm -rf ${HOME@Q}", "rm -rf ~nosuchuser9/..",
+                        "rm -rf ${XDG_CACHE_HOME:-$HOME/.cache}/pip", "cd ~/proj && rm -rf build"):
                 with self.subTest(cmd=cmd):
                     self.assertIsNone(guard.is_destructive(cmd))
         # Another HOME moves the reading with it: `/root` is no longer the home.
@@ -3978,6 +3985,14 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             self.assertIsNone(guard.is_destructive('rm -rf "${HOME/root/etc}"/x'))
             self.assertIsNotNone(guard.is_destructive('rm -rf "${HOME%/me}"'))
             self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/../../etc"))
+            self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
+        # An op sees HOME as written, trailing slash and all.
+        with mock.patch.dict(os.environ, {"HOME": "/root/"}):
+            self.assertIsNotNone(guard.is_destructive("rm -rf ${HOME%root/}etc"))
+            self.assertIsNone(guard.is_destructive("rm -rf ${HOME%root}etc"))
+        # With HOME=/ nothing maps back to the home: `$HOME/etc` is /etc.
+        with mock.patch.dict(os.environ, {"HOME": "/"}):
+            self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/etc"))
             self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
 
     def test_home_readings_are_bounded(self):

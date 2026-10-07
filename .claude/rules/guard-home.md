@@ -15,12 +15,21 @@ paths:
   - Never judge it as the absolute path: `/root/.cache` is a child of the /root system
     root, so every `$HOME/...` cleanup would deny.
 - Ops are evaluated by the guard's own `_apply_var_op` / `_replace_op`; an unset name in an
-  op's word reads empty (`${HOME/root/$y}` is `/`). An element or transform → no reading.
-- `${HOME:-w}` / `${HOME:=w}` are NOT spliced as `w`: HOME is always set, so `w` hid
-  `"${HOME:-/tmp}"/*`. A line that can unset HOME (`_HOME_UNSET_RE`: `unset`, `env`,
-  `HOME=`) still gets the default, since `env -i bash -c 'rm -rf ${HOME:-/etc}'` uses it.
+  op's word reads empty (`${HOME/root/$y}` is `/`). An element or quoting transform (`@Q`) → no reading.
+- `${HOME:-w}` is spliced as `w` AND, in a second `_expand_readings` pass (`_HOME_KEPT`, only
+  for lines with a `${HOME:-`/`:=` default), kept as written for `_home_reading`.
+  - Never one instead of the other: as `w` only, `"${HOME:-/tmp}"/*` hid the home wipe; as
+    written only, `local HOME`, `read HOME </dev/null` and `exec -c` unset HOME and ran `w`.
+  - Never gate it on the line's text (`unset`/`env`): any `echo env` turned it off, and a
+    per-use regex over the whole line was quadratic (45s on 87 KB).
+  - A new reading flag joins `_memo`'s key and `_reading()`, or the memo replays the old pass.
+- An op sees HOME as written (`${HOME%root/}etc` is /etc when HOME=/root/); only the
+  map-back normalises it.
+- Only person homes map back (session HOME, /root, /home/*, /Users/*): `~bin/x` is /bin/x.
+  With HOME=/ nothing maps back. `cd ~/..` is read through the same reading.
 - The reading depends on `$HOME`: tests pin it with `mock.patch.dict(os.environ, ...)`.
-- Cost, measured: 0 changed decisions over a 34.8k-command real corpus replay vs main.
+- Cost, measured: 0 changed decisions over a 34.8k-command real corpus replay vs main;
+  decide time on 200 targets of 64 HOME ops matches main.
 - Cost bound: past `_MAX_HOME_OPS` operators on HOME in one target, the reading is `/`.
 - Open: an unquoted `${x: -5}` is split at its space before any of this (XERK-1680).
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,

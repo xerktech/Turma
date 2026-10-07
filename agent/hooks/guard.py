@@ -1739,7 +1739,7 @@ def _memo(kind: str, key, fn, *args):
     memo = _budget[kind]
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
            _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0],
-           _FOR_PICK[0])
+           _FOR_PICK[0], _HOME_KEPT[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -3418,11 +3418,10 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 # A name in an op's pattern is expanded first: `"${a%%$s*}"`.
                 out = _splice_readings(_op_readings(value, op.group(1), op.group(2), vals)
                                        if op else [value], state)
-        elif name == "HOME" and op and not _HOME_UNSET_RE.search(command):
-            # HOME is set in every shell an agent runs, so its default is
-            # unused: spliced, `"${HOME:-/tmp}"/*` read `/tmp/*` and hid the
-            # home wipe (XERK-1656). Kept, `_home_reading` judges it. A line
-            # that can unset HOME (`unset`, `env -i`) still gets the default.
+        elif name == "HOME" and op and op.group(1) in _VAR_DEFAULT_OPS and _HOME_KEPT[0]:
+            # The reading where HOME is set, as it is in every shell an agent
+            # runs: spliced, `"${HOME:-/tmp}"/*` read `/tmp/*` and hid the
+            # home wipe (XERK-1656). Kept, `_home_reading` judges it.
             return "${" + name + rest + "}", end
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
             # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
@@ -3491,7 +3490,8 @@ def _dq_default(text: str) -> str:
 def _reading() -> tuple:
     """The reading flags a body's resolution reads, as a memo key: a body
     memoised under one reading was replayed under another (XERK-1621)."""
-    return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUE_PICK[0])
+    return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUE_PICK[0],
+            _HOME_KEPT[0])
 
 
 # Names a `for NAME in …` sets this decision. Its words are joined as the
@@ -3535,6 +3535,11 @@ _BRACE_OTHER_SEEN = [False]
 # so the old parse's denies are KEPT as a reading rather than replaced.
 _MAIN_PARSE = [False]
 _MAIN_PARSE_SEEN = [False]
+# Set while `_expand_both` reads a `${HOME:-w}` default as unused (XERK-1656):
+# HOME is set where an agent runs, but `local HOME`, `read HOME` or `exec -c`
+# can unset it, so the default spliced is kept as a reading of its own.
+_HOME_KEPT = [False]
+_HOME_DEFAULT_RE = re.compile(r"\$\{HOME:?[-=]")
 # Past this many `${…}` nested in one another, a line is too large to read.
 _MAX_NESTED_VARS = 200
 # Past this many assignments to one name, a line is too large to read.
@@ -5544,6 +5549,12 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     also read once per distinct word with the list cut down to that word
     (`_for_word_lines`, XERK-1647)."""
     out = _expand_readings(command)
+    if _HOME_DEFAULT_RE.search(command) and not _HOME_KEPT[0]:
+        _HOME_KEPT[0] = True
+        try:
+            out = out + _expand_readings(command)
+        finally:
+            _HOME_KEPT[0] = False
     # A values pass is one reading, again when values print differently, and
     # once per taint reading: sixteen tainted `x=$(…)` made each 9x the cost.
     weight = 1 + bool(_VALUES_DIFFER[0]) + min(_VALUES_TAINT_N[0], _MAX_TAINT_STARTS)
@@ -7516,7 +7527,8 @@ def _cd_targets(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
         except ValueError:
             args = m.group(2).split()
         ops = [a for a in args if not (a.startswith("-") and len(a) > 1)]
-        target = _norm_path(ops[0]) if ops else "~"  # a bare `cd` goes home
+        # A bare `cd` goes home; `cd ~/..` leaves it (XERK-1656).
+        target = _norm_path(_home_reading(ops[0]) or ops[0]) if ops else "~"
         low = target.lower()
         if low.startswith("/") or low.rstrip("/") in _HOME_TOKENS or _HOME_USER_RE.match(low):
             target = target.rstrip("/") or "/"
@@ -7839,14 +7851,19 @@ def _leading_names_end(raw: str) -> int:
 # `${HOME/root/etc}` is /etc, `${HOME:+/etc}` is /etc. As a token, `$HOME/..`
 # normpaths to `.` and an operator hides the name, so each was allowed.
 _HOME_NAME_RE = re.compile(r"\$HOME(?!\w)")
-# What can run a command with HOME unset, where a `${HOME:-w}` default is used.
-_HOME_UNSET_RE = re.compile(r"\b(?:unset|env)\b|\bHOME=")
+
+# The `${HOME@x}` transforms that leave a path: `@E`/`@P` expand escapes and
+# prompt codes, which a path holding none keeps as it is.
+_HOME_TRANSFORMS = {"@E": lambda v: v, "@P": lambda v: v, "@L": str.lower,
+                    "@U": str.upper, "@u": lambda v: v[:1].upper() + v[1:]}
 # Past this many `${HOME<op>}` in one target the reading is `/`: each pattern
 # operator costs a match per substring of HOME, and a target that size is no path.
 _MAX_HOME_OPS = 64
 
 
 def _session_home() -> str | None:
+    """HOME as bash holds it: an op sees its text, so it is not normalised
+    (`${HOME%root/}etc` is /etc when HOME=/root/)."""
     home = os.environ.get("HOME", "")
     if not home.startswith("/"):
         try:
@@ -7854,7 +7871,6 @@ def _session_home() -> str | None:
             home = pwd.getpwuid(os.getuid()).pw_dir
         except (ImportError, KeyError, AttributeError):
             return None
-    home = posixpath.normpath(re.sub(r"/{2,}", "/", home))
     return home if home.startswith("/") and len(home) <= 256 else None
 
 
@@ -7904,8 +7920,10 @@ def _home_expanded(raw: str, home: str, budget: list[int]) -> str | None:
             value = home  # set and non-empty, so the default is unused
         elif tail in _CASE_OPS:
             value = _CASE_OPS[tail](home)
+        elif tail in _HOME_TRANSFORMS:
+            value = _HOME_TRANSFORMS[tail](home)
         elif op is None:
-            return None  # a transform (`${HOME@Q}`)
+            return None  # a quoting transform (`${HOME@Q}`): no path
         elif op.group(1) in ("/", "//"):
             pat, rep = _split_replace(op.group(2))
             pat, rep = word(pat), word(rep)
@@ -7947,12 +7965,17 @@ def _home_reading(raw: str) -> str | None:
     home = _session_home()
     if home is None:
         return None
-    homes = [("$HOME", home)]
+    # Only a home that holds a person's files maps back. With HOME=/ every
+    # path is "inside" it, and a system account's home is a system directory
+    # (`~bin/x` is /bin/x, `~daemon/sshd` /usr/sbin/sshd).
+    norm = posixpath.normpath(re.sub(r"/{2,}", "/", home))
+    homes = [("$HOME", norm)] if norm != "/" else []
     if tilde:
         user = _user_home(tilde.group(1))
         if user is None:
             return None  # bash leaves an unknown `~name` as text
-        homes.insert(0, (tilde.group(0), user))
+        if user == norm or user.startswith(("/home/", "/Users/")) or user == "/root":
+            homes.insert(0, (tilde.group(0), user))
         raw = user + raw[tilde.end():]
     path = _home_expanded(raw, home, [_MAX_HOME_OPS])
     if path is None or path == raw and not tilde:
@@ -7962,11 +7985,9 @@ def _home_reading(raw: str) -> str | None:
     if path.startswith("/"):
         path = posixpath.normpath(path)
     for prefix, root in homes:
-        root = root.rstrip("/")
         # A glob straight after the home stays one too: `$HOME*/build`.
         if path.startswith(root) and path[len(root):len(root) + 1] in ("", "/", "*", "?", "["):
-            if path != "/" or not root:
-                return prefix + path[len(root):] + slash
+            return prefix + path[len(root):] + slash
     return path + slash
 
 
