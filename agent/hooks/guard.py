@@ -1766,6 +1766,7 @@ def _budgeted(fn):
         _VALUE_COUNTS.clear()
         _BRACE_OTHER_SEEN[0] = False
         _MAIN_PARSE_SEEN[0] = False
+        _READINGS_SEEN[0] = False
         _FOR_NAMES.clear()
         # These memos set the readings' SEEN flags as they fill, and a hit
         # skips that: a body cached by an earlier decision in this process
@@ -1788,7 +1789,7 @@ def _memo(kind: str, key, fn, *args):
     memo = _budget[kind]
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
            _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0],
-           _FOR_PICK[0], _HOME_KEPT[0])
+           _FOR_PICK[0], _HOME_KEPT[0], _READINGS_JOINED[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -2101,11 +2102,42 @@ _VAR_BARE_RE = re.compile(
 )
 
 
+def _nest_depth(text: str, lo: int, hi: int) -> int:
+    """How deep `${` openers nest in ``text[lo:hi]``, quoting ignored."""
+    depth = most = 0
+    for t in re.finditer(r"\$\{|\}", text[lo:hi]):
+        depth = depth + 1 if t.group(0) == "${" else max(depth - 1, 0)
+        most = max(most, depth)
+    return most
+
+
 def _var_uses(text: str):
-    """``_VAR_USE_RE.finditer(text)``, in time linear in ``text``."""
+    """``_VAR_USE_RE.finditer(text)``, in time linear in ``text`` — except a
+    `${…}` whose op word nests another runs to its real `}`: cut at the inner
+    one, `y=${q:+${e}x}` read as `${e}` then `x}`, and `y=${q#${nope}}` kept
+    a stray `}` on /etc (XERK-1673). `_substitute_vars` reads these itself."""
     k = text.rfind("}") + 1
-    yield from _VAR_USE_RE.finditer(text, 0, k)
-    yield from _VAR_BARE_RE.finditer(text, k)
+    last = 0
+    states = None  # once per text: looked up per use, a run of them is quadratic
+    for m in _VAR_USE_RE.finditer(text, 0, k):
+        if m.start() < last:
+            continue  # inside a nested use already yielded
+        if m.group(1) and "${" in m.group(2):
+            if states is None:
+                states = _quote_states(text)
+            close = _brace_end(text, m.start(), states[m.start()] == '"')
+            # Past `_MAX_NESTED_VARS` levels the flat match stays: each level
+            # is a recursion in the callers, and `_substitute_vars` already
+            # refuses that line as too large.
+            if close >= m.end() and _nest_depth(text, m.start(), close) <= _MAX_NESTED_VARS:
+                # Each caller re-reads the op word a level down, so the work
+                # is charged: 200 levels of a 40 KB value took 49s uncharged.
+                _spend(close - m.start())
+                m = _NestedUse(text, m.start(), m.group(1), close + 1)
+        last = m.end()
+        yield m
+    for m in _VAR_BARE_RE.finditer(text, max(k, last)):
+        yield m
 
 
 class _NestedUse:
@@ -2491,10 +2523,20 @@ def _op_readings(value: str, op: str, arg: str, vals: dict[str, list[str]]) -> l
 def _splice_readings(readings: list[str], state: str) -> str:
     """Several readings of one expansion spliced as words led by
     `_UNREAD_OUTPUT`: as a program it is refused, and each reading still
-    reaches the path rules — inside `"…"` too, as separate words."""
+    reaches the path rules — inside `"…"` too, as separate words.
+
+    Inside `"…"` that cuts a `bash -c "${q%x$nope} …"` script into a lone
+    marker plus arguments, so the script ran unread; kept one word, every
+    per-word judge but the path one (a stdin shell, `~/.ssh`, `cd /`) missed
+    it (XERK-1673 QA). So both: split here, one word in the added
+    `_READINGS_JOINED` reading."""
     if len(readings) == 1:
         return _quote_literal(readings[0], state)
     words = [_quote_literal(w, state) for w in (_UNREAD_OUTPUT, *readings)]
+    if state == '"':
+        _READINGS_SEEN[0] = True
+        if _READINGS_JOINED[0]:
+            return " ".join(words)
     return ('" "' if state == '"' else " ").join(words)
 
 
@@ -4327,12 +4369,16 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 arg = op.group(2) if op else ""
                 if state == '"' and op and op.group(1) in (":+", "+"):
                     arg = _dq_unescape_brace(arg)  # as a default's, below
-                if not op and state == '"' and value.startswith(_UNREAD_OUTPUT + " "):
-                    # A value bound from several readings (`c="${a#${b:-x}}"`,
-                    # `_assigned_values`): its words, marker first, as a
-                    # direct `"${a#${b:-x}}"` splices them (XERK-1668). One
-                    # quoted word, `rm -rf "$c"` hid `/etc`.
-                    out = '" "'.join(_quote_literal(w, state) for w in value.split())
+                if not op and value.startswith(_UNREAD_OUTPUT + " "):
+                    # A value bound from several readings (`y=${q%x$nope}`,
+                    # `c="${a#${b:-x}}"`, `_assigned_values`), stored
+                    # marker-led and joined: spliced as a direct op's readings
+                    # are (XERK-1668, XERK-1673). One quoted word, `rm -rf
+                    # "$c"` hid `/etc`. One reading (a `$(…)` output, `L=$(cat
+                    # f || echo ls)`) is doubled, as `@E` does: alone it lost
+                    # its marker and the program read as known.
+                    readings = value.split(" ")[1:]
+                    out = _splice_readings(readings * (2 if len(readings) == 1 else 1), state)
                 else:
                     out = _splice_readings(_op_readings(value, op.group(1), arg, vals)
                                            if op else [value], state)
@@ -4425,7 +4471,7 @@ def _reading() -> tuple:
     """The reading flags a body's resolution reads, as a memo key: a body
     memoised under one reading was replayed under another (XERK-1621)."""
     return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUE_PICK[0],
-            _HOME_KEPT[0])
+            _HOME_KEPT[0], _READINGS_JOINED[0])
 
 
 # Names a `for NAME in …` sets this decision. Its words are joined as the
@@ -4465,6 +4511,10 @@ _VALUES_ASSIGNED = [1]
 # as a plain character; bash pairs it. And whether this decision saw one.
 _BRACE_OTHER_SHELL = [False]
 _BRACE_OTHER_SEEN = [False]
+# Set while `_expand_both` splices an op's several readings inside `"…"` as
+# ONE word (`_splice_readings`), and whether this decision spliced any.
+_READINGS_JOINED = [False]
+_READINGS_SEEN = [False]
 # Set while `_expand_both` reads the line with quoting parsed flat, as before
 # XERK-1621 (no `${…}` frames, parens paired blind); and whether this decision
 # saw text the two parsers read differently. Every new rule above is a model
@@ -7091,6 +7141,15 @@ def _expand_readings(command: str) -> list[tuple[list[str], str]]:
                 out = out + _expand_picks(command)
             finally:
                 _VALUES_CHAINED[0] = 0
+    if _READINGS_SEEN[0] and not _READINGS_JOINED[0]:
+        # An op's readings in `"…"` as one word too (`_splice_readings`), in
+        # every reading above: one assignment away, only the chained one
+        # resolves `s="$y …"` (XERK-1673 QA).
+        _READINGS_JOINED[0] = True
+        try:
+            out = out + _expand_readings(command)
+        finally:
+            _READINGS_JOINED[0] = False
     return out
 
 
@@ -9489,6 +9548,12 @@ def _trailing_unset_dropped(tok: str, after_slash: bool = True) -> str | None:
 
 
 def _is_dangerous_path(tok: str, trailing: bool = True) -> bool:
+    if tok.startswith(_UNREAD_OUTPUT + " "):
+        # An assigned op's several readings, stored joined (`y=${q%x$nope}`),
+        # reach a quoted `"$y"` as ONE word: each reading is a target of its
+        # own (XERK-1673). Split here, never where `$y` is spliced: there a
+        # `bash -c "$y …"` script was cut into script and arguments (QA).
+        return any(_is_dangerous_path(w, trailing) for w in tok.split(" ")[1:] if w)
     dropped = _trailing_unset_dropped(tok) if trailing else None
     if dropped is not None and _is_dangerous_path(dropped):
         return True
@@ -9856,6 +9921,10 @@ def _dangerous_target(tok: str, home_read: bool = True, keep_last: bool = True) 
     whose normpath folds `$x/../etc` into `etc` and `./$x/etc` into `$x/etc`.
     ``keep_last`` keeps the names of the last component (`"$dir/$f"`), which
     only GNU rm's preserve-root makes safe when they read `/` (XERK-1687)."""
+    if tok.startswith(_UNREAD_OUTPUT + " "):
+        # Several readings kept one word (`_READINGS_JOINED`): each is a target.
+        return next(filter(None, (_dangerous_target(w, home_read, keep_last)
+                                  for w in tok.split(" ")[1:] if w)), None)
     if _is_dangerous_path(tok):
         return f"({tok!r})"
     raw = tok.strip().strip('"').strip("'")

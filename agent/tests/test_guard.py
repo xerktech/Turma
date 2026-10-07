@@ -1424,6 +1424,75 @@ class TestProducedScripts(unittest.TestCase):
         self.assertEqual(guard._substitute_vars("${a:-'}' #}", {}), "'}' \\#")
         self.assertEqual(guard._substitute_vars("${x:-${y:-$(echo P)}}", {}), "$(echo P)")
 
+    def test_a_nested_brace_in_an_assigned_op_word_is_read_whole(self):
+        # XERK-1673: an assigned value's `${q#${nope}x}` was cut at the inner
+        # `}`, so the op read `${nope` and a stray `x}` followed; each ran
+        # `rm -rf /etc` (or eval'd it) while the guard allowed it.
+        R = self.R
+        for cmd in ("q=/etc; y=${q#${nope}}; rm -rf $y",
+                    "q=/etcx; y=${q%${nope}x}; rm -rf $y",
+                    "q=/etcx; y=${q%%${nope}x}; rm -rf \"$y\"",
+                    # Quoted, the stored readings stay words (main too).
+                    "q=/etcx; y=${q%x$nope}; rm -rf \"$y\"",
+                    "q=x/etc; n=x; y=${q#${n}}; z=$y; rm -rf $z",
+                    "q=/etcx; y=${q/${nope}x/}; rm -rf $y",
+                    "q=/etc; y=${q:-${nope}}; rm -rf $y",
+                    "q=/etc; y=${q:0:${nope:-4}}; rm -rf $y",
+                    "q=/etc; y=${q:+${q}}; rm -rf $y",
+                    "q=1; a=/etc; y=${q:+${a}}; rm -rf $y",
+                    f"q=1; e=eval; y=${{q:+${{e}}}}; $y '{R}'",
+                    f"q=1; e=ev; y=${{q:+${{e}}}}; ${{y}}al '{R}'",
+                    f"q=evalx; y=${{q%${{nope}}x}}; $y '{R}'",
+                    "q=; rm -rf ${q:-${r}/etc}", "q=; rm -rf ${q:-${q:+x}/etc}",
+                    f"q=; ${{q:-${{r}}eval}} '{R}'",
+                    # QA: several readings inside a larger `"…"` stay ONE
+                    # word: split there, a `-c` script lost its program.
+                    f"q=evalx; y=${{q%x$nope}}; bash -c \"$y '{R}'\"",
+                    f"q=evalx; y=${{q%x$nope}}; s=\"$y '{R}'\"; bash -c \"$s\"",
+                    "q=/etcx; y=${q%x$nope}; bash -c \"rm -rf $y\"",
+                    f"q=evalx; bash -c \"${{q%x$nope}} '{R}'\"",
+                    f"q=evalx; bash -c \"${{q%x*$nope}} '{R}'\"",
+                    "q=/etcx; bash -c \"rm -rf ${q%x$nope}\"",
+                    "q=/etcx; y=${q%x$nope}; chmod -R 777 \"$y\"",
+                    "q=/etcx; y=${q%x$nope}; rm -rf -- \"$y/\"",
+                    f"q=evalx; y=${{q%x$nope}}; s=\"$y '{R}'\"; bash -c \"$s\"",
+                    # QA delta: kept ONE word only, a lone program fed on
+                    # stdin, `~/.ssh` and a `cd /` relative target ran.
+                    f"q=bashx; echo '{R}' | \"${{q%x$nope}}\"",
+                    f"q=bashx; y=${{q%x$nope}}; echo '{R}' | \"$y\"",
+                    "h=~/.sshx; rm -rf \"${h%x$nope}\"",
+                    "h=~/.sshx; y=${h%x$nope}; rm -rf \"$y\"",
+                    "q=etcx; y=${q%x$nope}; cd / && rm -rf \"$y\"",
+                    # QA: a `$(…)` output stored with one reading keeps its
+                    # marker, never read as a known program.
+                    f"echo eval > f; L=$(cat f || echo echo); $L '{R}'",
+                    # QA (rebase): a nested use in an assigned op's pattern.
+                    f"q=evalXY; a=XYZ; y=${{q%${{a%${{n}}Z}}}}; $y '{R}'",
+                    f"q=evalx; y=${{q%${{a:-${{b:-${{c}}}}}}x}}; $y '{R}'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("q=/tmp/x; y=${q#${nope}}; rm -rf $y",
+                    "q=1; a=ls; y=${q:+${a}}; $y -la",
+                    "h=$HOME/proj/buildx; rm -rf \"${h%x$nope}\"",
+                    "h=$HOME/proj/buildx; y=${h%x$nope}; rm -rf \"$y\"",
+                    "q=echox; y=${q%x$nope}; bash -c \"echo $y\""):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        uses = list(guard._var_uses("${q:+${e}x} $z"))
+        self.assertEqual([(m.group(1), m.group(2)) for m in uses[:1]], [("q", ":+${e}x")])
+        self.assertEqual(guard._names_used("${q#${n}}"), {"q", "n"})
+        # Past `_MAX_NESTED_VARS` levels the flat match stays (no recursion
+        # that deep); below it each extension is charged to the budget.
+        n = guard._MAX_NESTED_VARS + 1
+        deep = "${a:+" * n + "x" + "}" * n
+        self.assertEqual(next(guard._var_uses(deep)).group(0), deep[:deep.index("}") + 1])
+        guard._budget = {"left": 10}
+        try:
+            with self.assertRaises(guard._ExpansionTooLarge):
+                list(guard._var_uses("${a:+${b}xxxxxxxxxx}"))
+        finally:
+            guard._budget = None
+
     def test_defaults_on_empty_subscripted_and_quoted_brace_names_apply(self):
         # XERK-1659: each ran `rm -rf /` as nobody while the guard allowed it.
         R = self.R
