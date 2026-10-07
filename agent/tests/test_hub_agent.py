@@ -42703,6 +42703,21 @@ class TestHookIntegrity(unittest.TestCase):
         if before is not None:
             self.assertLess(len(os.listdir("/proc/self/fd")) - before, 25)
 
+    def test_only_a_regular_file_is_read(self):
+        # A character device reads as b"" — exactly what an unchecked FIFO that
+        # was pre-filled and then drained would look like.
+        if os.path.exists("/dev/null"):
+            self.assertIsNone(ha._read_regular("/dev/null", 10))
+
+    def test_no_baseline_without_o_nonblock(self):
+        # Windows CPython has no os.O_NONBLOCK; the check must stay quietly inert.
+        os.unlink(os.path.join(self.dir, "hooks.sha256"))
+        saved = getattr(ha.os, "O_NONBLOCK", None)
+        if saved is not None:
+            del ha.os.O_NONBLOCK
+            self.addCleanup(setattr, ha.os, "O_NONBLOCK", saved)
+        self.assertIsNone(self._check({}, 1000))
+
     def test_a_fifo_baseline_never_blocks(self):
         path = os.path.join(self.dir, "hooks.sha256")
         os.unlink(path)

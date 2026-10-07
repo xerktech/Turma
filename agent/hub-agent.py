@@ -5124,7 +5124,10 @@ def _read_regular(path, cap):
     beat forever), a symlink to /dev/zero (a read never ends) or a directory
     (``python3 guard.py`` runs its ``__main__.py``)."""
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+        # Windows has neither flag (and writes no baseline, so nothing reaches here
+        # but the baseline read itself).
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0))
     except OSError:
         return None
     try:
