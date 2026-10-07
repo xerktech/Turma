@@ -28,11 +28,13 @@ paths:
 - Positionals (`$0`-`$9`, `$@`, `$*`) are left out: bound in `bash -c '…' _ /tmp/x`,
   `find -exec sh -c` and functions, where reading them empty denied the common idiom.
 - Later names are read empty in the SAME reading (`_unset_names_dropped`, XERK-1652):
-  - a whole component of names with more path after it: `/$x/etc`, `"$a/$b"/*` → `//*`.
-  - a trailing run glued to text: `$x/etc$y` → `/etc`, `$x/.$y` → `/.`.
-  - Kept: a last component, and a trailing run right after `/`. Reading those empty denied
-    the everyday `rm -rf "$dir/$f"` and `"$TMP/$x"` (→ `/`); so `$x/$y` stays allowed.
+  - every name in a component before the last, glued or not: `/$x/etc`, `"$a/$b"/*` → `//*`,
+    `"$x/usr$y/lib"` → `/usr/lib`, `"$x/.${y}/etc"` → `/./etc`.
+  - in the last component, only a trailing run glued to text: `$x/etc$y` → `/etc`.
+  - Kept: the rest of the last component. Reading it empty denied the everyday
+    `"$dir/$f"`, `"$TMP/$x"` (→ `/`) and `"$dir/$name.$ext"` (→ `/.`); so `$x/$y` stays allowed.
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
+  - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top
   would read `"$TMP/$x"` as `/`.
 - Cost, measured: 0 new denies over a 36.7k-command real corpus replay vs main (XERK-1652).

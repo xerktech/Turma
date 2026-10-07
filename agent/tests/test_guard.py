@@ -3960,15 +3960,20 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "rm -rf $x/etc$y", 'rm -rf "$x/etc$y"', "rm -rf $x/*$y", "rm -rf $x/.$y",
                     "rm -rf $x/e$y*", "rm -rf $x/usr$y/", 'rm -rf "$x$y/etc$z"', "rm -rf /${x%/}/usr",
                     "chmod -R 777 $x/etc$y", "find $x/etc$y -delete", 'chown -R me "/$x/$y"/etc',
-                    'f() { rm -rf "$x$1$y"; }; f /etc'):
+                    'f() { rm -rf "$x$1$y"; }; f /etc',
+                    # Every name in a component before the last, glued or not (QA).
+                    'rm -rf "$x/usr$y/lib"', "rm -rf /usr$y/bin", 'rm -rf "$x/.${y}/etc"',
+                    'rm -rf "$x/$y.$z/etc"', 'rm -rf "$x/usr${y:+/foo}/lib"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$dir/$f"', 'rm -rf "$TMP/$x"', 'rm -rf "$x"/$y/', "rm -rf $x/$y",
                     'rm -rf "/tmp/$x/etc"', 'rm -rf "$x/build$y"', "rm -rf /$HOME/etc",
-                    "rm -rf /${x:-a}/etc", 'rm -rf "$x/$y/out"'):
+                    "rm -rf /${x:-a}/etc", 'rm -rf "$x/$y/out"', 'rm -rf "$dir/$name.$ext"',
+                    "rm -rf ~$USER/x", 'rm -rf "$x".bak/etc'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
-        for word in ("/${a" * 20000, "/${a}" * 20000 + "/x", "/$a" * 40000 + "/x"):
+        for word in ("/${a" * 20000, "/${a}" * 20000 + "/x", "/$a" * 40000 + "/x",
+                     "$a" * 20000 + "${b:-c}/x", "/${a:-b}" * 20000 + "/x"):
             start = time.monotonic()
             guard._unset_names_dropped(word)
             self.assertLess(time.monotonic() - start, 2)
@@ -3976,13 +3981,13 @@ class TestGroupsHoldingOperators(unittest.TestCase):
     def test_leading_names_are_one_run_and_scan_linearly(self):
         # XERK-1639: every name in the run is read empty, not just the first,
         # and an unclosed `${` stops the scan instead of backtracking (QA).
-        self.assertEqual(guard._leading_names_end("$a${b%/}/etc"), len("$a${b%/}"))
-        self.assertEqual(guard._leading_names_end("$a${b:-c}/etc"), 0)
-        self.assertEqual(guard._leading_names_end("${x:-${HOME}}/etc"), 0)
+        empty = guard._unset_names_dropped
+        self.assertEqual(empty("$a${b%/}/etc"), "/etc")
+        self.assertEqual(empty("${x:-${HOME}}/etc"), None)
         for word in ("${HOME%/}", "${HOME#/}", "${HOME:+x}", "${HOME+x}", "${HOME:-}", "${HOME-x}",
                      "${HOME^^}", "${HOME,,}", "${HOME@Q}", "${HOME:?}"):
             with self.subTest(word=word):
-                self.assertEqual(guard._leading_names_end(word + "/etc"), 0)
+                self.assertEqual(empty(word + "/etc"), None)
         # ...but an operator can still empty an always-set name (QA pass 4).
         for word in ("${x:-${HOME:+}}", "${x:-${HOME+}}", "${x:-${y:+$HOME}}", "${x:-${y:+${HOME}}}",
                      "${x:-${HOME#$HOME}}", "${x:-${HOME:0:0}}", "${x:-${PWD:+}}", "${x:=${HOME:+}}",
@@ -3990,16 +3995,16 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                      "${HOME+}", "${HOME+$y}", "${x:-$HOMEDIR}", "${HOME[1]}", "${PWD[1]}",
                      "${HOME#/root}", "${HOME%root}", "${HOME/root}", "${HOME:1}"):
             with self.subTest(word=word):
-                self.assertEqual(guard._leading_names_end(word + "/etc"), len(word))
+                self.assertEqual(empty(word + "/etc"), "/etc")
         for depth in (2, 17, 30):
             with self.subTest(depth=depth):
                 word = "${a:-" * depth + "${y}" + "}" * depth
-                self.assertEqual(guard._leading_names_end(word + "/etc"), len(word))
+                self.assertEqual(empty(word + "/etc"), "/etc")
         start = time.monotonic()
-        self.assertEqual(guard._leading_names_end("${a}" * 20000 + "x"), 0)
+        self.assertEqual(empty("${a}" * 20000 + "x"), None)
         self.assertLess(time.monotonic() - start, 1)
         start = time.monotonic()
-        self.assertEqual(guard._leading_names_end("${" + "a" * 200000), 0)
+        self.assertEqual(empty("${" + "a" * 200000), None)
         self.assertLess(time.monotonic() - start, 1)
 
     def test_a_sibling_or_an_empty_expansion_does_not_hide_the_command(self):

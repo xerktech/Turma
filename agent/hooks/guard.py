@@ -7795,68 +7795,84 @@ def _empties_a_set_path(op: str) -> bool:
                 or op[:2] in (":-", ":=", ":?") or op in ("%/", "#/"))
 
 
-def _names_run_end(raw: str, pos: int) -> int:
-    """Where the run of possibly-empty names starting at ``pos`` ends, or
-    ``pos`` if there is none or one of them cannot be empty. A `${…}` is closed
-    by `_brace_end`, so a nested one (`${x:+${y}}`) is one expansion, and an
-    unclosed one stops the scan."""
-    start = pos
-    while raw.startswith("$", pos):
-        if m := _PLAIN_NAME_RE.match(raw, pos):
-            name, op, end = m.group(1), "", m.end()
-        elif raw.startswith("${", pos):
-            # Unquoted: the token is dequoted, and looking its quotes up rescans
-            # the whole word per `${`, quadratic in a run of names (QA).
-            close = _brace_end(raw, pos, False)
-            head = _BRACED_NAME_RE.match(raw, pos + 2, close) if close > 0 else None
-            if head is None:
-                return start
-            name, op, end = head.group(1), raw[head.end():close], close + 1
-            if head.group(0) != name:
-                name = ""  # `${HOME[1]}` and `${!HOME}` are not HOME's value
-        else:
-            return start
-        # `?` errors and a default or assigned word is used; only an empty one
-        # leaves it empty. HOME and PWD are set, so only another operator
-        # (`${HOME:+}`, `${HOME#$HOME}`) can empty them.
-        body = op[1:] if op.startswith(":") else op
-        if body[:1] == "?" or (body[:1] in ("-", "=") and not _only_expansions(body[1:])):
-            return start
-        if name in _ALWAYS_SET_NAMES and not _empties_a_set_path(op):
-            return start
-        pos = end
-    return pos
-
-
-def _leading_names_end(raw: str) -> int:
-    """Where the run of possibly-empty names opening ``raw`` ends, if a `/`
-    follows it, else 0."""
-    end = _names_run_end(raw, 0)
-    return end if raw.startswith("/", end) else 0
+def _name_end(raw: str, pos: int) -> tuple[int, bool]:
+    """The end of the expansion at ``pos`` and whether it can be empty, or
+    ``(pos, False)`` if none starts there. A `${…}` is closed by `_brace_end`,
+    so a nested one (`${x:+${y}}`) is one expansion; an unclosed one is none."""
+    if m := _PLAIN_NAME_RE.match(raw, pos):
+        name, op, end = m.group(1), "", m.end()
+    elif raw.startswith("${", pos):
+        # Unquoted: the token is dequoted, and looking its quotes up rescans
+        # the whole word per `${`, quadratic in a run of names (QA).
+        close = _brace_end(raw, pos, False)
+        if close < 0:
+            return pos, False
+        head = _BRACED_NAME_RE.match(raw, pos + 2, close)
+        if head is None:
+            return close + 1, False
+        name, op, end = head.group(1), raw[head.end():close], close + 1
+        if head.group(0) != name:
+            name = ""  # `${HOME[1]}` and `${!HOME}` are not HOME's value
+    else:
+        return pos, False
+    # `?` errors and a default or assigned word is used; only an empty one
+    # leaves it empty. HOME and PWD are set, so only another operator
+    # (`${HOME:+}`, `${HOME#$HOME}`) can empty them.
+    body = op[1:] if op.startswith(":") else op
+    if body[:1] == "?" or (body[:1] in ("-", "=") and not _only_expansions(body[1:])):
+        return end, False
+    if name in _ALWAYS_SET_NAMES and not _empties_a_set_path(op):
+        return end, False
+    return end, True
 
 
 def _unset_names_dropped(raw: str) -> str | None:
     """``raw`` with the unknown names bash would read as empty dropped, or
-    None if it has none (XERK-1652). Every path component made only of such
-    names is dropped when more path follows it: `$x/etc` and `/$x/etc` are
-    `/etc`, `"$a/$b"/*` is `//*`. A last component is kept, as is a trailing
-    run of names right after a `/`: `"$dir/$f"` and `"$TMP/$x"` are the
-    everyday idiom, and `/` only when both are unset. A run glued to text is
-    dropped (`$x/etc$y` is `/etc`)."""
-    # A later component needs a non-`/` character after its `/` to have more
-    # path after it: `"$x"/$y/` names `$y`, not the root. The leading run
-    # needs only the `/`: `$x/` is the root (XERK-1639).
-    last = len(raw.rstrip("/"))
-    pieces, kept, pos = [], 0, 0
+    None if it has none (XERK-1639, XERK-1652). Every such name in a component
+    before the last is dropped: `/$x/etc` and `"$x/usr$y/lib"` are `/etc` and
+    `/usr/lib`, `"$a/$b"/*` is `//*`. In the last component only a trailing run
+    glued to text is (`$x/etc$y` is `/etc`): `"$dir/$f"`, `"$TMP/$x"` and
+    `"$dir/$name.$ext"` are the everyday idiom, `/` or `/.` only when all are
+    unset. A word that is one component counts as two when names alone
+    open it before a `/`: `$x/` is the root, `"$x"*` and `"$x".bak` stay."""
+    # (start, end) of each name that can be empty, and every `/` between them.
+    names, slashes, pos = [], [], 0
     while pos < len(raw):
-        end = _names_run_end(raw, pos)
-        if pos < end < (last if pos else len(raw)) and raw[end] == "/":
-            pieces.append(raw[kept:pos])
-            kept = end
-        slash = raw.find("/", end)
-        if slash < 0:
+        nxt = min((i for i in (raw.find("$", pos), raw.find("/", pos)) if i >= 0), default=-1)
+        if nxt < 0:
             break
-        pos = slash + 1
+        if raw[nxt] == "/":
+            slashes.append(nxt)
+            pos = nxt + 1
+            continue
+        end, empty = _name_end(raw, nxt)
+        if empty:
+            names.append((nxt, end))
+        pos = max(end, nxt + 1)
+    # The last component starts after the last `/` with more than `/`s after it.
+    last = len(raw.rstrip("/"))
+    seps = [i for i in slashes if i < last]
+    if seps:
+        cut = seps[-1]
+    elif slashes and names and names[0][0] == 0:
+        # One component before trailing `/`s: names alone must fill it.
+        cut = slashes[0]
+        filled = 0
+        for start, end in names:
+            if start != filled:
+                break
+            filled = end
+        if filled != cut:
+            cut = 0
+    else:
+        cut = 0
+    # A `~` prefix is not expanded once a name is in it (`~$USER`): keep them.
+    tilde = (raw.find("/") % (len(raw) + 1)) if raw.startswith("~") else -1
+    pieces, kept = [], 0
+    for start, end in names:
+        if end <= cut and start > tilde:
+            pieces.append(raw[kept:start])
+            kept = end
     pieces.append(raw[kept:])
     rest = "".join(pieces)
     dropped = _trailing_unset_dropped(rest, after_slash=False)
