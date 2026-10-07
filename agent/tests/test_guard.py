@@ -4986,5 +4986,19 @@ class TestJudgeGrants(unittest.TestCase):
             allow.assert_not_called()
 
 
+class TestHookSourcesCompileClean(unittest.TestCase):
+    def test_no_syntax_warnings(self):
+        # An invalid escape (`\``) in a docstring warns on every hook run and
+        # is a SyntaxError in a future Python.
+        import warnings
+        hooks = os.path.join(AGENT_DIR, "hooks")
+        for name in sorted(os.listdir(hooks)):
+            if name.endswith(".py"):
+                with self.subTest(name=name), open(os.path.join(hooks, name)) as f:
+                    with warnings.catch_warnings():
+                        warnings.simplefilter("error", SyntaxWarning)
+                        compile(f.read(), name, "exec")
+
+
 if __name__ == "__main__":
     unittest.main()
