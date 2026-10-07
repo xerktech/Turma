@@ -2753,7 +2753,10 @@ class TestScriptChannels(unittest.TestCase):
                 "echo 'rm -rf \"$1\"' > x.sh; set -- /etc; . ./x.sh",
                 "echo 'rm -rf \"$1\"' > x.sh; f() { . ./x.sh; }; f /etc",
                 "echo 'rm -rf \"$1\"' > x.sh; cp x.sh y.sh; sh y.sh /etc",
-                f"echo '{P}' > notes.txt; bash b.sh"):
+                f"echo '{P}' > notes.txt; bash b.sh",
+                # a `-c` script naming the written file again, a `$S` spelling
+                f"echo '{P}' > f; bash -c ./f", f"echo '{P}' > f; sh -c \"$(cat f)\"",
+                f"S=.; echo '{P}' > $S/f; $S/f", f"echo '{P}' > f; cat f > g; sh g"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # Past `_MAX_SCRIPT_RUNS`, a glued `"$1/$2"` is read per argument.
@@ -2762,6 +2765,10 @@ class TestScriptChannels(unittest.TestCase):
         self.assertAllowed(f"echo 'rm -rf \"$1/$2\"' > x.sh; {runs}; sh x.sh tmp x")
         for cmd in ("echo hello > out.txt; ./run.sh", "echo ls | cat - > f; sh f",
                     f"cat <(echo hi) | bash -c 'echo {P} > notes'",
+                    # a note holding a command, beside a `.` argument or a path run
+                    f"echo '{P} is the repro' > notes.md; git add . && git commit -qm wip",
+                    f"cat > notes.md <<'EOF'\n{P}\nEOF\n./scripts/lint.sh",
+                    f"cat > n.md <<'EOF'\n{P}\nEOF\n~/.claude/bin/jira create -d \"$(cat n.md)\"",
                     "git log --oneline > log.txt && bash scripts/check.sh",
                     "echo 'rm -rf \"$1\"' > x.sh; sh x.sh build",
                     "cat > a.sh <<'EOF'\nrm -rf build\nEOF\nchmod +x a.sh && ./a.sh"):

@@ -39,17 +39,25 @@ paths:
   on a line that writes text, any such run reads EVERY written file not already read.
   - Patching spellings (XERK-1641) kept leaving neighbours: copies, `$PWD`/`$(pwd)` paths,
     `cat f | sh`, `sh -c 'sh < f'`, `xargs`, `find -exec`, `PATH=.`. Don't go back to a list.
-  - Trigger: a `script_path` not in `written`, or `_RUNS_UNNAMED_RE` anywhere in the line less
-    its heredoc bodies (a shell not given `-c`, `.`/`source`, `xargs`, `eval`, `exec`,
-    `-exec`, `PATH`, `hash`). `bash -c '…'` alone is excluded: it runs no file.
+  - A run's path matches a written one by BASENAME too (`$S/x.sh` written, run with `$S`
+    spliced; `"$PWD"/f`; after a `cd`), then it is an exact run, bound to its own args.
+  - Fails closed on: a shell/`.`/`source` given a file that is not written; a path run that
+    is not written when the line also copies (`_COPIES_RE`: cp/mv/ln/install/rsync/dd/tar,
+    `cat f > g`) or names a glob; `_RUNS_UNNAMED_RE` at a COMMAND START (a shell reading stdin,
+    `.`/`source`, `eval`, `xargs`, `hash`) or `-exec`/`PATH=` anywhere; a `-c` script or `eval`
+    when a written file's basename appears twice on the line (`bash -c ./f`, `sh -c "$(cat f)"`).
+  - Never match those words anywhere: `git add .`, "bash" in a note, `~/.claude/bin/jira -F
+    notes.md` beside a written note denied 87 real commands (QA corpus replay).
   - Writers are read broadly too: any non-shell stage fed text or a here-string writes it
     (`| cat - > f`, `| tr … > f`, `cat > f <<< …`), `dd of=`, `cp|install /dev/stdin f`, and a
     write inside a `-c` script or `eval`. A transform (`base64`) is read as its input: accepted.
-  - Such a reading, and any run with no arguments, also binds every parameter to every
-    path-like word of the line (`line_words`): a sourced file inherits `set --`/a function's `$@`.
+  - On a line that sources (`.`/`source`), a no-argument reading also binds every parameter
+    to the line's first `_MAX_LINE_WORDS` path-like words: a sourced file inherits `set --`/a
+    function's `$@`. On every line it multiplied real scripts' cost (QA).
   - Accepted over-deny: `echo 'rm -rf /etc' > notes; bash b.sh`. Accepted cost: a big heredoc
     written beside an unrelated `source venv/bin/activate` is read as shell (250 Python
-    functions ~2 s; the deadline fails closed).
+    functions ~2 s), and a heredoc script run as `$S/x.sh` is now read as main reads an exact
+    run (main missed the spelling): ~2-3x the script typed alone, the deadline fails closed.
 - An alias use runs its VALUE with the use's words after it: `alias b='bash -c'; b '<cmd>'`,
   through a chain, an `eval "b …"`, or a pipe (`echo /etc | b`). `_aliased_readings` is an
   ADDED whole-line reading with every use replaced, `_ALIASES_ON` off inside.
