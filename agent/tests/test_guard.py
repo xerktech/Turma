@@ -2756,7 +2756,8 @@ class TestScriptChannels(unittest.TestCase):
                 f"echo '{P}' > notes.txt; bash b.sh",
                 # a `-c` script naming the written file again, a `$S` spelling
                 f"echo '{P}' > f; bash -c ./f", f"echo '{P}' > f; sh -c \"$(cat f)\"",
-                f"S=.; echo '{P}' > $S/f; $S/f", f"echo '{P}' > f; cat f > g; sh g"):
+                f"S=.; echo '{P}' > $S/f; $S/f", f"echo '{P}' > f; cat f > g; sh g",
+                f"echo '{P}' > f; run(){{ sh f; }}; run", f"echo '{P}' > f; function r {{ ./f; }}; r"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # Past `_MAX_SCRIPT_RUNS`, a glued `"$1/$2"` is read per argument.
