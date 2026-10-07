@@ -175,8 +175,10 @@ installed_version() {
 HOOKS_BASELINE="$PREFIX/hooks.sha256"
 
 record_hooks_baseline() {
+  # rm first: `mv` onto a DIRECTORY moves the file inside it, and every later
+  # run would then find no baseline and reinstall again.
   ( cd "$PREFIX" && sha256sum hooks/*.py >"$HOOKS_BASELINE.tmp" \
-      && mv -f "$HOOKS_BASELINE.tmp" "$HOOKS_BASELINE" ) 2>/dev/null \
+      && rm -rf "$HOOKS_BASELINE" && mv -f "$HOOKS_BASELINE.tmp" "$HOOKS_BASELINE" ) 2>/dev/null \
     || { rm -f "$HOOKS_BASELINE.tmp" 2>/dev/null; logmsg "could NOT record $HOOKS_BASELINE"; }
 }
 
@@ -188,6 +190,19 @@ hooks_intact() {
   # reinstall on every run forever. The hard dependency makes this theoretical.
   command -v sha256sum >/dev/null 2>&1 || return 0
   [ -f "$HOOKS_BASELINE" ] || return 1
+  local listed present f
+  # hooks/ must hold EXACTLY the baselined files: a planted hooks/bisect.py is
+  # imported by guard.py ahead of the stdlib (the script dir leads sys.path).
+  listed="$(sed -n 's|^[0-9a-f]\{64\}  \(hooks/[^/]*\)$|\1|p' "$HOOKS_BASELINE" | sort)"
+  # Minus __pycache__: the manager imports permlog.py/guard.py as modules and
+  # writes their bytecode there; Python never imports from it without the source.
+  present="$(cd "$PREFIX" && find hooks -mindepth 1 -maxdepth 1 ! -name __pycache__ 2>/dev/null | sort)"
+  [ -n "$listed" ] && [ "$listed" = "$present" ] || return 1
+  # Each one a regular file, never a symlink or FIFO: sha256sum would block on a
+  # FIFO, or read a link to /dev/zero, until the run deadline killed it.
+  for f in $listed; do
+    [ -f "$PREFIX/$f" ] && [ ! -L "$PREFIX/$f" ] || return 1
+  done
   ( cd "$PREFIX" && sha256sum -c --quiet "$HOOKS_BASELINE" ) >/dev/null 2>&1
 }
 

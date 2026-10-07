@@ -5113,32 +5113,61 @@ def fileguard_script_path():
 HOOK_REPAIR_MIN_INTERVAL = 600   # seconds between updater kicks for one mismatch
 
 
+HOOK_MAX_BYTES = 8 << 20          # a hook bigger than this is not one we shipped
+
+
+def _hook_digest(path):
+    """sha256 of ``path`` when it is a regular, non-symlink file of at most
+    HOOK_MAX_BYTES, else None. The open is O_NONBLOCK|O_NOFOLLOW and the type is
+    checked on the open fd: a session can swap a hook for a FIFO (a plain read
+    blocks the beat forever) or a symlink to /dev/zero (a read never ends)."""
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NONBLOCK | getattr(os, "O_NOFOLLOW", 0))
+    except OSError:
+        return None
+    with os.fdopen(fd, "rb") as fh:
+        st = os.fstat(fh.fileno())
+        if not stat.S_ISREG(st.st_mode) or st.st_size > HOOK_MAX_BYTES:
+            return None
+        data = fh.read(HOOK_MAX_BYTES + 1)
+    return None if len(data) > HOOK_MAX_BYTES else hashlib.sha256(data).hexdigest()
+
+
 def hook_integrity_failures(script_dir=None):
-    """The hooks (``hooks/<name>.py``) whose bytes no longer match the baseline,
-    sorted; ``[]`` when all match, ``None`` when there is no readable baseline
-    (nothing to check against). A listed file that is gone counts as a mismatch:
-    a missing hook command is a NON-blocking hook, i.e. a guard failing open."""
+    """The ``hooks/`` entries that no longer match the baseline, sorted; ``[]``
+    when all match, ``None`` when there is no readable baseline (nothing to check
+    against). A listed hook that is gone counts as a mismatch (a missing hook
+    command is a NON-blocking hook, i.e. a guard failing open), and so does any
+    entry the baseline does NOT list: hooks run as ``python3 <hooks>/x.py``, so
+    their dir is first on sys.path and a planted ``hooks/bisect.py`` replaces the
+    stdlib module guard.py imports."""
     script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
     try:
         with open(os.path.join(script_dir, "hooks.sha256"), encoding="utf-8") as fh:
-            lines = fh.read().splitlines()
+            lines = fh.read(1 << 20).splitlines()
     except (OSError, UnicodeDecodeError):
         return None
-    bad = []
+    expected = {}
     for line in lines:
         digest, _, rel = line.partition("  ")
         # Only the sha256sum lines install_payload writes; anything else (and any
         # path escaping hooks/) is ignored rather than trusted.
-        if not re.fullmatch(r"[0-9a-f]{64}", digest) or not re.fullmatch(
+        if re.fullmatch(r"[0-9a-f]{64}", digest) and re.fullmatch(
                 r"hooks/[A-Za-z0-9_.-]+\.py", rel):
-            continue
-        try:
-            with open(os.path.join(script_dir, rel), "rb") as fh:
-                ok = hashlib.sha256(fh.read()).hexdigest() == digest
-        except OSError:
-            ok = False
-        if not ok:
-            bad.append(rel)
+            expected[rel] = digest
+    if not expected:
+        return None
+    bad = [rel for rel, digest in expected.items()
+           if _hook_digest(os.path.join(script_dir, rel)) != digest]
+    try:
+        present = os.listdir(os.path.join(script_dir, "hooks"))
+    except OSError:
+        present = []
+    # __pycache__ is legitimate: the manager imports permlog.py/guard.py as
+    # modules and writes their bytecode. Python never imports from it without
+    # the matching source beside it, so it cannot carry a planted module.
+    bad += [f"hooks/{name}" for name in present
+            if f"hooks/{name}" not in expected and name != "__pycache__"]
     return sorted(bad)
 
 

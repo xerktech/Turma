@@ -1822,14 +1822,27 @@ run_integrity_case() {  # <installed> <release> <tamper|intact|nobaseline> [lega
   mkdir -p "$prefix/hooks"; echo "# guard" >"$prefix/hooks/guard.py"
   echo "$installed" >"$prefix/VERSION"
   [ "$mode" = nobaseline ] || ( cd "$prefix" && sha256sum hooks/*.py >hooks.sha256 )
-  [ "$mode" = tamper ] && printf 'import sys\nsys.exit(0)\n' >"$prefix/hooks/guard.py"
+  case "$mode" in
+    tamper) printf 'import sys\nsys.exit(0)\n' >"$prefix/hooks/guard.py" ;;
+    # A FIFO / a link to /dev/zero: sha256sum on either never returns.
+    fifo) rm -f "$prefix/hooks/guard.py"; mkfifo "$prefix/hooks/guard.py" ;;
+    devzero) rm -f "$prefix/hooks/guard.py"; ln -s /dev/zero "$prefix/hooks/guard.py" ;;
+    # A planted module: the hooks dir leads guard.py's sys.path.
+    plant) echo "import sys; sys.exit(0)" >"$prefix/hooks/bisect.py" ;;
+    # The manager's own bytecode cache is NOT tampering.
+    pycache) mkdir -p "$prefix/hooks/__pycache__"; : >"$prefix/hooks/__pycache__/guard.cpython-312.pyc" ;;
+    # mv onto a directory would nest the new baseline and reinstall forever.
+    basedir) rm -f "$prefix/hooks.sha256"; mkdir "$prefix/hooks.sha256" ;;
+  esac
   install_fake_restart "$bin"; install_fake_gh "$bin"
   FAKE_GH_DIR="$d" HOME="$root/home" PATH="$bin:$PATH" TURMA_REPO="xerktech/turma" \
     TURMA_CLAUDE_AUTO_UPDATE=0 TURMA_TEST_RESTART_LOG="$root/restarts" \
     "$bin/turma-agent-update" >/dev/null 2>&1 || true
   local restarted=no
   [ -s "$root/restarts" ] && restarted=yes
-  if [ -f "$prefix/hooks.sha256" ] && ( cd "$prefix" && sha256sum -c --quiet hooks.sha256 ) >/dev/null 2>&1; then
+  if [ -p "$prefix/hooks/guard.py" ] || [ -L "$prefix/hooks/guard.py" ] || [ -e "$prefix/hooks/bisect.py" ]; then
+    printf 'unrepaired|%s|-\n' "$restarted"
+  elif [ -f "$prefix/hooks.sha256" ] && ( cd "$prefix" && sha256sum -c --quiet hooks.sha256 ) >/dev/null 2>&1; then
     printf '%s|%s|baseline-ok\n' "$(head -n1 "$prefix/hooks/guard.py")" "$restarted"
   else
     printf '%s|%s|baseline-bad\n' "$(head -n1 "$prefix/hooks/guard.py")" "$restarted"
@@ -1852,6 +1865,14 @@ assert_eq "# guard|yes|baseline-ok" "$got" "no baseline: reinstall once and reco
 got="$(run_integrity_case 0.6.1 0.6.0 tamper)"
 assert_eq "import sys|no|baseline-bad" "$got" "an installed build newer than the release is never downgraded" \
   "repair downgraded a newer install ($got)"
+for m in fifo devzero plant basedir; do
+  got="$(timeout 120 bash -c "$(declare -f run_integrity_case new_gh_dir add_unified_release make_tarball install_fake_restart install_fake_gh); SCRIPT='$SCRIPT'; run_integrity_case 0.6.0 0.6.0 $m")"
+  assert_eq "# guard|yes|baseline-ok" "$got" "$m: repaired by one reinstall, without hanging" \
+    "$m: not repaired ($got)"
+done
+got="$(run_integrity_case 0.6.0 0.6.0 pycache)"
+assert_eq "# guard|no|baseline-ok" "$got" "hooks/__pycache__ is not tampering (no reinstall loop)" \
+  "__pycache__ triggered a reinstall ($got)"
 got="$(run_integrity_case 0.5.0 0.6.0 nobaseline)"
 assert_eq "# guard|yes|baseline-ok" "$got" "a normal update records a fresh baseline" \
   "update left no/stale baseline ($got)"

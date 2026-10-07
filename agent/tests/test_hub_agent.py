@@ -10287,6 +10287,15 @@ class TestSpawnFailures(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "IS_WINDOWS", True):
             self.assertEqual(sm.build_payload(1)["hostOs"], "windows")
 
+    def test_a_full_beat_checks_the_hooks_and_a_light_one_does_not(self):
+        """XERK-1643: the check is only worth anything if the beat runs it."""
+        sm = self._manager()
+        with mock.patch.object(ha, "check_hook_integrity") as check:
+            sm.build_payload(1, light=True)
+            check.assert_not_called()
+            sm.build_payload(1)
+            check.assert_called_once()
+
     def test_a_refused_resume_stages_its_reason_against_the_cmd_id(self):
         sm = self._manager()
         with mock.patch.object(ha, "MAX_SESSIONS", 0):
@@ -42659,6 +42668,27 @@ class TestHookIntegrity(unittest.TestCase):
     def test_a_deleted_hook_is_a_mismatch(self):
         os.unlink(os.path.join(self.dir, "hooks", "fileguard.py"))
         self.assertEqual(["hooks/fileguard.py"], self._check({}, 1000))
+
+    def test_a_fifo_hook_is_a_mismatch_and_never_blocks(self):
+        path = os.path.join(self.dir, "hooks", "guard.py")
+        os.unlink(path)
+        os.mkfifo(path)
+        self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
+
+    def test_a_symlink_to_dev_zero_is_a_mismatch(self):
+        path = os.path.join(self.dir, "hooks", "guard.py")
+        os.unlink(path)
+        os.symlink("/dev/zero", path)
+        self.assertEqual(["hooks/guard.py"], self._check({}, 1000))
+
+    def test_a_planted_module_is_a_mismatch(self):
+        self._write("hooks/bisect.py", "import sys; sys.exit(0)\n")
+        os.makedirs(os.path.join(self.dir, "hooks", "json"))
+        self.assertEqual(["hooks/bisect.py", "hooks/json"], self._check({}, 1000))
+
+    def test_the_bytecode_cache_is_not_tampering(self):
+        os.makedirs(os.path.join(self.dir, "hooks", "__pycache__"))
+        self.assertEqual([], self._check({}, 1000))
 
     def test_baseline_lines_outside_hooks_are_ignored(self):
         with open(os.path.join(self.dir, "hooks.sha256"), "a") as fh:
