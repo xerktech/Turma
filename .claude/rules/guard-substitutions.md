@@ -108,6 +108,8 @@ paths:
   - Only an UNQUOTED `$'` is decoded (`_quote_states` at the `$`, always computed): in `"…"`,
     `'…'` or a `#` comment it is literal; decoded, `"$'\x27'"` unbalanced the line and a
     comment's `$'\nx'` hid the next one. A skipped match steps past its `$'` only.
+  - The skip is a READING, not the only one: `_quote_states` reads the `\'` in `$'it\'s'` as a
+    close, so `_expand` also reads the line decoded blind (`aware=False`, main's old decode).
   - Divergence kept (no bypass found): bash decodes `$'…'` inside `"${x:-…}"` (extquote).
   Tests: `test_ansi_c_strings_decode_as_bash_does` (against real bash).
 - **`_ANSI_C_RE` checks the backslash run's PARITY**: an odd run (`"\$'…'"`) is literal here and

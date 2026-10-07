@@ -1890,6 +1890,8 @@ class TestScriptChannels(unittest.TestCase):
                     "bash -c $'rm -rf /etc; : \\x4'", "echo \"$'\\x27'\"; rm -rf /etc",
                     "bash -c \"echo $'\\x27'; rm -rf /etc\"", "eval \"echo $'\\''\"; rm -rf /etc\"",
                     "echo 'x$'\\' $'\\x41'; rm -rf /etc", ": # $'\\nx'\nrm -rf /etc",
+                    "echo $'it\\'s'; bash -c $'rm -rf /etc'",
+                    "echo $'it\\'s'; bash -c $'\\x72m -rf /etc'",
                     "bash -c ': # $'\"'\"'\\nx'\"'\"'\nrm -rf /etc'"):
             with self.subTest(cmd=cmd):
                 self.assertIn("recursive delete", guard.is_destructive(cmd) or "")
