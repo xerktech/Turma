@@ -3540,6 +3540,7 @@ _MAIN_PARSE_SEEN = [False]
 # can unset it, so the default spliced is kept as a reading of its own.
 _HOME_KEPT = [False]
 _HOME_DEFAULT_RE = re.compile(r"\$\{HOME:?[-=]")
+_HOME_TARGET_PROGS = {"rm", "unlink", "chmod", "chown", "chgrp", "find", "cd", "pushd"}
 # Past this many `${…}` nested in one another, a line is too large to read.
 _MAX_NESTED_VARS = 200
 # Past this many assignments to one name, a line is too large to read.
@@ -5549,7 +5550,10 @@ def _expand_both(command: str) -> list[tuple[list[str], str]]:
     also read once per distinct word with the list cut down to that word
     (`_for_word_lines`, XERK-1647)."""
     out = _expand_readings(command)
-    if _HOME_DEFAULT_RE.search(command) and not _HOME_KEPT[0]:
+    # Only a target can read the kept default, so a line with no command that
+    # judges one (a HOME default in heredoc data) is not read twice (QA).
+    if (_HOME_DEFAULT_RE.search(command) and not _HOME_KEPT[0]
+            and any(_basename(entry[0][0]) in _HOME_TARGET_PROGS for entry in out)):
         _HOME_KEPT[0] = True
         try:
             out = out + _expand_readings(command)

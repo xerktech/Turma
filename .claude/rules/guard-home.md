@@ -23,13 +23,16 @@ paths:
   - Never gate it on the line's text (`unset`/`env`): any `echo env` turned it off, and a
     per-use regex over the whole line was quadratic (45s on 87 KB).
   - A new reading flag joins `_memo`'s key and `_reading()`, or the memo replays the old pass.
+  - The pass doubles the line's cost, so it runs only when the first pass found a command
+    whose target it can change (`_HOME_TARGET_PROGS`); a default in heredoc data doubled a
+    4.7 KB command past the deadline (QA).
 - An op sees HOME as written (`${HOME%root/}etc` is /etc when HOME=/root/); only the
   map-back normalises it.
 - Only person homes map back (session HOME, /root, /home/*, /Users/*): `~bin/x` is /bin/x.
   With HOME=/ nothing maps back. `cd ~/..` is read through the same reading.
 - The reading depends on `$HOME`: tests pin it with `mock.patch.dict(os.environ, ...)`.
-- Cost, measured: 0 changed decisions over a 34.8k-command real corpus replay vs main;
-  decide time on 200 targets of 64 HOME ops matches main.
+- Cost, measured at the final commit: 0 changed decisions over a 35k-command real corpus
+  replay vs main; 200 targets of 64 HOME ops decide as fast as main.
 - Cost bound: past `_MAX_HOME_OPS` operators on HOME in one target, the reading is `/`.
 - Open: an unquoted `${x: -5}` is split at its space before any of this (XERK-1680).
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,
