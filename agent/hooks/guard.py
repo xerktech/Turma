@@ -4178,6 +4178,23 @@ def _escape_value(value: str, state: str) -> str:
     return bare
 
 
+def _ifs_split_re(vals: dict[str, list[str]]) -> "re.Pattern[str] | None":
+    """The non-blank characters of every IFS ``vals`` assigns, where an
+    unquoted expansion splits, or None when it assigns none (XERK-1662)."""
+    chars = {c for v in vals.get("IFS", ()) for c in v if not c.isspace()}
+    return re.compile("[" + re.escape("".join(sorted(chars))) + "]") if chars else None
+
+
+def _ifs_split_values(vals: dict[str, list[str]]) -> dict[str, list[str]]:
+    """``vals`` with each `_ifs_split_re` character read as a blank, or {}:
+    `IFS=,` makes `$x` of `rm,-rf,/etc` three words (XERK-1662). Every IFS
+    value at once, and quoted expansions too: both only widen."""
+    split = _ifs_split_re(vals)
+    if split is None:
+        return {}
+    return {name: [split.sub(" ", v) for v in vs] for name, vs in vals.items() if name != "IFS"}
+
+
 def _prenormalise(command: str) -> str:
     # Braced before ANSI-C decoding, which glued `$x$'eval'` into `$xeval`.
     command = _brace_glued_names(command)
@@ -7904,6 +7921,19 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     if _budget is not None and time.monotonic() > _budget["until"]:
         _budget["left"] = -1
         raise _ExpansionTooLarge
+    # bash drops a `\\<newline>` before it expands anything, so `$\\<newline>v`
+    # is `$v`; read apart, `$` and `v` hid the value (XERK-1662). An ADDED
+    # reading of the joined text: the raw one stays. Then, once nothing but
+    # single-quoted ones are left, with those joined too, as the `eval` or
+    # `bash -c` that re-parses the quoted text joins them. Each step leaves
+    # fewer to join, so this recurses at most twice.
+    if "\\\n" in command and "$" in command:
+        joined = _join_continuations(command)
+        if joined == command:
+            joined = command.replace("\\\n", "")
+        if joined != command:
+            _spend(len(joined))
+            out.extend(_expand(joined, depth, cwds))
     # Before any reader: an assigned value read first kept `a=$x$(echo rm …)`
     # as `$xrm …` (see `_brace_glued_names`). An ADDED reading, never swapped
     # in: a re-parse can join what the brace split — `eval "\$x$(echo y) rm …"`
@@ -8047,6 +8077,15 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         bound = _substitute_vars(reading, vals)
         out.extend(_memo("expand", ("positional", bound, depth, every_cd),
                          _expand_segments, bound, depth + 1, every_cd))
+        # A bound `$1` is spliced in as text, so a set IFS cannot split it
+        # there: `IFS=,; set -- rm,-rf,/etc; $1` (XERK-1662). Read with every
+        # IFS character a blank too — over-reads its literal text, and only
+        # on a line that sets IFS.
+        split = _ifs_split_re(vals)
+        if split is not None and split.search(bound):
+            bound = split.sub(" ", bound)
+            out.extend(_memo("expand", ("positional", bound, depth, every_cd),
+                             _expand_segments, bound, depth + 1, every_cd))
         # A `for v; do $v` / `for v in "$@"` list is the bound words, each run
         # alone as the top line's lists are (`_for_word_lines`): joined,
         # `set -- a 'rm …'; for v; do $v; done` ran program `a` (XERK-1657).
@@ -8148,6 +8187,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if seg not in seen:
                     seen.add(seg)
                     segments.append(seg)
+    # ...and with each value split where a non-blank IFS the line sets splits
+    # it: `x=rm,-rf,/etc; IFS=,; $x` runs `rm -rf /etc` (XERK-1662).
+    split_vals = _ifs_split_values(raw_vals)
+    if split_vals:
+        _spend(len(raw_commands))
+        seen = set(segments)
+        for seg in _split_segments(_prenormalise(_substitute_vars(raw_commands, split_vals))):
+            if seg not in seen:
+                seen.add(seg)
+                segments.append(seg)
     # The TAINT reading of every operator-holding substitution the splitter cut
     # (XERK-1613), rebuilt in ONE pass so a body of N statements stays linear.
     seen = set(segments)
@@ -8325,7 +8374,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         and ("sh" in command or "." in command or "source" in command)) else {}
     for raw in segments:
         if every_cd != cwds:
-            cwds = _cd_readings(raw, cwds)
+            cwds = _cd_readings(raw, cwds, raw_vals)
         # Function headers closed up (`f ( ) {` → `f() {`), as one more ADDED
         # reading: in place, an extglob `@()`, or a `()` the guard itself
         # splices in from a printed `` `echo '()'` ``, read as a header and hid
@@ -8706,18 +8755,22 @@ _REPLAYS_RE = re.compile(
 
 
 
-def _cd_readings(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
+def _cd_readings(text: str, inherited: tuple[str, ...],
+                 line_vals: dict[str, list[str]] | None = None) -> tuple[str, ...]:
     """`_cd_targets` of ``text`` with its substitutions read both as several
     statements and as before XERK-1609 (see `_body_printed`): `cd "$(echo / |
     grep /)"` names `/` only in the second."""
-    found = _cd_targets(_sub_substs(text, _subst_text), inherited)
-    base = _cd_targets(_sub_substs(text, lambda m: _subst_text(m, multi=False)), inherited)
+    found = _cd_targets(_sub_substs(text, _subst_text), inherited, line_vals)
+    base = _cd_targets(_sub_substs(text, lambda m: _subst_text(m, multi=False)), inherited,
+                       line_vals)
     return found + tuple(c for c in base if c not in found)
 
 
-def _cd_targets(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
+def _cd_targets(text: str, inherited: tuple[str, ...],
+                line_vals: dict[str, list[str]] | None = None) -> tuple[str, ...]:
     """``inherited`` plus each absolute or home directory a `cd` in ``text``
-    names. A relative or unknowable one (`cd -`, `cd $OLDPWD`) adds nothing:
+    names; ``line_vals`` adds what the whole line assigns when ``text`` is one
+    segment of it. A relative or unknowable one (`cd -`, `cd $OLDPWD`) adds nothing:
     the directories already listed stay listed whatever it does."""
     if "cd" not in text and "pushd" not in text:
         return inherited
@@ -8729,12 +8782,30 @@ def _cd_targets(text: str, inherited: tuple[str, ...]) -> tuple[str, ...]:
             args = m.group(2).split()
         ops = [a for a in args if not (a.startswith("-") and len(a) > 1)]
         # A bare `cd` goes home; `cd ~/..` leaves it (XERK-1656).
-        target = _norm_path(_home_reading(ops[0]) or ops[0]) if ops else "~"
-        low = target.lower()
-        if low.startswith("/") or low.rstrip("/") in _HOME_TOKENS or _HOME_USER_RE.match(low):
-            target = target.rstrip("/") or "/"
-            if target not in found:
-                found.append(target)
+        targets = [_norm_path(_home_reading(ops[0]) or ops[0]) if ops else "~"]
+        # `cd -` goes to $OLDPWD, and a relative name is looked up in each
+        # $CDPATH entry first: `CDPATH=/; cd etc` is `/etc` (XERK-1662). Only
+        # values the line itself assigns; an inherited one stays unknown.
+        if ops and (ops[0] == "~-" or not ops[0].startswith(("/", "~"))
+                    or ops[0].startswith("~-/")):
+            vals = {**(line_vals or {})}
+            for name, vs in _var_values(text).items():
+                vals[name] = vals.get(name, []) + vs
+            # `~-` is `$OLDPWD` too, wherever `cd` is given it.
+            if ops[0] in ("-", "~-") or ops[0].startswith("~-/"):
+                targets += [v + ops[0][2:] for v in vals.get("OLDPWD", [])]
+            elif not ops[0].startswith("."):
+                targets += [entry.rstrip("/") + "/" + ops[0]
+                            for cdpath in vals.get("CDPATH", ()) for entry in cdpath.split(":")
+                            if entry.startswith("/")]
+        for target in targets:
+            target = _norm_path(target)
+            low = target.lower()
+            if (low.startswith("/") or low.rstrip("/") in _HOME_TOKENS
+                    or _HOME_USER_RE.match(low)):
+                target = target.rstrip("/") or "/"
+                if target not in found:
+                    found.append(target)
         if len(found) >= _MAX_CWDS:
             break
     return tuple(found)

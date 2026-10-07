@@ -1454,6 +1454,30 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_ifs_oldpwd_cdpath_and_continued_dollar_spellings_are_read(self):
+        # XERK-1662: bash runs each as the destructive command it spells.
+        rm = "r" + "m -rf"
+        for cmd in ("x=r" + "m,-rf,/etc; IFS=,; $x", "x=r" + "m:-rf:/etc; IFS=:; $x",
+                    f"OLDPWD=/; cd -; {rm} *", f"export OLDPWD=/etc; cd - ; {rm} *",
+                    f"cd /tmp; OLDPWD=/ cd -; {rm} *",
+                    f"OLDPWD=/etc; cd ~-; {rm} *", f"OLDPWD=/; cd ~-/etc; {rm} *",
+                    f"OLDPWD=/tmp; cd ~-/../etc; {rm} *",
+                    "IFS=,; set -- r" + "m,-rf,/etc; x=$1; $x", "set -- r" + "m,-rf,/etc; IFS=,; $1",
+                    f"CDPATH=/; cd etc; {rm} *", f"CDPATH=/tmp:/; cd etc && {rm} *",
+                    f"CDPATH=/; pushd usr; {rm} *",
+                    f"v=/etc; {rm} $\\\nv", f"v=/etc; {rm} $\\\n{{v}}", f"v=/etc; {rm} ${{\\\nv}}",
+                    f'v=/etc; {rm} "$\\\nv"', "x=r" + "m; $\\\nx -rf /etc",
+                    f"v=/etc; eval '{rm} $\\\nv'", f"export v=/etc; bash -c '{rm} $\\\nv'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("cd -; ls", f"OLDPWD=/tmp; cd -; {rm} build", "cd ~-; ls",
+                    "IFS=,; set -- a,b; echo $1",
+                    f"CDPATH=/tmp; cd foo; {rm} build", f"CDPATH=/; cd ./etc; {rm} build",
+                    "IFS=,; x=a,b; echo $x", "IFS=,; read -r a b <<< 'x,y'; echo $a",
+                    "v=/etc; echo $\\\nv", "ls \\\n  -la"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_value_a_grouped_or_looped_reader_takes_from_stdin_runs(self):
         # XERK-1650: each ran `rm -rf /etc` while the guard allowed it.
         R = self.R
