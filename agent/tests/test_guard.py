@@ -4098,6 +4098,13 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "bash <<< 'rm -rf /etc'\\", "echo 'rm -rf /etc' | sh\\",
                     "bash <(echo 'rm -rf /etc')\\", "cat <(echo 'rm -rf /etc') | sh\\",
                     "source <(echo 'rm -rf /etc')\\", "# don't\nbash -c 'rm -rf /etc'\\",
+                    # ...after a glued `#` (no comment), before a newline, and
+                    # where the split ate the escaped blank after it.
+                    "bash -c 'rm -rf /etc;'#\\", "sh <<< 'rm -rf /etc '#\\",
+                    "bash -c 'rm -rf /etc'\\\n", "bash -c 'rm -rf /etc'\\\n\nls",
+                    "sh <<< 'rm -rf /etc'\\\n", "bash -c 'rm -rf /etc '\\ ; true",
+                    "eval 'rm -rf /etc '\\ ; true", "echo 'rm -rf /etc;'\\ | sh",
+                    "{ bash -c 'rm -rf /etc'\\; }",
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',

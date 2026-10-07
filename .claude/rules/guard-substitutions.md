@@ -262,15 +262,17 @@ paths:
     scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
   - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
-- **A lone `\` ending a text is read both ways** (XERK-1646, `_trailing_escape_readings`):
-  shlex raises on it, and the whitespace split it falls back to kept a `-c`/`eval` script's
-  quotes, so `bash -c 'rm …'\` was never re-read. ADDED whole-line readings at `_expand`'s
-  entry: escaped (bash keeps a literal `\`) and dropped (zsh: `git push origin main\` pushes
-  main; bash's here-string hands its reader `text\` + newline, a continuation).
-  - Whole-line, never per segment: the pipe, here-string and `<(…)` feeds read the raw line
-    and missed per-segment readings (QA). A lone `\` can only end the line or a body.
-  - Never swap the fallback out: `_expand_braces` joins `{/etc,/var}\` into `/etc\ /var\`,
-    which shlex alone reads as ONE word — the split reading is what denies it (QA).
+- **A lone `\` ending a text is read both ways** (XERK-1646, `_trailing_escape_readings`).
+  shlex raises on it and the whitespace-split fallback kept a `-c`/`eval` script's quotes.
+  - bash's (a literal `\`) is the TOKENIZER's (`_tokenize_cached`): every route tokenizes, and
+    the stdin-feed walk reads stages (`echo '…'\ | sh`) no added segment reaches.
+  - zsh's (dropped; also bash's here-string `text\`+newline continuation) is ADDED in `_expand`:
+    per whole line (the feeds read the raw line) AND per segment (the split leaves a lone `\`
+    the line lacks: `'…'\ ; true` loses the escaped blank; `\<newline>` split at its newline).
+  - Detected by `_quote_states` + the run's parity, never shlex: `comments=True` read a glued
+    `'…'#\` as a comment; without it `# don't` is an open quote.
+  - `_expand_braces` escapes a lone `\` on every joined word but the last: unescaped,
+    `{/etc,/var}\` became `/etc\ /var\`, ONE word to shlex.
 - **A `${…}` inside `"…"` is a quoting frame of its own** (XERK-1621, `_quote_states`'s `{"`):
   a `"` there nests a string, never closes the outer one. Read flat, `"${y:-"it's"}"; rm …` left
   the `'` open and hid the `rm`.
