@@ -3418,6 +3418,12 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
                 # A name in an op's pattern is expanded first: `"${a%%$s*}"`.
                 out = _splice_readings(_op_readings(value, op.group(1), op.group(2), vals)
                                        if op else [value], state)
+        elif name == "HOME" and op and not _HOME_UNSET_RE.search(command):
+            # HOME is set in every shell an agent runs, so its default is
+            # unused: spliced, `"${HOME:-/tmp}"/*` read `/tmp/*` and hid the
+            # home wipe (XERK-1656). Kept, `_home_reading` judges it. A line
+            # that can unset HOME (`unset`, `env -i`) still gets the default.
+            return "${" + name + rest + "}", end
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
             # Spliced bare, `${y:- #}; rm -rf /` became `echo  #; rm -rf /` and
             # the `rm` a comment. The `#` was a word inside the braces; keep it
@@ -7741,11 +7747,14 @@ def _is_dangerous_path(tok: str, trailing: bool = True) -> bool:
     return False
 
 
-def _is_home_ssh(tok: str) -> bool:
+def _is_home_ssh(tok: str, home_read: bool = True) -> bool:
     """`~/.ssh` itself — deleting it loses the keys, though `chmod -R 700` of
     it is the routine permission fix, so only `rm` asks this."""
     dropped = _trailing_unset_dropped(tok)
     if dropped is not None and _is_home_ssh(dropped):
+        return True
+    home = _home_reading(tok.strip().strip('"').strip("'")) if home_read else None
+    if home is not None and _is_home_ssh(home, home_read=False):
         return True
     parent, _, leaf = _norm_path(tok).lower().rstrip("/").rpartition("/")
     return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent))
@@ -7825,7 +7834,142 @@ def _leading_names_end(raw: str) -> int:
     return pos if raw.startswith("/", pos) else 0
 
 
-def _dangerous_target(tok: str) -> str | None:
+# The session's own HOME, which bash expands `~` and `$HOME` to (XERK-1656).
+# Built from it, a target can leave the home: `$HOME/..` is the home's parent,
+# `${HOME/root/etc}` is /etc, `${HOME:+/etc}` is /etc. As a token, `$HOME/..`
+# normpaths to `.` and an operator hides the name, so each was allowed.
+_HOME_NAME_RE = re.compile(r"\$HOME(?!\w)")
+# What can run a command with HOME unset, where a `${HOME:-w}` default is used.
+_HOME_UNSET_RE = re.compile(r"\b(?:unset|env)\b|\bHOME=")
+# Past this many `${HOME<op>}` in one target the reading is `/`: each pattern
+# operator costs a match per substring of HOME, and a target that size is no path.
+_MAX_HOME_OPS = 64
+
+
+def _session_home() -> str | None:
+    home = os.environ.get("HOME", "")
+    if not home.startswith("/"):
+        try:
+            import pwd
+            home = pwd.getpwuid(os.getuid()).pw_dir
+        except (ImportError, KeyError, AttributeError):
+            return None
+    home = posixpath.normpath(re.sub(r"/{2,}", "/", home))
+    return home if home.startswith("/") and len(home) <= 256 else None
+
+
+def _home_expanded(raw: str, home: str, budget: list[int]) -> str | None:
+    """``raw`` with `~`, `$HOME` and `${HOME<op>}` expanded against ``home``
+    by the guard's own op evaluation, or None when an operator on HOME is one
+    it cannot read. Other names stay as written, except in an operator's word,
+    where an unset one reads empty as in bash (`${HOME/root/$y}` is `/`)."""
+
+    def word(text: str) -> str | None:
+        text = _home_expanded(text, home, budget)
+        if text is None:
+            return None
+        for _ in range(16):
+            text, n = _EXPANSIONS_RE.subn("", text)
+            if not n:
+                return text
+        return None
+
+    out, pos = [], 0
+    if raw == "~" or raw.startswith("~/"):
+        out.append(home)
+        pos = 1
+    while (dollar := raw.find("$", pos)) >= 0:
+        out.append(raw[pos:dollar])
+        if m := _HOME_NAME_RE.match(raw, dollar):
+            out.append(home)
+            pos = m.end()
+            continue
+        close = _brace_end(raw, dollar, False) if raw.startswith("${HOME", dollar) else -1
+        if close < 0:
+            out.append("$")
+            pos = dollar + 1
+            continue
+        tail = raw[dollar + 6:close]
+        if tail[:1] == "[":
+            return None  # an element: not evaluated
+        if tail[:1].isalnum() or tail[:1] == "_":
+            out.append("$")  # another name (`${HOMEDIR}`)
+            pos = dollar + 1
+            continue
+        budget[0] -= 1
+        if budget[0] < 0:
+            return "/"  # a target this size is no path; read it as the root
+        op = _VAR_OP_RE.match(tail)
+        if tail == "" or tail[:1] in ("-", "=", "?") or tail[:2] in (":-", ":=", ":?"):
+            value = home  # set and non-empty, so the default is unused
+        elif tail in _CASE_OPS:
+            value = _CASE_OPS[tail](home)
+        elif op is None:
+            return None  # a transform (`${HOME@Q}`)
+        elif op.group(1) in ("/", "//"):
+            pat, rep = _split_replace(op.group(2))
+            pat, rep = word(pat), word(rep)
+            if pat is None or rep is None:
+                return None
+            value = _replace_op(home, op.group(1), pat, rep)
+        else:
+            arg = word(op.group(2))
+            if arg is None:
+                return None
+            value = _apply_var_op(home, op.group(1), arg)
+        out.append(value)
+        pos = close + 1
+    out.append(raw[pos:])
+    return "".join(out)
+
+
+def _user_home(name: str) -> str | None:
+    """`~name`'s directory as bash finds it, or None when it has none here."""
+    try:
+        import pwd
+        home = pwd.getpwnam(name).pw_dir
+    except (ImportError, KeyError):
+        return None
+    home = posixpath.normpath(re.sub(r"/{2,}", "/", home))
+    return home if home.startswith("/") else None
+
+
+def _home_reading(raw: str) -> str | None:
+    """``raw`` read with the session's HOME expanded (and a `~user` prefix,
+    as bash does), or None when it names no home or the reading cannot be
+    made. A reading that stays inside a home is put back as `~…`/`~user…`,
+    which the home rules judge (`$HOME/.cache` is not `/root/.cache`, a child
+    of the /root system root); one that leaves it is an absolute path with its
+    `..` folded (`$HOME/..` is `/` when HOME=/root)."""
+    tilde = re.match(r"~([a-z0-9_][a-z0-9_.-]*)(?=/|$)", raw)
+    if not raw.startswith("~") and "$HOME" not in raw and "${HOME" not in raw:
+        return None
+    home = _session_home()
+    if home is None:
+        return None
+    homes = [("~", home)]
+    if tilde:
+        user = _user_home(tilde.group(1))
+        if user is None:
+            return None  # bash leaves an unknown `~name` as text
+        homes.insert(0, (tilde.group(0), user))
+        raw = user + raw[tilde.end():]
+    path = _home_expanded(raw, home, [_MAX_HOME_OPS])
+    if path is None or path == raw and not tilde:
+        return None
+    path = re.sub(r"/{2,}", "/", path)
+    slash = "/" if path.endswith("/") and path != "/" else ""
+    if path.startswith("/"):
+        path = posixpath.normpath(path)
+    for prefix, root in homes:
+        if path == root:
+            return prefix + slash
+        if path.startswith(root.rstrip("/") + "/"):
+            return prefix + "/" + path[len(root.rstrip("/")) + 1:] + slash
+    return path + slash
+
+
+def _dangerous_target(tok: str, home_read: bool = True) -> str | None:
     """Why ``tok`` names a protected path, or None. Besides the target as
     written, its leading unknown names are read as empty, but that reading is
     judged by `_is_dangerous_path` like any other: `"$build"/out` reads `/out`,
@@ -7841,6 +7985,9 @@ def _dangerous_target(tok: str) -> str | None:
     # (both ends empty) allowed; both are XERK-1652's call.
     if end and _is_dangerous_path(raw[end:], trailing=False):
         return f"({tok!r}, which is {_norm_path(raw[end:])!r} when {raw[:end]} is unset)"
+    home = _home_reading(raw) if home_read else None
+    if home is not None and _dangerous_target(home, home_read=False):
+        return f"({tok!r}, which is {home!r} with the home expanded)"
     return None
 
 
