@@ -5104,6 +5104,73 @@ def fileguard_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "fileguard.py")
 
 
+# Hook integrity (XERK-1643). The updater records the installed hooks' hashes in
+# `<prefix>/hooks.sha256` and reinstalls the current release when they drift, but
+# it runs hourly; a session that stubbed guard.py had every Bash call on the host
+# allowed until then. So the beat re-checks the same baseline and, on a
+# mismatch, logs it and starts that updater run now. Inert where no baseline
+# exists (a repo checkout, the Windows agent, an install from before this).
+HOOK_REPAIR_MIN_INTERVAL = 600   # seconds between updater kicks for one mismatch
+
+
+def hook_integrity_failures(script_dir=None):
+    """The hooks (``hooks/<name>.py``) whose bytes no longer match the baseline,
+    sorted; ``[]`` when all match, ``None`` when there is no readable baseline
+    (nothing to check against). A listed file that is gone counts as a mismatch:
+    a missing hook command is a NON-blocking hook, i.e. a guard failing open."""
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    try:
+        with open(os.path.join(script_dir, "hooks.sha256"), encoding="utf-8") as fh:
+            lines = fh.read().splitlines()
+    except (OSError, UnicodeDecodeError):
+        return None
+    bad = []
+    for line in lines:
+        digest, _, rel = line.partition("  ")
+        # Only the sha256sum lines install_payload writes; anything else (and any
+        # path escaping hooks/) is ignored rather than trusted.
+        if not re.fullmatch(r"[0-9a-f]{64}", digest) or not re.fullmatch(
+                r"hooks/[A-Za-z0-9_.-]+\.py", rel):
+            continue
+        try:
+            with open(os.path.join(script_dir, rel), "rb") as fh:
+                ok = hashlib.sha256(fh.read()).hexdigest() == digest
+        except OSError:
+            ok = False
+        if not ok:
+            bad.append(rel)
+    return sorted(bad)
+
+
+def check_hook_integrity(state, script_dir=None, now=None, spawn=None):
+    """Beat-time half of the check above. ``state`` is a dict the caller keeps
+    across beats (last kick time + last reported set). Returns the mismatched
+    list (or None). Kicks ``bin/turma-agent-update`` detached at most once per
+    HOOK_REPAIR_MIN_INTERVAL; that run takes the update lock, reinstalls the
+    current version and restarts this manager with sessions preserved."""
+    script_dir = script_dir or os.path.dirname(os.path.abspath(__file__))
+    bad = hook_integrity_failures(script_dir)
+    if not bad:
+        state.pop("reported", None)
+        return bad
+    now = time.time() if now is None else now
+    if state.get("reported") != bad:
+        log(f"WARNING: installed safety hooks do not match {script_dir}/hooks.sha256 "
+            f"(tampered or truncated): {', '.join(bad)} — starting the updater to restore them")
+        state["reported"] = bad
+    updater = os.path.join(script_dir, "bin", "turma-agent-update")
+    if now - state.get("kicked", 0) < HOOK_REPAIR_MIN_INTERVAL or not os.path.isfile(updater):
+        return bad
+    state["kicked"] = now
+    try:
+        (spawn or subprocess.Popen)(
+            [updater], stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL, start_new_session=True, close_fds=True)
+    except OSError as e:
+        log(f"hook repair: could not start {updater}: {e}")
+    return bad
+
+
 def permlog_script_path():
     """Absolute path to the bundled permission-ledger hook (``hooks/permlog.py``,
     XERK-1563), resolved the same way as ``guard_script_path``."""
@@ -20652,6 +20719,8 @@ class SessionManager:
         # cmdId is what the UI followed the spawn by; the migrationId is what the
         # hub's migration bookkeeping keys on.
         self.spawn_failures = []
+        # check_hook_integrity's memory across beats (XERK-1643).
+        self._hook_integrity = {}
         # Archive sync: the manifest of inactive transcripts sent on the last slow
         # beat, keyed by transcriptId, so when the reply's archiveHave cursors come
         # back we know each one's size/slug/meta to push deltas for.
@@ -38133,6 +38202,11 @@ class SessionManager:
                 self._deliver_pr_comments()
             except Exception as e:
                 log(f"pr comment delivery failed: {e}")
+        if not light:
+            try:
+                check_hook_integrity(self.__dict__.setdefault("_hook_integrity", {}))
+            except Exception as e:  # never worth a beat
+                log(f"hook integrity check failed: {e}")
         self._poll_clones()
         self._poll_prunes()
         # Start any queued session that can now run — a freed slot or a

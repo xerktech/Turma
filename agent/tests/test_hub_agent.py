@@ -14,6 +14,7 @@ import contextlib
 import datetime
 import errno
 import gzip
+import hashlib
 import http.server
 import importlib.util
 import inspect
@@ -42604,6 +42605,65 @@ class TestDecisionsFile(ManagerMixin, unittest.TestCase):
         self.assertIn("not instructions to you", d)
         # A runtime addendum still closes the directive.
         self.assertTrue(self.sm._session_directive(dict(sess, agentType="qwen"), "X").endswith("X"))
+
+
+
+class TestHookIntegrity(unittest.TestCase):
+    """XERK-1643: the beat re-checks the installed hooks against the baseline the
+    updater recorded, and starts the updater when they drift — a stubbed guard
+    must not ride out the hour to the next timer run."""
+
+    def setUp(self):
+        self.dir = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, self.dir, True)
+        os.makedirs(os.path.join(self.dir, "hooks"))
+        os.makedirs(os.path.join(self.dir, "bin"))
+        for name in ("guard.py", "fileguard.py"):
+            self._write(f"hooks/{name}", f"# real {name}\n")
+        self._write("bin/turma-agent-update", "#!/bin/sh\n")
+        lines = []
+        for name in ("guard.py", "fileguard.py"):
+            with open(os.path.join(self.dir, "hooks", name), "rb") as fh:
+                lines.append(f"{hashlib.sha256(fh.read()).hexdigest()}  hooks/{name}")
+        self._write("hooks.sha256", "\n".join(lines) + "\n")
+        self.spawned = []
+
+    def _write(self, rel, text):
+        with open(os.path.join(self.dir, rel), "w") as fh:
+            fh.write(text)
+
+    def _check(self, state, now):
+        with mock.patch.object(ha, "log"):
+            return ha.check_hook_integrity(state, script_dir=self.dir, now=now,
+                                           spawn=lambda argv, **kw: self.spawned.append(argv))
+
+    def test_intact_hooks_do_nothing(self):
+        self.assertEqual([], self._check({}, 1000))
+        self.assertEqual([], self.spawned)
+
+    def test_no_baseline_is_inert(self):
+        os.unlink(os.path.join(self.dir, "hooks.sha256"))
+        self.assertIsNone(self._check({}, 1000))
+        self.assertEqual([], self.spawned)
+
+    def test_stubbed_guard_kicks_the_updater_once_per_interval(self):
+        self._write("hooks/guard.py", "import sys\nsys.exit(0)\n")
+        state = {}
+        self.assertEqual(["hooks/guard.py"], self._check(state, 1000))
+        self.assertEqual([[os.path.join(self.dir, "bin", "turma-agent-update")]], self.spawned)
+        self._check(state, 1000 + ha.HOOK_REPAIR_MIN_INTERVAL - 1)
+        self.assertEqual(1, len(self.spawned))
+        self._check(state, 1000 + ha.HOOK_REPAIR_MIN_INTERVAL)
+        self.assertEqual(2, len(self.spawned))
+
+    def test_a_deleted_hook_is_a_mismatch(self):
+        os.unlink(os.path.join(self.dir, "hooks", "fileguard.py"))
+        self.assertEqual(["hooks/fileguard.py"], self._check({}, 1000))
+
+    def test_baseline_lines_outside_hooks_are_ignored(self):
+        with open(os.path.join(self.dir, "hooks.sha256"), "a") as fh:
+            fh.write("0" * 64 + "  ../hub-agent.py\n" + "0" * 64 + "  hooks/../../x.py\n")
+        self.assertEqual([], self._check({}, 1000))
 
 
 if __name__ == "__main__":

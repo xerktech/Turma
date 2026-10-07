@@ -215,6 +215,18 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   `TURMA_BOOT_UPDATE_MIN_INTERVAL` 300s) — a future-dated stamp reads as no stamp, age computed
   base-10 (bash reads a zero-padded stamp as octal). Fired BEFORE the credential gate, NEVER by
   `--preflight`. `TURMA_BOOT_UPDATE=0` opts out. Tests: `test_turma_agent.sh`.
+- **The safety hooks are re-asserted every run, not only on a version bump** (XERK-1643): a session
+  once replaced `hooks/guard.py` with an allow-all stub, which the version check alone kept until the
+  next release.
+  - Every install (`install_payload`, `install.sh`) records `$PREFIX/hooks.sha256`; a run whose release
+    equals the installed version but whose hooks fail that baseline (or that has none) REINSTALLS it.
+  - Never repair by downgrading: an installed build newer than the release is left alone.
+  - The manager re-checks the same baseline every full beat (`check_hook_integrity`) and kicks
+    `bin/turma-agent-update` detached, at most once per `HOOK_REPAIR_MIN_INTERVAL` — exposure is one
+    beat plus an update run, not up to an hour. Inert with no baseline (checkout, Windows).
+  - The baseline is as writable as the hooks: this repairs a model that stubs its guard to get
+    unblocked, not a shell set on hiding it (XERK-309). Tests: `run_integrity_case` in
+    `test_turma_agent_update.sh`, `TestHookIntegrity`.
 - **Auth on the release read is an optimisation, never a precondition** (XERK-151): tries `gh`, then
   `$GH_TOKEN`, then anonymously — requiring auth would pin a no-login host at its installed version
   forever. Exports the same `$HOME/.local/bin` PATH the launcher does (its unit sets none).

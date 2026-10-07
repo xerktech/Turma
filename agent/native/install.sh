@@ -305,6 +305,9 @@ install_files() {
   chmod +x "$PREFIX/hub-agent.py" "$PREFIX/tunnel-agent.js" \
            "$PREFIX/bin/turma-agent" "$PREFIX/bin/turma-agentctl" \
            "$PREFIX/bin/turma-agent-update" "$PREFIX/hooks/"*.py
+  # The baseline the updater and the manager check the hooks against (XERK-1643);
+  # without it the first update run reinstalls the release just to record one.
+  ( cd "$PREFIX" && sha256sum hooks/*.py >hooks.sha256 ) || warn "could not record $PREFIX/hooks.sha256"
   # Record the installed native version (read by the updater and --verify). The
   # release tarball ships a stamped VERSION next to the files; a repo checkout
   # falls back to the repo-root VERSION (bare MAJOR.MINOR, which still sorts

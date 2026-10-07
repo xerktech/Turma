@@ -164,6 +164,48 @@ installed_version() {
   [ -f "$PREFIX/VERSION" ] && tr -d '[:space:]' <"$PREFIX/VERSION" || echo "0.0.0"
 }
 
+# ---- hook integrity (XERK-1643) ---------------------------------------------
+# The safety hooks are plain files the session uid can write, and the version
+# check alone never looks at them: on TrueNAS hooks/guard.py was replaced by an
+# allow-all `sys.exit(0)` stub that would have survived until the next release.
+# So every install records the hooks' hashes here, and every run re-checks them;
+# a mismatch reinstalls the CURRENT version from its verified release asset. The
+# baseline is as writable as the hooks are — this repairs a session that stubbed
+# the guard to get unblocked, not a shell that sets out to hide it.
+HOOKS_BASELINE="$PREFIX/hooks.sha256"
+
+record_hooks_baseline() {
+  ( cd "$PREFIX" && sha256sum hooks/*.py >"$HOOKS_BASELINE.tmp" \
+      && mv -f "$HOOKS_BASELINE.tmp" "$HOOKS_BASELINE" ) 2>/dev/null \
+    || { rm -f "$HOOKS_BASELINE.tmp" 2>/dev/null; logmsg "could NOT record $HOOKS_BASELINE"; }
+}
+
+# 0 when every hook matches the baseline. No baseline (an install that predates
+# this check) counts as NOT intact: the files can't be vouched for, and the
+# reinstall that follows is what records one.
+hooks_intact() {
+  # No sha256sum: nothing can be checked OR recorded, so "not intact" would
+  # reinstall on every run forever. The hard dependency makes this theoretical.
+  command -v sha256sum >/dev/null 2>&1 || return 0
+  [ -f "$HOOKS_BASELINE" ] || return 1
+  ( cd "$PREFIX" && sha256sum -c --quiet "$HOOKS_BASELINE" ) >/dev/null 2>&1
+}
+
+# Called when the release is NOT newer than what's installed: 0 means reinstall
+# <release_version> anyway. Only ever the SAME version — an installed build newer
+# than the release (a hand install) is never downgraded to repair it.
+needs_repair() {  # <release_version> <installed_version>
+  [ "$1" = "$2" ] || return 1
+  hooks_intact && return 1
+  if [ -f "$HOOKS_BASELINE" ]; then
+    logmsg "installed hooks do NOT match $HOOKS_BASELINE (tampered or truncated);" \
+           "reinstalling $2 to restore them"
+  else
+    logmsg "no hook baseline at $HOOKS_BASELINE; reinstalling $2 to record one"
+  fi
+  return 0
+}
+
 # is $1 strictly newer than $2 (dotted numeric, e.g. 0.3.12)?
 newer_than() {
   [ "$1" != "$2" ] && \
@@ -743,6 +785,7 @@ install_payload() {  # <tgz> <version>
     [ -f "$src/$b" ] && { mv -f "$src/$b" "$PREFIX/bin/$b"; chmod +x "$PREFIX/bin/$b"; }
   done
   chmod +x "$PREFIX/hooks/"*.py 2>/dev/null || true
+  record_hooks_baseline
   # dsh toolchain: keep it in step with the payload, on a host that wants dsh
   # (install.sh --with-dsh wrote $PREFIX/.dsh). The plugins sit OUTSIDE the
   # shared files this swap used to own, so unreferenced here they silently froze
@@ -890,11 +933,12 @@ try_unified() {  # <cur> <stage>
     logmsg "manifest.json missing agent-native fields; trying legacy"; return 1
   fi
 
-  if ! newer_than "$comp_version" "$cur"; then
+  if newer_than "$comp_version" "$cur"; then
+    logmsg "update available: $cur -> $comp_version (from $release_tag, release $utag)"
+  elif ! needs_repair "$comp_version" "$cur"; then
     logmsg "up to date ($cur; latest release $utag carries native $comp_version)"
     return 0
   fi
-  logmsg "update available: $cur -> $comp_version (from $release_tag, release $utag)"
 
   local dl="$stage/payload"; mkdir -p "$dl"
   if [ -n "$sha" ]; then
@@ -914,12 +958,13 @@ try_legacy() {  # <cur> <stage>
     logmsg "no native release found (or auth unavailable); staying at $cur"
     return 0
   fi
-  if ! newer_than "$latest" "$cur"; then
+  tag="${LEGACY_TAG_PREFIX}${latest}"
+  if newer_than "$latest" "$cur"; then
+    logmsg "update available (legacy): $cur -> $latest ($tag)"
+  elif ! needs_repair "$latest" "$cur"; then
     logmsg "up to date ($cur; latest $latest)"
     return 0
   fi
-  tag="${LEGACY_TAG_PREFIX}${latest}"
-  logmsg "update available (legacy): $cur -> $latest ($tag)"
   dl="$stage/payload"; mkdir -p "$dl"
   download_assets "$tag" "$dl" '*.tar.gz' '*.sha256' || { logmsg "download failed for $tag; keeping $cur"; return 0; }
   verify_and_install "$dl" "$latest" || true
