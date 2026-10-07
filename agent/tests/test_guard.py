@@ -1461,6 +1461,7 @@ class TestProducedScripts(unittest.TestCase):
                     f"OLDPWD=/; cd -; {rm} *", f"export OLDPWD=/etc; cd - ; {rm} *",
                     f"cd /tmp; OLDPWD=/ cd -; {rm} *",
                     f"OLDPWD=/etc; cd ~-; {rm} *", f"OLDPWD=/; cd ~-/etc; {rm} *",
+                    f"OLDPWD=/tmp; cd ~-/../etc; {rm} *",
                     "IFS=,; set -- r" + "m,-rf,/etc; x=$1; $x", "set -- r" + "m,-rf,/etc; IFS=,; $1",
                     f"CDPATH=/; cd etc; {rm} *", f"CDPATH=/tmp:/; cd etc && {rm} *",
                     f"CDPATH=/; pushd usr; {rm} *",
