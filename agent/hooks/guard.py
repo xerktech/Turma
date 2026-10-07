@@ -2415,6 +2415,12 @@ def _expand_braces(command: str) -> str:
         prefix, suffix = command[word_start:start], command[end:word_end]
         # An empty word goes, as in bash: `{,bash}` runs `bash`.
         parts = [w for w in (prefix + p.strip() + suffix for p in items) if w]
+        # A suffix ending in a lone `\` (the word ends the text) escaped the
+        # blank joining two words: `{/etc,/var}\` read as ONE word
+        # `/etc /var\`. zsh drops that `\` before it expands; bash keeps it
+        # literal on every word, which judges no worse (XERK-1646).
+        if suffix.endswith("\\") and _drop_trailing_escape(command[:word_end]) is not None:
+            parts = [w[:-1] for w in parts if w[:-1]]
         command = command[:word_start] + " ".join(parts) + command[word_end:]
         pos = word_start
         states = _quote_states(command)
@@ -4575,13 +4581,49 @@ def _glue_func_parens(segment: str) -> str:
     return "".join(out)
 
 
+def _drop_trailing_escape(text: str) -> str | None:
+    """``text`` with the lone live `\\` ending it (trailing blanks aside)
+    dropped, or None when it ends otherwise (XERK-1646).
+
+    zsh drops that `\\`, and so does every shell reading it as a line
+    continuation (a here-string's `text\\` + newline, a `\\<newline>` split
+    at its newline). bash keeps it as a literal `\\` glued to the last word,
+    which only ever makes that word LESS than the dropped reading's (`/etc\\`,
+    `sh\\`, `*\\`): nothing follows it in this parse, and in any later
+    parse it ends the text again. So the dropped reading is the one to judge.
+
+    Judged by `_quote_states` and the run's parity, never by shlex: shlex's
+    `comments` takes a `#` glued to a word (`'…'#\\`) for a comment, and
+    without it `# don't` is an open quote.
+    """
+    body = text.rstrip(" \t\n")
+    if not body.endswith("\\"):
+        return None
+    run = len(body) - len(body.rstrip("\\"))
+    if run % 2 == 0 or _quote_states(body)[-1] != "\\":
+        return None
+    return body[:-1] + text[len(body):]
+
+
 @functools.lru_cache(maxsize=512)
 def _tokenize_cached(segment: str) -> tuple[str, ...]:
     segment = _join_continuations(segment)
     try:
         return tuple(shlex.split(segment, posix=True))
     except ValueError:
-        return tuple(segment.split())
+        pass
+    # A lone `\` ending the text makes shlex raise, and the whitespace split
+    # below kept a `-c`/`eval` script's quotes, so `bash -c 'rm …'\` was
+    # never re-read (XERK-1646). Every route tokenizes — the stdin-feed walk's
+    # stages, a segment whose escaped blank the split ate — so the reading
+    # goes here, and costs nothing per nesting level.
+    dropped = _drop_trailing_escape(segment)
+    if dropped is not None:
+        try:
+            return tuple(shlex.split(dropped, posix=True))
+        except ValueError:
+            pass
+    return tuple(segment.split())
 
 
 def _tokenize(segment: str) -> list[str]:

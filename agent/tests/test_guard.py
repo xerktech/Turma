@@ -2893,6 +2893,23 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         self.assertDenied("echo " + "$(echo " * 3000 + "x" + ")" * 3000)
         self.assertLess(time.monotonic() - started, 5)
 
+    def test_a_trailing_backslash_costs_no_reading_per_level(self):
+        # XERK-1646 QA: a second reading of a lone trailing `\` at every
+        # level of a nested `eval '…'\` grew 4x per level (1 KB took 29s).
+        cmd = "; ".join(["echo a | sh"] * 50)
+        for _ in range(5):
+            cmd = "eval " + shlex.quote(cmd) + "\\"
+        started = time.monotonic()
+        self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        self.assertLess(time.monotonic() - started, 5)
+
+    def test_a_brace_word_drops_only_a_lone_trailing_backslash(self):
+        # XERK-1646: zsh drops a lone `\` ending the text before it expands;
+        # an escaped one (an even run) is text and stays on every word.
+        self.assertEqual(guard._prenormalise("rm -rf {/etc,/var}\\"), "rm -rf /etc /var")
+        self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\"), "rm -rf a\\\\ b\\\\")
+        self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\\\"), "rm -rf a\\\\ b\\\\")
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
@@ -4084,6 +4101,27 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "$x \\\nrm -rf /etc", '"$@" \\\nrm -rf /etc', "$(true) \\\nrm -rf /etc",
                     'bash -c "\\$x \\\nrm -rf /etc"', 'eval "\\$x \\\nrm -rf /etc"',
                     'bash <<< "\\$x \\\nrm -rf /etc"', 'echo "\\$x \\\nrm -rf /etc" | bash',
+                    # A lone trailing `\` is a literal `\` to bash; shlex raised on
+                    # it and its fallback kept the script's quotes (XERK-1646).
+                    "bash -c 'rm -rf /etc '\\", "bash -c 'rm -rf /etc'\\",
+                    "sh -c 'rm -rf /etc'\\", "eval 'rm -rf /etc'\\",
+                    "bash -c 'X=${nope:-a b} rm -rf /etc '\\",
+                    # zsh drops it instead; a brace expansion glued to it is
+                    # still read split (it was denied before the fix too).
+                    "git push origin main\\", "bash -c 'git push origin main'\\",
+                    "eval 'reboot'\\", "bash -c 'find / -delete'\\",
+                    "rm -rf {/etc,/var}\\", "rm -rf /{etc,var}\\", "rm -rf {/,x}\\",
+                    # ...on the routes that feed a shell its stdin too.
+                    "bash <<< 'rm -rf /etc'\\", "echo 'rm -rf /etc' | sh\\",
+                    "bash <(echo 'rm -rf /etc')\\", "cat <(echo 'rm -rf /etc') | sh\\",
+                    "source <(echo 'rm -rf /etc')\\", "# don't\nbash -c 'rm -rf /etc'\\",
+                    # ...after a glued `#` (no comment), before a newline, and
+                    # where the split ate the escaped blank after it.
+                    "bash -c 'rm -rf /etc;'#\\", "sh <<< 'rm -rf /etc '#\\",
+                    "bash -c 'rm -rf /etc'\\\n", "bash -c 'rm -rf /etc'\\\n\nls",
+                    "sh <<< 'rm -rf /etc'\\\n", "bash -c 'rm -rf /etc '\\ ; true",
+                    "eval 'rm -rf /etc '\\ ; true", "echo 'rm -rf /etc;'\\ | sh",
+                    "{ bash -c 'rm -rf /etc'\\; }",
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',
