@@ -56,7 +56,7 @@ paths:
   - A segment's leading `f(){`/`function f {`/`{`/`(` is dropped first (`_RAW_SEG_OPENER_RE`):
     `_tokenize` keeps `f(){` as one word. Every `-exec` script counts, not the first.
   - Its scripts: an eval join, every `-c` script, a `trap` action, and a shell's or `.`'s
-    here-string (name glued to `<<<` too). Not yet a here-string a pipe carries to a shell
+    here-string (name glued to `<<<` too); a segment is ANSI-C decoded first (`bash -c $'…'`). Not yet a here-string a pipe carries to a shell
     (`cat <<< '…' | bash`): XERK-1684.
   - Accepted over-deny, as base already does for `$(echo 'X=1 Y=2') rm …`: printed text at
     command start is read as re-parsed (`$(echo 'X=${v:-a b}') rm …` runs no `rm`).

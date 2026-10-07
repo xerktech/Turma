@@ -4354,7 +4354,8 @@ def _raw_printed_cuts(command: str, depth: int = 0) -> list[str]:
             continue
         for m in _find_substs(raw_seg):
             cuts += _raw_printed_cuts(_subst_inner(m), depth + 1)
-        seg = _unwrap_group(raw_seg)
+        # `$'…'` decoded first: `bash -c $'eval $(echo \'X=…\') …'` is a script too.
+        seg = _unwrap_group(_decode_ansi_c(raw_seg))
         seg = seg[_RAW_SEG_OPENER_RE.match(seg).end():]
         words = _strip_prefixes(_tokenize(seg))
         if not words:
