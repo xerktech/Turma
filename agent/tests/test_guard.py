@@ -3951,6 +3951,64 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
+    def test_a_target_built_from_home_is_read_with_the_real_home(self):
+        # XERK-1656: `$HOME`, `~` and `${HOME<op>}` are expanded against the
+        # session's HOME, so a target that leaves the home through `..`, a
+        # replace, a trim or an alternative names what bash deletes.
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cmd in ('rm -rf "${HOME/root/}"*', 'rm -rf "${HOME/root/etc}"', 'rm -rf "$HOME"/../etc',
+                        'rm -rf "${x:-${HOME}}"/*', 'rm -rf "${HOME:-/tmp}"/*', "rm -rf ${HOME:=/tmp}",
+                        'rm -rf "${x:-${HOME:-/tmp}}"/*', 'rm -rf "${HOME:+/etc}"', 'rm -rf "${HOME+/etc}"',
+                        'rm -rf "${HOME:+/}"etc', 'rm -rf "${HOME/root/$y}"', "chmod -R 777 ~/..",
+                        "chmod -R 777 $HOME/..", "chown -R nobody $HOME/..", "rm -rf ${HOME%/}",
+                        "rm -rf ${HOME:0}", "rm -rf ${HOME/x/x}", "rm -rf ${HOME%/}/.ssh", "rm -rf ${HOME,,}",
+                        'rm -rf "${HOME: -5}"', "rm -rf ~/x/..", "find ~/.. -delete", "rm -rf ~root/..",
+                        "chmod -R 777 ${HOME@E}/..", "rm -rf ${HOME@L}/../etc", "rm -rf ~bin/x",
+                        "cd ~/..; rm -rf *", "cd $HOME/..; rm -rf etc", "pushd ~/.. && rm -rf *",
+                        # Text on the line never switches the home reading off (QA).
+                        'echo env; rm -rf "${HOME:-/tmp}"/*', 'rm -rf "${HOME:-/tmp}"/* # unset',
+                        # HOME can be unset, so its default is a reading too.
+                        'unset HOME; rm -rf "${HOME:-/}"etc', "env -i bash -c 'rm -rf \"${HOME:-/}\"etc'",
+                        'read HOME </dev/null; rm -rf "${HOME:-/}"etc',
+                        # Each command a kept default can reach (`_HOME_TARGET_PROGS`).
+                        'chown -R nobody "${HOME:-/tmp}"', 'chgrp -R nobody "${HOME:-/tmp}"',
+                        'chmod -R 000 "${HOME:-/tmp}"/', 'unlink "${HOME:-/tmp}"/.ssh',
+                        'find "${HOME:-/tmp}" -delete', 'cd "${HOME:-/tmp}"/..; rm -rf *',
+                        "f(){ local HOME; ${HOME:-rm} -rf /; }; f"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNotNone(guard.is_destructive(cmd))
+            for cmd in ("rm -rf $HOME/.cache", "rm -rf ~/.cache/pip", 'rm -rf "$HOME/build"', "rm -rf ~/x/",
+                        'rm -rf "${HOME:-/tmp}"/.cache', "rm -rf ${HOME}/tmp/x", "chmod -R 755 ~/proj",
+                        "chmod -R 700 ~/.ssh", "rm -rf ~/../foo", "rm -rf ~root/x", "rm -rf ${HOME:1}",
+                        "rm -rf ${HOME//o/}", "rm -rf ${HOME@Q}", "rm -rf ~nosuchuser9/..",
+                        "rm -rf ${XDG_CACHE_HOME:-$HOME/.cache}/pip", "cd ~/proj && rm -rf build"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNone(guard.is_destructive(cmd))
+        # Another HOME moves the reading with it: `/root` is no longer the home.
+        with mock.patch.dict(os.environ, {"HOME": "/home/me"}):
+            self.assertIsNone(guard.is_destructive('rm -rf "${HOME/root/etc}"/x'))
+            self.assertIsNotNone(guard.is_destructive('rm -rf "${HOME%/me}"'))
+            self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/../../etc"))
+            self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
+        # An op sees HOME as written, trailing slash and all.
+        with mock.patch.dict(os.environ, {"HOME": "/root/"}):
+            self.assertIsNotNone(guard.is_destructive("rm -rf ${HOME%root/}etc"))
+            self.assertIsNone(guard.is_destructive("rm -rf ${HOME%root}etc"))
+        # With HOME=/ nothing maps back to the home: `$HOME/etc` is /etc.
+        with mock.patch.dict(os.environ, {"HOME": "/"}):
+            self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/etc"))
+            self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
+
+    def test_home_readings_are_bounded(self):
+        # XERK-1656: each pattern op costs a match per substring of HOME, so
+        # past `_MAX_HOME_OPS` the target reads as `/` instead of being timed.
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            word = "${HOME%/}" * (guard._MAX_HOME_OPS + 1)
+            self.assertEqual(guard._home_reading(word), "/")
+            self.assertEqual(guard._home_reading("${HOME[0]}/x"), None)
+            self.assertEqual(guard._home_reading("$HOMEDIR/x"), None)
+            self.assertEqual(guard._home_reading("${HOME}/../etc"), "/etc")
+
     def test_leading_names_are_one_run_and_scan_linearly(self):
         # XERK-1639: every name in the run is read empty, not just the first,
         # and an unclosed `${` stops the scan instead of backtracking (QA).
