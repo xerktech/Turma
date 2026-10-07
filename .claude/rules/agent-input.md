@@ -24,10 +24,17 @@ composed.**
   - Outbox is internal (not heartbeated), cleared on restart-clear-context; text typed directly into
     the raw ttyd terminal bypasses `send_input` and isn't covered.
   - Tests: `TestPendingScan`, `TestPollPendingInputs`, `TestSendInput`.
-- **PASTED, not typed** (`_type_into_pane`, XERK-227): `send-keys` is a tmux command argument,
-  refused past ~16 KiB, which a pasted log exceeds. `-p` brackets for an app that asked (Claude Code
-  does) so newlines survive as ONE message; control bytes are stripped, else one ends the paste and
-  the rest reads as KEYSTROKES.
+- **Via the paste BUFFER, never argv** (`_type_into_pane`, XERK-227): `send-keys` is a tmux command
+  argument, refused past ~16 KiB. Control bytes are stripped, else one reads as a KEYSTROKE.
+- **Chat-sized input is typed UNBRACKETED** (XERK-1718): Claude Code wraps bracketed (`-p`) input,
+  and any one burst over ~800 chars, in `<pasted_content>` — the model then reads the operator's
+  words as pasted DATA. So text ≤ `PASTE_SLICED_MAX_CHARS` with nothing in `_SLICE_UNSAFE_RE` goes
+  in `PASTE_CHUNK_CHARS` slices with `-r` (LF = Ctrl+J = line break; tmux's default CR submits).
+  - Do not slice past the cap or with astral/ZWJ/VS chars: typed dense emoji past ~10K chars never
+    submit and arrive corrupted, and slicing costs ~2 tmux calls per slice ON THE BEAT (resend, qwen
+    peer). Those keep one bracketed paste; `chat.js` `stripFraming` hides the tags.
+  - A typed TAB is autocomplete, so tabs go as 4 spaces. One writer per pane (`_PANE_TYPE_LOCKS`).
+  - Windows `_pty_inject` still brackets multi-line (XERK-1727). Tests: `TestSendInput`.
 - **Nothing truncates silently**: the fallback CHUNKS its send-keys; the agent REFUSES past
   `INPUT_MAX_CHARS` (100k) and heartbeats it as `inputMaxChars`; the hub caps at the receiving
   host's figure (`inputCapFor`, **4k when unreported** — an agent predating paste clips the tail

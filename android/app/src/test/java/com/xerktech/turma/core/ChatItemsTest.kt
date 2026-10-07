@@ -396,6 +396,35 @@ class ChatItemsTest {
         assertTrue("linear scan should be well under a second (was ${elapsedMs}ms)", elapsedMs < 2_000)
     }
 
+    @Test fun `buildItems classifies a user turn then strips its framing tags`() {
+        val items = buildItems(
+            listOf(
+                TailEntry(id = "p", role = "user", blocks = listOf(
+                    TextBlock("<pasted_content id=\"3dcc\">\r\nline one\r\n</pasted_content id=\"3dcc\">"))),
+                TailEntry(id = "s", role = "user", blocks = listOf(
+                    TextBlock("<system-reminder>\nnamed the session\n</system-reminder>"))),
+                TailEntry(id = "e", role = "user", blocks = listOf(
+                    TextBlock("<system-reminder>\n</system-reminder>"))),
+            ),
+            VerbosityPrefs.forPreset(Verbosity.NORMAL),
+        )
+        val bubbles = items.filterIsInstance<ChatItem.Bubble>()
+        assertEquals(listOf("line one", "named the session"), bubbles.map { it.text })
+        // Classified on the raw text (its leading tag), shown without it.
+        assertEquals(listOf("operator", "system"), bubbles.map { it.origin })
+    }
+
+    @Test fun `stripFraming drops Claude Code's tag lines and keeps their body`() {
+        assertEquals("line one\nline two",
+            stripFraming("<pasted_content id=\"3dcc\">\nline one\nline two\n</pasted_content id=\"3dcc\">\n"))
+        assertEquals("The user named this session.",
+            stripFraming("<system-reminder>\nThe user named this session.\n</system-reminder>"))
+        assertEquals("look at this\n\nlog <tail>",
+            stripFraming("look at this\n\n<pasted_content id=\"ab\">\nlog <tail>\n</pasted_content id=\"ab\">"))
+        assertEquals("keep <b> and a <system-reminder> mid-line",
+            stripFraming("keep <b> and a <system-reminder> mid-line"))
+    }
+
     // ---- messageOrigin: a user turn's real source (web parity) --------------
 
     @Test fun `messageOrigin classifies each relay framing, operator by default`() {
