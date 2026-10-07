@@ -3403,7 +3403,14 @@ class TestExpansionBudget(unittest.TestCase):
                     f"for v in a '{R}'; do f(){{ $1; }}; f \"$v\"; done",
                     f"for v in a '{R}'; do echo \"$v\" > s.sh; done; sh s.sh",
                     f"{{ echo '{R}' > s.sh; }}; sh s.sh", f"(echo '{R}' > s.sh); sh s.sh",
-                    f"if true; then echo '{R}' > s.sh; fi; . s.sh"):
+                    f"if true; then echo '{R}' > s.sh; fi; . s.sh",
+                    # QA: an assignment never splits (escaped, `x=$1` read
+                    # `x=rm`); `$'…'` args; a brace list past its cap; a `$`
+                    # inside `'…'` is no ANSI-C string (`'$''v'` is `$v`).
+                    f"f(){{ x=$1; $x; }}; f '{R}'", f"f(){{ local x=$1; bash -c \"$x\"; }}; f '{R}'",
+                    f"set -- '{R}'; x=$1; $x", f"f(){{ $1; }}; f $'{R}'",
+                    f"v='{R}'; eval '$''v'", f"for v in a '{R}'; do eval '$''v'; done",
+                    f"d='$'; v='{R}'; eval $d'v'"):
             with self.subTest(cmd=cmd):
                 reason = self.check(cmd)
                 self.assertIsNotNone(reason)
@@ -3416,8 +3423,13 @@ class TestExpansionBudget(unittest.TestCase):
                     "for v in a b; do eval \"echo \\$v\"; done",
                     f"for v in a '{R}'; do echo '$'v; done",
                     "for v in a $\"hello world\"; do echo $v; done",
-                    "f(){ $1 --version; }; f 'git'", "for v in a b; do echo \"$v\" > s.txt; done; sh s.sh"):
+                    "f(){ $1 --version; }; f 'git'", "f(){ x=$1; echo $x; }; f 'a b'", "for v in a b; do echo \"$v\" > s.txt; done; sh s.sh"):
             self.assertIsNone(self.check(cmd), cmd)
+        # Glued names are found in linear time on a long blank-free run (QA).
+        self.assertTrue(guard._glued_name_pairs("x" * 60000 + "$a" + "$b" * 3, {"a", "b"}))
+        # A brace list past its cap is too large, never read short (QA).
+        self.assertIn(self.TOO_LARGE, self.check(
+            "for v in {a,}{a,}{a,}{a,}{a,}{a,}{a,}{z,'rm -rf /'}; do $v; done") or "")
         # A product past `_MAX_FOR_PRODUCT` readings is too large, never slow.
         words = " ".join(f"w{i}" for i in range(17))
         self.assertIn(self.TOO_LARGE, self.check(

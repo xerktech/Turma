@@ -51,6 +51,8 @@ paths:
 - An UNQUOTED use of a raw word splits it (XERK-1657): a quoted word is spliced dequoted, plain
   text escaped as a `$x` value is (`f(){ $1; }; f 'rm …'` ran `rm`); one holding `$`/backtick only
   dequoted, so `f "$v"` stays live for the line's substitution.
+  - Never in an assignment or `case`/`[[` word (`_in_assignment_word`): bash splits none there,
+    and escaped `f(){ x=$1; $x; }; f 'rm …'` read `x=rm` (a QA bypass of main's deny).
 - Every binding is an ADDED reading beside the unbound text, and ORDER-BLIND on purpose: a `set`
   binds bodies it never reaches; a call binds whatever body its name has.
 - `shift` in the bound text adds each shifted list (`_shifted`, up to `_MAX_SHIFTS`); `for p;`

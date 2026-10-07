@@ -104,13 +104,20 @@ paths:
     `_MAX_FOR_PRODUCT` readings the line is too large (60×60 words took 8 s). Unglued nested lists
     stay one at a time; three glued names are read pairwise only (residual).
   - Shell-list words are brace-expanded first (`_brace_words`): `_expand_braces` skips a list
-    holding a blank, so `for v in a {'rm …',b}` bound one word. `$"…"` dequotes as `"…"`.
+    holding a blank, so `for v in a {'rm …',b}` bound one word. Past `_BRACE_SEQ_MAX` words the
+    list is too large (a deny): read short, a later item ran unread. `$"…"` dequotes as `"…"`,
+    `$'…'` as its decoded text.
+  - Cost accepted: each word now read (brace items, product) is a whole-line reading, as a literal
+    list of that length already was; a heavy line can reach the deadline (fails closed).
   - A whole `"$v"` of a multi-word list splices each word as its OWN quoted word; spliced bare,
     `for v in c 'rm …'; do bash -c "$v"` handed `-c` the word `rm` (XERK-1657).
   - A loop over positionals (`set -- …; for v; do`, `f(){ for v in "$@"; …}; f …`) is read per
     word on each bound reading in `_expand` too, `_FOR_PICK` saved and restored around it.
   - An `eval` whose joined words rebuild a use (`eval '$'v`, `eval "$"v`) is re-read with the
-    line's values substituted; the per-word scan counts `'$'v` as a use of `v`.
+    line's values substituted — only when quotes split a `$` from its name in the raw segment
+    (`_QUOTE_SPLIT_USE_RE`): on every eval it cost ~5x. The per-word scan counts `'$'v` as a use.
+  - `_decode_ansi_c` skips a `$` inside `'…'`: there the next `'` closes the string, so
+    `eval '$''v'` is `eval $v`; decoded as `$''` it lost the `$`.
     Tests: `test_loop_words_reach_a_script_positional_or_eval_alone`.
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.

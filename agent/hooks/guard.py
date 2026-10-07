@@ -1902,13 +1902,18 @@ def _brace_words(word: str) -> list[str]:
     """A raw ``word`` as bash brace-expands it: a word per item of each
     unquoted `{a,b}` / `{x..y}`, its items' quotes kept for `_dequote_value`.
     `_expand_braces` reads no list holding a blank, which a quoted item may
-    (`{'rm -rf /etc',b}`). Past `_BRACE_SEQ_MAX` words the rest stay as written."""
+    (`{'rm -rf /etc',b}`). Past `_BRACE_SEQ_MAX` words it ends with
+    `_TOO_LARGE`: kept as written, a later item ran unread."""
     if "{" not in word:
         return [word]
     out, todo = [], [word]
     while todo:
         w = todo.pop()
-        span = _brace_list(w) if len(out) + len(todo) < _BRACE_SEQ_MAX else None
+        span = _brace_list(w)
+        if span is not None and len(out) + len(todo) >= _BRACE_SEQ_MAX:
+            # Truncated, a later item went unread (XERK-1657 QA): the list
+            # is too large to read, which `_for_word_lines` denies.
+            return [*out, w, *todo, _TOO_LARGE]
         if span is None:
             out.append(w)
             continue
@@ -2428,10 +2433,16 @@ def _replace_op(value: str, op: str, pat: str, rep: str) -> str:
 
 
 def _decode_ansi_c(command: str) -> str:
-    """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token."""
+    """`$'\\x2fetc'` → `/etc`, re-quoted so it stays one token. Not a `$`
+    inside `'…'`: there the `'` after it CLOSES the string, so `'$''v'` is
+    `$v`; decoded, it lost the `$` (XERK-1657 QA)."""
+    states = _quote_states(command) if "'$'" in command or "'$\\" in command else []
 
     def rep(m: "re.Match[str]") -> str:
         if len(m.group(1)) % 2:
+            return m.group(0)
+        at = m.start() + len(m.group(1))
+        if states and states[at] == "'":
             return m.group(0)
         try:
             return m.group(1) + shlex.quote(m.group(2).encode().decode("unicode_escape"))
@@ -2891,6 +2902,17 @@ def _dequote_value(value: str) -> str:
             i = m.end()
             continue
         ch = value[i]
+        if ch == "$" and value.startswith("'", i + 1):
+            # `$'…'` is its ANSI-C decoded text (XERK-1657 QA: `f(){ $1; };
+            # f $'rm …'` bound `$rm …`).
+            m = re.compile(r"\$'((?:[^'\\]|\\.)*)'", re.S).match(value, i)
+            if m:
+                try:
+                    out.append(m.group(1).encode().decode("unicode_escape"))
+                except (UnicodeDecodeError, UnicodeEncodeError):
+                    out.append(m.group(1))
+                i = m.end()
+                continue
         if ch == "$" and value.startswith('"', i + 1):
             # `$"…"` is a locale string: the `"…"` with no `$` (XERK-1657).
             # Kept, `for v in a $"rm …"` bound `$rm …`, a name read empty.
@@ -5701,6 +5723,10 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForP
             # script, and read per word a 10 KB Python heredoc was too
             # large, its words cut out of their quoting too deep (QA).
             continue
+        if _TOO_LARGE in words:
+            if _budget is not None:
+                _budget["capped"] = True
+            return [], True
         read.append((name, nth[name], start, end, list(dict.fromkeys(words))))
     picks = [(((name, k),), ((start, end, word),))
              for name, k, start, end, words in read for word in words]
@@ -5739,7 +5765,11 @@ def _glued_name_pairs(command: str, names: set[str]) -> set[frozenset[str]]:
     if len(names) < 2:
         return set()
     pairs = set()
-    for run in re.finditer(r"[^\s;|&<>()]*\$[^\s;|&<>()]*\$[^\s;|&<>()]*", command):
+    # Runs first, then the uses in each: one regex spanning two `$`s
+    # backtracked quadratically over a long blank-free run (XERK-1657 QA).
+    for run in re.finditer(r"[^\s;|&<>()]+", command):
+        if run.group(0).count("$") < 2:
+            continue
         used = {u for u in re.findall(r"\$['\"]*\{?!?['\"]*([A-Za-z_]\w*)", run.group(0))
                 if u in names}
         pairs.update(frozenset(p) for p in itertools.combinations(sorted(used), 2))
@@ -6349,7 +6379,7 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
         if raw:
             if state == "'":
                 return m.group(0)  # the function's shell never expands it
-            if not state:
+            if not state and not _in_assignment_word(script, m.start()):
                 # An unquoted use word-splits its value: `f(){ $1; }; f 'rm
                 # -rf /etc'` runs `rm` (XERK-1657). A quoted word is its text
                 # unquoted: plain text spliced as a `$x` value is, and one
@@ -6376,6 +6406,26 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
         return out
 
     return _POSITIONAL_RE.sub(rep, script)
+
+
+_ASSIGN_HEAD_RE = re.compile(r"[A-Za-z_]\w*(?:\[[^]]*\])?\+?=")
+
+
+# A `$` and the name it expands split by quotes (`'$'v`, `"$"'v'`, `\$\v`):
+# only an `eval`'s join makes it a use (XERK-1657).
+_QUOTE_SPLIT_USE_RE = re.compile(r"\$(?:['\"\\]+)\{?[A-Za-z_]")
+
+
+def _in_assignment_word(text: str, pos: int) -> bool:
+    """Whether ``pos`` sits in an assignment word (`x=$1`, `local x=a$1`) or a
+    `case` word, where bash never splits an expansion: escaped there,
+    `f(){ x=$1; $x; }; f 'rm …'` read `x=rm` (XERK-1657 QA)."""
+    start = pos
+    while start and text[start - 1] not in " \t\n;&|()`":
+        start -= 1
+    if _ASSIGN_HEAD_RE.match(text, start):
+        return True
+    return text[:start].rstrip().endswith(("case", "[["))
 
 
 def _shifted(args: list, text: str, every: bool = False) -> list[list]:
@@ -7350,7 +7400,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 # ...with the line's values, where the join rebuilt a use the
                 # line's own splice never saw: `eval '$'v`, `eval "$"v` run $v
                 # (XERK-1657). The re-parse sees only this text, not the line.
-                if "$" in script and raw_vals:
+                if raw_vals and _QUOTE_SPLIT_USE_RE.search(raw):
                     bound = _substitute_vars(script, raw_vals)
                     if bound != script:
                         out.extend(_expand_segments(bound, depth + 1, every_cd))
