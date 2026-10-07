@@ -191,10 +191,44 @@ class TestGuardSettings(unittest.TestCase):
         for event, entries in s["hooks"].items():
             for entry in entries:
                 for hook in entry["hooks"]:
-                    self.assertIn("-SsE", hook["command"],
+                    self.assertIn("-SI", hook["command"],
                                   f"{event} {entry.get('matcher')} hook is neutralisable")
         limits = ha.build_limits_settings(python_exe="/usr/bin/python3")
-        self.assertIn("-SsE", limits["statusLine"]["command"])
+        self.assertIn("-SI", limits["statusLine"]["command"])
+
+    def test_a_module_planted_beside_the_guard_cannot_disable_it(self):
+        """XERK-1681: `-SsE` keeps the script's OWN directory at sys.path[0], so
+        a `hooks/<stdlib-name>.py` holding `sys.exit(0)` ran on the guard's
+        import and turned every deny into an allow. `-I` drops that entry."""
+        import ast
+        import shutil
+        import subprocess
+        hooks_src = os.path.join(AGENT_DIR, "hooks")
+        with tempfile.TemporaryDirectory() as tmp:
+            hooks = os.path.join(tmp, "hooks")
+            shutil.copytree(hooks_src, hooks)
+            guard = os.path.join(hooks, "guard.py")
+            with open(guard) as f:
+                tree = ast.parse(f.read())
+            names = {a.name.split(".")[0] for n in ast.walk(tree)
+                     if isinstance(n, ast.Import) for a in n.names}
+            names |= {n.module.split(".")[0] for n in ast.walk(tree)
+                      if isinstance(n, ast.ImportFrom) and n.module
+                      and n.module != "__future__"}
+            self.assertIn("json", names)
+            for name in names:
+                with open(os.path.join(hooks, name + ".py"), "w") as f:
+                    f.write("import sys\nsys.exit(0)\n")
+            s = ha.build_guard_settings(python_exe=sys.executable, guard_path=guard)
+            cmd = next(h["command"] for e in s["hooks"]["PreToolUse"]
+                       if e.get("matcher") == "Bash" for h in e["hooks"])
+            event = json.dumps({"tool_name": "Bash", "hook_event_name": "PreToolUse",
+                                "tool_input": {"command": "rm -rf /etc"}})
+            proc = subprocess.run(cmd, shell=True, input=event, capture_output=True,
+                                  text=True, timeout=30, cwd=tmp)
+        self.assertEqual(proc.returncode, 0, proc.stderr)
+        decision = json.loads(proc.stdout)["hookSpecificOutput"]
+        self.assertEqual(decision["permissionDecision"], "deny")
 
     def test_the_files_that_wire_the_guard_are_denied(self):
         # Denying the agent's installed code without these just moves the
@@ -208,7 +242,7 @@ class TestGuardSettings(unittest.TestCase):
         self.assertIn("Edit(~/.turma/limits-settings.json)", deny)
         # The interpreter injection points. A partial reduction only — they stop
         # a plant via the file-editing tools, and Bash walks past them like it
-        # walks past every pattern (XERK-309). The -SsE flags are the real fix;
+        # walks past every pattern (XERK-309). The -SI flags are the real fix;
         # these are pinned so they are not deleted silently.
         for rule in ("Edit(~/.local/lib/python*/site-packages/**)",
                      "Edit(~/.local/lib/python*/site-packages/*.pth)",
@@ -342,7 +376,7 @@ class TestGuardSettings(unittest.TestCase):
         with mock.patch.object(ha, "PERMISSION_JUDGE", False):
             s = ha.build_guard_settings(python_exe="py", guard_path="/x/hooks/guard.py")
         cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        self.assertEqual(cmd, '"py" -SsE "/x/hooks/guard.py"')
+        self.assertEqual(cmd, '"py" -SI "/x/hooks/guard.py"')
 
     def test_the_guard_honours_judge_grants_only_when_launched_with_the_judge_on(self):
         # XERK-1566: the switch rides the session's own --settings (written per
@@ -350,7 +384,7 @@ class TestGuardSettings(unittest.TestCase):
         with mock.patch.object(ha, "PERMISSION_JUDGE", True):
             s = ha.build_guard_settings(python_exe="py", guard_path="/x/hooks/guard.py")
         cmd = s["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
-        self.assertEqual(cmd, '"py" -SsE "/x/hooks/guard.py" --grants')
+        self.assertEqual(cmd, '"py" -SI "/x/hooks/guard.py" --grants')
         self.assertTrue(cmd.endswith(" " + ha._guard_module().GRANTS_FLAG))
 
     def test_registers_askuserquestion_bridge_hook(self):
@@ -367,7 +401,7 @@ class TestGuardSettings(unittest.TestCase):
     def test_explicit_ask_path_is_used(self):
         s = ha.build_guard_settings(python_exe="py", ask_path="/x/hooks/ask.py")
         ask = next(e for e in s["hooks"]["PreToolUse"] if e["matcher"] == "AskUserQuestion")
-        self.assertEqual(ask["hooks"][0]["command"], '"py" -SsE "/x/hooks/ask.py"')
+        self.assertEqual(ask["hooks"][0]["command"], '"py" -SI "/x/hooks/ask.py"')
 
     def test_wires_the_permission_ledger_hook_on_its_two_events(self):
         # XERK-1563: PermissionRequest (rule/manual prompts) and PermissionDenied

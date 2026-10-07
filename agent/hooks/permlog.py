@@ -47,7 +47,7 @@ symlink planted at the log path — exit 0, no output. A ledger hook that wedged
 or failed a prompt would cost more than the row it lost. Every open is
 ``O_NONBLOCK`` + regular-file only for the same reason ``guard.py``'s reads are.
 
-Stdlib only, run as ``python3 -SsE``: invoked by absolute path, so nothing beyond
+Stdlib only, run as ``python3 -SI``: invoked by absolute path, so nothing beyond
 the standard library can be assumed importable.
 """
 

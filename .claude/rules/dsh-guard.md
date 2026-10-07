@@ -12,7 +12,7 @@ second runtime with a different enforcement model; [F] maps that same deny polic
 ## Where the policy lives — NOT duplicated
 
 - **Deny POLICY is `guard.py` + `fileguard.py`, shared by both runtimes.** `agent/dsh/guard/policy.mjs`
-  SHELLS OUT to those scripts (`python3 -SsE <hook>`, same PreToolUse JSON on stdin). **Never port
+  SHELLS OUT to those scripts (`python3 -SI <hook>`, same PreToolUse JSON on stdin). **Never port
   that logic into TS** — the mirror multiplication `docs/dsh-adr.md` (D3) exists to avoid.
 - **Credential/roster path globs are ONE list too.** `build_dsh_guard_config()` reads the SAME rule
   set `build_guard_settings()` produces, converting `Read(...)`/`Edit(...)` into `denyWrite`/

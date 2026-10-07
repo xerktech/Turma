@@ -246,7 +246,7 @@ control socket. The ONE net-new module is the projection tail.
     it is invisible to Turma (`paneBusy` False, `panePrompt`/`question` None, reads idle) AND it
     name-collides with the MCP tool, the built-in winning. So `_qwen_settings` **DISABLES the built-in
     via `tools.exclude:["ask_user_question"]`** (`QWEN_NATIVE_ASK_TOOL`) and REGISTERS a replacement
-    via MCP: `mcpServers."turma-ask"` runs `python3 -SsE agent/qwen/ask_mcp.py`, a stdlib stdio
+    via MCP: `mcpServers."turma-ask"` runs `python3 -SI agent/qwen/ask_mcp.py`, a stdlib stdio
     JSON-RPC server exposing `ask_user_question({question, options[], multiSelect, header?})`. On a
     call it writes the EXACT `QUESTIONS_DIR/<sid>.req.json` shape `ask.py`/`_hook_question` use and
     BLOCKS for `<sid>.ans.json` — so the EXISTING `answer_question` path (the else-branch, dropping
@@ -361,7 +361,7 @@ WHO writes the native log into the store.
 qwen's PreToolUse-hook model IS Claude's, so it reuses the shared deny policy directly. The deny
 POLICY is NOT duplicated: destructive/policy/attribution shell classification (`guard.py`) and the
 "everything under ~/.claude except the two memory trees" predicate (`fileguard.py`) have ONE home,
-shelled out to `python3 -SsE <hook>` exactly as Claude and dsh do.
+shelled out to `python3 -SI <hook>` exactly as Claude and dsh do.
 
 - **The one mismatch qwen adds is TOOL NAMES, so a thin SHIM bridges it** (`agent/qwen/guard/shim.py`).
   `guard.py` keys on `tool_name=="Bash"` and `fileguard.py` on `Write|Edit|…`; a qwen

@@ -52,7 +52,7 @@ class TestBuildQwenGuardConfig(unittest.TestCase):
         self.assertEqual(len(pre), 1)
         hook = pre[0]["hooks"][0]
         self.assertEqual(hook["type"], "command")
-        self.assertIn("-SsE", hook["command"])
+        self.assertIn("-SI", hook["command"])
         self.assertIn("shim.py", hook["command"])
         self.assertIn("/tmp/qwen-guard-test.json", hook["command"])
         # G0 gotcha: qwen's timeout is MILLISECONDS, and a too-small value
@@ -150,7 +150,7 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
         cfg = config_path if config_path is not None else self.config_path
         payload = json.dumps(event) if event is not None else "{ not json"
         proc = subprocess.run(
-            [sys.executable, "-SsE", self.shim, cfg],
+            [sys.executable, "-SI", self.shim, cfg],
             input=payload, capture_output=True, text=True, timeout=30)
         reason = None
         out = (proc.stdout or "").strip()
@@ -329,7 +329,7 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
         self.assertIsNotNone(reason)
 
     def test_no_config_arg_fails_closed(self):
-        proc = subprocess.run([sys.executable, "-SsE", self.shim],
+        proc = subprocess.run([sys.executable, "-SI", self.shim],
                               input="{}", capture_output=True, text=True, timeout=30)
         self.assertEqual(proc.returncode, 2)
         self.assertIn("deny", proc.stdout)

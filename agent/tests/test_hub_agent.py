@@ -5636,7 +5636,7 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         popen = self._launch(sm, sess, prompt="hi")
         cid = sess["claudeSessionId"]
         args, kwargs = popen.call_args
-        self.assertEqual(args[0], ["python3", "-SsE", ha.qwen_peer_inbox_path()])
+        self.assertEqual(args[0], ["python3", "-SI", ha.qwen_peer_inbox_path()])
         env = kwargs["env"]
         self.assertEqual(env["TURMA_SESSION_ID"], "q1")
         self.assertEqual(env["TURMA_CLAUDE_SESSION_ID"], cid)
@@ -36578,7 +36578,7 @@ class TestQwenSessionArms(ManagerMixin, unittest.TestCase):
         settings = sm._qwen_settings({"id": "q1"})
         srv = settings["mcpServers"]["turma-ask"]
         self.assertEqual(srv["command"], "python3")
-        self.assertIn("-SsE", srv["args"])
+        self.assertIn("-SI", srv["args"])
         self.assertTrue(srv["args"][-1].endswith(os.path.join("qwen", "ask_mcp.py")))
         self.assertEqual(srv["env"]["TURMA_SESSION_ID"], "q1")
         self.assertEqual(srv["env"]["TURMA_QUESTIONS_DIR"], ha.QUESTIONS_DIR)

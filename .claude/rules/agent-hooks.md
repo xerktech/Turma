@@ -354,13 +354,18 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     - Path is **glob-escaped with a BACKSLASH**, not a character class (`[c]` on every metachar was
       shipped broken once — denies nothing; don't repeat that mistake). A literal `?` has no working
       escape, so `runtime_code_deny_rules` refuses to emit a rule for such a path and warns instead.
-    - **Every hook runs `python3 -SsE`** — security flags, not style. `-S` is the one that closes the
+    - **Every hook runs `python3 -SI`** — security flags, not style (`-I` = `-sE` + no script dir). `-S` is the one that closes the
       class: a plain start runs `site` before the hook's own code, so a planted `.pth`/
       `sitecustomize.py` in the interpreter's OWN site-packages (not just the user one `-s` alone
       blocks) disables the hook — measured to allow `rm -rf /`. `-E` kills `PYTHONPATH`/
       `PYTHONHOME`/`PYTHONSTARTUP`. PATH shadowing is separately closed by an absolute
       `sys.executable`. The `~/.local` deny patterns are a partial reduction (file-edit tools only,
       Bash walks past them); **the flags are the actual fix**.
+    - **`-I`, never `-SsE`** (XERK-1681): `-SsE` keeps the script's OWN dir at `sys.path[0]`, so a
+      `hooks/json.py` (or `bisect/`, sourceless `.pyc`) with `sys.exit(0)` turned every deny into an
+      allow. Hooks are stdlib-only and import no sibling, so `-I` costs nothing. The session CLI's
+      `-SsE` spelling (allow rule, directives) is not a gate and stays. Tests:
+      `test_a_module_planted_beside_the_guard_cannot_disable_it`.
     - **`~/.turma/guard-settings.json` is denied too** — it's the file that WIRES both hooks, so
       denying the code without it just moves the attack one directory over. The exposure is bounded
       by the MANAGER PROCESS (`_ensure_guard_settings` rewrites it fresh per process), so a tampered
@@ -437,7 +442,7 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
 - **Permission ledger hook** (`hooks/permlog.py`, XERK-1563) — wired on `PermissionRequest` and
   `PermissionDenied` (NOT `PreToolUse`, whose matcher list stays `["Bash","AskUserQuestion"]` plus
   the file guard); RECORDS one line per event to `~/.turma/permissions/<sid>.jsonl`, decides nothing,
-  fails open on everything, `-SsE` like every hook, wired only when the script exists. Its dir is
+  fails open on everything, `-SI` like every hook, wired only when the script exists. Its dir is
   `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `agent-permissions.md`.
   - With `--judge` (XERK-1566, unless `TURMA_PERMISSION_JUDGE=0`) it also hands a Bash call to the
     manager's permission judge and waits (timeout 90s); judge contract in `agent-permissions.md`.

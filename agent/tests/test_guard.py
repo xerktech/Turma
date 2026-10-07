@@ -4642,7 +4642,7 @@ class TestPrSummary(unittest.TestCase):
             with self.subTest(cmd=cmd[:50]):
                 ev = json.dumps({"tool_name": "Bash", "tool_input": {"command": cmd},
                                  "cwd": self.repo, "hook_event_name": "PreToolUse"})
-                out = subprocess.run([sys.executable, "-SsE", hook], input=ev,
+                out = subprocess.run([sys.executable, "-SI", hook], input=ev,
                                      capture_output=True, text=True, timeout=30).stdout
                 self.assertEqual("deny" if '"deny"' in out else "allow", want)
 
@@ -5090,7 +5090,7 @@ class TestJudgeGrants(unittest.TestCase):
                **(env_extra or {})}
         env.pop("TURMA_PERMISSION_JUDGE", None)
         env.update(env_extra or {})
-        proc = subprocess.run([sys.executable, "-SsE", GUARD_PATH]
+        proc = subprocess.run([sys.executable, "-SI", GUARD_PATH]
                               + ([guard.GRANTS_FLAG] if grants else []),
                               input=json.dumps({"tool_name": "Bash",
                                                 "tool_input": {"command": command}}),
