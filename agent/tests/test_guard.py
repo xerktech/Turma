@@ -2584,6 +2584,16 @@ class TestScriptChannels(unittest.TestCase):
                     # QA: an extglob op on HOME reads as the root.
                     "rm -rf ${HOME%+(?)}", "rm -rf \"${HOME/+(?)/}\"",
                     "rm -rf \"${HOME%+(?)}\"/.ssh", "rm -rf ~/../../etc${HOME#+(?)}",
+                    # QA (merge): every reading of a HOME op is spliced, so
+                    # the text glued after it stays with each.
+                    "shopt -s extglob; rm -rf ${HOME##@(*)}/etc", "rm -rf ${HOME//+(?)/}/usr",
+                    "${HOME##@(*)}eval 'rm -rf /etc'", "a=X; rm -rf \"/e${a%@(X)}tc\"",
+                    # QA (merge): positionals read extglob both ways, raw too.
+                    "f(){ ${1#@(xx)}; }; f 'xxrm -rf /etc'",
+                    "set -- 'xxrm -rf /etc'; ${1#@(xx)}",
+                    "set -- 'xxrm -rf /etc'; eval \"${1##+(x)}\"",
+                    "bash -c '${0#@(xx)}' 'xxrm -rf /etc'",
+                    "sh -c 'eval \"${1##+(x)}\"' _ 'xxrm -rf /etc'",
                     # QA delta: a carrier reading ONE argument or word gets
                     # every reading, not just the marker.
                     "shopt -s extglob; a='xxrm -rf /etc'; bash -c \"${a##+(x)}\"",
@@ -2608,6 +2618,11 @@ class TestScriptChannels(unittest.TestCase):
                     "a=xxrm; echo ${a#@(xx)}"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cmd in ("rm -rf ${HOME%@(t)}t/.ssh", "rm -rf ${HOME%@(t)}t",
+                        "cd ${HOME%+(root)} && rm -rf etc"):
+                with self.subTest(cmd=cmd, home="/root"):
+                    self.assertDenied(cmd)
         # A group whose matching blows up stops at its step budget, and deep
         # nesting is unreadable, never a RecursionError (XERK-1664 QA).
         star = "|".join(["*"] * 200)
@@ -5346,10 +5361,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # past `_MAX_HOME_OPS` the target reads as `/` instead of being timed.
         with mock.patch.dict(os.environ, {"HOME": "/root"}):
             word = "${HOME%/}" * (guard._MAX_HOME_OPS + 1)
-            self.assertEqual(guard._home_reading(word), "/")
-            self.assertEqual(guard._home_reading("${HOME[0]}/x"), None)
-            self.assertEqual(guard._home_reading("$HOMEDIR/x"), None)
-            self.assertEqual(guard._home_reading("${HOME}/../etc"), "/etc")
+            self.assertEqual(guard._home_readings(word), ["/"])
+            self.assertEqual(guard._home_readings("${HOME[0]}/x"), [])
+            self.assertEqual(guard._home_readings("$HOMEDIR/x"), [])
+            self.assertEqual(guard._home_readings("${HOME}/../etc"), ["/etc"])
 
     def test_leading_names_are_one_run_and_scan_linearly(self):
         # XERK-1639: every name in the run is read empty, not just the first,

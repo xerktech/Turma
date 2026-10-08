@@ -4976,12 +4976,12 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
         elif name == "HOME" and op and op.group(1) in _VAR_DEFAULT_OPS and _HOME_KEPT[0]:
             # The reading where HOME is set, as it is in every shell an agent
             # runs: spliced, `"${HOME:-/tmp}"/*` read `/tmp/*` and hid the
-            # home wipe (XERK-1656). Kept, `_home_reading` judges it.
+            # home wipe (XERK-1656). Kept, `_home_readings` judges it.
             return "${" + name + rest + "}", end
         elif (name == "HOME" and rest and not (op and op.group(1) in _VAR_DEFAULT_OPS)
               and not re.search(r"[$`]", _HOME_USE_RE.sub("", rest))
               and not ("$" in rest and re.search(r"['\"]", rest))
-              and (home := _home_reading("${HOME" + rest + "}")) is not None):
+              and (homes := _home_readings("${HOME" + rest + "}"))):
             # HOME is set where an agent runs, so its op reads the session's
             # HOME: kept as written, `${HOME:+r}m -rf /` hid the program and
             # `rm ${HOME:+-rf} /` the flag (XERK-1686). A reading inside the
@@ -4991,8 +4991,10 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # `$((…))`/`$(…)` empty, so `${HOME:$((0)):0}` read `$HOME` (QA).
             # Nor a quoted `$HOME` in it: the quotes stay, so `"/root"/x`
             # never mapped back and `${HOME:+"$HOME"/x}` cleanups denied (QA).
+            # Several (an extglob op, XERK-1664) splice as an op's readings
+            # do: one alone dropped the text glued after it (`${HOME##@(*)}/etc`).
             state = states[m.start()] if m.start() < len(states) else ""
-            out = _splice_readings([home], state)
+            out = _splice_readings(homes, state)
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
             out = default(op.group(2), m.start())
         else:
@@ -10530,7 +10532,8 @@ def _cd_targets(text: str, inherited: tuple[str, ...],
             args = m.group(2).split()
         ops = [a for a in args if not (a.startswith("-") and len(a) > 1)]
         # A bare `cd` goes home; `cd ~/..` leaves it (XERK-1656).
-        targets = [_norm_path(_home_reading(ops[0]) or ops[0]) if ops else "~"]
+        targets = ([_norm_path(h) for h in _home_readings(ops[0])] or [_norm_path(ops[0])]
+                   if ops else ["~"])
         # `cd -` goes to $OLDPWD, and a relative name is looked up in each
         # $CDPATH entry first: `CDPATH=/; cd etc` is `/etc` (XERK-1662). Only
         # values the line itself assigns; an inherited one stays unknown.
@@ -10803,8 +10806,8 @@ def _is_home_ssh(tok: str, home_read: bool = True) -> bool:
     dropped = _trailing_unset_dropped(tok)
     if dropped is not None and _is_home_ssh(dropped):
         return True
-    home = _home_reading(tok.strip().strip('"').strip("'")) if home_read else None
-    if home is not None and _is_home_ssh(home, home_read=False):
+    if home_read and any(_is_home_ssh(h, home_read=False)
+                         for h in _home_readings(tok.strip().strip('"').strip("'"))):
         return True
     parent, _, leaf = _norm_path(tok).lower().rstrip("/").rpartition("/")
     return leaf == ".ssh" and (parent in _HOME_TOKENS or bool(_HOME_USER_RE.match(parent))
@@ -10971,7 +10974,7 @@ def _session_home() -> str | None:
 
 
 # Which reading of an extglob op on HOME `_home_expanded` takes, and the most
-# readings one had (`_home_reading` tries each, XERK-1664).
+# readings one had (`_home_readings` tries each, XERK-1664).
 _HOME_EXT_PICK = [0]
 _HOME_EXT_N = [1]
 
@@ -11060,21 +11063,24 @@ def _user_home(name: str) -> str | None:
     return home if home.startswith("/") else None
 
 
-def _home_reading(raw: str) -> str | None:
-    """`_home_one_reading`, once per reading of an extglob op on HOME
-    (XERK-1664): the first that names a protected path, else extglob off.
-    Read as `/` instead, `"${HOME%+(?)}"/.ssh` lost its `/.ssh`."""
+def _home_readings(raw: str) -> list[str]:
+    """`_home_one_reading` once per reading of an extglob op on HOME
+    (extglob off first, XERK-1664); empty when there is none. Every caller
+    judges them ALL: one picked by a single judge dropped what another
+    sees, and read as `/` a glued `/.ssh` was lost."""
     _HOME_EXT_PICK[0], _HOME_EXT_N[0] = 0, 1
-    first = _home_one_reading(raw)
+    out = []
     try:
-        for pick in range(1, _HOME_EXT_N[0]):
+        pick = 0
+        while pick < _HOME_EXT_N[0]:
             _HOME_EXT_PICK[0] = pick
             got = _home_one_reading(raw)
-            if got is not None and _dangerous_target(got, home_read=False):
-                return got
+            if got is not None and got not in out:
+                out.append(got)
+            pick += 1
     finally:
         _HOME_EXT_PICK[0], _HOME_EXT_N[0] = 0, 1
-    return first
+    return out
 
 
 def _home_one_reading(raw: str) -> str | None:
@@ -11137,9 +11143,9 @@ def _dangerous_target(tok: str, home_read: bool = True, keep_last: bool = True) 
     # as `/`; `_unset_names_dropped` already drops the trailing names it may.
     if empty is not None and _is_dangerous_path(empty, trailing=False):
         return f"({tok!r}, which is {_norm_path(empty)!r} when its unknown names are unset)"
-    home = _home_reading(raw) if home_read else None
-    if home is not None and _dangerous_target(home, home_read=False, keep_last=keep_last):
-        return f"({tok!r}, which is {home!r} with the home expanded)"
+    for home in _home_readings(raw) if home_read else ():
+        if _dangerous_target(home, home_read=False, keep_last=keep_last):
+            return f"({tok!r}, which is {home!r} with the home expanded)"
     return None
 
 
