@@ -4381,10 +4381,10 @@ class TestExpansionBudget(unittest.TestCase):
                     f"for c in '{R}' x; do python3 -c 'import sys' \"$c\"; done", "for v in a b; do echo \"$v\" > s.txt; done; sh s.sh"):
             self.assertIsNone(self.check(cmd), cmd)
         # Glued names are found in linear time on a long blank-free run (QA).
-        self.assertTrue(guard._glued_name_pairs("x" * 60000 + "$a" + "$b" * 3, {"a", "b"}))
+        self.assertTrue(guard._glued_name_groups("x" * 60000 + "$a" + "$b" * 3, {"a", "b"}))
         # Only uses touching (quotes between at most) are a product: a path
         # `$d/$f` is read per list, as on main (QA: 2x on real loops).
-        self.assertEqual(guard._glued_name_pairs('$d/$f "$a""$b" $c\'$\'e', set("abcdef")),
+        self.assertEqual(guard._glued_name_groups('$d/$f "$a""$b" $c\'$\'e', set("abcdef")),
                          {frozenset("ab"), frozenset("ce")})
         # Past its cap a brace list's items are each read, never cut short or
         # refused (a long brace in heredoc text nothing runs, QA).
@@ -4402,6 +4402,61 @@ class TestExpansionBudget(unittest.TestCase):
         with mock.patch.object(guard, "_MAX_FOR_PRODUCT", 0):
             self.assertIsNone(self.check(
                 f"for a in {words}; do for b in {words}; do echo $a $b; done; done"))
+
+    def test_glued_loop_values_through_three_lists_names_or_calls(self):
+        # XERK-1692: each ran `rm -rf /etc` while the guard allowed it.
+        A, B = "for a in x r; do for b in y m; do", "done; done"
+        for cmd in ("for a in x r; do for b in y m; do for c in z ' -rf /etc'; do $a$b$c; "
+                    "done; done; done",
+                    f"{A} c=$a; $c$b -rf /etc; {B}",
+                    f"{A} c=$a; d=$c; $d$b -rf /etc; {B}",
+                    f"f(){{ $1$2 -rf /etc; }}; {A} f $a $b; {B}",
+                    f"{A} eval '$'a'$'b' -rf /etc'; {B}",
+                    f"{A} printf -v c '%s%s' $a $b; $c -rf /etc; {B}",
+                    # QA: a quoted or substituted value, a here-string read,
+                    # `set`, a `shift`ed call.
+                    f'{A} c=" $a"; $c$b -rf /etc; {B}', f"{A} c=$(echo $a); $c$b -rf /etc; {B}",
+                    f"{A} c=`echo $a`; $c$b -rf /etc; {B}", f"{A} read c <<< $a; $c$b -rf /etc; {B}",
+                    f"{A} set -- $a $b; $1$2 -rf /etc; {B}",
+                    f"f(){{ shift; $1$2 -rf /etc; }}; {A} f x $a $b; {B}"):
+            with self.subTest(cmd=cmd):
+                reason = self.check(cmd)
+                self.assertIsNotNone(reason)
+                self.assertNotIn(self.TOO_LARGE, reason)
+        for cmd in (f"{A} c=$a; echo $c$b; {B}", f"f(){{ echo $1$2; }}; {A} f $a $b; {B}",
+                    f"{A} c=$a; echo $c $b; {B}"):
+            self.assertIsNone(self.check(cmd), cmd)
+        self.assertEqual(guard._glued_name_groups("$a$b$c", set("abc")), {frozenset("abc")})
+        self.assertEqual(guard._glued_name_groups("c=$a; $c$b", set("ab")), {frozenset("ab")})
+        self.assertEqual(guard._glued_name_groups("c=$a; $c $b", set("ab")), set())
+        # A loop name holds its list word, whatever else assigns it (replay).
+        self.assertEqual(guard._glued_name_groups(
+            "v=$1; for v in a b; do echo rf-$v; done; for d in 'x y' 'z w'; do set -- $d; done",
+            set("vd")), set())
+        self.assertEqual(guard._glued_name_groups("f(){ $1$2; }; f $a $b", set("ab")),
+                         {frozenset("ab")})
+        # Sources settle along any chain order, and a run of unclosed `$(`
+        # values stays linear.
+        chain = " ".join(f"l{i}=$l{i + 1};" for i in range(40))
+        self.assertEqual(guard._glued_name_groups(f"{chain} l40=$a; $l0$b", set("ab")),
+                         {frozenset("ab")})
+        for text in ("c=$(" * 40000, "c=`" * 40000, "read " + "x " * 40000 + "<<<"):
+            t = time.monotonic()
+            guard._glued_name_groups(text + " $a$b", set("ab"))
+            self.assertLess(time.monotonic() - t, 3, text[:10])
+        # The same names looped again and again (a rig's copies): past the cap
+        # each glued word reads only the loops binding it, never too large.
+        three = "for a in x r; do for b in y m; do for c in z w; do echo $a$b$c; done; done; done; "
+        self.assertIsNone(self.check(three * 4, limit=20))
+        reason = self.check(three * 3 + "for a in x r; do for b in y m; do for c in z ' -rf /etc'; "
+                            "do $a$b$c; done; done; done", limit=20)
+        self.assertIsNotNone(reason)
+        self.assertNotIn(self.TOO_LARGE, reason)
+        # An N-way product stays inside `_MAX_FOR_PRODUCT`: 7^3 is too large.
+        words = " ".join(f"w{i}" for i in range(7))
+        self.assertIn(self.TOO_LARGE, self.check(
+            f"for a in {words}; do for b in {words}; do for c in {words}; do echo $a$b$c; "
+            "done; done; done") or "")
 
     def test_long_for_lists_are_read_per_word_fast(self):
         # XERK-1647: a reading per list word drops the rest of the list, so

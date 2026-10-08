@@ -7505,17 +7505,48 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForP
         read.append((name, nth[name], start, end, list(dict.fromkeys(words))))
     picks = [(((name, k),), ((start, end, word),))
              for name, k, start, end, words in read for word in words]
-    glued = _glued_name_pairs(command, {r[0] for r in read if len(r[4]) > 1})
-    products = 0
-    for a, b in itertools.combinations(read, 2):
-        if a[0] != b[0] and frozenset((a[0], b[0])) in glued and len(a[4]) > 1 < len(b[4]):
-            products += len(a[4]) * len(b[4])
+    where: dict[frozenset[str], list[int]] = {}
+    glued = _glued_name_groups(command, {r[0] for r in read if len(r[4]) > 1}, where)
+    lists: dict[str, list[int]] = {}  # each name's lists, by index into `read`
+    for i, r in enumerate(read):
+        if len(r[4]) > 1:
+            lists.setdefault(r[0], []).append(i)
+    # Largest first: a group inside a kept one is already read by its product.
+    kept: list[frozenset[str]] = []
+    for group in sorted(glued, key=lambda g: (-len(g), sorted(g))):
+        if not any(group <= k for k in kept):
+            kept.append(group)
+
+    def nearest(group: frozenset[str], at: int) -> tuple:
+        # Each name's last list starting before the word: the loop that binds
+        # it there. None before it (a function body read later): all of them.
+        return tuple(tuple(i for i in lists[n] if read[i][2] < at)[-1:] or tuple(lists[n])
+                     for n in sorted(group))
+
+    # Every list of each name against every other's, as two names always
+    # were; past the cap, only the lists binding each glued word, so the same
+    # names looped again and again (eight copies of a test rig) stay readable.
+    for mode in ("all", "near"):
+        combos = dict.fromkeys(
+            combo for group in kept
+            for per in ([tuple(tuple(lists[n]) for n in sorted(group))] if mode == "all"
+                        else dict.fromkeys(nearest(group, at) for at in where[group]))
+            for combo in itertools.product(*per))
+        products = 0
+        for combo in combos:
+            products += math.prod(len(read[i][4]) for i in combo)
             if products > _MAX_FOR_PRODUCT:
-                if _budget is not None:
-                    _budget["capped"] = True
-                return [], True
-            picks += [(((a[0], a[1]), (b[0], b[1])), ((a[2], a[3], x), (b[2], b[3], y)))
-                      for x in a[4] for y in b[4]]
+                break
+        else:
+            break
+    else:
+        if _budget is not None:
+            _budget["capped"] = True
+        return [], True
+    for combo in combos:
+        rs = [read[i] for i in combo]
+        picks += [(tuple((r[0], r[1]) for r in rs), tuple((r[2], r[3], w) for r, w in zip(rs, words)))
+                  for words in itertools.product(*(r[4] for r in rs))]
     for pick, spans in picks:
         line = command
         for start, end, word in sorted(spans, reverse=True):
@@ -7534,28 +7565,112 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForP
     return lines, False
 
 
-def _glued_name_pairs(command: str, names: set[str]) -> set[frozenset[str]]:
-    """Each pair of ``names`` used in one word, as a product of their values
-    may form it (`$a$b`, `${a}a$b`, `$a$z$b`, XERK-1657 QA). Not across a
-    `/` (`$d/$f`): read per path, real loops over directories cost 2x for a
-    shape that forms no program word."""
+def _glued_name_groups(command: str, names: set[str],
+                       where: dict[frozenset[str], list[int]] | None = None) -> set[frozenset[str]]:
+    """Each set of ``names`` whose values one word may join, as a product of
+    their values may form it: used in one word (`$a$b`, `${a}a$b`, `$a$z$b`,
+    `$a$b$c`, XERK-1657 QA), or through a name that holds them (`c=$a; $c$b`,
+    `printf -v c %s%s $a $b; $c`, `f(){ $1$2; }; f $a $b`, XERK-1692;
+    `_glue_sources`). Not across a `/` (`$d/$f`): read per path, real loops
+    over directories cost 2x for a shape that forms no program word. Each
+    group's word starts are added to ``where``."""
     if len(names) < 2:
         return set()
-    pairs = set()
-    last = None
+    src = _glue_sources(command, names)
+    groups: set[frozenset[str]] = set()
+    run: set[str] = set()
+    last = start = None
+
+    def close() -> None:
+        if len(run) > 1:
+            groups.add(frozenset(run))
+            if where is not None:
+                where.setdefault(frozenset(run), []).append(start)
+
     for use in _GLUE_USE_RE.finditer(command):
-        name = use.group(1)
-        if name not in names:
+        got = src.get(use.group(1))
+        if not got:
             continue  # another name may be empty: `$a$z$b`
-        if last is not None and last[0] != name \
-                and re.fullmatch(r"[^\s;|&<>()/]*", command[last[1]:use.start()]):
-            pairs.add(frozenset((last[0], name)))
-        last = (name, use.end())
-    return pairs
+        if last is None or not re.fullmatch(r"[^\s;|&<>()/]*", command[last:use.start()]):
+            close()
+            run, start = set(), use.start()
+        run |= got
+        last = use.end()
+    close()
+    return groups
 
 
-# A use `_glued_name_pairs` reads: `$a`, `${a}`, `'$'a` (an eval joins it).
-_GLUE_USE_RE = re.compile(r"\$['\"]*\{?!?['\"]*([A-Za-z_]\w*)['\"]*\}?")
+def _glue_sources(command: str, names: set[str]) -> dict[str, frozenset[str]]:
+    """Each name mapped to the ``names`` (loop names) its value may hold:
+    a loop name itself; a name assigned a word using one (`c=$a`, `c=" $a"`,
+    `c=$(echo $a)`), rendered or read from one (`printf -v c FMT $a $b`,
+    `read c <<< $a`); a positional `$N` a
+    `set` or a call of a function the line defines passes one in (`f $a $b`;
+    with a `shift` on the line, any later argument too). Lexical and
+    order-blind: an extra source only adds product readings (capped); one
+    missed is a product never read."""
+    def uses(text: str) -> set[str]:
+        return {u.group(1) for u in _GLUE_USE_RE.finditer(text)}
+
+    edges: list[tuple[str, set[str]]] = []
+    for m in _GLUE_ASSIGN_RE.finditer(command):
+        if m.group(1):
+            edges.append((m.group(1), uses(m.group(2))))
+        elif m.group(3):
+            edges.append((m.group(3), uses(m.group(4))))
+        else:
+            got = uses(m.group(6))
+            edges += [(w, got) for w in m.group(5).split() if _GLUE_NAME_RE.fullmatch(w)]
+    if _GLUE_POS_RE.search(command):
+        shifts = bool(_GLUE_SHIFT_RE.search(command))
+        lists = [m.group(1) for m in _GLUE_SET_RE.finditer(command)]
+        funcs = {m.group(1) or m.group(2) for m in _FUNC_NAME_RE.finditer(command)} - {None}
+        if funcs:
+            call_re = re.compile(_CALL_LEAD + r"(?:" + "|".join(map(re.escape, funcs))
+                                 + r")[ \t]+([^;&|\n`)]*)")
+            lists += [m.group(1) for m in call_re.finditer(command)]
+        for text in lists:
+            for k, word in enumerate(_call_words(text)[:9], 1):
+                got = uses(word)
+                # A `shift` moves a later argument down to `$k`.
+                edges += [(str(j), got) for j in (range(1, k + 1) if shifts else (k,))]
+    # A loop name holds its list's word: a `v=$1` elsewhere (a heredoc
+    # script's) made every `rf-$v` a product (replayed false deny).
+    edges = [(t, u) for t, u in edges if u and t not in names]
+    # Propagated along a worklist: a name's sources grow at most once per
+    # loop name, so a chain of any length or order settles in linear work.
+    src: dict[str, frozenset[str]] = {n: frozenset((n,)) for n in names}
+    readers: dict[str, list[int]] = {}
+    for i, (_, used) in enumerate(edges):
+        for u in used:
+            readers.setdefault(u, []).append(i)
+    work = [i for n in names for i in readers.get(n, ())]
+    while work:
+        target, used = edges[work.pop()]
+        before = src.get(target, frozenset())
+        got = before.union(*(src.get(u, ()) for u in used))
+        if got != before:
+            src[target] = got
+            work += readers.get(target, ())
+    return src
+
+
+# A use `_glued_name_groups` reads: `$a`, `${a}`, `'$'a` (an eval joins it),
+# and a positional `$1`.
+_GLUE_USE_RE = re.compile(r"\$['\"]*\{?!?['\"]*([A-Za-z_]\w*|[1-9])['\"]*\}?")
+_GLUE_NAME_RE = re.compile(r"[A-Za-z_]\w*")
+# A value `_glue_sources` follows: `c=WORD` (quoted runs, `$(…)` and
+# backticks in it, each bounded so a run of unclosed `$(` stays linear),
+# `local c=WORD`; `printf -v c` to the end of its command;
+# `read NAMES <<< WORD`. A nameref is not followed (XERK-1722).
+_GLUE_ASSIGN_RE = re.compile(
+    r"(?<![\w$])([A-Za-z_]\w*)\+?=((?:\"[^\"]*\"|'[^']*'|\$\([^)\n]{0,256}\)|`[^`\n]{0,256}`|[^\s\"'`;&|])*)"
+    r"|(?<![\w.-])printf[ \t]+-v[ \t]*['\"]?([A-Za-z_]\w*)['\"]?([^;&|\n]*)"
+    r"|(?<![\w.-])read((?:[ \t]+[^\s;&|<>]+)*)[ \t]*<<<[ \t]*([^\s;&|]+)")
+_GLUE_POS_RE = re.compile(r"\$\{?[1-9]")
+_GLUE_SHIFT_RE = re.compile(r"(?<![\w.-])shift\b")
+# A `set` binding positionals: `set -- WORDS`, `set WORDS`.
+_GLUE_SET_RE = re.compile(r"(?<![\w.-])set[ \t]+(?:-[\w-]*[ \t]+)*([^;&|\n`)]*)")
 
 
 def _expand_readings(command: str) -> list[tuple[list[str], str]]:

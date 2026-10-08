@@ -100,11 +100,27 @@ paths:
     `_TOO_LARGE` (a deny) — e.g. ~200 loops on one line. Characters, never a wall clock: that
     denied a real command only on a busy host.
   - Two lists used in one word (`$a$b`, `${a}a$b`, `$a$z$b`, `$a'$'b`) are also read as their
-    PRODUCT (XERK-1657, `_glued_name_pairs`): one at a time, `$a$b` never formed `rm`. Not
+    PRODUCT (XERK-1657, `_glued_name_groups`): one at a time, `$a$b` never formed `rm`. Not
     across a `/` (`$d/$f`): that doubled real directory loops' cost (QA); quotes-only glue let
     `${a}a$b` and an empty `$z` between through (QA). Past
     `_MAX_FOR_PRODUCT` readings the line is too large (60×60 words took 8 s). Unglued nested lists
-    stay one at a time; three glued names are read pairwise only (residual).
+    stay one at a time.
+  - Any NUMBER of glued names is one product (`$a$b$c`, XERK-1692), and glue reaches through a
+    name holding a loop name (`_glue_sources`): `c=$a`, `c=" $a"`, `c=$(echo $a)`, `printf -v`,
+    `read c <<< $a`, and `$1$2` bound by `set --` or a call (`shift` on the line: any later
+    argument). Pairwise, three names never formed the word. Namerefs are XERK-1722.
+    - The product's reading count sums over groups, so an N-way loop stays inside
+      `_MAX_FOR_PRODUCT` (7³ is too large, a deny). A group inside a larger one is skipped.
+    - Every list of each name is read against every other's (as pairs were on main); only past
+      the cap does each glued word fall back to its nearest preceding list per name. All-only, a
+      rig repeating the same three loops went too large (replay); near-only can miss a word
+      read later than its loops (a function body).
+    - A loop name keeps its list word: an edge targeting one is dropped (`v=$1` in a heredoc
+      script made every `rf-$v` a product, a replayed false deny).
+    - `_glue_sources` is lexical and order-blind on purpose: an extra source only adds capped
+      readings, a missed one is a product never read. Sources settle on a worklist (any chain
+      length or order, linear). Its value regex bounds each `$(…)`/backtick unit: unbounded, a
+      run of unclosed `c=$(` took 77 s on 80 KB (QA).
   - Shell-list words are brace-expanded first (`_brace_words`): `_expand_braces` skips a list
     holding a blank, so `for v in a {'rm …',b}` bound one word. Past `_BRACE_SEQ_MAX` words each
     item of each list is a word too (`_brace_items_flat`, `_BRACE_FLAT_DEPTH` levels, a deeper item
