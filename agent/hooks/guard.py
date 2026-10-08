@@ -7388,27 +7388,48 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForP
         read.append((name, nth[name], start, end, list(dict.fromkeys(words))))
     picks = [(((name, k),), ((start, end, word),))
              for name, k, start, end, words in read for word in words]
-    glued = _glued_name_groups(command, {r[0] for r in read if len(r[4]) > 1})
-    lists: dict[str, list] = {}
-    for r in read:
+    where: dict[frozenset[str], list[int]] = {}
+    glued = _glued_name_groups(command, {r[0] for r in read if len(r[4]) > 1}, where)
+    lists: dict[str, list[int]] = {}  # each name's lists, by index into `read`
+    for i, r in enumerate(read):
         if len(r[4]) > 1:
-            lists.setdefault(r[0], []).append(r)
-    products = 0
-    kept: list[frozenset[str]] = []
+            lists.setdefault(r[0], []).append(i)
     # Largest first: a group inside a kept one is already read by its product.
+    kept: list[frozenset[str]] = []
     for group in sorted(glued, key=lambda g: (-len(g), sorted(g))):
-        if any(group <= k for k in kept):
-            continue
-        kept.append(group)
-        for combo in itertools.product(*(lists[n] for n in sorted(group))):
-            products += math.prod(len(r[4]) for r in combo)
+        if not any(group <= k for k in kept):
+            kept.append(group)
+
+    def nearest(group: frozenset[str], at: int) -> tuple:
+        # Each name's last list starting before the word: the loop that binds
+        # it there. None before it (a function body read later): all of them.
+        return tuple(tuple(i for i in lists[n] if read[i][2] < at)[-1:] or tuple(lists[n])
+                     for n in sorted(group))
+
+    # Every list of each name against every other's, as two names always
+    # were; past the cap, only the lists binding each glued word, so the same
+    # names looped again and again (eight copies of a test rig) stay readable.
+    for mode in ("all", "near"):
+        combos = dict.fromkeys(
+            combo for group in kept
+            for per in ([tuple(tuple(lists[n]) for n in sorted(group))] if mode == "all"
+                        else dict.fromkeys(nearest(group, at) for at in where[group]))
+            for combo in itertools.product(*per))
+        products = 0
+        for combo in combos:
+            products += math.prod(len(read[i][4]) for i in combo)
             if products > _MAX_FOR_PRODUCT:
-                if _budget is not None:
-                    _budget["capped"] = True
-                return [], True
-            picks += [(tuple((r[0], r[1]) for r in combo),
-                       tuple((r[2], r[3], w) for r, w in zip(combo, words)))
-                      for words in itertools.product(*(r[4] for r in combo))]
+                break
+        else:
+            break
+    else:
+        if _budget is not None:
+            _budget["capped"] = True
+        return [], True
+    for combo in combos:
+        rs = [read[i] for i in combo]
+        picks += [(tuple((r[0], r[1]) for r in rs), tuple((r[2], r[3], w) for r, w in zip(rs, words)))
+                  for words in itertools.product(*(r[4] for r in rs))]
     for pick, spans in picks:
         line = command
         for start, end, word in sorted(spans, reverse=True):
@@ -7427,31 +7448,38 @@ def _for_word_lines_of(command: str, weight: int) -> tuple[list[tuple[str, _ForP
     return lines, False
 
 
-def _glued_name_groups(command: str, names: set[str]) -> set[frozenset[str]]:
+def _glued_name_groups(command: str, names: set[str],
+                       where: dict[frozenset[str], list[int]] | None = None) -> set[frozenset[str]]:
     """Each set of ``names`` whose values one word may join, as a product of
     their values may form it: used in one word (`$a$b`, `${a}a$b`, `$a$z$b`,
     `$a$b$c`, XERK-1657 QA), or through a name that holds them (`c=$a; $c$b`,
     `printf -v c %s%s $a $b; $c`, `f(){ $1$2; }; f $a $b`, XERK-1692;
     `_glue_sources`). Not across a `/` (`$d/$f`): read per path, real loops
-    over directories cost 2x for a shape that forms no program word."""
+    over directories cost 2x for a shape that forms no program word. Each
+    group's word starts are added to ``where``."""
     if len(names) < 2:
         return set()
     src = _glue_sources(command, names)
     groups: set[frozenset[str]] = set()
     run: set[str] = set()
-    last = None
+    last = start = None
+
+    def close() -> None:
+        if len(run) > 1:
+            groups.add(frozenset(run))
+            if where is not None:
+                where.setdefault(frozenset(run), []).append(start)
+
     for use in _GLUE_USE_RE.finditer(command):
         got = src.get(use.group(1))
         if not got:
             continue  # another name may be empty: `$a$z$b`
         if last is None or not re.fullmatch(r"[^\s;|&<>()/]*", command[last:use.start()]):
-            if len(run) > 1:
-                groups.add(frozenset(run))
-            run = set()
+            close()
+            run, start = set(), use.start()
         run |= got
         last = use.end()
-    if len(run) > 1:
-        groups.add(frozenset(run))
+    close()
     return groups
 
 

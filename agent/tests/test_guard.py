@@ -4415,6 +4415,14 @@ class TestExpansionBudget(unittest.TestCase):
             t = time.monotonic()
             guard._glued_name_groups(text + " $a$b", set("ab"))
             self.assertLess(time.monotonic() - t, 3, text[:10])
+        # The same names looped again and again (a rig's copies): past the cap
+        # each glued word reads only the loops binding it, never too large.
+        three = "for a in x r; do for b in y m; do for c in z w; do echo $a$b$c; done; done; done; "
+        self.assertIsNone(self.check(three * 4, limit=20))
+        reason = self.check(three * 3 + "for a in x r; do for b in y m; do for c in z ' -rf /etc'; "
+                            "do $a$b$c; done; done; done", limit=20)
+        self.assertIsNotNone(reason)
+        self.assertNotIn(self.TOO_LARGE, reason)
         # An N-way product stays inside `_MAX_FOR_PRODUCT`: 7^3 is too large.
         words = " ".join(f"w{i}" for i in range(7))
         self.assertIn(self.TOO_LARGE, self.check(

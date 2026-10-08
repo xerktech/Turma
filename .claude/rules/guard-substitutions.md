@@ -111,6 +111,12 @@ paths:
     argument). Pairwise, three names never formed the word. Namerefs are XERK-1722.
     - The product's reading count sums over groups, so an N-way loop stays inside
       `_MAX_FOR_PRODUCT` (7³ is too large, a deny). A group inside a larger one is skipped.
+    - Every list of each name is read against every other's (as pairs were on main); only past
+      the cap does each glued word fall back to its nearest preceding list per name. All-only, a
+      rig repeating the same three loops went too large (replay); near-only can miss a word
+      read later than its loops (a function body).
+    - A loop name keeps its list word: an edge targeting one is dropped (`v=$1` in a heredoc
+      script made every `rf-$v` a product, a replayed false deny).
     - `_glue_sources` is lexical and order-blind on purpose: an extra source only adds capped
       readings, a missed one is a product never read. Sources settle on a worklist (any chain
       length or order, linear). Its value regex bounds each `$(…)`/backtick unit: unbounded, a
