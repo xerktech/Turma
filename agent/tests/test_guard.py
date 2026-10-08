@@ -4977,6 +4977,47 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
+    def test_a_blank_inside_an_unquoted_brace_stays_in_its_word(self):
+        # XERK-1680: bash reads `${x: -5}/etc` as ONE word (the negative offset
+        # needs the blank); shlex cut it at the blank, so `/etc` was never judged.
+        self.assertEqual(guard._tokenize("rm -rf ${x: -5}/etc"), ["rm", "-rf", "${x: -5}/etc"])
+        self.assertEqual(guard._tokenize("rm ${x:\t-5} \\${y: 1}"),
+                         ["rm", "${x:\t-5}", "${y:", "1}"])
+        # A planted stand-in stays itself, never a blank.
+        self.assertEqual(guard._tokenize("echo ${x: 1} \ue000 a\ue001b"),
+                         ["echo", "${x: 1}", "\ue000", "a\ue001b"])
+        # The pipe-to-shell walk reads the stage joined too (QA F1).
+        payload = "rm" + " -rf /etc"
+        for cmd in (f"echo '{payload}' ${{x/;/}} | sh", f"echo '{payload}' ${{x/&&/}} | sh",
+                    f"printf %s ${{x/;/}}'{payload}' | sh",
+                    f"cat <<< '{payload}' ${{x/;/}} | sh",
+                    f"echo {payload} ${{x/\n/}} | sh"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ("echo ${x//|/,} | sh", "echo ${x//;/,} | cat"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cmd in ("rm -rf ${x: -5}/etc", "rm -rf ${HOME: -5}", "rm -rf ${x:0: -1}/etc",
+                        "rm -rf ${x: 1}/usr", "rm -rf ${x/ a/}/etc", "rm -rf ${x#* }/etc",
+                        "rm -rf ${x:\t-5}/etc", "chmod -R 777 ${x: -5}/etc",
+                        "chown -R me ${x: -5}/usr",
+                        # `\r` is a blank to shlex only; a newline or operator inside the
+                        # braces is text to bash, so the segment is also read joined.
+                        "rm -rf ${x:\r-5}/etc", "rm -rf ${x:\n-5}/etc", "rm -rf ${x/;/}/etc",
+                        "rm -rf ${x/|/}/etc", "rm -rf ${x/&&/}/etc",
+                        # A planted stand-in character never reads as a blank.
+                        "rm -rf ${x: -5}/etc \ue000", "chmod -R 777 ${x: -5}/etc \ue002"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNotNone(guard.is_destructive(cmd))
+            for cmd in ("rm -rf ${x: -5}/build", "rm -rf $HOME/${x: -3}/build",
+                        "echo ${x: -5} && ls", "echo ${x/;/} ; ls",
+                        # A `${` then a blank names no parameter (the guard's own
+                        # placeholder splices read so): its words stay split.
+                        "$(echo ${;#)}\nf"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNone(guard.is_destructive(cmd))
+
     def test_every_unset_name_component_is_read_empty(self):
         # XERK-1652: bash reads every unset name empty, not only the leading
         # run: a whole component with more path after it, and a trailing run
