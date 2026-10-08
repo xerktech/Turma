@@ -5309,6 +5309,13 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "sh <<< 'rm -rf /etc'\\\n", "bash -c 'rm -rf /etc '\\ ; true",
                     "eval 'rm -rf /etc '\\ ; true", "echo 'rm -rf /etc;'\\ | sh",
                     "{ bash -c 'rm -rf /etc'\\; }",
+                    # ...printed by a substitution spliced into a quoted
+                    # script, where it escaped the closing `"` (XERK-1691).
+                    'sh -c "$(echo "bash -c \'rm -rf /etc;\'\\\\")"',
+                    'sh -c "$(printf "bash -c \'rm -rf /etc;\'\\\\\\\\")"',
+                    'eval "$(printf "bash -c \'rm -rf /etc;\'\\\\\\\\")"',
+                    'bash -c "$(printf \'%s\' "bash -c \'rm -rf /etc;\'\\\\")"',
+                    'echo "$(echo \'a\\\')"; rm -rf /etc',
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',

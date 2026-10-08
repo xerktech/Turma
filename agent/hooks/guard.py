@@ -1143,7 +1143,14 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
         _SUBST_DEPTH[0] -= 1
     _SPLICES_ESCAPED[0] += escaped
     if printed is not None:
-        return _literal(printed) if literal and m.group(0)[0] in "$`" else printed
+        if literal and m.group(0)[0] in "$`":
+            return _literal(printed)
+        # A lone `\` ending the text, spliced plain, escaped what follows it:
+        # the `"` closing `sh -c "$(echo "bash -c 'rm …'\\")"` never closed,
+        # and the unbalanced line hid the script (XERK-1691). Dropped, as
+        # `_drop_trailing_escape` reads it at a script's end (XERK-1646).
+        run = len(printed) - len(printed.rstrip("\\"))
+        return printed[:-1] if run % 2 else printed
     if glued_empty and not _subst_standalone(m):
         return ""
     return _OPAQUE_SUBST
