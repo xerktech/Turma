@@ -9224,7 +9224,7 @@ def _first_json_object(text):
             break
         try:
             obj, _end = dec.raw_decode(s, idx)
-        except ValueError:
+        except (ValueError, RecursionError):  # absurd nesting must not raise onto the beat
             idx = s.find("{", idx + 1)
             continue
         if isinstance(obj, dict):
@@ -9343,25 +9343,37 @@ def _scan_pr_bg_notification(entry, state, found):
     read that task's output file and attribute the PR it printed. Only a
     `user`/`queue-operation` entry carries a real one — an assistant turn merely
     quoting a notification retires nothing, as in the live-agent scan."""
-    bg = state.get("pr_bg")
-    if not bg or entry.get("type") not in ("user", "queue-operation"):
+    if entry.get("type") not in ("user", "queue-operation"):
         return
+    bg = state.setdefault("pr_bg", {})
     for text in _entry_texts_for_scan(entry):
         tn = _parse_task_notification(text)
         if not tn:
             continue
         m = re.search(r"<output-file>(.*?)</output-file>", text, re.DOTALL)
+        named = m.group(1).strip() if m else ""
         for tid in tn["taskIds"]:
-            task = bg.pop(tid, None)
-            if not task:
-                continue
-            path = task["path"] or (m.group(1).strip() if m else "")
-            # The file Claude Code names for that task, and no other.
-            if os.path.basename(path) != f"{tid}.output":
-                continue
-            raw = _read_regular_tail(path, PR_BG_OUTPUT_TAIL_BYTES)
-            if raw:
-                found.extend(_created_pr_urls(raw.decode("utf-8", "replace"), task["api"]))
+            if tid in bg:
+                _read_pr_bg_output(bg, tid, named, found)
+            else:
+                # Possibly a fast task whose result is not written yet: remember
+                # it, bounded, for the result to claim.
+                done = state.setdefault("pr_bg_done", {})
+                done[tid] = named
+                while len(done) > PR_BG_TASKS_MAX:
+                    done.pop(next(iter(done)))
+
+
+def _read_pr_bg_output(bg, tid, named, found):
+    """Read a finished backgrounded create's output file into `found`."""
+    task = bg.pop(tid)
+    path = task["path"] or named
+    # The file Claude Code names for that task, and no other.
+    if os.path.basename(path) != f"{tid}.output":
+        return
+    raw = _read_regular_tail(path, PR_BG_OUTPUT_TAIL_BYTES)
+    if raw:
+        found.extend(_created_pr_urls(raw.decode("utf-8", "replace"), task["api"]))
 
 
 def _scan_pr_entry(entry, state, report):
@@ -9381,28 +9393,37 @@ def _scan_pr_entry(entry, state, report):
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_use":
-                cmd = (block.get("input") or {}).get("command")
+                inp = block.get("input")
+                cmd = inp.get("command") if isinstance(inp, dict) else None
                 if block.get("name") != "Bash" or not isinstance(cmd, str) or not block.get("id"):
                     continue
-                if PR_CREATE_RE.search(cmd):
+                # A `gh api` create anywhere in the command (`gh pr create … ||
+                # gh api …/pulls`) reads its output by the stricter api rule, or
+                # PRs its body quotes would chip too.
+                api = _gh_api_pr_create(cmd)
+                if api or PR_CREATE_RE.search(cmd):
                     calls.append(block["id"])
-                elif _gh_api_pr_create(cmd):
-                    calls.append(block["id"])
+                    del calls[:-PR_CALLS_MAX]
+                if api:
                     api_calls.append(block["id"])
                     del api_calls[:-PR_CALLS_MAX]
-                del calls[:-PR_CALLS_MAX]
             elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
                 text = _tool_result_text(block.get("content"))
                 api = block["tool_use_id"] in api_calls
                 tur = entry.get("toolUseResult")
                 task = tur.get("backgroundTaskId") if isinstance(tur, dict) else None
                 if isinstance(task, str) and task:
-                    # Backgrounded: its output arrives with a later notification.
+                    # Backgrounded: its output arrives with a later notification —
+                    # or already did, when a fast task finished before Claude Code
+                    # wrote this result.
                     m = PR_BG_OUTPUT_PATH_RE.search(text)
                     bg = state.setdefault("pr_bg", {})
                     bg[task] = {"path": m.group(1) if m else "", "api": api}
                     while len(bg) > PR_BG_TASKS_MAX:
                         bg.pop(next(iter(bg)))
+                    done = state.get("pr_bg_done") or {}
+                    if task in done:
+                        _read_pr_bg_output(bg, task, done.pop(task), found)
                     continue
                 found.extend(_created_pr_urls(text, api))
     for url in found:
@@ -9973,7 +9994,7 @@ def _scan_agent_entry(entry, state):
                 # description; the call's own timestamp is when it started,
                 # which for a shell moved to the background on its timeout is
                 # minutes before the launch record lands.
-                inp = block.get("input") or {}
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
                 kind, secs = _shell_kind(inp.get("command"))
                 shells[block["id"]] = {
                     "label": str(inp.get("description") or inp.get("command") or "").strip()[:200],
@@ -9981,7 +10002,7 @@ def _scan_agent_entry(entry, state):
                 while len(shells) > LIVE_AGENTS_MAX * 4:
                     shells.pop(next(iter(shells)))
             elif block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
-                inp = block.get("input") or {}
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
                 atype = str(inp.get("subagent_type") or "").strip()
                 if block.get("id") and atype:
                     tasks[block["id"]] = atype

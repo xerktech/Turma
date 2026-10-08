@@ -44,6 +44,9 @@ DevOps, and what gets typed back because of it.
     file is read (tail, `O_NOFOLLOW|O_NONBLOCK`, regular only) when that task's
     `<task-notification>` lands on a `user`/`queue-operation` entry — never an assistant quote.
     Lost across a manager restart between launch and notification (the restart primes to EOF).
+  - A FAST task's notification can land BEFORE the launch's tool_result, so notifications for
+    unknown task ids are remembered (`state["pr_bg_done"]`, bounded) for that result to claim.
+  - A command that is BOTH (`gh pr create … || gh api …/pulls`) reads by the stricter api rule.
   - Cost: a PR opened another way (subagent, MCP, web UI) gets no chip. **Widen only by teaching
     `_scan_pr_line` another creation event, never by scanning loose text.**
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: dispatch by URL to

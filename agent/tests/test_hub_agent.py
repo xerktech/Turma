@@ -2041,24 +2041,88 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         write_jsonl(path, [self.notification("bk1", out), self.notification("bk1", out, "user")])
         self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
 
-    def test_a_background_notification_is_trusted_only_where_claude_writes_it(self):
-        path, state = self._primed()
-        out = os.path.join(self.tmp, "bk2.output")
+    def _bg_out(self, task, text=None):
+        out = os.path.join(self.tmp, f"{task}.output")
         with open(out, "w") as f:
-            f.write(f"{self.PR1}\n")
+            f.write(text if text is not None else f"{self.PR1}\n")
+        return out
+
+    def test_an_assistant_quoted_notification_reads_nothing(self):
+        path, state = self._primed()
+        out = self._bg_out("bk2")
+        write_jsonl(path, [self.pr_create_call("b2"), self.bg_result("b2", "bk2", out),
+                           self.notification("bk2", out, "assistant")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+        # The real one still lands afterwards.
+        write_jsonl(path, [self.notification("bk2", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_only_the_file_named_for_that_task_is_read(self):
+        path, state = self._primed()
+        other = self._bg_out("elsewhere")
+        e = self.bg_result("b4", "bk4", "")
+        e["message"]["content"][0]["content"] = "Command running in background with ID: bk4."
+        write_jsonl(path, [self.pr_create_call("b4"), e,
+                           # The notification's own <output-file> names a file
+                           # that is not bk4's — never read.
+                           self.notification("bk4", other)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+        self.assertNotIn("bk4", state["pr_bg"])
+
+    def test_a_symlinked_output_file_is_never_followed(self):
+        path, state = self._primed()
+        real = self._bg_out("real")
+        out = os.path.join(self.tmp, "bk5.output")
+        os.symlink(real, out)
+        write_jsonl(path, [self.pr_create_call("b5"), self.bg_result("b5", "bk5", out),
+                           self.notification("bk5", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def test_a_directory_at_the_output_path_reads_nothing(self):
+        path, state = self._primed()
+        out = os.path.join(self.tmp, "bk6.output")
+        os.mkdir(out)
+        write_jsonl(path, [self.pr_create_call("b6"), self.bg_result("b6", "bk6", out),
+                           self.notification("bk6", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def test_a_fast_task_notified_before_its_result_still_chips(self):
+        """A task finishing in ~1s can have its notification written BEFORE the
+        launch's tool_result."""
+        path, state = self._primed()
+        out = self._bg_out("bk7")
+        write_jsonl(path, [self.pr_create_call("b7"), self.notification("bk7", out),
+                           self.bg_result("b7", "bk7", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_gh_api_output_naming_two_prs_chips_neither(self):
+        path, state = self._primed()
+        write_jsonl(path, [self.pr_create_call("a3", cmd=self.GH_API_CREATE),
+                           self.tool_result("a3", f"{self.PR1}\n{self.PR2}\n")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def test_a_create_or_gh_api_fallback_reads_by_the_api_rule(self):
+        """`gh pr create … || gh api …/pulls` — the object's body links stay out."""
+        path, state = self._primed()
+        obj = {"html_url": self.PR1, "body": f"See {self.PR2}"}
         write_jsonl(path, [
-            self.pr_create_call("b2"), self.bg_result("b2", "bk2", ""),
-            # An assistant turn QUOTING a notification is not one.
-            self.notification("bk2", out, "assistant"),
-            # A notification for a task no create launched reads nothing.
-            self.notification("other", os.path.join(self.tmp, "other.output")),
+            self.pr_create_call("a4", cmd=f"gh pr create --fill || {self.GH_API_CREATE.split(' --jq')[0]}"),
+            self.tool_result("a4", "GraphQL: Something went wrong\n" + json.dumps(obj)),
         ])
-        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
-        # The real one; with no path in the result its own <output-file> is used,
-        # but only a file named for that task.
-        write_jsonl(path, [self.notification("bk2", os.path.join(self.tmp, "x.output"))])
-        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
-        self.assertNotIn("bk2", state.get("pr_bg", {}))
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_absurd_output_never_raises_onto_the_beat(self):
+        path, state = self._primed()
+        deep = '{"a":' + "[" * 60000
+        out = self._bg_out("bk8", deep)
+        write_jsonl(path, [
+            self.pr_create_call("a5", cmd=self.GH_API_CREATE), self.tool_result("a5", deep),
+            self.pr_create_call("b8"), self.bg_result("b8", "bk8", out), self.notification("bk8", out),
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "x", "name": "Bash", "input": "gh pr create"}]}},
+        ])
+        write_jsonl(path, self.opened_pr(self.PR2, "after"))
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR2])
 
     def test_a_background_output_fifo_never_blocks(self):
         if not hasattr(os, "mkfifo"):
