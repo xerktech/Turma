@@ -9832,9 +9832,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             continue
         printed, escaped = _body_printed(body, _reading())
         _SPLICES_ESCAPED[0] += escaped
-        # An EMPTY print counts: `$(echo '' | head -1) rm …` runs `rm`, and
-        # skipping it left the cut halves the only reading (XERK-1717 QA).
-        if printed is not None and "$(" not in printed and "`" not in printed:
+        if printed and "$(" not in printed and "`" not in printed:
             for whole in ("$(" + body + ")", "`" + body + "`"):
                 printed_line = printed_line.replace(whole, printed)
     if printed_line != unprinted:

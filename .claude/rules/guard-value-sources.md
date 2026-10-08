@@ -72,9 +72,9 @@ paths:
   - `_printed_from_tokens` reads `yes WORDS` as printing WORDS (`y` with none, a leading `--`
     dropped as GNU yes does), so every printed-text route sees it, not only the pipe walk.
     `yes ''` prints EMPTY lines (`" ".join(args) if args else "y"`, never `or "y"`).
-  - A substitution printing NOTHING is read as empty on the operator-body re-split and the
-    line-level taint (`printed is not None`, `_body_tainted` → `("",)`): `$(echo '' | head -1)
-    rm …` and `$(echo '' | sed 1q) rm …` run `rm`; skipping a falsy print hid it (on main too).
+  - A substitution whose producers all print NOTHING is read as empty by the line-level taint
+    (`_body_tainted` → `("",)`, `_taint_line_repl` takes it): `$(echo '' | head -1) rm …` and
+    `$(echo '' | sed 1q) rm …` run `rm`; skipping a falsy print hid it (on main too).
   - 0 changed decisions over 4,729 real Bash commands holding `$(`, a backtick, `yes` or `coproc`.
   - Tests: `test_a_coproc_shell_runs_what_the_line_writes_to_its_fd`.
 - An alias use runs its VALUE with the use's words after it: `alias b='bash -c'; b '<cmd>'`,
