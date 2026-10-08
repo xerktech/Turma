@@ -1143,7 +1143,18 @@ def _subst_text(m: "re.Match[str]", glued_empty: bool = False, literal: bool = F
         _SUBST_DEPTH[0] -= 1
     _SPLICES_ESCAPED[0] += escaped
     if printed is not None:
-        return _literal(printed) if literal and m.group(0)[0] in "$`" else printed
+        if literal and m.group(0)[0] in "$`":
+            return _literal(printed)
+        # A lone `\` ending the text, spliced plain, escaped what follows it:
+        # the `"` closing `sh -c "$(echo "bash -c 'rm …'\\")"` never closed,
+        # and the unbalanced line hid the script (XERK-1691). `_PRINTED_DROP`
+        # reads it dropped, as `_drop_trailing_escape` does at a script's end
+        # (XERK-1646) — an ADDED reading, at the outermost splice only.
+        if (len(printed) - len(printed.rstrip("\\"))) % 2:
+            _PRINTED_DROP_SEEN[0] = True
+            if _PRINTED_DROP[0] and not _SUBST_DEPTH[0]:
+                return printed[:-1]
+        return printed
     if glued_empty and not _subst_standalone(m):
         return ""
     return _OPAQUE_SUBST
@@ -1768,6 +1779,7 @@ def _budgeted(fn):
         _MAIN_PARSE_SEEN[0] = False
         _BRACE_QUOTED_SEEN[0] = False
         _READINGS_SEEN[0] = False
+        _PRINTED_DROP_SEEN[0] = False
         _FOR_NAMES.clear()
         # These memos set the readings' SEEN flags as they fill, and a hit
         # skips that: a body cached by an earlier decision in this process
@@ -1790,7 +1802,7 @@ def _memo(kind: str, key, fn, *args):
     memo = _budget[kind]
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
            _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0],
-           _FOR_PICK[0], _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0])
+           _FOR_PICK[0], _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0], _PRINTED_DROP[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -4837,7 +4849,7 @@ def _reading() -> tuple:
     """The reading flags a body's resolution reads, as a memo key: a body
     memoised under one reading was replayed under another (XERK-1621)."""
     return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUE_PICK[0],
-            _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0])
+            _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0], _PRINTED_DROP[0])
 
 
 # Names a `for NAME in …` sets this decision. Its words are joined as the
@@ -4881,6 +4893,12 @@ _BRACE_OTHER_SEEN = [False]
 # ONE word (`_splice_readings`), and whether this decision spliced any.
 _READINGS_JOINED = [False]
 _READINGS_SEEN = [False]
+# Set while `_expand_both` reads a lone `\` ending a substitution's printed
+# text as dropped (`_subst_text`, XERK-1691); and whether this decision
+# printed one. Never in place: kept, it joins a `\`-newline continuation and
+# keeps an outer printer's escape run odd, which main's denies rely on.
+_PRINTED_DROP = [False]
+_PRINTED_DROP_SEEN = [False]
 # Set while `_expand_both` reads the line with quoting parsed flat, as before
 # XERK-1621 (no `${…}` frames, parens paired blind); and whether this decision
 # saw text the two parsers read differently. Every new rule above is a model
@@ -7710,6 +7728,12 @@ def _expand_readings(command: str) -> list[tuple[list[str], str]]:
                 out = out + _expand_picks(command)
             finally:
                 _VALUES_CHAINED[0] = 0
+    if _PRINTED_DROP_SEEN[0] and not _PRINTED_DROP[0]:
+        _PRINTED_DROP[0] = True
+        try:
+            out = out + _expand_picks(command)
+        finally:
+            _PRINTED_DROP[0] = False
     if _READINGS_SEEN[0] and not _READINGS_JOINED[0]:
         # An op's readings in `"…"` as one word too (`_splice_readings`), in
         # every reading above: one assignment away, only the chained one
