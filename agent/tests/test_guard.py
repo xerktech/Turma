@@ -3627,6 +3627,56 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_coproc_shell_runs_what_the_line_writes_to_its_fd(self):
+        # XERK-1717: a coproc reads its stdin fd, which the line may write by
+        # any route, so every text the line prints feeds a shell coproc.
+        R = self.R
+        for cmd in (
+                f"F=x; coproc {{ X=${{F}} bash; }} ; echo {R} >&${{COPROC[1]}}; wait",
+                f"coproc bash; echo {R} >&${{COPROC[1]}}",
+                f"coproc S {{ bash; }}; echo {R} >&${{S[1]}}",
+                f'coproc bash; echo {R} >&"${{COPROC[1]}}"',
+                f'coproc bash; printf "{R}" 1>&${{COPROC[1]}}',
+                f"coproc bash; exec 5>&${{COPROC[1]}}; echo {R} >&5",
+                f"coproc bash; fd=${{COPROC[1]}}; echo {R} >&$fd",
+                f"coproc bash; echo {R} >/dev/fd/${{COPROC[1]}}",
+                f"coproc bash; echo {R} > /proc/self/fd/${{COPROC[1]}}",
+                f"S=bash; coproc $S; echo {R} >&${{COPROC[1]}}",
+                f"{{ coproc bash; }}; echo {R} >&${{COPROC[1]}}",
+                f"coproc sh -s; echo {R} >&${{COPROC[1]}}",
+                f"bash -c 'coproc bash; echo {R} >&${{COPROC[1]}}'",
+                f'coproc bash; echo "$(echo {R})" >&${{COPROC[1]}}',
+                f'coproc bash; cat <<< "{R}" >&${{COPROC[1]}}',
+                f'coproc bash; x="{R}"; echo "$x" >&${{COPROC[1]}}',
+                f"coproc bash; cat >&${{COPROC[1]}} <<EOF\n{R}\nEOF",
+                # A writer in a function or loop.
+                f"g() {{ echo {R} >&${{COPROC[1]}}; }}; coproc bash; g",
+                f"coproc bash; for i in 1; do echo {R} >&${{COPROC[1]}}; done",
+                f"coproc bash; {{ yes -- '{R}' | head -1; }} >&${{COPROC[1]}}",
+                # `yes` prints its words (a leading `--` dropped) on every
+                # route `echo` does.
+                f"yes {R} | head -1 | bash", f"yes -- '{R}' | head -1 | sh",
+                f"bash < <(yes '{R}' | head -1)", f"bash <(yes '{R}' | head -1)",
+                f"eval \"$(yes '{R}' | head -1)\"", f"bash -c \"$(yes '{R}' | head -1)\"",
+                f"yes '{R}' | head -1 > /tmp/f; bash /tmp/f",
+                f"source <(yes '{R}' | head -1)", f"x=$(yes '{R}' | head -1); $x",
+                # `yes ''` prints empty lines, not `y`; and a body holding an
+                # operator (a pipe, a filter) that prints nothing is empty too.
+                f"$(timeout 1 yes '') {R}", f"$(echo '' | head -1) {R}",
+                f"`echo '' | head -1` {R}", f"$(yes -- '' | head -3) {R}",
+                f"$(echo '' | sed 1q) {R}", f"$(echo '' | tr a b) {R}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("coproc cat; echo hi >&${COPROC[1]}", "coproc bash; echo ls >&${COPROC[1]}",
+                    f"coproc cat; echo {R} >&${{COPROC[1]}}",
+                    f"coproc python3 -c 'import sys'; echo {R} >&${{COPROC[1]}}",
+                    "coproc S { sleep 1; }; echo done; wait",
+                    "yes | head -3 | bash -c 'cat'", "yes | apt-get install foo",
+                    "yes '' | head", "$(echo '' | sed 1q) ls",
+                    "v=$(echo '' | tr -d x); echo \"$v\""):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_stdin_route_shapes_classify_fast(self):
         # Every pipeline replays the line's exec/`<(…)` texts, and nested
         # `cat <(` resolves through `_body_printed` (XERK-1614).
