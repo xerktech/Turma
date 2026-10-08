@@ -3797,9 +3797,17 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                     "rm -rf {build,${OUT:-dist}}", "echo ${x,,} {a,b}",
                     "rm -rf {x,${y:-/tmp}/etc}", "mkdir -p build/{a,$(date +%s)}",
                     "find . -name x -exec rm -rf {} \\;", "rm -rf {x,{a}}",
-                    "echo " + "{" * 30 + "a" + "}" * 30):
+                    "echo " + "{" * 30 + "a" + "}" * 30,
+                    "rm -rf {x," + "{" * 16 + "a" + "}" * 16 + "}"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        # Out of stand-ins a unit would stay unmasked and its list unread, so it
+        # is refused: no free private-use character, or one free for one unit.
+        taken = "".join(chr(c) for c in range(0xE000, 0xF900))
+        self.assertDenied("rm -rf {x'" + taken + "',${HOME}}")
+        self.assertIsNotNone(guard._mask_param_braces("{x'" + taken[2:] + "',${a}}"))
+        with self.assertRaises(guard._ExpansionTooLarge):
+            guard._mask_param_braces("{x'" + taken[2:] + "',${a},${b}}")
 
 
 class TestClassification(unittest.TestCase):
