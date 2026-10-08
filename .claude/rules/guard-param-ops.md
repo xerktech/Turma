@@ -73,6 +73,8 @@ paths:
     (`${a#*@(x|)}` on `x/etc` is `/etc`; `[[ x == *!(x) ]]` is false). Path-form quirks: XERK-1714.
   - On `${HOME<op>}` every reading is kept (`_home_readings`): spliced as an op's readings are,
     and each judged. One picked dropped glued text (`${HOME##@(*)}/etc`); a None read not-home.
+  - A reading back inside the home splices as `${HOME}`, braced: bare, glued text made another
+    name (`${HOME%q}x/../x` read `$HOMEx/../x`, i.e. `/x`, and wiped HOME).
 - **Each reading of a multi-reading op also gets a whole-line pass of its own** (`_READING_PICK`,
   `_expand_both`, XERK-1664), spliced plainly, on top of the split and joined forms below.
   - Text glued after the op (`bash -c "rm -rf ${a%@(X)}tc"`) joins only the last reading in both

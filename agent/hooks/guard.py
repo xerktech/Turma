@@ -4993,8 +4993,11 @@ def _substitute_vars(command: str, vals: dict[str, list[str]] | None = None) -> 
             # never mapped back and `${HOME:+"$HOME"/x}` cleanups denied (QA).
             # Several (an extglob op, XERK-1664) splice as an op's readings
             # do: one alone dropped the text glued after it (`${HOME##@(*)}/etc`).
+            # A reading back inside the home is braced: bare, glued text made
+            # it another name (`${HOME%q}x/../x` read `$HOMEx/../x`, `/x`).
             state = states[m.start()] if m.start() < len(states) else ""
-            out = _splice_readings(homes, state)
+            out = _splice_readings([re.sub(r"\A\$HOME(?![A-Za-z0-9_])", "${HOME}", h)
+                                    for h in homes], state)
         elif op and op.group(1) in _VAR_DEFAULT_OPS:
             out = default(op.group(2), m.start())
         else:

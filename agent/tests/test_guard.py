@@ -2618,6 +2618,13 @@ class TestScriptChannels(unittest.TestCase):
                     "a=xxrm; echo ${a#@(xx)}"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        with mock.patch.dict(os.environ, {"HOME": "/home/x"}):
+            # QA: a HOME op that leaves HOME as it is reads back braced; bare,
+            # the glued `x` made `$HOMEx` and `/home/xx/../x` read `/x`.
+            for cmd in ("rm -rf ${HOME%q}x/../x", "rm -rf ${HOME:0}x/../x",
+                        "rm -rf ${HOME%@(q)}x/../x"):
+                with self.subTest(cmd=cmd, home="/home/x"):
+                    self.assertDenied(cmd)
         with mock.patch.dict(os.environ, {"HOME": "/root"}):
             for cmd in ("rm -rf ${HOME%@(t)}t/.ssh", "rm -rf ${HOME%@(t)}t",
                         "cd ${HOME%+(root)} && rm -rf etc"):
