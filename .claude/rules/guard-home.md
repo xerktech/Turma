@@ -72,10 +72,16 @@ paths:
   - The unset-HOME reading is the unset-names one every name gets; no extra pass.
   - An op it cannot read (`[i]`, `@Q`) stays as written. 0 diffs over 126 real `${HOME` commands.
   - Tests: `test_a_program_or_flag_built_from_home_is_read_with_the_real_home`.
-- A `${…}` inside a brace list is ONE item (XERK-1694, `_mask_param_braces`): `_expand_braces`
-  masks each live `${…}` with a stand-in char before matching lists, as bash's `${` inhibits
-  brace expansion to its `}`. Unmasked, `_BRACE_RE` found only `{HOME}`, skipped it, and
+- A brace unit inside a brace list is ONE item (XERK-1694, `_mask_param_braces`): before
+  matching lists, `_expand_braces` masks each with a stand-in and restores it after.
+  `_BRACE_RE` cannot span braces or blanks, so a list holding one was never expanded:
   `rm -rf {/tmp/x,${HOME}}` (also `{"$HOME",x}`, braced by `_brace_quote_ended`) went unread.
-  Tests: `test_a_braced_parameter_inside_a_brace_list_is_one_item`.
+  - Units: a live `${…}` (bash counts plain `{…}` inside it, which `_brace_end` does not:
+    `${y:-{a,b}}` is one unit), a `$(…)`/backtick, then a literal non-list `{…}` (`{x,{a},/etc}`).
+  - An unbalanced plain count keeps `_brace_end`'s close and stops counting for the line:
+    a scan per opener is quadratic. Masking `{}` first instead hid `{x,${a:-{} ; rm …`.
+  - It runs per nested body (thousands of calls on a backtick-heavy line): keep its
+    no-unit early return and lazy stand-in pick, or it costs 3-5x on the timing tests.
+  - Tests: `test_a_brace_unit_inside_a_brace_list_is_one_item`.
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,
   `test_home_readings_are_bounded`.
