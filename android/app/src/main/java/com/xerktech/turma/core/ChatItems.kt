@@ -202,10 +202,13 @@ fun buildItems(
             // Any thoughts already folded come BEFORE this bubble in the stream
             // (the web pushes the msg item after the thinking items it followed),
             // so drain the fold first.
-            if (!text.isNullOrBlank()) {
+            // Stripped before the blank check, so a turn that was nothing but
+            // framing tags shows no empty bubble.
+            val shown = if (entry.role == "user" && text != null) stripFraming(text) else text
+            if (!shown.isNullOrBlank()) {
                 flushFold()
-                val origin = if (entry.role == "user") messageOrigin(text) else "operator"
-                out.add(ChatItem.Bubble(entry.key, entry.role, text, clipped, origin))
+                val origin = if (entry.role == "user") messageOrigin(text!!) else "operator"
+                out.add(ChatItem.Bubble(entry.key, entry.role, shown, clipped, origin))
             }
         }
         for (block in blocks) {
@@ -335,6 +338,21 @@ fun messageOrigin(text: String): String {
     if (t.startsWith("[Image:")) return "system"
     if (t == "Continue from where you left off.") return "system"
     return "operator"
+}
+
+private val FRAMING_TAG_RE =
+    Regex("(?m)^[ \\t]*</?(?:pasted_content(?: id=\"[^\"\\n]*\")?|system-reminder)>[ \\t]*(?:\\r?\\n|$)")
+
+/**
+ * Claude Code's own framing tags on a user turn, each on a line of its own —
+ * `<pasted_content id="…">` round a bracketed paste, `<system-reminder>` round
+ * its injected notices — are wire markup for the model, never shown: drop the
+ * tag lines, keep what they wrap. Run AFTER [messageOrigin], which classifies a
+ * system turn by its leading tag. A port of chat.js `stripFraming`.
+ */
+fun stripFraming(text: String): String {
+    if (!text.contains('<')) return text
+    return text.replace(FRAMING_TAG_RE, "").trim('\r', '\n')
 }
 
 /**

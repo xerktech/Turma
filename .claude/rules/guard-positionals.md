@@ -91,12 +91,50 @@ paths:
   - One reading binding `$1` to every path lost `d="$1"`, `cd "$1"` and `$0`, and false-denied
     a direct `sh -c` with 2+ args; all paths, uncapped, false-denied ~330 roots as too large
     (QA). Residual: past the cap, 33+ paths the guard calls dangerous are not all read per run.
-- Not covered (XERK-1655): a quoted `eval 'set -- …'`, `trap`/alias calls, `f() if/for/while/[[`
-  bodies, `${1#x}`/`${!#}`/`"${@:2}"` ops applied, an eval'd single-quoted `$1`, `"$(f /etc)"`
-  output, `f ${HOME:+/etc}`, `f {a,b} …` brace words, `set -- $(…)`, a `while` shifting past
-  `_MAX_SHIFTS`, `source` of a file, a function defined in one substitution and called in
-  another, and past the byte budget `$1` as a PROGRAM word.
+- Positionals reached through MORE spellings are bound too (XERK-1655):
+  - A NON-BRACE compound function body (`f() for p; do …; done`, `f() if …; fi`, `f() [[ … ]]`,
+    `f() ((…))`, `function f while …`) is extracted by `_compound_body_end` — a nesting-tracking
+    scan from after the `_FUNC_HEADER_RE` header to the compound's own closer (`done`/`fi`/`]]`…),
+    the body's own opener taken without a command-start check (it sits right after the header `)`).
+  - `eval`/`trap` ACTION strings are inlined in place (`_eval_inlined_lines`, an ADDED reading):
+    `eval 'f /etc'`, `trap 'f /etc' EXIT`, `f() { eval 'rm -rf "$1"'; }`, `eval 'set -- /etc'`, and
+    `c='rm …"$1"'; eval "$c"` (the action's `$c` resolved) — so the revealed call/`set` binds beside
+    the line's defs. `_positional_readings` recurses into the inlined line (depth `_MAX_EVAL_INLINE`).
+  - A non-default operator is APPLIED in a RAW binding too (`${1#x}`, `${1%/}`, `${@/a/b}`): the raw
+    word is dequoted, the op applied, and the result spliced as a literal; a word still holding a `$`
+    stays live. `${@:N}`/`${@:N:M}` slices the positional ARRAY (`_slice_positionals`), not the join.
+  - A call word is also read with `${x:+alt}`/`${x+alt}` taken (`_alternatives_taken`, `f ${HOME:+/etc}`)
+    and brace-expanded (`f {a,b} /etc` → three args, `$3` is `/etc`).
+  - `set -- $(…)` sets the positionals to the words the substitution PRINTS (`_sub_substs` first).
+  - A `shift` under a loop may run past `_MAX_SHIFTS`, so the last arg never lands at `$1` in the
+    capped shift lists; an `every=True` binding (every parameter ← every arg) is added beside them.
+  - Function OUTPUT (`rm -rf "$(f /etc)"`): a call whose output is CAPTURED — inside a `$(…)`/backtick
+    (`_find_substs`) — is inlined IN PLACE (`f`'s body, args bound), so the command-substitution
+    machinery resolves `$(echo "/etc")` to `/etc`. `all_defs` holds every function (a body printing a
+    literal matters too); a SELF-RECURSIVE one is never inlined (it nested a countdown to "too deep").
+    Only substitution-captured calls, never top-level (bound by the `work` loop already): inlining
+    those only spent budget and false-denied big QA scripts as "too large".
+  - `bash -c "$(declare -f f); f /etc"`: `$(declare -f f)` is spliced as f's definition
+    (`_DECLARE_F_RE`), so the child's `-c` script is read with f defined and its call binds.
+- **These inline readings are a CPU-blowup hotspot — the gates below are load-bearing** (XERK-1655 QA
+  found 10-23x process-time blowups that tripped the 30s deadline → false-deny on real QA rigs, which
+  this fleet constantly generates). A blowup needs an inlined whole-command/script reading that gets
+  re-expanded per value pass, compounding when it carries nested `$(…)`. Keep all of:
+  - `_positional_readings` is MEMOISED per decision (`_memo("posread", …)`): `_expand` re-reads the
+    same line once per value pass, and recomputing the inlining each time was ~10x.
+  - A body/action/definition that itself holds `$(…)`/backtick is NEVER inlined (call, `declare -f`,
+    eval): splicing it into a `$(…)` re-expands that nest on every reading.
+  - A `$(f)` capture is inlined ONLY when it FEEDS a destructive command (`_capture_feeds_destructive`,
+    `_OUTPUT_TARGET_PROGS`) — `id=$(f)`/benign pipelines are data, and inlining them only re-expands
+    the line (2.5x+). This loses `$(f)` output used by a NON-destructive program, by design.
+  - An `eval` action that is only positional parameters (`eval "$@"`, redirections stripped via
+    `_call_words`) is skipped: it reveals no hidden call/set and binding `$@` per call was 6-11x.
+  - Verify ANY change here with a process_time (NOT wall-clock) replay of the function+`$(f)`+eval
+    corpus subset — the deadline is wall-clock and load-dependent, so a blowup hides under load.
+- Not covered (XERK-1655 residual): `source`/`.` of a written file carrying a positional, a function
+  defined in one substitution and called in another, an `eval` of a value read from an untraceable
+  source past the reader machinery, and past the byte budget `$1` as a PROGRAM word.
 - Accepted over-deny: a benign `bash -c` nested 4+ levels with a function at each is "too deep".
 - Tests: `TestScriptChannels.test_the_found_path_reaches_the_script_it_runs`,
   `test_a_function_call_and_set_bind_the_positionals`, `test_positional_readings_stay_linear`,
-  `test_qa_positional_shapes`.
+  `test_qa_positional_shapes`, `test_xerk_1655_positional_bypasses`.

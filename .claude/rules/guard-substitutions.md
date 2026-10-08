@@ -100,11 +100,27 @@ paths:
     `_TOO_LARGE` (a deny) — e.g. ~200 loops on one line. Characters, never a wall clock: that
     denied a real command only on a busy host.
   - Two lists used in one word (`$a$b`, `${a}a$b`, `$a$z$b`, `$a'$'b`) are also read as their
-    PRODUCT (XERK-1657, `_glued_name_pairs`): one at a time, `$a$b` never formed `rm`. Not
+    PRODUCT (XERK-1657, `_glued_name_groups`): one at a time, `$a$b` never formed `rm`. Not
     across a `/` (`$d/$f`): that doubled real directory loops' cost (QA); quotes-only glue let
     `${a}a$b` and an empty `$z` between through (QA). Past
     `_MAX_FOR_PRODUCT` readings the line is too large (60×60 words took 8 s). Unglued nested lists
-    stay one at a time; three glued names are read pairwise only (residual).
+    stay one at a time.
+  - Any NUMBER of glued names is one product (`$a$b$c`, XERK-1692), and glue reaches through a
+    name holding a loop name (`_glue_sources`): `c=$a`, `c=" $a"`, `c=$(echo $a)`, `printf -v`,
+    `read c <<< $a`, and `$1$2` bound by `set --` or a call (`shift` on the line: any later
+    argument). Pairwise, three names never formed the word. Namerefs are XERK-1722.
+    - The product's reading count sums over groups, so an N-way loop stays inside
+      `_MAX_FOR_PRODUCT` (7³ is too large, a deny). A group inside a larger one is skipped.
+    - Every list of each name is read against every other's (as pairs were on main); only past
+      the cap does each glued word fall back to its nearest preceding list per name. All-only, a
+      rig repeating the same three loops went too large (replay); near-only can miss a word
+      read later than its loops (a function body).
+    - A loop name keeps its list word: an edge targeting one is dropped (`v=$1` in a heredoc
+      script made every `rf-$v` a product, a replayed false deny).
+    - `_glue_sources` is lexical and order-blind on purpose: an extra source only adds capped
+      readings, a missed one is a product never read. Sources settle on a worklist (any chain
+      length or order, linear). Its value regex bounds each `$(…)`/backtick unit: unbounded, a
+      run of unclosed `c=$(` took 77 s on 80 KB (QA).
   - Shell-list words are brace-expanded first (`_brace_words`): `_expand_braces` skips a list
     holding a blank, so `for v in a {'rm …',b}` bound one word. Past `_BRACE_SEQ_MAX` words each
     item of each list is a word too (`_brace_items_flat`, `_BRACE_FLAT_DEPTH` levels, a deeper item
@@ -123,6 +139,14 @@ paths:
     Tests: `test_loop_words_reach_a_script_positional_or_eval_alone`.
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.
+- A brace word's START is also read as bash's word (XERK-1683, `_brace_word_start`): cut at the
+  last blank, quoted or not, `eval 'rm -rf /etc'{,x}` repeated only `/etc'`.
+  - Found by a forward `_word_end` scan from the innermost substitution body holding the brace:
+    `_quote_states` reads a `"$(…)"` body as bare, so a backward quote walk stopped inside it.
+  - An ADDED reading in `_expand_readings` (`_BRACE_QUOTED`), taken only once the two starts
+    differ (`_BRACE_QUOTED_SEEN`); the blank-cut reading stays.
+  - Open: quoted items with blanks (`{'a b',c}`, XERK-1738); a here-string word (XERK-1739).
+  - Tests: `test_a_brace_glued_to_a_quoted_word_repeats_the_whole_word`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
 - **`$'…'` is decoded by bash's rules** (`_ansi_c_text`, XERK-1693), never `unicode_escape`: that
   raised on escapes bash takes (`\x`, `\x4`, `\u41`) and the string stayed undecoded, so one such
@@ -297,19 +321,20 @@ paths:
     scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
   - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
-- **A lone `\` ending a text is read DROPPED** (XERK-1646, `_drop_trailing_escape`): shlex
-  raises on it, and the whitespace-split fallback kept a `-c`/`eval` script's quotes.
-  - The reading lives in the TOKENIZER (`_tokenize_cached`): every route tokenizes — the
-    stdin-feed walk's stages (`echo '…'\ | sh`), a segment whose escaped blank the split ate
-    (`'…'\ ; true`), a `\<newline>` split at its newline.
-  - Dropped, not bash's literal `\`: zsh drops it, so does a continuation (bash's here-string
-    `text\`+newline), and the literal only ever weakens the last word (`/etc\`, `sh\`). Never
-    add the literal as a second whole-line or per-segment reading: each level of a nested
-    `eval '…'\` re-expanded both, 4x per level, and 1 KB took 29s (QA).
-  - Detected by `_quote_states` + the run's parity, never shlex: `comments=True` read a glued
-    `'…'#\` as a comment; without it `# don't` is an open quote.
-  - `_expand_braces` drops it too, BEFORE joining (as zsh does): left on, `{/etc,/var}\` became
-    `/etc\ /var\`, ONE word to shlex.
+- **A blank or operator inside an unquoted `${…}` stays in its word** (XERK-1680): bash reads
+  `${x: -5}/etc`, `${x:<newline>-5}/etc` and `${x/;/}/etc` as one word; cut, `/etc` was unjudged.
+  - Tokenizer (`_keep_brace_blanks`): shlex's blanks (`\r` too) swap to private-use stand-ins
+    the text does NOT hold — a fixed set was disabled by planting one.
+  - A `${` then a blank names no parameter and is skipped: the guard's own `${ <placeholder>}`
+    splices became one program word (a replayed false deny).
+  - Splitter: an operator inside a `${…}` that `_brace_end` closes later is a `cuts` entry, so the
+    segment is read split AND joined — a misread close must not hide every later command.
+  - The stage walk (`keep_redirects`) joins these too (its redirect cuts still never join):
+    split only, `echo '…' ${x/;/} | sh` cut the producer off its shell.
+  - Open (XERK-1742): a spliced DEFAULT keeps `;`/`&` live
+    (`echo '…' ${x:-;} | sh`), unlike an assigned value, which `_quote_literal` escapes.
+  - Tests: `test_a_blank_inside_an_unquoted_brace_stays_in_its_word`.
+- **A lone `\` ending a text is read DROPPED** (XERK-1646/1691): `guard-trailing-escape.md`.
 - **A `${…}` inside `"…"` is a quoting frame of its own** (XERK-1621, `_quote_states`'s `{"`):
   a `"` there nests a string, never closes the outer one. Read flat, `"${y:-"it's"}"; rm …` left
   the `'` open and hid the `rm`.
@@ -381,11 +406,22 @@ paths:
   - A link's `${q%x}`, `${q/a/b}`, `${q:+…}` applies its operator (`_apply_var_op`); names in a
     `:+`/`+` alternative are expanded by the caller's `expand` (both `_assigned_values` and
     `_substitute_vars`) and count as dependencies (`_names_used`). Spliced raw, `${x:+$x}` ran
-    as the literal `$x` — a bypass of `rm -rf ${x:+$x}`. `${q:+${a}}` (brace in an argument),
-    an unset `${Q:-$A}` and `$b'tc'` are XERK-1661.
+    as the literal `$x` — a bypass of `rm -rf ${x:+$x}`.
+  - An unset name's default is resolved over the line's positions like a nested `${…}`
+    (XERK-1661): spliced raw, `a=/etc; rm -rf ${q:-$a}` left a `${a}` nothing expanded again.
+    Only the default's span, so an element's `${y[0]:-$a}` keeps its `[0]`; an ASSIGNED element's
+    marker-led default is resolved the same way. A quote in it stays raw (XERK-1700).
+  - `_dequote_value` braces a name a quote ends (`$b'tc'`, `"$b"tc` → `${b}tc`): stored as
+    `$btc`, it read an unset name where bash appends `tc` to `$b` (XERK-1661).
+    `_brace_quote_ended` braces one in any text (`$(echo $b'tc')`), with NO unbraced re-read:
+    via `_GLUED_NAME_RE` that re-read doubled ~9% of real commands, 11 past the deadline (QA).
+    Left as written: an escaped `\$b'`, and `$b'` inside `'…'` (a `-c` re-parse joins them).
+  - A value that only MAY be empty (`q=$(true)`, `q=$nope`) is still read as set and never
+    takes its `:-` default: XERK-1705. (A literally empty one does, `guard-param-ops.md`.)
   - Tests: `test_a_chain_of_assignments_resolves_every_link`,
     `test_a_cycle_of_assignments_stays_bounded`, `test_a_cycle_of_assignments_is_read_once`,
-    `test_names_in_an_operator_argument_are_dependencies`.
+    `test_names_in_an_operator_argument_are_dependencies`,
+    `test_a_name_in_an_operator_argument_or_a_quote_join_expands`.
 - **A name assigned more than once is also read with each value on its own** (`_picked`,
   XERK-1621): joined, `x=a; x="rm …"; $x` ran the program `a`. Added readings, never swapped.
   - One whole-line reading per value; more than `_MAX_VALUE_READINGS` assignments to one name

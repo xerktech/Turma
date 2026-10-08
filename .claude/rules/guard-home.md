@@ -35,7 +35,6 @@ paths:
 - Cost, measured at the final commit: 0 changed decisions over a 35k-command real corpus
   replay vs main; 200 targets of 64 HOME ops decide as fast as main.
 - Cost bound: past `_MAX_HOME_OPS` operators on HOME in one target, the reading is `/`.
-- Open: an unquoted `${x: -5}` is split at its space before any of this (XERK-1680).
 - `~` and `$PWD` follow the LINE, not the session (XERK-1685): `HOME=/; rm -rf ~/etc` is //etc.
   - `_home_tilde_reading` adds a reading with every word-start `~` (and a bare `cd`) as `$HOME`
     when the raw text holds `HOM`, `OME` or `eval` (`HOM{E,}`, `H\OME`, `x=OME; …H$x`).
@@ -65,5 +64,13 @@ paths:
   - Known false deny: `HOME=/ rm -rf ~/etc` (a prefix binding; bash expands `~` first),
     as `$HOME` already is there.
   - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`.
+- An unassigned `${HOME<op>}` (not a `:-`/`:=` default) is spliced in the values pass as its
+  `_home_reading` (XERK-1686): kept as written, `${HOME:+r}m -rf /`, `${HOME/*/rm} -rf /` and
+  `rm ${HOME:+-rf} /` hid the program or flag.
+  - Through `_home_reading`, so a value inside the home comes back as `$HOME…` and target rules
+    still judge it as the home (`rm -rf ${HOME:+$HOME/.cache}` stays allowed).
+  - The unset-HOME reading is the unset-names one every name gets; no extra pass.
+  - An op it cannot read (`[i]`, `@Q`) stays as written. 0 diffs over 126 real `${HOME` commands.
+  - Tests: `test_a_program_or_flag_built_from_home_is_read_with_the_real_home`.
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,
   `test_home_readings_are_bounded`.

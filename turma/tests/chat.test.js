@@ -2891,3 +2891,31 @@ test("model source: choosing one actually issues the switch request", () => {
   assert.deepEqual(calls[0].body, { modelSource: "local" });
   __setModelSourcePending(null);
 });
+
+test("buildItems: Claude Code's framing tags never reach a user bubble", () => {
+  const entries = [
+    { id: "pc", role: "user", blocks: [{ t: "text",
+      text: '<pasted_content id="3dcc">\nline one\nline two\n</pasted_content id="3dcc">\n' }] },
+    { id: "sr", role: "user", blocks: [{ t: "text",
+      text: "<system-reminder>\nThe user named this session \"x\".\n</system-reminder>" }] },
+    { id: "mx", role: "user", blocks: [{ t: "text",
+      text: 'look at this\n\n<pasted_content id="ab">\nlog <tail>\n</pasted_content id="ab">' }] },
+    { id: "lt", role: "user", blocks: [{ t: "text", text: "keep <b> and a <system-reminder> mid-line" }] },
+    { id: "cr", role: "user", blocks: [{ t: "text",
+      text: '<pasted_content id="c">\r\nwindows\r\n</pasted_content id="c">' }] },
+    { id: "em", role: "user", blocks: [{ t: "text", text: "<system-reminder>\n</system-reminder>" }] },
+  ];
+  const items = buildItems(entries);
+  const byId = Object.fromEntries(items.map((i) => [i.id, i]));
+  assert.equal(byId.pc.text, "line one\nline two");
+  assert.equal(byId.pc.origin, "operator");
+  // Classified on the raw text (the leading tag), shown without it.
+  assert.equal(byId.sr.origin, "system");
+  assert.equal(byId.sr.text, 'The user named this session "x".');
+  assert.equal(byId.mx.text, "look at this\n\nlog <tail>");
+  // Only a tag on a line of its own is framing; inline text is left alone.
+  assert.equal(byId.lt.text, "keep <b> and a <system-reminder> mid-line");
+  assert.equal(byId.cr.text, "windows");
+  // A turn that was only tags leaves no empty bubble.
+  assert.equal(byId.em, undefined);
+});

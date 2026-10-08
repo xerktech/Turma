@@ -1424,6 +1424,75 @@ class TestProducedScripts(unittest.TestCase):
         self.assertEqual(guard._substitute_vars("${a:-'}' #}", {}), "'}' \\#")
         self.assertEqual(guard._substitute_vars("${x:-${y:-$(echo P)}}", {}), "$(echo P)")
 
+    def test_a_nested_brace_in_an_assigned_op_word_is_read_whole(self):
+        # XERK-1673: an assigned value's `${q#${nope}x}` was cut at the inner
+        # `}`, so the op read `${nope` and a stray `x}` followed; each ran
+        # `rm -rf /etc` (or eval'd it) while the guard allowed it.
+        R = self.R
+        for cmd in ("q=/etc; y=${q#${nope}}; rm -rf $y",
+                    "q=/etcx; y=${q%${nope}x}; rm -rf $y",
+                    "q=/etcx; y=${q%%${nope}x}; rm -rf \"$y\"",
+                    # Quoted, the stored readings stay words (main too).
+                    "q=/etcx; y=${q%x$nope}; rm -rf \"$y\"",
+                    "q=x/etc; n=x; y=${q#${n}}; z=$y; rm -rf $z",
+                    "q=/etcx; y=${q/${nope}x/}; rm -rf $y",
+                    "q=/etc; y=${q:-${nope}}; rm -rf $y",
+                    "q=/etc; y=${q:0:${nope:-4}}; rm -rf $y",
+                    "q=/etc; y=${q:+${q}}; rm -rf $y",
+                    "q=1; a=/etc; y=${q:+${a}}; rm -rf $y",
+                    f"q=1; e=eval; y=${{q:+${{e}}}}; $y '{R}'",
+                    f"q=1; e=ev; y=${{q:+${{e}}}}; ${{y}}al '{R}'",
+                    f"q=evalx; y=${{q%${{nope}}x}}; $y '{R}'",
+                    "q=; rm -rf ${q:-${r}/etc}", "q=; rm -rf ${q:-${q:+x}/etc}",
+                    f"q=; ${{q:-${{r}}eval}} '{R}'",
+                    # QA: several readings inside a larger `"…"` stay ONE
+                    # word: split there, a `-c` script lost its program.
+                    f"q=evalx; y=${{q%x$nope}}; bash -c \"$y '{R}'\"",
+                    f"q=evalx; y=${{q%x$nope}}; s=\"$y '{R}'\"; bash -c \"$s\"",
+                    "q=/etcx; y=${q%x$nope}; bash -c \"rm -rf $y\"",
+                    f"q=evalx; bash -c \"${{q%x$nope}} '{R}'\"",
+                    f"q=evalx; bash -c \"${{q%x*$nope}} '{R}'\"",
+                    "q=/etcx; bash -c \"rm -rf ${q%x$nope}\"",
+                    "q=/etcx; y=${q%x$nope}; chmod -R 777 \"$y\"",
+                    "q=/etcx; y=${q%x$nope}; rm -rf -- \"$y/\"",
+                    f"q=evalx; y=${{q%x$nope}}; s=\"$y '{R}'\"; bash -c \"$s\"",
+                    # QA delta: kept ONE word only, a lone program fed on
+                    # stdin, `~/.ssh` and a `cd /` relative target ran.
+                    f"q=bashx; echo '{R}' | \"${{q%x$nope}}\"",
+                    f"q=bashx; y=${{q%x$nope}}; echo '{R}' | \"$y\"",
+                    "h=~/.sshx; rm -rf \"${h%x$nope}\"",
+                    "h=~/.sshx; y=${h%x$nope}; rm -rf \"$y\"",
+                    "q=etcx; y=${q%x$nope}; cd / && rm -rf \"$y\"",
+                    # QA: a `$(…)` output stored with one reading keeps its
+                    # marker, never read as a known program.
+                    f"echo eval > f; L=$(cat f || echo echo); $L '{R}'",
+                    # QA (rebase): a nested use in an assigned op's pattern.
+                    f"q=evalXY; a=XYZ; y=${{q%${{a%${{n}}Z}}}}; $y '{R}'",
+                    f"q=evalx; y=${{q%${{a:-${{b:-${{c}}}}}}x}}; $y '{R}'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("q=/tmp/x; y=${q#${nope}}; rm -rf $y",
+                    "q=1; a=ls; y=${q:+${a}}; $y -la",
+                    "h=$HOME/proj/buildx; rm -rf \"${h%x$nope}\"",
+                    "h=$HOME/proj/buildx; y=${h%x$nope}; rm -rf \"$y\"",
+                    "q=echox; y=${q%x$nope}; bash -c \"echo $y\""):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        uses = list(guard._var_uses("${q:+${e}x} $z"))
+        self.assertEqual([(m.group(1), m.group(2)) for m in uses[:1]], [("q", ":+${e}x")])
+        self.assertEqual(guard._names_used("${q#${n}}"), {"q", "n"})
+        # Past `_MAX_NESTED_VARS` levels the flat match stays (no recursion
+        # that deep); below it each extension is charged to the budget.
+        n = guard._MAX_NESTED_VARS + 1
+        deep = "${a:+" * n + "x" + "}" * n
+        self.assertEqual(next(guard._var_uses(deep)).group(0), deep[:deep.index("}") + 1])
+        guard._budget = {"left": 10}
+        try:
+            with self.assertRaises(guard._ExpansionTooLarge):
+                list(guard._var_uses("${a:+${b}xxxxxxxxxx}"))
+        finally:
+            guard._budget = None
+
     def test_defaults_on_empty_subscripted_and_quoted_brace_names_apply(self):
         # XERK-1659: each ran `rm -rf /` as nobody while the guard allowed it.
         R = self.R
@@ -1478,6 +1547,58 @@ class TestProducedScripts(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_name_in_an_operator_argument_or_a_quote_join_expands(self):
+        # XERK-1661: each ran `rm -rf /etc` (as nobody, guard_differential.py)
+        # while the guard allowed it.
+        R = "rm -rf /etc"
+        for cmd in (f"A='{R}'; ${{Q:-$A}}", "a=/etc; rm -rf ${q:-$a}",
+                    'a=/etc; rm -rf "${q:-$a}"', 'a=/etc; rm -rf "${q:-"$a"}"',
+                    "b=/e; a=$b'tc'; rm -rf $a", 'b=/e; a=$b"tc"; rm -rf $a',
+                    'b=/e; a="$b"tc; rm -rf $a', "a=/etc; rm -rf ${q-$a}",
+                    "a=/etc; rm -rf ${y[0]:-$a}", 'a=/etc; rm -rf "${y[@]:-$a}"',
+                    # An element's default too, assigned or not. (With a quote in
+                    # an assigned one's default it stays raw: XERK-1700.)
+                    "a=/etc; y=(); rm -rf ${y[0]:-$a}", "a=/etc; y=(x); rm -rf ${y[1]-$a}",
+                    # A quote join inside a value's substitution (QA).
+                    "b=/e; a=$(echo $b'tc'); rm -rf $a", "b=/e; a=`echo $b'tc'`; rm -rf $a",
+                    'b=/e; a=$(echo "$b"tc); rm -rf $a', "B=r; a=$(echo $B'm'); $a -rf /etc",
+                    # An operator in the body: the brace applies with no re-read (QA).
+                    "b=/e; rm -rf $(true; echo $b'tc')", "r=r; $(echo $r'm' | cat) -rf /etc",
+                    # Inside `'…'` the `'` closes the quote: eval reads `$bt` (QA).
+                    "bt=/etc; eval 'a=$b't; rm -rf $a",
+                    # Set but empty takes a `:-`/`:=` default (QA).
+                    "q=; rm -rf ${q:-/etc}", "q=''; rm -rf ${q:=/etc}", f"q=; A='{R}'; ${{q:-$A}}",
+                    # The brace-argument forms (fixed by XERK-1653), pinned.
+                    f"Q=1; A='{R}'; D=${{Q:+${{A}}}}; $D", f"Q=1; A='{R}'; ${{Q:+${{A}}}}",
+                    'q=1; a=/etc; rm -rf ${q:+"${a}"}',
+                    f"x=1; y=1; z='{R}'; ${{x:+${{y:+$z}}}}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("A='ls -la'; ${Q:-$A}", "a=/tmp/x; rm -rf ${q:-$a}",
+                    "a=/etc; rm -rf ${q:-x$a}", "b=/tm; a=$b'p/x'; rm -rf $a",
+                    'b=/tm; a="$b"p/x; rm -rf $a', "b=/tm; a=$(echo $b'p/x'); rm -rf $a",
+                    "q=; rm -rf ${q-/etc}", "q=x; rm -rf ${q:-/etc}"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # An element default's resolved names are charged once, as a scalar's (QA).
+        for use in ("${y[0]:-$a}", "${q:-$a}"):
+            cmd = "a=" + "x" * 2000 + "; y=(); echo " + " ".join([use] * 100)
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow", use)
+        self.assertEqual(guard._dequote_value("$b'tc'"), "${b}tc")
+        self.assertEqual(guard._dequote_value('"$b"tc'), "${b}tc")
+        self.assertEqual(guard._dequote_value("$'tc'"), "tc")
+        # A wrapper glued to `<<`: the shell after the delimiter runs the
+        # body (XERK-1661 QA; main allowed the literal spellings).
+        for owner in ("env<<'EOF' bash", "nice<<EOF bash", "F=env; ${F}<<'EOF' bash",
+                      "G=bash; env<<'EOF' ${G}", "env<<'EOF'x bash", "env<<E'O F' bash",
+                      'env<<"E F"x bash', "env<<E\\ F bash", "nice<<'EOF'x sh"):
+            self.assertDenied(owner + "\nrm -rf /etc\nEOF")
+        for owner in ("F=cat; ${F}<<'EOF' > out.txt", "cat<<'EOF' > bash.txt"):
+            self.assertAllowed(owner + "\nrm -rf /etc\nEOF")
+        # Left unbraced: an escaped `$`, and a `$b'` a `'…'` quote ends.
+        self.assertEqual(guard._brace_quote_ended("echo \\$b'tc' 'x $b'y \"$b\"c"),
+                         "echo \\$b'tc' 'x $b'y \"${b}\"c")
+
     def test_a_value_a_grouped_or_looped_reader_takes_from_stdin_runs(self):
         # XERK-1650: each ran `rm -rf /etc` while the guard allowed it.
         R = self.R
@@ -1526,6 +1647,203 @@ class TestProducedScripts(unittest.TestCase):
                     'echo "$HOME"; ls | while read f; do rm -rf "./$f"; done'):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+
+    def test_a_value_a_split_heredoc_or_callback_reader_takes_runs(self):
+        # XERK-1658: each ran `rm -rf /etc` while the guard allowed it.
+        R = self.R
+        for cmd in (f'IFS=, read a b <<< "x,{R}"; $b',
+                    f"echo 'x,{R}' | {{ IFS=, read a b; $b; }}",
+                    f"echo 'x:{R}' | {{ IFS=: read -a arr; ${{arr[1]}}; }}",
+                    f"echo 'x,{R},' | while read -d , a; do $a; done",
+                    f"printf 'x\\0{R}\\0' | while read -d '' a; do $a; done",
+                    f"printf 'x\\0{R}\\0' | {{ mapfile -d '' -t a; ${{a[1]}}; }}",
+                    f'f() {{ $2; }}; mapfile -c 1 -C f -t a <<< "$(echo {R})"',
+                    f'yes "{R}" | head -1 | while read a; do $a; done',
+                    f"coproc {{ echo {R}; }}; read -u ${{COPROC[0]}} a; $a",
+                    f"echo {R} > /tmp/f; read a < /tmp/f; $a",
+                    f"$(echo echo) {R} | while read a; do $a; done",
+                    f'set -- "$(echo {R})"; select v; do $v; break; done <<< 1',
+                    # A heredoc straight into a reader.
+                    f"read a <<E\n{R}\nE\n$a",
+                    f"mapfile -t a <<'E'\nx\n{R}\nE\n${{a[1]}}",
+                    f"IFS=, read a b <<E\nx,{R}\nE\n$b",
+                    f"f() {{ $2; }}; mapfile -C f -t a <<E\n{R}\nE\n",
+                    # QA: a use is no producer (it bound `a` empty and hid
+                    # main's own deny); spellings of each claim.
+                    f"exec 3<<E\n{R}\nE\nread -u 3 a; $a",
+                    f"exec 3<<E\n{R}\nE\nmapfile -t -u 3 a; ${{a[0]}}",
+                    f"i=,; IFS=$i read a b <<< \"x,{R}\"; $b",
+                    f"IFS=${{x:-,}} read a b <<< \"x,{R}\"; $b",
+                    f"d=,; echo 'x,{R},' | while read -d \"$d\" a; do $a; done",
+                    f"command yes '{R}' | head -n1 | while read a; do $a; done",
+                    f"/usr/bin/yes -- '{R}' | head -n1 | while read a; do $a; done",
+                    f"'echo' {R} | while read a; do $a; done",
+                    f"e\\cho {R} | while read a; do $a; done",
+                    f"`echo echo` {R} | while read a; do $a; done",
+                    f"echo {R} > f; while read a; do $a; done < f",
+                    f"echo {R} > f; {{ read a; $a; }} < f",
+                    f"echo {R} > f; read a 0< f; $a",
+                    f"echo {R} > f; exec < f; read a; $a",
+                    f"cat > f <<'E'\n{R}\nE\nread a < f; $a",
+                    f"g=f; f() {{ $2; }}; mapfile -C \"$g\" -t a <<< \"$(echo {R})\"",
+                    f"<<E read a\n{R}\nE\n$a",
+                    f"read a <<A <<B\nx\nA\n{R}\nB\n$a",
+                    # Pass 12: blanks in IFS only trim; a split piece as a path.
+                    # Pass 13: a quoted `;`/`&&` on the reader's own command.
+                    f"read -d ';' a <<'E'\n{R};x\nE\n$a",
+                    f"IFS=';' read a b <<'E'\nx;{R}\nE\n$b",
+                    f"read -p 'go; ' a <<'E'\n{R}\nE\n$a",
+                    f"X=';' mapfile -t arr <<'E'\n{R}\nE\n${{arr[0]}}",
+                    'IFS=, read a b c d e <<< "1,2,3,4,/etc"; rm -rf "$e"',
+                    # Pass 14: quoted assignments before a reader in `"$(…)"`.
+                    f"x=\"$(IFS=';' read a b <<'E'\nx;{R}\nE\n$b)\"",
+                    f"x=\"$(X='a b' read a <<'E'\n{R}\nE\n$a)\"",
+                    f'IFS=", " read a b <<< "x,{R}"; $b',
+                    f"IFS=$'\\t' read a b <<< $'x\\t{R}'; $b",
+                    f"while IFS=', ' read -r a b; do $b; done <<< \"x,{R}\"",
+                    'IFS=, read d x <<< "/etc,a"; rm -rf "$d"',
+                    'IFS=, read x y <<< "/,etc"; rm -rf "$x/$y"',
+                    'read -d , d <<< "/etc,x"; rm -rf "$d"',
+                    f"while IFS=, read a b; do $b; done <<E\nx,{R}\nE",
+                    f"while read a\ndo\n$a\ndone <<E\n{R}\nE",
+                    f'exec 3<<E\n{R}\nE\nread -u 3 a; "$a"',
+                    f"exec 3<<'E'\n{R}\nE\nread -u 3 a; eval \"$a\"",
+                    f"tee f >/dev/null <<'E'\n{R}\nE\nread a < f; $a",
+                    # A spelled producer WITH words still writes the file.
+                    f"e=echo; $e '{R}' > f; read a < f; $a",
+                    f"`echo echo` '{R}' > f; while read a; do $a; done < f",
+                    # The file a heredoc writes, read back (pass 3).
+                    f"tee f <<'E'\n{R}\nE\nread a < f; $a",
+                    f"cat <<E | tee -a ./f\n{R}\nE\nread a < f; $a",
+                    f"cat > f <<E\n{R}\nE\n{{ read a; $a; }} < f",
+                    f"cat > f <<'E'\n{R}\nE\n( read a; $a ) < f",
+                    f"cat > $F <<E\n{R}\nE\nread a < g; $a",
+                    # Pass 4: another heredoc on the line, before or after;
+                    # `dd of=`, `&>`, `>|`; one file spelled two ways.
+                    f"cat > a <<'A'\nhello\nA\ncat > f <<'E'\n{R}\nE\nread x < f; $x",
+                    f"cat > f <<'E'\n{R}\nE\ncat > a <<'A'\nhello\nA\nread x < f; $x",
+                    f"cat <<'A'\nhi\nA\nread a <<'E'\n{R}\nE\n$a",
+                    f"dd of=f status=none <<'E'\n{R}\nE\nread a < f; $a",
+                    f"cat &> f <<E\n{R}\nE\nread x < f; $x",
+                    f"cat >| f <<E\n{R}\nE\nread x < f; $x",
+                    f"cd /tmp && cat > f <<E\n{R}\nE\nread x < /tmp/f; $x",
+                    f"S=/tmp; cat > $S/f <<E\n{R}\nE\nread x < $S/f; $x",
+                    f"cat > f <<E\n{R}\nE\nread x < f*; $x",
+                    f"read a <<A <<B\nx\nA\n{R}\nB\ncat <<'C'\nz\nC\n$a",
+                    # Pass 5: identical owner lines are two owners.
+                    f"cat <<'A'\nhello\nA\ncat <<'A'\nhi\nA\ncat > f <<'E'\n{R}\nE\nread x < f; $x",
+                    f"cat > f <<'E'\nhello\nE\ncat > f <<'E'\n{R}\nE\nread x < f; $x",
+                    f"read a <<'E'\nhello\nE\nread a <<'E'\n{R}\nE\n$a",
+                    # Pass 6: the operator where the lexer found it, never a
+                    # quoted/commented copy of its line, a shift or `$'\''`;
+                    # a reader inside `$(…)`.
+                    f"echo \"read a <<'E'\"\nread a <<'E'\n{R}\nE\n$a",
+                    f"# read a <<'E'\nread a <<'E'\n{R}\nE\n$a",
+                    f"echo \"cat > f <<'E'\"\ncat > f <<'E'\n{R}\nE\nread x < f; $x",
+                    f"x=$((1<<2)); read a <<'E'\n{R}\nE\n$a",
+                    f"echo $'\\''; read a <<'E'\n{R}\nE\n$a",
+                    f"x=\"$(cat <<'A'\nhi\nA\n)\"; read a <<'E'\n{R}\nE\n$a",
+                    f"x=$(read a <<'E'\n{R}\nE\n$a)",
+                    f"x=\"$(while read l; do $l; done <<'E'\n{R}\nE\n)\"",
+                    # Pass 8: any spelling, after a token the splitter misreads.
+                    f"echo $'\\'' ; time read a <<'E'\n{R}\nE\n$a",
+                    f"echo $'\\''\ncommand read a <<'E'\n{R}\nE\n$a",
+                    f"echo $'\\'' ; ! read a <<'E'\n{R}\nE\n$a",
+                    # Pass 10: a word-only reader's body keeps its assignments.
+                    f"echo $'\\'' ; read -r a <<'E'\nX=1 {R}\nE\neval \"$a\"",
+                    f"echo $'\\'' ; read -r -d '' a <<'E'\nc='{R}'\n$c\nE\neval \"$a\"",
+                    # Pass 11: a backticked command holding `=` still runs.
+                    f"echo $'\\'' ; read -r a <<'E'\n`x=1;{R}`\nE\neval \"$a\"",
+                    f"echo $'\\'' ; read -r a <<'E'\n`{R} # =`\nE\neval \"$a\"",
+                    f"echo $'\\'' ; read -r a <<'E'\n`X=1 {R}`\nE\neval \"$a\"",
+                    f"echo $'\\'' ; read -r a <<'E'\n`a=1` {R} `b=2`\nE\neval \"$a\"",
+                    f"echo \"$(\n\\read a <<'E'\n{R}\nE\n$a)\"",
+                    # A command in the body still runs where the value is run.
+                    f"read -r a <<'E'\n`{R}`\nE\neval \"$a\"",
+                    f"read -r a <<'E'\necho \"`{R}`\"\nE\neval \"$a\"",
+                    f"read -r a <<'E'\necho \"$({R})\"\nE\nbash -c \"$a\"",
+                    f"cat > f <<'E'\necho \"`{R}`\"\nE\nread -r a < f; eval \"$a\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ('IFS=, read a b <<< "x,ls"; $b',
+                    'while IFS=: read -r user _; do echo "$user"; done < /etc/passwd',
+                    "printf 'a\\0b\\0' | while read -d '' f; do echo \"$f\"; done",
+                    "read a <<E\nls\nE\n$a",
+                    "mapfile -t a <<E\nhello\nE\necho ${a[0]}",
+                    'f() { echo "$2"; }; mapfile -C f -t a <<< "$(ls)"',
+                    f"cat <<E\n{R}\nE",
+                    'set -- a b; select v; do echo "$v"; break; done <<< 1',
+                    # QA: a heredoc on another command never feeds a reader
+                    # of a pipe or `<(…)`; bound, distinct bodies spent the
+                    # budget ("too large") on real scripts.
+                    "read -r ans\n" + "".join(f"cat > f{i}.txt <<'EOF'\nbody {i} x\nEOF\n"
+                                               for i in range(24)),
+                    "while IFS= read -r f; do echo \"$f\"; done < <(find . -name x)\n"
+                    "python3 - <<'PY'\n" + "\n".join(f"print({i}, 'rm -rf /x{i}')"
+                                                       for i in range(20)) + "\nPY",
+                    # Only the file a reader reads feeds it (pass 3: 16 files
+                    # written beside a reader of one were "too large").
+                    "".join(f"cat > f{i}.txt <<'EOF'\nk{i}\nEOF\n" for i in range(40))
+                    + "while read l; do echo $l; done < f0.txt",
+                    f"cat > g <<'E'\n{R}\nE\nread a < f; $a",
+                    # Pass 4: a `$S/` directory is no wildcard for the file.
+                    "cat > $S/p.py <<'E'\n" + "\n".join(f"print('rm -rf /{i}')"
+                                                         for i in range(240))
+                    + "\nE\nwhile read l; do echo $l; done < $S/l.txt",
+                    # Pass 5: many bodies feed a reader as ONE value.
+                    "".join(f"cat > svc{i}/config.yaml <<'EOF'\na: 1\nb: 2\nc: 3\nEOF\n"
+                            for i in range(8))
+                    + 'while IFS= read -r l; do echo "$l"; done < base/config.yaml',
+                    "".join(f"cat > f{i} <<'EOF'\nk{i}\nEOF\n" for i in range(16))
+                    + 'while read l; do echo $l; done < "$1"',
+                    # Pass 7: "read" in a title, comment or message is no
+                    # reader; its markdown body stays data.
+                    f"gh issue create --title 'read path' --body-file - <<'EOF'\nRepro: `{R}`\nEOF",
+                    f"cat > f.md <<'EOF'  # read me\n- `{R}` is bad\nEOF",
+                    f"git commit -qm 'read it' && cat > f.md <<'EOF'\n- `{R}` is bad\nEOF",
+                    # Pass 14: a wide literal CSV read is not "too large".
+                    "IFS=, read -r " + " ".join(f"c{i}" for i in range(16)) + ' <<< "'
+                    + ",".join(f"x{i}" for i in range(16)) + '"; echo "$c0"',
+                    f"ssh host \"cd x; read a; echo ok\" <<'EOF'\n- `{R}` is bad\nEOF",
+                    # Pass 13: "read" after a keyword inside a quoted title.
+                    f"gh issue create --title 'while read loop stalls' --body-file - <<'EOF'\n"
+                    f"- `{R}` is bad\nEOF",
+                    # Pass 10: a reader on ANOTHER command of the line.
+                    f"read -p 'ok? ' x; gh issue create --title t --body-file - <<'EOF'\n"
+                    f"- never run `{R}` here\nEOF",
+                    # Pass 11: a group closer on ANOTHER command of the line.
+                    f"{{ echo; }}; gh x --title read --body-file - <<'EOF'\n- `{R}`\nEOF",
+                    # Pass 9: twenty `x=$y` notes in a body "read" names.
+                    "cat > read.md <<'EOF'\n" + "\n".join(
+                        f"- note {i}: set `x=$y_{i}` here" for i in range(20)) + "\nEOF"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_a_file_reader_matches_only_the_heredocs_own_command(self):
+        # XERK-1658 QA pass 8: a write elsewhere on the owner line matched.
+        cmd = "./mk > keys.txt; cat > poll.sh <<'E'\nbody\nE\nread k < keys.txt"
+        commands, heredocs = guard._split_heredocs(cmd)
+        readings = guard._reader_extra_readings(cmd, commands, heredocs, {})
+        self.assertFalse(any("body" in r for r in readings), readings)
+
+    def test_many_backtick_assignments_before_a_heredoc_classify_fast(self):
+        # XERK-1658 QA pass 16: the reader-word value regex backtracked
+        # exponentially on a run of backtick/$() assignments before a
+        # heredoc, hanging the guard open past the hook timeout.
+        for prefix in ("".join(f"a{i}=`x` " for i in range(60)),
+                       "".join(f"A{i}=1 B{i}='x' C{i}=$(z) D{i}=`w` " for i in range(60))):
+            cmd = prefix + "cat <<EOF\nhi\nEOF"
+            t = time.monotonic()
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow", cmd[:60])
+            self.assertLess(time.monotonic() - t, 5, cmd[:60])
+
+    def test_a_file_reader_takes_each_written_line_once(self):
+        # XERK-1658 QA: a file written N times over was N copies to read.
+        line = "cat > d{}/f <<'E'\nsame line\nE\n"
+        cmd = "".join(line.format(i) for i in range(4)) + "while read l; do echo $l; done < f"
+        commands, heredocs = guard._split_heredocs(cmd)
+        readings = guard._reader_extra_readings(cmd, commands, heredocs, {})
+        self.assertEqual(sum(r.count("same line") for r in readings), 1, readings)
 
     def test_an_assigned_substitution_in_a_script_xargs_find_or_proc_subst_runs(self):
         # XERK-1649: each ran `rm -rf /etc` while the guard allowed it.
@@ -2067,6 +2385,127 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_eval_and_source_bind_names_from_output_they_read(self):
+        """XERK-1668: an `eval` of a `$(…)` whose output `_printed_text`
+        couldn't compute, a `source`/`.` of a `<(…)` or stdin, and an op whose
+        pattern or offset nests a `${…}` or `$((…))` hid the command; each
+        ran its payload as nobody."""
+        for cmd in ("v=a; eval \"$(echo \"$v='rm -rf /etc'\")\"; $a",
+                    "eval \"$(printf 'a=%q' 'rm -rf /etc')\"; $a",
+                    "eval \"$(printf '%s=%q' a 'rm -rf /etc')\"; $a",
+                    "eval \"$(cat <<<\"a='rm -rf /etc'\")\"; $a",
+                    "eval \"$(eval echo \"a=\\\\'rm -rf /etc\\\\'\")\"; $a",
+                    "eval \"$(eval echo 'rm -rf /etc')\"",
+                    "source <(echo \"a='rm -rf /etc'\"); $a",
+                    ". <(echo \"a='rm -rf /etc'\"); $a",
+                    "v=a; source <(echo \"$v='rm -rf /etc'\"); $a",
+                    "f(){ source <(echo \"a='rm -rf /etc'\"); }; f; $a",
+                    ". /dev/stdin <<<\"a='rm -rf /etc'\"; $a",
+                    "source -- <(echo \"a='rm -rf /etc'\"); $a",
+                    ". -- /dev/stdin <<<\"a='rm -rf /etc'\"; $a",
+                    "source /dev/fd/0 <<<\"a='rm -rf /etc'\"; $a",
+                    "{ . /dev/stdin; } <<<\"a='rm -rf /etc'\"; $a",
+                    ". /dev/stdin < <(echo \"a='rm -rf /etc'\"); $a",
+                    "a=x/etc; c=\"${a#${b:-x}}\"; rm -rf \"$c\"",
+                    "a=x/etc; c=\"${a#${b}x}\"; rm -rf \"$c\"",
+                    "a=xx/etc; rm -rf \"${a:$((1+1))}\"",
+                    "a=xx/etc; c=\"${a:$((1+1))}\"; rm -rf \"$c\"",
+                    # Corpus replay: an unread-output program keeps its marker.
+                    "R=$(ls -d ~/x || echo ruff); $R check",
+                    "R=$(ls -d ~/x || echo ruff); \"$R\" check"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("eval \"$(printf 'a=%q' 'x y')\"; echo \"$a\"",
+                    "source <(echo a=1); echo $a",
+                    ". /dev/stdin <<<'a=/tmp/x'; rm -rf \"$a\"",
+                    "a=x/tmp/q; c=\"${a#${b:-x}}\"; rm -rf \"$c\"",
+                    "a=xx/tmp; c=\"${a:$((1+1))}\"; ls \"$c\"",
+                    "source <(kubectl completion bash); kubectl get pods"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
+    def test_eval_named_by_indirection_or_a_for_word_binds_its_assignment(self):
+        """XERK-1666: an eval word spelled by `${!x}` or by a `for` name binds
+        what it assigns, as a literal eval does; each ran as nobody."""
+        for cmd in ("y=eval; x=y; ${!x} \"a='rm -rf /etc'\"; $a",
+                    "y=eval; x=y; \"${!x}\" \"a='rm -rf /etc'\"; $a",
+                    "for e in eval; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for e in ls eval; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for e in 'eval'; do \"$e\" \"a='rm -rf /etc'\"; done; $a",
+                    "for e in ev; do ${e}al \"a='rm -rf /etc'\"; done; $a",
+                    "y=eval; for x in y; do ${!x} \"a='rm -rf /etc'\"; $a; done",
+                    # QA: indirection to a loop name, a word-split list, a
+                    # name glued to a quote, an op or element on `${!x}`,
+                    # a backslash in the value.
+                    "for y in ls eval; do x=y; ${!x} \"a='rm -rf /etc'\"; done; $a",
+                    "x='ls eval'; for e in $x; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for p in e x; do for q in v y; do $p$q'al' \"a='rm -rf /etc'\"; done; done; $a",
+                    "y=EVAL; x=y; ${!x,,} \"a='rm -rf /etc'\"; $a",
+                    "y=evalz; x=y; ${!x%%z} \"a='rm -rf /etc'\"; $a",
+                    "y=eval; x=(y); ${!x[0]} \"a='rm -rf /etc'\"; $a",
+                    "y=(eval); x='y[0]'; ${!x} \"a='rm -rf /etc'\"; $a",
+                    "e=ev\\al; $e \"a='rm -rf /etc'\"; $a",
+                    # QA delta: transforms, glued-quote and nested split
+                    # lists, eval past a long split list, `$"…"` glue.
+                    "y=EVAL; x=y; ${!x@L} \"a='rm -rf /etc'\"; $a",
+                    "y=EVAL; ${y@L} \"a='rm -rf /etc'\"; $a",
+                    "x='ls eval'; for e in $x''; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for y in 'ls eval'; do for e in $y; do $e \"a='rm -rf /etc'\"; done; done; $a",
+                    "x='" + " ".join(f"w{i}" for i in range(20)) + " eval'; "
+                    "for e in $x; do $e \"a='rm -rf /etc'\"; done; $a",
+                    "for p in ev; do $p$\"al\" \"a='rm -rf /etc'\"; done; $a",
+                    # QA delta 3: a `${!x}` whose x no reading follows, and
+                    # transforms that decode or prefix the value.
+                    "for y in ls eval; do x=$'\\x79'; ${!x} \"a='rm -rf /etc'\"; done; $a",
+                    "for y in ls eval; do z=ay; x=${z#a}; ${!x} \"a='rm -rf /etc'\"; done; $a",
+                    "y='\\x65val'; ${y@E} \"a='rm -rf /etc'\"; $a",
+                    "y=EVAL; ${y@a}${y@L} \"a='rm -rf /etc'\"; $a",
+                    # QA delta 4: the decoded value stored, then run.
+                    "y='\\x65val'; z=${y@E}; $z \"a='rm -rf /etc'\"; $a",
+                    "y='\\145val'; z=${y@P}; $z \"a='rm -rf /etc'\"; $a",
+                    "y='\\x65val'; for z in ${y@E}; do $z \"a='rm -rf /etc'\"; done; $a",
+                    # QA delta 5: bash ends `@E` at a NUL; `@P` is a prompt
+                    # expansion (`\s` is the shell), read as unreadable.
+                    "y='eval\\0x'; z=${y@E}; $z \"a='rm -rf /etc'\"; $a",
+                    "y='eval\\c x'; z=${y@E}; $z \"a='rm -rf /etc'\"; $a",
+                    "y='\\s'; z=${y@P}; $z -c 'rm -rf /etc'",
+                    "y='\\s'; z=${y@P}; w=$z; $w -c 'rm -rf /etc'",
+                    "y='\\x65val'; z=${y@E}; w=$z; $w \"a='rm -rf /etc'\"; $a",
+                    # QA delta 6: the transform spliced in place, and on an
+                    # array element.
+                    "y='\\x62ash'; ${y@E} -c 'rm -rf /etc'",
+                    "y='\\x62ash'; \"${y@E}\" -c 'rm -rf /etc'",
+                    "y='\\s'; \"${y@P}\" -c 'rm -rf /etc'",
+                    "y=('\\x65val'); z=${y[0]@E}; $z \"a='rm -rf /etc'\"; $a",
+                    "y=('\\x62ash'); \"${y[@]@E}\" -c 'rm -rf /etc'",
+                    "y=('\\s'); z=${y[0]@P}; $z -c 'rm -rf /etc'",
+                    "y=('\\x62ash'); i=(0); ${y[i[0]]@E} -c 'rm -rf /etc'",
+                    # QA delta 8: `%]@E` is a trim, never decoded (the NUL
+                    # cut would hide the script).
+                    "y=('true \\0; rm -rf /etc'); bash -c \"${y[0]%]@E}\"",
+                    "y=('true \\0; rm -rf /etc'); z=${y[0]//x/]@E}; bash -c \"$z\"",
+                    # QA delta 9: an escaped quote in the subscript.
+                    "declare -A y; y[\\\"]='\\x62ash'; ${y[\\\"]@E} -c 'rm -rf /etc'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("for e in eval; do echo \"$e\"; done",
+                    "y=echo; x=y; ${!x} \"a=hi\"; echo $a",
+                    "for f in a b; do echo \"$f\"; done",
+                    "x='ls echo'; for e in $x; do $e \"a=hi\"; done; echo $a",
+                    "y=1; x=y; echo ${!x[@]} ${!y*}",
+                    "for y in a b; do x=y; echo \"${!x}\"; done",
+                    "x='a b'; printf '%s' \"${x@Q}\" \"${x@E}\"",
+                    "y='a\\tb'; echo \"${y@E}\" \"${y@P}\"",
+                    # Plain loops beside an unrelated `${!x}` stay cheap,
+                    # their name reused too (QA).
+                    "; ".join("for v in " + " ".join(f"f{i}" for i in range(30)) + "; do echo v; done"
+                              for _ in range(15)) + "; x=HOME; echo \"${!x}\"",
+                    "x=HOME; echo \"${!x}\"; " + "; ".join(
+                        f"for v{j} in " + " ".join(f"w{i}" for i in range(20)) + "; do :; done"
+                        for j in range(12))):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_an_op_too_costly_to_match_is_unreadable_not_kept_whole(self):
         """XERK-1651 QA: the cost caps are what keep one op from running past
         the hook's deadline; past them a value with blanks is led by the
@@ -2163,8 +2602,8 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("shopt -s extglob; f=build.bak; rm -rf \"${f%+(.bak)}\"",
-                    "shopt -s extglob; t=' x '; eval \"echo ${t##+( )}\"",
                     "shopt -s extglob; p=/repos/x/; cd \"${p%%+(/)}\"",
+                    "shopt -s extglob; rm -rf \"${HOME%%+(/)}/scratch/tmp\"",
                     "shopt -s extglob; a='xx/tmp/y'; rm -rf \"${a##+(x)}\"",
                     "a=xxrm; echo ${a#@(xx)}"):
             with self.subTest(cmd=cmd):
@@ -2375,6 +2814,64 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_xerk_1655_positional_bypasses(self):
+        """XERK-1655: positionals reached through eval/trap/declare -f, non-brace
+        function bodies, `${1#x}`/`${@:2}` ops applied, brace/alternative call
+        words, `set` from a substitution, a `while` shifting past `_MAX_SHIFTS`,
+        and function OUTPUT (`$(f /etc)`). Each ran its payload under real bash
+        (verified as nobody, flow.py) and reached rm with /etc."""
+        for cmd in (
+            # eval / trap reaching a call or a set
+            'f() { rm -rf "$1"; }; eval \'f /etc\'',
+            'f() { rm -rf "$1"; }; trap \'f /etc\' EXIT',
+            'f() { eval \'rm -rf "$1"\'; }; f /etc',
+            'f() { eval rm -rf \'$1\'; }; f /etc',
+            'f() { x=\'$1\'; eval rm -rf "$x"; }; f /etc',
+            'f() { trap \'rm -rf "$1"\' RETURN; }; f /etc',
+            'eval \'set -- /etc\'; rm -rf "$1"',
+            'for i in 1 2; do eval "set -- /etc"; rm -rf "$1"; done',
+            'c=\'rm -rf "$1"\'; set -- /etc; eval "$c"',
+            'c=\'rm -rf "$1"\'; f() { eval "$c"; }; f /etc',
+            'f() { rm -rf "$1"; }; f a; eval "f /etc"',
+            'set -- /etc; eval \'rm -rf "$1"\'',
+            'c=\'rm -rf "$1"\'; set -- /etc; eval "$c"',
+            # non-brace function bodies
+            'f() for p; do rm -rf "$p"; done; f /etc',
+            'f() if true; then rm -rf "$1"; fi; f /etc',
+            'f() [[ -n $(rm -rf "$1") ]]; f /etc',
+            'f() while rm -rf "$1"; do break; done; f /etc',
+            'function f for p; do rm -rf "$p"; done; f /etc',
+            # operator forms applied in a bound reading
+            'f() { rm -rf "${1#x}"; }; f x/etc',
+            'set -- x /etc; set -- "${@:2}"; rm -rf "$1"',
+            # brace / alternative call words
+            'f() { rm -rf "$3"; }; f {a,b} /etc',
+            'f() { rm -rf "$1"; }; f ${HOME:+/etc}',
+            # set from a substitution's output
+            'set -- $(printf \'%s \' a /etc); rm -rf "$2"',
+            # a while loop shifting past _MAX_SHIFTS
+            'f() { while [ $# -gt 0 ]; do rm -rf "$1"; shift; done; }; f a b c d e f g h i /etc',
+            # function OUTPUT
+            'f() { echo "$1"; }; rm -rf "$(f /etc)"',
+            'f() { echo /etc; }; rm -rf "$(f)"',
+            'f() { rm -rf "$(f2 "$1")"; }; f2() { echo "$1"; }; f /etc',
+            # a function exported into a child shell via declare -f
+            'f() { rm -rf "$1"; }; bash -c "$(declare -f f); f /etc"',
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Benign shapes these must not catch.
+        for cmd in (
+            "f() { if [ \"$1\" -gt 0 ]; then f $(( $1 - 1 )); fi; }; f 10",
+            "f() for d in build dist; do rm -rf \"./$d\"; done; f",
+            "log() { echo \"[$1]\"; }; log hi",
+            "f() { echo \"$1\"; }; x=$(f hi); echo \"$x\"",
+            "trap 'echo done' EXIT; echo hi",
+            "eval 'ls -l'",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_backslash_ending_comment_is_no_continuation(self):
         """XERK-1626 QA: `# c\\` NL `# d` is two comments. Read as `a\\`-newline
         `#`, the second `#` was a word: a function body stayed open, and its `'`
@@ -2442,7 +2939,9 @@ class TestScriptChannels(unittest.TestCase):
                     f"cat <<'EOF' | bash\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
-        for cmd in ("echo hi | sh", f"echo '{R}' | cat", f"echo '{R}' > n.txt; bash b.sh",
+        # `echo … > n.txt; bash b.sh` is refused: a file run that is not the
+        # written path fails closed (XERK-1674).
+        for cmd in ("echo hi | sh", f"echo '{R}' | cat", f"echo '{R}' > n.txt; python3 b.py",
                     "git log | sh -c 'wc -l'", f"cat <<'EOF' | python3\n{R}\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
@@ -2800,6 +3299,56 @@ class TestScriptChannels(unittest.TestCase):
         self.assertAllowed(many)
         self.assertLess(time.monotonic() - start, 10)
 
+    def test_xerk_1674_write_then_run_fails_closed(self):
+        # XERK-1674: a file the line writes, run by a route the guard cannot pin
+        # to the written path, reads every written file as a script.
+        P = "rm -rf /etc"
+        for cmd in (
+                # writers
+                f"echo '{P}' | cat - > f; sh f", f"echo '{P}' | cat -u > f; sh f",
+                f"cat > f <<< '{P}'; sh f", f"echo '{P}' | head -n1 > f; sh f",
+                f"echo '{P}' | tr a a > f; sh f", f"echo '{P}' | dd of=f; sh f",
+                f"echo '{P}' | cp /dev/stdin f; sh f", f"sh -c \"echo '{P}' > f\"; sh f",
+                f"eval \"echo '{P}' > f\"; sh ./f",
+                # runners
+                f"echo '{P}' > f; bash -s a < f", f"echo '{P}' > f; cat f | sh",
+                f"echo '{P}' > f; sh < <(cat f)", f"echo '{P}' > f; sh /dev/stdin < f",
+                f"echo '{P}' > f; sh -c 'sh < f'", f"echo '{P}' > f; bash -c 'bash f'",
+                # path spellings
+                f'echo \'{P}\' > f; sh "$PWD"/f', f"echo '{P}' > f; sh $(pwd)/f",
+                f"echo '{P}' > f; PATH=.:$PATH f", f"echo '{P}' > f; echo | xargs ./f",
+                f"echo '{P}' > f; find . -name f -exec {{}} \\;", f'echo \'{P}\' > f; "$PWD/f"',
+                # copies
+                f"echo '{P}' > f; cp f g; sh g", f"echo '{P}' > f; mv f g; sh g",
+                f"echo '{P}' > f; ln -s f g; sh g",
+                # the caller's positionals reaching a sourced or unnamed run
+                "echo 'rm -rf \"$1\"' > x.sh; set -- /etc; . ./x.sh",
+                "echo 'rm -rf \"$1\"' > x.sh; f() { . ./x.sh; }; f /etc",
+                "echo 'rm -rf \"$1\"' > x.sh; cp x.sh y.sh; sh y.sh /etc",
+                f"echo '{P}' > notes.txt; bash b.sh",
+                # a `-c` script naming the written file again, a `$S` spelling
+                f"echo '{P}' > f; bash -c ./f", f"echo '{P}' > f; sh -c \"$(cat f)\"",
+                f"S=.; echo '{P}' > $S/f; $S/f", f"echo '{P}' > f; cat f > g; sh g",
+                f"echo '{P}' > f; run(){{ sh f; }}; run", f"echo '{P}' > f; trap 'sh f' EXIT"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Past `_MAX_SCRIPT_RUNS`, a glued `"$1/$2"` is read per argument.
+        runs = "; ".join(f"sh x.sh a{i} b{i}" for i in range(9))
+        self.assertDenied(f"echo 'rm -rf \"$1/$2\"' > x.sh; {runs}; sh x.sh \"\" etc")
+        self.assertAllowed(f"echo 'rm -rf \"$1/$2\"' > x.sh; {runs}; sh x.sh tmp x")
+        for cmd in ("echo hello > out.txt; ./run.sh", "echo ls | cat - > f; sh f",
+                    f"cat <(echo hi) | bash -c 'echo {P} > notes'",
+                    # a note holding a command, beside a `.` argument or a path run
+                    f"echo '{P} is the repro' > notes.md; git add . && git commit -qm wip",
+                    f"cat > notes.md <<'EOF'\n{P}\nEOF\n./scripts/lint.sh",
+                    "echo hi > t.txt; trap 'rm -f t.txt' EXIT; cat t.txt",
+                    f"cat > n.md <<'EOF'\n{P}\nEOF\n~/.claude/bin/jira create -d \"$(cat n.md)\"",
+                    "git log --oneline > log.txt && bash scripts/check.sh",
+                    "echo 'rm -rf \"$1\"' > x.sh; sh x.sh build",
+                    "cat > a.sh <<'EOF'\nrm -rf build\nEOF\nchmod +x a.sh && ./a.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_proc_subst_passed_through_or_sourced_in_a_c_script(self):
         # XERK-1611: `cat <(…)` passes its file through to a shell downstream,
         # and a quoted `<(…)` in a `-c` script is the INNER shell's to run.
@@ -2900,10 +3449,15 @@ class TestScriptChannels(unittest.TestCase):
                     "{ (true; echo hi) | sh; }", "for i in 1; do (true; echo hi) | sh; done",
                     # A redirect re-read as its own part must not loop to the
                     # depth cap, which reads as a reader (replay false deny).
-                    f"git push -u origin x 2>&1 | tail -4 && cat > pr.md <<'EOF'\n| sh `{R}`\nEOF",
-                    f'jira comment X "\\`while read l; do eval \\"\\$l\\"; done < <(echo {R})\\`" 2>&1 | tail -2'):
+                    f"git push -u origin x 2>&1 | tail -4 && cat > pr.md <<'EOF'\n| sh `{R}`\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        # XERK-1655: the backtick below runs `while read l; do eval "$l"; done <
+        # <(echo rm -rf /)`, which really deletes / — eval-inlining now resolves
+        # the read value into the eval'd command (main missed it). Must still not
+        # loop to the depth cap: it classifies fast, below.
+        self.assertDenied(
+            f'jira comment X "\\`while read l; do eval \\"\\$l\\"; done < <(echo {R})\\`" 2>&1 | tail -2')
         # Past its depth cap a stage reads as a reader: fails closed.
         self.assertTrue(guard._reads_stdin_script("true", guard._MAX_EXPAND_DEPTH + 1))
         self.assertEqual(guard._group_core("(a)>a1>a1 2>&1 {fd}>/dev/null <<<w"), "(a)")
@@ -3259,6 +3813,35 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         self.assertEqual(guard._prenormalise("rm -rf {/etc,/var}\\"), "rm -rf /etc /var")
         self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\"), "rm -rf a\\\\ b\\\\")
         self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\\\"), "rm -rf a\\\\ b\\\\")
+
+    def test_a_brace_glued_to_a_quoted_word_repeats_the_whole_word(self):
+        # XERK-1683: the brace word started at the last blank, quoted or not,
+        # so `eval 'rm -rf /etc'{,x}` repeated only `/etc'` and was allowed.
+        for cmd in ("eval 'rm -rf /etc'{,x}", "eval 'rm -rf /etc'{,x}\\",
+                    'eval "rm -rf /etc"{,x}', "eval rm\\ -rf\\ /etc{,x}",
+                    "eval 'rm -rf /'{e..e}tc",
+                    # ...and one a quoted substitution or arithmetic fills:
+                    # cut inside it, the quotes unbalanced and hid the `rm`.
+                    'echo "$(echo x)"{1,2}; rm -rf /etc',
+                    'echo "`echo x y`"{1,2}; rm -rf /etc',
+                    'echo "$((1 + 2))"{1,2}; rm -rf /etc',
+                    'echo "${x:-$(echo a b)}"{1,2}; rm -rf /etc',
+                    "echo 'a b'{1,2}; rm -rf /etc",
+                    'x=$(echo "$(echo a b)"{1,2}); rm -rf /etc',
+                    "echo 'a b'$[1 + 2]`echo a $[1 + 2] b`{1,2} '$(a b)''`a b`'{a,b}c; "
+                    "rm -rf /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("echo 'a b'{,x}", "eval 'echo hi'{,x}", "touch /tmp/'a b'{1,2}",
+                    'git log --format="%h $(date)"{,}', 'mkdir -p "/tmp/my dir"/{src,test}',
+                    "echo $(echo 'a b'{1,2})",
+                    # Go raw strings in heredoc data: backticks misread as
+                    # substitutions once read this text "nested too deeply".
+                    "cat > x_test.go <<'EOF'\n// Wolf's field names.\n// Wolf's request and\n"
+                    "\t\t`\"pin\":false,\"runner\":{\"type\":\"process\",\"cmd\":\"x\"}}]}`)\n"
+                    "}\nEOF\nexport PATH=$HOME/go/bin:$PATH; go test ./pkg/... 2>&1 | tail -20"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
 
 class TestClassification(unittest.TestCase):
@@ -3936,10 +4519,10 @@ class TestExpansionBudget(unittest.TestCase):
                     f"for c in '{R}' x; do python3 -c 'import sys' \"$c\"; done", "for v in a b; do echo \"$v\" > s.txt; done; sh s.sh"):
             self.assertIsNone(self.check(cmd), cmd)
         # Glued names are found in linear time on a long blank-free run (QA).
-        self.assertTrue(guard._glued_name_pairs("x" * 60000 + "$a" + "$b" * 3, {"a", "b"}))
+        self.assertTrue(guard._glued_name_groups("x" * 60000 + "$a" + "$b" * 3, {"a", "b"}))
         # Only uses touching (quotes between at most) are a product: a path
         # `$d/$f` is read per list, as on main (QA: 2x on real loops).
-        self.assertEqual(guard._glued_name_pairs('$d/$f "$a""$b" $c\'$\'e', set("abcdef")),
+        self.assertEqual(guard._glued_name_groups('$d/$f "$a""$b" $c\'$\'e', set("abcdef")),
                          {frozenset("ab"), frozenset("ce")})
         # Past its cap a brace list's items are each read, never cut short or
         # refused (a long brace in heredoc text nothing runs, QA).
@@ -3957,6 +4540,61 @@ class TestExpansionBudget(unittest.TestCase):
         with mock.patch.object(guard, "_MAX_FOR_PRODUCT", 0):
             self.assertIsNone(self.check(
                 f"for a in {words}; do for b in {words}; do echo $a $b; done; done"))
+
+    def test_glued_loop_values_through_three_lists_names_or_calls(self):
+        # XERK-1692: each ran `rm -rf /etc` while the guard allowed it.
+        A, B = "for a in x r; do for b in y m; do", "done; done"
+        for cmd in ("for a in x r; do for b in y m; do for c in z ' -rf /etc'; do $a$b$c; "
+                    "done; done; done",
+                    f"{A} c=$a; $c$b -rf /etc; {B}",
+                    f"{A} c=$a; d=$c; $d$b -rf /etc; {B}",
+                    f"f(){{ $1$2 -rf /etc; }}; {A} f $a $b; {B}",
+                    f"{A} eval '$'a'$'b' -rf /etc'; {B}",
+                    f"{A} printf -v c '%s%s' $a $b; $c -rf /etc; {B}",
+                    # QA: a quoted or substituted value, a here-string read,
+                    # `set`, a `shift`ed call.
+                    f'{A} c=" $a"; $c$b -rf /etc; {B}', f"{A} c=$(echo $a); $c$b -rf /etc; {B}",
+                    f"{A} c=`echo $a`; $c$b -rf /etc; {B}", f"{A} read c <<< $a; $c$b -rf /etc; {B}",
+                    f"{A} set -- $a $b; $1$2 -rf /etc; {B}",
+                    f"f(){{ shift; $1$2 -rf /etc; }}; {A} f x $a $b; {B}"):
+            with self.subTest(cmd=cmd):
+                reason = self.check(cmd)
+                self.assertIsNotNone(reason)
+                self.assertNotIn(self.TOO_LARGE, reason)
+        for cmd in (f"{A} c=$a; echo $c$b; {B}", f"f(){{ echo $1$2; }}; {A} f $a $b; {B}",
+                    f"{A} c=$a; echo $c $b; {B}"):
+            self.assertIsNone(self.check(cmd), cmd)
+        self.assertEqual(guard._glued_name_groups("$a$b$c", set("abc")), {frozenset("abc")})
+        self.assertEqual(guard._glued_name_groups("c=$a; $c$b", set("ab")), {frozenset("ab")})
+        self.assertEqual(guard._glued_name_groups("c=$a; $c $b", set("ab")), set())
+        # A loop name holds its list word, whatever else assigns it (replay).
+        self.assertEqual(guard._glued_name_groups(
+            "v=$1; for v in a b; do echo rf-$v; done; for d in 'x y' 'z w'; do set -- $d; done",
+            set("vd")), set())
+        self.assertEqual(guard._glued_name_groups("f(){ $1$2; }; f $a $b", set("ab")),
+                         {frozenset("ab")})
+        # Sources settle along any chain order, and a run of unclosed `$(`
+        # values stays linear.
+        chain = " ".join(f"l{i}=$l{i + 1};" for i in range(40))
+        self.assertEqual(guard._glued_name_groups(f"{chain} l40=$a; $l0$b", set("ab")),
+                         {frozenset("ab")})
+        for text in ("c=$(" * 40000, "c=`" * 40000, "read " + "x " * 40000 + "<<<"):
+            t = time.monotonic()
+            guard._glued_name_groups(text + " $a$b", set("ab"))
+            self.assertLess(time.monotonic() - t, 3, text[:10])
+        # The same names looped again and again (a rig's copies): past the cap
+        # each glued word reads only the loops binding it, never too large.
+        three = "for a in x r; do for b in y m; do for c in z w; do echo $a$b$c; done; done; done; "
+        self.assertIsNone(self.check(three * 4, limit=20))
+        reason = self.check(three * 3 + "for a in x r; do for b in y m; do for c in z ' -rf /etc'; "
+                            "do $a$b$c; done; done; done", limit=20)
+        self.assertIsNotNone(reason)
+        self.assertNotIn(self.TOO_LARGE, reason)
+        # An N-way product stays inside `_MAX_FOR_PRODUCT`: 7^3 is too large.
+        words = " ".join(f"w{i}" for i in range(7))
+        self.assertIn(self.TOO_LARGE, self.check(
+            f"for a in {words}; do for b in {words}; do for c in {words}; do echo $a$b$c; "
+            "done; done; done") or "")
 
     def test_long_for_lists_are_read_per_word_fast(self):
         # XERK-1647: a reading per list word drops the rest of the list, so
@@ -4532,6 +5170,47 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
+    def test_a_blank_inside_an_unquoted_brace_stays_in_its_word(self):
+        # XERK-1680: bash reads `${x: -5}/etc` as ONE word (the negative offset
+        # needs the blank); shlex cut it at the blank, so `/etc` was never judged.
+        self.assertEqual(guard._tokenize("rm -rf ${x: -5}/etc"), ["rm", "-rf", "${x: -5}/etc"])
+        self.assertEqual(guard._tokenize("rm ${x:\t-5} \\${y: 1}"),
+                         ["rm", "${x:\t-5}", "${y:", "1}"])
+        # A planted stand-in stays itself, never a blank.
+        self.assertEqual(guard._tokenize("echo ${x: 1} \ue000 a\ue001b"),
+                         ["echo", "${x: 1}", "\ue000", "a\ue001b"])
+        # The pipe-to-shell walk reads the stage joined too (QA F1).
+        payload = "rm" + " -rf /etc"
+        for cmd in (f"echo '{payload}' ${{x/;/}} | sh", f"echo '{payload}' ${{x/&&/}} | sh",
+                    f"printf %s ${{x/;/}}'{payload}' | sh",
+                    f"cat <<< '{payload}' ${{x/;/}} | sh",
+                    f"echo {payload} ${{x/\n/}} | sh"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ("echo ${x//|/,} | sh", "echo ${x//;/,} | cat"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cmd in ("rm -rf ${x: -5}/etc", "rm -rf ${HOME: -5}", "rm -rf ${x:0: -1}/etc",
+                        "rm -rf ${x: 1}/usr", "rm -rf ${x/ a/}/etc", "rm -rf ${x#* }/etc",
+                        "rm -rf ${x:\t-5}/etc", "chmod -R 777 ${x: -5}/etc",
+                        "chown -R me ${x: -5}/usr",
+                        # `\r` is a blank to shlex only; a newline or operator inside the
+                        # braces is text to bash, so the segment is also read joined.
+                        "rm -rf ${x:\r-5}/etc", "rm -rf ${x:\n-5}/etc", "rm -rf ${x/;/}/etc",
+                        "rm -rf ${x/|/}/etc", "rm -rf ${x/&&/}/etc",
+                        # A planted stand-in character never reads as a blank.
+                        "rm -rf ${x: -5}/etc \ue000", "chmod -R 777 ${x: -5}/etc \ue002"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNotNone(guard.is_destructive(cmd))
+            for cmd in ("rm -rf ${x: -5}/build", "rm -rf $HOME/${x: -3}/build",
+                        "echo ${x: -5} && ls", "echo ${x/;/} ; ls",
+                        # A `${` then a blank names no parameter (the guard's own
+                        # placeholder splices read so): its words stay split.
+                        "$(echo ${;#)}\nf"):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNone(guard.is_destructive(cmd))
+
     def test_every_unset_name_component_is_read_empty(self):
         # XERK-1652: bash reads every unset name empty, not only the leading
         # run: a whole component with more path after it, and a trailing run
@@ -4560,6 +5239,35 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             start = time.monotonic()
             guard._unset_names_dropped(word)
             self.assertLess(time.monotonic() - start, 2)
+
+    def test_a_last_component_of_names_is_read_empty_without_preserve_root(self):
+        # XERK-1687: GNU rm refuses `/`, so `rm -rf "$x/$y"` keeps its last
+        # component's names; nothing else that walks a tree refuses it.
+        for cmd in ('chmod -R 777 "$x/$y"', 'chown -R nobody "$x/$y"', 'chgrp -R x "$TMP/$y"',
+                    'find "$x/$y" -delete', "find $x/$y -exec rm -rf {} +",
+                    'find "$x/$y" -exec sh -c "rm -rf {}" \\;', 'find "$dir/$name.$ext" -delete',
+                    'rm -rf --no-preserve-root "$x/$y"', 'busybox rm -rf "$x/$y"',
+                    "busybox rm -rf /etc", "busybox chmod -R 777 /", "busybox find / -delete",
+                    "cd /; busybox rm -rf *", 'find "$x/$y" | xargs rm -rf',
+                    'find "$x/$y" -print0 | xargs -0 rm -rf',
+                    # `busybox` is stripped, so its shells must still be shells (QA).
+                    "busybox hush -c 'rm -rf /'", "busybox msh -c 'rm -rf /etc'",
+                    "busybox hush <<'E'\nrm -rf /etc\nE",
+                    # ...and busybox itself stays one to `-c` (QA).
+                    "busybox script -qc 'rm -rf /etc' /dev/null", "busybox -- rm -rf /etc",
+                    # ...and a pipe still reaches the applet (QA).
+                    "echo 'rm -rf /etc' | busybox env sh", "echo /etc | busybox xargs rm -rf",
+                    "echo 'rm -rf /etc' | busybox xargs -0 busybox hush -c",
+                    'busybox find "$x/$y" | xargs rm -rf'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
+                    'find "$dir/$f" -exec grep -l x {} +', 'chmod -R 755 "$dir"/build',
+                    'find "$d"/out -delete', 'busybox rm -rf "$dir"/build', "busybox ls /",
+                    'find "$dir"/out -name "*.o" | xargs rm -f', "busybox tar -czf x.tgz dir",
+                    "echo hi | busybox hush"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
 
     def test_a_target_built_from_home_is_read_with_the_real_home(self):
         # XERK-1656: `$HOME`, `~` and `${HOME<op>}` are expanded against the
@@ -4608,6 +5316,30 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": "/"}):
             self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/etc"))
             self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
+
+    def test_a_program_or_flag_built_from_home_is_read_with_the_real_home(self):
+        # XERK-1686: HOME is set, so `${HOME:+r}` is `r` and `${HOME/*/rm}` is
+        # `rm`; kept as written, the program and flag words hid `rm -rf /`.
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cmd in ("${HOME:+r}m -rf /", "${HOME/*/rm} -rf /", "rm ${HOME:+-rf} /",
+                        "${HOME:+eval} 'rm -rf /'", "${HOME/*/eval} 'rm -rf /'",
+                        '"${HOME:+rm}" -rf /', "${HOME:+rm -rf /}", "${HOME+r}m -rf /etc",
+                        "${HOME//*/rm} -rf /", "${HOME:+'rm'} -rf /",
+                        "bash -c '${HOME:+r}m -rf /'",
+                        # An op word with another expansion stays as written,
+                        # as on main: read empty, `$((0))` made it `$HOME` (QA).
+                        '${HOME:0:$((0))}rm -rf /', 'rm -rf ${HOME:0:$((0))}/etc',
+                        '${HOME:$[0]:0}rm -rf /', '${HOME:0:$(echo 0)}rm -rf /',
+                        '${HOME:0:`echo 0`}rm -rf /', 'rm -rf ${HOME:0:`echo 0`}/etc'):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNotNone(guard.is_destructive(cmd))
+            # A reading inside the home still maps back to `$HOME…`.
+            for cmd in ("rm -rf ${HOME:+$HOME/.cache}", 'rm -rf "${HOME%/}/.cache"',
+                        "echo ${HOME:+hi}", "${HOME#/}x rm -rf /", '"${HOME:+rm -rf /}"',
+                        'cp a "${HOME%/}/b"', "${HOME%/*}/bin/x",
+                        'rm -rf ${HOME:+"$HOME"/tmp/x}', 'rm -rf "${HOME:+"$HOME"/.cache}"'):
+                with self.subTest(cmd=cmd):
+                    self.assertIsNone(guard.is_destructive(cmd))
 
     def test_home_readings_are_bounded(self):
         # XERK-1656: each pattern op costs a match per substring of HOME, so
@@ -4715,6 +5447,17 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "sh <<< 'rm -rf /etc'\\\n", "bash -c 'rm -rf /etc '\\ ; true",
                     "eval 'rm -rf /etc '\\ ; true", "echo 'rm -rf /etc;'\\ | sh",
                     "{ bash -c 'rm -rf /etc'\\; }",
+                    # ...printed by a substitution spliced into a quoted
+                    # script, where it escaped the closing `"` (XERK-1691).
+                    'sh -c "$(echo "bash -c \'rm -rf /etc;\'\\\\")"',
+                    'sh -c "$(printf "bash -c \'rm -rf /etc;\'\\\\\\\\")"',
+                    'eval "$(printf "bash -c \'rm -rf /etc;\'\\\\\\\\")"',
+                    'bash -c "$(printf \'%s\' "bash -c \'rm -rf /etc;\'\\\\")"',
+                    'echo "$(echo \'a\\\')"; rm -rf /etc',
+                    # ...an ADDED reading: kept, an inner printer's odd run
+                    # and a `\`-newline continuation still deny (QA).
+                    'sh -c "$(echo $(echo \'a; b\\\\\\\'))\'; rm -rf /; #\'"',
+                    "echo \"$(echo 'rm -rf /et\\')\nm -rf /etc\" | sh",
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',
