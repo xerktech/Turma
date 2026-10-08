@@ -2179,6 +2179,15 @@ class TestScriptChannels(unittest.TestCase):
                     "bash -c 'cd /; cd /tmp; rm -rf ~-'",
                     "bash -c 'cd /etc; pushd /tmp; rm -rf ~1'",
                     "bash -c 'HOME=/etc; rm -rf ~'",
+                    # QA: a quoted or escaped tilde `eval` expands, and an op
+                    # that keeps the set value.
+                    "cd /; cd /tmp; eval rm -rf '~-'",
+                    "cd /; cd /tmp; eval rm -rf \\~-/etc",
+                    "cd /etc; cd /tmp; eval rm -rf \\~-/\\*",
+                    "cd /; cd /tmp; t='~-'; eval rm -rf $t",
+                    "cd /etc; eval rm -rf '~+'",
+                    "cd /; cd /tmp; rm -rf ${OLDPWD:?}",
+                    "cd /etc; rm -rf ${PWD:?}/*",
                     # Already denied: `..` climbing out of a home.
                     "rm -rf ~root/../etc", "rm -rf ~daemon/../../etc",
                     "rm -rf ~/../..", "rm -rf $HOME/../../etc"):
@@ -2186,7 +2195,8 @@ class TestScriptChannels(unittest.TestCase):
                 self.assertDenied(cmd)
         for cmd in ("rm -rf ~-/build", "cd /tmp/a; cd /tmp/b; rm -rf ~-/build",
                     "bash -c 'cd /tmp/a; rm -rf ~+/build'", "bash -c 'rm -rf ~/build'",
-                    "ls ~1 ~+2", "cd ~-; rm -rf build", "rm -rf x-~-y"):
+                    "ls ~1 ~+2", "cd ~-; rm -rf build", "rm -rf x-~-y",
+                    "git diff HEAD~1", "cd /tmp/a; rm -rf ${PWD:?}/build"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

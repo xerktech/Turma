@@ -41,6 +41,8 @@ paths:
     `~+` always reads as `$PWD`.
   - `~-` reads as `$OLDPWD`, and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD` (XERK-1696);
     `_under_cwd` reads `$OLDPWD` as `$PWD`: any directory the line visited, unordered.
+  - `_PWD_LEAD_RE` also takes `${PWD:?}`-style ops and an unspliced directory tilde, which
+    `eval rm '~-'` / `\~-` reach a target as (the splice's lookbehind skips quotes).
   - A quote may end the tilde word (`bash -c 'cd /etc; rm -rf ~+'`): `~'/x'` is literal in
     bash, so that splice over-reads, which only adds a reading.
   - A `~` opening a `${y:-…}`/`-`/`:+`/`:=`/`:?` word (`_PARAM_TILDE_RE`) or a `${y/pat/…}`

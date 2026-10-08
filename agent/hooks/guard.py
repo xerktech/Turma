@@ -10592,7 +10592,10 @@ def _is_exact_root(path: str) -> bool:
 
 # `$OLDPWD` too: whichever directory the line was in before its last `cd`,
 # so any of them (XERK-1696). An inherited one reads as the session's cwd.
-_PWD_LEAD_RE = re.compile(r"\$(?:(?:OLD)?PWD|\{(?:OLD)?PWD\})(?=/|$)")
+# ...and a `${PWD:?}`-style op that keeps a set value, and a directory tilde
+# (`~-`, `~+`, `~1`) reaching a target unspliced, as through `eval rm '~-'`.
+_PWD_LEAD_RE = re.compile(r"(?:\$(?:(?:OLD)?PWD|\{(?:OLD)?PWD(?::?[-=?][^${}]*)?\})"
+                          r"|~(?:[+-]|[+-]?[0-9]+))(?=/|$)")
 
 
 def _under_cwd(tok: str, cwd: str) -> str:
