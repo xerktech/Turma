@@ -10592,12 +10592,13 @@ def _is_exact_root(path: str) -> bool:
 
 # `$OLDPWD` too: whichever directory the line was in before its last `cd`,
 # so any of them (XERK-1696). An inherited one reads as the session's cwd.
-# ...and a `${PWD:?}`-style op that keeps a set value, and a directory tilde
+# ...and a `${PWD:?}`/`${PWD?}` op, which keeps the set value, and a directory tilde
 # (`~-`, `~+`, `~1`) reaching a target unspliced, as through `eval rm '~-'`.
-_PWD_LEAD_RE = re.compile(r"(?:\$(?:(?:OLD)?PWD|\{(?:OLD)?PWD(?::?[-=?][^${}]*)?\})"
+_PWD_LEAD_RE = re.compile(r"(?:\$(?:(?:OLD)?PWD|\{(?:OLD)?PWD(?::?\?[^${}]*)?\})"
                           r"|~(?:[+-]|[+-]?[0-9]+))(?=[/$]|$)")
 # Unknown names glued after it read empty (`$PWD$x`, `eval rm -rf '~-'$x`): every
-# name the line assigns is already spliced. Positionals stay: they are bound.
+# name the line assigns is already spliced. Anything else glued on (`$1`, `${x#a}`,
+# `.bak`) is joined to the directory as bash joins it, and judged there.
 _GLUED_UNSET_RE = re.compile(r"(?:\$[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\})+")
 
 
@@ -10614,6 +10615,8 @@ def _under_cwd(tok: str, cwd: str) -> str:
         if g := _GLUED_UNSET_RE.match(rest):
             rest = rest[g.end():]
         if rest[:1] not in ("", "/"):
+            if _is_exact_root(cwd) or ".." in rest.split("/"):
+                return (cwd.rstrip("/") or "/") + rest
             return tok
         rest = rest.lstrip("/")
         if _is_exact_root(cwd) or ".." in rest.split("/"):

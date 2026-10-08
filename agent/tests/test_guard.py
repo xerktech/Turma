@@ -2193,6 +2193,12 @@ class TestScriptChannels(unittest.TestCase):
                     "cd /etc; cd /tmp; eval rm -rf '~-'$x/*",
                     "cd /etc; pushd /tmp; eval rm -rf '~1'$x",
                     "cd /; rm -rf $PWD$x",
+                    "cd /; cd /tmp; eval rm -rf '~-'${x}$y",
+                    # ...and a positional or an op glued on joins the directory.
+                    "cd /; rm -rf $PWD$1", "cd /etc; rm -rf $PWD$1",
+                    "cd /; f(){ rm -rf $PWD$1; }; f",
+                    "cd /; cd /tmp; eval rm -rf '~-'$1",
+                    "cd /; rm -rf $PWD${x#a}",
                     # Already denied: `..` climbing out of a home.
                     "rm -rf ~root/../etc", "rm -rf ~daemon/../../etc",
                     "rm -rf ~/../..", "rm -rf $HOME/../../etc"):
@@ -2203,7 +2209,9 @@ class TestScriptChannels(unittest.TestCase):
                     "ls ~1 ~+2", "cd ~-; rm -rf build", "rm -rf x-~-y",
                     "git diff HEAD~1", "cd /tmp/a; rm -rf ${PWD:?}/build",
                     "cd /tmp/a; rm -rf $PWD$x", "cd /; rm -rf $PWD$x.bak",
-                    "cd /tmp/a; eval rm -rf ~-$x/build", "rm -rf ~-$x"):
+                    "cd /tmp/a; eval rm -rf ~-$x/build", "rm -rf ~-$x",
+                    "cd /; rm -rf $PWD${x}-old", "cd /etc; rm -rf $PWD.bak",
+                    "cd /tmp/a; rm -rf $PWD$1", "f(){ rm -rf $PWD$1; }; f /build"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
