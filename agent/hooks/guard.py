@@ -5200,6 +5200,7 @@ def _split_on_operators(command: str, include_pipe: bool = True,
     # is text, so `${y:- #}; rm -rf /` must not hide the `rm` as a comment, and
     # the `}` in `${a:-$(echo }) #}` closes nothing (XERK-1585).
     braces: list[str] = []
+    brace_at: list[int] = []  # where each of ``braces`` opened
     # With ``groups``: the open `(`/`{` groups, innermost last.
     opened: list[str] = []
     substs: dict[int, int] | None = None
@@ -5306,13 +5307,16 @@ def _split_on_operators(command: str, include_pipe: bool = True,
             # `$$` is the PID, so `$${` opens nothing.
             if command[i + 1] != "$":
                 braces.append(command[i + 1])
+                brace_at.append(i)
             buf.append(command[i:i + 2])
             i += 2
             continue
         if braces and ch == "}" and braces[-1] == "{":
             braces.pop()
+            brace_at.pop()
         elif braces and ch == ")" and braces[-1] == "(":
             braces.pop()
+            brace_at.pop()
         # No group opens inside a `${…}`: its `(` is pattern text (`${x#(}`),
         # and an open "group" there swallowed every pipe after it (XERK-1614).
         elif groups and not braces and not in_pattern and ch == "(":
@@ -5400,6 +5404,17 @@ def _split_on_operators(command: str, include_pipe: bool = True,
         if opened:
             buf.append(ch)
             i += 1
+            continue
+        if (braces and braces[-1] == "{" and ch in ";\n&|"
+                and _brace_end(command, brace_at[-1], False) > i):
+            # An operator inside a `${…}` is text to bash: `${x/;/}/etc` and
+            # `${x:<newline>-5}/etc` are one word, `/etc`. Read it both ways,
+            # split as before and joined (see `flush`), since a misread close
+            # must not hide every command after it (XERK-1680).
+            op = command[i:i + 2] if command[i:i + 2] in ("&&", "||", "|&", ";;") else ch
+            buf.append(op)
+            cuts.append((len(buf) - 1, ""))
+            i += len(op)
             continue
         if command[i:i + 2] in ("&&", "||"):
             flush()
@@ -6216,9 +6231,62 @@ def _drop_trailing_escape(text: str) -> str | None:
     return body[:-1] + text[len(body):]
 
 
+# The blanks shlex splits at; bash keeps them inside a `${…}` (`\r` it never splits at).
+_SHLEX_BLANKS = " \t\r\n"
+
+
+def _keep_brace_blanks(segment: str) -> tuple[str, dict[str, str]] | None:
+    """``segment`` with each blank inside an unquoted `${…}` swapped for a
+    private-use character the text does not hold, and the map back; None when
+    there is none to keep.
+
+    bash reads `${x: -5}/etc` as ONE word (a negative substring offset needs
+    the blank); shlex cut it into `${x:` and `-5}/etc`, so no target rule saw
+    the `/etc` it expands to (XERK-1680). Quoted blanks are shlex's already.
+    A `${` followed by a blank names no parameter: it is skipped, so the
+    guard's own `${ <placeholder>}` splices stay split as before.
+    """
+    if "${" not in segment:
+        return None
+    states = _quote_states(segment)
+    out = list(segment)
+    i = segment.find("${")
+    kept = False
+    while i >= 0:
+        end = -1
+        if states[i] == "" and segment[i + 2:i + 3] not in ("", *_SHLEX_BLANKS) \
+                and _live_dollar(segment, i):
+            end = _brace_end(segment, i, False)
+        if end < 0:
+            i = segment.find("${", i + 2)
+            continue
+        for k in range(i + 2, end):
+            if segment[k] in _SHLEX_BLANKS and states[k] == "":
+                out[k] = None
+                kept = True
+        i = segment.find("${", end + 1)
+    if not kept:
+        return None
+    # Stand-ins the text does not hold: a planted one must not read as a blank.
+    have = set(segment)
+    free = (chr(c) for c in range(0xE000, 0xF900) if chr(c) not in have)
+    stand = {b: next(free) for b in _SHLEX_BLANKS}
+    text = "".join(stand[segment[k]] if c is None else c for k, c in enumerate(out))
+    return text, {v: k for k, v in stand.items()}
+
+
 @functools.lru_cache(maxsize=512)
 def _tokenize_cached(segment: str) -> tuple[str, ...]:
     segment = _join_continuations(segment)
+    kept = _keep_brace_blanks(segment)
+    if kept is None:
+        return _tokenize_split(segment)
+    text, back = kept
+    back_table = str.maketrans(back)
+    return tuple(t.translate(back_table) for t in _tokenize_split(text))
+
+
+def _tokenize_split(segment: str) -> tuple[str, ...]:
     try:
         return tuple(shlex.split(segment, posix=True))
     except ValueError:

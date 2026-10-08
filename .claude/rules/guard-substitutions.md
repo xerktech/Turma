@@ -305,6 +305,19 @@ paths:
     scan, or a missed backtick, took `# don't` / `"\`echo "it's"\`"` as an open quote.
   - A backtick body ends at the next UNESCAPED backtick, as in bash, whatever `'` or `#` it holds;
     its states are computed locally. An open frame let `\`echo # it's\`` swallow its closer.
+- **A blank or operator inside an unquoted `${…}` stays in its word** (XERK-1680): bash reads
+  `${x: -5}/etc`, `${x:<newline>-5}/etc` and `${x/;/}/etc` as one word; cut, `/etc` was unjudged.
+  - Tokenizer (`_keep_brace_blanks`): shlex's blanks (`\r` too) swap to private-use stand-ins
+    the text does NOT hold — a fixed set was disabled by planting one.
+  - A `${` then a blank names no parameter and is skipped: the guard's own `${ <placeholder>}`
+    splices became one program word (a replayed false deny).
+  - Splitter: an operator inside a `${…}` that `_brace_end` closes later is a `cuts` entry, so the
+    segment is read split AND joined — a misread close must not hide every later command.
+  - The stage walk (`keep_redirects`) joins these too (its redirect cuts still never join):
+    split only, `echo '…' ${x/;/} | sh` cut the producer off its shell.
+  - Open (XERK-1742): a spliced DEFAULT keeps `;`/`&` live
+    (`echo '…' ${x:-;} | sh`), unlike an assigned value, which `_quote_literal` escapes.
+  - Tests: `test_a_blank_inside_an_unquoted_brace_stays_in_its_word`.
 - **A lone `\` ending a text is read DROPPED** (XERK-1646, `_drop_trailing_escape`): shlex
   raises on it, and the whitespace-split fallback kept a `-c`/`eval` script's quotes.
   - The reading lives in the TOKENIZER (`_tokenize_cached`): every route tokenizes — the

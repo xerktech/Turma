@@ -35,7 +35,6 @@ paths:
 - Cost, measured at the final commit: 0 changed decisions over a 35k-command real corpus
   replay vs main; 200 targets of 64 HOME ops decide as fast as main.
 - Cost bound: past `_MAX_HOME_OPS` operators on HOME in one target, the reading is `/`.
-- Open: an unquoted `${x: -5}` is split at its space before any of this (XERK-1680).
 - `~` and `$PWD` follow the LINE, not the session (XERK-1685): `HOME=/; rm -rf ~/etc` is //etc.
   - `_home_tilde_reading` adds a reading with every word-start `~` (and a bare `cd`) as `$HOME`
     when the raw text holds `HOM`, `OME` or `eval` (`HOM{E,}`, `H\OME`, `x=OME; …H$x`).
