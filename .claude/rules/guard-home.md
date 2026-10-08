@@ -84,7 +84,8 @@ paths:
   - Never mask literal non-list braces here (`{x,{a},/etc}`, XERK-1756): readings that see
     quoted JSON bare then expanded its lists, and two real commands went 4s → 26s (deadline).
   - It runs per nested body (thousands of calls on a backtick-heavy line): keep its
-    no-unit early return and lazy stand-in pick, or it costs 3-5x on the timing tests.
+    early returns (no unit, or no `{` but a `${`'s) and lazy stand-in pick: without them it
+    cost 3-5x on the timing tests, and 100k backticks with no list hit the stand-in refusal.
   - Tests: `test_a_brace_unit_inside_a_brace_list_is_one_item`.
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,
   `test_home_readings_are_bounded`.

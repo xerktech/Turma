@@ -2898,8 +2898,9 @@ def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
     in readings that see quoted JSON bare, unblocking its lists multiplied
     the readings, and real commands went past the deadline (6x).
     """
-    if "${" not in command and "$(" not in command and "`" not in command:
-        return None
+    if "${" not in command and "$(" not in command and "`" not in command \
+            or not _LIST_OPENER_RE.search(command):
+        return None  # nothing to mask, or no `{` a list could open with
     states = _quote_states(command)
     n = len(command)
     spans: list[tuple[int, int]] = []
@@ -2972,6 +2973,9 @@ def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
 
 # `_mask_param_braces`'s stand-ins' digit count: two digits name 65536 units.
 _BRACE_MASK_DIGITS = 256
+# A `{` that is not a `${`'s, or follows an escaped `\$`: only such a one opens a
+# brace list (bash expands `\${a,b}` to `$a $b`).
+_LIST_OPENER_RE = re.compile(r"(?<!\$)\{|\\\$\{")
 
 
 def _unmask_param_braces(command: str, back: dict[str, str]) -> str:
