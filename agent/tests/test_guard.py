@@ -2199,6 +2199,10 @@ class TestScriptChannels(unittest.TestCase):
                     "cd /; f(){ rm -rf $PWD$1; }; f",
                     "cd /; cd /tmp; eval rm -rf '~-'$1",
                     "cd /; rm -rf $PWD${x#a}",
+                    "cd /usr/lib; rm -rf $PWD$1/../..",
+                    # ...and a glob glued on (`/*`).
+                    "cd /; rm -rf $PWD*", "cd /; cd /tmp; rm -rf $OLDPWD*",
+                    "cd /; rm -rf ${PWD:?}*",
                     # Already denied: `..` climbing out of a home.
                     "rm -rf ~root/../etc", "rm -rf ~daemon/../../etc",
                     "rm -rf ~/../..", "rm -rf $HOME/../../etc"):
@@ -2211,7 +2215,8 @@ class TestScriptChannels(unittest.TestCase):
                     "cd /tmp/a; rm -rf $PWD$x", "cd /; rm -rf $PWD$x.bak",
                     "cd /tmp/a; eval rm -rf ~-$x/build", "rm -rf ~-$x",
                     "cd /; rm -rf $PWD${x}-old", "cd /etc; rm -rf $PWD.bak",
-                    "cd /tmp/a; rm -rf $PWD$1", "f(){ rm -rf $PWD$1; }; f /build"):
+                    "cd /tmp/a; rm -rf $PWD$1", "f(){ rm -rf $PWD$1; }; f /build",
+                    "cd /tmp/a; rm -rf $PWD*", "cd /; rm -rf $PWD.bak", "rm -rf $PWDX"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

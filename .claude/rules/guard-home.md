@@ -44,8 +44,10 @@ paths:
   - `_PWD_LEAD_RE` also takes `${PWD:?}`/`${PWD?}` and an unspliced directory tilde, which
     `eval rm '~-'` / `\~-` reach a target as (the splice's lookbehind skips quotes).
     `${PWD:-x}` never reaches it: the default is spliced upstream (XERK-1755).
-  - Unknown names glued after that lead read empty in `_under_cwd` (`$PWD$x`, eval'd `'~-'$x`);
-    any other glued tail (`$1`, `${x#a}`) is joined to the directory as bash joins it.
+  - Any tail glued after that lead (`$x`, `$1`, `${x#a}`, `*`) is joined to the directory as bash
+    joins it, then judged (`cd /; rm -rf $PWD*` is `/*`); a tilde lead takes only `/` or `$`.
+  - Accepted over-read: a function body's unbound reading reads `$1` empty, so after `cd /`,
+    `f(){ rm -rf $PWD$1; }; f /build` is refused, as `f(){ rm -rf /$1; }` already was.
   - Accepted over-read: a literal `~-` word (`t='~-'; rm -rf $t`) reads as `$OLDPWD`, so after a
     `cd /` it is refused; bash would remove a file named `~-`.
   - A quote may end the tilde word (`bash -c 'cd /etc; rm -rf ~+'`): `~'/x'` is literal in

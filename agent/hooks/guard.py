@@ -10594,12 +10594,11 @@ def _is_exact_root(path: str) -> bool:
 # so any of them (XERK-1696). An inherited one reads as the session's cwd.
 # ...and a `${PWD:?}`/`${PWD?}` op, which keeps the set value, and a directory tilde
 # (`~-`, `~+`, `~1`) reaching a target unspliced, as through `eval rm '~-'`.
-_PWD_LEAD_RE = re.compile(r"(?:\$(?:(?:OLD)?PWD|\{(?:OLD)?PWD(?::?\?[^${}]*)?\})"
-                          r"|~(?:[+-]|[+-]?[0-9]+))(?=[/$]|$)")
-# Unknown names glued after it read empty (`$PWD$x`, `eval rm -rf '~-'$x`): every
-# name the line assigns is already spliced. Anything else glued on (`$1`, `${x#a}`,
-# `.bak`) is joined to the directory as bash joins it, and judged there.
-_GLUED_UNSET_RE = re.compile(r"(?:\$[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\})+")
+# Whatever is glued on after it (`$x`, `$1`, `${x#a}`, `*`, `.bak`) is joined to the
+# directory as bash joins it and judged there: `cd /; rm -rf $PWD*` is `/*`. A tilde
+# takes only a `/` or a name (`eval rm -rf '~-'$x`): `~-.bak` is a literal word.
+_PWD_LEAD_RE = re.compile(r"(?:\$(?:OLD)?PWD(?!\w)|\$\{(?:OLD)?PWD(?::?\?[^${}]*)?\}"
+                          r"|~(?:[+-]|[+-]?[0-9]+)(?=[/$]|$))")
 
 
 def _under_cwd(tok: str, cwd: str) -> str:
@@ -10612,8 +10611,6 @@ def _under_cwd(tok: str, cwd: str) -> str:
         # `$PWD` is the directory `cd` left, read as a relative operand is:
         # `cd /; rm -rf $PWD/etc` (XERK-1685).
         rest = tok[m.end():]
-        if g := _GLUED_UNSET_RE.match(rest):
-            rest = rest[g.end():]
         if rest[:1] not in ("", "/"):
             if _is_exact_root(cwd) or ".." in rest.split("/"):
                 return (cwd.rstrip("/") or "/") + rest
