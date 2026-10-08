@@ -61,6 +61,22 @@ paths:
     written beside an unrelated `source venv/bin/activate` is read as shell (250 Python
     functions ~2 s), and a heredoc script run as `$S/x.sh` is now read as main reads an exact
     run (main missed the spelling): ~2-3x the script typed alone, the deadline fails closed.
+- **A coproc shell reads EVERY text the line prints** (XERK-1717): its stdin fd may be written
+  by any route (`>&${COPROC[1]}`, `>&"${S[1]}"`, `exec 5>&${S[1]}`, `fd=${S[1]}; >&$fd`,
+  `/dev/fd/N`, `/proc/self/fd/N`), so it fails closed like an unpinned file run.
+  - Gate: a walked stage holding `coproc` that `_stage_reads` (the stdin-walk's reader test);
+    fed: `_stage_emits` of every walked stage. Any `coproc` text turns `feeds_a_shell` on.
+    Never pair writers by fd spelling: each spelling is a neighbour.
+  - Accepted over-deny: a shell coproc beside an echo of a destructive command sent elsewhere,
+    and a writer in a pipeline stage (bash closes coproc fds in a pipeline's subshells).
+  - `_printed_from_tokens` reads `yes WORDS` as printing WORDS (`y` with none, a leading `--`
+    dropped as GNU yes does), so every printed-text route sees it, not only the pipe walk.
+    `yes ''` prints EMPTY lines (`" ".join(args) if args else "y"`, never `or "y"`).
+  - A substitution printing NOTHING is read as empty on the operator-body re-split and the
+    line-level taint (`printed is not None`, `_body_tainted` → `("",)`): `$(echo '' | head -1)
+    rm …` and `$(echo '' | sed 1q) rm …` run `rm`; skipping a falsy print hid it (on main too).
+  - 0 changed decisions over 4,729 real Bash commands holding `$(`, a backtick, `yes` or `coproc`.
+  - Tests: `test_a_coproc_shell_runs_what_the_line_writes_to_its_fd`.
 - An alias use runs its VALUE with the use's words after it: `alias b='bash -c'; b '<cmd>'`,
   through a chain, an `eval "b …"`, or a pipe (`echo /etc | b`). `_aliased_readings` is an
   ADDED whole-line reading with every use replaced, `_ALIASES_ON` off inside.

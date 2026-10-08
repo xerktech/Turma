@@ -892,6 +892,11 @@ def _printed_from_tokens(toks: list[str]) -> str | None:
     if prog == "printf":
         name, rest = _printf_args(toks)
         return _render_printf(rest[0], rest[1:]) if name is None and rest else ""
+    if prog == "yes":
+        # `yes WORDS` prints its words line after line (`y` with none); GNU
+        # yes drops a leading `--` (XERK-1717). Read as one line of them.
+        args = toks[2:] if toks[1:2] == ["--"] else toks[1:]
+        return " ".join(args) if args else "y"
     if prog in _ECHO_PROGS:
         args, flags = toks[1:], ""
         while args and re.match(r"^-[neE]+$", args[0]):
@@ -1464,7 +1469,9 @@ def _body_tainted_at(body: str, raw: tuple) -> tuple[str, ...] | None:
     # only a leading one takes the program slot (`_UNREAD_PROG`).
     out = [x for x in out if x]
     if not out:
-        return None
+        # Every producer printed nothing, so the output is empty: `$(echo '' |
+        # sed 1q) rm …` runs `rm` (XERK-1717 QA). Opaque, the placeholder hid it.
+        return ("",)
     if not _has_conditional(body) or len(out) == 1:
         return (" ".join(out),)
     if len(out) > _MAX_TAINT_STARTS:
@@ -1535,7 +1542,7 @@ def _taint_line_repl(m: "re.Match[str]") -> str:
     if taint is None:
         return m.group(0)
     taint = _taint_pick(taint)
-    if taint and "$(" not in taint and "`" not in taint:
+    if "$(" not in taint and "`" not in taint:  # an empty print too (XERK-1717 QA)
         return taint
     return m.group(0)
 
@@ -9825,7 +9832,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             continue
         printed, escaped = _body_printed(body, _reading())
         _SPLICES_ESCAPED[0] += escaped
-        if printed and "$(" not in printed and "`" not in printed:
+        # An EMPTY print counts: `$(echo '' | head -1) rm …` runs `rm`, and
+        # skipping it left the cut halves the only reading (XERK-1717 QA).
+        if printed is not None and "$(" not in printed and "`" not in printed:
             for whole in ("$(" + body + ")", "`" + body + "`"):
                 printed_line = printed_line.replace(whole, printed)
     if printed_line != unprinted:
@@ -9951,7 +9960,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # the line has none — a line of 1000 `bash <<EOF` heredocs otherwise paid
     # for it (the body is a script by the heredoc path above, not this one).
     feeds_a_shell = ("|" in command or "<<<" in command or "<(" in command
-                     or ">(" in command)  # `cmd > >(sh)` feeds the sub too (XERK-1628)
+                     or ">(" in command  # `cmd > >(sh)` feeds the sub too (XERK-1628)
+                     or "coproc" in command)  # `>&${COPROC[1]}` feeds a coproc (XERK-1717)
     # A `<(…)` operand is a FILE its stage reads, and `cat`, `tee`, `head` and
     # the like pass a file through: `cat <(echo <cmd>) | bash` runs <cmd>
     # (XERK-1611). Fed to EVERY reader on the line, whatever the program and
@@ -9995,6 +10005,51 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # Functions the line defines, so a call in a pipeline runs its body.
     func_bodies = (_function_bodies(command)
                    if feeds_a_shell and ("(" in command or "function" in command) else {})
+    def _stage_reads(stage: str) -> bool:
+        # Named as bash forms it before the group is unwrapped (XERK-1629).
+        # ...and a program word that is not literal read as the heredoc
+        # owner's is: `| $SHELL`, `| /bin/ba?h`, an alias (XERK-1632).
+        return (any(_reads_stdin_script(_unwrap_group(t)) for t in _name_readings(stage))
+                or ((_defined() or _NONLITERAL_RE.search(stage))
+                    and _stage_may_read_stdin(stage, raw_vals, _defined(), checked=True)))
+
+    def _stage_emits(ustage: str) -> list[str]:
+        # What a stage prints to whatever reads its stdout. A producer behind
+        # a prefix (`sudo echo …`, `time printf …`) still prints, so strip
+        # them before reading what it emits.
+        texts: list[str] = []
+        for seg in _simple_commands(ustage):
+            texts.append(_printed_from_tokens(_strip_prefixes(_tokenize(seg))) or "")
+            # ...and with its substitutions run: tokenising first split a
+            # nested backtick at its escaped inner opener (XERK-1605).
+            texts.append(_printed_text(_sub_substs(seg, _subst_text)) or "")
+            # ...and with an unknown one glued to its program read as
+            # empty: `$(true)echo rm -rf / | sh` runs `echo` (XERK-1621).
+            if "$(" in seg or "`" in seg:
+                texts.append(_printed_text(_sub_substs(
+                    seg, lambda m: _subst_text(m, glued_empty=True))) or "")
+            texts.extend(_herestrings(seg))
+        return texts
+
+    if "coproc" in command:
+        # A coproc's command reads its stdin from an fd the rest of the line
+        # may write by any route — `>&${COPROC[1]}`, `>&"${S[1]}"`, an `exec
+        # 5>&${S[1]}` copy, `fd=${S[1]}; >&$fd`, `/dev/fd/N`, `/proc/self/fd/N`
+        # — so which writer reaches it can't be traced. As for a file run
+        # unpinned (XERK-1674) it fails closed: EVERY text the line prints is
+        # fed to a coproc that may read a script from stdin (XERK-1717).
+        # Accepted over-deny: a shell coproc beside an echo of a destructive
+        # command written somewhere else.
+        stages = list(dict.fromkeys(
+            stage for pipeline in pipelines
+            for stage in _split_on_operators(pipeline, keep_redirects=True, groups=True)))
+        if any("coproc" in _tokenize(stage) and _stage_reads(stage)
+               for stage in stages):
+            fed_coproc = list(dict.fromkeys(
+                t for stage in stages for t in _stage_emits(_unwrap_group(stage))))
+            for text in [t for t in fed_coproc if t.strip()][:_FED_TEXT_CAP]:
+                for script in _script_readings(text):
+                    out.extend(_expand_segments(script, depth + 1, every_cd))
     for pipeline in pipelines:
         # A single-stage "pipeline" with no here-string or `<(…)` has nothing
         # feeding it either, so skip its per-stage scan too — unless the line
@@ -10037,12 +10092,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                         if text.strip():
                             for script in _script_readings(text):
                                 out.extend(_expand_segments(script, depth + 1, every_cd))
-            # Named as bash forms it before the group is unwrapped (XERK-1629).
-            # ...and a program word that is not literal read as the heredoc
-            # owner's is: `| $SHELL`, `| /bin/ba?h`, an alias (XERK-1632).
-            if any(_reads_stdin_script(_unwrap_group(t)) for t in _name_readings(stage)) \
-                    or ((_defined() or _NONLITERAL_RE.search(stage))
-                        and _stage_may_read_stdin(stage, raw_vals, _defined(), checked=True)):
+            if _stage_reads(stage):
                 fed = list(producers)
                 fed.extend(_herestrings(ustage))
                 for m in _find_substs(ustage):
@@ -10054,21 +10104,9 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                         # <<< "\\$x rm …"` runs an unset `$x` (XERK-1615).
                         for script in _script_readings(text):
                             out.extend(_expand_segments(script, depth + 1, every_cd))
-            # This stage's own contribution to readers DOWNSTREAM of it. A
-            # producer behind a prefix (`sudo echo …`, `time printf …`) still
-            # prints, so strip them before reading what it emits.
-            for seg in _simple_commands(ustage):
-                _feed(_printed_from_tokens(_strip_prefixes(_tokenize(seg))) or "")
-                # ...and with its substitutions run: tokenising first split a
-                # nested backtick at its escaped inner opener (XERK-1605).
-                _feed(_printed_text(_sub_substs(seg, _subst_text)) or "")
-                # ...and with an unknown one glued to its program read as
-                # empty: `$(true)echo rm -rf / | sh` runs `echo` (XERK-1621).
-                if "$(" in seg or "`" in seg:
-                    _feed(_printed_text(_sub_substs(
-                        seg, lambda m: _subst_text(m, glued_empty=True))) or "")
-                for hs in _herestrings(seg):
-                    _feed(hs)
+            # This stage's own contribution to readers DOWNSTREAM of it.
+            for text in _stage_emits(ustage):
+                _feed(text)
     if _ALIASES_ON[0] and "alias" in raw_commands:
         # An alias runs its VALUE with the use's words after it: `alias
         # b='bash -c'; b '<cmd>'`, through a chain, an `eval "b …"` or a pipe
