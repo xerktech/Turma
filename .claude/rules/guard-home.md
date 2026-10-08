@@ -39,6 +39,10 @@ paths:
   - `_home_tilde_reading` adds a reading with every word-start `~` (and a bare `cd`) as `$HOME`
     when the raw text holds `HOM`, `OME` or `eval` (`HOM{E,}`, `H\OME`, `x=OME; …H$x`).
     `~+` always reads as `$PWD`.
+  - `~-` reads as `$OLDPWD`, and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD` (XERK-1696);
+    `_under_cwd` reads `$OLDPWD` as `$PWD`: any directory the line visited, unordered.
+  - A quote may end the tilde word (`bash -c 'cd /etc; rm -rf ~+'`): `~'/x'` is literal in
+    bash, so that splice over-reads, which only adds a reading.
   - A `~` opening a `${y:-…}`/`-`/`:+`/`:=`/`:?` word (`_PARAM_TILDE_RE`) or a `${y/pat/…}`
     replacement (`_replacement_tildes`) is spliced too, read both braced (`${HOME}`: an
     unbraced name ending a default word is unresolved, XERK-1670) and bare. Never add `-`/`+`
@@ -63,7 +67,8 @@ paths:
   - `_under_cwd` reads `$PWD` as a relative operand is (exact root or `..` only).
   - Known false deny: `HOME=/ rm -rf ~/etc` (a prefix binding; bash expands `~` first),
     as `$HOME` already is there.
-  - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`.
+  - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`,
+    `test_directory_tildes_read_as_the_directories_the_line_visited`.
 - An unassigned `${HOME<op>}` (not a `:-`/`:=` default) is spliced in the values pass as its
   `_home_readings` (XERK-1686): kept as written, `${HOME:+r}m -rf /`, `${HOME/*/rm} -rf /` and
   `rm ${HOME:+-rf} /` hid the program or flag.

@@ -7570,22 +7570,42 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
     return out
 
 
-# A `~` bash expands to $HOME (`~+` to $PWD): opening a word, or after an
-# assignment's `=` or `:`, and followed by a `/` or the word's end. Quotes are
-# not read, so one inside a `bash -c '…'` script is found too; this only adds
-# a reading.
-_HOME_TILDE_RE = re.compile(r"(?:(?<=^)|(?<=[\s;&|()<>=:{,`]))~(\+?)(?=[/\s;&|()<>:},`]|$)")
+# A `~` bash expands to $HOME (`~+` to $PWD, `~-` to $OLDPWD, `~N`/`~+N`/`~-N`
+# to a `dirs` stack entry): opening a word, or after an assignment's `=` or
+# `:`, and followed by a `/` or the word's end. Quotes are not read, so one
+# inside a `bash -c '…'` script is found too, and a quote may end one
+# (`bash -c 'cd /etc; rm -rf ~+'`); this only adds a reading.
+_TILDE_SUFFIX = r"(\+|-|[+-]?[0-9]+)?"
+_HOME_TILDE_RE = re.compile(r"(?:(?<=^)|(?<=[\s;&|()<>=:{,`]))~" + _TILDE_SUFFIX
+                            + r"(?=[/\s;&|()<>:},`'\"]|$)")
 # ...and the word of a `${y:-~/x}`, `${y-~}`, `${y:+~/x}`, `${y:=~}`, `${y:?~}`,
 # which bash tilde-expands too. Its own pattern: a lookbehind cannot vary in width.
 # A name may be a multi-digit positional (`${10:-~}`).
 _PARAM_NAME = r"\$\{(?:[A-Za-z_]\w*|[0-9]+|[@*#?!$-])"
-_PARAM_TILDE_RE = re.compile("(" + _PARAM_NAME + r":?[-+=?])~(\+?)(?=[/}])")
+_PARAM_TILDE_RE = re.compile("(" + _PARAM_NAME + r":?[-+=?])~" + _TILDE_SUFFIX + "(?=[/}])")
+# What a line holding a directory tilde (`~+`, `~-`, `~1`) has, so it is read
+# even when it cannot bind HOME.
+_DIR_TILDE_RE = re.compile(r"~[-+0-9]")
+
+
+def _tilde_name(suffix: str | None, home: bool) -> str:
+    """The variable a `~<suffix>` reads (XERK-1696): `~+` is $PWD and `~-`
+    $OLDPWD; a `dirs` stack entry (`~1`, `~+1`, `~-1`) is a directory the line
+    `cd`/`pushd`ed to, which `_under_cwd` reads `$PWD` as. "" leaves a bare `~`
+    as written when the line cannot bind HOME."""
+    if suffix == "+":
+        return "PWD"
+    if suffix == "-":
+        return "OLDPWD"
+    if suffix:
+        return "PWD"
+    return "HOME" if home else ""
 # ...and the replacement of a `${y/pat/~/x}`, found by `_replacement_tildes`.
 _PARAM_REPLACE_RE = re.compile(_PARAM_NAME + "//?")
 
 
-def _replacement_tildes(text: str) -> list[tuple[int, bool]]:
-    """Where a `~` (and whether `~+`) opens the replacement word of a
+def _replacement_tildes(text: str) -> list[tuple[int, str]]:
+    """Where a `~` (and its `+`/`-`/`N` suffix) opens the replacement word of a
     `${y/pat/…}` in ``text``. The pattern may hold `\\x`, `'…'`, `"…"` and a
     `${…}` (quotes and escapes in it too), as bash allows. Linear: one
     right-to-left pass gives, for each position, where a pattern read from
@@ -7646,19 +7666,20 @@ def _replacement_tildes(text: str) -> list[tuple[int, bool]]:
         end = ends[start]
         if end < 0 or not text.startswith("~", end + 1):
             continue
-        plus = text.startswith("~+", end + 1)
-        after = end + 2 + plus
-        if after < n and text[after] in "/}":
-            out.append((end + 1, plus))
+        m = _REPLACEMENT_TILDE_RE.match(text, end + 1)
+        if m:
+            out.append((end + 1, m.group(1) or ""))
     return out
 
 
+_REPLACEMENT_TILDE_RE = re.compile("~" + _TILDE_SUFFIX + "(?=[/}])")
 _BARE_CD_RE = re.compile(r"((?:^|(?<=[\s;&|(){`]))cd)(?=[ \t]*(?:[;&|)}\n`]|$))")
 # What a line that may bind HOME holds: the name (`HOM{E,}`, `H\OME`, `H$x`
 # with `x=OME`) or an `eval` that can build it.
 _HOME_HINT_RE = re.compile(r"HOM|OME|\beval\b")
 def _home_tilde_readings(command: str) -> list[str]:
-    """``command`` with each `~` read as `$HOME` and each `~+` as `$PWD`, when
+    """``command`` with each `~` read as `$HOME`, `~+` as `$PWD`, `~-` as
+    `$OLDPWD` and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD`, when
     the line may bind HOME (`_HOME_HINT_RE`); none if that changes nothing
     (XERK-1685). Bash expands `~` from HOME's CURRENT value, so `HOME=/; rm
     -rf ~/etc` deletes /etc, while `~` alone reads as the session's home.
@@ -7674,13 +7695,12 @@ def _home_tilde_readings(command: str) -> list[str]:
     if "~" not in command and "cd" not in command:
         return []
     home = bool(_HOME_HINT_RE.search(command))
-    if not home and "~+" not in command:
+    if not home and not _DIR_TILDE_RE.search(command):
         return []
 
     def splice(m: "re.Match[str]") -> str:
-        if m.group(1):
-            return "$PWD"
-        return "$HOME" if home else m.group(0)
+        name = _tilde_name(m.group(1), home)
+        return "$" + name if name else m.group(0)
 
     out = _HOME_TILDE_RE.sub(splice, command)
     if home:
@@ -7688,16 +7708,16 @@ def _home_tilde_readings(command: str) -> list[str]:
         out = _BARE_CD_RE.sub(r"\1 $HOME", out)
     readings = [out]
     if "${" in out:
-        spots = [(m.end(1), bool(m.group(2))) for m in _PARAM_TILDE_RE.finditer(out)]
+        spots = [(m.end(1), m.group(2) or "") for m in _PARAM_TILDE_RE.finditer(out)]
         spots += _replacement_tildes(out)
         if spots:
             def param(form: str) -> str:
                 pieces, last = [], 0
-                for at, plus in sorted(spots):
-                    word = "PWD" if plus else "HOME" if home else ""
+                for at, suffix in sorted(spots):
+                    word = _tilde_name(suffix, home)
                     if word:
                         pieces += (out[last:at], form % word)
-                        last = at + 1 + plus
+                        last = at + 1 + len(suffix)
                 pieces.append(out[last:])
                 return "".join(pieces)
             readings = [param("${%s}"), param("$%s")]
@@ -10570,7 +10590,9 @@ def _is_exact_root(path: str) -> bool:
     return low in _HOME_TOKENS or low in _SYSTEM_ROOTS or bool(_HOME_USER_RE.match(low))
 
 
-_PWD_LEAD_RE = re.compile(r"\$(?:PWD|\{PWD\})(?=/|$)")
+# `$OLDPWD` too: whichever directory the line was in before its last `cd`,
+# so any of them (XERK-1696). An inherited one reads as the session's cwd.
+_PWD_LEAD_RE = re.compile(r"\$(?:(?:OLD)?PWD|\{(?:OLD)?PWD\})(?=/|$)")
 
 
 def _under_cwd(tok: str, cwd: str) -> str:
