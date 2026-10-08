@@ -7646,6 +7646,29 @@ PR_CREATE_RE = re.compile(_pr_create_pattern(PR_CREATE_CMDS))
 # died) must not grow the set for the life of the session.
 PR_CALLS_MAX = 20
 
+# A `gh api` call that POSTs to a repo's `/pulls` endpoint opens a PR exactly as
+# `gh pr create` does — and it is what a session falls back to when `gh pr
+# create` fails on a GitHub GraphQL error, so leaving it out dropped that PR's
+# chip in silence. Only a call carrying a request body counts (`--input`,
+# `-f`/`-F`/`--field`/`--raw-field`, which make gh POST) and never one forced to
+# GET: `gh api repos/o/r/pulls` alone LISTS every open PR. The args run to the
+# end of that shell word sequence, so a sibling command's flags can't qualify it.
+GH_API_CALL_RE = re.compile(r"(?<![\w-])gh\s+api(?![\w-])([^;|&)\n`]*)")
+GH_API_PULLS_PATH_RE = re.compile(
+    r"(?:^|\s)['\"]?/?repos/[^/\s'\"]+/[^/\s'\"]+/pulls['\"]?(?=\s|$)")
+GH_API_BODY_RE = re.compile(r"(?:^|\s)(?:--input|--field|--raw-field|-[fF])")
+GH_API_GET_RE = re.compile(r"(?:^|\s)(?:-X|--method)(?:\s+|=)?['\"]?GET\b", re.IGNORECASE)
+
+# A creating call run in the background (`run_in_background`, or moved there on
+# its timeout) answers only "running in background", and the PR URL lands in the
+# task's output FILE, announced later by a `<task-notification>`. Remembered per
+# task id until that notification, capped like PR_CALLS_MAX.
+PR_BG_TASKS_MAX = 20
+# The output file is read from its END and bounded: the URL is the last thing a
+# create prints, and a long-running loop around it may have printed a lot first.
+PR_BG_OUTPUT_TAIL_BYTES = 1 << 16
+PR_BG_OUTPUT_PATH_RE = re.compile(r"Output is being written to: (\S+?)\.?(?:\s|$)")
+
 # Beats between `gh pr view` status refreshes for the PR links a session opened
 # (~INTERVAL*N sec). Faster than the github-block cadence so CI/merge state on a
 # session card stays reasonably live, but not every beat (each is a gh network
@@ -9239,41 +9262,153 @@ def _azdo_created_pr_url(text):
     return f"{web}/pullrequest/{pr_id}"
 
 
+def _gh_api_pr_create(cmd):
+    """True when `cmd` POSTs to a GitHub repo's `/pulls` endpoint via `gh api`
+    (see GH_API_CALL_RE) — a PR create, not a listing."""
+    for m in GH_API_CALL_RE.finditer(cmd):
+        args = m.group(1)
+        if (GH_API_PULLS_PATH_RE.search(args) and GH_API_BODY_RE.search(args)
+                and not GH_API_GET_RE.search(args)):
+            return True
+    return False
+
+
+def _gh_api_created_pr_url(text):
+    """The URL of the PR a `gh api …/pulls` POST opened, from its OWN output, or
+    None. Unlike `gh pr create`, that output is the whole PR object (or whatever
+    `--jq` kept of it), and the object's body text can quote OTHER PRs' links —
+    so the object's own `html_url` wins, else exactly one distinct PR URL. A
+    JSON array is a listing, never a create."""
+    s = str(text or "")
+    if s.lstrip().startswith("["):
+        return None
+    data = _first_json_object(s)
+    if isinstance(data, dict):
+        url = data.get("html_url")
+        return url if isinstance(url, str) and PR_URL_RE.fullmatch(url) else None
+    urls = set(PR_URL_RE.findall(s))
+    return urls.pop() if len(urls) == 1 else None
+
+
+def _created_pr_urls(text, api=False):
+    """Every PR/MR URL a creating call's output names as the one it opened."""
+    if api:
+        url = _gh_api_created_pr_url(text)
+        return [url] if url else []
+    found = []
+    for rx in (PR_URL_RE, MR_URL_RE, AZDO_PR_URL_RE):
+        found.extend(m.group(0) for m in rx.finditer(text))
+    if not any(AZDO_PR_URL_RE.match(u) for u in found):
+        # `az repos pr create` reports the PR it opened as a JSON object
+        # carrying no browser link at all, so the URL is composed from
+        # that object (XERK-226). Only consulted when the output printed
+        # no ADO PR link of its own, so one create can't chip twice.
+        composed = _azdo_created_pr_url(text)
+        if composed:
+            found.append(composed)
+    return found
+
+
+def _read_regular_tail(path, cap):
+    """The last ``cap`` bytes of ``path`` when it is a regular, non-symlink file,
+    else None; never raises OSError. Same open discipline as _read_regular: the
+    task output file lives in a session-writable dir, so a FIFO or a symlink to
+    /dev/zero planted there must not wedge the beat."""
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0)
+                     | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+    except (OSError, ValueError):
+        return None
+    try:
+        st = os.fstat(fd)
+        if not stat.S_ISREG(st.st_mode):
+            return None
+        os.lseek(fd, max(0, st.st_size - cap), os.SEEK_SET)
+        chunks, total = [], 0
+        while total < cap:
+            chunk = os.read(fd, min(1 << 16, cap - total))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            total += len(chunk)
+        return b"".join(chunks)
+    except OSError:
+        return None
+    finally:
+        os.close(fd)
+
+
+def _scan_pr_bg_notification(entry, state, found):
+    """A backgrounded creating call's `<task-notification>` (see PR_BG_TASKS_MAX):
+    read that task's output file and attribute the PR it printed. Only a
+    `user`/`queue-operation` entry carries a real one — an assistant turn merely
+    quoting a notification retires nothing, as in the live-agent scan."""
+    bg = state.get("pr_bg")
+    if not bg or entry.get("type") not in ("user", "queue-operation"):
+        return
+    for text in _entry_texts_for_scan(entry):
+        tn = _parse_task_notification(text)
+        if not tn:
+            continue
+        m = re.search(r"<output-file>(.*?)</output-file>", text, re.DOTALL)
+        for tid in tn["taskIds"]:
+            task = bg.pop(tid, None)
+            if not task:
+                continue
+            path = task["path"] or (m.group(1).strip() if m else "")
+            # The file Claude Code names for that task, and no other.
+            if os.path.basename(path) != f"{tid}.output":
+                continue
+            raw = _read_regular_tail(path, PR_BG_OUTPUT_TAIL_BYTES)
+            if raw:
+                found.extend(_created_pr_urls(raw.decode("utf-8", "replace"), task["api"]))
+
+
 def _scan_pr_entry(entry, state, report):
     """_scan_pr_line's fold, taking the already-parsed entry (the shared
     per-line scan parses each line once for every scanner)."""
-    msg = entry.get("message") if isinstance(entry, dict) else None
-    content = msg.get("content") if isinstance(msg, dict) else None
-    if not isinstance(content, list):
+    if not isinstance(entry, dict):
         return
-    calls = state.setdefault("pr_calls", [])
     seen = state.setdefault("pr_seen", set())
-    for block in content:
-        if not isinstance(block, dict):
-            continue
-        if block.get("type") == "tool_use":
-            cmd = (block.get("input") or {}).get("command")
-            if (block.get("name") == "Bash" and isinstance(cmd, str)
-                    and PR_CREATE_RE.search(cmd) and block.get("id")):
-                calls.append(block["id"])
+    found = []
+    _scan_pr_bg_notification(entry, state, found)
+    msg = entry.get("message")
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        calls = state.setdefault("pr_calls", [])
+        api_calls = state.setdefault("pr_api_calls", [])
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use":
+                cmd = (block.get("input") or {}).get("command")
+                if block.get("name") != "Bash" or not isinstance(cmd, str) or not block.get("id"):
+                    continue
+                if PR_CREATE_RE.search(cmd):
+                    calls.append(block["id"])
+                elif _gh_api_pr_create(cmd):
+                    calls.append(block["id"])
+                    api_calls.append(block["id"])
+                    del api_calls[:-PR_CALLS_MAX]
                 del calls[:-PR_CALLS_MAX]
-        elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
-            text = _tool_result_text(block.get("content"))
-            found = []
-            for rx in (PR_URL_RE, MR_URL_RE, AZDO_PR_URL_RE):
-                found.extend(m.group(0) for m in rx.finditer(text))
-            if not any(AZDO_PR_URL_RE.match(u) for u in found):
-                # `az repos pr create` reports the PR it opened as a JSON object
-                # carrying no browser link at all, so the URL is composed from
-                # that object (XERK-226). Only consulted when the output printed
-                # no ADO PR link of its own, so one create can't chip twice.
-                composed = _azdo_created_pr_url(text)
-                if composed:
-                    found.append(composed)
-            for url in found:
-                if url not in seen:
-                    seen.add(url)
-                    report["prUrls"].append(url)
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
+                text = _tool_result_text(block.get("content"))
+                api = block["tool_use_id"] in api_calls
+                tur = entry.get("toolUseResult")
+                task = tur.get("backgroundTaskId") if isinstance(tur, dict) else None
+                if isinstance(task, str) and task:
+                    # Backgrounded: its output arrives with a later notification.
+                    m = PR_BG_OUTPUT_PATH_RE.search(text)
+                    bg = state.setdefault("pr_bg", {})
+                    bg[task] = {"path": m.group(1) if m else "", "api": api}
+                    while len(bg) > PR_BG_TASKS_MAX:
+                        bg.pop(next(iter(bg)))
+                    continue
+                found.extend(_created_pr_urls(text, api))
+    for url in found:
+        if url not in seen:
+            seen.add(url)
+            report["prUrls"].append(url)
 
 
 # The confirmation line Claude Code prints (and transcribes as local-command
