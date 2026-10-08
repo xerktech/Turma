@@ -389,8 +389,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
       for a root repo/session (web `sessions.html`/`index.html`/`chat.js`, Android
       `FleetDialogs.kt`/`ChatScreen.kt`).
     - **A WORKTREE session may still choose bypass** — deliberately, so the offered unattended-run
-      capability survives. That class stays exposed to this hole; closing it is the filesystem/uid
-      change XERK-309 weighs (make `~/.claude` unwritable to the session uid), not a mode gate.
+      capability survives. That class stays exposed to this hole; the guard HOOKS themselves are
+      closed by root-owned managed copies (`guard-protected.md`, XERK-1677), `~/.claude` is not.
       Tests: `test_resolve_permission_mode_refuses_bypass_for_root` in `test_hub_agent.py`, the
       `XERK-309:` cases in `server.test.js`.
   - Tests: `test_fileguard.py` (behavioural — resolved paths, asserts `decide()`, not rule strings),

@@ -1,0 +1,446 @@
+#!/usr/bin/python3 -SI
+"""Put the agent's safety hooks where its sessions cannot write (XERK-1677).
+
+The native agent and every session it launches run as ONE uid, and the hooks
+live in that uid's home: a session once replaced `hooks/guard.py` with an
+allow-all stub and every Bash call on the host was allowed (XERK-1643). The
+hooks are wired through the `--settings` file, which the same uid can rewrite,
+and a `disableAllHooks: true` in `~/.claude/settings.json` switches every
+non-managed hook off. So this moves the two security hooks out of that uid's
+reach entirely:
+
+  /etc/turma-agent/hooks/{guard,fileguard}.py           root:root 0644
+  /etc/claude-code/managed-settings.d/50-turma-guard.json root:root 0644
+
+Claude Code's MANAGED settings are the one scope a user-level
+`disableAllHooks` cannot switch off (measured on 2.1.294), and they apply to
+every `claude` on the host, nested ones included. The manager sees the drop-in
+and stops wiring its own (writable) copies, so the hook runs once.
+
+Nothing here reads from the session uid's home: `sync` (the root timer) takes
+the hooks from the latest GitHub release, checked against that release's
+sha256 asset. Reading them from `$PREFIX/hooks` would hand a session that
+tampered with its copy a ROOT-OWNED, protected tamper.
+
+This is only a boundary while the session uid cannot become root. A uid with
+passwordless sudo (`NOPASSWD: ALL`) walks straight past it; `status` says so.
+
+Modes (all but `status` need root):
+  install [--from DIR]  lay the hooks (from a release payload DIR, else the
+                        latest release), the drop-in, and the refresh timer
+  sync                  refresh the hooks from the latest release (the timer)
+  remove                undo install: drop-in first, then the hooks
+  status                report whether this host is protected; exit 0 if so
+"""
+import hashlib
+import io
+import json
+import os
+import pwd
+import re
+import stat
+import subprocess
+import sys
+import tarfile
+import tempfile
+import urllib.request
+
+REPO = "xerktech/turma"
+ETC_DIR = "/etc/turma-agent"
+HOOKS = ("guard.py", "fileguard.py")
+SELF_NAME = "turma-agent-protect"
+DROPIN_DIR = "/etc/claude-code/managed-settings.d"
+DROPIN_NAME = "50-turma-guard.json"
+UNIT_DIR = "/etc/systemd/system"
+UNIT = "turma-agent-protect"
+# The interpreter the hooks run under must be one the session uid cannot
+# replace — `python3` off PATH could resolve to ~/.local/bin.
+PYTHON_CANDIDATES = ("/usr/bin/python3", "/bin/python3")
+FILE_EDIT_MATCHER = "Write|Edit|MultiEdit|NotebookEdit"
+HTTP_TIMEOUT = 30
+MAX_ASSET_BYTES = 64 << 20
+MAX_HOOK_BYTES = 8 << 20
+
+SERVICE = f"""[Unit]
+Description=Turma agent: refresh the root-owned guard hooks from the latest release
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart={{python}} -SI {ETC_DIR}/{SELF_NAME} sync
+"""
+
+TIMER = f"""[Unit]
+Description=Turma agent: refresh the root-owned guard hooks hourly
+
+[Timer]
+OnBootSec=2min
+OnCalendar=hourly
+RandomizedDelaySec=300
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+"""
+
+
+def say(msg):
+    print(f"[{SELF_NAME}] {msg}", flush=True)
+
+
+class Layout:
+    """Every absolute path this script touches, relocatable under `root` so the
+    tests can run it unprivileged in a temp dir. Production is root="/"."""
+
+    def __init__(self, root="/"):
+        self.root = root
+        j = lambda p: os.path.join(root, p.lstrip("/"))  # noqa: E731
+        self.etc = j(ETC_DIR)
+        self.hooks = os.path.join(self.etc, "hooks")
+        self.self_copy = os.path.join(self.etc, SELF_NAME)
+        self.dropin_dir = j(DROPIN_DIR)
+        self.dropin = os.path.join(self.dropin_dir, DROPIN_NAME)
+        self.unit_dir = j(UNIT_DIR)
+        # The paths the drop-in names are the REAL ones even in a test layout:
+        # they are what claude will execute.
+        self.hook_cmd_dir = os.path.join(ETC_DIR, "hooks")
+
+    @property
+    def is_real(self):
+        return self.root == "/"
+
+
+def python_for(layout):
+    # A test layout writes the conventional path rather than probing the host.
+    return find_python() if layout.is_real else PYTHON_CANDIDATES[0]
+
+
+def find_python():
+    for p in PYTHON_CANDIDATES:
+        try:
+            st = os.stat(os.path.realpath(p))
+        except OSError:
+            continue
+        if st.st_uid == 0 and not st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            return p
+    raise SystemExit(f"no root-owned python3 at {', '.join(PYTHON_CANDIDATES)}")
+
+
+def dropin_settings(layout, python):
+    def cmd(name, *args):
+        return " ".join([f'"{python}"', "-SI",
+                         f'"{os.path.join(layout.hook_cmd_dir, name)}"', *args])
+    # `--grants` is always on: the guard still ANDs it with the session's own
+    # TURMA_PERMISSION_JUDGE, and a static file cannot follow the manager's env.
+    return {"hooks": {"PreToolUse": [
+        {"matcher": "Bash",
+         "hooks": [{"type": "command", "command": cmd("guard.py", "--grants")}]},
+        {"matcher": FILE_EDIT_MATCHER,
+         "hooks": [{"type": "command", "command": cmd("fileguard.py")}]},
+    ]}}
+
+
+def _own(path, mode, layout):
+    os.chmod(path, mode)
+    if layout.is_real:
+        os.chown(path, 0, 0)
+
+
+def ensure_dir(path, layout):
+    """Create `path` (and parents) root-owned 0755; an existing one is taken
+    over: a dir the session uid could write would let it swap our files."""
+    if os.path.islink(path):
+        raise SystemExit(f"refusing: {path} is a symlink")
+    os.makedirs(path, exist_ok=True)
+    _own(path, 0o755, layout)
+
+
+def write_file(path, data, mode, layout):
+    """Atomic: a reader never sees half a hook, and a hook that vanished even
+    for a moment fails EVERY Bash call on the host closed."""
+    d = os.path.dirname(path)
+    fd, tmp = tempfile.mkstemp(dir=d, prefix=f".{os.path.basename(path)}.")
+    try:
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(data)
+        _own(tmp, mode, layout)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def read_capped(path, cap=MAX_HOOK_BYTES):
+    with open(path, "rb") as fh:
+        data = fh.read(cap + 1)
+    if len(data) > cap:
+        raise SystemExit(f"{path} is larger than {cap} bytes")
+    return data
+
+
+def lay(layout, payload, python):
+    """Install `payload` ({name: bytes}: the hooks, optionally this script).
+    Hooks BEFORE the drop-in: a drop-in naming a missing hook blocks every Bash
+    call on the host (measured)."""
+    for name in HOOKS:
+        if name not in payload:
+            raise SystemExit(f"payload has no hooks/{name}; nothing changed")
+    ensure_dir(layout.etc, layout)
+    ensure_dir(layout.hooks, layout)
+    for name in HOOKS:
+        write_file(os.path.join(layout.hooks, name), payload[name], 0o644, layout)
+    if SELF_NAME in payload:
+        write_file(layout.self_copy, payload[SELF_NAME], 0o755, layout)
+    ensure_dir(layout.dropin_dir, layout)
+    body = json.dumps(dropin_settings(layout, python), indent=2).encode() + b"\n"
+    write_file(layout.dropin, body, 0o644, layout)
+
+
+def payload_from_dir(src):
+    for name in HOOKS:
+        if not os.path.isfile(os.path.join(src, "hooks", name)):
+            raise SystemExit(f"{src} has no hooks/{name}; nothing changed")
+    out = {name: read_capped(os.path.join(src, "hooks", name)) for name in HOOKS}
+    me = os.path.join(src, SELF_NAME)
+    if os.path.isfile(me):
+        out[SELF_NAME] = read_capped(me)
+    return out
+
+
+# --- the latest release ---------------------------------------------------------
+
+def http_get(url, cap=MAX_ASSET_BYTES):
+    req = urllib.request.Request(url, headers={"User-Agent": SELF_NAME})
+    with urllib.request.urlopen(req, timeout=HTTP_TIMEOUT) as resp:
+        data = resp.read(cap + 1)
+    if len(data) > cap:
+        raise SystemExit(f"{url}: larger than {cap} bytes")
+    return data
+
+
+def latest_tag(fetch):
+    rels = json.loads(fetch(f"https://api.github.com/repos/{REPO}/releases?per_page=100"))
+    tags = [r.get("tag_name", "") for r in rels if isinstance(r, dict)]
+    tags = [t for t in tags if re.fullmatch(r"v\d+\.\d+\.\d+", t)]
+    if not tags:
+        raise SystemExit("no v<M>.<m>.<p> release found")
+    return max(tags, key=lambda t: tuple(int(x) for x in t[1:].split(".")))
+
+
+def _asset_url(tag, name):
+    if not re.fullmatch(r"[A-Za-z0-9._-]+", tag) or not re.fullmatch(r"[A-Za-z0-9._-]+", name):
+        raise SystemExit(f"refusing odd release tag/asset name {tag!r}/{name!r}")
+    return f"https://github.com/{REPO}/releases/download/{tag}/{name}"
+
+
+def payload_from_release(fetch=http_get):
+    """The hooks out of the latest release's native tarball, verified against
+    its sha256 asset. A release with no checksum is refused, not trusted."""
+    tag = latest_tag(fetch)
+    manifest = json.loads(fetch(_asset_url(tag, "manifest.json")))
+    comp = (manifest.get("components") or {}).get("agent-native") or {}
+    asset, sha_asset = comp.get("asset"), comp.get("sha256_asset")
+    rtag = comp.get("release_tag") or tag
+    if not asset or not sha_asset:
+        raise SystemExit(f"release {tag}: manifest has no agent-native asset + checksum")
+    want = fetch(_asset_url(rtag, sha_asset)).decode("ascii", "replace").split()
+    if not want or not re.fullmatch(r"[0-9a-f]{64}", want[0]):
+        raise SystemExit(f"release {rtag}: unreadable {sha_asset}")
+    tgz = fetch(_asset_url(rtag, asset))
+    if hashlib.sha256(tgz).hexdigest() != want[0]:
+        raise SystemExit(f"release {rtag}: {asset} FAILED its checksum; nothing changed")
+    wanted = {f"hooks/{n}": n for n in HOOKS}
+    wanted[SELF_NAME] = SELF_NAME
+    out = {}
+    # Read the named members only — never extract the archive to disk.
+    with tarfile.open(fileobj=io.BytesIO(tgz), mode="r:gz") as tar:
+        for m in tar.getmembers():
+            key = wanted.get(m.name[2:] if m.name.startswith("./") else m.name)
+            if key and m.isfile() and m.size <= MAX_HOOK_BYTES:
+                out[key] = tar.extractfile(m).read()
+    say(f"release {rtag} ({comp.get('version', '?')}): verified {asset}")
+    return out
+
+
+# --- systemd ------------------------------------------------------------------------
+
+def systemd_present(layout):
+    return layout.is_real and os.path.isdir("/run/systemd/system")
+
+
+def install_units(layout, python):
+    if not systemd_present(layout):
+        say("no systemd: run `sync` yourself (cron) to keep the hooks current")
+        return
+    write_file(os.path.join(layout.unit_dir, f"{UNIT}.service"),
+               SERVICE.format(python=python).encode(), 0o644, layout)
+    write_file(os.path.join(layout.unit_dir, f"{UNIT}.timer"), TIMER.encode(), 0o644, layout)
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+    subprocess.run(["systemctl", "enable", "--now", f"{UNIT}.timer"], check=False)
+
+
+def remove_units(layout):
+    if not systemd_present(layout):
+        return
+    subprocess.run(["systemctl", "disable", "--now", f"{UNIT}.timer"], check=False,
+                   stderr=subprocess.DEVNULL)
+    for ext in ("service", "timer"):
+        try:
+            os.unlink(os.path.join(layout.unit_dir, f"{UNIT}.{ext}"))
+        except FileNotFoundError:
+            pass
+    subprocess.run(["systemctl", "daemon-reload"], check=False)
+
+
+# --- status -------------------------------------------------------------------------
+
+def _root_only(path):
+    """Problem with `path` and every dir above it, or None: each must be
+    root-owned and unwritable by anyone else, or the uid that CAN write it can
+    swap what claude runs."""
+    p = os.path.abspath(path)
+    while True:
+        try:
+            st = os.lstat(p)
+        except OSError:
+            return f"{p} is missing"
+        if stat.S_ISLNK(st.st_mode):
+            return f"{p} is a symlink"
+        if st.st_uid != 0:
+            return f"{p} is owned by uid {st.st_uid}, not root"
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH) and not st.st_mode & stat.S_ISVTX:
+            return f"{p} is writable by group/other"
+        if p == os.path.dirname(p):
+            return None
+        p = os.path.dirname(p)
+
+
+def problems(layout):
+    out = []
+    for path in [layout.dropin] + [os.path.join(layout.hooks, n) for n in HOOKS]:
+        why = _root_only(path) if layout.is_real else (None if os.path.exists(path)
+                                                       else f"{path} is missing")
+        if why:
+            out.append(why)
+    if not out:
+        try:
+            body = json.loads(read_capped(layout.dropin))
+            if body != dropin_settings(layout, python_for(layout)):
+                out.append(f"{layout.dropin} does not wire the hooks as install would")
+        except (ValueError, SystemExit) as e:
+            out.append(f"{layout.dropin} is unreadable ({e})")
+    return out
+
+
+def session_user():
+    return os.environ.get("SUDO_USER") or pwd.getpwuid(os.getuid()).pw_name
+
+
+def can_sudo_freely(user):
+    """True when `user` can become root without a password — the case where
+    root ownership protects nothing. `sudo -n -l -U` needs root; as the user
+    itself, `sudo -n true` answers the same question."""
+    if user == "root":
+        return False
+    try:
+        if os.geteuid() == 0:
+            r = subprocess.run(["sudo", "-n", "-l", "-U", user], capture_output=True,
+                               text=True, timeout=10)
+            return bool(re.search(r"NOPASSWD:\s*ALL\b", r.stdout))
+        r = subprocess.run(["sudo", "-n", "true"], capture_output=True, timeout=10)
+        return r.returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def warn_sudo():
+    user = session_user()
+    if can_sudo_freely(user):
+        say(f"WARNING: {user} can become root without a password, so a session "
+            f"running as {user} can still rewrite the protected hooks. Remove "
+            f"its NOPASSWD sudo for this to be a boundary.")
+        return True
+    return False
+
+
+def status(layout):
+    bad = problems(layout)
+    for why in bad:
+        say(f"NOT protected: {why}")
+    if not bad:
+        say(f"protected: {layout.dropin} wires {layout.hook_cmd_dir}/{{{','.join(HOOKS)}}}")
+    sudo = warn_sudo() if layout.is_real else False
+    return 1 if bad or sudo else 0
+
+
+# --- main ---------------------------------------------------------------------------
+
+def main(argv):
+    args = list(argv)
+    root = "/"
+    if "--root" in args:  # tests only: relocate every path, skip chown + systemd
+        i = args.index("--root")
+        root = args[i + 1]
+        del args[i:i + 2]
+    layout = Layout(root)
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 0 if args else 2
+    mode, rest = args[0], args[1:]
+    if mode == "status":
+        return status(layout)
+    if mode not in ("install", "sync", "remove"):
+        say(f"unknown mode {mode!r}")
+        return 2
+    if layout.is_real and os.geteuid() != 0:
+        say(f"{mode} needs root (sudo)")
+        return 1
+    os.umask(0o022)
+    if mode == "remove":
+        # Drop-in FIRST: hooks without it are inert; it without hooks blocks
+        # every Bash call on the host.
+        for p in [layout.dropin] + [os.path.join(layout.hooks, n) for n in HOOKS]:
+            try:
+                os.unlink(p)
+            except FileNotFoundError:
+                pass
+        remove_units(layout)
+        try:
+            os.unlink(layout.self_copy)
+            os.rmdir(layout.hooks)
+            os.rmdir(layout.etc)
+        except OSError:
+            pass
+        say("removed. New sessions get the agent's own hook copies back; restart "
+            "sessions already running to give them a guard again.")
+        return 0
+    python = python_for(layout)
+    if mode == "install" and rest[:1] == ["--from"] and len(rest) == 2:
+        payload = payload_from_dir(rest[1])
+    elif rest:
+        say(f"unexpected arguments {rest!r}")
+        return 2
+    else:
+        payload = payload_from_release()
+    lay(layout, payload, python)
+    if mode == "install":
+        if SELF_NAME not in payload:
+            # `--from` a payload without this script: copy the running one so
+            # the timer has something root-owned to run.
+            write_file(layout.self_copy, read_capped(os.path.abspath(__file__)),
+                       0o755, layout)
+        install_units(layout, python)
+        say("installed. Every claude on this host now runs the protected hooks.")
+        if layout.is_real:
+            warn_sudo()
+    else:
+        say("hooks current")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

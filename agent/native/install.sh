@@ -5,7 +5,8 @@
 # missing prerequisites (apt + npm + a pinned static ttyd), copies the runtime
 # files into a prefix, writes a config template, wires a service (systemd user
 # unit + auto-update timer, or a nohup fallback), runs a preflight, and prints
-# next steps. Idempotent; also does --verify and --uninstall.
+# next steps. Idempotent; also does --verify and --uninstall, and --protect /
+# --unprotect (root-owned guard hooks, XERK-1677; see turma-agent-protect).
 set -euo pipefail
 
 # ---- paths & args ---------------------------------------------------------
@@ -40,12 +41,14 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --verify)          DO=verify ;;
     --uninstall)       DO=uninstall ;;
+    --protect)         DO=protect ;;
+    --unprotect)       DO=unprotect ;;
     --no-install-deps) INSTALL_DEPS=no ;;
     --autostart)       AUTOSTART=yes ;;
     --with-dsh)        WITH_DSH=yes ;;
     --prefix)          shift; PREFIX="$1" ;;
     -h|--help)
-      echo "usage: install.sh [--prefix DIR] [--no-install-deps] [--autostart] [--with-dsh] [--verify] [--uninstall]"
+      echo "usage: install.sh [--prefix DIR] [--no-install-deps] [--autostart] [--with-dsh] [--verify] [--uninstall] [--protect] [--unprotect]"
       exit 0 ;;
     *) echo "unknown arg: $1" >&2; exit 2 ;;
   esac
@@ -527,7 +530,29 @@ do_verify() {
   elif systemd_system_ok; then echo "  service: systemd system"
   else echo "  service: nohup fallback (turma-agentctl)"; fi
   [ -f "$HOME/.claude/.credentials.json" ] && echo "  claude login: present" || echo "  claude login: MISSING (run: claude /login)"
+  # Optional, so it never fails verify: a host without it still runs its guard
+  # from $PREFIX, just one the sessions can rewrite.
+  if [ -f "$PROTECT" ]; then
+    echo "  guard hooks:"
+    /usr/bin/python3 -SI "$PROTECT" status 2>&1 | sed 's/^/    /' || true
+  fi
   return $ok
+}
+
+# Root-owned guard hooks (XERK-1677). The helper runs from THIS payload, never
+# from $PREFIX: the session uid can write $PREFIX, and this runs as root.
+PROTECT="$SELF_DIR/turma-agent-protect"
+do_protect() {  # <install|remove>
+  local run=()
+  [ -f "$PROTECT" ] || { warn "no turma-agent-protect beside install.sh"; return 1; }
+  if [ "$(id -u)" = 0 ]; then run=()
+  elif have_sudo; then run=(sudo)
+  else warn "--protect needs root: re-run with sudo access"; return 1; fi
+  if [ "$1" = install ]; then
+    "${run[@]}" /usr/bin/python3 -SI "$PROTECT" install --from "$SRC_DIR"
+  else
+    "${run[@]}" /usr/bin/python3 -SI "$PROTECT" remove
+  fi
 }
 
 do_uninstall() {
@@ -564,6 +589,8 @@ do_uninstall() {
 case "$DO" in
   verify)    do_verify; exit $? ;;
   uninstall) do_uninstall; exit 0 ;;
+  protect)   do_protect install; exit $? ;;
+  unprotect) do_protect remove; exit $? ;;
 esac
 
 info "source: $SRC_DIR"

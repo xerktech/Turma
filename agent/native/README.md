@@ -245,6 +245,27 @@ is fetched by the exact name and release the manifest records. If no unified
 release exists (a rollback, or before the cutover) it falls back to the legacy
 `agent-native-v*` stream, so a host self-updates correctly either way.
 
+## Protect the guard hooks (recommended)
+
+By default the safety hooks live in `$PREFIX/hooks`, which the sessions' own
+uid can rewrite — a session once replaced `guard.py` with an allow-all stub.
+`--protect` moves the Bash guard and the file-edit guard to root-owned copies in
+`/etc/turma-agent/hooks`, wired through Claude Code's managed settings
+(`/etc/claude-code/managed-settings.d/50-turma-guard.json`), which a session
+cannot override or switch off. A root systemd timer refreshes them from the
+latest release, checked against its sha256. It needs sudo once:
+
+```sh
+curl -fsSL .../bootstrap.sh | bash -s -- --protect     # or ./install.sh --protect
+curl -fsSL .../bootstrap.sh | bash -s -- --unprotect
+```
+
+**This is a boundary only if the agent's user cannot become root.** If it has
+passwordless sudo (`NOPASSWD: ALL`, the TrueNAS `truenas_admin` default), a
+session can `sudo` past it; `--verify` reports that. Give the agent a user
+without it, or require a password. Every `claude` on the host, including your
+own interactive ones, runs the protected hooks.
+
 ## Verify / uninstall
 
 ```sh

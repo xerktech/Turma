@@ -233,6 +233,10 @@ Installs the SAME runtime files onto a host and reuses its tooling. See `agent/n
   - The baseline is as writable as the hooks: this repairs a model that stubs its guard to get
     unblocked, not a shell set on hiding it (XERK-309). Tests: `run_integrity_case` in
     `test_turma_agent_update.sh`, `TestHookIntegrity`.
+- **`turma-agent-protect` (`install.sh --protect`/`--unprotect`) is the ROOT half** (XERK-1677):
+  root-owned guard hooks + a managed-settings drop-in + a root refresh timer. It ships in the
+  tarball root but is never laid into `$PREFIX` and the updater never runs it. Rules:
+  `guard-protected.md`.
 - **Auth on the release read is an optimisation, never a precondition** (XERK-151): tries `gh`, then
   `$GH_TOKEN`, then anonymously — requiring auth would pin a no-login host at its installed version
   forever. Exports the same `$HOME/.local/bin` PATH the launcher does (its unit sets none).

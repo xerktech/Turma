@@ -524,6 +524,7 @@ jobs:
              agent/native/turma-agent \
              agent/native/turma-agentctl \
              agent/native/turma-agent-update \
+             agent/native/turma-agent-protect \
              agent/native/turma-agent.service \
              agent/native/turma-agent-update.service \
              agent/native/turma-agent-update.timer \

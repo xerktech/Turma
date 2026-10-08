@@ -5104,6 +5104,39 @@ def fileguard_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "fileguard.py")
 
 
+# Protected hooks (XERK-1677). `turma-agent-protect` lays root-owned copies of
+# guard.py and fileguard.py in PROTECTED_HOOKS_DIR and wires them through Claude
+# Code's MANAGED settings, which a session's own `disableAllHooks` cannot switch
+# off. While that drop-in wires both, `build_guard_settings` leaves them out of
+# `--settings`: run twice, the first guard would consume a judge's one-shot grant
+# and the second would refuse the retried command.
+MANAGED_GUARD_DROPIN = "/etc/claude-code/managed-settings.d/50-turma-guard.json"
+PROTECTED_HOOKS_DIR = "/etc/turma-agent/hooks"
+
+
+def managed_guard_active(dropin=None, hooks_dir=None):
+    """True when the managed drop-in wires BOTH protected hooks and both exist.
+    Anything less (no drop-in, an older one, a hook missing) reads False, so the
+    manager keeps wiring its own copies rather than leaving a gap."""
+    dropin = dropin or MANAGED_GUARD_DROPIN
+    hooks_dir = hooks_dir or PROTECTED_HOOKS_DIR
+    raw = _read_regular(dropin, 1 << 20)
+    if raw is None:
+        return False
+    try:
+        cmds = [h.get("command", "")
+                for e in json.loads(raw)["hooks"]["PreToolUse"]
+                for h in e.get("hooks", [])]
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return False
+    for name in ("guard.py", "fileguard.py"):
+        path = os.path.join(hooks_dir, name)
+        if not os.path.isfile(path) or not any(f'"{path}"' in c for c in cmds
+                                               if isinstance(c, str)):
+            return False
+    return True
+
+
 # Hook integrity (XERK-1643). The updater records the installed hooks' hashes in
 # `<prefix>/hooks.sha256` and reinstalls the current release when they drift, but
 # it runs hourly; a session that stubbed guard.py had every Bash call on the host
@@ -5443,7 +5476,7 @@ def auto_mode_host_block(device=None, repos=None):
 
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
                          local_settings_path=None, fileguard_path=None,
-                         permlog_path=None, device=None, repos=None):
+                         permlog_path=None, device=None, repos=None, managed=None):
     """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
     Bash (the safety guard), the file-editing tools (the ~/.claude file guard)
     and AskUserQuestion (the glasses answer bridge),
@@ -5502,7 +5535,9 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     for rule in tool_allow_floor() + allow:
         if rule not in perms["allow"]:
             perms["allow"].append(rule)
-    pre = [{
+    # The protected copies run from managed settings instead (XERK-1677).
+    managed = managed_guard_active() if managed is None else managed
+    pre = [] if managed else [{
         "matcher": "Bash",
         "hooks": [{"type": "command", "command": guard_command}],
     }]
@@ -5511,7 +5546,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
     # every session on the host — a version-skewed install would present as an
     # unexplainable permissions bug. So wire it only when it is actually there,
     # and say so loudly: patterns-only is degraded, not broken.
-    if os.path.exists(fileguard_path):
+    if not managed and os.path.exists(fileguard_path):
         pre.append({
             # ~/.claude is "everything except the two memory trees", which is a
             # predicate and not a glob. See hooks/fileguard.py for why.
@@ -5520,7 +5555,7 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
             "matcher": "Write|Edit|MultiEdit|NotebookEdit",
             "hooks": [{"type": "command", "command": fileguard_command}],
         })
-    else:
+    elif not managed:
         log(f"fileguard hook missing at {fileguard_path}; ~/.claude is protected "
             f"by deny patterns only (see .claude/rules/agent-hooks.md)")
     pre.append({
@@ -22962,7 +22997,12 @@ class SessionManager:
         cloned later, or a later edit to that file, is picked up only when the
         manager restarts."""
         cached = getattr(self, "_guard_settings_path", None)
-        if cached and os.path.exists(cached):
+        # Re-written when the protected hooks come or go (XERK-1677): an OS
+        # upgrade that resets /etc must put the guard back into --settings
+        # for the next launch, not leave it in neither place.
+        managed = managed_guard_active()
+        if cached and os.path.exists(cached) \
+                and managed == getattr(self, "_guard_settings_managed", None):
             return cached
         path = os.path.join(REGISTRY_DIR, "guard-settings.json")
         # Written whole to a tmp, then renamed over (XERK-1565): every manager
@@ -22978,7 +23018,8 @@ class SessionManager:
             fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL
                          | getattr(os, "O_NOFOLLOW", 0), 0o666)
             with os.fdopen(fd, "w", encoding="utf-8") as fh:
-                json.dump(build_guard_settings(device=getattr(self, "device", None)),
+                json.dump(build_guard_settings(device=getattr(self, "device", None),
+                                               managed=managed),
                           fh, indent=2)
             os.replace(tmp, path)
         except OSError as e:
@@ -22988,6 +23029,12 @@ class SessionManager:
                 pass
             log(f"guard settings write failed ({e}); launching without --settings")
             return None
+        if managed != getattr(self, "_guard_settings_managed", None):
+            log("guard hooks: " + ("root-owned copies via managed settings "
+                                   f"({MANAGED_GUARD_DROPIN})" if managed else
+                                   "this install's own copies via --settings "
+                                   "(session-writable; see turma-agent-protect)"))
+        self._guard_settings_managed = managed
         self._guard_settings_path = path
         return path
 

@@ -19,6 +19,9 @@ spec = importlib.util.spec_from_file_location("hub_agent", MODULE_PATH)
 ha = importlib.util.module_from_spec(spec)
 sys.modules["hub_agent"] = ha
 spec.loader.exec_module(ha)
+# A host with the protected hooks installed (XERK-1677) would otherwise change
+# what every test here builds; TestManagedGuard opts back in explicitly.
+ha.MANAGED_GUARD_DROPIN = "/nonexistent/managed-settings.d/50-turma-guard.json"
 
 
 class TestGuardSettings(unittest.TestCase):
@@ -452,6 +455,65 @@ class TestGuardSettings(unittest.TestCase):
         path = ha.ask_script_path()
         self.assertTrue(path.endswith(os.path.join("hooks", "ask.py")))
         self.assertTrue(os.path.exists(path))
+
+
+class TestManagedGuard(unittest.TestCase):
+    """XERK-1677: while root-owned copies run from managed settings, the
+    --settings file must not wire the guard a second time (the first run would
+    consume a judge's one-shot grant and the second refuse the retry)."""
+
+    def _dropin(self, d, names=("guard.py", "fileguard.py")):
+        hooks = os.path.join(d, "hooks")
+        os.makedirs(hooks)
+        for n in ("guard.py", "fileguard.py"):
+            open(os.path.join(hooks, n), "w").close()
+        dropin = os.path.join(d, "50-turma-guard.json")
+        with open(dropin, "w") as fh:
+            json.dump({"hooks": {"PreToolUse": [
+                {"matcher": "x", "hooks": [{"type": "command",
+                                            "command": f'"/usr/bin/python3" -SI "{hooks}/{n}"'}]}
+                for n in names]}}, fh)
+        return dropin, hooks
+
+    def test_active_only_when_both_hooks_are_wired_and_present(self):
+        with tempfile.TemporaryDirectory() as d:
+            dropin, hooks = self._dropin(d)
+            self.assertTrue(ha.managed_guard_active(dropin, hooks))
+            os.unlink(os.path.join(hooks, "fileguard.py"))
+            self.assertFalse(ha.managed_guard_active(dropin, hooks))
+        with tempfile.TemporaryDirectory() as d:
+            dropin, hooks = self._dropin(d, names=("guard.py",))
+            self.assertFalse(ha.managed_guard_active(dropin, hooks))
+        with tempfile.TemporaryDirectory() as d:
+            bad = os.path.join(d, "x.json")
+            with open(bad, "w") as fh:
+                fh.write("{not json")
+            self.assertFalse(ha.managed_guard_active(bad, d))
+            self.assertFalse(ha.managed_guard_active(os.path.join(d, "none"), d))
+
+    def test_managed_drops_the_guard_and_fileguard_only(self):
+        s = ha.build_guard_settings(python_exe="/usr/bin/python3", managed=True)
+        self.assertEqual([e["matcher"] for e in s["hooks"]["PreToolUse"]],
+                         ["AskUserQuestion"])
+        self.assertIn("deny", s["permissions"])           # the rest is untouched
+        s = ha.build_guard_settings(python_exe="/usr/bin/python3", managed=False)
+        self.assertEqual([e["matcher"] for e in s["hooks"]["PreToolUse"]][0], "Bash")
+
+    def test_settings_file_is_rewritten_when_protection_changes(self):
+        # An OS upgrade that resets /etc must put the guard back into the next
+        # launch's --settings, not leave it in neither place.
+        with tempfile.TemporaryDirectory() as d:
+            mgr = ha.SessionManager.__new__(ha.SessionManager)
+            mgr.device = "h"
+            with mock.patch.object(ha, "REGISTRY_DIR", d):
+                with mock.patch.object(ha, "managed_guard_active", return_value=True):
+                    path = mgr._ensure_guard_settings()
+                    pre = json.load(open(path))["hooks"]["PreToolUse"]
+                    self.assertNotIn("Bash", [e["matcher"] for e in pre])
+                with mock.patch.object(ha, "managed_guard_active", return_value=False):
+                    path = mgr._ensure_guard_settings()
+                    pre = json.load(open(path))["hooks"]["PreToolUse"]
+                    self.assertIn("Bash", [e["matcher"] for e in pre])
 
 
 class TestOperatorLocalPermissions(unittest.TestCase):
