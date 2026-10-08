@@ -2162,6 +2162,67 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_directory_tildes_read_as_the_directories_the_line_visited(self):
+        """XERK-1696: `~-` is $OLDPWD and `~N`/`~+N`/`~-N` a `dirs` entry, so
+        each of these reached rm as / or /etc (nobody rig)."""
+        for cmd in ("cd /; cd /tmp; rm -rf ~-",
+                    "cd /; cd /tmp; rm -rf ~-/etc",
+                    "OLDPWD=/etc; rm -rf ~-/*",
+                    "cd /; cd /tmp; rm -rf $OLDPWD",
+                    "cd /etc; pushd /tmp; rm -rf ~+1",
+                    "cd /etc; pushd /tmp; rm -rf ~1",
+                    "cd /etc; pushd /tmp; rm -rf ~-0",
+                    "cd /etc; cd /tmp; rm -rf ${y:-~-}",
+                    "y=a; cd /; cd /tmp; rm -rf ${y/a/~-/etc}",
+                    # ...and inside a script, where a quote ends the word.
+                    "bash -c 'cd /etc; rm -rf ~+'",
+                    "bash -c 'cd /; cd /tmp; rm -rf ~-'",
+                    "bash -c 'cd /etc; pushd /tmp; rm -rf ~1'",
+                    "bash -c 'HOME=/etc; rm -rf ~'",
+                    # QA: a quoted or escaped tilde `eval` expands, and an op
+                    # that keeps the set value.
+                    "cd /; cd /tmp; eval rm -rf '~-'",
+                    "cd /; cd /tmp; eval rm -rf \\~-/etc",
+                    "cd /etc; cd /tmp; eval rm -rf \\~-/\\*",
+                    "cd /; cd /tmp; t='~-'; eval rm -rf $t",
+                    "cd /etc; eval rm -rf '~+'",
+                    "cd /; cd /tmp; rm -rf ${OLDPWD:?}",
+                    "cd /etc; rm -rf ${PWD:?}/*",
+                    # QA: an unknown name glued after it reads empty.
+                    "cd /; cd /tmp; eval rm -rf '~-'$x",
+                    "cd /etc; cd /tmp; eval rm -rf '~-'$x/*",
+                    "cd /etc; pushd /tmp; eval rm -rf '~1'$x",
+                    "cd /; rm -rf $PWD$x",
+                    "cd /; cd /tmp; eval rm -rf '~-'${x}$y",
+                    # ...and a positional or an op glued on joins the directory.
+                    "cd /; rm -rf $PWD$1", "cd /etc; rm -rf $PWD$1",
+                    "cd /; f(){ rm -rf $PWD$1; }; f",
+                    "cd /; cd /tmp; eval rm -rf '~-'$1",
+                    "cd /; rm -rf $PWD${x#a}",
+                    "cd /usr/lib; rm -rf $PWD$1/../..",
+                    # ...and a glob glued on (`/*`).
+                    "cd /; rm -rf $PWD*", "cd /; cd /tmp; rm -rf $OLDPWD*",
+                    "cd /; rm -rf ${PWD:?}*",
+                    # Already denied: `..` climbing out of a home.
+                    "rm -rf ~root/../etc", "rm -rf ~daemon/../../etc",
+                    "rm -rf ~/../..", "rm -rf $HOME/../../etc"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("rm -rf ~-/build", "cd /tmp/a; cd /tmp/b; rm -rf ~-/build",
+                    "bash -c 'cd /tmp/a; rm -rf ~+/build'", "bash -c 'rm -rf ~/build'",
+                    "ls ~1 ~+2", "cd ~-; rm -rf build", "rm -rf x-~-y",
+                    "git diff HEAD~1", "cd /tmp/a; rm -rf ${PWD:?}/build",
+                    "cd /tmp/a; rm -rf $PWD$x", "cd /; rm -rf $PWD$x.bak",
+                    "cd /tmp/a; eval rm -rf ~-$x/build", "rm -rf ~-$x",
+                    "cd /; rm -rf $PWD${x}-old", "cd /etc; rm -rf $PWD.bak",
+                    "cd /tmp/a; rm -rf $PWD$1", "f(){ rm -rf $PWD$1; }; f /build",
+                    "cd /tmp/a; rm -rf $PWD*", "cd /; rm -rf $PWD.bak", "rm -rf $PWDX",
+                    # Another name, and a literal tilde word, join nothing.
+                    "cd /; rm -rf $PWDetc", "cd /; cd /tmp; rm -rf ~-*",
+                    "cd /; cd /tmp; eval rm -rf '~-'etc"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_tilde_and_pwd_follow_the_line_s_own_home_and_cd(self):
         """XERK-1685: bash expands `~` from HOME's current value and `$PWD` is
         where a `cd` left it, so each of these reached rm as /etc (nobody rig)."""

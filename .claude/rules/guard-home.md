@@ -39,6 +39,19 @@ paths:
   - `_home_tilde_reading` adds a reading with every word-start `~` (and a bare `cd`) as `$HOME`
     when the raw text holds `HOM`, `OME` or `eval` (`HOM{E,}`, `H\OME`, `x=OME; …H$x`).
     `~+` always reads as `$PWD`.
+  - `~-` reads as `$OLDPWD`, and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD` (XERK-1696);
+    `_under_cwd` reads `$OLDPWD` as `$PWD`: any directory the line visited, unordered.
+  - `_PWD_LEAD_RE` also takes `${PWD:?}`/`${PWD?}` and an unspliced directory tilde, which
+    `eval rm '~-'` / `\~-` reach a target as (the splice's lookbehind skips quotes).
+    `${PWD:-x}` never reaches it: the default is spliced upstream (XERK-1755).
+  - Any tail glued after that lead (`$x`, `$1`, `${x#a}`, `*`) is joined to the directory as bash
+    joins it, then judged (`cd /; rm -rf $PWD*` is `/*`); a tilde lead takes only `/` or `$`.
+  - Accepted over-read: a function body's unbound reading reads `$1` empty, so after `cd /`,
+    `f(){ rm -rf $PWD$1; }; f /build` is refused, as `f(){ rm -rf /$1; }` already was.
+  - Accepted over-read: a literal `~-` word (`t='~-'; rm -rf $t`) reads as `$OLDPWD`, so after a
+    `cd /` it is refused; bash would remove a file named `~-`.
+  - A quote may end the tilde word (`bash -c 'cd /etc; rm -rf ~+'`): `~'/x'` is literal in
+    bash, so that splice over-reads, which only adds a reading.
   - A `~` opening a `${y:-…}`/`-`/`:+`/`:=`/`:?` word (`_PARAM_TILDE_RE`) or a `${y/pat/…}`
     replacement (`_replacement_tildes`) is spliced too, read both braced (`${HOME}`: an
     unbraced name ending a default word is unresolved, XERK-1670) and bare. Never add `-`/`+`
@@ -63,7 +76,8 @@ paths:
   - `_under_cwd` reads `$PWD` as a relative operand is (exact root or `..` only).
   - Known false deny: `HOME=/ rm -rf ~/etc` (a prefix binding; bash expands `~` first),
     as `$HOME` already is there.
-  - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`.
+  - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`,
+    `test_directory_tildes_read_as_the_directories_the_line_visited`.
 - An unassigned `${HOME<op>}` (not a `:-`/`:=` default) is spliced in the values pass as its
   `_home_readings` (XERK-1686): kept as written, `${HOME:+r}m -rf /`, `${HOME/*/rm} -rf /` and
   `rm ${HOME:+-rf} /` hid the program or flag.
