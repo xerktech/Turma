@@ -3676,6 +3676,35 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\"), "rm -rf a\\\\ b\\\\")
         self.assertEqual(guard._prenormalise("rm -rf {a,b}\\\\\\"), "rm -rf a\\\\ b\\\\")
 
+    def test_a_brace_glued_to_a_quoted_word_repeats_the_whole_word(self):
+        # XERK-1683: the brace word started at the last blank, quoted or not,
+        # so `eval 'rm -rf /etc'{,x}` repeated only `/etc'` and was allowed.
+        for cmd in ("eval 'rm -rf /etc'{,x}", "eval 'rm -rf /etc'{,x}\\",
+                    'eval "rm -rf /etc"{,x}', "eval rm\\ -rf\\ /etc{,x}",
+                    "eval 'rm -rf /'{e..e}tc",
+                    # ...and one a quoted substitution or arithmetic fills:
+                    # cut inside it, the quotes unbalanced and hid the `rm`.
+                    'echo "$(echo x)"{1,2}; rm -rf /etc',
+                    'echo "`echo x y`"{1,2}; rm -rf /etc',
+                    'echo "$((1 + 2))"{1,2}; rm -rf /etc',
+                    'echo "${x:-$(echo a b)}"{1,2}; rm -rf /etc',
+                    "echo 'a b'{1,2}; rm -rf /etc",
+                    'x=$(echo "$(echo a b)"{1,2}); rm -rf /etc',
+                    "echo 'a b'$[1 + 2]`echo a $[1 + 2] b`{1,2} '$(a b)''`a b`'{a,b}c; "
+                    "rm -rf /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("echo 'a b'{,x}", "eval 'echo hi'{,x}", "touch /tmp/'a b'{1,2}",
+                    'git log --format="%h $(date)"{,}', 'mkdir -p "/tmp/my dir"/{src,test}',
+                    "echo $(echo 'a b'{1,2})",
+                    # Go raw strings in heredoc data: backticks misread as
+                    # substitutions once read this text "nested too deeply".
+                    "cat > x_test.go <<'EOF'\n// Wolf's field names.\n// Wolf's request and\n"
+                    "\t\t`\"pin\":false,\"runner\":{\"type\":\"process\",\"cmd\":\"x\"}}]}`)\n"
+                    "}\nEOF\nexport PATH=$HOME/go/bin:$PATH; go test ./pkg/... 2>&1 | tail -20"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):

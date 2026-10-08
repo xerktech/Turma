@@ -1766,6 +1766,7 @@ def _budgeted(fn):
         _VALUE_COUNTS.clear()
         _BRACE_OTHER_SEEN[0] = False
         _MAIN_PARSE_SEEN[0] = False
+        _BRACE_QUOTED_SEEN[0] = False
         _READINGS_SEEN[0] = False
         _FOR_NAMES.clear()
         # These memos set the readings' SEEN flags as they fill, and a hit
@@ -1789,7 +1790,7 @@ def _memo(kind: str, key, fn, *args):
     memo = _budget[kind]
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
            _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0],
-           _FOR_PICK[0], _HOME_KEPT[0], _READINGS_JOINED[0])
+           _FOR_PICK[0], _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -2770,6 +2771,41 @@ def _brace_sequence(body: str) -> list[str] | None:
     return [str(v) if a.lstrip("-").isdigit() else chr(v) for v in seq]
 
 
+def _brace_word_start(command: str, start: int, cut: int) -> int:
+    """Where the bash word holding the brace at ``start`` begins, quotes and
+    substitutions read: `"$(echo a b)"{1,2}` and `'x y'{,z}` are one word
+    each (XERK-1683). ``cut`` (the last blank before it) when nothing
+    between can join a word across a blank."""
+    quoted = any(c in command[cut:start] for c in "'\"\\")
+    if not quoted and "`" not in command[cut:start] and not (cut and command[cut - 1] == ")"):
+        return cut
+    # Words are scanned from the innermost substitution body holding the
+    # brace, where bash starts splitting words afresh.
+    origin, end = 0, len(command)
+    while True:
+        inner = next((m for m in _find_substs(command[origin:end])
+                      if origin + m.start() < start < origin + m.end() - 1), None)
+        if inner is None:
+            break
+        tick = command[origin + inner.start()] == "`"
+        origin, end = origin + inner.start() + (1 if tick else 2), origin + inner.end() - 1
+        if tick:
+            break  # a backtick body is unescaped: its nested offsets differ
+    i = origin
+    while i < start:
+        if command[i] in _BRACE_WORD_END:
+            i += 1
+            continue
+        w = _word_end(command, i)
+        if w < 0 or w > start:
+            # Only ever further back than the cut. With no quote between, a
+            # word across a newline is a backtick misread in data (a Go raw
+            # string in a heredoc), never one bash forms.
+            return i if i < cut and (quoted or "\n" not in command[i:cut]) else cut
+        i = w
+    return cut
+
+
 def _expand_braces(command: str) -> str:
     """`rm -rf {/etc,/var}` → `rm -rf /etc /var` (prefix/suffix preserved).
 
@@ -2798,6 +2834,15 @@ def _expand_braces(command: str) -> str:
         word_start = start
         while word_start and command[word_start - 1] not in _BRACE_WORD_END:
             word_start -= 1
+        # A quoted run glued before the brace is the word's too: cut at a
+        # quoted blank, `eval 'rm -rf /etc'{,x}` read as `'rm -rf /etc' /etc'x`
+        # (XERK-1683). An ADDED reading (`_BRACE_QUOTED`), never in place of
+        # the cut one: no lexer short of bash finds every word start.
+        quoted_start = _brace_word_start(command, start, word_start)
+        if quoted_start != word_start:
+            _BRACE_QUOTED_SEEN[0] = True
+            if _BRACE_QUOTED[0]:
+                word_start = quoted_start
         # A `$(…)`, backtick or quoted run glued on is the word's too: cut at
         # its `(`, `{,}$(echo rm -rf /)` read as `$ $` (XERK-1622).
         word_end = _word_end(command, end)
@@ -4523,6 +4568,10 @@ def _brace_quote_ended(text: str) -> str:
 
 # Off while `_expand` takes its unbraced reading (see `_brace_glued_names`).
 _BRACE_GLUED = [True]
+# On while `_expand_readings` takes the reading where a brace word starts at
+# the quote-aware word start (`_expand_braces`); SEEN once the two differ.
+_BRACE_QUOTED = [False]
+_BRACE_QUOTED_SEEN = [False]
 
 
 @_budgeted
@@ -4788,7 +4837,7 @@ def _reading() -> tuple:
     """The reading flags a body's resolution reads, as a memo key: a body
     memoised under one reading was replayed under another (XERK-1621)."""
     return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUE_PICK[0],
-            _HOME_KEPT[0], _READINGS_JOINED[0])
+            _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0])
 
 
 # Names a `for NAME in …` sets this decision. Its words are joined as the
@@ -7457,6 +7506,12 @@ def _expand_readings(command: str) -> list[tuple[list[str], str]]:
             out = out + _expand_picks(command)
         finally:
             _BRACE_OTHER_SHELL[0] = False
+    if _BRACE_QUOTED_SEEN[0] and not _BRACE_QUOTED[0]:
+        _BRACE_QUOTED[0] = True
+        try:
+            out = out + _expand_picks(command)
+        finally:
+            _BRACE_QUOTED[0] = False
     if _MAIN_PARSE_SEEN[0] or _BRACE_OTHER_SEEN[0]:
         _MAIN_PARSE[0] = True
         try:
