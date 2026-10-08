@@ -76,7 +76,7 @@ class TestInstall(Base):
         # Absolute interpreter, isolated mode, the ROOT path — never python3
         # off PATH or a file under the session uid's home.
         self.assertTrue(bash.startswith('"/usr/bin/python3" -SI "/etc/turma-agent/hooks/guard.py"'))
-        self.assertTrue(bash.endswith("--grants"))
+        self.assertTrue(bash.endswith("--grants --protected"))
         self.assertEqual(set(body), {"hooks"})   # no key claude might reject
         self.assertEqual(os.stat(self.layout.self_copy).st_mode & 0o777, 0o755)
         self.assertEqual(run("--root", self.root, "status")[0], 0)
@@ -113,6 +113,55 @@ class TestInstall(Base):
     def test_unknown_mode_and_stray_args_are_refused(self):
         self.assertEqual(run("--root", self.root, "bogus")[0], 2)
         self.assertEqual(run("--root", self.root, "sync", "extra")[0], 2)
+
+
+class TestOrdering(Base):
+    """A drop-in naming a missing hook blocks every Bash call on the host, so
+    the hooks land before it and leave after it."""
+
+    def test_hooks_are_written_before_the_dropin(self):
+        order = []
+        real = tap.write_file
+        def rec(path, *a, **k):
+            order.append(os.path.basename(path))
+            return real(path, *a, **k)
+        tap.write_file = rec
+        self.addCleanup(setattr, tap, "write_file", real)
+        run("--root", self.root, "install", "--from", self.src)
+        self.assertLess(max(order.index(n) for n in tap.HOOKS), order.index(tap.DROPIN_NAME))
+
+    def test_the_dropin_is_removed_before_the_hooks(self):
+        run("--root", self.root, "install", "--from", self.src)
+        order = []
+        real = tap._unlink
+        def rec(path):
+            order.append(os.path.basename(path))
+            return real(path)
+        tap._unlink = rec
+        self.addCleanup(setattr, tap, "_unlink", real)
+        run("--root", self.root, "remove")
+        self.assertLess(order.index(tap.DROPIN_NAME), min(order.index(n) for n in tap.HOOKS))
+
+    def test_remove_twice_leaves_nothing(self):
+        run("--root", self.root, "install", "--from", self.src)
+        run("--root", self.root, "remove")
+        os.makedirs(self.layout.hooks)        # a half-removed leftover
+        self.assertEqual(run("--root", self.root, "remove")[0], 0)
+        self.assertFalse(os.path.exists(self.layout.etc))
+
+    def test_a_sync_after_remove_lays_nothing(self):
+        # A sync queued behind remove's lock must not re-install what it removed.
+        run("--root", self.root, "install", "--from", self.src)
+        run("--root", self.root, "remove")
+        rc, out = run("--root", self.root, "sync")
+        self.assertEqual(rc, 0)
+        self.assertIn("nothing to sync", out)
+        self.assertFalse(os.path.exists(self.layout.dropin))
+
+    def test_the_guard_ignores_env_overrides(self):
+        run("--root", self.root, "install", "--from", self.src)
+        cmd = json.load(open(self.layout.dropin))["hooks"]["PreToolUse"][0]["hooks"][0]["command"]
+        self.assertIn("--protected", cmd.split())
 
 
 class TestManagerAgrees(Base):

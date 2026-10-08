@@ -141,6 +141,18 @@ class TestClaudeConfigIsProtected(FileGuardBase):
             self.assertRefused(os.path.join(self.claude, rel))
 
 
+class TestFakedHome(FileGuardBase):
+    def test_the_account_home_stays_protected_under_a_faked_home(self):
+        # XERK-1677: a nested claude started with HOME=/tmp/x runs this hook in
+        # that env; the account's real ~/.claude must still be refused.
+        import pwd
+        real = pwd.getpwuid(os.getuid()).pw_dir
+        if os.path.realpath(real) == self.home:
+            self.skipTest("passwd home is the test home")
+        self.assertRefused(os.path.join(real, ".claude", "settings.json"))
+        self.assertAllowed(os.path.join(self.home, "worktree", "x.txt"))
+
+
 class TestCarveOutBoundaries(FileGuardBase):
     def test_the_memory_directory_entry_itself_is_not_writable(self):
         """A session must not plant a FILE where a memory DIRECTORY belongs.

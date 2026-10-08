@@ -264,7 +264,9 @@ curl -fsSL .../bootstrap.sh | bash -s -- --unprotect
 passwordless sudo (`NOPASSWD: ALL`, the TrueNAS `truenas_admin` default), a
 session can `sudo` past it; `--verify` reports that. Give the agent a user
 without it, or require a password. Every `claude` on the host, including your
-own interactive ones, runs the protected hooks.
+own interactive ones, runs the protected hooks. They ignore `TURMA_TOOL_GRANTS`,
+`TURMA_NO_ATTRIBUTION` and `TURMA_PR_SUMMARY` in the environment (a session sets
+those on a nested `claude`); set them in root-owned `/etc/turma-agent/guard.env`.
 
 ## Verify / uninstall
 

@@ -11,6 +11,9 @@ reach entirely:
 
   /etc/turma-agent/hooks/{guard,fileguard}.py           root:root 0644
   /etc/claude-code/managed-settings.d/50-turma-guard.json root:root 0644
+  /etc/turma-agent/guard.env   optional, the operator's: TURMA_TOOL_GRANTS,
+                               TURMA_NO_ATTRIBUTION, TURMA_PR_SUMMARY for the
+                               protected guard, which ignores them in its env
 
 Claude Code's MANAGED settings are the one scope a user-level
 `disableAllHooks` cannot switch off (measured on 2.1.294), and they apply to
@@ -133,9 +136,12 @@ def dropin_settings(layout, python):
                          f'"{os.path.join(layout.hook_cmd_dir, name)}"', *args])
     # `--grants` is always on: the guard still ANDs it with the session's own
     # TURMA_PERMISSION_JUDGE, and a static file cannot follow the manager's env.
+    # `--protected` makes the guard read its overrides from the root-owned
+    # guard.env instead of the environment, which a nested claude can set.
     return {"hooks": {"PreToolUse": [
         {"matcher": "Bash",
-         "hooks": [{"type": "command", "command": cmd("guard.py", "--grants")}]},
+         "hooks": [{"type": "command",
+                    "command": cmd("guard.py", "--grants", "--protected")}]},
         {"matcher": FILE_EDIT_MATCHER,
          "hooks": [{"type": "command", "command": cmd("fileguard.py")}]},
     ]}}
@@ -288,6 +294,8 @@ def remove_units(layout):
         return
     subprocess.run(["systemctl", "disable", "--now", f"{UNIT}.timer"], check=False,
                    stderr=subprocess.DEVNULL)
+    subprocess.run(["systemctl", "stop", f"{UNIT}.service"], check=False,
+                   stderr=subprocess.DEVNULL)
     for ext in ("service", "timer"):
         try:
             os.unlink(os.path.join(layout.unit_dir, f"{UNIT}.{ext}"))
@@ -379,6 +387,63 @@ def status(layout):
 
 # --- main ---------------------------------------------------------------------------
 
+def _unlink(path):
+    try:
+        os.unlink(path)
+    except FileNotFoundError:
+        pass
+
+
+def remove(layout):
+    # Units FIRST, waiting out a sync already running (`stop` blocks on the
+    # oneshot), then the lock: a sync queued behind it finds no self copy and
+    # does nothing, rather than re-laying what this is removing.
+    remove_units(layout)
+    with locked(layout):
+        # Drop-in before the hooks: hooks without it are inert; it without
+        # them blocks every Bash call on the host.
+        _unlink(layout.dropin)
+        for n in HOOKS:
+            _unlink(os.path.join(layout.hooks, n))
+        _unlink(layout.self_copy)
+        for d in (layout.hooks, layout.etc):   # kept if guard.env is still there
+            try:
+                os.rmdir(d)
+            except OSError:
+                pass
+    say("removed. New sessions get the agent's own hook copies back; restart "
+        "sessions already running to give them a guard again.")
+    return 0
+
+
+def locked(layout):
+    """One install/sync/remove at a time (fcntl lock under /run, root-only)."""
+    import contextlib
+    import fcntl
+
+    @contextlib.contextmanager
+    def _held():
+        path = os.path.join(layout.root, "run", f"{SELF_NAME}.lock")
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(fd)
+    return _held()
+
+
+def _current(layout):
+    out = {}
+    for n in HOOKS:
+        try:
+            out[n] = read_capped(os.path.join(layout.hooks, n))
+        except (OSError, SystemExit):
+            pass
+    return out
+
+
 def main(argv):
     args = list(argv)
     root = "/"
@@ -401,44 +466,36 @@ def main(argv):
         return 1
     os.umask(0o022)
     if mode == "remove":
-        # Drop-in FIRST: hooks without it are inert; it without hooks blocks
-        # every Bash call on the host.
-        for p in [layout.dropin] + [os.path.join(layout.hooks, n) for n in HOOKS]:
-            try:
-                os.unlink(p)
-            except FileNotFoundError:
-                pass
-        remove_units(layout)
-        try:
-            os.unlink(layout.self_copy)
-            os.rmdir(layout.hooks)
-            os.rmdir(layout.etc)
-        except OSError:
-            pass
-        say("removed. New sessions get the agent's own hook copies back; restart "
-            "sessions already running to give them a guard again.")
-        return 0
+        return remove(layout)
     python = python_for(layout)
     if mode == "install" and rest[:1] == ["--from"] and len(rest) == 2:
-        payload = payload_from_dir(rest[1])
+        source = rest[1]
     elif rest:
         say(f"unexpected arguments {rest!r}")
         return 2
     else:
-        payload = payload_from_release()
-    lay(layout, payload, python)
-    if mode == "install":
-        if SELF_NAME not in payload:
+        source = None
+    with locked(layout):
+        if mode == "sync" and not os.path.exists(layout.self_copy):
+            say("not installed (or removed): nothing to sync")
+            return 0
+        payload = payload_from_dir(source) if source else payload_from_release()
+        before = _current(layout)
+        lay(layout, payload, python)
+        if mode == "install" and SELF_NAME not in payload:
             # `--from` a payload without this script: copy the running one so
             # the timer has something root-owned to run.
             write_file(layout.self_copy, read_capped(os.path.abspath(__file__)),
                        0o755, layout)
+    changed = before != {n: payload[n] for n in HOOKS}
+    if mode == "install":
         install_units(layout, python)
-        say("installed. Every claude on this host now runs the protected hooks.")
+        say("installed. Every claude on this host now runs the protected hooks. "
+            "The timer replaces them with the latest release's at each sync.")
         if layout.is_real:
             warn_sudo()
     else:
-        say("hooks current")
+        say("hooks updated" if changed else "hooks unchanged")
     return 0
 
 
