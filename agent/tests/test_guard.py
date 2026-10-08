@@ -4400,6 +4400,10 @@ class TestExpansionBudget(unittest.TestCase):
         self.assertEqual(guard._glued_name_groups("$a$b$c", set("abc")), {frozenset("abc")})
         self.assertEqual(guard._glued_name_groups("c=$a; $c$b", set("ab")), {frozenset("ab")})
         self.assertEqual(guard._glued_name_groups("c=$a; $c $b", set("ab")), set())
+        # A loop name holds its list word, whatever else assigns it (replay).
+        self.assertEqual(guard._glued_name_groups(
+            "v=$1; for v in a b; do echo rf-$v; done; for d in 'x y' 'z w'; do set -- $d; done",
+            set("vd")), set())
         self.assertEqual(guard._glued_name_groups("f(){ $1$2; }; f $a $b", set("ab")),
                          {frozenset("ab")})
         # Sources settle along any chain order, and a run of unclosed `$(`

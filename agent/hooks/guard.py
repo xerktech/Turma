@@ -7489,6 +7489,9 @@ def _glue_sources(command: str, names: set[str]) -> dict[str, frozenset[str]]:
                 got = uses(word)
                 # A `shift` moves a later argument down to `$k`.
                 edges += [(str(j), got) for j in (range(1, k + 1) if shifts else (k,))]
+    # A loop name holds its list's word: a `v=$1` elsewhere (a heredoc
+    # script's) made every `rf-$v` a product (replayed false deny).
+    edges = [(t, u) for t, u in edges if u and t not in names]
     # Propagated along a worklist: a name's sources grow at most once per
     # loop name, so a chain of any length or order settles in linear work.
     src: dict[str, frozenset[str]] = {n: frozenset((n,)) for n in names}
