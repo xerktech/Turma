@@ -35,6 +35,18 @@ DevOps, and what gets typed back because of it.
     the tail of `run-mkpr`/`pr-create.md`. An entry under `PR_CREATE_CMD_MIN` chars is **ignored** —
     attribution must not fail open on a 1-2 char token.
   - ADO URL regexes take **http as well as https** (on-prem is routinely plain HTTP on the LAN).
+  - **`gh api …/repos/<o>/<r>/pulls` with a request body is a create too** (`_gh_api_pr_create`) —
+    what a session falls back to when `gh pr create` hits a GitHub GraphQL error. Never one without
+    a body flag or forced to GET: that LISTS every open PR. Its output is the PR object, whose body
+    can quote other PRs, so `_gh_api_created_pr_url` takes `html_url`, else exactly one distinct URL.
+  - **A BACKGROUNDED create** (`run_in_background`, or moved there on timeout) answers only "running
+    in background"; its URL is in `<task>.output`. The task id is held in `state["pr_bg"]` and the
+    file is read (tail, `O_NOFOLLOW|O_NONBLOCK`, regular only) when that task's
+    `<task-notification>` lands on a `user`/`queue-operation` entry — never an assistant quote.
+    Lost across a manager restart between launch and notification (the restart primes to EOF).
+  - A FAST task's notification can land BEFORE the launch's tool_result, so notifications for
+    unknown task ids are remembered (`state["pr_bg_done"]`, bounded) for that result to claim.
+  - A command that is BOTH (`gh pr create … || gh api …/pulls`) reads by the stricter api rule.
   - Cost: a PR opened another way (subagent, MCP, web UI) gets no chip. **Widen only by teaching
     `_scan_pr_line` another creation event, never by scanning loose text.**
 - **A GitLab MR and an ADO PR answer everywhere a GitHub PR does**: dispatch by URL to

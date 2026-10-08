@@ -1971,6 +1971,169 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         write_jsonl(path, [self.tool_result("t9", f"{self.PR1}\n")])
         self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
 
+    def _primed(self):
+        path = os.path.join(self.proj, "s.jsonl")
+        write_jsonl(path, [self.entry_with_text("hello")])
+        state = {}
+        ha.session_report(self.WORKDIR, state)  # prime
+        return path, state
+
+    GH_API_CREATE = ("gh api repos/o/r/pulls --input /tmp/pr.json --jq .html_url")
+
+    def test_gh_api_pulls_post_is_a_create(self):
+        """A session whose `gh pr create` hits a GraphQL error falls back to the
+        REST endpoint; that PR is its own and must chip."""
+        path, state = self._primed()
+        write_jsonl(path, [self.pr_create_call("a1", cmd=self.GH_API_CREATE),
+                           self.tool_result("a1", f"{self.PR1}\n")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_gh_api_create_takes_the_objects_own_url(self):
+        """The whole PR object comes back; a link its body quotes is not this PR."""
+        path, state = self._primed()
+        obj = {"number": 7, "html_url": self.PR1, "body": f"Follows {self.PR2}"}
+        write_jsonl(path, [
+            self.pr_create_call("a2", cmd="gh api -X POST repos/o/r/pulls -f title=t -f head=b"),
+            self.tool_result("a2", json.dumps(obj)),
+        ])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_gh_api_pulls_listing_is_not_a_create(self):
+        path, state = self._primed()
+        listed = f"{self.PR1}\n{self.PR2}\n"
+        write_jsonl(path, [
+            self.pr_create_call("l1", cmd="gh api repos/o/r/pulls --jq '.[].html_url'"),
+            self.tool_result("l1", listed),
+            self.pr_create_call("l2", cmd="gh api repos/o/r/pulls -X GET -f state=open --jq '.[0].html_url'"),
+            self.tool_result("l2", f"{self.PR1}\n"),
+            self.pr_create_call("l3", cmd="gh api repos/o/r/pulls -f state=open"),
+            self.tool_result("l3", json.dumps([{"html_url": self.PR1}])),
+            # A sibling command's flag does not make the listing a POST.
+            self.pr_create_call("l4", cmd="gh api repos/o/r/pulls; gh issue create -f x"),
+            self.tool_result("l4", f"{self.PR1}\n"),
+        ])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def bg_result(self, tool_id, task, out_path):
+        e = self.tool_result(tool_id, f"Command running in background with ID: {task}. "
+                                      f"Output is being written to: {out_path}. You will be "
+                                      "notified when it completes.")
+        e["toolUseResult"] = {"stdout": "", "stderr": "", "backgroundTaskId": task}
+        return e
+
+    def notification(self, task, out_path, etype="queue-operation"):
+        text = (f"<task-notification>\n<task-id>{task}</task-id>\n<output-file>{out_path}"
+                "</output-file>\n<status>completed</status>\n</task-notification>")
+        if etype == "queue-operation":
+            return {"type": etype, "operation": "enqueue", "content": text}
+        return {"type": etype, "message": {"role": etype, "content": text}}
+
+    def test_a_backgrounded_create_is_attributed_from_its_output_file(self):
+        """run_in_background: the result says only "running in background"; the
+        URL is in the task's output file, announced by a later notification."""
+        path, state = self._primed()
+        out = os.path.join(self.tmp, "bk1.output")
+        with open(out, "w") as f:
+            f.write(f"{self.PR1}\n")
+        write_jsonl(path, [self.pr_create_call("b1", cmd=f"until {self.GH_API_CREATE}; do sleep 60; done"),
+                           self.bg_result("b1", "bk1", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+        write_jsonl(path, [self.notification("bk1", out), self.notification("bk1", out, "user")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def _bg_out(self, task, text=None):
+        out = os.path.join(self.tmp, f"{task}.output")
+        with open(out, "w") as f:
+            f.write(text if text is not None else f"{self.PR1}\n")
+        return out
+
+    def test_an_assistant_quoted_notification_reads_nothing(self):
+        path, state = self._primed()
+        out = self._bg_out("bk2")
+        write_jsonl(path, [self.pr_create_call("b2"), self.bg_result("b2", "bk2", out),
+                           self.notification("bk2", out, "assistant")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+        # The real one still lands afterwards.
+        write_jsonl(path, [self.notification("bk2", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_only_the_file_named_for_that_task_is_read(self):
+        path, state = self._primed()
+        other = self._bg_out("elsewhere")
+        e = self.bg_result("b4", "bk4", "")
+        e["message"]["content"][0]["content"] = "Command running in background with ID: bk4."
+        write_jsonl(path, [self.pr_create_call("b4"), e,
+                           # The notification's own <output-file> names a file
+                           # that is not bk4's — never read.
+                           self.notification("bk4", other)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+        self.assertNotIn("bk4", state["pr_bg"])
+
+    def test_a_symlinked_output_file_is_never_followed(self):
+        path, state = self._primed()
+        real = self._bg_out("real")
+        out = os.path.join(self.tmp, "bk5.output")
+        os.symlink(real, out)
+        write_jsonl(path, [self.pr_create_call("b5"), self.bg_result("b5", "bk5", out),
+                           self.notification("bk5", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def test_a_directory_at_the_output_path_reads_nothing(self):
+        path, state = self._primed()
+        out = os.path.join(self.tmp, "bk6.output")
+        os.mkdir(out)
+        write_jsonl(path, [self.pr_create_call("b6"), self.bg_result("b6", "bk6", out),
+                           self.notification("bk6", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def test_a_fast_task_notified_before_its_result_still_chips(self):
+        """A task finishing in ~1s can have its notification written BEFORE the
+        launch's tool_result."""
+        path, state = self._primed()
+        out = self._bg_out("bk7")
+        write_jsonl(path, [self.pr_create_call("b7"), self.notification("bk7", out),
+                           self.bg_result("b7", "bk7", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_gh_api_output_naming_two_prs_chips_neither(self):
+        path, state = self._primed()
+        write_jsonl(path, [self.pr_create_call("a3", cmd=self.GH_API_CREATE),
+                           self.tool_result("a3", f"{self.PR1}\n{self.PR2}\n")])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
+    def test_a_create_or_gh_api_fallback_reads_by_the_api_rule(self):
+        """`gh pr create … || gh api …/pulls` — the object's body links stay out."""
+        path, state = self._primed()
+        obj = {"html_url": self.PR1, "body": f"See {self.PR2}"}
+        write_jsonl(path, [
+            self.pr_create_call("a4", cmd=f"gh pr create --fill || {self.GH_API_CREATE.split(' --jq')[0]}"),
+            self.tool_result("a4", "GraphQL: Something went wrong\n" + json.dumps(obj)),
+        ])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR1])
+
+    def test_absurd_output_never_raises_onto_the_beat(self):
+        path, state = self._primed()
+        deep = '{"a":' + "[" * 60000
+        out = self._bg_out("bk8", deep)
+        write_jsonl(path, [
+            self.pr_create_call("a5", cmd=self.GH_API_CREATE), self.tool_result("a5", deep),
+            self.pr_create_call("b8"), self.bg_result("b8", "bk8", out), self.notification("bk8", out),
+            {"type": "assistant", "message": {"content": [
+                {"type": "tool_use", "id": "x", "name": "Bash", "input": "gh pr create"}]}},
+        ])
+        write_jsonl(path, self.opened_pr(self.PR2, "after"))
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [self.PR2])
+
+    def test_a_background_output_fifo_never_blocks(self):
+        if not hasattr(os, "mkfifo"):
+            self.skipTest("no FIFOs")
+        path, state = self._primed()
+        out = os.path.join(self.tmp, "bk3.output")
+        os.mkfifo(out)
+        write_jsonl(path, [self.pr_create_call("b3"), self.bg_result("b3", "bk3", out),
+                           self.notification("bk3", out)])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
     MR1 = "https://gitlab.example.com/grp/sub/app/-/merge_requests/12"
 
     def test_glab_mr_create_result_is_this_sessions_mr(self):
