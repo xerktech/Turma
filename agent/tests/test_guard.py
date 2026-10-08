@@ -4588,10 +4588,16 @@ class TestExpansionBudget(unittest.TestCase):
             'x="xargs echo"; ' + " | ".join(f"$x a/b{i}" for i in range(8192)),
         ):
             t = time.monotonic()
-            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny", cmd[:80])
+            decision, reason = guard.decide("Bash", {"command": cmd})[:2]
+            self.assertEqual(decision, "deny", cmd[:80])
+            self.assertIn(self.TOO_LARGE, reason, cmd[:80])
             # xargs re-expands each argv (XERK-1539) until the budget is
-            # spent: ~2.5s idle, so leave a shared CI runner headroom.
-            self.assertLess(time.monotonic() - t, 10, cmd[:80])
+            # spent: ~8s idle. Running out of _MAX_DECIDE_SECONDS gives the
+            # same reason, so this ceiling under it is what proves the budget
+            # stopped it; a tighter one failed releases on a loaded runner
+            # (XERK-1743).
+            self.assertLess(time.monotonic() - t, 25, cmd[:80])
+            self.assertLess(25, guard._MAX_DECIDE_SECONDS)
 
     def test_ordinary_find_exec_and_xargs_stay_allowed(self):
         for cmd in (
