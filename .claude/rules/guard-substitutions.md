@@ -123,6 +123,14 @@ paths:
     Tests: `test_loop_words_reach_a_script_positional_or_eval_alone`.
 - `_expand_braces` ends a brace word with `_word_end`, so a glued `$(…)` stays whole:
   `{,}$(echo rm …)` was cut at its `(` into `$ $`.
+- A brace word's START is also read as bash's word (XERK-1683, `_brace_word_start`): cut at the
+  last blank, quoted or not, `eval 'rm -rf /etc'{,x}` repeated only `/etc'`.
+  - Found by a forward `_word_end` scan from the innermost substitution body holding the brace:
+    `_quote_states` reads a `"$(…)"` body as bare, so a backward quote walk stopped inside it.
+  - An ADDED reading in `_expand_readings` (`_BRACE_QUOTED`), taken only once the two starts
+    differ (`_BRACE_QUOTED_SEEN`); the blank-cut reading stays.
+  - Open: quoted items with blanks (`{'a b',c}`, XERK-1738); a here-string word (XERK-1739).
+  - Tests: `test_a_brace_glued_to_a_quoted_word_repeats_the_whole_word`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
 - **`$'…'` is decoded by bash's rules** (`_ansi_c_text`, XERK-1693), never `unicode_escape`: that
   raised on escapes bash takes (`\x`, `\x4`, `\u41`) and the string stayed undecoded, so one such
