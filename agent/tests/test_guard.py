@@ -5316,6 +5316,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'eval "$(printf "bash -c \'rm -rf /etc;\'\\\\\\\\")"',
                     'bash -c "$(printf \'%s\' "bash -c \'rm -rf /etc;\'\\\\")"',
                     'echo "$(echo \'a\\\')"; rm -rf /etc',
+                    # ...an ADDED reading: kept, an inner printer's odd run
+                    # and a `\`-newline continuation still deny (QA).
+                    'sh -c "$(echo $(echo \'a; b\\\\\\\'))\'; rm -rf /; #\'"',
+                    "echo \"$(echo 'rm -rf /et\\')\nm -rf /etc\" | sh",
                     'x="\\$y \\\nrm -rf /etc"; bash <<< "$x"',
                     # ...whatever came before: a comment's apostrophe, a quote.
                     "# don't\nx=\"\\\nrm -rf /etc\"; $x", 'env X="it\'s" \\\nrm -rf /etc',

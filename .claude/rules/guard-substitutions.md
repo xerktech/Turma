@@ -347,9 +347,10 @@ paths:
     `'…'#\` as a comment; without it `# don't` is an open quote.
   - `_expand_braces` drops it too, BEFORE joining (as zsh does): left on, `{/etc,/var}\` became
     `/etc\ /var\`, ONE word to shlex.
-  - A substitution's PRINTED text ending in one is spliced with it dropped in the plain reading
-    (`_subst_text`, XERK-1691): kept, it escaped the `"` closing `sh -c "$(echo "…'\\")"`, the
-    line no longer tokenized, and the script hid. The literal reading keeps it (as `\\`).
+  - A substitution's PRINTED text ending in one is ALSO read dropped (`_PRINTED_DROP`, XERK-1691):
+    kept, it escaped the `"` closing `sh -c "$(echo "…'\\")"` and the script hid. Added, outermost
+    splice only, taken only when one was printed: in place it lost main's denies of a
+    `\`-newline continuation and of an outer printer whose escape run it made even (QA).
 - **A `${…}` inside `"…"` is a quoting frame of its own** (XERK-1621, `_quote_states`'s `{"`):
   a `"` there nests a string, never closes the outer one. Read flat, `"${y:-"it's"}"; rm …` left
   the `'` open and hid the `rm`.
