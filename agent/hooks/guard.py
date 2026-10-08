@@ -2944,16 +2944,16 @@ def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
     free = list(itertools.islice((chr(c) for c in range(0xE000, 0xF900) if chr(c) not in have),
                                  _BRACE_MASK_DIGITS + 1))
     if len(free) < 2:
-        return None
+        raise _ExpansionTooLarge  # a list left unread fails open: refuse
     # A lead stand-in then two digit stand-ins: room for more units than any
     # command under the growth budget holds, so none stays unread.
     lead, digits = free[0], free[1:]
     base = len(digits)
     back: dict[str, str] = {}
 
-    def stand_in(text: str) -> str | None:
+    def stand_in(text: str) -> str:
         if len(back) >= base * base:
-            return None
+            raise _ExpansionTooLarge  # as above, past the stand-ins
         stand = lead + digits[len(back) // base] + digits[len(back) % base]
         back[stand] = text
         return stand
@@ -2963,22 +2963,23 @@ def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
         if s < last:
             continue  # inside an outer unit already masked
         stand = stand_in(command[s:e])
-        if stand is None:
-            break
         out.append(command[last:s] + stand)
         last = e
     out.append(command[last:])
     command = "".join(out)
-    for _ in range(_BRACE_MASK_PASSES):
+    for passes in range(_BRACE_MASK_PASSES + 1):
         parts, last = [], 0
         for m in _LITERAL_BRACE_RE.finditer(command):
             if "," in m.group(1) or _brace_sequence(m.group(1)) \
                     or (m.start() and command[m.start() - 1] == "$"):
                 continue
-            stand = stand_in(m.group(0))
-            if stand is None:
-                break
-            parts.append(command[last:m.start()] + stand)
+            if passes == _BRACE_MASK_PASSES and "," in command:
+                # Nested deeper still: the list around it would go unread
+                # (`{x,{{{{{{{{{a}}}}}}}}},/etc}`), so refuse rather than allow.
+                raise _ExpansionTooLarge
+            if passes == _BRACE_MASK_PASSES:
+                break  # no `,`: no list for it to hide
+            parts.append(command[last:m.start()] + stand_in(m.group(0)))
             last = m.end()
         if not parts:
             break
@@ -2989,7 +2990,7 @@ def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
 
 
 # How many levels of literal `{…}` `_mask_param_braces` masks inside a list.
-_BRACE_MASK_PASSES = 8
+_BRACE_MASK_PASSES = 16
 # Its stand-ins' digit count: two digits name 65536 units.
 _BRACE_MASK_DIGITS = 256
 # A literal brace: `_BRACE_RE`, empty `{}` included.

@@ -78,6 +78,8 @@ paths:
   `rm -rf {/tmp/x,${HOME}}` (also `{"$HOME",x}`, braced by `_brace_quote_ended`) went unread.
   - Units: a live `${…}` (bash counts plain `{…}` inside it, which `_brace_end` does not:
     `${y:-{a,b}}` is one unit), a `$(…)`/backtick, then a literal non-list `{…}` (`{x,{a},/etc}`).
+  - Past `_BRACE_MASK_PASSES` levels of literal braces (on a line with a `,`) or past the
+    stand-ins it refuses as too large: a list left unread fails open.
   - An unbalanced plain count keeps `_brace_end`'s close and stops counting for the line:
     a scan per opener is quadratic. Masking `{}` first instead hid `{x,${a:-{} ; rm …`.
   - It runs per nested body (thousands of calls on a backtick-heavy line): keep its

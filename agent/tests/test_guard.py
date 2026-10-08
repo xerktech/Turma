@@ -3786,14 +3786,18 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                     "rm -rf {x,$(echo /etc)}", "rm -rf {x,`echo /etc`}",
                     'rm -rf {x,"$(echo /etc)"}', "rm -rf {x,$(echo /e),y}tc",
                     # ...and a literal brace, which is part of its item:
-                    "rm -rf {x,{a},/etc}", "rm -rf {x,{},/etc}", "rm -rf {x,{{a}},/etc}"):
+                    "rm -rf {x,{a},/etc}", "rm -rf {x,{},/etc}", "rm -rf {x,{{a}},/etc}",
+                    # past the mask's passes the list would go unread: refused
+                    "rm -rf {x," + "{" * 9 + "a" + "}" * 9 + ",/etc}",
+                    "rm -rf {x," + "{" * 40 + "}" * 40 + ",${HOME}}"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # A `,` inside the `${…}` is no item separator; ordinary lists stay allowed.
         for cmd in ("rm -rf {x,${y:-a,b}}", "rm -rf ${HOME}/.cache/{build,dist}",
                     "rm -rf {build,${OUT:-dist}}", "echo ${x,,} {a,b}",
                     "rm -rf {x,${y:-/tmp}/etc}", "mkdir -p build/{a,$(date +%s)}",
-                    "find . -name x -exec rm -rf {} \\;", "rm -rf {x,{a}}"):
+                    "find . -name x -exec rm -rf {} \\;", "rm -rf {x,{a}}",
+                    "echo " + "{" * 30 + "a" + "}" * 30):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
