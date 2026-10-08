@@ -7,7 +7,7 @@ paths:
 # Guard: targets built from the home (XERK-1656)
 
 - `_dangerous_target` adds a reading of each target with `~`, `~user`, `$HOME` and
-  `${HOME<op>}` expanded against the session's REAL home (`_home_reading`).
+  `${HOME<op>}` expanded against the session's REAL home (`_home_readings`).
   - As tokens, `$HOME/..` normpaths to `.` and `${HOME/root/etc}` hides the name, so
     `chmod -R 777 $HOME/..` (= `/`) and `rm -rf "${HOME/root/}"*` (= `/*`) were allowed.
 - A reading that stays inside a home is put back as `$HOME…` / `~user…` before it is judged
@@ -17,7 +17,7 @@ paths:
 - Ops are evaluated by the guard's own `_apply_var_op` / `_replace_op`; an unset name in an
   op's word reads empty (`${HOME/root/$y}` is `/`). An element or quoting transform (`@Q`) → no reading.
 - `${HOME:-w}` is spliced as `w` AND, in a second `_expand_readings` pass (`_HOME_KEPT`, only
-  for lines with a `${HOME:-`/`:=` default), kept as written for `_home_reading`.
+  for lines with a `${HOME:-`/`:=` default), kept as written for `_home_readings`.
   - Never one instead of the other: as `w` only, `"${HOME:-/tmp}"/*` hid the home wipe; as
     written only, `local HOME`, `read HOME </dev/null` and `exec -c` unset HOME and ran `w`.
   - Never gate it on the line's text (`unset`/`env`): any `echo env` turned it off, and a
@@ -65,9 +65,9 @@ paths:
     as `$HOME` already is there.
   - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`.
 - An unassigned `${HOME<op>}` (not a `:-`/`:=` default) is spliced in the values pass as its
-  `_home_reading` (XERK-1686): kept as written, `${HOME:+r}m -rf /`, `${HOME/*/rm} -rf /` and
+  `_home_readings` (XERK-1686): kept as written, `${HOME:+r}m -rf /`, `${HOME/*/rm} -rf /` and
   `rm ${HOME:+-rf} /` hid the program or flag.
-  - Through `_home_reading`, so a value inside the home comes back as `$HOME…` and target rules
+  - Through `_home_readings`, so a value inside the home comes back as `$HOME…` and target rules
     still judge it as the home (`rm -rf ${HOME:+$HOME/.cache}` stays allowed).
   - The unset-HOME reading is the unset-names one every name gets; no extra pass.
   - An op it cannot read (`[i]`, `@Q`) stays as written. 0 diffs over 126 real `${HOME` commands.

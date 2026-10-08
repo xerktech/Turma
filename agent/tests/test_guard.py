@@ -2545,6 +2545,103 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(value=v, op=op, pat=pat):
                 self.assertEqual(guard._apply_var_op(v, op, pat), exp)
 
+    def test_extglob_ops_read_both_ways_as_bash(self):
+        """XERK-1664: an extglob pattern means one thing under `shopt -s
+        extglob` and another without it, and the guard does not track shell
+        options: with it off `_apply_var_op` is bash exactly, and every result
+        bash gives with it on is one of `_var_op_readings`."""
+        vals = ("", "x", "xxy", "xyz", "xx/etc", "/etcxx", "a|b", "(x)", "+(x)", "xyxy")
+        pats = ("+(x)", "*(x)", "?(x)", "@(x|xx)", "!(x)", "!(*y)", "!(x)*", "+(x|y)", "*(xy)",
+                "+([a-z])", "@(\\))", "+(x)y", "?(*)", "!(@(x))", "*(+(x)|y)", "@('x'|\"y\")",
+                "+(x", "@()", "x@(", "+(?)", "x!(y)")
+        cases = [(v, op, anc + p + ("/-" if op[0] == "/" else ""))
+                 for v in vals for p in pats for op in ("#", "##", "%", "%%", "/", "//")
+                 for anc in (("", "#", "%") if op == "/" else ("",))]
+        for ext in (False, True):
+            script = "shopt -s extglob\n" * ext + "".join(
+                f"v={shlex.quote(v)}; printf '%s\\0' \"${{v{op}{a}}}\"\n" for v, op, a in cases)
+            want = subprocess.run(["bash", "-c", script], capture_output=True,
+                                  text=True, check=True).stdout.split("\0")
+            for (v, op, a), exp in zip(cases, want):
+                with self.subTest(value=v, op=op, pat=a, extglob=ext):
+                    if ext:
+                        self.assertIn(exp, guard._var_op_readings(v, op, a))
+                    else:
+                        self.assertEqual(guard._apply_var_op(v, op, a), exp)
+        # Read both ways, the line's command and paths are whichever bash runs.
+        for cmd in ("shopt -s extglob; a='xx/etc'; rm -rf \"${a##+(x)}\"",
+                    "shopt -s extglob; a='xx/etc'; rm -rf \"${a/@(xx)/}\"",
+                    "shopt -s extglob; a='xxrm'; ${a#@(xx)} -rf /etc",
+                    "shopt -s extglob; a='/etcxx'; rm -rf ${a%%*(x)}",
+                    "shopt -s extglob; a='x/etc'; rm -rf \"${a##!(*/*)}\"",
+                    "shopt -s extglob; a='xxeval'; ${a//+(x)/} \"a='rm -rf /etc'\"; $a",
+                    "a='qq/etc'; b=${a##@(q|qq)}; rm -rf $b",
+                    "a='/'; rm -rf \"${a/%?(x)/etc}\"",
+                    # QA: bash-quirk patterns the on reading does not model,
+                    # and a nested op, are still never one trusted command.
+                    "shopt -s extglob; a='xrm -rf /etc'; ${a#*@(x|)}",
+                    "shopt -s extglob; a='rm -rf /etcx'; ${a%*@(x|)}",
+                    "shopt -s extglob; a='xxrm -rf /etc'; c=zx; ${a#@(${c#@(z)}x)}",
+                    # QA: an extglob op on HOME reads as the root.
+                    "rm -rf ${HOME%+(?)}", "rm -rf \"${HOME/+(?)/}\"",
+                    "rm -rf \"${HOME%+(?)}\"/.ssh", "rm -rf ~/../../etc${HOME#+(?)}",
+                    # QA (merge): every reading of a HOME op is spliced, so
+                    # the text glued after it stays with each.
+                    "shopt -s extglob; rm -rf ${HOME##@(*)}/etc", "rm -rf ${HOME//+(?)/}/usr",
+                    "${HOME##@(*)}eval 'rm -rf /etc'", "a=X; rm -rf \"/e${a%@(X)}tc\"",
+                    # QA (merge): positionals read extglob both ways, raw too.
+                    "f(){ ${1#@(xx)}; }; f 'xxrm -rf /etc'",
+                    "set -- 'xxrm -rf /etc'; ${1#@(xx)}",
+                    "set -- 'xxrm -rf /etc'; eval \"${1##+(x)}\"",
+                    "bash -c '${0#@(xx)}' 'xxrm -rf /etc'",
+                    "sh -c 'eval \"${1##+(x)}\"' _ 'xxrm -rf /etc'",
+                    # QA delta: a carrier reading ONE argument or word gets
+                    # every reading, not just the marker.
+                    "shopt -s extglob; a='xxrm -rf /etc'; bash -c \"${a##+(x)}\"",
+                    "shopt -s extglob; a='xrm -rf /etc'; trap \"${a#*@(x|)}\" EXIT",
+                    "shopt -s extglob; a='xrm -rf /etc'; bash <<< \"${a#*@(x|)}\"",
+                    "shopt -s extglob; a='xxrm -rf /etc'; bash <<<\"${a//+(x)/}\"",
+                    "shopt -s extglob; a='xxrm -rf /etc'; xargs -0 bash -c <<< \"${a##+(x)}\"",
+                    "a='rm -rf /etc'; bash -c \"${a#$PWD}\"",
+                    "a='rm -rf /etc'; bash <<< \"${a%$nope}\"",
+                    # QA delta 3: text AFTER the splice in that one argument,
+                    # and a path glued to it, are read too.
+                    "x=xx1; bash -c \"echo ${x##+(x)}; rm -rf /etc\"",
+                    "x=xx1; sh -c \"echo ${x//+(x)/} && rm -rf /etc\"",
+                    "a=/eX; bash -c \"rm -rf ${a%@(X)}tc\"",
+                    "a=/eX; trap \"rm -rf ${a%@(X)}tc\" EXIT"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("shopt -s extglob; f=build.bak; rm -rf \"${f%+(.bak)}\"",
+                    "shopt -s extglob; p=/repos/x/; cd \"${p%%+(/)}\"",
+                    "shopt -s extglob; rm -rf \"${HOME%%+(/)}/scratch/tmp\"",
+                    "shopt -s extglob; a='xx/tmp/y'; rm -rf \"${a##+(x)}\"",
+                    "a=xxrm; echo ${a#@(xx)}"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        with mock.patch.dict(os.environ, {"HOME": "/home/x"}):
+            # QA: a HOME op that leaves HOME as it is reads back braced; bare,
+            # the glued `x` made `$HOMEx` and `/home/xx/../x` read `/x`.
+            for cmd in ("rm -rf ${HOME%q}x/../x", "rm -rf ${HOME:0}x/../x",
+                        "rm -rf ${HOME%@(q)}x/../x"):
+                with self.subTest(cmd=cmd, home="/home/x"):
+                    self.assertDenied(cmd)
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cmd in ("rm -rf ${HOME%@(t)}t/.ssh", "rm -rf ${HOME%@(t)}t",
+                        "cd ${HOME%+(root)} && rm -rf etc"):
+                with self.subTest(cmd=cmd, home="/root"):
+                    self.assertDenied(cmd)
+        # A group whose matching blows up stops at its step budget, and deep
+        # nesting is unreadable, never a RecursionError (XERK-1664 QA).
+        star = "|".join(["*"] * 200)
+        for v, op, pat in (("x" * 5000 + "/etc", "##", "*(!(y))"), ("x" * 2000, "##", f"+({star})"),
+                           ("x" * 2000, "%%", f"*({star})"), ("x" * 500, "//", f"!({star})/-"),
+                           ("x" * 256, "##", "+(" * 3000 + "x" + ")" * 3000)):
+            with self.subTest(pat=pat[:20]):
+                started = time.monotonic()
+                self.assertGreater(len(guard._var_op_readings(v, op, pat)), 1)
+                self.assertLess(time.monotonic() - started, 2)
+
     def test_ansi_c_strings_decode_as_bash_does(self):
         """XERK-1693: `$'…'` is decoded by bash's rules, never given up on: a
         `\\x` Python's decoder rejected left the whole script unread."""
@@ -5278,10 +5375,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # past `_MAX_HOME_OPS` the target reads as `/` instead of being timed.
         with mock.patch.dict(os.environ, {"HOME": "/root"}):
             word = "${HOME%/}" * (guard._MAX_HOME_OPS + 1)
-            self.assertEqual(guard._home_reading(word), "/")
-            self.assertEqual(guard._home_reading("${HOME[0]}/x"), None)
-            self.assertEqual(guard._home_reading("$HOMEDIR/x"), None)
-            self.assertEqual(guard._home_reading("${HOME}/../etc"), "/etc")
+            self.assertEqual(guard._home_readings(word), ["/"])
+            self.assertEqual(guard._home_readings("${HOME[0]}/x"), [])
+            self.assertEqual(guard._home_readings("$HOMEDIR/x"), [])
+            self.assertEqual(guard._home_readings("${HOME}/../etc"), ["/etc"])
 
     def test_leading_names_are_one_run_and_scan_linearly(self):
         # XERK-1639: every name in the run is read empty, not just the first,

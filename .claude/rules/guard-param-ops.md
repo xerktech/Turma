@@ -10,7 +10,7 @@ paths:
   - Quotes and `\` make text literal, `[...]` takes POSIX classes; `fnmatch` does neither.
   - Never go back to "leave the value whole" for a pattern it can't read: a value with blanks
     stays ONE quoted word, so `"${a%% *}" ${a#* }` ran `rm` while the guard saw one word.
-  - Unreadable (extglob, an unknown `$` in the pattern, over the cost cap) → `_unreadable_op`:
+  - Unreadable (an unknown `$` in the pattern, over the cost cap) → `_unreadable_op`:
     `_UNREAD_OUTPUT` + the value, so as a program it is refused and its words still reach path rules.
   - `_glob_ends` is a state-set run, O(value × pattern) whatever the stars; fnmatch per cut
     blew one line past the hook deadline. The `_VAR_OP_*_COST` caps bound it; keep them.
@@ -55,7 +55,7 @@ paths:
   bash's default). A name not assigned on the line may be unset OR hold what bash knows (`$PWD`,
   `$HOME`, `$_`), and a `$(…)` prints something: no single reading is safe either way.
   - Pattern/offset: `_op_readings` yields every reading (unknowns empty, `$(…)` as printed, value
-    untouched); `_splice_readings` splices them as separate words led by `_UNREAD_OUTPUT`.
+    untouched); `_splice_readings` splices them marker-led, each also read alone (see below).
     Reading unknowns empty alone let `${a#$PWD}` through; keeping the value alone, `${a#${nope}xx}`.
   - Replacement and `:+`/`+` alternative: words, not patterns. An unknown stays live text (a
     trailing name braced, `_brace_trailing`, so glued text stays text); the line's reading then
@@ -63,8 +63,24 @@ paths:
     `${q:+$HOME}` lost `$HOME`.
   - Cost: a benign command-position op with an unknown pattern (`${cmd%$x}`) is refused. Accepted.
 - `${a:off:len}` arithmetic (`_arith_offset`) truncates `/` and `%` toward zero as bash/C do.
-- Extglob (`+(x)`) is unreadable on purpose: its meaning depends on `shopt -s extglob`, which the
-  guard does not track; reading it either way is a bypass the other way.
+- **An extglob pattern (`+(x)`) is read BOTH ways** (`_var_op_readings`, XERK-1664): its meaning
+  depends on `shopt -s extglob`, which the guard does not track, and either reading alone is a bypass.
+  - Off, it is plain glob; on, `_GlobExt` groups matched by `_ext_ends` (memoised, step-capped:
+    `!(…)` makes it O(value² x pattern)).
+  - It ALWAYS yields 2+ readings (equal ones repeated), spliced marker-led: as a program it is
+    refused, and each reading reaches the path rules (`${a##+(x)}` on `xx/etc` names `/etc`).
+  - Never trust the on reading as THE text: bash's matcher has quirks it does not model
+    (`${a#*@(x|)}` on `x/etc` is `/etc`; `[[ x == *!(x) ]]` is false). Path-form quirks: XERK-1714.
+  - On `${HOME<op>}` every reading is kept (`_home_readings`): spliced as an op's readings are,
+    and each judged. One picked dropped glued text (`${HOME##@(*)}/etc`); a None read not-home.
+  - A reading back inside the home splices as `${HOME}`, braced: bare, glued text made another
+    name (`${HOME%q}x/../x` read `$HOMEx/../x`, i.e. `/x`, and wiped HOME).
+- **Each reading of a multi-reading op also gets a whole-line pass of its own** (`_READING_PICK`,
+  `_expand_both`, XERK-1664), spliced plainly, on top of the split and joined forms below.
+  - Text glued after the op (`bash -c "rm -rf ${a%@(X)}tc"`) joins only the last reading in both
+    marker-led forms; only a per-reading pass reads `/etc` there.
+  - `_READING_PICK` is in `_memo`'s and `_reading()`'s keys: missing, a pick pass replayed the
+    default pass's result. `_READINGS_MOST` (how many) is not main's `_READINGS_SEEN` (whether).
 - **A default applies wherever bash applies it, not only to an unassigned name** (XERK-1659):
   - A name assigned empty takes its `:-`/`:=` default (`x=; ${x:-cmd}`); `-`/`=` keep the empty value.
   - An unset array element takes its default as a scalar does (`${y[0]:-cmd}`, `[@]`, `[*]`).
