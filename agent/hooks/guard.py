@@ -10595,7 +10595,10 @@ def _is_exact_root(path: str) -> bool:
 # ...and a `${PWD:?}`-style op that keeps a set value, and a directory tilde
 # (`~-`, `~+`, `~1`) reaching a target unspliced, as through `eval rm '~-'`.
 _PWD_LEAD_RE = re.compile(r"(?:\$(?:(?:OLD)?PWD|\{(?:OLD)?PWD(?::?[-=?][^${}]*)?\})"
-                          r"|~(?:[+-]|[+-]?[0-9]+))(?=/|$)")
+                          r"|~(?:[+-]|[+-]?[0-9]+))(?=[/$]|$)")
+# Unknown names glued after it read empty (`$PWD$x`, `eval rm -rf '~-'$x`): every
+# name the line assigns is already spliced. Positionals stay: they are bound.
+_GLUED_UNSET_RE = re.compile(r"(?:\$[A-Za-z_]\w*|\$\{[A-Za-z_]\w*\})+")
 
 
 def _under_cwd(tok: str, cwd: str) -> str:
@@ -10607,7 +10610,12 @@ def _under_cwd(tok: str, cwd: str) -> str:
     if m := _PWD_LEAD_RE.match(tok):
         # `$PWD` is the directory `cd` left, read as a relative operand is:
         # `cd /; rm -rf $PWD/etc` (XERK-1685).
-        rest = tok[m.end():].lstrip("/")
+        rest = tok[m.end():]
+        if g := _GLUED_UNSET_RE.match(rest):
+            rest = rest[g.end():]
+        if rest[:1] not in ("", "/"):
+            return tok
+        rest = rest.lstrip("/")
         if _is_exact_root(cwd) or ".." in rest.split("/"):
             return (cwd.rstrip("/") + "/" + rest).rstrip("/") or "/"
         return tok

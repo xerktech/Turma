@@ -2188,6 +2188,11 @@ class TestScriptChannels(unittest.TestCase):
                     "cd /etc; eval rm -rf '~+'",
                     "cd /; cd /tmp; rm -rf ${OLDPWD:?}",
                     "cd /etc; rm -rf ${PWD:?}/*",
+                    # QA: an unknown name glued after it reads empty.
+                    "cd /; cd /tmp; eval rm -rf '~-'$x",
+                    "cd /etc; cd /tmp; eval rm -rf '~-'$x/*",
+                    "cd /etc; pushd /tmp; eval rm -rf '~1'$x",
+                    "cd /; rm -rf $PWD$x",
                     # Already denied: `..` climbing out of a home.
                     "rm -rf ~root/../etc", "rm -rf ~daemon/../../etc",
                     "rm -rf ~/../..", "rm -rf $HOME/../../etc"):
@@ -2196,7 +2201,9 @@ class TestScriptChannels(unittest.TestCase):
         for cmd in ("rm -rf ~-/build", "cd /tmp/a; cd /tmp/b; rm -rf ~-/build",
                     "bash -c 'cd /tmp/a; rm -rf ~+/build'", "bash -c 'rm -rf ~/build'",
                     "ls ~1 ~+2", "cd ~-; rm -rf build", "rm -rf x-~-y",
-                    "git diff HEAD~1", "cd /tmp/a; rm -rf ${PWD:?}/build"):
+                    "git diff HEAD~1", "cd /tmp/a; rm -rf ${PWD:?}/build",
+                    "cd /tmp/a; rm -rf $PWD$x", "cd /; rm -rf $PWD$x.bak",
+                    "cd /tmp/a; eval rm -rf ~-$x/build", "rm -rf ~-$x"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
