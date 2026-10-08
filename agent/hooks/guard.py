@@ -7457,47 +7457,72 @@ def _glued_name_groups(command: str, names: set[str]) -> set[frozenset[str]]:
 
 def _glue_sources(command: str, names: set[str]) -> dict[str, frozenset[str]]:
     """Each name mapped to the ``names`` (loop names) its value may hold:
-    a loop name itself; a name assigned a word using one (`c=$a`, `c=$a$b`) or
-    rendered from them (`printf -v c FMT $a $b`); a positional `$N` a call of
-    a function the line defines passes one in (`f $a $b`). Lexical and
+    a loop name itself; a name assigned a word using one (`c=$a`, `c=" $a"`,
+    `c=$(echo $a)`), rendered or read from one (`printf -v c FMT $a $b`,
+    `read c <<< $a`); a positional `$N` a
+    `set` or a call of a function the line defines passes one in (`f $a $b`;
+    with a `shift` on the line, any later argument too). Lexical and
     order-blind: an extra source only adds product readings (capped); one
-    missed is a product never read. Links are followed `_GLUE_LAPS` deep."""
+    missed is a product never read."""
+    def uses(text: str) -> set[str]:
+        return {u.group(1) for u in _GLUE_USE_RE.finditer(text)}
+
     edges: list[tuple[str, set[str]]] = []
     for m in _GLUE_ASSIGN_RE.finditer(command):
-        target, value = (m.group(1), m.group(2)) if m.group(1) else (m.group(3), m.group(4))
-        edges.append((target, {u.group(1) for u in _GLUE_USE_RE.finditer(value)}))
+        if m.group(1):
+            edges.append((m.group(1), uses(m.group(2))))
+        elif m.group(3):
+            edges.append((m.group(3), uses(m.group(4))))
+        else:
+            got = uses(m.group(6))
+            edges += [(w, got) for w in m.group(5).split() if _GLUE_NAME_RE.fullmatch(w)]
     if _GLUE_POS_RE.search(command):
+        shifts = bool(_GLUE_SHIFT_RE.search(command))
+        lists = [m.group(1) for m in _GLUE_SET_RE.finditer(command)]
         funcs = {m.group(1) or m.group(2) for m in _FUNC_NAME_RE.finditer(command)} - {None}
         if funcs:
             call_re = re.compile(_CALL_LEAD + r"(?:" + "|".join(map(re.escape, funcs))
                                  + r")[ \t]+([^;&|\n`)]*)")
-            for m in call_re.finditer(command):
-                for k, word in enumerate(_call_words(m.group(1))[:9], 1):
-                    edges.append((str(k), {u.group(1) for u in _GLUE_USE_RE.finditer(word)}))
-    edges = [(t, u) for t, u in edges if u]
+            lists += [m.group(1) for m in call_re.finditer(command)]
+        for text in lists:
+            for k, word in enumerate(_call_words(text)[:9], 1):
+                got = uses(word)
+                # A `shift` moves a later argument down to `$k`.
+                edges += [(str(j), got) for j in (range(1, k + 1) if shifts else (k,))]
+    # Propagated along a worklist: a name's sources grow at most once per
+    # loop name, so a chain of any length or order settles in linear work.
     src: dict[str, frozenset[str]] = {n: frozenset((n,)) for n in names}
-    for _ in range(_GLUE_LAPS):
-        changed = False
-        for target, uses in edges:
-            got = src.get(target, frozenset()).union(*(src.get(u, ()) for u in uses))
-            if got != src.get(target, frozenset()):
-                src[target] = got
-                changed = True
-        if not changed:
-            break
+    readers: dict[str, list[int]] = {}
+    for i, (_, used) in enumerate(edges):
+        for u in used:
+            readers.setdefault(u, []).append(i)
+    work = [i for n in names for i in readers.get(n, ())]
+    while work:
+        target, used = edges[work.pop()]
+        before = src.get(target, frozenset())
+        got = before.union(*(src.get(u, ()) for u in used))
+        if got != before:
+            src[target] = got
+            work += readers.get(target, ())
     return src
 
 
 # A use `_glued_name_groups` reads: `$a`, `${a}`, `'$'a` (an eval joins it),
 # and a positional `$1`.
 _GLUE_USE_RE = re.compile(r"\$['\"]*\{?!?['\"]*([A-Za-z_]\w*|[1-9])['\"]*\}?")
-# A value `_glue_sources` follows: `c=WORD`, `local c=WORD`, and `printf -v c`
-# to the end of its command.
-_GLUE_ASSIGN_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)\+?=(\S*)"
-                             r"|(?<![\w.-])printf[ \t]+-v[ \t]*['\"]?([A-Za-z_]\w*)['\"]?([^;&|\n]*)")
+_GLUE_NAME_RE = re.compile(r"[A-Za-z_]\w*")
+# A value `_glue_sources` follows: `c=WORD` (quoted runs, `$(…)` and
+# backticks in it, each bounded so a run of unclosed `$(` stays linear),
+# `local c=WORD`; `printf -v c` to the end of its command;
+# `read NAMES <<< WORD`. A nameref is not followed (XERK-1722).
+_GLUE_ASSIGN_RE = re.compile(
+    r"(?<![\w$])([A-Za-z_]\w*)\+?=((?:\"[^\"]*\"|'[^']*'|\$\([^)\n]{0,256}\)|`[^`\n]{0,256}`|[^\s\"'`;&|])*)"
+    r"|(?<![\w.-])printf[ \t]+-v[ \t]*['\"]?([A-Za-z_]\w*)['\"]?([^;&|\n]*)"
+    r"|(?<![\w.-])read((?:[ \t]+[^\s;&|<>]+)*)[ \t]*<<<[ \t]*([^\s;&|]+)")
 _GLUE_POS_RE = re.compile(r"\$\{?[1-9]")
-# How many links of `c=$a; d=$c; …` `_glue_sources` follows.
-_GLUE_LAPS = 8
+_GLUE_SHIFT_RE = re.compile(r"(?<![\w.-])shift\b")
+# A `set` binding positionals: `set -- WORDS`, `set WORDS`.
+_GLUE_SET_RE = re.compile(r"(?<![\w.-])set[ \t]+(?:-[\w-]*[ \t]+)*([^;&|\n`)]*)")
 
 
 def _expand_readings(command: str) -> list[tuple[list[str], str]]:

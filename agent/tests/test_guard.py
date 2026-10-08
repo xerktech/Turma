@@ -4383,7 +4383,13 @@ class TestExpansionBudget(unittest.TestCase):
                     f"{A} c=$a; d=$c; $d$b -rf /etc; {B}",
                     f"f(){{ $1$2 -rf /etc; }}; {A} f $a $b; {B}",
                     f"{A} eval '$'a'$'b' -rf /etc'; {B}",
-                    f"{A} printf -v c '%s%s' $a $b; $c -rf /etc; {B}"):
+                    f"{A} printf -v c '%s%s' $a $b; $c -rf /etc; {B}",
+                    # QA: a quoted or substituted value, a here-string read,
+                    # `set`, a `shift`ed call.
+                    f'{A} c=" $a"; $c$b -rf /etc; {B}', f"{A} c=$(echo $a); $c$b -rf /etc; {B}",
+                    f"{A} c=`echo $a`; $c$b -rf /etc; {B}", f"{A} read c <<< $a; $c$b -rf /etc; {B}",
+                    f"{A} set -- $a $b; $1$2 -rf /etc; {B}",
+                    f"f(){{ shift; $1$2 -rf /etc; }}; {A} f x $a $b; {B}"):
             with self.subTest(cmd=cmd):
                 reason = self.check(cmd)
                 self.assertIsNotNone(reason)
@@ -4396,6 +4402,15 @@ class TestExpansionBudget(unittest.TestCase):
         self.assertEqual(guard._glued_name_groups("c=$a; $c $b", set("ab")), set())
         self.assertEqual(guard._glued_name_groups("f(){ $1$2; }; f $a $b", set("ab")),
                          {frozenset("ab")})
+        # Sources settle along any chain order, and a run of unclosed `$(`
+        # values stays linear.
+        chain = " ".join(f"l{i}=$l{i + 1};" for i in range(40))
+        self.assertEqual(guard._glued_name_groups(f"{chain} l40=$a; $l0$b", set("ab")),
+                         {frozenset("ab")})
+        for text in ("c=$(" * 40000, "c=`" * 40000, "read " + "x " * 40000 + "<<<"):
+            t = time.monotonic()
+            guard._glued_name_groups(text + " $a$b", set("ab"))
+            self.assertLess(time.monotonic() - t, 3, text[:10])
         # An N-way product stays inside `_MAX_FOR_PRODUCT`: 7^3 is too large.
         words = " ".join(f"w{i}" for i in range(7))
         self.assertIn(self.TOO_LARGE, self.check(
