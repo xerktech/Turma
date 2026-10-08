@@ -77,11 +77,12 @@ paths:
   `_BRACE_RE` cannot span braces or blanks, so a list holding one was never expanded:
   `rm -rf {/tmp/x,${HOME}}` (also `{"$HOME",x}`, braced by `_brace_quote_ended`) went unread.
   - Units: a live `${…}` (bash counts plain `{…}` inside it, which `_brace_end` does not:
-    `${y:-{a,b}}` is one unit), a `$(…)`/backtick, then a literal non-list `{…}` (`{x,{a},/etc}`).
-  - Past `_BRACE_MASK_PASSES` levels of literal braces (on a line with a `,`) or past the
-    stand-ins it refuses as too large: a list left unread fails open.
+    `${y:-{a,b}}` is one unit) and a `$(…)`/backtick.
+  - Out of stand-ins it refuses as too large: a list left unread fails open.
   - An unbalanced plain count keeps `_brace_end`'s close and stops counting for the line:
-    a scan per opener is quadratic. Masking `{}` first instead hid `{x,${a:-{} ; rm …`.
+    a scan per opener is quadratic.
+  - Never mask literal non-list braces here (`{x,{a},/etc}`, XERK-1756): readings that see
+    quoted JSON bare then expanded its lists, and two real commands went 4s → 26s (deadline).
   - It runs per nested body (thousands of calls on a backtick-heavy line): keep its
     no-unit early return and lazy stand-in pick, or it costs 3-5x on the timing tests.
   - Tests: `test_a_brace_unit_inside_a_brace_list_is_one_item`.

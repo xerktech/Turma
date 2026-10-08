@@ -2893,11 +2893,12 @@ def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
     - a live `${…}` that is not single-quoted: `${` inhibits brace expansion
       to its `}`, so `{x,${y:-a,b}}` is two items. bash counts plain `{…}`
       inside it (`${y:-{a}}` is one unit), which `_brace_end` does not;
-    - a live `$(…)` or backtick (one word: `{x,$(echo /etc)}`);
-    - then a brace that is no list or sequence, literal to bash
-      (`{x,{a},/etc}` is `x {a} /etc`), innermost first, a pass per level.
+    - a live `$(…)` or backtick (one word: `{x,$(echo /etc)}`).
+    A literal non-list brace (`{x,{a},/etc}`) is NOT masked (XERK-1756):
+    in readings that see quoted JSON bare, unblocking its lists multiplied
+    the readings, and real commands went past the deadline (6x).
     """
-    if "{" not in command and "$(" not in command and "`" not in command:
+    if "${" not in command and "$(" not in command and "`" not in command:
         return None
     states = _quote_states(command)
     n = len(command)
@@ -2938,7 +2939,7 @@ def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
             continue
         spans.append((i, end + 1))
         i = command.find("${", end + 1)
-    if not spans and not any("," not in m.group(1) for m in _LITERAL_BRACE_RE.finditer(command)):
+    if not spans:
         return None
     have = set(command)
     free = list(itertools.islice((chr(c) for c in range(0xE000, 0xF900) if chr(c) not in have),
@@ -2966,48 +2967,20 @@ def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
         out.append(command[last:s] + stand)
         last = e
     out.append(command[last:])
-    command = "".join(out)
-    for passes in range(_BRACE_MASK_PASSES + 1):
-        parts, last = [], 0
-        for m in _LITERAL_BRACE_RE.finditer(command):
-            if "," in m.group(1) or _brace_sequence(m.group(1)) \
-                    or (m.start() and command[m.start() - 1] == "$"):
-                continue
-            if passes == _BRACE_MASK_PASSES and "," in command:
-                # Nested deeper still: the list around it would go unread
-                # (`{x,{{{{{{{{{a}}}}}}}}},/etc}`), so refuse rather than allow.
-                raise _ExpansionTooLarge
-            if passes == _BRACE_MASK_PASSES:
-                break  # no `,`: no list for it to hide
-            parts.append(command[last:m.start()] + stand_in(m.group(0)))
-            last = m.end()
-        if not parts:
-            break
-        command = "".join(parts) + command[last:]
-    if not back:
-        return None
-    return command, back
+    return "".join(out), back
 
 
-# How many levels of literal `{…}` `_mask_param_braces` masks inside a list.
-_BRACE_MASK_PASSES = 16
-# Its stand-ins' digit count: two digits name 65536 units.
+# `_mask_param_braces`'s stand-ins' digit count: two digits name 65536 units.
 _BRACE_MASK_DIGITS = 256
-# A literal brace: `_BRACE_RE`, empty `{}` included.
-_LITERAL_BRACE_RE = re.compile(r"\{([^{}\s]*)\}")
 
 
 def _unmask_param_braces(command: str, back: dict[str, str]) -> str:
-    """``command`` with `_mask_param_braces`'s stand-ins put back, a masked
-    text's own stand-ins too."""
+    """``command`` with `_mask_param_braces`'s stand-ins put back."""
     lead = next(iter(back))[0]
-    for _ in range(_BRACE_MASK_PASSES + 2):
-        if lead not in command:
-            break
-        parts = command.split(lead)
-        command = parts[0] + "".join(back.get(lead + p[:2], lead + p[:2]) + p[2:]
-                                     for p in parts[1:])
-    return command
+    if lead not in command:
+        return command
+    parts = command.split(lead)
+    return parts[0] + "".join(back.get(lead + p[:2], lead + p[:2]) + p[2:] for p in parts[1:])
 
 
 @_budgeted

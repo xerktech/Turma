@@ -3780,16 +3780,11 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                     # ...a `${…}` holding plain braces, which bash counts:
                     "rm -rf {x,${y:-{a}},${HOME}}", "rm -rf {x,${y:-{a,b}},${HOME}}",
                     "rm -rf {${y:-{}},/etc}", "y=1; rm -rf {x,${y:+{a}},/etc}",
-                    'rm -rf {x,"${y:-{a}}",${HOME}}', "bash -c 'rm -rf {x,${y:-{a}},${HOME}}'",
+                    'rm -rf {x,"${y:-{a}}",${HOME}}',
                     "rm -rf {x,${a:-{} ; rm -rf {x,${HOME}}",
                     # ...a substitution, one word however many blanks it holds:
                     "rm -rf {x,$(echo /etc)}", "rm -rf {x,`echo /etc`}",
-                    'rm -rf {x,"$(echo /etc)"}', "rm -rf {x,$(echo /e),y}tc",
-                    # ...and a literal brace, which is part of its item:
-                    "rm -rf {x,{a},/etc}", "rm -rf {x,{},/etc}", "rm -rf {x,{{a}},/etc}",
-                    # past the mask's passes the list would go unread: refused
-                    "rm -rf {x," + "{" * 9 + "a" + "}" * 9 + ",/etc}",
-                    "rm -rf {x," + "{" * 40 + "}" * 40 + ",${HOME}}"):
+                    'rm -rf {x,"$(echo /etc)"}', "rm -rf {x,$(echo /e),y}tc"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # A `,` inside the `${…}` is no item separator; ordinary lists stay allowed.
@@ -3797,8 +3792,7 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                     "rm -rf {build,${OUT:-dist}}", "echo ${x,,} {a,b}",
                     "rm -rf {x,${y:-/tmp}/etc}", "mkdir -p build/{a,$(date +%s)}",
                     "find . -name x -exec rm -rf {} \\;", "rm -rf {x,{a}}",
-                    "echo " + "{" * 30 + "a" + "}" * 30,
-                    "rm -rf {x," + "{" * 16 + "a" + "}" * 16 + "}"):
+                    "echo " + "{" * 30 + "a" + "}" * 30):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
         # Out of stand-ins a unit would stay unmasked and its list unread, so it
