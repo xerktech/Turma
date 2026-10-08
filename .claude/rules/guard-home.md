@@ -51,8 +51,8 @@ paths:
     and a heredoc writer read twice was "another part naming the description file".
   - A textual gate, never the line's values: those miss a `bash -c` script's own `HOME=`,
     `HOME[0]=`, `read HOME`; each inner level's values pass resolves the spliced `$HOME`.
-  - `$HOME`, never `${HOME}` or `${HOME:-~}`: braced, it is not resolved inside `{a,b}`, and a
-    default is applied at the OUTER level, before a `bash -c` script's own HOME is known.
+  - `$HOME`, never `${HOME:-~}`: a default is applied at the OUTER level, before a `bash -c`
+    script's own HOME is known.
   - Every `~` is spliced, a program's too. Any "command position" test by the text before it
     reopened the bypass (`rm -rf do ~/etc`, `rm -rf \; ~/etc`, `a=(~/etc)`): that needs a parse.
   - A spliced program stays literal: `_owner_word_may_be_shell` reads an unassigned
@@ -72,5 +72,10 @@ paths:
   - The unset-HOME reading is the unset-names one every name gets; no extra pass.
   - An op it cannot read (`[i]`, `@Q`) stays as written. 0 diffs over 126 real `${HOME` commands.
   - Tests: `test_a_program_or_flag_built_from_home_is_read_with_the_real_home`.
+- A `${…}` inside a brace list is ONE item (XERK-1694, `_mask_param_braces`): `_expand_braces`
+  masks each live `${…}` with a stand-in char before matching lists, as bash's `${` inhibits
+  brace expansion to its `}`. Unmasked, `_BRACE_RE` found only `{HOME}`, skipped it, and
+  `rm -rf {/tmp/x,${HOME}}` (also `{"$HOME",x}`, braced by `_brace_quote_ended`) went unread.
+  Tests: `test_a_braced_parameter_inside_a_brace_list_is_one_item`.
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,
   `test_home_readings_are_bounded`.

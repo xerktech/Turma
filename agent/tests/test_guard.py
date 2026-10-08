@@ -3769,6 +3769,23 @@ class TestCommentAndEvalReparse(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
+    def test_a_braced_parameter_inside_a_brace_list_is_one_item(self):
+        # XERK-1694: `_BRACE_RE` cannot span a `${…}`'s braces, so a list
+        # holding one was never expanded and bash's home wipe was allowed.
+        for cmd in ("rm -rf {${HOME},/tmp/x}", "rm -rf {/tmp/x,${HOME}}",
+                    "rm -rf {/tmp/a,${HOME%q}}", 'rm -rf {"$HOME",/tmp/x}',
+                    'rm -rf {"${HOME}",/tmp/x}', "rm -rf {x,${y:-/etc}}",
+                    "rm -rf {x,${y:-/e}tc}", "HOME=/; rm -rf {x,${y:-~/etc}}",
+                    "HOME=/; rm -rf {${y:-~/etc},x}", "bash -c 'rm -rf {x,${HOME}}'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A `,` inside the `${…}` is no item separator; ordinary lists stay allowed.
+        for cmd in ("rm -rf {x,${y:-a,b}}", "rm -rf ${HOME}/.cache/{build,dist}",
+                    "rm -rf {build,${OUT:-dist}}", "echo ${x,,} {a,b}",
+                    "rm -rf {x,${y:-/tmp}/etc}"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):

@@ -2825,6 +2825,9 @@ def _expand_braces(command: str) -> str:
     rewriting `awk '{print $2,$4}'` unbalanced its quotes (XERK-1256). A quoted
     script handed to `bash -c`/`eval` is re-expanded unquoted where it runs.
     """
+    masked = _mask_param_braces(command)
+    if masked is not None:
+        command, back = masked
     pos = 0
     expansions = 0
     states = _quote_states(command)
@@ -2873,7 +2876,49 @@ def _expand_braces(command: str) -> str:
         command = command[:word_start] + " ".join(parts) + command[word_end:]
         pos = word_start
         states = _quote_states(command)
+    if masked is not None:
+        command = "".join(back.get(c, c) for c in command)
     return command
+
+
+def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
+    """``command`` with each live, unsingle-quoted `${…}` swapped for one
+    private-use character the text does not hold, and the map back; None when
+    there is none.
+
+    bash reads a `${…}` as one unit inside a brace list (`${` inhibits brace
+    expansion to its `}`), but `_BRACE_RE` cannot span its braces: it found
+    only the inner `{HOME}`, skipped it as a parameter, and left
+    `rm -rf {/tmp/x,${HOME}}` unexpanded, so no target rule saw the home
+    (XERK-1694). `"$HOME"` reaches here braced too (`_brace_quote_ended`).
+    Masked, its `,`/`{` are no list syntax either (`{x,${y:-a,b}}` is two
+    items). Past the free characters the rest stay as written.
+    """
+    if "${" not in command:
+        return None
+    states = _quote_states(command)
+    have = set(command)
+    free = (chr(c) for c in range(0xE000, 0xF900) if chr(c) not in have)
+    out, back, last = [], {}, 0
+    i = command.find("${")
+    while i >= 0:
+        end = -1
+        if states[i] in ("", '"') and _live_dollar(command, i):
+            end = _brace_end(command, i, states[i] == '"')
+        if end < 0:
+            i = command.find("${", i + 2)
+            continue
+        stand = next(free, None)
+        if stand is None:
+            break
+        out.append(command[last:i] + stand)
+        back[stand] = command[i:end + 1]
+        last = end + 1
+        i = command.find("${", last)
+    if not back:
+        return None
+    out.append(command[last:])
+    return "".join(out), back
 
 
 @_budgeted
