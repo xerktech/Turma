@@ -23,6 +23,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line`, GitLab/ADO dispatch, comment + conflict replies |
 | `agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `agent-hooks.md` | `agent/hooks/**` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
+| `guard-protected.md` | `turma-agent-protect`, `hub-agent.py` | root-owned guard hooks, managed settings (XERK-1677) |
 | `guard-qa.md` | `agent/hooks/guard.py`, its tests + rig | guard QA: cases run as nobody via `guard_differential.py` (XERK-1590) |
 | `guard-substitutions.md` | `agent/hooks/guard.py`, `test_guard.py` | guard: balanced substitution scan, every parser on it, arithmetic, nesting cost (XERK-1605) |
 | `guard-heredoc-owners.md` | `guard.py`, `test_guard.py` | guard: which heredoc owners are shells; the broad closer rule (XERK-1618) |
@@ -84,7 +85,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 - **When a file nears the ceiling, split it by path** — never raise the number.
 - **Put a fact in the narrowest file that always sees it.** Component detail → that component's rules
   file. A rule spanning two components → "Cross-cutting contracts" below, since a `paths:`-scoped file
-  does not load on the other side of the contract.
+  won't load on the other side.
 - **Settled decision NARRATIVE belongs in `docs/`, not here** — rationale, alternatives considered,
   spike history, open questions. `docs/dsh-adr.md` and `docs/qwen-adr.md` are the pattern. Rules files
   carry the operative rule and point there for *why*.
@@ -201,8 +202,7 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     deep** — the SAME as the reverted drift-refusal, not better — since silence is not drift (XERK-348)
     and the binding never moved, so a drifted-then-quiet host is `boundOrgOf` again; permanent drift
     quarantine would need drift history the record lacks and would undo the over-refusal fix. Clients
-    mirror the served `org` (older-hub fallback to `jira.siteKey`), so hub and menus agree — the piece
-    the two reverted `orgBound` attempts lacked (it was stripped from the payload). Cost: a no-Jira
+    mirror the served `org` (older-hub fallback to `jira.siteKey`), so hub and menus agree. Cost: a no-Jira
     fleet cannot migrate. **Do not re-key this on the claimed `jira.siteKey`** — that reopens the holes.
   - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one —
     nothing else bounds `rcName`, and the spawn route takes a 100k `label`.
@@ -355,7 +355,7 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
       button. Android types NEITHER yet (`ignoreUnknownKeys` skips them — safe); web-only, in
       `PARITY.md`. Native/agent detail in `agent-native.md`.
 - **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers** (XERK-258,
-  XERK-273). It runs at `mem_limit: 512m` (raised from 256m for XERK-287), so a flat constant larger
+  XERK-273). It runs at `mem_limit: 512m`, so a flat constant larger
   than that can never refuse anything before the OOM killer fires. `containerMemoryLimit()` reads the cgroup; everything derives
   from it and is logged at boot. Raising `mem_limit` widens them with no code change. Mechanics:
   `turma-limits.md`. What spans components:

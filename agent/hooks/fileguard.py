@@ -96,16 +96,27 @@ REASON = (
 )
 
 
-def _claude_dir():
-    """The real path of ~/.claude, or None if HOME is unusable.
+def _claude_dirs():
+    """The real paths of ~/.claude, for $HOME AND the account's passwd home.
 
     `realpath` so a symlinked ~/.claude (or a symlinked HOME, which the limits
-    probe already trips over) still compares equal to a resolved target.
+    probe already trips over) still compares equal to a resolved target. Both
+    homes, because $HOME is the caller's to set: a session can launch a nested
+    claude with `HOME=/tmp/x`, and this hook then runs in that env (XERK-1677).
     """
-    home = os.path.expanduser("~")
-    if not home or home == "~":
-        return None
-    return os.path.realpath(os.path.join(home, ".claude"))
+    homes = [os.path.expanduser("~")]
+    try:
+        import pwd
+        homes.append(pwd.getpwuid(os.getuid()).pw_dir)
+    except (ImportError, KeyError, OSError):
+        pass                              # Windows, or a uid with no entry
+    out = []
+    for home in homes:
+        if home and home != "~":
+            d = os.path.realpath(os.path.join(home, ".claude"))
+            if d not in out:
+                out.append(d)
+    return out
 
 
 def _resolve(path, cwd):
@@ -155,10 +166,15 @@ def decide(payload):
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
-    base = _claude_dir()
-    if base is None:
-        return None                       # no resolvable HOME: nothing to protect
     cwd = payload.get("cwd")
+    for base in _claude_dirs():           # none: no resolvable home, nothing to protect
+        reason = _refusal(tool_input, cwd, base)
+        if reason:
+            return reason
+    return None
+
+
+def _refusal(tool_input, cwd, base):
     for key in PATH_KEYS:
         target = _resolve(tool_input.get(key), cwd)
         if target is None:

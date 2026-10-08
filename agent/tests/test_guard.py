@@ -19,6 +19,7 @@ import shlex
 import os
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -5711,6 +5712,36 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         out = json.loads(proc.stdout)
         self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
 
+
+class TestProtectedOverrides(unittest.TestCase):
+    """XERK-1677: the root-owned guard runs with --protected and must not take
+    overrides from its env — a session sets them on a nested claude."""
+
+    def run_hook(self, *flags, env_grants="Bash(*)"):
+        proc = subprocess.run(
+            [sys.executable, GUARD_PATH, *flags],
+            input=json.dumps({"tool_name": "Bash",
+                              "tool_input": {"command": "rm -rf /etc"}}),
+            capture_output=True, text=True,
+            env={**os.environ, "TURMA_TOOL_GRANTS": env_grants},
+        )
+        return proc.stdout
+
+    def test_protected_ignores_env_grants(self):
+        self.assertEqual(self.run_hook(), "")             # the env grant applies unprotected
+        if os.path.exists(guard.PROTECTED_ENV_FILE):
+            self.skipTest("host has a guard.env")
+        out = json.loads(self.run_hook("--grants", "--protected"))
+        self.assertEqual(out["hookSpecificOutput"]["permissionDecision"], "deny")
+
+    def test_protected_settings_reads_only_its_keys(self):
+        with tempfile.NamedTemporaryFile("w", suffix=".env", delete=False) as fh:
+            fh.write("# c\nTURMA_TOOL_GRANTS='Bash(make deploy)'\nTURMA_PR_SUMMARY=0\n"
+                     "PATH=/x\nnot a line\n")
+        self.addCleanup(os.unlink, fh.name)
+        self.assertEqual(guard.protected_settings(fh.name),
+                         {"TURMA_TOOL_GRANTS": "Bash(make deploy)", "TURMA_PR_SUMMARY": "0"})
+        self.assertEqual(guard.protected_settings(fh.name + ".missing"), {})
 
 GOOD_BODY = """**Summary:** Archived transcripts no longer store lines twice.
 

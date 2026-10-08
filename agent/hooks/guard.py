@@ -12561,6 +12561,30 @@ def grant_key(command: str) -> str:
 # var the long-lived tmux server would keep from whenever it started.
 GRANTS_FLAG = "--grants"
 
+# The root-owned copy wired through managed settings (XERK-1677) runs with this
+# flag, and then takes its operator overrides from a root-owned file, never the
+# environment: a session can start a nested `claude` with
+# `TURMA_TOOL_GRANTS='Bash(*)'`, and the hook inherits claude's env.
+PROTECTED_FLAG = "--protected"
+PROTECTED_ENV_FILE = "/etc/turma-agent/guard.env"
+_PROTECTED_KEYS = ("TURMA_TOOL_GRANTS", "TURMA_NO_ATTRIBUTION", "TURMA_PR_SUMMARY")
+
+
+def protected_settings(path: str = PROTECTED_ENV_FILE) -> dict:
+    """The overrides in ``path`` (``KEY=value`` lines, only `_PROTECTED_KEYS`);
+    a missing or unreadable file is no overrides — the strict defaults."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read(1 << 16)
+    except (OSError, ValueError):
+        return {}
+    out = {}
+    for line in text.splitlines():
+        key, sep, value = line.strip().partition("=")
+        if sep and key in _PROTECTED_KEYS:
+            out[key] = value.strip().strip("'\"")
+    return out
+
 
 def _grants_dir() -> str:
     return os.path.join(os.path.expanduser("~"), ".turma", "grants")
@@ -12677,9 +12701,10 @@ def main(argv: list[str] | None = None) -> int:
 
     tool_name = event.get("tool_name") or ""
     tool_input = event.get("tool_input") or {}
-    overrides = _parse_overrides(os.environ.get("TURMA_TOOL_GRANTS"))
-    no_attribution = os.environ.get("TURMA_NO_ATTRIBUTION", "1") != "0"
-    pr_summary = os.environ.get("TURMA_PR_SUMMARY", "1") != "0"
+    settings = protected_settings() if PROTECTED_FLAG in argv[1:] else os.environ
+    overrides = _parse_overrides(settings.get("TURMA_TOOL_GRANTS"))
+    no_attribution = settings.get("TURMA_NO_ATTRIBUTION", "1") != "0"
+    pr_summary = settings.get("TURMA_PR_SUMMARY", "1") != "0"
     cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
 
     verdict: list = []
