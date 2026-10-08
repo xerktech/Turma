@@ -149,6 +149,30 @@ class TestOrdering(Base):
         self.assertEqual(run("--root", self.root, "remove")[0], 0)
         self.assertFalse(os.path.exists(self.layout.etc))
 
+    def test_remove_waits_for_a_sync_holding_the_lock(self):
+        # A sync mid-run holds the lock; remove must not unlink under it, or the
+        # sync re-lays hooks (or a drop-in naming missing ones) after "removed".
+        import threading
+        run("--root", self.root, "install", "--from", self.src)
+        held, release = threading.Event(), threading.Event()
+
+        def sync_like():
+            with tap.locked(self.layout):
+                held.set()
+                release.wait(5)
+        t = threading.Thread(target=sync_like)
+        t.start()
+        held.wait(5)
+        r = threading.Thread(target=run, args=("--root", self.root, "remove"))
+        r.start()
+        r.join(0.3)
+        self.assertTrue(r.is_alive())                  # blocked on the lock
+        self.assertTrue(os.path.exists(self.layout.dropin))
+        release.set()
+        t.join(5)
+        r.join(5)
+        self.assertFalse(os.path.exists(self.layout.dropin))
+
     def test_a_sync_after_remove_lays_nothing(self):
         # A sync queued behind remove's lock must not re-install what it removed.
         run("--root", self.root, "install", "--from", self.src)
