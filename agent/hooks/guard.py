@@ -1766,7 +1766,7 @@ def _budgeted(fn):
         if _budget is not None:
             return fn(*args, **kwargs)
         _budget = {"left": _MAX_SUBST_GROWTH, "expand": {}, "vals": {}, "capped": False, "proc": {},
-                   "until": time.monotonic() + _MAX_DECIDE_SECONDS}
+                   "posread": {}, "until": time.monotonic() + _MAX_DECIDE_SECONDS}
         # Lives as long as the memo that may skip re-reading the values.
         _VALUES_DIFFER[0] = False
         _CHAIN_DIFFERS[0] = False
@@ -8292,6 +8292,23 @@ _SHIFT_RE = re.compile(r"(?<![\w.-])shift(?![\w.-])(?:[ \t]+([0-9]+))?")
 _LOOP_RE = re.compile(r"\b(?:while|until|for|select)\b")
 
 
+def _slice_positionals(args: list, spec: str) -> list | None:
+    """``${@:off}`` / ``${@:off:len}`` over the positional ARRAY ``args`` (its
+    `$0` first), None if the offset/length is not plain arithmetic. Negative
+    counts from the end, as bash does."""
+    nums = [_arith_offset(b) for b in spec.split(":")[:2]]
+    if None in nums or not nums:
+        return None
+    off = nums[0]
+    start = off if off >= 0 else max(len(args) + off, 0)
+    if len(nums) == 1:
+        sub = args[start:]
+    else:
+        end = start + nums[1] if nums[1] >= 0 else len(args) + nums[1]
+        sub = args[start:end] if end >= start else []
+    return [w for w in sub if w is not None]
+
+
 class _BoundTooLong(Exception):
     """A bound reading past the ``limit`` `_bind_positionals` was given."""
 
@@ -8329,8 +8346,16 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
         # The operator applied, as bash does (XERK-1636): `${@/tmp/etc}`,
         # and `${1:-/etc}` with `$1` unset or empty is `/etc`.
         op = _VAR_OP_RE.match(m.group(0)[2 + len(name):-1]) if m.group(1) else None
+        # `${@:N}` / `${@:N:M}` slices the positionals as an ARRAY (XERK-1655),
+        # not the joined string `_apply_var_op`'s `:` would.
+        slice_op = op and name in ("@", "*") and op.group(1) == ":"
         if name == "!#":
             words = [args[-1]] if args[-1] is not None else []
+        elif slice_op:
+            sliced = _slice_positionals(args, op.group(2))
+            if sliced is None:
+                return m.group(0)
+            words, op = sliced, None
         elif name in ("@", "*") or every and name != "0":
             if len(args) < 2:
                 return m.group(0) if not op or op.group(1) not in _VAR_DEFAULT_OPS \
@@ -8342,12 +8367,27 @@ def _bind_positionals(script: str, args: list, raw: bool = False,
             return op.group(2)
         else:
             return m.group(0)
-        if op and not raw:
-            if op.group(1) in _VAR_DEFAULT_OPS:
-                words = [w if w or op.group(1)[:1] != ":" else op.group(2) for w in words]
+        # A non-default operator (`${1#x}`, `${1%/}`, `${@/a/b}`) is APPLIED,
+        # raw or not — a raw word is dequoted first and then spliced as a
+        # literal, since it is now a concrete value. One that still carries a
+        # `$` (a caller positional or a substitution) is left live, as raw does.
+        raw_applied = False
+        if op and op.group(1) not in _VAR_DEFAULT_OPS:
+            if raw:
+                new_words = []
+                for w in words:
+                    if "$" in w or "`" in w:
+                        new_words.append(w)
+                    else:
+                        new_words.append(_apply_var_op(_dequote_value(w), op.group(1),
+                                                       op.group(2)))
+                        raw_applied = True
+                words = new_words
             else:
                 words = [_apply_var_op(w, op.group(1), op.group(2)) for w in words]
-        if raw:
+        elif op and not raw and op.group(1) in _VAR_DEFAULT_OPS:
+            words = [w if w or op.group(1)[:1] != ":" else op.group(2) for w in words]
+        if raw and not raw_applied:
             if state == "'":
                 return m.group(0)  # the function's shell never expands it
             if not state and not _in_assignment_word(script, m.start()):
@@ -8613,8 +8653,183 @@ def _separates(text: str, j: int, states: list[str]) -> bool:
     return not (text[j] == "&" and j and text[j - 1] in "<>")
 
 
+# A function body that is a compound command other than `{…}`/`(…)`: bash
+# allows `f() for p; do …; done`, `f() if …; fi`, `f() [[ … ]]`, `f() ((…))`.
+# `_FUNC_HEADER_RE` matches the header (and comment/ws before the body); the
+# body starts at its end and runs to the compound's own closer.
+_FUNC_HEADER_RE = re.compile(
+    r"(?:^|(?<=[\s;&|()]))(?:function[ \t]+([^\s();|&<>'\"`$]+)(?:[ \t]*\([ \t]*\))?"
+    r"|([^\s;&|()<>'\"`$]+)[ \t]*\([ \t]*\))(?:[ \t]|\n|#[^\n]*\n)*")
 
-def _positional_readings(text: str) -> list[str]:
+
+def _compound_body_end(text: str, states: list[str], start: int) -> int | None:
+    """If ``text[start]`` opens a compound command (`for`/`if`/`while`/`until`/
+    `select`/`case`, `[[ … ]]` or `((…))`), the index just past its closer,
+    else None. Nested compounds are tracked so an inner `done`/`fi` does not
+    close the body early; quoted text is skipped (``states``)."""
+    n = len(text)
+    stack: list[str] = []
+    i = start
+    while i < n:
+        if states[i]:
+            i += 1
+            continue
+        # The body's own opener sits right after the header `)`, which
+        # `_at_command_start` does not read as a command boundary; a nested one
+        # must pass it.
+        at_start = i == start or _at_command_start(text, i)
+        if (text.startswith("[[", i) or text.startswith("((", i)) and at_start:
+            stack.append("]]" if text[i + 1] == "[" else "))")
+            i += 2
+            continue
+        if i == start:
+            kw = next((k for k in _COMPOUND_OPENERS if _word_at(text, i, k)), "")
+        else:
+            kw = _compound_opener(text, i)
+        if kw:
+            stack.append(_COMPOUND_OPENERS[kw])
+            i += len(kw)
+            continue
+        if not stack:
+            return None  # text[start] did not open a compound command
+        top = stack[-1]
+        if top in ("]]", "))"):
+            if text.startswith(top, i):
+                stack.pop()
+                i += 2
+                if not stack:
+                    return i
+                continue
+        elif _compound_closes(text, i, top):
+            stack.pop()
+            i += len(top)
+            if not stack:
+                return i
+            continue
+        i += 1
+    return None  # unclosed: fail open rather than read past the function
+
+
+# `eval` / `trap` at a command start: their ACTION string is code the shell runs
+# later, so a call or `set` inside it never reached `_positional_readings` beside
+# the line's function defs and `set`s (XERK-1655).
+_EVAL_TRAP_RE = re.compile(_CALL_LEAD + r"(eval|trap)(?=[ \t])")
+_MAX_EVAL_INLINE = 2
+_MAX_CALL_INLINE = 4
+# `$(declare -f NAME)` / `` `typeset -f NAME` `` prints NAME's definition.
+_DECLARE_F_RE = re.compile(r"[$`]\(?\s*(?:declare|typeset)\s+-f[A-Za-z]*\s+"
+                           r"([^\s();|&'\"`$]+)\s*[)`]")
+# Programs a captured function output is only WORTH inlining in front of —
+# where it names a path that is deleted/rechmod'd. Elsewhere `$(f)` output is
+# data, so inlining it only re-expands the line (XERK-1655 QA deadline).
+_OUTPUT_TARGET_PROGS = frozenset({"rm", "unlink", "rmdir", "chmod", "chown", "chgrp",
+                                  "shred", "truncate", "dd", "mkfs", "mv", "cp"})
+
+
+def _capture_feeds_destructive(text: str, states: list[str], at: int) -> bool:
+    """Whether the substitution starting at ``at`` is an operand of a
+    destructive program (its enclosing simple command's first word)."""
+    j = at - 1
+    while j >= 0 and not (states[j] == "" and (text[j] in ";&|\n(`"
+                                               or (text[j] == "{" and text[j + 1:j + 2] in " \t"))):
+        j -= 1
+    words = _raw_words(text[j + 1:at])
+    k = 0
+    while k < len(words) and ("=" in words[k] and _ENV_ASSIGN.match(words[k])
+                              or words[k][:1] in "<>" or words[k] in ("!", "time")):
+        k += 1
+    return k < len(words) and _basename(words[k].strip("'\"\\")) in _OUTPUT_TARGET_PROGS
+
+
+def _eval_inlined_lines(text: str) -> list[str]:
+    """``text`` with every `eval <args>` / `trap <action> <sigs>` replaced by
+    the action it will run, variables resolved (`c='rm …"$1"'; eval "$c"` →
+    `c=…; rm …"$1"`). An ADDED reading: `_positional_readings` then binds the
+    revealed call/`set` against the line's defs, and `_expand` classifies any
+    command the action reveals directly."""
+    if "eval" not in text and "trap" not in text:
+        return []
+    states = _quote_states(text)
+    vals = _var_values(text)
+    pieces: list[tuple[int, int, str]] = []
+    for m in _EVAL_TRAP_RE.finditer(text):
+        if states[m.start(1)]:
+            continue
+        kind = m.group(1)
+        end = _args_end(text, states, m.end(1))
+        # `_call_words` drops `eval`'s own redirections (`eval "$@" 2>&1`), so a
+        # pure args-passthrough action reads as just `$@` and is skipped below.
+        words = _call_words(text[m.end(1):end])
+        while words and words[0] == "--":
+            words = words[1:]
+        if kind == "trap":
+            # `trap -p`/`trap` with no action adds nothing; the action is the
+            # first word, the rest signal names.
+            while words and words[0][:1] == "-" and words[0] != "-":
+                words = words[1:]
+            if not words:
+                continue
+            action = _dequote_value(words[0])
+        else:
+            if not words:
+                continue
+            action = " ".join(_dequote_value(w) for w in words)
+        action = _substitute_vars(action, vals)
+        # A substitution in the action re-expands on every reading once spliced
+        # into the line; skip it (the direct call/set shapes carry none) so a
+        # substitution-heavy eval does not blow the decide deadline (XERK-1655 QA).
+        if "$(" in action or "`" in action:
+            continue
+        # An action that is ONLY positional parameters (`eval "$@"`, the
+        # args-passthrough idiom) reveals no hidden call/set — it just re-runs
+        # the args, which binding already covers — and splicing `$@` binds it
+        # per call, 6-11x on real QA rigs that call such a function many times
+        # (XERK-1655 QA deadline). The ticket's eval shapes all carry a literal.
+        if not _POSITIONAL_RE.sub("", action).strip():
+            continue
+        if action.strip() and action != text[m.start(1):end]:
+            pieces.append((m.start(1), end, action))
+    if not pieces:
+        return []
+    buf, last = [], 0
+    for start, end, action in sorted(pieces):
+        if start < last:
+            continue
+        buf.append(text[last:start])
+        buf.append(action)
+        last = end
+    buf.append(text[last:])
+    inlined = "".join(buf)
+    if inlined == text:
+        return []
+    _spend(len(inlined))
+    return [inlined]
+
+
+def _positional_readings(text: str, _eval_depth: int = 0) -> list[str]:
+    """`_positional_readings_core`, plus readings where `eval`/`trap` action
+    strings are inlined so a call or `set` hidden in one binds too (XERK-1655).
+
+    Memoised per decision at the top level: `_expand` re-reads the same line
+    once per value pass, and recomputing the inlining (`_find_substs` per pass)
+    turned a real function-defining QA rig 10x slower toward the deadline."""
+    if _eval_depth == 0 and _budget is not None:
+        return _memo("posread", text, _positional_readings_uncached, text, 0)
+    return _positional_readings_uncached(text, _eval_depth)
+
+
+def _positional_readings_uncached(text: str, _eval_depth: int = 0) -> list[str]:
+    out = _positional_readings_core(text)
+    if _eval_depth < _MAX_EVAL_INLINE and ("eval" in text or "trap" in text):
+        for inlined in _eval_inlined_lines(text):
+            if inlined == text:
+                continue
+            out.append(inlined)
+            out.extend(_positional_readings_uncached(inlined, _eval_depth + 1))
+    return list(dict.fromkeys(out))
+
+
+def _positional_readings_core(text: str) -> list[str]:
     """Texts ``text`` runs with positional parameters bound (XERK-1626).
 
     `_bind_positionals` covers `sh -c '<script>' <args>`; a function's `$1`…
@@ -8636,6 +8851,7 @@ def _positional_readings(text: str) -> list[str]:
         return []
     states = _quote_states(text)
     defs: dict[str, list[str]] = {}
+    all_defs: dict[str, list[str]] = {}
     for m in _FUNC_BODY_RE.finditer(text):
         if states[m.start()]:
             continue
@@ -8645,7 +8861,8 @@ def _positional_readings(text: str) -> list[str]:
         name = m.group(1) or m.group(2)
         depth, maybes = 0, 0
 
-        def keep(body: str) -> None:
+        def keep(body: str, name: str = name) -> None:
+            all_defs.setdefault(name, []).append(body)
             if _POSITIONAL_RE.search(body) or _IMPLICIT_FOR_RE.search(body):
                 defs.setdefault(name, []).append(body)
 
@@ -8670,6 +8887,21 @@ def _positional_readings(text: str) -> list[str]:
                     if not depth:
                         keep(text[opener + 1:i])
                         break
+    # Non-brace compound bodies (`f() for …; done`, `f() if …; fi`): the header
+    # is matched here and the body runs from its end to the compound's closer.
+    for m in _FUNC_HEADER_RE.finditer(text):
+        if states[m.start()]:
+            continue
+        start = m.end()
+        if start >= len(text) or text[start] in "{(":
+            continue  # a `{…}`/`(…)` body is read above
+        end = _compound_body_end(text, states, start)
+        if end is not None:
+            body = text[start:end]
+            name = m.group(1) or m.group(2)
+            all_defs.setdefault(name, []).append(body)
+            if _POSITIONAL_RE.search(body) or _IMPLICIT_FOR_RE.search(body):
+                defs.setdefault(name, []).append(body)
     out: list[str] = []
     seen = {text}
     room = [_POSITIONAL_READ_FACTOR * len(text) + _POSITIONAL_READ_FLOOR]
@@ -8684,6 +8916,94 @@ def _positional_readings(text: str) -> list[str]:
         out.append(reading)
         return True
 
+    if all_defs:
+        # `rm -rf "$(f /etc)"` runs what `f` PRINTS, so a call is also inlined
+        # IN PLACE — `f`'s body, its arguments bound — and the result read: the
+        # command-substitution machinery then resolves `$(echo "/etc")` to
+        # `/etc` (XERK-1655). Nested calls (`$(f2 "$1")` in f's body) resolve
+        # over a few passes. All functions, not just positional ones: a body
+        # printing a literal (`f() { echo /etc; }`) matters for its output too.
+        # A self-recursive function is never inlined in place: its body holds a
+        # call to itself, which would nest every pass (a plain countdown became
+        # "too deep", XERK-1626 QA). The positional `work` loop handles those.
+        # Nor is a body that itself holds a `$(…)`/backtick: splicing it into a
+        # `$(…)` re-expands that nest on every reading, 10-23x on real QA rigs
+        # that `$(f)`-capture a substitution-heavy body (XERK-1655 QA, deadline).
+        inlinable = {n: b for n, b in all_defs.items()
+                     if not any(re.search(r"(?<![\w.-])" + re.escape(n) + r"(?![\w.-])", body)
+                                or "$(" in body or "`" in body
+                                for body in b)}
+        inlined = text
+        if inlinable:
+            inline_re = re.compile(_CALL_LEAD + r"((['\"]?)\\?("
+                                   + "|".join(map(re.escape, inlinable))
+                                   + r")\2)(?=[ \t;&|)<>\n`]|$)")
+            inlined_names: set[str] = set()
+            for _ in range(_MAX_CALL_INLINE):
+                st = _quote_states(inlined)
+                # Only a call whose OUTPUT is captured — inside a `$(…)` or
+                # backtick — needs inlining; a top-level call is already bound
+                # by the `work` loop below, and inlining it only spends budget
+                # (big QA scripts went "too large", XERK-1655 corpus replay).
+                spans = [(s.start(), s.end()) for s in _find_substs(inlined)
+                         if inlined[s.start()] in "$`"]
+                if not spans:
+                    break
+                repls = []
+                this_pass: set[str] = set()
+                for m in inline_re.finditer(inlined):
+                    if st[m.start(1)] not in ("", m.group(2) or "\\") or m.group(3) in inlined_names:
+                        continue
+                    span = next(((s, e) for s, e in spans if s < m.start(1) < e), None)
+                    if span is None:
+                        continue
+                    # Only inline a capture that FEEDS a destructive command
+                    # (`rm -rf "$(f)"`); elsewhere (`id=$(mkid)`, a benign
+                    # pipeline) the output is data and inlining just re-expands
+                    # the line — 10-23x on real QA rigs (XERK-1655 QA deadline).
+                    if not _capture_feeds_destructive(inlined, st, span[0]):
+                        continue
+                    end = _args_end(inlined, st, m.end(1))
+                    cwords = _call_words(inlined[m.end(1):end])
+                    body = inlinable[m.group(3)][0]
+                    if len(body) > room[0]:
+                        continue
+                    try:
+                        bound = _bind_positionals(body, [None, *cwords], raw=True, limit=room[0])
+                    except _BoundTooLong:
+                        continue
+                    repls.append((m.start(1), end, bound))
+                    this_pass.add(m.group(3))
+                if not repls:
+                    break
+                inlined_names |= this_pass
+                buf, last = [], 0
+                for s, e, r in sorted(repls):
+                    if s < last:
+                        continue
+                    buf.append(inlined[last:s])
+                    buf.append(r)
+                    last = e
+                buf.append(inlined[last:])
+                nxt = "".join(buf)
+                if nxt == inlined:
+                    break
+                inlined = nxt
+        if inlined != text:
+            add(inlined)
+        # `bash -c "$(declare -f f); f /etc"` exports f into the child shell:
+        # `declare -f f` prints f's definition, which the child then runs
+        # (XERK-1655). Splice that definition in so the `-c` script is read with
+        # f defined, and its call binds.
+        def _declare_f(mm: "re.Match[str]") -> str:
+            body = all_defs.get(mm.group(1))
+            if not body or "$(" in body[0] or "`" in body[0]:
+                return mm.group(0)  # a substitution-heavy body re-expands too far
+            return f"{mm.group(1)}() {{{body[0]}}}; "
+
+        declared = _DECLARE_F_RE.sub(_declare_f, text)
+        if declared != text:
+            add(declared)
     if defs:
         # `'f'`, `"f"` and `\f` call the function too.
         call_re = re.compile(_CALL_LEAD + r"((['\"]?)\\?(" + "|".join(map(re.escape, defs))
@@ -8713,15 +9033,26 @@ def _positional_readings(text: str) -> list[str]:
                 lists = [words, [w for w in words if not _POSITIONAL_RE.search(w)]]
                 if lists[1] == words or not lists[1]:
                     lists.pop()
+                # `f ${HOME:+/etc}` passes the alternative as the argument when
+                # the name is set (XERK-1655); read it taken.
+                taken = [_alternatives_taken(w) for w in words]
+                if taken != words:
+                    lists.append(taken)
+                # `f {a,b} /etc` brace-expands to three arguments, so `$3`
+                # is `/etc` (XERK-1655).
+                braced = [bw for w in words for bw in _raw_words(_expand_braces(w))]
+                if braced != words:
+                    lists.append(braced)
                 for body in defs[name]:
                     if len(body) > room[0]:
                         # Spent: not even bound, or binding alone is quadratic.
                         union.setdefault(name, []).extend(words)
                         continue
+                    self_calls = bool(re.search(
+                        r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])", body))
                     # A body calling itself may shift any number of times.
                     for args in (shifted for ws in lists for shifted in _shifted(
-                            [None, *ws], body, bool(re.search(
-                                r"(?<![\w.-])" + re.escape(name) + r"(?![\w.-])", body)))):
+                            [None, *ws], body, self_calls)):
                         try:
                             reading = _bind_positionals(body, args, raw=True, limit=room[0])
                         except _BoundTooLong:
@@ -8733,6 +9064,19 @@ def _positional_readings(text: str) -> list[str]:
                             work.append((reading, path + (name,)))
                         else:
                             union.setdefault(name, []).extend(words)
+                    # A `shift` under a loop may run past `_MAX_SHIFTS` (`while
+                    # [ $# -gt 0 ]; do rm -rf "$1"; shift; done`), so the last
+                    # argument never lands at `$1` in the capped shift lists
+                    # (XERK-1655). Bind every parameter to every argument too.
+                    if _SHIFT_RE.search(body) and (_LOOP_RE.search(body) or self_calls):
+                        for ws in lists:
+                            try:
+                                reading = _bind_positionals(body, [None, *ws], raw=True,
+                                                            every=True, limit=room[0])
+                            except _BoundTooLong:
+                                continue
+                            if reading != body:
+                                add(reading)
         for name, words in union.items():
             # Only words that can name a path or option: every word at every
             # parameter is (refs × calls), and plain names (`a0`…`a400`) made
@@ -8748,7 +9092,12 @@ def _positional_readings(text: str) -> list[str]:
         if states[m.start(1)]:
             continue
         end = _args_end(text, states, m.end(1))
-        words = _set_positionals(_raw_words(text[m.end(1):end]))
+        arg_text = text[m.end(1):end]
+        # `set -- $(printf '%s ' a /etc)` sets the positionals to the words the
+        # substitution PRINTS, so `$2` is `/etc` (XERK-1655); resolve it first.
+        if "$(" in arg_text or "`" in arg_text:
+            arg_text = _sub_substs(arg_text, _subst_text)
+        words = _set_positionals(_raw_words(arg_text))
         if words:
             prev = _set_lists(words, prev, replays) or [([], False)]
             sets.append((m.start(), m.end(1), end, prev))

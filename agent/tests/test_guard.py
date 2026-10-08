@@ -2739,6 +2739,64 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_xerk_1655_positional_bypasses(self):
+        """XERK-1655: positionals reached through eval/trap/declare -f, non-brace
+        function bodies, `${1#x}`/`${@:2}` ops applied, brace/alternative call
+        words, `set` from a substitution, a `while` shifting past `_MAX_SHIFTS`,
+        and function OUTPUT (`$(f /etc)`). Each ran its payload under real bash
+        (verified as nobody, flow.py) and reached rm with /etc."""
+        for cmd in (
+            # eval / trap reaching a call or a set
+            'f() { rm -rf "$1"; }; eval \'f /etc\'',
+            'f() { rm -rf "$1"; }; trap \'f /etc\' EXIT',
+            'f() { eval \'rm -rf "$1"\'; }; f /etc',
+            'f() { eval rm -rf \'$1\'; }; f /etc',
+            'f() { x=\'$1\'; eval rm -rf "$x"; }; f /etc',
+            'f() { trap \'rm -rf "$1"\' RETURN; }; f /etc',
+            'eval \'set -- /etc\'; rm -rf "$1"',
+            'for i in 1 2; do eval "set -- /etc"; rm -rf "$1"; done',
+            'c=\'rm -rf "$1"\'; set -- /etc; eval "$c"',
+            'c=\'rm -rf "$1"\'; f() { eval "$c"; }; f /etc',
+            'f() { rm -rf "$1"; }; f a; eval "f /etc"',
+            'set -- /etc; eval \'rm -rf "$1"\'',
+            'c=\'rm -rf "$1"\'; set -- /etc; eval "$c"',
+            # non-brace function bodies
+            'f() for p; do rm -rf "$p"; done; f /etc',
+            'f() if true; then rm -rf "$1"; fi; f /etc',
+            'f() [[ -n $(rm -rf "$1") ]]; f /etc',
+            'f() while rm -rf "$1"; do break; done; f /etc',
+            'function f for p; do rm -rf "$p"; done; f /etc',
+            # operator forms applied in a bound reading
+            'f() { rm -rf "${1#x}"; }; f x/etc',
+            'set -- x /etc; set -- "${@:2}"; rm -rf "$1"',
+            # brace / alternative call words
+            'f() { rm -rf "$3"; }; f {a,b} /etc',
+            'f() { rm -rf "$1"; }; f ${HOME:+/etc}',
+            # set from a substitution's output
+            'set -- $(printf \'%s \' a /etc); rm -rf "$2"',
+            # a while loop shifting past _MAX_SHIFTS
+            'f() { while [ $# -gt 0 ]; do rm -rf "$1"; shift; done; }; f a b c d e f g h i /etc',
+            # function OUTPUT
+            'f() { echo "$1"; }; rm -rf "$(f /etc)"',
+            'f() { echo /etc; }; rm -rf "$(f)"',
+            'f() { rm -rf "$(f2 "$1")"; }; f2() { echo "$1"; }; f /etc',
+            # a function exported into a child shell via declare -f
+            'f() { rm -rf "$1"; }; bash -c "$(declare -f f); f /etc"',
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Benign shapes these must not catch.
+        for cmd in (
+            "f() { if [ \"$1\" -gt 0 ]; then f $(( $1 - 1 )); fi; }; f 10",
+            "f() for d in build dist; do rm -rf \"./$d\"; done; f",
+            "log() { echo \"[$1]\"; }; log hi",
+            "f() { echo \"$1\"; }; x=$(f hi); echo \"$x\"",
+            "trap 'echo done' EXIT; echo hi",
+            "eval 'ls -l'",
+        ):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_backslash_ending_comment_is_no_continuation(self):
         """XERK-1626 QA: `# c\\` NL `# d` is two comments. Read as `a\\`-newline
         `#`, the second `#` was a word: a function body stayed open, and its `'`
@@ -3316,10 +3374,15 @@ class TestScriptChannels(unittest.TestCase):
                     "{ (true; echo hi) | sh; }", "for i in 1; do (true; echo hi) | sh; done",
                     # A redirect re-read as its own part must not loop to the
                     # depth cap, which reads as a reader (replay false deny).
-                    f"git push -u origin x 2>&1 | tail -4 && cat > pr.md <<'EOF'\n| sh `{R}`\nEOF",
-                    f'jira comment X "\\`while read l; do eval \\"\\$l\\"; done < <(echo {R})\\`" 2>&1 | tail -2'):
+                    f"git push -u origin x 2>&1 | tail -4 && cat > pr.md <<'EOF'\n| sh `{R}`\nEOF"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
+        # XERK-1655: the backtick below runs `while read l; do eval "$l"; done <
+        # <(echo rm -rf /)`, which really deletes / — eval-inlining now resolves
+        # the read value into the eval'd command (main missed it). Must still not
+        # loop to the depth cap: it classifies fast, below.
+        self.assertDenied(
+            f'jira comment X "\\`while read l; do eval \\"\\$l\\"; done < <(echo {R})\\`" 2>&1 | tail -2')
         # Past its depth cap a stage reads as a reader: fails closed.
         self.assertTrue(guard._reads_stdin_script("true", guard._MAX_EXPAND_DEPTH + 1))
         self.assertEqual(guard._group_core("(a)>a1>a1 2>&1 {fd}>/dev/null <<<w"), "(a)")
