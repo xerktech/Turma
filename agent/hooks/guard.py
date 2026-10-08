@@ -3045,6 +3045,9 @@ def _expand_braces(command: str) -> str:
     rewriting `awk '{print $2,$4}'` unbalanced its quotes (XERK-1256). A quoted
     script handed to `bash -c`/`eval` is re-expanded unquoted where it runs.
     """
+    masked = _mask_param_braces(command)
+    if masked is not None:
+        command, back = masked
     pos = 0
     expansions = 0
     states = _quote_states(command)
@@ -3093,7 +3096,115 @@ def _expand_braces(command: str) -> str:
         command = command[:word_start] + " ".join(parts) + command[word_end:]
         pos = word_start
         states = _quote_states(command)
+    if masked is not None:
+        command = _unmask_param_braces(command, back)
     return command
+
+
+def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:
+    """``command`` with each brace unit bash keeps whole inside a brace list
+    swapped for a stand-in the text does not hold, and the map back; None
+    when there is none.
+
+    `_BRACE_RE` cannot span braces or blanks, so a list holding a unit was
+    never expanded: it found only the inner `{HOME}`, skipped it as a
+    parameter, and `rm -rf {/tmp/x,${HOME}}` went unread (XERK-1694).
+    `"$HOME"` reaches here braced too (`_brace_quote_ended`). Units:
+    - a live `${…}` that is not single-quoted: `${` inhibits brace expansion
+      to its `}`, so `{x,${y:-a,b}}` is two items. bash counts plain `{…}`
+      inside it (`${y:-{a}}` is one unit), which `_brace_end` does not;
+    - a live `$(…)` or backtick (one word: `{x,$(echo /etc)}`).
+    A literal non-list brace (`{x,{a},/etc}`) is NOT masked (XERK-1756):
+    in readings that see quoted JSON bare, unblocking its lists multiplied
+    the readings, and real commands went past the deadline (6x).
+    """
+    if "${" not in command and "$(" not in command and "`" not in command \
+            or not _LIST_OPENER_RE.search(command):
+        return None  # nothing to mask, or no `{` a list could open with
+    states = _quote_states(command)
+    n = len(command)
+    spans: list[tuple[int, int]] = []
+    in_sub = bytearray(n)
+    for m in _find_substs(command):
+        s, e = m.start(), m.end()
+        in_sub[s:e] = b"\x01" * (e - s)
+        if command[s] in "$`" and states[s] in ("", '"') \
+                and (command[s] == "`" or _live_dollar(command, s)):
+            spans.append((s, e))
+    unclosed = False
+    i = command.find("${")
+    while i >= 0:
+        end = -1
+        if states[i] in ("", '"') and not in_sub[i] and _live_dollar(command, i):
+            end = _brace_end(command, i, states[i] == '"')
+        if end >= 0 and not unclosed:
+            # Plain braces counted as bash does. One that never balances keeps
+            # `_brace_end`'s close, and stops the count for the rest of the
+            # line: a scan to the end per opener is quadratic.
+            depth, k, quoting = 1, i + 2, states[i]
+            while k < n:
+                if not in_sub[k] and states[k] == quoting:
+                    if command[k] == "{":
+                        depth += 1
+                    elif command[k] == "}":
+                        depth -= 1
+                        if not depth:
+                            break
+                k += 1
+            if k >= n:
+                unclosed = True
+            elif k > end:
+                end = k
+        if end < 0:
+            i = command.find("${", i + 2)
+            continue
+        spans.append((i, end + 1))
+        i = command.find("${", end + 1)
+    if not spans:
+        return None
+    have = set(command)
+    free = list(itertools.islice((chr(c) for c in range(0xE000, 0xF900) if chr(c) not in have),
+                                 _BRACE_MASK_DIGITS + 1))
+    if len(free) < 2:
+        raise _ExpansionTooLarge  # a list left unread fails open: refuse
+    # A lead stand-in then two digit stand-ins: room for more units than any
+    # command under the growth budget holds, so none stays unread.
+    lead, digits = free[0], free[1:]
+    base = len(digits)
+    back: dict[str, str] = {}
+
+    def stand_in(text: str) -> str:
+        if len(back) >= base * base:
+            raise _ExpansionTooLarge  # as above, past the stand-ins
+        stand = lead + digits[len(back) // base] + digits[len(back) % base]
+        back[stand] = text
+        return stand
+
+    out, last = [], 0
+    for s, e in sorted(spans):
+        if s < last:
+            continue  # inside an outer unit already masked
+        stand = stand_in(command[s:e])
+        out.append(command[last:s] + stand)
+        last = e
+    out.append(command[last:])
+    return "".join(out), back
+
+
+# `_mask_param_braces`'s stand-ins' digit count: two digits name 65536 units.
+_BRACE_MASK_DIGITS = 256
+# A `{` that is not a `${`'s, or follows an escaped `\$`: only such a one opens a
+# brace list (bash expands `\${a,b}` to `$a $b`).
+_LIST_OPENER_RE = re.compile(r"(?<!\$)\{|\\\$\{")
+
+
+def _unmask_param_braces(command: str, back: dict[str, str]) -> str:
+    """``command`` with `_mask_param_braces`'s stand-ins put back."""
+    lead = next(iter(back))[0]
+    if lead not in command:
+        return command
+    parts = command.split(lead)
+    return parts[0] + "".join(back.get(lead + p[:2], lead + p[:2]) + p[2:] for p in parts[1:])
 
 
 @_budgeted

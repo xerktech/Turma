@@ -64,8 +64,8 @@ paths:
     and a heredoc writer read twice was "another part naming the description file".
   - A textual gate, never the line's values: those miss a `bash -c` script's own `HOME=`,
     `HOME[0]=`, `read HOME`; each inner level's values pass resolves the spliced `$HOME`.
-  - `$HOME`, never `${HOME}` or `${HOME:-~}`: braced, it is not resolved inside `{a,b}`, and a
-    default is applied at the OUTER level, before a `bash -c` script's own HOME is known.
+  - `$HOME`, never `${HOME:-~}`: a default is applied at the OUTER level, before a `bash -c`
+    script's own HOME is known.
   - Every `~` is spliced, a program's too. Any "command position" test by the text before it
     reopened the bypass (`rm -rf do ~/etc`, `rm -rf \; ~/etc`, `a=(~/etc)`): that needs a parse.
   - A spliced program stays literal: `_owner_word_may_be_shell` reads an unassigned
@@ -86,5 +86,20 @@ paths:
   - The unset-HOME reading is the unset-names one every name gets; no extra pass.
   - An op it cannot read (`[i]`, `@Q`) stays as written. 0 diffs over 126 real `${HOME` commands.
   - Tests: `test_a_program_or_flag_built_from_home_is_read_with_the_real_home`.
+- A brace unit inside a brace list is ONE item (XERK-1694, `_mask_param_braces`): before
+  matching lists, `_expand_braces` masks each with a stand-in and restores it after.
+  `_BRACE_RE` cannot span braces or blanks, so a list holding one was never expanded:
+  `rm -rf {/tmp/x,${HOME}}` (also `{"$HOME",x}`, braced by `_brace_quote_ended`) went unread.
+  - Units: a live `${…}` (bash counts plain `{…}` inside it, which `_brace_end` does not:
+    `${y:-{a,b}}` is one unit) and a `$(…)`/backtick.
+  - Out of stand-ins it refuses as too large: a list left unread fails open.
+  - An unbalanced plain count keeps `_brace_end`'s close and stops counting for the line:
+    a scan per opener is quadratic.
+  - Never mask literal non-list braces here (`{x,{a},/etc}`, XERK-1756): readings that see
+    quoted JSON bare then expanded its lists, and two real commands went 4s → 26s (deadline).
+  - It runs per nested body (thousands of calls on a backtick-heavy line): keep its
+    early returns (no unit, or no `{` but a `${`'s) and lazy stand-in pick: without them it
+    cost 3-5x on the timing tests, and 100k backticks with no list hit the stand-in refusal.
+  - Tests: `test_a_brace_unit_inside_a_brace_list_is_one_item`.
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,
   `test_home_readings_are_bounded`.
