@@ -2216,7 +2216,10 @@ class TestScriptChannels(unittest.TestCase):
                     "cd /tmp/a; eval rm -rf ~-$x/build", "rm -rf ~-$x",
                     "cd /; rm -rf $PWD${x}-old", "cd /etc; rm -rf $PWD.bak",
                     "cd /tmp/a; rm -rf $PWD$1", "f(){ rm -rf $PWD$1; }; f /build",
-                    "cd /tmp/a; rm -rf $PWD*", "cd /; rm -rf $PWD.bak", "rm -rf $PWDX"):
+                    "cd /tmp/a; rm -rf $PWD*", "cd /; rm -rf $PWD.bak", "rm -rf $PWDX",
+                    # Another name, and a literal tilde word, join nothing.
+                    "cd /; rm -rf $PWDetc", "cd /; cd /tmp; rm -rf ~-*",
+                    "cd /; cd /tmp; eval rm -rf '~-'etc"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
