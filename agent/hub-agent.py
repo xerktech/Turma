@@ -4415,7 +4415,9 @@ closing and why:
 # beside the policies above, on every launch. The guard hook
 # (hooks/guard.py `pr_summary_reason`) refuses a PR/MR whose description lacks
 # these sections, so the two must name the same headings. A repo's own PR
-# template outranks it in both places.
+# template outranks it in both places. Its last paragraph keeps a session from
+# polling for its own merge: such a poll ends only when the hub's auto-merge
+# lands it, and an idle session is what that auto-merge acts on.
 PR_SUMMARY_SYSTEM_PROMPT = """
 PR summary standard (set by Turma; the safety guard refuses a PR/MR without it):
 
@@ -4453,6 +4455,10 @@ Write it for a human reviewer who never saw this session:
     update the description (`gh pr edit --body-file`) so it stays true.
   - Pass the description inline (--body/--description or a heredoc) or with
     --body-file; the guard can't check --fill or an editor.
+
+Once a PR's CI is green, do not watch or poll for it to merge (a `gh pr view`
+loop, `until ... MERGED`): end the turn with no such shell left running. The hub
+or the operator merges it; you are re-prompted if anything follows.
 """
 
 # --- cross-session messaging (XERK-339) --------------------------------------
