@@ -14819,13 +14819,9 @@ def _type_into_pane(tmux_name, text):
     emoji-bearing text keeps the single bracketed paste (see the constants).
     The BUFFER carries every paste (XERK-227's argv limit, unrelated).
 
-    On Windows the pty-host stands in for tmux (XERK-697): `_pty_inject` delivers
-    the text as a bracketed paste over the control channel, the direct analog of
-    the `paste-buffer -p` path here (newlines survive as ONE message), then
-    submits with Enter. It applies the same single-line rule, for the same
-    reason."""
-    if IS_WINDOWS:
-        return _pty_inject(tmux_name, text)
+    On Windows the pty-host stands in for tmux (XERK-697): `_pty_inject` applies
+    the same typed-vs-bracketed rule over the control channel (XERK-1727), then
+    submits with Enter."""
     if not tmux_name:
         return False
     with _PANE_TYPE_LOCKS_GUARD:
@@ -14837,6 +14833,9 @@ def _type_into_pane(tmux_name, text):
         log(f"typing into {tmux_name}: another writer still busy after "
             f"{PANE_TYPE_LOCK_WAIT_SEC}s; typing unserialized")
     try:
+        # A Windows message is N slice injects too, so it takes the same lock.
+        if IS_WINDOWS:
+            return _pty_inject(tmux_name, text)
         return _type_into_tmux_pane(tmux_name, text)
     finally:
         if locked:
@@ -15302,46 +15301,76 @@ def _pty_capture(tmux_name):
 
 
 def _pty_inject(tmux_name, text):
-    """send-keys/paste analog. Delivers `text` as a BRACKETED PASTE (ESC[200~ …
-    ESC[201~) so a multi-line message lands as one input just as `paste-buffer
-    -p` keeps it whole on Linux, then submits with Enter. Control bytes are
-    stripped first (an ESC inside the body would close the paste early and have
-    the rest read as keystrokes — the same hazard INPUT_CTRL_RE guards on the
-    tmux path), and \\r is normalized to \\n like the paste path. Returns True
-    when the paste was accepted.
+    """send-keys/paste analog, the pty-host twin of _type_into_tmux_pane: the
+    SAME rule decides typed vs bracketed (XERK-1727). Control bytes are stripped
+    first (an ESC inside the body would close a paste early and have the rest
+    read as keystrokes -- the hazard INPUT_CTRL_RE guards on the tmux path), and
+    CR/CRLF normalize to LF. Returns True when the text was accepted.
 
-    A MULTI-LINE paste needs the Enter DELAYED: Claude Code collapses it into a
-    "[Pasted text +N lines]" chip, and an Enter that races that collapse is
-    absorbed, leaving the message unsubmitted in the composer (PTY_SUBMIT_SETTLE_SEC
-    — the Windows submit bug the tmux path never had, since its separate
-    `send-keys Enter` subprocess already interposed the delay). After the Enter we
-    re-check and Enter again while the chip is still showing, bounded, for a
-    collapse slower than one settle. A single-line paste doesn't collapse, so it
-    keeps the immediate-Enter fast path."""
+    Chat-sized text (<= PASTE_SLICED_MAX_CHARS, nothing in _SLICE_UNSAFE_RE) is
+    TYPED, unbracketed, in PASTE_CHUNK_CHARS slices: bracketing -- or one burst
+    past ~800 chars -- is what makes Claude Code record the turn as
+    `<pasted_content>`, framing the operator's words as pasted data. A newline
+    goes as a raw LF: ConPTY's input engine turns it into a Ctrl+Enter key event
+    carrying '\\n', which libuv hands node as the same LF byte the tmux `-r`
+    path types, a line break rather than a submit (read from the conhost and
+    libuv sources; NOT yet verified on a Windows host). Tabs go as four spaces
+    (a typed tab is autocomplete). Then a separate CR submits; a multi-slice or
+    multi-line message waits PASTE_CHUNK_GAP_SEC first so the Enter is never
+    read in the same burst as the text.
+
+    Longer or emoji-bearing text keeps ONE inject, bracketed when multi-line
+    (ESC[200~ ... ESC[201~) so it stays one message. That bracketed paste needs
+    the Enter DELAYED: Claude Code collapses it into a "[Pasted text +N lines]"
+    chip, and an Enter that races the collapse is absorbed, leaving the message
+    unsubmitted (PTY_SUBMIT_SETTLE_SEC -- the tmux path's separate `send-keys
+    Enter` subprocess already interposed that delay). After the Enter we
+    re-check and Enter again while the chip still shows, bounded. Typed text
+    makes no chip, so it never takes that loop."""
     if not tmux_name:
         return False
-    clean = INPUT_CTRL_RE.sub("", text.replace("\r", "\n"))
-    multiline = "\n" in clean
-    # Bracket ONLY what needs it. Claude Code tags bracketed-paste input as
-    # `<pasted_content id=...>` in the transcript, so bracketing an ordinary
-    # one-line message wrapped every operator turn in those tags (see
-    # _type_into_pane). A single line needs neither the newline preservation nor
-    # the chip-collapse settle below, so it is injected as typed text.
-    payload = ("\x1b[200~" + clean + "\x1b[201~") if multiline else clean
-    r = _pty_control(tmux_name, "inject", data=payload)
-    if not (r and r.get("ok")):
-        return False   # no live terminal / control call failed
-    if multiline:
+    clean = _clean_input_text(text)
+    sliced = len(clean) <= PASTE_SLICED_MAX_CHARS and not _SLICE_UNSAFE_RE.search(clean)
+    if sliced:
+        clean = clean.replace("\t", "    ")
+        slices = _input_slices(clean)
+    else:
+        multiline = "\n" in clean
+        slices = [("\x1b[200~" + clean + "\x1b[201~") if multiline else clean]
+    for n, piece in enumerate(slices):
+        if n:
+            time.sleep(PASTE_CHUNK_GAP_SEC)   # keep each burst under the paste threshold
+        r = _pty_control(tmux_name, "inject", data=piece)
+        if not (r and r.get("ok")) and n:
+            # Earlier slices already sit in the composer, where the NEXT
+            # message would submit them glued to its own text: retry once
+            # before giving up on a transient control failure. Accepted cost:
+            # None also means "reply lost", and if that inject DID land the
+            # retry types the slice twice (rarer than a refused connect).
+            time.sleep(PTY_SUBMIT_SETTLE_SEC)
+            r = _pty_control(tmux_name, "inject", data=piece)
+        if not (r and r.get("ok")):
+            # No live terminal / control call failed. Nothing is submitted, so
+            # a cut message never goes out as if whole.
+            if n:
+                log(f"typing into {tmux_name}: slice {n + 1}/{len(slices)} "
+                    f"failed; {sum(map(len, slices[:n]))} chars typed but left "
+                    f"unsubmitted in the composer")
+            return False
+    chip = not sliced and "\n" in clean
+    if chip:
         time.sleep(PTY_SUBMIT_SETTLE_SEC)          # let the paste chip settle
+    elif len(slices) > 1 or "\n" in clean:
+        time.sleep(PASTE_CHUNK_GAP_SEC)            # Enter in its own burst
     _pty_control(tmux_name, "inject", data="\r")   # submit with Enter
     # Safety net: while a not-yet-submitted paste chip is still on screen and no
-    # turn has started, Enter again. Never fires for a single-line paste (no
-    # chip). Bounded by PTY_SUBMIT_MAX_RETRIES *and* a wall-clock deadline
+    # turn has started, Enter again. Never fires for typed text (no chip).
+    # Bounded by PTY_SUBMIT_MAX_RETRIES *and* a wall-clock deadline
     # (PTY_SUBMIT_DEADLINE_SEC, XERK-867) — the iteration count alone multiplied a
     # ~5s-class control timeout, so on a degraded host the loop could run far
     # longer than the retry count suggests.
     deadline = time.monotonic() + PTY_SUBMIT_DEADLINE_SEC
-    for _ in range(PTY_SUBMIT_MAX_RETRIES if multiline else 0):
+    for _ in range(PTY_SUBMIT_MAX_RETRIES if chip else 0):
         if time.monotonic() >= deadline:
             break
         cap = _capture_pane(tmux_name) or ""

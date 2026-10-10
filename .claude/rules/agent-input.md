@@ -34,7 +34,8 @@ composed.**
     submit and arrive corrupted, and slicing costs ~2 tmux calls per slice ON THE BEAT (resend, qwen
     peer). Those keep one bracketed paste; `chat.js` `stripFraming` hides the tags.
   - A typed TAB is autocomplete, so tabs go as 4 spaces. One writer per pane (`_PANE_TYPE_LOCKS`).
-  - Windows `_pty_inject` still brackets multi-line (XERK-1727). Tests: `TestSendInput`.
+  - Windows `_pty_inject` applies the same rule (XERK-1727, `windows-agent.md`). Tests:
+    `TestSendInput`, the `_pty_inject` cases in `TestWindowsTerminalBackend`.
 - **Nothing truncates silently**: the fallback CHUNKS its send-keys; the agent REFUSES past
   `INPUT_MAX_CHARS` (100k) and heartbeats it as `inputMaxChars`; the hub caps at the receiving
   host's figure (`inputCapFor`, **4k when unreported** — an agent predating paste clips the tail
