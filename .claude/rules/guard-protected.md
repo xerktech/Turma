@@ -61,6 +61,6 @@ stub (XERK-1643 incident). `agent/native/turma-agent-protect` moves the two SECU
   - They run the protected guard WITHOUT `--protected`: its env is the runtime's own, which the
     session cannot set (unlike a nested `claude`'s).
   - Still session-writable around them: the qwen shim + dsh plugin code under `$PREFIX`,
-    `~/.turma/qwen-guard.json`, the dsh profile, and qwen's per-worktree `.qwen/settings.json`.
+    `~/.turma/qwen-guard.json`, the dsh profile, and qwen's per-worktree `.qwen/settings.json` (XERK-1764).
 - Tests: `test_turma_agent_protect.py`, `TestManagedGuard` (`test_guard_settings.py`),
   `TestProtectedOverrides` (`test_guard.py`), `TestFakedHome` (`test_fileguard.py`).
