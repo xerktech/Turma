@@ -10721,6 +10721,17 @@ def _cd_targets(text: str, inherited: tuple[str, ...],
                             if entry.startswith("/")]
         for target in targets:
             target = _norm_path(target)
+            # The session home spelled absolutely is `~`: joined as `$HOME/x`,
+            # the home rules judge it, so `cd /home/me && rm -rf build` stays
+            # allowed while `*` is refused (XERK-1757).
+            home = _session_home()
+            if home and target.rstrip("/") and target.rstrip("/") == (
+                    posixpath.normpath(re.sub(r"/{2,}", "/", home))):
+                target = "$HOME"
+            # `~me/`, `~me/.` and `~me//` are `~me`: `_norm_path` leaves a
+            # tilde form unfolded, and unfolded it matched no home token.
+            if target.startswith("~"):
+                target = posixpath.normpath(re.sub(r"/{2,}", "/", target))
             low = target.lower()
             if (low.startswith("/") or low.rstrip("/") in _HOME_TOKENS
                     or _HOME_USER_RE.match(low)):
@@ -10732,9 +10743,15 @@ def _cd_targets(text: str, inherited: tuple[str, ...],
     return tuple(found)
 
 
+# A person's home spelled absolutely (`/home/me`, `/Users/me`): a cwd there is
+# an exact root, as `~` and `/root` are (XERK-1757).
+_PERSON_HOME_RE = re.compile(r"^/(?:home|users)/[^/]+$")
+
+
 def _is_exact_root(path: str) -> bool:
     low = path.lower()
-    return low in _HOME_TOKENS or low in _SYSTEM_ROOTS or bool(_HOME_USER_RE.match(low))
+    return (low in _HOME_TOKENS or low in _SYSTEM_ROOTS or bool(_HOME_USER_RE.match(low))
+            or bool(_PERSON_HOME_RE.match(low)))
 
 
 # `$OLDPWD` too: whichever directory the line was in before its last `cd`,
