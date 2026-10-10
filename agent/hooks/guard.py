@@ -1789,6 +1789,7 @@ def _budgeted(fn):
         _READINGS_SEEN[0] = False
         _PRINTED_DROP_SEEN[0] = False
         _READINGS_MOST[0] = 0
+        _PWD_SEEN[0] = False
         _FOR_NAMES.clear()
         # These memos set the readings' SEEN flags as they fill, and a hit
         # skips that: a body cached by an earlier decision in this process
@@ -3582,6 +3583,8 @@ def _assigned_values(command: str, depth: int = 0,
         for table in (vals, applied, where, applied_where):
             for name in _CD_NAMES:
                 table.pop(name, None)
+    elif any(name in vals or name in applied for name in _CD_NAMES):
+        _PWD_SEEN[0] = True
     plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
     own = {k: len(vs) for k, vs in vals.items()}
     # An applied default is one more value of its name, and resolves OTHER
@@ -5261,10 +5264,10 @@ _HOME_KEPT = [False]
 _PWD_UNASSIGNED = [False]
 _CD_NAMES = ("PWD", "OLDPWD")
 _MOVES_RE = re.compile(r"(?<![\w-])(?:cd|pushd|popd)(?![\w-])")
-# PWD/OLDPWD named other than as a use (`PWD=`, `read PWD`, `for PWD in`), or
-# spelled in pieces (`{P,Q}WD=`, `eval "P""WD=…"`, XERK-1753 QA). Any other
-# spelling (`x=PW; eval "${x}D=…"`) is found by the line's values.
-_PWD_NAMED_RE = re.compile(r"(?<![\w$!])(?<!\$\{)(?:OLD)?P?WD(?!\w)|\}WD(?!\w)")
+# Whether any values pass of this decision bound PWD or OLDPWD, however the
+# line spelled the name (`$'P\x57D'`, `P{W,}D`, `eval "${x}D=…"`): a text
+# gate missed each spelling in turn, and a broad one cost +50% (XERK-1753 QA).
+_PWD_SEEN = [False]
 # Set while `_expand_both` reads the line with each multi-reading expansion
 # spliced as its Nth reading (`_splice_readings`); and the most readings one
 # expansion of this decision had (XERK-1664).
@@ -7669,8 +7672,8 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
             out = out + _expand_readings(command)
         finally:
             _HOME_KEPT[0] = False
-    pwd_assigned = (not _PWD_UNASSIGNED[0] and _MOVES_RE.search(command) is not None
-                    and _pwd_assigned(command))
+    pwd_assigned = (not _PWD_UNASSIGNED[0] and _PWD_SEEN[0]
+                    and _MOVES_RE.search(command) is not None)
     if pwd_assigned:
         _PWD_UNASSIGNED[0] = True
         try:
@@ -7719,18 +7722,6 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
             _PWD_UNASSIGNED[0] = False
     return out
 
-
-def _pwd_assigned(command: str) -> bool:
-    """Whether ``command`` may assign PWD or OLDPWD (see `_PWD_UNASSIGNED`)."""
-    if _PWD_NAMED_RE.search(command):
-        return True
-    try:
-        # The heredoc-free text `_expand` reads values from: memoised there.
-        vals = _var_values(_split_heredocs(command)[0])
-    except _ExpansionTooLarge:
-        # Read: the extra reading meets the spent budget and denies.
-        return True
-    return any(name in vals for name in _CD_NAMES)
 
 
 # A `~` bash expands to $HOME (`~+` to $PWD, `~-` to $OLDPWD, `~N`/`~+N`/`~-N`

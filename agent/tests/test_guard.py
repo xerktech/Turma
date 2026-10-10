@@ -2280,6 +2280,11 @@ class TestScriptChannels(unittest.TestCase):
                     "declare {P,Q}WD=/x; cd /etc; rm -rf $PWD",
                     "eval \"P\"\"WD=/x\"; cd /etc; rm -rf $PWD",
                     "x=PW; eval \"${x}D=/x\"; cd /etc; rm -rf $PWD",
+                    "eval $'P\\x57D=/x'; cd /etc; rm -rf $PWD",
+                    "printf -v $'\\x50WD' /x; cd /etc; rm -rf $PWD",
+                    "export P{W,}D=/x; cd /etc; rm -rf $PWD",
+                    "read P{W,}D <<< '/x /y'; cd /etc; rm -rf $PWD",
+                    "eval $'OLDP\\x57D=/x'; cd /etc; cd /tmp; rm -rf ~-",
                     "PWD=/x; cd /etc; rm -rf \"$(echo $PWD)\"",
                     "PWD=/x; cd /etc; x=$(printf %s \"$PWD\"); rm -rf \"$x\""):
             with self.subTest(cmd=cmd):

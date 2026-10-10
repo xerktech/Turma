@@ -44,9 +44,10 @@ paths:
   - A line that assigns PWD/OLDPWD AND moves (`cd`/`pushd`/`popd`) is also read with both
     unassigned (`_PWD_UNASSIGNED`, XERK-1753): `cd` rewrites them, so spliced,
     `PWD=/x; cd /etc; rm -rf $PWD` read `/x`. Added, never swapped: `cd -` reads OLDPWD's value.
-    - Gated textually (`_MOVES_RE` + `_PWD_NAMED_RE`, pieces like `{P,Q}WD=` too), else on the
-      line's memoised values (`x=PW; eval "${x}D=…"`): a fresh `_var_values` there spent the
-      budget outside `_expand` and raised. Each `for` word's pass is read unassigned too.
+    - Gated on a move (`_MOVES_RE`) AND a values pass of this decision having bound either name
+      (`_PWD_SEEN`), however spelled (`$'P\x57D'`, `P{W,}D`, `eval "${x}D=…"`). Never a text
+      gate: each pattern missed the next spelling, and a broad one cost +53% CPU (QA, 3 passes).
+    - Each `for` word's pass is read unassigned too: a loop's `cd $d` reaches its words only there.
     - Accepted over-read (visited dirs are unordered): `cd /etc; PWD=/tmp/x; rm -rf $PWD`.
   - `_PWD_LEAD_RE` also takes `${PWD:?}`/`${PWD?}` and an unspliced directory tilde, which
     `eval rm '~-'` / `\~-` reach a target as (the splice's lookbehind skips quotes).
