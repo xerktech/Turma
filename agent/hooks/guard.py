@@ -11167,6 +11167,8 @@ _HOME_NAME_RE = re.compile(r"\$HOME(?!\w)")
 # prompt codes, which a path holding none keeps as it is.
 _HOME_TRANSFORMS = {"@E": lambda v: v, "@P": lambda v: v, "@L": str.lower,
                     "@U": str.upper, "@u": lambda v: v[:1].upper() + v[1:]}
+# bash's case ops (`^ ^^ , ,, ~ ~~`; `~` toggles), each with an optional pattern.
+_HOME_CASE_OP_RE = re.compile(r"(\^\^|,,|~~|\^|,|~)(.*)", re.DOTALL)
 # Past this many `${HOME<op>}` in one target the reading is `/`: each pattern
 # operator costs a match per substring of HOME, and a target that size is no path.
 _MAX_HOME_OPS = 64
@@ -11241,6 +11243,12 @@ def _home_expanded(raw: str, home: str, budget: list[int]) -> str | None:
         op = _VAR_OP_RE.match(tail)
         if tail == "" or tail[:1] in ("-", "=", "?") or tail[:2] in (":-", ":=", ":?"):
             value = home  # set and non-empty, so the default is unused
+        elif tail not in _CASE_OPS and _HOME_CASE_OP_RE.fullmatch(tail):
+            # A case op maps only what its optional pattern matches, so one
+            # matching nothing (`${HOME,x}`) leaves HOME as is (XERK-1759). Any
+            # other result is the home on a case-blind disk and no path on a
+            # normal one, so HOME is the reading that matters.
+            value = home
         elif tail in _CASE_OPS:
             value = _CASE_OPS[tail](home)
         elif tail in _HOME_TRANSFORMS:
