@@ -3078,72 +3078,77 @@ def _expand_braces(command: str) -> str:
     # first list of every word, as one rebuild: a pass per list re-read the
     # whole line's quoting per list, quadratic in a line of 1000 lists. A
     # product that outgrows the budget is refused, too large to finish.
-    while True:
-        states = _quote_states(command)
-        lists = []
-        for m in _BRACE_RE.finditer(command):
-            start = m.start()
-            # `${x,,}` is a case-modifying parameter expansion, never a brace
-            # list: expanded, `${x,,}rm` read as `$xrm $rm $rm` (XERK-1615).
-            items = m.group(1).split(",") if "," in m.group(1) else _brace_sequence(m.group(1))
-            # A quote or escape in the body may hide the real close (`{x,'}',/etc}`
-            # matched as `{x,'}`): bash's scan reads that list below.
-            if states[start] or not items or any(c in _BRACE_HARD for c in m.group(1)) \
-                    or (start and command[start - 1] == "$" and _live_dollar(command, start - 1)):
-                continue
-            lists.append((start, m.end(), items))
-        # A list `_BRACE_RE` cannot match, read by bash's own scan: an item
-        # holding a quote, an escape or a literal brace (XERK-1756).
-        lists.extend(_bash_brace_lists(command, states))
-        if not lists:
-            break
-        passes += 1
-        out, last, size, walks = [], 0, len(command), {}
-        for start, end, items in sorted(lists):
-            if start < last:
-                continue  # another list of a word this pass expands
-            # A word ends at a blank or an operator: cut only at a space,
-            # `{,bash}|cat` read as `|cat bash|cat` (XERK-1629).
-            word_start = start
-            while word_start > last and command[word_start - 1] not in _BRACE_WORD_END:
-                word_start -= 1
-            # A quoted run glued before the brace is the word's too: cut at a
-            # quoted blank, `eval 'rm -rf /etc'{,x}` read as `'rm -rf /etc' /etc'x`
-            # (XERK-1683). An ADDED reading (`_BRACE_QUOTED`), never in place of
-            # the cut one: no lexer short of bash finds every word start.
-            quoted_start = max(_brace_word_start(command, start, word_start, walks), last)
-            if quoted_start != word_start:
-                _BRACE_QUOTED_SEEN[0] = True
-                if _BRACE_QUOTED[0]:
-                    word_start = quoted_start
-            # A `$(…)`, backtick or quoted run glued on is the word's too: cut at
-            # its `(`, `{,}$(echo rm -rf /)` read as `$ $` (XERK-1622).
-            word_end = _word_end(command, end)
-            if word_end < 0:
-                m_end = _BRACE_WORD_END_RE.search(command, end)
-                word_end = m_end.start() if m_end else len(command)
-            prefix, suffix = command[word_start:start], command[end:word_end]
-            # An empty word goes, as in bash: `{,bash}` runs `bash`.
-            parts = [w for w in (prefix + p.strip() + suffix for p in items) if w]
-            # A suffix ending in a lone `\` (the word ends the text) escaped the
-            # blank joining two words: `{/etc,/var}\` read as ONE word
-            # `/etc /var\`. zsh drops that `\` before it expands; bash keeps it
-            # literal on every word, which judges no worse (XERK-1646).
-            if suffix.endswith("\\") and _drop_trailing_escape(command[:word_end]) is not None:
-                parts = [w[:-1] for w in parts if w[:-1]]
-            out.append(command[last:word_start] + " ".join(parts))
-            size += len(out[-1]) - (word_end - last)
-            if size > grown:
+    saved = _WORD_END_MEMO[0]
+    try:
+        while True:
+            states = _quote_states(command)
+            _WORD_END_MEMO[0] = (command, {})
+            lists = []
+            for m in _BRACE_RE.finditer(command):
+                start = m.start()
+                # `${x,,}` is a case-modifying parameter expansion, never a brace
+                # list: expanded, `${x,,}rm` read as `$xrm $rm $rm` (XERK-1615).
+                items = m.group(1).split(",") if "," in m.group(1) else _brace_sequence(m.group(1))
+                # A quote or escape in the body may hide the real close (`{x,'}',/etc}`
+                # matched as `{x,'}`): bash's scan reads that list below.
+                if states[start] or not items or any(c in _BRACE_HARD for c in m.group(1)) \
+                        or (start and command[start - 1] == "$" and _live_dollar(command, start - 1)):
+                    continue
+                lists.append((start, m.end(), items))
+            # A list `_BRACE_RE` cannot match, read by bash's own scan: an item
+            # holding a quote, an escape or a literal brace (XERK-1756).
+            lists.extend(_bash_brace_lists(command, states))
+            if not lists:
+                break
+            passes += 1
+            out, last, size, walks = [], 0, len(command), {}
+            for start, end, items in sorted(lists):
+                if start < last:
+                    continue  # another list of a word this pass expands
+                # A word ends at a blank or an operator: cut only at a space,
+                # `{,bash}|cat` read as `|cat bash|cat` (XERK-1629).
+                word_start = start
+                while word_start > last and command[word_start - 1] not in _BRACE_WORD_END:
+                    word_start -= 1
+                # A quoted run glued before the brace is the word's too: cut at a
+                # quoted blank, `eval 'rm -rf /etc'{,x}` read as `'rm -rf /etc' /etc'x`
+                # (XERK-1683). An ADDED reading (`_BRACE_QUOTED`), never in place of
+                # the cut one: no lexer short of bash finds every word start.
+                quoted_start = max(_brace_word_start(command, start, word_start, walks), last)
+                if quoted_start != word_start:
+                    _BRACE_QUOTED_SEEN[0] = True
+                    if _BRACE_QUOTED[0]:
+                        word_start = quoted_start
+                # A `$(…)`, backtick or quoted run glued on is the word's too: cut at
+                # its `(`, `{,}$(echo rm -rf /)` read as `$ $` (XERK-1622).
+                word_end = _word_end(command, end)
+                if word_end < 0:
+                    m_end = _BRACE_WORD_END_RE.search(command, end)
+                    word_end = m_end.start() if m_end else len(command)
+                prefix, suffix = command[word_start:start], command[end:word_end]
+                # An empty word goes, as in bash: `{,bash}` runs `bash`.
+                parts = [w for w in (prefix + p.strip() + suffix for p in items) if w]
+                # A suffix ending in a lone `\` (the word ends the text) escaped the
+                # blank joining two words: `{/etc,/var}\` read as ONE word
+                # `/etc /var\`. zsh drops that `\` before it expands; bash keeps it
+                # literal on every word, which judges no worse (XERK-1646).
+                if suffix.endswith("\\") and _drop_trailing_escape(command[:word_end]) is not None:
+                    parts = [w[:-1] for w in parts if w[:-1]]
+                out.append(command[last:word_start] + " ".join(parts))
+                size += len(out[-1]) - (word_end - last)
+                if size > grown:
+                    raise _ExpansionTooLarge
+                last = max(word_end, end)
+            out.append(command[last:])
+            # Charged to the decision too: every substitution body and eval level
+            # expands its own lists, and 200 bodies of `{a,b}` x10 each fit one
+            # call's budget but read 2.6 MB between them (QA: 26s).
+            _spend(size - len(command))
+            command = "".join(out)
+            if passes > _BRACE_PASSES_MAX or len(command) > grown:
                 raise _ExpansionTooLarge
-            last = max(word_end, end)
-        out.append(command[last:])
-        # Charged to the decision too: every substitution body and eval level
-        # expands its own lists, and 200 bodies of `{a,b}` x10 each fit one
-        # call's budget but read 2.6 MB between them (QA: 26s).
-        _spend(size - len(command))
-        command = "".join(out)
-        if passes > _BRACE_PASSES_MAX or len(command) > grown:
-            raise _ExpansionTooLarge
+    finally:
+        _WORD_END_MEMO[0] = saved
     if masked is not None:
         command = _unmask_param_braces(command, back)
     return command
@@ -6125,6 +6130,13 @@ def _join_continuations(segment: str) -> str:
     return "".join(out)
 
 
+# A per-pass memo of `_word_end` for one text, `(text, {(i, stop): end})`, set
+# by `_expand_braces` while it scans: a line of lists each glued to an unclosed
+# `$(` ran every list's word end through the rest of the nest (XERK-1756 QA,
+# quadratic). Keyed on the text's identity; reading flags hold for the pass.
+_WORD_END_MEMO: list = [None]
+
+
 def _word_end(s: str, i: int, stop: str | None = None) -> int:
     """Where the bash word starting at ``i`` ends (``stop`` None), or the
     index of the ``stop`` character closing the construct whose body starts
@@ -6133,6 +6145,10 @@ def _word_end(s: str, i: int, stop: str | None = None) -> int:
     Unlike shlex it keeps whitespace inside `${…}`, `$(…)`, `$((…))`, `$[…]`,
     backticks and nested brackets in the word, as bash does.
     """
+    # Inner constructs' ends come from the pass memo when one is set for
+    # ``s``, looked up inline: a wrapper would double the frames per level.
+    memo = _WORD_END_MEMO[0]
+    known = memo[1] if memo is not None and memo[0] is s else None
     n = len(s)
     while i < n:
         ch = s[i]
@@ -6155,19 +6171,34 @@ def _word_end(s: str, i: int, stop: str | None = None) -> int:
             # Quoting is known here; looked up, it is a whole-line scan per `${`.
             j = _brace_end(s, i, quoted=stop == '"')
         elif s.startswith(("$(", "$["), i):
-            j = _word_end(s, i + 2, ")" if s[i + 1] == "(" else "]")
+            key = (i + 2, ")" if s[i + 1] == "(" else "]")
+            j = known.get(key) if known is not None else None
+            if j is None:
+                j = _word_end(s, *key)
+                if known is not None:
+                    known[key] = j
         elif stop == '"':
             i += 1
             continue
         elif ch == '"':
-            j = _word_end(s, i + 1, '"')
+            key = (i + 1, '"')
+            j = known.get(key) if known is not None else None
+            if j is None:
+                j = _word_end(s, *key)
+                if known is not None:
+                    known[key] = j
         elif ch == "'" or s.startswith("$'", i):
             j = i + 1 if ch == "'" else i + 2
             while j < n and s[j] != "'":
                 j += 2 if ch == "$" and s[j] == "\\" else 1
             j = j if j < n else -1
         elif (stop, ch) in ((")", "("), ("]", "[")):
-            j = _word_end(s, i + 1, stop)
+            key = (i + 1, stop)
+            j = known.get(key) if known is not None else None
+            if j is None:
+                j = _word_end(s, *key)
+                if known is not None:
+                    known[key] = j
         else:
             i += 1
             continue

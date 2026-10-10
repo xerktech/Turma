@@ -32,6 +32,10 @@ paths:
   - `_brace_word_start` takes a per-pass memo (substitutions per body, how far its word walk
     got, each word's end): walked from the start per list, a line of quoted lists was
     quadratic (9s on 135 B), and so was one word spanning many lists (`$[ "1"{1,2}… ]`, 7.7s).
+  - `_word_end` reads inner constructs' ends from `_WORD_END_MEMO` while a pass runs (keyed on
+    the text's identity): each list glued to an unclosed `$(` rescanned the rest of the nest
+    (6s on 8 KB). Looked up inline, never via a wrapper, which doubles frames per nesting level
+    and halves the depth a `$(` nest reaches before RecursionError.
   - A refusal is never grantable (`_expand_top` sets `_budget["capped"]`): the policy checks
     after a grant see only `_TOO_LARGE`, so brace padding hid a `gh pr merge` (QA).
   - Accepted over-deny: products past that budget, e.g. `touch f{0..9}{0..9}{0..9}.txt`
