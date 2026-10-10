@@ -2232,18 +2232,26 @@ class TestScriptChannels(unittest.TestCase):
                         "cd ~/.. && rm -rf *", "cd ~/.. && rm -rf x*",
                         "cd ~/.. && rm -rf $PWD/x", "cd /var/tmp && rm -rf qa7h",
                         "cd /var/tmp && rm -rf qa7h/home", "cd ~/.. && chmod -R 777 x",
-                        "cd ~/.. && find x -delete"):
+                        "cd ~/.. && find x -delete", "cd ~/.. && rm -rf x/*",
+                        "cd ~/.. && rm -rf $PWD/x/*", "cd ~/.. && rm -rf x/{*,.*}",
+                        "cd ~/.. && chmod -R 000 x/*", "cd ~/.. && rm -rf x$n",
+                        "cd ~/.. && rm -rf $PWD*", "cd /var/tmp/qa7h && rm -rf $PWD*"):
                 with self.subTest(cmd=cmd):
                     self.assertDenied(cmd)
             # Inside the home, or a sibling of it, names nothing above it.
             for cmd in ("cd ~/.. && rm -rf y", "cd ~/.. && rm -rf y*",
                         "cd ~/.. && rm -rf x/build", "cd ~ && rm -rf build",
-                        "cd /var/tmp && rm -rf other"):
+                        "cd /var/tmp && rm -rf other", "cd ~/proj && rm -rf build",
+                        "cd /var/tmp && rm -rf qa7hh", "cd ~/.. && rm -rf y$n",
+                        "cd ~ && rm -rf .c*"):
                 with self.subTest(cmd=cmd):
                     self.assertAllowed(cmd)
         with mock.patch.dict(os.environ, {"HOME": "/home/a/b"}):
             self.assertDenied("cd /home/a && rm -rf b")
             self.assertAllowed("cd /home/a && rm -rf c")
+            self.assertDenied("cd /home/a && rm -rf b/*")
+        with mock.patch.dict(os.environ, {"HOME": "/home/x[1]"}):
+            self.assertDenied("cd /home && rm -rf 'x[1]'")
 
     def test_tilde_and_pwd_follow_the_line_s_own_home_and_cd(self):
         """XERK-1685: bash expands `~` from HOME's current value and `$PWD` is

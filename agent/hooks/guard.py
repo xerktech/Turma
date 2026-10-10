@@ -10762,34 +10762,44 @@ def _under_cwd(tok: str, cwd: str) -> str:
         rest = tok[m.end():]
         if rest[:1] not in ("", "/"):
             joined = (cwd.rstrip("/") or "/") + rest
-            if _is_exact_root(cwd) or ".." in rest.split("/") or _holds_home(joined):
+            if _is_exact_root(cwd) or ".." in rest.split("/") or _holds_home(joined, cwd):
                 return joined
             return tok
         rest = rest.lstrip("/")
         joined = (cwd.rstrip("/") + "/" + rest).rstrip("/") or "/"
-        if _is_exact_root(cwd) or ".." in rest.split("/") or _holds_home(joined):
+        if _is_exact_root(cwd) or ".." in rest.split("/") or _holds_home(joined, cwd):
             return joined
         return tok
     if tok.startswith(("-", "/", "~", "$", _OPAQUE_SUBST)):
         return tok
     joined = cwd.rstrip("/") + "/" + tok
-    if _is_exact_root(cwd) or ".." in tok.split("/") or _holds_home(joined):
+    if _is_exact_root(cwd) or ".." in tok.split("/") or _holds_home(joined, cwd):
         return joined
     return tok
 
 
-def _holds_home(path: str) -> bool:
-    """Whether ``path`` (absolute, maybe a glob) may name the session home or a
-    directory above it, matched component by component: after `cd ~/..`, `x`,
-    `./x/` and `*` are all the home (XERK-1752). A cwd that is not absolute (an
-    unresolved `$d`) holds nothing we can place."""
+def _holds_home(path: str, cwd: str) -> bool:
+    """Whether ``path`` (absolute, maybe a glob) may name the session home, a
+    directory above it, or (from a ``cwd`` above it) a glob over its contents,
+    matched component by component: after `cd ~/..`, `x`, `./x/`, `x/*` and `*`
+    all reach the home (XERK-1752). An unset name reads empty (`x$n` is `x`).
+    A cwd that is not absolute (an unresolved `$d`) holds nothing we can place."""
     home = _session_home()
     if not home or not path.startswith("/"):
         return False
     want = [c for c in posixpath.normpath(home).split("/") if c]
-    have = [c for c in posixpath.normpath(path).split("/") if c]
-    return len(have) <= len(want) and all(
-        fnmatch.fnmatchcase(h, g) for g, h in zip(have, want))
+    above = len([c for c in posixpath.normpath(cwd).split("/") if c]) < len(want)
+    for text in {path, _EXPANSIONS_RE.sub("", path)}:
+        have = [c for c in posixpath.normpath(text).split("/") if c]
+        # Past the home only a glob joins (`x/*` is its contents), and only from
+        # above it: a join is judged as an absolute path, so a named child under
+        # a protected root (/var/…/home/x/build), or `cd ~ && rm -rf .c*`
+        # (`/home/x/.c*`), would refuse an ordinary cleanup.
+        past = have[len(want):]
+        if all(g == h or fnmatch.fnmatchcase(h, g) for g, h in zip(have, want)) and (
+                not past or (above and all(re.search(r"[*?\[]", g) for g in past))):
+            return True
+    return False
 
 
 # Absolute roots whose recursive removal/permission-change destroys the host.
