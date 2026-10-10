@@ -8001,6 +8001,15 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
             _PWD_UNASSIGNED[0] = False
     for reading in _home_tilde_readings(command) if home else ():
         out = out + _expand_both(reading)
+    # Only a target can read a directory spelling, as for the kept default.
+    if (home and _DIR_SPELLING_RE.search(command)
+            and any(_basename(entry[0][0]) in _HOME_TARGET_PROGS for entry in out)):
+        try:
+            readings = _dir_readings(command)
+        except _ExpansionTooLarge:
+            readings, out = [], out + [([_TOO_LARGE], command)]
+        for reading in readings:
+            out = out + _expand_both(reading)
     if _READINGS_MOST[0] > 1 and _READING_PICK[0] is None:
         # Each reading of a multi-reading op spliced plainly, line-wide
         # (XERK-1664): marker-led, `"…; ${a##+(x)}; …"` kept them all in one
@@ -8195,6 +8204,124 @@ def _home_tilde_readings(command: str) -> list[str]:
                 return "".join(pieces)
             readings = [param("${%s}"), param("$%s")]
     return [r for r in dict.fromkeys(readings) if r != command]
+
+
+# Other spellings of a directory the line visited (XERK-1755): a `${PWD<op>…}`
+# or `${OLDPWD<op>…}` op, a `DIRSTACK` element, a `dirs`/`pwd` output, and a
+# zsh named directory (`hash -d e=/; … ~e`, or `~e` naming a parameter holding
+# an absolute path).
+_DIR_SPELLING_RE = re.compile(r"\$\{(?:OLD)?PWD[^\w}]|DIRSTACK|\b(?:dirs|pwd)\b|~[A-Za-z_]")
+_DIR_PARAM_RE = re.compile(r"\$\{(OLDPWD|PWD|DIRSTACK)")
+_DIRSTACK_BARE_RE = re.compile(r"\$DIRSTACK(?!\w)")
+# A substitution (or `<(…)`) running `dirs`/`pwd`, its name quoted, escaped,
+# behind `builtin`/`command`/`eval`, or a `$name` the line sets to one. Its
+# arguments are bounded: unbounded, a run of unclosed `$(pwd ` was quadratic.
+_DIRS_SUBST_RE = re.compile(r"(\$\(|`|<\()\s*(?:(?:builtin|command|eval)\s+)?"
+                            r"(\$\{?\w+\}?|[\w'\"\\]+)(?=[\s;&|)`]|$)[^()`]{0,256}?([)`])")
+_DIRS_VALUE_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)=['\"]?(?:dirs|pwd)['\"]?(?![\w-])")
+_NAME_ASSIGN_RE = re.compile(r"(?<![\w$])([A-Za-z_]\w*)=")
+_NAMED_DIR_RE = re.compile(r"(?:(?<=^)|(?<=[\s;&|()<>=:{,`]))~([A-Za-z_]\w*)"
+                           r"(?=[/\s;&|()<>:},`'\"]|$)")
+
+
+# How many nested `${PWD:+…}` words `_dir_spelled` rewrites in one pass.
+_MAX_DIR_NEST = 8
+
+
+def _dir_spelled(text: str, cwd: str | None, evaluated: list[bool], depth: int = 0) -> str:
+    """``text`` with each `${PWD…}`/`${OLDPWD…}` op and `${DIRSTACK…}` read
+    as the directory (see `_dir_readings`). A trim, replace, offset or case
+    op is applied to ``cwd`` (left as written when None); ``evaluated`` notes
+    that one was seen. An unclosed `${` is skipped: read to the line's end,
+    each later splice re-copied the line (quadratic, QA). Past
+    `_MAX_DIR_NEST` nested `:+` words the line is too large: each level is a
+    `_brace_end` over the rest (quadratic, then past Python's stack), and
+    leaving the rest for the re-read reading only peels it a level at a time."""
+    pieces, last = [], 0
+    for m in _DIR_PARAM_RE.finditer(text):
+        if m.start() < last:
+            continue
+        end = _brace_end(text, m.start(), False)
+        if end < 0:
+            continue
+        name, inner = m.group(1), text[m.end():end]
+        if name == "DIRSTACK":
+            if inner and inner[0] not in "[}:#%/^,@-":
+                continue
+            rep = "${PWD}"
+        else:
+            if not inner or inner[0] == "?" or inner[:2] == ":?" or inner[0].isalnum() or inner[0] == "_":
+                continue  # `${PWD}`, `${PWD:?}` (`_PWD_LEAD_RE`), another name
+            op = _VAR_OP_RE.match(inner)
+            if inner[0] == "[" or op and op.group(1) in _VAR_DEFAULT_OPS:
+                rep = "${%s}" % name  # set, so the default is unused; element 0
+            elif op and op.group(1) in (":+", "+"):
+                if depth >= _MAX_DIR_NEST:
+                    raise _ExpansionTooLarge
+                rep = _dir_spelled(op.group(2), cwd, evaluated, depth + 1)  # set: the word
+            elif not op and inner not in _CASE_OPS:
+                continue  # a quoting transform (`@Q`): no path
+            else:
+                evaluated[0] = True
+                if cwd is None or op and re.search(r"[$`]", op.group(2)):
+                    continue
+                rep = (_CASE_OPS[inner](cwd) if not op
+                       else _apply_var_op(cwd, op.group(1), op.group(2)))
+                if rep.startswith(_UNREAD_OUTPUT):
+                    continue
+                rep = shlex.quote(rep) if rep else "''"
+        pieces += (text[last:m.start()], rep)
+        last = end + 1
+    pieces.append(text[last:])
+    return "".join(pieces)
+
+
+def _dir_readings(command: str) -> list[str]:
+    """``command`` with each other spelling of a visited directory read as
+    `$PWD`/`$OLDPWD`, which `_under_cwd` judges (XERK-1755); none if that
+    changes nothing.
+
+    PWD is always set, and OLDPWD once a `cd` ran, so a default keeps the
+    value and an alternative is its word: the values pass splices `${PWD-x}`
+    as `x` and `${OLDPWD:+$OLDPWD}` as empty. Any other op (`${PWD%/*}`) is
+    applied to each directory the line `cd`s to, a reading each. A
+    `DIRSTACK` element and a `dirs`/`pwd` output are a directory the line
+    `cd`/`pushd`ed to, read as `$PWD` (`_under_cwd` reads it as any of them).
+    zsh expands `~e` to a `hash -d` entry or a parameter's value (`~PWD`
+    too): `~e` of a name the line assigns (`hash -d e=/` too) reads as
+    `${e}` (in bash it stays literal: over-read). Quote-blind, like the tilde
+    reading: it only adds a reading."""
+    if not _DIR_SPELLING_RE.search(command):
+        return []
+    evaluated = [False]
+    texts = [_dir_spelled(command, None, evaluated)]
+    if evaluated[0]:
+        texts += [_dir_spelled(command, cwd, [False])
+                  for cwd in _cd_targets(command, ()) if cwd.startswith("/")]
+    dir_names = set(_DIRS_VALUE_RE.findall(command))
+
+    def subst(m: "re.Match[str]") -> str:
+        if (m.group(1) == "`") != (m.group(3) == "`"):
+            return m.group(0)
+        word = m.group(2)
+        if word.startswith("$"):
+            ok = word.strip("${}") in dir_names
+        else:
+            ok = re.sub(r"['\"\\]", "", word) in ("dirs", "pwd")
+        if not ok:
+            return m.group(0)
+        return "<(echo $PWD)" if m.group(1) == "<(" else "$PWD"
+
+    out = []
+    for text in texts:
+        text = _DIRSTACK_BARE_RE.sub("$PWD", text)
+        text = _DIRS_SUBST_RE.sub(subst, text)
+        if "~" in text:
+            names = set(_NAME_ASSIGN_RE.findall(text)) | {"PWD", "OLDPWD"}
+            text = _NAMED_DIR_RE.sub(
+                lambda n: "${%s}" % n.group(1) if n.group(1) in names else n.group(0), text)
+        out.append(text)
+    return [r for r in dict.fromkeys(out) if r != command]
 
 
 # How many characters of line the per-word `for` readings may re-read in one
