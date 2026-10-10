@@ -901,6 +901,8 @@ def _printed_from_tokens(toks: list[str]) -> str | None:
         # yes drops a leading `--` (XERK-1717). Read as one line of them.
         args = toks[2:] if toks[1:2] == ["--"] else toks[1:]
         return " ".join(args) if args else "y"
+    if prog in _PATH_PRINTERS:
+        return _path_printed(prog, toks[1:])
     if prog in _ECHO_PROGS:
         args, flags = toks[1:], ""
         while args and re.match(r"^-[neE]+$", args[0]):
@@ -908,6 +910,42 @@ def _printed_from_tokens(toks: list[str]) -> str | None:
         text = " ".join(args)
         return _printf_unescape(text).split(_PRINTF_STOP, 1)[0] if "e" in flags else text
     return None
+
+
+# Programs printing a path computed from their operands (XERK-1768):
+# `cd "$(dirname "$HOME")"` is the home's parent.
+_PATH_PRINTERS = {"dirname", "realpath", "readlink"}
+
+
+def _path_printed(prog: str, args: list[str]) -> str | None:
+    """What `dirname`/`realpath`/`readlink -f` print for literal operands, a
+    leading `~`/`$HOME` read as the session home; None when that is unknowable
+    (a name, a relative path to resolve, an option not modelled). Symlinks are
+    not followed: `realpath ~/..` is read as the home's parent."""
+    opts = {"dirname": {"--"}, "realpath": {"-s", "-m", "-e", "-q", "-L", "-P", "--"},
+            "readlink": {"-f", "-e", "-m", "-n", "-q", "-s", "-v", "--"}}[prog]
+    ops = [a for a in args if not a.startswith("-") or a == "-"]
+    flags = [a for a in args if a not in ops]
+    if not ops or any(f not in opts for f in flags) or (
+            prog == "readlink" and not {"-f", "-e", "-m"} & set(flags)):
+        return None
+    out = []
+    for op in ops:
+        home_op = op.startswith(("$HOME", "${HOME}", "~"))
+        path = _cwd_abs(op) if home_op else op
+        if path is None or re.search(r"[$`]", path) or _OPAQUE_SUBST in path:
+            return None
+        if prog == "dirname":
+            path = path.rstrip("/") or "/"
+            path = (posixpath.dirname(path).rstrip("/") or "/") if "/" in path else "."
+        elif path.startswith("/"):
+            path = posixpath.normpath(re.sub(r"/{2,}", "/", path))
+        else:
+            return None
+        # Inside the home it stays `$HOME…`, as the home rules judge it:
+        # `$(dirname ~/proj/x)` is `~/proj`, not a child of /root.
+        out.append(_cwd_reading(path) if home_op else path)
+    return " ".join(out)
 
 
 # How deep `_subst_text` resolves substitutions nested in a body. Deeper
@@ -10206,6 +10244,7 @@ def _expand_segments(command: str, depth: int = 0,
     """`_expand`, reporting a spent growth budget as `_TOO_LARGE`."""
     if depth:
         return _expand(command, depth, cwds)
+    cwds = cwds or _SESSION_CWD[0]
     return list(_budgeted(_memo)("expand", (command, cwds), _expand_top, command, cwds))
 
 
@@ -10365,6 +10404,8 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # substitution pass skips the same body at the same cwds: both reach every
     # outermost `$(…)`, and expanding it twice per level was 2^depth work.
     expanded: set[tuple[str, tuple[str, ...]]] = set()
+    heads: list[tuple[str, tuple[str, ...], dict[str, dict[str, list[str]]]]] = []
+    walked = [0]
     for body in bodies:
         if _ARITH_BODY_RE.match(body):
             continue
@@ -10379,7 +10420,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
         if every_cd != cwds:
             # The `cd`s written before the group are the ones it runs after.
             head = raw_commands[:max(raw_commands.find(body), 0)]
-            before = _cd_readings(_prenormalise(head), cwds)
+            walked[0] += len(head)
+            # Each head is split whole; past the cap a group is read from
+            # every cwd the line names, which over-reads but never under-reads.
+            before = (_cd_walk(_prenormalise(head), cwds, raw_vals, heads)
+                      if walked[0] <= _MAX_CD_WALK else every_cd)
         body = _substitute_vars(body, raw_vals)
         expanded.add((body, before))
         out.extend(_expand_segments(body, depth + 1, before))
@@ -10737,9 +10782,10 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # `cp f g; sh g`): fails closed, every written file read (XERK-1674).
     unresolved: dict[tuple[str, ...], None] = {}
     sources = False
+    walk: dict[str, dict[str, list[str]]] | None = {} if every_cd != cwds else None
     for raw in segments:
-        if every_cd != cwds:
-            cwds = _cd_readings(raw, cwds, raw_vals)
+        if walk is not None:
+            cwds = _cd_readings(raw, cwds, raw_vals, walk)
         # Function headers closed up (`f ( ) {` → `f() {`), as one more ADDED
         # reading: in place, an extglob `@()`, or a `()` the guard itself
         # splices in from a printed `` `echo '()'` ``, read as a header and hid
@@ -11227,6 +11273,9 @@ def _cd_split_redirects(raw: str) -> str:
             last = start = i
     return "".join(out) + raw[last:]
 _MAX_CWDS = 8
+# Characters of group heads `_cd_walk` splits per line before the rest fall
+# back to every cwd the line names: 240 `(cd p && make)` cost 7s (XERK-1768 QA).
+_MAX_CD_WALK = 200_000
 _HOME_USER_RE = re.compile(r"^~[a-z0-9_][a-z0-9_.-]*$")
 # A construct that can run earlier text again after a later `cd`. Matched
 # loosely — in quotes, comments and heredocs too — since a miss fails open.
@@ -11288,34 +11337,89 @@ def _cd_spelled_readings(text: str) -> list[str]:
 
 
 def _cd_readings(text: str, inherited: tuple[str, ...],
-                 line_vals: dict[str, list[str]] | None = None) -> tuple[str, ...]:
+                 line_vals: dict[str, list[str]] | None = None,
+                 walk: dict[str, dict[str, list[str]]] | None = None) -> tuple[str, ...]:
     """`_cd_targets` of ``text`` with its substitutions read both as several
     statements and as before XERK-1609 (see `_body_printed`): `cd "$(echo / |
-    grep /)"` names `/` only in the second."""
-    found = _cd_targets(_sub_substs(text, _subst_text), inherited, line_vals)
+    grep /)"` names `/` only in the second. ``walk`` carries each reading's
+    anchors and latest cwds from one segment of a line to the next."""
+    found = _cd_targets(_sub_substs(text, _subst_text), inherited, line_vals,
+                        None if walk is None else walk.setdefault("multi", {}))
     base = _cd_targets(_sub_substs(text, lambda m: _subst_text(m, multi=False)), inherited,
-                       line_vals)
+                       line_vals, None if walk is None else walk.setdefault("single", {}))
     return found + tuple(c for c in base if c not in found)
 
 
+def _cd_walk(text: str, inherited: tuple[str, ...], line_vals: dict[str, list[str]],
+             done: list[tuple[str, tuple[str, ...], dict[str, dict[str, list[str]]]]]
+             ) -> tuple[str, ...]:
+    """The cwds after ``text``'s `cd`s, walked per segment as the line's own
+    loop walks them. ``done`` keeps the last walk, so a later group's head
+    resumes from the segments it shares with an earlier one: rereading every
+    head was quadratic, 30s for 240 `(cd p && make)` (XERK-1768 QA)."""
+    segs = _split_segments(text)
+    n = 0
+    while n < len(done) and n < len(segs) and done[n][0] == segs[n]:
+        n += 1
+    del done[n:]
+    cwds, walk = (done[-1][1], done[-1][2]) if done else (inherited, {})
+    for seg in segs[n:]:
+        walk = {k: dict(v) for k, v in walk.items()}
+        cwds = _cd_readings(seg, cwds, line_vals, walk)
+        done.append((seg, cwds, walk))
+    return cwds
+
+
 def _cd_targets(text: str, inherited: tuple[str, ...],
-                line_vals: dict[str, list[str]] | None = None) -> tuple[str, ...]:
+                line_vals: dict[str, list[str]] | None = None,
+                state: dict[str, list[str]] | None = None) -> tuple[str, ...]:
     """``inherited`` plus each absolute or home directory a `cd` in ``text``
     names; ``line_vals`` adds what the whole line assigns when ``text`` is one
-    segment of it. A relative or unknowable one (`cd -`, `cd $OLDPWD`) adds nothing:
-    the directories already listed stay listed whatever it does."""
-    found = _cd_targets_in(text, inherited, line_vals)
+    segment of it. A relative one is joined to the anchors (``inherited`` and
+    each absolute or home `cd`) and to where the last relative one left the line
+    (`cd ~ && cd ..`, XERK-1768); an unknowable one (`cd $d`, `cd $OLDPWD`) adds
+    nothing: the directories already listed stay listed whatever it does.
+    ``state`` holds the anchors and latest cwds of the line's earlier segments.
+    A `cd` word spelled with quotes or escapes (`c\\d`) is read too (XERK-1769)."""
+    found = _cd_targets_in(text, inherited, line_vals, state)
     for reading in _cd_spelled_readings(text):
-        found = _cd_targets_in(reading, found, line_vals)
+        # Its own walk: carried, the same relative `cd` would move the line twice.
+        found = _cd_targets_in(reading, found, line_vals, None)
     return found
 
 
 def _cd_targets_in(text: str, inherited: tuple[str, ...],
-                   line_vals: dict[str, list[str]] | None) -> tuple[str, ...]:
+                   line_vals: dict[str, list[str]] | None,
+                   state: dict[str, list[str]] | None) -> tuple[str, ...]:
     if "cd" not in text and "pushd" not in text:
         return inherited
     found = list(inherited)
+    # Joined to every listed cwd, the list doubled per relative `cd`: the cap
+    # dropped a later `cd ../../..`, and across segments it grew to minutes.
+    # Joined to the last `cd` only, one that did not persist (`(cd x)`, `popd`,
+    # `||`) hid the cwd it left (XERK-1768 QA). Anchors + latest grow linearly,
+    # and only while they pass between segments in ``state``: joined to every
+    # inherited cwd, four `(cd sN)` segments built 2^N cwds and the trim
+    # dropped the real one (XERK-1768 QA).
+    home = _session_home()
+    home_norm = home and posixpath.normpath(re.sub(r"/{2,}", "/", home))
+    # ``stops``: where each relative `cd` left the line had every earlier one
+    # persisted, so a later one that did not (`cd .. && (cd s) && cd ..`) is
+    # joined from there too. Stops and anchors keep those nearest danger.
+    if state:
+        anchors, latest = list(state["anchors"]), list(state["latest"])
+        stops = list(state["stops"])
+    else:
+        anchors, latest, stops = list(inherited), list(inherited), []
     for m in itertools.chain(_CD_RE.finditer(text), _CD_QUOTED_RE.finditer(text)):
+        # Every danger group is kept, and `.git` positions multiply them: a
+        # crafted line of 2400 decoys ran 311s for a caller with no hook
+        # deadline (XERK-1768 QA). Out of time, the decision fails closed.
+        if _budget is not None and time.monotonic() > _budget["until"]:
+            _budget["left"] = -1
+            raise _ExpansionTooLarge
+        moved: list[str] = []
+        bases = list(dict.fromkeys(latest + anchors + stops))
         raw = _cd_split_redirects(m.group(2))
         try:
             args = shlex.split(raw)
@@ -11368,47 +11472,194 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
                             for cdpath in vals.get("CDPATH", ()) for entry in cdpath.split(":")
                             if entry.startswith("/")]
         targets += uncut
+        relative = op is not None and not op.startswith(("/", "~", "-")) \
+            and not _CD_UNPLACEABLE_RE.search(op)
+        if relative:
+            # A relative name moves from wherever the line already is (XERK-1768):
+            # `cd ~ && cd .. && rm -rf x` removes the home.
+            for base in bases:
+                start = base if base.startswith("/") else _cwd_abs_in(base, home)
+                if start is not None:
+                    targets.append(_cwd_reading_in(posixpath.normpath(start + "/" + op),
+                                                   home))
         for target in targets:
-            target = _norm_path(target)
+            target = _norm_cd(target)
             # The session home spelled absolutely is `~`: joined as `$HOME/x`,
             # the home rules judge it, so `cd /home/me && rm -rf build` stays
             # allowed while `*` is refused (XERK-1757).
-            home = _session_home()
-            if home and target.rstrip("/") and target.rstrip("/") == (
-                    posixpath.normpath(re.sub(r"/{2,}", "/", home))):
+            if home_norm and target.rstrip("/") and target.rstrip("/") == home_norm:
                 target = "$HOME"
             # `~me/`, `~me/.` and `~me//` are `~me`: `_norm_path` leaves a
             # tilde form unfolded, and unfolded it matched no home token.
             if target.startswith("~"):
                 target = posixpath.normpath(re.sub(r"/{2,}", "/", target))
             low = target.lower()
-            if (low.startswith("/") or low.rstrip("/") in _HOME_TOKENS
+            # `$HOME/…` is how `_home_readings` keeps one inside the home (`cd ~/proj`).
+            if (low.startswith(("/", "$home/")) or low.rstrip("/") in _HOME_TOKENS
                     or _HOME_USER_RE.match(low)):
                 target = target.rstrip("/") or "/"
+                if target not in moved:
+                    moved.append(target)
                 if target in found:
-                    continue
-                # Past the cap an exact root still counts as itself (`cd ~;
-                # rm -rf .ssh`) and any other directory as `/`, where every
-                # relative operand is joined: dropped, `cd /d0; … cd /d7; cd /;
-                # rm -rf *` was allowed (XERK-1769 QA). Past twice the cap the
-                # decision is refused as too large: dropping one more let
-                # seven `cd ~uN` hide a `cd /etc`.
-                if len(found) >= _MAX_CWDS:
-                    if not _is_exact_root(target):
-                        target = "/"
-                    if target in found:
-                        continue
-                    if len(found) >= 2 * _MAX_CWDS:
-                        if _budget is not None:
-                            _budget["capped"] = True
-                        return tuple(found)
+                    found.remove(target)
                 found.append(target)
-    return tuple(found)
+        if not moved:
+            continue
+        if not relative:
+            anchors = _cd_nearest(list(dict.fromkeys(anchors + moved)), home)
+        elif moved[0] not in stops:
+            stops = _cd_nearest(stops + [moved[0]], home, deep=False)
+        latest = moved[:_MAX_CWDS]
+        if len(found) > 8 * _MAX_CWDS:
+            # Each `cd` scans the list: untrimmed, 480 of them took 0.8s.
+            found = _cd_trimmed(found, anchors + stops, latest, home)
+    if state is not None:
+        state["anchors"], state["latest"], state["stops"] = anchors, latest, stops
+    return tuple(_cd_trimmed(found, anchors + stops, latest, home))
+
+
+def _cd_nearest(cwds: list[str], home: str | None, deep: bool = True) -> list[str]:
+    """``cwds`` thinned to one per danger group (`_cd_reach`), the newest, in
+    order. Two cwds `..` climbs below the same home or fixed system root land in
+    the same places on every climb that reaches it, so neither hides the other;
+    every such group is kept. Capping by recency, depth or distance let 17
+    decoys near another root or under the home evict the real cwd, and `rm -rf
+    .ssh` / `rm -rf data` ran there (XERK-1768 QA). Only unplaceable cwds
+    (`~bob`, read as dangerous wherever they lead) keep the 16 nearest, and with
+    ``deep`` off, stops past `_MAX_STOP_CLIMBS` with no `.git` on their climb."""
+    if len(cwds) <= 2 * _MAX_CWDS:
+        return cwds
+    groups: dict[tuple[str, int, tuple[int, ...]], int] = {}
+    rest: list[int] = []
+    for i, cwd in enumerate(cwds):
+        group = _cd_reach(cwd, home)
+        if group is None or not deep and group[1] > _MAX_STOP_CLIMBS and not group[2]:
+            rest.append(i)
+        else:
+            groups[group] = i
+    rest.sort(key=lambda i: (_cd_climbs(cwds[i], home), -i))
+    keep = set(groups.values()) | set(rest[:2 * _MAX_CWDS])
+    return [t for i, t in enumerate(cwds) if i in keep]
+
+
+# Climbs a STOP is grouped to unless a `.git` is on its climb: every `(cd p &&
+# cd q)` deepens the line's path, so 240 of them made 480 groups (34s).
+_MAX_STOP_CLIMBS = 8
+
+
+@functools.lru_cache(maxsize=4096)
+def _cd_reach(cwd: str, home: str | None) -> tuple[str, int, tuple[int, ...]] | None:
+    """(danger, climbs, gits): how many `..` take ``cwd`` to the session home
+    ("~") or the nearest exact root, and which of them land on a `.git`. A cwd
+    that holds the home is a group of its own; None only for an unplaceable
+    one. No depth cap: a capped `.git/hooks` 9 deep fell to the capped rest and
+    20 decoys evicted it (XERK-1768 QA); a flood fails on the deadline instead."""
+    path = cwd if cwd.startswith("/") else _cwd_abs_in(cwd, home)
+    if path is None:
+        return None
+    path = posixpath.normpath(path)
+    # Which climbs land on a `.git`: a partial `..` from `/tmp/r/.git/hooks`
+    # lands on the repo's `.git`, from `/mnt/d/e/f` on nothing (QA).
+    # Lower-cased as the danger test is: `.GIT` is the repo on a case-blind disk.
+    gits = tuple(i for i, part in enumerate(reversed(path.split("/")))
+                 if part.lower() == ".git")
+    norm = home and posixpath.normpath(re.sub(r"/{2,}", "/", home))
+    if norm and norm != "/":
+        if path == norm or norm.startswith(path.rstrip("/") + "/"):
+            return (path, 0, ())
+        if path.startswith(norm + "/"):
+            climbs = path[len(norm):].count("/")
+            return ("~", climbs, gits)
+    climbs = 0
+    while path != "/" and not _is_exact_root(path):
+        path, climbs = posixpath.dirname(path), climbs + 1
+    return (path, climbs, gits)
+
+
+def _cd_climbs(cwd: str, home: str | None) -> int:
+    path = cwd if cwd.startswith("/") else _cwd_abs_in(cwd, home)
+    return posixpath.normpath(path).count("/") if path else 0
+
+
+def _cd_trimmed(found: list[str], anchors: list[str], latest: list[str],
+                home: str | None) -> list[str]:
+    """``found`` past the cap less its oldest cwds: never one a relative operand
+    joins from (an anchor, the latest, the home, a directory holding it, an
+    exact root), nor the newest. Dropping a later `cd` let a long chain or
+    decoys hide `cd ../..`, and dropping an anchor hid `rm -rf ..` (XERK-1768 QA)."""
+    if len(found) <= _MAX_CWDS:
+        return found
+    keep = set([t for t in found if _cwd_holds_home_in(t, home)][-2 * _MAX_CWDS:])
+    keep.update(anchors, latest)
+    keep.update([t for t in found if t not in keep][-_MAX_CWDS:])
+    return [t for t in found if t in keep]
 
 
 # A person's home spelled absolutely (`/home/me`, `/Users/me`): a cwd there is
 # an exact root, as `~` and `/root` are (XERK-1757).
 _PERSON_HOME_RE = re.compile(r"^/(?:home|users)/[^/]+$")
+
+
+# A `cd` operand whose directory the line cannot place: a name, a substitution.
+_CD_UNPLACEABLE_RE = re.compile(r"[$`]|" + re.escape(_OPAQUE_SUBST))
+
+
+def _cwd_abs(cwd: str) -> str | None:
+    """A cwd reading as an absolute path, the session home put in for a home
+    one (`~`, `$HOME/proj`); None for one that cannot be placed (`~bob`)."""
+    if cwd.startswith("/"):
+        return cwd
+    return _cwd_abs_in(cwd, _session_home())
+
+
+# Pure on (cwd, home), and asked of every listed cwd at every `cd`: uncached,
+# 240 `(cd p && make)` spent seconds re-deriving the same few (XERK-1768 QA).
+@functools.lru_cache(maxsize=4096)
+def _cwd_abs_in(cwd: str, home: str | None) -> str | None:
+    if home is None:
+        return None
+    for tok in ("$HOME", "${HOME}", "~"):
+        if cwd == tok or cwd.startswith(tok + "/"):
+            return posixpath.normpath(home + "/" + cwd[len(tok):])
+    return None
+
+
+def _cwd_reading(path: str) -> str:
+    """An absolute directory as a cwd reading: inside the session home it is
+    `$HOME…`, as `_home_one_reading` keeps one, so `..` from `~/proj` is judged
+    as the home and `build` there never as a child of the /root system root."""
+    return _cwd_reading_in(path, _session_home())
+
+
+@functools.lru_cache(maxsize=4096)
+def _cwd_reading_in(path: str, home: str | None) -> str:
+    if home is not None:
+        norm = posixpath.normpath(re.sub(r"/{2,}", "/", home))
+        if norm != "/" and (path == norm or path.startswith(norm + "/")):
+            return "$HOME" + path[len(norm):]
+    return path
+
+
+def _cwd_holds_home(cwd: str) -> bool:
+    """Whether every relative operand may join from ``cwd``: an exact root, the
+    session home, or a directory holding it (`_under_cwd`)."""
+    return _cwd_holds_home_in(cwd, _session_home())
+
+
+@functools.lru_cache(maxsize=4096)
+def _cwd_holds_home_in(cwd: str, home: str | None) -> bool:
+    if _is_exact_root(cwd):
+        return True
+    path = _cwd_abs_in(cwd, home) if not cwd.startswith("/") else cwd
+    if path is None or home is None:
+        return False
+    norm = posixpath.normpath(re.sub(r"/{2,}", "/", home))
+    return path == norm or norm.startswith(path.rstrip("/") + "/")
+
+
+# The hook event's cwd, as the cwd reading a line starts from (XERK-1768):
+# `rm -rf x` run from the home's parent removes the home. Set by `is_destructive`.
+_SESSION_CWD: list[tuple[str, ...]] = [()]
 
 
 def _is_exact_root(path: str) -> bool:
@@ -11523,6 +11774,11 @@ def _norm_path(tok: str) -> str:
         t = posixpath.normpath(t) + ("/" if t.endswith("/") and t != "/" else "")
     # Windows drive root (C:\ , C:/ , c:) and Windows system dirs.
     return t
+
+
+# `_norm_path` for `_cd_targets`, which re-normalises every listed cwd joined
+# at every relative `cd` (XERK-1768 QA).
+_norm_cd = functools.lru_cache(maxsize=4096)(_norm_path)
 
 
 def _shell_fnmatch(name: str, pattern: str) -> bool:
@@ -13544,8 +13800,27 @@ _LITERAL_COMMIT_RE = re.compile(
 
 
 @_budgeted
-def is_destructive(command: str) -> str | None:
-    """Return a human reason if ``command`` is catastrophic, else ``None``."""
+def _session_cwds(cwd: str | None) -> tuple[str, ...]:
+    """The hook event's cwd as the cwd readings a line starts from."""
+    if isinstance(cwd, str) and cwd.startswith("/") and len(cwd) <= 4096:
+        return (_cwd_reading(posixpath.normpath(re.sub(r"/{2,}", "/", cwd))),)
+    return ()
+
+
+@_budgeted
+def is_destructive(command: str, cwd: str | None = None) -> str | None:
+    """Return a human reason if ``command`` is catastrophic, else ``None``.
+    ``cwd`` is the directory it runs in (the hook event's), when known."""
+    if cwd is None:
+        return _is_destructive(command)
+    _SESSION_CWD[0] = _session_cwds(cwd)
+    try:
+        return _is_destructive(command)
+    finally:
+        _SESSION_CWD[0] = ()
+
+
+def _is_destructive(command: str) -> str | None:
     if _LITERAL_COMMIT_RE.fullmatch(command):
         return None
     # Fork bombs contain the `;`/`|` we segment on, so match the whole string.
@@ -13659,7 +13934,18 @@ def decide(
     if not isinstance(command, str) or not command.strip():
         return ("allow", None, None)
 
-    reason = is_destructive(command)
+    # Seeded for the whole decision: every check's `_expand_both` then shares
+    # one memoised expansion (seeded for one, the policy checks re-read the line).
+    _SESSION_CWD[0] = _session_cwds(cwd)
+    try:
+        return _decide_bash(command, overrides, no_attribution, pr_summary, cwd)
+    finally:
+        _SESSION_CWD[0] = ()
+
+
+def _decide_bash(command: str, overrides: list[str], no_attribution: bool, pr_summary: bool,
+                 cwd: str | None) -> tuple[str, str | None, str | None]:
+    reason = _is_destructive(command)
     # A line too large to read is never grantable: a spent budget, or a cap
     # on readings (`_expand_picks`). Past a cap the policy checks below see
     # none of the per-value readings, so a grant let `x=ls; <17 x=…>;

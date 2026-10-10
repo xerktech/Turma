@@ -37,10 +37,8 @@ paths:
   separator-anchored regex with a backtracking `+` was quadratic: 32 KB of `\ ` took 70s in the
   hook, past its timeout, which lets the command run. Re-time any change to it on long runs of
   `\ `, `\;`, unclosed quotes, `$(`, `${`.
-- Past `_MAX_CWDS` (8) an exact root (`_is_exact_root`: `/`, homes, system roots) still counts
-  as itself and any other target as `/` (fail closed). Dropped, `cd /d0; … cd /d7; cd /;
-  rm -rf *` was allowed; read only as `/`, `cd ~; rm -rf .ssh` was. Cost: past the cap,
-  `rm -rf *` from anywhere is refused.
-  - Past twice the cap the decision is refused as too large (`_budget["capped"]`): dropping
-    one more let seven `cd ~uN` hide a later `cd /etc`.
+- Past `_MAX_CWDS` the cwd list is trimmed by `_cd_trimmed`/`_cd_nearest`, never by
+  recency: exact roots, the home and its holders, and one cwd per danger group are always
+  kept (`guard-home.md`, XERK-1768). Dropped by recency, `cd /d0; … cd /d7; cd /; rm -rf *`
+  was allowed, and seven `cd ~uN` hid a later `cd /etc` (XERK-1769 QA).
 - Tests: `test_a_cd_spelled_with_quotes_or_escapes_is_a_cd`.
