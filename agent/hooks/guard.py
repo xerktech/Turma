@@ -1812,7 +1812,7 @@ def _memo(kind: str, key, fn, *args):
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
            _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0],
            _FOR_PICK[0], _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0], _PRINTED_DROP[0],
-           _READING_PICK[0])
+           _READING_PICK[0], _PWD_UNASSIGNED[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -3575,6 +3575,13 @@ def _assigned_values(command: str, depth: int = 0,
     # level re-inlined it, the text grew each time, and an ordinary command
     # was refused as nested too deeply. An unresolvable one is empty, as bash
     # reads an unset name.
+    if _PWD_UNASSIGNED[0]:
+        # `cd` rewrites both, so the line's own assignment is not where a
+        # later `$PWD` points: read as written, `_under_cwd` judges them
+        # against every directory the line visited (XERK-1753).
+        for table in (vals, applied, where, applied_where):
+            for name in _CD_NAMES:
+                table.pop(name, None)
     plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
     own = {k: len(vs) for k, vs in vals.items()}
     # An applied default is one more value of its name, and resolves OTHER
@@ -5186,7 +5193,7 @@ def _reading() -> tuple:
     memoised under one reading was replayed under another (XERK-1621)."""
     return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUE_PICK[0],
             _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0], _PRINTED_DROP[0],
-            _READING_PICK[0])
+            _READING_PICK[0], _PWD_UNASSIGNED[0])
 
 
 # Names a `for NAME in …` sets this decision. Its words are joined as the
@@ -5247,6 +5254,16 @@ _MAIN_PARSE_SEEN = [False]
 # HOME is set where an agent runs, but `local HOME`, `read HOME` or `exec -c`
 # can unset it, so the default spliced is kept as a reading of its own.
 _HOME_KEPT = [False]
+# Set while `_expand_both` reads PWD/OLDPWD as unassigned on a line that also
+# moves (XERK-1753): `cd` rewrites both, so `PWD=/x; cd /etc; rm -rf $PWD`
+# removes /etc, which only the unspliced `$PWD` (`_under_cwd`) reads. The
+# assigned reading stays: `cd -` goes to the OLDPWD the line set.
+_PWD_UNASSIGNED = [False]
+_CD_NAMES = ("PWD", "OLDPWD")
+_MOVES_RE = re.compile(r"cd|pushd|popd")
+# PWD/OLDPWD named other than as a use (`PWD=`, `read PWD`, `for PWD in`):
+# textual, as the values themselves may spend the budget outside `_expand`.
+_PWD_NAMED_RE = re.compile(r"(?<![\w${!])(?:OLD)?PWD(?!\w)")
 # Set while `_expand_both` reads the line with each multi-reading expansion
 # spliced as its Nth reading (`_splice_readings`); and the most readings one
 # expansion of this decision had (XERK-1664).
@@ -7651,6 +7668,13 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
             out = out + _expand_readings(command)
         finally:
             _HOME_KEPT[0] = False
+    if (not _PWD_UNASSIGNED[0] and "PWD" in command and _MOVES_RE.search(command)
+            and _PWD_NAMED_RE.search(command)):
+        _PWD_UNASSIGNED[0] = True
+        try:
+            out = out + _expand_readings(command)
+        finally:
+            _PWD_UNASSIGNED[0] = False
     for reading in _home_tilde_readings(command) if home else ():
         out = out + _expand_both(reading)
     if _READINGS_MOST[0] > 1 and _READING_PICK[0] is None:
