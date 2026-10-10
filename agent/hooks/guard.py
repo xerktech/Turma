@@ -1858,7 +1858,7 @@ _BRACE_SEQ_MAX = 64
 # and how far a line may grow, before it refuses the line as too large rather
 # than leave a list unread.
 _BRACE_PASSES_MAX = 64
-_BRACE_GROWTH, _BRACE_GROWTH_FLOOR = 4, 4096
+_BRACE_GROWTH, _BRACE_GROWTH_FLOOR = 4, 1 << 14
 _BRACE_WORD_END = frozenset(" \t\n;&|<>()")
 _BRACE_WORD_END_RE = re.compile(r"[ \t\n;&|<>()]")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
@@ -3080,7 +3080,7 @@ def _expand_braces(command: str) -> str:
         if not lists:
             break
         passes += 1
-        out, last = [], 0
+        out, last, size = [], 0, len(command)
         for start, end, items in sorted(lists):
             if start < last:
                 continue  # another list of a word this pass expands
@@ -3114,6 +3114,9 @@ def _expand_braces(command: str) -> str:
             if suffix.endswith("\\") and _drop_trailing_escape(command[:word_end]) is not None:
                 parts = [w[:-1] for w in parts if w[:-1]]
             out.append(command[last:word_start] + " ".join(parts))
+            size += len(out[-1]) - (word_end - last)
+            if size > grown:
+                raise _ExpansionTooLarge
             last = max(word_end, end)
         out.append(command[last:])
         command = "".join(out)
@@ -9869,6 +9872,10 @@ def _expand_top(command: str, cwds: tuple[str, ...]) -> list[tuple[list[str], st
     try:
         return _expand(command, 0, cwds)
     except _ExpansionTooLarge:
+        # Never grantable, as a spent budget is not: the policy checks after a
+        # grant see only this token, so ten brace lists padding a granted line
+        # hid a `gh pr merge` on it (XERK-1756 QA).
+        _budget["capped"] = True
         return [([_TOO_LARGE], command)]
 
 

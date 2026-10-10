@@ -4975,6 +4975,14 @@ class TestExpansionBudget(unittest.TestCase):
                             ("kill $(pgrep tmux)\n", "kill*")):
             got = guard.decide("Bash", {"command": head + pad}, overrides=[grant])
             self.assertEqual(got[:1] + got[2:], ("deny", "policy"), head)
+        # A brace product past its growth budget is the same verdict (XERK-1756
+        # QA): ten lists in one word hid the merge behind a granted reason.
+        braces = "echo " + "{a,b}" * 16 + "; "
+        for head, grant in (("psql -d app <<EOF\nDROP TABLE t;\nEOF\n", "psql*"),
+                            (":(){ :|:& };:\n", ":*")):
+            for tail in ("gh pr merge 5 --squash", "git push origin HEAD:main"):
+                got = guard.decide("Bash", {"command": head + braces + tail}, overrides=[grant])
+                self.assertEqual(got[:1] + got[2:], ("deny", "policy"), head + tail)
 
     def test_wrapper_suffixes_are_charged(self):
         # n arguments emit n²/2 suffix words; 20k took minutes (XERK-1589).
