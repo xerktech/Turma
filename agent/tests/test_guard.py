@@ -5538,9 +5538,13 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                             "chmod -R 777 ${HOME,x}/.."):
                     with self.subTest(cmd=cmd):
                         self.assertIsNotNone(guard.is_destructive(cmd))
-                for cmd in ('rm -rf "${HOME,x}"/.cache', "rm -rf ${HOME,,x}/proj/build"):
+                for cmd in ('rm -rf "${HOME,x}"/.cache', "rm -rf ${HOME,,x}/proj/build",
+                            "rm -rf ${HOME^^x}/proj/build", "rm -rf ${HOME~~x}/proj/build",
+                            "rm -rf ${HOME~~}/proj/build", "rm -rf ${HOME^^[!a-z]}/proj/build"):
                     with self.subTest(cmd=cmd):
                         self.assertIsNone(guard.is_destructive(cmd))
+                # An unpatterned `^^` keeps main's mapped reading (over-denies).
+                self.assertIsNotNone(guard.is_destructive("rm -rf ${HOME^^}/proj/build"))
 
     def test_a_program_or_flag_built_from_home_is_read_with_the_real_home(self):
         # XERK-1686: HOME is set, so `${HOME:+r}` is `r` and `${HOME/*/rm}` is
