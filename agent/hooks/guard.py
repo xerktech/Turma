@@ -3051,18 +3051,27 @@ def _expand_braces(command: str) -> str:
     pos = 0
     expansions = 0
     states = _quote_states(command)
+    scan = [0, 0]  # the fallback's next opener, and its steps so far
     while expansions < 4:  # bounded: an expansion can re-create a brace
         m = _BRACE_RE.search(command, pos)
-        if not m:
-            break
-        start, end = m.span()
-        # `${x,,}` is a case-modifying parameter expansion, never a brace
-        # list: expanded, `${x,,}rm` read as `$xrm $rm $rm` (XERK-1615).
-        items = m.group(1).split(",") if "," in m.group(1) else _brace_sequence(m.group(1))
-        if states[start] or not items \
-                or (start and command[start - 1] == "$" and _live_dollar(command, start - 1)):
-            pos = start + 1
-            continue
+        if m:
+            start, end = m.span()
+            # `${x,,}` is a case-modifying parameter expansion, never a brace
+            # list: expanded, `${x,,}rm` read as `$xrm $rm $rm` (XERK-1615).
+            items = m.group(1).split(",") if "," in m.group(1) else _brace_sequence(m.group(1))
+            # A quote or escape in the body may hide the real close (`{x,'}',/etc}`
+            # matched as `{x,'}`): bash's scan reads that list below.
+            if states[start] or not items or any(c in _BRACE_HARD for c in m.group(1)) \
+                    or (start and command[start - 1] == "$" and _live_dollar(command, start - 1)):
+                pos = start + 1
+                continue
+        else:
+            # A list `_BRACE_RE` cannot match, read by bash's own scan: an item
+            # holding a quote, an escape or a literal brace (XERK-1756).
+            found = _bash_brace_list(command, states, scan)
+            if found is None:
+                break
+            start, end, items = found
         expansions += 1
         # A word ends at a blank or an operator: cut only at a space,
         # `{,bash}|cat` read as `|cat bash|cat` (XERK-1629).
@@ -3095,10 +3104,108 @@ def _expand_braces(command: str) -> str:
             parts = [w[:-1] for w in parts if w[:-1]]
         command = command[:word_start] + " ".join(parts) + command[word_end:]
         pos = word_start
+        scan[0] = min(scan[0], word_start)
         states = _quote_states(command)
     if masked is not None:
         command = _unmask_param_braces(command, back)
     return command
+
+
+# Characters that stop `_BRACE_RE` inside a list body: only a body holding one
+# is left to `_bash_brace_list`, so every list the regex reads reads as before.
+_BRACE_HARD = frozenset("{}'\"\\`")
+# The most characters `_bash_brace_list` scans per `_expand_braces` call. Bash
+# rescans a word from each `{`, so a word full of them is quadratic; past
+# this a list could go unread, so the command is refused as too large.
+_BRACE_SCAN_MAX = 2_000_000
+
+
+def _brace_gobble(s: str, i: int, satisfy: str, limit: list[int]) -> int:
+    """Where bash's `brace_gobbler` (braces.c) stops scanning ``s`` from ``i``
+    for ``satisfy`` (`}` closing a list, or `,` between its items): the index,
+    or -1 when the word ends first. Quotes, `\\`-escapes, `$(…)` and a
+    `${`'s braces are passed over as bash passes them, so `{x,"}",/etc}` and
+    `{x,{a},/etc}` are three items each. A `}` closes a list only after a
+    top-level `,` or `..`: `{a},/etc}` is the list `a}` and `/etc`.
+    ``limit`` is charged for each character scanned."""
+    level, quoted, n, start = 0, "", len(s), i
+    commas = 0 if satisfy == "}" else 1
+    found = -1
+    while i < n:
+        c = s[i]
+        if c == "\\" and quoted != "'":
+            i += 2
+            continue
+        if c == "$" and i + 1 < n and s[i + 1] == "{" and quoted != "'":
+            i += 2
+            if not quoted:
+                level += 1
+            continue
+        if quoted:
+            if c == quoted:
+                quoted = ""
+            i += 1
+            continue
+        if c in "'\"`":
+            quoted = c
+            i += 1
+            continue
+        if c in "$<>" and i + 1 < n and s[i + 1] == "(":
+            j = _word_end(s, i + 2, ")")
+            if j < 0:
+                break
+            i = j + 1
+            continue
+        if c in _BRACE_WORD_END:
+            break  # the word ends: no list closes in it
+        if c == satisfy and not level and commas:
+            found = i
+            break
+        if c == "{":
+            level += 1
+        elif c == "}" and level:
+            level -= 1
+        elif satisfy == "}" and not level and (
+                c == "," or (s.startswith("..", i) and i + 2 < n and s[i + 2] != "}")):
+            commas += 1
+        i += 1
+    limit[1] += i - start + 1
+    if limit[1] > _BRACE_SCAN_MAX:
+        raise _ExpansionTooLarge  # a list left unread fails open: refuse
+    return found
+
+
+def _bash_brace_list(command: str, states: list[str],
+                     scan: list[int]) -> tuple[int, int, list[str]] | None:
+    """The first brace list from ``scan[0]`` on that bash expands and
+    `_BRACE_RE` cannot match, as (start, end, items), or None.
+
+    `_BRACE_RE` cannot span a quote, an escape or a brace, so a list holding
+    one went unread: `rm -rf {x,"}",/etc}`, `{x,a\\},/etc}` and `{x,{a},/etc}`
+    all pass bash's `rm` a `/etc` (XERK-1756). Items keep their quotes, as
+    the regex's do. Only a body holding a `_BRACE_HARD` character is taken,
+    so a list the regex skipped on purpose (quoted, `${x,,}`) stays skipped.
+    """
+    i = command.find("{", scan[0])
+    while i >= 0:
+        scan[0] = i + 1
+        if states[i] or (i and command[i - 1] == "$" and _live_dollar(command, i - 1)) \
+                or "," not in command[i:i + 2] and command.find(",", i) < 0:
+            i = command.find("{", i + 1)
+            continue
+        end = _brace_gobble(command, i + 1, "}", scan)
+        if end >= 0 and any(c in _BRACE_HARD for c in command[i + 1:end]):
+            body, items, k = command[i + 1:end], [], 0
+            while True:
+                comma = _brace_gobble(body, k, ",", scan)
+                if comma < 0:
+                    items.append(body[k:])
+                    break
+                items.append(body[k:comma])
+                k = comma + 1
+            return i, end + 1, items
+        i = command.find("{", i + 1)
+    return None
 
 
 def _mask_param_braces(command: str) -> tuple[str, dict[str, str]] | None:

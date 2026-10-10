@@ -4011,6 +4011,29 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         with self.assertRaises(guard._ExpansionTooLarge):
             guard._mask_param_braces("{x'" + taken[2:] + "',${a},${b}}")
 
+    def test_a_quoted_escaped_or_literal_brace_inside_a_list_is_read(self):
+        # XERK-1756: `_BRACE_RE` cannot span a quote, an escape or a brace, so
+        # each list below went unread; bash passes `rm` a `/etc` in every one.
+        for cmd in ('rm -rf {x,"{a",/etc}', "rm -rf {x,'}',/etc}", 'rm -rf {x,"}",/etc}',
+                    "rm -rf {x,a\\},/etc}", "rm -rf {x,$'}',/etc}", "rm -rf {x,$ {a},/etc}",
+                    # ...a `}` before the list's first `,` is an item's text:
+                    "rm -rf {a},/etc}", "rm -rf {a}b,/etc}", "rm -rf {a},${HOME}}",
+                    # ...a literal non-list brace is an item's text too:
+                    "rm -rf {x,{a},/etc}", "rm -rf {x,{},/etc}", "rm -rf {x,{{a}},/etc}",
+                    "bash -c 'rm -rf {x,${y:-{a}},${HOME}}'", "rm -rf {'a b',/etc}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Quoted lists and braces that are no list stay as written.
+        for cmd in ("echo {x,\"}\",/etc}", "rm -rf {'a,/etc'}", "rm -rf '{x,/etc}'",
+                    "rm -rf \\{x,/etc}", "rm -rf {x,\"a b\",/tmp/y}",
+                    "rm -rf {x,{a}}", "echo {\"a\":{\"b\":1},\"c\":2}"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        self.assertEqual(guard._expand_braces("echo {x,\"}\",/etc}"), 'echo x "}" /etc')
+        # Bash rescans a word from each `{`: past the scan budget, refused.
+        with self.assertRaises(guard._ExpansionTooLarge):
+            guard._expand_braces("echo " + "{'a'" * 3000 + ",b")
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
