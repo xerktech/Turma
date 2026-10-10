@@ -10753,24 +10753,53 @@ def _under_cwd(tok: str, cwd: str) -> str:
     every relative operand is joined (`cd /etc; rm -rf ./*` is `/etc/*`).
     Deeper, only one climbing out with `..` is (`cd /tmp; rm -rf ../*` is
     `/*`): joining the rest would refuse `cd /usr/src/app && rm -rf build`,
-    which names nothing an absolute rm would not, for a cwd that may be stale."""
+    which names nothing an absolute rm would not, for a cwd that may be stale.
+    One that lands on the session home or a directory holding it is joined too:
+    `cd ~/.. && rm -rf x` is the home itself (XERK-1752)."""
     if m := _PWD_LEAD_RE.match(tok):
         # `$PWD` is the directory `cd` left, read as a relative operand is:
         # `cd /; rm -rf $PWD/etc` (XERK-1685).
         rest = tok[m.end():]
         if rest[:1] not in ("", "/"):
-            if _is_exact_root(cwd) or ".." in rest.split("/"):
-                return (cwd.rstrip("/") or "/") + rest
+            joined = (cwd.rstrip("/") or "/") + rest
+            if _is_exact_root(cwd) or ".." in rest.split("/") or _holds_home(joined, cwd):
+                return joined
             return tok
         rest = rest.lstrip("/")
-        if _is_exact_root(cwd) or ".." in rest.split("/"):
-            return (cwd.rstrip("/") + "/" + rest).rstrip("/") or "/"
+        joined = (cwd.rstrip("/") + "/" + rest).rstrip("/") or "/"
+        if _is_exact_root(cwd) or ".." in rest.split("/") or _holds_home(joined, cwd):
+            return joined
         return tok
     if tok.startswith(("-", "/", "~", "$", _OPAQUE_SUBST)):
         return tok
-    if _is_exact_root(cwd) or ".." in tok.split("/"):
-        return cwd.rstrip("/") + "/" + tok
+    joined = cwd.rstrip("/") + "/" + tok
+    if _is_exact_root(cwd) or ".." in tok.split("/") or _holds_home(joined, cwd):
+        return joined
     return tok
+
+
+def _holds_home(path: str, cwd: str) -> bool:
+    """Whether ``path`` (absolute, maybe a glob) may name the session home, a
+    directory above it, or (from a ``cwd`` above it) a glob over its contents,
+    matched component by component: after `cd ~/..`, `x`, `./x/`, `x/*` and `*`
+    all reach the home (XERK-1752). An unset name reads empty (`x$n` is `x`).
+    A cwd that is not absolute (an unresolved `$d`) holds nothing we can place."""
+    home = _session_home()
+    if not home or not path.startswith("/"):
+        return False
+    want = [c for c in posixpath.normpath(home).split("/") if c]
+    above = len([c for c in posixpath.normpath(cwd).split("/") if c]) < len(want)
+    for text in {path, _EXPANSIONS_RE.sub("", path)}:
+        have = [c for c in posixpath.normpath(text).split("/") if c]
+        # Past the home only a glob joins (`x/*` is its contents), and only from
+        # above it: a join is judged as an absolute path, so a named child under
+        # a protected root (/var/…/home/x/build), or `cd ~ && rm -rf .c*`
+        # (`/home/x/.c*`), would refuse an ordinary cleanup.
+        past = have[len(want):]
+        if all(g == h or fnmatch.fnmatchcase(h, g) for g, h in zip(have, want)) and (
+                not past or (above and all(re.search(r"[*?\[]", g) for g in past))):
+            return True
+    return False
 
 
 # Absolute roots whose recursive removal/permission-change destroys the host.
