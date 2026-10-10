@@ -111,3 +111,7 @@ jobs:
           name: turma-debug-apk
           path: android/app/build/outputs/apk/debug/*.apk
           if-no-files-found: warn
+          # A PR's debug APK is for a quick sideload, not an archive. At the
+          # 90-day default these filled the org's shared artifact quota and
+          # blocked every repo's uploads (XERK-1770).
+          retention-days: 3
