@@ -1854,6 +1854,10 @@ _BRACE_RE = re.compile(r"\{([^{}\s]+)\}")
 _BRACE_SEQ_RE = re.compile(r"(-?\d+|[A-Za-z])\.\.(-?\d+|[A-Za-z])(?:\.\.(-?\d+))?")
 # The most words a sequence is expanded to; a longer one is left as written.
 _BRACE_SEQ_MAX = 64
+# How many lists `_expand_braces` expands, and how far a line may grow, before
+# it refuses the line as too large rather than leave a list unread.
+_BRACE_EXPANSIONS_MAX = 512
+_BRACE_GROWTH, _BRACE_GROWTH_FLOOR = 8, 1 << 16
 _BRACE_WORD_END = frozenset(" \t\n;&|<>()")
 _BRACE_WORD_END_RE = re.compile(r"[ \t\n;&|<>()]")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
@@ -3051,8 +3055,9 @@ def _expand_braces(command: str) -> str:
     pos = 0
     expansions = 0
     states = _quote_states(command)
-    scan = [0, 0]  # the fallback's next opener, and its steps so far
-    while expansions < 4:  # bounded: an expansion can re-create a brace
+    scan = [0]  # where the fallback looks for its next list
+    grown = len(command) * _BRACE_GROWTH + _BRACE_GROWTH_FLOOR
+    while True:
         m = _BRACE_RE.search(command, pos)
         if m:
             start, end = m.span()
@@ -3072,7 +3077,12 @@ def _expand_braces(command: str) -> str:
             if found is None:
                 break
             start, end, items = found
+        # Every list is read: one left unread runs as written, so padding a
+        # line with lists hid the one after them (XERK-1756). A product that
+        # outgrows the budget is refused, as a reading too large to finish.
         expansions += 1
+        if expansions > _BRACE_EXPANSIONS_MAX or len(command) > grown:
+            raise _ExpansionTooLarge
         # A word ends at a blank or an operator: cut only at a space,
         # `{,bash}|cat` read as `|cat bash|cat` (XERK-1629).
         word_start = start
@@ -3114,65 +3124,58 @@ def _expand_braces(command: str) -> str:
 # Characters that stop `_BRACE_RE` inside a list body: only a body holding one
 # is left to `_bash_brace_list`, so every list the regex reads reads as before.
 _BRACE_HARD = frozenset("{}'\"\\`")
-# The most characters `_bash_brace_list` scans per `_expand_braces` call. Bash
-# rescans a word from each `{`, so a word full of them is quadratic; past
-# this a list could go unread, so the command is refused as too large.
-_BRACE_SCAN_MAX = 2_000_000
+# Where a run of plain text ends for `_brace_units`.
+_BRACE_UNIT_RE = re.compile(r"[\\$'\"`<>{},.\s;&|()]")
 
 
-def _brace_gobble(s: str, i: int, satisfy: str, limit: list[int]) -> int:
-    """Where bash's `brace_gobbler` (braces.c) stops scanning ``s`` from ``i``
-    for ``satisfy`` (`}` closing a list, or `,` between its items): the index,
-    or -1 when the word ends first. Quotes, `\\`-escapes, `$(…)` and a
-    `${`'s braces are passed over as bash passes them, so `{x,"}",/etc}` and
-    `{x,{a},/etc}` are three items each. A `}` closes a list only after a
-    top-level `,` or `..`: `{a},/etc}` is the list `a}` and `/etc`.
-    ``limit`` is charged for each character scanned."""
-    level, quoted, n, start = 0, "", len(s), i
-    commas = 0 if satisfy == "}" else 1
-    found = -1
+def _brace_units(s: str) -> list[tuple[str, int, int]]:
+    """``s`` cut into the units bash's `brace_gobbler` (braces.c) steps over,
+    as (kind, start, end): `{` and `$` (a `${`, which bash counts as a level),
+    `}`, `,`, `.` (a `..` not before a `}`), `|` (a blank or operator, which
+    ends the word) and `x` (anything else: text, a `\\`-escape, a quoted run,
+    a `$(…)`/`<(…)`)."""
+    units: list[tuple[str, int, int]] = []
+    i, n = 0, len(s)
     while i < n:
         c = s[i]
-        if c == "\\" and quoted != "'":
+        if c == "\\":
+            units.append(("x", i, i + 2))
             i += 2
-            continue
-        if c == "$" and i + 1 < n and s[i + 1] == "{" and quoted != "'":
+        elif c == "$" and s.startswith("${", i):
+            units.append(("$", i, i + 2))
             i += 2
-            if not quoted:
-                level += 1
-            continue
-        if quoted:
-            if c == quoted:
-                quoted = ""
-            i += 1
-            continue
-        if c in "'\"`":
-            quoted = c
-            i += 1
-            continue
-        if c in "$<>" and i + 1 < n and s[i + 1] == "(":
-            j = _word_end(s, i + 2, ")")
-            if j < 0:
-                break
+        elif c in "'\"`":
+            j = i + 1
+            while j < n and s[j] != c:
+                if c != "'" and s[j] == "\\":
+                    j += 2
+                elif c == '"' and s.startswith("$(", j):
+                    k = _word_end(s, j + 2, ")")
+                    j = n if k < 0 else k + 1
+                else:
+                    j += 1
+            units.append(("x", i, min(j + 1, n)))
             i = j + 1
-            continue
-        if c in _BRACE_WORD_END:
-            break  # the word ends: no list closes in it
-        if c == satisfy and not level and commas:
-            found = i
-            break
-        if c == "{":
-            level += 1
-        elif c == "}" and level:
-            level -= 1
-        elif satisfy == "}" and not level and (
-                c == "," or (s.startswith("..", i) and i + 2 < n and s[i + 2] != "}")):
-            commas += 1
-        i += 1
-    limit[1] += i - start + 1
-    if limit[1] > _BRACE_SCAN_MAX:
-        raise _ExpansionTooLarge  # a list left unread fails open: refuse
-    return found
+        elif c in "$<>" and s.startswith("(", i + 1):
+            k = _word_end(s, i + 2, ")")
+            j = n if k < 0 else k + 1
+            units.append(("x", i, j))
+            i = j
+        elif c in _BRACE_WORD_END or c.isspace():
+            units.append(("|", i, i + 1))
+            i += 1
+        elif c in "{},":
+            units.append((c, i, i + 1))
+            i += 1
+        elif c == "." and s.startswith("..", i) and s[i + 2:i + 3] != "}":
+            units.append((".", i, i + 2))
+            i += 2
+        else:
+            m = _BRACE_UNIT_RE.search(s, i + 1)
+            j = m.start() if m else n
+            units.append(("x", i, j))
+            i = j
+    return units
 
 
 def _bash_brace_list(command: str, states: list[str],
@@ -3185,26 +3188,52 @@ def _bash_brace_list(command: str, states: list[str],
     all pass bash's `rm` a `/etc` (XERK-1756). Items keep their quotes, as
     the regex's do. Only a body holding a `_BRACE_HARD` character is taken,
     so a list the regex skipped on purpose (quoted, `${x,,}`) stays skipped.
+
+    Bash rescans the word from each `{`, which is quadratic in its braces.
+    The same answers come from one right-to-left pass over the units: a scan
+    at level 0 enters a nested `{` and is back at level 0 just past the first
+    `}` that brace's own scan meets at ITS level 0 (`first`); a `}` at level 0
+    before any `,` is text (`{a},/etc}`), after which the scan is as fresh.
     """
-    i = command.find("{", scan[0])
-    while i >= 0:
-        scan[0] = i + 1
-        if states[i] or (i and command[i - 1] == "$" and _live_dollar(command, i - 1)) \
-                or "," not in command[i:i + 2] and command.find(",", i) < 0:
-            i = command.find("{", i + 1)
+    units = _brace_units(command)
+    m = len(units)
+    first = [-1] * (m + 1)  # the first `}` a level-0 scan from u meets at level 0
+    close = [-1] * (m + 1)  # where a fresh scan from u closes a list
+    for u in range(m - 1, -1, -1):
+        kind = units[u][0]
+        if kind == "|":
             continue
-        end = _brace_gobble(command, i + 1, "}", scan)
-        if end >= 0 and any(c in _BRACE_HARD for c in command[i + 1:end]):
-            body, items, k = command[i + 1:end], [], 0
-            while True:
-                comma = _brace_gobble(body, k, ",", scan)
-                if comma < 0:
-                    items.append(body[k:])
-                    break
-                items.append(body[k:comma])
-                k = comma + 1
-            return i, end + 1, items
-        i = command.find("{", i + 1)
+        if kind == "}":
+            first[u], close[u] = u, close[u + 1]
+        elif kind in "{$":
+            back = first[u + 1]
+            if back >= 0:
+                first[u], close[u] = first[back + 1], close[back + 1]
+        elif kind in ",.":
+            first[u] = close[u] = first[u + 1]
+        else:
+            first[u], close[u] = first[u + 1], close[u + 1]
+    for u, (kind, start, _) in enumerate(units):
+        end = close[u + 1]
+        if kind != "{" or start < scan[0] or end < 0 or states[start] \
+                or (start and command[start - 1] == "$" and _live_dollar(command, start - 1)) \
+                or (units[u + 1][0] == "}" and (not start or command[start - 1].isspace())) \
+                or not any(c in _BRACE_HARD for c in command[start + 1:units[end][1]]):
+            continue
+        items, item, v = [], start + 1, u + 1
+        while v < end:
+            if units[v][0] == ",":
+                items.append(command[item:units[v][1]])
+                item = units[v][2]
+            elif units[v][0] in "{$":
+                v = first[v + 1]
+            v += 1
+        if not items:
+            continue  # a `..` sequence: bash reads none with a quote or brace
+        items.append(command[item:units[end][1]])
+        scan[0] = start + 1
+        return start, units[end][2], items
+    scan[0] = len(command)
     return None
 
 

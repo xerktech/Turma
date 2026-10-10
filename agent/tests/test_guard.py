@@ -4030,9 +4030,41 @@ class TestCommentAndEvalReparse(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
         self.assertEqual(guard._expand_braces("echo {x,\"}\",/etc}"), 'echo x "}" /etc')
-        # Bash rescans a word from each `{`: past the scan budget, refused.
+        # A substitution or `${…}` is one unit of its item, whatever braces it holds.
+        for cmd in ('rm -rf {x,$(echo "}"),/etc}', "rm -rf {x,`echo }`,/etc}",
+                    'rm -rf {x,"${y:-}}",/etc}', "rm -rf {x,${y:-{a}}\\},/etc}",
+                    # ...and every list is read, however many come first:
+                    "mkdir -p a/{b,c} d/{e,f} g/{h,i} j/{k,l}; rm -rf {/etc,/var}",
+                    "rm -rf {x,'y'} {x,'y'} {x,'y'} {x,'y'} {x,'/etc'}",
+                    'eval {"rm -rf /etc;",{y,{z,{w,v}}}}'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Bash rescans a word from each `{`; read in one pass, a word full of
+        # them stays fast and allowed (the rescan was quadratic: refused).
+        for cmd in ("docker ps --format " + "{{.Names}}," * 500,
+                    "echo " + ",".join('{"id":%d}' % i for i in range(600)),
+                    "echo " + "{a}" * 3000 + ",", "rm -rf " + "{a}" * 3000 + "{x,'}',/etc}"):
+            with self.subTest(cmd=cmd[:40]):
+                start = time.process_time()
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+                self.assertLess(time.process_time() - start, 5)
+        # A product past the growth budget is refused, never left unread.
         with self.assertRaises(guard._ExpansionTooLarge):
-            guard._expand_braces("echo " + "{'a'" * 3000 + ",b")
+            guard._expand_braces("echo " + "{a,b}" * 24)
+
+    def test_brace_lists_expand_as_bash_expands_them(self):
+        """XERK-1756: the words `_bash_brace_list` reads are bash's own."""
+        words = ['{x,"{a",/etc}', "{x,'}',/etc}", '{x,"}",/etc}', "{x,a\\},/etc}",
+                 "{a},/etc}", "{a}b,/etc}", "{x,{a},/etc}", "{x,{},/etc}", "{x,{{a}},/etc}",
+                 "{'a b',/etc}", "p{a}{a}{x,'}',/etc}s", "{x,{y,'/etc'}}", "{'a,b'}",
+                 "'{x,y}'", "\\{x,'y'}"]
+        script = "".join(f"printf '%s\\0' {w}; printf '\\1'\n" for w in words)
+        want = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              check=True, cwd="/tmp").stdout.split("\1")
+        for w, exp in zip(words, want):
+            with self.subTest(word=w):
+                got = shlex.split(guard._expand_braces("printf " + w))[1:]
+                self.assertEqual(got, exp.split("\0")[:-1])
 
 
 class TestClassification(unittest.TestCase):
