@@ -11446,8 +11446,11 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
         moved: list[str] = []
         bases = list(dict.fromkeys(latest + anchors + stops))
         relatives: list[bool] = []
-        # Each relative reading's own landing is a stop: the flat reading of
-        # `cd "a;b/c"` lands on `"a`, and only its quoted twin on `a;b/c` (QA).
+        # Every landing of a relative `cd` is a stop. From one base alone, the
+        # flat reading of `cd "a;b/c"` landed on `"a` and lost its quoted twin's
+        # `a;b/c`; from latest alone, a `(cd q)` that did not persist left the
+        # real cwd only an anchor, and `cd c/d` from it was lost (XERK-1768 QA).
+        # Decoy floods pay for it and fail closed on the deadline.
         landed: list[str] = []
         for m in by_start[start]:
             raw = _cd_split_redirects(m.group(2))
@@ -11535,8 +11538,8 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
                         found.remove(target)
                     found.append(target)
             relatives.append(relative)
-            if relative and len(moved) > first:
-                landed.append(moved[first])
+            if relative:
+                landed.extend(t for t in moved[first:] if t not in landed)
         if not moved:
             continue
         if not all(relatives):

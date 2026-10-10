@@ -2414,6 +2414,10 @@ class TestScriptChannels(unittest.TestCase):
                         "cd ~/p/x && c\\d ab/c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
                         "cd ~/p/x && c\\d ab && cd c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
                         "cd /etc/x && c\\d a && cd b && (cd /tmp/z) && cd ../../.. && rm -rf passwd",
+                        # A relative cd that did not persist hides no later landing (QA).
+                        "cd ~/p/x && (cd q && make) && cd c/d && (cd /tmp/z) && cd ../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && pushd q && popd && cd c/d && (cd /tmp/z) && cd ../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && echo c\\d q && cd c/d && (cd /tmp/z) && cd ../../../.. && rm -rf .ssh",
                         "cd >|/dev/null / && rm -rf etc",
                         # ...nor decoys filling the cap.
                         "cd /a1; cd /a2; cd /a3; cd /a4; cd /a5; cd /a6; cd /a7; cd /a8;"

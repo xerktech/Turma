@@ -178,6 +178,10 @@ paths:
     - Never cap by recency, depth or distance: decoys near another root (`(cd /opt/dN && cd
       ../sN)` ×17) evicted the real cwd and `rm -rf .ssh` / `rm -rf data` ran there (QA). Probe
       eviction with a home-only AND a root-only target, never `*` alone.
+  - Every landing of a relative `cd` is a stop, from every base: from one base, the flat
+    reading of `cd "a;b/c"` lost its quoted twin's landing; from latest only, a `(cd q)` left
+    the real cwd an anchor and `cd c/d` from it was lost. A spelled walk's state merges with
+    its latest first. Costs ~2x on decoy floods, which fail closed on the deadline.
   - Anchors, latest and stops pass from segment to segment in a `walk` state, never re-derived
     from the tuple: joined to every inherited cwd, four `(cd sN)` segments built 2^N phantoms and
     the trim dropped the real cwd (`rm -rf *` in the home was allowed).
