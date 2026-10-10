@@ -18,8 +18,11 @@ paths:
     `_brace_units`: a level-0 scan entering a nested `{` is back at level 0 just past the first
     `}` that brace's own scan meets. A per-opener scan with a step budget false-denied
     `docker --format {{.Names}},…` ×400 and slowed nested readings 15x (QA).
-- Every list on a line is expanded (`_BRACE_EXPANSIONS_MAX`, growth `_BRACE_GROWTH`), and past
-  either the line is refused: the old 4-expansion stop ran the 5th list unread, so four
-  harmless lists before `rm -rf {x,'/etc'}` hid it.
+- Every list on a line is expanded, and past `_BRACE_PASSES_MAX` or `_BRACE_GROWTH` the line
+  is refused: the old 4-expansion stop ran the 5th list unread, so four harmless lists before
+  `rm -rf {x,'/etc'}` hid it.
+  - A pass expands the first list of EVERY word in one rebuild: a pass per list re-read the
+    line's quoting per list, quadratic (1000 lists through 6 nested readers went too large).
+  - So passes = lists in one word + nesting depth; `{a,b}` ×24 in one word is refused.
 - Tests: `test_a_quoted_escaped_or_literal_brace_inside_a_list_is_read`,
   `test_brace_lists_expand_as_bash_expands_them` (against real bash).
