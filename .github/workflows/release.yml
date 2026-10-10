@@ -447,6 +447,7 @@ jobs:
           name: glasses-ehpk-dry-run
           path: turma.ehpk
           if-no-files-found: error
+          retention-days: 7
 
   # ------------------------------------------------------- build: android -----
   # Hosted: a hosted runner ships the Android SDK and a JDK, so this needs no
@@ -497,6 +498,10 @@ jobs:
           name: asset-android
           path: turma-android-v${{ needs.plan.outputs.version }}.apk
           if-no-files-found: error
+          # Consumed by `publish` in this same run; carried assets come from the
+          # release, never an artifact. The 90-day default filled the org's
+          # shared artifact quota (XERK-1770).
+          retention-days: 1
 
   # -------------------------------------------------- build: agent-native -----
   # GitHub-hosted: pure cp + tar + sha256, needs no docker/disk/network reach.
@@ -566,6 +571,8 @@ jobs:
             turma-agent-native-v${{ needs.plan.outputs.version }}.tar.gz
             turma-agent-native-v${{ needs.plan.outputs.version }}.tar.gz.sha256
           if-no-files-found: error
+          # Same-run hand-off to `publish` only (XERK-1770).
+          retention-days: 1
 
   # ------------------------------------------------- build: agent-windows -----
   # GitHub-hosted (ubuntu, like every job): pure cp + zip + sha256. The no-WSL
@@ -634,6 +641,8 @@ jobs:
             turma-agent-windows-v${{ needs.plan.outputs.version }}.zip
             turma-agent-windows-v${{ needs.plan.outputs.version }}.zip.sha256
           if-no-files-found: error
+          # Same-run hand-off to `publish` only (XERK-1770).
+          retention-days: 1
 
   # --------------------------------------------------------------- publish ----
   # Runs last. Assembles manifest.json + release notes, carries unchanged assets
@@ -726,6 +735,7 @@ jobs:
           path: |
             meta/
             dist/
+          retention-days: 7
       - name: Create tag + release
         if: needs.plan.outputs.dry_run != 'true'
         run: |
