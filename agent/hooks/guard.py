@@ -1858,7 +1858,7 @@ _BRACE_SEQ_MAX = 64
 # and how far a line may grow, before it refuses the line as too large rather
 # than leave a list unread.
 _BRACE_PASSES_MAX = 64
-_BRACE_GROWTH, _BRACE_GROWTH_FLOOR = 8, 1 << 16
+_BRACE_GROWTH, _BRACE_GROWTH_FLOOR = 4, 4096
 _BRACE_WORD_END = frozenset(" \t\n;&|<>()")
 _BRACE_WORD_END_RE = re.compile(r"[ \t\n;&|<>()]")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`

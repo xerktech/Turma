@@ -4048,9 +4048,15 @@ class TestCommentAndEvalReparse(unittest.TestCase):
                 start = time.process_time()
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
                 self.assertLess(time.process_time() - start, 5)
-        # A product past the growth budget is refused, never left unread.
+        # A product past the growth budget is refused, never left unread, and
+        # refused fast: a loose budget let 65 KB through every reader (49s, QA).
         with self.assertRaises(guard._ExpansionTooLarge):
             guard._expand_braces("echo " + "{a,b}" * 24)
+        for n in range(4, 12):
+            with self.subTest(objects=n):
+                start = time.process_time()
+                guard.decide("Bash", {"command": "echo " + "{a:{b:'x',c:[1,2]}}" * n}, cwd="/tmp")
+                self.assertLess(time.process_time() - start, 3)
 
     def test_brace_lists_expand_as_bash_expands_them(self):
         """XERK-1756: the words `_bash_brace_list` reads are bash's own."""

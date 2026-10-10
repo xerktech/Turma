@@ -24,10 +24,16 @@ paths:
   - A pass expands the first list of EVERY word in one rebuild: a pass per list re-read the
     line's quoting per list, quadratic (1000 lists through 6 nested readers went too large).
   - So passes = lists in one word + nesting depth; `{a,b}` ×24 in one word is refused.
+  - Keep the growth budget tight (4x + 4 KB): every later reader re-reads the expanded text,
+    and at 8x + 64 KB a 150-byte line of glued objects took 49s to refuse (QA). Accepted
+    over-deny: 5+ glued unquoted objects (`echo {a:{b:'x',c:[1,2]}}{a:…}…`) are refused.
   - Accepted over-deny: JSON objects glued in one word in text a reading takes as a script
     (`printf '{"a":{"b":"%s"}}' x y z | python3`): each object is a list, and the product
     passes the growth budget. Never make it non-product: padding then hides `/{e,'x'}{t,'y'}c`.
   - Cost, measured: 1 decision change (that shape) over 12.2k real Bash commands holding a
     `,`; CPU time within noise except lines with many lists (+9-14%: more text is read).
+- The pass follows bash closely, not exactly: in 2 of 300 random words of `{ } , ' " \ $( ${ ..`
+  (e.g. `"}"{{},},{}a}"a b"}`) it reads extra words where bash keeps one. That over-reads
+  (a false deny at worst); a word read SHORT would be a bypass, so test new shapes for that.
 - Tests: `test_a_quoted_escaped_or_literal_brace_inside_a_list_is_read`,
   `test_brace_lists_expand_as_bash_expands_them` (against real bash).
