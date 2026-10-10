@@ -44,6 +44,10 @@ paths:
   - A line that assigns PWD/OLDPWD AND moves (`cd`/`pushd`/`popd`) is also read with both
     unassigned (`_PWD_UNASSIGNED`, XERK-1753): `cd` rewrites them, so spliced,
     `PWD=/x; cd /etc; rm -rf $PWD` read `/x`. Added, never swapped: `cd -` reads OLDPWD's value.
+    - Gated textually (`_MOVES_RE` + `_PWD_NAMED_RE`, pieces like `{P,Q}WD=` too), else on the
+      line's memoised values (`x=PW; eval "${x}D=…"`): a fresh `_var_values` there spent the
+      budget outside `_expand` and raised. Each `for` word's pass is read unassigned too.
+    - Accepted over-read (visited dirs are unordered): `cd /etc; PWD=/tmp/x; rm -rf $PWD`.
   - `_PWD_LEAD_RE` also takes `${PWD:?}`/`${PWD?}` and an unspliced directory tilde, which
     `eval rm '~-'` / `\~-` reach a target as (the splice's lookbehind skips quotes).
     `${PWD:-x}` never reaches it: the default is spliced upstream (XERK-1755).

@@ -2271,12 +2271,23 @@ class TestScriptChannels(unittest.TestCase):
                     "read PWD <<< /x; cd /etc; rm -rf $PWD",
                     "bash -c 'PWD=/x; cd /etc; rm -rf $PWD'",
                     # The assigned reading stays: `cd -` goes to OLDPWD's value.
-                    "OLDPWD=/; cd /tmp/a; cd -; rm -rf *"):
+                    "OLDPWD=/; cd /tmp/a; cd -; rm -rf *",
+                    # QA: a loop's `cd $d` reaches each word, any spelling of
+                    # the name assigns it, and a substitution prints it.
+                    "PWD=/y; for d in /tmp/q /etc; do cd $d && rm -rf $PWD/*; done",
+                    "for d in /tmp/q /etc; do PWD=/y; cd \"$d\"; rm -rf \"$PWD\"; done",
+                    "export {PWD,Z}=/x; cd /etc; rm -rf $PWD",
+                    "declare {P,Q}WD=/x; cd /etc; rm -rf $PWD",
+                    "eval \"P\"\"WD=/x\"; cd /etc; rm -rf $PWD",
+                    "x=PW; eval \"${x}D=/x\"; cd /etc; rm -rf $PWD",
+                    "PWD=/x; cd /etc; rm -rf \"$(echo $PWD)\"",
+                    "PWD=/x; cd /etc; x=$(printf %s \"$PWD\"); rm -rf \"$x\""):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("PWD=/tmp/x; rm -rf $PWD",
                     "PWD=/x; cd /usr/src/app && rm -rf $PWD/build",
-                    "OLDPWD=/x; cd /tmp/a; cd /tmp/b; rm -rf $OLDPWD/build"):
+                    "OLDPWD=/x; cd /tmp/a; cd /tmp/b; rm -rf $OLDPWD/build",
+                    "PWD=/y; for d in /tmp/q /tmp/r; do cd $d && rm -rf $PWD/build; done"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
