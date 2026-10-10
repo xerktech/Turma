@@ -24,5 +24,10 @@ paths:
   - A pass expands the first list of EVERY word in one rebuild: a pass per list re-read the
     line's quoting per list, quadratic (1000 lists through 6 nested readers went too large).
   - So passes = lists in one word + nesting depth; `{a,b}` ×24 in one word is refused.
+  - Accepted over-deny: JSON objects glued in one word in text a reading takes as a script
+    (`printf '{"a":{"b":"%s"}}' x y z | python3`): each object is a list, and the product
+    passes the growth budget. Never make it non-product: padding then hides `/{e,'x'}{t,'y'}c`.
+  - Cost, measured: 1 decision change (that shape) over 12.2k real Bash commands holding a
+    `,`; CPU time within noise except lines with many lists (+9-14%: more text is read).
 - Tests: `test_a_quoted_escaped_or_literal_brace_inside_a_list_is_read`,
   `test_brace_lists_expand_as_bash_expands_them` (against real bash).
