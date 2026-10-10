@@ -24,13 +24,17 @@ paths:
   - A pass expands the first list of EVERY word in one rebuild: a pass per list re-read the
     line's quoting per list, quadratic (1000 lists through 6 nested readers went too large).
   - So passes = lists in one word + nesting depth; `{a,b}` ×24 in one word is refused.
-  - The growth budget (4x + 16 KB) is checked per word as a pass builds, so a refusal stops
-    early: every later reader re-reads the expanded text, and at 8x + 64 KB a 150-byte line of
-    glued objects took 49s (QA). A 1000-word `touch f{0..9}{0..9}{0..9}` stays allowed.
+  - The growth budget (4x + 8 KB per call, checked per word as a pass builds) and the
+    decision's `_spend` budget bound it: every later reader and eval level re-reads the
+    expanded text. At 16 KB a 6-deep `eval` of `{a,b}` x10 took 8s; 200 `$(…)` bodies of it,
+    each inside one call's budget, read 2.6 MB (26s). Worst measured now ~3.7s.
+  - `_brace_word_start` takes a per-pass memo (substitutions per body, how far its word walk
+    got): walked from the start per list, a line of quoted lists was quadratic (9s on 135 B).
   - A refusal is never grantable (`_expand_top` sets `_budget["capped"]`): the policy checks
     after a grant see only `_TOO_LARGE`, so brace padding hid a `gh pr merge` (QA).
-  - Accepted over-deny: products past that budget (`{a,b}` ×16 in a word; 6+ glued unquoted
-    objects `{a:{b:'x',c:[1,2]}}…`).
+  - Accepted over-deny: products past that budget, e.g. `touch f{0..9}{0..9}{0..9}.txt`
+    (1000 words), `{a,b}` x10 in one word, 5+ glued unquoted objects `{a:{b:'x',c:[1,2]}}…`.
+    A bigger budget makes the readers after it slow; 0 real replayed commands reach it.
   - Accepted over-deny: JSON objects glued in one word in text a reading takes as a script
     (`printf '{"a":{"b":"%s"}}' x y z | python3`): each object is a list, and the product
     passes the growth budget. Never make it non-product: padding then hides `/{e,'x'}{t,'y'}c`.

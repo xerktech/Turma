@@ -1858,7 +1858,7 @@ _BRACE_SEQ_MAX = 64
 # and how far a line may grow, before it refuses the line as too large rather
 # than leave a list unread.
 _BRACE_PASSES_MAX = 64
-_BRACE_GROWTH, _BRACE_GROWTH_FLOOR = 4, 1 << 14
+_BRACE_GROWTH, _BRACE_GROWTH_FLOOR = 4, 1 << 13
 _BRACE_WORD_END = frozenset(" \t\n;&|<>()")
 _BRACE_WORD_END_RE = re.compile(r"[ \t\n;&|<>()]")
 # A quoted value is read WHOLE: cut at its first blank, `x='rm -rf /'; eval $x`
@@ -3008,11 +3008,17 @@ def _brace_sequence(body: str) -> list[str] | None:
     return [str(v) if a.lstrip("-").isdigit() else chr(v) for v in seq]
 
 
-def _brace_word_start(command: str, start: int, cut: int) -> int:
+def _brace_word_start(command: str, start: int, cut: int, memo: dict | None = None) -> int:
     """Where the bash word holding the brace at ``start`` begins, quotes and
     substitutions read: `"$(echo a b)"{1,2}` and `'x y'{,z}` are one word
     each (XERK-1683). ``cut`` (the last blank before it) when nothing
-    between can join a word across a blank."""
+    between can join a word across a blank.
+
+    ``memo`` (one per text, asked with rising ``start``) keeps each body's
+    substitutions and how far its word walk got, so a line of N lists is
+    walked once, not N times from its start (XERK-1756 QA: quadratic)."""
+    if memo is None:
+        memo = {}
     quoted = any(c in command[cut:start] for c in "'\"\\")
     if not quoted and "`" not in command[cut:start] and not (cut and command[cut - 1] == ")"):
         return cut
@@ -3020,7 +3026,10 @@ def _brace_word_start(command: str, start: int, cut: int) -> int:
     # brace, where bash starts splitting words afresh.
     origin, end = 0, len(command)
     while True:
-        inner = next((m for m in _find_substs(command[origin:end])
+        substs = memo.get((origin, end))
+        if substs is None:
+            substs = memo[(origin, end)] = _find_substs(command[origin:end])
+        inner = next((m for m in substs
                       if origin + m.start() < start < origin + m.end() - 1), None)
         if inner is None:
             break
@@ -3028,18 +3037,22 @@ def _brace_word_start(command: str, start: int, cut: int) -> int:
         origin, end = origin + inner.start() + (1 if tick else 2), origin + inner.end() - 1
         if tick:
             break  # a backtick body is unescaped: its nested offsets differ
-    i = origin
+    i = memo.get(origin, origin)
+    if i > start:
+        i = origin
     while i < start:
         if command[i] in _BRACE_WORD_END:
             i += 1
             continue
         w = _word_end(command, i)
         if w < 0 or w > start:
+            memo[origin] = i  # a word start: a later brace's walk resumes here
             # Only ever further back than the cut. With no quote between, a
             # word across a newline is a backtick misread in data (a Go raw
             # string in a heredoc), never one bash forms.
             return i if i < cut and (quoted or "\n" not in command[i:cut]) else cut
         i = w
+    memo[origin] = i
     return cut
 
 
@@ -3080,7 +3093,7 @@ def _expand_braces(command: str) -> str:
         if not lists:
             break
         passes += 1
-        out, last, size = [], 0, len(command)
+        out, last, size, walks = [], 0, len(command), {}
         for start, end, items in sorted(lists):
             if start < last:
                 continue  # another list of a word this pass expands
@@ -3093,7 +3106,7 @@ def _expand_braces(command: str) -> str:
             # quoted blank, `eval 'rm -rf /etc'{,x}` read as `'rm -rf /etc' /etc'x`
             # (XERK-1683). An ADDED reading (`_BRACE_QUOTED`), never in place of
             # the cut one: no lexer short of bash finds every word start.
-            quoted_start = max(_brace_word_start(command, start, word_start), last)
+            quoted_start = max(_brace_word_start(command, start, word_start, walks), last)
             if quoted_start != word_start:
                 _BRACE_QUOTED_SEEN[0] = True
                 if _BRACE_QUOTED[0]:
@@ -3119,6 +3132,10 @@ def _expand_braces(command: str) -> str:
                 raise _ExpansionTooLarge
             last = max(word_end, end)
         out.append(command[last:])
+        # Charged to the decision too: every substitution body and eval level
+        # expands its own lists, and 200 bodies of `{a,b}` x10 each fit one
+        # call's budget but read 2.6 MB between them (QA: 26s).
+        _spend(size - len(command))
         command = "".join(out)
         if passes > _BRACE_PASSES_MAX or len(command) > grown:
             raise _ExpansionTooLarge
