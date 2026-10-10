@@ -5310,6 +5310,30 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
+    def test_a_body_that_may_print_nothing_does_not_hide_the_command(self):
+        # XERK-1758: a skipped producer or a filter that empties its text
+        # leaves the substitution EMPTY, so bash runs the words after it.
+        p = "rm -rf /etc"
+        for body in ("false && echo x", "false && echo x | head -1",
+                     "test -e /nonexist && echo x | sed 1q", "true || echo x",
+                     "echo x | grep y", "echo x | head -n 0", "echo x | sed d",
+                     "echo x | tr -d x", "echo x | sed 's/x//'", "echo x | cut -c2-",
+                     "echo x | tail -n 0", "yes x | head -0", "sed d <<< x",
+                     "echo x | uniq -d", "echo x | grep y | cat",
+                     "false || " * 9 + "echo x"):
+            for cmd in (f"$({body}) {p}", f"`{body}` {p}", f"x=$({body}); $x {p}"):
+                with self.subTest(cmd=cmd):
+                    self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0],
+                                     "deny")
+        # A filter that keeps every line, a body as an argument, or a word
+        # list stays as it was.
+        for cmd in ("$(echo x | cat) ls", "$(echo ls | tr a-z a-z) -la",
+                    "$(echo x | grep x) foo", "echo $(false && echo x) rm -rf /etc",
+                    "rm -rf /tmp/$(echo x | sed s/x/y/)",
+                    "for f in $(echo a b | grep a); do rm -rf /tmp/$f; done"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
     def test_many_assigned_taint_bodies_stay_fast(self):
         # XERK-1625: the taint passes over assigned values are capped at
         # `_MAX_TAINT_STARTS`, whatever the values hold.

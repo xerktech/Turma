@@ -1368,6 +1368,29 @@ def _stmt_tainted(stmt: str) -> tuple[str, bool] | None:
     return None
 
 
+# Stages that re-emit every line they read, so a producer's text cannot vanish
+# through them. Any other filter may print nothing (`grep y`, `head -n 0`,
+# `sed d`, `tr -d x`, `cut -c2-`, `uniq -d`, `sort -o f`).
+_KEEPS_ALL_INPUT = {"cat", "tee"}
+
+
+def _stmt_may_print_nothing(stmt: str) -> bool:
+    """Whether a statement `_stmt_tainted` read may still print NOTHING: its
+    producer's text passes a filter (a later pipeline stage, or the command a
+    here-string feeds) that may drop all of it (XERK-1758)."""
+    stages = _split_segments(stmt)
+    first = _strip_prefixes(_tokenize(_unwrap_group(stages[0]))) if stages else []
+    if first and _printed_from_tokens(first) is None:
+        stages = stages[:]      # a here-string producer: its own stage filters
+    else:
+        stages = stages[1:]
+    for st in stages:
+        toks = _strip_prefixes(_tokenize(_unwrap_group(st)))
+        if not toks or _basename(toks[0]) not in _KEEPS_ALL_INPUT:
+            return True
+    return False
+
+
 # A conditional body holding more statements than this is read as if its
 # output could start with an unread one, rather than as every suffix: each
 # suffix is a re-expansion of the whole segment.
@@ -1443,6 +1466,7 @@ def _body_tainted_at(body: str, raw: tuple) -> tuple[str, ...] | None:
     if _has_background(body):
         return None
     out: list[str] = []
+    may_empty: list[bool] = []
     producers = False
     for stmt in _split_on_operators(body, include_pipe=False):
         stmt = _unwrap_group(stmt).lstrip("( \t").rstrip(") \t")
@@ -1455,10 +1479,12 @@ def _body_tainted_at(body: str, raw: tuple) -> tuple[str, ...] | None:
         if known is not None:
             producers = True
             out.append(known[0])
+            may_empty.append(_stmt_may_print_nothing(stmt))
         elif _stdout_redirected(stmt) or _basename(toks[0]) in _SILENT_PROGS:
             continue
         else:
             out.append(_UNREAD_OUTPUT)
+            may_empty.append(False)
     if not producers:
         return None
     # Joined with SPACE, never newline: a command substitution's output is
@@ -1467,17 +1493,31 @@ def _body_tainted_at(body: str, raw: tuple) -> tuple[str, ...] | None:
     # that turned a later arg into a phantom program (XERK-1613 QA). An unread
     # statement after a producer is thus a trailing WORD, not the program —
     # only a leading one takes the program slot (`_UNREAD_PROG`).
-    out = [x for x in out if x]
+    kept = [(x, e) for x, e in zip(out, may_empty) if x]
+    out = [x for x, _ in kept]
     if not out:
         # Every producer printed nothing, so the output is empty: `$(echo '' |
         # sed 1q) rm …` runs `rm` (XERK-1717 QA). Opaque, the placeholder hid it.
         return ("",)
-    if not _has_conditional(body) or len(out) == 1:
+    # Which statement may print first. A `&&`/`||` body may skip any of them,
+    # and a filtered producer may print nothing (`echo x | grep y`, `head -n
+    # 0`, `sed d`), so the next one leads — or, past the last, NOTHING does and
+    # the words after the substitution are the command: `$(false && echo x)
+    # rm …` and `$(echo x | grep y) rm …` run `rm` (XERK-1758).
+    conditional = _has_conditional(body)
+    starts = [0]
+    for i, (_, empty) in enumerate(kept):
+        if not (conditional or empty):
+            break
+        starts.append(i + 1)
+    if len(starts) == 1:
         return (" ".join(out),)
-    if len(out) > _MAX_TAINT_STARTS:
-        # Too many to read each: any of them may lead, unread or not.
+    if len(starts) > _MAX_TAINT_STARTS:
+        # Too many to read each: any of them may lead, unread or not. As a
+        # program the unread lead is refused, so it stands in for the empty
+        # reading too (one more pass here doubled a 20k-statement body's cost).
         return (" ".join(out), _UNREAD_OUTPUT + " " + " ".join(out))
-    return tuple(" ".join(out[i:]) for i in range(len(out)))
+    return tuple(" ".join(out[i:]) for i in starts)
 
 
 def _taint_pick(readings: tuple[str, ...]) -> str:
