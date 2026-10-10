@@ -17,11 +17,14 @@ paths:
 - The readings are each suffix whose skipped statements may all be empty, plus the empty
   reading past the last (`starts`). Only a LEADING run counts: a statement skipped mid-way
   drops words, never the program.
-- Past `_MAX_TAINT_STARTS` the readings are the all-run one and a BARE `_UNREAD_OUTPUT` (refused
-  as a program), which stands in for every later lead and for the empty reading.
+- Past `_MAX_TAINT_STARTS` the readings are the all-run one and one led by `_UNREAD_OUTPUT`,
+  which stands in for every later lead and for the empty reading.
   - Never add the empty reading there too: a third pass took a 20k-statement body past 30s.
-  - Never put the words after the bare lead: spliced through `$x`, that long value cost ~12x
-    a plain pass, and a benign 17 KB `x=$(…); echo $x` went "too large" (QA).
+  - Keep the words after the lead: `$(… ×9; ls /x || echo -rf /etc)` is refused for `-rf /etc`.
+  - A `&&`/`||` body keeps main's reading (every word); one made optional only by filters gets
+    each word ONCE: repeated, a benign 17 KB `x=$(…); echo $x` went "too large" (QA).
+  - Not shortened for `&&`/`||`: a SHORT lead reading took the 20k-statement test past 30s (a
+    long one runs out the growth budget early). 200 distinct `$HOME/fN` prints still cost ~10s.
 - Accepted over-deny: a filtered or conditional body in program position followed by
   destructive-looking words (`$(command -v x || echo y) rm -rf /etc`); the lookup-or-fallback
   over-deny in `guard-substitutions.md` already refused most of these.

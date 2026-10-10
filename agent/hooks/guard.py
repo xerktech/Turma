@@ -1514,11 +1514,16 @@ def _body_tainted_at(body: str, raw: tuple) -> tuple[str, ...] | None:
         return (" ".join(out),)
     if len(starts) > _MAX_TAINT_STARTS:
         # Too many to read each: any of them may lead, unread or not, or none
-        # (XERK-1758). An unread lead is refused as a program, so it stands in
-        # for the empty reading too: a third pass took a 20k-statement body
-        # past 30s. The lead alone, never followed by the words: a long value
-        # led by it cost ~12x a plain pass wherever `$x` was spliced (QA).
-        return (" ".join(out), _UNREAD_OUTPUT)
+        # (XERK-1758), and an unread lead stands in for the empty reading too
+        # (a third pass took a 20k-statement body past 30s). Its words stay:
+        # `<unread> -rf /etc` is refused for them, not for the lead.
+        if conditional:
+            return (" ".join(out), _UNREAD_OUTPUT + " " + " ".join(out))
+        # Only filters made these statements optional (none ran before this
+        # change): each word once, or a benign 17 KB `x=$(…); echo $x` of
+        # repeated prints cost ~8x and went too large (QA).
+        words = dict.fromkeys(" ".join(out).split())
+        return (" ".join(out), " ".join([_UNREAD_OUTPUT, *words]))
     return tuple(" ".join(out[i:]) for i in starts)
 
 
