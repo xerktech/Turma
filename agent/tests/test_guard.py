@@ -3374,9 +3374,21 @@ class TestScriptChannels(unittest.TestCase):
                     "bash -c 'rm -rf \"$1\"' _>/dev/null /etc",
                     f"env -u>/dev/null X {R}", f"timeout -s >/dev/null KILL 5 {R}",
                     f"exec -a>/dev/null name {R}", f"echo x | xargs -n>/dev/null 1 {R}",
-                    f"eval>/dev/null -- '{R}'"):
+                    f"eval>/dev/null -- '{R}'",
+                    # ...a trailing redirection too, and a stdin feed still feeds (QA 2).
+                    f"bash -c>/dev/null '{R}' 2>&1", f"bash -c 2>/dev/null '{R}' >/dev/null",
+                    f"bash -c>/dev/null '{R}' </dev/null", f"env -u>/dev/null X {R} 2>&1",
+                    f"echo x | xargs -n>/dev/null 1 {R} 2>&1",
+                    f"x=${{y:-(}} bash -c>/dev/null '{R}' 2>&1",
+                    f"bash -o 2>/dev/null errexit <<< '{R}'",
+                    f"bash -O 2>/dev/null extglob < <(echo '{R}')",
+                    f"env -u 2>/dev/null X bash <<< '{R}'",
+                    "xargs -n 2>/dev/null 1 rm -rf <<< /etc"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
+        # The reason names no stray cwd (QA 2).
+        reason = guard.is_destructive("env -u>/dev/null X rm -rf /etc")
+        self.assertNotIn("inside", reason)
         # A quoted or escaped `>` is text, a digit word is the fd, and an
         # ordinary target stays allowed.
         for cmd in ('rm -rf "/etc>x"', "rm -rf '/etc'\\>x", "rm -rf /etc2>/dev/null",

@@ -6725,24 +6725,21 @@ def _unglue_redirects(segment: str) -> str:
     return " ".join(segment[a:b] for a, b in zip(bounds, bounds[1:]))
 
 
-# The flag on an `_expand` entry read with its redirections cut.
-_BARE = "bare"
-
-
-def _without_redirects(segment: str) -> str:
-    """``segment`` with every live redirection and its target cut out, or
-    ``segment`` itself when none is followed by another word.
+def _redirects_last(segment: str) -> str:
+    """``segment`` with every live redirection moved after its words, or
+    ``segment`` itself when they all already follow them.
 
     A redirection is no argument: `bash -c>/dev/null '<cmd>'`,
     `bash -c 2>/dev/null '<cmd>'` and `env -u >f X <cmd>` run the words around
     it, but every option walker read the redirection as the script or the
-    option's value (XERK-1754 QA). Read beside the segment, never in place:
-    the stdout-target, reader and heredoc rules read the redirections."""
+    option's value (XERK-1754 QA). Moved, not cut: a here-string or `< f` still
+    feeds the program (`bash -o 2>x errexit <<< '<cmd>'`). Read beside the
+    segment, never in place."""
     if "<" not in segment and ">" not in segment:
         return segment
     states = _quote_states(segment)
     n = len(segment)
-    out, at = [], 0
+    words, redirs, at = [], [], 0
     for start, op, _word in _redirect_ops(segment):
         if start < at:
             continue  # inside the last one's target
@@ -6761,18 +6758,17 @@ def _without_redirects(segment: str) -> str:
                 elif segment[j] in ")}" and inner:
                     inner -= 1
             j += 1
-        # One blank per run of them: a blank per cut grew a 20k run that a
-        # quadratic scan downstream choked on.
-        if not (out and at == start):
-            out += (segment[at:start], " ")
+        words.append(segment[at:start])
+        redirs.append(segment[start:j])
         at = j
-    if not out or not segment[at:].strip(";&| \t\r\n"):
-        # Only trailing redirections: the words before them read the same
-        # with or without them, and a second reading of every `cmd 2>&1`
-        # doubled real commands' cost toward the deadline (replayed).
+    tail = segment[at:]
+    # Every redirection already after the words: nothing moves, and a second
+    # reading of every `cmd 2>&1` doubled real commands' cost (replayed).
+    # Blank runs collapse: a 20k run choked a quadratic scan downstream.
+    if not redirs or not "".join(words[1:]).strip() and not tail.strip(";&| \t\r\n"):
         return segment
-    out.append(segment[at:])
-    return "".join(out)
+    body = " ".join(w.strip() for w in (*words, tail) if w.strip())
+    return body + " " + " ".join(r.strip() for r in redirs)
 
 
 @functools.lru_cache(maxsize=512)
@@ -7421,8 +7417,11 @@ def _simple_commands(stage: str, depth: int = 0) -> list[str]:
 
 def _command_reads_stdin(stage: str, depth: int) -> bool:
     """`_reads_stdin_script` for one simple command (no list, no group), in
-    every way bash may form its program name (`_name_readings`)."""
-    return any(_command_reads_stdin_as(text, depth) for text in _name_readings(stage))
+    every way bash may form its program name (`_name_readings`), and with its
+    redirections after its words: `env -u 2>x X bash <<< …` (XERK-1754 QA)."""
+    moved = _redirects_last(stage)
+    return any(_command_reads_stdin_as(text, depth)
+               for st in dict.fromkeys((stage, moved)) for text in _name_readings(st))
 
 
 def _command_reads_stdin_as(stage: str, depth: int) -> bool:
@@ -10194,15 +10193,11 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
     # ...and each segment with its redirections cut out, the words bash runs:
     # `bash -c>/dev/null '<cmd>'` read the redirection as the script
     # (XERK-1754 QA). Added, never swapped: the redirect rules need them.
-    # Flagged (`_BARE`) so the PR-description check, which reads a body from
-    # those redirections, skips them.
-    bare_segments: set[str] = set()
     for seg in list(segments):
-        bare = _without_redirects(seg)
-        if bare not in seen:
-            seen.add(bare)
-            bare_segments.add(bare)
-            segments.append(bare)
+        moved = _redirects_last(seg)
+        if moved not in seen:
+            seen.add(moved)
+            segments.append(moved)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
@@ -10523,7 +10518,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # refused rather than read as the harmless placeholder.
             out.append(([_UNREAD_PROG], seg))
             continue
-        out.append((tokens, seg, False, _BARE) if raw in bare_segments else (tokens, seg))
+        out.append((tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
         # `busybox` is stripped as a wrapper, which lost busybox itself as a
@@ -12617,9 +12612,7 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     named: set[str] = set()  # every other path an earlier segment mentions
     # Without the `~` reading (XERK-1685): it repeats the line, and a writer
     # read twice is "another part" naming the file it wrote.
-    for tokens, segment, *flags in _expand_both(command, home=False):
-        if flags[1:2] == [_BARE]:
-            continue  # its redirections are where gh reads the body from
+    for tokens, segment, *_flags in _expand_both(command, home=False):
         if _basename(tokens[0]) == "cd" and len(tokens) > 1:
             cwd = _join_path(cwd, tokens[1])
             continue

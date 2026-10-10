@@ -20,12 +20,14 @@ paths:
     escaped text, and anything inside a CLOSED `$(…)`/`${…}`/`(…)`/backtick (read with its body).
   - A frame that never closes does not hide its redirections (`_redirect_ops`): `${y:-(}`
     spliced reads `(`, and skipping it hid `rm -rf /etc>/dev/null` after it (QA).
-  - A segment with a redirection BEFORE another word is ALSO read with them cut (`_without_redirects`):
-    every option walker took one as an argument (`bash -c>/dev/null '…'`, `bash -c 2>f '…'`,
-    `env -u >f X cmd`, `eval>f -- '…'`). Added, never swapped: the redirect rules read them.
-    - Flagged `_BARE` on its `_expand` entry; `pr_summary_reason` skips it (gh reads `-F -` there).
-    - Trailing-only redirections add no copy: a copy of every `cmd 2>&1` doubled real cost (replay).
-    - `_stray_group_fragments` strips its tail by a backward walk: the regex was quadratic in an
+  - A segment with a redirection BEFORE another word is ALSO read with them moved after its
+    words (`_redirects_last`): every option walker took one as an argument
+    (`bash -c>/dev/null '…' 2>&1`, `bash -c 2>f '…'`, `env -u >f X cmd`, `eval>f -- '…'`).
+    - Moved, never cut: cut, `bash -o 2>x errexit <<< '…'` lost its stdin feed (QA).
+    - Added, never swapped. Already-trailing redirections add no copy: a copy of every
+      `cmd 2>&1` doubled real cost (replay). Gate on ALL words after the first move, never
+      on the tail alone: that let any trailing `2>&1` switch the reading off (QA).
+  - `_stray_group_fragments` strips its tail by a backward walk: the regex was quadratic in an
       inner blank run, which these copies made.
   - In the tokenizer, not per target rule: every `_tokenize` consumer gets bash's words.
   - `_script_file_readings` reads each written text once: `>f>f…` wrote 20k copies of one text.
