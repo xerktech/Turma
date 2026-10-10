@@ -145,7 +145,7 @@ paths:
     `_quote_states` reads a `"$(…)"` body as bare, so a backward quote walk stopped inside it.
   - An ADDED reading in `_expand_readings` (`_BRACE_QUOTED`), taken only once the two starts
     differ (`_BRACE_QUOTED_SEEN`); the blank-cut reading stays.
-  - Open: quoted items with blanks (`{'a b',c}`, XERK-1738); a here-string word (XERK-1739).
+  - Open: a here-string word (XERK-1739).
   - Tests: `test_a_brace_glued_to_a_quoted_word_repeats_the_whole_word`.
 - **`_shell_c_script` is how to read a `-c` script**: bash drops a `--` after `-c`.
 - **`$'…'` is decoded by bash's rules** (`_ansi_c_text`, XERK-1693), never `unicode_escape`: that

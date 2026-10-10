@@ -110,8 +110,8 @@ paths:
   - Out of stand-ins it refuses as too large: a list left unread fails open.
   - An unbalanced plain count keeps `_brace_end`'s close and stops counting for the line:
     a scan per opener is quadratic.
-  - Never mask literal non-list braces here (`{x,{a},/etc}`, XERK-1756): readings that see
-    quoted JSON bare then expanded its lists, and two real commands went 4s → 26s (deadline).
+  - Never mask literal non-list braces here: readings that see quoted JSON bare then expanded
+    its lists (4s → 26s, deadline). `_bash_brace_list` reads them in place (XERK-1756).
   - It runs per nested body (thousands of calls on a backtick-heavy line): keep its
     early returns (no unit, or no `{` but a `${`'s) and lazy stand-in pick: without them it
     cost 3-5x on the timing tests, and 100k backticks with no list hit the stand-in refusal.

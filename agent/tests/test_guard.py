@@ -4124,6 +4124,67 @@ class TestCommentAndEvalReparse(unittest.TestCase):
         with self.assertRaises(guard._ExpansionTooLarge):
             guard._mask_param_braces("{x'" + taken[2:] + "',${a},${b}}")
 
+    def test_a_quoted_escaped_or_literal_brace_inside_a_list_is_read(self):
+        # XERK-1756: `_BRACE_RE` cannot span a quote, an escape or a brace, so
+        # each list below went unread; bash passes `rm` a `/etc` in every one.
+        for cmd in ('rm -rf {x,"{a",/etc}', "rm -rf {x,'}',/etc}", 'rm -rf {x,"}",/etc}',
+                    "rm -rf {x,a\\},/etc}", "rm -rf {x,$'}',/etc}", "rm -rf {x,$ {a},/etc}",
+                    # ...a `}` before the list's first `,` is an item's text:
+                    "rm -rf {a},/etc}", "rm -rf {a}b,/etc}", "rm -rf {a},${HOME}}",
+                    # ...a literal non-list brace is an item's text too:
+                    "rm -rf {x,{a},/etc}", "rm -rf {x,{},/etc}", "rm -rf {x,{{a}},/etc}",
+                    "bash -c 'rm -rf {x,${y:-{a}},${HOME}}'", "rm -rf {'a b',/etc}"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Quoted lists and braces that are no list stay as written.
+        for cmd in ("echo {x,\"}\",/etc}", "rm -rf {'a,/etc'}", "rm -rf '{x,/etc}'",
+                    "rm -rf \\{x,/etc}", "rm -rf {x,\"a b\",/tmp/y}",
+                    "rm -rf {x,{a}}", "echo {\"a\":{\"b\":1},\"c\":2}"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        self.assertEqual(guard._expand_braces("echo {x,\"}\",/etc}"), 'echo x "}" /etc')
+        # A substitution or `${…}` is one unit of its item, whatever braces it holds.
+        for cmd in ('rm -rf {x,$(echo "}"),/etc}', "rm -rf {x,`echo }`,/etc}",
+                    'rm -rf {x,"${y:-}}",/etc}', "rm -rf {x,${y:-{a}}\\},/etc}",
+                    # ...and every list is read, however many come first:
+                    "mkdir -p a/{b,c} d/{e,f} g/{h,i} j/{k,l}; rm -rf {/etc,/var}",
+                    "rm -rf {x,'y'} {x,'y'} {x,'y'} {x,'y'} {x,'/etc'}",
+                    'eval {"rm -rf /etc;",{y,{z,{w,v}}}}'):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Bash rescans a word from each `{`; read in one pass, a word full of
+        # them stays fast and allowed (the rescan was quadratic: refused).
+        for cmd in ("docker ps --format " + "{{.Names}}," * 500,
+                    "echo " + ",".join('{"id":%d}' % i for i in range(600)),
+                    "echo " + "{a}" * 3000 + ",", "rm -rf " + "{a}" * 3000 + "{x,'}',/etc}"):
+            with self.subTest(cmd=cmd[:40]):
+                start = time.process_time()
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+                self.assertLess(time.process_time() - start, 5)
+        # A product past the growth budget is refused, never left unread, and
+        # refused fast: a loose budget let 65 KB through every reader (49s, QA).
+        with self.assertRaises(guard._ExpansionTooLarge):
+            guard._expand_braces("echo " + "{a,b}" * 24)
+        for n in range(4, 12):
+            with self.subTest(objects=n):
+                start = time.process_time()
+                guard.decide("Bash", {"command": "echo " + "{a:{b:'x',c:[1,2]}}" * n}, cwd="/tmp")
+                self.assertLess(time.process_time() - start, 3)
+
+    def test_brace_lists_expand_as_bash_expands_them(self):
+        """XERK-1756: the words `_bash_brace_list` reads are bash's own."""
+        words = ['{x,"{a",/etc}', "{x,'}',/etc}", '{x,"}",/etc}', "{x,a\\},/etc}",
+                 "{a},/etc}", "{a}b,/etc}", "{x,{a},/etc}", "{x,{},/etc}", "{x,{{a}},/etc}",
+                 "{'a b',/etc}", "p{a}{a}{x,'}',/etc}s", "{x,{y,'/etc'}}", "{'a,b'}",
+                 "'{x,y}'", "\\{x,'y'}"]
+        script = "".join(f"printf '%s\\0' {w}; printf '\\1'\n" for w in words)
+        want = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
+                              check=True, cwd="/tmp").stdout.split("\1")
+        for w, exp in zip(words, want):
+            with self.subTest(word=w):
+                got = shlex.split(guard._expand_braces("printf " + w))[1:]
+                self.assertEqual(got, exp.split("\0")[:-1])
+
 
 class TestClassification(unittest.TestCase):
     def test_destructive_blocked(self):
@@ -5025,6 +5086,14 @@ class TestExpansionBudget(unittest.TestCase):
                             ("kill $(pgrep tmux)\n", "kill*")):
             got = guard.decide("Bash", {"command": head + pad}, overrides=[grant])
             self.assertEqual(got[:1] + got[2:], ("deny", "policy"), head)
+        # A brace product past its growth budget is the same verdict (XERK-1756
+        # QA): ten lists in one word hid the merge behind a granted reason.
+        braces = "echo " + "{a,b}" * 16 + "; "
+        for head, grant in (("psql -d app <<EOF\nDROP TABLE t;\nEOF\n", "psql*"),
+                            (":(){ :|:& };:\n", ":*")):
+            for tail in ("gh pr merge 5 --squash", "git push origin HEAD:main"):
+                got = guard.decide("Bash", {"command": head + braces + tail}, overrides=[grant])
+                self.assertEqual(got[:1] + got[2:], ("deny", "policy"), head + tail)
 
     def test_wrapper_suffixes_are_charged(self):
         # n arguments emit n²/2 suffix words; 20k took minutes (XERK-1589).
