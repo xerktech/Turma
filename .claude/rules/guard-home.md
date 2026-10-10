@@ -130,3 +130,11 @@ paths:
   - Accepted over-read: every `cd` target stays a candidate cwd for the rest of the line, so
     `cd ~/.. && cd /tmp && rm -rf <home's name>` is refused.
   - Tests: `test_a_relative_name_for_the_home_after_cd_to_its_parent`.
+- A cwd at a person home spelled absolutely (`/home/<x>`, `/Users/<x>`) is an exact root like `~`
+  and `/root`, so `cd /home/me; rm -rf *` joins (XERK-1757, `_PERSON_HOME_RE`).
+  - The SESSION home spelled absolutely is rewritten to `$HOME` in `_cd_targets`: joined as
+    `/home/me/build` it would be a /home child and refuse `cd /home/me && rm -rf build`.
+  - Accepted over-read: another person's home refuses every relative name, as `/root` does.
+  - A tilde target is normpath'd there too (`~root/`, `~root/.` are `~root`): `_norm_path` leaves
+    tilde forms unfolded, and `~root/` matched no home token, so `cd ~root/; rm -rf *` ran.
+  - Tests: `test_a_cwd_at_a_person_home_spelled_absolutely_is_an_exact_root`.

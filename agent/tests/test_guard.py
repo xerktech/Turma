@@ -2258,13 +2258,46 @@ class TestScriptChannels(unittest.TestCase):
                     self.assertAllowed(cmd)
         with mock.patch.dict(os.environ, {"HOME": "/home/a/b"}):
             self.assertDenied("cd /home/a && rm -rf b")
-            self.assertAllowed("cd /home/a && rm -rf c")
+            # /home/a is itself a person home, an exact root (XERK-1757).
+            self.assertDenied("cd /home/a && rm -rf c")
+            self.assertAllowed("cd /home/a/c && rm -rf d")
             self.assertDenied("cd /home/a && rm -rf b/*")
         # A HOME holding `[`: under /home (an exact root) every operand joins,
         # so the parent here must be an ordinary directory.
         with mock.patch.dict(os.environ, {"HOME": "/var/tmp/q/x[1]"}):
             self.assertDenied("cd /var/tmp/q && rm -rf 'x[1]'")
             self.assertAllowed("cd /var/tmp/q && rm -rf x1")
+
+    def test_a_cwd_at_a_person_home_spelled_absolutely_is_an_exact_root(self):
+        """XERK-1757: `rm -rf /home/me` was refused but `cd /home/me; rm -rf *`
+        was not: only `~`/`$HOME`/`~user` cwds joined every relative operand."""
+        for home in ("/root", "/home/me"):
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                for cmd in ("cd /home/me; rm -rf *", "cd /home/me; rm -rf ./*",
+                            "cd /home/me; rm -rf $PWD", "cd /home/me/; rm -rf .",
+                            "cd /home/me && rm -rf ../*", "cd /Users/me; rm -rf *",
+                            "cd /users/me; rm -rf *", "cd /home/me; chmod -R 777 *",
+                            "cd /home/me; find . -delete", "cd /home//me; rm -rf *"):
+                    with self.subTest(home=home, cmd=cmd):
+                        self.assertDenied(cmd)
+                # Deeper, only `..` joins, as before.
+                for cmd in ("cd /home/me/proj; rm -rf build", "cd /home/me/proj; rm -rf *"):
+                    with self.subTest(home=home, cmd=cmd):
+                        self.assertAllowed(cmd)
+        # The session's own home spelled absolutely reads as `~`: a name in it
+        # is judged by the home rules, as after `cd ~`.
+        for home in ("/home/me", "/home/me/", "//home/me", "/home/me/."):
+            with mock.patch.dict(os.environ, {"HOME": home}):
+                for cmd in ("cd /home/me && rm -rf build", "cd /home/me/ && rm -rf .cache"):
+                    with self.subTest(home=home, cmd=cmd):
+                        self.assertAllowed(cmd)
+                self.assertIn("$HOME/*", guard.is_destructive("cd /home/me; rm -rf *"))
+        # A tilde target with a trailing `/`, `/.` or `//` is the same home.
+        for cmd in ("cd ~root/; rm -rf *", "cd ~root/.; rm -rf ./*", "cd ~root//; rm -rf *",
+                    "pushd ~root/; rm -rf *", "cd ~/; rm -rf *", "cd ~/.; rm -rf *"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        self.assertAllowed("cd ~root/ && rm -rf build")
 
     def test_a_cd_overrides_the_line_s_own_pwd_assignment(self):
         """XERK-1753: `cd` rewrites PWD and OLDPWD, so the line's own
