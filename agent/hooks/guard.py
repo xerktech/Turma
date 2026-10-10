@@ -9731,7 +9731,9 @@ def _written_scripts(segments: list[str],
                     _unwrap_group(core), include_pipe=False, groups=True), [], depth + 1)
                 for path, texts in inner.items():
                     written.setdefault(path, []).extend(texts)
-            words, outs = _stdout_targets(_strip_prefixes(_tokenize(stage)))
+            # Redirections moved after the words: `> f echo …` writes f, but
+            # the strip dropped a leading `> f` with its target (XERK-1754 QA).
+            words, outs = _stdout_targets(_strip_prefixes(_tokenize(_redirects_last(stage))))
             prog = _basename(words[0]) if words else ""
             text = _printed_from_tokens(words) if words else None
             # ...and one a `-c` script or `eval` makes: `sh -c 'echo … > f';
@@ -9772,7 +9774,7 @@ def _written_scripts(segments: list[str],
         for seg in _split_segments(owner):
             if "<<" not in seg:
                 continue
-            words, outs = _stdout_targets(_strip_prefixes(_tokenize(seg)))
+            words, outs = _stdout_targets(_strip_prefixes(_tokenize(_redirects_last(seg))))
             if words and _basename(words[0]) == "tee":
                 outs += [posixpath.normpath(w) for w in words[1:] if not w.startswith("-")]
             if words and _basename(words[0]) in ("cat", "tee"):

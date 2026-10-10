@@ -3387,7 +3387,9 @@ class TestScriptChannels(unittest.TestCase):
                     # A reader's option value skips a redirection (QA 3).
                     'read -d 2>/dev/null , x <<< /etc,; rm -rf "$x"',
                     'read -d>/dev/null , x <<< /etc,; rm -rf "$x"',
-                    'read -p 2>/dev/null p x <<< /etc; rm -rf "$x"'):
+                    'read -p 2>/dev/null p x <<< /etc; rm -rf "$x"',
+                    # A leading `> f` still writes f, which a shell then runs (QA 3).
+                    "> /tmp/s.sh echo 'rm -rf /etc'; bash /tmp/s.sh"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # The reason names no stray cwd (QA 2).

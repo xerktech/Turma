@@ -29,7 +29,10 @@ paths:
       on the tail alone: that let any trailing `2>&1` switch the reading off (QA).
     - `pr_summary_reason` skips `_note_paths` for a segment whose moved reading is the PR
       command: noted, its own `-F f` was "another part naming f" (QA).
-    - A reader's options (`_reader_opts`) drop redirection words first: `read -d 2>x , v`.
+    - A reader's options (`_reader_opts`) are also read with redirection words dropped, its
+      names first (binding is positional): `read -d 2>x , v`. Also, never instead: a dequoted
+      `-p '<<<'` prompt looks the same.
+    - `_written_scripts` reads the moved form: a leading `> f echo …` wrote f unseen (QA).
   - `_stray_group_fragments` strips its tail by a backward walk: the regex was quadratic in an
       inner blank run, which these copies made.
   - In the tokenizer, not per target rule: every `_tokenize` consumer gets bash's words.
