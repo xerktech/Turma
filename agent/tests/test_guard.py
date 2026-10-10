@@ -5527,6 +5527,21 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/etc"))
             self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
 
+    def test_a_case_op_with_a_pattern_on_home_is_the_home(self):
+        # XERK-1759: a case op maps only what its pattern matches, so one
+        # matching nothing (`x`, `/etc`) leaves HOME whole; `~` toggles.
+        for home in ("/root", "/home/qah"):
+            with self.subTest(home=home), mock.patch.dict(os.environ, {"HOME": home}):
+                for cmd in ('rm -rf "${HOME,x}"', "rm -rf ${HOME,/etc}", 'rm -rf "${HOME^x}"',
+                            'rm -rf "${HOME,[a-z]}"', 'rm -rf "${HOME~}"', 'rm -rf "${HOME~~}"',
+                            'rm -rf "${HOME^^x}"/', 'rm -rf "${HOME,,$y}"', 'rm -rf "${HOME~~x}"/*',
+                            "chmod -R 777 ${HOME,x}/.."):
+                    with self.subTest(cmd=cmd):
+                        self.assertIsNotNone(guard.is_destructive(cmd))
+                for cmd in ('rm -rf "${HOME,x}"/.cache', "rm -rf ${HOME,,x}/proj/build"):
+                    with self.subTest(cmd=cmd):
+                        self.assertIsNone(guard.is_destructive(cmd))
+
     def test_a_program_or_flag_built_from_home_is_read_with_the_real_home(self):
         # XERK-1686: HOME is set, so `${HOME:+r}` is `r` and `${HOME/*/rm}` is
         # `rm`; kept as written, the program and flag words hid `rm -rf /`.

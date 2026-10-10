@@ -27,6 +27,11 @@ paths:
     whose target it can change (`_HOME_TARGET_PROGS`); a default in heredoc data doubled a
     4.7 KB command past the deadline (QA). A line holding both a target command and a
     default still pays twice; it fails closed (rollup, XERK-1584).
+- A case op on HOME (`^ ^^ , ,, ~ ~~`) with or without a pattern reads as HOME AND its fully
+  mapped form (`_HOME_CASE_OP_RE`, XERK-1759): a pattern matching nothing (`${HOME,x}`) leaves
+  HOME whole, and on a case-blind disk the mapped form is the home. An upper-cased home
+  (`${HOME^^}/proj`) is not mapped back, so it over-denies, as `${HOME@U}` already did.
+  Tests: `test_a_case_op_with_a_pattern_on_home_is_the_home`.
 - An op sees HOME as written (`${HOME%root/}etc` is /etc when HOME=/root/); only the
   map-back normalises it.
 - Only person homes map back (session HOME, /root, /home/*, /Users/*): `~bin/x` is /bin/x.
