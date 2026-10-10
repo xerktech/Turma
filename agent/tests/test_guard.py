@@ -3349,6 +3349,66 @@ class TestScriptChannels(unittest.TestCase):
         # An ODD run escapes the `>`: the `&` backgrounds echo, and sh reads nothing.
         self.assertAllowed(f"echo '{R} #' {B16}\\>&1 | sh")
 
+    def test_a_redirection_glued_to_a_target_ends_it(self):
+        # XERK-1754: bash ends a word at an unquoted redirection, so
+        # `rm -rf /etc>/dev/null` removes /etc; shlex kept `/etc>/dev/null`.
+        for cmd in ("rm -rf /etc>/dev/null", "rm -rf />x", "rm -rf /etc>>x",
+                    "rm -rf /etc>&2", "rm -rf /etc>|x", "rm -rf /etc<<<x",
+                    "rm -rf /etc<>x", "rm -rf /etc&>x", "rm -rf /etc<x",
+                    "chmod -R 000 /etc>/dev/null",
+                    "rm -rf --no-preserve-root />/dev/null", "rm -rf ~/>/dev/null",
+                    "cd /; cd /tmp; rm -rf ~->/dev/null",
+                    "f() { rm -rf /etc>/dev/null; }", "bash -c 'rm -rf /etc>/dev/null'",
+                    # A `(` inside `${…}` closes no frame (QA).
+                    "x=${y:-(} rm -rf /etc>/dev/null", "x=${y//(/} rm -rf /etc<<<x",
+                    "rm -rf ${y:-(} /etc>/dev/null"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A redirection is no argument: every option walker reads the words
+        # around it, glued or not (QA).
+        R = "rm -rf /"
+        for cmd in (f"bash -c>/dev/null '{R}'", f"bash -c 2>/dev/null '{R}'",
+                    f"bash -c </dev/null '{R}'", f"bash -ec>x '{R}'",
+                    f"sh -c>/dev/null -- '{R}'", f"env bash -c>x '{R}'",
+                    f"find /tmp -maxdepth 0 -exec sh -c>/dev/null '{R}' \\;",
+                    "bash -c 'rm -rf \"$1\"' _>/dev/null /etc",
+                    f"env -u>/dev/null X {R}", f"timeout -s >/dev/null KILL 5 {R}",
+                    f"exec -a>/dev/null name {R}", f"echo x | xargs -n>/dev/null 1 {R}",
+                    f"eval>/dev/null -- '{R}'",
+                    # ...a trailing redirection too, and a stdin feed still feeds (QA 2).
+                    f"bash -c>/dev/null '{R}' 2>&1", f"bash -c 2>/dev/null '{R}' >/dev/null",
+                    f"bash -c>/dev/null '{R}' </dev/null", f"env -u>/dev/null X {R} 2>&1",
+                    f"echo x | xargs -n>/dev/null 1 {R} 2>&1",
+                    f"x=${{y:-(}} bash -c>/dev/null '{R}' 2>&1",
+                    f"bash -o 2>/dev/null errexit <<< '{R}'",
+                    f"bash -O 2>/dev/null extglob < <(echo '{R}')",
+                    f"env -u 2>/dev/null X bash <<< '{R}'",
+                    "xargs -n 2>/dev/null 1 rm -rf <<< /etc",
+                    # A reader's option value skips a redirection (QA 3).
+                    'read -d 2>/dev/null , x <<< /etc,; rm -rf "$x"',
+                    'read -d>/dev/null , x <<< /etc,; rm -rf "$x"',
+                    'read -p 2>/dev/null p x <<< /etc; rm -rf "$x"',
+                    # ...but a QUOTED one is the option's value (QA 4).
+                    "read -d '>' -r x <<< '/etc>'; rm -rf \"$x\"",
+                    "read -d \\> -s x <<< '/etc>'; rm -rf \"$x\"",
+                    "read -d '<<<' -t 5 x <<< '/etc<<<'; rm -rf \"$x\"",
+                    "mapfile -c 1 -C 2>/dev/null 'rm -rf /etc #' a <<< x",
+                    # A leading `> f` still writes f, which a shell then runs (QA 3).
+                    "> /tmp/s.sh echo 'rm -rf /etc'; bash /tmp/s.sh"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # The reason names no stray cwd (QA 2).
+        reason = guard.is_destructive("env -u>/dev/null X rm -rf /etc")
+        self.assertNotIn("inside", reason)
+        # A quoted or escaped `>` is text, a digit word is the fd, and an
+        # ordinary target stays allowed.
+        for cmd in ('rm -rf "/etc>x"', "rm -rf '/etc'\\>x", "rm -rf /etc2>/dev/null",
+                    "rm -rf build>/dev/null 2>&1", "ls /etc>out.txt",
+                    "echo $((1<<2))>f", "cat a<(echo hi)", "bash -c 'ls' < <(echo hi) 2>&1",
+                    "cat <<< x >out 2>&1"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_xerk_1641_remaining_bypasses(self):
         # XERK-1641: redirects between a command's words, shells named through
         # `$SHELL`/globs/aliases, options after `-c`, name rebinds, positional
@@ -6254,6 +6314,20 @@ class TestPrSummary(unittest.TestCase):
             fh.write(GOOD_BODY)
         self.assertIsNone(self.reason("cd sub && gh pr create -t t -F body.md"))
         self.assertIsNone(self.reason("gh pr create -t t --body-file=sub/body.md"))
+
+    def test_a_redirection_inside_the_pr_command_still_reads_its_body(self):
+        # XERK-1754 QA: a redirection between a wrapper's option and its value
+        # mis-split the command; its moved reading is the PR command, so the
+        # original must not count as "another part naming" the body file.
+        with open(os.path.join(self.repo, "good.md"), "w") as fh:
+            fh.write(GOOD_BODY)
+        for cmd in ("gh pr 2>/dev/null create -F good.md -t x",
+                    "sudo -u 2>/dev/null me gh pr create -F good.md -t x",
+                    "timeout 2>/dev/null 60 gh pr create -F good.md",
+                    "env -u 2>/dev/null X gh pr create -t x --body-file good.md"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.reason(cmd))
+        self.assertIsNotNone(self.reason("env -u 2>/dev/null X gh pr create -t x --body nope"))
 
     def test_more_than_one_description_flag_is_refused(self):
         # XERK-1565: the check read the UNION of every source while gh sends

@@ -14,6 +14,30 @@ paths:
   - The stage walk (`keep_redirects`) never joins: joined, `echo … \>&1 | sh` fed sh.
   - Every path-like word feeds `xargs` once (`piped_operands` de-duped): the extra readings
     repeated them until a benign `xargs kill` line hit the value cap ("too large").
+- **A live `<`/`>` glued to a word ends it** (XERK-1754, `_unglue_redirects` in the tokenizer):
+  shlex kept `rm -rf /etc>/dev/null` one word `/etc>/dev/null`, which named no protected root.
+  - Left glued: an fd word (`2>`, `{fd}>`; `/etc2>` is the word `/etc2`), `<(`/`>(`, quoted or
+    escaped text, and anything inside a CLOSED `$(…)`/`${…}`/`(…)`/backtick (read with its body).
+  - A frame that never closes does not hide its redirections (`_redirect_ops`): `${y:-(}`
+    spliced reads `(`, and skipping it hid `rm -rf /etc>/dev/null` after it (QA).
+  - A segment with a redirection BEFORE another word is ALSO read with them moved after its
+    words (`_redirects_last`): every option walker took one as an argument
+    (`bash -c>/dev/null '…' 2>&1`, `bash -c 2>f '…'`, `env -u >f X cmd`, `eval>f -- '…'`).
+    - Moved, never cut: cut, `bash -o 2>x errexit <<< '…'` lost its stdin feed (QA).
+    - Added, never swapped. Already-trailing redirections add no copy: a copy of every
+      `cmd 2>&1` doubled real cost (replay). Gate on ALL words after the first move, never
+      on the tail alone: that let any trailing `2>&1` switch the reading off (QA).
+    - `pr_summary_reason` skips `_note_paths` for a segment whose moved reading is the PR
+      command: noted, its own `-F f` was "another part naming f" (QA).
+    - A reader's options are walked over `_redirects_last` RAW text (`read -d 2>x , v`): only a
+      live redirection moves, so a quoted `-d '>'` stays the value. A walk over dequoted tokens
+      with redirect-looking words dropped took `'>'` as one and bound the wrong delimiter (QA).
+    - `_written_scripts` reads the moved form: a leading `> f echo …` wrote f unseen (QA).
+  - `_stray_group_fragments` strips its tail by a backward walk: the regex was quadratic in an
+      inner blank run, which these copies made.
+  - In the tokenizer, not per target rule: every `_tokenize` consumer gets bash's words.
+  - `_script_file_readings` reads each written text once: `>f>f…` wrote 20k copies of one text.
+  - Tests: `test_a_redirection_glued_to_a_target_ends_it`.
 - **Values a line sets, beyond `name=value`** (`_assigned_values`, XERK-1634):
   - an array's elements, each a value of its own (`"${a[1]}"`), up to `_MAX_VALUE_READINGS`/2;
   - `${x:=w}`/`${x=w}` as an ADDED whole-line reading with `x=w` written first

@@ -441,7 +441,6 @@ def _balanced_groups(command: str, heredoc: bool = False) -> tuple[list[str], bo
 
 # The ends a group leaves on an operator-split fragment: `rm -rf /)` is the
 # tail of `$(true; rm -rf /)`, `echo $(rm -rf /` its head.
-_GROUP_TAIL_RE = re.compile(r"[)`\s]+\Z")
 _GROUP_HEAD_RE = re.compile(r"\A(?:\$\(|[<>]\(|[(`\s])+")
 _GROUP_OPEN_RE = re.compile(r"\$\(|[<>]\(|\(|`")
 
@@ -449,7 +448,12 @@ _GROUP_OPEN_RE = re.compile(r"\$\(|[<>]\(|\(|`")
 def _stray_group_fragments(segment: str) -> list[str]:
     """``segment`` with a group's severed edges cut off, when it has any."""
     s = segment.strip()
-    trimmed = _GROUP_HEAD_RE.sub("", _GROUP_TAIL_RE.sub("", s))
+    # The tail by a backward walk: a `[)\`\s]+\Z` regex retried at every
+    # blank of an inner run, quadratic in it (XERK-1754 QA).
+    end = len(s)
+    while end and (s[end - 1] in ")`" or s[end - 1].isspace()):
+        end -= 1
+    trimmed = _GROUP_HEAD_RE.sub("", s[:end])
     out = [trimmed] if trimmed and trimmed != s else []
     opens = list(_GROUP_OPEN_RE.finditer(trimmed))
     if opens:
@@ -4398,7 +4402,9 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
 
 def _reader_opts(tokens: list[str]) -> tuple[list[str], list[str], dict[str, str]] | None:
     """`_reader_names`, with the value of each option given one (`-d`, `-C`,
-    `-u`), dequoted (XERK-1658)."""
+    `-u`), dequoted (XERK-1658). Callers tokenize `_redirects_last` text: a
+    live redirection in an option's value slot (`read -d 2>x , v`) moved out
+    of it, a quoted `-d '>'` left alone (XERK-1754 QA)."""
     if not tokens:
         return None
     prog = tokens[0]
@@ -4616,7 +4622,7 @@ def _reader_values(command: str) -> list[tuple[str, str]]:
                 text = text[:m.start()] + "/dev/fd/63" + text[m.end():]
         # A function's body opens on its header: `f(){ read a`.
         text = _FUNC_HEADER_RE.sub("", text.lstrip())
-        got = _reader_opts(_strip_prefixes(_tokenize(text)))
+        got = _reader_opts(_strip_prefixes(_tokenize(_redirects_last(text))))
         if got:
             readers[k] = got[:2]
             # `-d ''` delimits on NUL.
@@ -4655,7 +4661,7 @@ def _reader_extra_readings(line: str, commands: str, heredocs: list[tuple[str, s
     # the `mapfile -C` callbacks below that run, so skip it (a 30 KB line
     # with no heredoc paid `_HEREDOC_OP_RE.sub` over it for nothing, QA pass 16).
     reader_segs = [seg for seg in _split_segments(commands) if _reader_opts(_strip_prefixes(
-        _tokenize(_FUNC_HEADER_RE.sub("", _HEREDOC_OP_RE.sub(" ", seg).lstrip()))))] \
+        _tokenize(_redirects_last(_FUNC_HEADER_RE.sub("", _HEREDOC_OP_RE.sub(" ", seg).lstrip())))))] \
         if heredocs else []
     # Each operator where the LEXER found it, never by searching the text:
     # a quoted or commented copy of an owner line, a `$((1<<2))` shift or a
@@ -4744,7 +4750,8 @@ def _reader_extra_readings(line: str, commands: str, heredocs: list[tuple[str, s
     calls = []
     if "-C" in commands:
         for seg in _split_segments(rewritten):
-            got = _reader_opts(_strip_prefixes(_tokenize(_FUNC_HEADER_RE.sub("", seg.lstrip()))))
+            got = _reader_opts(_strip_prefixes(_tokenize(
+                _redirects_last(_FUNC_HEADER_RE.sub("", seg.lstrip())))))
             if not got or not got[2].get("C") or not got[1]:
                 continue
             got_vals = vals if rewritten == commands else _var_values(rewritten)
@@ -6855,9 +6862,119 @@ def _keep_brace_blanks(segment: str) -> tuple[str, dict[str, str]] | None:
     return text, {v: k for k, v in stand.items()}
 
 
+_FD_WORD_RE = re.compile(r"\d+|\{[A-Za-z_]\w*\}")
+_WORD_BREAK = " \t\r\n;|"
+
+
+def _redirect_ops(segment: str) -> list[tuple[int, int, int]]:
+    """Each live redirection operator in ``segment`` as (start, operator
+    start, word start): start is the word start when the word before it is
+    its fd (`2>`, `{fd}>`), else the operator's own.
+
+    One inside `$(…)`, `${…}`, `(…)` or backticks is left to the reading of
+    that body, unless the frame never closes: `${y:-(}` spliced reads `(`,
+    and a skipped frame then hid every later redirection (XERK-1754 QA).
+    `<(…)`/`>(…)` is a process substitution, not a redirection."""
+    states = _quote_states(segment)
+    # Frames: (closer, ops found inside); a closed frame drops its ops.
+    stack: list[tuple[str, list]] = []
+    top: list[tuple[int, int, int]] = []
+    word = 0
+    for i, ch in enumerate(segment):
+        if states[i]:
+            continue
+        found = stack[-1][1] if stack else top
+        if ch == "`":
+            if stack and stack[-1][0] == "`":
+                stack.pop()
+            else:
+                stack.append(("`", []))
+        elif ch == "(":
+            stack.append((")", []))
+        elif ch == "{" and i and segment[i - 1] == "$":
+            stack.append(("}", []))
+        elif ch in ")}" and any(c == ch for c, _ in stack):
+            # Pop to the opener: a `(` inside `${y:-(}` is pattern text.
+            while stack.pop()[0] != ch:
+                pass
+        elif ch in _WORD_BREAK or ch == "&" and segment[i + 1:i + 2] != ">":
+            word = i + 1
+        elif ch in "<>&" and segment[i + 1:i + 2] != "(" \
+                and not (i > word and segment[i - 1] in "<>&"):
+            # (A `&` here opens `&>`: any other ended the word above.)
+            fd = _FD_WORD_RE.fullmatch(segment[word:i]) is not None
+            found.append((word if fd else i, i, word))
+            word = i
+    for _closer, ops in stack:
+        top += ops
+    return sorted(top)
+
+
+def _unglue_redirects(segment: str) -> str:
+    """``segment`` with a blank before each live redirection glued to a word.
+
+    bash ends a word at an unquoted redirection: `rm -rf /etc>/dev/null` is
+    the operand `/etc` plus `>/dev/null`. shlex kept `/etc>/dev/null` one
+    word, which named no protected root (XERK-1754). An fd word (`2>`,
+    `{fd}>`) stays glued; see `_redirect_ops` for what is left alone."""
+    if "<" not in segment and ">" not in segment:
+        return segment
+    cuts = [start for start, _op, word in _redirect_ops(segment) if start > word]
+    if not cuts:
+        return segment
+    bounds = [0, *cuts, len(segment)]
+    return " ".join(segment[a:b] for a, b in zip(bounds, bounds[1:]))
+
+
+def _redirects_last(segment: str) -> str:
+    """``segment`` with every live redirection moved after its words, or
+    ``segment`` itself when they all already follow them.
+
+    A redirection is no argument: `bash -c>/dev/null '<cmd>'`,
+    `bash -c 2>/dev/null '<cmd>'` and `env -u >f X <cmd>` run the words around
+    it, but every option walker read the redirection as the script or the
+    option's value (XERK-1754 QA). Moved, not cut: a here-string or `< f` still
+    feeds the program (`bash -o 2>x errexit <<< '<cmd>'`). Read beside the
+    segment, never in place."""
+    if "<" not in segment and ">" not in segment:
+        return segment
+    states = _quote_states(segment)
+    n = len(segment)
+    words, redirs, at = [], [], 0
+    for start, op, _word in _redirect_ops(segment):
+        if start < at:
+            continue  # inside the last one's target
+        j = op
+        while j < n and segment[j] in "<>&|" and not states[j]:
+            j += 1
+        while j < n and segment[j] in " \t":
+            j += 1
+        # The target: one word, its own `$(…)`/`<(…)`/`${…}` held whole.
+        first, inner = j, 0
+        while j < n and (states[j] or inner or segment[j] not in _WORD_BREAK + "&<>"
+                         or j == first and segment[j + 1:j + 2] == "("):
+            if not states[j]:
+                if segment[j] in "({":
+                    inner += 1
+                elif segment[j] in ")}" and inner:
+                    inner -= 1
+            j += 1
+        words.append(segment[at:start])
+        redirs.append(segment[start:j])
+        at = j
+    tail = segment[at:]
+    # Every redirection already after the words: nothing moves, and a second
+    # reading of every `cmd 2>&1` doubled real commands' cost (replayed).
+    # Blank runs collapse: a 20k run choked a quadratic scan downstream.
+    if not redirs or not "".join(words[1:]).strip() and not tail.strip(";&| \t\r\n"):
+        return segment
+    body = " ".join(w.strip() for w in (*words, tail) if w.strip())
+    return body + " " + " ".join(r.strip() for r in redirs)
+
+
 @functools.lru_cache(maxsize=512)
 def _tokenize_cached(segment: str) -> tuple[str, ...]:
-    segment = _join_continuations(segment)
+    segment = _unglue_redirects(_join_continuations(segment))
     kept = _keep_brace_blanks(segment)
     if kept is None:
         return _tokenize_split(segment)
@@ -7501,8 +7618,11 @@ def _simple_commands(stage: str, depth: int = 0) -> list[str]:
 
 def _command_reads_stdin(stage: str, depth: int) -> bool:
     """`_reads_stdin_script` for one simple command (no list, no group), in
-    every way bash may form its program name (`_name_readings`)."""
-    return any(_command_reads_stdin_as(text, depth) for text in _name_readings(stage))
+    every way bash may form its program name (`_name_readings`), and with its
+    redirections after its words: `env -u 2>x X bash <<< …` (XERK-1754 QA)."""
+    moved = _redirects_last(stage)
+    return any(_command_reads_stdin_as(text, depth)
+               for st in dict.fromkeys((stage, moved)) for text in _name_readings(st))
 
 
 def _command_reads_stdin_as(stage: str, depth: int) -> bool:
@@ -9782,7 +9902,9 @@ def _written_scripts(segments: list[str],
                     _unwrap_group(core), include_pipe=False, groups=True), [], depth + 1)
                 for path, texts in inner.items():
                     written.setdefault(path, []).extend(texts)
-            words, outs = _stdout_targets(_strip_prefixes(_tokenize(stage)))
+            # Redirections moved after the words: `> f echo …` writes f, but
+            # the strip dropped a leading `> f` with its target (XERK-1754 QA).
+            words, outs = _stdout_targets(_strip_prefixes(_tokenize(_redirects_last(stage))))
             prog = _basename(words[0]) if words else ""
             text = _printed_from_tokens(words) if words else None
             # ...and one a `-c` script or `eval` makes: `sh -c 'echo … > f';
@@ -9823,7 +9945,7 @@ def _written_scripts(segments: list[str],
         for seg in _split_segments(owner):
             if "<<" not in seg:
                 continue
-            words, outs = _stdout_targets(_strip_prefixes(_tokenize(seg)))
+            words, outs = _stdout_targets(_strip_prefixes(_tokenize(_redirects_last(seg))))
             if words and _basename(words[0]) == "tee":
                 outs += [posixpath.normpath(w) for w in words[1:] if not w.startswith("-")]
             if words and _basename(words[0]) in ("cat", "tee"):
@@ -9886,7 +10008,9 @@ def _script_file_readings(path: str, runs: list[tuple[str, ...]],
     XERK-1674)."""
     out: list[str] = []
     argful = [a for a in runs if a]
-    for text in written.get(path, ()):
+    # Each distinct text once: `>f>f>f…` writes one text to f per redirect,
+    # and reading every copy was quadratic (XERK-1754).
+    for text in dict.fromkeys(written.get(path, ())):
         scripts = _script_readings(text)
         bound = [r for sc in scripts for r in _positional_readings(sc)]
         if len(argful) > _MAX_SCRIPT_RUNS:
@@ -10273,6 +10397,14 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if seg not in seen:
                     seen.add(seg)
                     segments.append(seg)
+    # ...and each segment with its redirections cut out, the words bash runs:
+    # `bash -c>/dev/null '<cmd>'` read the redirection as the script
+    # (XERK-1754 QA). Added, never swapped: the redirect rules need them.
+    for seg in list(segments):
+        moved = _redirects_last(seg)
+        if moved not in seen:
+            seen.add(moved)
+            segments.append(moved)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
@@ -12694,6 +12826,13 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
         command_tokens = _drop_leading_redirects(tokens)
         hit = _pr_body_command(command_tokens) if command_tokens else None
         if not hit:
+            # A PR command a redirection mis-split (`env -u 2>x X gh pr …`):
+            # its moved reading is checked below, and noted here its own
+            # `-F f` read as another part naming f (XERK-1754 QA).
+            moved = _redirects_last(segment)
+            if moved != segment and _pr_body_command(
+                    _drop_leading_redirects(_strip_prefixes(_tokenize(moved))) or ["_"]):
+                continue
             _note_paths(tokens, segment, cwd, written, named)
             continue
         bodies, files, sources = hit
