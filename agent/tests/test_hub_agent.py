@@ -54,6 +54,10 @@ spec.loader.exec_module(ha)
 # Never let a test sweep the REAL host's processes: resume_on_boot reaps
 # pre-XERK-1588 ttyds, which on a live agent host would signal real terminals.
 ha.PROC_ROOT = tempfile.mkdtemp(prefix="hub-agent-noproc-")
+# A host with the protected hooks installed (XERK-1677) would otherwise drop the
+# guard matchers from every settings file built here (XERK-1767);
+# test_guard_settings.TestManagedGuard covers the managed path.
+ha.MANAGED_GUARD_DROPIN = "/nonexistent/managed-settings.d/50-turma-guard.json"
 # Every module path under the host's REAL ~/.turma, re-pointed at a throwaway dir
 # for the whole suite. ManagerMixin patches its own per-test copies, but a test
 # that builds a bare SessionManager() (TestDshWeb, TestDshLivenessSeam, ...)
