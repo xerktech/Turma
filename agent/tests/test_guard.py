@@ -2243,15 +2243,21 @@ class TestScriptChannels(unittest.TestCase):
                         "cd ~/.. && rm -rf x/build", "cd ~ && rm -rf build",
                         "cd /var/tmp && rm -rf other", "cd ~/proj && rm -rf build",
                         "cd /var/tmp && rm -rf qa7hh", "cd ~/.. && rm -rf y$n",
-                        "cd ~ && rm -rf .c*"):
+                        "cd ~ && rm -rf .c*",
+                        # From the home itself a glob past it is not joined:
+                        # read as /var/…/.c*, it would refuse a cleanup.
+                        "cd /var/tmp/qa7h/home/x && rm -rf .c*"):
                 with self.subTest(cmd=cmd):
                     self.assertAllowed(cmd)
         with mock.patch.dict(os.environ, {"HOME": "/home/a/b"}):
             self.assertDenied("cd /home/a && rm -rf b")
             self.assertAllowed("cd /home/a && rm -rf c")
             self.assertDenied("cd /home/a && rm -rf b/*")
-        with mock.patch.dict(os.environ, {"HOME": "/home/x[1]"}):
-            self.assertDenied("cd /home && rm -rf 'x[1]'")
+        # A HOME holding `[`: under /home (an exact root) every operand joins,
+        # so the parent here must be an ordinary directory.
+        with mock.patch.dict(os.environ, {"HOME": "/var/tmp/q/x[1]"}):
+            self.assertDenied("cd /var/tmp/q && rm -rf 'x[1]'")
+            self.assertAllowed("cd /var/tmp/q && rm -rf x1")
 
     def test_tilde_and_pwd_follow_the_line_s_own_home_and_cd(self):
         """XERK-1685: bash expands `~` from HOME's current value and `$PWD` is
