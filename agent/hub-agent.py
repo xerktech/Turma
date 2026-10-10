@@ -7756,6 +7756,7 @@ MERGE_PR_RESULTS_MAX = _env_int("TURMA_AUTOMERGE_RESULTS_MAX", 50, minimum=1)
 # so the hub gives up on them. Matched case-insensitively against gh's stderr.
 _MERGE_RETRYABLE_SIGNS = (
     "base branch was modified",
+    "head branch was modified",   # --match-head-commit after a push (merge_pr)
     "try the merge again",
     "please try again",
     "try again later",
@@ -7763,6 +7764,9 @@ _MERGE_RETRYABLE_SIGNS = (
     "500 internal", "502 bad gateway", "503 service", "504 gateway",
     "timed out", "timeout",
 )
+
+
+_GIT_SHA_RE = re.compile(r"^[0-9a-f]{40}\Z", re.ASCII)
 
 
 def _merge_error_retryable(err):
@@ -7863,7 +7867,9 @@ def _summarize_pr(data):
 
     `base` (the PR's target branch) rides along for the conflict nudge
     (XERK-223), which has to name the branch to merge in; no renderer reads
-    it."""
+    it. `head` (the head commit this verdict was read for) pins an auto-merge
+    to that commit (merge_pr), so a push after the read never merges on the
+    previous commit's green; no renderer reads it either."""
     state = str(data.get("state") or "").upper()  # OPEN / MERGED / CLOSED
     draft = bool(data.get("isDraft"))
     counts = {"pass": 0, "fail": 0, "pending": 0}
@@ -7892,6 +7898,7 @@ def _summarize_pr(data):
         "mergeable": mergeable,
         "ready": _merge_ready(state, checks, mergeable),
         "base": data.get("baseRefName") or None,
+        "head": data.get("headRefOid") or None,
     }
 
 
@@ -7909,7 +7916,7 @@ def pr_status(url):
         return azdo_pr_status(url)
     raw = run(["gh", "pr", "view", url, "--json",
                "number,title,state,isDraft,url,statusCheckRollup,mergeable,"
-               "baseRefName"])
+               "baseRefName,headRefOid"])
     if not raw:
         return None
     try:
@@ -9648,7 +9655,8 @@ LIVE_AGENTS_MAX = 32
 #                  `eta` = start + N when N is a literal
 #   wait-external  a watch on something outside: `gh pr checks --watch`,
 #                  `gh run watch`, `kubectl wait|rollout status`, `docker logs -f`,
-#                  `tail -f`, `watch`, an `until …; do sleep …; done` poll
+#                  `tail -f`, `watch`, an `until …; do sleep …; done` poll, or a
+#                  loop that sleeps between read-only PROBES (`gh pr view …`)
 #   work           anything else
 #
 # **Anything not recognised is `work`** — that is today's reading, so a miss
@@ -9667,6 +9675,13 @@ _SHELL_FILTER_CMDS = frozenset({"grep", "egrep", "fgrep", "head", "tail", "sed",
                                 "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"})
 # Wrappers that run the rest of the line unchanged.
 _SHELL_PREFIX_CMDS = frozenset({"nohup", "exec", "command"})
+# Read-only checks a poll loop runs between sleeps — the canonical one is a
+# session polling for its own PR to merge. A PROBE only counts INSIDE a loop that
+# also sleeps and can `break` on what it read (`for …; do gh pr view … | grep -q MERGED && break; sleep 60; done`);
+# on its own line it stays `work` — one `gh pr view` is a command, not a wait.
+_SHELL_PROBE_CMDS = frozenset({"[", "[[", "test", "break", "continue"})
+_SHELL_GH_PROBES = (["pr", "view"], ["pr", "checks"], ["pr", "status"],
+                    ["run", "view"], ["run", "list"])
 # re.ASCII + \Z, never `$`: Python's `\d` takes Unicode digits and `$` matches
 # before a final newline, where the JS mirror (and bash's `sleep`) do neither.
 _SHELL_DURATION_RE = re.compile(r"^(\d+(?:\.\d+)?|\.\d+)([smhd]?)\Z", re.ASCII)
@@ -9869,7 +9884,7 @@ def _shell_cmd_kind(words, depth=0):
             return "work", None
         limit = _shell_duration(rest[0])
         kind, secs = _shell_cmd_kind(_shell_words(rest[1:]), depth + 1)
-        if kind in ("work", "neutral"):
+        if kind in ("work", "neutral", "probe"):
             return kind, None
         if secs is not None and (limit is None or secs < limit):
             limit = secs
@@ -9879,6 +9894,8 @@ def _shell_cmd_kind(words, depth=0):
     if cmd == "gh" and ((args[:2] == ["pr", "checks"] and "--watch" in args)
                         or args[:2] == ["run", "watch"]):
         return "external", None
+    if cmd in _SHELL_PROBE_CMDS or (cmd == "gh" and args[:2] in _SHELL_GH_PROBES):
+        return "probe", None
     if cmd == "kubectl":
         # The SUBCOMMAND, not any word: `kubectl delete pod wait` is work.
         sub = _kubectl_positionals(args)[:2]
@@ -9906,7 +9923,8 @@ def _shell_loop(segs, i):
     """(kind, next index) for a `while|until|for …; do …; done` at segs[i], or
     ("work", None) when it is not a plain sleep loop."""
     head = _shell_words(segs[i][0])
-    if len(segs[i]) != 1 or i + 1 >= len(segs):
+    # The condition may pipe into filters (`until gh pr view … | grep -q MERGED`).
+    if i + 1 >= len(segs) or _shell_pipeline_kind([["true"]] + segs[i][1:])[0] == "work":
         return "work", None
     first = _shell_words(segs[i + 1][0])
     if not first or first[0] != "do":
@@ -9918,17 +9936,24 @@ def _shell_loop(segs, i):
         j += 1
     if j >= len(segs):
         return "work", None
-    slept = False
+    slept = probed = broke = False
     for st in body:
         if _shell_words(st[0])[:1] in (["while"], ["until"], ["for"]):
             return "work", None   # a nested loop: never recurse
         kind, _ = _shell_pipeline_kind(st)
-        if kind not in ("timed", "neutral"):
+        if kind not in ("timed", "neutral", "probe"):
             return "work", None
         slept = slept or kind == "timed"
+        probed = probed or kind == "probe"
+        broke = broke or _shell_words(st[0])[:1] == ["break"]
+    # A probe loop polls only when it can END on what it reads (a `break`);
+    # `while true; do gh pr checks; sleep 60; done` never does, so stays work.
+    if probed and not broke:
+        return "work", None
     if not slept or _shell_pipeline_kind([["true"]] + segs[j][1:])[0] == "work":
         return "work", None
-    if head[0] == "until" or (head[0] == "while" and head[1:] not in (["true"], [":"])):
+    if probed or head[0] == "until" or (
+            head[0] == "while" and head[1:] not in (["true"], [":"])):
         return "external", j + 1
     return "timed", j + 1
 
@@ -9958,7 +9983,7 @@ def _shell_kind(command):
             i = nxt
             continue
         kind, secs = _shell_pipeline_kind(segs[i])
-        if kind == "work":
+        if kind in ("work", "probe"):   # a probe waits only inside a sleeping loop
             return SHELL_KIND_WORK, None
         if kind == "external":
             external = True
@@ -31376,6 +31401,16 @@ class SessionManager:
             cmd = ["gh", "pr", "merge", u, f"--{method}"]
             if os.environ.get("TURMA_AUTOMERGE_DELETE_BRANCH", "1") != "0":
                 cmd.append("--delete-branch")
+            # Pin the merge to the head commit whose status the hub judged ready.
+            # PR status refreshes every few beats and nothing invalidates it on a
+            # push, so for up to a minute after one the hub still sees the OLD
+            # head's green. GitHub refuses a moved head ("Head branch was
+            # modified … try the merge again"), which _merge_error_retryable
+            # retries — by then the status is the new head's.
+            st = self.pr_status_cache.get(u)
+            head = st.get("head") if isinstance(st, dict) else None
+            if isinstance(head, str) and _GIT_SHA_RE.match(head):
+                cmd += ["--match-head-commit", head]
             # Run from a NEUTRAL, non-repo cwd (REGISTRY_DIR), NEVER the session
             # worktree (XERK-563). gh resolves owner/repo from the URL, so it
             # needs no repo context — and `--delete-branch` from INSIDE a git

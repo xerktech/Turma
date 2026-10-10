@@ -994,6 +994,11 @@ const LIVE_AGENTS_MAX = 32;
 // anything unrecognised is `work` (today's reading, so a miss costs nothing new).
 // The shared vectors in TestShellKind / tunnel-agent.test.js keep the two in step.
 const SHELL_NEUTRAL_CMDS = new Set(["date", "echo", "printf", "true", ":", "cd"]);
+// Read-only checks a poll loop runs between sleeps; they count only INSIDE a
+// sleeping loop (mirror of _SHELL_PROBE_CMDS / _SHELL_GH_PROBES).
+const SHELL_PROBE_CMDS = new Set(["[", "[[", "test", "break", "continue"]);
+const SHELL_GH_PROBES = [["pr", "view"], ["pr", "checks"], ["pr", "status"],
+                         ["run", "view"], ["run", "list"]];
 const SHELL_FILTER_CMDS = new Set(["grep", "egrep", "fgrep", "head", "tail", "sed", "awk",
   "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"]);
 const SHELL_PREFIX_CMDS = new Set(["nohup", "exec", "command"]);
@@ -1126,13 +1131,17 @@ function shellCmdKind(words, depth = 0) {
     if (!rest.length) return ["work", null];
     let limit = shellDuration(rest[0]);
     const [kind, secs] = shellCmdKind(shellWords(rest.slice(1)), depth + 1);
-    if (kind === "work" || kind === "neutral") return [kind, null];
+    if (kind === "work" || kind === "neutral" || kind === "probe") return [kind, null];
     if (secs != null && (limit == null || secs < limit)) limit = secs;
     return ["timed", limit];
   }
   if (SHELL_NEUTRAL_CMDS.has(cmd)) return ["neutral", null];
   if (cmd === "gh" && ((sameWords(args.slice(0, 2), ["pr", "checks"]) && args.includes("--watch"))
                        || sameWords(args.slice(0, 2), ["run", "watch"]))) return ["external", null];
+  if (SHELL_PROBE_CMDS.has(cmd)
+      || (cmd === "gh" && SHELL_GH_PROBES.some((p) => sameWords(args.slice(0, 2), p)))) {
+    return ["probe", null];
+  }
   if (cmd === "kubectl") {
     // The SUBCOMMAND, not any word: `kubectl delete pod wait` is work.
     const sub = kubectlPositionals(args).slice(0, 2);
@@ -1161,24 +1170,31 @@ const SHELL_LOOP_HEADS = new Set(["while", "until", "for"]);
 // [kind, next index] for a `while|until|for …; do …; done` at segs[i].
 function shellLoop(segs, i) {
   const head = shellWords(segs[i][0]);
-  if (segs[i].length !== 1 || i + 1 >= segs.length) return ["work", null];
+  // The condition may pipe into filters (`until gh pr view … | grep -q MERGED`).
+  if (i + 1 >= segs.length || shellPipelineKind([["true"], ...segs[i].slice(1)])[0] === "work") {
+    return ["work", null];
+  }
   const first = shellWords(segs[i + 1][0]);
   if (!first.length || first[0] !== "do") return ["work", null];
   const body = [[first.slice(1), ...segs[i + 1].slice(1)]];
   let j = i + 2;
   while (j < segs.length && !sameWords(shellWords(segs[j][0]), ["done"])) body.push(segs[j++]);
   if (j >= segs.length) return ["work", null];
-  let slept = false;
+  let slept = false, probed = false, broke = false;
   for (const st of body) {
     const w = shellWords(st[0]);
     if (w.length && SHELL_LOOP_HEADS.has(w[0])) return ["work", null];
     const [kind] = shellPipelineKind(st);
-    if (kind !== "timed" && kind !== "neutral") return ["work", null];
+    if (kind !== "timed" && kind !== "neutral" && kind !== "probe") return ["work", null];
     slept = slept || kind === "timed";
+    probed = probed || kind === "probe";
+    broke = broke || (w.length > 0 && w[0] === "break");
   }
+  // A probe loop polls only when it can END on what it reads (a `break`).
+  if (probed && !broke) return ["work", null];
   if (!slept || shellPipelineKind([["true"], ...segs[j].slice(1)])[0] === "work") return ["work", null];
   const cond = head.slice(1);
-  if (head[0] === "until" || (head[0] === "while" && !sameWords(cond, ["true"]) && !sameWords(cond, [":"]))) {
+  if (probed || head[0] === "until" || (head[0] === "while" && !sameWords(cond, ["true"]) && !sameWords(cond, [":"]))) {
     return ["external", j + 1];
   }
   return ["timed", j + 1];
@@ -1203,7 +1219,7 @@ function shellKind(command) {
       continue;
     }
     const [kind, secs] = shellPipelineKind(segs[i]);
-    if (kind === "work") return ["work", null];
+    if (kind === "work" || kind === "probe") return ["work", null];   // a probe waits only in a sleeping loop
     if (kind === "external") external = true;
     else if (kind === "timed") {
       timed = true;

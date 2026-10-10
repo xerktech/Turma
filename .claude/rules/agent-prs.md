@@ -112,6 +112,11 @@ DevOps, and what gets typed back because of it.
   draft, a permission error or an unknown repo is NOT retryable — those never fix themselves. Only
   meaningful on a failure; a success is never retryable. The hub still bounds retries by
   `AUTO_MERGE_MAX_ATTEMPTS`.
+- **The merge is PINNED to the head its status was read for** (`--match-head-commit`, the cached
+  `head` from `headRefOid`). PR status refreshes every `PR_STATUS_REFRESH_EVERY` beats and nothing
+  invalidates it on a push, so without the pin a merge right after a push lands the new commit on
+  the OLD commit's green. GitHub's moved-head refusal (`Head branch was modified`) is retryable.
+  Tests: `test_the_merge_is_pinned_to_the_head_its_status_was_read_for`.
 - **Runs as the MANAGER, off the beat.** `_merge_pr_async` spawns a worker thread — `gh pr merge` is
   a blocking network call and `handle_commands` is on the heartbeat loop (XERK-395). A failed
   `Thread.start()` (pids_limit) is caught and staged synchronously on the beat, which is safe.

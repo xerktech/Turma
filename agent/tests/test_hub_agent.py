@@ -32153,6 +32153,31 @@ class TestMergePr(ManagerMixin, unittest.TestCase):
                          ("c1", self.URL, True, None))
         self.assertFalse(r["retryable"])  # a success is never retryable
 
+    def test_the_merge_is_pinned_to_the_head_its_status_was_read_for(self):
+        # A push after the last PR-status read must not merge on the old head's
+        # green: the cached head rides as --match-head-commit, and GitHub's
+        # moved-head refusal is retryable (by then the status is the new head's).
+        sha = "a" * 40
+        for cached, want in ((({"head": sha}), ["--match-head-commit", sha]),
+                             ({"head": None}, []), ({"head": "a; rm -rf /"}, []),
+                             ({"head": "A" * 40}, []), (None, [])):
+            sm = self.make_manager()
+            if cached is not None:
+                sm.pr_status_cache[self.URL] = cached
+            seen = {}
+
+            def fake_run(cmd, **kw):
+                seen["cmd"] = cmd
+                return self._fake_run(rc=0)
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(ha.subprocess, "run", fake_run):
+                sm.merge_pr("c", None, self.URL)
+            self.assertEqual(seen["cmd"], ["gh", "pr", "merge", self.URL, "--squash",
+                                           "--delete-branch"] + want, cached)
+        self.assertTrue(ha._merge_error_retryable(
+            "GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)"))
+        self.assertEqual(ha._summarize_pr({"state": "OPEN", "headRefOid": sha})["head"], sha)
+
     def test_a_refused_merge_stages_the_gh_error(self):
         sm = self.make_manager()
         with mock.patch.dict(os.environ, {}, clear=True), \
