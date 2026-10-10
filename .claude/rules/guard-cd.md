@@ -30,6 +30,10 @@ paths:
   - The uncut operand (main's reading) is ALSO kept when it names an exact root or the home:
     a value spliced in earlier (`${x:-<}`) has lost its expansion. Only then: kept always,
     each redirected `cd` took two cwd slots and filled the cap (a false deny).
+- Each `cd` is read ONCE, whichever regexes match it (`by_start` in `_cd_targets_in`): read per
+  match, a relative `cd ..` climbed once per reading and refused `cd ~/p/a && cd 2>&1 .. && rm
+  -rf *` (XERK-1768). In the operand regexes `[<>]&|&>|>\|` come before the plain class, or
+  the class takes the `>` and `cd 2>&1 ..` / `cd >|f ..` stop at the `&` / `|` (read as `cd`).
 - `_CD_QUOTED_RE` is an ADDED match whose words run through quotes and escapes
   (`cd "/x/a;b/../../../etc"`). Never replace `_CD_RE` with it: matched at a `cd` inside a
   string it pairs quotes from there and swallowed `echo "a cd b"; cd /etc; echo "c"`.

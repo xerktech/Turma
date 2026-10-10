@@ -11208,14 +11208,16 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
 # `cd`/`pushd` (bare or behind `builtin`/`command`) and the words after it.
 _CD_RE = re.compile(r"(?:^|[\s;&|({`])(?:(?:builtin|command)\s+)?\\?([\"']?)(?:cd|pushd)\1"
                     r"(?=$|[\s;&|)`<>])"
-                    r"((?:[^;&|\n)`]|[<>]&|&>)*)")
+                    r"((?:[<>]&|&>|>\||[^;&|\n)`])*)")
 # ...and again with its words run through quotes and escapes, as an ADDED
 # reading: `cd "/x/a;b/../../../etc"` (XERK-1769 QA). Never in place of the
 # flat one: matched at a `cd` inside a string, it paired quotes from there and
 # swallowed the real `cd /etc` after it (`echo "a cd b"; cd /etc; echo "c"`).
 _CD_QUOTED_RE = re.compile(_CD_RE.pattern.replace(
-    r"((?:[^;&|\n)`]|[<>]&|&>)*)",
-    r"((?:'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.|[^;&|\n)`'\"\\]|[<>]&|&>)*)"))
+    r"((?:[<>]&|&>|>\||[^;&|\n)`])*)",
+    r"((?:[<>]&|&>|>\||'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.|[^;&|\n)`'\"\\])*)"))
+# `[<>]&`/`&>`/`>|` before the plain class: after it, the class took the `>` and
+# the operand stopped at its `&`/`|`, so `cd 2>&1 ..` read as a bare `cd` (XERK-1768 QA).
 # A redirection word among `cd`'s words (`cd >/dev/null /`, `cd 2>&1 /`): not
 # an operand. Bare, it takes the next word as its target.
 _CD_REDIRECT_RE = re.compile(r"&>>?|[<>]&|>>|<<<?|<>|>\||[<>]")
@@ -11383,8 +11385,10 @@ def _cd_targets(text: str, inherited: tuple[str, ...],
     A `cd` word spelled with quotes or escapes (`c\\d`) is read too (XERK-1769)."""
     found = _cd_targets_in(text, inherited, line_vals, state)
     for reading in _cd_spelled_readings(text):
-        # Its own walk: carried, the same relative `cd` would move the line twice.
-        found = _cd_targets_in(reading, found, line_vals, None)
+        # Its own walk from the same start: from ``found``, the same relative
+        # `cd ..` climbed twice and refused `cd ~/p/a && cd 2>&1 .. && rm -rf *`.
+        found += tuple(c for c in _cd_targets_in(reading, inherited, line_vals, None)
+                       if c not in found)
     return found
 
 
@@ -11411,7 +11415,12 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
         stops = list(state["stops"])
     else:
         anchors, latest, stops = list(inherited), list(inherited), []
+    # Each `cd` once, however many readings match it (the quoted one, XERK-1769):
+    # read in turn, a relative `cd ..` climbed once per reading (XERK-1768 QA).
+    by_start: dict[int, list[re.Match[str]]] = {}
     for m in itertools.chain(_CD_RE.finditer(text), _CD_QUOTED_RE.finditer(text)):
+        by_start.setdefault(m.start(), []).append(m)
+    for start in sorted(by_start):
         # Every danger group is kept, and `.git` positions multiply them: a
         # crafted line of 2400 decoys ran 311s for a caller with no hook
         # deadline (XERK-1768 QA). Out of time, the decision fails closed.
@@ -11420,94 +11429,97 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
             raise _ExpansionTooLarge
         moved: list[str] = []
         bases = list(dict.fromkeys(latest + anchors + stops))
-        raw = _cd_split_redirects(m.group(2))
-        try:
-            args = shlex.split(raw)
-        except ValueError:
-            args = raw.split()
-        ops, skip = [], False
-        for a in args:
-            if skip:
-                skip = False
-                continue
-            # A redirection (`>x`, `2>&1`, `{fd}>x`) is no operand; bare, it
-            # takes the next word as its target.
-            at = _CD_GLUED_REDIRECT_RE.search(a)
-            if at and (at.start() == 0 or _CD_FD_RE.fullmatch(a[:at.start()])):
-                redirect = _CD_REDIRECT_RE.match(a, at.start())
-                skip = redirect is not None and redirect.end() == len(a)
-                continue
-            if not (a.startswith("-") and len(a) > 1):
-                ops.append(a)
-        op = ops[0] if ops else None
-        # The operand as main read it, uncut: a value spliced in before this
-        # (`${x:-<}`, `$(echo '>')`) leaves a `<`/`>` that looks like a
-        # redirect but was word text. Kept only when it names an exact root,
-        # so a redirected `cd` takes no second cwd slot (XERK-1769 QA).
-        try:
-            whole = shlex.split(m.group(2))
-        except ValueError:
-            whole = m.group(2).split()
-        whole = [a for a in whole if not (a.startswith("-") and len(a) > 1)]
-        uncut = [t for t in ([_norm_path(h) for h in _home_readings(whole[0])]
-                             or [_norm_path(whole[0])] if whole and whole[0] != op else [])
-                 if _is_exact_root(t.rstrip("/") or "/") or (
-                     _session_home() and t.rstrip("/") == posixpath.normpath(_session_home()))]
-        # A bare `cd` goes home; `cd ~/..` leaves it (XERK-1656).
-        targets = ([_norm_path(h) for h in _home_readings(op)] or [_norm_path(op)]
-                   if op is not None else ["~"])
-        # `cd -` goes to $OLDPWD, and a relative name is looked up in each
-        # $CDPATH entry first: `CDPATH=/; cd etc` is `/etc` (XERK-1662). Only
-        # values the line itself assigns; an inherited one stays unknown.
-        if op is not None and (op == "~-" or not op.startswith(("/", "~"))
-                    or op.startswith("~-/")):
-            vals = {**(line_vals or {})}
-            for name, vs in _var_values(text).items():
-                vals[name] = vals.get(name, []) + vs
-            # `~-` is `$OLDPWD` too, wherever `cd` is given it.
-            if op in ("-", "~-") or op.startswith("~-/"):
-                targets += [v + op[2:] for v in vals.get("OLDPWD", [])]
-            elif not op.startswith("."):
-                targets += [entry.rstrip("/") + "/" + op
-                            for cdpath in vals.get("CDPATH", ()) for entry in cdpath.split(":")
-                            if entry.startswith("/")]
-        targets += uncut
-        relative = op is not None and not op.startswith(("/", "~", "-")) \
-            and not _CD_UNPLACEABLE_RE.search(op)
-        if relative:
-            # A relative name moves from wherever the line already is (XERK-1768):
-            # `cd ~ && cd .. && rm -rf x` removes the home.
-            for base in bases:
-                start = base if base.startswith("/") else _cwd_abs_in(base, home)
-                if start is not None:
-                    targets.append(_cwd_reading_in(posixpath.normpath(start + "/" + op),
-                                                   home))
-        for target in targets:
-            target = _norm_cd(target)
-            # The session home spelled absolutely is `~`: joined as `$HOME/x`,
-            # the home rules judge it, so `cd /home/me && rm -rf build` stays
-            # allowed while `*` is refused (XERK-1757).
-            if home_norm and target.rstrip("/") and target.rstrip("/") == home_norm:
-                target = "$HOME"
-            # `~me/`, `~me/.` and `~me//` are `~me`: `_norm_path` leaves a
-            # tilde form unfolded, and unfolded it matched no home token.
-            if target.startswith("~"):
-                target = posixpath.normpath(re.sub(r"/{2,}", "/", target))
-            low = target.lower()
-            # `$HOME/…` is how `_home_readings` keeps one inside the home (`cd ~/proj`).
-            if (low.startswith(("/", "$home/")) or low.rstrip("/") in _HOME_TOKENS
-                    or _HOME_USER_RE.match(low)):
-                target = target.rstrip("/") or "/"
-                if target not in moved:
-                    moved.append(target)
-                if target in found:
-                    found.remove(target)
-                found.append(target)
+        relatives: list[bool] = []
+        for m in by_start[start]:
+            raw = _cd_split_redirects(m.group(2))
+            try:
+                args = shlex.split(raw)
+            except ValueError:
+                args = raw.split()
+            ops, skip = [], False
+            for a in args:
+                if skip:
+                    skip = False
+                    continue
+                # A redirection (`>x`, `2>&1`, `{fd}>x`) is no operand; bare, it
+                # takes the next word as its target.
+                at = _CD_GLUED_REDIRECT_RE.search(a)
+                if at and (at.start() == 0 or _CD_FD_RE.fullmatch(a[:at.start()])):
+                    redirect = _CD_REDIRECT_RE.match(a, at.start())
+                    skip = redirect is not None and redirect.end() == len(a)
+                    continue
+                if not (a.startswith("-") and len(a) > 1):
+                    ops.append(a)
+            op = ops[0] if ops else None
+            # The operand as main read it, uncut: a value spliced in before this
+            # (`${x:-<}`, `$(echo '>')`) leaves a `<`/`>` that looks like a
+            # redirect but was word text. Kept only when it names an exact root,
+            # so a redirected `cd` takes no second cwd slot (XERK-1769 QA).
+            try:
+                whole = shlex.split(m.group(2))
+            except ValueError:
+                whole = m.group(2).split()
+            whole = [a for a in whole if not (a.startswith("-") and len(a) > 1)]
+            uncut = [t for t in ([_norm_path(h) for h in _home_readings(whole[0])]
+                                 or [_norm_path(whole[0])] if whole and whole[0] != op else [])
+                     if _is_exact_root(t.rstrip("/") or "/") or (
+                         _session_home() and t.rstrip("/") == posixpath.normpath(_session_home()))]
+            # A bare `cd` goes home; `cd ~/..` leaves it (XERK-1656).
+            targets = ([_norm_path(h) for h in _home_readings(op)] or [_norm_path(op)]
+                       if op is not None else ["~"])
+            # `cd -` goes to $OLDPWD, and a relative name is looked up in each
+            # $CDPATH entry first: `CDPATH=/; cd etc` is `/etc` (XERK-1662). Only
+            # values the line itself assigns; an inherited one stays unknown.
+            if op is not None and (op == "~-" or not op.startswith(("/", "~"))
+                        or op.startswith("~-/")):
+                vals = {**(line_vals or {})}
+                for name, vs in _var_values(text).items():
+                    vals[name] = vals.get(name, []) + vs
+                # `~-` is `$OLDPWD` too, wherever `cd` is given it.
+                if op in ("-", "~-") or op.startswith("~-/"):
+                    targets += [v + op[2:] for v in vals.get("OLDPWD", [])]
+                elif not op.startswith("."):
+                    targets += [entry.rstrip("/") + "/" + op
+                                for cdpath in vals.get("CDPATH", ()) for entry in cdpath.split(":")
+                                if entry.startswith("/")]
+            targets += uncut
+            relative = op is not None and not op.startswith(("/", "~", "-")) \
+                and not _CD_UNPLACEABLE_RE.search(op)
+            if relative:
+                # A relative name moves from wherever the line already is (XERK-1768):
+                # `cd ~ && cd .. && rm -rf x` removes the home.
+                for base in bases:
+                    start = base if base.startswith("/") else _cwd_abs_in(base, home)
+                    if start is not None:
+                        targets.append(_cwd_reading_in(posixpath.normpath(start + "/" + op),
+                                                       home))
+            for target in targets:
+                target = _norm_cd(target)
+                # The session home spelled absolutely is `~`: joined as `$HOME/x`,
+                # the home rules judge it, so `cd /home/me && rm -rf build` stays
+                # allowed while `*` is refused (XERK-1757).
+                if home_norm and target.rstrip("/") and target.rstrip("/") == home_norm:
+                    target = "$HOME"
+                # `~me/`, `~me/.` and `~me//` are `~me`: `_norm_path` leaves a
+                # tilde form unfolded, and unfolded it matched no home token.
+                if target.startswith("~"):
+                    target = posixpath.normpath(re.sub(r"/{2,}", "/", target))
+                low = target.lower()
+                # `$HOME/…` is how `_home_readings` keeps one inside the home (`cd ~/proj`).
+                if (low.startswith(("/", "$home/")) or low.rstrip("/") in _HOME_TOKENS
+                        or _HOME_USER_RE.match(low)):
+                    target = target.rstrip("/") or "/"
+                    if target not in moved:
+                        moved.append(target)
+                    if target in found:
+                        found.remove(target)
+                    found.append(target)
+            relatives.append(relative)
         if not moved:
             continue
-        if not relative:
+        if not all(relatives):
             anchors = _cd_nearest(list(dict.fromkeys(anchors + moved)), home)
-        elif moved[0] not in stops:
+        if any(relatives) and moved[0] not in stops:
             stops = _cd_nearest(stops + [moved[0]], home, deep=False)
         latest = moved[:_MAX_CWDS]
         if len(found) > 8 * _MAX_CWDS:

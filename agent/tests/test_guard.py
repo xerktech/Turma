@@ -2404,6 +2404,11 @@ class TestScriptChannels(unittest.TestCase):
                         "cd ~ && echo cd sub && cd .. && rm -rf x",
                         "cd ~/a || cd sub && cd .. && rm -rf *",
                         "cd ~ && cd nope; cd .. && rm -rf x",
+                        # ...nor an fd duplication ahead of the operand (QA).
+                        "cd ~ && cd 2>&1 .. && rm -rf x", "cd ~ && cd >&2 .. && rm -rf x",
+                        "cd ~ && cd <&0 .. && rm -rf x", "cd ~ && cd &>/dev/null .. && rm -rf x",
+                        "cd ~ && cd >|/dev/null .. && rm -rf x", "cd 2>&1 /etc && rm -rf passwd",
+                        "cd >|/dev/null / && rm -rf etc",
                         # ...nor decoys filling the cap.
                         "cd /a1; cd /a2; cd /a3; cd /a4; cd /a5; cd /a6; cd /a7; cd /a8;"
                         " cd ~; cd ..; rm -rf x"):
@@ -2465,6 +2470,8 @@ class TestScriptChannels(unittest.TestCase):
                 with self.subTest(cwd=cwd, cmd=cmd):
                     self.assertEqual(decide("Bash", {"command": cmd}, cwd=cwd)[0], "deny")
             for cmd in ("cd ~/proj && rm -rf build", "cd ~/proj && rm -rf ../other",
+                        # One `cd ..` climbs once, however many readings match it (QA).
+                        "cd ~/p/a && cd 2>&1 .. && rm -rf *", "cd ~/p/a && c\\d .. && rm -rf *",
                         "cd $(dirname $0) && rm -rf build", "rm -rf \"$(dirname \"$f\")\"/x",
                         "rm -rf \"$(dirname /tmp/a/b)\"/*",
                         # A printed path inside the home stays `$HOME…` (QA).
