@@ -78,6 +78,9 @@ permissions:
   pull-requests: read # changelog from merged PRs
 
 env:
+  # build-push-action uploads a .dockerbuild build-record artifact per build, and it
+  # counts against the org's shared Actions storage quota (XERK-1796).
+  DOCKER_BUILD_RECORD_UPLOAD: "false"
   TURMA_IMAGE: ghcr.io/${{ github.repository_owner }}/turma
 
 jobs:
@@ -447,7 +450,7 @@ jobs:
           name: glasses-ehpk-dry-run
           path: turma.ehpk
           if-no-files-found: error
-          retention-days: 7
+          retention-days: 3
 
   # ------------------------------------------------------- build: android -----
   # Hosted: a hosted runner ships the Android SDK and a JDK, so this needs no
@@ -735,7 +738,7 @@ jobs:
           path: |
             meta/
             dist/
-          retention-days: 7
+          retention-days: 3
       - name: Create tag + release
         if: needs.plan.outputs.dry_run != 'true'
         run: |
