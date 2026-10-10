@@ -441,7 +441,6 @@ def _balanced_groups(command: str, heredoc: bool = False) -> tuple[list[str], bo
 
 # The ends a group leaves on an operator-split fragment: `rm -rf /)` is the
 # tail of `$(true; rm -rf /)`, `echo $(rm -rf /` its head.
-_GROUP_TAIL_RE = re.compile(r"[)`\s]+\Z")
 _GROUP_HEAD_RE = re.compile(r"\A(?:\$\(|[<>]\(|[(`\s])+")
 _GROUP_OPEN_RE = re.compile(r"\$\(|[<>]\(|\(|`")
 
@@ -449,7 +448,12 @@ _GROUP_OPEN_RE = re.compile(r"\$\(|[<>]\(|\(|`")
 def _stray_group_fragments(segment: str) -> list[str]:
     """``segment`` with a group's severed edges cut off, when it has any."""
     s = segment.strip()
-    trimmed = _GROUP_HEAD_RE.sub("", _GROUP_TAIL_RE.sub("", s))
+    # The tail by a backward walk: a `[)\`\s]+\Z` regex retried at every
+    # blank of an inner run, quadratic in it (XERK-1754 QA).
+    end = len(s)
+    while end and (s[end - 1] in ")`" or s[end - 1].isspace()):
+        end -= 1
+    trimmed = _GROUP_HEAD_RE.sub("", s[:end])
     out = [trimmed] if trimmed and trimmed != s else []
     opens = list(_GROUP_OPEN_RE.finditer(trimmed))
     if opens:
@@ -6658,54 +6662,117 @@ def _keep_brace_blanks(segment: str) -> tuple[str, dict[str, str]] | None:
 
 
 _FD_WORD_RE = re.compile(r"\d+|\{[A-Za-z_]\w*\}")
+_WORD_BREAK = " \t\r\n;|"
 
 
-def _unglue_redirects(segment: str) -> str:
-    """``segment`` with a blank before each live `<`/`>` glued to a word.
+def _redirect_ops(segment: str) -> list[tuple[int, int, int]]:
+    """Each live redirection operator in ``segment`` as (start, operator
+    start, word start): start is the word start when the word before it is
+    its fd (`2>`, `{fd}>`), else the operator's own.
 
-    bash ends a word at an unquoted redirection: `rm -rf /etc>/dev/null` is
-    the operand `/etc` plus `>/dev/null`. shlex kept `/etc>/dev/null` one
-    word, which named no protected root (XERK-1754). Left glued: a word that
-    is the redirection's fd (`2>`, `{fd}>`), `<(…)`/`>(…)`, and anything
-    inside `$(…)`, `${…}`, `(…)` or backticks — those bodies are tokenized on
-    their own when they are read."""
-    if "<" not in segment and ">" not in segment:
-        return segment
+    One inside `$(…)`, `${…}`, `(…)` or backticks is left to the reading of
+    that body, unless the frame never closes: `${y:-(}` spliced reads `(`,
+    and a skipped frame then hid every later redirection (XERK-1754 QA).
+    `<(…)`/`>(…)` is a process substitution, not a redirection."""
     states = _quote_states(segment)
-    stack: list[str] = []
-    cuts: list[int] = []
-    word = 0  # where the current word starts
+    # Frames: (closer, ops found inside); a closed frame drops its ops.
+    stack: list[tuple[str, list]] = []
+    top: list[tuple[int, int, int]] = []
+    word = 0
     for i, ch in enumerate(segment):
         if states[i]:
             continue
+        found = stack[-1][1] if stack else top
         if ch == "`":
-            if stack and stack[-1] == "`":
+            if stack and stack[-1][0] == "`":
                 stack.pop()
             else:
-                stack.append("`")
+                stack.append(("`", []))
         elif ch == "(":
-            stack.append("(")
+            stack.append((")", []))
         elif ch == "{" and i and segment[i - 1] == "$":
-            stack.append("{")
-        elif ch in ")}" and stack and stack[-1] == ("(" if ch == ")" else "{"):
-            stack.pop()
-        if stack:
-            continue
-        if ch in " \t\r\n;|" or ch == "&" and segment[i + 1:i + 2] != ">":
+            stack.append(("}", []))
+        elif ch in ")}" and any(c == ch for c, _ in stack):
+            # Pop to the opener: a `(` inside `${y:-(}` is pattern text.
+            while stack.pop()[0] != ch:
+                pass
+        elif ch in _WORD_BREAK or ch == "&" and segment[i + 1:i + 2] != ">":
             word = i + 1
-        elif ch in "<>" and i > word and segment[i - 1] not in "<>&" \
-                and segment[i + 1:i + 2] != "(":
-            if not _FD_WORD_RE.fullmatch(segment[word:i]):
-                cuts.append(i)
+        elif ch in "<>&" and segment[i + 1:i + 2] != "(" \
+                and not (i > word and segment[i - 1] in "<>&"):
+            # (A `&` here opens `&>`: any other ended the word above.)
+            fd = _FD_WORD_RE.fullmatch(segment[word:i]) is not None
+            found.append((word if fd else i, i, word))
             word = i
-        elif ch == "&" and i > word:
-            # `/etc&>x`: the `&` opens the `&>` redirection.
-            cuts.append(i)
-            word = i
+    for _closer, ops in stack:
+        top += ops
+    return sorted(top)
+
+
+def _unglue_redirects(segment: str) -> str:
+    """``segment`` with a blank before each live redirection glued to a word.
+
+    bash ends a word at an unquoted redirection: `rm -rf /etc>/dev/null` is
+    the operand `/etc` plus `>/dev/null`. shlex kept `/etc>/dev/null` one
+    word, which named no protected root (XERK-1754). An fd word (`2>`,
+    `{fd}>`) stays glued; see `_redirect_ops` for what is left alone."""
+    if "<" not in segment and ">" not in segment:
+        return segment
+    cuts = [start for start, _op, word in _redirect_ops(segment) if start > word]
     if not cuts:
         return segment
     bounds = [0, *cuts, len(segment)]
     return " ".join(segment[a:b] for a, b in zip(bounds, bounds[1:]))
+
+
+# The flag on an `_expand` entry read with its redirections cut.
+_BARE = "bare"
+
+
+def _without_redirects(segment: str) -> str:
+    """``segment`` with every live redirection and its target cut out, or
+    ``segment`` itself when none is followed by another word.
+
+    A redirection is no argument: `bash -c>/dev/null '<cmd>'`,
+    `bash -c 2>/dev/null '<cmd>'` and `env -u >f X <cmd>` run the words around
+    it, but every option walker read the redirection as the script or the
+    option's value (XERK-1754 QA). Read beside the segment, never in place:
+    the stdout-target, reader and heredoc rules read the redirections."""
+    if "<" not in segment and ">" not in segment:
+        return segment
+    states = _quote_states(segment)
+    n = len(segment)
+    out, at = [], 0
+    for start, op, _word in _redirect_ops(segment):
+        if start < at:
+            continue  # inside the last one's target
+        j = op
+        while j < n and segment[j] in "<>&|" and not states[j]:
+            j += 1
+        while j < n and segment[j] in " \t":
+            j += 1
+        # The target: one word, its own `$(…)`/`<(…)`/`${…}` held whole.
+        first, inner = j, 0
+        while j < n and (states[j] or inner or segment[j] not in _WORD_BREAK + "&<>"
+                         or j == first and segment[j + 1:j + 2] == "("):
+            if not states[j]:
+                if segment[j] in "({":
+                    inner += 1
+                elif segment[j] in ")}" and inner:
+                    inner -= 1
+            j += 1
+        # One blank per run of them: a blank per cut grew a 20k run that a
+        # quadratic scan downstream choked on.
+        if not (out and at == start):
+            out += (segment[at:start], " ")
+        at = j
+    if not out or not segment[at:].strip(";&| \t\r\n"):
+        # Only trailing redirections: the words before them read the same
+        # with or without them, and a second reading of every `cmd 2>&1`
+        # doubled real commands' cost toward the deadline (replayed).
+        return segment
+    out.append(segment[at:])
+    return "".join(out)
 
 
 @functools.lru_cache(maxsize=512)
@@ -10124,6 +10191,18 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 if seg not in seen:
                     seen.add(seg)
                     segments.append(seg)
+    # ...and each segment with its redirections cut out, the words bash runs:
+    # `bash -c>/dev/null '<cmd>'` read the redirection as the script
+    # (XERK-1754 QA). Added, never swapped: the redirect rules need them.
+    # Flagged (`_BARE`) so the PR-description check, which reads a body from
+    # those redirections, skips them.
+    bare_segments: set[str] = set()
+    for seg in list(segments):
+        bare = _without_redirects(seg)
+        if bare not in seen:
+            seen.add(bare)
+            bare_segments.add(bare)
+            segments.append(bare)
     # `xargs` takes its operands from the PIPE, not its own argv, so
     # `echo /etc | xargs rm -rf` carries the target in a sibling segment.
     # Collect every path-shaped operand in the command so an xargs segment can
@@ -10444,7 +10523,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
             # refused rather than read as the harmless placeholder.
             out.append(([_UNREAD_PROG], seg))
             continue
-        out.append((tokens, seg))
+        out.append((tokens, seg, False, _BARE) if raw in bare_segments else (tokens, seg))
         prog = _basename(tokens[0])
         rest = tokens[1:]
         # `busybox` is stripped as a wrapper, which lost busybox itself as a
@@ -12538,7 +12617,9 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
     named: set[str] = set()  # every other path an earlier segment mentions
     # Without the `~` reading (XERK-1685): it repeats the line, and a writer
     # read twice is "another part" naming the file it wrote.
-    for tokens, segment, *_flags in _expand_both(command, home=False):
+    for tokens, segment, *flags in _expand_both(command, home=False):
+        if flags[1:2] == [_BARE]:
+            continue  # its redirections are where gh reads the body from
         if _basename(tokens[0]) == "cd" and len(tokens) > 1:
             cwd = _join_path(cwd, tokens[1])
             continue

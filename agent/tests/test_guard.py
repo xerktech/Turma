@@ -3358,14 +3358,31 @@ class TestScriptChannels(unittest.TestCase):
                     "chmod -R 000 /etc>/dev/null",
                     "rm -rf --no-preserve-root />/dev/null", "rm -rf ~/>/dev/null",
                     "cd /; cd /tmp; rm -rf ~->/dev/null",
-                    "f() { rm -rf /etc>/dev/null; }", "bash -c 'rm -rf /etc>/dev/null'"):
+                    "f() { rm -rf /etc>/dev/null; }", "bash -c 'rm -rf /etc>/dev/null'",
+                    # A `(` inside `${…}` closes no frame (QA).
+                    "x=${y:-(} rm -rf /etc>/dev/null", "x=${y//(/} rm -rf /etc<<<x",
+                    "rm -rf ${y:-(} /etc>/dev/null"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A redirection is no argument: every option walker reads the words
+        # around it, glued or not (QA).
+        R = "rm -rf /"
+        for cmd in (f"bash -c>/dev/null '{R}'", f"bash -c 2>/dev/null '{R}'",
+                    f"bash -c </dev/null '{R}'", f"bash -ec>x '{R}'",
+                    f"sh -c>/dev/null -- '{R}'", f"env bash -c>x '{R}'",
+                    f"find /tmp -maxdepth 0 -exec sh -c>/dev/null '{R}' \\;",
+                    "bash -c 'rm -rf \"$1\"' _>/dev/null /etc",
+                    f"env -u>/dev/null X {R}", f"timeout -s >/dev/null KILL 5 {R}",
+                    f"exec -a>/dev/null name {R}", f"echo x | xargs -n>/dev/null 1 {R}",
+                    f"eval>/dev/null -- '{R}'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # A quoted or escaped `>` is text, a digit word is the fd, and an
         # ordinary target stays allowed.
         for cmd in ('rm -rf "/etc>x"', "rm -rf '/etc'\\>x", "rm -rf /etc2>/dev/null",
                     "rm -rf build>/dev/null 2>&1", "ls /etc>out.txt",
-                    "echo $((1<<2))>f", "cat a<(echo hi)"):
+                    "echo $((1<<2))>f", "cat a<(echo hi)", "bash -c 'ls' < <(echo hi) 2>&1",
+                    "cat <<< x >out 2>&1"):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 

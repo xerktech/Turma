@@ -17,7 +17,16 @@ paths:
 - **A live `<`/`>` glued to a word ends it** (XERK-1754, `_unglue_redirects` in the tokenizer):
   shlex kept `rm -rf /etc>/dev/null` one word `/etc>/dev/null`, which named no protected root.
   - Left glued: an fd word (`2>`, `{fd}>`; `/etc2>` is the word `/etc2`), `<(`/`>(`, quoted or
-    escaped text, and anything inside `$(…)`/`${…}`/`(…)`/backticks (read when those bodies are).
+    escaped text, and anything inside a CLOSED `$(…)`/`${…}`/`(…)`/backtick (read with its body).
+  - A frame that never closes does not hide its redirections (`_redirect_ops`): `${y:-(}`
+    spliced reads `(`, and skipping it hid `rm -rf /etc>/dev/null` after it (QA).
+  - A segment with a redirection BEFORE another word is ALSO read with them cut (`_without_redirects`):
+    every option walker took one as an argument (`bash -c>/dev/null '…'`, `bash -c 2>f '…'`,
+    `env -u >f X cmd`, `eval>f -- '…'`). Added, never swapped: the redirect rules read them.
+    - Flagged `_BARE` on its `_expand` entry; `pr_summary_reason` skips it (gh reads `-F -` there).
+    - Trailing-only redirections add no copy: a copy of every `cmd 2>&1` doubled real cost (replay).
+    - `_stray_group_fragments` strips its tail by a backward walk: the regex was quadratic in an
+      inner blank run, which these copies made.
   - In the tokenizer, not per target rule: every `_tokenize` consumer gets bash's words.
   - `_script_file_readings` reads each written text once: `>f>f…` wrote 20k copies of one text.
   - Tests: `test_a_redirection_glued_to_a_target_ends_it`.
