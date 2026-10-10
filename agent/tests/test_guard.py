@@ -2292,6 +2292,43 @@ class TestScriptChannels(unittest.TestCase):
                 self.assertDenied(cmd)
         self.assertAllowed("cd ~root/ && rm -rf build")
 
+    def test_a_cd_overrides_the_line_s_own_pwd_assignment(self):
+        """XERK-1753: `cd` rewrites PWD and OLDPWD, so the line's own
+        assignment is not where a later `$PWD` points; each reached rm as /etc."""
+        for cmd in ("PWD=/x; cd /etc; rm -rf $PWD",
+                    "OLDPWD=/x; cd /etc; cd /tmp; rm -rf $OLDPWD",
+                    "OLDPWD=/x; cd /etc; cd /tmp; rm -rf ~-",
+                    "PWD=/x; cd /etc; d=$PWD; rm -rf $d",
+                    "PWD=/x; pushd /etc; rm -rf $PWD",
+                    "PWD=/x; cd /etc; rm -rf \"${PWD}\"/*",
+                    "read PWD <<< /x; cd /etc; rm -rf $PWD",
+                    "bash -c 'PWD=/x; cd /etc; rm -rf $PWD'",
+                    # The assigned reading stays: `cd -` goes to OLDPWD's value.
+                    "OLDPWD=/; cd /tmp/a; cd -; rm -rf *",
+                    # QA: a loop's `cd $d` reaches each word, any spelling of
+                    # the name assigns it, and a substitution prints it.
+                    "PWD=/y; for d in /tmp/q /etc; do cd $d && rm -rf $PWD/*; done",
+                    "for d in /tmp/q /etc; do PWD=/y; cd \"$d\"; rm -rf \"$PWD\"; done",
+                    "export {PWD,Z}=/x; cd /etc; rm -rf $PWD",
+                    "declare {P,Q}WD=/x; cd /etc; rm -rf $PWD",
+                    "eval \"P\"\"WD=/x\"; cd /etc; rm -rf $PWD",
+                    "x=PW; eval \"${x}D=/x\"; cd /etc; rm -rf $PWD",
+                    "eval $'P\\x57D=/x'; cd /etc; rm -rf $PWD",
+                    "printf -v $'\\x50WD' /x; cd /etc; rm -rf $PWD",
+                    "export P{W,}D=/x; cd /etc; rm -rf $PWD",
+                    "read P{W,}D <<< '/x /y'; cd /etc; rm -rf $PWD",
+                    "eval $'OLDP\\x57D=/x'; cd /etc; cd /tmp; rm -rf ~-",
+                    "PWD=/x; cd /etc; rm -rf \"$(echo $PWD)\"",
+                    "PWD=/x; cd /etc; x=$(printf %s \"$PWD\"); rm -rf \"$x\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("PWD=/tmp/x; rm -rf $PWD",
+                    "PWD=/x; cd /usr/src/app && rm -rf $PWD/build",
+                    "OLDPWD=/x; cd /tmp/a; cd /tmp/b; rm -rf $OLDPWD/build",
+                    "PWD=/y; for d in /tmp/q /tmp/r; do cd $d && rm -rf $PWD/build; done"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_tilde_and_pwd_follow_the_line_s_own_home_and_cd(self):
         """XERK-1685: bash expands `~` from HOME's current value and `$PWD` is
         where a `cd` left it, so each of these reached rm as /etc (nobody rig)."""
@@ -5559,6 +5596,25 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         with mock.patch.dict(os.environ, {"HOME": "/"}):
             self.assertIsNotNone(guard.is_destructive("rm -rf $HOME/etc"))
             self.assertIsNone(guard.is_destructive("rm -rf $HOME/.cache"))
+
+    def test_a_case_op_with_a_pattern_on_home_is_the_home(self):
+        # XERK-1759: a case op maps only what its pattern matches, so one
+        # matching nothing (`x`, `/etc`) leaves HOME whole; `~` toggles.
+        for home in ("/root", "/home/qah"):
+            with self.subTest(home=home), mock.patch.dict(os.environ, {"HOME": home}):
+                for cmd in ('rm -rf "${HOME,x}"', "rm -rf ${HOME,/etc}", 'rm -rf "${HOME^x}"',
+                            'rm -rf "${HOME,[a-z]}"', 'rm -rf "${HOME~}"', 'rm -rf "${HOME~~}"',
+                            'rm -rf "${HOME^^x}"/', 'rm -rf "${HOME,,$y}"', 'rm -rf "${HOME~~x}"/*',
+                            "chmod -R 777 ${HOME,x}/.."):
+                    with self.subTest(cmd=cmd):
+                        self.assertIsNotNone(guard.is_destructive(cmd))
+                for cmd in ('rm -rf "${HOME,x}"/.cache', "rm -rf ${HOME,,x}/proj/build",
+                            "rm -rf ${HOME^^x}/proj/build", "rm -rf ${HOME~~x}/proj/build",
+                            "rm -rf ${HOME~~}/proj/build", "rm -rf ${HOME^^[!a-z]}/proj/build"):
+                    with self.subTest(cmd=cmd):
+                        self.assertIsNone(guard.is_destructive(cmd))
+                # An unpatterned `^^` keeps main's mapped reading (over-denies).
+                self.assertIsNotNone(guard.is_destructive("rm -rf ${HOME^^}/proj/build"))
 
     def test_a_program_or_flag_built_from_home_is_read_with_the_real_home(self):
         # XERK-1686: HOME is set, so `${HOME:+r}` is `r` and `${HOME/*/rm}` is

@@ -27,6 +27,12 @@ paths:
     whose target it can change (`_HOME_TARGET_PROGS`); a default in heredoc data doubled a
     4.7 KB command past the deadline (QA). A line holding both a target command and a
     default still pays twice; it fails closed (rollup, XERK-1584).
+- A case op on HOME with a pattern, or `~`/`~~`, reads as HOME (`_HOME_CASE_OP_RE`, XERK-1759):
+  a pattern matching nothing (`${HOME,x}`) leaves HOME whole; any other result is the home on a
+  case-blind disk and no path on a normal one. Never add the mapped form beside it: an
+  upper-cased home is not mapped back, so `${HOME^^x}/proj` would over-deny.
+  - Unpatterned `^^ ,, ^ ,` keep `_CASE_OPS`'s mapped reading (`${HOME^^}/proj` over-denies).
+  - Tests: `test_a_case_op_with_a_pattern_on_home_is_the_home`.
 - An op sees HOME as written (`${HOME%root/}etc` is /etc when HOME=/root/); only the
   map-back normalises it.
 - Only person homes map back (session HOME, /root, /home/*, /Users/*): `~bin/x` is /bin/x.
@@ -41,6 +47,14 @@ paths:
     `~+` always reads as `$PWD`.
   - `~-` reads as `$OLDPWD`, and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD` (XERK-1696);
     `_under_cwd` reads `$OLDPWD` as `$PWD`: any directory the line visited, unordered.
+  - A line that assigns PWD/OLDPWD AND moves (`cd`/`pushd`/`popd`) is also read with both
+    unassigned (`_PWD_UNASSIGNED`, XERK-1753): `cd` rewrites them, so spliced,
+    `PWD=/x; cd /etc; rm -rf $PWD` read `/x`. Added, never swapped: `cd -` reads OLDPWD's value.
+    - Gated on a move (`_MOVES_RE`) AND a values pass of this decision having bound either name
+      (`_PWD_SEEN`), however spelled (`$'P\x57D'`, `P{W,}D`, `eval "${x}D=…"`). Never a text
+      gate: each pattern missed the next spelling, and a broad one cost +53% CPU (QA, 3 passes).
+    - Each `for` word's pass is read unassigned too: a loop's `cd $d` reaches its words only there.
+    - Accepted over-read (visited dirs are unordered): `cd /etc; PWD=/tmp/x; rm -rf $PWD`.
   - `_PWD_LEAD_RE` also takes `${PWD:?}`/`${PWD?}` and an unspliced directory tilde, which
     `eval rm '~-'` / `\~-` reach a target as (the splice's lookbehind skips quotes).
     `${PWD:-x}` never reaches it: the default is spliced upstream (XERK-1755).
@@ -77,7 +91,8 @@ paths:
   - Known false deny: `HOME=/ rm -rf ~/etc` (a prefix binding; bash expands `~` first),
     as `$HOME` already is there.
   - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`,
-    `test_directory_tildes_read_as_the_directories_the_line_visited`.
+    `test_directory_tildes_read_as_the_directories_the_line_visited`,
+    `test_a_cd_overrides_the_line_s_own_pwd_assignment`.
 - An unassigned `${HOME<op>}` (not a `:-`/`:=` default) is spliced in the values pass as its
   `_home_readings` (XERK-1686): kept as written, `${HOME:+r}m -rf /`, `${HOME/*/rm} -rf /` and
   `rm ${HOME:+-rf} /` hid the program or flag.

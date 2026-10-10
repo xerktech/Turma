@@ -1789,6 +1789,7 @@ def _budgeted(fn):
         _READINGS_SEEN[0] = False
         _PRINTED_DROP_SEEN[0] = False
         _READINGS_MOST[0] = 0
+        _PWD_SEEN[0] = False
         _FOR_NAMES.clear()
         # These memos set the readings' SEEN flags as they fill, and a hit
         # skips that: a body cached by an earlier decision in this process
@@ -1812,7 +1813,7 @@ def _memo(kind: str, key, fn, *args):
     key = (key, _SPLICE_RAW[0], _VALUES_MULTI[0], _VALUES_TAINT[0], _BRACE_GLUED[0],
            _VALUE_PICK[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUES_CHAINED[0],
            _FOR_PICK[0], _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0], _PRINTED_DROP[0],
-           _READING_PICK[0])
+           _READING_PICK[0], _PWD_UNASSIGNED[0])
     if key not in memo:
         before = _SPLICES_ESCAPED[0]
         memo[key] = (fn(*args), _SPLICES_ESCAPED[0] - before)
@@ -3575,6 +3576,15 @@ def _assigned_values(command: str, depth: int = 0,
     # level re-inlined it, the text grew each time, and an ordinary command
     # was refused as nested too deeply. An unresolvable one is empty, as bash
     # reads an unset name.
+    if _PWD_UNASSIGNED[0]:
+        # `cd` rewrites both, so the line's own assignment is not where a
+        # later `$PWD` points: read as written, `_under_cwd` judges them
+        # against every directory the line visited (XERK-1753).
+        for table in (vals, applied, where, applied_where):
+            for name in _CD_NAMES:
+                table.pop(name, None)
+    elif any(name in vals or name in applied for name in _CD_NAMES):
+        _PWD_SEEN[0] = True
     plain = {k: [v for v in vs if not _names_assigned(v, vals)] for k, vs in vals.items()}
     own = {k: len(vs) for k, vs in vals.items()}
     # An applied default is one more value of its name, and resolves OTHER
@@ -5186,7 +5196,7 @@ def _reading() -> tuple:
     memoised under one reading was replayed under another (XERK-1621)."""
     return (_SPLICE_RAW[0], _BRACE_OTHER_SHELL[0], _MAIN_PARSE[0], _VALUE_PICK[0],
             _HOME_KEPT[0], _READINGS_JOINED[0], _BRACE_QUOTED[0], _PRINTED_DROP[0],
-            _READING_PICK[0])
+            _READING_PICK[0], _PWD_UNASSIGNED[0])
 
 
 # Names a `for NAME in …` sets this decision. Its words are joined as the
@@ -5247,6 +5257,17 @@ _MAIN_PARSE_SEEN = [False]
 # HOME is set where an agent runs, but `local HOME`, `read HOME` or `exec -c`
 # can unset it, so the default spliced is kept as a reading of its own.
 _HOME_KEPT = [False]
+# Set while `_expand_both` reads PWD/OLDPWD as unassigned on a line that also
+# moves (XERK-1753): `cd` rewrites both, so `PWD=/x; cd /etc; rm -rf $PWD`
+# removes /etc, which only the unspliced `$PWD` (`_under_cwd`) reads. The
+# assigned reading stays: `cd -` goes to the OLDPWD the line set.
+_PWD_UNASSIGNED = [False]
+_CD_NAMES = ("PWD", "OLDPWD")
+_MOVES_RE = re.compile(r"(?<![\w-])(?:cd|pushd|popd)(?![\w-])")
+# Whether any values pass of this decision bound PWD or OLDPWD, however the
+# line spelled the name (`$'P\x57D'`, `P{W,}D`, `eval "${x}D=…"`): a text
+# gate missed each spelling in turn, and a broad one cost +50% (XERK-1753 QA).
+_PWD_SEEN = [False]
 # Set while `_expand_both` reads the line with each multi-reading expansion
 # spliced as its Nth reading (`_splice_readings`); and the most readings one
 # expansion of this decision had (XERK-1664).
@@ -7651,6 +7672,14 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
             out = out + _expand_readings(command)
         finally:
             _HOME_KEPT[0] = False
+    pwd_assigned = (not _PWD_UNASSIGNED[0] and _PWD_SEEN[0]
+                    and _MOVES_RE.search(command) is not None)
+    if pwd_assigned:
+        _PWD_UNASSIGNED[0] = True
+        try:
+            out = out + _expand_readings(command)
+        finally:
+            _PWD_UNASSIGNED[0] = False
     for reading in _home_tilde_readings(command) if home else ():
         out = out + _expand_both(reading)
     if _READINGS_MOST[0] > 1 and _READING_PICK[0] is None:
@@ -7682,10 +7711,17 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
             for chain in chained:
                 _VALUES_CHAINED[0] = chain
                 out = out + _expand_values(line)
+            if pwd_assigned:
+                # ...and with PWD/OLDPWD unassigned: a `cd $d` in the loop
+                # reaches each word only here (XERK-1753 QA).
+                _PWD_UNASSIGNED[0] = True
+                out = out + _expand_values(line)
         finally:
             _FOR_PICK[0] = None
             _VALUES_CHAINED[0] = 0
+            _PWD_UNASSIGNED[0] = False
     return out
+
 
 
 # A `~` bash expands to $HOME (`~+` to $PWD, `~-` to $OLDPWD, `~N`/`~+N`/`~-N`
@@ -11184,6 +11220,8 @@ _HOME_NAME_RE = re.compile(r"\$HOME(?!\w)")
 # prompt codes, which a path holding none keeps as it is.
 _HOME_TRANSFORMS = {"@E": lambda v: v, "@P": lambda v: v, "@L": str.lower,
                     "@U": str.upper, "@u": lambda v: v[:1].upper() + v[1:]}
+# bash's case ops (`^ ^^ , ,, ~ ~~`; `~` toggles), each with an optional pattern.
+_HOME_CASE_OP_RE = re.compile(r"(\^\^|,,|~~|\^|,|~)(.*)", re.DOTALL)
 # Past this many `${HOME<op>}` in one target the reading is `/`: each pattern
 # operator costs a match per substring of HOME, and a target that size is no path.
 _MAX_HOME_OPS = 64
@@ -11258,6 +11296,12 @@ def _home_expanded(raw: str, home: str, budget: list[int]) -> str | None:
         op = _VAR_OP_RE.match(tail)
         if tail == "" or tail[:1] in ("-", "=", "?") or tail[:2] in (":-", ":=", ":?"):
             value = home  # set and non-empty, so the default is unused
+        elif tail not in _CASE_OPS and _HOME_CASE_OP_RE.fullmatch(tail):
+            # A case op maps only what its optional pattern matches, so one
+            # matching nothing (`${HOME,x}`) leaves HOME as is (XERK-1759). Any
+            # other result is the home on a case-blind disk and no path on a
+            # normal one, so HOME is the reading that matters.
+            value = home
         elif tail in _CASE_OPS:
             value = _CASE_OPS[tail](home)
         elif tail in _HOME_TRANSFORMS:
