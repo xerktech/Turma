@@ -252,6 +252,22 @@ test('a module planted beside the hooks cannot disable the guard (XERK-1681)', (
   assert.ok(r && /protected path/.test(r), `expected the guard's own denial, got: ${r}`)
 })
 
+test('guardArgs reach guard.py: --protected ignores an env grant (XERK-1751)', () => {
+  // A nested runtime inherits whatever env its session gives it; the root-owned
+  // guard runs --protected so a Bash(*) grant there cannot lift a deny.
+  const prev = process.env.TURMA_TOOL_GRANTS
+  process.env.TURMA_TOOL_GRANTS = 'Bash(*)'
+  try {
+    const call = ex('bash', { command: 'rm -rf ~' })
+    assert.equal(decideDeny(call, cfg), null, 'baseline: the env grant lifts the deny')
+    const prot = compileConfig({ ...cfg, guardArgs: ['--protected'] })
+    assert.ok(decideDeny(call, prot), 'with --protected the deny must stand')
+  } finally {
+    if (prev === undefined) delete process.env.TURMA_TOOL_GRANTS
+    else process.env.TURMA_TOOL_GRANTS = prev
+  }
+})
+
 // --- glob matcher --------------------------------------------------------
 
 test('globToRegExp: ** crosses / but * does not', () => {

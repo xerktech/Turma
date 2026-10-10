@@ -180,7 +180,7 @@ function resolveTarget(p, cwd) {
 // interpreter, missing script, crash, timeout) we DENY with a clear reason
 // rather than silently stop enforcing — a guard that quietly disengages is the
 // exact "not shippable" state this ticket exists to prevent.
-function runHook(cfg, script, toolName, toolInput, cwd) {
+function runHook(cfg, script, toolName, toolInput, cwd, args = []) {
   if (!script) return null
   const payload = JSON.stringify({
     tool_name: toolName,
@@ -191,7 +191,7 @@ function runHook(cfg, script, toolName, toolInput, cwd) {
   })
   let out
   try {
-    out = execFileSync(cfg.pythonExe || 'python3', ['-SI', script], {
+    out = execFileSync(cfg.pythonExe || 'python3', ['-SI', script, ...args], {
       input: payload,
       timeout: cfg.hookTimeoutMs || 5000,
       maxBuffer: 1 << 20,
@@ -231,7 +231,8 @@ export function decideDeny(execution, cfg) {
   if (c.kind === 'shell') {
     // destructive / policy / attribution — guard.py. Shell commands walk past
     // the path rules exactly as they do under Claude (agent-hooks.md / XERK-309).
-    return runHook(cfg, cfg.guardScript, 'Bash', { command: c.command }, cfg.cwd)
+    return runHook(cfg, cfg.guardScript, 'Bash', { command: c.command }, cfg.cwd,
+      Array.isArray(cfg.guardArgs) ? cfg.guardArgs : [])
   }
 
   if (c.kind === 'write') {

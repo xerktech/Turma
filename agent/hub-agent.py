@@ -5137,17 +5137,20 @@ def managed_guard_active(dropin=None, hooks_dir=None):
     return True
 
 
-def runtime_hook_paths(managed=None):
-    """(guard.py, fileguard.py) for the dsh and qwen guards (XERK-1751). Those
-    runtimes never read Claude's managed settings, so they shell out to whatever
-    path their config names: the root-owned copies while the managed guard is
-    active, else the install's own (`$PREFIX/hooks`, which the session uid can
-    write and so stub, as in XERK-1643)."""
+def runtime_hooks(managed=None):
+    """(guard.py, fileguard.py, guard.py's extra argv) for the dsh and qwen
+    guards (XERK-1751). Those runtimes never read Claude's managed settings, so
+    they shell out to whatever their config names: the root-owned copies while
+    the managed guard is active, else the install's own (`$PREFIX/hooks`, which
+    the session uid can write and so stub, as in XERK-1643). The root-owned
+    guard runs `--protected`, as the drop-in runs it: a session can start a
+    nested runtime with `TURMA_TOOL_GRANTS='Bash(*)'` in its env."""
     managed = managed_guard_active() if managed is None else managed
     if managed:
         return (os.path.join(PROTECTED_HOOKS_DIR, "guard.py"),
-                os.path.join(PROTECTED_HOOKS_DIR, "fileguard.py"))
-    return guard_script_path(), fileguard_script_path()
+                os.path.join(PROTECTED_HOOKS_DIR, "fileguard.py"),
+                ["--protected"])
+    return guard_script_path(), fileguard_script_path(), []
 
 
 # Hook integrity (XERK-1643). The updater records the installed hooks' hashes in
@@ -5742,7 +5745,8 @@ def build_dsh_guard_config(python_exe=None, guard_path=None, fileguard_path=None
     writes + an approval seam that denies an unanswered escalation.
     """
     python_exe = python_exe or sys.executable or "python3"
-    default_guard, default_fileguard = runtime_hook_paths()
+    default_guard, default_fileguard, protected_args = runtime_hooks()
+    guard_args = protected_args if not guard_path else []
     guard_path = guard_path or default_guard
     fileguard_path = fileguard_path or default_fileguard
     settings = build_guard_settings(python_exe=python_exe, guard_path=guard_path,
@@ -5767,6 +5771,7 @@ def build_dsh_guard_config(python_exe=None, guard_path=None, fileguard_path=None
     plugin = {
         "pythonExe": python_exe,
         "guardScript": guard_path,
+        "guardArgs": guard_args,
         "fileguardScript": fileguard_path if os.path.exists(fileguard_path) else None,
         "denyWrite": deny_write,
         "denyRead": deny_read,
@@ -5873,7 +5878,8 @@ def build_qwen_guard_config(python_exe=None, guard_path=None, fileguard_path=Non
     dsh builder does) so there is no second list to keep in sync.
     """
     python_exe = python_exe or sys.executable or "python3"
-    default_guard, default_fileguard = runtime_hook_paths()
+    default_guard, default_fileguard, protected_args = runtime_hooks()
+    guard_args = protected_args if not guard_path else []
     guard_path = guard_path or default_guard
     fileguard_path = fileguard_path or default_fileguard
     shim_path = shim_path or qwen_guard_shim_path()
@@ -5901,6 +5907,7 @@ def build_qwen_guard_config(python_exe=None, guard_path=None, fileguard_path=Non
     shim_config = {
         "pythonExe": python_exe,
         "guardScript": guard_path,
+        "guardArgs": guard_args,
         # None degrades ~/.claude protection to the write-deny globs only, matching
         # the dsh guard; the shim treats a missing SHELL guard as fail-closed, but
         # a missing fileguard as a degrade (the globs still name the catastrophic

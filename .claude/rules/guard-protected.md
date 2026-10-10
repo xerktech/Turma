@@ -56,7 +56,7 @@ stub (XERK-1643 incident). `agent/native/turma-agent-protect` moves the two SECU
 - Still session-controllable (best-effort, XERK-1749): `~/.turma/grants` and the grant's
   `TURMA_SESSION_ID` env, `$HOME` as guard.py's own home readings use it, `ask.py`/`permlog.py`, the
   `--settings` deny rules, the `claude` binary in `~/.local`.
-- **dsh and qwen read no managed settings**, so `runtime_hook_paths()` points their guard configs at
+- **dsh and qwen read no managed settings**, so `runtime_hooks()` points their guard configs at
   the protected copies while `managed_guard_active()` (XERK-1751); both caches re-check it per launch.
   - They run the protected guard WITHOUT `--protected`: its env is the runtime's own, which the
     session cannot set (unlike a nested `claude`'s).

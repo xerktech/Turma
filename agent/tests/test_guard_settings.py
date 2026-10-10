@@ -531,9 +531,11 @@ class TestManagedGuard(unittest.TestCase):
             for cfg in (dsh, qwen):
                 self.assertEqual(cfg["guardScript"], os.path.join(d, "guard.py"))
                 self.assertEqual(cfg["fileguardScript"], os.path.join(d, "fileguard.py"))
+                self.assertEqual(cfg["guardArgs"], ["--protected"])
         with mock.patch.object(ha, "managed_guard_active", return_value=False):
             dsh = ha.build_dsh_guard_config(python_exe="/usr/bin/python3")["plugin"]
         self.assertEqual(dsh["guardScript"], ha.guard_script_path())
+        self.assertEqual(dsh["guardArgs"], [])
 
     def test_dsh_and_qwen_configs_are_rebuilt_when_protection_changes(self):
         with tempfile.TemporaryDirectory() as d:
