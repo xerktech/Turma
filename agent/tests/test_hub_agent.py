@@ -32318,6 +32318,20 @@ class TestMergePr(ManagerMixin, unittest.TestCase):
         self.assertEqual(seen, {"cid": "c5", "sid": "s1", "url": self.URL, "head": "b" * 40})
         self.assertIn("c5", sm.acked)
 
+    def test_the_async_worker_carries_the_stamped_head_to_the_merge(self):
+        sm = self.make_manager()
+        seen = {}
+
+        class FakeThread:
+            def __init__(self, target, args, **kw):
+                seen["target"], seen["args"] = target, args
+
+            def start(self):
+                pass
+        with mock.patch.object(ha.threading, "Thread", FakeThread):
+            sm._merge_pr_async("c7", "s1", self.URL, "d" * 40)
+        self.assertEqual(seen["args"], ("c7", "s1", self.URL, "d" * 40))
+
     def test_a_failed_thread_start_stages_a_result_on_the_beat(self):
         sm = self.make_manager()
         with mock.patch.object(ha.threading, "Thread",
