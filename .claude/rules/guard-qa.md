@@ -27,3 +27,12 @@ paths:
     re-read doubled the work per nesting level and turned big benign scripts into "too large".
   - Probe any token-joining or header change with quoted/escaped/printed `()`, extglob args,
     `\`-newline splits, zsh quoted names (`'f g'(){`), and timing on nested `eval`s full of functions.
+- **A speed test never asserts wall-clock time** (XERK-1750): CI runners are loaded, and one ran
+  2-8x over idle. Time with `time.process_time()`.
+  - CPU time still rose ~2.2x at 48 busy loops on 16 threads (shared cores), so a ceiling
+    sits at ~3x idle CPU. It only has to catch the quadratic blowups (14-180s) it guards.
+  - A "too large" verdict is the same reason whether the budget or `_MAX_DECIDE_SECONDS` stopped
+    it, and a CPU ceiling at or past the live deadline can never trip. So `test_guard.py` sets
+    the deadline off at module top; only the deadline tests patch it back. Keep it off.
+  - Keep wall time only where a HANG is the defect (a FIFO read), since a blocked process spends
+    no CPU.
