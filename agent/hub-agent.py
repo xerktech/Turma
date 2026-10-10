@@ -31353,7 +31353,7 @@ class SessionManager:
     # deliberate override of. The outcome is staged so the hub stops retrying a
     # merge `gh` refuses (branch protection, review required, a fresh conflict).
 
-    def _merge_pr_async(self, cmd_id, session_id, url):
+    def _merge_pr_async(self, cmd_id, session_id, url, head=None):
         """Run the merge on its OWN thread, never the beat (XERK-395): `gh pr
         merge` is a blocking network call dispatched from handle_commands, which
         runs on the heartbeat loop, so inline it could stall the beat past
@@ -31363,7 +31363,7 @@ class SessionManager:
         backoff bounds re-dispatch, so no tracking/join is needed."""
         try:
             threading.Thread(
-                target=self.merge_pr, args=(cmd_id, session_id, url),
+                target=self.merge_pr, args=(cmd_id, session_id, url, head),
                 name="pr-merge", daemon=True).start()
         except Exception as e:
             with self._merge_pr_lock:
@@ -31373,7 +31373,7 @@ class SessionManager:
                 })
                 del self.merge_pr_results[:-MERGE_PR_RESULTS_MAX]
 
-    def merge_pr(self, cmd_id, session_id, url):
+    def merge_pr(self, cmd_id, session_id, url, head=None):
         """Merge one PR the hub judged ready. GitHub only for now: a GitLab MR or
         Azure DevOps PR stages a refusal so the hub gives up rather than retrying
         a merge this path can't do. Never raises (runs on a worker thread)."""
@@ -31406,9 +31406,12 @@ class SessionManager:
             # push, so for up to a minute after one the hub still sees the OLD
             # head's green. GitHub refuses a moved head ("Head branch was
             # modified … try the merge again"), which _merge_error_retryable
-            # retries — by then the status is the new head's.
-            st = self.pr_status_cache.get(u)
-            head = st.get("head") if isinstance(st, dict) else None
+            # retries — by then the status is the new head's. The hub stamps the
+            # head it JUDGED on the command; this host's cache may already hold
+            # a newer, still-pending head, so it is only the older-hub fallback.
+            if not (isinstance(head, str) and _GIT_SHA_RE.match(head)):
+                st = self.pr_status_cache.get(u)
+                head = st.get("head") if isinstance(st, dict) else None
             if isinstance(head, str) and _GIT_SHA_RE.match(head):
                 cmd += ["--match-head-commit", head]
             # Run from a NEUTRAL, non-repo cwd (REGISTRY_DIR), NEVER the session
@@ -37589,7 +37592,7 @@ class SessionManager:
                     self.spawn_epic_builder(cmd)
                 elif ctype == "mergePr":
                     self._merge_pr_async(
-                        cid, cmd.get("sessionId"), cmd.get("url"))
+                        cid, cmd.get("sessionId"), cmd.get("url"), cmd.get("head"))
                 elif ctype == "setJiraRepo":
                     self.set_jira_repo(
                         cmd.get("issueKey"), cmd.get("repo"),

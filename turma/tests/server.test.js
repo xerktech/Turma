@@ -13226,6 +13226,27 @@ test("auto-merge holds for a timed wait ahead of its ETA, never for an external 
   }
 });
 
+test("auto-merge stamps the head commit it judged ready on the mergePr command", async () => {
+  // The agent pins the merge to it; its own cache may already hold a newer,
+  // still-pending head by the time the command is delivered.
+  for (const [head, want] of [["c".repeat(40), "c".repeat(40)], ["--admin", undefined], [undefined, undefined]]) {
+    resetEpicD();
+    const host = "edHead";
+    const site = "dhead.atlassian.net";
+    const url = "https://github.com/ep/h1/pull/1";
+    const sess = dChildSession("s-c1", "C-1", site, "OPEN", url);
+    if (head !== undefined) sess.prs[0].head = head;
+    await asBeat(host, site, { autoStart: false,
+      tickets: [dEpic(), dChild("C-1", [], "inprogress")], sessions: [sess] });
+    armEpicRun(site, "E-1");
+    autoMergeSweep();
+    const c = (agents[host].commands || []).find((x) => x.type === "mergePr");
+    assert.ok(c, String(head));
+    assert.equal(c.head, want, String(head));
+    delete agents[host];
+  }
+});
+
 test("XERK-705/637: an armed run's child is MESSAGED to self-close on a merged PR — no Done write, no kill", async () => {
   // The child self-closes like any session now (XERK-705): the hub messages it, and
   // its own Done edge (once it moves the ticket) advances the wave via C. No forced

@@ -32174,6 +32174,17 @@ class TestMergePr(ManagerMixin, unittest.TestCase):
                 sm.merge_pr("c", None, self.URL)
             self.assertEqual(seen["cmd"], ["gh", "pr", "merge", self.URL, "--squash",
                                            "--delete-branch"] + want, cached)
+        # The hub's stamped head wins over this host's cache, which may already
+        # hold a newer, still-pending head; a malformed stamp falls back to it.
+        for stamped, want in (("b" * 40, "b" * 40), ("--admin", sha), (None, sha)):
+            sm = self.make_manager()
+            sm.pr_status_cache[self.URL] = {"head": sha, "ready": "pending"}
+            seen = {}
+            with mock.patch.dict(os.environ, {}, clear=True), \
+                 mock.patch.object(ha.subprocess, "run",
+                                   lambda cmd, **kw: seen.setdefault("cmd", cmd) and self._fake_run()):
+                sm.merge_pr("c", None, self.URL, stamped)
+            self.assertEqual(seen["cmd"][-2:], ["--match-head-commit", want], stamped)
         self.assertTrue(ha._merge_error_retryable(
             "GraphQL: Head branch was modified. Review and try the merge again. (mergePullRequest)"))
         self.assertEqual(ha._summarize_pr({"state": "OPEN", "headRefOid": sha})["head"], sha)
@@ -32300,10 +32311,11 @@ class TestMergePr(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         seen = {}
         with mock.patch.object(sm, "_merge_pr_async",
-                               lambda cid, sid, url: seen.update(cid=cid, sid=sid, url=url)):
+                               lambda cid, sid, url, head: seen.update(
+                                   cid=cid, sid=sid, url=url, head=head)):
             sm.handle_commands([{"cmdId": "c5", "type": "mergePr",
-                                 "sessionId": "s1", "url": self.URL}])
-        self.assertEqual(seen, {"cid": "c5", "sid": "s1", "url": self.URL})
+                                 "sessionId": "s1", "url": self.URL, "head": "b" * 40}])
+        self.assertEqual(seen, {"cid": "c5", "sid": "s1", "url": self.URL, "head": "b" * 40})
         self.assertIn("c5", sm.acked)
 
     def test_a_failed_thread_start_stages_a_result_on_the_beat(self):

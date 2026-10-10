@@ -14959,7 +14959,12 @@ function autoMergeSweep() {
           console.error(`auto-merge: giving up on ${p.url} after ${attempts - 1} attempts`);
           continue;
         }
-        const cmdId = queueCommand(host, { type: "mergePr", sessionId: s.id, url: p.url });
+        // `head`: the commit this readiness was judged on, so the agent pins the
+        // merge to it (--match-head-commit) — a push since then is refused and
+        // retried, never merged on the previous commit's green.
+        const head = typeof p.head === "string" && /^[0-9a-f]{40}$/.test(p.head) ? p.head : null;
+        const cmdId = queueCommand(host, { type: "mergePr", sessionId: s.id, url: p.url,
+          ...(head ? { head } : {}) });
         awaitResult(a, cmdId, "mergePr");
         rememberCmdHost(cmdId, host, "mergePr");
         autoMergeState.set(p.url, { at: now, attempts });
