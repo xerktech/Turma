@@ -5320,6 +5320,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                      "echo x | tr -d x", "echo x | sed 's/x//'", "echo x | cut -c2-",
                      "echo x | tail -n 0", "yes x | head -0", "sed d <<< x",
                      "echo x | uniq -d", "echo x | grep y | cat",
+                     "echo x | cat | grep y", "echo x | tee | sed d",
+                     "sed d <<< x; echo z | grep y",
+                     # Past `_MAX_TAINT_STARTS` statements that may be empty.
+                     "echo a | grep y; " * 9 + "echo z | grep y",
                      "false || " * 9 + "echo x"):
             for cmd in (f"$({body}) {p}", f"`{body}` {p}", f"x=$({body}); $x {p}"):
                 with self.subTest(cmd=cmd):
@@ -5333,6 +5337,13 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "for f in $(echo a b | grep a); do rm -rf /tmp/$f; done"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        # A long body past the cap stays cheap: its unread lead is read alone.
+        import time
+        for body in ("echo a | grep b; " * 400 + "echo a", "echo a | grep b || " * 400 + "echo a"):
+            with self.subTest(n=len(body)):
+                start = time.process_time()
+                guard.decide("Bash", {"command": f"x=$({body}); echo $x"}, cwd="/tmp")
+                self.assertLess(time.process_time() - start, 10)
 
     def test_many_assigned_taint_bodies_stay_fast(self):
         # XERK-1625: the taint passes over assigned values are capped at

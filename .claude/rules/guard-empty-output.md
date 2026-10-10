@@ -17,9 +17,14 @@ paths:
 - The readings are each suffix whose skipped statements may all be empty, plus the empty
   reading past the last (`starts`). Only a LEADING run counts: a statement skipped mid-way
   drops words, never the program.
-- Past `_MAX_TAINT_STARTS` the `_UNREAD_OUTPUT`-led reading stands in for the empty one (refused
-  as a program); one more pass there took a 20k-statement body past the test's 30s.
+- Past `_MAX_TAINT_STARTS` the readings are the all-run one and a BARE `_UNREAD_OUTPUT` (refused
+  as a program), which stands in for every later lead and for the empty reading.
+  - Never add the empty reading there too: a third pass took a 20k-statement body past 30s.
+  - Never put the words after the bare lead: spliced through `$x`, that long value cost ~12x
+    a plain pass, and a benign 17 KB `x=$(…); echo $x` went "too large" (QA).
 - Accepted over-deny: a filtered or conditional body in program position followed by
   destructive-looking words (`$(command -v x || echo y) rm -rf /etc`); the lookup-or-fallback
   over-deny in `guard-substitutions.md` already refused most of these.
+- Open (XERK-1778): nested substitutions (`_taint_nested` takes the all-run
+  reading), a `{ …; }` producer, `cat </dev/null`, a non-filter stage first, `exec >/dev/null`.
 - Tests: `test_a_body_that_may_print_nothing_does_not_hide_the_command`.

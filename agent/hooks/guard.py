@@ -1513,10 +1513,12 @@ def _body_tainted_at(body: str, raw: tuple) -> tuple[str, ...] | None:
     if len(starts) == 1:
         return (" ".join(out),)
     if len(starts) > _MAX_TAINT_STARTS:
-        # Too many to read each: any of them may lead, unread or not. As a
-        # program the unread lead is refused, so it stands in for the empty
-        # reading too (one more pass here doubled a 20k-statement body's cost).
-        return (" ".join(out), _UNREAD_OUTPUT + " " + " ".join(out))
+        # Too many to read each: any of them may lead, unread or not, or none
+        # (XERK-1758). An unread lead is refused as a program, so it stands in
+        # for the empty reading too: a third pass took a 20k-statement body
+        # past 30s. The lead alone, never followed by the words: a long value
+        # led by it cost ~12x a plain pass wherever `$x` was spliced (QA).
+        return (" ".join(out), _UNREAD_OUTPUT)
     return tuple(" ".join(out[i:]) for i in starts)
 
 
