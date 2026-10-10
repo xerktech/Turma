@@ -516,6 +516,44 @@ class TestManagedGuard(unittest.TestCase):
                     self.assertIn("Bash", [e["matcher"] for e in pre])
 
 
+    def test_dsh_and_qwen_guards_follow_the_protected_hooks(self):
+        # XERK-1751: dsh and qwen read no managed settings, so their configs
+        # must NAME the root-owned copies, never the session-writable $PREFIX ones.
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("guard.py", "fileguard.py"):
+                open(os.path.join(d, name), "w").close()
+            with mock.patch.object(ha, "PROTECTED_HOOKS_DIR", d), \
+                    mock.patch.object(ha, "managed_guard_active", return_value=True):
+                dsh = ha.build_dsh_guard_config(python_exe="/usr/bin/python3")["plugin"]
+                qwen = ha.build_qwen_guard_config(
+                    python_exe="/usr/bin/python3",
+                    config_path=os.path.join(d, "q.json"))["shimConfig"]
+            for cfg in (dsh, qwen):
+                self.assertEqual(cfg["guardScript"], os.path.join(d, "guard.py"))
+                self.assertEqual(cfg["fileguardScript"], os.path.join(d, "fileguard.py"))
+        with mock.patch.object(ha, "managed_guard_active", return_value=False):
+            dsh = ha.build_dsh_guard_config(python_exe="/usr/bin/python3")["plugin"]
+        self.assertEqual(dsh["guardScript"], ha.guard_script_path())
+
+    def test_dsh_and_qwen_configs_are_rebuilt_when_protection_changes(self):
+        with tempfile.TemporaryDirectory() as d:
+            for name in ("guard.py", "fileguard.py"):
+                open(os.path.join(d, name), "w").close()
+            mgr = ha.SessionManager.__new__(ha.SessionManager)
+            with mock.patch.object(ha, "REGISTRY_DIR", d), \
+                    mock.patch.object(ha, "PROTECTED_HOOKS_DIR", d):
+                with mock.patch.object(ha, "managed_guard_active", return_value=False):
+                    self.assertEqual(mgr._dsh_guard_config()["plugin"]["guardScript"],
+                                     ha.guard_script_path())
+                    mgr._qwen_guard_config()
+                with mock.patch.object(ha, "managed_guard_active", return_value=True):
+                    self.assertEqual(mgr._dsh_guard_config()["plugin"]["guardScript"],
+                                     os.path.join(d, "guard.py"))
+                    path = mgr._qwen_guard_config()["configPath"]
+                    self.assertEqual(json.load(open(path))["guardScript"],
+                                     os.path.join(d, "guard.py"))
+
+
 class TestOperatorLocalPermissions(unittest.TestCase):
     """The agent folds a user-level ~/.claude/settings.local.json (which Claude
     Code ignores) into the injected --settings so operator pre-approvals apply."""

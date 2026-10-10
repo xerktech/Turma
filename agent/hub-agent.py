@@ -5137,6 +5137,19 @@ def managed_guard_active(dropin=None, hooks_dir=None):
     return True
 
 
+def runtime_hook_paths(managed=None):
+    """(guard.py, fileguard.py) for the dsh and qwen guards (XERK-1751). Those
+    runtimes never read Claude's managed settings, so they shell out to whatever
+    path their config names: the root-owned copies while the managed guard is
+    active, else the install's own (`$PREFIX/hooks`, which the session uid can
+    write and so stub, as in XERK-1643)."""
+    managed = managed_guard_active() if managed is None else managed
+    if managed:
+        return (os.path.join(PROTECTED_HOOKS_DIR, "guard.py"),
+                os.path.join(PROTECTED_HOOKS_DIR, "fileguard.py"))
+    return guard_script_path(), fileguard_script_path()
+
+
 # Hook integrity (XERK-1643). The updater records the installed hooks' hashes in
 # `<prefix>/hooks.sha256` and reinstalls the current release when they drift, but
 # it runs hourly; a session that stubbed guard.py had every Bash call on the host
@@ -5729,8 +5742,9 @@ def build_dsh_guard_config(python_exe=None, guard_path=None, fileguard_path=None
     writes + an approval seam that denies an unanswered escalation.
     """
     python_exe = python_exe or sys.executable or "python3"
-    guard_path = guard_path or guard_script_path()
-    fileguard_path = fileguard_path or fileguard_script_path()
+    default_guard, default_fileguard = runtime_hook_paths()
+    guard_path = guard_path or default_guard
+    fileguard_path = fileguard_path or default_fileguard
     settings = build_guard_settings(python_exe=python_exe, guard_path=guard_path,
                                     local_settings_path=local_settings_path,
                                     fileguard_path=fileguard_path)
@@ -5859,8 +5873,9 @@ def build_qwen_guard_config(python_exe=None, guard_path=None, fileguard_path=Non
     dsh builder does) so there is no second list to keep in sync.
     """
     python_exe = python_exe or sys.executable or "python3"
-    guard_path = guard_path or guard_script_path()
-    fileguard_path = fileguard_path or fileguard_script_path()
+    default_guard, default_fileguard = runtime_hook_paths()
+    guard_path = guard_path or default_guard
+    fileguard_path = fileguard_path or default_fileguard
     shim_path = shim_path or qwen_guard_shim_path()
     config_path = config_path or QWEN_GUARD_CONFIG
     settings = build_guard_settings(python_exe=python_exe, guard_path=guard_path,
@@ -24645,10 +24660,15 @@ class SessionManager:
         once and reused. See ``build_dsh_guard_config`` / ``.claude/rules/dsh-guard.md``.
         Consumed by _ensure_dsh_profile (composes @turma/dsh-guard into the profile
         + pins sandbox/approval) — the guard seam XERK-470 requires the launcher to wire."""
+        # Rebuilt when the protected hooks come or go (XERK-1751), as
+        # _ensure_guard_settings is: every launch rewrites the profile from this,
+        # so the next session follows the hooks to (or back from) /etc.
+        managed = managed_guard_active()
         cached = getattr(self, "_dsh_guard_config_cache", None)
-        if cached is None:
+        if cached is None or managed != getattr(self, "_dsh_guard_managed", None):
             cached = build_dsh_guard_config()
             self._dsh_guard_config_cache = cached
+            self._dsh_guard_managed = managed
         return cached
 
     def _qwen_guard_config(self):
@@ -24669,9 +24689,11 @@ class SessionManager:
         # for guard-settings.json), not the frozen module constant, so it honours
         # a patched REGISTRY_DIR and stays beside the other ~/.turma guard files.
         config_path = os.path.join(REGISTRY_DIR, "qwen-guard.json")
+        managed = managed_guard_active()   # follow the protected hooks (XERK-1751)
         cached = getattr(self, "_qwen_guard_config_cache", None)
         if (cached is not None and cached["configPath"] == config_path
-                and os.path.exists(config_path)):
+                and os.path.exists(config_path)
+                and managed == getattr(self, "_qwen_guard_managed", None)):
             return cached
         cfg = build_qwen_guard_config(config_path=config_path)
         try:
@@ -24683,6 +24705,7 @@ class SessionManager:
                 f"qwen guard config write failed ({e}); refusing to launch a "
                 f"qwen session without the safety guard")
         self._qwen_guard_config_cache = cfg
+        self._qwen_guard_managed = managed
         return cfg
 
     def _launch_tmux(self, sess, resume=False, prompt=None, resume_id=None):

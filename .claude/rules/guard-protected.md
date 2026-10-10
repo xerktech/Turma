@@ -7,6 +7,8 @@ paths:
   - "agent/hooks/fileguard.py"
   - "agent/tests/test_turma_agent_protect.py"
   - "agent/tests/test_guard_settings.py"
+  - "agent/qwen/guard/shim.py"
+  - "agent/dsh/guard/**"
 ---
 
 # Root-owned guard hooks (XERK-1677)
@@ -53,7 +55,12 @@ stub (XERK-1643 incident). `agent/native/turma-agent-protect` moves the two SECU
   config, not code.
 - Still session-controllable (best-effort, XERK-1749): `~/.turma/grants` and the grant's
   `TURMA_SESSION_ID` env, `$HOME` as guard.py's own home readings use it, `ask.py`/`permlog.py`, the
-  `--settings` deny rules, the `claude` binary in `~/.local`, and the dsh/qwen guards (their own
-  runtimes, which read `$PREFIX` copies).
+  `--settings` deny rules, the `claude` binary in `~/.local`.
+- **dsh and qwen read no managed settings**, so `runtime_hook_paths()` points their guard configs at
+  the protected copies while `managed_guard_active()` (XERK-1751); both caches re-check it per launch.
+  - They run the protected guard WITHOUT `--protected`: its env is the runtime's own, which the
+    session cannot set (unlike a nested `claude`'s).
+  - Still session-writable around them: the qwen shim + dsh plugin code under `$PREFIX`,
+    `~/.turma/qwen-guard.json`, the dsh profile, and qwen's per-worktree `.qwen/settings.json`.
 - Tests: `test_turma_agent_protect.py`, `TestManagedGuard` (`test_guard_settings.py`),
   `TestProtectedOverrides` (`test_guard.py`), `TestFakedHome` (`test_fileguard.py`).
