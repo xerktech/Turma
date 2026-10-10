@@ -13196,6 +13196,36 @@ test("XERK-637: an armed run's child auto-merges even with NO org opt-in and a n
   assert.equal(c.sessionId, "s-c1");
 });
 
+test("auto-merge holds for a timed wait ahead of its ETA, never for an external watch", async () => {
+  // A session watching CI or polling for its own merge would otherwise hold the
+  // merge it is waiting on — the two wait on each other forever.
+  const now = Date.now();
+  const cases = [
+    ["external watch", [{ type: "shell", label: "Watch CI", kind: "wait-external" }], true],
+    ["timed wait ahead", [{ type: "shell", label: "Sleep", kind: "wait-timed", eta: now + 10 * 60_000 }], false],
+    ["timed wait past ETA", [{ type: "shell", label: "Sleep", kind: "wait-timed", eta: now - 30_000 }], true],
+    ["watch + timed ahead", [{ type: "shell", kind: "wait-external" },
+      { type: "shell", kind: "wait-timed", eta: now + 10 * 60_000 }], false],
+    ["background work", [{ type: "shell", label: "Build", kind: "work" }], false],
+  ];
+  let n = 0;
+  for (const [name, rows, merges] of cases) {
+    resetEpicD();
+    const host = `edW${n++}`;
+    const site = `dwait${n}.atlassian.net`;
+    const url = `https://github.com/ep/w${n}/pull/1`;
+    const sess = dChildSession("s-c1", "C-1", site, "OPEN", url);
+    sess.session.agents = rows;
+    await asBeat(host, site, { autoStart: false,
+      tickets: [dEpic(), dChild("C-1", [], "inprogress")], sessions: [sess] });
+    armEpicRun(site, "E-1");
+    autoMergeSweep();
+    const merged = (agents[host].commands || []).some((c) => c.type === "mergePr" && c.url === url);
+    assert.equal(merged, merges, name);
+    delete agents[host];
+  }
+});
+
 test("XERK-705/637: an armed run's child is MESSAGED to self-close on a merged PR — no Done write, no kill", async () => {
   // The child self-closes like any session now (XERK-705): the hub messages it, and
   // its own Done edge (once it moves the ticket) advances the wave via C. No forced

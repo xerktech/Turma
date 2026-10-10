@@ -86,8 +86,11 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   a wrong type is decode-fatal for the whole fleet.
 - **A session whose live rows are ALL waits is waiting, not working** — a distinct live kind
   (`holding` in the clients; `sessionWait` → `{state:"waiting"|"stalled", eta}` in the hub):
-  - waiting while any ETA is ahead — never Ready for review, never the review alert, never
-    auto-merged (`autoMergeSweep` skips it like a working session);
+  - waiting while any ETA is ahead — never Ready for review, never the review alert;
+  - **auto-merge holds only for a TIMED wait still before its ETA** (`timedWaitAhead`), never
+    for an ETA-less external watch: the watch is often a poll for that very merge, so holding it
+    deadlocks both (a session can watch for 45 min until stalled). Tests: `auto-merge holds for
+    a timed wait ahead of its ETA…` in `server.test.js`;
   - **stalled** once the newest ETA passed by `WAIT_ETA_GRACE_MS` (2 min — a finished sleep's own
     stop notification needs a beat to land) with no transcript write since, OR the transcript has
     been silent `ATTENTION_WAIT_STALL_MIN` (hub env, default 45; clients hardcode the default). A
