@@ -2259,6 +2259,43 @@ class TestScriptChannels(unittest.TestCase):
             self.assertDenied("cd /var/tmp/q && rm -rf 'x[1]'")
             self.assertAllowed("cd /var/tmp/q && rm -rf x1")
 
+    def test_a_cd_overrides_the_line_s_own_pwd_assignment(self):
+        """XERK-1753: `cd` rewrites PWD and OLDPWD, so the line's own
+        assignment is not where a later `$PWD` points; each reached rm as /etc."""
+        for cmd in ("PWD=/x; cd /etc; rm -rf $PWD",
+                    "OLDPWD=/x; cd /etc; cd /tmp; rm -rf $OLDPWD",
+                    "OLDPWD=/x; cd /etc; cd /tmp; rm -rf ~-",
+                    "PWD=/x; cd /etc; d=$PWD; rm -rf $d",
+                    "PWD=/x; pushd /etc; rm -rf $PWD",
+                    "PWD=/x; cd /etc; rm -rf \"${PWD}\"/*",
+                    "read PWD <<< /x; cd /etc; rm -rf $PWD",
+                    "bash -c 'PWD=/x; cd /etc; rm -rf $PWD'",
+                    # The assigned reading stays: `cd -` goes to OLDPWD's value.
+                    "OLDPWD=/; cd /tmp/a; cd -; rm -rf *",
+                    # QA: a loop's `cd $d` reaches each word, any spelling of
+                    # the name assigns it, and a substitution prints it.
+                    "PWD=/y; for d in /tmp/q /etc; do cd $d && rm -rf $PWD/*; done",
+                    "for d in /tmp/q /etc; do PWD=/y; cd \"$d\"; rm -rf \"$PWD\"; done",
+                    "export {PWD,Z}=/x; cd /etc; rm -rf $PWD",
+                    "declare {P,Q}WD=/x; cd /etc; rm -rf $PWD",
+                    "eval \"P\"\"WD=/x\"; cd /etc; rm -rf $PWD",
+                    "x=PW; eval \"${x}D=/x\"; cd /etc; rm -rf $PWD",
+                    "eval $'P\\x57D=/x'; cd /etc; rm -rf $PWD",
+                    "printf -v $'\\x50WD' /x; cd /etc; rm -rf $PWD",
+                    "export P{W,}D=/x; cd /etc; rm -rf $PWD",
+                    "read P{W,}D <<< '/x /y'; cd /etc; rm -rf $PWD",
+                    "eval $'OLDP\\x57D=/x'; cd /etc; cd /tmp; rm -rf ~-",
+                    "PWD=/x; cd /etc; rm -rf \"$(echo $PWD)\"",
+                    "PWD=/x; cd /etc; x=$(printf %s \"$PWD\"); rm -rf \"$x\""):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("PWD=/tmp/x; rm -rf $PWD",
+                    "PWD=/x; cd /usr/src/app && rm -rf $PWD/build",
+                    "OLDPWD=/x; cd /tmp/a; cd /tmp/b; rm -rf $OLDPWD/build",
+                    "PWD=/y; for d in /tmp/q /tmp/r; do cd $d && rm -rf $PWD/build; done"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_tilde_and_pwd_follow_the_line_s_own_home_and_cd(self):
         """XERK-1685: bash expands `~` from HOME's current value and `$PWD` is
         where a `cd` left it, so each of these reached rm as /etc (nobody rig)."""
