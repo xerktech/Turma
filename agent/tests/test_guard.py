@@ -2412,6 +2412,8 @@ class TestScriptChannels(unittest.TestCase):
                         "cd ~/p/x && cd \"a;b/c/d\" && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
                         "cd ~/p/x && cd a\\;b/c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
                         "cd ~/p/x && c\\d ab/c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && c\\d ab && cd c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
+                        "cd /etc/x && c\\d a && cd b && (cd /tmp/z) && cd ../../.. && rm -rf passwd",
                         "cd >|/dev/null / && rm -rf etc",
                         # ...nor decoys filling the cap.
                         "cd /a1; cd /a2; cd /a3; cd /a4; cd /a5; cd /a6; cd /a7; cd /a8;"

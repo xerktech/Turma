@@ -11401,7 +11401,10 @@ def _cd_targets(text: str, inherited: tuple[str, ...],
             for key, deep in (("anchors", True), ("stops", False)):
                 state[key] = _cd_nearest(list(dict.fromkeys(state[key] + own[key])),
                                          home, deep=deep)
-            state["latest"] = list(dict.fromkeys(state["latest"] + own["latest"]))[:_MAX_CWDS]
+            # The spelled walk's latest first: it holds the whole chain, and a
+            # stop is joined from ``latest[0]``; behind a `c\\d ab` the main
+            # walk's is the stale cwd, and `cd c/d` missed `ab/c/d` (QA).
+            state["latest"] = list(dict.fromkeys(own["latest"] + state["latest"]))[:_MAX_CWDS]
     return found
 
 
