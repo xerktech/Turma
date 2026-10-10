@@ -27,6 +27,9 @@ paths:
     - Added, never swapped. Already-trailing redirections add no copy: a copy of every
       `cmd 2>&1` doubled real cost (replay). Gate on ALL words after the first move, never
       on the tail alone: that let any trailing `2>&1` switch the reading off (QA).
+    - `pr_summary_reason` skips `_note_paths` for a segment whose moved reading is the PR
+      command: noted, its own `-F f` was "another part naming f" (QA).
+    - A reader's options (`_reader_opts`) drop redirection words first: `read -d 2>x , v`.
   - `_stray_group_fragments` strips its tail by a backward walk: the regex was quadratic in an
       inner blank run, which these copies made.
   - In the tokenizer, not per target rule: every `_tokenize` consumer gets bash's words.

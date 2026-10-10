@@ -3383,7 +3383,11 @@ class TestScriptChannels(unittest.TestCase):
                     f"bash -o 2>/dev/null errexit <<< '{R}'",
                     f"bash -O 2>/dev/null extglob < <(echo '{R}')",
                     f"env -u 2>/dev/null X bash <<< '{R}'",
-                    "xargs -n 2>/dev/null 1 rm -rf <<< /etc"):
+                    "xargs -n 2>/dev/null 1 rm -rf <<< /etc",
+                    # A reader's option value skips a redirection (QA 3).
+                    'read -d 2>/dev/null , x <<< /etc,; rm -rf "$x"',
+                    'read -d>/dev/null , x <<< /etc,; rm -rf "$x"',
+                    'read -p 2>/dev/null p x <<< /etc; rm -rf "$x"'):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         # The reason names no stray cwd (QA 2).
@@ -6234,6 +6238,20 @@ class TestPrSummary(unittest.TestCase):
             fh.write(GOOD_BODY)
         self.assertIsNone(self.reason("cd sub && gh pr create -t t -F body.md"))
         self.assertIsNone(self.reason("gh pr create -t t --body-file=sub/body.md"))
+
+    def test_a_redirection_inside_the_pr_command_still_reads_its_body(self):
+        # XERK-1754 QA: a redirection between a wrapper's option and its value
+        # mis-split the command; its moved reading is the PR command, so the
+        # original must not count as "another part naming" the body file.
+        with open(os.path.join(self.repo, "good.md"), "w") as fh:
+            fh.write(GOOD_BODY)
+        for cmd in ("gh pr 2>/dev/null create -F good.md -t x",
+                    "sudo -u 2>/dev/null me gh pr create -F good.md -t x",
+                    "timeout 2>/dev/null 60 gh pr create -F good.md",
+                    "env -u 2>/dev/null X gh pr create -t x --body-file good.md"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.reason(cmd))
+        self.assertIsNotNone(self.reason("env -u 2>/dev/null X gh pr create -t x --body nope"))
 
     def test_more_than_one_description_flag_is_refused(self):
         # XERK-1565: the check read the UNION of every source while gh sends

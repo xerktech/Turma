@@ -4230,7 +4230,37 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
 
 def _reader_opts(tokens: list[str]) -> tuple[list[str], list[str], dict[str, str]] | None:
     """`_reader_names`, with the value of each option given one (`-d`, `-C`,
-    `-u`), dequoted (XERK-1658)."""
+    `-u`), dequoted (XERK-1658).
+
+    Also read with redirection words dropped, names merged: `read -d 2>x , v`
+    binds `v` (XERK-1754 QA). Only also: the tokens are dequoted, so a prompt
+    `-p '<<<'` looks the same, and dropped it lost the name after it."""
+    got = _reader_opts_as(tokens)
+    if not got:
+        return got
+    kept, k = tokens[:1], 1
+    while k < len(tokens):
+        redirect = None if tokens[k][:2] in ("<(", ">(") else _REDIRECT_RE.match(tokens[k])
+        if redirect:
+            k += 1 if redirect.group(1) else 2
+            continue
+        kept.append(tokens[k])
+        k += 1
+    if len(kept) == len(tokens):
+        return got
+    other = _reader_opts_as(kept)
+    names, arrays, values = got
+    if not other or len(kept) < 3:
+        return got  # nothing but the reader word and an option was left
+    # Its names first, as binding is positional (`read -p 2>x p v` fills `v`
+    # first), but not its default REPLY; and its option values win: a
+    # delimiter or fd that is a redirection is the redirection's.
+    first = [n for n in other[0] if n != "REPLY" or n in names]
+    return (list(dict.fromkeys(first + names)), list(dict.fromkeys(other[1] + arrays)),
+            {**values, **other[2]})
+
+
+def _reader_opts_as(tokens: list[str]) -> tuple[list[str], list[str], dict[str, str]] | None:
     if not tokens:
         return None
     prog = tokens[0]
@@ -12619,6 +12649,13 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
         command_tokens = _drop_leading_redirects(tokens)
         hit = _pr_body_command(command_tokens) if command_tokens else None
         if not hit:
+            # A PR command a redirection mis-split (`env -u 2>x X gh pr …`):
+            # its moved reading is checked below, and noted here its own
+            # `-F f` read as another part naming f (XERK-1754 QA).
+            moved = _redirects_last(segment)
+            if moved != segment and _pr_body_command(
+                    _drop_leading_redirects(_strip_prefixes(_tokenize(moved))) or ["_"]):
+                continue
             _note_paths(tokens, segment, cwd, written, named)
             continue
         bodies, files, sources = hit
