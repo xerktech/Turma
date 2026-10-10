@@ -3015,8 +3015,9 @@ def _brace_word_start(command: str, start: int, cut: int, memo: dict | None = No
     between can join a word across a blank.
 
     ``memo`` (one per text, asked with rising ``start``) keeps each body's
-    substitutions and how far its word walk got, so a line of N lists is
-    walked once, not N times from its start (XERK-1756 QA: quadratic)."""
+    substitutions, how far its word walk got and each word's end, so a line
+    of N lists is walked once, not N times from its start (XERK-1756 QA:
+    quadratic)."""
     if memo is None:
         memo = {}
     quoted = any(c in command[cut:start] for c in "'\"\\")
@@ -3044,7 +3045,11 @@ def _brace_word_start(command: str, start: int, cut: int, memo: dict | None = No
         if command[i] in _BRACE_WORD_END:
             i += 1
             continue
-        w = _word_end(command, i)
+        w = memo.get(("w", i))
+        if w is None:
+            # One word may span many lists (`$(( … ))`, an unclosed `$(`):
+            # found once, not once per list (XERK-1756 QA).
+            w = memo[("w", i)] = _word_end(command, i)
         if w < 0 or w > start:
             memo[origin] = i  # a word start: a later brace's walk resumes here
             # Only ever further back than the cut. With no quote between, a

@@ -27,9 +27,11 @@ paths:
   - The growth budget (4x + 8 KB per call, checked per word as a pass builds) and the
     decision's `_spend` budget bound it: every later reader and eval level re-reads the
     expanded text. At 16 KB a 6-deep `eval` of `{a,b}` x10 took 8s; 200 `$(…)` bodies of it,
-    each inside one call's budget, read 2.6 MB (26s). Worst measured now ~3.7s.
+    each inside one call's budget, read 2.6 MB (26s). A 6-deep `eval` of `{a,b}` x9 (3.8s) is
+    the slowest shape QA found inside the budget.
   - `_brace_word_start` takes a per-pass memo (substitutions per body, how far its word walk
-    got): walked from the start per list, a line of quoted lists was quadratic (9s on 135 B).
+    got, each word's end): walked from the start per list, a line of quoted lists was
+    quadratic (9s on 135 B), and so was one word spanning many lists (`$[ "1"{1,2}… ]`, 7.7s).
   - A refusal is never grantable (`_expand_top` sets `_budget["capped"]`): the policy checks
     after a grant see only `_TOO_LARGE`, so brace padding hid a `gh pr merge` (QA).
   - Accepted over-deny: products past that budget, e.g. `touch f{0..9}{0..9}{0..9}.txt`
