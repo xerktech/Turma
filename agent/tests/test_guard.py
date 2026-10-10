@@ -4878,9 +4878,10 @@ class TestExpansionBudget(unittest.TestCase):
             self.assertEqual(decision, "deny", cmd[:80])
             self.assertIn(self.TOO_LARGE, reason, cmd[:80])
             # xargs re-expands each argv (XERK-1539) until the budget is
-            # spent: ~8s CPU. The deadline is off (module top), so the deny above
-            # is the budget's; this only catches a slower way to spend it.
-            self.assertLess(time.process_time() - t, 25, cmd[:80])
+            # spent: 8-23s CPU by host and load. The deadline is off (module top),
+            # so the deny above is the budget's; this only catches a slower way to
+            # spend it.
+            self.assertLess(time.process_time() - t, 50, cmd[:80])
 
     def test_ordinary_find_exec_and_xargs_stay_allowed(self):
         for cmd in (
@@ -5322,8 +5323,9 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "a=$(false || echo a | sed ''); " * 2000 + "$a"):
             with self.subTest(n=len(cmd)):
                 start = time.process_time()
+                # Runs to its budget: ~27 CPU s idle, 57 under load.
                 guard.decide("Bash", {"command": cmd}, cwd="/tmp")
-                self.assertLess(time.process_time() - start, 60)
+                self.assertLess(time.process_time() - start, 90)
 
     def test_a_large_conditional_or_nested_taint_body_stays_fast(self):
         # XERK-1617: suffix readings are capped, and nested taint resolution is
@@ -5333,8 +5335,9 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "$(echo " * 200 + "rm -rf /etc" + " | sed '')" * 200):
             with self.subTest(n=len(cmd)):
                 start = time.process_time()
+                # ~23 CPU s idle, 35 under load.
                 guard.decide("Bash", {"command": cmd}, cwd="/tmp")
-                self.assertLess(time.process_time() - start, 60)
+                self.assertLess(time.process_time() - start, 90)
 
     def test_a_large_filtered_body_classifies_without_timing_out(self):
         # XERK-1613 QA: the taint reading must not make the guard quadratic —
