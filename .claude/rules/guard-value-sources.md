@@ -29,9 +29,9 @@ paths:
       on the tail alone: that let any trailing `2>&1` switch the reading off (QA).
     - `pr_summary_reason` skips `_note_paths` for a segment whose moved reading is the PR
       command: noted, its own `-F f` was "another part naming f" (QA).
-    - A reader's options (`_reader_opts`) are also read with redirection words dropped, its
-      names first (binding is positional): `read -d 2>x , v`. Also, never instead: a dequoted
-      `-p '<<<'` prompt looks the same.
+    - A reader's options are walked over `_redirects_last` RAW text (`read -d 2>x , v`): only a
+      live redirection moves, so a quoted `-d '>'` stays the value. A walk over dequoted tokens
+      with redirect-looking words dropped took `'>'` as one and bound the wrong delimiter (QA).
     - `_written_scripts` reads the moved form: a leading `> f echo …` wrote f unseen (QA).
   - `_stray_group_fragments` strips its tail by a backward walk: the regex was quadratic in an
       inner blank run, which these copies made.

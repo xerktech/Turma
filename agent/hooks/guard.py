@@ -4230,37 +4230,9 @@ def _reader_names(tokens: list[str]) -> tuple[list[str], list[str]] | None:
 
 def _reader_opts(tokens: list[str]) -> tuple[list[str], list[str], dict[str, str]] | None:
     """`_reader_names`, with the value of each option given one (`-d`, `-C`,
-    `-u`), dequoted (XERK-1658).
-
-    Also read with redirection words dropped, names merged: `read -d 2>x , v`
-    binds `v` (XERK-1754 QA). Only also: the tokens are dequoted, so a prompt
-    `-p '<<<'` looks the same, and dropped it lost the name after it."""
-    got = _reader_opts_as(tokens)
-    if not got:
-        return got
-    kept, k = tokens[:1], 1
-    while k < len(tokens):
-        redirect = None if tokens[k][:2] in ("<(", ">(") else _REDIRECT_RE.match(tokens[k])
-        if redirect:
-            k += 1 if redirect.group(1) else 2
-            continue
-        kept.append(tokens[k])
-        k += 1
-    if len(kept) == len(tokens):
-        return got
-    other = _reader_opts_as(kept)
-    names, arrays, values = got
-    if not other or len(kept) < 3:
-        return got  # nothing but the reader word and an option was left
-    # Its names first, as binding is positional (`read -p 2>x p v` fills `v`
-    # first), but not its default REPLY; and its option values win: a
-    # delimiter or fd that is a redirection is the redirection's.
-    first = [n for n in other[0] if n != "REPLY" or n in names]
-    return (list(dict.fromkeys(first + names)), list(dict.fromkeys(other[1] + arrays)),
-            {**values, **other[2]})
-
-
-def _reader_opts_as(tokens: list[str]) -> tuple[list[str], list[str], dict[str, str]] | None:
+    `-u`), dequoted (XERK-1658). Callers tokenize `_redirects_last` text: a
+    live redirection in an option's value slot (`read -d 2>x , v`) moved out
+    of it, a quoted `-d '>'` left alone (XERK-1754 QA)."""
     if not tokens:
         return None
     prog = tokens[0]
@@ -4478,7 +4450,7 @@ def _reader_values(command: str) -> list[tuple[str, str]]:
                 text = text[:m.start()] + "/dev/fd/63" + text[m.end():]
         # A function's body opens on its header: `f(){ read a`.
         text = _FUNC_HEADER_RE.sub("", text.lstrip())
-        got = _reader_opts(_strip_prefixes(_tokenize(text)))
+        got = _reader_opts(_strip_prefixes(_tokenize(_redirects_last(text))))
         if got:
             readers[k] = got[:2]
             # `-d ''` delimits on NUL.
@@ -4517,7 +4489,7 @@ def _reader_extra_readings(line: str, commands: str, heredocs: list[tuple[str, s
     # the `mapfile -C` callbacks below that run, so skip it (a 30 KB line
     # with no heredoc paid `_HEREDOC_OP_RE.sub` over it for nothing, QA pass 16).
     reader_segs = [seg for seg in _split_segments(commands) if _reader_opts(_strip_prefixes(
-        _tokenize(_FUNC_HEADER_RE.sub("", _HEREDOC_OP_RE.sub(" ", seg).lstrip()))))] \
+        _tokenize(_redirects_last(_FUNC_HEADER_RE.sub("", _HEREDOC_OP_RE.sub(" ", seg).lstrip())))))] \
         if heredocs else []
     # Each operator where the LEXER found it, never by searching the text:
     # a quoted or commented copy of an owner line, a `$((1<<2))` shift or a
@@ -4606,7 +4578,8 @@ def _reader_extra_readings(line: str, commands: str, heredocs: list[tuple[str, s
     calls = []
     if "-C" in commands:
         for seg in _split_segments(rewritten):
-            got = _reader_opts(_strip_prefixes(_tokenize(_FUNC_HEADER_RE.sub("", seg.lstrip()))))
+            got = _reader_opts(_strip_prefixes(_tokenize(
+                _redirects_last(_FUNC_HEADER_RE.sub("", seg.lstrip())))))
             if not got or not got[2].get("C") or not got[1]:
                 continue
             got_vals = vals if rewritten == commands else _var_values(rewritten)

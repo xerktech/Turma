@@ -3388,6 +3388,11 @@ class TestScriptChannels(unittest.TestCase):
                     'read -d 2>/dev/null , x <<< /etc,; rm -rf "$x"',
                     'read -d>/dev/null , x <<< /etc,; rm -rf "$x"',
                     'read -p 2>/dev/null p x <<< /etc; rm -rf "$x"',
+                    # ...but a QUOTED one is the option's value (QA 4).
+                    "read -d '>' -r x <<< '/etc>'; rm -rf \"$x\"",
+                    "read -d \\> -s x <<< '/etc>'; rm -rf \"$x\"",
+                    "read -d '<<<' -t 5 x <<< '/etc<<<'; rm -rf \"$x\"",
+                    "mapfile -c 1 -C 2>/dev/null 'rm -rf /etc #' a <<< x",
                     # A leading `> f` still writes f, which a shell then runs (QA 3).
                     "> /tmp/s.sh echo 'rm -rf /etc'; bash /tmp/s.sh"):
             with self.subTest(cmd=cmd):
