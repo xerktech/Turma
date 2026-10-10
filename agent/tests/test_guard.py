@@ -2299,6 +2299,87 @@ class TestScriptChannels(unittest.TestCase):
                 self.assertDenied(cmd)
         self.assertAllowed("cd ~root/ && rm -rf build")
 
+    def test_a_cd_spelled_with_quotes_or_escapes_is_a_cd(self):
+        """XERK-1769: bash dequotes the program word, so `c\\d /` changes
+        directory; the guard saw no `cd` and judged `rm -rf *` from the session cwd."""
+        for cmd in ("c\\d /; rm -rf *", '"c"d /; rm -rf *', "c''d /; rm -rf *",
+                    "pu\\shd /; rm -rf *", "x=c; y=d; $x$y /; rm -rf *",
+                    "$'\\x63d' /; rm -rf *", "'c'\"d\" /etc; rm -rf ./*",
+                    "\\builtin c\\d /; rm -rf *", "b''uiltin cd /; rm -rf *",
+                    "c\\d / && chmod -R 777 *", "(c\\d /; rm -rf *)",
+                    "PWD=/x; c\\d /etc; rm -rf $PWD", '$"cd" /; rm -rf *',
+                    'c$"d" /; rm -rf *', "c\\\nd /; rm -rf *",
+                    # A word part that may expand to nothing: an empty list,
+                    # an unset name, a silent substitution.
+                    "c$@d /; rm -rf *", 'c"$@"d /; rm -rf *', "c${nope}d /; rm -rf *",
+                    "c$(:)d /; rm -rf *", "c`:`d /; rm -rf *", '"c$(true)d" /; rm -rf *',
+                    "PWD=/x; c$@d /etc; rm -rf $PWD",
+                    # Past the 8-directory cap a later `cd /` still counts.
+                    "".join("cd /d%d; " % i for i in range(8)) + "cd /; rm -rf *",
+                    "".join("c\\d /d%d; " % i for i in range(8)) + "cd /; rm -rf *",
+                    # Padding past any word length, and empty positionals.
+                    "c" + '""' * 40 + "d /; rm -rf *", "c" + "$@" * 40 + "d /; rm -rf *",
+                    "c$1d /; rm -rf *", "c$!d /; rm -rf *",
+                    # A redirection among `cd`'s words is not its operand.
+                    "cd >/dev/null /; rm -rf *", "cd>/dev/null /; rm -rf *",
+                    "c\\d 2>&1 /; rm -rf *", "cd &>/dev/null /; rm -rf *",
+                    "cd > /dev/null /; rm -rf *", "cd />/dev/null; rm -rf *",
+                    "cd /<x; rm -rf *", "cd />&2; rm -rf *", "cd ~&>/dev/null; rm -rf .ssh",
+                    "cd ~>/dev/null; rm -rf .ssh", "cd '/'>/dev/null; rm -rf *",
+                    "cd 2>/dev/null /; rm -rf *",
+                    # A quoted or escaped `>` is no redirect: still read whole.
+                    'cd "/tmp/q/a>b/../../../etc"; rm -rf *', "cd /tmp/q/a\\>b/../../..; rm -rf *",
+                    """cd '/tmp/q/a<'/../../../etc; rm -rf *""",
+                    'cd "/tmp/q/a>b/../../../etc">/dev/null; rm -rf *',
+                    # A quoted or escaped operator is part of the operand.
+                    'cd "/tmp/q/a;b/../../../etc"; rm -rf *', 'cd "/tmp/q/a|b/../../../etc"; rm -rf *',
+                    "cd /tmp/q/a\\;b/../../../etc; rm -rf *",
+                    # A `cd` inside a string must not swallow the real one after it.
+                    'echo "a cd b"; cd /etc; echo "c"; rm -rf *',
+                    "echo 'a cd b' && cd /etc && echo 'c' && rm -rf *",
+                    # A `<`/`>` an expansion supplies is word text, not a redirect.
+                    "cd /tmp/q/a${x:-<}b/../../../etc; rm -rf *",
+                    "cd /tmp/q/a$(echo '>')b/../../../etc; rm -rf *",
+                    "cd /tmp${a#>}/..>/dev/null; rm -rf *"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # Only a bare redirection is split off; quoted or printed text stays in the word.
+        for raw in ('"/x/a>b"', "/a$(echo '>')b", "/a`echo '>'`b", "/a\\>b", "'a<'/b"):
+            with self.subTest(raw=raw):
+                self.assertEqual(guard._cd_split_redirects(raw), raw)
+        self.assertEqual(guard._cd_split_redirects('"/x/a>b">y'), '"/x/a>b" >y')
+        self.assertEqual(guard._cd_split_redirects("/2>x 2>y"), "/2 >x 2>y")
+        for raw, split in (("/a$(:>x)b>y", "/a$(:>x)b >y"), ("/a`:>x`b>y", "/a`:>x`b >y"),
+                           ("/a${b#>}c>x", "/a${b#>}c >x"), ("/a${b:-${c#<}}>x", "/a${b:-${c#<}} >x"),
+                           ("/a$${b#>x", "/a$${b# >x"), ("/a$$${b#>}>x", "/a$$${b#>} >x"),
+                           # A quoted or escaped `$` ends the run.
+                           ("/a$\\${b#>x", "/a$\\${b# >x"), ("/a$'$'$${b#>x", "/a$'$'$${b# >x")):
+            with self.subTest(raw=raw):
+                self.assertEqual(guard._cd_split_redirects(raw), split)
+        # Past the cap an exact root is itself, not `/`: `.ssh` under `/` is harmless.
+        visited = "".join("cd /tmp/q/d%d; " % i for i in range(8))
+        with mock.patch.dict(os.environ, {"HOME": "/tmp/q"}):
+            for cmd in ("cd ~; rm -rf .ssh", "cd /etc; rm -rf ssh", "cd; rm -rf .ssh"):
+                with self.subTest(cmd=cmd):
+                    self.assertDenied(visited + cmd)
+            # Past twice the cap the whole decision is refused, never a cwd dropped.
+            hops = visited + "cd /; " + "".join("cd ~u%d; " % i for i in range(7))
+            self.assertEqual(guard.decide("Bash", {"command": hops + "cd /etc; rm -rf ssh"})[0],
+                             "deny")
+        for cmd in ("c\\d /usr/src/app && rm -rf build", "c''d /tmp/x; rm -rf *",
+                    "echo c\\d; rm -rf build", "'c d' /; rm -rf build",
+                    # Only the program word is rewritten: an argument read empty
+                    # would be a bare `cd` home.
+                    'cd "$d"; rm -rf *', "cd $BUILD; rm -rf *",
+                    'cd "$(mktemp -d)" && rm -rf *', "cd >/dev/null /usr/src/app; rm -rf build",
+                    # A digit glued to the operand is part of it: `cd /2` here.
+                    "cd /2>/dev/null; rm -rf *", "cd /repos/a&>/dev/null; rm -rf build",
+                    # A redirected `cd` takes one cwd slot, not two.
+                    "".join("cd /repos/a%d>/dev/null; " % i for i in range(1, 6)) + "cd /repos/a6 && rm -rf *",
+                    "".join("cd /d%d; " % i for i in range(9)) + "rm -rf build"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_a_cd_overrides_the_line_s_own_pwd_assignment(self):
         """XERK-1753: `cd` rewrites PWD and OLDPWD, so the line's own
         assignment is not where a later `$PWD` points; each reached rm as /etc."""
