@@ -36,3 +36,7 @@ paths:
     the deadline off at module top; only the deadline tests patch it back. Keep it off.
   - Keep wall time only where a HANG is the defect (a FIFO read), since a blocked process spends
     no CPU.
+- **A new module-level name in guard.py must be unique**: the file is ~13k lines, and a later
+  `_X_RE = …` silently replaces an earlier one for every caller. XERK-1769 reused
+  `_SHELL_WORD_RE` and `_REDIRECT_WORD_RE`; heredoc data turned into scripts (15 suite failures).
+  Check with a `^(_\w+)\s*=` / `^def ` duplicate count against main.

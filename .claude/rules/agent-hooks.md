@@ -270,6 +270,7 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
       trailing `cd /`) is refused; the reason names the cwd and asks for an absolute path.
     - Joining covers `rm`/`unlink`/`chmod`/`chown` and `find` roots, never an opaque
       substitution (`trap 'rm -rf "$tmpd"' EXIT; cd /` is the cleanup idiom).
+    - How a `cd` word is recognised (spelled, emptied, past the cap): `guard-cd.md` (XERK-1769).
     - The literal `~/.ssh` is dangerous to `rm` only (`_is_home_ssh`): `chmod -R 700 ~/.ssh`
       is the routine fix.
     - Inside an exact protected root/home every relative `rm` operand is joined (`cd /; rm -rf *`
