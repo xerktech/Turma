@@ -156,3 +156,46 @@ paths:
   - A tilde target is normpath'd there too (`~root/`, `~root/.` are `~root`): `_norm_path` leaves
     tilde forms unfolded, and `~root/` matched no home token, so `cd ~root/; rm -rf *` ran.
   - Tests: `test_a_cwd_at_a_person_home_spelled_absolutely_is_an_exact_root`.
+- Every directory a line can be in is a cwd reading, not only an absolute/home `cd` (XERK-1768):
+  - A relative `cd` is joined to the ANCHORS (the cwds the text started with, and each absolute
+    or home `cd`), to where the last relative one left the line (`cd ~ && cd ..`), and to each
+    STOP (where a relative `cd` left the line had every earlier one persisted); one naming a
+    `$`, backtick or opaque substitution stays unknown and adds nothing.
+    - Never to every listed cwd: the list doubled per `cd` — 16 `cd`s took 100s CPU and the hook
+      denied — and the cap dropped the climb in `cd ~ && cd a && cd b && cd c && cd ../../../..`.
+    - Never to the latest alone: a `cd` that did not persist (`(cd x)`, `popd`, `||`, `echo cd x`)
+      hid the cwd it left; stops cover one after a relative move (`cd .. && (cd s) && cd ..`).
+    - Stops and anchors keep ONE cwd per danger group (`_cd_nearest`, `_cd_reach`): the session
+      home or exact root a cwd climbs to, how many `..`, and which land on a `.git`. Two cwds
+      in a group land in the same places on every climb, so neither hides the other. Every
+      anchor group is kept at any depth (a `.git/hooks` 9 deep was evictable when capped).
+    - Stops are grouped to `_MAX_STOP_CLIMBS` (8) or any depth with a `.git` on the climb: each
+      `(cd p && cd q)` deepens the line's path, and uncapped 240 of them took 34s. Deeper stops
+      keep the 16 shallowest. Residual: 16+ deep decoy stops evict a deep relative one.
+    - `/tmp/r/.git/hooks` and `/mnt/d/e/f` share `/` and 4 climbs, but only one `rm -rf ..`
+      deletes a `.git`, so the key holds the `.git` climbs, lower-cased (`.GIT`). Floods fail
+      closed: `_cd_targets` checks the decision deadline per `cd`.
+    - Never cap by recency, depth or distance: decoys near another root (`(cd /opt/dN && cd
+      ../sN)` ×17) evicted the real cwd and `rm -rf .ssh` / `rm -rf data` ran there (QA). Probe
+      eviction with a home-only AND a root-only target, never `*` alone.
+  - Every landing of a relative `cd` is a stop, from every base: from one base, the flat
+    reading of `cd "a;b/c"` lost its quoted twin's landing; from latest only, a `(cd q)` left
+    the real cwd an anchor and `cd c/d` from it was lost. A spelled walk's state merges with
+    its latest first. Costs ~2x on decoy floods, which fail closed on the deadline.
+  - Anchors, latest and stops pass from segment to segment in a `walk` state, never re-derived
+    from the tuple: joined to every inherited cwd, four `(cd sN)` segments built 2^N phantoms and
+    the trim dropped the real cwd (`rm -rf *` in the home was allowed).
+  - Past `_MAX_CWDS` the OLDEST cwds go (`_cd_trimmed`), never an anchor, stop or latest one, the
+    newest, nor one holding the home or an exact root (`_cwd_holds_home`).
+  - A group's head is walked per segment ONCE across the line's groups (`_cd_walk`): re-read per
+    group it was quadratic (240 `(cd p && cd q && make)`: 30s → 2.4s). Past `_MAX_CD_WALK`
+    characters a group is read from every cwd on the line (over-reads, never under-reads).
+  - Time any change here WITH an event cwd: without one most of these paths never run.
+  - A cwd inside the session home is kept as `$HOME…` (`_cwd_reading`), as `_home_one_reading`
+    keeps a target: `..` from `~/proj` is judged as the home, `../other` never as a child of /root.
+    `_cwd_abs` puts the home back in to join a relative `cd`.
+  - The hook event's `cwd` seeds the readings (`_SESSION_CWD`, set by `decide` for the whole decision), judged by
+    the same `_under_cwd` rules, so no new over-read past what a `cd` there already gets.
+  - `dirname`, `realpath` and `readlink -f|-e|-m` print their path for literal or home operands
+    (`_path_printed`); a name or a relative path stays opaque. A home operand prints `$HOME…`. Symlinks are not followed.
+  - Tests: `test_a_cwd_from_a_relative_cd_a_path_printer_or_the_session`.

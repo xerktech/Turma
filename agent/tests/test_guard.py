@@ -2380,6 +2380,148 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_cwd_from_a_relative_cd_a_path_printer_or_the_session(self):
+        """XERK-1768: a relative `cd`, a `cd ~/proj`, a `cd $(dirname $HOME)`
+        and the hook event's own cwd recorded no cwd, so each reached the home."""
+        decide = guard.decide
+        with mock.patch.dict(os.environ, {"HOME": "/var/tmp/qa7h/home/x"}):
+            for cmd in ("cd ~ && cd .. && rm -rf x", "cd ~/build && cd ../.. && rm -rf x",
+                        "cd /var/tmp/qa7h && cd home && rm -rf x",
+                        "cd $(dirname $HOME) && rm -rf x", "cd \"$(dirname ~)\" && rm -rf x",
+                        "rm -rf $(dirname $HOME)/x", "rm -rf $(realpath ~/..)/x",
+                        "cd $(readlink -f ~/..) && rm -rf x",
+                        "cd ~/proj && rm -rf ..", "cd $HOME/proj && rm -rf ..",
+                        "cd ~/proj && rm -rf ../*", "cd ~/proj && rm -rf ../.*",
+                        "cd ~/proj && rm -rf ../{*,.*}", "cd ~/proj && chmod -R 000 ..",
+                        "cd ~/a/b && rm -rf ../../*", "rm -rf $(dirname /etc/x)",
+                        # A chain of relative cds never fills the cap (QA).
+                        "cd ~ && cd a && cd b && cd c && cd ../../../.. && rm -rf x",
+                        "cd ~ && cd a && cd b && cd c && cd d && cd e && cd f && cd g"
+                        " && cd ../../../../../../../.. && rm -rf x",
+                        # ...nor does a cd that did not persist hide the cwd it left.
+                        "cd ~ && (cd sub && make) && cd .. && rm -rf x",
+                        "cd ~ && pushd /tmp/a && popd && cd .. && rm -rf x",
+                        "cd ~ && echo cd sub && cd .. && rm -rf x",
+                        "cd ~/a || cd sub && cd .. && rm -rf *",
+                        "cd ~ && cd nope; cd .. && rm -rf x",
+                        # ...nor an fd duplication ahead of the operand (QA).
+                        "cd ~ && cd 2>&1 .. && rm -rf x", "cd ~ && cd >&2 .. && rm -rf x",
+                        "cd ~ && cd <&0 .. && rm -rf x", "cd ~ && cd &>/dev/null .. && rm -rf x",
+                        "cd ~ && cd >|/dev/null .. && rm -rf x", "cd 2>&1 /etc && rm -rf passwd",
+                        # A quoted or spelled relative cd's landing is a stop too (QA).
+                        "cd ~/p/x && cd \"a;b/c/d\" && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && cd a\\;b/c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && c\\d ab/c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && c\\d ab && cd c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
+                        "cd /etc/x && c\\d a && cd b && (cd /tmp/z) && cd ../../.. && rm -rf passwd",
+                        # A relative cd that did not persist hides no later landing (QA).
+                        "cd ~/p/x && (cd q && make) && cd c/d && (cd /tmp/z) && cd ../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && pushd q && popd && cd c/d && (cd /tmp/z) && cd ../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && echo c\\d q && cd c/d && (cd /tmp/z) && cd ../../../.. && rm -rf .ssh",
+                        "cd >|/dev/null / && rm -rf etc",
+                        # ...nor decoys filling the cap.
+                        "cd /a1; cd /a2; cd /a3; cd /a4; cd /a5; cd /a6; cd /a7; cd /a8;"
+                        " cd ~; cd ..; rm -rf x"):
+                with self.subTest(cmd=cmd):
+                    self.assertDenied(cmd)
+            for cwd, cmd in (("/var/tmp/qa7h/home", "rm -rf x"),
+                             ("/var/tmp/qa7h/home", "rm -rf *"),
+                             ("/var/tmp/qa7h/home", "rm -rf ./x"),
+                             ("/var/tmp/qa7h/home/x/proj", "rm -rf .."),
+                             ("/var/tmp/qa7h/home/x", "cd proj && rm -rf ../.."),
+                             ("/", "rm -rf *"),
+                             # Four cds that did not persist never trim the real cwd (QA).
+                             ("/var/tmp/qa7h/home/x/proj", "".join(
+                                 f"(cd s{i} && make) && " for i in range(9)) + "cd .. && rm -rf *"),
+                             ("/var/tmp/qa7h/home/x/proj", "".join(
+                                 f"pushd s{i} && make && popd ; " for i in range(9))
+                              + "cd .. && rm -rf *"),
+                             ("/var/tmp/qa7h/home/x/proj", "".join(
+                                 f"cd s{i} || true ; " for i in range(9)) + "cd .. && rm -rf *"),
+                             ("/var/tmp/qa7h/home/x", "".join(
+                                 f"(cd a{i}) && " for i in range(9)) + "cd .. && rm -rf x"),
+                             # ...nor where an earlier relative cd left the line.
+                             (None, "cd ~/a/b && cd .. && (cd s1) && cd .. && rm -rf *"),
+                             (None, "cd ~/a/b && cd .. && " + "".join(
+                                 f"(cd s{i}) && " for i in range(20)) + "cd .. && rm -rf *"),
+                             # The trim keeps the start cwd and the home past any decoys.
+                             ("/var/tmp/qa7h/home/x/proj", "".join(
+                                 f"(cd s{i}) && " for i in range(9)) + "rm -rf .."),
+                             (None, "cd ~; " + "".join(f"cd /a{i}; " for i in range(30))
+                              + "rm -rf *"),
+                             # ...and decoys shallower than the real cwd evict nothing.
+                             ("/var/tmp/qa7h/home/x/a/b/c", "cd ../.. && " + "".join(
+                                 f"(cd /opt/aa/bb/cc/d{i} && cd ../s{i} && make) && "
+                                 for i in range(24)) + "cd .. && rm -rf *"),
+                             # ...nor decoys near another root, for a home-only target or a
+                             # root-only one (QA): one cwd per (root, climbs) group is kept.
+                             ("/var/tmp/qa7h/home/x/a/b/c", "cd .. ; " + "".join(
+                                 f"(cd /opt/d{i} && cd ../s{i} && make) ; " for i in range(24))
+                              + "cd ../.. && rm -rf .ssh"),
+                             ("/srv/a/b/c", "cd .. && " + "".join(
+                                 f"(cd ~/d{i} && cd ../s{i} && make) && " for i in range(24))
+                              + "cd ../.. && rm -rf data"),
+                             # Every group is kept, past 16 of them too.
+                             ("/var/tmp/qa7h/home/x/a/b/c", "cd .. ; " + "".join(
+                                 f"(cd {r}{'/d' * k}/x && cd ../s && make) ; "
+                                 for r in ("/opt", "/srv", "/usr", "/var") for k in range(2, 8))
+                              + "cd ../.. && rm -rf .ssh"),
+                             # A partial climb lands where the real cwd's does: `.git`.
+                             ("/tmp/w", "cd /tmp/r/.git/hooks && " + "".join(
+                                 f"(cd /mnt/d{i}/e/f && make) && " for i in range(24))
+                              + "rm -rf .."),
+                             ("/tmp/w", "cd /tmp/r/.GIT/hooks && " + "".join(
+                                 f"(cd /mnt/d{i}/e/f && make) && " for i in range(24))
+                              + "rm -rf .."),
+                             # ...however deep: past a depth cap it was evictable (QA).
+                             ("/tmp/w", "cd /tmp/a/b/c/d/e/f/g/h/r/.git/hooks && " + "".join(
+                                 f"(cd /tmp/a/b/c/d/e/f/g/h/i/x{i} && make) && "
+                                 for i in range(24)) + "rm -rf ..")):
+                with self.subTest(cwd=cwd, cmd=cmd):
+                    self.assertEqual(decide("Bash", {"command": cmd}, cwd=cwd)[0], "deny")
+            for cmd in ("cd ~/proj && rm -rf build", "cd ~/proj && rm -rf ../other",
+                        # One `cd ..` climbs once, however many readings match it (QA).
+                        "cd ~/p/a && cd 2>&1 .. && rm -rf *", "cd ~/p/a && c\\d .. && rm -rf *",
+                        "cd ~/p/a && \"cd\" .. && rm -rf *",
+                        "cd $(dirname $0) && rm -rf build", "rm -rf \"$(dirname \"$f\")\"/x",
+                        "rm -rf \"$(dirname /tmp/a/b)\"/*",
+                        # A printed path inside the home stays `$HOME…` (QA).
+                        "rm -rf $(dirname ~/proj/x)", "rm -rf $(realpath ~/proj)"):
+                with self.subTest(cmd=cmd):
+                    self.assertAllowed(cmd)
+            for cwd, cmd in (("/var/tmp/qa7h/home/x/proj", "rm -rf build *"),
+                             ("/var/tmp/qa7h/home/x", "rm -rf .cache node_modules"),
+                             ("/var/tmp/qa7h/home/x/proj", "cd sub && rm -rf ../build"),
+                             ("/", "rm -rf node_modules"), ("relative", "rm -rf *")):
+                with self.subTest(cwd=cwd, cmd=cmd):
+                    self.assertEqual(decide("Bash", {"command": cmd}, cwd=cwd)[0], "allow")
+            # Relative cds join anchors + the latest, never every cwd: joined to
+            # every one, 16 took 100s CPU and the hook denied (QA).
+            for cmd in (" && ".join(f"cd d{i}" for i in range(60)) + " && make",
+                        "; ".join(f"cd p{i} && make && cd .." for i in range(60)),
+                        "cd ~/proj && " + "; ".join(f"(cd p{i} && make)" for i in range(60)),
+                        # Each group's head walked once, not re-read: 240 took 30s (QA).
+                        " && ".join(f"(cd p{i} && cd q{i} && make)" for i in range(240))):
+                with self.subTest(cmd=cmd[:40]):
+                    t = time.process_time()
+                    self.assertEqual(decide("Bash", {"command": cmd},
+                                            cwd="/var/tmp/qa7h/home/x/proj")[0], "allow")
+                    self.assertLess(time.process_time() - t, 10)
+        # A flood of `cd`s fails closed on the decision deadline, checked per `cd`.
+        with mock.patch.object(guard, "_budget", {"left": 10 ** 9, "expand": {}, "vals": {},
+                                                  "capped": False, "proc": {}, "posread": {},
+                                                  "until": 0}):
+            with self.assertRaises(guard._ExpansionTooLarge):
+                guard._cd_targets("cd a; cd b", ("/tmp",))
+        # A home that is a system root: what a relative cd reaches inside it is
+        # still judged as the home's, never as a child of /root.
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            for cwd, cmd in ((None, "cd ~/proj && rm -rf ../other"), ("/root", "rm -rf .cache"),
+                             ("/root/proj", "rm -rf ../other"),
+                             ("/root/repos/wt", "cd .. && rm -rf wt2")):
+                with self.subTest(cwd=cwd, cmd=cmd):
+                    self.assertEqual(decide("Bash", {"command": cmd}, cwd=cwd)[0], "allow")
+
     def test_a_cd_overrides_the_line_s_own_pwd_assignment(self):
         """XERK-1753: `cd` rewrites PWD and OLDPWD, so the line's own
         assignment is not where a later `$PWD` points; each reached rm as /etc."""
