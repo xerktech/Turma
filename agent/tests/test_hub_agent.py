@@ -20348,7 +20348,8 @@ class TestPtyInjectDeadline(unittest.TestCase):
                 mock.patch.object(ha, "_capture_pane", side_effect=cap), \
                 mock.patch.object(ha, "_busy_from_capture", return_value=False), \
                 mock.patch.object(ha.time, "sleep", lambda *_a: None):
-            ha._pty_inject("agent-s1", "line one\nline two")
+            # An emoji keeps the bracketed paste (typed text makes no chip).
+            ha._pty_inject("agent-s1", "line one\nline two \U0001F600")
         return len(captures), ctl
 
     def test_a_zero_deadline_halts_the_retry_loop_immediately(self):
@@ -38333,7 +38334,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
              mock.patch.object(ha.time, "sleep"), \
              mock.patch.object(ha, "_capture_pane", return_value="submitted"):
-            self.assertTrue(ha._pty_inject("agent-x", "line1\nline2"))
+            self.assertTrue(ha._pty_inject("agent-x", "line1\nline2 \U0001F600"))
         # First call: the whole message wrapped in bracketed-paste markers (so
         # newlines land as ONE message); then a bare CR to submit.
         self.assertTrue(calls[0].startswith("\x1b[200~"))
@@ -38355,7 +38356,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
              mock.patch.object(ha.time, "sleep",
                                side_effect=lambda s: order.append(("sleep", s))), \
              mock.patch.object(ha, "_capture_pane", return_value=""):
-            ha._pty_inject("agent-x", "a\nb")
+            ha._pty_inject("agent-x", "a\nb\U0001F600")
         # paste, THEN a settle sleep, THEN the Enter — never Enter before the sleep.
         self.assertEqual(order[0][0], "inject")
         self.assertEqual(order[1], ("sleep", ha.PTY_SUBMIT_SETTLE_SEC))
@@ -38398,7 +38399,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
              mock.patch.object(ha, "_busy_from_capture", return_value=False), \
              mock.patch.object(ha, "_capture_pane",
                                side_effect=lambda n: next(caps)):
-            ha._pty_inject("agent-x", "a\nb")
+            ha._pty_inject("agent-x", "a\nb\U0001F600")
         # the initial Enter + one per chip-still-showing re-check (2), then it
         # cleared — three Enters total, well under PTY_SUBMIT_MAX_RETRIES+1.
         self.assertEqual(len(enters), 3)
@@ -38417,7 +38418,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
              mock.patch.object(ha, "_busy_from_capture", return_value=True), \
              mock.patch.object(ha, "_capture_pane",
                                return_value="[Pasted text #1 +3 lines] esc to interrupt"):
-            ha._pty_inject("agent-x", "a\nb")
+            ha._pty_inject("agent-x", "a\nb\U0001F600")
         self.assertEqual(len(enters), 1)   # the initial Enter only; busy -> no retry
 
     def test_pty_inject_strips_control_bytes_from_the_paste(self):
@@ -38439,9 +38440,117 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
              mock.patch.object(ha, "PTY_SUBMIT_SETTLE_SEC", 0), \
              mock.patch.object(ha, "PTY_SUBMIT_MAX_RETRIES", 0):
-            ha._pty_inject("agent-x", "one\ntwo")
-        # Multi-line keeps the markers, or it submits a turn per line.
-        self.assertEqual("\x1b[200~one\ntwo\x1b[201~", seen[0])
+            ha._pty_inject("agent-x", "one\ntwo\U0001F600")
+        # A multi-line paste keeps the markers, or it submits a turn per line.
+        self.assertEqual("\x1b[200~one\ntwo\U0001F600\x1b[201~", seen[0])
+
+    # --- XERK-1727: chat-sized text is TYPED, the tmux path's rule ------------
+
+    def _inject(self, text, ok=True):
+        order = []
+
+        def fake_control(name, op, **kw):
+            order.append(("inject", kw.get("data")))
+            return {"ok": ok}
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep",
+                               side_effect=lambda s: order.append(("sleep", s))), \
+             mock.patch.object(ha, "_capture_pane") as cap:
+            result = ha._pty_inject("agent-x", text)
+        return result, order, cap
+
+    def test_pty_inject_types_multiline_text_unbracketed(self):
+        # Bracketing is what tags the turn <pasted_content>; a chat-sized
+        # multi-line message goes as typed text with raw LFs, then its own Enter.
+        ok, order, cap = self._inject("line1\r\nline2\tx")
+        self.assertTrue(ok)
+        self.assertEqual(order, [("inject", "line1\nline2    x"),
+                                 ("sleep", ha.PASTE_CHUNK_GAP_SEC),
+                                 ("inject", "\r")])
+        cap.assert_not_called()   # typed text makes no chip: no retry loop
+
+    def test_pty_inject_slices_a_long_single_line(self):
+        # One burst past ~800 chars is a paste too, so a long line is typed in
+        # PASTE_CHUNK_CHARS slices with a gap between them.
+        text = "".join(chr(97 + i % 26) for i in range(ha.PASTE_CHUNK_CHARS * 2 + 7))
+        ok, order, _ = self._inject(text)
+        injects = [d for k, d in order if k == "inject"]
+        self.assertEqual(injects[:-1], ha._input_slices(text))
+        self.assertEqual(len(injects[:-1]), 3)
+        self.assertTrue(all(len(p) <= ha.PASTE_CHUNK_CHARS for p in injects[:-1]))
+        self.assertEqual("".join(injects[:-1]), text)
+        self.assertNotIn("\x1b[200~", "".join(injects))
+        self.assertEqual(order[-2:], [("sleep", ha.PASTE_CHUNK_GAP_SEC), ("inject", "\r")])
+        self.assertEqual(sum(1 for k, _ in order if k == "sleep"), 3)
+
+    def test_pty_inject_brackets_past_the_slicing_cap(self):
+        text = "x" * (ha.PASTE_SLICED_MAX_CHARS + 1) + "\ny"
+        ok, order, _ = self._inject(text)
+        self.assertEqual(order[0], ("inject", "\x1b[200~" + text + "\x1b[201~"))
+        self.assertEqual(order[1], ("sleep", ha.PTY_SUBMIT_SETTLE_SEC))
+
+    def test_pty_inject_retries_a_failed_later_slice_once(self):
+        # A transient failure mid-message would otherwise leave the earlier
+        # slices in the composer for the next message to submit.
+        results = iter([{"ok": True}, None, {"ok": True}, {"ok": True}])
+        sent = []
+
+        def fake_control(name, op, **kw):
+            sent.append(kw.get("data"))
+            return next(results)
+
+        text = "a" * ha.PASTE_CHUNK_CHARS + "b" * 5
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep"):
+            self.assertTrue(ha._pty_inject("agent-x", text))
+        self.assertEqual(sent, ["a" * ha.PASTE_CHUNK_CHARS, "bbbbb", "bbbbb", "\r"])
+
+    def test_pty_inject_at_the_slicing_cap_is_typed(self):
+        text = "x" * (ha.PASTE_SLICED_MAX_CHARS - 2) + "\ny"
+        ok, order, _ = self._inject(text)
+        injects = [d for k, d in order if k == "inject"]
+        self.assertEqual("".join(injects[:-1]), text)
+        self.assertNotIn("\x1b[200~", "".join(injects))
+
+    def test_type_into_pane_serializes_windows_writers(self):
+        # Two writers (input worker, beat resend) must never splice slices.
+        import threading as th
+        log_ = []
+        gate = th.Event()
+
+        def fake_inject(name, text):
+            log_.append(("start", text))
+            gate.wait(0.2)
+            log_.append(("end", text))
+            return True
+
+        with mock.patch.object(ha, "IS_WINDOWS", True), \
+             mock.patch.object(ha, "_pty_inject", side_effect=fake_inject):
+            ts = [th.Thread(target=ha._type_into_pane, args=("agent-lock", t))
+                  for t in ("A", "B")]
+            for t in ts:
+                t.start()
+            for t in ts:
+                t.join()
+        self.assertEqual([k for k, _ in log_], ["start", "end", "start", "end"])
+
+    def test_pty_inject_failed_slice_submits_nothing(self):
+        # A dead control channel mid-message must never submit a cut message.
+        ok, order, _ = self._inject("a" * (ha.PASTE_CHUNK_CHARS + 5), ok=False)
+        self.assertFalse(ok)
+        self.assertEqual([d for k, d in order if k == "inject"], ["a" * ha.PASTE_CHUNK_CHARS])
+        results = iter([{"ok": True}, None, None])
+        sent = []
+
+        def fake_control(name, op, **kw):
+            sent.append(kw.get("data"))
+            return next(results)
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep"):
+            self.assertFalse(ha._pty_inject("agent-x", "a" * ha.PASTE_CHUNK_CHARS + "bb"))
+        self.assertNotIn("\r", sent)   # retried once, then gave up: no Enter
 
     def test_pane_send_keys_translates_key_names_on_windows(self):
         with mock.patch.object(ha, "IS_WINDOWS", True), \

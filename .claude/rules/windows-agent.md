@@ -76,7 +76,7 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   the hub's 75s `OFFLINE_AFTER_MS`, flapping a healthy host offline — the CLAUDE.md beat-loop contract.
   A missed capture just reads "can't tell", which the transcript-freshness fallback already handles.
   Tests: `TestBeatLoopBudget.test_pane_capture_worst_case_fits_under_the_offline_threshold`.
-- **A MULTI-LINE composer send must DELAY the Enter after the paste** (`_pty_inject`,
+- **A bracketed MULTI-LINE paste must DELAY the Enter after it** (`_pty_inject`,
   `PTY_SUBMIT_SETTLE_SEC`). Claude Code collapses a multi-line bracketed paste into a
   `[Pasted text +N lines]` chip, and an Enter that races that collapse is ABSORBED — the message
   lands in the composer but is never submitted ("it gets typed into the terminal chat but not
@@ -89,6 +89,21 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   and keeps the immediate-Enter fast path. **Do NOT "simplify" to an atomic paste+`\r` in one inject
   (`submit:true`)** — that removes the settle and submitted 0/4. Tests: the `_pty_inject` cases in
   `TestWindowsTerminalBackend`.
+- **Chat-sized input is TYPED, not bracketed** (XERK-1727, the XERK-1718 rule): `_pty_inject`
+  types text ≤ `PASTE_SLICED_MAX_CHARS` with nothing in `_SLICE_UNSAFE_RE` in `PASTE_CHUNK_CHARS`
+  slices, LF raw, tabs as 4 spaces, then a separate CR (after a `PASTE_CHUNK_GAP_SEC` gap when
+  there were several slices or any LF). Only
+  longer or emoji-bearing text takes the bracketed paste + settle/chip-retry path above.
+  - LF as a line break rests on the SOURCES, not a host run: conhost's input engine maps LF to a
+    Ctrl+Enter key event carrying `\n`, which libuv hands node as LF — the byte tmux `-r` types.
+  - **Host-unverified** (no Windows host in the fleet when it shipped). Verify on the first one:
+    a typed two-line message must land as ONE turn with no `<pasted_content>` in the transcript.
+    If LF submits there, revert `_pty_inject` to bracketing multi-line text.
+  - A failed slice returns False with no Enter; a failed LATER slice is retried once first,
+    since the earlier ones already sit in the composer. Residuals: a second failure leaves them
+    there for the NEXT message to submit; a lost reply on a slice that DID land types it twice.
+  - `_type_into_pane` holds `_PANE_TYPE_LOCKS` on Windows too: N injects from two writers (input
+    worker, beat resend, qwen peer) would otherwise splice into one turn.
 - **The multi-line retry loop is bounded by a WALL CLOCK, not just the iteration count** (XERK-867,
   `PTY_SUBMIT_DEADLINE_SEC`): each iteration's `_capture_pane` + Enter is a ~5s-class control RPC, so
   `PTY_SUBMIT_MAX_RETRIES` alone let one degraded multi-line paste run ~15-30s. That was load-bearing
