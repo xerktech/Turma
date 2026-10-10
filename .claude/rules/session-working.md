@@ -65,6 +65,10 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   - `wait-external` — `gh pr checks --watch`, `gh run watch`, `kubectl wait|rollout status`,
     `docker logs -f`, `tail -f`, `watch`, an `until …; do sleep …; done` poll;
   - `work` — anything else.
+  - a loop that sleeps between read-only PROBES (`gh pr view|checks|status`, `gh run view|list`,
+    `[`/`test`) and can `break` on one is `wait-external` — a session polling for its own merge.
+    A probe on its own line, or in a loop with no `break`, stays `work`. A loop condition may pipe
+    into filters (`until gh pr view … | grep -q MERGED`).
 - **Anything unrecognised is `work`** — that is the pre-XERK-1570 reading, so a classifier miss
   costs nothing new; the reverse miss (work read as waiting) would hide a busy session. Every rule
   errs toward `work`; nested timeouts/loops classify as work rather than recurse on the beat.
@@ -86,8 +90,11 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
   a wrong type is decode-fatal for the whole fleet.
 - **A session whose live rows are ALL waits is waiting, not working** — a distinct live kind
   (`holding` in the clients; `sessionWait` → `{state:"waiting"|"stalled", eta}` in the hub):
-  - waiting while any ETA is ahead — never Ready for review, never the review alert, never
-    auto-merged (`autoMergeSweep` skips it like a working session);
+  - waiting while any ETA is ahead — never Ready for review, never the review alert;
+  - **auto-merge holds only for a TIMED wait still before its ETA** (`timedWaitAhead`), never
+    for an ETA-less external watch: the watch is often a poll for that very merge, so holding it
+    deadlocks both (a session can watch for 45 min until stalled). Tests: `auto-merge holds for
+    a timed wait ahead of its ETA…` in `server.test.js`;
   - **stalled** once the newest ETA passed by `WAIT_ETA_GRACE_MS` (2 min — a finished sleep's own
     stop notification needs a beat to land) with no transcript write since, OR the transcript has
     been silent `ATTENTION_WAIT_STALL_MIN` (hub env, default 45; clients hardcode the default). A

@@ -11819,6 +11819,15 @@ function backgroundWait(rows, lastWrite, now) {
   return { state: overdue || silent ? "stalled" : "waiting", eta };
 }
 
+// Is any live TIMED wait (`sleep N`, a literal timeout) still before its ETA?
+// autoMergeSweep holds only for these; an ETA-less external watch never ends on
+// its own when what it watches is the merge itself.
+function timedWaitAhead(session, now) {
+  const rows = session.session?.agents;
+  return Array.isArray(rows) && rows.some((a) =>
+    a && a.kind === "wait-timed" && Number.isSafeInteger(a.eta) && a.eta > now);
+}
+
 // The session-level wait: null unless it is live, online, not working, and
 // every live row is a wait (a computed kind only — the attention child renders it).
 function sessionWait(session, lastSeen, now) {
@@ -14898,8 +14907,12 @@ function autoMergeSweep() {
       // (it may still be pushing commits, which drops the PR out of "ready"
       // anyway) and never while it is blocked asking the operator something.
       if (sessionWorking(s, a.lastSeen, now)) continue;
-      // Still waiting out a shell it launched (XERK-1570) — not finished either.
-      if (sessionWait(s, a.lastSeen, now)?.state === "waiting") continue;
+      // Still sleeping out a TIMED wait it launched (XERK-1570) — it said when it
+      // comes back, so it is not finished. An open-ended watch on something outside
+      // (`gh pr checks --watch`, a poll for the merge) does NOT hold the merge: the
+      // session ended its own turn, and the thing it watches is often exactly the
+      // merge this sweep is about to make — holding it would deadlock both.
+      if (sessionWait(s, a.lastSeen, now)?.state === "waiting" && timedWaitAhead(s, now)) continue;
       // Asleep until a session-CLI wake (XERK-1571) — it means to come back to it.
       if (sessionSleeping(s.session, now)) continue;
       const ss = s.session || {};
@@ -14946,7 +14959,12 @@ function autoMergeSweep() {
           console.error(`auto-merge: giving up on ${p.url} after ${attempts - 1} attempts`);
           continue;
         }
-        const cmdId = queueCommand(host, { type: "mergePr", sessionId: s.id, url: p.url });
+        // `head`: the commit this readiness was judged on, so the agent pins the
+        // merge to it (--match-head-commit) — a push since then is refused and
+        // retried, never merged on the previous commit's green.
+        const head = typeof p.head === "string" && /^[0-9a-f]{40}$/.test(p.head) ? p.head : null;
+        const cmdId = queueCommand(host, { type: "mergePr", sessionId: s.id, url: p.url,
+          ...(head ? { head } : {}) });
         awaitResult(a, cmdId, "mergePr");
         rememberCmdHost(cmdId, host, "mergePr");
         autoMergeState.set(p.url, { at: now, attempts });
