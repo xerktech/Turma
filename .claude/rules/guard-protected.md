@@ -7,6 +7,8 @@ paths:
   - "agent/hooks/fileguard.py"
   - "agent/tests/test_turma_agent_protect.py"
   - "agent/tests/test_guard_settings.py"
+  - "agent/qwen/guard/shim.py"
+  - "agent/dsh/guard/**"
 ---
 
 # Root-owned guard hooks (XERK-1677)
@@ -53,7 +55,15 @@ stub (XERK-1643 incident). `agent/native/turma-agent-protect` moves the two SECU
   config, not code.
 - Still session-controllable (best-effort, XERK-1749): `~/.turma/grants` and the grant's
   `TURMA_SESSION_ID` env, `$HOME` as guard.py's own home readings use it, `ask.py`/`permlog.py`, the
-  `--settings` deny rules, the `claude` binary in `~/.local`, and the dsh/qwen guards (their own
-  runtimes, which read `$PREFIX` copies).
+  `--settings` deny rules, the `claude` binary in `~/.local`.
+- **dsh and qwen read no managed settings**, so `runtime_hooks()` points their guard configs at
+  the protected copies while `managed_guard_active()` (XERK-1751); both caches re-check it per launch.
+  - It runs `--protected` there too (`guardArgs`): a session can start a nested dsh/qwen with
+    `TURMA_TOOL_GRANTS='Bash(*)'` in its env, which lifts an unprotected guard's denies.
+  - A live dsh/qwen session keeps the paths it launched with: after `remove` its shell and file
+    calls fail CLOSED (hook missing) until it relaunches. Safe, so accepted.
+  - Still session-writable around them (XERK-1764): the shim + plugin code under `$PREFIX`,
+    `~/.turma/qwen-guard.json`, the dsh profile, qwen's per-worktree `.qwen/settings.json`.
 - Tests: `test_turma_agent_protect.py`, `TestManagedGuard` (`test_guard_settings.py`),
-  `TestProtectedOverrides` (`test_guard.py`), `TestFakedHome` (`test_fileguard.py`).
+  `TestProtectedOverrides` (`test_guard.py`), `TestFakedHome` (`test_fileguard.py`),
+  `test_guard_args_reach_guard_py` (`test_qwen_guard.py`), `guardArgs reach guard.py` (dsh policy test).

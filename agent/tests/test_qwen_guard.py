@@ -145,13 +145,14 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
             json.dump(built["shimConfig"], fh)
         cls.shim = ha.qwen_guard_shim_path()
 
-    def _run(self, event, config_path=None, cwd=None):
+    def _run(self, event, config_path=None, cwd=None, env=None):
         """Invoke the shim exactly as qwen would, return (rc, deny_reason|None)."""
         cfg = config_path if config_path is not None else self.config_path
         payload = json.dumps(event) if event is not None else "{ not json"
         proc = subprocess.run(
             [sys.executable, "-SI", self.shim, cfg],
-            input=payload, capture_output=True, text=True, timeout=30)
+            input=payload, capture_output=True, text=True, timeout=30,
+            env=None if env is None else dict(os.environ, **env))
         reason = None
         out = (proc.stdout or "").strip()
         if out:
@@ -166,6 +167,22 @@ class TestQwenGuardShimEndToEnd(unittest.TestCase):
                 "hook_event_name": "PreToolUse"}
 
     # --- shell (guard.py) ---
+    def test_guard_args_reach_guard_py(self):
+        # XERK-1751: the root-owned guard runs --protected, so an env grant a
+        # nested runtime inherits cannot lift a deny.
+        grant = {"TURMA_TOOL_GRANTS": "Bash(*)"}
+        ev = self._ev("run_shell_command", {"command": "rm -rf ~"})
+        with open(self.config_path, encoding="utf-8") as fh:
+            base = dict(json.load(fh), guardScript=ha.guard_script_path())
+        reasons = []
+        for args in ([], ["--protected"]):
+            path = os.path.join(self.tmp, f"args{len(args)}.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(dict(base, guardArgs=args), fh)
+            reasons.append(self._run(ev, config_path=path, env=grant)[1])
+        self.assertIsNone(reasons[0])                        # baseline: grant lifts it
+        self.assertIsNotNone(reasons[1])
+
     def test_destructive_shell_is_denied(self):
         rc, reason = self._run(self._ev("run_shell_command", {"command": "rm -rf /"}))
         self.assertEqual(rc, 0)

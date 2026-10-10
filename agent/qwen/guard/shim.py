@@ -47,7 +47,7 @@ disengages is the exact "not shippable" state this ticket exists to prevent.
 
 Config (``argv[1]``) is a JSON file ``build_qwen_guard_config()`` writes::
 
-    {"pythonExe", "guardScript", "fileguardScript"|null,
+    {"pythonExe", "guardScript", "guardArgs": [...], "fileguardScript"|null,
      "denyWrite": [...], "denyRead": [...], "allowRead": [...],
      "hookTimeoutMs": <int>}
 
@@ -227,7 +227,7 @@ def _matches_target(literal, real, regexps):
 # --- the shared py deny policy (guard.py / fileguard.py) ------------------
 
 
-def _run_hook(cfg, script, tool_name, tool_input, cwd, session_id):
+def _run_hook(cfg, script, tool_name, tool_input, cwd, session_id, args=()):
     """Invoke a shared Claude PreToolUse hook exactly as Claude Code does and
     return its denial reason, or None to allow. FAILS CLOSED: a hook that cannot
     be spawned, crashes (nonzero exit), times out, or returns unreadable output
@@ -246,7 +246,7 @@ def _run_hook(cfg, script, tool_name, tool_input, cwd, session_id):
     timeout = (cfg.get("hookTimeoutMs") or 5000) / 1000.0
     try:
         proc = subprocess.run(
-            [cfg.get("pythonExe") or "python3", "-SI", script],
+            [cfg.get("pythonExe") or "python3", "-SI", script, *args],
             input=payload, capture_output=True, text=True, timeout=timeout,
         )
     except (OSError, subprocess.SubprocessError) as e:
@@ -316,8 +316,11 @@ def decide(event, cfg):
             raise _FailClosed(
                 "Turma qwen safety guard: a shell tool was called with a "
                 "non-string command that cannot be inspected. Denying by default.")
+        args = cfg.get("guardArgs")
         return _run_hook(cfg, cfg["guardScript"], "Bash",
-                         {"command": payload}, cwd, session_id)
+                         {"command": payload}, cwd, session_id,
+                         [a for a in args if isinstance(a, str)]
+                         if isinstance(args, list) else ())
 
     if kind == "write":
         for tgt in payload:
