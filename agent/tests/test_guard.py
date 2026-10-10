@@ -2296,6 +2296,66 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_other_spellings_of_a_visited_directory_are_read(self):
+        """XERK-1755: a PWD/OLDPWD default or alternative, a DIRSTACK element,
+        a `dirs` output and a zsh named directory each reached rm as / or /etc."""
+        for cmd in ("cd /; cd /tmp; rm -rf ${OLDPWD:-x}",
+                    "cd /; rm -rf ${PWD-x}",
+                    "cd /; cd /tmp; rm -rf ${OLDPWD:+$OLDPWD}",
+                    "cd /; cd /tmp; rm -rf ${OLDPWD=x}/etc",
+                    "cd /etc; rm -rf ${PWD:-x}/*",
+                    "cd /; pushd /tmp; rm -rf ${DIRSTACK[1]}",
+                    "cd /; pushd /tmp; rm -rf ${DIRSTACK[-1]}",
+                    "cd /; pushd /tmp; rm -rf $DIRSTACK",
+                    "cd /; pushd /tmp; rm -rf $(dirs -l +1)",
+                    "cd /; pushd /tmp; rm -rf `dirs -l +1`",
+                    "bash -c 'cd /; rm -rf ${PWD-x}'",
+                    "hash -d e=/; rm -rf ~e/etc",
+                    "hash -d e=/etc; rm -rf ~e",
+                    "e=/; rm -rf ~e/etc",
+                    # QA: an alternative's own word, other ops, `pwd`, other
+                    # `dirs` spellings, and zsh's always-set `~PWD`.
+                    "cd /; rm -rf ${PWD:+/etc}",
+                    "cd /etc; rm -rf ${PWD:+${PWD%x}}",
+                    "cd /etc; rm -rf ${PWD%x}", "cd /etc/x; rm -rf ${PWD%/*}",
+                    "cd /etc; rm -rf ${PWD/x/y}", "cd /etc; rm -rf ${PWD:0}",
+                    "cd /etc; rm -rf ${PWD,,}", "cd /etc; rm -rf ${PWD[@]}",
+                    "cd /etc; cd /tmp; rm -rf ${OLDPWD#x}",
+                    "cd /etc; rm -rf $(pwd)", "cd /etc; rm -rf `pwd -P`",
+                    "cd /etc; rm -rf $(builtin pwd)",
+                    "cd /; pushd /tmp; rm -rf $(\\dirs -l +1)",
+                    "cd /; pushd /tmp; rm -rf $('dirs' -l +1)",
+                    "cd /; pushd /tmp; rm -rf $(eval dirs -l +1)",
+                    "cd /; pushd /tmp; d=dirs; rm -rf $($d -l +1)",
+                    "cd /; pushd /tmp; read x < <(dirs -l +1); rm -rf $x",
+                    "cd /; rm -rf ~PWD/etc", "cd /; cd /tmp; rm -rf ~OLDPWD/etc"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        for cmd in ("cd /tmp/a; rm -rf ${PWD-x}/build", "rm -rf ${OLDPWD:-x}",
+                    "cd /tmp/a; pushd /tmp/b; rm -rf ${DIRSTACK[1]}/build",
+                    "rm -rf ${PWD:-.}/build", "dirs -v; rm -rf build",
+                    "cd /; rm -rf ${PWDX:-x}", "cd /; rm -rf ${#DIRSTACK[@]}",
+                    "hash -d e=/tmp/x; rm -rf ~e/build", "rm -rf ~e/etc",
+                    "cd /tmp/a; rm -rf ${PWD%/*}/b", "cd /tmp/proj; rm -rf ../${PWD##*/}-old",
+                    "cd /tmp/a; rm -rf $(pwd)/build", "cd /; rm -rf ${PWD:+/tmp/x}",
+                    "cd /tmp/a; rm -rf ${PWD@Q}"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+        # An unclosed opener splices nothing: it re-copied the line per opener.
+        # Each opener a reading takes (`[`, a default, an alternative), unclosed or nested.
+        for unit in ("${DIRSTACK[", "${PWD:-", "${OLDPWD:+"):
+            start = time.process_time()
+            cmd = "rm -rf x; echo '" + unit * 300 + "'"
+            self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow", unit)
+            self.assertLess(time.process_time() - start, 5, unit)
+        # Nested alternatives: read to a depth, then refused as too large, never quadratic.
+        nest = lambda n, w: "${PWD:+" * n + w + "}" * n
+        self.assertIsNotNone(guard.is_destructive("rm -rf " + nest(8, "/etc")))
+        start = time.process_time()
+        line = "rm -rf x; cat <<'E'\n" + nest(1200, "a") + "\nE"
+        self.assertEqual(guard.decide("Bash", {"command": line})[0], "deny")
+        self.assertLess(time.process_time() - start, 5)
+
     def test_tilde_and_pwd_follow_the_line_s_own_home_and_cd(self):
         """XERK-1685: bash expands `~` from HOME's current value and `$PWD` is
         where a `cd` left it, so each of these reached rm as /etc (nobody rig)."""

@@ -57,7 +57,24 @@ paths:
     - Accepted over-read (visited dirs are unordered): `cd /etc; PWD=/tmp/x; rm -rf $PWD`.
   - `_PWD_LEAD_RE` also takes `${PWD:?}`/`${PWD?}` and an unspliced directory tilde, which
     `eval rm '~-'` / `\~-` reach a target as (the splice's lookbehind skips quotes).
-    `${PWD:-x}` never reaches it: the default is spliced upstream (XERK-1755).
+    `${PWD:-x}` never reaches it as written: the values pass splices the default.
+  - Other spellings of a visited directory are an ADDED reading (`_dir_readings`, XERK-1755):
+    - `${PWD<op>w}`/`${OLDPWD<op>w}` default → the name, `:+`/`+` → `w` rewritten again (both are
+      always set); a trim/replace/offset/case op is applied to each directory the line `cd`s to,
+      one reading each (`_cd_targets`); `@Q` and an op word holding `$` stay as written.
+    - A `DIRSTACK` element, `$DIRSTACK`, and a `$(…)`/backtick/`<(…)` running `dirs`/`pwd`
+      (quoted, escaped, behind `builtin`/`command`/`eval`, or a `$d` the line sets) → `$PWD`.
+    - zsh: `~e` of a name the line assigns (`hash -d e=/` counts) or PWD/OLDPWD → `${e}`
+      (bash leaves it literal: over-read).
+    - Gated like the kept default: a spelling in the text AND a `_HOME_TARGET_PROGS` command.
+    - Skip an unclosed `${`, and keep the `dirs`/`pwd` argument run bounded: an unclosed opener
+      read to the line's end re-copied the line per opener (4 KB → 31s, QA).
+    - Past `_MAX_DIR_NEST` nested `${PWD:+…}` words the line is too large: each level is a
+      `_brace_end` over the rest (quadratic, then a RecursionError), and leaving the rest to the
+      re-read reading only peels it a level per pass (QA).
+    - Open (XERK-1774): an always-set name's `:+` word in program position, `di''rs`/`d\irs`,
+      `$(/bin/pwd)`/`$(env pwd)`/`$("$p")`, a `dirs`/`pwd` run padded past the bound or holding
+      `(`, zsh's `$dirstack`/`$PWD:h`/`${(L)PWD}`/glob qualifiers, the session's own starting cwd.
   - Any tail glued after that lead (`$x`, `$1`, `${x#a}`, `*`) is joined to the directory as bash
     joins it, then judged (`cd /; rm -rf $PWD*` is `/*`); a tilde lead takes only `/` or `$`.
   - Accepted over-read: a function body's unbound reading reads `$1` empty, so after `cd /`,
@@ -92,7 +109,8 @@ paths:
     as `$HOME` already is there.
   - Tests: `test_tilde_and_pwd_follow_the_line_s_own_home_and_cd`,
     `test_directory_tildes_read_as_the_directories_the_line_visited`,
-    `test_a_cd_overrides_the_line_s_own_pwd_assignment`.
+    `test_a_cd_overrides_the_line_s_own_pwd_assignment`,
+    `test_other_spellings_of_a_visited_directory_are_read`.
 - An unassigned `${HOME<op>}` (not a `:-`/`:=` default) is spliced in the values pass as its
   `_home_readings` (XERK-1686): kept as written, `${HOME:+r}m -rf /`, `${HOME/*/rm} -rf /` and
   `rm ${HOME:+-rf} /` hid the program or flag.
