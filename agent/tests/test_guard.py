@@ -2408,6 +2408,10 @@ class TestScriptChannels(unittest.TestCase):
                         "cd ~ && cd 2>&1 .. && rm -rf x", "cd ~ && cd >&2 .. && rm -rf x",
                         "cd ~ && cd <&0 .. && rm -rf x", "cd ~ && cd &>/dev/null .. && rm -rf x",
                         "cd ~ && cd >|/dev/null .. && rm -rf x", "cd 2>&1 /etc && rm -rf passwd",
+                        # A quoted or spelled relative cd's landing is a stop too (QA).
+                        "cd ~/p/x && cd \"a;b/c/d\" && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && cd a\\;b/c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
+                        "cd ~/p/x && c\\d ab/c/d && (cd /tmp/z) && cd ../../../../.. && rm -rf .ssh",
                         "cd >|/dev/null / && rm -rf etc",
                         # ...nor decoys filling the cap.
                         "cd /a1; cd /a2; cd /a3; cd /a4; cd /a5; cd /a6; cd /a7; cd /a8;"
@@ -2472,6 +2476,7 @@ class TestScriptChannels(unittest.TestCase):
             for cmd in ("cd ~/proj && rm -rf build", "cd ~/proj && rm -rf ../other",
                         # One `cd ..` climbs once, however many readings match it (QA).
                         "cd ~/p/a && cd 2>&1 .. && rm -rf *", "cd ~/p/a && c\\d .. && rm -rf *",
+                        "cd ~/p/a && \"cd\" .. && rm -rf *",
                         "cd $(dirname $0) && rm -rf build", "rm -rf \"$(dirname \"$f\")\"/x",
                         "rm -rf \"$(dirname /tmp/a/b)\"/*",
                         # A printed path inside the home stays `$HOME…` (QA).

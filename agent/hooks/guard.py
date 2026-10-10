@@ -11383,12 +11383,25 @@ def _cd_targets(text: str, inherited: tuple[str, ...],
     nothing: the directories already listed stay listed whatever it does.
     ``state`` holds the anchors and latest cwds of the line's earlier segments.
     A `cd` word spelled with quotes or escapes (`c\\d`) is read too (XERK-1769)."""
+    readings = _cd_spelled_readings(text)
+    start = None if state is None else {k: list(v) for k, v in state.items()}
     found = _cd_targets_in(text, inherited, line_vals, state)
-    for reading in _cd_spelled_readings(text):
+    for reading in readings:
         # Its own walk from the same start: from ``found``, the same relative
         # `cd ..` climbed twice and refused `cd ~/p/a && cd 2>&1 .. && rm -rf *`.
-        found += tuple(c for c in _cd_targets_in(reading, inherited, line_vals, None)
+        # Its anchors and stops join the carried ones: dropped, a `c\\d ab/c`
+        # landing was lost to the line's later segments (XERK-1768 QA).
+        own = None if start is None else {k: list(v) for k, v in start.items()}
+        found += tuple(c for c in _cd_targets_in(reading, inherited, line_vals, own)
                        if c not in found)
+        if own and state is not None:
+            if not state:
+                state.update(anchors=list(inherited), latest=list(inherited), stops=[])
+            home = _session_home()
+            for key, deep in (("anchors", True), ("stops", False)):
+                state[key] = _cd_nearest(list(dict.fromkeys(state[key] + own[key])),
+                                         home, deep=deep)
+            state["latest"] = list(dict.fromkeys(state["latest"] + own["latest"]))[:_MAX_CWDS]
     return found
 
 
@@ -11430,6 +11443,9 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
         moved: list[str] = []
         bases = list(dict.fromkeys(latest + anchors + stops))
         relatives: list[bool] = []
+        # Each relative reading's own landing is a stop: the flat reading of
+        # `cd "a;b/c"` lands on `"a`, and only its quoted twin on `a;b/c` (QA).
+        landed: list[str] = []
         for m in by_start[start]:
             raw = _cd_split_redirects(m.group(2))
             try:
@@ -11493,6 +11509,7 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
                     if start is not None:
                         targets.append(_cwd_reading_in(posixpath.normpath(start + "/" + op),
                                                        home))
+            first = len(moved)
             for target in targets:
                 target = _norm_cd(target)
                 # The session home spelled absolutely is `~`: joined as `$HOME/x`,
@@ -11515,12 +11532,14 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
                         found.remove(target)
                     found.append(target)
             relatives.append(relative)
+            if relative and len(moved) > first:
+                landed.append(moved[first])
         if not moved:
             continue
         if not all(relatives):
             anchors = _cd_nearest(list(dict.fromkeys(anchors + moved)), home)
-        if any(relatives) and moved[0] not in stops:
-            stops = _cd_nearest(stops + [moved[0]], home, deep=False)
+        if any(t not in stops for t in landed):
+            stops = _cd_nearest(list(dict.fromkeys(stops + landed)), home, deep=False)
         latest = moved[:_MAX_CWDS]
         if len(found) > 8 * _MAX_CWDS:
             # Each `cd` scans the list: untrimmed, 480 of them took 0.8s.
