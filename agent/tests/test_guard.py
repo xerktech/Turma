@@ -2223,6 +2223,28 @@ class TestScriptChannels(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertAllowed(cmd)
 
+    def test_a_relative_name_for_the_home_after_cd_to_its_parent(self):
+        """XERK-1752: after `cd` to the home's parent a bare `x` IS the home;
+        only `..` operands were joined, so QA's nobody rig lost HOME."""
+        with mock.patch.dict(os.environ, {"HOME": "/var/tmp/qa7h/home/x"}):
+            for cmd in ("cd ${HOME%q}x/.. && rm -rf x", "cd $HOME/.. && rm -rf x",
+                        "cd ~/.. && rm -rf x", "cd ~/.. && rm -rf ./x/",
+                        "cd ~/.. && rm -rf *", "cd ~/.. && rm -rf x*",
+                        "cd ~/.. && rm -rf $PWD/x", "cd /var/tmp && rm -rf qa7h",
+                        "cd /var/tmp && rm -rf qa7h/home", "cd ~/.. && chmod -R 777 x",
+                        "cd ~/.. && find x -delete"):
+                with self.subTest(cmd=cmd):
+                    self.assertDenied(cmd)
+            # Inside the home, or a sibling of it, names nothing above it.
+            for cmd in ("cd ~/.. && rm -rf y", "cd ~/.. && rm -rf y*",
+                        "cd ~/.. && rm -rf x/build", "cd ~ && rm -rf build",
+                        "cd /var/tmp && rm -rf other"):
+                with self.subTest(cmd=cmd):
+                    self.assertAllowed(cmd)
+        with mock.patch.dict(os.environ, {"HOME": "/home/a/b"}):
+            self.assertDenied("cd /home/a && rm -rf b")
+            self.assertAllowed("cd /home/a && rm -rf c")
+
     def test_tilde_and_pwd_follow_the_line_s_own_home_and_cd(self):
         """XERK-1685: bash expands `~` from HOME's current value and `$PWD` is
         where a `cd` left it, so each of these reached rm as /etc (nobody rig)."""

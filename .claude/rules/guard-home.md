@@ -103,3 +103,10 @@ paths:
   - Tests: `test_a_brace_unit_inside_a_brace_list_is_one_item`.
 - Tests: `test_a_target_built_from_home_is_read_with_the_real_home`,
   `test_home_readings_are_bounded`.
+- A relative `rm`/`chmod`/`find` operand after a `cd` is joined to that cwd when the join may
+  name the session home or a directory above it (`_holds_home`, XERK-1752).
+  - Otherwise only `..` operands (or any, inside an exact root) are joined: joining every one
+    would refuse `cd /usr/src/app && rm -rf build` against a cwd that may be stale.
+  - Matched component by component with `fnmatchcase`, so after `cd ~/..` the operands `x`,
+    `./x/`, `x*` and `*` all deny; `*` matching a dot-name over-reads, which only adds a refusal.
+  - Tests: `test_a_relative_name_for_the_home_after_cd_to_its_parent`.
