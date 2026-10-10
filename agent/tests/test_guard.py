@@ -3349,6 +3349,26 @@ class TestScriptChannels(unittest.TestCase):
         # An ODD run escapes the `>`: the `&` backgrounds echo, and sh reads nothing.
         self.assertAllowed(f"echo '{R} #' {B16}\\>&1 | sh")
 
+    def test_a_redirection_glued_to_a_target_ends_it(self):
+        # XERK-1754: bash ends a word at an unquoted redirection, so
+        # `rm -rf /etc>/dev/null` removes /etc; shlex kept `/etc>/dev/null`.
+        for cmd in ("rm -rf /etc>/dev/null", "rm -rf />x", "rm -rf /etc>>x",
+                    "rm -rf /etc>&2", "rm -rf /etc>|x", "rm -rf /etc<<<x",
+                    "rm -rf /etc<>x", "rm -rf /etc&>x", "rm -rf /etc<x",
+                    "chmod -R 000 /etc>/dev/null",
+                    "rm -rf --no-preserve-root />/dev/null", "rm -rf ~/>/dev/null",
+                    "cd /; cd /tmp; rm -rf ~->/dev/null",
+                    "f() { rm -rf /etc>/dev/null; }", "bash -c 'rm -rf /etc>/dev/null'"):
+            with self.subTest(cmd=cmd):
+                self.assertDenied(cmd)
+        # A quoted or escaped `>` is text, a digit word is the fd, and an
+        # ordinary target stays allowed.
+        for cmd in ('rm -rf "/etc>x"', "rm -rf '/etc'\\>x", "rm -rf /etc2>/dev/null",
+                    "rm -rf build>/dev/null 2>&1", "ls /etc>out.txt",
+                    "echo $((1<<2))>f", "cat a<(echo hi)"):
+            with self.subTest(cmd=cmd):
+                self.assertAllowed(cmd)
+
     def test_xerk_1641_remaining_bypasses(self):
         # XERK-1641: redirects between a command's words, shells named through
         # `$SHELL`/globs/aliases, options after `-c`, name rebinds, positional

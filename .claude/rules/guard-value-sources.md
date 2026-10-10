@@ -14,6 +14,13 @@ paths:
   - The stage walk (`keep_redirects`) never joins: joined, `echo … \>&1 | sh` fed sh.
   - Every path-like word feeds `xargs` once (`piped_operands` de-duped): the extra readings
     repeated them until a benign `xargs kill` line hit the value cap ("too large").
+- **A live `<`/`>` glued to a word ends it** (XERK-1754, `_unglue_redirects` in the tokenizer):
+  shlex kept `rm -rf /etc>/dev/null` one word `/etc>/dev/null`, which named no protected root.
+  - Left glued: an fd word (`2>`, `{fd}>`; `/etc2>` is the word `/etc2`), `<(`/`>(`, quoted or
+    escaped text, and anything inside `$(…)`/`${…}`/`(…)`/backticks (read when those bodies are).
+  - In the tokenizer, not per target rule: every `_tokenize` consumer gets bash's words.
+  - `_script_file_readings` reads each written text once: `>f>f…` wrote 20k copies of one text.
+  - Tests: `test_a_redirection_glued_to_a_target_ends_it`.
 - **Values a line sets, beyond `name=value`** (`_assigned_values`, XERK-1634):
   - an array's elements, each a value of its own (`"${a[1]}"`), up to `_MAX_VALUE_READINGS`/2;
   - `${x:=w}`/`${x=w}` as an ADDED whole-line reading with `x=w` written first

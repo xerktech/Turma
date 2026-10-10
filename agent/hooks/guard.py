@@ -6657,9 +6657,60 @@ def _keep_brace_blanks(segment: str) -> tuple[str, dict[str, str]] | None:
     return text, {v: k for k, v in stand.items()}
 
 
+_FD_WORD_RE = re.compile(r"\d+|\{[A-Za-z_]\w*\}")
+
+
+def _unglue_redirects(segment: str) -> str:
+    """``segment`` with a blank before each live `<`/`>` glued to a word.
+
+    bash ends a word at an unquoted redirection: `rm -rf /etc>/dev/null` is
+    the operand `/etc` plus `>/dev/null`. shlex kept `/etc>/dev/null` one
+    word, which named no protected root (XERK-1754). Left glued: a word that
+    is the redirection's fd (`2>`, `{fd}>`), `<(…)`/`>(…)`, and anything
+    inside `$(…)`, `${…}`, `(…)` or backticks — those bodies are tokenized on
+    their own when they are read."""
+    if "<" not in segment and ">" not in segment:
+        return segment
+    states = _quote_states(segment)
+    stack: list[str] = []
+    cuts: list[int] = []
+    word = 0  # where the current word starts
+    for i, ch in enumerate(segment):
+        if states[i]:
+            continue
+        if ch == "`":
+            if stack and stack[-1] == "`":
+                stack.pop()
+            else:
+                stack.append("`")
+        elif ch == "(":
+            stack.append("(")
+        elif ch == "{" and i and segment[i - 1] == "$":
+            stack.append("{")
+        elif ch in ")}" and stack and stack[-1] == ("(" if ch == ")" else "{"):
+            stack.pop()
+        if stack:
+            continue
+        if ch in " \t\r\n;|" or ch == "&" and segment[i + 1:i + 2] != ">":
+            word = i + 1
+        elif ch in "<>" and i > word and segment[i - 1] not in "<>&" \
+                and segment[i + 1:i + 2] != "(":
+            if not _FD_WORD_RE.fullmatch(segment[word:i]):
+                cuts.append(i)
+            word = i
+        elif ch == "&" and i > word:
+            # `/etc&>x`: the `&` opens the `&>` redirection.
+            cuts.append(i)
+            word = i
+    if not cuts:
+        return segment
+    bounds = [0, *cuts, len(segment)]
+    return " ".join(segment[a:b] for a, b in zip(bounds, bounds[1:]))
+
+
 @functools.lru_cache(maxsize=512)
 def _tokenize_cached(segment: str) -> tuple[str, ...]:
-    segment = _join_continuations(segment)
+    segment = _unglue_redirects(_join_continuations(segment))
     kept = _keep_brace_blanks(segment)
     if kept is None:
         return _tokenize_split(segment)
@@ -9688,7 +9739,9 @@ def _script_file_readings(path: str, runs: list[tuple[str, ...]],
     XERK-1674)."""
     out: list[str] = []
     argful = [a for a in runs if a]
-    for text in written.get(path, ()):
+    # Each distinct text once: `>f>f>f…` writes one text to f per redirect,
+    # and reading every copy was quadratic (XERK-1754).
+    for text in dict.fromkeys(written.get(path, ())):
         scripts = _script_readings(text)
         bound = [r for sc in scripts for r in _positional_readings(sc)]
         if len(argful) > _MAX_SCRIPT_RUNS:
