@@ -249,6 +249,14 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   let a wedged leader outlive the standby's acquisition for a fractional-second custom lease. Keep the
   two in agreement (both `leaseSeconds*1000`, `leaseSeconds` ceiled). Timing tests that need real
   expiry use ≥1s.
+- **A renewal is stamped with the TICK's `now` (the renewTime written), never `Date.now()` after
+  the PUT returns** (XERK-1835). A slow renew response otherwise extends the leader's self-expiry
+  past the expiry a standby reads off that renewTime, and two replicas report `isLeader()`. Every
+  `_setLeader(true)` call passes `now`. Test: `XERK-1835:` in `leader.test.js`.
+  - The stamp is MAX-merged: a late response to an older renew never moves it backwards.
+  - `_setLeader(true)` does NOT hold leadership if the newest stamp already lapsed, if the elector
+    is closed (`release()`), or if `canLead()` is false (abstain). An in-flight renew can return
+    after any of those and must not re-arm `_leader`.
 - **On graceful shutdown the leader RENOUNCES** (`release()` backdates the lease's `renewTime`) so a
   warm standby promotes within one retry instead of waiting out the lease — but only AFTER its
   registry writes landed (the handover order above); a draining FOLLOWER stops its elector at once.

@@ -221,6 +221,11 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     The term relies on the elector emitting a promotion after a lapsed lease is re-won
     (`turma-ha-leader.md`). Residual: a process pause between a check and its write.
   - `dedupPendingIds` is keyed by id, so never clear it for a file whose row is another file's.
+  - A gated HEAL replace (`mirrorReplace(..., true)`, the sqlite-path heal in `reconcileRow`) applies
+    only under the queuing term (XERK-1836). The ingest re-seat (`reindexHeld`) and the boot backfill
+    send `seat` instead: it overwrites ordinals and trims nothing, so a stale copy cannot delete
+    another replica's appends (XERK-1837). Never dropped on a term change, since that left held
+    entries out of PG with nothing to re-run them.
   - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
     covered) skips unchanged files.
   - Tests: the `XERK-1450` cases in `index-store.test.js` and `archive-landed-wiring.test.js`.
