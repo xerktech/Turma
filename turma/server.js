@@ -3195,7 +3195,9 @@ function buildEpicWaves(childRows) {
 function epicChildRows(siteKey, epicKey, rows) {
   const out = [];
   for (const r of rows.values()) {
-    if (r && r.siteKey === siteKey && r.row && r.row.epicKey === epicKey) {
+    // An epic whose own epicKey names itself is not its own child: the board's
+    // preview (epicPreviewRun/epicChildrenOf) excludes it, so the run must too.
+    if (r && r.siteKey === siteKey && r.row && r.row.epicKey === epicKey && r.row.key !== epicKey) {
       out.push(r.row);
     }
   }

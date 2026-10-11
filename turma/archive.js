@@ -2914,7 +2914,9 @@ function dedupLines(buf) {
     const nl = buf.indexOf(10, start);
     const end = nl === -1 ? buf.length : nl + 1;
     const line = buf.subarray(start, nl === -1 ? buf.length : nl);
-    const key = line.toString("latin1");
+    // A CRLF line keys as its LF twin: a copy torn between a line and its \r
+    // must still de-dup to a prefix of the repaired file.
+    const key = line.toString("latin1").replace(/\r$/, "");
     if (key.trim() && seen.has(key)) dropped += 1;
     else { seen.add(key); parts.push(buf.subarray(start, end)); }
     start = end;
@@ -3737,7 +3739,7 @@ module.exports = {
   // is the sessions-only hydration applier.
   setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles, reindexHeld,
   // The one-time repair of files duplicated before XERK-1364 (XERK-1450).
-  dedupArchive, reseatIndexFromFiles,
+  dedupArchive, dedupLines, reseatIndexFromFiles,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

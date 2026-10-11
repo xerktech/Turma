@@ -19,46 +19,44 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `agent-workflows.md` | `agent/hub-agent.py` | workflow runs: run-dir layout, resolving a `workflow` row, journal/label reads |
 | `agent-archive.md` | `agent/hub-agent.py` | archive sync: manifest, rendered + raw delta pushes, payload shed, off-beat sync worker |
 | `agent-board.md` | `agent/hub-agent.py` | Jira/ADO collectors, tracker writes, repo triage, ticket sessions |
+| `ticket-model-ladder.md` | `server.js`, `hub-agent.py`, `bench/`, `board.js`, `Board.kt` | ticket model ladder (XERK-1827) |
 | `agent-usage.md` | `agent/hub-agent.py`, `hooks/statusline.py` | token aggregates, attribution ledger, subscription limits + probe |
 | `agent-prs.md` | `agent/hub-agent.py` | PR/MR status + ledgers, `_scan_pr_line`, GitLab/ADO dispatch, comment + conflict replies |
 | `agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `agent-hooks.md` | `agent/hooks/**` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
+| `agent-permissions.md` | `hub-agent.py`, `permlog.py`, `guard.py` | permission ledger (agent half), the permission judge + its one-shot grant |
+| `agent-session-cli.md` | `hooks/session_cli.py`, `hub-agent.py` | the session CLI (XERK-1564) |
 | `guard-protected.md` | `turma-agent-protect`, `hub-agent.py` | root-owned guard hooks, managed settings (XERK-1677) |
-| `guard-qa.md` | `agent/hooks/guard.py`, its tests + rig | guard QA: cases run as nobody via `guard_differential.py` (XERK-1590) |
-| `guard-substitutions.md` | `agent/hooks/guard.py`, `test_guard.py` | guard: balanced substitution scan, every parser on it, arithmetic, nesting cost (XERK-1605) |
-| `guard-heredoc-owners.md` | `guard.py`, `test_guard.py` | guard: which heredoc owners are shells; the broad closer rule (XERK-1618) |
-| `guard-prefix-assignments.md` | `guard.py`, `test_guard.py` | guard: leading `X='a b' cmd` assignments, the added unsplit reading (XERK-1620) |
-| `guard-leading-names.md` | `guard.py`, `test_guard.py` | guard: unknown names in a target read empty, protected reading only (XERK-1639/1652) |
-| `guard-home.md` | `guard.py`, `test_guard.py` | guard: `$HOME`/`~` targets read with the real home (XERK-1656) |
-| `guard-trailing-escape.md` | `guard.py`, `test_guard.py` | guard: a lone trailing `\` read dropped (XERK-1646/1691) |
-| `guard-param-ops.md` | `guard.py`, `test_guard.py` | guard: `${v#pat}` ops as globs, unreadable → refused, `eval` assignments (XERK-1651) |
-| `guard-order.md` | `guard.py`, `test_guard.py` | guard: values also read in order, loops replayed (XERK-1660) |
-| `guard-value-sources.md` | `guard.py`, `test_guard.py` | guard: redirect joins, value sources, files run as scripts (XERK-1641) |
-| `guard-positionals.md` | `guard.py`, `test_guard.py` | guard: `$1` bound by `sh -c`, a function call or `set` (XERK-1626) |
-| `guard-readers.md` | `guard.py`, `test_guard.py` | guard: what a reader binds: IFS/`-d`, heredocs, `-C` (XERK-1658) |
+| `guard-*.md` | `guard.py`, `test_guard.py` | guard parser invariants, one per topic: `-qa` (cases run as nobody), `-substitutions`, `-heredoc-owners`, `-prefix-assignments`, `-leading-names`, `-home`, `-trailing-escape`, `-param-ops`, `-order`, `-value-sources`, `-positionals`, `-readers`, `-braces`, `-cd`, `-unreadable` (refuse what it can't read) |
 | `agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
 | `agent-native-windows.md` | `agent/native/README-windows.md`, `docs/windows-agent-adr.md` | Windows agent (XERK-666) map: component→rules-file, invariants, operator guide |
 | `windows-agent.md` | `agent/hub-agent.py` | native Windows portability: paths, %APPDATA%, icacls ACL, liveness/degradation (XERK-670); ADR `docs/windows-agent-adr.md` |
-| `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher (XERK-669), service/control (XERK-671), installer (XERK-672), `irm\|iex` bootstrap (XERK-673), self-updater (XERK-674): WinSW unit, session-preserving restart, pidfile, update poller + payload swap, asset seam |
+| `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher, service, installer, `irm\|iex` bootstrap, self-updater (XERK-669..674) |
 | `windows-terminal.md` | `agent/win/**` | native Windows terminal layer (XERK-668): the ttyd drop-in pty-host; rationale in `docs/windows-agent-adr.md` |
 | `turma.md` | `turma/**` | chrome, org filter, org binding, dashboard, terminal proxy, auth |
 | `turma-archive.md` | `turma/archive.js` | durable archive: layers, size ceilings, how the total is measured |
+| `trajectory.md` | `archive.js`, `server.js`, `hub-agent.py` | trajectory contract (`docs/trajectory-contract.md`) |
+| `turma-ha-index-mirror.md` | `server.js`, `archive.js` | HA: archive index mirror to Postgres, repairs, leader tenure (XERK-1834) |
 | `turma-ha-archive.md` | `turma/blobstore.js`, `turma/archive-mirror.js`, `turma/index-store.js` | HA archive of-record (XERK-759/780/793): object-store bytes + Postgres index; under HA local sqlite is RETIRED for a PG-hydrated session map + PG-direct search |
 | `turma-ha-postgres.md` | `turma/pgclient.js` | HA Postgres of-record spine (XERK-776): stdlib v3 wire client + SCRAM-SHA-256 + extended query + pool + GREATEST upsert; consumed by the ledger (XERK-779) + archive index (XERK-780) of-records; non-HA returns null |
 | `turma-limits.md` | `turma/server.js` | connection cap, in-flight body budget, lanes, reclaim, drain |
 | `turma-ha-registry.md` | `turma/server.js` | HA: the fleet registry + per-host command queues in the shared store (per-host write-through, hydration, watch); non-HA byte-identical (XERK-756) |
 | `turma-ha-leader.md` | `turma/leader.js`, `turma/forward.js`, `turma/server.js` | HA: k8s-Lease leader election; the LEADER SERVES, followers forward (XERK-919) + the handover order; `isLeader()`-gated sweeps; shared guards; local HA-stack recipe; non-HA byte-identical |
 | `turma-ha-tunnel.md` | `turma/server.js`, `turma/relay.js` | HA: cross-replica tunnel directory + control bus (XERK-764) + the duplex byte-stream relay for /term,/live,openChannel (XERK-777/781) — now the handover/degraded path (XERK-919); non-HA byte-identical |
+| `turma-ha-store.md` | `turma/store.js`, `ha-config.js` | HA shared store + config |
 | `turma-oidc.md` | `turma/server.js` | OIDC relying-party core: code+PKCE, discovery, JWKS RS256, session cookie, RP-logout |
 | `turma-break-glass.md` | `turma/server.js`, `turma/public/login.html` | IdP-independent break-glass local login; invariants a mandatory-OIDC change must keep |
 | `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |
+| `turma-permissions.md` | `permission-ledger.js`, `usage.html`, `server.js` | permission ledger (hub half) |
+| `turma-attention.md` | `server.js`, sessions/dashboard pages + ports | session attention states |
+| `turma-brief.md` | `server.js`, `brief.html`, android Brief | the brief page |
 | `turma-notifications.md` | `turma/server.js`, `turma/push.js` | FCM alerts, one-alert-per-work rule, runaway spend (XERK-310), Claude login alerts, `notify()`/`push.js`, dismiss, `pushEnabled` |
 | `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
 | `turma-triage.md` | `turma/public/board.*`, `turma/server.js` | Triage lane, per-ticket verdicts, org triage policy, auto-start gate |
 | `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
 | `turma-epic-run.md` | `turma/server.js` | epic auto-orchestration: durable run store, dependency DAG, manual-start route, never-auto-start gate (XERK-635); auto-close chaining + epic-completion write (XERK-637); pause/resume operator hold (XERK-641) |
 | `turma-epic-builder.md` | `turma/server.js` | Epic Builder (XERK-725): idea→epic `epic-builder` route + DELETE, `epicBuilders` durable store, `epicBuilderDriveSweep` dispatch via findTicketHost (not ticketQueue), `epicBuilderStatus` heartbeat ingest |
-| `epic-builder.md` | `agent/hub-agent.py`, `turma/epic-plan.js` | Epic Builder agent+plan half (XERK-722/723/724): EpicPlan model + `waves`==`buildEpicWaves` parity (3 mirrors), verified Blocks direction (inwardIssue=blocker), isEpic/epicKey/blocks for Auto Epic, final-child-blocked-by-all, `createBlocksLink` idempotency, the builder session + no-silent-half-epic materializer + on-beat reap |
+| `epic-builder.md` | `agent/hub-agent.py`, `turma/epic-plan.js` | Epic Builder agent + plan half (XERK-722/723/724): EpicPlan, `waves` parity (3 mirrors), Blocks direction, materializer |
 | `board-ticket-view.md` | `server.js`, `hub-agent.py`, `board.js` + vendored copies, `Board.kt` | routing a ticket to a capable host; hub resolving a ticket as the board does |
 | `turma-sessions.md` | `turma/public/sessions.html`, `chat.js` | Sessions page, chat engine, live tail, composer, terminal |
 | `chat-prose.md` | `turma/public/chat.js`, `glasses/…/chat.cjs`, android `Prose.kt` | `renderProse` markdown engine: block/inline rules, linearity invariants, JS↔Kotlin port parity |

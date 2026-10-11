@@ -2397,6 +2397,21 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         self.assertEqual(rep["question"], long_q[:300])
         self.assertEqual(len(rep["question"]), 300)
 
+    def test_a_malformed_ask_input_is_no_question(self):
+        # A non-dict `input` (or `questions`) raised AttributeError on every beat
+        # for that session (XERK-1701 rollup); it is now just no question.
+        path = os.path.join(self.proj, "s.jsonl")
+        for bad in ("a string", ["q"], None, {"questions": "q"}):
+            write_jsonl(path, [{
+                "type": "assistant",
+                "message": {"content": [
+                    {"type": "tool_use", "name": "AskUserQuestion", "input": bad},
+                ]},
+            }])
+            rep = ha.session_report(self.WORKDIR, {})
+            self.assertTrue(rep["lastHasToolUse"], bad)
+            self.assertIsNone(rep.get("question"), bad)
+
     def test_plain_tool_use_is_not_a_question(self):
         path = os.path.join(self.proj, "s.jsonl")
         write_jsonl(path, [{

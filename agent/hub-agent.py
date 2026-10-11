@@ -16683,8 +16683,9 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
                     continue
                 report["lastHasToolUse"] = True
                 if block.get("name") == "AskUserQuestion" and report["lastRole"] == "assistant":
-                    qs = (block.get("input") or {}).get("questions") or []
-                    if qs and isinstance(qs[0], dict):
+                    inp = block.get("input")
+                    qs = (inp.get("questions") if isinstance(inp, dict) else None) or []
+                    if isinstance(qs, list) and qs and isinstance(qs[0], dict):
                         q0 = qs[0]
                         report["question"] = str(q0.get("question") or "")[:300] or None
                         opts = q0.get("options") or []

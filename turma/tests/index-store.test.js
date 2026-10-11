@@ -1266,6 +1266,15 @@ test("XERK-1450: a local-only pass rewrites the copy but mirrors nothing", async
   } finally { archive.setBlobSink(null); pgTeardown(); }
 });
 
+test("a CRLF copy torn before a \\r still de-dups to a prefix of the repaired file", () => {
+  const file = Buffer.from('{"a":1}\r\n{"a":1}\r\n');
+  const torn = file.subarray(0, file.length - 2); // cut before the second \r
+  const repaired = archive.dedupLines(file).out.toString("latin1");
+  const copy = archive.dedupLines(torn).out.toString("latin1");
+  assert.equal(repaired, '{"a":1}\r\n');
+  assert.ok(repaired.startsWith(copy), JSON.stringify(copy));
+});
+
 test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
   const mem = pgSetup();
   try {
