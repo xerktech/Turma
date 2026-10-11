@@ -115,7 +115,8 @@ enum class LiveState { WORKING, IDLE, WAITING, HOLDING, STOPPED }
 
 fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState = when {
     session.status != "running" -> LiveState.STOPPED
-    (session.session?.question ?: "").isNotBlank() -> LiveState.WAITING
+    // Truthy, as the hub and web read it: a whitespace-only question still blocks.
+    (session.session?.question ?: "").isNotEmpty() -> LiveState.WAITING
     sessionWorking(session, agentLastSeen, now) -> LiveState.WORKING
     // Asleep until a session-CLI wake (XERK-1571): holding, never Ready for review.
     sessionSleeping(session, now) -> LiveState.HOLDING

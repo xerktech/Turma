@@ -299,10 +299,10 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         val eta = waits.mapNotNull { it.eta }.maxOrNull()
         // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
         val what = if (waits.size == 1 && waits[0].label.isNotBlank()) " · ${waits[0].label}" else ""
-        if (eta != null && eta > now) return "⏳ waiting$what · ${waitLeftText(eta - now)} left"
+        if (eta != null && eta > now) return "⏳ waiting$what\u00A0·\u00A0${waitLeftText(eta - now)} left"
         // No ETA: how long it has waited, off the oldest row's startedAt (XERK-1571).
         val started = waits.mapNotNull { it.startedAt }.filter { it <= now }.minOrNull()
-        val since = if (started == null) "" else " · ${waitLeftText(now - started)}"
+        val since = if (started == null) "" else "\u00A0·\u00A0${waitLeftText(now - started)}"
         if (what.isNotEmpty()) return "⏳ waiting$what$since"
         return "⏳ waiting on ${waits.size} background shell" + (if (waits.size == 1) "" else "s") + since
     }
@@ -331,8 +331,8 @@ data class CardState(val label: String, val tone: CardTone)
  * "stalled · Watch CI", "PR awaiting review", "finished · awaiting review", …
  *
  * The web reads a permission dialog off `panePrompt`, which this client does not
- * type; the hub's `needs-you:permission` attention is the same edge. Its ask (the
- * pending command) is a line of its own on the card, as on the web.
+ * type; the hub's `needs-you:permission` attention is the same edge. Unlike the
+ * web card, the phone card shows no ask/why line beside it (operator call).
  */
 fun sessionCardState(session: SessionInfo, agentLastSeen: Long, now: Long, review: Boolean): CardState {
     val live = sessionLiveState(session, agentLastSeen, now)
@@ -341,7 +341,7 @@ fun sessionCardState(session: SessionInfo, agentLastSeen: Long, now: Long, revie
 
 private fun sessionLiveState(session: SessionInfo, agentLastSeen: Long, now: Long): CardState {
     val s = session.session
-    if (!s?.question.isNullOrBlank()) return CardState("waiting for your answer", CardTone.WAITING)
+    if (!s?.question.isNullOrEmpty()) return CardState("waiting for your answer", CardTone.WAITING)
     if (session.attention?.state == "needs-you:permission")
         return CardState("waiting for your permission", CardTone.WAITING)
     if (s?.transcriptAgeSec == null) return CardState("no transcript yet", CardTone.IDLE)

@@ -153,7 +153,7 @@ class SessionsTest {
 
     @Test fun `liveStateLabel says what a holding session waits on`() {
         val timed = LiveSignals(agents = listOf(shell("wait-timed", "Sleep", eta = now + 12 * 60_000L)))
-        assertEquals("⏳ waiting · Sleep · 12m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
+        assertEquals("⏳ waiting · Sleep\u00A0·\u00A012m left", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, timed, now))
         val ci = LiveSignals(agents = listOf(shell("wait-external", "Watch CI")))
         assertEquals("⏳ waiting · Watch CI", com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, ci, now))
         val two = LiveSignals(agents = listOf(shell("wait-external"), shell("wait-timed")))
@@ -161,12 +161,12 @@ class SessionsTest {
         // XERK-1571: no ETA, but a startedAt — how long it has been waiting, off the oldest row.
         val started = LiveSignals(agents = listOf(
             shell("wait-external", "Watch CI on PR #412").copy(startedAt = now - 12 * 60_000L)))
-        assertEquals("⏳ waiting · Watch CI on PR #412 · 12m",
+        assertEquals("⏳ waiting · Watch CI on PR #412\u00A0·\u00A012m",
             com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, started, now))
         val twoStarted = LiveSignals(agents = listOf(
             shell("wait-external").copy(startedAt = now - 5 * 60_000L),
             shell("wait-timed").copy(startedAt = now - 20 * 60_000L)))
-        assertEquals("⏳ waiting on 2 background shells · 20m",
+        assertEquals("⏳ waiting on 2 background shells\u00A0·\u00A020m",
             com.xerktech.turma.ui.liveStateLabel(LiveState.HOLDING, twoStarted, now))
         // A working card names only its WORK rows.
         val mixed = LiveSignals(agents = listOf(shell("work"), shell("wait-external")))
@@ -590,6 +590,20 @@ class SessionsTest {
         // A stalled wait names what it stalled on, in the danger tone, with no age.
         assertEquals(st("stalled · Watch CI", com.xerktech.turma.ui.CardTone.STALLED),
             card(waitingOn(shell("wait-external", "Watch CI"), ageSec = 46 * 60.0)))
+        assertEquals(st("stalled on 2 background shells", com.xerktech.turma.ui.CardTone.STALLED),
+            card(waitingOn(shell("wait-external"), shell("wait-timed"), ageSec = 46 * 60.0)))
+        assertEquals(st("stalled on 1 background shell", com.xerktech.turma.ui.CardTone.STALLED),
+            card(waitingOn(shell("wait-external"), ageSec = 46 * 60.0)))
+        assertEquals(st("stopped", com.xerktech.turma.ui.CardTone.IDLE), card(SessionInfo(status = "stopped",
+            session = LiveSignals(transcriptAgeSec = 1.0))))
+        assertEquals(st("💤 sleeping until ${clockTime(now + 3_600_000L, now)}", com.xerktech.turma.ui.CardTone.HOLDING),
+            card(SessionInfo(status = "running", session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0,
+                wakeAt = now + 3_600_000L))))
+        // A whitespace-only question still blocks, as the hub and web read it (truthy).
+        assertEquals(st("waiting for your answer", com.xerktech.turma.ui.CardTone.WAITING), card(SessionInfo(
+            status = "running", session = LiveSignals(question = " ", transcriptAgeSec = 1.0))))
+        assertEquals(LiveState.WAITING, liveState(SessionInfo(status = "running",
+            session = LiveSignals(question = " ", transcriptAgeSec = 1.0)), now, now))
     }
 
     @Test fun `sessionCardState under Ready for review says why it qualified`() {
@@ -604,6 +618,9 @@ class SessionsTest {
         assertEquals(com.xerktech.turma.ui.CardState("stalled · repeating Bash ×4", com.xerktech.turma.ui.CardTone.STALLED),
             card(done.copy(attention = att("needs-you:stalled", now, "repeating Bash ×4"),
                 session = LiveSignals(paneBusy = true, transcriptAgeSec = 1.0)), review = true))
+        // The hub says stalled where this screen reads plain idle (a host gone quiet).
+        assertEquals(com.xerktech.turma.ui.CardState("stalled · Watch CI", com.xerktech.turma.ui.CardTone.STALLED),
+            card(done.copy(attention = att("needs-you:stalled", now, "Watch CI")), review = true))
         // A waiting card keeps its own stronger line.
         assertEquals("waiting for your answer",
             card(done.copy(session = LiveSignals(question = "Q?", transcriptAgeSec = 1.0)), review = true).label)

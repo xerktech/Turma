@@ -1102,13 +1102,12 @@ private fun SessionListCard(
                 ((dotState == com.xerktech.turma.core.LiveState.IDLE ||
                     dotState == com.xerktech.turma.core.LiveState.WORKING) &&
                     com.xerktech.turma.core.attentionStalled(r.session.attention))
-            if (stalled) {
-                StatusLight(com.xerktech.turma.ui.theme.TurmaColors.critical)
-            } else if (dotState == com.xerktech.turma.core.LiveState.IDLE &&
-                r.session.attention?.state == "needs-you:permission") {
-                // Blocked on a permission dialog: the waiting amber its state line has
-                // (web liveState reads it `waiting`), never the review accent.
+            if (r.session.status == "running" && r.session.attention?.state == "needs-you:permission") {
+                // Blocked on a permission dialog: the waiting amber its state line has,
+                // whatever else is running (web liveState reads it `waiting` first).
                 StateDot(com.xerktech.turma.core.LiveState.WAITING)
+            } else if (stalled) {
+                StatusLight(com.xerktech.turma.ui.theme.TurmaColors.critical)
             } else if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
                 StatusLight(com.xerktech.turma.ui.theme.TurmaColors.review)
             } else {
