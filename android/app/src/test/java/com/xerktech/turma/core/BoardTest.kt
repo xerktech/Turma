@@ -569,6 +569,27 @@ class BoardTest {
         assertEquals(LadderPick("haiku"), ladderPickOf(agents, ladder, "acme", "ENG-5"))
     }
 
+    @Test fun `ladderPickOf names online non-claude-default hosts an unpinned Start may land on`() {
+        val agents = listOf(
+            AgentInfo(key = "h1", org = "acme", online = true),
+            AgentInfo(key = "q1", org = "acme", online = true, defaultRuntime = "qwen"),
+            AgentInfo(key = "d1", org = "acme", online = true, defaultRuntime = "dsh"),
+            AgentInfo(key = "q2", org = "acme", defaultRuntime = "qwen"),
+            AgentInfo(key = "x1", org = "rival", online = true, defaultRuntime = "dsh"))
+        val pick = ladderPickOf(agents, ladder, "acme", "ENG-5")
+        assertEquals(LadderPick("haiku", elsewhere = listOf("dsh", "qwen")), pick)
+        assertEquals(LadderPick("haiku"), ladderPickOf(listOf(agents[0], agents[3], agents[4]), ladder, "acme", "ENG-5"))
+        assertEquals(LadderPick("haiku"), ladderPickOf(agents, ladder, "acme", "ENG-5",
+            agentPin = com.xerktech.turma.model.TicketAgentPin(host = "h1")))
+        assertEquals(LadderPick("haiku"), ladderPickOf(agents, ladder, "acme", "ENG-5",
+            runtimePin = com.xerktech.turma.model.TicketRuntimePin(runtime = "claude")))
+        assertEquals("Auto (Haiku on Claude hosts)", modelAutoLabel(BoardModels(), pick!!))
+        assertEquals("the model ladder's first tier; a dsh (DeepSeek Harness) or Qwen Code host runs its own default",
+            ladderPickReason(pick))
+        assertEquals("Auto (Sonnet on Claude hosts, retry)",
+            modelAutoLabel(BoardModels(), LadderPick("sonnet", "haiku", listOf("qwen"))))
+    }
+
     @Test fun `ladderPickOf is null under a non-claude runtime pin or pinned host default`() {
         val agents = listOf(AgentInfo(key = "h1", org = "acme"), AgentInfo(key = "q1", org = "acme", defaultRuntime = "qwen"))
         assertNull(ladderPickOf(agents, ladder, "acme", "ENG-5",

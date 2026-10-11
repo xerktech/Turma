@@ -2012,7 +2012,12 @@
   // (the served `org`, as ticketSessionIndex reads it). A dsh/qwen runtime pin,
   // or an agent pin to a host whose default runtime isn't claude, gets no
   // ladder (null) — the hub sends no model there either. Returns
-  // {model, escalatedFrom?} or null.
+  // {model, escalatedFrom?, elsewhere?} or null.
+  // `elsewhere` (XERK-1840): with no agent or runtime pin, Start may route to ANY
+  // online host in the org, and one whose default runtime isn't claude gets no
+  // ladder model. The client can't know which host Start picks, so the pick
+  // names those runtimes and the row hedges ("on Claude hosts") rather than
+  // claiming a tier that host won't run.
   function ladderPickOf(agents, ladder, siteKey, issueKey, opts) {
     if (!Array.isArray(ladder) || !ladder.length) return null;
     const o = opts || {};
@@ -2042,15 +2047,28 @@
       for (const c of a.closedSessions || []) consider(c, false);
     }
     const next = Math.min(failed + 1, ladder.length - 1);
-    return failed >= 0 ? { model: ladder[next], escalatedFrom: ladder[failed] } : { model: ladder[next] };
+    const pick = failed >= 0 ? { model: ladder[next], escalatedFrom: ladder[failed] } : { model: ladder[next] };
+    if (!o.runtimePin && !(o.agentPin && o.agentPin.host)) {
+      const other = [];
+      for (const a of list) {
+        if (!a || !a.online || orgOf(a) !== siteKey) continue;
+        const rt = a.defaultRuntime || "claude";
+        if (rt !== "claude" && !other.includes(rt)) other.push(rt);
+      }
+      if (other.length) pick.elsewhere = other.sort();
+    }
+    return pick;
   }
 
   // What an unpinned ticket's Model row / picker release option is called:
   // "Auto (Haiku)", "Auto (Sonnet, retry)" under the ladder, else the old
-  // "Default (<probed default>)".
+  // "Default (<probed default>)". A pick that may land on a non-claude-default
+  // host (XERK-1840) says the tier holds only "on Claude hosts".
   function modelAutoLabel(models, ladderPick) {
     if (ladderPick && ladderPick.model) {
-      return `Auto (${esc(prettyModel(ladderPick.model))}${ladderPick.escalatedFrom ? ", retry" : ""})`;
+      return `Auto (${esc(prettyModel(ladderPick.model))}`
+        + `${ladderPick.elsewhere && ladderPick.elsewhere.length ? " on Claude hosts" : ""}`
+        + `${ladderPick.escalatedFrom ? ", retry" : ""})`;
     }
     return "Default" + (models && models.defaultLabel
       ? ` (${esc(prettyModel(models.defaultLabel))})` : "");
@@ -2068,7 +2086,10 @@
       const why = o.ladderPick.escalatedFrom
         ? `a ${esc(prettyModel(o.ladderPick.escalatedFrom))} session ended without a PR`
         : "the model ladder's first tier";
-      bits.push(`<span class="td-dim">${modelAutoLabel(models, o.ladderPick)} — ${why}</span>`);
+      const other = o.ladderPick.elsewhere && o.ladderPick.elsewhere.length
+        ? `; a ${o.ladderPick.elsewhere.map((r) => esc(prettyRuntime(r))).join(" or ")} host runs its own default`
+        : "";
+      bits.push(`<span class="td-dim">${modelAutoLabel(models, o.ladderPick)} — ${why}${other}</span>`);
     } else if (!pin) {
       const def = models && models.defaultLabel
         ? ` (${esc(prettyModel(models.defaultLabel))})` : "";
