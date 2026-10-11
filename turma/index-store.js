@@ -373,12 +373,19 @@ class PgIndexStore {
   // and its INSERTs left the transcript with no entries, and a concurrent replace's
   // ack could already have cleared the flag that would redo it. Failing part-way
   // now leaves a mix of new and old rows, never fewer than before.
-  async replaceEntries(transcriptId, entries) {
+  //
+  // `proceed` (optional) is re-checked before every batch and before the trim; once
+  // it answers false the replace stops and returns false, having written only rows
+  // that overwrite in place (the duplicate repair's leadership check, XERK-1450).
+  async replaceEntries(transcriptId, entries, proceed) {
     await this.ensureSchema();
+    const ok = typeof proceed === "function" ? proceed : () => true;
     const n = entries ? entries.length : 0;
-    if (n) await this._insertEntriesBatched(transcriptId, entries, 0, true);
+    if (n && !(await this._insertEntriesBatched(transcriptId, entries, 0, true, ok))) return false;
+    if (!ok()) return false;
     await this.pool.execute(
       `DELETE FROM ${this.prefix}_entries WHERE transcript_id = $1 AND seq >= $2`, [transcriptId, n]);
+    return true;
   }
 
   // Insert entries in SUB-BATCHES so one INSERT never exceeds the Postgres v3 bound
@@ -390,12 +397,14 @@ class PgIndexStore {
   // caught + dropped it, and a promoted replica's full-text search silently missed
   // that transcript. ENTRY_INSERT_MAX rows keep the count far under both limits. Seq
   // continuity is preserved across sub-batches (each starts at startSeq+offset).
-  async _insertEntriesBatched(transcriptId, entries, startSeq, overwrite) {
+  async _insertEntriesBatched(transcriptId, entries, startSeq, overwrite, proceed) {
     for (let i = 0; i < entries.length; i += ENTRY_INSERT_MAX) {
+      if (proceed && !proceed()) return false;
       const slice = entries.slice(i, i + ENTRY_INSERT_MAX);
       const { text, params } = buildEntryInsert(this.prefix, transcriptId, slice, startSeq + i, overwrite);
       await this.pool.execute(text, params);
     }
+    return true;
   }
 
   // Drop a transcript entirely (the reclaim case — rows for a deleted `.jsonl`,

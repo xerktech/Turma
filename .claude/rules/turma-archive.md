@@ -214,8 +214,11 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     The pool has no transactions; a delete-first replace failing mid-way, after another repair's
     ack (same pod, or the old leader across a handover) cleared pending, left PG entries empty
     for good (QA).
-  - `IndexMirror` applies a `repair` only while this replica leads: a deposed leader's late repair
-    trimmed the new leader's newer append and lowered its counts (QA). Its sidecar stays pending.
+  - `IndexMirror` applies a `repair` only while this replica leads UNDER THE TERM THAT QUEUED IT
+    (`leaderTerm`, bumped by `onLeaderPromoted`), re-checked before every batch, the trim, the
+    counts and the ack. "Am I leader now" is not enough: a lease lost and won back passed it, and
+    the stale repair trimmed the other leader's append (QA). A stopped repair stays pending.
+    Residual: a process pause between a check and its write (no Postgres-side fence).
   - `dedupPendingIds` is keyed by id, so never clear it for a file whose row is another file's.
   - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
     covered) skips unchanged files.

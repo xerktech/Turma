@@ -264,4 +264,44 @@ test("XERK-1450: IndexMirror applies a repair as replace + exact counts, acks it
   assert.equal(acked, 1);
 });
 
+test("XERK-1450: the wired IndexMirror drops a repair queued under an earlier leader term", async () => {
+  const calls = [];
+  const store = {
+    async replaceEntries(t, e) { calls.push("replace"); return true; },
+    async setCounts() { calls.push("counts"); },
+  };
+  hub.setIndexMirror(store, true);
+  try {
+    const m = hub.getIndexMirror();
+    let acked = 0;
+    m._running = true;                         // hold the queue: the repair is queued, not applied
+    m.sink().repair("t1", [{ text: "a" }], 1, 9, () => { acked += 1; });
+    hub.onLeaderPromoted();                    // lease lost and won back: a new term
+    m._running = false;
+    await m._drain();
+    assert.deepEqual(calls, [], "the stale-term repair wrote nothing");
+    assert.equal(acked, 0, "and left its sidecar pending");
+    m.sink().repair("t2", [{ text: "a" }], 1, 9, () => { acked += 1; });
+    await new Promise((r) => setImmediate(r));
+    await m._drain();
+    assert.deepEqual(calls, ["replace", "counts"], "a current-term repair applies");
+    assert.equal(acked, 1);
+  } finally {
+    hub.setIndexMirror(null, false);
+  }
+});
+
+test("XERK-1450: a repair stops between batches once its term is gone", async () => {
+  const { PgIndexStore, ENTRY_INSERT_MAX } = require("../index-store.js");
+  const calls = [];
+  let live = true;
+  const pool = { async query() { return { rows: [] }; },
+    async execute(text) { calls.push(text.slice(0, 6)); if (calls.length === 1) live = false; return {}; } };
+  const store = new PgIndexStore(pool, {});
+  store._schemaReady = Promise.resolve();
+  const entries = Array.from({ length: ENTRY_INSERT_MAX + 1 }, (_, i) => ({ text: "e" + i }));
+  assert.equal(await store.replaceEntries("t1", entries, () => live), false);
+  assert.deepEqual(calls, ["INSERT"], "no second batch, and never the trim");
+});
+
 test.after(() => { if (hub.server && hub.server.close) hub.server.close(); });

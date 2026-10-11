@@ -324,7 +324,11 @@ async function hydrateGuards() {
 // Fired when THIS replica acquires leadership (and once at boot when it is the
 // leader). Re-hydrates the singleton state the old leader owned so the handover
 // re-fires nothing: the migration record Map (its own hydrate) and the guards.
+// Bumped on every promotion: a repair queued under an earlier term must not apply,
+// even on a replica that has since won the lease back (XERK-1450).
+let leaderTerm = 0;
 function onLeaderPromoted() {
+  leaderTerm += 1;
   if (!HA_ON) return;
   // XERK-919: become the single writer only after re-reading the registry the old
   // leader flushed before it released the lease (a watch event can be missed or
@@ -4733,11 +4737,14 @@ let indexMirror = null;
 // operator-triggered re-sync — never local data loss).
 const INDEX_MIRROR_QUEUE_MAX = positiveEnv("INDEX_MIRROR_QUEUE_MAX", 100000);
 class IndexMirror {
-  // `isLeader` gates the duplicate repair (XERK-1450): a deposed leader's queued
-  // repair would trim the new leader's newer appends and lower its counts.
-  constructor(store, isLeader) {
+  // `isLeader` + `term` gate the duplicate repair (XERK-1450): a repair applies only
+  // while this replica still leads under the term that queued it. A deposed leader's
+  // repair — or one surviving a lease lost and won back — would trim the newer
+  // leader's appends and lower its counts.
+  constructor(store, isLeader, term) {
     this.store = store;
     this.isLeader = typeof isLeader === "function" ? isLeader : () => true;
+    this.term = typeof term === "function" ? term : () => 0;
     this._q = [];
     this._running = false;
     this._dropped = 0;
@@ -4790,10 +4797,15 @@ class IndexMirror {
     if (op.t === "replace") return this.store.replaceEntries(op.transcriptId, op.entries);
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
     if (op.t === "repair") {
-      // Its sidecar stays pending; the leader that deposed us owns the repair now.
-      if (!this.isLeader()) return;
-      await this.store.replaceEntries(op.transcriptId, op.entries);
+      // Re-checked between every write. Stopping leaves the sidecar pending; the
+      // current leader owns the repair. A pause between a check and its write is
+      // the residual (no Postgres-side fence).
+      const current = () => this.isLeader() && this.term() === op.term;
+      if (!current()) return;
+      if ((await this.store.replaceEntries(op.transcriptId, op.entries, current)) === false) return;
+      if (!current()) return;
       await this.store.setCounts(op.transcriptId, op.msgCount, op.archiveBytes);
+      if (!current()) return;
       if (op.done) { try { op.done(); } catch (e) { console.error(`archive index mirror: repair ack failed (${e && e.message})`); } }
     }
   }
@@ -4807,7 +4819,7 @@ class IndexMirror {
       replace: (transcriptId, entries) => this._push({ t: "replace", transcriptId, entries }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
       repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
-        this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done }),
+        this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done, term: this.term() }),
     };
   }
 }
@@ -4816,7 +4828,7 @@ function setIndexMirror(store, ha) {
     indexMirror = null; archive.setIndexSink(null); archive.setIndexMode(null);
     return;
   }
-  indexMirror = new IndexMirror(store, () => isLeader());
+  indexMirror = new IndexMirror(store, () => isLeader(), () => leaderTerm);
   archive.setIndexSink(indexMirror.sink());
   // XERK-793: retire the per-replica local node:sqlite index. The index becomes the
   // in-memory session-row map (beat-safe, hydrated from Postgres) + Postgres-direct
@@ -22044,6 +22056,8 @@ if (process.env.TURMA_TEST) {
     // The duplicate repair's hydrate ordering (XERK-1450) and its mirror op.
     hydrateArchive,
     IndexMirror,
+    setIndexMirror,
+    getIndexMirror: () => indexMirror,
     // The index hydrate's deadline (XERK-1282): a hung load must reject AND cut its
     // loader, or a late page lands in an index ingest has since reopened.
     withLoaderDeadline,
