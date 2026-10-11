@@ -4775,7 +4775,8 @@ class IndexMirror {
     const id = op.t === "session" ? op.row && op.row.transcriptId : op.transcriptId;
     if (!id) return;
     if (op.t === "refill") {
-      this._refill.set(id, op.term);
+      // Never over a newer entry: a drop owed since, under a later term, wins.
+      if (!this._refill.has(id)) this._refill.set(id, op.term);
       this._refillAfter = Date.now() + INDEX_MIRROR_REFILL_RETRY_MS;
     } else if (this._refill.has(id) || this._refill.size < INDEX_MIRROR_QUEUE_MAX) {
       // Always under the CURRENT term: an entry owed under an earlier one would be

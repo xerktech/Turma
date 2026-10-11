@@ -332,6 +332,38 @@ test("a dropped duplicate repair or remove is not owed a refill", () => {
   } finally { teardown(); }
 });
 
+test("an exhausted refill never overwrites a refill owed since under a newer term", () => {
+  const { mirror } = setup();
+  try {
+    mirror._refill.set("t", 2);
+    mirror._lost({ t: "refill", transcriptId: "t", term: 1 });
+    assert.equal(mirror._refill.get("t"), 2);
+  } finally { teardown(); }
+});
+
+test("the owed set is capped at the queue size", () => {
+  const { mirror } = setup();
+  try {
+    for (const id of ["a", "b", "c", "d"]) mirror._lost({ t: "entries", transcriptId: id });
+    assert.equal(mirror._refill.size, 3);
+  } finally { teardown(); }
+});
+
+test("a refill stops before replacing when the term moves after its row upsert", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0")]);
+    await settle(mirror);
+    store.entries.set("t", new Map([[0, "n0"], [1, "theirs"]]));
+    const upsert = store.upsertSession;
+    store.upsertSession = async (row) => { await upsert(row); term++; };
+    mirror._refill.set("t", term);
+    mirror._drain();
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:theirs"]);
+  } finally { teardown(); }
+});
+
 test("a refill Postgres refuses outright is given up, not retried forever", async () => {
   const { store, mirror } = setup();
   try {

@@ -22,6 +22,7 @@ paths:
   leader appended (QA reproduced the clobber on real Postgres).
   - A new drop always re-stamps the owed entry with the CURRENT term — an entry left from an
     earlier term would otherwise be skipped as stale, taking this leader's own drop with it (QA).
+    An exhausted refill re-owes itself only if nothing newer is owed, for the same reason.
 - **Plain `replace` ops are NOT leader-gated**: the boot backfill (XERK-797) queues them before the
   elector runs, and skipping one left a row with no entries (QA). A replace from a deposed replica
   can still wipe a newer leader's appends: XERK-1836.
