@@ -248,3 +248,68 @@ test("XERK-1839: /metrics label sets stay bounded whatever models the agents rep
   assert.ok(lines.length <= 21 * 5, `${lines.length} series`);
   assert.match(L.metricsText(T0), /model="other"/);
 });
+
+test("XERK-1839: past MAX_ROWS the org holding the most rows loses first, not the oldest rows", () => {
+  L._internals.reset();
+  // A small org's rows are the OLDEST; a big org's are newer. Eviction must still
+  // take from the big org.
+  const small = Array.from({ length: 10 }, (_, i) => obs({ site: "small.atlassian.net",
+    issue: `S-${i}`, host: `sh${i}`, sid: `s${i}` }));
+  L.observe(small, T0);
+  const per = Math.floor(L.MAX_ROWS / 4);
+  for (let h = 0; h < 5; h++) {
+    L.observe(Array.from({ length: per }, (_, i) => obs({ site: "big.atlassian.net",
+      issue: "B-1", host: `bh${h}`, sid: `b${h}-${i}` })), T0 + 1 + h);
+  }
+  const all = [...L._internals.rows().values()];
+  assert.equal(all.length, L.MAX_ROWS);
+  assert.equal(all.filter((r) => r.site === "small.atlassian.net").length, 10);
+});
+
+test("XERK-1839: a rescan resets the load gate, deletes what it evicts, and a failed one is retried", async () => {
+  const table = new Map();
+  let fail = false;
+  let selects = 0;
+  const pool = {
+    health: "ready",
+    async query(sql, params = []) {
+      if (/^CREATE TABLE/.test(sql)) return [];
+      if (/^SELECT doc/.test(sql)) {
+        selects += 1;
+        if (fail) throw new Error("postgres query timeout");
+        return [...table.values()];
+      }
+      if (/^INSERT/.test(sql)) {
+        for (let i = 0; i < params.length; i += 3) table.set(params[i], { updated_at: params[i + 1], doc: params[i + 2] });
+        return [];
+      }
+      if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
+      throw new Error(sql);
+    },
+  };
+  L._internals.reset();
+  const store = new L.OutcomeLedgerPgStore(pool);
+  L._internals.setBackend(store);
+  // An expired row in the table is evicted by the rescan AND deleted from it.
+  const oldRow = L.sanitizeRow({ site: "a.atlassian.net", issue: "A-1", host: "h", sid: "x",
+    cls: "bug", model: "opus", firstSeen: T0 - 500 * DAY, updatedAt: T0 - 500 * DAY });
+  table.set(oldRow.key, { updated_at: String(oldRow.updatedAt), doc: JSON.stringify(oldRow) });
+  await store.rescan(T0);
+  await store._drain();
+  assert.equal(table.has(oldRow.key), false);
+  assert.equal(store.loaded, true);
+  // A failing rescan leaves the gate shut (it reset it first) ...
+  fail = true;
+  await store._onReady();
+  assert.equal(store.loaded, false);
+  assert.equal(L.observe([obs()], T0).length, 0);
+  // ... and a later sweep retries it once the database answers again.
+  fail = false;
+  const before = selects;
+  L.observe([obs()], T0 + 120000);
+  await store._readyWork;
+  assert.ok(selects > before);
+  assert.equal(store.loaded, true);
+  await store.close();
+  L._internals.reset();
+});

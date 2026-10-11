@@ -171,7 +171,12 @@ function observe(observations, now = Date.now()) {
   // Under HA, never fold into a model the of-record has not been read into yet: a
   // promoted leader's stale snapshot would win the newer-wins upsert over rows
   // another replica wrote.
-  if (backend.loaded === false) return [];
+  if (backend.loaded === false) {
+    // A failed rescan (a timeout with no later pool health edge) must not leave the
+    // ledger recording nothing: retry it, throttled, off this sweep.
+    if (backend.retryLoad) backend.retryLoad(now);
+    return [];
+  }
   const changed = new Map();
   const ticketDone = new Map();     // [site, issue] -> {cat, resolvedAt} seen this sweep
   for (const o of observations) {
@@ -464,6 +469,7 @@ backend = fileBackend;
 const T_ROW = "outcome_session";
 const PG_QUEUE_MAX = 5000;
 const PG_ROWS_PER_INSERT = 500;           // 3 params a row
+const RESCAN_RETRY_MS = 60000;
 
 class OutcomeLedgerPgStore {
   constructor(pool, cfg = {}) {
@@ -493,6 +499,12 @@ class OutcomeLedgerPgStore {
     } else if (this.pool.health === "ready") {
       await this._onReady();
     }
+  }
+
+  retryLoad(now = Date.now()) {
+    if (this._closed || this._readyWork || now - (this._lastRetry || 0) < RESCAN_RETRY_MS) return;
+    this._lastRetry = now;
+    this._onReady();
   }
 
   _onReady() {

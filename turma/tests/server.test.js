@@ -24390,6 +24390,20 @@ test("XERK-1563: /metrics carries the ledger's per-kind aggregates and nothing e
 
 // ---- the outcome ledger (XERK-1839) ---------------------------------------------
 
+// The sweep folds the WHOLE fleet, and earlier tests leave hosts behind: run each
+// sweep test against only its own hosts.
+function outcomeIsolated(fn) {
+  return async () => {
+    const saved = { ...agents };
+    for (const k of Object.keys(agents)) delete agents[k];
+    try { await fn(); } finally {
+      for (const k of Object.keys(agents)) delete agents[k];
+      Object.assign(agents, saved);
+      hub.outcomeLedger._internals.reset();
+    }
+  };
+}
+
 function outcomeHost(key, site, extra = {}) {
   agents[key] = {
     lastSeen: Date.now(), orgBound: site,
@@ -24406,7 +24420,7 @@ function outcomeHost(key, site, extra = {}) {
   };
 }
 
-test("XERK-1839: the sweep folds ticket sessions into fleet-wide model outcomes", async () => {
+test("XERK-1839: the sweep folds ticket sessions into fleet-wide model outcomes", outcomeIsolated(async () => {
   hub.outcomeLedger._internals.reset();
   outcomeHost("ol-acme", "ol-acme.atlassian.net");
   outcomeHost("ol-rival", "ol-rival.atlassian.net");
@@ -24430,9 +24444,21 @@ test("XERK-1839: the sweep folds ticket sessions into fleet-wide model outcomes"
   assert.equal(rows.body.rows.length, 2);
   assert.ok(rows.body.rows.every((r) => r.site === "ol-acme.atlassian.net" && r.host === "ol-acme"));
   for (const k of ["ol-acme", "ol-rival", "ol-drift"]) delete agents[k];
-});
+}));
 
-test("XERK-1839: /api/model-quality is user-authed and /metrics leaks no ticket", async () => {
+test("XERK-1839: the sweep dates Done by the board row's resolution time", outcomeIsolated(async () => {
+  hub.outcomeLedger._internals.reset();
+  outcomeHost("ol-done", "ol-done.atlassian.net");
+  agents["ol-done"].jira.tickets[0].statusCategory = "done";
+  agents["ol-done"].jira.tickets[0].resolved = "2026-09-01T12:00:00.000+0000";
+  hub.outcomeLedgerSweep();
+  const rows = [...hub.outcomeLedger._internals.rows().values()];
+  assert.ok(rows.length && rows.every((r) => r.doneAt === Date.parse("2026-09-01T12:00:00.000Z")));
+  delete agents["ol-done"];
+  hub.outcomeLedger._internals.reset();
+}));
+
+test("XERK-1839: /api/model-quality is user-authed and /metrics leaks no ticket", outcomeIsolated(async () => {
   assert.equal((await request("GET", "/api/model-quality")).status, 401);
   assert.equal((await request("GET", "/api/model-quality", { headers: agentHeaders })).status, 401);
   hub.outcomeLedger._internals.reset();
@@ -24443,7 +24469,7 @@ test("XERK-1839: /api/model-quality is user-authed and /metrics leaks no ticket"
   assert.doesNotMatch(m.raw, /OL-1|ol-metrics/);
   delete agents["ol-metrics"];
   hub.outcomeLedger._internals.reset();
-});
+}));
 
 test("XERK-1839: a malformed record never throws out of the sweep", () => {
   agents["ol-bad"] = { orgBound: "x.atlassian.net", jira: { siteKey: "x.atlassian.net", tickets: "nope" },
