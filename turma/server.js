@@ -49,6 +49,10 @@ const usageLedger = require("./usage-ledger.js");
 // the allow rule that would retire it — the agent's `permissionEvents`, kept on
 // /data (non-HA) or a Postgres append table (HA), served by /api/permissions.
 const permissionLedger = require("./permission-ledger.js");
+// The outcome ledger (XERK-1839): which model worked which ticket session and
+// what became of the work, folded from the fleet by outcomeLedgerSweep and served
+// by /api/model-quality. Fleet-wide evidence for model routing (docs/model-quality-adr.md).
+const outcomeLedger = require("./outcome-ledger.js");
 // HA storage-abstraction seam (XERK-754, epic XERK-751): the config resolver and
 // the LiveStore backends (file/in-memory default, or the Valkey shared client
 // when HA is on). Requiring these is side-effect-free — no socket is dialled and
@@ -361,6 +365,9 @@ function onLeaderPromoted() {
   // on the file backend.
   permissionLedger.rehydrate().catch((e) =>
     console.error(`leader promotion: permission-ledger rehydrate failed: ${(e && e.message) || e}`));
+  // The outcome ledger's Postgres rows (XERK-1839), for the same reason.
+  outcomeLedger.rehydrate().catch((e) =>
+    console.error(`leader promotion: outcome-ledger rehydrate failed: ${(e && e.message) || e}`));
 }
 
 const PORT = positiveEnv("PORT", 8300);
@@ -4693,6 +4700,49 @@ function permissionMetricsText() {
   return out;
 }
 
+// The outcome ledger's sweep (XERK-1839): one observation per ticket session the
+// fleet reports, on hosts DECIDED into the session's org (ticket.siteKey is
+// agent-asserted), joined to the board's resolved row for its work class and
+// status. Never throws onto the orchestration tick.
+function outcomeLedgerSweep(now = Date.now()) {
+  try {
+    const board = fleetTicketRows();
+    const obs = [];
+    for (const [host, a] of Object.entries(agents)) {
+      const org = decidedOrgOf(a);
+      if (!org) continue;
+      const add = (s, running) => {
+        const t = s && s.ticket;
+        if (!t || typeof t.key !== "string" || t.siteKey !== org || typeof s.id !== "string") return;
+        const b = board.get(ticketQueueKey(org, t.key));
+        const row = b ? b.row : null;
+        obs.push({
+          site: org, issue: t.key, host, sid: s.id, repo: s.repo,
+          model: s.model, modelActual: s.modelActual, runtime: s.agentType,
+          running, createdAt: s.createdAt, closedAt: s.closedAt,
+          prs: Array.isArray(s.prs) ? s.prs : [],
+          closeKind: t.outcome && t.outcome.kind,
+          type: row && row.type, statusCategory: row && row.statusCategory,
+        });
+      };
+      for (const s of a.sessions || []) {
+        if (s && s.status !== "queued") add(s, s.status === "running" || s.status === "error");
+      }
+      for (const c of a.closedSessions || []) if (!(c && c.paused)) add(c, false);
+    }
+    outcomeLedger.observe(obs, now);
+  } catch (e) {
+    console.error(`outcome ledger sweep failed: ${(e && e.message) || e}`);
+  }
+}
+
+function modelQualityView(params, now = Date.now()) {
+  const org = String(params.get("org") || "").trim();
+  return outcomeLedger.aggregate({
+    site: org || null, withRows: !!org && params.get("rows") === "1", now,
+  });
+}
+
 function metricsText(now = Date.now()) {
   if (now - metricsBlocked.at >= METRICS_CACHE_MS) {
     metricsBlocked = { at: now, n: new Set([
@@ -4712,7 +4762,8 @@ function metricsText(now = Date.now()) {
     "closed, 0 while open.\n" +
     "# TYPE turma_archive_ingest_gated_seconds gauge\n" +
     `turma_archive_ingest_gated_seconds ${Math.floor(archive.hydratingForMs(now) / 1000)}\n` +
-    permissionMetricsText();
+    permissionMetricsText() +
+    outcomeLedger.metricsText(now);
 }
 
 // Under HA a transcript's raw files may still be in the bucket (XERK-1043): fetch
@@ -16238,6 +16289,8 @@ function masterOrchestrationTick() {
   epicRunCompleteSweep();
   // The per-org brief (XERK-1573): a fresh one per org every BRIEF_INTERVAL_MIN.
   briefTick();
+  // Fold ticket sessions into the outcome ledger (XERK-1839). Observes only.
+  outcomeLedgerSweep();
   // Resume paused sleepers whose wake has come (XERK-1575). The drain does it
   // too, but only runs with something queued.
   wakePausedSleepers();
@@ -18423,6 +18476,13 @@ const server = http.createServer(async (req, res) => {
     // under "All orgs".
     if (req.method === "GET" && url.pathname === "/api/permissions") {
       return json(res, 200, permissionsView(url.searchParams));
+    }
+
+    // The outcome ledger (XERK-1839): per (work class, model) outcome counts,
+    // FLEET-WIDE — evidence pools across orgs (docs/model-quality-adr.md).
+    // `org=<siteKey>&rows=1` adds that one org's per-session rows.
+    if (req.method === "GET" && url.pathname === "/api/model-quality") {
+      return json(res, 200, modelQualityView(url.searchParams));
     }
 
     if (req.method === "POST" && url.pathname === "/api/heartbeat") {
@@ -22225,6 +22285,8 @@ if (process.env.TURMA_TEST) {
     // The permission ledger's served view + its module (XERK-1563).
     permissionsView,
     permissionLedger,
+    // The outcome ledger, its sweep and served view (XERK-1839).
+    outcomeLedger, outcomeLedgerSweep, modelQualityView,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
     // its value relative to the client's give-up is the whole point (XERK-241).
@@ -23109,6 +23171,10 @@ if (process.env.TURMA_TEST) {
   permissionLedger.configure(haConfig, archiveIndexPool).catch((e) => {
     console.error(`permission ledger: Postgres configure failed, staying on the local file: ${(e && e.message) || e}`);
   });
+  // The outcome ledger (XERK-1839), the same way.
+  outcomeLedger.configure(haConfig, archiveIndexPool).catch((e) => {
+    console.error(`outcome ledger: Postgres configure failed, staying on the local file: ${(e && e.message) || e}`);
+  });
 
   // ---- Leader election (XERK-763) ---------------------------------------
   // Elect the ONE replica that runs the singleton sweeps + migration-advance.
@@ -23279,11 +23345,12 @@ if (process.env.TURMA_TEST) {
       try { archive.closeDb(); } catch {}
       const finish = () => { clearTimeout(forceExit); console.log("drain complete — exiting"); process.exit(0); };
       const once = () => { if (!done) { done = true; finish(); } };
-      // Both ledgers flush before exit; `once` fires when the second lands.
-      let pending = 2;
+      // Every ledger flushes before exit; `once` fires when the last lands.
+      let pending = 3;
       const one = () => { if (--pending <= 0) once(); };
       try { permissionLedger.flush(() => one()); } catch { one(); }
       try { usageLedger.flush(() => one()); } catch { one(); }
+      try { outcomeLedger.flush(() => one()); } catch { one(); }
     };
 
     if (READYZ_DRAIN_DELAY_MS > 0) {

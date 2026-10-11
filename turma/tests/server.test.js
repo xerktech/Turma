@@ -110,6 +110,11 @@ process.env.PERMISSION_LEDGER_FILE = path.join(
   scratchDir(),
   `turma-test-permission-ledger-${process.pid}.json`
 );
+// The outcome ledger (XERK-1839), likewise.
+process.env.OUTCOME_LEDGER_FILE = path.join(
+  scratchDir(),
+  `turma-test-outcome-ledger-${process.pid}.json`
+);
 // The per-org permission policy text (XERK-1566), an externalized /data store.
 process.env.PERMISSION_POLICIES_FILE = path.join(
   scratchDir(),
@@ -24381,6 +24386,67 @@ test("XERK-1563: /metrics carries the ledger's per-kind aggregates and nothing e
   // The route is unauthenticated: no host, command or session leaks into it.
   assert.doesNotMatch(m.raw, /perm-metrics-host|secret-cmd|npm test/);
   delete agents["perm-metrics-host"];
+});
+
+// ---- the outcome ledger (XERK-1839) ---------------------------------------------
+
+function outcomeHost(key, site, extra = {}) {
+  agents[key] = {
+    lastSeen: Date.now(), orgBound: site,
+    jira: { siteKey: site, fetchedAt: new Date().toISOString(),
+      tickets: [{ key: "OL-1", type: "Bug", statusCategory: "inprogress", updated: "2026-10-01" }] },
+    sessions: [{ id: "s-live", status: "running", repo: "app", model: "opus",
+      modelActual: "claude-opus-5-5", createdAt: "2026-10-01T00:00:00Z",
+      ticket: { key: "OL-1", siteKey: site },
+      prs: [{ url: "https://github.com/o/r/pull/7", state: "OPEN" }] }],
+    closedSessions: [{ id: "s-old", repo: "app", model: "haiku", closedAt: "2026-10-01T01:00:00Z",
+      ticket: { key: "OL-1", siteKey: site },
+      prs: [{ url: "https://github.com/o/r/pull/6", state: "CLOSED" }] }],
+    ...extra,
+  };
+}
+
+test("XERK-1839: the sweep folds ticket sessions into fleet-wide model outcomes", async () => {
+  hub.outcomeLedger._internals.reset();
+  outcomeHost("ol-acme", "ol-acme.atlassian.net");
+  outcomeHost("ol-rival", "ol-rival.atlassian.net");
+  // A host whose DECIDED org differs from the session's claimed org contributes nothing.
+  outcomeHost("ol-drift", "ol-acme.atlassian.net", { orgBound: "elsewhere.atlassian.net" });
+  hub.outcomeLedgerSweep();
+  const v = await request("GET", "/api/model-quality", { headers: userHeaders });
+  assert.equal(v.status, 200);
+  const bugOpus = v.body.groups.find((g) => g.cls === "bug" && g.model === "opus");
+  const bugHaiku = v.body.groups.find((g) => g.cls === "bug" && g.model === "haiku");
+  assert.deepEqual([bugOpus.sessions, bugOpus.pending], [2, 2], "both orgs pool");
+  assert.deepEqual([bugHaiku.sessions, bugHaiku.bad], [2, 2]);
+  assert.equal(v.body.rows, undefined);
+  const rows = await request("GET", "/api/model-quality?org=ol-acme.atlassian.net&rows=1",
+    { headers: userHeaders });
+  assert.equal(rows.body.rows.length, 2);
+  assert.ok(rows.body.rows.every((r) => r.site === "ol-acme.atlassian.net" && r.host === "ol-acme"));
+  for (const k of ["ol-acme", "ol-rival", "ol-drift"]) delete agents[k];
+});
+
+test("XERK-1839: /api/model-quality is user-authed and /metrics leaks no ticket", async () => {
+  assert.equal((await request("GET", "/api/model-quality")).status, 401);
+  assert.equal((await request("GET", "/api/model-quality", { headers: agentHeaders })).status, 401);
+  hub.outcomeLedger._internals.reset();
+  outcomeHost("ol-metrics", "ol-metrics.atlassian.net");
+  hub.outcomeLedgerSweep();
+  const m = await request("GET", "/metrics");
+  assert.match(m.raw, /^turma_model_outcomes\{class="bug",model="opus",outcome="pending"\} 1$/m);
+  assert.doesNotMatch(m.raw, /OL-1|ol-metrics/);
+  delete agents["ol-metrics"];
+  hub.outcomeLedger._internals.reset();
+});
+
+test("XERK-1839: a malformed record never throws out of the sweep", () => {
+  agents["ol-bad"] = { orgBound: "x.atlassian.net", jira: { siteKey: "x.atlassian.net", tickets: "nope" },
+    sessions: [null, { id: 7, ticket: { key: "X-1", siteKey: "x.atlassian.net" } },
+      { id: "ok", status: "running", ticket: { key: {}, siteKey: "x.atlassian.net" } }],
+    closedSessions: "nope" };
+  assert.doesNotThrow(() => hub.outcomeLedgerSweep());
+  delete agents["ol-bad"];
 });
 
 // ---- XERK-1572: wait classifier hints, the loop signal, attention nudges ---------
