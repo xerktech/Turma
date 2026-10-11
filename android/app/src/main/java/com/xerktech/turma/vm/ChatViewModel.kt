@@ -30,6 +30,7 @@ import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
 import com.xerktech.turma.net.ModelSourceRequest
 import com.xerktech.turma.net.OkResponse
+import com.xerktech.turma.net.PanePromptAnswer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -95,6 +96,14 @@ data class ChatUiState(
     // it back. Mirrors the web's `answeredQuestion` guard (chat.js updateQuestion),
     // which Android lacked.
     val answeredQuestion: String? = null,
+    // Same guard for the TUI's blocking dialog (web chat.js `answeredPanePrompt`),
+    // so a stale beat can't bounce the sheet back. Keyed on prompt AND detail
+    // ([panePromptKey]): Claude asks every Bash permission as "Do you want to
+    // proceed?", so the prompt alone hid the NEXT command's dialog. Held at most
+    // [PANE_ANSWER_HOLD_MS] past [answeredPanePromptAt], so even an identical
+    // dialog asked again can never stay hidden.
+    val answeredPanePrompt: String? = null,
+    val answeredPanePromptAt: Long = 0,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     private val rawQuestion: String get() = session?.session?.question ?: ""
@@ -105,6 +114,17 @@ data class ChatUiState(
     val questionMulti: Boolean get() = session?.session?.questionMulti ?: false
     val questionTotal: Int? get() = session?.session?.questionTotal
     val questionIndex: Int? get() = session?.session?.questionIndex
+    /**
+     * The blocking TUI dialog (tool permission / plan approval) to show, or null.
+     * A session is never blocked on both it and an AskUserQuestion; the question
+     * wins if both report, as on the web (chat.js updateQuestion).
+     */
+    val panePrompt: com.xerktech.turma.model.PanePrompt? get() {
+        if (rawQuestion.isNotBlank()) return null
+        val p = session?.session?.panePrompt ?: return null
+        if (p.prompt.isEmpty() || p.options.isEmpty() || panePromptKey(p) == answeredPanePrompt) return null
+        return p
+    }
     // Attaching is off while a question is pending: the draft then routes to
     // POST .../answer, which carries no files (web chat.js renderAttachments).
     val canAttach: Boolean get() = Uploads.canAttach(uploadMaxBytes) && question.isBlank()
@@ -130,7 +150,10 @@ data class ChatUiState(
      * local-model controls forever — and nothing else in the suite notices,
      * because a Composable's body has no gate at all.
      */
-    fun fromFleet(agent: AgentInfo?, session: SessionInfo?, host: String): ChatUiState = copy(
+    fun fromFleet(
+        agent: AgentInfo?, session: SessionInfo?, host: String,
+        now: Long = System.currentTimeMillis(),
+    ): ChatUiState = copy(
         session = session,
         hostLabel = agent?.device?.ifBlank { host } ?: host,
         tunnelOnline = tunnelOnlineOf(agent),
@@ -142,8 +165,22 @@ data class ChatUiState(
         // to the next question or clears, forget it so the new one shows at once
         // (XERK-812) — the web's `answeredQuestion = null` on a differing beat.
         answeredQuestion = answeredQuestion?.takeIf { it == (session?.session?.question ?: "") },
+        answeredPanePrompt = answeredPanePrompt?.takeIf {
+            it == session?.session?.panePrompt?.let(::panePromptKey) &&
+                now - answeredPanePromptAt < PANE_ANSWER_HOLD_MS
+        },
     )
 }
+
+/**
+ * What identifies one dialog for the just-answered guard: the agent's digest of
+ * it (XERK-1831), else its question plus what it asks about (an older agent).
+ */
+internal fun panePromptKey(p: com.xerktech.turma.model.PanePrompt) =
+    p.id.ifEmpty { p.prompt + "\u0000" + p.detail }
+
+/** The longest a just-answered dialog stays hidden while beats still report it (~2 agent beats). */
+internal const val PANE_ANSWER_HOLD_MS = 45_000L
 
 class ChatViewModel(
     app: Application,
@@ -569,6 +606,28 @@ class ChatViewModel(
                 _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             } else {
                 pollForNextQuestion(pending)
+            }
+            container.fleet.nudge()
+        }
+    }
+
+    /**
+     * Answer the TUI's blocking dialog by its option number. The agent re-reads
+     * the pane and drops the answer if the dialog has moved on, so a tap against
+     * a stale beat can't type a stray digit into the composer. The sheet hides at
+     * once (web chat.js answerPanePrompt) and comes back if the POST fails.
+     */
+    fun answerPanePrompt(optionNumber: Int): Job? {
+        val shown = _state.value.panePrompt ?: return null
+        val prompt = panePromptKey(shown)
+        _state.update { it.copy(answeredPanePrompt = prompt, answeredPanePromptAt = System.currentTimeMillis()) }
+        return viewModelScope.launch {
+            val r = runCatching { client.api.answerPanePrompt(
+                host, sessionId, PanePromptAnswer(optionNumber, shown.id.ifEmpty { null }),
+            ) }
+            if (r.isFailure) {
+                _state.update { if (it.answeredPanePrompt == prompt) it.copy(answeredPanePrompt = null) else it }
+                _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             }
             container.fleet.nudge()
         }

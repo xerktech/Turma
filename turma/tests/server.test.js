@@ -16957,6 +16957,34 @@ test("normalizeRecord coerces session summary: type, whitespace, length", () => 
   assert.equal("summary" in a.sessions[4], false, "absent stays absent");
 });
 
+test("normalizeRecord rebuilds session.panePrompt to its typed shape or drops it", () => {
+  // Android TYPES panePrompt (the blocking permission/plan dialog it answers),
+  // and decodes /api/agents atomically — a wrong shape must never reach it.
+  const good = { prompt: "Do you want to proceed?", detail: "Bash command\n  ls", id: "0123456789abcdef0123456789abcdef",
+    options: [{ number: 1, label: "Yes", selected: true }, { number: 2, label: "No", selected: false }] };
+  const a = {
+    sessions: [
+      { id: "s1", session: { panePrompt: { ...good, extra: 1 } } },
+      { id: "s2", session: { panePrompt: { prompt: "Q", id: "NOT-A-DIGEST", options: [{ number: "1", label: "Yes" },
+        { number: 12, label: "x" }, 7, { number: 3, label: {} }, { number: 2, label: "No", selected: "y" }],
+        detail: {} } } },
+      { id: "s3", session: { panePrompt: { prompt: "Q", options: [{ number: "1", label: "Yes" }] } } },
+      { id: "s4", session: { panePrompt: { prompt: 5, options: good.options } } },
+      { id: "s5", session: { panePrompt: "Do you want to proceed?" } },
+      { id: "s6", session: { panePrompt: null } },
+    ],
+  };
+  hub.normalizeRecord(a);
+  assert.deepEqual(a.sessions[0].session.panePrompt, good, "a good dialog survives, unknown keys dropped");
+  assert.deepEqual(a.sessions[1].session.panePrompt,
+    { prompt: "Q", options: [{ number: 2, label: "No", selected: false }], detail: "" });
+  // No usable option is still a blocking dialog — the hub's attention keys on the prompt.
+  assert.deepEqual(a.sessions[2].session.panePrompt, { prompt: "Q", options: [], detail: "" });
+  for (const i of [3, 4, 5]) {
+    assert.equal("panePrompt" in a.sessions[i].session, false, `session ${i + 1} kept a bad panePrompt`);
+  }
+});
+
 test("normalizeRecord runs the triage coercions too, on ingest and on restore (XERK-481)", () => {
   // Pins the WIRING, not just the leaves: a malformed TOP-LEVEL `triage` block is
   // decode-fatal for Android's whole /api/agents array, so normalizeRecord must

@@ -369,6 +369,15 @@ class SessionsTest {
         assertEquals(LiveState.WAITING, liveState(s, now, now))
     }
 
+    @Test fun `a blocking permission dialog reads WAITING, over working`() {
+        val dialog = com.xerktech.turma.model.PanePrompt(
+            prompt = "Do you want to proceed?",
+            options = listOf(com.xerktech.turma.model.PaneOption(1, "Yes", true)),
+        )
+        val s = SessionInfo(status = "running", session = LiveSignals(paneBusy = true, panePrompt = dialog))
+        assertEquals(LiveState.WAITING, liveState(s, now, now))
+    }
+
     @Test fun `stopped session is STOPPED`() {
         assertEquals(LiveState.STOPPED, liveState(SessionInfo(status = "stopped"), now, now))
     }

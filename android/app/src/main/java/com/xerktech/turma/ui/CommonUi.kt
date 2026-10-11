@@ -330,8 +330,8 @@ data class CardState(val label: String, val tone: CardTone)
  * answer", "waiting for your permission", "QA Review", "⏳ waiting · Watch CI",
  * "stalled · Watch CI", "PR awaiting review", "finished · awaiting review", …
  *
- * The web reads a permission dialog off `panePrompt`, which this client does not
- * type; the hub's `needs-you:permission` attention is the same edge. Unlike the
+ * The web reads a permission dialog off `panePrompt`; this card keys on the
+ * hub's `needs-you:permission` attention, the same edge. Unlike the
  * web card, the phone card shows no ask/why line beside it (operator call).
  */
 fun sessionCardState(session: SessionInfo, agentLastSeen: Long, now: Long, review: Boolean): CardState {

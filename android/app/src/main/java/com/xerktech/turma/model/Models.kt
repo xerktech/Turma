@@ -1210,6 +1210,11 @@ data class LiveSignals(
     val questionIndex: Int? = null,
     val questionTotal: Int? = null,
     val questionMulti: Boolean = false,
+    // The blocking TUI dialog — a tool-permission request or a plan approval —
+    // scraped off the pane (agent parse_pane_prompt). Answered by its option
+    // NUMBER via POST .../pane-prompt. The hub rebuilds it to this shape or
+    // omits it (server.js coerceLiveSignals), since a typed field is decode-fatal.
+    val panePrompt: PanePrompt? = null,
     val newPrUrls: List<String> = emptyList(),
     val tail: List<TailEntry> = emptyList(),
     // A session-CLI wake request (XERK-1564): epoch ms + why. A [wakeAt] still in
@@ -1217,6 +1222,26 @@ data class LiveSignals(
     // positive safe integer and [wakeReason] a capped string, else omits them.
     val wakeAt: Long? = null,
     val wakeReason: String? = null,
+)
+
+/** `LiveSignals.panePrompt`: the dialog's question, its numbered options and the context above it. */
+@Serializable
+data class PanePrompt(
+    val prompt: String = "",
+    val options: List<PaneOption> = emptyList(),
+    val detail: String = "",
+    // The agent's digest of the whole dialog (XERK-1831), sent back with the
+    // answer so it is never applied to a dialog that replaced this one. Empty
+    // from an agent predating it.
+    val id: String = "",
+)
+
+/** One numbered choice of a [PanePrompt]; [selected] is the TUI cursor's row. */
+@Serializable
+data class PaneOption(
+    val number: Int = 0,
+    val label: String = "",
+    val selected: Boolean = false,
 )
 
 @Serializable

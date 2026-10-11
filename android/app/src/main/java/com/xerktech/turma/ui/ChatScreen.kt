@@ -6,17 +6,23 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.unit.Dp
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -162,15 +168,22 @@ fun ChatScreen(
         }
     }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
+    // The top bar's and the compose footer's MEASURED heights, for the waiting
+    // sheets' cap ([waitingSheetCap]) — both grow with the font scale.
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    var topBarPx by remember { mutableIntStateOf(0) }
+    var footerPx by remember { mutableIntStateOf(0) }
 
+    // Lift the whole screen above the soft keyboard (XERK-76): the app is
+    // edge-to-edge, so without this the IME simply overlays the compose box
+    // and you can't see what you're typing. imePadding consumes the inset,
+    // so the bottomBar (footer + question sheet) lands right on the keyboard.
+    BoxWithConstraints(Modifier.imePadding()) {
+    val sheetMax = with(density) { waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()) }
     Scaffold(
-        // Lift the whole screen above the soft keyboard (XERK-76): the app is
-        // edge-to-edge, so without this the IME simply overlays the compose box
-        // and you can't see what you're typing. imePadding consumes the inset,
-        // so the bottomBar (footer + question sheet) lands right on the keyboard.
-        modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
+                modifier = Modifier.onSizeChanged { topBarPx = it.height },
                 title = {
                     Column {
                         Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
@@ -263,6 +276,7 @@ fun ChatScreen(
                         state.questionOptions.map { com.xerktech.turma.model.QuestionOption(label = it) }
                     }
                     QuestionSheet(
+                        maxHeight = sheetMax,
                         question = state.question,
                         header = state.questionHeader,
                         index = state.questionIndex,
@@ -273,6 +287,8 @@ fun ChatScreen(
                         onAnswerMulti = { vm.answerMulti(it) },
                     )
                 }
+                state.panePrompt?.let { p -> PanePromptSheet(p, sheetMax, onPick = vm::answerPanePrompt) }
+                Box(Modifier.onSizeChanged { footerPx = it.height }) {
                 ChatFooter(
                     session = state.session,
                     draft = state.draft,
@@ -283,7 +299,7 @@ fun ChatScreen(
                     // to the heartbeat's paneBusy. Drives the separate ◼ Stop button —
                     // suppressed while a question is pending (the draft answers it).
                     busy = (state.liveTurn.isNotBlank() || state.session?.session?.paneBusy == true) &&
-                        state.question.isBlank(),
+                        state.question.isBlank() && state.panePrompt == null,
                     onDraft = vm::setDraft,
                     onSend = vm::submitDraft,
                     onStop = vm::stop,
@@ -299,6 +315,7 @@ fun ChatScreen(
                     onAttach = vm::attach,
                     onRemoveAttachment = vm::removeAttachment,
                 )
+                }
             }
         },
     ) { pad ->
@@ -346,6 +363,7 @@ fun ChatScreen(
                 }
             }
         }
+    }
     }
 }
 
@@ -521,6 +539,7 @@ private fun AgentsList(
 
 @Composable
 private fun QuestionSheet(
+    maxHeight: androidx.compose.ui.unit.Dp,
     question: String,
     header: String,
     index: Int?,
@@ -532,7 +551,10 @@ private fun QuestionSheet(
 ) {
     val picks = remember(question) { mutableStateListOf<Int>() }
     Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(
+            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
             if (header.isNotBlank() || (total != null && total > 1)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     if (header.isNotBlank()) Pill(header, color = MaterialTheme.colorScheme.primary)
@@ -552,6 +574,65 @@ private fun QuestionSheet(
                 PrimaryButton("Submit selection", onClick = { onAnswerMulti(picks.toList()) }, enabled = picks.isNotEmpty())
             }
             Text("…or type a custom answer below.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/**
+ * The tallest a question / permission sheet may grow before it scrolls. The
+ * Scaffold's bottomBar is measured against the whole window, so a sheet taller
+ * than what is left between the top bar and the compose footer draws OVER the
+ * top bar (landscape, or a large font scale: Kill and Terminal untappable).
+ * Both are MEASURED, since they grow with the font scale; [CHAT_SHEET_GAP] keeps
+ * a strip of transcript visible. Never more than half the window. No floor:
+ * when nothing is left (landscape with the keyboard up) the sheet collapses
+ * until the keyboard goes, rather than covering the top bar.
+ */
+internal fun waitingSheetCap(window: Dp, topBar: Dp, footer: Dp): Dp =
+    minOf(window / 2, window - topBar - footer - CHAT_SHEET_GAP).coerceAtLeast(0.dp)
+
+internal val CHAT_SHEET_GAP = 24.dp
+
+/**
+ * The TUI's blocking dialog — a tool-permission request or a plan approval —
+ * in the same place as the question sheet (web chat.js panePromptHtml): the
+ * dialog's question, the context it asks about, and one card per numbered
+ * option, the TUI cursor's row outlined. Tapping a card answers by its number.
+ */
+@Composable
+private fun PanePromptSheet(
+    prompt: com.xerktech.turma.model.PanePrompt,
+    maxHeight: androidx.compose.ui.unit.Dp,
+    onPick: (Int) -> Unit,
+) {
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
+        Column(
+            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Pill("waiting", color = MaterialTheme.colorScheme.primary)
+            Text(prompt.prompt, fontWeight = FontWeight.Medium)
+            if (prompt.detail.isNotBlank()) {
+                Text(
+                    prompt.detail,
+                    Modifier.fillMaxWidth()
+                        .heightIn(max = 180.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                        .verticalScroll(rememberScrollState())
+                        .horizontalScroll(rememberScrollState())
+                        .padding(8.dp),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            prompt.options.forEach { opt ->
+                QuestionOptionCard(
+                    com.xerktech.turma.model.QuestionOption(label = "${opt.number}. ${opt.label}"),
+                    multi = false, selected = opt.selected,
+                ) { onPick(opt.number) }
+            }
         }
     }
 }
