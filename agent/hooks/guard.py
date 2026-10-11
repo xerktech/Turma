@@ -13914,6 +13914,238 @@ def _is_destructive(command: str) -> str | None:
     return None
 
 
+# --- can't-read-this markers (XERK-1749) ----------------------------------
+#
+# A long tail of bypasses comes from shell constructs the guard resolves
+# CONFIDENTLY but WRONGLY (an array-element op, a nested `${…}` in a pattern, a
+# `case` inside a `$(…)`, an indirect/nameref name, an extglob, a here-string
+# brace list, …). Rather than model each one exactly — every such model is
+# another QA pass that files 3-5 new evasions — these are DETECTED and, when the
+# same line also carries a dangerous SINK, refused: "write it plainly."
+#
+# The markers are kept DELIBERATELY NARROW so real transcripts do not newly fail:
+# each fires only on a construct that is genuinely exotic in live shell (not in
+# heredoc/data), gated by `_quote_states` so a `${…}` inside a single-quoted
+# `python3 -c '…'` payload is NOT a marker. The behavioural shapes that cannot
+# be told from ordinary automation by text alone (a rebuilt `$var` run as a
+# command, a value echoed out of a reader, positionals in a re-parse) are left
+# as a documented residual — see `.claude/rules/guard-unreadable.md`.
+#
+# This is an EXTENSION of the `_unreadable_op` idea (XERK-1651/1664): the marker
+# sits on the construct, not on a (mis)read result, so it catches confident
+# misreads a "value unreadable" rule never would.
+
+_UNREADABLE_REASON = ("the guard can't read this command with confidence (it uses a shell "
+                      "construct the guard does not resolve exactly) and the line has a "
+                      "destructive or shell-executing sink — write it plainly, or put the "
+                      "data in a file")
+
+# The live quoting states: text here is real shell / subject to expansion. A
+# `${…}` or `$'…'` inside a single-quoted literal (state "'") is data unless a
+# re-parse runs it, so markers skip it to keep ordinary `… -c '…'`/`python3 -c
+# '…'` payloads from tripping.
+_UNREAD_LIVE = ("", '"', '{"')
+
+_UNREAD_SHELL = r"(?:bash|sh|zsh|ksh|dash|ash|busybox|su)"
+# A destructive file op named anywhere (quoting-blind: a verb hidden in a value,
+# here-string or heredoc body is still the sink the marker reaches).
+_UNREAD_SINK_DESTRUCTIVE_RE = re.compile(
+    r"\b(?:rm|rmdir|unlink|shred|srm|wipefs|blkdiscard|mkfs\w*|mke2fs|mkswap|"
+    r"dd|truncate|fdisk|sgdisk|cfdisk|parted)\b")
+# A shell-executing sink: eval / source / a shell `-c` / a pipe into a shell /
+# a shell reading a here-doc or here-string / a process-substitution feed.
+_UNREAD_SINK_SHELL_RE = re.compile(
+    r"\beval\b|\bsource\b|\btrap\b|\bxargs\b"
+    r"|(?:^|[;&|(]|\bdo\b|\bthen\b|\belse\b)\s*\.\s+\S"
+    rf"|\b{_UNREAD_SHELL}\b\s+(?:-\S+\s+){{0,40}}-c\b"
+    rf"|\|\s*(?:\w+\s+){{0,5}}{_UNREAD_SHELL}\b"
+    rf"|\b{_UNREAD_SHELL}\b\s*<<"
+    r"|<\s*<\(")
+# An `rm -rf`-shaped flag cluster (both r and f), for a program word rebuilt
+# from a value with no literal verb (`$a -rf /etc`, XERK-1747/1711).
+_UNREAD_SINK_RMFLAG_RE = re.compile(
+    r"(?:^|\s)-(?:[a-eg-qs-z]*r[a-eg-qs-z]*f|[a-eg-qs-z]*f[a-eg-qs-z]*r)[a-z]*\b")
+
+
+def _unreadable_sink(command: str) -> bool:
+    """True if the line carries a destructive or shell-executing sink. Coarse
+    and quoting-blind on purpose: the MARKER (gated to live shell) is the tight
+    half; this only needs the dangerous thing to be present somewhere."""
+    return bool(_UNREAD_SINK_DESTRUCTIVE_RE.search(command)
+                or _UNREAD_SINK_SHELL_RE.search(command)
+                or _UNREAD_SINK_RMFLAG_RE.search(command))
+
+
+# cmd-start context: a marker word is a declaration/builtin only at a command
+# start, never inside a path (`.local/`) or a message (`"shopt …"`).
+_UNREAD_CMDPOS = r"(?:^|[\n;&|(]|&&|\|\||\bthen\b|\bdo\b|\belse\b|\{)\s*"
+_UNREAD_NAMEREF_RE = re.compile(_UNREAD_CMDPOS + r"(?:declare|local|typeset)\s+(?:-\w+\s+)*-\w*n\b")
+_UNREAD_COPROC_RE = re.compile(_UNREAD_CMDPOS + r"coproc\b")
+_UNREAD_SHOPT_RE = re.compile(_UNREAD_CMDPOS + r"shopt\b")
+_UNREAD_IFS_VAR_RE = re.compile(r"\bIFS=(?:[\"']?\$)")
+_UNREAD_READ_D_RE = re.compile(r"\bread\b[^\n;|&]*-d\s*[\"']?\$")
+# A `$(case … in …)` whose `esac)` is GLUED to more text (XERK-1695): the
+# substitution scanner ends the body at the first case-pattern `)`, so the
+# whole one-word assignment is mis-read. A plain `$(case … esac)` ends at a
+# separator and is left alone.
+_UNREAD_CASE_GLUED_RE = re.compile(r"\besac\)[^\s;|&)}]")
+_UNREAD_OP_HEAD_RE = re.compile(r"^(!?)([#a-zA-Z_]\w*|[-@*#?!0-9])")
+_UNREAD_EXTGLOB_RE = re.compile(r"[?*+@!]\(")
+# A here-string word carrying a brace list (`,`/`..`). The alternatives have
+# DISTINCT first chars (`'`, `"`, else) and the catch-all excludes the quote
+# chars, so there is no overlap to backtrack on: an unterminated `$(` run is
+# matched char by char by the catch-all, never re-tried per position. A `$(…)`
+# branch here overlapped the catch-all (`$`/`(`/`)` are in it) and went O(n²) on
+# `sh <<< $($($(…` (XERK-1749 QA) — do not reintroduce it. Must stay linear.
+_UNREAD_HERESTR_WORD_RE = re.compile(
+    r"\s*((?:'[^']*'|\"[^\"]*\"|[^\s;|&<>'\"])+)")
+# A brace list `{…,…}` / `{a..b}`. The `[^}]` runs are BOUNDED (a real list is
+# short): unbounded, each `{` in a `${${${…` run scanned to the end looking for
+# the `,`/`.` → O(n^2) (XERK-1749 QA). Keep the caps.
+_UNREAD_HERESTR_BRACE_RE = re.compile(r"\{[^}]{0,200}[,.][^}]{0,200}\}")
+_UNREAD_HERESTR_SHELL_RE = re.compile(rf"(?:^|\s){_UNREAD_SHELL}\b")
+
+
+def _unreadable_brace_spans(command: str, states: list[str]):
+    """Each live `${…}` span's inner text; quoting-aware close via `_brace_end`.
+
+    Linear: a closed span jumps PAST itself, and a live `${` that does not close
+    STOPS the scan — re-calling `_brace_end` at every later `$` on an unterminated
+    `${${${…` run was O(n²) (XERK-1749 QA). An unclosed `${` is malformed (bash
+    errors on the whole command), so there is nothing after it to catch."""
+    out = []
+    i, n = 0, len(command)
+    while i < n:
+        if command[i] == "$" and i + 1 < n and command[i + 1] == "{" and states[i] in _UNREAD_LIVE:
+            end = _brace_end(command, i, states[i] in ('"', '{"'))
+            if end <= i:
+                break
+            out.append((command[i + 2:end]))
+            i = end + 1
+            continue
+        i += 1
+    return out
+
+
+def _unreadable_op_parts(inner: str):
+    """Split a `${…}` inner into (indirect, subscript_or_None, op_and_arg)."""
+    m = _UNREAD_OP_HEAD_RE.match(inner)
+    if not m:
+        return None
+    rest = inner[m.end():]
+    sub = None
+    if rest.startswith("["):
+        depth = 0
+        for j, c in enumerate(rest):
+            if c == "[":
+                depth += 1
+            elif c == "]":
+                depth -= 1
+                if depth == 0:
+                    sub, rest = rest[1:j], rest[j + 1:]
+                    break
+    return bool(m.group(1)), sub, rest
+
+
+def _unreadable_markers(command: str) -> bool:
+    """True if ``command`` uses a shell construct the guard cannot resolve
+    exactly, in LIVE shell (not in heredoc data or a single-quoted payload).
+    Narrow by design — see the module comment and guard-unreadable.md."""
+    # Heredoc bodies are data (a python/commit/file payload must not look like
+    # shell to the scan); the SINK scan above still sees them.
+    try:
+        text, _hd = _split_heredocs(command)
+    except Exception:
+        text = command
+    states = _quote_states(text)
+
+    def live(idx: int) -> bool:
+        return 0 <= idx < len(states) and states[idx] in _UNREAD_LIVE
+
+    def live_hit(rx) -> bool:
+        return any(live(m.start()) for m in rx.finditer(text))
+
+    # namerefs / coproc / shopt — command-start builtins
+    if live_hit(_UNREAD_NAMEREF_RE) or live_hit(_UNREAD_COPROC_RE) or live_hit(_UNREAD_SHOPT_RE):
+        return True
+    # a reader IFS / -d separator spelled by an expansion (XERK-1702)
+    if live_hit(_UNREAD_IFS_VAR_RE) or live_hit(_UNREAD_READ_D_RE):
+        return True
+    # a case inside a $(…) glued to text (XERK-1695) — raw (covers eval re-parse)
+    if _UNREAD_CASE_GLUED_RE.search(command):
+        return True
+
+    # exotic ${…} parameter expansions (live only)
+    for inner in _unreadable_brace_spans(text, states):
+        parts = _unreadable_op_parts(inner)
+        if parts is None:
+            if inner[:1] == "!":          # ${!…} with no name char
+                return True
+            continue
+        indirect, sub, rest = parts
+        if indirect and rest[:1] not in ("*", "@") and sub not in ("@", "*"):
+            return True                    # ${!name} indirection (not keys/prefix)
+        if sub is not None and rest:       # array element with an op (XERK-1700/1716/1730/1731)
+            return True
+        if _UNREAD_EXTGLOB_RE.search(rest):   # extglob in an op (XERK-1709/1714/1716)
+            return True
+        opchar = rest[:1]
+        if opchar in ("#", "%", "/") or rest[:2] in ("##", "%%", "//"):
+            if "${" in rest:               # nested ${…} in a pattern (XERK-1709/1723)
+                return True
+            if "[" in rest:                # bracket class in a trim/replace pattern (XERK-1707)
+                return True
+        if opchar == ":" and rest[1:2] not in ("-", "=", "+", "?", "") and "$" in rest:
+            return True                    # substring offset with an expansion (XERK-1723)
+        bstates = _quote_states(inner)     # a quoted/escaped } in an op word (XERK-1729/1700)
+        if any(c == "}" and bstates[j] in ("'", '"', "\\") for j, c in enumerate(inner)):
+            return True
+        if rest.startswith((":=", "=")):   # assignment-valued expansion (XERK-1700)
+            return True
+
+    # ANSI-C $'…' whose body escapes a quote — desyncs the splitter (XERK-1733)
+    for m in re.finditer(r"\$'", text):
+        if states[m.start()] not in _UNREAD_LIVE:
+            continue
+        j = m.end()
+        while j < len(text):
+            if text[j] == "\\":
+                j += 2
+                continue
+            if text[j] == "'":
+                break
+            j += 1
+        if "\\'" in text[m.end():j] or '\\"' in text[m.end():j]:
+            return True
+
+    # a here-string `<<<` feeding a shell, whose word carries a brace list
+    # (bash never brace-expands a here-string, XERK-1739)
+    for m in re.finditer(r"<<<", text):
+        if not live(m.start()):
+            continue
+        head = re.split(r"[\n;&|(]|&&|\|\|", text[max(0, m.start() - 80):m.start()])[-1]
+        if not _UNREAD_HERESTR_SHELL_RE.search(head):
+            continue
+        wm = _UNREAD_HERESTR_WORD_RE.match(text, m.end())
+        if wm and _UNREAD_HERESTR_BRACE_RE.search(wm.group(1)):
+            return True
+
+    return False
+
+
+def _unreadable_construct(command: str) -> str | None:
+    """The refusal reason when ``command`` both carries a dangerous sink AND
+    uses a construct the guard cannot read with confidence; else None.
+
+    Sink first: it is three cheap regexes and most commands have no sink, so the
+    heavier marker scan runs only when one is present."""
+    if not _unreadable_sink(command):
+        return None
+    if _unreadable_markers(command):
+        return _UNREADABLE_REASON
+    return None
+
+
 def _parse_overrides(raw: str | None) -> list[str]:
     """Extract approved command patterns from a ``Bash(<cmd>),...`` CSV grant.
 
@@ -14008,6 +14240,16 @@ def _decide_bash(command: str, overrides: list[str], no_attribution: bool, pr_su
         summary = pr_summary_reason(command, cwd)
         if summary:
             return ("deny", summary, "pr-summary")
+
+    # Constructs the guard cannot read with confidence, next to a dangerous sink
+    # (XERK-1749). Last among the readers but before the final allow: the exact
+    # checks above resolve ordinary commands, and a confident MISREAD by them
+    # returns None here — the marker sits on the construct, not the result, so it
+    # still fires. Non-grantable (category "policy"): the fix is to write it
+    # plainly, like `_TOO_LARGE`.
+    unreadable = _unreadable_construct(command)
+    if unreadable:
+        return ("deny", unreadable, "policy")
 
     # Not grantable: the budget replaces the WHOLE expansion, so the checks
     # above saw nothing. A granted reason found before any expansion (a heredoc

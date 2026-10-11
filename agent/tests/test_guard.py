@@ -7347,6 +7347,100 @@ class TestJudgeGrants(unittest.TestCase):
             allow.assert_not_called()
 
 
+class TestUnreadableConstructs(unittest.TestCase):
+    """XERK-1749: a shell construct the guard cannot resolve exactly, next to a
+    destructive/shell sink, is refused ("write it plainly") instead of modelled.
+
+    Each DENY case is a shape folded from a closed long-tail ticket; each ALLOW
+    case is the ordinary counterpart that MUST keep working (the construct is
+    data, or has no sink, or is a plain expansion). The ALLOW cases are the real
+    guard here: a textual marker is only safe if it does not deny these.
+    """
+
+    RM = "rm -rf /etc"
+
+    # construct -> a command that must be DENIED (folded ticket in the comment)
+    DENIED = [
+        ("nameref", "declare -n r=y; y=eval; $r \"a='rm -rf /etc'\"; $a"),       # XERK-1722
+        ("var-ifs", 'i=Q; IFS=$i read a b <<< "1Qrm -rf /etc"; $b'),             # XERK-1702
+        ("case-subst", "X=$(case a in a) echo;; esac)x rm -rf /etc"),            # XERK-1695
+        ("indirection", "x=source; y=x; ${!y} <(echo \"a='rm -rf /etc'\"); $a"),  # XERK-1732
+        ("array-op-c", 'y=(); bash -c "${y[0]:-rm -rf /etc}"'),                  # XERK-1731
+        ("array-op", "y=(); ${y[0]:-rm -rf /etc}"),                             # XERK-1700
+        ("extglob", "a='x/etc'; rm -rf \"${a#*@(x|)}\""),                       # XERK-1714
+        ("nested-op", "a='xx/etc'; b=${a#${nope}xx}; rm -rf \"$b\""),            # XERK-1709
+        ("bracket-pat", "y='/etc'; rm -rf ${y/[/]/x}"),                         # XERK-1707
+        ("arith-name", 'a=xx/etc; n=2; rm -rf "${a:$((n))}"'),                  # XERK-1723
+        ("quoted-brace", "q='/etc}x'; y=${q%'}x'}; rm -rf $y"),                 # XERK-1729
+        ("assign-op", ": ${x:=rm -rf /etc}; $x"),                              # XERK-1700
+        ("ansi-c", "echo $'\\'' ; r''ead a <<'E'\nrm -rf /etc\nE\n$a"),         # XERK-1733
+        ("shopt", "shopt -s extglob; ${HOME/+(?)/rm} -rf /"),                   # XERK-1716
+        ("herestring-brace", "sh <<< 'rm -rf /etc;'{,:}"),                      # XERK-1739
+    ]
+
+    # ordinary commands that LOOK similar but must keep working
+    ALLOWED = [
+        ("array-ref-no-op", 'rm -rf "${files[@]}"'),
+        ("default-literal", 'rm -rf "${TMPDIR:-/tmp}/build"'),
+        ("default-in-arg", 'cd "${DIR:-$HOME}" && rm -rf build'),
+        ("case-esac-plain", "type=$(case $T in a) echo x;; esac); rm -rf build"),
+        ("exotic-in-single-quote-data", "grep -n '${a#*x}' file && rm -rf build"),
+        ("bash-c-plain", "bash -c 'make clean && rm -rf build'"),
+        ("glob-loop", 'for f in *.log; do rm -f "$f"; done'),
+        ("default-from-subst", 'k=$(kubectl get pod -o name); rm -rf "${k:-/tmp/x}"'),
+        ("grep-rf", "grep -rf patterns.txt ."),
+        ("python-c-data", "python3 -c 'print(\"rm -rf /\")'"),
+    ]
+
+    # a marker WITHOUT a sink is allowed (the construct alone is not refused)
+    MARKER_NO_SINK = [
+        "declare -n ref=arr; echo \"${ref}\"",
+        'echo "${y[0]:-hello}"',
+        "shopt -s extglob; echo ${x#+(a)}",
+        "X=$(case a in a) echo;; esac)x echo hi",
+    ]
+
+    def test_unreadable_constructs_with_a_sink_are_denied(self):
+        for tag, cmd in self.DENIED:
+            with self.subTest(tag=tag):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+
+    def test_ordinary_lookalikes_are_allowed(self):
+        for tag, cmd in self.ALLOWED:
+            with self.subTest(tag=tag):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_a_marker_without_a_sink_is_allowed(self):
+        for cmd in self.MARKER_NO_SINK:
+            with self.subTest(cmd=cmd):
+                self.assertFalse(guard._unreadable_sink(cmd) and guard._unreadable_markers(cmd))
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+
+    def test_the_refusal_is_not_grantable(self):
+        """It is category "policy" (like `_TOO_LARGE`): an operator grant for the
+        exact command does not lift it — the fix is to write it plainly."""
+        cmd = "X=$(case a in a) echo;; esac)x rm -rf /etc"
+        self.assertIsNone(guard._is_destructive(cmd))  # only the marker catches it
+        decision, _reason, category = guard.decide(
+            "Bash", {"command": cmd}, overrides=["Bash(%s)" % cmd], cwd="/tmp")
+        self.assertEqual((decision, category), ("deny", "policy"))
+
+    def test_the_marker_scan_stays_linear(self):
+        """No new ReDoS: an adversarial pile of `${`, `\\ `, `esac)` and `<<<`
+        stays well under budget (CPU time, never wall-clock — XERK-1750)."""
+        import time
+        for cmd in ("${a#" * 4000, "esac)" * 4000, "<<<" * 4000,
+                    ("a" + "\\ " * 4000), "$'\\'" * 4000, "${y[0]:-x}" * 2000,
+                    # the here-string word regex: an unterminated `$(` run after a
+                    # shell `<<<` was O(n^2) (one uninterruptible C call) until the
+                    # overlapping `$(` branch was dropped (XERK-1749 QA).
+                    "sh <<< " + "$(" * 160000, "sh <<< " + "'x'" * 80000,
+                    "bash <<< " + "${" * 80000):
+            t = time.process_time()
+            guard._unreadable_construct(cmd + " rm -rf /etc")
+            self.assertLess(time.process_time() - t, 3.0, cmd[:20])
+
+
 class TestHookSourcesCompileClean(unittest.TestCase):
     def test_no_syntax_warnings(self):
         # An invalid escape (`\``) in a docstring warns on every hook run and
