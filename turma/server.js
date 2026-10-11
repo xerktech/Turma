@@ -2600,12 +2600,14 @@ const TICKET_MODEL_LADDER = (() => {
   return list;
 })();
 
-// Every session of this ticket the fleet still knows about, on hosts BOUND to its
-// org (the startedTicketKeys rule: a drifted host's claim is not this org's work).
+// Every session of this ticket the fleet still knows about, on hosts DECIDED into
+// its org (decidedOrgOf: bound and not actively drifting). That is the served
+// `org` the board's Model row filters on (XERK-1830), so the row and the spawn
+// agree; a drifting host's history only costs a cheaper retry for a beat.
 function ticketSessionRecords(siteKey, issueKey) {
   const out = [];
   for (const a of Object.values(agents)) {
-    if (boundOrgOf(a) !== siteKey) continue;
+    if (decidedOrgOf(a) !== siteKey) continue;
     const mine = (s) => s && s.ticket && s.ticket.key === issueKey && s.ticket.siteKey === siteKey;
     for (const s of a.sessions || []) if (mine(s)) out.push({ rec: s, live: true });
     for (const c of a.closedSessions || []) if (mine(c)) out.push({ rec: c, live: false });
@@ -5435,7 +5437,12 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, ticketPlatforms, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
+    now, agents: list, ticketAgents, ticketModels,
+    // The model ladder unpinned claude ticket sessions climb (XERK-1827), [] when
+    // TICKET_MODEL_LADDER=off. Env-fixed for the hub's life, so no SSE frame; the
+    // board derives each ticket's next tier from it + the live fleet (XERK-1830).
+    ticketModelLadder: TICKET_MODEL_LADDER,
+    ticketRuntimes, ticketPlatforms, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
     // Per-org triage policy (XERK-486 [F]) and the per-ticket triage verdicts
     // (approve/hold/reject): hub-owned like the pins above, and the board's one
     // read channel for both — the policy panel and the card chips read them

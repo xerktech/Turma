@@ -8135,6 +8135,12 @@ test("XERK-1827: an undelivered haiku session escalates the next start to sonnet
   assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "opus", escalatedFrom: "opus" });
 });
 
+test("XERK-1830: /api/agents serves the ticket model ladder for the board's Model row", async () => {
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.deepEqual(res.body.ticketModelLadder, hub.TICKET_MODEL_LADDER);
+  assert.deepEqual(res.body.ticketModelLadder, ["haiku", "sonnet", "opus"]);
+});
+
 test("XERK-1827: a live error or queued record never climbs the ladder (infra is not a miss)", async () => {
   const site = "lad5.atlassian.net";
   await ladderBeat("lad5", site);
@@ -8150,6 +8156,15 @@ test("XERK-1827: a host bound to another org cannot climb this org's ladder", as
   await ladderBeat("lad6rogue", "rival6.atlassian.net");          // bound to rival
   await ladderBeat("lad6rogue", site, { closed: [                  // now claims lad6
     { id: "x", repo: "Turma", model: "sonnet", ticket: ladderTicket(site) }] });
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
+});
+
+test("XERK-1830: a drifting host's history never climbs the ladder (row and spawn agree)", async () => {
+  const site = "lad8.atlassian.net";
+  await ladderBeat("lad8", site);                                  // bound to lad8
+  await ladderBeat("lad8", "other8.atlassian.net", { closed: [     // now declares another org
+    { id: "x", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }] });
+  // The board filters on the served (decided) org, "" here, so the hub must too.
   assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
 });
 

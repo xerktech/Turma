@@ -808,6 +808,14 @@ let openTicketState = null, openSeq = 0, lastFocus = null;
 
 const sleep = (ms) => new Promise(r => setTimeout(r, ms));
 
+// The ladder pick for one ticket off the cached payload (XERK-1830), and the
+// string the open panel compares to know whether the Model row moved.
+function ladderPickFor(siteKey, key, agentPin, runtimePin) {
+  return B.ladderPickOf((cache && cache.agents) || [], cache && cache.ticketModelLadder,
+    siteKey, key, { agentPin, runtimePin });
+}
+const ladderSig = (p) => (p ? `${p.model}|${p.escalatedFrom || ""}` : "");
+
 function paintDetail() {
   const s = openTicketState;
   if (!s) return;
@@ -815,6 +823,9 @@ function paintDetail() {
   const agentPin = B.agentPinOf(cache && cache.ticketAgents, s.siteKey, s.key);
   const modelPin = B.modelPinOf(cache && cache.ticketModels, s.siteKey, s.key);
   const runtimePin = B.runtimePinOf(cache && cache.ticketRuntimes, s.siteKey, s.key);
+  // The model ladder's next tier for an unpinned ticket (XERK-1830), derived from
+  // the live fleet so a session ending undelivered moves the row at once.
+  const ladderPick = ladderPickFor(s.siteKey, s.key, agentPin, runtimePin);
   // The host-OS requirement (XERK-693), off the payload's ticketPlatforms like
   // the other hub-owned pins. A subtask with no pin of its own inherits its
   // epic's; setting it on an epic constrains all its subtasks.
@@ -829,6 +840,7 @@ function paintDetail() {
   // repaint only when a pin actually moved (same story as the repoGuess `shown`).
   s.agentPinShown = agentPin ? agentPin.host : "";
   s.modelPinShown = modelPin ? modelPin.model : "";
+  s.ladderPickShown = ladderSig(ladderPick);
   s.runtimePinShown = runtimePin ? runtimePin.runtime : "";
   s.platformPinShown = platformPin ? platformPin.platform : "";
   s.platformInheritedShown = epicPlatform ? epicPlatform.platform : "";
@@ -883,6 +895,7 @@ function paintDetail() {
     // The model pin is hub-owned too (XERK-123); its options are the org's
     // probed model list off the merged site block.
     modelPin,
+    ladderPick,
     modelEditing: s.modelEditing,
     modelError: s.modelError,
     models: (site && site.models) || null,
@@ -1030,6 +1043,7 @@ function refreshOpenTicket() {
   const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
     (pin ? pin.host : "") !== (s.agentPinShown || "") ||
     (mpin ? mpin.model : "") !== (s.modelPinShown || "") ||
+    ladderSig(ladderPickFor(s.siteKey, s.key, pin, rpin)) !== (s.ladderPickShown || "") ||
     (rpin ? rpin.runtime : "") !== (s.runtimePinShown || "") ||
     (ppin ? ppin.platform : "") !== (s.platformPinShown || "") ||
     (pInherit ? pInherit.platform : "") !== (s.platformInheritedShown || "") ||
