@@ -19941,12 +19941,12 @@ TICKET_RETRY_DIRECTIVE = (
     " branch."
 )
 
-# Ticket sessions send sub-agents (QA included) to the cheap tier first
-# (XERK-1827: haiku found 4/5 seeded defects in docs/routing-qa-recall.md, and a
-# sub-agent's own context means it adds no cache gap to its parent). Claude
-# Code's CLAUDE_CODE_SUBAGENT_MODEL is the DEFAULT for an agent that names no
-# model, so a definition pinning its own still wins. Empty turns it off.
-TICKET_SUBAGENT_MODEL = os.environ.get("TURMA_TICKET_SUBAGENT_MODEL", "haiku").strip()
+# TURMA_TICKET_SUBAGENT_MODEL (e.g. "haiku") makes it the sub-agent default in
+# ticket sessions (XERK-1827), via Claude Code's CLAUDE_CODE_SUBAGENT_MODEL — the
+# default for an agent that names no model, so a definition pinning its own
+# still wins. OFF by default: it would also put QA on the cheap model, and
+# nothing yet measures what that costs in quality (XERK-1839).
+TICKET_SUBAGENT_MODEL = os.environ.get("TURMA_TICKET_SUBAGENT_MODEL", "").strip()
 if TICKET_SUBAGENT_MODEL and not SPAWN_MODEL_RE.fullmatch(TICKET_SUBAGENT_MODEL):
     TICKET_SUBAGENT_MODEL = ""
 

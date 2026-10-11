@@ -36688,19 +36688,29 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
             sm2.spawn_ticket("PROJ-7", model="haiku", escalated_from="x'; rm -rf /")
         self.assertNotIn("A previous session", self._launches()[-1][-1])
 
-    def test_a_ticket_session_sends_subagents_to_the_cheap_tier(self):
-        # XERK-1827: CLAUDE_CODE_SUBAGENT_MODEL is the default for agents that
-        # name no model; only ticket sessions get it.
+    def test_the_subagent_default_is_off_unless_configured(self):
+        # XERK-1827 follow-up: off by default (it would put QA on the cheap model
+        # with nothing measuring the cost, XERK-1839); TURMA_TICKET_SUBAGENT_MODEL
+        # turns it on for ticket sessions only.
+        self.assertEqual(ha.TICKET_SUBAGENT_MODEL, "")
         sm = self.make_ticket_manager()
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()), \
                 mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
             sm.spawn_ticket("PROJ-7")
+        self.assertNotIn("CLAUDE_CODE_SUBAGENT_MODEL", self._launches()[-1][-1])
+        sm2 = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()), \
+                mock.patch.object(ha, "TICKET_SUBAGENT_MODEL", "haiku"), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
+            sm2.spawn_ticket("PROJ-7")
         self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=haiku ", self._launches()[-1][-1])
 
     def test_subagent_model_is_never_set_off_ticket_local_or_over_the_operator(self):
         f = ha.SessionManager._ticket_subagent_model
-        with mock.patch.dict(os.environ, {}, clear=False):
+        with mock.patch.dict(os.environ, {}, clear=False), \
+                mock.patch.object(ha, "TICKET_SUBAGENT_MODEL", "haiku"):
             os.environ.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
             self.assertIsNone(f({}, False))                       # bare session
             self.assertIsNone(f({"ticket": {"key": "P-1"}}, True))  # failed over

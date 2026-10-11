@@ -173,6 +173,7 @@ const hub = require("../server.js");
 test.afterEach(() => {
   hub.__setDshEnabled(false);
   hub.__setQwenEnabled(false);
+  hub.__setTicketModelLadder([]);   // XERK-1827: off by default; ladder tests turn it on
   // Release the XERK-550 auto-merge opt-in so server.js's LIVE 15s sweep
   // interval (which runs autoMergeSweep/autoCloseSweep) idles outside the exact
   // test that set it up — otherwise a populated map keeps those sweeps churning
@@ -7682,7 +7683,7 @@ test("http: starting a ticket session queues spawnTicket on the org's host", asy
   // and is stripped before the reply — the next test asserts that.
   assert.deepEqual(agents.ts1.commands, [
     { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
-      ticketSite: "t1.atlassian.net", model: "haiku", cmdId: res.body.cmdId },
+      ticketSite: "t1.atlassian.net", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -7692,7 +7693,7 @@ test("http: the ticket spawn rides the heartbeat like any other command", async 
     { headers: userHeaders });
   const beat = await ticketBeat("ts2", "t2.atlassian.net");
   assert.deepEqual(beat.body.commands, [
-    { type: "spawnTicket", issueKey: "ENG-5", model: "haiku", cmdId: res.body.cmdId },
+    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -7812,7 +7813,7 @@ test("http: no online host has the repo -> routes anyway and clones on demand", 
   assert.equal(res.body.needsClone, true);
   assert.deepEqual(agents.ts5.commands, [
     { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
-      ticketSite: "t5.atlassian.net", model: "haiku", cmdId: res.body.cmdId },
+      ticketSite: "t5.atlassian.net", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -8084,7 +8085,18 @@ test("http: a model-pinned ticket carries the model on its spawnTicket command",
   ]);
 });
 
-test("XERK-1827: an unpinned ticket's first session starts on the ladder's bottom tier", async () => {
+test("XERK-1827: the ladder is OFF by default — an unpinned ticket carries no model", async () => {
+  await ticketBeat("tmOff", "tmOff.atlassian.net");
+  const res = await request("POST", "/api/jira/tmOff.atlassian.net/ENG-5/session",
+    { headers: userHeaders });
+  assert.deepEqual(agents.tmOff.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
+      ticketSite: "tmOff.atlassian.net", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("XERK-1827: with the ladder on, an unpinned ticket's first session starts on its bottom tier", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   await ticketBeat("tmNone", "tmNone.atlassian.net");
   const res = await request("POST", "/api/jira/tmNone.atlassian.net/ENG-5/session",
     { headers: userHeaders });
@@ -8115,6 +8127,7 @@ const ladderTicket = (site, extra = {}) =>
   ({ key: "ENG-5", siteKey: site, url: "u", summary: "s", branch: "ENG-5", ...extra });
 
 test("XERK-1827: an undelivered haiku session escalates the next start to sonnet, then opus", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad1.atlassian.net";
   await ladderBeat("lad1", site);   // bind the org first
   await ladderBeat("lad1", site, { closed: [
@@ -8136,6 +8149,7 @@ test("XERK-1827: an undelivered haiku session escalates the next start to sonnet
 });
 
 test("XERK-1827: a live error or queued record never climbs the ladder (infra is not a miss)", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad5.atlassian.net";
   await ladderBeat("lad5", site);
   await ladderBeat("lad5", site, { sessions: [
@@ -8145,6 +8159,7 @@ test("XERK-1827: a live error or queued record never climbs the ladder (infra is
 });
 
 test("XERK-1827: a host bound to another org cannot climb this org's ladder", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad6.atlassian.net";
   await ladderBeat("lad6", site);
   await ladderBeat("lad6rogue", "rival6.atlassian.net");          // bound to rival
@@ -8154,6 +8169,7 @@ test("XERK-1827: a host bound to another org cannot climb this org's ladder", as
 });
 
 test("XERK-1827: a host whose default runtime is not claude gets no ladder model", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad7.atlassian.net";
   await ladderBeat("lad7", site);
   agents.lad7.defaultRuntime = "qwen";
@@ -8163,6 +8179,7 @@ test("XERK-1827: a host whose default runtime is not claude gets no ladder model
 });
 
 test("XERK-1827: Start and the drain send a qwen-default host no ladder model", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   hub.__setQwenEnabled(true);   // reset by the suite's afterEach
   const site = "lad9.atlassian.net";
   const beat = (free) => request("POST", "/api/heartbeat", {
@@ -8191,6 +8208,7 @@ test("XERK-1827: Start and the drain send a qwen-default host no ladder model", 
 });
 
 test("XERK-1827: the queue drain carries the ladder's pick", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad8.atlassian.net";
   const full = { maxSessions: 1, running: 1, queued: 0, free: 0, rootRunning: false };
   const beat = (capacity, closed = []) => request("POST", "/api/heartbeat", {
@@ -8215,6 +8233,7 @@ test("XERK-1827: the queue drain carries the ladder's pick", async () => {
 });
 
 test("XERK-1827: a delivered, running, paused or model-less session is no failed attempt", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad2.atlassian.net";
   await ladderBeat("lad2", site);
   await ladderBeat("lad2", site, {
@@ -8235,6 +8254,7 @@ test("XERK-1827: a delivered, running, paused or model-less session is no failed
 });
 
 test("XERK-1827: the operator's model pin and a non-claude runtime pin bypass the ladder", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad3.atlassian.net";
   await ladderBeat("lad3", site);
   await ladderBeat("lad3", site, { closed: [
@@ -8246,6 +8266,7 @@ test("XERK-1827: the operator's model pin and a non-claude runtime pin bypass th
 });
 
 test("XERK-1827: a closed session's model is kept only as a plain alias", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad4.atlassian.net";
   await ladderBeat("lad4", site);
   await ladderBeat("lad4", site, { closed: [
