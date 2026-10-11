@@ -14869,6 +14869,28 @@ test("transcribePcm: {text} body, trimmed", async () => {
   restoreFetch();
 });
 
+test("transcribePcm: Whisper's non-speech output (silence -> 'you') comes back empty", async () => {
+  // XERK-1824: the STT alias serves Whisper, which answers a silent clip with "you" and
+  // noise with "Thank you." / subtitle outros; dictation must not insert those.
+  for (const junk of [" you", "Thank you.", "THANK YOU!", ".", "*sad music*", "[Music]",
+    "We'll be right back.", "Gracias por ver el video.", "ご視聴ありがとうございました。",
+    "Sous-titrage Société Radio-Canada", "Продолжение следует..."]) {
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: junk, language: "en" }) });
+    const result = await transcribePcm(Buffer.from([1]));
+    assert.deepEqual(result, { text: "", language: "en" }, junk);
+  }
+  restoreFetch();
+});
+
+test("transcribePcm: real short replies are not taken for non-speech", async () => {
+  for (const real of ["Thank you very much.", "you know", "Okay.", "Gracias.", "Merci.", "[Music] hola"]) {
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: real }) });
+    const result = await transcribePcm(Buffer.from([1]));
+    assert.deepEqual(result, { text: real }, real);
+  }
+  restoreFetch();
+});
+
 test("transcribePcm: {transcription} string fallback", async () => {
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ transcription: "  raw text  " }) });
   const result = await transcribePcm(Buffer.from([1]));
