@@ -146,7 +146,8 @@ const archiveBlobStore = createBlobStore(haConfig.fatal.length ? { ha: false } :
 // query, which happens off the beat (ingest mirror + boot/promotion hydrate). When
 // a Postgres LedgerStore lands (w2-ledger) it shares this same pool.
 const archiveIndexPool = createPgClient(haConfig.fatal.length ? { ha: false } : haConfig);
-const archiveIndexStore = createIndexStore(
+// `let` only so a TURMA_TEST suite can swap it (setArchiveIndexStore); never reassigned in production.
+let archiveIndexStore = createIndexStore(
   haConfig.fatal.length ? { ha: false } : haConfig, archiveIndexPool);
 
 // ---- HA fleet registry externalization (XERK-756, epic XERK-751) ------------
@@ -4719,8 +4720,8 @@ function setIndexMirror(store, ha) {
 // it one await that never settled kept ingest 503'd until the pod died.
 // setTimeout fires after ~1ms for a delay past 2^31-1, so clamp the env knobs below.
 const MAX_TIMER_MS = 2147483647;
-const ARCHIVE_INDEX_HYDRATE_DEADLINE_MS = Math.min(MAX_TIMER_MS,
-  positiveEnv("ARCHIVE_INDEX_HYDRATE_DEADLINE_MS", 10 * 60 * 1000));
+function timerEnv(name, fallback) { return Math.min(MAX_TIMER_MS, positiveEnv(name, fallback)); }
+const ARCHIVE_INDEX_HYDRATE_DEADLINE_MS = timerEnv("ARCHIVE_INDEX_HYDRATE_DEADLINE_MS", 10 * 60 * 1000);
 // Every method of `loader`, made a no-op once `cut()` is called.
 function cuttableLoader(loader) {
   let live = true;
@@ -4842,8 +4843,7 @@ async function hydrateArchiveIndex() {
 // ARCHIVE_HYDRATE_WATCH_MS it is still in flight it says so, naming how long ingest
 // has been gated — a hydrate that hangs somewhere new is a log line and a growing
 // `turma_archive_ingest_gated_seconds`, never days of silence.
-const ARCHIVE_HYDRATE_WATCH_MS = Math.min(MAX_TIMER_MS,
-  positiveEnv("ARCHIVE_HYDRATE_WATCH_MS", 5 * 60 * 1000));
+const ARCHIVE_HYDRATE_WATCH_MS = timerEnv("ARCHIVE_HYDRATE_WATCH_MS", 5 * 60 * 1000);
 let archiveHydrateInFlight = null;
 function hydrateArchive() {
   if (archiveHydrateInFlight) return archiveHydrateInFlight;
@@ -21885,6 +21885,13 @@ if (process.env.TURMA_TEST) {
     // The index hydrate's deadline (XERK-1282): a hung load must reject AND cut its
     // loader, or a late page lands in an index ingest has since reopened.
     withLoaderDeadline,
+    // The env clamp on those timers, and one whole hydrate run with a swappable index
+    // store: the gate must stay closed across the byte->index boundary (XERK-1523).
+    timerEnv,
+    ARCHIVE_INDEX_HYDRATE_DEADLINE_MS,
+    ARCHIVE_HYDRATE_WATCH_MS,
+    hydrateArchiveOnce,
+    setArchiveIndexStore: (s) => { archiveIndexStore = s; },
     metricsText,
     // The permission ledger's served view + its module (XERK-1563).
     permissionsView,
