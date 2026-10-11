@@ -814,7 +814,7 @@ function ladderPickFor(siteKey, key, agentPin, runtimePin) {
   return B.ladderPickOf((cache && cache.agents) || [], cache && cache.ticketModelLadder,
     siteKey, key, { agentPin, runtimePin });
 }
-const ladderSig = (p) => (p ? `${p.model}|${p.escalatedFrom || ""}` : "");
+const ladderSig = (p) => (p ? `${p.model}|${p.escalatedFrom || ""}|${(p.elsewhere || []).join(",")}` : "");
 
 function paintDetail() {
   const s = openTicketState;

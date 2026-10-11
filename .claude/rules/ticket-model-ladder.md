@@ -67,5 +67,10 @@ Evidence: `docs/routing-spike-phase2-3.md`.
   - Client-side, not a served per-ticket map: with SSE healthy the board never re-reads
     `/api/agents`, so a served map goes stale; per-agent SSE keeps the sessions it reads live.
   - No ladder served (older hub, or `off`) → the old "Default (<probed>)" row.
+  - **The row hedges when Start could land on a non-claude-default host** (XERK-1840): with no
+    agent/runtime pin, any ONLINE in-org host whose `defaultRuntime` isn't claude goes in the pick's
+    `elsewhere`, and the row reads "Auto (Haiku on Claude hosts)" naming that runtime. Routing is
+    unchanged on purpose: `findTicketHost` may pick such a host, and requiring claude hosts would
+    starve a qwen-default host of unpinned work (the per-host default, XERK-521).
 - Tests: `XERK-1827:` in `server.test.js`; `test_a_ladder_retry_*`/`test_*subagent*`/
   `test_an_ended_ticket_session_reports_its_model` in `TestSpawnTicket`; `bench/tests/test_policy.py`.

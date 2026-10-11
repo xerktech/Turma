@@ -541,7 +541,12 @@ fun modelPinOf(
     ticketModels["$siteKey/$issueKey"]?.takeIf { it.model.isNotBlank() }
 
 /** The model ladder's pick for an unpinned ticket (board.js `ladderPickOf`). */
-data class LadderPick(val model: String, val escalatedFrom: String? = null)
+data class LadderPick(
+    val model: String,
+    val escalatedFrom: String? = null,
+    /** Non-claude default runtimes an unpinned Start may route to (XERK-1840). */
+    val elsewhere: List<String> = emptyList(),
+)
 
 /**
  * The model ladder's next tier for an UNPINNED ticket (XERK-1830) — a port of
@@ -552,6 +557,9 @@ data class LadderPick(val model: String, val escalatedFrom: String? = null)
  * longer running (stopped, or a closed record that isn't a paused sleeper) with no
  * PR and no close-ticket outcome is a failed attempt on its model; the pick is one
  * tier above the highest failed one, capped. Only hosts decided into the org count.
+ * With no agent or runtime pin, [LadderPick.elsewhere] names the default runtimes of
+ * online in-org hosts that aren't claude: Start may land there and send no model
+ * (XERK-1840), so the row hedges "on Claude hosts".
  */
 fun ladderPickOf(
     agents: List<AgentInfo>,
@@ -587,7 +595,12 @@ fun ladderPickOf(
         }
     }
     val next = minOf(failed + 1, ladder.size - 1)
-    return if (failed >= 0) LadderPick(ladder[next], ladder[failed]) else LadderPick(ladder[next])
+    val elsewhere = if (runtimePin == null && (agentPin == null || agentPin.host.isBlank())) {
+        agents.filter { it.online && orgOf(it) == siteKey }
+            .map { it.defaultRuntime.ifEmpty { "claude" } }
+            .filter { it != "claude" }.distinct().sorted()
+    } else emptyList()
+    return LadderPick(ladder[next], if (failed >= 0) ladder[failed] else null, elsewhere)
 }
 
 /**
@@ -596,13 +609,17 @@ fun ladderPickOf(
  * else "Default (<probed default>)".
  */
 fun modelAutoLabel(models: BoardModels, pick: LadderPick?): String =
-    if (pick != null) "Auto (${prettyModel(pick.model)}${if (pick.escalatedFrom != null) ", retry" else ""})"
+    if (pick != null) "Auto (${prettyModel(pick.model)}" +
+        "${if (pick.elsewhere.isNotEmpty()) " on Claude hosts" else ""}" +
+        "${if (pick.escalatedFrom != null) ", retry" else ""})"
     else "Default" + (models.defaultLabel.takeIf { it.isNotBlank() }?.let { " (${prettyModel(it)})" } ?: "")
 
 /** The dim reason beside an Auto value (board.js `modelFieldHtml`). */
 fun ladderPickReason(pick: LadderPick): String =
-    pick.escalatedFrom?.let { "a ${prettyModel(it)} session ended without a PR" }
-        ?: "the model ladder's first tier"
+    (pick.escalatedFrom?.let { "a ${prettyModel(it)} session ended without a PR" }
+        ?: "the model ladder's first tier") +
+        if (pick.elsewhere.isEmpty()) ""
+        else "; a ${pick.elsewhere.joinToString(" or ") { prettyRuntime(it) }} host runs its own default"
 
 /**
  * The curated aliases the model picker offers besides "Default", filtered to what

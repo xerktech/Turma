@@ -1335,6 +1335,24 @@ test("XERK-1830: ladderPickOf is null under a non-claude runtime pin or pinned h
     { agentPin: { host: "q1" }, runtimePin: { runtime: "claude" } }), { model: "haiku" });
 });
 
+test("XERK-1840: an unpinned pick names online non-claude-default hosts it may land on", () => {
+  const agents = [ladAgent("h1", { online: true }), ladAgent("q1", { online: true, defaultRuntime: "qwen" }),
+    ladAgent("d1", { online: true, defaultRuntime: "dsh" }), ladAgent("q2", { defaultRuntime: "qwen" }),
+    ladAgent("x1", { online: true, org: "rival", defaultRuntime: "dsh" })];
+  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5"), { model: "haiku", elsewhere: ["dsh", "qwen"] });
+  // Offline or other-org non-claude hosts can't take Start: no hedge.
+  assert.deepEqual(ladderPickOf([agents[0], agents[3], agents[4]], LADDER, "acme", "ENG-5"), { model: "haiku" });
+  // A pin decides the host's runtime, so it never hedges.
+  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5", { agentPin: { host: "h1" } }), { model: "haiku" });
+  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5", { runtimePin: { runtime: "claude" } }), { model: "haiku" });
+  const models = { available: ["haiku"] };
+  const row = modelFieldHtml(null, models, { ladderPick: { model: "haiku", elsewhere: ["dsh", "qwen"] } });
+  assert.ok(row.includes("Auto (Haiku on Claude hosts) — the model ladder's first tier; "
+    + "a dsh (DeepSeek Harness) or Qwen Code host runs its own default"), row);
+  const pick = modelPickerHtml(null, models, { model: "sonnet", escalatedFrom: "haiku", elsewhere: ["qwen"] });
+  assert.ok(/<option value="__default__" selected>Auto \(Sonnet on Claude hosts, retry\)</.test(pick));
+});
+
 test("XERK-1830: an unpinned Model row and picker name the ladder's tier as Auto", () => {
   const models = { available: ["opus", "sonnet", "haiku"], defaultLabel: "Sonnet 5" };
   const first = modelFieldHtml(null, models, { editable: true, ladderPick: { model: "haiku" } });
@@ -3550,4 +3568,10 @@ test("board.html keys the open epic panel's repaint on epicPanelSig at BOTH site
   assert.match(html, /s\.epicRunShown = B\.epicPanelSig\(epicRun \|\| epicPreview, !!epicRun\)/);
   assert.match(html, /epicSig = B\.epicPanelSig\([^]*?, !!run\);/);
   assert.doesNotMatch(html, /B\.epicRunSig\(/, "epicRunSig alone collides armed vs preview");
+});
+
+test("XERK-1840: board.html repaints the open Model row when the hedge's runtimes change", () => {
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "../public/board.html"), "utf8");
+  const m = html.match(/const ladderSig = \(p\) => ([^\n]*)/);
+  assert.ok(m && /p\.elsewhere/.test(m[1]), "ladderSig must key on elsewhere or a qwen host going online never repaints");
 });
