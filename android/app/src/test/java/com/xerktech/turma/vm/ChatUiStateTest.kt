@@ -200,4 +200,19 @@ class ChatUiStateTest {
         assertEquals("Pick one", both.question)
         assertNull(both.panePrompt)
     }
+
+    @Test
+    fun `a new dialog with the same text but a new id shows at once`() {
+        // XERK-1831's digest tells two identical-looking dialogs apart, so the
+        // guard keys on it — the same command asked twice is still two dialogs.
+        fun withId(id: String) = dialog("Bash command\n  ls").let {
+            it.copy(session = it.session!!.copy(panePrompt = it.session!!.panePrompt!!.copy(id = id)))
+        }
+        val first = withId("a".repeat(32))
+        val answered = ChatUiState(session = first)
+            .copy(answeredPanePrompt = panePromptKey(first.session!!.panePrompt!!), answeredPanePromptAt = 1_000)
+        assertNull(answered.fromFleet(null, first, host = "h1", now = 2_000).panePrompt)
+        val again = answered.fromFleet(null, withId("b".repeat(32)), host = "h1", now = 2_000)
+        assertEquals("b".repeat(32), again.panePrompt?.id)
+    }
 }
