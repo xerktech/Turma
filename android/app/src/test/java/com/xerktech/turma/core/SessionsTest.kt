@@ -268,10 +268,13 @@ class SessionsTest {
         // "for Nm" on every surface (operator review); the age's "·" never ends a line.
         assertEquals("PR open · CI passing\u00A0·\u00A0for\u00A012m",
             attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
-        // A stall says it stalled.
-        assertEquals("Ship it?\u00A0·\u00A0for\u00A03m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
-        assertEquals("Bash: rm -rf build\u00A0·\u00A0for\u00A03m",
+        // A question/permission/stall names its why in the state line: the time only.
+        assertEquals("for\u00A03m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
+        assertEquals("for\u00A03m",
             attentionWhy(att("needs-you:permission", now - 3 * 60_000L, "Bash: rm -rf build"), now))
+        assertEquals("needs a test\u00A0·\u00A0for\u00A03m",
+            attentionWhy(att("needs-you:test", now - 3 * 60_000L, "needs a test"), now))
+        // A stall says it stalled.
         assertEquals("stalled\u00A03m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
         assertEquals("", attentionWhy(att("working", now), now))
         assertEquals("", attentionWhy(null, now))
@@ -578,5 +581,47 @@ class SessionsTest {
             agent("peer", decidedOrg = ""),
         )
         assertEquals(emptyList<String>(), eligibleMoveTargets(agents, "src", sess).map { it.key })
+    }
+
+    // ---- the Sessions card's state line (web sessions.html liveState/reviewState) ----
+
+    private fun card(s: SessionInfo, review: Boolean = false, seen: Long = now) =
+        com.xerktech.turma.ui.sessionCardState(s, seen, now, review)
+
+    @Test fun `sessionCardState reads the web card's state line`() {
+        fun st(label: String, tone: com.xerktech.turma.ui.CardTone) = com.xerktech.turma.ui.CardState(label, tone)
+        val T = com.xerktech.turma.ui.CardTone.WORKING
+        assertEquals(st("working", T), card(SessionInfo(status = "running",
+            session = LiveSignals(paneBusy = true, transcriptAgeSec = 1.0))))
+        assertEquals(st("idle", com.xerktech.turma.ui.CardTone.IDLE), card(quiet().copy(
+            session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0))))
+        assertEquals(st("no transcript yet", com.xerktech.turma.ui.CardTone.IDLE), card(quiet()))
+        assertEquals(st("waiting for your answer", com.xerktech.turma.ui.CardTone.WAITING), card(SessionInfo(
+            status = "running", session = LiveSignals(question = "Ship it?", transcriptAgeSec = 1.0))))
+        assertEquals(st("waiting for your permission", com.xerktech.turma.ui.CardTone.WAITING), card(SessionInfo(
+            status = "running", attention = att("needs-you:permission", now, "Bash: ls"),
+            session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0))))
+        assertEquals(st("⏳ waiting · Watch CI", com.xerktech.turma.ui.CardTone.HOLDING),
+            card(waitingOn(shell("wait-external", "Watch CI"))))
+        // A stalled wait names what it stalled on, in the danger tone, with no age.
+        assertEquals(st("stalled · Watch CI", com.xerktech.turma.ui.CardTone.STALLED),
+            card(waitingOn(shell("wait-external", "Watch CI"), ageSec = 46 * 60.0)))
+    }
+
+    @Test fun `sessionCardState under Ready for review says why it qualified`() {
+        val R = com.xerktech.turma.ui.CardTone.REVIEW
+        val done = SessionInfo(status = "running", session = LiveSignals(paneBusy = false, transcriptAgeSec = 1.0, lastRole = "assistant"))
+        assertEquals(com.xerktech.turma.ui.CardState("finished · awaiting review", R), card(done, review = true))
+        assertEquals(com.xerktech.turma.ui.CardState("PR awaiting review", R),
+            card(done.copy(prs = listOf(pr("OPEN"))), review = true))
+        assertEquals(com.xerktech.turma.ui.CardState("awaiting your test", R),
+            card(done.copy(attention = att("needs-you:test", now)), review = true))
+        // The hub's stall speaks over idle, and over a LOOPING session's working.
+        assertEquals(com.xerktech.turma.ui.CardState("stalled · repeating Bash ×4", com.xerktech.turma.ui.CardTone.STALLED),
+            card(done.copy(attention = att("needs-you:stalled", now, "repeating Bash ×4"),
+                session = LiveSignals(paneBusy = true, transcriptAgeSec = 1.0)), review = true))
+        // A waiting card keeps its own stronger line.
+        assertEquals("waiting for your answer",
+            card(done.copy(session = LiveSignals(question = "Q?", transcriptAgeSec = 1.0)), review = true).label)
     }
 }

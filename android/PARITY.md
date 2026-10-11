@@ -325,11 +325,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     `sessionWait` — `LiveState.HOLDING` (Active, never Ready for review, "⏳ waiting · Sleep · 12m left" /
     "⏳ waiting · Watch CI"; a session-CLI sleeper "💤 sleeping until 14:05", XERK-1571) until
     stalled, then IDLE. The chat bar reads "Waiting…" and a wait row "waiting".
-  - **Gap:** the Fleet card labels an IDLE session from the hub's served attention
-    (`attentionLabel` → "stalled · Watch CI", in the error colour) as the web does, but the
-    Sessions-screen card has no state label, so a stalled session there shows only its
-    danger dot and the review card's why line ("Watch CI · stalled 31m"). The HOLDING dot is a
-    dimmed working colour, not the hollow ring.
+  - The Sessions-screen card carries the web's state line (`sessionCardState` in
+    `ui/CommonUi.kt`, web `liveState` + `reviewState`): "stalled · Watch CI" in the error
+    colour, "PR awaiting review", "waiting for your permission", "· terminal offline", plus the
+    quoted question and the permission ask. **Gap:** the HOLDING dot is a dimmed working colour,
+    not the hollow ring; the `🏠 local` mark on the web card's state row is not shown.
 
 ## Done (XERK-78 installment — the P0 sweep)
 
@@ -889,11 +889,9 @@ those are marked `[MODEL]`.
   `setSummary`/`SummaryRequest`.
 - P1 Sidebar sections: Ready for review / Active / Idle split done (XERK-73 + XERK-224,
   `rankRunning` → `LiveGroups`); the dedicated Queued section done (XERK-78; the old Stopped group
-  folded into Ended). Still open: a state line + question preview on each live card (the dashboard card
-  has both; the sessions-list card shows only the dot). Because there is no state line, a
-  Ready-for-review card carries the accent dot where the web card also spells out *why* it qualified
-  ("PR awaiting review" / "finished · awaiting review" / "awaiting your test"); its why and verdict
-  lines still tell a test apart from a plain review.
+  folded into Ended). Each live card now carries the web's state line + question/ask preview, and
+  a Ready-for-review card spells out why it qualified ("PR awaiting review" / "finished · awaiting
+  review" / "awaiting your test").
 - ~~P1 SendUserFile inline previews (XERK-221).~~ **Done**: the app now has an image pipeline (Coil +
   `SvgDecoder`, wired via `TurmaApplication : ImageLoaderFactory`). `SendFile`/`files[]`/`caption` are on
   `ToolUseBlock` (decoded) → `ChatItem.Tool` (`ChatItemsTest`), and `TranscriptView` renders each file:

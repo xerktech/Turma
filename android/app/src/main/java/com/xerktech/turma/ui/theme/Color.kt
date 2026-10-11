@@ -32,6 +32,8 @@ val Muted = Color(0xFF898781)
 // ---- semantic (shared across both themes — the web never redefines these) --
 val Good = Color(0xFF12A312)
 val Warning = Color(0xFFFAB219)
+// Amber as text on a light surface (web --warning-text, light).
+val WarningTextLight = Color(0xFF8A5A00)
 val Critical = Color(0xFFD03B3B)
 // A mid purple that reads on both surfaces (web --s5 is #4a3aa7 / #9085e9).
 val Purple = Color(0xFF7D6FE0)

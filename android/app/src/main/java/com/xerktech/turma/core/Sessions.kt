@@ -244,17 +244,17 @@ fun <T> sortedBySince(rows: List<T>, attention: (T) -> Attention?): List<T> =
     rows.sortedWith(compareBy<T, Long?>(nullsLast<Long>()) { attention(it)?.since })
 
 /**
- * A review card's second line (XERK-1571, web sessions.html `attentionWhy`): WHY
- * the session is the operator's and how long it has waited. Unlike the web card,
- * the phone card carries no state label or quoted question, so the why is kept for
- * every needs-you state (the question text, the wait, the PR). The time reads
+ * A review card's why line (XERK-1571, web sessions.html `attentionWhy`): WHY
+ * the session is the operator's and how long it has waited. A question card
+ * already quotes its question, a permission card names its ask and a stalled one
+ * names its wait in the state line, so for those only the time shows. The time reads
  * "stalled 31m" on a stall, else "for 22m" (the wording every surface uses). The
  * age is glued to its word, and its "·" to both sides, by no-break spaces, so a
  * line never ends on a dangling "·". "" when the hub serves none.
  */
 fun attentionWhy(att: Attention?, now: Long): String {
     if (att == null || needsYouChip(att.state) == null) return ""
-    val why = att.why?.takeIf { it.isNotBlank() }.orEmpty()
+    val why = att.why?.takeIf { it.isNotBlank() && (att.state == "needs-you:review" || att.state == "needs-you:test") }.orEmpty()
     val age = att.since?.let {
         val word = if (att.state == "needs-you:stalled") "stalled" else "for"
         "$word\u00A0${waitLeftText(now - it)}"
