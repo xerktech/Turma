@@ -214,19 +214,35 @@ class LeaderElector {
     }
   }
 
-  // Set/clear leadership, firing onChange only on a real edge. Re-acquiring after our
-  // own leadership had self-expired (isLeader() went false with `_leader` still set: a
-  // stalled loop) IS an edge: another replica may have led — and released — meanwhile,
-  // so the promotion work (registry re-sync, hydrates, the archive repair's leader
-  // term, XERK-1450) must re-run. Emit the demote/promote pair that lapse never fired.
-  _setLeader(next) {
-    const lapsed = next && this._leader && Date.now() - this._lastRenew > this.leaseSeconds * 1000;
-    if (next) this._lastRenew = Date.now();
-    if (lapsed) {
-      this._log(`leader: re-acquired lease ${this.leaseName} as ${this.identity} after it lapsed`);
-      this._emit(false);
-      this._emit(true);
-      return;
+  // Set/clear leadership, firing onChange only on a real edge. `renewedAt` is the
+  // tick's `now` — the renewTime the PUT/POST wrote — NOT Date.now() after the write
+  // returns: a slow PUT would otherwise extend our self-expiry past the expiry a
+  // standby reads off that renewTime (XERK-1835).
+  _setLeader(next, renewedAt = Date.now()) {
+    if (next) {
+      // A late response to an OLDER renew must not move the stamp backwards past a newer one.
+      const stamp = Math.max(this._lastRenew, renewedAt);
+      // Refuse (never hold) when the newest confirmed stamp already lapsed for standbys, when
+      // closed (release()), or when we cannot lead (abstain): an in-flight renew can return
+      // after any of those and must not re-arm `_leader`.
+      if (Date.now() - stamp > this.leaseSeconds * 1000 || this._closed ||
+          (this._canLead && !this._canLead())) {
+        next = false;
+      } else {
+        // Re-acquiring after our own leadership had self-expired (isLeader() went false with
+        // `_leader` still set: a stalled loop) IS an edge: another replica may have led — and
+        // released — meanwhile, so the promotion work (registry re-sync, hydrates, the archive
+        // repair's leader term, XERK-1450) must re-run. Emit the demote/promote pair that
+        // lapse never fired.
+        const lapsed = this._leader && Date.now() - this._lastRenew > this.leaseSeconds * 1000;
+        this._lastRenew = stamp;
+        if (lapsed) {
+          this._log(`leader: re-acquired lease ${this.leaseName} as ${this.identity} after it lapsed`);
+          this._emit(false);
+          this._emit(true);
+          return;
+        }
+      }
     }
     if (next === this._leader) return;
     this._leader = next;
@@ -361,7 +377,7 @@ class LeaderElector {
     }
 
     if (observed === null) {
-      this._setLeader(await this._create(now));
+      this._setLeader(await this._create(now), now);
       return;
     }
 
@@ -375,13 +391,13 @@ class LeaderElector {
     if (held) {
       // We are (or were) the holder — renew. A failed renew keeps leadership only
       // within the renew deadline.
-      if (await this._put(observed, now)) this._setLeader(true);
+      if (await this._put(observed, now)) this._setLeader(true, now);
       else this._maybeExpire();
       return;
     }
     if (expired) {
       // The lease is up for grabs — acquire it.
-      this._setLeader(await this._put(observed, now));
+      this._setLeader(await this._put(observed, now), now);
       return;
     }
     // A different replica holds a valid lease: we are a follower.
