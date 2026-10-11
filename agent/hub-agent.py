@@ -28744,7 +28744,7 @@ class SessionManager:
         _pane_send_keys(sess["tmuxName"], "Escape")
         log(f"interrupted session {sid}")
 
-    def answer_pane_prompt(self, sid, number):
+    def answer_pane_prompt(self, sid, number, seen_prompt=None, seen_detail=None):
         """Answer the blocking choice dialog a session's TUI is showing (a tool
         permission request or a plan approval — see parse_pane_prompt) by typing
         its option digit, exactly the key an operator at the live terminal would
@@ -28756,7 +28756,17 @@ class SessionManager:
         heartbeat a click was made against is up to a beat stale, and by the
         time it lands the dialog may be gone — typing a bare digit into a live
         composer would silently prepend a stray character to the operator's next
-        message. So a stale answer is dropped rather than sent."""
+        message. So a stale answer is dropped rather than sent.
+
+        The number alone is not the dialog (XERK-1831): every permission dialog
+        offers "1. Yes", so dialog A's answer would approve a dialog B that
+        replaced it before delivery (answered in the terminal, or the next of
+        parallel tool calls). The hub stamps the answer with the `prompt` +
+        `detail` the operator was shown (`seen_prompt`/`seen_detail`) — this
+        same parser's served output, so the caps agree — and a dialog whose
+        face differs is dropped. A pane re-wrapped by a resize differs too and
+        is dropped: the operator answers again, never the wrong dialog. No
+        stamp (an older hub) keeps the number check alone."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
@@ -28770,6 +28780,12 @@ class SessionManager:
             return
         if not any(o["number"] == number for o in prompt["options"]):
             log(f"pane-prompt answer {number} for {sid} dropped: not an option")
+            return
+        seen_detail = seen_detail if isinstance(seen_detail, str) else ""
+        if isinstance(seen_prompt, str) and (
+                prompt["prompt"] != seen_prompt
+                or (prompt.get("detail") or "") != seen_detail):
+            log(f"pane-prompt answer {number} for {sid} dropped: a different dialog is on screen")
             return
         _pane_send_keys(sess["tmuxName"], str(number))
         # Qwen's approval picker requires the digit AND Enter to submit (G0
@@ -37615,7 +37631,8 @@ class SessionManager:
                     )
                 elif ctype == "answerPanePrompt":
                     self.answer_pane_prompt(
-                        cmd.get("sessionId"), cmd.get("optionNumber"))
+                        cmd.get("sessionId"), cmd.get("optionNumber"),
+                        cmd.get("prompt"), cmd.get("detail"))
                 elif ctype == "renderBrief":
                     # The org brief's summary (XERK-1574): only STAGED here —
                     # the `claude -p` runs on its own worker, never the beat.

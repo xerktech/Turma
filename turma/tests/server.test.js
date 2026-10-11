@@ -5839,6 +5839,50 @@ test("http: pane-prompt endpoint queues answerPanePrompt with the displayed numb
   ]);
 });
 
+test("XERK-1831: pane-prompt stamps the answer with the dialog the client rendered", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "pp3" }, headers: agentHeaders });
+  const res = await request("POST", "/api/agents/pp3/sessions/sess1/pane-prompt", {
+    body: { optionNumber: 1, prompt: "Do you want to proceed?", detail: "Bash command\nls" },
+    headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp3" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerPanePrompt", sessionId: "sess1", optionNumber: 1,
+      prompt: "Do you want to proceed?", detail: "Bash command\nls", cmdId: res.body.cmdId },
+  ]);
+});
+
+test("XERK-1831: pane-prompt falls back to the session's served dialog", async () => {
+  const pp = { prompt: "Do you want to proceed?", detail: "Bash command\nrm -rf build/",
+    options: [{ number: 1, label: "Yes", selected: true }, { number: 2, label: "No", selected: false }] };
+  await request("POST", "/api/heartbeat", {
+    body: { device: "pp4", sessions: [{ id: "sess1", status: "running", session: { panePrompt: pp } }] },
+    headers: agentHeaders,
+  });
+  const res = await request("POST", "/api/agents/pp4/sessions/sess1/pane-prompt", {
+    body: { optionNumber: 1 }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp4" }, headers: agentHeaders });
+  const cmd = beat.body.commands.find((c) => c.type === "answerPanePrompt");
+  assert.equal(cmd.prompt, pp.prompt);
+  assert.equal(cmd.detail, pp.detail);
+});
+
+test("XERK-1831: pane-prompt refuses a malformed dialog identity", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "pp5" }, headers: agentHeaders });
+  for (const extra of [{ prompt: 7 }, { prompt: "" }, { prompt: "x".repeat(301) },
+    { prompt: "ok?", detail: 3 }, { prompt: "ok?", detail: "d".repeat(801) }, { detail: "only" }]) {
+    const res = await request("POST", "/api/agents/pp5/sessions/sess1/pane-prompt", {
+      body: { optionNumber: 1, ...extra }, headers: userHeaders,
+    });
+    assert.equal(res.status, 400, JSON.stringify(extra).slice(0, 60));
+  }
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp5" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, []);
+});
+
 test("http: pane-prompt endpoint rejects a number no dialog key could carry", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "pp2" }, headers: agentHeaders });
   // The answer is delivered by typing the digit, so 0, 10+ and non-integers

@@ -3238,7 +3238,7 @@
         box.hidden = false;
         box.innerHTML = panePromptHtml(p);
         box.querySelectorAll(".q-opt-pick").forEach((b) => b.addEventListener("click", () =>
-          answerPanePrompt(parseInt(b.getAttribute("data-num"), 10), p.prompt)));
+          answerPanePrompt(parseInt(b.getAttribute("data-num"), 10), p)));
         return;
       }
     } else {
@@ -3298,19 +3298,21 @@
   // Answer the TUI's blocking dialog by its option number — the agent re-reads
   // the pane and drops the answer if the dialog has moved on (see
   // answer_pane_prompt), so a click made against a stale beat can't type a
-  // stray digit into a live composer.
-  async function answerPanePrompt(optionNumber, prompt) {
+  // stray digit into a live composer. The POST names the dialog this click
+  // answered (prompt + detail), so the agent never applies it to a different
+  // dialog that replaced this one before delivery (XERK-1831).
+  async function answerPanePrompt(optionNumber, p) {
     if (!hostKey || !sessionId || !Number.isInteger(optionNumber)) return;
     // Hide on click like the question box: the agent's next beat is a moment
     // away, and leaving the dialog up reads as if the click didn't register.
-    answeredPanePrompt = prompt || null;
+    answeredPanePrompt = (p && p.prompt) || null;
     panePromptActive = false;
     const box = $("chatQuestion"); if (box) { box.hidden = true; box.innerHTML = ""; }
     updateComposeAction();
     try {
       const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/pane-prompt", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ optionNumber }),
+        body: JSON.stringify({ optionNumber, prompt: p && p.prompt, detail: (p && p.detail) || "" }),
       });
       if (!r.ok) { await hubRefused("Answer", r); throw new Error(String(r.status)); }
     } catch {

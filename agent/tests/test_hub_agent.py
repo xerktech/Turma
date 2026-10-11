@@ -16398,6 +16398,63 @@ class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
         self._answer(sm, 4)          # the permission dialog offers 1-3
         self.assertEqual(self.run_calls, [])
 
+    # XERK-1831: the option NUMBER existing is not enough — "1. Yes" exists on
+    # every permission dialog, so an answer made against dialog A must never
+    # approve a different dialog B that replaced it before delivery.
+    def _answer_stamped(self, sm, number, prompt, detail, cap=PANE_PERMISSION_DIALOG):
+        with mock.patch.object(ha, "_capture_pane", return_value=cap):
+            sm.answer_pane_prompt("abcde", number, prompt, detail)
+
+    def test_an_answer_stamped_with_the_dialog_on_screen_is_typed(self):
+        sm = self.make_manager()
+        self._session(sm)
+        shown = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
+        self._answer_stamped(sm, 1, shown["prompt"], shown["detail"])
+        self.assertEqual(
+            self.run_calls, [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "1"]])
+
+    def test_an_answer_for_a_different_dialog_is_dropped(self):
+        # The operator answered "Bash: ls"; by delivery the pane shows a
+        # different command under the same "Do you want to proceed?" question.
+        sm = self.make_manager()
+        self._session(sm)
+        answered = ha.parse_pane_prompt(
+            PANE_PERMISSION_DIALOG.replace("touch /tmp/permtest-marker", "ls"))
+        self._answer_stamped(sm, 1, answered["prompt"], answered["detail"])
+        self.assertEqual(self.run_calls, [])
+
+    def test_an_answer_for_a_different_question_is_dropped(self):
+        sm = self.make_manager()
+        self._session(sm)
+        shown = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
+        self._answer_stamped(sm, 1, "Would you like to proceed?", shown["detail"])
+        self.assertEqual(self.run_calls, [])
+
+    def test_a_stamped_answer_with_no_detail_does_not_match_one_with_detail(self):
+        sm = self.make_manager()
+        self._session(sm)
+        shown = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
+        self._answer_stamped(sm, 1, shown["prompt"], None)
+        self.assertEqual(self.run_calls, [])
+
+    def test_an_unstamped_answer_keeps_the_number_check(self):
+        # An older hub sends no dialog identity: the agent still answers on the
+        # number alone rather than refusing every answer it relays.
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, 1)
+        self.assertEqual(
+            self.run_calls, [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "1"]])
+
+    def test_handle_commands_forwards_the_stamp(self):
+        sm = self.make_manager()
+        self._session(sm)
+        with mock.patch.object(sm, "answer_pane_prompt") as answer:
+            sm.handle_commands([{"type": "answerPanePrompt", "cmdId": "c1",
+                                 "sessionId": "abcde", "optionNumber": 1,
+                                 "prompt": "Do you want to proceed?", "detail": "Bash: ls"}])
+        answer.assert_called_once_with("abcde", 1, "Do you want to proceed?", "Bash: ls")
+
     def test_noop_for_stopped_or_unknown_session(self):
         sm = self.make_manager()
         self._session(sm, status="stopped")
