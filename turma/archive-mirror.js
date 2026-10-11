@@ -71,9 +71,10 @@ const HYDRATE_CONCURRENCY = 8;
 const GET_DEADLINE_MS = 5 * 60 * 1000;
 // A retryBlocked GET that hit its deadline gets twice as long next time, up to
 // this. With one flat cap a legitimately slow object (slower than ~55 KB/s for
-// 16 MiB) timed out on every retry and its transcript stayed blocked forever. The
-// ceiling keeps one hung key from holding the serial retry pass for hours; a
-// waiting hydrate never waits on it (`_yieldWake`).
+// 16 MiB) timed out on every retry and its transcript stayed blocked forever. A
+// retry pass tries keys shortest-deadline first, so a newly blocked key never
+// queues behind hung keys' escalated deadlines; a waiting hydrate never waits on
+// one either (`_yieldWake`).
 const RETRY_GET_DEADLINE_MAX_MS = 60 * 60 * 1000;
 const YIELDED = Symbol("yielded");
 const TIMED_OUT = Symbol("timedOut");
@@ -473,15 +474,18 @@ class ArchiveMirror {
     // A hydrate that starts waiting abandons the in-flight GET (its key stays
     // blocked) rather than waiting out a deadline that may have escalated.
     const yielded = new Promise((res) => { this._yieldWake = () => res(YIELDED); });
+    const deadlineOf = (k) => this._getDeadline.get(k) || getDeadlineMs;
+    // Shortest deadline first (stable): a fresh key never waits out hung ones.
+    const keys = [...this._blocked.keys()].sort((a, b) => deadlineOf(a) - deadlineOf(b));
     const run = (async () => {
-      for (const key of [...this._blocked.keys()]) {
+      for (const key of keys) {
         if (this._yieldRetry) break; // the rest wait for the next pass
         const dest = this.pathFor(key);
         if (!dest) { done.push(key); continue; }
         // A GET past its deadline leaves the key blocked; if it lands later it is
         // discarded, never renamed in after the pass (and its reconcile) moved on.
         let abandoned = false;
-        const deadline = this._getDeadline.get(key) || getDeadlineMs;
+        const deadline = deadlineOf(key);
         try {
           const r = await raceDeadline(Promise.race([
             this._download(key, dest, () => !abandoned && this._blocked.has(key)), yielded]), deadline);

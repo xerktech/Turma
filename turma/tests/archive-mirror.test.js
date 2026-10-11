@@ -1074,6 +1074,44 @@ test("a waiting hydrate cuts a retry GET short instead of waiting out its deadli
   assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
 });
 
+test("a newly blocked key is retried before hung keys with escalated deadlines (XERK-1833 QA D3)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const gets = [];
+  const store = { list: async () => [], stat: async () => null,
+    getToFile: (k, dest) => {
+      gets.push(k);
+      if (k === "repo/hung.jsonl") return new Promise(() => {});
+      fs.writeFileSync(dest, "ok");
+      return Promise.resolve(true);
+    } };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m._blocked.set("repo/hung.jsonl", "x");
+  await m.retryBlocked({ getDeadlineMs: 10 }); // hung escalates to 20ms
+  m._blocked.set("repo/fresh.jsonl", "x");
+  gets.length = 0;
+  await m.retryBlocked({ getDeadlineMs: 10 });
+  assert.deepEqual(gets, ["repo/fresh.jsonl", "repo/hung.jsonl"]);
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "fresh.jsonl")), false);
+});
+
+test("a retry GET cut by a hydrate never lands, even while its key stays blocked (XERK-1833 QA)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const held = [];
+  // Every GET hangs until released; the hydrate's own GET times out too.
+  const store = { list: async () => ["repo/a.jsonl"], stat: async () => ({ size: 2 }),
+    getToFile: (k, dest) => new Promise((r) => held.push(() => { fs.writeFileSync(dest, "ab"); r(true); })) };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m._blocked.set("repo/a.jsonl", "x");
+  const retry = m.retryBlocked({ getDeadlineMs: 60 * 1000 });
+  await new Promise((r) => setImmediate(r));
+  await m.hydrate({ getDeadlineMs: 20 });
+  assert.equal(await retry, 0);
+  assert.equal(m.blockedCount(), 1);
+  held[0](); // the cut retry GET lands late: discarded although the key is blocked
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
+});
+
 test("an abandoned pass that wakes during the backoff writes nothing (XERK-1282)", async () => {
   const root = mkdtemp("turma-mir-");
   let hang = true;

@@ -133,6 +133,7 @@ of-record**, so both halves of the ADR split now hold:
     It must clear a 16 MiB object on a slow link and stay under the pass stall deadline.
   - **A retry GET that times out gets double the deadline next time** (`_getDeadline`, capped at
     `RETRY_GET_DEADLINE_MAX_MS`, 1h): with one flat cap a legitimately slow object never landed.
+    A pass tries keys shortest-deadline first, so a fresh key never queues behind hung ones.
   - **A waiting hydrate CUTS the retry's in-flight GET short** (`_yieldWake`; key stays blocked) —
     with escalated deadlines, waiting it out would hold the gate closed for up to an hour.
   - A hydrate waits on an in-flight `retryBlocked` pass, so that pass is bounded too: each GET by
