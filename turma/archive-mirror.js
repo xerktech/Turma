@@ -45,13 +45,20 @@ const path = require("path");
 // before answering "still syncing" (the fetches carry on). XERK-1043.
 const RAW_FETCH_CONCURRENCY = 4;
 const RAW_ROUTE_WAIT_MS = 10 * 1000;
-// The longest ONE hydrate pass may run before hydrateUntilListed abandons it and
-// starts another (XERK-1282). A pass awaits a listing and one GET per missing
-// rendered file; any of those that never settles (a request queued for a socket
-// it never gets, before its own idle timeout is armed) otherwise held the ingest
-// gate closed for days. Generous: a slow first fill that hits it loses nothing —
-// what it downloaded stays on disk and the next pass fetches only the rest.
+// The longest ONE hydrate pass may go WITHOUT PROGRESS (no store request settling)
+// before hydrateUntilListed abandons it and starts another (XERK-1282). A pass
+// awaits a listing and one GET per missing rendered file; any of those that never
+// settles (a request queued for a socket it never gets, before its own idle
+// timeout is armed) otherwise held the ingest gate closed for days. A stall bound,
+// never a wall-clock one: a fresh pod fetches the WHOLE rendered layer (~11k
+// objects in prod), and a pass that was progressing still hit a 15-minute
+// wall-clock cap and was abandoned, keeping ingest 503'd 20+ minutes (XERK-1829).
 const HYDRATE_PASS_DEADLINE_MS = 15 * 60 * 1000;
+// Rendered GETs one hydrate pass runs at once. Fetched one at a time, a fresh pod
+// spent 20+ minutes on per-request latency alone (~4 GETs/s against the prod
+// store); 8 in flight measured 2-17x faster there (XERK-1829). Each streams to its
+// own temp file, so this bounds sockets and fds, not memory.
+const HYDRATE_CONCURRENCY = 8;
 // The longest one retryBlocked GET may run before that key is left blocked for the
 // next pass. A hydrate waits on an in-flight retry pass (they must not overlap), so
 // a retry GET that never settled made every bounded hydrate pass abandon and retry
@@ -302,25 +309,36 @@ class ArchiveMirror {
       // Postgres still counts its bytes, archive.js blocks the transcript itself
       // (its local .jsonl is absent), so nothing is lost by forgetting it here.
       for (const k of [...this._blocked.keys()]) if (!listed.has(k)) this._blocked.delete(k);
-      for (const { key, dest } of downloads) {
-        try {
-          // Through a temp file too: a GET cut mid-body left a PARTIAL rendered
-          // file at its real path, which ingest would then append to and the
-          // drain PUT over the complete object (XERK-1043 QA, pass 2). A 404
-          // (deleted since the listing) returns false: gone, as above.
-          // An abandoned pass's late GET is discarded, never renamed over a file
-          // a newer pass (and the ingest it reopened) has since written.
-          if (await this._download(key, dest, () => !stale())) fetched++;
-          if (stale()) return fetched;
-          this._blocked.delete(key);
-        } catch (e) {
-          if (stale()) return fetched;
-          // ABSENT (or short) locally while Postgres holds its full cursor:
-          // ingest onto it would write a tail-only file the drain PUTs over the
-          // complete object. Blocked until retryBlocked lands it (XERK-1050).
-          this._blocked.set(key, `${key} (${e && e.message})`);
+      this._progress();
+      // HYDRATE_CONCURRENCY workers drain one queue. Every key is its own file
+      // and the gate is closed, so their order does not matter.
+      let next = 0;
+      const worker = async () => {
+        while (next < downloads.length && !stale()) {
+          const { key, dest } = downloads[next++];
+          try {
+            // Through a temp file too: a GET cut mid-body left a PARTIAL rendered
+            // file at its real path, which ingest would then append to and the
+            // drain PUT over the complete object (XERK-1043 QA, pass 2). A 404
+            // (deleted since the listing) returns false: gone, as above.
+            // An abandoned pass's late GET is discarded, never renamed over a file
+            // a newer pass (and the ingest it reopened) has since written.
+            if (await this._download(key, dest, () => !stale())) fetched++;
+            if (stale()) return;
+            this._blocked.delete(key);
+          } catch (e) {
+            if (stale()) return;
+            // ABSENT (or short) locally while Postgres holds its full cursor:
+            // ingest onto it would write a tail-only file the drain PUTs over the
+            // complete object. Blocked until retryBlocked lands it (XERK-1050).
+            this._blocked.set(key, `${key} (${e && e.message})`);
+          }
+          this._progress();
         }
-      }
+      };
+      await Promise.all(Array.from(
+        { length: Math.min(HYDRATE_CONCURRENCY, downloads.length) }, worker));
+      if (stale()) return fetched;
       this.hydrated = true;
       this.lastFailure = this._blockedSummary();
       // Reindex whatever landed, so search + cursors reflect the hydrated store.
@@ -334,17 +352,34 @@ class ArchiveMirror {
     return fetched;
   }
 
-  // One hydrate(), bounded by `deadlineMs`. A pass still running at the deadline is
-  // ABANDONED — its later awaits return without writing — and reported as an
-  // incomplete hydrate, so hydrateUntilListed logs it and retries with ingest still
-  // gated (XERK-1048: never open over a tree that was not fully classified).
+  // A hydrate pass made progress: a store request settled.
+  _progress() { this._progressAt = Date.now(); }
+
+  // One hydrate(), abandoned once `deadlineMs` passes with NO progress (no store
+  // request settling). An abandoned pass's later awaits return without writing, and
+  // it is reported as an incomplete hydrate, so hydrateUntilListed logs it and
+  // retries with ingest still gated (XERK-1048: never open over a tree that was not
+  // fully classified). A slow pass that keeps landing files runs to completion.
   async _boundedHydrate(deadlineMs) {
-    const r = await raceDeadline(this.hydrate(), deadlineMs);
+    this._progress();
+    let timer;
+    const stalled = new Promise((res) => {
+      const check = () => {
+        const idle = Date.now() - this._progressAt;
+        if (idle >= deadlineMs) return res(TIMED_OUT);
+        timer = setTimeout(check, deadlineMs - idle);
+        timer.unref?.();
+      };
+      check();
+    });
+    let r;
+    try { r = await Promise.race([this.hydrate(), stalled]); }
+    finally { clearTimeout(timer); }
     if (r !== TIMED_OUT) return r;
     this._hydrateRun++;
     this._hydrating = false;
     this.hydrated = false;
-    this.lastFailure = `a hydrate pass did not finish within ${Math.round(deadlineMs / 1000)}s ` +
+    this.lastFailure = `a hydrate pass made no progress for ${Math.round(deadlineMs / 1000)}s ` +
       `(a store request that never settled?) and was abandoned.`;
     return 0;
   }

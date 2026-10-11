@@ -120,8 +120,13 @@ of-record**, so both halves of the ADR split now hold:
   - The gate lives in `mirror.hydrateGated(setGate)`, not inline in server.js, so a test pins it.
 - **Every await under the gate is BOUNDED (XERK-1282)** — one that never settled kept prod ingest
   503'd for days, and `hydrateArchive`'s single-flight swallowed every later promotion.
-  - A byte pass past `HYDRATE_PASS_DEADLINE_MS` (constant, not env) is ABANDONED (`_hydrateRun`
-    bump) and retried with the gate still CLOSED — never opened over an unclassified tree (XERK-1048).
+  - A byte pass that makes NO PROGRESS for `HYDRATE_PASS_DEADLINE_MS` (constant, not env) is ABANDONED
+    (`_hydrateRun` bump) and retried with the gate still CLOSED — never opened over an unclassified
+    tree (XERK-1048).
+  - **A stall bound, never wall-clock (XERK-1829)**: every pod (emptyDir) re-fetches the whole
+    rendered layer (~11k objects, ~2 GB in prod); a wall-clock cap abandoned passes that were
+    progressing, keeping ingest 503'd 20+ min per pod start. Progress = a store request settling.
+  - Rendered GETs run `HYDRATE_CONCURRENCY` (8) at once: sequential was latency-bound (~4/s).
   - A hydrate waits on an in-flight `retryBlocked` pass, so that pass is bounded too: each GET by
     `RETRY_GET_DEADLINE_MS` (key stays blocked), and it stops after its current key once a hydrate
     waits (`_yieldRetry`). Unbounded, one hung retry GET made every hydrate pass abandon forever.
