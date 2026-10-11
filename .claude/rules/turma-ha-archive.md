@@ -276,9 +276,11 @@ of-record**, so both halves of the ADR split now hold:
   (`heldEntries(jsonl, true)`). A stale pre-repair copy seated after the duplicate repair put the
   repeated lines back. First-copy de-dup is prefix-monotone (the repair's own rule), so the seat
   writes a prefix of the repaired rows and the next append still lands at its seq.
-  - So a seat never leaves a stale tail of its own. A tail past a seat exists only while a repair
-    is pending (its op trims it) or after an out-of-band `.jsonl` truncation, which stays the
-    accepted hand-delete posture: later appends at those seqs are dropped by `DO NOTHING`.
+  - The ingest path numbers its append after the FIRST-COPY count too (`prevCount = seated.length`),
+    and the backfill row's `msgCount` is the first-copy count: raw counts left a seq hole (QA F2/F3).
+  - A seat never adds a stale tail, but cannot trim one: Postgres rows past the file (a pending
+    repair, damage `reseatIndexFromFiles` has not reached yet, an out-of-band truncation) make the
+    next append at those seqs a `DO NOTHING` no-op until the leader's repair/re-seat replaces them.
   - Do not gate the seat on leader+term instead: a dropped follower heal is a permanent search miss.
   - Tests: `XERK-1838:` in `index-mirror-heal.test.js` (backfill + ingest call sites).
 - **Hydration (XERK-793, `pg` mode): sessions-only into the map** (`hydrateSessionsInto` →

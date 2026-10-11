@@ -34,8 +34,10 @@ function fakeStore() {
   const rows = new Map();
   const seqsOf = (id) => rows.get(id) || (rows.set(id, new Map()), rows.get(id));
   const texts = (id) => [...seqsOf(id).entries()].sort((a, b) => a[0] - b[0]).map(([, e]) => e.text);
+  const seqs = (id) => [...seqsOf(id).entries()].sort((a, b) => a[0] - b[0]).map(([s, e]) => `${s}:${e.text}`);
   return {
     texts,
+    seqs,
     async upsertSession() {},
     async replaceEntries(id, entries) {
       const m = seqsOf(id);
@@ -143,6 +145,7 @@ test("XERK-1838: the backfill's seat from a pre-repair copy re-adds no duplicate
     fs.writeFileSync(path.join(dir, "bf2.jsonl.meta"), JSON.stringify({ transcriptId: "t-bf2", host: "h" }));
     archive.backfillPgIndexFromFiles();
     await idle(mirror);
+    assert.equal(archive.sessionRow("t-bf2").msgCount, 3, "the row counts first copies, as the seat does");
   });
   assert.deepEqual(store.texts("t-bf2"), ["A", "B", "C"]);
   await store.appendEntries("t-bf2", [e("N")], 3);                 // the next append lands
@@ -167,7 +170,6 @@ test("XERK-1838: the ingest re-seat from a pre-repair copy re-adds no duplicates
       r.bytesStored + Buffer.byteLength(JSON.stringify(next)), next, "acme");
     await idle(mirror);
   });
-  const texts = store.texts("t-ing");
-  assert.deepEqual(texts.slice(0, 3), ["A", "B", "C"], `seat wrote first copies only: ${texts}`);
-  assert.equal(texts.filter((t) => t === "A").length, 1, `no duplicate A: ${texts}`);
+  // First copies seated, and the append numbered after them: no duplicate, no hole.
+  assert.deepEqual(store.seqs("t-ing"), ["0:A", "1:B", "2:C", "3:D"]);
 });
