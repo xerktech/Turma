@@ -213,7 +213,7 @@ const {
   agentBearerKind, agentHostRefusal, agentPresentedRefusal, resolveEnrollToken, hostAgentToken, tokenHost, ttydAuth,
   controlChannels, pendingChannels, termAgents,
   credentialsMatch, issueSessionToken, sessionTokenValid,
-  pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
+  pcmToWav, transcribePcm, WHISPER_NON_SPEECH, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
   TERM_SCROLL_BOTTOM_JS,
   TERM_LIVE_BEACON_JS,
@@ -14866,6 +14866,42 @@ test("transcribePcm: {text} body, trimmed", async () => {
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: "  hello world  " }) });
   const result = await transcribePcm(Buffer.from([1, 2, 3, 4]));
   assert.deepEqual(result, { text: "hello world" });
+  restoreFetch();
+});
+
+test("transcribePcm: Whisper's non-speech output (silence -> 'you') comes back empty", async () => {
+  // XERK-1824: the STT alias serves Whisper, which answers a silent clip with "you" and
+  // noise with "Thank you." / subtitle outros; dictation must not insert those.
+  for (const junk of [" you", "Thank you.", "THANK YOU!", ".", "*sad music*", "[Music]",
+    "We'll be right back.", "Gracias por ver el video.", "ご視聴ありがとうございました。",
+    "Sous-titrage Société Radio-Canada", "Продолжение следует..."]) {
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: junk, language: "en" }) });
+    const result = await transcribePcm(Buffer.from([1]));
+    assert.deepEqual(result, { text: "", language: "en" }, junk);
+  }
+  // The list is Tenir's _NON_SPEECH (api/src/api/stt/parakeet.py); pinned here so an
+  // entry can't be dropped unnoticed, and each one must actually match.
+  assert.deepEqual([...WHISPER_NON_SPEECH].sort(), [
+    "", "you", "thank you", "thanks for watching", "thank you for watching",
+    "well be right back", "subtítulos realizados por la comunidad de amaraorg",
+    "subtítulos por la comunidad de amaraorg", "soustitres réalisés par la communauté damaraorg",
+    "gracias por ver el video", "gracias por ver el vídeo", "gracias por ver",
+    "soustitrage société radiocanada", "soustitrage st 501", "ご視聴ありがとうございました",
+    "продолжение следует",
+  ].sort());
+  for (const phrase of WHISPER_NON_SPEECH) {
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: ` ${phrase}.` }) });
+    assert.deepEqual(await transcribePcm(Buffer.from([1])), { text: "" }, phrase);
+  }
+  restoreFetch();
+});
+
+test("transcribePcm: real short replies are not taken for non-speech", async () => {
+  for (const real of ["Thank you very much.", "you know", "Okay.", "Gracias.", "Merci.", "[Music] hola"]) {
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: real }) });
+    const result = await transcribePcm(Buffer.from([1]));
+    assert.deepEqual(result, { text: real }, real);
+  }
   restoreFetch();
 });
 

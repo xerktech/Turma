@@ -16537,6 +16537,39 @@ function pcmToWav(pcm) {
   return Buffer.concat([header, pcm]);
 }
 
+// Whisper's stock output for a clip with no speech in it (XERK-1824): the LiteLLM STT
+// alias serves Whisper large-v3-turbo since Tenir XERK-1476, and it answers silence with
+// "you", noise with "Thank you." or a subtitle outro, where Parakeet returned "". A
+// transcript whose WHOLE text (sound notes like "*music*" removed, then punctuation and
+// case) is one of these is no speech, so dictation must not insert it. Same list as
+// Tenir's api/src/api/stt/parakeet.py _NON_SPEECH. A real one-phrase "Thank you." is lost.
+const WHISPER_NON_SPEECH = new Set([
+  "",
+  "you",
+  "thank you",
+  "thanks for watching",
+  "thank you for watching",
+  "well be right back",
+  "subtítulos realizados por la comunidad de amaraorg",
+  "subtítulos por la comunidad de amaraorg",
+  "soustitres réalisés par la communauté damaraorg",
+  "gracias por ver el video",
+  "gracias por ver el vídeo",
+  "gracias por ver",
+  "soustitrage société radiocanada",
+  "soustitrage st 501",
+  "ご視聴ありがとうございました",
+  "продолжение следует",
+]);
+
+function isWhisperNonSpeech(text) {
+  const bare = text
+    .replace(/\*[^*]*\*|\[[^\]]*\]|\([^)]*\)/g, " ")
+    .toLowerCase()
+    .replace(/[^\p{L}\p{N}\s]/gu, "");
+  return WHISPER_NON_SPEECH.has(bare.split(/\s+/).filter(Boolean).join(" "));
+}
+
 // Never throws — every failure mode (disabled, non-OK response, network
 // error/timeout, bad JSON) resolves to {text:"", unavailable:true, reason}.
 async function transcribePcm(pcm) {
@@ -16565,7 +16598,8 @@ async function transcribePcm(pcm) {
         ? body.transcription.map((seg) => (seg && seg.text) || "").join("")
         : body.transcription;
     }
-    const result = { text: String(text == null ? "" : text).trim() };
+    text = String(text == null ? "" : text).trim();
+    const result = { text: isWhisperNonSpeech(text) ? "" : text };
     if (body.language != null) result.language = body.language;
     return result;
   } catch (e) {
@@ -22190,6 +22224,7 @@ if (process.env.TURMA_TEST) {
     TERM_LIVE_BEACON_JS,
     pcmToWav,
     transcribePcm,
+    WHISPER_NON_SPEECH,
     issueWsToken,
     wsTokenValid,
     registerDevice,
