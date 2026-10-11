@@ -303,6 +303,13 @@ test("XERK-1839: a rescan resets the load gate, deletes what it evicts, and a fa
   await store._onReady();
   assert.equal(store.loaded, false);
   assert.equal(L.observe([obs()], T0).length, 0);
+  // The retry is throttled: a sweep inside RESCAN_RETRY_MS of the last one reads nothing.
+  L.observe([obs()], T0 + 1000);
+  await store._readyWork;
+  const throttled = selects;
+  L.observe([obs()], T0 + 2000);
+  await store._readyWork;
+  assert.equal(selects, throttled, "no second rescan inside the throttle window");
   // ... and a later sweep retries it once the database answers again.
   fail = false;
   const before = selects;
