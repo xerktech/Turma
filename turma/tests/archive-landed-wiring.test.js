@@ -109,4 +109,71 @@ test("a hung index hydrate is abandoned at its deadline and its loader cut (XERK
   assert.deepEqual(wrote, ["reset", [1]]);
 });
 
+test("timer env knobs clamp to setTimeout's 2^31-1 ceiling (XERK-1523)", () => {
+  process.env.XERK1523_TIMER = String(2 ** 31 + 5);
+  try {
+    assert.equal(hub.timerEnv("XERK1523_TIMER", 1000), 2147483647);
+    process.env.XERK1523_TIMER = "60000";
+    assert.equal(hub.timerEnv("XERK1523_TIMER", 1000), 60000);
+  } finally {
+    delete process.env.XERK1523_TIMER;
+  }
+  assert.equal(hub.timerEnv("XERK1523_TIMER", 1000), 1000);
+});
+
+// The two knobs themselves, resolved at module load: a fresh hub booted with both set
+// past the ceiling must come up clamped, or inlining positiveEnv at either reopens it.
+test("the hydrate deadline and watch knobs boot clamped (XERK-1523)", () => {
+  const { execFileSync } = require("child_process");
+  const boot = (deadline, watch) => JSON.parse(execFileSync(process.execPath, ["-e",
+    "const h = require(process.argv[1]); process.stdout.write(JSON.stringify(" +
+    "[h.ARCHIVE_INDEX_HYDRATE_DEADLINE_MS, h.ARCHIVE_HYDRATE_WATCH_MS])); process.exit(0);",
+    path.join(__dirname, "..", "server.js")],
+  { env: { ...process.env, ARCHIVE_INDEX_HYDRATE_DEADLINE_MS: String(deadline),
+    ARCHIVE_HYDRATE_WATCH_MS: String(watch) }, encoding: "utf8" }));
+  // One knob past the ceiling at a time, so each is also pinned to its OWN env var.
+  assert.deepEqual(boot(2 ** 32, 60000), [2147483647, 60000]);
+  assert.deepEqual(boot(60000, 2 ** 33), [60000, 2147483647]);
+});
+
+// One whole hydrate run, spying on the ingest gate. With an index hydrate to follow,
+// the byte phase must never open the gate, or its closed-since stamp resets at the
+// phase boundary while ingest stays closed (XERK-1282/1523).
+async function gateCallsOfHydrate(indexStore) {
+  const store = { async list() { return []; }, async put() {}, async stat() { return null; },
+    async getToFile() { return false; } };
+  const calls = [];
+  const real = { setHydrating: archive.setHydrating, isPgMode: archive.isPgMode,
+    backfill: archive.backfillPgIndexFromFiles, reconcile: archive.reconcileHydratedCursors };
+  archive.setHydrating = (v) => { calls.push(v); real.setHydrating(v); };
+  archive.isPgMode = () => true;
+  archive.backfillPgIndexFromFiles = () => {};
+  archive.reconcileHydratedCursors = () => {};
+  hub.setArchiveIndexStore(indexStore);
+  hub.setArchiveMirror(store, true);
+  try {
+    await hub.hydrateArchiveOnce();
+  } finally {
+    Object.assign(archive, { setHydrating: real.setHydrating, isPgMode: real.isPgMode,
+      backfillPgIndexFromFiles: real.backfill, reconcileHydratedCursors: real.reconcile });
+    hub.setArchiveIndexStore(null);
+    hub.setArchiveMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+  }
+  assert.equal(archive.isHydrating(), false, "the run ends with ingest open");
+  return calls;
+}
+
+test("a hydrate with an index phase keeps the gate closed across the boundary (XERK-1523)", async () => {
+  let hydrated = 0;
+  const calls = await gateCallsOfHydrate({ async hydrateSessionsInto() { hydrated++; } });
+  assert.equal(hydrated, 1);
+  assert.deepEqual(calls, [true, true, false], "opened once, at the very end");
+});
+
+test("a byte-only hydrate opens the gate when the byte phase ends (XERK-1523)", async () => {
+  assert.deepEqual(await gateCallsOfHydrate(null), [true, false]);
+});
+
 test.after(() => { if (hub.server && hub.server.close) hub.server.close(); });
