@@ -15,14 +15,13 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const LEDGER = path.join(os.tmpdir(), `turma-usage-ledger-${process.pid}.json`);
+const LEDGER = path.join(scratchDir(), `turma-usage-ledger-${process.pid}.json`);
 process.env.USAGE_LEDGER_FILE = LEDGER;
 // Wound down from the fleet's 120/100/32 so retention and eviction are testable
 // at a handful of entries rather than by inventing months of history.

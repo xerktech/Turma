@@ -9,18 +9,17 @@
 
 "use strict";
 
-const os = require("os");
 const path = require("path");
 const net = require("net");
 const http = require("http");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
 process.env.TURMA_TEST = "1";
 // Wide enough that all 8 drains pin before the first one times out.
 process.env.BODY_IDLE_TIMEOUT_MS = "1000";
-const tmp = (name) => path.join(os.tmpdir(), `turma-drain-idle-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-drain-idle-${name}-${process.pid}.json`);
 process.env.STATE_FILE = tmp("state");
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");

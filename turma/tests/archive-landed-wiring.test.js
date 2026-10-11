@@ -5,10 +5,9 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -16,7 +15,7 @@ process.env.TURMA_TEST = "1";
 process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
-const tmp = (name) => path.join(os.tmpdir(), `turma-landed-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-landed-${name}-${process.pid}.json`);
 for (const [k, n] of [["DEVICES_FILE", "devices"], ["TICKET_AGENTS_FILE", "ticket-agents"],
   ["AUTOSTART_ORGS_FILE", "autostart-orgs"], ["TICKET_MODELS_FILE", "ticket-models"],
   ["ORG_COLORS_FILE", "org-colors"], ["USAGE_LEDGER_FILE", "usage-ledger"], ["STATE_FILE", "state"]]) {

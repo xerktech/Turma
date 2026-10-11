@@ -11,11 +11,10 @@
 
 "use strict";
 
-const os = require("os");
 const vm = require("vm");
 const fs = require("fs");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const http = require("http");
 // One fresh connection per test request (XERK-1095). Node >=19's global agent keeps
 // sockets alive, and the hub closes an idle one after its 5s keepAliveTimeout. A test
@@ -57,63 +56,63 @@ process.env.BIG_LANE_MAX_HOLD_MS = "3000";
 // values and drives them over the wire.
 process.env.AGENTS_MAX = "1000";
 process.env.STATE_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-state-${process.pid}.json`
 );
 process.env.DEVICES_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-devices-${process.pid}.json`
 );
 process.env.TICKET_AGENTS_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-ticket-agents-${process.pid}.json`
 );
 process.env.AUTOSTART_ORGS_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-autostart-orgs-${process.pid}.json`
 );
 process.env.TRIAGE_POLICIES_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-triage-policies-${process.pid}.json`
 );
 process.env.TRIAGE_ACTIONS_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-triage-actions-${process.pid}.json`
 );
 process.env.PRIORITY_WRITEBACK_ORGS_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-priority-writeback-orgs-${process.pid}.json`
 );
 process.env.TICKET_MODELS_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-ticket-models-${process.pid}.json`
 );
 process.env.TICKET_RUNTIMES_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-ticket-runtimes-${process.pid}.json`
 );
 process.env.ORG_COLORS_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-org-colors-${process.pid}.json`
 );
 process.env.BRIEFS_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-briefs-${process.pid}.json`
 );
 // Durable token-usage history (XERK-338) is a /data file of its own, read at
 // require time like the stores above, so it gets a throwaway one too.
 process.env.USAGE_LEDGER_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-usage-ledger-${process.pid}.json`
 );
 // The permission ledger (XERK-1563) is another /data file read at require time.
 process.env.PERMISSION_LEDGER_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-permission-ledger-${process.pid}.json`
 );
 // The per-org permission policy text (XERK-1566), an externalized /data store.
 process.env.PERMISSION_POLICIES_FILE = path.join(
-  os.tmpdir(),
+  scratchDir(),
   `turma-test-permission-policies-${process.pid}.json`
 );
 // The migration relay spools transcript bundles to disk (XERK-263) and sweeps
@@ -7918,7 +7917,7 @@ test("http: a pinned agent without the repo clones on demand, like any routed ho
 test("ticket-agent pins survive a hub restart (read back from their own file)", () => {
   // "Persistent" is the point of the feature: the pin has its own durable file
   // on /data rather than riding the best-effort state.json.
-  const file = path.join(os.tmpdir(), `turma-test-ta-persist-${process.pid}.json`);
+  const file = path.join(scratchDir(), `turma-test-ta-persist-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({
     "o.atlassian.net/ENG-1": { host: "h1", at: 123 } }));
   try {
@@ -8609,7 +8608,7 @@ test("XERK-555: a manual start whose only host is 5-hour-maxed QUEUES and holds,
 });
 
 test("ticket-model pins survive a hub restart (read back from their own file)", () => {
-  const file = path.join(os.tmpdir(), `turma-test-tm-persist-${process.pid}.json`);
+  const file = path.join(scratchDir(), `turma-test-tm-persist-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({
     "o.atlassian.net/ENG-1": { model: "opus", at: 123 } }));
   try {
@@ -11194,7 +11193,7 @@ test("XERK-303: the BOOT restore is what stamps a restored command, not the call
   // The stamping only protects anything if the restore actually runs it: a
   // freshly-required module reading a state.json whose command has no
   // deliveredAt must come up with that command marked delivered.
-  const f = path.join(os.tmpdir(), `turma-x303-restore-${process.pid}.json`);
+  const f = path.join(scratchDir(), `turma-x303-restore-${process.pid}.json`);
   fs.writeFileSync(f, JSON.stringify({
     bootHost: {
       device: "bootHost", lastSeen: Date.now(), sessions: [], repos: [],
@@ -11212,7 +11211,7 @@ test("XERK-303: junk in a restored command list is DROPPED, not carried", async 
   // A corrupt state.json is the only door: nothing on the wire reaches this
   // array, and queueCommand only pushes objects. Dropping it at the restore is
   // what makes every c.type / c.cmdId read in the file safe.
-  const f = path.join(os.tmpdir(), `turma-x303-junk-${process.pid}.json`);
+  const f = path.join(scratchDir(), `turma-x303-junk-${process.pid}.json`);
   fs.writeFileSync(f, JSON.stringify({
     junkHost: {
       device: "junkHost", lastSeen: Date.now(), sessions: [], repos: [],
@@ -11282,7 +11281,7 @@ test("XERK-303: a non-ARRAY commands list is rewritten, not skipped past", async
   // same no-handler exit. A string is a plausible hand-edit precisely because it
   // looks scalar.
   for (const junk of ['"junk"', "5", '{"0":{"type":"kill","cmdId":"k1"}}', "true"]) {
-    const f = path.join(os.tmpdir(), `turma-x303-arr-${process.pid}.json`);
+    const f = path.join(scratchDir(), `turma-x303-arr-${process.pid}.json`);
     fs.writeFileSync(f, `{"badHost":{"device":"badHost","lastSeen":${Date.now()},`
       + `"sessions":[],"repos":[],"commands":${junk}}}`);
     const mod = freshServerModule((env) => { env.STATE_FILE = f; });
@@ -12834,7 +12833,7 @@ test("XERK-635: {clear:true} cancels an armed run and drops it from the payload"
 });
 
 test("XERK-635: an armed run survives a hub restart (read back from its own file)", () => {
-  const file = path.join(os.tmpdir(), `turma-test-epicruns-${process.pid}.json`);
+  const file = path.join(scratchDir(), `turma-test-epicruns-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({
     "o.atlassian.net/E-1": {
       epicKey: "E-1", siteKey: "o.atlassian.net", state: "running",
@@ -13060,7 +13059,7 @@ test("XERK-725: a host's epicBuilderStatus report advances the run; another host
 });
 
 test("XERK-725: builder runs survive a hub restart; a malformed record is dropped", () => {
-  const file = path.join(os.tmpdir(), `turma-test-epicbuilders-${process.pid}.json`);
+  const file = path.join(scratchDir(), `turma-test-epicbuilders-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({
     abc123: { id: "abc123", siteKey: "o.atlassian.net", title: "Keep me",
       idea: "expand", state: "researching", host: "h1", startedAt: 111, updatedAt: 222 },
@@ -23302,7 +23301,7 @@ test("XERK-1573: the brief store coerces to the typed wire shape and survives a 
   assert.equal(hub.sanitizeBrief({ ...good, since: 9999 }).since, 2000, "a period never starts after it ends");
   // Coercing a coerced store changes nothing (the HA own-write echo dedups).
   assert.deepEqual(hub.briefsCoerce(JSON.parse(JSON.stringify(out))), out);
-  const file = path.join(os.tmpdir(), `turma-test-briefs-restore-${process.pid}.json`);
+  const file = path.join(scratchDir(), `turma-test-briefs-restore-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify({ "o.atlassian.net": [good] }));
   try {
     const mod = freshServerModule((env) => { env.BRIEFS_FILE = file; });
@@ -23961,7 +23960,7 @@ test("XERK-1574: the decisions store coerces to the typed shape and survives a r
     { at: 7, source: "note", text: "t" },
   ]);
   assert.deepEqual(hub.decisionsCoerce(JSON.parse(JSON.stringify(out))), out, "a fixed point");
-  const file = path.join(os.tmpdir(), `turma-test-decisions-restore-${process.pid}.json`);
+  const file = path.join(scratchDir(), `turma-test-decisions-restore-${process.pid}.json`);
   fs.writeFileSync(file, JSON.stringify(raw));
   try {
     const mod = freshServerModule((env) => { env.DECISIONS_FILE = file; });

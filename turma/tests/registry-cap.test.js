@@ -16,10 +16,9 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const http = require("http");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -36,7 +35,7 @@ process.env.AGENTS_MAX = "4";
 process.env.AGENTS_TOTAL_MAX = String(640 << 10);
 process.env.AGENT_EVICT_IDLE_MS = String(60 * 1000);
 
-const tmp = (name) => path.join(os.tmpdir(), `turma-regcap-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-regcap-${name}-${process.pid}.json`);
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");
 process.env.AUTOSTART_ORGS_FILE = tmp("autostart-orgs");

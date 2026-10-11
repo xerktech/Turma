@@ -11,9 +11,9 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { scratchDir } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -22,7 +22,7 @@ process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
 
-const tmp = (name) => path.join(os.tmpdir(), `turma-xstore-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-xstore-${name}-${process.pid}.json`);
 // Point every externalized store's file at a temp path so the module-init load is
 // a clean "absent" and nothing touches a real /data.
 for (const v of [

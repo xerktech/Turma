@@ -11,10 +11,9 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const http = require("http");
 const zlib = require("zlib");
 const test = require("node:test");
@@ -24,9 +23,9 @@ process.env.TURMA_TEST = "1";
 process.env.TURMA_USER = "hubuser";
 process.env.TURMA_PASSWORD = "hubpass";
 process.env.TURMA_AGENT_TOKEN = "agenttok";
-process.env.STATE_FILE = path.join(os.tmpdir(), `turma-restore-state-${process.pid}.json`);
-process.env.DEVICES_FILE = path.join(os.tmpdir(), `turma-restore-devices-${process.pid}.json`);
-process.env.USAGE_LEDGER_FILE = path.join(os.tmpdir(), `turma-restore-ledger-${process.pid}.json`);
+process.env.STATE_FILE = path.join(scratchDir(), `turma-restore-state-${process.pid}.json`);
+process.env.DEVICES_FILE = path.join(scratchDir(), `turma-restore-devices-${process.pid}.json`);
+process.env.USAGE_LEDGER_FILE = path.join(scratchDir(), `turma-restore-ledger-${process.pid}.json`);
 // NOT mkdtemp'd: a spool dir the TEST creates is a directory production does not
 // have. `spoolRawBody` makes it on the migration-UPLOAD path only, and a hub that
 // has never relayed a live move — a fresh deploy, a recreated volume, or the
@@ -34,7 +33,7 @@ process.env.USAGE_LEDGER_FILE = path.join(os.tmpdir(), `turma-restore-ledger-${p
 // with an ENOENT reported to the operator as a corrupt archive. Naming a path
 // that does not exist is what keeps that honest.
 process.env.MIGRATE_SPOOL_DIR = path.join(
-  os.tmpdir(), `turma-restore-spool-${process.pid}`, "migrations");
+  scratchDir(), `turma-restore-spool-${process.pid}`, "migrations");
 process.env.ARCHIVE_DIR = mkdtemp("turma-restore-archive-");
 process.env.ARCHIVE_DB = path.join(process.env.ARCHIVE_DIR, "index.db");
 
