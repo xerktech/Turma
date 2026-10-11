@@ -37,10 +37,14 @@ composed.**
   - **Typed text's Enter is settled and verified** (`_submit_typed`): an Enter close behind typed
     input is read as a LINE BREAK, leaving the message unsent in the composer with nothing to
     retry it. Measured on 2.1.296: a ~790-char two-slice message (the hub's PR-merged nudge)
-    stuck 2/4 at a 10ms gap. So it waits `TYPED_SUBMIT_SETTLE_SEC`, then re-reads the composer
-    (`_composer_holds`: between the last two rules) and Enters again, bounded by count + clock.
-    The settle alone is not enough under load (8 concurrent panes each needed re-presses).
-    Never Enter again on a busy pane. Tests: `TestSubmitTyped`.
+    stuck 2/4 at a 10ms gap. So it waits `TYPED_SUBMIT_SETTLE_SEC`, Enters, then WATCHES the pane
+    (`_composer_state`): "holds" (between the last two rules) → Enter again; "sent" (the text is
+    above the box) or busy → done; neither → keep watching, to `TYPED_SUBMIT_DEADLINE_SEC`.
+  - **Never read one empty composer as "sent"** — a loaded TUI draws typed text seconds late, and
+    stopping there left 7/12 stuck in QA. A FRESH session swallows its first Enter whatever the
+    gap, so the re-press, not the settle, is the fix. Never Enter on a busy pane (it may be a
+    dialog next). Beat cost: up to the deadline + one capture on the compaction resend.
+    Tests: `TestSubmitTyped`.
   - Windows `_pty_inject` applies the same rule (XERK-1727, `windows-agent.md`). Tests:
     `TestSendInput`, the `_pty_inject` cases in `TestWindowsTerminalBackend`.
 - **Nothing truncates silently**: the fallback CHUNKS its send-keys; the agent REFUSES past

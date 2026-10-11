@@ -8384,6 +8384,19 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
             ha._type_into_pane("agent-abcde", text)
         return [c for c in self.run_calls if c[-1] == "Enter"]
 
+    def test_the_composer_states_from_real_frames(self):
+        self.assertEqual(ha._composer_state(COMPOSER_STUCK, _STUCK_MSG), "holds")
+        self.assertEqual(ha._composer_state(COMPOSER_SENT, _STUCK_MSG), "sent")
+        # Not drawn yet (a loaded TUI): neither — never read as sent.
+        self.assertIsNone(ha._composer_state(LINUX_COMPOSER_PANE, _STUCK_MSG))
+        # The box is the LAST pair of rules: an earlier rule above the
+        # submitted turn must not make the scrollback read as the composer.
+        self.assertEqual(ha._composer_state("─" * 40 + "\n" + COMPOSER_SENT, _STUCK_MSG),
+                         "sent")
+        # The message with more typed after it is not "the message, unsent".
+        self.assertIsNone(ha._composer_state(
+            COMPOSER_STUCK.replace("  requests.\n─", "  requests. and more\n─"), _STUCK_MSG))
+
     def test_the_composer_reads_back_from_real_frames(self):
         self.assertTrue(ha._composer_holds(COMPOSER_STUCK, _STUCK_MSG))
         self.assertFalse(ha._composer_holds(COMPOSER_SENT, _STUCK_MSG))
@@ -8403,6 +8416,17 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         # Busy: the Enter took (or queued the message); another could answer
         # whatever the turn shows next.
         self.assertEqual(len(self._send([COMPOSER_BUSY])), 1)
+
+    def test_a_lagging_pane_is_watched_until_it_draws_the_text(self):
+        # QA under load: the first read shows only the placeholder; stopping
+        # there left the message stuck. Keep watching, then press again.
+        enters = self._send([LINUX_COMPOSER_PANE, LINUX_COMPOSER_PANE,
+                             COMPOSER_STUCK, COMPOSER_SENT])
+        self.assertEqual(len(enters), 2)
+
+    def test_a_pane_that_never_resolves_stops_at_the_deadline(self):
+        with mock.patch.object(ha, "TYPED_SUBMIT_DEADLINE_SEC", 0.05):
+            self.assertEqual(len(self._send([LINUX_COMPOSER_PANE])), 1)
 
     def test_an_unreadable_pane_gets_one_enter(self):
         self.assertEqual(len(self._send([None])), 1)
@@ -38865,10 +38889,10 @@ class TestWindowsTerminalBackend(unittest.TestCase):
 
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
              mock.patch.object(ha.time, "sleep") as slept, \
-             mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_SENT) as cap:
+             mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_BUSY) as cap:
             self.assertTrue(ha._pty_inject("agent-x", "just one line"))
         # Typed text: settle, ONE Enter, then one read of the composer, which
-        # is empty, so no second Enter.
+        # shows a turn running, so no second Enter.
         self.assertEqual(calls, [calls[0], "\r"])
         self.assertEqual(slept.call_args_list[0], mock.call(ha.TYPED_SUBMIT_SETTLE_SEC))
         cap.assert_called_once()
@@ -38950,7 +38974,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
              mock.patch.object(ha.time, "sleep",
                                side_effect=lambda s: order.append(("sleep", s))), \
-             mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_SENT) as cap:
+             mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_BUSY) as cap:
             result = ha._pty_inject("agent-x", text)
         return result, order, cap
 
@@ -38963,7 +38987,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
                                  ("sleep", ha.TYPED_SUBMIT_SETTLE_SEC),
                                  ("inject", "\r"),
                                  ("sleep", ha.TYPED_SUBMIT_SETTLE_SEC)])
-        cap.assert_called_once()  # composer read back once; it was empty
+        cap.assert_called_once()  # read back once: a turn is running
 
     def test_pty_inject_slices_a_long_single_line(self):
         # One burst past ~800 chars is a paste too, so a long line is typed in

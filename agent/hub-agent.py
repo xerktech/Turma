@@ -14730,12 +14730,16 @@ _SLICE_UNSAFE_RE = re.compile("[\U00010000-\U0010FFFF\u200d\ufe0e\ufe0f\u20e3]")
 # was 0/6 at 10ms, so the window is short but load-dependent. So a typed message
 # settles before its Enter, then the composer is read back and Enter is pressed
 # again while it still holds the message (bounded by count and wall clock).
+# The settle is NOT enough on its own: QA found a FRESH session swallows its
+# first Enter even after an 8s gap, and a loaded host draws the typed text
+# seconds late — so the read-back keeps watching until the text shows as a
+# submitted turn (or a turn runs), never trusting one empty composer.
 TYPED_SUBMIT_SETTLE_SEC = _env_float("TYPED_SUBMIT_SETTLE_SEC", 0.5, minimum=0.0)
 TYPED_SUBMIT_MAX_RETRIES = _env_int("TYPED_SUBMIT_MAX_RETRIES", 3, minimum=0)
-TYPED_SUBMIT_DEADLINE_SEC = _env_float("TYPED_SUBMIT_DEADLINE_SEC", 4.0, minimum=0.0)
+TYPED_SUBMIT_DEADLINE_SEC = _env_float("TYPED_SUBMIT_DEADLINE_SEC", 10.0, minimum=0.0)
 # The composer is boxed by two horizontal rules (the upper may carry the
 # session's name); version-coupled to the TUI like the busy markers. It only
-# gates the retry \u2014 the settle above is the marker-independent fix.
+# gates the retry, which is what actually rescues a swallowed Enter.
 _COMPOSER_RULE_RE = re.compile(r"^\s*\u2500{10,}")
 # How much of the message's end must still be in the composer to call it unsent.
 COMPOSER_TAIL_CHARS = 60
@@ -14761,37 +14765,60 @@ def _input_slices(text):
     return out or [""]
 
 
-def _composer_holds(cap, text):
-    """True when the pane's composer — the lines between the last two rules —
-    still ends with `text`, i.e. its Enter was read as a line break. Whitespace
-    is ignored on both sides: the composer wraps and indents what it shows."""
+def _composer_state(cap, text):
+    """Where `text` is on the pane: "holds" when the composer (the lines
+    between the last two rules) still ends with it, its Enter read as a line
+    break; "sent" when it sits ABOVE the composer as a submitted turn; else
+    None — can't tell, which includes a loaded TUI that has not drawn the typed
+    text yet (QA: one empty-composer read taken as "sent" left it stuck).
+    Whitespace is ignored: the composer wraps and indents what it shows."""
     want = re.sub(r"\s+", "", text or "")[-COMPOSER_TAIL_CHARS:]
     if not cap or not want:
-        return False
+        return None
     lines = cap.splitlines()
     rules = [i for i, line in enumerate(lines) if _COMPOSER_RULE_RE.match(line)]
     if len(rules) < 2:
-        return False
+        return None
     box = "".join(lines[rules[-2] + 1:rules[-1]])
-    return re.sub(r"\s+", "", box).endswith(want)
+    if re.sub(r"\s+", "", box).endswith(want):
+        return "holds"
+    if want in re.sub(r"\s+", "", "".join(lines[:rules[-2]])):
+        return "sent"
+    return None
+
+
+def _composer_holds(cap, text):
+    return _composer_state(cap, text) == "holds"
 
 
 def _submit_typed(tmux_name, text, press_enter):
-    """Submit TYPED text: settle, Enter, then Enter again while the composer
-    still holds it and no turn has started (TYPED_SUBMIT_SETTLE_SEC)."""
+    """Submit TYPED text: settle, Enter, then watch the pane until the text is
+    a submitted turn or a turn is running, pressing Enter again whenever the
+    composer still holds it (bounded by TYPED_SUBMIT_MAX_RETRIES and
+    TYPED_SUBMIT_DEADLINE_SEC). A read that can't tell keeps watching."""
     time.sleep(TYPED_SUBMIT_SETTLE_SEC)
     press_enter()
     deadline = time.monotonic() + TYPED_SUBMIT_DEADLINE_SEC
-    for _ in range(TYPED_SUBMIT_MAX_RETRIES):
-        if time.monotonic() >= deadline:
-            break
+    presses = 0
+    while time.monotonic() < deadline:
         time.sleep(TYPED_SUBMIT_SETTLE_SEC)
         cap = _capture_pane(tmux_name)
-        if _busy_from_capture(cap) or not _composer_holds(cap, text):
-            break
-        log(f"typing into {tmux_name}: Enter was read as a line break; "
-            f"pressing it again")
-        press_enter()
+        if cap is None or _busy_from_capture(cap):
+            return
+        state = _composer_state(cap, text)
+        if state == "sent":
+            return
+        if state == "holds":
+            if presses >= TYPED_SUBMIT_MAX_RETRIES:
+                log(f"typing into {tmux_name}: still unsent after "
+                    f"{presses + 1} Enters; leaving it in the composer")
+                return
+            log(f"typing into {tmux_name}: Enter was read as a line break; "
+                f"pressing it again")
+            presses += 1
+            press_enter()
+    log(f"typing into {tmux_name}: could not confirm the message was sent "
+        f"within {TYPED_SUBMIT_DEADLINE_SEC}s")
 
 
 def _clean_input_text(text):
