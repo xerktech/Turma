@@ -2914,10 +2914,11 @@ function dedupLines(buf) {
     const nl = buf.indexOf(10, start);
     const end = nl === -1 ? buf.length : nl + 1;
     const line = buf.subarray(start, nl === -1 ? buf.length : nl);
-    // Trailing whitespace is not part of the key: a copy torn between a line and
-    // its \r (or other trailing blank) must still de-dup to a prefix of the
-    // repaired file. JSON lines differing only there are the same entry.
-    const key = line.toString("latin1").trimEnd();
+    // Trailing JSON whitespace is not part of the key: a copy torn between a line
+    // and its \r (or other trailing blank) must still de-dup to a prefix of the
+    // repaired file. Only JSON's own blanks: trimEnd() also strips a latin1 0xA0,
+    // which made a valid line a "duplicate" of a corrupt one and dropped it.
+    const key = line.toString("latin1").replace(/[ \t\r]+$/, "");
     if (key.trim() && seen.has(key)) dropped += 1;
     else { seen.add(key); parts.push(buf.subarray(start, end)); }
     start = end;
