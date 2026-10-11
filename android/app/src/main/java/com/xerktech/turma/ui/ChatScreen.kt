@@ -536,7 +536,10 @@ private fun QuestionSheet(
 ) {
     val picks = remember(question) { mutableStateListOf<Int>() }
     Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(
+            Modifier.heightIn(max = waitingSheetMaxHeight()).verticalScroll(rememberScrollState()).padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
             if (header.isNotBlank() || (total != null && total > 1)) {
                 Row(horizontalArrangement = Arrangement.spacedBy(6.dp), verticalAlignment = Alignment.CenterVertically) {
                     if (header.isNotBlank()) Pill(header, color = MaterialTheme.colorScheme.primary)
@@ -561,6 +564,19 @@ private fun QuestionSheet(
 }
 
 /**
+ * The tallest a question / permission sheet may grow before it scrolls. The
+ * Scaffold's bottomBar is measured against the whole screen, so a sheet taller
+ * than what is left under the top bar draws OVER it (landscape: Kill and the
+ * terminal button became untappable). Reserve the top bar + chips + composer,
+ * never more than half the screen.
+ */
+@Composable
+private fun waitingSheetMaxHeight(): androidx.compose.ui.unit.Dp {
+    val screen = LocalConfiguration.current.screenHeightDp
+    return minOf(screen / 2, screen - 280).coerceAtLeast(96).dp
+}
+
+/**
  * The TUI's blocking dialog — a tool-permission request or a plan approval —
  * in the same place as the question sheet (web chat.js panePromptHtml): the
  * dialog's question, the context it asks about, and one card per numbered
@@ -568,12 +584,9 @@ private fun QuestionSheet(
  */
 @Composable
 private fun PanePromptSheet(prompt: com.xerktech.turma.model.PanePrompt, onPick: (Int) -> Unit) {
-    // Capped at half the screen and scrollable, so in landscape the options and
-    // the composer below stay reachable rather than being pushed off-screen.
-    val maxHeight = (LocalConfiguration.current.screenHeightDp / 2).dp
     Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
         Column(
-            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
+            Modifier.heightIn(max = waitingSheetMaxHeight()).verticalScroll(rememberScrollState()).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Pill("waiting", color = MaterialTheme.colorScheme.primary)
