@@ -411,8 +411,9 @@ class PgIndexStore {
   // A follower's heal comes from its local copy, which can be behind rows another replica
   // has since appended; replaceEntries' trim would delete those. Overwriting [0..n) is
   // correct when the file's prefix matches Postgres's, which holds for an append-only file
-  // that has not been dedupe-repaired (XERK-1450 rewrites ordinals; a seat from a stale
-  // pre-repair copy can re-add duplicates, a case replace shares). Nothing in pg mode calls
+  // that has not been dedupe-repaired. A seat from a stale pre-repair copy is sent as
+  // that copy's first-copy lines (archive.js `heldEntries(..., true)`, XERK-1838), a prefix
+  // of the repaired rows, so it re-adds no duplicates. Nothing in pg mode calls
   // replaceEntries for a truncated file any more: heal-on-read is disabled there.
   async seatEntries(transcriptId, entries) {
     await this.ensureSchema();

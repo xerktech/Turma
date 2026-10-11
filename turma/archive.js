@@ -788,9 +788,15 @@ function entryKey(e) {
 
 // The entries a `.jsonl` already holds (as parseEntries reads them — a torn line
 // is no entry) and a count per entry key. Read only for a suspect cursor.
-function heldEntries(jsonl) {
+// `firstCopy` reads the file as dedupArchive leaves it (XERK-1838): the first copy of
+// each exact line. A seat from a stale pre-repair copy then writes a prefix of the
+// repaired rows (first-copy de-dup is prefix-monotone), never the duplicates back.
+function heldEntries(jsonl, firstCopy) {
   let raw = "";
-  try { raw = fs.readFileSync(jsonl, "utf8"); } catch { /* absent: nothing held */ }
+  try {
+    raw = firstCopy ? dedupLines(fs.readFileSync(jsonl)).out.toString("utf8")
+      : fs.readFileSync(jsonl, "utf8");
+  } catch { /* absent: nothing held */ }
   const entries = [];
   const keys = new Map();
   for (const line of raw.split("\n")) {
@@ -1404,7 +1410,10 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     // Entering suspicion here means the index never saw some of what the file
     // holds (an orphan under a missing row): re-seat the transcript's search
     // entries from the file once, or they stay unsearchable for good.
-    if (!wasSuspect) reindexHeld(transcriptId, held.entries);
+    // First copies (XERK-1838): what the duplicate repair leaves, so the re-seat and the
+    // append ordinals below share one numbering with the repaired rows.
+    const seated = heldEntries(paths.jsonl, true).entries;
+    if (!wasSuspect) reindexHeld(transcriptId, seated);
     // A multiset, consumed one per match: entries can legitimately repeat a key
     // (pr-link rows share an id), and a re-send repeats each held one ONCE.
     const fresh = list.filter((e) => {
@@ -1419,7 +1428,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
         `re-sent entr(ies) its .jsonl already holds (cursor behind the file; XERK-1364)`);
     }
     list = fresh;
-    prevCount = held.entries.length;
+    prevCount = seated.length;
     // Still suspect until a chunk carries something new: the agent re-sends in
     // order, so the first new entry means it has caught up with the file. The
     // sidecar carries the suspicion (`cursorUnverified`) so a restart or handover
@@ -2838,15 +2847,9 @@ function backfillPgIndexFromFiles() {
     // when its archiveBytes is the file's size (XERK-1364): else de-dup the re-send.
     if (meta.cursorUnverified || meta.archiveBytes !== archiveBytes) unverifiedCursors.add(transcriptId);
     else unverifiedCursors.delete(transcriptId);
-    const entries = [];
-    for (const line of raw.split("\n")) {
-      const s = line.trim();
-      if (!s) continue;
-      let e;
-      try { e = JSON.parse(s); } catch { continue; }
-      if (!e || typeof e !== "object") continue;
-      entries.push({ uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || "") });
-    }
+    // First copies (XERK-1838): the row's msgCount and the seat both count what the
+    // duplicate repair leaves, so a stale pre-repair copy re-adds no duplicates.
+    const entries = heldEntries(jsonl, true).entries;
     // `?? null` KEEPS a recorded "" (a real no-org owner, still gated) distinct from a
     // missing field, exactly as rebuildIndex/indexLoader/sessionLoader do. bytesStored
     // (the agent cursor) comes from the sidecar; archiveBytes/rawBytes from the files.
