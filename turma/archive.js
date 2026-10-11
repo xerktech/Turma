@@ -788,9 +788,15 @@ function entryKey(e) {
 
 // The entries a `.jsonl` already holds (as parseEntries reads them — a torn line
 // is no entry) and a count per entry key. Read only for a suspect cursor.
-function heldEntries(jsonl) {
+// `firstCopy` reads the file as dedupArchive leaves it (XERK-1838): the first copy of
+// each exact line. A seat from a stale pre-repair copy then writes a prefix of the
+// repaired rows (first-copy de-dup is prefix-monotone), never the duplicates back.
+function heldEntries(jsonl, firstCopy) {
   let raw = "";
-  try { raw = fs.readFileSync(jsonl, "utf8"); } catch { /* absent: nothing held */ }
+  try {
+    raw = firstCopy ? dedupLines(fs.readFileSync(jsonl)).out.toString("utf8")
+      : fs.readFileSync(jsonl, "utf8");
+  } catch { /* absent: nothing held */ }
   const entries = [];
   const keys = new Map();
   for (const line of raw.split("\n")) {
@@ -1404,7 +1410,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     // Entering suspicion here means the index never saw some of what the file
     // holds (an orphan under a missing row): re-seat the transcript's search
     // entries from the file once, or they stay unsearchable for good.
-    if (!wasSuspect) reindexHeld(transcriptId, held.entries);
+    if (!wasSuspect) reindexHeld(transcriptId, heldEntries(paths.jsonl, true).entries);
     // A multiset, consumed one per match: entries can legitimately repeat a key
     // (pr-link rows share an id), and a re-send repeats each held one ONCE.
     const fresh = list.filter((e) => {
@@ -2860,7 +2866,9 @@ function backfillPgIndexFromFiles() {
       archiveBytes, rawBytes, filePath: relPath, updatedAt: meta.updatedAt || null,
     }));
     mirrorSession(transcriptId);
-    mirrorSeat(transcriptId, entries);   // re-seat, never trim: a concurrent replica may append (XERK-1837)
+    // Re-seat, never trim: a concurrent replica may append (XERK-1837). First copies
+    // only, so a stale pre-repair copy cannot re-add duplicates (XERK-1838).
+    mirrorSeat(transcriptId, heldEntries(jsonl, true).entries);
     rebuilt += 1;
   }
   if (rebuilt) {

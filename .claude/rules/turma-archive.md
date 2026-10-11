@@ -226,6 +226,8 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     send `seat` instead: it overwrites ordinals and trims nothing, so a stale copy cannot delete
     another replica's appends (XERK-1837). Never dropped on a term change, since that left held
     entries out of PG with nothing to re-run them.
+  - A seat sends the file's FIRST-COPY lines (XERK-1838), so a stale pre-repair copy cannot
+    re-add the duplicates a repair removed. Detail: `turma-ha-archive.md`.
   - **The pass YIELDS every ~20ms** (`dedupArchive` is async, serialized): run whole over ~2 GB it
     held the event loop 16-20s, past the 15s lease, and in prod both replicas lost leadership
     mid-repair. Never make it synchronous again; keep each file's step one synchronous slice.

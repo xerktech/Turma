@@ -272,6 +272,15 @@ of-record**, so both halves of the ADR split now hold:
   `replace` trims seq >= n, so a follower's heal from its stale copy deleted rows another replica
   had appended by the time it applied. Only a repair (leader-gated, term-checked) or a truncated
   file's heal-on-read (sqlite mode only) may trim.
+- **A seat sends its file's FIRST-COPY lines, never the raw copy (XERK-1838)**
+  (`heldEntries(jsonl, true)`). A stale pre-repair copy seated after the duplicate repair put the
+  repeated lines back. First-copy de-dup is prefix-monotone (the repair's own rule), so the seat
+  writes a prefix of the repaired rows and the next append still lands at its seq.
+  - So a seat never leaves a stale tail of its own. A tail past a seat exists only while a repair
+    is pending (its op trims it) or after an out-of-band `.jsonl` truncation, which stays the
+    accepted hand-delete posture: later appends at those seqs are dropped by `DO NOTHING`.
+  - Do not gate the seat on leader+term instead: a dropped follower heal is a permanent search miss.
+  - Tests: `XERK-1838:` in `index-mirror-heal.test.js` (backfill + ingest call sites).
 - **Hydration (XERK-793, `pg` mode): sessions-only into the map** (`hydrateSessionsInto` →
   `archive.sessionLoader`) — it pages the SESSION rows out of Postgres into the in-memory `sessionsMap`
   (entries stay in PG; search reads them there), so a promotion is a small, entry-free load. The
