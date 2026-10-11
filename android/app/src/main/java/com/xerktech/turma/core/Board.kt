@@ -245,6 +245,64 @@ fun epicRunView(
 }
 
 /**
+ * Layer an epic's children into dependency waves — a port of board.js
+ * epicLayerWaves (itself a mirror of server.js buildEpicWaves): only in-set
+ * blockers order the waves, self-blocks are dropped, input order is kept within
+ * a wave, and children a loop stalls land in the second list (the cycle).
+ */
+fun epicLayerWaves(children: List<JiraTicket>): Pair<List<List<String>>, List<String>> {
+    val keys = children.map { it.key }.filter { it.isNotBlank() }.distinct()
+    val inSet = keys.toSet()
+    val byKey = children.associateBy { it.key }
+    val blockers = keys.associateWith { k ->
+        (byKey[k]?.blockedBy ?: emptyList()).filter { it in inSet && it != k }.distinct()
+    }
+    val waves = mutableListOf<List<String>>()
+    val placed = mutableSetOf<String>()
+    var remaining = keys
+    while (remaining.isNotEmpty()) {
+        val wave = remaining.filter { k -> blockers.getValue(k).all { it in placed } }
+        if (wave.isEmpty()) break
+        placed += wave
+        waves += wave
+        remaining = remaining.filterNot { it in placed }
+    }
+    return waves to remaining
+}
+
+/**
+ * A run-shaped preview of an UN-armed epic, built from the board's children the
+ * way arming would build it now — fed to [epicRunView] so the sheet shows the
+ * same waves an armed run does. A port of board.js epicPreviewRun.
+ */
+fun epicPreviewRun(site: BoardSite, epicKey: String): EpicRun {
+    val kids = site.tickets.filter { it.key.isNotBlank() && it.key != epicKey && it.epicKey == epicKey }
+    val (waves, cycle) = epicLayerWaves(kids)
+    return EpicRun(
+        epicKey = epicKey, siteKey = site.siteKey, state = "running",
+        children = kids.map { it.key }.distinct().take(500), // server EPIC_RUN_CHILDREN_MAX
+        waves = waves, cycle = cycle,
+    )
+}
+
+/** One board child of an epic, listed by its column — board.js epicChildrenOf. */
+data class EpicBoardChild(val key: String, val summary: String, val category: String)
+
+/**
+ * Every child of an epic the board carries ([JiraTicket.epicKey] names it), in
+ * column order — independent of any run, so an un-armed, cancelled or finished
+ * epic still lists its sub-tickets. A pure port of board.js epicChildrenOf.
+ */
+fun epicChildrenOf(site: BoardSite, epicKey: String): List<EpicBoardChild> {
+    if (epicKey.isBlank()) return emptyList()
+    val order = BOARD_CATEGORIES.map { it.first }
+    return site.tickets
+        .filter { it.key.isNotBlank() && it.key != epicKey && it.epicKey == epicKey }
+        .map { EpicBoardChild(it.key, it.summary, categoryOf(it)) }
+        .sortedBy { order.indexOf(it.category) }
+}
+
+/**
  * A short signature of what the epic-run surface renders, so a screen can tell
  * when the run actually moved. Mirrors board.js epicRunSig.
  */

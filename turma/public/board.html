@@ -837,15 +837,22 @@ function paintDetail() {
   // payload's epicRuns, resolved to live child progress against this site's
   // tickets + the fleet's sessions/queue; epicOps carries the in-flight
   // arm/cancel state for this epic (keyed like `starts`).
+  // An un-armed epic gets a PREVIEW view of the waves arming would build
+  // (epicPreviewRun), so the panel reads the same before and after Start.
   let epicRun = null;
+  let epicPreview = null;
   if (B.isEpicTicket(s.ticket) && site) {
     const run = B.epicRunOf(cache && cache.epicRuns, s.siteKey, s.key);
-    epicRun = run ? B.epicRunView(run, site,
-      { sessionIndex: B.ticketSessionIndex((cache && cache.agents) || []),
-        ticketQueue: queueView(cache && cache.ticketQueue) }) : null;
+    const vopts = { sessionIndex: B.ticketSessionIndex((cache && cache.agents) || []),
+      ticketQueue: queueView(cache && cache.ticketQueue) };
+    if (run) epicRun = B.epicRunView(run, site, vopts);
+    else epicPreview = B.epicRunView(B.epicPreviewRun(site, s.key), site, vopts);
   }
+  // Every child the board carries, run or no run, so the panel always lists them.
+  const epicChildren = B.isEpicTicket(s.ticket) && site ? B.epicChildrenOf(site, s.key) : null;
   const epicOp = epicOps.get(startKey(s.siteKey, s.key)) || null;
-  s.epicRunShown = B.epicRunSig(epicRun);
+  s.epicRunShown = B.epicPanelSig(epicRun || epicPreview, !!epicRun)
+    + (epicChildren ? "#" + B.epicChildrenSig(epicChildren) : "");
   // The ticket's sessions, for the "Closed by" row (XERK-1569): a session that
   // closed this ticket itself, why, and when.
   const ticketSessions = B.ticketSessionsOf(
@@ -910,6 +917,8 @@ function paintDetail() {
     canChangeStatus: !!(site && site.online && s.detail &&
       Array.isArray(s.detail.statusOptions) && s.detail.statusOptions.length),
     epicRun,
+    epicChildren,
+    epicPreview,
     epicRunPending: !!(epicOp && epicOp.pending),
     epicRunError: epicOp && epicOp.error,
     sessions: ticketSessions,
@@ -1013,9 +1022,10 @@ function refreshOpenTicket() {
   let epicSig = "";
   if (B.isEpicTicket(fresh) && site) {
     const run = B.epicRunOf(cache && cache.epicRuns, s.siteKey, s.key);
-    epicSig = run ? B.epicRunSig(B.epicRunView(run, site,
+    epicSig = B.epicPanelSig(B.epicRunView(run || B.epicPreviewRun(site, s.key), site,
       { sessionIndex: B.ticketSessionIndex((cache && cache.agents) || []),
-        ticketQueue: queueView(cache && cache.ticketQueue) })) : "";
+        ticketQueue: queueView(cache && cache.ticketQueue) }), !!run);
+    epicSig += "#" + B.epicChildrenSig(B.epicChildrenOf(site, s.key));
   }
   const changed = shown(fresh.repoGuess) !== shown(s.ticket.repoGuess) ||
     (pin ? pin.host : "") !== (s.agentPinShown || "") ||

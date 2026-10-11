@@ -991,6 +991,7 @@ body.td-open { overflow: hidden; }
 .epic-state.epic-blocked { color: var(--warning); border-color: var(--warning); }
 .epic-state.epic-done { color: var(--good); border-color: var(--good); }
 .epic-state.epic-paused { color: var(--muted); border-color: var(--muted); }
+.epic-state.epic-idle { color: var(--muted); border-color: var(--muted); }
 .epic-paused-note { color: var(--ink-2); }
 .epic-prog { display: flex; align-items: center; gap: 10px; margin: 4px 0 10px; }
 .epic-prog-num { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); white-space: nowrap; }
@@ -1024,6 +1025,11 @@ body.td-open { overflow: hidden; }
 .epic-child.epic-ready .epic-child-dot { background: color-mix(in srgb, var(--accent) 45%, var(--page)); }
 .epic-child.epic-blocked .epic-child-dot { background: color-mix(in srgb, var(--warning) 60%, var(--page)); }
 .epic-child.epic-none { color: var(--muted); font-style: italic; }
+/* A board child listed by column (epicChildrenOf), not by run status. */
+.epic-child.epic-cat-inprogress .epic-child-dot,
+.epic-child.epic-cat-review .epic-child-dot { background: var(--accent); }
+.epic-child.epic-cat-done .epic-child-dot { background: var(--good); }
+.epic-child.epic-cat-done .epic-child-st { color: var(--good); }
 .epic-actions { display: flex; gap: 8px; flex-wrap: wrap; }
 .epic-btn {
   padding: 5px 12px; border-radius: var(--radius-sm); font-size: 13px; cursor: pointer;

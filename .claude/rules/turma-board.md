@@ -493,10 +493,16 @@ UNTOUCHED, so it triggers no column-mirror re-port. The ONE lane-rule change is 
   done = child in Done column; running = a running/queued session names it or it's ticket-queued;
   ready = every IN-EPIC blocker (`blockedBy ∩ run.children`) Done; blocked = an in-epic blocker not
   Done, or in `run.cycle`.** It NEVER re-derives the DAG — the hub owns `waves`/`children`/`cycle`;
-  the panel renders `waves` in order. `epicRunSig` is the repaint trigger for the open panel.
+  the panel renders `waves` in order.
 - **The route is 200-authoritative like the pins**: `{}` arms/re-arms (returns `{ok, run}`),
   `{clear:true}` cancels (`{ok, run:null}`); `epicOps` overlays only the click's round trip and toasts
   the hub's own refusal (XERK-264). `epicRuns` rides the payload + is a `LIVE_MAPS`/SSE key.
+- **An UN-armed epic's panel draws the same waves an armed run does** (`epicPreviewRun` →
+  `epicRunView`, a "Not started" chip, Start kept); an armed run also lists board children it
+  was not armed over under "Not in this run" (`epicChildrenOf`). Android mirrors both.
+- **The open panel repaints on `epicPanelSig`, never `epicRunSig` alone** — the preview is always
+  "running", so without the armed/preview prefix a Start or Cancel never repainted; it also keys
+  each wave child's `key:status`. Both board.html sites use it (source-pinned in `board.test.js`).
 - Tests: the `XERK-638` cases in `board.test.js` (isEpicTicket/epicRunOf/epicRunView/lane-exclusion/
   card+panel) and `BoardTest.kt`; the SSE keep-live for `epicRuns` in `board.test.js`.
 

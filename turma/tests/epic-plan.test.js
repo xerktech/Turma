@@ -238,3 +238,19 @@ test("XERK-722: waves equals buildEpicWaves for self-blocks and external refs", 
   assert.deepEqual(a.waves, [["S1"], ["S2"]]);
   assert.deepEqual(a.cycle, []);
 });
+
+// The board's un-armed epic preview (public/board.js epicLayerWaves) is a FOURTH
+// mirror of the layering — it shows what arming would build, so it must lay out
+// exactly as buildEpicWaves over every fixture above.
+test("board.js epicLayerWaves matches buildEpicWaves (diamond, chain, cycle, self/external)", () => {
+  const { epicLayerWaves } = require("../public/board.js");
+  const fixtures = [
+    SHARED_EDGES,
+    [{ id: "N1", blockedBy: [] }, { id: "N2", blockedBy: ["N1"] }, { id: "N3", blockedBy: ["N1", "N2"] }],
+    [{ id: "Z", blockedBy: [] }, { id: "X", blockedBy: ["Y"] }, { id: "Y", blockedBy: ["X"] }],
+    [{ id: "S1", blockedBy: ["S1"] }, { id: "S2", blockedBy: ["S1", "OUTSIDE-9"] }],
+  ];
+  for (const f of fixtures) {
+    assert.deepEqual(epicLayerWaves(edgesToRows(f)), buildEpicWaves(edgesToRows(f)));
+  }
+});

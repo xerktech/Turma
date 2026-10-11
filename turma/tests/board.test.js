@@ -21,7 +21,7 @@ const {
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
   isEpicTicket, epicRunOf, epicRunView, epicRunSig,
-  epicCardControlHtml, epicRunPanelHtml,
+  epicCardControlHtml, epicRunPanelHtml, epicChildrenOf, epicChildrenSig, epicPreviewRun, epicPanelSig,
   epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
@@ -3057,6 +3057,126 @@ test("epicRunPanelHtml: no run armed -> a description and a Start-run button", (
   assert.match(epicRunPanelHtml(epicTicket("E-1"), null, { error: "nope" }), /td-err[^]*nope/);
 });
 
+test("epicChildrenOf: every board child of the epic, in column order, run or no run", () => {
+  const site = { siteKey: "myorg.atlassian.net", tickets: [
+    epicTicket("E-1"),
+    ticket("C-3", { epicKey: "E-1", statusCategory: "done", status: "Done", summary: "third" }),
+    ticket("C-1", { epicKey: "E-1", statusCategory: "todo", status: "To Do", summary: "first" }),
+    ticket("C-2", { epicKey: "E-1", statusCategory: "inprogress", status: "In Review", summary: "second" }),
+    ticket("X-9", { epicKey: "E-2" }),
+    ticket("Y-1"),
+  ] };
+  assert.deepEqual(epicChildrenOf(site, "E-1"), [
+    { key: "C-1", summary: "first", category: "todo" },
+    { key: "C-2", summary: "second", category: "review" },
+    { key: "C-3", summary: "third", category: "done" },
+  ]);
+  assert.deepEqual(epicChildrenOf(site, ""), []);
+  assert.deepEqual(epicChildrenOf(null, "E-1"), []);
+  // The repaint signature moves when a child changes column.
+  const before = epicChildrenSig(epicChildrenOf(site, "E-1"));
+  site.tickets[2] = ticket("C-1", { epicKey: "E-1", statusCategory: "done", status: "Done", summary: "first" });
+  assert.notEqual(epicChildrenSig(epicChildrenOf(site, "E-1")), before);
+});
+
+test("epicPreviewRun: an un-armed epic previews the waves arming would build", () => {
+  const site = { siteKey: "myorg.atlassian.net", tickets: [
+    epicTicket("E-1"),
+    ticket("C-1", { epicKey: "E-1", statusCategory: "done", status: "Done", summary: "first" }),
+    ticket("C-2", { epicKey: "E-1", statusCategory: "todo", status: "To Do", blockedBy: ["C-1"] }),
+    ticket("C-3", { epicKey: "E-1", statusCategory: "todo", status: "To Do", blockedBy: ["C-1", "X-9"] }),
+    ticket("C-4", { epicKey: "E-1", statusCategory: "todo", status: "To Do", blockedBy: ["C-2", "C-3"] }),
+    ticket("X-9", { epicKey: "E-2" }),
+  ] };
+  const run = epicPreviewRun(site, "E-1");
+  assert.deepEqual(run.children, ["C-1", "C-2", "C-3", "C-4"]);
+  assert.deepEqual(run.waves, [["C-1"], ["C-2", "C-3"], ["C-4"]], "external blocker X-9 orders nothing");
+  assert.equal(run.cycle, undefined);
+  const view = epicRunView(run, site, {});
+  assert.equal(view.total, 4);
+  assert.equal(view.done, 1);
+  assert.deepEqual(view.waves[1].map((c) => c.status), ["ready", "ready"]);
+  assert.equal(view.waves[2][0].status, "blocked");
+  // A loop is annotated, never dropped.
+  site.tickets.push(ticket("C-5", { epicKey: "E-1", blockedBy: ["C-6"] }),
+    ticket("C-6", { epicKey: "E-1", blockedBy: ["C-5"] }));
+  assert.deepEqual(epicPreviewRun(site, "E-1").cycle, ["C-5", "C-6"]);
+  assert.deepEqual(epicPreviewRun(site, "E-9").children, []);
+});
+
+test("epic children/preview never include the epic itself, even when it names itself", () => {
+  const site = { siteKey: "s", tickets: [
+    epicTicket("E-1", { epicKey: "E-1" }),
+    ticket("C-1", { epicKey: "E-1", blockedBy: ["E-1"] }),
+  ] };
+  assert.deepEqual(epicChildrenOf(site, "E-1").map((c) => c.key), ["C-1"]);
+  assert.deepEqual(epicPreviewRun(site, "E-1").children, ["C-1"]);
+});
+
+test("epicPanelSig: Start/Cancel and a re-layering both move the signature", () => {
+  const view = (waves) => ({
+    state: "running", paused: false, total: 3, done: 0,
+    counts: { done: 0, running: 0, ready: 1, blocked: 2 }, cycleChildren: [], cycle: false,
+    waves: waves.map((w) => w.map((key) => ({ key, summary: "", status: "ready" }))),
+  });
+  const v = view([["A"], ["B", "C"]]);
+  // Same view armed vs previewed (the preview is always "running"): must differ.
+  assert.notEqual(epicPanelSig(v, true), epicPanelSig(v, false));
+  // A blockedBy change re-layers with identical counts: must differ.
+  assert.notEqual(epicPanelSig(v, false), epicPanelSig(view([["A"], ["B"], ["C"]]), false));
+  assert.equal(epicPanelSig(v, false), epicPanelSig(view([["A"], ["B", "C"]]), false));
+  // Two children swap status with identical counts: must differ.
+  const swapped = view([["A"], ["B", "C"]]);
+  swapped.waves[1][0].status = "blocked";
+  const other = view([["A"], ["B", "C"]]);
+  other.waves[1][1].status = "blocked";
+  assert.notEqual(epicPanelSig(swapped, true), epicPanelSig(other, true));
+  assert.equal(epicPanelSig(null, false), "");
+});
+
+test("epicRunPanelHtml: 'Not in this run' rows escape the child summary", () => {
+  const view = { state: "running", total: 0, done: 0, counts: { done: 0, running: 0, ready: 0, blocked: 0 },
+    waves: [], cycleChildren: [], cycle: false };
+  const html = epicRunPanelHtml(epicTicket("E-1"), view,
+    { children: [{ key: "C-9", summary: "<img src=x onerror=alert(1)>", category: "todo" }] });
+  assert.match(html, /&lt;img src=x onerror=alert\(1\)&gt;/);
+  assert.doesNotMatch(html, /<img/);
+});
+
+test("epicRunPanelHtml: no run armed draws the previewed waves like an armed run", () => {
+  const preview = {
+    state: "running", total: 2, done: 1, counts: { done: 1, running: 0, ready: 1, blocked: 0 },
+    waves: [[{ key: "C-1", summary: "first <b>", status: "done" }], [{ key: "C-2", summary: "second", status: "ready" }]],
+    cycleChildren: [], cycle: false,
+  };
+  const html = epicRunPanelHtml(epicTicket("E-1"), null, { preview });
+  assert.match(html, /Not started/);
+  assert.match(html, /1 \/ 2 done/);
+  assert.match(html, /Wave 1[^]*C-1[^]*first &lt;b&gt;[^]*Wave 2[^]*epic-child epic-ready[^]*C-2/);
+  assert.match(html, /data-epic-arm="E-1"/, "Start is still offered");
+  assert.doesNotMatch(html, /data-epic-cancel/);
+  // Resolved but empty -> says so; not resolved (an older caller) -> silent.
+  const empty = { ...preview, total: 0, done: 0, waves: [] };
+  assert.match(epicRunPanelHtml(epicTicket("E-1"), null, { preview: empty }), /no children on the board yet/);
+  assert.doesNotMatch(epicRunPanelHtml(epicTicket("E-1"), null, {}), /no children|Wave 1|Not started/);
+});
+
+test("epicRunPanelHtml: an armed run lists board children it was not armed over", () => {
+  const view = {
+    state: "done", total: 1, done: 1, counts: { done: 1, running: 0, ready: 0, blocked: 0 },
+    waves: [[{ key: "C-1", summary: "first", status: "done" }]], cycleChildren: [], cycle: false,
+  };
+  const children = [
+    { key: "C-1", summary: "first", category: "done" },
+    { key: "C-4", summary: "added later", category: "todo" },
+  ];
+  const html = epicRunPanelHtml(epicTicket("E-1"), view, { children });
+  assert.match(html, /Not in this run[^]*C-4[^]*added later/);
+  assert.equal((html.match(/epic-child-key">C-1</g) || []).length, 1, "a run child is not listed twice");
+  // Every child in the run -> no extra group.
+  assert.doesNotMatch(epicRunPanelHtml(epicTicket("E-1"), view, { children: children.slice(0, 1) }), /Not in this run/);
+});
+
 test("epicRunPanelHtml: an armed run shows waves, progress, Re-arm + Cancel", () => {
   const view = {
     state: "running", total: 3, done: 1, counts: { done: 1, running: 1, ready: 0, blocked: 1 },
@@ -3356,4 +3476,11 @@ test("XERK-1566: the permission policy modal never uses a bare policy* id (XERK-
   assert.ok(BOARD_HTML.includes('id="permissionRulesPanel"'));
   assert.ok(BOARD_HTML.includes('getElementById("permissionPolicy")'));
   assert.doesNotMatch(BOARD_HTML, /id="policy(Backdrop|Panel)"/);
+});
+
+test("board.html keys the open epic panel's repaint on epicPanelSig at BOTH sites", () => {
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "../public/board.html"), "utf8");
+  assert.match(html, /s\.epicRunShown = B\.epicPanelSig\(epicRun \|\| epicPreview, !!epicRun\)/);
+  assert.match(html, /epicSig = B\.epicPanelSig\([^]*?, !!run\);/);
+  assert.doesNotMatch(html, /B\.epicRunSig\(/, "epicRunSig alone collides armed vs preview");
 });
