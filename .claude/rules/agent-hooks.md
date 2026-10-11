@@ -268,7 +268,7 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
       retry without a bash parser.
     - Accepted cost: one real command in 33.7k replayed (defines a function, `chmod -R go-w .`,
       trailing `cd /`) is refused; the reason names the cwd and asks for an absolute path.
-    - Joining covers `rm`/`unlink`/`chmod`/`chown` and `find` roots, never an opaque
+    - Joining covers `rm`/`unlink`/`chmod`/`chown`/`chgrp` and `find` roots, never an opaque
       substitution (`trap 'rm -rf "$tmpd"' EXIT; cd /` is the cleanup idiom).
     - How a `cd` word is recognised (spelled, emptied, past the cap): `guard-cd.md` (XERK-1769).
     - The literal `~/.ssh` is dangerous to `rm` only (`_is_home_ssh`): `chmod -R 700 ~/.ssh`

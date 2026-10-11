@@ -9936,8 +9936,50 @@ def _shell_cmd_kind(words, depth=0):
     return "work", None
 
 
-def _shell_pipeline_kind(stages):
-    """A pipeline's kind: its first command's, when every later stage is a filter."""
+def _shell_subst_bodies(word):
+    """The command texts a word's `$(…)`/backtick substitutions run. `$((…))`
+    is arithmetic, not a command, but a `$(…)` inside it still runs. An
+    unclosed one yields the rest of the word."""
+    out, i, n = [], 0, len(word)
+    while i < n:
+        if word.startswith("$((", i):
+            i += 3
+        elif word.startswith("$(", i):
+            depth, j = 1, i + 2
+            while j < n and depth:
+                depth += {"(": 1, ")": -1}.get(word[j], 0)
+                j += 1
+            out.append(word[i + 2:j - 1 if not depth else j])
+            i = j
+        elif word[i] == "`":
+            j = word.find("`", i + 1)
+            j = n if j < 0 else j
+            out.append(word[i + 1:j])
+            i = j + 1
+        else:
+            i += 1
+    return out
+
+
+def _shell_runs_work(words, depth=0):
+    """True when a substitution in these raw words runs WORK: `OUT=$(npm test)`
+    is a stage with no command word, so it read `neutral`, and a loop around it
+    read as a wait. A probe's body (`s=$(gh pr view …)`) is not work."""
+    for w in words:
+        for body in _shell_subst_bodies(w):
+            if depth >= 3:
+                return True   # deep nesting must not recurse on the beat
+            for seg in _shell_segments(body):
+                if _shell_pipeline_kind(seg, depth + 1)[0] == "work":
+                    return True
+    return False
+
+
+def _shell_pipeline_kind(stages, depth=0):
+    """A pipeline's kind: its first command's, when every later stage is a
+    filter and no substitution in it runs work."""
+    if any(_shell_runs_work(st, depth) for st in stages):
+        return "work", None
     for st in stages[1:]:
         w = _shell_words(st)
         if w and w[0].rsplit("/", 1)[-1] not in _SHELL_FILTER_CMDS:
@@ -9951,6 +9993,10 @@ def _shell_loop(segs, i):
     head = _shell_words(segs[i][0])
     # The condition may pipe into filters (`until gh pr view … | grep -q MERGED`).
     if i + 1 >= len(segs) or _shell_pipeline_kind([["true"]] + segs[i][1:])[0] == "work":
+        return "work", None
+    # A `while`/`until` condition runs every lap: `while [ "$(make deploy)" … ]`
+    # is work. A `for` list's `$(seq …)` only generates the words.
+    if head[0] in ("while", "until") and _shell_runs_work(segs[i][0]):
         return "work", None
     first = _shell_words(segs[i + 1][0])
     if not first or first[0] != "do":
@@ -21014,6 +21060,18 @@ def _summary_due(sess, now):
     return now >= (sess.get("summaryRetryAt") or 0)
 
 
+def _ignore_late_pokes():
+    """Ignore SIGUSR1 from here on. Interpreter finalization resets a Python
+    handler to SIG_DFL, which TERMINATES the process, so a poke landing during
+    exit turned a clean shutdown into rc -10 (rollup XERK-1584). An ignored
+    signal keeps SIG_IGN through finalization. No SIGUSR1 on Windows."""
+    if hasattr(signal, "SIGUSR1"):
+        try:
+            signal.signal(signal.SIGUSR1, signal.SIG_IGN)
+        except (ValueError, OSError):
+            pass   # not the main thread: the exit still proceeds
+
+
 class SessionManager:
     """Owns the registry, the live tmux/ttyd/claude processes, and the
     heartbeat loop. Single-threaded: all mutations happen in the main loop, so
@@ -24209,7 +24267,7 @@ class SessionManager:
         already track is reaped before a new one is started."""
         sid = sess["id"]
         self._stop_qwen_peer_inbox(sid)
-        env = dict(os.environ)
+        env = _session_env()   # no agent token in a session-uid process (rollup XERK-1584)
         env["TURMA_SESSION_ID"] = sid
         env["TURMA_CLAUDE_SESSION_ID"] = claude_sid
         env["TURMA_RC_NAME"] = sess.get("rcName") or sid
@@ -39958,6 +40016,7 @@ class SessionManager:
         supervisor (systemd / Docker) brings us back. Sessions survive natively
         (KillMode=process) and are re-adopted on boot; a container recreate takes
         the whole stack down, which is exactly the outage this status explains."""
+        _ignore_late_pokes()
         reason, version = self._read_updating_flag()
         self._announce_updating(reason or "restart", version)
         # A probe in flight is on a daemon thread, whose `finally` will NOT run

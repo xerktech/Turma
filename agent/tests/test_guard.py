@@ -1921,10 +1921,13 @@ class TestProducedScripts(unittest.TestCase):
                     "cd /tmp; rm -rf ../*", "cd /tmp/a; rm -rf ../../*",
                     # The cwd reaches into groups and re-parsed scripts.
                     "cd / && (rm -rf *; true)", "cd / && bash -c 'rm -rf *'",
-                    "cd / && eval 'rm -rf *'"):
+                    "cd / && eval 'rm -rf *'",
+                    # chgrp joins the cwd as chown does (rollup XERK-1584).
+                    "cd /etc; chgrp -R nobody .", "cd /etc; chgrp -R nobody ${PWD-x}"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("cd /tmp/x && rm -rf *", "cd / && rm -rf tmp/build",
+                    "cd /usr/src/app && chgrp -R staff build",
                     "cd /etc && ls", "cd ~ && rm -rf .cache",
                     "cd /repos/x && rm -rf node_modules",
                     "cd /usr/src/app && rm -rf build"):
@@ -2172,6 +2175,11 @@ class TestScriptChannels(unittest.TestCase):
     def test_directory_tildes_read_as_the_directories_the_line_visited(self):
         """XERK-1696: `~-` is $OLDPWD and `~N`/`~+N`/`~-N` a `dirs` entry, so
         each of these reached rm as / or /etc (nobody rig)."""
+        # `~/../..` reaches / only from a home two levels deep (rollup XERK-1584).
+        with mock.patch.dict(os.environ, {"HOME": "/root"}):
+            self._directory_tildes()
+
+    def _directory_tildes(self):
         for cmd in ("cd /; cd /tmp; rm -rf ~-",
                     "cd /; cd /tmp; rm -rf ~-/etc",
                     "OLDPWD=/etc; rm -rf ~-/*",
@@ -7442,6 +7450,26 @@ class TestUnreadableConstructs(unittest.TestCase):
 
 
 class TestHookSourcesCompileClean(unittest.TestCase):
+    def test_module_level_names_are_unique(self):
+        # A later `_X_RE = …` silently replaces an earlier one for every
+        # caller (guard-qa.md); two such pairs sat dead (rollup XERK-1584).
+        import ast
+        with open(os.path.join(AGENT_DIR, "hooks", "guard.py")) as f:
+            tree = ast.parse(f.read())
+        seen, dups = set(), []
+        for node in tree.body:
+            if isinstance(node, (ast.FunctionDef, ast.ClassDef)):
+                names = [node.name]
+            elif isinstance(node, ast.Assign):
+                names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+            else:
+                continue
+            for name in names:
+                if name in seen:
+                    dups.append(name)
+                seen.add(name)
+        self.assertEqual(dups, [])
+
     def test_no_syntax_warnings(self):
         # An invalid escape (`\``) in a docstring warns on every hook run and
         # is a SyntaxError in a future Python.

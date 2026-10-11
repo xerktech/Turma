@@ -12,7 +12,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `CLAUDE.md` | **always** | repo purpose, session model, cross-cutting contracts, conventions, deploy |
 | `agent.md` | `agent/hub-agent.py` | process model, commands, heartbeat, live-session signals, summaries, transcript blocks |
 | `agent-input.md` | `agent/hub-agent.py` | `send_input`'s pane path + compaction outbox, `notify_session`'s inbox |
-| `agent-sessions.md` | `agent/hub-agent.py` | session launch, repos-root sessions, queue, kill/resume/delete, new-work directive, local-model failover |
+| `agent-sessions.md` | `agent/hub-agent.py` | session launch, repos-root sessions, queue, kill/resume/delete, new-work directive |
 | `session-transcript.md` | `agent/hub-agent.py`, `agent/tunnel-agent.js`, `turma/server.js`, `turma/public/sessions.html` | which transcript is a session's: id pinning, `_session_transcript_path`, root-session isolation |
 | `session-working.md` | the five working mirrors, `hub-agent.py`, `tunnel-agent.js` | "working" = paneBusy OR live work; shell kinds, waiting/stalled (XERK-1570) |
 | `session-migration.md` | `agent/hub-agent.py`, `turma/server.js`, `sessions.html`, android `Sessions.kt` | migrating a session between agents (XERK-101); a refused start is REPORTED (XERK-265) |
@@ -384,7 +384,7 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
 - All credentials are inline in environment variables (no Docker secrets): the agent's in its per-host
   `agent/native/turma-agent.env`, the hub's in its ArgoCD deployment — never here.
 - Native install, run-as identity, updater → `agent-native.md`. Session runtime, new-work branching
-  directive, local-model failover → `agent-sessions.md`. Safety guard and the `--settings` file every
+  directive → `agent-sessions.md`. Safety guard and the `--settings` file every
   launch passes → `agent-hooks.md`.
 
 ## Deployment (mostly not here)
