@@ -24412,6 +24412,11 @@ test("XERK-1839: the sweep folds ticket sessions into fleet-wide model outcomes"
   outcomeHost("ol-rival", "ol-rival.atlassian.net");
   // A host whose DECIDED org differs from the session's claimed org contributes nothing.
   outcomeHost("ol-drift", "ol-acme.atlassian.net", { orgBound: "elsewhere.atlassian.net" });
+  // A queued session (no work yet) and a paused sleeper (waiting, not ended) are not rows.
+  agents["ol-acme"].sessions.push({ id: "s-q", status: "queued", model: "haiku",
+    ticket: { key: "OL-1", siteKey: "ol-acme.atlassian.net" } });
+  agents["ol-acme"].closedSessions.push({ id: "s-p", model: "haiku", paused: { wakeAt: Date.now() + 1e6 },
+    ticket: { key: "OL-1", siteKey: "ol-acme.atlassian.net" } });
   hub.outcomeLedgerSweep();
   const v = await request("GET", "/api/model-quality", { headers: userHeaders });
   assert.equal(v.status, 200);

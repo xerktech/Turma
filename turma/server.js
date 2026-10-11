@@ -4723,6 +4723,7 @@ function outcomeLedgerSweep(now = Date.now()) {
           prs: Array.isArray(s.prs) ? s.prs : [],
           closeKind: t.outcome && t.outcome.kind,
           type: row && row.type, statusCategory: row && row.statusCategory,
+          resolved: row && row.resolved,
         });
       };
       for (const s of a.sessions || []) {

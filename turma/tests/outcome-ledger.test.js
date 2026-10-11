@@ -34,7 +34,7 @@ test("XERK-1839: a ticket session becomes one row with its class and model", () 
   L._internals.reset();
   L.observe([obs()], T0);
   const r = only();
-  assert.equal(r.key, "acme.atlassian.net/ACME-1/h1/s1");
+  assert.equal(r.key, JSON.stringify(["acme.atlassian.net", "ACME-1", "h1", "s1"]));
   assert.equal(r.cls, "bug");
   assert.equal(r.model, "opus");
   assert.equal(r.startedAt, T0);
@@ -92,7 +92,7 @@ test("XERK-1839: a ticket reopened after Done marks the session that worked it b
   assert.deepEqual(L.outcomeOf(r, T0 + 400 * DAY), { outcome: "bad", reason: "reopened" });
   // A session started AFTER the Done is the reopened work, not its cause.
   L.observe([obs({ sid: "s2", createdAt: "2026-10-05T00:00:00Z", statusCategory: "inprogress" })], T0 + 4 * DAY);
-  assert.equal(L._internals.rows().get("acme.atlassian.net/ACME-1/h1/s2").reopenedAt, undefined);
+  assert.equal(L._internals.rows().get(JSON.stringify(["acme.atlassian.net", "ACME-1", "h1", "s2"])).reopenedAt, undefined);
 });
 
 test("XERK-1839: aggregates are fleet-wide; rows only for a named org", () => {
@@ -117,7 +117,7 @@ test("XERK-1839: aggregates are fleet-wide; rows only for a named org", () => {
 test("XERK-1839: malformed observations are dropped, strings bounded", () => {
   L._internals.reset();
   L.observe([
-    obs({ issue: "../../etc" }), obs({ sid: "" }), obs({ site: "a/b" }), null, 7,
+    obs({ issue: "../../etc" }), obs({ sid: "" }), obs({ site: "" }), null, 7,
     obs({ sid: "ok", type: "Weird Type!!" + "x".repeat(200), model: "\u0007GPT-9 <b>",
       prs: [{ url: "javascript:alert(1)" }, { url: "https://x/pull/1", state: "BOGUS" }] }),
   ], T0);
@@ -167,12 +167,14 @@ test("XERK-1839: the Postgres backend upserts monotone and rescans newest-wins",
         return [];
       }
       if (/^SELECT doc/.test(sql)) return [...table.values()];
+      if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
       throw new Error(`unexpected SQL ${sql}`);
     },
   };
   L._internals.reset();
   const store = new L.OutcomeLedgerPgStore(pool);
   L._internals.setBackend(store);
+  await store.rescan(T0);          // a fresh store folds nothing until it has loaded
   L.observe([obs()], T0);
   await store._drain();
   assert.equal(table.size, 1);
@@ -185,6 +187,64 @@ test("XERK-1839: the Postgres backend upserts monotone and rescans newest-wins",
   L._internals.rows().clear();
   await store.rescan(T0);
   assert.equal(only().model, "opus");
+  // Until a rescan has loaded the table, a sweep folds nothing.
+  store.loaded = false;
+  assert.equal(L.observe([obs({ sid: "s-late" })], T0 + 10).length, 0);
+  store.loaded = true;
+  // A row evicted from the model is deleted from the table too.
+  L.observe([obs({ sid: "s-old" })], T0 - 400 * DAY);
+  L.observe([obs({ sid: "s-new" })], T0 + 20);
+  await store._drain();
+  assert.ok(![...table.keys()].some((k) => k.includes("s-old")));
   await store.close();
   L._internals.reset();
+});
+
+test("XERK-1839: an Azure DevOps org (a '/' in its site key) is recorded", () => {
+  L._internals.reset();
+  L.observe([obs({ site: "dev.azure.com/myorg", issue: "123" })], T0);
+  const r = only();
+  assert.equal(r.site, "dev.azure.com/myorg");
+  assert.equal(L.aggregate({ site: "dev.azure.com/myorg", withRows: true, now: T0 }).rows.length, 1);
+});
+
+test("XERK-1839: a mix of CLOSED and OPEN PRs is still pending, never bad", () => {
+  L._internals.reset();
+  L.observe([obs({ prs: [{ url: "https://x/pull/1", state: "CLOSED" },
+    { url: "https://x/pull/2", state: "OPEN" }] })], T0);
+  assert.deepEqual(L.outcomeOf(only(), T0), { outcome: "pending", reason: "PR open" });
+});
+
+test("XERK-1839: Done is dated by the tracker, so a session begun after it is not 'reopened'", () => {
+  L._internals.reset();
+  // The ticket resolved on day 1; the board still shows Done when s2 starts on day 3.
+  L.observe([obs({ sid: "s2", createdAt: "2026-10-04T00:00:00Z", statusCategory: "done",
+    resolved: "2026-10-02T00:00:00Z" })], T0 + 3 * DAY);
+  assert.equal(only().doneAt, T0 + DAY);
+  L.observe([obs({ sid: "s2", createdAt: "2026-10-04T00:00:00Z", statusCategory: "inprogress" })], T0 + 4 * DAY);
+  assert.equal(only().reopenedAt, undefined);
+  assert.notEqual(L.outcomeOf(only(), T0 + 4 * DAY).reason, "reopened");
+});
+
+test("XERK-1839: one host or org churning sessions cannot evict the rest of the fleet", () => {
+  L._internals.reset();
+  const rival = Array.from({ length: 50 }, (_, i) => obs({ site: "rival.atlassian.net",
+    issue: `RIV-${i}`, host: "good", sid: `r${i}`, prs: [{ url: "https://x/pull/1", state: "MERGED" }] }));
+  L.observe(rival, T0);
+  for (let round = 0; round < 5; round++) {
+    L.observe(Array.from({ length: 4000 }, (_, i) => obs({ site: "evil.atlassian.net",
+      issue: "EV-1", host: "evil", sid: `e${round}-${i}` })), T0 + round + 1);
+  }
+  const all = [...L._internals.rows().values()];
+  assert.equal(all.filter((r) => r.site === "rival.atlassian.net").length, 50);
+  assert.ok(all.filter((r) => r.host === "evil").length <= Math.floor(L.MAX_ROWS / 4));
+});
+
+test("XERK-1839: /metrics label sets stay bounded whatever models the agents report", () => {
+  L._internals.reset();
+  L.observe(Array.from({ length: 300 }, (_, i) => obs({ sid: `m${i}`, modelActual: `local-model-${i}`,
+    type: `Type${i}` })), T0);
+  const lines = L.metricsText(T0).split("\n").filter((l) => l.startsWith("turma_model_outcomes{"));
+  assert.ok(lines.length <= 21 * 5, `${lines.length} series`);
+  assert.match(L.metricsText(T0), /model="other"/);
 });

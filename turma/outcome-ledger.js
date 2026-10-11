@@ -47,11 +47,21 @@ const FILE_MAX_BYTES = positiveEnv("OUTCOME_LEDGER_FILE_MAX", 16 << 20);
 const SAVE_DEBOUNCE_MS = positiveEnv("OUTCOME_LEDGER_SAVE_MS", 5000);
 const DAY_MS = 86400000;
 const PRS_MAX = 10;
+// One host may hold at most this many rows, and past MAX_ROWS the org holding the
+// most rows loses its oldest first — so one host or org churning session ids
+// cannot push the rest of the fleet's evidence out.
+const HOST_MAX_ROWS = positiveEnv("OUTCOME_LEDGER_HOST_MAX_ROWS", Math.max(1, Math.floor(MAX_ROWS / 4)));
+// /metrics labels a model outside these families "other": a model id is
+// agent-supplied, and every distinct one would add series to an unauthenticated route.
+const METRIC_MODELS = new Set(["opus", "sonnet", "haiku", "default"]);
+const METRIC_CLASSES_MAX = 20;
 const ROWS_SERVED_MAX = 500;
 
 // ---- shapes ----------------------------------------------------------------------
 
-const KEY_PART_RE = /^[^\u0000-\u001f\u007f/]{1,200}$/;
+// A site may contain '/' (ADO's `dev.azure.com/<org>`), so the key is a JSON tuple,
+// never a '/'-joined path.
+const KEY_PART_RE = /^[^\u0000-\u001f\u007f]{1,200}$/;
 const ISSUE_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SID_RE = /^[A-Za-z0-9._-]{1,100}$/;
 const PR_STATES = new Set(["OPEN", "MERGED", "CLOSED", "DRAFT"]);
@@ -141,7 +151,7 @@ function sanitizeRow(r) {
 }
 
 function rowKey(site, issue, host, sid) {
-  return `${site}/${issue}/${host}/${sid}`;
+  return JSON.stringify([site, issue, host, sid]);
 }
 
 // ---- the model ------------------------------------------------------------------
@@ -158,8 +168,12 @@ let backend = null;            // set below
  */
 function observe(observations, now = Date.now()) {
   if (!Array.isArray(observations)) return [];
+  // Under HA, never fold into a model the of-record has not been read into yet: a
+  // promoted leader's stale snapshot would win the newer-wins upsert over rows
+  // another replica wrote.
+  if (backend.loaded === false) return [];
   const changed = new Map();
-  const ticketDone = new Map();     // site/issue -> statusCategory seen this sweep
+  const ticketDone = new Map();     // [site, issue] -> {cat, resolvedAt} seen this sweep
   for (const o of observations) {
     if (!o || typeof o !== "object") continue;
     const base = sanitizeRow({
@@ -195,8 +209,10 @@ function observe(observations, now = Date.now()) {
     }
     if (CLOSE_KINDS.has(o.closeKind)) next.closeKind = o.closeKind;
     mergePrs(next, o.prs, now);
-    const tkey = `${base.site}/${base.issue}`;
-    if (typeof o.statusCategory === "string") ticketDone.set(tkey, o.statusCategory);
+    const tkey = JSON.stringify([base.site, base.issue]);
+    if (typeof o.statusCategory === "string") {
+      ticketDone.set(tkey, { cat: o.statusCategory, resolvedAt: timeOf(o.resolved) });
+    }
     commit(prev, next, now, changed);
   }
   // Ticket status edges, applied to every row of that ticket: Done stamps doneAt;
@@ -205,17 +221,19 @@ function observe(observations, now = Date.now()) {
   const byTicket = new Map();
   if (ticketDone.size) {
     for (const r of rows.values()) {
-      const tkey = `${r.site}/${r.issue}`;
+      const tkey = JSON.stringify([r.site, r.issue]);
       if (!ticketDone.has(tkey)) continue;
       if (!byTicket.has(tkey)) byTicket.set(tkey, []);
       byTicket.get(tkey).push(r);
     }
   }
-  for (const [tkey, cat] of ticketDone) {
+  for (const [tkey, { cat, resolvedAt }] of ticketDone) {
     for (const r of byTicket.get(tkey) || []) {
       const next = { ...r };
       if (cat === "done") {
-        if (!next.doneAt) next.doneAt = now;
+        // The tracker's own resolution time when it has one: a session first seen
+        // while the board still shows an earlier Done started AFTER it.
+        if (!next.doneAt) next.doneAt = resolvedAt && resolvedAt <= now ? resolvedAt : now;
       } else if (next.doneAt && !next.reopenedAt && (next.startedAt || next.firstSeen) < next.doneAt) {
         next.reopenedAt = now;
       }
@@ -223,9 +241,10 @@ function observe(observations, now = Date.now()) {
     }
   }
   if (changed.size) {
-    evict(now);
+    const dropped = evict(now);
     const live = [...changed.values()].filter((r) => rows.get(r.key) === r);
     if (live.length) backend.onChange(live);
+    if (dropped.length && backend.onDelete) backend.onDelete(dropped);
   }
   return [...changed.values()];
 }
@@ -261,12 +280,38 @@ function commit(prev, next, now, changed) {
   changed.set(clean.key, clean);
 }
 
+// Drop rows past retention, then any host past its share, then — past MAX_ROWS —
+// the oldest row of whichever org holds the most. Returns the keys dropped.
 function evict(now = Date.now()) {
   const cutoff = now - RETAIN_DAYS * DAY_MS;
-  for (const [k, r] of rows) if (r.updatedAt < cutoff) rows.delete(k);
-  if (rows.size <= MAX_ROWS) return;
-  const oldest = [...rows.values()].sort((a, b) => a.updatedAt - b.updatedAt);
-  for (const r of oldest.slice(0, rows.size - MAX_ROWS)) rows.delete(r.key);
+  const dropped = [];
+  const drop = (r) => { rows.delete(r.key); dropped.push(r.key); };
+  const byHost = new Map();
+  for (const r of rows.values()) {
+    if (r.updatedAt < cutoff) { drop(r); continue; }
+    if (!byHost.has(r.host)) byHost.set(r.host, []);
+    byHost.get(r.host).push(r);
+  }
+  for (const list of byHost.values()) {
+    if (list.length <= HOST_MAX_ROWS) continue;
+    list.sort((a, b) => a.updatedAt - b.updatedAt);
+    for (const r of list.slice(0, list.length - HOST_MAX_ROWS)) drop(r);
+  }
+  let over = rows.size - MAX_ROWS;
+  if (over <= 0) return dropped;
+  const bySite = new Map();
+  for (const r of rows.values()) {
+    if (!bySite.has(r.site)) bySite.set(r.site, []);
+    bySite.get(r.site).push(r);
+  }
+  for (const list of bySite.values()) list.sort((a, b) => b.updatedAt - a.updatedAt); // oldest last
+  while (over > 0) {
+    let big = null;
+    for (const list of bySite.values()) if (!big || list.length > big.length) big = list;
+    drop(big.pop());
+    over -= 1;
+  }
+  return dropped;
 }
 
 // ---- reads ---------------------------------------------------------------------
@@ -333,10 +378,25 @@ function aggregate({ site = null, withRows = false, now = Date.now(), windowDays
 
 /** Per (class, model, outcome) counts for /metrics (no host, ticket or session). */
 function metricsText(now = Date.now()) {
-  const { groups } = aggregate({ now });
+  // Bounded label sets: models outside the known families read "other", and only
+  // the largest METRIC_CLASSES_MAX classes keep their name.
+  const merged = new Map();
+  const raw = aggregate({ now }).groups;
+  const classTotals = new Map();
+  for (const g of raw) classTotals.set(g.cls, (classTotals.get(g.cls) || 0) + g.sessions);
+  const keep = new Set([...classTotals].sort((a, b) => b[1] - a[1]).slice(0, METRIC_CLASSES_MAX)
+    .map(([c]) => c));
+  for (const g of raw) {
+    const cls = keep.has(g.cls) ? g.cls : "other";
+    const model = METRIC_MODELS.has(g.model) ? g.model : "other";
+    const k = `${cls}\u0000${model}`;
+    const m = merged.get(k) || { cls, model };
+    for (const o of OUTCOMES) m[o] = (m[o] || 0) + g[o];
+    merged.set(k, m);
+  }
   let out = "# HELP turma_model_outcomes Ticket sessions in the outcome ledger, by work " +
     "class, model and outcome.\n# TYPE turma_model_outcomes gauge\n";
-  for (const g of groups) {
+  for (const g of merged.values()) {
     for (const o of OUTCOMES) {
       out += `turma_model_outcomes{class="${g.cls}",model="${g.model}",outcome="${o}"} ${g[o]}\n`;
     }
@@ -417,6 +477,9 @@ class OutcomeLedgerPgStore {
     this._readyWork = null;
     this._schemaReady = false;
     this._onExternalChange = typeof cfg.onExternalChange === "function" ? cfg.onExternalChange : null;
+    // False until a rescan has read the table into the model; observe() waits on it.
+    this.loaded = false;
+    this._deletes = [];
   }
 
   async init() {
@@ -464,6 +527,7 @@ class OutcomeLedgerPgStore {
   // recently than the table's copy (a write held back by an outage) is kept and
   // re-queued; a hot row the table lacks is re-queued too.
   async rescan(now = Date.now()) {
+    this.loaded = false;
     await this._ensureSchema();
     const got = (await this.pool.query(
       `SELECT doc FROM ${this.table} ORDER BY updated_at DESC LIMIT $1`, [String(MAX_ROWS)])) || [];
@@ -479,9 +543,11 @@ class OutcomeLedgerPgStore {
       if (hot && hot.updatedAt > r.updatedAt) { stale.push(hot); continue; }
       rows.set(r.key, r);
     }
-    evict(now);
+    const dropped = evict(now);
     for (const r of rows.values()) if (!held.has(r.key)) stale.push(r);
     if (stale.length) this.onChange(stale);
+    if (dropped.length) this.onDelete(dropped);
+    this.loaded = true;
     if (this._onExternalChange) { try { this._onExternalChange(); } catch { /* never breaks a scan */ } }
   }
 
@@ -492,9 +558,16 @@ class OutcomeLedgerPgStore {
     this._drain();
   }
 
+  // Rows evicted from the model leave the table too, so it stays as bounded as the model.
+  onDelete(keys) {
+    this._deletes.push(...keys);
+    if (this._deletes.length > PG_QUEUE_MAX) this._deletes.splice(0, this._deletes.length - PG_QUEUE_MAX);
+    this._drain();
+  }
+
   _drain() {
     if (this._draining) return this._draining;
-    if (this._closed || !this._queue.length) return Promise.resolve();
+    if (this._closed || (!this._queue.length && !this._deletes.length)) return Promise.resolve();
     this._draining = (async () => {
       await null;
       try {
@@ -515,7 +588,19 @@ class OutcomeLedgerPgStore {
           } catch (e) {
             this._queue.unshift(...batch);
             console.error(`outcome ledger: Postgres write failed (${(e && e.message) || e}); ${batch.length} row(s) held for retry`);
-            break;
+            return;
+          }
+        }
+        while (this._deletes.length) {
+          const batch = this._deletes.splice(0, PG_ROWS_PER_INSERT);
+          try {
+            await this.pool.query(
+              `DELETE FROM ${this.table} WHERE key IN (${batch.map((_, i) => `$${i + 1}`).join(", ")})`,
+              batch);
+          } catch (e) {
+            this._deletes.unshift(...batch);
+            console.error(`outcome ledger: Postgres delete failed (${(e && e.message) || e}); held for retry`);
+            return;
           }
         }
       } finally {
