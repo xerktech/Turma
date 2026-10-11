@@ -7613,7 +7613,7 @@ test("http: starting a ticket session queues spawnTicket on the org's host", asy
   // and is stripped before the reply — the next test asserts that.
   assert.deepEqual(agents.ts1.commands, [
     { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
-      ticketSite: "t1.atlassian.net", cmdId: res.body.cmdId },
+      ticketSite: "t1.atlassian.net", model: "haiku", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -7623,7 +7623,7 @@ test("http: the ticket spawn rides the heartbeat like any other command", async 
     { headers: userHeaders });
   const beat = await ticketBeat("ts2", "t2.atlassian.net");
   assert.deepEqual(beat.body.commands, [
-    { type: "spawnTicket", issueKey: "ENG-5", cmdId: res.body.cmdId },
+    { type: "spawnTicket", issueKey: "ENG-5", model: "haiku", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -7743,7 +7743,7 @@ test("http: no online host has the repo -> routes anyway and clones on demand", 
   assert.equal(res.body.needsClone, true);
   assert.deepEqual(agents.ts5.commands, [
     { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
-      ticketSite: "t5.atlassian.net", cmdId: res.body.cmdId },
+      ticketSite: "t5.atlassian.net", model: "haiku", cmdId: res.body.cmdId },
   ]);
 });
 
@@ -8015,14 +8015,97 @@ test("http: a model-pinned ticket carries the model on its spawnTicket command",
   ]);
 });
 
-test("http: an unpinned ticket spawns with no model on the command (unchanged)", async () => {
+test("XERK-1827: an unpinned ticket's first session starts on the ladder's bottom tier", async () => {
   await ticketBeat("tmNone", "tmNone.atlassian.net");
   const res = await request("POST", "/api/jira/tmNone.atlassian.net/ENG-5/session",
     { headers: userHeaders });
   assert.deepEqual(agents.tmNone.commands, [
     { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
-      ticketSite: "tmNone.atlassian.net", cmdId: res.body.cmdId },
+      ticketSite: "tmNone.atlassian.net", model: "haiku", cmdId: res.body.cmdId },
   ]);
+});
+
+// The ticket model ladder (XERK-1827): a session of the ticket that ENDED with no
+// PR and no close-ticket outcome is a failed attempt on its model; the next start
+// runs one tier up, capped at the top.
+const ladderBeat = (device, site, { sessions = [], closed = [] } = {}) =>
+  request("POST", "/api/heartbeat", {
+    body: {
+      device,
+      repos: [{ name: "Turma", path: "/git/Turma" }],
+      sessions, closedSessions: closed,
+      jira: {
+        available: true, configured: true, siteKey: site, user: `${device}@x.com`,
+        fetchedAt: "2026-07-14T12:00:00Z",
+        tickets: [{ key: "ENG-5", summary: "Fix it", repoGuess: { repo: "Turma", cloned: true } }],
+      },
+    },
+    headers: agentHeaders,
+  });
+const ladderTicket = (site, extra = {}) =>
+  ({ key: "ENG-5", siteKey: site, url: "u", summary: "s", branch: "ENG-5", ...extra });
+
+test("XERK-1827: an undelivered haiku session escalates the next start to sonnet, then opus", async () => {
+  const site = "lad1.atlassian.net";
+  await ladderBeat("lad1", site);   // bind the org first
+  await ladderBeat("lad1", site, { closed: [
+    { id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site), prs: [] }] });
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "sonnet", escalatedFrom: "haiku" });
+  const res = await request("POST", `/api/jira/${site}/ENG-5/session`, { headers: userHeaders });
+  assert.deepEqual(agents.lad1.commands, [
+    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual", ticketSite: site,
+      model: "sonnet", escalatedFrom: "haiku", cmdId: res.body.cmdId },
+  ]);
+  // A failed sonnet session too: opus, and opus stays the ceiling after that.
+  await ladderBeat("lad1", site, { closed: [
+    { id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site) },
+    { id: "b", repo: "Turma", model: "sonnet", ticket: ladderTicket(site) }] });
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "opus", escalatedFrom: "sonnet" });
+  await ladderBeat("lad1", site, { sessions: [
+    { id: "c", repo: "Turma", status: "error", model: "opus", ticket: ladderTicket(site) }] });
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "opus", escalatedFrom: "opus" });
+});
+
+test("XERK-1827: a delivered, running, paused or model-less session is no failed attempt", async () => {
+  const site = "lad2.atlassian.net";
+  await ladderBeat("lad2", site);
+  await ladderBeat("lad2", site, {
+    sessions: [{ id: "r", repo: "Turma", status: "running", model: "haiku", ticket: ladderTicket(site) }],
+    closed: [
+      { id: "p", repo: "Turma", model: "haiku", ticket: ladderTicket(site),
+        prs: [{ url: "https://github.com/x/y/pull/1", state: "OPEN" }] },
+      { id: "o", repo: "Turma", model: "sonnet",
+        ticket: ladderTicket(site, { outcome: { kind: "not-reproducible", at: 1 } }) },
+      { id: "z", repo: "Turma", model: "sonnet", ticket: ladderTicket(site),
+        paused: { wakeAt: Date.now() + 3600000 } },
+      { id: "n", repo: "Turma", ticket: ladderTicket(site) },
+      // Another ticket's failure says nothing about this one.
+      { id: "q", repo: "Turma", model: "sonnet", ticket: { ...ladderTicket(site), key: "ENG-9" } },
+    ],
+  });
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
+});
+
+test("XERK-1827: the operator's model pin and a non-claude runtime pin bypass the ladder", async () => {
+  const site = "lad3.atlassian.net";
+  await ladderBeat("lad3", site);
+  await ladderBeat("lad3", site, { closed: [
+    { id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }] });
+  assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", { runtime: "dsh" }), {});
+  await setModel(site, "ENG-5", { model: "opus" });
+  assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null), { model: "opus" });
+  assert.equal(hub.ticketLadderPick(site, "ENG-5", []), null);   // ladder off
+});
+
+test("XERK-1827: a closed session's model is kept only as a plain alias", async () => {
+  const site = "lad4.atlassian.net";
+  await ladderBeat("lad4", site);
+  await ladderBeat("lad4", site, { closed: [
+    { id: "a", repo: "Turma", model: { evil: 1 }, ticket: ladderTicket(site) },
+    { id: "b", repo: "Turma", model: "x'; rm", ticket: ladderTicket(site) }] });
+  const closed = agents.lad4.closedSessions;
+  assert.ok(!("model" in closed[0]) && !("model" in closed[1]));
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
 });
 
 // POST /api/jira/<siteKey>/<issueKey>/runtime — the operator's per-ticket

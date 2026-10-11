@@ -2549,6 +2549,82 @@ function setTicketModel(siteKey, issueKey, model) {
   sseBroadcast("ticketModels", ticketModels);
 }
 
+// ---- ticket model ladder (XERK-1827) ---------------------------------------
+// An UNPINNED claude ticket session starts on the cheapest tier, and each start
+// after a session of the ticket ENDED UNDELIVERED moves one tier up. The XERK-445
+// replay set measured haiku-4-5 solving 72% at ~1/5 of opus's cost, haiku and
+// sonnet each solving 3 tasks the other missed, and opus as a quota-limited last
+// resort (docs/routing-spike-phase2-3.md). Per SESSION, never per turn: a switch
+// mid-conversation makes the new model re-cache every turn it missed.
+//   - The ladder is derived from the fleet payload, not stored: a session of the
+//     ticket that is no longer running (killed, exited, errored) with NO PR and NO
+//     close-ticket outcome is a failed attempt on its `model`. The next start runs
+//     one tier above the highest failed one, capped at the top.
+//   - Only ladder models count. A session with no recorded model (an agent
+//     predating this, or a pre-ladder login-default session) is no evidence, so a
+//     host that forgets its closed history only ever costs a cheaper retry.
+//   - A paused sleeper (XERK-1575) is waiting, not failed.
+//   - The operator's model pin (XERK-123) always wins, and dsh/qwen sessions are
+//     never laddered (their model is the host's endpoint, not a Claude alias).
+// TICKET_MODEL_LADDER (comma list of aliases) replaces it; set it to "off" to
+// return unpinned tickets to the login's default model. bench/run_policy.py's
+// "ladder" policy replays exactly this list — keep the two equal (pinned by
+// bench/tests/test_policy.py).
+const TICKET_MODEL_LADDER_DEFAULT = ["haiku", "sonnet", "opus"];
+const TICKET_MODEL_LADDER = (() => {
+  const raw = (process.env.TICKET_MODEL_LADDER || "").trim().toLowerCase();
+  if (!raw) return TICKET_MODEL_LADDER_DEFAULT;
+  if (raw === "off" || raw === "none") return [];
+  const list = raw.split(",").map((s) => s.trim()).filter((s) => /^[a-z0-9.-]{1,40}$/.test(s));
+  if (!list.length) {
+    console.warn(`TICKET_MODEL_LADDER=${JSON.stringify(raw)} names no usable alias; using the default`);
+    return TICKET_MODEL_LADDER_DEFAULT;
+  }
+  return list;
+})();
+
+// Every session of this ticket the fleet still knows about, on hosts BOUND to its
+// org (the startedTicketKeys rule: a drifted host's claim is not this org's work).
+function ticketSessionRecords(siteKey, issueKey) {
+  const out = [];
+  for (const a of Object.values(agents)) {
+    if (boundOrgOf(a) !== siteKey) continue;
+    const mine = (s) => s && s.ticket && s.ticket.key === issueKey && s.ticket.siteKey === siteKey;
+    for (const s of a.sessions || []) if (mine(s)) out.push({ rec: s, live: true });
+    for (const c of a.closedSessions || []) if (mine(c)) out.push({ rec: c, live: false });
+  }
+  return out;
+}
+
+// The tier an UNPINNED claude ticket spawn should run on: {model, escalatedFrom?}
+// or null when the ladder is off. Pure over the fleet payload, so it is read at
+// DISPATCH (Start button and queue drain alike) like the model pin.
+function ticketLadderPick(siteKey, issueKey, ladder = TICKET_MODEL_LADDER) {
+  if (!ladder.length) return null;
+  let failed = -1;
+  for (const { rec, live } of ticketSessionRecords(siteKey, issueKey)) {
+    if (live && (rec.status === "running" || rec.status === "queued")) continue;
+    if (rec.paused) continue;
+    const delivered = (Array.isArray(rec.prs) && rec.prs.length > 0)
+      || (Array.isArray(rec.prUrls) && rec.prUrls.length > 0)
+      || !!(rec.ticket && rec.ticket.outcome);
+    if (delivered) continue;
+    const tier = ladder.indexOf(typeof rec.model === "string" ? rec.model : "");
+    if (tier > failed) failed = tier;
+  }
+  const next = Math.min(failed + 1, ladder.length - 1);
+  return failed >= 0 ? { model: ladder[next], escalatedFrom: ladder[failed] } : { model: ladder[next] };
+}
+
+// The model fields a spawnTicket command carries: the operator's pin as-is, else
+// the ladder's pick for a claude session, else nothing (the login's default).
+function ticketSpawnModelFields(siteKey, issueKey, rpin) {
+  const mpin = ticketModelPin(siteKey, issueKey);
+  if (mpin) return { model: mpin.model };
+  if (rpin && rpin.runtime && rpin.runtime !== "claude") return {};
+  return ticketLadderPick(siteKey, issueKey) || {};
+}
+
 // ---- ticket -> runtime pins (XERK-473) -------------------------------------
 // The operator's answer to which RUNTIME a ticket's session runs on — "claude"
 // (the default) or "dsh" (XERK-460). Keyed "<siteKey>/<issueKey>" like the model
@@ -9559,6 +9635,11 @@ function normalizeClosedSessions(a) {
     }
     if ("ticket" in c && !objectish(c.ticket)) delete c.ticket;
     if (objectish(c.ticket)) coerceTicketOutcome(c.ticket);
+    // The alias the session was spawned on (XERK-1827, the ticket model ladder
+    // reads it). Untyped on Android; a non-alias value drops to absent.
+    if ("model" in c && !(typeof c.model === "string" && /^[a-z0-9.-]{1,40}$/.test(c.model))) {
+      delete c.model;
+    }
     // A sleeper paused for its slot (XERK-1575): {wakeAt, wakeReason?, at?}.
     // Android TYPES it, so it is rebuilt field by field or dropped whole.
     if ("paused" in c) {
@@ -13465,7 +13546,6 @@ function drainTicketQueue() {
     // The operator's model pin (XERK-123) rides the command, exactly as it does
     // from the Start button — read at DISPATCH so a pin changed while the ticket
     // waited is the one that takes effect.
-    const mpin = ticketModelPin(e.siteKey, e.issueKey);
     // The runtime pin (XERK-473) rides the command as `agentType`, read at
     // DISPATCH like the model pin so a pin changed while the ticket waited takes
     // effect. findTicketHost has already restricted the pool to a host that
@@ -13478,7 +13558,7 @@ function drainTicketQueue() {
     // before taking it (XERK-303).
     const dispatchedCmdId = queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
       ticketSource: e.source, ticketSite: e.siteKey,
-      ...(mpin ? { model: mpin.model } : {}),
+      ...ticketSpawnModelFields(e.siteKey, e.issueKey, rpin),
       ...(rpin ? { agentType: rpin.runtime } : {}) });
     rememberDispatch(e.siteKey, e.issueKey, dispatchedCmdId);
     const wait = Math.round((now - e.at) / 1000);
@@ -20722,15 +20802,13 @@ const server = http.createServer(async (req, res) => {
       // this is a genuine fresh start — queue one.
       // The operator's model pin (XERK-123) rides the command the hub already
       // routes — the agent has no per-ticket ledger of its own to read it from.
-      // Omitted when unpinned, so a ticket with no model choice spawns exactly as
-      // it always did (the agent's default model).
-      const mpin = ticketModelPin(siteKey, issueKey);
+      // Unpinned, the ticket model ladder (XERK-1827) picks the tier instead.
       // The runtime pin (XERK-473) rides as `agentType`; findTicketHost above
       // already ensured `host` offers it. Omitted (claude) when unpinned.
       const rpin = ticketRuntimePin(siteKey, issueKey);
       const cmdId = queueCommand(host, { type: "spawnTicket", issueKey,
             ticketSource: "manual", ticketSite: siteKey,
-            ...(mpin ? { model: mpin.model } : {}),
+            ...ticketSpawnModelFields(siteKey, issueKey, rpin),
             ...(rpin ? { agentType: rpin.runtime } : {}) });
       // This ticket may ALREADY be waiting in the queue (the sweep queued it, or
       // a board that hadn't seen the queue yet clicked Start). Its session is
@@ -22355,6 +22433,9 @@ if (process.env.TURMA_TEST) {
     ticketAgents,
     ticketModels,
     ticketModelPin,
+    ticketLadderPick,
+    ticketSpawnModelFields,
+    TICKET_MODEL_LADDER,
     setTicketModel,
     orgModelAliases,
     ticketRuntimes,

@@ -36320,7 +36320,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model=None, agent_type=None)
+            "PROJ-7", cmd_id="c9", model=None, agent_type=None, escalated_from=None)
 
     def test_handle_commands_carries_the_model_pin(self):
         # The hub's per-ticket model pin (XERK-123) rides the command; the agent
@@ -36330,7 +36330,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "model": "opus", "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model="opus", agent_type=None)
+            "PROJ-7", cmd_id="c9", model="opus", agent_type=None, escalated_from=None)
 
     def test_handle_commands_carries_the_runtime_pin(self):
         # The hub's per-ticket runtime pin (XERK-473) rides the command as
@@ -36341,7 +36341,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "agentType": "dsh", "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model=None, agent_type="dsh")
+            "PROJ-7", cmd_id="c9", model=None, agent_type="dsh", escalated_from=None)
 
     def test_a_model_pin_lands_on_the_session_and_command_line(self):
         sm = self.make_ticket_manager()
@@ -36381,6 +36381,56 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sess = sm.registry[0]
         self.assertIsNone(sess["model"])            # omit --model = login default
         self.assertNotIn("--model", self._launches()[-1][-1])
+
+    def test_a_ladder_retry_tells_the_session_which_tier_missed(self):
+        # XERK-1827: the hub names the tier the last session failed on; the
+        # prompt says so, and the model rides --model like any pin.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", model="sonnet", escalated_from="haiku")
+        cmd = self._launches()[-1][-1]
+        self.assertIn("--model sonnet", cmd)
+        self.assertIn("A previous session on this ticket ran on haiku", cmd)
+
+    def test_a_first_attempt_and_a_hostile_escalated_from_carry_no_retry_line(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", model="haiku")
+        self.assertNotIn("A previous session", self._launches()[-1][-1])
+        sm2 = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm2.spawn_ticket("PROJ-7", model="haiku", escalated_from="x'; rm -rf /")
+        self.assertNotIn("A previous session", self._launches()[-1][-1])
+
+    def test_a_ticket_session_sends_subagents_to_the_cheap_tier(self):
+        # XERK-1827: CLAUDE_CODE_SUBAGENT_MODEL is the default for agents that
+        # name no model; only ticket sessions get it.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
+            sm.spawn_ticket("PROJ-7")
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=haiku ", self._launches()[-1][-1])
+
+    def test_subagent_model_is_never_set_off_ticket_local_or_over_the_operator(self):
+        f = ha.SessionManager._ticket_subagent_model
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
+            self.assertIsNone(f({}, False))                       # bare session
+            self.assertIsNone(f({"ticket": {"key": "P-1"}}, True))  # failed over
+            self.assertEqual(f({"ticket": {"key": "P-1"}}, False), "haiku")
+            os.environ["CLAUDE_CODE_SUBAGENT_MODEL"] = "opus"
+            self.assertIsNone(f({"ticket": {"key": "P-1"}}, False))
+
+    def test_an_ended_ticket_session_reports_its_model(self):
+        # The hub's ladder reads a failed session's tier off closedSessions.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", model="haiku")
+        sm.kill(sm.registry[0]["id"])
+        closed = sm._closed_payload()
+        self.assertEqual(closed[0]["model"], "haiku")
+        self.assertEqual(closed[0]["ticket"]["key"], "PROJ-7")
 
     def test_hostile_ticket_text_cannot_break_out_of_the_command_line(self):
         # Ticket text is the one genuinely untrusted input here: unlike an
