@@ -23,9 +23,8 @@ paths:
   - A new drop always re-stamps the owed entry with the CURRENT term — an entry left from an
     earlier term would otherwise be skipped as stale, taking this leader's own drop with it (QA).
     An exhausted refill re-owes itself only if nothing newer is owed, for the same reason.
-- **Plain `replace` ops are NOT leader-gated**: the boot backfill (XERK-797) queues them before the
-  elector runs, and skipping one left a row with no entries (QA). A replace from a deposed replica
-  can still wipe a newer leader's appends: XERK-1836.
+- **The boot backfill's `replace` ops stay ungated** (only heal replaces are, XERK-1836): it queues
+  them before the elector runs, and skipping one left a row with no entries (QA).
 - **A failed refill stays owed**, retried every `INDEX_MIRROR_REFILL_RETRY_MS` (30s) by an unref'd
   timer, so an outage that drops ops is refilled once it ends. One Postgres refuses outright (SQLSTATE
   class 22/23/42, `indexMirrorPermanent`) is given up — retrying re-sent the whole transcript forever.
