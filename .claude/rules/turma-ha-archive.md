@@ -254,8 +254,8 @@ of-record**, so both halves of the ADR split now hold:
   camel↔snake mappers are unit-tested; the socket path is host-QA-only.
 - **The sink archive.js calls (`archive.setIndexSink`, no-op off HA) is SYNC + never throws** into
   the hot path — it enqueues; server.js's `IndexMirror` drains it to Postgres in a background loop
-  (bounded `INDEX_MIRROR_QUEUE_MAX`, drop-oldest on overflow: a lost mirror op self-heals — Postgres
-  is the of-record and a promotion re-hydrates the map from it). A SESSION mutation mirrors the FULL
+  (bounded `INDEX_MIRROR_QUEUE_MAX`, drop-oldest on overflow; a dropped op owes its transcript a
+  REFILL, `turma-ha-index-mirror.md`). A SESSION mutation mirrors the FULL
   row (re-read from the local index — the in-memory map in `pg` mode, the sqlite table otherwise) so
   the upsert never clobbers untouched metadata; ENTRIES mirror append-only by ordinal, or
   wholesale-replace on a reconcile (XERK-280).
