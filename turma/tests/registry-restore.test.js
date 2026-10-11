@@ -14,10 +14,9 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -35,7 +34,7 @@ process.env.STATE_FILE_MAX = "4096";
 // was OOM-killed at -m 256m before the share stopped being floored.
 process.env.AGENTS_MAX = "2000";
 
-const tmp = (name) => path.join(os.tmpdir(), `turma-regrestore-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-regrestore-${name}-${process.pid}.json`);
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");
 process.env.AUTOSTART_ORGS_FILE = tmp("autostart-orgs");

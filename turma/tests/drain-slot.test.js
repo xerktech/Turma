@@ -12,10 +12,9 @@
 
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const http = require("http");
 const test = require("node:test");
 const assert = require("node:assert/strict");
@@ -30,7 +29,7 @@ process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.MEMORY_LIMIT_BYTES = String(64 << 20);
 process.env.AGENTS_MAX = "500";
 
-const tmp = (name) => path.join(os.tmpdir(), `turma-drain-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-drain-${name}-${process.pid}.json`);
 process.env.STATE_FILE = tmp("state");
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");

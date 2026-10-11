@@ -6,9 +6,8 @@
 // at require time. Here group enforcement is ON (the default names) and the OIDC
 // session TTL is pinned short so the cookie's Max-Age can be asserted.
 
-const os = require("os");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const http = require("http");
 const crypto = require("crypto");
 const test = require("node:test");
@@ -36,7 +35,7 @@ process.env.TURMA_OIDC_ADMIN_GROUP = ADMIN_GROUP;
 const OIDC_TTL_MS = 3600 * 1000; // 1h
 process.env.TURMA_OIDC_SESSION_TTL_MS = String(OIDC_TTL_MS);
 
-const tmp = (name) => path.join(os.tmpdir(), `turma-oidcgrp-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-oidcgrp-${name}-${process.pid}.json`);
 process.env.STATE_FILE = tmp("state");
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");

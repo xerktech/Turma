@@ -12,9 +12,8 @@
 
 "use strict";
 
-const os = require("os");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
@@ -27,7 +26,7 @@ process.env.TURMA_AGENT_TOKEN = "agenttok";
 process.env.SESSION_SPEND_WARN_TOKENS = "300000000";
 process.env.SESSION_SPEND_HIGH_TOKENS = "200000000";
 
-const tmp = (name) => path.join(os.tmpdir(), `turma-spendcfg-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-spendcfg-${name}-${process.pid}.json`);
 process.env.STATE_FILE = tmp("state");
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");

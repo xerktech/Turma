@@ -7,13 +7,13 @@
 // it is not real repo work ("reattribute the real ones, fold the rest").
 "use strict";
 
-const os = require("os");
 const fs = require("fs");
 const path = require("path");
+const { scratchDir } = require("./tmpdirs");
 const test = require("node:test");
 const assert = require("node:assert/strict");
 
-const LEDGER = path.join(os.tmpdir(), `turma-usage-sysrepos-${process.pid}.json`);
+const LEDGER = path.join(scratchDir(), `turma-usage-sysrepos-${process.pid}.json`);
 process.env.USAGE_LEDGER_FILE = LEDGER;
 process.env.USAGE_SYSTEM_REPOS = "git, mhabeeb ,, workspace";
 try { fs.unlinkSync(LEDGER); } catch { /* first run */ }

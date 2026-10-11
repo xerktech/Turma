@@ -11,9 +11,8 @@
 
 "use strict";
 
-const os = require("os");
 const path = require("path");
-const { mkdtemp } = require("./tmpdirs");
+const { mkdtemp, scratchDir } = require("./tmpdirs");
 const http = require("http");
 const net = require("net");
 const crypto = require("crypto");
@@ -44,7 +43,7 @@ process.env.TURMA_OIDC_REDIRECT_URI = REDIRECT_URI;
 process.env.TURMA_OIDC_USER_GROUP = "";
 process.env.TURMA_OIDC_ADMIN_GROUP = "";
 
-const tmp = (name) => path.join(os.tmpdir(), `turma-oidc-${name}-${process.pid}.json`);
+const tmp = (name) => path.join(scratchDir(), `turma-oidc-${name}-${process.pid}.json`);
 process.env.STATE_FILE = tmp("state");
 process.env.DEVICES_FILE = tmp("devices");
 process.env.TICKET_AGENTS_FILE = tmp("ticket-agents");

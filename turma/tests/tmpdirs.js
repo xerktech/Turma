@@ -34,4 +34,14 @@ function mkdtemp(prefix) {
   return dir;
 }
 
-module.exports = { mkdtemp };
+// `scratchDir()` is the ONE tracked directory a suite roots its per-pid state
+// files under (STATE_FILE, DEVICES_FILE, ...) instead of os.tmpdir() itself, so
+// they — and any sibling the server writes next to them (`.oversized`, `.tmp`) —
+// go with the tree on exit (XERK-1828). Created lazily, once per process.
+let scratch = null;
+function scratchDir() {
+  if (!scratch) scratch = mkdtemp("turma-test-scratch-");
+  return scratch;
+}
+
+module.exports = { mkdtemp, scratchDir };

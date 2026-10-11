@@ -38,3 +38,20 @@ test("no test suite mkdtemps under os.tmpdir() without the self-cleaning helper"
     `these suites mkdtemp under os.tmpdir() directly and leak the tree on every run — ` +
     `use require("./tmpdirs").mkdtemp(prefix) instead: ${offenders.join(", ")}`);
 });
+
+// The same leak with no mkdtemp in sight (XERK-1828): a per-pid state file built as
+// `path.join(os.tmpdir(), "turma-...-${process.pid}.json")` is never removed either,
+// and a pid-unique name accretes one more file per run. Suites root those under
+// `scratchDir()` instead, so no suite needs os.tmpdir() at all.
+test("no test suite builds paths directly under os.tmpdir()", () => {
+  const offenders = [];
+  for (const name of fs.readdirSync(__dirname)) {
+    if (!name.endsWith(".test.js") || name === path.basename(__filename)) continue;
+    const src = fs.readFileSync(path.join(__dirname, name), "utf8");
+    if (/\bos\.tmpdir\(\)/.test(src)) offenders.push(name);
+  }
+  assert.deepEqual(
+    offenders, [],
+    `these suites write under os.tmpdir() directly and leak on every run — ` +
+    `use require("./tmpdirs").scratchDir() instead: ${offenders.join(", ")}`);
+});
