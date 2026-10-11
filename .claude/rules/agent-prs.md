@@ -99,7 +99,7 @@ DevOps, and what gets typed back because of it.
   branch-delete env-overridable). Outcome staged on `merge_pr_results`
   (`{cmdId, url, ok, error, retryable}`), keyed by cmdId, so the hub stops retrying a merge `gh`
   refuses. The hub half (the two sweeps, the eligibility gate, the backoff):
-  `.claude/rules/turma-board.md`.
+  `.claude/rules/turma-automerge.md`.
 - **The merge runs from a NEUTRAL, non-repo cwd (`REGISTRY_DIR`), NEVER the session worktree**
   (XERK-563). gh resolves owner/repo from the URL, so it needs no repo context — and `--delete-branch`
   from INSIDE a git worktree runs a local `git checkout <base>` for cleanup that collides with
@@ -157,3 +157,18 @@ DevOps, and what gets typed back because of it.
   migration packs as the top-level transcript), independent of each runtime's raw native-log sidecar
   (dsh's `<tid>/dsh/`, qwen's `<tid>/qwen/`). Tests: `TestDshPrAttribution`, `TestQwenPrAttribution`
   (drives the real qwen projector over `qwen_pr_corpus.json`).
+
+## PR-comment poller off the beat (XERK-543)
+
+Moved out of `CLAUDE.md`, which keeps the beat-budget rule (XERK-395) this serves.
+
+- **The PR-COMMENT poller is a FETCH/DELIVER SPLIT** (XERK-543), not on the slow-refresh worker.
+  Its `gh`/GitLab/ADO fetch (PR_COMMENTS_MAX per pass, same class as `refresh_pr_status`) runs on
+  its OWN worker (`_fetch_pr_comments`, staged by `_stage_pr_comment_fetch`), which stages raw
+  events (`_pr_comments_fetched`, REBOUND under `_pr_comments_lock` like `spawn_failures`); the beat
+  only DRAINS that and DELIVERS (`_deliver_pr_comments` — the baseline/new-key logic, `prCommentBase`
+  mutation, `save()`, `notify_session`). It could NOT ride the slow-refresh worker: that worker is
+  the single lock-free writer of caches the beat READS, whereas delivery MUTATES session records,
+  which is the beat's to own — so the network half moved off, the registry half stayed on. The
+  synchronous `_poll_pr_comments` (fetch-then-deliver) is kept only as the behavioural-test entry
+  point. One beat stale, accepted.
