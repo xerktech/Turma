@@ -20183,7 +20183,8 @@ const server = http.createServer(async (req, res) => {
         if (optionNumber < 1 || optionNumber > 9) {
           return json(res, 400, { error: "optionNumber 1-9 required" });
         }
-        if (body.dialogId !== undefined && !PANE_DIALOG_ID_RE.test(String(body.dialogId))) {
+        if (body.dialogId !== undefined
+          && !(typeof body.dialogId === "string" && PANE_DIALOG_ID_RE.test(body.dialogId))) {
           return json(res, 400, { error: "dialogId must be the dialog's served id" });
         }
         const servedId = servedPaneDialogId(agents[key], sessionId);

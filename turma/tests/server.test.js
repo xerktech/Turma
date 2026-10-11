@@ -5897,6 +5897,7 @@ test("XERK-1831: pane-prompt refuses a malformed dialog id or body", async () =>
   await request("POST", "/api/heartbeat", { body: { device: "pp5" }, headers: agentHeaders });
   for (const body of [{ optionNumber: 1, dialogId: 7 }, { optionNumber: 1, dialogId: "" },
     { optionNumber: 1, dialogId: "A".repeat(32) }, { optionNumber: 1, dialogId: "a".repeat(33) },
+    { optionNumber: 1, dialogId: ["a".repeat(32)] },
     null]) {
     const res = await request("POST", "/api/agents/pp5/sessions/sess1/pane-prompt", {
       body, headers: userHeaders,
