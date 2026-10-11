@@ -16960,12 +16960,12 @@ test("normalizeRecord coerces session summary: type, whitespace, length", () => 
 test("normalizeRecord rebuilds session.panePrompt to its typed shape or drops it", () => {
   // Android TYPES panePrompt (the blocking permission/plan dialog it answers),
   // and decodes /api/agents atomically — a wrong shape must never reach it.
-  const good = { prompt: "Do you want to proceed?", detail: "Bash command\n  ls",
+  const good = { prompt: "Do you want to proceed?", detail: "Bash command\n  ls", id: "0123456789abcdef0123456789abcdef",
     options: [{ number: 1, label: "Yes", selected: true }, { number: 2, label: "No", selected: false }] };
   const a = {
     sessions: [
       { id: "s1", session: { panePrompt: { ...good, extra: 1 } } },
-      { id: "s2", session: { panePrompt: { prompt: "Q", options: [{ number: "1", label: "Yes" },
+      { id: "s2", session: { panePrompt: { prompt: "Q", id: "NOT-A-DIGEST", options: [{ number: "1", label: "Yes" },
         { number: 12, label: "x" }, 7, { number: 3, label: {} }, { number: 2, label: "No", selected: "y" }],
         detail: {} } } },
       { id: "s3", session: { panePrompt: { prompt: "Q", options: [{ number: "1", label: "Yes" }] } } },

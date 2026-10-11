@@ -172,8 +172,12 @@ data class ChatUiState(
     )
 }
 
-/** What identifies one dialog for the just-answered guard: its question plus what it asks about. */
-internal fun panePromptKey(p: com.xerktech.turma.model.PanePrompt) = p.prompt + "\u0000" + p.detail
+/**
+ * What identifies one dialog for the just-answered guard: the agent's digest of
+ * it (XERK-1831), else its question plus what it asks about (an older agent).
+ */
+internal fun panePromptKey(p: com.xerktech.turma.model.PanePrompt) =
+    p.id.ifEmpty { p.prompt + "\u0000" + p.detail }
 
 /** The longest a just-answered dialog stays hidden while beats still report it (~2 agent beats). */
 internal const val PANE_ANSWER_HOLD_MS = 45_000L
@@ -614,10 +618,13 @@ class ChatViewModel(
      * once (web chat.js answerPanePrompt) and comes back if the POST fails.
      */
     fun answerPanePrompt(optionNumber: Int): Job? {
-        val prompt = _state.value.panePrompt?.let(::panePromptKey) ?: return null
+        val shown = _state.value.panePrompt ?: return null
+        val prompt = panePromptKey(shown)
         _state.update { it.copy(answeredPanePrompt = prompt, answeredPanePromptAt = System.currentTimeMillis()) }
         return viewModelScope.launch {
-            val r = runCatching { client.api.answerPanePrompt(host, sessionId, PanePromptAnswer(optionNumber)) }
+            val r = runCatching { client.api.answerPanePrompt(
+                host, sessionId, PanePromptAnswer(optionNumber, shown.id.ifEmpty { null }),
+            ) }
             if (r.isFailure) {
                 _state.update { if (it.answeredPanePrompt == prompt) it.copy(answeredPanePrompt = null) else it }
                 _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))

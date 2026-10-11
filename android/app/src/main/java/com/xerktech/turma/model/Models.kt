@@ -1230,6 +1230,10 @@ data class PanePrompt(
     val prompt: String = "",
     val options: List<PaneOption> = emptyList(),
     val detail: String = "",
+    // The agent's digest of the whole dialog (XERK-1831), sent back with the
+    // answer so it is never applied to a dialog that replaced this one. Empty
+    // from an agent predating it.
+    val id: String = "",
 )
 
 /** One numbered choice of a [PanePrompt]; [selected] is the TUI cursor's row. */

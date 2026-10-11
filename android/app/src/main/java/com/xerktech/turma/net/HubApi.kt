@@ -664,9 +664,13 @@ data class AnswerRequest(
     val optionIndices: List<Int>? = null,
 )
 
-/** The 1-based number the dialog itself displays (hub accepts 1-9). */
+/**
+ * The 1-based number the dialog itself displays (hub accepts 1-9), and the
+ * served `panePrompt.id` it was picked on (XERK-1831). A null id is omitted
+ * (explicitNulls=false) — the hub 400s a non-string one.
+ */
 @Serializable
-data class PanePromptAnswer(val optionNumber: Int)
+data class PanePromptAnswer(val optionNumber: Int, val dialogId: String? = null)
 
 /** The target agent a session should move to (XERK-101). */
 @Serializable

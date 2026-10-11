@@ -9498,7 +9498,9 @@ function coerceLiveSignals(live) {
   // selected}], detail} with right-typed leaves. A non-empty string `prompt` is
   // what makes it a dialog (attention, review, the sleeper guard all key on it),
   // so only a bad prompt drops it; a bad option is filtered. `number` is the
-  // digit the agent types, so only 1-9 survives.
+  // digit the agent types, so only 1-9 survives. `id` is the agent's digest of
+  // the whole dialog (XERK-1831), kept only in PANE_DIALOG_ID_RE's shape — an
+  // inline literal, since this runs on the boot-time restore, before that const.
   if ("panePrompt" in live) {
     const p = live.panePrompt;
     if (objectish(p) && typeof p.prompt === "string" && p.prompt) {
@@ -9508,7 +9510,8 @@ function coerceLiveSignals(live) {
           .map((o) => ({ number: o.number, label: o.label, selected: o.selected === true }))
         : [];
       live.panePrompt = { prompt: p.prompt, options,
-        detail: typeof p.detail === "string" ? p.detail : "" };
+        detail: typeof p.detail === "string" ? p.detail : "",
+        ...(typeof p.id === "string" && /^[0-9a-f]{32}$/.test(p.id) ? { id: p.id } : {}) };
     } else delete live.panePrompt;
   }
   coerceStringList(live, "questionOptions");

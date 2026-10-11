@@ -90,7 +90,7 @@ class ChatQuestionTest {
     private fun permission(prompt: String) = HubHarness.fleetJson(
         host = host,
         sessions = """{ "id": "$session", "repo": "Turma", "session": { "panePrompt": {
-            "prompt": "$prompt", "detail": "Bash command\\n  ls",
+            "prompt": "$prompt", "detail": "Bash command\\n  ls", "id": "0123456789abcdef0123456789abcdef",
             "options": [{"number":1,"label":"Yes","selected":true},{"number":2,"label":"No"}] } } }""",
     )
 
@@ -109,7 +109,8 @@ class ChatQuestionTest {
         // Let the POST + nudge finish inside the test, so nothing touches Main after it.
         kotlinx.coroutines.runBlocking { job?.join() }
         val req = hub.findRequest("/pane-prompt")
-        assertEquals("""{"optionNumber":2}""", req.body.readUtf8())
+        // The answer names the dialog it was picked on (XERK-1831).
+        assertEquals("""{"optionNumber":2,"dialogId":"0123456789abcdef0123456789abcdef"}""", req.body.readUtf8())
         vm.onLeave()
     }
 
