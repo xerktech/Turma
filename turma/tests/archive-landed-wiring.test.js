@@ -428,4 +428,35 @@ test("XERK-1450: the re-seat asks nothing while the mirror is busy or once depos
   }
 });
 
+test("XERK-1450: both wired publishing passes stop once this replica stops leading", async () => {
+  const seen = [];
+  const real = archive.dedupArchive;
+  archive.dedupArchive = async (o) => { if (o && o.publish) seen.push(o); return 0; };
+  const blob = { async list() { return []; }, async put() {}, async stat() { return null; },
+    async getToFile(k, dest) { fs.writeFileSync(dest, "x\n"); return true; } };
+  hub.setArchiveMirror(blob, true);
+  try {
+    await hub.hydrateArchiveOnce();                       // the leader's pass after the hydrate
+    const mirror = hub.getArchiveMirror();
+    mirror._blocked.set("repo/t.jsonl", "x");
+    await mirror.retryBlocked();                          // the late-landing pass
+    await new Promise((r) => setImmediate(r));
+    assert.equal(seen.length, 2);
+    for (const o of seen) {
+      assert.equal(typeof o.stillLeader, "function");
+      assert.equal(o.stillLeader(), true);
+      hub.__setLeader({ isLeader: () => false });
+      assert.equal(o.stillLeader(), false, "reads leadership live");
+      hub.__setLeader(null);
+    }
+  } finally {
+    archive.dedupArchive = real;
+    hub.__setLeader(null);
+    hub.setArchiveMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+    archive.setRenderedGate(null);
+  }
+});
+
 test.after(() => { if (hub.server && hub.server.close) hub.server.close(); });

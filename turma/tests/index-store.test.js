@@ -1525,3 +1525,13 @@ test("XERK-1450: a NUL in entry text never reaches Postgres", async () => {
     assert.deepEqual([...mem.entries.get("t-nul").values()].map((e) => e.text), ["ab", "xy"]);
   } finally { pgTeardown(); }
 });
+
+test("XERK-1450: two entries differing only by a NUL converge (the re-seat compares Postgres' text)", async () => {
+  const mem = pgSetup();
+  try {
+    archive.ingestChunk("nas", "t-nul2", META, 0, 100,
+      [ent("z0", "user", "ab", "2026-07-10T00:00:01Z"), ent("z0", "user", "a\u0000b", "2026-07-10T00:00:01Z")], "acme");
+    // Postgres stores both as "ab": two rows, one distinct — which its file also yields once stripped.
+    assert.equal(await archive.reseatIndexFromFiles([{ transcriptId: "t-nul2", msgCount: 2, n: 2, u: 1 }]), 0);
+  } finally { pgTeardown(); }
+});
