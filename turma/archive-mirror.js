@@ -69,6 +69,13 @@ const HYDRATE_CONCURRENCY = 8;
 // object on a slow link: ARCHIVE_TRANSCRIPT_MAX_BYTES (16 MiB) in 5 min is ~55 KB/s.
 // Shorter than HYDRATE_PASS_DEADLINE_MS, so a hung GET never reaches the stall bound.
 const GET_DEADLINE_MS = 5 * 60 * 1000;
+// A retryBlocked GET that hit its deadline gets twice as long next time, up to
+// this. With one flat cap a legitimately slow object (slower than ~55 KB/s for
+// 16 MiB) timed out on every retry and its transcript stayed blocked forever. The
+// ceiling keeps one hung key from holding the serial retry pass for hours; a
+// waiting hydrate never waits on it (`_yieldWake`).
+const RETRY_GET_DEADLINE_MAX_MS = 60 * 60 * 1000;
+const YIELDED = Symbol("yielded");
 const TIMED_OUT = Symbol("timedOut");
 // `p`, or TIMED_OUT once `ms` passes first. `p` itself is left running.
 async function raceDeadline(p, ms) {
@@ -125,6 +132,8 @@ class ArchiveMirror {
     this._blocked = new Map();
     this._retrying = null;   // the in-flight retryBlocked pass, so hydrate waits on it
     this._yieldRetry = false; // a hydrate is waiting: the retry pass stops after its current key
+    this._yieldWake = null;  // cuts the retry pass's in-flight GET short for a waiting hydrate
+    this._getDeadline = new Map(); // blocked key -> its escalated retry GET deadline (ms)
     this._retryLoop = false; // retryBlockedUntilClear is running
   }
 
@@ -227,7 +236,7 @@ class ArchiveMirror {
     let fetched = 0;
     try {
       // A retryBlocked pass renames files into place; never classify under it.
-      if (this._retrying) { this._yieldRetry = true; await this._retrying; }
+      if (this._retrying) { this._yieldRetry = true; this._yieldWake?.(); await this._retrying; }
       if (stale()) return 0;
       // [{key, size}] in one listing when the store can give sizes (S3 always
       // does); otherwise a HEAD per key, the pre-XERK-1043 shape.
@@ -460,6 +469,10 @@ class ArchiveMirror {
     if (!this.blobStore || this._hydrating || this._retrying || !this._blocked.size) return 0;
     let landed = 0;
     const done = [];
+    for (const k of [...this._getDeadline.keys()]) if (!this._blocked.has(k)) this._getDeadline.delete(k);
+    // A hydrate that starts waiting abandons the in-flight GET (its key stays
+    // blocked) rather than waiting out a deadline that may have escalated.
+    const yielded = new Promise((res) => { this._yieldWake = () => res(YIELDED); });
     const run = (async () => {
       for (const key of [...this._blocked.keys()]) {
         if (this._yieldRetry) break; // the rest wait for the next pass
@@ -468,15 +481,19 @@ class ArchiveMirror {
         // A GET past its deadline leaves the key blocked; if it lands later it is
         // discarded, never renamed in after the pass (and its reconcile) moved on.
         let abandoned = false;
+        const deadline = this._getDeadline.get(key) || getDeadlineMs;
         try {
-          const r = await raceDeadline(
-            this._download(key, dest, () => !abandoned && this._blocked.has(key)), getDeadlineMs);
+          const r = await raceDeadline(Promise.race([
+            this._download(key, dest, () => !abandoned && this._blocked.has(key)), yielded]), deadline);
+          if (r === YIELDED) { abandoned = true; break; }
           if (r === TIMED_OUT) {
             abandoned = true;
-            this._blocked.set(key, `${key} (GET did not finish within ${Math.round(getDeadlineMs / 1000)}s)`);
+            this._getDeadline.set(key, Math.min(deadline * 2, RETRY_GET_DEADLINE_MAX_MS));
+            this._blocked.set(key, `${key} (GET did not finish within ${Math.round(deadline / 1000)}s)`);
             continue;
           }
           if (r) landed++;
+          this._getDeadline.delete(key);
           done.push(key);
         } catch (e) {
           this._blocked.set(key, `${key} (${e && e.message})`);
@@ -484,7 +501,7 @@ class ArchiveMirror {
       }
     })();
     this._retrying = run;
-    try { await run; } finally { this._retrying = null; this._yieldRetry = false; }
+    try { await run; } finally { this._retrying = null; this._yieldRetry = false; this._yieldWake = null; }
     // Any unblock reconciles, not only a landing: a key that landed on a pass
     // whose reconcile threw, then 404'd, would otherwise open unreconciled.
     if (done.length) {
