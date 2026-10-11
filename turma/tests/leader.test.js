@@ -411,6 +411,96 @@ test("XERK-935: StandaloneLeader reports no other lease holder", () => {
   assert.equal(new StandaloneLeader("ha-no-lease").leaseHeldByOther(), false);
 });
 
+// XERK-1835: a renew whose RESPONSE is slow must not extend the leader's own
+// self-expiry past the renewTime it wrote. The lease carries the tick's start as
+// renewTime, so a standby reads it expired at tickStart + lease; the old leader's
+// isLeader() must have lapsed by then, not at putReturn + lease.
+test("XERK-1835: a slow renew PUT does not keep the old leader's isLeader() past the standby's expiry", async () => {
+  const api = fakeK8s();
+  const writeOnly = api.request;
+  api.request = async (method, path, body) => {
+    const r = await writeOnly(method, path, body);
+    // The server applies the write now; only the response is slow.
+    if (method === "PUT" && api.putDelayMs) await sleep(api.putDelayMs);
+    return r;
+  };
+  const a = elector(api, "pod-a", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
+  const b = elector(api, "pod-b", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
+  await a._tick(); // acquire (POST, no delay)
+
+  api.putDelayMs = 900;
+  const renewing = a._tick(); // renewTime = this tick's start; PUT response lands ~900ms later
+  await sleep(1050); // the lease A wrote is now past its 1000ms duration
+  api.putDelayMs = 0;
+  await b._tick();
+
+  assert.equal(api.lease.spec.holderIdentity, "pod-b", "the standby acquires the expired lease");
+  assert.equal(b.isLeader(), true);
+  assert.equal(a.isLeader(), false, "the old leader stepped down by the standby's expiry");
+  await renewing;
+});
+
+// XERK-1835 (QA): a late response to an OLDER renew must not move the stamp backwards,
+// and a renew answered after its lease already lapsed for standbys must not be held.
+test("XERK-1835: an out-of-order late renew does not drop a leader whose newer renew landed", () => {
+  const api = fakeK8s();
+  const a = elector(api, "pod-a", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
+  a._setLeader(true, Date.now());
+  const fresh = a._lastRenew;
+  a._setLeader(true, Date.now() - 1200); // the older renew's response, 1.2s late
+  assert.equal(a._lastRenew, fresh, "the stamp never moves backwards");
+  assert.equal(a.isLeader(), true);
+});
+
+test("XERK-1835: a renew answered after its lease lapsed for standbys is not held", () => {
+  const api = fakeK8s();
+  const a = elector(api, "pod-a", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
+  a._setLeader(true, Date.now() - 1500);
+  assert.equal(a.isLeader(), false);
+  assert.equal(a._leader, false);
+});
+
+// XERK-1835 (QA): an in-flight renew whose response returns AFTER release() or an abstain
+// must not re-arm leadership.
+test("XERK-1835: a renew answered after release() does not re-arm leadership", async () => {
+  const api = fakeK8s();
+  const a = elector(api, "pod-a", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
+  await a._tick(); // acquire
+  const send = a._request;
+  let slowed = false; // only the in-flight renew is slow; release()'s own PUT is not
+  a._request = async (method, path, body) => {
+    const r = await send(method, path, body);
+    if (method === "PUT" && !slowed) { slowed = true; await sleep(300); }
+    return r;
+  };
+  const renewing = a._tick();
+  await sleep(50);
+  await a.release();
+  await renewing;
+  assert.equal(a._leader, false);
+  assert.equal(a.isLeader(), false);
+});
+
+test("XERK-1835: a renew answered after canLead() turns false does not re-arm leadership", async () => {
+  const api = fakeK8s();
+  let canLead = true;
+  const a = elector(api, "pod-a", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
+  a._canLead = () => canLead;
+  await a._tick(); // acquire
+  const send = a._request;
+  a._request = async (method, path, body) => {
+    const r = await send(method, path, body);
+    if (method === "PUT") await sleep(300);
+    return r;
+  };
+  const renewing = a._tick();
+  await sleep(50);
+  canLead = false;
+  await renewing;
+  assert.equal(a._leader, false);
+  assert.equal(a.isLeader(), false);
+});
+
 function sleep(ms) {
   return new Promise((r) => setTimeout(r, ms));
 }
