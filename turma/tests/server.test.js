@@ -8062,8 +8062,59 @@ test("XERK-1827: an undelivered haiku session escalates the next start to sonnet
     { id: "b", repo: "Turma", model: "sonnet", ticket: ladderTicket(site) }] });
   assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "opus", escalatedFrom: "sonnet" });
   await ladderBeat("lad1", site, { sessions: [
-    { id: "c", repo: "Turma", status: "error", model: "opus", ticket: ladderTicket(site) }] });
+    { id: "c", repo: "Turma", status: "stopped", model: "opus", ticket: ladderTicket(site) }] });
   assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "opus", escalatedFrom: "opus" });
+});
+
+test("XERK-1827: a live error or queued record never climbs the ladder (infra is not a miss)", async () => {
+  const site = "lad5.atlassian.net";
+  await ladderBeat("lad5", site);
+  await ladderBeat("lad5", site, { sessions: [
+    { id: "e", repo: "Turma", status: "error", errorMsg: "clone failed", model: "haiku", ticket: ladderTicket(site) },
+    { id: "q", repo: "Turma", status: "queued", model: "sonnet", ticket: ladderTicket(site) }] });
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
+});
+
+test("XERK-1827: a host bound to another org cannot climb this org's ladder", async () => {
+  const site = "lad6.atlassian.net";
+  await ladderBeat("lad6", site);
+  await ladderBeat("lad6rogue", "rival6.atlassian.net");          // bound to rival
+  await ladderBeat("lad6rogue", site, { closed: [                  // now claims lad6
+    { id: "x", repo: "Turma", model: "sonnet", ticket: ladderTicket(site) }] });
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
+});
+
+test("XERK-1827: a host whose default runtime is not claude gets no ladder model", async () => {
+  const site = "lad7.atlassian.net";
+  await ladderBeat("lad7", site);
+  agents.lad7.defaultRuntime = "qwen";
+  assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null, "lad7"), {});
+  agents.lad7.defaultRuntime = "claude";
+  assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null, "lad7"), { model: "haiku" });
+});
+
+test("XERK-1827: the queue drain carries the ladder's pick", async () => {
+  const site = "lad8.atlassian.net";
+  const full = { maxSessions: 1, running: 1, queued: 0, free: 0, rootRunning: false };
+  const beat = (capacity, closed = []) => request("POST", "/api/heartbeat", {
+    body: {
+      device: "lad8", repos: [{ name: "Turma", path: "/git/Turma" }], capacity, closedSessions: closed,
+      jira: { available: true, configured: true, siteKey: site, user: "lad8@x.com",
+        fetchedAt: "2026-07-14T12:00:00Z",
+        tickets: [{ key: "ENG-5", summary: "Fix it", repoGuess: { repo: "Turma", cloned: true } }] },
+    },
+    headers: agentHeaders,
+  });
+  await beat(full);
+  await beat(full, [{ id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }]);
+  const res = await request("POST", `/api/jira/${site}/ENG-5/session`, { headers: userHeaders });
+  assert.equal(res.body.queued, true);
+  await beat({ ...full, running: 0, free: 1 },
+    [{ id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }]);
+  drainTicketQueue();
+  const cmd = agents.lad8.commands.find((c) => c.type === "spawnTicket");
+  assert.equal(cmd.model, "sonnet");
+  assert.equal(cmd.escalatedFrom, "haiku");
 });
 
 test("XERK-1827: a delivered, running, paused or model-less session is no failed attempt", async () => {

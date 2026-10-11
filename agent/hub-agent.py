@@ -19900,7 +19900,7 @@ TICKET_BUG_VERIFY_DIRECTIVE = (
 # minus the branch sentence (a bench run never pushes).
 TICKET_RETRY_DIRECTIVE = (
     "A previous session on this ticket ran on {prev} and ended without opening a"
-    " PR or closing the ticket. This session runs on a stronger model. Check"
+    " PR or closing the ticket. This session runs on {model}. Check"
     " origin for a branch that session may have pushed for this ticket and build"
     " on it only if it helps; otherwise start fresh from the current default"
     " branch."
@@ -19997,7 +19997,10 @@ def build_ticket_prompt(detail, attachments=None, session_cli=True):
 
     retry_of = d.get("retryOf")
     if isinstance(retry_of, str) and SPAWN_MODEL_RE.fullmatch(retry_of):
-        out += ["", TICKET_RETRY_DIRECTIVE.format(prev=retry_of)]
+        model = d.get("retryModel")
+        if not (isinstance(model, str) and SPAWN_MODEL_RE.fullmatch(model)):
+            model = "a different model"
+        out += ["", TICKET_RETRY_DIRECTIVE.format(prev=retry_of, model=model)]
 
     if _ticket_is_bug(d):
         out += ["", TICKET_BUG_VERIFY_DIRECTIVE.format(
@@ -26133,7 +26136,7 @@ class SessionManager:
         # since it is interpolated into the prompt; anything else is dropped.
         if (isinstance(escalated_from, str) and SPAWN_MODEL_RE.fullmatch(escalated_from)
                 and isinstance(detail, dict)):
-            detail = dict(detail, retryOf=escalated_from)
+            detail = dict(detail, retryOf=escalated_from, retryModel=model)
         # The ticket text goes as the DETAIL, not as a built prompt: the prompt
         # names the attachments this ticket's session downloads for itself, and
         # those land under the session id spawn() is about to mint (XERK-242).

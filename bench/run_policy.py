@@ -80,7 +80,7 @@ def delivered(rec):
     return bool(rec.get("solved")) and bool(rec.get("committed"))
 
 
-def run_ladder(repo, task, ladder, args, run_one=run_bench.one_run):
+def run_ladder(repo, task, ladder, args, run_one=run_bench.one_run, workroot=None):
     """Walk one task up a ladder; stop at the first tier that delivers.
 
     A run that never reached the model (infra) or could not be bootstrapped
@@ -91,7 +91,9 @@ def run_ladder(repo, task, ladder, args, run_one=run_bench.one_run):
     prev = None
     for alias in ladder:
         prefix = RETRY_PREAMBLE.format(prev=prev) if prev else ""
-        rec = run_one(repo, task, "claude-local", 1, args, args.workroot,
+        # Each policy gets its own workroot: two policies running one tier on
+        # one task at once would otherwise share (and wipe) a worktree.
+        rec = run_one(repo, task, "claude-local", 1, args, workroot or args.workroot,
                       model=GATEWAY_MODELS[alias], prompt_prefix=prefix)
         rec["tier"] = alias
         rec["retry"] = bool(prev)
@@ -184,7 +186,11 @@ def main():
     lock = threading.Lock()
 
     def job(name, task):
-        rec = run_ladder(args.repo, task, POLICIES[name], args)
+        pargs = argparse.Namespace(**vars(args))
+        pargs.runs = os.path.join(args.runs, name)
+        wr = os.path.join(args.workroot, name)
+        os.makedirs(wr, exist_ok=True)
+        rec = run_ladder(args.repo, task, POLICIES[name], pargs, workroot=wr)
         with lock:
             results["policies"].setdefault(name, {})[task["id"]] = rec
             with open(args.out + ".tmp", "w") as fh:

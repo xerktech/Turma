@@ -2563,9 +2563,13 @@ function setTicketModel(siteKey, issueKey, model) {
 //   - Only ladder models count. A session with no recorded model (an agent
 //     predating this, or a pre-ladder login-default session) is no evidence, so a
 //     host that forgets its closed history only ever costs a cheaper retry.
-//   - A paused sleeper (XERK-1575) is waiting, not failed.
+//   - A paused sleeper (XERK-1575) is waiting, not failed, and a live `error`
+//     record (a failed clone/launch, a crashed tmux) is not finished: it holds
+//     its slot and Start resumes it, so infra trouble never climbs the ladder.
 //   - The operator's model pin (XERK-123) always wins, and dsh/qwen sessions are
-//     never laddered (their model is the host's endpoint, not a Claude alias).
+//     never laddered (their model is the host's endpoint, not a Claude alias) —
+//     a runtime pin, or an unpinned ticket routed to a host whose DEFAULT
+//     runtime is not claude (TURMA_DEFAULT_RUNTIME, XERK-521).
 // TICKET_MODEL_LADDER (comma list of aliases) replaces it; set it to "off" to
 // return unpinned tickets to the login's default model. bench/run_policy.py's
 // "ladder" policy replays exactly this list — keep the two equal (pinned by
@@ -2575,7 +2579,15 @@ const TICKET_MODEL_LADDER = (() => {
   const raw = (process.env.TICKET_MODEL_LADDER || "").trim().toLowerCase();
   if (!raw) return TICKET_MODEL_LADDER_DEFAULT;
   if (raw === "off" || raw === "none") return [];
-  const list = raw.split(",").map((s) => s.trim()).filter((s) => /^[a-z0-9.-]{1,40}$/.test(s));
+  const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  const list = parts.filter((s) => /^[a-z0-9.-]{1,40}$/.test(s));
+  if (list.length !== parts.length) {
+    console.warn(`TICKET_MODEL_LADDER: dropped ${parts.length - list.length} entr(ies) that are not a plain model alias`);
+  }
+  const odd = list.filter((s) => !["opus", "sonnet", "haiku", "fable"].includes(s));
+  if (odd.length) {
+    console.warn(`TICKET_MODEL_LADDER: ${odd.join(", ")} is not a static alias; a host that has not probed it refuses the spawn`);
+  }
   if (!list.length) {
     console.warn(`TICKET_MODEL_LADDER=${JSON.stringify(raw)} names no usable alias; using the default`);
     return TICKET_MODEL_LADDER_DEFAULT;
@@ -2603,7 +2615,7 @@ function ticketLadderPick(siteKey, issueKey, ladder = TICKET_MODEL_LADDER) {
   if (!ladder.length) return null;
   let failed = -1;
   for (const { rec, live } of ticketSessionRecords(siteKey, issueKey)) {
-    if (live && (rec.status === "running" || rec.status === "queued")) continue;
+    if (live && rec.status !== "stopped") continue;
     if (rec.paused) continue;
     const delivered = (Array.isArray(rec.prs) && rec.prs.length > 0)
       || (Array.isArray(rec.prUrls) && rec.prUrls.length > 0)
@@ -2618,10 +2630,12 @@ function ticketLadderPick(siteKey, issueKey, ladder = TICKET_MODEL_LADDER) {
 
 // The model fields a spawnTicket command carries: the operator's pin as-is, else
 // the ladder's pick for a claude session, else nothing (the login's default).
-function ticketSpawnModelFields(siteKey, issueKey, rpin) {
+function ticketSpawnModelFields(siteKey, issueKey, rpin, host) {
   const mpin = ticketModelPin(siteKey, issueKey);
   if (mpin) return { model: mpin.model };
   if (rpin && rpin.runtime && rpin.runtime !== "claude") return {};
+  const a = host ? agents[host] : null;
+  if (!rpin && a && (a.defaultRuntime || "claude") !== "claude") return {};
   return ticketLadderPick(siteKey, issueKey) || {};
 }
 
@@ -13558,7 +13572,7 @@ function drainTicketQueue() {
     // before taking it (XERK-303).
     const dispatchedCmdId = queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
       ticketSource: e.source, ticketSite: e.siteKey,
-      ...ticketSpawnModelFields(e.siteKey, e.issueKey, rpin),
+      ...ticketSpawnModelFields(e.siteKey, e.issueKey, rpin, host),
       ...(rpin ? { agentType: rpin.runtime } : {}) });
     rememberDispatch(e.siteKey, e.issueKey, dispatchedCmdId);
     const wait = Math.round((now - e.at) / 1000);
@@ -20808,7 +20822,7 @@ const server = http.createServer(async (req, res) => {
       const rpin = ticketRuntimePin(siteKey, issueKey);
       const cmdId = queueCommand(host, { type: "spawnTicket", issueKey,
             ticketSource: "manual", ticketSite: siteKey,
-            ...ticketSpawnModelFields(siteKey, issueKey, rpin),
+            ...ticketSpawnModelFields(siteKey, issueKey, rpin, host),
             ...(rpin ? { agentType: rpin.runtime } : {}) });
       // This ticket may ALREADY be waiting in the queue (the sweep queued it, or
       // a board that hadn't seen the queue yet clicked Start). Its session is

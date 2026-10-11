@@ -75,6 +75,15 @@ class TestRunLadder(unittest.TestCase):
             self.assertEqual(len(calls), 1, flag)
             self.assertTrue(rec["inconclusive"], flag)
 
+    def test_the_workroot_override_reaches_every_tier(self):
+        seen = []
+
+        def run_one(repo, task, hname, attempt, args, workroot, model=None, prompt_prefix=""):
+            seen.append(workroot)
+            return {"solved": False, "committed": False}
+        run_policy.run_ladder("/repo", TASK, ["haiku", "opus"], ARGS, run_one, workroot="/w/ladder")
+        self.assertEqual(seen, ["/w/ladder", "/w/ladder"])
+
     def test_cost_sums_every_tier_at_its_own_price(self):
         rec, _ = self.walk(["haiku", "sonnet"], {})
         haiku = (100 * 1 + 1000 * 5 + 1_000_000 * 0.10) / 1e6

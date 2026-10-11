@@ -17,14 +17,19 @@ UNDELIVERED runs one tier up (haiku → sonnet → opus, capped). Evidence: `doc
   turn it missed (the spike's -8.2% vs -36.3%). Never route inside a session from this.
 - **The ladder is DERIVED, not stored** (`ticketLadderPick`): a ticket session no longer running,
   with no PR (`prs`/`prUrls`) and no close-ticket `outcome`, is a failed attempt on its `model`.
-  - A paused sleeper is waiting, not failed. Only ladder aliases count: a model-less session (an
-    older agent, a pre-ladder login-default session) is no evidence, so forgotten closed history
-    only ever costs a cheaper retry.
+  - A live `error`/`queued` record is not finished (Start resumes an error; it holds its slot), so
+    a failed clone or launch never climbs the ladder. A paused sleeper is waiting, not failed.
+  - Only ladder aliases count: a model-less session (an older agent, a pre-ladder login-default
+    session) is no evidence, so forgotten closed history only ever costs a cheaper retry.
   - Read only on hosts BOUND to the ticket's org (`boundOrgOf`), the `startedTicketKeys` rule.
+  - Known over-count: a PR opened outside `_scan_pr_line` attribution, or a migration's killed source
+    record, reads as an undelivered attempt (rollup).
   - Needs the agent's `closedSessions[].model` (added for this); `normalizeClosedSessions` keeps it
     only as a plain alias.
 - **Read at DISPATCH by both spawn sites** (`ticketSpawnModelFields`: Start route + queue drain).
-  The operator's model pin wins; a dsh/qwen runtime pin gets nothing (no Claude alias there).
+  The operator's model pin wins; a dsh/qwen runtime pin gets nothing, and neither does an unpinned
+  ticket routed to a host whose `defaultRuntime` is not claude (a qwen host would send `haiku` to
+  its OpenAI endpoint as `OPENAI_MODEL`).
 - **A retry carries `escalatedFrom`**; the agent appends `TICKET_RETRY_DIRECTIVE` to the prompt
   (charset-checked like a model alias). The bench's `RETRY_PREAMBLE` mirrors it minus the branch
   sentence.
@@ -39,6 +44,8 @@ UNDELIVERED runs one tier up (haiku → sonnet → opus, capped). Evidence: `doc
 - **The replay gate**: `bench/run_policy.py` runs `ladder` and `always-opus` over the 25 `turma-*`
   tasks and prints solve rate + dollar cost side by side. Its `ladder` must equal
   `TICKET_MODEL_LADDER_DEFAULT` (`TestPolicyMatchesHub`). Re-run it for any ladder change.
+  - Each policy gets its own workroot + runs dir: two policies on one tier/task otherwise share
+    and wipe a worktree under `--jobs >1`.
   - Delivered = tests green AND committed. An infra/setup failure ends the walk unscored.
   - Usage is reduced per `requestId` to the max of each counter (output is cumulative on the last
     line) — summing lines over-counts.

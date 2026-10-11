@@ -36391,6 +36391,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         cmd = self._launches()[-1][-1]
         self.assertIn("--model sonnet", cmd)
         self.assertIn("A previous session on this ticket ran on haiku", cmd)
+        self.assertIn("This session runs on sonnet", cmd)
 
     def test_a_first_attempt_and_a_hostile_escalated_from_carry_no_retry_line(self):
         sm = self.make_ticket_manager()
