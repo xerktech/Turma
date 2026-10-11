@@ -676,10 +676,13 @@ test("a hydrate waits for an in-flight retryBlocked pass, never overlapping it",
   await new Promise((r) => setImmediate(r));
   assert.equal(hydrated, false, "hydrate waited on the retry pass");
   assert.equal(await m.retryBlocked(), 0, "no second pass while one runs");
+  // The waiting hydrate cut the retry's GET short (XERK-1833) and fetches b itself.
+  assert.equal(await retry, 0);
+  assert.equal(m.blockedCount(), 1);
   release();
-  assert.equal(await retry, 1);
   await h;
   assert.equal(m.blockedCount(), 0);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "b.jsonl"), "utf8"), "b\n");
 });
 
 test("hydrateGated holds the ingest gate closed until the hydrate completes (XERK-1048)", async () => {
@@ -1003,6 +1006,133 @@ test("rendered downloads run concurrently, bounded (XERK-1829)", async () => {
   for (const k of keys) assert.equal(fs.readFileSync(path.join(root, k), "utf8"), "ab");
 });
 
+test("one hung rendered GET blocks its transcript only, never the whole pass (XERK-1833)", async () => {
+  const root = mkdtemp("turma-mir-");
+  let held;
+  let calls = 0;
+  const store = { list: async () => ["repo/a.jsonl", "repo/b.jsonl"], stat: async () => ({ size: 2 }),
+    getToFile: (k, dest) => {
+      if (k === "repo/a.jsonl" && ++calls === 1) {
+        return new Promise((r) => { held = () => { fs.writeFileSync(dest, "ab"); r(true); }; });
+      }
+      fs.writeFileSync(dest, "ab");
+      return Promise.resolve(true);
+    } };
+  const logs = [];
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log: (l) => logs.push(l) });
+  const gate = [];
+  // The pass stall deadline is far beyond the per-GET one: a pass held by the
+  // hung key would hang this test, not just abandon.
+  await m.hydrateGated((v) => gate.push(v),
+    { passDeadlineMs: 60 * 1000, getDeadlineMs: 20, sleep: async () => { throw new Error("retried"); } });
+  assert.deepEqual(gate, [true, false]); // opened after ONE pass, no retry
+  assert.equal(m.hydrated, true);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "b.jsonl"), "utf8"), "ab");
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "a.jsonl")), true);
+  assert.match(m.lastFailure, /repo\/a\.jsonl \(GET did not finish within 0s\)/);
+  // The timed-out GET finally lands: discarded, never renamed in behind the gate.
+  held();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
+  assert.equal(m.blockedCount(), 1);
+  // retryBlocked owns it from here.
+  assert.equal(await m.retryBlocked(), 1);
+  assert.equal(m.blockedCount(), 0);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl"), "utf8"), "ab");
+});
+
+test("a slow object that outlasts the retry GET deadline lands on a later, longer retry (XERK-1833 QA D1)", async () => {
+  const root = mkdtemp("turma-mir-");
+  // Every GET of this key takes 50ms: past a 20ms deadline, inside 80ms.
+  const store = { list: async () => [], stat: async () => null,
+    getToFile: (k, dest) => new Promise((r) => setTimeout(() => { fs.writeFileSync(dest, "big"); r(true); }, 50)) };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m._blocked.set("repo/a.jsonl", "x");
+  assert.equal(await m.retryBlocked({ getDeadlineMs: 20 }), 0);
+  assert.match(m._blocked.get("repo/a.jsonl"), /within 0s/);
+  assert.equal(await m.retryBlocked({ getDeadlineMs: 20 }), 0); // 40ms: still short
+  assert.equal(await m.retryBlocked({ getDeadlineMs: 20 }), 1); // 80ms: lands
+  assert.equal(m.blockedCount(), 0);
+  assert.equal(m._getDeadline.size, 0);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl"), "utf8"), "big");
+});
+
+test("a waiting hydrate cuts a retry GET short instead of waiting out its deadline (XERK-1833)", async () => {
+  const root = mkdtemp("turma-mir-");
+  let held;
+  const store = { list: async () => [], stat: async () => null,
+    getToFile: (k, dest) => new Promise((r) => { held = () => { fs.writeFileSync(dest, "o"); r(true); }; }) };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m._blocked.set("repo/a.jsonl", "x");
+  const retry = m.retryBlocked({ getDeadlineMs: 60 * 1000 });
+  await new Promise((r) => setImmediate(r));
+  await m.hydrate(); // would hang a minute if it waited on the GET
+  assert.equal(await retry, 0);
+  assert.equal(m.hydrated, true);
+  held(); // the cut GET lands late: discarded
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
+});
+
+test("a newly blocked key is retried before hung keys with escalated deadlines (XERK-1833 QA D3)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const gets = [];
+  const store = { list: async () => [], stat: async () => null,
+    getToFile: (k, dest) => {
+      gets.push(k);
+      if (k === "repo/hung.jsonl") return new Promise(() => {});
+      fs.writeFileSync(dest, "ok");
+      return Promise.resolve(true);
+    } };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m._blocked.set("repo/hung.jsonl", "x");
+  await m.retryBlocked({ getDeadlineMs: 10 }); // hung escalates to 20ms
+  m._blocked.set("repo/fresh.jsonl", "x");
+  gets.length = 0;
+  let landed = 0;
+  m.onLanded = () => { landed++; };
+  const pass = m.retryBlocked({ getDeadlineMs: 10 });
+  // Opened while the hung key's (escalated) GET is still in flight.
+  while (!gets.includes("repo/hung.jsonl")) await new Promise((r) => setImmediate(r));
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "fresh.jsonl")), false);
+  assert.equal(landed, 1, "reconciled before it opened");
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "hung.jsonl")), true);
+  await pass;
+  assert.deepEqual(gets, ["repo/fresh.jsonl", "repo/hung.jsonl"]);
+});
+
+test("escalated keys are retried least-escalated first (XERK-1833 QA)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const gets = [];
+  const store = { list: async () => [], stat: async () => null,
+    getToFile: (k) => { gets.push(k); return new Promise(() => {}); } };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m._blocked.set("repo/worse.jsonl", "x");
+  m._blocked.set("repo/better.jsonl", "x");
+  m._getDeadline.set("repo/worse.jsonl", 40);
+  m._getDeadline.set("repo/better.jsonl", 20);
+  await m.retryBlocked({ getDeadlineMs: 10 });
+  assert.deepEqual(gets, ["repo/better.jsonl", "repo/worse.jsonl"]);
+});
+
+test("a retry GET cut by a hydrate never lands, even while its key stays blocked (XERK-1833 QA)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const held = [];
+  // Every GET hangs until released; the hydrate's own GET times out too.
+  const store = { list: async () => ["repo/a.jsonl"], stat: async () => ({ size: 2 }),
+    getToFile: (k, dest) => new Promise((r) => held.push(() => { fs.writeFileSync(dest, "ab"); r(true); })) };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m._blocked.set("repo/a.jsonl", "x");
+  const retry = m.retryBlocked({ getDeadlineMs: 60 * 1000 });
+  await new Promise((r) => setImmediate(r));
+  await m.hydrate({ getDeadlineMs: 20 });
+  assert.equal(await retry, 0);
+  assert.equal(m.blockedCount(), 1);
+  held[0](); // the cut retry GET lands late: discarded although the key is blocked
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
+});
+
 test("an abandoned pass that wakes during the backoff writes nothing (XERK-1282)", async () => {
   const root = mkdtemp("turma-mir-");
   let hang = true;
@@ -1040,22 +1170,24 @@ test("a retryBlocked GET that never settles is bounded and cannot wedge a hydrat
   late.shift()(); // lands after its pass gave up: discarded
   await new Promise((r) => setImmediate(r));
   assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
-  // A hydrate arriving mid-pass makes the pass stop after its current key.
+  // A hydrate arriving mid-pass cuts the current key short and stops the pass.
+  // b goes first: a's deadline has escalated (XERK-1833 QA D3).
   m._blocked.set("repo/b.jsonl", "x");
   gets.length = 0;
   const retry = m.retryBlocked({ getDeadlineMs: 2000 });
   await new Promise((r) => setImmediate(r));
   const hyd = m.hydrate();
-  late.shift()(); // the current key lands; the next is never fetched
+  late.shift()(); // the cut key lands late; a is never fetched
   await retry;
   await hyd;
-  assert.deepEqual(gets, ["repo/a.jsonl"]);
+  assert.deepEqual(gets, ["repo/b.jsonl"]);
   assert.equal(m.hydrated, true);
-  // The yield is per pass: the next retry pass fetches what this one left.
+  // The yield is per pass: the next retry pass fetches b again (the hydrate's
+  // empty listing already forgot a).
   m._blocked.set("repo/b.jsonl", "x");
   const next = m.retryBlocked({ getDeadlineMs: 2000 });
   await new Promise((r) => setImmediate(r));
   late.shift()();
   assert.equal(await next, 1);
-  assert.deepEqual(gets, ["repo/a.jsonl", "repo/b.jsonl"]);
+  assert.deepEqual(gets, ["repo/b.jsonl", "repo/b.jsonl"]);
 });

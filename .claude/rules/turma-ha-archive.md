@@ -127,9 +127,18 @@ of-record**, so both halves of the ADR split now hold:
     rendered layer (~11k objects, ~2 GB in prod); a wall-clock cap abandoned passes that were
     progressing, keeping ingest 503'd 20+ min per pod start. Progress = a store request settling.
   - Rendered GETs run `HYDRATE_CONCURRENCY` (8) at once: sequential was latency-bound (~4/s).
+  - **Each rendered GET is bounded by `GET_DEADLINE_MS` (5 min) in the hydrate pass too (XERK-1833)**:
+    past it the key is `_blocked` (per transcript, XERK-1050) and `retryBlocked` owns it. Without it
+    one hung GET stalled the pass, and a key that hung every time kept ingest 503'd hub-wide forever.
+    It must clear a 16 MiB object on a slow link and stay under the pass stall deadline.
+  - **A retry GET that times out gets double the deadline next time** (`_getDeadline`, capped at
+    `RETRY_GET_DEADLINE_MAX_MS`, 1h): with one flat cap a legitimately slow object never landed.
+    A pass fetches, reconciles and OPENS un-escalated keys before it tries escalated ones, so a
+    fresh key never stays closed behind hung ones (opening at pass end alone did not fix that).
+  - **A waiting hydrate CUTS the retry's in-flight GET short** (`_yieldWake`; key stays blocked) —
+    with escalated deadlines, waiting it out would hold the gate closed for up to an hour.
   - A hydrate waits on an in-flight `retryBlocked` pass, so that pass is bounded too: each GET by
-    `RETRY_GET_DEADLINE_MS` (key stays blocked), and it stops after its current key once a hydrate
-    waits (`_yieldRetry`). Unbounded, one hung retry GET made every hydrate pass abandon forever.
+    `GET_DEADLINE_MS` (key stays blocked), and it stops once a hydrate waits (`_yieldRetry`). Unbounded, one hung retry GET made every hydrate pass abandon forever.
   - The byte phase does not open the gate when an index hydrate follows — the index phase's
     `finally` does — so the closed-since stamp spans the whole run.
   - An abandoned pass writes nothing: its late GET is discarded via `_download`'s `stillWanted`,

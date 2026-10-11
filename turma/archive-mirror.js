@@ -59,11 +59,24 @@ const HYDRATE_PASS_DEADLINE_MS = 15 * 60 * 1000;
 // store); 8 in flight measured 2-17x faster there (XERK-1829). Each streams to its
 // own temp file, so this bounds sockets and fds, not memory.
 const HYDRATE_CONCURRENCY = 8;
-// The longest one retryBlocked GET may run before that key is left blocked for the
-// next pass. A hydrate waits on an in-flight retry pass (they must not overlap), so
-// a retry GET that never settled made every bounded hydrate pass abandon and retry
-// forever, gate closed (XERK-1282 QA).
-const RETRY_GET_DEADLINE_MS = 5 * 60 * 1000;
+// The longest one rendered GET may run, in a hydrate pass or a retryBlocked pass,
+// before its key is left blocked (XERK-1050's per-transcript gate) for
+// retryBlocked. A hydrate waits on an in-flight retry pass (they must not
+// overlap), so a retry GET that never settled made every bounded hydrate pass
+// abandon and retry forever, gate closed (XERK-1282 QA). In the hydrate pass
+// itself one hung GET stalled the whole pass the same way, keeping ingest closed
+// hub-wide for one key (XERK-1833). It must clear the largest legitimate rendered
+// object on a slow link: ARCHIVE_TRANSCRIPT_MAX_BYTES (16 MiB) in 5 min is ~55 KB/s.
+// Shorter than HYDRATE_PASS_DEADLINE_MS, so a hung GET never reaches the stall bound.
+const GET_DEADLINE_MS = 5 * 60 * 1000;
+// A retryBlocked GET that hit its deadline gets twice as long next time, up to
+// this. With one flat cap a legitimately slow object (slower than ~55 KB/s for
+// 16 MiB) timed out on every retry and its transcript stayed blocked forever. A
+// retry pass lands and opens un-escalated keys before it tries escalated ones, so
+// a newly blocked key never waits behind hung keys' deadlines; a waiting hydrate
+// never waits on one either (`_yieldWake`).
+const RETRY_GET_DEADLINE_MAX_MS = 60 * 60 * 1000;
+const YIELDED = Symbol("yielded");
 const TIMED_OUT = Symbol("timedOut");
 // `p`, or TIMED_OUT once `ms` passes first. `p` itself is left running.
 async function raceDeadline(p, ms) {
@@ -120,6 +133,8 @@ class ArchiveMirror {
     this._blocked = new Map();
     this._retrying = null;   // the in-flight retryBlocked pass, so hydrate waits on it
     this._yieldRetry = false; // a hydrate is waiting: the retry pass stops after its current key
+    this._yieldWake = null;  // cuts the retry pass's in-flight GET short for a waiting hydrate
+    this._getDeadline = new Map(); // blocked key -> its escalated retry GET deadline (ms)
     this._retryLoop = false; // retryBlockedUntilClear is running
   }
 
@@ -214,7 +229,7 @@ class ArchiveMirror {
   // authoritative; the un-mirrored tail re-mirrors on the next drain. A leader
   // that has been writing thus hydrates to a near-no-op. Best-effort per key.
   // Returns the count downloaded.
-  async hydrate() {
+  async hydrate({ getDeadlineMs = GET_DEADLINE_MS } = {}) {
     if (!this.blobStore || this._hydrating) return 0;
     this._hydrating = true;
     const run = ++this._hydrateRun;
@@ -222,7 +237,7 @@ class ArchiveMirror {
     let fetched = 0;
     try {
       // A retryBlocked pass renames files into place; never classify under it.
-      if (this._retrying) { this._yieldRetry = true; await this._retrying; }
+      if (this._retrying) { this._yieldRetry = true; this._yieldWake?.(); await this._retrying; }
       if (stale()) return 0;
       // [{key, size}] in one listing when the store can give sizes (S3 always
       // does); otherwise a HEAD per key, the pre-XERK-1043 shape.
@@ -316,6 +331,9 @@ class ArchiveMirror {
       const worker = async () => {
         while (next < downloads.length && !stale()) {
           const { key, dest } = downloads[next++];
+          // A GET past its deadline leaves the key blocked; if it lands later it is
+          // discarded, never renamed in after the pass moved on (XERK-1833).
+          let abandoned = false;
           try {
             // Through a temp file too: a GET cut mid-body left a PARTIAL rendered
             // file at its real path, which ingest would then append to and the
@@ -323,9 +341,16 @@ class ArchiveMirror {
             // (deleted since the listing) returns false: gone, as above.
             // An abandoned pass's late GET is discarded, never renamed over a file
             // a newer pass (and the ingest it reopened) has since written.
-            if (await this._download(key, dest, () => !stale())) fetched++;
+            const r = await raceDeadline(
+              this._download(key, dest, () => !stale() && !abandoned), getDeadlineMs);
             if (stale()) return;
-            this._blocked.delete(key);
+            if (r === TIMED_OUT) {
+              abandoned = true;
+              this._blocked.set(key, `${key} (GET did not finish within ${Math.round(getDeadlineMs / 1000)}s)`);
+            } else {
+              if (r) fetched++;
+              this._blocked.delete(key);
+            }
           } catch (e) {
             if (stale()) return;
             // ABSENT (or short) locally while Postgres holds its full cursor:
@@ -360,7 +385,7 @@ class ArchiveMirror {
   // it is reported as an incomplete hydrate, so hydrateUntilListed logs it and
   // retries with ingest still gated (XERK-1048: never open over a tree that was not
   // fully classified). A slow pass that keeps landing files runs to completion.
-  async _boundedHydrate(deadlineMs) {
+  async _boundedHydrate(deadlineMs, getDeadlineMs) {
     this._progress();
     let timer;
     const stalled = new Promise((res) => {
@@ -373,7 +398,7 @@ class ArchiveMirror {
       check();
     });
     let r;
-    try { r = await Promise.race([this.hydrate(), stalled]); }
+    try { r = await Promise.race([this.hydrate({ getDeadlineMs }), stalled]); }
     finally { clearTimeout(timer); }
     if (r !== TIMED_OUT) return r;
     this._hydrateRun++;
@@ -402,15 +427,15 @@ class ArchiveMirror {
   // one undownloadable key no longer stalls the whole hub (XERK-1050). `sleep` is
   // injectable for tests.
   async hydrateUntilListed({ firstDelayMs = 2000, maxDelayMs = 60 * 1000,
-    passDeadlineMs = HYDRATE_PASS_DEADLINE_MS,
+    passDeadlineMs = HYDRATE_PASS_DEADLINE_MS, getDeadlineMs = GET_DEADLINE_MS,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
-    let fetched = await this._boundedHydrate(passDeadlineMs);
+    let fetched = await this._boundedHydrate(passDeadlineMs, getDeadlineMs);
     for (let delay = firstDelayMs; this.blobStore && !this.hydrated;
       delay = Math.min(delay * 2, maxDelayMs)) {
       this.log(`archive hydrate: incomplete — ${this.lastFailure} Archive ingest ` +
         `stays closed on this replica; retrying in ${Math.round(delay / 1000)}s`);
       await sleep(delay);
-      fetched = await this._boundedHydrate(passDeadlineMs);
+      fetched = await this._boundedHydrate(passDeadlineMs, getDeadlineMs);
     }
     return fetched;
   }
@@ -436,51 +461,82 @@ class ArchiveMirror {
   // else writes their local files while the rename lands. Never overlaps a
   // hydrate (they share `_hydrating`/`_retrying`).
   //
-  // A landed or gone (404) key stays BLOCKED until the pass ends and `onLanded`
-  // has re-derived cursors from the landed files, and only then unblocks — in the
-  // same synchronous step. Unblocked on landing, a transcript was open with its
-  // Postgres cursor still AHEAD of the older bucket copy, so the agent's next
-  // chunk appended past a gap and the lagging tail was lost for good (QA D1).
-  async retryBlocked({ getDeadlineMs = RETRY_GET_DEADLINE_MS } = {}) {
+  // A landed or gone (404) key stays BLOCKED until its group's GETs are done and
+  // `onLanded` has re-derived cursors from the landed files, and only then
+  // unblocks — in the same synchronous step. Unblocked on landing, a transcript
+  // was open with its Postgres cursor still AHEAD of the older bucket copy, so the
+  // agent's next chunk appended past a gap and the lagging tail was lost for good
+  // (QA D1).
+  //
+  // Keys whose deadline has NOT escalated go first, as their own group that
+  // reconciles and opens before any escalated (likely hung) key is tried: a fresh
+  // key otherwise stayed closed behind up to RETRY_GET_DEADLINE_MAX_MS per hung key
+  // (XERK-1833 QA D3).
+  async retryBlocked({ getDeadlineMs = GET_DEADLINE_MS } = {}) {
     if (!this.blobStore || this._hydrating || this._retrying || !this._blocked.size) return 0;
     let landed = 0;
-    const done = [];
-    const run = (async () => {
-      for (const key of [...this._blocked.keys()]) {
+    for (const k of [...this._getDeadline.keys()]) if (!this._blocked.has(k)) this._getDeadline.delete(k);
+    // A hydrate that starts waiting abandons the in-flight GET (its key stays
+    // blocked) rather than waiting out a deadline that may have escalated.
+    const yielded = new Promise((res) => { this._yieldWake = () => res(YIELDED); });
+    const deadlineOf = (k) => this._getDeadline.get(k) || getDeadlineMs;
+    const keys = [...this._blocked.keys()];
+    const groups = [keys.filter((k) => !this._getDeadline.has(k)),
+      keys.filter((k) => this._getDeadline.has(k)).sort((a, b) => deadlineOf(a) - deadlineOf(b))];
+    // GET each key of one group; returns the keys to unblock and how many landed.
+    const fetchGroup = async (group) => {
+      const done = [];
+      let n = 0;
+      for (const key of group) {
         if (this._yieldRetry) break; // the rest wait for the next pass
         const dest = this.pathFor(key);
         if (!dest) { done.push(key); continue; }
         // A GET past its deadline leaves the key blocked; if it lands later it is
         // discarded, never renamed in after the pass (and its reconcile) moved on.
         let abandoned = false;
+        const deadline = deadlineOf(key);
         try {
-          const r = await raceDeadline(
-            this._download(key, dest, () => !abandoned && this._blocked.has(key)), getDeadlineMs);
+          const r = await raceDeadline(Promise.race([
+            this._download(key, dest, () => !abandoned && this._blocked.has(key)), yielded]), deadline);
+          if (r === YIELDED) { abandoned = true; break; }
           if (r === TIMED_OUT) {
             abandoned = true;
-            this._blocked.set(key, `${key} (GET did not finish within ${Math.round(getDeadlineMs / 1000)}s)`);
+            this._getDeadline.set(key, Math.min(deadline * 2, RETRY_GET_DEADLINE_MAX_MS));
+            this._blocked.set(key, `${key} (GET did not finish within ${Math.round(deadline / 1000)}s)`);
             continue;
           }
-          if (r) landed++;
+          if (r) n++;
+          this._getDeadline.delete(key);
           done.push(key);
         } catch (e) {
           this._blocked.set(key, `${key} (${e && e.message})`);
         }
       }
-    })();
-    this._retrying = run;
-    try { await run; } finally { this._retrying = null; this._yieldRetry = false; }
+      return { done, n };
+    };
     // Any unblock reconciles, not only a landing: a key that landed on a pass
     // whose reconcile threw, then 404'd, would otherwise open unreconciled.
-    if (done.length) {
+    // false = the reconcile threw; its keys stay blocked for the next pass.
+    const settle = (done) => {
+      if (!done.length) return true;
       try { this.onLanded(); } catch (e) {
-        // Not reconciled, so not safe to open: they stay blocked for the next pass.
         this.log(`archive hydrate: post-retry reconcile failed (${e && e.message})`);
-        this.lastFailure = this._blockedSummary();
-        return 0;
+        return false;
       }
-    }
-    for (const k of done) this._blocked.delete(k);
+      for (const k of done) this._blocked.delete(k);
+      return true;
+    };
+    const run = (async () => {
+      for (const group of groups) {
+        if (this._yieldRetry) break;
+        const { done, n } = await fetchGroup(group);
+        if (!settle(done)) break;
+        landed += n;
+        this.lastFailure = this._blockedSummary();
+      }
+    })();
+    this._retrying = run;
+    try { await run; } finally { this._retrying = null; this._yieldRetry = false; this._yieldWake = null; }
     this.lastFailure = this._blockedSummary();
     return landed;
   }
