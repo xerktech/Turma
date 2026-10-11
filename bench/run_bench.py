@@ -298,7 +298,10 @@ def _extract_usage(dest, env, started=0):
     multi-block reply two or three times over.
     """
     config_dir = env.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
-    slug = dest.replace("/", "-")
+    # Claude Code names a project dir by mapping EVERY non-alphanumeric char of
+    # the cwd to "-" (hub-agent's _project_slug); mapping only "/" missed any
+    # workroot holding a "." or "_" and read zero tokens for the whole run.
+    slug = re.sub(r"[^A-Za-z0-9]", "-", dest)
     proj_dir = os.path.join(config_dir, "projects", slug)
     totals = {"input_tokens": 0, "output_tokens": 0,
               "cache_creation_tokens": 0, "cache_read_tokens": 0}

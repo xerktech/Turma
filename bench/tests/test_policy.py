@@ -128,8 +128,11 @@ class TestUsageDedupe(unittest.TestCase):
         # Claude Code writes one line per content block, each repeating the
         # request's usage; summing per line double-counts.
         cfg = tempfile.mkdtemp(prefix="bench-cfg-")
-        dest = "/work/x"
-        proj = os.path.join(cfg, "projects", dest.replace("/", "-"))
+        # A real workroot carries dots and underscores (the gateway model id);
+        # Claude Code slugs every non-alphanumeric char, not just "/".
+        dest = "/work/claude-local-us.anthropic.claude-haiku-4-5_v1-0-t-1"
+        proj = os.path.join(cfg, "projects",
+                            "-work-claude-local-us-anthropic-claude-haiku-4-5-v1-0-t-1")
         os.makedirs(proj)
         u = {"input_tokens": 10, "output_tokens": 20,
              "cache_creation_input_tokens": 30, "cache_read_input_tokens": 40}
