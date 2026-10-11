@@ -52,6 +52,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-ha-tunnel.md` | `turma/server.js`, `turma/relay.js` | HA: cross-replica tunnel directory + control bus (XERK-764) + the duplex byte-stream relay for /term,/live,openChannel (XERK-777/781) — now the handover/degraded path (XERK-919); non-HA byte-identical |
 | `turma-oidc.md` | `turma/server.js` | OIDC relying-party core: code+PKCE, discovery, JWKS RS256, session cookie, RP-logout |
 | `turma-break-glass.md` | `turma/server.js`, `turma/public/login.html` | IdP-independent break-glass local login; invariants a mandatory-OIDC change must keep |
+| `model-quality.md` | `turma/outcome-ledger.js`, `turma/server.js` | outcome ledger (XERK-1839): per-ticket-session model + outcome, fleet-wide evidence; plan `docs/model-quality-adr.md` |
 | `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |
 | `turma-notifications.md` | `turma/server.js`, `turma/push.js` | FCM alerts, one-alert-per-work rule, runaway spend (XERK-310), Claude login alerts, `notify()`/`push.js`, dismiss, `pushEnabled` |
 | `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
