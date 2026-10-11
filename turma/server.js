@@ -4731,11 +4731,22 @@ async function rawLocalFor(transcriptId) {
 let indexMirror = null;
 // Bounds the pending-op queue so a Postgres outage can't grow the hub's heap without
 // limit — the same "cap agent-influenced growth" posture as every other queue here.
-// Past it the OLDEST op is dropped (a lost mirror write self-heals: the local SQLite
-// is authoritative and a promotion re-hydrates only what Postgres holds; a dropped
-// op just means that row waits for the next write of the same transcript, or an
-// operator-triggered re-sync — never local data loss).
+// Past it the OLDEST op is dropped and its transcript is owed a REFILL (XERK-1834):
+// once the queue drains, the mirror re-sends that transcript whole — row plus a
+// replace of every entry its local `.jsonl` holds. Without it a dropped append left a
+// seq hole in Postgres that later appends never filled (they land at their own seqs).
+// An op that exhausts its retries is owed one the same way. A refill that fails stays
+// owed and is retried every INDEX_MIRROR_REFILL_RETRY_MS, so a Postgres outage that
+// drops ops is refilled once it ends; one Postgres refuses outright is given up.
+// A dropped "remove", or duplicate "repair" (its sidecar stays pending), is not.
 const INDEX_MIRROR_QUEUE_MAX = positiveEnv("INDEX_MIRROR_QUEUE_MAX", 100000);
+const INDEX_MIRROR_REFILL_RETRY_MS = positiveEnv("INDEX_MIRROR_REFILL_RETRY_MS", 30000);
+// A Postgres error no retry can fix — bad data (class 22), a constraint (23), a
+// statement it refuses (42). A refill failing this way is given up, not retried forever.
+function indexMirrorPermanent(e) {
+  const code = e && e.pgError && e.pgError.C;
+  return typeof code === "string" && /^(22|23|42)/.test(code);
+}
 class IndexMirror {
   // `isLeader` + `term` gate the duplicate repair (XERK-1450): a repair applies only
   // while this replica still leads under the term that queued it. A deposed leader's
@@ -4749,18 +4760,48 @@ class IndexMirror {
     this._running = false;
     this._dropped = 0;
     this._lastDropWarnAt = 0;
+    // Transcripts owed a refill, each with the leader term it was owed under: a refill
+    // runs only while this replica still leads under that term, since another leader
+    // may have appended past this replica's local copy since.
+    this._refill = new Map();
+    this._refillAfter = 0;
+    this._refillTimer = null;
+  }
+  // Owe a dropped op's transcript a refill. Bounded like the queue: past the cap the
+  // id is not tracked, and that transcript waits for its next replace. A failed refill
+  // is owed again and holds every refill off for the retry interval.
+  _lost(op) {
+    if (op.t === "remove" || op.t === "repair") return;
+    const id = op.t === "session" ? op.row && op.row.transcriptId : op.transcriptId;
+    if (!id) return;
+    if (op.t === "refill") {
+      this._refill.set(id, op.term);
+      this._refillAfter = Date.now() + INDEX_MIRROR_REFILL_RETRY_MS;
+    } else if (!this._refill.has(id) && this._refill.size < INDEX_MIRROR_QUEUE_MAX) {
+      this._refill.set(id, this.term());
+    }
+  }
+  _refillDue() {
+    return this._refill.size > 0 && Date.now() >= this._refillAfter;
+  }
+  // Wake the drain when held-off refills come due; nothing else would, on a quiet hub.
+  _armRefillRetry() {
+    if (!this._refill.size || this._refillTimer) return;
+    const wait = Math.max(0, this._refillAfter - Date.now());
+    this._refillTimer = setTimeout(() => { this._refillTimer = null; this._drain(); }, wait);
+    this._refillTimer.unref?.();
   }
   _push(op) {
     if (this._q.length >= INDEX_MIRROR_QUEUE_MAX) {
-      this._q.shift();
+      this._lost(this._q.shift());
       this._dropped++;
       const now = Date.now();
       if (now - this._lastDropWarnAt > 60 * 60 * 1000) {
         this._lastDropWarnAt = now;
         console.error(
           `archive index mirror: queue over ${INDEX_MIRROR_QUEUE_MAX} (Postgres slow/down); ` +
-          `dropped ${this._dropped} oldest ops. The local index is authoritative and a ` +
-          `promotion re-hydrates from Postgres; a dropped op self-heals on the next write.`);
+          `dropped ${this._dropped} oldest ops; their transcripts are re-sent whole from ` +
+          `the local files once the queue drains.`);
       }
     }
     this._q.push(op);
@@ -4775,8 +4816,16 @@ class IndexMirror {
     if (this._running || !this.store) return;
     this._running = true;
     try {
-      while (this._q.length) {
-        const op = this._q.shift();
+      while (this._q.length || this._refillDue()) {
+        // A refill runs only on an EMPTY queue, so every op queued before it has
+        // landed. It carries only the id and reads the file when APPLIED, so a retry
+        // still sends what the file holds by then.
+        let op = this._q.shift();
+        if (!op) {
+          const [id, term] = this._refill.entries().next().value;
+          this._refill.delete(id);
+          op = { t: "refill", transcriptId: id, term };
+        }
         try { await this._apply(op); }
         catch (e) {
           op._tries = (op._tries || 0) + 1;
@@ -4784,11 +4833,19 @@ class IndexMirror {
           // sidecar stays `dedupPending`, so the next leader pass redoes it (XERK-1450).
           if (op.t === "repair") console.error(`archive index mirror: repair of ${op.transcriptId} failed (${e && e.message}); the next leader pass redoes it`);
           else if (op._tries < 3) this._q.unshift(op); // transient — retry before anything newer
-          else console.error(`archive index mirror: op ${op.t} failed (${e && e.message}); dropped`);
+          else if (op.t === "refill" && !indexMirrorPermanent(e)) {
+            console.error(`archive index mirror: refill of ${logName(op.transcriptId)} failed ` +
+              `(${e && e.message}); retrying in ${Math.round(INDEX_MIRROR_REFILL_RETRY_MS / 1000)}s`);
+            this._lost(op);
+          } else {
+            console.error(`archive index mirror: op ${op.t} failed (${e && e.message}); dropped`);
+            if (op.t !== "refill") this._lost(op);
+          }
         }
       }
     } finally {
       this._running = false;
+      this._armRefillRetry();
     }
   }
   async _apply(op) {
@@ -4810,6 +4867,17 @@ class IndexMirror {
     // A follower's heal (XERK-1837): overwrites its own ordinals, never trims the tail.
     if (op.t === "seat") return this.store.seatEntries(op.transcriptId, op.entries);
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
+    if (op.t === "refill") {
+      // Rewrites Postgres from this replica's local copy, so only while leading under
+      // the term it was owed in; otherwise it is dropped (the copy may be stale).
+      const current = () => this.isLeader() && this.term() === op.term;
+      if (!current()) return;
+      const held = archive.mirrorRefillOf(op.transcriptId);
+      if (!held) return;
+      await this.store.upsertSession(held.row);
+      if (!current()) return;
+      return this.store.replaceEntries(op.transcriptId, held.entries, current);
+    }
     if (op.t === "repair") {
       // Re-checked between every write. Stopping leaves the sidecar pending; the
       // current leader owns the repair. A pause between a check and its write is
