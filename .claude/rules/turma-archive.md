@@ -202,10 +202,16 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     first runs it local-only (`publish:false`, nothing mirrored): a follower's stale duplicated copy
     then de-dups to a prefix of the repaired object and is refetched. First-copy de-dup being
     prefix-monotone is what makes that safe — keep it that way.
-  - Only the LEADER (or a non-HA boot) publishes: re-PUTs file + sidecar, re-seats entries, and sets
-    PG counts with `setCounts` — the session upsert's GREATEST can never lower them.
-  - `bytesStored` is untouched; a `dedupChecked` sidecar stamp skips unchanged files next pass.
-  - Tests: the `XERK-1450` cases in `index-store.test.js`.
+  - Only the LEADER (or a non-HA boot, or a late landing) publishes: re-PUTs file + sidecar, and
+    sends ONE `repair` mirror op (entries replace + `setCounts`) — the session upsert's GREATEST can
+    never lower the counts. A rendered-blocked file is never published (not the of-record copy).
+  - `dedupPending` is in the sidecar from BEFORE the file shrinks until PG acks the `repair` op, and
+    the next publishing pass redoes a pending file. Never stamp done on the local write alone: the
+    stamp reaches the bucket, and a lost PG op was then never redone (QA). A failed `repair` op is
+    dropped, never re-queued — behind a newer append its entry snapshot would delete it.
+  - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
+    covered) skips unchanged files.
+  - Tests: the `XERK-1450` cases in `index-store.test.js` and `archive-landed-wiring.test.js`.
 - **`meta` is COERCED before it is bound** (`normalizeMeta`) — every field is agent-supplied and goes
   straight into sqlite (scalars only); a non-scalar stores as nothing rather than poisoning every
   later beat with a 500. The length cap is the receiving half of the same XERK-235 rule as above.

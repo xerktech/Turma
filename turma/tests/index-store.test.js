@@ -178,7 +178,10 @@ class MemIndexStore {
       session: (r) => this.upsertSession(r),
       entries: (t, e, s) => this.appendEntries(t, e, s),
       replace: (t, e) => this.replaceEntries(t, e),
-      counts: (t, n, b) => this.setCounts(t, n, b),
+      repair: (t, e, n, b, done) => {
+        if (this.dropRepairs) return;           // a lost mirror op (pod died, retries spent)
+        this.replaceEntries(t, e); this.setCounts(t, n, b); if (done) done();
+      },
     };
   }
   // Mirrors PgIndexStore.hydrateInto: reset once, then batch-apply sessions + entries.
@@ -1218,7 +1221,8 @@ test("XERK-1450 pg mode: the leader repair de-dups the file, lowers PG counts, r
     assert.equal(meta.archiveBytes, bytes);
     assert.equal(meta.msgCount, 4);
     assert.equal(meta.bytesStored, len1);
-    assert.deepEqual(noted.sort(), [jsonl, jsonl + ".meta"].sort(), "both re-PUT to the bucket");
+    assert.equal(meta.dedupPending, undefined, "cleared once Postgres acked the repair");
+    assert.deepEqual([...new Set(noted)].sort(), [jsonl, jsonl + ".meta"].sort(), "both re-PUT to the bucket");
 
     // Idempotent, and the stamp means the next pass does not re-read the file.
     noted.length = 0;
@@ -1246,9 +1250,50 @@ test("XERK-1450: a local-only pass rewrites the copy but mirrors nothing", async
     assert.deepEqual(noted, [], "a follower never pushes its copy");
     assert.deepEqual(mem.sessions.get("t-local"), pgBefore);
     assert.equal(mem.entries.get("t-local").size, entriesBefore);
-    // Nothing stamped locally, so the leader's pass still checks it.
-    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupChecked, Buffer.byteLength(once));
+    // Left pending, so a leader that keeps this copy still re-seats its index.
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true);
+    archive.setBlobSink(null);
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "the publisher redoes a pending file");
+    assert.equal(mem.sessions.get("t-local").msgCount, 4);
+    assert.equal(mem.entries.get("t-local").size, 4);
   } finally { archive.setBlobSink(null); pgTeardown(); }
+});
+
+test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl, once } = duplicatedTranscript("t-lost");
+    mem.upsertSession({ ...mem.sessions.get("t-lost"), msgCount: 10, archiveBytes: 4096 });
+    mem.dropRepairs = true;
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    assert.equal(mem.sessions.get("t-lost").msgCount, 10, "Postgres never got it");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true);
+    mem.dropRepairs = false;
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "the clean-but-pending file is redone");
+    assert.equal(mem.sessions.get("t-lost").msgCount, 4);
+    assert.equal(mem.sessions.get("t-lost").archiveBytes, Buffer.byteLength(once));
+    assert.equal(mem.entries.get("t-lost").size, 4);
+    assert.equal(archive.dedupArchive({ publish: true }), 0, "then settled");
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1450: kept lines are written back byte-for-byte; a rendered-blocked file is skipped", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl } = duplicatedTranscript("t-bytes");
+    const bad = Buffer.from([0x7b, 0xff, 0xfe, 0x7d, 0x0a]);            // invalid UTF-8 line
+    const torn = Buffer.from('{"uuid":"torn"');                          // no trailing newline
+    const base = fs.readFileSync(jsonl);
+    fs.writeFileSync(jsonl, Buffer.concat([base, bad, bad, torn]));
+    archive.setRenderedGate((p) => p === jsonl);
+    assert.equal(archive.dedupArchive({ publish: true }), 0, "not landed: not the of-record copy");
+    archive.setRenderedGate(null);
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    const once = Buffer.from(base.toString("latin1").split("\n").slice(0, 4).join("\n") + "\n", "latin1");
+    assert.deepEqual(fs.readFileSync(jsonl), Buffer.concat([once, bad, torn]));
+    assert.ok(mem.sessions.get("t-bytes"));
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
 });
 
 test("XERK-1450 sqlite mode: the repair re-seats the local row and search index", async () => {

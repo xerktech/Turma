@@ -175,4 +175,82 @@ test("a byte-only hydrate opens the gate when the byte phase ends (XERK-1523)", 
   assert.deepEqual(await gateCallsOfHydrate(null), [true, false]);
 });
 
+// A transcript whose file holds its lines twice (XERK-1364 damage) — the XERK-1450 seed.
+function seedDuplicated(id) {
+  archive.ingestChunk("nas", id, { repo: "qa", summary: id, endedTs: "2026-07-10T00:00:00Z" }, 0, 10,
+    [{ uuid: "a", role: "user", ts: "t", text: "one" }, { uuid: "b", role: "assistant", ts: "t", text: "two" }]);
+  const jsonl = archive.__walkJsonl().find((p) => p.includes(id));
+  const once = fs.readFileSync(jsonl, "utf8");
+  fs.appendFileSync(jsonl, once);
+  return { jsonl, once };
+}
+
+test("XERK-1450: the hydrate de-dups local copies BEFORE it lists the bucket, then publishes", async () => {
+  const { jsonl, once } = seedDuplicated("t-hyd");
+  const atList = [];
+  const store = { async list() { atList.push(fs.readFileSync(jsonl, "utf8")); return []; },
+    async put() {}, async stat() { return null; }, async getToFile() { return true; } };
+  hub.setArchiveMirror(store, true);
+  try {
+    await hub.hydrateArchive();
+    assert.deepEqual(atList, [once], "the size compare saw the de-duplicated copy");
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    assert.equal(meta.dedupPending, undefined, "the leader pass re-seated the index");
+    assert.equal(archive.sessionRow("t-hyd").msgCount, 2);
+  } finally {
+    hub.setArchiveMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+    archive.setRenderedGate(null);
+  }
+});
+
+test("XERK-1450: a late-landed file is repaired by the wired onLanded", async () => {
+  const { jsonl, once } = seedDuplicated("t-land");
+  const store = { async list() { return []; }, async put() {}, async stat() { return null; },
+    async getToFile(k, dest) { fs.writeFileSync(dest, "x\n"); return true; } };
+  hub.setArchiveMirror(store, true);
+  try {
+    const mirror = hub.getArchiveMirror();
+    // The landed file itself: still blocked while onLanded runs, so the repair waits a tick.
+    mirror._blocked.set(mirror.keyFor(jsonl), "x");
+    const realGet = store.getToFile;
+    store.getToFile = async (k, dest) => { fs.copyFileSync(jsonl, dest); return true; };
+    await mirror.retryBlocked();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(mirror.blockedCount(), 0);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    store.getToFile = realGet;
+  } finally {
+    hub.setArchiveMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+    archive.setRenderedGate(null);
+  }
+});
+
+test("XERK-1450: IndexMirror applies a repair as replace + exact counts, acks it, never re-queues it", async () => {
+  const calls = [];
+  let fail = false;
+  const store = {
+    async replaceEntries(t, e) { if (fail) throw new Error("pg down"); calls.push(["replace", t, e.length]); },
+    async setCounts(t, n, b) { calls.push(["counts", t, n, b]); },
+  };
+  const m = new hub.IndexMirror(store);
+  let acked = 0;
+  m.sink().repair("t1", [{ text: "a" }, { text: "b" }], 2, 99, () => { acked += 1; });
+  await m._drain();
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(calls, [["replace", "t1", 2], ["counts", "t1", 2, 99]]);
+  assert.equal(acked, 1);
+  fail = true;
+  calls.length = 0;
+  m.sink().repair("t2", [], 0, 0, () => { acked += 1; });
+  await new Promise((r) => setImmediate(r));
+  await m._drain();
+  assert.deepEqual(calls, []);
+  assert.equal(m._q.length, 0, "a failed repair is dropped, left pending for the next pass");
+  assert.equal(acked, 1);
+});
+
 test.after(() => { if (hub.server && hub.server.close) hub.server.close(); });

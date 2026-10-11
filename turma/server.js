@@ -4612,7 +4612,16 @@ function setArchiveMirror(blobStore, ha) {
     isLeader: () => true,
     // A rendered file retryBlocked landed after the hydrate (XERK-1050): re-derive
     // cursors from it before it unblocks, as the hydrate does.
-    onLanded: () => archive.reconcileLanded(!!archiveIndexStore),
+    // It may also be one the leader's duplicate repair skipped (XERK-1450) — run
+    // on the next tick, once the landed keys are unblocked in this sync step.
+    onLanded: () => {
+      archive.reconcileLanded(!!archiveIndexStore);
+      setImmediate(() => {
+        if (!isLeader()) return;
+        try { archive.dedupArchive({ publish: true }); }
+        catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+      });
+    },
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
   // Ingest closes per TRANSCRIPT for rendered files that did not land (XERK-1050).
@@ -4761,7 +4770,10 @@ class IndexMirror {
         try { await this._apply(op); }
         catch (e) {
           op._tries = (op._tries || 0) + 1;
-          if (op._tries < 3) this._q.unshift(op); // transient — retry before anything newer
+          // A repair is never retried: its entry snapshot may be stale by then. Its
+          // sidecar stays `dedupPending`, so the next leader pass redoes it (XERK-1450).
+          if (op.t === "repair") console.error(`archive index mirror: repair of ${op.transcriptId} failed (${e && e.message}); the next leader pass redoes it`);
+          else if (op._tries < 3) this._q.unshift(op); // transient — retry before anything newer
           else console.error(`archive index mirror: op ${op.t} failed (${e && e.message}); dropped`);
         }
       }
@@ -4774,7 +4786,11 @@ class IndexMirror {
     if (op.t === "entries") return this.store.appendEntries(op.transcriptId, op.entries, op.startSeq);
     if (op.t === "replace") return this.store.replaceEntries(op.transcriptId, op.entries);
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
-    if (op.t === "counts") return this.store.setCounts(op.transcriptId, op.msgCount, op.archiveBytes);
+    if (op.t === "repair") {
+      await this.store.replaceEntries(op.transcriptId, op.entries);
+      await this.store.setCounts(op.transcriptId, op.msgCount, op.archiveBytes);
+      if (op.done) { try { op.done(); } catch (e) { console.error(`archive index mirror: repair ack failed (${e && e.message})`); } }
+    }
   }
   // The sink archive.js calls — each method SYNC (enqueue only), never awaited by the
   // caller and never throwing back into archive.js's hot path.
@@ -4785,8 +4801,8 @@ class IndexMirror {
         this._push({ t: "entries", transcriptId, entries, startSeq }),
       replace: (transcriptId, entries) => this._push({ t: "replace", transcriptId, entries }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
-      counts: (transcriptId, msgCount, archiveBytes) =>
-        this._push({ t: "counts", transcriptId, msgCount, archiveBytes }),
+      repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
+        this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done }),
     };
   }
 }
@@ -22020,6 +22036,8 @@ if (process.env.TURMA_TEST) {
     setArchiveMirror,
     getArchiveMirror: () => archiveMirror,
     // The index mirror's drain: a retried op must stay ahead of later ops (XERK-1832).
+    // The duplicate repair's hydrate ordering (XERK-1450) and its mirror op.
+    hydrateArchive,
     IndexMirror,
     // The index hydrate's deadline (XERK-1282): a hung load must reject AND cut its
     // loader, or a late page lands in an index ingest has since reopened.

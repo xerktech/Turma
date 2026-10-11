@@ -448,11 +448,16 @@ function mirrorEntries(transcriptId, list, startSeq) {
   } catch { /* best-effort mirror */ }
 }
 // Mirror a wholesale replacement of a transcript's entries (the reconcile heal).
-// Mirror a transcript's EXACT msgCount/archiveBytes — the one write allowed to
-// LOWER them (the session upsert only raises), for the duplicate repair below.
-function mirrorCounts(transcriptId, msgCount, archiveBytes) {
-  if (!indexSink || typeof indexSink.counts !== "function") return;
-  try { indexSink.counts(transcriptId, msgCount, archiveBytes); } catch { /* best-effort mirror */ }
+// Mirror the duplicate repair (XERK-1450) as ONE op: replace the transcript's
+// entries and set its msgCount/archiveBytes EXACTLY — the one write allowed to
+// lower them (the session upsert only raises). `done` runs once Postgres has both.
+function mirrorRepair(transcriptId, list, msgCount, archiveBytes, done) {
+  if (!indexSink || typeof indexSink.repair !== "function") return;
+  try {
+    indexSink.repair(transcriptId, (list || []).map((e) => ({
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+    })), msgCount, archiveBytes, done);
+  } catch { /* best-effort mirror */ }
 }
 function mirrorReplace(transcriptId, list) {
   if (!indexSink || typeof indexSink.replace !== "function") return;
@@ -2841,67 +2846,100 @@ function backfillPgIndexFromFiles() {
 // repair holds a stale LARGER copy the hydrate would otherwise keep over the
 // repaired bucket object, and it must never push that copy anywhere.
 //
-// A clean pass stamps `dedupChecked` (the file size it covered) on the sidecar so
-// later passes read only files that changed. The agent cursor (`bytesStored`) is
-// untouched: it counts the agent's raw bytes, not the lines we kept. Synchronous,
-// like the other whole-store boot passes. Returns the number of files repaired.
+// The sidecar carries `dedupPending` from before the file shrinks until the index
+// is re-seated — in pg mode, until Postgres confirms the repair op — so a crash or
+// a dropped mirror op is redone by the next publishing pass rather than skipped.
+// `dedupChecked` (the size a pass covered) lets later passes skip unchanged files.
+// The agent cursor (`bytesStored`) is untouched: it counts the agent's raw bytes,
+// not the lines we kept. Synchronous, like the other whole-store boot passes.
+// Returns the number of files rewritten or re-seated.
+function dedupLines(buf) {
+  const seen = new Set();
+  const parts = [];
+  let dropped = 0;
+  let start = 0;
+  // Split on raw bytes and key on latin1 (one char per byte), so whatever a kept
+  // line holds — invalid UTF-8 included — is written back byte-for-byte.
+  while (start < buf.length) {
+    const nl = buf.indexOf(10, start);
+    const end = nl === -1 ? buf.length : nl + 1;
+    const line = buf.subarray(start, nl === -1 ? buf.length : nl);
+    const key = line.toString("latin1");
+    if (key.trim() && seen.has(key)) dropped += 1;
+    else { seen.add(key); parts.push(buf.subarray(start, end)); }
+    start = end;
+  }
+  // A torn final line dropped as a duplicate leaves the kept text ending cleanly.
+  return { out: dropped ? Buffer.concat(parts) : buf, dropped };
+}
 function dedupArchive(opts) {
   const publish = !!(opts && opts.publish);
   const files = [];
   walkJsonl(ARCHIVE_DIR, files, 0);
   let repaired = 0, droppedTotal = 0;
   for (const jsonl of files) {
+    // A rendered file whose download has not landed is not the of-record copy.
+    if (renderedGate) { try { if (renderedGate(jsonl)) continue; } catch { continue; } }
     const metaPath = jsonl + ".meta";
     const meta = readSidecar(metaPath);
     if (!meta || !meta.transcriptId) continue; // unattributable: leave it alone
-    let raw;
-    try { raw = fs.readFileSync(jsonl, "utf8"); } catch { continue; }
-    const size = Buffer.byteLength(raw);
-    if (meta.dedupChecked === size) continue;
-    const seen = new Set();
-    const kept = [];
-    let dropped = 0;
-    for (const line of raw.split("\n")) {
-      if (!line.trim()) continue;
-      if (seen.has(line)) { dropped += 1; continue; }
-      seen.add(line);
-      kept.push(line);
-    }
-    if (!dropped) {
+    let buf;
+    try { buf = fs.readFileSync(jsonl); } catch { continue; }
+    const redo = publish && !!meta.dedupPending;
+    if (meta.dedupChecked === buf.length && !redo) continue;
+    const { out, dropped } = dedupLines(buf);
+    if (!dropped && !redo) {
       // Only the publisher stamps: a local-only stamp would differ from the
       // bucket's sidecar and just be refetched over.
-      if (publish) writeSidecar(metaPath, { ...meta, dedupChecked: size });
+      if (publish) writeSidecar(metaPath, { ...meta, dedupChecked: buf.length });
       continue;
     }
-    const text = kept.length ? kept.join("\n") + "\n" : "";
-    const archiveBytes = Buffer.byteLength(text);
-    const tmp = jsonl + ".tmp";
-    fs.writeFileSync(tmp, text);
-    fs.renameSync(tmp, jsonl);
+    if (dropped) {
+      // Pending BEFORE the file shrinks, so no crash point leaves a clean file
+      // beside an index that still counts the copies.
+      writeSidecar(metaPath, { ...meta, dedupPending: true }, true);
+      const tmp = jsonl + ".tmp";
+      fs.writeFileSync(tmp, out);
+      fs.renameSync(tmp, jsonl);
+      droppedTotal += dropped;
+    }
+    repaired += 1;
+    const archiveBytes = out.length;
     const entries = heldEntries(jsonl).entries;
     const msgCount = entries.length;
-    writeSidecar(metaPath, { ...meta, msgCount, archiveBytes, dedupChecked: archiveBytes }, !publish);
-    repaired += 1;
-    droppedTotal += dropped;
-    if (!publish) continue;
+    const fixed = { ...meta, msgCount, archiveBytes, dedupChecked: archiveBytes, dedupPending: true };
+    if (!publish) { writeSidecar(metaPath, fixed, true); continue; }
     noteWrite(jsonl);
     const id = meta.transcriptId;
-    const relPath = path.relative(ARCHIVE_DIR, jsonl);
     const row = idxGetSession(id);
     // Only re-seat the row this file IS — never a different file's that shares the id.
-    if (!row || row.filePath !== relPath) continue;
+    if (!row || row.filePath !== path.relative(ARCHIVE_DIR, jsonl)) {
+      delete fixed.dedupPending;
+      writeSidecar(metaPath, fixed);
+      continue;
+    }
     if (isPgMode()) {
       const live = sessionsMap.get(id);
       if (live) { live.msgCount = msgCount; live.archiveBytes = archiveBytes; }
+      writeSidecar(metaPath, fixed);
+      mirrorRepair(id, entries, msgCount, archiveBytes, () => {
+        // Postgres holds the repair: clear the flag, unless an ingest has since
+        // rewritten the sidecar (which drops it anyway).
+        const sc = readSidecar(metaPath);
+        if (!sc || !sc.dedupPending || sc.archiveBytes !== archiveBytes) return;
+        delete sc.dedupPending;
+        writeSidecar(metaPath, sc);
+      });
     } else {
       db.prepare("UPDATE sessions SET msgCount=?, archiveBytes=? WHERE transcriptId=?")
         .run(msgCount, archiveBytes, id);
+      reindexHeld(id, entries);
+      delete fixed.dedupPending;
+      writeSidecar(metaPath, fixed);
     }
-    reindexHeld(id, entries);
-    mirrorCounts(id, msgCount, archiveBytes);
   }
   if (repaired) {
-    console.error(`archive: removed ${droppedTotal} repeated line(s) from ${repaired} ` +
+    console.error(`archive: removed ${droppedTotal} repeated line(s); repaired ${repaired} ` +
       `transcript(s)${publish ? "" : " (local copy only, before a hydrate)"} — damage ` +
       `written before XERK-1364's re-send de-dup (XERK-1450)`);
   }
