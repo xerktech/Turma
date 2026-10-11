@@ -2401,7 +2401,7 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
         # A non-dict `input` (or `questions`) raised AttributeError on every beat
         # for that session (XERK-1701 rollup); it is now just no question.
         path = os.path.join(self.proj, "s.jsonl")
-        for bad in ("a string", ["q"], None, {"questions": "q"}):
+        for bad in ("a string", ["q"], 7, {"questions": {"a": 1}}, {"questions": 3}):
             write_jsonl(path, [{
                 "type": "assistant",
                 "message": {"content": [
@@ -2411,6 +2411,11 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
             rep = ha.session_report(self.WORKDIR, {})
             self.assertTrue(rep["lastHasToolUse"], bad)
             self.assertIsNone(rep.get("question"), bad)
+        # A last line that is not an object, or a non-object message, is no entry.
+        for line in ("[1, 2]", "\"hi\"", {"type": "assistant", "message": "text"}):
+            write_jsonl(path, [line])
+            rep = ha.session_report(self.WORKDIR, {})
+            self.assertIsNone(rep.get("question"), line)
 
     def test_plain_tool_use_is_not_a_question(self):
         path = os.path.join(self.proj, "s.jsonl")

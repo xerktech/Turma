@@ -2914,9 +2914,10 @@ function dedupLines(buf) {
     const nl = buf.indexOf(10, start);
     const end = nl === -1 ? buf.length : nl + 1;
     const line = buf.subarray(start, nl === -1 ? buf.length : nl);
-    // A CRLF line keys as its LF twin: a copy torn between a line and its \r
-    // must still de-dup to a prefix of the repaired file.
-    const key = line.toString("latin1").replace(/\r$/, "");
+    // Trailing whitespace is not part of the key: a copy torn between a line and
+    // its \r (or other trailing blank) must still de-dup to a prefix of the
+    // repaired file. JSON lines differing only there are the same entry.
+    const key = line.toString("latin1").trimEnd();
     if (key.trim() && seen.has(key)) dropped += 1;
     else { seen.add(key); parts.push(buf.subarray(start, end)); }
     start = end;

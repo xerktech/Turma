@@ -1273,6 +1273,9 @@ test("a CRLF copy torn before a \\r still de-dups to a prefix of the repaired fi
   const copy = archive.dedupLines(torn).out.toString("latin1");
   assert.equal(repaired, '{"a":1}\r\n');
   assert.ok(repaired.startsWith(copy), JSON.stringify(copy));
+  // Any trailing blank, not only \r: '{"u":1} ' and '{"u":1}' are one entry.
+  const spaced = Buffer.from('{"u":1} \n{"u":3}\n{"u":1}\n');
+  assert.equal(archive.dedupLines(spaced).out.toString("latin1"), '{"u":1} \n{"u":3}\n');
 });
 
 test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
