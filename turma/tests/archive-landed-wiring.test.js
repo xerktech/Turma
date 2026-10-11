@@ -252,6 +252,15 @@ test("XERK-1450: IndexMirror applies a repair as replace + exact counts, acks it
   assert.deepEqual(calls, []);
   assert.equal(m._q.length, 0, "a failed repair is dropped, left pending for the next pass");
   assert.equal(failed, 1, "tried once, never re-queued behind newer ops");
+  // A deposed leader applies nothing and acks nothing.
+  fail = false;
+  calls.length = 0;
+  const demoted = new hub.IndexMirror(store, () => false);
+  demoted.sink().repair("t3", [{ text: "a" }], 1, 9, () => { acked += 1; });
+  await new Promise((r) => setImmediate(r));
+  await demoted._drain();
+  assert.deepEqual(calls, []);
+  assert.equal(acked, 1);
   assert.equal(acked, 1);
 });
 

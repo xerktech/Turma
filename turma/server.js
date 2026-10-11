@@ -4733,8 +4733,11 @@ let indexMirror = null;
 // operator-triggered re-sync — never local data loss).
 const INDEX_MIRROR_QUEUE_MAX = positiveEnv("INDEX_MIRROR_QUEUE_MAX", 100000);
 class IndexMirror {
-  constructor(store) {
+  // `isLeader` gates the duplicate repair (XERK-1450): a deposed leader's queued
+  // repair would trim the new leader's newer appends and lower its counts.
+  constructor(store, isLeader) {
     this.store = store;
+    this.isLeader = typeof isLeader === "function" ? isLeader : () => true;
     this._q = [];
     this._running = false;
     this._dropped = 0;
@@ -4787,6 +4790,8 @@ class IndexMirror {
     if (op.t === "replace") return this.store.replaceEntries(op.transcriptId, op.entries);
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
     if (op.t === "repair") {
+      // Its sidecar stays pending; the leader that deposed us owns the repair now.
+      if (!this.isLeader()) return;
       await this.store.replaceEntries(op.transcriptId, op.entries);
       await this.store.setCounts(op.transcriptId, op.msgCount, op.archiveBytes);
       if (op.done) { try { op.done(); } catch (e) { console.error(`archive index mirror: repair ack failed (${e && e.message})`); } }
@@ -4811,7 +4816,7 @@ function setIndexMirror(store, ha) {
     indexMirror = null; archive.setIndexSink(null); archive.setIndexMode(null);
     return;
   }
-  indexMirror = new IndexMirror(store);
+  indexMirror = new IndexMirror(store, () => isLeader());
   archive.setIndexSink(indexMirror.sink());
   // XERK-793: retire the per-replica local node:sqlite index. The index becomes the
   // in-memory session-row map (beat-safe, hydrated from Postgres) + Postgres-direct

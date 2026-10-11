@@ -2925,7 +2925,8 @@ function dedupArchive(opts) {
     const row = idxGetSession(id);
     // Only re-seat the row this file IS — never a different file's that shares the id.
     if (!row || row.filePath !== path.relative(ARCHIVE_DIR, jsonl)) {
-      dedupPendingIds.delete(id);
+      // Not dedupPendingIds: it is keyed by id, and another file with this id may
+      // hold a repair Postgres has not acked. A stale entry only re-stamps pending.
       delete fixed.dedupPending;
       writeSidecar(metaPath, fixed);
       continue;

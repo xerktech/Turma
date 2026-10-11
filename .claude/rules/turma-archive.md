@@ -214,6 +214,9 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     The pool has no transactions; a delete-first replace failing mid-way, after another repair's
     ack (same pod, or the old leader across a handover) cleared pending, left PG entries empty
     for good (QA).
+  - `IndexMirror` applies a `repair` only while this replica leads: a deposed leader's late repair
+    trimmed the new leader's newer append and lowered its counts (QA). Its sidecar stays pending.
+  - `dedupPendingIds` is keyed by id, so never clear it for a file whose row is another file's.
   - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
     covered) skips unchanged files.
   - Tests: the `XERK-1450` cases in `index-store.test.js` and `archive-landed-wiring.test.js`.

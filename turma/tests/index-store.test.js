@@ -1301,6 +1301,24 @@ test("XERK-1450 pg mode: only the latest queued repair's ack clears pending", as
   } finally { pgTeardown(); }
 });
 
+test("XERK-1450 pg mode: a same-id stray file never clears the real file's pending repair", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl, len1 } = duplicatedTranscript("t-stray");
+    const stray = path.join(process.env.ARCHIVE_DIR, "zzz", path.basename(jsonl));
+    fs.mkdirSync(path.dirname(stray), { recursive: true });
+    fs.copyFileSync(jsonl, stray);
+    fs.copyFileSync(jsonl + ".meta", stray + ".meta");
+    mem.dropRepairs = true;
+    assert.equal(archive.dedupArchive({ publish: true }), 2);
+    archive.ingestChunk("nas", "t-stray", META, len1, len1 + 50, [ent("d2", "user", "third")], "acme");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true);
+    mem.dropRepairs = false;
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "the real file is redone");
+    assert.equal(mem.entries.get("t-stray").size, 5);
+  } finally { pgTeardown(); }
+});
+
 test("XERK-1450 pg mode: an ingest while the repair is unacked keeps it pending", async () => {
   const mem = pgSetup();
   try {
@@ -1359,7 +1377,8 @@ test("PgIndexStore.replaceEntries: overwrites in place, then trims — never del
   await store.replaceEntries("t1", [ent("u0", "user", "a"), ent("u1", "user", "b")]);
   const exec = pool.calls.filter((c) => c.m === "execute");
   assert.equal(exec.length, 2);
-  assert.match(exec[0].text, /^INSERT INTO archive_entries .* ON CONFLICT \(transcript_id, seq\) DO UPDATE SET/);
+  assert.match(exec[0].text, /^INSERT INTO archive_entries .* ON CONFLICT \(transcript_id, seq\) DO UPDATE SET uuid = EXCLUDED\.uuid, role = EXCLUDED\.role, ts = EXCLUDED\.ts, text = EXCLUDED\.text$/,
+    "every column is overwritten, text included (tsv is generated from it)");
   assert.match(exec[1].text, /^DELETE FROM archive_entries WHERE transcript_id = \$1 AND seq >= \$2$/);
   assert.deepEqual(exec[1].params, ["t1", 2]);
   // An empty replace is just the trim (every row).
