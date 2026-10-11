@@ -14879,7 +14879,16 @@ test("transcribePcm: Whisper's non-speech output (silence -> 'you') comes back e
     const result = await transcribePcm(Buffer.from([1]));
     assert.deepEqual(result, { text: "", language: "en" }, junk);
   }
-  // Every listed phrase, so dropping one from the list fails here.
+  // The list is Tenir's _NON_SPEECH (api/src/api/stt/parakeet.py); pinned here so an
+  // entry can't be dropped unnoticed, and each one must actually match.
+  assert.deepEqual([...WHISPER_NON_SPEECH].sort(), [
+    "", "you", "thank you", "thanks for watching", "thank you for watching",
+    "well be right back", "subtítulos realizados por la comunidad de amaraorg",
+    "subtítulos por la comunidad de amaraorg", "soustitres réalisés par la communauté damaraorg",
+    "gracias por ver el video", "gracias por ver el vídeo", "gracias por ver",
+    "soustitrage société radiocanada", "soustitrage st 501", "ご視聴ありがとうございました",
+    "продолжение следует",
+  ].sort());
   for (const phrase of WHISPER_NON_SPEECH) {
     globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: ` ${phrase}.` }) });
     assert.deepEqual(await transcribePcm(Buffer.from([1])), { text: "" }, phrase);
