@@ -38142,10 +38142,6 @@ class SessionManager:
         ledgers. Replaced by the first scan that lands. Never raises."""
         try:
             raw = _read_untrusted_json(RESUMABLE_CACHE_PATH, RESUMABLE_CACHE_MAX_BYTES)
-            # A file that parsed is an answer, even an empty one; anything else
-            # (first start on this code, deleted, planted FIFO) is not, and the
-            # first refresh then builds the picker inline (_stage_repo_usage).
-            self._resumable_known = isinstance(raw, dict)
             out = {}
             for repo, lst in (raw if isinstance(raw, dict) else {}).items():
                 if not isinstance(repo, str) or not isinstance(lst, list):
@@ -38168,6 +38164,11 @@ class SessionManager:
                     keep.append(row)
                 if keep:
                     out[repo] = keep
+            # An answer is a file that parsed to an empty picker (nothing to
+            # resume) or kept rows. Anything else — first start on this code,
+            # deleted, a planted FIFO, a dict whose every row was junk — is not,
+            # and the first refresh builds the picker inline (_stage_repo_usage).
+            self._resumable_known = raw == {} or bool(out)
             return out
         except Exception as e:
             log(f"resumable cache load failed: {type(e).__name__}: {e}")

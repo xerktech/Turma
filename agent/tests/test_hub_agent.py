@@ -7638,12 +7638,23 @@ class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
         calls = []
         with mock.patch.object(sm, "_resumable_report",
                                lambda inputs=None: calls.append(inputs) or row), \
-             mock.patch.object(ha.threading.Thread, "start"):
+             mock.patch.object(ha.threading.Thread, "start",
+                               lambda self_: calls.append("worker-start")):
             sm._stage_repo_usage()
             self.assertEqual(sm.resumable, row)        # on beat 0's payload
             sm._stage_repo_usage()
-        self.assertEqual(calls, [None])                # inline once, never again
+        # Inline once, and BEFORE the worker that owns the read caches starts.
+        self.assertEqual(calls[:2], [None, "worker-start"])
+        self.assertEqual(calls.count(None), 1)
         self.assertTrue(os.path.exists(ha.RESUMABLE_CACHE_PATH))
+        self.assertTrue(self.make_manager()._resumable_known)
+
+    def test_a_cache_whose_rows_were_all_junk_is_no_answer(self):
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump({"Turma": [dict(self._resumable_row("../x"))]}, f)
+        self.assertFalse(self.make_manager()._resumable_known)
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump({}, f)                           # nothing to resume: an answer
         self.assertTrue(self.make_manager()._resumable_known)
 
     def test_the_cache_is_untrusted(self):
