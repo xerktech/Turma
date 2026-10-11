@@ -149,4 +149,55 @@ class ChatUiStateTest {
         assertTrue(after.tunnelOnline)               // recovers, not just degrades
         assertFalse(after.canSwitchModelSource())
     }
+
+    // --- the TUI's blocking dialog (session.panePrompt) -----------------------
+
+    private fun dialog(detail: String, question: String = "") = SessionInfo(
+        id = "s1",
+        session = com.xerktech.turma.model.LiveSignals(
+            question = question,
+            panePrompt = com.xerktech.turma.model.PanePrompt(
+                prompt = "Do you want to proceed?", detail = detail,
+                options = listOf(com.xerktech.turma.model.PaneOption(1, "Yes", true)),
+            ),
+        ),
+    )
+
+    @Test
+    fun `an answered dialog stays hidden while a stale beat still reports it`() {
+        val first = dialog("Bash command\n  ls -la")
+        val answered = ChatUiState(session = first)
+            .copy(answeredPanePrompt = panePromptKey(first.session!!.panePrompt!!), answeredPanePromptAt = 1_000)
+        assertNull(answered.panePrompt)
+        val stale = answered.fromFleet(null, first, host = "h1", now = 2_000)
+        assertNull(stale.panePrompt)
+    }
+
+    @Test
+    fun `the next command's dialog shows even with the same question text`() {
+        // Claude asks every Bash permission as "Do you want to proceed?" — a guard
+        // on the prompt alone hid the next dialog until a dialog-free beat.
+        val first = dialog("Bash command\n  ls -la")
+        val answered = ChatUiState(session = first)
+            .copy(answeredPanePrompt = panePromptKey(first.session!!.panePrompt!!), answeredPanePromptAt = 1_000)
+        val next = answered.fromFleet(null, dialog("Bash command\n  rm -rf build/"), host = "h1", now = 2_000)
+        assertNull(next.answeredPanePrompt)
+        assertEquals("Bash command\n  rm -rf build/", next.panePrompt?.detail)
+    }
+
+    @Test
+    fun `an identical dialog asked again is not hidden past the hold`() {
+        val first = dialog("Bash command\n  ls -la")
+        val answered = ChatUiState(session = first)
+            .copy(answeredPanePrompt = panePromptKey(first.session!!.panePrompt!!), answeredPanePromptAt = 1_000)
+        val later = answered.fromFleet(null, first, host = "h1", now = 1_000 + PANE_ANSWER_HOLD_MS)
+        assertEquals("Do you want to proceed?", later.panePrompt?.prompt)
+    }
+
+    @Test
+    fun `a pending question wins over the dialog`() {
+        val both = ChatUiState(session = dialog("Bash command\n  ls", question = "Pick one"))
+        assertEquals("Pick one", both.question)
+        assertNull(both.panePrompt)
+    }
 }

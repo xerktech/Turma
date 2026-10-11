@@ -96,9 +96,14 @@ data class ChatUiState(
     // it back. Mirrors the web's `answeredQuestion` guard (chat.js updateQuestion),
     // which Android lacked.
     val answeredQuestion: String? = null,
-    // Same guard for the TUI's blocking dialog (web chat.js `answeredPanePrompt`):
-    // the prompt text just answered, so a stale beat can't bounce the sheet back.
+    // Same guard for the TUI's blocking dialog (web chat.js `answeredPanePrompt`),
+    // so a stale beat can't bounce the sheet back. Keyed on prompt AND detail
+    // ([panePromptKey]): Claude asks every Bash permission as "Do you want to
+    // proceed?", so the prompt alone hid the NEXT command's dialog. Held at most
+    // [PANE_ANSWER_HOLD_MS] past [answeredPanePromptAt], so even an identical
+    // dialog asked again can never stay hidden.
     val answeredPanePrompt: String? = null,
+    val answeredPanePromptAt: Long = 0,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     private val rawQuestion: String get() = session?.session?.question ?: ""
@@ -117,7 +122,7 @@ data class ChatUiState(
     val panePrompt: com.xerktech.turma.model.PanePrompt? get() {
         if (rawQuestion.isNotBlank()) return null
         val p = session?.session?.panePrompt ?: return null
-        if (p.prompt.isEmpty() || p.options.isEmpty() || p.prompt == answeredPanePrompt) return null
+        if (p.prompt.isEmpty() || p.options.isEmpty() || panePromptKey(p) == answeredPanePrompt) return null
         return p
     }
     // Attaching is off while a question is pending: the draft then routes to
@@ -145,7 +150,10 @@ data class ChatUiState(
      * local-model controls forever — and nothing else in the suite notices,
      * because a Composable's body has no gate at all.
      */
-    fun fromFleet(agent: AgentInfo?, session: SessionInfo?, host: String): ChatUiState = copy(
+    fun fromFleet(
+        agent: AgentInfo?, session: SessionInfo?, host: String,
+        now: Long = System.currentTimeMillis(),
+    ): ChatUiState = copy(
         session = session,
         hostLabel = agent?.device?.ifBlank { host } ?: host,
         tunnelOnline = tunnelOnlineOf(agent),
@@ -157,9 +165,18 @@ data class ChatUiState(
         // to the next question or clears, forget it so the new one shows at once
         // (XERK-812) — the web's `answeredQuestion = null` on a differing beat.
         answeredQuestion = answeredQuestion?.takeIf { it == (session?.session?.question ?: "") },
-        answeredPanePrompt = answeredPanePrompt?.takeIf { it == session?.session?.panePrompt?.prompt },
+        answeredPanePrompt = answeredPanePrompt?.takeIf {
+            it == session?.session?.panePrompt?.let(::panePromptKey) &&
+                now - answeredPanePromptAt < PANE_ANSWER_HOLD_MS
+        },
     )
 }
+
+/** What identifies one dialog for the just-answered guard: its question plus what it asks about. */
+internal fun panePromptKey(p: com.xerktech.turma.model.PanePrompt) = p.prompt + "\u0000" + p.detail
+
+/** The longest a just-answered dialog stays hidden while beats still report it (~2 agent beats). */
+internal const val PANE_ANSWER_HOLD_MS = 45_000L
 
 class ChatViewModel(
     app: Application,
@@ -597,8 +614,8 @@ class ChatViewModel(
      * once (web chat.js answerPanePrompt) and comes back if the POST fails.
      */
     fun answerPanePrompt(optionNumber: Int) {
-        val prompt = _state.value.panePrompt?.prompt ?: return
-        _state.update { it.copy(answeredPanePrompt = prompt) }
+        val prompt = _state.value.panePrompt?.let(::panePromptKey) ?: return
+        _state.update { it.copy(answeredPanePrompt = prompt, answeredPanePromptAt = System.currentTimeMillis()) }
         viewModelScope.launch {
             val r = runCatching { client.api.answerPanePrompt(host, sessionId, PanePromptAnswer(optionNumber)) }
             if (r.isFailure) {

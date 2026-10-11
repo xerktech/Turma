@@ -68,6 +68,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -567,8 +568,14 @@ private fun QuestionSheet(
  */
 @Composable
 private fun PanePromptSheet(prompt: com.xerktech.turma.model.PanePrompt, onPick: (Int) -> Unit) {
+    // Capped at half the screen and scrollable, so in landscape the options and
+    // the composer below stay reachable rather than being pushed off-screen.
+    val maxHeight = (LocalConfiguration.current.screenHeightDp / 2).dp
     Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
-        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Column(
+            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
             Pill("waiting", color = MaterialTheme.colorScheme.primary)
             Text(prompt.prompt, fontWeight = FontWeight.Medium)
             if (prompt.detail.isNotBlank()) {
