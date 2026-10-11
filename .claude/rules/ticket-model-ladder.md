@@ -12,8 +12,15 @@ paths:
 
 # Ticket model ladder (XERK-1827)
 
-An UNPINNED claude ticket session starts on haiku; each start after a session of that ticket ENDED
-UNDELIVERED runs one tier up (haiku → sonnet → opus, capped). Evidence: `docs/routing-spike-phase2-3.md`.
+**OFF by default — both the ladder and the sub-agent default.** The ladder's only failure signal is
+"delivered nothing" (no PR, no close): it cannot tell a wrong PR from a right one, so a cheap
+model's plausible-but-wrong PR never escalates, and the sub-agent default put QA itself on the
+cheap model. Keep both off until a per-ticket quality signal exists (XERK-1839); don't flip a
+default back on from bench solve rates alone — those grade known past fixes, not new tickets.
+
+When on (`TICKET_MODEL_LADDER=on`): an UNPINNED claude ticket session starts on haiku; each start
+after a session of that ticket ENDED UNDELIVERED runs one tier up (haiku → sonnet → opus, capped).
+Evidence: `docs/routing-spike-phase2-3.md`.
 
 - **Per session, never per turn.** A mid-conversation switch makes the new model re-cache every
   turn it missed (the spike's -8.2% vs -36.3%). Never route inside a session from this.
@@ -40,10 +47,10 @@ UNDELIVERED runs one tier up (haiku → sonnet → opus, capped). Evidence: `doc
 - **Escalation happens on the NEXT start only.** Auto-start never re-dispatches a ticket that has
   any session (`startedTicketKeys`), so a failed ticket is retried by an operator Start or the
   queue — nothing auto-restarts it, and nothing kills a running session for it.
-- `TICKET_MODEL_LADDER` (hub env, comma aliases) replaces the ladder; `off` restores the login
-  default for unpinned tickets — the rollback lever.
-- **Ticket sessions' sub-agents default to haiku** (`CLAUDE_CODE_SUBAGENT_MODEL`,
-  `TURMA_TICKET_SUBAGENT_MODEL`, "" = off) — never for a local-model session or over an operator's
+- `TICKET_MODEL_LADDER` (hub env): unset/`off`/`false`/`0`/unusable = off (login default), `on`/`true`/`1` = the
+  recommended `TICKET_MODEL_LADDER_DEFAULT`, a comma list = a custom ladder.
+- **`TURMA_TICKET_SUBAGENT_MODEL` (agent env, default "" = off) sets ticket sessions' sub-agent
+  default** (`CLAUDE_CODE_SUBAGENT_MODEL`) — never for a local-model session or over an operator's
   own setting; an agent definition naming its own model still wins.
 - **The replay gate**: `bench/run_policy.py` runs `ladder` and `always-opus` over the 25 `turma-*`
   tasks and prints solve rate + dollar cost side by side. Its `ladder` must equal

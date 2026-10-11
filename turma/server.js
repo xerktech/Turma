@@ -2575,15 +2575,19 @@ function setTicketModel(siteKey, issueKey, model) {
 //     never laddered (their model is the host's endpoint, not a Claude alias) —
 //     a runtime pin, or an unpinned ticket routed to a host whose DEFAULT
 //     runtime is not claude (TURMA_DEFAULT_RUNTIME, XERK-521).
-// TICKET_MODEL_LADDER (comma list of aliases) replaces it; set it to "off" to
-// return unpinned tickets to the login's default model. bench/run_policy.py's
-// "ladder" policy replays exactly this list — keep the two equal (pinned by
+// OFF BY DEFAULT: the ladder escalates only when a session delivered NOTHING —
+// it cannot tell a wrong PR from a right one, so a cheap model's plausible-but-
+// wrong PR never escalates. Until a per-ticket quality signal exists (XERK-1839)
+// unpinned tickets keep the login's default model. TICKET_MODEL_LADDER=on turns
+// on the recommended ladder below; a comma list of aliases sets a custom one;
+// unset, "off" or an unusable value leaves it off. bench/run_policy.py's
+// "ladder" policy replays the recommended list — keep the two equal (pinned by
 // bench/tests/test_policy.py).
 const TICKET_MODEL_LADDER_DEFAULT = ["haiku", "sonnet", "opus"];
-const TICKET_MODEL_LADDER = (() => {
-  const raw = (process.env.TICKET_MODEL_LADDER || "").trim().toLowerCase();
-  if (!raw) return TICKET_MODEL_LADDER_DEFAULT;
-  if (raw === "off" || raw === "none") return [];
+function parseTicketModelLadder(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || ["off", "none", "false", "0", "no"].includes(raw)) return [];
+  if (["on", "default", "true", "1", "yes"].includes(raw)) return TICKET_MODEL_LADDER_DEFAULT;
   const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
   const list = parts.filter((s) => /^[a-z0-9.-]{1,40}$/.test(s));
   if (list.length !== parts.length) {
@@ -2594,11 +2598,12 @@ const TICKET_MODEL_LADDER = (() => {
     console.warn(`TICKET_MODEL_LADDER: ${odd.join(", ")} is not a static alias; a host that has not probed it refuses the spawn`);
   }
   if (!list.length) {
-    console.warn(`TICKET_MODEL_LADDER=${JSON.stringify(raw)} names no usable alias; using the default`);
-    return TICKET_MODEL_LADDER_DEFAULT;
+    console.warn(`TICKET_MODEL_LADDER=${JSON.stringify(raw)} names no usable alias; the ladder stays off`);
+    return [];
   }
   return list;
-})();
+}
+let TICKET_MODEL_LADDER = parseTicketModelLadder(process.env.TICKET_MODEL_LADDER);
 
 // Every session of this ticket the fleet still knows about, on hosts DECIDED into
 // its org (decidedOrgOf: bound and not actively drifting). That is the served
@@ -22688,7 +22693,9 @@ if (process.env.TURMA_TEST) {
     ticketModelPin,
     ticketLadderPick,
     ticketSpawnModelFields,
-    TICKET_MODEL_LADDER,
+    TICKET_MODEL_LADDER_DEFAULT,
+    parseTicketModelLadder,
+    __setTicketModelLadder: (list) => { TICKET_MODEL_LADDER = list; },
     setTicketModel,
     orgModelAliases,
     ticketRuntimes,
