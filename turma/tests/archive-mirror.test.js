@@ -1003,6 +1003,41 @@ test("rendered downloads run concurrently, bounded (XERK-1829)", async () => {
   for (const k of keys) assert.equal(fs.readFileSync(path.join(root, k), "utf8"), "ab");
 });
 
+test("one hung rendered GET blocks its transcript only, never the whole pass (XERK-1833)", async () => {
+  const root = mkdtemp("turma-mir-");
+  let held;
+  let calls = 0;
+  const store = { list: async () => ["repo/a.jsonl", "repo/b.jsonl"], stat: async () => ({ size: 2 }),
+    getToFile: (k, dest) => {
+      if (k === "repo/a.jsonl" && ++calls === 1) {
+        return new Promise((r) => { held = () => { fs.writeFileSync(dest, "ab"); r(true); }; });
+      }
+      fs.writeFileSync(dest, "ab");
+      return Promise.resolve(true);
+    } };
+  const logs = [];
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log: (l) => logs.push(l) });
+  const gate = [];
+  // The pass stall deadline is far beyond the per-GET one: a pass held by the
+  // hung key would hang this test, not just abandon.
+  await m.hydrateGated((v) => gate.push(v),
+    { passDeadlineMs: 60 * 1000, getDeadlineMs: 20, sleep: async () => { throw new Error("retried"); } });
+  assert.deepEqual(gate, [true, false]); // opened after ONE pass, no retry
+  assert.equal(m.hydrated, true);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "b.jsonl"), "utf8"), "ab");
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "a.jsonl")), true);
+  assert.match(m.lastFailure, /repo\/a\.jsonl \(GET did not finish within 0s\)/);
+  // The timed-out GET finally lands: discarded, never renamed in behind the gate.
+  held();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
+  assert.equal(m.blockedCount(), 1);
+  // retryBlocked owns it from here.
+  assert.equal(await m.retryBlocked(), 1);
+  assert.equal(m.blockedCount(), 0);
+  assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl"), "utf8"), "ab");
+});
+
 test("an abandoned pass that wakes during the backoff writes nothing (XERK-1282)", async () => {
   const root = mkdtemp("turma-mir-");
   let hang = true;

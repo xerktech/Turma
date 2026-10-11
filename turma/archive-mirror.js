@@ -59,11 +59,16 @@ const HYDRATE_PASS_DEADLINE_MS = 15 * 60 * 1000;
 // store); 8 in flight measured 2-17x faster there (XERK-1829). Each streams to its
 // own temp file, so this bounds sockets and fds, not memory.
 const HYDRATE_CONCURRENCY = 8;
-// The longest one retryBlocked GET may run before that key is left blocked for the
-// next pass. A hydrate waits on an in-flight retry pass (they must not overlap), so
-// a retry GET that never settled made every bounded hydrate pass abandon and retry
-// forever, gate closed (XERK-1282 QA).
-const RETRY_GET_DEADLINE_MS = 5 * 60 * 1000;
+// The longest one rendered GET may run, in a hydrate pass or a retryBlocked pass,
+// before its key is left blocked (XERK-1050's per-transcript gate) for
+// retryBlocked. A hydrate waits on an in-flight retry pass (they must not
+// overlap), so a retry GET that never settled made every bounded hydrate pass
+// abandon and retry forever, gate closed (XERK-1282 QA). In the hydrate pass
+// itself one hung GET stalled the whole pass the same way, keeping ingest closed
+// hub-wide for one key (XERK-1833). It must clear the largest legitimate rendered
+// object on a slow link: ARCHIVE_TRANSCRIPT_MAX_BYTES (16 MiB) in 5 min is ~55 KB/s.
+// Shorter than HYDRATE_PASS_DEADLINE_MS, so a hung GET never reaches the stall bound.
+const GET_DEADLINE_MS = 5 * 60 * 1000;
 const TIMED_OUT = Symbol("timedOut");
 // `p`, or TIMED_OUT once `ms` passes first. `p` itself is left running.
 async function raceDeadline(p, ms) {
@@ -214,7 +219,7 @@ class ArchiveMirror {
   // authoritative; the un-mirrored tail re-mirrors on the next drain. A leader
   // that has been writing thus hydrates to a near-no-op. Best-effort per key.
   // Returns the count downloaded.
-  async hydrate() {
+  async hydrate({ getDeadlineMs = GET_DEADLINE_MS } = {}) {
     if (!this.blobStore || this._hydrating) return 0;
     this._hydrating = true;
     const run = ++this._hydrateRun;
@@ -316,6 +321,9 @@ class ArchiveMirror {
       const worker = async () => {
         while (next < downloads.length && !stale()) {
           const { key, dest } = downloads[next++];
+          // A GET past its deadline leaves the key blocked; if it lands later it is
+          // discarded, never renamed in after the pass moved on (XERK-1833).
+          let abandoned = false;
           try {
             // Through a temp file too: a GET cut mid-body left a PARTIAL rendered
             // file at its real path, which ingest would then append to and the
@@ -323,9 +331,16 @@ class ArchiveMirror {
             // (deleted since the listing) returns false: gone, as above.
             // An abandoned pass's late GET is discarded, never renamed over a file
             // a newer pass (and the ingest it reopened) has since written.
-            if (await this._download(key, dest, () => !stale())) fetched++;
+            const r = await raceDeadline(
+              this._download(key, dest, () => !stale() && !abandoned), getDeadlineMs);
             if (stale()) return;
-            this._blocked.delete(key);
+            if (r === TIMED_OUT) {
+              abandoned = true;
+              this._blocked.set(key, `${key} (GET did not finish within ${Math.round(getDeadlineMs / 1000)}s)`);
+            } else {
+              if (r) fetched++;
+              this._blocked.delete(key);
+            }
           } catch (e) {
             if (stale()) return;
             // ABSENT (or short) locally while Postgres holds its full cursor:
@@ -360,7 +375,7 @@ class ArchiveMirror {
   // it is reported as an incomplete hydrate, so hydrateUntilListed logs it and
   // retries with ingest still gated (XERK-1048: never open over a tree that was not
   // fully classified). A slow pass that keeps landing files runs to completion.
-  async _boundedHydrate(deadlineMs) {
+  async _boundedHydrate(deadlineMs, getDeadlineMs) {
     this._progress();
     let timer;
     const stalled = new Promise((res) => {
@@ -373,7 +388,7 @@ class ArchiveMirror {
       check();
     });
     let r;
-    try { r = await Promise.race([this.hydrate(), stalled]); }
+    try { r = await Promise.race([this.hydrate({ getDeadlineMs }), stalled]); }
     finally { clearTimeout(timer); }
     if (r !== TIMED_OUT) return r;
     this._hydrateRun++;
@@ -402,15 +417,15 @@ class ArchiveMirror {
   // one undownloadable key no longer stalls the whole hub (XERK-1050). `sleep` is
   // injectable for tests.
   async hydrateUntilListed({ firstDelayMs = 2000, maxDelayMs = 60 * 1000,
-    passDeadlineMs = HYDRATE_PASS_DEADLINE_MS,
+    passDeadlineMs = HYDRATE_PASS_DEADLINE_MS, getDeadlineMs = GET_DEADLINE_MS,
     sleep = (ms) => new Promise((r) => setTimeout(r, ms)) } = {}) {
-    let fetched = await this._boundedHydrate(passDeadlineMs);
+    let fetched = await this._boundedHydrate(passDeadlineMs, getDeadlineMs);
     for (let delay = firstDelayMs; this.blobStore && !this.hydrated;
       delay = Math.min(delay * 2, maxDelayMs)) {
       this.log(`archive hydrate: incomplete — ${this.lastFailure} Archive ingest ` +
         `stays closed on this replica; retrying in ${Math.round(delay / 1000)}s`);
       await sleep(delay);
-      fetched = await this._boundedHydrate(passDeadlineMs);
+      fetched = await this._boundedHydrate(passDeadlineMs, getDeadlineMs);
     }
     return fetched;
   }
@@ -441,7 +456,7 @@ class ArchiveMirror {
   // same synchronous step. Unblocked on landing, a transcript was open with its
   // Postgres cursor still AHEAD of the older bucket copy, so the agent's next
   // chunk appended past a gap and the lagging tail was lost for good (QA D1).
-  async retryBlocked({ getDeadlineMs = RETRY_GET_DEADLINE_MS } = {}) {
+  async retryBlocked({ getDeadlineMs = GET_DEADLINE_MS } = {}) {
     if (!this.blobStore || this._hydrating || this._retrying || !this._blocked.size) return 0;
     let landed = 0;
     const done = [];
