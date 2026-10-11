@@ -171,7 +171,7 @@ static and the only thing that changes is a child's board Done-ness.
     is Done. **This reverses the earlier "a child must not depend on choosing to self-close" rule** —
     arming a run still gets the child auto-MERGED and messaged, but each ticket owns the decision that
     its work is complete. TRADE-OFF: a child that neither continues nor self-marks Done stalls its
-    wave (the deliberate cost of not closing behind live work). Mechanics: `turma-board.md`.
+    wave (the deliberate cost of not closing behind live work). Mechanics: `turma-automerge.md`.
 - **Arming the run is the hands-off opt-in — it OVERRIDES the org auto-merge toggle.** The operator
   armed the run deliberately (operator-confirmed for XERK-637), so `epicRunChildSession` requires
   neither `autoMergeOrgs[site]` nor the org triage policy — only membership in an armed run's

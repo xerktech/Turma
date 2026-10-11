@@ -37,6 +37,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `guard-positionals.md` | `guard.py`, `test_guard.py` | guard: `$1` bound by `sh -c`, a function call or `set` (XERK-1626) |
 | `guard-readers.md` | `guard.py`, `test_guard.py` | guard: what a reader binds: IFS/`-d`, heredocs, `-C` (XERK-1658) |
 | `agent-native.md` | `agent/native/**` | non-Docker install, launcher, updater |
+| `agent-token-onboarding.md` | `server.js`, `hub-agent.py`, `agent/native/**` | per-host token roll + enroll (XERK-578) |
 | `agent-native-windows.md` | `agent/native/README-windows.md`, `docs/windows-agent-adr.md` | Windows agent (XERK-666) map: component→rules-file, invariants, operator guide |
 | `windows-agent.md` | `agent/hub-agent.py` | native Windows portability: paths, %APPDATA%, icacls ACL, liveness/degradation (XERK-670); ADR `docs/windows-agent-adr.md` |
 | `windows-launcher.md` | `agent/native/windows/**` | native Windows launcher (XERK-669), service/control (XERK-671), installer (XERK-672), `irm\|iex` bootstrap (XERK-673), self-updater (XERK-674): WinSW unit, session-preserving restart, pidfile, update poller + payload swap, asset seam |
@@ -54,6 +55,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |
 | `turma-notifications.md` | `turma/server.js`, `turma/push.js` | FCM alerts, one-alert-per-work rule, runaway spend (XERK-310), Claude login alerts, `notify()`/`push.js`, dismiss, `pushEnabled` |
 | `turma-board.md` | `turma/public/board.*` | Kanban, ticket panel, routing, auto-start/stop |
+| `turma-automerge.md` | `turma/server.js`, `hub-agent.py` | per-org auto-merge + auto-close sweeps (XERK-550/563/705) |
 | `turma-triage.md` | `turma/public/board.*`, `turma/server.js` | Triage lane, per-ticket verdicts, org triage policy, auto-start gate |
 | `turma-ticket-queue.md` | `turma/server.js`, `board.*` | hub ticket queue: admission, drain, expiries, caps |
 | `turma-epic-run.md` | `turma/server.js` | epic auto-orchestration: durable run store, dependency DAG, manual-start route, never-auto-start gate (XERK-635); auto-close chaining + epic-completion write (XERK-637); pause/resume operator hold (XERK-641) |
@@ -192,18 +194,11 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - **Drift is declaring a DIFFERENT org, never failing to declare one** — a host whose tracker goes
     quiet keeps its binding and its peers.
   - **The hub SERVES its decided org as `org`, and the migrate route + every Move menu key on it**
-    (XERK-349). `decidedOrgOf` = the bound org, or "" for an actively-drifted host or a never-bound
-    one; `serializeAgent` stamps it after the spread (like `key`), `normalizeOrg` strips any an agent
-    forges. A migration needs a shared NON-EMPTY decided org on BOTH sides (`sameDecidedOrg`). What it
-    CLOSES: two hosts that both declare NO org no longer pool (the org-less hole — a bound-to-acme host
-    declaring nothing now reads "acme", not the same "" a bound-to-rival one does). What it FIXES: the
-    over-refusal where two same-org hosts, one momentarily quiet, wrongly 409'd. What it does NOT do:
-    an actively-drifting host is refused (decided ""), but that quarantine is **self-healing, one beat
-    deep** — the SAME as the reverted drift-refusal, not better — since silence is not drift (XERK-348)
-    and the binding never moved, so a drifted-then-quiet host is `boundOrgOf` again; permanent drift
-    quarantine would need drift history the record lacks and would undo the over-refusal fix. Clients
-    mirror the served `org` (older-hub fallback to `jira.siteKey`), so hub and menus agree. Cost: a no-Jira
-    fleet cannot migrate. **Do not re-key this on the claimed `jira.siteKey`** — that reopens the holes.
+    (XERK-349). `decidedOrgOf` = the bound org, or "" for a drifted or never-bound host; a migration
+    needs a shared NON-EMPTY decided org on BOTH sides (`sameDecidedOrg`). Clients mirror the served
+    `org` (older-hub fallback to `jira.siteKey`). Drift quarantine heals in one beat, and a no-Jira
+    fleet cannot migrate. **Do not re-key this on the claimed `jira.siteKey`** — that reopens the
+    holes. What it closes and fixes: `turma.md`.
   - **Every roster cell is capped on the wire** (`PEER_CELL_MAX`), not just the free-text one —
     nothing else bounds `rcName`, and the spawn route takes a 100k `label`.
   - **Both sides fail NARROW.** No `peers` on a reply forgets the roster; a silent hub expires it;
@@ -232,22 +227,12 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     OWN thread (`_export_session_async`); its refusal still reaches the hub because the
     `spawn_failures` append is lock-guarded and `post()` clears only the entries THIS payload
     delivered, by identity, so a refusal appended mid-beat is never lost.
-  - **The PR-COMMENT poller is a FETCH/DELIVER SPLIT** (XERK-543), not on the slow-refresh worker.
-    Its `gh`/GitLab/ADO fetch (PR_COMMENTS_MAX per pass, same class as `refresh_pr_status`) runs on
-    its OWN worker (`_fetch_pr_comments`, staged by `_stage_pr_comment_fetch`), which stages raw
-    events (`_pr_comments_fetched`, REBOUND under `_pr_comments_lock` like `spawn_failures`); the beat
-    only DRAINS that and DELIVERS (`_deliver_pr_comments` — the baseline/new-key logic, `prCommentBase`
-    mutation, `save()`, `notify_session`). It could NOT ride the slow-refresh worker: that worker is
-    the single lock-free writer of caches the beat READS, whereas delivery MUTATES session records,
-    which is the beat's to own — so the network half moved off, the registry half stayed on. The
-    synchronous `_poll_pr_comments` (fetch-then-deliver) is kept only as the behavioural-test entry
-    point. One beat stale, accepted.
-  - **The operator `input` command is a STAGE/DELIVER/RECORD split too** (XERK-867): `handle_commands`
-    only `_stage_input`s it; `_input_worker_loop` delivers (uploads fetch, trust-clear, the Windows
-    multi-line settle+retry paste — all ~5s-class pane RPCs); the BEAT records the `pendingInputs`
-    outbox via `_apply_landed_inputs` (the "only the beat writes+saves the registry" line the
-    PR-comment split draws too — the worker's one touch is a benign `trustCheckUntil` pop). Delivery
-    was inline and its Windows worst case ate the budget. Mechanics: `.claude/rules/agent-input.md`.
+  - **The PR-COMMENT poller is a FETCH/DELIVER SPLIT** (XERK-543): its network fetch runs on its OWN
+    worker, the beat only drains + delivers (delivery mutates session records, the beat's to own).
+    Mechanics: `agent-prs.md`.
+  - **The operator `input` command is a STAGE/DELIVER/RECORD split too** (XERK-867):
+    `handle_commands` only stages it, a worker delivers (its Windows worst case ate the budget inline),
+    and the beat records the `pendingInputs` outbox. Mechanics: `.claude/rules/agent-input.md`.
   - Tests: `TestBeatLoopBudget`, `TestSlowRefreshWorker`, `TestPrCommentFetchWorker`,
     `TestArchiveSyncWorker`, `TestOffBeatInputDelivery`.
 - **`readyForReview` has FOUR mirrors that must agree**: `turma/public/sessions.html`,
@@ -328,32 +313,9 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
   - The master still authenticates as `legacy` so a fleet mid-rollover keeps beating;
     **`TURMA_AGENT_STRICT` retires it**, and the hub warns at boot until it is set. Detail in
     `turma.md`; the agent needs no code change, only the right `TURMA_TOKEN`.
-  - **Onboarding onto that derived token is ONE action, not a per-host ritual** (XERK-578), spanning
-    hub + agent + native. The hub re-derives `hostAgentToken(host)` and delivers it two ways:
-    - **Roll (design A):** `POST /api/agents/<host>/roll-token` (operator-authed) queues a `setToken`
-      command over the existing tunnel; the agent (`set_token`) writes it to its env file atomically
-      and does a session-preserving restart. Deterministic, so a re-roll is idempotent.
-    - **Enroll (design B):** `GET /api/agent/token` (AGENT-authed) returns ONLY the token for the
-      identity the request proved — a derived-token caller gets its own (never another host's); a
-      MASTER caller names its own `?device=` and gets that, which is exactly master-mintable. Driven
-      by `turma-agentctl enroll` or opt-in `TURMA_AGENT_SELF_ENROLL=1` on start.
-    - **`resolveEnrollToken` is the endpoint's decision** (exported, unit-tested strict + non-strict).
-      Both self-close under `TURMA_AGENT_STRICT` — the master is no longer a credential, so neither
-      can be driven by a master holder; during rollover they hand out only what a master holder could
-      already mint, so no new exposure. **Never re-key the endpoint on a caller-named device for a
-      PROVED caller** — that reopens the cross-host escalation the whole thing guards.
-    - **DEVICE_NAME mismatch is impossible-by-construction AND checked**: the hub mints for the name
-      the agent beats as, and the agent (`token_device_name`) refuses to persist a token whose name
-      half isn't its own `DEVICE_NAME` — never a silent invalidation. Env write is a single-key atomic
-      rewrite (`rewrite_env_var`, preserves operator edits); the launcher exports `TURMA_AGENT_ENV` so
-      the manager knows which file to roll.
-    - **`tokenBound` is now SERVED** (was stripped) as the onboarding signal, replacing the "curl
-      twice to verify" step. The dashboard flags ONLY a host still on the master (`⚠ shared token`);
-      a bound host shows no chip (a positive chip on every host is noise). Still HUB-DERIVED
-      (forge-proof, re-stamped in `serializeAgent`), and served ONLY when the hub has a master
-      (absent = no per-host tokens here). `tokenRoll` is the agent capability that gates the Roll
-      button. Android types NEITHER yet (`ignoreUnknownKeys` skips them — safe); web-only, in
-      `PARITY.md`. Native/agent detail in `agent-native.md`.
+  - **Onboarding onto that derived token is ONE action, not a per-host ritual** (XERK-578): the
+    hub roll route + agent enroll endpoint, spanning hub + agent + native. Never re-key the enroll
+    endpoint on a caller-named device for a PROVED caller. Mechanics: `agent-token-onboarding.md`.
 - **The hub's memory ceilings are FRACTIONS OF ITS CONTAINER LIMIT, never fixed numbers** (XERK-258,
   XERK-273). It runs at `mem_limit: 512m`, so a flat constant larger
   than that can never refuse anything before the OOM killer fires. `containerMemoryLimit()` reads the cgroup; everything derives
@@ -368,16 +330,10 @@ Rules spanning more than one component, so no `paths:`-scoped file can carry the
     close the connection under a request still being written, and a client that writes before reading
     — python urllib, which is what `hub-agent.py` posts with — loses the response and sees a socket
     error (XERK-235's offline loop). **Test agent refusals with urllib, never with fetch.**
-  - **XERK-287 (closed by the raise): uploads are a budget SEPARATE from the in-flight ceiling**, so
-    the hub's worst-case heap is `in-flight + uploads` = ¾ of the container — 192 MiB at 256m, which
-    OOM'd. `mem_limit` was raised to **512m** (co-peak 384 + baseline, ~68 MiB margin) rather than
-    shrink either budget (the raise widens every derived ceiling with no code change). **The
-    chunked-body / socket-error halves (findings 2/3) need NO code**: the k8s NGINX ingress fronting
-    the hub buffers every request body (`proxy_request_buffering on`) and forwards it DECLARED-LENGTH,
-    so the hub's declared-length pre-check always fires and an oversize body always gets a readable 413
-    — the direct-tunnel topology those findings (and XERK-235) assumed is gone. The one residual is an
-    in-cluster agent posting to the Service directly, bypassing nginx. Mechanics + evidence:
-    `turma-limits.md`.
+  - **XERK-287 (closed by the raise)**: uploads are a budget SEPARATE from the in-flight ceiling, so
+    worst-case heap is `in-flight + uploads` = ¾ of the container; hence `mem_limit: 512m`. The nginx
+    ingress buffers bodies and forwards them declared-length, so oversize always gets a readable 413.
+    Co-peak margin, findings 2/3 and the in-cluster residual: `turma-limits.md`.
 
 ## Conventions
 
