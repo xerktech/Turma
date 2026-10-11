@@ -4660,6 +4660,8 @@ class IndexMirror {
   // A single background drain loop — serialized, so writes to one transcript apply in
   // order (session before its entries). Fire-and-forget; a failed op is retried a
   // bounded number of times then dropped (best-effort, like the byte mirror).
+  // The retry goes back at the HEAD, never the tail (XERK-1832): a "replace" retried
+  // behind a later append trims that append's rows out of Postgres.
   async _drain() {
     if (this._running || !this.store) return;
     this._running = true;
@@ -4669,7 +4671,7 @@ class IndexMirror {
         try { await this._apply(op); }
         catch (e) {
           op._tries = (op._tries || 0) + 1;
-          if (op._tries < 3) this._q.push(op); // transient — re-queue at the tail
+          if (op._tries < 3) this._q.unshift(op); // transient — retry before anything newer
           else console.error(`archive index mirror: op ${op.t} failed (${e && e.message}); dropped`);
         }
       }
@@ -21882,6 +21884,8 @@ if (process.env.TURMA_TEST) {
     // late-landed file's cursor, and dropping it loses data with no unit failing.
     setArchiveMirror,
     getArchiveMirror: () => archiveMirror,
+    // The index mirror's drain: a retried op must stay ahead of later ops (XERK-1832).
+    IndexMirror,
     // The index hydrate's deadline (XERK-1282): a hung load must reject AND cut its
     // loader, or a late page lands in an index ingest has since reopened.
     withLoaderDeadline,
