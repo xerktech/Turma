@@ -1485,6 +1485,8 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     updatedAt: nowIso,
     // Only while suspect, so a healthy sidecar is byte-identical to before.
     ...(unverifiedCursors.has(transcriptId) ? { cursorUnverified: true } : {}),
+    // A duplicate repair Postgres has not acked yet survives this rewrite (XERK-1450).
+    ...(dedupPendingIds.has(transcriptId) ? { dedupPending: true } : {}),
   });
 
   // Mirror the durable index write to the Postgres of-record (XERK-780, no-op off
@@ -2853,6 +2855,9 @@ function backfillPgIndexFromFiles() {
 // The agent cursor (`bytesStored`) is untouched: it counts the agent's raw bytes,
 // not the lines we kept. Synchronous, like the other whole-store boot passes.
 // Returns the number of files rewritten or re-seated.
+// Transcripts whose repair Postgres has not acked, so an ingest's sidecar rewrite
+// keeps `dedupPending`. A cache of the sidecars: every publishing pass re-derives it.
+const dedupPendingIds = new Set();
 function dedupLines(buf) {
   const seen = new Set();
   const parts = [];
@@ -2921,12 +2926,14 @@ function dedupArchive(opts) {
     if (isPgMode()) {
       const live = sessionsMap.get(id);
       if (live) { live.msgCount = msgCount; live.archiveBytes = archiveBytes; }
+      dedupPendingIds.add(id);
       writeSidecar(metaPath, fixed);
       mirrorRepair(id, entries, msgCount, archiveBytes, () => {
-        // Postgres holds the repair: clear the flag, unless an ingest has since
-        // rewritten the sidecar (which drops it anyway).
+        // Postgres holds the repair. Entries appended since mirrored at ordinals
+        // after it, in queue order, so it is done whatever the file holds now.
+        dedupPendingIds.delete(id);
         const sc = readSidecar(metaPath);
-        if (!sc || !sc.dedupPending || sc.archiveBytes !== archiveBytes) return;
+        if (!sc || !sc.dedupPending) return;
         delete sc.dedupPending;
         writeSidecar(metaPath, sc);
       });

@@ -1278,6 +1278,23 @@ test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leade
   } finally { pgTeardown(); }
 });
 
+test("XERK-1450 pg mode: an ingest while the repair is unacked keeps it pending", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl, len1 } = duplicatedTranscript("t-mid");
+    mem.dropRepairs = true;
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    archive.ingestChunk("nas", "t-mid", META, len1, len1 + 50, [ent("d2", "user", "third")], "acme");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true);
+    mem.dropRepairs = false;
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "redone, though the file is clean");
+    assert.equal(mem.entries.get("t-mid").size, 5);
+    assert.equal(mem.entries.get("t-mid").get(4).uuid, "d2");
+    assert.equal(mem.sessions.get("t-mid").msgCount, 5);
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, undefined);
+  } finally { pgTeardown(); }
+});
+
 test("XERK-1450: kept lines are written back byte-for-byte; a rendered-blocked file is skipped", async () => {
   const mem = pgSetup();
   try {
