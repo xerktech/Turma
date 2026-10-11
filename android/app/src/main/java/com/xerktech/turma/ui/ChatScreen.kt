@@ -584,14 +584,14 @@ private fun QuestionSheet(
  * than what is left between the top bar and the compose footer draws OVER the
  * top bar (landscape, or a large font scale: Kill and Terminal untappable).
  * Both are MEASURED, since they grow with the font scale; [CHAT_SHEET_GAP] keeps
- * a strip of transcript visible. Never more than half the window, and never
- * below [CHAT_SHEET_MIN] so at least one option shows.
+ * a strip of transcript visible. Never more than half the window. No floor:
+ * when nothing is left (landscape with the keyboard up) the sheet collapses
+ * until the keyboard goes, rather than covering the top bar.
  */
 internal fun waitingSheetCap(window: Dp, topBar: Dp, footer: Dp): Dp =
-    minOf(window / 2, window - topBar - footer - CHAT_SHEET_GAP).coerceAtLeast(CHAT_SHEET_MIN)
+    minOf(window / 2, window - topBar - footer - CHAT_SHEET_GAP).coerceAtLeast(0.dp)
 
 internal val CHAT_SHEET_GAP = 24.dp
-internal val CHAT_SHEET_MIN = 56.dp
 
 /**
  * The TUI's blocking dialog — a tool-permission request or a plan approval —

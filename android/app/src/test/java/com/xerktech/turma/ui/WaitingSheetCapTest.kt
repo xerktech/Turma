@@ -26,7 +26,8 @@ class WaitingSheetCapTest {
     }
 
     @Test
-    fun `it never collapses below the floor`() {
-        assertEquals(CHAT_SHEET_MIN, waitingSheetCap(300.dp, 120.dp, 260.dp))
+    fun `with no room left it collapses rather than cover the top bar`() {
+        // Landscape with the keyboard up: ~175dp window, the bars take it all.
+        assertEquals(0.dp, waitingSheetCap(175.dp, 64.dp, 140.dp))
     }
 }
