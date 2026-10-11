@@ -7369,6 +7369,22 @@ def _repo_from_worktree_slug(slug):
     return repo or None
 
 
+def _fold_slug_in(store, slug, baseline):
+    """Fold a project slug's appended transcript bytes into `store[slug]`
+    and return its accumulator. A tracked transcript that shrank/vanished
+    starts the slug over, so the total still matches a from-scratch parse.
+    `baseline` is the usage cutoff state (XERK-1085) to apply."""
+    st = store.get(slug)
+    if st is None:
+        st = store[slug] = {"acc": _UsageAcc(), "offsets": {}}
+    proj = os.path.join(PROJECTS_ROOT, slug)
+    cutoff = lambda rel: _usage_exclusion(baseline, rel)  # noqa: E731
+    if not _aggregate_project(proj, st["acc"], st["offsets"], cutoff):
+        st = store[slug] = {"acc": _UsageAcc(), "offsets": {}}
+        _aggregate_project(proj, st["acc"], st["offsets"], cutoff)
+    return st["acc"]
+
+
 def repo_usage_report(ledger, fold_slug):
     """Aggregate token usage per repo across ALL known worktree transcripts, plus
     a merged host-level total. `ledger` maps worktreePath -> {repo, remote, slug}.
@@ -20983,8 +20999,23 @@ class SessionManager:
         self._memguard_panes_cache = None  # (running tmux names, {(pane pid, start)})
         self.usage_cache = {}                    # id -> usage_report result
         self.slug_usage = {}                     # project slug -> {acc, offsets}
-                                                 # persistent incremental usage fold,
-                                                 # shared by per-session + repo usage
+                                                 # persistent incremental usage fold
+                                                 # for the per-session cards (beat)
+        # The host/repo aggregate, the resume picker and the two sweeps run on
+        # their OWN worker (XERK-1453, see _stage_repo_usage): its fold store is
+        # separate from slug_usage above, which the beat folds into, so neither
+        # thread ever folds an accumulator the other is mid-way through.
+        # `_usage_refold` is beat-owned (import_session adds a slug whose window
+        # changed) and rides the next staged snapshot; `_usage_gen` is bumped
+        # with it, so a scan staged before the window existed never publishes.
+        self._agg_slug_usage = {}                # worker-owned: slug -> {acc, offsets}
+        self._usage_refold = set()
+        self._usage_gen = 0
+        self._usage_lock = threading.Lock()
+        self._usage_wake = threading.Event()
+        self._usage_inputs = None
+        self._usage_ready = None
+        self._usage_worker = None
         # _resumable_report re-derives the "Resume any session" picker from every
         # transcript on disk each slow beat; the per-file reads (_transcript_cwd
         # over ALL of them, _first_user_text/_last_activity_ts over the survivors)
@@ -20993,6 +21024,7 @@ class SessionManager:
         # slug_usage above — the reads dominate the slow beat on a host with many
         # transcripts and/or contended disk, and re-reading them cold could stall
         # the heartbeat past OFFLINE_AFTER_MS and flap the host (XERK-395 class).
+        # Owned by the usage worker since XERK-1453.
         self._resumable_cwd_cache = {}           # path -> ((mtime, size), cwd)
         self._resumable_facts_cache = {}         # path -> ((mtime, size), firstUserText, lastActivityTs)
         self.pending_prs = {}                    # id -> undelivered PR urls
@@ -22532,6 +22564,11 @@ class SessionManager:
         del wins[:-USAGE_IMPORT_WINDOWS_MAX]
         self._save_usage_baseline(self.usage_baseline)
         self.slug_usage.pop(slug, None)
+        # The aggregate's fold is the usage worker's: ask the next snapshot to
+        # restart it, and void any scan staged before this window existed —
+        # it may already have counted the unpacked turns.
+        self._usage_refold.add(slug)
+        self._usage_gen += 1
 
     def _ingest_peers(self, raw):
         """Take the org-scoped roster off a heartbeat reply (XERK-348).
@@ -22902,13 +22939,14 @@ class SessionManager:
             if entry and entry.get("urls"):
                 self.session_pr_urls.setdefault(sess["id"], list(entry["urls"]))
 
-    def _ledger_prs(self, tid):
+    def _ledger_prs(self, tid, pr_ledger=None):
         """PR-status objects for a transcript's ledgered PR links, newest last —
         the durable-side counterpart of _session_prs / _closed_prs, reading the
         PR ledger by transcript id. This is the only channel that answers for a
         session aged out of closed.json (the resumable scan). None when it opened
         no PR, or predates the ledger."""
-        entry = self.pr_ledger.get(tid) if tid else None
+        ledger = self.pr_ledger if pr_ledger is None else pr_ledger
+        entry = ledger.get(tid) if tid else None
         urls = (entry or {}).get("urls")
         if not urls:
             return None
@@ -27996,7 +28034,7 @@ class SessionManager:
             log(f"session {sess['id']}: ticket attachment {len(blob)} bytes as {path}")
         return paths, failed
 
-    def _sweep_uploads(self):
+    def _sweep_uploads(self, live=None):
         """Drop attachment directories for sessions this agent no longer knows
         about, once they are past UPLOAD_RETENTION_SEC. A live or resumable
         session's files stay: its conversation still names their paths, and a
@@ -28007,8 +28045,9 @@ class SessionManager:
         points at is the one mistake here that can't be undone."""
         if not os.path.isdir(UPLOADS_DIR):
             return
-        live = {s.get("id") for s in self.registry}
-        live |= {c.get("id") for c in self.closed}
+        if live is None:      # the usage worker passes the beat's snapshot
+            live = {s.get("id") for s in self.registry}
+            live |= {c.get("id") for c in self.closed}
         now = time.time()
         for entry in os.listdir(UPLOADS_DIR):
             if entry in live:
@@ -31952,7 +31991,7 @@ class SessionManager:
         self._resumable_facts_cache[path] = (key, fut, lat)
         return fut, lat
 
-    def _resumable_report(self):
+    def _resumable_report(self, inputs=None):
         """Per-repo list of EVERY prior Claude session resumable on this host —
         the "Resume any session" picker's source, not just the last-5 killed
         Turma sessions in closed.json. Enumerates transcripts under PROJECTS_ROOT
@@ -31967,17 +32006,24 @@ class SessionManager:
         deferred until after the cap so it's paid only for the survivors.
 
         Returns repo-name -> [{transcriptId, cwd, repo, root, origin, slug,
-        summary, endedTs}] newest-first."""
+        summary, endedTs}] newest-first.
+
+        `inputs` is the beat's snapshot (_usage_scan_inputs) when this runs on
+        the usage worker; None reads the live state, for a caller on the beat."""
+        if inputs is None:
+            inputs = {"carded": self._carded_slugs(), "ledger": self.usage_ledger,
+                      "sessMeta": self._session_meta_by_slug(),
+                      "tickets": self.ticket_ledger, "prLedger": self.pr_ledger}
         # Slugs already represented by a session card (running or stopped). This
         # is the scan-time cut; because the scan is cached across the slow beats
         # between refreshes, _sorted_repo_entries() re-applies it against
         # registry every beat — see the filter there.
-        carded = self._carded_slugs()
+        carded = inputs["carded"]
         repo_names = {r["name"] for r in scan_repos()}
         # slug -> a real worktree path the ledger recorded, so a transcript whose
         # own cwd we can't read still classifies when the ledger keyed its path.
         slug_path = {}
-        for wt, m in (self.usage_ledger or {}).items():
+        for wt, m in (inputs["ledger"] or {}).items():
             slug = (m or {}).get("slug") or _project_slug(wt)
             slug_path.setdefault(slug, wt)
 
@@ -32030,7 +32076,7 @@ class SessionManager:
                     "mtime": mtime,        # dropped below; sort/cap key
                     "size": size,          # dropped below; facts-cache key
                 })
-        sess_meta = self._session_meta_by_slug()
+        sess_meta = inputs["sessMeta"]
         for repo, lst in by_repo.items():
             # Cap by mtime (a cheap stat, already in hand) so the accurate
             # last-message read below is paid only for the survivors. mtime can
@@ -32059,13 +32105,13 @@ class SessionManager:
                 # durable ledger that re-attaches the two — and this is the only
                 # channel still reporting a session once its record has aged out
                 # of closed.json (see TICKET_LEDGER_PATH).
-                e["ticket"] = self.ticket_ledger.get(e["transcriptId"])
+                e["ticket"] = inputs["tickets"].get(e["transcriptId"])
                 # The PRs this conversation opened, from the durable PR ledger —
                 # same story as the ticket above. This scan is the only channel
                 # still reporting a session once its closed record has aged out,
                 # so without the ledger its PR chips would be lost for good (a
                 # resumable row has no record to have snapshotted them onto).
-                e["prs"] = self._ledger_prs(e["transcriptId"])
+                e["prs"] = self._ledger_prs(e["transcriptId"], inputs["prLedger"])
                 e.pop("mtime", None)
                 e.pop("size", None)
         # Prune both memo caches to the transcripts still scanned this pass, so a
@@ -37658,19 +37704,9 @@ class SessionManager:
         """Return a project slug's persistent usage accumulator, folding any
         bytes appended to its transcripts since the last beat (incremental).
         Rebuilt from scratch if a transcript was truncated/rewritten so totals
-        can't overcount. Shared by per-session usage and the per-repo/host
-        aggregation, so each transcript is parsed at most once per beat."""
-        st = self.slug_usage.get(slug)
-        if st is None:
-            st = self.slug_usage[slug] = {"acc": _UsageAcc(), "offsets": {}}
-        proj = os.path.join(PROJECTS_ROOT, slug)
-        cutoff = lambda rel: _usage_exclusion(self.usage_baseline, rel)  # noqa: E731
-        if not _aggregate_project(proj, st["acc"], st["offsets"], cutoff):
-            # A tracked transcript shrank/vanished — start this slug over so the
-            # running total still matches a from-scratch parse.
-            st = self.slug_usage[slug] = {"acc": _UsageAcc(), "offsets": {}}
-            _aggregate_project(proj, st["acc"], st["offsets"], cutoff)
-        return st["acc"]
+        can't overcount. Per-session usage folds here, on the beat; the per-repo/
+        host aggregation's worker keeps its own store (_fold_slug_in)."""
+        return _fold_slug_in(self.slug_usage, slug, self.usage_baseline)
 
     def _backfill_ledger(self):
         """Ensure live and recently-closed sessions are in the attribution
@@ -37989,30 +38025,72 @@ class SessionManager:
             self._save_ledger()
 
     def _refresh_repo_usage(self):
-        """Recompute the persistent host/repo usage from every known transcript.
-        Independent of the live registry, so killed/deleted sessions still count.
-        Runs on the slow usage cadence; folds each slug incrementally (only bytes
-        appended since the last beat) via _fold_slug, so it no longer re-reads
-        every transcript from scratch."""
+        """Recompute the persistent host/repo usage, the resume picker and the
+        two sweeps INLINE. Independent of the live registry, so killed/deleted
+        sessions still count. The beat no longer calls this: it runs the ledger
+        upkeep and STAGES the scan on the usage worker (_stage_repo_usage,
+        XERK-1453). Kept as the synchronous entry point for tests."""
+        self._maintain_usage_ledger()
+        self._apply_usage_scan(self._usage_scan(self._usage_scan_inputs()))
+
+    def _maintain_usage_ledger(self):
+        """The ledger upkeep half of a usage refresh — cheap, in-memory plus a
+        few isdir, and it MUTATES usage_ledger, which only the beat may do."""
         self._backfill_ledger()
         self._sanitize_internal_tool_entries()
         self._sanitize_junk_repo_entries()
         self._reconcile_orphan_transcripts()
         self._prune_ledger()
+
+    def _usage_scan_inputs(self):
+        """Snapshot what the usage scan reads from beat-owned state, so the
+        worker never iterates the registry, closed list or ledgers itself (the
+        _archive_candidate_inputs rule). Hands over and clears the pending
+        refold set, so it travels with the baseline it must be read under."""
+        refold, self._usage_refold = self._usage_refold, set()
+        return {
+            "gen": self._usage_gen,
+            "refold": refold,
+            "ledger": {p: dict(m or {}) for p, m in self.usage_ledger.items()},
+            "baseline": json.loads(json.dumps(self.usage_baseline)),
+            "carded": self._carded_slugs(),
+            "sessMeta": self._session_meta_by_slug(),
+            "liveIds": ({s.get("id") for s in self.registry}
+                        | {c.get("id") for c in self.closed}),
+            "tickets": dict(self.ticket_ledger),
+            "prLedger": dict(self.pr_ledger),
+        }
+
+    def _usage_scan(self, inputs):
+        """The DISK half of a usage refresh, safe off the beat: fold every
+        ledger slug into the worker's own store, build the resume picker, sweep
+        dead uploads and leaked inbox sockets. Returns what the beat applies
+        (_apply_usage_scan); a part that failed is left out, so the beat keeps
+        its previous answer for it. Never raises."""
+        out = {"gen": inputs["gen"]}
+        store = self._agg_slug_usage
+        for slug in inputs["refold"]:
+            store.pop(slug, None)
+        baseline = inputs["baseline"]
         try:
-            self.repo_usage, self.host_usage = repo_usage_report(
-                self.usage_ledger, self._fold_slug)
+            out["usage"] = repo_usage_report(
+                inputs["ledger"], lambda slug: _fold_slug_in(store, slug, baseline))
         except Exception as e:
             log(f"repo usage parse failed: {e}")
+        # Keep the folds bounded to slugs the ledger still tracks, so a pruned
+        # session's accumulator doesn't linger forever.
+        live_slugs = {m.get("slug") or _project_slug(p)
+                      for p, m in inputs["ledger"].items()}
+        self._agg_slug_usage = {s: v for s, v in store.items() if s in live_slugs}
         # The "resume any prior session" picker's per-repo list, computed on the
         # same slow cadence and reported (from cache) every beat.
         try:
-            self.resumable = self._resumable_report()
+            out["resumable"] = self._resumable_report(inputs)
         except Exception as e:
             log(f"resumable scan failed: {e}")
         # Attachments of long-gone sessions, on the same slow cadence (XERK-234).
         try:
-            self._sweep_uploads()
+            self._sweep_uploads(inputs["liveIds"])
         except Exception as e:
             log(f"uploads sweep failed: {e}")
         # Claude Code's own leaked inbox sockets, likewise (XERK-341).
@@ -38020,6 +38098,78 @@ class SessionManager:
             self._sweep_claude_sockets()
         except Exception as e:
             log(f"cc-socks sweep failed: {e}")
+        return out
+
+    def _apply_usage_scan(self, result):
+        """Publish a scan's answers to the payload (beat only). A scan staged
+        before a migrated-in transcript's usage window was recorded is dropped
+        whole: it may have counted the source host's turns, and the hub keeps a
+        day's high-water mark, so one over-count would stick."""
+        if result.get("gen") != self._usage_gen:
+            return
+        if "usage" in result:
+            self.repo_usage, self.host_usage = result["usage"]
+        if "resumable" in result:
+            self.resumable = result["resumable"]
+
+    def _stage_repo_usage(self):
+        """A refresh beat's usage work (XERK-1453): the ledger upkeep inline,
+        then a snapshot handed to the usage worker. The scan used to run here,
+        and the FIRST one after a manager start re-folds every transcript on
+        disk — measured ~16s for 4k transcripts on a warm NVMe host, minutes on
+        a cold HDD pool — so every command queued during a restart waited on
+        it. Coalesces like the archive inventory: a snapshot staged while a
+        scan runs replaces any older one still waiting. Never raises onto the
+        beat; a failed Thread.start() (XERK-402) leaves the snapshot staged for
+        the next refresh beat."""
+        try:
+            self._maintain_usage_ledger()
+        except Exception as e:
+            log(f"usage ledger upkeep failed: {type(e).__name__}: {e}")
+        try:
+            inputs = self._usage_scan_inputs()
+            with self._usage_lock:
+                prev = self._usage_inputs
+                if prev is not None:
+                    # The scan it replaces never ran: its refold still applies.
+                    inputs["refold"] |= prev["refold"]
+                self._usage_inputs = inputs
+                w = self._usage_worker
+                if w is None or not w.is_alive():
+                    w = threading.Thread(target=self._usage_worker_loop,
+                                         name="usage-scan", daemon=True)
+                    self._usage_worker = w
+                    w.start()
+            self._usage_wake.set()
+        except Exception as e:
+            log(f"usage scan could not be staged: {type(e).__name__}: {e}")
+
+    def _take_repo_usage(self):
+        """Apply the newest published usage scan, if one landed. Beat only."""
+        with self._usage_lock:
+            ready, self._usage_ready = self._usage_ready, None
+        if ready is not None:
+            self._apply_usage_scan(ready)
+
+    def _usage_worker_loop(self):
+        """Run each staged usage scan off the beat and publish it for the next
+        beat to apply. Never raises — a dead worker would freeze the usage
+        figures and the resume picker. The wake is cleared BEFORE the job is
+        taken, so a snapshot staged mid-scan is never dropped."""
+        while True:
+            self._usage_wake.wait()
+            self._usage_wake.clear()
+            with self._usage_lock:
+                staged, self._usage_inputs = self._usage_inputs, None
+            if staged is None:
+                continue
+            try:
+                ready = self._usage_scan(staged)
+            except Exception as e:
+                log(f"usage scan failed: {type(e).__name__}: {e}")
+                continue
+            with self._usage_lock:
+                self._usage_ready = ready
 
     def _session_git(self, sess, refresh, light=False):
         """(git-info dict | None, branch-sync work dict | None) for a session's
@@ -38529,11 +38679,13 @@ class SessionManager:
         refresh = (not light) and (beat % USAGE_EVERY == 0)
 
         # Persistent host/repo usage — the whole-fleet, session-independent
-        # aggregation that survives kill/delete. On the slow cadence it folds
-        # every ledger slug incrementally (only bytes appended since last beat),
-        # so it no longer re-reads every transcript from scratch.
+        # aggregation that survives kill/delete — plus the resume picker. On the
+        # slow cadence the beat keeps the ledger and stages the disk scan on the
+        # usage worker (XERK-1453); every beat applies whatever scan has landed.
+        # One beat stale, and empty until the first scan after a start lands.
         if refresh:
-            self._refresh_repo_usage()
+            self._stage_repo_usage()
+        self._take_repo_usage()
 
         # Per-session usage is parsed incrementally now (cheap), but still
         # staggered per session (each refreshes on its own beat within the
