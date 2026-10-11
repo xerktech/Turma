@@ -324,7 +324,11 @@ async function hydrateGuards() {
 // Fired when THIS replica acquires leadership (and once at boot when it is the
 // leader). Re-hydrates the singleton state the old leader owned so the handover
 // re-fires nothing: the migration record Map (its own hydrate) and the guards.
+// Bumped on every promotion: a repair queued under an earlier term must not apply,
+// even on a replica that has since won the lease back (XERK-1450).
+let leaderTerm = 0;
 function onLeaderPromoted() {
+  leaderTerm += 1;
   if (!HA_ON) return;
   // XERK-919: become the single writer only after re-reading the registry the old
   // leader flushed before it released the lease (a watch event can be missed or
@@ -4612,7 +4616,16 @@ function setArchiveMirror(blobStore, ha) {
     isLeader: () => true,
     // A rendered file retryBlocked landed after the hydrate (XERK-1050): re-derive
     // cursors from it before it unblocks, as the hydrate does.
-    onLanded: () => archive.reconcileLanded(!!archiveIndexStore),
+    // It may also be one the leader's duplicate repair skipped (XERK-1450) — run
+    // on the next tick, once the landed keys are unblocked in this sync step.
+    onLanded: () => {
+      archive.reconcileLanded(!!archiveIndexStore);
+      setImmediate(() => {
+        if (!isLeader()) return;
+        try { archive.dedupArchive({ publish: true }); }
+        catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+      });
+    },
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
   // Ingest closes per TRANSCRIPT for rendered files that did not land (XERK-1050).
@@ -4724,8 +4737,14 @@ let indexMirror = null;
 // operator-triggered re-sync — never local data loss).
 const INDEX_MIRROR_QUEUE_MAX = positiveEnv("INDEX_MIRROR_QUEUE_MAX", 100000);
 class IndexMirror {
-  constructor(store) {
+  // `isLeader` + `term` gate the duplicate repair (XERK-1450): a repair applies only
+  // while this replica still leads under the term that queued it. A deposed leader's
+  // repair — or one surviving a lease lost and won back — would trim the newer
+  // leader's appends and lower its counts.
+  constructor(store, isLeader, term) {
     this.store = store;
+    this.isLeader = typeof isLeader === "function" ? isLeader : () => true;
+    this.term = typeof term === "function" ? term : () => 0;
     this._q = [];
     this._running = false;
     this._dropped = 0;
@@ -4761,7 +4780,10 @@ class IndexMirror {
         try { await this._apply(op); }
         catch (e) {
           op._tries = (op._tries || 0) + 1;
-          if (op._tries < 3) this._q.unshift(op); // transient — retry before anything newer
+          // A repair is never retried: its entry snapshot may be stale by then. Its
+          // sidecar stays `dedupPending`, so the next leader pass redoes it (XERK-1450).
+          if (op.t === "repair") console.error(`archive index mirror: repair of ${op.transcriptId} failed (${e && e.message}); the next leader pass redoes it`);
+          else if (op._tries < 3) this._q.unshift(op); // transient — retry before anything newer
           else console.error(`archive index mirror: op ${op.t} failed (${e && e.message}); dropped`);
         }
       }
@@ -4774,6 +4796,18 @@ class IndexMirror {
     if (op.t === "entries") return this.store.appendEntries(op.transcriptId, op.entries, op.startSeq);
     if (op.t === "replace") return this.store.replaceEntries(op.transcriptId, op.entries);
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
+    if (op.t === "repair") {
+      // Re-checked between every write. Stopping leaves the sidecar pending; the
+      // current leader owns the repair. A pause between a check and its write is
+      // the residual (no Postgres-side fence).
+      const current = () => this.isLeader() && this.term() === op.term;
+      if (!current()) return;
+      if ((await this.store.replaceEntries(op.transcriptId, op.entries, current)) === false) return;
+      if (!current()) return;
+      await this.store.setCounts(op.transcriptId, op.msgCount, op.archiveBytes);
+      if (!current()) return;
+      if (op.done) { try { op.done(); } catch (e) { console.error(`archive index mirror: repair ack failed (${e && e.message})`); } }
+    }
   }
   // The sink archive.js calls — each method SYNC (enqueue only), never awaited by the
   // caller and never throwing back into archive.js's hot path.
@@ -4784,6 +4818,8 @@ class IndexMirror {
         this._push({ t: "entries", transcriptId, entries, startSeq }),
       replace: (transcriptId, entries) => this._push({ t: "replace", transcriptId, entries }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
+      repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
+        this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done, term: this.term() }),
     };
   }
 }
@@ -4792,7 +4828,7 @@ function setIndexMirror(store, ha) {
     indexMirror = null; archive.setIndexSink(null); archive.setIndexMode(null);
     return;
   }
-  indexMirror = new IndexMirror(store);
+  indexMirror = new IndexMirror(store, () => isLeader(), () => leaderTerm);
   archive.setIndexSink(indexMirror.sink());
   // XERK-793: retire the per-replica local node:sqlite index. The index becomes the
   // in-memory session-row map (beat-safe, hydrated from Postgres) + Postgres-direct
@@ -4952,6 +4988,12 @@ function hydrateArchive() {
   return archiveHydrateInFlight;
 }
 async function hydrateArchiveOnce() {
+  // Repair duplicated `.jsonl` files (XERK-1450) on the local copy BEFORE the byte
+  // hydrate: the hydrate keeps a local file that is larger than the bucket's, so a
+  // stale duplicated copy would otherwise survive the leader's repair. Local only —
+  // nothing is mirrored from a replica that may not be the leader.
+  try { archive.dedupArchive({ publish: false }); }
+  catch (e) { console.error(`archive: duplicate repair (local) failed: ${e && e.message}`); }
   if (archiveMirror) {
     // Ingest stays CLOSED across the byte hydrate, not just the index hydrate
     // below, and until the bucket has actually been listed (XERK-1048): opened over
@@ -4967,6 +5009,13 @@ async function hydrateArchiveOnce() {
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
   }
   await hydrateArchiveIndex();
+  // The leader repairs what the bucket and Postgres hold, now that both are loaded
+  // (XERK-1450). Synchronous, so no ingest interleaves. A replica promoted after this
+  // point re-runs the whole hydrate from onLeaderPromoted.
+  if (isLeader()) {
+    try { archive.dedupArchive({ publish: true }); }
+    catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+  }
   // Rendered downloads that failed keep only THEIR transcripts closed; keep
   // retrying them in the background with the rest of the hub ingesting (XERK-1050).
   // Started after the index hydrate so a landing never reconciles mid-hydrate.
@@ -22004,7 +22053,11 @@ if (process.env.TURMA_TEST) {
     setArchiveMirror,
     getArchiveMirror: () => archiveMirror,
     // The index mirror's drain: a retried op must stay ahead of later ops (XERK-1832).
+    // The duplicate repair's hydrate ordering (XERK-1450) and its mirror op.
+    hydrateArchive,
     IndexMirror,
+    setIndexMirror,
+    getIndexMirror: () => indexMirror,
     // The index hydrate's deadline (XERK-1282): a hung load must reject AND cut its
     // loader, or a late page lands in an index ingest has since reopened.
     withLoaderDeadline,
@@ -22787,6 +22840,11 @@ if (process.env.TURMA_TEST) {
         console.error(`archive mirror drain failed: ${e && e.message}`));
     }, ARCHIVE_MIRROR_DRAIN_MS);
     archiveDrainTimer.unref();
+  } else {
+    // No bucket: the local tree is the whole of-record, so repair it here, once per
+    // boot, before any ingest (XERK-1450).
+    try { archive.dedupArchive({ publish: true }); }
+    catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
   }
   // XERK-764 (wave-3): the cross-replica tunnel directory + control bus. Watch the
   // host->replica directory FIRST (so no owner change is missed during the async

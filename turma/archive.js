@@ -448,6 +448,17 @@ function mirrorEntries(transcriptId, list, startSeq) {
   } catch { /* best-effort mirror */ }
 }
 // Mirror a wholesale replacement of a transcript's entries (the reconcile heal).
+// Mirror the duplicate repair (XERK-1450) as ONE op: replace the transcript's
+// entries and set its msgCount/archiveBytes EXACTLY — the one write allowed to
+// lower them (the session upsert only raises). `done` runs once Postgres has both.
+function mirrorRepair(transcriptId, list, msgCount, archiveBytes, done) {
+  if (!indexSink || typeof indexSink.repair !== "function") return;
+  try {
+    indexSink.repair(transcriptId, (list || []).map((e) => ({
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+    })), msgCount, archiveBytes, done);
+  } catch { /* best-effort mirror */ }
+}
 function mirrorReplace(transcriptId, list) {
   if (!indexSink || typeof indexSink.replace !== "function") return;
   try {
@@ -775,11 +786,11 @@ function reindexHeld(transcriptId, entries) {
   mirrorReplace(transcriptId, entries);
 }
 
-function writeSidecar(metaPath, obj) {
+function writeSidecar(metaPath, obj, local) {
   const tmp = metaPath + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(obj));
   fs.renameSync(tmp, metaPath);
-  noteWrite(metaPath);
+  if (!local) noteWrite(metaPath);
 }
 
 // Bytes the whole store holds, measured by WALKING THE FILES — never summed
@@ -1474,6 +1485,8 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     updatedAt: nowIso,
     // Only while suspect, so a healthy sidecar is byte-identical to before.
     ...(unverifiedCursors.has(transcriptId) ? { cursorUnverified: true } : {}),
+    // A duplicate repair Postgres has not acked yet survives this rewrite (XERK-1450).
+    ...(dedupPendingIds.has(transcriptId) ? { dedupPending: true } : {}),
   });
 
   // Mirror the durable index write to the Postgres of-record (XERK-780, no-op off
@@ -2819,6 +2832,140 @@ function backfillPgIndexFromFiles() {
   return rebuilt;
 }
 
+// Repair `.jsonl` files that hold repeated lines (XERK-1450). Before XERK-1364 a
+// re-send onto a cursor behind its file was appended whole, so damaged files carry
+// the same rendered lines several times over while their sidecar counts them once.
+// Keeps the FIRST copy of each exact line, in order. Exact lines, not entryKey: a
+// uuid'd key ignores text, and two different entries can share one; an identical
+// line is a duplicate by any reading. First-copy de-dup is prefix-monotone — a
+// shorter copy of a file de-dups to a prefix of the longer copy's result — which
+// is what keeps the hydrate's "larger local copy is ahead" size compare honest.
+//
+// `publish` (the leader, or a non-HA hub) re-seats the index and mirrors the result:
+// the rewritten file and sidecar to the bucket, the entries and the EXACT lowered
+// counts to Postgres. Without it (a replica about to hydrate) only the local copy
+// is rewritten and nothing is mirrored: a follower booted before the leader's
+// repair holds a stale LARGER copy the hydrate would otherwise keep over the
+// repaired bucket object, and it must never push that copy anywhere.
+//
+// The sidecar carries `dedupPending` from before the file shrinks until the index
+// is re-seated — in pg mode, until Postgres confirms the repair op — so a crash or
+// a dropped mirror op is redone by the next publishing pass rather than skipped.
+// `dedupChecked` (the size a pass covered) lets later passes skip unchanged files.
+// The agent cursor (`bytesStored`) is untouched: it counts the agent's raw bytes,
+// not the lines we kept. Synchronous, like the other whole-store boot passes.
+// Returns the number of files rewritten or re-seated.
+// Transcripts whose repair Postgres has not acked, so an ingest's sidecar rewrite
+// keeps `dedupPending`. A cache of the sidecars: every publishing pass re-derives it.
+const dedupPendingIds = new Set();
+// The latest repair queued per transcript. Only ITS ack clears pending: an older
+// one acking while a newer one is still queued would clear it, and that newer one
+// failing after its DELETE would then leave Postgres empty with nothing to redo it.
+const dedupRepairGen = new Map();
+function dedupLines(buf) {
+  const seen = new Set();
+  const parts = [];
+  let dropped = 0;
+  let start = 0;
+  // Split on raw bytes and key on latin1 (one char per byte), so whatever a kept
+  // line holds — invalid UTF-8 included — is written back byte-for-byte.
+  while (start < buf.length) {
+    const nl = buf.indexOf(10, start);
+    const end = nl === -1 ? buf.length : nl + 1;
+    const line = buf.subarray(start, nl === -1 ? buf.length : nl);
+    const key = line.toString("latin1");
+    if (key.trim() && seen.has(key)) dropped += 1;
+    else { seen.add(key); parts.push(buf.subarray(start, end)); }
+    start = end;
+  }
+  // A torn final line dropped as a duplicate leaves the kept text ending cleanly.
+  return { out: dropped ? Buffer.concat(parts) : buf, dropped };
+}
+function dedupArchive(opts) {
+  const publish = !!(opts && opts.publish);
+  const files = [];
+  walkJsonl(ARCHIVE_DIR, files, 0);
+  let repaired = 0, droppedTotal = 0;
+  for (const jsonl of files) {
+    // A rendered file whose download has not landed is not the of-record copy.
+    if (renderedGate) { try { if (renderedGate(jsonl)) continue; } catch { continue; } }
+    const metaPath = jsonl + ".meta";
+    const meta = readSidecar(metaPath);
+    if (!meta || !meta.transcriptId) continue; // unattributable: leave it alone
+    const redo = publish && !!meta.dedupPending;
+    let size;
+    try { size = fs.statSync(jsonl).size; } catch { continue; }
+    if (meta.dedupChecked === size && !redo) continue;
+    let buf;
+    try { buf = fs.readFileSync(jsonl); } catch { continue; }
+    const { out, dropped } = dedupLines(buf);
+    if (!dropped && !redo) {
+      // Only the publisher stamps: a local-only stamp would differ from the
+      // bucket's sidecar and just be refetched over.
+      if (publish) writeSidecar(metaPath, { ...meta, dedupChecked: buf.length });
+      continue;
+    }
+    if (dropped) {
+      // Pending BEFORE the file shrinks, so no crash point leaves a clean file
+      // beside an index that still counts the copies.
+      writeSidecar(metaPath, { ...meta, dedupPending: true }, true);
+      const tmp = jsonl + ".tmp";
+      fs.writeFileSync(tmp, out);
+      fs.renameSync(tmp, jsonl);
+      droppedTotal += dropped;
+    }
+    repaired += 1;
+    const archiveBytes = out.length;
+    const entries = heldEntries(jsonl).entries;
+    const msgCount = entries.length;
+    const fixed = { ...meta, msgCount, archiveBytes, dedupChecked: archiveBytes, dedupPending: true };
+    if (!publish) { writeSidecar(metaPath, fixed, true); continue; }
+    noteWrite(jsonl);
+    const id = meta.transcriptId;
+    const row = idxGetSession(id);
+    // Only re-seat the row this file IS — never a different file's that shares the id.
+    if (!row || row.filePath !== path.relative(ARCHIVE_DIR, jsonl)) {
+      // Not dedupPendingIds: it is keyed by id, and another file with this id may
+      // hold a repair Postgres has not acked. A stale entry only re-stamps pending.
+      delete fixed.dedupPending;
+      writeSidecar(metaPath, fixed);
+      continue;
+    }
+    if (isPgMode()) {
+      const live = sessionsMap.get(id);
+      if (live) { live.msgCount = msgCount; live.archiveBytes = archiveBytes; }
+      dedupPendingIds.add(id);
+      const gen = (dedupRepairGen.get(id) || 0) + 1;
+      dedupRepairGen.set(id, gen);
+      writeSidecar(metaPath, fixed);
+      mirrorRepair(id, entries, msgCount, archiveBytes, () => {
+        // Postgres holds the repair. Entries appended since mirrored at ordinals
+        // after it, in queue order, so it is done whatever the file holds now.
+        if (dedupRepairGen.get(id) !== gen) return; // a newer repair is still queued
+        // No older one can ack after this: the queue is FIFO and a failure never re-queues.
+        dedupRepairGen.delete(id);
+        dedupPendingIds.delete(id);
+        const sc = readSidecar(metaPath);
+        if (!sc || !sc.dedupPending) return;
+        delete sc.dedupPending;
+        writeSidecar(metaPath, sc);
+      });
+    } else {
+      db.prepare("UPDATE sessions SET msgCount=?, archiveBytes=? WHERE transcriptId=?")
+        .run(msgCount, archiveBytes, id);
+      reindexHeld(id, entries);
+      delete fixed.dedupPending;
+      writeSidecar(metaPath, fixed);
+    }
+  }
+  if (repaired) {
+    console.error(`archive: removed ${droppedTotal} repeated line(s); repaired ${repaired} ` +
+      `transcript(s)${publish ? "" : " (local copy only, before a hydrate)"} — damage ` +
+      `written before XERK-1364's re-send de-dup (XERK-1450)`);
+  }
+  return repaired;
+}
+
 // ---- the dsh Trajectory (XERK-498) ------------------------------------------
 // A read-only Trajectory over a dsh session's D3 NATIVE event log — the
 // canonical record the raw layer already keeps at `<id>/dsh/*.jsonl` (XERK-469),
@@ -3488,6 +3635,8 @@ module.exports = {
   // under HA so the index is the in-memory map + Postgres-direct search; sessionLoader
   // is the sessions-only hydration applier.
   setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles,
+  // The one-time repair of files duplicated before XERK-1364 (XERK-1450).
+  dedupArchive,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

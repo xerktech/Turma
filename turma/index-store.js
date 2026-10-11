@@ -163,7 +163,8 @@ function buildSessionUpsert(prefix, row) {
 // One entry-row upsert value tuple builder (transcript_id, seq, uuid, role, ts, text).
 // The batch insert below composes N of these into one multi-row INSERT with a single
 // ON CONFLICT DO NOTHING — idempotent by (transcript_id, seq).
-function buildEntryInsert(prefix, transcriptId, entries, startSeq) {
+// `overwrite` (a replace) updates an existing ordinal in place instead of skipping it.
+function buildEntryInsert(prefix, transcriptId, entries, startSeq, overwrite) {
   const table = `${prefix}_entries`;
   const rows = [];
   const params = [];
@@ -178,7 +179,10 @@ function buildEntryInsert(prefix, transcriptId, entries, startSeq) {
   }
   const text =
     `INSERT INTO ${table} (transcript_id, seq, uuid, role, ts, text) ` +
-    `VALUES ${rows.join(", ")} ON CONFLICT (transcript_id, seq) DO NOTHING`;
+    `VALUES ${rows.join(", ")} ON CONFLICT (transcript_id, seq) ` +
+    (overwrite
+      ? "DO UPDATE SET uuid = EXCLUDED.uuid, role = EXCLUDED.role, ts = EXCLUDED.ts, text = EXCLUDED.text"
+      : "DO NOTHING");
   return { text, params };
 }
 
@@ -353,15 +357,35 @@ class PgIndexStore {
     await this._insertEntriesBatched(transcriptId, entries, startSeq || 0);
   }
 
-  // Replace a transcript's entries wholesale (the reconcile / rebuild-one case — a
-  // deleted/truncated `.jsonl` healed on read, XERK-280). Deletes then re-inserts
-  // from seq 0, matching the SQLite heal.
-  async replaceEntries(transcriptId, entries) {
+  // Set a transcript's msgCount/archiveBytes EXACTLY — the one write that may lower
+  // them, for the duplicate repair (XERK-1450); upsertSession only ever raises.
+  async setCounts(transcriptId, msgCount, archiveBytes) {
     await this.ensureSchema();
-    await this.pool.execute(`DELETE FROM ${this.prefix}_entries WHERE transcript_id = $1`, [transcriptId]);
-    if (entries && entries.length) {
-      await this._insertEntriesBatched(transcriptId, entries, 0);
-    }
+    await this.pool.execute(
+      `UPDATE ${this.prefix}_sessions SET msg_count = $2, archive_bytes = $3 WHERE transcript_id = $1`,
+      [transcriptId, intParam(msgCount), intParam(archiveBytes)]);
+  }
+
+  // Replace a transcript's entries wholesale (the reconcile / rebuild-one case — a
+  // deleted/truncated `.jsonl` healed on read, XERK-280; the duplicate repair,
+  // XERK-1450). OVERWRITES ordinals [0..n) in place, THEN trims the rest — never
+  // delete-first: the pool has no transaction, so a replace failing between a DELETE
+  // and its INSERTs left the transcript with no entries, and a concurrent replace's
+  // ack could already have cleared the flag that would redo it. Failing part-way
+  // now leaves a mix of new and old rows, never fewer than before.
+  //
+  // `proceed` (optional) is re-checked before every batch and before the trim; once
+  // it answers false the replace stops and returns false, having written only rows
+  // that overwrite in place (the duplicate repair's leadership check, XERK-1450).
+  async replaceEntries(transcriptId, entries, proceed) {
+    await this.ensureSchema();
+    const ok = typeof proceed === "function" ? proceed : () => true;
+    const n = entries ? entries.length : 0;
+    if (n && !(await this._insertEntriesBatched(transcriptId, entries, 0, true, ok))) return false;
+    if (!ok()) return false;
+    await this.pool.execute(
+      `DELETE FROM ${this.prefix}_entries WHERE transcript_id = $1 AND seq >= $2`, [transcriptId, n]);
+    return true;
   }
 
   // Insert entries in SUB-BATCHES so one INSERT never exceeds the Postgres v3 bound
@@ -373,12 +397,14 @@ class PgIndexStore {
   // caught + dropped it, and a promoted replica's full-text search silently missed
   // that transcript. ENTRY_INSERT_MAX rows keep the count far under both limits. Seq
   // continuity is preserved across sub-batches (each starts at startSeq+offset).
-  async _insertEntriesBatched(transcriptId, entries, startSeq) {
+  async _insertEntriesBatched(transcriptId, entries, startSeq, overwrite, proceed) {
     for (let i = 0; i < entries.length; i += ENTRY_INSERT_MAX) {
+      if (proceed && !proceed()) return false;
       const slice = entries.slice(i, i + ENTRY_INSERT_MAX);
-      const { text, params } = buildEntryInsert(this.prefix, transcriptId, slice, startSeq + i);
+      const { text, params } = buildEntryInsert(this.prefix, transcriptId, slice, startSeq + i, overwrite);
       await this.pool.execute(text, params);
     }
+    return true;
   }
 
   // Drop a transcript entirely (the reclaim case — rows for a deleted `.jsonl`,

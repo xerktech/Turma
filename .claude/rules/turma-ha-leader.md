@@ -237,6 +237,11 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   A wedged election loop (no ticks firing) drops leadership even though `_tick` never cleared it — the
   split-brain defence. A transient API error keeps leadership only within the renewDeadline, then
   drops it. Do NOT remove either guard.
+- **Re-acquiring after that self-expiry is a NEW leadership, so `_setLeader(true)` emits a
+  demote/promote pair** (XERK-1450): `_leader` stayed true through the lapse, so the old edge check
+  saw no change, and `onLeaderPromoted` never re-ran after another replica had led (and released)
+  meanwhile — stale singleton state, and an un-bumped term let a stale archive repair through.
+  Test: `XERK-1450: re-acquiring after a self-expired lapse…` in `leader.test.js`.
 - **The self-expiry bounds on the ADVERTISED lease (`leaseSeconds*1000`), NOT the raw
   `leaseDurationMs`** (XERK-763 QA): a k8s Lease advertises integer SECONDS (`leaseDurationSeconds`),
   which is what a standby reads for expiry, and `leaseSeconds` CEILs — so the local guard's window is
