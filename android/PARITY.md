@@ -327,9 +327,11 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
     stalled, then IDLE. The chat bar reads "Waiting…" and a wait row "waiting".
   - The Sessions-screen card carries the web's state line (`sessionCardState` in
     `ui/CommonUi.kt`, web `liveState` + `reviewState`): "stalled · Watch CI" in the error
-    colour, "PR awaiting review", "waiting for your permission", "· terminal offline", plus the
-    quoted question and the permission ask. **Gap:** the HOLDING dot is a dimmed working colour,
-    not the hollow ring; the `🏠 local` mark on the web card's state row is not shown.
+    colour, "PR awaiting review", "waiting for your permission", "· terminal offline".
+    **Deliberate gap (operator call):** that colored line is the card's ONE status line — the web's
+    grey `.why` age line, quoted question and permission ask are left off so phone cards stay
+    compact (the chat screen shows the question). **Gap:** the HOLDING dot is a dimmed working
+    colour, not the hollow ring; the `🏠 local` mark on the web card's state row is not shown.
 
 ## Done (XERK-78 installment — the P0 sweep)
 
@@ -889,8 +891,8 @@ those are marked `[MODEL]`.
   `setSummary`/`SummaryRequest`.
 - P1 Sidebar sections: Ready for review / Active / Idle split done (XERK-73 + XERK-224,
   `rankRunning` → `LiveGroups`); the dedicated Queued section done (XERK-78; the old Stopped group
-  folded into Ended). Each live card now carries the web's state line + question/ask preview, and
-  a Ready-for-review card spells out why it qualified ("PR awaiting review" / "finished · awaiting
+  folded into Ended). Each live card now carries the web's colored state line, and a
+  Ready-for-review card spells out why it qualified ("PR awaiting review" / "finished · awaiting
   review" / "awaiting your test").
 - ~~P1 SendUserFile inline previews (XERK-221).~~ **Done**: the app now has an image pipeline (Coil +
   `SvgDecoder`, wired via `TurmaApplication : ImageLoaderFactory`). `SendFile`/`files[]`/`caption` are on

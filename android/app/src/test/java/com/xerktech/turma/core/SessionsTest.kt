@@ -264,22 +264,6 @@ class SessionsTest {
         assertEquals("", attentionFor(null, now))
     }
 
-    @Test fun `attentionWhy says why and for how long`() {
-        // "for Nm" on every surface (operator review); the age's "·" never ends a line.
-        assertEquals("PR open · CI passing\u00A0·\u00A0for\u00A012m",
-            attentionWhy(att("needs-you:review", now - 12 * 60_000L, "PR open · CI passing"), now))
-        // A question/permission/stall names its why in the state line: the time only.
-        assertEquals("for\u00A03m", attentionWhy(att("needs-you:question", now - 3 * 60_000L, "Ship it?"), now))
-        assertEquals("for\u00A03m",
-            attentionWhy(att("needs-you:permission", now - 3 * 60_000L, "Bash: rm -rf build"), now))
-        assertEquals("needs a test\u00A0·\u00A0for\u00A03m",
-            attentionWhy(att("needs-you:test", now - 3 * 60_000L, "needs a test"), now))
-        // A stall says it stalled.
-        assertEquals("stalled\u00A03m", attentionWhy(att("needs-you:stalled", now - 3 * 60_000L), now))
-        assertEquals("", attentionWhy(att("working", now), now))
-        assertEquals("", attentionWhy(null, now))
-    }
-
     @Test fun `attentionLabel names a needs-you state, never idle`() {
         assertEquals("review · PR open · CI passing", attentionLabel(att("needs-you:review", now, "PR open · CI passing")))
         assertEquals("stalled · Watch CI", attentionLabel(att("needs-you:stalled", now, "Watch CI")))

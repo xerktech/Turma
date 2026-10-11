@@ -102,8 +102,9 @@ session CLI's `wakeAt` (`agent-session-cli.md`, XERK-1564).
   tinted card. "waiting for your answer/permission" (`.sess-wait`, `.state.waiting`) uses it.
 - **Each review card carries a `.why` line** (`attentionWhy`: the why + the time — "for 12m" on
   every needs-you card, "stalled 31m" on a stall; the why is dropped on a
-  question/permission/stalled card, whose state line or ask line already says it — web and
-  Android `core/Sessions.kt` alike). The age is glued to its word by a no-break space.
+  question/permission/stalled card, whose label or ask line already says it). The age is glued to
+  its word by a no-break space. Web only: the Android Sessions card keeps its colored state line
+  as its ONE status line (operator call, cards stay compact).
 - **An age's " · " never ends a line**: the `.why` line joins its age with no-break spaces around
   the dot, the dashboard State row wraps "· for 22m" in `stateAge` (NBSP + no-wrap span), and a
   wait label's age ("· 11m left", "· 12m") and the Sessions card's "· terminal offline" take NBSPs.

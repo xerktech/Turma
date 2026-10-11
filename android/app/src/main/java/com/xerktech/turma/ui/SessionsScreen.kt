@@ -1148,42 +1148,13 @@ private fun SessionListCard(
                     fontWeight = if (cs.tone == CardTone.WAITING || cs.tone == CardTone.REVIEW ||
                         cs.tone == CardTone.STALLED) FontWeight.SemiBold else null,
                     fontStyle = if (cs.tone == CardTone.HOLDING) androidx.compose.ui.text.font.FontStyle.Italic else null,
-                    maxLines = 2,
+                    maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                // The pending question, quoted (web `.question`).
-                r.session.session?.question?.takeIf { it.isNotBlank() }?.let { q ->
-                    Text(
-                        "“$q”",
-                        style = MaterialTheme.typography.bodySmall,
-                        maxLines = 2,
-                        overflow = TextOverflow.Ellipsis,
-                    )
-                }
-                // What a permission dialog asks for — the hub's why, the pending
-                // command (web `.question.ask`).
-                r.session.attention?.takeIf { it.state == "needs-you:permission" }?.why
-                    ?.takeIf { it.isNotBlank() }?.let { ask ->
-                        Text(
-                            ask,
-                            style = MaterialTheme.typography.bodySmall,
-                            maxLines = 2,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
-                // Why it is the operator's and for how long (XERK-1571, web
-                // sessions.html `.why` line) — review cards only.
+                // The colored state line is the card's ONE status line: the web's
+                // grey why/age line, quoted question and permission ask are left off
+                // so the phone card stays compact (operator call, android/PARITY.md).
                 if (review) {
-                    val why = com.xerktech.turma.core.attentionWhy(r.session.attention, now)
-                    if (why.isNotEmpty()) {
-                        Text(
-                            why,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
                     // The wait classifier's verdict and the answer it suggests
                     // (XERK-1572, web sessions.html `.att-hint`).
                     val hint = com.xerktech.turma.core.attentionHintLine(r.session.attention)

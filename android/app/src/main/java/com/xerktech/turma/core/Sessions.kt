@@ -244,25 +244,6 @@ fun <T> sortedBySince(rows: List<T>, attention: (T) -> Attention?): List<T> =
     rows.sortedWith(compareBy<T, Long?>(nullsLast<Long>()) { attention(it)?.since })
 
 /**
- * A review card's why line (XERK-1571, web sessions.html `attentionWhy`): WHY
- * the session is the operator's and how long it has waited. A question card
- * already quotes its question, a permission card names its ask and a stalled one
- * names its wait in the state line, so for those only the time shows. The time reads
- * "stalled 31m" on a stall, else "for 22m" (the wording every surface uses). The
- * age is glued to its word, and its "·" to both sides, by no-break spaces, so a
- * line never ends on a dangling "·". "" when the hub serves none.
- */
-fun attentionWhy(att: Attention?, now: Long): String {
-    if (att == null || needsYouChip(att.state) == null) return ""
-    val why = att.why?.takeIf { it.isNotBlank() && (att.state == "needs-you:review" || att.state == "needs-you:test") }.orEmpty()
-    val age = att.since?.let {
-        val word = if (att.state == "needs-you:stalled") "stalled" else "for"
-        "$word\u00A0${waitLeftText(now - it)}"
-    }.orEmpty()
-    return if (why.isNotEmpty() && age.isNotEmpty()) "$why\u00A0·\u00A0$age" else why.ifEmpty { age }
-}
-
-/**
  * A fleet card's State row for a session the hub says needs the operator (XERK-1571,
  * web index.html `attentionLabel`): "review · PR open · CI passing", "awaiting your
  * test · PR open", "stalled · Watch CI", "waiting for your answer", "waiting for your
