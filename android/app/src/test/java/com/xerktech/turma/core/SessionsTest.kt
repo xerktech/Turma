@@ -602,6 +602,10 @@ class SessionsTest {
         // A whitespace-only question still blocks, as the hub and web read it (truthy).
         assertEquals(st("waiting for your answer", com.xerktech.turma.ui.CardTone.WAITING), card(SessionInfo(
             status = "running", session = LiveSignals(question = " ", transcriptAgeSec = 1.0))))
+        // …ahead of the no-transcript and permission reads, as on the web.
+        assertEquals(st("waiting for your answer", com.xerktech.turma.ui.CardTone.WAITING), card(SessionInfo(
+            status = "running", attention = att("needs-you:permission", now),
+            session = LiveSignals(question = " "))))
         assertEquals(LiveState.WAITING, liveState(SessionInfo(status = "running",
             session = LiveSignals(question = " ", transcriptAgeSec = 1.0)), now, now))
     }
