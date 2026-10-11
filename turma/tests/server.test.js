@@ -8093,6 +8093,34 @@ test("XERK-1827: a host whose default runtime is not claude gets no ladder model
   assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null, "lad7"), { model: "haiku" });
 });
 
+test("XERK-1827: Start and the drain send a qwen-default host no ladder model", async () => {
+  hub.__setQwenEnabled(true);   // reset by the suite's afterEach
+  const site = "lad9.atlassian.net";
+  const beat = (free) => request("POST", "/api/heartbeat", {
+    body: {
+      device: "lad9", repos: [{ name: "Turma", path: "/git/Turma" }],
+      defaultRuntime: "qwen", qwen: { available: true },
+      capacity: { maxSessions: 2, running: 2 - free, queued: 0, free, rootRunning: false },
+      jira: { available: true, configured: true, siteKey: site, user: "lad9@x.com",
+        fetchedAt: "2026-07-14T12:00:00Z",
+        tickets: [{ key: "ENG-5", summary: "Fix it", repoGuess: { repo: "Turma", cloned: true } },
+          { key: "ENG-6", summary: "Fix it", repoGuess: { repo: "Turma", cloned: true } }] },
+    },
+    headers: agentHeaders,
+  });
+  await beat(2);
+  assert.equal(agents.lad9.defaultRuntime, "qwen");
+  await request("POST", `/api/jira/${site}/ENG-5/session`, { headers: userHeaders });
+  await beat(0);
+  const q = await request("POST", `/api/jira/${site}/ENG-6/session`, { headers: userHeaders });
+  assert.equal(q.body.queued, true);
+  await beat(2);   // ENG-5's undelivered spawn still holds one of the two slots
+  drainTicketQueue();
+  const cmds = agents.lad9.commands.filter((c) => c.type === "spawnTicket");
+  assert.deepEqual(cmds.map((c) => c.issueKey).sort(), ["ENG-5", "ENG-6"]);
+  for (const c of cmds) assert.ok(!("model" in c) && !("escalatedFrom" in c), JSON.stringify(c));
+});
+
 test("XERK-1827: the queue drain carries the ladder's pick", async () => {
   const site = "lad8.atlassian.net";
   const full = { maxSessions: 1, running: 1, queued: 0, free: 0, rootRunning: false };
