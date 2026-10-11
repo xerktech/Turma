@@ -459,12 +459,14 @@ function mirrorRepair(transcriptId, list, msgCount, archiveBytes, done) {
     })), msgCount, archiveBytes, done);
   } catch { /* best-effort mirror */ }
 }
-function mirrorReplace(transcriptId, list) {
+// `gated` (heal paths) drops the replace once this replica is deposed (XERK-1836); the
+// boot backfill passes nothing and stays ungated.
+function mirrorReplace(transcriptId, list, gated) {
   if (!indexSink || typeof indexSink.replace !== "function") return;
   try {
     indexSink.replace(transcriptId, (list || []).map((e) => ({
       uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
-    })));
+    })), gated === true);
   } catch { /* best-effort mirror */ }
 }
 
@@ -783,7 +785,7 @@ function reindexHeld(transcriptId, entries) {
       }
     });
   }
-  mirrorReplace(transcriptId, entries);
+  mirrorReplace(transcriptId, entries, true);
 }
 
 function writeSidecar(metaPath, obj, local) {
@@ -2341,7 +2343,7 @@ function reconcileRow(transcriptId, storedCount, storedBytes, entries, trueBytes
   // Mirror the heal to the Postgres of-record (XERK-780): the transcript's entries
   // are REPLACED wholesale (matching the SQLite DELETE+reinsert), and its row's
   // healed msgCount/archiveBytes re-mirrored.
-  mirrorReplace(transcriptId, entries);
+  mirrorReplace(transcriptId, entries, true);
   mirrorSession(transcriptId);
   console.error(
     `archive: reconciled ${transcriptId} on read — index claimed ${storedCount} ` +
