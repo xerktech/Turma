@@ -275,7 +275,8 @@ of-record**, so both halves of the ADR split now hold:
 - **A seat sends its file's FIRST-COPY lines, never the raw copy (XERK-1838)**
   (`heldEntries(jsonl, true)`). A stale pre-repair copy seated after the duplicate repair put the
   repeated lines back. First-copy de-dup is prefix-monotone (the repair's own rule), so the seat
-  writes a prefix of the repaired rows and the next append still lands at its seq.
+  writes a prefix of the repaired rows; the next append lands at its seq when Postgres holds no
+  tail past the seat (below).
   - The ingest path numbers its append after the FIRST-COPY count too (`prevCount = seated.length`),
     and the backfill row's `msgCount` is the first-copy count: raw counts left a seq hole (QA F2/F3).
   - A seat never adds a stale tail, but cannot trim one: Postgres rows past the file (a pending
