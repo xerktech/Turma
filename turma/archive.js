@@ -448,6 +448,12 @@ function mirrorEntries(transcriptId, list, startSeq) {
   } catch { /* best-effort mirror */ }
 }
 // Mirror a wholesale replacement of a transcript's entries (the reconcile heal).
+// Mirror a transcript's EXACT msgCount/archiveBytes — the one write allowed to
+// LOWER them (the session upsert only raises), for the duplicate repair below.
+function mirrorCounts(transcriptId, msgCount, archiveBytes) {
+  if (!indexSink || typeof indexSink.counts !== "function") return;
+  try { indexSink.counts(transcriptId, msgCount, archiveBytes); } catch { /* best-effort mirror */ }
+}
 function mirrorReplace(transcriptId, list) {
   if (!indexSink || typeof indexSink.replace !== "function") return;
   try {
@@ -775,11 +781,11 @@ function reindexHeld(transcriptId, entries) {
   mirrorReplace(transcriptId, entries);
 }
 
-function writeSidecar(metaPath, obj) {
+function writeSidecar(metaPath, obj, local) {
   const tmp = metaPath + ".tmp";
   fs.writeFileSync(tmp, JSON.stringify(obj));
   fs.renameSync(tmp, metaPath);
-  noteWrite(metaPath);
+  if (!local) noteWrite(metaPath);
 }
 
 // Bytes the whole store holds, measured by WALKING THE FILES — never summed
@@ -2819,6 +2825,89 @@ function backfillPgIndexFromFiles() {
   return rebuilt;
 }
 
+// Repair `.jsonl` files that hold repeated lines (XERK-1450). Before XERK-1364 a
+// re-send onto a cursor behind its file was appended whole, so damaged files carry
+// the same rendered lines several times over while their sidecar counts them once.
+// Keeps the FIRST copy of each exact line, in order. Exact lines, not entryKey: a
+// uuid'd key ignores text, and two different entries can share one; an identical
+// line is a duplicate by any reading. First-copy de-dup is prefix-monotone — a
+// shorter copy of a file de-dups to a prefix of the longer copy's result — which
+// is what keeps the hydrate's "larger local copy is ahead" size compare honest.
+//
+// `publish` (the leader, or a non-HA hub) re-seats the index and mirrors the result:
+// the rewritten file and sidecar to the bucket, the entries and the EXACT lowered
+// counts to Postgres. Without it (a replica about to hydrate) only the local copy
+// is rewritten and nothing is mirrored: a follower booted before the leader's
+// repair holds a stale LARGER copy the hydrate would otherwise keep over the
+// repaired bucket object, and it must never push that copy anywhere.
+//
+// A clean pass stamps `dedupChecked` (the file size it covered) on the sidecar so
+// later passes read only files that changed. The agent cursor (`bytesStored`) is
+// untouched: it counts the agent's raw bytes, not the lines we kept. Synchronous,
+// like the other whole-store boot passes. Returns the number of files repaired.
+function dedupArchive(opts) {
+  const publish = !!(opts && opts.publish);
+  const files = [];
+  walkJsonl(ARCHIVE_DIR, files, 0);
+  let repaired = 0, droppedTotal = 0;
+  for (const jsonl of files) {
+    const metaPath = jsonl + ".meta";
+    const meta = readSidecar(metaPath);
+    if (!meta || !meta.transcriptId) continue; // unattributable: leave it alone
+    let raw;
+    try { raw = fs.readFileSync(jsonl, "utf8"); } catch { continue; }
+    const size = Buffer.byteLength(raw);
+    if (meta.dedupChecked === size) continue;
+    const seen = new Set();
+    const kept = [];
+    let dropped = 0;
+    for (const line of raw.split("\n")) {
+      if (!line.trim()) continue;
+      if (seen.has(line)) { dropped += 1; continue; }
+      seen.add(line);
+      kept.push(line);
+    }
+    if (!dropped) {
+      // Only the publisher stamps: a local-only stamp would differ from the
+      // bucket's sidecar and just be refetched over.
+      if (publish) writeSidecar(metaPath, { ...meta, dedupChecked: size });
+      continue;
+    }
+    const text = kept.length ? kept.join("\n") + "\n" : "";
+    const archiveBytes = Buffer.byteLength(text);
+    const tmp = jsonl + ".tmp";
+    fs.writeFileSync(tmp, text);
+    fs.renameSync(tmp, jsonl);
+    const entries = heldEntries(jsonl).entries;
+    const msgCount = entries.length;
+    writeSidecar(metaPath, { ...meta, msgCount, archiveBytes, dedupChecked: archiveBytes }, !publish);
+    repaired += 1;
+    droppedTotal += dropped;
+    if (!publish) continue;
+    noteWrite(jsonl);
+    const id = meta.transcriptId;
+    const relPath = path.relative(ARCHIVE_DIR, jsonl);
+    const row = idxGetSession(id);
+    // Only re-seat the row this file IS — never a different file's that shares the id.
+    if (!row || row.filePath !== relPath) continue;
+    if (isPgMode()) {
+      const live = sessionsMap.get(id);
+      if (live) { live.msgCount = msgCount; live.archiveBytes = archiveBytes; }
+    } else {
+      db.prepare("UPDATE sessions SET msgCount=?, archiveBytes=? WHERE transcriptId=?")
+        .run(msgCount, archiveBytes, id);
+    }
+    reindexHeld(id, entries);
+    mirrorCounts(id, msgCount, archiveBytes);
+  }
+  if (repaired) {
+    console.error(`archive: removed ${droppedTotal} repeated line(s) from ${repaired} ` +
+      `transcript(s)${publish ? "" : " (local copy only, before a hydrate)"} — damage ` +
+      `written before XERK-1364's re-send de-dup (XERK-1450)`);
+  }
+  return repaired;
+}
+
 // ---- the dsh Trajectory (XERK-498) ------------------------------------------
 // A read-only Trajectory over a dsh session's D3 NATIVE event log — the
 // canonical record the raw layer already keeps at `<id>/dsh/*.jsonl` (XERK-469),
@@ -3488,6 +3577,8 @@ module.exports = {
   // under HA so the index is the in-memory map + Postgres-direct search; sessionLoader
   // is the sessions-only hydration applier.
   setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles,
+  // The one-time repair of files duplicated before XERK-1364 (XERK-1450).
+  dedupArchive,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

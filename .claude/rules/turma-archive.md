@@ -196,6 +196,16 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     file alone, so the bucket can hold a `.meta` (and PG a row) newer than its `.jsonl`. Only
     cursors whose `archiveBytes` ≤ the file size are candidates; none left → 0 (`sidecarCursor`).
   - Tests: `XERK-1364` + `XERK-1459` cases in `archive.test.js` and `index-store.test.js`.
+- **Files duplicated BEFORE XERK-1364 are repaired by `dedupArchive`** (XERK-1450): first copy of
+  each EXACT line kept, in order (not `entryKey` — a uuid'd key ignores text).
+  - It SHRINKS a file, which breaks the hydrate's "larger local copy is ahead" rule. So every hydrate
+    first runs it local-only (`publish:false`, nothing mirrored): a follower's stale duplicated copy
+    then de-dups to a prefix of the repaired object and is refetched. First-copy de-dup being
+    prefix-monotone is what makes that safe — keep it that way.
+  - Only the LEADER (or a non-HA boot) publishes: re-PUTs file + sidecar, re-seats entries, and sets
+    PG counts with `setCounts` — the session upsert's GREATEST can never lower them.
+  - `bytesStored` is untouched; a `dedupChecked` sidecar stamp skips unchanged files next pass.
+  - Tests: the `XERK-1450` cases in `index-store.test.js`.
 - **`meta` is COERCED before it is bound** (`normalizeMeta`) — every field is agent-supplied and goes
   straight into sqlite (scalars only); a non-scalar stores as nothing rather than poisoning every
   later beat with a 500. The length cap is the receiving half of the same XERK-235 rule as above.

@@ -4774,6 +4774,7 @@ class IndexMirror {
     if (op.t === "entries") return this.store.appendEntries(op.transcriptId, op.entries, op.startSeq);
     if (op.t === "replace") return this.store.replaceEntries(op.transcriptId, op.entries);
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
+    if (op.t === "counts") return this.store.setCounts(op.transcriptId, op.msgCount, op.archiveBytes);
   }
   // The sink archive.js calls — each method SYNC (enqueue only), never awaited by the
   // caller and never throwing back into archive.js's hot path.
@@ -4784,6 +4785,8 @@ class IndexMirror {
         this._push({ t: "entries", transcriptId, entries, startSeq }),
       replace: (transcriptId, entries) => this._push({ t: "replace", transcriptId, entries }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
+      counts: (transcriptId, msgCount, archiveBytes) =>
+        this._push({ t: "counts", transcriptId, msgCount, archiveBytes }),
     };
   }
 }
@@ -4952,6 +4955,12 @@ function hydrateArchive() {
   return archiveHydrateInFlight;
 }
 async function hydrateArchiveOnce() {
+  // Repair duplicated `.jsonl` files (XERK-1450) on the local copy BEFORE the byte
+  // hydrate: the hydrate keeps a local file that is larger than the bucket's, so a
+  // stale duplicated copy would otherwise survive the leader's repair. Local only —
+  // nothing is mirrored from a replica that may not be the leader.
+  try { archive.dedupArchive({ publish: false }); }
+  catch (e) { console.error(`archive: duplicate repair (local) failed: ${e && e.message}`); }
   if (archiveMirror) {
     // Ingest stays CLOSED across the byte hydrate, not just the index hydrate
     // below, and until the bucket has actually been listed (XERK-1048): opened over
@@ -4967,6 +4976,13 @@ async function hydrateArchiveOnce() {
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
   }
   await hydrateArchiveIndex();
+  // The leader repairs what the bucket and Postgres hold, now that both are loaded
+  // (XERK-1450). Synchronous, so no ingest interleaves. A replica promoted after this
+  // point re-runs the whole hydrate from onLeaderPromoted.
+  if (isLeader()) {
+    try { archive.dedupArchive({ publish: true }); }
+    catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+  }
   // Rendered downloads that failed keep only THEIR transcripts closed; keep
   // retrying them in the background with the rest of the hub ingesting (XERK-1050).
   // Started after the index hydrate so a landing never reconciles mid-hydrate.
@@ -22787,6 +22803,11 @@ if (process.env.TURMA_TEST) {
         console.error(`archive mirror drain failed: ${e && e.message}`));
     }, ARCHIVE_MIRROR_DRAIN_MS);
     archiveDrainTimer.unref();
+  } else {
+    // No bucket: the local tree is the whole of-record, so repair it here, once per
+    // boot, before any ingest (XERK-1450).
+    try { archive.dedupArchive({ publish: true }); }
+    catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
   }
   // XERK-764 (wave-3): the cross-replica tunnel directory + control bus. Watch the
   // host->replica directory FIRST (so no owner change is missed during the async

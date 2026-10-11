@@ -353,6 +353,15 @@ class PgIndexStore {
     await this._insertEntriesBatched(transcriptId, entries, startSeq || 0);
   }
 
+  // Set a transcript's msgCount/archiveBytes EXACTLY — the one write that may lower
+  // them, for the duplicate repair (XERK-1450); upsertSession only ever raises.
+  async setCounts(transcriptId, msgCount, archiveBytes) {
+    await this.ensureSchema();
+    await this.pool.execute(
+      `UPDATE ${this.prefix}_sessions SET msg_count = $2, archive_bytes = $3 WHERE transcript_id = $1`,
+      [transcriptId, intParam(msgCount), intParam(archiveBytes)]);
+  }
+
   // Replace a transcript's entries wholesale (the reconcile / rebuild-one case — a
   // deleted/truncated `.jsonl` healed on read, XERK-280). Deletes then re-inserts
   // from seq 0, matching the SQLite heal.

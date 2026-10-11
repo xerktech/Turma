@@ -167,12 +167,18 @@ class MemIndexStore {
     this.entries.set(tid, m);
   }
   deleteTranscript(tid) { this.sessions.delete(tid); this.entries.delete(tid); }
+  // Mirrors PgIndexStore.setCounts: an exact UPDATE, the one write that may lower.
+  setCounts(tid, msgCount, archiveBytes) {
+    const r = this.sessions.get(tid);
+    if (r) this.sessions.set(tid, { ...r, msgCount, archiveBytes });
+  }
   // The archive.js sink shape.
   sink() {
     return {
       session: (r) => this.upsertSession(r),
       entries: (t, e, s) => this.appendEntries(t, e, s),
       replace: (t, e) => this.replaceEntries(t, e),
+      counts: (t, n, b) => this.setCounts(t, n, b),
     };
   }
   // Mirrors PgIndexStore.hydrateInto: reset once, then batch-apply sessions + entries.
@@ -1167,4 +1173,105 @@ test("XERK-1364 pg mode: a handover mid-re-send keeps de-duplicating", async () 
     A.setIndexMode(null);
     pgTeardown();
   }
+});
+
+// ============================================================================
+// XERK-1450: repairing `.jsonl` files duplicated before XERK-1364's re-send de-dup.
+// ============================================================================
+
+// A transcript whose file holds a whole re-sent copy appended after the original —
+// the XERK-1364 damage shape — with the row/sidecar counting it once, as in prod.
+function duplicatedTranscript(id) {
+  const pr = (ts) => ({ uuid: "pr-link:https://x/pr/1", role: "assistant", ts, text: "PR #1" });
+  const b1 = [ent("d0", "user", "first"), pr("2026-07-10T00:01:00Z"),
+    ent("d1", "assistant", "second"), pr("2026-07-10T00:02:00Z")];
+  const len1 = Buffer.byteLength(JSON.stringify(b1));
+  archive.ingestChunk("nas", id, META, 0, len1, b1, "acme");
+  const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow(id).filePath);
+  const once = fs.readFileSync(jsonl, "utf8");
+  fs.appendFileSync(jsonl, once + once.split("\n").slice(0, 2).join("\n") + "\n");
+  return { jsonl, once, len1 };
+}
+
+test("XERK-1450 pg mode: the leader repair de-dups the file, lowers PG counts, re-seats entries", async () => {
+  const mem = pgSetup();
+  const noted = [];
+  archive.setBlobSink((p) => noted.push(p));
+  try {
+    const { jsonl, once, len1 } = duplicatedTranscript("t-dup");
+    // Postgres holds the inflated figures a GREATEST upsert can never lower.
+    mem.upsertSession({ ...mem.sessions.get("t-dup"), msgCount: 10, archiveBytes: 4096 });
+    mem.appendEntries("t-dup", [ent("d0", "user", "first")], 4);
+    noted.length = 0;
+
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once, "first copies kept, in order");
+    const bytes = Buffer.byteLength(once);
+    const row = archive.sessionRow("t-dup");
+    assert.equal(row.msgCount, 4);
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-dup" }], "acme")["t-dup"], len1,
+      "the agent cursor is untouched");
+    assert.equal(mem.sessions.get("t-dup").msgCount, 4);
+    assert.equal(mem.sessions.get("t-dup").archiveBytes, bytes);
+    assert.equal(mem.entries.get("t-dup").size, 4);
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    assert.equal(meta.archiveBytes, bytes);
+    assert.equal(meta.msgCount, 4);
+    assert.equal(meta.bytesStored, len1);
+    assert.deepEqual(noted.sort(), [jsonl, jsonl + ".meta"].sort(), "both re-PUT to the bucket");
+
+    // Idempotent, and the stamp means the next pass does not re-read the file.
+    noted.length = 0;
+    assert.equal(archive.dedupArchive({ publish: true }), 0);
+    assert.deepEqual(noted, []);
+
+    // The next chunk appends at the cursor without tripping XERK-1364's suspect path.
+    const b2 = [ent("d2", "user", "third")];
+    archive.ingestChunk("nas", "t-dup", META, len1, len1 + 50, b2, "acme");
+    assert.equal(fs.readFileSync(jsonl, "utf8").trim().split("\n").length, 5);
+    assert.equal(mem.entries.get("t-dup").size, 5);
+  } finally { archive.setBlobSink(null); pgTeardown(); }
+});
+
+test("XERK-1450: a local-only pass rewrites the copy but mirrors nothing", async () => {
+  const mem = pgSetup();
+  const noted = [];
+  try {
+    const { jsonl, once } = duplicatedTranscript("t-local");
+    const pgBefore = { ...mem.sessions.get("t-local") };
+    const entriesBefore = mem.entries.get("t-local").size;
+    archive.setBlobSink((p) => noted.push(p));
+    assert.equal(archive.dedupArchive({ publish: false }), 1);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    assert.deepEqual(noted, [], "a follower never pushes its copy");
+    assert.deepEqual(mem.sessions.get("t-local"), pgBefore);
+    assert.equal(mem.entries.get("t-local").size, entriesBefore);
+    // Nothing stamped locally, so the leader's pass still checks it.
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupChecked, Buffer.byteLength(once));
+  } finally { archive.setBlobSink(null); pgTeardown(); }
+});
+
+test("XERK-1450 sqlite mode: the repair re-seats the local row and search index", async () => {
+  archive.closeDb();
+  fs.rmSync(process.env.ARCHIVE_DIR, { recursive: true, force: true });
+  try {
+    const { jsonl, once } = duplicatedTranscript("t-sq");
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    const row = archive.sessionRow("t-sq");
+    assert.equal(row.msgCount, 4);
+    const res = await archive.searchArchive("second");
+    const hits = res.groups.flatMap((g) => g.matches).filter((m) => m.transcriptId === "t-sq");
+    assert.equal(hits.length, 1, "searchable once, not once per copy");
+  } finally { archive.closeDb(); }
+});
+
+test("PgIndexStore.setCounts: an exact UPDATE, never GREATEST", async () => {
+  const pool = spyPool();
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  await store.setCounts("t1", 3, 120);
+  const c = pool.calls.find((x) => x.m === "execute" && /^UPDATE archive_sessions/.test(x.text));
+  assert.ok(c, "the UPDATE was issued");
+  assert.doesNotMatch(c.text, /GREATEST/);
+  assert.deepEqual(c.params, ["t1", 3, 120]);
 });
