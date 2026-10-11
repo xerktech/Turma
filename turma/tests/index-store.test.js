@@ -1351,6 +1351,25 @@ test("XERK-1450 sqlite mode: the repair re-seats the local row and search index"
   } finally { archive.closeDb(); }
 });
 
+test("PgIndexStore.replaceEntries: overwrites in place, then trims — never deletes first (XERK-1450)", async () => {
+  const pool = spyPool();
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  await store.ensureSchema();
+  pool.calls.length = 0;
+  await store.replaceEntries("t1", [ent("u0", "user", "a"), ent("u1", "user", "b")]);
+  const exec = pool.calls.filter((c) => c.m === "execute");
+  assert.equal(exec.length, 2);
+  assert.match(exec[0].text, /^INSERT INTO archive_entries .* ON CONFLICT \(transcript_id, seq\) DO UPDATE SET/);
+  assert.match(exec[1].text, /^DELETE FROM archive_entries WHERE transcript_id = \$1 AND seq >= \$2$/);
+  assert.deepEqual(exec[1].params, ["t1", 2]);
+  // An empty replace is just the trim (every row).
+  pool.calls.length = 0;
+  await store.replaceEntries("t1", []);
+  assert.deepEqual(pool.calls.filter((c) => c.m === "execute").map((c) => c.params), [["t1", 0]]);
+  // Appends still never overwrite a held ordinal.
+  assert.match(buildEntryInsert("archive", "t1", [ent("u", "user", "x")], 0).text, /DO NOTHING$/);
+});
+
 test("PgIndexStore.setCounts: an exact UPDATE, never GREATEST", async () => {
   const pool = spyPool();
   const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });

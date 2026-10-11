@@ -2925,6 +2925,7 @@ function dedupArchive(opts) {
     const row = idxGetSession(id);
     // Only re-seat the row this file IS — never a different file's that shares the id.
     if (!row || row.filePath !== path.relative(ARCHIVE_DIR, jsonl)) {
+      dedupPendingIds.delete(id);
       delete fixed.dedupPending;
       writeSidecar(metaPath, fixed);
       continue;
@@ -2940,6 +2941,8 @@ function dedupArchive(opts) {
         // Postgres holds the repair. Entries appended since mirrored at ordinals
         // after it, in queue order, so it is done whatever the file holds now.
         if (dedupRepairGen.get(id) !== gen) return; // a newer repair is still queued
+        // No older one can ack after this: the queue is FIFO and a failure never re-queues.
+        dedupRepairGen.delete(id);
         dedupPendingIds.delete(id);
         const sc = readSidecar(metaPath);
         if (!sc || !sc.dedupPending) return;
