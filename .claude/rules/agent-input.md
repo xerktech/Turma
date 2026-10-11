@@ -34,6 +34,20 @@ composed.**
     submit and arrive corrupted, and slicing costs ~2 tmux calls per slice ON THE BEAT (resend, qwen
     peer). Those keep one bracketed paste; `chat.js` `stripFraming` hides the tags.
   - A typed TAB is autocomplete, so tabs go as 4 spaces. One writer per pane (`_PANE_TYPE_LOCKS`).
+  - **Typed text's Enter is settled and verified** (`_submit_typed`): an Enter close behind typed
+    input is read as a LINE BREAK, leaving the message unsent in the composer with nothing to
+    retry it. Measured on 2.1.296: a ~790-char two-slice message (the hub's PR-merged nudge)
+    stuck 2/4 at a 10ms gap. So it waits `TYPED_SUBMIT_SETTLE_SEC`, Enters, then WATCHES the pane
+    (`_composer_state`): "holds" (between the last two rules) → Enter again; "sent" or busy → done;
+    neither → keep watching, to `TYPED_SUBMIT_DEADLINE_SEC`.
+  - **"Sent" is the text's count ABOVE the box RISING past a pre-Enter baseline** (`_sent_count`),
+    never "the text is above the box": an identical earlier message (a resend, a resumed session)
+    or a short text inside a reply is already there, and QA stranded a message that way.
+  - **Never read one empty composer as "sent"** — a loaded TUI draws typed text seconds late, and
+    stopping there left 7/12 stuck in QA. A FRESH session swallows its first Enter whatever the
+    gap, so the re-press, not the settle, is the fix. Never Enter on a busy pane (it may be a
+    dialog next). Beat cost: up to the deadline + one capture on the compaction resend.
+    Tests: `TestSubmitTyped`.
   - Windows `_pty_inject` applies the same rule (XERK-1727, `windows-agent.md`). Tests:
     `TestSendInput`, the `_pty_inject` cases in `TestWindowsTerminalBackend`.
 - **Nothing truncates silently**: the fallback CHUNKS its send-keys; the agent REFUSES past

@@ -91,8 +91,8 @@ launch with `WinError 2` — the whole session surface was dead. The seam, in `h
   `TestWindowsTerminalBackend`.
 - **Chat-sized input is TYPED, not bracketed** (XERK-1727, the XERK-1718 rule): `_pty_inject`
   types text ≤ `PASTE_SLICED_MAX_CHARS` with nothing in `_SLICE_UNSAFE_RE` in `PASTE_CHUNK_CHARS`
-  slices, LF raw, tabs as 4 spaces, then a separate CR (after a `PASTE_CHUNK_GAP_SEC` gap when
-  there were several slices or any LF). Only
+  slices, LF raw, tabs as 4 spaces, then a separate CR via `_submit_typed` (settle, then Enter
+  again while the composer still holds the text — `agent-input.md`). Only
   longer or emoji-bearing text takes the bracketed paste + settle/chip-retry path above.
   - LF as a line break rests on the SOURCES, not a host run: conhost's input engine maps LF to a
     Ctrl+Enter key event carrying `\n`, which libuv hands node as LF — the byte tmux `-r` types.
