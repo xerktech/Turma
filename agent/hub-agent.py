@@ -14765,24 +14765,48 @@ def _input_slices(text):
     return out or [""]
 
 
-def _composer_state(cap, text):
-    """Where `text` is on the pane: "holds" when the composer (the lines
-    between the last two rules) still ends with it, its Enter read as a line
-    break; "sent" when it sits ABOVE the composer as a submitted turn; else
-    None — can't tell, which includes a loaded TUI that has not drawn the typed
-    text yet (QA: one empty-composer read taken as "sent" left it stuck).
-    Whitespace is ignored: the composer wraps and indents what it shows."""
-    want = re.sub(r"\s+", "", text or "")[-COMPOSER_TAIL_CHARS:]
-    if not cap or not want:
+def _composer_split(cap):
+    """(above, box) of a pane capture, whitespace-stripped: the box is the
+    composer between the last two rules, `above` everything over it. None when
+    there is no composer to read."""
+    if not cap:
         return None
     lines = cap.splitlines()
     rules = [i for i, line in enumerate(lines) if _COMPOSER_RULE_RE.match(line)]
     if len(rules) < 2:
         return None
-    box = "".join(lines[rules[-2] + 1:rules[-1]])
-    if re.sub(r"\s+", "", box).endswith(want):
+    strip = lambda part: re.sub(r"\s+", "", "".join(part))
+    return strip(lines[:rules[-2]]), strip(lines[rules[-2] + 1:rules[-1]])
+
+
+def _composer_tail(text):
+    return re.sub(r"\s+", "", text or "")[-COMPOSER_TAIL_CHARS:]
+
+
+def _sent_count(cap, text):
+    """How often `text`'s tail shows ABOVE the composer, or None if unreadable.
+    Compared before and after Enter: a rise is the submitted turn. A bare
+    "text is above the box" is not — an earlier identical message, or a short
+    message that is a substring of a reply, already sits there (QA)."""
+    split, want = _composer_split(cap), _composer_tail(text)
+    if split is None or not want:
+        return None
+    return split[0].count(want)
+
+
+def _composer_state(cap, text, sent_before=None):
+    """Where `text` is on the pane: "holds" when the composer still ends with
+    it (its Enter read as a line break); "sent" when it shows above the
+    composer more often than `sent_before` (None: no baseline, so never
+    "sent"); else None — can't tell, which includes a loaded TUI that has not
+    drawn the typed text yet. Whitespace is ignored: the composer wraps."""
+    split, want = _composer_split(cap), _composer_tail(text)
+    if split is None or not want:
+        return None
+    above, box = split
+    if box.endswith(want):
         return "holds"
-    if want in re.sub(r"\s+", "", "".join(lines[:rules[-2]])):
+    if sent_before is not None and above.count(want) > sent_before:
         return "sent"
     return None
 
@@ -14793,10 +14817,11 @@ def _composer_holds(cap, text):
 
 def _submit_typed(tmux_name, text, press_enter):
     """Submit TYPED text: settle, Enter, then watch the pane until the text is
-    a submitted turn or a turn is running, pressing Enter again whenever the
+    a NEW submitted turn or a turn is running, pressing Enter again whenever the
     composer still holds it (bounded by TYPED_SUBMIT_MAX_RETRIES and
     TYPED_SUBMIT_DEADLINE_SEC). A read that can't tell keeps watching."""
     time.sleep(TYPED_SUBMIT_SETTLE_SEC)
+    sent_before = _sent_count(_capture_pane(tmux_name), text)
     press_enter()
     deadline = time.monotonic() + TYPED_SUBMIT_DEADLINE_SEC
     presses = 0
@@ -14805,13 +14830,14 @@ def _submit_typed(tmux_name, text, press_enter):
         cap = _capture_pane(tmux_name)
         if cap is None or _busy_from_capture(cap):
             return
-        state = _composer_state(cap, text)
+        state = _composer_state(cap, text, sent_before)
         if state == "sent":
             return
         if state == "holds":
             if presses >= TYPED_SUBMIT_MAX_RETRIES:
-                log(f"typing into {tmux_name}: still unsent after "
-                    f"{presses + 1} Enters; leaving it in the composer")
+                # A lagging redraw can keep showing a message that did go.
+                log(f"typing into {tmux_name}: composer still shows the message "
+                    f"after {presses + 1} Enters (or has not redrawn yet)")
                 return
             log(f"typing into {tmux_name}: Enter was read as a line break; "
                 f"pressing it again")

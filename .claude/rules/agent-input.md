@@ -38,8 +38,11 @@ composed.**
     input is read as a LINE BREAK, leaving the message unsent in the composer with nothing to
     retry it. Measured on 2.1.296: a ~790-char two-slice message (the hub's PR-merged nudge)
     stuck 2/4 at a 10ms gap. So it waits `TYPED_SUBMIT_SETTLE_SEC`, Enters, then WATCHES the pane
-    (`_composer_state`): "holds" (between the last two rules) → Enter again; "sent" (the text is
-    above the box) or busy → done; neither → keep watching, to `TYPED_SUBMIT_DEADLINE_SEC`.
+    (`_composer_state`): "holds" (between the last two rules) → Enter again; "sent" or busy → done;
+    neither → keep watching, to `TYPED_SUBMIT_DEADLINE_SEC`.
+  - **"Sent" is the text's count ABOVE the box RISING past a pre-Enter baseline** (`_sent_count`),
+    never "the text is above the box": an identical earlier message (a resend, a resumed session)
+    or a short text inside a reply is already there, and QA stranded a message that way.
   - **Never read one empty composer as "sent"** — a loaded TUI draws typed text seconds late, and
     stopping there left 7/12 stuck in QA. A FRESH session swallows its first Enter whatever the
     gap, so the re-press, not the settle, is the fix. Never Enter on a busy pane (it may be a
