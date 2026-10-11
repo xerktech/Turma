@@ -43,7 +43,7 @@ Evidence: `docs/routing-spike-phase2-3.md`.
 - **Escalation happens on the NEXT start only.** Auto-start never re-dispatches a ticket that has
   any session (`startedTicketKeys`), so a failed ticket is retried by an operator Start or the
   queue — nothing auto-restarts it, and nothing kills a running session for it.
-- `TICKET_MODEL_LADDER` (hub env): unset/`off`/unusable = off (login default), `on` = the
+- `TICKET_MODEL_LADDER` (hub env): unset/`off`/`false`/`0`/unusable = off (login default), `on`/`true`/`1` = the
   recommended `TICKET_MODEL_LADDER_DEFAULT`, a comma list = a custom ladder.
 - **`TURMA_TICKET_SUBAGENT_MODEL` (agent env, default "" = off) sets ticket sessions' sub-agent
   default** (`CLAUDE_CODE_SUBAGENT_MODEL`) — never for a local-model session or over an operator's

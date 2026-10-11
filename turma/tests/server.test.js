@@ -8085,6 +8085,17 @@ test("http: a model-pinned ticket carries the model on its spawnTicket command",
   ]);
 });
 
+test("XERK-1827: TICKET_MODEL_LADDER parses off by default; on/booleans/lists as written", () => {
+  const P = hub.parseTicketModelLadder, D = hub.TICKET_MODEL_LADDER_DEFAULT;
+  for (const v of [undefined, "", "  ", "off", "OFF", "none", "false", "0", "no", "junk!!,@@"]) {
+    assert.deepEqual(P(v), [], String(v));
+  }
+  for (const v of ["on", "ON ", "default", "true", "1", "yes"]) assert.deepEqual(P(v), D, v);
+  assert.deepEqual(P("haiku, opus"), ["haiku", "opus"]);
+  assert.deepEqual(P("haiku,BAD!,opus"), ["haiku", "opus"]);
+  assert.deepEqual(D, ["haiku", "sonnet", "opus"]);
+});
+
 test("XERK-1827: the ladder is OFF by default — an unpinned ticket carries no model", async () => {
   await ticketBeat("tmOff", "tmOff.atlassian.net");
   const res = await request("POST", "/api/jira/tmOff.atlassian.net/ENG-5/session",

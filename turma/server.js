@@ -2584,10 +2584,10 @@ function setTicketModel(siteKey, issueKey, model) {
 // "ladder" policy replays the recommended list — keep the two equal (pinned by
 // bench/tests/test_policy.py).
 const TICKET_MODEL_LADDER_DEFAULT = ["haiku", "sonnet", "opus"];
-let TICKET_MODEL_LADDER = (() => {
-  const raw = (process.env.TICKET_MODEL_LADDER || "").trim().toLowerCase();
-  if (!raw || raw === "off" || raw === "none") return [];
-  if (raw === "on" || raw === "default") return TICKET_MODEL_LADDER_DEFAULT;
+function parseTicketModelLadder(value) {
+  const raw = String(value || "").trim().toLowerCase();
+  if (!raw || ["off", "none", "false", "0", "no"].includes(raw)) return [];
+  if (["on", "default", "true", "1", "yes"].includes(raw)) return TICKET_MODEL_LADDER_DEFAULT;
   const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
   const list = parts.filter((s) => /^[a-z0-9.-]{1,40}$/.test(s));
   if (list.length !== parts.length) {
@@ -2602,7 +2602,8 @@ let TICKET_MODEL_LADDER = (() => {
     return [];
   }
   return list;
-})();
+}
+let TICKET_MODEL_LADDER = parseTicketModelLadder(process.env.TICKET_MODEL_LADDER);
 
 // Every session of this ticket the fleet still knows about, on hosts BOUND to its
 // org (the startedTicketKeys rule: a drifted host's claim is not this org's work).
@@ -22686,6 +22687,7 @@ if (process.env.TURMA_TEST) {
     ticketLadderPick,
     ticketSpawnModelFields,
     TICKET_MODEL_LADDER_DEFAULT,
+    parseTicketModelLadder,
     __setTicketModelLadder: (list) => { TICKET_MODEL_LADDER = list; },
     setTicketModel,
     orgModelAliases,
