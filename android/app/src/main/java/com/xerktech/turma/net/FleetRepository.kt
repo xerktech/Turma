@@ -48,6 +48,10 @@ data class FleetState(
     // Ticket -> pinned model (XERK-123), from the same payload; the board's Model
     // row reads it. Refreshed by the poll and the "ticketModels" SSE event.
     val ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap(),
+    // The hub's model ladder (XERK-1830): the board's Model row derives an
+    // unpinned ticket's next tier from it + [agents]. Env-fixed hub-side, so the
+    // poll alone refreshes it (no SSE event); empty = no ladder ("Default").
+    val ticketModelLadder: List<String> = emptyList(),
     // Ticket -> pinned runtime (XERK-473), from the same payload; the board's
     // Runtime row reads it. Refreshed by the poll and the "ticketRuntimes" SSE event.
     val ticketRuntimes: Map<String, com.xerktech.turma.model.TicketRuntimePin> = emptyMap(),
@@ -161,6 +165,7 @@ class FleetRepository(
             autoStartOrgs = resp.autoStartOrgs
             autoMergeOrgs = resp.autoMergeOrgs
             ticketModels = resp.ticketModels
+            ticketModelLadder = resp.ticketModelLadder
             ticketRuntimes = resp.ticketRuntimes
             ticketPlatforms = resp.ticketPlatforms
             orgColors = resp.orgColors
@@ -198,6 +203,9 @@ class FleetRepository(
 
     @Volatile
     private var ticketModels: Map<String, com.xerktech.turma.model.TicketModelPin> = emptyMap()
+
+    @Volatile
+    private var ticketModelLadder: List<String> = emptyList()
 
     @Volatile
     private var ticketRuntimes: Map<String, com.xerktech.turma.model.TicketRuntimePin> = emptyMap()
@@ -246,6 +254,7 @@ class FleetRepository(
             autoStartOrgs = autoStartOrgs,
             autoMergeOrgs = autoMergeOrgs,
             ticketModels = ticketModels,
+            ticketModelLadder = ticketModelLadder,
             ticketRuntimes = ticketRuntimes,
             ticketPlatforms = ticketPlatforms,
             orgColors = orgColors,

@@ -2600,12 +2600,14 @@ const TICKET_MODEL_LADDER = (() => {
   return list;
 })();
 
-// Every session of this ticket the fleet still knows about, on hosts BOUND to its
-// org (the startedTicketKeys rule: a drifted host's claim is not this org's work).
+// Every session of this ticket the fleet still knows about, on hosts DECIDED into
+// its org (decidedOrgOf: bound and not actively drifting). That is the served
+// `org` the board's Model row filters on (XERK-1830), so the row and the spawn
+// agree; a drifting host's history only costs a cheaper retry for a beat.
 function ticketSessionRecords(siteKey, issueKey) {
   const out = [];
   for (const a of Object.values(agents)) {
-    if (boundOrgOf(a) !== siteKey) continue;
+    if (decidedOrgOf(a) !== siteKey) continue;
     const mine = (s) => s && s.ticket && s.ticket.key === issueKey && s.ticket.siteKey === siteKey;
     for (const s of a.sessions || []) if (mine(s)) out.push({ rec: s, live: true });
     for (const c of a.closedSessions || []) if (mine(c)) out.push({ rec: c, live: false });

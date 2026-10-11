@@ -23,7 +23,9 @@ UNDELIVERED runs one tier up (haiku → sonnet → opus, capped). Evidence: `doc
     a failed clone or launch never climbs the ladder. A paused sleeper is waiting, not failed.
   - Only ladder aliases count: a model-less session (an older agent, a pre-ladder login-default
     session) is no evidence, so forgotten closed history only ever costs a cheaper retry.
-  - Read only on hosts BOUND to the ticket's org (`boundOrgOf`), the `startedTicketKeys` rule.
+  - Read only on hosts DECIDED into the ticket's org (`decidedOrgOf`) — the served `org` the
+    board's port filters on; `boundOrgOf` there made the row say Haiku while a drifted host's
+    history made Start send Sonnet.
   - Known over-count: a PR opened outside `_scan_pr_line` attribution, or a migration's killed source
     record, reads as an undelivered attempt (rollup).
   - Needs the agent's `closedSessions[].model` (added for this); `normalizeClosedSessions` keeps it

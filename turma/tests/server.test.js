@@ -8159,6 +8159,15 @@ test("XERK-1827: a host bound to another org cannot climb this org's ladder", as
   assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
 });
 
+test("XERK-1830: a drifting host's history never climbs the ladder (row and spawn agree)", async () => {
+  const site = "lad8.atlassian.net";
+  await ladderBeat("lad8", site);                                  // bound to lad8
+  await ladderBeat("lad8", "other8.atlassian.net", { closed: [     // now declares another org
+    { id: "x", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }] });
+  // The board filters on the served (decided) org, "" here, so the hub must too.
+  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
+});
+
 test("XERK-1827: a host whose default runtime is not claude gets no ladder model", async () => {
   const site = "lad7.atlassian.net";
   await ladderBeat("lad7", site);
