@@ -4794,7 +4794,17 @@ class IndexMirror {
   async _apply(op) {
     if (op.t === "session") return this.store.upsertSession(op.row);
     if (op.t === "entries") return this.store.appendEntries(op.transcriptId, op.entries, op.startSeq);
-    if (op.t === "replace") return this.store.replaceEntries(op.transcriptId, op.entries);
+    if (op.t === "replace") {
+      // A heal replace (gated) rewrites the transcript from THIS replica's local copy, so
+      // it applies only while this replica still leads under the term that queued it (XERK-1836).
+      // Once deposed, the new leader's appends would be trimmed. The boot backfill is ungated:
+      // it runs on every replica before the elector exists, and skipping it strands rows.
+      if (!op.gated) return this.store.replaceEntries(op.transcriptId, op.entries);
+      const current = () => this.isLeader() && this.term() === op.term;
+      if (!current()) return;
+      await this.store.replaceEntries(op.transcriptId, op.entries, current);
+      return;
+    }
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
     if (op.t === "repair") {
       // Re-checked between every write. Stopping leaves the sidecar pending; the
@@ -4816,7 +4826,8 @@ class IndexMirror {
       session: (row) => this._push({ t: "session", row }),
       entries: (transcriptId, entries, startSeq) =>
         this._push({ t: "entries", transcriptId, entries, startSeq }),
-      replace: (transcriptId, entries) => this._push({ t: "replace", transcriptId, entries }),
+      replace: (transcriptId, entries, gated) =>
+        this._push({ t: "replace", transcriptId, entries, gated: !!gated, term: this.term() }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
       repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
         this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done, term: this.term() }),

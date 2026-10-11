@@ -69,3 +69,54 @@ test("a replace failing every try is dropped and the queue moves on to the appen
   // The append's seq 3 already holds o3, so it is skipped, as Postgres would.
   assert.deepEqual(await run(3), ["o0", "o1", "o2", "o3", "o4"]);
 });
+
+// XERK-1836: a heal replace queued while this replica led, applied after it was deposed,
+// trimmed the new leader's appends. A gated replace drops once leadership (or its term) is
+// gone; the boot backfill replace is ungated, so a follower still rebuilds from files.
+function gatedStore(rows) {
+  let release = () => {};
+  const gate = new Promise((r) => { release = r; });
+  return {
+    store: {
+      async upsertSession() { await gate; },
+      async replaceEntries(id, entries, proceed) {
+        const ok = proceed || (() => true);
+        for (let i = 0; i < entries.length; i++) { if (!ok()) return false; rows.set(id, rows.get(id) || []); rows.get(id)[i] = entries[i]; }
+        if (!ok()) return false;
+        rows.get(id).length = entries.length;
+        return true;
+      },
+      async appendEntries(id, entries, startSeq) {
+        const cur = (rows.get(id) || []).slice();
+        entries.forEach((e, i) => { cur[startSeq + i] = e; });
+        rows.set(id, cur);
+      },
+    },
+    release,
+  };
+}
+
+test("XERK-1836: a gated replace queued while leading is dropped once deposed", async () => {
+  const rows = new Map([["t", [{ text: "o0" }, { text: "o1" }, { text: "o2" }]]]);
+  const { store, release } = gatedStore(rows);
+  let leader = true;
+  const mirror = new hub.IndexMirror(store, () => leader, () => 1);
+  const sink = mirror.sink();
+  sink.session({ transcriptId: "t" });                   // blocks the drain
+  sink.replace("t", [{ text: "e0" }, { text: "e1" }], true); // heal from a stale local copy
+  leader = false;                                        // deposed before it runs
+  await store.appendEntries("t", [{ text: "n2" }, { text: "b3" }], 2); // new leader's appends
+  release();
+  while (mirror._running || mirror._q.length) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(rows.get("t").map((e) => e.text), ["o0", "o1", "n2", "b3"]);
+});
+
+test("XERK-1836: an ungated replace (boot backfill) still applies on a follower", async () => {
+  const rows = new Map();
+  const { store, release } = gatedStore(rows);
+  const mirror = new hub.IndexMirror(store, () => false, () => 0);
+  mirror.sink().replace("t", [{ text: "f0" }, { text: "f1" }]);
+  release();
+  while (mirror._running || mirror._q.length) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(rows.get("t").map((e) => e.text), ["f0", "f1"]);
+});
