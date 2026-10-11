@@ -153,8 +153,10 @@ def harness_claude_local(prompt, env):
     host, _, _ = url.rpartition("/v1")
     env["ANTHROPIC_BASE_URL"] = host or url
     env["ANTHROPIC_AUTH_TOKEN"] = env["TURMA_LOCAL_API_KEY"]
-    env["ANTHROPIC_MODEL"] = MODEL
-    env["ANTHROPIC_SMALL_FAST_MODEL"] = MODEL
+    # Per-run override (run_policy.py runs several tiers in one process).
+    model = env.get("TURMA_LOCAL_MODEL") or MODEL
+    env["ANTHROPIC_MODEL"] = model
+    env["ANTHROPIC_SMALL_FAST_MODEL"] = model
     # Claude Code does not know this model's window and would otherwise assume
     # 200k and compact far too late. Tracks the server's real per-slot window
     # (see docs/opencode-model-eval-2026-08.md's sizing).
@@ -288,6 +290,12 @@ def _extract_usage(dest, env, started=0):
 
     Multiple models may share a workroot (and therefore a project slug dir),
     so ``started`` limits to JSONL files created during THIS run.
+
+    Claude Code writes one transcript line per content block, each repeating
+    the SAME request's input counters (output is cumulative on the last), so a
+    request is reduced by ``requestId`` to the max of each counter — the unit
+    bench/archive/classify.py established. Summing every line counts a
+    multi-block reply two or three times over.
     """
     config_dir = env.get("CLAUDE_CONFIG_DIR", os.path.expanduser("~/.claude"))
     slug = dest.replace("/", "-")
@@ -296,6 +304,7 @@ def _extract_usage(dest, env, started=0):
               "cache_creation_tokens": 0, "cache_read_tokens": 0}
     if not os.path.isdir(proj_dir):
         return totals
+    per_request = {}
     for jf in glob.glob(os.path.join(proj_dir, "*.jsonl")):
         if started and os.path.getmtime(jf) < started:
             continue
@@ -306,14 +315,21 @@ def _extract_usage(dest, env, started=0):
                     u = (e.get("message") or {}).get("usage")
                     if not u:
                         continue
-                    totals["input_tokens"] += u.get("input_tokens", 0)
-                    totals["output_tokens"] += u.get("output_tokens", 0)
-                    totals["cache_creation_tokens"] += u.get(
-                        "cache_creation_input_tokens", 0)
-                    totals["cache_read_tokens"] += u.get(
-                        "cache_read_input_tokens", 0)
+                    rid = (e.get("requestId") or (e.get("message") or {}).get("id")
+                           or f"{jf}:{len(per_request)}")
+                    got = per_request.setdefault(rid, dict.fromkeys(totals, 0))
+                    for key, field in (("input_tokens", "input_tokens"),
+                                       ("output_tokens", "output_tokens"),
+                                       ("cache_creation_tokens", "cache_creation_input_tokens"),
+                                       ("cache_read_tokens", "cache_read_input_tokens")):
+                        v = u.get(field, 0)
+                        if isinstance(v, int) and v > got[key]:
+                            got[key] = v
         except (json.JSONDecodeError, OSError):
             pass
+    for got in per_request.values():
+        for key in totals:
+            totals[key] += got[key]
     return totals
 
 
@@ -353,14 +369,24 @@ def looks_like_infra_failure(out):
     return not TOOL_ACTIVITY_RE.search(model_output)
 
 
-def one_run(repo, task, hname, attempt, args, workroot, infra_try=1):
-    dest = os.path.join(workroot, f"{hname}-{task['id']}-{attempt}")
+def one_run(repo, task, hname, attempt, args, workroot, infra_try=1,
+            model=None, prompt_prefix=""):
+    """One scored run. `model` overrides TURMA_LOCAL_MODEL for this run only and
+    `prompt_prefix` is prepended to the task prompt — both used by
+    run_policy.py to replay a tier ladder; the plain bench passes neither."""
+    tag = f"{hname}-{model.rsplit('/', 1)[-1].replace(':', '_')}" if model else hname
+    dest = os.path.join(workroot, f"{tag}-{task['id']}-{attempt}")
     rec = {"harness": hname, "task": task["id"], "attempt": attempt,
            "kind": task["kind"], "lang": task["lang"]}
+    if model:
+        rec["model"] = model
     started = time.time()
     try:
         baseline = prepare(repo, task, dest)
-        cmd, env = HARNESSES[hname](task["prompt"] + DELIVERY_CONTRACT, base_env())
+        env0 = base_env()
+        if model:
+            env0["TURMA_LOCAL_MODEL"] = model
+        cmd, env = HARNESSES[hname](prompt_prefix + task["prompt"] + DELIVERY_CONTRACT, env0)
         try:
             rc, out = run(cmd, cwd=dest, timeout=args.cap, env=env)
             rec["timed_out"] = False
@@ -388,7 +414,7 @@ def one_run(repo, task, hname, attempt, args, workroot, infra_try=1):
         if secs > 0 and usage["output_tokens"] > 0:
             rec["tps"] = round(usage["output_tokens"] / secs, 1)
         os.makedirs(args.runs, exist_ok=True)
-        with open(os.path.join(args.runs, f"{hname}-{task['id']}-{attempt}.log"), "w") as fh:
+        with open(os.path.join(args.runs, f"{tag}-{task['id']}-{attempt}.log"), "w") as fh:
             fh.write(" ".join(cmd[:4]) + "\n\n" + out)
     except SetupError as exc:                                   # bootstrap never ran
         rec.update({"error": str(exc)[:300], "setup_failed": True,
@@ -404,7 +430,8 @@ def one_run(repo, task, hname, attempt, args, workroot, infra_try=1):
         print(f"  {hname:<9} {task['id']:<28} attempt {attempt} "
               f"INFRA FAILURE (never reached the model) — retry "
               f"{infra_try + 1}/{args.infra_retries}", flush=True)
-        return one_run(repo, task, hname, attempt, args, workroot, infra_try + 1)
+        return one_run(repo, task, hname, attempt, args, workroot, infra_try + 1,
+                       model=model, prompt_prefix=prompt_prefix)
     if rec.get("setup_failed"):
         print(f"  {hname:<9} {task['id']:<28} attempt {attempt} "
               f"SETUP FAILED (bootstrap never ran) — {rec.get('error')}", flush=True)

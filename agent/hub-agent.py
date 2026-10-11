@@ -19917,6 +19917,31 @@ TICKET_BUG_VERIFY_DIRECTIVE = (
 )
 
 
+# The hub's ticket model ladder (XERK-1827, turma/server.js ticketLadderPick)
+# starts an unpinned ticket on the cheapest tier and, after a session of it ENDED
+# without a PR or a close, starts the next one a tier up. That retry session is
+# told so: the earlier attempt may have pushed a branch worth building on, and
+# knowing the cheaper model already missed is a reason to check the ask again
+# rather than repeat its route. bench/run_policy.py's RETRY_PREAMBLE mirrors this
+# minus the branch sentence (a bench run never pushes).
+TICKET_RETRY_DIRECTIVE = (
+    "A previous session on this ticket ran on {prev} and ended without opening a"
+    " PR or closing the ticket. This session runs on {model}. Check"
+    " origin for a branch that session may have pushed for this ticket and build"
+    " on it only if it helps; otherwise start fresh from the current default"
+    " branch."
+)
+
+# Ticket sessions send sub-agents (QA included) to the cheap tier first
+# (XERK-1827: haiku found 4/5 seeded defects in docs/routing-qa-recall.md, and a
+# sub-agent's own context means it adds no cache gap to its parent). Claude
+# Code's CLAUDE_CODE_SUBAGENT_MODEL is the DEFAULT for an agent that names no
+# model, so a definition pinning its own still wins. Empty turns it off.
+TICKET_SUBAGENT_MODEL = os.environ.get("TURMA_TICKET_SUBAGENT_MODEL", "haiku").strip()
+if TICKET_SUBAGENT_MODEL and not SPAWN_MODEL_RE.fullmatch(TICKET_SUBAGENT_MODEL):
+    TICKET_SUBAGENT_MODEL = ""
+
+
 def build_ticket_prompt(detail, attachments=None, session_cli=True):
     """A fetched ticket -> the initial task prompt for its session: everything the
     agent would otherwise have to go and read, inlined.
@@ -19995,6 +20020,13 @@ def build_ticket_prompt(detail, attachments=None, session_cli=True):
             out.append(f"**{who}**{f' — {when}' if when else ''}\n{body}\n")
 
     out += _ticket_attachment_lines(d, attachments)
+
+    retry_of = d.get("retryOf")
+    if isinstance(retry_of, str) and SPAWN_MODEL_RE.fullmatch(retry_of):
+        model = d.get("retryModel")
+        if not (isinstance(model, str) and SPAWN_MODEL_RE.fullmatch(model)):
+            model = "a different model"
+        out += ["", TICKET_RETRY_DIRECTIVE.format(prev=retry_of, model=model)]
 
     if _ticket_is_bug(d):
         out += ["", TICKET_BUG_VERIFY_DIRECTIVE.format(
@@ -24828,6 +24860,17 @@ class SessionManager:
         self._qwen_guard_managed = managed
         return cfg
 
+    @staticmethod
+    def _ticket_subagent_model(sess, on_local):
+        """The sub-agent default a TICKET session launches with (XERK-1827), or
+        None. Never for a local-model session — a Claude alias 403s the gateway
+        it was failed over to — and never over an operator's own setting."""
+        if not TICKET_SUBAGENT_MODEL or on_local or not sess.get("ticket"):
+            return None
+        if os.environ.get("CLAUDE_CODE_SUBAGENT_MODEL"):
+            return None
+        return TICKET_SUBAGENT_MODEL
+
     def _launch_tmux(self, sess, resume=False, prompt=None, resume_id=None):
         """(Re)launch claude for a session inside its own tmux, detached.
 
@@ -25051,6 +25094,9 @@ class SessionManager:
         # from the manager env; an operator-set GITLAB_HOST wins.
         if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
             env_prefix += f"GITLAB_HOST={shlex.quote(gitlab_base())} "
+        subagent_model = self._ticket_subagent_model(sess, on_local)
+        if subagent_model:
+            env_prefix += f"CLAUDE_CODE_SUBAGENT_MODEL={shlex.quote(subagent_model)} "
         claude_cmd = env_prefix + claude_cmd
         if local_env_file:
             # SOURCED, never inlined and never passed as `tmux -e`: both put the
@@ -25093,6 +25139,8 @@ class SessionManager:
             }
             if gitlab_configured() and not os.environ.get("GITLAB_HOST"):
                 extra_env["GITLAB_HOST"] = gitlab_base()
+            if subagent_model:
+                extra_env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent_model
             if local_env_file:
                 extra_env.update(_read_env_file(local_env_file))
             self._trust_watch(sess)
@@ -26028,7 +26076,8 @@ class SessionManager:
             return None
         return branch
 
-    def spawn_ticket(self, issue_key, cmd_id=None, model=None, agent_type=None):
+    def spawn_ticket(self, issue_key, cmd_id=None, model=None, agent_type=None,
+                     escalated_from=None):
         """Spawn a session to work a ticket (Jira or Azure DevOps) — the board's
         per-card start button.
 
@@ -26135,6 +26184,12 @@ class SessionManager:
         # so a Jira ticket record is byte-for-byte what it always was.
         if branch_base != key:
             ticket["branchBase"] = branch_base
+        # A ladder retry (XERK-1827): the hub names the tier the last session
+        # failed on, and the prompt says so. Charset-checked like a model alias,
+        # since it is interpolated into the prompt; anything else is dropped.
+        if (isinstance(escalated_from, str) and SPAWN_MODEL_RE.fullmatch(escalated_from)
+                and isinstance(detail, dict)):
+            detail = dict(detail, retryOf=escalated_from, retryModel=model)
         # The ticket text goes as the DETAIL, not as a built prompt: the prompt
         # names the attachments this ticket's session downloads for itself, and
         # those land under the session id spawn() is about to mint (XERK-242).
@@ -37547,7 +37602,8 @@ class SessionManager:
                 elif ctype == "spawnTicket":
                     self.spawn_ticket(cmd.get("issueKey"), cmd_id=cid,
                                       model=cmd.get("model"),
-                                      agent_type=cmd.get("agentType"))
+                                      agent_type=cmd.get("agentType"),
+                                      escalated_from=cmd.get("escalatedFrom"))
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
                 elif ctype == "pauseSleeper":
@@ -38616,6 +38672,9 @@ class SessionManager:
                 # and the label must not change just because the session was
                 # killed.
                 "summaryManual": c.get("summaryManual"),
+                # The alias it was spawned on: the hub's ticket model ladder
+                # (XERK-1827) reads a failed ticket session's tier off it.
+                "model": c.get("model"),
                 # Which model this session RAN against (XERK-246). Reading an
                 # ended session's transcript is exactly when "which model wrote
                 # this" matters, and the Ended card's mark reads this field.
