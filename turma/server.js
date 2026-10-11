@@ -22695,7 +22695,7 @@ if (process.env.TURMA_TEST) {
     ticketSpawnModelFields,
     TICKET_MODEL_LADDER_DEFAULT,
     parseTicketModelLadder,
-    __setTicketModelLadder: (list) => { TICKET_MODEL_LADDER = list; },
+    __setTicketModelLadder: (list) => { TICKET_MODEL_LADDER = list; invalidateAgentsCache(); },
     setTicketModel,
     orgModelAliases,
     ticketRuntimes,

@@ -361,7 +361,7 @@ button and the auto-start sweep.
   `hostOptions` (online-first). `{host}` pins, `{auto:true}` releases, allowlist-checked against
   hosts of that org (offline pinnable, other-org not). `findTicketHost` honors it over availability
   ranking; a pinned-but-offline host **refuses with the pin named, never silently reroutes**.
-- **Model row** — which MODEL runs, default the ladder (below); rides `spawnTicket`'s `model`
+- **Model row** — which MODEL runs, default the login's (the ladder below is off unless on); rides `spawnTicket`'s `model`
   (`ticketModelPin`). Alias must be one the org **actually offers** (`orgModelAliases`: its hosts'
   probed `models.available`, non-bracketed, + static aliases); agent re-validates;
   unpinned omits `model`. Menu falls back to static aliases if un-probed, never empty.
