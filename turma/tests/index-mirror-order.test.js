@@ -111,6 +111,16 @@ test("XERK-1836: a gated replace queued while leading is dropped once deposed", 
   assert.deepEqual(rows.get("t").map((e) => e.text), ["o0", "o1", "n2", "b3"]);
 });
 
+test("XERK-1836: a heal queued by a follower still applies (not dropped)", async () => {
+  const rows = new Map();
+  const { store, release } = gatedStore(rows);
+  const mirror = new hub.IndexMirror(store, () => false, () => 0);
+  mirror.sink().replace("t", [{ text: "h0" }], true);
+  release();
+  while (mirror._running || mirror._q.length) await new Promise((r) => setImmediate(r));
+  assert.deepEqual(rows.get("t").map((e) => e.text), ["h0"]);
+});
+
 test("XERK-1836: an ungated replace (boot backfill) still applies on a follower", async () => {
   const rows = new Map();
   const { store, release } = gatedStore(rows);

@@ -4799,7 +4799,9 @@ class IndexMirror {
       // it applies only while this replica still leads under the term that queued it (XERK-1836).
       // Once deposed, the new leader's appends would be trimmed. The boot backfill is ungated:
       // it runs on every replica before the elector exists, and skipping it strands rows.
-      if (!op.gated) return this.store.replaceEntries(op.transcriptId, op.entries);
+      // A heal queued by a FOLLOWER (ingest on a degraded replica) is applied as before: dropping
+      // it left the held entries out of Postgres with nothing to re-run it (XERK-1836 QA).
+      if (!op.gated || !op.leadAtQueue) return this.store.replaceEntries(op.transcriptId, op.entries);
       const current = () => this.isLeader() && this.term() === op.term;
       if (!current()) return;
       await this.store.replaceEntries(op.transcriptId, op.entries, current);
@@ -4827,7 +4829,7 @@ class IndexMirror {
       entries: (transcriptId, entries, startSeq) =>
         this._push({ t: "entries", transcriptId, entries, startSeq }),
       replace: (transcriptId, entries, gated) =>
-        this._push({ t: "replace", transcriptId, entries, gated: !!gated, term: this.term() }),
+        this._push({ t: "replace", transcriptId, entries, gated: !!gated, term: this.term(), leadAtQueue: this.isLeader() }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
       repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
         this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done, term: this.term() }),
