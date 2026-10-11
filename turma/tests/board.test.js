@@ -3569,3 +3569,9 @@ test("board.html keys the open epic panel's repaint on epicPanelSig at BOTH site
   assert.match(html, /epicSig = B\.epicPanelSig\([^]*?, !!run\);/);
   assert.doesNotMatch(html, /B\.epicRunSig\(/, "epicRunSig alone collides armed vs preview");
 });
+
+test("XERK-1840: board.html repaints the open Model row when the hedge's runtimes change", () => {
+  const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "../public/board.html"), "utf8");
+  const m = html.match(/const ladderSig = \(p\) => ([^\n]*)/);
+  assert.ok(m && /p\.elsewhere/.test(m[1]), "ladderSig must key on elsewhere or a qwen host going online never repaints");
+});
