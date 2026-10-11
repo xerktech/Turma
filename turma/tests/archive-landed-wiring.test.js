@@ -175,4 +175,173 @@ test("a byte-only hydrate opens the gate when the byte phase ends (XERK-1523)", 
   assert.deepEqual(await gateCallsOfHydrate(null), [true, false]);
 });
 
+// A transcript whose file holds its lines twice (XERK-1364 damage) — the XERK-1450 seed.
+function seedDuplicated(id) {
+  archive.ingestChunk("nas", id, { repo: "qa", summary: id, endedTs: "2026-07-10T00:00:00Z" }, 0, 10,
+    [{ uuid: "a", role: "user", ts: "t", text: "one" }, { uuid: "b", role: "assistant", ts: "t", text: "two" }]);
+  const jsonl = archive.__walkJsonl().find((p) => p.includes(id));
+  const once = fs.readFileSync(jsonl, "utf8");
+  fs.appendFileSync(jsonl, once);
+  return { jsonl, once };
+}
+
+test("XERK-1450: the hydrate de-dups local copies BEFORE it lists the bucket, then publishes", async () => {
+  const { jsonl, once } = seedDuplicated("t-hyd");
+  const atList = [];
+  const store = { async list() { atList.push(fs.readFileSync(jsonl, "utf8")); return []; },
+    async put() {}, async stat() { return null; }, async getToFile() { return true; } };
+  hub.setArchiveMirror(store, true);
+  try {
+    await hub.hydrateArchive();
+    assert.deepEqual(atList, [once], "the size compare saw the de-duplicated copy");
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    assert.equal(meta.dedupPending, undefined, "the leader pass re-seated the index");
+    assert.equal(archive.sessionRow("t-hyd").msgCount, 2);
+  } finally {
+    hub.setArchiveMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+    archive.setRenderedGate(null);
+  }
+});
+
+test("XERK-1450: a late-landed file is repaired by the wired onLanded", async () => {
+  const { jsonl, once } = seedDuplicated("t-land");
+  const store = { async list() { return []; }, async put() {}, async stat() { return null; },
+    async getToFile(k, dest) { fs.writeFileSync(dest, "x\n"); return true; } };
+  hub.setArchiveMirror(store, true);
+  try {
+    const mirror = hub.getArchiveMirror();
+    // The landed file itself: still blocked while onLanded runs, so the repair waits a tick.
+    mirror._blocked.set(mirror.keyFor(jsonl), "x");
+    const realGet = store.getToFile;
+    store.getToFile = async (k, dest) => { fs.copyFileSync(jsonl, dest); return true; };
+    await mirror.retryBlocked();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(mirror.blockedCount(), 0);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    store.getToFile = realGet;
+  } finally {
+    hub.setArchiveMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+    archive.setRenderedGate(null);
+  }
+});
+
+test("XERK-1450: IndexMirror applies a repair as replace + exact counts, acks it, never re-queues it", async () => {
+  const calls = [];
+  let fail = false;
+  let failed = 0;
+  const store = {
+    async replaceEntries(t, e) { if (fail) { failed += 1; throw new Error("pg down"); } calls.push(["replace", t, e.length]); },
+    async setCounts(t, n, b) { calls.push(["counts", t, n, b]); },
+  };
+  const m = new hub.IndexMirror(store);
+  let acked = 0;
+  m.sink().repair("t1", [{ text: "a" }, { text: "b" }], 2, 99, () => { acked += 1; });
+  await m._drain();
+  await new Promise((r) => setImmediate(r));
+  assert.deepEqual(calls, [["replace", "t1", 2], ["counts", "t1", 2, 99]]);
+  assert.equal(acked, 1);
+  fail = true;
+  calls.length = 0;
+  m.sink().repair("t2", [], 0, 0, () => { acked += 1; });
+  await new Promise((r) => setImmediate(r));
+  await m._drain();
+  assert.deepEqual(calls, []);
+  assert.equal(m._q.length, 0, "a failed repair is dropped, left pending for the next pass");
+  assert.equal(failed, 1, "tried once, never re-queued behind newer ops");
+  // A deposed leader applies nothing and acks nothing.
+  fail = false;
+  calls.length = 0;
+  const demoted = new hub.IndexMirror(store, () => false);
+  demoted.sink().repair("t3", [{ text: "a" }], 1, 9, () => { acked += 1; });
+  await new Promise((r) => setImmediate(r));
+  await demoted._drain();
+  assert.deepEqual(calls, []);
+  assert.equal(acked, 1);
+  assert.equal(acked, 1);
+});
+
+test("XERK-1450: the wired IndexMirror drops a repair queued under an earlier leader term", async () => {
+  const calls = [];
+  const store = {
+    async replaceEntries(t, e) { calls.push("replace"); return true; },
+    async setCounts() { calls.push("counts"); },
+  };
+  hub.setIndexMirror(store, true);
+  try {
+    const m = hub.getIndexMirror();
+    let acked = 0;
+    m._running = true;                         // hold the queue: the repair is queued, not applied
+    m.sink().repair("t1", [{ text: "a" }], 1, 9, () => { acked += 1; });
+    hub.onLeaderPromoted();                    // lease lost and won back: a new term
+    m._running = false;
+    await m._drain();
+    assert.deepEqual(calls, [], "the stale-term repair wrote nothing");
+    assert.equal(acked, 0, "and left its sidecar pending");
+    m.sink().repair("t2", [{ text: "a" }], 1, 9, () => { acked += 1; });
+    await new Promise((r) => setImmediate(r));
+    await m._drain();
+    assert.deepEqual(calls, ["replace", "counts"], "a current-term repair applies");
+    assert.equal(acked, 1);
+  } finally {
+    hub.setIndexMirror(null, false);
+  }
+});
+
+test("XERK-1450: the wired IndexMirror gates each repair step on leadership + term", async () => {
+  // Each step re-checks: a term change during the replace stops setCounts and the
+  // ack; one during setCounts stops the ack; the gate reaches replaceEntries.
+  let flipIn = null;
+  const calls = [];
+  const store = {
+    async replaceEntries(t, e, proceed) {
+      calls.push(["replace", typeof proceed]);
+      if (flipIn === "replace") hub.onLeaderPromoted();
+      return true;
+    },
+    async setCounts() { calls.push(["counts"]); if (flipIn === "counts") hub.onLeaderPromoted(); },
+  };
+  hub.setIndexMirror(store, true);
+  try {
+    const m = hub.getIndexMirror();
+    let acked = 0;
+    const run = async (when) => {
+      flipIn = when; calls.length = 0;
+      m.sink().repair("t", [{ text: "a" }], 1, 9, () => { acked += 1; });
+      await new Promise((r) => setImmediate(r));
+      await m._drain();
+    };
+    await run("replace");
+    assert.deepEqual(calls, [["replace", "function"]], "no setCounts after the term moved");
+    await run("counts");
+    assert.deepEqual(calls, [["replace", "function"], ["counts"]]);
+    assert.equal(acked, 0, "never acked once the term moved");
+    hub.__setLeader({ isLeader: () => false });
+    await run(null);
+    assert.deepEqual(calls, [], "a follower applies nothing");
+    hub.__setLeader(null);
+    await run(null);
+    assert.equal(acked, 1, "the current leader's repair applies and acks");
+  } finally {
+    hub.__setLeader(null);
+    hub.setIndexMirror(null, false);
+  }
+});
+
+test("XERK-1450: a repair stops between batches once its term is gone", async () => {
+  const { PgIndexStore, ENTRY_INSERT_MAX } = require("../index-store.js");
+  const calls = [];
+  let live = true;
+  const pool = { async query() { return { rows: [] }; },
+    async execute(text) { calls.push(text.slice(0, 6)); if (calls.length === 1) live = false; return {}; } };
+  const store = new PgIndexStore(pool, {});
+  store._schemaReady = Promise.resolve();
+  const entries = Array.from({ length: ENTRY_INSERT_MAX + 1 }, (_, i) => ({ text: "e" + i }));
+  assert.equal(await store.replaceEntries("t1", entries, () => live), false);
+  assert.deepEqual(calls, ["INSERT"], "no second batch, and never the trim");
+});
+
 test.after(() => { if (hub.server && hub.server.close) hub.server.close(); });

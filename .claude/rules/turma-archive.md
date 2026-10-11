@@ -196,6 +196,34 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     file alone, so the bucket can hold a `.meta` (and PG a row) newer than its `.jsonl`. Only
     cursors whose `archiveBytes` ≤ the file size are candidates; none left → 0 (`sidecarCursor`).
   - Tests: `XERK-1364` + `XERK-1459` cases in `archive.test.js` and `index-store.test.js`.
+- **Files duplicated BEFORE XERK-1364 are repaired by `dedupArchive`** (XERK-1450): first copy of
+  each EXACT line kept, in order (not `entryKey` — a uuid'd key ignores text).
+  - It SHRINKS a file, which breaks the hydrate's "larger local copy is ahead" rule. So every hydrate
+    first runs it local-only (`publish:false`, nothing mirrored): a follower's stale duplicated copy
+    then de-dups to a prefix of the repaired object and is refetched. First-copy de-dup being
+    prefix-monotone is what makes that safe — keep it that way.
+  - Only the LEADER (or a non-HA boot, or a late landing) publishes: re-PUTs file + sidecar, and
+    sends ONE `repair` mirror op (entries replace + `setCounts`) — the session upsert's GREATEST can
+    never lower the counts. A rendered-blocked file is never published (not the of-record copy).
+  - `dedupPending` is in the sidecar from BEFORE the file shrinks until PG acks the `repair` op, and
+    the next publishing pass redoes a pending file. Never stamp done on the local write alone: the
+    stamp reaches the bucket, and a lost PG op was then never redone (QA). A failed `repair` op is
+    dropped, never re-queued — behind a newer append its entry snapshot would delete it.
+  - Only the LATEST queued repair's ack clears pending (`dedupRepairGen`), and
+    `PgIndexStore.replaceEntries` OVERWRITES ordinals then trims the tail — never DELETE-first.
+    The pool has no transactions; a delete-first replace failing mid-way, after another repair's
+    ack (same pod, or the old leader across a handover) cleared pending, left PG entries empty
+    for good (QA).
+  - `IndexMirror` applies a `repair` only while this replica leads UNDER THE TERM THAT QUEUED IT
+    (`leaderTerm`, bumped by `onLeaderPromoted`), re-checked before every batch, the trim, the
+    counts and the ack. "Am I leader now" is not enough: a lease lost and won back passed it, and
+    the stale repair trimmed the other leader's append (QA). A stopped repair stays pending.
+    The term relies on the elector emitting a promotion after a lapsed lease is re-won
+    (`turma-ha-leader.md`). Residual: a process pause between a check and its write.
+  - `dedupPendingIds` is keyed by id, so never clear it for a file whose row is another file's.
+  - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
+    covered) skips unchanged files.
+  - Tests: the `XERK-1450` cases in `index-store.test.js` and `archive-landed-wiring.test.js`.
 - **`meta` is COERCED before it is bound** (`normalizeMeta`) — every field is agent-supplied and goes
   straight into sqlite (scalars only); a non-scalar stores as nothing rather than poisoning every
   later beat with a 500. The length cap is the receiving half of the same XERK-235 rule as above.

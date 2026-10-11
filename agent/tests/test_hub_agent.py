@@ -5366,6 +5366,7 @@ class ManagerMixin:
             # XERK-1587: every launch/teardown unlinks the session's snapshot.
             ("LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
@@ -7490,6 +7491,218 @@ class TestUsageLedger(ManagerMixin, unittest.TestCase):
         sm._refresh_repo_usage()
         self.assertTrue(any(r["repo"] == "Turma" for r in sm.repo_usage))
         self.assertIsNotNone(sm.host_usage)
+
+
+class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
+    """XERK-1453: the host/repo usage fold, the resume picker and the two
+    sweeps run on the usage worker; a refresh beat only keeps the ledger and
+    stages a snapshot. The first scan after a manager start re-folds every
+    transcript on disk, which inline held beat 0 for seconds to minutes."""
+
+    WT = "/w/.turma/worktrees/Turma/usw"
+
+    def _seed(self, sm, tokens=100_000, name="a.jsonl"):
+        d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.WT))
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, name), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m-" + name, "r-" + name,
+                        "claude-sonnet-4-20250514", tokens, 0),
+        ])
+        sm._remember_usage({"repo": "Turma", "repoPath": "/w/Turma",
+                            "worktreePath": self.WT})
+        return d
+
+    def _wait_ready(self, sm, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with sm._usage_lock:
+                if sm._usage_ready is not None:
+                    return
+            time.sleep(0.01)
+        self.fail("the usage worker never published")
+
+    def _total(self, sm):
+        return sum(r["usage"]["totals"]["input"] for r in sm.repo_usage)
+
+    def test_a_refresh_beat_stages_the_scan_and_never_runs_it_inline(self):
+        sm = self.make_manager()
+        self._seed(sm)
+        sm.registry = []
+        threads = []
+        release = threading.Event()
+        real = sm._usage_scan
+
+        def slow_scan(inputs):
+            threads.append(threading.current_thread().name)
+            release.wait(5)
+            return real(inputs)
+
+        empty = tempfile.mkdtemp(dir=self.tmp)
+        with mock.patch.object(sm, "_usage_scan", slow_scan), \
+             mock.patch.object(ha, "REPOS_ROOT", empty):
+            t0 = time.time()
+            sm.build_payload(0)
+            self.assertLess(time.time() - t0, 3.0, "the beat waited on the scan")
+            self.assertEqual(sm.repo_usage, [])      # nothing landed yet
+            release.set()
+            self._wait_ready(sm)
+            payload = sm.build_payload(1)
+        self.assertEqual(threads, ["usage-scan"])
+        self.assertEqual(self._total(sm), 100_000)
+        self.assertEqual(payload["usage"], sm.host_usage)
+
+    def test_the_ledger_upkeep_stays_on_the_beat(self):
+        # usage_ledger is the beat's to mutate; only a snapshot crosses over.
+        sm = self.make_manager()
+        upkeep = []
+        with mock.patch.object(sm, "_maintain_usage_ledger",
+                               lambda: upkeep.append(threading.current_thread())), \
+             mock.patch.object(sm, "_usage_scan", lambda inputs: {"gen": inputs["gen"]}):
+            sm._stage_repo_usage()
+        self.assertEqual(upkeep, [threading.current_thread()])
+        with sm._usage_lock:
+            pass
+        inputs = sm._usage_scan_inputs()
+        self.assertIsNot(inputs["ledger"], sm.usage_ledger)
+        self.assertIsNot(inputs["baseline"], sm.usage_baseline)
+
+    def test_the_worker_folds_into_its_own_store(self):
+        # Never the per-session store the beat folds into: two threads folding
+        # one accumulator would double-count.
+        sm = self.make_manager()
+        self._seed(sm)
+        sm._refresh_repo_usage()
+        slug = ha._project_slug(self.WT)
+        self.assertIn(slug, sm._agg_slug_usage)
+        self.assertNotIn(slug, sm.slug_usage)
+
+    def test_a_scan_staged_before_an_import_window_never_publishes(self):
+        # The hub keeps a day's high-water mark, so a scan that may have counted
+        # a migrated-in transcript's source turns must be dropped, and the next
+        # one must re-fold that slug under the new window.
+        sm = self.make_manager()
+        self._seed(sm)
+        sm._refresh_repo_usage()
+        self.assertEqual(self._total(sm), 100_000)
+        stale_inputs = sm._usage_scan_inputs()
+        slug = ha._project_slug(self.WT)
+        self._seed(sm, tokens=7, name="b.jsonl")          # the unpacked bytes
+        sm._mark_imported_usage("b", slug, None)
+        stale = sm._usage_scan(stale_inputs)               # counts them
+        sm._apply_usage_scan(stale)
+        self.assertEqual(self._total(sm), 100_000, "a pre-window scan published")
+        fresh = sm._usage_scan_inputs()
+        self.assertEqual(fresh["refold"], {slug})
+        sm._apply_usage_scan(sm._usage_scan(fresh))
+        self.assertEqual(self._total(sm), 100_000)         # b.jsonl excluded
+
+    def test_a_replaced_snapshot_keeps_its_refold(self):
+        sm = self.make_manager()
+        sm._usage_inputs = {"refold": {"s1"}}
+        sm._usage_refold = {"s2"}
+        with mock.patch.object(ha.threading.Thread, "start"):
+            sm._stage_repo_usage()
+        self.assertEqual(sm._usage_inputs["refold"], {"s1", "s2"})
+
+    def test_staging_never_raises_onto_the_beat(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            sm._stage_repo_usage()                          # no raise
+        self.assertIsNotNone(sm._usage_inputs)              # retried next refresh
+
+    def _resumable_row(self, tid="t1", repo="Turma"):
+        return {"transcriptId": tid, "cwd": self.WT, "repo": repo, "root": False,
+                "origin": "worktree", "slug": ha._project_slug(self.WT),
+                "summary": "s", "endedTs": "2026-07-01T10:00:00Z"}
+
+    def test_a_restarted_manager_reports_the_last_picker_before_its_first_scan(self):
+        # The hub counts a ticket whose only session is in `resumable` as
+        # started (startedTicketKeys); an empty list after a restart let
+        # auto-start spawn it a second time.
+        sm = self.make_manager()
+        sm.ticket_ledger["t1"] = {"key": "ENG-5"}
+        sm._apply_usage_scan({"gen": sm._usage_gen,
+                              "resumable": {"Turma": [self._resumable_row()]}})
+        fresh = self.make_manager()             # its __init__ loads the cache
+        self.assertEqual(fresh.resumable["Turma"][0]["transcriptId"], "t1")
+        fresh.ticket_ledger = {"t1": {"key": "ENG-5"}}
+        self.assertEqual(fresh._load_resumable_cache()["Turma"][0]["ticket"],
+                         {"key": "ENG-5"})            # from the ledger, not the file
+
+    def test_a_start_with_no_cache_builds_the_picker_inline_once(self):
+        # The upgrade restart onto this code has no cache on any host.
+        sm = self.make_manager()
+        self.assertFalse(sm._resumable_known)
+        row = {"Turma": [self._resumable_row()]}
+        calls = []
+        with mock.patch.object(sm, "_resumable_report",
+                               lambda inputs=None: calls.append(inputs) or row), \
+             mock.patch.object(ha.threading.Thread, "start",
+                               lambda self_: calls.append("worker-start")):
+            sm._stage_repo_usage()
+            self.assertEqual(sm.resumable, row)        # on beat 0's payload
+            sm._stage_repo_usage()
+        # Inline once, and BEFORE the worker that owns the read caches starts.
+        self.assertEqual(calls[:2], [None, "worker-start"])
+        self.assertEqual(calls.count(None), 1)
+        self.assertTrue(os.path.exists(ha.RESUMABLE_CACHE_PATH))
+        self.assertTrue(self.make_manager()._resumable_known)
+
+    def test_a_cache_whose_rows_were_all_junk_is_no_answer(self):
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump({"Turma": [dict(self._resumable_row("../x"))]}, f)
+        self.assertFalse(self.make_manager()._resumable_known)
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump({}, f)                           # nothing to resume: an answer
+        self.assertTrue(self.make_manager()._resumable_known)
+
+    def test_the_cache_is_untrusted(self):
+        # ~/.turma is session-writable: junk is dropped, ticket/prs never read
+        # from the file, and a FIFO does not block the load.
+        sm = self.make_manager()
+        bad = dict(self._resumable_row(), ticket={"key": "FORGED-1"})
+        rows = {"Turma": [bad, dict(self._resumable_row("x y")),
+                          dict(self._resumable_row("t2"), repo="Other"),
+                          dict(self._resumable_row("t3"), cwd=7), "junk"],
+                "Bad": "nope"}
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump(rows, f)
+        got = sm._load_resumable_cache()
+        self.assertEqual([e["transcriptId"] for e in got["Turma"]], ["t1"])
+        self.assertIsNone(got["Turma"][0]["ticket"])
+        os.remove(ha.RESUMABLE_CACHE_PATH)
+        os.mkfifo(ha.RESUMABLE_CACHE_PATH)
+        self.assertEqual(sm._load_resumable_cache(), {})
+
+    def test_an_import_mid_scan_still_publishes_the_picker_and_rescans(self):
+        sm = self.make_manager()
+        self._seed(sm)
+        stale_inputs = sm._usage_scan_inputs()
+        sm._mark_imported_usage("b", ha._project_slug(self.WT), None)
+        stale = sm._usage_scan(stale_inputs)
+        stale["resumable"] = {"Turma": [self._resumable_row()]}
+        sm._apply_usage_scan(stale)
+        self.assertEqual(sm.repo_usage, [])                 # usage voided
+        self.assertIn("Turma", sm.resumable)                # picker kept
+        self.assertTrue(sm._usage_restage)
+        with mock.patch.object(sm, "_stage_repo_usage") as stage:
+            sm.build_payload(1)                             # not a refresh beat
+        stage.assert_called_once_with()
+        self.assertFalse(sm._usage_restage)
+
+    def test_the_worker_store_is_pruned_to_ledger_slugs(self):
+        sm = self.make_manager()
+        sm._agg_slug_usage["gone-slug"] = {"acc": ha._UsageAcc(), "offsets": {}}
+        sm._refresh_repo_usage()
+        self.assertNotIn("gone-slug", sm._agg_slug_usage)
+
+    def test_a_failed_part_keeps_the_previous_answer(self):
+        sm = self.make_manager()
+        sm.resumable = {"Turma": ["kept"]}
+        with mock.patch.object(sm, "_resumable_report", side_effect=OSError("boom")):
+            sm._refresh_repo_usage()
+        self.assertEqual(sm.resumable, {"Turma": ["kept"]})
 
 
 class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
@@ -16184,6 +16397,77 @@ class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
         self._session(sm)
         self._answer(sm, 4)          # the permission dialog offers 1-3
         self.assertEqual(self.run_calls, [])
+
+    # XERK-1831: the option NUMBER existing is not enough — "1. Yes" exists on
+    # every permission dialog, so an answer made against dialog A must never
+    # approve a different dialog B that replaced it before delivery.
+    def _answer_stamped(self, sm, number, dialog_id, cap=PANE_PERMISSION_DIALOG):
+        with mock.patch.object(ha, "_capture_pane", return_value=cap):
+            sm.answer_pane_prompt("abcde", number, dialog_id)
+
+    def test_an_answer_stamped_with_the_dialog_on_screen_is_typed(self):
+        sm = self.make_manager()
+        self._session(sm)
+        shown = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
+        self._answer_stamped(sm, 1, shown["id"])
+        self.assertEqual(
+            self.run_calls, [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "1"]])
+
+    def test_an_answer_for_a_different_dialog_is_dropped(self):
+        # The operator answered "Bash: ls"; by delivery the pane shows a
+        # different command under the same "Do you want to proceed?" question.
+        sm = self.make_manager()
+        self._session(sm)
+        answered = ha.parse_pane_prompt(
+            PANE_PERMISSION_DIALOG.replace("touch /tmp/permtest-marker", "ls"))
+        self._answer_stamped(sm, 1, answered["id"])
+        self.assertEqual(self.run_calls, [])
+
+    def test_two_long_commands_differing_past_the_detail_cut_are_different_dialogs(self):
+        # `detail` is a capped window (14 lines / 800 chars); the id covers the
+        # whole block, so a revised script that differs only past the cut is a
+        # different dialog — QA's repro of the first, detail-keyed design.
+        body = "".join(f"   print('line {n:03d} of a long heredoc script')\n" for n in range(40))
+        def dialog(first):
+            # The window keeps the lines NEAREST the question, so the two
+            # differ at the top of the script.
+            return ("────────────────────────────────────────────\n Bash command\n\n"
+                    f"   python3 - <<'EOF'\n   {first}\n" + body + "   EOF\n\n"
+                    " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
+        safe = ha.parse_pane_prompt(dialog("print('ok')"))
+        evil = ha.parse_pane_prompt(dialog("os.system('rm -rf ~/work')"))
+        self.assertEqual(safe["detail"], evil["detail"])     # the window can't tell them apart
+        self.assertNotEqual(safe["id"], evil["id"])
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer_stamped(sm, 1, safe["id"], cap=dialog("os.system('rm -rf ~/work')"))
+        self.assertEqual(self.run_calls, [])
+
+    def test_the_id_ignores_the_cursor_and_is_stable_across_reads(self):
+        a = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
+        moved = PANE_PERMISSION_DIALOG.replace(" ❯ 1. Yes", "   1. Yes").replace(
+            "   3. No", " ❯ 3. No")
+        self.assertEqual(a["id"], ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)["id"])
+        self.assertEqual(a["id"], ha.parse_pane_prompt(moved)["id"])
+        self.assertRegex(a["id"], r"^[0-9a-f]{32}$")
+
+    def test_an_unstamped_answer_keeps_the_number_check(self):
+        # An older hub sends no dialog id: the agent still answers on the
+        # number alone rather than refusing every answer it relays.
+        sm = self.make_manager()
+        self._session(sm)
+        self._answer(sm, 1)
+        self.assertEqual(
+            self.run_calls, [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "1"]])
+
+    def test_handle_commands_forwards_the_stamp(self):
+        sm = self.make_manager()
+        self._session(sm)
+        with mock.patch.object(sm, "answer_pane_prompt") as answer:
+            sm.handle_commands([{"type": "answerPanePrompt", "cmdId": "c1",
+                                 "sessionId": "abcde", "optionNumber": 1,
+                                 "dialogId": "ab" * 16}])
+        answer.assert_called_once_with("abcde", 1, "ab" * 16)
 
     def test_noop_for_stopped_or_unknown_session(self):
         sm = self.make_manager()
@@ -26030,6 +26314,7 @@ class TestPruneRepo(unittest.TestCase):
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
@@ -36320,7 +36605,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model=None, agent_type=None)
+            "PROJ-7", cmd_id="c9", model=None, agent_type=None, escalated_from=None)
 
     def test_handle_commands_carries_the_model_pin(self):
         # The hub's per-ticket model pin (XERK-123) rides the command; the agent
@@ -36330,7 +36615,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "model": "opus", "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model="opus", agent_type=None)
+            "PROJ-7", cmd_id="c9", model="opus", agent_type=None, escalated_from=None)
 
     def test_handle_commands_carries_the_runtime_pin(self):
         # The hub's per-ticket runtime pin (XERK-473) rides the command as
@@ -36341,7 +36626,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "agentType": "dsh", "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model=None, agent_type="dsh")
+            "PROJ-7", cmd_id="c9", model=None, agent_type="dsh", escalated_from=None)
 
     def test_a_model_pin_lands_on_the_session_and_command_line(self):
         sm = self.make_ticket_manager()
@@ -36381,6 +36666,57 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sess = sm.registry[0]
         self.assertIsNone(sess["model"])            # omit --model = login default
         self.assertNotIn("--model", self._launches()[-1][-1])
+
+    def test_a_ladder_retry_tells_the_session_which_tier_missed(self):
+        # XERK-1827: the hub names the tier the last session failed on; the
+        # prompt says so, and the model rides --model like any pin.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", model="sonnet", escalated_from="haiku")
+        cmd = self._launches()[-1][-1]
+        self.assertIn("--model sonnet", cmd)
+        self.assertIn("A previous session on this ticket ran on haiku", cmd)
+        self.assertIn("This session runs on sonnet", cmd)
+
+    def test_a_first_attempt_and_a_hostile_escalated_from_carry_no_retry_line(self):
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", model="haiku")
+        self.assertNotIn("A previous session", self._launches()[-1][-1])
+        sm2 = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm2.spawn_ticket("PROJ-7", model="haiku", escalated_from="x'; rm -rf /")
+        self.assertNotIn("A previous session", self._launches()[-1][-1])
+
+    def test_a_ticket_session_sends_subagents_to_the_cheap_tier(self):
+        # XERK-1827: CLAUDE_CODE_SUBAGENT_MODEL is the default for agents that
+        # name no model; only ticket sessions get it.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()), \
+                mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
+            sm.spawn_ticket("PROJ-7")
+        self.assertIn("CLAUDE_CODE_SUBAGENT_MODEL=haiku ", self._launches()[-1][-1])
+
+    def test_subagent_model_is_never_set_off_ticket_local_or_over_the_operator(self):
+        f = ha.SessionManager._ticket_subagent_model
+        with mock.patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CLAUDE_CODE_SUBAGENT_MODEL", None)
+            self.assertIsNone(f({}, False))                       # bare session
+            self.assertIsNone(f({"ticket": {"key": "P-1"}}, True))  # failed over
+            self.assertEqual(f({"ticket": {"key": "P-1"}}, False), "haiku")
+            os.environ["CLAUDE_CODE_SUBAGENT_MODEL"] = "opus"
+            self.assertIsNone(f({"ticket": {"key": "P-1"}}, False))
+
+    def test_an_ended_ticket_session_reports_its_model(self):
+        # The hub's ladder reads a failed session's tier off closedSessions.
+        sm = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+            sm.spawn_ticket("PROJ-7", model="haiku")
+        sm.kill(sm.registry[0]["id"])
+        closed = sm._closed_payload()
+        self.assertEqual(closed[0]["model"], "haiku")
+        self.assertEqual(closed[0]["ticket"]["key"], "PROJ-7")
 
     def test_hostile_ticket_text_cannot_break_out_of_the_command_line(self):
         # Ticket text is the one genuinely untrusted input here: unlike an

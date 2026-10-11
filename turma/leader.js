@@ -214,9 +214,20 @@ class LeaderElector {
     }
   }
 
-  // Set/clear leadership, firing onChange only on a real edge.
+  // Set/clear leadership, firing onChange only on a real edge. Re-acquiring after our
+  // own leadership had self-expired (isLeader() went false with `_leader` still set: a
+  // stalled loop) IS an edge: another replica may have led — and released — meanwhile,
+  // so the promotion work (registry re-sync, hydrates, the archive repair's leader
+  // term, XERK-1450) must re-run. Emit the demote/promote pair that lapse never fired.
   _setLeader(next) {
+    const lapsed = next && this._leader && Date.now() - this._lastRenew > this.leaseSeconds * 1000;
     if (next) this._lastRenew = Date.now();
+    if (lapsed) {
+      this._log(`leader: re-acquired lease ${this.leaseName} as ${this.identity} after it lapsed`);
+      this._emit(false);
+      this._emit(true);
+      return;
+    }
     if (next === this._leader) return;
     this._leader = next;
     this._log(

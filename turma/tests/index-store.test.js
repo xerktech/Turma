@@ -167,12 +167,21 @@ class MemIndexStore {
     this.entries.set(tid, m);
   }
   deleteTranscript(tid) { this.sessions.delete(tid); this.entries.delete(tid); }
+  // Mirrors PgIndexStore.setCounts: an exact UPDATE, the one write that may lower.
+  setCounts(tid, msgCount, archiveBytes) {
+    const r = this.sessions.get(tid);
+    if (r) this.sessions.set(tid, { ...r, msgCount, archiveBytes });
+  }
   // The archive.js sink shape.
   sink() {
     return {
       session: (r) => this.upsertSession(r),
       entries: (t, e, s) => this.appendEntries(t, e, s),
       replace: (t, e) => this.replaceEntries(t, e),
+      repair: (t, e, n, b, done) => {
+        if (this.dropRepairs) return;           // a lost mirror op (pod died, retries spent)
+        this.replaceEntries(t, e); this.setCounts(t, n, b); if (done) done();
+      },
     };
   }
   // Mirrors PgIndexStore.hydrateInto: reset once, then batch-apply sessions + entries.
@@ -1167,4 +1176,231 @@ test("XERK-1364 pg mode: a handover mid-re-send keeps de-duplicating", async () 
     A.setIndexMode(null);
     pgTeardown();
   }
+});
+
+// ============================================================================
+// XERK-1450: repairing `.jsonl` files duplicated before XERK-1364's re-send de-dup.
+// ============================================================================
+
+// A transcript whose file holds a whole re-sent copy appended after the original —
+// the XERK-1364 damage shape — with the row/sidecar counting it once, as in prod.
+function duplicatedTranscript(id) {
+  const pr = (ts) => ({ uuid: "pr-link:https://x/pr/1", role: "assistant", ts, text: "PR #1" });
+  const b1 = [ent("d0", "user", "first"), pr("2026-07-10T00:01:00Z"),
+    ent("d1", "assistant", "second"), pr("2026-07-10T00:02:00Z")];
+  const len1 = Buffer.byteLength(JSON.stringify(b1));
+  archive.ingestChunk("nas", id, META, 0, len1, b1, "acme");
+  const jsonl = path.join(process.env.ARCHIVE_DIR, archive.sessionRow(id).filePath);
+  const once = fs.readFileSync(jsonl, "utf8");
+  fs.appendFileSync(jsonl, once + once.split("\n").slice(0, 2).join("\n") + "\n");
+  return { jsonl, once, len1 };
+}
+
+test("XERK-1450 pg mode: the leader repair de-dups the file, lowers PG counts, re-seats entries", async () => {
+  const mem = pgSetup();
+  const noted = [];
+  archive.setBlobSink((p) => noted.push(p));
+  try {
+    const { jsonl, once, len1 } = duplicatedTranscript("t-dup");
+    // Postgres holds the inflated figures a GREATEST upsert can never lower.
+    mem.upsertSession({ ...mem.sessions.get("t-dup"), msgCount: 10, archiveBytes: 4096 });
+    mem.appendEntries("t-dup", [ent("d0", "user", "first")], 4);
+    noted.length = 0;
+
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once, "first copies kept, in order");
+    const bytes = Buffer.byteLength(once);
+    const row = archive.sessionRow("t-dup");
+    assert.equal(row.msgCount, 4);
+    assert.equal(archive.manifestCursors("nas", [{ transcriptId: "t-dup" }], "acme")["t-dup"], len1,
+      "the agent cursor is untouched");
+    assert.equal(mem.sessions.get("t-dup").msgCount, 4);
+    assert.equal(mem.sessions.get("t-dup").archiveBytes, bytes);
+    assert.equal(mem.entries.get("t-dup").size, 4);
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    assert.equal(meta.archiveBytes, bytes);
+    assert.equal(meta.msgCount, 4);
+    assert.equal(meta.bytesStored, len1);
+    assert.equal(meta.dedupPending, undefined, "cleared once Postgres acked the repair");
+    assert.deepEqual([...new Set(noted)].sort(), [jsonl, jsonl + ".meta"].sort(), "both re-PUT to the bucket");
+
+    // Idempotent, and the stamp means the next pass does not re-read the file.
+    noted.length = 0;
+    assert.equal(archive.dedupArchive({ publish: true }), 0);
+    assert.deepEqual(noted, []);
+
+    // The next chunk appends at the cursor without tripping XERK-1364's suspect path.
+    const b2 = [ent("d2", "user", "third")];
+    archive.ingestChunk("nas", "t-dup", META, len1, len1 + 50, b2, "acme");
+    assert.equal(fs.readFileSync(jsonl, "utf8").trim().split("\n").length, 5);
+    assert.equal(mem.entries.get("t-dup").size, 5);
+  } finally { archive.setBlobSink(null); pgTeardown(); }
+});
+
+test("XERK-1450: a local-only pass rewrites the copy but mirrors nothing", async () => {
+  const mem = pgSetup();
+  const noted = [];
+  try {
+    const { jsonl, once } = duplicatedTranscript("t-local");
+    const pgBefore = { ...mem.sessions.get("t-local") };
+    const entriesBefore = mem.entries.get("t-local").size;
+    archive.setBlobSink((p) => noted.push(p));
+    assert.equal(archive.dedupArchive({ publish: false }), 1);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    assert.deepEqual(noted, [], "a follower never pushes its copy");
+    assert.deepEqual(mem.sessions.get("t-local"), pgBefore);
+    assert.equal(mem.entries.get("t-local").size, entriesBefore);
+    // Left pending, so a leader that keeps this copy still re-seats its index.
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true);
+    archive.setBlobSink(null);
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "the publisher redoes a pending file");
+    assert.equal(mem.sessions.get("t-local").msgCount, 4);
+    assert.equal(mem.entries.get("t-local").size, 4);
+  } finally { archive.setBlobSink(null); pgTeardown(); }
+});
+
+test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl, once } = duplicatedTranscript("t-lost");
+    mem.upsertSession({ ...mem.sessions.get("t-lost"), msgCount: 10, archiveBytes: 4096 });
+    mem.dropRepairs = true;
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    assert.equal(mem.sessions.get("t-lost").msgCount, 10, "Postgres never got it");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true);
+    mem.dropRepairs = false;
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "the clean-but-pending file is redone");
+    assert.equal(mem.sessions.get("t-lost").msgCount, 4);
+    assert.equal(mem.sessions.get("t-lost").archiveBytes, Buffer.byteLength(once));
+    assert.equal(mem.entries.get("t-lost").size, 4);
+    assert.equal(archive.dedupArchive({ publish: true }), 0, "then settled");
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1450 pg mode: only the latest queued repair's ack clears pending", async () => {
+  const mem = pgSetup();
+  const queued = [];
+  try {
+    const { jsonl } = duplicatedTranscript("t-gen");
+    archive.setIndexSink({ ...mem.sink(), repair: (...a) => queued.push(a) });
+    assert.equal(archive.dedupArchive({ publish: true }), 1);   // repair A
+    assert.equal(archive.dedupArchive({ publish: true }), 1);   // still pending: repair B
+    assert.equal(queued.length, 2);
+    queued[0][4]();                                              // A acks; B then fails
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true,
+      "A's ack must not clear what B still owes");
+    archive.setIndexSink(mem.sink());
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "so the next pass redoes it");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, undefined);
+    // Acked: a later ingest's sidecar carries no pending flag.
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    archive.ingestChunk("nas", "t-gen", META, meta.bytesStored, meta.bytesStored + 9,
+      [ent("g9", "user", "later")], "acme");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, undefined);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1450 pg mode: a same-id stray file never clears the real file's pending repair", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl, len1 } = duplicatedTranscript("t-stray");
+    const stray = path.join(process.env.ARCHIVE_DIR, "zzz", path.basename(jsonl));
+    fs.mkdirSync(path.dirname(stray), { recursive: true });
+    fs.copyFileSync(jsonl, stray);
+    fs.copyFileSync(jsonl + ".meta", stray + ".meta");
+    mem.dropRepairs = true;
+    assert.equal(archive.dedupArchive({ publish: true }), 2);
+    archive.ingestChunk("nas", "t-stray", META, len1, len1 + 50, [ent("d2", "user", "third")], "acme");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true);
+    mem.dropRepairs = false;
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "the real file is redone");
+    assert.equal(mem.entries.get("t-stray").size, 5);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1450 pg mode: an ingest while the repair is unacked keeps it pending", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl, len1 } = duplicatedTranscript("t-mid");
+    mem.dropRepairs = true;
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    archive.ingestChunk("nas", "t-mid", META, len1, len1 + 50, [ent("d2", "user", "third")], "acme");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true);
+    mem.dropRepairs = false;
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "redone, though the file is clean");
+    assert.equal(mem.entries.get("t-mid").size, 5);
+    assert.equal(mem.entries.get("t-mid").get(4).uuid, "d2");
+    assert.equal(mem.sessions.get("t-mid").msgCount, 5);
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, undefined);
+  } finally { pgTeardown(); }
+});
+
+test("XERK-1450: kept lines are written back byte-for-byte; a rendered-blocked file is skipped", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl } = duplicatedTranscript("t-bytes");
+    const bad = Buffer.from([0x7b, 0xff, 0xfe, 0x7d, 0x0a]);            // invalid UTF-8 line
+    const torn = Buffer.from('{"uuid":"torn"');                          // no trailing newline
+    const base = fs.readFileSync(jsonl);
+    fs.writeFileSync(jsonl, Buffer.concat([base, bad, bad, torn]));
+    archive.setRenderedGate((p) => p === jsonl);
+    assert.equal(archive.dedupArchive({ publish: true }), 0, "not landed: not the of-record copy");
+    archive.setRenderedGate(null);
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    const once = Buffer.from(base.toString("latin1").split("\n").slice(0, 4).join("\n") + "\n", "latin1");
+    assert.deepEqual(fs.readFileSync(jsonl), Buffer.concat([once, bad, torn]));
+    assert.ok(mem.sessions.get("t-bytes"));
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
+});
+
+test("XERK-1450 sqlite mode: the repair re-seats the local row and search index", async () => {
+  archive.closeDb();
+  fs.rmSync(process.env.ARCHIVE_DIR, { recursive: true, force: true });
+  try {
+    const { jsonl, once } = duplicatedTranscript("t-sq");
+    assert.equal(archive.dedupArchive({ publish: true }), 1);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), once);
+    const row = archive.sessionRow("t-sq");
+    assert.equal(row.msgCount, 4);
+    const res = await archive.searchArchive("second");
+    const hits = res.groups.flatMap((g) => g.matches).filter((m) => m.transcriptId === "t-sq");
+    assert.equal(hits.length, 1, "searchable once, not once per copy");
+  } finally { archive.closeDb(); }
+});
+
+test("PgIndexStore.replaceEntries: overwrites in place, then trims — never deletes first (XERK-1450)", async () => {
+  const pool = spyPool();
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  await store.ensureSchema();
+  pool.calls.length = 0;
+  await store.replaceEntries("t1", [ent("u0", "user", "a"), ent("u1", "user", "b")]);
+  const exec = pool.calls.filter((c) => c.m === "execute");
+  assert.equal(exec.length, 2);
+  assert.match(exec[0].text, /^INSERT INTO archive_entries .* ON CONFLICT \(transcript_id, seq\) DO UPDATE SET uuid = EXCLUDED\.uuid, role = EXCLUDED\.role, ts = EXCLUDED\.ts, text = EXCLUDED\.text$/,
+    "every column is overwritten, text included (tsv is generated from it)");
+  assert.match(exec[1].text, /^DELETE FROM archive_entries WHERE transcript_id = \$1 AND seq >= \$2$/);
+  assert.deepEqual(exec[1].params, ["t1", 2]);
+  // An empty replace is just the trim (every row).
+  pool.calls.length = 0;
+  await store.replaceEntries("t1", []);
+  assert.deepEqual(pool.calls.filter((c) => c.m === "execute").map((c) => c.params), [["t1", 0]]);
+  // A gate that closes after the last batch stops the trim (and reports it).
+  pool.calls.length = 0;
+  let open = true;
+  const gate = () => { const was = open; open = false; return was; };
+  assert.equal(await store.replaceEntries("t1", [ent("u0", "user", "a")], gate), false);
+  assert.deepEqual(pool.calls.filter((c) => c.m === "execute").map((c) => c.text.slice(0, 6)), ["INSERT"]);
+  // Appends still never overwrite a held ordinal.
+  assert.match(buildEntryInsert("archive", "t1", [ent("u", "user", "x")], 0).text, /DO NOTHING$/);
+});
+
+test("PgIndexStore.setCounts: an exact UPDATE, never GREATEST", async () => {
+  const pool = spyPool();
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  await store.setCounts("t1", 3, 120);
+  const c = pool.calls.find((x) => x.m === "execute" && /^UPDATE archive_sessions/.test(x.text));
+  assert.ok(c, "the UPDATE was issued");
+  assert.doesNotMatch(c.text, /GREATEST/);
+  assert.deepEqual(c.params, ["t1", 3, 120]);
 });

@@ -324,7 +324,11 @@ async function hydrateGuards() {
 // Fired when THIS replica acquires leadership (and once at boot when it is the
 // leader). Re-hydrates the singleton state the old leader owned so the handover
 // re-fires nothing: the migration record Map (its own hydrate) and the guards.
+// Bumped on every promotion: a repair queued under an earlier term must not apply,
+// even on a replica that has since won the lease back (XERK-1450).
+let leaderTerm = 0;
 function onLeaderPromoted() {
+  leaderTerm += 1;
   if (!HA_ON) return;
   // XERK-919: become the single writer only after re-reading the registry the old
   // leader flushed before it released the lease (a watch event can be missed or
@@ -2550,6 +2554,96 @@ function setTicketModel(siteKey, issueKey, model) {
   sseBroadcast("ticketModels", ticketModels);
 }
 
+// ---- ticket model ladder (XERK-1827) ---------------------------------------
+// An UNPINNED claude ticket session starts on the cheapest tier, and each start
+// after a session of the ticket ENDED UNDELIVERED moves one tier up. The XERK-445
+// replay set measured haiku-4-5 solving 72% at ~1/5 of opus's cost, haiku and
+// sonnet each solving 3 tasks the other missed, and opus as a quota-limited last
+// resort (docs/routing-spike-phase2-3.md). Per SESSION, never per turn: a switch
+// mid-conversation makes the new model re-cache every turn it missed.
+//   - The ladder is derived from the fleet payload, not stored: a session of the
+//     ticket that is no longer running (killed, exited, errored) with NO PR and NO
+//     close-ticket outcome is a failed attempt on its `model`. The next start runs
+//     one tier above the highest failed one, capped at the top.
+//   - Only ladder models count. A session with no recorded model (an agent
+//     predating this, or a pre-ladder login-default session) is no evidence, so a
+//     host that forgets its closed history only ever costs a cheaper retry.
+//   - A paused sleeper (XERK-1575) is waiting, not failed, and a live `error`
+//     record (a failed clone/launch, a crashed tmux) is not finished: it holds
+//     its slot and Start resumes it, so infra trouble never climbs the ladder.
+//   - The operator's model pin (XERK-123) always wins, and dsh/qwen sessions are
+//     never laddered (their model is the host's endpoint, not a Claude alias) —
+//     a runtime pin, or an unpinned ticket routed to a host whose DEFAULT
+//     runtime is not claude (TURMA_DEFAULT_RUNTIME, XERK-521).
+// TICKET_MODEL_LADDER (comma list of aliases) replaces it; set it to "off" to
+// return unpinned tickets to the login's default model. bench/run_policy.py's
+// "ladder" policy replays exactly this list — keep the two equal (pinned by
+// bench/tests/test_policy.py).
+const TICKET_MODEL_LADDER_DEFAULT = ["haiku", "sonnet", "opus"];
+const TICKET_MODEL_LADDER = (() => {
+  const raw = (process.env.TICKET_MODEL_LADDER || "").trim().toLowerCase();
+  if (!raw) return TICKET_MODEL_LADDER_DEFAULT;
+  if (raw === "off" || raw === "none") return [];
+  const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
+  const list = parts.filter((s) => /^[a-z0-9.-]{1,40}$/.test(s));
+  if (list.length !== parts.length) {
+    console.warn(`TICKET_MODEL_LADDER: dropped ${parts.length - list.length} entr(ies) that are not a plain model alias`);
+  }
+  const odd = list.filter((s) => !["opus", "sonnet", "haiku", "fable"].includes(s));
+  if (odd.length) {
+    console.warn(`TICKET_MODEL_LADDER: ${odd.join(", ")} is not a static alias; a host that has not probed it refuses the spawn`);
+  }
+  if (!list.length) {
+    console.warn(`TICKET_MODEL_LADDER=${JSON.stringify(raw)} names no usable alias; using the default`);
+    return TICKET_MODEL_LADDER_DEFAULT;
+  }
+  return list;
+})();
+
+// Every session of this ticket the fleet still knows about, on hosts BOUND to its
+// org (the startedTicketKeys rule: a drifted host's claim is not this org's work).
+function ticketSessionRecords(siteKey, issueKey) {
+  const out = [];
+  for (const a of Object.values(agents)) {
+    if (boundOrgOf(a) !== siteKey) continue;
+    const mine = (s) => s && s.ticket && s.ticket.key === issueKey && s.ticket.siteKey === siteKey;
+    for (const s of a.sessions || []) if (mine(s)) out.push({ rec: s, live: true });
+    for (const c of a.closedSessions || []) if (mine(c)) out.push({ rec: c, live: false });
+  }
+  return out;
+}
+
+// The tier an UNPINNED claude ticket spawn should run on: {model, escalatedFrom?}
+// or null when the ladder is off. Pure over the fleet payload, so it is read at
+// DISPATCH (Start button and queue drain alike) like the model pin.
+function ticketLadderPick(siteKey, issueKey, ladder = TICKET_MODEL_LADDER) {
+  if (!ladder.length) return null;
+  let failed = -1;
+  for (const { rec, live } of ticketSessionRecords(siteKey, issueKey)) {
+    if (live && rec.status !== "stopped") continue;
+    if (rec.paused) continue;
+    const delivered = (Array.isArray(rec.prs) && rec.prs.length > 0)
+      || (Array.isArray(rec.prUrls) && rec.prUrls.length > 0)
+      || !!(rec.ticket && rec.ticket.outcome);
+    if (delivered) continue;
+    const tier = ladder.indexOf(typeof rec.model === "string" ? rec.model : "");
+    if (tier > failed) failed = tier;
+  }
+  const next = Math.min(failed + 1, ladder.length - 1);
+  return failed >= 0 ? { model: ladder[next], escalatedFrom: ladder[failed] } : { model: ladder[next] };
+}
+
+// The model fields a spawnTicket command carries: the operator's pin as-is, else
+// the ladder's pick for a claude session, else nothing (the login's default).
+function ticketSpawnModelFields(siteKey, issueKey, rpin, host) {
+  const mpin = ticketModelPin(siteKey, issueKey);
+  if (mpin) return { model: mpin.model };
+  if (rpin && rpin.runtime && rpin.runtime !== "claude") return {};
+  const a = host ? agents[host] : null;
+  if (!rpin && a && (a.defaultRuntime || "claude") !== "claude") return {};
+  return ticketLadderPick(siteKey, issueKey) || {};
+}
+
 // ---- ticket -> runtime pins (XERK-473) -------------------------------------
 // The operator's answer to which RUNTIME a ticket's session runs on — "claude"
 // (the default) or "dsh" (XERK-460). Keyed "<siteKey>/<issueKey>" like the model
@@ -4522,7 +4616,16 @@ function setArchiveMirror(blobStore, ha) {
     isLeader: () => true,
     // A rendered file retryBlocked landed after the hydrate (XERK-1050): re-derive
     // cursors from it before it unblocks, as the hydrate does.
-    onLanded: () => archive.reconcileLanded(!!archiveIndexStore),
+    // It may also be one the leader's duplicate repair skipped (XERK-1450) — run
+    // on the next tick, once the landed keys are unblocked in this sync step.
+    onLanded: () => {
+      archive.reconcileLanded(!!archiveIndexStore);
+      setImmediate(() => {
+        if (!isLeader()) return;
+        try { archive.dedupArchive({ publish: true }); }
+        catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+      });
+    },
   });
   archive.setBlobSink((p) => archiveMirror.note(p));
   // Ingest closes per TRANSCRIPT for rendered files that did not land (XERK-1050).
@@ -4634,8 +4737,14 @@ let indexMirror = null;
 // operator-triggered re-sync — never local data loss).
 const INDEX_MIRROR_QUEUE_MAX = positiveEnv("INDEX_MIRROR_QUEUE_MAX", 100000);
 class IndexMirror {
-  constructor(store) {
+  // `isLeader` + `term` gate the duplicate repair (XERK-1450): a repair applies only
+  // while this replica still leads under the term that queued it. A deposed leader's
+  // repair — or one surviving a lease lost and won back — would trim the newer
+  // leader's appends and lower its counts.
+  constructor(store, isLeader, term) {
     this.store = store;
+    this.isLeader = typeof isLeader === "function" ? isLeader : () => true;
+    this.term = typeof term === "function" ? term : () => 0;
     this._q = [];
     this._running = false;
     this._dropped = 0;
@@ -4660,6 +4769,8 @@ class IndexMirror {
   // A single background drain loop — serialized, so writes to one transcript apply in
   // order (session before its entries). Fire-and-forget; a failed op is retried a
   // bounded number of times then dropped (best-effort, like the byte mirror).
+  // The retry goes back at the HEAD, never the tail (XERK-1832): a "replace" retried
+  // behind a later append trims that append's rows out of Postgres.
   async _drain() {
     if (this._running || !this.store) return;
     this._running = true;
@@ -4669,7 +4780,10 @@ class IndexMirror {
         try { await this._apply(op); }
         catch (e) {
           op._tries = (op._tries || 0) + 1;
-          if (op._tries < 3) this._q.push(op); // transient — re-queue at the tail
+          // A repair is never retried: its entry snapshot may be stale by then. Its
+          // sidecar stays `dedupPending`, so the next leader pass redoes it (XERK-1450).
+          if (op.t === "repair") console.error(`archive index mirror: repair of ${op.transcriptId} failed (${e && e.message}); the next leader pass redoes it`);
+          else if (op._tries < 3) this._q.unshift(op); // transient — retry before anything newer
           else console.error(`archive index mirror: op ${op.t} failed (${e && e.message}); dropped`);
         }
       }
@@ -4682,6 +4796,18 @@ class IndexMirror {
     if (op.t === "entries") return this.store.appendEntries(op.transcriptId, op.entries, op.startSeq);
     if (op.t === "replace") return this.store.replaceEntries(op.transcriptId, op.entries);
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
+    if (op.t === "repair") {
+      // Re-checked between every write. Stopping leaves the sidecar pending; the
+      // current leader owns the repair. A pause between a check and its write is
+      // the residual (no Postgres-side fence).
+      const current = () => this.isLeader() && this.term() === op.term;
+      if (!current()) return;
+      if ((await this.store.replaceEntries(op.transcriptId, op.entries, current)) === false) return;
+      if (!current()) return;
+      await this.store.setCounts(op.transcriptId, op.msgCount, op.archiveBytes);
+      if (!current()) return;
+      if (op.done) { try { op.done(); } catch (e) { console.error(`archive index mirror: repair ack failed (${e && e.message})`); } }
+    }
   }
   // The sink archive.js calls — each method SYNC (enqueue only), never awaited by the
   // caller and never throwing back into archive.js's hot path.
@@ -4692,6 +4818,8 @@ class IndexMirror {
         this._push({ t: "entries", transcriptId, entries, startSeq }),
       replace: (transcriptId, entries) => this._push({ t: "replace", transcriptId, entries }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
+      repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
+        this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done, term: this.term() }),
     };
   }
 }
@@ -4700,7 +4828,7 @@ function setIndexMirror(store, ha) {
     indexMirror = null; archive.setIndexSink(null); archive.setIndexMode(null);
     return;
   }
-  indexMirror = new IndexMirror(store);
+  indexMirror = new IndexMirror(store, () => isLeader(), () => leaderTerm);
   archive.setIndexSink(indexMirror.sink());
   // XERK-793: retire the per-replica local node:sqlite index. The index becomes the
   // in-memory session-row map (beat-safe, hydrated from Postgres) + Postgres-direct
@@ -4860,6 +4988,12 @@ function hydrateArchive() {
   return archiveHydrateInFlight;
 }
 async function hydrateArchiveOnce() {
+  // Repair duplicated `.jsonl` files (XERK-1450) on the local copy BEFORE the byte
+  // hydrate: the hydrate keeps a local file that is larger than the bucket's, so a
+  // stale duplicated copy would otherwise survive the leader's repair. Local only —
+  // nothing is mirrored from a replica that may not be the leader.
+  try { archive.dedupArchive({ publish: false }); }
+  catch (e) { console.error(`archive: duplicate repair (local) failed: ${e && e.message}`); }
   if (archiveMirror) {
     // Ingest stays CLOSED across the byte hydrate, not just the index hydrate
     // below, and until the bucket has actually been listed (XERK-1048): opened over
@@ -4875,6 +5009,13 @@ async function hydrateArchiveOnce() {
     catch (e) { console.error(`archive hydrate failed: ${e && e.message}`); }
   }
   await hydrateArchiveIndex();
+  // The leader repairs what the bucket and Postgres hold, now that both are loaded
+  // (XERK-1450). Synchronous, so no ingest interleaves. A replica promoted after this
+  // point re-runs the whole hydrate from onLeaderPromoted.
+  if (isLeader()) {
+    try { archive.dedupArchive({ publish: true }); }
+    catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+  }
   // Rendered downloads that failed keep only THEIR transcripts closed; keep
   // retrying them in the background with the rest of the hub ingesting (XERK-1050).
   // Started after the index hydrate so a landing never reconciles mid-hydrate.
@@ -9577,6 +9718,11 @@ function normalizeClosedSessions(a) {
     }
     if ("ticket" in c && !objectish(c.ticket)) delete c.ticket;
     if (objectish(c.ticket)) coerceTicketOutcome(c.ticket);
+    // The alias the session was spawned on (XERK-1827, the ticket model ladder
+    // reads it). Untyped on Android; a non-alias value drops to absent.
+    if ("model" in c && !(typeof c.model === "string" && /^[a-z0-9.-]{1,40}$/.test(c.model))) {
+      delete c.model;
+    }
     // A sleeper paused for its slot (XERK-1575): {wakeAt, wakeReason?, at?}.
     // Android TYPES it, so it is rebuilt field by field or dropped whole.
     if ("paused" in c) {
@@ -13483,7 +13629,6 @@ function drainTicketQueue() {
     // The operator's model pin (XERK-123) rides the command, exactly as it does
     // from the Start button — read at DISPATCH so a pin changed while the ticket
     // waited is the one that takes effect.
-    const mpin = ticketModelPin(e.siteKey, e.issueKey);
     // The runtime pin (XERK-473) rides the command as `agentType`, read at
     // DISPATCH like the model pin so a pin changed while the ticket waited takes
     // effect. findTicketHost has already restricted the pool to a host that
@@ -13496,7 +13641,7 @@ function drainTicketQueue() {
     // before taking it (XERK-303).
     const dispatchedCmdId = queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
       ticketSource: e.source, ticketSite: e.siteKey,
-      ...(mpin ? { model: mpin.model } : {}),
+      ...ticketSpawnModelFields(e.siteKey, e.issueKey, rpin, host),
       ...(rpin ? { agentType: rpin.runtime } : {}) });
     rememberDispatch(e.siteKey, e.issueKey, dispatchedCmdId);
     const wait = Math.round((now - e.at) / 1000);
@@ -15799,6 +15944,15 @@ function questionAnswerText(a, sessionId, picks, custom) {
   // Worded as a phrase, not a "; (…)" list item, which read like a glitch.
   return picked ? `${picked}, plus a typed answer` : "(a typed answer)";
 }
+// The served id of a session's blocking dialog (XERK-1831), or "" — an older
+// agent serves none, and its answers then carry none (the number check alone).
+const PANE_DIALOG_ID_RE = /^[0-9a-f]{32}$/;
+function servedPaneDialogId(a, sessionId) {
+  const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
+  const pp = s && s.session && s.session.panePrompt;
+  return pp && typeof pp.id === "string" && PANE_DIALOG_ID_RE.test(pp.id) ? pp.id : "";
+}
+
 function panePromptAnswerText(a, sessionId, n) {
   const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
   const pp = s && s.session && s.session.panePrompt;
@@ -20178,13 +20332,31 @@ const server = http.createServer(async (req, res) => {
       // the 1-based number the dialog itself displays — the agent types that
       // digit, and re-reads the pane first so a click made against a stale beat
       // is dropped rather than typed into a live composer.
+      //
+      // The command also names WHICH dialog was answered (XERK-1831): every
+      // permission dialog offers "1. Yes", so a number alone approves whatever
+      // dialog replaced the answered one before delivery. Body `dialogId` is
+      // the served panePrompt.id the client rendered (the agent's digest of
+      // the whole dialog); without one the hub stamps the served id. A
+      // dialogId the hub already knows is gone is refused here (409), and the
+      // agent drops any answer whose id is not the dialog on screen.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "pane-prompt") {
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = JSON.parse((await readBody(req)) || "{}") || {};
         const optionNumber = Number.isInteger(body.optionNumber) ? body.optionNumber : 0;
         if (optionNumber < 1 || optionNumber > 9) {
           return json(res, 400, { error: "optionNumber 1-9 required" });
         }
-        const cmdId = queueCommand(key, { type: "answerPanePrompt", sessionId, optionNumber });
+        if (body.dialogId !== undefined
+          && !(typeof body.dialogId === "string" && PANE_DIALOG_ID_RE.test(body.dialogId))) {
+          return json(res, 400, { error: "dialogId must be the dialog's served id" });
+        }
+        const servedId = servedPaneDialogId(agents[key], sessionId);
+        if (body.dialogId !== undefined && servedId && body.dialogId !== servedId) {
+          return json(res, 409, { error: "That dialog has already changed — answer the one showing now." });
+        }
+        const dialogId = body.dialogId !== undefined ? body.dialogId : servedId;
+        const cmdId = queueCommand(key, { type: "answerPanePrompt", sessionId, optionNumber,
+          ...(dialogId ? { dialogId } : {}) });
         // The org's decisions log (XERK-1574): the dialog + the option picked.
         recordAnswerDecision(key, sessionId, "permission",
           panePromptAnswerText(agents[key], sessionId, optionNumber));
@@ -20740,15 +20912,13 @@ const server = http.createServer(async (req, res) => {
       // this is a genuine fresh start — queue one.
       // The operator's model pin (XERK-123) rides the command the hub already
       // routes — the agent has no per-ticket ledger of its own to read it from.
-      // Omitted when unpinned, so a ticket with no model choice spawns exactly as
-      // it always did (the agent's default model).
-      const mpin = ticketModelPin(siteKey, issueKey);
+      // Unpinned, the ticket model ladder (XERK-1827) picks the tier instead.
       // The runtime pin (XERK-473) rides as `agentType`; findTicketHost above
       // already ensured `host` offers it. Omitted (claude) when unpinned.
       const rpin = ticketRuntimePin(siteKey, issueKey);
       const cmdId = queueCommand(host, { type: "spawnTicket", issueKey,
             ticketSource: "manual", ticketSite: siteKey,
-            ...(mpin ? { model: mpin.model } : {}),
+            ...ticketSpawnModelFields(siteKey, issueKey, rpin, host),
             ...(rpin ? { agentType: rpin.runtime } : {}) });
       // This ticket may ALREADY be waiting in the queue (the sweep queued it, or
       // a board that hadn't seen the queue yet clicked Start). Its session is
@@ -21900,6 +22070,12 @@ if (process.env.TURMA_TEST) {
     // late-landed file's cursor, and dropping it loses data with no unit failing.
     setArchiveMirror,
     getArchiveMirror: () => archiveMirror,
+    // The index mirror's drain: a retried op must stay ahead of later ops (XERK-1832).
+    // The duplicate repair's hydrate ordering (XERK-1450) and its mirror op.
+    hydrateArchive,
+    IndexMirror,
+    setIndexMirror,
+    getIndexMirror: () => indexMirror,
     // The index hydrate's deadline (XERK-1282): a hung load must reject AND cut its
     // loader, or a late page lands in an index ingest has since reopened.
     withLoaderDeadline,
@@ -22380,6 +22556,9 @@ if (process.env.TURMA_TEST) {
     ticketAgents,
     ticketModels,
     ticketModelPin,
+    ticketLadderPick,
+    ticketSpawnModelFields,
+    TICKET_MODEL_LADDER,
     setTicketModel,
     orgModelAliases,
     ticketRuntimes,
@@ -22679,6 +22858,11 @@ if (process.env.TURMA_TEST) {
         console.error(`archive mirror drain failed: ${e && e.message}`));
     }, ARCHIVE_MIRROR_DRAIN_MS);
     archiveDrainTimer.unref();
+  } else {
+    // No bucket: the local tree is the whole of-record, so repair it here, once per
+    // boot, before any ingest (XERK-1450).
+    try { archive.dedupArchive({ publish: true }); }
+    catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
   }
   // XERK-764 (wave-3): the cross-replica tunnel directory + control bus. Watch the
   // host->replica directory FIRST (so no owner change is missed during the async

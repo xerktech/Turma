@@ -9,7 +9,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet } = require("../public/chat.js");
+const { mergeTail, foldHistory, weight, buildItems, itemsToHtml, linkify, renderInline, renderProse, copyCodeClick, prFooterChip, ticketFooterChip, modelOpts, prettyModel, MODEL_OPTS, modelChipLabel, modeChipValue, __setSess, __setAgent, __setModelSwitchPending, __setModeSwitchPending, agentsHtml, optionCardHtml, panePromptHtml, __setPanePromptActive, filterModeOpts, MODE_OPTS, isBusy, updateComposeAction, updateLiveStatus, sendFailure, isTooLong, TOO_LONG, __setVerbosity, __setLiveStatus, __setLiveAgents, __stopPending, __setQuestionActive, attachmentsHtml, fmtBytes, readyUploadIds, renderAttachments, __setAttachments, __attachments, MAX_ATTACHMENTS, localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts, __setModelSourcePending, setSessionModelSource, __setHostKey, localModels, localModelOpts, currentLocalModel, currentLocalContext, servedContextFor, fmtCtx, localModelChipHtml, __setLocalModelPending, contextMeterChip, isDshSession, dshModels, currentDshModel, dshModelOpts, dshModelChipHtml, dshRuntimeChipHtml, __setDshModelPending, isQwenSession, qwenRuntimeChipHtml, qwenModelChipHtml, reseedFromFleet, answerPanePrompt } = require("../public/chat.js");
 const fs = require("node:fs");
 const path = require("node:path");
 
@@ -2890,6 +2890,35 @@ test("model source: choosing one actually issues the switch request", () => {
   assert.match(calls[0].url, /\/sessions\/AAAAA\/model-source$/);
   assert.deepEqual(calls[0].body, { modelSource: "local" });
   __setModelSourcePending(null);
+});
+
+test("XERK-1831: answering a pane dialog names the dialog that was shown", async () => {
+  // The id is what stops the agent typing this answer into a different
+  // dialog that replaced the shown one; without it the hub falls back to
+  // whatever it serves at click time, which may already be the other one.
+  const calls = [];
+  const realFetch = global.fetch;
+  const realDoc = global.document;
+  global.document = { getElementById: () => null, querySelectorAll: () => [],
+                      addEventListener() {} };
+  global.fetch = (url, init) => {
+    calls.push({ url, body: JSON.parse(init.body) });
+    return Promise.resolve({ ok: true, json: async () => ({}) });
+  };
+  try {
+    __setSess({ id: "AAAAA" });
+    __setHostKey("hostA");
+    await answerPanePrompt(1, { prompt: "Do you want to proceed?", id: "ab".repeat(16),
+      options: [{ number: 1, label: "Yes" }] });
+    await answerPanePrompt(2, { prompt: "Older agent?", options: [] });
+  } finally {
+    global.fetch = realFetch;
+    if (realDoc === undefined) delete global.document; else global.document = realDoc;
+    __setPanePromptActive(false);
+  }
+  assert.match(calls[0].url, /\/sessions\/AAAAA\/pane-prompt$/);
+  assert.deepEqual(calls[0].body, { optionNumber: 1, dialogId: "ab".repeat(16) });
+  assert.deepEqual(calls[1].body, { optionNumber: 2 }, "an older agent serves no id to send");
 });
 
 test("buildItems: Claude Code's framing tags never reach a user bubble", () => {
