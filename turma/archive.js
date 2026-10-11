@@ -2858,6 +2858,10 @@ function backfillPgIndexFromFiles() {
 // Transcripts whose repair Postgres has not acked, so an ingest's sidecar rewrite
 // keeps `dedupPending`. A cache of the sidecars: every publishing pass re-derives it.
 const dedupPendingIds = new Set();
+// The latest repair queued per transcript. Only ITS ack clears pending: an older
+// one acking while a newer one is still queued would clear it, and that newer one
+// failing after its DELETE would then leave Postgres empty with nothing to redo it.
+const dedupRepairGen = new Map();
 function dedupLines(buf) {
   const seen = new Set();
   const parts = [];
@@ -2888,10 +2892,12 @@ function dedupArchive(opts) {
     const metaPath = jsonl + ".meta";
     const meta = readSidecar(metaPath);
     if (!meta || !meta.transcriptId) continue; // unattributable: leave it alone
+    const redo = publish && !!meta.dedupPending;
+    let size;
+    try { size = fs.statSync(jsonl).size; } catch { continue; }
+    if (meta.dedupChecked === size && !redo) continue;
     let buf;
     try { buf = fs.readFileSync(jsonl); } catch { continue; }
-    const redo = publish && !!meta.dedupPending;
-    if (meta.dedupChecked === buf.length && !redo) continue;
     const { out, dropped } = dedupLines(buf);
     if (!dropped && !redo) {
       // Only the publisher stamps: a local-only stamp would differ from the
@@ -2927,10 +2933,13 @@ function dedupArchive(opts) {
       const live = sessionsMap.get(id);
       if (live) { live.msgCount = msgCount; live.archiveBytes = archiveBytes; }
       dedupPendingIds.add(id);
+      const gen = (dedupRepairGen.get(id) || 0) + 1;
+      dedupRepairGen.set(id, gen);
       writeSidecar(metaPath, fixed);
       mirrorRepair(id, entries, msgCount, archiveBytes, () => {
         // Postgres holds the repair. Entries appended since mirrored at ordinals
         // after it, in queue order, so it is done whatever the file holds now.
+        if (dedupRepairGen.get(id) !== gen) return; // a newer repair is still queued
         dedupPendingIds.delete(id);
         const sc = readSidecar(metaPath);
         if (!sc || !sc.dedupPending) return;

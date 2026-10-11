@@ -1278,6 +1278,29 @@ test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leade
   } finally { pgTeardown(); }
 });
 
+test("XERK-1450 pg mode: only the latest queued repair's ack clears pending", async () => {
+  const mem = pgSetup();
+  const queued = [];
+  try {
+    const { jsonl } = duplicatedTranscript("t-gen");
+    archive.setIndexSink({ ...mem.sink(), repair: (...a) => queued.push(a) });
+    assert.equal(archive.dedupArchive({ publish: true }), 1);   // repair A
+    assert.equal(archive.dedupArchive({ publish: true }), 1);   // still pending: repair B
+    assert.equal(queued.length, 2);
+    queued[0][4]();                                              // A acks; B then fails
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, true,
+      "A's ack must not clear what B still owes");
+    archive.setIndexSink(mem.sink());
+    assert.equal(archive.dedupArchive({ publish: true }), 1, "so the next pass redoes it");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, undefined);
+    // Acked: a later ingest's sidecar carries no pending flag.
+    const meta = JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8"));
+    archive.ingestChunk("nas", "t-gen", META, meta.bytesStored, meta.bytesStored + 9,
+      [ent("g9", "user", "later")], "acme");
+    assert.equal(JSON.parse(fs.readFileSync(jsonl + ".meta", "utf8")).dedupPending, undefined);
+  } finally { pgTeardown(); }
+});
+
 test("XERK-1450 pg mode: an ingest while the repair is unacked keeps it pending", async () => {
   const mem = pgSetup();
   try {

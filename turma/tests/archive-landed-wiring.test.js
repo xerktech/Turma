@@ -232,8 +232,9 @@ test("XERK-1450: a late-landed file is repaired by the wired onLanded", async ()
 test("XERK-1450: IndexMirror applies a repair as replace + exact counts, acks it, never re-queues it", async () => {
   const calls = [];
   let fail = false;
+  let failed = 0;
   const store = {
-    async replaceEntries(t, e) { if (fail) throw new Error("pg down"); calls.push(["replace", t, e.length]); },
+    async replaceEntries(t, e) { if (fail) { failed += 1; throw new Error("pg down"); } calls.push(["replace", t, e.length]); },
     async setCounts(t, n, b) { calls.push(["counts", t, n, b]); },
   };
   const m = new hub.IndexMirror(store);
@@ -250,6 +251,7 @@ test("XERK-1450: IndexMirror applies a repair as replace + exact counts, acks it
   await m._drain();
   assert.deepEqual(calls, []);
   assert.equal(m._q.length, 0, "a failed repair is dropped, left pending for the next pass");
+  assert.equal(failed, 1, "tried once, never re-queued behind newer ops");
   assert.equal(acked, 1);
 });
 

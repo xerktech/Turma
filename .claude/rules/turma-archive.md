@@ -209,6 +209,9 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     the next publishing pass redoes a pending file. Never stamp done on the local write alone: the
     stamp reaches the bucket, and a lost PG op was then never redone (QA). A failed `repair` op is
     dropped, never re-queued — behind a newer append its entry snapshot would delete it.
+  - Only the LATEST queued repair's ack clears pending (`dedupRepairGen`): `replaceEntries` is
+    DELETE-then-INSERT, so an older ack clearing it while a newer repair later fails mid-way left
+    the transcript's PG entries empty for good (QA).
   - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
     covered) skips unchanged files.
   - Tests: the `XERK-1450` cases in `index-store.test.js` and `archive-landed-wiring.test.js`.
