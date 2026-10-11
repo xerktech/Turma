@@ -4777,7 +4777,9 @@ class IndexMirror {
     if (op.t === "refill") {
       this._refill.set(id, op.term);
       this._refillAfter = Date.now() + INDEX_MIRROR_REFILL_RETRY_MS;
-    } else if (!this._refill.has(id) && this._refill.size < INDEX_MIRROR_QUEUE_MAX) {
+    } else if (this._refill.has(id) || this._refill.size < INDEX_MIRROR_QUEUE_MAX) {
+      // Always under the CURRENT term: an entry owed under an earlier one would be
+      // skipped as stale, and with it this drop.
       this._refill.set(id, this.term());
     }
   }

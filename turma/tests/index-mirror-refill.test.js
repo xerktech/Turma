@@ -281,6 +281,57 @@ test("an append queued in an earlier term still runs after a promotion", async (
   } finally { teardown(); }
 });
 
+test("a drop under the current term re-owes a refill an earlier term left owed", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0")]);
+    await settle(mirror);
+    mirror._refill.set("t", term);                             // owed under term 0
+    term++;                                                    // promoted meanwhile
+    store.hold();
+    mirror.sink().session({ transcriptId: "other" });          // in flight, blocked
+    for (const a of ["a1", "a2", "a3", "a4"]) push("t", [ent(a, a)]);
+    assert.equal(mirror._refill.get("t"), term, "re-stamped under the current term");
+    store.release();
+    await settle(mirror);
+    assert.deepEqual(seqs(store, "t"), ["0:n0", "1:a1", "2:a2", "3:a3", "4:a4"]);
+  } finally { teardown(); }
+});
+
+test("a refill sends nothing while deposed, and hands replaceEntries the leader gate", async () => {
+  const { store, mirror } = setup();
+  try {
+    push("t", [ent("n0", "n0")]);
+    await settle(mirror);
+    store.rows.set("t", { transcriptId: "t", msgCount: 99 });
+    leading = false;
+    mirror._refill.set("t", term);
+    mirror._drain();
+    await settle(mirror);
+    assert.equal(store.rows.get("t").msgCount, 99, "no row upsert while deposed");
+    leading = true;
+    let proceed;
+    const replace = store.replaceEntries;
+    store.replaceEntries = async (id, list, p) => { proceed = p; return replace(id, list); };
+    mirror._refill.set("t", term);
+    mirror._drain();
+    await settle(mirror);
+    assert.equal(typeof proceed, "function");
+    assert.equal(proceed(), true);
+    term++;
+    assert.equal(proceed(), false, "the gate turns false once the term moves");
+  } finally { teardown(); }
+});
+
+test("a dropped duplicate repair or remove is not owed a refill", () => {
+  const { mirror } = setup();
+  try {
+    mirror._lost({ t: "repair", transcriptId: "t" });
+    mirror._lost({ t: "remove", transcriptId: "t" });
+    assert.equal(mirror._refill.size, 0);
+  } finally { teardown(); }
+});
+
 test("a refill Postgres refuses outright is given up, not retried forever", async () => {
   const { store, mirror } = setup();
   try {

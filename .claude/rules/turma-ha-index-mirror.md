@@ -20,6 +20,8 @@ paths:
 - **Only while leading under the term it was owed in** (`isLeader` + `leaderTerm`, the XERK-1450
   gate); else dropped. A deposed or re-promoted replica's local copy may be behind what another
   leader appended (QA reproduced the clobber on real Postgres).
+  - A new drop always re-stamps the owed entry with the CURRENT term — an entry left from an
+    earlier term would otherwise be skipped as stale, taking this leader's own drop with it (QA).
 - **Plain `replace` ops are NOT leader-gated**: the boot backfill (XERK-797) queues them before the
   elector runs, and skipping one left a row with no entries (QA). A replace from a deposed replica
   can still wipe a newer leader's appends: XERK-1836.
