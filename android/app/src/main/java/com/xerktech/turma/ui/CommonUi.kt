@@ -299,10 +299,10 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         val eta = waits.mapNotNull { it.eta }.maxOrNull()
         // One named wait keeps its subject on every branch (XERK-1571), a timed one too.
         val what = if (waits.size == 1 && waits[0].label.isNotBlank()) " · ${waits[0].label}" else ""
-        if (eta != null && eta > now) return "⏳ waiting$what · ${waitLeftText(eta - now)} left"
+        if (eta != null && eta > now) return "⏳ waiting$what\u00A0·\u00A0${waitLeftText(eta - now)} left"
         // No ETA: how long it has waited, off the oldest row's startedAt (XERK-1571).
         val started = waits.mapNotNull { it.startedAt }.filter { it <= now }.minOrNull()
-        val since = if (started == null) "" else " · ${waitLeftText(now - started)}"
+        val since = if (started == null) "" else "\u00A0·\u00A0${waitLeftText(now - started)}"
         if (what.isNotEmpty()) return "⏳ waiting$what$since"
         return "⏳ waiting on ${waits.size} background shell" + (if (waits.size == 1) "" else "s") + since
     }
@@ -316,6 +316,73 @@ fun liveStateLabel(state: LiveState, live: LiveSignals?, now: Long = System.curr
         return "${rows.size} background $noun" + if (rows.size == 1) "" else "s"
     }
     return liveStateLabel(state)
+}
+
+/** The colour a Sessions card's state line takes — web sessions.html `.state.<tone>`. */
+enum class CardTone { WORKING, WAITING, HOLDING, IDLE, REVIEW, STALLED }
+
+/** A Sessions card's state line and the colour it reads in. */
+data class CardState(val label: String, val tone: CardTone)
+
+/**
+ * The Sessions card's state line — web sessions.html `liveState`, then
+ * `reviewState` for a card under Ready for review ([review]). "waiting for your
+ * answer", "waiting for your permission", "QA Review", "⏳ waiting · Watch CI",
+ * "stalled · Watch CI", "PR awaiting review", "finished · awaiting review", …
+ *
+ * The web reads a permission dialog off `panePrompt`, which this client does not
+ * type; the hub's `needs-you:permission` attention is the same edge. Unlike the
+ * web card, the phone card shows no ask/why line beside it (operator call).
+ */
+fun sessionCardState(session: SessionInfo, agentLastSeen: Long, now: Long, review: Boolean): CardState {
+    val live = sessionLiveState(session, agentLastSeen, now)
+    return if (review) reviewCardState(session, live) else live
+}
+
+private fun sessionLiveState(session: SessionInfo, agentLastSeen: Long, now: Long): CardState {
+    val s = session.session
+    if (!s?.question.isNullOrEmpty()) return CardState("waiting for your answer", CardTone.WAITING)
+    if (session.attention?.state == "needs-you:permission")
+        return CardState("waiting for your permission", CardTone.WAITING)
+    if (s?.transcriptAgeSec == null) return CardState("no transcript yet", CardTone.IDLE)
+    val state = com.xerktech.turma.core.liveState(session, agentLastSeen, now)
+    return when (state) {
+        LiveState.WORKING -> CardState(liveStateLabel(state, s, now), CardTone.WORKING)
+        LiveState.HOLDING -> CardState(liveStateLabel(state, s, now), CardTone.HOLDING)
+        LiveState.WAITING -> CardState("waiting for your answer", CardTone.WAITING)
+        LiveState.STOPPED -> CardState("stopped", CardTone.IDLE)
+        LiveState.IDLE -> {
+            // A stalled background wait (XERK-1571) reads idle, so a dead shell
+            // surfaces like any finished session — but it says what it stalled on,
+            // in the danger tone (web `backgroundWaitLabel` on a stall: no age, the
+            // hub's `since` carries that on the why line).
+            if (com.xerktech.turma.core.sessionWait(session, agentLastSeen, now)?.stalled == true) {
+                val waits = s.agents.filter(::isWaitAgent)
+                val label = if (waits.size == 1 && waits[0].label.isNotBlank()) "stalled · ${waits[0].label}"
+                    else "stalled on ${waits.size} background shell" + if (waits.size == 1) "" else "s"
+                CardState(label, CardTone.STALLED)
+            } else CardState("idle", CardTone.IDLE)
+        }
+    }
+}
+
+private fun reviewCardState(session: SessionInfo, live: CardState): CardState {
+    val att = session.attention
+    val hubStalled = com.xerktech.turma.core.attentionStalled(att)
+    val stalledLabel = listOf("stalled", att?.why.orEmpty()).filter { it.isNotBlank() }.joinToString(" · ")
+    // A LOOPING session is busy, so it reads working — but the hub says it is stuck
+    // repeating one failing call (XERK-1572): the hub's read, in the danger tone.
+    if (live.tone == CardTone.WORKING && hubStalled) return CardState(stalledLabel, CardTone.STALLED)
+    if (live.tone != CardTone.IDLE) return live
+    // The hub says it stalled where this screen can't judge silence (the host
+    // just went quiet) — the hub's read, as anywhere.
+    if (hubStalled) return CardState(stalledLabel, CardTone.STALLED)
+    val label = when {
+        att?.state == "needs-you:test" -> "awaiting your test"
+        session.prs.any { !com.xerktech.turma.core.prLanded(it) } -> "PR awaiting review"
+        else -> "finished · awaiting review"
+    }
+    return CardState(label, CardTone.REVIEW)
 }
 
 /**

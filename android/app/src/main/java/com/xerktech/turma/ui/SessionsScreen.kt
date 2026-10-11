@@ -89,6 +89,8 @@ data class FlatSession(
     val online: Boolean,
     val hostLastSeen: Long,
     val session: SessionInfo,
+    /** The host's terminal tunnel is up (web `a.terminalOnline`); true from an older caller. */
+    val terminalOnline: Boolean = true,
 )
 
 /** Flatten every host's sessions into a single searchable list, running first. */
@@ -98,7 +100,7 @@ fun flattenSessions(
 ): List<FlatSession> {
     val q = query.trim().lowercase()
     val all = agents.flatMap { a ->
-        a.sessions.map { FlatSession(a.key, a.device.ifBlank { a.key }, a.online, a.lastSeen, it) }
+        a.sessions.map { FlatSession(a.key, a.device.ifBlank { a.key }, a.online, a.lastSeen, it, a.terminalOnline) }
     }
     val filtered = if (q.isEmpty()) all else all.filter {
         sessionName(it.session).lowercase().contains(q) ||
@@ -181,7 +183,7 @@ fun collectSessions(agents: List<AgentInfo>, query: String): SessionLists {
         val device = a.device.ifBlank { a.key }
         for (s in a.sessions) {
             if (s.transcriptId.isNotBlank()) carded.add(key(host, s.transcriptId))
-            val flat = FlatSession(host, device, a.online, a.lastSeen, s)
+            val flat = FlatSession(host, device, a.online, a.lastSeen, s, a.terminalOnline)
             val nameMatch = matches(sessionName(s), s.repo, sessionBranch(s), device)
             when (s.status) {
                 "running" -> if (nameMatch) running.add(flat)
@@ -1100,7 +1102,11 @@ private fun SessionListCard(
                 ((dotState == com.xerktech.turma.core.LiveState.IDLE ||
                     dotState == com.xerktech.turma.core.LiveState.WORKING) &&
                     com.xerktech.turma.core.attentionStalled(r.session.attention))
-            if (stalled) {
+            if (r.session.status == "running" && r.session.attention?.state == "needs-you:permission") {
+                // Blocked on a permission dialog: the waiting amber its state line has,
+                // whatever else is running (web liveState reads it `waiting` first).
+                StateDot(com.xerktech.turma.core.LiveState.WAITING)
+            } else if (stalled) {
                 StatusLight(com.xerktech.turma.ui.theme.TurmaColors.critical)
             } else if (review && dotState == com.xerktech.turma.core.LiveState.IDLE) {
                 StatusLight(com.xerktech.turma.ui.theme.TurmaColors.review)
@@ -1125,19 +1131,29 @@ private fun SessionListCard(
                     maxLines = 1,
                     overflow = TextOverflow.Ellipsis,
                 )
-                // Why it is the operator's and for how long (XERK-1571, web
-                // sessions.html `.why` line) — review cards only.
+                // The state line (web sessions.html `.state`): what the session is
+                // doing, or — under Ready for review — why it is there.
+                val cs = sessionCardState(r.session, r.hostLastSeen, now, review)
+                Text(
+                    cs.label + if (r.terminalOnline) "" else "\u00A0·\u00A0terminal offline",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = when (cs.tone) {
+                        CardTone.WORKING -> com.xerktech.turma.ui.theme.TurmaColors.working
+                        CardTone.WAITING -> com.xerktech.turma.ui.theme.TurmaColors.waitingText()
+                        CardTone.REVIEW -> com.xerktech.turma.ui.theme.TurmaColors.review
+                        CardTone.STALLED -> MaterialTheme.colorScheme.error
+                        CardTone.HOLDING, CardTone.IDLE -> MaterialTheme.colorScheme.onSurfaceVariant
+                    },
+                    fontWeight = if (cs.tone == CardTone.WAITING || cs.tone == CardTone.REVIEW ||
+                        cs.tone == CardTone.STALLED) FontWeight.SemiBold else null,
+                    fontStyle = if (cs.tone == CardTone.HOLDING) androidx.compose.ui.text.font.FontStyle.Italic else null,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                )
+                // The colored state line is the card's ONE status line: the web's
+                // grey why/age line, quoted question and permission ask are left off
+                // so the phone card stays compact (operator call, android/PARITY.md).
                 if (review) {
-                    val why = com.xerktech.turma.core.attentionWhy(r.session.attention, now)
-                    if (why.isNotEmpty()) {
-                        Text(
-                            why,
-                            style = MaterialTheme.typography.bodySmall,
-                            color = MaterialTheme.colorScheme.onSurfaceVariant,
-                            maxLines = 1,
-                            overflow = TextOverflow.Ellipsis,
-                        )
-                    }
                     // The wait classifier's verdict and the answer it suggests
                     // (XERK-1572, web sessions.html `.att-hint`).
                     val hint = com.xerktech.turma.core.attentionHintLine(r.session.attention)

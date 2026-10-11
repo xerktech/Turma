@@ -8,6 +8,7 @@ import androidx.compose.material3.lightColorScheme
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.SideEffect
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.luminance
 import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
@@ -79,6 +80,14 @@ object TurmaColors {
     val checkFail = Critical
     val checkPending = Warning
     val series = ChartSeries
+
+    /**
+     * Amber as TEXT (web `--warning-text`): the fill is under 2:1 on a light card,
+     * so light steps down to [WarningTextLight]; dark keeps the fill.
+     */
+    @Composable
+    fun waitingText(): Color =
+        if (MaterialTheme.colorScheme.surface.luminance() > 0.5f) WarningTextLight else Warning
 }
 
 @Composable

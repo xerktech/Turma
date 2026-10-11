@@ -115,7 +115,8 @@ enum class LiveState { WORKING, IDLE, WAITING, HOLDING, STOPPED }
 
 fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState = when {
     session.status != "running" -> LiveState.STOPPED
-    (session.session?.question ?: "").isNotBlank() -> LiveState.WAITING
+    // Truthy, as the hub and web read it: a whitespace-only question still blocks.
+    (session.session?.question ?: "").isNotEmpty() -> LiveState.WAITING
     sessionWorking(session, agentLastSeen, now) -> LiveState.WORKING
     // Asleep until a session-CLI wake (XERK-1571): holding, never Ready for review.
     sessionSleeping(session, now) -> LiveState.HOLDING
@@ -242,25 +243,6 @@ fun attentionFor(att: Attention?, now: Long): String {
  */
 fun <T> sortedBySince(rows: List<T>, attention: (T) -> Attention?): List<T> =
     rows.sortedWith(compareBy<T, Long?>(nullsLast<Long>()) { attention(it)?.since })
-
-/**
- * A review card's second line (XERK-1571, web sessions.html `attentionWhy`): WHY
- * the session is the operator's and how long it has waited. Unlike the web card,
- * the phone card carries no state label or quoted question, so the why is kept for
- * every needs-you state (the question text, the wait, the PR). The time reads
- * "stalled 31m" on a stall, else "for 22m" (the wording every surface uses). The
- * age is glued to its word, and its "·" to both sides, by no-break spaces, so a
- * line never ends on a dangling "·". "" when the hub serves none.
- */
-fun attentionWhy(att: Attention?, now: Long): String {
-    if (att == null || needsYouChip(att.state) == null) return ""
-    val why = att.why?.takeIf { it.isNotBlank() }.orEmpty()
-    val age = att.since?.let {
-        val word = if (att.state == "needs-you:stalled") "stalled" else "for"
-        "$word\u00A0${waitLeftText(now - it)}"
-    }.orEmpty()
-    return if (why.isNotEmpty() && age.isNotEmpty()) "$why\u00A0·\u00A0$age" else why.ifEmpty { age }
-}
 
 /**
  * A fleet card's State row for a session the hub says needs the operator (XERK-1571,
