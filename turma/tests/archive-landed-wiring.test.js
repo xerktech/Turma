@@ -344,4 +344,27 @@ test("XERK-1450: a repair stops between batches once its term is gone", async ()
   assert.deepEqual(calls, ["INSERT"], "no second batch, and never the trim");
 });
 
+test("XERK-1450: the wired re-seat waits for the mirror, then re-seats a clean file Postgres disagrees with", async () => {
+  const calls = [];
+  const store = {
+    async upsertSession() {}, async appendEntries() {},
+    async replaceEntries(t, e) { calls.push(["replace", t, e.length]); return true; },
+    async setCounts(t, n) { calls.push(["counts", t, n]); },
+    async inconsistentTranscripts() { return [{ transcriptId: "t-rs", msgCount: 9, n: 6, u: 2 }]; },
+  };
+  hub.setIndexMirror(store, true);
+  hub.setArchiveIndexStore(store);
+  try {
+    archive.ingestChunk("nas", "t-rs", { repo: "qa", summary: "t-rs", endedTs: "2026-07-10T00:00:00Z" }, 0, 10,
+      [{ uuid: "a", role: "user", ts: "t", text: "one" }, { uuid: "b", role: "assistant", ts: "t", text: "two" }]);
+    assert.equal(await hub.reseatArchiveIndex(), 1);
+    await new Promise((r) => setImmediate(r));
+    await hub.getIndexMirror()._drain();
+    assert.deepEqual(calls, [["replace", "t-rs", 2], ["counts", "t-rs", 2]]);
+  } finally {
+    hub.setArchiveIndexStore(null);
+    hub.setIndexMirror(null, false);
+  }
+});
+
 test.after(() => { if (hub.server && hub.server.close) hub.server.close(); });

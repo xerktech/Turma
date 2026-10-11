@@ -2894,12 +2894,28 @@ function dedupLines(buf) {
   // A torn final line dropped as a duplicate leaves the kept text ending cleanly.
   return { out: dropped ? Buffer.concat(parts) : buf, dropped };
 }
+// A pass YIELDS to the event loop every PASS_SLICE_MS (XERK-1450 follow-up): run
+// whole over a ~2 GB archive it held the loop 16-20s, past the 15s leader lease —
+// both replicas lost leadership mid-repair in prod and the leader's Postgres repairs
+// were dropped. Each file's read-rewrite-index step stays one synchronous slice, so
+// an ingest landing between slices never sees a half-repaired file. Passes are
+// serialized (a landing's pass queues behind the hydrate's).
+const PASS_SLICE_MS = 20;
+const yieldLoop = () => new Promise((r) => setImmediate(r));
+let dedupChain = Promise.resolve();
 function dedupArchive(opts) {
+  const run = dedupChain.then(() => dedupPass(opts));
+  dedupChain = run.catch(() => {});
+  return run;
+}
+async function dedupPass(opts) {
   const publish = !!(opts && opts.publish);
   const files = [];
   walkJsonl(ARCHIVE_DIR, files, 0);
   let repaired = 0, droppedTotal = 0;
+  let slice = Date.now();
   for (const jsonl of files) {
+    if (Date.now() - slice > PASS_SLICE_MS) { await yieldLoop(); slice = Date.now(); }
     // A rendered file whose download has not landed is not the of-record copy.
     if (renderedGate) { try { if (renderedGate(jsonl)) continue; } catch { continue; } }
     const metaPath = jsonl + ".meta";
@@ -2977,6 +2993,46 @@ function dedupArchive(opts) {
       `written before XERK-1364's re-send de-dup (XERK-1450)`);
   }
   return repaired;
+}
+
+// Re-seat Postgres for transcripts whose CLEAN file it disagrees with (XERK-1450
+// follow-up). The repair above only revisits a file with repeated lines or a pending
+// flag; in prod 239 files were already clean (repaired, or never damaged) while
+// Postgres still held their duplicated entries or an inflated msg_count. `rows` come
+// from `PgIndexStore.inconsistentTranscripts`: `{transcriptId, msgCount, n, u}` —
+// msg_count, entry rows, distinct (uuid,role,ts,text) rows. A transcript is re-seated
+// only when one of the three differs from its FILE, so it converges: two lines that
+// differ only in `blocks` are two entries in both places. pg mode, leader only (the
+// repair op is leader-gated). Returns how many were queued.
+async function reseatIndexFromFiles(rows) {
+  if (!isPgMode() || !Array.isArray(rows)) return 0;
+  let queued = 0;
+  let slice = Date.now();
+  for (const r of rows) {
+    if (Date.now() - slice > PASS_SLICE_MS) { await yieldLoop(); slice = Date.now(); }
+    const id = r && r.transcriptId;
+    if (!id || dedupPendingIds.has(id)) continue; // the repair above owns a pending one
+    const live = sessionsMap.get(id);
+    if (!live || !live.filePath) continue;
+    const { jsonl } = filePaths(live.filePath);
+    if (renderedGate) { try { if (renderedGate(jsonl)) continue; } catch { continue; } }
+    let size;
+    try { size = fs.statSync(jsonl).size; } catch { continue; } // no local file: nothing to trust
+    const entries = heldEntries(jsonl).entries;
+    const keys = new Set(entries.map((e) => JSON.stringify(
+      [e.uuid || null, e.role || null, e.ts || null, String(e.text || "")])));
+    const n = entries.length;
+    if (r.n === n && r.msgCount === n && r.u === keys.size) continue;
+    live.msgCount = n;
+    live.archiveBytes = size;
+    mirrorRepair(id, entries, n, size, null);
+    queued += 1;
+  }
+  if (queued) {
+    console.error(`archive: re-seated ${queued} transcript(s) whose Postgres entries or counts ` +
+      `disagreed with their file (XERK-1450)`);
+  }
+  return queued;
 }
 
 // ---- the dsh Trajectory (XERK-498) ------------------------------------------
@@ -3649,7 +3705,7 @@ module.exports = {
   // is the sessions-only hydration applier.
   setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles, reindexHeld,
   // The one-time repair of files duplicated before XERK-1364 (XERK-1450).
-  dedupArchive,
+  dedupArchive, reseatIndexFromFiles,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,
   archiveLimits, normalizeMeta, META_TEXT_MAX,
   // The raw layer (XERK-338).

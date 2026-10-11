@@ -226,6 +226,13 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     send `seat` instead: it overwrites ordinals and trims nothing, so a stale copy cannot delete
     another replica's appends (XERK-1837). Never dropped on a term change, since that left held
     entries out of PG with nothing to re-run them.
+  - **The pass YIELDS every ~20ms** (`dedupArchive` is async, serialized): run whole over ~2 GB it
+    held the event loop 16-20s, past the 15s lease, and in prod both replicas lost leadership
+    mid-repair. Never make it synchronous again; keep each file's step one synchronous slice.
+  - **A clean file can still have a damaged Postgres row** (239 in prod): after the leader's pass,
+    `reseatArchiveIndex` waits for the mirror to drain, asks `inconsistentTranscripts` (rows ≠
+    distinct rows, or msg_count ≠ rows) and `reseatIndexFromFiles` re-seats only those whose
+    counts differ from their FILE — so lines differing only in `blocks` don't loop forever.
   - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
     covered) skips unchanged files.
   - Tests: the `XERK-1450` cases in `index-store.test.js` and `archive-landed-wiring.test.js`.

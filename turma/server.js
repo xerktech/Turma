@@ -4622,8 +4622,8 @@ function setArchiveMirror(blobStore, ha) {
       archive.reconcileLanded(!!archiveIndexStore);
       setImmediate(() => {
         if (!isLeader()) return;
-        try { archive.dedupArchive({ publish: true }); }
-        catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+        archive.dedupArchive({ publish: true }).catch((e) =>
+          console.error(`archive: duplicate repair failed: ${e && e.message}`));
       });
     },
   });
@@ -4823,6 +4823,8 @@ class IndexMirror {
       if (op.done) { try { op.done(); } catch (e) { console.error(`archive index mirror: repair ack failed (${e && e.message})`); } }
     }
   }
+  // Nothing queued and nothing applying.
+  idle() { return !this._running && this._q.length === 0; }
   // The sink archive.js calls — each method SYNC (enqueue only), never awaited by the
   // caller and never throwing back into archive.js's hot path.
   sink() {
@@ -5003,12 +5005,26 @@ function hydrateArchive() {
     .finally(() => { clearInterval(watch); archiveHydrateInFlight = null; });
   return archiveHydrateInFlight;
 }
+// Re-seat the Postgres index from the files where the two disagree (XERK-1450): once
+// the repair's own ops have drained, ask Postgres which transcripts look wrong and
+// let archive.js compare each against its file. Leader only, pg mode only.
+const ARCHIVE_RESEAT_WAIT_MS = 10 * 60 * 1000;
+async function reseatArchiveIndex() {
+  if (!archiveIndexStore || !indexMirror || !archive.isPgMode()) return 0;
+  const until = Date.now() + ARCHIVE_RESEAT_WAIT_MS;
+  while (!indexMirror.idle() && Date.now() < until) {
+    await new Promise((r) => { const t = setTimeout(r, 1000); t.unref?.(); });
+  }
+  if (!isLeader()) return 0;
+  const rows = await archiveIndexStore.inconsistentTranscripts();
+  return archive.reseatIndexFromFiles(rows);
+}
 async function hydrateArchiveOnce() {
   // Repair duplicated `.jsonl` files (XERK-1450) on the local copy BEFORE the byte
   // hydrate: the hydrate keeps a local file that is larger than the bucket's, so a
   // stale duplicated copy would otherwise survive the leader's repair. Local only —
   // nothing is mirrored from a replica that may not be the leader.
-  try { archive.dedupArchive({ publish: false }); }
+  try { await archive.dedupArchive({ publish: false }); }
   catch (e) { console.error(`archive: duplicate repair (local) failed: ${e && e.message}`); }
   if (archiveMirror) {
     // Ingest stays CLOSED across the byte hydrate, not just the index hydrate
@@ -5026,11 +5042,15 @@ async function hydrateArchiveOnce() {
   }
   await hydrateArchiveIndex();
   // The leader repairs what the bucket and Postgres hold, now that both are loaded
-  // (XERK-1450). Synchronous, so no ingest interleaves. A replica promoted after this
-  // point re-runs the whole hydrate from onLeaderPromoted.
+  // (XERK-1450). The pass yields between files; each file's repair is one synchronous
+  // step, so an ingest between them is safe. A replica promoted after this point
+  // re-runs the whole hydrate from onLeaderPromoted. Then, off this path, Postgres
+  // rows that disagree with an already-clean file are re-seated from it.
   if (isLeader()) {
-    try { archive.dedupArchive({ publish: true }); }
+    try { await archive.dedupArchive({ publish: true }); }
     catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+    reseatArchiveIndex().catch((e) =>
+      console.error(`archive: Postgres re-seat failed: ${e && e.message}`));
   }
   // Rendered downloads that failed keep only THEIR transcripts closed; keep
   // retrying them in the background with the rest of the hub ingesting (XERK-1050).
@@ -22093,6 +22113,7 @@ if (process.env.TURMA_TEST) {
     // The duplicate repair's hydrate ordering (XERK-1450) and its mirror op.
     hydrateArchive,
     IndexMirror,
+    reseatArchiveIndex,
     setIndexMirror,
     getIndexMirror: () => indexMirror,
     // The index hydrate's deadline (XERK-1282): a hung load must reject AND cut its
@@ -22879,9 +22900,9 @@ if (process.env.TURMA_TEST) {
     archiveDrainTimer.unref();
   } else {
     // No bucket: the local tree is the whole of-record, so repair it here, once per
-    // boot, before any ingest (XERK-1450).
-    try { archive.dedupArchive({ publish: true }); }
-    catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
+    // boot (XERK-1450). It yields between files; each file's repair is atomic.
+    archive.dedupArchive({ publish: true }).catch((e) =>
+      console.error(`archive: duplicate repair failed: ${e && e.message}`));
   }
   // XERK-764 (wave-3): the cross-replica tunnel directory + control bus. Watch the
   // host->replica directory FIRST (so no owner change is missed during the async
