@@ -433,18 +433,46 @@ function mirrorSession(transcriptId) {
     // mode, XERK-793), returning a copy either way — so the enqueued upsert never
     // aliases the live map row.
     const row = idxGetSession(transcriptId);
-    if (row) indexSink.session(row);
+    if (row) indexSink.session(mirrorRow(row));
   } catch { /* best-effort mirror */ }
 }
+// What is mirrored drops NUL from every string — the session row's and each entry's
+// FTS-indexed {uuid,role,ts,text} projection: Postgres refuses NUL in text ("invalid
+// byte sequence"), failing that write and every refill after it (XERK-1834).
+function mirrorStr(v) {
+  return v ? String(v).replace(/\u0000/g, "") : null;
+}
+function mirrorRow(row) {
+  const out = {};
+  for (const [k, v] of Object.entries(row)) {
+    out[k] = typeof v === "string" ? v.replace(/\u0000/g, "") : v;
+  }
+  return out;
+}
+function mirrorEntry(e) {
+  return { uuid: mirrorStr(e.uuid), role: mirrorStr(e.role), ts: mirrorStr(e.ts),
+    text: e.text ? String(e.text).replace(/\u0000/g, "") : "" };
+}
+// What the mirror re-sends to REFILL a transcript whose queued write it had to drop
+// (XERK-1834): the full current session row and every entry the local `.jsonl`
+// holds. The local file is complete for what this replica ingested, so a wholesale
+// replace from it closes any seq gap. null when there is no filed row or the file
+// can't be read — never an empty list from a missing file, which would wipe the
+// of-record's entries for a copy that just isn't here.
+function mirrorRefillOf(transcriptId) {
+  const row = idxGetSession(transcriptId);
+  if (!row || !row.filePath) return null;
+  let raw;
+  try { raw = fs.readFileSync(filePaths(row.filePath).jsonl, "utf8"); } catch { return null; }
+  return { row: mirrorRow(row), entries: parseEntries(raw).map(mirrorEntry) };
+}
 // Mirror newly-appended entries at ordinals [startSeq, startSeq+n). `list` is the
-// raw entry objects; only the FTS-indexed {uuid,role,ts,text} projection is mirrored,
-// matching what the SQLite entries_fts holds.
+// raw entry objects; only the FTS-indexed projection is mirrored, matching what the
+// SQLite entries_fts holds.
 function mirrorEntries(transcriptId, list, startSeq) {
   if (!indexSink || typeof indexSink.entries !== "function" || !list || !list.length) return;
   try {
-    indexSink.entries(transcriptId, list.map((e) => ({
-      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
-    })), startSeq);
+    indexSink.entries(transcriptId, list.map(mirrorEntry), startSeq);
   } catch { /* best-effort mirror */ }
 }
 // Mirror a wholesale replacement of a transcript's entries (the reconcile heal).
@@ -454,9 +482,7 @@ function mirrorEntries(transcriptId, list, startSeq) {
 function mirrorRepair(transcriptId, list, msgCount, archiveBytes, done) {
   if (!indexSink || typeof indexSink.repair !== "function") return;
   try {
-    indexSink.repair(transcriptId, (list || []).map((e) => ({
-      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
-    })), msgCount, archiveBytes, done);
+    indexSink.repair(transcriptId, (list || []).map(mirrorEntry), msgCount, archiveBytes, done);
   } catch { /* best-effort mirror */ }
 }
 // `gated` (heal paths) drops the replace once this replica is deposed (XERK-1836); the
@@ -464,18 +490,14 @@ function mirrorRepair(transcriptId, list, msgCount, archiveBytes, done) {
 function mirrorReplace(transcriptId, list, gated) {
   if (!indexSink || typeof indexSink.replace !== "function") return;
   try {
-    indexSink.replace(transcriptId, (list || []).map((e) => ({
-      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
-    })), gated === true);
+    indexSink.replace(transcriptId, (list || []).map(mirrorEntry), gated === true);
   } catch { /* best-effort mirror */ }
 }
 // Re-seat a file's held entries at their ordinals without trimming the tail (XERK-1837).
 function mirrorSeat(transcriptId, list) {
   if (!indexSink || typeof indexSink.seat !== "function") return;
   try {
-    indexSink.seat(transcriptId, (list || []).map((e) => ({
-      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
-    })));
+    indexSink.seat(transcriptId, (list || []).map(mirrorEntry));
   } catch { /* best-effort mirror */ }
 }
 
@@ -3643,7 +3665,7 @@ module.exports = {
   // The Postgres INDEX of-record seam (XERK-780): the write sink + the hydration
   // bulk loader + the post-hydrate cursor reconcile (all no-ops off HA — the sink
   // stays unset, and the loader/reconcile only run on the HA hydrate path).
-  setIndexSink, indexLoader, reconcileHydratedCursors,
+  setIndexSink, indexLoader, reconcileHydratedCursors, mirrorRefillOf,
   // The node:sqlite retirement (XERK-793): server.js calls setIndexMode("pg", store)
   // under HA so the index is the in-memory map + Postgres-direct search; sessionLoader
   // is the sessions-only hydration applier.
