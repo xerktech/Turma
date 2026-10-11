@@ -1385,6 +1385,12 @@ test("PgIndexStore.replaceEntries: overwrites in place, then trims — never del
   pool.calls.length = 0;
   await store.replaceEntries("t1", []);
   assert.deepEqual(pool.calls.filter((c) => c.m === "execute").map((c) => c.params), [["t1", 0]]);
+  // A gate that closes after the last batch stops the trim (and reports it).
+  pool.calls.length = 0;
+  let open = true;
+  const gate = () => { const was = open; open = false; return was; };
+  assert.equal(await store.replaceEntries("t1", [ent("u0", "user", "a")], gate), false);
+  assert.deepEqual(pool.calls.filter((c) => c.m === "execute").map((c) => c.text.slice(0, 6)), ["INSERT"]);
   // Appends still never overwrite a held ordinal.
   assert.match(buildEntryInsert("archive", "t1", [ent("u", "user", "x")], 0).text, /DO NOTHING$/);
 });

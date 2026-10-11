@@ -152,6 +152,28 @@ test("isLeader() self-expires when the election loop wedges (split-brain guard)"
   assert.equal(a.isLeader(), false);
 });
 
+test("XERK-1450: re-acquiring after a self-expired lapse fires a demote/promote pair", async () => {
+  // A stalled leader whose lease another replica took and released re-acquires with
+  // `_leader` still set; without the pair, onLeaderPromoted never re-ran.
+  const api = fakeK8s();
+  const a = elector(api, "pod-a", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
+  const b = elector(api, "pod-b", { leaseDurationMs: 1000, renewDeadlineMs: 800 });
+  const changes = [];
+  a.onChange((v) => changes.push([v, a.isLeader()]));
+  await a._tick();
+  await sleep(1200);                     // a stalls past its lease
+  assert.equal(a.isLeader(), false);
+  await b._tick();                       // b leads...
+  assert.equal(b.isLeader(), true);
+  await b.release();                     // ...and hands back (a rolling deploy)
+  await a._tick();                       // a re-acquires
+  assert.equal(a.isLeader(), true);
+  assert.deepEqual(changes, [[true, true], [false, true], [true, true]]);
+  // A renewal inside the lease is no edge.
+  await a._tick();
+  assert.equal(changes.length, 3);
+});
+
 test("the local self-expiry is never LOOSER than a standby's expiry (rounding guard)", () => {
   // XERK-763 QA: leaseSeconds CEILs, and isLeader() bounds on leaseSeconds*1000,
   // so the local split-brain guard's window can never exceed the seconds-granular

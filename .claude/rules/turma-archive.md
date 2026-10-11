@@ -218,7 +218,8 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
     (`leaderTerm`, bumped by `onLeaderPromoted`), re-checked before every batch, the trim, the
     counts and the ack. "Am I leader now" is not enough: a lease lost and won back passed it, and
     the stale repair trimmed the other leader's append (QA). A stopped repair stays pending.
-    Residual: a process pause between a check and its write (no Postgres-side fence).
+    The term relies on the elector emitting a promotion after a lapsed lease is re-won
+    (`turma-ha-leader.md`). Residual: a process pause between a check and its write.
   - `dedupPendingIds` is keyed by id, so never clear it for a file whose row is another file's.
   - Lines are split and written as raw bytes; `bytesStored` is untouched; `dedupChecked` (the size
     covered) skips unchanged files.

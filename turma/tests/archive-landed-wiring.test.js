@@ -291,6 +291,46 @@ test("XERK-1450: the wired IndexMirror drops a repair queued under an earlier le
   }
 });
 
+test("XERK-1450: the wired IndexMirror gates each repair step on leadership + term", async () => {
+  // Each step re-checks: a term change during the replace stops setCounts and the
+  // ack; one during setCounts stops the ack; the gate reaches replaceEntries.
+  let flipIn = null;
+  const calls = [];
+  const store = {
+    async replaceEntries(t, e, proceed) {
+      calls.push(["replace", typeof proceed]);
+      if (flipIn === "replace") hub.onLeaderPromoted();
+      return true;
+    },
+    async setCounts() { calls.push(["counts"]); if (flipIn === "counts") hub.onLeaderPromoted(); },
+  };
+  hub.setIndexMirror(store, true);
+  try {
+    const m = hub.getIndexMirror();
+    let acked = 0;
+    const run = async (when) => {
+      flipIn = when; calls.length = 0;
+      m.sink().repair("t", [{ text: "a" }], 1, 9, () => { acked += 1; });
+      await new Promise((r) => setImmediate(r));
+      await m._drain();
+    };
+    await run("replace");
+    assert.deepEqual(calls, [["replace", "function"]], "no setCounts after the term moved");
+    await run("counts");
+    assert.deepEqual(calls, [["replace", "function"], ["counts"]]);
+    assert.equal(acked, 0, "never acked once the term moved");
+    hub.__setLeader({ isLeader: () => false });
+    await run(null);
+    assert.deepEqual(calls, [], "a follower applies nothing");
+    hub.__setLeader(null);
+    await run(null);
+    assert.equal(acked, 1, "the current leader's repair applies and acks");
+  } finally {
+    hub.__setLeader(null);
+    hub.setIndexMirror(null, false);
+  }
+});
+
 test("XERK-1450: a repair stops between batches once its term is gone", async () => {
   const { PgIndexStore, ENTRY_INSERT_MAX } = require("../index-store.js");
   const calls = [];
