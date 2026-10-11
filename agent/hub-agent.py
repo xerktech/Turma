@@ -51,6 +51,7 @@ import io
 import ipaddress
 import json
 import math
+import operator
 import os
 import re
 import secrets
@@ -109,8 +110,9 @@ _TMUX_CONF = os.path.join(_AGENT_DIR, "tmux.conf")
 # handler calling Event.set() then blocks on that same lock, the next poke in a
 # burst (the hub pokes once per queued command) interrupts it and nests another,
 # and the manager either deadlocks or dies with RecursionError. A non-blocking
-# os.write takes no Python lock, so the handler can't block and can't nest
-# deeper than the signals that land during one write. Windows keeps the Event:
+# os.write takes no Python lock, and on POSIX it is the C-level wakeup fd that
+# writes it, never Python code (_install_sigusr1), so nothing can block or nest
+# (XERK-1606). Windows keeps the Event:
 # its setter is the listener THREAD, never a signal handler, and select() there
 # takes only sockets.
 class _Poke:
@@ -159,9 +161,24 @@ class _Poke:
 _poke = _Poke()
 
 
-def _on_sigusr1(_signum, _frame):
-    """The SIGUSR1 handler. Lock-free: _poke.set() is one non-blocking write."""
-    _poke.set()
+# The SIGUSR1 handler is a C builtin that does nothing, on purpose (XERK-1606).
+# The poke itself is written by signal.set_wakeup_fd from the C-level signal
+# handler (_install_sigusr1). A Python-function handler — even a one-line
+# `_poke.set()` — NESTS under a burst: CPython runs pending handlers at the
+# handler's own bytecode boundaries (function entry, after each call), so every
+# signal landing mid-handler starts another one a frame deeper, and a fast
+# enough burst walks into RecursionError. A C builtin runs no bytecode, so there
+# is no boundary for a second handler to nest at. operator.is_ only because it
+# takes the (signum, frame) pair without side effects or a way to raise.
+_on_sigusr1 = operator.is_
+
+
+def _install_sigusr1():
+    """POSIX, main thread only: make SIGUSR1 set _poke without running Python.
+    The wakeup fd is process-wide, so SIGTERM/SIGINT also poke — harmless, the
+    loop just beats once more on its way out."""
+    signal.set_wakeup_fd(_poke._w, warn_on_full_buffer=False)
+    signal.signal(signal.SIGUSR1, _on_sigusr1)
 
 def _env_num(name, default, cast, *, minimum=None, maximum=None):
     """Read a numeric env var, FALLING BACK to `default` instead of raising.
@@ -39995,7 +40012,7 @@ class SessionManager:
         # it every command sat until the next scheduled beat (up to 20s), which
         # read as the terminal/chat/submit "instability" on native Windows hosts.
         if not IS_WINDOWS:
-            signal.signal(signal.SIGUSR1, _on_sigusr1)
+            _install_sigusr1()
         else:
             _start_poke_listener()
         # SIGTERM/SIGINT = the supervisor is restarting us (an update swapping
