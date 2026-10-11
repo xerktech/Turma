@@ -361,17 +361,12 @@ button and the auto-start sweep.
   `hostOptions` (online-first). `{host}` pins, `{auto:true}` releases, allowlist-checked against
   hosts of that org (offline pinnable, other-org not). `findTicketHost` honors it over availability
   ranking; a pinned-but-offline host **refuses with the pin named, never silently reroutes**.
-- **Model row** — which MODEL runs, default "Default"; rides `spawnTicket`'s `model`
+- **Model row** — which MODEL runs, default the ladder (below); rides `spawnTicket`'s `model`
   (`ticketModelPin`). Alias must be one the org **actually offers** (`orgModelAliases`: its hosts'
   probed `models.available`, non-bracketed, + static aliases); agent re-validates;
   unpinned omits `model`. Menu falls back to static aliases if un-probed, never empty.
-- **An unpinned Model row names the ladder's next tier** (XERK-1830): "Auto (Haiku)", "Auto (Sonnet,
-  retry)" + why, and the picker's release option says the same. `ladderPickOf` (`board.js`, ported to
-  `Board.kt`) derives it from the live fleet + the hub's served `ticketModelLadder` — a mirror of
-  the hub's `ticketLadderPick`/`ticketSpawnModelFields`; change the ladder rule in all three. No
-  ladder served (older hub, `TICKET_MODEL_LADDER=off`) = the old "Default (<probed>)" row.
-  - Derived client-side, not served per ticket: with SSE healthy the board never re-reads
-    `/api/agents`, so a hub-served map would go stale; the per-agent SSE keeps sessions live.
+- **Unpinned, it names the ladder's next tier** (XERK-1830, "Auto (Sonnet, retry)"): `ladderPickOf`
+  (+ `Board.kt`) over the live fleet + served `ticketModelLadder`; rule in `ticket-model-ladder.md`.
 - Tests: `server.test.js`; `modelPinOf`/`modelPickerHtml`/`modelChoices`/`XERK-1830` in `board.test.js`.
 
 ##### Runtime row (XERK-473 dsh, XERK-515 qwen)

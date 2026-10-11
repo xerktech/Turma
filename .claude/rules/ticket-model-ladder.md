@@ -55,5 +55,8 @@ UNDELIVERED runs one tier up (haiku → sonnet → opus, capped). Evidence: `doc
 - **The board mirrors the pick** (XERK-1830): `/api/agents` serves `ticketModelLadder`, and
   `board.js`/`Board.kt` `ladderPickOf` re-derive each ticket's tier for the Model row. Change the
   delivered/failed rule or the runtime exclusions here → change both ports (`turma-board.md`).
+  - Client-side, not a served per-ticket map: with SSE healthy the board never re-reads
+    `/api/agents`, so a served map goes stale; per-agent SSE keeps the sessions it reads live.
+  - No ladder served (older hub, or `off`) → the old "Default (<probed>)" row.
 - Tests: `XERK-1827:` in `server.test.js`; `test_a_ladder_retry_*`/`test_*subagent*`/
   `test_an_ended_ticket_session_reports_its_model` in `TestSpawnTicket`; `bench/tests/test_policy.py`.
