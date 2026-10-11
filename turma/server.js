@@ -4807,6 +4807,8 @@ class IndexMirror {
       await this.store.replaceEntries(op.transcriptId, op.entries, current);
       return;
     }
+    // A follower's heal (XERK-1837): overwrites its own ordinals, never trims the tail.
+    if (op.t === "seat") return this.store.seatEntries(op.transcriptId, op.entries);
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
     if (op.t === "repair") {
       // Re-checked between every write. Stopping leaves the sidecar pending; the
@@ -4830,6 +4832,7 @@ class IndexMirror {
         this._push({ t: "entries", transcriptId, entries, startSeq }),
       replace: (transcriptId, entries, gated) =>
         this._push({ t: "replace", transcriptId, entries, gated: !!gated, term: this.term(), leadAtQueue: this.isLeader() }),
+      seat: (transcriptId, entries) => this._push({ t: "seat", transcriptId, entries }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
       repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
         this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done, term: this.term() }),

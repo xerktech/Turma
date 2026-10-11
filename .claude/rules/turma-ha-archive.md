@@ -267,6 +267,11 @@ of-record**, so both halves of the ADR split now hold:
   own append-only/forward-only/ownership gates (XERK-255/344/573) run in the local index (the in-memory
   map in `pg` mode) BEFORE the mirror fires, so the mirrored value is already the resolved one;
   GREATEST is the belt.
+- **Re-seating from a local copy is a SEAT, never a REPLACE (XERK-1837).** `reindexHeld` and the
+  backfill mirror the `seat` op (`PgIndexStore.seatEntries`: overwrite ordinals [0..n), no trim).
+  `replace` trims seq >= n, so a follower's heal from its stale copy deleted rows another replica
+  had appended by the time it applied. Only a repair (leader-gated, term-checked) or a truncated
+  file's heal-on-read (sqlite mode only) may trim.
 - **Hydration (XERK-793, `pg` mode): sessions-only into the map** (`hydrateSessionsInto` →
   `archive.sessionLoader`) — it pages the SESSION rows out of Postgres into the in-memory `sessionsMap`
   (entries stay in PG; search reads them there), so a promotion is a small, entry-free load. The
