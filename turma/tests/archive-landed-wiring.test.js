@@ -168,11 +168,20 @@ test("a hydrate with an index phase keeps the gate closed across the boundary (X
   let hydrated = 0;
   const calls = await gateCallsOfHydrate({ async hydrateSessionsInto() { hydrated++; } });
   assert.equal(hydrated, 1);
-  assert.deepEqual(calls, [true, true, false], "opened once, at the very end");
+  // Closed before the local repair pass (XERK-1450), again by the byte phase, again by the index phase.
+  assert.deepEqual(calls, [true, true, true, false], "opened once, at the very end");
 });
 
 test("a byte-only hydrate opens the gate when the byte phase ends (XERK-1523)", async () => {
-  assert.deepEqual(await gateCallsOfHydrate(null), [true, false]);
+  assert.deepEqual(await gateCallsOfHydrate(null), [true, true, false]);
+});
+
+test("XERK-1450: ingest is closed for the whole local repair pass before the byte hydrate", async () => {
+  const seen = [];
+  const real = archive.dedupArchive;
+  archive.dedupArchive = async (o) => { seen.push([!!(o && o.publish), archive.isHydrating()]); return 0; };
+  try { await gateCallsOfHydrate(null); } finally { archive.dedupArchive = real; }
+  assert.deepEqual(seen[0], [false, true], "the local pass runs with ingest closed");
 });
 
 // A transcript whose file holds its lines twice (XERK-1364 damage) — the XERK-1450 seed.
@@ -342,6 +351,112 @@ test("XERK-1450: a repair stops between batches once its term is gone", async ()
   const entries = Array.from({ length: ENTRY_INSERT_MAX + 1 }, (_, i) => ({ text: "e" + i }));
   assert.equal(await store.replaceEntries("t1", entries, () => live), false);
   assert.deepEqual(calls, ["INSERT"], "no second batch, and never the trim");
+});
+
+test("XERK-1450: the wired re-seat waits for the mirror, then re-seats a clean file Postgres disagrees with", async () => {
+  const calls = [];
+  const store = {
+    async upsertSession() {}, async appendEntries() {},
+    async replaceEntries(t, e) { calls.push(["replace", t, e.length]); return true; },
+    async setCounts(t, n) { calls.push(["counts", t, n]); },
+    async inconsistentTranscripts() { return [{ transcriptId: "t-rs", msgCount: 9, n: 6, u: 2 }]; },
+  };
+  hub.setIndexMirror(store, true);
+  hub.setArchiveIndexStore(store);
+  try {
+    archive.ingestChunk("nas", "t-rs", { repo: "qa", summary: "t-rs", endedTs: "2026-07-10T00:00:00Z" }, 0, 10,
+      [{ uuid: "a", role: "user", ts: "t", text: "one" }, { uuid: "b", role: "assistant", ts: "t", text: "two" }]);
+    assert.equal(await hub.reseatArchiveIndex(), 1);
+    await new Promise((r) => setImmediate(r));
+    await hub.getIndexMirror()._drain();
+    assert.deepEqual(calls, [["replace", "t-rs", 2], ["counts", "t-rs", 2]]);
+  } finally {
+    hub.setArchiveIndexStore(null);
+    hub.setIndexMirror(null, false);
+  }
+});
+
+test("XERK-1450: the wired hydrate runs the Postgres re-seat after the leader's pass", async () => {
+  let asked = 0;
+  const store = {
+    async upsertSession() {}, async appendEntries() {}, async replaceEntries() { return true; },
+    async setCounts() {}, async hydrateSessionsInto() {},
+    async inconsistentTranscripts() { asked += 1; return []; },
+  };
+  const blob = { async list() { return []; }, async put() {}, async stat() { return null; },
+    async getToFile() { return false; } };
+  hub.setIndexMirror(store, true);
+  hub.setArchiveIndexStore(store);
+  hub.setArchiveMirror(blob, true);
+  try {
+    await hub.hydrateArchiveOnce();
+    for (let i = 0; i < 50 && !asked; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(asked, 1);
+  } finally {
+    hub.setArchiveMirror(null, false);
+    hub.setArchiveIndexStore(null);
+    hub.setIndexMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+    archive.setRenderedGate(null);
+  }
+});
+
+test("XERK-1450: the re-seat asks nothing while the mirror is busy or once deposed", async () => {
+  let asked = 0;
+  const store = { async upsertSession() {}, async appendEntries() {},
+    async inconsistentTranscripts() { asked += 1; return []; } };
+  hub.setIndexMirror(store, true);
+  hub.setArchiveIndexStore(store);
+  try {
+    const m = hub.getIndexMirror();
+    m._running = true;                        // the repair's own ops still draining
+    const run = hub.reseatArchiveIndex();
+    assert.equal(hub.reseatArchiveIndex(), run, "single-flight");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(asked, 0, "waits for the mirror to go idle");
+    m._running = false;
+    assert.equal(await run, 0);
+    assert.equal(asked, 1);
+    hub.__setLeader({ isLeader: () => false });
+    assert.equal(await hub.reseatArchiveIndex(), 0);
+    assert.equal(asked, 1, "a deposed replica never queries");
+  } finally {
+    hub.__setLeader(null);
+    hub.setArchiveIndexStore(null);
+    hub.setIndexMirror(null, false);
+  }
+});
+
+test("XERK-1450: both wired publishing passes stop once this replica stops leading", async () => {
+  const seen = [];
+  const real = archive.dedupArchive;
+  archive.dedupArchive = async (o) => { if (o && o.publish) seen.push(o); return 0; };
+  const blob = { async list() { return []; }, async put() {}, async stat() { return null; },
+    async getToFile(k, dest) { fs.writeFileSync(dest, "x\n"); return true; } };
+  hub.setArchiveMirror(blob, true);
+  try {
+    await hub.hydrateArchiveOnce();                       // the leader's pass after the hydrate
+    const mirror = hub.getArchiveMirror();
+    mirror._blocked.set("repo/t.jsonl", "x");
+    await mirror.retryBlocked();                          // the late-landing pass
+    await new Promise((r) => setImmediate(r));
+    assert.equal(seen.length, 2);
+    for (const o of seen) {
+      assert.equal(typeof o.stillLeader, "function");
+      assert.equal(o.stillLeader(), true);
+      hub.__setLeader({ isLeader: () => false });
+      assert.equal(o.stillLeader(), false, "reads leadership live");
+      hub.__setLeader(null);
+    }
+  } finally {
+    archive.dedupArchive = real;
+    hub.__setLeader(null);
+    hub.setArchiveMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+    archive.setRenderedGate(null);
+  }
 });
 
 test.after(() => { if (hub.server && hub.server.close) hub.server.close(); });

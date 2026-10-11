@@ -357,6 +357,25 @@ class PgIndexStore {
     await this._insertEntriesBatched(transcriptId, entries, startSeq || 0);
   }
 
+  // Transcripts whose entry rows disagree with their own row (XERK-1450): repeated
+  // entries (distinct < rows) or a msg_count that is not the entry count. Returns
+  // `{transcriptId, msgCount, n, u}` for archive.reseatIndexFromFiles, which compares
+  // each against its file. One aggregate over the entries table, run once per
+  // leader hydrate.
+  async inconsistentTranscripts() {
+    await this.ensureSchema();
+    const p = this.prefix;
+    const rows = await this.pool.query(
+      `WITH e AS (SELECT transcript_id, count(*) AS n, ` +
+      `count(DISTINCT (uuid, role, ts, text)) AS u FROM ${p}_entries GROUP BY transcript_id) ` +
+      `SELECT s.transcript_id, s.msg_count, COALESCE(e.n, 0) AS n, COALESCE(e.u, 0) AS u ` +
+      `FROM ${p}_sessions s LEFT JOIN e ON e.transcript_id = s.transcript_id ` +
+      `WHERE COALESCE(e.n, 0) <> COALESCE(e.u, 0) OR s.msg_count <> COALESCE(e.n, 0)`, []);
+    return (rows || []).map((r) => ({
+      transcriptId: r.transcript_id, msgCount: intParam(r.msg_count), n: intParam(r.n), u: intParam(r.u),
+    }));
+  }
+
   // Set a transcript's msgCount/archiveBytes EXACTLY — the one write that may lower
   // them, for the duplicate repair (XERK-1450); upsertSession only ever raises.
   async setCounts(transcriptId, msgCount, archiveBytes) {
