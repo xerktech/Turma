@@ -14717,7 +14717,8 @@ PASTE_CHUNK_GAP_SEC = 0.01
 # the next is typed -- drawn means read. Bounded per message, not per slice
 # (_type_into_pane also runs on the beat); past the bound, or on a pane with no
 # readable composer, the rest falls back to the bare gap. Measured waits are
-# 0.1-0.9s a slice under load, so 5s only bites a composer that never matches.
+# 0.1-0.9s a slice under load; a heavy spike can still spend the 5s across a
+# whole message, and the remaining slices then go with the bare gap.
 PASTE_SLICE_DRAWN_DEADLINE_SEC = _env_float("PASTE_SLICE_DRAWN_DEADLINE_SEC", 5.0,
                                             minimum=0.0)
 PASTE_SLICE_DRAWN_POLL_SEC = 0.03
