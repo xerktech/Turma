@@ -22224,6 +22224,7 @@ if (process.env.TURMA_TEST) {
     TERM_LIVE_BEACON_JS,
     pcmToWav,
     transcribePcm,
+    WHISPER_NON_SPEECH,
     issueWsToken,
     wsTokenValid,
     registerDevice,

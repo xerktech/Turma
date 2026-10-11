@@ -213,7 +213,7 @@ const {
   agentBearerKind, agentHostRefusal, agentPresentedRefusal, resolveEnrollToken, hostAgentToken, tokenHost, ttydAuth,
   controlChannels, pendingChannels, termAgents,
   credentialsMatch, issueSessionToken, sessionTokenValid,
-  pcmToWav, transcribePcm, issueWsToken, wsTokenValid,
+  pcmToWav, transcribePcm, WHISPER_NON_SPEECH, issueWsToken, wsTokenValid,
   TERM_OSC52_JS,
   TERM_SCROLL_BOTTOM_JS,
   TERM_LIVE_BEACON_JS,
@@ -14878,6 +14878,11 @@ test("transcribePcm: Whisper's non-speech output (silence -> 'you') comes back e
     globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: junk, language: "en" }) });
     const result = await transcribePcm(Buffer.from([1]));
     assert.deepEqual(result, { text: "", language: "en" }, junk);
+  }
+  // Every listed phrase, so dropping one from the list fails here.
+  for (const phrase of WHISPER_NON_SPEECH) {
+    globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: ` ${phrase}.` }) });
+    assert.deepEqual(await transcribePcm(Buffer.from([1])), { text: "" }, phrase);
   }
   restoreFetch();
 });
