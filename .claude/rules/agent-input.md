@@ -40,6 +40,11 @@ composed.**
     ~3.4K chars at ~30 load on 16 CPUs was tagged and reordered up to 7/8. Never revert to the bare
     gap. Bounded per MESSAGE (`PASTE_SLICE_DRAWN_DEADLINE_SEC`), not per slice, since this also
     runs on the beat; past it, or with no readable composer (None), the rest falls back to the gap.
+    - **The pane lock outlasts a whole message** (`PANE_TYPE_LOCK_WAIT_SEC` = draw + submit
+      deadlines + settles): a lock wait shorter than one writer's message lets the next writer type
+      into its middle (QA spliced two messages that way). Keep the sum if you change either deadline.
+    - **The comparison is NFC with format chars dropped** (`_composer_norm`): Claude Code draws
+      e+U+0301 as U+00E9 and draws no ZWSP/soft hyphen/BOM/LRM, so a raw compare never matched.
     - A short pane shows only the composer's last lines (~55 chars at 40x12, under the 60-char
       tail), so a box that is itself the text's tail counts too (`_box_ends_with`, at least
       `COMPOSER_MIN_SHOWN_CHARS`); the "holds" read uses the same rule.
@@ -56,7 +61,8 @@ composed.**
   - **Never read one empty composer as "sent"** — a loaded TUI draws typed text seconds late, and
     stopping there left 7/12 stuck in QA. A FRESH session swallows its first Enter whatever the
     gap, so the re-press, not the settle, is the fix. Never Enter on a busy pane (it may be a
-    dialog next). Beat cost: up to the deadline + one capture on the compaction resend.
+    dialog next). Beat cost on the compaction resend: the draw deadline + the submit deadline
+    (each can overshoot by one 5s capture), plus up to `PANE_TYPE_LOCK_WAIT_SEC` waiting out a writer.
     Tests: `TestSubmitTyped`.
   - Windows `_pty_inject` applies the same rule (XERK-1727, `windows-agent.md`). Tests:
     `TestSendInput`, the `_pty_inject` cases in `TestWindowsTerminalBackend`.

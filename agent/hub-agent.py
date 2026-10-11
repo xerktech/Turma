@@ -14716,8 +14716,9 @@ PASTE_CHUNK_GAP_SEC = 0.01
 # So each slice waits until the composer has DRAWN the text typed so far before
 # the next is typed -- drawn means read. Bounded per message, not per slice
 # (_type_into_pane also runs on the beat); past the bound, or on a pane with no
-# readable composer, the rest falls back to the bare gap.
-PASTE_SLICE_DRAWN_DEADLINE_SEC = _env_float("PASTE_SLICE_DRAWN_DEADLINE_SEC", 8.0,
+# readable composer, the rest falls back to the bare gap. Measured waits are
+# 0.1-0.9s a slice under load, so 5s only bites a composer that never matches.
+PASTE_SLICE_DRAWN_DEADLINE_SEC = _env_float("PASTE_SLICE_DRAWN_DEADLINE_SEC", 5.0,
                                             minimum=0.0)
 PASTE_SLICE_DRAWN_POLL_SEC = 0.03
 # Slicing is for ordinary chat-sized text only; anything longer goes as ONE
@@ -14761,8 +14762,12 @@ COMPOSER_MIN_SHOWN_CHARS = 20
 # peer) can type into the same pane, and slices from two messages must never
 # interleave. They share one tmux buffer name too.
 _PANE_TYPE_LOCKS = {}
-# A sliced message takes ~1s under load, so this only trips on a wedged tmux.
-PANE_TYPE_LOCK_WAIT_SEC = 5.0
+# Long enough to outlast the other writer's WHOLE message -- its draw waits
+# plus its submit watch (and their settles) -- or the second writer types into
+# the middle of the first (XERK-1842 QA: an 8s draw wait vs a 5s lock wait
+# spliced two messages). Past it only a wedged tmux holds the lock.
+PANE_TYPE_LOCK_WAIT_SEC = (PASTE_SLICE_DRAWN_DEADLINE_SEC + TYPED_SUBMIT_DEADLINE_SEC
+                           + 2 * TYPED_SUBMIT_SETTLE_SEC + 2.0)
 _PANE_TYPE_LOCKS_GUARD = threading.Lock()
 
 
@@ -14789,12 +14794,22 @@ def _composer_split(cap):
     rules = [i for i, line in enumerate(lines) if _COMPOSER_RULE_RE.match(line)]
     if len(rules) < 2:
         return None
-    strip = lambda part: re.sub(r"\s+", "", "".join(part))
+    strip = lambda part: _composer_norm("".join(part))
     return strip(lines[:rules[-2]]), strip(lines[rules[-2] + 1:rules[-1]])
 
 
+def _composer_norm(text):
+    """Text as compared against the pane: whitespace dropped (the composer
+    wraps), NFC (Claude Code draws e+U+0301 as U+00E9) and format characters
+    dropped (it draws no zero-width space, soft hyphen, BOM or LRM) -- else
+    such a message never reads as drawn (XERK-1842 QA)."""
+    text = unicodedata.normalize("NFC", text or "")
+    return "".join(c for c in text
+                   if not c.isspace() and unicodedata.category(c) != "Cf")
+
+
 def _composer_tail(text):
-    return re.sub(r"\s+", "", text or "")[-COMPOSER_TAIL_CHARS:]
+    return _composer_norm(text)[-COMPOSER_TAIL_CHARS:]
 
 
 def _box_ends_with(box, want):

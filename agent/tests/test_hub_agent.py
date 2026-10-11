@@ -8516,6 +8516,26 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         self.assertIsNone(ha._composer_state(tiny, typed))
         self.assertIsNone(ha._composer_state(frame, typed + " more"))
 
+    def test_text_the_tui_draws_normalised_still_reads_as_drawn(self):
+        # QA (2.1.296): Claude Code draws e+U+0301 as U+00E9 and drops zero-width
+        # / soft-hyphen / BOM / LRM; such a message never matched and cost the
+        # whole deadline, then burst like before.
+        typed = "caf" + "é" + " soft­hy​phen﻿ ‎mark " * 3
+        drawn = unicodedata.normalize("NFC", typed)
+        for ch in "­​﻿‎":
+            drawn = drawn.replace(ch, "")
+        frame = "─" * 40 + "\n❯ " + drawn + "\n" + "─" * 40 + "\n"
+        with mock.patch.object(ha, "_capture_pane", return_value=frame):
+            self.assertTrue(ha._await_slice_drawn("agent-x", typed, time.monotonic()))
+        self.assertEqual(ha._composer_state(frame, typed), "holds")
+
+    def test_the_pane_lock_outlasts_another_writers_whole_message(self):
+        # QA: an 8s draw wait behind a 5s lock wait let a second writer type
+        # into the middle of the first message.
+        self.assertGreater(ha.PANE_TYPE_LOCK_WAIT_SEC,
+                           ha.PASTE_SLICE_DRAWN_DEADLINE_SEC + ha.TYPED_SUBMIT_DEADLINE_SEC
+                           + 2 * ha.TYPED_SUBMIT_SETTLE_SEC)
+
     def test_an_unreadable_composer_falls_back_to_the_gap(self):
         # No composer to read (another TUI, a dead capture): never wait on it.
         self.make_manager()
