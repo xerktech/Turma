@@ -544,6 +544,84 @@
       + `|${view.counts.running},${view.counts.ready},${view.counts.blocked}`;
   }
 
+  // Every child of an epic the board carries (`epicKey` names it), in column
+  // order — independent of any run, so an un-armed, cancelled or finished epic
+  // still lists its sub-tickets. A run's `children` is only what it was armed
+  // over; this is what the board holds now. Each: {key, summary, category}.
+  function epicChildrenOf(site, epicKey) {
+    if (!epicKey) return [];
+    const order = CATEGORIES.map(([c]) => c);
+    return ((site && site.tickets) || [])
+      .filter((t) => t && t.key && t.key !== epicKey && String(t.epicKey || "") === String(epicKey))
+      .map((t) => ({ key: String(t.key), summary: t.summary || "", category: categoryOf(t) }))
+      .sort((a, b) => order.indexOf(a.category) - order.indexOf(b.category));
+  }
+
+  // Layer an epic's children into dependency waves — a mirror of server.js
+  // buildEpicWaves / epic-plan.js layerWaves (parity pinned in epic-plan.test.js),
+  // so an un-armed epic previews exactly the waves arming would build. Only
+  // in-set blockers order the waves; input order is kept within a wave.
+  function epicLayerWaves(childRows) {
+    const keys = [];
+    const seen = new Set();
+    for (const r of childRows || []) {
+      if (r && typeof r.key === "string" && r.key && !seen.has(r.key)) {
+        seen.add(r.key);
+        keys.push(r.key);
+      }
+    }
+    const inSet = new Set(keys);
+    const byKey = new Map();
+    for (const r of childRows || []) if (r && r.key) byKey.set(r.key, r);
+    const blockers = new Map();
+    for (const k of keys) {
+      const r = byKey.get(k);
+      const bs = Array.isArray(r && r.blockedBy) ? r.blockedBy : [];
+      blockers.set(k, [...new Set(bs.filter(
+        (b) => typeof b === "string" && inSet.has(b) && b !== k))]);
+    }
+    const waves = [];
+    const placed = new Set();
+    let remaining = keys.slice();
+    while (remaining.length) {
+      const wave = remaining.filter((k) => blockers.get(k).every((b) => placed.has(b)));
+      if (!wave.length) break;
+      for (const k of wave) placed.add(k);
+      waves.push(wave);
+      remaining = remaining.filter((k) => !placed.has(k));
+    }
+    return { waves, cycle: remaining };
+  }
+
+  // A run-shaped preview of an UN-armed epic, built from the board's children
+  // the way armEpicRun would build it now — fed to epicRunView so the panel
+  // shows the same waves, groupings and progress an armed run does.
+  function epicPreviewRun(site, epicKey) {
+    const kids = ((site && site.tickets) || []).filter((t) =>
+      t && t.key && t.key !== epicKey && String(t.epicKey || "") === String(epicKey));
+    const { waves, cycle } = epicLayerWaves(kids);
+    const children = [...new Set(kids.map((t) => t.key))].slice(0, 500);  // server EPIC_RUN_CHILDREN_MAX
+    const run = { epicKey, siteKey: (site && site.siteKey) || "", state: "running", children, waves };
+    if (cycle.length) run.cycle = cycle;
+    return run;
+  }
+
+  // The open panel's epic repaint signature: armed-vs-preview (the preview is
+  // always "running", so epicRunSig alone can't tell a Start/Cancel apart) plus
+  // the wave layout with each child's status (a blockedBy change re-layers, or
+  // two children swap status, without moving any count).
+  function epicPanelSig(view, armed) {
+    if (!view) return "";
+    const keys = (list) => list.map((c) => `${c.key}:${c.status}`).join(",");
+    return `${armed ? "run" : "preview"}:${epicRunSig(view)}`
+      + `|${view.waves.map(keys).join(";")}|${keys(view.cycleChildren)}`;
+  }
+
+  // The repaint signature of epicChildrenOf's list (see epicRunSig).
+  function epicChildrenSig(children) {
+    return (children || []).map((c) => `${c.key}:${c.category}:${c.summary}`).join("|");
+  }
+
   // The compact epic-run affordance on the CARD, in place of the per-ticket Start
   // (an epic is an organizer, so it never offers a work-session Start). No run yet
   // → a Start-epic button; an armed run → a state+progress chip that opens the
@@ -589,21 +667,17 @@
     const o = opts || {};
     const key = (t && t.key) || "";
     const err = o.error ? `<div class="td-note td-err">${esc(o.error)}</div>` : "";
-    if (!view) {
-      const btn = o.pending
-        ? `<span class="epic-btn epic-btn-busy">⏳ starting…</span>`
-        : `<button class="epic-btn" type="button" data-epic-arm="${esc(key)}">▶ Start epic run</button>`;
-      return `<section class="td-section epic-run">
-          <h3>Epic run</h3>
-          <p class="epic-desc">This epic isn't being auto-orchestrated yet. Starting the run works its
-            children in dependency order — ready children start in parallel, each completed wave unlocks
-            the next, and the epic closes itself once every child is Done.</p>
-          ${err}<div class="epic-actions">${btn}</div>
-        </section>`;
-    }
-    const stateLabel = view.paused ? "Paused"
-      : view.state === "done" ? "Done"
-      : view.state === "blocked" ? "Blocked" : "Running";
+    // A board child (epicChildrenOf) row: its column, not a run status.
+    const boardChildLi = (c) => {
+      const label = (CATEGORIES.find(([k]) => k === c.category) || [, ""])[1];
+      return `<li class="epic-child epic-cat-${esc(c.category)}">
+          <span class="epic-child-dot"></span>
+          <span class="epic-child-key">${esc(c.key)}</span>
+          <span class="epic-child-sum">${esc(c.summary)}</span>
+          <span class="epic-child-st">${esc(label)}</span>
+        </li>`;
+    };
+    const boardKids = Array.isArray(o.children) ? o.children : [];
     const childLi = (c) => {
       const st = c.status === "done" ? "Done"
         : c.status === "running" ? "In progress"
@@ -615,19 +689,55 @@
           <span class="epic-child-st">${st}</span>
         </li>`;
     };
-    const waveHtml = view.waves.map((w, i) =>
+    // The wave-by-wave list (and the cycle group) of a run view — shared by an
+    // armed run and an un-armed epic's preview, so both read the same.
+    const wavesHtml = (v) => v.waves.map((w, i) =>
       `<li class="epic-wave">
           <div class="epic-wave-h">Wave ${i + 1}</div>
           <ul class="epic-wave-list">${w.map(childLi).join("")}</ul>
-        </li>`).join("");
-    const cycleHtml = view.cycleChildren.length
-      ? `<li class="epic-wave epic-wave-cycle">
+        </li>`).join("")
+      + (v.cycleChildren.length
+        ? `<li class="epic-wave epic-wave-cycle">
             <div class="epic-wave-h">Cyclic — never becomes ready</div>
-            <ul class="epic-wave-list">${view.cycleChildren.map(childLi).join("")}</ul>
+            <ul class="epic-wave-list">${v.cycleChildren.map(childLi).join("")}</ul>
+          </li>`
+        : "");
+    const emptyHtml = `<div class="td-none">This epic has no children on the board yet.</div>`;
+    if (!view) {
+      // An un-armed epic draws the waves arming would build (`o.preview`, an
+      // epicRunView over epicPreviewRun); absent = a caller that doesn't
+      // resolve them, so say nothing.
+      const p = o.preview;
+      const previewHtml = !p ? "" : p.total
+        ? `<div class="epic-prog"><span class="epic-prog-num">${p.done} / ${p.total} done</span>
+            ${epicProgressBarHtml(p)}</div>
+          <ul class="epic-children">${wavesHtml(p)}</ul>`
+        : emptyHtml;
+      const btn = o.pending
+        ? `<span class="epic-btn epic-btn-busy">⏳ starting…</span>`
+        : `<button class="epic-btn" type="button" data-epic-arm="${esc(key)}">▶ Start epic run</button>`;
+      return `<section class="td-section epic-run">
+          <h3>Epic run${p ? ` <span class="epic-state epic-idle">Not started</span>` : ""}</h3>
+          <p class="epic-desc">This epic isn't being auto-orchestrated yet. Starting the run works its
+            children in dependency order — ready children start in parallel, each completed wave unlocks
+            the next, and the epic closes itself once every child is Done.</p>
+          ${previewHtml}${err}<div class="epic-actions">${btn}</div>
+        </section>`;
+    }
+    const stateLabel = view.paused ? "Paused"
+      : view.state === "done" ? "Done"
+      : view.state === "blocked" ? "Blocked" : "Running";
+    // Children on the board the run was not armed over (added since) — listed
+    // so the panel always shows every sub-ticket; a Re-arm folds them in.
+    const inRun = new Set([...view.waves.flat(), ...view.cycleChildren].map((c) => c.key));
+    const outside = boardKids.filter((c) => !inRun.has(c.key));
+    const outsideHtml = outside.length
+      ? `<li class="epic-wave epic-wave-outside">
+            <div class="epic-wave-h">Not in this run</div>
+            <ul class="epic-wave-list">${outside.map(boardChildLi).join("")}</ul>
           </li>`
       : "";
-    const emptyNote = view.total === 0
-      ? `<div class="td-none">This epic has no children on the board yet.</div>` : "";
+    const emptyNote = view.total === 0 && !outside.length ? emptyHtml : "";
     const cycleNote = view.cycle
       ? `<div class="td-note td-err">Some children form a dependency cycle and can never become
            ready — untangle the blocks in the tracker, then re-arm.</div>` : "";
@@ -657,7 +767,7 @@
         <div class="epic-prog"><span class="epic-prog-num">${view.done} / ${view.total} done</span>
           ${epicProgressBarHtml(view)}</div>
         ${pausedNote}${cycleNote}${err}${emptyNote}
-        <ul class="epic-children">${waveHtml}${cycleHtml}</ul>
+        <ul class="epic-children">${wavesHtml(view)}${outsideHtml}</ul>
         <div class="epic-actions">${actions}</div>
       </section>`;
   }
@@ -2323,7 +2433,7 @@
       </div>
       <h2 class="td-summary">${esc(v("summary") || "")}</h2>
       <dl class="td-fields">${fields}</dl>
-      ${isEpicTicket(t) ? epicRunPanelHtml(t, o.epicRun, { pending: o.epicRunPending, error: o.epicRunError }) : ""}
+      ${isEpicTicket(t) ? epicRunPanelHtml(t, o.epicRun, { pending: o.epicRunPending, error: o.epicRunError, children: o.epicChildren, preview: o.epicPreview }) : ""}
       ${body}
       <div class="td-foot"><a href="${safeUrl(v("url"))}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
   }
@@ -2649,7 +2759,7 @@
     statusFieldHtml, statusPickerHtml, statusPickerValue,
     triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
     isEpicTicket, epicRunOf, epicRunView, epicRunSig,
-    epicCardControlHtml, epicProgressBarHtml, epicRunPanelHtml,
+    epicCardControlHtml, epicProgressBarHtml, epicRunPanelHtml, epicChildrenOf, epicChildrenSig, epicLayerWaves, epicPreviewRun, epicPanelSig,
     FILTER_FIELDS, SORTS, emptyBoardView, boardViewActive, boardViewFilterCount, priorityRank,
     ticketFacets, ticketSearchMatch, boardViewMatches, boardViewSort, boardFilterGroups,
     boardViewFromParams, boardViewToParams, hasBoardViewParams,

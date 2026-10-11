@@ -112,10 +112,13 @@ import com.xerktech.turma.core.createLabelWord
 import com.xerktech.turma.core.displayColumnOf
 import com.xerktech.turma.core.edgeScrollStep
 import com.xerktech.turma.core.EpicBuilderRow
+import com.xerktech.turma.core.EpicBoardChild
 import com.xerktech.turma.core.EpicChild
 import com.xerktech.turma.core.EpicChildStatus
 import com.xerktech.turma.core.epicBuilderRows
 import com.xerktech.turma.core.epicBuilderStateLabel
+import com.xerktech.turma.core.epicChildrenOf
+import com.xerktech.turma.core.epicPreviewRun
 import com.xerktech.turma.core.EpicRunView
 import com.xerktech.turma.core.epicRunOf
 import com.xerktech.turma.core.epicRunView
@@ -480,14 +483,19 @@ fun BoardScreen(
         val triageAction = triageActionOf(fleet.ticketTriageActions, site.siteKey, ticket.key)
         // The epic-run view (XERK-638), only for an epic — resolved against the
         // LIVE site so a child finishing while the sheet is open shows at once.
+        val liveSite = sites.find { it.siteKey == site.siteKey } ?: site
         val epicView = if (isEpicTicket(ticket)) {
-            val liveSite = sites.find { it.siteKey == site.siteKey } ?: site
             epicRunOf(fleet.epicRuns, site.siteKey, ticket.key)
                 ?.let { epicRunView(it, liveSite, sessionIndex, ticketQueue) }
         } else null
+        // An un-armed epic previews the waves arming would build (board.js epicPreviewRun).
+        val epicPreview = if (isEpicTicket(ticket) && epicView == null)
+            epicRunView(epicPreviewRun(liveSite, ticket.key), liveSite, sessionIndex, ticketQueue) else null
+        // Every child on the board, run or no run (board.js epicChildrenOf).
+        val epicChildren = if (isEpicTicket(ticket)) epicChildrenOf(liveSite, ticket.key) else emptyList()
         // A session that closed this ticket itself (XERK-1569) — web's "Closed by" row.
         val closedBy = ticketOutcomeOf(ticketSessionsOf(sessionIndex, site.siteKey, ticket.key))
-        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, vm, closedBy, onDismiss = { detail = null })
+        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, epicPreview, epicChildren, vm, closedBy, onDismiss = { detail = null })
     }
 
     if (filterOpen) {
@@ -978,7 +986,14 @@ private fun EpicCardControl(view: EpicRunView?, onStartEpic: () -> Unit) {
  * inline in the hub's own words (XERK-264).
  */
 @Composable
-private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, vm: BoardViewModel) {
+private fun EpicRunSection(
+    site: BoardSite,
+    t: JiraTicket,
+    view: EpicRunView?,
+    preview: EpicRunView?,
+    children: List<EpicBoardChild>,
+    vm: BoardViewModel,
+) {
     val scope = rememberCoroutineScope()
     var busy by remember(t.key) { mutableStateOf(false) }
     var error by remember(t.key) { mutableStateOf<String?>(null) }
@@ -1002,6 +1017,9 @@ private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, v
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             SectionLabel("Epic run")
+            if (view == null && preview != null) {
+                Pill("Not started", color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
             if (view != null) {
                 val label = when { view.paused -> "Paused"; view.state == "done" -> "Done"; view.state == "blocked" -> "Blocked"; else -> "Running" }
                 Pill(label, color = epicStateColor(if (view.paused) "paused" else view.state))
@@ -1017,6 +1035,19 @@ private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, v
                     "next, and the epic closes itself once every child is Done.",
                 style = MaterialTheme.typography.bodyMedium,
             )
+            // The waves arming would build, drawn exactly as an armed run's.
+            if (preview != null) {
+                if (preview.total == 0) {
+                    Text("This epic has no children on the board yet.", style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                } else {
+                    Text("${preview.done} / ${preview.total} done", style = MaterialTheme.typography.bodyMedium, fontFamily = FontFamily.Monospace)
+                    EpicProgressBar(preview)
+                    preview.waves.forEachIndexed { i, wave -> EpicWaveGroup("Wave ${i + 1}", wave, cyclic = false) }
+                    if (preview.cycleChildren.isNotEmpty()) {
+                        EpicWaveGroup("Cyclic — never becomes ready", preview.cycleChildren, cyclic = true)
+                    }
+                }
+            }
             if (busy) Text("⏳ starting…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             else Button(onClick = { act(false) }) { Text("▶ Start epic run") }
         } else {
@@ -1037,7 +1068,10 @@ private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, v
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error,
                 )
             }
-            if (view.total == 0) {
+            // Board children the run was not armed over (added since) — a Re-arm folds them in.
+            val inRun = (view.waves.flatten() + view.cycleChildren).map { it.key }.toSet()
+            val outside = children.filterNot { it.key in inRun }
+            if (view.total == 0 && outside.isEmpty()) {
                 Text("This epic has no children on the board yet.", style = MaterialTheme.typography.bodySmall, fontStyle = FontStyle.Italic, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
             view.waves.forEachIndexed { i, wave ->
@@ -1046,6 +1080,7 @@ private fun EpicRunSection(site: BoardSite, t: JiraTicket, view: EpicRunView?, v
             if (view.cycleChildren.isNotEmpty()) {
                 EpicWaveGroup("Cyclic — never becomes ready", view.cycleChildren, cyclic = true)
             }
+            if (outside.isNotEmpty()) EpicBoardChildGroup("Not in this run", outside)
             if (busy) {
                 Text("⏳ working…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
@@ -1109,6 +1144,28 @@ private fun EpicWaveGroup(title: String, children: List<EpicChild>, cyclic: Bool
                 Text(c.key, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 Text(c.summary, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.weight(1f))
                 Text(epicChildLabel(c.status), style = MaterialTheme.typography.labelSmall, color = epicChildColor(c.status))
+            }
+        }
+    }
+}
+
+/** A labelled list of an epic's board children, each tinted by its column (board.js boardChildLi). */
+@Composable
+private fun EpicBoardChildGroup(title: String, children: List<EpicBoardChild>) {
+    Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+        Text(title.uppercase(), style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        for (c in children) {
+            val color = when (c.category) {
+                "done" -> TurmaColors.good
+                "inprogress", "review" -> MaterialTheme.colorScheme.primary
+                else -> MaterialTheme.colorScheme.onSurfaceVariant
+            }
+            val label = BOARD_CATEGORIES.firstOrNull { it.first == c.category }?.second.orEmpty()
+            Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                Box(Modifier.size(8.dp).clip(CircleShape).background(color))
+                Text(c.key, fontFamily = FontFamily.Monospace, style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                Text(c.summary, style = MaterialTheme.typography.bodyMedium, maxLines = 1, modifier = Modifier.weight(1f))
+                Text(label, style = MaterialTheme.typography.labelSmall, color = color)
             }
         }
     }
@@ -1770,6 +1827,8 @@ private fun TicketDetailSheet(
     platformInheritedFrom: String?,
     triageAction: String?,
     epicView: EpicRunView?,
+    epicPreview: EpicRunView?,
+    epicChildren: List<EpicBoardChild>,
     vm: BoardViewModel,
     closedBy: TicketSession?,
     onDismiss: () -> Unit,
@@ -1814,7 +1873,7 @@ private fun TicketDetailSheet(
             // An epic is an organizer: it shows the epic-run panel (Start/progress),
             // not the work-ticket pins (repo/agent/model/runtime), which don't apply.
             if (isEpicTicket(t)) {
-                EpicRunSection(site, t, epicView, vm)
+                EpicRunSection(site, t, epicView, epicPreview, epicChildren, vm)
                 // The host-OS requirement applies to an epic too (XERK-693) —
                 // setting it here is what constrains all the epic's subtasks.
                 PlatformSection(site, t, platformPin, null, null, vm)

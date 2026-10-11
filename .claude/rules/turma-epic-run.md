@@ -56,6 +56,8 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   `layerWaves` in `turma/epic-plan.js` is a byte-for-byte copy, and `_epic_plan_cycle` in
   `hub-agent.py` its Python twin — so a builder's plan previews as the exact waves this run executes.
   Change the layering here and both move too; `turma/tests/epic-plan.test.js` pins the parity.
+- **A THIRD mirror is the board's un-armed preview**: `epicLayerWaves` in `board.js` (+ the
+  `core/Board.kt` port) lays out an un-armed epic as arming would; same parity test pins it.
 - `epicChildRows(siteKey, epicKey, rows)` resolves the children from `fleetTicketRows()` — the
   board's own resolved view (XERK-634 `epicKey`), never a raw walk of `agents`.
 

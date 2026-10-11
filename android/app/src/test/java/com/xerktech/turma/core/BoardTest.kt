@@ -1343,6 +1343,53 @@ class BoardTest {
         assertNull(ticketStartControl(e, 0, null, null))
     }
 
+    @Test fun `epicChildrenOf lists every board child of the epic in column order`() {
+        val site = epicSite(listOf(
+            child("C-3", cat = "done", summary = "third").copy(epicKey = "E-1"),
+            child("C-1", summary = "first").copy(epicKey = "E-1"),
+            child("C-2", cat = "inprogress", summary = "second").copy(epicKey = "E-1", status = "In Review"),
+            child("X-9").copy(epicKey = "E-2"),
+            child("Y-1"),
+        ))
+        assertEquals(
+            listOf(
+                EpicBoardChild("C-1", "first", "todo"),
+                EpicBoardChild("C-2", "second", "review"),
+                EpicBoardChild("C-3", "third", "done"),
+            ),
+            epicChildrenOf(site, "E-1"),
+        )
+        assertTrue(epicChildrenOf(site, "").isEmpty())
+    }
+
+    @Test fun `epic children and preview never include the epic itself`() {
+        val site = BoardSite(siteKey = "org", site = "org", online = true, error = null, fetchedAt = "",
+            tickets = listOf(epicTicket("E-1").copy(epicKey = "E-1"), child("C-1").copy(epicKey = "E-1")))
+        assertEquals(listOf("C-1"), epicChildrenOf(site, "E-1").map { it.key })
+        assertEquals(listOf("C-1"), epicPreviewRun(site, "E-1").children)
+    }
+
+    @Test fun `epicPreviewRun lays out an un-armed epic the way arming would`() {
+        val site = epicSite(listOf(
+            child("C-1", cat = "done").copy(epicKey = "E-1"),
+            child("C-2", blockedBy = listOf("C-1")).copy(epicKey = "E-1"),
+            child("C-3", blockedBy = listOf("C-1", "X-9")).copy(epicKey = "E-1"),
+            child("C-4", blockedBy = listOf("C-2", "C-3")).copy(epicKey = "E-1"),
+            child("C-5", blockedBy = listOf("C-6")).copy(epicKey = "E-1"),
+            child("C-6", blockedBy = listOf("C-5")).copy(epicKey = "E-1"),
+            child("X-9").copy(epicKey = "E-2"),
+        ))
+        val run = epicPreviewRun(site, "E-1")
+        assertEquals(listOf("C-1", "C-2", "C-3", "C-4", "C-5", "C-6"), run.children)
+        assertEquals(listOf(listOf("C-1"), listOf("C-2", "C-3"), listOf("C-4")), run.waves)
+        assertEquals(listOf("C-5", "C-6"), run.cycle)
+        val view = epicRunView(run, site, emptyMap())
+        assertEquals(6, view.total)
+        assertEquals(1, view.done)
+        assertEquals(EpicChildStatus.READY, view.waves[1][0].status)
+        assertEquals(EpicChildStatus.BLOCKED, view.waves[2][0].status)
+    }
+
     @Test fun `epicRunView derives child status from the live board`() {
         // C-1 Done; C-2 has a running session; C-3 unstarted, its in-epic blocker
         // C-2 not Done -> blocked.
