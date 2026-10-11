@@ -103,9 +103,11 @@ class ChatQuestionTest {
         hub.awaitFlow(vm.state) { it.panePrompt?.prompt == "Do you want to proceed?" }
         assertEquals(listOf(1, 2), vm.state.value.panePrompt?.options?.map { it.number })
 
-        vm.answerPanePrompt(2)
+        val job = vm.answerPanePrompt(2)
         // Hidden at once — the fleet still reports the dialog, only the guard hides it.
         assertEquals(null, vm.state.value.panePrompt)
+        // Let the POST + nudge finish inside the test, so nothing touches Main after it.
+        kotlinx.coroutines.runBlocking { job?.join() }
         val req = hub.findRequest("/pane-prompt")
         assertEquals("""{"optionNumber":2}""", req.body.readUtf8())
         vm.onLeave()
@@ -121,7 +123,8 @@ class ChatQuestionTest {
         vm.onEnter()
         hub.awaitFlow(vm.state) { it.panePrompt != null }
 
-        vm.answerPanePrompt(1)
+        val job = vm.answerPanePrompt(1)
+        kotlinx.coroutines.runBlocking { job?.join() }
         hub.awaitFlow(vm.state) { it.panePrompt?.prompt == "Do you want to proceed?" }
         vm.onLeave()
     }

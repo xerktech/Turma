@@ -613,10 +613,10 @@ class ChatViewModel(
      * a stale beat can't type a stray digit into the composer. The sheet hides at
      * once (web chat.js answerPanePrompt) and comes back if the POST fails.
      */
-    fun answerPanePrompt(optionNumber: Int) {
-        val prompt = _state.value.panePrompt?.let(::panePromptKey) ?: return
+    fun answerPanePrompt(optionNumber: Int): Job? {
+        val prompt = _state.value.panePrompt?.let(::panePromptKey) ?: return null
         _state.update { it.copy(answeredPanePrompt = prompt, answeredPanePromptAt = System.currentTimeMillis()) }
-        viewModelScope.launch {
+        return viewModelScope.launch {
             val r = runCatching { client.api.answerPanePrompt(host, sessionId, PanePromptAnswer(optionNumber)) }
             if (r.isFailure) {
                 _state.update { if (it.answeredPanePrompt == prompt) it.copy(answeredPanePrompt = null) else it }

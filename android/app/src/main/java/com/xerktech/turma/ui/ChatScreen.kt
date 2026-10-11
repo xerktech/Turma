@@ -12,6 +12,10 @@ import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.ui.unit.Dp
+import androidx.compose.runtime.mutableIntStateOf
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.FlowRow
@@ -68,7 +72,6 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
@@ -165,15 +168,22 @@ fun ChatScreen(
         }
     }
     val scope = androidx.compose.runtime.rememberCoroutineScope()
+    // The top bar's and the compose footer's MEASURED heights, for the waiting
+    // sheets' cap ([waitingSheetCap]) — both grow with the font scale.
+    val density = androidx.compose.ui.platform.LocalDensity.current
+    var topBarPx by remember { mutableIntStateOf(0) }
+    var footerPx by remember { mutableIntStateOf(0) }
 
+    // Lift the whole screen above the soft keyboard (XERK-76): the app is
+    // edge-to-edge, so without this the IME simply overlays the compose box
+    // and you can't see what you're typing. imePadding consumes the inset,
+    // so the bottomBar (footer + question sheet) lands right on the keyboard.
+    BoxWithConstraints(Modifier.imePadding()) {
+    val sheetMax = with(density) { waitingSheetCap(maxHeight, topBarPx.toDp(), footerPx.toDp()) }
     Scaffold(
-        // Lift the whole screen above the soft keyboard (XERK-76): the app is
-        // edge-to-edge, so without this the IME simply overlays the compose box
-        // and you can't see what you're typing. imePadding consumes the inset,
-        // so the bottomBar (footer + question sheet) lands right on the keyboard.
-        modifier = Modifier.imePadding(),
         topBar = {
             TopAppBar(
+                modifier = Modifier.onSizeChanged { topBarPx = it.height },
                 title = {
                     Column {
                         Text(state.session?.let { sessionName(it) } ?: "Session", maxLines = 1)
@@ -266,6 +276,7 @@ fun ChatScreen(
                         state.questionOptions.map { com.xerktech.turma.model.QuestionOption(label = it) }
                     }
                     QuestionSheet(
+                        maxHeight = sheetMax,
                         question = state.question,
                         header = state.questionHeader,
                         index = state.questionIndex,
@@ -276,7 +287,8 @@ fun ChatScreen(
                         onAnswerMulti = { vm.answerMulti(it) },
                     )
                 }
-                state.panePrompt?.let { p -> PanePromptSheet(p, onPick = vm::answerPanePrompt) }
+                state.panePrompt?.let { p -> PanePromptSheet(p, sheetMax, onPick = vm::answerPanePrompt) }
+                Box(Modifier.onSizeChanged { footerPx = it.height }) {
                 ChatFooter(
                     session = state.session,
                     draft = state.draft,
@@ -303,6 +315,7 @@ fun ChatScreen(
                     onAttach = vm::attach,
                     onRemoveAttachment = vm::removeAttachment,
                 )
+                }
             }
         },
     ) { pad ->
@@ -350,6 +363,7 @@ fun ChatScreen(
                 }
             }
         }
+    }
     }
 }
 
@@ -525,6 +539,7 @@ private fun AgentsList(
 
 @Composable
 private fun QuestionSheet(
+    maxHeight: androidx.compose.ui.unit.Dp,
     question: String,
     header: String,
     index: Int?,
@@ -537,7 +552,7 @@ private fun QuestionSheet(
     val picks = remember(question) { mutableStateListOf<Int>() }
     Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
         Column(
-            Modifier.heightIn(max = waitingSheetMaxHeight()).verticalScroll(rememberScrollState()).padding(12.dp),
+            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             if (header.isNotBlank() || (total != null && total > 1)) {
@@ -565,16 +580,18 @@ private fun QuestionSheet(
 
 /**
  * The tallest a question / permission sheet may grow before it scrolls. The
- * Scaffold's bottomBar is measured against the whole screen, so a sheet taller
- * than what is left under the top bar draws OVER it (landscape: Kill and the
- * terminal button became untappable). Reserve the top bar + chips + composer,
- * never more than half the screen.
+ * Scaffold's bottomBar is measured against the whole window, so a sheet taller
+ * than what is left between the top bar and the compose footer draws OVER the
+ * top bar (landscape, or a large font scale: Kill and Terminal untappable).
+ * Both are MEASURED, since they grow with the font scale; [CHAT_SHEET_GAP] keeps
+ * a strip of transcript visible. Never more than half the window, and never
+ * below [CHAT_SHEET_MIN] so at least one option shows.
  */
-@Composable
-private fun waitingSheetMaxHeight(): androidx.compose.ui.unit.Dp {
-    val screen = LocalConfiguration.current.screenHeightDp
-    return minOf(screen / 2, screen - 280).coerceAtLeast(96).dp
-}
+internal fun waitingSheetCap(window: Dp, topBar: Dp, footer: Dp): Dp =
+    minOf(window / 2, window - topBar - footer - CHAT_SHEET_GAP).coerceAtLeast(CHAT_SHEET_MIN)
+
+internal val CHAT_SHEET_GAP = 24.dp
+internal val CHAT_SHEET_MIN = 56.dp
 
 /**
  * The TUI's blocking dialog — a tool-permission request or a plan approval —
@@ -583,10 +600,14 @@ private fun waitingSheetMaxHeight(): androidx.compose.ui.unit.Dp {
  * option, the TUI cursor's row outlined. Tapping a card answers by its number.
  */
 @Composable
-private fun PanePromptSheet(prompt: com.xerktech.turma.model.PanePrompt, onPick: (Int) -> Unit) {
+private fun PanePromptSheet(
+    prompt: com.xerktech.turma.model.PanePrompt,
+    maxHeight: androidx.compose.ui.unit.Dp,
+    onPick: (Int) -> Unit,
+) {
     Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
         Column(
-            Modifier.heightIn(max = waitingSheetMaxHeight()).verticalScroll(rememberScrollState()).padding(12.dp),
+            Modifier.heightIn(max = maxHeight).verticalScroll(rememberScrollState()).padding(12.dp),
             verticalArrangement = Arrangement.spacedBy(6.dp),
         ) {
             Pill("waiting", color = MaterialTheme.colorScheme.primary)
