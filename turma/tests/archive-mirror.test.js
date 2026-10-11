@@ -1101,6 +1101,20 @@ test("a newly blocked key is retried before hung keys with escalated deadlines (
   assert.deepEqual(gets, ["repo/fresh.jsonl", "repo/hung.jsonl"]);
 });
 
+test("escalated keys are retried least-escalated first (XERK-1833 QA)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const gets = [];
+  const store = { list: async () => [], stat: async () => null,
+    getToFile: (k) => { gets.push(k); return new Promise(() => {}); } };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  m._blocked.set("repo/worse.jsonl", "x");
+  m._blocked.set("repo/better.jsonl", "x");
+  m._getDeadline.set("repo/worse.jsonl", 40);
+  m._getDeadline.set("repo/better.jsonl", 20);
+  await m.retryBlocked({ getDeadlineMs: 10 });
+  assert.deepEqual(gets, ["repo/better.jsonl", "repo/worse.jsonl"]);
+});
+
 test("a retry GET cut by a hydrate never lands, even while its key stays blocked (XERK-1833 QA)", async () => {
   const root = mkdtemp("turma-mir-");
   const held = [];
@@ -1168,7 +1182,8 @@ test("a retryBlocked GET that never settles is bounded and cannot wedge a hydrat
   await hyd;
   assert.deepEqual(gets, ["repo/b.jsonl"]);
   assert.equal(m.hydrated, true);
-  // The yield is per pass: the next retry pass fetches what this one left.
+  // The yield is per pass: the next retry pass fetches b again (the hydrate's
+  // empty listing already forgot a).
   m._blocked.set("repo/b.jsonl", "x");
   const next = m.retryBlocked({ getDeadlineMs: 2000 });
   await new Promise((r) => setImmediate(r));
