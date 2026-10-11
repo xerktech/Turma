@@ -936,7 +936,7 @@ test("a hydrate pass that never settles is abandoned and retried, ingest gated t
   await m.hydrateGated((v) => gate.push(v), { passDeadlineMs: 20, firstDelayMs: 1, sleep: async () => {} });
   assert.deepEqual(gate, [true, false]); // closed across the abandoned pass, opened after the retry
   assert.equal(m.hydrated, true);
-  assert.match(logs.join("\n"), /a hydrate pass did not finish within 0s .*abandoned\. Archive ingest stays closed/);
+  assert.match(logs.join("\n"), /a hydrate pass made no progress for 0s .*abandoned\. Archive ingest stays closed/);
   const dest = path.join(root, "repo", "a.jsonl");
   assert.equal(fs.readFileSync(dest, "utf8"), "ab");
   // The abandoned pass's GET finally returns: discarded, never renamed over the file.
@@ -944,6 +944,63 @@ test("a hydrate pass that never settles is abandoned and retried, ingest gated t
   await new Promise((r) => setImmediate(r));
   assert.equal(fs.readFileSync(dest, "utf8"), "ab");
   assert.equal(m._hydrating, false);
+});
+
+test("a slow pass that keeps landing files outlives the deadline, never abandoned (XERK-1829)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const keys = Array.from({ length: 40 }, (_, i) => `repo/t${i}.jsonl`);
+  // Every GET takes 15ms against a 40ms stall deadline: the pass runs well past
+  // it in wall-clock time (40 keys / 8 workers x 15ms x jitter) but never stalls.
+  const store = { list: async () => keys, stat: async () => ({ size: 2 }),
+    getToFile: (k, dest) => new Promise((r) => setTimeout(() => { fs.writeFileSync(dest, "ab"); r(true); }, 15)) };
+  const logs = [];
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log: (l) => logs.push(l) });
+  const t0 = Date.now();
+  let sleeps = 0;
+  const fetched = await m.hydrateUntilListed({ passDeadlineMs: 40, sleep: async () => { sleeps++; } });
+  assert.ok(Date.now() - t0 >= 40, "the pass outran the deadline in wall-clock time");
+  assert.equal(fetched, 40);
+  assert.equal(sleeps, 0, logs.join("\n"));
+  assert.equal(m.hydrated, true);
+});
+
+test("an abandoned pass's late GET never unblocks a key the newer pass blocked (XERK-1829 QA)", async () => {
+  const root = mkdtemp("turma-mir-");
+  let held;
+  let calls = 0;
+  const store = { list: async () => ["repo/a.jsonl"], stat: async () => ({ size: 2 }),
+    getToFile: (k, dest) => {
+      calls++;
+      if (calls === 1) return new Promise((r) => { held = () => { fs.writeFileSync(dest, "o"); r(true); }; });
+      return Promise.reject(new Error("503 slow down"));
+    } };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrateUntilListed({ passDeadlineMs: 20, firstDelayMs: 1, sleep: async () => {} });
+  assert.equal(m.hydrated, true);
+  assert.match(m._blocked.get("repo/a.jsonl"), /503 slow down/);
+  held(); // the abandoned pass's GET finally lands
+  await new Promise((r) => setImmediate(r));
+  assert.equal(m.blockedCount(), 1, "still blocked: its local file never landed");
+  assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
+});
+
+test("rendered downloads run concurrently, bounded (XERK-1829)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const keys = Array.from({ length: 30 }, (_, i) => `repo/t${i}.jsonl`);
+  let inFlight = 0;
+  let peak = 0;
+  const store = { list: async () => keys, stat: async () => ({ size: 2 }),
+    getToFile: async (k, dest) => {
+      peak = Math.max(peak, ++inFlight);
+      await new Promise((r) => setTimeout(r, 2));
+      inFlight--;
+      fs.writeFileSync(dest, "ab");
+      return true;
+    } };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {} });
+  assert.equal(await m.hydrate(), 30);
+  assert.equal(peak, 8);
+  for (const k of keys) assert.equal(fs.readFileSync(path.join(root, k), "utf8"), "ab");
 });
 
 test("an abandoned pass that wakes during the backoff writes nothing (XERK-1282)", async () => {
