@@ -21027,6 +21027,7 @@ class SessionManager:
         self._usage_ready = None
         self._usage_worker = None
         self._usage_restage = False      # a discarded scan asks the next beat to re-stage
+        self._resumable_known = False    # set by _load_resumable_cache / the first refresh
         # _resumable_report re-derives the "Resume any session" picker from every
         # transcript on disk each slow beat; the per-file reads (_transcript_cwd
         # over ALL of them, _first_user_text/_last_activity_ts over the survivors)
@@ -38141,6 +38142,10 @@ class SessionManager:
         ledgers. Replaced by the first scan that lands. Never raises."""
         try:
             raw = _read_untrusted_json(RESUMABLE_CACHE_PATH, RESUMABLE_CACHE_MAX_BYTES)
+            # A file that parsed is an answer, even an empty one; anything else
+            # (first start on this code, deleted, planted FIFO) is not, and the
+            # first refresh then builds the picker inline (_stage_repo_usage).
+            self._resumable_known = isinstance(raw, dict)
             out = {}
             for repo, lst in (raw if isinstance(raw, dict) else {}).items():
                 if not isinstance(repo, str) or not isinstance(lst, list):
@@ -38209,6 +38214,17 @@ class SessionManager:
             self._maintain_usage_ledger()
         except Exception as e:
             log(f"usage ledger upkeep failed: {type(e).__name__}: {e}")
+        if not self._resumable_known:
+            # No picker to report until the worker's first scan lands, and an
+            # empty one re-spawns tickets (RESUMABLE_CACHE_PATH). Build it once
+            # inline, as every start did before the worker. Safe: the worker
+            # that owns the picker's read caches has not been started yet.
+            self._resumable_known = True
+            try:
+                self.resumable = self._resumable_report()
+                self._save_resumable_cache()
+            except Exception as e:
+                log(f"resumable scan failed: {e}")
         try:
             inputs = self._usage_scan_inputs()
             with self._usage_lock:

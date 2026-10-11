@@ -7630,6 +7630,22 @@ class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
         self.assertEqual(fresh._load_resumable_cache()["Turma"][0]["ticket"],
                          {"key": "ENG-5"})            # from the ledger, not the file
 
+    def test_a_start_with_no_cache_builds_the_picker_inline_once(self):
+        # The upgrade restart onto this code has no cache on any host.
+        sm = self.make_manager()
+        self.assertFalse(sm._resumable_known)
+        row = {"Turma": [self._resumable_row()]}
+        calls = []
+        with mock.patch.object(sm, "_resumable_report",
+                               lambda inputs=None: calls.append(inputs) or row), \
+             mock.patch.object(ha.threading.Thread, "start"):
+            sm._stage_repo_usage()
+            self.assertEqual(sm.resumable, row)        # on beat 0's payload
+            sm._stage_repo_usage()
+        self.assertEqual(calls, [None])                # inline once, never again
+        self.assertTrue(os.path.exists(ha.RESUMABLE_CACHE_PATH))
+        self.assertTrue(self.make_manager()._resumable_known)
+
     def test_the_cache_is_untrusted(self):
         # ~/.turma is session-writable: junk is dropped, ticket/prs never read
         # from the file, and a FIFO does not block the load.

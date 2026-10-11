@@ -135,7 +135,9 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
     is in it as started (`startedTicketKeys`), so an empty list re-spawns it via auto-start / an epic
     run. The last list is persisted (`RESUMABLE_CACHE_PATH`) and loaded at init; the file is
     session-writable, so it is read via `_read_untrusted_json`, re-shaped, and ticket/prs are
-    re-attached from the manager's own ledgers. A gen-voided scan still applies `resumable` (it
+    re-attached from the manager's own ledgers. With NO usable cache (the upgrade restart onto this
+    code, a deleted/planted file) the first refresh builds the picker INLINE once
+    (`_resumable_known`). A gen-voided scan still applies `resumable` (it
     reads no baseline) and re-stages on the next full beat (`_usage_restage`).
   - `_refresh_repo_usage` is the synchronous form, for tests only. Tests: `TestUsageScanWorker`.
 - Tests: `TestReconcileOrphanTranscripts`, `TestSanitizeJunkRepoEntries`, android
