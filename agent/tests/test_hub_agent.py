@@ -16401,15 +16401,15 @@ class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
     # XERK-1831: the option NUMBER existing is not enough — "1. Yes" exists on
     # every permission dialog, so an answer made against dialog A must never
     # approve a different dialog B that replaced it before delivery.
-    def _answer_stamped(self, sm, number, prompt, detail, cap=PANE_PERMISSION_DIALOG):
+    def _answer_stamped(self, sm, number, dialog_id, cap=PANE_PERMISSION_DIALOG):
         with mock.patch.object(ha, "_capture_pane", return_value=cap):
-            sm.answer_pane_prompt("abcde", number, prompt, detail)
+            sm.answer_pane_prompt("abcde", number, dialog_id)
 
     def test_an_answer_stamped_with_the_dialog_on_screen_is_typed(self):
         sm = self.make_manager()
         self._session(sm)
         shown = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
-        self._answer_stamped(sm, 1, shown["prompt"], shown["detail"])
+        self._answer_stamped(sm, 1, shown["id"])
         self.assertEqual(
             self.run_calls, [["tmux", "-L", "turma", "send-keys", "-t", "=agent-abcde:", "1"]])
 
@@ -16420,25 +16420,39 @@ class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
         self._session(sm)
         answered = ha.parse_pane_prompt(
             PANE_PERMISSION_DIALOG.replace("touch /tmp/permtest-marker", "ls"))
-        self._answer_stamped(sm, 1, answered["prompt"], answered["detail"])
+        self._answer_stamped(sm, 1, answered["id"])
         self.assertEqual(self.run_calls, [])
 
-    def test_an_answer_for_a_different_question_is_dropped(self):
+    def test_two_long_commands_differing_past_the_detail_cut_are_different_dialogs(self):
+        # `detail` is a capped window (14 lines / 800 chars); the id covers the
+        # whole block, so a revised script that differs only past the cut is a
+        # different dialog — QA's repro of the first, detail-keyed design.
+        body = "".join(f"   print('line {n:03d} of a long heredoc script')\n" for n in range(40))
+        def dialog(first):
+            # The window keeps the lines NEAREST the question, so the two
+            # differ at the top of the script.
+            return ("────────────────────────────────────────────\n Bash command\n\n"
+                    f"   python3 - <<'EOF'\n   {first}\n" + body + "   EOF\n\n"
+                    " Do you want to proceed?\n ❯ 1. Yes\n   2. No\n")
+        safe = ha.parse_pane_prompt(dialog("print('ok')"))
+        evil = ha.parse_pane_prompt(dialog("os.system('rm -rf ~/work')"))
+        self.assertEqual(safe["detail"], evil["detail"])     # the window can't tell them apart
+        self.assertNotEqual(safe["id"], evil["id"])
         sm = self.make_manager()
         self._session(sm)
-        shown = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
-        self._answer_stamped(sm, 1, "Would you like to proceed?", shown["detail"])
+        self._answer_stamped(sm, 1, safe["id"], cap=dialog("os.system('rm -rf ~/work')"))
         self.assertEqual(self.run_calls, [])
 
-    def test_a_stamped_answer_with_no_detail_does_not_match_one_with_detail(self):
-        sm = self.make_manager()
-        self._session(sm)
-        shown = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
-        self._answer_stamped(sm, 1, shown["prompt"], None)
-        self.assertEqual(self.run_calls, [])
+    def test_the_id_ignores_the_cursor_and_is_stable_across_reads(self):
+        a = ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)
+        moved = PANE_PERMISSION_DIALOG.replace(" ❯ 1. Yes", "   1. Yes").replace(
+            "   3. No", " ❯ 3. No")
+        self.assertEqual(a["id"], ha.parse_pane_prompt(PANE_PERMISSION_DIALOG)["id"])
+        self.assertEqual(a["id"], ha.parse_pane_prompt(moved)["id"])
+        self.assertRegex(a["id"], r"^[0-9a-f]{32}$")
 
     def test_an_unstamped_answer_keeps_the_number_check(self):
-        # An older hub sends no dialog identity: the agent still answers on the
+        # An older hub sends no dialog id: the agent still answers on the
         # number alone rather than refusing every answer it relays.
         sm = self.make_manager()
         self._session(sm)
@@ -16452,8 +16466,8 @@ class TestAnswerPanePrompt(ManagerMixin, unittest.TestCase):
         with mock.patch.object(sm, "answer_pane_prompt") as answer:
             sm.handle_commands([{"type": "answerPanePrompt", "cmdId": "c1",
                                  "sessionId": "abcde", "optionNumber": 1,
-                                 "prompt": "Do you want to proceed?", "detail": "Bash: ls"}])
-        answer.assert_called_once_with("abcde", 1, "Do you want to proceed?", "Bash: ls")
+                                 "dialogId": "ab" * 16}])
+        answer.assert_called_once_with("abcde", 1, "ab" * 16)
 
     def test_noop_for_stopped_or_unknown_session(self):
         sm = self.make_manager()

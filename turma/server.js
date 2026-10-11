@@ -15781,27 +15781,13 @@ function questionAnswerText(a, sessionId, picks, custom) {
   // Worded as a phrase, not a "; (…)" list item, which read like a glitch.
   return picked ? `${picked}, plus a typed answer` : "(a typed answer)";
 }
-// The dialog an answerPanePrompt command answers (XERK-1831): the client's
-// rendered {prompt, detail} when it sent one, else the session's served
-// panePrompt, else nothing (the agent then checks the number alone). Bounded
-// by the agent's own parse caps — a longer value can never match a dialog.
-const PANE_PROMPT_SEEN_MAX = 300;
-const PANE_PROMPT_DETAIL_SEEN_MAX = 800;
-function panePromptSeen(a, sessionId, body) {
-  if (body.prompt !== undefined || body.detail !== undefined) {
-    const prompt = body.prompt;
-    const detail = body.detail === undefined || body.detail === null ? "" : body.detail;
-    if (typeof prompt !== "string" || !prompt || prompt.length > PANE_PROMPT_SEEN_MAX
-      || typeof detail !== "string" || detail.length > PANE_PROMPT_DETAIL_SEEN_MAX) {
-      return { error: "prompt (1-300 chars) and optional detail (≤800 chars) must be strings" };
-    }
-    return { stamp: { prompt, detail } };
-  }
+// The served id of a session's blocking dialog (XERK-1831), or "" — an older
+// agent serves none, and its answers then carry none (the number check alone).
+const PANE_DIALOG_ID_RE = /^[0-9a-f]{32}$/;
+function servedPaneDialogId(a, sessionId) {
   const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
   const pp = s && s.session && s.session.panePrompt;
-  if (!pp || typeof pp.prompt !== "string" || !pp.prompt) return { stamp: {} };
-  return { stamp: { prompt: pp.prompt.slice(0, PANE_PROMPT_SEEN_MAX),
-    detail: typeof pp.detail === "string" ? pp.detail.slice(0, PANE_PROMPT_DETAIL_SEEN_MAX) : "" } };
+  return pp && typeof pp.id === "string" && PANE_DIALOG_ID_RE.test(pp.id) ? pp.id : "";
 }
 
 function panePromptAnswerText(a, sessionId, n) {
@@ -20186,20 +20172,27 @@ const server = http.createServer(async (req, res) => {
       //
       // The command also names WHICH dialog was answered (XERK-1831): every
       // permission dialog offers "1. Yes", so a number alone approves whatever
-      // dialog replaced the answered one before delivery. Optional body
-      // {prompt, detail} is the dialog the client rendered; without it the hub
-      // stamps the session's served panePrompt. The agent drops the answer
-      // unless the dialog on screen still has that prompt + detail.
+      // dialog replaced the answered one before delivery. Body `dialogId` is
+      // the served panePrompt.id the client rendered (the agent's digest of
+      // the whole dialog); without one the hub stamps the served id. A
+      // dialogId the hub already knows is gone is refused here (409), and the
+      // agent drops any answer whose id is not the dialog on screen.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "pane-prompt") {
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = JSON.parse((await readBody(req)) || "{}") || {};
         const optionNumber = Number.isInteger(body.optionNumber) ? body.optionNumber : 0;
         if (optionNumber < 1 || optionNumber > 9) {
           return json(res, 400, { error: "optionNumber 1-9 required" });
         }
-        const seen = panePromptSeen(agents[key], sessionId, body);
-        if (seen.error) return json(res, 400, { error: seen.error });
+        if (body.dialogId !== undefined && !PANE_DIALOG_ID_RE.test(String(body.dialogId))) {
+          return json(res, 400, { error: "dialogId must be the dialog's served id" });
+        }
+        const servedId = servedPaneDialogId(agents[key], sessionId);
+        if (body.dialogId !== undefined && servedId && body.dialogId !== servedId) {
+          return json(res, 409, { error: "That dialog has already changed — answer the one showing now." });
+        }
+        const dialogId = body.dialogId !== undefined ? body.dialogId : servedId;
         const cmdId = queueCommand(key, { type: "answerPanePrompt", sessionId, optionNumber,
-          ...seen.stamp });
+          ...(dialogId ? { dialogId } : {}) });
         // The org's decisions log (XERK-1574): the dialog + the option picked.
         recordAnswerDecision(key, sessionId, "permission",
           panePromptAnswerText(agents[key], sessionId, optionNumber));

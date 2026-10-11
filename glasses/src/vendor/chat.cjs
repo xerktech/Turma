@@ -3299,7 +3299,7 @@
   // the pane and drops the answer if the dialog has moved on (see
   // answer_pane_prompt), so a click made against a stale beat can't type a
   // stray digit into a live composer. The POST names the dialog this click
-  // answered (prompt + detail), so the agent never applies it to a different
+  // answered (its served id), so the agent never applies it to a different
   // dialog that replaced this one before delivery (XERK-1831).
   async function answerPanePrompt(optionNumber, p) {
     if (!hostKey || !sessionId || !Number.isInteger(optionNumber)) return;
@@ -3312,7 +3312,7 @@
     try {
       const r = await fetch("/api/agents/" + enc(hostKey) + "/sessions/" + enc(sessionId) + "/pane-prompt", {
         method: "POST", headers: { "content-type": "application/json" },
-        body: JSON.stringify({ optionNumber, prompt: p && p.prompt, detail: (p && p.detail) || "" }),
+        body: JSON.stringify(p && typeof p.id === "string" ? { optionNumber, dialogId: p.id } : { optionNumber }),
       });
       if (!r.ok) { await hubRefused("Answer", r); throw new Error(String(r.status)); }
     } catch {
@@ -3944,7 +3944,7 @@
       __setAgent: (a) => { agent = a; },
       __setModelSwitchPending: (p) => { modelSwitchPending = p; },
       localModelOffered, currentModelSource, modelSourceLabel, modelSourceOpts,
-      setSessionModelSource,
+      setSessionModelSource, answerPanePrompt,
       // XERK-489 endpoint model dropdown + context override
       localModels, localModelOpts, currentLocalModel, currentLocalContext,
       servedContextFor, fmtCtx, localModelChipHtml, setSessionLocalModel,

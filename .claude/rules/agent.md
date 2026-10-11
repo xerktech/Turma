@@ -339,11 +339,11 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
   - `answer_pane_prompt` **re-reads the pane first** and drops the answer unless that number is on
     screen NOW. Both `liveState`s check the prompt ahead of the busy read. Tests:
     `TestAnswerPanePrompt`.
-  - **The number is not the dialog** (XERK-1831): every permission dialog offers "1. Yes". The
-    command carries the answered `prompt`+`detail` (client-sent, else the hub stamps the served
-    `panePrompt`); the agent drops it unless the fresh parse matches exactly. Never relax this to
-    a fuzzy match — a resize re-wrap dropping an answer is the safe failure. Unstamped = older hub,
-    number check only. Tests:
+  - **The number is not the dialog** (XERK-1831): every permission dialog offers "1. Yes".
+    `panePrompt.id` hashes the UNCUT dialog (question, whole block, labels; not the cursor) —
+    never key on `detail`, a capped window two long commands can share. The answer carries it
+    (client-sent, else the hub stamps the served id; a known-stale one is 409'd); the agent drops
+    a mismatch. A resize re-wrap dropping an answer is the safe failure. No id = number check. Tests:
     `TestParsePanePrompt`, `TestAnswerPanePrompt`, `pane-prompt` in `server.test.js`,
     `panePromptHtml` in `chat.test.js`.
   - **It is NOT the only blocking dialog.** Claude Code's trust-folder modal has no numbered options,

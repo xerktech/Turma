@@ -12375,21 +12375,30 @@ def parse_pane_prompt(cap, face=False):
         prompt = lines[q].strip()
         # Walk up for the fenced block above the question: skip blanks and rules
         # until real text starts, then stop at the rule that closes it.
-        detail = []
+        # `block` is the same walk with no line cap: the dialog's whole visible
+        # body, hashed into `id` below.
+        block = []
         for line in reversed(lines[:q]):
             text = line.strip()
             if not text:
                 continue         # a blank never closes the block (the TUI puts
                                  # one between a dialog's title and its body)
             if PANE_PROMPT_RULE_RE.match(line):
-                if detail:
+                if block:
                     break        # the rule fencing the block we just collected
                 continue         # still above/between rules — keep looking
-            detail.append(text)
-            if len(detail) >= PANE_PROMPT_DETAIL_LINES:
-                break
+            block.append(text)
+        detail = block[:PANE_PROMPT_DETAIL_LINES]
         detail.reverse()
-        out = {"prompt": prompt[:300], "options": opts}
+        block.reverse()
+        # The dialog's identity (XERK-1831): a digest of everything uncut — the
+        # question, the whole block above it and the option labels (never the
+        # ❯ cursor, which arrow keys move). `detail` is a capped window, so two
+        # long commands differing past its cut would share it; an answer
+        # stamped with this id is applied only to the dialog that carries it.
+        ident = "\x1f".join([prompt] + block + [o["label"] for o in opts])
+        out = {"prompt": prompt[:300], "options": opts,
+               "id": hashlib.sha256(ident.encode("utf-8", "replace")).hexdigest()[:32]}
         if detail:
             joined = "\n".join(detail)
             out["detail"] = joined[:PANE_PROMPT_DETAIL_CHARS]
@@ -28744,7 +28753,7 @@ class SessionManager:
         _pane_send_keys(sess["tmuxName"], "Escape")
         log(f"interrupted session {sid}")
 
-    def answer_pane_prompt(self, sid, number, seen_prompt=None, seen_detail=None):
+    def answer_pane_prompt(self, sid, number, dialog_id=None):
         """Answer the blocking choice dialog a session's TUI is showing (a tool
         permission request or a plan approval — see parse_pane_prompt) by typing
         its option digit, exactly the key an operator at the live terminal would
@@ -28761,12 +28770,12 @@ class SessionManager:
         The number alone is not the dialog (XERK-1831): every permission dialog
         offers "1. Yes", so dialog A's answer would approve a dialog B that
         replaced it before delivery (answered in the terminal, or the next of
-        parallel tool calls). The hub stamps the answer with the `prompt` +
-        `detail` the operator was shown (`seen_prompt`/`seen_detail`) — this
-        same parser's served output, so the caps agree — and a dialog whose
-        face differs is dropped. A pane re-wrapped by a resize differs too and
-        is dropped: the operator answers again, never the wrong dialog. No
-        stamp (an older hub) keeps the number check alone."""
+        parallel tool calls). The answer carries the `id` of the dialog the
+        operator was shown (`dialog_id`, parse_pane_prompt's digest of the
+        uncut dialog), and a dialog with any other id is dropped. A pane
+        re-wrapped by a resize hashes differently too and is dropped: the
+        operator answers again, never the wrong dialog. No id (an older hub or
+        client) keeps the number check alone."""
         sess = self._find(sid)
         if not sess or sess.get("status") != "running":
             return
@@ -28781,10 +28790,7 @@ class SessionManager:
         if not any(o["number"] == number for o in prompt["options"]):
             log(f"pane-prompt answer {number} for {sid} dropped: not an option")
             return
-        seen_detail = seen_detail if isinstance(seen_detail, str) else ""
-        if isinstance(seen_prompt, str) and (
-                prompt["prompt"] != seen_prompt
-                or (prompt.get("detail") or "") != seen_detail):
+        if isinstance(dialog_id, str) and dialog_id and prompt["id"] != dialog_id:
             log(f"pane-prompt answer {number} for {sid} dropped: a different dialog is on screen")
             return
         _pane_send_keys(sess["tmuxName"], str(number))
@@ -37632,7 +37638,7 @@ class SessionManager:
                 elif ctype == "answerPanePrompt":
                     self.answer_pane_prompt(
                         cmd.get("sessionId"), cmd.get("optionNumber"),
-                        cmd.get("prompt"), cmd.get("detail"))
+                        cmd.get("dialogId"))
                 elif ctype == "renderBrief":
                     # The org brief's summary (XERK-1574): only STAGED here —
                     # the `claude -p` runs on its own worker, never the beat.
