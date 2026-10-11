@@ -5366,6 +5366,7 @@ class ManagerMixin:
             # XERK-1587: every launch/teardown unlinks the session's snapshot.
             ("LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
@@ -7490,6 +7491,218 @@ class TestUsageLedger(ManagerMixin, unittest.TestCase):
         sm._refresh_repo_usage()
         self.assertTrue(any(r["repo"] == "Turma" for r in sm.repo_usage))
         self.assertIsNotNone(sm.host_usage)
+
+
+class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
+    """XERK-1453: the host/repo usage fold, the resume picker and the two
+    sweeps run on the usage worker; a refresh beat only keeps the ledger and
+    stages a snapshot. The first scan after a manager start re-folds every
+    transcript on disk, which inline held beat 0 for seconds to minutes."""
+
+    WT = "/w/.turma/worktrees/Turma/usw"
+
+    def _seed(self, sm, tokens=100_000, name="a.jsonl"):
+        d = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.WT))
+        os.makedirs(d, exist_ok=True)
+        write_jsonl(os.path.join(d, name), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m-" + name, "r-" + name,
+                        "claude-sonnet-4-20250514", tokens, 0),
+        ])
+        sm._remember_usage({"repo": "Turma", "repoPath": "/w/Turma",
+                            "worktreePath": self.WT})
+        return d
+
+    def _wait_ready(self, sm, timeout=5.0):
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            with sm._usage_lock:
+                if sm._usage_ready is not None:
+                    return
+            time.sleep(0.01)
+        self.fail("the usage worker never published")
+
+    def _total(self, sm):
+        return sum(r["usage"]["totals"]["input"] for r in sm.repo_usage)
+
+    def test_a_refresh_beat_stages_the_scan_and_never_runs_it_inline(self):
+        sm = self.make_manager()
+        self._seed(sm)
+        sm.registry = []
+        threads = []
+        release = threading.Event()
+        real = sm._usage_scan
+
+        def slow_scan(inputs):
+            threads.append(threading.current_thread().name)
+            release.wait(5)
+            return real(inputs)
+
+        empty = tempfile.mkdtemp(dir=self.tmp)
+        with mock.patch.object(sm, "_usage_scan", slow_scan), \
+             mock.patch.object(ha, "REPOS_ROOT", empty):
+            t0 = time.time()
+            sm.build_payload(0)
+            self.assertLess(time.time() - t0, 3.0, "the beat waited on the scan")
+            self.assertEqual(sm.repo_usage, [])      # nothing landed yet
+            release.set()
+            self._wait_ready(sm)
+            payload = sm.build_payload(1)
+        self.assertEqual(threads, ["usage-scan"])
+        self.assertEqual(self._total(sm), 100_000)
+        self.assertEqual(payload["usage"], sm.host_usage)
+
+    def test_the_ledger_upkeep_stays_on_the_beat(self):
+        # usage_ledger is the beat's to mutate; only a snapshot crosses over.
+        sm = self.make_manager()
+        upkeep = []
+        with mock.patch.object(sm, "_maintain_usage_ledger",
+                               lambda: upkeep.append(threading.current_thread())), \
+             mock.patch.object(sm, "_usage_scan", lambda inputs: {"gen": inputs["gen"]}):
+            sm._stage_repo_usage()
+        self.assertEqual(upkeep, [threading.current_thread()])
+        with sm._usage_lock:
+            pass
+        inputs = sm._usage_scan_inputs()
+        self.assertIsNot(inputs["ledger"], sm.usage_ledger)
+        self.assertIsNot(inputs["baseline"], sm.usage_baseline)
+
+    def test_the_worker_folds_into_its_own_store(self):
+        # Never the per-session store the beat folds into: two threads folding
+        # one accumulator would double-count.
+        sm = self.make_manager()
+        self._seed(sm)
+        sm._refresh_repo_usage()
+        slug = ha._project_slug(self.WT)
+        self.assertIn(slug, sm._agg_slug_usage)
+        self.assertNotIn(slug, sm.slug_usage)
+
+    def test_a_scan_staged_before_an_import_window_never_publishes(self):
+        # The hub keeps a day's high-water mark, so a scan that may have counted
+        # a migrated-in transcript's source turns must be dropped, and the next
+        # one must re-fold that slug under the new window.
+        sm = self.make_manager()
+        self._seed(sm)
+        sm._refresh_repo_usage()
+        self.assertEqual(self._total(sm), 100_000)
+        stale_inputs = sm._usage_scan_inputs()
+        slug = ha._project_slug(self.WT)
+        self._seed(sm, tokens=7, name="b.jsonl")          # the unpacked bytes
+        sm._mark_imported_usage("b", slug, None)
+        stale = sm._usage_scan(stale_inputs)               # counts them
+        sm._apply_usage_scan(stale)
+        self.assertEqual(self._total(sm), 100_000, "a pre-window scan published")
+        fresh = sm._usage_scan_inputs()
+        self.assertEqual(fresh["refold"], {slug})
+        sm._apply_usage_scan(sm._usage_scan(fresh))
+        self.assertEqual(self._total(sm), 100_000)         # b.jsonl excluded
+
+    def test_a_replaced_snapshot_keeps_its_refold(self):
+        sm = self.make_manager()
+        sm._usage_inputs = {"refold": {"s1"}}
+        sm._usage_refold = {"s2"}
+        with mock.patch.object(ha.threading.Thread, "start"):
+            sm._stage_repo_usage()
+        self.assertEqual(sm._usage_inputs["refold"], {"s1", "s2"})
+
+    def test_staging_never_raises_onto_the_beat(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha.threading.Thread, "start",
+                               side_effect=RuntimeError("can't start new thread")):
+            sm._stage_repo_usage()                          # no raise
+        self.assertIsNotNone(sm._usage_inputs)              # retried next refresh
+
+    def _resumable_row(self, tid="t1", repo="Turma"):
+        return {"transcriptId": tid, "cwd": self.WT, "repo": repo, "root": False,
+                "origin": "worktree", "slug": ha._project_slug(self.WT),
+                "summary": "s", "endedTs": "2026-07-01T10:00:00Z"}
+
+    def test_a_restarted_manager_reports_the_last_picker_before_its_first_scan(self):
+        # The hub counts a ticket whose only session is in `resumable` as
+        # started (startedTicketKeys); an empty list after a restart let
+        # auto-start spawn it a second time.
+        sm = self.make_manager()
+        sm.ticket_ledger["t1"] = {"key": "ENG-5"}
+        sm._apply_usage_scan({"gen": sm._usage_gen,
+                              "resumable": {"Turma": [self._resumable_row()]}})
+        fresh = self.make_manager()             # its __init__ loads the cache
+        self.assertEqual(fresh.resumable["Turma"][0]["transcriptId"], "t1")
+        fresh.ticket_ledger = {"t1": {"key": "ENG-5"}}
+        self.assertEqual(fresh._load_resumable_cache()["Turma"][0]["ticket"],
+                         {"key": "ENG-5"})            # from the ledger, not the file
+
+    def test_a_start_with_no_cache_builds_the_picker_inline_once(self):
+        # The upgrade restart onto this code has no cache on any host.
+        sm = self.make_manager()
+        self.assertFalse(sm._resumable_known)
+        row = {"Turma": [self._resumable_row()]}
+        calls = []
+        with mock.patch.object(sm, "_resumable_report",
+                               lambda inputs=None: calls.append(inputs) or row), \
+             mock.patch.object(ha.threading.Thread, "start",
+                               lambda self_: calls.append("worker-start")):
+            sm._stage_repo_usage()
+            self.assertEqual(sm.resumable, row)        # on beat 0's payload
+            sm._stage_repo_usage()
+        # Inline once, and BEFORE the worker that owns the read caches starts.
+        self.assertEqual(calls[:2], [None, "worker-start"])
+        self.assertEqual(calls.count(None), 1)
+        self.assertTrue(os.path.exists(ha.RESUMABLE_CACHE_PATH))
+        self.assertTrue(self.make_manager()._resumable_known)
+
+    def test_a_cache_whose_rows_were_all_junk_is_no_answer(self):
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump({"Turma": [dict(self._resumable_row("../x"))]}, f)
+        self.assertFalse(self.make_manager()._resumable_known)
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump({}, f)                           # nothing to resume: an answer
+        self.assertTrue(self.make_manager()._resumable_known)
+
+    def test_the_cache_is_untrusted(self):
+        # ~/.turma is session-writable: junk is dropped, ticket/prs never read
+        # from the file, and a FIFO does not block the load.
+        sm = self.make_manager()
+        bad = dict(self._resumable_row(), ticket={"key": "FORGED-1"})
+        rows = {"Turma": [bad, dict(self._resumable_row("x y")),
+                          dict(self._resumable_row("t2"), repo="Other"),
+                          dict(self._resumable_row("t3"), cwd=7), "junk"],
+                "Bad": "nope"}
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump(rows, f)
+        got = sm._load_resumable_cache()
+        self.assertEqual([e["transcriptId"] for e in got["Turma"]], ["t1"])
+        self.assertIsNone(got["Turma"][0]["ticket"])
+        os.remove(ha.RESUMABLE_CACHE_PATH)
+        os.mkfifo(ha.RESUMABLE_CACHE_PATH)
+        self.assertEqual(sm._load_resumable_cache(), {})
+
+    def test_an_import_mid_scan_still_publishes_the_picker_and_rescans(self):
+        sm = self.make_manager()
+        self._seed(sm)
+        stale_inputs = sm._usage_scan_inputs()
+        sm._mark_imported_usage("b", ha._project_slug(self.WT), None)
+        stale = sm._usage_scan(stale_inputs)
+        stale["resumable"] = {"Turma": [self._resumable_row()]}
+        sm._apply_usage_scan(stale)
+        self.assertEqual(sm.repo_usage, [])                 # usage voided
+        self.assertIn("Turma", sm.resumable)                # picker kept
+        self.assertTrue(sm._usage_restage)
+        with mock.patch.object(sm, "_stage_repo_usage") as stage:
+            sm.build_payload(1)                             # not a refresh beat
+        stage.assert_called_once_with()
+        self.assertFalse(sm._usage_restage)
+
+    def test_the_worker_store_is_pruned_to_ledger_slugs(self):
+        sm = self.make_manager()
+        sm._agg_slug_usage["gone-slug"] = {"acc": ha._UsageAcc(), "offsets": {}}
+        sm._refresh_repo_usage()
+        self.assertNotIn("gone-slug", sm._agg_slug_usage)
+
+    def test_a_failed_part_keeps_the_previous_answer(self):
+        sm = self.make_manager()
+        sm.resumable = {"Turma": ["kept"]}
+        with mock.patch.object(sm, "_resumable_report", side_effect=OSError("boom")):
+            sm._refresh_repo_usage()
+        self.assertEqual(sm.resumable, {"Turma": ["kept"]})
 
 
 class TestLimitsSnapshot(ManagerMixin, unittest.TestCase):
@@ -26030,6 +26243,7 @@ class TestPruneRepo(unittest.TestCase):
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
