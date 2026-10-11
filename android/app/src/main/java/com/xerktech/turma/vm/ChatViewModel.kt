@@ -30,6 +30,7 @@ import com.xerktech.turma.net.ModeRequest
 import com.xerktech.turma.net.ModelRequest
 import com.xerktech.turma.net.ModelSourceRequest
 import com.xerktech.turma.net.OkResponse
+import com.xerktech.turma.net.PanePromptAnswer
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -95,6 +96,9 @@ data class ChatUiState(
     // it back. Mirrors the web's `answeredQuestion` guard (chat.js updateQuestion),
     // which Android lacked.
     val answeredQuestion: String? = null,
+    // Same guard for the TUI's blocking dialog (web chat.js `answeredPanePrompt`):
+    // the prompt text just answered, so a stale beat can't bounce the sheet back.
+    val answeredPanePrompt: String? = null,
 ) {
     val prefs: VerbosityPrefs get() = VerbosityPrefs.forPreset(verbosity)
     private val rawQuestion: String get() = session?.session?.question ?: ""
@@ -105,6 +109,17 @@ data class ChatUiState(
     val questionMulti: Boolean get() = session?.session?.questionMulti ?: false
     val questionTotal: Int? get() = session?.session?.questionTotal
     val questionIndex: Int? get() = session?.session?.questionIndex
+    /**
+     * The blocking TUI dialog (tool permission / plan approval) to show, or null.
+     * A session is never blocked on both it and an AskUserQuestion; the question
+     * wins if both report, as on the web (chat.js updateQuestion).
+     */
+    val panePrompt: com.xerktech.turma.model.PanePrompt? get() {
+        if (rawQuestion.isNotBlank()) return null
+        val p = session?.session?.panePrompt ?: return null
+        if (p.prompt.isEmpty() || p.options.isEmpty() || p.prompt == answeredPanePrompt) return null
+        return p
+    }
     // Attaching is off while a question is pending: the draft then routes to
     // POST .../answer, which carries no files (web chat.js renderAttachments).
     val canAttach: Boolean get() = Uploads.canAttach(uploadMaxBytes) && question.isBlank()
@@ -142,6 +157,7 @@ data class ChatUiState(
         // to the next question or clears, forget it so the new one shows at once
         // (XERK-812) — the web's `answeredQuestion = null` on a differing beat.
         answeredQuestion = answeredQuestion?.takeIf { it == (session?.session?.question ?: "") },
+        answeredPanePrompt = answeredPanePrompt?.takeIf { it == session?.session?.panePrompt?.prompt },
     )
 }
 
@@ -569,6 +585,25 @@ class ChatViewModel(
                 _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             } else {
                 pollForNextQuestion(pending)
+            }
+            container.fleet.nudge()
+        }
+    }
+
+    /**
+     * Answer the TUI's blocking dialog by its option number. The agent re-reads
+     * the pane and drops the answer if the dialog has moved on, so a tap against
+     * a stale beat can't type a stray digit into the composer. The sheet hides at
+     * once (web chat.js answerPanePrompt) and comes back if the POST fails.
+     */
+    fun answerPanePrompt(optionNumber: Int) {
+        val prompt = _state.value.panePrompt?.prompt ?: return
+        _state.update { it.copy(answeredPanePrompt = prompt) }
+        viewModelScope.launch {
+            val r = runCatching { client.api.answerPanePrompt(host, sessionId, PanePromptAnswer(optionNumber)) }
+            if (r.isFailure) {
+                _state.update { if (it.answeredPanePrompt == prompt) it.copy(answeredPanePrompt = null) else it }
+                _messages.tryEmit("✗ " + (r.exceptionOrNull()?.let { hubErrorMessage(it) } ?: "hub unreachable"))
             }
             container.fleet.nudge()
         }

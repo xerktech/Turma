@@ -86,4 +86,43 @@ class ChatQuestionTest {
         assertEquals("", vm.state.value.question)
         vm.onLeave()
     }
+
+    private fun permission(prompt: String) = HubHarness.fleetJson(
+        host = host,
+        sessions = """{ "id": "$session", "repo": "Turma", "session": { "panePrompt": {
+            "prompt": "$prompt", "detail": "Bash command\\n  ls",
+            "options": [{"number":1,"label":"Yes","selected":true},{"number":2,"label":"No"}] } } }""",
+    )
+
+    @Test
+    fun `a permission dialog surfaces and is answered by its option number`() {
+        hub.json("/api/agents/$host/sessions/$session/pane-prompt", """{"ok":true}""")
+        hub.seedFleet(permission("Do you want to proceed?"))
+        val vm = vm()
+        vm.onEnter()
+        hub.awaitFlow(vm.state) { it.panePrompt?.prompt == "Do you want to proceed?" }
+        assertEquals(listOf(1, 2), vm.state.value.panePrompt?.options?.map { it.number })
+
+        vm.answerPanePrompt(2)
+        // Hidden at once — the fleet still reports the dialog, only the guard hides it.
+        assertEquals(null, vm.state.value.panePrompt)
+        val req = hub.findRequest("/pane-prompt")
+        assertEquals("""{"optionNumber":2}""", req.body.readUtf8())
+        vm.onLeave()
+    }
+
+    @Test
+    fun `a refused permission answer re-surfaces the dialog`() {
+        hub.route("/api/agents/$host/sessions/$session/pane-prompt") {
+            HubHarness.refusal("session is not running")
+        }
+        hub.seedFleet(permission("Do you want to proceed?"))
+        val vm = vm()
+        vm.onEnter()
+        hub.awaitFlow(vm.state) { it.panePrompt != null }
+
+        vm.answerPanePrompt(1)
+        hub.awaitFlow(vm.state) { it.panePrompt?.prompt == "Do you want to proceed?" }
+        vm.onLeave()
+    }
 }

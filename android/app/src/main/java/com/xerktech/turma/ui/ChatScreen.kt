@@ -6,6 +6,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.background
 import androidx.compose.foundation.horizontalScroll
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
@@ -17,6 +18,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.imePadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -273,6 +275,7 @@ fun ChatScreen(
                         onAnswerMulti = { vm.answerMulti(it) },
                     )
                 }
+                state.panePrompt?.let { p -> PanePromptSheet(p, onPick = vm::answerPanePrompt) }
                 ChatFooter(
                     session = state.session,
                     draft = state.draft,
@@ -283,7 +286,7 @@ fun ChatScreen(
                     // to the heartbeat's paneBusy. Drives the separate ◼ Stop button —
                     // suppressed while a question is pending (the draft answers it).
                     busy = (state.liveTurn.isNotBlank() || state.session?.session?.paneBusy == true) &&
-                        state.question.isBlank(),
+                        state.question.isBlank() && state.panePrompt == null,
                     onDraft = vm::setDraft,
                     onSend = vm::submitDraft,
                     onStop = vm::stop,
@@ -552,6 +555,43 @@ private fun QuestionSheet(
                 PrimaryButton("Submit selection", onClick = { onAnswerMulti(picks.toList()) }, enabled = picks.isNotEmpty())
             }
             Text("…or type a custom answer below.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        }
+    }
+}
+
+/**
+ * The TUI's blocking dialog — a tool-permission request or a plan approval —
+ * in the same place as the question sheet (web chat.js panePromptHtml): the
+ * dialog's question, the context it asks about, and one card per numbered
+ * option, the TUI cursor's row outlined. Tapping a card answers by its number.
+ */
+@Composable
+private fun PanePromptSheet(prompt: com.xerktech.turma.model.PanePrompt, onPick: (Int) -> Unit) {
+    Surface(color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f), modifier = Modifier.fillMaxWidth()) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
+            Pill("waiting", color = MaterialTheme.colorScheme.primary)
+            Text(prompt.prompt, fontWeight = FontWeight.Medium)
+            if (prompt.detail.isNotBlank()) {
+                Text(
+                    prompt.detail,
+                    Modifier.fillMaxWidth()
+                        .heightIn(max = 180.dp)
+                        .clip(RoundedCornerShape(8.dp))
+                        .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+                        .verticalScroll(rememberScrollState())
+                        .horizontalScroll(rememberScrollState())
+                        .padding(8.dp),
+                    fontFamily = FontFamily.Monospace,
+                    fontSize = 12.sp,
+                    color = MaterialTheme.colorScheme.onSurface,
+                )
+            }
+            prompt.options.forEach { opt ->
+                QuestionOptionCard(
+                    com.xerktech.turma.model.QuestionOption(label = "${opt.number}. ${opt.label}"),
+                    multi = false, selected = opt.selected,
+                ) { onPick(opt.number) }
+            }
         }
     }
 }

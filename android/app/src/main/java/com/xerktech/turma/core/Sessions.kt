@@ -117,6 +117,8 @@ fun liveState(session: SessionInfo, agentLastSeen: Long, now: Long): LiveState =
     session.status != "running" -> LiveState.STOPPED
     // Truthy, as the hub and web read it: a whitespace-only question still blocks.
     (session.session?.question ?: "").isNotEmpty() -> LiveState.WAITING
+    // A blocking TUI dialog (permission / plan approval) — web liveState's panePrompt.
+    !session.session?.panePrompt?.prompt.isNullOrEmpty() -> LiveState.WAITING
     sessionWorking(session, agentLastSeen, now) -> LiveState.WORKING
     // Asleep until a session-CLI wake (XERK-1571): holding, never Ready for review.
     sessionSleeping(session, now) -> LiveState.HOLDING

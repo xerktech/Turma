@@ -944,13 +944,6 @@ those are marked `[MODEL]`.
   so a port that renders them per-entry shows the same PR ~6 times). Android decodes these to
   `UnknownBlock`/ignored keys today (safe degrade); port the fields onto `model/Models.kt`'s
   `ToolUseBlock` + new marker blocks, build items in `core/ChatItems.kt`, render in `ChatScreen`.
-- P1 **Blocking TUI dialogs (`session.panePrompt`).** The agent now reports the tool-permission /
-  plan-approval dialog scraped off the pane, and the web renders it in the pending-question box with
-  numbered picks that `POST .../sessions/<id>/pane-prompt {optionNumber}`; both web `liveState`s also
-  treat it as "waiting for your answer" so the card isn't labelled idle while it blocks. Android
-  decodes the field away today, so such a session still reads idle with no way to answer. Port:
-  `panePrompt` onto the session model, the waiting state in `core/Sessions.kt`, and the picker in
-  `ChatScreen`/`ChatViewModel` beside the existing question sheet.
 ### Usage
 - P2 **Table-view state persistence (XERK-31).** The web keeps the usage table open + the page put
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).

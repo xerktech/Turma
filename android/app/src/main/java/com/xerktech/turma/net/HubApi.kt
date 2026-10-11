@@ -143,6 +143,14 @@ interface HubApi {
         @Body body: AnswerRequest,
     ): OkResponse
 
+    /** Answer the TUI's blocking dialog (permission / plan approval) by its option number. */
+    @POST("api/agents/{host}/sessions/{id}/pane-prompt")
+    suspend fun answerPanePrompt(
+        @Path("host") host: String,
+        @Path("id") id: String,
+        @Body body: PanePromptAnswer,
+    ): OkResponse
+
     // 200 with entries, or 202 {pending, cmdId}; caller inspects the code.
     @GET("api/agents/{host}/sessions/{id}/history")
     suspend fun history(@Path("host") host: String, @Path("id") id: String): Response<HistoryResponse>
@@ -655,6 +663,10 @@ data class AnswerRequest(
     val custom: String? = null,
     val optionIndices: List<Int>? = null,
 )
+
+/** The 1-based number the dialog itself displays (hub accepts 1-9). */
+@Serializable
+data class PanePromptAnswer(val optionNumber: Int)
 
 /** The target agent a session should move to (XERK-101). */
 @Serializable

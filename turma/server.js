@@ -9352,6 +9352,24 @@ function coerceLiveSignals(live) {
   if ("attentionEdgeTs" in live && !(Number.isSafeInteger(live.attentionEdgeTs) && live.attentionEdgeTs > 0)) {
     delete live.attentionEdgeTs;
   }
+  // The blocking TUI dialog (permission / plan approval; agent parse_pane_prompt).
+  // Android TYPES it, so it is rebuilt to {prompt, options[{number, label,
+  // selected}], detail} with right-typed leaves. A non-empty string `prompt` is
+  // what makes it a dialog (attention, review, the sleeper guard all key on it),
+  // so only a bad prompt drops it; a bad option is filtered. `number` is the
+  // digit the agent types, so only 1-9 survives.
+  if ("panePrompt" in live) {
+    const p = live.panePrompt;
+    if (objectish(p) && typeof p.prompt === "string" && p.prompt) {
+      const options = Array.isArray(p.options)
+        ? p.options.filter((o) => objectish(o) && Number.isInteger(o.number) && o.number >= 1 &&
+            o.number <= 9 && typeof o.label === "string")
+          .map((o) => ({ number: o.number, label: o.label, selected: o.selected === true }))
+        : [];
+      live.panePrompt = { prompt: p.prompt, options,
+        detail: typeof p.detail === "string" ? p.detail : "" };
+    } else delete live.panePrompt;
+  }
   coerceStringList(live, "questionOptions");
   coerceStringList(live, "newPrUrls");
   coerceObjectList(live, "questionOptionsRich"); // QuestionOption leaves are all Strings
