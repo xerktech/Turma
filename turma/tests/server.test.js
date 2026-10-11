@@ -8160,8 +8160,11 @@ test("XERK-1827: an undelivered haiku session escalates the next start to sonnet
 });
 
 test("XERK-1830: /api/agents serves the ticket model ladder for the board's Model row", async () => {
-  const res = await request("GET", "/api/agents", { headers: userHeaders });
-  assert.deepEqual(res.body.ticketModelLadder, hub.TICKET_MODEL_LADDER);
+  // Off by default (XERK-1827): served empty, so the board reads "Default".
+  let res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.deepEqual(res.body.ticketModelLadder, []);
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
+  res = await request("GET", "/api/agents", { headers: userHeaders });
   assert.deepEqual(res.body.ticketModelLadder, ["haiku", "sonnet", "opus"]);
 });
 
@@ -8186,6 +8189,7 @@ test("XERK-1827: a host bound to another org cannot climb this org's ladder", as
 });
 
 test("XERK-1830: a drifting host's history never climbs the ladder (row and spawn agree)", async () => {
+  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad8.atlassian.net";
   await ladderBeat("lad8", site);                                  // bound to lad8
   await ladderBeat("lad8", "other8.atlassian.net", { closed: [     // now declares another org
