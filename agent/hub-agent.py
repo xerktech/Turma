@@ -14721,6 +14721,24 @@ PASTE_SLICED_MAX_CHARS = 4000
 # (emoji, flags), zero-width joiners, variation selectors and the keycap mark.
 # Sliced emoji were tagged anyway and ZWJ runs corrupted, so these go bracketed.
 _SLICE_UNSAFE_RE = re.compile("[\U00010000-\U0010FFFF\u200d\ufe0e\ufe0f\u20e3]")
+# Claude Code reads an Enter that lands within a short window of TYPED input as
+# part of that input \u2014 a line break, not a submit \u2014 so the message sits in the
+# composer forever (no turn, nothing for the compaction outbox to see). Measured
+# on 2.1.296 through a real tmux pane: a ~790-char message typed in two slices
+# (the size of the hub's PR-merged nudge) stayed unsubmitted 2/4 times with the
+# Enter 10ms behind it, 2/4 at 100ms, 0/4 at 300ms; a one-slice ~220-char message
+# was 0/6 at 10ms, so the window is short but load-dependent. So a typed message
+# settles before its Enter, then the composer is read back and Enter is pressed
+# again while it still holds the message (bounded by count and wall clock).
+TYPED_SUBMIT_SETTLE_SEC = _env_float("TYPED_SUBMIT_SETTLE_SEC", 0.5, minimum=0.0)
+TYPED_SUBMIT_MAX_RETRIES = _env_int("TYPED_SUBMIT_MAX_RETRIES", 3, minimum=0)
+TYPED_SUBMIT_DEADLINE_SEC = _env_float("TYPED_SUBMIT_DEADLINE_SEC", 4.0, minimum=0.0)
+# The composer is boxed by two horizontal rules (the upper may carry the
+# session's name); version-coupled to the TUI like the busy markers. It only
+# gates the retry \u2014 the settle above is the marker-independent fix.
+_COMPOSER_RULE_RE = re.compile(r"^\s*\u2500{10,}")
+# How much of the message's end must still be in the composer to call it unsent.
+COMPOSER_TAIL_CHARS = 60
 # One writer per pane at a time: the input worker and the beat (resend, qwen
 # peer) can type into the same pane, and slices from two messages must never
 # interleave. They share one tmux buffer name too.
@@ -14741,6 +14759,39 @@ def _input_slices(text):
         out.append(text[i:j])
         i = j
     return out or [""]
+
+
+def _composer_holds(cap, text):
+    """True when the pane's composer — the lines between the last two rules —
+    still ends with `text`, i.e. its Enter was read as a line break. Whitespace
+    is ignored on both sides: the composer wraps and indents what it shows."""
+    want = re.sub(r"\s+", "", text or "")[-COMPOSER_TAIL_CHARS:]
+    if not cap or not want:
+        return False
+    lines = cap.splitlines()
+    rules = [i for i, line in enumerate(lines) if _COMPOSER_RULE_RE.match(line)]
+    if len(rules) < 2:
+        return False
+    box = "".join(lines[rules[-2] + 1:rules[-1]])
+    return re.sub(r"\s+", "", box).endswith(want)
+
+
+def _submit_typed(tmux_name, text, press_enter):
+    """Submit TYPED text: settle, Enter, then Enter again while the composer
+    still holds it and no turn has started (TYPED_SUBMIT_SETTLE_SEC)."""
+    time.sleep(TYPED_SUBMIT_SETTLE_SEC)
+    press_enter()
+    deadline = time.monotonic() + TYPED_SUBMIT_DEADLINE_SEC
+    for _ in range(TYPED_SUBMIT_MAX_RETRIES):
+        if time.monotonic() >= deadline:
+            break
+        time.sleep(TYPED_SUBMIT_SETTLE_SEC)
+        cap = _capture_pane(tmux_name)
+        if _busy_from_capture(cap) or not _composer_holds(cap, text):
+            break
+        log(f"typing into {tmux_name}: Enter was read as a line break; "
+            f"pressing it again")
+        press_enter()
 
 
 def _clean_input_text(text):
@@ -14883,6 +14934,8 @@ def _type_into_pane(tmux_name, text):
     burst past ~800 chars is read as a paste too). A tab becomes four spaces, as
     Claude Code renders a pasted one: a typed tab is autocomplete. Longer or
     emoji-bearing text keeps the single bracketed paste (see the constants).
+    Typed text is submitted by _submit_typed: an Enter too close behind it is
+    read as a line break and the message would sit unsent in the composer.
     The BUFFER carries every paste (XERK-227's argv limit, unrelated).
 
     On Windows the pty-host stands in for tmux (XERK-697): `_pty_inject` applies
@@ -14954,7 +15007,15 @@ def _type_into_tmux_pane(tmux_name, text):
             # Each chunk appends to the input line; only the Enter below submits.
             run(_tmux("send-keys", "-t", _tmux_pane(tmux_name), "-l", "--", chunk,
                       name=tmux_name))
-    run(_tmux("send-keys", "-t", _tmux_pane(tmux_name), "Enter", name=tmux_name))
+
+    def press_enter():
+        run(_tmux("send-keys", "-t", _tmux_pane(tmux_name), "Enter", name=tmux_name))
+
+    if sliced or not pasted:
+        # Typed, not bracketed: an immediate Enter can be read as a line break.
+        _submit_typed(tmux_name, text, press_enter)
+    else:
+        press_enter()
     return pasted
 
 
@@ -15381,9 +15442,9 @@ def _pty_inject(tmux_name, text):
     carrying '\\n', which libuv hands node as the same LF byte the tmux `-r`
     path types, a line break rather than a submit (read from the conhost and
     libuv sources; NOT yet verified on a Windows host). Tabs go as four spaces
-    (a typed tab is autocomplete). Then a separate CR submits; a multi-slice or
-    multi-line message waits PASTE_CHUNK_GAP_SEC first so the Enter is never
-    read in the same burst as the text.
+    (a typed tab is autocomplete). Then a separate CR submits, after
+    TYPED_SUBMIT_SETTLE_SEC and re-pressed while the composer still holds the
+    text (_submit_typed): an Enter too close to typed input is a line break.
 
     Longer or emoji-bearing text keeps ONE inject, bracketed when multi-line
     (ESC[200~ ... ESC[201~) so it stays one message. That bracketed paste needs
@@ -15423,11 +15484,15 @@ def _pty_inject(tmux_name, text):
                     f"failed; {sum(map(len, slices[:n]))} chars typed but left "
                     f"unsubmitted in the composer")
             return False
-    chip = not sliced and "\n" in clean
+    if sliced:
+        # Typed text: settle, Enter, and Enter again if it was read as a line
+        # break (TYPED_SUBMIT_SETTLE_SEC — measured on the tmux path).
+        _submit_typed(tmux_name, clean,
+                      lambda: _pty_control(tmux_name, "inject", data="\r"))
+        return True
+    chip = "\n" in clean
     if chip:
         time.sleep(PTY_SUBMIT_SETTLE_SEC)          # let the paste chip settle
-    elif len(slices) > 1 or "\n" in clean:
-        time.sleep(PASTE_CHUNK_GAP_SEC)            # Enter in its own burst
     _pty_control(tmux_name, "inject", data="\r")   # submit with Enter
     # Safety net: while a not-yet-submitted paste chip is still on screen and no
     # turn has started, Enter again. Never fires for typed text (no chip).

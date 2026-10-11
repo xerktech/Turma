@@ -5341,6 +5341,8 @@ class ManagerMixin:
             ("run", fake_run),
             ("run_ok", fake_run_ok),
             ("run_stdin", fake_run_stdin),
+            # The settle before a typed message's Enter is real wall-clock time.
+            ("TYPED_SUBMIT_SETTLE_SEC", 0),
             ("_port_open", fake_port_open),
             ("repo_head_ready", lambda path: self.head_ready),
             ("REGISTRY_DIR", self.tmp),
@@ -8333,6 +8335,105 @@ LINUX_COMPOSER_PANE = (
     + "─" * 220 + "\n"
     "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n"
 )
+
+
+# Real Claude Code 2.1.296 frames (trimmed width) right after a typed message's
+# Enter: STUCK is the Enter read as a line break, the message left in the
+# composer; SENT is the same message submitted (and answered).
+_STUCK_MSG = ("Reply with just the word PONG. "
+              + "Ignore this filler sentence about deployment verification and "
+                "merged pull requests. " * 9)
+COMPOSER_STUCK = (
+    "\n" * 4
+    + "─" * 120 + "\n"
+    "❯ Reply with just the word PONG. Ignore this filler sentence about deployment "
+    "verification and merged pull\n"
+    + "".join("  requests. Ignore this filler sentence about deployment verification "
+              "and merged pull\n" for _ in range(8))
+    + "  requests.\n"
+    + "─" * 120 + "\n"
+    "  ⏵⏵ auto mode on (shift+tab to cycle)\n"
+)
+COMPOSER_SENT = (
+    "❯ Reply with just the word PONG. Ignore this filler sentence about deployment "
+    "verification and merged pull\n"
+    "  requests.\n"
+    "● PONG\n"
+    "✻ Cogitated for 1s · done 1:59 PM\n"
+    + "─" * 120 + "\n"
+    "❯ \n"
+    + "─" * 120 + "\n"
+    "  ⏵⏵ auto mode on (shift+tab to cycle) · ← for agents\n"
+)
+COMPOSER_BUSY = COMPOSER_STUCK.replace(
+    "(shift+tab to cycle)", "(shift+tab to cycle) · esc to interrupt")
+
+
+class TestSubmitTyped(ManagerMixin, unittest.TestCase):
+    """A typed message's Enter can be read as a line break, leaving the message
+    unsent in the composer — the hub's PR-merged nudge, ~760 chars in two
+    slices, stuck 2/4 times on a real pane. _submit_typed settles, then presses
+    Enter again while the composer still holds the message."""
+
+    def _send(self, caps, text=_STUCK_MSG):
+        self.make_manager()             # the mixin's tmux fakes
+        self.run_calls.clear()
+        frames = list(caps)
+        with mock.patch.object(ha, "_capture_pane",
+                               side_effect=lambda t: frames.pop(0) if frames else caps[-1]):
+            ha._type_into_pane("agent-abcde", text)
+        return [c for c in self.run_calls if c[-1] == "Enter"]
+
+    def test_the_composer_reads_back_from_real_frames(self):
+        self.assertTrue(ha._composer_holds(COMPOSER_STUCK, _STUCK_MSG))
+        self.assertFalse(ha._composer_holds(COMPOSER_SENT, _STUCK_MSG))
+        self.assertFalse(ha._composer_holds(LINUX_COMPOSER_PANE, _STUCK_MSG))
+        self.assertFalse(ha._composer_holds(None, _STUCK_MSG))
+        self.assertFalse(ha._composer_holds(COMPOSER_STUCK, ""))
+        # The message's tail in the SCROLLBACK above the composer is not unsent.
+        self.assertFalse(ha._composer_holds(COMPOSER_SENT, "merged pull requests."))
+
+    def test_an_enter_read_as_a_line_break_is_pressed_again(self):
+        self.assertEqual(len(self._send([COMPOSER_STUCK, COMPOSER_SENT])), 2)
+
+    def test_a_submitted_message_gets_one_enter(self):
+        self.assertEqual(len(self._send([COMPOSER_SENT])), 1)
+
+    def test_a_turn_already_running_is_never_entered_again(self):
+        # Busy: the Enter took (or queued the message); another could answer
+        # whatever the turn shows next.
+        self.assertEqual(len(self._send([COMPOSER_BUSY])), 1)
+
+    def test_an_unreadable_pane_gets_one_enter(self):
+        self.assertEqual(len(self._send([None])), 1)
+
+    def test_re_presses_are_bounded(self):
+        self.assertEqual(len(self._send([COMPOSER_STUCK])),
+                         1 + ha.TYPED_SUBMIT_MAX_RETRIES)
+
+    def test_re_presses_stop_at_the_deadline(self):
+        with mock.patch.object(ha, "TYPED_SUBMIT_DEADLINE_SEC", 0):
+            self.assertEqual(len(self._send([COMPOSER_STUCK])), 1)
+
+    def test_a_bracketed_paste_keeps_its_immediate_enter(self):
+        # Past the slicing cap the text is pasted, not typed: no read-back.
+        self.make_manager()
+        self.run_calls.clear()
+        with mock.patch.object(ha, "_capture_pane") as cap:
+            ha._type_into_pane("agent-abcde", "x" * (ha.PASTE_SLICED_MAX_CHARS + 1))
+        cap.assert_not_called()
+        self.assertEqual([c[-1] for c in self.run_calls], ["Enter"])
+
+    def test_the_windows_typed_path_presses_again_too(self):
+        sent = []
+        frames = [COMPOSER_STUCK, COMPOSER_SENT]
+        with mock.patch.object(ha, "_pty_control",
+                               side_effect=lambda n, op, **kw: sent.append(kw.get("data"))
+                               or {"ok": True}), \
+                mock.patch.object(ha, "_capture_pane", side_effect=lambda t: frames.pop(0)), \
+                mock.patch.object(ha.time, "sleep"):
+            self.assertTrue(ha._pty_inject("agent-x", _STUCK_MSG))
+        self.assertEqual(sent.count("\r"), 2)
 
 
 class TestTrustDialogIsABlockingDialog(unittest.TestCase):
@@ -38753,9 +38854,9 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         self.assertEqual(order[1], ("sleep", ha.PTY_SUBMIT_SETTLE_SEC))
         self.assertEqual(order[2], ("inject", "\r"))
 
-    def test_pty_inject_single_line_submits_immediately(self):
-        # A single-line paste never collapses, so it keeps the fast path: no
-        # settle sleep, no pane re-read, an immediate Enter.
+    def test_pty_inject_single_line_settles_before_its_enter(self):
+        # Typed text makes no paste chip, but an Enter right behind it can be
+        # read as a line break (_submit_typed), so it settles first.
         calls = []
 
         def fake_control(name, op, **kw):
@@ -38764,11 +38865,13 @@ class TestWindowsTerminalBackend(unittest.TestCase):
 
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
              mock.patch.object(ha.time, "sleep") as slept, \
-             mock.patch.object(ha, "_capture_pane") as cap:
+             mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_SENT) as cap:
             self.assertTrue(ha._pty_inject("agent-x", "just one line"))
+        # Typed text: settle, ONE Enter, then one read of the composer, which
+        # is empty, so no second Enter.
         self.assertEqual(calls, [calls[0], "\r"])
-        slept.assert_not_called()
-        cap.assert_not_called()
+        self.assertEqual(slept.call_args_list[0], mock.call(ha.TYPED_SUBMIT_SETTLE_SEC))
+        cap.assert_called_once()
 
     def test_pty_inject_retries_enter_while_the_paste_chip_shows(self):
         # Safety net: a collapse slower than one settle leaves the "[Pasted text]"
@@ -38847,7 +38950,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
              mock.patch.object(ha.time, "sleep",
                                side_effect=lambda s: order.append(("sleep", s))), \
-             mock.patch.object(ha, "_capture_pane") as cap:
+             mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_SENT) as cap:
             result = ha._pty_inject("agent-x", text)
         return result, order, cap
 
@@ -38857,9 +38960,10 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         ok, order, cap = self._inject("line1\r\nline2\tx")
         self.assertTrue(ok)
         self.assertEqual(order, [("inject", "line1\nline2    x"),
-                                 ("sleep", ha.PASTE_CHUNK_GAP_SEC),
-                                 ("inject", "\r")])
-        cap.assert_not_called()   # typed text makes no chip: no retry loop
+                                 ("sleep", ha.TYPED_SUBMIT_SETTLE_SEC),
+                                 ("inject", "\r"),
+                                 ("sleep", ha.TYPED_SUBMIT_SETTLE_SEC)])
+        cap.assert_called_once()  # composer read back once; it was empty
 
     def test_pty_inject_slices_a_long_single_line(self):
         # One burst past ~800 chars is a paste too, so a long line is typed in
@@ -38872,8 +38976,9 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         self.assertTrue(all(len(p) <= ha.PASTE_CHUNK_CHARS for p in injects[:-1]))
         self.assertEqual("".join(injects[:-1]), text)
         self.assertNotIn("\x1b[200~", "".join(injects))
-        self.assertEqual(order[-2:], [("sleep", ha.PASTE_CHUNK_GAP_SEC), ("inject", "\r")])
-        self.assertEqual(sum(1 for k, _ in order if k == "sleep"), 3)
+        self.assertEqual(order[-3:], [("sleep", ha.TYPED_SUBMIT_SETTLE_SEC), ("inject", "\r"),
+                                      ("sleep", ha.TYPED_SUBMIT_SETTLE_SEC)])
+        self.assertEqual(sum(1 for k, _ in order if k == "sleep"), 4)
 
     def test_pty_inject_brackets_past_the_slicing_cap(self):
         text = "x" * (ha.PASTE_SLICED_MAX_CHARS + 1) + "\ny"

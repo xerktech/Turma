@@ -34,6 +34,13 @@ composed.**
     submit and arrive corrupted, and slicing costs ~2 tmux calls per slice ON THE BEAT (resend, qwen
     peer). Those keep one bracketed paste; `chat.js` `stripFraming` hides the tags.
   - A typed TAB is autocomplete, so tabs go as 4 spaces. One writer per pane (`_PANE_TYPE_LOCKS`).
+  - **Typed text's Enter is settled and verified** (`_submit_typed`): an Enter close behind typed
+    input is read as a LINE BREAK, leaving the message unsent in the composer with nothing to
+    retry it. Measured on 2.1.296: a ~790-char two-slice message (the hub's PR-merged nudge)
+    stuck 2/4 at a 10ms gap. So it waits `TYPED_SUBMIT_SETTLE_SEC`, then re-reads the composer
+    (`_composer_holds`: between the last two rules) and Enters again, bounded by count + clock.
+    The settle alone is not enough under load (8 concurrent panes each needed re-presses).
+    Never Enter again on a busy pane. Tests: `TestSubmitTyped`.
   - Windows `_pty_inject` applies the same rule (XERK-1727, `windows-agent.md`). Tests:
     `TestSendInput`, the `_pty_inject` cases in `TestWindowsTerminalBackend`.
 - **Nothing truncates silently**: the fallback CHUNKS its send-keys; the agent REFUSES past
