@@ -5839,6 +5839,76 @@ test("http: pane-prompt endpoint queues answerPanePrompt with the displayed numb
   ]);
 });
 
+const DIALOG_A = "a".repeat(32);
+const DIALOG_B = "b".repeat(32);
+function servedDialog(id) {
+  return { prompt: "Do you want to proceed?", detail: "Bash command\nls", id,
+    options: [{ number: 1, label: "Yes", selected: true }, { number: 2, label: "No", selected: false }] };
+}
+
+test("XERK-1831: pane-prompt stamps the answer with the dialog the client rendered", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "pp3", sessions: [{ id: "sess1", status: "running",
+      session: { panePrompt: servedDialog(DIALOG_A) } }] },
+    headers: agentHeaders,
+  });
+  const res = await request("POST", "/api/agents/pp3/sessions/sess1/pane-prompt", {
+    body: { optionNumber: 1, dialogId: DIALOG_A }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp3" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, [
+    { type: "answerPanePrompt", sessionId: "sess1", optionNumber: 1, dialogId: DIALOG_A,
+      cmdId: res.body.cmdId },
+  ]);
+});
+
+test("XERK-1831: pane-prompt falls back to the session's served dialog id", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "pp4", sessions: [{ id: "sess1", status: "running",
+      session: { panePrompt: servedDialog(DIALOG_B) } }] },
+    headers: agentHeaders,
+  });
+  const res = await request("POST", "/api/agents/pp4/sessions/sess1/pane-prompt", {
+    body: { optionNumber: 1 }, headers: userHeaders,
+  });
+  assert.equal(res.status, 200);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp4" }, headers: agentHeaders });
+  const cmd = beat.body.commands.find((c) => c.type === "answerPanePrompt");
+  assert.equal(cmd.dialogId, DIALOG_B);
+});
+
+test("XERK-1831: pane-prompt refuses an answer to a dialog the hub already saw replaced", async () => {
+  await request("POST", "/api/heartbeat", {
+    body: { device: "pp6", sessions: [{ id: "sess1", status: "running",
+      session: { panePrompt: servedDialog(DIALOG_B) } }] },
+    headers: agentHeaders,
+  });
+  const res = await request("POST", "/api/agents/pp6/sessions/sess1/pane-prompt", {
+    body: { optionNumber: 1, dialogId: DIALOG_A }, headers: userHeaders,
+  });
+  assert.equal(res.status, 409);
+  assert.match(res.body.error, /changed/);
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp6" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, []);
+});
+
+test("XERK-1831: pane-prompt refuses a malformed dialog id or body", async () => {
+  await request("POST", "/api/heartbeat", { body: { device: "pp5" }, headers: agentHeaders });
+  for (const body of [{ optionNumber: 1, dialogId: 7 }, { optionNumber: 1, dialogId: "" },
+    { optionNumber: 1, dialogId: "A".repeat(32) }, { optionNumber: 1, dialogId: "a".repeat(33) },
+    { optionNumber: 1, dialogId: ["a".repeat(32)] },
+    null]) {
+    const res = await request("POST", "/api/agents/pp5/sessions/sess1/pane-prompt", {
+      body, headers: userHeaders,
+    });
+    assert.equal(res.status, 400, JSON.stringify(body));
+    assert.doesNotMatch(res.body.error || "", /Cannot read/);
+  }
+  const beat = await request("POST", "/api/heartbeat", { body: { device: "pp5" }, headers: agentHeaders });
+  assert.deepEqual(beat.body.commands, []);
+});
+
 test("http: pane-prompt endpoint rejects a number no dialog key could carry", async () => {
   await request("POST", "/api/heartbeat", { body: { device: "pp2" }, headers: agentHeaders });
   // The answer is delivered by typing the digit, so 0, 10+ and non-integers

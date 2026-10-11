@@ -15877,6 +15877,15 @@ function questionAnswerText(a, sessionId, picks, custom) {
   // Worded as a phrase, not a "; (…)" list item, which read like a glitch.
   return picked ? `${picked}, plus a typed answer` : "(a typed answer)";
 }
+// The served id of a session's blocking dialog (XERK-1831), or "" — an older
+// agent serves none, and its answers then carry none (the number check alone).
+const PANE_DIALOG_ID_RE = /^[0-9a-f]{32}$/;
+function servedPaneDialogId(a, sessionId) {
+  const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
+  const pp = s && s.session && s.session.panePrompt;
+  return pp && typeof pp.id === "string" && PANE_DIALOG_ID_RE.test(pp.id) ? pp.id : "";
+}
+
 function panePromptAnswerText(a, sessionId, n) {
   const s = (Array.isArray(a.sessions) ? a.sessions : []).find((x) => x && x.id === sessionId);
   const pp = s && s.session && s.session.panePrompt;
@@ -20256,13 +20265,31 @@ const server = http.createServer(async (req, res) => {
       // the 1-based number the dialog itself displays — the agent types that
       // digit, and re-reads the pane first so a click made against a stale beat
       // is dropped rather than typed into a live composer.
+      //
+      // The command also names WHICH dialog was answered (XERK-1831): every
+      // permission dialog offers "1. Yes", so a number alone approves whatever
+      // dialog replaced the answered one before delivery. Body `dialogId` is
+      // the served panePrompt.id the client rendered (the agent's digest of
+      // the whole dialog); without one the hub stamps the served id. A
+      // dialogId the hub already knows is gone is refused here (409), and the
+      // agent drops any answer whose id is not the dialog on screen.
       if (req.method === "POST" && parts.length === 6 && parts[5] === "pane-prompt") {
-        const body = JSON.parse((await readBody(req)) || "{}");
+        const body = JSON.parse((await readBody(req)) || "{}") || {};
         const optionNumber = Number.isInteger(body.optionNumber) ? body.optionNumber : 0;
         if (optionNumber < 1 || optionNumber > 9) {
           return json(res, 400, { error: "optionNumber 1-9 required" });
         }
-        const cmdId = queueCommand(key, { type: "answerPanePrompt", sessionId, optionNumber });
+        if (body.dialogId !== undefined
+          && !(typeof body.dialogId === "string" && PANE_DIALOG_ID_RE.test(body.dialogId))) {
+          return json(res, 400, { error: "dialogId must be the dialog's served id" });
+        }
+        const servedId = servedPaneDialogId(agents[key], sessionId);
+        if (body.dialogId !== undefined && servedId && body.dialogId !== servedId) {
+          return json(res, 409, { error: "That dialog has already changed — answer the one showing now." });
+        }
+        const dialogId = body.dialogId !== undefined ? body.dialogId : servedId;
+        const cmdId = queueCommand(key, { type: "answerPanePrompt", sessionId, optionNumber,
+          ...(dialogId ? { dialogId } : {}) });
         // The org's decisions log (XERK-1574): the dialog + the option picked.
         recordAnswerDecision(key, sessionId, "permission",
           panePromptAnswerText(agents[key], sessionId, optionNumber));
