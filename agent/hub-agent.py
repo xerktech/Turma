@@ -9936,13 +9936,30 @@ def _shell_cmd_kind(words, depth=0):
     return "work", None
 
 
+def _shell_arith_end(word, i):
+    """For a `$((` at i, the index past its `))` when it is arithmetic, else
+    None: `$((cd x && make) 2>&1)` is a command substitution holding a
+    subshell, which bash runs (its inner group does not close right before
+    the outer one)."""
+    depth, j, n = 2, i + 3, len(word)
+    while j < n:
+        if word[j] == "(":
+            depth += 1
+        elif word[j] == ")":
+            depth -= 1
+            if depth == 1:
+                return j + 2 if word[j + 1:j + 2] == ")" else None
+        j += 1
+    return None   # unclosed: read the body as a command (errs toward work)
+
+
 def _shell_subst_bodies(word):
     """The command texts a word's `$(…)`/backtick substitutions run. `$((…))`
     is arithmetic, not a command, but a `$(…)` inside it still runs. An
     unclosed one yields the rest of the word."""
     out, i, n = [], 0, len(word)
     while i < n:
-        if word.startswith("$((", i):
+        if word.startswith("$((", i) and _shell_arith_end(word, i) is not None:
             i += 3
         elif word.startswith("$(", i):
             depth, j = 1, i + 2
@@ -40007,6 +40024,7 @@ class SessionManager:
             except Exception as e:
                 log(f"restartAgent: turma-agentctl handoff failed ({e}); exiting")
         log("restartAgent: exiting for the supervisor to restart us")
+        _ignore_late_pokes()
         raise SystemExit(0)
 
     def _handle_shutdown(self, signum, frame):

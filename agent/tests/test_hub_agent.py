@@ -37268,11 +37268,14 @@ class TestRestartAgent(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
              mock.patch.dict(ha.os.environ, self._no_systemd_env(INVOCATION_ID="abc"), clear=True), \
              mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha, "_ignore_late_pokes") as ignore, \
              mock.patch.object(ha.subprocess, "Popen") as popen:
             with self.assertRaises(SystemExit):
                 sm._perform_restart()
         ann.assert_called_once_with("restart")
         popen.assert_not_called()
+        # A poke landing during exit must not kill us (rollup XERK-1584).
+        ignore.assert_called_once_with()
 
     def test_perform_restart_exits_in_container(self):
         # No systemd and no ctl script beside hub-agent.py (the container layout):

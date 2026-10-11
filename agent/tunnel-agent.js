@@ -1160,11 +1160,23 @@ function shellCmdKind(words, depth = 0) {
 // The command texts a word's `$(…)`/backtick substitutions run. `$((…))` is
 // arithmetic, not a command, but a `$(…)` inside it still runs. An unclosed one
 // yields the rest of the word.
+function shellArithEnd(word, i) {
+  // For a `$((` at i, the index past its `))` when it is arithmetic, else null:
+  // `$((cd x && make) 2>&1)` is a command substitution holding a subshell,
+  // which bash runs (its inner group does not close right before the outer one).
+  let depth = 2;
+  for (let j = i + 3; j < word.length; j++) {
+    if (word[j] === "(") depth++;
+    else if (word[j] === ")" && --depth === 1) return word[j + 1] === ")" ? j + 2 : null;
+  }
+  return null;   // unclosed: read the body as a command (errs toward work)
+}
+
 function shellSubstBodies(word) {
   const out = [], n = word.length;
   let i = 0;
   while (i < n) {
-    if (word.startsWith("$((", i)) {
+    if (word.startsWith("$((", i) && shellArithEnd(word, i) != null) {
       i += 3;
     } else if (word.startsWith("$(", i)) {
       let depth = 1, j = i + 2;

@@ -47,6 +47,8 @@
     ["while true; do n=$(date +%s); sleep 60; done", "wait-timed", null],
     ["sleep $((2 * 30))", "wait-timed", null],
     ["sleep $(( $(nproc) * 5 ))", "work", null],
+    ["while true; do OUT=$((cd build && make) 2>&1); sleep 60; done", "work", null],
+    ["while true; do n=$(( (3 + 4) * 2 )); sleep 60; done", "wait-timed", null],
     ["timeout 60 gh pr view 1", "work", null],
     ["for p in 1 2 3; do gh pr view $p; done", "work", null],
     ["while true; do gh pr view 1; make; sleep 5; done", "work", null],
