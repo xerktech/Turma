@@ -168,11 +168,20 @@ test("a hydrate with an index phase keeps the gate closed across the boundary (X
   let hydrated = 0;
   const calls = await gateCallsOfHydrate({ async hydrateSessionsInto() { hydrated++; } });
   assert.equal(hydrated, 1);
-  assert.deepEqual(calls, [true, true, false], "opened once, at the very end");
+  // Closed before the local repair pass (XERK-1450), again by the byte phase, again by the index phase.
+  assert.deepEqual(calls, [true, true, true, false], "opened once, at the very end");
 });
 
 test("a byte-only hydrate opens the gate when the byte phase ends (XERK-1523)", async () => {
-  assert.deepEqual(await gateCallsOfHydrate(null), [true, false]);
+  assert.deepEqual(await gateCallsOfHydrate(null), [true, true, false]);
+});
+
+test("XERK-1450: ingest is closed for the whole local repair pass before the byte hydrate", async () => {
+  const seen = [];
+  const real = archive.dedupArchive;
+  archive.dedupArchive = async (o) => { seen.push([!!(o && o.publish), archive.isHydrating()]); return 0; };
+  try { await gateCallsOfHydrate(null); } finally { archive.dedupArchive = real; }
+  assert.deepEqual(seen[0], [false, true], "the local pass runs with ingest closed");
 });
 
 // A transcript whose file holds its lines twice (XERK-1364 damage) — the XERK-1450 seed.
@@ -362,6 +371,58 @@ test("XERK-1450: the wired re-seat waits for the mirror, then re-seats a clean f
     await hub.getIndexMirror()._drain();
     assert.deepEqual(calls, [["replace", "t-rs", 2], ["counts", "t-rs", 2]]);
   } finally {
+    hub.setArchiveIndexStore(null);
+    hub.setIndexMirror(null, false);
+  }
+});
+
+test("XERK-1450: the wired hydrate runs the Postgres re-seat after the leader's pass", async () => {
+  let asked = 0;
+  const store = {
+    async upsertSession() {}, async appendEntries() {}, async replaceEntries() { return true; },
+    async setCounts() {}, async hydrateSessionsInto() {},
+    async inconsistentTranscripts() { asked += 1; return []; },
+  };
+  const blob = { async list() { return []; }, async put() {}, async stat() { return null; },
+    async getToFile() { return false; } };
+  hub.setIndexMirror(store, true);
+  hub.setArchiveIndexStore(store);
+  hub.setArchiveMirror(blob, true);
+  try {
+    await hub.hydrateArchiveOnce();
+    for (let i = 0; i < 50 && !asked; i++) await new Promise((r) => setTimeout(r, 20));
+    assert.equal(asked, 1);
+  } finally {
+    hub.setArchiveMirror(null, false);
+    hub.setArchiveIndexStore(null);
+    hub.setIndexMirror(null, false);
+    archive.setBlobSink(null);
+    archive.setRawRemote(null);
+    archive.setRenderedGate(null);
+  }
+});
+
+test("XERK-1450: the re-seat asks nothing while the mirror is busy or once deposed", async () => {
+  let asked = 0;
+  const store = { async upsertSession() {}, async appendEntries() {},
+    async inconsistentTranscripts() { asked += 1; return []; } };
+  hub.setIndexMirror(store, true);
+  hub.setArchiveIndexStore(store);
+  try {
+    const m = hub.getIndexMirror();
+    m._running = true;                        // the repair's own ops still draining
+    const run = hub.reseatArchiveIndex();
+    assert.equal(hub.reseatArchiveIndex(), run, "single-flight");
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(asked, 0, "waits for the mirror to go idle");
+    m._running = false;
+    assert.equal(await run, 0);
+    assert.equal(asked, 1);
+    hub.__setLeader({ isLeader: () => false });
+    assert.equal(await hub.reseatArchiveIndex(), 0);
+    assert.equal(asked, 1, "a deposed replica never queries");
+  } finally {
+    hub.__setLeader(null);
     hub.setArchiveIndexStore(null);
     hub.setIndexMirror(null, false);
   }

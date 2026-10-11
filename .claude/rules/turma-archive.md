@@ -229,6 +229,10 @@ The agent half (what it ships, delta bounds, when it sheds) is in `.claude/rules
   - **The pass YIELDS every ~20ms** (`dedupArchive` is async, serialized): run whole over ~2 GB it
     held the event loop 16-20s, past the 15s lease, and in prod both replicas lost leadership
     mid-repair. Never make it synchronous again; keep each file's step one synchronous slice.
+  - **Because it yields, ingest is CLOSED before the local pre-hydrate pass** (`setHydrating(true)`
+    in `hydrateArchiveOnce`): open, a promoted replica took chunks onto its stale copy mid-pass and
+    the drain PUT the shorter file over the complete object (QA). A publishing pass stops once this
+    replica stops leading (`stillLeader`).
   - **A clean file can still have a damaged Postgres row** (239 in prod): after the leader's pass,
     `reseatArchiveIndex` waits for the mirror to drain, asks `inconsistentTranscripts` (rows ≠
     distinct rows, or msg_count ≠ rows) and `reseatIndexFromFiles` re-seats only those whose

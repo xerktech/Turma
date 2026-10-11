@@ -4622,7 +4622,7 @@ function setArchiveMirror(blobStore, ha) {
       archive.reconcileLanded(!!archiveIndexStore);
       setImmediate(() => {
         if (!isLeader()) return;
-        archive.dedupArchive({ publish: true }).catch((e) =>
+        archive.dedupArchive({ publish: true, stillLeader: () => isLeader() }).catch((e) =>
           console.error(`archive: duplicate repair failed: ${e && e.message}`));
       });
     },
@@ -5008,8 +5008,15 @@ function hydrateArchive() {
 // Re-seat the Postgres index from the files where the two disagree (XERK-1450): once
 // the repair's own ops have drained, ask Postgres which transcripts look wrong and
 // let archive.js compare each against its file. Leader only, pg mode only.
+// Single-flight: a lease lost and won back runs the hydrate twice, and two re-seats
+// would each queue repairs for the same transcripts.
 const ARCHIVE_RESEAT_WAIT_MS = 10 * 60 * 1000;
-async function reseatArchiveIndex() {
+let reseatInFlight = null;
+function reseatArchiveIndex() {
+  if (!reseatInFlight) reseatInFlight = reseatArchiveIndexOnce().finally(() => { reseatInFlight = null; });
+  return reseatInFlight;
+}
+async function reseatArchiveIndexOnce() {
   if (!archiveIndexStore || !indexMirror || !archive.isPgMode()) return 0;
   const until = Date.now() + ARCHIVE_RESEAT_WAIT_MS;
   while (!indexMirror.idle() && Date.now() < until) {
@@ -5024,6 +5031,11 @@ async function hydrateArchiveOnce() {
   // hydrate: the hydrate keeps a local file that is larger than the bucket's, so a
   // stale duplicated copy would otherwise survive the leader's repair. Local only —
   // nothing is mirrored from a replica that may not be the leader.
+  // The pass yields between files, so ingest is CLOSED first (XERK-1048): open, a
+  // promoted replica took chunks onto its stale copy during the pass and the drain
+  // PUT that shorter file over the complete object (QA). The byte hydrate below
+  // keeps it closed and its phase (or the index phase) opens it.
+  if (archiveMirror) archive.setHydrating(true);
   try { await archive.dedupArchive({ publish: false }); }
   catch (e) { console.error(`archive: duplicate repair (local) failed: ${e && e.message}`); }
   if (archiveMirror) {
@@ -5047,7 +5059,7 @@ async function hydrateArchiveOnce() {
   // re-runs the whole hydrate from onLeaderPromoted. Then, off this path, Postgres
   // rows that disagree with an already-clean file are re-seated from it.
   if (isLeader()) {
-    try { await archive.dedupArchive({ publish: true }); }
+    try { await archive.dedupArchive({ publish: true, stillLeader: () => isLeader() }); }
     catch (e) { console.error(`archive: duplicate repair failed: ${e && e.message}`); }
     reseatArchiveIndex().catch((e) =>
       console.error(`archive: Postgres re-seat failed: ${e && e.message}`));

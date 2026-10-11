@@ -1480,5 +1480,48 @@ test("PgIndexStore.inconsistentTranscripts: one aggregate, rows mapped", async (
   const q = pool.calls.find((c) => c.m === "query");
   assert.match(q.text, /count\(DISTINCT \(uuid, role, ts, text\)\)/);
   assert.match(q.text, /LEFT JOIN e ON e\.transcript_id = s\.transcript_id/);
+  assert.match(q.text, /WHERE COALESCE\(e\.n, 0\) <> COALESCE\(e\.u, 0\) OR s\.msg_count <> COALESCE\(e\.n, 0\)$/);
   assert.deepEqual(out, [{ transcriptId: "t1", msgCount: 9, n: 6, u: 3 }]);
+});
+
+test("XERK-1450: the re-seat skips a pending or rendered-blocked file and catches a distinct-count mismatch alone", async () => {
+  const mem = pgSetup();
+  try {
+    const { jsonl } = duplicatedTranscript("t-skip");
+    mem.dropRepairs = true;
+    await archive.dedupArchive({ publish: true });            // leaves t-skip pending
+    mem.dropRepairs = false;
+    const bad = (id) => ({ transcriptId: id, msgCount: 99, n: 99, u: 1 });
+    assert.equal(await archive.reseatIndexFromFiles([bad("t-skip")]), 0, "the repair owns a pending file");
+    archive.ingestChunk("nas", "t-ok", META, 0, 100, [ent("o0", "user", "a"), ent("o1", "user", "b")], "acme");
+    const okPath = path.join(process.env.ARCHIVE_DIR, archive.sessionRow("t-ok").filePath);
+    archive.setRenderedGate((p) => p === okPath);
+    assert.equal(await archive.reseatIndexFromFiles([bad("t-ok")]), 0, "a blocked file is not the of-record copy");
+    archive.setRenderedGate(null);
+    // n and msg_count agree with the file; only the distinct count is off.
+    assert.equal(await archive.reseatIndexFromFiles([{ transcriptId: "t-ok", msgCount: 2, n: 2, u: 1 }]), 1);
+    assert.ok(jsonl);
+  } finally { archive.setRenderedGate(null); pgTeardown(); }
+});
+
+test("XERK-1450: a deposed replica's publishing pass stops and rewrites nothing", async () => {
+  const mem = pgSetup();
+  const noted = [];
+  try {
+    const { jsonl } = duplicatedTranscript("t-dep");
+    const before = fs.readFileSync(jsonl, "utf8");
+    archive.setBlobSink((p) => noted.push(p));
+    assert.equal(await archive.dedupArchive({ publish: true, stillLeader: () => false }), 0);
+    assert.equal(fs.readFileSync(jsonl, "utf8"), before);
+    assert.deepEqual(noted, []);
+    assert.ok(mem);
+  } finally { archive.setBlobSink(null); pgTeardown(); }
+});
+
+test("XERK-1450: a NUL in entry text never reaches Postgres", async () => {
+  const mem = pgSetup();
+  try {
+    archive.ingestChunk("nas", "t-nul", META, 0, 100, [ent("n0", "user", "a\u0000b"), ent("n1", "user", "xy")], "acme");
+    assert.deepEqual([...mem.entries.get("t-nul").values()].map((e) => e.text), ["ab", "xy"]);
+  } finally { pgTeardown(); }
 });

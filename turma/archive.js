@@ -443,11 +443,14 @@ function mirrorEntries(transcriptId, list, startSeq) {
   if (!indexSink || typeof indexSink.entries !== "function" || !list || !list.length) return;
   try {
     indexSink.entries(transcriptId, list.map((e) => ({
-      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: pgText(e.text),
     })), startSeq);
   } catch { /* best-effort mirror */ }
 }
 // Mirror a wholesale replacement of a transcript's entries (the reconcile heal).
+// Entry text as Postgres can store it: a U+0000 is refused in a text column, and the
+// refusal drops the WHOLE insert batch (up to 1000 entries), not just that entry.
+function pgText(t) { return String(t || "").replace(/\u0000/g, ""); }
 // Mirror the duplicate repair (XERK-1450) as ONE op: replace the transcript's
 // entries and set its msgCount/archiveBytes EXACTLY — the one write allowed to
 // lower them (the session upsert only raises). `done` runs once Postgres has both.
@@ -455,7 +458,7 @@ function mirrorRepair(transcriptId, list, msgCount, archiveBytes, done) {
   if (!indexSink || typeof indexSink.repair !== "function") return;
   try {
     indexSink.repair(transcriptId, (list || []).map((e) => ({
-      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: pgText(e.text),
     })), msgCount, archiveBytes, done);
   } catch { /* best-effort mirror */ }
 }
@@ -465,7 +468,7 @@ function mirrorReplace(transcriptId, list, gated) {
   if (!indexSink || typeof indexSink.replace !== "function") return;
   try {
     indexSink.replace(transcriptId, (list || []).map((e) => ({
-      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: pgText(e.text),
     })), gated === true);
   } catch { /* best-effort mirror */ }
 }
@@ -474,7 +477,7 @@ function mirrorSeat(transcriptId, list) {
   if (!indexSink || typeof indexSink.seat !== "function") return;
   try {
     indexSink.seat(transcriptId, (list || []).map((e) => ({
-      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: pgText(e.text),
     })));
   } catch { /* best-effort mirror */ }
 }
@@ -2910,12 +2913,16 @@ function dedupArchive(opts) {
 }
 async function dedupPass(opts) {
   const publish = !!(opts && opts.publish);
+  // A publishing pass stops the moment this replica stops leading: its rewrites are
+  // noted for the bucket, and a deposed replica must not PUT over the new leader's.
+  const stillLeader = publish && opts && typeof opts.stillLeader === "function" ? opts.stillLeader : null;
   const files = [];
   walkJsonl(ARCHIVE_DIR, files, 0);
   let repaired = 0, droppedTotal = 0;
   let slice = Date.now();
   for (const jsonl of files) {
     if (Date.now() - slice > PASS_SLICE_MS) { await yieldLoop(); slice = Date.now(); }
+    if (stillLeader && !stillLeader()) break;
     // A rendered file whose download has not landed is not the of-record copy.
     if (renderedGate) { try { if (renderedGate(jsonl)) continue; } catch { continue; } }
     const metaPath = jsonl + ".meta";
@@ -3020,7 +3027,7 @@ async function reseatIndexFromFiles(rows) {
     try { size = fs.statSync(jsonl).size; } catch { continue; } // no local file: nothing to trust
     const entries = heldEntries(jsonl).entries;
     const keys = new Set(entries.map((e) => JSON.stringify(
-      [e.uuid || null, e.role || null, e.ts || null, String(e.text || "")])));
+      [e.uuid || null, e.role || null, e.ts || null, pgText(e.text)])));
     const n = entries.length;
     if (r.n === n && r.msgCount === n && r.u === keys.size) continue;
     live.msgCount = n;
