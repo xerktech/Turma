@@ -129,8 +129,14 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
     transcript before `_mark_imported_usage` records its window, and the hub keeps a day's
     HIGH-WATER, so one over-count would stick. The slug rides the next snapshot's `refold`, and a
     snapshot replaced before it ran hands its `refold` on.
-  - `repoUsage`/`usage`/`resumable` are one scan stale, and EMPTY until the first scan after a start
-    lands (`usage` None = "can't tell"; the hub's high-water keeps the day).
+  - `repoUsage`/`usage` are one scan stale, and absent until the first scan after a start lands
+    (`usage` None = "can't tell"; the hub's high-water keeps the day).
+  - **`resumable` must NEVER read empty after a restart**: the hub counts a ticket whose only session
+    is in it as started (`startedTicketKeys`), so an empty list re-spawns it via auto-start / an epic
+    run. The last list is persisted (`RESUMABLE_CACHE_PATH`) and loaded at init; the file is
+    session-writable, so it is read via `_read_untrusted_json`, re-shaped, and ticket/prs are
+    re-attached from the manager's own ledgers. A gen-voided scan still applies `resumable` (it
+    reads no baseline) and re-stages on the next full beat (`_usage_restage`).
   - `_refresh_repo_usage` is the synchronous form, for tests only. Tests: `TestUsageScanWorker`.
 - Tests: `TestReconcileOrphanTranscripts`, `TestSanitizeJunkRepoEntries`, android
   `UsageViewModelTest`.

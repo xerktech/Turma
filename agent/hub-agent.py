@@ -513,6 +513,16 @@ CLOSED_PER_REPO = 5
 # session I ended" is the point of it, and bounded at all only to bound the
 # heartbeat — the hub's archive holds the tail beyond this, searchably.
 RESUMABLE_PER_REPO = 50
+# The last resume-picker scan, kept across a manager restart (XERK-1453). The
+# scan runs on the usage worker, so a restarted manager's first beats would
+# otherwise report every repo's `resumable` EMPTY until it lands — and the hub
+# counts a ticket whose only session is in that list as started
+# (startedTicketKeys), so an empty list lets auto-start spawn it a second time.
+RESUMABLE_CACHE_PATH = os.path.join(REGISTRY_DIR, "resumable-cache.json")
+RESUMABLE_CACHE_MAX_BYTES = 16 * 1024 * 1024
+# The fields a cached resumable entry keeps; ticket and prs are re-attached from
+# the manager's own ledgers at load, never taken from the file.
+_RESUMABLE_CACHE_STR_KEYS = ("transcriptId", "cwd", "repo", "origin", "slug", "endedTs")
 # Durable worktree-path -> {repo, remote, slug} attribution ledger. Written at
 # spawn and NEVER dropped on kill/delete, so a transcript's token usage stays
 # traceable to its repo long after the session (and even its worktree) is gone.
@@ -21016,6 +21026,7 @@ class SessionManager:
         self._usage_inputs = None
         self._usage_ready = None
         self._usage_worker = None
+        self._usage_restage = False      # a discarded scan asks the next beat to re-stage
         # _resumable_report re-derives the "Resume any session" picker from every
         # transcript on disk each slow beat; the per-file reads (_transcript_cwd
         # over ALL of them, _first_user_text/_last_activity_ts over the survivors)
@@ -21545,6 +21556,9 @@ class SessionManager:
         # blanking them. See PR_LEDGER_PATH.
         self.pr_ledger = self._load_pr_ledger()
         self._backfill_pr_ledger()
+        # Needs both ledgers above: they re-attach each entry's ticket and PRs.
+        self.resumable = self._load_resumable_cache()
+        self._resumable_saved = None
         # Last SUCCESSFUL gh repo sweep, held so a failed one (which blanks the
         # github block to repos:[]) can't be mistaken for an empty org — see
         # _start_jira_triage.
@@ -38105,12 +38119,81 @@ class SessionManager:
         before a migrated-in transcript's usage window was recorded is dropped
         whole: it may have counted the source host's turns, and the hub keeps a
         day's high-water mark, so one over-count would stick."""
+        if "resumable" in result:
+            # The picker reads no usage baseline, so an import cannot void it.
+            self.resumable = result["resumable"]
+            self._save_resumable_cache()
         if result.get("gen") != self._usage_gen:
+            # Re-scan on the next full beat rather than leave the figures a
+            # whole USAGE_EVERY window stale (empty, right after a start).
+            self._usage_restage = True
             return
         if "usage" in result:
             self.repo_usage, self.host_usage = result["usage"]
-        if "resumable" in result:
-            self.resumable = result["resumable"]
+
+    def _load_resumable_cache(self):
+        """The resume picker as the previous manager last published it, so the
+        first beats after a restart do not report it empty (RESUMABLE_CACHE_PATH
+        says why that matters). The file is under ~/.turma, which a session can
+        write, so it is read through _read_untrusted_json and every entry is
+        re-shaped: only plain string fields survive, the transcript id must be
+        one a resume would accept, and ticket/prs come from this manager's own
+        ledgers. Replaced by the first scan that lands. Never raises."""
+        try:
+            raw = _read_untrusted_json(RESUMABLE_CACHE_PATH, RESUMABLE_CACHE_MAX_BYTES)
+            out = {}
+            for repo, lst in (raw if isinstance(raw, dict) else {}).items():
+                if not isinstance(repo, str) or not isinstance(lst, list):
+                    continue
+                keep = []
+                for e in lst[:RESUMABLE_PER_REPO]:
+                    if not isinstance(e, dict) or e.get("repo") != repo:
+                        continue
+                    if not all(isinstance(e.get(k), str) for k in _RESUMABLE_CACHE_STR_KEYS):
+                        continue
+                    tid = e["transcriptId"]
+                    if not VALID_CLAUDE_SID_RE.fullmatch(tid):
+                        continue
+                    row = {k: e[k] for k in _RESUMABLE_CACHE_STR_KEYS}
+                    row["root"] = e.get("root") is True
+                    summary = e.get("summary")
+                    row["summary"] = summary if isinstance(summary, str) else None
+                    row["ticket"] = self.ticket_ledger.get(tid)
+                    row["prs"] = self._ledger_prs(tid)
+                    keep.append(row)
+                if keep:
+                    out[repo] = keep
+            return out
+        except Exception as e:
+            log(f"resumable cache load failed: {type(e).__name__}: {e}")
+            return {}
+
+    def _save_resumable_cache(self):
+        """Persist the picker for the next manager start (beat only, on change;
+        small). ticket/prs are left out — the loader re-derives them. Never
+        raises: a lost cache only costs the post-restart window it covers."""
+        try:
+            body = json.dumps({repo: [{k: v for k, v in e.items()
+                                       if k not in ("ticket", "prs")} for e in lst]
+                               for repo, lst in self.resumable.items()},
+                              sort_keys=True)
+            if body == self._resumable_saved:
+                return
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            fd, tmp = tempfile.mkstemp(prefix=".resumable-", dir=REGISTRY_DIR)
+            try:
+                with os.fdopen(fd, "w") as f:
+                    f.write(body)
+                os.replace(tmp, RESUMABLE_CACHE_PATH)
+            except BaseException:
+                try:
+                    os.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            self._resumable_saved = body
+        except Exception as e:
+            log(f"resumable cache save failed: {type(e).__name__}: {e}")
 
     def _stage_repo_usage(self):
         """A refresh beat's usage work (XERK-1453): the ledger upkeep inline,
@@ -38683,7 +38766,8 @@ class SessionManager:
         # slow cadence the beat keeps the ledger and stages the disk scan on the
         # usage worker (XERK-1453); every beat applies whatever scan has landed.
         # One beat stale, and empty until the first scan after a start lands.
-        if refresh:
+        if refresh or (not light and self._usage_restage):
+            self._usage_restage = False
             self._stage_repo_usage()
         self._take_repo_usage()
 

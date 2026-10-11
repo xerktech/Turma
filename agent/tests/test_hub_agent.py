@@ -5366,6 +5366,7 @@ class ManagerMixin:
             # XERK-1587: every launch/teardown unlinks the session's snapshot.
             ("LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
@@ -7609,6 +7610,65 @@ class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
                                side_effect=RuntimeError("can't start new thread")):
             sm._stage_repo_usage()                          # no raise
         self.assertIsNotNone(sm._usage_inputs)              # retried next refresh
+
+    def _resumable_row(self, tid="t1", repo="Turma"):
+        return {"transcriptId": tid, "cwd": self.WT, "repo": repo, "root": False,
+                "origin": "worktree", "slug": ha._project_slug(self.WT),
+                "summary": "s", "endedTs": "2026-07-01T10:00:00Z"}
+
+    def test_a_restarted_manager_reports_the_last_picker_before_its_first_scan(self):
+        # The hub counts a ticket whose only session is in `resumable` as
+        # started (startedTicketKeys); an empty list after a restart let
+        # auto-start spawn it a second time.
+        sm = self.make_manager()
+        sm.ticket_ledger["t1"] = {"key": "ENG-5"}
+        sm._apply_usage_scan({"gen": sm._usage_gen,
+                              "resumable": {"Turma": [self._resumable_row()]}})
+        fresh = self.make_manager()             # its __init__ loads the cache
+        self.assertEqual(fresh.resumable["Turma"][0]["transcriptId"], "t1")
+        fresh.ticket_ledger = {"t1": {"key": "ENG-5"}}
+        self.assertEqual(fresh._load_resumable_cache()["Turma"][0]["ticket"],
+                         {"key": "ENG-5"})            # from the ledger, not the file
+
+    def test_the_cache_is_untrusted(self):
+        # ~/.turma is session-writable: junk is dropped, ticket/prs never read
+        # from the file, and a FIFO does not block the load.
+        sm = self.make_manager()
+        bad = dict(self._resumable_row(), ticket={"key": "FORGED-1"})
+        rows = {"Turma": [bad, dict(self._resumable_row("x y")),
+                          dict(self._resumable_row("t2"), repo="Other"),
+                          dict(self._resumable_row("t3"), cwd=7), "junk"],
+                "Bad": "nope"}
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump(rows, f)
+        got = sm._load_resumable_cache()
+        self.assertEqual([e["transcriptId"] for e in got["Turma"]], ["t1"])
+        self.assertIsNone(got["Turma"][0]["ticket"])
+        os.remove(ha.RESUMABLE_CACHE_PATH)
+        os.mkfifo(ha.RESUMABLE_CACHE_PATH)
+        self.assertEqual(sm._load_resumable_cache(), {})
+
+    def test_an_import_mid_scan_still_publishes_the_picker_and_rescans(self):
+        sm = self.make_manager()
+        self._seed(sm)
+        stale_inputs = sm._usage_scan_inputs()
+        sm._mark_imported_usage("b", ha._project_slug(self.WT), None)
+        stale = sm._usage_scan(stale_inputs)
+        stale["resumable"] = {"Turma": [self._resumable_row()]}
+        sm._apply_usage_scan(stale)
+        self.assertEqual(sm.repo_usage, [])                 # usage voided
+        self.assertIn("Turma", sm.resumable)                # picker kept
+        self.assertTrue(sm._usage_restage)
+        with mock.patch.object(sm, "_stage_repo_usage") as stage:
+            sm.build_payload(1)                             # not a refresh beat
+        stage.assert_called_once_with()
+        self.assertFalse(sm._usage_restage)
+
+    def test_the_worker_store_is_pruned_to_ledger_slugs(self):
+        sm = self.make_manager()
+        sm._agg_slug_usage["gone-slug"] = {"acc": ha._UsageAcc(), "offsets": {}}
+        sm._refresh_repo_usage()
+        self.assertNotIn("gone-slug", sm._agg_slug_usage)
 
     def test_a_failed_part_keeps_the_previous_answer(self):
         sm = self.make_manager()
@@ -26156,6 +26216,7 @@ class TestPruneRepo(unittest.TestCase):
             ("REGISTRY_PATH", os.path.join(self.tmp, "sessions.json")),
             ("CLOSED_PATH", os.path.join(self.tmp, "closed.json")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
+            ("RESUMABLE_CACHE_PATH", os.path.join(self.tmp, "resumable-cache.json")),
             ("USAGE_BASELINE_PATH", os.path.join(self.tmp, "usage-baseline.json")),
             ("TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-repos.json")),
             ("TICKET_TRIAGE_LEDGER_PATH", os.path.join(self.tmp, "jira-triage.json")),
