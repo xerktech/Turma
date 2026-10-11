@@ -33,6 +33,10 @@ data class AgentsResponse(
     // a ticket's session runs, when the operator overrode the login's default.
     // Hub-owned and durable like ticketAgents; absent on older hubs.
     val ticketModels: Map<String, TicketModelPin> = emptyMap(),
+    // The model ladder unpinned claude ticket sessions climb (XERK-1827/1830),
+    // e.g. ["haiku","sonnet","opus"]; empty when TICKET_MODEL_LADDER=off and on
+    // an older hub — both mean "the login's default", the old Default row.
+    val ticketModelLadder: List<String> = emptyList(),
     // Ticket -> pinned RUNTIME (XERK-473 / [I]), keyed "<siteKey>/<issueKey>":
     // which runtime ("claude"|"dsh") a ticket's session spawns on, delivered on
     // the spawnTicket command as `agentType`. Only a non-default ("dsh") pin is
@@ -363,6 +367,9 @@ data class ClaudeAuth(
 data class AgentInfo(
     val key: String = "",
     val device: String = "",
+    // This host's effective runtime for an unpinned spawn (XERK-521), hub-coerced
+    // to claude|dsh|qwen (normalizeDefaultRuntime); "" = an older hub, read as claude.
+    val defaultRuntime: String = "",
     // The coding agent this host runs + this Turma agent build's version, both
     // shown in the host header (web index.html codingAgent()/agentVersion).
     val claudeVersion: String = "",
@@ -630,6 +637,10 @@ data class ClosedSessionInfo(
     // over the branch), and must not change just because the session was killed.
     val summaryManual: Boolean = false,
     val label: String = "",
+    // The alias it was spawned on (XERK-1827): the board's Model row reads a
+    // failed ticket session's ladder tier off it (XERK-1830). The hub keeps it
+    // only as a plain alias (normalizeClosedSessions), else drops it.
+    val model: String = "",
     // Which runtime this session ran on (XERK-460 / [M] XERK-477), so an ended
     // dsh card shows its runtime the same way a live one does. "claude" (the
     // default) and "" (a record from an agent predating the field) both read as

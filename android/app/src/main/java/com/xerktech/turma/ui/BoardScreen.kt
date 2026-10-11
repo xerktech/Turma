@@ -474,6 +474,10 @@ fun BoardScreen(
         val pin = com.xerktech.turma.core.agentPinOf(fleet.ticketAgents, site.siteKey, ticket.key)
         val modelPin = com.xerktech.turma.core.modelPinOf(fleet.ticketModels, site.siteKey, ticket.key)
         val runtimePin = com.xerktech.turma.core.runtimePinOf(fleet.ticketRuntimes, site.siteKey, ticket.key)
+        // The model ladder's next tier for an unpinned ticket (XERK-1830), off the
+        // live fleet so a session ending undelivered moves the Model row.
+        val ladderPick = com.xerktech.turma.core.ladderPickOf(
+            fleet.agents, fleet.ticketModelLadder, site.siteKey, ticket.key, pin, runtimePin)
         // Host-OS requirement (XERK-693): the ticket's own pin, plus the epic's
         // requirement it inherits when it has none of its own.
         val platformPin = com.xerktech.turma.core.platformPinOf(fleet.ticketPlatforms, site.siteKey, ticket.key)
@@ -495,7 +499,7 @@ fun BoardScreen(
         val epicChildren = if (isEpicTicket(ticket)) epicChildrenOf(liveSite, ticket.key) else emptyList()
         // A session that closed this ticket itself (XERK-1569) — web's "Closed by" row.
         val closedBy = ticketOutcomeOf(ticketSessionsOf(sessionIndex, site.siteKey, ticket.key))
-        TicketDetailSheet(site, ticket, pin, modelPin, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, epicPreview, epicChildren, vm, closedBy, onDismiss = { detail = null })
+        TicketDetailSheet(site, ticket, pin, modelPin, ladderPick, runtimePin, platformPin, platformInherited, platformEpicKey, triageAction, epicView, epicPreview, epicChildren, vm, closedBy, onDismiss = { detail = null })
     }
 
     if (filterOpen) {
@@ -1429,15 +1433,16 @@ private fun AgentSection(
 
 /**
  * The Model row of the detail sheet (XERK-123): which MODEL this ticket's session
- * runs — the operator's override of the login's default. Mirrors board.js
- * modelFieldHtml + modelPickerHtml: Default is the stated default (naming what it
- * resolves to when probed), a pin says "set by you".
+ * runs. Mirrors board.js modelFieldHtml + modelPickerHtml: an unpinned ticket
+ * reads "Auto (<the ladder's next tier>)" with why (XERK-1830), or on a hub with
+ * no ladder "Default" naming what it resolves to when probed; a pin says "set by you".
  */
 @Composable
 private fun ModelSection(
     site: BoardSite,
     t: JiraTicket,
     pin: com.xerktech.turma.model.TicketModelPin?,
+    ladderPick: com.xerktech.turma.core.LadderPick?,
     vm: BoardViewModel,
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -1445,9 +1450,11 @@ private fun ModelSection(
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(6.dp)) {
             // The value IS the picker; it's always offerable (static family
             // aliases), matching the web row's always-editable Model field.
-            ModelPicker(site, pin) { model -> vm.setTicketModel(site.siteKey, t.key, model) }
+            ModelPicker(site, pin, ladderPick) { model -> vm.setTicketModel(site.siteKey, t.key, model) }
             if (pin != null) {
                 Text("— set by you", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            } else if (ladderPick != null) {
+                Text("— ${com.xerktech.turma.core.ladderPickReason(ladderPick)}", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
             }
         }
     }
@@ -1455,22 +1462,24 @@ private fun ModelSection(
 
 /** The model value rendered as the picker; a pick IS the save, null = default. */
 @Composable
-private fun ModelPicker(site: BoardSite, pin: com.xerktech.turma.model.TicketModelPin?, onPick: (model: String?) -> Unit) {
+private fun ModelPicker(
+    site: BoardSite,
+    pin: com.xerktech.turma.model.TicketModelPin?,
+    ladderPick: com.xerktech.turma.core.LadderPick?,
+    onPick: (model: String?) -> Unit,
+) {
     var open by remember { mutableStateOf(false) }
     // A pinned alias off the probed list is carried back so it can stay current,
     // the same orphan handling the web picker does.
     val choices = com.xerktech.turma.core.modelChoices(site.models).toMutableList()
     pin?.model?.takeIf { it.isNotBlank() && it !in choices }?.let { choices.add(0, it) }
-    val current = pin?.let { com.xerktech.turma.core.prettyModel(it.model) }
-        ?: ("Default" + (site.models.defaultLabel.takeIf { it.isNotBlank() }
-            ?.let { " (${com.xerktech.turma.core.prettyModel(it)})" } ?: ""))
+    val auto = com.xerktech.turma.core.modelAutoLabel(site.models, ladderPick)
+    val current = pin?.let { com.xerktech.turma.core.prettyModel(it.model) } ?: auto
     Box {
         SelectableValue(current, onClick = { open = true }, mono = pin != null)
         androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-            val def = site.models.defaultLabel.takeIf { it.isNotBlank() }
-                ?.let { " (${com.xerktech.turma.core.prettyModel(it)})" } ?: ""
             androidx.compose.material3.DropdownMenuItem(
-                text = { Text("Default$def") },
+                text = { Text(auto) },
                 onClick = { open = false; onPick(null) },
             )
             for (m in choices) {
@@ -1821,6 +1830,7 @@ private fun TicketDetailSheet(
     t: JiraTicket,
     pin: com.xerktech.turma.model.TicketAgentPin?,
     modelPin: com.xerktech.turma.model.TicketModelPin?,
+    ladderPick: com.xerktech.turma.core.LadderPick?,
     runtimePin: com.xerktech.turma.model.TicketRuntimePin?,
     platformPin: com.xerktech.turma.model.TicketPlatformPin?,
     platformInherited: com.xerktech.turma.model.TicketPlatformPin?,
@@ -1880,7 +1890,7 @@ private fun TicketDetailSheet(
             } else {
                 RepoSection(site, t, vm)
                 AgentSection(site, t, pin, vm)
-                ModelSection(site, t, modelPin, vm)
+                ModelSection(site, t, modelPin, ladderPick, vm)
                 RuntimeSection(site, t, runtimePin, vm)
                 PlatformSection(site, t, platformPin, platformInherited, platformInheritedFrom, vm)
                 TriageSection(site, t, triageAction, vm)

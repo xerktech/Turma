@@ -15,7 +15,7 @@ const {
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
   dedupeChipHtml, dedupeTwinUrl,
   agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
-  modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
+  modelPinOf, ladderPickOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
   runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
   platformPinOf, platformFieldHtml, platformPickerHtml, platformPickerValue, prettyPlatform,
   statusFieldHtml, statusPickerHtml, statusPickerValue,
@@ -1282,6 +1282,73 @@ test("modelPickerHtml: default preselected without a pin, the pinned alias with 
   const pinned = modelPickerHtml({ model: "opus" }, models);
   assert.ok(/<option value="opus" selected>/.test(pinned));
   assert.ok(!/<option value="__default__" selected>/.test(pinned));
+});
+
+// ---- the model ladder's pick (XERK-1830): what an unpinned Model row names ----
+const LADDER = ["haiku", "sonnet", "opus"];
+const ladTicket = (extra = {}) => ({ key: "ENG-5", siteKey: "acme", ...extra });
+const ladAgent = (key, extra = {}) => ({ key, org: "acme", sessions: [], closedSessions: [], ...extra });
+
+test("XERK-1830: ladderPickOf is null without a ladder, the bottom tier with no history", () => {
+  assert.equal(ladderPickOf([ladAgent("h1")], undefined, "acme", "ENG-5"), null);
+  assert.equal(ladderPickOf([ladAgent("h1")], [], "acme", "ENG-5"), null);
+  assert.deepEqual(ladderPickOf([ladAgent("h1")], LADDER, "acme", "ENG-5"), { model: "haiku" });
+});
+
+test("XERK-1830: ladderPickOf climbs one tier past an undelivered ended session, capped", () => {
+  const closed = (model, extra = {}) => ({ id: model, model, ticket: ladTicket(), prs: [], ...extra });
+  let agents = [ladAgent("h1", { closedSessions: [closed("haiku")] })];
+  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5"), { model: "sonnet", escalatedFrom: "haiku" });
+  agents = [ladAgent("h1", { closedSessions: [closed("haiku")],
+    sessions: [{ id: "s", status: "stopped", model: "opus", ticket: ladTicket() }] })];
+  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5"), { model: "opus", escalatedFrom: "opus" });
+});
+
+test("XERK-1830: ladderPickOf ignores delivered, live, paused and other-org/ticket sessions", () => {
+  const agents = [
+    ladAgent("h1", {
+      sessions: [
+        { id: "a", status: "running", model: "sonnet", ticket: ladTicket() },
+        { id: "b", status: "error", model: "sonnet", ticket: ladTicket() },
+      ],
+      closedSessions: [
+        { id: "c", model: "sonnet", ticket: ladTicket(), prs: [{ url: "u" }] },
+        { id: "d", model: "sonnet", ticket: ladTicket({ outcome: { kind: "done", at: 1 } }) },
+        { id: "e", model: "sonnet", ticket: ladTicket(), paused: { wakeAt: 9 } },
+        { id: "f", model: "sonnet", ticket: ladTicket({ key: "ENG-6" }) },
+        { id: "g", model: "fable", ticket: ladTicket() },   // not a ladder tier: no evidence
+      ],
+    }),
+    // A host the hub decided into another org (or none) never counts here.
+    ladAgent("h2", { org: "", closedSessions: [{ id: "h", model: "opus", ticket: ladTicket() }] }),
+  ];
+  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5"), { model: "haiku" });
+});
+
+test("XERK-1830: ladderPickOf is null under a non-claude runtime pin or pinned host default", () => {
+  const agents = [ladAgent("h1"), ladAgent("q1", { defaultRuntime: "qwen" })];
+  assert.equal(ladderPickOf(agents, LADDER, "acme", "ENG-5", { runtimePin: { runtime: "dsh" } }), null);
+  assert.equal(ladderPickOf(agents, LADDER, "acme", "ENG-5", { agentPin: { host: "q1" } }), null);
+  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5", { agentPin: { host: "h1" } }), { model: "haiku" });
+  // A claude runtime pin forces claude even on a qwen-default host.
+  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5",
+    { agentPin: { host: "q1" }, runtimePin: { runtime: "claude" } }), { model: "haiku" });
+});
+
+test("XERK-1830: an unpinned Model row and picker name the ladder's tier as Auto", () => {
+  const models = { available: ["opus", "sonnet", "haiku"], defaultLabel: "Sonnet 5" };
+  const first = modelFieldHtml(null, models, { editable: true, ladderPick: { model: "haiku" } });
+  assert.ok(first.includes("Auto (Haiku) — the model ladder's first tier"));
+  assert.ok(!first.includes("Default"));
+  const retry = modelFieldHtml(null, models,
+    { editable: true, ladderPick: { model: "sonnet", escalatedFrom: "haiku" } });
+  assert.ok(retry.includes("Auto (Sonnet, retry) — a Haiku session ended without a PR"));
+  // A pin still wins over the ladder.
+  assert.ok(modelFieldHtml({ model: "opus" }, models, { ladderPick: { model: "haiku" } }).includes("set by you"));
+  const pick = modelPickerHtml(null, models, { model: "sonnet", escalatedFrom: "haiku" });
+  assert.ok(/<option value="__default__" selected>Auto \(Sonnet, retry\)</.test(pick));
+  // No ladder (older hub / TICKET_MODEL_LADDER=off): the login default as before.
+  assert.ok(/<option value="__default__" selected>Default \(Sonnet 5\)</.test(modelPickerHtml(null, models, null)));
 });
 
 // ---- ticket -> runtime pin (XERK-473): the detail panel's Runtime row -------

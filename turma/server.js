@@ -5435,7 +5435,12 @@ function buildAgentsCache() {
   // board-scoped, and hub-owned, so this is their one read channel (plus their
   // own SSE events for open boards).
   const body = JSON.stringify({
-    now, agents: list, ticketAgents, ticketModels, ticketRuntimes, ticketPlatforms, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
+    now, agents: list, ticketAgents, ticketModels,
+    // The model ladder unpinned claude ticket sessions climb (XERK-1827), [] when
+    // TICKET_MODEL_LADDER=off. Env-fixed for the hub's life, so no SSE frame; the
+    // board derives each ticket's next tier from it + the live fleet (XERK-1830).
+    ticketModelLadder: TICKET_MODEL_LADDER,
+    ticketRuntimes, ticketPlatforms, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
     // Per-org triage policy (XERK-486 [F]) and the per-ticket triage verdicts
     // (approve/hold/reject): hub-owned like the pins above, and the board's one
     // read channel for both — the policy panel and the card chips read them

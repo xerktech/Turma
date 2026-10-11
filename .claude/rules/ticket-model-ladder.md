@@ -6,6 +6,8 @@ paths:
   - "bench/run_policy.py"
   - "bench/run_bench.py"
   - "bench/tests/test_policy.py"
+  - "turma/public/board.js"
+  - "android/app/src/main/java/com/xerktech/turma/core/Board.kt"
 ---
 
 # Ticket model ladder (XERK-1827)
@@ -50,5 +52,8 @@ UNDELIVERED runs one tier up (haiku → sonnet → opus, capped). Evidence: `doc
   - Usage is reduced per `requestId` to the max of each counter (output is cumulative on the last
     line) — summing lines over-counts.
   - Needs a gateway key (`TURMA_LOCAL_API_KEY`); run the cloud models `--jobs 1` (429s otherwise).
+- **The board mirrors the pick** (XERK-1830): `/api/agents` serves `ticketModelLadder`, and
+  `board.js`/`Board.kt` `ladderPickOf` re-derive each ticket's tier for the Model row. Change the
+  delivered/failed rule or the runtime exclusions here → change both ports (`turma-board.md`).
 - Tests: `XERK-1827:` in `server.test.js`; `test_a_ladder_retry_*`/`test_*subagent*`/
   `test_an_ended_ticket_session_reports_its_model` in `TestSpawnTicket`; `bench/tests/test_policy.py`.

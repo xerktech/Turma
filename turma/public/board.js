@@ -2000,15 +2000,76 @@
     return p && p.model ? p : null;
   }
 
+  // The model ladder's pick for an UNPINNED ticket (XERK-1830) — a port of the
+  // hub's ticketLadderPick + ticketSpawnModelFields (XERK-1827), so the Model row
+  // names the tier Start will actually send. `ladder` is the hub's served
+  // ticketModelLadder; absent (an older hub) or empty (TICKET_MODEL_LADDER=off)
+  // means unpinned tickets run the login's default → null, the old "Default" row.
+  // A session of the ticket that is no longer running (stopped, or a closed
+  // record that isn't a paused sleeper) with no PR and no close-ticket outcome
+  // is a failed attempt on its `model`; the pick is one tier above the highest
+  // failed one, capped. Only hosts the hub decided into the ticket's org count
+  // (the served `org`, as ticketSessionIndex reads it). A dsh/qwen runtime pin,
+  // or an agent pin to a host whose default runtime isn't claude, gets no
+  // ladder (null) — the hub sends no model there either. Returns
+  // {model, escalatedFrom?} or null.
+  function ladderPickOf(agents, ladder, siteKey, issueKey, opts) {
+    if (!Array.isArray(ladder) || !ladder.length) return null;
+    const o = opts || {};
+    if (o.runtimePin && o.runtimePin.runtime && o.runtimePin.runtime !== "claude") return null;
+    const list = agents || [];
+    if (!o.runtimePin && o.agentPin && o.agentPin.host) {
+      const a = list.find((x) => x && (x.key || x.device) === o.agentPin.host);
+      if (a && (a.defaultRuntime || "claude") !== "claude") return null;
+    }
+    const orgOf = (a) => a.org != null ? a.org : ((a.jira && a.jira.siteKey) || undefined);
+    const mine = (s) => s && s.ticket && s.ticket.key === issueKey && s.ticket.siteKey === siteKey;
+    let failed = -1;
+    const consider = (rec, live) => {
+      if (!mine(rec)) return;
+      if (live && rec.status !== "stopped") return;
+      if (rec.paused) return;
+      const delivered = (Array.isArray(rec.prs) && rec.prs.length > 0)
+        || (Array.isArray(rec.prUrls) && rec.prUrls.length > 0)
+        || !!rec.ticket.outcome;
+      if (delivered) return;
+      const tier = ladder.indexOf(typeof rec.model === "string" ? rec.model : "");
+      if (tier > failed) failed = tier;
+    };
+    for (const a of list) {
+      if (!a || orgOf(a) !== siteKey) continue;
+      for (const s of a.sessions || []) consider(s, true);
+      for (const c of a.closedSessions || []) consider(c, false);
+    }
+    const next = Math.min(failed + 1, ladder.length - 1);
+    return failed >= 0 ? { model: ladder[next], escalatedFrom: ladder[failed] } : { model: ladder[next] };
+  }
+
+  // What an unpinned ticket's Model row / picker release option is called:
+  // "Auto (Haiku)", "Auto (Sonnet, retry)" under the ladder, else the old
+  // "Default (<probed default>)".
+  function modelAutoLabel(models, ladderPick) {
+    if (ladderPick && ladderPick.model) {
+      return `Auto (${esc(prettyModel(ladderPick.model))}${ladderPick.escalatedFrom ? ", retry" : ""})`;
+    }
+    return "Default" + (models && models.defaultLabel
+      ? ` (${esc(prettyModel(models.defaultLabel))})` : "");
+  }
+
   // The Model row of the detail panel (XERK-123): which model this ticket's
   // session runs. Panel-only like the Agent row — the default is the common case
-  // and there's no per-card chip worth the space. "Default" names what it
-  // resolves to when the org has probed, so the operator sees what "leave it
-  // alone" means.
+  // and there's no per-card chip worth the space. An unpinned row names what
+  // Start will send: the ladder's next tier (opts.ladderPick, XERK-1830), or on
+  // a ladder-less hub what "Default" resolves to when the org has probed.
   function modelFieldHtml(pin, models, opts) {
     const o = opts || {};
     const bits = [];
-    if (!pin) {
+    if (!pin && o.ladderPick && o.ladderPick.model) {
+      const why = o.ladderPick.escalatedFrom
+        ? `a ${esc(prettyModel(o.ladderPick.escalatedFrom))} session ended without a PR`
+        : "the model ladder's first tier";
+      bits.push(`<span class="td-dim">${modelAutoLabel(models, o.ladderPick)} — ${why}</span>`);
+    } else if (!pin) {
       const def = models && models.defaultLabel
         ? ` (${esc(prettyModel(models.defaultLabel))})` : "";
       bits.push(`<span class="td-dim">Default${def} — the agent's default model</span>`);
@@ -2033,19 +2094,17 @@
   // The model picker, swapped in for the row on "Change". Choosing an option IS
   // the save, exactly like the repo/agent pickers. "Default" is the release
   // (drops the pin); every other option pins that alias.
-  function modelPickerHtml(pin, models) {
+  function modelPickerHtml(pin, models, ladderPick) {
     const cur = pin ? pin.model : null;
     const list = modelChoices(models);
     // A pinned alias that has fallen out of the org's current choices (a probe
     // that no longer lists it) is carried back in so it stays `selected` — the
     // same orphan handling the repo/agent pickers do.
     if (cur && !list.includes(cur)) list.unshift(cur);
-    const def = models && models.defaultLabel
-      ? ` (${esc(prettyModel(models.defaultLabel))})` : "";
     const optHtml = (a) => `<option value="${esc(a)}"${
       a === cur ? " selected" : ""}>${esc(prettyModel(a))}</option>`;
     const sel = `<select class="td-repo-select" data-model-select="1">
-      <option value="__default__"${pin ? "" : " selected"}>Default${def}</option>
+      <option value="__default__"${pin ? "" : " selected"}>${modelAutoLabel(models, ladderPick)}</option>
       ${list.map(optHtml).join("")}
     </select>`;
     return `<div class="td-repo-edit">${sel}
@@ -2327,9 +2386,10 @@
       // it needs no online host to be editable — the model options are the org's
       // probed list (o.models), always at least the static family aliases.
       fieldRow("Model", o.modelEditing
-        ? modelPickerHtml(o.modelPin, o.models)
+        ? modelPickerHtml(o.modelPin, o.models, o.ladderPick)
         : modelFieldHtml(o.modelPin, o.models, {
             editable: true,
+            ladderPick: o.ladderPick,
             error: o.modelError,
           })),
       // Which RUNTIME this ticket's session runs on (XERK-473 dsh, XERK-515 qwen).
@@ -2753,7 +2813,7 @@
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     dedupeChipHtml, dedupeTwinUrl,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
-    modelPinOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
+    modelPinOf, ladderPickOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
     runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
     platformPinOf, platformFieldHtml, platformPickerHtml, platformPickerValue, prettyPlatform,
     statusFieldHtml, statusPickerHtml, statusPickerValue,

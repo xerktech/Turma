@@ -528,6 +528,66 @@ class BoardTest {
         assertEquals(null, modelPinOf(mapOf("s/X-1" to com.xerktech.turma.model.TicketModelPin()), "s", "X-1"))
     }
 
+    // ---- the model ladder's pick (XERK-1830): parity with board.js ladderPickOf
+    private val ladder = listOf("haiku", "sonnet", "opus")
+    private fun ladRef(key: String = "ENG-5", outcome: com.xerktech.turma.model.TicketOutcome? = null) =
+        com.xerktech.turma.model.TicketRef(key = key, siteKey = "acme", outcome = outcome)
+    private fun ladClosed(id: String, model: String, ref: com.xerktech.turma.model.TicketRef = ladRef(),
+                          prs: List<com.xerktech.turma.model.PrInfo> = emptyList(),
+                          paused: com.xerktech.turma.model.PausedSleep? = null) =
+        com.xerktech.turma.model.ClosedSessionInfo(id = id, model = model, ticket = ref, prs = prs, paused = paused)
+
+    @Test fun `ladderPickOf is null without a ladder and the bottom tier with no history`() {
+        val agents = listOf(AgentInfo(key = "h1", org = "acme"))
+        assertNull(ladderPickOf(agents, emptyList(), "acme", "ENG-5"))
+        assertEquals(LadderPick("haiku"), ladderPickOf(agents, ladder, "acme", "ENG-5"))
+    }
+
+    @Test fun `ladderPickOf climbs past an undelivered ended session and caps at the top`() {
+        var agents = listOf(AgentInfo(key = "h1", org = "acme", closedSessions = listOf(ladClosed("a", "haiku"))))
+        assertEquals(LadderPick("sonnet", "haiku"), ladderPickOf(agents, ladder, "acme", "ENG-5"))
+        agents = listOf(AgentInfo(key = "h1", org = "acme",
+            closedSessions = listOf(ladClosed("a", "haiku")),
+            sessions = listOf(com.xerktech.turma.model.SessionInfo(id = "s", status = "stopped", model = "opus", ticket = ladRef()))))
+        assertEquals(LadderPick("opus", "opus"), ladderPickOf(agents, ladder, "acme", "ENG-5"))
+    }
+
+    @Test fun `ladderPickOf ignores delivered, live, paused and other-org sessions`() {
+        val agents = listOf(
+            AgentInfo(key = "h1", org = "acme",
+                sessions = listOf(
+                    com.xerktech.turma.model.SessionInfo(id = "a", status = "running", model = "sonnet", ticket = ladRef()),
+                    com.xerktech.turma.model.SessionInfo(id = "b", status = "error", model = "sonnet", ticket = ladRef())),
+                closedSessions = listOf(
+                    ladClosed("c", "sonnet", prs = listOf(com.xerktech.turma.model.PrInfo(url = "u"))),
+                    ladClosed("d", "sonnet", ladRef(outcome = com.xerktech.turma.model.TicketOutcome(kind = "done", at = 1))),
+                    ladClosed("e", "sonnet", paused = com.xerktech.turma.model.PausedSleep(wakeAt = 9)),
+                    ladClosed("f", "sonnet", ladRef(key = "ENG-6")),
+                    ladClosed("g", "fable"))),
+            AgentInfo(key = "h2", org = "", closedSessions = listOf(ladClosed("h", "opus"))),
+        )
+        assertEquals(LadderPick("haiku"), ladderPickOf(agents, ladder, "acme", "ENG-5"))
+    }
+
+    @Test fun `ladderPickOf is null under a non-claude runtime pin or pinned host default`() {
+        val agents = listOf(AgentInfo(key = "h1", org = "acme"), AgentInfo(key = "q1", org = "acme", defaultRuntime = "qwen"))
+        assertNull(ladderPickOf(agents, ladder, "acme", "ENG-5",
+            runtimePin = com.xerktech.turma.model.TicketRuntimePin(runtime = "dsh")))
+        assertNull(ladderPickOf(agents, ladder, "acme", "ENG-5",
+            agentPin = com.xerktech.turma.model.TicketAgentPin(host = "q1")))
+        assertEquals(LadderPick("haiku"), ladderPickOf(agents, ladder, "acme", "ENG-5",
+            agentPin = com.xerktech.turma.model.TicketAgentPin(host = "h1")))
+    }
+
+    @Test fun `modelAutoLabel names the ladder tier, or the probed default without a ladder`() {
+        val models = BoardModels(defaultLabel = "Sonnet 5")
+        assertEquals("Auto (Haiku)", modelAutoLabel(models, LadderPick("haiku")))
+        assertEquals("Auto (Sonnet, retry)", modelAutoLabel(models, LadderPick("sonnet", "haiku")))
+        assertEquals("Default (Sonnet 5)", modelAutoLabel(models, null))
+        assertEquals("the model ladder's first tier", ladderPickReason(LadderPick("haiku")))
+        assertEquals("a Haiku session ended without a PR", ladderPickReason(LadderPick("sonnet", "haiku")))
+    }
+
     @Test fun `modelChoices filters the menu to the probe, static fallback when empty`() {
         assertEquals(listOf("opus", "haiku"), modelChoices(BoardModels(available = listOf("opus", "haiku"))))
         assertEquals(listOf("opus", "fable", "sonnet", "haiku"), modelChoices(BoardModels()))

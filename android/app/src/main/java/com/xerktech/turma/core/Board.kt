@@ -540,6 +540,70 @@ fun modelPinOf(
 ): com.xerktech.turma.model.TicketModelPin? =
     ticketModels["$siteKey/$issueKey"]?.takeIf { it.model.isNotBlank() }
 
+/** The model ladder's pick for an unpinned ticket (board.js `ladderPickOf`). */
+data class LadderPick(val model: String, val escalatedFrom: String? = null)
+
+/**
+ * The model ladder's next tier for an UNPINNED ticket (XERK-1830) — a port of
+ * board.js `ladderPickOf`, itself a port of the hub's ticketLadderPick +
+ * ticketSpawnModelFields (XERK-1827). Null when the hub serves no ladder (off, or
+ * an older hub), under a dsh/qwen runtime pin, or when the ticket is pinned to a
+ * host whose default runtime isn't claude. A session of the ticket that is no
+ * longer running (stopped, or a closed record that isn't a paused sleeper) with no
+ * PR and no close-ticket outcome is a failed attempt on its model; the pick is one
+ * tier above the highest failed one, capped. Only hosts decided into the org count.
+ */
+fun ladderPickOf(
+    agents: List<AgentInfo>,
+    ladder: List<String>,
+    siteKey: String,
+    issueKey: String,
+    agentPin: com.xerktech.turma.model.TicketAgentPin? = null,
+    runtimePin: com.xerktech.turma.model.TicketRuntimePin? = null,
+): LadderPick? {
+    if (ladder.isEmpty()) return null
+    if (runtimePin != null && runtimePin.runtime.isNotBlank() && runtimePin.runtime != "claude") return null
+    if (runtimePin == null && agentPin != null && agentPin.host.isNotBlank()) {
+        val a = agents.find { (it.key.ifEmpty { it.device }) == agentPin.host }
+        if (a != null && a.defaultRuntime.ifEmpty { "claude" } != "claude") return null
+    }
+    fun orgOf(a: AgentInfo): String? = a.org ?: a.jira?.siteKey?.ifBlank { null }
+    fun mine(t: com.xerktech.turma.model.TicketRef?) = t != null && t.key == issueKey && t.siteKey == siteKey
+    var failed = -1
+    fun consider(model: String, delivered: Boolean) {
+        if (delivered) return
+        val tier = ladder.indexOf(model)
+        if (tier > failed) failed = tier
+    }
+    for (a in agents) {
+        if (orgOf(a) != siteKey) continue
+        for (s in a.sessions) {
+            if (!mine(s.ticket) || s.status != "stopped") continue
+            consider(s.model, s.prs.isNotEmpty() || s.ticket?.outcome != null)
+        }
+        for (c in a.closedSessions) {
+            if (!mine(c.ticket) || c.paused != null) continue
+            consider(c.model, c.prs.isNotEmpty() || c.ticket?.outcome != null)
+        }
+    }
+    val next = minOf(failed + 1, ladder.size - 1)
+    return if (failed >= 0) LadderPick(ladder[next], ladder[failed]) else LadderPick(ladder[next])
+}
+
+/**
+ * What an unpinned ticket's Model value / picker release option reads (board.js
+ * `modelAutoLabel`): "Auto (Haiku)", "Auto (Sonnet, retry)" under the ladder,
+ * else "Default (<probed default>)".
+ */
+fun modelAutoLabel(models: BoardModels, pick: LadderPick?): String =
+    if (pick != null) "Auto (${prettyModel(pick.model)}${if (pick.escalatedFrom != null) ", retry" else ""})"
+    else "Default" + (models.defaultLabel.takeIf { it.isNotBlank() }?.let { " (${prettyModel(it)})" } ?: "")
+
+/** The dim reason beside an Auto value (board.js `modelFieldHtml`). */
+fun ladderPickReason(pick: LadderPick): String =
+    pick.escalatedFrom?.let { "a ${prettyModel(it)} session ended without a PR" }
+        ?: "the model ladder's first tier"
+
 /**
  * The curated aliases the model picker offers besides "Default", filtered to what
  * the org probed — a port of board.js `modelChoices`. The bracketed "[1m]" alias

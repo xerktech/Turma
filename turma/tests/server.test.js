@@ -8135,6 +8135,12 @@ test("XERK-1827: an undelivered haiku session escalates the next start to sonnet
   assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "opus", escalatedFrom: "opus" });
 });
 
+test("XERK-1830: /api/agents serves the ticket model ladder for the board's Model row", async () => {
+  const res = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.deepEqual(res.body.ticketModelLadder, hub.TICKET_MODEL_LADDER);
+  assert.deepEqual(res.body.ticketModelLadder, ["haiku", "sonnet", "opus"]);
+});
+
 test("XERK-1827: a live error or queued record never climbs the ladder (infra is not a miss)", async () => {
   const site = "lad5.atlassian.net";
   await ladderBeat("lad5", site);
