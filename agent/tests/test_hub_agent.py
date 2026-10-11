@@ -8381,8 +8381,10 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         self.make_manager()             # the mixin's tmux fakes
         self.run_calls.clear()
         frames = [LINUX_COMPOSER_PANE if before is None else before] + list(caps)
+        # The per-slice draw wait (XERK-1842) is pinned on its own below.
         with mock.patch.object(ha, "_capture_pane",
-                               side_effect=lambda t: frames.pop(0) if frames else caps[-1]):
+                               side_effect=lambda t: frames.pop(0) if frames else caps[-1]), \
+                mock.patch.object(ha, "_await_slice_drawn", return_value=True):
             ha._type_into_pane("agent-abcde", text)
         return [c for c in self.run_calls if c[-1] == "Enter"]
 
@@ -8466,6 +8468,95 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
         cap.assert_not_called()
         self.assertEqual([c[-1] for c in self.run_calls], ["Enter"])
 
+    def test_each_slice_waits_until_the_composer_draws_the_text_so_far(self):
+        # XERK-1842: on a loaded host a fixed gap let Claude Code read several
+        # slices as one burst (a paste). The next slice goes only once the
+        # composer shows everything typed before it.
+        self.make_manager()
+        n = ha.PASTE_CHUNK_CHARS
+        text = "a" * (n - 1) + " " + "b" * (n - 1) + " " + "c" * 10
+        typed, order = [], []
+        def stdin(cmd, data, timeout=None):
+            typed.append(data)
+            order.append(("slice", len(typed)))
+            return True
+        def frame(_t):
+            order.append(("read", len(typed)))
+            # Two reads per slice still show the composer behind, then it draws.
+            reads = sum(1 for kind, at in order if kind == "read" and at == len(typed))
+            shown = "".join(typed) if reads > 2 else "".join(typed[:-1])
+            return "─" * 40 + "\n❯ " + shown + "\n" + "─" * 40 + "\n"
+        with mock.patch.object(ha, "run_stdin", side_effect=stdin), \
+                mock.patch.object(ha, "_capture_pane", side_effect=frame), \
+                mock.patch.object(ha, "_submit_typed"), \
+                mock.patch.object(ha, "PASTE_SLICE_DRAWN_POLL_SEC", 0):
+            ha._type_into_pane("agent-abcde", text)
+        self.assertEqual("".join(typed), text)
+        # Slice k+1 is typed only after a read that showed slices 1..k.
+        for k in (2, 3):
+            i = order.index(("slice", k))
+            self.assertEqual(order[i - 1], ("read", k - 1))
+            self.assertEqual(sum(1 for o in order[:i] if o == ("read", k - 1)), 3)
+
+    def test_a_short_pane_showing_only_the_texts_tail_reads_as_drawn(self):
+        # Real 40x12 frame (2.1.296): the box shows ~55 chars, fewer than the
+        # 60-char tail, behind the ❯ glyph. That is the text, drawn.
+        typed = ("india175 charlie176 alpha177 golf171 juliet172 golf173 alpha174 "
+                 "india175 charlie176 alpha177 echo178 alpha179 ch")
+        frame = ("  /logout to sign out of claude.ai.\n\n" + "─" * 40 + "\n"
+                 "❯ golf173 alpha174 india175\n"
+                 "  charlie176 alpha177 echo178 alpha179\n"
+                 "  ch\n" + "─" * 40 + "\n")
+        self.assertEqual(ha._composer_state(frame, typed), "holds")
+        with mock.patch.object(ha, "_capture_pane", return_value=frame):
+            self.assertTrue(ha._await_slice_drawn("agent-x", typed, time.monotonic()))
+        # Too little shown to vouch for anything, or text that isn't the tail.
+        tiny = frame.replace("❯ golf173 alpha174 india175\n"
+                             "  charlie176 alpha177 echo178 alpha179\n", "❯ 179\n")
+        self.assertIsNone(ha._composer_state(tiny, typed))
+        self.assertIsNone(ha._composer_state(frame, typed + " more"))
+
+    def test_an_unreadable_composer_falls_back_to_the_gap(self):
+        # No composer to read (another TUI, a dead capture): never wait on it.
+        self.make_manager()
+        n = ha.PASTE_CHUNK_CHARS
+        with mock.patch.object(ha, "_capture_pane", return_value=None) as cap, \
+                mock.patch.object(ha, "_submit_typed"):
+            ha._type_into_pane("agent-abcde", "x" * (n * 3))
+        self.assertEqual(cap.call_count, 1)        # one look, then the bare gap
+        self.assertEqual(len(self.run_stdin_calls), 3)
+
+    def test_the_wait_is_bounded_per_message(self):
+        # A composer that never draws the text costs the deadline ONCE, not per
+        # slice: _type_into_pane also runs on the beat.
+        self.make_manager()
+        n = ha.PASTE_CHUNK_CHARS
+        with mock.patch.object(ha, "_capture_pane", return_value=LINUX_COMPOSER_PANE), \
+                mock.patch.object(ha, "_submit_typed"), \
+                mock.patch.object(ha, "PASTE_SLICE_DRAWN_DEADLINE_SEC", 0.2), \
+                mock.patch.object(ha, "PASTE_SLICE_DRAWN_POLL_SEC", 0.01):
+            t0 = time.monotonic()
+            ha._type_into_pane("agent-abcde", "x" * (n * 6))
+            took = time.monotonic() - t0
+        self.assertEqual(len(self.run_stdin_calls), 6)
+        self.assertLess(took, 0.6)
+
+    def test_the_windows_typed_path_waits_for_each_slice_too(self):
+        n = ha.PASTE_CHUNK_CHARS
+        text = "a" * n + "b" * n + "c" * 10
+        events = []
+        with mock.patch.object(ha, "_pty_control",
+                               side_effect=lambda nm, op, **kw: events.append(("inject", kw.get("data")))
+                               or {"ok": True}), \
+                mock.patch.object(ha, "_await_slice_drawn",
+                                  side_effect=lambda t, typed, dl: events.append(("wait", typed)) or True), \
+                mock.patch.object(ha, "_submit_typed"), \
+                mock.patch.object(ha.time, "sleep"):
+            self.assertTrue(ha._pty_inject("agent-x", text))
+        self.assertEqual(events, [("inject", "a" * n), ("wait", "a" * n),
+                                  ("inject", "b" * n), ("wait", "a" * n + "b" * n),
+                                  ("inject", "c" * 10)])
+
     def test_the_windows_typed_path_presses_again_too(self):
         sent = []
         frames = [LINUX_COMPOSER_PANE, COMPOSER_STUCK, COMPOSER_SENT]
@@ -8473,6 +8564,7 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
                                side_effect=lambda n, op, **kw: sent.append(kw.get("data"))
                                or {"ok": True}), \
                 mock.patch.object(ha, "_capture_pane", side_effect=lambda t: frames.pop(0)), \
+                mock.patch.object(ha, "_await_slice_drawn", return_value=True), \
                 mock.patch.object(ha.time, "sleep"):
             self.assertTrue(ha._pty_inject("agent-x", _STUCK_MSG))
         self.assertEqual(sent.count("\r"), 2)
@@ -39002,6 +39094,7 @@ class TestWindowsTerminalBackend(unittest.TestCase):
         with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
              mock.patch.object(ha.time, "sleep",
                                side_effect=lambda s: order.append(("sleep", s))), \
+             mock.patch.object(ha, "_await_slice_drawn", return_value=True), \
              mock.patch.object(ha, "_capture_pane", return_value=COMPOSER_BUSY) as cap:
             result = ha._pty_inject("agent-x", text)
         return result, order, cap

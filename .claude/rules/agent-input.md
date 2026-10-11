@@ -34,6 +34,16 @@ composed.**
     submit and arrive corrupted, and slicing costs ~2 tmux calls per slice ON THE BEAT (resend, qwen
     peer). Those keep one bracketed paste; `chat.js` `stripFraming` hides the tags.
   - A typed TAB is autocomplete, so tabs go as 4 spaces. One writer per pane (`_PANE_TYPE_LOCKS`).
+  - **Each slice waits until the composer has DRAWN the text so far** (`_await_slice_drawn`,
+    XERK-1842). A fixed gap is not enough under load: Claude Code isn't scheduled between slices,
+    the pty buffers several, and one read past ~800 chars is a paste again — measured on 2.1.296,
+    ~3.4K chars at ~30 load on 16 CPUs was tagged and reordered up to 7/8. Never revert to the bare
+    gap. Bounded per MESSAGE (`PASTE_SLICE_DRAWN_DEADLINE_SEC`), not per slice, since this also
+    runs on the beat; past it, or with no readable composer (None), the rest falls back to the gap.
+    - A short pane shows only the composer's last lines (~55 chars at 40x12, under the 60-char
+      tail), so a box that is itself the text's tail counts too (`_box_ends_with`, at least
+      `COMPOSER_MIN_SHOWN_CHARS`); the "holds" read uses the same rule.
+    Tests: the slice-wait cases in `TestSubmitTyped`.
   - **Typed text's Enter is settled and verified** (`_submit_typed`): an Enter close behind typed
     input is read as a LINE BREAK, leaving the message unsent in the composer with nothing to
     retry it. Measured on 2.1.296: a ~790-char two-slice message (the hub's PR-merged nudge)
