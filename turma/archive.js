@@ -467,6 +467,15 @@ function mirrorReplace(transcriptId, list) {
     })));
   } catch { /* best-effort mirror */ }
 }
+// Re-seat a file's held entries at their ordinals without trimming the tail (XERK-1837).
+function mirrorSeat(transcriptId, list) {
+  if (!indexSink || typeof indexSink.seat !== "function") return;
+  try {
+    indexSink.seat(transcriptId, (list || []).map((e) => ({
+      uuid: e.uuid || null, role: e.role || null, ts: e.ts || null, text: String(e.text || ""),
+    })));
+  } catch { /* best-effort mirror */ }
+}
 
 // ---- index backend mode: retire the local node:sqlite under HA (XERK-793) ---
 //
@@ -783,7 +792,9 @@ function reindexHeld(transcriptId, entries) {
       }
     });
   }
-  mirrorReplace(transcriptId, entries);
+  // Seat, never replace: this runs on a follower from its local copy, and a replace would
+  // trim the appends another replica has made to the same Postgres rows (XERK-1837).
+  mirrorSeat(transcriptId, entries);
 }
 
 function writeSidecar(metaPath, obj, local) {
@@ -2776,7 +2787,7 @@ function reconcileLanded(hasIndexStore) {
 // A row another host is recorded as owning is rebuilt from ITS OWN sidecar (the byte
 // of-record's attribution), so this cannot re-attribute — it reconstructs exactly what a
 // full rebuildIndex would derive. Idempotent: `mirrorSession`'s GREATEST upsert never
-// lowers a cursor and `mirrorReplace` re-seats entries at [0..n), so a re-run or a
+// lowers a cursor and `mirrorSeat` re-seats entries at [0..n), so a re-run or a
 // concurrent replica's own backfill converge with no lock.
 function backfillPgIndexFromFiles() {
   if (!isPgMode()) return 0;
@@ -2822,7 +2833,7 @@ function backfillPgIndexFromFiles() {
       archiveBytes, rawBytes, filePath: relPath, updatedAt: meta.updatedAt || null,
     }));
     mirrorSession(transcriptId);
-    mirrorReplace(transcriptId, entries);
+    mirrorSeat(transcriptId, entries);   // re-seat, never trim: a concurrent replica may append (XERK-1837)
     rebuilt += 1;
   }
   if (rebuilt) {
@@ -3634,7 +3645,7 @@ module.exports = {
   // The node:sqlite retirement (XERK-793): server.js calls setIndexMode("pg", store)
   // under HA so the index is the in-memory map + Postgres-direct search; sessionLoader
   // is the sessions-only hydration applier.
-  setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles,
+  setIndexMode, isPgMode, sessionLoader, backfillPgIndexFromFiles, reindexHeld,
   // The one-time repair of files duplicated before XERK-1364 (XERK-1450).
   dedupArchive,
   ingestChunk, manifestCursors, inventoryCursors, rawCursorsForIds,

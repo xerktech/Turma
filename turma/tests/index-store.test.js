@@ -166,6 +166,12 @@ class MemIndexStore {
     for (const e of ents) m.set(seq++, e);
     this.entries.set(tid, m);
   }
+  // Mirrors PgIndexStore.seatEntries: overwrite [0..n), trim nothing (XERK-1837).
+  seatEntries(tid, ents) {
+    const m = this.entries.get(tid) || new Map();
+    ents.forEach((e, i) => m.set(i, e));
+    this.entries.set(tid, m);
+  }
   deleteTranscript(tid) { this.sessions.delete(tid); this.entries.delete(tid); }
   // Mirrors PgIndexStore.setCounts: an exact UPDATE, the one write that may lower.
   setCounts(tid, msgCount, archiveBytes) {
@@ -178,6 +184,7 @@ class MemIndexStore {
       session: (r) => this.upsertSession(r),
       entries: (t, e, s) => this.appendEntries(t, e, s),
       replace: (t, e) => this.replaceEntries(t, e),
+      seat: (t, e) => this.seatEntries(t, e),
       repair: (t, e, n, b, done) => {
         if (this.dropRepairs) return;           // a lost mirror op (pod died, retries spent)
         this.replaceEntries(t, e); this.setCounts(t, n, b); if (done) done();
@@ -1393,6 +1400,21 @@ test("PgIndexStore.replaceEntries: overwrites in place, then trims — never del
   assert.deepEqual(pool.calls.filter((c) => c.m === "execute").map((c) => c.text.slice(0, 6)), ["INSERT"]);
   // Appends still never overwrite a held ordinal.
   assert.match(buildEntryInsert("archive", "t1", [ent("u", "user", "x")], 0).text, /DO NOTHING$/);
+});
+
+test("PgIndexStore.seatEntries: overwrites [0..n) and never trims the tail (XERK-1837)", async () => {
+  const pool = spyPool();
+  const store = new PgIndexStore(pool, { prefix: DEFAULT_PREFIX });
+  await store.ensureSchema();
+  pool.calls.length = 0;
+  await store.seatEntries("t1", [ent("u0", "user", "a"), ent("u1", "user", "b")]);
+  const exec = pool.calls.filter((c) => c.m === "execute");
+  assert.equal(exec.length, 1, "one INSERT, no DELETE: a follower's seat cannot delete the leader's appends");
+  assert.match(exec[0].text, /^INSERT INTO archive_entries .* DO UPDATE SET/);
+  assert.deepEqual(exec[0].params.filter((_, i) => i % 6 === 1), [0, 1]);
+  pool.calls.length = 0;
+  await store.seatEntries("t1", []);
+  assert.deepEqual(pool.calls.filter((c) => c.m === "execute"), [], "an empty seat writes nothing");
 });
 
 test("PgIndexStore.setCounts: an exact UPDATE, never GREATEST", async () => {

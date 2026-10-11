@@ -388,6 +388,19 @@ class PgIndexStore {
     return true;
   }
 
+  // Re-seat a file's first `entries.length` ordinals WITHOUT trimming the tail (XERK-1837).
+  // A follower's heal comes from its local copy, which can be behind rows another replica
+  // has since appended; replaceEntries' trim would delete those. Overwriting [0..n) is
+  // correct when the file's prefix matches Postgres's, which holds for an append-only file
+  // that has not been dedupe-repaired (XERK-1450 rewrites ordinals; a seat from a stale
+  // pre-repair copy can re-add duplicates, a case replace shares). Nothing in pg mode calls
+  // replaceEntries for a truncated file any more: heal-on-read is disabled there.
+  async seatEntries(transcriptId, entries) {
+    await this.ensureSchema();
+    if (entries && entries.length) await this._insertEntriesBatched(transcriptId, entries, 0, true);
+    return true;
+  }
+
   // Insert entries in SUB-BATCHES so one INSERT never exceeds the Postgres v3 bound
   // parameter limit. Each entry is 6 bound params; the wire encodes the value count
   // as an Int16 (pgclient's `encodeBind` throws past 32767, and Postgres itself caps
