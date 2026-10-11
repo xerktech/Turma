@@ -72,9 +72,9 @@ const GET_DEADLINE_MS = 5 * 60 * 1000;
 // A retryBlocked GET that hit its deadline gets twice as long next time, up to
 // this. With one flat cap a legitimately slow object (slower than ~55 KB/s for
 // 16 MiB) timed out on every retry and its transcript stayed blocked forever. A
-// retry pass tries keys shortest-deadline first, so a newly blocked key never
-// queues behind hung keys' escalated deadlines; a waiting hydrate never waits on
-// one either (`_yieldWake`).
+// retry pass lands and opens un-escalated keys before it tries escalated ones, so
+// a newly blocked key never waits behind hung keys' deadlines; a waiting hydrate
+// never waits on one either (`_yieldWake`).
 const RETRY_GET_DEADLINE_MAX_MS = 60 * 60 * 1000;
 const YIELDED = Symbol("yielded");
 const TIMED_OUT = Symbol("timedOut");
@@ -461,24 +461,33 @@ class ArchiveMirror {
   // else writes their local files while the rename lands. Never overlaps a
   // hydrate (they share `_hydrating`/`_retrying`).
   //
-  // A landed or gone (404) key stays BLOCKED until the pass ends and `onLanded`
-  // has re-derived cursors from the landed files, and only then unblocks — in the
-  // same synchronous step. Unblocked on landing, a transcript was open with its
-  // Postgres cursor still AHEAD of the older bucket copy, so the agent's next
-  // chunk appended past a gap and the lagging tail was lost for good (QA D1).
+  // A landed or gone (404) key stays BLOCKED until its group's GETs are done and
+  // `onLanded` has re-derived cursors from the landed files, and only then
+  // unblocks — in the same synchronous step. Unblocked on landing, a transcript
+  // was open with its Postgres cursor still AHEAD of the older bucket copy, so the
+  // agent's next chunk appended past a gap and the lagging tail was lost for good
+  // (QA D1).
+  //
+  // Keys whose deadline has NOT escalated go first, as their own group that
+  // reconciles and opens before any escalated (likely hung) key is tried: a fresh
+  // key otherwise stayed closed behind up to RETRY_GET_DEADLINE_MAX_MS per hung key
+  // (XERK-1833 QA D3).
   async retryBlocked({ getDeadlineMs = GET_DEADLINE_MS } = {}) {
     if (!this.blobStore || this._hydrating || this._retrying || !this._blocked.size) return 0;
     let landed = 0;
-    const done = [];
     for (const k of [...this._getDeadline.keys()]) if (!this._blocked.has(k)) this._getDeadline.delete(k);
     // A hydrate that starts waiting abandons the in-flight GET (its key stays
     // blocked) rather than waiting out a deadline that may have escalated.
     const yielded = new Promise((res) => { this._yieldWake = () => res(YIELDED); });
     const deadlineOf = (k) => this._getDeadline.get(k) || getDeadlineMs;
-    // Shortest deadline first (stable): a fresh key never waits out hung ones.
-    const keys = [...this._blocked.keys()].sort((a, b) => deadlineOf(a) - deadlineOf(b));
-    const run = (async () => {
-      for (const key of keys) {
+    const keys = [...this._blocked.keys()];
+    const groups = [keys.filter((k) => !this._getDeadline.has(k)),
+      keys.filter((k) => this._getDeadline.has(k)).sort((a, b) => deadlineOf(a) - deadlineOf(b))];
+    // GET each key of one group; returns the keys to unblock and how many landed.
+    const fetchGroup = async (group) => {
+      const done = [];
+      let n = 0;
+      for (const key of group) {
         if (this._yieldRetry) break; // the rest wait for the next pass
         const dest = this.pathFor(key);
         if (!dest) { done.push(key); continue; }
@@ -496,27 +505,38 @@ class ArchiveMirror {
             this._blocked.set(key, `${key} (GET did not finish within ${Math.round(deadline / 1000)}s)`);
             continue;
           }
-          if (r) landed++;
+          if (r) n++;
           this._getDeadline.delete(key);
           done.push(key);
         } catch (e) {
           this._blocked.set(key, `${key} (${e && e.message})`);
         }
       }
+      return { done, n };
+    };
+    // Any unblock reconciles, not only a landing: a key that landed on a pass
+    // whose reconcile threw, then 404'd, would otherwise open unreconciled.
+    // false = the reconcile threw; its keys stay blocked for the next pass.
+    const settle = (done) => {
+      if (!done.length) return true;
+      try { this.onLanded(); } catch (e) {
+        this.log(`archive hydrate: post-retry reconcile failed (${e && e.message})`);
+        return false;
+      }
+      for (const k of done) this._blocked.delete(k);
+      return true;
+    };
+    const run = (async () => {
+      for (const group of groups) {
+        if (this._yieldRetry) break;
+        const { done, n } = await fetchGroup(group);
+        if (!settle(done)) break;
+        landed += n;
+        this.lastFailure = this._blockedSummary();
+      }
     })();
     this._retrying = run;
     try { await run; } finally { this._retrying = null; this._yieldRetry = false; this._yieldWake = null; }
-    // Any unblock reconciles, not only a landing: a key that landed on a pass
-    // whose reconcile threw, then 404'd, would otherwise open unreconciled.
-    if (done.length) {
-      try { this.onLanded(); } catch (e) {
-        // Not reconciled, so not safe to open: they stay blocked for the next pass.
-        this.log(`archive hydrate: post-retry reconcile failed (${e && e.message})`);
-        this.lastFailure = this._blockedSummary();
-        return 0;
-      }
-    }
-    for (const k of done) this._blocked.delete(k);
     this.lastFailure = this._blockedSummary();
     return landed;
   }

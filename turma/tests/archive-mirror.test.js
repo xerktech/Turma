@@ -1089,9 +1089,16 @@ test("a newly blocked key is retried before hung keys with escalated deadlines (
   await m.retryBlocked({ getDeadlineMs: 10 }); // hung escalates to 20ms
   m._blocked.set("repo/fresh.jsonl", "x");
   gets.length = 0;
-  await m.retryBlocked({ getDeadlineMs: 10 });
-  assert.deepEqual(gets, ["repo/fresh.jsonl", "repo/hung.jsonl"]);
+  let landed = 0;
+  m.onLanded = () => { landed++; };
+  const pass = m.retryBlocked({ getDeadlineMs: 10 });
+  // Opened while the hung key's (escalated) GET is still in flight.
+  while (!gets.includes("repo/hung.jsonl")) await new Promise((r) => setImmediate(r));
   assert.equal(m.renderedBlocked(path.join(root, "repo", "fresh.jsonl")), false);
+  assert.equal(landed, 1, "reconciled before it opened");
+  assert.equal(m.renderedBlocked(path.join(root, "repo", "hung.jsonl")), true);
+  await pass;
+  assert.deepEqual(gets, ["repo/fresh.jsonl", "repo/hung.jsonl"]);
 });
 
 test("a retry GET cut by a hydrate never lands, even while its key stays blocked (XERK-1833 QA)", async () => {
@@ -1149,16 +1156,17 @@ test("a retryBlocked GET that never settles is bounded and cannot wedge a hydrat
   late.shift()(); // lands after its pass gave up: discarded
   await new Promise((r) => setImmediate(r));
   assert.equal(fs.existsSync(path.join(root, "repo", "a.jsonl")), false);
-  // A hydrate arriving mid-pass makes the pass stop after its current key.
+  // A hydrate arriving mid-pass cuts the current key short and stops the pass.
+  // b goes first: a's deadline has escalated (XERK-1833 QA D3).
   m._blocked.set("repo/b.jsonl", "x");
   gets.length = 0;
   const retry = m.retryBlocked({ getDeadlineMs: 2000 });
   await new Promise((r) => setImmediate(r));
   const hyd = m.hydrate();
-  late.shift()(); // the current key lands; the next is never fetched
+  late.shift()(); // the cut key lands late; a is never fetched
   await retry;
   await hyd;
-  assert.deepEqual(gets, ["repo/a.jsonl"]);
+  assert.deepEqual(gets, ["repo/b.jsonl"]);
   assert.equal(m.hydrated, true);
   // The yield is per pass: the next retry pass fetches what this one left.
   m._blocked.set("repo/b.jsonl", "x");
@@ -1166,5 +1174,5 @@ test("a retryBlocked GET that never settles is bounded and cannot wedge a hydrat
   await new Promise((r) => setImmediate(r));
   late.shift()();
   assert.equal(await next, 1);
-  assert.deepEqual(gets, ["repo/a.jsonl", "repo/b.jsonl"]);
+  assert.deepEqual(gets, ["repo/b.jsonl", "repo/b.jsonl"]);
 });
