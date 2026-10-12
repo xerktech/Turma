@@ -5387,6 +5387,8 @@ class ManagerMixin:
             # Derived from REGISTRY_DIR at import; kill/delete rmtree a session's
             # request dir (XERK-1564), so it must never be the host's real one.
             ("SESSION_REQUESTS_DIR", os.path.join(self.tmp, "session-requests")),
+            # XERK-1847: derived from REGISTRY_DIR at import.
+            ("SHADOW_RUNS_PATH", os.path.join(self.tmp, "shadow-runs.json")),
             # XERK-1587: every launch/teardown unlinks the session's snapshot.
             ("LIVE_AGENTS_DIR", os.path.join(self.tmp, "live-agents")),
             ("USAGE_LEDGER_PATH", os.path.join(self.tmp, "repo-usage.json")),
@@ -44189,3 +44191,204 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestShadowRuns(ManagerMixin, unittest.TestCase):
+    """XERK-1847: the hub's `spawnShadow` re-does a merged ticket on a candidate
+    model from the merged PR's parent commit; an Opus grader then reports one
+    grade. Neither session may publish, and neither ever carries a ticket."""
+
+    SITE = "x.atlassian.net"
+    MERGE = "a" * 40
+    BASE = "b" * 40
+    HEAD = "c" * 40
+    RID = "sh-0123456789abcdef"
+
+    def setUp(self):
+        super().setUp()
+        self.repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        self.head = self.HEAD
+        self.dirty = ""
+        for name, value in [("scan_repos", lambda: [self.repo]),
+                            ("JIRA_SITE", self.SITE), ("JIRA_EMAIL", "a@b.c"),
+                            ("JIRA_TOKEN", "t"), ("run", self.fake_git)]:
+            p = mock.patch.object(ha, name, value)
+            p.start()
+            self.addCleanup(p.stop)
+
+    def fake_git(self, cmd, cwd=None, timeout=None):
+        self.run_calls.append(cmd)
+        if "rev-parse" in cmd and cmd[-1] == f"{self.MERGE}^1^{{commit}}":
+            return self.BASE
+        if "rev-parse" in cmd and cmd[-1] == "HEAD":
+            return self.head
+        if "rev-parse" in cmd and cmd[-1] in (self.BASE, self.HEAD):
+            return cmd[-1]       # branch_exists on a commit id
+        if "status" in cmd:
+            return self.dirty
+        return ""
+
+    def detail(self):
+        return {"key": "PROJ-7", "summary": "Fix the board", "description": "broken",
+                "url": f"https://{self.SITE}/browse/PROJ-7", "attachments": [{"x": 1}],
+                "comments": [
+                    {"author": "a", "created": "2026-10-01T00:00:00.000+0000", "body": "BEFORE"},
+                    {"author": "b", "created": "2026-10-03T00:00:00.000+0000", "body": "FIXED-BY-X"},
+                    {"author": "c", "body": "UNDATED"}]}
+
+    def cmd(self, **over):
+        c = {"type": "spawnShadow", "shadowId": self.RID, "siteKey": self.SITE,
+             "issueKey": "PROJ-7", "repo": "Turma", "model": "sonnet",
+             "mergeSha": self.MERGE, "prUrl": "https://github.com/o/r/pull/9",
+             "notBefore": int(ha._ts_ms("2026-10-02T00:00:00Z"))}
+        c.update(over)
+        return c
+
+    def spawned(self):
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            sm.spawn_shadow(self.cmd())
+        for sess in sm.registry:   # the faked worktree add creates no directory
+            os.makedirs(sess["worktreePath"], exist_ok=True)
+        return sm
+
+    def launches(self):
+        return [c[:-1] + [expand_launch_text(c[-1])] for c in self.run_ok_calls
+                if c and c[0] == "tmux" and "new-session" in c]
+
+    def request(self, sid, name, data):
+        d = os.path.join(self.tmp, "session-requests", sid)
+        os.makedirs(d, exist_ok=True)
+        with open(os.path.join(d, f"{name}.json"), "w") as f:
+            json.dump(data, f)
+
+    def test_a_shadow_spawns_blind_from_the_parent_commit_and_cannot_publish(self):
+        sm = self.spawned()
+        [sess] = sm.registry
+        self.assertEqual(sess["shadow"], {"id": self.RID, "role": "run"})
+        self.assertIsNone(sess["ticket"], "a shadow never carries a ticket")
+        self.assertEqual(sess["model"], "sonnet")
+        self.assertEqual(sess["baseRef"], self.BASE)
+        run = sm.shadow_runs[self.RID]
+        self.assertEqual((run["state"], run["runSid"], run["baseSha"]), ("running", sess["id"], self.BASE))
+        cmd = self.launches()[-1][-1]
+        self.assertIn("TURMA_SHADOW=run", cmd)
+        self.assertIn("GH_TOKEN=turma-shadow-no-publish", cmd)
+        self.assertIn("JIRA_TOKEN=''", cmd)
+        self.assertIn("--strict-mcp-config", cmd)
+        self.assertIn("SHADOW RUN", cmd)
+        self.assertIn(ha.shadow_branch(self.RID), cmd)
+        self.assertNotIn("git fetch origin", cmd, "no new-work policy telling it to fetch")
+        # The ticket as the live session saw it: no later or undated comment.
+        self.assertIn("BEFORE", cmd)
+        self.assertNotIn("FIXED-BY-X", cmd)
+        self.assertNotIn("UNDATED", cmd)
+        # It is in no roster, raises no alert hub-side and cannot be adopted.
+        self.assertEqual(sm._peer_rows(sm.registry), [])
+        self.assertFalse(sm._maybe_adopt_ticket(sess, "PROJ-7"))
+        self.assertTrue(sm._session_payload(sess, refresh=False)["shadow"])
+        # Reported to the hub, and a re-delivered command is a no-op.
+        self.assertEqual(sm.shadow_runs_report()[0]["state"], "running")
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            sm.spawn_shadow(self.cmd())
+        self.assertEqual(len(sm.registry), 1)
+
+    def test_refusals_are_reported_as_failed_runs(self):
+        cases = [({"siteKey": "other.atlassian.net"}, "org"),
+                 ({"mergeSha": "zz"}, "merge commit"),
+                 ({"repo": "Nope"}, "not cloned"),
+                 ({"model": "gpt"}, "not runnable")]
+        for over, why in cases:
+            with self.subTest(why=why):
+                if os.path.exists(ha.SHADOW_RUNS_PATH):
+                    os.remove(ha.SHADOW_RUNS_PATH)
+                sm = self.make_manager()
+                with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+                    sm.spawn_shadow(self.cmd(**over))
+                self.assertEqual(sm.registry, [])
+                r = sm.shadow_runs[self.RID]
+                self.assertEqual(r["state"], "failed")
+                self.assertIn(why, r["error"])
+        os.remove(ha.SHADOW_RUNS_PATH)
+        sm = self.make_manager()
+        sm.spawn_shadow(self.cmd(shadowId="../x"))
+        self.assertEqual(sm.shadow_runs, {})
+
+    def test_done_hands_the_commit_to_an_opus_grader_then_reports_the_grade(self):
+        sm = self.spawned()
+        run_sid = sm.registry[0]["id"]
+        sm._advance_shadow_runs()
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "running", "nothing yet")
+        self.dirty = " M x.py"
+        self.request(run_sid, "shadow-done", {"note": "fixed the board"})
+        sm._advance_shadow_runs()
+        r = sm.shadow_runs[self.RID]
+        self.assertEqual(r["state"], "grading")
+        self.assertTrue(any("commit" in c for c in self.run_ok_calls), "left-over work committed")
+        grader = sm._find(r["gradeSid"])
+        self.assertEqual(grader["shadow"], {"id": self.RID, "role": "grade"})
+        self.assertEqual(grader["model"], "opus")
+        self.assertEqual(grader["baseRef"], self.HEAD)
+        gcmd = self.launches()[-1][-1]
+        self.assertIn("TURMA_SHADOW=grade", gcmd)
+        self.assertIn(f"git diff {self.BASE} {self.MERGE}", gcmd)
+        self.assertIn("shadow-grade --verdict", gcmd)
+        # The next beat deletes the run session (one teardown per beat).
+        sm._advance_shadow_runs()
+        self.assertIsNone(sm._find(run_sid))
+        self.assertIsNotNone(sm._find(r["gradeSid"]))
+        # A junk grade is no grade; a valid one is final and reported.
+        self.request(r["gradeSid"], "shadow-grade", {"verdict": "great", "tests": "pass",
+                                                     "qa": "pass", "design": "same"})
+        sm._advance_shadow_runs()
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "grading")
+        self.request(r["gradeSid"], "shadow-grade", {"verdict": "good", "tests": "pass",
+                                                     "qa": "partial", "design": "same",
+                                                     "note": " fine\n"})
+        sm._advance_shadow_runs()
+        r = sm.shadow_runs[self.RID]
+        self.assertEqual(r["state"], "graded")
+        rep = sm.shadow_runs_report()[0]
+        self.assertEqual(rep["grade"]["verdict"], "good")
+        self.assertEqual(rep["grade"]["note"], "fine")
+        self.assertEqual(rep["siteKey"], self.SITE)
+        # Teardown: the grader, then the shadow branch.
+        sm._advance_shadow_runs()
+        self.assertEqual(sm.registry, [])
+        sm._advance_shadow_runs()
+        self.assertTrue(any(c[-2:] == ["-D", ha.shadow_branch(self.RID)] for c in self.run_ok_calls))
+        # Persisted, re-validated on load.
+        self.assertEqual(sm._load_shadow_runs()[self.RID]["grade"]["verdict"], "good")
+
+    def test_no_change_is_graded_bad_without_a_grader(self):
+        sm = self.spawned()
+        run_sid = sm.registry[0]["id"]
+        self.head = self.BASE
+        self.request(run_sid, "shadow-done", {"note": "nothing to do"})
+        sm._advance_shadow_runs()
+        r = sm.shadow_runs[self.RID]
+        self.assertEqual(r["state"], "graded")
+        self.assertEqual(r["grade"]["verdict"], "bad")
+        self.assertIsNone(r.get("gradeSid"))
+
+    def test_a_vanished_session_or_a_timeout_never_hangs_the_run(self):
+        sm = self.spawned()
+        sm.registry = []
+        sm._advance_shadow_runs()
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "failed")
+        os.remove(ha.SHADOW_RUNS_PATH)
+        sm = self.spawned()
+        sm.shadow_runs[self.RID]["phaseAt"] = time.time() - ha.SHADOW_RUN_TIMEOUT_SEC - 1
+        sm._advance_shadow_runs()
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "grading")
+        self.assertEqual(sm.shadow_runs[self.RID]["note"], "(timed out)")
+
+    def test_the_persisted_ledger_is_read_as_untrusted(self):
+        with open(ha.SHADOW_RUNS_PATH, "w") as f:
+            json.dump({self.RID: {"id": self.RID, "state": "running", "evil": 1},
+                       "sh-zz": {"id": "sh-zz", "state": "running"},
+                       "sh-00112233": {"id": "sh-00112233", "state": "bogus"}}, f)
+        runs = self.make_manager().shadow_runs
+        self.assertEqual(list(runs), [self.RID])
+        self.assertNotIn("evil", runs[self.RID])

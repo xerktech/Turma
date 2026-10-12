@@ -12941,6 +12941,114 @@ def policy_reason(command: str) -> str | None:
     return None
 
 
+# --- shadow runs (XERK-1847) -------------------------------------------------
+#
+# A SHADOW session re-runs a merged ticket on a cheaper model so an Opus grader
+# can compare it with what merged (docs/model-quality-adr.md). It must never
+# publish: no push, no PR/MR, no tracker write. The manager launches it with
+# TURMA_SHADOW set, and this check denies the publishing commands outright. It is
+# a TIGHTENING read from the environment, so the protected guard honours it too
+# (a session stripping the variable from a nested claude only loses the extra
+# denies, the same-uid residual every ~/.turma control has). Fails CLOSED by
+# command family, like the permission judge's never-list: every gh/glab/hub verb
+# outside a read allowlist, any az repos/boards write, any tracker CLI, and any
+# HTTP client given a body or a non-GET method.
+
+_SHADOW_FORGE_READS = {
+    ("pr", "view"), ("pr", "diff"), ("pr", "list"), ("pr", "checks"), ("pr", "status"),
+    ("mr", "view"), ("mr", "diff"), ("mr", "list"),
+    ("issue", "view"), ("issue", "list"), ("repo", "view"), ("run", "view"),
+    ("run", "list"), ("auth", "status"), ("search", "code"), ("search", "prs"),
+    ("search", "issues"), ("search", "commits"), ("search", "repos"),
+}
+_SHADOW_TRACKER_CLIS = {"jira", "acli", "ado", "ado.py", "jira-cli"}
+_SHADOW_HTTP_CLIS = {"curl", "wget", "http", "https", "httpie", "xh", "xhs"}
+_SHADOW_REASON = (
+    "this is a shadow run: it may not publish — no push, no PR/MR, no tracker or "
+    "API write. Commit locally and finish with `shadow-done`"
+)
+
+
+def _shadow_http_writes(prog: str, args: list[str]) -> bool:
+    """True when an HTTP client invocation sends a body or a non-GET method."""
+    i = 0
+    while i < len(args):
+        t = args[i]
+        low = t.lower()
+        if prog == "wget":
+            if low.startswith(("--post-data", "--post-file", "--body-data", "--body-file")):
+                return True
+            if low.startswith("--method"):
+                m = t.split("=", 1)[1] if "=" in t else (args[i + 1] if i + 1 < len(args) else "")
+                if m.upper() not in ("GET", "HEAD"):
+                    return True
+        elif prog in ("http", "https", "httpie", "xh", "xhs"):
+            # `http POST url k=v`: a method word, or any request item, writes.
+            if t.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                return True
+            if not t.startswith("-") and re.search(r"(?<!:)(?::=|=|@)", t) and "://" not in t:
+                return True
+        else:  # curl
+            if low.startswith(("--data", "--json", "--form", "--upload-file")):
+                return True
+            if low.startswith("--request") or t == "-X" or (t.startswith("-X") and len(t) > 2):
+                if "=" in t:
+                    m = t.split("=", 1)[1]
+                elif t.startswith("-X") and len(t) > 2:
+                    m = t[2:]
+                else:
+                    m = args[i + 1] if i + 1 < len(args) else ""
+                if m.upper() not in ("GET", "HEAD"):
+                    return True
+            elif t.startswith("-") and not t.startswith("--") and len(t) > 1:
+                # A short-option cluster: -d / -F / -T anywhere in it writes.
+                if any(c in t[1:] for c in "dFT"):
+                    return True
+        i += 1
+    return False
+
+
+@_budgeted
+def shadow_reason(command: str) -> str | None:
+    """A reason when a SHADOW session's command would publish (XERK-1847)."""
+    for tokens, _segment, *_flags in _expand_both(command):
+        if not tokens:
+            continue
+        prog = _basename(tokens[0]).lower()
+        if prog.endswith(".exe"):
+            prog = prog[:-4]
+        rest = tokens[1:]
+        if prog == "git":
+            sub = _git_args(tokens)
+            if sub and sub[0] in ("push", "send-pack", "http-push", "request-pull"):
+                return _SHADOW_REASON
+            continue
+        if prog in ("gh", "hub", "glab"):
+            words = [t for t in rest if not t.startswith("-")]
+            if not words:
+                continue
+            if words[0] == "api":
+                if any(t in ("-X", "-f", "-F", "--input") or t.startswith(
+                        ("--method", "--field", "--raw-field", "-X")) for t in rest) \
+                        or "graphql" in words[1:2]:
+                    return _SHADOW_REASON
+                continue
+            if words[0] == "search" or tuple(words[:2]) in _SHADOW_FORGE_READS:
+                continue
+            return _SHADOW_REASON
+        if prog == "az":
+            words = [t for t in rest if not t.startswith("-")]
+            if words[:1] and words[0] in ("repos", "boards", "devops", "pipelines") \
+                    and not any(w in ("show", "list") for w in words[1:]):
+                return _SHADOW_REASON
+            continue
+        if prog in _SHADOW_TRACKER_CLIS:
+            return _SHADOW_REASON
+        if prog in _SHADOW_HTTP_CLIS and _shadow_http_writes(prog, rest):
+            return _SHADOW_REASON
+    return None
+
+
 @_budgeted
 def attribution_reason(command: str) -> str | None:
     if not _ATTRIB_CONTEXT.search(command):
@@ -14184,6 +14292,7 @@ def decide(
     no_attribution: bool = True,
     pr_summary: bool = True,
     cwd: str | None = None,
+    shadow: bool = False,
 ) -> tuple[str, str | None, str | None]:
     """Return ``(decision, reason, category)``.
 
@@ -14204,13 +14313,13 @@ def decide(
     # one memoised expansion (seeded for one, the policy checks re-read the line).
     _SESSION_CWD[0] = _session_cwds(cwd)
     try:
-        return _decide_bash(command, overrides, no_attribution, pr_summary, cwd)
+        return _decide_bash(command, overrides, no_attribution, pr_summary, cwd, shadow)
     finally:
         _SESSION_CWD[0] = ()
 
 
 def _decide_bash(command: str, overrides: list[str], no_attribution: bool, pr_summary: bool,
-                 cwd: str | None) -> tuple[str, str | None, str | None]:
+                 cwd: str | None, shadow: bool = False) -> tuple[str, str | None, str | None]:
     reason = _is_destructive(command)
     # A line too large to read is never grantable: a spent budget, or a cap
     # on readings (`_expand_picks`). Past a cap the policy checks below see
@@ -14227,6 +14336,12 @@ def _decide_bash(command: str, overrides: list[str], no_attribution: bool, pr_su
     pol = policy_reason(command)
     if pol:
         return ("deny", pol, "policy")
+
+    # A shadow run never publishes (XERK-1847). Hard, like policy: no grant.
+    if shadow:
+        sh = shadow_reason(command)
+        if sh:
+            return ("deny", sh, "policy")
 
     if no_attribution:
         attrib = attribution_reason(command)
@@ -14440,6 +14555,8 @@ def main(argv: list[str] | None = None) -> int:
     no_attribution = settings.get("TURMA_NO_ATTRIBUTION", "1") != "0"
     pr_summary = settings.get("TURMA_PR_SUMMARY", "1") != "0"
     cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
+    # Read from the ENVIRONMENT even under --protected: it only ever adds denies.
+    shadow = os.environ.get("TURMA_SHADOW", "") not in ("", "0")
 
     verdict: list = []
 
@@ -14453,6 +14570,7 @@ def main(argv: list[str] | None = None) -> int:
                 no_attribution=no_attribution,
                 pr_summary=pr_summary,
                 cwd=cwd,
+                shadow=shadow,
             )
             # A judge grant (XERK-1566) is consulted only once decide() ALLOWED the
             # command — every hard deny wins — and only for Bash, the one tool this

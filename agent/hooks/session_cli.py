@@ -5,6 +5,9 @@ A session runs::
 
     python3 -SsE "$TURMA_SESSION_CLI" wake <duration> <reason...>
     python3 -SsE "$TURMA_SESSION_CLI" close-ticket <done|not-reproducible|already-fixed> --note "<evidence>"
+    python3 -SsE "$TURMA_SESSION_CLI" shadow-done --note "<summary>"
+    python3 -SsE "$TURMA_SESSION_CLI" shadow-grade --verdict good|bad --tests pass|fail|none \
+        --qa pass|partial|fail|none --design better|same|worse --note "<why>"
 
 Each subcommand writes ONE rendezvous file,
 ``~/.turma/session-requests/<TURMA_SESSION_ID>/<subcommand>.json``, atomically
@@ -46,6 +49,10 @@ CLOSE_NOTE_MAX = 2000
 # resumed by a person, not one that should hold a slot asleep.
 WAKE_MAX_SEC = 7 * 24 * 3600
 CLOSE_RESOLUTIONS = ("done", "not-reproducible", "already-fixed")
+# A shadow run (XERK-1847): the shadow session says it is finished, then its Opus
+# grader reports the grade. hub-agent.py reads both and re-validates every field.
+SHADOW_NOTE_MAX = 2000
+GRADE_NOTE_MAX = 500
 
 _DURATION_PART = re.compile(r"(\d+)([dhms])")
 _UNIT_SEC = {"d": 86400, "h": 3600, "m": 60, "s": 1}
@@ -121,6 +128,29 @@ def _close_ticket(sid: str, args) -> str:
             "and message you if it cannot close the ticket")
 
 
+def _note(args, limit: int, what: str) -> str:
+    note = (args.note or "").strip()
+    if not note:
+        raise Refused(f"{what} needs --note")
+    if len(note) > limit:
+        raise Refused(f"note is {len(note)} chars; the limit is {limit}")
+    return note
+
+
+def _shadow_done(sid: str, args) -> str:
+    note = _note(args, SHADOW_NOTE_MAX, "shadow-done")
+    write_request(sid, "shadow-done", {"note": note, "requestedAt": int(time.time() * 1000)})
+    return "shadow-done recorded; the manager will hand your change to the grader"
+
+
+def _shadow_grade(sid: str, args) -> str:
+    note = _note(args, GRADE_NOTE_MAX, "shadow-grade")
+    write_request(sid, "shadow-grade", {
+        "verdict": args.verdict, "tests": args.tests, "qa": args.qa, "design": args.design,
+        "note": note, "requestedAt": int(time.time() * 1000)})
+    return f"shadow-grade recorded ({args.verdict}); the manager will report it and end this session"
+
+
 def _parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="session_cli.py",
                                 description="Hand the Turma manager a request.")
@@ -134,6 +164,17 @@ def _parser() -> argparse.ArgumentParser:
     c.add_argument("--note", required=True,
                    help=f"the evidence (at most {CLOSE_NOTE_MAX} chars)")
     c.set_defaults(func=_close_ticket)
+    d = sub.add_parser("shadow-done", help="a shadow run: your change is finished")
+    d.add_argument("--note", required=True,
+                   help=f"what you did (at most {SHADOW_NOTE_MAX} chars)")
+    d.set_defaults(func=_shadow_done)
+    g = sub.add_parser("shadow-grade", help="a shadow grader: report the grade")
+    g.add_argument("--verdict", required=True, choices=("good", "bad"))
+    g.add_argument("--tests", required=True, choices=("pass", "fail", "none"))
+    g.add_argument("--qa", required=True, choices=("pass", "partial", "fail", "none"))
+    g.add_argument("--design", required=True, choices=("better", "same", "worse"))
+    g.add_argument("--note", required=True, help=f"why (at most {GRADE_NOTE_MAX} chars)")
+    g.set_defaults(func=_shadow_grade)
     return p
 
 

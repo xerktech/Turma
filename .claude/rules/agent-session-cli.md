@@ -30,6 +30,9 @@ reads. `agent.md` is at its size ceiling; this file carries the contract.
     `20m`/`2h`/`1h30m`-style (`s`/`m`/`h`/`d`), above zero, at most 7 days; reason ≤200 chars.
   - `close-ticket <done|not-reproducible|already-fixed> --note "<evidence>"` →
     `{resolution, note, requestedAt}`, note ≤2000 chars. Read by the close-ticket worker below.
+  - `shadow-done --note` → `{note, requestedAt}` and `shadow-grade --verdict --tests --qa --design
+    --note` → the grade (XERK-1847, a shadow run's two sessions). Read on the beat by
+    `read_shadow_done`/`read_shadow_grade`, every enum re-validated (`model-quality.md`).
 - Exit 0 + one confirmation line on success; **2** on a refusal (usage, a bound, no
   `TURMA_SESSION_ID`, an id that is not a plain name), saying why and writing nothing; 1 on an
   I/O error.

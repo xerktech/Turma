@@ -25572,3 +25572,98 @@ test("XERK-1575: the brief reads a paused sleeper as asleep, never as finished w
   assert.equal(hub.compileBrief(S, now, "scheduled", []).counts.waiting, 0);
   delete agents.slpBrief;
 });
+
+// ---- shadow runs (XERK-1847) ----------------------------------------------------
+
+function shadowHost(key, site, extra = {}) {
+  agents[key] = {
+    lastSeen: Date.now(), orgBound: site, repos: [{ name: "app" }],
+    capacity: { maxSessions: 4, running: 0, queued: 0, free: 4 },
+    modelShadow: { available: true },
+    jira: { siteKey: site, fetchedAt: new Date().toISOString(),
+      tickets: [{ key: "SH-1", type: "Bug", statusCategory: "done", updated: "2026-10-01" }] },
+    sessions: [],
+    closedSessions: [{ id: "s-merged", repo: "app", model: "opus", modelActual: "claude-opus-5-5",
+      createdAt: new Date(Date.now() - 3600000).toISOString(), closedAt: new Date().toISOString(),
+      ticket: { key: "SH-1", siteKey: site },
+      prs: [{ url: "https://github.com/o/r/pull/9", state: "MERGED", mergedAt: new Date().toISOString(),
+        mergeCommit: "0123456789abcdef0123456789abcdef01234567" }] }],
+    ...extra,
+  };
+}
+
+test("XERK-1847: a merged ticket is sampled into ONE shadow on a candidate model, then paired", outcomeIsolated(async () => {
+  hub.outcomeLedger._internals.reset();
+  const site = "sh.atlassian.net";
+  shadowHost("sh-a", site);
+  hub.outcomeLedgerSweep();
+  // Rate 0: decided not-sampled, and never asked again.
+  hub.modelShadowSweep(Date.now(), { rate: 0 });
+  const [live0] = [...hub.outcomeLedger._internals.rows().values()];
+  assert.deepEqual(Object.keys(live0.shadow), ["sampled", "at"]);
+  assert.equal((agents["sh-a"].commands || []).length, 0);
+
+  hub.outcomeLedger._internals.reset();
+  hub.outcomeLedgerSweep();
+  hub.modelShadowSweep(Date.now(), { rate: 1 });
+  const cmd = (agents["sh-a"].commands || []).find((c) => c.type === "spawnShadow");
+  assert.ok(cmd, "dispatched");
+  assert.equal(cmd.issueKey, "SH-1");
+  assert.equal(cmd.repo, "app");
+  assert.equal(cmd.mergeSha, "0123456789abcdef0123456789abcdef01234567");
+  assert.ok(["sonnet", "haiku"].includes(cmd.model), "a candidate, never the live family");
+  assert.match(cmd.shadowId, /^sh-[0-9a-f]{16}$/);
+  // A second sweep dispatches nothing more for it.
+  hub.modelShadowSweep(Date.now(), { rate: 1 });
+  assert.equal(agents["sh-a"].commands.filter((c) => c.type === "spawnShadow").length, 1);
+
+  // The host's report, through the heartbeat coercion, lands as a paired row.
+  agents["sh-a"].shadowRuns = [{ id: cmd.shadowId, siteKey: site, issueKey: "SH-1", state: "graded",
+    modelActual: "claude-haiku-5-5", junk: "x",
+    grade: { verdict: "good", tests: "pass", qa: "pass", design: "same", note: "ok", extra: 1 } }];
+  hub.normalizeShadowRuns(agents["sh-a"]);
+  assert.equal(agents["sh-a"].shadowRuns[0].junk, undefined);
+  hub.outcomeLedgerSweep();
+  const v = await request("GET", "/api/model-quality", { headers: userHeaders });
+  assert.equal(v.body.pairs.length, 1);
+  assert.equal(v.body.pairs[0].shadowGood, 1);
+  assert.equal(v.body.groups.reduce((n, g) => n + g.sessions, 0), 1, "shadows never feed live groups");
+}));
+
+test("XERK-1847: a shadow goes only to a capable, free host decided into the org with the repo cloned", outcomeIsolated(async () => {
+  hub.outcomeLedger._internals.reset();
+  const site = "sh2.atlassian.net";
+  shadowHost("sh-src", site, { modelShadow: { available: false } });
+  hub.outcomeLedgerSweep();
+  // No capable host: held undecided, nothing queued.
+  hub.modelShadowSweep(Date.now(), { rate: 1 });
+  assert.equal((agents["sh-src"].commands || []).length, 0);
+  assert.equal(hub.outcomeLedger.shadowCandidates().length, 1);
+  // A host of ANOTHER org, a host without the repo, a full host: still nothing.
+  shadowHost("sh-other", "other.atlassian.net", { closedSessions: [] });
+  shadowHost("sh-norepo", site, { closedSessions: [], repos: [] });
+  shadowHost("sh-full", site, { closedSessions: [], capacity: { maxSessions: 1, running: 1, queued: 0, free: 0 } });
+  hub.modelShadowSweep(Date.now(), { rate: 1 });
+  for (const k of ["sh-other", "sh-norepo", "sh-full"]) assert.equal((agents[k].commands || []).length, 0, k);
+  // A good one takes it; the daily cap then holds the next.
+  shadowHost("sh-ok", site, { closedSessions: [] });
+  hub.modelShadowSweep(Date.now(), { rate: 1, dailyMax: 1 });
+  assert.equal(agents["sh-ok"].commands.length, 1);
+  assert.equal(hub.outcomeLedger.shadowsDispatchedSince(Date.now() - 86400000), 1);
+  // A report for that id from a host it was NOT sent to is ignored.
+  agents["sh-full"].shadowRuns = [{ id: agents["sh-ok"].commands[0].shadowId, siteKey: site, state: "running" }];
+  hub.outcomeLedgerSweep();
+  assert.equal([...hub.outcomeLedger._internals.rows().values()].filter((r) => r.kind === "shadow").length, 0);
+}));
+
+test("XERK-1847: a shadow session raises no operator alert and its flag is strictly boolean", () => {
+  const p = { sessions: [{ id: "a", shadow: "yes" }, { id: "b", shadow: true }] };
+  hub.normalizeSessions(p);
+  assert.ok(!("shadow" in p.sessions[0]));
+  assert.equal(p.sessions[1].shadow, true);
+  const m = { modelShadow: "on" };
+  hub.normalizeModelShadow(m);
+  assert.equal(m.modelShadow, null);
+  assert.equal(hub.shadowSampled("k", 0), false);
+  assert.equal(hub.shadowSampled("k", 1), true);
+});

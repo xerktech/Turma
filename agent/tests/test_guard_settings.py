@@ -342,6 +342,7 @@ class TestGuardSettings(unittest.TestCase):
         # XERK-1564: the session CLI's rendezvous dir. File tools only; Bash
         # still writes it, so the manager reads it as untrusted.
         "Edit(~/.turma/session-requests/**)",
+        "Edit(~/.turma/shadow-runs.json)",
         # XERK-510 [Qwen F]: the qwen guard's own config (a rewrite disables the
         # guard) and the qwen per-session model-credential env file. Added to the
         # SHARED list so all three runtimes cover them with no qwen-specific change.
