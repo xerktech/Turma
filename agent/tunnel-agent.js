@@ -993,7 +993,7 @@ const LIVE_AGENTS_MAX = 32;
 // Mirror of hub-agent.py's _shell_kind — read there for the three kinds and why
 // anything unrecognised is `work` (today's reading, so a miss costs nothing new).
 // The shared vectors in TestShellKind / tunnel-agent.test.js keep the two in step.
-const SHELL_NEUTRAL_CMDS = new Set(["date", "echo", "printf", "true", ":", "cd"]);
+const SHELL_NEUTRAL_CMDS = new Set(["date", "echo", "printf", "true", ":", "cd", "seq"]);
 // Read-only checks a poll loop runs between sleeps; they count only INSIDE a
 // sleeping loop (mirror of _SHELL_PROBE_CMDS / _SHELL_GH_PROBES).
 const SHELL_PROBE_CMDS = new Set(["[", "[[", "test", "break", "continue"]);
@@ -1001,6 +1001,19 @@ const SHELL_GH_PROBES = [["pr", "view"], ["pr", "checks"], ["pr", "status"],
                          ["run", "view"], ["run", "list"]];
 const SHELL_FILTER_CMDS = new Set(["grep", "egrep", "fgrep", "head", "tail", "sed", "awk",
   "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"]);
+// ...except one that edits a FILE in place (mirror of _shell_filter_writes).
+function shellFilterWrites(words) {
+  const cmd = words.length ? shellBase(words[0]) : "";
+  if (cmd !== "sed" && cmd !== "awk") return false;
+  for (const w of words.slice(1)) {
+    if (w.startsWith("--")) {
+      if (w.startsWith(cmd === "sed" ? "--in-place" : "--include")) return true;
+    } else if (w.startsWith("-") && w.includes("i")) {
+      return true;
+    }
+  }
+  return false;
+}
 const SHELL_PREFIX_CMDS = new Set(["nohup", "exec", "command"]);
 const SHELL_DURATION_RE = /^(\d+(?:\.\d+)?|\.\d+)([smhd]?)$/;
 const SHELL_DURATION_UNIT = { "": 1, s: 1, m: 60, h: 3600, d: 86400 };
@@ -1218,7 +1231,7 @@ function shellPipelineKind(stages, depth = 0) {
   if (stages.some((st) => shellRunsWork(st, depth))) return ["work", null];
   for (const st of stages.slice(1)) {
     const w = shellWords(st);
-    if (w.length && !SHELL_FILTER_CMDS.has(shellBase(w[0]))) return ["work", null];
+    if (w.length && (!SHELL_FILTER_CMDS.has(shellBase(w[0])) || shellFilterWrites(w))) return ["work", null];
   }
   return shellCmdKind(shellWords(stages[0]));
 }
@@ -1233,8 +1246,8 @@ function shellLoop(segs, i) {
     return ["work", null];
   }
   // A `while`/`until` condition runs every lap: `while [ "$(make deploy)" … ]`
-  // is work. A `for` list's `$(seq …)` only generates the words.
-  if ((head[0] === "while" || head[0] === "until") && shellRunsWork(segs[i][0])) return ["work", null];
+  // is work; so is a `for` list's `$(npm test)`. `$(seq …)` is neutral.
+  if (shellRunsWork(segs[i][0])) return ["work", null];
   const first = shellWords(segs[i + 1][0]);
   if (!first.length || first[0] !== "do") return ["work", null];
   const body = [[first.slice(1), ...segs[i + 1].slice(1)]];

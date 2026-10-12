@@ -1109,6 +1109,24 @@ class TestRepoUsageReport(unittest.TestCase):
         ha._aggregate_project(os.path.join(self.tmp, slug), acc)
         return acc
 
+    def test_a_slug_persisted_twice_counts_once(self):
+        # Rollup XERK-1584: an older build left one slug under the worktree
+        # path AND its projects dir, the second adopted into the root bucket,
+        # so the host total counted it twice.
+        wt = "/w/.turma/worktrees/Turma/aaa"
+        write_jsonl(os.path.join(self._proj(wt), "a.jsonl"), [
+            usage_entry("2026-07-01T10:00:00.000Z", "m1", "r1",
+                        "claude-opus-4-20250514", 1_000, 0),
+        ])
+        slug = ha._project_slug(wt)
+        for root_first in (True, False):
+            ledger = {wt: self._entry(wt, "Turma", "")}
+            dup = {os.path.join(self.tmp, slug): {"repo": None, "remote": "", "slug": slug}}
+            ledger = {**dup, **ledger} if root_first else {**ledger, **dup}
+            repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
+            self.assertEqual([r["repo"] for r in repo_usage], ["Turma"])
+            self.assertEqual(host["totals"]["input"], 1_000)
+
     def test_merges_worktrees_per_repo_and_host_total(self):
         wt_a = "/w/.turma/worktrees/Turma/aaa"
         wt_b = "/w/.turma/worktrees/Turma/bbb"

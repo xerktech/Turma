@@ -8088,6 +8088,9 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
     lines, too_large = _for_word_lines(command, weight)
     if too_large:
         return out + [([_TOO_LARGE], command)]
+    # Each flag is put back as it was, never to its default: this may run
+    # inside an outer reading that set one (rollup, XERK-1584).
+    outer = (_FOR_PICK[0], _VALUES_CHAINED[0], _PWD_UNASSIGNED[0])
     for line, pick in lines:
         # Values only: the per-value, brace and old-parse passes would
         # multiply the readings by the words (XERK-1647 QA). Their joined
@@ -8103,9 +8106,7 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
                 _PWD_UNASSIGNED[0] = True
                 out = out + _expand_values(line)
         finally:
-            _FOR_PICK[0] = None
-            _VALUES_CHAINED[0] = 0
-            _PWD_UNASSIGNED[0] = False
+            _FOR_PICK[0], _VALUES_CHAINED[0], _PWD_UNASSIGNED[0] = outer
     return out
 
 
@@ -8622,12 +8623,14 @@ def _expand_readings(command: str) -> list[tuple[list[str], str]]:
         # one written out as an assignment first; folded into the values, it
         # shadowed the default at the `${…}` itself and the name's own value.
         out = out + _expand_picks(assigned + command)
+    # Each flag below is put back as it was (an outer reading may hold it).
     if _BRACE_OTHER_SEEN[0]:
+        outer = _BRACE_OTHER_SHELL[0]
         _BRACE_OTHER_SHELL[0] = True
         try:
             out = out + _expand_picks(command)
         finally:
-            _BRACE_OTHER_SHELL[0] = False
+            _BRACE_OTHER_SHELL[0] = outer
     if _BRACE_QUOTED_SEEN[0] and not _BRACE_QUOTED[0]:
         _BRACE_QUOTED[0] = True
         try:
@@ -8635,20 +8638,22 @@ def _expand_readings(command: str) -> list[tuple[list[str], str]]:
         finally:
             _BRACE_QUOTED[0] = False
     if _MAIN_PARSE_SEEN[0] or _BRACE_OTHER_SEEN[0]:
+        outer = _MAIN_PARSE[0]
         _MAIN_PARSE[0] = True
         try:
             out = out + _expand_values(command)
         finally:
-            _MAIN_PARSE[0] = False
+            _MAIN_PARSE[0] = outer
     # Every value resolved through its whole chain, and in order, per value
     # too (`_assigned_values`): added readings, as the others are.
     for mode, differs in ((1, _CHAIN_DIFFERS[0]), (2, _ORDER_DIFFERS[0])):
         if differs:
+            outer = _VALUES_CHAINED[0]
             _VALUES_CHAINED[0] = mode
             try:
                 out = out + _expand_picks(command)
             finally:
-                _VALUES_CHAINED[0] = 0
+                _VALUES_CHAINED[0] = outer
     if _PRINTED_DROP_SEEN[0] and not _PRINTED_DROP[0]:
         _PRINTED_DROP[0] = True
         try:
@@ -13274,7 +13279,7 @@ def attribution_reason(command: str) -> str | None:
 # template and its readability rules ride PR_SUMMARY_SYSTEM_PROMPT in
 # hub-agent.py; this is the hard check behind it. A repo's OWN template wins:
 # when the repo has one, its headings are what is required instead.
-_PR_SUMMARY_LINE = re.compile(r"^\s*\*\*summary:?\*\*", re.IGNORECASE | re.MULTILINE)
+_PR_SUMMARY_LINE = re.compile(r"^[ \t]*\*\*summary:?\*\*", re.IGNORECASE | re.MULTILINE)
 _PR_SECTIONS = (
     ("Why", r"why"),
     ("What changed", r"what\s+changed"),
@@ -13292,14 +13297,16 @@ _REPO_PR_TEMPLATES = (
 )
 # A repo template heading worded as optional is not required of every PR.
 _OPTIONAL_HEADING = re.compile(r"optional|if applicable", re.IGNORECASE)
-_TEMPLATE_HEADING = re.compile(r"^\s*#{1,6}\s+(.+?)\s*#*\s*$", re.MULTILINE)
+# Blanks, never `\s`: a `\s*` at a line start runs over every newline after
+# it, so a body of N blank lines was quadratic (36 KB took 39s, rollup).
+_TEMPLATE_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t\r]*#*[ \t\r]*$", re.MULTILINE)
 _PR_BODY_MAX_READ = 256 * 1024
 
 
 def _heading_present(body: str, pattern: str) -> bool:
     # `(?!\w)`, not `\b`: a template heading may end in `?`/`:`/`)`, after
     # which there is no word boundary at the end of a line.
-    return re.search(rf"^\s*#{{1,6}}\s*{pattern}(?!\w)", body,
+    return re.search(rf"^[ \t]*#{{1,6}}[ \t]*{pattern}(?!\w)", body,
                      re.IGNORECASE | re.MULTILINE) is not None
 
 
