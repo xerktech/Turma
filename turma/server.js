@@ -20266,7 +20266,12 @@ const server = http.createServer(async (req, res) => {
         parts[3] === "trajectory" && parts.length === 4) {
       const transcriptId = decodeURIComponent(parts[2]);
       const traj = archive.dshTrajectory(transcriptId);
-      if (!traj) return json(res, 404, withIngestClosed({ error: "no dsh trajectory for this session" }));
+      if (!traj) {
+        const r = archiveRefusalFor(transcriptId);
+        return json(res, 404, withIngestClosed(r
+          ? { error: "no dsh trajectory for this session", refused: { host: r.host, at: r.at, error: r.error } }
+          : { error: "no dsh trajectory for this session" }));
+      }
       return json(res, 200, traj);
     }
 

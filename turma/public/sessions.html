@@ -3914,10 +3914,13 @@ async function loadTrajectory(transcriptId, force) {
         : '<div class="traj-empty">No trajectory yet — a running session syncs to the archive within a few beats. Reopen or ↻ Refresh in a moment.</div>';
       return;
     }
-    if (!r.ok) { scroll.innerHTML = `<div class="traj-empty">Could not load the trajectory (HTTP ${r.status}).</div>`; return; }
+    if (!r.ok) {
+      if (currentTrajId === transcriptId) scroll.innerHTML = `<div class="traj-empty">Could not load the trajectory (HTTP ${r.status}).</div>`;
+      return;
+    }
     data = await r.json();
   } catch (e) {
-    scroll.innerHTML = '<div class="traj-empty">Could not reach the hub for the trajectory.</div>';
+    if (currentTrajId === transcriptId) scroll.innerHTML = '<div class="traj-empty">Could not reach the hub for the trajectory.</div>';
     return;
   }
   if (currentTrajId !== transcriptId) return;  // a newer open won the race

@@ -54,7 +54,7 @@ paths:
     (a stale `running` record is NOT trusted — the same reason the route dispatches
     off archived data), no `trajectory` capability, or the tail not cached yet. The
     endpoint always returns a trajectory; `partial`/`live`/`pending` say which.
-- **Both trajectory 404s carry `ingestClosed`** (`withIngestClosed`; the archive route also `refused`, XERK-1584):
+- **Both trajectory 404s carry `ingestClosed` and `refused`** (`withIngestClosed`, `archiveRefusalFor`, XERK-1584):
   the web pane (`archiveMissingNote`) and Android (`archiveMissingMessage`) say a refused push or
   closed ingest instead of promising a sync; only a plain 404 keeps "syncs within a few beats".
 - **`renderedTrajectory()` (archive.js) is the RUNNING fallback** — a running

@@ -3588,6 +3588,14 @@ test("XERK-1283: ingestClosed.since is exactly when the gate closed, however the
   }
 });
 
+test("XERK-1584 #13: the dsh trajectory 404 names a refused push like the archive route", async () => {
+  noteArchiveRefusal("trd-refused", "nas", "archive chunk is larger than this hub takes");
+  const r = await request("GET", "/api/dsh/trd-refused/trajectory", { headers: userHeaders });
+  assert.equal(r.status, 404);
+  assert.equal(r.body.refused.host, "nas");
+  assert.match(r.body.refused.error, /larger than this hub takes/);
+});
+
 test("XERK-1584 #13: both trajectory 404s say when archive ingest closed, and only while it is", async () => {
   // The trajectory panes promised "syncs within a few beats" on every 404, which
   // is untrue while the hydrate holds ingest shut, exactly as for the transcript.

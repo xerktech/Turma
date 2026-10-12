@@ -3706,6 +3706,43 @@ test("trajectory pane: closed ingest and a refused push are not worded as 'syncs
   assert.match(html, /within a few beats/);
 });
 
+// A slower answer for the session the operator already left must never paint
+// over the one now open — every loadTrajectory outcome (404 note, 5xx, network).
+test("trajectory pane: a late answer for a session left behind does not overwrite the open one", async () => {
+  const page = loadPage();
+  const c = host([
+    { ...running("s1", "A", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidA" },
+    { ...running("s2", "B", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidB" },
+  ]);
+  page.beat({ now: c.now, agents: [c.host] });
+  for (const late of [
+    { ok: false, status: 404, json: async () => ({ ingestClosed: { since: Date.now() - 60e3 } }) },
+    { ok: false, status: 502, json: async () => ({}) },
+    null,   // a network failure
+  ]) {
+    let releaseA;
+    page.setGet((url) => {
+      // A thenable carrying `json` is passed through as the response itself, so
+      // the fetch settles only when releaseA() hands it the late answer.
+      if (url.includes("/tidA/trajectory")) return {
+        json: () => null, then: (res, rej) => { releaseA = () => late ? res(late) : rej(new Error("down")); } };
+      if (url.includes("/tidB/trajectory")) return { ok: false, status: 404, json: async () => ({}) };
+      return null;
+    });
+    if (page.els.trajScroll) page.els.trajScroll.dataset.loaded = "";
+    page.selectSession("s1");
+    page.chatToTrajectory();
+    page.selectSession("s2");
+    page.chatToTrajectory();
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    const shown = page.els.trajScroll.innerHTML;
+    assert.match(shown, /within a few beats/, "B's own plain 404");
+    releaseA();
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    assert.equal(page.els.trajScroll.innerHTML, shown, `late ${late ? late.status : "network error"} for A left B alone`);
+  }
+});
+
 // --- Trajectory on the read-only stage (XERK-718) ----------------------------
 // The ended/killed-session and archived-transcript views are archive-served, so
 // their Trajectory works for an offline host too. The toggle rides the SAME
