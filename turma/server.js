@@ -4879,7 +4879,8 @@ function modelPolicySweep(now = Date.now()) {
     // The tripwire acts only on live work the policy routed, so only when on.
     if (MODEL_POLICY === "on") {
       for (const [key, e] of Object.entries(modelPolicyState)) {
-        if (e.state !== "promoted") continue;
+        // A promotion made this sweep has routed nothing yet.
+        if (e.state !== "promoted" || e.at >= now) continue;
         const [cls, model] = key.split("/");
         const live = outcomeLedger.liveRate(cls, model, { since: e.at, now });
         if (!live.n) continue;

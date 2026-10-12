@@ -8256,10 +8256,11 @@ test("XERK-1848: the tripwire demotes a promoted model whose live bad rate beats
     hub.modelPolicySweep();
     assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
     // 1 bad of 3 since: Wilson lower 6% > the 1.7% baseline -> demoted.
-    seedLive("bug", "sonnet", "bad");
-    seedLive("bug", "sonnet", "merged");
-    seedLive("bug", "sonnet", "merged");
-    hub.modelPolicySweep();
+    const after = hub.__modelPolicyState()["bug/sonnet"].at + 5;   // routed after the promotion
+    seedLive("bug", "sonnet", "bad", after);
+    seedLive("bug", "sonnet", "merged", after);
+    seedLive("bug", "sonnet", "merged", after);
+    hub.modelPolicySweep(after + 1);
     const e = hub.__modelPolicyState()["bug/sonnet"];
     assert.equal(e.state, "demoted");
     assert.equal(e.bad, 1);
@@ -8328,10 +8329,28 @@ test("XERK-1848: the tripwire uses the Wilson lower bound, not the point rate", 
     for (let i = 0; i < 19; i++) seedLive("bug", "opus", "merged", Date.now() - 120000);
     seedLive("bug", "opus", "bad", Date.now() - 120000);   // baseline 1/60
     // 1 bad of 20: point rate 5% > 1.7%, but Wilson lower 0.9% is not.
-    seedLive("bug", "sonnet", "bad");
-    for (let i = 0; i < 19; i++) seedLive("bug", "sonnet", "merged");
-    hub.modelPolicySweep();
+    const after = hub.__modelPolicyState()["bug/sonnet"].at + 5;
+    seedLive("bug", "sonnet", "bad", after);
+    for (let i = 0; i < 19; i++) seedLive("bug", "sonnet", "merged", after);
+    hub.modelPolicySweep(after + 1);
     assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-1848: a promotion is never tripped by work started in its own millisecond", () => {
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  try {
+    const N = Date.now() + 10000;
+    seedPairs("bug", "sonnet", 40, { at: N - 1000 });
+    for (let i = 0; i < 3; i++) seedLive("bug", "sonnet", "bad", N);   // same ms as the promotion
+    hub.modelPolicySweep(N);
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+    hub.modelPolicySweep(N + 1);   // nor on the next sweep: none started AFTER it
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+    seedLive("bug", "sonnet", "bad", N + 1);
+    hub.modelPolicySweep(N + 2);
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "demoted");
   } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
 });
 
@@ -8340,8 +8359,9 @@ test("XERK-1848: the tripwire only runs when the policy is on", () => {
   try {
     seedPairs("bug", "sonnet", 40, { at: Date.now() - 60000 });
     hub.modelPolicySweep();
-    for (let i = 0; i < 3; i++) seedLive("bug", "sonnet", "bad");
-    hub.modelPolicySweep();
+    const after = hub.__modelPolicyState()["bug/sonnet"].at + 5;
+    for (let i = 0; i < 3; i++) seedLive("bug", "sonnet", "bad", after);
+    hub.modelPolicySweep(after + 1);
     assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
   } finally { resetPolicy(); }
 });
