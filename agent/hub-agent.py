@@ -11070,6 +11070,11 @@ def _publish_live_agents(session_id, path, offset, state):
         return
     body = {k: state.get(k) or {} for k in _LIVE_SNAPSHOT_MAPS}
     body["stoppedAgents"] = list(state.get("stoppedAgents") or [])
+    # The QA scan rides the same offset (XERK-1857): `qa` says this manager's
+    # scan saw the whole transcript up to it, and `qaCalls` the launches still
+    # awaiting a result, so a restart folds the gap instead of going partial.
+    body["qa"] = state.get("qaComplete") is True
+    body["qaCalls"] = dict(state.get("qaCalls") or {})
     fp = json.dumps(body, sort_keys=True)
     last = state.get("liveSnapshot") or {}
     if last.get("path") == path and last.get("fp") == fp \
@@ -11120,7 +11125,7 @@ def _snapshot_row(row):
     return out
 
 
-def _restore_live_agents(session_id, path, state):
+def _restore_live_agents(session_id, path, state, report=None):
     """Seed the live-agent scan from this session's published snapshot and fold
     the bytes written since its offset, or return False to leave the caller to
     _backscan_live_agents. Revalidated, never trusted: the snapshot must name
@@ -11130,6 +11135,11 @@ def _restore_live_agents(session_id, path, state):
     was down is in that gap, so a launch that ended is never resurrected. A
     launch whose stop is NEVER written (claude itself died) is expired by
     `_launch_tmux`, which drops the snapshot: background work dies with claude.
+
+    With a `report`, a snapshot whose QA scan was complete (`qa`) also folds the
+    gap into the QA-run scan and sets state["qaRestored"] (XERK-1857): the runs
+    before its offset are already on the registry record, so the session's QA
+    history stays whole across the restart instead of being marked partial.
 
     Returns the end of the last complete line read (the caller resumes the
     incremental scan there, as for _backscan_live_agents), or None to refuse."""
@@ -11164,6 +11174,16 @@ def _restore_live_agents(session_id, path, state):
     state["agentTasks"] = {str(k): v for k, v in maps[1].items() if isinstance(v, str)}
     state["shellCalls"] = {str(k): v for k, v in maps[2].items() if isinstance(v, dict)}
     state["stoppedAgents"] = [t for t in stopped if isinstance(t, str)][-LIVE_AGENTS_MAX * 4:]
+    qa = report is not None and snap.get("qa") is True and isinstance(snap.get("qaCalls"), dict)
+    if qa:
+        # Launches still awaiting a result when it was written; the record
+        # (_seed_qa_scan) only knows runs that already had one.
+        calls = state.setdefault("qaCalls", {})
+        for k, v in list(snap["qaCalls"].items())[-QA_RUNS_MAX:]:
+            if isinstance(v, str) and v in QA_AGENT_TYPES:
+                calls.setdefault(str(k)[:200], v)
+        while len(calls) > QA_RUNS_MAX:
+            calls.pop(next(iter(calls)))
     # Only COMPLETE lines: a last one still being written is left for the
     # incremental scan, which resumes at the returned end.
     end = raw.rfind(b"\n") + 1
@@ -11174,6 +11194,10 @@ def _restore_live_agents(session_id, path, state):
             continue
         if isinstance(entry, dict):
             _scan_agent_entry(entry, state)
+            if qa:
+                _scan_qa_entry(entry, state, report)
+    if qa:
+        state["qaRestored"] = True
     return offset + end
 
 
@@ -17654,6 +17678,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # never reach a transcript this beat), so a session with agents still in
         # flight keeps reporting them on a beat that appended nothing.
         report["agents"] = live_agents_report(state)
+        # Every beat, not just the one that judged it: if that beat raised,
+        # the record would otherwise never latch qaPartial (XERK-1857).
+        if state.get("qaComplete") is False:
+            report["qaPartial"] = True
         # Only while the turn runs: a session that ended its turn after a loop
         # (a `Host blocker:` line, say) is waiting on the operator, and that
         # end-of-turn wait is what the hub and the classifier must read.
@@ -17687,6 +17715,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
               if claude_sid and VALID_CLAUDE_SID_RE.fullmatch(claude_sid) else "")
     newest, newest_mtime = None, 0.0
     found, found_mtime = None, 0.0
+    if not primed:
+        # False until judged: an exception before the judgement below must not
+        # leave a snapshot claiming the skipped history was scanned (XERK-1857).
+        state["qaComplete"] = False
     try:
         for fname in os.listdir(proj):
             if not fname.endswith(".jsonl"):
@@ -17703,6 +17735,8 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
             if st.st_mtime > newest_mtime:
                 newest, newest_mtime = path, st.st_mtime
     except OSError:
+        if not primed:
+            state["qaComplete"] = True  # nothing primed: read from byte 0 later
         state["primed"] = True
         return _finish()
     state["primed"] = True
@@ -17712,20 +17746,26 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # in a shared project dir is its conversation.
         newest, newest_mtime = found, found_mtime
     if not newest:
+        if not primed:
+            # Not written yet: it will be scanned from its first byte.
+            state["qaComplete"] = True
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
-    if not primed and offsets.get(newest, 0) > 0:
-        # This scan never saw the transcript's start (a manager restart, an
-        # upgrade, a resume), so the QA runs before it are unknown (XERK-1845).
-        report["qaPartial"] = True
     if not primed:
+        qa_from = offsets.get(newest, 0)
         # The prime set this transcript's offset to EOF, possibly mid-line;
         # resume at the last complete line instead, so a line being written
         # across the restart (a stop, say) is read whole rather than skipped.
-        end = _restore_live_agents(session_id, newest, state)
+        end = _restore_live_agents(session_id, newest, state, report)
         if end is None:
             end = _backscan_live_agents(newest, state)
+        if qa_from > 0 and not state.pop("qaRestored", False):
+            # This scan never saw the transcript's start (a resume, or a restart
+            # with no QA-complete snapshot to resume from), so the QA runs
+            # before it are unknown (XERK-1845).
+            report["qaPartial"] = True
+        state["qaComplete"] = not report.get("qaPartial")
         if end is not None and end <= offsets.get(newest, end):
             offsets[newest] = end
 
@@ -17774,6 +17814,9 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
             start = size  # file was truncated/rewritten; don't rescan
         if size - start > 1 << 22:
             start = size - (1 << 22)  # cap a huge backlog at 4 MiB
+            # The skipped bytes' QA runs are unknown, as after a restart.
+            report["qaPartial"] = True
+            state["qaComplete"] = False
         consumed = start
         if size > start:
             with open(newest, "rb") as f:
@@ -26133,7 +26176,7 @@ class SessionManager:
         # byte: mark the scan primed so the first beat never treats the lines
         # claude wrote before it as history it missed (XERK-1845 qaPartial).
         if not resume and not resume_id and isinstance(sess.get("id"), str):
-            self.sess_state[sess["id"]] = {"primed": True}
+            self.sess_state[sess["id"]] = {"primed": True, "qaComplete": True}
         # Runtime dispatch (XERK-460). _launch_tmux is the ONE launch choke point
         # every path goes through (spawn provision, resume, restart, resume-any,
         # resume-on-boot), so the claude-vs-dsh branch lives here rather than at

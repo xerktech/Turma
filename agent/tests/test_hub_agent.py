@@ -44462,6 +44462,79 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
         self.assertFalse(rep.get("qaPartial"))
         self.assertEqual([r["key"] for r in rep["qaRuns"]], ["t1"])
 
+    def _append(self, sid, lines):
+        proj = os.path.join(ha.PROJECTS_ROOT, ha._project_slug(self.tmp))
+        with open(os.path.join(proj, sid + ".jsonl"), "a") as f:
+            for e in lines:
+                f.write(json.dumps(e) + "\n")
+
+    def _restart_after(self, before, after):
+        # A fresh launch's scan, a manager restart, then the next beat.
+        sid = "22222222-2222-4222-8222-222222222222"
+        self._pinned(sid, before)
+        st = {"primed": True, "qaComplete": True}
+        rep = ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        runs, _ = ha.merge_qa_runs([], rep.get("qaRuns"))
+        self._append(sid, after)
+        st = {}
+        ha._seed_qa_scan(st, runs)
+        rep = ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        return st, rep, ha.merge_qa_runs(runs, rep.get("qaRuns"))[0]
+
+    def test_a_restart_resumes_the_qa_scan_from_the_snapshot(self):
+        # XERK-1857: a restart folds the bytes written since the published
+        # offset into the QA scan, so the history stays whole. The synchronous
+        # run's call was pending at the restart: only the snapshot knew it.
+        done = {"type": "user", "message": {"role": "user", "content": [
+            {"type": "tool_result", "tool_use_id": "t1",
+             "content": [{"type": "text", "text": "VERDICT: FAIL"}]}]}}
+        st, rep, runs = self._restart_after(
+            [_qa_call("t1", bg=False)],
+            [done, _qa_call("t2", "qa-delta"), _qa_launched("t2", "a2")])
+        self.assertFalse(rep.get("qaPartial"))
+        self.assertTrue(st["qaComplete"])
+        self.assertEqual(ha.qa_runs_wire(runs), [
+            {"agent": "qa", "verdict": "FAIL"}, {"agent": "qa-delta", "verdict": None}])
+
+    def test_a_snapshot_from_a_partial_scan_stays_partial(self):
+        # A scan that itself began mid-transcript publishes qa:false, so the
+        # next restart cannot launder it into a whole history.
+        sid = "33333333-3333-4333-8333-333333333333"
+        self._pinned(sid, [_qa_call("t1"), _qa_launched("t1", "a1")])
+        st = {}
+        self.assertTrue(ha.session_report(self.tmp, st, session_id="s1",
+                                          claude_sid=sid).get("qaPartial"))
+        self._append(sid, [_qa_call("t2")])
+        ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        rep = ha.session_report(self.tmp, {}, session_id="s1", claude_sid=sid)
+        self.assertTrue(rep.get("qaPartial"))
+
+    def test_an_older_snapshot_without_the_qa_scan_stays_partial(self):
+        sid = "44444444-4444-4444-8444-444444444444"
+        self._pinned(sid, [_qa_call("t1"), _qa_launched("t1", "a1")])
+        ha.session_report(self.tmp, {"primed": True, "qaComplete": True},
+                          session_id="s1", claude_sid=sid)
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, "s1.json")
+        with open(snap) as f:
+            body = json.load(f)
+        self.assertIs(body["qa"], True)
+        for k in ("qa", "qaCalls"):
+            body.pop(k)
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        rep = ha.session_report(self.tmp, {}, session_id="s1", claude_sid=sid)
+        self.assertTrue(rep.get("qaPartial"))
+
+    def test_a_backlog_past_the_scan_cap_marks_the_list_partial(self):
+        sid = "55555555-5555-4555-8555-555555555555"
+        self._pinned(sid, [_qa_call("t1")])
+        st = {"primed": True, "qaComplete": True}
+        ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self._append(sid, [{"type": "user", "message": {"content": "x" * (1 << 22)}}])
+        rep = ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertTrue(rep.get("qaPartial"))
+        self.assertFalse(st["qaComplete"])
+
     def test_a_resume_carries_the_runs_and_is_partial(self):
         sm = self.make_manager()
         wt = os.path.join(self.tmp, "wt1")
@@ -44490,7 +44563,61 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
                 except RuntimeError:
                     pass
                 self.assertEqual("s1" in sm.sess_state, not resume)
+                if not resume:
+                    # XERK-1857: the snapshot it publishes says its QA scan is whole.
+                    self.assertIs(sm.sess_state["s1"].get("qaComplete"), True)
         self.assertEqual(sm.sess_state.get("s1"), None)
+
+    def test_a_restart_before_the_transcript_exists_is_qa_complete(self):
+        # XERK-1857 QA D3: the transcript is then read from its first byte.
+        sid = "66666666-6666-4666-8666-666666666666"
+        st = {}
+        ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertIs(st.get("qaComplete"), True)
+        self._pinned(sid, [_qa_call("t1"), _qa_launched("t1", "a1")])
+        rep = ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertFalse(rep.get("qaPartial"))
+        rep = ha.session_report(self.tmp, {}, session_id="s1", claude_sid=sid)
+        self.assertFalse(rep.get("qaPartial"))
+
+    def test_a_restore_that_raises_never_publishes_a_whole_scan(self):
+        # XERK-1857 delta QA: the flag is False until the judgement runs.
+        sid = "88888888-8888-4888-8888-888888888888"
+        self._pinned(sid, [_qa_call("t1")])
+        ha.session_report(self.tmp, {"primed": True, "qaComplete": True},
+                          session_id="s1", claude_sid=sid)
+        st = {}
+        with mock.patch.object(ha, "_restore_live_agents", side_effect=TypeError("x")):
+            with self.assertRaises(TypeError):
+                ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertIs(st.get("qaComplete"), False)
+        # The next beat still reports it, so the record latches qaPartial.
+        self.assertTrue(ha.session_report(self.tmp, st, session_id="s1",
+                                          claude_sid=sid).get("qaPartial"))
+
+    def test_a_pinned_transcript_not_written_yet_beside_neighbours_is_qa_complete(self):
+        self._pinned("99999999-9999-4999-8999-999999999999", [_qa_call("t9")])
+        st = {}
+        ha.session_report(self.tmp, st, session_id="s1",
+                          claude_sid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self.assertIs(st.get("qaComplete"), True)
+
+    def test_a_forged_unhashable_qa_call_never_raises(self):
+        # XERK-1857 QA D1: the snapshot is session-writable.
+        sid = "77777777-7777-4777-8777-777777777777"
+        self._pinned(sid, [_qa_call("t1")])
+        ha.session_report(self.tmp, {"primed": True, "qaComplete": True},
+                          session_id="s1", claude_sid=sid)
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, "s1.json")
+        with open(snap) as f:
+            body = json.load(f)
+        body["qaCalls"] = {"x": [1], "y": {}, "t1": "qa"}
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        st = {}
+        rep = ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertFalse(rep.get("qaPartial"))
+        self.assertEqual(st["qaCalls"], {"t1": "qa"})
 
     def test_qa_partial_sticks_and_rides_both_wires(self):
         sm = self.make_manager()
