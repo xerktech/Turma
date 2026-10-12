@@ -3184,7 +3184,10 @@ function armEpicRun(siteKey, epicKey, rows, opts) {
   if (all.length > EPIC_RUNS_MAX) {
     all.sort((a, b) => (epicRuns[a].updatedAt || 0) - (epicRuns[b].updatedAt || 0));
     for (const old of all.slice(0, all.length - EPIC_RUNS_MAX)) {
-      if (old !== k) delete epicRuns[old];
+      if (old !== k) {
+        delete epicRuns[old];
+        withdrawEpicRunQueue(old, "its epic run was evicted");
+      }
     }
   }
   persistEpicRuns();
@@ -3232,12 +3235,28 @@ function setEpicRunPaused(siteKey, epicKey, paused) {
 // children at once. Only entries tagged `epicRun` go: a human's own Start on a
 // child is untagged (or had the tag cleared by the click), and stays. The
 // child's backoff is cleared too, so a Resume re-queues it on the next sweep.
+// A child already DISPATCHED but not yet handed to its host goes too: the tag
+// rides the spawnTicket, and an undelivered one would still start the child on
+// that host's next beat (or be reclaimed back into the queue untagged).
 function withdrawEpicRunQueue(runKey, why) {
-  for (const e of ticketQueue.filter((q) => q.epicRun === runKey && !q.expiredAt)) {
-    dropQueuedTicket(e.siteKey, e.issueKey, why);
-    const k = ticketQueueKey(e.siteKey, e.issueKey);
+  const forget = (siteKey, issueKey) => {
+    const k = ticketQueueKey(siteKey, issueKey);
     epicChildAttempts.delete(k);
     guardStoreDel("epicChildAttempts", k);
+  };
+  for (const e of ticketQueue.filter((q) => q.epicRun === runKey && !q.expiredAt)) {
+    dropQueuedTicket(e.siteKey, e.issueKey, why);
+    forget(e.siteKey, e.issueKey);
+  }
+  for (const host of Object.keys(agents)) {
+    const cmds = agents[host].commands;
+    if (!Array.isArray(cmds)) continue;
+    for (const c of cmds.filter((x) => x && typeof x === "object" && x.type === "spawnTicket"
+      && x.epicRun === runKey && !("deliveredAt" in x))) {
+      if (!dropQueuedCommand(host, c.cmdId, "spawnTicket")) continue;
+      console.log(`ticket queue: withdrew ${logName(c.issueKey)} from ${logName(host)} — ${why}`);
+      if (c.ticketSite) forget(c.ticketSite, c.issueKey);
+    }
   }
 }
 // Set or clear (null) an armed run's cap on concurrently-working children
@@ -5667,14 +5686,14 @@ function sanitizeRestoredCommands(reg) {
 // for as long as the record lived. That is XERK-235's loop, from a one-word gap.
 // `pauseFor` is the queue key of the waiting ticket a `pauseSleeper` answers
 // (XERK-1575): hub-only bookkeeping, like the two ticket stamps.
-const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite", "pauseFor"];
+const INTERNAL_COMMAND_FIELDS = ["deliveredAt", "ticketSource", "ticketSite", "pauseFor", "epicRun"];
 function publicCommands(cmds) {
   const internal = (c) => c && typeof c === "object"
     && INTERNAL_COMMAND_FIELDS.some((f) => f in c);
   if (!cmds || !cmds.some(internal)) return cmds;
   return cmds.map((c) => {
     if (!internal(c)) return c;
-    const { deliveredAt, ticketSource, ticketSite, pauseFor, ...rest } = c;
+    const { deliveredAt, ticketSource, ticketSite, pauseFor, epicRun, ...rest } = c;
     return rest;
   });
 }
@@ -14265,6 +14284,7 @@ function drainTicketQueue() {
     // before taking it (XERK-303).
     const dispatchedCmdId = queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
       ticketSource: e.source, ticketSite: e.siteKey,
+      ...(e.epicRun ? { epicRun: e.epicRun } : {}),
       ...ticketSpawnModelFields(e.siteKey, e.issueKey, rpin, host, rows),
       ...(rpin ? { agentType: rpin.runtime } : {}) });
     rememberDispatch(e.siteKey, e.issueKey, dispatchedCmdId);
@@ -14765,7 +14785,13 @@ function reclaimStrandedTicketSpawns() {
       const prio = tri ? tri.priority : undefined;
       if (ticketQueueAdmission(siteKey, c.issueKey, source, prio) !== "ok") continue;
       if (!dropQueuedCommand(host, c.cmdId, "spawnTicket")) continue;
-      if (!enqueueTicketStart(siteKey, c.issueKey, source, prio)) {
+      const hadEntry = !!liveQueuedTicket(siteKey, c.issueKey);
+      const requeued = enqueueTicketStart(siteKey, c.issueKey, source, prio);
+      // An epic run's child keeps its tag (XERK-1862), so a later pause/cancel
+      // still withdraws it. Pause/cancel already dropped an undelivered spawn,
+      // so a tagged one reaching here belongs to a run still driving.
+      if (requeued && !hadEntry && c.epicRun && epicRuns[c.epicRun]) requeued.epicRun = c.epicRun;
+      if (!requeued) {
         // Unreachable: admission answered "ok" one line ago and nothing between
         // the two touches the queue. Said out loud anyway, because the one thing
         // this function must never do quietly is lose the work.

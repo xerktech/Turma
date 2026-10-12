@@ -93,6 +93,9 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   - The driver tags its entry `epicRun: <runKey>` (hub-only, never on the payload); only tagged
     entries are withdrawn, and their `epicChildAttempts` backoff is cleared so Resume re-queues at once.
   - A human's Start clears the tag (`enqueueTicketStart`), so a deliberate click is never withdrawn.
+  - The tag rides the `spawnTicket` (hub-only, `INTERNAL_COMMAND_FIELDS`): an UNDELIVERED child
+    spawn is withdrawn too, and a reclaimed one (XERK-303) is re-queued still tagged.
+  - An `EPIC_RUNS_MAX` eviction withdraws like a cancel.
   - Tests: the `XERK-1862:` cases in `server.test.js`.
 - **A re-arm PRESERVES the hold** (like `startedAt`): arming is "rebuild the plan", not "resume it"
   — only `{resume:true}` lifts a pause. So a paused-then-re-armed run stays held.
