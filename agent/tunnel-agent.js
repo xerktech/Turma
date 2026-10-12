@@ -1054,10 +1054,42 @@ function kubectlPositionals(args) {
 }
 
 // Segments (`;` `&&` `||` `&` newline) of pipeline stages (`|`) of words.
+// For a substitution whose `(` ends just before i, [index past its `)`, closed]
+// (mirror of _shell_group_end). Quotes, backslash escapes and `#` comments inside
+// it are text, so `$(echo ')'; make)` closes where bash does. An unclosed one
+// runs to the end (its rest is read as the body: work).
+function shellGroupEnd(s, i) {
+  let depth = 1, quote = "";
+  const n = s.length;
+  for (; i < n; i++) {
+    const c = s[i];
+    if (quote === "'") { if (c === "'") quote = ""; }
+    else if (c === "\\") i++;
+    else if (quote) { if (c === '"') quote = ""; }
+    else if (c === "'" || c === '"') quote = c;
+    else if (c === "#" && (i === 0 || " \t\n;&|(".includes(s[i - 1]))) {
+      while (i + 1 < n && s[i + 1] !== "\n") i++;
+    } else if (c === "(") depth++;
+    else if (c === ")" && --depth === 0) return [i + 1, true];
+  }
+  return [n, false];
+}
+
+// For a backtick that opened just before i, [index past its closing backtick,
+// closed]; a backslash escapes the next character (mirror of _shell_tick_end).
+function shellTickEnd(s, i) {
+  const n = s.length;
+  for (; i < n; i++) {
+    if (s[i] === "\\") i++;
+    else if (s[i] === "`") return [i + 1, true];
+  }
+  return [n, false];
+}
+
 function shellSegments(command) {
   const segs = [];
   let stages = [], words = [], word = [], inWord = false;
-  let quote = "", depth = 0, tick = false;
+  let quote = "";
   const s = String(command == null ? "" : command);
   const n = s.length;
   const endWord = () => { if (inWord) words.push(word.join("")); word = []; inWord = false; };
@@ -1071,20 +1103,18 @@ function shellSegments(command) {
       else word.push(c);
       continue;
     }
-    if (depth || tick) {
-      word.push(c);
-      if (c === "`" && !depth) tick = false;
-      else if (c === "(") depth++;
-      else if (c === ")") depth--;
-      continue;
-    }
     if (c === "'" || c === '"') { quote = c; inWord = true; }
     else if (c === "\\" && i + 1 < n) {
       i++;
       if (s[i] !== "\n") { word.push(s[i]); inWord = true; }
-    } else if (c === "$" && i + 1 < n && s[i + 1] === "(") {
-      word.push("$("); inWord = true; depth = 1; i++;
-    } else if (c === "`") { word.push(c); inWord = true; tick = true; }
+    } else if ((c === "$" || c === "<" || c === ">") && i + 1 < n && s[i + 1] === "(") {
+      // `<(…)`/`>(…)` run their body like `$(…)`; the whole group is one word.
+      const [j] = shellGroupEnd(s, i + 2);
+      word.push(s.slice(i, j)); inWord = true; i = j - 1;
+    } else if (c === "`") {
+      const [j] = shellTickEnd(s, i + 1);
+      word.push(s.slice(i, j)); inWord = true; i = j - 1;
+    }
     else if (c === "#" && !inWord) { while (i + 1 < n && s[i + 1] !== "\n") i++; }
     else if (c === ";" || c === "\n") endSeg();
     else if (c === "|") {
@@ -1172,7 +1202,7 @@ function shellCmdKind(words, depth = 0) {
   return ["work", null];
 }
 
-// The command texts a word's `$(…)`/backtick substitutions run. `$((…))` is
+// The command texts a word's `$(…)`/`<(…)`/`>(…)`/backtick substitutions run. `$((…))` is
 // arithmetic, not a command, but a `$(…)` inside it still runs. An unclosed one
 // yields the rest of the word.
 function shellArithEnd(word, i) {
@@ -1193,20 +1223,14 @@ function shellSubstBodies(word) {
   while (i < n) {
     if (word.startsWith("$((", i) && shellArithEnd(word, i) != null) {
       i += 3;
-    } else if (word.startsWith("$(", i)) {
-      let depth = 1, j = i + 2;
-      while (j < n && depth) {
-        if (word[j] === "(") depth++;
-        else if (word[j] === ")") depth--;
-        j++;
-      }
-      out.push(word.slice(i + 2, depth ? j : j - 1));
+    } else if (word.startsWith("$(", i) || word.startsWith("<(", i) || word.startsWith(">(", i)) {
+      const [j, closed] = shellGroupEnd(word, i + 2);
+      out.push(word.slice(i + 2, closed ? j - 1 : j));
       i = j;
     } else if (word[i] === "`") {
-      let j = word.indexOf("`", i + 1);
-      if (j < 0) j = n;
-      out.push(word.slice(i + 1, j));
-      i = j + 1;
+      const [j, closed] = shellTickEnd(word, i + 1);
+      out.push(word.slice(i + 1, closed ? j - 1 : j));
+      i = j;
     } else {
       i++;
     }
@@ -1262,7 +1286,10 @@ function shellLoop(segs, i) {
   if (shellRunsWork(segs[i][0], 0, head[0] === "for")) return ["work", null];
   const first = shellWords(segs[i + 1][0]);
   if (!first.length || first[0] !== "do") return ["work", null];
-  const body = [[first.slice(1), ...segs[i + 1].slice(1)]];
+  // The raw words after `do`, not `first`: shellWords drops a redirect-looking
+  // `<(make)`, whose body still runs.
+  const raw = segs[i + 1][0];
+  const body = [[raw[0] === "do" ? raw.slice(1) : first.slice(1), ...segs[i + 1].slice(1)]];
   let j = i + 2;
   while (j < segs.length && !sameWords(shellWords(segs[j][0]), ["done"])) body.push(segs[j++]);
   if (j >= segs.length) return ["work", null];
