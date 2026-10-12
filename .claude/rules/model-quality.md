@@ -74,10 +74,19 @@ This file is the operative rules for what has shipped.
   `defect-scan` thread every `TURMA_DEFECT_SCAN_EVERY` (1800s; `TURMA_DEFECT_SCAN=0` off) fetches
   each repo's default branch and walks new first-parent commits from a per-repo cursor
   (`defect-scan.json`); the first scan back-fills `MODEL_QUALITY_WINDOW_DAYS`.
-  - A FIX is a revert (`This reverts commit <sha>` names the introducer) or a commit whose subject's
-    ticket key classes `bug` (board cache, else the tracker; a tracker error stops BEFORE that commit
-    so it is retried, never skipped). Its first-parent diff is blamed `-w`; test paths and pure
-    additions blame nothing.
+  - A FIX is a revert or a commit whose subject's ticket key classes `bug` (board cache, else the
+    tracker; a tracker error stops BEFORE that commit so it is retried, never skipped). A revert's
+    `This reverts commit <sha>` line counts only line-anchored and only when the sha is an ancestor;
+    for a merge commit the merged branch's messages are read too (a revert PR merged with a merge).
+  - Commits are listed as `%H %ct` only and each message read separately: a `%x1e`-delimited log
+    let a commit message forge a whole record (QA).
+  - Its first-parent diff (`-w`, `-M` — a rename blamed the whole file) is blamed `-w`; test paths
+    and pure additions blame nothing; `--- ` is a path only in a file's header (a deleted `-- `
+    comment line is not). Boundary/shallow-graft commits are never introducers.
+  - Each blamed commit is mapped to the first-parent commit that LANDED it (`_defect_landing`):
+    itself for a squash, else its PR's merge commit — the ledger's `mergeCommit`.
+  - A commit git cannot read or diff (root, graft, timeout) is logged and SKIPPED, never retried
+    forever: one commit must not stop a repo's scan.
   - Introducers map to MERGED PRs via the forge (GitHub `commits/<sha>/pulls`, GitLab
     `merge_requests`); ADO has none, so the hub also joins on the PR's `mergeCommit`.
   - Reports are HELD (500, 30 days) and re-sent as a rotating page each beat (`defectReports`), so
@@ -88,8 +97,8 @@ This file is the operative rules for what has shipped.
   - A row is marked (`defects[]` → outcome bad, reason `defect`/`reverted`) only when the fix landed
     after its PR merged and inside the window, and never by its own PR. No row = unattributed,
     excluded from every model statistic.
-  - Known: Jira/ADO-key tickets only (`KEY-1`, `AB#1`); squash and merge commits both work, a
-    rebase-merged PR joins only through the forge.
+  - Known: ticket keys are Jira-style or ADO `AB#1` in the SUBJECT (a merge commit's branch name
+    counts); a rebase-merged PR's commits land as themselves, so they join only through the forge.
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
 - Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:` cases in
   `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`, `TestDefect*`;

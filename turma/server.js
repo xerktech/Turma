@@ -9021,7 +9021,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
   "spawnFailures", "epicBuilderStatus", "permissionEvents", "attentionHints",
-  "briefRender", "briefNarratives",
+  "briefRender", "briefNarratives", "defectReports",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted

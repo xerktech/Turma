@@ -387,8 +387,9 @@ function finish(changed, now) {
  *   entries: [{site, reports}] — `site` is the reporting host's DECIDED org, and
  *   only rows of that org are touched (a host cannot mark another org's work).
  * A fix counts only when it landed after the PR merged and inside the defect
- * window (a row already `good` is not re-judged), and never against the fix's
- * own PR. An introducer with no row is unattributed: human work, a direct push
+ * window — a late back-fill may still mark a row that already read `good`,
+ * since the fix it found landed inside that row's window — and never against
+ * the fix's own PR. An introducer with no row is unattributed: human work, a direct push
  * or pre-ledger history — excluded, never counted against anyone. Idempotent:
  * the agent re-sends its reports every few minutes until they age out.
  */

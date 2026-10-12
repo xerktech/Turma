@@ -8048,8 +8048,10 @@ DEFECT_REPORT_KEEP_SEC = 30 * 86400
 DEFECT_REPORTS_PER_BEAT = 25       # one rotating page a beat
 DEFECT_CLASSES_MAX = 5000
 DEFECT_BLAME_RANGES_MAX = 200      # -L ranges per file per fix
+DEFECT_GIT_TIMEOUT = 120           # one git call; off the beat
 _DEFECT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
-_REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{40})")
+# Anchored to a line start: git's own revert message, not a quote of one.
+_REVERT_RE = re.compile(r"(?m)^This reverts commit ([0-9a-f]{40})")
 _JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d{1,7})\b")
 _ADO_KEY_RE = re.compile(r"\bAB#(\d{1,9})\b")
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
@@ -8075,22 +8077,35 @@ def _defect_ticket_keys(subject):
 def _defect_changed_ranges(repo, sha):
     """{parent path: [(start, count)]} — the parent's lines a commit deleted or
     changed, whitespace-only changes ignored (`-w`), test files and pure
-    additions skipped (an addition blames nothing). Diffed against the FIRST
-    parent, so a merge commit covers its whole PR. None when git fails."""
+    additions skipped (an addition blames nothing). Renames are DETECTED (`-M`):
+    a moved file's hunks are its real edits against the old path, never the
+    whole file as deleted. Diffed against the FIRST parent, so a merge commit
+    covers its whole PR. None when git fails."""
     rc, out = run_out(["git", "-C", repo, "-c", "core.quotePath=false", "diff",
-                       "-U0", "-w", "--ignore-blank-lines", "--no-renames",
-                       "--no-color", "--no-ext-diff", f"{sha}^1", sha], timeout=60)
+                       "-U0", "-w", "--ignore-blank-lines", "-M", "--no-color",
+                       "--no-ext-diff", f"{sha}^1", sha], timeout=DEFECT_GIT_TIMEOUT)
     if rc != 0:
         return None
-    ranges, path = {}, None
+    ranges, path, header = {}, None, False
     for line in out.splitlines():
-        if line.startswith("--- "):
-            p = line[4:]
-            # A quoted (odd-byte) or /dev/null (new file) path blames nothing.
-            path = p[2:] if p.startswith("a/") else None
-            if path and _defect_is_test_path(path):
-                path = None
+        # A file's header runs from `diff --git` to its first hunk. Only there
+        # is `--- ` a path: inside a hunk it is a deleted line that began `-- `
+        # (a SQL/Lua/Haskell comment).
+        if line.startswith("diff --git "):
+            header, path = True, None
             continue
+        if header:
+            if line.startswith("--- "):
+                # git ends a path holding a space with a TAB; a quoted (odd-byte)
+                # path or /dev/null (a new file) blames nothing.
+                p = line[4:].rstrip("\t")
+                path = p[2:] if p.startswith("a/") else None
+                if path and _defect_is_test_path(path):
+                    path = None
+                continue
+            if not line.startswith("@@"):
+                continue
+            header = False
         if path is None:
             continue
         m = _HUNK_RE.match(line)
@@ -8101,23 +8116,46 @@ def _defect_changed_ranges(repo, sha):
     return ranges
 
 
+def _defect_shallow(repo):
+    """The grafted boundary commits of a shallow clone: blame credits them with
+    every older line, so they are never an introducer."""
+    rc, path = run_out(["git", "-C", repo, "rev-parse", "--git-path", "shallow"])
+    if rc != 0 or not path:
+        return set()
+    if not os.path.isabs(path):
+        path = os.path.join(repo, path)
+    try:
+        with open(path) as f:
+            return {s.strip() for s in f.read(1 << 20).split() if _DEFECT_SHA_RE.match(s.strip())}
+    except OSError:
+        return set()
+
+
 def _defect_blame(repo, sha, ranges):
     """{introducer sha: lines} — who last touched the changed lines on the fix's
-    parent, ignoring whitespace (`-w`). Boundary/uncommitted lines count for
-    nobody. A file git cannot blame is skipped."""
-    counts = {}
+    parent, ignoring whitespace (`-w`). Boundary commits (a shallow clone's
+    graft, porcelain's `boundary` mark) and uncommitted lines count for nobody.
+    A file git cannot blame is skipped."""
+    counts, boundary = {}, set()
     for path, spans in ranges.items():
         args = []
         for start, count in spans[:DEFECT_BLAME_RANGES_MAX]:
             args += ["-L", f"{start},+{count}"]
         rc, out = run_out(["git", "-C", repo, "blame", "-w", "--porcelain", *args,
-                           f"{sha}^1", "--", path], timeout=60)
+                           f"{sha}^1", "--", path], timeout=DEFECT_GIT_TIMEOUT)
         if rc != 0:
             continue
+        cur = None
         for line in out.splitlines():
             m = _BLAME_LINE_RE.match(line)
-            if m and m.group(1) != "0" * 40:
-                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+            if m:
+                cur = m.group(1)
+                if cur != "0" * 40:
+                    counts[cur] = counts.get(cur, 0) + 1
+            elif line == "boundary" and cur:
+                boundary.add(cur)
+    for s in boundary | (_defect_shallow(repo) if counts else set()):
+        counts.pop(s, None)
     return counts
 
 
@@ -8167,10 +8205,12 @@ def _defect_commit_prs(forge, sha):
 
 
 def _defect_commits(repo, ref, cursor):
-    """New first-parent commits on `ref`, oldest first, as (sha, ctime, subject,
-    body). From `cursor` when it is still an ancestor, else (first scan, or a
-    rewritten branch) the back-fill: everything inside the defect window.
-    Capped at DEFECT_COMMITS_PER_PASS; the caller's cursor resumes the rest."""
+    """New first-parent commits on `ref`, oldest first, as (sha, ctime). From
+    `cursor` when it is still an ancestor, else (first scan, or a rewritten
+    branch) the back-fill: everything inside the defect window. Capped at
+    DEFECT_COMMITS_PER_PASS; the caller's cursor resumes the rest. Only the hash
+    and time are listed — a message is read per commit, so no byte a commit
+    message carries can forge a record here."""
     base = []
     if cursor and _DEFECT_SHA_RE.match(cursor):
         rc, _ = run_out(["git", "-C", repo, "merge-base", "--is-ancestor", cursor, ref])
@@ -8179,24 +8219,51 @@ def _defect_commits(repo, ref, cursor):
     if not base:
         base = [f"--since={DEFECT_WINDOW_DAYS}.days.ago", ref]
     rc, out = run_out(["git", "-C", repo, "log", "--first-parent", "--reverse",
-                       # The trailing "." survives run_out's strip(), which eats
-                       # \x1e/\x1f as whitespace at the very end of the output.
-                       "--format=%H%x1f%ct%x1f%s%x1f%b%x1f.%x1e", *base], timeout=60)
+                       "--format=%H %ct", *base], timeout=DEFECT_GIT_TIMEOUT)
     if rc != 0:
         return None
     commits = []
-    for rec in out.split("\x1e"):
-        parts = rec.strip("\n").split("\x1f")
-        if len(parts) < 5 or not _DEFECT_SHA_RE.match(parts[0]):
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) != 2 or not _DEFECT_SHA_RE.match(parts[0]) or not parts[1].isdigit():
             continue
-        try:
-            ctime = int(parts[1])
-        except ValueError:
-            continue
-        commits.append((parts[0], ctime, parts[2], parts[3]))
+        commits.append((parts[0], int(parts[1])))
         if len(commits) >= DEFECT_COMMITS_PER_PASS:
             break
     return commits
+
+
+def _defect_revert_targets(repo, sha, message, parents):
+    """The commits a revert names, kept only when each is really an ancestor of
+    the revert's first parent (a quoted or invented sha names nothing). A revert
+    merged as a PR with a merge commit carries the line on the MERGED branch's
+    commits, not the merge's own message, so those are read too."""
+    texts = [message or ""]
+    if len(parents) > 1:
+        rc, out = run_out(["git", "-C", repo, "log", "-n", "50", "--format=%B",
+                           f"{parents[0]}..{parents[1]}"], timeout=DEFECT_GIT_TIMEOUT)
+        if rc == 0:
+            texts.append(out)
+    found = []
+    for t in texts:
+        for m in _REVERT_RE.finditer(t):
+            if m.group(1) not in found:
+                found.append(m.group(1))
+    return [t for t in found[:DEFECT_INTRODUCERS_MAX * 2]
+            if run_out(["git", "-C", repo, "merge-base", "--is-ancestor", t, parents[0]])[0] == 0]
+
+
+def _defect_landing(repo, sha, tip, first_parents):
+    """The commit on the default branch's first-parent line that brought `sha`
+    in: itself for a squash or direct commit, else the merge commit of its PR —
+    what the hub's ledger knows as the PR's `mergeCommit`, and what the forge
+    maps to the PR. None when it cannot be placed."""
+    if sha in first_parents:
+        return sha
+    rc, out = run_out(["git", "-C", repo, "rev-list", "--first-parent", "--ancestry-path",
+                       "--reverse", f"{sha}..{tip}"], timeout=DEFECT_GIT_TIMEOUT)
+    first = out.split("\n", 1)[0].strip() if rc == 0 else ""
+    return first if _DEFECT_SHA_RE.match(first) else None
 
 
 def _defect_tracker_classes(keys):
@@ -8232,21 +8299,34 @@ def _defect_tracker_classes(keys):
 def scan_repo_defects(repo, name, ref, cursor, classify, forge, now=None):
     """One repo's pass: (new cursor, [report]). `classify(keys)` answers
     {ticket key: work class} and may raise (the tracker is down) — the pass
-    then stops BEFORE that commit, so it is retried, never skipped. A report:
-    {repo, fix, fixPrs, kind: bug|revert, ticket, at (fix commit ms), found,
-    introducers: [{sha, prs, lines}]}."""
+    then stops BEFORE that commit, so it is retried, never skipped. Anything
+    git cannot answer about one commit (a root or graft with no parent, a diff
+    past its timeout) is logged and skipped, so one commit never stops a repo's
+    scan for good. A report: {repo, fix, fixPrs, kind: bug|revert, ticket, at
+    (fix commit ms), found, introducers: [{sha, prs, lines}]}, where each
+    introducer is the default-branch commit that landed the blamed line."""
     now = int(now if now is not None else time.time())
     commits = _defect_commits(repo, ref, cursor)
     if commits is None:
         return cursor, []
-    reports = []
-    for sha, ctime, subject, body in commits:
+    reports, first_parents = [], None
+    for sha, ctime in commits:
+        rc, line = run_out(["git", "-C", repo, "rev-list", "--parents", "-n", "1", sha])
+        parents = line.split()[1:] if rc == 0 else []
+        if not parents:
+            # A root or shallow-graft commit has nothing to blame; an unreadable
+            # one is logged. Either way the scan moves past it.
+            if rc != 0:
+                log(f"defect scan {name}: cannot read {sha[:12]}; skipped")
+            cursor = sha
+            continue
+        message = run(["git", "-C", repo, "log", "-1", "--format=%B", sha])
+        subject = message.split("\n", 1)[0]
         kind, ticket, counts = None, None, {}
-        target = _REVERT_RE.search(body or "")
-        if target or (subject or "").startswith('Revert "'):
+        targets = _defect_revert_targets(repo, sha, message, parents)
+        if targets or subject.startswith('Revert "'):
             kind = "revert"
-            if target:
-                counts = {target.group(1): 1}
+            counts = {t: 1 for t in targets}
         else:
             keys = _defect_ticket_keys(subject)
             if keys:
@@ -8258,16 +8338,27 @@ def scan_repo_defects(repo, name, ref, cursor, classify, forge, now=None):
                 bug = [k for k in keys if classes.get(k) == "bug"]
                 if bug:
                     kind, ticket = "bug", bug[0]
+        cursor = sha
         if kind and not counts:
             ranges = _defect_changed_ranges(repo, sha)
             if ranges is None:
-                break                 # git failed: retry this commit next pass
+                log(f"defect scan {name}: git could not diff {sha[:12]}; skipped")
+                continue
             counts = _defect_blame(repo, sha, ranges)
-        cursor = sha
-        counts.pop(sha, None)
         if not kind or not counts:
             continue
-        top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:DEFECT_INTRODUCERS_MAX]
+        if first_parents is None:
+            rc, out = run_out(["git", "-C", repo, "rev-list", "--first-parent", ref],
+                              timeout=DEFECT_GIT_TIMEOUT)
+            first_parents = set(out.split()) if rc == 0 else set()
+        landed = {}
+        for s, n in counts.items():
+            land = _defect_landing(repo, s, parents[0], first_parents)
+            if land and land != sha:
+                landed[land] = landed.get(land, 0) + n
+        if not landed:
+            continue
+        top = sorted(landed.items(), key=lambda kv: (-kv[1], kv[0]))[:DEFECT_INTRODUCERS_MAX]
         reports.append({
             "repo": name, "fix": sha, "fixPrs": _defect_commit_prs(forge, sha),
             "kind": kind, "ticket": ticket, "at": ctime * 1000, "found": now,

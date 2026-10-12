@@ -44272,6 +44272,96 @@ class TestDefectAttribution(unittest.TestCase):
         _, reports = self.scan("0" * 40)
         self.assertEqual(len(reports), 1)
 
+    def test_a_renamed_and_edited_file_blames_only_the_edit(self):
+        body = "".join(f"line {i}\n" for i in range(40))
+        self.commit({"big.py": body}, "XERK-1: add big")
+        self.git("mv", "big.py", "moved.py")
+        fix = self.commit({"moved.py": body.replace("line 7\n", "line seven\n")}, "XERK-2: fix")
+        _, reports = self.scan()
+        self.assertEqual([(r["fix"], [i["lines"] for i in r["introducers"]]) for r in reports],
+                         [(fix, [1])])
+
+    def test_a_deleted_dash_dash_line_and_a_spaced_path_keep_parsing(self):
+        sql = "a\n-- c1\nb\nc\n-- c2\nd\n"
+        self.commit({"q.sql": sql, "my file.txt": "x\ny\n"}, "XERK-1: add")
+        self.commit({"q.sql": "a\nb\nc\nd\n", "my file.txt": "x\nY\n"}, "XERK-2: fix")
+        sha = self.git("rev-parse", "HEAD")
+        self.assertEqual(ha._defect_changed_ranges(self.repo, sha),
+                         {"q.sql": [(2, 1), (5, 1)], "my file.txt": [(2, 1)]})
+
+    def test_a_modified_test_file_is_never_blamed(self):
+        self.commit({"tests/test_app.py": "x = 1\n"}, "XERK-1: add test")
+        self.commit({"tests/test_app.py": "x = 2\n"}, "XERK-2: fix the test")
+        self.assertEqual(self.scan()[1], [])
+
+    def test_a_forged_record_in_a_commit_message_is_inert(self):
+        evil = f"XERK-6: docs\n\n\x1e{'d' * 40}\x1f1\x1fRevert \"x\"\x1f" \
+               f"This reverts commit {self.bad}.\x1f"
+        self.commit({"README": "hi\n"}, evil)
+        cursor, reports = self.scan()
+        self.assertEqual(reports, [])
+        self.assertEqual(cursor, self.git("rev-parse", "HEAD"))
+
+    def test_a_quoted_or_foreign_revert_line_names_nothing(self):
+        self.commit({"README": "hi\n"}, f"XERK-4: notes\n\nsee: This reverts commit {self.bad}")
+        self.commit({"README": "ho\n"}, f"XERK-4: notes\n\nThis reverts commit {'e' * 40}.")
+        self.assertEqual(self.scan()[1], [])
+
+    def test_a_root_commit_fix_never_stops_the_scan(self):
+        root = tempfile.mkdtemp(prefix="defect-root-")
+        self.addCleanup(shutil.rmtree, root, ignore_errors=True)
+        self.repo = root
+        self.git("init", "-q", "-b", "main")
+        self.commit({"a.py": "1\n"}, "XERK-2: first is a bug")
+        bad = self.commit({"a.py": "2\n"}, "XERK-1: tweak")
+        fix = self.commit({"a.py": "1\n"}, "XERK-2: fix")
+        cursor, reports = self.scan()
+        self.assertEqual(cursor, fix)
+        self.assertEqual([r["introducers"][0]["sha"] for r in reports], [bad])
+
+    def test_a_git_failure_on_one_commit_skips_it(self):
+        fix = self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"}, "XERK-2: fix b")
+        with mock.patch.object(ha, "_defect_changed_ranges", return_value=None):
+            cursor, reports = self.scan()
+        self.assertEqual((cursor, reports), (fix, []))
+
+    def _merge(self, branch, files, msg, merge_msg):
+        self.git("switch", "-q", "-c", branch)
+        c = self.commit(files, msg)
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", merge_msg, branch)
+        return c, self.git("rev-parse", "HEAD")
+
+    def test_merge_commit_prs_land_on_their_merge_and_a_merged_revert_is_seen(self):
+        _, m1 = self._merge("pr1", {"lib.py": "v = 1\nw = 2\n"}, "XERK-1: add lib",
+                            "Merge pull request #1 from o/pr1")
+        # A bug fix merged as its own PR: the blamed line lands on PR #1's MERGE.
+        _, m2 = self._merge("pr2", {"lib.py": "v = 1\nw = 3\n"}, "XERK-2: fix w",
+                            "Merge pull request #2 from o/XERK-2-fix")
+        # A revert done as a PR and merged with a merge commit.
+        _, m3 = self._merge("pr3", {"lib.py": "v = 1\nw = 2\n"},
+                            f'Revert "XERK-2: fix w"\n\nThis reverts commit {m2}.',
+                            "Merge pull request #3 from o/revert-2")
+        _, reports = self.scan()
+        by_fix = {r["fix"]: r for r in reports}
+        self.assertEqual(by_fix[m2]["kind"], "bug")
+        self.assertEqual([i["sha"] for i in by_fix[m2]["introducers"]], [m1])
+        self.assertEqual(by_fix[m3]["kind"], "revert")
+        self.assertEqual([i["sha"] for i in by_fix[m3]["introducers"]], [m2])
+
+    def test_a_shallow_clones_boundary_is_never_the_introducer(self):
+        self.commit({"app.py": "a = 1\nb = 20\nc = 4\n"}, "XERK-1: tweak c")
+        clone = tempfile.mkdtemp(prefix="defect-shallow-")
+        self.addCleanup(shutil.rmtree, clone, ignore_errors=True)
+        subprocess.run(["git", "clone", "-q", "--depth", "1", f"file://{self.repo}", clone],
+                       check=True, capture_output=True)
+        origin = self.repo
+        self.repo = clone
+        self.commit({"app.py": "a = 1\nb = 2\nc = 4\n"}, "XERK-2: fix b")
+        _, reports = self.scan()
+        self.assertEqual(reports, [])
+        self.repo = origin
+
     def test_paths_and_keys(self):
         for p in ("tests/x.py", "a/__tests__/b.js", "x.test.ts", "foo_test.go", "test_x.py",
                   "FooTest.kt", "spec/a.rb"):
