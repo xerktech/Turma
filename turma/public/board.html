@@ -932,6 +932,7 @@ function paintDetail() {
     epicChildren,
     epicPreview,
     epicRunPending: !!(epicOp && epicOp.pending),
+    epicLimitDraft: s.epicLimitDraft || null,
     epicRunError: epicOp && epicOp.error,
     sessions: ticketSessions,
   });
@@ -1300,8 +1301,19 @@ async function postEpicRun(epicKey, siteKey, body, verb) {
 }
 
 // Arm (or re-arm) the run: rebuilds the DAG from the current board.
-function startEpicRun(epicKey, siteKey) {
-  return postEpicRun(epicKey, siteKey, {}, "start");
+// `maxConcurrent` (XERK-1860, optional): arm with that cap on how many of the
+// epic's tickets work at once; omitted keeps whatever cap the run already had.
+function startEpicRun(epicKey, siteKey, maxConcurrent) {
+  const body = maxConcurrent ? { arm: true, maxConcurrent } : {};
+  return postEpicRun(epicKey, siteKey, body, "start");
+}
+// Set (1..50) or clear (null) an armed run's cap without re-arming it (XERK-1860).
+// Repaints the open panel afterwards: a refused pick must not leave the select
+// showing a cap the hub never took (the run record in `cache` is the truth).
+async function setEpicRunLimit(epicKey, siteKey, maxConcurrent) {
+  await postEpicRun(epicKey, siteKey, { maxConcurrent }, "limit");
+  if (openTicketState && openTicketState.key === epicKey
+    && openTicketState.siteKey === siteKey) paintDetail();
 }
 // Cancel the run: the hub stops orchestrating; running child sessions are left
 // alone (a Done move or a human still ends them).
@@ -2025,7 +2037,13 @@ $panel.addEventListener("click", (e) => {
   if (!openTicketState) return;
   // Epic run controls: Start / Re-arm (both arm), Pause / Resume (XERK-641), Cancel.
   const armBtn = e.target.closest("[data-epic-arm]");
-  if (armBtn) { startEpicRun(armBtn.dataset.epicArm, openTicketState.siteKey); return; }
+  if (armBtn) {
+    // An un-armed epic's Start carries the drafted cap; a Re-arm keeps the run's own.
+    const draft = armBtn.closest(".epic-run")?.querySelector("[data-epic-limit-new]")
+      ? openTicketState.epicLimitDraft : null;
+    startEpicRun(armBtn.dataset.epicArm, openTicketState.siteKey, draft || undefined);
+    return;
+  }
   const pauseBtn = e.target.closest("[data-epic-pause]");
   if (pauseBtn) { pauseEpicRun(pauseBtn.dataset.epicPause, openTicketState.siteKey); return; }
   const resumeBtn = e.target.closest("[data-epic-resume]");
@@ -2109,6 +2127,18 @@ $panel.addEventListener("click", (e) => {
 // still closes the picker, which is what a pick means.
 $panel.addEventListener("change", (e) => {
   if (!openTicketState) return;
+  // The epic run's "max running at once" cap (XERK-1860): on an armed run a pick
+  // IS the save; on an un-armed epic it is a draft the Start button sends.
+  const lsel = e.target.closest("[data-epic-limit]");
+  if (lsel) {
+    const n = lsel.value ? Number(lsel.value) : null;
+    return void setEpicRunLimit(lsel.dataset.epicLimit, openTicketState.siteKey, n);
+  }
+  const ldraft = e.target.closest("[data-epic-limit-new]");
+  if (ldraft) {
+    openTicketState.epicLimitDraft = ldraft.value ? Number(ldraft.value) : null;
+    return;
+  }
   // The agent picker follows the repo picker's contract: a pick IS the save, a
   // re-pick of the current answer saves nothing but still closes the picker.
   const asel = e.target.closest("[data-agent-select]");

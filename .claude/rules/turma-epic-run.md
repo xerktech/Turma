@@ -29,7 +29,8 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   is the SAME per-record `sanitizeEpicRunRecord` whitelist boot-load used, applied to a remote value
   too; `persistEpicRuns()` replaces the old `scheduleEpicRunsSave`. HA off: byte-identical file writes,
   same 5s debounce. Mechanics: `.claude/rules/turma-ha-store.md` (wave-3 pattern).
-- **Run record**: `{epicKey, siteKey, state, children[], waves[][], cycle?[], startedAt, updatedAt}`.
+- **Run record**: `{epicKey, siteKey, state, children[], waves[][], cycle?[], paused?, maxConcurrent?,
+  startedAt, updatedAt}`.
   `state ∈ {running, blocked, done}` (`EPIC_RUN_STATES`); `waves` is the topological layering;
   `cycle` is present only when a dependency loop stalls children. `startedAt` is preserved across
   re-arms.
@@ -93,6 +94,23 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   NEW child starts and freezes the run's own merge/close, while in-flight child sessions keep running
   untouched until Resume. Board UI + Android render a `paused` chip and a Pause/Resume control (Pause
   on a running/blocked run, Resume on a paused one; a `done` run offers neither).
+
+## Per-epic concurrency cap (XERK-1860)
+
+- **`maxConcurrent` (int 1..50, `validEpicRunLimit`) on the run record caps how many of ITS children
+  work at once**; absent = no limit. Per epic, so epics in one org cap independently.
+- Route: `{maxConcurrent:N|null}` alone updates an ARMED run (`setEpicRunLimit`, no DAG rebuild; 404
+  when none — never a silent arm); `{arm:true, maxConcurrent}` arms with it; a plain re-arm keeps it
+  (like `paused`). Anything but null or an int in range is a 400. Coerced by `sanitizeEpicRunRecord`.
+- **"Working" = `epicRunActiveCount`**: a not-Done child with a LIVE (running/queued) session
+  (`liveTicketSessionKeys`), a queue place, a spawn in flight/committed, or dispatched within
+  `EPIC_CHILD_LAUNCH_GRACE_MS` (the `at` stamp on `epicChildAttempts`).
+  - Never `startedTicketKeys` — it counts KILLED sessions, so a finished child would hold its slot.
+  - The grace closes the ack-before-session gap; without it a cap of 1 starts a second child there.
+- The driver checks the cap AFTER every other guard, so a held child spends no attempt. Lowering the
+  cap never kills a running child. Board: `epicLimitPickerHtml` in the epic panel; Android web-only
+  gap in `PARITY.md`.
+- Tests: the `XERK-1860:` cases in `server.test.js` and `board.test.js`.
 
 ## The driver — `epicRunDriveSweep` (XERK-636)
 

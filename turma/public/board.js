@@ -530,9 +530,12 @@
     const waves = wavesSrc.map((w) => (Array.isArray(w) ? w : []).map(node));
     const cycleChildren = cycleKeys.map(node);
     const state = run.state === "done" || run.state === "blocked" ? run.state : "running";
+    // The operator's cap on concurrently-working children (XERK-1860); null = no limit.
+    const maxConcurrent = Number.isInteger(run.maxConcurrent) && run.maxConcurrent >= 1
+      ? run.maxConcurrent : null;
     return {
       state, paused: run.paused === true, total: keys.length, done: counts.done, counts,
-      waves, cycleChildren, cycle: cycleKeys.length > 0,
+      waves, cycleChildren, cycle: cycleKeys.length > 0, maxConcurrent,
     };
   }
 
@@ -541,7 +544,8 @@
   function epicRunSig(view) {
     if (!view) return "";
     return `${view.state}|${view.paused ? "p" : ""}|${view.done}/${view.total}`
-      + `|${view.counts.running},${view.counts.ready},${view.counts.blocked}`;
+      + `|${view.counts.running},${view.counts.ready},${view.counts.blocked}`
+      + `|m${view.maxConcurrent || ""}`;
   }
 
   // Every child of an epic the board carries (`epicKey` names it), in column
@@ -659,6 +663,25 @@
       + `</span>`;
   }
 
+  // The "max running at once" picker for an epic run (XERK-1860): No limit, 1..10,
+  // plus the current value if it is above that (the hub accepts up to 50). `attr`
+  // is the data attribute the page's change handler keys on: data-epic-limit on an
+  // armed run (a pick IS the save), data-epic-limit-new on an un-armed epic (a
+  // draft the Start button sends). `value` is an integer or null.
+  const EPIC_LIMIT_CHOICES = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+  function epicLimitPickerHtml(key, value, attr, disabled) {
+    const v = Number.isInteger(value) && value >= 1 ? value : null;
+    const nums = v && !EPIC_LIMIT_CHOICES.includes(v) ? [...EPIC_LIMIT_CHOICES, v] : EPIC_LIMIT_CHOICES;
+    const opt = (val, label) =>
+      `<option value="${val}"${String(v || "") === String(val) ? " selected" : ""}>${label}</option>`;
+    return `<label class="epic-limit" title="How many of this epic's tickets the run works on at the same time">
+        <span>Max running at once</span>
+        <select ${attr}="${esc(key)}"${disabled ? " disabled" : ""}>
+          ${opt("", "No limit")}${nums.map((n) => opt(n, String(n))).join("")}
+        </select>
+      </label>`;
+  }
+
   // The epic-run panel in the ticket detail view (XERK-638): Start / Re-arm /
   // Cancel plus the wave-by-wave child progress. Rendered only for an epic.
   // `view` is epicRunView() or null (no run armed); `o.pending`/`o.error` carry
@@ -721,7 +744,9 @@
           <p class="epic-desc">This epic isn't being auto-orchestrated yet. Starting the run works its
             children in dependency order — ready children start in parallel, each completed wave unlocks
             the next, and the epic closes itself once every child is Done.</p>
-          ${previewHtml}${err}<div class="epic-actions">${btn}</div>
+          ${previewHtml}${err}
+          ${epicLimitPickerHtml(key, o.limitDraft, "data-epic-limit-new", o.pending)}
+          <div class="epic-actions">${btn}</div>
         </section>`;
     }
     const stateLabel = view.paused ? "Paused"
@@ -768,6 +793,8 @@
           ${epicProgressBarHtml(view)}</div>
         ${pausedNote}${cycleNote}${err}${emptyNote}
         <ul class="epic-children">${wavesHtml(view)}${outsideHtml}</ul>
+        ${view.state === "done" ? ""
+          : epicLimitPickerHtml(key, view.maxConcurrent, "data-epic-limit", o.pending)}
         <div class="epic-actions">${actions}</div>
       </section>`;
   }
@@ -2496,7 +2523,7 @@
       </div>
       <h2 class="td-summary">${esc(v("summary") || "")}</h2>
       <dl class="td-fields">${fields}</dl>
-      ${isEpicTicket(t) ? epicRunPanelHtml(t, o.epicRun, { pending: o.epicRunPending, error: o.epicRunError, children: o.epicChildren, preview: o.epicPreview }) : ""}
+      ${isEpicTicket(t) ? epicRunPanelHtml(t, o.epicRun, { pending: o.epicRunPending, error: o.epicRunError, children: o.epicChildren, preview: o.epicPreview, limitDraft: o.epicLimitDraft }) : ""}
       ${body}
       <div class="td-foot"><a href="${safeUrl(v("url"))}" target="_blank" rel="noopener">Open in ${srcName} ↗</a></div>`;
   }
@@ -2822,7 +2849,7 @@
     statusFieldHtml, statusPickerHtml, statusPickerValue,
     triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
     isEpicTicket, epicRunOf, epicRunView, epicRunSig,
-    epicCardControlHtml, epicProgressBarHtml, epicRunPanelHtml, epicChildrenOf, epicChildrenSig, epicLayerWaves, epicPreviewRun, epicPanelSig,
+    epicCardControlHtml, epicProgressBarHtml, epicRunPanelHtml, epicLimitPickerHtml, epicChildrenOf, epicChildrenSig, epicLayerWaves, epicPreviewRun, epicPanelSig,
     FILTER_FIELDS, SORTS, emptyBoardView, boardViewActive, boardViewFilterCount, priorityRank,
     ticketFacets, ticketSearchMatch, boardViewMatches, boardViewSort, boardFilterGroups,
     boardViewFromParams, boardViewToParams, hasBoardViewParams,
