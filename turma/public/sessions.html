@@ -3361,6 +3361,9 @@ const $stageEmpty = document.getElementById("stageEmpty");
 // The dsh session whose Trajectory is currently staged (XERK-498), so ↻ Refresh
 // and a re-open know which one to re-fetch.
 let currentTrajId = null;
+// Bumped per trajectory fetch: only the newest request may paint, so a slow
+// answer can't overwrite a ↻ Refresh of the same session either.
+let trajLoadSeq = 0;
 // The Trajectory pane is reached two ways (XERK-717 live chat, XERK-718 read-only
 // stage), so its ◂ Back routes by where it was opened FROM: "chat" returns to the
 // live chat pane, "transcript" returns to the read-only stage (an ended/killed
@@ -3899,6 +3902,8 @@ async function loadTrajectory(transcriptId, force) {
   if (!transcriptId) { scroll.innerHTML = '<div class="traj-empty">This session has no transcript id yet.</div>'; return; }
   if (!force && currentTrajId === transcriptId && scroll.dataset.loaded === "1") return;
   currentTrajId = transcriptId;
+  const seq = ++trajLoadSeq;
+  const stale = () => seq !== trajLoadSeq;
   scroll.innerHTML = '<div class="traj-empty">Loading trajectory…</div>';
   scroll.dataset.loaded = "";
   let data;
@@ -3908,22 +3913,22 @@ async function loadTrajectory(transcriptId, force) {
       // A refused push or closed archive ingest never syncs: say why instead of
       // promising a few beats (XERK-1584 #13; same note as the ended pane).
       const why = await archiveMissingNote(r);
-      if (currentTrajId !== transcriptId) return;
+      if (stale()) return;
       scroll.innerHTML = why
         ? `<div class="traj-empty">No trajectory — ${why}</div>`
         : '<div class="traj-empty">No trajectory yet — a running session syncs to the archive within a few beats. Reopen or ↻ Refresh in a moment.</div>';
       return;
     }
     if (!r.ok) {
-      if (currentTrajId === transcriptId) scroll.innerHTML = `<div class="traj-empty">Could not load the trajectory (HTTP ${r.status}).</div>`;
+      if (!stale()) scroll.innerHTML = `<div class="traj-empty">Could not load the trajectory (HTTP ${r.status}).</div>`;
       return;
     }
     data = await r.json();
   } catch (e) {
-    if (currentTrajId === transcriptId) scroll.innerHTML = '<div class="traj-empty">Could not reach the hub for the trajectory.</div>';
+    if (!stale()) scroll.innerHTML = '<div class="traj-empty">Could not reach the hub for the trajectory.</div>';
     return;
   }
-  if (currentTrajId !== transcriptId) return;  // a newer open won the race
+  if (stale()) return;  // a newer open or refresh won the race
   renderTrajectory(scroll, data);
   scroll.dataset.loaded = "1";
 }

@@ -213,7 +213,7 @@ function loadPage({ search = "", sidebar = null, textareas = [], postReply = nul
       + " openSubagentView, transcriptBack,"
       + " armTermWatch, disarmTermWatch, termWatchdog, getTermWatch: () => termWatch,"
       + " chatToTerminal, terminalToChat, chatToTrajectory, trajectoryToChat, renderTrajectory,"
-      + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn,"
+      + " transcriptToTrajectory, trajectoryBack, trajScrollClick, trajScrollKey, trajToggleTurn, loadTrajectory,"
       + " sessMeta, autoGrowTermInput, clearStage, prBadgeHtml, hostCapHtml,"
       + " applyAgent, mergeSnapshot, sseClock: () => sseClock,"
       + " setCache: (c) => { cache = c; }, getCache: () => cache, setDraft: (t) => { renameDraft = t; },"
@@ -3741,6 +3741,27 @@ test("trajectory pane: a late answer for a session left behind does not overwrit
     for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
     assert.equal(page.els.trajScroll.innerHTML, shown, `late ${late ? late.status : "network error"} for A left B alone`);
   }
+});
+
+test("trajectory pane: a slow answer does not overwrite a refresh of the same session", async () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "A", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidA" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  let releaseSlow, calls = 0;
+  page.setGet((url) => {
+    if (!url.includes("/tidA/trajectory")) return null;
+    if (++calls === 1) return { json: () => null, then: (res) => { releaseSlow = () => res({ ok: false, status: 502, json: async () => ({}) }); } };
+    return { ok: false, status: 404, json: async () => ({ refused: { host: "nas", error: "too big" } }) };
+  });
+  page.selectSession("s1");
+  page.chatToTrajectory();
+  page.loadTrajectory("tidA", true);   // the ↻ Refresh
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  const shown = page.els.trajScroll.innerHTML;
+  assert.match(shown, /nas&rsquo;s last push/);
+  releaseSlow();
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(page.els.trajScroll.innerHTML, shown, "the stale 502 left the refreshed pane alone");
 });
 
 // --- Trajectory on the read-only stage (XERK-718) ----------------------------
