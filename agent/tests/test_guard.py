@@ -5809,6 +5809,13 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             guard._bare_cds(text)
         self.assertLess(time.process_time() - t, 1)
         self.assertEqual(guard._bare_cds("cd >/dev/null /etc; cd -"), "cd >/dev/null /etc; cd -")
+        # Past either cap a `cd` reads as bare (bash goes home after any number).
+        for cmd in ("HOME=/; cd" + " >a" * 9 + "; rm -rf etc",
+                    "HOME=/; cd >" + "a" * 300 + "; rm -rf etc"):
+            with self.subTest(cmd=cmd[:40]):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        self.assertEqual(guard._bare_cds("cd" + " >a" * 8 + " /tmp"), "cd" + " >a" * 8 + " /tmp")
+        self.assertEqual(guard._bare_cds("cd" + " >a" * 8), "cd $HOME" + " >a" * 8)
         # A spelled `cd` whose reading is too large denies, never raises.
         taken = "".join(chr(c) for c in range(0xE000, 0xF900))
         with self.assertRaises(guard._ExpansionTooLarge):

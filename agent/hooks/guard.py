@@ -8291,17 +8291,18 @@ def _bare_cds(text: str) -> str:
     pieces, last = [], 0
     for m in _BARE_CD_HEAD_RE.finditer(text):
         j, bare = m.end(), False
-        for _ in range(_BARE_CD_MAX_REDIRECTS):
+        for k in range(_BARE_CD_MAX_REDIRECTS + 1):
             r = _BARE_CD_REDIRECT_RE.match(text, j)
             if r is None:
                 bare = _BARE_CD_END_RE.match(text, j) is not None
+                break
+            if k == _BARE_CD_MAX_REDIRECTS:
+                bare = True     # more redirections than are walked
                 break
             j = r.end()
             if j < len(text) and text[j] not in " \t\n;&|()<>`":
                 bare = True     # a target past 256 characters
                 break
-        else:
-            bare = True
         if bare:
             pieces += [text[last:m.end()], " $HOME"]
             last = m.end()
