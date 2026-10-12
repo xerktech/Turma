@@ -90,6 +90,8 @@ This file is the operative rules for what has shipped.
     One it cannot place stands as itself; its forge lookup falls back to the blamed commit.
   - A revert line must be git's own (`This reverts commit <sha>.` alone on its line); a branch
     that reverts a commit and then reverts that revert reverts nothing (judged by chain parity).
+    A SQUASH message naming any commit off the default branch carried such a chain flattened
+    into one message, so it names no revert target at all (its parity cannot be read).
   - A commit git cannot read or diff (root, graft, timeout) is logged and SKIPPED, never retried
     forever: one commit must not stop a repo's scan.
   - Introducers map to MERGED PRs via the forge (GitHub `commits/<sha>/pulls`, GitLab

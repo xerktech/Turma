@@ -44413,6 +44413,24 @@ class TestDefectAttribution(unittest.TestCase):
         self.assertEqual([(r["fix"], [i["sha"] for i in r["introducers"]]) for r in reports],
                          [(fix, [m1])])
 
+    def test_a_squashed_revert_then_reapply_reverts_nothing(self):
+        x = self.commit({"lib.py": "v = 1\nw = 2\n"}, "XERK-1: add v")
+        self.git("switch", "-q", "-c", "b")
+        self.git("revert", "--no-edit", x)
+        r1 = self.git("rev-parse", "HEAD")
+        self.git("switch", "-q", "main")
+        # The squash of revert + re-apply + unrelated work, GitHub-style body.
+        self.commit({"other.py": "o\n"},
+                    f"XERK-4: feature (#51)\n\n* Revert\n\nThis reverts commit {x}.\n\n"
+                    f"* Reapply\n\nThis reverts commit {r1}.\n\n* XERK-4: feature")
+        self.assertEqual(self.scan()[1], [])
+
+    def test_an_unplaceable_blamed_commit_stands_as_itself(self):
+        self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"}, "XERK-2: fix b")
+        with mock.patch.object(ha, "_defect_landing", return_value=None):
+            _, reports = self.scan()
+        self.assertEqual([i["sha"] for i in reports[0]["introducers"]], [self.bad])
+
     def test_a_revert_line_must_be_gits_own(self):
         self.commit({"README": "hi\n"},
                     f"XERK-4: notes\n\nThis reverts commit {self.bad} was discussed")

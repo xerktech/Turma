@@ -8239,7 +8239,8 @@ def _defect_revert_targets(repo, sha, message, parents):
     merged as a PR with a merge commit carries the line on the MERGED branch's
     commits, not the merge's own message, so those are read too — and a target
     whose revert the same branch reverted again (revert, then re-apply) is net
-    nothing and dropped."""
+    nothing and dropped. A squash whose message names a commit off the default
+    branch carried such a chain and names nothing."""
     pairs = [(sha, t) for t in _REVERT_RE.findall(message or "")]
     if len(parents) > 1:
         rc, out = run_out(["git", "-C", repo, "rev-list", "-n", "50",
@@ -8263,8 +8264,16 @@ def _defect_revert_targets(repo, sha, message, parents):
         return stands[r]
     found = [t for t in dict.fromkeys(t for _, t in pairs)
              if any(standing(r) for r in by_target[t])]
-    return [t for t in found[:DEFECT_INTRODUCERS_MAX * 2]
-            if run_out(["git", "-C", repo, "merge-base", "--is-ancestor", t, parents[0]])[0] == 0]
+    found = found[:DEFECT_INTRODUCERS_MAX * 2]
+    ancestors = [t for t in found
+                 if run_out(["git", "-C", repo, "merge-base", "--is-ancestor", t, parents[0]])[0] == 0]
+    # A squash flattens a branch's whole chain into its one message: a line
+    # naming a commit that never reached the default branch is a revert the
+    # branch made and squashed away (revert, then re-apply), whose effect the
+    # message cannot show. Ambiguous, so the squash names no revert target.
+    if any(t not in ancestors for r, t in pairs if r == sha):
+        return []
+    return ancestors
 
 
 def _defect_landing(repo, sha, tip, first_parents):
