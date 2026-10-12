@@ -12124,13 +12124,16 @@ def _strip_pane_ellipsis(cell):
 def _row_label_matches(want_label, have_label):
     """Does a pane agent-list row's label name this launch?
 
-    An empty want matches anything; otherwise EITHER side may be the prefix —
+    An empty want matches anything, an empty have nothing; otherwise EITHER side may be the prefix —
     the TUI ellipsizes a long cell on a narrow window (XERK-130), and the
     launch's own description can itself be the shorter string. Shared by the
     Task/Agent lookup and the workflow-run lookup so a row resolves the same way
     whichever kind of background work it names."""
     if not want_label or have_label == want_label:
         return True
+    # A launch with no label names nothing: as a prefix it would match every row.
+    if not have_label:
+        return False
     return have_label.startswith(want_label) or want_label.startswith(have_label)
 
 

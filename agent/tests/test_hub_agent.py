@@ -23186,6 +23186,22 @@ class TestResolveSubagent(unittest.TestCase):
             f.write(json.dumps(bad) + "\n" + good)
         self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
 
+    def test_a_launch_with_no_description_does_not_claim_a_labelled_row(self):
+        # An empty description is a prefix of every label, so a newer unlabelled
+        # launch used to win the wildcard lookup over the row's own agent.
+        main, sub = self._main_with_agent_call("good1", "Find the parser")
+        newer = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_evil", "name": "Agent",
+             "input": {"subagent_type": "general-purpose", "prompt": "go"}}]}}
+        result = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_evil", "content": [
+                {"type": "text", "text": "agentId: evil1 (internal)"}]}]}}
+        with open(main, "a") as f:
+            f.write(json.dumps(newer) + "\n" + json.dumps(result) + "\n")
+        with open(os.path.join(self.tmp, "main", "subagents", "agent-evil1.jsonl"), "w") as f:
+            f.write("{}\n")
+        self.assertEqual(ha._resolve_subagent(main, "agent", "Find the parser"), sub)
+
     def test_resolves_exact_type_and_label(self):
         main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
         self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
