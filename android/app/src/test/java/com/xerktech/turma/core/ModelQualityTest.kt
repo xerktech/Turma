@@ -1,0 +1,77 @@
+package com.xerktech.turma.core
+
+import com.xerktech.turma.model.ModelQualityGroup
+import com.xerktech.turma.model.ModelQualityPr
+import com.xerktech.turma.model.ModelQualityRework
+import com.xerktech.turma.model.ModelQualityShadow
+import com.xerktech.turma.model.ModelQualityView
+import com.xerktech.turma.model.TurmaJson
+import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
+import org.junit.Test
+
+/** Ports of usage.html's `mq*` helpers (XERK-1849); each case mirrors the web test. */
+class ModelQualityTest {
+    private fun g(cls: String, model: String, sessions: Int = 0, good: Int = 0, bad: Int = 0) =
+        ModelQualityGroup(cls = cls, model = model, sessions = sessions, good = good, bad = bad)
+
+    @Test fun `bad rate counts only decided sessions`() {
+        assertNull(ModelQuality.badRate(g("bug", "opus", sessions = 5)))
+        assertEquals(0.25, ModelQuality.badRate(g("bug", "sonnet", good = 3, bad = 1))!!, 1e-9)
+        assertEquals("25%", ModelQuality.pct(0.25))
+        assertEquals("—", ModelQuality.pct(null))
+    }
+
+    @Test fun `the Opus column is the same class's Opus rate, absent for Opus itself`() {
+        val groups = listOf(g("bug", "opus", good = 7, bad = 1), g("bug", "sonnet", good = 1, bad = 1),
+            g("task", "haiku", good = 1))
+        val base = ModelQuality.baselines(groups)
+        assertEquals(0.125, ModelQuality.opusRate(groups[1], base)!!, 1e-9)
+        assertNull(ModelQuality.opusRate(groups[0], base))
+        assertNull(ModelQuality.opusRate(groups[2], base))
+    }
+
+    @Test fun `classes order by total sessions with Opus first inside each`() {
+        val out = ModelQuality.ordered(listOf(
+            g("story", "opus", sessions = 5), g("bug", "sonnet", sessions = 12),
+            g("bug", "opus", sessions = 3), g("bug", "haiku", sessions = 4)))
+        assertEquals(listOf("bug/opus", "bug/sonnet", "bug/haiku", "story/opus"), out.map { "${it.cls}/${it.model}" })
+    }
+
+    @Test fun `rework shadow and status read only what the hub serves`() {
+        val plain = g("bug", "sonnet")
+        assertEquals("—", ModelQuality.shadow(plain))
+        assertEquals("—", ModelQuality.status(plain))
+        assertEquals("baseline", ModelQuality.status(g("bug", "opus")))
+        assertFalse(ModelQuality.hasRework(listOf(plain)))
+        val served = plain.copy(rework = ModelQualityRework(qaPasses = 1.5, ciRounds = 2.0),
+            shadow = ModelQualityShadow(pairs = 23, candidateOnlyBad = 1), promotion = "candidate")
+        assertTrue(ModelQuality.hasRework(listOf(served)))
+        assertEquals("1.5", ModelQuality.median(served.rework?.qaPasses))
+        assertEquals("2", ModelQuality.median(served.rework?.ciRounds))
+        assertEquals("—", ModelQuality.median(Double.NaN))
+        assertEquals("23 · 1 worse", ModelQuality.shadow(served))
+        assertEquals("candidate", ModelQuality.status(served))
+    }
+
+    @Test fun `a PR link needs an http url`() {
+        assertEquals("#412" to "merged", ModelQuality.prLabel(ModelQualityPr("https://github.com/a/b/pull/412", "MERGED")))
+        assertNull(ModelQuality.prLabel(ModelQualityPr("javascript:alert(1)")))
+        assertEquals("pending", ModelQuality.outcomeOf("weird"))
+    }
+
+    @Test fun `the hub's answer decodes, no-change included, extra fields ignored`() {
+        val v = TurmaJson.decodeFromString<ModelQualityView>(
+            """{"windowDays":90,"groups":[{"cls":"bug","model":"opus","sessions":3,"good":1,"bad":1,"pending":0,
+              "no-change":1,"undelivered":0,"reasons":{"reopened":1},"future":true}],
+              "rows":[{"key":"x","site":"s","issue":"A-1","host":"h","sid":"s1","cls":"bug","model":"opus",
+              "firstSeen":1,"updatedAt":2.5,"outcome":"bad","reason":"reopened",
+              "prs":[{"url":"https://x/pull/1","state":"MERGED","mergedAt":3}]}]}""")
+        assertEquals(1, v.groups[0].noChange)
+        assertEquals("1 no change", ModelQuality.other(v.groups[0]))
+        assertEquals("A-1", v.rows[0].issue)
+        assertEquals(1, v.rows[0].prs.size)
+    }
+}

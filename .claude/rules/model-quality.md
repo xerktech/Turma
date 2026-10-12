@@ -5,6 +5,9 @@ paths:
   - "turma/tests/outcome-ledger.test.js"
   - "turma/server.js"
   - "docs/model-quality-adr.md"
+  - "turma/public/usage.html"
+  - "android/app/src/main/java/com/xerktech/turma/**/ModelQuality.kt"
+  - "android/app/src/main/java/com/xerktech/turma/ui/UsageModelQuality.kt"
 ---
 
 # Model quality loop — the outcome ledger (XERK-1839, epic XERK-1844)
@@ -73,3 +76,18 @@ This file is the operative rules for what has shipped.
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
 - Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:` cases in
   `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`.
+
+## The report (XERK-1849): Usage page "Model quality" card, web + Android
+
+- A card on `/usage` (`modelQualityCardHtml`) and Android's Usage screen (`ModelQualitySection`,
+  ports in `core/ModelQuality.kt`) — its OWN fetch, never `/api/agents`, like the permission card.
+- **Groups are fleet-wide whatever the header picks**; only the session drill-down follows it, and
+  only when the filter resolves to EXACTLY one org (`TurmaOrg.get()` / `scope().singleOrNull()`),
+  since the route serves rows for one named org. Several or none → "Pick one org…".
+- **Bad rate = bad ÷ (good + bad)**; pending, no-change and undelivered say nothing about code
+  quality. The Opus column is that class's Opus bad rate (the baseline), never a fleet average.
+- **Fields the later seams serve, read by both clients when present** (absent = column hidden,
+  not a column of dashes): per group `rework: {qaPasses, ciRounds}` medians (XERK-1845),
+  `shadow: {pairs, candidateOnlyBad}` (XERK-1847), `promotion` string (XERK-1848). A seam that
+  names them differently must change both clients in the same PR.
+- Tests: the `XERK-1849:` cases in `usage.test.js`; android `ModelQualityTest`.

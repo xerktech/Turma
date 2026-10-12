@@ -432,6 +432,15 @@ interface HubApi {
         @Query("org") org: String?,
     ): Response<com.xerktech.turma.model.PermissionSummary>
 
+    // The outcome ledger's report (XERK-1839): per (work class, model) outcome
+    // counts, fleet-wide. `org` + `rows=1` adds that ONE org's session rows; both
+    // null = groups only. Its own call, never the atomic /api/agents decode.
+    @GET("api/model-quality")
+    suspend fun modelQuality(
+        @Query("org") org: String?,
+        @Query("rows") rows: Int?,
+    ): Response<com.xerktech.turma.model.ModelQualityView>
+
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.
     @POST("api/jira/{siteKey}/autostart")

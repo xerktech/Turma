@@ -107,7 +107,7 @@ function loadHelpers(fetchReply = null) {
     TurmaNav: { preserveScroll: (el, paint) => { scrollCalls.push(el); paint(); } },
     // Indirected through `orgFilter` so a test can narrow the page the way the
     // header's org control does, and check what each section was rendered from.
-    TurmaOrg: { get: () => "", getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
+    TurmaOrg: { get: () => (orgKeys.length === 1 ? orgKeys[0] : ""), getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
       update: (d) => { if (orgHooks) orgHooks.update(d); }, filter: (a) => orgFilter(a),
       subscribe: noop, sse: noop, orgColors: () => ({}) },
     TurmaBoard: { orgName: (k) => k, orgColorMap: () => ({}) },
@@ -121,6 +121,7 @@ function loadHelpers(fetchReply = null) {
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
     hostLabel, hostSeries, repoSeries,
     applyAgent, connectSSE, refresh, mergeSnapshot,
+    modelQualityCardHtml, refreshModelQuality, mqBadRate, mqOrdered, getMqView: () => mqView,
     permissionsCardHtml, refreshPermissions, getPermView: () => permView, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
@@ -1639,4 +1640,76 @@ test("XERK-1563: on a phone the card reflows to blocks, not a sideways-scrolling
   // Prose subjects wrap at word boundaries; only commands may break mid-token.
   assert.doesNotMatch(src, /\.perm-subj \{[^}]*break-all/);
   assert.match(src, /\.perm-subj\.cmd \{[^}]*overflow-wrap: anywhere;/);
+});
+
+// --- Model quality (XERK-1849) ---------------------------------------------------
+const MQ_NOW = Date.UTC(2026, 9, 12);
+const mqG = (o) => Object.assign({ cls: "bug", model: "opus", sessions: 0, good: 0, bad: 0, pending: 0,
+  "no-change": 0, undelivered: 0, reasons: {} }, o);
+
+test("XERK-1849: bad rate counts only decided sessions; Opus column is the class's Opus rate", () => {
+  assert.equal(H.mqBadRate(mqG({ pending: 4 })), null);
+  assert.equal(H.mqBadRate(mqG({ good: 3, bad: 1 })), 0.25);
+  const html = H.modelQualityCardHtml({ windowDays: 90, groups: [
+    mqG({ model: "opus", sessions: 8, good: 7, bad: 1 }),
+    mqG({ model: "sonnet", sessions: 2, good: 1, bad: 1 }),
+    mqG({ cls: "task", model: "haiku", sessions: 1, good: 1 }),
+  ] }, MQ_NOW);
+  const row = (m) => html.split("<tr").find((r) => r.includes(`mq-model">${m}<`));
+  assert.match(row("sonnet"), /data-label="Bad rate">50%</);
+  assert.match(row("sonnet"), /data-label="Opus">13%</);
+  // Opus itself, and a class with no Opus session, show no baseline figure.
+  assert.match(row("opus"), /mq-na" data-label="Opus">—</);
+  assert.match(row("haiku"), /mq-na" data-label="Opus">—</);
+  assert.match(row("opus"), /data-label="Status">baseline</);
+});
+
+test("XERK-1849: classes order by total sessions, Opus first inside each", () => {
+  const out = H.mqOrdered([mqG({ cls: "story", sessions: 5 }), mqG({ model: "sonnet", sessions: 12 }),
+    mqG({ sessions: 3 }), mqG({ model: "haiku", sessions: 4 })]);
+  assert.deepEqual(out.map((g) => `${g.cls}/${g.model}`), ["bug/opus", "bug/sonnet", "bug/haiku", "story/opus"]);
+});
+
+test("XERK-1849: rework and shadow columns appear only once the hub serves them", () => {
+  const plain = H.modelQualityCardHtml({ groups: [mqG({ model: "sonnet", sessions: 1 })] }, MQ_NOW);
+  assert.doesNotMatch(plain, /QA passes|Shadow pairs/);
+  const served = H.modelQualityCardHtml({ groups: [mqG({ model: "sonnet", sessions: 1,
+    rework: { qaPasses: 1.5, ciRounds: 2 }, shadow: { pairs: 23, candidateOnlyBad: 1 }, promotion: "candidate" })] }, MQ_NOW);
+  assert.match(served, /data-label="QA passes">1.5</);
+  assert.match(served, /data-label="CI rounds">2</);
+  assert.match(served, /data-label="Shadow pairs">23 · 1 worse</);
+  assert.match(served, /data-label="Status">candidate</);
+});
+
+test("XERK-1849: session rows show only for one org, escaped, PR links http only", () => {
+  const view = { groups: [mqG({ sessions: 1, bad: 1 })], rows: [{ issue: "A-1", cls: "bug", model: "opus",
+    outcome: "bad", reason: "reopened", host: "<b>h</b>", updatedAt: MQ_NOW - 3600e3,
+    prs: [{ url: "https://github.com/a/b/pull/7", state: "MERGED" }, { url: "javascript:alert(1)" }] }] };
+  assert.match(H.modelQualityCardHtml(view, MQ_NOW, ""), /Pick one org in the header/);
+  const html = H.modelQualityCardHtml(view, MQ_NOW, "acme.atlassian.net", true);
+  assert.match(html, /<details class="table-view mq-rows-view" open>/);
+  assert.match(html, /mq-outcome o-bad/);
+  assert.match(html, /&lt;b&gt;h&lt;\/b&gt;/);
+  assert.match(html, /href="https:\/\/github.com\/a\/b\/pull\/7"[^>]*>#7<\/a> merged/);
+  assert.doesNotMatch(html, /javascript:/);
+});
+
+test("XERK-1849: the card asks for rows only when exactly one org applies", async () => {
+  const saved = orgKeys;
+  try {
+    for (const [keys, want] of [[[], "/api/model-quality"], [["a", "b"], "/api/model-quality"],
+      [["acme"], "/api/model-quality?org=acme&rows=1"]]) {
+      orgKeys = keys;
+      const H6 = loadHelpers(() => ({ windowDays: 90, groups: [] }));
+      await H6.refreshModelQuality();
+      assert.ok(H6.fetches.includes(want), `${keys}: ${H6.fetches}`);
+      assert.deepEqual(H6.getMqView(), { windowDays: 90, groups: [] });
+    }
+  } finally { orgKeys = saved; }
+});
+
+test("XERK-1849: a failed first read says why rather than loading forever", async () => {
+  const H7 = loadHelpers(Object.assign(() => ({}), { httpStatus: (u) => (u.includes("model-quality") ? 503 : 0) }));
+  await H7.refreshModelQuality();
+  assert.match(H7.els.modelQuality.innerHTML, /Could not load model quality \(HTTP 503\)/);
 });
