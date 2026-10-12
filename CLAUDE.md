@@ -47,6 +47,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `turma-ha-store.md` | `turma/store.js`, `ha-config.js` | HA shared store + config |
 | `turma-oidc.md` | `turma/server.js` | OIDC relying-party core: code+PKCE, discovery, JWKS RS256, session cookie, RP-logout |
 | `turma-break-glass.md` | `turma/server.js`, `turma/public/login.html` | IdP-independent break-glass local login; invariants a mandatory-OIDC change must keep |
+| `model-quality.md` | `turma/outcome-ledger.js`, `turma/server.js` | outcome ledger (XERK-1839): per-ticket-session model + outcome, fleet-wide evidence; plan `docs/model-quality-adr.md` |
 | `turma-usage.md` | `turma/public/usage.html`, `usage-ledger.js` | token chart, durable ledger, sub-agent split, limit cards, ingest coercions |
 | `turma-permissions.md` | `permission-ledger.js`, `usage.html`, `server.js` | permission ledger (hub half) |
 | `turma-attention.md` | `server.js`, sessions/dashboard pages + ports | session attention states |

@@ -15,8 +15,9 @@ paths:
 **OFF by default — both the ladder and the sub-agent default.** The ladder's only failure signal is
 "delivered nothing" (no PR, no close): it cannot tell a wrong PR from a right one, so a cheap
 model's plausible-but-wrong PR never escalates, and the sub-agent default put QA itself on the
-cheap model. Keep both off until a per-ticket quality signal exists (XERK-1839); don't flip a
-default back on from bench solve rates alone — those grade known past fixes, not new tickets.
+cheap model. Keep both off: the per-ticket quality signal (the outcome ledger, XERK-1839,
+`model-quality.md`) now exists, and the ladder is to be REPLACED by the evidence-gated routing
+policy (XERK-1848), never flipped back on from bench solve rates alone.
 
 When on (`TICKET_MODEL_LADDER=on`): an UNPINNED claude ticket session starts on haiku; each start
 after a session of that ticket ENDED UNDELIVERED runs one tier up (haiku → sonnet → opus, capped).
