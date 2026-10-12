@@ -49,9 +49,11 @@ paths:
   - The strip lost busybox ITSELF as a `-c` shell (`busybox script -qc '…'`), so `_expand`
     adds a reading of the words from `busybox` on with it as `sh`. Keep both: an applet-only
     added reading (no strip) lost the pipe readers; the strip alone lost `-c` (3 QA passes).
-  - `toybox`, `busybox.static` and `busybox-static` are read as `busybox` (`_basename`'s
-    `_MULTICALL_ALIASES`), so every rule above reaches them; the raw-text shell regexes list
-    them too. Unmapped, `toybox rm -rf /etc` ran (rollup XERK-1701).
+  - Any name STARTING with `busybox` or `toybox` is read as `busybox` (`_basename`,
+    `_MULTICALL_PREFIXES`): both binaries dispatch on that prefix, and the shipped files are
+    `toybox-x86_64`, `busybox.static`. Exact names only let `toybox-x86_64 rm -rf /etc` run.
+    - `_CMD_START` takes one as a wrapper word, so `cat a.sh | busybox sh` is a stdin shell
+      for the write-then-run rule (was allowed on main). Rollup XERK-1701.
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top

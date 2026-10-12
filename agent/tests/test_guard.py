@@ -6198,7 +6198,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "toybox rm -rf /etc", "/bin/toybox rm -rf /etc", "busybox.static rm -rf /etc",
                     "busybox-static rm -rf /etc", 'toybox rm -rf "$x/$y"',
                     "toybox sh -c 'rm -rf /etc'", "echo 'rm -rf /etc' | toybox sh",
-                    "echo 'rm -rf /etc' | busybox-static hush"):
+                    "echo 'rm -rf /etc' | busybox-static hush",
+                    # Both dispatch on any name STARTING with theirs (the shipped files).
+                    "toybox-x86_64 rm -rf /etc", "busybox-x86_64 rm -rf /etc", "busybox1 rm -rf /etc",
+                    "toybox.static rm -rf /etc", "echo 'rm -rf /etc' | toybox-x86_64 sh",
+                    'busybox-x86_64 rm -rf "$a/$b"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
@@ -6209,6 +6213,19 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     'toybox rm -rf "$dir"/build'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_a_written_file_piped_into_a_multicall_shell_is_read(self):
+        # `| busybox sh` is a shell reading stdin, as `| sh` is; the write-then-run
+        # rule only knew it when busybox itself was the shell word.
+        for cmd in ("echo 'rm -rf /etc' > a.sh; cat a.sh | busybox sh",
+                    "echo 'rm -rf /etc' > b.sh; cat b.sh | toybox-x86_64 sh",
+                    "shopt -s nullglob; echo x | toybox-x86_64 sh"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        for cmd in ("echo hi | busybox sh", "cat notes.md | busybox wc -l",
+                    "busybox-static tar -xzf a.tgz", "echo toybox rm -rf /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
     def test_a_target_built_from_home_is_read_with_the_real_home(self):
         # XERK-1656: `$HOME`, `~` and `${HOME<op>}` are expanded against the
