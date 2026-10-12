@@ -8317,8 +8317,11 @@ def _defect_tracker_classes(keys):
             try:
                 data = jira_get(f"/rest/api/3/issue/{urllib.parse.quote(k)}",
                                 {"fields": "issuetype"})
-            except urllib.error.HTTPError as e:
-                if e.code in (403, 404):
+            except (BoardHttpError, urllib.error.HTTPError) as e:
+                # jira_get re-raises as BoardHttpError. A key Jira refuses
+                # outright (no such issue, another project, malformed) is no bug
+                # ticket; retrying it would stall the repo's scan for good.
+                if getattr(e, "code", None) in (400, 403, 404):
                     out[k] = "other"
                     continue
                 raise
