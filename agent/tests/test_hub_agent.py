@@ -44100,6 +44100,46 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
         self.assertEqual(rec["qaRuns"][0]["verdict"], "PASS")
         self.assertTrue(rec["qaPartial"])
 
+    def test_a_fresh_launch_pre_primes_its_scan_and_a_resume_does_not(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "agentType": "claude"}
+        with mock.patch.object(sm, "_launch_dsh", side_effect=RuntimeError("stop")), \
+                mock.patch.object(sm, "_launch_qwen", side_effect=RuntimeError("stop")):
+            for resume in (False, True):
+                sm.sess_state.pop("s1", None)
+                try:
+                    sm._launch_tmux(dict(sess, agentType="dsh"), resume=resume)
+                except RuntimeError:
+                    pass
+                self.assertEqual("s1" in sm.sess_state, not resume)
+        self.assertEqual(sm.sess_state.get("s1"), None)
+
+    def test_qa_partial_sticks_and_rides_both_wires(self):
+        sm = self.make_manager()
+        sess = {"id": "s1", "status": "running", "repo": "r", "worktreePath": self.tmp,
+                "tmuxName": "agent-s1"}
+        sm.registry = [sess]
+        sig = {"prUrls": [], "qaPartial": True,
+               "qaRuns": [{"key": "t1", "agent": "qa", "verdict": None}]}
+        with mock.patch.object(ha, "session_report", return_value=dict(sig)), \
+                mock.patch.object(sm, "save"):
+            p = sm._session_payload(sess)
+        self.assertIsNotNone(p["session"], "the probe ran")
+        self.assertTrue(sess["qaPartial"])
+        self.assertTrue(p["qaPartial"])
+        self.assertEqual(p["qaRuns"], [{"agent": "qa", "verdict": None}])
+        self.assertNotIn("qaPartial", p["session"] or {})
+        with mock.patch.object(ha, "session_report", return_value={"prUrls": []}), \
+                mock.patch.object(sm, "save"):
+            p = sm._session_payload(sess)
+        self.assertIsNotNone(p["session"], "the probe ran")
+        self.assertTrue(p["qaPartial"], "sticky across beats")
+        with mock.patch.object(sm, "_session_transcript_id", return_value=None), \
+                mock.patch.object(sm, "_remember_prs"), mock.patch.object(sm, "save"):
+            sm._remember_closed(sess)
+        self.assertTrue(sm.closed[-1]["qaPartial"])
+        self.assertTrue(sm._closed_payload()[0]["qaPartial"])
+
     def test_closed_payload_carries_model_actual_and_qa_runs(self):
         sm = self.make_manager()
         sm.closed = [{"id": "s1", "repo": "r", "modelActual": "claude-sonnet-5-5",

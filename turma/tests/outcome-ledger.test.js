@@ -388,3 +388,12 @@ test("XERK-1845: a merge time before the session started is junk; the commit is 
   L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "MERGED", mergeCommit: "bbbbbbb" }] })], T0 + 2 * DAY);
   assert.equal(only().prs[0].mergeCommit, "aaaaaaa");
 });
+
+test("XERK-1845: a future merge time is junk too", () => {
+  L._internals.reset();
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "MERGED", mergedAt: "2027-10-01T00:00:00Z" }] })], T0 + DAY);
+  assert.equal(only().prs[0].mergedAt, T0 + DAY);
+  // ...and an earlier-than-sighting but still-future one never replaces it.
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "MERGED", mergedAt: "2026-12-01T00:00:00Z" }] })], T0 + 2 * DAY);
+  assert.equal(only().prs[0].mergedAt, T0 + DAY);
+});

@@ -24489,6 +24489,18 @@ test("XERK-1845: a closed session is credited to the model that answered, with i
   const g = v.body.groups.find((x) => x.model === "sonnet");
   assert.deepEqual(g.rework.qaRuns, { median: 3, n: 1 });
   assert.deepEqual(g.rework.ciRounds, { median: 2, n: 1 });
+  // qaPartial rides heartbeat coercion into the ledger: the row is incomplete
+  // and left out of the QA median; a non-true value is dropped.
+  c.qaPartial = true;
+  const junkPartial = { closedSessions: [{ id: "y", qaPartial: "yes" }] };
+  hub.normalizeClosedSessions(junkPartial);
+  assert.ok(!("qaPartial" in junkPartial.closedSessions[0]));
+  hub.normalizeClosedSessions(agents["ol-rw"]);
+  hub.outcomeLedgerSweep();
+  const [r2] = [...hub.outcomeLedger._internals.rows().values()];
+  assert.equal(r2.qa.incomplete, true);
+  const v2 = await request("GET", "/api/model-quality", { headers: userHeaders });
+  assert.equal(v2.body.groups.find((x) => x.model === "sonnet").rework.qaRuns, undefined);
   // A non-string modelActual and a non-list qaRuns drop (an older agent's "can't tell").
   const bad = { closedSessions: [{ id: "x", modelActual: { a: 1 }, qaRuns: "PASS" }] };
   hub.normalizeClosedSessions(bad);
