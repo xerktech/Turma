@@ -17,6 +17,11 @@ paths:
   (`${HOME:+}`, `${HOME#/root}`, `${HOME[1]}`): `_empties_a_set_path` WHITELISTS the safe
   operators — a pattern blacklist missed literal patterns equal to HOME; a name not directly before `/` is left
   alone (`"$x"*`, `"$d".bak` stay relative).
+- `${HOME@a}` is HOME's attributes, empty once HOME is not exported (`export -n HOME`), so it is
+  the one `@` transform `_empties_a_set_path` reads as empty.
+- A last component globbing `..` (`/.*`, `/etc/.?`) is judged on its parent for every walker but
+  GNU rm (`keep_last=False`): bash before 5.2 globs `/..`, and only rm refuses `..`.
+  Accepted over-deny: `chmod -R 700 ~/.ssh/.*` (it is `chmod -R 700 ~` there).
 - Match the names on the token BEFORE `_norm_path`: normpath folds `"$x"/../etc` to `etc`
   and hid the bypass; the remainder is normalised by `_is_dangerous_path` itself.
 - A `${…}` with an operator is empty too (`"${dir%/}"/*`, `${x:+$x}`); only a length

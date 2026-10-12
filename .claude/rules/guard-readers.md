@@ -20,6 +20,8 @@ paths:
 - Feeds `_reader_feeds` adds beyond here-strings, `< <(…)` and piped echoes:
   - `yes WORDS`, `/bin/echo`, `'echo'`, and a producer an expansion spells (`$(echo echo) WORDS`)
     read as `echo WORDS`.
+  - A printf (`/usr/bin/printf`, or spelled: `e=printf; $e '%s\n' …`) is also read without its
+    format word (`unformatted`): as an echo only, the format bound the reader's program.
   - A bare `$a` with no words (a group closer `)`/`}` is none) is NO producer: read as `echo` it bound a reader to "" and that
     empty value hid main's own deny of `exec 3<<E … read -u 3 a; $a` (XERK-1658 QA).
   - A "blind" reader (`-u FD`, `< file`, `0< file`, in a group `done < f`, after `exec < f`) gets

@@ -5822,6 +5822,91 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
 
+    def test_rollup_batch_four_shapes(self):
+        # Rollup XERK-1584: each of these was allowed while bash ran the
+        # destructive command (or, for `/.*`, globbed `/..` before bash 5.2).
+        for cmd in ("xargs $x rm -rf /etc </dev/null",
+                    "xargs -n 1 $x rm -rf /etc </dev/null",
+                    "$(false || echo rm -rf /etc | xargs echo)",
+                    "$(false || echo rm -rf /etc | xargs)",
+                    "e=printf; $e '%s\\n' 'rm -rf /etc' > f; read a < f; $a",
+                    "e=printf; $e -- '%s\\n' 'rm -rf /etc' > f; read a < f; $a",
+                    "export -n HOME; rm -rf \"${HOME@a}\"/etc",
+                    "chmod -R 777 /.*", "chown -R x /.*", "chmod -R 777 /etc/.?",
+                    "rm --no-preserve-root -rf /.*",
+                    "HOME=/; cd --; rm -rf etc", "HOME=/; cd -P; rm -rf etc",
+                    "HOME=/; cd >/dev/null; rm -rf etc", "HOME=/; cd 2>&1; rm -rf etc",
+                    "HOME=/; \"cd\"; rm -rf etc", "HOME=/; c\\d; rm -rf etc",
+                    "HOME=/; eval 'cd; rm -rf etc'",
+                    "export HOME=/; bash -c 'cd; rm -rf etc'"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        for cmd in ("N=$[ $(nproc || echo 2) + 1 ]; make -j$N",
+                    "make -j$[ $(nproc || echo 2) + 1 ]",
+                    "printf '%s\\n' a b | xargs echo", "find . -name '*.o' | xargs $RM",
+                    "rm -rf \"${HOME@Q}\"/x", "chmod -R 755 ./build/.*",
+                    "rm -rf /tmp/w/.*", "cd; rm -rf build", "cd >/dev/null && rm -rf build",
+                    "cd -- && rm -rf node_modules", "bash -c 'cd; rm -rf build'"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        # Each `cd` is walked a bounded number of redirections on: a lookahead
+        # rescanned a `cd >'cd >'cd …` chain per `cd` (720s on 250 KB, QA).
+        t = time.process_time()
+        for text in ("cd " + ">a1" * 20000 + " x", "cd" + " -P" * 10000 + " q",
+                     "HOME=/; cd " + ">'cd " * 20000 + "x", "cd > cd " * 20000 + " x",
+                     "cd >{cd " * 20000, 'cd >"cd ' * 20000, "cd <<<'cd " * 20000,
+                     "cd >$(cd " * 20000, "cd < <(cd " * 20000,
+                     # Glued, every `cd` starts a walk: quadratic without the cap.
+                     "cd" + ">{cd" * 2500):
+            guard._bare_cds(text)
+        self.assertLess(time.process_time() - t, 3)
+        self.assertEqual(guard._bare_cds("cd >/dev/null /etc; cd -"), "cd >/dev/null /etc; cd -")
+        # Past either cap a `cd` reads as bare (bash goes home after any number).
+        for cmd in ("HOME=/; cd" + " >a" * 9 + "; rm -rf etc",
+                    "HOME=/; cd >" + "a" * 300 + "; rm -rf etc"):
+            with self.subTest(cmd=cmd[:40]):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        self.assertEqual(guard._bare_cds("cd" + " >a" * 8 + " /tmp"), "cd" + " >a" * 8 + " /tmp")
+        self.assertEqual(guard._bare_cds("cd" + " >a" * 8), "cd $HOME" + " >a" * 8)
+        # Input redirections leave it bare too: a here-string, heredoc or `<>`.
+        for cmd in ("HOME=/; cd <<<x; rm -rf etc", "HOME=/; cd <<E\nx\nE\nrm -rf etc",
+                    "HOME=/; cd <<-E\nx\nE\nrm -rf etc", "HOME=/; cd <>f; rm -rf etc",
+                    "HOME=/; cd 0<>f; rm -rf etc", "HOME=/; cd >/dev/null <<<x; rm -rf etc",
+                    "HOME=/; bash -c 'cd <<<x; rm -rf etc'",
+                    # A target it cannot read (quoted, expanded, substituted) is bare too.
+                    "HOME=/; cd <<<'a b'; rm -rf etc", "HOME=/; cd <<<\"$x y\"; rm -rf etc",
+                    "HOME=/; cd <<<$(echo a b); rm -rf etc", "HOME=/; cd <<<`echo a`; rm -rf etc",
+                    "HOME=/; cd < <(true); rm -rf etc", "HOME=/; cd >'a b'; rm -rf etc",
+                    "HOME=/; cd >$(echo f); rm -rf etc",
+                    "HOME=/; cd <<<$x; rm -rf etc", "HOME=/; cd >a\\ b; rm -rf etc",
+                    # An option after a redirection, a comment, a continuation.
+                    "HOME=/; cd 2>/dev/null --; rm -rf etc", "HOME=/; cd >/dev/null -P; rm -rf etc",
+                    "HOME=/; cd # home\nrm -rf etc", "HOME=/; cd >/dev/null # h\nrm -rf etc",
+                    "HOME=/; cd \\\n>/dev/null; rm -rf etc",
+                    "HOME=/; cd <<<${x:-a b}; rm -rf etc", "HOME=/; cd -P\\\n; rm -rf etc",
+                    # An option bash dequotes is still an option.
+                    "HOME=/; cd '-P'; rm -rf etc", "HOME=/; cd -P''; rm -rf etc",
+                    "HOME=/; cd \\-P; rm -rf etc", "HOME=/; cd $'-P'; rm -rf etc",
+                    "HOME=/; cd >/dev/null '--'; rm -rf etc",
+                    "HOME=/; cd -P{,}; rm -rf etc", "HOME=/; cd '-e'; rm -rf etc",
+                    "HOME=/; bash -c 'cd <<<\"a b\"; rm -rf etc'",
+                    "HOME=/; cd >" + "a" * 100 + "; rm -rf etc"):
+            with self.subTest(cmd=cmd[:40]):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        for cmd in ("HOME=/; cd <<<x /tmp; rm -rf etc", "HOME=/; cd <>f /tmp; rm -rf etc",
+                    "HOME=/; cd \\\n/tmp; rm -rf etc", "HOME=/; cd ''; rm -rf etc",
+                    'f(){ cd "$@" && rm -rf *; }; f /tmp/x',
+                    'HOME=/; f(){ cd "$@"; rm -rf etc; }; f /tmp',
+                    "HOME=/; cd >" + "a" * 100 + " /tmp; rm -rf etc"):
+            with self.subTest(cmd=cmd[:40]):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
+        # A spelled `cd` whose reading is too large denies, never raises.
+        taken = "".join(chr(c) for c in range(0xE000, 0xF900))
+        with self.assertRaises(guard._ExpansionTooLarge):
+            guard._home_tilde_readings("HOME=/; c\\d; echo {x'" + taken + "',${HOME}}")
+        self.assertEqual(guard.decide("Bash", {"command": "HOME=/; c\\d; echo {x'" + taken
+                                               + "',${HOME}}"}, cwd="/tmp")[0], "deny")
+
     def test_a_filtered_or_unread_body_runs_as_its_producers_text(self):
         # XERK-1613: a here-string producer, a rewriting filter, or an unread
         # statement left the body opaque while bash ran its output.
@@ -7200,6 +7285,18 @@ class TestPrSummary(unittest.TestCase):
                 self.assertTrue(guard._heading_present(body, "why"))
         self.assertFalse(guard._heading_present("##\nWhy", "why"))
         self.assertTrue(guard._PR_SUMMARY_LINE.search("x\n\r**Summary:** y"))
+
+    def test_a_template_deny_names_its_headings_capped(self):
+        # Rollup XERK-1584: the reason echoed every missing heading whole.
+        os.makedirs(os.path.join(self.repo, ".github"))
+        heads = ["## " + "L" * 5000] + [f"## H{i}" for i in range(20)]
+        with open(os.path.join(self.repo, ".github", "pull_request_template.md"), "w") as fh:
+            fh.write("\n".join(heads) + "\n")
+        reason = self.reason("gh pr create -t t --body x")
+        self.assertIn("L" * 80 + "…", reason)
+        self.assertNotIn("L" * 81, reason)
+        self.assertIn("H10, and 9 more", reason)
+        self.assertLess(len(reason), 1200)
 
     def test_a_fifo_body_file_or_template_never_hangs_the_hook(self):
         os.mkfifo(os.path.join(self.repo, "body.fifo"))

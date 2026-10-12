@@ -45,6 +45,18 @@ paths:
   - `_home_tilde_reading` adds a reading with every word-start `~` (and a bare `cd`) as `$HOME`
     when the raw text holds `HOM`, `OME` or `eval` (`HOM{E,}`, `H\OME`, `x=OME; …H$x`).
     `~+` always reads as `$PWD`.
+  - A `cd` reads as bare (`_bare_cds`, rollup XERK-1584) unless a PLAIN word follows its options,
+    redirections (`<<<`, `<<`, `<>` too) and `\`-newlines, in any order: a comment, an operator or
+    the end is bare (`cd 2>/dev/null --`, `cd # x`). Also spelled (`"cd"`, `c\d`) or opening a
+    quoted script (`bash -c 'cd; …'`).
+    - It walks 8 of them, targets up to 256 chars; a 9th, a longer target, or one it cannot read
+      (quoted, `$`, `\`, `$(…)`, `<(…)`) reads as bare. Accepted over-read when an operand follows.
+    - Positive evidence on purpose: each "this ends a bare cd" list missed a spelling (4 QA passes).
+    - A word bash dequotes to an option (`'-P'`, `-P''`, `\-P`, `$'-P'`) is walked past.
+    - A word that may expand to nothing (`$1`, `"$@"`, an unset `$d`) stays an operand, as for rm
+      targets; `cd $1; rm -rf *` going home is XERK-1865 (a policy call: over-denies).
+  - Never a lookahead regex there: one rescanned a `cd >'cd >'cd …` chain per `cd`, 720s on
+    250 KB through the hook, past its timeout (which RUNS the command).
   - `~-` reads as `$OLDPWD`, and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD` (XERK-1696);
     `_under_cwd` reads `$OLDPWD` as `$PWD`: any directory the line visited, unordered.
   - A line that assigns PWD/OLDPWD AND moves (`cd`/`pushd`/`popd`) is also read with both
