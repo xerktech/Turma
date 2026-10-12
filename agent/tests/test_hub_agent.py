@@ -44360,6 +44360,13 @@ class TestDefectAttribution(unittest.TestCase):
         _, reports = self.scan()
         self.assertEqual([(r["fix"], [i["sha"] for i in r["introducers"]]) for r in reports],
                          [(fix, [m1])])
+        # A forge that maps only the branch commit (not the merge) still names the PR.
+        branch = self.git("rev-parse", "pr1~1")
+        url = "https://github.com/o/r/pull/1"
+        with mock.patch.object(ha, "_defect_commit_prs",
+                               side_effect=lambda forge, c: [url] if c == branch else []):
+            _, reports = self.scan()
+        self.assertEqual(reports[0]["introducers"][0]["prs"], [url])
 
     def test_a_branch_that_reverts_then_reapplies_reverts_nothing(self):
         x = self.commit({"lib.py": "v = 1\n"}, "XERK-1: add v")
@@ -44371,6 +44378,40 @@ class TestDefectAttribution(unittest.TestCase):
         self.git("switch", "-q", "main")
         self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #5 from o/feat", "feat")
         self.assertEqual([r for r in self.scan()[1] if r["kind"] == "revert"], [])
+
+    def test_an_odd_revert_chain_still_reverts(self):
+        x = self.commit({"lib.py": "v = 1\n"}, "XERK-1: add v")
+        self.git("switch", "-q", "-c", "feat")
+        self.git("revert", "--no-edit", x)
+        r1 = self.git("rev-parse", "HEAD")
+        self.git("revert", "--no-edit", r1)
+        self.git("revert", "--no-edit", self.git("rev-parse", "HEAD"))
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #6 from o/feat", "feat")
+        reverts = [r for r in self.scan()[1] if r["kind"] == "revert"]
+        self.assertEqual([[i["sha"] for i in r["introducers"]] for r in reverts], [[x]])
+
+    def test_landing_ignores_a_skewed_commit_date(self):
+        def at(t):
+            return {"GIT_COMMITTER_DATE": f"2026-01-01T{t}Z"}
+        self.git("switch", "-q", "-c", "pr1")
+        self.commit({"lib.py": "v = 1\n"}, "XERK-1: add v")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1 from o/pr1", "pr1",
+                 env=at("01:00:00"))
+        m1 = self.git("rev-parse", "HEAD")
+        self.git("switch", "-q", "-c", "side")
+        self.git("commit", "-q", "--allow-empty", "-m", "side", env=at("05:00:00"))
+        self.git("switch", "-q", "main")
+        # A first-parent commit whose clock ran early: date order puts it ahead
+        # of the real landing merge.
+        self.git("commit", "-q", "--allow-empty", "-m", "skewed", env=at("00:05:00"))
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #2 from o/side", "side",
+                 env=at("06:00:00"))
+        fix = self.commit({"lib.py": "v = 2\n"}, "XERK-2: fix v")
+        _, reports = self.scan()
+        self.assertEqual([(r["fix"], [i["sha"] for i in r["introducers"]]) for r in reports],
+                         [(fix, [m1])])
 
     def test_a_revert_line_must_be_gits_own(self):
         self.commit({"README": "hi\n"},

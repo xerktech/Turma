@@ -85,11 +85,11 @@ This file is the operative rules for what has shipped.
     comment line is not). Boundary/shallow-graft commits are never introducers.
   - Each blamed commit is mapped to the first-parent commit that LANDED it (`_defect_landing`):
     itself for a squash, else its PR's merge commit — the ledger's `mergeCommit`. That is the
-    OLDEST `--ancestry-path` descendant on the first-parent set; never add `--first-parent` to the
-    rev-list (git then finds only a branch's TIP commit, dropping every earlier commit of a PR).
+    topologically first `--ancestry-path` descendant on the first-parent set: `--topo-order` (dates
+    can be skewed), never `--first-parent` (git then finds only a branch's TIP commit).
     One it cannot place stands as itself; its forge lookup falls back to the blamed commit.
   - A revert line must be git's own (`This reverts commit <sha>.` alone on its line); a branch
-    that reverts a commit and then reverts that revert reverts nothing.
+    that reverts a commit and then reverts that revert reverts nothing (judged by chain parity).
   - A commit git cannot read or diff (root, graft, timeout) is logged and SKIPPED, never retried
     forever: one commit must not stop a repo's scan.
   - Introducers map to MERGED PRs via the forge (GitHub `commits/<sha>/pulls`, GitLab

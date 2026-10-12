@@ -8248,11 +8248,21 @@ def _defect_revert_targets(repo, sha, message, parents):
             if _DEFECT_SHA_RE.match(c):
                 body = run(["git", "-C", repo, "log", "-1", "--format=%B", c])
                 pairs += [(c, t) for t in _REVERT_RE.findall(body)]
-    reverted = {t for _, t in pairs}
-    # A target whose every revert was itself reverted (revert, then re-apply)
-    # is net nothing.
+    # A revert stands unless a revert that itself stands undoes it, so a chain
+    # (revert, re-apply, revert again) is judged by its parity: revert then
+    # re-apply is net nothing, an odd chain leaves the target reverted.
+    by_target, stands = {}, {}
+    for r, t in pairs:
+        by_target.setdefault(t, []).append(r)
+
+    def standing(r, depth=0):
+        if r not in stands:
+            stands[r] = True                 # a cycle (impossible in git) stands
+            stands[r] = depth > 50 or not any(
+                standing(r2, depth + 1) for r2 in by_target.get(r, []))
+        return stands[r]
     found = [t for t in dict.fromkeys(t for _, t in pairs)
-             if not all(r in reverted for r, x in pairs if x == t)]
+             if any(standing(r) for r in by_target[t])]
     return [t for t in found[:DEFECT_INTRODUCERS_MAX * 2]
             if run_out(["git", "-C", repo, "merge-base", "--is-ancestor", t, parents[0]])[0] == 0]
 
@@ -8260,12 +8270,13 @@ def _defect_revert_targets(repo, sha, message, parents):
 def _defect_landing(repo, sha, tip, first_parents):
     """The commit on the default branch's first-parent line that brought `sha`
     in: itself for a squash or direct commit, else the merge commit of its PR —
-    what the hub's ledger knows as the PR's `mergeCommit`. The OLDEST descendant
-    of `sha` on that line (`--first-parent --ancestry-path` only finds a
-    branch's tip commit, so it is not used). None when it cannot be placed."""
+    what the hub's ledger knows as the PR's `mergeCommit`. The topologically
+    first descendant of `sha` on that line — `--topo-order`, since commit dates
+    can be skewed, and never `--first-parent`, which only finds a branch's tip
+    commit. None when it cannot be placed."""
     if sha in first_parents:
         return sha
-    rc, out = run_out(["git", "-C", repo, "rev-list", "--ancestry-path", "--reverse",
+    rc, out = run_out(["git", "-C", repo, "rev-list", "--topo-order", "--ancestry-path", "--reverse",
                        f"{sha}..{tip}"], timeout=DEFECT_GIT_TIMEOUT)
     for c in (out.split() if rc == 0 else []):
         if c in first_parents:
