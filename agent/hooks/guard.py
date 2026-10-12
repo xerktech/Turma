@@ -12977,7 +12977,7 @@ _SHADOW_GIT_VERBS = {
 # A config key that redirects a later git into a publish (an alias, a push/pull
 # URL or command).
 _SHADOW_GIT_CONFIG_RE = re.compile(
-    r"(?i)^(alias\.|remote\.|url\.|core\.|credential|diff\.|filter\.|merge\.|gpg|"
+    r"(?i)^(alias\.|remote\.|url\.|core\.|credential|diff\.|filter\.|merge\..*\.driver|gpg|"
     r"sequence\.|include|.*\.(command|program|cmd|helper|tool|path|textconv)\b)")
 # Programs that run their first argument as a script: a tracker CLI named there
 # runs (`python3 ~/.claude/bin/jira …`); named anywhere else it is just a word.
@@ -12997,9 +12997,15 @@ _SHADOW_PUBLISH_VERBS = {
     "dotnet": {"nuget"}, "nuget": {"push"}, "mvn": {"deploy"}, "gradle": {"publish"},
 }
 # Env vars that would undo the launch's push block or make git run a command.
+# Matched only where the shell SETS or UNSETS a variable — an assignment, or a
+# word after env/unset/export — so a `grep -rn GIT_SSH` or a commit message
+# naming one is ordinary text (QA over-deny).
 _SHADOW_GIT_ENV_RE = re.compile(
-    r"GIT_(CONFIG|SSH|EDITOR|SEQUENCE_EDITOR|EXEC_PATH|ASKPASS|PAGER|EXTERNAL_DIFF|DIR\b|"
-    r"WORK_TREE|PROXY_COMMAND|TEMPLATE_DIR)")
+    r"(?:(?:^|[\s;&|(`])(?:GIT_(?:CONFIG|SSH|EDITOR|SEQUENCE_EDITOR|EXEC_PATH|ASKPASS|PAGER|"
+    r"EXTERNAL_DIFF|DIR|WORK_TREE|PROXY_COMMAND|TEMPLATE_DIR)\w*)\+?=)|"
+    r"(?:\b(?:env|unset|export|declare|typeset|local)\b[^;&|\n]*\bGIT_(?:CONFIG|SSH|EDITOR|"
+    r"SEQUENCE_EDITOR|EXEC_PATH|ASKPASS|PAGER|EXTERNAL_DIFF|DIR|WORK_TREE|PROXY_COMMAND|"
+    r"TEMPLATE_DIR))")
 _SHADOW_REASON = (
     "this is a shadow run: it may not publish — no push, no PR/MR, no tracker, "
     "registry or API write. Commit locally and finish with `shadow-done`"

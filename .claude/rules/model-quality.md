@@ -105,10 +105,11 @@ This file is the operative rules for what has shipped.
     of its launch protections. The closed record keeps `shadow`, and every shadow session and
     transcript id is persisted (`_sessions` in `shadow-runs.json`) so a record that lost the flag
     is still refused. An operator-killed shadow's closed record + worktree are reaped.
-  - Residual: a same-uid session can start a nested `claude` without `TURMA_SHADOW`, or strip the
-    push block from an interpreter's own env (the ~/.turma class); an HTTP API write from an
-    interpreter is unseen by the Bash guard where a credential survives (a stored `gh` token, an
-    SSH key for a raw API). A live run session could also
+  - **These stop ACCIDENTAL publishing, not a shadow that deliberately tampers** (QA-reproduced:
+    a `pushurl` written into `.git/config`, an interpreter clearing its env, a longer
+    pushInsteadOf, a nested `claude` without `TURMA_SHADOW`, a stored `gh` token or SSH key). No
+    same-uid layer closes that; the credential-level fix (no push credentials for a shadow) is
+    XERK-1859. A live run session could also
     write its grader's `shadow-grade.json` (same class). Peeking at later git history is forbidden
     by the directive only (validity, not safety).
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).

@@ -44434,6 +44434,13 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertIn("GIT_CONFIG_KEY_0=url./nonexistent/turma-shadow-no-push/.pushInsteadOf",
                       self.launches()[-1][-1])
 
+    def test_the_shadow_id_memory_keeps_the_newest(self):
+        sm = self.make_manager()
+        ids = [f"z{i:04d}" if i % 2 else f"a{i:04d}" for i in range(ha.SHADOW_SESSIONS_KEEP + 10)]
+        sm.shadow_sids = list(ids)
+        sm._save_shadow_runs()
+        self.assertEqual(self.make_manager().shadow_sids, ids[-ha.SHADOW_SESSIONS_KEEP:])
+
     def test_the_persisted_ledger_is_read_as_untrusted(self):
         with open(ha.SHADOW_RUNS_PATH, "w") as f:
             json.dump({self.RID: {"id": self.RID, "state": "running", "evil": 1},

@@ -7477,7 +7477,8 @@ class TestShadowRun(unittest.TestCase):
         "git rebase -x 'git push o' HEAD~1", "git bisect run sh -c 'git push o'",
         "git -c core.hooksPath=h commit", "git -c diff.external=x diff",
         "env -u GIT_CONFIG_COUNT git push", "GIT_CONFIG_COUNT=0 git status",
-        "unset GIT_CONFIG_KEY_0; git status", "wget --post-d=a=b u", "wget --meth=PUT u",
+        "unset GIT_CONFIG_KEY_0; git status", "export GIT_SSH_COMMAND=x; git status",
+        "env GIT_CONFIG_PARAMETERS=x git status", "git -c merge.x.driver=y merge main", "wget --post-d=a=b u", "wget --meth=PUT u",
     ]
     ALLOWED = [
         "git status", "git commit -m fix", "git switch -c turma-shadow/sh-0011223344",
@@ -7488,6 +7489,8 @@ class TestShadowRun(unittest.TestCase):
         "cat jira.md", "git log --oneline", "grep -rn jira agent/", "rg hub turma/",
         "git commit -m hub", "git fetch origin", "git pull", "git ls-remote origin",
         "git submodule update --init", "git rebase main",
+        "grep -rn GIT_SSH agent/", "git log --grep GIT_CONFIG", "git commit -m 'GIT_DIR is set'",
+        "git -c merge.conflictStyle=zdiff3 merge main",
     ]
 
     def test_publishing_is_denied_only_in_a_shadow(self):
