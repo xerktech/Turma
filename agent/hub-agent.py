@@ -4957,6 +4957,13 @@ def guard_script_path():
     return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks", "guard.py")
 
 
+def subagent_model_script_path():
+    """Absolute path to the bundled sub-agent model pin hook
+    (``hooks/subagent_model.py``, XERK-1851), resolved like ``ask_script_path``."""
+    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "hooks",
+                        "subagent_model.py")
+
+
 def ask_script_path():
     """Absolute path to the bundled AskUserQuestion bridge hook (``hooks/ask.py``),
     resolved the same way as ``guard_script_path``."""
@@ -5525,7 +5532,8 @@ def auto_mode_host_block(device=None, repos=None):
 
 def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
                          local_settings_path=None, fileguard_path=None,
-                         permlog_path=None, device=None, repos=None, managed=None):
+                         permlog_path=None, device=None, repos=None, managed=None,
+                         subagent_model_path=None):
     """Build the dict passed to ``claude --settings``: ``PreToolUse`` hooks over
     Bash (the safety guard), the file-editing tools (the ~/.claude file guard)
     and AskUserQuestion (the glasses answer bridge),
@@ -5615,6 +5623,16 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
             "timeout": ASK_HOOK_TIMEOUT_SEC,
         }],
     })
+    # QA/review sub-agents pinned to Opus (XERK-1851). Not a safety gate, so not
+    # in the managed drop-in; wired only when the script is there, since a
+    # missing hook command errors on every Agent call.
+    subagent_model_path = subagent_model_path or subagent_model_script_path()
+    if os.path.exists(subagent_model_path):
+        pre.append({
+            "matcher": "Agent|Task",   # Task: the tool's pre-2.1 name
+            "hooks": [{"type": "command",
+                       "command": f'"{python_exe}" -SI "{subagent_model_path}"'}],
+        })
     hooks = {"PreToolUse": pre}
     # The permission ledger (XERK-1563): RECORDS each permission prompt and
     # classifier block, decides nothing. Wired only when the script is there —
@@ -20210,9 +20228,13 @@ TICKET_RETRY_DIRECTIVE = (
 # TURMA_TICKET_SUBAGENT_MODEL (e.g. "haiku") makes it the sub-agent default in
 # ticket sessions (XERK-1827), via Claude Code's CLAUDE_CODE_SUBAGENT_MODEL — the
 # default for an agent that names no model, so a definition pinning its own
-# still wins. OFF by default: it would also put QA on the cheap model, and
-# nothing yet measures what that costs in quality (XERK-1839).
+# still wins. QA/review sub-agents are pinned to GRADER_SUBAGENT_MODEL whatever
+# this says (XERK-1851). OFF by default: nothing yet measures what a cheap
+# default costs the work sub-agents in quality (XERK-1839).
 TICKET_SUBAGENT_MODEL = os.environ.get("TURMA_TICKET_SUBAGENT_MODEL", "").strip()
+# QA and review always run on Opus, whatever model did the work
+# (docs/model-quality-adr.md decision 3); hooks/subagent_model.py applies it.
+GRADER_SUBAGENT_MODEL = "opus"
 if TICKET_SUBAGENT_MODEL and not SPAWN_MODEL_RE.fullmatch(TICKET_SUBAGENT_MODEL):
     TICKET_SUBAGENT_MODEL = ""
 
@@ -25384,6 +25406,10 @@ class SessionManager:
         subagent_model = self._ticket_subagent_model(sess, on_local)
         if subagent_model:
             env_prefix += f"CLAUDE_CODE_SUBAGENT_MODEL={shlex.quote(subagent_model)} "
+        # What hooks/subagent_model.py pins QA/review sub-agents to (XERK-1851).
+        # Never on the local model: its gateway 403s a Claude alias.
+        if not on_local:
+            env_prefix += f"TURMA_PIN_SUBAGENT_MODEL={GRADER_SUBAGENT_MODEL} "
         claude_cmd = env_prefix + claude_cmd
         if local_env_file:
             # SOURCED, never inlined and never passed as `tmux -e`: both put the
@@ -25428,6 +25454,8 @@ class SessionManager:
                 extra_env["GITLAB_HOST"] = gitlab_base()
             if subagent_model:
                 extra_env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent_model
+            if not on_local:
+                extra_env["TURMA_PIN_SUBAGENT_MODEL"] = GRADER_SUBAGENT_MODEL
             if local_env_file:
                 extra_env.update(_read_env_file(local_env_file))
             self._trust_watch(sess)

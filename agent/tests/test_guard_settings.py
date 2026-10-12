@@ -70,6 +70,23 @@ class TestGuardSettings(unittest.TestCase):
         deny = ha.build_guard_settings()["permissions"]["deny"]
         self.assertEqual([r for r in deny if r.startswith("Write(")], [])
 
+    def test_wires_the_subagent_model_pin(self):
+        # XERK-1851: QA/review sub-agents run on Opus whatever the session runs.
+        # Same -SI isolation as every hook; outside the managed drop-in, so it
+        # is wired whether or not the guard is protected.
+        for managed in (True, False):
+            s = ha.build_guard_settings(python_exe="/usr/bin/python3", managed=managed,
+                                        subagent_model_path=ha.subagent_model_script_path())
+            pin, = [e for e in s["hooks"]["PreToolUse"] if e["matcher"] == "Agent|Task"]
+            self.assertEqual(pin["hooks"][0]["command"],
+                             f'"/usr/bin/python3" -SI "{ha.subagent_model_script_path()}"')
+        self.assertTrue(os.path.isfile(ha.subagent_model_script_path()))
+
+    def test_a_missing_subagent_model_hook_is_not_wired(self):
+        # A missing hook command errors on every Agent call; degrade instead.
+        s = ha.build_guard_settings(subagent_model_path="/nonexistent/subagent_model.py")
+        self.assertNotIn("Agent|Task", [e["matcher"] for e in s["hooks"]["PreToolUse"]])
+
     def test_wires_the_claude_file_guard(self):
         """~/.claude is guarded by a HOOK, not by a deny pattern.
 
@@ -115,7 +132,7 @@ class TestGuardSettings(unittest.TestCase):
         """
         s = ha.build_guard_settings(fileguard_path="/nonexistent/fileguard.py")
         matchers = [e["matcher"] for e in s["hooks"]["PreToolUse"]]
-        self.assertEqual(matchers, ["Bash", "AskUserQuestion"])
+        self.assertEqual(matchers, ["Bash", "AskUserQuestion", "Agent|Task"])
         # …and the pattern backstop is still in force.
         self.assertIn("Edit(~/.claude/shell-snapshots/**)", s["permissions"]["deny"])
 
@@ -414,7 +431,7 @@ class TestGuardSettings(unittest.TestCase):
         s = ha.build_guard_settings(python_exe="/usr/bin/python3",
                                     fileguard_path="/nonexistent/fileguard.py")
         self.assertEqual([e["matcher"] for e in s["hooks"]["PreToolUse"]],
-                         ["Bash", "AskUserQuestion"])
+                         ["Bash", "AskUserQuestion", "Agent|Task"])
         for event in ("PermissionRequest", "PermissionDenied"):
             entry, = s["hooks"][event]
             self.assertNotIn("matcher", entry)       # every tool
@@ -494,7 +511,7 @@ class TestManagedGuard(unittest.TestCase):
     def test_managed_drops_the_guard_and_fileguard_only(self):
         s = ha.build_guard_settings(python_exe="/usr/bin/python3", managed=True)
         self.assertEqual([e["matcher"] for e in s["hooks"]["PreToolUse"]],
-                         ["AskUserQuestion"])
+                         ["AskUserQuestion", "Agent|Task"])
         self.assertIn("deny", s["permissions"])           # the rest is untouched
         s = ha.build_guard_settings(python_exe="/usr/bin/python3", managed=False)
         self.assertEqual([e["matcher"] for e in s["hooks"]["PreToolUse"]][0], "Bash")
