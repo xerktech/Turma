@@ -82,6 +82,9 @@ Each fires on a live construct next to a sink; the folded ticket is named.
   rebuild one.
 - Accepted over-deny: a read-only script naming all three (`Get-ChildItem C:\Windows; Remove-Item
   -Recurse .\dist`). Only a shell PROGRAM is scanned, so a commit message quoting one is data.
+  Also any recursive delete in a script that names `/` or `~` elsewhere (`rm -r ./dist; ls ~`).
+- It runs on the RAW command's segments too, not only the expanded ones: the expansion swaps a
+  single-quoted subexpression for a placeholder, and pwsh runs it.
 - Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook.
 - Tests: `test_a_powershell_c_script_s_remove_targets_are_judged`,
   `test_a_long_cmd_switch_run_stays_linear`.
