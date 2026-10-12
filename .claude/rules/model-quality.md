@@ -138,30 +138,46 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
     no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it. The
     hub raises no alert for a `shadow` session and lists it in no peer roster.
-  - **No-publish is two layers.** The launch env (`SHADOW_ENV`) carries an EMPTY
-    `url.<dead path>.pushInsteadOf` via `GIT_CONFIG_COUNT/KEY_0/VALUE_0`, which rewrites EVERY
-    push URL (remote, path, file, https, ssh) for any git a child runs — a hook, `rebase -x`, an
-    interpreter's subprocess — while fetch works; plus blanked tracker tokens, a non-token
-    `GH_TOKEN`, `--strict-mcp-config` and `ENABLE_CLAUDEAI_MCP_SERVERS=false`. On top, the guard
-    (`TURMA_SHADOW`, `shadow_reason`, `agent-hooks.md`) fails closed per family and refuses any
-    command naming the `GIT_CONFIG*`/`GIT_SSH`/`GIT_EDITOR` env. A text guard alone cannot close
-    git's own command runners — never drop the env layer.
+  - **No-publish is enforced by the OS, not text** (XERK-1859, operator decision 2026-10-12:
+    Claude Code's sandbox over a separate OS user). A shadow runs as the manager's uid, so it
+    can READ every credential; the boundary is where one would be USED (`build_shadow_settings`,
+    a per-session `--settings` under `LAUNCH_TEXT_DIR`):
+    - Bash runs in Claude Code's OS sandbox, `deniedDomains: ["*"]`,
+      `allowUnsandboxedCommands: false`, `failIfUnavailable`: no network for any push/API call.
+    - Sandbox writes: the worktree + the session's own request dir only. The repo's gitdir, the
+      worktree's `.git` pointer and `.claude` are read-only — the manager's UNSANDBOXED git runs
+      there, and `.claude` settings/hooks would run outside the sandbox.
+    - `--restricted --tools SHADOW_TOOLS`: no user/project/local settings (no operator hook or
+      excluded command), file tools confined to the worktree, no WebFetch/peers/MCP.
+    - `fileguard.py` keyed on `TURMA_SHADOW_ROOT` (the env, never the payload cwd a `cd` moves)
+      refuses a file-tool write outside the worktree or into `.git`/`.claude`, fail-CLOSED.
+  - **So the shadow cannot commit**: the manager does (`_advance_shadow_run`), on
+    `turma-shadow/<id>`, with git hardened against the tree (`core.fsmonitor=false`, no hooks,
+    `--ignore-submodules=all`). A nested repo in the tree (`?? x/` under `-uall`) fails the run
+    BEFORE `git add`, so no gitlink reaches an index the manager's git later recurses into; a base
+    with `.gitmodules` is refused at spawn. The grader applies tests with `git restore --worktree`.
+  - **A host that cannot sandbox runs no shadow**: `shadow_sandbox_reason()` (Linux: bwrap + socat
+    and a namespace probe; macOS: sandbox-exec; Windows: never) gates `modelShadow.available` and
+    `spawn_shadow`; `_shadow_settings` raises rather than launch unsandboxed. Never add
+    bubblewrap to a host just for this without checking the operator's own `sandbox.enabled`:
+    it switches every session's Bash onto the sandbox there.
+  - **Kept as the ACCIDENT layer**: `SHADOW_ENV` (empty `pushInsteadOf`, blanked tokens,
+    `--strict-mcp-config`) and the guard's `shadow_reason` (`agent-hooks.md`) turn an
+    accidental push into a readable refusal instead of a network error. Never drop them.
+  - The request-dir allowance is per session, so a run can no longer write its grader's
+    `shadow-grade.json`.
+  - Residuals: sandboxed Bash still writes `/tmp` (another session's scratch files); enforcement
+    itself is HOST-PROOF — CI and the k8x pods have no unprivileged user namespaces.
   - **A shadow is never resumed, migrated or paused** (`resume`, `_resume_at_cwd`,
     `export_session`, `_sleeper_unpausable`, hub `sleeperPausable`): relaunched it would carry none
     of its launch protections. The closed record keeps `shadow`, and every shadow session and
     transcript id is persisted (`_sessions` in `shadow-runs.json`) so a record that lost the flag
     is still refused. An operator-killed shadow's closed record + worktree are reaped.
-  - **These stop ACCIDENTAL publishing, not a shadow that deliberately tampers** (QA-reproduced:
-    a `pushurl` written into `.git/config`, an interpreter clearing its env, a longer
-    pushInsteadOf, a nested `claude` without `TURMA_SHADOW`, a stored `gh` token or SSH key). No
-    same-uid layer closes that; the credential-level fix (no push credentials for a shadow) is
-    XERK-1859. A live run session could also
-    write its grader's `shadow-grade.json` (same class). Peeking at later git history is forbidden
-    by the directive only (validity, not safety).
+  - Peeking at later git history is forbidden by the directive only (validity, not safety).
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
 - Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:`/`XERK-1846:`/`XERK-1847:` cases in
   `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`,
-  `TestShadowRuns`; `TestShadowRun` (`test_guard.py`); the shadow cases in `test_session_cli.py`; `TestDefect*`.
+  `TestShadowRuns`, `TestShadowSandbox`; `TestShadowRun` (`test_guard.py`), `TestShadowRoot` (`test_fileguard.py`); the shadow cases in `test_session_cli.py`; `TestDefect*`.
 
 ## The report (XERK-1849): Usage page "Model quality" card, web + Android
 

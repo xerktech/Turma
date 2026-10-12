@@ -32,6 +32,10 @@ class FileGuardBase(unittest.TestCase):
         os.makedirs(self.claude)
         self.cwd = os.path.join(self.home, "worktree")
         os.makedirs(self.cwd)
+        # The shadow root is the session's env, never the test runner's.
+        old_root = os.environ.pop(fileguard.SHADOW_ROOT_ENV, None)
+        if old_root is not None:
+            self.addCleanup(os.environ.__setitem__, fileguard.SHADOW_ROOT_ENV, old_root)
 
     def _restore_home(self):
         if self._old_home is None:
@@ -236,6 +240,70 @@ class TestHookContract(FileGuardBase):
             input="not json at all", capture_output=True, text=True,
         )
         self.assertEqual(out.returncode, 0)
+        self.assertEqual(out.stdout, "")
+
+
+class TestShadowRoot(FileGuardBase):
+    """XERK-1859: a shadow run's file tools write only inside its worktree, never
+    its .git or .claude, and the hook fails CLOSED there."""
+
+    def setUp(self):
+        super().setUp()
+        os.environ[fileguard.SHADOW_ROOT_ENV] = self.cwd
+        self.addCleanup(os.environ.pop, fileguard.SHADOW_ROOT_ENV, None)
+
+    def test_inside_the_worktree_is_writable(self):
+        self.assertAllowed(os.path.join(self.cwd, "src", "x.py"))
+        self.assertAllowed("rel/y.py")
+        self.assertAllowed(os.path.join(self.cwd, ".gitignore"))
+        self.assertAllowed(os.path.join(self.cwd, ".github", "x.yml"))
+
+    def test_outside_git_and_claude_are_refused(self):
+        for path in (os.path.join(self.home, ".bashrc"), "/etc/x",
+                     os.path.join(self.cwd, "..", "other", "x"),
+                     self.cwd,
+                     os.path.join(self.cwd, ".git"),
+                     os.path.join(self.cwd, ".git", "config"),
+                     os.path.join(self.cwd, ".claude", "settings.json"),
+                     os.path.join(self.cwd, ".claude")):
+            self.assertRefused(path)
+        self.assertRefused("x.ipynb", tool="NotebookEdit", key="notebook_path",
+                           cwd="/")
+
+    def test_the_payload_cwd_is_not_the_root(self):
+        # A session's `cd /` moves the payload cwd; the root comes from the env.
+        self.assertRefused("etc/passwd", cwd="/")
+        self.assertRefused(os.path.join(self.home, "x"), cwd=self.home)
+
+    def test_a_symlink_out_of_the_worktree_is_refused(self):
+        os.symlink(self.home, os.path.join(self.cwd, "out"))
+        self.assertRefused(os.path.join(self.cwd, "out", ".profile"))
+        os.symlink(os.path.join(self.cwd, ".git"), os.path.join(self.cwd, "g"))
+        self.assertRefused(os.path.join(self.cwd, "g", "config"))
+
+    def test_shadow_input_it_cannot_place_is_refused(self):
+        for payload in ({"tool_name": "Write", "tool_input": None},
+                        {"tool_name": "Write", "tool_input": {}},
+                        {"tool_name": "Write", "tool_input": {"file_path": ""}},
+                        {"tool_name": "Write", "tool_input": {"file_path": 7}}):
+            self.assertIsNotNone(fileguard.decide(payload), payload)
+        os.environ[fileguard.SHADOW_ROOT_ENV] = "relative/root"
+        self.assertRefused(os.path.join(self.cwd, "x.py"))
+
+    def test_the_hook_fails_closed_for_a_shadow(self):
+        env = {**os.environ, "HOME": self.home}
+        for stdin in ("not json", "[]"):
+            out = subprocess.run(
+                [sys.executable, "-SI", os.path.join(HOOKS_DIR, "fileguard.py")],
+                input=stdin, capture_output=True, text=True, env=env)
+            self.assertEqual(out.returncode, 0)
+            hook = json.loads(out.stdout)["hookSpecificOutput"]
+            self.assertEqual(hook["permissionDecision"], "deny")
+        out = subprocess.run(
+            [sys.executable, "-SI", os.path.join(HOOKS_DIR, "fileguard.py")],
+            input=json.dumps({"tool_name": "Write", "cwd": "/",
+                              "tool_input": {"file_path": os.path.join(self.cwd, "ok.py")}}),
+            capture_output=True, text=True, env=env)
         self.assertEqual(out.stdout, "")
 
 

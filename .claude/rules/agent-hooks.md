@@ -108,6 +108,9 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
   field/method/graphql, `az rest` / `az repos|boards` writes, a tracker CLI named anywhere on the
   command, registry publishes, an HTTP client that may write. Hard `policy` denies. Read from the ENVIRONMENT even
   under `--protected` — it only adds denies. Tests: `TestShadowRun`.
+  - That is the ACCIDENT layer; the hard boundary is the OS sandbox (`model-quality.md`,
+    XERK-1859). fileguard.py's half: with `TURMA_SHADOW_ROOT` set it refuses any file-tool
+    write outside that root or into its `.git`/`.claude`, and FAILS CLOSED. Tests: `TestShadowRoot`.
 - **Destructive includes the agent's tmux server** (XERK-1077): `kill-server`, killing tmux by name
   or PID, and `kill-session`/`-window`/`-pane` of anything that could resolve to an `agent-*` session
   are denied unless tmux names some OTHER server (`-L`/`-S`). Protected: the default server and the

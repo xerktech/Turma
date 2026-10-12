@@ -155,6 +155,53 @@ def _is_memory_path(rel_parts):
     return False
 
 
+# A shadow run (XERK-1859) writes only inside its own worktree. The manager sets
+# the root at launch; the session cannot change the env this hook inherits from
+# claude, and `cwd` in the payload moves with the session's own `cd`, so it is
+# never the root. `.git` (the pointer to the shared repo's gitdir, which the
+# manager's own git follows unsandboxed) and `.claude` (settings and hooks that
+# would run outside the sandbox) are refused even inside it.
+SHADOW_ROOT_ENV = "TURMA_SHADOW_ROOT"
+SHADOW_DENIED_TOP = (".git", ".claude")
+SHADOW_REASON = (
+    "Refused: {path} is outside what this shadow run may write. A shadow run "
+    "writes only files inside its own worktree ({root}), never its .git or "
+    ".claude. Make the change inside the worktree."
+)
+
+
+def _shadow_root():
+    """The shadow root, None when this is no shadow run, or "" when the env names
+    one this hook cannot use (relative) — which then refuses every write."""
+    root = os.environ.get(SHADOW_ROOT_ENV, "")
+    if not root:
+        return None
+    return os.path.realpath(root) if os.path.isabs(root) else ""
+
+
+def shadow_refusal(payload, root):
+    """The shadow confinement: a refusal string, or None. Fails CLOSED — a file
+    tool call it cannot place inside the root is refused."""
+    tool_input = payload.get("tool_input")
+    if not root or not isinstance(tool_input, dict):
+        return SHADOW_REASON.format(path="(unreadable tool input)", root=root)
+    # A relative path resolves where the TOOL resolves it — the session's cwd,
+    # which its own `cd` moves — and must then land inside the root.
+    cwd = payload.get("cwd")
+    cwd = cwd if isinstance(cwd, str) and os.path.isabs(cwd) else root
+    targets = [_resolve(tool_input.get(k), cwd) for k in PATH_KEYS
+               if tool_input.get(k) is not None]
+    if not targets:
+        return SHADOW_REASON.format(path="(no path)", root=root)
+    for target in targets:
+        if target is None or not target.startswith(root + os.sep):
+            return SHADOW_REASON.format(path=target, root=root)
+        top = os.path.relpath(target, root).split(os.sep)[0]
+        if top in SHADOW_DENIED_TOP:
+            return SHADOW_REASON.format(path=target, root=root)
+    return None
+
+
 def decide(payload):
     """Return a refusal string, or None to allow.
 
@@ -163,6 +210,11 @@ def decide(payload):
     tool = payload.get("tool_name")
     if tool not in FILE_TOOLS:
         return None
+    root = _shadow_root()
+    if root is not None:
+        reason = shadow_refusal(payload, root)
+        if reason:
+            return reason
     tool_input = payload.get("tool_input")
     if not isinstance(tool_input, dict):
         return None
@@ -195,6 +247,11 @@ def _refusal(tool_input, cwd, base):
 
 
 def main():
+    # A shadow run fails CLOSED (XERK-1859): its confinement is a boundary, not
+    # a convenience, and there the cost of a refused edit is one shadow run.
+    shadow = os.environ.get(SHADOW_ROOT_ENV, "") != ""
+    fallback = SHADOW_REASON.format(path="(unreadable request)",
+                                    root=os.environ.get(SHADOW_ROOT_ENV, ""))
     try:
         payload = json.load(sys.stdin)
     except Exception:
@@ -202,13 +259,14 @@ def main():
         # that blocks every edit because it could not parse its own input takes
         # the whole fleet down. The catastrophic paths are covered by
         # permissions.deny patterns regardless, which is why that is survivable.
-        return 0
+        payload = None
     if not isinstance(payload, dict):
-        return 0
-    try:
-        reason = decide(payload)
-    except Exception:
-        return 0
+        reason = fallback if shadow else None
+    else:
+        try:
+            reason = decide(payload)
+        except Exception:
+            reason = fallback if shadow else None
     if reason:
         json.dump({"hookSpecificOutput": {
             "hookEventName": "PreToolUse",
