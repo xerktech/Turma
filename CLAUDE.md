@@ -25,6 +25,7 @@ with `paths:` frontmatter so it loads only when Claude touches that component's 
 | `agent-tunnel.md` | `agent/tunnel-agent.js` | reverse tunnel, control-channel liveness, live pane footer |
 | `agent-hooks.md` | `agent/hooks/**` | safety-guard policy, guard + file-guard hooks, AskUserQuestion bridge |
 | `agent-permissions.md` | `hub-agent.py`, `permlog.py`, `guard.py` | permission ledger (agent half), the permission judge + its one-shot grant |
+| `subagent-model-pin.md` | `hooks/subagent_model.py`, `hub-agent.py` | QA/review sub-agents pinned to Opus on the Agent call (XERK-1851) |
 | `agent-session-cli.md` | `hooks/session_cli.py`, `hub-agent.py` | the session CLI (XERK-1564) |
 | `guard-protected.md` | `turma-agent-protect`, `hub-agent.py` | root-owned guard hooks, managed settings (XERK-1677) |
 | `guard-*.md` | `guard.py`, `test_guard.py` | guard parser invariants, one per topic: `-qa` (cases run as nobody), `-substitutions`, `-heredoc-owners`, `-prefix-assignments`, `-leading-names`, `-home`, `-trailing-escape`, `-param-ops`, `-order`, `-value-sources`, `-positionals`, `-readers`, `-braces`, `-cd`, `-unreadable` (refuse what it can't read) |
