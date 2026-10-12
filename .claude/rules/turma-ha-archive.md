@@ -280,11 +280,14 @@ of-record**, so both halves of the ADR split now hold:
   - The ingest path numbers its append after the FIRST-COPY count too (`prevCount = seated.length`),
     and the backfill row's `msgCount` is the first-copy count: raw counts left a seq hole (QA F2/F3).
   - A FOLLOWER's seat never trims: Postgres rows past its file may be another replica's appends.
-  - **The LEADER's seat, applied under the term that queued it, trims rows past the file**
-    (XERK-1843, `replaceEntries` with the term check). A stale tail there (pre-XERK-1450 damage,
-    a raw copy with a pending repair) made the next append at those seqs a `DO NOTHING` no-op until
-    the next leader hydrate's re-seat. Deposed by apply time, it falls back to the plain seat —
-    never dropped. The boot backfill queues at term 0, so under a lease it never trims.
+  - **The leader's INGEST re-seat trims rows past the file** (XERK-1843, `reindexHeld(..., true)` →
+    `replaceEntries` with the term check): only while leading under the term that queued it, and
+    only at a term > 0 (no-lease mode never bumps it, and every replica leads there). A stale tail
+    (pre-XERK-1450 damage, a raw copy with a pending repair) made the next append a `DO NOTHING`
+    no-op until the next leader hydrate. Deposed by apply time, it falls back to the plain seat —
+    never dropped.
+  - **The backfill never trims**, even on the leader: it runs after the elector (term ≥ 1) from a
+    copy that can lag entries the old leader already appended to Postgres (QA D1).
   - Do not gate the seat on leader+term instead: a dropped follower heal is a permanent search miss.
   - Tests: `XERK-1838:` + `XERK-1843:` in `index-mirror-heal.test.js` (call sites, trim, term).
 - **Hydration (XERK-793, `pg` mode): sessions-only into the map** (`hydrateSessionsInto` →
