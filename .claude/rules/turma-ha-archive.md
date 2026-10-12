@@ -143,6 +143,8 @@ of-record**, so both halves of the ADR split now hold:
     `finally` does — so the closed-since stamp spans the whole run.
   - An abandoned pass writes nothing: its late GET is discarded via `_download`'s `stillWanted`,
     or it would rename an older object over a file ingest has since appended to.
+  - A GET abandoned at its deadline (or cut by a waiting hydrate) is ABORTED (`getToFile`'s
+    `signal`): left running, a trickling key leaked a socket, an fd and a growing `.part` per pass.
   - The index load past `ARCHIVE_INDEX_HYDRATE_DEADLINE_MS` is treated as a failed one, its loader
     CUT first (`withLoaderDeadline`) so a late page never lands in a map ingest now owns.
   - The env deadlines are clamped to 2^31-1 ms: past it `setTimeout` fires after ~1ms.

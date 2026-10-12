@@ -78,7 +78,8 @@ const GET_DEADLINE_MS = 5 * 60 * 1000;
 const RETRY_GET_DEADLINE_MAX_MS = 60 * 60 * 1000;
 const YIELDED = Symbol("yielded");
 const TIMED_OUT = Symbol("timedOut");
-// `p`, or TIMED_OUT once `ms` passes first. `p` itself is left running.
+// `p`, or TIMED_OUT once `ms` passes first. `p` itself is left running: a caller
+// that gives up on it aborts its GET (`_download`'s signal).
 async function raceDeadline(p, ms) {
   let timer;
   try {
@@ -334,6 +335,7 @@ class ArchiveMirror {
           // A GET past its deadline leaves the key blocked; if it lands later it is
           // discarded, never renamed in after the pass moved on (XERK-1833).
           let abandoned = false;
+          const ac = new AbortController();
           try {
             // Through a temp file too: a GET cut mid-body left a PARTIAL rendered
             // file at its real path, which ingest would then append to and the
@@ -342,10 +344,11 @@ class ArchiveMirror {
             // An abandoned pass's late GET is discarded, never renamed over a file
             // a newer pass (and the ingest it reopened) has since written.
             const r = await raceDeadline(
-              this._download(key, dest, () => !stale() && !abandoned), getDeadlineMs);
+              this._download(key, dest, () => !stale() && !abandoned, ac.signal), getDeadlineMs);
             if (stale()) return;
             if (r === TIMED_OUT) {
               abandoned = true;
+              ac.abort();
               this._blocked.set(key, `${key} (GET did not finish within ${Math.round(getDeadlineMs / 1000)}s)`);
             } else {
               if (r) fetched++;
@@ -494,13 +497,16 @@ class ArchiveMirror {
         // A GET past its deadline leaves the key blocked; if it lands later it is
         // discarded, never renamed in after the pass (and its reconcile) moved on.
         let abandoned = false;
+        const ac = new AbortController();
         const deadline = deadlineOf(key);
         try {
           const r = await raceDeadline(Promise.race([
-            this._download(key, dest, () => !abandoned && this._blocked.has(key)), yielded]), deadline);
-          if (r === YIELDED) { abandoned = true; break; }
+            this._download(key, dest, () => !abandoned && this._blocked.has(key), ac.signal),
+            yielded]), deadline);
+          if (r === YIELDED) { abandoned = true; ac.abort(); break; }
           if (r === TIMED_OUT) {
             abandoned = true;
+            ac.abort();
             this._getDeadline.set(key, Math.min(deadline * 2, RETRY_GET_DEADLINE_MAX_MS));
             this._blocked.set(key, `${key} (GET did not finish within ${Math.round(deadline / 1000)}s)`);
             continue;
@@ -720,12 +726,12 @@ class ArchiveMirror {
   // it or finds no `.jsonl` in it, and it shares the volume, so the rename is
   // atomic. `stillWanted` is re-asked after the GET: false discards the download.
   // Returns true when `dest` was written, false on a 404 or a discard.
-  async _download(key, dest, stillWanted = () => true) {
+  async _download(key, dest, stillWanted = () => true, signal = undefined) {
     const tmpDir = path.join(this.archiveDir, ".raw-fetch");
     const tmp = path.join(tmpDir, `${process.pid}-${++this._tmpSeq}.part`);
     try {
       fs.mkdirSync(tmpDir, { recursive: true });
-      const ok = await this.blobStore.getToFile(key, tmp);
+      const ok = await this.blobStore.getToFile(key, tmp, { signal });
       if (!ok || !stillWanted()) return false;
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.renameSync(tmp, dest);

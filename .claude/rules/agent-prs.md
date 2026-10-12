@@ -38,7 +38,8 @@ DevOps, and what gets typed back because of it.
   - **`gh api …/repos/<o>/<r>/pulls` with a request body is a create too** (`_gh_api_pr_create`) —
     what a session falls back to when `gh pr create` hits a GitHub GraphQL error. Never one without
     a body flag or forced to GET: that LISTS every open PR. Its output is the PR object, whose body
-    can quote other PRs, so `_gh_api_created_pr_url` takes `html_url`, else exactly one distinct URL.
+    can quote other PRs, so `_gh_api_created_pr_url` takes `html_url`, else exactly one distinct URL
+    that also stands ALONE on a line (`--jq .html_url`); a `--jq .body` naming one PR in prose chips none.
   - **A BACKGROUNDED create** (`run_in_background`, or moved there on timeout) answers only "running
     in background"; its URL is in `<task>.output`. The task id is held in `state["pr_bg"]` and the
     file is read (tail, `O_NOFOLLOW|O_NONBLOCK`, regular only) when that task's

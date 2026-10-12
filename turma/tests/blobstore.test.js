@@ -249,6 +249,34 @@ test("getToFile: a body cut short fails AND closes its file (no leaked fd)", asy
   }
 });
 
+test("getToFile: an aborted GET closes its socket and file at once (XERK-1701)", { timeout: 10000 }, async () => {
+  // A trickling key: headers, a few bytes, then nothing. Abandoned at its
+  // deadline, the GET used to keep streaming until the client timeout.
+  let sock;
+  const server = http.createServer((req, res) => {
+    sock = res.socket;
+    res.writeHead(200, { "content-length": "1000" });
+    res.write(Buffer.alloc(10, 0x61));
+  });
+  await new Promise((r) => server.listen(0, "127.0.0.1", r));
+  const TMP = mkdtemp("turma-blob-");
+  try {
+    const store = new S3BlobStore({
+      endpoint: `http://127.0.0.1:${server.address().port}`,
+      bucket: "arc", region: "us-east-1", accessKey: "AK", secretKey: "SK",
+    });
+    const ac = new AbortController();
+    const p = store.getToFile("k", path.join(TMP, "part"), { signal: ac.signal });
+    await new Promise((r) => setTimeout(r, 50));
+    ac.abort();
+    await assert.rejects(p);
+    await new Promise((r) => setTimeout(r, 50));
+    assert.equal(sock.destroyed, true, "server side still sees a live socket");
+  } finally {
+    server.close();
+  }
+});
+
 test("getToFile: a body that ends cleanly but short is a failure, not a small object", async () => {
   const server = http.createServer((req, res) => {
     // Wrong length on purpose: the transport ends "normally" after 4 of 9 bytes.

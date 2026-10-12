@@ -237,7 +237,7 @@ class S3BlobStore {
   // One request. `bodyFile` streams a file as the body; `bodyBuffer` sends bytes;
   // neither = empty body. `collect` buffers the response (list); `toFile` streams
   // it to disk (get). Resolves { status, headers, body? }.
-  _request(method, key, { query, headers, bodyFile, bodyBuffer, collect, toFile } = {}) {
+  _request(method, key, { query, headers, bodyFile, bodyBuffer, collect, toFile, signal } = {}) {
     return new Promise((resolve, reject) => {
       const canonicalUri = key == null ? `/${encodeS3Path(this.bucket)}` : this._uriFor(key);
       const extraHeaders = { ...(headers || {}) };
@@ -269,6 +269,8 @@ class S3BlobStore {
         port: this.port,
         path,
         headers: { ...signedHeaders, "content-length": String(contentLength), host: this.hostHeader },
+        // An abort destroys the request, which lands on req's "error" below.
+        ...(signal ? { signal } : {}),
       }, (res) => {
         const status = res.statusCode;
         if (toFile && status === 200) {
@@ -335,8 +337,10 @@ class S3BlobStore {
   }
 
   // GET one object straight to a local file. Returns true, or false on a 404.
-  async getToFile(key, destPath) {
-    const r = await this._request("GET", key, { toFile: destPath });
+  // `signal` aborts it: the socket and the half-written file are closed at once,
+  // never left streaming until the client timeout (XERK-1701).
+  async getToFile(key, destPath, { signal } = {}) {
+    const r = await this._request("GET", key, { toFile: destPath, signal });
     if (r.status === 200) return true;
     if (r.status === 404) return false;
     throw new Error(`s3 get ${key} -> HTTP ${r.status}`);

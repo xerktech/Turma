@@ -9399,8 +9399,11 @@ def _gh_api_created_pr_url(text):
     if isinstance(data, dict):
         url = data.get("html_url")
         return url if isinstance(url, str) and PR_URL_RE.fullmatch(url) else None
+    # No object: `--jq .html_url` printed the URL alone on its line. A body
+    # (`--jq .body`) quoting one other PR in prose names no such line.
     urls = set(PR_URL_RE.findall(s))
-    return urls.pop() if len(urls) == 1 else None
+    alone = {ln.strip() for ln in s.splitlines() if PR_URL_RE.fullmatch(ln.strip())}
+    return urls.pop() if len(urls) == 1 and alone == urls else None
 
 
 def _created_pr_urls(text, api=False):
@@ -25729,6 +25732,9 @@ class SessionManager:
         # ttyd), so tearing it down here ends claude AND the terminal in one step
         # (XERK-697). _kill_ttyd then no-ops. Every kill/delete/restart path runs
         # _kill_tmux before _kill_ttyd, so nothing leaks.
+        # Its pane is gone, so is any need to serialize typing into it.
+        with _PANE_TYPE_LOCKS_GUARD:
+            _PANE_TYPE_LOCKS.pop(sess.get("tmuxName"), None)
         if IS_WINDOWS:
             _pty_teardown(sess.get("tmuxName"))
             return

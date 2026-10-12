@@ -2105,6 +2105,15 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                            self.tool_result("a3", f"{self.PR1}\n{self.PR2}\n")])
         self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
 
+    def test_gh_api_body_quoting_one_other_pr_chips_nothing(self):
+        # XERK-1701 (#20.1): `--jq .body` prints the body, whose prose names a PR.
+        path, state = self._primed()
+        write_jsonl(path, [
+            self.pr_create_call("a6", cmd="gh api repos/o/r/pulls --input b.json --jq .body"),
+            self.tool_result("a6", f"Follows {self.PR2} with the fix.\n"),
+        ])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
     def test_a_create_or_gh_api_fallback_reads_by_the_api_rule(self):
         """`gh pr create … || gh api …/pulls` — the object's body links stay out."""
         path, state = self._primed()
@@ -24740,6 +24749,15 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         sm._kill_tmux(sess)
         self.assertEqual(self._reaped_tmux(),
                          [["tmux", "-L", "turma", "kill-session", "-t", "=agent-dead"]] * 2)
+
+    def test_killing_a_session_forgets_its_pane_type_lock(self):
+        # XERK-1701 (#14): one lock per tmux name ever typed into, never pruned.
+        sm = super().make_manager()
+        sess = self._sess()
+        with ha._PANE_TYPE_LOCKS_GUARD:
+            ha._PANE_TYPE_LOCKS[sess["tmuxName"]] = threading.Lock()
+        sm._kill_tmux(sess)
+        self.assertNotIn(sess["tmuxName"], ha._PANE_TYPE_LOCKS)
 
     def test_a_record_without_agent_pane_keeps_the_name_only_rule(self):
         # Launched before XERK-1037 (or its pane read failed), or hand-edited to

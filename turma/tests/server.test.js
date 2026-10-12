@@ -15157,6 +15157,14 @@ test("transcribePcm: WHISPER_URL derives from LITELLM_URL when unset", async () 
   restoreFetch();
 });
 
+test("transcribePcm: no audio is an empty transcript, never 'unavailable' (XERK-1701)", async () => {
+  let called = false;
+  globalThis.fetch = async () => { called = true; return { ok: false, status: 400 }; };
+  assert.deepEqual(await transcribePcm(Buffer.alloc(0)), { text: "" });
+  assert.equal(called, false);
+  restoreFetch();
+});
+
 test("transcribePcm: {text} body, trimmed", async () => {
   globalThis.fetch = async () => ({ ok: true, json: async () => ({ text: "  hello world  " }) });
   const result = await transcribePcm(Buffer.from([1, 2, 3, 4]));
