@@ -14041,11 +14041,17 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             continue
         command_tokens = _drop_leading_redirects(tokens)
         hit = _pr_body_command(command_tokens) if command_tokens else None
+        moved = _redirects_last(segment)
+        if hit and moved != segment:
+            # A redirection is no flag value: `--body-file 2>/dev/null f.md`
+            # hands gh f.md, but the walk read `2>/dev/null` as the file
+            # (rollup XERK-1701). Only a LIVE one moves; a quoted `'2>x'` stays.
+            moved_tokens = _drop_leading_redirects(_strip_prefixes(_tokenize(moved)))
+            hit = (_pr_body_command(moved_tokens) if moved_tokens else None) or hit
         if not hit:
             # A PR command a redirection mis-split (`env -u 2>x X gh pr …`):
             # its moved reading is checked below, and noted here its own
             # `-F f` read as another part naming f (XERK-1754 QA).
-            moved = _redirects_last(segment)
             if moved != segment and _pr_body_command(
                     _drop_leading_redirects(_strip_prefixes(_tokenize(moved))) or ["_"]):
                 continue

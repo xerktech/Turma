@@ -6896,6 +6896,25 @@ class TestPrSummary(unittest.TestCase):
                 self.assertIsNone(self.reason(cmd))
         self.assertIsNotNone(self.reason("env -u 2>/dev/null X gh pr create -t x --body nope"))
 
+    def test_a_redirection_after_a_description_flag_is_not_its_value(self):
+        # Rollup XERK-1701: `--body-file 2>/dev/null good.md` hands gh good.md,
+        # but the flag walk took `2>/dev/null` as the file and refused it.
+        with open(os.path.join(self.repo, "good.md"), "w") as fh:
+            fh.write(GOOD_BODY)
+        with open(os.path.join(self.repo, "bad.md"), "w") as fh:
+            fh.write("no sections\n")
+        for cmd in ("gh pr create -t x --body-file 2>/dev/null good.md",
+                    "gh pr create -t x -F >/dev/null good.md",
+                    "gh pr create -t x --body-file 2>&1 good.md"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.reason(cmd))
+        # The file gh reads is still the one checked, and a quoted name stays a name.
+        for cmd in ("gh pr create -t x --body-file 2>/dev/null bad.md",
+                    "gh pr create -t x --body-file '2>x' good.md",
+                    "gh pr create -t x -F 2>/dev/null good.md -F bad.md"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.reason(cmd))
+
     def test_more_than_one_description_flag_is_refused(self):
         # XERK-1565: the check read the UNION of every source while gh sends
         # only the last, so a conforming file vouched for a credential file.

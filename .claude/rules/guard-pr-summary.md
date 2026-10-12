@@ -68,6 +68,10 @@ Split out of `agent-hooks.md` (size ceiling); the guard's other categories live 
     - With a file flag, an input redirect on ANY fd (`<`, `N<`, `<&`, `<<<`) is refused, and a
       redirect BEFORE the command word (`< f gh pr create -F -`) is the PR command's
       (`_drop_leading_redirects`).
+  - **A redirection among the PR command's words is no flag value** (rollup XERK-1701): with one
+    present the command is read with its LIVE redirections moved after the words
+    (`_redirects_last`), so `--body-file 2>/dev/null f.md` checks f.md, as gh reads it. A quoted
+    `'2>x'` is not live and stays the file name.
   - **A shorthand CLUSTER is a description flag too** (`_shorthand_value`): pflag reads `-dF x` as
     `-d -F x`, so `--body-file ok.md -dF hosts.yml` (also `-dFhosts.yml`, `-wF`, glab `-yd`) is
     two sources. ANY letter of a single-dash token counts (gh `b`/`F`, glab `d`): a glued value
