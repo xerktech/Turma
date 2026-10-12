@@ -48,6 +48,21 @@ function previousReleaseTag(versionModule) {
   return bestTag;
 }
 
+// Did `ref` branch off from `tag`'s parent commit — i.e. is it a sibling of
+// the tagged commit rather than its ancestor or descendant? That is the shape of
+// a merge that raced a minor/major bump (see version.js patchBase). The parent
+// itself is not a sibling: it is the commit the release already shipped.
+function branchedFromParentOf(tag, ref) {
+  // A root commit has no parent, so nothing can be its sibling.
+  let parent;
+  try {
+    parent = git(["rev-parse", "--verify", "--quiet", `${tag}^{commit}^`]);
+  } catch (_e) {
+    return false;
+  }
+  return git(["merge-base", tag, ref]) === parent && git(["rev-parse", `${ref}^{commit}`]) !== parent;
+}
+
 // Does a ref resolve? Used to decide whether a rollup range start exists.
 function tagExists(tag) {
   if (!tag) return false;
@@ -162,6 +177,7 @@ module.exports = {
   allTags,
   previousReleaseTag,
   tagExists,
+  branchedFromParentOf,
   diffPaths,
   firstParentCommits,
   commitPaths,

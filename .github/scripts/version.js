@@ -67,6 +67,24 @@ function bumpBase(base, type) {
   return { major: base.major, minor: base.minor };
 }
 
+// The line a PATCH release ships on. Normally VERSION's, but a merge that landed
+// while a minor/major release was running carries the pre-bump VERSION: the
+// bump commit is merged into main beside it (release.yml `bump`), so the newest
+// tag sits on a higher line, on a SIBLING of this commit (both children of the
+// commit the release was dispatched on). Only then does the run adopt the tag's
+// line instead of computing a patch below it and failing assertStrictlyGreatest.
+// Anything else keeps VERSION's line and fails loudly: a VERSION hand-edited
+// below a released line (tag is an ancestor), or a re-run of a pre-bump commit
+// (tag is a descendant) that would otherwise publish stale code on the new line.
+function patchBase(base, prevTag, racedBump) {
+  const p = parseTag(prevTag || "");
+  if (!p || !racedBump) return base;
+  if (compare({ major: p.major, minor: p.minor, patch: 0 }, { major: base.major, minor: base.minor, patch: 0 }) <= 0) {
+    return base;
+  }
+  return { major: p.major, minor: p.minor };
+}
+
 // Pack a version into an Android versionCode. Throws (red release) rather than
 // silently wrapping if a field is out of budget.
 function androidVersionCode(v) {
@@ -100,6 +118,7 @@ module.exports = {
   compare,
   nextPatch,
   bumpBase,
+  patchBase,
   androidVersionCode,
   assertStrictlyGreatest,
   ANDROID_MAJOR_MAX,

@@ -232,8 +232,29 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git add VERSION CHANGELOG.md
           git commit -m "Release ${{ needs.plan.outputs.tag }}"
-          git push origin HEAD:main
-          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          # The commit the release tags and builds: this run's code-scanned tree
+          # plus the bump. A merge that landed on main during code-scan is not
+          # rebased under it — that would ship code this run never scanned.
+          # Instead main gets a merge of the bump commit, and the merge's newer
+          # code ships in its own queued release (plan.js adopts the new line there).
+          RELEASED="$(git rev-parse HEAD)"
+          for attempt in 1 2 3; do
+            if git push origin HEAD:main; then
+              echo "sha=${RELEASED}" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            [ "$attempt" -lt 3 ] || break
+            echo "Push lost a race with main (attempt ${attempt}); merging the bump onto the new main."
+            git fetch --quiet origin main
+            git checkout --quiet --detach origin/main
+            # Only another VERSION/CHANGELOG bump can conflict; fail by name.
+            git merge --no-ff -m "Merge ${{ needs.plan.outputs.tag }} into main" "$RELEASED" || {
+              echo "::error::Merging ${{ needs.plan.outputs.tag }}'s VERSION/CHANGELOG bump into main conflicted — main changed one of them during this run." >&2
+              exit 1
+            }
+          done
+          echo "::error::Could not push ${{ needs.plan.outputs.tag }}'s bump to main after 3 attempts." >&2
+          exit 1
 
   # --------------------------------------------------------- build: turma -----
   # Hosted, like every workflow in this repo: the layer cache is `type=gha`
