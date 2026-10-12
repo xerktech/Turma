@@ -265,7 +265,8 @@ class TestShadowRoot(FileGuardBase):
                      os.path.join(self.cwd, ".git"),
                      os.path.join(self.cwd, ".git", "config"),
                      os.path.join(self.cwd, ".claude", "settings.json"),
-                     os.path.join(self.cwd, ".claude")):
+                     os.path.join(self.cwd, ".claude"),
+                     os.path.join(self.cwd, "sub", ".claude", "skills", "x", "SKILL.md")):
             self.assertRefused(path)
         self.assertRefused("x.ipynb", tool="NotebookEdit", key="notebook_path",
                            cwd="/")

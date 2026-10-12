@@ -196,8 +196,9 @@ def shadow_refusal(payload, root):
     for target in targets:
         if target is None or not target.startswith(root + os.sep):
             return SHADOW_REASON.format(path=target, root=root)
-        top = os.path.relpath(target, root).split(os.sep)[0]
-        if top in SHADOW_DENIED_TOP:
+        parts = os.path.relpath(target, root).split(os.sep)
+        # `.claude` at ANY depth: a nested one can hold skills and agents.
+        if parts[0] in SHADOW_DENIED_TOP or ".claude" in parts:
             return SHADOW_REASON.format(path=target, root=root)
     return None
 

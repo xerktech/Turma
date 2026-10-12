@@ -156,6 +156,12 @@ This file is the operative rules for what has shipped; the routing policy is `mo
       CLAUDE.md rides the directive and the user agents ride `--agents` (minus hook/MCP
       ones), so the run stays like-for-like. **Never `--restricted`**: it drops CLAUDE.md and
       every user agent, so the qa sub-agent both directives name does not exist (QA-found).
+    - The repo's COMMITTED project config therefore loads, and its hooks would run OUTSIDE the
+      sandbox, calling scripts the shadow can rewrite (QA-reproduced). So `spawn_shadow`
+      refuses a base whose `.claude/settings*.json` holds any key but `permissions`/`$schema`
+      or whose `.claude/agents/*.md` define hooks/MCP servers (`shadow_project_reason`,
+      fail-closed). No `Skill` tool: skill hooks run outside the sandbox too, and fileguard
+      refuses `.claude` at any depth. `--agents` is capped (`SHADOW_AGENTS_MAX_BYTES`, E2BIG).
     - `fileguard.py` keyed on `TURMA_SHADOW_ROOT` (the env, never the payload cwd a `cd` moves)
       refuses a file-tool write outside the worktree or into `.git`/`.claude`, fail-CLOSED.
   - **So the shadow cannot commit**: the manager does (`_advance_shadow_run`), on
@@ -174,8 +180,7 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     accidental push into a readable refusal instead of a network error. Never drop them.
   - The request-dir allowance is per session, so a run can no longer write its grader's
     `shadow-grade.json`.
-  - Residuals: repo-COMMITTED `.claude/settings.json` hooks still run (as in a live session);
-    enforcement itself is HOST-PROOF — CI and the k8x pods have no unprivileged user
+  - Residuals: no repo skills in a shadow (parity cost); enforcement itself is HOST-PROOF — CI and the k8x pods have no unprivileged user
     namespaces. On the first host with bwrap check: no network, `.git`/gitdir unwritable, the
     seccomp helper present (Claude Code's `/sandbox` Dependencies tab), tmux socket unreachable.
   - **A shadow is never resumed, migrated or paused** (`resume`, `_resume_at_cwd`,

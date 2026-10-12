@@ -5727,8 +5727,20 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
 # The guard's shadow_reason and SHADOW_ENV stay: they turn an ACCIDENTAL push into
 # a readable refusal instead of a network error. Decision: operator, 2026-10-12
 # (Claude Code sandbox over a separate OS user).
+#   * The repo's COMMITTED project config is loaded too (CLAUDE.md, rules,
+#     settings), so a base whose project settings hold anything but
+#     `permissions` — a hook, statusLine, plugin, helper, env, sandbox override —
+#     or whose project agents define hooks/MCP servers is refused at spawn: a
+#     hook runs outside the sandbox, and may call a script the shadow rewrote
+#     (QA-reproduced). `Skill` is not in SHADOW_TOOLS for the same reason: a
+#     skill's frontmatter hooks run outside the sandbox, and a nested
+#     `.claude/skills` dir is one the sandboxed shell could write.
 SHADOW_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit",
-                "Agent", "Task", "Skill", "ToolSearch", "TaskStop", "TodoWrite")
+                "Agent", "Task", "ToolSearch", "TaskStop", "TodoWrite")
+SHADOW_PROJECT_SETTINGS_KEYS = frozenset({"permissions", "$schema"})
+# The `--agents` JSON is ONE argv string; past ~128 KiB exec fails (E2BIG).
+SHADOW_AGENTS_MAX_BYTES = 64 * 1024
+SHADOW_AGENTS_KEEP = ("qa", "qa-delta")
 SHADOW_ROOT_ENV = "TURMA_SHADOW_ROOT"
 SHADOW_SANDBOX_PROBE_TIMEOUT_SEC = 10
 # A failed probe is re-tried this often, so installing bubblewrap needs no restart.
@@ -5876,7 +5888,49 @@ def shadow_agents(agents_dir=None):
         if meta.get("model"):
             entry["model"] = meta["model"]
         out[agent_name] = entry
+    if len(json.dumps(out)) > SHADOW_AGENTS_MAX_BYTES:
+        # Only what the directives name, and nothing at all past the cap.
+        out = {k: v for k, v in out.items() if k in SHADOW_AGENTS_KEEP}
+        if len(json.dumps(out)) > SHADOW_AGENTS_MAX_BYTES:
+            log("shadow: the user's qa agents are too large for --agents; none passed")
+            out = {}
     return out
+
+
+def _agent_frontmatter_keys(text):
+    m = re.match(r"---\n(.*?)\n---", text, re.S)
+    if not m:
+        return set()
+    return {line.partition(":")[0].strip() for line in m.group(1).splitlines()
+            if line.partition(":")[1] and not line[:1].isspace()}
+
+
+def shadow_project_reason(repo, base):
+    """Why the repo's committed Claude config at `base` rules out a shadow, or
+    None. A shadow loads project settings and agents (for CLAUDE.md and rules
+    parity); anything there that runs a command does so OUTSIDE the sandbox.
+    Fails closed: an unreadable listing is a reason."""
+    rc, names = run_out(["git", "-C", repo, "ls-tree", "-r", "--name-only", base,
+                         "--", ".claude"], timeout=15)
+    if rc != 0:
+        return "could not read the repo's .claude config"
+    for name in names.splitlines():
+        if name in (".claude/settings.json", ".claude/settings.local.json"):
+            rc, text = run_out(["git", "-C", repo, "show", f"{base}:{name}"], timeout=15)
+            try:
+                data = json.loads(text) if rc == 0 else None
+            except ValueError:
+                data = None
+            if not isinstance(data, dict):
+                return f"could not read {name}"
+            extra = sorted(set(data) - SHADOW_PROJECT_SETTINGS_KEYS)
+            if extra:
+                return f"{name} sets {', '.join(extra)[:120]}, which would run outside the sandbox"
+        elif re.fullmatch(r"\.claude/agents/[^/]+\.md", name):
+            rc, text = run_out(["git", "-C", repo, "show", f"{base}:{name}"], timeout=15)
+            if rc != 0 or {"hooks", "mcpServers"} & _agent_frontmatter_keys(text):
+                return f"{name} defines hooks or MCP servers"
+    return None
 
 
 def shadow_user_instructions(path=None):
@@ -27899,12 +27953,15 @@ class SessionManager:
                     f"{merge}^1^{{commit}}"]).strip().lower()
         if not SHADOW_SHA_RE.fullmatch(base):
             return self._fail_shadow(rid, cmd, "the merge commit is not in this clone")
-        if re.search(r"(?m)^160000 ", run(["git", "-C", repo["path"], "ls-tree", "-r",
-                                            base], timeout=30)):
+        rc, tree = run_out(["git", "-C", repo["path"], "ls-tree", "-r", base], timeout=30)
+        if rc != 0 or re.search(r"(?m)^160000 ", tree):
             # A gitlink's `.git` sits inside the worktree the sandbox lets the
             # shadow write, and the manager's own git status recurses into it —
             # with or without a .gitmodules (XERK-1859).
             return self._fail_shadow(rid, cmd, "shadow runs do not support submodules")
+        project = shadow_project_reason(repo["path"], base)
+        if project:
+            return self._fail_shadow(rid, cmd, f"shadow runs cannot sandbox this repo: {project}")
         try:
             detail = fetch_board_issue(key)
         except Exception as e:

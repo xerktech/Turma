@@ -44567,9 +44567,11 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.head = self.HEAD
         self.dirty = ""
         self.gitlink = False
+        self.claude_files = {}     # the base's committed .claude/*, path -> text
         for name, value in [("scan_repos", lambda: [self.repo]),
                             ("JIRA_SITE", self.SITE), ("JIRA_EMAIL", "a@b.c"),
-                            ("JIRA_TOKEN", "t"), ("run", self.fake_git)]:
+                            ("JIRA_TOKEN", "t"), ("run", self.fake_git),
+                            ("run_out", self.fake_git_out)]:
             p = mock.patch.object(ha, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -44584,10 +44586,19 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
             return cmd[-1]       # branch_exists on a commit id
         if "status" in cmd:
             return self.dirty
-        if "ls-tree" in cmd:
-            return (f"100644 blob {'d' * 40}\ta.py\n"
-                    + (f"160000 commit {'e' * 40}\tsub\n" if self.gitlink else ""))
         return ""
+
+    def fake_git_out(self, cmd, cwd=None, timeout=None):
+        self.run_calls.append(cmd)
+        if "ls-tree" in cmd and "--name-only" in cmd:
+            return 0, "\n".join(sorted(self.claude_files))
+        if "ls-tree" in cmd:
+            return 0, (f"100644 blob {'d' * 40}\ta.py\n"
+                       + (f"160000 commit {'e' * 40}\tsub\n" if self.gitlink else ""))
+        if "show" in cmd:
+            name = cmd[-1].split(":", 1)[1]
+            return (0, self.claude_files[name]) if name in self.claude_files else (128, "")
+        return 0, ""
 
     def detail(self):
         return {"key": "PROJ-7", "summary": "Fix the board", "description": "broken",
@@ -44656,6 +44667,12 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertEqual(oct(os.stat(settings_path).st_mode & 0o777), "0o600")
         self.assertIn("read-only git", cmd, "told it cannot commit")
         self.assertNotIn("git switch -c", cmd, "no longer told to commit itself")
+        self.assertNotIn("Skill", ha.SHADOW_TOOLS, "skill hooks run outside the sandbox")
+        self.assertTrue(os.path.isdir(tmp))
+        sm._forget_session_caches(sess["id"])
+        self.assertFalse(os.path.exists(tmp), "a shadow's temp goes with it")
+        self.assertFalse(os.path.exists(settings_path))
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "running")
         self.assertNotIn("git fetch origin", cmd, "no new-work policy telling it to fetch")
         # The ticket as the live session saw it: no later or undated comment.
         self.assertIn("BEFORE", cmd)
@@ -44841,11 +44858,6 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertNotIn("evil", runs[self.RID])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
-
     # XERK-1859: what the manager's own (unsandboxed) git refuses to touch.
     def test_a_base_with_a_gitlink_is_refused(self):
         self.gitlink = True
@@ -44855,16 +44867,55 @@ if __name__ == "__main__":
         self.assertEqual(r["state"], "failed")
         self.assertIn("submodules", r["error"])
 
+    def test_a_repo_whose_claude_config_runs_commands_is_refused(self):
+        hooks = json.dumps({"hooks": {"PostToolUse": []}, "permissions": {}})
+        agent = "---\nname: x\nhooks:\n  Stop: []\n---\nhi\n"
+        cases = [({".claude/settings.json": hooks}, "hooks"),
+                 ({".claude/settings.local.json": '{"statusLine": {}}'}, "statusLine"),
+                 ({".claude/settings.json": '{"sandbox": {}}'}, "sandbox"),
+                 ({".claude/settings.json": "not json"}, "could not read"),
+                 ({".claude/agents/x.md": agent}, "hooks or MCP")]
+        sm = self.make_manager()
+        sm._launch_ttyd = mock.Mock()
+
+        def spawn(n):
+            rid = f"sh-{n:016x}"
+            with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+                sm.spawn_shadow(self.cmd(shadowId=rid))
+            return sm.shadow_runs[rid]
+        for n, (files, why) in enumerate(cases, 1):
+            with self.subTest(why=why):
+                self.claude_files = files
+                r = spawn(n)
+                self.assertEqual((r["state"], sm.registry), ("failed", []))
+                self.assertIn(why, r["error"])
+        # Permissions alone, rules and a plain agent are the repo's own and fine.
+        self.claude_files = {".claude/settings.json": '{"permissions": {"allow": []}}',
+                             ".claude/rules/a.md": "rule",
+                             ".claude/agents/y.md": "---\nname: y\n---\nhi\n"}
+        self.assertEqual(spawn(99)["state"], "running")
+        self.assertEqual(len(sm.registry), 1)
+
+    def test_an_unreadable_tree_is_refused(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "run_out", lambda *a, **k: (None, "")):
+            self.assertIn("could not read", ha.shadow_project_reason("/r", self.BASE))
+            with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+                sm.spawn_shadow(self.cmd())
+        self.assertEqual(sm.registry, [])
+        self.assertIn("submodules", sm.shadow_runs[self.RID]["error"])
+
     def test_a_nested_repository_fails_the_run_before_git_add(self):
         sm = self.spawned()
         run_sid = sm.registry[0]["id"]
         self.dirty = " M x.py\n?? vendor/evil/\n"
         self.request(run_sid, "shadow-done", {"note": "done"})
+        before = len(self.run_ok_calls)
         sm._advance_shadow_runs()
         r = sm.shadow_runs[self.RID]
         self.assertEqual(r["state"], "failed")
         self.assertIn("nested repository", r["error"])
-        self.assertFalse(any("add" in c or "commit" in c for c in self.run_ok_calls),
+        self.assertEqual(self.run_ok_calls[before:], [],
                          "nothing staged: no gitlink reaches the index")
 
     def test_the_user_agents_and_instructions_ride_the_shadow(self):
@@ -44885,6 +44936,8 @@ if __name__ == "__main__":
                                          "tools": ["Bash", "Read"]}},
                          "a hook-defining agent is left out; memory is dropped")
         self.assertTrue(sm.registry)
+
+
 
 
 # The real probe, kept before ManagerMixin stubs it for the suite (XERK-1859).
@@ -45003,6 +45056,22 @@ class TestShadowSandbox(ManagerMixin, unittest.TestCase):
                     break
                 time.sleep(0.01)
             self.assertTrue(avail())
+
+    def test_the_heartbeat_reads_the_non_blocking_probe(self):
+        sm = self.make_manager()
+        with mock.patch.object(ha, "shadow_sandbox_available", lambda: False):
+            self.assertFalse(sm.build_payload(1)["modelShadow"]["available"])
+
+    def test_the_agents_argument_stays_under_the_argv_limit(self):
+        d = os.path.join(self.tmp, "agents")
+        os.makedirs(d)
+        for name in ("qa", "big1", "big2"):
+            with open(os.path.join(d, f"{name}.md"), "w") as f:
+                f.write(f"---\nname: {name}\ndescription: d\n---\n" + "x" * 40000)
+        agents = ha.shadow_agents(d)
+        self.assertEqual(list(agents), ["qa"], "past the cap only the directives' agents")
+        with mock.patch.object(ha, "SHADOW_AGENTS_MAX_BYTES", 100):
+            self.assertEqual(ha.shadow_agents(d), {})
 
     def test_a_host_that_cannot_sandbox_offers_and_runs_no_shadow(self):
         sm = self.make_manager()
@@ -45434,3 +45503,7 @@ class TestDefectForgeAndTracker(unittest.TestCase):
                     ha._defect_tracker_classes([key])
             with self.assertRaises(urllib.error.URLError):
                 ha._defect_tracker_classes(["SLOW-1"])
+
+
+if __name__ == "__main__":
+    unittest.main()
