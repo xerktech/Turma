@@ -21,12 +21,12 @@ const {
   statusFieldHtml, statusPickerHtml, statusPickerValue,
   triageActionOf, triageLaneOf, triageChipHtml, triageFieldHtml, triagePickerHtml, triagePickerValue,
   isEpicTicket, epicRunOf, epicRunView, epicRunSig,
-  epicCardControlHtml, epicRunPanelHtml, epicChildrenOf, epicChildrenSig, epicPreviewRun, epicPanelSig,
+  epicCardControlHtml, epicRunPanelHtml, epicLimitPickerHtml, epicChildrenOf, epicChildrenSig, epicPreviewRun, epicPanelSig,
   epicBuilderRows, epicBuilderStateLabel, epicBuilderProgressHtml, epicBuilderComposerHtml,
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   ticketOutcomeWords, ticketOutcomeLabel, ticketOutcomeOf, ticketOutcomeFieldHtml,
-  queuedTicketOf, queuedTip,
+  queuedTicketOf, queuedTip, queuedLabel,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
 } = require("../public/board.js");
@@ -3277,6 +3277,51 @@ test("epicRunView: surfaces the run's paused hold (XERK-641)", () => {
   const running = epicRunSig(epicRunView(run(), site, { sessionIndex: new Map() }));
   const held = epicRunSig(epicRunView(run({ paused: true }), site, { sessionIndex: new Map() }));
   assert.notEqual(running, held);
+});
+
+test("epicRunView: surfaces the run's per-epic cap, and the sig moves with it (XERK-1860)", () => {
+  const site = epicSite([ticket("C-1", { statusCategory: "todo", status: "To Do" })]);
+  const v = (r) => epicRunView(r, site, { sessionIndex: new Map() });
+  assert.equal(v(run()).maxConcurrent, null);
+  assert.equal(v(run({ maxConcurrent: 2 })).maxConcurrent, 2);
+  assert.equal(v(run({ maxConcurrent: "2" })).maxConcurrent, null, "a malformed cap reads as none");
+  assert.notEqual(epicRunSig(v(run())), epicRunSig(v(run({ maxConcurrent: 2 }))));
+});
+
+test("epicLimitPickerHtml: No limit + 1..10, the current value selected, carried when above 10 (XERK-1860)", () => {
+  const none = epicLimitPickerHtml("E-1", null, "data-epic-limit");
+  assert.match(none, /data-epic-limit="E-1"/);
+  assert.match(none, /<option value="" selected>No limit<\/option>/);
+  assert.match(none, /<option value="10">10<\/option>/);
+  const two = epicLimitPickerHtml("E-1", 2, "data-epic-limit");
+  assert.match(two, /<option value="2" selected>2<\/option>/);
+  assert.doesNotMatch(two, /<option value="" selected>/);
+  const big = epicLimitPickerHtml("E-1", 25, "data-epic-limit");
+  assert.match(big, /<option value="25" selected>25<\/option>/, "a cap set past the menu stays selected");
+  assert.match(epicLimitPickerHtml("E-1", 1, "data-epic-limit", true), /<select [^>]*disabled/);
+});
+
+test("queuedLabel/queuedTip: an epic-cap hold names the epic limit (XERK-1860)", () => {
+  const q = { reason: "epic-cap", error: "its epic is at its limit of 1 running at once", position: 2 };
+  assert.equal(queuedLabel(q), "⏳ queued · epic limit");
+  assert.match(queuedTip(q, "H-2"), /H-2 is waiting: its epic is at its limit of 1/);
+});
+
+test("epicRunPanelHtml: the cap picker on an armed run, a draft one on an un-armed epic, none once done (XERK-1860)", () => {
+  const base = {
+    total: 2, done: 1, counts: { done: 1, running: 1, ready: 0, blocked: 0 },
+    waves: [[{ key: "C-1", summary: "a", status: "done" }]], cycleChildren: [], cycle: false,
+  };
+  const armed = epicRunPanelHtml(epicTicket("E-1"),
+    { ...base, state: "running", paused: false, maxConcurrent: 3 }, {});
+  assert.match(armed, /data-epic-limit="E-1"/);
+  assert.match(armed, /<option value="3" selected>/);
+  const done = epicRunPanelHtml(epicTicket("E-1"), { ...base, state: "done", paused: false }, {});
+  assert.doesNotMatch(done, /data-epic-limit/);
+  const unarmed = epicRunPanelHtml(epicTicket("E-1"), null, { limitDraft: 1 });
+  assert.match(unarmed, /data-epic-limit-new="E-1"/);
+  assert.match(unarmed, /<option value="1" selected>/);
+  assert.match(unarmed, /data-epic-arm="E-1"/);
 });
 
 test("epicCardControlHtml: a paused run reads 'paused' with its own chip class (XERK-641)", () => {

@@ -223,7 +223,9 @@ const {
   TERM_LIVE_BEACON_JS,
   autoStartSweep, autoStopSweep, startedTicketKeys, orgsWithAutoStart, autoStarted,
   autoStopped, autoStopResumeExempt, autoStartOrgs, setAutoStartOrg,
-  epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, buildEpicWaves, epicChildRows,
+  epicRuns, armEpicRun, clearEpicRun, setEpicRunPaused, setEpicRunLimit, epicRunActiveCount,
+  fleetTicketRows,
+  buildEpicWaves, epicChildRows,
   isEpicOrEpicChild, isRollupTicket, sanitizeEpicRunRecord,
   epicBuilders, armEpicBuilder, clearEpicBuilder, advanceEpicBuilder,
   ingestEpicBuilderStatus, epicBuilderDriveSweep, sanitizeEpicBuilderRecord,
@@ -14449,6 +14451,232 @@ test("XERK-641: the epic-run route pauses/resumes an armed run, and refuses clea
     { body: { pause: false }, headers: userHeaders });
   assert.equal(r.status, 400);
   resetEpicRuns();
+});
+
+// ---- per-epic cap on concurrently-working children (XERK-1860) -------------
+// Two flat epics in ONE org: G-1's children H-1..H-3, K-1's children L-1..L-3.
+const capTickets = (st = {}) => {
+  const kid = (key, epic) => ({ key, statusCategory: st[key] || "todo", epicKey: epic,
+    blockedBy: [], repoGuess: { repo: "Turma", cloned: true },
+    triage: { priority: "P2", type: "task", actionable: true } });
+  return [
+    { key: "G-1", statusCategory: "todo", isEpic: true, repoGuess: { repo: "Turma", cloned: true } },
+    { key: "K-1", statusCategory: "todo", isEpic: true, repoGuess: { repo: "Turma", cloned: true } },
+    kid("H-1", "G-1"), kid("H-2", "G-1"), kid("H-3", "G-1"),
+    kid("L-1", "K-1"), kid("L-2", "K-1"), kid("L-3", "K-1"),
+  ];
+};
+const capBeat = (st, sessions = []) => asBeat("edCapA", "e1860.atlassian.net",
+  { autoStart: false, capacity: { maxSessions: 20, running: 0, queued: 0, free: 19 },
+    tickets: capTickets(st), sessions });
+const capSession = (id, key) => ({ id, status: "running",
+  ticket: { key, siteKey: "e1860.atlassian.net" }, session: { paneBusy: true } });
+// Drain until the hub queue stops moving (one dispatch per host per pass).
+const capRound = () => { epicRunDriveSweep(); for (let i = 0; i < 8; i++) drainTicketQueue(); };
+
+test("XERK-1860: a per-epic cap limits that epic's working children; another epic is unaffected", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  await capBeat();
+  armEpicRun("e1860.atlassian.net", "G-1", undefined, { maxConcurrent: 1 });
+  armEpicRun("e1860.atlassian.net", "K-1");                  // no cap
+  assert.equal(epicRuns["e1860.atlassian.net/G-1"].maxConcurrent, 1);
+  assert.equal("maxConcurrent" in epicRuns["e1860.atlassian.net/K-1"], false);
+  capRound();
+  const h = () => spawnedKeys("edCapA").filter((k) => k.startsWith("H-"));
+  const l = () => spawnedKeys("edCapA").filter((k) => k.startsWith("L-"));
+  assert.deepEqual(h(), ["H-1"], "capped epic starts ONE child");
+  assert.deepEqual(l().sort(), ["L-1", "L-2", "L-3"], "uncapped epic starts all three");
+  // Its session comes up and runs: still at the cap, nothing more starts.
+  await capBeat({}, [capSession("s-h1", "H-1")]);
+  capRound();
+  assert.deepEqual(h(), ["H-1"]);
+  // H-1 finishes (Done, its session gone): the slot frees and exactly one more starts.
+  await capBeat({ "H-1": "done" });
+  capRound();
+  assert.deepEqual(h(), ["H-1", "H-2"]);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-1860: a just-dispatched child holds its slot until its session shows up", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  if (agents.edCapA) agents.edCapA.commands = [];   // the previous test's spawns
+  await capBeat();
+  armEpicRun("e1860.atlassian.net", "G-1", undefined, { maxConcurrent: 1 });
+  capRound();
+  // The host acks the spawn (the command leaves its queue) before any session is
+  // reported: the launch grace still counts H-1, so H-2 must not start.
+  agents.edCapA.commands = [];
+  capRound();
+  assert.deepEqual(spawnedKeys("edCapA"), []);
+  assert.equal(epicRunActiveCount(epicRuns["e1860.atlassian.net/G-1"],
+    fleetTicketRows(), Date.now()), 1);
+  // Past the grace with still no session (a refused spawn): the slot is free again.
+  const k = "e1860.atlassian.net\x00H-1";
+  epicChildAttempts.set(k, { ...epicChildAttempts.get(k), at: Date.now() - 4 * 60_000 });
+  assert.equal(epicRunActiveCount(epicRuns["e1860.atlassian.net/G-1"],
+    fleetTicketRows(), Date.now()), 0);
+  // Raising the cap lets the next ready child start at once.
+  setEpicRunLimit("e1860.atlassian.net", "G-1", 3);
+  capRound();
+  assert.deepEqual(spawnedKeys("edCapA").sort(), ["H-2", "H-3"]);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-1860: what holds a slot — live or paused-sleeper session yes; ended session or blocked queue entry no", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  const site = "e1860.atlassian.net";
+  await capBeat();
+  armEpicRun(site, "G-1", undefined, { maxConcurrent: 1 });
+  capRound();
+  // The host acks H-1's spawn and the launch grace has passed, so only the
+  // session's own state can hold the slot from here on.
+  agents.edCapA.commands = [];
+  const k = site + "\x00H-1";
+  epicChildAttempts.set(k, { ...epicChildAttempts.get(k), at: Date.now() - 4 * 60_000 });
+  const active = () => epicRunActiveCount(epicRuns[site + "/G-1"], fleetTicketRows(), Date.now());
+  await capBeat({ "H-1": "inprogress" }, [capSession("s-h1", "H-1")]);
+  assert.equal(active(), 1, "a running session holds the slot");
+  await capBeat({ "H-1": "inprogress" }, [{ ...capSession("s-h1", "H-1"), status: "stopped" }]);
+  assert.equal(active(), 0, "an ended session frees it, even with the row still In Progress");
+  // A sleeper the hub paused to free a host slot will wake and run again: it holds.
+  await asBeat("edCapA", site, { autoStart: false,
+    capacity: { maxSessions: 20, running: 0, queued: 0, free: 19 },
+    tickets: capTickets({ "H-1": "inprogress" }),
+    closedSessions: [{ id: "s-h1", transcriptId: "t-h1", closedAt: Date.now(),
+      ticket: { key: "H-1", siteKey: site }, paused: { wakeAt: Date.now() + 30 * 60_000 } }] });
+  assert.equal(active(), 1, "a paused sleeper holds the slot");
+  capRound();
+  assert.deepEqual(spawnedKeys("edCapA"), [], "no second child while H-1 sleeps");
+  // A queued child no host can run is not working: it must not hold the slot.
+  await capBeat({ "H-1": "done" });
+  enqueueTicketStart(site, "H-2", "manual");
+  const e = ticketQueue.find((x) => x.issueKey === "H-2");
+  e.reason = "blocked";
+  assert.equal(active(), 0, "a blocked queue entry does not hold the slot");
+  e.reason = "capacity";
+  assert.equal(active(), 1, "one waiting for capacity does");
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-1860: the drain enforces the cap — children queued while blocked go out one at a time when it clears", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  if (agents.edCapA) agents.edCapA.commands = [];
+  const site = "e1860.atlassian.net";
+  await capBeat();
+  armEpicRun(site, "G-1", undefined, { maxConcurrent: 1 });
+  // What the driver leaves behind after a long block: every ready child in line
+  // (a blocked entry holds no slot, so the driver kept queuing).
+  for (const k of ["H-1", "H-2", "H-3"]) assert.ok(enqueueTicketStart(site, k, "manual"));
+  // The block clears (a free host): only ONE goes, the rest hold on the cap.
+  for (let i = 0; i < 8; i++) drainTicketQueue();
+  const first = spawnedKeys("edCapA");
+  assert.equal(first.length, 1, `one child dispatched, got ${first}`);
+  const heldNow = () => ticketQueue.filter((e) => !e.expiredAt);
+  assert.equal(heldNow().length, 2);
+  assert.ok(heldNow().every((e) => e.reason === "epic-cap"));
+  // Held entries never count each other: the first finishing releases exactly one more.
+  await capBeat({ [first[0]]: "done" });
+  for (let i = 0; i < 8; i++) drainTicketQueue();
+  assert.equal(spawnedKeys("edCapA").length, 2);
+  assert.equal(heldNow().length, 1);
+  assert.equal(heldNow()[0].reason, "epic-cap");
+  // An uncapped run's children are never held by it.
+  setEpicRunLimit(site, "G-1", null);
+  for (let i = 0; i < 8; i++) drainTicketQueue();
+  assert.deepEqual(spawnedKeys("edCapA").sort(), ["H-1", "H-2", "H-3"]);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-1860: cap-held siblings never hold each other through the launch grace", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  if (agents.edCapA) agents.edCapA.commands = [];
+  const site = "e1860.atlassian.net";
+  const full = () => asBeat("edCapA", site, { autoStart: false,
+    capacity: { maxSessions: 1, running: 1, queued: 0, free: 0 }, tickets: capTickets() });
+  await full();
+  // Cap 3 on a full host: the driver queues all three (each stamped with a fresh
+  // attempt), and they wait on capacity.
+  armEpicRun(site, "G-1", undefined, { maxConcurrent: 3 });
+  capRound();
+  assert.equal(ticketQueue.filter((e) => !e.expiredAt).length, 3);
+  // Lower the cap to 1 and free the host: one must go NOW, not after the grace.
+  setEpicRunLimit(site, "G-1", 1);
+  await capBeat();
+  capRound();
+  assert.equal(spawnedKeys("edCapA").length, 1);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-1860: the epic-run route sets, keeps and clears the cap, and refuses bad values", async () => {
+  resetEpicRuns();
+  await epicBeat("edCapR", "e1860r.atlassian.net");
+  const post = (key, body) => request("POST", `/api/jira/e1860r.atlassian.net/${key}/epic-run`,
+    { body, headers: userHeaders });
+  // A cap on an UNARMED epic is a 404 and arms nothing.
+  let r = await post("E-1", { maxConcurrent: 2 });
+  assert.equal(r.status, 404);
+  assert.equal("e1860r.atlassian.net/E-1" in epicRuns, false);
+  // {arm:true, maxConcurrent} arms with the cap.
+  r = await post("E-1", { arm: true, maxConcurrent: 2 });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.run.maxConcurrent, 2);
+  // A cap on an armed run updates it without a re-arm (startedAt/DAG kept).
+  const startedAt = r.body.run.startedAt;
+  r = await post("E-1", { maxConcurrent: 1 });
+  assert.equal(r.status, 200);
+  assert.equal(r.body.run.maxConcurrent, 1);
+  assert.equal(r.body.run.startedAt, startedAt);
+  // A plain re-arm keeps it, like the pause.
+  r = await post("E-1", {});
+  assert.equal(r.body.run.maxConcurrent, 1);
+  // It rides /api/agents.
+  const list = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.equal(list.body.epicRuns["e1860r.atlassian.net/E-1"].maxConcurrent, 1);
+  // null clears it.
+  r = await post("E-1", { maxConcurrent: null });
+  assert.equal(r.status, 200);
+  assert.equal("maxConcurrent" in r.body.run, false);
+  // Bad values are 400s and change nothing.
+  for (const bad of [0, 51, 1.5, "2", true, -1]) {
+    r = await post("E-1", { maxConcurrent: bad });
+    assert.equal(r.status, 400, `maxConcurrent ${JSON.stringify(bad)}`);
+  }
+  assert.equal("maxConcurrent" in epicRuns["e1860r.atlassian.net/E-1"], false);
+  // A cap never rides along with a pause/resume: that would drop one of the two.
+  for (const body of [{ maxConcurrent: 2, resume: true }, { maxConcurrent: 2, pause: false }]) {
+    r = await post("E-1", body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+  }
+  // A non-object body is refused, never an arm.
+  for (const body of [5, [1], "x"]) {
+    r = await post("E-1", body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.match(r.body.error, /JSON object/);
+  }
+  resetEpicRuns();
+});
+
+test("XERK-1860: sanitizeEpicRunRecord keeps only a valid cap", () => {
+  const base = { epicKey: "E-1", siteKey: "s.atlassian.net", children: [], waves: [] };
+  assert.equal(sanitizeEpicRunRecord({ ...base, maxConcurrent: 3 }).maxConcurrent, 3);
+  for (const bad of [0, 51, 2.5, "3", null]) {
+    assert.equal("maxConcurrent" in sanitizeEpicRunRecord({ ...base, maxConcurrent: bad }), false);
+  }
 });
 
 test("XERK-550: an ignore-tier repo is never eligible, even opted in", () => {

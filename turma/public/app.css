@@ -1031,6 +1031,10 @@ body.td-open { overflow: hidden; }
 .epic-child.epic-cat-done .epic-child-dot { background: var(--good); }
 .epic-child.epic-cat-done .epic-child-st { color: var(--good); }
 .epic-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+/* The run's "max running at once" cap (XERK-1860), above its actions. */
+.epic-limit { display: flex; align-items: center; gap: 8px; margin: 0 0 10px; font-size: 13px; color: var(--muted); }
+.epic-limit select { font: inherit; color: var(--ink); background: var(--field);
+  border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 3px 6px; }
 .epic-btn {
   padding: 5px 12px; border-radius: var(--radius-sm); font-size: 13px; cursor: pointer;
   border: 1px solid var(--accent); background: var(--accent); color: #fff;

@@ -91,6 +91,8 @@ import android.os.Handler
 import android.os.Looper
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.xerktech.turma.core.epicLimitChoices
+import com.xerktech.turma.core.epicLimitLabel
 import com.xerktech.turma.core.boardFilterGroups
 import com.xerktech.turma.core.boardViewActive
 import com.xerktech.turma.core.boardViewComparator
@@ -893,6 +895,7 @@ private fun TicketStartControl(
                     c.blocked -> "⏳ queued · blocked"
                     // XERK-555: a self-clearing usage pause, not an error state.
                     c.paused -> "⏳ queued · usage paused"
+                    c.epicCap -> "⏳ queued · epic limit"
                     c.position > 1 -> "⏳ queued · #${c.position}"
                     else -> "⏳ queued"
                 },
@@ -1000,11 +1003,23 @@ private fun EpicRunSection(
     val scope = rememberCoroutineScope()
     var busy by remember(t.key) { mutableStateOf(false) }
     var error by remember(t.key) { mutableStateOf<String?>(null) }
+    // The un-armed epic's drafted "max running at once" (XERK-1860), sent with Start.
+    var limitDraft by remember(t.key) { mutableStateOf<Int?>(null) }
     fun act(clear: Boolean) {
         if (busy) return
         busy = true; error = null
         scope.launch {
-            error = vm.setEpicRun(site.siteKey, t.key, clear)
+            // Start on an un-armed epic carries the draft; a Re-arm keeps the run's own cap.
+            error = vm.setEpicRun(site.siteKey, t.key, clear, if (view == null && !clear) limitDraft else null)
+            busy = false
+        }
+    }
+    // Set/clear an armed run's cap — a pick IS the save, like the web select.
+    fun limit(n: Int?) {
+        if (busy) return
+        busy = true; error = null
+        scope.launch {
+            error = vm.setEpicRunLimit(site.siteKey, t.key, n)
             busy = false
         }
     }
@@ -1051,6 +1066,7 @@ private fun EpicRunSection(
                     }
                 }
             }
+            EpicLimitPicker(limitDraft, enabled = !busy) { limitDraft = it }
             if (busy) Text("⏳ starting…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             else Button(onClick = { act(false) }) { Text("▶ Start epic run") }
         } else {
@@ -1084,6 +1100,7 @@ private fun EpicRunSection(
                 EpicWaveGroup("Cyclic — never becomes ready", view.cycleChildren, cyclic = true)
             }
             if (outside.isNotEmpty()) EpicBoardChildGroup("Not in this run", outside)
+            if (view.state != "done") EpicLimitPicker(view.maxConcurrent, enabled = !busy) { limit(it) }
             if (busy) {
                 Text("⏳ working…", style = MaterialTheme.typography.labelLarge, color = MaterialTheme.colorScheme.onSurfaceVariant)
             } else {
@@ -1105,6 +1122,29 @@ private fun EpicRunSection(
                         onClick = { act(true) },
                         colors = ButtonDefaults.outlinedButtonColors(contentColor = MaterialTheme.colorScheme.error),
                     ) { Text("Cancel run") }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * "Max running at once" for an epic run (XERK-1860), board.js epicLimitPickerHtml:
+ * No limit or 1..10 (plus a larger current value). [onPick] gets null for No limit.
+ */
+@Composable
+private fun EpicLimitPicker(value: Int?, enabled: Boolean, onPick: (Int?) -> Unit) {
+    var open by remember { mutableStateOf(false) }
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+        Text("Max running at once", style = MaterialTheme.typography.bodyMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
+        Box {
+            SelectableValue(epicLimitLabel(value), onClick = { if (enabled) open = true })
+            androidx.compose.material3.DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                for (n in epicLimitChoices(value)) {
+                    androidx.compose.material3.DropdownMenuItem(
+                        text = { Text(epicLimitLabel(n)) },
+                        onClick = { open = false; if (n != value) onPick(n) },
+                    )
                 }
             }
         }

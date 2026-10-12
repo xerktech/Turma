@@ -2999,6 +2999,12 @@ const EPIC_RUN_STATES = new Set(["running", "blocked", "done"]);
 // unbounded number of runs would grow the payload and every SSE frame.
 const EPIC_RUNS_MAX = positiveEnv("EPIC_RUNS_MAX", 1000);
 const EPIC_RUN_CHILDREN_MAX = 500;
+// The operator's per-epic cap on how many of the run's children work at once
+// (XERK-1860): an integer 1..EPIC_RUN_MAX_CONCURRENT_MAX, or absent = no limit.
+const EPIC_RUN_MAX_CONCURRENT_MAX = 50;
+function validEpicRunLimit(n) {
+  return Number.isInteger(n) && n >= 1 && n <= EPIC_RUN_MAX_CONCURRENT_MAX;
+}
 // Coerce ONE persisted run record to the fixed shape the payload serves. Inline
 // literal bounds (64 key / 200 site), NOT the TICKET_KEY_MAX / TICKET_SITE_MAX
 // consts declared far below: this runs at module-init from the load loop, where a
@@ -3027,6 +3033,7 @@ function sanitizeEpicRunRecord(v) {
   };
   if (cycle.length) rec.cycle = cycle;
   if (v.paused === true) rec.paused = true;   // operator hold survives a restart (XERK-641)
+  if (validEpicRunLimit(v.maxConcurrent)) rec.maxConcurrent = v.maxConcurrent;   // XERK-1860
   return rec;
 }
 // Coerce a raw store/file value (the whole run map) to the sanitized shape: keep
@@ -3138,7 +3145,9 @@ function epicChildRows(siteKey, epicKey, rows) {
 // — its route calls it after validating the epic is one the fleet reports. State:
 // `blocked` if a dependency cycle stalls any child (annotated), `done` if every
 // child is already Done, else `running`. `startedAt` is preserved across re-arms.
-function armEpicRun(siteKey, epicKey, rows) {
+// `opts.maxConcurrent` (XERK-1860): a valid limit sets the cap, null clears it,
+// undefined keeps the previous run's cap (a re-arm preserves it like `paused`).
+function armEpicRun(siteKey, epicKey, rows, opts) {
   rows = rows || fleetTicketRows();
   const kids = epicChildRows(siteKey, epicKey, rows);
   const { waves, cycle } = buildEpicWaves(kids);
@@ -3165,6 +3174,9 @@ function armEpicRun(siteKey, epicKey, rows) {
   // "rebuild the plan", not "resume it" — Resume is the only thing that lifts a
   // pause. Preserved like startedAt.
   if (prev && prev.paused) rec.paused = true;
+  const limit = opts && opts.maxConcurrent !== undefined
+    ? opts.maxConcurrent : prev && prev.maxConcurrent;
+  if (validEpicRunLimit(limit)) rec.maxConcurrent = limit;
   epicRuns[k] = rec;
   // Bound the run map: evict the least-recently-updated once over the cap, like
   // the ticket-triage-action map. Epics are few, so this is a backstop.
@@ -3205,6 +3217,22 @@ function setEpicRunPaused(siteKey, epicKey, paused) {
   const want = !!paused;
   if (!!run.paused === want) return run;   // idempotent
   if (want) run.paused = true; else delete run.paused;
+  run.updatedAt = Date.now();
+  persistEpicRuns();
+  invalidateAgentsCache();
+  sseBroadcast("epicRuns", epicRuns);
+  return run;
+}
+// Set or clear (null) an armed run's cap on concurrently-working children
+// (XERK-1860) without rebuilding its DAG. Null when no run is armed. Lowering the
+// cap never kills a running child — it only stops the driver starting more until
+// the count falls under it. Persists + broadcasts like the pause.
+function setEpicRunLimit(siteKey, epicKey, limit) {
+  const run = epicRuns[epicRunKey(siteKey, epicKey)];
+  if (!run) return null;
+  const want = validEpicRunLimit(limit) ? limit : undefined;
+  if (run.maxConcurrent === want) return run;   // idempotent
+  if (want === undefined) delete run.maxConcurrent; else run.maxConcurrent = want;
   run.updatedAt = Date.now();
   persistEpicRuns();
   invalidateAgentsCache();
@@ -3789,6 +3817,50 @@ function advanceEpicRunState(run, rows) {
 // re-dispatched every 15s, and closes the ack-before-session-visible window that
 // would otherwise let a just-dispatched child re-queue for the beat or two before
 // its session first heartbeats.
+// How many of a run's children are WORKING right now, for its per-epic cap
+// (XERK-1860): a not-Done child with a live (running/queued) or paused-sleeper
+// session, a place in the hub queue it can leave (not `blocked` — a child no host
+// can run is not working, and counting it stalled a capped run forever as it
+// cycled blocked → given up → re-queued), a spawn in flight or committed to a
+// host, or one dispatched
+// within EPIC_CHILD_LAUNCH_GRACE_MS (acked, but its session hasn't heartbeat yet
+// — without this a cap of 1 would start a second child in that gap). Not
+// startedTicketKeys: that counts KILLED sessions too, so a finished child would
+// hold its slot forever.
+const EPIC_CHILD_LAUNCH_GRACE_MS = 3 * 60_000;
+// `exclude` (a queue key) leaves one child out — the drain asking "may THIS one
+// go?". Queue entries held by the cap itself (reason "epic-cap") never count:
+// two held children counting each other would deadlock once the slot frees.
+function epicRunActiveCount(run, rows, now, exclude) {
+  const live = liveTicketSessionKeys();
+  let n = 0;
+  for (const childKey of run.children || []) {
+    const k = ticketQueueKey(run.siteKey, childKey);
+    if (k === exclude) continue;
+    const hit = rows.get(k);
+    if (hit && hit.row && hit.row.statusCategory === "done") continue;
+    const att = epicChildAttempts.get(k);
+    const q = liveQueuedTicket(run.siteKey, childKey);
+    if (live.has(k)) n++;
+    // A child still in line is judged by its entry alone: the launch grace is
+    // stamped at QUEUE time, so applying it here made two cap-held siblings hold
+    // each other at the cap for up to the grace with a host free.
+    else if (q) { if (q.reason !== "blocked" && q.reason !== "epic-cap") n++; }
+    else if (spawnTicketInFlight(run.siteKey, childKey)
+      || committedTicketSpawn(run.siteKey, childKey)
+      || (att && Number.isFinite(att.at) && now - att.at < EPIC_CHILD_LAUNCH_GRACE_MS)) n++;
+  }
+  return n;
+}
+// The armed, capped run a queued ticket is a child of, or null (XERK-1860). Hub-
+// owned membership (`run.children`), like epicRunChildSession.
+function cappedEpicRunOf(siteKey, issueKey) {
+  for (const run of Object.values(epicRuns)) {
+    if (run && run.maxConcurrent && run.state !== "done" && run.siteKey === siteKey
+      && (run.children || []).includes(issueKey)) return run;
+  }
+  return null;
+}
 function epicRunDriveSweep() {
   const runKeys = Object.keys(epicRuns);
   if (!runKeys.length) return;
@@ -3811,6 +3883,7 @@ function epicRunDriveSweep() {
     // run back up on the next sweep. Fully inert, so just skip it.
     if (run.paused) continue;
     const siteKey = run.siteKey;
+    let active = null;   // the run's working-children count, for its cap (XERK-1860)
     for (const childKey of run.children || []) {
       const k = ticketQueueKey(siteKey, childKey);
       const hit = rows.get(k);
@@ -3847,9 +3920,17 @@ function epicRunDriveSweep() {
       // A full org line refuses the entry — retry next sweep, spending no attempt
       // (queuing commits nothing; the backoff is for a spawn the AGENT can't
       // complete, not for capacity backpressure the queue already handles).
+      // The operator's per-epic cap (XERK-1860): count what is already working
+      // (once per run, only when there is a ready child to hold back) and stop
+      // queuing at the cap. A held child spends no attempt — it is simply ready.
+      if (run.maxConcurrent) {
+        if (active === null) active = epicRunActiveCount(run, rows, now);
+        if (active >= run.maxConcurrent) continue;
+      }
       if (!enqueueTicketStart(siteKey, childKey, "manual")) continue;
+      if (active !== null) active++;
       const attempts = Math.min((prior ? prior.attempts : 0) + 1, AUTO_START_BACKOFF_STEPS);
-      const rec = { attempts, nextAt: autoStartRetryAt(now, attempts) };
+      const rec = { attempts, nextAt: autoStartRetryAt(now, attempts), at: now };
       epicChildAttempts.set(k, rec);
       guardStoreSet("epicChildAttempts", k, rec);
     }
@@ -13356,6 +13437,28 @@ function startedTicketKeys() {
   }
   return keys;
 }
+// The subset of startedTicketKeys whose session is LIVE (running/queued) on its
+// host's registry, or a sleeper the hub PAUSED to free a slot (XERK-1575 — a
+// closed record carrying a valid `paused`, which will wake and run again) — what
+// an epic run's per-epic cap counts (XERK-1860). Same bound-org rule as
+// startedTicketKeys.
+function liveTicketSessionKeys() {
+  const keys = new Set();
+  for (const a of Object.values(agents)) {
+    const bound = boundOrgOf(a);
+    if (!bound) continue;
+    for (const s of a.sessions || []) {
+      const t = s && s.ticket;
+      if (!t || !t.key || t.siteKey !== bound) continue;
+      if (s.status === "running" || s.status === "queued") keys.add(bound + "\x00" + t.key);
+    }
+    for (const c of a.closedSessions || []) {
+      const t = c && c.ticket;
+      if (t && t.key && t.siteKey === bound && wirePaused(c.paused)) keys.add(bound + "\x00" + t.key);
+    }
+  }
+  return keys;
+}
 
 // ---- the hub-side ticket queue (XERK-296) ----------------------------------
 // Work waiting for a session is a QUEUED TICKET on the hub, not a session record
@@ -14070,6 +14173,19 @@ function drainTicketQueue() {
     if (e.source === "auto" &&
         (triageAction === "hold" || triageAction === "reject")) {
       drop(`it was ${triageAction} by triage while it waited`);
+      continue;
+    }
+    // XERK-1860: an epic-run child dispatches only while its epic is under its
+    // "max running at once" cap. The driver stops QUEUING at the cap, but a child
+    // it queued while others were `blocked` (not counted, so a stuck child can't
+    // stall the run) would otherwise all dispatch the moment the block cleared.
+    // Held here as "epic-cap" — self-clearing, never aged out as blocked.
+    const capRun = cappedEpicRunOf(e.siteKey, e.issueKey);
+    if (capRun && epicRunActiveCount(capRun, rows, now, ticketQueueKey(e.siteKey, e.issueKey))
+      >= capRun.maxConcurrent) {
+      changed = holdQueued(e, "epic-cap",
+        `its epic is at its limit of ${capRun.maxConcurrent} running at once`) || changed;
+      if (e.blockedSince) { e.blockedSince = 0; changed = true; }
       continue;
     }
     const { host, error, full, paused } = findTicketHost(
@@ -21717,6 +21833,9 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "not a valid issue key" });
       }
       const body = JSON.parse((await readBody(req)) || "{}");
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return json(res, 400, { error: "body must be a JSON object" });
+      }
       if (!Object.values(agents).some(
         (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
@@ -21732,6 +21851,23 @@ const server = http.createServer(async (req, res) => {
       // so this is NOT a re-arm and never rebuilds the DAG. A body carrying either
       // key is ALWAYS a pause/resume intent — an explicit {pause:false} etc. is a
       // 400, never a silent fall-through to the arm path below.
+      // Set/clear the per-epic cap on concurrently-working children (XERK-1860):
+      // {maxConcurrent: 1..50} sets it, {maxConcurrent: null} clears it. On its own
+      // it only updates an ARMED run (404 otherwise — never a silent arm); with
+      // {arm:true} it arms/re-arms with that cap (handled on the arm path below).
+      const hasLimit = "maxConcurrent" in body;
+      if (hasLimit && body.maxConcurrent !== null && !validEpicRunLimit(body.maxConcurrent)) {
+        return json(res, 400, {
+          error: `maxConcurrent must be null or an integer 1..${EPIC_RUN_MAX_CONCURRENT_MAX}` });
+      }
+      if (hasLimit && ("pause" in body || "resume" in body)) {
+        return json(res, 400, { error: "send maxConcurrent on its own or with {arm:true}" });
+      }
+      if (hasLimit && body.arm !== true) {
+        const run = setEpicRunLimit(siteKey, epicKey, body.maxConcurrent);
+        if (!run) return json(res, 404, { error: "no epic run is armed for that key" });
+        return json(res, 200, { ok: true, run });
+      }
       if ("pause" in body || "resume" in body) {
         if (body.pause !== true && body.resume !== true) {
           return json(res, 400, { error: "use {pause:true} or {resume:true}" });
@@ -21748,7 +21884,8 @@ const server = http.createServer(async (req, res) => {
       if (!epicRow || !epicRow.row || epicRow.row.isEpic !== true) {
         return json(res, 404, { error: "no epic by that key is reported for that org" });
       }
-      const run = armEpicRun(siteKey, epicKey, rows);
+      const run = armEpicRun(siteKey, epicKey, rows,
+        hasLimit ? { maxConcurrent: body.maxConcurrent } : undefined);
       return json(res, 200, { ok: true, run });
     }
 
@@ -22957,6 +23094,8 @@ if (process.env.TURMA_TEST) {
     armEpicRun,
     clearEpicRun,
     setEpicRunPaused,
+    setEpicRunLimit,
+    epicRunActiveCount,
     buildEpicWaves,
     epicChildRows,
     isEpicOrEpicChild, isRollupTicket,
