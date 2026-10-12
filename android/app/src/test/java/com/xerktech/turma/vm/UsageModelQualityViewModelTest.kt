@@ -59,7 +59,8 @@ class UsageModelQualityViewModelTest {
 
     @Test
     fun `one org asks for its rows, named as the header names it, several ask for none`() {
-        routeByOrg()
+        // The unscoped read answers late, so the moment between the pick and it is observable.
+        routeByOrg(delayFor = "all")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
         val vm = UsageViewModel(hub.app)
