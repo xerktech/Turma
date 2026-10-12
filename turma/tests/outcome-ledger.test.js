@@ -366,3 +366,25 @@ test("XERK-1845: junk counters and qa entries are dropped by the whitelist", () 
   // A stored row (file load / Postgres rescan) with a junk qa block drops it.
   assert.ok(!("qa" in L.sanitizeRow({ ...r, qa: { runs: "1", pass: 0, partial: 0, fail: 0 } })));
 });
+
+test("XERK-1845: a partial QA list is a floor, never served as the count", () => {
+  L._internals.reset();
+  L.observe([obs({ qaRuns: [{ agent: "qa", verdict: "PASS" }] }),
+    obs({ sid: "s2", qaRuns: [], qaPartial: true })], T0);
+  const g = L.aggregate({ now: T0 }).groups[0];
+  assert.deepEqual(g.rework.qaRuns, { median: 1, n: 1 }, "the partial session is not a zero");
+  // Partial is sticky: a later complete-looking beat cannot clear it.
+  L.observe([obs({ sid: "s2", qaRuns: [{ agent: "qa", verdict: "FAIL" }] })], T0 + 1);
+  const s2 = [...L._internals.rows().values()].find((r) => r.sid === "s2");
+  assert.equal(s2.qa.incomplete, true);
+});
+
+test("XERK-1845: a merge time before the session started is junk; the commit is set once", () => {
+  L._internals.reset();
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "MERGED", mergedAt: "1970-01-01T00:00:01Z",
+    mergeCommit: "aaaaaaa" }] })], T0 + DAY);
+  assert.equal(only().prs[0].mergedAt, T0 + DAY, "dated at the sighting, not 1970");
+  assert.equal(L.outcomeOf(only(), T0 + DAY).outcome, "pending");
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "MERGED", mergeCommit: "bbbbbbb" }] })], T0 + 2 * DAY);
+  assert.equal(only().prs[0].mergeCommit, "aaaaaaa");
+});

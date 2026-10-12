@@ -159,6 +159,7 @@ function sanitizeQa(q) {
     if (n === null) return null;
     out[k] = n;
   }
+  if (q.incomplete === true) out.incomplete = true;
   return out;
 }
 
@@ -269,6 +270,9 @@ function observe(observations, now = Date.now()) {
       const prevQa = next.qa || {};
       next.qa = {};
       for (const k of QA_KEYS) next.qa[k] = Math.max(prevQa[k] || 0, qa[k]);
+      // Part of the session's transcript went unscanned (a restart, an
+      // upgrade, a resume): the counts are a floor, never served as the count.
+      if (prevQa.incomplete || o.qaPartial === true) next.qa.incomplete = true;
     }
     const tkey = JSON.stringify([base.site, base.issue]);
     if (typeof o.statusCategory === "string") {
@@ -332,14 +336,20 @@ function mergePrs(row, prs, now) {
       cur.mergeCommit = p.mergeCommit;
     }
     // The agent's own merge time beats a sighting: a PR already merged when the
-    // ledger first saw it was dated at that sighting (XERK-1845 comment 2).
-    if (cur.state === "MERGED" && p.mergedAt && p.mergedAt < (cur.mergedAt || Infinity)) {
+    // ledger first saw it was dated at that sighting (XERK-1845 comment 2). A
+    // session's PR cannot have merged before the session started, so an
+    // earlier time is junk and is ignored (it would open the window at once).
+    const floor = row.startedAt || row.firstSeen - WINDOW_DAYS * DAY_MS;
+    if (cur.state === "MERGED" && p.mergedAt && p.mergedAt >= floor
+        && p.mergedAt < (cur.mergedAt || Infinity)) {
       cur.mergedAt = p.mergedAt;
     }
     // MERGED is terminal: a later read never moves it back.
     if (cur.state === "MERGED") continue;
     if (p.state) cur.state = p.state;
-    if (cur.state === "MERGED" && !cur.mergedAt) cur.mergedAt = p.mergedAt || now;
+    if (cur.state === "MERGED" && !cur.mergedAt) {
+      cur.mergedAt = p.mergedAt && p.mergedAt >= floor ? p.mergedAt : now;
+    }
     if (cur.state === "CLOSED" && !cur.closedAt) cur.closedAt = p.closedAt || now;
     if (cur.state !== "CLOSED") delete cur.closedAt;
   }
@@ -429,8 +439,8 @@ function reworkOf(r) {
     return vals.length ? vals.reduce((a, b) => a + b, 0) : null;
   };
   return {
-    qaRuns: r.qa ? r.qa.runs : null,
-    qaFail: r.qa ? r.qa.fail : null,
+    qaRuns: r.qa && !r.qa.incomplete ? r.qa.runs : null,
+    qaFail: r.qa && !r.qa.incomplete ? r.qa.fail : null,
     ciRounds: sum("ciRounds"),
     changesRequested: sum("changesRequested"),
   };

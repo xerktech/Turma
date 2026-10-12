@@ -10362,7 +10362,8 @@ def _scan_agent_entry(entry, state):
 # runs a session needed, and what each concluded. Read off the transcript the
 # same way the live-agent scan reads background work — never from loose text:
 #
-#   launch   an `Agent`/`Task` tool_use whose input names one of QA_AGENT_TYPES
+#   run      an `Agent`/`Task` tool_use naming one of QA_AGENT_TYPES whose
+#            tool_result is not an error (a refused launch never ran)
 #   verdict  that call's own tool_result (a synchronous run), or — for a
 #            background run — the report it hands back: an `<agent-message
 #            from="<agentId>">` on a user/queue entry, or a `<task-notification>`
@@ -10374,13 +10375,22 @@ def _scan_agent_entry(entry, state):
 # agent's report format); a report without one leaves the run's verdict unknown.
 QA_AGENT_TYPES = frozenset({"qa", "qa-delta"})
 QA_VERDICT_RE = re.compile(r"(?i:verdict)\W{0,12}(PASS|PARTIAL|FAIL)\b")
-QA_AGENT_MESSAGE_RE = re.compile(r'<agent-message from="([A-Za-z0-9_-]{1,64})">')
+# The report's own verdict LINE wins over a verdict quoted mid-sentence
+# ("prior verdict: FAIL … VERDICT: PASS").
+QA_VERDICT_LINE_RE = re.compile(r"^\W*(?i:verdict)\W{0,12}(PASS|PARTIAL|FAIL)\b", re.M)
+# A hand-back is the WHOLE content: Claude Code's own frame, then the hand-back
+# marker. Anchored, so a user turn merely containing the tag cannot forge one.
+QA_AGENT_MESSAGE_RE = re.compile(
+    r'\A(?:Another Claude session sent a message:\s*)?'
+    r'<agent-message from="([A-Za-z0-9_-]{1,64})">\s*\[Subagent hand-back\]')
 # A session's QA runs kept on its record; a pathological one is bounded.
 QA_RUNS_MAX = 30
 
 
 def _qa_verdict(text):
-    m = QA_VERDICT_RE.search(text) if isinstance(text, str) else None
+    if not isinstance(text, str):
+        return None
+    m = QA_VERDICT_LINE_RE.search(text) or QA_VERDICT_RE.search(text)
     return m.group(1) if m else None
 
 
@@ -10407,10 +10417,13 @@ def _scan_qa_entry(entry, state, report):
                     calls[block["id"]] = atype
                     while len(calls) > QA_RUNS_MAX:
                         calls.pop(next(iter(calls)))
-                    out.append({"key": block["id"], "agent": atype, "verdict": None})
             elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
                 key = block["tool_use_id"]
                 atype = calls[key]
+                if block.get("is_error") is True:
+                    # Refused (permission, classifier) or errored: it never ran.
+                    calls.pop(key, None)
+                    continue
                 tur = entry.get("toolUseResult")
                 if isinstance(tur, dict) and tur.get("status") == "async_launched":
                     aid = str(tur.get("agentId") or "").strip()
@@ -10420,14 +10433,13 @@ def _scan_qa_entry(entry, state, report):
                             agents.pop(next(iter(agents)))
                         out.append({"key": key, "agent": atype, "verdict": None, "aid": aid})
                 else:
-                    v = _qa_verdict(_tool_result_text(block.get("content")))
-                    if v:
-                        out.append({"key": key, "agent": atype, "verdict": v})
+                    out.append({"key": key, "agent": atype,
+                                "verdict": _qa_verdict(_tool_result_text(block.get("content")))})
     # A background run's report — never off an ASSISTANT turn (it would be the
     # session quoting one).
     if entry.get("type") != "assistant" and agents:
         for text in _entry_texts_for_scan(entry):
-            m = QA_AGENT_MESSAGE_RE.search(text)
+            m = QA_AGENT_MESSAGE_RE.match(text)
             aid, body = (m.group(1), text[m.end():]) if m else (None, None)
             if aid is None:
                 tn = _parse_task_notification(text)
@@ -17013,6 +17025,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
+    if not primed and offsets.get(newest, 0) > 0:
+        # This scan never saw the transcript's start (a manager restart, an
+        # upgrade, a resume), so the QA runs before it are unknown (XERK-1845).
+        report["qaPartial"] = True
     if not primed:
         # The prime set this transcript's offset to EOF, possibly mid-line;
         # resume at the last complete line instead, so a line being written
@@ -25387,6 +25403,11 @@ class SessionManager:
         that happens to start with '-' can't be read as a flag. The per-session
         model (#12) and permission mode (#12) come from the validated fields on
         the session record; both fall back to today's behavior when unset."""
+        # A FRESH conversation (new --session-id) is scanned from its first
+        # byte: mark the scan primed so the first beat never treats the lines
+        # claude wrote before it as history it missed (XERK-1845 qaPartial).
+        if not resume and not resume_id and isinstance(sess.get("id"), str):
+            self.sess_state[sess["id"]] = {"primed": True}
         # Runtime dispatch (XERK-460). _launch_tmux is the ONE launch choke point
         # every path goes through (spawn provision, resume, restart, resume-any,
         # resume-on-boot), so the claude-vs-dsh branch lives here rather than at
@@ -26962,7 +26983,7 @@ class SessionManager:
             # The model that actually answered and its QA runs (XERK-1845): the
             # outcome ledger credits a session it first sees already closed by
             # these, so a kill must not forget them.
-            "modelActual", "qaRuns",
+            "modelActual", "qaRuns", "qaPartial",
             # Which model this session was running against (XERK-246). Without
             # it a resume silently returns a failed-over session to the
             # exhausted subscription — and restores its --model alias, which the
@@ -27189,6 +27210,12 @@ class SessionManager:
             # Resuming an ended session keeps whichever model it was running
             # against; usage has not come back just because it was killed.
             "modelSource": rec.get("modelSource") or "subscription",
+            # What the outcome ledger reads off it (XERK-1845): the model that
+            # answered and the QA runs so far. The resumed scan starts at the
+            # transcript's end, so its QA history is partial from here on.
+            "modelActual": rec.get("modelActual"),
+            "qaRuns": rec.get("qaRuns") if isinstance(rec.get("qaRuns"), list) else [],
+            "qaPartial": True,
             # Re-gate the runtime on rebuild, like receive_migration does: a
             # persisted "dsh"/"qwen" falls back to claude when this host does not
             # offer that runtime (which its kill switch forces off), rather than
@@ -38941,6 +38968,9 @@ class SessionManager:
                 # record — the scan sees only new bytes, so the record is the
                 # session's whole history (and survives a restart).
                 qa_reports = signals.pop("qaRuns", None)
+                if signals.pop("qaPartial", None) and not sess.get("qaPartial"):
+                    sess["qaPartial"] = True
+                    self.save()
                 if qa_reports:
                     runs, grew = merge_qa_runs(sess.get("qaRuns"), qa_reports)
                     if grew:
@@ -39144,6 +39174,9 @@ class SessionManager:
             # (XERK-1845), for the hub's model-quality ledger.
             # An empty list is a known zero; absent (an older agent) is "can't tell".
             "qaRuns": qa_runs_wire(sess.get("qaRuns")),
+            # True once part of the transcript went unscanned (a manager restart,
+            # an upgrade, a resume): the list is then a floor, not the count.
+            "qaPartial": True if sess.get("qaPartial") else None,
             # Has the conversation moved on since every PR it opened landed?
             # (XERK-224 — see _poll_prs_landed.) "Merging IS the review" demotes
             # a session out of Ready-for-review, and this is what lets that
@@ -39211,6 +39244,7 @@ class SessionManager:
                 # without these credits it to its spawn alias.
                 "modelActual": c.get("modelActual"),
                 "qaRuns": qa_runs_wire(c.get("qaRuns")),
+                "qaPartial": True if c.get("qaPartial") else None,
                 # Which model this session RAN against (XERK-246). Reading an
                 # ended session's transcript is exactly when "which model wrote
                 # this" matters, and the Ended card's mark reads this field.

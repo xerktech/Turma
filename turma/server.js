@@ -4723,7 +4723,7 @@ function outcomeLedgerSweep(now = Date.now()) {
           model: s.model, modelActual: s.modelActual, runtime: s.agentType,
           running, createdAt: s.createdAt, closedAt: s.closedAt,
           prs: Array.isArray(s.prs) ? s.prs : [],
-          qaRuns: s.qaRuns,
+          qaRuns: s.qaRuns, qaPartial: s.qaPartial === true,
           closeKind: t.outcome && t.outcome.kind,
           type: row && row.type, statusCategory: row && row.statusCategory,
           resolved: row && row.resolved,
@@ -9962,6 +9962,8 @@ function wireQaRuns(v) {
   return out.slice(-30);
 }
 function coerceQaRuns(owner) {
+  // qaPartial: part of the transcript went unscanned, so the list is a floor.
+  if ("qaPartial" in owner && owner.qaPartial !== true) delete owner.qaPartial;
   if (!("qaRuns" in owner)) return;
   const runs = wireQaRuns(owner.qaRuns);
   if (runs) owner.qaRuns = runs;
