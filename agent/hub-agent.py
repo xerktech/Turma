@@ -16733,23 +16733,26 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
             offsets[newest] = end
 
     entry = _last_entry(newest)
-    if entry:
+    # A last line that is valid JSON but not an object is no entry (it raised
+    # on every beat for that session, as a malformed tool input did).
+    if isinstance(entry, dict):
         report["lastRole"] = entry.get("type")
         # The newest entry's OWN timestamp — the conversation's clock, not the
         # file's. `_session_payload` compares it against `prsLandedTs` to answer
         # "has this session said anything since its PRs landed?" (XERK-224);
         # both sides come from transcript entries, so no wall-clock skew enters.
         report["lastActivityTs"] = entry.get("timestamp")
-        msg = entry.get("message") or {}
-        content = msg.get("content")
+        msg = entry.get("message")
+        content = msg.get("content") if isinstance(msg, dict) else None
         if isinstance(content, list):
             for block in content:
                 if not (isinstance(block, dict) and block.get("type") == "tool_use"):
                     continue
                 report["lastHasToolUse"] = True
                 if block.get("name") == "AskUserQuestion" and report["lastRole"] == "assistant":
-                    qs = (block.get("input") or {}).get("questions") or []
-                    if qs and isinstance(qs[0], dict):
+                    inp = block.get("input")
+                    qs = (inp.get("questions") if isinstance(inp, dict) else None) or []
+                    if isinstance(qs, list) and qs and isinstance(qs[0], dict):
                         q0 = qs[0]
                         report["question"] = str(q0.get("question") or "")[:300] or None
                         opts = q0.get("options") or []

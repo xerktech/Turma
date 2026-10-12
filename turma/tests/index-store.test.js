@@ -1266,6 +1266,21 @@ test("XERK-1450: a local-only pass rewrites the copy but mirrors nothing", async
   } finally { archive.setBlobSink(null); pgTeardown(); }
 });
 
+test("a CRLF copy torn before a \\r still de-dups to a prefix of the repaired file", () => {
+  const file = Buffer.from('{"a":1}\r\n{"a":1}\r\n');
+  const torn = file.subarray(0, file.length - 2); // cut before the second \r
+  const repaired = archive.dedupLines(file).out.toString("latin1");
+  const copy = archive.dedupLines(torn).out.toString("latin1");
+  assert.equal(repaired, '{"a":1}\r\n');
+  assert.ok(repaired.startsWith(copy), JSON.stringify(copy));
+  // Any trailing blank, not only \r: '{"u":1} ' and '{"u":1}' are one entry.
+  const spaced = Buffer.from('{"u":1} \n{"u":3}\n{"u":1}\n');
+  assert.equal(archive.dedupLines(spaced).out.toString("latin1"), '{"u":1} \n{"u":3}\n');
+  // A stray 0xA0 byte is not JSON whitespace: the valid twin must survive.
+  const nbsp = Buffer.concat([Buffer.from('{"k":"z"}'), Buffer.from([0xa0]), Buffer.from('\n{"k":"z"}\n')]);
+  assert.equal(archive.dedupLines(nbsp).dropped, 0);
+});
+
 test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
   const mem = pgSetup();
   try {

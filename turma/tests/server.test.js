@@ -13441,6 +13441,14 @@ const resetEpicD = () => {
     }
   }
 };
+test("an epic whose epicKey names itself is not its own run child", () => {
+  const site = "self.atlassian.net";
+  const rows = new Map([
+    ["a", { siteKey: site, row: { key: "EP-2", epicKey: "EP-2" } }],
+    ["b", { siteKey: site, row: { key: "S1", epicKey: "EP-2" } }],
+  ]);
+  assert.deepEqual(epicChildRows(site, "EP-2", rows).map((r) => r.key), ["S1"]);
+});
 // The epic organizer ticket, and a child ticket (type "Task").
 const dEpic = (statusCategory = "todo") => ({
   key: "E-1", statusCategory, isEpic: true,
