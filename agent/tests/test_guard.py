@@ -4590,7 +4590,10 @@ class TestClassification(unittest.TestCase):
                     # A heredoc a shell reads is a script, not data (QA).
                     f"bash <<'E'\npwsh -c '$(ri -r {W})'\nE",
                     f"cat <<'E' | sh\nx=1\npwsh -c '$(ri -r {W})'\nE",
-                    f"ssh host <<'E'\npwsh -c '$(ri -r {W})'\nE"):
+                    f"ssh host <<'E'\npwsh -c '$(ri -r {W})'\nE",
+                    f"echo \"$( env pwsh -c '$(ri -r {W})')\"", f"x=\"$(timeout 5 pwsh -c '$(ri -r {W})')\"",
+                    # Past the nesting cap a pwsh script is refused, never let through (QA).
+                    "bash <<'L'\n" * 6 + f"pwsh -c '$(ri -r {W})'\n" + "L\n" * 6):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
@@ -4605,7 +4608,9 @@ class TestClassification(unittest.TestCase):
                     f'echo cmd -c "Remove-Item -Recurse {W}"',
                     # XERK-1861: a heredoc body nothing runs as a script is data.
                     f"cat > n.md <<'E'\npwsh rm -Recurse '{W}'\nE",
-                    f"cat > n.md <<E\nnotes\npowershell Remove-Item -Recurse '{W}'\nE"):
+                    f"cat > n.md <<E\nnotes\npowershell Remove-Item -Recurse '{W}'\nE",
+                    f"cat > ssh-notes.md <<'E'\npwsh rm -Recurse '{W}'\nE",
+                    "bash <<'L'\n" * 6 + "echo hi\n" + "L\n" * 6):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
@@ -5430,6 +5435,10 @@ class TestExpansionBudget(unittest.TestCase):
         self.assertLess(time.process_time() - t, 1)
         self.assertEqual(guard._ps_targets("C:\\Windows\\*.*"), ["C:\\Windows\\*.*", "C:\\Windows"])
         self.assertEqual(guard._ps_targets("C:/x/*/y"), ["C:/x/*/y"])
+        # Each `$(` opener looks ahead a bounded run, never the rest of the line.
+        t = time.process_time()
+        guard._ps_raw_reason("echo " + "$(x " * 40000 + "pwsh")
+        self.assertLess(time.process_time() - t, 2)
 
     def test_a_default_assignment_spending_the_budget_reads_too_large(self):
         # Rollup XERK-1584: `_default_assignments` spent the budget outside

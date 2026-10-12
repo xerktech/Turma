@@ -95,9 +95,12 @@ Each fires on a live construct next to a sink; the folded ticket is named.
   - A body a shell reads (`_walk_owner_feeds_shell`, or an `ssh` owner) is scanned as a script:
     stripped, `bash <<'E'` hid a pwsh `$(…)` main had denied (QA). A body whose owner line runs
     pwsh/cmd is scanned with it (`pwsh -c - <<E`).
+  - Past `_PS_RAW_DEPTH` nested scripts, text still naming pwsh/cmd is REFUSED: returning
+    nothing let five nested `bash <<E` through where main denied (QA). Never fail open there.
   - Owner lines are split once per OWNER, never per heredoc: per heredoc, N `<<E` on one line
     was quadratic (36s at 16 KB, QA). Each substitution opener looks ahead a bounded run.
-  - Open (XERK-1863): `echo '…' | pwsh -c -`, `eval "$(cat <<E…)"`, `p\wsh` (all allowed on main too).
+  - Open (XERK-1863), all allowed on main too: `echo '…' | pwsh -c -`, `eval "$(cat <<E…)"`,
+    `p\wsh`, a `bash <<<` here-string, `eval pwsh -c \''$(…)'\'`, `bash -c '… "$1"' _ '$(…)'`.
 - Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook;
   the trailing-glob cut in `_ps_targets` is `rfind`, never a regex (72s at 128 KB, XERK-1861).
 - Tests: `test_a_powershell_c_script_s_remove_targets_are_judged`,

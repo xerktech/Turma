@@ -12489,25 +12489,33 @@ def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
     except one a shell reads, which is a script of its own, and one whose owner
     line runs pwsh/cmd (`pwsh -c - <<E`), scanned with it."""
     if depth > _PS_RAW_DEPTH:
+        # Fail closed: allowing here let five nested `bash <<E` hide what main
+        # denied (QA). Only text still naming a pwsh/cmd word is refused.
+        if _PS_SHELL_WORD_RE.search(command):
+            return "refusing a PowerShell/cmd script nested too deeply to classify — flatten it"
         return None
     text, heredocs = _split_heredocs(command)
     bodies: dict[str, list[str]] = {}
     for owner, body, _quoted in heredocs:
         bodies.setdefault(owner, []).append(body)
-    pieces = [(seg, "") for seg in _split_on_operators(text)]
+    owner_pieces = []
     memo: dict = {}
     for owner, owned in bodies.items():
         # One split per owner line, never per heredoc: a line of N `<<E` was
         # N splits of the whole line (quadratic, QA).
         joined = "\n".join(owned)
-        pieces += [(seg, joined) for seg in _split_on_operators(owner)]
+        owner_pieces += [(seg, joined) for seg in _split_on_operators(owner)]
         # `ssh host <<E` runs the body in the remote login shell.
         if _walk_owner_feeds_shell(text, owner, memo) or _PS_SSH_RE.search(owner):
             for body in owned:
                 reason = _ps_raw_reason(body, depth + 1)
                 if reason:
                     return reason
-    for seg, body in pieces:
+    # An owner's segments are scanned once, with their bodies: scanned again
+    # bare, each nest level doubled the cost (QA).
+    owned_segs = {seg for seg, _body in owner_pieces}
+    pieces = [(seg, "") for seg in _split_on_operators(text) if seg not in owned_segs]
+    for seg, body in pieces + owner_pieces:
         if not _PS_SHELL_WORD_RE.search(seg):
             continue
         reason = _ps_segment_reason(seg, body, depth)
@@ -12517,7 +12525,8 @@ def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
 
 
 _PS_RAW_DEPTH = 4
-_PS_SSH_RE = re.compile(r"\bssh\b")
+# `ssh` as a word of its own: `ssh-notes.md` or a quoted "ssh fix" title is not.
+_PS_SSH_RE = re.compile(r"(?:^|[\s;|&(])ssh(?=\s|$)")
 # Programs that run a later word as a program: `xargs`, find's actions and
 # wrappers `_strip_prefixes` does not know (`parallel`, `fd -x`, `flock f`).
 _PS_RUNNERS = {"xargs", "parallel", "sem", "watch", "strace", "ltrace", "taskset",
