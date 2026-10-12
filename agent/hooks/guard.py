@@ -10299,12 +10299,14 @@ _MAY_RUN_FILE_RE = re.compile(r"sh|source|\.|/|xargs|exec|eval|PATH")
 # `xargs`, `hash`; and anywhere, `find -exec` or a `PATH=` change. A shell
 # given a file is the segment loop's; a word elsewhere (`git add .`, "bash"
 # in a note) is text.
-# A keyword or wrapper starts a command only at a word start (after a blank or
-# a start character), as in bash: glued to other text (`A=env`, `A=:busybox`) it
-# is part of a word. Read with `\b`, `A=:env A=:env …` started a match at every
-# value and each ran the assignment loop to the line's end, quadratic past the
-# hook timeout, which lets the command run.
-_CMD_START = (r"(?:^|[;&|({`\n'\"]|(?<![^\s;&|({`'\"])(?:then|do|else|elif|if|while|until|exec|env|sudo|"
+# A keyword or wrapper starts a command only after a blank, a start character,
+# or what bash leaves the command name ending in: a path (`/usr/bin/env`), an
+# escape (`\env`) or an expansion (`${x}env`, `$(true)env`, `case x in x)env`).
+# Glued to other text (`A=:env`, `A=-busybox`) it is part of a word. Read with
+# `\b`, `A=:env A=:env …` started a match at every value and each ran the
+# assignment loop to the line's end, quadratic past the hook timeout, which lets
+# the command run. `A=/env` still does, as on main (XERK-1866).
+_CMD_START = (r"(?:^|[;&|({`\n'\"]|(?<![^\s;&|({`'\"/\\})])(?:then|do|else|elif|if|while|until|exec|env|sudo|"
               r"nohup|command|builtin|time|timeout\s+\S+|" + _MULTICALL_WORD + r")\s)\s*"
               r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*")
 _RUNS_UNNAMED_RE = re.compile(

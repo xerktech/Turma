@@ -6223,6 +6223,15 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "echo 'rm -rf /etc' > c.sh; cat c.sh | busybox+x sh"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        # A command name bash still runs as the wrapper: a path, an escape, an
+        # expansion glued before it, or a `case` arm's `)` (QA).
+        for run in ("cat f | /usr/bin/env sh", "cat f | /usr/bin/sudo sh", "cat f | \\env sh",
+                    "${x}env sh < f", "$(true)env sh < f", '\\env sh -c "$(cat f)"',
+                    "cat f | \\command sh", "cat f | /usr/bin/timeout 5 sh",
+                    'case x in x)env sh -c "$(cat f)";; esac', "cat f | /bin/busybox sh"):
+            with self.subTest(run=run):
+                cmd = "echo 'rm -rf /etc' > f; " + run
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         for cmd in ("echo hi | busybox sh", "cat notes.md | busybox wc -l",
                     "busybox-static tar -xzf a.tgz", "echo toybox rm -rf /etc"):
             with self.subTest(cmd=cmd):
@@ -6235,7 +6244,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # began a command start whose assignment loop ran to the line's end.
         for text in (": a" + "-busybox" * 20000, "A=env " * 20000, "A=busybox " * 20000,
                      "A=:busybox " * 20000, "A=x,toybox " * 20000, "A=-env " * 20000,
-                     "A=/env " * 20000):
+                     "A=!env " * 20000):
             for name in ("_RUNS_UNNAMED_RE", "_C_OR_EVAL_RE", "_UNREAD_SINK_SHELL_RE"):
                 with self.subTest(regex=name, text=text[:12]):
                     start = time.process_time()

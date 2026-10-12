@@ -57,11 +57,12 @@ paths:
     - `_MULTICALL_WORD` is anchored by a lookbehind: unanchored, every `-busybox` in one long
       word started a match, quadratic (1 MB: 945s, past the hook timeout, which runs it).
       Test: `test_multicall_names_scan_linearly`.
-    - `_CMD_START`'s keyword/wrapper words start only at a word start (after a blank or a start
-      character), as in bash: read with `\b`, `A=env`/`A=:env`/`A=-busybox` values each started a
-      match that ran the assignment loop to the end (quadratic, past the hook timeout, on main
-      too). 0 diffs over 2182 real commands with such a glued word. Start characters INSIDE a
-      value (`A=; `, `A='env' `) are still quadratic: XERK-1866.
+    - `_CMD_START`'s keyword/wrapper words start only after a blank, a start character, or
+      `/` `\` `}` `)`: read with `\b`, `A=env`/`A=:env`/`A=-busybox` values each started a match
+      that ran the assignment loop to the end (quadratic, past the hook timeout, on main too).
+    - Never drop `/` `\` `}` `)`: bash runs `/usr/bin/env`, `\env`, `${x}env`, `$(true)env` and
+      `case x in x)env` as `env`, and without them `cat f | /usr/bin/env sh` slipped past (QA).
+      Those same characters inside a value (`A=/env `, `A=; `) stay quadratic: XERK-1866.
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top
