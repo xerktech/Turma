@@ -6,6 +6,7 @@ import com.xerktech.turma.harness.MainDispatcherRule
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
 import okhttp3.mockwebserver.MockResponse
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -103,5 +104,24 @@ class UsageModelQualityViewModelTest {
         hub.container.org.set(setOf("rival"))
         hub.awaitFlow(vm.modelQuality) { it.org == "rival" }
         assertNull("acme's error must not linger under rival's pick", vm.modelQuality.value.error)
+    }
+
+    @Test
+    fun `a failed refresh keeps the org's last view`() {
+        var fail = false
+        hub.route("/api/model-quality") { _ ->
+            if (fail) MockResponse().setResponseCode(500).setBody("""{"error":"ledger down"}""")
+            else MockResponse().setResponseCode(200).setHeader("Content-Type", "application/json")
+                .setBody("""{"groups":[],"rows":[{"issue":"acme-1"}]}""")
+        }
+        hub.container.org.set(setOf("acme"))
+        hub.seedFleet(fleet)
+        val vm = UsageViewModel(hub.app)
+        start(vm)
+        hub.awaitFlow(vm.modelQuality) { it.view != null }
+        fail = true
+        runBlocking { vm.refreshModelQuality("acme").join() }
+        assertEquals("acme-1", issueOf(vm))
+        assertNull(vm.modelQuality.value.error)
     }
 }

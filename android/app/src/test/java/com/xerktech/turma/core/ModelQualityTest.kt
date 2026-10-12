@@ -91,6 +91,8 @@ class ModelQualityTest {
         assertNull(v.rows.single().updatedAt)
         assertTrue(v.rows.single().prs.isEmpty())
         assertEquals(0, parseModelQuality(TurmaJson.parseToJsonElement("[1]")).groups.size)
+        assertEquals(0, parseModelQuality(TurmaJson.parseToJsonElement(
+            """{"groups":[{"cls":"bug","model":"opus","bad":-3}]}""")).groups.single().bad)
     }
 
     @Test fun `rework with no figures adds no column, as on the web`() {

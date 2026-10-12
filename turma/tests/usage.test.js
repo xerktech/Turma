@@ -83,7 +83,8 @@ function loadHelpers(fetchReply = null) {
       if (!fetchReply) return new Promise(() => {});
       // `fetchReply.httpStatus(url)` returning n answers that refusal instead of a body.
       const status = fetchReply.httpStatus && fetchReply.httpStatus(String(u));
-      if (status) return Promise.resolve({ status, ok: false, json: () => Promise.resolve({}) });
+      if (status) return Promise.resolve({ status, ok: false,
+        json: () => Promise.resolve(fetchReply.refusalBody ? fetchReply.refusalBody(String(u)) : {}) });
       return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(fetchReply(String(u))) });
     },
     // Captures the page's SSE handlers so a test can deliver a real `removed`
@@ -111,7 +112,8 @@ function loadHelpers(fetchReply = null) {
     TurmaOrg: { get: () => (orgKeys.length === 1 ? orgKeys[0] : ""), getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
       update: (d) => { if (orgHooks) orgHooks.update(d); }, filter: (a) => orgFilter(a),
       subscribe: noop, sse: noop, orgColors: () => ({}) },
-    TurmaBoard: { orgName: (k) => k, orgColorMap: () => ({}) },
+    TurmaBoard: { orgName: (k, o) => o || k, orgColorMap: () => ({}),
+      mergeSites: (agents) => agents.map((a) => a.jira).filter(Boolean) },
     TurmaNewTicket: { update: noop },
   };
   const keys = Object.keys(stubs);
@@ -122,7 +124,7 @@ function loadHelpers(fetchReply = null) {
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
     hostLabel, hostSeries, repoSeries,
     applyAgent, connectSSE, refresh, mergeSnapshot,
-    modelQualityCardHtml, refreshModelQuality, mqBadRate, mqOrdered, getMqView: () => mqView,
+    modelQualityCardHtml, refreshModelQuality, syncModelQualityScope, mqBadRate, mqOrdered, getMqView: () => mqView,
     permissionsCardHtml, refreshPermissions, getPermView: () => permView, setCache: (c) => { cache = c; }, getCache: () => cache };`;
   // `els` rides along so the render-level tests can reach the containers the
   // page paints INTO — the strip is written to #totals rather than returned.
@@ -1778,4 +1780,40 @@ test("XERK-1849: an outcome named like an Object member reads pending", () => {
     MQ_NOW, "acme", true);
   assert.match(html, /mq-outcome o-pending/);
   assert.doesNotMatch(html, /native code/);
+});
+
+test("XERK-1849: a rework block with no figure adds no column", () => {
+  const html = H.modelQualityCardHtml({ groups: [mqG({ sessions: 1, rework: { qaPasses: null, ciRounds: "n/a" } })] }, MQ_NOW);
+  assert.doesNotMatch(html, /QA passes/);
+});
+
+test("XERK-1849: the drill-down names the org as the header does", async () => {
+  const saved = orgKeys;
+  try {
+    orgKeys = ["acme"];
+    const H11 = loadHelpers(() => ({ groups: [mqG({ sessions: 1 })], rows: [{ issue: "A-1" }] }));
+    H11.syncModelQualityScope([{ jira: { siteKey: "acme", orgName: "Acme Corp" } }]);
+    await new Promise((r) => setImmediate(r));
+    await new Promise((r) => setImmediate(r));
+    assert.match(H11.els.modelQuality.innerHTML, /Sessions in Acme Corp \(1\)/);
+  } finally { orgKeys = saved; }
+});
+
+test("XERK-1849: a late refusal for an org the operator left is discarded", async () => {
+  const saved = orgKeys;
+  let release;
+  try {
+    orgKeys = ["acme"];
+    const H12 = loadHelpers(Object.assign(() => ({ groups: [mqG({ sessions: 1 })], rows: [{ issue: "R-1" }] }), {
+      httpStatus: (u) => (u.includes("acme") ? 500 : 0),
+      refusalBody: () => new Promise((res) => { release = () => res({ error: "acme down" }); }),
+    }));
+    const first = H12.refreshModelQuality();
+    orgKeys = ["rival"];
+    await H12.refreshModelQuality();
+    release();
+    await first;
+    assert.match(H12.els.modelQuality.innerHTML, /R-1/);
+    assert.doesNotMatch(H12.els.modelQuality.innerHTML, /acme down/);
+  } finally { orgKeys = saved; }
 });
