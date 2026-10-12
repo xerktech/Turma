@@ -178,7 +178,6 @@ const hub = require("../server.js");
 test.afterEach(() => {
   hub.__setDshEnabled(false);
   hub.__setQwenEnabled(false);
-  hub.__setTicketModelLadder([]);   // XERK-1827: off by default; ladder tests turn it on
   // Release the XERK-550 auto-merge opt-in so server.js's LIVE 15s sweep
   // interval (which runs autoMergeSweep/autoCloseSweep) idles outside the exact
   // test that set it up — otherwise a populated map keeps those sweeps churning
@@ -8090,18 +8089,7 @@ test("http: a model-pinned ticket carries the model on its spawnTicket command",
   ]);
 });
 
-test("XERK-1827: TICKET_MODEL_LADDER parses off by default; on/booleans/lists as written", () => {
-  const P = hub.parseTicketModelLadder, D = hub.TICKET_MODEL_LADDER_DEFAULT;
-  for (const v of [undefined, "", "  ", "off", "OFF", "none", "false", "0", "no", "junk!!,@@"]) {
-    assert.deepEqual(P(v), [], String(v));
-  }
-  for (const v of ["on", "ON ", "default", "true", "1", "yes"]) assert.deepEqual(P(v), D, v);
-  assert.deepEqual(P("haiku, opus"), ["haiku", "opus"]);
-  assert.deepEqual(P("haiku,BAD!,opus"), ["haiku", "opus"]);
-  assert.deepEqual(D, ["haiku", "sonnet", "opus"]);
-});
-
-test("XERK-1827: the ladder is OFF by default — an unpinned ticket carries no model", async () => {
+test("XERK-1848: the policy routes nothing by default (observe) — an unpinned ticket carries no model", async () => {
   await ticketBeat("tmOff", "tmOff.atlassian.net");
   const res = await request("POST", "/api/jira/tmOff.atlassian.net/ENG-5/session",
     { headers: userHeaders });
@@ -8111,205 +8099,297 @@ test("XERK-1827: the ladder is OFF by default — an unpinned ticket carries no 
   ]);
 });
 
-test("XERK-1827: with the ladder on, an unpinned ticket's first session starts on its bottom tier", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  await ticketBeat("tmNone", "tmNone.atlassian.net");
-  const res = await request("POST", "/api/jira/tmNone.atlassian.net/ENG-5/session",
-    { headers: userHeaders });
-  assert.deepEqual(agents.tmNone.commands, [
-    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual",
-      ticketSite: "tmNone.atlassian.net", model: "haiku", cmdId: res.body.cmdId },
-  ]);
-});
-
-// The ticket model ladder (XERK-1827): a session of the ticket that ENDED with no
-// PR and no close-ticket outcome is a failed attempt on its model; the next start
-// runs one tier up, capped at the top.
-const ladderBeat = (device, site, { sessions = [], closed = [] } = {}) =>
+// The routing policy (XERK-1848): shadow pairs promote (class, model); a
+// promoted class's unpinned tickets start on that model when MODEL_POLICY=on.
+const policyBeat = (device, site, { sessions = [], closed = [], type = "Bug", capacity } = {}) =>
   request("POST", "/api/heartbeat", {
     body: {
       device,
       repos: [{ name: "Turma", path: "/git/Turma" }],
       sessions, closedSessions: closed,
+      ...(capacity ? { capacity } : {}),
       jira: {
         available: true, configured: true, siteKey: site, user: `${device}@x.com`,
         fetchedAt: "2026-07-14T12:00:00Z",
-        tickets: [{ key: "ENG-5", summary: "Fix it", repoGuess: { repo: "Turma", cloned: true } }],
+        tickets: [{ key: "ENG-5", summary: "Fix it", type, repoGuess: { repo: "Turma", cloned: true } }],
       },
     },
     headers: agentHeaders,
   });
-const ladderTicket = (site, extra = {}) =>
+const policyTicket = (site, extra = {}) =>
   ({ key: "ENG-5", siteKey: site, url: "u", summary: "s", branch: "ENG-5", ...extra });
+// One live row + its graded shadow per pair, straight into the ledger.
+let policySeq = 0;
+function seedPairs(cls, model, n, { bad = 0, liveModel = "opus", at = Date.now() - 1000 } = {}) {
+  const rows = hub.outcomeLedger._internals.rows();
+  for (let i = 0; i < n; i++) {
+    const id = `p${++policySeq}`;
+    const live = hub.outcomeLedger.sanitizeRow({ site: "seed.atlassian.net", issue: `S-${policySeq}`,
+      host: "seed", sid: id, cls, model: liveModel, firstSeen: at, updatedAt: at, startedAt: at,
+      prs: [{ url: `https://github.com/x/y/pull/${policySeq}`, state: "MERGED", mergedAt: at }] });
+    rows.set(live.key, live);
+    const sh = hub.outcomeLedger.sanitizeRow({ site: "seed.atlassian.net", issue: `S-${policySeq}`,
+      host: "seed", sid: `sh-${id}`, cls, model, firstSeen: at, updatedAt: at, kind: "shadow",
+      pairOf: live.key, shadowState: "graded", grade: { verdict: i < bad ? "bad" : "good" } });
+    rows.set(sh.key, sh);
+  }
+}
+// A live (class, model) row with an outcome: "bad" (closed unmerged) or "good-ish" (merged).
+function seedLive(cls, model, outcome, at = Date.now()) {
+  const id = `l${++policySeq}`;
+  const r = hub.outcomeLedger.sanitizeRow({ site: "seed.atlassian.net", issue: `L-${policySeq}`,
+    host: "seed", sid: id, cls, model, firstSeen: at, updatedAt: at, startedAt: at,
+    prs: [{ url: `https://github.com/x/y/pull/9${policySeq}`,
+      state: outcome === "bad" ? "CLOSED" : "MERGED", mergedAt: at }] });
+  hub.outcomeLedger._internals.rows().set(r.key, r);
+}
+function resetPolicy() {
+  hub.outcomeLedger._internals.reset();
+  hub.__setModelPolicyState({});
+}
 
-test("XERK-1827: an undelivered haiku session escalates the next start to sonnet, then opus", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  const site = "lad1.atlassian.net";
-  await ladderBeat("lad1", site);   // bind the org first
-  await ladderBeat("lad1", site, { closed: [
-    { id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site), prs: [] }] });
-  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "sonnet", escalatedFrom: "haiku" });
-  const res = await request("POST", `/api/jira/${site}/ENG-5/session`, { headers: userHeaders });
-  assert.deepEqual(agents.lad1.commands, [
-    { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual", ticketSite: site,
-      model: "sonnet", escalatedFrom: "haiku", cmdId: res.body.cmdId },
-  ]);
-  // A failed sonnet session too: opus, and opus stays the ceiling after that.
-  await ladderBeat("lad1", site, { closed: [
-    { id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site) },
-    { id: "b", repo: "Turma", model: "sonnet", ticket: ladderTicket(site) }] });
-  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "opus", escalatedFrom: "sonnet" });
-  await ladderBeat("lad1", site, { sessions: [
-    { id: "c", repo: "Turma", status: "stopped", model: "opus", ticket: ladderTicket(site) }] });
-  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "opus", escalatedFrom: "opus" });
+test("XERK-1848: promotion needs 40 graded pairs and few candidate-only failures", () => {
+  resetPolicy();
+  try {
+    seedPairs("bug", "sonnet", 39);
+    hub.modelPolicySweep();
+    assert.deepEqual({ ...hub.__modelPolicyState() }, {});
+    seedPairs("bug", "sonnet", 1);
+    seedPairs("task", "haiku", 40, { bad: 1 });   // 1/40: Wilson upper 12.9% > 10%
+    hub.modelPolicySweep();
+    const st = hub.__modelPolicyState();
+    assert.equal(st["bug/sonnet"].state, "promoted");
+    assert.equal(st["bug/sonnet"].graded, 40);
+    assert.ok(!st["task/haiku"]);
+    // Observe (the default) records it but routes nothing.
+    assert.deepEqual(hub.modelPolicyPayload(), { mode: "observe", promoted: { bug: "sonnet" } });
+    assert.equal(hub.modelPolicyPick("x", "ENG-5"), null);
+  } finally { resetPolicy(); }
 });
 
-test("XERK-1830: /api/agents serves the ticket model ladder for the board's Model row", async () => {
-  // Off by default (XERK-1827): served empty, so the board reads "Default".
-  let res = await request("GET", "/api/agents", { headers: userHeaders });
-  assert.deepEqual(res.body.ticketModelLadder, []);
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  res = await request("GET", "/api/agents", { headers: userHeaders });
-  assert.deepEqual(res.body.ticketModelLadder, ["haiku", "sonnet", "opus"]);
+test("XERK-1848: a live bad pair (both models bad) is no candidate-only failure", () => {
+  resetPolicy();
+  try {
+    // Shadows graded bad whose live row is ALSO bad do not count against the candidate.
+    const rows = hub.outcomeLedger._internals.rows();
+    seedPairs("bug", "haiku", 40, { bad: 5 });
+    for (const r of rows.values()) {
+      if (r.kind === "shadow" && r.grade.verdict === "bad") rows.get(r.pairOf).reopenedAt = Date.now();
+    }
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/haiku"].state, "promoted");
+  } finally { resetPolicy(); }
 });
 
-test("XERK-1827: a live error or queued record never climbs the ladder (infra is not a miss)", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  const site = "lad5.atlassian.net";
-  await ladderBeat("lad5", site);
-  await ladderBeat("lad5", site, { sessions: [
-    { id: "e", repo: "Turma", status: "error", errorMsg: "clone failed", model: "haiku", ticket: ladderTicket(site) },
-    { id: "q", repo: "Turma", status: "queued", model: "sonnet", ticket: ladderTicket(site) }] });
-  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
+test("XERK-1848: MODEL_POLICY=on starts an unpinned ticket of a promoted class on that model", async () => {
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  try {
+    seedPairs("bug", "sonnet", 40);
+    seedPairs("bug", "haiku", 40);   // two promoted: the cheaper one routes
+    hub.modelPolicySweep();
+    const site = "pol1.atlassian.net";
+    await policyBeat("pol1", site);
+    const res = await request("POST", `/api/jira/${site}/ENG-5/session`, { headers: userHeaders });
+    assert.deepEqual(agents.pol1.commands, [
+      { type: "spawnTicket", issueKey: "ENG-5", ticketSource: "manual", ticketSite: site,
+        model: "haiku", cmdId: res.body.cmdId },
+    ]);
+    const agentsRes = await request("GET", "/api/agents", { headers: userHeaders });
+    assert.deepEqual(agentsRes.body.modelPolicy, { mode: "on", promoted: { bug: "haiku" } });
+    assert.ok(!("ticketModelLadder" in agentsRes.body));
+    // Another class keeps the login default.
+    await policyBeat("pol1b", "pol1b.atlassian.net", { type: "Story" });
+    assert.equal(hub.modelPolicyPick("pol1b.atlassian.net", "ENG-5"), null);
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
 });
 
-test("XERK-1827: a host bound to another org cannot climb this org's ladder", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  const site = "lad6.atlassian.net";
-  await ladderBeat("lad6", site);
-  await ladderBeat("lad6rogue", "rival6.atlassian.net");          // bound to rival
-  await ladderBeat("lad6rogue", site, { closed: [                  // now claims lad6
-    { id: "x", repo: "Turma", model: "sonnet", ticket: ladderTicket(site) }] });
-  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
+test("XERK-1848: the operator's model pin and a non-claude runtime always win", async () => {
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  try {
+    seedPairs("bug", "sonnet", 40);
+    hub.modelPolicySweep();
+    const site = "pol2.atlassian.net";
+    await policyBeat("pol2", site);
+    assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null, "pol2"), { model: "sonnet" });
+    assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", { runtime: "dsh" }), {});
+    agents.pol2.defaultRuntime = "qwen";
+    assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null, "pol2"), {});
+    agents.pol2.defaultRuntime = "claude";
+    await setModel(site, "ENG-5", { model: "opus" });
+    assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null, "pol2"), { model: "opus" });
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
 });
 
-test("XERK-1830: a drifting host's history never climbs the ladder (row and spawn agree)", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  const site = "lad8.atlassian.net";
-  await ladderBeat("lad8", site);                                  // bound to lad8
-  await ladderBeat("lad8", "other8.atlassian.net", { closed: [     // now declares another org
-    { id: "x", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }] });
-  // The board filters on the served (decided) org, "" here, so the hub must too.
-  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
+test("XERK-1848: the queue drain carries the policy's pick", async () => {
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  try {
+    seedPairs("bug", "sonnet", 40);
+    hub.modelPolicySweep();
+    const site = "pol3.atlassian.net";
+    const full = { maxSessions: 1, running: 1, queued: 0, free: 0, rootRunning: false };
+    await policyBeat("pol3", site, { capacity: full });
+    const res = await request("POST", `/api/jira/${site}/ENG-5/session`, { headers: userHeaders });
+    assert.equal(res.body.queued, true);
+    await policyBeat("pol3", site, { capacity: { ...full, running: 0, free: 1 } });
+    drainTicketQueue();
+    const cmd = agents.pol3.commands.find((c) => c.type === "spawnTicket");
+    assert.equal(cmd.model, "sonnet");
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
 });
 
-test("XERK-1827: a host whose default runtime is not claude gets no ladder model", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  const site = "lad7.atlassian.net";
-  await ladderBeat("lad7", site);
-  agents.lad7.defaultRuntime = "qwen";
-  assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null, "lad7"), {});
-  agents.lad7.defaultRuntime = "claude";
-  assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null, "lad7"), { model: "haiku" });
+test("XERK-1848: the tripwire demotes a promoted model whose live bad rate beats Opus's, sticky until new pairs", () => {
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  const before = notifications.length;
+  try {
+    seedPairs("bug", "sonnet", 40, { at: Date.now() - 60000 });
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+    // Opus's baseline: 1 bad in 60 (the 40 seeded live rows merged, plus these 20).
+    for (let i = 0; i < 19; i++) seedLive("bug", "opus", "merged", Date.now() - 120000);
+    seedLive("bug", "opus", "bad", Date.now() - 120000);
+    // Sonnet live work BEFORE its promotion is not the tripwire's business.
+    for (let i = 0; i < 5; i++) seedLive("bug", "sonnet", "bad", Date.now() - 120000);
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+    // 1 bad of 3 since: Wilson lower 6% > the 1.7% baseline -> demoted.
+    seedLive("bug", "sonnet", "bad");
+    seedLive("bug", "sonnet", "merged");
+    seedLive("bug", "sonnet", "merged");
+    hub.modelPolicySweep();
+    const e = hub.__modelPolicyState()["bug/sonnet"];
+    assert.equal(e.state, "demoted");
+    assert.equal(e.bad, 1);
+    assert.equal(e.n, 3);
+    assert.ok(Math.abs(e.baseline - 1 / 60) < 1e-9);
+    assert.equal(hub.modelPolicyPick("x", "y"), null);
+    const n = notifications.slice(before).find((x) => x.data && x.data.notifKey === "model-demoted:bug/sonnet");
+    assert.ok(n, "the operator is notified");
+    assert.match(n.title, /bug work moved back to Opus/);
+    // Sticky: the old 40 pairs do not re-promote it.
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "demoted");
+    // 40 NEW clean pairs, graded after the demotion, do.
+    seedPairs("bug", "sonnet", 40, { at: Date.now() + 1000 });
+    hub.modelPolicySweep();
+    const again = hub.__modelPolicyState()["bug/sonnet"];
+    assert.equal(again.state, "promoted");
+    assert.equal(again.graded, 80);   // the fleet total at promotion
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
 });
 
-test("XERK-1827: Start and the drain send a qwen-default host no ladder model", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  hub.__setQwenEnabled(true);   // reset by the suite's afterEach
-  const site = "lad9.atlassian.net";
-  const beat = (free) => request("POST", "/api/heartbeat", {
-    body: {
-      device: "lad9", repos: [{ name: "Turma", path: "/git/Turma" }],
-      defaultRuntime: "qwen", qwen: { available: true },
-      capacity: { maxSessions: 2, running: 2 - free, queued: 0, free, rootRunning: false },
-      jira: { available: true, configured: true, siteKey: site, user: "lad9@x.com",
-        fetchedAt: "2026-07-14T12:00:00Z",
-        tickets: [{ key: "ENG-5", summary: "Fix it", repoGuess: { repo: "Turma", cloned: true } },
-          { key: "ENG-6", summary: "Fix it", repoGuess: { repo: "Turma", cloned: true } }] },
-    },
-    headers: agentHeaders,
+test("XERK-1848: re-promotion judges only pairs graded after the demotion, never count deltas", () => {
+  resetPolicy();
+  try {
+    const demotedAt = Date.now();
+    hub.__setModelPolicyState({ "bug/sonnet": { state: "demoted", at: demotedAt, graded: 60, mOnlyFail: 3,
+      bad: 1, n: 3, baseline: 0 } });
+    // Old failing evidence later blamed on Opus too (live row reopened) must not
+    // free up "room" for new failures: 3 of 40 new pairs fail -> stays demoted.
+    seedPairs("bug", "sonnet", 20, { bad: 3, at: demotedAt - 5000 });
+    const rows = hub.outcomeLedger._internals.rows();
+    for (const r of rows.values()) {
+      if (r.kind === "shadow" && r.grade.verdict === "bad") rows.get(r.pairOf).reopenedAt = Date.now();
+    }
+    seedPairs("bug", "sonnet", 40, { bad: 3, at: demotedAt + 1000 });
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "demoted");
+  } finally { resetPolicy(); }
+  resetPolicy();
+  try {
+    // Evicted old pairs never block a model that earned it back on new ones.
+    const demotedAt = Date.now();
+    hub.__setModelPolicyState({ "bug/sonnet": { state: "demoted", at: demotedAt, graded: 100, mOnlyFail: 0,
+      bad: 1, n: 3, baseline: 0 } });
+    seedPairs("bug", "sonnet", 60, { at: demotedAt + 1000 });
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+  } finally { resetPolicy(); }
+});
+
+test("XERK-1848: only a cheaper Claude family is ever promoted", () => {
+  resetPolicy();
+  try {
+    for (const m of ["opus", "fable", "default", "gpt-oss-20b"]) seedPairs("bug", m, 40, { liveModel: "sonnet" });
+    hub.modelPolicySweep();
+    assert.deepEqual({ ...hub.__modelPolicyState() }, {});
+  } finally { resetPolicy(); }
+});
+
+test("XERK-1848: the tripwire uses the Wilson lower bound, not the point rate", () => {
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  try {
+    seedPairs("bug", "sonnet", 40, { at: Date.now() - 60000 });
+    hub.modelPolicySweep();
+    for (let i = 0; i < 19; i++) seedLive("bug", "opus", "merged", Date.now() - 120000);
+    seedLive("bug", "opus", "bad", Date.now() - 120000);   // baseline 1/60
+    // 1 bad of 20: point rate 5% > 1.7%, but Wilson lower 0.9% is not.
+    seedLive("bug", "sonnet", "bad");
+    for (let i = 0; i < 19; i++) seedLive("bug", "sonnet", "merged");
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-1848: the tripwire only runs when the policy is on", () => {
+  resetPolicy();
+  try {
+    seedPairs("bug", "sonnet", 40, { at: Date.now() - 60000 });
+    hub.modelPolicySweep();
+    for (let i = 0; i < 3; i++) seedLive("bug", "sonnet", "bad");
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+  } finally { resetPolicy(); }
+});
+
+test("XERK-1848: the model-quality route serves each group's promotion status", () => {
+  resetPolicy();
+  try {
+    seedPairs("bug", "sonnet", 40);
+    hub.modelPolicySweep();
+    hub.__setModelPolicyState({ ...hub.__modelPolicyState(),
+      "task/haiku": { state: "demoted", at: 1, graded: 40, mOnlyFail: 0, bad: 2, n: 3, baseline: 0 } });
+    seedPairs("task", "haiku", 1);
+    let view = hub.modelQualityView(new URLSearchParams());
+    const g = (cls, model) => view.groups.find((x) => x.cls === cls && x.model === model);
+    assert.equal(view.policy, "observe");
+    assert.equal(g("bug", "sonnet").promotion, "promoted (observe)");
+    assert.equal(g("task", "haiku").promotion, "demoted");
+    assert.ok(!("promotion" in g("bug", "opus")));
+    hub.__setModelPolicy("on");
+    view = hub.modelQualityView(new URLSearchParams());
+    assert.equal(g("bug", "sonnet").promotion, "promoted");
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-1848: the stored policy is coerced field by field", () => {
+  hub.__setModelPolicyState({
+    "bug/sonnet": { state: "promoted", at: 5, graded: 40, mOnlyFail: 0 },
+    "bug/opus": { state: "promoted", at: 5 },               // Opus is the baseline, never promoted
+    "Bad Key/x": { state: "promoted", at: 5 },
+    "task/haiku": { state: "weird", at: 5 },
+    "story/haiku": { state: "demoted", at: "5" },
+    "epic/haiku": { state: "demoted", at: 7, graded: -1, baseline: 3 },
   });
-  await beat(2);
-  assert.equal(agents.lad9.defaultRuntime, "qwen");
-  await request("POST", `/api/jira/${site}/ENG-5/session`, { headers: userHeaders });
-  await beat(0);
-  const q = await request("POST", `/api/jira/${site}/ENG-6/session`, { headers: userHeaders });
-  assert.equal(q.body.queued, true);
-  await beat(2);   // ENG-5's undelivered spawn still holds one of the two slots
-  drainTicketQueue();
-  const cmds = agents.lad9.commands.filter((c) => c.type === "spawnTicket");
-  assert.deepEqual(cmds.map((c) => c.issueKey).sort(), ["ENG-5", "ENG-6"]);
-  for (const c of cmds) assert.ok(!("model" in c) && !("escalatedFrom" in c), JSON.stringify(c));
-});
-
-test("XERK-1827: the queue drain carries the ladder's pick", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  const site = "lad8.atlassian.net";
-  const full = { maxSessions: 1, running: 1, queued: 0, free: 0, rootRunning: false };
-  const beat = (capacity, closed = []) => request("POST", "/api/heartbeat", {
-    body: {
-      device: "lad8", repos: [{ name: "Turma", path: "/git/Turma" }], capacity, closedSessions: closed,
-      jira: { available: true, configured: true, siteKey: site, user: "lad8@x.com",
-        fetchedAt: "2026-07-14T12:00:00Z",
-        tickets: [{ key: "ENG-5", summary: "Fix it", repoGuess: { repo: "Turma", cloned: true } }] },
-    },
-    headers: agentHeaders,
+  assert.deepEqual({ ...hub.__modelPolicyState() }, {
+    "bug/sonnet": { state: "promoted", at: 5, graded: 40, mOnlyFail: 0 },
+    "epic/haiku": { state: "demoted", at: 7, graded: 0, mOnlyFail: 0, bad: 0, n: 0, baseline: 0 },
   });
-  await beat(full);
-  await beat(full, [{ id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }]);
-  const res = await request("POST", `/api/jira/${site}/ENG-5/session`, { headers: userHeaders });
-  assert.equal(res.body.queued, true);
-  await beat({ ...full, running: 0, free: 1 },
-    [{ id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }]);
-  drainTicketQueue();
-  const cmd = agents.lad8.commands.find((c) => c.type === "spawnTicket");
-  assert.equal(cmd.model, "sonnet");
-  assert.equal(cmd.escalatedFrom, "haiku");
-});
-
-test("XERK-1827: a delivered, running, paused or model-less session is no failed attempt", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  const site = "lad2.atlassian.net";
-  await ladderBeat("lad2", site);
-  await ladderBeat("lad2", site, {
-    sessions: [{ id: "r", repo: "Turma", status: "running", model: "haiku", ticket: ladderTicket(site) }],
-    closed: [
-      { id: "p", repo: "Turma", model: "haiku", ticket: ladderTicket(site),
-        prs: [{ url: "https://github.com/x/y/pull/1", state: "OPEN" }] },
-      { id: "o", repo: "Turma", model: "sonnet",
-        ticket: ladderTicket(site, { outcome: { kind: "not-reproducible", at: 1 } }) },
-      { id: "z", repo: "Turma", model: "sonnet", ticket: ladderTicket(site),
-        paused: { wakeAt: Date.now() + 3600000 } },
-      { id: "n", repo: "Turma", ticket: ladderTicket(site) },
-      // Another ticket's failure says nothing about this one.
-      { id: "q", repo: "Turma", model: "sonnet", ticket: { ...ladderTicket(site), key: "ENG-9" } },
-    ],
-  });
-  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
-});
-
-test("XERK-1827: the operator's model pin and a non-claude runtime pin bypass the ladder", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
-  const site = "lad3.atlassian.net";
-  await ladderBeat("lad3", site);
-  await ladderBeat("lad3", site, { closed: [
-    { id: "a", repo: "Turma", model: "haiku", ticket: ladderTicket(site) }] });
-  assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", { runtime: "dsh" }), {});
-  await setModel(site, "ENG-5", { model: "opus" });
-  assert.deepEqual(hub.ticketSpawnModelFields(site, "ENG-5", null), { model: "opus" });
-  assert.equal(hub.ticketLadderPick(site, "ENG-5", []), null);   // ladder off
+  hub.__setModelPolicyState({});
 });
 
 test("XERK-1827: a closed session's model is kept only as a plain alias", async () => {
-  hub.__setTicketModelLadder(hub.TICKET_MODEL_LADDER_DEFAULT);
   const site = "lad4.atlassian.net";
-  await ladderBeat("lad4", site);
-  await ladderBeat("lad4", site, { closed: [
-    { id: "a", repo: "Turma", model: { evil: 1 }, ticket: ladderTicket(site) },
-    { id: "b", repo: "Turma", model: "x'; rm", ticket: ladderTicket(site) }] });
+  await policyBeat("lad4", site);
+  await policyBeat("lad4", site, { closed: [
+    { id: "a", repo: "Turma", model: { evil: 1 }, ticket: policyTicket(site) },
+    { id: "b", repo: "Turma", model: "x'; rm", ticket: policyTicket(site) }] });
   const closed = agents.lad4.closedSessions;
   assert.ok(!("model" in closed[0]) && !("model" in closed[1]));
-  assert.deepEqual(hub.ticketLadderPick(site, "ENG-5"), { model: "haiku" });
 });
 
 // POST /api/jira/<siteKey>/<issueKey>/runtime — the operator's per-ticket

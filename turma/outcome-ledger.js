@@ -819,6 +819,70 @@ function pairsOf(shadows, now, windowDays) {
     || a.cls.localeCompare(b.cls) || a.model.localeCompare(b.model));
 }
 
+// ---- routing policy evidence (XERK-1848) ------------------------------------
+
+/**
+ * The 95% Wilson score interval for k successes in n trials: {lower, upper}.
+ * n = 0 says nothing, so the interval is the whole [0, 1].
+ */
+function wilson(k, n, z = 1.96) {
+  if (!(n > 0)) return { lower: 0, upper: 1 };
+  const p = Math.min(Math.max(k, 0), n) / n;
+  const z2 = z * z;
+  const centre = (p + z2 / (2 * n)) / (1 + z2 / n);
+  const half = (z / (1 + z2 / n)) * Math.sqrt(p * (1 - p) / n + z2 / (4 * n * n));
+  return { lower: Math.max(0, centre - half), upper: Math.min(1, centre + half) };
+}
+
+/**
+ * The promotion rule (ADR "Routing policy"): at least `minPairs` graded shadow
+ * pairs, and candidate-only failures at most `maxRate` of them with a 95% Wilson
+ * upper bound at most `maxUpper`.
+ */
+function promotionPasses(graded, mOnlyFail, { minPairs = 40, maxRate = 0.05, maxUpper = 0.10 } = {}) {
+  if (!(graded >= minPairs)) return false;
+  return mOnlyFail / graded <= maxRate && wilson(mOnlyFail, graded).upper <= maxUpper;
+}
+
+/**
+ * Graded shadow pairs for (class, candidate model) whose grade landed at or
+ * after `since` (the grade's own time, else the row's last update): {graded,
+ * mOnlyFail}, counted as `pairsOf` counts them. A demotion re-promotes only on
+ * these — never on count deltas, which fall when rows are evicted or a live row
+ * later goes bad.
+ */
+function pairEvidence(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW_DAYS } = {}) {
+  let graded = 0, mOnlyFail = 0;
+  for (const r of rows.values()) {
+    if (r.kind !== "shadow" || r.cls !== cls || r.model !== model || !r.grade) continue;
+    if ((r.grade.at || r.updatedAt) < since) continue;
+    const live = r.pairOf ? rows.get(r.pairOf) : null;
+    if (!live) continue;
+    graded += 1;
+    if (r.grade.verdict !== "good" && outcomeOf(live, now, windowDays).outcome !== "bad") mOnlyFail += 1;
+  }
+  return { graded, mOnlyFail };
+}
+
+/**
+ * The live bad rate of (class, model) for the tripwire: {bad, n} over live rows
+ * that started at or after `since`. n counts the rows with something to judge —
+ * bad, good, or merged and still inside the defect window — so a model is not
+ * read as all-bad just because `good` needs the whole window to elapse; the Opus
+ * baseline is read the same way.
+ */
+function liveRate(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW_DAYS } = {}) {
+  let bad = 0, n = 0;
+  for (const r of rows.values()) {
+    if (r.kind === "shadow" || r.cls !== cls || r.model !== model) continue;
+    if ((r.startedAt || r.firstSeen) < since) continue;
+    const { outcome, reason } = outcomeOf(r, now, windowDays);
+    if (outcome === "bad") { bad += 1; n += 1; }
+    else if (outcome === "good" || reason === "merged, in window") n += 1;
+  }
+  return { bad, n };
+}
+
 /** Per (class, model, outcome) counts for /metrics (no host, ticket or session). */
 function metricsText(now = Date.now()) {
   // Bounded label sets: models outside the known families read "other", and only
@@ -1095,6 +1159,7 @@ load();
 module.exports = {
   observe, attributeDefects, sanitizeDefectReports, aggregate, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
   shadowCandidates, decideShadow, shadowsDispatchedSince, observeShadows, SHADOW_ID_RE,
+  wilson, promotionPasses, liveRate, pairEvidence,
   configure, rehydrate, flush,
   LEDGER_FILE, MAX_ROWS, WINDOW_DAYS, RETAIN_DAYS, T_ROW, OutcomeLedgerPgStore,
   _internals: {

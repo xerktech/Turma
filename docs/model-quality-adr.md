@@ -103,6 +103,9 @@ evidence from real work that it does not ship worse code.
 - Tripwire: live (C, M) bad rate whose Wilson lower bound exceeds the Opus baseline for C demotes
   (C, M) back to Opus and notifies the operator. Demotion is sticky until new shadow evidence.
 - The XERK-1827 ladder is retired when the policy ships; its delivery-only signal is subsumed.
+- Shipped in XERK-1848; operative rules in `.claude/rules/model-routing.md`. The tripwire's live
+  rate counts bad over bad + good + merged-in-window on both sides, since `good` needs the whole
+  defect window to elapse.
 
 ## Delivery
 

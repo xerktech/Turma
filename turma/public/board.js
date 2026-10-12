@@ -2000,26 +2000,30 @@
     return p && p.model ? p : null;
   }
 
-  // The model ladder's pick for an UNPINNED ticket (XERK-1830) — a port of the
-  // hub's ticketLadderPick + ticketSpawnModelFields (XERK-1827), so the Model row
-  // names the tier Start will actually send. `ladder` is the hub's served
-  // ticketModelLadder; absent (an older hub) or empty (TICKET_MODEL_LADDER=off)
-  // means unpinned tickets run the login's default → null, the old "Default" row.
-  // A session of the ticket that is no longer running (stopped, or a closed
-  // record that isn't a paused sleeper) with no PR and no close-ticket outcome
-  // is a failed attempt on its `model`; the pick is one tier above the highest
-  // failed one, capped. Only hosts the hub decided into the ticket's org count
-  // (the served `org`, as ticketSessionIndex reads it). A dsh/qwen runtime pin,
-  // or an agent pin to a host whose default runtime isn't claude, gets no
-  // ladder (null) — the hub sends no model there either. Returns
-  // {model, escalatedFrom?, elsewhere?} or null.
+  // A ticket's work class (XERK-1848) — the hub's outcome-ledger `workClass`:
+  // the tracker's issue type, lowercased, one token, "other" when missing.
+  function workClassOf(type) {
+    const s = typeof type === "string"
+      ? type.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim().slice(0, 40) : "";
+    return s.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "") || "other";
+  }
+
+  // The routing policy's pick for an UNPINNED ticket (XERK-1848) — a port of the
+  // hub's ticketSpawnModelFields + modelPolicyPick, so the Model row names what
+  // Start will send. `policy` is the hub's served modelPolicy ({mode, promoted:
+  // {class: model}}); only mode "on" routes, so anything else (observe, off, an
+  // older hub) → null, the "Default" row. A dsh/qwen runtime pin, or an agent pin
+  // to a host whose default runtime isn't claude, gets no model (null) — the hub
+  // sends none there either. Returns {model, cls, elsewhere?} or null.
   // `elsewhere` (XERK-1840): with no agent or runtime pin, Start may route to ANY
   // online host in the org, and one whose default runtime isn't claude gets no
-  // ladder model. The client can't know which host Start picks, so the pick
-  // names those runtimes and the row hedges ("on Claude hosts") rather than
-  // claiming a tier that host won't run.
-  function ladderPickOf(agents, ladder, siteKey, issueKey, opts) {
-    if (!Array.isArray(ladder) || !ladder.length) return null;
+  // policy model. The client can't know which host Start picks, so the pick
+  // names those runtimes and the row hedges ("on Claude hosts").
+  function modelPickOf(agents, policy, siteKey, ticket, opts) {
+    if (!policy || policy.mode !== "on" || !policy.promoted || typeof policy.promoted !== "object") return null;
+    const cls = workClassOf(ticket && ticket.type);
+    const model = Object.prototype.hasOwnProperty.call(policy.promoted, cls) ? policy.promoted[cls] : null;
+    if (typeof model !== "string" || !model) return null;
     const o = opts || {};
     if (o.runtimePin && o.runtimePin.runtime && o.runtimePin.runtime !== "claude") return null;
     const list = agents || [];
@@ -2027,28 +2031,9 @@
       const a = list.find((x) => x && (x.key || x.device) === o.agentPin.host);
       if (a && (a.defaultRuntime || "claude") !== "claude") return null;
     }
-    const orgOf = (a) => a.org != null ? a.org : ((a.jira && a.jira.siteKey) || undefined);
-    const mine = (s) => s && s.ticket && s.ticket.key === issueKey && s.ticket.siteKey === siteKey;
-    let failed = -1;
-    const consider = (rec, live) => {
-      if (!mine(rec)) return;
-      if (live && rec.status !== "stopped") return;
-      if (rec.paused) return;
-      const delivered = (Array.isArray(rec.prs) && rec.prs.length > 0)
-        || (Array.isArray(rec.prUrls) && rec.prUrls.length > 0)
-        || !!rec.ticket.outcome;
-      if (delivered) return;
-      const tier = ladder.indexOf(typeof rec.model === "string" ? rec.model : "");
-      if (tier > failed) failed = tier;
-    };
-    for (const a of list) {
-      if (!a || orgOf(a) !== siteKey) continue;
-      for (const s of a.sessions || []) consider(s, true);
-      for (const c of a.closedSessions || []) consider(c, false);
-    }
-    const next = Math.min(failed + 1, ladder.length - 1);
-    const pick = failed >= 0 ? { model: ladder[next], escalatedFrom: ladder[failed] } : { model: ladder[next] };
+    const pick = { model, cls };
     if (!o.runtimePin && !(o.agentPin && o.agentPin.host)) {
+      const orgOf = (a) => a.org != null ? a.org : ((a.jira && a.jira.siteKey) || undefined);
       const other = [];
       for (const a of list) {
         if (!a || !a.online || orgOf(a) !== siteKey) continue;
@@ -2061,14 +2046,13 @@
   }
 
   // What an unpinned ticket's Model row / picker release option is called:
-  // "Auto (Haiku)", "Auto (Sonnet, retry)" under the ladder, else the old
+  // "Auto (Sonnet)" under the routing policy, else the old
   // "Default (<probed default>)". A pick that may land on a non-claude-default
-  // host (XERK-1840) says the tier holds only "on Claude hosts".
-  function modelAutoLabel(models, ladderPick) {
-    if (ladderPick && ladderPick.model) {
-      return `Auto (${esc(prettyModel(ladderPick.model))}`
-        + `${ladderPick.elsewhere && ladderPick.elsewhere.length ? " on Claude hosts" : ""}`
-        + `${ladderPick.escalatedFrom ? ", retry" : ""})`;
+  // host (XERK-1840) says the model holds only "on Claude hosts".
+  function modelAutoLabel(models, pick) {
+    if (pick && pick.model) {
+      return `Auto (${esc(prettyModel(pick.model))}`
+        + `${pick.elsewhere && pick.elsewhere.length ? " on Claude hosts" : ""})`;
     }
     return "Default" + (models && models.defaultLabel
       ? ` (${esc(prettyModel(models.defaultLabel))})` : "");
@@ -2077,19 +2061,17 @@
   // The Model row of the detail panel (XERK-123): which model this ticket's
   // session runs. Panel-only like the Agent row — the default is the common case
   // and there's no per-card chip worth the space. An unpinned row names what
-  // Start will send: the ladder's next tier (opts.ladderPick, XERK-1830), or on
-  // a ladder-less hub what "Default" resolves to when the org has probed.
+  // Start will send: the routing policy's pick (opts.modelPick, XERK-1848), or
+  // what "Default" resolves to when the org has probed.
   function modelFieldHtml(pin, models, opts) {
     const o = opts || {};
     const bits = [];
-    if (!pin && o.ladderPick && o.ladderPick.model) {
-      const why = o.ladderPick.escalatedFrom
-        ? `a ${esc(prettyModel(o.ladderPick.escalatedFrom))} session ended without a PR`
-        : "the model ladder's first tier";
-      const other = o.ladderPick.elsewhere && o.ladderPick.elsewhere.length
-        ? `; a ${o.ladderPick.elsewhere.map((r) => esc(prettyRuntime(r))).join(" or ")} host runs its own default`
+    if (!pin && o.modelPick && o.modelPick.model) {
+      const why = `promoted for ${esc(o.modelPick.cls)} work on shadow-run evidence`;
+      const other = o.modelPick.elsewhere && o.modelPick.elsewhere.length
+        ? `; a ${o.modelPick.elsewhere.map((r) => esc(prettyRuntime(r))).join(" or ")} host runs its own default`
         : "";
-      bits.push(`<span class="td-dim">${modelAutoLabel(models, o.ladderPick)} — ${why}${other}</span>`);
+      bits.push(`<span class="td-dim">${modelAutoLabel(models, o.modelPick)} — ${why}${other}</span>`);
     } else if (!pin) {
       const def = models && models.defaultLabel
         ? ` (${esc(prettyModel(models.defaultLabel))})` : "";
@@ -2115,7 +2097,7 @@
   // The model picker, swapped in for the row on "Change". Choosing an option IS
   // the save, exactly like the repo/agent pickers. "Default" is the release
   // (drops the pin); every other option pins that alias.
-  function modelPickerHtml(pin, models, ladderPick) {
+  function modelPickerHtml(pin, models, modelPick) {
     const cur = pin ? pin.model : null;
     const list = modelChoices(models);
     // A pinned alias that has fallen out of the org's current choices (a probe
@@ -2125,7 +2107,7 @@
     const optHtml = (a) => `<option value="${esc(a)}"${
       a === cur ? " selected" : ""}>${esc(prettyModel(a))}</option>`;
     const sel = `<select class="td-repo-select" data-model-select="1">
-      <option value="__default__"${pin ? "" : " selected"}>${modelAutoLabel(models, ladderPick)}</option>
+      <option value="__default__"${pin ? "" : " selected"}>${modelAutoLabel(models, modelPick)}</option>
       ${list.map(optHtml).join("")}
     </select>`;
     return `<div class="td-repo-edit">${sel}
@@ -2407,10 +2389,10 @@
       // it needs no online host to be editable — the model options are the org's
       // probed list (o.models), always at least the static family aliases.
       fieldRow("Model", o.modelEditing
-        ? modelPickerHtml(o.modelPin, o.models, o.ladderPick)
+        ? modelPickerHtml(o.modelPin, o.models, o.modelPick)
         : modelFieldHtml(o.modelPin, o.models, {
             editable: true,
-            ladderPick: o.ladderPick,
+            modelPick: o.modelPick,
             error: o.modelError,
           })),
       // Which RUNTIME this ticket's session runs on (XERK-473 dsh, XERK-515 qwen).
@@ -2834,7 +2816,7 @@
     repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
     dedupeChipHtml, dedupeTwinUrl,
     agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
-    modelPinOf, ladderPickOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
+    modelPinOf, modelPickOf, workClassOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
     runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
     platformPinOf, platformFieldHtml, platformPickerHtml, platformPickerValue, prettyPlatform,
     statusFieldHtml, statusPickerHtml, statusPickerValue,
