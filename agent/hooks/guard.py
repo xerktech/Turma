@@ -4494,7 +4494,6 @@ def _reader_opts(tokens: list[str]) -> tuple[list[str], list[str], dict[str, str
 
 _GROUP_OPENERS = {"while", "until", "if", "for", "select", "case"}
 _GROUP_CLOSERS = {"done", "fi", "esac"}
-_FUNC_HEADER_RE = re.compile(r"^(?:function\s+)?[A-Za-z_][\w-]*\s*\(\)\s*")
 
 
 def _seg_groups(segs: list[str]) -> list[tuple[int, int]]:
@@ -4884,8 +4883,6 @@ _READER_WORD_RE = re.compile(
     # (QA pass 18). A real reader-prefix value is short.
     r"|`[^`]*`|[^\s;|&'\"$()`]){0,64}[ \t]+){0,8}"
     r"\\?(?:read|mapfile|readarray)(?![\w-])")
-# A heredoc operator and its delimiter word: `<<E`, `<<-'E'`, `<< "E"`.
-_HEREDOC_OP_RE = re.compile(r"(?<!<)<<-?[ \t]*(?:'[^']*'|\"[^\"]*\"|\\?[^\s;|&<>()'\"]+)(?!<)")
 
 
 # An output redirection on an echo: `> f`, `2>>f`, `>&2`.
@@ -10939,7 +10936,7 @@ def _expand(command: str, depth: int, cwds: tuple[str, ...]) -> list[tuple[list[
                 # A run of some other file, which may be a copy of one the
                 # line wrote, or a path built from a value: fails closed.
                 unresolved.setdefault(args, None)
-        if prog in ("rm", "unlink", "chmod", "chown"):
+        if prog in ("rm", "unlink", "chmod", "chown", "chgrp"):
             # `cd /; rm -rf *` deletes `/*`, which `rm` alone never names.
             for cwd in cwds:
                 joined = [_under_cwd(t, cwd) for t in rest]

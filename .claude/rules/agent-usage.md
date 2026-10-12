@@ -149,7 +149,7 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
   a different question from the token counts above, on a pool shared with claude.ai. No API answers
   this (Usage & Cost API is org-scoped/admin-keyed, reports API spend only) — the numbers exist
   **only in the blob Claude Code hands a `statusLine` command**.
-- Early warning for what **local-model failover** (XERK-246, `agent-sessions.md`) handles: reading
+- Early warning for what **local-model failover** (XERK-246, `agent-local-model.md`) handles: reading
   headroom and failing a session over are deliberately separate controls.
 - The probe runs against the **mounted subscription login, never the failover's endpoint** (a local
   model has no windows and every probe would time out). Tests: `TestLimitsSnapshot`.

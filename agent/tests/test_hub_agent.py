@@ -5361,6 +5361,8 @@ class ManagerMixin:
             ("run", fake_run),
             ("run_ok", fake_run_ok),
             ("run_stdin", fake_run_stdin),
+            # _handle_shutdown would set the TEST process's SIGUSR1 to ignored.
+            ("_ignore_late_pokes", lambda: None),
             # The settle before a typed message's Enter is real wall-clock time.
             ("TYPED_SUBMIT_SETTLE_SEC", 0),
             ("_port_open", fake_port_open),
@@ -5832,11 +5834,14 @@ class TestLaunchQwen(ManagerMixin, unittest.TestCase):
         # secrets — it carries no credential at all, unlike the model env file).
         sm = self.make_manager()
         sess = self._sess(rcName="host-Repo-Q1")
-        popen = self._launch(sm, sess, prompt="hi")
+        with mock.patch.dict(os.environ, {"TURMA_TOKEN": "agent-secret"}):
+            popen = self._launch(sm, sess, prompt="hi")
         cid = sess["claudeSessionId"]
         args, kwargs = popen.call_args
         self.assertEqual(args[0], ["python3", "-SI", ha.qwen_peer_inbox_path()])
         env = kwargs["env"]
+        # It runs as the session's uid, so it never holds the agent's own token.
+        self.assertNotIn("TURMA_TOKEN", env)
         self.assertEqual(env["TURMA_SESSION_ID"], "q1")
         self.assertEqual(env["TURMA_CLAUDE_SESSION_ID"], cid)
         self.assertEqual(env["TURMA_RC_NAME"], "host-Repo-Q1")
@@ -37357,6 +37362,16 @@ class TestUpdatingAnnounce(ManagerMixin, unittest.TestCase):
                 sm._handle_shutdown(ha.signal.SIGTERM, None)
         self.assertEqual(calls, [("restart", None)])
 
+    def test_shutdown_ignores_a_late_poke(self):
+        # Rollup XERK-1584: finalization resets a Python SIGUSR1 handler to
+        # SIG_DFL, which kills the process; SIG_IGN survives it.
+        sm = self.make_manager()
+        with mock.patch.object(sm, "_announce_updating"), \
+             mock.patch.object(ha, "_ignore_late_pokes") as ignore:
+            with self.assertRaises(SystemExit):
+                sm._handle_shutdown(ha.signal.SIGTERM, None)
+        ignore.assert_called_once_with()
+
     def test_shutdown_reaps_in_flight_clones(self):
         # A clone can't be adopted across a restart (XERK-374), so a graceful
         # shutdown must kill it rather than orphan a git the boot sweep races.
@@ -37411,11 +37426,14 @@ class TestRestartAgent(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "__file__", os.path.join(self.tmp, "hub-agent.py")), \
              mock.patch.dict(ha.os.environ, self._no_systemd_env(INVOCATION_ID="abc"), clear=True), \
              mock.patch.object(sm, "_announce_updating") as ann, \
+             mock.patch.object(ha, "_ignore_late_pokes") as ignore, \
              mock.patch.object(ha.subprocess, "Popen") as popen:
             with self.assertRaises(SystemExit):
                 sm._perform_restart()
         ann.assert_called_once_with("restart")
         popen.assert_not_called()
+        # A poke landing during exit must not kill us (rollup XERK-1584).
+        ignore.assert_called_once_with()
 
     def test_perform_restart_exits_in_container(self):
         # No systemd and no ctl script beside hub-agent.py (the container layout):
@@ -43838,6 +43856,15 @@ class TestHookIntegrity(unittest.TestCase):
             fh.write("0" * 64 + "  ../hub-agent.py\n" + "0" * 64 + "  hooks/../../x.py\n")
         self.assertEqual([], self._check({}, 1000))
 
+
+
+class TestIgnoreLatePokes(unittest.TestCase):
+    @unittest.skipUnless(hasattr(signal, "SIGUSR1"), "POSIX only")
+    def test_sets_sigusr1_ignored(self):
+        old = signal.getsignal(signal.SIGUSR1)
+        self.addCleanup(signal.signal, signal.SIGUSR1, old)
+        ha._ignore_late_pokes()
+        self.assertIs(signal.getsignal(signal.SIGUSR1), signal.SIG_IGN)
 
 if __name__ == "__main__":
     unittest.main()

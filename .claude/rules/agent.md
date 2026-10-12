@@ -7,7 +7,7 @@ paths:
 # `agent/` — per-host headless agent image
 
 Currently Claude Code; agent-generic name so it can host other agents later. Read `CLAUDE.md` first.
-Session runtime (queue, kill/resume, launch flags, local-model failover): `agent-sessions.md`.
+Session runtime (queue, kill/resume, launch flags): `agent-sessions.md`; local-model failover: `agent-local-model.md`.
 Safety-guard policy: `agent-hooks.md`.
 
 ## `hub-agent.py` — session manager and heartbeat in one process
@@ -122,7 +122,7 @@ Two delivery paths — pane vs. the session's own inbox — and which one a mess
 ### `setModelSource` — failover to the self-hosted model (XERK-246)
 
 - Moves a RUNNING session between the subscription and this host's local model, keeping its
-  conversation (env-repointing, not a second coding agent — why: `agent-sessions.md`,
+  conversation (env-repointing, not a second coding agent — why: `agent-local-model.md`,
   `docs/local-model-failover.md`).
 - `local_model_configured()` gates on **both** endpoint and key, charset-checked model name.
   Half-configured reads as "no".
