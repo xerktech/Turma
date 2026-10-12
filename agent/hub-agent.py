@@ -12170,7 +12170,7 @@ def _resolve_subagent(main_path, agent_type, label):
             # `Task` was matched here, so on today's transcripts NO clicked row
             # resolved and every subagent view opened empty.
             if block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task"):
-                inp = block.get("input") or {}
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
                 have_type = str(inp.get("subagent_type") or "").strip()
                 # A background launch carries NO subagent_type, so its row's type
                 # is the generic "agent" the scan falls back to. Matching that

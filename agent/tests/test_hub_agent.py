@@ -23174,6 +23174,18 @@ class TestResolveSubagent(unittest.TestCase):
         # A pane-truncated label still resolves through the same path.
         self.assertEqual(ha._resolve_subagent(main, "agent", "QA lifecycle pro…"), sub)
 
+    def test_a_non_dict_task_input_is_skipped_not_raised(self):
+        # Claude Code never writes a non-object `input`, but a hand-edited or
+        # corrupt transcript can; one such line must not abort the lookup.
+        main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
+        with open(main) as f:
+            good = f.read()
+        bad = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_x", "name": "Task", "input": "oops"}]}}
+        with open(main, "w") as f:
+            f.write(json.dumps(bad) + "\n" + good)
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
+
     def test_resolves_exact_type_and_label(self):
         main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
         self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
