@@ -58,6 +58,7 @@
     ["while [ \"$(seq 3)\" ]; do sleep 5; done", "work", null],
     ["for i in $(seq 1 $(npm test)); do sleep 5; done", "work", null],
     ["for i in $(seq 3 | sort); do sleep 5; done", "work", null],
+    ["for i in $(seq 3; make); do sleep 5; done", "work", null],
     ["tail -f log | sed --in s/a/b/ f", "work", null],
     ["tail -f log | awk --inc inplace 1 f", "work", null],
     ["tail -f log | awk --include=inplace 1 f", "work", null],
