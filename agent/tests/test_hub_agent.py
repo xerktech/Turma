@@ -7669,8 +7669,15 @@ class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
         sm = self.make_manager()
         gone = dict(self._resumable_row("t2"))
         os.remove(os.path.join(ha.PROJECTS_ROOT, gone["slug"], "t2.jsonl"))
-        escape = dict(self._resumable_row("t3"), slug="..")
-        rows = {"Turma": [self._resumable_row(), self._resumable_row(), gone, escape],
+        # Slugs _project_slug never makes, each with a real file at the joined
+        # path, so only the slug check drops them: a dotted name, an absolute path.
+        odd = os.path.join(ha.PROJECTS_ROOT, "a.b")
+        os.makedirs(odd, exist_ok=True)
+        open(os.path.join(odd, "t3.jsonl"), "a").close()
+        open(os.path.join(odd, "t4.jsonl"), "a").close()
+        dotted = dict(self._resumable_row("t3"), slug="a.b")
+        absolute = dict(self._resumable_row("t4"), slug=odd)
+        rows = {"Turma": [self._resumable_row(), self._resumable_row(), gone, dotted, absolute],
                 "Other": [dict(self._resumable_row(), repo="Other")]}
         with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
             json.dump(rows, f)
