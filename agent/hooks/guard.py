@@ -7884,7 +7884,9 @@ _FED_TEXT_CAP = 64
 # preserve-root) applies.
 _MULTICALL_PREFIXES = ("busybox", "toybox")
 # The same names as raw text: a wrapper word at a command start, and a shell.
-_MULTICALL_WORD = r"(?:busybox|toybox)[\w.-]*"
+# Anchored to a word start: unanchored, each `-busybox` in `a-busybox-busybox…`
+# began a match that scanned the rest of the run, quadratic past the hook timeout.
+_MULTICALL_WORD = r"(?<![\w.+-])(?:busybox|toybox)[\w.+-]*"
 
 
 def _basename(prog: str) -> str:

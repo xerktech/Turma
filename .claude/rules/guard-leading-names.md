@@ -54,6 +54,9 @@ paths:
     `toybox-x86_64`, `busybox.static`. Exact names only let `toybox-x86_64 rm -rf /etc` run.
     - `_CMD_START` takes one as a wrapper word, so `cat a.sh | busybox sh` is a stdin shell
       for the write-then-run rule (was allowed on main). Rollup XERK-1701.
+    - `_MULTICALL_WORD` is anchored by a lookbehind: unanchored, every `-busybox` in one long
+      word started a match, quadratic (1 MB: 945s, past the hook timeout, which runs it).
+      Test: `test_multicall_names_scan_linearly`.
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top

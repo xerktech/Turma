@@ -6227,6 +6227,16 @@ class TestGroupsHoldingOperators(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
 
+    def test_multicall_names_scan_linearly(self):
+        # Unanchored, each `-busybox` in one long word started a match that ran to
+        # its end: 1 MB took 945s in the hook, past its timeout (which runs it).
+        text = ": a" + "-busybox" * 20000
+        for name in ("_RUNS_UNNAMED_RE", "_C_OR_EVAL_RE", "_UNREAD_SINK_SHELL_RE"):
+            with self.subTest(regex=name):
+                start = time.process_time()
+                getattr(guard, name).search(text)
+                self.assertLess(time.process_time() - start, 1)
+
     def test_a_target_built_from_home_is_read_with_the_real_home(self):
         # XERK-1656: `$HOME`, `~` and `${HOME<op>}` are expanded against the
         # session's HOME, so a target that leaves the home through `..`, a
