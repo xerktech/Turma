@@ -85,11 +85,19 @@ Each fires on a live construct next to a sink; the folded ticket is named.
   Also any recursive delete in a script that names `/` or `~` elsewhere (`rm -r ./dist; ls ~`).
 - It runs on the RAW command's segments too, not only the expanded ones: the expansion swaps a
   single-quoted subexpression for a placeholder, and pwsh runs it (`_ps_raw_reason`).
-  - A shell word there counts as the program, opening a `$(`/backtick/`(`, or after an
-    `xargs`/`-exec` runner (XERK-1861): segment-start only missed `xargs pwsh -c '$(…)'`.
-    `echo pwsh …` stays data.
-  - It scans the heredoc-STRIPPED text: a note's body line naming all three was refused. A body
-    whose owner line has a shell program is scanned with it (`pwsh -c - <<E`).
+  - A shell word there counts as the program, right after a `$(`/backtick/`<(` (behind prefix
+    words), or after a runner (`_PS_RUNNERS`: xargs, parallel, flock…; find/fd `-exec`/`-x`)
+    (XERK-1861): segment-start only missed `xargs pwsh -c '$(…)'`. `echo pwsh …` stays data.
+  - Accepted over-read: after a runner any later word may be its program, so
+    `xargs echo pwsh … <all three>` is refused.
+  - A shell's/`eval`'s later words are scripts, each scanned as a command (`bash -c 'pwsh …'`).
+  - It scans the heredoc-STRIPPED text: a note's body line naming all three was refused.
+  - A body a shell reads (`_walk_owner_feeds_shell`, or an `ssh` owner) is scanned as a script:
+    stripped, `bash <<'E'` hid a pwsh `$(…)` main had denied (QA). A body whose owner line runs
+    pwsh/cmd is scanned with it (`pwsh -c - <<E`).
+  - Owner lines are split once per OWNER, never per heredoc: per heredoc, N `<<E` on one line
+    was quadratic (36s at 16 KB, QA). Each substitution opener looks ahead a bounded run.
+  - Open (XERK-1863): `echo '…' | pwsh -c -`, `eval "$(cat <<E…)"`, `p\wsh` (all allowed on main too).
 - Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook;
   the trailing-glob cut in `_ps_targets` is `rfind`, never a regex (72s at 128 KB, XERK-1861).
 - Tests: `test_a_powershell_c_script_s_remove_targets_are_judged`,

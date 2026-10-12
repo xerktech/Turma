@@ -4580,7 +4580,17 @@ class TestClassification(unittest.TestCase):
                     f"find . -exec pwsh -c '$(Remove-Item -Recurse {W})' \\;",
                     f"echo $(pwsh -c '$(Remove-Item -Recurse {W})')",
                     f"pwsh -c - <<'E'\nRemove-Item -Recurse '{W}'\nE",
-                    f"cat > n.md <<E && pwsh -c - <<F\nhi\nE\nRemove-Item -Recurse '{W}'\nF"):
+                    f"cat > n.md <<E && pwsh -c - <<F\nhi\nE\nRemove-Item -Recurse '{W}'\nF",
+                    f"echo x | xargs pwsh.exe -c '$(ri -r {W})'",
+                    f"echo \"$(pwsh -c '$(ri -r {W})')\"", f"x=$( env pwsh -c '$(ri -r {W})')",
+                    f"cat <(pwsh -c '$(ri -r {W})')",
+                    f"bash -c 'pwsh -c '\"'\"'$(ri -r {W})'\"'\"",
+                    f"eval 'pwsh -c '\"'\"'$(ri -r {W})'\"'\"",
+                    f"parallel pwsh -c '$(ri -r {W})' ::: a", f"flock /tmp/l pwsh -c '$(ri -r {W})'",
+                    # A heredoc a shell reads is a script, not data (QA).
+                    f"bash <<'E'\npwsh -c '$(ri -r {W})'\nE",
+                    f"cat <<'E' | sh\nx=1\npwsh -c '$(ri -r {W})'\nE",
+                    f"ssh host <<'E'\npwsh -c '$(ri -r {W})'\nE"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',

@@ -12479,40 +12479,98 @@ def _ps_targets(word: str) -> list[str]:
     return [word]
 
 
-_PS_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
-
-
-def _ps_raw_reason(command: str) -> str | None:
+def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
     """`_ps_script_reason` over the RAW command, wherever a pwsh/cmd word sits
     (XERK-1861). The expansion swaps a single-quoted `$(…)` for an opaque
-    placeholder, and pwsh runs it — reached through `xargs`, `find -exec` or a
-    `$(…)` too. So a shell word counts as the segment's program, opening a
-    `$(`/backtick/`(`, or after an `xargs`/`-exec` runner; scanned from the
-    first such word (which covers every later one). `echo pwsh …` stays data.
-    Heredoc bodies are data (`_split_heredocs`), except one whose owner line
-    names a shell: `pwsh -c - <<E` runs it."""
+    placeholder, and pwsh runs it — reached through `xargs`, `find -exec`, a
+    substitution or a shell's `-c`/`eval`/heredoc script too. Scanned from the
+    first shell word in program position (which covers every later one);
+    `echo pwsh …` stays data. Heredoc bodies are data (`_split_heredocs`),
+    except one a shell reads, which is a script of its own, and one whose owner
+    line runs pwsh/cmd (`pwsh -c - <<E`), scanned with it."""
+    if depth > _PS_RAW_DEPTH:
+        return None
     text, heredocs = _split_heredocs(command)
+    bodies: dict[str, list[str]] = {}
+    for owner, body, _quoted in heredocs:
+        bodies.setdefault(owner, []).append(body)
     pieces = [(seg, "") for seg in _split_on_operators(text)]
-    pieces += [(seg, body) for owner, body, _quoted in heredocs
-               for seg in _split_on_operators(owner)]
-    for seg, body in pieces:
-        if not re.search(r"\b(?:powershell|pwsh|cmd)\b", seg.lower()):
-            continue
-        try:
-            tokens = _tokenize(seg)
-        except ValueError:
-            continue
-        prog = len(tokens) - len(_strip_prefixes(tokens))
-        runner = False
-        for i, tok in enumerate(tokens):
-            word = tok.lstrip("$(`{")
-            if (i == prog or word != tok or runner) and \
-                    re.sub(r"\.exe$", "", _basename(word).lower()) in _PS_SHELLS:
-                reason = _ps_script_reason([word] + tokens[i + 1:] + [body])
+    memo: dict = {}
+    for owner, owned in bodies.items():
+        # One split per owner line, never per heredoc: a line of N `<<E` was
+        # N splits of the whole line (quadratic, QA).
+        joined = "\n".join(owned)
+        pieces += [(seg, joined) for seg in _split_on_operators(owner)]
+        # `ssh host <<E` runs the body in the remote login shell.
+        if _walk_owner_feeds_shell(text, owner, memo) or _PS_SSH_RE.search(owner):
+            for body in owned:
+                reason = _ps_raw_reason(body, depth + 1)
                 if reason:
                     return reason
-                break
-            runner = runner or _basename(tok) == "xargs" or tok in _PS_EXEC_ACTIONS
+    for seg, body in pieces:
+        if not _PS_SHELL_WORD_RE.search(seg):
+            continue
+        reason = _ps_segment_reason(seg, body, depth)
+        if reason:
+            return reason
+    return None
+
+
+_PS_RAW_DEPTH = 4
+_PS_SSH_RE = re.compile(r"\bssh\b")
+# Programs that run a later word as a program: `xargs`, find's actions and
+# wrappers `_strip_prefixes` does not know (`parallel`, `fd -x`, `flock f`).
+_PS_RUNNERS = {"xargs", "parallel", "sem", "watch", "strace", "ltrace", "taskset",
+               "flock", "chrt", "ionice", "unbuffer", "firejail", "systemd-run"}
+_PS_RUNNER_FLAGS = {"-exec", "-execdir", "-ok", "-okdir", "-x", "-X", "--exec", "--exec-batch"}
+_PS_SHELL_WORD_RE = re.compile(r"\b(?:powershell|pwsh|cmd)\b", re.IGNORECASE)
+_PS_SUBST_OPEN_RE = re.compile(r"\$\(|`|[<>]\(")
+_PS_SCRIPT_RUNNERS = _SHELL_PROGS | {"eval", "source", "."}
+
+
+def _ps_prog(tok: str) -> str:
+    return re.sub(r"\.exe$", "", _basename(tok).lower())
+
+
+def _ps_segment_reason(seg: str, body: str, depth: int) -> str | None:
+    """One raw segment of `_ps_raw_reason`. A shell word counts as the
+    segment's program, after an `xargs`/`-exec` runner, or right after a
+    `$(`/backtick/`<(`/`>(` (behind prefix words: `$( env pwsh`). A shell's
+    or `eval`'s later words are scripts, each scanned as a command."""
+    # A substitution opener: scanned from the FIRST one leading a shell, by
+    # blank-split words (it may sit inside quotes shlex would merge).
+    for m in _PS_SUBST_OPEN_RE.finditer(seg):
+        # Only a bounded look-ahead per opener: the rest split per `$(` was
+        # quadratic.
+        near = seg[m.end():m.end() + 256].split()[:8]
+        head = _strip_prefixes(near)
+        if head and _ps_prog(head[0].strip("'\"")) in _PS_SHELLS:
+            words = seg[m.end():].split()
+            reason = _ps_script_reason(words[len(near) - len(head):] + [body])
+            if reason:
+                return reason
+            break
+    try:
+        tokens = _tokenize(seg)
+    except ValueError:
+        return None
+    prog = len(tokens) - len(_strip_prefixes(tokens))
+    runner = False
+    for i, tok in enumerate(tokens):
+        word = tok.lstrip("$(`{")
+        if i == prog or word != tok or runner:
+            name = _ps_prog(word)
+            if name in _PS_SHELLS:
+                return _ps_script_reason([word] + tokens[i + 1:] + [body])
+            if name in _PS_SCRIPT_RUNNERS:
+                for script in tokens[i + 1:]:
+                    reason = _ps_raw_reason(script, depth + 1)
+                    if reason:
+                        return reason
+                return None
+        # Accepted over-read: after a runner every later word may be its
+        # program (`xargs echo pwsh …` is refused when it names all three).
+        runner = runner or _basename(tok) in _PS_RUNNERS or tok in _PS_RUNNER_FLAGS
     return None
 
 
