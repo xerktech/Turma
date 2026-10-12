@@ -4152,7 +4152,7 @@ def launch_text_paths(sid):
     """The files write_launch_text (and a shadow's _shadow_settings) may have
     left for session `sid`."""
     return [os.path.join(LAUNCH_TEXT_DIR, f"{sid}-{kind}.txt")
-            for kind in ("system", "prompt")] + \
+            for kind in ("system", "prompt", "agents")] + \
         [os.path.join(LAUNCH_TEXT_DIR, f"{sid}-settings.json")]   # a shadow's
 
 
@@ -5707,13 +5707,23 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
 #     the session CLI writes); the shared repo's gitdir, the worktree's `.git`
 #     pointer and `.claude` are read-only — the manager's own UNSANDBOXED git runs
 #     there, and `.claude` holds settings/hooks that would run outside the sandbox.
-#   * `--restricted` loads no user/project/local settings (so no operator hook,
-#     excluded command or allowed domain), confines the file tools to the
-#     worktree, and drops every tool not named in SHADOW_TOOLS (WebFetch, peer
-#     messaging, schedulers, MCP).
+#   * Bash cannot reach the host's Unix sockets either: the seccomp filter blocks
+#     them, and the sockets this host is known to serve (the agent's tmux server,
+#     ttyd, dsh, every session's peer inbox, ssh-agent, docker) are also hidden
+#     from it (`denyRead`), since tmux alone would run any command unsandboxed.
+#     Its temp dir is its own, not the shared /tmp/claude-<uid> that holds every
+#     other session's scratch files.
+#   * `--setting-sources project,local` loads no USER settings (so no operator
+#     hook, excluded command or allowed domain); the repo's own committed settings
+#     still apply, as in a live session, and the shadow cannot write `.claude`.
+#     What the user scope would have given is re-supplied so the comparison stays
+#     like-for-like: the user CLAUDE.md rides the directive and the user's agents
+#     (qa, qa-delta…) ride `--agents`, minus any that define hooks or MCP servers.
+#     `--tools SHADOW_TOOLS` is the exact tool list (no WebFetch, peers,
+#     schedulers or MCP). `--restricted` was the first choice and was dropped: it
+#     also drops CLAUDE.md and every user agent, which broke both directives.
 #   * fileguard.py, keyed on TURMA_SHADOW_ROOT, refuses a file-tool write outside
-#     the worktree or into its `.git`/`.claude` — deterministic, beside the
-#     restricted-mode confinement.
+#     the worktree or into its `.git`/`.claude`, failing closed.
 # The guard's shadow_reason and SHADOW_ENV stay: they turn an ACCIDENTAL push into
 # a readable refusal instead of a network error. Decision: operator, 2026-10-12
 # (Claude Code sandbox over a separate OS user).
@@ -5721,7 +5731,35 @@ SHADOW_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit",
                 "Agent", "Task", "Skill", "ToolSearch", "TaskStop", "TodoWrite")
 SHADOW_ROOT_ENV = "TURMA_SHADOW_ROOT"
 SHADOW_SANDBOX_PROBE_TIMEOUT_SEC = 10
+# A failed probe is re-tried this often, so installing bubblewrap needs no restart.
+SHADOW_SANDBOX_REPROBE_SEC = 3600
+SHADOW_TMP_DIR = os.path.join(REGISTRY_DIR, "shadow-tmp")
+USER_CLAUDE_MD = os.path.expanduser("~/.claude/CLAUDE.md")
+USER_AGENTS_DIR = os.path.expanduser("~/.claude/agents")
+SHADOW_CONTEXT_MAX_BYTES = 256 * 1024
 _shadow_sandbox_cache = {}
+_shadow_probe_lock = threading.Lock()
+
+
+def shadow_sandbox_available():
+    """The heartbeat's view of shadow_sandbox_reason(), never blocking the beat:
+    False until a probe on its own thread has answered, and a negative answer
+    is re-probed every SHADOW_SANDBOX_REPROBE_SEC."""
+    at = _shadow_sandbox_cache.get("at")
+    if at is None or (_shadow_sandbox_cache.get("reason")
+                      and time.time() - at > SHADOW_SANDBOX_REPROBE_SEC):
+        if _shadow_probe_lock.acquire(blocking=False):
+            def probe():
+                try:
+                    _shadow_sandbox_cache.pop("reason", None)
+                    shadow_sandbox_reason()
+                finally:
+                    _shadow_probe_lock.release()
+            try:
+                threading.Thread(target=probe, daemon=True, name="shadow-probe").start()
+            except Exception:
+                _shadow_probe_lock.release()
+    return "reason" in _shadow_sandbox_cache and _shadow_sandbox_cache["reason"] is None
 
 
 def shadow_sandbox_reason():
@@ -5760,6 +5798,7 @@ def shadow_sandbox_reason():
     if reason:
         log(f"shadow runs unavailable: {reason}")
     _shadow_sandbox_cache["reason"] = reason
+    _shadow_sandbox_cache["at"] = time.time()
     return reason
 
 
@@ -5770,8 +5809,94 @@ def _abs_rule_path(path):
     return "/" + os.path.abspath(path)
 
 
+def shadow_tmp_dir(sid):
+    """A shadow session's own temp dir (TMPDIR and CLAUDE_CODE_TMPDIR), the only
+    temp its sandbox may write — removed with the session's launch files."""
+    return os.path.join(SHADOW_TMP_DIR, str(sid))
+
+
+def shadow_socket_dirs():
+    """Where this host's Unix sockets live, for a shadow's sandbox to hide: the
+    agent's tmux server (tmux runs any command it is sent, outside the
+    sandbox), ttyd, dsh, every session's peer inbox, ssh-agent and docker.
+    Defence in depth beside the seccomp filter; existing paths only."""
+    uid = os.getuid() if hasattr(os, "getuid") else 0
+    tmux = os.environ.get("TMUX_TMPDIR") or "/tmp"
+    cands = [os.path.join(tmux, f"tmux-{uid}"), f"/tmp/tmux-{uid}", TTYD_SOCK_DIR,
+             DSH_SOCK_DIR, f"/run/user/{uid}", "/var/run/docker.sock",
+             "/run/docker.sock"]
+    cands += cc_socket_dirs()
+    if os.environ.get("XDG_RUNTIME_DIR"):
+        cands.append(os.environ["XDG_RUNTIME_DIR"])
+    if os.environ.get("SSH_AUTH_SOCK"):
+        cands.append(os.path.dirname(os.environ["SSH_AUTH_SOCK"]))
+    out = []
+    for c in cands:
+        c = os.path.abspath(c)
+        if c not in out and c != "/" and os.path.exists(c):
+            out.append(c)
+    return out
+
+
+def shadow_agents(agents_dir=None):
+    """The user's agent definitions (~/.claude/agents/*.md) as an `--agents`
+    object, so a shadow keeps the qa/qa-delta agents its directive names while
+    loading no user settings. An agent defining hooks or MCP servers is left
+    out: those run outside the sandbox. `memory:` is dropped (it writes under
+    ~/.claude, which fileguard refuses a shadow)."""
+    agents_dir = agents_dir or USER_AGENTS_DIR
+    out = {}
+    try:
+        names = sorted(n for n in os.listdir(agents_dir) if n.endswith(".md"))
+    except OSError:
+        return out
+    for name in names:
+        try:
+            with open(os.path.join(agents_dir, name), encoding="utf-8") as f:
+                text = f.read(SHADOW_CONTEXT_MAX_BYTES)
+        except (OSError, UnicodeDecodeError):
+            continue
+        m = re.match(r"---\n(.*?)\n---\n?(.*)\Z", text, re.S)
+        if not m:
+            continue
+        meta = {}
+        for line in m.group(1).splitlines():
+            k, sep, v = line.partition(":")
+            if sep and not line[:1].isspace():
+                meta[k.strip()] = v.strip()
+        if "hooks" in meta or "mcpServers" in meta:
+            continue
+        agent_name = meta.get("name") or name[:-3]
+        if not re.fullmatch(r"[A-Za-z0-9_-]{1,64}", agent_name):
+            continue
+        entry = {"description": meta.get("description") or agent_name,
+                 "prompt": m.group(2)}
+        if meta.get("tools"):
+            entry["tools"] = [t.strip() for t in meta["tools"].split(",") if t.strip()]
+        if meta.get("model"):
+            entry["model"] = meta["model"]
+        out[agent_name] = entry
+    return out
+
+
+def shadow_user_instructions(path=None):
+    """The user CLAUDE.md a live session loads, which `--setting-sources`
+    without `user` leaves out — appended to a shadow's directive instead."""
+    try:
+        with open(path or USER_CLAUDE_MD, encoding="utf-8") as f:
+            text = f.read(SHADOW_CONTEXT_MAX_BYTES).strip()
+    except (OSError, UnicodeDecodeError):
+        return ""
+    if not text:
+        return ""
+    return ("\n\nThe operator's own instructions, which every session on this host "
+            "follows (read where they conflict with the rules above, the rules above "
+            "win):\n\n" + text + "\n")
+
+
 def build_shadow_settings(guard, worktree, request_dir, git_dirs,
-                          python_exe=None, fileguard_path=None):
+                          python_exe=None, fileguard_path=None, tmp_dir=None,
+                          socket_dirs=()):
     """The `--settings` dict for a shadow session: the host's guard settings
     plus the OS sandbox block above. `guard` is build_guard_settings()'s dict
     (copied, never changed); `git_dirs` are the repo's gitdirs to keep
@@ -5788,8 +5913,10 @@ def build_shadow_settings(guard, worktree, request_dir, git_dirs,
         "allowUnsandboxedCommands": False,
         "autoAllowBashIfSandboxed": True,
         "network": {"deniedDomains": ["*"]},
-        "filesystem": {"allowWrite": [_abs_rule_path(request_dir)],
-                       "denyWrite": deny_write},
+        "filesystem": {"allowWrite": [_abs_rule_path(request_dir)]
+                       + ([_abs_rule_path(tmp_dir)] if tmp_dir else []),
+                       "denyWrite": deny_write,
+                       "denyRead": [_abs_rule_path(d) for d in socket_dirs]},
     }
     perms = s.setdefault("permissions", {})
     deny = perms.setdefault("deny", [])
@@ -24734,14 +24861,18 @@ class SessionManager:
         git_dirs = [d for d in {common, os.path.join(sess.get("repoPath") or "", ".git")}
                     if os.path.isabs(d)]
         os.makedirs(req, exist_ok=True)   # allowWrite names it: it must exist
+        tmp = shadow_tmp_dir(sess["id"])
+        os.makedirs(tmp, mode=0o700, exist_ok=True)
         path = os.path.join(LAUNCH_TEXT_DIR, f"{sess['id']}-settings.json")
         try:
             os.makedirs(LAUNCH_TEXT_DIR, exist_ok=True)
             fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC
                          | getattr(os, "O_NOFOLLOW", 0), 0o600)
             with os.fdopen(fd, "w", encoding="utf-8") as f:
-                json.dump(build_shadow_settings(guard, wt, req, sorted(git_dirs)), f,
-                          indent=2)
+                json.dump(build_shadow_settings(guard, wt, req, sorted(git_dirs),
+                                                tmp_dir=tmp,
+                                                socket_dirs=shadow_socket_dirs()),
+                          f, indent=2)
         except OSError as e:
             raise RuntimeError(f"shadow settings file: {e}")
         return path
@@ -25224,8 +25355,9 @@ class SessionManager:
             # A shadow run (XERK-1847) gets ONLY its own rules: no new-work branch
             # policy (it must not fetch), no PR standard, no peers, no wake.
             if shadow.get("role") == "grade":
-                return SHADOW_GRADE_SYSTEM_PROMPT + addendum
-            return SHADOW_RUN_SYSTEM_PROMPT.format(cli=_session_cli_spelling()) + addendum
+                return SHADOW_GRADE_SYSTEM_PROMPT + shadow_user_instructions() + addendum
+            return (SHADOW_RUN_SYSTEM_PROMPT.format(cli=_session_cli_spelling())
+                    + shadow_user_instructions() + addendum)
         policy = NEW_WORK_SYSTEM_PROMPT
         ticket = sess.get("ticket") or {}
         if ticket.get("branch"):
@@ -26473,10 +26605,14 @@ class SessionManager:
             # the Bash guard never sees); ENABLE_CLAUDEAI_MCP_SERVERS below drops
             # the claude.ai connectors too (XERK-1847).
             parts.append("--strict-mcp-config")
-            # No user/project/local settings, file tools confined to the
-            # worktree, only SHADOW_TOOLS (XERK-1859, build_shadow_settings).
-            parts.append("--restricted")
+            # No USER settings, only SHADOW_TOOLS, the user's agents re-supplied
+            # (XERK-1859; why not --restricted: the comment on SHADOW_TOOLS).
+            parts.append("--setting-sources project,local")
             parts.append("--tools " + shlex.quote(",".join(SHADOW_TOOLS)))
+            agents = shadow_agents()
+            if agents and not IS_WINDOWS:
+                parts.append("--agents " + write_launch_text(
+                    sess["id"], "agents", json.dumps(agents)))
         policy = self._session_directive(sess)
         if not IS_WINDOWS:
             parts.append("--append-system-prompt "
@@ -26519,6 +26655,9 @@ class SessionManager:
             env_prefix += "".join(f"{k}={shlex.quote(v)} " for k, v in SHADOW_ENV.items())
             # fileguard.py's write root (XERK-1859): the hook inherits claude's env.
             env_prefix += f"{SHADOW_ROOT_ENV}={shlex.quote(sess.get('worktreePath') or '')} "
+            # Its own temp, never the shared /tmp/claude-<uid> of every session.
+            tmp = shlex.quote(shadow_tmp_dir(sess["id"]))
+            env_prefix += f"TMPDIR={tmp} CLAUDE_CODE_TMPDIR={tmp} "
         claude_cmd = env_prefix + claude_cmd
         if local_env_file:
             # SOURCED, never inlined and never passed as `tmux -e`: both put the
@@ -27000,6 +27139,7 @@ class SessionManager:
         # dead session's native log (XERK-509 [Qwen C]).
         self._teardown_qwen(sid)
         unlink_quietly(launch_text_paths(sid))
+        shutil.rmtree(shadow_tmp_dir(sid), ignore_errors=True)   # a shadow's (XERK-1859)
         self._forget_live_agents(sid)
         self.sess_state.pop(sid, None)
         self.dsh_status.pop(sid, None)  # dsh liveness dies with the session (XERK-468)
@@ -27759,10 +27899,11 @@ class SessionManager:
                     f"{merge}^1^{{commit}}"]).strip().lower()
         if not SHADOW_SHA_RE.fullmatch(base):
             return self._fail_shadow(rid, cmd, "the merge commit is not in this clone")
-        if run_ok(["git", "-C", repo["path"], "cat-file", "-e", f"{base}:.gitmodules"],
-                  timeout=10)[0] == 0:
-            # A submodule's `.git` sits inside the worktree the sandbox lets the
-            # shadow write, and the manager's own git recurses into it (XERK-1859).
+        if re.search(r"(?m)^160000 ", run(["git", "-C", repo["path"], "ls-tree", "-r",
+                                            base], timeout=30)):
+            # A gitlink's `.git` sits inside the worktree the sandbox lets the
+            # shadow write, and the manager's own git status recurses into it —
+            # with or without a .gitmodules (XERK-1859).
             return self._fail_shadow(rid, cmd, "shadow runs do not support submodules")
         try:
             detail = fetch_board_issue(key)
@@ -41215,7 +41356,7 @@ class SessionManager:
             # hub samples merged tickets only onto a host reporting it;
             # TURMA_MODEL_SHADOW=0 reports false.
             # Only where the shadow sandbox can run (XERK-1859).
-            "modelShadow": {"available": MODEL_SHADOW and shadow_sandbox_reason() is None},
+            "modelShadow": {"available": MODEL_SHADOW and shadow_sandbox_available()},
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),

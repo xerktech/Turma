@@ -5421,6 +5421,11 @@ class ManagerMixin:
             # the suite assumes one that can sandbox. TestShadowSandbox drives
             # the probe and the refusal itself.
             ("shadow_sandbox_reason", lambda: None),
+            ("shadow_sandbox_available", lambda: True),
+            # The user's own agents and CLAUDE.md a shadow re-supplies.
+            ("USER_AGENTS_DIR", os.path.join(self.tmp, "no-agents")),
+            ("USER_CLAUDE_MD", os.path.join(self.tmp, "no-CLAUDE.md")),
+            ("SHADOW_TMP_DIR", os.path.join(self.tmp, "shadow-tmp")),
             # Derived from REGISTRY_DIR at import; kill/delete rmtree a session's
             # request dir (XERK-1564), so it must never be the host's real one.
             ("SESSION_REQUESTS_DIR", os.path.join(self.tmp, "session-requests")),
@@ -37413,7 +37418,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertIn("x" * 40000, self._launches()[-1][-1])
         files = ha.launch_text_paths(sess["id"])
         for path in files:
-            if path.endswith("-settings.json"):   # a shadow's only (XERK-1859)
+            if path.endswith(("-settings.json", "-agents.txt")):   # a shadow's only
                 self.assertFalse(os.path.exists(path))
                 continue
             self.assertEqual(os.stat(path).st_mode & 0o777, 0o600)
@@ -44561,19 +44566,10 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         self.head = self.HEAD
         self.dirty = ""
-        self.gitmodules = False
-        mixin_run_ok = ha.run_ok
-
-        def run_ok(cmd, *a, **kw):
-            if "cat-file" in cmd:          # `<base>:.gitmodules` exists?
-                mixin_run_ok(cmd, *a, **kw)
-                return (0, "") if self.gitmodules else (128, "")
-            return mixin_run_ok(cmd, *a, **kw)
-
+        self.gitlink = False
         for name, value in [("scan_repos", lambda: [self.repo]),
                             ("JIRA_SITE", self.SITE), ("JIRA_EMAIL", "a@b.c"),
-                            ("JIRA_TOKEN", "t"), ("run", self.fake_git),
-                            ("run_ok", run_ok)]:
+                            ("JIRA_TOKEN", "t"), ("run", self.fake_git)]:
             p = mock.patch.object(ha, name, value)
             p.start()
             self.addCleanup(p.stop)
@@ -44588,6 +44584,9 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
             return cmd[-1]       # branch_exists on a commit id
         if "status" in cmd:
             return self.dirty
+        if "ls-tree" in cmd:
+            return (f"100644 blob {'d' * 40}\ta.py\n"
+                    + (f"160000 commit {'e' * 40}\tsub\n" if self.gitlink else ""))
         return ""
 
     def detail(self):
@@ -44642,7 +44641,10 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertIn("SHADOW RUN", cmd)
         # XERK-1859: the OS sandbox, restricted mode, only SHADOW_TOOLS, and
         # fileguard's write root.
-        self.assertIn("--restricted", cmd)
+        self.assertIn("--setting-sources project,local", cmd)
+        self.assertNotIn("--restricted", cmd, "it drops CLAUDE.md and the qa agents")
+        tmp = os.path.join(self.tmp, "shadow-tmp", sess["id"])
+        self.assertIn(f"TMPDIR={tmp} CLAUDE_CODE_TMPDIR={tmp}", cmd)
         self.assertIn("--tools " + ",".join(ha.SHADOW_TOOLS), cmd)
         self.assertIn(f"TURMA_SHADOW_ROOT={sess['worktreePath']}", cmd)
         settings_path = os.path.join(self.tmp, "launch", f"{sess['id']}-settings.json")
@@ -44844,8 +44846,50 @@ if __name__ == "__main__":
 
 
 
+    # XERK-1859: what the manager's own (unsandboxed) git refuses to touch.
+    def test_a_base_with_a_gitlink_is_refused(self):
+        self.gitlink = True
+        sm = self.spawned()
+        self.assertEqual(sm.registry, [])
+        r = sm.shadow_runs[self.RID]
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("submodules", r["error"])
+
+    def test_a_nested_repository_fails_the_run_before_git_add(self):
+        sm = self.spawned()
+        run_sid = sm.registry[0]["id"]
+        self.dirty = " M x.py\n?? vendor/evil/\n"
+        self.request(run_sid, "shadow-done", {"note": "done"})
+        sm._advance_shadow_runs()
+        r = sm.shadow_runs[self.RID]
+        self.assertEqual(r["state"], "failed")
+        self.assertIn("nested repository", r["error"])
+        self.assertFalse(any("add" in c or "commit" in c for c in self.run_ok_calls),
+                         "nothing staged: no gitlink reaches the index")
+
+    def test_the_user_agents_and_instructions_ride_the_shadow(self):
+        os.makedirs(ha.USER_AGENTS_DIR)
+        with open(os.path.join(ha.USER_AGENTS_DIR, "qa.md"), "w") as f:
+            f.write("---\nname: qa\ndescription: QA gate\ntools: Bash, Read\n"
+                    "memory: user\n---\nYou are QA.\n")
+        with open(os.path.join(ha.USER_AGENTS_DIR, "hooky.md"), "w") as f:
+            f.write("---\nname: hooky\ndescription: x\nhooks:\n  Stop: []\n---\nx\n")
+        with open(ha.USER_CLAUDE_MD, "w") as f:
+            f.write("# Global rules\nCOST-DISCIPLINE-MARKER\n")
+        sm = self.spawned()
+        cmd = self.launches()[-1][-1]
+        self.assertIn("COST-DISCIPLINE-MARKER", cmd)
+        i = cmd.index("--agents ") + len("--agents ")
+        agents = json.loads(shlex.split(cmd[i:])[0])
+        self.assertEqual(agents, {"qa": {"description": "QA gate", "prompt": "You are QA.\n",
+                                         "tools": ["Bash", "Read"]}},
+                         "a hook-defining agent is left out; memory is dropped")
+        self.assertTrue(sm.registry)
+
+
 # The real probe, kept before ManagerMixin stubs it for the suite (XERK-1859).
 REAL_SHADOW_SANDBOX_REASON = ha.shadow_sandbox_reason
+REAL_SHADOW_SANDBOX_AVAILABLE = ha.shadow_sandbox_available
 
 
 class TestShadowSandbox(ManagerMixin, unittest.TestCase):
@@ -44858,13 +44902,17 @@ class TestShadowSandbox(ManagerMixin, unittest.TestCase):
         before = json.dumps(guard, sort_keys=True)
         s = ha.build_shadow_settings(guard, "/r/.turma/worktrees/x/ab", "/h/.turma/sr/ab",
                                      ["/r/x/.git"], python_exe="/usr/bin/python3",
-                                     fileguard_path="/p/hooks/fileguard.py")
+                                     fileguard_path="/p/hooks/fileguard.py",
+                                     tmp_dir="/h/.turma/shadow-tmp/ab",
+                                     socket_dirs=["/tmp/tmux-0", "/run/user/0"])
         self.assertEqual(json.dumps(guard, sort_keys=True), before, "guard dict untouched")
         sb = s["sandbox"]
         self.assertTrue(sb["enabled"] and sb["failIfUnavailable"])
         self.assertFalse(sb["allowUnsandboxedCommands"])
         self.assertEqual(sb["network"], {"deniedDomains": ["*"]})
-        self.assertEqual(sb["filesystem"]["allowWrite"], ["//h/.turma/sr/ab"])
+        self.assertEqual(sb["filesystem"]["allowWrite"],
+                         ["//h/.turma/sr/ab", "//h/.turma/shadow-tmp/ab"])
+        self.assertEqual(sb["filesystem"]["denyRead"], ["//tmp/tmux-0", "//run/user/0"])
         self.assertEqual(sb["filesystem"]["denyWrite"],
                          ["//r/.turma/worktrees/x/ab/.git",
                           "//r/.turma/worktrees/x/ab/.claude", "//r/x/.git"])
@@ -44919,9 +44967,47 @@ class TestShadowSandbox(ManagerMixin, unittest.TestCase):
         reason, _ = self.probe(lambda n: f"/usr/bin/{n}", ok, windows=True)
         self.assertIn("Windows", reason)
 
+    def test_the_socket_dirs_hide_the_agents_tmux_server(self):
+        sock = os.path.join(self.tmp, "tmux-sock")
+        os.makedirs(os.path.join(sock, f"tmux-{os.getuid()}"))
+        with mock.patch.dict(os.environ, {"TMUX_TMPDIR": sock}):
+            dirs = ha.shadow_socket_dirs()
+        self.assertIn(os.path.join(sock, f"tmux-{os.getuid()}"), dirs)
+        self.assertNotIn("/", dirs)
+        self.assertTrue(all(os.path.exists(d) for d in dirs))
+
+    def test_the_heartbeat_never_waits_on_the_probe(self):
+        ha._shadow_sandbox_cache.clear()
+        self.addCleanup(ha._shadow_sandbox_cache.clear)
+        gate = threading.Event()
+        answers = iter(["no bwrap", None])
+
+        def slow_probe():
+            gate.wait(5)
+            ha._shadow_sandbox_cache.update(reason=next(answers), at=time.time())
+            return ha._shadow_sandbox_cache["reason"]
+        with mock.patch.object(ha, "shadow_sandbox_reason", slow_probe):
+            avail = REAL_SHADOW_SANDBOX_AVAILABLE
+            self.assertFalse(avail(), "unknown until probed: not offered")
+            gate.set()
+            for _ in range(100):
+                if "reason" in ha._shadow_sandbox_cache:
+                    break
+                time.sleep(0.01)
+            self.assertFalse(avail())
+            # A failed probe is re-tried once it is old enough.
+            ha._shadow_sandbox_cache["at"] -= ha.SHADOW_SANDBOX_REPROBE_SEC + 1
+            avail()
+            for _ in range(100):
+                if ha._shadow_sandbox_cache.get("reason", "x") is None:
+                    break
+                time.sleep(0.01)
+            self.assertTrue(avail())
+
     def test_a_host_that_cannot_sandbox_offers_and_runs_no_shadow(self):
         sm = self.make_manager()
-        with mock.patch.object(ha, "shadow_sandbox_reason", lambda: "no userns"):
+        with mock.patch.object(ha, "shadow_sandbox_reason", lambda: "no userns"), \
+                mock.patch.object(ha, "shadow_sandbox_available", lambda: False):
             self.assertFalse(sm.build_payload(1)["modelShadow"]["available"])
             sm.spawn_shadow({"type": "spawnShadow", "shadowId": "sh-00000000aaaa",
                              "siteKey": "x", "issueKey": "PROJ-1", "repo": "r",
