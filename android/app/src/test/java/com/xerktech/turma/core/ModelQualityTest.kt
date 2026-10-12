@@ -50,6 +50,7 @@ class ModelQualityTest {
             shadow = ModelQualityShadow(pairs = 23, candidateOnlyBad = 1), promotion = "candidate")
         assertEquals(listOf("QA runs" to "1.5", "CI rounds" to "2"), ModelQuality.reworkStats(served))
         assertEquals("—", ModelQuality.median(Double.NaN))
+        assertEquals("300000000", ModelQuality.median(3e8))
         assertEquals("23 · 1 worse", ModelQuality.shadow(served))
         assertEquals("candidate", ModelQuality.status(served))
     }

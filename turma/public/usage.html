@@ -2000,14 +2000,16 @@ const MQ_REWORK = [["qaRuns", "QA runs"], ["qaFail", "QA failed"], ["ciRounds", 
   ["changesRequested", "Changes requested"]];
 // A median as shown, one decimal, or "—" when the hub sends none.
 function mqMedian(v) {
-  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? String(Math.round(v * 10) / 10) : "—";
+  if (!(typeof v === "number" && Number.isFinite(v) && v >= 0)) return "—";
+  // A large one is whole: v * 10 would overflow to Infinity near the double's top.
+  return String(v >= 1e6 ? Math.round(v) : Math.round(v * 10) / 10);
 }
 function mqRework(g) { return g.rework && typeof g.rework === "object" ? g.rework : {}; }
 function mqFinite(v) { return typeof v === "number" && Number.isFinite(v); }
 // One signal of a group, or null when the hub sent no usable median for it.
 function mqSignal(g, key) {
   const v = Object.hasOwn(mqRework(g), key) ? mqRework(g)[key] : null;
-  return v && typeof v === "object" && mqFinite(v.median) ? v : null;
+  return v && typeof v === "object" && mqFinite(v.median) && v.median >= 0 ? v : null;
 }
 // Shadow pairs (XERK-1847): graded pairs, and how many the candidate lost to Opus.
 function mqShadow(g) {
@@ -2085,7 +2087,7 @@ function modelQualityCardHtml(view, now, org = "", rowsOpen = false, loadError =
       cols.rework.map(([k, label]) => {
         const sig = mqSignal(g, k);
         return `<td class="mq-num${sig ? "" : " mq-na"}" data-label="${label}"` +
-          (sig ? ` title="median of ${permNum(sig.n)} sessions"` : "") + `>${esc(mqMedian(sig && sig.median))}</td>`;
+          (sig ? ` title="median of ${permNum(sig.n)} session${permNum(sig.n) === 1 ? "" : "s"}"` : "") + `>${esc(mqMedian(sig && sig.median))}</td>`;
       }).join("") +
       (cols.shadow ? num("Shadow pairs", mqShadow(g)) : "") +
       num("Status", mqStatus(g), mqStatus(g) === "—" ? " mq-na" : "") + `

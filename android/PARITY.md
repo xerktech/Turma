@@ -29,6 +29,8 @@ are recorded under "Deliberate differences" below, not left to look like gaps.
 - **Hub-URL field on Login.** The web is same-origin; a phone app must point at any hub, so Login has
   an extra Hub-URL field.
 - **Voice dictation** into the spawn/compose fields — a phone-only addition.
+- **Model quality rework sample size (XERK-1849).** The web shows each rework median's `n`
+  ("median of N sessions") as a cell hover; a phone has no hover, so Android shows the median only.
 - **Brief rows (XERK-1573).** A ticket row on the web brief links to the board's own detail; the
   phone row is plain text (the Board screen has no deep-link route to a ticket yet) — unless it
   carries a folded merged PR, which a tap opens (the web links its "merged PR" bit) — and the phone

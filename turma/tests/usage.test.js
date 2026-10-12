@@ -1680,6 +1680,10 @@ test("XERK-1849: rework and shadow columns appear only once the hub serves them"
     rework: { qaRuns: { median: 1.5, n: 4 }, ciRounds: { median: 2, n: 3 } }, shadow: { pairs: 23, candidateOnlyBad: 1 }, promotion: "candidate" })] }, MQ_NOW);
   assert.match(served, /data-label="QA runs" title="median of 4 sessions">1.5</);
   assert.match(served, /data-label="CI rounds" title="median of 3 sessions">2</);
+  const big = H.modelQualityCardHtml({ groups: [mqG({ sessions: 1, rework: { qaRuns: { median: 3e8, n: 1 },
+    ciRounds: { median: -1, n: 5 } } })] }, MQ_NOW);
+  assert.match(big, /data-label="QA runs" title="median of 1 session">300000000</);
+  assert.doesNotMatch(big, /CI rounds/);
   // A signal no group reported gets no column at all.
   assert.doesNotMatch(served, /Changes requested|QA failed/);
   assert.match(served, /data-label="Shadow pairs">23 · 1 worse</);

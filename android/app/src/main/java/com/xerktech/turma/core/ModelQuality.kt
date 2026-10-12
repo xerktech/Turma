@@ -50,6 +50,8 @@ object ModelQuality {
     /** A served median, one decimal, or "—" (web `mqMedian`). */
     fun median(v: Double?): String {
         if (v == null || !v.isFinite() || v < 0) return "—"
+        // A large one is whole (Int rounding would saturate it; web `mqMedian` likewise).
+        if (v >= 1e6) return String.format(java.util.Locale.ROOT, "%.0f", v)
         val r = (v * 10).roundToInt() / 10.0
         return if (r == Math.floor(r)) r.toLong().toString() else r.toString()
     }
