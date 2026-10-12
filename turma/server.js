@@ -4710,10 +4710,13 @@ function outcomeLedgerSweep(now = Date.now()) {
   try {
     const board = fleetTicketRows();
     const obs = [];
+    const defects = [];
     const shadows = [];
     for (const [host, a] of Object.entries(agents)) {
       const org = decidedOrgOf(a);
       if (!org) continue;
+      // Defect reports (XERK-1846) attribute only within the host's decided org.
+      if (Array.isArray(a.defectReports)) defects.push({ site: org, reports: a.defectReports });
       const add = (s, running) => {
         const t = s && s.ticket;
         if (!t || typeof t.key !== "string" || t.siteKey !== org || typeof s.id !== "string") return;
@@ -4739,6 +4742,7 @@ function outcomeLedgerSweep(now = Date.now()) {
       }
     }
     outcomeLedger.observe(obs, now);
+    outcomeLedger.attributeDefects(defects, now);
     // Shadow reports (XERK-1847) only from a host decided into the org the
     // ledger dispatched them for; the ledger checks the id was sent to it.
     outcomeLedger.observeShadows(shadows, now);
@@ -5521,7 +5525,7 @@ function serializeAgent(key, agent, now, pausedSubs, liveKeys) {
   const { history, trajectoryTails, subagentHistory, jiraIssues, statusResults,
           priorityResults, linkResults, mergeResults,
           createMeta, createTypes, createResults, resultWaits, tokenBound,
-          orgBound, autoPaused: _forgedAutoPaused, ...a } = agent;
+          orgBound, autoPaused: _forgedAutoPaused, defectReports: _defects, ...a } = agent;
   // The paused-subscription set (XERK-544/548). buildAgentsCache computes it once
   // and passes it; the per-agent SSE broadcast has none and derives its own.
   if (!pausedSubs) pausedSubs = pausedSubscriptions(now);
@@ -9173,7 +9177,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
   "spawnFailures", "epicBuilderStatus", "permissionEvents", "attentionHints",
-  "briefRender", "briefNarratives", "modelShadow", "shadowRuns",
+  "briefRender", "briefNarratives", "modelShadow", "shadowRuns", "defectReports",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -9590,6 +9594,19 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeClosedSessions(a);
   normalizeUploadMax(a);
   normalizeUpdating(a);
+  normalizeDefectReports(a);
+}
+
+// The agent's defect-attribution findings (XERK-1846) — whitelisted and capped by
+// the ledger's own sanitizer, kept on the record for the leader's outcome-ledger
+// sweep, never served (serializeAgent strips them). A `require` here, not the
+// module-level binding: this is reached from the state restore near the top of
+// the file, where that `const` may still be in its TDZ.
+function normalizeDefectReports(a) {
+  if (!a || typeof a !== "object" || !("defectReports" in a)) return;
+  const list = require("./outcome-ledger.js").sanitizeDefectReports(a.defectReports);
+  if (list.length) a.defectReports = list;
+  else delete a.defectReports;
 }
 
 /**

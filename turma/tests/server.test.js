@@ -24508,6 +24508,38 @@ test("XERK-1845: a closed session is credited to the model that answered, with i
   delete agents["ol-rw"];
 }));
 
+test("XERK-1846: a host's defect reports mark its own org's merged rows bad, and are never served", outcomeIsolated(async () => {
+  hub.outcomeLedger._internals.reset();
+  const sha = "a".repeat(40);
+  const merged = { url: "https://github.com/o/r/pull/7", state: "MERGED", mergedAt: "2026-10-02T00:00:00Z",
+    mergeCommit: sha };
+  const fix = { repo: "app", fix: "f".repeat(40), fixPrs: ["https://github.com/o/r/pull/9"], kind: "bug",
+    ticket: "OL-2", at: Date.now() - 1000, found: 1, introducers: [{ sha, prs: [], lines: 4 }] };
+  outcomeHost("ol-def", "ol-def.atlassian.net");
+  outcomeHost("ol-def-rival", "ol-def-rival.atlassian.net");
+  for (const k of ["ol-def", "ol-def-rival"]) {
+    agents[k].sessions[0].prs = [{ ...merged }];
+    agents[k].closedSessions = [];
+  }
+  // Only the rival host reports, so only the rival org's row may be marked.
+  agents["ol-def-rival"].defectReports = [fix, { kind: "evil" }];
+  hub.normalizeRecord(agents["ol-def-rival"]);
+  assert.equal(agents["ol-def-rival"].defectReports.length, 1, "coerced through the ledger's whitelist");
+  hub.outcomeLedgerSweep();
+  const rows = [...hub.outcomeLedger._internals.rows().values()];
+  const bySite = Object.fromEntries(rows.map((r) => [r.site, r]));
+  assert.equal(bySite["ol-def-rival.atlassian.net"].defects[0].fix, "f".repeat(40));
+  assert.equal(bySite["ol-def.atlassian.net"].defects, undefined, "another org's report never marks it");
+  const v = await request("GET", "/api/agents", { headers: userHeaders });
+  assert.ok(!JSON.stringify(v.body).includes("defectReports"));
+  // A non-list drops on coercion (restore path too).
+  const junk = { defectReports: "x" };
+  hub.normalizeRecord(junk);
+  assert.ok(!("defectReports" in junk));
+  delete agents["ol-def"];
+  delete agents["ol-def-rival"];
+}));
+
 test("XERK-1839: /api/model-quality is user-authed and /metrics leaks no ticket", outcomeIsolated(async () => {
   assert.equal((await request("GET", "/api/model-quality")).status, 401);
   assert.equal((await request("GET", "/api/model-quality", { headers: agentHeaders })).status, 401);

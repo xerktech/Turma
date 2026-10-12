@@ -398,6 +398,105 @@ test("XERK-1845: a future merge time is junk too", () => {
   assert.equal(only().prs[0].mergedAt, T0 + DAY);
 });
 
+// ---- defect attribution (XERK-1846) ------------------------------------------------
+
+const HEX = (c) => c.repeat(40);
+const PR1 = "https://github.com/o/r/pull/1";
+const FIXPR = "https://github.com/o/r/pull/9";
+function mergedRow(extra = {}) {
+  L.observe([obs({
+    prs: [{ url: PR1, state: "MERGED", mergeCommit: HEX("a"), mergedAt: T0 + DAY }],
+    ...extra,
+  })], T0 + DAY);
+}
+function report(extra = {}) {
+  return {
+    repo: "r", fix: HEX("f"), fixPrs: [FIXPR], kind: "bug", ticket: "ACME-9", at: T0 + 5 * DAY,
+    introducers: [{ sha: HEX("a"), prs: [] }], ...extra,
+  };
+}
+
+test("XERK-1846: a later bug fix blaming a row's merge commit marks it bad, once", () => {
+  L._internals.reset();
+  mergedRow();
+  L.attributeDefects([{ site: "acme.atlassian.net", reports: [report()] }], T0 + 6 * DAY);
+  const r = only();
+  assert.deepEqual(r.defects, [{ fix: HEX("f"), kind: "bug", at: T0 + 5 * DAY, prs: [FIXPR] }]);
+  assert.deepEqual(L.outcomeOf(r, T0 + 6 * DAY), { outcome: "bad", reason: "defect" });
+  // Re-sent every few minutes by the agent: idempotent.
+  const changed = L.attributeDefects([{ site: "acme.atlassian.net", reports: [report()] }], T0 + 7 * DAY);
+  assert.equal(changed.length, 0);
+  assert.equal(only().defects.length, 1);
+  // It is BAD in the served groups, with its reason, and survives a reload.
+  const g = L.aggregate({ now: T0 + 7 * DAY }).groups[0];
+  assert.equal(g.bad, 1);
+  assert.equal(g.reasons.defect, 1);
+  assert.deepEqual(L.sanitizeRow(JSON.parse(JSON.stringify(only()))).defects, only().defects);
+});
+
+test("XERK-1846: the forge's PR url joins too, and a revert reads 'reverted'", () => {
+  L._internals.reset();
+  mergedRow({ prs: [{ url: PR1, state: "MERGED", mergedAt: T0 + DAY }] }); // no merge sha
+  L.attributeDefects([{ site: "acme.atlassian.net", reports: [report({
+    kind: "revert", introducers: [{ sha: HEX("b"), prs: [PR1] }],
+  })] }], T0 + 6 * DAY);
+  assert.equal(L.outcomeOf(only(), T0 + 6 * DAY).reason, "reverted");
+});
+
+test("XERK-1846: another org's report, the fix's own PR, a pre-merge or out-of-window fix never mark", () => {
+  const cases = [
+    { site: "rival.atlassian.net", rep: report() },
+    { site: "acme.atlassian.net", rep: report({ fixPrs: [PR1] }) },
+    { site: "acme.atlassian.net", rep: report({ fix: HEX("a").replace(/a$/, "c"), at: T0 }) },
+    { site: "acme.atlassian.net", rep: report({ at: T0 + DAY + (L.WINDOW_DAYS + 1) * DAY }) },
+    // Unattributed: an introducer no row holds (human work, a direct push).
+    { site: "acme.atlassian.net", rep: report({ introducers: [{ sha: HEX("d"), prs: ["https://github.com/o/r/pull/77"] }] }) },
+  ];
+  for (const c of cases) {
+    L._internals.reset();
+    mergedRow();
+    L.attributeDefects([{ site: c.site, reports: [c.rep] }], T0 + 200 * DAY);
+    assert.equal(only().defects, undefined, JSON.stringify(c));
+  }
+});
+
+test("XERK-1846: an open or closed-unmerged PR is never an introducer", () => {
+  L._internals.reset();
+  L.observe([obs({ prs: [{ url: PR1, state: "OPEN" }] })], T0 + DAY);
+  L.attributeDefects([{ site: "acme.atlassian.net", reports: [report({
+    introducers: [{ sha: HEX("a"), prs: [PR1] }] })] }], T0 + 6 * DAY);
+  assert.equal(only().defects, undefined);
+});
+
+test("XERK-1846: reports are whitelisted and capped", () => {
+  const out = L.sanitizeDefectReports([
+    report(),
+    report({ kind: "nope" }),
+    report({ fix: "abc" }),
+    report({ introducers: [{ sha: HEX("f") }] }),            // the fix itself: dropped → no introducers
+    report({ introducers: Array.from({ length: 9 }, (_, i) => ({ sha: String(i).repeat(40), prs: ["javascript:x", PR1] })) }),
+    "junk",
+  ]);
+  assert.equal(out.length, 2);
+  assert.equal(out[1].introducers.length, 5);
+  assert.deepEqual(out[1].introducers[0].prs, [PR1]);
+  assert.equal(L.sanitizeDefectReports(Array.from({ length: 80 }, () => report())).length, 50);
+  assert.deepEqual(L.sanitizeDefectReports({}), []);
+});
+
+test("XERK-1846: nothing folds under HA until the table is loaded", () => {
+  L._internals.reset();
+  mergedRow();
+  const b = L._internals.getBackend();
+  L._internals.setBackend({ ...b, loaded: false });
+  try {
+    assert.equal(L.attributeDefects([{ site: "acme.atlassian.net", reports: [report()] }], T0 + 6 * DAY).length, 0);
+  } finally {
+    L._internals.setBackend(b);
+  }
+  assert.equal(only().defects, undefined);
+});
+
 // ---- shadow runs (XERK-1847) ----------------------------------------------------
 
 const SHA = "0123456789abcdef0123456789abcdef01234567";

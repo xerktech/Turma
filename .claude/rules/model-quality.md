@@ -73,6 +73,42 @@ This file is the operative rules for what has shipped.
     launch (`is_error`) is no run, and the report's own verdict LINE beats a quoted one.
   - Known: a mid-session `/model` switch still credits the whole session to the LAST model; a
     RESUMED qa agent's later report is not re-delivered as a hand-back, so its first verdict sticks.
+- **Defect attribution is SZZ on the agent, the join on the hub** (XERK-1846). Agent: a
+  `defect-scan` thread every `TURMA_DEFECT_SCAN_EVERY` (1800s; `TURMA_DEFECT_SCAN=0` off) fetches
+  each repo's default branch and walks new first-parent commits from a per-repo cursor
+  (`defect-scan.json`); the first scan back-fills `MODEL_QUALITY_WINDOW_DAYS`.
+  - A FIX is a revert or a commit whose subject's ticket key classes `bug` (board cache, else the
+    tracker; a tracker error stops BEFORE that commit so it is retried, never skipped). A revert's
+    `This reverts commit <sha>` line counts only line-anchored and only when the sha is an ancestor;
+    for a merge commit the merged branch's messages are read too (a revert PR merged with a merge).
+  - Commits are listed as `%H %ct` only and each message read separately: a `%x1e`-delimited log
+    let a commit message forge a whole record (QA).
+  - Its first-parent diff (`-w`, `-M` — a rename blamed the whole file) is blamed `-w`; test paths
+    and pure additions blame nothing; `--- ` is a path only in a file's header (a deleted `-- `
+    comment line is not). Boundary/shallow-graft commits are never introducers.
+  - Each blamed commit is mapped to the first-parent commit that LANDED it (`_defect_landing`):
+    itself for a squash, else its PR's merge commit — the ledger's `mergeCommit`. That is the
+    topologically first `--ancestry-path` descendant on the first-parent set: `--topo-order` (dates
+    can be skewed), never `--first-parent` (git then finds only a branch's TIP commit).
+    One it cannot place stands as itself; its forge lookup falls back to the blamed commit.
+  - A revert line must be git's own (`This reverts commit <sha>.` alone on its line); a branch
+    that reverts a commit and then reverts that revert reverts nothing (judged by chain parity).
+    A SQUASH message naming any commit off the default branch carried such a chain flattened
+    into one message, so it names no revert target at all (its parity cannot be read).
+  - A commit git cannot read or diff (root, graft, timeout) is logged and SKIPPED, never retried
+    forever: one commit must not stop a repo's scan.
+  - Introducers map to MERGED PRs via the forge (GitHub `commits/<sha>/pulls`, GitLab
+    `merge_requests`); ADO has none, so the hub also joins on the PR's `mergeCommit`.
+  - Reports are HELD (500, 30 days) and re-sent as a rotating page each beat (`defectReports`), so
+    no ack is needed — the hub folds idempotently. Never make it a deliver-once outbox: the fold
+    runs on the HA leader's sweep, not on the replica the beat reached.
+  - Hub: `normalizeDefectReports` coerces them onto the record (never served); `outcomeLedgerSweep`
+    calls `attributeDefects` with the host's DECIDED org — only that org's rows can be marked.
+  - A row is marked (`defects[]` → outcome bad, reason `defect`/`reverted`) only when the fix landed
+    after its PR merged and inside the window, and never by its own PR. No row = unattributed,
+    excluded from every model statistic.
+  - Known: ticket keys are Jira-style or ADO `AB#1` in the SUBJECT (a merge commit's branch name
+    counts); a rebase-merged PR's commits land as themselves, so they join only through the forge.
 - **Shadow runs (XERK-1847), only under `MODEL_POLICY=observe|on`** (default observe):
   - **Hub samples, leader-only** (`modelShadowSweep` after `outcomeLedgerSweep`): a live claude
     row whose PR MERGED with a `mergeCommit`, merged within `MODEL_SHADOW_MAX_AGE_DAYS` (7).
@@ -118,9 +154,9 @@ This file is the operative rules for what has shipped.
     write its grader's `shadow-grade.json` (same class). Peeking at later git history is forbidden
     by the directive only (validity, not safety).
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
-- Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:`/`XERK-1847:` cases in
+- Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:`/`XERK-1846:`/`XERK-1847:` cases in
   `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`,
-  `TestShadowRuns`; `TestShadowRun` (`test_guard.py`); the shadow cases in `test_session_cli.py`.
+  `TestShadowRuns`; `TestShadowRun` (`test_guard.py`); the shadow cases in `test_session_cli.py`; `TestDefect*`.
 
 ## The report (XERK-1849): Usage page "Model quality" card, web + Android
 
