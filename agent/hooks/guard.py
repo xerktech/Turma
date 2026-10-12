@@ -12491,7 +12491,7 @@ def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
     if depth > _PS_RAW_DEPTH:
         # Fail closed: allowing here let five nested `bash <<E` hide what main
         # denied (QA). Only text still naming a pwsh/cmd word is refused.
-        if _PS_SHELL_WORD_RE.search(command):
+        if _PS_INVOKED_RE.search(command):
             return "refusing a PowerShell/cmd script nested too deeply to classify — flatten it"
         return None
     text, heredocs = _split_heredocs(command)
@@ -12506,7 +12506,7 @@ def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
         joined = "\n".join(owned)
         owner_pieces += [(seg, joined) for seg in _split_on_operators(owner)]
         # `ssh host <<E` runs the body in the remote login shell.
-        if _walk_owner_feeds_shell(text, owner, memo) or _PS_SSH_RE.search(owner):
+        if _walk_owner_feeds_shell(text, owner, memo) or _names_ssh(owner):
             for body in owned:
                 reason = _ps_raw_reason(body, depth + 1)
                 if reason:
@@ -12525,8 +12525,22 @@ def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
 
 
 _PS_RAW_DEPTH = 4
-# `ssh` as a word of its own: `ssh-notes.md` or a quoted "ssh fix" title is not.
-_PS_SSH_RE = re.compile(r"(?:^|[\s;|&(])ssh(?=\s|$)")
+# pwsh, or cmd given a script (`cmd /c`): `./cmd/server` or `$cmd` is not one.
+_PS_INVOKED_RE = re.compile(r"\b(?:powershell|pwsh)\b|\bcmd(?:\.exe)?\s+/[ck]\b", re.IGNORECASE)
+_PS_SSH_PROGS = {"ssh", "autossh"}
+
+
+def _names_ssh(owner: str) -> bool:
+    """Whether a word of ``owner`` is an ssh program, however spelled
+    (`/usr/bin/ssh`, `\\ssh`, `"ssh"`), matched by basename after shlex
+    dequotes it: a raw-text match missed those (QA). `ssh-notes.md` or a
+    quoted "ssh fix" title is not one. Unreadable text fails closed."""
+    if "ssh" not in owner:
+        return False
+    try:
+        return any(_basename(t) in _PS_SSH_PROGS for t in _tokenize(owner))
+    except ValueError:
+        return True
 # Programs that run a later word as a program: `xargs`, find's actions and
 # wrappers `_strip_prefixes` does not know (`parallel`, `fd -x`, `flock f`).
 _PS_RUNNERS = {"xargs", "parallel", "sem", "watch", "strace", "ltrace", "taskset",

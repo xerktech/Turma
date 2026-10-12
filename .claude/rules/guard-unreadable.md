@@ -92,11 +92,14 @@ Each fires on a live construct next to a sink; the folded ticket is named.
     `xargs echo pwsh … <all three>` is refused.
   - A shell's/`eval`'s later words are scripts, each scanned as a command (`bash -c 'pwsh …'`).
   - It scans the heredoc-STRIPPED text: a note's body line naming all three was refused.
-  - A body a shell reads (`_walk_owner_feeds_shell`, or an `ssh` owner) is scanned as a script:
-    stripped, `bash <<'E'` hid a pwsh `$(…)` main had denied (QA). A body whose owner line runs
+  - A body a shell reads (`_walk_owner_feeds_shell`, or an ssh/autossh word, `_names_ssh`) is
+    scanned as a script. Match ssh by dequoted basename: a raw `\bssh\b`-style regex both
+    over-read `ssh-notes.md` and missed `/usr/bin/ssh`, `\ssh`, `"ssh"` (QA). Stripped,
+    `bash <<'E'` hid a pwsh `$(…)` main had denied (QA). A body whose owner line runs
     pwsh/cmd is scanned with it (`pwsh -c - <<E`).
-  - Past `_PS_RAW_DEPTH` nested scripts, text still naming pwsh/cmd is REFUSED: returning
+  - Past `_PS_RAW_DEPTH` nested scripts, text invoking pwsh or `cmd /c` is REFUSED: returning
     nothing let five nested `bash <<E` through where main denied (QA). Never fail open there.
+    Test at exactly `_PS_RAW_DEPTH + 1`: deeper nests are denied by another path anyway.
   - Owner lines are split once per OWNER, never per heredoc: per heredoc, N `<<E` on one line
     was quadratic (36s at 16 KB, QA). Each substitution opener looks ahead a bounded run.
   - Open (XERK-1863), all allowed on main too: `echo '…' | pwsh -c -`, `eval "$(cat <<E…)"`,

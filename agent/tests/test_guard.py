@@ -4593,7 +4593,11 @@ class TestClassification(unittest.TestCase):
                     f"ssh host <<'E'\npwsh -c '$(ri -r {W})'\nE",
                     f"echo \"$( env pwsh -c '$(ri -r {W})')\"", f"x=\"$(timeout 5 pwsh -c '$(ri -r {W})')\"",
                     # Past the nesting cap a pwsh script is refused, never let through (QA).
-                    "bash <<'L'\n" * 6 + f"pwsh -c '$(ri -r {W})'\n" + "L\n" * 6):
+                    # Exactly one past the cap: 6+ is denied by another path too.
+                    "bash <<'L'\n" * (guard._PS_RAW_DEPTH + 1) + f"pwsh -c '$(ri -r {W})'\n"
+                    + "L\n" * (guard._PS_RAW_DEPTH + 1),
+                    *(f"{s} -T h <<'E'\npwsh -c '$(ri -r {W})'\nE"
+                      for s in ("/usr/bin/ssh", "\\ssh", '"ssh"', "'ssh'", "autossh -M 0"))):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
@@ -4610,7 +4614,9 @@ class TestClassification(unittest.TestCase):
                     f"cat > n.md <<'E'\npwsh rm -Recurse '{W}'\nE",
                     f"cat > n.md <<E\nnotes\npowershell Remove-Item -Recurse '{W}'\nE",
                     f"cat > ssh-notes.md <<'E'\npwsh rm -Recurse '{W}'\nE",
-                    "bash <<'L'\n" * 6 + "echo hi\n" + "L\n" * 6):
+                    "bash <<'L'\n" * 6 + "echo hi\n" + "L\n" * 6,
+                    "bash <<'L'\n" * 6 + "go build ./cmd/server; echo $cmd\n" + "L\n" * 6,
+                    f"cat > docs/ssh-notes.md <<'E'\npwsh -c '$(ri -r {W})'\nE"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
