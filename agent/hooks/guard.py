@@ -7065,7 +7065,12 @@ def _redirects_last(segment: str) -> str:
         while j < n and (states[j] or inner or segment[j] not in _WORD_BREAK + "&<>"
                          or j == first and segment[j + 1:j + 2] == "("):
             if not states[j]:
-                if segment[j] in "({":
+                # Only an expansion opens a frame (`$(`, `${`, `>(`), and then any
+                # bracket inside it: a bare `x{` ends at the blank, as in bash.
+                # Counted, `2>x{ creds -t }` moved the words up to the `}` and
+                # `bash -c 2>x{ '<cmd>' } y` hid the script (rollup XERK-1701).
+                if segment[j] in "({" and (inner or segment[j - 1] == "$"
+                                            or segment[j] == "(" and segment[j - 1] in "<>"):
                     inner += 1
                 elif segment[j] in ")}" and inner:
                     inner -= 1

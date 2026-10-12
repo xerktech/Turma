@@ -3628,7 +3628,10 @@ class TestScriptChannels(unittest.TestCase):
                     f"sh -c 'true &>/dev/null {R}'", f"<&- {R}", f"{{fd}}>/dev/null {R}",
                     # ...and a producer's own `2>&1` still feeds the shell after it.
                     f"echo '{R} #' 2>&1 | sh", f"echo '{R} #' {B16}>&1 | sh", f"echo '{R}' 2>&1 | tee /dev/null | sh",
-                    f"bash <(echo '{R}' 2>&1)"):
+                    f"bash <(echo '{R}' 2>&1)",
+                    # A bare `{` in a target is text: the word ends at the blank.
+                    f"bash -c 2>x{{ '{R}' }} y", f"sh -c 2>x{{ '{R}' }} a b",
+                    f"bash -c 2>x( '{R}' ) y"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("2>/dev/null ls /etc", "> out echo hi", "ls 2>&1 | tail",
@@ -6911,7 +6914,10 @@ class TestPrSummary(unittest.TestCase):
         # The file gh reads is still the one checked, and a quoted name stays a name.
         for cmd in ("gh pr create -t x --body-file 2>/dev/null bad.md",
                     "gh pr create -t x --body-file '2>x' good.md",
-                    "gh pr create -t x -F 2>/dev/null good.md -F bad.md"):
+                    "gh pr create -t x -F 2>/dev/null good.md -F bad.md",
+                    # A bare `{` does not stretch the target over the file gh reads.
+                    "gh pr edit --body-file 2>x{ bad.md -t } good.md",
+                    "gh pr edit --body-file >{ bad.md --add-label } good.md"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self.reason(cmd))
 
