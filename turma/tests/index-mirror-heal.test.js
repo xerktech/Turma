@@ -173,3 +173,76 @@ test("XERK-1838: the ingest re-seat from a pre-repair copy re-adds no duplicates
   // First copies seated, and the append numbered after them: no duplicate, no hole.
   assert.deepEqual(store.seqs("t-ing"), ["0:A", "1:B", "2:C", "3:D"]);
 });
+
+// A Postgres tail past the leader's clean file (XERK-1843): rows left by pre-XERK-1450
+// damage, with no repair pending. The leader's ingest re-seat must remove them, or the
+// next append at the file's count hits a stale row and DO NOTHING drops it.
+test("XERK-1843: the leader's ingest re-seat trims a stale Postgres tail", async () => {
+  const store = fakeStore();
+  const META = { remoteKey: "github.com/xerk/turma", repo: "turma", host: "nas",
+    createdAt: "2026-07-10T00:00:00Z", endedTs: "2026-07-10T01:00:00Z", summary: "Tail" };
+  const archive = require("../archive.js");
+  const mirror = new hub.IndexMirror(store, () => true, () => 7);
+  archive.setIndexSink(mirror.sink());
+  archive.setIndexMode("pg", { upsertSession() {}, appendEntries() {}, setCounts() {} });
+  try {
+    const first = [e("A"), e("B")];
+    const r = archive.ingestChunk("nas", "t-tail", META, 0,
+      Buffer.byteLength(JSON.stringify(first)), first, "acme");
+    await idle(mirror);
+    await store.replaceEntries("t-tail", [e("A"), e("B"), e("A"), e("C")]); // damaged PG rows
+    fs.appendFileSync(findJsonl(process.env.ARCHIVE_DIR, "t-tail"), line("C") + "\n"); // clean file A,B,C
+    const next = [e("D")];
+    archive.ingestChunk("nas", "t-tail", META, r.bytesStored,
+      r.bytesStored + Buffer.byteLength(JSON.stringify(next)), next, "acme");
+    await idle(mirror);
+  } finally {
+    archive.setIndexSink(null);
+    archive.setIndexMode(null);
+  }
+  assert.deepEqual(store.seqs("t-tail"), ["0:A", "1:B", "2:C", "3:D"]);
+});
+
+// The comment-2 shape: the leader's OWN file is still raw (A,B,A,C) and so is Postgres.
+// The first-copy seat (A,B,C) must trim the stale C at seq 3 so D lands there.
+test("XERK-1843: a leader seat over a raw duplicated copy lets the next append land", async () => {
+  const store = fakeStore();
+  const META = { remoteKey: "github.com/xerk/turma", repo: "turma", host: "nas",
+    createdAt: "2026-07-10T00:00:00Z", endedTs: "2026-07-10T01:00:00Z", summary: "Raw" };
+  const archive = require("../archive.js");
+  const mirror = new hub.IndexMirror(store, () => true, () => 7);
+  archive.setIndexSink(mirror.sink());
+  archive.setIndexMode("pg", { upsertSession() {}, appendEntries() {}, setCounts() {} });
+  try {
+    const first = [e("A"), e("B")];
+    const r = archive.ingestChunk("nas", "t-raw", META, 0,
+      Buffer.byteLength(JSON.stringify(first)), first, "acme");
+    await idle(mirror);
+    await store.replaceEntries("t-raw", [e("A"), e("B"), e("A"), e("C")]);
+    fs.appendFileSync(findJsonl(process.env.ARCHIVE_DIR, "t-raw"), ["A", "C"].map(line).join("\n") + "\n");
+    const next = [e("D")];
+    archive.ingestChunk("nas", "t-raw", META, r.bytesStored,
+      r.bytesStored + Buffer.byteLength(JSON.stringify(next)), next, "acme");
+    await idle(mirror);
+  } finally {
+    archive.setIndexSink(null);
+    archive.setIndexMode(null);
+  }
+  assert.deepEqual(store.seqs("t-raw"), ["0:A", "1:B", "2:C", "3:D"]);
+});
+
+// The trim is the leader's under the term that queued it. Deposed (or re-promoted) by
+// apply time, the seat still lands but trims nothing: a new leader may have appended.
+test("XERK-1843: a seat queued as leader trims nothing once the term moved", async () => {
+  const store = fakeStore();
+  let term = 1;
+  const mirror = new hub.IndexMirror(store, () => true, () => term);
+  await store.seatEntries("t-dep", [e("A"), e("B")]);
+  mirror._running = true;                                   // hold the queue
+  mirror.sink().seat("t-dep", [e("A"), e("B")]);
+  term = 2;                                                 // lease lost and won back
+  await store.appendEntries("t-dep", [e("N")], 2);          // the other leader's append
+  mirror._running = false;
+  await mirror._drain();
+  assert.deepEqual(store.seqs("t-dep"), ["0:A", "1:B", "2:N"]);
+});

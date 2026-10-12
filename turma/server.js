@@ -4928,8 +4928,17 @@ class IndexMirror {
       await this.store.replaceEntries(op.transcriptId, op.entries, current);
       return;
     }
-    // A follower's heal (XERK-1837): overwrites its own ordinals, never trims the tail.
-    if (op.t === "seat") return this.store.seatEntries(op.transcriptId, op.entries);
+    // A re-seat from this replica's file (XERK-1837). A follower's overwrites its own
+    // ordinals and never trims: another replica may have appended past its copy. The
+    // leader's, applied under the term that queued it, also trims rows past the file
+    // (XERK-1843): a stale tail there made the next append's DO NOTHING drop it. Never
+    // dropped: a leader deposed meanwhile (or mid-replace) falls back to the plain seat.
+    if (op.t === "seat") {
+      const current = () => this.isLeader() && this.term() === op.term;
+      if (op.leadAtQueue && current() &&
+        (await this.store.replaceEntries(op.transcriptId, op.entries, current)) !== false) return;
+      return this.store.seatEntries(op.transcriptId, op.entries);
+    }
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
     if (op.t === "refill") {
       // Rewrites Postgres from this replica's local copy, so only while leading under
@@ -4966,7 +4975,8 @@ class IndexMirror {
         this._push({ t: "entries", transcriptId, entries, startSeq }),
       replace: (transcriptId, entries, gated) =>
         this._push({ t: "replace", transcriptId, entries, gated: !!gated, term: this.term(), leadAtQueue: this.isLeader() }),
-      seat: (transcriptId, entries) => this._push({ t: "seat", transcriptId, entries }),
+      seat: (transcriptId, entries) =>
+        this._push({ t: "seat", transcriptId, entries, term: this.term(), leadAtQueue: this.isLeader() }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
       repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
         this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done, term: this.term() }),
