@@ -17235,6 +17235,9 @@ function isWhisperNonSpeech(text) {
 // error/timeout, bad JSON) resolves to {text:"", unavailable:true, reason}.
 async function transcribePcm(pcm) {
   if (!WHISPER_URL) return { text: "", unavailable: true, reason: "whisper not configured" };
+  // A tap-then-stop sends no audio: nothing was said, so there is nothing to
+  // transcribe (Whisper answers an empty WAV 400, which read as "unavailable").
+  if (!pcm || !pcm.length) return { text: "" };
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), WHISPER_TIMEOUT_MS);
   try {

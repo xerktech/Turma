@@ -1041,6 +1041,22 @@ test("one hung rendered GET blocks its transcript only, never the whole pass (XE
   assert.equal(fs.readFileSync(path.join(root, "repo", "a.jsonl"), "utf8"), "ab");
 });
 
+test("a GET abandoned at its deadline is aborted, in the hydrate and the retry (XERK-1701)", async () => {
+  const root = mkdtemp("turma-mir-");
+  const aborted = [];
+  const store = { list: async () => ["repo/a.jsonl"], stat: async () => ({ size: 2 }),
+    getToFile: (k, dest, { signal } = {}) => new Promise((res, rej) => {
+      signal.addEventListener("abort", () => { aborted.push(k); rej(new Error("aborted")); });
+    }) };
+  const m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {} });
+  await m.hydrateGated(() => {}, { passDeadlineMs: 60 * 1000, getDeadlineMs: 20,
+    sleep: async () => { throw new Error("retried"); } });
+  assert.deepEqual(aborted, ["repo/a.jsonl"]);
+  assert.equal(await m.retryBlocked({ getDeadlineMs: 20 }), 0);
+  assert.deepEqual(aborted, ["repo/a.jsonl", "repo/a.jsonl"]);
+  assert.equal(m.blockedCount(), 1);
+});
+
 test("a slow object that outlasts the retry GET deadline lands on a later, longer retry (XERK-1833 QA D1)", async () => {
   const root = mkdtemp("turma-mir-");
   // Every GET of this key takes 50ms: past a 20ms deadline, inside 80ms.

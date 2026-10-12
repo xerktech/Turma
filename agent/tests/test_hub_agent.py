@@ -2108,6 +2108,15 @@ class TestSessionReport(ProjectDirMixin, unittest.TestCase):
                            self.tool_result("a3", f"{self.PR1}\n{self.PR2}\n")])
         self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
 
+    def test_gh_api_body_quoting_one_other_pr_chips_nothing(self):
+        # XERK-1701 (#20.1): `--jq .body` prints the body, whose prose names a PR.
+        path, state = self._primed()
+        write_jsonl(path, [
+            self.pr_create_call("a6", cmd="gh api repos/o/r/pulls --input b.json --jq .body"),
+            self.tool_result("a6", f"Follows {self.PR2} with the fix.\n"),
+        ])
+        self.assertEqual(ha.session_report(self.WORKDIR, state)["prUrls"], [])
+
     def test_a_create_or_gh_api_fallback_reads_by_the_api_rule(self):
         """`gh pr create … || gh api …/pulls` — the object's body links stay out."""
         path, state = self._primed()
