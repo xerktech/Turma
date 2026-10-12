@@ -4572,7 +4572,15 @@ class TestClassification(unittest.TestCase):
                     f'cmd /c "r^d /s /q {W}"',
                     f"pwsh -c 'Remove-Item -Recurse:$true {W}'",
                     f"pwsh -c 'Remove-Item {W}\\* -Force'",
-                    f'cmd /c "del /f /s /q {W}\\*.*"'):
+                    f'cmd /c "del /f /s /q {W}\\*.*"',
+                    # XERK-1861: a single-quoted `$(…)` reached through a
+                    # runner or a substitution, and a heredoc a shell reads.
+                    f"echo x | xargs pwsh -c '$(Remove-Item -Recurse {W})'",
+                    f"echo x | xargs -n1 sudo pwsh -c '$(ri -r {W})'",
+                    f"find . -exec pwsh -c '$(Remove-Item -Recurse {W})' \\;",
+                    f"echo $(pwsh -c '$(Remove-Item -Recurse {W})')",
+                    f"pwsh -c - <<'E'\nRemove-Item -Recurse '{W}'\nE",
+                    f"cat > n.md <<E && pwsh -c - <<F\nhi\nE\nRemove-Item -Recurse '{W}'\nF"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
@@ -4584,7 +4592,10 @@ class TestClassification(unittest.TestCase):
                     f'git commit -m "guard: deny Remove-Item -Recurse {W} in powershell -c"',
                     'rg -n "Remove-Item -Recurse -Force C:/Windows" agent/',
                     f'grep -rn "rd /s /q {W}" agent/tests',
-                    f'echo cmd -c "Remove-Item -Recurse {W}"'):
+                    f'echo cmd -c "Remove-Item -Recurse {W}"',
+                    # XERK-1861: a heredoc body nothing runs as a script is data.
+                    f"cat > n.md <<'E'\npwsh rm -Recurse '{W}'\nE",
+                    f"cat > n.md <<E\nnotes\npowershell Remove-Item -Recurse '{W}'\nE"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
@@ -5401,6 +5412,14 @@ class TestExpansionBudget(unittest.TestCase):
         t = time.process_time()
         self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         self.assertLess(time.process_time() - t, 15)
+        # XERK-1861: the trailing-glob cut in `_ps_targets` was a regex that
+        # backtracked quadratically on one long word (72s at 128 KB).
+        t = time.process_time()
+        for word in ("/" + "*" * 128000 + "/", "\\" + "?" * 128000):
+            guard._ps_targets(word)
+        self.assertLess(time.process_time() - t, 1)
+        self.assertEqual(guard._ps_targets("C:\\Windows\\*.*"), ["C:\\Windows\\*.*", "C:\\Windows"])
+        self.assertEqual(guard._ps_targets("C:/x/*/y"), ["C:/x/*/y"])
 
     def test_a_default_assignment_spending_the_budget_reads_too_large(self):
         # Rollup XERK-1584: `_default_assignments` spent the budget outside

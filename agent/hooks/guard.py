@@ -12471,8 +12471,49 @@ def _ps_targets(word: str) -> list[str]:
     if not word:
         return []
     # A trailing glob component (`x\\*`, `x\\*.*`) empties the directory x.
-    parent = re.sub(r"[\\/][^\\/]*[*?][^\\/]*$", "", word)
-    return [word, parent] if parent != word else [word]
+    # Cut at the last separator, never a regex: `[\\/][^\\/]*[*?][^\\/]*$`
+    # backtracked quadratically on one long word (72s at 128 KB, XERK-1861).
+    cut = max(word.rfind("\\"), word.rfind("/"))
+    if cut >= 0 and ("*" in word[cut + 1:] or "?" in word[cut + 1:]):
+        return [word, word[:cut]]
+    return [word]
+
+
+_PS_EXEC_ACTIONS = {"-exec", "-execdir", "-ok", "-okdir"}
+
+
+def _ps_raw_reason(command: str) -> str | None:
+    """`_ps_script_reason` over the RAW command, wherever a pwsh/cmd word sits
+    (XERK-1861). The expansion swaps a single-quoted `$(…)` for an opaque
+    placeholder, and pwsh runs it — reached through `xargs`, `find -exec` or a
+    `$(…)` too. So a shell word counts as the segment's program, opening a
+    `$(`/backtick/`(`, or after an `xargs`/`-exec` runner; scanned from the
+    first such word (which covers every later one). `echo pwsh …` stays data.
+    Heredoc bodies are data (`_split_heredocs`), except one whose owner line
+    names a shell: `pwsh -c - <<E` runs it."""
+    text, heredocs = _split_heredocs(command)
+    pieces = [(seg, "") for seg in _split_on_operators(text)]
+    pieces += [(seg, body) for owner, body, _quoted in heredocs
+               for seg in _split_on_operators(owner)]
+    for seg, body in pieces:
+        if not re.search(r"\b(?:powershell|pwsh|cmd)\b", seg.lower()):
+            continue
+        try:
+            tokens = _tokenize(seg)
+        except ValueError:
+            continue
+        prog = len(tokens) - len(_strip_prefixes(tokens))
+        runner = False
+        for i, tok in enumerate(tokens):
+            word = tok.lstrip("$(`{")
+            if (i == prog or word != tok or runner) and \
+                    re.sub(r"\.exe$", "", _basename(word).lower()) in _PS_SHELLS:
+                reason = _ps_script_reason([word] + tokens[i + 1:] + [body])
+                if reason:
+                    return reason
+                break
+            runner = runner or _basename(tok) == "xargs" or tok in _PS_EXEC_ACTIONS
+    return None
 
 
 def _ps_recursive_remove(low: str) -> bool:
@@ -14202,13 +14243,9 @@ def _is_destructive(command: str) -> str | None:
     # single-quoted `$(…)` for an opaque placeholder, which hid
     # `pwsh -c '$(Remove-Item -Recurse C:\\Windows)'` (rollup XERK-1584 QA).
     if re.search(r"\b(?:powershell|pwsh|cmd)\b", command.lower()):
-        for seg in _split_on_operators(command):
-            try:
-                reason = _ps_script_reason(_tokenize(seg))
-            except ValueError:
-                reason = None
-            if reason:
-                return reason
+        reason = _ps_raw_reason(command)
+        if reason:
+            return reason
     for tokens, segment, *flags in _expand_both(command):
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"

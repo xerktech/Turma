@@ -84,8 +84,14 @@ Each fires on a live construct next to a sink; the folded ticket is named.
   -Recurse .\dist`). Only a shell PROGRAM is scanned, so a commit message quoting one is data.
   Also any recursive delete in a script that names `/` or `~` elsewhere (`rm -r ./dist; ls ~`).
 - It runs on the RAW command's segments too, not only the expanded ones: the expansion swaps a
-  single-quoted subexpression for a placeholder, and pwsh runs it.
-- Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook.
+  single-quoted subexpression for a placeholder, and pwsh runs it (`_ps_raw_reason`).
+  - A shell word there counts as the program, opening a `$(`/backtick/`(`, or after an
+    `xargs`/`-exec` runner (XERK-1861): segment-start only missed `xargs pwsh -c '$(…)'`.
+    `echo pwsh …` stays data.
+  - It scans the heredoc-STRIPPED text: a note's body line naming all three was refused. A body
+    whose owner line has a shell program is scanned with it (`pwsh -c - <<E`).
+- Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook;
+  the trailing-glob cut in `_ps_targets` is `rfind`, never a regex (72s at 128 KB, XERK-1861).
 - Tests: `test_a_powershell_c_script_s_remove_targets_are_judged`,
   `test_a_long_cmd_switch_run_stays_linear`.
 
