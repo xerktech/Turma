@@ -13362,6 +13362,57 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         self.assertEqual(entered, ["A", "B", "C"])
         self.assertNotIn("agent-abcde", ha._PANE_TYPE_LOCKS)
 
+    def test_a_writer_that_raises_still_frees_its_pane_lock(self):
+        # XERK-1701: an exception mid-typing must release the lock AND drop
+        # the writer's count, or the next writer waits out the timeout and the
+        # map keeps the entry forever.
+        sm = self.make_manager()
+        self._running_session(sm)
+        long = "x" * (ha.PASTE_CHUNK_CHARS * 2)
+        def boom(cmd, data, timeout=None):
+            raise RuntimeError("tmux gone")
+        with mock.patch.object(ha, "run_stdin", side_effect=boom), \
+                mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
+            with self.assertRaises(RuntimeError):
+                ha._type_into_pane("agent-abcde", long)
+            self.assertNotIn("agent-abcde", ha._PANE_TYPE_LOCKS)
+            started = time.monotonic()
+            with self.assertRaises(RuntimeError):
+                ha._type_into_pane("agent-abcde", long)
+            self.assertLess(time.monotonic() - started, 1.0)   # not a lock wait
+        self.assertNotIn("agent-abcde", ha._PANE_TYPE_LOCKS)
+        # A writer WAITING behind the one that raises gets the lock at once.
+        go, done = threading.Event(), []
+        def stdin(cmd, data, timeout=None):
+            if threading.current_thread().name == "A":
+                go.wait(5)
+                raise RuntimeError("tmux gone")
+            return True
+        def run_a():
+            try:
+                ha._type_into_pane("agent-abcde", long)
+            except RuntimeError:
+                pass
+        with mock.patch.object(ha, "run_stdin", side_effect=stdin), \
+                mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
+            a = threading.Thread(target=run_a, name="A")
+            b = threading.Thread(name="B", target=lambda: done.append(
+                ha._type_into_pane("agent-abcde", long)))
+            a.start()
+            deadline = time.time() + 5
+            while "agent-abcde" not in ha._PANE_TYPE_LOCKS and time.time() < deadline:
+                time.sleep(0.01)
+            b.start()
+            while ha._PANE_TYPE_LOCKS["agent-abcde"][1] < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            started = time.monotonic()
+            go.set()
+            a.join(10)
+            b.join(10)
+            self.assertLess(time.monotonic() - started, 2.0)   # B never waited it out
+        self.assertEqual(len(done), 1)
+        self.assertNotIn("agent-abcde", ha._PANE_TYPE_LOCKS)
+
     def test_a_paste_failing_midway_types_only_the_rest(self):
         # Slices already in the composer must not be typed a second time by the
         # fallback — it sends only what had not landed.

@@ -35,7 +35,7 @@ composed.**
     peer). Those keep one bracketed paste; `chat.js` `stripFraming` hides the tags.
   - A typed TAB is autocomplete, so tabs go as 4 spaces. One writer per pane (`_PANE_TYPE_LOCKS`).
   - **The cap is judged on the text AS TYPED** (tabs already 4 spaces), on tmux and Windows alike:
-    judged before, 4000 tabs became 41 slices, each a pane call, on the beat's resend path.
+    judged before, 4000 tabs became 40 slices, each a pane call, on the beat's resend path.
   - **A pane's lock entry lives only while a writer uses it** (`[lock, users]`): a writer counts
     itself in under the guard BEFORE waiting, the last out drops it. Never prune on kill/teardown
     instead — a waiting writer would hold the old lock while a newcomer got a fresh one.

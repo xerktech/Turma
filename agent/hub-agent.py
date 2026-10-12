@@ -15827,7 +15827,7 @@ def _type_into_tmux_pane(tmux_name, text):
     """_type_into_pane's tmux half, run under that pane's lock."""
     buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
     # The cap is judged on the text as TYPED (tabs as 4 spaces): judged before,
-    # 4000 tabs became 41 slices, each a tmux call, on the beat's resend path.
+    # 4000 tabs became 40 slices, each a tmux call, on the beat's resend path.
     typed = text.replace("\t", "    ")
     sliced = len(typed) <= PASTE_SLICED_MAX_CHARS and not _SLICE_UNSAFE_RE.search(typed)
     if sliced:
