@@ -3841,8 +3841,12 @@ function epicRunActiveCount(run, rows, now, exclude) {
     if (hit && hit.row && hit.row.statusCategory === "done") continue;
     const att = epicChildAttempts.get(k);
     const q = liveQueuedTicket(run.siteKey, childKey);
-    if (live.has(k) || (q && q.reason !== "blocked" && q.reason !== "epic-cap")
-      || spawnTicketInFlight(run.siteKey, childKey)
+    if (live.has(k)) n++;
+    // A child still in line is judged by its entry alone: the launch grace is
+    // stamped at QUEUE time, so applying it here made two cap-held siblings hold
+    // each other at the cap for up to the grace with a host free.
+    else if (q) { if (q.reason !== "blocked" && q.reason !== "epic-cap") n++; }
+    else if (spawnTicketInFlight(run.siteKey, childKey)
       || committedTicketSpawn(run.siteKey, childKey)
       || (att && Number.isFinite(att.at) && now - att.at < EPIC_CHILD_LAUNCH_GRACE_MS)) n++;
   }

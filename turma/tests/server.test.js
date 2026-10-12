@@ -14599,6 +14599,29 @@ test("XERK-1860: the drain enforces the cap — children queued while blocked go
   resetEpicRuns();
 });
 
+test("XERK-1860: cap-held siblings never hold each other through the launch grace", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  if (agents.edCapA) agents.edCapA.commands = [];
+  const site = "e1860.atlassian.net";
+  const full = () => asBeat("edCapA", site, { autoStart: false,
+    capacity: { maxSessions: 1, running: 1, queued: 0, free: 0 }, tickets: capTickets() });
+  await full();
+  // Cap 3 on a full host: the driver queues all three (each stamped with a fresh
+  // attempt), and they wait on capacity.
+  armEpicRun(site, "G-1", undefined, { maxConcurrent: 3 });
+  capRound();
+  assert.equal(ticketQueue.filter((e) => !e.expiredAt).length, 3);
+  // Lower the cap to 1 and free the host: one must go NOW, not after the grace.
+  setEpicRunLimit(site, "G-1", 1);
+  await capBeat();
+  capRound();
+  assert.equal(spawnedKeys("edCapA").length, 1);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
 test("XERK-1860: the epic-run route sets, keeps and clears the cap, and refuses bad values", async () => {
   resetEpicRuns();
   await epicBeat("edCapR", "e1860r.atlassian.net");

@@ -116,6 +116,8 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   - Needed because the driver keeps queuing past uncounted `blocked` entries; without the gate they
     ALL dispatched the moment the block cleared (QA: cap 1, three children on one host).
   - `epic-cap` entries never count toward the cap — two held children counting each other deadlock.
+  - A child WITH a queue entry is judged by that entry alone, never the launch grace (stamped at
+    QUEUE time) — else cap-held siblings hold each other at the cap for up to the grace.
   - Clients label it "⏳ queued · epic limit" (`board.js` `queuedLabel`, `Board.kt` `Queued.epicCap`).
 - The driver checks the cap AFTER every other guard, so a held child spends no attempt. Lowering the
   cap never kills a running child. Board: `epicLimitPickerHtml` in the epic panel; Android
