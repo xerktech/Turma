@@ -44408,6 +44408,32 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertFalse(any(c["id"] == sid for c in sm.closed))
         self.assertTrue(any(c[-1:] == [wt] and "remove" in c for c in self.run_calls))
 
+    def test_the_launch_env_blocks_every_push_with_real_git(self):
+        # The layer under the guard: whatever runs git in a shadow (a hook, a
+        # `rebase -x`, an interpreter's subprocess) inherits this env.
+        d = tempfile.mkdtemp(prefix="shadow-push-")
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        env = {k: v for k, v in os.environ.items() if not k.startswith("GIT_")}
+        env.update(HOME=d, GIT_AUTHOR_NAME="a", GIT_AUTHOR_EMAIL="a@b",
+                   GIT_COMMITTER_NAME="a", GIT_COMMITTER_EMAIL="a@b")
+        sh = lambda *a, e=env, cwd=d: subprocess.run(list(a), cwd=cwd, env=e, capture_output=True)
+        sh("git", "init", "-q", "--bare", "origin.git")
+        sh("git", "clone", "-q", "origin.git", "w")
+        w = os.path.join(d, "w")
+        sh("git", "commit", "-q", "--allow-empty", "-m", "x", cwd=w)
+        shadow_env = {**env, **ha.SHADOW_ENV}
+        for url in ("origin", "../origin.git", f"file://{d}/origin.git"):
+            r = sh("git", "push", url, "HEAD:refs/heads/x", e=shadow_env, cwd=w)
+            self.assertNotEqual(r.returncode, 0, url)
+        self.assertEqual(sh("git", "fetch", "origin", e=shadow_env, cwd=w).returncode, 0)
+        self.assertEqual(sh("git", "branch", cwd=os.path.join(d, "origin.git")).stdout, b"")
+        # Without it, the same push lands: the test proves the block, not a broken rig.
+        self.assertEqual(sh("git", "push", "origin", "HEAD:refs/heads/x", cwd=w).returncode, 0)
+        # And the launch carries it.
+        sm = self.spawned()
+        self.assertIn("GIT_CONFIG_KEY_0=url./nonexistent/turma-shadow-no-push/.pushInsteadOf",
+                      self.launches()[-1][-1])
+
     def test_the_persisted_ledger_is_read_as_untrusted(self):
         with open(ha.SHADOW_RUNS_PATH, "w") as f:
             json.dump({self.RID: {"id": self.RID, "state": "running", "evil": 1},

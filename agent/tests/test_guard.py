@@ -7472,6 +7472,12 @@ class TestShadowRun(unittest.TestCase):
         "gh api /graphql -fquery=x", "env -u GH_TOKEN gh api r -fbody=x",
         "python3 ~/.claude/bin/jira issue x", "curl -K f", "az rest --method post --uri u",
         "npm publish", "docker push x", "twine upload d/*", "cargo publish", "tea pr create",
+        # Delta QA: git's own command runners, the push block's env, wget prefixes.
+        "git -c core.fsmonitor='git push o' status", "GIT_EDITOR='git push o; true' git commit",
+        "git rebase -x 'git push o' HEAD~1", "git bisect run sh -c 'git push o'",
+        "git -c core.hooksPath=h commit", "git -c diff.external=x diff",
+        "env -u GIT_CONFIG_COUNT git push", "GIT_CONFIG_COUNT=0 git status",
+        "unset GIT_CONFIG_KEY_0; git status", "wget --post-d=a=b u", "wget --meth=PUT u",
     ]
     ALLOWED = [
         "git status", "git commit -m fix", "git switch -c turma-shadow/sh-0011223344",
@@ -7479,7 +7485,9 @@ class TestShadowRun(unittest.TestCase):
         "gh pr view 1", "gh pr diff 9", "gh api repos/o/r/pulls/9",
         "az repos pr list", "curl -s https://example.com", "curl -XGET https://h",
         "wget https://h/f", "http https://h", "git config user.name x", "docker build .",
-        "cat jira.md", "git log --oneline",
+        "cat jira.md", "git log --oneline", "grep -rn jira agent/", "rg hub turma/",
+        "git commit -m hub", "git fetch origin", "git pull", "git ls-remote origin",
+        "git submodule update --init", "git rebase main",
     ]
 
     def test_publishing_is_denied_only_in_a_shadow(self):

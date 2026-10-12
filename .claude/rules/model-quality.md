@@ -92,17 +92,23 @@ This file is the operative rules for what has shipped.
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
     no ticket sweep — auto-stop on Done, auto-merge, close-ticket, the ladder — acts on it. The
     hub raises no alert for a `shadow` session and lists it in no peer roster.
-  - **No-publish is the guard's, on the launch flag** (`TURMA_SHADOW`, `shadow_reason` in
-    `guard.py`, `agent-hooks.md`), plus `--strict-mcp-config`, `ENABLE_CLAUDEAI_MCP_SERVERS=false`,
-    blanked tracker tokens and a non-token `GH_TOKEN` (`SHADOW_ENV`).
+  - **No-publish is two layers.** The launch env (`SHADOW_ENV`) carries an EMPTY
+    `url.<dead path>.pushInsteadOf` via `GIT_CONFIG_COUNT/KEY_0/VALUE_0`, which rewrites EVERY
+    push URL (remote, path, file, https, ssh) for any git a child runs — a hook, `rebase -x`, an
+    interpreter's subprocess — while fetch works; plus blanked tracker tokens, a non-token
+    `GH_TOKEN`, `--strict-mcp-config` and `ENABLE_CLAUDEAI_MCP_SERVERS=false`. On top, the guard
+    (`TURMA_SHADOW`, `shadow_reason`, `agent-hooks.md`) fails closed per family and refuses any
+    command naming the `GIT_CONFIG*`/`GIT_SSH`/`GIT_EDITOR` env. A text guard alone cannot close
+    git's own command runners — never drop the env layer.
   - **A shadow is never resumed, migrated or paused** (`resume`, `_resume_at_cwd`,
     `export_session`, `_sleeper_unpausable`, hub `sleeperPausable`): relaunched it would carry none
     of its launch protections. The closed record keeps `shadow`, and every shadow session and
     transcript id is persisted (`_sessions` in `shadow-runs.json`) so a record that lost the flag
     is still refused. An operator-killed shadow's closed record + worktree are reaped.
-  - Residual: a same-uid session can start a nested `claude` without `TURMA_SHADOW` (the ~/.turma
-    class); an HTTP write from an interpreter (`python -c`) is unseen by the Bash guard, and on an
-    SSH or ADO-extraHeader remote no blanked credential stops it. A live run session could also
+  - Residual: a same-uid session can start a nested `claude` without `TURMA_SHADOW`, or strip the
+    push block from an interpreter's own env (the ~/.turma class); an HTTP API write from an
+    interpreter is unseen by the Bash guard where a credential survives (a stored `gh` token, an
+    SSH key for a raw API). A live run session could also
     write its grader's `shadow-grade.json` (same class). Peeking at later git history is forbidden
     by the directive only (validity, not safety).
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).

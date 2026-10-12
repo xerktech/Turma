@@ -12971,12 +12971,19 @@ _SHADOW_GIT_VERBS = {
     "diff-tree", "diff-files", "diff-index", "show-ref", "symbolic-ref", "name-rev",
     "notes", "bisect", "reflog", "for-each-ref", "check-ignore", "hash-object", "help",
     "version", "init", "count-objects", "fsck", "gc", "range-diff", "whatchanged",
+    # Read-only network verbs: the launch's pushInsteadOf block never touches them.
+    "fetch", "pull", "ls-remote", "submodule", "sparse-checkout", "lfs",
 }
 # A config key that redirects a later git into a publish (an alias, a push/pull
 # URL or command).
 _SHADOW_GIT_CONFIG_RE = re.compile(
-    r"(?i)^(alias\.|remote\..*\.(url|pushurl|push|mirror|receivepack|uploadpack)|"
-    r"url\..*\.(insteadof|pushinsteadof)|core\.sshcommand|credential\.)")
+    r"(?i)^(alias\.|remote\.|url\.|core\.|credential|diff\.|filter\.|merge\.|gpg|"
+    r"sequence\.|include|.*\.(command|program|cmd|helper|tool|path|textconv)\b)")
+# Programs that run their first argument as a script: a tracker CLI named there
+# runs (`python3 ~/.claude/bin/jira …`); named anywhere else it is just a word.
+_SHADOW_INTERPRETERS = {"python", "python3", "node", "bash", "sh", "zsh", "dash", "perl",
+                        "ruby", "deno", "bun", "env", "sudo", "exec", "command", "xargs",
+                        "nohup", "timeout"}
 _SHADOW_TRACKER_CLIS = {"jira", "acli", "ado", "jira-cli", "tea", "glab", "hub", "lab"}
 _SHADOW_HTTP_CLIS = {"curl", "wget", "http", "https", "httpie", "xh", "xhs"}
 # Package / image registries: a publish there is a publish.
@@ -12989,6 +12996,10 @@ _SHADOW_PUBLISH_VERBS = {
     "helm": {"push"}, "oras": {"push"}, "skopeo": {"copy"}, "crane": {"push", "copy"},
     "dotnet": {"nuget"}, "nuget": {"push"}, "mvn": {"deploy"}, "gradle": {"publish"},
 }
+# Env vars that would undo the launch's push block or make git run a command.
+_SHADOW_GIT_ENV_RE = re.compile(
+    r"GIT_(CONFIG|SSH|EDITOR|SEQUENCE_EDITOR|EXEC_PATH|ASKPASS|PAGER|EXTERNAL_DIFF|DIR\b|"
+    r"WORK_TREE|PROXY_COMMAND|TEMPLATE_DIR)")
 _SHADOW_REASON = (
     "this is a shadow run: it may not publish — no push, no PR/MR, no tracker, "
     "registry or API write. Commit locally and finish with `shadow-done`"
@@ -13003,9 +13014,15 @@ def _shadow_http_writes(prog: str, args: list[str]) -> bool:
         t = args[i]
         low = t.lower()
         if prog == "wget":
-            if low.startswith(("--post-data", "--post-file", "--body-data", "--body-file",
-                               "--method", "--config", "-e", "--execute", "-i",
-                               "--input-file")):
+            # wget takes any unambiguous PREFIX of a long option (`--post-d`).
+            opt = low.split("=", 1)[0]
+            if opt.startswith("--") and len(opt) >= 4 and any(
+                    w.startswith(opt) for w in ("--post-data", "--post-file", "--body-data",
+                                                "--body-file", "--method", "--config",
+                                                "--execute", "--input-file")):
+                return True
+            if t in ("-e", "-i") or (t.startswith("-") and not t.startswith("--")
+                                     and any(c in t[1:] for c in "ei")):
                 return True
         elif prog in ("http", "https", "httpie", "xh", "xhs"):
             # `http POST url k=v`: a method word, a request item or a file feed writes.
@@ -13050,6 +13067,12 @@ def _shadow_git_reason(tokens: list[str]) -> str | None:
     sub = _git_args(tokens)
     if not sub:
         return None
+    # Verbs that run a command of the session's choosing.
+    if sub[0] == "rebase" and any(w in ("-x", "--exec", "-i", "--interactive")
+                                  or w.startswith(("--exec", "-x")) for w in sub[1:]):
+        return _SHADOW_REASON
+    if sub[0] == "bisect" and "run" in sub[1:2]:
+        return _SHADOW_REASON
     if sub[0] == "config":
         if any(_SHADOW_GIT_CONFIG_RE.match(w) for w in sub[1:] if not w.startswith("-")):
             return _SHADOW_REASON
@@ -13083,10 +13106,16 @@ def shadow_reason(command: str) -> str | None:
     for tokens, _segment, *_flags in _expand_both(command):
         if not tokens:
             continue
-        names = {_basename(t).lower().removesuffix(".exe").removesuffix(".py")
-                 for t in tokens if t and not t.startswith("-")}
-        # A tracker CLI run through an interpreter (`python3 ~/.claude/bin/jira`).
-        if names & _SHADOW_TRACKER_CLIS:
+        # The launch's push block lives in GIT_CONFIG_*: a command that names it
+        # (to unset or override it) is refused outright.
+        if _SHADOW_GIT_ENV_RE.search(" ".join(tokens)) or _SHADOW_GIT_ENV_RE.search(command):
+            return _SHADOW_REASON
+        words = [t for t in tokens if t and not t.startswith("-")]
+        name = lambda t: _basename(t).lower().removesuffix(".exe").removesuffix(".py")
+        # A tracker CLI as the program, or as an interpreter's script.
+        if name(tokens[0]) in _SHADOW_TRACKER_CLIS or (
+                name(tokens[0]) in _SHADOW_INTERPRETERS and len(words) > 1
+                and name(words[1]) in _SHADOW_TRACKER_CLIS):
             return _SHADOW_REASON
         prog = _basename(tokens[0]).lower().removesuffix(".exe")
         rest = tokens[1:]

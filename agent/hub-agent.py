@@ -16655,6 +16655,14 @@ SHADOW_ENV = {
     "GH_TOKEN": "turma-shadow-no-publish", "GITHUB_TOKEN": "",
     "GITLAB_TOKEN": "", "JIRA_TOKEN": "", "JIRA_API_TOKEN": "", "AZDO_TOKEN": "",
     "AZURE_DEVOPS_EXT_PAT": "",
+    # The layer a text guard cannot be (QA: `rebase -x`, hooks, core.fsmonitor,
+    # an interpreter's subprocess all run git unseen): an EMPTY pushInsteadOf
+    # prefix rewrites EVERY push URL — named remote, path, file://, https, ssh,
+    # scp-like — to a path that does not exist, in the environment every child
+    # inherits. Fetch is untouched. Verified against real git.
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "url./nonexistent/turma-shadow-no-push/.pushInsteadOf",
+    "GIT_CONFIG_VALUE_0": "",
 }
 
 
@@ -26973,10 +26981,12 @@ class SessionManager:
         # Every session and transcript a shadow ever ran as, kept past the run
         # record so neither can be resumed into an ordinary session.
         known = (data or {}).get("_sessions")
-        self.shadow_sids = {x for x in (known.get("sids") or [])
-                            if isinstance(x, str)} if isinstance(known, dict) else set()
-        self.shadow_tids = {x for x in (known.get("tids") or [])
-                            if isinstance(x, str)} if isinstance(known, dict) else set()
+        # Lists in arrival order, so the cap keeps the NEWEST ids.
+        def ids(k):
+            v = known.get(k) if isinstance(known, dict) else None
+            return list(dict.fromkeys(x for x in (v or []) if isinstance(x, str)))
+        self.shadow_sids = ids("sids")
+        self.shadow_tids = ids("tids")
         out = {}
         for rid, r in (data or {}).items():
             if not (isinstance(r, dict) and isinstance(rid, str)
@@ -26997,8 +27007,8 @@ class SessionManager:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = SHADOW_RUNS_PATH + f".{os.getpid()}.tmp"
             data = dict(self.shadow_runs)
-            data["_sessions"] = {"sids": sorted(self.shadow_sids)[-SHADOW_SESSIONS_KEEP:],
-                                 "tids": sorted(self.shadow_tids)[-SHADOW_SESSIONS_KEEP:]}
+            data["_sessions"] = {"sids": self.shadow_sids[-SHADOW_SESSIONS_KEEP:],
+                                 "tids": self.shadow_tids[-SHADOW_SESSIONS_KEEP:]}
             with open(tmp, "w") as f:
                 json.dump(data, f)
             os.replace(tmp, SHADOW_RUNS_PATH)
@@ -27110,11 +27120,12 @@ class SessionManager:
         """Remember a shadow session's id and transcript id (saved with the runs)."""
         if not sid:
             return
-        self.shadow_sids.add(sid)
+        if sid not in self.shadow_sids:
+            self.shadow_sids.append(sid)
         sess = self._find(sid)
         tid = sess.get("claudeSessionId") if sess else None
-        if isinstance(tid, str) and tid:
-            self.shadow_tids.add(tid)
+        if isinstance(tid, str) and tid and tid not in self.shadow_tids:
+            self.shadow_tids.append(tid)
 
     def _shadow_session_live(self, sid):
         sess = self._find(sid) if sid else None
