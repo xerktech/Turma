@@ -53,7 +53,8 @@ const PRS_MAX = 10;
 const HOST_MAX_ROWS = positiveEnv("OUTCOME_LEDGER_HOST_MAX_ROWS", Math.max(1, Math.floor(MAX_ROWS / 4)));
 // /metrics labels a model outside these families "other": a model id is
 // agent-supplied, and every distinct one would add series to an unauthenticated route.
-const METRIC_MODELS = new Set(["opus", "sonnet", "haiku", "default"]);
+const MODEL_FAMILIES = ["opus", "sonnet", "haiku", "fable"];
+const METRIC_MODELS = new Set(MODEL_FAMILIES);
 const METRIC_CLASSES_MAX = 20;
 const ROWS_SERVED_MAX = 500;
 
@@ -119,8 +120,34 @@ function workClass(type) {
 function modelFamily(v) {
   const s = capStr(v, 80).toLowerCase();
   if (!s) return "";
-  for (const f of ["opus", "sonnet", "haiku"]) if (s.includes(f)) return f;
+  for (const f of MODEL_FAMILIES) if (s.includes(f)) return f;
   return s.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+}
+
+// What an unpinned session runs on when its host never probed a default: Opus, the
+// login default the fleet runs on. "default" is never a group of its own — it is
+// whatever model the login resolves it to, and it reads as that model.
+const DEFAULT_MODEL = "opus";
+
+/**
+ * A spawn alias → its family, with "default" (the release value, not a model)
+ * resolved to the host's probed default label ("Default (Opus 5)", "Sonnet 5"),
+ * else DEFAULT_MODEL. Empty stays empty: no alias is not a claim.
+ */
+function aliasFamily(alias, defaultLabel) {
+  const m = modelFamily(alias);
+  if (m !== "default") return m;
+  return defaultFamily(defaultLabel);
+}
+
+/**
+ * The host's probed default label → its family, else DEFAULT_MODEL. The probe's
+ * label reads "`Opus 5.5 (1M context)` (effort: medium)", so only a known family
+ * named anywhere in it counts — never a parenthesised fragment.
+ */
+function defaultFamily(label) {
+  const m = modelFamily(label);
+  return MODEL_FAMILIES.includes(m) ? m : DEFAULT_MODEL;
 }
 
 function sanitizePr(p) {
@@ -233,7 +260,7 @@ function sanitizeRow(r) {
   if (!firstSeen || !updatedAt) return null;
   const out = {
     key: rowKey(site, issue, host, sid), site, issue, host, sid,
-    cls: workClass(r.cls), model: modelFamily(r.model) || "default",
+    cls: workClass(r.cls), model: aliasFamily(r.model) || DEFAULT_MODEL,
     firstSeen, updatedAt,
   };
   if (r.modelKnown === true) out.modelKnown = true;
@@ -334,7 +361,7 @@ let backend = null;            // set below
 /**
  * Fold one sweep's observations. Each observation is one ticket session the
  * fleet still reports:
- *   {site, issue, host, sid, repo, model, modelActual, runtime, running,
+ *   {site, issue, host, sid, repo, model, modelActual, modelDefault, runtime, running,
  *    createdAt, closedAt, prs:[{url,state}], closeKind, type, statusCategory}
  * Returns the rows that changed (also handed to the backend).
  */
@@ -383,7 +410,7 @@ function observe(observations, now = Date.now()) {
       room.set(base.host, room.get(base.host) - 1);
     }
     const next = prev ? { ...prev, prs: prev.prs ? prev.prs.map((p) => ({ ...p })) : undefined }
-      : { ...base, model: "default" };
+      : { ...base, model: defaultFamily(o.modelDefault) };
     if (!prev) created.add(base.key);
     if (!next.prs) delete next.prs;
     // The class can be learned late (the board row arrives after the session).
@@ -393,7 +420,7 @@ function observe(observations, now = Date.now()) {
     const actual = modelFamily(o.modelActual);
     if (actual) { next.model = actual; next.modelKnown = true; }
     else if (!next.modelKnown) {
-      const alias = modelFamily(o.model);
+      const alias = aliasFamily(o.model, o.modelDefault);
       if (alias) next.model = alias;
     }
     const repo = capStr(o.repo, 200);
@@ -587,7 +614,7 @@ function observeShadows(reports, now = Date.now()) {
     const prev = rows.get(key);
     const next = prev ? { ...prev } : {
       site: live.site, issue: live.issue, host: o.host, sid: o.id, kind: "shadow",
-      pairOf: live.key, cls: live.cls, model: live.shadow.model || "default",
+      pairOf: live.key, cls: live.cls, model: live.shadow.model || DEFAULT_MODEL,
       repo: live.repo, firstSeen: now, updatedAt: now,
     };
     const actual = modelFamily(o.modelActual);

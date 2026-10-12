@@ -29,8 +29,13 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   - A paused sleeper is skipped (waiting, not ended); a `queued` record has no work yet.
 - **Work class = the tracker's issue type**, lowercased (`workClass`), "other" when unknown. Coarse
   on purpose so each (class, model) collects enough tickets to compare.
-- **Model = the family that ANSWERED** (`modelActual`), else the spawn alias, else "default"
-  (`modelFamily`). Once a real model is seen (`modelKnown`) an alias never overwrites it.
+- **Model = the family that ANSWERED** (`modelActual`), else the spawn alias, else the host's
+  probed default (`models.defaultLabel` → `defaultFamily`), else Opus. Once a real model is seen
+  (`modelKnown`) an alias never overwrites it.
+- **There is no "default" model group**: "default" is the login's model, not a model. A stored
+  legacy "default" row folds into Opus on load (`sanitizeRow`). The probe's label reads
+  "`Opus 5.5 (1M context)` (effort: medium)", so only a known family named in it counts — never a
+  parenthesised fragment. Tests: "an unpinned or 'default' session…" in `outcome-ledger.test.js`.
 - **Outcome is DERIVED at read time** (`outcomeOf`), never stored: reopened → bad; merged →
   pending until `MODEL_QUALITY_WINDOW_DAYS` (90) passes, then good; every PR closed unmerged → bad;
   a stale close (not-reproducible / already-fixed) → no-change; ended with nothing → undelivered.
@@ -70,7 +75,7 @@ This file is the operative rules for what has shipped; the routing policy is `mo
 - **Under HA a sweep folds nothing until a rescan loaded the table** (`backend.loaded`): a
   promoted leader's stale snapshot would otherwise win the newer-wins upsert.
 - **`/metrics` carries per (class, model, outcome) gauges only** — no host, ticket or session.
-  Labels are BOUNDED: a model outside opus/sonnet/haiku/default reads `other`, and only the 20
+  Labels are BOUNDED: a model outside opus/sonnet/haiku/fable reads `other`, and only the 20
   largest classes keep their name (both are agent/tracker strings on an unauthenticated route).
 - **Rework signals ride the agent's existing reports** (XERK-1845), reported beside the outcome,
   never part of good/bad: `aggregate()` serves each group's `rework.<signal> = {median, n}` over

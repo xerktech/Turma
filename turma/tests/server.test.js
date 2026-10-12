@@ -24985,6 +24985,19 @@ test("XERK-1839: the sweep folds ticket sessions into fleet-wide model outcomes"
   for (const k of ["ol-acme", "ol-rival", "ol-drift"]) delete agents[k];
 }));
 
+test("an unpinned session reads as its host's probed default model, never 'default'", outcomeIsolated(async () => {
+  hub.outcomeLedger._internals.reset();
+  outcomeHost("ol-dflt", "ol-dflt.atlassian.net", {
+    models: { available: ["sonnet", "opus"], defaultLabel: "`Sonnet 5.5 (1M context)` (effort: medium)" },
+  });
+  const s = agents["ol-dflt"].sessions[0];
+  delete s.model; delete s.modelActual;
+  agents["ol-dflt"].closedSessions[0].model = "default";
+  hub.outcomeLedgerSweep();
+  const models = [...hub.outcomeLedger._internals.rows().values()].map((r) => r.model);
+  assert.deepEqual(models, ["sonnet", "sonnet"]);
+}));
+
 test("XERK-1839: the sweep dates Done by the board row's resolution time", outcomeIsolated(async () => {
   hub.outcomeLedger._internals.reset();
   outcomeHost("ol-done", "ol-done.atlassian.net");

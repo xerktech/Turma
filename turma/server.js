@@ -4769,6 +4769,8 @@ function outcomeLedgerSweep(now = Date.now()) {
         obs.push({
           site: org, issue: t.key, host, sid: s.id, repo: s.repo,
           model: s.model, modelActual: s.modelActual, runtime: s.agentType,
+          // What "default" / an unpinned spawn resolves to on this host's login.
+          modelDefault: a.models && a.models.defaultLabel,
           running, createdAt: s.createdAt, closedAt: s.closedAt,
           prs: Array.isArray(s.prs) ? s.prs : [],
           qaRuns: s.qaRuns, qaPartial: s.qaPartial === true,
