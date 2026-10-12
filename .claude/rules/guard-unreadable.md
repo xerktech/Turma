@@ -70,6 +70,22 @@ Each fires on a live construct next to a sink; the folded ticket is named.
   plain `$'\t'`/`$'\n'` is left alone.
 - **herestring-brace** `<<<` feeding a shell with a brace-list word (XERK-1739).
 
+## PowerShell / cmd scripts are scanned, never parsed (rollup XERK-1584)
+
+- When `powershell`/`pwsh`/`cmd` is the command's PROGRAM (after `_strip_prefixes`),
+  `_ps_script_reason` refuses it if ANY argument word is a remove command/alias, ANY is a
+  recursive switch (`-Recurse` abbreviation, `/s` in a switch run) or wildcard, and ANY names a
+  protected path. Words are split on blanks, punctuation and comment chars; quoted text also
+  counts whole (`'C:\Program Files'`).
+- Four statement parsers each lost to a shape QA ran live in pwsh: option values, `-Com`, blocks,
+  `<#` inside a string, newlines, expression position (`$x = rm …`, `echo (rm …)`). Don't
+  rebuild one.
+- Accepted over-deny: a read-only script naming all three (`Get-ChildItem C:\Windows; Remove-Item
+  -Recurse .\dist`). Only a shell PROGRAM is scanned, so a commit message quoting one is data.
+- Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook.
+- Tests: `test_a_powershell_c_script_s_remove_targets_are_judged`,
+  `test_a_long_cmd_switch_run_stays_linear`.
+
 ## Residual — NOT closed this way (documented, not a bug to "finish")
 
 Behavioural shapes indistinguishable from ordinary automation by text alone, so a marker broad

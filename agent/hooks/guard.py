@@ -12413,124 +12413,60 @@ def _destructive_rm(tokens: list[str]) -> str | None:
 
 _PS_SHELLS = {"powershell", "pwsh", "cmd"}
 _PS_REMOVE_CMDS = {"remove-item", "ri", "rm", "del", "erase", "rd", "rmdir"}
+_PS_WORD_SPLIT_RE = re.compile(r"[\s;|&{}()\[\]$=,@'\"#<>]+")
+_PS_QUOTED_RE = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"")
 _PS_SWITCHES_RE = re.compile(r"(?:/[a-z])+")
 
 
-def _ps_drop_block_comments(script: str) -> str:
-    """`<# … #>` blocks blanked (a find loop: a regex rescanned per `<#`)."""
-    out, i = [], 0
-    while True:
-        j = script.find("<#", i)
-        k = script.find("#>", j + 2) if j >= 0 else -1
-        if k < 0:
-            return "".join(out) + script[i:]
-        out.append(script[i:j] + " ")
-        i = k + 2
-
-
-def _ps_statements(script: str) -> list[list[str]]:
-    """A PowerShell/cmd script's statements (cut at `;`, `|`, `&` and braces),
-    each its words with quotes and backtick escapes removed and
-    backslashes kept (`'C:\\Program Files'` is one word). Unbalanced quotes
-    fall back to blanks."""
-    script = _ps_drop_block_comments(script.replace("`", ""))
-    try:
-        lex = shlex.shlex(script, posix=False, punctuation_chars=";|&{}")
-        lex.whitespace_split = True
-        lex.commenters = ""   # `a#b` and `<# … #>` are not shell comments (QA)
-        words = list(lex)
-    except ValueError:
-        words = re.split(r"[\s;|&{}]+", script)
-    out: list[list[str]] = [[]]
-    for w in words:
-        if not w or set(w) <= set(";|&{}"):
-            out.append([])
-        else:
-            out[-1].append(w[1:-1] if len(w) > 1 and w[0] == w[-1] and w[0] in "'\"" else w)
-    return [st for st in out if st]
-
-
-def _ps_targets(word: str) -> list[str]:
-    """The paths one PowerShell word may name: `-Path:C:\\x` binds its value,
-    `a,b` and `@('a','b')` are lists, and `x\\*` empties the directory x."""
-    if word.startswith("-") and ":" in word:
-        word = word.split(":", 1)[1]
-    out = []
-    for part in re.split(r"[,@()]", word):
-        part = part.strip().strip("'\"")
-        if part:
-            out.append(part)
-            if part.endswith(("\\*", "/*")):
-                out.append(part[:-2])
-    return out
-
-
-def _ps_recursive_remove_args(st: list[str]) -> list[str] | None:
-    """The arguments of a recursive delete this statement runs, else None: a
-    remove command or alias as its first word (statements are already cut at
-    `&`, `{`, `|`, so `if (1) { rm … }` reaches it; a leading `(` is dropped)
-    with an abbreviation of `-Recurse`, a `/s` switch (`/s/q` too) or a `*`
-    target. Only the first word: `Write-Host rm -Recurse x` deletes nothing."""
-    if not st or st[0].lstrip("(").lower() not in _PS_REMOVE_CMDS:
-        return None
-    args = st[1:]
-    for a in (a.lower() for a in args):
-        # Linear: `(/[a-z])*/s(/[a-z])*` backtracked quadratically (QA).
-        if ((len(a) >= 2 and "-recurse".startswith(a.split(":", 1)[0]))
-                or (_PS_SWITCHES_RE.fullmatch(a) and "s" in a.split("/"))
-                or a.endswith("*")):
-            return args
-    return None
+def _ps_recursive_word(word: str) -> bool:
+    """`-Recurse` or an abbreviation (`-r`, `-Rec`, `-Recurse:$true`), a cmd
+    switch run holding `/s` (`/s/q`), or a wildcard. Linear: a regex with an
+    ambiguous `/s` backtracked quadratically (QA)."""
+    w = word.lower()
+    return ((len(w) >= 2 and "-recurse".startswith(w.split(":", 1)[0]))
+            or (_PS_SWITCHES_RE.fullmatch(w) is not None and "s" in w.split("/"))
+            or w.endswith("*"))
 
 
 def _ps_script_reason(tokens: list[str]) -> str | None:
-    """Judge what `powershell`/`pwsh`/`cmd` runs when it IS the command's
-    program (rollup XERK-1584). Each quoted script argument is read as a
-    script, and so are all the words joined, past the shell's own leading
-    options (`-NoProfile -ExecutionPolicy Bypass -Command …`), so neither an
-    option's value nor a misspelled `-Command` hides a delete. Quoted text
-    naming such a script elsewhere (a commit message, `echo cmd -c …`) is not
-    one."""
+    """A recursive delete of a protected path in what `powershell`, `pwsh`
+    or `cmd` runs, when it IS the command's program (rollup XERK-1584).
+
+    Deliberately NOT a PowerShell parser (guard-unreadable.md): four QA passes
+    each found a shape that hid a statement from one — option values,
+    `-Com`/`/Command`, blocks, `<#` in a string, newlines, expression position
+    (`$x = rm …`, `echo (rm …)`). Instead every word of every argument counts:
+    a remove command or alias anywhere, a recursive switch or wildcard
+    anywhere, and a protected path anywhere refuse the command. Accepted
+    over-deny: a read-only script naming all three
+    (`Get-ChildItem -Filter del -Recurse C:\\Windows`)."""
     words = _strip_prefixes(tokens)
     if not words or re.sub(r"\.exe$", "", _basename(words[0]).lower()) not in _PS_SHELLS:
         return None
-    statements = [st for w in words[1:] if re.search(r"[\s;|&{}]", w)
-                  for st in _ps_statements(w)]
-    joined = _ps_statements(" ".join(words[1:]))
-    if joined:
-        joined[0] = _ps_past_options(joined[0])
-    for st in statements + joined:
-        for word in _ps_recursive_remove_args(st) or ():
-            for target in _ps_targets(word):
-                if _is_dangerous_path(target):
-                    return f"refusing recursive delete of a protected path ({target!r})"
+    text = " ".join(words[1:]).replace("`", "").replace("^", "")
+    found = _PS_WORD_SPLIT_RE.split(text)
+    # A quoted path holds blanks (`'C:\\Program Files'`): its whole text too.
+    found += [a or b for a, b in _PS_QUOTED_RE.findall(text)]
+    if not any(w.lower() in _PS_REMOVE_CMDS for w in found):
+        return None
+    if not any(_ps_recursive_word(w) for w in found):
+        return None
+    for word in found:
+        for target in _ps_targets(word):
+            if _is_dangerous_path(target):
+                return f"refusing recursive delete of a protected path ({target!r})"
     return None
 
 
-def _ps_script_flag(word: str) -> bool:
-    """`-c`, `-Com…`/`-Command` (any abbreviation pwsh takes), `--command`,
-    `/Command`, or cmd's `/c` `/k`: the script starts at the next word."""
-    w = word.lower()
-    return (w in ("-c", "/c", "/k", "--command", "/command")
-            or (len(w) >= 4 and "-command".startswith(w)))
-
-
-def _ps_past_options(st: list[str]) -> list[str]:
-    """The joined words from where the script starts: past the shell's
-    options and their values up to a script flag (`-ExecutionPolicy Bypass
-    -c …`). Unchanged when a word that is no option or option value comes
-    first."""
-    prev_option = False
-    for i, w in enumerate(st):
-        if _ps_script_flag(w):
-            return st[i + 1:]
-        if w.startswith(("-", "/")):
-            prev_option = True
-        elif prev_option:
-            prev_option = False
-        else:
-            return st[i:]
-    return []
+def _ps_targets(word: str) -> list[str]:
+    """The paths one word may name: `-Path:C:\\x` binds its value, and
+    `x\\*` empties the directory x."""
+    if word.startswith("-") and ":" in word:
+        word = word.split(":", 1)[1]
+    word = word.strip()
+    if not word:
+        return []
+    return [word, word[:-2]] if word.endswith(("\\*", "/*")) else [word]
 
 
 def _ps_recursive_remove(low: str) -> bool:

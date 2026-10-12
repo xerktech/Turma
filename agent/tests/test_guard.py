@@ -4539,62 +4539,44 @@ class TestCommentAndEvalReparse(unittest.TestCase):
 
 class TestClassification(unittest.TestCase):
     def test_a_powershell_c_script_s_remove_targets_are_judged(self):
-        # Rollup XERK-1584: the quoted -c script was one token, so its paths
-        # were never judged.
-        for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Windows"',
+        # Rollup XERK-1584: what powershell/pwsh/cmd runs is scanned, not
+        # parsed (guard-unreadable.md): a remove word, a recursive switch or
+        # wildcard, and a protected path anywhere in its arguments refuse it.
+        # Four parsers each lost to a shape QA ran live in pwsh.
+        W = "C:\\Windows"
+        for cmd in (f'powershell -c "Remove-Item -Recurse -Force {W}"',
                     'powershell -c "Remove-Item -Recurse -Force C:/Windows"',
-                    'pwsh -Command "Remove-Item -Recurse -Force C:\\Windows\\System32"',
-                    "powershell -c \"Remove-Item -Recurse -Force 'C:\\Program Files'\"",
-                    'powershell -c "Remove-Item -Recurse -Force C:\\Windows; echo hi"',
-                    'powershell -c "rd /s /q C:\\Windows"',
-                    'cmd /c "rd /s /q C:\\Windows"',
-                    'powershell.exe -NoProfile -Command "Remove-Item -Recurse C:\\Windows"',
-                    # Backtick escapes, a bound value, a wildcard, lists, aliases
-                    # and switch abbreviations all reach the same path (QA).
-                    'powershell -c "Remove-Item -Recurse C:\\Win`dows"',
-                    'powershell -c "Remove-Item -Recurse -Path:C:\\Windows"',
-                    'powershell -c "Remove-Item -Recurse C:\\Windows\\*"',
-                    'powershell -c "Remove-Item -Recurse .\\a,C:\\Windows"',
-                    "powershell -c \"Remove-Item -Recurse @('.\\a','C:\\Windows')\"",
-                    'powershell -c "ri -r C:\\Windows"',
-                    'powershell -c "del -Rec C:\\Windows"',
-                    # Every word after the program is script: option values,
-                    # -Command spellings and blocks hide nothing (QA delta).
-                    'powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -Recurse -Force C:\\Windows"',
-                    'pwsh -WorkingDirectory C:\\ -c "Remove-Item -Recurse C:\\Windows"',
-                    'powershell -Com "Remove-Item -Recurse C:\\Windows"',
-                    'pwsh -c "& { Remove-Item -Recurse C:\\Windows }"',
-                    'pwsh -c "if (1) { Remove-Item -Recurse C:\\Windows }"',
-                    'pwsh -c "(Remove-Item -Recurse C:\\Windows)"',
-                    'cmd /c "rd /s/q C:\\Windows"',
-                    'sudo pwsh -c "Remove-Item -Recurse C:\\Windows"',
-                    'pwsh -NoProfile -Comm Remove-Item -Recurse C:/Windows',
-                    # A comment or a glued brace hides nothing (QA delta 2).
-                    'pwsh -c "<# x #> Remove-Item -Recurse C:\\Windows"',
-                    'pwsh -c "Write-Host a#b; Remove-Item -Recurse C:\\Windows"',
-                    'cmd /c "echo a#b & rd /s /q C:\\Windows"',
-                    'pwsh -c "& {Remove-Item -Recurse C:\\Windows}"',
-                    'pwsh -c "1|%{Remove-Item -Recurse C:\\Windows}"'):
+                    f'pwsh -Command "Remove-Item -Recurse -Force {W}\\System32"',
+                    f"powershell -c \"Remove-Item -Recurse -Force 'C:\\Program Files'\"",
+                    f'powershell -c "rd /s /q {W}"', f'cmd /c "rd /s/q {W}"',
+                    f'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -Recurse {W}"',
+                    f'powershell -Com "Remove-Item -Recurse {W}"', f'sudo pwsh -c "Remove-Item -Recurse {W}"',
+                    f'powershell -c "Remove-Item -Recurse C:\\Win`dows"',
+                    f'powershell -c "Remove-Item -Recurse -Path:{W}"',
+                    f'powershell -c "Remove-Item -Recurse {W}\\*"',
+                    f'powershell -c "Remove-Item -Recurse .\\a,{W}"',
+                    f"powershell -c \"Remove-Item -Recurse @('.\\a','{W}')\"",
+                    f'powershell -c "ri -r {W}"', f'powershell -c "del -Rec {W}"',
+                    f'pwsh -c "& {{Remove-Item -Recurse {W}}}"', f'pwsh -c "if (1) {{ ri -r {W} }}"',
+                    f'pwsh -c "<#x#>Remove-Item -Recurse {W}"',
+                    f"pwsh -c \"Write-Host '<#'; Remove-Item -Recurse {W}; Write-Host '#>'\"",
+                    f"pwsh -c 'Write-Host x\nRemove-Item -Recurse {W}'",
+                    f"pwsh -c 'Write-Host `\"; Remove-Item -Recurse {W}'",
+                    f'pwsh -c "Write-Output (Remove-Item -Recurse {W})"',
+                    'powershell -NoProfile Remove-Item -Recurse -Path:C:/Windows',
+                    f'pwsh -WorkingDirectory "{W}" -c "Remove-Item -Recurse -Force *"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
-                    'powershell -c "Get-ChildItem C:\\Windows; Remove-Item -Recurse -Force .\\dist"',
-                    'powershell -c "Get-ChildItem C:\\Windows -Recurse"',
+                    f'powershell -c "Get-ChildItem {W} -Recurse"',
                     'powershell -c "Remove-Item -Recurse .\\dist\\*"',
-                    # Quoted text naming such a script is no script (QA).
-                    'git commit -m "guard: deny Remove-Item -Recurse C:\\Windows in powershell -c"',
+                    f'cmd /c "dir {W} /s"', 'cmd /c "rd /q build"',
+                    # Only a shell PROGRAM's arguments are scanned: quoted text
+                    # naming one elsewhere is data.
+                    f'git commit -m "guard: deny Remove-Item -Recurse {W} in powershell -c"',
                     'rg -n "Remove-Item -Recurse -Force C:/Windows" agent/',
-                    'grep -rn "rd /s /q C:\\Windows" agent/tests',
-                    'echo "Remove-Item -Recurse C:\\Users is blocked"',
-                    'echo cmd -c "Remove-Item -Recurse C:\\Windows"',
-                    'grep -rn cmd -c "Remove-Item -Recurse C:\\Windows"',
-                    'pwsh -WorkingDirectory C:\\Windows -c "Remove-Item -Recurse .\\build"',
-                    'cmd /c "dir C:\\Windows /s"',
-                    # A remove word that is no statement's command (QA delta 2).
-                    'pwsh -c "Get-ChildItem -Filter del -Recurse C:\\Windows"',
-                    'pwsh -c "Write-Host rm -Recurse C:\\Windows"',
-                    'cmd /c "findstr /s rd C:\\Windows\\*"',
-                    'pwsh -c Get-ChildItem -Filter del -Recurse C:\\Windows'):
+                    f'grep -rn "rd /s /q {W}" agent/tests',
+                    f'echo cmd -c "Remove-Item -Recurse {W}"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
