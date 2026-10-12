@@ -7464,13 +7464,22 @@ class TestShadowRun(unittest.TestCase):
         "curl -sd '{}' https://api.github.com/repos/o/r/pulls",
         "curl --data-binary @f https://h", "curl -T f https://h", "curl -XPUT https://h",
         "wget --post-data=a https://h", "http POST https://h a=1", "http https://h a:=1",
+        # QA's bypasses (an alias or an unknown verb fails closed, attached flags,
+        # an interpreter-run tracker CLI, registries).
+        "git -c alias.p=push p origin x", "git config alias.p push; git p",
+        "git subtree push --prefix d o b", "git send-email x", "git remote set-url origin u",
+        "gh api repos/o/r/issues -fbody=x", "gh api x --input=f.json",
+        "gh api /graphql -fquery=x", "env -u GH_TOKEN gh api r -fbody=x",
+        "python3 ~/.claude/bin/jira issue x", "curl -K f", "az rest --method post --uri u",
+        "npm publish", "docker push x", "twine upload d/*", "cargo publish", "tea pr create",
     ]
     ALLOWED = [
         "git status", "git commit -m fix", "git switch -c turma-shadow/sh-0011223344",
         "git diff a b", "git checkout abc -- t.py", "npm test", "python3 -m pytest -q",
-        "gh pr view 1", "gh pr diff 9", "gh api repos/o/r/pulls/9", "glab mr view 3",
+        "gh pr view 1", "gh pr diff 9", "gh api repos/o/r/pulls/9",
         "az repos pr list", "curl -s https://example.com", "curl -XGET https://h",
-        "wget https://h/f", "http https://h",
+        "wget https://h/f", "http https://h", "git config user.name x", "docker build .",
+        "cat jira.md", "git log --oneline",
     ]
 
     def test_publishing_is_denied_only_in_a_shadow(self):

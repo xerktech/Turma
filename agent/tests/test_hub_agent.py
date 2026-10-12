@@ -44189,10 +44189,6 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
         self.assertEqual(rec["qaRuns"][0]["verdict"], "PASS")
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class TestShadowRuns(ManagerMixin, unittest.TestCase):
     """XERK-1847: the hub's `spawnShadow` re-does a merged ticket on a candidate
     model from the merged PR's parent commit; an Opus grader then reports one
@@ -44384,6 +44380,34 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.assertEqual(sm.shadow_runs[self.RID]["state"], "grading")
         self.assertEqual(sm.shadow_runs[self.RID]["note"], "(timed out)")
 
+    def test_a_killed_shadow_is_never_resumed_or_moved_and_its_worktree_is_reaped(self):
+        sm = self.spawned()
+        sess = sm.registry[0]
+        sid, wt = sess["id"], sess["worktreePath"]
+        self.assertEqual(sm._sleeper_unpausable(sess, 0), "it is a shadow run (XERK-1847)")
+        sm.export_session(sid, "mig1")
+        self.assertIn("cannot be migrated", sm.spawn_failures[-1]["error"])
+        sm.kill(sid)
+        self.assertTrue(next(c for c in sm.closed if c["id"] == sid)["shadow"])
+        sm.resume(sid, cmd_id="c1")
+        self.assertIsNone(sm._find(sid), "not relaunched as an ordinary session")
+        self.assertIn("cannot be resumed", sm.spawn_failures[-1]["error"])
+        self.assertIsNone(sm._resume_at_cwd("tid", wt, cmd_id="c2"))
+        self.assertIn("cannot be resumed", sm.spawn_failures[-1]["error"])
+        # A fresh manager (restart) still knows it, from the persisted set.
+        sm2 = self.make_manager()
+        self.assertIn(sid, sm2.shadow_sids)
+        # Even a closed record that lost its flag is refused by that set.
+        sm.closed[[c["id"] for c in sm.closed].index(sid)].pop("shadow")
+        sm.resume(sid, cmd_id="c3")
+        self.assertIsNone(sm._find(sid))
+        # The run reads failed; the closed record and its worktree are reaped.
+        sm._advance_shadow_runs()
+        self.assertEqual(sm.shadow_runs[self.RID]["state"], "failed")
+        sm._advance_shadow_runs()
+        self.assertFalse(any(c["id"] == sid for c in sm.closed))
+        self.assertTrue(any(c[-1:] == [wt] and "remove" in c for c in self.run_calls))
+
     def test_the_persisted_ledger_is_read_as_untrusted(self):
         with open(ha.SHADOW_RUNS_PATH, "w") as f:
             json.dump({self.RID: {"id": self.RID, "state": "running", "evil": 1},
@@ -44392,3 +44416,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         runs = self.make_manager().shadow_runs
         self.assertEqual(list(runs), [self.RID])
         self.assertNotIn("evil", runs[self.RID])
+
+
+if __name__ == "__main__":
+    unittest.main()

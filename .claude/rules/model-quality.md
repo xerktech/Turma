@@ -95,10 +95,16 @@ This file is the operative rules for what has shipped.
   - **No-publish is the guard's, on the launch flag** (`TURMA_SHADOW`, `shadow_reason` in
     `guard.py`, `agent-hooks.md`), plus `--strict-mcp-config`, `ENABLE_CLAUDEAI_MCP_SERVERS=false`,
     blanked tracker tokens and a non-token `GH_TOKEN` (`SHADOW_ENV`).
+  - **A shadow is never resumed, migrated or paused** (`resume`, `_resume_at_cwd`,
+    `export_session`, `_sleeper_unpausable`, hub `sleeperPausable`): relaunched it would carry none
+    of its launch protections. The closed record keeps `shadow`, and every shadow session and
+    transcript id is persisted (`_sessions` in `shadow-runs.json`) so a record that lost the flag
+    is still refused. An operator-killed shadow's closed record + worktree are reaped.
   - Residual: a same-uid session can start a nested `claude` without `TURMA_SHADOW` (the ~/.turma
-    class), and an HTTP write from an interpreter (`python -c`) is unseen by the Bash guard; the
-    blanked credentials are what stand there. Peeking at later git history is forbidden by the
-    directive only (validity, not safety).
+    class); an HTTP write from an interpreter (`python -c`) is unseen by the Bash guard, and on an
+    SSH or ADO-extraHeader remote no blanked credential stops it. A live run session could also
+    write its grader's `shadow-grade.json` (same class). Peeking at later git history is forbidden
+    by the directive only (validity, not safety).
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
 - Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:`/`XERK-1847:` cases in
   `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`,

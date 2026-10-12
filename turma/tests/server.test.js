@@ -25667,3 +25667,22 @@ test("XERK-1847: a shadow session raises no operator alert and its flag is stric
   assert.equal(hub.shadowSampled("k", 0), false);
   assert.equal(hub.shadowSampled("k", 1), true);
 });
+
+test("XERK-1847: a shadow session raises no alert and is in no peer roster", () => {
+  const beat = makeHost();
+  notifications.length = 0;
+  beat({ sessions: [{ id: "s1", rcName: "nas-repo-s1", shadow: true, session: { question: "Push?" } }] });
+  assert.deepEqual(titles(), []);
+  beat({ sessions: [{ id: "s2", rcName: "nas-repo-s2", session: { question: "Push?" } }] });
+  assert.deepEqual(titles(), ["nas-repo-s2 has a question"], "the same beat without the flag alerts");
+  peerHost("shA", "shp.atlassian.net", [peerSession("s1"), peerSession("s2", { shadow: true })]);
+  peerHost("shB", "shp.atlassian.net", [peerSession("s3", { shadow: true }), peerSession("s4")]);
+  try {
+    assert.deepEqual(orgPeers("shA").map((p) => p.id).sort(), ["s1", "s4"]);
+    // Never paused as a sleeper either.
+    assert.equal(hub.sleeperPausable({ status: "running", shadow: true,
+      session: { wakeAt: Date.now() + 3600000, paneBusy: false, agents: [] } }, Date.now()), false);
+  } finally {
+    dropPeerHosts("shA", "shB");
+  }
+});

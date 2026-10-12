@@ -14136,7 +14136,8 @@ function pauseSleepersAvailable(a) {
 // live background agent or shell (absent = can't tell = no), no loop. The agent
 // re-checks all of it against its own beat before it kills anything.
 function sleeperPausable(s, now) {
-  if (!s || s.status !== "running") return false;
+  // A shadow run (XERK-1847) is never paused: its agent refuses to resume it.
+  if (!s || s.status !== "running" || s.shadow === true) return false;
   const live = s.session;
   if (!objectish(live) || !sessionSleeping(live, now)) return false;
   if (live.wakeAt - now < SLEEPER_PAUSE_MIN_AHEAD_MS) return false;

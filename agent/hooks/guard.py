@@ -12958,91 +12958,164 @@ _SHADOW_FORGE_READS = {
     ("pr", "view"), ("pr", "diff"), ("pr", "list"), ("pr", "checks"), ("pr", "status"),
     ("mr", "view"), ("mr", "diff"), ("mr", "list"),
     ("issue", "view"), ("issue", "list"), ("repo", "view"), ("run", "view"),
-    ("run", "list"), ("auth", "status"), ("search", "code"), ("search", "prs"),
-    ("search", "issues"), ("search", "commits"), ("search", "repos"),
+    ("run", "list"), ("auth", "status"),
 }
-_SHADOW_TRACKER_CLIS = {"jira", "acli", "ado", "ado.py", "jira-cli"}
+# git verbs a shadow may run: everything local. Any other verb — push, subtree,
+# send-email, request-pull, an ALIAS (which may be any of those) — is denied, so
+# the check fails closed on a spelling it does not know (QA: `-c alias.p=push p`).
+_SHADOW_GIT_VERBS = {
+    "status", "diff", "log", "show", "add", "commit", "switch", "checkout", "restore",
+    "branch", "rev-parse", "rev-list", "stash", "reset", "merge", "rebase", "cherry-pick",
+    "revert", "grep", "ls-files", "ls-tree", "blame", "apply", "am", "mv", "rm", "tag",
+    "describe", "shortlog", "worktree", "clean", "cat-file", "merge-base", "format-patch",
+    "diff-tree", "diff-files", "diff-index", "show-ref", "symbolic-ref", "name-rev",
+    "notes", "bisect", "reflog", "for-each-ref", "check-ignore", "hash-object", "help",
+    "version", "init", "count-objects", "fsck", "gc", "range-diff", "whatchanged",
+}
+# A config key that redirects a later git into a publish (an alias, a push/pull
+# URL or command).
+_SHADOW_GIT_CONFIG_RE = re.compile(
+    r"(?i)^(alias\.|remote\..*\.(url|pushurl|push|mirror|receivepack|uploadpack)|"
+    r"url\..*\.(insteadof|pushinsteadof)|core\.sshcommand|credential\.)")
+_SHADOW_TRACKER_CLIS = {"jira", "acli", "ado", "jira-cli", "tea", "glab", "hub", "lab"}
 _SHADOW_HTTP_CLIS = {"curl", "wget", "http", "https", "httpie", "xh", "xhs"}
+# Package / image registries: a publish there is a publish.
+_SHADOW_PUBLISH_VERBS = {
+    "npm": {"publish", "unpublish", "dist-tag", "deprecate", "owner", "access"},
+    "pnpm": {"publish"}, "yarn": {"publish", "npm"}, "bun": {"publish"},
+    "docker": {"push", "login"}, "podman": {"push", "login"}, "buildah": {"push"},
+    "twine": {"upload"}, "cargo": {"publish", "yank", "owner"}, "gem": {"push", "yank"},
+    "poetry": {"publish"}, "flit": {"publish"}, "hatch": {"publish"}, "uv": {"publish"},
+    "helm": {"push"}, "oras": {"push"}, "skopeo": {"copy"}, "crane": {"push", "copy"},
+    "dotnet": {"nuget"}, "nuget": {"push"}, "mvn": {"deploy"}, "gradle": {"publish"},
+}
 _SHADOW_REASON = (
-    "this is a shadow run: it may not publish — no push, no PR/MR, no tracker or "
-    "API write. Commit locally and finish with `shadow-done`"
+    "this is a shadow run: it may not publish — no push, no PR/MR, no tracker, "
+    "registry or API write. Commit locally and finish with `shadow-done`"
 )
 
 
 def _shadow_http_writes(prog: str, args: list[str]) -> bool:
-    """True when an HTTP client invocation sends a body or a non-GET method."""
+    """True when an HTTP client invocation may send a body, a non-GET method,
+    or read its options from a file (which could carry either)."""
     i = 0
     while i < len(args):
         t = args[i]
         low = t.lower()
         if prog == "wget":
-            if low.startswith(("--post-data", "--post-file", "--body-data", "--body-file")):
+            if low.startswith(("--post-data", "--post-file", "--body-data", "--body-file",
+                               "--method", "--config", "-e", "--execute", "-i",
+                               "--input-file")):
                 return True
-            if low.startswith("--method"):
-                m = t.split("=", 1)[1] if "=" in t else (args[i + 1] if i + 1 < len(args) else "")
-                if m.upper() not in ("GET", "HEAD"):
-                    return True
         elif prog in ("http", "https", "httpie", "xh", "xhs"):
-            # `http POST url k=v`: a method word, or any request item, writes.
+            # `http POST url k=v`: a method word, a request item or a file feed writes.
             if t.upper() in ("POST", "PUT", "PATCH", "DELETE"):
                 return True
-            if not t.startswith("-") and re.search(r"(?<!:)(?::=|=|@)", t) and "://" not in t:
+            if low.startswith(("--form", "-f", "--raw", "--offline")):
+                return True
+            if not t.startswith("-") and "://" not in t and re.search(r"(?::=|=|@|:=@)", t):
                 return True
         else:  # curl
-            if low.startswith(("--data", "--json", "--form", "--upload-file")):
+            if low.startswith(("--data", "--json", "--form", "--upload-file", "--config",
+                               "--request", "--url-query", "--variable")):
+                if low.startswith("--request"):
+                    m = t.split("=", 1)[1] if "=" in t else (args[i + 1] if i + 1 < len(args) else "")
+                    if m.upper() in ("GET", "HEAD"):
+                        i += 1
+                        continue
                 return True
-            if low.startswith("--request") or t == "-X" or (t.startswith("-X") and len(t) > 2):
-                if "=" in t:
-                    m = t.split("=", 1)[1]
-                elif t.startswith("-X") and len(t) > 2:
-                    m = t[2:]
-                else:
-                    m = args[i + 1] if i + 1 < len(args) else ""
-                if m.upper() not in ("GET", "HEAD"):
+            if t.startswith("-") and not t.startswith("--") and len(t) > 1:
+                letters = t[1:]
+                # Letters after an X are its method (`-XGET`), not more options.
+                if any(c in letters.split("X", 1)[0] for c in "dFTK"):
                     return True
-            elif t.startswith("-") and not t.startswith("--") and len(t) > 1:
-                # A short-option cluster: -d / -F / -T anywhere in it writes.
-                if any(c in t[1:] for c in "dFT"):
-                    return True
+                if "X" in letters:
+                    rest = letters.split("X", 1)[1]
+                    m = rest or (args[i + 1] if i + 1 < len(args) else "")
+                    if m.upper() not in ("GET", "HEAD"):
+                        return True
         i += 1
+    return False
+
+
+def _shadow_git_reason(tokens: list[str]) -> str | None:
+    # A `-c key=value` before the verb can define an alias or a push URL.
+    for i, t in enumerate(tokens[1:], 1):
+        if t == "-c" and i + 1 < len(tokens) and _SHADOW_GIT_CONFIG_RE.match(tokens[i + 1]):
+            return _SHADOW_REASON
+        if t.startswith("-c") and len(t) > 2 and _SHADOW_GIT_CONFIG_RE.match(t[2:]):
+            return _SHADOW_REASON
+        if t.startswith("--config-env"):
+            return _SHADOW_REASON
+    sub = _git_args(tokens)
+    if not sub:
+        return None
+    if sub[0] == "config":
+        if any(_SHADOW_GIT_CONFIG_RE.match(w) for w in sub[1:] if not w.startswith("-")):
+            return _SHADOW_REASON
+        return None
+    if sub[0] == "remote":
+        return _SHADOW_REASON if any(w in ("add", "set-url", "rename") for w in sub[1:]) else None
+    return None if sub[0] in _SHADOW_GIT_VERBS else _SHADOW_REASON
+
+
+def _shadow_gh_api_writes(rest: list[str]) -> bool:
+    words = [t for t in rest if not t.startswith("-")]
+    if any("graphql" in w.lower() for w in words):
+        return True
+    for t in rest:
+        if t in ("-X", "-f", "-F", "--input", "--field", "--raw-field", "--method"):
+            return True
+        if t.startswith(("--method", "--field", "--raw-field", "--input")):
+            return True
+        # An attached short option (`-fbody=x`, `-XPOST`), or one inside a cluster.
+        if t.startswith("-") and not t.startswith("--") and any(c in t[1:] for c in "XfF"):
+            return True
     return False
 
 
 @_budgeted
 def shadow_reason(command: str) -> str | None:
-    """A reason when a SHADOW session's command would publish (XERK-1847)."""
+    """A reason when a SHADOW session's command could publish (XERK-1847).
+    Fails CLOSED per family: git outside its local verbs, gh outside its read
+    verbs, any tracker CLI named anywhere on the command, registries' publish
+    verbs, and HTTP clients that may write."""
     for tokens, _segment, *_flags in _expand_both(command):
         if not tokens:
             continue
-        prog = _basename(tokens[0]).lower()
-        if prog.endswith(".exe"):
-            prog = prog[:-4]
+        names = {_basename(t).lower().removesuffix(".exe").removesuffix(".py")
+                 for t in tokens if t and not t.startswith("-")}
+        # A tracker CLI run through an interpreter (`python3 ~/.claude/bin/jira`).
+        if names & _SHADOW_TRACKER_CLIS:
+            return _SHADOW_REASON
+        prog = _basename(tokens[0]).lower().removesuffix(".exe")
         rest = tokens[1:]
         if prog == "git":
-            sub = _git_args(tokens)
-            if sub and sub[0] in ("push", "send-pack", "http-push", "request-pull"):
-                return _SHADOW_REASON
+            r = _shadow_git_reason(tokens)
+            if r:
+                return r
             continue
-        if prog in ("gh", "hub", "glab"):
+        if prog == "gh":
             words = [t for t in rest if not t.startswith("-")]
             if not words:
                 continue
             if words[0] == "api":
-                if any(t in ("-X", "-f", "-F", "--input") or t.startswith(
-                        ("--method", "--field", "--raw-field", "-X")) for t in rest) \
-                        or "graphql" in words[1:2]:
+                if _shadow_gh_api_writes(rest[rest.index("api") + 1:] if "api" in rest else rest):
                     return _SHADOW_REASON
                 continue
-            if words[0] == "search" or tuple(words[:2]) in _SHADOW_FORGE_READS:
+            if tuple(words[:2]) in _SHADOW_FORGE_READS:
                 continue
             return _SHADOW_REASON
         if prog == "az":
             words = [t for t in rest if not t.startswith("-")]
-            if words[:1] and words[0] in ("repos", "boards", "devops", "pipelines") \
-                    and not any(w in ("show", "list") for w in words[1:]):
+            if words[:1] == ["rest"]:
+                return _SHADOW_REASON
+            if words[:1] and words[0] in ("repos", "boards", "devops", "pipelines", "artifacts") \
+                    and words[-1:] and words[-1] not in ("show", "list"):
                 return _SHADOW_REASON
             continue
-        if prog in _SHADOW_TRACKER_CLIS:
+        verbs = _SHADOW_PUBLISH_VERBS.get(prog)
+        if verbs and any(w in verbs for w in rest if not w.startswith("-")):
             return _SHADOW_REASON
         if prog in _SHADOW_HTTP_CLIS and _shadow_http_writes(prog, rest):
             return _SHADOW_REASON

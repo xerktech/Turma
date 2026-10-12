@@ -176,9 +176,10 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
     creates/body edits, 0 others. Tests: `TestPrSummary`, the hook-entrypoint toggle case (its cwd
     must be OUTSIDE this repo, or Turma's own template switches it to template mode).
 - **A shadow run may not publish** (XERK-1847, `shadow_reason`): with `TURMA_SHADOW` set (the
-  manager's launch flag for a shadow session) any `git push`, any gh/glab/hub verb outside a read
-  allowlist, a non-GET `gh api`/graphql, an `az repos|boards` write, a tracker CLI, and an HTTP
-  client sending a body or non-GET method are hard `policy` denies. Read from the ENVIRONMENT even
+  manager's launch flag) it fails CLOSED per family: git outside its LOCAL verbs (an alias is
+  unknown, so denied) or setting an alias/remote URL, gh outside its read verbs, any `gh api`
+  field/method/graphql, `az rest` / `az repos|boards` writes, a tracker CLI named anywhere on the
+  command, registry publishes, an HTTP client that may write. Hard `policy` denies. Read from the ENVIRONMENT even
   under `--protected` — it only adds denies. Tests: `TestShadowRun`.
 - **Destructive includes the agent's tmux server** (XERK-1077): `kill-server`, killing tmux by name
   or PID, and `kill-session`/`-window`/`-pane` of anything that could resolve to an `agent-*` session

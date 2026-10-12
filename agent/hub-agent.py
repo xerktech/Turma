@@ -16631,6 +16631,8 @@ def read_wake_request(session_id):
 MODEL_SHADOW = os.environ.get("TURMA_MODEL_SHADOW", "1") != "0"
 SHADOW_RUNS_PATH = os.path.join(REGISTRY_DIR, "shadow-runs.json")
 SHADOW_RUNS_MAX = 50
+# Session/transcript ids of past shadow sessions, kept so none is ever resumed.
+SHADOW_SESSIONS_KEEP = 2000
 SHADOW_RUNS_FILE_MAX_BYTES = 512 * 1024
 SHADOW_RUN_TIMEOUT_SEC = _env_int("TURMA_SHADOW_RUN_TIMEOUT_SEC", 3 * 3600, minimum=600)
 SHADOW_GRADE_TIMEOUT_SEC = _env_int("TURMA_SHADOW_GRADE_TIMEOUT_SEC", 2 * 3600, minimum=600)
@@ -26968,6 +26970,13 @@ class SessionManager:
         """The persisted runs, re-shaped. The file sits in session-writable
         ~/.turma, so it is read as untrusted and every record re-validated."""
         data = _read_untrusted_json(SHADOW_RUNS_PATH, SHADOW_RUNS_FILE_MAX_BYTES)
+        # Every session and transcript a shadow ever ran as, kept past the run
+        # record so neither can be resumed into an ordinary session.
+        known = (data or {}).get("_sessions")
+        self.shadow_sids = {x for x in (known.get("sids") or [])
+                            if isinstance(x, str)} if isinstance(known, dict) else set()
+        self.shadow_tids = {x for x in (known.get("tids") or [])
+                            if isinstance(x, str)} if isinstance(known, dict) else set()
         out = {}
         for rid, r in (data or {}).items():
             if not (isinstance(r, dict) and isinstance(rid, str)
@@ -26987,8 +26996,11 @@ class SessionManager:
         try:
             os.makedirs(REGISTRY_DIR, exist_ok=True)
             tmp = SHADOW_RUNS_PATH + f".{os.getpid()}.tmp"
+            data = dict(self.shadow_runs)
+            data["_sessions"] = {"sids": sorted(self.shadow_sids)[-SHADOW_SESSIONS_KEEP:],
+                                 "tids": sorted(self.shadow_tids)[-SHADOW_SESSIONS_KEEP:]}
             with open(tmp, "w") as f:
-                json.dump(self.shadow_runs, f)
+                json.dump(data, f)
             os.replace(tmp, SHADOW_RUNS_PATH)
         except OSError as e:
             log(f"shadow runs save failed: {e}")
@@ -27090,8 +27102,19 @@ class SessionManager:
             return self._fail_shadow(rid, cmd, f"could not spawn the shadow: {e}")
         if not sid:
             return self._fail_shadow(rid, cmd, "could not spawn the shadow")
+        self._note_shadow_session(sid)
         self._set_shadow(rid, runSid=sid)
         log(f"shadow run {rid}: {key} on {model} from {base[:12]} (session {sid})")
+
+    def _note_shadow_session(self, sid):
+        """Remember a shadow session's id and transcript id (saved with the runs)."""
+        if not sid:
+            return
+        self.shadow_sids.add(sid)
+        sess = self._find(sid)
+        tid = sess.get("claudeSessionId") if sess else None
+        if isinstance(tid, str) and tid:
+            self.shadow_tids.add(tid)
 
     def _shadow_session_live(self, sid):
         sess = self._find(sid) if sid else None
@@ -27174,6 +27197,8 @@ class SessionManager:
             self._set_shadow(rid, state="failed", error="could not spawn the grader",
                              headSha=head, note=note, endedAt=now, phaseAt=now)
             return True
+        self._note_shadow_session(gsid)
+        self._note_shadow_session(sid)      # its transcript id is known by now
         self._set_shadow(rid, state="grading", gradeSid=gsid, headSha=head, note=note,
                          phaseAt=now)
         log(f"shadow run {rid}: grading {head[:12]} (session {gsid})")
@@ -27205,7 +27230,18 @@ class SessionManager:
             if k == "gradeSid" and not terminal:
                 continue
             if sid and self._find(sid):
+                self._note_shadow_session(sid)
                 self.delete(sid)
+                return True
+            # Killed by the operator: its closed record still holds a worktree.
+            rec = next((c for c in self.closed if c.get("id") == sid), None) if sid else None
+            if rec is not None:
+                self.closed = [c for c in self.closed if c.get("id") != sid]
+                if rec.get("worktreePath") and rec.get("repoPath") \
+                        and os.path.isdir(rec["worktreePath"]):
+                    self._worktree_remove(rec)
+                self._forget_session_caches(sid)
+                self.save()
                 return True
         if terminal and not r.get("branchDropped"):
             repo = next((x for x in scan_repos() if x["name"] == r.get("repo")), None)
@@ -27487,6 +27523,8 @@ class SessionManager:
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
             "rcName", "tmuxName", "createdAt", "label", "summary",
             "summaryManual", "model", "permissionMode", "root", "ticket",
+            # A shadow run's flag (XERK-1847): resume refuses such a record.
+            "shadow",
             # Branch-adopted ticket provenance (XERK-1440). A record adopted by an
             # older agent has it ONLY here, not as `ticket.adopted`; dropping it
             # would make the resumed session auto-merge.
@@ -27657,6 +27695,11 @@ class SessionManager:
         rec = next((c for c in self.closed if c.get("id") == sid), None)
         if not rec:
             log(f"resume: no closed session {sid}")
+            return
+        # A shadow run (XERK-1847) is never resumed: relaunched as an ordinary
+        # session it would carry none of its no-publish protections.
+        if rec.get("shadow") or sid in self.shadow_sids:
+            self._refuse_start("a shadow run cannot be resumed", cmd_id=cmd_id)
             return
         # A paused sleeper still in the lifecycle worker's hands (XERK-1575): its
         # worktree is being re-added for this very resume, or its old tmux is
@@ -28039,6 +28082,12 @@ class SessionManager:
         def refuse(reason):
             self._refuse_start(reason, cmd_id=cmd_id, migration_id=migration_id)
 
+        # A shadow run's conversation (XERK-1847) is never resumed: its worktree
+        # dir is named for its session id, which the run ledger remembers.
+        if isinstance(cwd, str) and (os.path.basename(os.path.normpath(cwd)) in self.shadow_sids
+                                     or transcript_id in self.shadow_tids):
+            refuse("a shadow run cannot be resumed")
+            return None
         # Only a cwd under REPOS_ROOT is resumable here — never let a free-form
         # path reach git/tmux.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
@@ -28248,6 +28297,10 @@ class SessionManager:
         sess = self._find(session_id)
         if not sess:
             refuse(f"no such session {session_id} on the source host")
+            return
+        if sess.get("shadow"):
+            # Moved, it would relaunch without its no-publish launch (XERK-1847).
+            refuse("a shadow run cannot be migrated")
             return
         path = _session_transcript_path(sess)
         if not path or not os.path.isfile(path):
@@ -30764,6 +30817,8 @@ class SessionManager:
             return "no such session"
         if sess.get("status") != "running":
             return "it is not running"
+        if sess.get("shadow"):
+            return "it is a shadow run (XERK-1847)"
         # Mid-move: the paused record here would later be woken while the moved
         # copy runs on the target — two claudes on one conversation and ticket.
         if self._export_running(sess.get("id")):
