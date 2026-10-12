@@ -3784,6 +3784,26 @@ test("trajectory pane: a slow 200 for a session left behind paints nothing, nor 
   assert.notEqual(page.els.trajScroll.dataset.loaded, "1");
 });
 
+test("trajectory pane: after the no-transcript note, reopening the last session fetches it again", async () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "A", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidA" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  page.setGet((url) => url.includes("/tidA/trajectory")
+    ? { ok: false, status: 404, json: async () => ({ refused: { host: "nas", error: "too big" } }) } : null);
+  const settle = async () => { for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r)); };
+  page.selectSession("s1");
+  page.chatToTrajectory();
+  await settle();
+  page.els.trajScroll.dataset.loaded = "1";   // as if A's trajectory had painted
+  page.loadTrajectory(null);
+  assert.match(page.els.trajScroll.innerHTML, /no transcript id yet/);
+  const before = page.gets.length;
+  page.loadTrajectory("tidA");                 // back to A, non-forced
+  await settle();
+  assert.ok(page.gets.length > before, "A is fetched again, not served from a stale cache flag");
+  assert.match(page.els.trajScroll.innerHTML, /nas&rsquo;s last push/);
+});
+
 // --- Trajectory on the read-only stage (XERK-718) ----------------------------
 // The ended/killed-session and archived-transcript views are archive-served, so
 // their Trajectory works for an offline host too. The toggle rides the SAME
