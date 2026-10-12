@@ -1224,7 +1224,8 @@ _REWRITE_FILTERS = {"sed", "tr", "awk", "gawk", "mawk", "nawk", "cut", "rev",
 # A grep prints the lines it selects, so it filters like `sed` — unless a flag
 # makes it print nothing, a count or file names instead (XERK-1617 QA:
 # `$(false || echo rm -rf / | grep .)`).
-_GREP_PROGS = {"grep", "egrep", "fgrep"}
+_GREP_PROGS = {"grep", "egrep", "fgrep", "zgrep", "zegrep", "zfgrep", "xzgrep",
+               "xzegrep", "xzfgrep", "lzgrep", "bzgrep", "zstdgrep"}
 # Short and long options that print no line text, and those taking a value
 # (the value is skipped, so `-e -q` is a pattern, not quiet).
 _GREP_NO_LINES = set("qclL")
@@ -1235,13 +1236,35 @@ _GREP_VALUE_LONG = {"--regexp", "--file", "--max-count", "--after-context",
                     "--before-context", "--context", "--directories", "--devices",
                     "--label", "--include", "--exclude", "--exclude-dir",
                     "--exclude-from", "--binary-files", "--color", "--colour"}
+# ripgrep's own (rollup XERK-1584: `$(false || echo … | rg .)` stayed opaque).
+# `-r/--replace` rewrites the line, which the taint reading passes through
+# like `sed`.
+_RG_NO_LINES = set("qcl")   # rg's -L is --follow, which prints lines
+_RG_NO_LINES_LONG = {"--quiet", "--count", "--count-matches", "--files-with-matches",
+                     "--files-without-match", "--files", "--type-list"}
+_RG_VALUE_SHORT = set("efgtTmABCjMrEd")
+_RG_VALUE_LONG = {"--regexp", "--file", "--glob", "--iglob", "--type", "--type-not",
+                  "--max-count", "--after-context", "--before-context", "--context",
+                  "--threads", "--max-columns", "--replace", "--encoding",
+                  "--max-depth", "--type-add", "--color", "--colors", "--sort",
+                  "--sortr", "--pre", "--pre-glob", "--path-separator",
+                  "--context-separator", "--field-match-separator",
+                  "--field-context-separator", "--ignore-file", "--type-clear",
+                  "--hostname-bin"}
+_GREP_OPTION_TABLES = {
+    **{p: (_GREP_NO_LINES, _GREP_NO_LINES_LONG, _GREP_VALUE_SHORT,
+           _GREP_VALUE_LONG - {"--color", "--colour"}) for p in _GREP_PROGS},
+    "rg": (_RG_NO_LINES, _RG_NO_LINES_LONG, _RG_VALUE_SHORT, _RG_VALUE_LONG),
+}
 
 
 def _greps_lines(toks: list[str]) -> bool:
     """Whether ``toks`` is a grep that re-emits the lines it reads: no option
     makes it print nothing, a count or file names instead."""
-    if _basename(toks[0]) not in _GREP_PROGS:
+    table = _GREP_OPTION_TABLES.get(_basename(toks[0]))
+    if table is None:
         return False
+    no_short, no_long, value_short, value_long = table
     i = 1
     while i < len(toks):
         t = toks[i]
@@ -1250,15 +1273,15 @@ def _greps_lines(toks: list[str]) -> bool:
             break
         if t.startswith("--"):
             name = t.split("=", 1)[0]
-            if name in _GREP_NO_LINES_LONG:
+            if name in no_long:
                 return False
-            if "=" not in t and name in _GREP_VALUE_LONG - {"--color", "--colour"}:
+            if "=" not in t and name in value_long:
                 i += 1
         elif t.startswith("-") and len(t) > 1:
             for k, c in enumerate(t[1:], 1):
-                if c in _GREP_NO_LINES:
+                if c in no_short:
                     return False
-                if c in _GREP_VALUE_SHORT:
+                if c in value_short:
                     if k == len(t) - 1:
                         i += 1      # the value is the next word
                     break           # the rest of the cluster is the value
@@ -8584,7 +8607,15 @@ _GLUE_SET_RE = re.compile(r"(?<![\w.-])set[ \t]+(?:-[\w-]*[ \t]+)*([^;&|\n`)]*)"
 def _expand_readings(command: str) -> list[tuple[list[str], str]]:
     """`_expand_both` for one line: the readings its values and quoting need."""
     out = _expand_picks(command)
-    assigned = _default_assignments(command)
+    try:
+        assigned = _default_assignments(command)
+    except _ExpansionTooLarge:
+        # Its `_spend` sits outside `_expand_top`'s catch, so a spent budget
+        # escaped `decide` and was denied as unclassifiable, not too large
+        # (rollup XERK-1584). Never grantable, as `_expand_top` marks it.
+        if _budget is not None:
+            _budget["capped"] = True
+        return out + [([_TOO_LARGE], command)]
     if assigned:
         # `${x:=word}` assigns word to an unset x, which a later `$x` runs:
         # `: ${x:='rm …'}; eval "$x"` (XERK-1634). An ADDED reading with each
@@ -11967,7 +11998,8 @@ def _is_dangerous_path(tok: str, trailing: bool = True) -> bool:
     # Windows drive roots: C:, C:\, C:\windows, C:\users, ...
     if re.match(r"^[a-z]:([\\/].*)?$", low):
         seg = low.split(":", 1)[1].strip("\\/")
-        if seg in ("", "windows", "users", "program files", "program files (x86)", "system32"):
+        if seg.replace("\\", "/") in ("", "windows", "users", "program files",
+                                        "program files (x86)", "system32", "windows/system32"):
             return True
     # POSIX system roots: exact match or a direct child of the root.
     for root in _SYSTEM_ROOTS:
@@ -12379,15 +12411,79 @@ def _destructive_rm(tokens: list[str]) -> str | None:
     return None
 
 
+_PS_SHELLS = {"powershell", "pwsh", "cmd"}
+_PS_REMOVE_CMDS = {"remove-item", "ri", "rm", "del", "erase", "rd", "rmdir"}
+_PS_WORD_SPLIT_RE = re.compile(r"[\s;|&{}()\[\]$=,@'\"#<>]+")
+_PS_QUOTED_RE = re.compile(r"'([^'\n]*)'|\"([^\"\n]*)\"")
+_PS_SWITCHES_RE = re.compile(r"(?:/[a-z])+")
+
+
+def _ps_recursive_word(word: str) -> bool:
+    """`-Recurse` or an abbreviation (`-r`, `-Rec`, `-Recurse:$true`), a cmd
+    switch run holding `/s` (`/s/q`), or a wildcard. Linear: a regex with an
+    ambiguous `/s` backtracked quadratically (QA)."""
+    w = word.lower()
+    return ((len(w) >= 2 and "-recurse".startswith(w.split(":", 1)[0]))
+            or (_PS_SWITCHES_RE.fullmatch(w) is not None and "s" in w.split("/"))
+            or w.endswith("*"))
+
+
+def _ps_script_reason(tokens: list[str]) -> str | None:
+    """A recursive delete of a protected path in what `powershell`, `pwsh`
+    or `cmd` runs, when it IS the command's program (rollup XERK-1584).
+
+    Deliberately NOT a PowerShell parser (guard-unreadable.md): four QA passes
+    each found a shape that hid a statement from one — option values,
+    `-Com`/`/Command`, blocks, `<#` in a string, newlines, expression position
+    (`$x = rm …`, `echo (rm …)`). Instead every word of every argument counts:
+    a remove command or alias anywhere, a recursive switch or wildcard
+    anywhere, and a protected path anywhere refuse the command. Accepted
+    over-deny: a read-only script naming all three
+    (`Get-ChildItem -Filter del -Recurse C:\\Windows`)."""
+    words = _strip_prefixes(tokens)
+    if not words or re.sub(r"\.exe$", "", _basename(words[0]).lower()) not in _PS_SHELLS:
+        return None
+    text = " ".join(words[1:]).replace("`", "").replace("^", "")
+    found = _PS_WORD_SPLIT_RE.split(text)
+    # A quoted path holds blanks (`'C:\\Program Files'`): its whole text too.
+    found += [a or b for a, b in _PS_QUOTED_RE.findall(text)]
+    if not any(w.lower() in _PS_REMOVE_CMDS for w in found):
+        return None
+    if not any(_ps_recursive_word(w) for w in found):
+        return None
+    for word in found:
+        for target in _ps_targets(word):
+            if _is_dangerous_path(target):
+                return f"refusing recursive delete of a protected path ({target!r})"
+    return None
+
+
+def _ps_targets(word: str) -> list[str]:
+    """The paths one word may name: `-Path:C:\\x` binds its value."""
+    if word.startswith("-") and ":" in word:
+        word = word.split(":", 1)[1]
+    word = word.strip()
+    if not word:
+        return []
+    # A trailing glob component (`x\\*`, `x\\*.*`) empties the directory x.
+    parent = re.sub(r"[\\/][^\\/]*[*?][^\\/]*$", "", word)
+    return [word, parent] if parent != word else [word]
+
+
+def _ps_recursive_remove(low: str) -> bool:
+    if "remove-item" not in low and not re.search(r"\b(rd|rmdir)\b", low):
+        return False
+    return ("-recurse" in low or re.search(r"\bremove-item\b.*\*", low) is not None
+            or re.search(r"\b(rd|rmdir)\b\s+/s", low) is not None)
+
+
 def _destructive_powershell_remove(segment: str) -> str | None:
     low = segment.lower()
-    if "remove-item" not in low and not re.search(r"\b(rd|rmdir)\b", low):
-        return None
-    if (
-        "-recurse" not in low
-        and not re.search(r"\bremove-item\b.*\*", low)
-        and not re.search(r"\b(rd|rmdir)\b\s+/s", low)
-    ):
+    if re.search(r"\b(?:powershell|pwsh|cmd)\b", low):
+        reason = _ps_script_reason(_tokenize(segment))
+        if reason:
+            return reason
+    if not _ps_recursive_remove(low):
         return None
     for tok in _tokenize(segment):
         if _is_dangerous_path(tok):
@@ -14083,6 +14179,17 @@ def _is_destructive(command: str) -> str | None:
     reason = _destructive_database(command)
     if reason:
         return reason
+    # PowerShell/cmd scripts also on the RAW segments: the expansion swaps a
+    # single-quoted `$(…)` for an opaque placeholder, which hid
+    # `pwsh -c '$(Remove-Item -Recurse C:\\Windows)'` (rollup XERK-1584 QA).
+    if re.search(r"\b(?:powershell|pwsh|cmd)\b", command.lower()):
+        for seg in _split_on_operators(command):
+            try:
+                reason = _ps_script_reason(_tokenize(seg))
+            except ValueError:
+                reason = None
+            if reason:
+                return reason
     for tokens, segment, *flags in _expand_both(command):
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"

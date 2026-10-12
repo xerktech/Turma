@@ -26536,16 +26536,27 @@ class TestPokeHeartbeat(unittest.TestCase):
         # manager, or RecursionError out of run_forever. Drive the real shape:
         # this (main) thread loops clear()/wait() like run_forever while another
         # process fires SIGUSR1 as fast as it can.
-        # XERK-1606: a Python-function handler still nested here (~15 deep
-        # unloaded, the full recursion limit under suite load), so the burst runs
-        # with the limit just above the current depth: nesting then fails it on
-        # some runs even unloaded; the handler-type test below is the sure gate.
+        # XERK-1606: a Python-function handler nests under a burst, so the burst
+        # runs with the limit just above the real current depth. That proves the
+        # INSTALLED handler neither wedges nor recurses; it does not reliably
+        # catch a nesting one (QA: a Python handler mostly passed it here), so
+        # the handler-type test below is the gate for that.
         self._install()
         depth, f = 0, sys._getframe()
         while f:
             depth, f = depth + 1, f.f_back
         prev_limit = sys.getrecursionlimit()
         self.addCleanup(sys.setrecursionlimit, prev_limit)
+        # The frame walk misses the C calls the limit also counts, which a
+        # full `unittest discover` stacks deeper than a module run (rollup
+        # XERK-1584): the lowest limit Python accepts is the real depth.
+        while True:
+            try:
+                sys.setrecursionlimit(depth)
+                break
+            except RecursionError:
+                depth += 1
+        sys.setrecursionlimit(prev_limit)
 
         sender = subprocess.Popen([sys.executable, "-c",
             "import os, signal, sys\n"
@@ -43942,6 +43953,40 @@ class TestHookIntegrity(unittest.TestCase):
             fh.write("0" * 64 + "  ../hub-agent.py\n" + "0" * 64 + "  hooks/../../x.py\n")
         self.assertEqual([], self._check({}, 1000))
 
+
+
+class TestGuardXargsValueOpts(unittest.TestCase):
+    def test_reads_guard_s_current_xargs_tables(self):
+        # Rollup XERK-1584: it read a name guard.py had dropped, so it was ()
+        # and the judge took an option's value for xargs' program word.
+        opts = ha.guard_xargs_value_opts()
+        for opt in ("-n", "-d", "-P", "-a", "--max-args", "--delimiter"):
+            self.assertIn(opt, opts)
+        self.assertNotIn("-0", opts)
+        self.assertEqual(ha._judge_feeder_reason("xargs", ["-n", "1", "-I{}", "{}", "push", "origin", "main"]),
+                         "an xargs command whose program comes from stdin")
+
+class TestLoadHookSource(unittest.TestCase):
+    def test_a_forged_pyc_beside_the_hook_is_never_run(self):
+        # Rollup XERK-1584: a timestamp .pyc whose header matches the source's
+        # mtime and size is what the import machinery would run instead.
+        import py_compile
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, ignore_errors=True)
+        path = os.path.join(d, "hook.py")
+        with open(path, "w") as f:
+            f.write("X = 'forged'\n")
+        st = os.stat(path)
+        py_compile.compile(path, cfile=importlib.util.cache_from_source(path),
+                           invalidation_mode=py_compile.PycInvalidationMode.TIMESTAMP)
+        with open(path, "w") as f:
+            f.write("X = 'source'\n")   # same size
+        os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns))
+        spec = importlib.util.spec_from_file_location("forged_probe", path)
+        cached = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cached)
+        self.assertEqual(cached.X, "forged")      # the trap is real
+        self.assertEqual(ha._load_hook_source("hook_probe", path).X, "source")
 
 
 class TestIgnoreLatePokes(unittest.TestCase):

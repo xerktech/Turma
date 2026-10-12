@@ -68,6 +68,7 @@ import tarfile
 import tempfile
 import threading
 import time
+import types
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -5276,11 +5277,10 @@ def hook_integrity_failures(script_dir=None):
         present = os.listdir(os.path.join(script_dir, "hooks"))
     except OSError:
         present = []
-    # __pycache__ is legitimate: the manager imports permlog.py/guard.py as
-    # modules and writes their bytecode. A HOOK run as a script never imports
-    # from it (no sourceless import from __pycache__), so it cannot shadow the
-    # stdlib for guard.py; the manager's own loaders do read it, but that uid can
-    # already rewrite hub-agent.py itself.
+    # __pycache__ is tolerated: an older manager imported permlog.py/guard.py
+    # as modules and wrote bytecode there. Nothing reads it now — a HOOK run as
+    # a script never imports from it, and the manager compiles both from
+    # source (`_load_hook_source`).
     bad += [f"hooks/{name}" for name in present
             if f"hooks/{name}" not in expected and name != "__pycache__"]
     return sorted(bad)
@@ -13685,6 +13685,19 @@ def _permission_ask_prompt(text):
     return " ".join(text[start:].split())[:PERMISSION_TEXT_MAX]
 
 
+def _load_hook_source(name, path):
+    """A hook file loaded as a module, compiled from its SOURCE. The import
+    machinery would run a matching `hooks/__pycache__/*.pyc` instead, and that
+    dir is session-writable and exempt from the hook-integrity check, so a
+    forged .pyc ran inside the manager's permission judge (rollup XERK-1584)."""
+    with open(path, "rb") as f:
+        code = compile(f.read(), path, "exec", dont_inherit=True)
+    mod = types.ModuleType(name)
+    mod.__file__ = path
+    exec(code, mod.__dict__)
+    return mod
+
+
 _PERMLOG_MODULE = None
 
 
@@ -13696,12 +13709,7 @@ def _permlog_module():
     global _PERMLOG_MODULE
     if _PERMLOG_MODULE is None:
         try:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location(
-                "turma_permlog", permlog_script_path())
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            _PERMLOG_MODULE = mod
+            _PERMLOG_MODULE = _load_hook_source("turma_permlog", permlog_script_path())
         except Exception as e:      # noqa: BLE001 — never raise onto the beat
             log(f"permission ledger: hooks/permlog.py did not load ({e}); "
                 f"pane rows carry the tool name only")
@@ -14238,7 +14246,13 @@ def guard_xargs_value_opts():
     """guard.py's xargs options that take a separate value (its own list, so
     both readers agree where xargs' command word starts)."""
     guard = _guard_module()
-    return getattr(guard, "_XARGS_OPTS_WITH_VALUE", ()) if guard else ()
+    if not guard:
+        return ()
+    # Read the tables guard.py has now: the old `_XARGS_OPTS_WITH_VALUE` was
+    # dropped there, and this read () ever since (rollup XERK-1584).
+    shorts = getattr(guard, "_XARGS_SHORT_VALUE", ())
+    longs = getattr(guard, "_XARGS_LONG_OPTS", {})
+    return frozenset([f"-{c}" for c in shorts] + [o for o, needs in longs.items() if needs])
 
 
 def _judge_family_reason(guard, tokens):
@@ -14788,11 +14802,7 @@ def _guard_module():
     global _GUARD_MODULE
     if _GUARD_MODULE is None:
         try:
-            import importlib.util
-            spec = importlib.util.spec_from_file_location("turma_guard", guard_script_path())
-            mod = importlib.util.module_from_spec(spec)
-            spec.loader.exec_module(mod)
-            _GUARD_MODULE = mod
+            _GUARD_MODULE = _load_hook_source("turma_guard", guard_script_path())
         except Exception as e:      # noqa: BLE001 — never raise onto a worker
             log(f"permission judge: hooks/guard.py did not load ({e}); every "
                 f"request stands")

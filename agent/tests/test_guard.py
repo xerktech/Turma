@@ -4538,6 +4538,56 @@ class TestCommentAndEvalReparse(unittest.TestCase):
 
 
 class TestClassification(unittest.TestCase):
+    def test_a_powershell_c_script_s_remove_targets_are_judged(self):
+        # Rollup XERK-1584: what powershell/pwsh/cmd runs is scanned, not
+        # parsed (guard-unreadable.md): a remove word, a recursive switch or
+        # wildcard, and a protected path anywhere in its arguments refuse it.
+        # Four parsers each lost to a shape QA ran live in pwsh.
+        W = "C:\\Windows"
+        for cmd in (f'powershell -c "Remove-Item -Recurse -Force {W}"',
+                    'powershell -c "Remove-Item -Recurse -Force C:/Windows"',
+                    f'pwsh -Command "Remove-Item -Recurse -Force {W}\\System32"',
+                    f"powershell -c \"Remove-Item -Recurse -Force 'C:\\Program Files'\"",
+                    f'powershell -c "rd /s /q {W}"', f'cmd /c "rd /s/q {W}"',
+                    f'powershell.exe -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -Recurse {W}"',
+                    f'powershell -Com "Remove-Item -Recurse {W}"', f'sudo pwsh -c "Remove-Item -Recurse {W}"',
+                    f'powershell -c "Remove-Item -Recurse C:\\Win`dows"',
+                    f'powershell -c "Remove-Item -Recurse -Path:{W}"',
+                    f'powershell -c "Remove-Item -Recurse {W}\\*"',
+                    f'powershell -c "Remove-Item -Recurse .\\a,{W}"',
+                    f"powershell -c \"Remove-Item -Recurse @('.\\a','{W}')\"",
+                    f'powershell -c "ri -r {W}"', f'powershell -c "del -Rec {W}"',
+                    f'pwsh -c "& {{Remove-Item -Recurse {W}}}"', f'pwsh -c "if (1) {{ ri -r {W} }}"',
+                    f'pwsh -c "<#x#>Remove-Item -Recurse {W}"',
+                    f"pwsh -c \"Write-Host '<#'; Remove-Item -Recurse {W}; Write-Host '#>'\"",
+                    f"pwsh -c 'Write-Host x\nRemove-Item -Recurse {W}'",
+                    f"pwsh -c 'Write-Host `\"; Remove-Item -Recurse {W}'",
+                    f'pwsh -c "Write-Output (Remove-Item -Recurse {W})"',
+                    'powershell -NoProfile Remove-Item -Recurse -Path:C:/Windows',
+                    f'pwsh -WorkingDirectory "{W}" -c "Remove-Item -Recurse -Force *"',
+                    # A single-quoted `$(…)` is pwsh's, not bash's (QA delta 4).
+                    f"pwsh -c '$(Remove-Item -Recurse {W})'",
+                    f"pwsh -c 'Write-Output \"x $(Remove-Item -Recurse {W})\"'",
+                    # Carets, a bound switch value and a wildcard (QA mutants).
+                    f'cmd /c "r^d /s /q {W}"',
+                    f"pwsh -c 'Remove-Item -Recurse:$true {W}'",
+                    f"pwsh -c 'Remove-Item {W}\\* -Force'",
+                    f'cmd /c "del /f /s /q {W}\\*.*"'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
+                    f'powershell -c "Get-ChildItem {W} -Recurse"',
+                    'powershell -c "Remove-Item -Recurse .\\dist\\*"',
+                    f'cmd /c "dir {W} /s"', 'cmd /c "rd /q build"',
+                    # Only a shell PROGRAM's arguments are scanned: quoted text
+                    # naming one elsewhere is data.
+                    f'git commit -m "guard: deny Remove-Item -Recurse {W} in powershell -c"',
+                    'rg -n "Remove-Item -Recurse -Force C:/Windows" agent/',
+                    f'grep -rn "rd /s /q {W}" agent/tests',
+                    f'echo cmd -c "Remove-Item -Recurse {W}"'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
     def test_destructive_blocked(self):
         for cmd in DESTRUCTIVE:
             with self.subTest(cmd=cmd):
@@ -5344,6 +5394,25 @@ class TestExpansionBudget(unittest.TestCase):
             limit = 20 if "<<EOF" in cmd else 15
             self.assertIn(self.TOO_LARGE, self.check(cmd, limit) or "", cmd[:80])
 
+    def test_a_long_cmd_switch_run_stays_linear(self):
+        # Rollup XERK-1584 QA: `(/[a-z])*/s(/[a-z])*` backtracked
+        # quadratically, 238s at 256 KB through the hook.
+        cmd = "cmd /c rd " + "/s" * 64000 + "/ build; rm -rf /"
+        t = time.process_time()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.process_time() - t, 15)
+
+    def test_a_default_assignment_spending_the_budget_reads_too_large(self):
+        # Rollup XERK-1584: `_default_assignments` spent the budget outside
+        # `_expand_top`'s catch, so `decide` raised and the hook's reason was
+        # "could not classify" instead of this one.
+        cmd = "; ".join(f"eval x=1; chmod -R 755 ~/a{i} ${{HOME:=/q}}/c{i}" for i in range(200))
+        t = time.process_time()
+        decision, reason = guard.decide("Bash", {"command": cmd})[:2]
+        self.assertEqual(decision, "deny")
+        self.assertIn(self.TOO_LARGE, reason)
+        self.assertLess(time.process_time() - t, 30)
+
     def test_find_exec_and_xargs_runs_are_denied_fast(self):
         # Their emitted WORK grew faster than linearly, not their text: 5000
         # `-exec` runs took 30s and 4096 xargs segments 18s (XERK-1589).
@@ -5742,6 +5811,15 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # A grep that prints its lines filters like `sed`.
                     "$(false || echo rm -rf / | grep .)",
                     "$(ls /x || echo rm -rf /etc | grep rm)",
+                    # ...and so do ripgrep and zgrep (rollup XERK-1584).
+                    "$(false || echo rm -rf /etc | rg .)",
+                    "$(false || echo rm -rf /etc | zgrep .)",
+                    "$(false || echo rm -rf /etc | rg -e -q)",
+                    # rg's -L is --follow; these long options take a value (QA).
+                    "$(false || echo rm -rf /etc | rg -L .)",
+                    "$(false || echo rm -rf /etc | rg --context-separator -c .)",
+                    "$(false || echo rm -rf /etc | rg --ignore-file -c .)",
+                    "$(false || echo rm -rf /etc | xzgrep .)",
                     # A quoted `$((` is not arithmetic around a later substitution.
                     "X=\"$((\" $(false || echo rm -rf /etc) \"))\"",
                     "echo '$((' ; $(ls -d /usr/bin/rm /nope || echo -rf /etc) ; echo '))'",
@@ -5777,6 +5855,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # A grep printing a count or nothing is not the text.
                     "$(ls /x || echo rm -rf /etc | grep -c rm)",
                     "$(ls /x || echo rm -rf /etc | grep -q rm)",
+                    "$(ls /x || echo rm -rf /etc | rg -c rm)",
+                    "$(ls /x || echo rm -rf /etc | rg --files-with-matches rm)",
                     # A backgrounded body's order is unknown: left opaque.
                     "$(sleep 1 & echo x | sed '')"):
             with self.subTest(cmd=cmd):
