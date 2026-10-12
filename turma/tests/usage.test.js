@@ -24,7 +24,7 @@ const script = blocks[blocks.length - 1][1];
 function makeEl() {
   const el = {
     _html: "", textContent: "", value: "", hidden: false,
-    style: {}, dataset: {}, children: [],
+    style: { setProperty(k, v) { this[k] = String(v); } }, dataset: {}, children: [],
     classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
     listeners: {},
     addEventListener(name, fn) { (this.listeners[name] ||= []).push(fn); }, removeEventListener() {},
@@ -118,7 +118,7 @@ function loadHelpers(fetchReply = null) {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheLineText, cacheHitRate,
-    blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView, limitColumns,
+    blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView, limitColumns, renderLimits,
     sevenDayPacing,
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
@@ -658,6 +658,19 @@ test("limitColumns balances the limit cards' rows: 4 cards are 2x2, not 3+1", ()
   const H = loadHelpers();
   const cols = [1, 2, 3, 4, 5, 6, 9].map(H.limitColumns);
   assert.deepEqual(cols, [1, 2, 3, 2, 3, 3, 3]);
+});
+
+test("renderLimits hands the grid its column counts: wide, and narrow (odd counts stack)", () => {
+  const H2 = loadHelpers();
+  const now = Math.floor(Date.now() / 1000);
+  const host = (i) => ({ device: "h" + i, subscription: { key: "s" + i },
+    limits: { capturedAt: now, fiveHour: { usedPct: 1, resetsAt: now + 60 } } });
+  const grid = (n) => {
+    H2.renderLimits(Array.from({ length: n }, (_, i) => host(i)));
+    return H2.els.limits.children.find((c) => c.className === "lim-cards").style;
+  };
+  assert.deepEqual([grid(4)["--lim-cols"], grid(4)["--lim-cols-narrow"]], ["2", "2"]);
+  assert.deepEqual([grid(3)["--lim-cols"], grid(3)["--lim-cols-narrow"]], ["3", "1"]);
 });
 
 // --- limitGroups: one card per subscription (XERK-301) ----------------------

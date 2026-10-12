@@ -51,7 +51,7 @@
     grid-template-columns: repeat(var(--lim-cols, 1), minmax(0, 1fr));
   }
   @media (max-width: 1000px) {
-    .lim-cards { grid-template-columns: repeat(min(var(--lim-cols, 1), 2), minmax(0, 1fr)); }
+    .lim-cards { grid-template-columns: repeat(var(--lim-cols-narrow, 1), minmax(0, 1fr)); }
   }
   @media (max-width: 680px) {
     .lim-cards { grid-template-columns: minmax(0, 1fr); }
@@ -1000,6 +1000,9 @@ function renderLimits(agents) {
   const cards = document.createElement("div");
   cards.className = "lim-cards";
   cards.style.setProperty("--lim-cols", String(limitColumns(entries.length)));
+  // At tablet width two columns, but only for an even count: an odd one would
+  // leave its last card alone at half width, so those stack in one column.
+  cards.style.setProperty("--lim-cols-narrow", entries.length % 2 ? "1" : "2");
   for (const entry of entries) cards.append(limitCard(entry, nowSec));
   $limits.append(cards);
 }
