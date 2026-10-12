@@ -17015,7 +17015,7 @@ def read_wake_request(session_id):
 # publish — the launch sets TURMA_SHADOW, which the guard reads to deny push / PR /
 # tracker / API writes, strips the tracker credentials and connects no MCP server.
 # Neither carries a `ticket` block, so no hub ticket sweep (auto-stop on Done,
-# auto-merge, close-ticket, the ladder) ever acts on it.
+# auto-merge, close-ticket, model routing) ever acts on it.
 
 MODEL_SHADOW = os.environ.get("TURMA_MODEL_SHADOW", "1") != "0"
 SHADOW_RUNS_PATH = os.path.join(REGISTRY_DIR, "shadow-runs.json")
@@ -27361,8 +27361,13 @@ class SessionManager:
             ticket["branchBase"] = branch_base
         # A claude session on a model cheaper than Opus (XERK-1848) is told to pass
         # Opus QA and an Opus review before its PR. Charset-checked like a model
-        # alias, since it is interpolated into the prompt; dsh/qwen get nothing.
-        if (agent_type in (None, "", "claude") and isinstance(model, str)
+        # alias, since it is interpolated into the prompt; dsh/qwen get nothing —
+        # judged on the runtime it will RUN (a blank pin takes this host's default).
+        try:
+            runtime = resolve_agent_type(agent_type, apply_default=True)
+        except ValueError:
+            runtime = None
+        if (runtime == "claude" and isinstance(model, str)
                 and SPAWN_MODEL_RE.fullmatch(model) and ticket_needs_opus_review(model)
                 and isinstance(detail, dict)):
             detail = dict(detail, opusReviewModel=model)
@@ -40349,8 +40354,8 @@ class SessionManager:
                 # and the label must not change just because the session was
                 # killed.
                 "summaryManual": c.get("summaryManual"),
-                # The alias it was spawned on: the hub's ticket model ladder
-                # (XERK-1827) reads a failed ticket session's tier off it.
+                # The alias it was spawned on (XERK-1827); the outcome ledger
+                # falls back to it when no answering model was seen.
                 "model": c.get("model"),
                 # The model that ANSWERED, and its QA runs (XERK-1845): the
                 # outcome ledger first sees a short session already closed, and

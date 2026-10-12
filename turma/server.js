@@ -4792,7 +4792,9 @@ function modelShadowSweep(now = Date.now(),
 //     promotion has a Wilson LOWER bound above the Opus baseline for the class is
 //     demoted back to Opus and the operator notified.
 //   - A demotion is sticky: only shadow pairs graded AFTER it can promote again
-//     (the pair counts at demotion are kept and subtracted).
+//     (`pairEvidence` since the demotion's `at`; never count deltas, which fall
+//     when rows are evicted or a live row later goes bad).
+//   - Only a cheaper Claude family (MODEL_COST_ORDER) is ever promoted.
 // State is hub-owned and durable: "<class>/<model>" -> {state, at, graded,
 // mOnlyFail} (+ the tripwire's {bad, n, baseline} on a demotion).
 const MODEL_PROMOTE_MIN_PAIRS = positiveEnv("MODEL_PROMOTE_MIN_PAIRS", 40);
@@ -4858,14 +4860,16 @@ function modelPolicySweep(now = Date.now()) {
     const pairs = outcomeLedger.aggregate({ now }).pairs;
     let changed = false;
     for (const p of pairs) {
-      if (p.model === "opus") continue;
+      // Only a cheaper Claude family is routable; Opus is the baseline.
+      if (!MODEL_COST_ORDER.includes(p.model)) continue;
       const key = `${p.cls}/${p.model}`;
       if (!/^[a-z0-9-]{1,40}\/[a-z0-9._-]{1,40}$/.test(key)) continue;
       const cur = modelPolicyState[key];
       if (cur && cur.state === "promoted") continue;
-      // After a demotion only the evidence graded since counts.
-      const graded = p.graded - (cur ? cur.graded : 0);
-      const mOnly = Math.max(0, p.mOnlyFail - (cur ? cur.mOnlyFail : 0));
+      // After a demotion only the pairs graded since it count (sticky).
+      const ev = cur ? outcomeLedger.pairEvidence(p.cls, p.model, { since: cur.at, now })
+        : { graded: p.graded, mOnlyFail: p.mOnlyFail };
+      const graded = ev.graded, mOnly = ev.mOnlyFail;
       if (!outcomeLedger.promotionPasses(graded, mOnly, { minPairs: MODEL_PROMOTE_MIN_PAIRS })) continue;
       modelPolicyState[key] = { state: "promoted", at: now, graded: p.graded, mOnlyFail: p.mOnlyFail };
       changed = true;

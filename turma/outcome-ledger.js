@@ -845,6 +845,26 @@ function promotionPasses(graded, mOnlyFail, { minPairs = 40, maxRate = 0.05, max
 }
 
 /**
+ * Graded shadow pairs for (class, candidate model) whose grade landed at or
+ * after `since` (the grade's own time, else the row's last update): {graded,
+ * mOnlyFail}, counted as `pairsOf` counts them. A demotion re-promotes only on
+ * these — never on count deltas, which fall when rows are evicted or a live row
+ * later goes bad.
+ */
+function pairEvidence(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW_DAYS } = {}) {
+  let graded = 0, mOnlyFail = 0;
+  for (const r of rows.values()) {
+    if (r.kind !== "shadow" || r.cls !== cls || r.model !== model || !r.grade) continue;
+    if ((r.grade.at || r.updatedAt) < since) continue;
+    const live = r.pairOf ? rows.get(r.pairOf) : null;
+    if (!live) continue;
+    graded += 1;
+    if (r.grade.verdict !== "good" && outcomeOf(live, now, windowDays).outcome !== "bad") mOnlyFail += 1;
+  }
+  return { graded, mOnlyFail };
+}
+
+/**
  * The live bad rate of (class, model) for the tripwire: {bad, n} over live rows
  * that started at or after `since`. n counts the rows with something to judge —
  * bad, good, or merged and still inside the defect window — so a model is not
@@ -1139,7 +1159,7 @@ load();
 module.exports = {
   observe, attributeDefects, sanitizeDefectReports, aggregate, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
   shadowCandidates, decideShadow, shadowsDispatchedSince, observeShadows, SHADOW_ID_RE,
-  wilson, promotionPasses, liveRate,
+  wilson, promotionPasses, liveRate, pairEvidence,
   configure, rehydrate, flush,
   LEDGER_FILE, MAX_ROWS, WINDOW_DAYS, RETAIN_DAYS, T_ROW, OutcomeLedgerPgStore,
   _internals: {

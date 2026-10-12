@@ -35,8 +35,11 @@ Never restore a ladder or route from bench solve rates (`bench/run_policy.py` is
     90-day window, so bad ÷ (good + bad) would read every new model as all-bad and trip at once.
   - No Opus evidence for the class → baseline 0, so one bad demotes. Conservative on purpose:
     a wrong demotion costs money, a missed one costs quality.
-- **A demotion is sticky until NEW shadow evidence**: the record keeps the pair counts at
-  demotion, and re-promotion judges only pairs graded since (`graded - g0`, `mOnlyFail - m0`).
+- **A demotion is sticky until NEW shadow evidence**: re-promotion judges only pairs graded since
+  the demotion's `at` (`pairEvidence`). Never count deltas: `graded` falls on eviction and
+  `mOnlyFail` falls when an old live row later goes bad, so a delta over/under-counts (QA).
+- **Only a cheaper Claude family (`MODEL_COST_ORDER`: haiku, sonnet) is ever promoted** — a shadow's
+  model is `modelFamily(modelActual)`, and a non-alias family would be refused at spawn.
 - **State is hub-owned durable** (`/data/model-policy.json`, `registerExternalStore` `modelPolicy`
   — low churn), `"<class>/<model>" → {state, at, graded, mOnlyFail, bad?, n?, baseline?}`,
   coerced field by field (`modelPolicyCoerce`; an Opus key is dropped — Opus is the baseline).
@@ -56,7 +59,9 @@ Never restore a ladder or route from bench solve rates (`bench/run_policy.py` is
 - **The Opus review gate is agent-side** (`TICKET_OPUS_REVIEW_DIRECTIVE`): a claude ticket session
   spawned on a sonnet/haiku alias (policy pick OR pin) is told to pass the `qa` agent AND an Opus
   code review of its diff before its PR, both verdicts in the PR summary. Keyed on the model, not
-  the policy, so a pinned cheap session is gated too; shadow runs never take this path.
+  the policy, so a pinned cheap session is gated too; shadow runs never take this path. It is
+  judged on the runtime the session RUNS (`resolve_agent_type(..., apply_default=True)`), so a
+  qwen-default host with a pinned alias gets no gate.
 - **Per session, never per turn** — a mid-conversation model switch re-caches every missed turn.
 - `TURMA_TICKET_SUBAGENT_MODEL` (agent env, default off) sets ticket sessions' sub-agent default;
   QA/review sub-agents stay pinned to Opus (`hooks/subagent_model.py`, XERK-1851).

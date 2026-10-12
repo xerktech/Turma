@@ -37033,6 +37033,16 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
             dict(self._detail(), opusReviewModel="opus")))
         self.assertIn("not Opus", ha.build_ticket_prompt(
             dict(self._detail(), opusReviewModel="haiku")))
+        # A pinned cheap model on a host whose DEFAULT runtime is qwen: no gate.
+        sm3 = self.make_ticket_manager()
+        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()), \
+                mock.patch.object(ha, "resolve_agent_type", lambda t, apply_default=False: "qwen"):
+            detail_seen = {}
+            orig = sm3.spawn
+            sm3.spawn = lambda *a, **k: detail_seen.update(k.get("ticket_detail") or {})
+            sm3.spawn_ticket("PROJ-7", model="haiku")
+            sm3.spawn = orig
+        self.assertNotIn("opusReviewModel", detail_seen)
         self.assertTrue(ha.ticket_needs_opus_review("claude-sonnet-4-5"))
         self.assertFalse(ha.ticket_needs_opus_review("claude-opus-4-8"))
         self.assertFalse(ha.ticket_needs_opus_review(None))
@@ -37068,7 +37078,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
             self.assertIsNone(f({"ticket": {"key": "P-1"}}, False))
 
     def test_an_ended_ticket_session_reports_its_model(self):
-        # The hub's ladder reads a failed session's tier off closedSessions.
+        # The outcome ledger falls back to a closed session's spawn alias.
         sm = self.make_ticket_manager()
         with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
             sm.spawn_ticket("PROJ-7", model="haiku")

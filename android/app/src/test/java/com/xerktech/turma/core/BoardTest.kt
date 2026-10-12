@@ -543,6 +543,7 @@ class BoardTest {
         assertEquals("pico", workClassOf("Épico"))
         assertEquals("a-b", workClassOf("a\u0000b"))
         assertEquals("x".repeat(40), workClassOf("x".repeat(60)))
+        assertEquals("x".repeat(40), workClassOf("\uFEFF" + "x".repeat(60)))
     }
 
     @Test fun `modelPickOf is null unless the policy is on and the class is promoted`() {

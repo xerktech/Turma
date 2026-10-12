@@ -8272,12 +8272,66 @@ test("XERK-1848: the tripwire demotes a promoted model whose live bad rate beats
     // Sticky: the old 40 pairs do not re-promote it.
     hub.modelPolicySweep();
     assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "demoted");
-    // 40 NEW clean pairs do.
-    seedPairs("bug", "sonnet", 40);
+    // 40 NEW clean pairs, graded after the demotion, do.
+    seedPairs("bug", "sonnet", 40, { at: Date.now() + 1000 });
     hub.modelPolicySweep();
     const again = hub.__modelPolicyState()["bug/sonnet"];
     assert.equal(again.state, "promoted");
-    assert.equal(again.graded, 80);
+    assert.equal(again.graded, 80);   // the fleet total at promotion
+  } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
+});
+
+test("XERK-1848: re-promotion judges only pairs graded after the demotion, never count deltas", () => {
+  resetPolicy();
+  try {
+    const demotedAt = Date.now();
+    hub.__setModelPolicyState({ "bug/sonnet": { state: "demoted", at: demotedAt, graded: 60, mOnlyFail: 3,
+      bad: 1, n: 3, baseline: 0 } });
+    // Old failing evidence later blamed on Opus too (live row reopened) must not
+    // free up "room" for new failures: 3 of 40 new pairs fail -> stays demoted.
+    seedPairs("bug", "sonnet", 20, { bad: 3, at: demotedAt - 5000 });
+    const rows = hub.outcomeLedger._internals.rows();
+    for (const r of rows.values()) {
+      if (r.kind === "shadow" && r.grade.verdict === "bad") rows.get(r.pairOf).reopenedAt = Date.now();
+    }
+    seedPairs("bug", "sonnet", 40, { bad: 3, at: demotedAt + 1000 });
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "demoted");
+  } finally { resetPolicy(); }
+  resetPolicy();
+  try {
+    // Evicted old pairs never block a model that earned it back on new ones.
+    const demotedAt = Date.now();
+    hub.__setModelPolicyState({ "bug/sonnet": { state: "demoted", at: demotedAt, graded: 100, mOnlyFail: 0,
+      bad: 1, n: 3, baseline: 0 } });
+    seedPairs("bug", "sonnet", 60, { at: demotedAt + 1000 });
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
+  } finally { resetPolicy(); }
+});
+
+test("XERK-1848: only a cheaper Claude family is ever promoted", () => {
+  resetPolicy();
+  try {
+    for (const m of ["opus", "fable", "default", "gpt-oss-20b"]) seedPairs("bug", m, 40, { liveModel: "sonnet" });
+    hub.modelPolicySweep();
+    assert.deepEqual({ ...hub.__modelPolicyState() }, {});
+  } finally { resetPolicy(); }
+});
+
+test("XERK-1848: the tripwire uses the Wilson lower bound, not the point rate", () => {
+  resetPolicy();
+  hub.__setModelPolicy("on");
+  try {
+    seedPairs("bug", "sonnet", 40, { at: Date.now() - 60000 });
+    hub.modelPolicySweep();
+    for (let i = 0; i < 19; i++) seedLive("bug", "opus", "merged", Date.now() - 120000);
+    seedLive("bug", "opus", "bad", Date.now() - 120000);   // baseline 1/60
+    // 1 bad of 20: point rate 5% > 1.7%, but Wilson lower 0.9% is not.
+    seedLive("bug", "sonnet", "bad");
+    for (let i = 0; i < 19; i++) seedLive("bug", "sonnet", "merged");
+    hub.modelPolicySweep();
+    assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "promoted");
   } finally { hub.__setModelPolicy("observe"); resetPolicy(); }
 });
 

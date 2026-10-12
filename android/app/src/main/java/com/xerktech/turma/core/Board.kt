@@ -545,7 +545,9 @@ fun modelPinOf(
  * outcome-ledger `workClass`: the issue type, lowercased, one token, "other".
  */
 fun workClassOf(type: String?): String {
-    val s = (type ?: "").replace(Regex("[\\u0000-\\u001f\\u007f-\\u009f]"), " ").trim().take(40)
+    val s = (type ?: "").replace(Regex("[\\u0000-\\u001f\\u007f-\\u009f]"), " ")
+        // JS trim() also strips U+FEFF; Kotlin's isWhitespace does not.
+        .trim { it.isWhitespace() || it == '\uFEFF' }.take(40)
     return s.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifEmpty { "other" }
 }
 
