@@ -14710,6 +14710,18 @@ SENDKEYS_MAX_CHARS = 4000
 # don't coalesce into one read.
 PASTE_CHUNK_CHARS = 400
 PASTE_CHUNK_GAP_SEC = 0.01
+# A fixed gap is NOT enough on a loaded host: Claude Code is not scheduled
+# between slices, the pty buffers several, and one read past ~800 chars is a
+# paste again (XERK-1842: ~3.4K chars at load ~30 on 16 CPUs, up to 7/8 tagged).
+# So each slice waits until the composer has DRAWN the text typed so far before
+# the next is typed -- drawn means read. Bounded per message, not per slice
+# (_type_into_pane also runs on the beat); past the bound, or on a pane with no
+# readable composer, the rest falls back to the bare gap. Measured waits are
+# 0.1-0.9s a slice under load; a heavy spike can still spend the 5s across a
+# whole message, and the remaining slices then go with the bare gap.
+PASTE_SLICE_DRAWN_DEADLINE_SEC = _env_float("PASTE_SLICE_DRAWN_DEADLINE_SEC", 5.0,
+                                            minimum=0.0)
+PASTE_SLICE_DRAWN_POLL_SEC = 0.03
 # Slicing is for ordinary chat-sized text only; anything longer goes as ONE
 # bracketed paste, as before (tagged in the transcript; chat.js hides the tags).
 # Two reasons, both measured: a sliced message costs ~2 tmux calls per slice and
@@ -14743,12 +14755,20 @@ TYPED_SUBMIT_DEADLINE_SEC = _env_float("TYPED_SUBMIT_DEADLINE_SEC", 10.0, minimu
 _COMPOSER_RULE_RE = re.compile(r"^\s*\u2500{10,}")
 # How much of the message's end must still be in the composer to call it unsent.
 COMPOSER_TAIL_CHARS = 60
+# A short pane shows only the composer's last few lines, fewer than the tail
+# (a 40x12 pane: ~55 chars, XERK-1842). A box that is itself the text's tail
+# then counts, if at least this long -- shorter is a coincidence risk.
+COMPOSER_MIN_SHOWN_CHARS = 20
 # One writer per pane at a time: the input worker and the beat (resend, qwen
 # peer) can type into the same pane, and slices from two messages must never
 # interleave. They share one tmux buffer name too.
 _PANE_TYPE_LOCKS = {}
-# A sliced message takes ~1s under load, so this only trips on a wedged tmux.
-PANE_TYPE_LOCK_WAIT_SEC = 5.0
+# Long enough to outlast the other writer's WHOLE message -- its draw waits
+# plus its submit watch (and their settles) -- or the second writer types into
+# the middle of the first (XERK-1842 QA: an 8s draw wait vs a 5s lock wait
+# spliced two messages). Past it only a wedged tmux holds the lock.
+PANE_TYPE_LOCK_WAIT_SEC = (PASTE_SLICE_DRAWN_DEADLINE_SEC + TYPED_SUBMIT_DEADLINE_SEC
+                           + 2 * TYPED_SUBMIT_SETTLE_SEC + 2.0)
 _PANE_TYPE_LOCKS_GUARD = threading.Lock()
 
 
@@ -14775,12 +14795,32 @@ def _composer_split(cap):
     rules = [i for i, line in enumerate(lines) if _COMPOSER_RULE_RE.match(line)]
     if len(rules) < 2:
         return None
-    strip = lambda part: re.sub(r"\s+", "", "".join(part))
+    strip = lambda part: _composer_norm("".join(part))
     return strip(lines[:rules[-2]]), strip(lines[rules[-2] + 1:rules[-1]])
 
 
+def _composer_norm(text):
+    """Text as compared against the pane: whitespace dropped (the composer
+    wraps), NFC (Claude Code draws e+U+0301 as U+00E9) and format characters
+    dropped (it draws no zero-width space, soft hyphen, BOM or LRM) -- else
+    such a message never reads as drawn (XERK-1842 QA)."""
+    text = unicodedata.normalize("NFC", text or "")
+    return "".join(c for c in text
+                   if not c.isspace() and unicodedata.category(c) != "Cf")
+
+
 def _composer_tail(text):
-    return re.sub(r"\s+", "", text or "")[-COMPOSER_TAIL_CHARS:]
+    return _composer_norm(text)[-COMPOSER_TAIL_CHARS:]
+
+
+def _box_ends_with(box, want):
+    """Does the composer `box` end with `want` (both whitespace-stripped)?
+    Also true when the pane shows less than `want`: the visible box, minus
+    the prompt glyph, is then `want`'s own tail."""
+    if box.endswith(want):
+        return True
+    shown = box[1:] if box.startswith("\u276f") else box
+    return len(shown) >= COMPOSER_MIN_SHOWN_CHARS and want.endswith(shown)
 
 
 def _sent_count(cap, text):
@@ -14804,7 +14844,7 @@ def _composer_state(cap, text, sent_before=None):
     if split is None or not want:
         return None
     above, box = split
-    if box.endswith(want):
+    if _box_ends_with(box, want):
         return "holds"
     if sent_before is not None and above.count(want) > sent_before:
         return "sent"
@@ -14813,6 +14853,22 @@ def _composer_state(cap, text, sent_before=None):
 
 def _composer_holds(cap, text):
     return _composer_state(cap, text) == "holds"
+
+
+def _await_slice_drawn(tmux_name, typed, deadline):
+    """Wait until the composer ends with `typed` (the text typed so far), so
+    the next slice is not read in one burst with this one. False when the
+    composer can't be read or `deadline` (monotonic) passed: stop waiting for
+    the rest of the message."""
+    while True:
+        split = _composer_split(_capture_pane(tmux_name))
+        if split is None:
+            return False
+        if _box_ends_with(split[1], _composer_tail(typed)):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(PASTE_SLICE_DRAWN_POLL_SEC)
 
 
 def _submit_typed(tmux_name, text, press_enter):
@@ -15029,9 +15085,13 @@ def _type_into_tmux_pane(tmux_name, text):
         flags = ["-d", "-p"] if "\n" in text else ["-d"]
     sent = 0
     pasted = True
+    drawn_deadline = time.monotonic() + PASTE_SLICE_DRAWN_DEADLINE_SEC
+    await_drawn = len(slices) > 1
     for n, piece in enumerate(slices):
         if n:
             time.sleep(PASTE_CHUNK_GAP_SEC)   # keep each burst under the paste threshold
+            if await_drawn:
+                await_drawn = _await_slice_drawn(tmux_name, text[:sent], drawn_deadline)
         # The buffer is per-SERVER, so load and paste must address the same one.
         if not run_stdin(_tmux("load-buffer", "-b", buf, "-", name=tmux_name), piece):
             pasted = False
@@ -15517,9 +15577,14 @@ def _pty_inject(tmux_name, text):
     else:
         multiline = "\n" in clean
         slices = [("\x1b[200~" + clean + "\x1b[201~") if multiline else clean]
+    drawn_deadline = time.monotonic() + PASTE_SLICE_DRAWN_DEADLINE_SEC
+    await_drawn = len(slices) > 1
     for n, piece in enumerate(slices):
         if n:
             time.sleep(PASTE_CHUNK_GAP_SEC)   # keep each burst under the paste threshold
+            if await_drawn:
+                await_drawn = _await_slice_drawn(
+                    tmux_name, "".join(slices[:n]), drawn_deadline)
         r = _pty_control(tmux_name, "inject", data=piece)
         if not (r and r.get("ok")) and n:
             # Earlier slices already sit in the composer, where the NEXT
