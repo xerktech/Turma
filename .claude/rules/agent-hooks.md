@@ -451,4 +451,4 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
 - **The judge's one-shot grant is guard.py's ONLY `allow`** (XERK-1566, `consume_grant`, `--grants`):
   the grant contract, the same-uid residual and the judge's gate live in `agent-permissions.md`.
 - **Sub-agent model pin** (`hooks/subagent_model.py`, XERK-1851) — `PreToolUse` over `Agent|Task`,
-  not a safety gate. Rules: `subagent-model-pin.md`.
+  not a safety gate. Rules: `agent-subagent-model.md`.

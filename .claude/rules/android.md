@@ -8,7 +8,7 @@ paths:
 Kotlin + Jetpack Compose, MVVM. Full parity with the web dashboard + glasses client, plus phone-only
 **OS push notifications** (FCM) and **voice**.
 
-**The parity rule itself is in `CLAUDE.md`** ("Cross-cutting contracts"): the mobile web UI
+**The parity rule itself is in `contract-clients.md`**: the mobile web UI
 (`turma/public/`) is the source of truth, and a PR changing user-facing behavior there must carry
 the Android change or add a line to `android/PARITY.md`.
 
