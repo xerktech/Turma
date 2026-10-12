@@ -25,11 +25,14 @@ function main() {
   const baseRaw = V.parseBase(fs.readFileSync(versionFile, "utf8"));
   // For a minor/major the target line is the bumped base; the `bump` job commits
   // the new VERSION separately, but plan must compute against the target line so
-  // nextPatch resets to 0 on it.
-  const base = V.bumpBase(baseRaw, releaseType);
-
+  // nextPatch resets to 0 on it. A patch normally stays on VERSION's line; see
+  // V.patchBase for the one case (a merge that raced a minor/major) it doesn't.
   const tags = git.allTags();
   const prevTag = git.previousReleaseTag(V);
+  const base =
+    releaseType === "patch"
+      ? V.patchBase(baseRaw, prevTag, !!prevTag && git.branchedFromParentOf(prevTag, "HEAD"))
+      : V.bumpBase(baseRaw, releaseType);
   const patch = V.nextPatch(tags, base);
   const version = V.format({ major: base.major, minor: base.minor, patch });
   V.assertStrictlyGreatest({ major: base.major, minor: base.minor, patch }, tags);

@@ -28,3 +28,36 @@ test("run returns '' rather than throwing when stdout is ignored", () => {
 test("run still throws when the command itself fails", () => {
   assert.throws(() => git.run("false", []));
 });
+
+test("branchedFromParentOf: only a sibling of the tagged commit", (t) => {
+  const fs = require("node:fs");
+  const os = require("node:os");
+  const path = require("node:path");
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "git-test-"));
+  const cwd = process.cwd();
+  t.after(() => {
+    process.chdir(cwd);
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+  process.chdir(dir);
+  const g = (...a) => git.run("git", ["-c", "user.name=t", "-c", "user.email=t@t", ...a]);
+  const commit = (m) => g("commit", "-q", "--allow-empty", "-m", m);
+  g("init", "-q");
+  commit("old"); // a pre-bump commit a stale re-run might plan
+  g("tag", "old");
+  commit("dispatched");
+  g("tag", "-a", "-m", "annotated", "dispatched");
+  commit("bump");
+  g("tag", "-a", "-m", "release", "bump");
+  g("checkout", "-q", "dispatched");
+  commit("raced"); // a merge that landed during the release run
+  g("tag", "raced");
+  commit("later");
+  assert.equal(git.branchedFromParentOf("bump", "raced"), true);
+  assert.equal(git.branchedFromParentOf("bump", "old"), false); // stale re-run
+  assert.equal(git.branchedFromParentOf("bump", "dispatched"), false); // stale re-run
+  assert.equal(git.branchedFromParentOf("dispatched", "bump"), false); // tag is an ancestor
+  assert.equal(git.branchedFromParentOf("bump", "HEAD"), true);
+  assert.equal(git.branchedFromParentOf("old", "HEAD"), false); // tag on a root commit
+  assert.throws(() => git.branchedFromParentOf("bump", "no-such-ref"));
+});

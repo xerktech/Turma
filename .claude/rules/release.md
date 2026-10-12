@@ -108,6 +108,12 @@ paths:
   - Its only bypass actor is **deploy keys**: `bump` pushes `VERSION`/`CHANGELOG` straight to main
     with `RELEASE_BUMP_DEPLOY_KEY`, after the release's own code-scan passed.
   - A repository ruleset cannot name GitHub Actions as a bypass actor (422), hence the key.
+  - A bump push that loses a race with main MERGES the bump commit onto the new main and retries
+    (3 attempts); the tag and builds stay on the bump commit itself. Never rebase it onto the new
+    main: that ships commits this release's code-scan never ran on.
+  - The racing merge's own queued patch run still has the old VERSION; `plan.js` moves it onto the
+    newest tag's line only when it is a SIBLING of the tagged bump commit (`branchedFromParentOf`),
+    so a hand-edited VERSION or a re-run of a pre-bump commit still fails `assertStrictlyGreatest`.
   - The bypass is by actor TYPE: never add another write deploy key to this repo.
   - The key lives in the `release-bump` Environment (main-only), never as a repo secret — same
     reasoning as `ARGOCD_DEPLOY_KEY`.

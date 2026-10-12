@@ -82,3 +82,17 @@ test("assertStrictlyGreatest rejects a regression against legacy namespaces", ()
   // 0.2.0 is below the published glasses 0.2.32 -> the bug the cutover avoids
   assert.throws(() => V.assertStrictlyGreatest({ major: 0, minor: 2, patch: 0 }, ["glasses-v0.2.32"]));
 });
+
+test("patchBase: a merge that raced a minor/major adopts the new line", () => {
+  const base = { major: 1, minor: 2 };
+  // v1.3.0 was tagged on a sibling bump commit of this merge.
+  assert.deepEqual(V.patchBase(base, "v1.3.0", true), { major: 1, minor: 3 });
+  // Never moves the line down, and a non-sibling never moves it at all (a bad
+  // VERSION edit or a stale re-run must still fail assertStrictlyGreatest).
+  assert.deepEqual(V.patchBase(base, "v1.2.7", true), base);
+  assert.deepEqual(V.patchBase(base, "", true), base);
+  assert.deepEqual(V.patchBase(base, "v1.3.0", false), base);
+  const raced = V.patchBase(base, "v1.3.0", true);
+  assert.equal(V.nextPatch(["v1.2.7", "v1.3.0"], raced), 1);
+  assert.doesNotThrow(() => V.assertStrictlyGreatest({ ...raced, patch: 1 }, ["v1.2.7", "v1.3.0"]));
+});
