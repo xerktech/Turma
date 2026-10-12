@@ -4,8 +4,8 @@ import com.xerktech.turma.model.ModelQualityGroup
 import com.xerktech.turma.model.ModelQualityPr
 import com.xerktech.turma.model.ModelQualityRework
 import com.xerktech.turma.model.ModelQualityShadow
-import com.xerktech.turma.model.ModelQualityView
 import com.xerktech.turma.model.TurmaJson
+import com.xerktech.turma.model.parseModelQuality
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
@@ -63,15 +63,37 @@ class ModelQualityTest {
     }
 
     @Test fun `the hub's answer decodes, no-change included, extra fields ignored`() {
-        val v = TurmaJson.decodeFromString<ModelQualityView>(
+        val v = parseModelQuality(TurmaJson.parseToJsonElement(
             """{"windowDays":90,"groups":[{"cls":"bug","model":"opus","sessions":3,"good":1,"bad":1,"pending":0,
               "no-change":1,"undelivered":0,"reasons":{"reopened":1},"future":true}],
               "rows":[{"key":"x","site":"s","issue":"A-1","host":"h","sid":"s1","cls":"bug","model":"opus",
               "firstSeen":1,"updatedAt":2.5,"outcome":"bad","reason":"reopened",
-              "prs":[{"url":"https://x/pull/1","state":"MERGED","mergedAt":3}]}]}""")
+              "prs":[{"url":"https://x/pull/1","state":"MERGED","mergedAt":3}]}]}"""))
         assertEquals(1, v.groups[0].noChange)
         assertEquals("1 no change", ModelQuality.other(v.groups[0]))
         assertEquals("A-1", v.rows[0].issue)
         assertEquals(1, v.rows[0].prs.size)
+    }
+
+    @Test fun `a wrong-typed field drops to its default instead of failing the card`() {
+        val v = parseModelQuality(TurmaJson.parseToJsonElement(
+            """{"windowDays":90.5,"groups":[null,{"cls":"bug","model":"sonnet","sessions":1.5,"good":3000000000,
+              "promotion":{"x":1},"rework":{"qaPasses":"n/a","ciRounds":2},"reasons":{"x":null}}],
+              "rows":[null,{"issue":"A-1","updatedAt":"x","prs":[null]}]}"""))
+        assertEquals(90, v.windowDays)
+        val g = v.groups.single()
+        assertEquals(1, g.sessions)
+        assertEquals(Int.MAX_VALUE, g.good)
+        assertNull(g.promotion)
+        assertNull(g.rework?.qaPasses)
+        assertEquals(2.0, g.rework?.ciRounds!!, 0.0)
+        assertEquals(mapOf("x" to 0), g.reasons)
+        assertNull(v.rows.single().updatedAt)
+        assertTrue(v.rows.single().prs.isEmpty())
+        assertEquals(0, parseModelQuality(TurmaJson.parseToJsonElement("[1]")).groups.size)
+    }
+
+    @Test fun `rework with no figures adds no column, as on the web`() {
+        assertFalse(ModelQuality.hasRework(listOf(g("bug", "sonnet").copy(rework = ModelQualityRework()))))
     }
 }

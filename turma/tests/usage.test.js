@@ -104,7 +104,8 @@ function loadHelpers(fetchReply = null) {
     console, Date, Math, JSON, encodeURIComponent, decodeURIComponent,
     parseInt, parseFloat, isNaN, Number, String, Object, Array, Map, Set,
     addEventListener: noop, removeEventListener: noop,
-    TurmaNav: { preserveScroll: (el, paint) => { scrollCalls.push(el); paint(); } },
+    TurmaNav: { preserveScroll: (el, paint) => { scrollCalls.push(el); paint(); },
+      refusalText: (what, status, body) => (body && typeof body.error === "string" && body.error) || `the hub answered HTTP ${status}` },
     // Indirected through `orgFilter` so a test can narrow the page the way the
     // header's org control does, and check what each section was rendered from.
     TurmaOrg: { get: () => (orgKeys.length === 1 ? orgKeys[0] : ""), getKeys: () => (orgHooks ? orgHooks.getKeys() : orgKeys),
@@ -1683,13 +1684,14 @@ test("XERK-1849: rework and shadow columns appear only once the hub serves them"
 
 test("XERK-1849: session rows show only for one org, escaped, PR links http only", () => {
   const view = { groups: [mqG({ sessions: 1, bad: 1 })], rows: [{ issue: "A-1", cls: "bug", model: "opus",
-    outcome: "bad", reason: "reopened", host: "<b>h</b>", updatedAt: MQ_NOW - 3600e3,
+    outcome: "bad", reason: "reopened", host: "<b>h</b>", repo: "<i>r</i>", updatedAt: MQ_NOW - 3600e3,
     prs: [{ url: "https://github.com/a/b/pull/7", state: "MERGED" }, { url: "javascript:alert(1)" }] }] };
   assert.match(H.modelQualityCardHtml(view, MQ_NOW, ""), /Pick one org in the header/);
   const html = H.modelQualityCardHtml(view, MQ_NOW, "acme.atlassian.net", true);
   assert.match(html, /<details class="table-view mq-rows-view" open>/);
   assert.match(html, /mq-outcome o-bad/);
   assert.match(html, /&lt;b&gt;h&lt;\/b&gt;/);
+  assert.match(html, /&lt;i&gt;r&lt;\/i&gt;/);
   assert.match(html, /href="https:\/\/github.com\/a\/b\/pull\/7"[^>]*>#7<\/a> merged/);
   assert.doesNotMatch(html, /javascript:/);
 });
@@ -1711,5 +1713,69 @@ test("XERK-1849: the card asks for rows only when exactly one org applies", asyn
 test("XERK-1849: a failed first read says why rather than loading forever", async () => {
   const H7 = loadHelpers(Object.assign(() => ({}), { httpStatus: (u) => (u.includes("model-quality") ? 503 : 0) }));
   await H7.refreshModelQuality();
-  assert.match(H7.els.modelQuality.innerHTML, /Could not load model quality \(HTTP 503\)/);
+  assert.match(H7.els.modelQuality.innerHTML, /Could not load model quality \(the hub answered HTTP 503\)/);
+});
+
+// fetchReply may return a Promise: a deferred answer lets a test land replies out of order.
+test("XERK-1849: a late answer for an org the operator left is discarded", async () => {
+  const saved = orgKeys;
+  const pending = new Map();
+  try {
+    orgKeys = ["acme"];
+    const H8 = loadHelpers((u) => new Promise((res) => pending.set(u.includes("acme") ? "acme" : "rival", res)));
+    const first = H8.refreshModelQuality();
+    orgKeys = ["rival"];
+    const second = H8.refreshModelQuality();
+    await new Promise((r) => setImmediate(r));   // both reads reach their json()
+    pending.get("rival")({ groups: [], rows: [{ issue: "R-1" }] });
+    await second;
+    pending.get("acme")({ groups: [], rows: [{ issue: "A-1" }] });
+    await first;
+    assert.deepEqual(H8.getMqView().rows.map((r) => r.issue), ["R-1"]);
+  } finally { orgKeys = saved; }
+});
+
+test("XERK-1849: a pick change drops the old org's rows and error at once", async () => {
+  const saved = orgKeys;
+  try {
+    orgKeys = ["acme"];
+    let hang = false;
+    const H9 = loadHelpers(Object.assign((u) => (hang ? new Promise(() => {}) : { groups: [mqG({ sessions: 1 })], rows: [{ issue: "A-1" }] }),
+      { httpStatus: (u) => (u.includes("org=bad") ? 500 : 0) }));
+    await H9.refreshModelQuality();
+    assert.match(H9.els.modelQuality.innerHTML, /A-1/);
+    hang = true;
+    orgKeys = ["rival"];
+    H9.refreshModelQuality();
+    assert.doesNotMatch(H9.els.modelQuality.innerHTML, /A-1/);
+    assert.match(H9.els.modelQuality.innerHTML, /Loading…/);
+    orgKeys = ["bad"];
+    await H9.refreshModelQuality();
+    assert.match(H9.els.modelQuality.innerHTML, /Could not load/);
+    orgKeys = ["rival"];
+    H9.refreshModelQuality();
+    assert.doesNotMatch(H9.els.modelQuality.innerHTML, /Could not load/);
+  } finally { orgKeys = saved; }
+});
+
+test("XERK-1849: a failed refresh keeps that org's view; rework with no figures adds no column", async () => {
+  const saved = orgKeys;
+  try {
+    orgKeys = ["acme"];
+    let fail = false;
+    const H10 = loadHelpers(Object.assign(() => ({ groups: [mqG({ sessions: 1, rework: {} })], rows: [{ issue: "A-1" }] }),
+      { httpStatus: () => (fail ? 500 : 0) }));
+    await H10.refreshModelQuality();
+    fail = true;
+    await H10.refreshModelQuality();
+    assert.match(H10.els.modelQuality.innerHTML, /A-1/);
+    assert.doesNotMatch(H10.els.modelQuality.innerHTML, /QA passes/);
+  } finally { orgKeys = saved; }
+});
+
+test("XERK-1849: an outcome named like an Object member reads pending", () => {
+  const html = H.modelQualityCardHtml({ groups: [mqG({ sessions: 1 })], rows: [{ issue: "A-1", outcome: "constructor" }] },
+    MQ_NOW, "acme", true);
+  assert.match(html, /mq-outcome o-pending/);
+  assert.doesNotMatch(html, /native code/);
 });

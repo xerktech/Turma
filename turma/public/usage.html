@@ -1146,7 +1146,7 @@ function renderInner(data) {
   // against the sites this data names), so the permission card's org scope is
   // settled here — its first fetch included.
   syncPermissionsScope();
-  syncModelQualityScope();
+  syncModelQualityScope(data.agents);
   TurmaNewTicket.update(data);
   // Live hosts PLUS the usage of hosts the hub no longer has (XERK-338), which
   // is the only place a deleted, pruned or wiped host's spend still exists. They
@@ -1970,6 +1970,11 @@ let mqFetchSeq = 0;
 let mqScoped = false;
 let mqFetchedOrg = null;
 let mqViewOrg = null;
+// The org the card's current state (view OR error) belongs to — a pick change
+// clears either at once, so neither another org's rows nor its error lingers.
+let mqStateOrg = null;
+// The header's display name per siteKey (the site's own orgName when it has one).
+let mqOrgNames = new Map();
 let mqPainted = null;
 let mqRowsOpen = false;
 
@@ -1994,6 +1999,7 @@ function mqMedian(v) {
   return typeof v === "number" && Number.isFinite(v) && v >= 0 ? String(Math.round(v * 10) / 10) : "—";
 }
 function mqRework(g) { return g.rework && typeof g.rework === "object" ? g.rework : {}; }
+function mqFinite(v) { return typeof v === "number" && Number.isFinite(v); }
 // Shadow pairs (XERK-1847): graded pairs, and how many the candidate lost to Opus.
 function mqShadow(g) {
   const s = g.shadow && typeof g.shadow === "object" ? g.shadow : null;
@@ -2010,7 +2016,7 @@ function mqStatus(g) {
 // is left off rather than shown as a column of dashes.
 function mqColumns(groups) {
   return {
-    rework: groups.some((g) => Object.keys(mqRework(g)).length),
+    rework: groups.some((g) => mqFinite(mqRework(g).qaPasses) || mqFinite(mqRework(g).ciRounds)),
     shadow: groups.some((g) => g.shadow && typeof g.shadow === "object"),
   };
 }
@@ -2087,10 +2093,10 @@ function mqSessionsHtml(view, now, org, rowsOpen) {
     return `<div class="note perm-foot">Pick one org in the header to list its sessions.</div>`;
   }
   const list = (Array.isArray(view.rows) ? view.rows : []).filter((r) => r && typeof r === "object");
-  const name = TurmaBoard.orgName ? TurmaBoard.orgName(org) : org;
+  const name = mqOrgNames.get(org) || (TurmaBoard.orgName ? TurmaBoard.orgName(org) : org);
   if (!list.length) return `<div class="note perm-foot">No ticket sessions recorded for ${esc(name)}.</div>`;
   const items = list.map((r) => {
-    const outcome = MQ_OUTCOME_LABEL[r.outcome] ? r.outcome : "pending";
+    const outcome = Object.hasOwn(MQ_OUTCOME_LABEL, r.outcome) ? r.outcome : "pending";
     const at = permNum(r.updatedAt);
     const span = (t) => (t ? `<span class="meta">${esc(t)}</span>` : "");
     const prs = mqPrLinks(r.prs);
@@ -2111,8 +2117,11 @@ function paintModelQuality() {
   TurmaNav.preserveScroll($mq, () => { $mq.innerHTML = html; });
 }
 
-function syncModelQualityScope() {
+function syncModelQualityScope(agents) {
   mqScoped = true;
+  if (TurmaBoard.mergeSites && Array.isArray(agents)) {
+    mqOrgNames = new Map(TurmaBoard.mergeSites(agents).map((s) => [s.siteKey, TurmaBoard.orgName(s.siteKey, s.orgName)]));
+  }
   if (mqOrg() !== mqFetchedOrg) refreshModelQuality();
 }
 
@@ -2122,11 +2131,13 @@ async function refreshModelQuality() {
   mqFetchedOrg = org;
   const q = new URLSearchParams();
   if (org) { q.set("org", org); q.set("rows", "1"); }
-  // Another org's rows are never shown under the new pick, not even while it loads.
-  if (mqView && mqViewOrg !== org) {
+  // Another org's rows — or its error — are never shown under the new pick,
+  // not even while it loads.
+  if (mqStateOrg !== org) {
     mqView = null;
     mqViewOrg = null;
     mqLoadError = null;
+    mqStateOrg = null;
     paintModelQuality();
   }
   const failed = (why) => {
@@ -2135,15 +2146,18 @@ async function refreshModelQuality() {
     mqView = null;
     mqViewOrg = null;
     mqLoadError = why;
+    mqStateOrg = org;
     paintModelQuality();
   };
   try {
     const r = await fetch("/api/model-quality" + (org ? "?" + q.toString() : ""));
-    if (!r.ok) return failed(`HTTP ${r.status}`);
+    // The hub's own words when it sent them (XERK-264), worded as Android's.
+    if (!r.ok) return failed(TurmaNav.refusalText("", r.status, await r.json().catch(() => null)));
     const body = await r.json();
     if (seq !== mqFetchSeq) return;
     mqView = body;
     mqViewOrg = org;
+    mqStateOrg = org;
     mqLoadError = null;
     paintModelQuality();
   } catch { failed("no readable answer from the hub"); }

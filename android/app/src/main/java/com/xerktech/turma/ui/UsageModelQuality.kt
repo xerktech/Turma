@@ -32,7 +32,6 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.xerktech.turma.core.ModelQuality
 import com.xerktech.turma.core.Permissions
-import com.xerktech.turma.core.orgName
 import com.xerktech.turma.model.ModelQualityGroup
 import com.xerktech.turma.model.ModelQualityRow
 import com.xerktech.turma.ui.theme.TurmaColors
@@ -78,9 +77,9 @@ internal fun ModelQualitySection(
             if (ui.org.isEmpty()) {
                 Text(ModelQuality.PICK_ORG, color = muted, modifier = Modifier.padding(top = 12.dp))
             } else if (view.rows.isEmpty()) {
-                Text("No ticket sessions recorded for ${orgName(ui.org)}.", color = muted, modifier = Modifier.padding(top = 12.dp))
+                Text("No ticket sessions recorded for ${ui.orgLabel.ifEmpty { ui.org }}.", color = muted, modifier = Modifier.padding(top = 12.dp))
             } else {
-                SessionRows(orgName(ui.org), view.rows, nowMs, rowsOpen) { rowsOpen = it }
+                SessionRows(ui.orgLabel.ifEmpty { ui.org }, view.rows, nowMs, rowsOpen) { rowsOpen = it }
             }
         }
     }

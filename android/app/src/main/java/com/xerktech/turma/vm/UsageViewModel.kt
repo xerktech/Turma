@@ -9,6 +9,9 @@ import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.ModelQuality
 import com.xerktech.turma.core.Permissions
 import com.xerktech.turma.model.ModelQualityView
+import com.xerktech.turma.model.parseModelQuality
+import com.xerktech.turma.core.mergeSites
+import com.xerktech.turma.core.orgName
 import com.xerktech.turma.model.PermissionSummary
 import com.xerktech.turma.model.UsageBucket
 import com.xerktech.turma.model.UsageInfo
@@ -144,6 +147,8 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     data class ModelQualityUi(
         val view: ModelQualityView? = null,
         val org: String = "",
+        /** [org] as the header names it (the site's own orgName when it has one). */
+        val orgLabel: String = "",
         val error: String? = null,
         val at: Long = 0L,
     )
@@ -154,6 +159,9 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
     private val mqSeq = AtomicInteger()
     @Volatile private var mqFetchedOrg: String? = null
     @Volatile private var mqStateOrg: String? = null
+    @Volatile private var mqNames: Map<String, String> = emptyMap()
+
+    private fun labelOf(org: String) = if (org.isEmpty()) "" else mqNames[org] ?: orgName(org)
 
     /**
      * Keep the card fetched while the screen shows it (web `syncModelQualityScope`):
@@ -166,7 +174,10 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         launch {
             combine(container.fleet.state, container.org.stored) { f, o -> f to o }
                 .collect { (f, o) ->
-                    if (f.polled) syncModelQuality(Permissions.scope(f.agents, o).singleOrNull().orEmpty())
+                    if (f.polled) {
+                        mqNames = mergeSites(f.agents).associate { it.siteKey to orgName(it.siteKey, it.orgName) }
+                        syncModelQuality(Permissions.scope(f.agents, o).singleOrNull().orEmpty())
+                    }
                     else if (f.error != null && mqStateOrg == null)
                         _modelQuality.value = ModelQualityUi(error = f.error)
                 }
@@ -192,24 +203,25 @@ class UsageViewModel(app: Application) : AndroidViewModel(app) {
         mqFetchedOrg = org
         if (mqStateOrg != org) {
             mqStateOrg = null
-            _modelQuality.value = ModelQualityUi(org = org)
+            _modelQuality.value = ModelQualityUi(org = org, orgLabel = labelOf(org))
         }
         return viewModelScope.launch {
             val resp = runCatching {
                 container.client.api.modelQuality(org.ifEmpty { null }, if (org.isEmpty()) null else 1)
             }.getOrNull()
-            val body = resp?.takeIf { it.isSuccessful }?.body()
+            val body = resp?.takeIf { it.isSuccessful }?.body()?.let(::parseModelQuality)
             if (seq != mqSeq.get()) return@launch
             if (body != null) {
                 mqStateOrg = org
-                _modelQuality.value = ModelQualityUi(view = body, org = org, at = System.currentTimeMillis())
+                _modelQuality.value = ModelQualityUi(view = body, org = org, orgLabel = labelOf(org),
+                    at = System.currentTimeMillis())
                 return@launch
             }
             if (_modelQuality.value.view != null && mqStateOrg == org) return@launch
             val why = if (resp != null && !resp.isSuccessful) hubErrorMessage(resp)
                       else "no readable answer from the hub"
             mqStateOrg = org
-            _modelQuality.value = ModelQualityUi(org = org, error = why)
+            _modelQuality.value = ModelQualityUi(org = org, orgLabel = labelOf(org), error = why)
         }
     }
 

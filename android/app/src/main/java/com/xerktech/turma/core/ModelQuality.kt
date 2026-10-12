@@ -75,7 +75,9 @@ object ModelQuality {
     ).joinToString(" · ")
 
     /** Whether any group carries rework / shadow figures (web `mqColumns`). */
-    fun hasRework(groups: List<ModelQualityGroup>) = groups.any { it.rework != null }
+    fun hasRework(groups: List<ModelQualityGroup>) = groups.any { g ->
+        g.rework?.let { it.qaPasses != null || it.ciRounds != null } == true
+    }
     fun hasShadow(groups: List<ModelQualityGroup>) = groups.any { it.shadow != null }
 
     /** Classes by total sessions, Opus first inside each, then by sessions (web `mqOrdered`). */

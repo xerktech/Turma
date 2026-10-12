@@ -1,7 +1,10 @@
 package com.xerktech.turma.model
 
-import kotlinx.serialization.SerialName
-import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.doubleOrNull
 
 /**
  * `GET /api/model-quality` (XERK-1839): per (work class, model) how ticket
@@ -9,19 +12,18 @@ import kotlinx.serialization.Serializable
  * `rows=1` — that org's newest per-session [rows]. Web twin: usage.html's
  * "Model quality" card (`modelQualityCardHtml`, XERK-1849).
  *
- * Decoded on ITS OWN call, never inside the atomic `/api/agents` decode. Every
- * field is optional with a default and every count/time is lenient (`Double`
- * for times), so an older or newer hub still decodes. [rework], [shadow] and
- * [promotion] are served once XERK-1845/1847/1848 ship; absent until then.
+ * Read on ITS OWN call, never inside the atomic `/api/agents` decode, and read
+ * FIELD BY FIELD ([parse]) rather than decoded: a wrong-typed field (a later
+ * seam's shape, a null element) drops to its default, as the web treats it,
+ * instead of failing the whole card. [rework], [shadow] and [promotion] are
+ * served once XERK-1845/1847/1848 ship; absent until then.
  */
-@Serializable
 data class ModelQualityView(
     val windowDays: Int = 0,
     val groups: List<ModelQualityGroup> = emptyList(),
     val rows: List<ModelQualityRow> = emptyList(),
 )
 
-@Serializable
 data class ModelQualityGroup(
     val cls: String = "",
     val model: String = "",
@@ -29,7 +31,7 @@ data class ModelQualityGroup(
     val good: Int = 0,
     val bad: Int = 0,
     val pending: Int = 0,
-    @SerialName("no-change") val noChange: Int = 0,
+    val noChange: Int = 0,
     val undelivered: Int = 0,
     /** Why the bad sessions were bad: reason → count. */
     val reasons: Map<String, Int> = emptyMap(),
@@ -39,21 +41,18 @@ data class ModelQualityGroup(
 )
 
 /** Rework medians per session (XERK-1845). */
-@Serializable
 data class ModelQualityRework(
     val qaPasses: Double? = null,
     val ciRounds: Double? = null,
 )
 
 /** Graded shadow pairs (XERK-1847), and how many the candidate lost to Opus. */
-@Serializable
 data class ModelQualityShadow(
     val pairs: Int = 0,
     val candidateOnlyBad: Int = 0,
 )
 
 /** One ticket session of the named org. */
-@Serializable
 data class ModelQualityRow(
     val issue: String = "",
     val host: String = "",
@@ -66,8 +65,56 @@ data class ModelQualityRow(
     val prs: List<ModelQualityPr> = emptyList(),
 )
 
-@Serializable
 data class ModelQualityPr(
     val url: String = "",
     val state: String? = null,
+)
+
+// ---- the lenient reader -------------------------------------------------------
+
+private fun JsonElement?.obj() = this as? JsonObject
+private fun JsonElement?.list() = (this as? JsonArray).orEmpty()
+private fun JsonElement?.str(): String? = (this as? JsonPrimitive)?.takeIf { it.isString }?.content
+private fun JsonElement?.num(): Double? =
+    (this as? JsonPrimitive)?.takeIf { !it.isString }?.doubleOrNull?.takeIf { it.isFinite() }
+/** A non-negative count, clamped to Int; anything else reads 0. */
+private fun JsonElement?.count(): Int = num()?.takeIf { it >= 0 }?.coerceAtMost(Int.MAX_VALUE.toDouble())?.toInt() ?: 0
+
+/** The route's answer, every field read leniently (web `modelQualityCardHtml`'s guards). */
+fun parseModelQuality(e: JsonElement?): ModelQualityView {
+    val o = e.obj() ?: return ModelQualityView()
+    return ModelQualityView(
+        windowDays = o["windowDays"].count(),
+        groups = o["groups"].list().mapNotNull { it.obj()?.let(::parseGroup) },
+        rows = o["rows"].list().mapNotNull { it.obj()?.let(::parseRow) },
+    )
+}
+
+private fun parseGroup(g: JsonObject) = ModelQualityGroup(
+    cls = g["cls"].str().orEmpty(),
+    model = g["model"].str().orEmpty(),
+    sessions = g["sessions"].count(),
+    good = g["good"].count(),
+    bad = g["bad"].count(),
+    pending = g["pending"].count(),
+    noChange = g["no-change"].count(),
+    undelivered = g["undelivered"].count(),
+    reasons = g["reasons"].obj()?.mapValues { it.value.count() }.orEmpty(),
+    rework = g["rework"].obj()?.let { ModelQualityRework(it["qaPasses"].num(), it["ciRounds"].num()) },
+    shadow = g["shadow"].obj()?.let { ModelQualityShadow(it["pairs"].count(), it["candidateOnlyBad"].count()) },
+    promotion = g["promotion"].str(),
+)
+
+private fun parseRow(r: JsonObject) = ModelQualityRow(
+    issue = r["issue"].str().orEmpty(),
+    host = r["host"].str().orEmpty(),
+    repo = r["repo"].str(),
+    cls = r["cls"].str().orEmpty(),
+    model = r["model"].str().orEmpty(),
+    outcome = r["outcome"].str().orEmpty(),
+    reason = r["reason"].str(),
+    updatedAt = r["updatedAt"].num(),
+    prs = r["prs"].list().mapNotNull { p ->
+        p.obj()?.let { ModelQualityPr(it["url"].str().orEmpty(), it["state"].str()) }
+    },
 )

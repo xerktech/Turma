@@ -434,12 +434,13 @@ interface HubApi {
 
     // The outcome ledger's report (XERK-1839): per (work class, model) outcome
     // counts, fleet-wide. `org` + `rows=1` adds that ONE org's session rows; both
-    // null = groups only. Its own call, never the atomic /api/agents decode.
+    // null = groups only. Its own call, never the atomic /api/agents decode; raw
+    // JSON, read leniently by `parseModelQuality`.
     @GET("api/model-quality")
     suspend fun modelQuality(
         @Query("org") org: String?,
         @Query("rows") rows: Int?,
-    ): Response<com.xerktech.turma.model.ModelQualityView>
+    ): Response<kotlinx.serialization.json.JsonElement>
 
     // Flip an org's auto-start opt-in (XERK-41). Hub-owned durable state, so —
     // like the agent pin — an authoritative 200. Body: {enabled:true|false}.

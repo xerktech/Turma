@@ -90,4 +90,10 @@ This file is the operative rules for what has shipped.
   not a column of dashes): per group `rework: {qaPasses, ciRounds}` medians (XERK-1845),
   `shadow: {pairs, candidateOnlyBad}` (XERK-1847), `promotion` string (XERK-1848). A seam that
   names them differently must change both clients in the same PR.
-- Tests: the `XERK-1849:` cases in `usage.test.js`; android `ModelQualityTest`.
+- **Android reads the route field by field** (`parseModelQuality` over a raw `JsonElement`), not
+  a typed decode: one wrong-typed field from a later seam drops to its default, as on the web,
+  instead of blanking the card.
+- **A pick change clears the old org's view AND error at once**, and a late answer for a scope
+  since left is discarded (`mqStateOrg`/`mqFetchSeq`; Android `mqStateOrg`/`mqSeq`).
+- Tests: the `XERK-1849:` cases in `usage.test.js`; android `ModelQualityTest`,
+  `UsageModelQualityViewModelTest`, `ModelQualitySectionTest`.
