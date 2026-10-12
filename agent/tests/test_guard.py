@@ -6231,9 +6231,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
     def test_multicall_names_scan_linearly(self):
         # Unanchored, each `-busybox` in one long word started a match that ran to
         # its end: 1 MB took 945s in the hook, past its timeout (which runs it).
-        # Glued to `=`, a wrapper is a value: each `A=env` began a command start
-        # whose assignment loop ran to the line's end (main too, via `env`).
-        for text in (": a" + "-busybox" * 20000, "A=env " * 20000, "A=busybox " * 20000):
+        # Glued to other text, a wrapper is part of a word: each `A=env`/`A=:env`
+        # began a command start whose assignment loop ran to the line's end.
+        for text in (": a" + "-busybox" * 20000, "A=env " * 20000, "A=busybox " * 20000,
+                     "A=:busybox " * 20000, "A=x,toybox " * 20000, "A=-env " * 20000,
+                     "A=/env " * 20000):
             for name in ("_RUNS_UNNAMED_RE", "_C_OR_EVAL_RE", "_UNREAD_SINK_SHELL_RE"):
                 with self.subTest(regex=name, text=text[:12]):
                     start = time.process_time()
