@@ -13229,6 +13229,15 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
         sm.send_input(sess["id"], "\tindented\ta")
         self.assertEqual(self.run_stdin_calls[0][1], "    indented    a")
 
+    def test_the_typing_cap_counts_tabs_as_typed(self):
+        # XERK-1701: 2000 tabs are 8000 typed chars, past the cap, so they go
+        # as ONE paste instead of 20 typed slices (each a tmux call).
+        sm = self.make_manager()
+        sess = self._running_session(sm)
+        sm.send_input(sess["id"], "x" + "\t" * 2000)
+        self.assertEqual(len(self.run_stdin_calls), 1)
+        self.assertEqual(self.run_stdin_calls[0][1], "x" + "\t" * 2000)
+
     def test_a_slice_never_starts_on_a_combining_mark(self):
         n = ha.PASTE_CHUNK_CHARS
         text = "a" * (n - 1) + "e\u0301" + "b" * 10
@@ -13258,6 +13267,48 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
             for t in ts:
                 t.join()
         self.assertEqual(sorted(self._typed()), msgs)
+        # XERK-1701: the last writer out drops the pane's lock entry.
+        self.assertNotIn("agent-abcde", ha._PANE_TYPE_LOCKS)
+
+    def test_a_pane_lock_lives_only_while_a_writer_uses_it(self):
+        # XERK-1701: the map kept a lock for every tmux name ever typed into.
+        # A writer still waiting on the lock keeps the entry, so it never gets
+        # a second, fresh lock while the first holder is typing.
+        sm = self.make_manager()
+        self._running_session(sm)
+        seen = []
+        def stdin(cmd, data, timeout=None):
+            e = ha._PANE_TYPE_LOCKS.get("agent-abcde")
+            seen.append(e and (e[0].locked(), e[1]))
+            self.pane_io.append(data)
+            return True
+        long = "x" * (ha.PASTE_CHUNK_CHARS * 2)
+        with mock.patch.object(ha, "run_stdin", side_effect=stdin), \
+                mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
+            ha._type_into_pane("agent-abcde", long)
+        self.assertEqual(seen[0], (True, 1))
+        self.assertNotIn("agent-abcde", ha._PANE_TYPE_LOCKS)
+        held = threading.Event()
+        go = threading.Event()
+        def blocking(cmd, data, timeout=None):
+            held.set()
+            go.wait(5)
+            return True
+        with mock.patch.object(ha, "run_stdin", side_effect=blocking), \
+                mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
+            a = threading.Thread(target=ha._type_into_pane, args=("agent-abcde", long))
+            a.start()
+            held.wait(5)
+            b = threading.Thread(target=ha._type_into_pane, args=("agent-abcde", long))
+            b.start()
+            deadline = time.time() + 5
+            while ha._PANE_TYPE_LOCKS["agent-abcde"][1] < 2 and time.time() < deadline:
+                time.sleep(0.01)
+            self.assertEqual(ha._PANE_TYPE_LOCKS["agent-abcde"][1], 2)
+            go.set()
+            a.join(10)
+            b.join(10)
+        self.assertNotIn("agent-abcde", ha._PANE_TYPE_LOCKS)
 
     def _typed(self):
         out, cur = [], []
@@ -13269,6 +13320,47 @@ class TestSendInput(ManagerMixin, unittest.TestCase):
             else:
                 cur.append(item)
         return out
+
+    def test_a_writer_arriving_while_another_waits_shares_its_lock(self):
+        # XERK-1701: the entry must outlive the FIRST writer while a second is
+        # still waiting on it, or a third gets a fresh lock and types beside
+        # the second (the race that withdrew the first prune).
+        sm = self.make_manager()
+        self._running_session(sm)
+        entered, gates = [], {n: threading.Event() for n in "ABC"}
+        def stdin(cmd, data, timeout=None):
+            me = threading.current_thread().name
+            if me not in entered:
+                entered.append(me)
+            gates[me].wait(5)
+            return True
+        long = "x" * (ha.PASTE_CHUNK_CHARS * 2)
+        def writer(n):
+            return threading.Thread(target=ha._type_into_pane, name=n,
+                                    args=("agent-abcde", long))
+        def until(pred):
+            deadline = time.time() + 5
+            while not pred() and time.time() < deadline:
+                time.sleep(0.01)
+        with mock.patch.object(ha, "run_stdin", side_effect=stdin), \
+                mock.patch.object(ha, "PASTE_CHUNK_GAP_SEC", 0):
+            ts = {n: writer(n) for n in "ABC"}
+            ts["A"].start()
+            until(lambda: entered == ["A"])
+            ts["B"].start()
+            until(lambda: ha._PANE_TYPE_LOCKS["agent-abcde"][1] == 2)
+            gates["A"].set()
+            until(lambda: entered == ["A", "B"])
+            ts["C"].start()
+            time.sleep(0.2)
+            self.assertEqual(entered, ["A", "B"])    # C waits behind B
+            gates["B"].set()
+            until(lambda: entered == ["A", "B", "C"])
+            gates["C"].set()
+            for t in ts.values():
+                t.join(10)
+        self.assertEqual(entered, ["A", "B", "C"])
+        self.assertNotIn("agent-abcde", ha._PANE_TYPE_LOCKS)
 
     def test_a_paste_failing_midway_types_only_the_rest(self):
         # Slices already in the composer must not be typed a second time by the
@@ -39165,6 +39257,20 @@ class TestWindowsTerminalBackend(unittest.TestCase):
              mock.patch.object(ha, "_pty_inject", return_value=True) as inj:
             self.assertTrue(ha._type_into_pane("agent-x", "hello"))
         inj.assert_called_once_with("agent-x", "hello")
+
+    def test_pty_inject_counts_tabs_as_typed_for_the_cap(self):
+        # XERK-1701: the cap is judged after tabs become 4 spaces, as on tmux.
+        calls = []
+
+        def fake_control(name, op, **kw):
+            calls.append(kw.get("data"))
+            return {"ok": True}
+
+        with mock.patch.object(ha, "_pty_control", side_effect=fake_control), \
+             mock.patch.object(ha.time, "sleep"), \
+             mock.patch.object(ha, "_capture_pane", return_value="submitted"):
+            self.assertTrue(ha._pty_inject("agent-x", "\t" * 2000))
+        self.assertEqual(calls, ["\t" * 2000, "\r"])
 
     def test_pty_inject_sends_a_bracketed_paste_then_enter(self):
         calls = []
