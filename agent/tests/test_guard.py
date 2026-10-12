@@ -6219,7 +6219,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # rule only knew it when busybox itself was the shell word.
         for cmd in ("echo 'rm -rf /etc' > a.sh; cat a.sh | busybox sh",
                     "echo 'rm -rf /etc' > b.sh; cat b.sh | toybox-x86_64 sh",
-                    "shopt -s nullglob; echo x | toybox-x86_64 sh"):
+                    "shopt -s nullglob; echo x | toybox-x86_64 sh",
+                    "echo 'rm -rf /etc' > c.sh; cat c.sh | busybox+x sh"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         for cmd in ("echo hi | busybox sh", "cat notes.md | busybox wc -l",
@@ -6230,12 +6231,14 @@ class TestGroupsHoldingOperators(unittest.TestCase):
     def test_multicall_names_scan_linearly(self):
         # Unanchored, each `-busybox` in one long word started a match that ran to
         # its end: 1 MB took 945s in the hook, past its timeout (which runs it).
-        text = ": a" + "-busybox" * 20000
-        for name in ("_RUNS_UNNAMED_RE", "_C_OR_EVAL_RE", "_UNREAD_SINK_SHELL_RE"):
-            with self.subTest(regex=name):
-                start = time.process_time()
-                getattr(guard, name).search(text)
-                self.assertLess(time.process_time() - start, 1)
+        # Glued to `=`, a wrapper is a value: each `A=env` began a command start
+        # whose assignment loop ran to the line's end (main too, via `env`).
+        for text in (": a" + "-busybox" * 20000, "A=env " * 20000, "A=busybox " * 20000):
+            for name in ("_RUNS_UNNAMED_RE", "_C_OR_EVAL_RE", "_UNREAD_SINK_SHELL_RE"):
+                with self.subTest(regex=name, text=text[:12]):
+                    start = time.process_time()
+                    getattr(guard, name).search(text)
+                    self.assertLess(time.process_time() - start, 1)
 
     def test_a_target_built_from_home_is_read_with_the_real_home(self):
         # XERK-1656: `$HOME`, `~` and `${HOME<op>}` are expanded against the

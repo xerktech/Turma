@@ -10299,7 +10299,10 @@ _MAY_RUN_FILE_RE = re.compile(r"sh|source|\.|/|xargs|exec|eval|PATH")
 # `xargs`, `hash`; and anywhere, `find -exec` or a `PATH=` change. A shell
 # given a file is the segment loop's; a word elsewhere (`git add .`, "bash"
 # in a note) is text.
-_CMD_START = (r"(?:^|[;&|({`\n'\"]|\b(?:then|do|else|elif|if|while|until|exec|env|sudo|"
+# A keyword or wrapper glued to `=` is an assignment's value (`A=env`), never a
+# command start; read as one, `A=env A=env …` started a match at every value and
+# each ran the assignment loop to the line's end, quadratic past the hook timeout.
+_CMD_START = (r"(?:^|[;&|({`\n'\"]|(?<!=)\b(?:then|do|else|elif|if|while|until|exec|env|sudo|"
               r"nohup|command|builtin|time|timeout\s+\S+|" + _MULTICALL_WORD + r")\s)\s*"
               r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*")
 _RUNS_UNNAMED_RE = re.compile(

@@ -57,6 +57,9 @@ paths:
     - `_MULTICALL_WORD` is anchored by a lookbehind: unanchored, every `-busybox` in one long
       word started a match, quadratic (1 MB: 945s, past the hook timeout, which runs it).
       Test: `test_multicall_names_scan_linearly`.
+    - `_CMD_START`'s keyword/wrapper words never start after `=` (`(?<!=)`): `A=env` is a value,
+      and `A=env A=env …` started a match per value that ran the assignment loop to the end
+      (quadratic, past the hook timeout, on main too). 0 diffs over 585 real commands holding one.
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top
