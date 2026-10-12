@@ -26,7 +26,7 @@ auto-start/auto-stop sweeps. Read `.claude/rules/turma.md` for the rest of the d
   - `resolved` covers **Azure DevOps** (XERK-250: Resolved = "fixed, not yet verified", reaches
     clients as `inprogress`); a Jira "Resolved" is normally `done`, which the carve-out can't pull
     from.
-  - **The rule has FIVE mirrors** — see `CLAUDE.md`'s cross-cutting contracts for the list.
+  - **The rule has FIVE mirrors** — see `contract-mirrors.md` for the list.
 - **The columns are ALWAYS one horizontal row, at every width** (XERK-253, `.kanban-cols`): a flex
   strip that scrolls sideways. Never reintroduce a wrapping breakpoint — stacked columns stop
   reading as a Kanban.
