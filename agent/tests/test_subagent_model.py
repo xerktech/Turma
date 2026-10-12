@@ -20,11 +20,19 @@ hook = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(hook)
 
 
+class _Stdin:
+    """A stdin exposing only .buffer, as the hook must read it."""
+    def __init__(self, data):
+        self.buffer = io.BytesIO(data)
+
+
 def run_main(event, pin="opus"):
-    stdin = event if isinstance(event, str) else json.dumps(event)
+    stdin = event if isinstance(event, (str, bytes)) else json.dumps(event)
+    if isinstance(stdin, str):
+        stdin = stdin.encode("utf-8")
     env = {"TURMA_PIN_SUBAGENT_MODEL": pin} if pin is not None else {}
     out = io.StringIO()
-    with mock.patch.object(sys, "stdin", io.StringIO(stdin)), \
+    with mock.patch.object(sys, "stdin", _Stdin(stdin)), \
             mock.patch.object(sys, "stdout", out), \
             mock.patch.dict(os.environ, env, clear=False):
         if pin is None:
@@ -63,12 +71,13 @@ class TestSubagentModelPin(unittest.TestCase):
         self.assertTrue(upd["run_in_background"])      # other fields kept
 
     def test_reviewers_are_pinned(self):
-        for name in ("code-reviewer", "Review", "security-review"):
+        for name in ("code-reviewer", "Review", "security-review", "pr_reviews"):
             _, out = run_main(agent_call(subagent_type=name))
             self.assertEqual(self.updated(out)["model"], "opus", name)
 
     def test_search_and_work_agents_stay_on_the_default(self):
-        for name in ("Explore", "general-purpose", "Plan", "qa-helper", None, 3):
+        for name in ("Explore", "general-purpose", "Plan", "qa-helper", None, 3,
+                     "ui-preview", "previewer", "reviewing-tool-x"):
             rc, out = run_main(agent_call(subagent_type=name, model="haiku"))
             self.assertEqual((rc, out), (0, ""), name)
         rc, out = run_main(agent_call(prompt="no type"))
@@ -83,8 +92,16 @@ class TestSubagentModelPin(unittest.TestCase):
         self.assertEqual(run_main(agent_call(subagent_type="qa"), pin=None), (0, ""))
         self.assertEqual(run_main(agent_call(subagent_type="qa"), pin="  "), (0, ""))
 
+    def test_non_ascii_prompt_round_trips_byte_exact(self):
+        # The hook echoes the whole prompt back: reading text stdin on Windows
+        # (cp1252) turned "—" into "â€”" (XERK-1851 QA).
+        prompt = "Verify the fix — café → ✓ 日本"
+        _, out = run_main(agent_call(subagent_type="qa", prompt=prompt))
+        self.assertTrue(out.isascii())
+        self.assertEqual(self.updated(out)["prompt"], prompt)
+
     def test_malformed_input_never_blocks(self):
-        for bad in ("", "{not json", "[]", '"x"', json.dumps({"tool_input": []}),
+        for bad in ("", "{not json", "[]", '"x"', b"\xff\xfe", json.dumps({"tool_input": []}),
                     json.dumps({"tool_input": None})):
             self.assertEqual(run_main(bad), (0, ""), bad)
 

@@ -12375,6 +12375,30 @@ class TestSessionLifecycle(ManagerMixin, unittest.TestCase):
             # XERK-1851: no Opus pin — the gateway 403s a Claude alias.
             self.assertNotIn("TURMA_PIN_SUBAGENT_MODEL", cmd)
 
+    def test_windows_launch_pins_grader_subagents_off_the_local_model(self):
+        # XERK-1851: the Windows launch has no shell prefix, so the pin rides
+        # extra_env — and, as on Linux, never onto the local model's gateway.
+        repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
+        sm = self.make_spawn_ready_manager([repo])
+        with mock.patch.multiple(ha, LOCAL_MODEL_BASE_URL="https://gw.example.com/v1",
+                                 LOCAL_MODEL_API_KEY="sk-abc",
+                                 LOCAL_MODEL_NAME="gpt-oss:120b"):
+            sm.spawn("Turma")
+            sess = sm.registry[-1]
+            for source, pinned in (("subscription", True), ("local", False)):
+                sess["modelSource"] = source
+                spawned = []
+                with mock.patch.object(ha, "IS_WINDOWS", True), \
+                        mock.patch.object(sm, "_spawn_pty_host",
+                                          side_effect=lambda s_, argv, env: spawned.append(env)), \
+                        mock.patch.object(sm, "_trust_watch"):
+                    sm._launch_tmux(sess)
+                env, = spawned
+                if pinned:
+                    self.assertEqual(env.get("TURMA_PIN_SUBAGENT_MODEL"), "opus")
+                else:
+                    self.assertNotIn("TURMA_PIN_SUBAGENT_MODEL", env)
+
     def test_spawn_onto_local_refused_without_configuration(self):
         repo = {"name": "Turma", "path": os.path.join(self.tmp, "Turma")}
         sm = self.make_spawn_ready_manager([repo])

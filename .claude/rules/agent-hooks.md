@@ -443,7 +443,8 @@ with. Policy (what's denied and why) plus the implementation contract behind it.
 - **Permission ledger hook** (`hooks/permlog.py`, XERK-1563) — wired on `PermissionRequest` and
   `PermissionDenied` (NOT `PreToolUse`, whose matcher list stays the guard, the file guard,
   `AskUserQuestion` and the model pin); RECORDS one line per event to
-  `~/.turma/permissions/<sid>.jsonl`, decides nothing, fails open on everything, `-SI` like every hook, wired only when the script exists. Its dir is
+  `~/.turma/permissions/<sid>.jsonl`, decides nothing, fails open on everything, `-SI` like every
+  hook, wired only when the script exists. Its dir is
   `Edit`-denied (`Edit(~/.turma/permissions/**)`, in the equality pin). Rules: `agent-permissions.md`.
   - With `--judge` (XERK-1566, unless `TURMA_PERMISSION_JUDGE=0`) it also hands a Bash call to the
     manager's permission judge and waits (timeout 90s); judge contract in `agent-permissions.md`.

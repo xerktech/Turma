@@ -39,18 +39,21 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 
 # The sub-agents that grade work: the QA gate, its re-pass, and any reviewer
-# (a `code-reviewer`, `review`, …) an operator defines.
+# (a `code-reviewer`, `security-review`, …) an operator defines. A whole WORD,
+# so `ui-preview` stays on the cheap default.
 PINNED_NAMES = frozenset({"qa", "qa-delta"})
+REVIEW_WORD_RE = re.compile(r"(?:^|[^a-z0-9])review(?:er|ers|s)?(?:$|[^a-z0-9])")
 
 
 def is_grader(subagent_type) -> bool:
     if not isinstance(subagent_type, str):
         return False
     name = subagent_type.strip().lower()
-    return name in PINNED_NAMES or "review" in name
+    return name in PINNED_NAMES or bool(REVIEW_WORD_RE.search(name))
 
 
 def main() -> int:
@@ -58,7 +61,10 @@ def main() -> int:
     if not model:
         return 0
     try:
-        payload = json.load(sys.stdin)
+        # BYTES, decoded as UTF-8: text stdin on Windows is the ANSI code page
+        # (cp1252; `-SI` ignores PYTHONUTF8), and this hook echoes the whole
+        # prompt back, so a `—` would come back as `â€”`.
+        payload = json.loads(sys.stdin.buffer.read().decode("utf-8"))
         tool_input = payload.get("tool_input")
     except (ValueError, AttributeError):
         return 0
@@ -67,6 +73,7 @@ def main() -> int:
     if tool_input.get("model") == model:
         return 0
     updated = dict(tool_input, model=model)
+    # ensure_ascii (the default) keeps stdout pure ASCII on any code page.
     sys.stdout.write(json.dumps({"hookSpecificOutput": {
         "hookEventName": "PreToolUse",
         "updatedInput": updated,
