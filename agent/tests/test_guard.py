@@ -4557,7 +4557,17 @@ class TestClassification(unittest.TestCase):
                     'powershell -c "Remove-Item -Recurse .\\a,C:\\Windows"',
                     "powershell -c \"Remove-Item -Recurse @('.\\a','C:\\Windows')\"",
                     'powershell -c "ri -r C:\\Windows"',
-                    'powershell -c "del -Rec C:\\Windows"'):
+                    'powershell -c "del -Rec C:\\Windows"',
+                    # Every word after the program is script: option values,
+                    # -Command spellings and blocks hide nothing (QA delta).
+                    'powershell -NoProfile -ExecutionPolicy Bypass -Command "Remove-Item -Recurse -Force C:\\Windows"',
+                    'pwsh -WorkingDirectory C:\\ -c "Remove-Item -Recurse C:\\Windows"',
+                    'powershell -Com "Remove-Item -Recurse C:\\Windows"',
+                    'pwsh -c "& { Remove-Item -Recurse C:\\Windows }"',
+                    'pwsh -c "if (1) { Remove-Item -Recurse C:\\Windows }"',
+                    'pwsh -c "(Remove-Item -Recurse C:\\Windows)"',
+                    'cmd /c "rd /s/q C:\\Windows"',
+                    'sudo pwsh -c "Remove-Item -Recurse C:\\Windows"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
@@ -4568,7 +4578,11 @@ class TestClassification(unittest.TestCase):
                     'git commit -m "guard: deny Remove-Item -Recurse C:\\Windows in powershell -c"',
                     'rg -n "Remove-Item -Recurse -Force C:/Windows" agent/',
                     'grep -rn "rd /s /q C:\\Windows" agent/tests',
-                    'echo "Remove-Item -Recurse C:\\Users is blocked"'):
+                    'echo "Remove-Item -Recurse C:\\Users is blocked"',
+                    'echo cmd -c "Remove-Item -Recurse C:\\Windows"',
+                    'grep -rn cmd -c "Remove-Item -Recurse C:\\Windows"',
+                    'pwsh -WorkingDirectory C:\\Windows -c "Remove-Item -Recurse .\\build"',
+                    'cmd /c "dir C:\\Windows /s"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 

@@ -12412,24 +12412,23 @@ def _destructive_rm(tokens: list[str]) -> str | None:
 
 
 _PS_SHELLS = {"powershell", "pwsh", "cmd"}
-_PS_SCRIPT_FLAGS = {"-c", "-command", "/c", "/k"}
 _PS_REMOVE_CMDS = {"remove-item", "ri", "rm", "del", "erase", "rd", "rmdir"}
-_PS_SHELL_RE = re.compile(r"\b(?:powershell|pwsh|cmd)(?:\.exe)?\b")
 
 
 def _ps_statements(script: str) -> list[list[str]]:
-    """A PowerShell/cmd script's statements (cut at `;`, `|`, `&`), each its
-    words with quotes and backtick escapes removed and backslashes kept
-    (`'C:\\Program Files'` is one word). Unbalanced quotes fall back to blanks."""
+    """A PowerShell/cmd script's statements (cut at `;`, `|`, `&` and braces),
+    each its words with quotes and backtick escapes removed and
+    backslashes kept (`'C:\\Program Files'` is one word). Unbalanced quotes
+    fall back to blanks."""
     try:
-        lex = shlex.shlex(script.replace("`", ""), posix=False, punctuation_chars=";|&")
+        lex = shlex.shlex(script.replace("`", ""), posix=False, punctuation_chars=";|&{}")
         lex.whitespace_split = True
         words = list(lex)
     except ValueError:
-        words = script.replace("`", "").split()
+        words = re.split(r"[\s;|&{}]+", script.replace("`", ""))
     out: list[list[str]] = [[]]
     for w in words:
-        if w and set(w) <= set(";|&"):
+        if not w or set(w) <= set(";|&{}"):
             out.append([])
         else:
             out[-1].append(w[1:-1] if len(w) > 1 and w[0] == w[-1] and w[0] in "'\"" else w)
@@ -12442,7 +12441,7 @@ def _ps_targets(word: str) -> list[str]:
     if word.startswith("-") and ":" in word:
         word = word.split(":", 1)[1]
     out = []
-    for part in re.split(r"[,()@]", word):
+    for part in re.split(r"[,@()]", word):
         part = part.strip().strip("'\"")
         if part:
             out.append(part)
@@ -12451,38 +12450,37 @@ def _ps_targets(word: str) -> list[str]:
     return out
 
 
-def _ps_recursive_remove_words(st: list[str]) -> bool:
-    """A statement that recursively deletes: a remove command or alias with an
-    abbreviation of `-Recurse` (or `/s` for rd/rmdir), or a `*` target."""
-    if not st or st[0].lower() not in _PS_REMOVE_CMDS:
-        return False
-    low = [w.lower() for w in st[1:]]
-    return any((len(w) >= 2 and "-recurse".startswith(w.split(":", 1)[0])) or w == "/s"
-               or w.endswith("*") for w in low)
+def _ps_recursive_remove_args(st: list[str]) -> list[str] | None:
+    """The arguments of a recursive delete in this statement, else None: a
+    remove command or alias anywhere in it (after `if`, `foreach`, …) with an
+    abbreviation of `-Recurse`, a `/s` switch (`/s/q` too) or a `*` target."""
+    for i, w in enumerate(st):
+        if w.strip("()").lower() in _PS_REMOVE_CMDS:
+            args = st[i + 1:]
+            low = [a.lower() for a in args]
+            if any((len(a) >= 2 and "-recurse".startswith(a.split(":", 1)[0]))
+                   or re.fullmatch(r"(/[a-z])*/s(/[a-z])*", a) or a.endswith("*")
+                   for a in low):
+                return args
+            return None
+    return None
 
 
 def _ps_script_reason(tokens: list[str]) -> str | None:
-    """Judge the script a `powershell -c "…"`, `pwsh -Command …` or
-    `cmd /c …` runs: each recursive-remove statement's targets (rollup
-    XERK-1584). Only a real script argument: quoted text in a commit message
-    or a grep pattern is not one."""
-    for i, tok in enumerate(tokens):
-        prog = re.sub(r"\.exe$", "", _basename(tok).lower())
-        if prog not in _PS_SHELLS:
-            continue
-        j = i + 1
-        while j < len(tokens) and tokens[j].lower() not in _PS_SCRIPT_FLAGS:
-            if not tokens[j].startswith(("-", "/")):
-                break
-            j += 1
-        if j >= len(tokens) or tokens[j].lower() not in _PS_SCRIPT_FLAGS:
-            continue
-        for st in _ps_statements(" ".join(tokens[j + 1:])):
-            if _ps_recursive_remove_words(st):
-                for word in st[1:]:
-                    for target in _ps_targets(word):
-                        if _is_dangerous_path(target):
-                            return f"refusing recursive delete of a protected path ({target!r})"
+    """Judge what `powershell`/`pwsh`/`cmd` runs when it IS the command's
+    program: every word after it is read as script, so an option's value or a
+    misspelled `-Command` cannot hide a delete (rollup XERK-1584). Quoted text
+    naming such a script elsewhere (a commit message, `echo cmd -c …`) is not
+    one."""
+    words = _strip_prefixes(tokens)
+    if not words or re.sub(r"\.exe$", "", _basename(words[0]).lower()) not in _PS_SHELLS:
+        return None
+    for st in _ps_statements(" ".join(words[1:])):
+        args = _ps_recursive_remove_args(st)
+        for word in args or ():
+            for target in _ps_targets(word):
+                if _is_dangerous_path(target):
+                    return f"refusing recursive delete of a protected path ({target!r})"
     return None
 
 
@@ -12495,7 +12493,7 @@ def _ps_recursive_remove(low: str) -> bool:
 
 def _destructive_powershell_remove(segment: str) -> str | None:
     low = segment.lower()
-    if _PS_SHELL_RE.search(low):
+    if re.search(r"\b(?:powershell|pwsh|cmd)\b", low):
         reason = _ps_script_reason(_tokenize(segment))
         if reason:
             return reason

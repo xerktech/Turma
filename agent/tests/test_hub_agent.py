@@ -26473,7 +26473,7 @@ class TestPokeHeartbeat(unittest.TestCase):
         # XERK-1606: a Python-function handler nests under a burst, so the burst
         # runs with the limit just above the real current depth. That proves the
         # INSTALLED handler neither wedges nor recurses; it does not reliably
-        # catch a nesting one (QA: a Python handler passed 26/27 runs here), so
+        # catch a nesting one (QA: a Python handler mostly passed it here), so
         # the handler-type test below is the gate for that.
         self._install()
         depth, f = 0, sys._getframe()
@@ -43868,6 +43868,17 @@ class TestHookIntegrity(unittest.TestCase):
         self.assertEqual([], self._check({}, 1000))
 
 
+
+class TestGuardXargsValueOpts(unittest.TestCase):
+    def test_reads_guard_s_current_xargs_tables(self):
+        # Rollup XERK-1584: it read a name guard.py had dropped, so it was ()
+        # and the judge took an option's value for xargs' program word.
+        opts = ha.guard_xargs_value_opts()
+        for opt in ("-n", "-d", "-P", "-a", "--max-args", "--delimiter"):
+            self.assertIn(opt, opts)
+        self.assertNotIn("-0", opts)
+        self.assertEqual(ha._judge_feeder_reason("xargs", ["-n", "1", "-I{}", "{}", "push", "origin", "main"]),
+                         "an xargs command whose program comes from stdin")
 
 class TestLoadHookSource(unittest.TestCase):
     def test_a_forged_pyc_beside_the_hook_is_never_run(self):
