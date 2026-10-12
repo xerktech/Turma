@@ -8276,38 +8276,44 @@ _REPLACEMENT_TILDE_RE = re.compile("~" + _TILDE_SUFFIX + "(?=[/}])")
 # (`bash -c 'cd; …'`). The redirections are walked by `_bare_cds`, never a
 # lookahead: one rescanned the rest of a `cd >'cd >'cd …` chain per `cd`
 # (720s on 250 KB, past the hook timeout, which RUNS the command).
-_BARE_CD_HEAD_RE = re.compile(r"(?:^|(?<=[\s;&|(){`'\"]))cd(?:[ \t]+-(?:-|[LPe@]+))*")
+_BARE_CD_HEAD_RE = re.compile(r"(?:^|(?<=[\s;&|(){`'\"]))cd(?=[\s;&|)}`<>]|\Z)")
 _BARE_CD_REDIRECT_OP = r"[ \t]*(?:\d+|\{\w+\})?(?:<<<|<<-?|<>|[<>]&?|&>>?|>>|>\|)"
 _BARE_CD_REDIRECT_OP_RE = re.compile(_BARE_CD_REDIRECT_OP)
 _BARE_CD_REDIRECT_RE = re.compile(_BARE_CD_REDIRECT_OP + r"[ \t]*[^\s;&|()<>`]{1,256}")
-_BARE_CD_END_RE = re.compile(r"[ \t]*(?:[;&|)}\n`]|\Z)")
-# How many redirections, each target at most 256 characters, a bare `cd` is
-# read through; past either, or at a target it cannot read (quoted, expanded,
-# a substitution: `cd <<<'a b'`, `cd >$(f)`), it is read as bare (an added home
-# reading only).
+# An option (`--`, `-P`) or a `\`-newline, which may sit before or after a redirection.
+_BARE_CD_SKIP_RE = re.compile(r"[ \t]*(?:-(?:-|[LPe@]+)(?=[\s;&|)}`<>]|\Z)|\\\n)")
+# What ends a `cd` with no operand: an operator, a comment, the end.
+_BARE_CD_END_RE = re.compile(r"[ \t]*(?:[;&|)}\n`#]|\Z)")
+# How many options, redirections and continuations (each target at most 256
+# characters) a bare `cd` is read through; past either, or at a target it
+# cannot read (quoted, expanded, a substitution: `cd <<<'a b'`, `cd >$(f)`), it
+# is read as bare (an added home reading only).
 _BARE_CD_MAX_REDIRECTS = 8
 
 
 def _bare_cds(text: str) -> str:
-    """``text`` with ` $HOME` after each `cd` that has no operand. Each `cd` is
-    read at most `_BARE_CD_MAX_REDIRECTS` redirections on, so it stays linear."""
+    """``text`` with ` $HOME` after each `cd` that may have no operand. Each
+    `cd` is walked at most `_BARE_CD_MAX_REDIRECTS` options, redirections or
+    continuations on, so it stays linear; it has an operand only where a plain
+    word follows them (an option after a redirection, a comment or a `\`-newline
+    each hid one: `cd 2>/dev/null --`, `cd # x`)."""
     pieces, last = [], 0
     for m in _BARE_CD_HEAD_RE.finditer(text):
-        j, bare = m.end(), False
-        for k in range(_BARE_CD_MAX_REDIRECTS + 1):
-            r = _BARE_CD_REDIRECT_RE.match(text, j)
+        j, bare = m.end(), True
+        for _ in range(_BARE_CD_MAX_REDIRECTS + 1):
+            r = _BARE_CD_SKIP_RE.match(text, j) or _BARE_CD_REDIRECT_RE.match(text, j)
             if r is None:
-                # An operator whose target is no plain word (`<<<$(…)`, `< <(…)`).
+                # An operand only if a plain word follows: not an operator, a
+                # comment, the end, or a redirection whose target is no plain
+                # word (`<<<$(…)`, `< <(…)`).
                 bare = (_BARE_CD_REDIRECT_OP_RE.match(text, j) is not None
                         or _BARE_CD_END_RE.match(text, j) is not None)
                 break
-            if k == _BARE_CD_MAX_REDIRECTS or any(c in r.group(0) for c in "'\"$\\"):
-                bare = True     # more redirections than are walked, or an unreadable target
-                break
+            if any(c in r.group(0) for c in "'\"$") or "\\" in r.group(0).rstrip("\n"):
+                break           # an unreadable target: bare
             j = r.end()
-            if j < len(text) and text[j] not in " \t\n;&|)<>`":
-                bare = True     # a target past 256 characters, or one opening `(`
-                break
+            if j < len(text) and text[j] not in " \t\n;&|)<>`\\":
+                break           # a target past 256 characters, or one opening `(`
         if bare:
             pieces += [text[last:m.end()], " $HOME"]
             last = m.end()

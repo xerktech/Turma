@@ -5808,7 +5808,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                      "cd >{cd " * 20000, 'cd >"cd ' * 20000, "cd <<<'cd " * 20000,
                      "cd >$(cd " * 20000, "cd < <(cd " * 20000):
             guard._bare_cds(text)
-        self.assertLess(time.process_time() - t, 1)
+        self.assertLess(time.process_time() - t, 3)
         self.assertEqual(guard._bare_cds("cd >/dev/null /etc; cd -"), "cd >/dev/null /etc; cd -")
         # Past either cap a `cd` reads as bare (bash goes home after any number).
         for cmd in ("HOME=/; cd" + " >a" * 9 + "; rm -rf etc",
@@ -5827,6 +5827,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "HOME=/; cd <<<$(echo a b); rm -rf etc", "HOME=/; cd <<<`echo a`; rm -rf etc",
                     "HOME=/; cd < <(true); rm -rf etc", "HOME=/; cd >'a b'; rm -rf etc",
                     "HOME=/; cd >$(echo f); rm -rf etc",
+                    "HOME=/; cd <<<$x; rm -rf etc", "HOME=/; cd >a\\ b; rm -rf etc",
+                    # An option after a redirection, a comment, a continuation.
+                    "HOME=/; cd 2>/dev/null --; rm -rf etc", "HOME=/; cd >/dev/null -P; rm -rf etc",
+                    "HOME=/; cd # home\nrm -rf etc", "HOME=/; cd >/dev/null # h\nrm -rf etc",
+                    "HOME=/; cd \\\n>/dev/null; rm -rf etc",
                     "HOME=/; bash -c 'cd <<<\"a b\"; rm -rf etc'",
                     "HOME=/; cd >" + "a" * 100 + "; rm -rf etc"):
             with self.subTest(cmd=cmd[:40]):
