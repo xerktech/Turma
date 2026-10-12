@@ -5919,7 +5919,9 @@ def shadow_tree_reason(repo, base):
         if not tab:
             continue
         mode = meta.split(" ", 1)[0]
-        parts = path.split("/")
+        # Case-folded: on a case-insensitive filesystem (macOS) `.CLAUDE/Settings.json`
+        # IS the config Claude opens.
+        parts = path.lower().split("/")
         if mode == "160000":
             return "shadow runs do not support submodules"
         if ".claude" not in parts:
@@ -5953,15 +5955,20 @@ def shadow_tree_reason(repo, base):
                     or re.match(r"\s*(Edit|Write|MultiEdit|NotebookEdit|WebFetch)\b", r)
                     for r in allow):
                 return f"{path} allows file writes or fetches a shadow cannot take"
-        elif sub and sub[0] == "agents":
-            if len(sub) != 2 or not sub[1].endswith(".md"):
+        elif sub and sub[0] in ("agents", "skills"):
+            # A skill's frontmatter hooks run outside the sandbox too (an agent's
+            # `skills:` preloads one even with no Skill tool).
+            if sub[0] == "agents" and (len(sub) != 2 or not sub[1].endswith(".md")):
                 return f"{path}: only top-level .md agents are allowed"
+            if not sub[-1].endswith(".md"):
+                continue
             rc, text = run_out(["git", "-C", repo, "show", f"{base}:{path}"], timeout=15)
             if rc != 0:
                 return f"could not read {path}"
             m = re.match(r"---\n(.*?)\n---(?:\n|\Z)", text, re.S)
             head = (m.group(1) if m else text).lower()
-            if "hook" in head or "mcp" in head:
+            # A backslash is a YAML escape that could spell either word.
+            if "hook" in head or "mcp" in head or "\\" in head:
                 return f"{path} may define hooks or MCP servers"
     return None
 

@@ -162,7 +162,8 @@ This file is the operative rules for what has shipped; the routing policy is `mo
       symlink at or under any `.claude`; a nested `.claude/settings*`/`agents`; project
       settings keys beyond `permissions`/`$schema`/attribution, permission keys beyond
       allow/deny/ask, or an Edit/Write/WebFetch allow (they merge into the sandbox); an agent
-      that is not a top-level `.md` or whose frontmatter MENTIONS hook/mcp at all.
+      not a top-level `.md`, or an agent/skill whose frontmatter MENTIONS hook/mcp or holds a
+      backslash (a YAML escape). Paths compare case-folded (macOS opens `.CLAUDE/`).
       **Judge bytes, never parse YAML**: a parser was beaten by quoted/complex keys, a BOM, a
       nested dir, a non-ASCII (quoted) name and a symlinked dir. Today it refuses Veiller
       (gitlink) and Tenir (Edit/WebFetch allows). No `Skill` tool (skill hooks run outside the

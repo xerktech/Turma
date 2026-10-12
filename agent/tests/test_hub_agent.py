@@ -44882,6 +44882,12 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
                  ({".claude/agents/c.md": "---\n? hooks\n: {}\n---\nx"}, "hooks or MCP"),
                  ({".claude/agents/sub/x.md": "---\nname: x\n---\n"}, "top-level"),
                  ({"sub/.claude/settings.json": "{}"}, "nested"),
+                 ({".claude/agents/u.md": "---\nHOOKS: {}\n---\nx"}, "hooks or MCP"),
+                 ({".claude/agents/m.md": "---\nmcpServers: {}\n---\nx"}, "hooks or MCP"),
+                 ({".claude/agents/e.md": '---\n"\\x68ooks": {}\n---\nx'}, "hooks or MCP"),
+                 ({".claude/skills/s/SKILL.md": "---\nhooks: {}\n---\nx"}, "hooks or MCP"),
+                 ({".CLAUDE/Settings.json": '{"hooks": {}}'}, "hooks"),
+                 ({".claude/AGENTS/sub/a.md": "---\nname: a\n---\n"}, "top-level"),
                  ({".claude/settings.json": '{"permissions": {"additionalDirectories": ["/"]}}'},
                   "permission options"),
                  ({".claude/settings.json": '{"permissions": {"allow": ["Edit(//repos/**)"]}}'},
@@ -44903,7 +44909,8 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         # Permissions alone, rules and a plain agent are the repo's own and fine.
         self.claude_files = {".claude/settings.json": '{"permissions": {"allow": []}}',
                              ".claude/rules/a.md": "rule",
-                             ".claude/agents/y.md": "---\nname: y\n---\nhi\n"}
+                             ".claude/agents/y.md": "---\nname: y\n---\nhi\n",
+                             ".claude/skills/v/SKILL.md": "---\nname: v\n---\nrun it\n"}
         self.assertEqual(spawn(99)["state"], "running")
         self.assertEqual(len(sm.registry), 1)
         # A symlinked .claude (or anything under it) is followed by Claude: refused.
