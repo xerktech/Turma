@@ -23174,6 +23174,34 @@ class TestResolveSubagent(unittest.TestCase):
         # A pane-truncated label still resolves through the same path.
         self.assertEqual(ha._resolve_subagent(main, "agent", "QA lifecycle pro…"), sub)
 
+    def test_a_non_dict_task_input_is_skipped_not_raised(self):
+        # Claude Code never writes a non-object `input`, but a hand-edited or
+        # corrupt transcript can; one such line must not abort the lookup.
+        main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
+        with open(main) as f:
+            good = f.read()
+        bad = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_x", "name": "Task", "input": "oops"}]}}
+        with open(main, "w") as f:
+            f.write(json.dumps(bad) + "\n" + good)
+        self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
+
+    def test_a_launch_with_no_description_does_not_claim_a_labelled_row(self):
+        # An empty description is a prefix of every label, so a newer unlabelled
+        # launch used to win the wildcard lookup over the row's own agent.
+        main, sub = self._main_with_agent_call("good1", "Find the parser")
+        newer = {"type": "assistant", "message": {"content": [
+            {"type": "tool_use", "id": "toolu_evil", "name": "Agent",
+             "input": {"subagent_type": "general-purpose", "prompt": "go"}}]}}
+        result = {"type": "user", "message": {"content": [
+            {"type": "tool_result", "tool_use_id": "toolu_evil", "content": [
+                {"type": "text", "text": "agentId: evil1 (internal)"}]}]}}
+        with open(main, "a") as f:
+            f.write(json.dumps(newer) + "\n" + json.dumps(result) + "\n")
+        with open(os.path.join(self.tmp, "main", "subagents", "agent-evil1.jsonl"), "w") as f:
+            f.write("{}\n")
+        self.assertEqual(ha._resolve_subagent(main, "agent", "Find the parser"), sub)
+
     def test_resolves_exact_type_and_label(self):
         main, sub = self._main_with_task("abc123", "Explore", "Find the parser")
         self.assertEqual(ha._resolve_subagent(main, "Explore", "Find the parser"), sub)
@@ -23335,6 +23363,15 @@ class TestResolveWorkflowRun(unittest.TestCase):
         run = self._run_dir("wf_aaa111")
         self.assertEqual(ha._resolve_workflow_run(self.main, "code-review"), run)
         self.assertFalse(os.path.exists("/somewhere/else/entirely/wf_aaa111"))
+
+    def test_a_newer_nameless_run_does_not_claim_a_named_row(self):
+        # An empty name is a prefix of every label; it must not win the row.
+        nameless = self._launch("", "wf_new222")
+        nameless[1]["toolUseResult"]["summary"] = ""
+        self._write_main(self._launch("build", "wf_old111"), nameless)
+        named = self._run_dir("wf_old111")
+        self._run_dir("wf_new222")
+        self.assertEqual(ha._resolve_workflow_run(self.main, "build"), named)
 
     def test_newest_matching_launch_wins(self):
         self._write_main(self._launch("nightly", "wf_old111"),
@@ -24044,6 +24081,11 @@ class TestLiveAgentResolveId(unittest.TestCase):
         st = self._state(("we1", "workflow", "nightly", "wf_old"),
                          ("we2", "workflow", "nightly", "wf_new"))
         self.assertEqual(ha._live_agent_resolve_id(st, "workflow", "nightly"), "wf_new")
+
+    def test_a_newer_unlabelled_launch_does_not_claim_a_labelled_row(self):
+        st = self._state(("a1", "explore", "map it", "good"),
+                         ("a2", "general-purpose", "", "evil"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "agent", "map it"), "good")
 
     def test_a_pane_truncated_label_matches_by_prefix(self):
         st = self._state(("a1", "explore", "map the whole repository", "a1"))
