@@ -8051,7 +8051,7 @@ DEFECT_BLAME_RANGES_MAX = 200      # -L ranges per file per fix
 DEFECT_GIT_TIMEOUT = 120           # one git call; off the beat
 _DEFECT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # Anchored to a line start: git's own revert message, not a quote of one.
-_REVERT_RE = re.compile(r"(?m)^This reverts commit ([0-9a-f]{40})")
+_REVERT_RE = re.compile(r"(?m)^This reverts commit ([0-9a-f]{40})(?:\.|, reversing)?[ \t]*$")
 _JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d{1,7})\b")
 _ADO_KEY_RE = re.compile(r"\bAB#(\d{1,9})\b")
 _HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
@@ -8237,18 +8237,22 @@ def _defect_revert_targets(repo, sha, message, parents):
     """The commits a revert names, kept only when each is really an ancestor of
     the revert's first parent (a quoted or invented sha names nothing). A revert
     merged as a PR with a merge commit carries the line on the MERGED branch's
-    commits, not the merge's own message, so those are read too."""
-    texts = [message or ""]
+    commits, not the merge's own message, so those are read too — and a target
+    whose revert the same branch reverted again (revert, then re-apply) is net
+    nothing and dropped."""
+    pairs = [(sha, t) for t in _REVERT_RE.findall(message or "")]
     if len(parents) > 1:
-        rc, out = run_out(["git", "-C", repo, "log", "-n", "50", "--format=%B",
+        rc, out = run_out(["git", "-C", repo, "rev-list", "-n", "50",
                            f"{parents[0]}..{parents[1]}"], timeout=DEFECT_GIT_TIMEOUT)
-        if rc == 0:
-            texts.append(out)
-    found = []
-    for t in texts:
-        for m in _REVERT_RE.finditer(t):
-            if m.group(1) not in found:
-                found.append(m.group(1))
+        for c in (out.split() if rc == 0 else []):
+            if _DEFECT_SHA_RE.match(c):
+                body = run(["git", "-C", repo, "log", "-1", "--format=%B", c])
+                pairs += [(c, t) for t in _REVERT_RE.findall(body)]
+    reverted = {t for _, t in pairs}
+    # A target whose every revert was itself reverted (revert, then re-apply)
+    # is net nothing.
+    found = [t for t in dict.fromkeys(t for _, t in pairs)
+             if not all(r in reverted for r, x in pairs if x == t)]
     return [t for t in found[:DEFECT_INTRODUCERS_MAX * 2]
             if run_out(["git", "-C", repo, "merge-base", "--is-ancestor", t, parents[0]])[0] == 0]
 
@@ -8256,14 +8260,17 @@ def _defect_revert_targets(repo, sha, message, parents):
 def _defect_landing(repo, sha, tip, first_parents):
     """The commit on the default branch's first-parent line that brought `sha`
     in: itself for a squash or direct commit, else the merge commit of its PR —
-    what the hub's ledger knows as the PR's `mergeCommit`, and what the forge
-    maps to the PR. None when it cannot be placed."""
+    what the hub's ledger knows as the PR's `mergeCommit`. The OLDEST descendant
+    of `sha` on that line (`--first-parent --ancestry-path` only finds a
+    branch's tip commit, so it is not used). None when it cannot be placed."""
     if sha in first_parents:
         return sha
-    rc, out = run_out(["git", "-C", repo, "rev-list", "--first-parent", "--ancestry-path",
-                       "--reverse", f"{sha}..{tip}"], timeout=DEFECT_GIT_TIMEOUT)
-    first = out.split("\n", 1)[0].strip() if rc == 0 else ""
-    return first if _DEFECT_SHA_RE.match(first) else None
+    rc, out = run_out(["git", "-C", repo, "rev-list", "--ancestry-path", "--reverse",
+                       f"{sha}..{tip}"], timeout=DEFECT_GIT_TIMEOUT)
+    for c in (out.split() if rc == 0 else []):
+        if c in first_parents:
+            return c
+    return None
 
 
 def _defect_tracker_classes(keys):
@@ -8351,19 +8358,29 @@ def scan_repo_defects(repo, name, ref, cursor, classify, forge, now=None):
             rc, out = run_out(["git", "-C", repo, "rev-list", "--first-parent", ref],
                               timeout=DEFECT_GIT_TIMEOUT)
             first_parents = set(out.split()) if rc == 0 else set()
-        landed = {}
+        # Group by the commit that LANDED each blamed line (the hub joins its
+        # mergeCommit); one that cannot be placed stands as itself, the forge
+        # still mapping it to its PR. Each keeps a blamed commit for that lookup.
+        landed, blamed = {}, {}
         for s, n in counts.items():
-            land = _defect_landing(repo, s, parents[0], first_parents)
-            if land and land != sha:
-                landed[land] = landed.get(land, 0) + n
+            land = _defect_landing(repo, s, parents[0], first_parents) or s
+            if land == sha:
+                continue
+            landed[land] = landed.get(land, 0) + n
+            blamed.setdefault(land, s)
         if not landed:
             continue
         top = sorted(landed.items(), key=lambda kv: (-kv[1], kv[0]))[:DEFECT_INTRODUCERS_MAX]
+
+        def prs_of(land):
+            urls = _defect_commit_prs(forge, land)
+            if not urls and blamed[land] != land:
+                urls = _defect_commit_prs(forge, blamed[land])
+            return urls
         reports.append({
             "repo": name, "fix": sha, "fixPrs": _defect_commit_prs(forge, sha),
             "kind": kind, "ticket": ticket, "at": ctime * 1000, "found": now,
-            "introducers": [{"sha": s, "prs": _defect_commit_prs(forge, s), "lines": n}
-                            for s, n in top],
+            "introducers": [{"sha": s, "prs": prs_of(s), "lines": n} for s, n in top],
         })
     return cursor, reports
 

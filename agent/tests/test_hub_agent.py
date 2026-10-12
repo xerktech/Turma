@@ -44349,6 +44349,34 @@ class TestDefectAttribution(unittest.TestCase):
         self.assertEqual(by_fix[m3]["kind"], "revert")
         self.assertEqual([i["sha"] for i in by_fix[m3]["introducers"]], [m2])
 
+    def test_every_commit_of_a_multi_commit_merge_pr_lands_on_its_merge(self):
+        self.git("switch", "-q", "-c", "pr1")
+        self.commit({"lib.py": "v = 1\nw = 2\n"}, "XERK-1: add v")
+        self.commit({"lib.py": "v = 1\nw = 2\nz = 3\n"}, "XERK-1: add z")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #1 from o/pr1", "pr1")
+        m1 = self.git("rev-parse", "HEAD")
+        fix = self.commit({"lib.py": "v = 9\nw = 2\nz = 3\n"}, "XERK-2: fix v")
+        _, reports = self.scan()
+        self.assertEqual([(r["fix"], [i["sha"] for i in r["introducers"]]) for r in reports],
+                         [(fix, [m1])])
+
+    def test_a_branch_that_reverts_then_reapplies_reverts_nothing(self):
+        x = self.commit({"lib.py": "v = 1\n"}, "XERK-1: add v")
+        self.git("switch", "-q", "-c", "feat")
+        self.git("revert", "--no-edit", x)
+        r = self.git("rev-parse", "HEAD")
+        self.git("revert", "--no-edit", r)
+        self.commit({"other.py": "o\n"}, "XERK-4: feature")
+        self.git("switch", "-q", "main")
+        self.git("merge", "-q", "--no-ff", "-m", "Merge pull request #5 from o/feat", "feat")
+        self.assertEqual([r for r in self.scan()[1] if r["kind"] == "revert"], [])
+
+    def test_a_revert_line_must_be_gits_own(self):
+        self.commit({"README": "hi\n"},
+                    f"XERK-4: notes\n\nThis reverts commit {self.bad} was discussed")
+        self.assertEqual(self.scan()[1], [])
+
     def test_a_shallow_clones_boundary_is_never_the_introducer(self):
         self.commit({"app.py": "a = 1\nb = 20\nc = 4\n"}, "XERK-1: tweak c")
         clone = tempfile.mkdtemp(prefix="defect-shallow-")
