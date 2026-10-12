@@ -17678,6 +17678,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # never reach a transcript this beat), so a session with agents still in
         # flight keeps reporting them on a beat that appended nothing.
         report["agents"] = live_agents_report(state)
+        # Every beat, not just the one that judged it: if that beat raised,
+        # the record would otherwise never latch qaPartial (XERK-1857).
+        if state.get("qaComplete") is False:
+            report["qaPartial"] = True
         # Only while the turn runs: a session that ended its turn after a loop
         # (a `Host blocker:` line, say) is waiting on the operator, and that
         # end-of-turn wait is what the hub and the classifier must read.

@@ -44591,6 +44591,16 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
             with self.assertRaises(TypeError):
                 ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
         self.assertIs(st.get("qaComplete"), False)
+        # The next beat still reports it, so the record latches qaPartial.
+        self.assertTrue(ha.session_report(self.tmp, st, session_id="s1",
+                                          claude_sid=sid).get("qaPartial"))
+
+    def test_a_pinned_transcript_not_written_yet_beside_neighbours_is_qa_complete(self):
+        self._pinned("99999999-9999-4999-8999-999999999999", [_qa_call("t9")])
+        st = {}
+        ha.session_report(self.tmp, st, session_id="s1",
+                          claude_sid="aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa")
+        self.assertIs(st.get("qaComplete"), True)
 
     def test_a_forged_unhashable_qa_call_never_raises(self):
         # XERK-1857 QA D1: the snapshot is session-writable.
