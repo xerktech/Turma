@@ -12459,14 +12459,15 @@ def _ps_script_reason(tokens: list[str]) -> str | None:
 
 
 def _ps_targets(word: str) -> list[str]:
-    """The paths one word may name: `-Path:C:\\x` binds its value, and
-    `x\\*` empties the directory x."""
+    """The paths one word may name: `-Path:C:\\x` binds its value."""
     if word.startswith("-") and ":" in word:
         word = word.split(":", 1)[1]
     word = word.strip()
     if not word:
         return []
-    return [word, word[:-2]] if word.endswith(("\\*", "/*")) else [word]
+    # A trailing glob component (`x\\*`, `x\\*.*`) empties the directory x.
+    parent = re.sub(r"[\\/][^\\/]*[*?][^\\/]*$", "", word)
+    return [word, parent] if parent != word else [word]
 
 
 def _ps_recursive_remove(low: str) -> bool:
@@ -13962,6 +13963,17 @@ def _is_destructive(command: str) -> str | None:
     reason = _destructive_database(command)
     if reason:
         return reason
+    # PowerShell/cmd scripts also on the RAW segments: the expansion swaps a
+    # single-quoted `$(…)` for an opaque placeholder, which hid
+    # `pwsh -c '$(Remove-Item -Recurse C:\\Windows)'` (rollup XERK-1584 QA).
+    if re.search(r"\b(?:powershell|pwsh|cmd)\b", command.lower()):
+        for seg in _split_on_operators(command):
+            try:
+                reason = _ps_script_reason(_tokenize(seg))
+            except ValueError:
+                reason = None
+            if reason:
+                return reason
     for tokens, segment, *flags in _expand_both(command):
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"

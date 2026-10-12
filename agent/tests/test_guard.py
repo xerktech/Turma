@@ -4564,7 +4564,15 @@ class TestClassification(unittest.TestCase):
                     f"pwsh -c 'Write-Host `\"; Remove-Item -Recurse {W}'",
                     f'pwsh -c "Write-Output (Remove-Item -Recurse {W})"',
                     'powershell -NoProfile Remove-Item -Recurse -Path:C:/Windows',
-                    f'pwsh -WorkingDirectory "{W}" -c "Remove-Item -Recurse -Force *"'):
+                    f'pwsh -WorkingDirectory "{W}" -c "Remove-Item -Recurse -Force *"',
+                    # A single-quoted `$(…)` is pwsh's, not bash's (QA delta 4).
+                    f"pwsh -c '$(Remove-Item -Recurse {W})'",
+                    f"pwsh -c 'Write-Output \"x $(Remove-Item -Recurse {W})\"'",
+                    # Carets, a bound switch value and a wildcard (QA mutants).
+                    f'cmd /c "r^d /s /q {W}"',
+                    f"pwsh -c 'Remove-Item -Recurse:$true {W}'",
+                    f"pwsh -c 'Remove-Item {W}\\* -Force'",
+                    f'cmd /c "del /f /s /q {W}\\*.*"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
