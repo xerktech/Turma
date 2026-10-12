@@ -67,9 +67,17 @@ This file is the operative rules for what has shipped; the routing policy is `mo
     `Agent` launch, its verdict from the sync tool_result or the background hand-back
     (`<agent-message from=<agentId>>`, the id only from the structured launch record). Kept on the
     registry record; `[]` = known zero, ABSENT = an older agent ("can't tell", not counted).
-  - `qaPartial` (the scan began mid-transcript: a manager restart, upgrade or resume) marks the
-    list a floor; the ledger row gets a sticky `qa.incomplete` and is left out of the QA medians.
-    A fresh launch pre-primes its scan state (`_launch_tmux`) so it is never partial.
+  - `qaPartial` (the scan began mid-transcript: a resume, a skipped >4 MiB backlog, or a restart
+    with no usable snapshot) marks the list a floor; the ledger row gets a sticky `qa.incomplete`
+    and is left out of the QA medians. A fresh launch pre-primes its scan state (`_launch_tmux`).
+  - **A manager restart resumes the QA scan, it is not partial** (XERK-1857): the live-agents
+    snapshot (`session-working.md`) also carries `qa` (this scan saw the whole transcript) and
+    `qaCalls` (launches awaiting a result); `_restore_live_agents` folds its gap into
+    `_scan_qa_entry`. Runs before its offset are already on the record. Only `qa: true` is
+    trusted, so a partial scan's snapshot (or an older agent's) stays partial. Without this every
+    self-update marked every live session incomplete, biasing the medians toward short sessions.
+    Residual: a manager killed between the beat's publish and its record `save()` loses that beat's
+    runs. Tests: `test_a_restart_resumes_the_qa_scan_from_the_snapshot` and siblings.
   - Every counter only RISES in the ledger (a closed record can carry less); an agent's
     `mergedAt` earlier than the sighting replaces it, even past MERGED.
   - `closedSessions[]` carries `modelActual` + `qaRuns`, so a session first seen closed is not
