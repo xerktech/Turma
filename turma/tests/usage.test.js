@@ -118,7 +118,7 @@ function loadHelpers(fetchReply = null) {
   };
   const keys = Object.keys(stubs);
   const body = `${script}\n;return { tokenCell, cacheSubLine, cacheLineText, cacheHitRate,
-    blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView,
+    blankBucket, limitEntries, limitGroups, limitHostLabel, limitCard, limitWindowView, limitColumns,
     sevenDayPacing,
     fmtDuration, LIMIT_STALE_SEC, LIMIT_MAX_AGE_SEC, fmtTokens,
     blankUsage, mergeUsageInto, subagentCard, fleetTotals, renderTotals, render,
@@ -650,6 +650,14 @@ test("limitEntries falls back to the agent key when a host has no device name", 
     { key: "unnamed-1", limits: { capturedAt: NOW, fiveHour: { usedPct: 5 } } },
   ], NOW);
   assert.equal(entries[0].host, "unnamed-1");
+});
+
+// --- limitColumns: limit cards split into even rows -------------------------
+
+test("limitColumns balances the limit cards' rows: 4 cards are 2x2, not 3+1", () => {
+  const H = loadHelpers();
+  const cols = [1, 2, 3, 4, 5, 6, 9].map(H.limitColumns);
+  assert.deepEqual(cols, [1, 2, 3, 2, 3, 3, 3]);
 });
 
 // --- limitGroups: one card per subscription (XERK-301) ----------------------

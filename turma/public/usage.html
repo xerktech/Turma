@@ -44,11 +44,22 @@
     display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap;
   }
   .limits h2 .note { font-weight: 400; font-size: 11.5px; color: var(--muted); }
-  .lim-cards { display: flex; flex-wrap: wrap; gap: 10px; }
+  /* A grid with a BALANCED column count (limitColumns), so 4 cards read 2x2
+     rather than a row of 3 and a stranded full-width 4th. */
+  .lim-cards {
+    display: grid; gap: 10px;
+    grid-template-columns: repeat(var(--lim-cols, 1), minmax(0, 1fr));
+  }
+  @media (max-width: 1000px) {
+    .lim-cards { grid-template-columns: repeat(min(var(--lim-cols, 1), 2), minmax(0, 1fr)); }
+  }
+  @media (max-width: 680px) {
+    .lim-cards { grid-template-columns: minmax(0, 1fr); }
+  }
   .lim-card {
     background: var(--surface); border: 1px solid var(--border);
     border-radius: var(--radius-md); padding: 12px 14px;
-    flex: 1 1 320px; min-width: 0;
+    min-width: 0;
   }
   .lim-head {
     display: flex; align-items: baseline; justify-content: space-between;
@@ -947,6 +958,12 @@ function renderTotals(agents) {
   }
 }
 
+// Columns for n limit cards: at most 3 per row, and rows as even as that
+// allows — 4 → 2x2, 5 → 3+2, 6 → 3+3 — so 4 cards never strand one below 3.
+function limitColumns(n) {
+  return n <= 3 ? Math.max(n, 1) : Math.ceil(n / Math.ceil(n / 3));
+}
+
 // The limits section: one card per reporting SUBSCRIPTION, or a single line
 // saying why there's nothing to show. Rendered before the chart's own
 // empty-state returns, so a fleet that has spent no tokens yet still shows its
@@ -982,6 +999,7 @@ function renderLimits(agents) {
 
   const cards = document.createElement("div");
   cards.className = "lim-cards";
+  cards.style.setProperty("--lim-cols", String(limitColumns(entries.length)));
   for (const entry of entries) cards.append(limitCard(entry, nowSec));
   $limits.append(cards);
 }
