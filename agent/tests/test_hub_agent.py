@@ -44828,11 +44828,20 @@ class TestDefectForgeAndTracker(unittest.TestCase):
                 raise ha.BoardHttpError("HTTP 400: bad key", 400)
             if path.endswith("/DOWN-1"):
                 raise ha.BoardHttpError("HTTP 503: down", 503)
+            if path.endswith("/AUTH-1"):
+                raise ha.BoardHttpError("HTTP 401: unauthorized", 401)
+            if path.endswith("/SLOW-1"):
+                raise urllib.error.URLError("timed out")
             return {"fields": {"issuetype": {"name": "Bug"}}}
         with mock.patch.object(ha, "jira_configured", return_value=True), \
                 mock.patch.object(ha, "azure_configured", return_value=False), \
                 mock.patch.object(ha, "jira_get", side_effect=get):
             self.assertEqual(ha._defect_tracker_classes(["XERK-1", "NOPE-1", "BAD-1"]),
                              {"XERK-1": "bug", "NOPE-1": "other", "BAD-1": "other"})
-            with self.assertRaises(ha.BoardHttpError):
-                ha._defect_tracker_classes(["DOWN-1"])
+            # A server or auth failure, or a timeout, says nothing about the
+            # ticket: it raises so the scan retries that commit.
+            for key in ("DOWN-1", "AUTH-1"):
+                with self.assertRaises(ha.BoardHttpError):
+                    ha._defect_tracker_classes([key])
+            with self.assertRaises(urllib.error.URLError):
+                ha._defect_tracker_classes(["SLOW-1"])
