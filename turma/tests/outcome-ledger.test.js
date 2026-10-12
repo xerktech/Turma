@@ -320,3 +320,49 @@ test("XERK-1839: a rescan resets the load gate, deletes what it evicts, and a fa
   await store.close();
   L._internals.reset();
 });
+
+test("XERK-1845: a PR's merge commit and the agent's merge time are kept", () => {
+  L._internals.reset();
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "OPEN" }] })], T0);
+  // First seen merged with no agent time: dated at the sighting...
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "MERGED" }] })], T0 + 5 * DAY);
+  assert.equal(only().prs[0].mergedAt, T0 + 5 * DAY);
+  // ...then the agent's real merge time (earlier) and commit replace it, past MERGED.
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "MERGED", mergedAt: "2026-10-02T00:00:00Z",
+    mergeCommit: "0123456789ABCDEF" }] })], T0 + 6 * DAY);
+  assert.equal(only().prs[0].mergedAt, Date.parse("2026-10-02T00:00:00Z"));
+  assert.equal(only().prs[0].mergeCommit, "0123456789abcdef");
+  // A later merge time never moves it, and a junk commit never lands.
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "MERGED", mergedAt: "2026-10-09T00:00:00Z",
+    mergeCommit: "zz" }] })], T0 + 7 * DAY);
+  assert.equal(only().prs[0].mergedAt, Date.parse("2026-10-02T00:00:00Z"));
+  assert.equal(only().prs[0].mergeCommit, "0123456789abcdef");
+});
+
+test("XERK-1845: rework counters only rise and are reported beside the outcome", () => {
+  L._internals.reset();
+  const pr = (ci, cr) => [{ url: "https://x/pr/1", state: "OPEN", ciRounds: ci, changesRequested: cr }];
+  L.observe([obs({ prs: pr(2, 1), qaRuns: [{ agent: "qa", verdict: "FAIL" }, { agent: "qa-delta", verdict: "PASS" }] })], T0);
+  // A stale read (a closed record carrying less) never lowers anything.
+  L.observe([obs({ prs: pr(1, 0), qaRuns: [{ agent: "qa", verdict: "FAIL" }] })], T0 + DAY);
+  const r = only();
+  assert.deepEqual([r.prs[0].ciRounds, r.prs[0].changesRequested], [2, 1]);
+  assert.deepEqual(r.qa, { runs: 2, pass: 1, partial: 0, fail: 1 });
+  // A second session with NO qa list (an older agent) is not counted as zero.
+  L.observe([obs({ sid: "s2", prs: [] }), obs({ sid: "s3", qaRuns: [] })], T0 + DAY);
+  const g = L.aggregate({ now: T0 + DAY }).groups[0];
+  assert.deepEqual(g.rework.qaRuns, { median: 1, n: 2 });
+  assert.deepEqual(g.rework.ciRounds, { median: 2, n: 1 });
+  assert.equal(g.pending, 3, "rework never changes the outcome");
+});
+
+test("XERK-1845: junk counters and qa entries are dropped by the whitelist", () => {
+  L._internals.reset();
+  L.observe([obs({ prs: [{ url: "https://x/pr/1", state: "OPEN", ciRounds: -1, changesRequested: "3" }],
+    qaRuns: [{ agent: "x" }, "y", null] })], T0);
+  const r = only();
+  assert.ok(!("ciRounds" in r.prs[0]) && !("changesRequested" in r.prs[0]));
+  assert.deepEqual(r.qa, { runs: 0, pass: 0, partial: 0, fail: 0 });
+  // A stored row (file load / Postgres rescan) with a junk qa block drops it.
+  assert.ok(!("qa" in L.sanitizeRow({ ...r, qa: { runs: "1", pass: 0, partial: 0, fail: 0 } })));
+});

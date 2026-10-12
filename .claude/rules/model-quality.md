@@ -1,6 +1,7 @@
 ---
 paths:
   - "turma/outcome-ledger.js"
+  - "agent/hub-agent.py"
   - "turma/tests/outcome-ledger.test.js"
   - "turma/server.js"
   - "docs/model-quality-adr.md"
@@ -47,5 +48,22 @@ This file is the operative rules for what has shipped.
 - **`/metrics` carries per (class, model, outcome) gauges only** — no host, ticket or session.
   Labels are BOUNDED: a model outside opus/sonnet/haiku/default reads `other`, and only the 20
   largest classes keep their name (both are agent/tracker strings on an unauthenticated route).
+- **Rework signals ride the agent's existing reports** (XERK-1845), reported beside the outcome,
+  never part of good/bad: `aggregate()` serves each group's `rework.<signal> = {median, n}` over
+  the rows that reported it.
+  - Per PR (`session.prs`): `mergeCommit` + `mergedAt` (merged only), `ciRounds` (red→green,
+    observed at the PR-refresh cadence, so a floor), `changesRequested` (GitHub exact from its
+    review list; GitLab/ADO edges into a changes-requested state). Agent: `_pr_merge_fields`,
+    `_carry_pr_rework`, carried in `pr-status.json` across restarts.
+  - Per session: `qaRuns: [{agent, verdict}]` off the transcript (`_scan_qa_entry`): a qa/qa-delta
+    `Agent` launch, its verdict from the sync tool_result or the background hand-back
+    (`<agent-message from=<agentId>>`, the id only from the structured launch record). Kept on the
+    registry record; `[]` = known zero, ABSENT = an older agent ("can't tell", not counted).
+  - Every counter only RISES in the ledger (a closed record can carry less); an agent's
+    `mergedAt` earlier than the sighting replaces it, even past MERGED.
+  - `closedSessions[]` carries `modelActual` + `qaRuns`, so a session first seen closed is not
+    credited to its spawn alias. `wireQaRuns` uses inline literals (reached from the restore).
+  - Known: a mid-session `/model` switch still credits the whole session to the LAST model.
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
-- Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:` cases in `server.test.js`.
+- Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:` cases in
+  `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`.
