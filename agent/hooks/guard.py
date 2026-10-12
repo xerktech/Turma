@@ -12413,6 +12413,19 @@ def _destructive_rm(tokens: list[str]) -> str | None:
 
 _PS_SHELLS = {"powershell", "pwsh", "cmd"}
 _PS_REMOVE_CMDS = {"remove-item", "ri", "rm", "del", "erase", "rd", "rmdir"}
+_PS_SWITCHES_RE = re.compile(r"(?:/[a-z])+")
+
+
+def _ps_drop_block_comments(script: str) -> str:
+    """`<# … #>` blocks blanked (a find loop: a regex rescanned per `<#`)."""
+    out, i = [], 0
+    while True:
+        j = script.find("<#", i)
+        k = script.find("#>", j + 2) if j >= 0 else -1
+        if k < 0:
+            return "".join(out) + script[i:]
+        out.append(script[i:j] + " ")
+        i = k + 2
 
 
 def _ps_statements(script: str) -> list[list[str]]:
@@ -12420,12 +12433,14 @@ def _ps_statements(script: str) -> list[list[str]]:
     each its words with quotes and backtick escapes removed and
     backslashes kept (`'C:\\Program Files'` is one word). Unbalanced quotes
     fall back to blanks."""
+    script = _ps_drop_block_comments(script.replace("`", ""))
     try:
-        lex = shlex.shlex(script.replace("`", ""), posix=False, punctuation_chars=";|&{}")
+        lex = shlex.shlex(script, posix=False, punctuation_chars=";|&{}")
         lex.whitespace_split = True
+        lex.commenters = ""   # `a#b` and `<# … #>` are not shell comments (QA)
         words = list(lex)
     except ValueError:
-        words = re.split(r"[\s;|&{}]+", script.replace("`", ""))
+        words = re.split(r"[\s;|&{}]+", script)
     out: list[list[str]] = [[]]
     for w in words:
         if not w or set(w) <= set(";|&{}"):
@@ -12451,37 +12466,71 @@ def _ps_targets(word: str) -> list[str]:
 
 
 def _ps_recursive_remove_args(st: list[str]) -> list[str] | None:
-    """The arguments of a recursive delete in this statement, else None: a
-    remove command or alias anywhere in it (after `if`, `foreach`, …) with an
-    abbreviation of `-Recurse`, a `/s` switch (`/s/q` too) or a `*` target."""
-    for i, w in enumerate(st):
-        if w.strip("()").lower() in _PS_REMOVE_CMDS:
-            args = st[i + 1:]
-            low = [a.lower() for a in args]
-            if any((len(a) >= 2 and "-recurse".startswith(a.split(":", 1)[0]))
-                   or re.fullmatch(r"(/[a-z])*/s(/[a-z])*", a) or a.endswith("*")
-                   for a in low):
-                return args
-            return None
+    """The arguments of a recursive delete this statement runs, else None: a
+    remove command or alias as its first word (statements are already cut at
+    `&`, `{`, `|`, so `if (1) { rm … }` reaches it; a leading `(` is dropped)
+    with an abbreviation of `-Recurse`, a `/s` switch (`/s/q` too) or a `*`
+    target. Only the first word: `Write-Host rm -Recurse x` deletes nothing."""
+    if not st or st[0].lstrip("(").lower() not in _PS_REMOVE_CMDS:
+        return None
+    args = st[1:]
+    for a in (a.lower() for a in args):
+        # Linear: `(/[a-z])*/s(/[a-z])*` backtracked quadratically (QA).
+        if ((len(a) >= 2 and "-recurse".startswith(a.split(":", 1)[0]))
+                or (_PS_SWITCHES_RE.fullmatch(a) and "s" in a.split("/"))
+                or a.endswith("*")):
+            return args
     return None
 
 
 def _ps_script_reason(tokens: list[str]) -> str | None:
     """Judge what `powershell`/`pwsh`/`cmd` runs when it IS the command's
-    program: every word after it is read as script, so an option's value or a
-    misspelled `-Command` cannot hide a delete (rollup XERK-1584). Quoted text
+    program (rollup XERK-1584). Each quoted script argument is read as a
+    script, and so are all the words joined, past the shell's own leading
+    options (`-NoProfile -ExecutionPolicy Bypass -Command …`), so neither an
+    option's value nor a misspelled `-Command` hides a delete. Quoted text
     naming such a script elsewhere (a commit message, `echo cmd -c …`) is not
     one."""
     words = _strip_prefixes(tokens)
     if not words or re.sub(r"\.exe$", "", _basename(words[0]).lower()) not in _PS_SHELLS:
         return None
-    for st in _ps_statements(" ".join(words[1:])):
-        args = _ps_recursive_remove_args(st)
-        for word in args or ():
+    statements = [st for w in words[1:] if re.search(r"[\s;|&{}]", w)
+                  for st in _ps_statements(w)]
+    joined = _ps_statements(" ".join(words[1:]))
+    if joined:
+        joined[0] = _ps_past_options(joined[0])
+    for st in statements + joined:
+        for word in _ps_recursive_remove_args(st) or ():
             for target in _ps_targets(word):
                 if _is_dangerous_path(target):
                     return f"refusing recursive delete of a protected path ({target!r})"
     return None
+
+
+def _ps_script_flag(word: str) -> bool:
+    """`-c`, `-Com…`/`-Command` (any abbreviation pwsh takes), `--command`,
+    `/Command`, or cmd's `/c` `/k`: the script starts at the next word."""
+    w = word.lower()
+    return (w in ("-c", "/c", "/k", "--command", "/command")
+            or (len(w) >= 4 and "-command".startswith(w)))
+
+
+def _ps_past_options(st: list[str]) -> list[str]:
+    """The joined words from where the script starts: past the shell's
+    options and their values up to a script flag (`-ExecutionPolicy Bypass
+    -c …`). Unchanged when a word that is no option or option value comes
+    first."""
+    prev_option = False
+    for i, w in enumerate(st):
+        if _ps_script_flag(w):
+            return st[i + 1:]
+        if w.startswith(("-", "/")):
+            prev_option = True
+        elif prev_option:
+            prev_option = False
+        else:
+            return st[i:]
+    return []
 
 
 def _ps_recursive_remove(low: str) -> bool:

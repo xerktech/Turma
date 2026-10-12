@@ -4567,7 +4567,14 @@ class TestClassification(unittest.TestCase):
                     'pwsh -c "if (1) { Remove-Item -Recurse C:\\Windows }"',
                     'pwsh -c "(Remove-Item -Recurse C:\\Windows)"',
                     'cmd /c "rd /s/q C:\\Windows"',
-                    'sudo pwsh -c "Remove-Item -Recurse C:\\Windows"'):
+                    'sudo pwsh -c "Remove-Item -Recurse C:\\Windows"',
+                    'pwsh -NoProfile -Comm Remove-Item -Recurse C:/Windows',
+                    # A comment or a glued brace hides nothing (QA delta 2).
+                    'pwsh -c "<# x #> Remove-Item -Recurse C:\\Windows"',
+                    'pwsh -c "Write-Host a#b; Remove-Item -Recurse C:\\Windows"',
+                    'cmd /c "echo a#b & rd /s /q C:\\Windows"',
+                    'pwsh -c "& {Remove-Item -Recurse C:\\Windows}"',
+                    'pwsh -c "1|%{Remove-Item -Recurse C:\\Windows}"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
@@ -4582,7 +4589,12 @@ class TestClassification(unittest.TestCase):
                     'echo cmd -c "Remove-Item -Recurse C:\\Windows"',
                     'grep -rn cmd -c "Remove-Item -Recurse C:\\Windows"',
                     'pwsh -WorkingDirectory C:\\Windows -c "Remove-Item -Recurse .\\build"',
-                    'cmd /c "dir C:\\Windows /s"'):
+                    'cmd /c "dir C:\\Windows /s"',
+                    # A remove word that is no statement's command (QA delta 2).
+                    'pwsh -c "Get-ChildItem -Filter del -Recurse C:\\Windows"',
+                    'pwsh -c "Write-Host rm -Recurse C:\\Windows"',
+                    'cmd /c "findstr /s rd C:\\Windows\\*"',
+                    'pwsh -c Get-ChildItem -Filter del -Recurse C:\\Windows'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
@@ -5391,6 +5403,14 @@ class TestExpansionBudget(unittest.TestCase):
             # a shared CI runner needs headroom, as the xargs test below has.
             limit = 20 if "<<EOF" in cmd else 15
             self.assertIn(self.TOO_LARGE, self.check(cmd, limit) or "", cmd[:80])
+
+    def test_a_long_cmd_switch_run_stays_linear(self):
+        # Rollup XERK-1584 QA: `(/[a-z])*/s(/[a-z])*` backtracked
+        # quadratically, 238s at 256 KB through the hook.
+        cmd = "cmd /c rd " + "/s" * 64000 + "/ build; rm -rf /"
+        t = time.process_time()
+        self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        self.assertLess(time.process_time() - t, 15)
 
     def test_a_default_assignment_spending_the_budget_reads_too_large(self):
         # Rollup XERK-1584: `_default_assignments` spent the budget outside
