@@ -29,8 +29,10 @@ Never restore a ladder or route from bench solve rates (`bench/run_policy.py` is
   host whose `defaultRuntime` isn't claude, carries no model (a qwen host would send the alias to
   its OpenAI endpoint). The class is the board row's `type` through `workClass`.
 - **Tripwire**: a promoted (class, M) whose live bad rate SINCE ITS PROMOTION (`liveRate`, rows
-  started at/after `at`) has a Wilson LOWER bound above the Opus baseline for the class is demoted,
-  logged, and the operator notified (`model-demoted:<class>/<model>`).
+  started strictly after `at`; never in the sweep that promoted it) has a Wilson LOWER bound
+  above the Opus baseline for the class is demoted, logged, and the operator notified
+  (`model-demoted:<class>/<model>`). Same-millisecond work was not routed by the promotion; the
+  release gate caught a test that re-demoted in the promoting sweep on a fast runner.
   - The rate's denominator is bad + good + merged-still-in-window, on BOTH sides: `good` needs the
     90-day window, so bad ÷ (good + bad) would read every new model as all-bad and trip at once.
   - No Opus evidence for the class → baseline 0, so one bad demotes. Conservative on purpose:

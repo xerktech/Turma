@@ -888,7 +888,7 @@ function pairEvidence(cls, model, { since = 0, now = Date.now(), windowDays = WI
 
 /**
  * The live bad rate of (class, model) for the tripwire: {bad, n} over live rows
- * that started at or after `since`. n counts the rows with something to judge —
+ * that started after `since` (all of them when `since` is 0). n counts the rows with something to judge —
  * bad, good, or merged and still inside the defect window — so a model is not
  * read as all-bad just because `good` needs the whole window to elapse; the Opus
  * baseline is read the same way.
@@ -897,7 +897,9 @@ function liveRate(cls, model, { since = 0, now = Date.now(), windowDays = WINDOW
   let bad = 0, n = 0;
   for (const r of rows.values()) {
     if (r.kind === "shadow" || r.cls !== cls || r.model !== model) continue;
-    if ((r.startedAt || r.firstSeen) < since) continue;
+    // Strictly after: work started in the promotion's own millisecond was not
+    // routed by it.
+    if (since && (r.startedAt || r.firstSeen) <= since) continue;
     const { outcome, reason } = outcomeOf(r, now, windowDays);
     if (outcome === "bad") { bad += 1; n += 1; }
     else if (outcome === "good" || reason === "merged, in window") n += 1;
