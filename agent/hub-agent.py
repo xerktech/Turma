@@ -11180,7 +11180,7 @@ def _restore_live_agents(session_id, path, state, report=None):
         # (_seed_qa_scan) only knows runs that already had one.
         calls = state.setdefault("qaCalls", {})
         for k, v in list(snap["qaCalls"].items())[-QA_RUNS_MAX:]:
-            if v in QA_AGENT_TYPES:
+            if isinstance(v, str) and v in QA_AGENT_TYPES:
                 calls.setdefault(str(k)[:200], v)
         while len(calls) > QA_RUNS_MAX:
             calls.pop(next(iter(calls)))
@@ -17711,6 +17711,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
               if claude_sid and VALID_CLAUDE_SID_RE.fullmatch(claude_sid) else "")
     newest, newest_mtime = None, 0.0
     found, found_mtime = None, 0.0
+    if not primed:
+        # A transcript not written yet (or a project dir not made yet) is read
+        # from its first byte; one that exists is re-judged below (XERK-1857).
+        state["qaComplete"] = True
     try:
         for fname in os.listdir(proj):
             if not fname.endswith(".jsonl"):

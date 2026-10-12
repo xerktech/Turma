@@ -44563,7 +44563,39 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
                 except RuntimeError:
                     pass
                 self.assertEqual("s1" in sm.sess_state, not resume)
+                if not resume:
+                    # XERK-1857: the snapshot it publishes says its QA scan is whole.
+                    self.assertIs(sm.sess_state["s1"].get("qaComplete"), True)
         self.assertEqual(sm.sess_state.get("s1"), None)
+
+    def test_a_restart_before_the_transcript_exists_is_qa_complete(self):
+        # XERK-1857 QA D3: the transcript is then read from its first byte.
+        sid = "66666666-6666-4666-8666-666666666666"
+        st = {}
+        ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertIs(st.get("qaComplete"), True)
+        self._pinned(sid, [_qa_call("t1"), _qa_launched("t1", "a1")])
+        rep = ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertFalse(rep.get("qaPartial"))
+        rep = ha.session_report(self.tmp, {}, session_id="s1", claude_sid=sid)
+        self.assertFalse(rep.get("qaPartial"))
+
+    def test_a_forged_unhashable_qa_call_never_raises(self):
+        # XERK-1857 QA D1: the snapshot is session-writable.
+        sid = "77777777-7777-4777-8777-777777777777"
+        self._pinned(sid, [_qa_call("t1")])
+        ha.session_report(self.tmp, {"primed": True, "qaComplete": True},
+                          session_id="s1", claude_sid=sid)
+        snap = os.path.join(ha.LIVE_AGENTS_DIR, "s1.json")
+        with open(snap) as f:
+            body = json.load(f)
+        body["qaCalls"] = {"x": [1], "y": {}, "t1": "qa"}
+        with open(snap, "w") as f:
+            json.dump(body, f)
+        st = {}
+        rep = ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertFalse(rep.get("qaPartial"))
+        self.assertEqual(st["qaCalls"], {"t1": "qa"})
 
     def test_qa_partial_sticks_and_rides_both_wires(self):
         sm = self.make_manager()
