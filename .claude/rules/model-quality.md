@@ -73,9 +73,54 @@ This file is the operative rules for what has shipped.
     launch (`is_error`) is no run, and the report's own verdict LINE beats a quoted one.
   - Known: a mid-session `/model` switch still credits the whole session to the LAST model; a
     RESUMED qa agent's later report is not re-delivered as a hand-back, so its first verdict sticks.
+- **Shadow runs (XERK-1847), only under `MODEL_POLICY=observe|on`** (default observe):
+  - **Hub samples, leader-only** (`modelShadowSweep` after `outcomeLedgerSweep`): a live claude
+    row whose PR MERGED with a `mergeCommit`, merged within `MODEL_SHADOW_MAX_AGE_DAYS` (7).
+    Sampling is a deterministic hash of the row key (`MODEL_SHADOW_RATE`, 0.25) and the decision
+    is persisted on the row (`shadow`), so nothing is asked twice. `MODEL_SHADOW_DAILY_MAX` (10,
+    rolling 24h) leaves the rest undecided for a later day.
+  - Model: of `MODEL_SHADOW_MODELS` (sonnet,haiku), never the live family, fewest pairs for the
+    class. Host: online, DECIDED into the org, `modelShadow.available`, repo cloned (a shadow
+    never clones), a free slot, claude default runtime, subscription not paused.
+  - `spawnShadow` carries a hub-minted `sh-<hex>` id; `observeShadows` takes a host's
+    `shadowRuns` report only for an id dispatched to THAT host in THAT org. A grade is final.
+  - **Shadow rows never feed the live groups or `/metrics`**; `aggregate().pairs` serves per
+    (class, candidate model) `pairs/graded/shadowGood/shadowBad/mOnlyFail/failed`, `mOnlyFail` =
+    shadow bad while the live row is not bad (the promotion rule's numerator, XERK-1848). The
+    same evidence rides each group as `shadow: {pairs, candidateOnlyBad, …}` (what the XERK-1849
+    card reads); a candidate with no live sessions gets a zero-session group carrying it.
+  - Agent (`spawn_shadow` → `_advance_shadow_runs`): RUN session on the candidate from the merge's
+    first parent, blind (comments after the live session started are dropped, no attachments, no
+    fetch directive); `shadow-done` (or its end/timeout) commits leftovers and hands the HEAD to an
+    Opus GRADE session; `shadow-grade` makes it terminal. A run with no change is graded bad
+    without a grader. One session teardown per beat; the `turma-shadow/<id>` branch is dropped.
+  - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
+    no ticket sweep — auto-stop on Done, auto-merge, close-ticket, the ladder — acts on it. The
+    hub raises no alert for a `shadow` session and lists it in no peer roster.
+  - **No-publish is two layers.** The launch env (`SHADOW_ENV`) carries an EMPTY
+    `url.<dead path>.pushInsteadOf` via `GIT_CONFIG_COUNT/KEY_0/VALUE_0`, which rewrites EVERY
+    push URL (remote, path, file, https, ssh) for any git a child runs — a hook, `rebase -x`, an
+    interpreter's subprocess — while fetch works; plus blanked tracker tokens, a non-token
+    `GH_TOKEN`, `--strict-mcp-config` and `ENABLE_CLAUDEAI_MCP_SERVERS=false`. On top, the guard
+    (`TURMA_SHADOW`, `shadow_reason`, `agent-hooks.md`) fails closed per family and refuses any
+    command naming the `GIT_CONFIG*`/`GIT_SSH`/`GIT_EDITOR` env. A text guard alone cannot close
+    git's own command runners — never drop the env layer.
+  - **A shadow is never resumed, migrated or paused** (`resume`, `_resume_at_cwd`,
+    `export_session`, `_sleeper_unpausable`, hub `sleeperPausable`): relaunched it would carry none
+    of its launch protections. The closed record keeps `shadow`, and every shadow session and
+    transcript id is persisted (`_sessions` in `shadow-runs.json`) so a record that lost the flag
+    is still refused. An operator-killed shadow's closed record + worktree are reaped.
+  - **These stop ACCIDENTAL publishing, not a shadow that deliberately tampers** (QA-reproduced:
+    a `pushurl` written into `.git/config`, an interpreter clearing its env, a longer
+    pushInsteadOf, a nested `claude` without `TURMA_SHADOW`, a stored `gh` token or SSH key). No
+    same-uid layer closes that; the credential-level fix (no push credentials for a shadow) is
+    XERK-1859. A live run session could also
+    write its grader's `shadow-grade.json` (same class). Peeking at later git history is forbidden
+    by the directive only (validity, not safety).
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
-- Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:` cases in
-  `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`.
+- Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:`/`XERK-1847:` cases in
+  `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`,
+  `TestShadowRuns`; `TestShadowRun` (`test_guard.py`); the shadow cases in `test_session_cli.py`.
 
 ## The report (XERK-1849): Usage page "Model quality" card, web + Android
 

@@ -7449,6 +7449,75 @@ class TestUnreadableConstructs(unittest.TestCase):
             self.assertLess(time.process_time() - t, 3.0, cmd[:20])
 
 
+class TestShadowRun(unittest.TestCase):
+    """XERK-1847: a shadow run's session (TURMA_SHADOW set) may not publish —
+    no push, no PR/MR, no tracker or API write — while ordinary work runs."""
+
+    DENIED = [
+        "git push origin HEAD", "git -C /r push", "git push --dry-run", "bash -c 'git push'",
+        "x=push; git $x", "gh pr create -t a -b b", "gh pr comment 1 -b x", "gh issue create",
+        "gh pr merge 1", "gh release create v1", "gh api -X POST repos/o/r/pulls",
+        "gh api repos/o/r/issues -f title=x", "gh api graphql -f query=x", "glab mr create",
+        "hub pull-request", "az repos pr create", "az boards work-item update --id 1",
+        "jira issue move X-1 Done", "acli jira workitem transition", "ado pr-create",
+        "curl -X POST https://x.atlassian.net/rest/api/3/issue",
+        "curl -sd '{}' https://api.github.com/repos/o/r/pulls",
+        "curl --data-binary @f https://h", "curl -T f https://h", "curl -XPUT https://h",
+        "wget --post-data=a https://h", "http POST https://h a=1", "http https://h a:=1",
+        # QA's bypasses (an alias or an unknown verb fails closed, attached flags,
+        # an interpreter-run tracker CLI, registries).
+        "git -c alias.p=push p origin x", "git config alias.p push; git p",
+        "git subtree push --prefix d o b", "git send-email x", "git remote set-url origin u",
+        "gh api repos/o/r/issues -fbody=x", "gh api x --input=f.json",
+        "gh api /graphql -fquery=x", "env -u GH_TOKEN gh api r -fbody=x",
+        "python3 ~/.claude/bin/jira issue x", "curl -K f", "az rest --method post --uri u",
+        "npm publish", "docker push x", "twine upload d/*", "cargo publish", "tea pr create",
+        # Delta QA: git's own command runners, the push block's env, wget prefixes.
+        "git -c core.fsmonitor='git push o' status", "GIT_EDITOR='git push o; true' git commit",
+        "git rebase -x 'git push o' HEAD~1", "git bisect run sh -c 'git push o'",
+        "git -c core.hooksPath=h commit", "git -c diff.external=x diff",
+        "env -u GIT_CONFIG_COUNT git push", "GIT_CONFIG_COUNT=0 git status",
+        "unset GIT_CONFIG_KEY_0; git status", "export GIT_SSH_COMMAND=x; git status",
+        "env GIT_CONFIG_PARAMETERS=x git status", "git -c merge.x.driver=y merge main", "wget --post-d=a=b u", "wget --meth=PUT u",
+    ]
+    ALLOWED = [
+        "git status", "git commit -m fix", "git switch -c turma-shadow/sh-0011223344",
+        "git diff a b", "git checkout abc -- t.py", "npm test", "python3 -m pytest -q",
+        "gh pr view 1", "gh pr diff 9", "gh api repos/o/r/pulls/9",
+        "az repos pr list", "curl -s https://example.com", "curl -XGET https://h",
+        "wget https://h/f", "http https://h", "git config user.name x", "docker build .",
+        "cat jira.md", "git log --oneline", "grep -rn jira agent/", "rg hub turma/",
+        "git commit -m hub", "git fetch origin", "git pull", "git ls-remote origin",
+        "git submodule update --init", "git rebase main",
+        "grep -rn GIT_SSH agent/", "git log --grep GIT_CONFIG", "git commit -m 'GIT_DIR is set'",
+        "git -c merge.conflictStyle=zdiff3 merge main",
+    ]
+
+    def test_publishing_is_denied_only_in_a_shadow(self):
+        for c in self.DENIED:
+            with self.subTest(c=c):
+                d, reason, cat = guard.decide("Bash", {"command": c}, shadow=True)
+                self.assertEqual(d, "deny")
+                self.assertEqual(cat, "policy", "never grantable")
+        for c in self.ALLOWED:
+            with self.subTest(c=c):
+                self.assertEqual(guard.decide("Bash", {"command": c}, shadow=True)[0], "allow")
+        # Outside a shadow, a push is ordinary work.
+        self.assertEqual(guard.decide("Bash", {"command": "git push origin HEAD"})[0], "allow")
+
+    def test_the_hook_reads_the_flag_from_the_environment_even_protected(self):
+        ev = json.dumps({"tool_name": "Bash", "tool_input": {"command": "git push"}})
+        for flags in ([], [guard.PROTECTED_FLAG]):
+            env = {**os.environ, "TURMA_SHADOW": "run"}
+            out = subprocess.run([sys.executable, "-SI", GUARD_PATH] + flags, input=ev,
+                                 capture_output=True, text=True, env=env)
+            self.assertIn("shadow run", out.stdout, flags)
+            env.pop("TURMA_SHADOW")
+            out = subprocess.run([sys.executable, "-SI", GUARD_PATH] + flags, input=ev,
+                                 capture_output=True, text=True, env=env)
+            self.assertEqual(out.stdout.strip(), "", flags)
+
+
 class TestHookSourcesCompileClean(unittest.TestCase):
     def test_module_level_names_are_unique(self):
         # A later `_X_RE = …` silently replaces an earlier one for every
