@@ -1082,8 +1082,8 @@ function shellSegments(command) {
     else if (c === "\\" && i + 1 < n) {
       i++;
       if (s[i] !== "\n") { word.push(s[i]); inWord = true; }
-    } else if (c === "$" && i + 1 < n && s[i + 1] === "(") {
-      word.push("$("); inWord = true; depth = 1; i++;
+    } else if ((c === "$" || c === "<" || c === ">") && i + 1 < n && s[i + 1] === "(") {
+      word.push(c + "("); inWord = true; depth = 1; i++;   // `<(…)`/`>(…)` run like `$(…)`
     } else if (c === "`") { word.push(c); inWord = true; tick = true; }
     else if (c === "#" && !inWord) { while (i + 1 < n && s[i + 1] !== "\n") i++; }
     else if (c === ";" || c === "\n") endSeg();
@@ -1172,7 +1172,7 @@ function shellCmdKind(words, depth = 0) {
   return ["work", null];
 }
 
-// The command texts a word's `$(…)`/backtick substitutions run. `$((…))` is
+// The command texts a word's `$(…)`/`<(…)`/`>(…)`/backtick substitutions run. `$((…))` is
 // arithmetic, not a command, but a `$(…)` inside it still runs. An unclosed one
 // yields the rest of the word.
 function shellArithEnd(word, i) {
@@ -1193,7 +1193,7 @@ function shellSubstBodies(word) {
   while (i < n) {
     if (word.startsWith("$((", i) && shellArithEnd(word, i) != null) {
       i += 3;
-    } else if (word.startsWith("$(", i)) {
+    } else if (word.startsWith("$(", i) || word.startsWith("<(", i) || word.startsWith(">(", i)) {
       let depth = 1, j = i + 2;
       while (j < n && depth) {
         if (word[j] === "(") depth++;

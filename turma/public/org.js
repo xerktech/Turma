@@ -335,7 +335,10 @@
     const nav = typeof window !== "undefined" && window.TurmaNav;
     if (nav && nav.preserveScroll) nav.preserveScroll(slot, () => { slot.innerHTML = html; });
     else slot.innerHTML = html;
-    const again = focusSel && slot.querySelector(focusSel);
+    // A focused control the repaint dropped (a row of a closed menu, a removed
+    // host's org) has nothing to return to: fall back to the menu button, not
+    // <body>, so the next key still lands in the control.
+    const again = focusSel && (slot.querySelector(focusSel) || slot.querySelector("[data-org-toggle]"));
     if (again && again.focus) again.focus({ preventScroll: true });
   }
 

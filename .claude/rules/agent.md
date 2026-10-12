@@ -418,11 +418,9 @@ worktree→repo attribution ledger, the subscription-limit snapshot + probe.
   --file=/root/.git-credentials`) after gh, reading an optional bind mount. gh first so github.com
   always gets a fresh token. Guard denies writing `~/.git-credentials`. Native inherits the host's
   git config untouched. Tests: `test_denies_non_github_git_credential_writes`.
-- **Azure DevOps git auth (XERK-54, XERK-226)** — reuses the board PAT via a URL-scoped
-  `http.<azure_base>.extraHeader` (`--wire-azure-git`, also exports `AZURE_DEVOPS_EXT_PAT` for `az
-  repos`) — not a credential helper, since self-hosted TFS/Server often issues no Basic challenge one
-  can act on. Wired by the old container entrypoint
-  only; native (no `az`) leaves this dormant. Tests: `TestAzureGitAuthConfig`.
+- **Azure DevOps git auth is the HOST's own git config** (XERK-1584 #10.2): the old container-only
+  `--wire-azure-git` wrote the board PAT into world-readable `/etc/gitconfig` and onto git's argv,
+  and nothing native ran it, so it was deleted. Never re-add a `--system` PAT header.
 
 ## `tunnel-agent.js`
 

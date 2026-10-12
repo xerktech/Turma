@@ -10680,8 +10680,8 @@ def _shell_segments(command):
             if s[i] != "\n":
                 word.append(s[i])
                 in_word = True
-        elif c == "$" and i + 1 < n and s[i + 1] == "(":
-            word.append("$(")
+        elif c in "$<>" and i + 1 < n and s[i + 1] == "(":
+            word.append(c + "(")   # `<(…)`/`>(…)` run their body like `$(…)`
             in_word, depth = True, 1
             i += 1
         elif c == "`":
@@ -10840,14 +10840,14 @@ def _shell_arith_end(word, i):
 
 
 def _shell_subst_bodies(word):
-    """The command texts a word's `$(…)`/backtick substitutions run. `$((…))`
-    is arithmetic, not a command, but a `$(…)` inside it still runs. An
-    unclosed one yields the rest of the word."""
+    """The command texts a word's `$(…)`/`<(…)`/`>(…)`/backtick substitutions
+    run. `$((…))` is arithmetic, not a command, but a `$(…)` inside it still
+    runs. An unclosed one yields the rest of the word."""
     out, i, n = [], 0, len(word)
     while i < n:
         if word.startswith("$((", i) and _shell_arith_end(word, i) is not None:
             i += 3
-        elif word.startswith("$(", i):
+        elif word.startswith(("$(", "<(", ">("), i):
             depth, j = 1, i + 2
             while j < n and depth:
                 depth += {"(": 1, ")": -1}.get(word[j], 0)
@@ -18638,8 +18638,8 @@ def collect_azure_repos():
     AZDO_URL/AZDO_TOKEN the board polls with — across every project the PAT can
     see (the collection-level repositories API enumerates them all in one call).
     nameWithOwner = 'Project/Repo'; cloneUrl is the https remoteUrl, which plain
-    git already authenticates against via the extraHeader wired at boot
-    (--wire-azure-git). Raises on HTTP failure; malformed entries are dropped."""
+    git authenticates against with the host's own git credentials. Raises on
+    HTTP failure; malformed entries are dropped."""
     data = azure_req("/_apis/git/repositories", {})
     out = []
     for r in (data.get("value") or []):
@@ -19779,30 +19779,6 @@ def azure_base():
     # Trim anything from a pasted board/REST URL back to the collection root.
     b = re.split(r"/_(?:apis|workitems|git|boards|dashboards|wiki|build)\b", b, maxsplit=1)[0]
     return b.rstrip("/")
-
-
-def azure_git_auth_config():
-    """The `git config` that lets plain git (clone/fetch/push) authenticate
-    against the configured Azure DevOps org, or None when ADO isn't configured.
-
-    Returns (key, value) for `git config --system`:
-      http.<base>.extraHeader = Authorization: Basic <base64(":<PAT>")>
-    URL-scoped to the ADO base, so no other host ever receives the header. The
-    PAT is the same AZDO_TOKEN the board already uses; Basic with an empty
-    username matches azure_req().
-
-    Why extraHeader and not a credential helper: self-hosted TFS / Azure DevOps
-    Server often does not issue a Basic challenge git can act on, so a helper is
-    never invoked at all (which is why such hosts set `http.proactiveAuth=basic`).
-    The image's git is too old for proactiveAuth (Debian bookworm ships git 2.39;
-    it landed in 2.46), whereas extraHeader (git 2.4+) forces the header
-    proactively on every request and works on the shipped git. This is the
-    non-GitHub counterpart to github.com going through `gh auth git-credential`."""
-    base = azure_base()
-    if not (base and AZDO_TOKEN):
-        return None
-    token = base64.b64encode(f":{AZDO_TOKEN}".encode()).decode()
-    return (f"http.{base}.extraHeader", f"Authorization: Basic {token}")
 
 
 def normalize_azure_site(url):
@@ -38168,8 +38144,8 @@ class SessionManager:
         from the URL its own API reported — never one built from the request.
         Anything unlisted falls back to the legacy free-text GitHub path,
         validated to a bare owner/repo. Auth: GitHub rides the system git
-        credential helper (`gh auth git-credential`), Azure DevOps the
-        extraHeader wired at boot (--wire-azure-git), GitLab the host's mounted
+        credential helper (`gh auth git-credential`), Azure DevOps the host's
+        own git credentials, GitLab the host's mounted
         ~/.ssh key (its listing URLs are ssh). The dest is the repo name
         directly under REPOS_ROOT and must not already exist."""
         raw = (repo_spec or "").strip()
@@ -42337,26 +42313,6 @@ if __name__ == "__main__":
         # the caller (turma-agentctl enroll) restart. Exit codes: 0 success/no-op,
         # 2 hub too old (soft skip on boot), 1 failure.
         sys.exit(enroll_self())
-    if "--wire-azure-git" in sys.argv:
-        # Writes --system git config so plain git can push to a non-GitHub Azure
-        # DevOps org using the PAT the board already has. This was invoked at boot
-        # by the old container entrypoint (as root, before the privilege drop);
-        # the native agent does not wire it (no `az`), so it is currently unused.
-        # Non-fatal and secret-safe: it logs the host, never the token, and any
-        # failure just leaves git unwired.
-        cfg = azure_git_auth_config()
-        if cfg:
-            key, value = cfg
-            try:
-                subprocess.run(["git", "config", "--system", key, value],
-                               check=True)
-                site = normalize_azure_site(AZDO_URL) or azure_base()
-                print(f"[entrypoint] git: Azure DevOps auth wired for {site} "
-                      "(http.extraHeader)")
-            except Exception as e:  # pragma: no cover - best effort
-                print(f"[entrypoint] git: Azure DevOps auth NOT wired ({e})",
-                      file=sys.stderr)
-        sys.exit(0)
     try:
         main()
     except KeyboardInterrupt:

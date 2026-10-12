@@ -1,9 +1,9 @@
 package com.xerktech.turma.harness
 
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.test.StandardTestDispatcher
 import kotlinx.coroutines.test.TestDispatcher
 import kotlinx.coroutines.test.UnconfinedTestDispatcher
-import kotlinx.coroutines.test.resetMain
 import kotlinx.coroutines.test.setMain
 import org.junit.rules.TestWatcher
 import org.junit.runner.Description
@@ -38,7 +38,15 @@ class MainDispatcherRule(
         Dispatchers.setMain(dispatcher)
     }
 
+    /**
+     * Parks `Dispatchers.Main` on a scheduler nothing ever advances, rather than
+     * `resetMain()` (XERK-1584 #6). Nothing cancels a test's ViewModels, so a
+     * `viewModelScope` coroutine still waiting on an OkHttp thread can resume
+     * after the test ends. Reset, that resume found no Main and threw
+     * IllegalStateException inside whichever test ran next. Parked, it queues
+     * and is dropped; the next test's [starting] installs its own dispatcher.
+     */
     override fun finished(description: Description) {
-        Dispatchers.resetMain()
+        Dispatchers.setMain(StandardTestDispatcher())
     }
 }

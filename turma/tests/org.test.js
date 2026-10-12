@@ -385,6 +385,39 @@ test("org: a repaint keeps the menu's scroll and the focused control", () => {
   }
 });
 
+// XERK-1584 #4: closing the menu (All orgs, Escape) or losing a host drops the
+// focused row; focus goes back to the menu button, never <body>.
+test("org: a focused control the repaint drops hands focus to the menu button", () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")] });
+  click("data-org-toggle", "");
+  const focused = { attributes: [{ name: "data-org-key", value: "acme.atlassian.net" }] };
+  const toggle = { focus(opts) { this.focusedWith = opts; } };
+  const asked = [];
+  slot.ownerDocument = { activeElement: focused };
+  slot.querySelector = (sel) => { asked.push(sel); return sel === "[data-org-toggle]" ? toggle : null; };
+  global.CSS = { escape: (s) => s };
+  try {
+    click("data-org-key", "");                           // "All orgs" closes the menu
+    assert.doesNotMatch(slot.innerHTML, /org-menu/);
+    assert.deepEqual(asked, ['[data-org-key="acme.atlassian.net"]', "[data-org-toggle]"]);
+    assert.deepEqual(toggle.focusedWith, { preventScroll: true });
+  } finally {
+    delete global.CSS;
+  }
+});
+
+// Nothing in the control had focus: a repaint moves no one's focus.
+test("org: a repaint with no focused control focuses nothing", () => {
+  const { slot, click } = mountOrg();
+  Org.update({ agents: [agent("a", "acme.atlassian.net")] });
+  let asked = 0;
+  slot.ownerDocument = { activeElement: null };
+  slot.querySelector = () => { asked++; return { focus() { throw new Error("focused"); } }; };
+  click("data-org-toggle", "");
+  assert.equal(asked, 0);
+});
+
 test("org: the auto switch flips optimistically and rolls back on a failed POST", async () => {
   const { slot, click } = mountOrg();
   Org.update({ agents: [agent("a", "acme.atlassian.net")], autoStartOrgs: {} });
