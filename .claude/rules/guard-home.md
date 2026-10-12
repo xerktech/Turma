@@ -47,8 +47,9 @@ paths:
     `~+` always reads as `$PWD`.
   - A bare `cd` is one after its options (`--`, `-P`), among redirections (`cd >/dev/null`,
     `cd 2>&1`), spelled (`"cd"`, `c\d`) or opening a quoted script (`bash -c 'cd; …'`)
-    (`_BARE_CD_RE`, rollup XERK-1584). Its redirect target must end at a blank or operator, so
-    `>a1>a1…` has one reading: keep the lookahead linear.
+    (`_bare_cds`, rollup XERK-1584). It walks at most 8 redirections of 256-char targets per
+    `cd` (past either: bare). Never a lookahead regex: one rescanned a `cd >'cd >'cd …` chain
+    per `cd`, 720s on 250 KB through the hook, past its timeout (which RUNS the command).
   - `~-` reads as `$OLDPWD`, and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD` (XERK-1696);
     `_under_cwd` reads `$OLDPWD` as `$PWD`: any directory the line visited, unordered.
   - A line that assigns PWD/OLDPWD AND moves (`cd`/`pushd`/`popd`) is also read with both

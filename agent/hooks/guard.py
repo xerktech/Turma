@@ -4654,6 +4654,8 @@ def _reader_feeds(command: str, segs: list[str], readers: dict[int, object],
             # as the program (rollup XERK-1584).
             if words and (prog == "printf" or spelled):
                 rest = words[_word_end(words, 0):].strip()
+                if words.startswith("--") and words[2:3] in (" ", "\t"):
+                    rest = rest[_word_end(rest, 0):].strip()    # `printf -- FMT …`
                 if rest:
                     unformatted[len(echo) - 1] = "$(echo " + rest + ")"
         else:
@@ -8271,12 +8273,39 @@ def _replacement_tildes(text: str) -> list[tuple[int, str]]:
 _REPLACEMENT_TILDE_RE = re.compile("~" + _TILDE_SUFFIX + "(?=[/}])")
 # A `cd` with no operand, which goes to $HOME: after its options (`--`, `-P`),
 # among redirections (`cd >/dev/null`, `cd 2>&1`) and opening a quoted script
-# (`bash -c 'cd; …'`). A redirect target must end at a blank or an operator, so
-# a run of `>a1>a1…` has one reading and the lookahead stays linear.
-_BARE_CD_RE = re.compile(
-    r"((?:^|(?<=[\s;&|(){`'\"]))cd(?:[ \t]+-(?:-|[LPe@]+))*)"
-    r"(?=(?:[ \t]*(?:\d+|\{\w+\})?(?:[<>]&?|&>>?|>>|>\|)[ \t]*[^\s;&|()<>`]+(?=[\s;&|)}`]|$))*"
-    r"[ \t]*(?:[;&|)}\n`]|$))")
+# (`bash -c 'cd; …'`). The redirections are walked by `_bare_cds`, never a
+# lookahead: one rescanned the rest of a `cd >'cd >'cd …` chain per `cd`
+# (720s on 250 KB, past the hook timeout, which RUNS the command).
+_BARE_CD_HEAD_RE = re.compile(r"(?:^|(?<=[\s;&|(){`'\"]))cd(?:[ \t]+-(?:-|[LPe@]+))*")
+_BARE_CD_REDIRECT_RE = re.compile(
+    r"[ \t]*(?:\d+|\{\w+\})?(?:[<>]&?|&>>?|>>|>\|)[ \t]*[^\s;&|()<>`]{1,256}")
+_BARE_CD_END_RE = re.compile(r"[ \t]*(?:[;&|)}\n`]|\Z)")
+# How many redirections, each target at most 256 characters, a bare `cd` is
+# read through; past either it is read as bare (an added home reading only).
+_BARE_CD_MAX_REDIRECTS = 8
+
+
+def _bare_cds(text: str) -> str:
+    """``text`` with ` $HOME` after each `cd` that has no operand. Each `cd` is
+    read at most `_BARE_CD_MAX_REDIRECTS` redirections on, so it stays linear."""
+    pieces, last = [], 0
+    for m in _BARE_CD_HEAD_RE.finditer(text):
+        j, bare = m.end(), False
+        for _ in range(_BARE_CD_MAX_REDIRECTS):
+            r = _BARE_CD_REDIRECT_RE.match(text, j)
+            if r is None:
+                bare = _BARE_CD_END_RE.match(text, j) is not None
+                break
+            j = r.end()
+            if j < len(text) and text[j] not in " \t\n;&|()<>`":
+                bare = True     # a target past 256 characters
+                break
+        else:
+            bare = True
+        if bare:
+            pieces += [text[last:m.end()], " $HOME"]
+            last = m.end()
+    return "".join(pieces) + text[last:] if pieces else text
 # What a line that may bind HOME holds: the name (`HOM{E,}`, `H\OME`, `H$x`
 # with `x=OME`) or an `eval` that can build it.
 _HOME_HINT_RE = re.compile(r"HOM|OME|\beval\b")
@@ -8316,7 +8345,7 @@ def _home_tilde_readings(command: str) -> list[str]:
         # ...and a bare `cd`, which goes to $HOME: `HOME=/; cd; rm -rf etc`.
         # A `cd` spelled with quotes or escapes (`"cd"`, `c\d`) is one too.
         if spelled:
-            out = _BARE_CD_RE.sub(r"\1 $HOME", (_cd_spelled_readings(out) or [out])[0])
+            out = _bare_cds((_cd_spelled_readings(out) or [out])[0])
     readings = [out]
     if "${" in out:
         spots = [(m.end(1), m.group(2) or "") for m in _PARAM_TILDE_RE.finditer(out)]

@@ -5781,6 +5781,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "$(false || echo rm -rf /etc | xargs echo)",
                     "$(false || echo rm -rf /etc | xargs)",
                     "e=printf; $e '%s\\n' 'rm -rf /etc' > f; read a < f; $a",
+                    "e=printf; $e -- '%s\\n' 'rm -rf /etc' > f; read a < f; $a",
                     "export -n HOME; rm -rf \"${HOME@a}\"/etc",
                     "chmod -R 777 /.*", "chown -R x /.*", "chmod -R 777 /etc/.?",
                     "rm --no-preserve-root -rf /.*",
@@ -5799,11 +5800,21 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "cd -- && rm -rf node_modules", "bash -c 'cd; rm -rf build'"):
             with self.subTest(cmd=cmd):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
-        # A redirect run after `cd` reads in one pass, never every split.
+        # Each `cd` is walked a bounded number of redirections on: a lookahead
+        # rescanned a `cd >'cd >'cd …` chain per `cd` (720s on 250 KB, QA).
         t = time.process_time()
-        for text in ("cd " + ">a1" * 20000 + " x", "cd" + " -P" * 10000 + " q"):
-            guard._BARE_CD_RE.sub("X", text)
+        for text in ("cd " + ">a1" * 20000 + " x", "cd" + " -P" * 10000 + " q",
+                     "HOME=/; cd " + ">'cd " * 20000 + "x", "cd > cd " * 20000 + " x",
+                     "cd >{cd " * 20000, 'cd >"cd ' * 20000):
+            guard._bare_cds(text)
         self.assertLess(time.process_time() - t, 1)
+        self.assertEqual(guard._bare_cds("cd >/dev/null /etc; cd -"), "cd >/dev/null /etc; cd -")
+        # A spelled `cd` whose reading is too large denies, never raises.
+        taken = "".join(chr(c) for c in range(0xE000, 0xF900))
+        with self.assertRaises(guard._ExpansionTooLarge):
+            guard._home_tilde_readings("HOME=/; c\\d; echo {x'" + taken + "',${HOME}}")
+        self.assertEqual(guard.decide("Bash", {"command": "HOME=/; c\\d; echo {x'" + taken
+                                               + "',${HOME}}"}, cwd="/tmp")[0], "deny")
 
     def test_a_filtered_or_unread_body_runs_as_its_producers_text(self):
         # XERK-1613: a here-string producer, a rewriting filter, or an unread
