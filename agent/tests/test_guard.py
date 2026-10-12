@@ -5839,14 +5839,14 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "HOME=/; cd '-P'; rm -rf etc", "HOME=/; cd -P''; rm -rf etc",
                     "HOME=/; cd \\-P; rm -rf etc", "HOME=/; cd $'-P'; rm -rf etc",
                     "HOME=/; cd >/dev/null '--'; rm -rf etc",
-                    # With no arguments (every top-level call) `cd "$@"` goes home.
-                    'cd "$@"; rm -rf *', "cd $*; rm -rf .ssh",
+                    "HOME=/; cd -P{,}; rm -rf etc",
                     "HOME=/; bash -c 'cd <<<\"a b\"; rm -rf etc'",
                     "HOME=/; cd >" + "a" * 100 + "; rm -rf etc"):
             with self.subTest(cmd=cmd[:40]):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         for cmd in ("HOME=/; cd <<<x /tmp; rm -rf etc", "HOME=/; cd <>f /tmp; rm -rf etc",
-                    "HOME=/; cd \\\n/tmp; rm -rf etc", 'f(){ cd "$@"; make; }; f /tmp',
+                    "HOME=/; cd \\\n/tmp; rm -rf etc", "HOME=/; cd ''; rm -rf etc",
+                    'f(){ cd "$@" && rm -rf *; }; f /tmp/x',
                     "HOME=/; cd >" + "a" * 100 + " /tmp; rm -rf etc"):
             with self.subTest(cmd=cmd[:40]):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")

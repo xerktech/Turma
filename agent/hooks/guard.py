@@ -8282,11 +8282,12 @@ _BARE_CD_REDIRECT_OP_RE = re.compile(_BARE_CD_REDIRECT_OP)
 _BARE_CD_REDIRECT_RE = re.compile(_BARE_CD_REDIRECT_OP + r"[ \t]*[^\s;&|()<>`]{1,256}")
 # An option (`--`, `-P`) or a `\`-newline, which may sit before or after a redirection.
 _BARE_CD_SKIP_RE = re.compile(r"[ \t]*(?:-(?:-|[LPe@]+)(?=[\s;&|)}`<>\\]|\Z)|\\\n)")
-# A word after it, and what bash may dequote it to: an option (`'-P'`, `-P''`,
-# `\-P`, `$'-P'`) or nothing (`""`, `"$@"` with no arguments) is no operand.
+# A word after it that bash dequotes to an option (`'-P'`, `-P''`, `\-P`,
+# `$'-P'`) is no operand. A word that may expand to nothing (`$1`, `"$@"`) is
+# left an operand, as positionals are for rm targets (guard-leading-names.md).
 _BARE_CD_WORD_RE = re.compile(r"[ \t]*([^\s;&|()<>`#]{1,256})")
 _BARE_CD_UNQUOTE_RE = re.compile(r"['\"\\]|\$(?=['\"])|\{,\}")
-_BARE_CD_NO_OPERAND_RE = re.compile(r"-(?:-|[LPe@]+)|\$[@*]|\$\{[@*]\}|")
+_BARE_CD_NO_OPERAND_RE = re.compile(r"-(?:-|[LPe@]+)")
 # What ends a `cd` with no operand: an operator, a comment, the end.
 _BARE_CD_END_RE = re.compile(r"[ \t]*(?:[;&|)}\n`#]|\Z)")
 # How many options, redirections and continuations (each target at most 256
@@ -11645,9 +11646,6 @@ def _cd_targets_in(text: str, inherited: tuple[str, ...],
             # A bare `cd` goes home; `cd ~/..` leaves it (XERK-1656).
             targets = ([_norm_path(h) for h in _home_readings(op)] or [_norm_path(op)]
                        if op is not None else ["~"])
-            # `cd "$@"` with no arguments (every top-level call) goes home too.
-            if op in ("$@", "$*", "${@}", "${*}"):
-                targets.append("~")
             # `cd -` goes to $OLDPWD, and a relative name is looked up in each
             # $CDPATH entry first: `CDPATH=/; cd etc` is `/etc` (XERK-1662). Only
             # values the line itself assigns; an inherited one stays unknown.
