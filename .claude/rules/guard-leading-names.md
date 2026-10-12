@@ -49,6 +49,22 @@ paths:
   - The strip lost busybox ITSELF as a `-c` shell (`busybox script -qc '…'`), so `_expand`
     adds a reading of the words from `busybox` on with it as `sh`. Keep both: an applet-only
     added reading (no strip) lost the pipe readers; the strip alone lost `-c` (3 QA passes).
+  - Any name STARTING with `busybox` or `toybox` is read as `busybox` (`_basename`,
+    `_MULTICALL_PREFIXES`): both binaries dispatch on that prefix, and the shipped files are
+    `toybox-x86_64`, `busybox.static`. Exact names only let `toybox-x86_64 rm -rf /etc` run.
+    - `_CMD_START` takes one as a wrapper word, so `cat a.sh | busybox sh` is a stdin shell
+      for the write-then-run rule (was allowed on main). Rollup XERK-1701.
+    - `_MULTICALL_WORD` is anchored by a lookbehind: unanchored, every `-busybox` in one long
+      word started a match, quadratic (1 MB: 945s, past the hook timeout, which runs it).
+      Test: `test_multicall_names_scan_linearly`.
+    - `_CMD_START`'s keyword/wrapper words start only after a blank, a start character, or a
+      character that can end a prefix bash drops or resolves: `/` `\` `}` `)` and the
+      empty-able `$@` `$*` `$!`. Any other glued literal stays in the command name, so that word
+      is not the wrapper; read with `\b`, `A=:env`/`A=-busybox` values each started a match that
+      ran the assignment loop to the end (quadratic, past the hook timeout, on main too).
+    - Derive that set from bash, never trim it by probe: dropping `/` or `$@` let
+      `cat f | /usr/bin/env sh` and `cat f | $@env sh` run a written file (2 QA passes).
+      Those characters inside a value (`A=/env `, `A=; `) stay quadratic: XERK-1866.
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top

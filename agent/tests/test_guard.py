@@ -6193,16 +6193,64 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # ...and a pipe still reaches the applet (QA).
                     "echo 'rm -rf /etc' | busybox env sh", "echo /etc | busybox xargs rm -rf",
                     "echo 'rm -rf /etc' | busybox xargs -0 busybox hush -c",
-                    'busybox find "$x/$y" | xargs rm -rf'):
+                    'busybox find "$x/$y" | xargs rm -rf',
+                    # Other names of a multi-call binary run the applet the same way.
+                    "toybox rm -rf /etc", "/bin/toybox rm -rf /etc", "busybox.static rm -rf /etc",
+                    "busybox-static rm -rf /etc", 'toybox rm -rf "$x/$y"',
+                    "toybox sh -c 'rm -rf /etc'", "echo 'rm -rf /etc' | toybox sh",
+                    "echo 'rm -rf /etc' | busybox-static hush",
+                    # Both dispatch on any name STARTING with theirs (the shipped files).
+                    "toybox-x86_64 rm -rf /etc", "busybox-x86_64 rm -rf /etc", "busybox1 rm -rf /etc",
+                    "toybox.static rm -rf /etc", "echo 'rm -rf /etc' | toybox-x86_64 sh",
+                    'busybox-x86_64 rm -rf "$a/$b"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
                     'find "$dir/$f" -exec grep -l x {} +', 'chmod -R 755 "$dir"/build',
                     'find "$d"/out -delete', 'busybox rm -rf "$dir"/build', "busybox ls /",
                     'find "$dir"/out -name "*.o" | xargs rm -f', "busybox tar -czf x.tgz dir",
-                    "echo hi | busybox hush"):
+                    "echo hi | busybox hush", "toybox ls -la", "busybox.static ls /",
+                    'toybox rm -rf "$dir"/build'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
+
+    def test_a_written_file_piped_into_a_multicall_shell_is_read(self):
+        # `| busybox sh` is a shell reading stdin, as `| sh` is; the write-then-run
+        # rule only knew it when busybox itself was the shell word.
+        for cmd in ("echo 'rm -rf /etc' > a.sh; cat a.sh | busybox sh",
+                    "echo 'rm -rf /etc' > b.sh; cat b.sh | toybox-x86_64 sh",
+                    "shopt -s nullglob; echo x | toybox-x86_64 sh",
+                    "echo 'rm -rf /etc' > c.sh; cat c.sh | busybox+x sh"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        # A command name bash still runs as the wrapper: a path, an escape, an
+        # expansion glued before it, or a `case` arm's `)` (QA).
+        for run in ("cat f | /usr/bin/env sh", "cat f | /usr/bin/sudo sh", "cat f | \\env sh",
+                    "${x}env sh < f", "$(true)env sh < f", '\\env sh -c "$(cat f)"',
+                    "cat f | \\command sh", "cat f | /usr/bin/timeout 5 sh",
+                    'case x in x)env sh -c "$(cat f)";; esac', "cat f | /bin/busybox sh",
+                    "cat f | $@env sh", "$*nohup sh < f", '$!exec sh -c "$(cat f)"'):
+            with self.subTest(run=run):
+                cmd = "echo 'rm -rf /etc' > f; " + run
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
+        for cmd in ("echo hi | busybox sh", "cat notes.md | busybox wc -l",
+                    "busybox-static tar -xzf a.tgz", "echo toybox rm -rf /etc"):
+            with self.subTest(cmd=cmd):
+                self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "allow")
+
+    def test_multicall_names_scan_linearly(self):
+        # Unanchored, each `-busybox` in one long word started a match that ran to
+        # its end: 1 MB took 945s in the hook, past its timeout (which runs it).
+        # Glued to other text, a wrapper is part of a word: each `A=env`/`A=:env`
+        # began a command start whose assignment loop ran to the line's end.
+        for text in (": a" + "-busybox" * 20000, "A=env " * 20000, "A=busybox " * 20000,
+                     "A=:busybox " * 20000, "A=x,toybox " * 20000, "A=-env " * 20000,
+                     "A=%env " * 20000):
+            for name in ("_RUNS_UNNAMED_RE", "_C_OR_EVAL_RE", "_UNREAD_SINK_SHELL_RE"):
+                with self.subTest(regex=name, text=text[:12]):
+                    start = time.process_time()
+                    getattr(guard, name).search(text)
+                    self.assertLess(time.process_time() - start, 1)
 
     def test_a_target_built_from_home_is_read_with_the_real_home(self):
         # XERK-1656: `$HOME`, `~` and `${HOME<op>}` are expanded against the

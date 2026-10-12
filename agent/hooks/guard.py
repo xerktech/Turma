@@ -7877,8 +7877,21 @@ def _herestrings(stage: str) -> list[str]:
 _FED_TEXT_CAP = 64
 
 
+# A multi-call binary runs the applet its first argument names, and BusyBox and
+# toybox both dispatch on any argv[0] that STARTS with their name
+# (`toybox-x86_64`, `busybox1`, `busybox.static`). Each is read as `busybox`, so
+# every busybox rule (wrapper stripping, its shells, its `rm` with no
+# preserve-root) applies.
+_MULTICALL_PREFIXES = ("busybox", "toybox")
+# The same names as raw text: a wrapper word at a command start, and a shell.
+# Anchored to a word start: unanchored, each `-busybox` in `a-busybox-busybox…`
+# began a match that scanned the rest of the run, quadratic past the hook timeout.
+_MULTICALL_WORD = r"(?<![\w.+-])(?:busybox|toybox)[\w.+-]*"
+
+
 def _basename(prog: str) -> str:
-    return re.split(r"[\\/]", prog)[-1].lower()
+    name = re.split(r"[\\/]", prog)[-1].lower()
+    return "busybox" if name.startswith(_MULTICALL_PREFIXES) else name
 
 
 # GNU xargs' long options, True where a value is REQUIRED (attached or the next
@@ -10286,8 +10299,17 @@ _MAY_RUN_FILE_RE = re.compile(r"sh|source|\.|/|xargs|exec|eval|PATH")
 # `xargs`, `hash`; and anywhere, `find -exec` or a `PATH=` change. A shell
 # given a file is the segment loop's; a word elsewhere (`git add .`, "bash"
 # in a note) is text.
-_CMD_START = (r"(?:^|[;&|({`\n'\"]|\b(?:then|do|else|elif|if|while|until|exec|env|sudo|"
-              r"nohup|command|builtin|time|timeout\s+\S+)\s)\s*"
+# A keyword or wrapper starts a command only after a blank, a start character,
+# or what can end a prefix bash drops or resolves: a path (`/usr/bin/env`), an
+# escape (`\env`), a quote, a closed expansion (`${x}env`, `$(true)env`, a `case`
+# arm's `)env`) or a special parameter that can be empty (`$@`, `$*`, `$!`).
+# Any other character glued before it (`A=:env`, `A=-busybox`) stays in the
+# command name, so the word is not that wrapper. Read with
+# `\b`, `A=:env A=:env …` started a match at every value and each ran the
+# assignment loop to the line's end, quadratic past the hook timeout, which lets
+# the command run. `A=/env` still does, as on main (XERK-1866).
+_CMD_START = (r"(?:^|[;&|({`\n'\"]|(?<![^\s;&|({`'\"/\\})@*!])(?:then|do|else|elif|if|while|until|exec|env|sudo|"
+              r"nohup|command|builtin|time|timeout\s+\S+|" + _MULTICALL_WORD + r")\s)\s*"
               r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*")
 _RUNS_UNNAMED_RE = re.compile(
     _CMD_START + r"(?:[^\s;&|'\"]*/)?(?:(?:(?:ba|da|z|k|a)?sh|busybox)"
@@ -14566,7 +14588,7 @@ _UNREADABLE_REASON = ("the guard can't read this command with confidence (it use
 # '…'` payloads from tripping.
 _UNREAD_LIVE = ("", '"', '{"')
 
-_UNREAD_SHELL = r"(?:bash|sh|zsh|ksh|dash|ash|busybox|su)"
+_UNREAD_SHELL = r"(?:bash|sh|zsh|ksh|dash|ash|" + _MULTICALL_WORD + r"|su)"
 # A destructive file op named anywhere (quoting-blind: a verb hidden in a value,
 # here-string or heredoc body is still the sink the marker reaches).
 _UNREAD_SINK_DESTRUCTIVE_RE = re.compile(
