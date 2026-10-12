@@ -14020,7 +14020,7 @@ function committedTicketSpawn(siteKey, issueKey) {
     const online = now - (a.lastSeen || 0) < OFFLINE_AFTER_MS;
     for (const c of a.commands || []) {
       if (!c || c.type !== "spawnTicket" || c.issueKey !== issueKey) continue;
-      if (online || "deliveredAt" in c) return { host, cmdId: c.cmdId };
+      if (online || "deliveredAt" in c) return { host, cmdId: c.cmdId, cmd: c };
     }
   }
   return null;
@@ -21543,6 +21543,9 @@ const server = http.createServer(async (req, res) => {
         // exactly as the fresh-start path below does — leaving it there would
         // dispatch it AGAIN on the next free slot, hours later and unasked.
         dropQueuedTicket(siteKey, issueKey, "dispatched by a direct start");
+        // A human Start claims an epic run's in-flight spawn, so the run's
+        // pause/cancel no longer withdraws it (XERK-1862).
+        delete committed.cmd.epicRun;
         rememberDispatch(siteKey, issueKey, committed.cmdId);
         return json(res, 200,
           { ok: true, cmdId: committed.cmdId, host: committed.host, repo });
@@ -23144,6 +23147,7 @@ if (process.env.TURMA_TEST) {
     armEpicRun,
     clearEpicRun,
     setEpicRunPaused,
+    EPIC_RUNS_MAX,
     setEpicRunLimit,
     epicRunActiveCount,
     buildEpicWaves,
