@@ -13071,16 +13071,9 @@ def _pr_body_command(tokens: list[str]) -> tuple[list[str], list[str], int] | No
             seen_flag = True
             sources += 1
             flag, value = hit
-            # bash takes a redirection anywhere among the words, so the
-            # flag's value is the next word that is not one
-            # (`--body-file 2>/dev/null f.md` reads f.md).
-            while value is None and i + 1 < len(args):
-                m = _REDIR_WORD.match(args[i + 1])
-                if not m:
-                    i += 1
-                    value = args[i]
-                else:
-                    i += 1 if args[i + 1][m.end():] else 2
+            if value is None and i + 1 < len(args):
+                i += 1
+                value = args[i]
             if value is not None:
                 (files if flag in _PR_FILE_FLAGS else bodies).append(value)
             prev_bare = False

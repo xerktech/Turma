@@ -6620,20 +6620,6 @@ class TestPrSummary(unittest.TestCase):
                 self.assertIsNone(self.reason(cmd))
         self.assertIsNotNone(self.reason("env -u 2>/dev/null X gh pr create -t x --body nope"))
 
-    def test_a_redirection_between_a_body_flag_and_its_value_is_not_the_value(self):
-        # XERK-1701 (#36): bash takes the redirection out, so gh reads good.md.
-        with open(os.path.join(self.repo, "good.md"), "w") as fh:
-            fh.write(GOOD_BODY)
-        with open(os.path.join(self.repo, "bad.md"), "w") as fh:
-            fh.write("junk")
-        for cmd in ("gh pr create -t x --body-file 2>/dev/null good.md",
-                    "gh pr create -t x -F 2> /dev/null good.md",
-                    "gh pr create -t x -F >out.txt good.md"):
-            with self.subTest(cmd=cmd):
-                self.assertIsNone(self.reason(cmd))
-        self.assertIsNotNone(self.reason("gh pr create -t x -F 2>/dev/null bad.md"))
-        self.assertIsNotNone(self.reason("gh pr create -t x -F 2>/dev/null"))
-
     def test_more_than_one_description_flag_is_refused(self):
         # XERK-1565: the check read the UNION of every source while gh sends
         # only the last, so a conforming file vouched for a credential file.

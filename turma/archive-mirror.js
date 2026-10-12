@@ -345,7 +345,7 @@ class ArchiveMirror {
             // a newer pass (and the ingest it reopened) has since written.
             const r = await raceDeadline(
               this._download(key, dest, () => !stale() && !abandoned, ac.signal), getDeadlineMs);
-            if (stale()) return;
+            if (stale()) { ac.abort(); return; }
             if (r === TIMED_OUT) {
               abandoned = true;
               ac.abort();
