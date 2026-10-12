@@ -4919,7 +4919,7 @@ class IndexMirror {
       // A heal replace (gated) rewrites the transcript from THIS replica's local copy, so
       // it applies only while this replica still leads under the term that queued it (XERK-1836).
       // Once deposed, the new leader's appends would be trimmed. The boot backfill is ungated:
-      // it runs on every replica before the elector exists, and skipping it strands rows.
+      // it runs on every replica (follower included), and skipping it strands rows.
       // A heal queued by a FOLLOWER (ingest on a degraded replica) is applied as before: dropping
       // it left the held entries out of Postgres with nothing to re-run it (XERK-1836 QA).
       if (!op.gated || !op.leadAtQueue) return this.store.replaceEntries(op.transcriptId, op.entries);
@@ -4928,8 +4928,19 @@ class IndexMirror {
       await this.store.replaceEntries(op.transcriptId, op.entries, current);
       return;
     }
-    // A follower's heal (XERK-1837): overwrites its own ordinals, never trims the tail.
-    if (op.t === "seat") return this.store.seatEntries(op.transcriptId, op.entries);
+    // A re-seat from this replica's file (XERK-1837). A follower's overwrites its own
+    // ordinals and never trims: another replica may have appended past its copy. The
+    // ingest re-seat (`trim`) on a leader under a real term (> 0: no lease never bumps
+    // it, and every replica leads there), applied under the term that queued it, also
+    // trims rows past the file (XERK-1843): a stale tail there made the next append's
+    // DO NOTHING drop it. Never dropped: deposed meanwhile (or mid-replace), it falls
+    // back to the plain seat.
+    if (op.t === "seat") {
+      const current = () => this.isLeader() && this.term() === op.term;
+      if (op.trim && op.leadAtQueue && op.term > 0 && current() &&
+        (await this.store.replaceEntries(op.transcriptId, op.entries, current)) !== false) return;
+      return this.store.seatEntries(op.transcriptId, op.entries);
+    }
     if (op.t === "remove") return this.store.deleteTranscript(op.transcriptId);
     if (op.t === "refill") {
       // Rewrites Postgres from this replica's local copy, so only while leading under
@@ -4966,7 +4977,8 @@ class IndexMirror {
         this._push({ t: "entries", transcriptId, entries, startSeq }),
       replace: (transcriptId, entries, gated) =>
         this._push({ t: "replace", transcriptId, entries, gated: !!gated, term: this.term(), leadAtQueue: this.isLeader() }),
-      seat: (transcriptId, entries) => this._push({ t: "seat", transcriptId, entries }),
+      seat: (transcriptId, entries, trim) =>
+        this._push({ t: "seat", transcriptId, entries, trim: trim === true, term: this.term(), leadAtQueue: this.isLeader() }),
       remove: (transcriptId) => this._push({ t: "remove", transcriptId }),
       repair: (transcriptId, entries, msgCount, archiveBytes, done) =>
         this._push({ t: "repair", transcriptId, entries, msgCount, archiveBytes, done, term: this.term() }),

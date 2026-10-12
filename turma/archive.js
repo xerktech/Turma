@@ -497,10 +497,12 @@ function mirrorReplace(transcriptId, list, gated) {
   } catch { /* best-effort mirror */ }
 }
 // Re-seat a file's held entries at their ordinals without trimming the tail (XERK-1837).
-function mirrorSeat(transcriptId, list) {
+// `trim` (the ingest re-seat only, XERK-1843) lets the leader drop Postgres rows past
+// the file; the backfill never asks — its copy may lag what Postgres already holds.
+function mirrorSeat(transcriptId, list, trim) {
   if (!indexSink || typeof indexSink.seat !== "function") return;
   try {
-    indexSink.seat(transcriptId, (list || []).map(mirrorEntry));
+    indexSink.seat(transcriptId, (list || []).map(mirrorEntry), trim === true);
   } catch { /* best-effort mirror */ }
 }
 
@@ -814,7 +816,7 @@ function heldEntries(jsonl, firstCopy) {
 
 // Re-seat a transcript's search entries from what its file holds: the local FTS
 // in sqlite mode, the Postgres of-record (by ordinal) in both.
-function reindexHeld(transcriptId, entries) {
+function reindexHeld(transcriptId, entries, trim) {
   if (!isPgMode()) {
     tx(() => {
       db.prepare("DELETE FROM entries_fts WHERE transcriptId=?").run(transcriptId);
@@ -827,7 +829,7 @@ function reindexHeld(transcriptId, entries) {
   }
   // Seat, never replace: this runs on a follower from its local copy, and a replace would
   // trim the appends another replica has made to the same Postgres rows (XERK-1837).
-  mirrorSeat(transcriptId, entries);
+  mirrorSeat(transcriptId, entries, trim);
 }
 
 function writeSidecar(metaPath, obj, local) {
@@ -1413,7 +1415,7 @@ function ingestChunk(host, transcriptId, meta, startOffset, endOffset, entries, 
     // First copies (XERK-1838): what the duplicate repair leaves, so the re-seat and the
     // append ordinals below share one numbering with the repaired rows.
     const seated = heldEntries(paths.jsonl, true).entries;
-    if (!wasSuspect) reindexHeld(transcriptId, seated);
+    if (!wasSuspect) reindexHeld(transcriptId, seated, true);
     // A multiset, consumed one per match: entries can legitimately repeat a key
     // (pr-link rows share an id), and a re-send repeats each held one ONCE.
     const fresh = list.filter((e) => {
