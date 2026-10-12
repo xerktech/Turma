@@ -102,7 +102,14 @@ paths:
   `code-scan` job calls it (`workflow_call`) and `plan` needs it, so a red main publishes nothing.
   - A PR is tested against its base, not the main it lands on — two green PRs can merge red.
   - Never drop that `needs:`; it is the last gate before hosts self-update.
-- **The main ruleset (`Default`) requires `Unit tests` + branches up to date** (XERK-1542).
+  - Its `Unit tests` job is skipped only when the shipped commit's TREE matches a same-repo PR
+    run's `tested-tree-<tree>` artifact (job `tested-tree`): identical tree = identical test input.
+  - Key on the tree, never the PR or head sha: a PR tested before another merge landed has a
+    different tree, and that is exactly the red-main case the re-run exists for.
+  - Keep the fork filter (`head_repository_id == repository_id`): the repo is public, and a fork's
+    PR runs its own edited workflow, so it can upload any artifact name.
+- **The main ruleset (`Default`) requires `Unit tests`**, NOT branches up to date (XERK-1542).
+  - Strict up-to-date is off on purpose: concurrent sessions would rebase-and-retest each other.
   - Never re-add a paths filter to code-scan's `pull_request`: a required check that never starts
     blocks the PR forever.
   - Its only bypass actor is **deploy keys**: `bump` pushes `VERSION`/`CHANGELOG` straight to main
