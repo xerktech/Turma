@@ -5,6 +5,9 @@ paths:
   - "turma/tests/outcome-ledger.test.js"
   - "turma/server.js"
   - "docs/model-quality-adr.md"
+  - "turma/public/usage.html"
+  - "android/app/src/main/java/com/xerktech/turma/**/ModelQuality.kt"
+  - "android/app/src/main/java/com/xerktech/turma/ui/UsageModelQuality.kt"
 ---
 
 # Model quality loop — the outcome ledger (XERK-1839, epic XERK-1844)
@@ -73,3 +76,27 @@ This file is the operative rules for what has shipped.
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
 - Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:` cases in
   `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`.
+
+## The report (XERK-1849): Usage page "Model quality" card, web + Android
+
+- A card on `/usage` (`modelQualityCardHtml`) and Android's Usage screen (`ModelQualitySection`,
+  ports in `core/ModelQuality.kt`) — its OWN fetch, never `/api/agents`, like the permission card.
+- **Groups are fleet-wide whatever the header picks**; only the session drill-down follows it, and
+  only when the filter resolves to EXACTLY one org (`TurmaOrg.get()` / `scope().singleOrNull()`),
+  since the route serves rows for one named org. Several or none → "Pick one org…".
+- **Bad rate = bad ÷ (good + bad)**; pending, no-change and undelivered say nothing about code
+  quality. The Opus column is that class's Opus bad rate (the baseline), never a fleet average.
+- **Rework renders one column per signal some group reported** (`MQ_REWORK` / Android
+  `ModelQuality.REWORK`: qaRuns, qaFail, ciRounds, changesRequested): the cell is its `median`,
+  `n` in the hover. A signal with no finite median is absent, never 0. A new signal needs a
+  label on BOTH clients or it stays hidden.
+- **Fields the later seams will serve, read when present** (absent = column hidden): per group
+  `shadow: {pairs, candidateOnlyBad}` (XERK-1847), `promotion` string (XERK-1848). A seam that
+  names them differently must change both clients in the same PR.
+- **Android reads the route field by field** (`parseModelQuality` over a raw `JsonElement`), not
+  a typed decode: one wrong-typed field from a later seam drops to its default, as on the web,
+  instead of blanking the card.
+- **A pick change clears the old org's view AND error at once**, and a late answer for a scope
+  since left is discarded (`mqStateOrg`/`mqFetchSeq`; Android `mqStateOrg`/`mqSeq`).
+- Tests: the `XERK-1849:` cases in `usage.test.js`; android `ModelQualityTest`,
+  `UsageModelQualityViewModelTest`, `ModelQualitySectionTest`.
