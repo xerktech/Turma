@@ -54,6 +54,9 @@ spec.loader.exec_module(ha)
 # Never let a test sweep the REAL host's processes: resume_on_boot reaps
 # pre-XERK-1588 ttyds, which on a live agent host would signal real terminals.
 ha.PROC_ROOT = tempfile.mkdtemp(prefix="hub-agent-noproc-")
+# The defect-attribution worker (XERK-1846) would fetch and blame every repo
+# under the real REPOS_ROOT from a beat; TestDefectAttribution turns it on.
+ha.DEFECT_SCAN = False
 # A host with the protected hooks installed (XERK-1677) would otherwise drop the
 # guard matchers from every settings file built here (XERK-1767);
 # test_guard_settings.TestManagedGuard covers the managed path.
@@ -5400,6 +5403,7 @@ class ManagerMixin:
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
+            ("DEFECT_SCAN_PATH", os.path.join(self.tmp, "defect-scan.json")),
             # Derived from REGISTRY_DIR at import (XERK-430). Without redirecting
             # it, __init__ would restore the rotation position from the real
             # host's ~/.turma and every beat would overwrite it.
@@ -26657,6 +26661,7 @@ class TestPruneRepo(unittest.TestCase):
             ("TICKET_LEDGER_PATH", os.path.join(self.tmp, "jira-sessions.json")),
             ("PR_LEDGER_PATH", os.path.join(self.tmp, "pr-sessions.json")),
             ("PR_STATUS_LEDGER_PATH", os.path.join(self.tmp, "pr-status.json")),
+            ("DEFECT_SCAN_PATH", os.path.join(self.tmp, "defect-scan.json")),
             # Derived from REGISTRY_DIR at import (XERK-430). Without redirecting
             # it, __init__ would restore the rotation position from the real
             # host's ~/.turma and every beat would overwrite it.
@@ -44189,3 +44194,183 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestDefectAttribution(unittest.TestCase):
+    """XERK-1846: SZZ over a REAL git repo — a bug fix's changed lines blame the
+    commit that introduced them; reverts, test-only and whitespace-only changes,
+    and the cursor/back-fill behave."""
+
+    def git(self, *args, env=None):
+        e = dict(os.environ, GIT_AUTHOR_NAME="t", GIT_AUTHOR_EMAIL="t@t",
+                 GIT_COMMITTER_NAME="t", GIT_COMMITTER_EMAIL="t@t", **(env or {}))
+        return subprocess.run(["git", "-C", self.repo, *args], check=True, env=e,
+                              capture_output=True, text=True).stdout.strip()
+
+    def commit(self, files, msg):
+        for name, body in files.items():
+            p = os.path.join(self.repo, name)
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            with open(p, "w") as f:
+                f.write(body)
+        self.git("add", "-A")
+        self.git("commit", "-q", "-m", msg)
+        return self.git("rev-parse", "HEAD")
+
+    def setUp(self):
+        self.repo = tempfile.mkdtemp(prefix="defect-scan-")
+        self.addCleanup(shutil.rmtree, self.repo, ignore_errors=True)
+        self.git("init", "-q", "-b", "main")
+        self.base = self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"}, "init")
+        self.bad = self.commit({"app.py": "a = 1\nb = 20\nc = 3\n"}, "XERK-1: tweak b")
+        self.classes = {"XERK-1": "task", "XERK-2": "bug", "XERK-3": "bug", "XERK-4": "story"}
+
+    def scan(self, cursor=None):
+        return ha.scan_repo_defects(self.repo, "r", "main", cursor,
+                                    lambda keys: {k: self.classes.get(k, "other") for k in keys},
+                                    None, now=100)
+
+    def test_a_bug_fix_blames_the_commit_that_wrote_the_changed_line(self):
+        fix = self.commit({"app.py": "a = 1\nb = 2\nc = 3\nd = 4\n", "tests/test_app.py": "x\n"},
+                          "XERK-2: fix b")
+        cursor, reports = self.scan()
+        self.assertEqual(cursor, fix)
+        self.assertEqual(len(reports), 1)
+        r = reports[0]
+        self.assertEqual((r["fix"], r["kind"], r["ticket"], r["repo"]), (fix, "bug", "XERK-2", "r"))
+        # Only b's line: the added `d` blames nothing, the test file is skipped.
+        self.assertEqual(r["introducers"], [{"sha": self.bad, "prs": [], "lines": 1}])
+        # The cursor resumes: nothing new, nothing re-reported.
+        self.assertEqual(self.scan(cursor), (cursor, []))
+
+    def test_non_bug_whitespace_and_test_only_changes_report_nothing(self):
+        self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"}, "XERK-4: story work")
+        self.commit({"app.py": "a = 1\nb  =  2\nc = 3\n"}, "XERK-2: reformat")
+        self.commit({"tests/test_app.py": "y\n"}, "XERK-3: fix a test")
+        self.assertEqual(self.scan()[1], [])
+
+    def test_a_revert_names_its_target(self):
+        rev = self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"},
+                          f'Revert "XERK-1: tweak b"\n\nThis reverts commit {self.bad}.')
+        _, reports = self.scan()
+        self.assertEqual([(r["fix"], r["kind"], r["introducers"][0]["sha"]) for r in reports],
+                         [(rev, "revert", self.bad)])
+
+    def test_a_tracker_failure_stops_before_the_commit_so_it_is_retried(self):
+        fix = self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"}, "XERK-2: fix b")
+
+        def down(keys):
+            raise OSError("jira down")
+        cursor, reports = ha.scan_repo_defects(self.repo, "r", "main", None, down, None, now=1)
+        self.assertNotEqual(cursor, fix)
+        self.assertEqual(reports, [])
+        cursor2, reports2 = self.scan(cursor)
+        self.assertEqual((cursor2, len(reports2)), (fix, 1))
+
+    def test_a_rewritten_cursor_falls_back_to_the_window_backfill(self):
+        self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"}, "XERK-2: fix b")
+        _, reports = self.scan("0" * 40)
+        self.assertEqual(len(reports), 1)
+
+    def test_paths_and_keys(self):
+        for p in ("tests/x.py", "a/__tests__/b.js", "x.test.ts", "foo_test.go", "test_x.py",
+                  "FooTest.kt", "spec/a.rb"):
+            self.assertTrue(ha._defect_is_test_path(p), p)
+        for p in ("app.py", "latest.py", "contest/x.py"):
+            self.assertFalse(ha._defect_is_test_path(p), p)
+        self.assertEqual(ha._defect_ticket_keys("XERK-12: fix AB#34 and XERK-12"),
+                         ["XERK-12", "34"])
+
+
+class TestDefectReportsWire(ManagerMixin, unittest.TestCase):
+    """XERK-1846: held reports ride the heartbeat a rotating page a beat and
+    persist across a restart."""
+
+    def test_reports_rotate_and_persist(self):
+        m = self.make_manager()
+        reports = [{"fix": f"{i:040x}", "found": int(time.time())} for i in range(30)]
+        m._defect_state = {"repos": {}, "classes": {}, "reports": reports}
+        first = m._defect_reports_page()
+        second = m._defect_reports_page()
+        self.assertEqual(len(first), ha.DEFECT_REPORTS_PER_BEAT)
+        self.assertEqual(first + second, reports)
+        self.assertEqual(m._defect_reports_page(), first)
+        m._save_defect_state(m._defect_state)
+        self.assertEqual(self.make_manager()._defect_state["reports"], reports)
+
+    def test_the_tick_is_off_when_disabled_and_runs_once_when_due(self):
+        m = self.make_manager()
+        with mock.patch.object(m, "_defect_scan_pass") as p:
+            m._defect_scan_tick(now=10)       # DEFECT_SCAN is off in tests
+            self.assertIsNone(m._defect_worker)
+            with mock.patch.object(ha, "DEFECT_SCAN", True):
+                m._defect_scan_tick(now=10)
+                m._defect_worker.join(5)
+                m._defect_scan_tick(now=11)   # not due again yet
+            self.assertEqual(p.call_count, 1)
+
+    def test_a_pass_merges_dedups_ages_out_and_advances_cursors(self):
+        m = self.make_manager()
+        now = int(time.time())
+        old = {"fix": "1" * 40, "found": now - ha.DEFECT_REPORT_KEEP_SEC - 5}
+        kept = {"fix": "2" * 40, "found": now - 10, "v": 1}
+        m._defect_state = {"repos": {"/r": "a" * 40}, "classes": {}, "reports": [old, kept]}
+        seen = {}
+
+        def fake_scan(path, name, ref, cursor, classify, forge, now):
+            seen["args"] = (path, name, ref, cursor)
+            self.assertEqual(classify(["XERK-5"]), {"XERK-5": "bug"})
+            return "b" * 40, [{"fix": "2" * 40, "found": now, "v": 2},
+                              {"fix": "3" * 40, "found": now}]
+        m.jira = {"tickets": [{"key": "XERK-5", "type": "Bug"}]}
+        with mock.patch.object(ha, "scan_repos", return_value=[{"name": "r", "path": "/r"}]), \
+                mock.patch.object(ha, "default_branch_name", return_value="main"), \
+                mock.patch.object(ha, "run_out", return_value=(0, "")), \
+                mock.patch.object(ha, "_defect_forge", return_value=None), \
+                mock.patch.object(ha, "scan_repo_defects", side_effect=fake_scan):
+            m._defect_scan_pass()
+        self.assertEqual(seen["args"], ("/r", "r", "refs/remotes/origin/main", "a" * 40))
+        st = m._defect_state
+        self.assertEqual(st["repos"], {"/r": "b" * 40})
+        self.assertEqual(st["classes"], {"XERK-5": "bug"}, "the board's type, cached")
+        self.assertEqual(sorted(r["fix"] for r in st["reports"]), ["2" * 40, "3" * 40])
+        self.assertEqual([r.get("v") for r in st["reports"] if r["fix"] == "2" * 40], [2])
+        self.assertEqual(self.make_manager()._defect_state["repos"], {"/r": "b" * 40})
+
+
+class TestDefectForgeAndTracker(unittest.TestCase):
+    """XERK-1846: introducer -> PR through the forge, ticket -> class through the tracker."""
+
+    def test_github_pulls_keep_only_merged_prs(self):
+        sha = "c" * 40
+        body = json.dumps([{"html_url": "https://github.com/o/r/pull/3", "merged_at": "2026-01-01"},
+                           {"html_url": "https://github.com/o/r/pull/4", "merged_at": None}])
+        with mock.patch.object(ha, "run", return_value=body) as r:
+            self.assertEqual(ha._defect_commit_prs(("github", "o/r"), sha),
+                             ["https://github.com/o/r/pull/3"])
+        self.assertEqual(r.call_args[0][0], ["gh", "api", f"repos/o/r/commits/{sha}/pulls"])
+        self.assertEqual(ha._defect_commit_prs(("github", "o/r"), "not-a-sha"), [])
+        self.assertEqual(ha._defect_commit_prs(None, sha), [])
+
+    def test_forge_from_origin(self):
+        for url, want in (("https://github.com/o/r.git", ("github", "o/r")),
+                          ("git@github.com:o/r.git", ("github", "o/r")),
+                          ("https://example.com/o/r.git", None), ("", None)):
+            with mock.patch.object(ha, "run", return_value=url), \
+                    mock.patch.object(ha, "gitlab_configured", return_value=False):
+                self.assertEqual(ha._defect_forge("/r"), want, url)
+
+    def test_jira_class_lookup_unknown_is_other_and_errors_raise(self):
+        def get(path, params):
+            if path.endswith("/NOPE-1"):
+                raise urllib.error.HTTPError(path, 404, "nf", {}, None)
+            if path.endswith("/DOWN-1"):
+                raise urllib.error.HTTPError(path, 503, "down", {}, None)
+            return {"fields": {"issuetype": {"name": "Bug"}}}
+        with mock.patch.object(ha, "jira_configured", return_value=True), \
+                mock.patch.object(ha, "azure_configured", return_value=False), \
+                mock.patch.object(ha, "jira_get", side_effect=get):
+            self.assertEqual(ha._defect_tracker_classes(["XERK-1", "NOPE-1"]),
+                             {"XERK-1": "bug", "NOPE-1": "other"})
+            with self.assertRaises(urllib.error.HTTPError):
+                ha._defect_tracker_classes(["DOWN-1"])

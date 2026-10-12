@@ -8027,6 +8027,256 @@ def _carry_pr_rework(prev, st):
     return st
 
 
+# ---- Defect attribution (XERK-1846) ------------------------------------------
+# SZZ over each repo's default branch, off the beat: a FIX commit (its ticket's
+# class is `bug`, or it reverts a commit) has the lines it deleted or changed
+# blamed on its parent; the commits that last touched them are the suspected
+# introducers, mapped to their PRs through the forge. The hub joins those PRs
+# (or the merge SHA) to its outcome-ledger rows and marks them bad. Nothing
+# about a model is read or written here: provenance stays hub-side.
+DEFECT_SCAN = os.environ.get("TURMA_DEFECT_SCAN", "1").strip() != "0"
+DEFECT_SCAN_PATH = os.path.join(REGISTRY_DIR, "defect-scan.json")
+DEFECT_SCAN_EVERY_SEC = _env_int("TURMA_DEFECT_SCAN_EVERY", 1800, minimum=60)
+# The back-fill reaches as far back as the hub's defect window: an older
+# introducer's row is already `good` and is never re-judged.
+DEFECT_WINDOW_DAYS = _env_int("MODEL_QUALITY_WINDOW_DAYS", 90, minimum=1)
+DEFECT_COMMITS_PER_PASS = 200      # per repo per pass; the cursor resumes the rest
+DEFECT_INTRODUCERS_MAX = 5         # the most-blamed commits of one fix
+DEFECT_PRS_MAX = 3                 # PRs per introducer
+DEFECT_REPORTS_MAX = 500           # held for re-delivery, newest kept
+DEFECT_REPORT_KEEP_SEC = 30 * 86400
+DEFECT_REPORTS_PER_BEAT = 25       # one rotating page a beat
+DEFECT_CLASSES_MAX = 5000
+DEFECT_BLAME_RANGES_MAX = 200      # -L ranges per file per fix
+_DEFECT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
+_REVERT_RE = re.compile(r"This reverts commit ([0-9a-f]{40})")
+_JIRA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]{1,9}-\d{1,7})\b")
+_ADO_KEY_RE = re.compile(r"\bAB#(\d{1,9})\b")
+_HUNK_RE = re.compile(r"^@@ -(\d+)(?:,(\d+))? \+\d+(?:,\d+)? @@")
+_BLAME_LINE_RE = re.compile(r"^([0-9a-f]{40}) \d+ \d+")
+# Test code is excluded from blame (ADR "Known noise"): a fix that only touches
+# a test says nothing about who introduced the bug.
+_DEFECT_TEST_PATH_RE = re.compile(
+    r"(^|/)(tests?|__tests__|spec|specs|testdata|fixtures)/"
+    r"|(^|/)test_[^/]*$|_test\.[^/]+$|\.(test|spec)\.[^/]+$|Tests?\.(kt|java|cs|swift)$")
+
+
+def _defect_is_test_path(path):
+    return bool(_DEFECT_TEST_PATH_RE.search(path or ""))
+
+
+def _defect_ticket_keys(subject):
+    """Ticket keys a commit subject names: Jira-style keys and ADO `AB#<n>`."""
+    s = subject or ""
+    keys = _JIRA_KEY_RE.findall(s) + _ADO_KEY_RE.findall(s)
+    return list(dict.fromkeys(keys))[:5]
+
+
+def _defect_changed_ranges(repo, sha):
+    """{parent path: [(start, count)]} — the parent's lines a commit deleted or
+    changed, whitespace-only changes ignored (`-w`), test files and pure
+    additions skipped (an addition blames nothing). Diffed against the FIRST
+    parent, so a merge commit covers its whole PR. None when git fails."""
+    rc, out = run_out(["git", "-C", repo, "-c", "core.quotePath=false", "diff",
+                       "-U0", "-w", "--ignore-blank-lines", "--no-renames",
+                       "--no-color", "--no-ext-diff", f"{sha}^1", sha], timeout=60)
+    if rc != 0:
+        return None
+    ranges, path = {}, None
+    for line in out.splitlines():
+        if line.startswith("--- "):
+            p = line[4:]
+            # A quoted (odd-byte) or /dev/null (new file) path blames nothing.
+            path = p[2:] if p.startswith("a/") else None
+            if path and _defect_is_test_path(path):
+                path = None
+            continue
+        if path is None:
+            continue
+        m = _HUNK_RE.match(line)
+        if m:
+            start, count = int(m.group(1)), int(m.group(2) or 1)
+            if count > 0:
+                ranges.setdefault(path, []).append((start, count))
+    return ranges
+
+
+def _defect_blame(repo, sha, ranges):
+    """{introducer sha: lines} — who last touched the changed lines on the fix's
+    parent, ignoring whitespace (`-w`). Boundary/uncommitted lines count for
+    nobody. A file git cannot blame is skipped."""
+    counts = {}
+    for path, spans in ranges.items():
+        args = []
+        for start, count in spans[:DEFECT_BLAME_RANGES_MAX]:
+            args += ["-L", f"{start},+{count}"]
+        rc, out = run_out(["git", "-C", repo, "blame", "-w", "--porcelain", *args,
+                           f"{sha}^1", "--", path], timeout=60)
+        if rc != 0:
+            continue
+        for line in out.splitlines():
+            m = _BLAME_LINE_RE.match(line)
+            if m and m.group(1) != "0" * 40:
+                counts[m.group(1)] = counts.get(m.group(1), 0) + 1
+    return counts
+
+
+def _defect_forge(repo):
+    """('github', 'owner/repo') or ('gitlab', 'group/project') for the repo's
+    origin, else None (ADO and anything else: the hub joins by merge SHA)."""
+    url = run(["git", "-C", repo, "remote", "get-url", "origin"])
+    if not url:
+        return None
+    if re.match(r"^(?:https?://(?:[^@/]+@)?github\.com/|git@github\.com:)", url):
+        try:
+            return ("github", normalize_github_repo(url))
+        except ValueError:
+            return None
+    if gitlab_configured():
+        host = gitlab_host().lower()
+        m = re.match(r"^(?:[a-zA-Z][\w.+-]*://(?:[^@/]+@)?|git@)([^/:]+)(?::\d+)?[:/](.+?)(?:\.git)?/?$", url)
+        if m and m.group(1).lower() == host.split(":")[0]:
+            return ("gitlab", m.group(2))
+    return None
+
+
+def _defect_commit_prs(forge, sha):
+    """The MERGED PR/MR urls that carry `sha`, through the forge (GitHub
+    `commits/<sha>/pulls`, GitLab `commits/<sha>/merge_requests`). [] when none
+    or the forge can't answer — the hub still joins by the merge SHA."""
+    if not forge or not _DEFECT_SHA_RE.match(sha or ""):
+        return []
+    kind, slug = forge
+    urls = []
+    if kind == "github":
+        raw = run(["gh", "api", f"repos/{slug}/commits/{sha}/pulls"], timeout=30)
+        try:
+            data = json.loads(raw) if raw else []
+        except ValueError:
+            data = []
+        for p in data if isinstance(data, list) else []:
+            if isinstance(p, dict) and p.get("merged_at") and isinstance(p.get("html_url"), str):
+                urls.append(p["html_url"])
+    elif kind == "gitlab":
+        data = _gitlab_get(f"projects/{urllib.parse.quote(slug, safe='')}"
+                           f"/repository/commits/{sha}/merge_requests")
+        for p in data if isinstance(data, list) else []:
+            if isinstance(p, dict) and p.get("state") == "merged" and isinstance(p.get("web_url"), str):
+                urls.append(p["web_url"])
+    return [u[:500] for u in urls if u.startswith(("http://", "https://"))][:DEFECT_PRS_MAX]
+
+
+def _defect_commits(repo, ref, cursor):
+    """New first-parent commits on `ref`, oldest first, as (sha, ctime, subject,
+    body). From `cursor` when it is still an ancestor, else (first scan, or a
+    rewritten branch) the back-fill: everything inside the defect window.
+    Capped at DEFECT_COMMITS_PER_PASS; the caller's cursor resumes the rest."""
+    base = []
+    if cursor and _DEFECT_SHA_RE.match(cursor):
+        rc, _ = run_out(["git", "-C", repo, "merge-base", "--is-ancestor", cursor, ref])
+        if rc == 0:
+            base = [f"{cursor}..{ref}"]
+    if not base:
+        base = [f"--since={DEFECT_WINDOW_DAYS}.days.ago", ref]
+    rc, out = run_out(["git", "-C", repo, "log", "--first-parent", "--reverse",
+                       # The trailing "." survives run_out's strip(), which eats
+                       # \x1e/\x1f as whitespace at the very end of the output.
+                       "--format=%H%x1f%ct%x1f%s%x1f%b%x1f.%x1e", *base], timeout=60)
+    if rc != 0:
+        return None
+    commits = []
+    for rec in out.split("\x1e"):
+        parts = rec.strip("\n").split("\x1f")
+        if len(parts) < 5 or not _DEFECT_SHA_RE.match(parts[0]):
+            continue
+        try:
+            ctime = int(parts[1])
+        except ValueError:
+            continue
+        commits.append((parts[0], ctime, parts[2], parts[3]))
+        if len(commits) >= DEFECT_COMMITS_PER_PASS:
+            break
+    return commits
+
+
+def _defect_tracker_classes(keys):
+    """{key: work class} from the configured tracker for ticket keys the board
+    cache did not answer. A key the tracker does not know reads "other"; any
+    other failure RAISES, so the scan retries that commit rather than skipping a
+    fix it could not classify."""
+    out = {}
+    jira_keys = [k for k in keys if _JIRA_KEY_RE.fullmatch(k)]
+    ado_ids = [k for k in keys if k.isdigit()]
+    if jira_keys and jira_configured() and not azure_configured():
+        for k in jira_keys:
+            try:
+                data = jira_get(f"/rest/api/3/issue/{urllib.parse.quote(k)}",
+                                {"fields": "issuetype"})
+            except urllib.error.HTTPError as e:
+                if e.code in (403, 404):
+                    out[k] = "other"
+                    continue
+                raise
+            t = ((data or {}).get("fields") or {}).get("issuetype") or {}
+            out[k] = (t.get("name") or "other").strip().lower()
+    if ado_ids and azure_configured():
+        found = {str(wi.get("id")): ((wi.get("fields") or {}).get("System.WorkItemType") or "")
+                 for wi in _azure_batch_get(ado_ids, ["System.Id", "System.WorkItemType"])}
+        for k in ado_ids:
+            out[k] = (found.get(k) or "other").strip().lower()
+    for k in keys:
+        out.setdefault(k, "other")    # no tracker that could answer: not a known bug
+    return out
+
+
+def scan_repo_defects(repo, name, ref, cursor, classify, forge, now=None):
+    """One repo's pass: (new cursor, [report]). `classify(keys)` answers
+    {ticket key: work class} and may raise (the tracker is down) — the pass
+    then stops BEFORE that commit, so it is retried, never skipped. A report:
+    {repo, fix, fixPrs, kind: bug|revert, ticket, at (fix commit ms), found,
+    introducers: [{sha, prs, lines}]}."""
+    now = int(now if now is not None else time.time())
+    commits = _defect_commits(repo, ref, cursor)
+    if commits is None:
+        return cursor, []
+    reports = []
+    for sha, ctime, subject, body in commits:
+        kind, ticket, counts = None, None, {}
+        target = _REVERT_RE.search(body or "")
+        if target or (subject or "").startswith('Revert "'):
+            kind = "revert"
+            if target:
+                counts = {target.group(1): 1}
+        else:
+            keys = _defect_ticket_keys(subject)
+            if keys:
+                try:
+                    classes = classify(keys)
+                except Exception as e:
+                    log(f"defect scan {name}: ticket class lookup failed ({e}); retrying later")
+                    break
+                bug = [k for k in keys if classes.get(k) == "bug"]
+                if bug:
+                    kind, ticket = "bug", bug[0]
+        if kind and not counts:
+            ranges = _defect_changed_ranges(repo, sha)
+            if ranges is None:
+                break                 # git failed: retry this commit next pass
+            counts = _defect_blame(repo, sha, ranges)
+        cursor = sha
+        counts.pop(sha, None)
+        if not kind or not counts:
+            continue
+        top = sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))[:DEFECT_INTRODUCERS_MAX]
+        reports.append({
+            "repo": name, "fix": sha, "fixPrs": _defect_commit_prs(forge, sha),
+            "kind": kind, "ticket": ticket, "at": ctime * 1000, "found": now,
+            "introducers": [{"sha": s, "prs": _defect_commit_prs(forge, s), "lines": n}
+                            for s, n in top],
+        })
+    return cursor, reports
+
+
 def pr_status(url):
     """Fetch a PR's state, CI-check rollup and mergeability via `gh pr view
     <url>`. Returns the compact status dict, or None on any failure (gh accepts
@@ -22111,6 +22361,13 @@ class SessionManager:
         # spawn_failures — a result the worker appends mid-beat is never lost.
         self._merge_pr_lock = threading.Lock()
         self.merge_pr_results = []
+        # Defect attribution (XERK-1846): the SZZ worker's durable state (cursor
+        # per repo, cached ticket classes, held reports) and its rotation.
+        self._defect_lock = threading.Lock()
+        self._defect_worker = None
+        self._defect_due = 0.0
+        self._defect_page = 0
+        self._defect_state = self._load_defect_state()
         # Durable transcript -> ticket attribution (persisted). Keeps the board's
         # ticket chips answerable after the session record behind them is gone —
         # killed, aged out of closed.json, or never in either. Backfilled from the
@@ -32032,6 +32289,130 @@ class SessionManager:
     # deliberate override of. The outcome is staged so the hub stops retrying a
     # merge `gh` refuses (branch protection, review required, a fresh conflict).
 
+    # ---- Defect attribution (XERK-1846) -------------------------------------
+    # The SZZ pass runs on its OWN thread every DEFECT_SCAN_EVERY_SEC — git log,
+    # diff, blame, a fetch and forge lookups per repo are far past the beat's
+    # budget (XERK-395). Its findings are held DURABLY (defect-scan.json) and
+    # re-sent a rotating page a beat until they age out: the hub folds them
+    # idempotently, so no ack is needed and a missed beat, a hub restart or an
+    # HA leader change costs nothing.
+
+    def _load_defect_state(self):
+        try:
+            with open(DEFECT_SCAN_PATH) as f:
+                data = json.load(f)
+        except (OSError, ValueError):
+            data = {}
+        if not isinstance(data, dict):
+            data = {}
+        repos = data.get("repos") if isinstance(data.get("repos"), dict) else {}
+        classes = data.get("classes") if isinstance(data.get("classes"), dict) else {}
+        reports = data.get("reports") if isinstance(data.get("reports"), list) else []
+        return {"repos": {k: v for k, v in repos.items() if isinstance(v, str)},
+                "classes": {k: v for k, v in classes.items() if isinstance(v, str)},
+                "reports": [r for r in reports if isinstance(r, dict)]}
+
+    def _save_defect_state(self, state):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = DEFECT_SCAN_PATH + ".tmp"
+            with open(tmp, "w") as f:
+                json.dump(state, f)
+            os.replace(tmp, DEFECT_SCAN_PATH)
+        except OSError as e:
+            log(f"defect scan state save failed: {e}")
+
+    def _defect_scan_tick(self, now=None):
+        """ON THE BEAT: start a pass when one is due and none is running. Never
+        raises — attribution is never worth the beat."""
+        if not DEFECT_SCAN:
+            return
+        now = time.monotonic() if now is None else now
+        try:
+            with self._defect_lock:
+                if now < self._defect_due or (
+                        self._defect_worker and self._defect_worker.is_alive()):
+                    return
+                self._defect_due = now + DEFECT_SCAN_EVERY_SEC
+                worker = threading.Thread(target=self._defect_scan_pass,
+                                          name="defect-scan", daemon=True)
+                self._defect_worker = worker
+            worker.start()
+        except Exception as e:
+            log(f"defect scan could not be started: {type(e).__name__}: {e}")
+
+    def _defect_classify(self, keys, classes):
+        """{key: work class}: the cached answer, else the board's row, else the
+        tracker (which may raise). New answers land in `classes`."""
+        out = {k: classes[k] for k in keys if k in classes}
+        missing = [k for k in keys if k not in out]
+        if missing:
+            board = {str(t.get("key")): t.get("type") for t in (self.jira.get("tickets") or [])
+                     if isinstance(t, dict) and t.get("type")}
+            for k in list(missing):
+                if k in board:
+                    out[k] = str(board[k]).strip().lower()
+                    missing.remove(k)
+        if missing:
+            out.update(_defect_tracker_classes(missing))
+        for k in keys:
+            if k in out:
+                classes[k] = out[k]
+        return out
+
+    def _defect_scan_pass(self):
+        """One pass over every repo (worker thread; never raises)."""
+        try:
+            with self._defect_lock:
+                state = json.loads(json.dumps(self._defect_state))
+            found = []
+            now = int(time.time())
+            for repo in scan_repos():
+                path, name = repo["path"], repo["name"]
+                branch = default_branch_name(path)
+                if not branch or not valid_ref_name(branch):
+                    continue
+                run(["git", "-C", path, "fetch", "--quiet", "origin", branch], timeout=60)
+                ref = f"refs/remotes/origin/{branch}"
+                if run_out(["git", "-C", path, "rev-parse", "--verify", "-q", ref])[0] != 0:
+                    ref = f"refs/heads/{branch}"
+                cursor, reports = scan_repo_defects(
+                    path, name, ref, state["repos"].get(path),
+                    lambda keys: self._defect_classify(keys, state["classes"]),
+                    _defect_forge(path), now)
+                if cursor:
+                    state["repos"][path] = cursor
+                found += reports
+            with self._defect_lock:
+                held = {r.get("fix"): r for r in self._defect_state["reports"]}
+                for r in found:
+                    held[r["fix"]] = r
+                keep = sorted((r for r in held.values()
+                               if now - int(r.get("found") or 0) < DEFECT_REPORT_KEEP_SEC),
+                              key=lambda r: int(r.get("found") or 0))[-DEFECT_REPORTS_MAX:]
+                classes = state["classes"]
+                if len(classes) > DEFECT_CLASSES_MAX:
+                    classes = dict(list(classes.items())[-DEFECT_CLASSES_MAX:])
+                self._defect_state = {"repos": state["repos"], "classes": classes,
+                                      "reports": keep}
+                snapshot = self._defect_state
+            self._save_defect_state(snapshot)
+            if found:
+                log(f"defect scan: {len(found)} fix commit(s) attributed")
+        except Exception as e:
+            log(f"defect scan failed: {type(e).__name__}: {e}")
+
+    def _defect_reports_page(self):
+        """ON THE BEAT: the next rotating page of held reports, or []."""
+        with self._defect_lock:
+            reports = self._defect_state["reports"]
+            if not reports:
+                return []
+            pages = -(-len(reports) // DEFECT_REPORTS_PER_BEAT)
+            i = self._defect_page % pages
+            self._defect_page = i + 1
+            return reports[i * DEFECT_REPORTS_PER_BEAT:(i + 1) * DEFECT_REPORTS_PER_BEAT]
+
     def _merge_pr_async(self, cmd_id, session_id, url, head=None):
         """Run the merge on its OWN thread, never the beat (XERK-395): `gh pr
         merge` is a blocking network call dispatched from handle_commands, which
@@ -39666,6 +40047,8 @@ class SessionManager:
         self._attention_hint_tick()
         # The org brief's narrative (XERK-1574): the same split. Never raises.
         self._brief_render_tick()
+        # Defect attribution (XERK-1846): the SZZ pass on its own thread.
+        self._defect_scan_tick()
 
         payload = {
             # `device` (the physical host name) is the hub's identity key; agentId
@@ -39867,6 +40250,11 @@ class SessionManager:
         with self._merge_pr_lock:
             if self.merge_pr_results:
                 payload["mergePrResults"] = list(self.merge_pr_results)
+        # Defect attribution (XERK-1846): one rotating page of the held reports,
+        # re-sent until they age out (the hub folds them idempotently).
+        defects = self._defect_reports_page()
+        if defects:
+            payload["defectReports"] = defects
         # The permission ledger's rows (XERK-1563), oldest first, at most
         # PERMISSION_EVENTS_MAX a beat; the rest wait for the next. Snapshotted
         # under the lock and cleared BY IDENTITY like mergePrResults. NOT an

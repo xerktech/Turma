@@ -70,6 +70,27 @@ This file is the operative rules for what has shipped.
     launch (`is_error`) is no run, and the report's own verdict LINE beats a quoted one.
   - Known: a mid-session `/model` switch still credits the whole session to the LAST model; a
     RESUMED qa agent's later report is not re-delivered as a hand-back, so its first verdict sticks.
+- **Defect attribution is SZZ on the agent, the join on the hub** (XERK-1846). Agent: a
+  `defect-scan` thread every `TURMA_DEFECT_SCAN_EVERY` (1800s; `TURMA_DEFECT_SCAN=0` off) fetches
+  each repo's default branch and walks new first-parent commits from a per-repo cursor
+  (`defect-scan.json`); the first scan back-fills `MODEL_QUALITY_WINDOW_DAYS`.
+  - A FIX is a revert (`This reverts commit <sha>` names the introducer) or a commit whose subject's
+    ticket key classes `bug` (board cache, else the tracker; a tracker error stops BEFORE that commit
+    so it is retried, never skipped). Its first-parent diff is blamed `-w`; test paths and pure
+    additions blame nothing.
+  - Introducers map to MERGED PRs via the forge (GitHub `commits/<sha>/pulls`, GitLab
+    `merge_requests`); ADO has none, so the hub also joins on the PR's `mergeCommit`.
+  - Reports are HELD (500, 30 days) and re-sent as a rotating page each beat (`defectReports`), so
+    no ack is needed — the hub folds idempotently. Never make it a deliver-once outbox: the fold
+    runs on the HA leader's sweep, not on the replica the beat reached.
+  - Hub: `normalizeDefectReports` coerces them onto the record (never served); `outcomeLedgerSweep`
+    calls `attributeDefects` with the host's DECIDED org — only that org's rows can be marked.
+  - A row is marked (`defects[]` → outcome bad, reason `defect`/`reverted`) only when the fix landed
+    after its PR merged and inside the window, and never by its own PR. No row = unattributed,
+    excluded from every model statistic.
+  - Known: Jira/ADO-key tickets only (`KEY-1`, `AB#1`); squash and merge commits both work, a
+    rebase-merged PR joins only through the forge.
 - The module must be in `turma/Dockerfile`'s `COPY` line (pinned by the image-copy test).
 - Tests: `turma/tests/outcome-ledger.test.js`; the `XERK-1839:`/`XERK-1845:` cases in
-  `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`.
+  `server.test.js`; `TestQaRunScan`, `TestPrReworkFields`, `TestReworkSignalsReachTheWire`, `TestDefect*`;
+  the `XERK-1846:` cases.

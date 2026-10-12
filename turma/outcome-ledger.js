@@ -69,6 +69,13 @@ const CLOSE_KINDS = new Set(["done", "not-reproducible", "already-fixed"]);
 const SHA_RE = /^[0-9a-fA-F]{7,64}$/;
 const COUNT_MAX = 1000;
 const QA_KEYS = ["runs", "pass", "partial", "fail"];
+// Defect attribution (XERK-1846): bounds on what one beat's reports and one row carry.
+const FULL_SHA_RE = /^[0-9a-f]{40}$/;
+const DEFECT_KINDS = new Set(["bug", "revert"]);
+const DEFECT_REPORTS_MAX = 50;
+const DEFECT_INTRODUCERS_MAX = 5;
+const DEFECT_PRS_MAX = 3;
+const ROW_DEFECTS_MAX = 10;
 
 function capStr(v, max) {
   if (typeof v !== "string") return "";
@@ -196,6 +203,60 @@ function sanitizeRow(r) {
   }
   const qa = sanitizeQa(r.qa);
   if (qa) out.qa = qa;
+  if (Array.isArray(r.defects)) {
+    const defects = r.defects.map(sanitizeDefect).filter(Boolean).slice(0, ROW_DEFECTS_MAX);
+    if (defects.length) out.defects = defects;
+  }
+  return out;
+}
+
+function prUrls(list) {
+  if (!Array.isArray(list)) return [];
+  return list.map((u) => capStr(u, 500)).filter((u) => /^https?:\/\//i.test(u)).slice(0, DEFECT_PRS_MAX);
+}
+
+/** A row's defect mark: the fix that implicated it. */
+function sanitizeDefect(d) {
+  if (!d || typeof d !== "object" || !DEFECT_KINDS.has(d.kind)) return null;
+  const fix = typeof d.fix === "string" ? d.fix.toLowerCase() : "";
+  const at = posInt(d.at);
+  if (!FULL_SHA_RE.test(fix) || !at) return null;
+  const out = { fix, kind: d.kind, at };
+  const prs = prUrls(d.prs);
+  if (prs.length) out.prs = prs;
+  return out;
+}
+
+/**
+ * One beat's `defectReports` (the agent's SZZ findings, XERK-1846) → the
+ * bounded shape attributeDefects folds, or [] — agent-supplied, so every field
+ * is whitelisted and capped. A report:
+ *   {repo, fix, fixPrs, kind: bug|revert, ticket, at, introducers: [{sha, prs}]}
+ */
+function sanitizeDefectReports(list) {
+  if (!Array.isArray(list)) return [];
+  const out = [];
+  for (const r of list) {
+    if (out.length >= DEFECT_REPORTS_MAX) break;
+    if (!r || typeof r !== "object" || !DEFECT_KINDS.has(r.kind)) continue;
+    const fix = typeof r.fix === "string" ? r.fix.toLowerCase() : "";
+    const at = posInt(r.at);
+    if (!FULL_SHA_RE.test(fix) || !at) continue;
+    const introducers = [];
+    for (const i of Array.isArray(r.introducers) ? r.introducers : []) {
+      if (introducers.length >= DEFECT_INTRODUCERS_MAX) break;
+      const sha = i && typeof i.sha === "string" ? i.sha.toLowerCase() : "";
+      if (!FULL_SHA_RE.test(sha) || sha === fix) continue;
+      introducers.push({ sha, prs: prUrls(i.prs) });
+    }
+    if (!introducers.length) continue;
+    const report = { fix, fixPrs: prUrls(r.fixPrs), kind: r.kind, at, introducers };
+    const repo = capStr(r.repo, 200);
+    if (repo) report.repo = repo;
+    const ticket = typeof r.ticket === "string" && ISSUE_RE.test(r.ticket) ? r.ticket : "";
+    if (ticket) report.ticket = ticket;
+    out.push(report);
+  }
   return out;
 }
 
@@ -305,6 +366,11 @@ function observe(observations, now = Date.now()) {
       commit(r, next, now, changed);
     }
   }
+  return finish(changed, now);
+}
+
+// Persist what a fold changed (and evict past the bounds). Returns the changed rows.
+function finish(changed, now) {
   if (changed.size) {
     const dropped = evict(now);
     const live = [...changed.values()].filter((r) => rows.get(r.key) === r);
@@ -312,6 +378,60 @@ function observe(observations, now = Date.now()) {
     if (dropped.length && backend.onDelete) backend.onDelete(dropped);
   }
   return [...changed.values()];
+}
+
+/**
+ * Fold defect reports (XERK-1846): each introducer of a fix maps to the ledger
+ * rows of its org whose MERGED PR is that introducer — by the forge's PR url or
+ * by the merge commit — and those rows are marked bad with the fix as evidence.
+ *   entries: [{site, reports}] — `site` is the reporting host's DECIDED org, and
+ *   only rows of that org are touched (a host cannot mark another org's work).
+ * A fix counts only when it landed after the PR merged and inside the defect
+ * window (a row already `good` is not re-judged), and never against the fix's
+ * own PR. An introducer with no row is unattributed: human work, a direct push
+ * or pre-ledger history — excluded, never counted against anyone. Idempotent:
+ * the agent re-sends its reports every few minutes until they age out.
+ */
+function attributeDefects(entries, now = Date.now(), windowDays = WINDOW_DAYS) {
+  if (!Array.isArray(entries) || !entries.some((e) => e && Array.isArray(e.reports) && e.reports.length)) {
+    return [];
+  }
+  if (backend.loaded === false) return [];
+  // url / merge sha -> [{row, pr}] over merged PRs only.
+  const byUrl = new Map();
+  const bySha = new Map();
+  const index = (m, k, v) => { if (!m.has(k)) m.set(k, []); m.get(k).push(v); };
+  for (const r of rows.values()) {
+    for (const p of r.prs || []) {
+      if (p.state !== "MERGED") continue;
+      index(byUrl, p.url, { r, p });
+      if (p.mergeCommit && p.mergeCommit.length === 40) index(bySha, p.mergeCommit, { r, p });
+    }
+  }
+  const changed = new Map();
+  for (const e of entries) {
+    if (!e || typeof e.site !== "string" || !e.site) continue;
+    for (const rep of sanitizeDefectReports(e.reports)) {
+      const fixPrs = new Set(rep.fixPrs);
+      for (const intro of rep.introducers) {
+        const hits = [...(bySha.get(intro.sha) || [])];
+        for (const u of intro.prs) hits.push(...(byUrl.get(u) || []));
+        for (const { r, p } of hits) {
+          const cur = rows.get(r.key);
+          if (!cur || cur.site !== e.site) continue;
+          if ((cur.prs || []).some((x) => fixPrs.has(x.url) || x.mergeCommit === rep.fix)) continue;
+          const mergedAt = p.mergedAt || cur.updatedAt;
+          if (rep.at < mergedAt || rep.at - mergedAt > windowDays * DAY_MS) continue;
+          const defects = cur.defects || [];
+          if (defects.some((d) => d.fix === rep.fix) || defects.length >= ROW_DEFECTS_MAX) continue;
+          const mark = { fix: rep.fix, kind: rep.kind, at: rep.at };
+          if (rep.fixPrs.length) mark.prs = rep.fixPrs;
+          commit(cur, { ...cur, defects: [...defects, mark] }, now, changed);
+        }
+      }
+    }
+  }
+  return finish(changed, now);
 }
 
 function mergePrs(row, prs, now) {
@@ -410,6 +530,10 @@ function evict(now = Date.now()) {
  */
 function outcomeOf(r, now = Date.now(), windowDays = WINDOW_DAYS) {
   if (r.reopenedAt) return { outcome: "bad", reason: "reopened" };
+  // A later fix blamed this work (XERK-1846): a revert of it, or a bug fix.
+  if (r.defects && r.defects.length) {
+    return { outcome: "bad", reason: r.defects.some((d) => d.kind === "revert") ? "reverted" : "defect" };
+  }
   const prs = r.prs || [];
   const merged = prs.filter((p) => p.state === "MERGED");
   if (merged.length) {
@@ -770,7 +894,7 @@ function flush(done) { backend.flush(done); }
 load();
 
 module.exports = {
-  observe, aggregate, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
+  observe, attributeDefects, sanitizeDefectReports, aggregate, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
   configure, rehydrate, flush,
   LEDGER_FILE, MAX_ROWS, WINDOW_DAYS, RETAIN_DAYS, T_ROW, OutcomeLedgerPgStore,
   _internals: {
