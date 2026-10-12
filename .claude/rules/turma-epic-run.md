@@ -101,11 +101,16 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   work at once**; absent = no limit. Per epic, so epics in one org cap independently.
 - Route: `{maxConcurrent:N|null}` alone updates an ARMED run (`setEpicRunLimit`, no DAG rebuild; 404
   when none — never a silent arm); `{arm:true, maxConcurrent}` arms with it; a plain re-arm keeps it
-  (like `paused`). Anything but null or an int in range is a 400. Coerced by `sanitizeEpicRunRecord`.
-- **"Working" = `epicRunActiveCount`**: a not-Done child with a LIVE (running/queued) session
-  (`liveTicketSessionKeys`), a queue place, a spawn in flight/committed, or dispatched within
+  (like `paused`). Anything but null or an int in range is a 400, as is a cap sent with
+  `pause`/`resume` (one change per request, so neither is silently dropped). Coerced by `sanitizeEpicRunRecord`.
+- **"Working" = `epicRunActiveCount`**: a not-Done child with a LIVE (running/queued) session or a
+  hub-PAUSED sleeper (closed record with valid `paused`, it will wake — `liveTicketSessionKeys`), a
+  non-`blocked` queue place, a spawn in flight/committed, or dispatched within
   `EPIC_CHILD_LAUNCH_GRACE_MS` (the `at` stamp on `epicChildAttempts`).
   - Never `startedTicketKeys` — it counts KILLED sessions, so a finished child would hold its slot.
+  - A `blocked` queue entry (no host can run it) does NOT hold a slot: it cycles blocked → given up →
+    re-queued, so counting it stalled a capped run forever. Cost: if that block clears, the run can
+    briefly sit one over its cap. Liveness over strictness, deliberately.
   - The grace closes the ack-before-session gap; without it a cap of 1 starts a second child there.
 - The driver checks the cap AFTER every other guard, so a held child spends no attempt. Lowering the
   cap never kills a running child. Board: `epicLimitPickerHtml` in the epic panel; Android web-only

@@ -3818,8 +3818,11 @@ function advanceEpicRunState(run, rows) {
 // would otherwise let a just-dispatched child re-queue for the beat or two before
 // its session first heartbeats.
 // How many of a run's children are WORKING right now, for its per-epic cap
-// (XERK-1860): a not-Done child with a live (running/queued) session, a place in
-// the hub queue, a spawn in flight or committed to a host, or one dispatched
+// (XERK-1860): a not-Done child with a live (running/queued) or paused-sleeper
+// session, a place in the hub queue it can leave (not `blocked` — a child no host
+// can run is not working, and counting it stalled a capped run forever as it
+// cycled blocked → given up → re-queued), a spawn in flight or committed to a
+// host, or one dispatched
 // within EPIC_CHILD_LAUNCH_GRACE_MS (acked, but its session hasn't heartbeat yet
 // — without this a cap of 1 would start a second child in that gap). Not
 // startedTicketKeys: that counts KILLED sessions too, so a finished child would
@@ -3833,7 +3836,8 @@ function epicRunActiveCount(run, rows, now) {
     const hit = rows.get(k);
     if (hit && hit.row && hit.row.statusCategory === "done") continue;
     const att = epicChildAttempts.get(k);
-    if (live.has(k) || liveQueuedTicket(run.siteKey, childKey)
+    const q = liveQueuedTicket(run.siteKey, childKey);
+    if (live.has(k) || (q && q.reason !== "blocked")
       || spawnTicketInFlight(run.siteKey, childKey)
       || committedTicketSpawn(run.siteKey, childKey)
       || (att && Number.isFinite(att.at) && now - att.at < EPIC_CHILD_LAUNCH_GRACE_MS)) n++;
@@ -13417,8 +13421,10 @@ function startedTicketKeys() {
   return keys;
 }
 // The subset of startedTicketKeys whose session is LIVE (running/queued) on its
-// host's registry — what an epic run's per-epic cap counts (XERK-1860). Same
-// bound-org rule as startedTicketKeys.
+// host's registry, or a sleeper the hub PAUSED to free a slot (XERK-1575 — a
+// closed record carrying a valid `paused`, which will wake and run again) — what
+// an epic run's per-epic cap counts (XERK-1860). Same bound-org rule as
+// startedTicketKeys.
 function liveTicketSessionKeys() {
   const keys = new Set();
   for (const a of Object.values(agents)) {
@@ -13428,6 +13434,10 @@ function liveTicketSessionKeys() {
       const t = s && s.ticket;
       if (!t || !t.key || t.siteKey !== bound) continue;
       if (s.status === "running" || s.status === "queued") keys.add(bound + "\x00" + t.key);
+    }
+    for (const c of a.closedSessions || []) {
+      const t = c && c.ticket;
+      if (t && t.key && t.siteKey === bound && wirePaused(c.paused)) keys.add(bound + "\x00" + t.key);
     }
   }
   return keys;
@@ -21793,6 +21803,9 @@ const server = http.createServer(async (req, res) => {
         return json(res, 400, { error: "not a valid issue key" });
       }
       const body = JSON.parse((await readBody(req)) || "{}");
+      if (!body || typeof body !== "object" || Array.isArray(body)) {
+        return json(res, 400, { error: "body must be a JSON object" });
+      }
       if (!Object.values(agents).some(
         (a) => hostInOrg(a, siteKey))) {
         return json(res, 404, { error: "no host reports that Jira org" });
@@ -21816,6 +21829,9 @@ const server = http.createServer(async (req, res) => {
       if (hasLimit && body.maxConcurrent !== null && !validEpicRunLimit(body.maxConcurrent)) {
         return json(res, 400, {
           error: `maxConcurrent must be null or an integer 1..${EPIC_RUN_MAX_CONCURRENT_MAX}` });
+      }
+      if (hasLimit && ("pause" in body || "resume" in body)) {
+        return json(res, 400, { error: "send maxConcurrent on its own or with {arm:true}" });
       }
       if (hasLimit && body.arm !== true) {
         const run = setEpicRunLimit(siteKey, epicKey, body.maxConcurrent);
