@@ -1057,6 +1057,20 @@ test("a GET abandoned at its deadline is aborted, in the hydrate and the retry (
   assert.equal(m.blockedCount(), 1);
 });
 
+test("a hydrate pass abandoned mid-GET aborts that GET (XERK-1701)", async () => {
+  // A newer pass superseded this one while its GET was in flight: the GET is
+  // cut, not left streaming into a .part nobody will rename.
+  const root = mkdtemp("turma-mir-");
+  let sig;
+  let m;
+  const store = { list: async () => ["repo/a.jsonl"], stat: async () => ({ size: 2 }),
+    getToFile: (k, dest, { signal } = {}) => { sig = signal; m._hydrateRun++; return Promise.resolve(false); } };
+  m = new ArchiveMirror({ blobStore: store, archiveDir: root, reindex() {}, log() {} });
+  await m.hydrate({ getDeadlineMs: 60 * 1000 });
+  assert.ok(sig, "the GET ran");
+  assert.equal(sig.aborted, true);
+});
+
 test("a slow object that outlasts the retry GET deadline lands on a later, longer retry (XERK-1833 QA D1)", async () => {
   const root = mkdtemp("turma-mir-");
   // Every GET of this key takes 50ms: past a 20ms deadline, inside 80ms.

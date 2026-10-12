@@ -540,6 +540,9 @@ RESUMABLE_CACHE_MAX_BYTES = 16 * 1024 * 1024
 # The fields a cached resumable entry keeps; ticket and prs are re-attached from
 # the manager's own ledgers at load, never taken from the file.
 _RESUMABLE_CACHE_STR_KEYS = ("transcriptId", "cwd", "repo", "origin", "slug", "endedTs")
+# A project slug as _project_slug makes one (every non-alphanumeric char -> "-"),
+# so a cached row's slug can be joined onto PROJECTS_ROOT without escaping it.
+_RESUMABLE_SLUG_RE = re.compile(r"[A-Za-z0-9-]{1,255}")
 # Durable worktree-path -> {repo, remote, slug} attribution ledger. Written at
 # spawn and NEVER dropped on kill/delete, so a transcript's token usage stays
 # traceable to its repo long after the session (and even its worktree) is gone.
@@ -39868,10 +39871,14 @@ class SessionManager:
         write, so it is read through _read_untrusted_json and every entry is
         re-shaped: only plain string fields survive, the transcript id must be
         one a resume would accept, and ticket/prs come from this manager's own
-        ledgers. Replaced by the first scan that lands. Never raises."""
+        ledgers. A row whose transcript is not on disk, or whose id an earlier
+        row already took, is dropped: a forged file could otherwise list
+        conversations that do not exist, or one id many times, until that scan.
+        Replaced by the first scan that lands. Never raises."""
         try:
             raw = _read_untrusted_json(RESUMABLE_CACHE_PATH, RESUMABLE_CACHE_MAX_BYTES)
             out = {}
+            seen = set()
             for repo, lst in (raw if isinstance(raw, dict) else {}).items():
                 if not isinstance(repo, str) or not isinstance(lst, list):
                     continue
@@ -39882,8 +39889,13 @@ class SessionManager:
                     if not all(isinstance(e.get(k), str) for k in _RESUMABLE_CACHE_STR_KEYS):
                         continue
                     tid = e["transcriptId"]
-                    if not VALID_CLAUDE_SID_RE.fullmatch(tid):
+                    if not VALID_CLAUDE_SID_RE.fullmatch(tid) or tid in seen:
                         continue
+                    slug = e["slug"]
+                    if (not _RESUMABLE_SLUG_RE.fullmatch(slug) or not os.path.isfile(
+                            os.path.join(PROJECTS_ROOT, slug, tid + ".jsonl"))):
+                        continue
+                    seen.add(tid)
                     row = {k: e[k] for k in _RESUMABLE_CACHE_STR_KEYS}
                     row["root"] = e.get("root") is True
                     summary = e.get("summary")

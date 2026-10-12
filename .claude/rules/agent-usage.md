@@ -139,6 +139,9 @@ Claude subscription is LEFT (5h/7d windows, answerable only by Claude Code). All
     code, a deleted/planted file, one whose rows were all rejected) the first refresh builds the picker INLINE once
     (`_resumable_known`). A gen-voided scan still applies `resumable` (it
     reads no baseline) and re-stages on the next full beat (`_usage_restage`).
+  - **A cached row survives the load only if its `<slug>/<id>.jsonl` exists and its id is new**
+    (one stat each; the slug must be `_project_slug`-shaped). A forged file otherwise listed phantom
+    conversations, or one id many times, until the first scan.
   - `_refresh_repo_usage` is the synchronous form, for tests only. Tests: `TestUsageScanWorker`.
 - Tests: `TestReconcileOrphanTranscripts`, `TestSanitizeJunkRepoEntries`, android
   `UsageViewModelTest`.

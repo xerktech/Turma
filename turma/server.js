@@ -3724,12 +3724,13 @@ const EPIC_CHILD_ATTEMPTS_MAX = 2000;
 // blocker (a key outside the epic) holds the child only while it is VISIBLE and
 // not Done; one no host reports is treated as satisfied, so an invisible
 // cross-project ticket cannot deadlock the whole run. Self-blocks are ignored,
-// matching buildEpicWaves.
+// matching buildEpicWaves, and so is the run's OWN epic: it is Done only once
+// every child is, so a child it "blocks" would hold the run forever.
 function epicChildBlockersDone(childRow, run, rows) {
   const kids = new Set(run.children || []);
   const blockers = Array.isArray(childRow.blockedBy) ? childRow.blockedBy : [];
   for (const b of blockers) {
-    if (typeof b !== "string" || !b || b === childRow.key) continue;
+    if (typeof b !== "string" || !b || b === childRow.key || b === run.epicKey) continue;
     const br = rows.get(ticketQueueKey(run.siteKey, b));
     const done = !!(br && br.row && br.row.statusCategory === "done");
     if (kids.has(b)) {

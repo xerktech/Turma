@@ -14239,6 +14239,19 @@ test("XERK-636: epicChildBlockersDone — in-epic blocker authoritative, externa
   assert.equal(epicChildBlockersDone({ key: "B", blockedBy: [] }, run, rows), true);
 });
 
+test("epicChildBlockersDone: a child blocked by its own epic is not held (XERK-1701)", () => {
+  // The epic is Done only once every child is, so treating it as a visible,
+  // not-Done external blocker stalled the run with nothing dispatched.
+  const run = { siteKey: "eb.atlassian.net", epicKey: "EP-1", children: ["A", "B"] };
+  const rows = new Map([
+    ["eb.atlassian.net\x00EP-1", { row: { key: "EP-1", statusCategory: "inprogress" } }],
+    ["eb.atlassian.net\x00Y", { row: { key: "Y", statusCategory: "todo" } }],
+  ]);
+  assert.equal(epicChildBlockersDone({ key: "B", blockedBy: ["EP-1"] }, run, rows), true);
+  // Another visible open blocker still holds it.
+  assert.equal(epicChildBlockersDone({ key: "B", blockedBy: ["EP-1", "Y"] }, run, rows), false);
+});
+
 // ---- pause / resume an armed run (XERK-641, epic XERK-633) ------------------
 // The operator's hands-off HOLD, the kill-switch a Cancel is too destructive for:
 // a paused run starts NO new children AND its already-running children are left

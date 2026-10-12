@@ -136,6 +136,9 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   external blocker (no host reports it) is treated as satisfied, so an invisible cross-project ticket
   can't deadlock the run. This is the driver's readiness concern; `buildEpicWaves` only ORDERS by
   in-set blockers.
+- **The run's OWN epic is never a blocker** (XERK-1701): it reaches Done only after every child, so a
+  child Jira lists as blocked by its epic would read as a visible, open external blocker and hold the
+  run forever with nothing dispatched.
 - **The driver re-derives run STATE as children complete** (`advanceEpicRunState`): a `running` run
   whose every child has reached Done becomes `done` (and drives nothing more); a cycle-`blocked` run
   is LEFT blocked (only a re-arm rebuilds the DAG — its acyclic children still drive while blocked,

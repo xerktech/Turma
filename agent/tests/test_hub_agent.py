@@ -7654,9 +7654,29 @@ class TestUsageScanWorker(ManagerMixin, unittest.TestCase):
         self.assertIsNotNone(sm._usage_inputs)              # retried next refresh
 
     def _resumable_row(self, tid="t1", repo="Turma"):
+        slug = ha._project_slug(self.WT)
+        if ha.VALID_CLAUDE_SID_RE.fullmatch(tid):      # its transcript is on disk
+            d = os.path.join(ha.PROJECTS_ROOT, slug)
+            os.makedirs(d, exist_ok=True)
+            open(os.path.join(d, tid + ".jsonl"), "a").close()
         return {"transcriptId": tid, "cwd": self.WT, "repo": repo, "root": False,
-                "origin": "worktree", "slug": ha._project_slug(self.WT),
+                "origin": "worktree", "slug": slug,
                 "summary": "s", "endedTs": "2026-07-01T10:00:00Z"}
+
+    def test_the_cache_drops_missing_transcripts_and_repeated_ids(self):
+        # XERK-1701: a forged cache listed conversations that do not exist, or
+        # one id many times, until the first scan replaced it.
+        sm = self.make_manager()
+        gone = dict(self._resumable_row("t2"))
+        os.remove(os.path.join(ha.PROJECTS_ROOT, gone["slug"], "t2.jsonl"))
+        escape = dict(self._resumable_row("t3"), slug="..")
+        rows = {"Turma": [self._resumable_row(), self._resumable_row(), gone, escape],
+                "Other": [dict(self._resumable_row(), repo="Other")]}
+        with open(ha.RESUMABLE_CACHE_PATH, "w") as f:
+            json.dump(rows, f)
+        got = sm._load_resumable_cache()
+        self.assertEqual([e["transcriptId"] for e in got["Turma"]], ["t1"])
+        self.assertNotIn("Other", got)
 
     def test_a_restarted_manager_reports_the_last_picker_before_its_first_scan(self):
         # The hub counts a ticket whose only session is in `resumable` as
