@@ -540,84 +540,71 @@ fun modelPinOf(
 ): com.xerktech.turma.model.TicketModelPin? =
     ticketModels["$siteKey/$issueKey"]?.takeIf { it.model.isNotBlank() }
 
-/** The model ladder's pick for an unpinned ticket (board.js `ladderPickOf`). */
-data class LadderPick(
+/**
+ * A ticket's work class (XERK-1848) — board.js `workClassOf`, the hub's
+ * outcome-ledger `workClass`: the issue type, lowercased, one token, "other".
+ */
+fun workClassOf(type: String?): String {
+    val s = (type ?: "").replace(Regex("[\\u0000-\\u001f\\u007f-\\u009f]"), " ").trim().take(40)
+    return s.lowercase().replace(Regex("[^a-z0-9]+"), "-").trim('-').ifEmpty { "other" }
+}
+
+/** The routing policy's pick for an unpinned ticket (board.js `modelPickOf`). */
+data class ModelPick(
     val model: String,
-    val escalatedFrom: String? = null,
+    val cls: String,
     /** Non-claude default runtimes an unpinned Start may route to (XERK-1840). */
     val elsewhere: List<String> = emptyList(),
 )
 
 /**
- * The model ladder's next tier for an UNPINNED ticket (XERK-1830) — a port of
- * board.js `ladderPickOf`, itself a port of the hub's ticketLadderPick +
- * ticketSpawnModelFields (XERK-1827). Null when the hub serves no ladder (off, or
- * an older hub), under a dsh/qwen runtime pin, or when the ticket is pinned to a
- * host whose default runtime isn't claude. A session of the ticket that is no
- * longer running (stopped, or a closed record that isn't a paused sleeper) with no
- * PR and no close-ticket outcome is a failed attempt on its model; the pick is one
- * tier above the highest failed one, capped. Only hosts decided into the org count.
- * With no agent or runtime pin, [LadderPick.elsewhere] names the default runtimes of
- * online in-org hosts that aren't claude: Start may land there and send no model
- * (XERK-1840), so the row hedges "on Claude hosts".
+ * The model an UNPINNED ticket's Start sends under the routing policy (XERK-1848)
+ * — a port of board.js `modelPickOf`, itself a port of the hub's
+ * ticketSpawnModelFields + modelPolicyPick. Null unless the policy is "on" and
+ * the ticket's work class is promoted, under a dsh/qwen runtime pin, or when the
+ * ticket is pinned to a host whose default runtime isn't claude. With no agent or
+ * runtime pin, [ModelPick.elsewhere] names the default runtimes of online in-org
+ * hosts that aren't claude: Start may land there and send no model (XERK-1840),
+ * so the row hedges "on Claude hosts".
  */
-fun ladderPickOf(
+fun modelPickOf(
     agents: List<AgentInfo>,
-    ladder: List<String>,
+    policy: com.xerktech.turma.model.ModelPolicy?,
     siteKey: String,
-    issueKey: String,
+    ticket: JiraTicket,
     agentPin: com.xerktech.turma.model.TicketAgentPin? = null,
     runtimePin: com.xerktech.turma.model.TicketRuntimePin? = null,
-): LadderPick? {
-    if (ladder.isEmpty()) return null
+): ModelPick? {
+    if (policy == null || policy.mode != "on") return null
+    val cls = workClassOf(ticket.type)
+    val model = policy.promoted[cls]?.takeIf { it.isNotBlank() } ?: return null
     if (runtimePin != null && runtimePin.runtime.isNotBlank() && runtimePin.runtime != "claude") return null
     if (runtimePin == null && agentPin != null && agentPin.host.isNotBlank()) {
         val a = agents.find { (it.key.ifEmpty { it.device }) == agentPin.host }
         if (a != null && a.defaultRuntime.ifEmpty { "claude" } != "claude") return null
     }
     fun orgOf(a: AgentInfo): String? = a.org ?: a.jira?.siteKey?.ifBlank { null }
-    fun mine(t: com.xerktech.turma.model.TicketRef?) = t != null && t.key == issueKey && t.siteKey == siteKey
-    var failed = -1
-    fun consider(model: String, delivered: Boolean) {
-        if (delivered) return
-        val tier = ladder.indexOf(model)
-        if (tier > failed) failed = tier
-    }
-    for (a in agents) {
-        if (orgOf(a) != siteKey) continue
-        for (s in a.sessions) {
-            if (!mine(s.ticket) || s.status != "stopped") continue
-            consider(s.model, s.prs.isNotEmpty() || s.ticket?.outcome != null)
-        }
-        for (c in a.closedSessions) {
-            if (!mine(c.ticket) || c.paused != null) continue
-            consider(c.model, c.prs.isNotEmpty() || c.ticket?.outcome != null)
-        }
-    }
-    val next = minOf(failed + 1, ladder.size - 1)
     val elsewhere = if (runtimePin == null && (agentPin == null || agentPin.host.isBlank())) {
         agents.filter { it.online && orgOf(it) == siteKey }
             .map { it.defaultRuntime.ifEmpty { "claude" } }
             .filter { it != "claude" }.distinct().sorted()
     } else emptyList()
-    return LadderPick(ladder[next], if (failed >= 0) ladder[failed] else null, elsewhere)
+    return ModelPick(model, cls, elsewhere)
 }
 
 /**
  * What an unpinned ticket's Model value / picker release option reads (board.js
- * `modelAutoLabel`): "Auto (Haiku)", "Auto (Sonnet, retry)" under the ladder,
- * else "Default (<probed default>)".
+ * `modelAutoLabel`): "Auto (Sonnet)" under the routing policy, else
+ * "Default (<probed default>)".
  */
-fun modelAutoLabel(models: BoardModels, pick: LadderPick?): String =
+fun modelAutoLabel(models: BoardModels, pick: ModelPick?): String =
     if (pick != null) "Auto (${prettyModel(pick.model)}" +
-        "${if (pick.elsewhere.isNotEmpty()) " on Claude hosts" else ""}" +
-        "${if (pick.escalatedFrom != null) ", retry" else ""})"
+        "${if (pick.elsewhere.isNotEmpty()) " on Claude hosts" else ""})"
     else "Default" + (models.defaultLabel.takeIf { it.isNotBlank() }?.let { " (${prettyModel(it)})" } ?: "")
 
 /** The dim reason beside an Auto value (board.js `modelFieldHtml`). */
-fun ladderPickReason(pick: LadderPick): String =
-    (pick.escalatedFrom?.let { "a ${prettyModel(it)} session ended without a PR" }
-        ?: "the model ladder's first tier") +
+fun modelPickReason(pick: ModelPick): String =
+    "promoted for ${pick.cls} work on shadow-run evidence" +
         if (pick.elsewhere.isEmpty()) ""
         else "; a ${pick.elsewhere.joinToString(" or ") { prettyRuntime(it) }} host runs its own default"
 

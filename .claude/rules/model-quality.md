@@ -13,7 +13,7 @@ paths:
 # Model quality loop — the outcome ledger (XERK-1839, epic XERK-1844)
 
 Decisions + the full plan (signals, attribution, shadow runs, routing): `docs/model-quality-adr.md`.
-This file is the operative rules for what has shipped.
+This file is the operative rules for what has shipped; the routing policy is `model-routing.md`.
 
 - **Model provenance is hub-owned, never written into git.** Some orgs require user-authored
   commits with no model attribution; never add a model trailer/author/PR-body line for this.
@@ -38,7 +38,7 @@ This file is the operative rules for what has shipped.
   - **Reopen marks only rows that started BEFORE the Done** — a later session is the reopened work.
     `doneAt` is the tracker's `resolved` time when the board row has one, else the sighting —
     sighting-time alone marked a session begun while the board lagged as the cause.
-  - Known over-count: a migration's killed source record reads undelivered (same as the ladder).
+  - Known over-count: a migration's killed source record reads undelivered.
 - **Persistence = the permission ledger's two backends**: `/data/outcome-ledger.json` (non-HA),
   Postgres `outcome_session` (HA, upsert monotone on `updated_at`, rescanned on the ready edge and
   in `onLeaderPromoted`). Never `registerExternalStore` (whole-value writes). Flushed on drain.
@@ -131,7 +131,7 @@ This file is the operative rules for what has shipped.
     Opus GRADE session; `shadow-grade` makes it terminal. A run with no change is graded bad
     without a grader. One session teardown per beat; the `turma-shadow/<id>` branch is dropped.
   - **Never a `ticket` block on either session** (and `_maybe_adopt_ticket` refuses a shadow), so
-    no ticket sweep — auto-stop on Done, auto-merge, close-ticket, the ladder — acts on it. The
+    no ticket sweep — auto-stop on Done, auto-merge, close-ticket, routing — acts on it. The
     hub raises no alert for a `shadow` session and lists it in no peer roster.
   - **No-publish is two layers.** The launch env (`SHADOW_ENV`) carries an EMPTY
     `url.<dead path>.pushInsteadOf` via `GIT_CONFIG_COUNT/KEY_0/VALUE_0`, which rewrites EVERY
@@ -172,8 +172,8 @@ This file is the operative rules for what has shipped.
   `n` in the hover. A signal with no finite median is absent, never 0. A new signal needs a
   label on BOTH clients or it stays hidden.
 - **Fields the later seams will serve, read when present** (absent = column hidden): per group
-  `shadow: {pairs, candidateOnlyBad}` (XERK-1847), `promotion` string (XERK-1848). A seam that
-  names them differently must change both clients in the same PR.
+  `shadow: {pairs, candidateOnlyBad}` (XERK-1847), `promotion` string (XERK-1848, shown
+  verbatim). A seam that names them differently must change both clients in the same PR.
 - **Android reads the route field by field** (`parseModelQuality` over a raw `JsonElement`), not
   a typed decode: one wrong-typed field from a later seam drops to its default, as on the web,
   instead of blanking the card.

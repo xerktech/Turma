@@ -36945,7 +36945,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model=None, agent_type=None, escalated_from=None)
+            "PROJ-7", cmd_id="c9", model=None, agent_type=None)
 
     def test_handle_commands_carries_the_model_pin(self):
         # The hub's per-ticket model pin (XERK-123) rides the command; the agent
@@ -36955,7 +36955,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "model": "opus", "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model="opus", agent_type=None, escalated_from=None)
+            "PROJ-7", cmd_id="c9", model="opus", agent_type=None)
 
     def test_handle_commands_carries_the_runtime_pin(self):
         # The hub's per-ticket runtime pin (XERK-473) rides the command as
@@ -36966,7 +36966,7 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         sm.handle_commands([{"type": "spawnTicket", "issueKey": "PROJ-7",
                              "agentType": "dsh", "cmdId": "c9"}])
         sm.spawn_ticket.assert_called_once_with(
-            "PROJ-7", cmd_id="c9", model=None, agent_type="dsh", escalated_from=None)
+            "PROJ-7", cmd_id="c9", model=None, agent_type="dsh")
 
     def test_a_model_pin_lands_on_the_session_and_command_line(self):
         sm = self.make_ticket_manager()
@@ -37007,26 +37007,35 @@ class TestSpawnTicket(ManagerMixin, unittest.TestCase):
         self.assertIsNone(sess["model"])            # omit --model = login default
         self.assertNotIn("--model", self._launches()[-1][-1])
 
-    def test_a_ladder_retry_tells_the_session_which_tier_missed(self):
-        # XERK-1827: the hub names the tier the last session failed on; the
-        # prompt says so, and the model rides --model like any pin.
-        sm = self.make_ticket_manager()
-        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
-            sm.spawn_ticket("PROJ-7", model="sonnet", escalated_from="haiku")
-        cmd = self._launches()[-1][-1]
-        self.assertIn("--model sonnet", cmd)
-        self.assertIn("A previous session on this ticket ran on haiku", cmd)
-        self.assertIn("This session runs on sonnet", cmd)
+    def test_a_cheaper_model_is_told_to_pass_opus_qa_and_review(self):
+        # XERK-1848: a sonnet/haiku ticket session (the routing policy's pick or
+        # a pin) must pass Opus QA and an Opus code review before its PR.
+        for model in ("sonnet", "haiku"):
+            sm = self.make_ticket_manager()
+            with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+                sm.spawn_ticket("PROJ-7", model=model)
+            cmd = self._launches()[-1][-1]
+            self.assertIn(f"--model {model}", cmd)
+            self.assertIn(f"This session runs on {model}, not Opus", cmd)
+            self.assertIn("`qa` agent", cmd)
+            self.assertIn("Opus code review", cmd)
 
-    def test_a_first_attempt_and_a_hostile_escalated_from_carry_no_retry_line(self):
-        sm = self.make_ticket_manager()
-        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
-            sm.spawn_ticket("PROJ-7", model="haiku")
-        self.assertNotIn("A previous session", self._launches()[-1][-1])
-        sm2 = self.make_ticket_manager()
-        with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
-            sm2.spawn_ticket("PROJ-7", model="haiku", escalated_from="x'; rm -rf /")
-        self.assertNotIn("A previous session", self._launches()[-1][-1])
+    def test_opus_the_default_and_other_runtimes_get_no_review_gate(self):
+        for model in (None, "opus", "fable"):
+            sm = self.make_ticket_manager()
+            with mock.patch.object(ha, "fetch_jira_issue", lambda k: self._detail()):
+                sm.spawn_ticket("PROJ-7", model=model)
+            self.assertNotIn("not Opus", self._launches()[-1][-1])
+        # A hostile alias never reaches the prompt.
+        self.assertNotIn("not Opus", ha.build_ticket_prompt(
+            dict(self._detail(), opusReviewModel="sonnet'; rm -rf /")))
+        self.assertNotIn("not Opus", ha.build_ticket_prompt(
+            dict(self._detail(), opusReviewModel="opus")))
+        self.assertIn("not Opus", ha.build_ticket_prompt(
+            dict(self._detail(), opusReviewModel="haiku")))
+        self.assertTrue(ha.ticket_needs_opus_review("claude-sonnet-4-5"))
+        self.assertFalse(ha.ticket_needs_opus_review("claude-opus-4-8"))
+        self.assertFalse(ha.ticket_needs_opus_review(None))
 
     def test_the_subagent_default_is_off_unless_configured(self):
         # XERK-1827 follow-up: off by default (it would put QA on the cheap model

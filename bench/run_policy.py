@@ -2,11 +2,13 @@
 """Replay a model-escalation POLICY over the validated task set (XERK-1827).
 
 run_bench.py holds the model fixed per run; this runs each task through a tier
-ladder the way the hub now runs a ticket: the first tier gets a fresh attempt,
+ladder the way the hub's XERK-1827 ladder ran a ticket (retired by the
+evidence-gated routing policy, XERK-1848): the first tier gets a fresh attempt,
 and only a task it did not DELIVER (tests green AND committed) moves to the next
-tier, which starts from a fresh worktree with the retry preamble a production
-retry session gets. The result is each policy's solve rate and dollar cost side
-by side, so it is the regression gate for any later change to the ladder.
+tier, which starts from a fresh worktree with a retry preamble. The result is
+each policy's solve rate and dollar cost side by side — an offline experiment on
+known past fixes, never the basis for production routing (that is the shadow-run
+evidence, docs/model-quality-adr.md).
 
     TURMA_LOCAL_BASE_URL=... TURMA_LOCAL_API_KEY=... \\
       python3 bench/run_policy.py --repo /path/to/Turma \\
@@ -46,9 +48,8 @@ PRICES = {
     "opus": (5.00, 25.00, 6.25, 0.50),
 }
 
-# The ladders. "ladder" is the production policy: it MUST match the hub's
-# TICKET_MODEL_LADDER (turma/server.js), or this gate measures a policy nobody
-# runs. Tests: TestPolicyMatchesHub.
+# The ladders. "ladder" is the retired XERK-1827 hub ladder, kept as an
+# experiment to compare against.
 POLICIES = {
     "ladder": ["haiku", "sonnet", "opus"],
     "always-opus": ["opus"],
@@ -56,9 +57,8 @@ POLICIES = {
     "always-sonnet": ["sonnet"],
 }
 
-# Prepended to a retry tier's prompt. Mirrors the agent's TICKET_RETRY_DIRECTIVE
-# minus the branch sentence: a bench run never pushes, so there is no earlier
-# branch to find.
+# Prepended to a retry tier's prompt (the retired ladder's retry directive,
+# minus its branch sentence: a bench run never pushes).
 RETRY_PREAMBLE = (
     "A previous attempt at this task ran on {prev} and ended without delivering "
     "a working, committed change. This attempt runs on a stronger model. Start "

@@ -21014,20 +21014,29 @@ TICKET_BUG_VERIFY_DIRECTIVE = (
 )
 
 
-# The hub's ticket model ladder (XERK-1827, turma/server.js ticketLadderPick)
-# starts an unpinned ticket on the cheapest tier and, after a session of it ENDED
-# without a PR or a close, starts the next one a tier up. That retry session is
-# told so: the earlier attempt may have pushed a branch worth building on, and
-# knowing the cheaper model already missed is a reason to check the ask again
-# rather than repeat its route. bench/run_policy.py's RETRY_PREAMBLE mirrors this
-# minus the branch sentence (a bench run never pushes).
-TICKET_RETRY_DIRECTIVE = (
-    "A previous session on this ticket ran on {prev} and ended without opening a"
-    " PR or closing the ticket. This session runs on {model}. Check"
-    " origin for a branch that session may have pushed for this ticket and build"
-    " on it only if it helps; otherwise start fresh from the current default"
-    " branch."
+# A ticket session on a model cheaper than Opus (the routing policy's pick,
+# XERK-1848, or an operator's pin) must pass Opus QA AND an Opus code review of
+# its diff before it opens a PR, and record both verdicts in the PR summary
+# (docs/model-quality-adr.md "Routing policy"). The qa agent already runs on Opus
+# (hooks/subagent_model.py, XERK-1851); the review is named here so a cheap
+# session cannot skip it or grade its own diff on its own model.
+TICKET_OPUS_REVIEW_FAMILIES = ("sonnet", "haiku")
+TICKET_OPUS_REVIEW_DIRECTIVE = (
+    "**This session runs on {model}, not Opus, so two Opus checks gate your PR.**"
+    " Before you open it: (1) run the `qa` agent on the change (it runs on Opus),"
+    " and (2) get an Opus code review of your full diff against the default"
+    " branch — launch a sub-agent with the Agent tool's `model` set to \"opus\""
+    " to review that diff for correctness bugs. Fix what either finds and re-run"
+    " it. Put both verdicts — the QA verdict and the Opus review's — in the PR"
+    " summary's Testing section."
 )
+
+
+def ticket_needs_opus_review(model):
+    """True for a Claude alias of a family cheaper than Opus (sonnet, haiku)."""
+    m = model.lower() if isinstance(model, str) else ""
+    return any(f in m for f in TICKET_OPUS_REVIEW_FAMILIES)
+
 
 # TURMA_TICKET_SUBAGENT_MODEL (e.g. "haiku") makes it the sub-agent default in
 # ticket sessions (XERK-1827), via Claude Code's CLAUDE_CODE_SUBAGENT_MODEL — the
@@ -21122,12 +21131,10 @@ def build_ticket_prompt(detail, attachments=None, session_cli=True):
 
     out += _ticket_attachment_lines(d, attachments)
 
-    retry_of = d.get("retryOf")
-    if isinstance(retry_of, str) and SPAWN_MODEL_RE.fullmatch(retry_of):
-        model = d.get("retryModel")
-        if not (isinstance(model, str) and SPAWN_MODEL_RE.fullmatch(model)):
-            model = "a different model"
-        out += ["", TICKET_RETRY_DIRECTIVE.format(prev=retry_of, model=model)]
+    review_model = d.get("opusReviewModel")
+    if (isinstance(review_model, str) and SPAWN_MODEL_RE.fullmatch(review_model)
+            and ticket_needs_opus_review(review_model)):
+        out += ["", TICKET_OPUS_REVIEW_DIRECTIVE.format(model=review_model)]
 
     if _ticket_is_bug(d):
         out += ["", TICKET_BUG_VERIFY_DIRECTIVE.format(
@@ -27245,8 +27252,7 @@ class SessionManager:
             return None
         return branch
 
-    def spawn_ticket(self, issue_key, cmd_id=None, model=None, agent_type=None,
-                     escalated_from=None):
+    def spawn_ticket(self, issue_key, cmd_id=None, model=None, agent_type=None):
         """Spawn a session to work a ticket (Jira or Azure DevOps) — the board's
         per-card start button.
 
@@ -27353,12 +27359,13 @@ class SessionManager:
         # so a Jira ticket record is byte-for-byte what it always was.
         if branch_base != key:
             ticket["branchBase"] = branch_base
-        # A ladder retry (XERK-1827): the hub names the tier the last session
-        # failed on, and the prompt says so. Charset-checked like a model alias,
-        # since it is interpolated into the prompt; anything else is dropped.
-        if (isinstance(escalated_from, str) and SPAWN_MODEL_RE.fullmatch(escalated_from)
+        # A claude session on a model cheaper than Opus (XERK-1848) is told to pass
+        # Opus QA and an Opus review before its PR. Charset-checked like a model
+        # alias, since it is interpolated into the prompt; dsh/qwen get nothing.
+        if (agent_type in (None, "", "claude") and isinstance(model, str)
+                and SPAWN_MODEL_RE.fullmatch(model) and ticket_needs_opus_review(model)
                 and isinstance(detail, dict)):
-            detail = dict(detail, retryOf=escalated_from, retryModel=model)
+            detail = dict(detail, opusReviewModel=model)
         # The ticket text goes as the DETAIL, not as a built prompt: the prompt
         # names the attachments this ticket's session downloads for itself, and
         # those land under the session id spawn() is about to mint (XERK-242).
@@ -39247,8 +39254,7 @@ class SessionManager:
                 elif ctype == "spawnTicket":
                     self.spawn_ticket(cmd.get("issueKey"), cmd_id=cid,
                                       model=cmd.get("model"),
-                                      agent_type=cmd.get("agentType"),
-                                      escalated_from=cmd.get("escalatedFrom"))
+                                      agent_type=cmd.get("agentType"))
                 elif ctype == "kill":
                     self.kill(cmd.get("sessionId"))
                 elif ctype == "pauseSleeper":

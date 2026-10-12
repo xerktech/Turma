@@ -8,7 +8,6 @@ over a hand-written Claude Code project dir.
 
 import json
 import os
-import re
 import sys
 import tempfile
 import types
@@ -16,7 +15,6 @@ import unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BENCH = os.path.dirname(HERE)
-REPO = os.path.dirname(BENCH)
 sys.path.insert(0, BENCH)
 
 import run_bench  # noqa: E402
@@ -111,16 +109,6 @@ class TestSummarize(unittest.TestCase):
         self.assertEqual(rows["ladder"]["inconclusive"], 1)
         self.assertEqual(rows["ladder"]["delivered_by"], {"haiku": 1, "sonnet": 1})
         self.assertEqual(rows["always-opus"]["usd_per_solve"], 10.0)
-
-
-class TestPolicyMatchesHub(unittest.TestCase):
-    def test_the_ladder_policy_is_the_hubs_default_ladder(self):
-        # The gate must measure the policy production runs.
-        with open(os.path.join(REPO, "turma", "server.js")) as fh:
-            m = re.search(r"TICKET_MODEL_LADDER_DEFAULT = \[([^\]]*)\]", fh.read())
-        hub = re.findall(r'"([^"]+)"', m.group(1))
-        self.assertEqual(run_policy.POLICIES["ladder"], hub)
-        self.assertTrue(set(hub) <= set(run_policy.GATEWAY_MODELS) & set(run_policy.PRICES))
 
 
 class TestUsageDedupe(unittest.TestCase):

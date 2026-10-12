@@ -15,7 +15,7 @@ const {
   repoChipHtml, repoFieldHtml, repoPickerHtml, repoPickerValue,
   dedupeChipHtml, dedupeTwinUrl,
   agentPinOf, agentFieldHtml, agentPickerHtml, agentPickerValue,
-  modelPinOf, ladderPickOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
+  modelPinOf, modelPickOf, workClassOf, modelFieldHtml, modelPickerHtml, modelPickerValue, modelChoices, prettyModel,
   runtimePinOf, runtimeFieldHtml, runtimePickerHtml, runtimePickerValue, prettyRuntime,
   platformPinOf, platformFieldHtml, platformPickerHtml, platformPickerValue, prettyPlatform,
   statusFieldHtml, statusPickerHtml, statusPickerValue,
@@ -1284,89 +1284,73 @@ test("modelPickerHtml: default preselected without a pin, the pinned alias with 
   assert.ok(!/<option value="__default__" selected>/.test(pinned));
 });
 
-// ---- the model ladder's pick (XERK-1830): what an unpinned Model row names ----
-const LADDER = ["haiku", "sonnet", "opus"];
-const ladTicket = (extra = {}) => ({ key: "ENG-5", siteKey: "acme", ...extra });
-const ladAgent = (key, extra = {}) => ({ key, org: "acme", sessions: [], closedSessions: [], ...extra });
+// ---- the routing policy's pick (XERK-1848): what an unpinned Model row names ----
+const POLICY = { mode: "on", promoted: { bug: "sonnet", task: "haiku" } };
+const bug = { key: "ENG-5", type: "Bug" };
+const polAgent = (key, extra = {}) => ({ key, org: "acme", sessions: [], closedSessions: [], ...extra });
 
-test("XERK-1830: ladderPickOf is null without a ladder, the bottom tier with no history", () => {
-  assert.equal(ladderPickOf([ladAgent("h1")], undefined, "acme", "ENG-5"), null);
-  assert.equal(ladderPickOf([ladAgent("h1")], [], "acme", "ENG-5"), null);
-  assert.deepEqual(ladderPickOf([ladAgent("h1")], LADDER, "acme", "ENG-5"), { model: "haiku" });
+test("XERK-1848: workClassOf matches the hub's outcome-ledger workClass", () => {
+  const { workClass } = require("../outcome-ledger.js");
+  for (const t of ["Bug", "  Task ", "User Story", "Sub-task", "", undefined, 5, "Épico", "a\u0000b", "x".repeat(60)]) {
+    assert.equal(workClassOf(t), workClass(t), JSON.stringify(t));
+  }
 });
 
-test("XERK-1830: ladderPickOf climbs one tier past an undelivered ended session, capped", () => {
-  const closed = (model, extra = {}) => ({ id: model, model, ticket: ladTicket(), prs: [], ...extra });
-  let agents = [ladAgent("h1", { closedSessions: [closed("haiku")] })];
-  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5"), { model: "sonnet", escalatedFrom: "haiku" });
-  agents = [ladAgent("h1", { closedSessions: [closed("haiku")],
-    sessions: [{ id: "s", status: "stopped", model: "opus", ticket: ladTicket() }] })];
-  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5"), { model: "opus", escalatedFrom: "opus" });
+test("XERK-1848: modelPickOf is null unless the policy is on and the class is promoted", () => {
+  const agents = [polAgent("h1")];
+  assert.equal(modelPickOf(agents, undefined, "acme", bug), null);                     // older hub
+  assert.equal(modelPickOf(agents, { ...POLICY, mode: "observe" }, "acme", bug), null);
+  assert.equal(modelPickOf(agents, { mode: "on", promoted: null }, "acme", bug), null);
+  assert.equal(modelPickOf(agents, POLICY, "acme", { key: "ENG-6", type: "Story" }), null);
+  assert.equal(modelPickOf(agents, { mode: "on", promoted: { constructor: "x" } }, "acme",
+    { key: "E", type: "constructor" }).model, "x");                                    // own keys only
+  assert.equal(modelPickOf(agents, POLICY, "acme", { key: "E", type: "toString" }), null);
+  assert.deepEqual(modelPickOf(agents, POLICY, "acme", bug), { model: "sonnet", cls: "bug" });
+  assert.deepEqual(modelPickOf(agents, POLICY, "acme", { key: "E", type: "Task" }), { model: "haiku", cls: "task" });
 });
 
-test("XERK-1830: ladderPickOf ignores delivered, live, paused and other-org/ticket sessions", () => {
-  const agents = [
-    ladAgent("h1", {
-      sessions: [
-        { id: "a", status: "running", model: "sonnet", ticket: ladTicket() },
-        { id: "b", status: "error", model: "sonnet", ticket: ladTicket() },
-      ],
-      closedSessions: [
-        { id: "c", model: "sonnet", ticket: ladTicket(), prs: [{ url: "u" }] },
-        { id: "d", model: "sonnet", ticket: ladTicket({ outcome: { kind: "done", at: 1 } }) },
-        { id: "e", model: "sonnet", ticket: ladTicket(), paused: { wakeAt: 9 } },
-        { id: "f", model: "sonnet", ticket: ladTicket({ key: "ENG-6" }) },
-        { id: "g", model: "fable", ticket: ladTicket() },   // not a ladder tier: no evidence
-      ],
-    }),
-    // A host the hub decided into another org (or none) never counts here.
-    ladAgent("h2", { org: "", closedSessions: [{ id: "h", model: "opus", ticket: ladTicket() }] }),
-  ];
-  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5"), { model: "haiku" });
-});
-
-test("XERK-1830: ladderPickOf is null under a non-claude runtime pin or pinned host default", () => {
-  const agents = [ladAgent("h1"), ladAgent("q1", { defaultRuntime: "qwen" })];
-  assert.equal(ladderPickOf(agents, LADDER, "acme", "ENG-5", { runtimePin: { runtime: "dsh" } }), null);
-  assert.equal(ladderPickOf(agents, LADDER, "acme", "ENG-5", { agentPin: { host: "q1" } }), null);
-  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5", { agentPin: { host: "h1" } }), { model: "haiku" });
+test("XERK-1848: modelPickOf is null under a non-claude runtime pin or pinned host default", () => {
+  const agents = [polAgent("h1"), polAgent("q1", { defaultRuntime: "qwen" })];
+  assert.equal(modelPickOf(agents, POLICY, "acme", bug, { runtimePin: { runtime: "dsh" } }), null);
+  assert.equal(modelPickOf(agents, POLICY, "acme", bug, { agentPin: { host: "q1" } }), null);
+  assert.deepEqual(modelPickOf(agents, POLICY, "acme", bug, { agentPin: { host: "h1" } }), { model: "sonnet", cls: "bug" });
   // A claude runtime pin forces claude even on a qwen-default host.
-  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5",
-    { agentPin: { host: "q1" }, runtimePin: { runtime: "claude" } }), { model: "haiku" });
+  assert.deepEqual(modelPickOf(agents, POLICY, "acme", bug,
+    { agentPin: { host: "q1" }, runtimePin: { runtime: "claude" } }), { model: "sonnet", cls: "bug" });
 });
 
 test("XERK-1840: an unpinned pick names online non-claude-default hosts it may land on", () => {
-  const agents = [ladAgent("h1", { online: true }), ladAgent("q1", { online: true, defaultRuntime: "qwen" }),
-    ladAgent("d1", { online: true, defaultRuntime: "dsh" }), ladAgent("q2", { defaultRuntime: "qwen" }),
-    ladAgent("x1", { online: true, org: "rival", defaultRuntime: "dsh" })];
-  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5"), { model: "haiku", elsewhere: ["dsh", "qwen"] });
+  const agents = [polAgent("h1", { online: true }), polAgent("q1", { online: true, defaultRuntime: "qwen" }),
+    polAgent("d1", { online: true, defaultRuntime: "dsh" }), polAgent("q2", { defaultRuntime: "qwen" }),
+    polAgent("x1", { online: true, org: "rival", defaultRuntime: "dsh" })];
+  const want = (extra = {}) => ({ model: "sonnet", cls: "bug", ...extra });
+  assert.deepEqual(modelPickOf(agents, POLICY, "acme", bug), want({ elsewhere: ["dsh", "qwen"] }));
   // Offline or other-org non-claude hosts can't take Start: no hedge.
-  assert.deepEqual(ladderPickOf([agents[0], agents[3], agents[4]], LADDER, "acme", "ENG-5"), { model: "haiku" });
+  assert.deepEqual(modelPickOf([agents[0], agents[3], agents[4]], POLICY, "acme", bug), want());
   // A pin decides the host's runtime, so it never hedges.
-  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5", { agentPin: { host: "h1" } }), { model: "haiku" });
-  assert.deepEqual(ladderPickOf(agents, LADDER, "acme", "ENG-5", { runtimePin: { runtime: "claude" } }), { model: "haiku" });
+  assert.deepEqual(modelPickOf(agents, POLICY, "acme", bug, { agentPin: { host: "h1" } }), want());
+  assert.deepEqual(modelPickOf(agents, POLICY, "acme", bug, { runtimePin: { runtime: "claude" } }), want());
   const models = { available: ["haiku"] };
-  const row = modelFieldHtml(null, models, { ladderPick: { model: "haiku", elsewhere: ["dsh", "qwen"] } });
-  assert.ok(row.includes("Auto (Haiku on Claude hosts) — the model ladder's first tier; "
+  const row = modelFieldHtml(null, models, { modelPick: want({ elsewhere: ["dsh", "qwen"] }) });
+  assert.ok(row.includes("Auto (Sonnet on Claude hosts) — promoted for bug work on shadow-run evidence; "
     + "a dsh (DeepSeek Harness) or Qwen Code host runs its own default"), row);
-  const pick = modelPickerHtml(null, models, { model: "sonnet", escalatedFrom: "haiku", elsewhere: ["qwen"] });
-  assert.ok(/<option value="__default__" selected>Auto \(Sonnet on Claude hosts, retry\)</.test(pick));
+  const pick = modelPickerHtml(null, models, want({ elsewhere: ["qwen"] }));
+  assert.ok(/<option value="__default__" selected>Auto \(Sonnet on Claude hosts\)</.test(pick));
 });
 
-test("XERK-1830: an unpinned Model row and picker name the ladder's tier as Auto", () => {
-  const models = { available: ["opus", "sonnet", "haiku"], defaultLabel: "Sonnet 5" };
-  const first = modelFieldHtml(null, models, { editable: true, ladderPick: { model: "haiku" } });
-  assert.ok(first.includes("Auto (Haiku) — the model ladder's first tier"));
-  assert.ok(!first.includes("Default"));
-  const retry = modelFieldHtml(null, models,
-    { editable: true, ladderPick: { model: "sonnet", escalatedFrom: "haiku" } });
-  assert.ok(retry.includes("Auto (Sonnet, retry) — a Haiku session ended without a PR"));
-  // A pin still wins over the ladder.
-  assert.ok(modelFieldHtml({ model: "opus" }, models, { ladderPick: { model: "haiku" } }).includes("set by you"));
-  const pick = modelPickerHtml(null, models, { model: "sonnet", escalatedFrom: "haiku" });
-  assert.ok(/<option value="__default__" selected>Auto \(Sonnet, retry\)</.test(pick));
-  // No ladder (older hub / TICKET_MODEL_LADDER=off): the login default as before.
-  assert.ok(/<option value="__default__" selected>Default \(Sonnet 5\)</.test(modelPickerHtml(null, models, null)));
+test("XERK-1848: an unpinned Model row and picker name the policy's model as Auto", () => {
+  const models = { available: ["opus", "sonnet", "haiku"], defaultLabel: "Opus 5" };
+  const row = modelFieldHtml(null, models, { editable: true, modelPick: { model: "haiku", cls: "task" } });
+  assert.ok(row.includes("Auto (Haiku) — promoted for task work on shadow-run evidence"), row);
+  assert.ok(!row.includes("Default"));
+  // A class is escaped (it is tracker text).
+  assert.ok(!modelFieldHtml(null, models, { modelPick: { model: "haiku", cls: "<b>" } }).includes("<b>"));
+  // A pin still wins over the policy.
+  assert.ok(modelFieldHtml({ model: "opus" }, models, { modelPick: { model: "haiku", cls: "bug" } }).includes("set by you"));
+  assert.ok(/<option value="__default__" selected>Auto \(Haiku\)</.test(
+    modelPickerHtml(null, models, { model: "haiku", cls: "task" })));
+  // No pick (observe / older hub / unpromoted class): the login default as before.
+  assert.ok(/<option value="__default__" selected>Default \(Opus 5\)</.test(modelPickerHtml(null, models, null)));
 });
 
 // ---- ticket -> runtime pin (XERK-473): the detail panel's Runtime row -------
@@ -2914,6 +2898,7 @@ const BOARD_LIVE_MAPS = [
   ["triagePolicies", "triagePolicies"],
   ["epicRuns", "epicRuns"],
   ["epicBuilders", "epicBuilders"],
+  ["modelPolicy", "modelPolicy"],   // XERK-1848
 ];
 
 for (const [key, event] of BOARD_LIVE_MAPS) {
@@ -3572,6 +3557,7 @@ test("board.html keys the open epic panel's repaint on epicPanelSig at BOTH site
 
 test("XERK-1840: board.html repaints the open Model row when the hedge's runtimes change", () => {
   const html = require("node:fs").readFileSync(require("node:path").join(__dirname, "../public/board.html"), "utf8");
-  const m = html.match(/const ladderSig = \(p\) => ([^\n]*)/);
-  assert.ok(m && /p\.elsewhere/.test(m[1]), "ladderSig must key on elsewhere or a qwen host going online never repaints");
+  const m = html.match(/const modelPickSig = \(p\) => ([^\n]*)/);
+  assert.ok(m && /p\.elsewhere/.test(m[1]) && /p\.model/.test(m[1]),
+    "modelPickSig must key on the model and elsewhere or a promotion / qwen host never repaints");
 });

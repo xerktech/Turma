@@ -546,6 +546,8 @@ const AUTOSTART_ORGS_FILE = process.env.AUTOSTART_ORGS_FILE || "/data/autostart-
 // TICKET_QUEUE_RATE_MAX). Hub-owned durable state like autostart-orgs.json:
 // per-org, tiny, must survive a hub restart, rides the fleet payload + SSE.
 const TRIAGE_POLICIES_FILE = process.env.TRIAGE_POLICIES_FILE || "/data/triage-policies.json";
+// The routing policy's promotions and demotions (XERK-1848).
+const MODEL_POLICY_FILE = process.env.MODEL_POLICY_FILE || "/data/model-policy.json";
 // Per-org permission policy TEXT (XERK-1566): siteKey -> {text, at}. The agent's
 // permission judge decides Bash permission prompts against it; it rides every
 // heartbeat reply as `permissionPolicy`. Same store shape/lifecycle as
@@ -2561,101 +2563,22 @@ function setTicketModel(siteKey, issueKey, model) {
   sseBroadcast("ticketModels", ticketModels);
 }
 
-// ---- ticket model ladder (XERK-1827) ---------------------------------------
-// An UNPINNED claude ticket session starts on the cheapest tier, and each start
-// after a session of the ticket ENDED UNDELIVERED moves one tier up. The XERK-445
-// replay set measured haiku-4-5 solving 72% at ~1/5 of opus's cost, haiku and
-// sonnet each solving 3 tasks the other missed, and opus as a quota-limited last
-// resort (docs/routing-spike-phase2-3.md). Per SESSION, never per turn: a switch
-// mid-conversation makes the new model re-cache every turn it missed.
-//   - The ladder is derived from the fleet payload, not stored: a session of the
-//     ticket that is no longer running (killed, exited, errored) with NO PR and NO
-//     close-ticket outcome is a failed attempt on its `model`. The next start runs
-//     one tier above the highest failed one, capped at the top.
-//   - Only ladder models count. A session with no recorded model (an agent
-//     predating this, or a pre-ladder login-default session) is no evidence, so a
-//     host that forgets its closed history only ever costs a cheaper retry.
-//   - A paused sleeper (XERK-1575) is waiting, not failed, and a live `error`
-//     record (a failed clone/launch, a crashed tmux) is not finished: it holds
-//     its slot and Start resumes it, so infra trouble never climbs the ladder.
-//   - The operator's model pin (XERK-123) always wins, and dsh/qwen sessions are
-//     never laddered (their model is the host's endpoint, not a Claude alias) —
-//     a runtime pin, or an unpinned ticket routed to a host whose DEFAULT
-//     runtime is not claude (TURMA_DEFAULT_RUNTIME, XERK-521).
-// OFF BY DEFAULT: the ladder escalates only when a session delivered NOTHING —
-// it cannot tell a wrong PR from a right one, so a cheap model's plausible-but-
-// wrong PR never escalates. Until a per-ticket quality signal exists (XERK-1839)
-// unpinned tickets keep the login's default model. TICKET_MODEL_LADDER=on turns
-// on the recommended ladder below; a comma list of aliases sets a custom one;
-// unset, "off" or an unusable value leaves it off. bench/run_policy.py's
-// "ladder" policy replays the recommended list — keep the two equal (pinned by
-// bench/tests/test_policy.py).
-const TICKET_MODEL_LADDER_DEFAULT = ["haiku", "sonnet", "opus"];
-function parseTicketModelLadder(value) {
-  const raw = String(value || "").trim().toLowerCase();
-  if (!raw || ["off", "none", "false", "0", "no"].includes(raw)) return [];
-  if (["on", "default", "true", "1", "yes"].includes(raw)) return TICKET_MODEL_LADDER_DEFAULT;
-  const parts = raw.split(",").map((s) => s.trim()).filter(Boolean);
-  const list = parts.filter((s) => /^[a-z0-9.-]{1,40}$/.test(s));
-  if (list.length !== parts.length) {
-    console.warn(`TICKET_MODEL_LADDER: dropped ${parts.length - list.length} entr(ies) that are not a plain model alias`);
-  }
-  const odd = list.filter((s) => !["opus", "sonnet", "haiku", "fable"].includes(s));
-  if (odd.length) {
-    console.warn(`TICKET_MODEL_LADDER: ${odd.join(", ")} is not a static alias; a host that has not probed it refuses the spawn`);
-  }
-  if (!list.length) {
-    console.warn(`TICKET_MODEL_LADDER=${JSON.stringify(raw)} names no usable alias; the ladder stays off`);
-    return [];
-  }
-  return list;
-}
-let TICKET_MODEL_LADDER = parseTicketModelLadder(process.env.TICKET_MODEL_LADDER);
-
-// Every session of this ticket the fleet still knows about, on hosts DECIDED into
-// its org (decidedOrgOf: bound and not actively drifting). That is the served
-// `org` the board's Model row filters on (XERK-1830), so the row and the spawn
-// agree; a drifting host's history only costs a cheaper retry for a beat.
-function ticketSessionRecords(siteKey, issueKey) {
-  const out = [];
-  for (const a of Object.values(agents)) {
-    if (decidedOrgOf(a) !== siteKey) continue;
-    const mine = (s) => s && s.ticket && s.ticket.key === issueKey && s.ticket.siteKey === siteKey;
-    for (const s of a.sessions || []) if (mine(s)) out.push({ rec: s, live: true });
-    for (const c of a.closedSessions || []) if (mine(c)) out.push({ rec: c, live: false });
-  }
-  return out;
-}
-
-// The tier an UNPINNED claude ticket spawn should run on: {model, escalatedFrom?}
-// or null when the ladder is off. Pure over the fleet payload, so it is read at
-// DISPATCH (Start button and queue drain alike) like the model pin.
-function ticketLadderPick(siteKey, issueKey, ladder = TICKET_MODEL_LADDER) {
-  if (!ladder.length) return null;
-  let failed = -1;
-  for (const { rec, live } of ticketSessionRecords(siteKey, issueKey)) {
-    if (live && rec.status !== "stopped") continue;
-    if (rec.paused) continue;
-    const delivered = (Array.isArray(rec.prs) && rec.prs.length > 0)
-      || (Array.isArray(rec.prUrls) && rec.prUrls.length > 0)
-      || !!(rec.ticket && rec.ticket.outcome);
-    if (delivered) continue;
-    const tier = ladder.indexOf(typeof rec.model === "string" ? rec.model : "");
-    if (tier > failed) failed = tier;
-  }
-  const next = Math.min(failed + 1, ladder.length - 1);
-  return failed >= 0 ? { model: ladder[next], escalatedFrom: ladder[failed] } : { model: ladder[next] };
-}
-
-// The model fields a spawnTicket command carries: the operator's pin as-is, else
-// the ladder's pick for a claude session, else nothing (the login's default).
-function ticketSpawnModelFields(siteKey, issueKey, rpin, host) {
+// ---- the model a ticket spawn carries (XERK-123, XERK-1848) ------------------
+// The operator's model pin always wins. Unpinned, a claude session of a work
+// class the routing policy promoted (MODEL_POLICY=on, `modelPolicyPick`) starts
+// on that model; anything else carries no model (the login's default). A
+// dsh/qwen runtime pin gets nothing, and neither does an unpinned ticket routed
+// to a host whose DEFAULT runtime is not claude (TURMA_DEFAULT_RUNTIME,
+// XERK-521) — a qwen host would send the alias to its OpenAI endpoint. Read at
+// DISPATCH by both spawn sites (Start route + queue drain), like the pin.
+function ticketSpawnModelFields(siteKey, issueKey, rpin, host, rows) {
   const mpin = ticketModelPin(siteKey, issueKey);
   if (mpin) return { model: mpin.model };
   if (rpin && rpin.runtime && rpin.runtime !== "claude") return {};
   const a = host ? agents[host] : null;
   if (!rpin && a && (a.defaultRuntime || "claude") !== "claude") return {};
-  return ticketLadderPick(siteKey, issueKey) || {};
+  const model = modelPolicyPick(siteKey, issueKey, rows);
+  return model ? { model } : {};
 }
 
 // ---- ticket -> runtime pins (XERK-473) -------------------------------------
@@ -4758,7 +4681,7 @@ function outcomeLedgerSweep(now = Date.now()) {
 // never publish (the agent's guard denies push/PR/tracker writes on its session
 // flag); an Opus grader then scores it and the agent reports the grade, which
 // the ledger records as a row PAIRED with the live one (docs/model-quality-adr.md).
-const MODEL_POLICY = (() => {
+let MODEL_POLICY = (() => {
   const v = String(process.env.MODEL_POLICY || "observe").trim().toLowerCase();
   if (["off", "observe", "on"].includes(v)) return v;
   console.error(`MODEL_POLICY=${JSON.stringify(process.env.MODEL_POLICY)} is not off|observe|on; using observe`);
@@ -4859,11 +4782,151 @@ function modelShadowSweep(now = Date.now(),
   }
 }
 
+// ---- routing policy (XERK-1848) ----------------------------------------------
+// MODEL_POLICY=on starts an UNPINNED claude ticket of a promoted work class on the
+// promoted model; observe records promotions but routes nothing; off does neither
+// (docs/model-quality-adr.md "Routing policy").
+//   - Promotion of (class, M), fleet-wide: at least MODEL_PROMOTE_MIN_PAIRS graded
+//     shadow pairs, M-only failures <= 5% with a 95% Wilson upper bound <= 10%.
+//   - Tripwire (on only): a promoted (class, M) whose live bad rate since its
+//     promotion has a Wilson LOWER bound above the Opus baseline for the class is
+//     demoted back to Opus and the operator notified.
+//   - A demotion is sticky: only shadow pairs graded AFTER it can promote again
+//     (the pair counts at demotion are kept and subtracted).
+// State is hub-owned and durable: "<class>/<model>" -> {state, at, graded,
+// mOnlyFail} (+ the tripwire's {bad, n, baseline} on a demotion).
+const MODEL_PROMOTE_MIN_PAIRS = positiveEnv("MODEL_PROMOTE_MIN_PAIRS", 40);
+const MODEL_POLICY_STATES = new Set(["promoted", "demoted"]);
+// Cheapest first: a class with two promoted models routes to the cheaper one.
+const MODEL_COST_ORDER = ["haiku", "sonnet"];
+const modelPolicyCoerce = (raw) => {
+  const out = Object.create(null);
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+  const count = (v) => (Number.isSafeInteger(v) && v >= 0 ? v : 0);
+  for (const [k, v] of Object.entries(raw)) {
+    if (!/^[a-z0-9-]{1,40}\/[a-z0-9._-]{1,40}$/.test(k) || k.endsWith("/opus")) continue;
+    if (!v || typeof v !== "object" || !MODEL_POLICY_STATES.has(v.state)) continue;
+    if (!(Number.isSafeInteger(v.at) && v.at > 0)) continue;
+    const e = { state: v.state, at: v.at, graded: count(v.graded), mOnlyFail: count(v.mOnlyFail) };
+    if (v.state === "demoted") {
+      e.bad = count(v.bad);
+      e.n = count(v.n);
+      e.baseline = typeof v.baseline === "number" && v.baseline >= 0 && v.baseline <= 1 ? v.baseline : 0;
+    }
+    out[k] = e;
+  }
+  return out;
+};
+let modelPolicyState = modelPolicyCoerce(readJsonFile(MODEL_POLICY_FILE));
+const persistModelPolicy = registerExternalStore({
+  name: "modelPolicy", file: MODEL_POLICY_FILE,
+  coerce: modelPolicyCoerce, read: () => modelPolicyState,
+  install: (v) => { modelPolicyState = v; invalidateAgentsCache(); },
+});
+
+// Each promoted class's model (the cheapest when several are promoted).
+function modelPolicyPromoted() {
+  const out = Object.create(null);
+  const rank = (m) => {
+    const i = MODEL_COST_ORDER.indexOf(m);
+    return i < 0 ? MODEL_COST_ORDER.length : i;
+  };
+  for (const [k, e] of Object.entries(modelPolicyState)) {
+    if (e.state !== "promoted") continue;
+    const [cls, model] = k.split("/");
+    const cur = out[cls];
+    if (!cur || rank(model) < rank(cur) || (rank(model) === rank(cur) && model < cur)) out[cls] = model;
+  }
+  return out;
+}
+
+function modelPolicyPayload() {
+  return { mode: MODEL_POLICY, promoted: { ...modelPolicyPromoted() } };
+}
+
+// The model an unpinned ticket's spawn carries under the policy, or null.
+function modelPolicyPick(siteKey, issueKey, rows) {
+  if (MODEL_POLICY !== "on") return null;
+  const r = (rows || fleetTicketRows()).get(ticketQueueKey(siteKey, issueKey));
+  const cls = outcomeLedger.workClass(r && r.row ? r.row.type : "");
+  return modelPolicyPromoted()[cls] || null;
+}
+
+function modelPolicySweep(now = Date.now()) {
+  if (MODEL_POLICY === "off") return;
+  try {
+    const pairs = outcomeLedger.aggregate({ now }).pairs;
+    let changed = false;
+    for (const p of pairs) {
+      if (p.model === "opus") continue;
+      const key = `${p.cls}/${p.model}`;
+      if (!/^[a-z0-9-]{1,40}\/[a-z0-9._-]{1,40}$/.test(key)) continue;
+      const cur = modelPolicyState[key];
+      if (cur && cur.state === "promoted") continue;
+      // After a demotion only the evidence graded since counts.
+      const graded = p.graded - (cur ? cur.graded : 0);
+      const mOnly = Math.max(0, p.mOnlyFail - (cur ? cur.mOnlyFail : 0));
+      if (!outcomeLedger.promotionPasses(graded, mOnly, { minPairs: MODEL_PROMOTE_MIN_PAIRS })) continue;
+      modelPolicyState[key] = { state: "promoted", at: now, graded: p.graded, mOnlyFail: p.mOnlyFail };
+      changed = true;
+      console.log(`model policy: promoted ${p.model} for ${p.cls} work`
+        + ` (${mOnly}/${graded} ${p.model}-only failures)${MODEL_POLICY === "on" ? "" : " [observe]"}`);
+    }
+    // The tripwire acts only on live work the policy routed, so only when on.
+    if (MODEL_POLICY === "on") {
+      for (const [key, e] of Object.entries(modelPolicyState)) {
+        if (e.state !== "promoted") continue;
+        const [cls, model] = key.split("/");
+        const live = outcomeLedger.liveRate(cls, model, { since: e.at, now });
+        if (!live.n) continue;
+        const base = outcomeLedger.liveRate(cls, "opus", { now });
+        const baseline = base.n ? base.bad / base.n : 0;
+        if (outcomeLedger.wilson(live.bad, live.n).lower <= baseline) continue;
+        const p = pairs.find((x) => x.cls === cls && x.model === model);
+        modelPolicyState[key] = { state: "demoted", at: now,
+          graded: p ? p.graded : e.graded, mOnlyFail: p ? p.mOnlyFail : e.mOnlyFail,
+          bad: live.bad, n: live.n, baseline };
+        changed = true;
+        const pct = (x) => `${Math.round(x * 100)}%`;
+        console.log(`model policy: demoted ${model} for ${cls} work (${live.bad}/${live.n} bad`
+          + ` vs Opus ${pct(baseline)})`);
+        notify(`${cls} work moved back to Opus`,
+          `${model} had ${live.bad} bad of ${live.n} since its promotion, worse than Opus's`
+          + ` ${pct(baseline)} for ${cls} work. It stays on Opus until new shadow runs earn it back.`,
+          { tags: "warning", notifKey: `model-demoted:${key}` });
+      }
+    }
+    if (changed) {
+      persistModelPolicy();
+      invalidateAgentsCache();
+      sseBroadcast("modelPolicy", modelPolicyPayload());
+    }
+  } catch (e) {
+    console.error(`model policy sweep failed: ${(e && e.message) || e}`);
+  }
+}
+
+// The Usage card's status cell per (class, model) group (XERK-1849 reads it).
+function modelPolicyStatus(g) {
+  if (g.model === "opus") return null;
+  const e = modelPolicyState[`${g.cls}/${g.model}`];
+  if (!e) return null;
+  if (e.state === "demoted") return "demoted";
+  const routed = MODEL_POLICY === "on" && modelPolicyPromoted()[g.cls] === g.model;
+  return routed ? "promoted" : MODEL_POLICY === "on" ? "promoted (unused)" : "promoted (observe)";
+}
+
 function modelQualityView(params, now = Date.now()) {
   const org = String(params.get("org") || "").trim();
-  return outcomeLedger.aggregate({
+  const view = outcomeLedger.aggregate({
     site: org || null, withRows: !!org && params.get("rows") === "1", now,
   });
+  for (const g of view.groups) {
+    const status = modelPolicyStatus(g);
+    if (status) g.promotion = status;
+  }
+  view.policy = MODEL_POLICY;
+  return view;
 }
 
 function metricsText(now = Date.now()) {
@@ -5629,10 +5692,9 @@ function buildAgentsCache() {
   // own SSE events for open boards).
   const body = JSON.stringify({
     now, agents: list, ticketAgents, ticketModels,
-    // The model ladder unpinned claude ticket sessions climb (XERK-1827), [] when
-    // TICKET_MODEL_LADDER=off. Env-fixed for the hub's life, so no SSE frame; the
-    // board derives each ticket's next tier from it + the live fleet (XERK-1830).
-    ticketModelLadder: TICKET_MODEL_LADDER,
+    // The routing policy (XERK-1848): its mode and each promoted work class's
+    // model, so the board's Model row names what an unpinned Start will send.
+    modelPolicy: modelPolicyPayload(),
     ticketRuntimes, ticketPlatforms, autoStartOrgs, autoMergeOrgs, priorityWriteBackOrgs, dedupeLinkOrgs, orgColors,
     // Per-org triage policy (XERK-486 [F]) and the per-ticket triage verdicts
     // (approve/hold/reject): hub-owned like the pins above, and the board's one
@@ -10094,8 +10156,8 @@ function normalizeClosedSessions(a) {
     }
     if ("ticket" in c && !objectish(c.ticket)) delete c.ticket;
     if (objectish(c.ticket)) coerceTicketOutcome(c.ticket);
-    // The alias the session was spawned on (XERK-1827, the ticket model ladder
-    // reads it). Untyped on Android; a non-alias value drops to absent.
+    // The alias the session was spawned on (XERK-1827). Untyped on Android; a
+    // non-alias value drops to absent.
     if ("model" in c && !(typeof c.model === "string" && /^[a-z0-9.-]{1,40}$/.test(c.model))) {
       delete c.model;
     }
@@ -14057,7 +14119,7 @@ function drainTicketQueue() {
     // before taking it (XERK-303).
     const dispatchedCmdId = queueCommand(host, { type: "spawnTicket", issueKey: e.issueKey,
       ticketSource: e.source, ticketSite: e.siteKey,
-      ...ticketSpawnModelFields(e.siteKey, e.issueKey, rpin, host),
+      ...ticketSpawnModelFields(e.siteKey, e.issueKey, rpin, host, rows),
       ...(rpin ? { agentType: rpin.runtime } : {}) });
     rememberDispatch(e.siteKey, e.issueKey, dispatchedCmdId);
     const wait = Math.round((now - e.at) / 1000);
@@ -16525,6 +16587,8 @@ function masterOrchestrationTick() {
   outcomeLedgerSweep();
   // Sample merged tickets into shadow runs on cheaper models (XERK-1847).
   modelShadowSweep();
+  // Promote / demote (class, model) pairs on that evidence (XERK-1848).
+  modelPolicySweep();
   // Resume paused sleepers whose wake has come (XERK-1575). The drain does it
   // too, but only runs with something queued.
   wakePausedSleepers();
@@ -21340,7 +21404,7 @@ const server = http.createServer(async (req, res) => {
       // this is a genuine fresh start — queue one.
       // The operator's model pin (XERK-123) rides the command the hub already
       // routes — the agent has no per-ticket ledger of its own to read it from.
-      // Unpinned, the ticket model ladder (XERK-1827) picks the tier instead.
+      // Unpinned, a work class the routing policy promoted (XERK-1848) picks it.
       // The runtime pin (XERK-473) rides as `agentType`; findTicketHost above
       // already ensured `host` offers it. Omitted (claude) when unpinned.
       const rpin = ticketRuntimePin(siteKey, issueKey);
@@ -22521,6 +22585,10 @@ if (process.env.TURMA_TEST) {
     permissionLedger,
     // The outcome ledger, its sweep and served view (XERK-1839).
     outcomeLedger, outcomeLedgerSweep, modelQualityView, modelShadowSweep, shadowSampled,
+    modelPolicySweep, modelPolicyPick, modelPolicyPayload,
+    __modelPolicyState: () => modelPolicyState,
+    __setModelPolicy: (mode) => { MODEL_POLICY = mode; invalidateAgentsCache(); },
+    __setModelPolicyState: (v) => { modelPolicyState = modelPolicyCoerce(v); invalidateAgentsCache(); },
     normalizeShadowRuns, normalizeModelShadow,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
@@ -22988,11 +23056,7 @@ if (process.env.TURMA_TEST) {
     ticketAgents,
     ticketModels,
     ticketModelPin,
-    ticketLadderPick,
     ticketSpawnModelFields,
-    TICKET_MODEL_LADDER_DEFAULT,
-    parseTicketModelLadder,
-    __setTicketModelLadder: (list) => { TICKET_MODEL_LADDER = list; invalidateAgentsCache(); },
     setTicketModel,
     orgModelAliases,
     ticketRuntimes,

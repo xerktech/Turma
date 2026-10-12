@@ -33,10 +33,9 @@ data class AgentsResponse(
     // a ticket's session runs, when the operator overrode the login's default.
     // Hub-owned and durable like ticketAgents; absent on older hubs.
     val ticketModels: Map<String, TicketModelPin> = emptyMap(),
-    // The model ladder unpinned claude ticket sessions climb (XERK-1827/1830),
-    // e.g. ["haiku","sonnet","opus"]; empty when TICKET_MODEL_LADDER=off and on
-    // an older hub — both mean "the login's default", the old Default row.
-    val ticketModelLadder: List<String> = emptyList(),
+    // The routing policy (XERK-1848): its mode and each promoted work class's
+    // model. Absent on an older hub, which reads as "routes nothing".
+    val modelPolicy: ModelPolicy = ModelPolicy(),
     // Ticket -> pinned RUNTIME (XERK-473 / [I]), keyed "<siteKey>/<issueKey>":
     // which runtime ("claude"|"dsh") a ticket's session spawns on, delivered on
     // the spawnTicket command as `agentType`. Only a non-default ("dsh") pin is
@@ -272,6 +271,13 @@ data class TicketAgentPin(val host: String = "", val at: Long = 0)
 /** One ticket->model pin (the web board's Model row; hub ticket-models store). */
 @Serializable
 data class TicketModelPin(val model: String = "", val at: Long = 0)
+
+/**
+ * The hub's routing policy (XERK-1848): `mode` off|observe|on, and per work class
+ * the model a promoted class's unpinned tickets start on (routed only when "on").
+ */
+@Serializable
+data class ModelPolicy(val mode: String = "", val promoted: Map<String, String> = emptyMap())
 
 /** One ticket->runtime pin (the web board's Runtime row; hub ticket-runtimes store). */
 @Serializable
@@ -637,9 +643,8 @@ data class ClosedSessionInfo(
     // over the branch), and must not change just because the session was killed.
     val summaryManual: Boolean = false,
     val label: String = "",
-    // The alias it was spawned on (XERK-1827): the board's Model row reads a
-    // failed ticket session's ladder tier off it (XERK-1830). The hub keeps it
-    // only as a plain alias (normalizeClosedSessions), else drops it.
+    // The alias it was spawned on (XERK-1827). The hub keeps it only as a plain
+    // alias (normalizeClosedSessions), else drops it.
     val model: String = "",
     // Which runtime this session ran on (XERK-460 / [M] XERK-477), so an ended
     // dsh card shows its runtime the same way a live one does. "claude" (the
