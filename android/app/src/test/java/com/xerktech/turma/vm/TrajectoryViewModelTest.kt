@@ -72,6 +72,35 @@ class TrajectoryViewModelTest {
     }
 
     @Test
+    fun `a 404 while archive ingest is closed says so instead of not-synced-yet`() {
+        // XERK-1584 #13: closed ingest never syncs, so "retry in a moment" is untrue.
+        val since = System.currentTimeMillis() - 3 * 86_400_000L
+        hub.json(
+            "/api/dsh/$tid/trajectory",
+            """{"error":"no dsh trajectory for this session","ingestClosed":{"since":$since}}""",
+            code = 404,
+        )
+        val vm = TrajectoryViewModel(hub.app)
+        vm.load(tid)
+        val err = hub.awaitFlow(vm.state) { it.error != null }.error!!
+        assertTrue(err, err.contains("has not been accepting archive pushes"))
+        assertTrue(!vm.state.value.notSynced)
+    }
+
+    @Test
+    fun `a 404 for a refused push names the refusal`() {
+        hub.json(
+            "/api/dsh/$tid/trajectory",
+            """{"error":"no dsh trajectory for this session","refused":{"host":"nas","at":1,"error":"too big"}}""",
+            code = 404,
+        )
+        val vm = TrajectoryViewModel(hub.app)
+        vm.load(tid)
+        val err = hub.awaitFlow(vm.state) { it.error != null }.error!!
+        assertTrue(err, err.contains("nas\u2019s last push") && err.contains("too big"))
+    }
+
+    @Test
     fun `a non-404 status is an error`() {
         hub.json("/api/dsh/$tid/trajectory", """{"error":"boom"}""", code = 500)
         val vm = TrajectoryViewModel(hub.app)

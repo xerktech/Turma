@@ -3679,6 +3679,33 @@ test("XERK-717: chatToTrajectory reveals the pane and loads from the unified /ap
     "loadTrajectory fetches the runtime-dispatched archive endpoint, not /api/dsh");
 });
 
+// XERK-1584 #13: a trajectory 404 only promises "a few beats" for the plain
+// not-here-yet case; closed ingest or a refused push is said instead.
+test("trajectory pane: closed ingest and a refused push are not worded as 'syncs within a few beats'", async () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "T", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tid1" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  page.selectSession("s1");
+  const open = async (body) => {
+    page.setGet((url) => url.includes("/trajectory")
+      ? { ok: false, status: 404, json: async () => body } : null);
+    page.chatToTrajectory();
+    page.trajectoryRefresh && page.trajectoryRefresh();
+    for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+    return page.els.trajScroll.innerHTML;
+  };
+  const since = Date.now() - 3 * 86400e3;
+  let html = await open({ error: "no trajectory for this session", ingestClosed: { since } });
+  assert.match(html, /has not been accepting archive pushes since/);
+  assert.doesNotMatch(html, /within a few beats/);
+  page.els.trajScroll.dataset.loaded = "";
+  html = await open({ error: "no trajectory for this session", refused: { host: "nas", error: "too big" } });
+  assert.match(html, /nas&rsquo;s last push/);
+  page.els.trajScroll.dataset.loaded = "";
+  html = await open({ error: "no trajectory for this session" });
+  assert.match(html, /within a few beats/);
+});
+
 // --- Trajectory on the read-only stage (XERK-718) ----------------------------
 // The ended/killed-session and archived-transcript views are archive-served, so
 // their Trajectory works for an offline host too. The toggle rides the SAME

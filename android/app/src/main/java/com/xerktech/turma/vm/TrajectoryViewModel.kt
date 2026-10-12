@@ -5,10 +5,12 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.model.DshTrajectory
+import com.xerktech.turma.net.archiveMissingMessage
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import retrofit2.HttpException
 
 /**
  * The dsh session Trajectory (XERK-498) — the read-only view that replaces the
@@ -65,7 +67,11 @@ class TrajectoryViewModel(app: Application) : AndroidViewModel(app) {
             _state.update {
                 when {
                     resp == null -> it.copy(loading = false, error = "Couldn't reach the hub for the trajectory.")
-                    resp.code() == 404 -> it.copy(loading = false, notSynced = true, data = null, error = null)
+                    // A refused push or closed archive ingest never syncs, so it is
+                    // said (as an error) instead of the retry-soon promise (XERK-1584 #13).
+                    resp.code() == 404 -> archiveMissingMessage(HttpException(resp))
+                        ?.let { why -> it.copy(loading = false, notSynced = false, data = null, error = "No trajectory \u2014 $why") }
+                        ?: it.copy(loading = false, notSynced = true, data = null, error = null)
                     resp.isSuccessful && resp.body() != null ->
                         it.copy(loading = false, data = resp.body(), notSynced = false, error = null)
                     else -> it.copy(loading = false, error = "Couldn't load the trajectory (HTTP ${resp.code()}).")

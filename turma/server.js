@@ -4312,6 +4312,18 @@ function noteArchiveRefusal(transcriptId, host, error) {
 // reader knows only the id — an archived session that never landed has no row to
 // say whose it was — so a migrated transcript legitimately has one per host, and
 // the last failure is the one that explains why it is missing now.
+// Adds `ingestClosed: {since}` to an archive-miss 404 body while the HA index
+// hydrate holds ingest shut (XERK-1283): every push 503s then, so the clients'
+// "syncs within a few minutes" would be untrue. Shared by the transcript and
+// both trajectory 404s (XERK-1584 #13). One clock read: `hydratingForMs()`
+// reading its own `Date.now()` could put `since` before the gate closed.
+function withIngestClosed(body) {
+  if (archive.isHydrating()) {
+    const now = Date.now();
+    body.ingestClosed = { since: now - archive.hydratingForMs(now) };
+  }
+  return body;
+}
 function archiveRefusalFor(transcriptId) {
   let found = null;
   for (const r of archiveRefusals.values()) {
@@ -20059,13 +20071,7 @@ const server = http.createServer(async (req, res) => {
         const body = r
           ? { error: "unknown transcript", refused: { host: r.host, at: r.at, error: r.error } }
           : { error: "unknown transcript" };
-        // One clock read: `hydratingForMs()` reading its own `Date.now()` could land a
-        // millisecond later and put `since` before the gate actually closed.
-        if (archive.isHydrating()) {
-          const now = Date.now();
-          body.ingestClosed = { since: now - archive.hydratingForMs(now) };
-        }
-        return json(res, 404, body);
+        return json(res, 404, withIngestClosed(body));
       }
       return json(res, 200, t);
     }
@@ -20260,7 +20266,7 @@ const server = http.createServer(async (req, res) => {
         parts[3] === "trajectory" && parts.length === 4) {
       const transcriptId = decodeURIComponent(parts[2]);
       const traj = archive.dshTrajectory(transcriptId);
-      if (!traj) return json(res, 404, { error: "no dsh trajectory for this session" });
+      if (!traj) return json(res, 404, withIngestClosed({ error: "no dsh trajectory for this session" }));
       return json(res, 200, traj);
     }
 
@@ -20316,9 +20322,9 @@ const server = http.createServer(async (req, res) => {
         transcriptId, liveRuntimeForTranscript(transcriptId));
       if (degraded) return json(res, 200, degraded);
       const r = archiveRefusalFor(transcriptId);
-      return json(res, 404, r
+      return json(res, 404, withIngestClosed(r
         ? { error: "no trajectory for this session", refused: { host: r.host, at: r.at, error: r.error } }
-        : { error: "no trajectory for this session" });
+        : { error: "no trajectory for this session" }));
     }
 
     // POST /api/agents/<host>/clone — queue a clone into the host's repos

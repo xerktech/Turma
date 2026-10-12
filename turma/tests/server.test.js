@@ -3588,6 +3588,29 @@ test("XERK-1283: ingestClosed.since is exactly when the gate closed, however the
   }
 });
 
+test("XERK-1584 #13: both trajectory 404s say when archive ingest closed, and only while it is", async () => {
+  // The trajectory panes promised "syncs within a few beats" on every 404, which
+  // is untrue while the hydrate holds ingest shut, exactly as for the transcript.
+  const archive = require("../archive.js");
+  const paths = ["/api/archive/never-arrives/trajectory", "/api/dsh/never-arrives/trajectory"];
+  try {
+    archive.setHydrating(true);
+    for (const p of paths) {
+      const r = await request("GET", p, { headers: userHeaders });
+      assert.equal(r.status, 404, p);
+      assert.ok(typeof r.body.error === "string" && r.body.error, p);
+      assert.ok(r.body.ingestClosed && r.body.ingestClosed.since > 0, p);
+    }
+  } finally {
+    archive.setHydrating(false);
+  }
+  for (const p of paths) {
+    const r = await request("GET", p, { headers: userHeaders });
+    assert.equal(r.status, 404, p);
+    assert.equal(r.body.ingestClosed, undefined, p);
+  }
+});
+
 // ---- the archive's raw layer (XERK-338) -------------------------------------
 //
 // Beside the rendered entries above, agents push a byte-for-byte copy of the
