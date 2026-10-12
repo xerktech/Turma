@@ -64,6 +64,10 @@ composed.**
     dialog next). Beat cost on the compaction resend: the draw deadline + the submit deadline
     (each can overshoot by one 5s capture), plus up to `PANE_TYPE_LOCK_WAIT_SEC` waiting out a writer.
     Tests: `TestSubmitTyped`.
+  - **Except a composer that HELD the text before Enter and now shows none of it** (`held`,
+    XERK-1853): that is a send. On a short pane (40x12) the turn wraps or scrolls off, so the
+    count never rises and every send waited out the deadline holding the pane lock. A fragment of
+    the text in the box is a redraw, not a send. Tests: `test_a_message_that_left_the_composer_*`.
   - Windows `_pty_inject` applies the same rule (XERK-1727, `windows-agent.md`). Tests:
     `TestSendInput`, the `_pty_inject` cases in `TestWindowsTerminalBackend`.
 - **Nothing truncates silently**: the fallback CHUNKS its send-keys; the agent REFUSES past

@@ -8475,6 +8475,30 @@ class TestSubmitTyped(ManagerMixin, unittest.TestCase):
                             before=COMPOSER_SENT)
         self.assertEqual(len(enters), 2)
 
+    def test_a_message_that_left_the_composer_reads_sent_on_a_short_pane(self):
+        # XERK-1853: at 40x12 the submitted turn wraps or scrolls off, so its
+        # count above the box never rises. The composer that held the text
+        # before Enter and now shows none of it is the proof.
+        short_sent = ("● working on it\n" + "─" * 40 + "\n❯ \n" + "─" * 40 + "\n")
+        self.assertIsNone(ha._composer_state(short_sent, _STUCK_MSG, 0))
+        self.assertEqual(ha._composer_state(short_sent, _STUCK_MSG, 0, held=True), "sent")
+        placeholder = short_sent.replace("❯ \n", "❯ Try \"refactor <filepath>\"\n")
+        self.assertEqual(ha._composer_state(placeholder, _STUCK_MSG, 0, held=True), "sent")
+        # A fragment of the text is a redraw, not a send.
+        partial = short_sent.replace("❯ \n", "❯ Reply with just the word\n")
+        self.assertIsNone(ha._composer_state(partial, _STUCK_MSG, 0, held=True))
+        with mock.patch.object(ha, "TYPED_SUBMIT_DEADLINE_SEC", 5), \
+                mock.patch.object(ha, "TYPED_SUBMIT_SETTLE_SEC", 0):
+            start = time.monotonic()
+            self.assertEqual(len(self._send([short_sent], before=COMPOSER_STUCK)), 1)
+            self.assertLess(time.monotonic() - start, 1)
+
+    def test_an_empty_composer_is_not_sent_when_it_never_showed_the_text(self):
+        # Never drawn before Enter (a loaded TUI): still watched, Enter again.
+        empty = "─" * 40 + "\n❯ \n" + "─" * 40 + "\n"
+        enters = self._send([empty, COMPOSER_STUCK, COMPOSER_SENT], before=empty)
+        self.assertEqual(len(enters), 2)
+
     def test_a_pane_that_never_resolves_stops_at_the_deadline(self):
         with mock.patch.object(ha, "TYPED_SUBMIT_DEADLINE_SEC", 0.05):
             self.assertEqual(len(self._send([LINUX_COMPOSER_PANE])), 1)

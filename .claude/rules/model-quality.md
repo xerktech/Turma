@@ -46,6 +46,11 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   `OUTCOME_LEDGER_HOST_MAX_ROWS` (a quarter), and past `MAX_ROWS` the org holding the most rows
   loses its oldest first — plain oldest-first let one host evict every other org's evidence.
   Evicted keys are DELETEd from Postgres too, so the table is as bounded as the model.
+- **A host reporting more sessions than its cap only fills the rows it has room for** (XERK-1853):
+  past it a new row evicted one the host still reports, re-created next sweep — new `firstSeen`
+  and Postgres upserts + deletes every 15s. Its newest sessions go unrecorded instead.
+  - Room counts only rows the host STILL reports: counting its stale rows recorded none of its
+    current work. Tests: the `XERK-1853:` cases in `outcome-ledger.test.js`.
 - **Under HA a sweep folds nothing until a rescan loaded the table** (`backend.loaded`): a
   promoted leader's stale snapshot would otherwise win the newer-wins upsert.
 - **`/metrics` carries per (class, model, outcome) gauges only** — no host, ticket or session.
