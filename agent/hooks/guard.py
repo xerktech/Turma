@@ -8301,7 +8301,7 @@ def _bare_cds(text: str) -> str:
     """``text`` with ` $HOME` after each `cd` that may have no operand. Each
     `cd` is walked at most `_BARE_CD_MAX_REDIRECTS` options, redirections or
     continuations on, so it stays linear; it has an operand only where a plain
-    word follows them (an option after a redirection, a comment or a `\`-newline
+    word follows them (an option after a redirection, a comment or a `\\`-newline
     each hid one: `cd 2>/dev/null --`, `cd # x`)."""
     pieces, last = [], 0
     for m in _BARE_CD_HEAD_RE.finditer(text):
