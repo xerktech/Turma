@@ -44886,6 +44886,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
                  ({".claude/agents/m.md": "---\nmcpServers: {}\n---\nx"}, "hooks or MCP"),
                  ({".claude/agents/e.md": '---\n"\\x68ooks": {}\n---\nx'}, "hooks or MCP"),
                  ({".claude/skills/s/SKILL.md": "---\nhooks: {}\n---\nx"}, "hooks or MCP"),
+                 ({".claude/commands/c.md": "---\nhooks: {}\n---\nx"}, "hooks or MCP"),
                  ({".CLAUDE/Settings.json": '{"hooks": {}}'}, "hooks"),
                  ({".claude/AGENTS/sub/a.md": "---\nname: a\n---\n"}, "top-level"),
                  ({".claude/settings.json": '{"permissions": {"additionalDirectories": ["/"]}}'},

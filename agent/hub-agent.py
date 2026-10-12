@@ -5955,9 +5955,10 @@ def shadow_tree_reason(repo, base):
                     or re.match(r"\s*(Edit|Write|MultiEdit|NotebookEdit|WebFetch)\b", r)
                     for r in allow):
                 return f"{path} allows file writes or fetches a shadow cannot take"
-        elif sub and sub[0] in ("agents", "skills"):
-            # A skill's frontmatter hooks run outside the sandbox too (an agent's
-            # `skills:` preloads one even with no Skill tool).
+        elif sub and sub[0] in ("agents", "skills", "commands"):
+            # Skills and commands carry frontmatter hooks that run outside the
+            # sandbox. A shadow has no Skill tool and a preload registers no
+            # hooks, so this is defence in depth, not a known route.
             if sub[0] == "agents" and (len(sub) != 2 or not sub[1].endswith(".md")):
                 return f"{path}: only top-level .md agents are allowed"
             if not sub[-1].endswith(".md"):
