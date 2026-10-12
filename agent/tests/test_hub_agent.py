@@ -23364,6 +23364,15 @@ class TestResolveWorkflowRun(unittest.TestCase):
         self.assertEqual(ha._resolve_workflow_run(self.main, "code-review"), run)
         self.assertFalse(os.path.exists("/somewhere/else/entirely/wf_aaa111"))
 
+    def test_a_newer_nameless_run_does_not_claim_a_named_row(self):
+        # An empty name is a prefix of every label; it must not win the row.
+        nameless = self._launch("", "wf_new222")
+        nameless[1]["toolUseResult"]["summary"] = ""
+        self._write_main(self._launch("build", "wf_old111"), nameless)
+        named = self._run_dir("wf_old111")
+        self._run_dir("wf_new222")
+        self.assertEqual(ha._resolve_workflow_run(self.main, "build"), named)
+
     def test_newest_matching_launch_wins(self):
         self._write_main(self._launch("nightly", "wf_old111"),
                          self._launch("nightly", "wf_new222"))
@@ -24072,6 +24081,11 @@ class TestLiveAgentResolveId(unittest.TestCase):
         st = self._state(("we1", "workflow", "nightly", "wf_old"),
                          ("we2", "workflow", "nightly", "wf_new"))
         self.assertEqual(ha._live_agent_resolve_id(st, "workflow", "nightly"), "wf_new")
+
+    def test_a_newer_unlabelled_launch_does_not_claim_a_labelled_row(self):
+        st = self._state(("a1", "explore", "map it", "good"),
+                         ("a2", "general-purpose", "", "evil"))
+        self.assertEqual(ha._live_agent_resolve_id(st, "agent", "map it"), "good")
 
     def test_a_pane_truncated_label_matches_by_prefix(self):
         st = self._state(("a1", "explore", "map the whole repository", "a1"))
