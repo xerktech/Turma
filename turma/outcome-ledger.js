@@ -350,6 +350,7 @@ function observe(observations, now = Date.now()) {
     return [];
   }
   const changed = new Map();
+  const created = new Set();        // keys this sweep made a row for
   const ticketDone = new Map();     // [site, issue] -> {cat, resolvedAt} seen this sweep
   const seen = [];
   const reported = new Map();       // host -> distinct sessions it reports this sweep
@@ -383,6 +384,7 @@ function observe(observations, now = Date.now()) {
     }
     const next = prev ? { ...prev, prs: prev.prs ? prev.prs.map((p) => ({ ...p })) : undefined }
       : { ...base, model: "default" };
+    if (!prev) created.add(base.key);
     if (!next.prs) delete next.prs;
     // The class can be learned late (the board row arrives after the session).
     if (o.type && workClass(o.type) !== "other") next.cls = workClass(o.type);
@@ -450,18 +452,22 @@ function observe(observations, now = Date.now()) {
       commit(r, next, now, changed);
     }
   }
-  return persistChanged(changed, now);
+  const reportedKeys = new Set();
+  for (const keys of reported.values()) for (const k of keys) reportedKeys.add(k);
+  return persistChanged(changed, now, { reported: reportedKeys, created });
 }
 
-// Evict, then hand the backend the rows that changed and survived.
-function persistChanged(changed, now) {
-  if (changed.size) {
-    const dropped = evict(now);
-    const live = [...changed.values()].filter((r) => rows.get(r.key) === r);
-    if (live.length) backend.onChange(live);
-    if (dropped.length && backend.onDelete) backend.onDelete(dropped);
-  }
-  return [...changed.values()];
+// Evict, then hand the backend the rows that changed and survived; returns those.
+// A row created and evicted in the same sweep never reached the backend, so it
+// is neither written nor deleted.
+function persistChanged(changed, now, sweep) {
+  if (!changed.size) return [];
+  const dropped = evict(now, sweep);
+  const live = [...changed.values()].filter((r) => rows.get(r.key) === r);
+  if (live.length) backend.onChange(live);
+  const gone = sweep ? dropped.filter((k) => !sweep.created.has(k)) : dropped;
+  if (gone.length && backend.onDelete) backend.onDelete(gone);
+  return live;
 }
 
 /**
@@ -653,11 +659,22 @@ function commit(prev, next, now, changed) {
 }
 
 // Drop rows past retention, then any host past its share, then — past MAX_ROWS —
-// the oldest row of whichever org holds the most. Returns the keys dropped.
-function evict(now = Date.now()) {
+// a row of whichever org holds the most. Returns the keys dropped.
+// Within a host or org the victim is (XERK-1855) a row no host reports this sweep,
+// then a row this sweep created, then the oldest: dropping a row its host still
+// reports re-creates it next sweep with a new firstSeen and rewrites the backend,
+// while a row created this sweep was never persisted, so dropping it churns nothing.
+// A shadow row is made by observeShadows, never reported here, so it ranks as reported.
+function evict(now = Date.now(), sweep = null) {
   const cutoff = now - RETAIN_DAYS * DAY_MS;
   const dropped = [];
   const drop = (r) => { rows.delete(r.key); dropped.push(r.key); };
+  const keep = (r) => {
+    if (!sweep) return 0;
+    if (r.kind === "shadow") return 2;
+    return !sweep.reported.has(r.key) ? 0 : sweep.created.has(r.key) ? 1 : 2;
+  };
+  const victimFirst = (a, b) => keep(a) - keep(b) || a.updatedAt - b.updatedAt;
   const byHost = new Map();
   for (const r of rows.values()) {
     if (r.updatedAt < cutoff) { drop(r); continue; }
@@ -666,7 +683,7 @@ function evict(now = Date.now()) {
   }
   for (const list of byHost.values()) {
     if (list.length <= HOST_MAX_ROWS) continue;
-    list.sort((a, b) => a.updatedAt - b.updatedAt);
+    list.sort(victimFirst);
     for (const r of list.slice(0, list.length - HOST_MAX_ROWS)) drop(r);
   }
   let over = rows.size - MAX_ROWS;
@@ -676,10 +693,16 @@ function evict(now = Date.now()) {
     if (!bySite.has(r.site)) bySite.set(r.site, []);
     bySite.get(r.site).push(r);
   }
-  for (const list of bySite.values()) list.sort((a, b) => b.updatedAt - a.updatedAt); // oldest last
+  for (const list of bySite.values()) list.sort((a, b) => victimFirst(b, a)); // next victim last
   while (over > 0) {
     let big = null;
-    for (const list of bySite.values()) if (!big || list.length > big.length) big = list;
+    // Tied orgs: the one whose next victim churns least loses, or tied orgs rotate a
+    // reported row between them every sweep.
+    for (const list of bySite.values()) {
+      if (!list.length) continue;
+      if (!big || list.length > big.length
+        || (list.length === big.length && keep(list[list.length - 1]) < keep(big[big.length - 1]))) big = list;
+    }
     drop(big.pop());
     over -= 1;
   }
@@ -1090,7 +1113,11 @@ class OutcomeLedgerPgStore {
     if (this._onExternalChange) { try { this._onExternalChange(); } catch { /* never breaks a scan */ } }
   }
 
+  // Upserts drain before deletes, so a key's later write cancels its queued opposite —
+  // else a row deleted then re-created in one tick stays deleted in the table.
   onChange(list) {
+    const keys = new Set(list.map((r) => r.key));
+    if (this._deletes.length) this._deletes = this._deletes.filter((k) => !keys.has(k));
     for (const r of list) this._queue.push([r.key, String(r.updatedAt), JSON.stringify(r)]);
     const over = this._queue.length - PG_QUEUE_MAX;
     if (over > 0) this._queue.splice(0, over);
@@ -1099,6 +1126,8 @@ class OutcomeLedgerPgStore {
 
   // Rows evicted from the model leave the table too, so it stays as bounded as the model.
   onDelete(keys) {
+    const gone = new Set(keys);
+    if (this._queue.length) this._queue = this._queue.filter((vals) => !gone.has(vals[0]));
     this._deletes.push(...keys);
     if (this._deletes.length > PG_QUEUE_MAX) this._deletes.splice(0, this._deletes.length - PG_QUEUE_MAX);
     this._drain();
@@ -1110,36 +1139,42 @@ class OutcomeLedgerPgStore {
     this._draining = (async () => {
       await null;
       try {
-        while (this._queue.length) {
-          const raw = this._queue.splice(0, PG_ROWS_PER_INSERT);
-          const byKey = new Map();
-          for (const vals of raw) byKey.set(vals[0], vals);
-          const batch = [...byKey.values()];
-          const params = [];
-          const tuples = batch.map((vals) => `(${vals.map((v) => { params.push(v); return `$${params.length}`; }).join(", ")})`);
-          try {
-            await this._ensureSchema();
-            await this.pool.query(
-              `INSERT INTO ${this.table} (key, updated_at, doc) VALUES ${tuples.join(", ")} ` +
-              `ON CONFLICT (key) DO UPDATE SET updated_at = EXCLUDED.updated_at, doc = EXCLUDED.doc ` +
-              `WHERE EXCLUDED.updated_at >= ${this.table}.updated_at`,
-              params);
-          } catch (e) {
-            this._queue.unshift(...batch);
-            console.error(`outcome ledger: Postgres write failed (${(e && e.message) || e}); ${batch.length} row(s) held for retry`);
-            return;
+        // Ops queued while a batch was in flight are drained too, not left for the next call.
+        while (this._queue.length || this._deletes.length) {
+          while (this._queue.length) {
+            const raw = this._queue.splice(0, PG_ROWS_PER_INSERT);
+            const byKey = new Map();
+            for (const vals of raw) byKey.set(vals[0], vals);
+            const batch = [...byKey.values()];
+            const params = [];
+            const tuples = batch.map((vals) => `(${vals.map((v) => { params.push(v); return `$${params.length}`; }).join(", ")})`);
+            try {
+              await this._ensureSchema();
+              await this.pool.query(
+                `INSERT INTO ${this.table} (key, updated_at, doc) VALUES ${tuples.join(", ")} ` +
+                `ON CONFLICT (key) DO UPDATE SET updated_at = EXCLUDED.updated_at, doc = EXCLUDED.doc ` +
+                `WHERE EXCLUDED.updated_at >= ${this.table}.updated_at`,
+                params);
+            } catch (e) {
+              this._queue.unshift(...batch);
+              console.error(`outcome ledger: Postgres write failed (${(e && e.message) || e}); ${batch.length} row(s) held for retry`);
+              return;
+            }
           }
-        }
-        while (this._deletes.length) {
-          const batch = this._deletes.splice(0, PG_ROWS_PER_INSERT);
-          try {
-            await this.pool.query(
-              `DELETE FROM ${this.table} WHERE key IN (${batch.map((_, i) => `$${i + 1}`).join(", ")})`,
-              batch);
-          } catch (e) {
-            this._deletes.unshift(...batch);
-            console.error(`outcome ledger: Postgres delete failed (${(e && e.message) || e}); held for retry`);
-            return;
+          while (this._deletes.length) {
+            const batch = this._deletes.splice(0, PG_ROWS_PER_INSERT);
+            try {
+              await this.pool.query(
+                `DELETE FROM ${this.table} WHERE key IN (${batch.map((_, i) => `$${i + 1}`).join(", ")})`,
+                batch);
+            } catch (e) {
+              // A key re-created since this batch left the queue keeps its upsert: that
+              // drains first on retry, and the stale delete would remove it.
+              const queued = new Set(this._queue.map((vals) => vals[0]));
+              this._deletes.unshift(...batch.filter((k) => !queued.has(k)));
+              console.error(`outcome ledger: Postgres delete failed (${(e && e.message) || e}); held for retry`);
+              return;
+            }
           }
         }
       } finally {

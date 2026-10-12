@@ -280,6 +280,104 @@ test("XERK-1853: a full host still records its current sessions over rows it sto
   assert.equal(L.observe(now, T0 + 3).length, 0);
 });
 
+function recording() {
+  const log = { changed: 0, deleted: 0 };
+  L._internals.setBackend({ onChange: (l) => { log.changed += l.length; },
+    onDelete: (k) => { log.deleted += k.length; }, flush() {}, close() {} });
+  return log;
+}
+
+test("XERK-1855: past MAX_ROWS the fleet-wide cap stops re-creating rows hosts still report", () => {
+  L._internals.reset();
+  const log = recording();
+  const per = Math.floor(L.MAX_ROWS / 4);
+  const sweep = () => Array.from({ length: 5 * per }, (_, i) => obs({ host: `h${i % 5}`, sid: `s${i}` }));
+  assert.equal(L.observe(sweep(), T0).length, L.MAX_ROWS);
+  // The rows past the cap were never persisted, so nothing is deleted for them.
+  assert.equal(log.changed, L.MAX_ROWS);
+  assert.equal(log.deleted, 0);
+  const held = new Map([...L._internals.rows().values()].map((r) => [r.key, r.firstSeen]));
+  assert.equal(L.observe(sweep(), T0 + 15000).length, 0);
+  assert.equal(L.observe(sweep(), T0 + 30000).length, 0);
+  assert.deepEqual(log, { changed: L.MAX_ROWS, deleted: 0 });
+  const rows = [...L._internals.rows().values()];
+  assert.equal(rows.length, L.MAX_ROWS);
+  for (const r of rows) assert.equal(r.firstSeen, held.get(r.key));
+  L._internals.reset();
+});
+
+test("XERK-1855: orgs tied for the most rows lose a row created this sweep, not rotate one", () => {
+  L._internals.reset();
+  const log = recording();
+  const base = Math.floor(L.MAX_ROWS / 3);
+  const org = (o, n) => Array.from({ length: n }, (_, i) => obs({ site: `${o}.atlassian.net`,
+    host: `${o}${i % 2}`, sid: `${o}${i}` }));
+  L.observe([...org("a", base), ...org("b", base), ...org("c", base)], T0);
+  L.observe([...org("a", base + 1), ...org("b", base), ...org("c", base)], T0 + 15000);
+  // Three orgs tied past the cap: dropping a's held row would re-create it next sweep.
+  const all = () => [...org("a", base + 1), ...org("b", base + 1), ...org("c", base + 1)];
+  L.observe(all(), T0 + 30000);
+  assert.equal(log.deleted, 0);
+  const held = new Map([...L._internals.rows().values()].map((r) => [r.key, r.firstSeen]));
+  assert.equal(held.size, L.MAX_ROWS);
+  const before = { ...log };
+  assert.equal(L.observe(all(), T0 + 45000).length, 0);
+  assert.equal(L.observe(all(), T0 + 60000).length, 0);
+  assert.deepEqual(log, before);
+  for (const r of L._internals.rows().values()) assert.equal(r.firstSeen, held.get(r.key));
+  L._internals.reset();
+});
+
+test("XERK-1855: a row deleted then re-created before the Postgres drain stays in the table", async () => {
+  const table = new Map();
+  const pool = {
+    health: "ready",
+    async query(sql, params = []) {
+      if (/^CREATE TABLE/.test(sql)) return [];
+      if (/^INSERT/.test(sql)) {
+        for (let i = 0; i < params.length; i += 3) table.set(params[i], params[i + 2]);
+        return [];
+      }
+      if (/^DELETE/.test(sql)) { for (const k of params) table.delete(k); return []; }
+      throw new Error(sql);
+    },
+  };
+  const store = new L.OutcomeLedgerPgStore(pool);
+  const row = L.sanitizeRow({ site: "a.atlassian.net", issue: "A-1", host: "h", sid: "x",
+    cls: "bug", model: "opus", firstSeen: T0, updatedAt: T0 });
+  store._closed = true;              // queue both before either drains
+  store.onDelete([row.key]);
+  store.onChange([row]);
+  store._closed = false;
+  await store._drain();
+  assert.ok(table.has(row.key));
+  // And the reverse: re-created then deleted ends deleted.
+  store._closed = true;
+  store.onChange([row]);
+  store.onDelete([row.key]);
+  store._closed = false;
+  await store._drain();
+  assert.ok(!table.has(row.key));
+});
+
+test("XERK-1855: a full host drops a row it stopped reporting before one it still reports", () => {
+  L._internals.reset();
+  const per = Math.floor(L.MAX_ROWS / 4);
+  const ids = (from, to) => Array.from({ length: to - from }, (_, i) => `s${from + i}`);
+  L.observe(ids(0, per).map((sid) => obs({ host: "h", sid })), T0);
+  // s0 ends — its row is now the most recently updated — while the rest run on.
+  L.observe(ids(0, per).map((sid) => obs({ host: "h", sid, running: sid !== "s0" })), T0 + 15000);
+  // The host stops reporting s0 and starts two more sessions.
+  const now = ids(1, per + 2).map((sid) => obs({ host: "h", sid }));
+  L.observe(now, T0 + 30000);
+  const rows = new Map([...L._internals.rows().values()].map((r) => [r.sid, r]));
+  assert.equal(rows.size, per);
+  assert.ok(!rows.has("s0"));
+  assert.equal(rows.get("s1").firstSeen, T0);
+  assert.equal(L.observe(now, T0 + 45000).length, 0);
+  assert.equal(rows.get("s1").firstSeen, L._internals.rows().get(rows.get("s1").key).firstSeen);
+});
+
 test("XERK-1839: /metrics label sets stay bounded whatever models the agents report", () => {
   L._internals.reset();
   L.observe(Array.from({ length: 300 }, (_, i) => obs({ sid: `m${i}`, modelActual: `local-model-${i}`,
@@ -623,4 +721,105 @@ test("XERK-1847: shadow fields survive the whitelist round-trip and junk is drop
   assert.equal(sh.shadowState, undefined);
   assert.equal(sh.grade, undefined);
   assert.equal(sh.shadow, undefined, "a shadow row never carries a decision");
+});
+
+test("XERK-1855: a shadow row on a host at its cap is not evicted and re-created each tick", () => {
+  L._internals.reset();
+  const log = recording();
+  mergedLive();
+  const live = only();
+  L.decideShadow(live.key, { sampled: true, at: T0 + 2 * DAY, id: "sh-00112233aabb",
+    model: "haiku", host: "h2" }, T0 + 2 * DAY);
+  const per = Math.floor(L.MAX_ROWS / 4);
+  const busy = () => Array.from({ length: per }, (_, i) => obs({ host: "h2", sid: `b${i}` }));
+  const shadow = [{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb", state: "running" }];
+  let t = T0 + 3 * DAY;
+  L.observe(busy(), t);
+  L.observeShadows(shadow, t);
+  const sh = [...L._internals.rows().values()].find((r) => r.kind === "shadow");
+  assert.ok(sh);
+  const before = { ...log };
+  for (let i = 0; i < 3; i++) {
+    t += 15000;
+    L.observe(busy(), t);
+    L.observeShadows(shadow, t);
+  }
+  assert.deepEqual(log, before);
+  assert.equal(L._internals.rows().get(sh.key).firstSeen, sh.firstSeen);
+  L._internals.reset();
+});
+
+test("XERK-1855: more orgs than MAX_ROWS evict without throwing", () => {
+  L._internals.reset();
+  L.observe(Array.from({ length: L.MAX_ROWS + 3 }, (_, i) => obs({ site: `o${i}.atlassian.net`,
+    host: `h${i % 8}`, sid: `s${i}` })), T0);
+  assert.equal(L._internals.rows().size, L.MAX_ROWS);
+  L._internals.reset();
+});
+
+test("XERK-1855: a failed in-flight DELETE does not undo a re-create queued behind it", async () => {
+  const table = new Map();
+  let release;
+  let deletes = 0;
+  const pool = {
+    health: "ready",
+    async query(sql, params = []) {
+      if (/^CREATE TABLE/.test(sql)) return [];
+      if (/^INSERT/.test(sql)) {
+        for (let i = 0; i < params.length; i += 3) table.set(params[i], params[i + 2]);
+        return [];
+      }
+      if (/^DELETE/.test(sql)) {
+        deletes += 1;
+        if (deletes === 1) { await new Promise((r) => { release = r; }); throw new Error("statement timeout"); }
+        for (const k of params) table.delete(k);
+        return [];
+      }
+      throw new Error(sql);
+    },
+  };
+  const store = new L.OutcomeLedgerPgStore(pool);
+  const row = L.sanitizeRow({ site: "a.atlassian.net", issue: "A-1", host: "h", sid: "x",
+    cls: "bug", model: "opus", firstSeen: T0, updatedAt: T0 });
+  store.onChange([row]);
+  await store._drain();
+  store.onDelete([row.key]);              // in flight, will fail
+  await new Promise((r) => setImmediate(r));
+  store.onChange([row]);                  // re-created while the DELETE is out
+  release();
+  await store._drain().catch(() => {});
+  await store._drain();
+  assert.ok(table.has(row.key));
+  assert.equal(store._deletes.length, 0);
+});
+
+test("XERK-1855: an upsert queued behind an in-flight DELETE drains in the same pass", async () => {
+  const table = new Map();
+  let release = null;
+  const pool = {
+    health: "ready",
+    async query(sql, params = []) {
+      if (/^CREATE TABLE/.test(sql)) return [];
+      if (/^INSERT/.test(sql)) {
+        for (let i = 0; i < params.length; i += 3) table.set(params[i], params[i + 2]);
+        return [];
+      }
+      if (/^DELETE/.test(sql)) {
+        await new Promise((r) => { release = r; });
+        for (const k of params) table.delete(k);
+        return [];
+      }
+      throw new Error(sql);
+    },
+  };
+  const store = new L.OutcomeLedgerPgStore(pool);
+  const row = (sid) => L.sanitizeRow({ site: "a.atlassian.net", issue: "A-1", host: "h", sid,
+    cls: "bug", model: "opus", firstSeen: T0, updatedAt: T0 });
+  store.onDelete([row("gone").key]);
+  const pass = store._drain();
+  await new Promise((r) => setImmediate(r));
+  store.onChange([row("new")]);
+  release();
+  await pass;
+  assert.ok(table.has(row("new").key));
 });

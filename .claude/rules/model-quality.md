@@ -51,6 +51,22 @@ This file is the operative rules for what has shipped; the routing policy is `mo
   and Postgres upserts + deletes every 15s. Its newest sessions go unrecorded instead.
   - Room counts only rows the host STILL reports: counting its stale rows recorded none of its
     current work. Tests: the `XERK-1853:` cases in `outcome-ledger.test.js`.
+- **Eviction never drops a row its host still reports while another will do** (XERK-1855):
+  `evict(now, sweep)` takes the sweep's reported and created keys, and both the host pass and the
+  fleet-wide pass drop unreported rows first, then rows created THIS sweep, then the oldest.
+  - A row created and evicted in one sweep was never persisted: no upsert, no DELETE. Dropping a
+    reported old row instead re-created it every sweep with a new `firstSeen`.
+  - Orgs tied for the most rows: the one whose next victim ranks lowest loses — a first-found
+    tie-break rotated a reported row between tied orgs forever.
+  - A shadow row ranks as reported: `observeShadows` makes it, so `observe` never reports it, and
+    evicting it re-created it every tick.
+  - Load and rescan call `evict()` with no sweep — plain oldest-first.
+- **The Postgres drain runs all upserts before all deletes**, so `onChange`/`onDelete` each cancel
+  the key's queued opposite: a row deleted then re-created in one tick otherwise stayed deleted.
+  - A failed DELETE batch re-queues only keys with no upsert queued since — an in-flight batch
+    can't be cancelled, and re-queued whole it removed the re-created row on retry.
+  - A pass loops until both queues are empty: ops queued during an in-flight batch drain too.
+  - Tests: the `XERK-1855:` cases in `outcome-ledger.test.js`.
 - **Under HA a sweep folds nothing until a rescan loaded the table** (`backend.loaded`): a
   promoted leader's stale snapshot would otherwise win the newer-wins upsert.
 - **`/metrics` carries per (class, model, outcome) gauges only** — no host, ticket or session.
