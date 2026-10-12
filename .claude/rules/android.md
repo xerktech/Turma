@@ -67,6 +67,8 @@ Mirrors the glasses pure-core/adapter-shell split:
   FULL fleet snapshot (`FleetState.polled` — poll-only; an SSE upsert is a partial fleet), scopes by the header's effective org keys, drops the old org's view on a scope
   change and discards a late answer for it. Port logic in `core/Permissions.kt`. Tests:
   `UsagePermissionsViewModelTest`, `PermissionsSectionTest`.
+- Usage's model-quality card (XERK-1849) is likewise its OWN `GET /api/model-quality` call
+  (`model/ModelQuality.kt`, `UsageViewModel.watchModelQuality`); rules in `model-quality.md`.
 
 ## Push delivery
 

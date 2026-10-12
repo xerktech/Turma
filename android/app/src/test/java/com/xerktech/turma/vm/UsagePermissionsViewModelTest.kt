@@ -68,7 +68,9 @@ class UsagePermissionsViewModelTest {
 
     @Test
     fun `fetches the current org's seven days and refetches on an org change, never showing the old org`() {
-        routeByOrg()
+        // rival answers late, so the check below sees the moment after the pick
+        // rather than racing a fast rival answer (a flake under full-suite load).
+        routeByOrg(delayFor = "rival")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
         val vm = UsageViewModel(hub.app)

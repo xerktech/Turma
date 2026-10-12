@@ -278,6 +278,29 @@
   .perm-recent .meta.meta-judge { white-space: normal; overflow-wrap: break-word; min-width: 0; }
   .perm-empty { color: var(--muted); font-size: 12.5px; padding: 6px 0 2px; }
 
+  /* "Model quality" (XERK-1849): per work class x model outcome counts, fleet-wide.
+     Reuses the models card; numbers are tabular, the class + model cell is prose. */
+  .mq-card td:first-child { font-family: inherit; font-size: 13px; word-break: normal; white-space: nowrap; }
+  .mq-card td.mq-num { font-variant-numeric: tabular-nums; }
+  .mq-card .mq-model { font-family: var(--font-mono); font-size: 12px; color: var(--ink-2); margin-left: 6px; }
+  .mq-card .mq-good { color: var(--good-text); }
+  .mq-card .mq-bad { color: var(--critical); }
+  .mq-card .mq-sub { color: var(--muted); font-size: 11.5px; }
+  .mq-card tr.mq-class-first td { border-top: 1px solid var(--hairline); }
+  .mq-rows { list-style: none; margin: 8px 0 0; padding: 0; }
+  .mq-rows li {
+    display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 10px;
+    padding: 6px 0; border-bottom: 1px solid var(--hairline); font-size: 12.5px;
+  }
+  .mq-rows li:last-child { border-bottom: none; }
+  .mq-rows .mq-issue { font-family: var(--font-mono); font-size: 12px; color: var(--ink); }
+  .mq-rows .meta { color: var(--muted); font-size: 11.5px; }
+  .mq-rows a { color: var(--accent); }
+  .mq-outcome { font-size: 11px; padding: 0 6px; border-radius: 999px; border: 1px solid currentColor; }
+  .mq-outcome.o-good { color: var(--good-text); }
+  .mq-outcome.o-bad { color: var(--critical); }
+  .mq-outcome.o-pending, .mq-outcome.o-no-change, .mq-outcome.o-undelivered { color: var(--muted); }
+
   @media (max-width: 600px) {
     .chart-card { padding: 12px 10px 8px; }
     .models-card { padding: 12px 10px; }
@@ -310,6 +333,25 @@
        always on a line of their own, host first. */
     .perm-recent .perm-subj { flex: 1 1 0; }
     .perm-recent .perm-meta { flex: 1 1 100%; }
+    /* Model quality on a phone: each (class, model) row reflows to a block —
+       class + model, then one line of labelled counts — no sideways scroll. */
+    .mq-card .table-scroll { overflow-x: visible; }
+    .mq-card table, .mq-card tbody, .mq-card td { display: block; }
+    .mq-card thead { display: none; }
+    .mq-card tbody tr {
+      display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 14px;
+      padding: 10px 12px; border-bottom: 1px solid var(--hairline);
+    }
+    .mq-card tbody tr:last-child { border-bottom: none; }
+    .mq-card tbody td {
+      position: static; padding: 0; border: none; background: none;
+      text-align: left; white-space: nowrap; min-width: 0;
+    }
+    .mq-card tbody td:first-child { flex: 1 1 100%; }
+    .mq-card tbody td.mq-num { font-size: 12px; color: var(--ink-2); }
+    .mq-card tbody td.mq-num::before { content: attr(data-label) " "; color: var(--muted); }
+    .mq-card tbody td.mq-na { display: none; }
+    .mq-card tbody tr.mq-class-first td { border-top: none; }
   }
   /* Touch devices: roomier legend/table hit areas. */
   @media (pointer: coarse) {
@@ -328,6 +370,7 @@
   <div id="chart"></div>
   <div id="models"></div>
   <div id="permissions"></div>
+  <div id="modelQuality"></div>
   <div class="footer">The <b>subscription limits</b> at the top are the 5-hour session window and the 7-day weekly window of your Claude plan — a single pool shared across claude.ai, Claude Code and every other Claude surface, so it moves for work done anywhere, not just here. There is no API for those numbers: each host captures them from its own Claude Code and reports the snapshot, which is why every card carries the moment it was taken and goes amber once it ages. Claude Code computes them from the sessions on that machine, so they can trail the real server-side counter — read them as headroom at a glance, not as the authoritative balance. There is <b>one card per subscription</b>, not per host: hosts logged into the same Claude account are reading and spending the same pool, so they fold into one card listing them all, and each window shows the freshest reading any of them took. A host whose agent is too old to say which account it's on stays on a card of its own. The <b>token figures</b> — the Today / This week / All-time totals above the limits, and every breakdown of them below — are parsed from the Claude transcripts on each host and count every session it has ever run — killed, deleted and pruned work included. Each host multiplexes worktree-backed sessions. A new session gets a randomly-named worktree checked out in <b>detached HEAD</b> off the latest default branch (main) — the app creates no branch; the running agent branches its own work when it's ready, and that live branch shows on the card. The <b>⌂ Repos root</b> entry at the top of a host's list starts a session directly at the repos root (spanning every repo) instead of inside one worktree — it has no worktree or branch, so the base-branch option doesn't apply. The clone bar pulls a repo into the repos root so it joins the list and can host sessions — from the host's GitHub login, and (when configured) its Azure DevOps org or a GitLab host — greyed out on hosts with no usable clone source. "+ New session" spawns instantly with today's defaults in one click; the ▾ caret beside it opens a composer to add an initial task prompt, a friendly label, and options (base branch, model, permission mode) — all optional, with last-used options remembered per repo. Kill stops a session and removes it from the hub but <b>keeps its worktree on disk</b> (uncommitted work survives) along with its conversation and usage history — a repo's "Resume" picker lists its 5 most recently killed sessions and re-attaches to the same worktree with its conversation intact. Delete (on an already-stopped session) removes the worktree; any branch the agent committed to survives in the repo, only uncommitted files are lost. "Restart (clear context)" relaunches a session with a fresh transcript and a new claude.ai/code name; Start on a stopped session continues its previous conversation. "Prune" (per repo, arm then confirm) cleans up finished work — it removes worktrees whose commits are merged into the latest default branch and deletes local branches merged into it, leaving anything unmerged or with uncommitted changes untouched.</div>
 </div>
 </div>
@@ -1103,6 +1146,7 @@ function renderInner(data) {
   // against the sites this data names), so the permission card's org scope is
   // settled here — its first fetch included.
   syncPermissionsScope();
+  syncModelQualityScope(data.agents);
   TurmaNewTicket.update(data);
   // Live hosts PLUS the usage of hosts the hub no longer has (XERK-338), which
   // is the only place a deleted, pruned or wiped host's spend still exists. They
@@ -1907,6 +1951,237 @@ $perms.addEventListener("click", (ev) => {
   } catch { done("Copy failed"); }
 });
 
+// ---- Model quality (XERK-1849) -----------------------------------------------
+// The outcome ledger's report (/api/model-quality, XERK-1839): per (work class,
+// model) how ticket sessions turned out, FLEET-WIDE — evidence pools across orgs
+// on purpose (docs/model-quality-adr.md). Per-session rows are org-scoped: the
+// hub serves them only for the one org named, so they show only when the
+// header's filter resolves to exactly one org. Its own fetch, like the
+// permission card; the beat's SSE patches never repaint it.
+const $mq = document.getElementById("modelQuality");
+const MQ_REFRESH_MS = 60000;
+const MQ_OUTCOME_LABEL = { good: "good", bad: "bad", pending: "pending", "no-change": "no change",
+  undelivered: "undelivered" };
+let mqView = null;
+let mqLoadError = null;
+let mqFetchSeq = 0;
+// As the permission card: no fetch before the first render's TurmaOrg.update,
+// then refetch whenever the org the rows are scoped to moves. "" = no single org.
+let mqScoped = false;
+let mqFetchedOrg = null;
+let mqViewOrg = null;
+// The org the card's current state (view OR error) belongs to — a pick change
+// clears either at once, so neither another org's rows nor its error lingers.
+let mqStateOrg = null;
+// The header's display name per siteKey (the site's own orgName when it has one).
+let mqOrgNames = new Map();
+let mqPainted = null;
+let mqRowsOpen = false;
+
+function mqOrg() {
+  return (TurmaOrg.get && TurmaOrg.get()) || "";
+}
+// Bad share of the DECIDED sessions (good + bad); null while none is decided —
+// pending, no-change and undelivered say nothing about the code's quality.
+function mqBadRate(g) {
+  const decided = permNum(g.good) + permNum(g.bad);
+  return decided ? permNum(g.bad) / decided : null;
+}
+function mqPct(r) { return r == null ? "—" : `${Math.round(r * 100)}%`; }
+// Opus's bad rate per class: the bar a cheaper model must meet on that class.
+function mqBaselines(groups) {
+  const m = new Map();
+  for (const g of groups) if (g.model === "opus") m.set(g.cls, mqBadRate(g));
+  return m;
+}
+// Rework (XERK-1845): per signal `{median, n}` over the sessions that reported
+// it. A signal no session reported is absent, never 0.
+const MQ_REWORK = [["qaRuns", "QA runs"], ["qaFail", "QA failed"], ["ciRounds", "CI rounds"],
+  ["changesRequested", "Changes requested"]];
+// A median as shown, one decimal, or "—" when the hub sends none.
+function mqMedian(v) {
+  if (!(typeof v === "number" && Number.isFinite(v) && v >= 0)) return "—";
+  // A large one is whole: v * 10 would overflow to Infinity near the double's top.
+  return String(v >= 1e6 ? Math.round(v) : Math.round(v * 10) / 10);
+}
+function mqRework(g) { return g.rework && typeof g.rework === "object" ? g.rework : {}; }
+function mqFinite(v) { return typeof v === "number" && Number.isFinite(v); }
+// One signal of a group, or null when the hub sent no usable median for it.
+function mqSignal(g, key) {
+  const v = Object.hasOwn(mqRework(g), key) ? mqRework(g)[key] : null;
+  return v && typeof v === "object" && mqFinite(v.median) && v.median >= 0 ? v : null;
+}
+// Shadow pairs (XERK-1847): graded pairs, and how many the candidate lost to Opus.
+function mqShadow(g) {
+  const s = g.shadow && typeof g.shadow === "object" ? g.shadow : null;
+  if (!s || !(permNum(s.pairs) > 0)) return "—";
+  const worse = permNum(s.candidateOnlyBad);
+  return `${permNum(s.pairs)}` + (worse ? ` · ${worse} worse` : "");
+}
+// Promotion (XERK-1848). Opus is the baseline every class starts on.
+function mqStatus(g) {
+  if (typeof g.promotion === "string" && g.promotion) return g.promotion;
+  return g.model === "opus" ? "baseline" : "—";
+}
+// Which optional columns any group carries: a column the hub serves for no group
+// is left off rather than shown as a column of dashes.
+function mqColumns(groups) {
+  return {
+    rework: MQ_REWORK.filter(([k]) => groups.some((g) => mqSignal(g, k))),
+    shadow: groups.some((g) => g.shadow && typeof g.shadow === "object"),
+  };
+}
+// Classes by total sessions, Opus first inside each (the baseline), then by sessions.
+function mqOrdered(groups) {
+  const totals = new Map();
+  for (const g of groups) totals.set(g.cls, (totals.get(g.cls) || 0) + permNum(g.sessions));
+  return [...groups].sort((a, b) => (totals.get(b.cls) - totals.get(a.cls)) || a.cls.localeCompare(b.cls)
+    || ((b.model === "opus") - (a.model === "opus")) || (permNum(b.sessions) - permNum(a.sessions))
+    || a.model.localeCompare(b.model));
+}
+function mqPrLinks(prs) {
+  return (Array.isArray(prs) ? prs : []).filter((p) => p && /^https?:\/\//i.test(p.url || "")).map((p) => {
+    const n = (String(p.url).match(/\/(\d+)\/?$/) || [])[1];
+    const state = typeof p.state === "string" ? ` ${p.state.toLowerCase()}` : "";
+    return `<a href="${esc(p.url)}" target="_blank" rel="noopener noreferrer">${esc(n ? `#${n}` : "PR")}</a>${esc(state)}`;
+  }).join(", ");
+}
+
+function modelQualityCardHtml(view, now, org = "", rowsOpen = false, loadError = null) {
+  const days = view && permNum(view.windowDays) > 0 ? permNum(view.windowDays) : 90;
+  const head = `<h2>Model quality</h2>` +
+    `<div class="note">How ticket sessions turned out, per work class (the ticket's type) and model, ` +
+    `pooled across every org. Good = merged with no reopen for ${days} days; bad = reopened after Done ` +
+    `or every PR closed unmerged. Bad rate is bad ÷ (good + bad); the Opus column is that rate for Opus ` +
+    `on the same class — the bar a cheaper model has to meet.</div>`;
+  if (!view && typeof loadError === "string" && loadError) {
+    return head + `<div class="perm-empty">Could not load model quality (${esc(loadError)}).</div>`;
+  }
+  if (!view) return head + `<div class="perm-empty">Loading…</div>`;
+  const groups = (Array.isArray(view.groups) ? view.groups : [])
+    .filter((g) => g && typeof g === "object" && typeof g.cls === "string" && typeof g.model === "string");
+  if (!groups.length) return head + `<div class="perm-empty">No ticket sessions recorded yet.</div>`;
+  const base = mqBaselines(groups);
+  const cols = mqColumns(groups);
+  let lastCls = null;
+  const rows = mqOrdered(groups).map((g) => {
+    const first = g.cls !== lastCls;
+    lastCls = g.cls;
+    const other = [];
+    if (permNum(g["no-change"])) other.push(`${permNum(g["no-change"])} no change`);
+    if (permNum(g.undelivered)) other.push(`${permNum(g.undelivered)} undelivered`);
+    const reasons = g.reasons && typeof g.reasons === "object"
+      ? Object.entries(g.reasons).map(([k, n]) => `${permNum(n)} ${k}`).join(", ") : "";
+    const opus = g.model === "opus" ? null : base.get(g.cls);
+    const num = (label, text, cls = "") =>
+      `<td class="mq-num${cls}" data-label="${label}">${esc(text)}</td>`;
+    return `<tr${first ? ` class="mq-class-first"` : ""}>
+      <td><b>${esc(g.cls)}</b><span class="mq-model">${esc(g.model)}</span>` +
+      (other.length ? `<div class="mq-sub">${esc(other.join(" · "))}</div>` : "") + `</td>
+      ${num("Sessions", String(permNum(g.sessions)))}
+      <td class="mq-num mq-good" data-label="Good">${permNum(g.good)}</td>
+      <td class="mq-num${permNum(g.bad) ? " mq-bad" : ""}" data-label="Bad"${reasons ? ` title="${esc(reasons)}"` : ""}>${permNum(g.bad)}</td>
+      ${num("Pending", String(permNum(g.pending)))}
+      ${num("Bad rate", mqPct(mqBadRate(g)))}
+      ${num("Opus", opus === undefined || opus === null ? "—" : mqPct(opus), opus == null ? " mq-na" : "")}` +
+      cols.rework.map(([k, label]) => {
+        const sig = mqSignal(g, k);
+        return `<td class="mq-num${sig ? "" : " mq-na"}" data-label="${label}"` +
+          (sig ? ` title="median of ${permNum(sig.n)} session${permNum(sig.n) === 1 ? "" : "s"}"` : "") + `>${esc(mqMedian(sig && sig.median))}</td>`;
+      }).join("") +
+      (cols.shadow ? num("Shadow pairs", mqShadow(g)) : "") +
+      num("Status", mqStatus(g), mqStatus(g) === "—" ? " mq-na" : "") + `
+    </tr>`;
+  }).join("");
+  const th = `<th>Class · model</th><th>Sessions</th><th>Good</th><th>Bad</th><th>Pending</th>` +
+    `<th>Bad rate</th><th>Opus</th>` +
+    cols.rework.map(([, label]) => `<th title="Median per session">${label}</th>`).join("") +
+    (cols.shadow ? `<th>Shadow pairs</th>` : "") + `<th>Status</th>`;
+  const table = `<div class="table-scroll"><table><thead><tr>${th}</tr></thead><tbody>${rows}</tbody></table></div>`;
+  return head + table + mqSessionsHtml(view, now, org, rowsOpen);
+}
+
+// The org-scoped drill-down: the newest sessions of the ONE org the header picks.
+function mqSessionsHtml(view, now, org, rowsOpen) {
+  if (!org) {
+    return `<div class="note perm-foot">Pick one org in the header to list its sessions.</div>`;
+  }
+  const list = (Array.isArray(view.rows) ? view.rows : []).filter((r) => r && typeof r === "object");
+  const name = mqOrgNames.get(org) || (TurmaBoard.orgName ? TurmaBoard.orgName(org) : org);
+  if (!list.length) return `<div class="note perm-foot">No ticket sessions recorded for ${esc(name)}.</div>`;
+  const items = list.map((r) => {
+    const outcome = Object.hasOwn(MQ_OUTCOME_LABEL, r.outcome) ? r.outcome : "pending";
+    const at = permNum(r.updatedAt);
+    const span = (t) => (t ? `<span class="meta">${esc(t)}</span>` : "");
+    const prs = mqPrLinks(r.prs);
+    return `<li><span class="mq-issue">${esc(r.issue || "—")}</span>` +
+      `<span class="mq-outcome o-${outcome}"${r.reason ? ` title="${esc(r.reason)}"` : ""}>${esc(MQ_OUTCOME_LABEL[outcome])}</span>` +
+      span(`${r.cls || "other"} · ${r.model || "default"}`) + span(r.reason) + span(r.host) + span(r.repo) +
+      (prs ? `<span class="meta">${prs}</span>` : "") +
+      span(at ? `${fmtDuration((now - at) / 1000)} ago` : "") + `</li>`;
+  }).join("");
+  return `<details class="table-view mq-rows-view"${rowsOpen ? " open" : ""}>` +
+    `<summary>Sessions in ${esc(name)} (${list.length})</summary><ul class="mq-rows">${items}</ul></details>`;
+}
+
+function paintModelQuality() {
+  const html = `<div class="models-card mq-card">${modelQualityCardHtml(mqView, Date.now(), mqViewOrg || "", mqRowsOpen, mqLoadError)}</div>`;
+  if (html === mqPainted) return;
+  mqPainted = html;
+  TurmaNav.preserveScroll($mq, () => { $mq.innerHTML = html; });
+}
+
+function syncModelQualityScope(agents) {
+  mqScoped = true;
+  if (TurmaBoard.mergeSites && Array.isArray(agents)) {
+    mqOrgNames = new Map(TurmaBoard.mergeSites(agents).map((s) => [s.siteKey, TurmaBoard.orgName(s.siteKey, s.orgName)]));
+  }
+  if (mqOrg() !== mqFetchedOrg) refreshModelQuality();
+}
+
+async function refreshModelQuality() {
+  const seq = ++mqFetchSeq;
+  const org = mqOrg();
+  mqFetchedOrg = org;
+  const q = new URLSearchParams();
+  if (org) { q.set("org", org); q.set("rows", "1"); }
+  // Another org's rows — or its error — are never shown under the new pick,
+  // not even while it loads.
+  if (mqStateOrg !== org) {
+    mqView = null;
+    mqViewOrg = null;
+    mqLoadError = null;
+    mqStateOrg = null;
+    paintModelQuality();
+  }
+  const failed = (why) => {
+    if (seq !== mqFetchSeq) return;
+    if (mqView && mqViewOrg === org) return;
+    mqView = null;
+    mqViewOrg = null;
+    mqLoadError = why;
+    mqStateOrg = org;
+    paintModelQuality();
+  };
+  try {
+    const r = await fetch("/api/model-quality" + (org ? "?" + q.toString() : ""));
+    // The hub's own words when it sent them (XERK-264), worded as Android's.
+    if (!r.ok) return failed(TurmaNav.refusalText("", r.status, await r.json().catch(() => null)));
+    const body = await r.json();
+    if (seq !== mqFetchSeq) return;
+    mqView = body;
+    mqViewOrg = org;
+    mqStateOrg = org;
+    mqLoadError = null;
+    paintModelQuality();
+  } catch { failed("no readable answer from the hub"); }
+}
+
+$mq.addEventListener("toggle", (ev) => {
+  const d = ev.target;
+  if (d && d.matches && d.matches("details.mq-rows-view")) mqRowsOpen = !!d.open;
+}, true);
+
 async function refresh() {
   const since = sseClock;   // captured BEFORE the fetch — the write window is its RTT
   try {
@@ -2005,6 +2280,8 @@ connectSSE();
 setInterval(() => { if (!sseOk) refresh(); }, 30000);
 paintPermissions();
 setInterval(() => { if (permScoped) refreshPermissions(); }, PERM_REFRESH_MS);
+paintModelQuality();
+setInterval(() => { if (mqScoped) refreshModelQuality(); }, MQ_REFRESH_MS);
 let resizeTimer;
 addEventListener("resize", () => {
   clearTimeout(resizeTimer);

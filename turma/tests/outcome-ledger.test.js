@@ -460,6 +460,10 @@ test("XERK-1847: only a hub-dispatched shadow's report lands, paired with its li
   const p = L.aggregate({ now: T0 + 5 * DAY }).pairs[0];
   assert.equal(p.shadowBad, 1);
   assert.equal(p.mOnlyFail, 1);
+  // ...and per group, as the XERK-1849 card reads it (a zero-session candidate group).
+  const g = L.aggregate({ now: T0 + 5 * DAY }).groups.find((x) => x.model === "haiku");
+  assert.equal(g.sessions, 0);
+  assert.deepEqual([g.shadow.pairs, g.shadow.candidateOnlyBad], [1, 1]);
   // A row-level read serves the shadow with its grade as the outcome.
   const rows = L.aggregate({ site: "acme.atlassian.net", withRows: true, now: T0 + 5 * DAY }).rows;
   assert.equal(rows.find((r) => r.kind === "shadow").outcome, "bad");

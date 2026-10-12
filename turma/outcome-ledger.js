@@ -649,6 +649,18 @@ function aggregate({ site = null, withRows = false, now = Date.now(), windowDays
       || a.cls.localeCompare(b.cls) || a.model.localeCompare(b.model)),
     pairs: pairsOf(shadows, now, windowDays),
   };
+  // The XERK-1849 report reads the paired evidence per group, as `shadow`. A
+  // candidate that ran no live session still shows, as a zero-session group.
+  for (const p of out.pairs) {
+    let g = out.groups.find((x) => x.cls === p.cls && x.model === p.model);
+    if (!g) {
+      g = { cls: p.cls, model: p.model, sessions: 0, reasons: {}, rework: {} };
+      for (const o of OUTCOMES) g[o] = 0;
+      out.groups.push(g);
+    }
+    g.shadow = { pairs: p.pairs, candidateOnlyBad: p.mOnlyFail, graded: p.graded,
+      shadowGood: p.shadowGood, shadowBad: p.shadowBad, failed: p.failed };
+  }
   if (withRows && site) {
     served.sort((a, b) => b.updatedAt - a.updatedAt);
     out.rows = served.slice(0, ROWS_SERVED_MAX);
@@ -692,7 +704,8 @@ function metricsText(now = Date.now()) {
   // Bounded label sets: models outside the known families read "other", and only
   // the largest METRIC_CLASSES_MAX classes keep their name.
   const merged = new Map();
-  const raw = aggregate({ now }).groups;
+  // Live sessions only: a candidate's zero-session shadow-evidence group has no outcome.
+  const raw = aggregate({ now }).groups.filter((g) => g.sessions > 0);
   const classTotals = new Map();
   for (const g of raw) classTotals.set(g.cls, (classTotals.get(g.cls) || 0) + g.sessions);
   const keep = new Set([...classTotals].sort((a, b) => b[1] - a[1]).slice(0, METRIC_CLASSES_MAX)
