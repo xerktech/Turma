@@ -24750,31 +24750,6 @@ class TestSweepDeadSessions(ManagerMixin, unittest.TestCase):
         self.assertEqual(self._reaped_tmux(),
                          [["tmux", "-L", "turma", "kill-session", "-t", "=agent-dead"]] * 2)
 
-    def test_killing_a_session_forgets_its_pane_type_lock(self):
-        # XERK-1701 (#14): one lock per tmux name ever typed into, never pruned.
-        sm = super().make_manager()
-        sess = self._sess()
-        with ha._PANE_TYPE_LOCKS_GUARD:
-            ha._PANE_TYPE_LOCKS[sess["tmuxName"]] = threading.Lock()
-        sm._kill_tmux(sess)
-        self.assertNotIn(sess["tmuxName"], ha._PANE_TYPE_LOCKS)
-
-    def test_a_held_pane_type_lock_survives_the_kill(self):
-        # A restart relaunches the same tmux name: the writer still typing keeps
-        # serializing the next one.
-        sm = super().make_manager()
-        sess = self._sess()
-        lock = threading.Lock()
-        lock.acquire()
-        with ha._PANE_TYPE_LOCKS_GUARD:
-            ha._PANE_TYPE_LOCKS[sess["tmuxName"]] = lock
-        try:
-            sm._kill_tmux(sess)
-            self.assertIs(ha._PANE_TYPE_LOCKS.get(sess["tmuxName"]), lock)
-        finally:
-            lock.release()
-            ha._PANE_TYPE_LOCKS.pop(sess["tmuxName"], None)
-
     def test_a_record_without_agent_pane_keeps_the_name_only_rule(self):
         # Launched before XERK-1037 (or its pane read failed), or hand-edited to
         # a malformed id: any pane keeps it alive — never reap a live agent.

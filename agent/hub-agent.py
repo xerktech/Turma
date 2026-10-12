@@ -25732,13 +25732,6 @@ class SessionManager:
         # ttyd), so tearing it down here ends claude AND the terminal in one step
         # (XERK-697). _kill_ttyd then no-ops. Every kill/delete/restart path runs
         # _kill_tmux before _kill_ttyd, so nothing leaks.
-        # Its pane is gone, so is any need to serialize typing into it -- unless
-        # a writer still holds the lock: a restart relaunches the same tmux name,
-        # and a fresh lock would let the next writer type into its middle.
-        with _PANE_TYPE_LOCKS_GUARD:
-            held = _PANE_TYPE_LOCKS.get(sess.get("tmuxName"))
-            if held is not None and not held.locked():
-                del _PANE_TYPE_LOCKS[sess.get("tmuxName")]
         if IS_WINDOWS:
             _pty_teardown(sess.get("tmuxName"))
             return
