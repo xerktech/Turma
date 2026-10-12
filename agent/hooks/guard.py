@@ -658,7 +658,11 @@ def _empty_program_dropped(cur: str) -> str | None:
         while e < n and not (cur[e] in " \t\n" and states[e] == ""):
             e += 1
         words.extend(_tokenize(cur[a:e]))
-        if _strip_prefixes(words):
+        prog = _strip_prefixes(words)
+        # xargs runs the words after its options: `xargs $x rm -rf /etc`
+        # with x empty runs rm (rollup XERK-1584).
+        if prog and not (_basename(prog[0]) == "xargs"
+                         and _xargs_options(prog[1:])[0] == len(prog) - 1):
             break
         kept.append(cur[pos:e])
         pos = e
@@ -1355,6 +1359,9 @@ def _subst_in_arith(m: "re.Match[str]") -> bool:
     (`_ARITH_GAP_RE`); anything else reads as not arithmetic, the deny side."""
     s, a, b = m.string, m.start(), m.end()
     p = s.rfind("$((", 0, a)
+    q = s.rfind("$[", 0, a)
+    if q > p:
+        return _subst_in_bracket_arith(s, q, a, b)
     if p < 0 or (p and s[p - 1] == "\\"):
         return False
     depth = 2
@@ -1370,6 +1377,24 @@ def _subst_in_arith(m: "re.Match[str]") -> bool:
             return False    # `((` closed apart: `$( (…) (…) )`, a subshell
     return (depth == 0 and bool(_ARITH_GAP_RE.match(s[p + 3:a]))
             and bool(_ARITH_GAP_RE.match(s[b:j])))
+
+
+def _subst_in_bracket_arith(s: str, q: int, a: int, b: int) -> bool:
+    """`_subst_in_arith` for bash's deprecated `$[ … ]` opening at ``q``
+    (rollup XERK-1584): `N=$[ $(nproc || echo 2) + 1 ]` was refused."""
+    if q and s[q - 1] == "\\":
+        return False
+    depth = 1
+    for ch in s[q + 2:a]:
+        depth += {"[": 1, "]": -1}.get(ch, 0)
+        if depth < 1:
+            return False    # that `$[` closed before the substitution
+    j = b
+    while j < len(s) and depth:
+        depth += {"[": 1, "]": -1}.get(s[j], 0)
+        j += 1
+    return (depth == 0 and bool(_ARITH_GAP_RE.match(s[q + 2:a]))
+            and bool(_ARITH_GAP_RE.match(s[b:j - 1])))
 
 
 def _has_conditional(body: str) -> bool:
@@ -1398,6 +1423,16 @@ def _stdout_redirected(stmt: str) -> bool:
     return bool(_STDOUT_REDIR_RE.search(masked))
 
 
+def _xargs_prints(toks: list[str]) -> bool:
+    """Whether ``toks`` is an xargs that prints the words it is fed: a bare
+    `xargs` runs echo, and `xargs echo|printf` relays them joined by blanks.
+    Left opaque, `$(false || echo rm -rf /etc | xargs echo)` ran unread."""
+    if not toks or _basename(toks[0]) != "xargs":
+        return False
+    rest = toks[1 + _xargs_options(toks[1:])[0]:]
+    return not rest or _basename(rest[0]) in ("echo", "printf")
+
+
 def _stmt_tainted(stmt: str) -> tuple[str, bool] | None:
     """What one statement's PRODUCER emits as taint — echo/printf arguments, or
     a here-string — carried through any pass-through or rewriting filter, plus
@@ -1412,7 +1447,7 @@ def _stmt_tainted(stmt: str) -> tuple[str, bool] | None:
     for st in stages[1:]:
         toks = _strip_prefixes(_tokenize(_unwrap_group(st)))
         if not toks or not (_passes_input(st) or _basename(toks[0]) in _REWRITE_FILTERS
-                            or _greps_lines(toks)):
+                            or _greps_lines(toks) or _xargs_prints(toks)):
             return None
     first = _strip_prefixes(_tokenize(_unwrap_group(stages[0])))
     text = _printed_from_tokens(first)
@@ -4569,6 +4604,8 @@ def _reader_feeds(command: str, segs: list[str], readers: dict[int, object],
     (`$(echo echo) WORDS`) may be an echo, so both are read as one (XERK-1658)."""
     own: list[list[str]] = []
     echo: list[str | None] = []
+    # A printf's text without its format word, beside the echo reading.
+    unformatted: dict[int, str] = {}
     piped: list[bool] = []
     pos = 0
     for seg in segs:
@@ -4612,25 +4649,38 @@ def _reader_feeds(command: str, segs: list[str], readers: dict[int, object],
             # A bare `$a` uses a value, it prints none: read as `echo` with
             # no words it bound a reader to "" (XERK-1658 QA).
             echo.append("$(echo " + words + ")" if words else None)
+            # A printf prints its arguments through the format word: read
+            # only as an echo, `e=printf; $e '%s\n' 'rm …' > f` bound `%s\n`
+            # as the program (rollup XERK-1584).
+            if words and (prog == "printf" or spelled):
+                rest = words[_word_end(words, 0):].strip()
+                if rest:
+                    unformatted[len(echo) - 1] = "$(echo " + rest + ")"
         else:
             echo.append(None)
     groups = _seg_groups(segs)
     closers = {c for _, c in groups}
     openers = {o for o, _ in groups}
     orphans: list[str] = []
+
+    def prints(k: int) -> list[str]:
+        """What segment ``k`` prints: its echo reading, and a printf's
+        arguments without the format word."""
+        return [e for e in (echo[k], unformatted.get(k)) if e]
+
     for k in range(len(segs)):
         if k not in readers and k not in closers:
             orphans.extend(own[k])
         if echo[k] and piped[k] and k + 1 < len(segs) \
                 and k + 1 not in readers and k + 1 not in openers:
-            orphans.append(echo[k])
+            orphans.extend(prints(k))
 
     def into(o: int) -> list[str]:
         """What is piped into segment ``o``: an echo, or a group's echoes."""
         if o == 0 or not piped[o - 1]:
             return []
         lo = min([g for g, c in groups if c == o - 1], default=o - 1)
-        return [e for e in echo[lo:o] if e]
+        return [e for k in range(lo, o) for e in prints(k)]
 
     # A reader in a group redirected from a file (`done < f`, `} < f`), or
     # on a line whose stdin `exec < f` moves, is blind too.
@@ -4642,7 +4692,8 @@ def _reader_feeds(command: str, segs: list[str], readers: dict[int, object],
             blind.update(k for k in readers if o <= k <= c)
     out = {}
     for k in readers:
-        feeds = own[k] + into(k) + ([e for e in echo if e] if k in blind else [])
+        feeds = own[k] + into(k) + ([e for j in range(len(echo)) for e in prints(j)]
+                                    if k in blind else [])
         for o, c in groups:
             if o <= k <= c:
                 feeds += own[c] + into(o)
@@ -8214,7 +8265,14 @@ def _replacement_tildes(text: str) -> list[tuple[int, str]]:
 
 
 _REPLACEMENT_TILDE_RE = re.compile("~" + _TILDE_SUFFIX + "(?=[/}])")
-_BARE_CD_RE = re.compile(r"((?:^|(?<=[\s;&|(){`]))cd)(?=[ \t]*(?:[;&|)}\n`]|$))")
+# A `cd` with no operand, which goes to $HOME: after its options (`--`, `-P`),
+# among redirections (`cd >/dev/null`, `cd 2>&1`) and opening a quoted script
+# (`bash -c 'cd; …'`). A redirect target must end at a blank or an operator, so
+# a run of `>a1>a1…` has one reading and the lookahead stays linear.
+_BARE_CD_RE = re.compile(
+    r"((?:^|(?<=[\s;&|(){`'\"]))cd(?:[ \t]+-(?:-|[LPe@]+))*)"
+    r"(?=(?:[ \t]*(?:\d+|\{\w+\})?(?:[<>]&?|&>>?|>>|>\|)[ \t]*[^\s;&|()<>`]+(?=[\s;&|)}`]|$))*"
+    r"[ \t]*(?:[;&|)}\n`]|$))")
 # What a line that may bind HOME holds: the name (`HOM{E,}`, `H\OME`, `H$x`
 # with `x=OME`) or an `eval` that can build it.
 _HOME_HINT_RE = re.compile(r"HOM|OME|\beval\b")
@@ -8233,9 +8291,9 @@ def _home_tilde_readings(command: str) -> list[str]:
     name ending a default word is not resolved, `${y:-$x}`, XERK-1670) and
     bare (`${y/$z/${HOME}/x}` is not resolved either). Elsewhere bare: a
     braced one is not resolved inside `{a,b}` (XERK-1694)."""
-    if "~" not in command and "cd" not in command:
-        return []
     home = bool(_HOME_HINT_RE.search(command))
+    if "~" not in command and not home:
+        return []
     if not home and not _DIR_TILDE_RE.search(command):
         return []
 
@@ -8246,7 +8304,8 @@ def _home_tilde_readings(command: str) -> list[str]:
     out = _HOME_TILDE_RE.sub(splice, command)
     if home:
         # ...and a bare `cd`, which goes to $HOME: `HOME=/; cd; rm -rf etc`.
-        out = _BARE_CD_RE.sub(r"\1 $HOME", out)
+        # A `cd` spelled with quotes or escapes (`"cd"`, `c\d`) is one too.
+        out = _BARE_CD_RE.sub(r"\1 $HOME", (_cd_spelled_readings(out) or [out])[0])
     readings = [out]
     if "${" in out:
         spots = [(m.end(1), m.group(2) or "") for m in _PARAM_TILDE_RE.finditer(out)]
@@ -12067,9 +12126,12 @@ def _empties_a_set_path(op: str) -> bool:
     """Whether `${HOME<op>}` can be empty though HOME holds a path. Only the
     operators that cannot are listed: a default or `?` (unused, HOME is set),
     a case change or `@` transform, and stripping one `/`. Any other pattern
-    can match the whole path, a literal one too (`${HOME#/root}`)."""
+    can match the whole path, a literal one too (`${HOME#/root}`). `@a` prints
+    HOME's attributes, which are none once it is not exported (`export -n`)."""
     if op[:2] == ":+" or op[:1] == "+":
         return _only_expansions(op[2 if op[0] == ":" else 1:])
+    if op == "@a":
+        return True
     return not (op == "" or op[:1] in ("-", "=", "?", "^", ",", "@")
                 or op[:2] in (":-", ":=", ":?") or op in ("%/", "#/"))
 
@@ -12365,6 +12427,13 @@ def _dangerous_target(tok: str, home_read: bool = True, keep_last: bool = True) 
     if _is_dangerous_path(tok):
         return f"({tok!r})"
     raw = tok.strip().strip('"').strip("'")
+    # A last component globbing `..` (`/.*`, `/x/.?`) names the parent too in
+    # bash before 5.2 (no globskipdots). GNU rm refuses `..`; a walker that
+    # does not (`chmod -R 777 /.*`) is judged on the parent (rollup XERK-1584).
+    parent, _, leaf = raw.rstrip("/").rpartition("/")
+    if (not keep_last and raw.startswith(("/", "~", "$")) and _GLOB_CHARS.search(leaf)
+            and _shell_fnmatch("..", leaf) and _is_dangerous_path(parent + "/..")):
+        return f"({tok!r}, which matches {parent + '/..'!r})"
     empty = _unset_names_dropped(raw, keep_last)
     # Judged as is: XERK-1623's trailing reading on top would read `"$TMP/$x"`
     # as `/`; `_unset_names_dropped` already drops the trailing names it may.
@@ -13898,9 +13967,14 @@ def _pr_body_reason(body: str, cwd: str) -> str | None:
         # A template with no headings asks for prose; there is nothing to check.
         missing = [name for name, pat in sections if not _heading_present(body, pat)]
         if missing:
+            # The headings are the template's text: a long one or many would
+            # bloat the reason a model reads (rollup XERK-1584).
+            shown = [n if len(n) <= 80 else n[:80] + "…" for n in missing[:12]]
+            if len(missing) > 12:
+                shown.append(f"and {len(missing) - 12} more")
             return (
                 "this repo has its own PR template — the description is missing "
-                f"its section(s): {', '.join(missing)}. Follow that template, "
+                f"its section(s): {', '.join(shown)}. Follow that template, "
                 "and pass the description inline (--body/--description, or a "
                 "heredoc) or with --body-file so it can be checked."
             )
