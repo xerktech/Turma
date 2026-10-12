@@ -307,7 +307,9 @@ test("every field the restore coerces is reachable from the restore's own line",
       capacity: { maxSessions: 4, running: 1, queued: 0, free: 3, rootRunning: false },
       github: { available: true, login: "octo", repos: [{ nameWithOwner: "x/y", name: "y", isPrivate: false }] },
       gitSources: [{ source: "azure", label: "AZ", available: true, user: "u", repos: [] }],
-      closedSessions: [{ id: "c", root: false, summaryManual: false, prs: [] }],
+      closedSessions: [{ id: "c", root: false, summaryManual: false, prs: [],
+        modelActual: "claude-opus-5-5", qaPartial: true,
+        qaRuns: [{ agent: "qa", verdict: "PASS" }, { agent: "x" }] }],
       uploadMaxBytes: 5_000_000,
       jira: { available: true, configured: true, siteKey: "acme.atlassian.net", tickets: [] },
     },
@@ -368,6 +370,7 @@ test("every field the restore coerces is reachable from the restore's own line",
       junkRepos: hub.agents.junk && hub.agents.junk.repos,
       junkGitSources: hub.agents.junk && hub.agents.junk.gitSources,
       junkClosed: hub.agents.junk && hub.agents.junk.closedSessions,
+      soloClosed: hub.agents.solo && hub.agents.solo.closedSessions,
       junkSession: hub.agents.junk && hub.agents.junk.sessions,
       junkJira: hub.agents.junk && hub.agents.junk.jira,
       soloKept: hub.agents.solo && {
@@ -403,6 +406,9 @@ test("every field the restore coerces is reachable from the restore's own line",
   assert.deepEqual(out.junkRepos, [{ name: "R", resumable: [] }]);
   assert.deepEqual(out.junkGitSources, []);
   assert.deepEqual(out.junkClosed, []);
+  // XERK-1845: the closed-session QA runs coerce at boot (a TDZ here empties the registry).
+  assert.deepEqual(out.soloClosed[0].qaRuns, [{ agent: "qa", verdict: "PASS" }]);
+  assert.equal(out.soloClosed[0].modelActual, "claude-opus-5-5");
   // jira internals coerced at boot: bad ticket filtered, labels object dropped,
   // repoGuess/repoOptions cloned dropped, non-bool `available` gone.
   assert.deepEqual(out.junkJira.tickets, [{ key: "K", labels: ["x"], repoGuess: {} }]);

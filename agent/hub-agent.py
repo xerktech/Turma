@@ -7949,7 +7949,7 @@ def _summarize_pr(data):
     # DRAFT is really an OPEN sub-state in the API; surface it as its own state
     # so the card can grey it out like GitHub does.
     state = "DRAFT" if draft and state == "OPEN" else state
-    return {
+    out = {
         "url": data.get("url"),
         "number": data.get("number"),
         "title": (data.get("title") or "")[:120],
@@ -7961,6 +7961,70 @@ def _summarize_pr(data):
         "base": data.get("baseRefName") or None,
         "head": data.get("headRefOid") or None,
     }
+    mc = data.get("mergeCommit")
+    _pr_merge_fields(out, state, mc.get("oid") if isinstance(mc, dict) else None,
+                     data.get("mergedAt"))
+    # Every review that asked for changes, counted exactly from the review list
+    # (XERK-1845) — not the current `reviewDecision`, which a later approval
+    # overwrites. Absent when gh sent no list (can't tell).
+    reviews = data.get("reviews")
+    if isinstance(reviews, list):
+        out["changesRequested"] = sum(
+            1 for r in reviews
+            if isinstance(r, dict) and str(r.get("state") or "").upper() == "CHANGES_REQUESTED")
+    return out
+
+
+# A merge commit is a hex object id (sha1 or sha256); anything else is dropped.
+_PR_SHA_RE = re.compile(r"^[0-9a-fA-F]{7,64}$")
+
+
+def _pr_merge_fields(out, state, sha, merged_at):
+    """Stamp a MERGED PR's merge commit and merge time (XERK-1845) — the model
+    quality ledger attributes a later defect to the commit and dates the merge's
+    defect window from `mergedAt`. Only on a merged PR, and only well-formed
+    values, so an open PR never carries a stale or placeholder one."""
+    if state != "MERGED":
+        return
+    if isinstance(sha, str) and _PR_SHA_RE.match(sha):
+        out["mergeCommit"] = sha.lower()
+    if isinstance(merged_at, str) and _ts_ms(merged_at):
+        out["mergedAt"] = merged_at
+
+
+def _carry_pr_rework(prev, st):
+    """Carry a PR's rework counters across status refreshes (XERK-1845).
+
+    `ciRounds` counts CI going red then green: a refresh reading `passing` after
+    the last SETTLED reading was `failing` (pending in between does not reset
+    it). Observed at the refresh cadence, so a red that was fixed between two
+    polls is not seen — the count is a floor. `ciSettled` is that last settled
+    reading, carried so the next refresh (and a restart, via the status ledger)
+    can compare.
+
+    `changesRequested` is exact when the source listed the reviews (GitHub);
+    otherwise it counts edges INTO a changes-requested state
+    (`changesRequestedNow`), observed like CI."""
+    prev = prev if isinstance(prev, dict) else {}
+
+    def count(v):
+        return v if isinstance(v, int) and not isinstance(v, bool) and v >= 0 else 0
+    rounds = count(prev.get("ciRounds"))
+    settled = prev.get("ciSettled") if prev.get("ciSettled") in ("failing", "passing") else None
+    checks = st.get("checks")
+    if checks in ("failing", "passing"):
+        if settled == "failing" and checks == "passing":
+            rounds += 1
+        settled = checks
+    st["ciRounds"] = rounds
+    if settled:
+        st["ciSettled"] = settled
+    if "changesRequested" not in st:
+        n = count(prev.get("changesRequested"))
+        if st.get("changesRequestedNow") is True and prev.get("changesRequestedNow") is not True:
+            n += 1
+        st["changesRequested"] = n
+    return st
 
 
 def pr_status(url):
@@ -7977,7 +8041,7 @@ def pr_status(url):
         return azdo_pr_status(url)
     raw = run(["gh", "pr", "view", url, "--json",
                "number,title,state,isDraft,url,statusCheckRollup,mergeable,"
-               "baseRefName,headRefOid"])
+               "baseRefName,headRefOid,mergeCommit,mergedAt,reviews"])
     if not raw:
         return None
     try:
@@ -8087,7 +8151,7 @@ def _summarize_mr(data):
         mergeable = "CONFLICTING"
     else:
         mergeable = "UNKNOWN"
-    return {
+    out = {
         "url": data.get("web_url"),
         "number": data.get("iid"),
         "title": (data.get("title") or "")[:120],
@@ -8097,7 +8161,14 @@ def _summarize_mr(data):
         "mergeable": mergeable,
         "ready": _merge_ready(state, checks, mergeable),
         "base": data.get("target_branch") or None,
+        # GitLab lists no per-review states on the MR, so a changes-requested
+        # review is observed as the merge status it puts the MR in (XERK-1845).
+        "changesRequestedNow": detailed == "requested_changes",
     }
+    _pr_merge_fields(out, state,
+                     data.get("merge_commit_sha") or data.get("squash_commit_sha"),
+                     data.get("merged_at"))
+    return out
 
 
 def mr_status(url):
@@ -8289,7 +8360,10 @@ def _summarize_azdo_pr(data, evals=None):
     base = str(data.get("targetRefName") or "")
     if base.startswith("refs/heads/"):
         base = base[len("refs/heads/"):]
-    return {
+    # A reviewer voting "waiting for author" (-5) or "rejected" (-10) is ADO's
+    # changes-requested, observed per refresh (XERK-1845).
+    votes = [r.get("vote") for r in data.get("reviewers") or [] if isinstance(r, dict)]
+    out = {
         "url": None,
         "number": data.get("pullRequestId"),
         "title": (data.get("title") or "")[:120],
@@ -8299,7 +8373,12 @@ def _summarize_azdo_pr(data, evals=None):
         "mergeable": mergeable,
         "ready": _merge_ready(state, checks, mergeable),
         "base": base or None,
+        "changesRequestedNow": any(isinstance(v, int) and v < 0 for v in votes),
     }
+    lmc = data.get("lastMergeCommit")
+    _pr_merge_fields(out, state, lmc.get("commitId") if isinstance(lmc, dict) else None,
+                     data.get("closedDate"))
+    return out
 
 
 def _azdo_fetch_pr(url):
@@ -9672,6 +9751,7 @@ def _scan_entry_line(raw, state, report):
     _scan_context_entry(entry, report)
     _scan_agent_entry(entry, state)
     _scan_loop_entry(entry, state)
+    _scan_qa_entry(entry, state, report)
 
 
 # ---- live background agents, off the transcript (XERK-245) -------------------
@@ -10292,6 +10372,149 @@ def _scan_agent_entry(entry, state):
             if tid not in stopped:
                 stopped.append(tid)
                 del stopped[:-LIVE_AGENTS_MAX * 4]
+
+
+# ---- QA passes and their verdicts (XERK-1845) ---------------------------------
+#
+# The model-quality ledger's rework cost: how many `qa` / `qa-delta` sub-agent
+# runs a session needed, and what each concluded. Read off the transcript the
+# same way the live-agent scan reads background work — never from loose text:
+#
+#   run      an `Agent`/`Task` tool_use naming one of QA_AGENT_TYPES whose
+#            tool_result is not an error (a refused launch never ran)
+#   verdict  that call's own tool_result (a synchronous run), or — for a
+#            background run — the report it hands back: an `<agent-message
+#            from="<agentId>">` on a user/queue entry, or a `<task-notification>`
+#            for that agentId whose <result> carries the report (older builds)
+#
+# The agentId comes from the launch's structured `async_launched` record, so a
+# session quoting a report (or an assistant turn holding one) cannot invent a
+# run. The verdict is the report's first `VERDICT|Verdict … PASS|PARTIAL|FAIL` (the qa
+# agent's report format); a report without one leaves the run's verdict unknown.
+QA_AGENT_TYPES = frozenset({"qa", "qa-delta"})
+QA_VERDICT_RE = re.compile(r"(?i:verdict)\W{0,12}(PASS|PARTIAL|FAIL)\b")
+# The report's own verdict LINE wins over a verdict quoted mid-sentence
+# ("prior verdict: FAIL … VERDICT: PASS").
+QA_VERDICT_LINE_RE = re.compile(r"^\W*(?i:verdict)\W{0,12}(PASS|PARTIAL|FAIL)\b", re.M)
+# A hand-back is the WHOLE content: Claude Code's own frame, then the hand-back
+# marker. Anchored, so a user turn merely containing the tag cannot forge one.
+QA_AGENT_MESSAGE_RE = re.compile(
+    r'\A(?:Another Claude session sent a message:\s*)?'
+    r'<agent-message from="([A-Za-z0-9_-]{1,64})">\s*\[Subagent hand-back\]')
+# A session's QA runs kept on its record; a pathological one is bounded.
+QA_RUNS_MAX = 30
+
+
+def _qa_verdict(text):
+    if not isinstance(text, str):
+        return None
+    m = QA_VERDICT_LINE_RE.search(text) or QA_VERDICT_RE.search(text)
+    return m.group(1) if m else None
+
+
+def _scan_qa_entry(entry, state, report):
+    """Fold one transcript entry into the QA-run scan. Appends to
+    `report["qaRuns"]` one `{key, agent, verdict, aid?}` per launch seen and per
+    verdict delivered this beat; the beat merges them onto the record by `key`
+    (the launch's tool_use id), so a report delivered twice (queue copy + user
+    turn) or a resumed agent's later report just updates that run."""
+    calls = state.setdefault("qaCalls", {})      # tool_use id -> agent type
+    agents = state.setdefault("qaAgents", {})    # background agentId -> (key, type)
+    out = report.setdefault("qaRuns", [])
+    msg = entry.get("message") if isinstance(entry, dict) else None
+    content = msg.get("content") if isinstance(msg, dict) else None
+    if isinstance(content, list):
+        for block in content:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") == "tool_use" and block.get("name") in ("Agent", "Task") \
+                    and entry.get("type") == "assistant":
+                inp = block.get("input") if isinstance(block.get("input"), dict) else {}
+                atype = str(inp.get("subagent_type") or "").strip()
+                if atype in QA_AGENT_TYPES and isinstance(block.get("id"), str):
+                    calls[block["id"]] = atype
+                    while len(calls) > QA_RUNS_MAX:
+                        calls.pop(next(iter(calls)))
+            elif block.get("type") == "tool_result" and block.get("tool_use_id") in calls:
+                key = block["tool_use_id"]
+                atype = calls[key]
+                if block.get("is_error") is True:
+                    # Refused (permission, classifier) or errored: it never ran.
+                    calls.pop(key, None)
+                    continue
+                tur = entry.get("toolUseResult")
+                if isinstance(tur, dict) and tur.get("status") == "async_launched":
+                    aid = str(tur.get("agentId") or "").strip()
+                    if aid:
+                        agents[aid] = (key, atype)
+                        while len(agents) > QA_RUNS_MAX:
+                            agents.pop(next(iter(agents)))
+                        out.append({"key": key, "agent": atype, "verdict": None, "aid": aid})
+                else:
+                    out.append({"key": key, "agent": atype,
+                                "verdict": _qa_verdict(_tool_result_text(block.get("content")))})
+    # A background run's report — never off an ASSISTANT turn (it would be the
+    # session quoting one).
+    if entry.get("type") != "assistant" and agents:
+        for text in _entry_texts_for_scan(entry):
+            m = QA_AGENT_MESSAGE_RE.match(text)
+            aid, body = (m.group(1), text[m.end():]) if m else (None, None)
+            if aid is None:
+                tn = _parse_task_notification(text)
+                if tn and tn.get("taskId"):
+                    aid, body = tn["taskId"], tn.get("result") or ""
+            if aid in agents:
+                v = _qa_verdict(body)
+                if v:
+                    key, atype = agents[aid]
+                    out.append({"key": key, "agent": atype, "verdict": v, "aid": aid})
+
+
+def merge_qa_runs(runs, reports):
+    """Fold this beat's QA reports into a record's run list (oldest first,
+    bounded QA_RUNS_MAX). A report naming a known run updates it — a verdict
+    replaces the previous one (a resumed agent's later report is its answer),
+    a launch never erases a verdict. Returns (runs, changed)."""
+    runs = [dict(r) for r in runs if isinstance(r, dict) and isinstance(r.get("key"), str)] \
+        if isinstance(runs, list) else []
+    changed = False
+    for rep in reports or []:
+        cur = next((r for r in runs if r["key"] == rep["key"]), None)
+        if cur is None:
+            cur = {"key": rep["key"], "agent": rep["agent"], "verdict": None}
+            runs.append(cur)
+            changed = True
+        if rep.get("aid") and cur.get("aid") != rep["aid"]:
+            cur["aid"] = rep["aid"]
+            changed = True
+        if rep.get("verdict") and cur.get("verdict") != rep["verdict"]:
+            cur["verdict"] = rep["verdict"]
+            changed = True
+    del runs[:-QA_RUNS_MAX]
+    return runs, changed
+
+
+def qa_runs_wire(runs):
+    """A record's QA runs as served: `[{agent, verdict}]`, oldest first —
+    verdict null while the run has not reported (or reported none)."""
+    return [{"agent": r.get("agent"), "verdict": r.get("verdict")}
+            for r in runs or [] if isinstance(r, dict) and r.get("agent") in QA_AGENT_TYPES]
+
+
+def _seed_qa_scan(state, runs):
+    """A manager restart loses the scan's in-memory id maps while a background
+    QA run may still be going; re-learn them from the record so its report
+    still lands on the run it belongs to."""
+    if "qaAgents" in state or not isinstance(runs, list):
+        return
+    calls = state.setdefault("qaCalls", {})
+    agents = state.setdefault("qaAgents", {})
+    for r in runs[-QA_RUNS_MAX:]:
+        if isinstance(r, dict) and isinstance(r.get("key"), str) \
+                and r.get("agent") in QA_AGENT_TYPES:
+            calls[r["key"]] = r["agent"]
+            if isinstance(r.get("aid"), str) and r["aid"]:
+                agents[r["aid"]] = (r["key"], r["agent"])
 
 
 def _entry_texts_for_scan(entry):
@@ -16820,6 +17043,10 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)
+    if not primed and offsets.get(newest, 0) > 0:
+        # This scan never saw the transcript's start (a manager restart, an
+        # upgrade, a resume), so the QA runs before it are unknown (XERK-1845).
+        report["qaPartial"] = True
     if not primed:
         # The prime set this transcript's offset to EOF, possibly mid-line;
         # resume at the last complete line instead, so a line being written
@@ -25198,6 +25425,11 @@ class SessionManager:
         that happens to start with '-' can't be read as a flag. The per-session
         model (#12) and permission mode (#12) come from the validated fields on
         the session record; both fall back to today's behavior when unset."""
+        # A FRESH conversation (new --session-id) is scanned from its first
+        # byte: mark the scan primed so the first beat never treats the lines
+        # claude wrote before it as history it missed (XERK-1845 qaPartial).
+        if not resume and not resume_id and isinstance(sess.get("id"), str):
+            self.sess_state[sess["id"]] = {"primed": True}
         # Runtime dispatch (XERK-460). _launch_tmux is the ONE launch choke point
         # every path goes through (spawn provision, resume, restart, resume-any,
         # resume-on-boot), so the claude-vs-dsh branch lives here rather than at
@@ -26776,6 +27008,10 @@ class SessionManager:
             # relaunched session already answers to — that keystroke would collide
             # with the operator's first message in the composer.
             "rcRenamedFor",
+            # The model that actually answered and its QA runs (XERK-1845): the
+            # outcome ledger credits a session it first sees already closed by
+            # these, so a kill must not forget them.
+            "modelActual", "qaRuns", "qaPartial",
             # Which model this session was running against (XERK-246). Without
             # it a resume silently returns a failed-over session to the
             # exhausted subscription — and restores its --model alias, which the
@@ -27002,6 +27238,12 @@ class SessionManager:
             # Resuming an ended session keeps whichever model it was running
             # against; usage has not come back just because it was killed.
             "modelSource": rec.get("modelSource") or "subscription",
+            # What the outcome ledger reads off it (XERK-1845): the model that
+            # answered and the QA runs so far. The resumed scan starts at the
+            # transcript's end, so its QA history is partial from here on.
+            "modelActual": rec.get("modelActual"),
+            "qaRuns": rec.get("qaRuns") if isinstance(rec.get("qaRuns"), list) else [],
+            "qaPartial": True,
             # Re-gate the runtime on rebuild, like receive_migration does: a
             # persisted "dsh"/"qwen" falls back to claude when this host does not
             # offer that runtime (which its kill switch forces off), rather than
@@ -34273,7 +34515,8 @@ class SessionManager:
         for url in wanted[:PR_STATUS_MAX]:
             st = pr_status(url)
             if st is not None:
-                self.pr_status_cache[url] = st
+                self.pr_status_cache[url] = _carry_pr_rework(
+                    self.pr_status_cache.get(url), st)
                 changed = True
         # Persist the refreshed status so the pill survives a restart. An ended
         # session's PR is never re-polled, so without this its state/CI degrades
@@ -38741,6 +38984,7 @@ class SessionManager:
         if running:
             try:
                 st = self.sess_state.setdefault(sid, {})
+                _seed_qa_scan(st, sess.get("qaRuns"))
                 signals = session_report(sess["worktreePath"], st, sess.get("tmuxName"),
                                          session_id=sess.get("id"),
                                          claude_sid=sess.get("claudeSessionId"),
@@ -38748,6 +38992,18 @@ class SessionManager:
                                          dsh_status=self.dsh_status.get(sid))
                 # The ledger's uncut dialog face: never on the wire.
                 pane_face = signals.pop("panePromptFace", None)
+                # QA runs + verdicts seen this beat (XERK-1845), folded onto the
+                # record — the scan sees only new bytes, so the record is the
+                # session's whole history (and survives a restart).
+                qa_reports = signals.pop("qaRuns", None)
+                if signals.pop("qaPartial", None) and not sess.get("qaPartial"):
+                    sess["qaPartial"] = True
+                    self.save()
+                if qa_reports:
+                    runs, grew = merge_qa_runs(sess.get("qaRuns"), qa_reports)
+                    if grew:
+                        sess["qaRuns"] = runs
+                        self.save()
                 pend = self.pending_prs.setdefault(sid, [])
                 pend.extend(signals.pop("prUrls"))
                 del pend[:-10]
@@ -38942,6 +39198,13 @@ class SessionManager:
             # pr_status_cache). Kept even after the session stops, as long as the
             # session record survives. None until it opens a PR.
             "prs": self._session_prs(sid),
+            # The qa / qa-delta sub-agent runs it needed and each one's verdict
+            # (XERK-1845), for the hub's model-quality ledger.
+            # An empty list is a known zero; absent (an older agent) is "can't tell".
+            "qaRuns": qa_runs_wire(sess.get("qaRuns")),
+            # True once part of the transcript went unscanned (a manager restart,
+            # an upgrade, a resume): the list is then a floor, not the count.
+            "qaPartial": True if sess.get("qaPartial") else None,
             # Has the conversation moved on since every PR it opened landed?
             # (XERK-224 — see _poll_prs_landed.) "Merging IS the review" demotes
             # a session out of Ready-for-review, and this is what lets that
@@ -39004,6 +39267,12 @@ class SessionManager:
                 # The alias it was spawned on: the hub's ticket model ladder
                 # (XERK-1827) reads a failed ticket session's tier off it.
                 "model": c.get("model"),
+                # The model that ANSWERED, and its QA runs (XERK-1845): the
+                # outcome ledger first sees a short session already closed, and
+                # without these credits it to its spawn alias.
+                "modelActual": c.get("modelActual"),
+                "qaRuns": qa_runs_wire(c.get("qaRuns")),
+                "qaPartial": True if c.get("qaPartial") else None,
                 # Which model this session RAN against (XERK-246). Reading an
                 # ended session's transcript is exactly when "which model wrote
                 # this" matters, and the Ended card's mark reads this field.

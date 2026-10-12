@@ -4723,6 +4723,7 @@ function outcomeLedgerSweep(now = Date.now()) {
           model: s.model, modelActual: s.modelActual, runtime: s.agentType,
           running, createdAt: s.createdAt, closedAt: s.closedAt,
           prs: Array.isArray(s.prs) ? s.prs : [],
+          qaRuns: s.qaRuns, qaPartial: s.qaPartial === true,
           closeKind: t.outcome && t.outcome.kind,
           type: row && row.type, statusCategory: row && row.statusCategory,
           resolved: row && row.resolved,
@@ -9932,7 +9933,41 @@ function normalizeClosedSessions(a) {
     }
     const prs = coerceObjectList(c, "prs");
     if (prs) prs.forEach(coercePrElem);
+    // The model that ANSWERED (XERK-1845): the outcome ledger credits a session
+    // it first sees already closed by it. Untyped on Android; a non-string drops.
+    if ("modelActual" in c) {
+      if (typeof c.modelActual === "string" && c.modelActual) c.modelActual = c.modelActual.slice(0, 120);
+      else delete c.modelActual;
+    }
+    coerceQaRuns(c);
   }
+}
+
+// `qaRuns` (XERK-1845): the qa / qa-delta sub-agent runs a session needed,
+// [{agent, verdict}], for the outcome ledger's rework signal. Untyped on every
+// client; rebuilt field by field (agent from the fixed pair, verdict one of
+// PASS/PARTIAL/FAIL or null), bounded; a non-list drops (absent = an older
+// agent, which the ledger reads as "can't tell").
+// Inline literals, not module consts: the state.json restore reaches this at
+// module init, where a const declared below is in its TDZ.
+function wireQaRuns(v) {
+  if (!Array.isArray(v)) return null;
+  const out = [];
+  for (const r of v) {
+    if (!objectish(r) || (r.agent !== "qa" && r.agent !== "qa-delta")) continue;
+    const verdict = ["PASS", "PARTIAL", "FAIL"].includes(r.verdict) ? r.verdict : null;
+    out.push({ agent: r.agent, verdict });
+  }
+  // An empty list is a known zero (no QA pass needed), not "can't tell".
+  return out.slice(-30);
+}
+function coerceQaRuns(owner) {
+  // qaPartial: part of the transcript went unscanned, so the list is a floor.
+  if ("qaPartial" in owner && owner.qaPartial !== true) delete owner.qaPartial;
+  if (!("qaRuns" in owner)) return;
+  const runs = wireQaRuns(owner.qaRuns);
+  if (runs) owner.qaRuns = runs;
+  else delete owner.qaRuns;
 }
 
 // `uploadMaxBytes` (Long on Android — the attachment cap AND the capability
@@ -10331,6 +10366,7 @@ function normalizeSessions(payload) {
     // the ingest (the hub 400s that heartbeat), but the state.json restore path
     // and defence-in-depth coerce it the same way.
     { const prs = coerceObjectList(s, "prs"); if (prs) prs.forEach(coercePrElem); }
+    coerceQaRuns(s);
     // root and newWorkSincePrs are non-null Boolean; ttydPort and restartCount
     // are Int. A wrong type drops to the client's default (false / 0).
     for (const k of ["root", "newWorkSincePrs"]) {

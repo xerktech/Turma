@@ -66,6 +66,9 @@ const ISSUE_RE = /^[A-Za-z0-9._-]{1,64}$/;
 const SID_RE = /^[A-Za-z0-9._-]{1,100}$/;
 const PR_STATES = new Set(["OPEN", "MERGED", "CLOSED", "DRAFT"]);
 const CLOSE_KINDS = new Set(["done", "not-reproducible", "already-fixed"]);
+const SHA_RE = /^[0-9a-fA-F]{7,64}$/;
+const COUNT_MAX = 1000;
+const QA_KEYS = ["runs", "pass", "partial", "fail"];
 
 function capStr(v, max) {
   if (typeof v !== "string") return "";
@@ -109,10 +112,54 @@ function sanitizePr(p) {
   const out = { url };
   const state = typeof p.state === "string" ? p.state.toUpperCase() : "";
   if (PR_STATES.has(state)) out.state = state;
-  const mergedAt = posInt(p.mergedAt);
+  // The agent sends mergedAt as the tracker's ISO time; the store keeps ms.
+  const mergedAt = timeOf(p.mergedAt);
   if (mergedAt) out.mergedAt = mergedAt;
   const closedAt = posInt(p.closedAt);
   if (closedAt) out.closedAt = closedAt;
+  if (typeof p.mergeCommit === "string" && SHA_RE.test(p.mergeCommit)) {
+    out.mergeCommit = p.mergeCommit.toLowerCase();
+  }
+  // Rework counters (XERK-1845). Absent = the agent could not tell.
+  for (const k of ["ciRounds", "changesRequested"]) {
+    const n = countOf(p[k]);
+    if (n !== null) out[k] = n;
+  }
+  return out;
+}
+
+/** A non-negative safe integer, capped; anything else is "can't tell". */
+function countOf(v) {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 ? Math.min(v, COUNT_MAX) : null;
+}
+
+/**
+ * QA runs off the wire ([{agent, verdict}]) → {runs, pass, partial, fail}, or
+ * null when the agent sent no list (an older agent: can't tell). An empty list
+ * is a KNOWN zero — a session that needed no QA pass.
+ */
+function qaOf(list) {
+  if (!Array.isArray(list)) return null;
+  const qa = { runs: 0, pass: 0, partial: 0, fail: 0 };
+  for (const r of list) {
+    if (!r || typeof r !== "object" || (r.agent !== "qa" && r.agent !== "qa-delta")) continue;
+    qa.runs += 1;
+    if (r.verdict === "PASS") qa.pass += 1;
+    else if (r.verdict === "PARTIAL") qa.partial += 1;
+    else if (r.verdict === "FAIL") qa.fail += 1;
+  }
+  return qa;
+}
+
+function sanitizeQa(q) {
+  if (!q || typeof q !== "object") return null;
+  const out = {};
+  for (const k of QA_KEYS) {
+    const n = countOf(q[k]);
+    if (n === null) return null;
+    out[k] = n;
+  }
+  if (q.incomplete === true) out.incomplete = true;
   return out;
 }
 
@@ -147,6 +194,8 @@ function sanitizeRow(r) {
     const prs = r.prs.map(sanitizePr).filter(Boolean).slice(0, PRS_MAX);
     if (prs.length) out.prs = prs;
   }
+  const qa = sanitizeQa(r.qa);
+  if (qa) out.qa = qa;
   return out;
 }
 
@@ -214,6 +263,17 @@ function observe(observations, now = Date.now()) {
     }
     if (CLOSE_KINDS.has(o.closeKind)) next.closeKind = o.closeKind;
     mergePrs(next, o.prs, now);
+    // QA runs (XERK-1845): the agent reports the session's whole list, so each
+    // count only rises — a closed record carrying fewer runs never lowers one.
+    const qa = qaOf(o.qaRuns);
+    if (qa) {
+      const prevQa = next.qa || {};
+      next.qa = {};
+      for (const k of QA_KEYS) next.qa[k] = Math.max(prevQa[k] || 0, qa[k]);
+      // Part of the session's transcript went unscanned (a restart, an
+      // upgrade, a resume): the counts are a floor, never served as the count.
+      if (prevQa.incomplete || o.qaPartial === true) next.qa.incomplete = true;
+    }
     const tkey = JSON.stringify([base.site, base.issue]);
     if (typeof o.statusCategory === "string") {
       ticketDone.set(tkey, { cat: o.statusCategory, resolvedAt: timeOf(o.resolved) });
@@ -266,10 +326,31 @@ function mergePrs(row, prs, now) {
       cur = { url: p.url };
       list.push(cur);
     }
+    // Rework counters only rise (a stale read never lowers one); the merge
+    // commit is set once. Both are read even past MERGED — a PR first seen
+    // merged, or merged before an agent that reports them, still gets them.
+    for (const k of ["ciRounds", "changesRequested"]) {
+      if (p[k] !== undefined && !(cur[k] >= p[k])) cur[k] = p[k];
+    }
+    if (p.mergeCommit && !cur.mergeCommit && (p.state === "MERGED" || cur.state === "MERGED")) {
+      cur.mergeCommit = p.mergeCommit;
+    }
+    // The agent's own merge time beats a sighting: a PR already merged when the
+    // ledger first saw it was dated at that sighting (XERK-1845 comment 2). A
+    // session's PR cannot have merged before the session started (nor after
+    // now), so such a time is junk and is ignored — before the start it would
+    // open the window at once, in the future it would hold it open.
+    const floor = row.startedAt || row.firstSeen - WINDOW_DAYS * DAY_MS;
+    const plausible = p.mergedAt && p.mergedAt >= floor && p.mergedAt <= now;
+    if (cur.state === "MERGED" && plausible && p.mergedAt < (cur.mergedAt || Infinity)) {
+      cur.mergedAt = p.mergedAt;
+    }
     // MERGED is terminal: a later read never moves it back.
     if (cur.state === "MERGED") continue;
     if (p.state) cur.state = p.state;
-    if (cur.state === "MERGED" && !cur.mergedAt) cur.mergedAt = p.mergedAt || now;
+    if (cur.state === "MERGED" && !cur.mergedAt) {
+      cur.mergedAt = plausible ? p.mergedAt : now;
+    }
     if (cur.state === "CLOSED" && !cur.closedAt) cur.closedAt = p.closedAt || now;
     if (cur.state !== "CLOSED") delete cur.closedAt;
   }
@@ -349,6 +430,30 @@ function outcomeOf(r, now = Date.now(), windowDays = WINDOW_DAYS) {
 const OUTCOMES = ["good", "bad", "pending", "no-change", "undelivered"];
 
 /**
+ * A row's rework signals (XERK-1845), each null when nothing reported it: QA
+ * runs + failed ones, CI red→green rounds and changes-requested reviews summed
+ * over its PRs (only PRs that carried the counter).
+ */
+function reworkOf(r) {
+  const sum = (k) => {
+    const vals = (r.prs || []).map((p) => p[k]).filter((v) => typeof v === "number");
+    return vals.length ? vals.reduce((a, b) => a + b, 0) : null;
+  };
+  return {
+    qaRuns: r.qa && !r.qa.incomplete ? r.qa.runs : null,
+    qaFail: r.qa && !r.qa.incomplete ? r.qa.fail : null,
+    ciRounds: sum("ciRounds"),
+    changesRequested: sum("changesRequested"),
+  };
+}
+
+function median(vals) {
+  const v = [...vals].sort((a, b) => a - b);
+  const m = v.length >> 1;
+  return v.length % 2 ? v[m] : (v[m - 1] + v[m]) / 2;
+}
+
+/**
  * The served view. Groups are fleet-wide per (class, model). `site` narrows the
  * served ROWS to one org (and only then are rows served at all).
  */
@@ -360,14 +465,25 @@ function aggregate({ site = null, withRows = false, now = Date.now(), windowDays
     const gk = `${r.cls}\u0000${r.model}`;
     let g = groups.get(gk);
     if (!g) {
-      g = { cls: r.cls, model: r.model, sessions: 0, reasons: {} };
+      g = { cls: r.cls, model: r.model, sessions: 0, reasons: {}, rework: {} };
       for (const o of OUTCOMES) g[o] = 0;
       groups.set(gk, g);
     }
     g.sessions += 1;
     g[outcome] += 1;
+    for (const [k, v] of Object.entries(reworkOf(r))) {
+      if (v === null) continue;
+      (g.rework[k] || (g.rework[k] = [])).push(v);
+    }
     if (outcome === "bad") g.reasons[reason] = (g.reasons[reason] || 0) + 1;
     if (withRows && site && r.site === site) served.push({ ...r, outcome, reason });
+  }
+  // Rework is REPORTED beside the outcome, never part of good/bad (ADR): per
+  // signal, the median over the sessions that reported it, and how many did.
+  for (const g of groups.values()) {
+    const rework = {};
+    for (const [k, vals] of Object.entries(g.rework)) rework[k] = { median: median(vals), n: vals.length };
+    g.rework = rework;
   }
   const out = {
     windowDays,

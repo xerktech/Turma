@@ -24466,6 +24466,48 @@ test("XERK-1839: the sweep dates Done by the board row's resolution time", outco
   hub.outcomeLedger._internals.reset();
 }));
 
+test("XERK-1845: a closed session is credited to the model that answered, with its rework", outcomeIsolated(async () => {
+  hub.outcomeLedger._internals.reset();
+  outcomeHost("ol-rw", "ol-rw.atlassian.net", { sessions: [] });
+  const c = agents["ol-rw"].closedSessions[0];
+  // Through the heartbeat's own coercion, as a beat would deliver it.
+  Object.assign(c, { modelActual: "claude-sonnet-5-5",
+    qaRuns: [{ agent: "qa", verdict: "FAIL" }, { agent: "qa-delta", verdict: "PASS" },
+      { agent: "evil", verdict: "PASS" }, { agent: "qa-delta", verdict: "maybe" }] });
+  c.prs = [{ url: "https://github.com/o/r/pull/6", state: "MERGED", mergedAt: "2026-09-20T00:00:00Z",
+    mergeCommit: "ABCDEF1234567", ciRounds: 2, changesRequested: 1 }];
+  hub.normalizeClosedSessions(agents["ol-rw"]);
+  assert.deepEqual(c.qaRuns, [{ agent: "qa", verdict: "FAIL" }, { agent: "qa-delta", verdict: "PASS" },
+    { agent: "qa-delta", verdict: null }]);
+  hub.outcomeLedgerSweep();
+  const [r] = [...hub.outcomeLedger._internals.rows().values()];
+  assert.equal(r.model, "sonnet", "the answering model, not the haiku spawn alias");
+  assert.deepEqual(r.qa, { runs: 3, pass: 1, partial: 0, fail: 1 });
+  assert.equal(r.prs[0].mergedAt, Date.parse("2026-09-20T00:00:00Z"));
+  assert.equal(r.prs[0].mergeCommit, "abcdef1234567");
+  const v = await request("GET", "/api/model-quality", { headers: userHeaders });
+  const g = v.body.groups.find((x) => x.model === "sonnet");
+  assert.deepEqual(g.rework.qaRuns, { median: 3, n: 1 });
+  assert.deepEqual(g.rework.ciRounds, { median: 2, n: 1 });
+  // qaPartial rides heartbeat coercion into the ledger: the row is incomplete
+  // and left out of the QA median; a non-true value is dropped.
+  c.qaPartial = true;
+  const junkPartial = { closedSessions: [{ id: "y", qaPartial: "yes" }] };
+  hub.normalizeClosedSessions(junkPartial);
+  assert.ok(!("qaPartial" in junkPartial.closedSessions[0]));
+  hub.normalizeClosedSessions(agents["ol-rw"]);
+  hub.outcomeLedgerSweep();
+  const [r2] = [...hub.outcomeLedger._internals.rows().values()];
+  assert.equal(r2.qa.incomplete, true);
+  const v2 = await request("GET", "/api/model-quality", { headers: userHeaders });
+  assert.equal(v2.body.groups.find((x) => x.model === "sonnet").rework.qaRuns, undefined);
+  // A non-string modelActual and a non-list qaRuns drop (an older agent's "can't tell").
+  const bad = { closedSessions: [{ id: "x", modelActual: { a: 1 }, qaRuns: "PASS" }] };
+  hub.normalizeClosedSessions(bad);
+  assert.ok(!("modelActual" in bad.closedSessions[0]) && !("qaRuns" in bad.closedSessions[0]));
+  delete agents["ol-rw"];
+}));
+
 test("XERK-1839: /api/model-quality is user-authed and /metrics leaks no ticket", outcomeIsolated(async () => {
   assert.equal((await request("GET", "/api/model-quality")).status, 401);
   assert.equal((await request("GET", "/api/model-quality", { headers: agentHeaders })).status, 401);
