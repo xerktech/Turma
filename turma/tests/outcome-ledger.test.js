@@ -62,9 +62,18 @@ test("an unpinned or 'default' session reads as the model its host's default res
   L._internals.reset();
   L.observe([obs({ model: null, modelDefault: "Haiku 5" })], T0);
   assert.equal(only().model, "haiku");
+  // The label the probe really emits: the family wins, never a parenthesised fragment.
+  for (const label of ["`Opus 5.5 (1M context)` (effort: medium)", "`Opus 5.5` (effort: medium)"]) {
+    L._internals.reset();
+    L.observe([obs({ model: null, modelDefault: label })], T0);
+    assert.equal(only().model, "opus", label);
+  }
+  L._internals.reset();
+  L.observe([obs({ model: null, modelDefault: "`Fable 5` (effort: high)" })], T0);
+  assert.equal(only().model, "fable");
   // A label naming no model falls back to Opus.
   L._internals.reset();
-  L.observe([obs({ model: "default", modelDefault: "Default" })], T0);
+  L.observe([obs({ model: "default", modelDefault: "Default (recommended)" })], T0);
   assert.equal(only().model, "opus");
   // A stored legacy "default" row folds into Opus on load.
   assert.equal(L.sanitizeRow({ site: "s.atlassian.net", issue: "ENG-1", host: "h", sid: "abc",

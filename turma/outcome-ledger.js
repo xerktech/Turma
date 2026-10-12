@@ -53,7 +53,8 @@ const PRS_MAX = 10;
 const HOST_MAX_ROWS = positiveEnv("OUTCOME_LEDGER_HOST_MAX_ROWS", Math.max(1, Math.floor(MAX_ROWS / 4)));
 // /metrics labels a model outside these families "other": a model id is
 // agent-supplied, and every distinct one would add series to an unauthenticated route.
-const METRIC_MODELS = new Set(["opus", "sonnet", "haiku", "default"]);
+const MODEL_FAMILIES = ["opus", "sonnet", "haiku", "fable"];
+const METRIC_MODELS = new Set(MODEL_FAMILIES);
 const METRIC_CLASSES_MAX = 20;
 const ROWS_SERVED_MAX = 500;
 
@@ -119,7 +120,7 @@ function workClass(type) {
 function modelFamily(v) {
   const s = capStr(v, 80).toLowerCase();
   if (!s) return "";
-  for (const f of ["opus", "sonnet", "haiku"]) if (s.includes(f)) return f;
+  for (const f of MODEL_FAMILIES) if (s.includes(f)) return f;
   return s.replace(/[^a-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
 }
 
@@ -139,11 +140,14 @@ function aliasFamily(alias, defaultLabel) {
   return defaultFamily(defaultLabel);
 }
 
-/** The host's probed default label → its family, else DEFAULT_MODEL. */
+/**
+ * The host's probed default label → its family, else DEFAULT_MODEL. The probe's
+ * label reads "`Opus 5.5 (1M context)` (effort: medium)", so only a known family
+ * named anywhere in it counts — never a parenthesised fragment.
+ */
 function defaultFamily(label) {
-  const inner = /\(([^)]*)\)/.exec(typeof label === "string" ? label : "");
-  const m = modelFamily(inner ? inner[1] : label);
-  return m && !m.startsWith("default") ? m : DEFAULT_MODEL;
+  const m = modelFamily(label);
+  return MODEL_FAMILIES.includes(m) ? m : DEFAULT_MODEL;
 }
 
 function sanitizePr(p) {
