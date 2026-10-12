@@ -10619,6 +10619,50 @@ _KUBECTL_VALUE_FLAGS = frozenset({"-n", "--namespace", "--context", "--kubeconfi
                                   "--token", "--request-timeout"})
 
 
+def _shell_group_end(s, i):
+    """For a substitution whose `(` ends just before i, (index past its `)`,
+    closed). Quotes, backslash escapes and `#` comments inside it are text,
+    so `$(echo ')'; make)` and `$(echo \\'); make` close where bash does.
+    An unclosed one runs to the end (its rest is read as the body: work)."""
+    depth, quote, n = 1, "", len(s)
+    while i < n:
+        c = s[i]
+        if quote == "'":
+            if c == "'":
+                quote = ""
+        elif c == "\\":
+            i += 1
+        elif quote:
+            if c == '"':
+                quote = ""
+        elif c in ("'", '"'):
+            quote = c
+        elif c == "#" and (i == 0 or s[i - 1] in " \t\n;&|("):
+            while i + 1 < n and s[i + 1] != "\n":
+                i += 1
+        elif c == "(":
+            depth += 1
+        elif c == ")":
+            depth -= 1
+            if not depth:
+                return i + 1, True
+        i += 1
+    return n, False
+
+
+def _shell_tick_end(s, i):
+    """For a backtick that opened just before i, (index past its closing
+    backtick, closed); a backslash escapes the next character."""
+    n = len(s)
+    while i < n:
+        if s[i] == "\\":
+            i += 1
+        elif s[i] == "`":
+            return i + 1, True
+        i += 1
+    return n, False
+
+
 def _shell_segments(command):
     """A command line as segments (split on `;` `&&` `||` `&` newline) of
     pipeline stages (split on `|`) of words — a deliberately small tokenizer:
@@ -10626,8 +10670,7 @@ def _shell_segments(command):
     Anything it cannot model just yields words no rule matches, i.e. `work`."""
     segs, stages, words = [], [], []
     word, in_word = [], False
-    quote, depth, tick = "", 0, False
-    inner = ""   # a quote open inside a substitution: its parens are text
+    quote = ""
     s = str(command or "")
     n = len(s)
 
@@ -10664,21 +10707,6 @@ def _shell_segments(command):
                 word.append(c)
             i += 1
             continue
-        if depth or tick:
-            word.append(c)
-            if inner:
-                if c == inner:
-                    inner = ""
-            elif c in ("'", '"'):
-                inner = c
-            elif c == "`" and not depth:
-                tick = False
-            elif c == "(":
-                depth += 1
-            elif c == ")":
-                depth -= 1
-            i += 1
-            continue
         if c in ("'", '"'):
             quote, in_word = c, True
         elif c == "\\" and i + 1 < n:
@@ -10687,12 +10715,16 @@ def _shell_segments(command):
                 word.append(s[i])
                 in_word = True
         elif c in "$<>" and i + 1 < n and s[i + 1] == "(":
-            word.append(c + "(")   # `<(…)`/`>(…)` run their body like `$(…)`
-            in_word, depth = True, 1
-            i += 1
+            # `<(…)`/`>(…)` run their body like `$(…)`; the whole group is one word.
+            j, _ = _shell_group_end(s, i + 2)
+            word.append(s[i:j])
+            in_word, i = True, j
+            continue
         elif c == "`":
-            word.append(c)
-            in_word, tick = True, True
+            j, _ = _shell_tick_end(s, i + 1)
+            word.append(s[i:j])
+            in_word, i = True, j
+            continue
         elif c == "#" and not in_word:
             while i + 1 < n and s[i + 1] != "\n":
                 i += 1
@@ -10854,17 +10886,13 @@ def _shell_subst_bodies(word):
         if word.startswith("$((", i) and _shell_arith_end(word, i) is not None:
             i += 3
         elif word.startswith(("$(", "<(", ">("), i):
-            depth, j = 1, i + 2
-            while j < n and depth:
-                depth += {"(": 1, ")": -1}.get(word[j], 0)
-                j += 1
-            out.append(word[i + 2:j - 1 if not depth else j])
+            j, closed = _shell_group_end(word, i + 2)
+            out.append(word[i + 2:j - 1 if closed else j])
             i = j
         elif word[i] == "`":
-            j = word.find("`", i + 1)
-            j = n if j < 0 else j
-            out.append(word[i + 1:j])
-            i = j + 1
+            j, closed = _shell_tick_end(word, i + 1)
+            out.append(word[i + 1:j - 1 if closed else j])
+            i = j
         else:
             i += 1
     return out
