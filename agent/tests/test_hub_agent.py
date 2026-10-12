@@ -8731,7 +8731,8 @@ class TestWindowsManagerBoot(ManagerMixin, unittest.TestCase):
         with mock.patch.object(ha, "IS_WINDOWS", is_windows), \
                 mock.patch.object(ha, "_start_poke_listener",
                                   side_effect=lambda: poke_started.append(True)), \
-                mock.patch.object(ha.signal, "signal", side_effect=fake_signal):
+                mock.patch.object(ha.signal, "signal", side_effect=fake_signal), \
+                mock.patch.object(ha.signal, "set_wakeup_fd"):  # process-wide: don't leak it
             try:
                 sm.run_forever()
             except _Stop:
@@ -26311,6 +26312,7 @@ class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
 
         with mock.patch.object(ha, "IS_WINDOWS", False), \
              mock.patch.object(ha.signal, "signal"), \
+             mock.patch.object(ha.signal, "set_wakeup_fd"), \
              mock.patch.object(sm, "_start_dsh_web"), \
              mock.patch.object(sm, "_beat_once", side_effect=fake_beat), \
              mock.patch.object(ha.time, "time", side_effect=lambda: clock[0]), \
@@ -26394,6 +26396,7 @@ class TestPokedBeatIsLight(ManagerMixin, unittest.TestCase):
 
         with mock.patch.object(ha, "IS_WINDOWS", False), \
              mock.patch.object(ha.signal, "signal"), \
+             mock.patch.object(ha.signal, "set_wakeup_fd"), \
              mock.patch.object(sm, "_start_dsh_web"), \
              mock.patch.object(sm, "_beat_once", side_effect=fake_beat), \
              mock.patch.object(ha.time, "time", side_effect=lambda: wall[0]), \
@@ -26429,11 +26432,16 @@ class TestPokeHeartbeat(unittest.TestCase):
         self.addCleanup(signal.setitimer, signal.ITIMER_REAL, 0)
         signal.setitimer(signal.ITIMER_REAL, secs)
 
+    def _install(self):
+        # The real installer, undone afterwards: the wakeup fd is process-wide.
+        prev = signal.getsignal(signal.SIGUSR1)
+        self.addCleanup(signal.signal, signal.SIGUSR1, prev)
+        self.addCleanup(signal.set_wakeup_fd, -1)
+        ha._install_sigusr1()
+
     def test_sigusr1_sets_the_poke_event_and_cuts_the_wait_short(self):
         self._arm_deadline(30)
-        prev = signal.getsignal(signal.SIGUSR1)
-        signal.signal(signal.SIGUSR1, ha._on_sigusr1)
-        self.addCleanup(signal.signal, signal.SIGUSR1, prev)
+        self._install()
 
         ha._poke.clear()
         # Without a poke, wait() blocks up to the timeout and returns False.
@@ -26457,9 +26465,16 @@ class TestPokeHeartbeat(unittest.TestCase):
         # manager, or RecursionError out of run_forever. Drive the real shape:
         # this (main) thread loops clear()/wait() like run_forever while another
         # process fires SIGUSR1 as fast as it can.
-        prev = signal.getsignal(signal.SIGUSR1)
-        signal.signal(signal.SIGUSR1, ha._on_sigusr1)
-        self.addCleanup(signal.signal, signal.SIGUSR1, prev)
+        # XERK-1606: a Python-function handler still nested here (~15 deep
+        # unloaded, the full recursion limit under suite load), so the burst runs
+        # with the limit just above the current depth: nesting then fails it on
+        # some runs even unloaded; the handler-type test below is the sure gate.
+        self._install()
+        depth, f = 0, sys._getframe()
+        while f:
+            depth, f = depth + 1, f.f_back
+        prev_limit = sys.getrecursionlimit()
+        self.addCleanup(sys.setrecursionlimit, prev_limit)
 
         sender = subprocess.Popen([sys.executable, "-c",
             "import os, signal, sys\n"
@@ -26469,6 +26484,7 @@ class TestPokeHeartbeat(unittest.TestCase):
         self.addCleanup(sender.kill)
         self._arm_deadline(60)
         waits = 0
+        sys.setrecursionlimit(depth + 8)  # clear/wait + the SIGALRM handler fit
         try:
             while sender.poll() is None:
                 ha._poke.clear()
@@ -26478,12 +26494,22 @@ class TestPokeHeartbeat(unittest.TestCase):
             self.fail(f"the wait loop wedged under a SIGUSR1 burst after {waits} waits")
         except RecursionError:
             self.fail("a SIGUSR1 burst nested handlers into RecursionError")
+        finally:
+            sys.setrecursionlimit(prev_limit)
         self.assertEqual(sender.returncode, 0)
         # The loop still works after the storm: a poke wakes it, quiet sleeps.
         ha._poke.clear()
         self.assertFalse(ha._poke.wait(0.05))
         os.kill(os.getpid(), signal.SIGUSR1)
         self.assertTrue(ha._poke.wait(5))
+
+    def test_the_installed_sigusr1_handler_runs_no_python(self):
+        # The deterministic half of XERK-1606: CPython nests a pending signal's
+        # handler at any bytecode boundary, including one inside a running
+        # Python handler, so only a handler with NO bytecode can't recurse.
+        self._install()
+        self.assertIsInstance(signal.getsignal(signal.SIGUSR1), types.BuiltinFunctionType)
+        self.assertEqual(signal.set_wakeup_fd(ha._poke._w), ha._poke._w)
 
     def test_a_poke_flood_with_no_waiter_never_blocks_the_setter(self):
         # The pipe's capacity is finite; set() past it must drop (a poke is
@@ -43255,6 +43281,7 @@ class TestPermissionJudge(ManagerMixin, unittest.TestCase):
         self.sm.permission_policy = None
         with mock.patch.object(ha, "IS_WINDOWS", False), \
              mock.patch.object(ha.signal, "signal"), \
+             mock.patch.object(ha.signal, "set_wakeup_fd"), \
              mock.patch.object(self.sm, "_start_dsh_web"), \
              mock.patch.object(self.sm, "_start_permission_judge"), \
              mock.patch.object(self.sm, "resume_on_boot"), \
