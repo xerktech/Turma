@@ -6228,7 +6228,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         for run in ("cat f | /usr/bin/env sh", "cat f | /usr/bin/sudo sh", "cat f | \\env sh",
                     "${x}env sh < f", "$(true)env sh < f", '\\env sh -c "$(cat f)"',
                     "cat f | \\command sh", "cat f | /usr/bin/timeout 5 sh",
-                    'case x in x)env sh -c "$(cat f)";; esac', "cat f | /bin/busybox sh"):
+                    'case x in x)env sh -c "$(cat f)";; esac', "cat f | /bin/busybox sh",
+                    "cat f | $@env sh", "$*nohup sh < f", '$!exec sh -c "$(cat f)"'):
             with self.subTest(run=run):
                 cmd = "echo 'rm -rf /etc' > f; " + run
                 self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
@@ -6244,7 +6245,7 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         # began a command start whose assignment loop ran to the line's end.
         for text in (": a" + "-busybox" * 20000, "A=env " * 20000, "A=busybox " * 20000,
                      "A=:busybox " * 20000, "A=x,toybox " * 20000, "A=-env " * 20000,
-                     "A=!env " * 20000):
+                     "A=%env " * 20000):
             for name in ("_RUNS_UNNAMED_RE", "_C_OR_EVAL_RE", "_UNREAD_SINK_SHELL_RE"):
                 with self.subTest(regex=name, text=text[:12]):
                     start = time.process_time()
