@@ -68,11 +68,10 @@ internal fun ModelQualitySection(
                 return@Column
             }
             val base = ModelQuality.baselines(groups)
-            val rework = ModelQuality.hasRework(groups)
             val shadow = ModelQuality.hasShadow(groups)
             ModelQuality.ordered(groups).forEachIndexed { i, g ->
                 if (i > 0) HorizontalDivider(thickness = 1.dp, color = MaterialTheme.colorScheme.outlineVariant)
-                GroupBlock(g, ModelQuality.opusRate(g, base), rework, shadow)
+                GroupBlock(g, ModelQuality.opusRate(g, base), shadow)
             }
             if (ui.org.isEmpty()) {
                 Text(ModelQuality.PICK_ORG, color = muted, modifier = Modifier.padding(top = 12.dp))
@@ -87,7 +86,7 @@ internal fun ModelQualitySection(
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun GroupBlock(g: ModelQualityGroup, opus: Double?, rework: Boolean, shadow: Boolean) {
+private fun GroupBlock(g: ModelQualityGroup, opus: Double?, shadow: Boolean) {
     Column(Modifier.fillMaxWidth().padding(vertical = 10.dp)) {
         Text(
             buildAnnotatedString {
@@ -110,10 +109,8 @@ private fun GroupBlock(g: ModelQualityGroup, opus: Double?, rework: Boolean, sha
             Stat("Bad rate", ModelQuality.pct(ModelQuality.badRate(g)))
             // No Opus figure for Opus itself or a class with none decided: no bare "—".
             if (opus != null) Stat("Opus", ModelQuality.pct(opus))
-            if (rework) {
-                Stat("QA passes", ModelQuality.median(g.rework?.qaPasses))
-                Stat("CI rounds", ModelQuality.median(g.rework?.ciRounds))
-            }
+            // Rework medians this group reported; one it did not is left off (web phone).
+            for ((label, value) in ModelQuality.reworkStats(g)) Stat(label, value)
             if (shadow) Stat("Shadow pairs", ModelQuality.shadow(g))
             val status = ModelQuality.status(g)
             if (status != "—") Stat("Status", status)

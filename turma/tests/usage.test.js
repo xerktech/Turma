@@ -1675,11 +1675,13 @@ test("XERK-1849: classes order by total sessions, Opus first inside each", () =>
 
 test("XERK-1849: rework and shadow columns appear only once the hub serves them", () => {
   const plain = H.modelQualityCardHtml({ groups: [mqG({ model: "sonnet", sessions: 1 })] }, MQ_NOW);
-  assert.doesNotMatch(plain, /QA passes|Shadow pairs/);
+  assert.doesNotMatch(plain, /QA runs|CI rounds|Shadow pairs/);
   const served = H.modelQualityCardHtml({ groups: [mqG({ model: "sonnet", sessions: 1,
-    rework: { qaPasses: 1.5, ciRounds: 2 }, shadow: { pairs: 23, candidateOnlyBad: 1 }, promotion: "candidate" })] }, MQ_NOW);
-  assert.match(served, /data-label="QA passes">1.5</);
-  assert.match(served, /data-label="CI rounds">2</);
+    rework: { qaRuns: { median: 1.5, n: 4 }, ciRounds: { median: 2, n: 3 } }, shadow: { pairs: 23, candidateOnlyBad: 1 }, promotion: "candidate" })] }, MQ_NOW);
+  assert.match(served, /data-label="QA runs" title="median of 4 sessions">1.5</);
+  assert.match(served, /data-label="CI rounds" title="median of 3 sessions">2</);
+  // A signal no group reported gets no column at all.
+  assert.doesNotMatch(served, /Changes requested|QA failed/);
   assert.match(served, /data-label="Shadow pairs">23 · 1 worse</);
   assert.match(served, /data-label="Status">candidate</);
 });
@@ -1771,7 +1773,7 @@ test("XERK-1849: a failed refresh keeps that org's view; rework with no figures 
     fail = true;
     await H10.refreshModelQuality();
     assert.match(H10.els.modelQuality.innerHTML, /A-1/);
-    assert.doesNotMatch(H10.els.modelQuality.innerHTML, /QA passes/);
+    assert.doesNotMatch(H10.els.modelQuality.innerHTML, /QA runs/);
   } finally { orgKeys = saved; }
 });
 
@@ -1783,8 +1785,9 @@ test("XERK-1849: an outcome named like an Object member reads pending", () => {
 });
 
 test("XERK-1849: a rework block with no figure adds no column", () => {
-  const html = H.modelQualityCardHtml({ groups: [mqG({ sessions: 1, rework: { qaPasses: null, ciRounds: "n/a" } })] }, MQ_NOW);
-  assert.doesNotMatch(html, /QA passes/);
+  const html = H.modelQualityCardHtml({ groups: [mqG({ sessions: 1,
+    rework: { qaRuns: { median: null, n: 0 }, ciRounds: "n/a", constructor: { median: 1 } } })] }, MQ_NOW);
+  assert.doesNotMatch(html, /QA runs|CI rounds/);
 });
 
 test("XERK-1849: the drill-down names the org as the header does", async () => {

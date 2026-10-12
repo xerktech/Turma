@@ -74,10 +74,17 @@ object ModelQuality {
         g.undelivered.takeIf { it > 0 }?.let { "$it undelivered" },
     ).joinToString(" · ")
 
-    /** Whether any group carries rework / shadow figures (web `mqColumns`). */
-    fun hasRework(groups: List<ModelQualityGroup>) = groups.any { g ->
-        g.rework?.let { it.qaPasses != null || it.ciRounds != null } == true
-    }
+    /** Rework signals in display order, with their labels (web `MQ_REWORK`). */
+    val REWORK = listOf(
+        "qaRuns" to "QA runs", "qaFail" to "QA failed", "ciRounds" to "CI rounds",
+        "changesRequested" to "Changes requested",
+    )
+
+    /** The rework stats [g] carries, label → median, in [REWORK] order (the web phone layout). */
+    fun reworkStats(g: ModelQualityGroup): List<Pair<String, String>> =
+        REWORK.mapNotNull { (k, label) -> g.rework[k]?.let { label to median(it.median) } }
+
+    /** Whether any group carries shadow figures (web `mqColumns`). */
     fun hasShadow(groups: List<ModelQualityGroup>) = groups.any { it.shadow != null }
 
     /** Classes by total sessions, Opus first inside each, then by sessions (web `mqOrdered`). */

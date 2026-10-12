@@ -86,8 +86,11 @@ This file is the operative rules for what has shipped.
   since the route serves rows for one named org. Several or none → "Pick one org…".
 - **Bad rate = bad ÷ (good + bad)**; pending, no-change and undelivered say nothing about code
   quality. The Opus column is that class's Opus bad rate (the baseline), never a fleet average.
-- **Fields the later seams serve, read by both clients when present** (absent = column hidden,
-  not a column of dashes): per group `rework: {qaPasses, ciRounds}` medians (XERK-1845),
+- **Rework renders one column per signal some group reported** (`MQ_REWORK` / Android
+  `ModelQuality.REWORK`: qaRuns, qaFail, ciRounds, changesRequested): the cell is its `median`,
+  `n` in the hover. A signal with no finite median is absent, never 0. A new signal needs a
+  label on BOTH clients or it stays hidden.
+- **Fields the later seams will serve, read when present** (absent = column hidden): per group
   `shadow: {pairs, candidateOnlyBad}` (XERK-1847), `promotion` string (XERK-1848). A seam that
   names them differently must change both clients in the same PR.
 - **Android reads the route field by field** (`parseModelQuality` over a raw `JsonElement`), not

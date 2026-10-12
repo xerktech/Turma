@@ -35,15 +35,16 @@ data class ModelQualityGroup(
     val undelivered: Int = 0,
     /** Why the bad sessions were bad: reason → count. */
     val reasons: Map<String, Int> = emptyMap(),
-    val rework: ModelQualityRework? = null,
+    /** Rework signal → its median over the sessions that reported it (XERK-1845). */
+    val rework: Map<String, ModelQualityRework> = emptyMap(),
     val shadow: ModelQualityShadow? = null,
     val promotion: String? = null,
 )
 
-/** Rework medians per session (XERK-1845). */
+/** One rework signal: its [median] over the [n] sessions that reported it. */
 data class ModelQualityRework(
-    val qaPasses: Double? = null,
-    val ciRounds: Double? = null,
+    val median: Double,
+    val n: Int = 0,
 )
 
 /** Graded shadow pairs (XERK-1847), and how many the candidate lost to Opus. */
@@ -100,7 +101,10 @@ private fun parseGroup(g: JsonObject) = ModelQualityGroup(
     noChange = g["no-change"].count(),
     undelivered = g["undelivered"].count(),
     reasons = g["reasons"].obj()?.mapValues { it.value.count() }.orEmpty(),
-    rework = g["rework"].obj()?.let { ModelQualityRework(it["qaPasses"].num(), it["ciRounds"].num()) },
+    // A signal with no usable median is left out, never read as 0 (web `mqSignal`).
+    rework = g["rework"].obj()?.mapNotNull { (k, v) ->
+        v.obj()?.let { o -> o["median"].num()?.let { k to ModelQualityRework(it, o["n"].count()) } }
+    }?.toMap().orEmpty(),
     shadow = g["shadow"].obj()?.let { ModelQualityShadow(it["pairs"].count(), it["candidateOnlyBad"].count()) },
     promotion = g["promotion"].str(),
 )

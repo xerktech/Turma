@@ -45,12 +45,10 @@ class ModelQualityTest {
         assertEquals("—", ModelQuality.shadow(plain))
         assertEquals("—", ModelQuality.status(plain))
         assertEquals("baseline", ModelQuality.status(g("bug", "opus")))
-        assertFalse(ModelQuality.hasRework(listOf(plain)))
-        val served = plain.copy(rework = ModelQualityRework(qaPasses = 1.5, ciRounds = 2.0),
+        assertTrue(ModelQuality.reworkStats(plain).isEmpty())
+        val served = plain.copy(rework = mapOf("ciRounds" to ModelQualityRework(2.0, 3), "qaRuns" to ModelQualityRework(1.5, 4)),
             shadow = ModelQualityShadow(pairs = 23, candidateOnlyBad = 1), promotion = "candidate")
-        assertTrue(ModelQuality.hasRework(listOf(served)))
-        assertEquals("1.5", ModelQuality.median(served.rework?.qaPasses))
-        assertEquals("2", ModelQuality.median(served.rework?.ciRounds))
+        assertEquals(listOf("QA runs" to "1.5", "CI rounds" to "2"), ModelQuality.reworkStats(served))
         assertEquals("—", ModelQuality.median(Double.NaN))
         assertEquals("23 · 1 worse", ModelQuality.shadow(served))
         assertEquals("candidate", ModelQuality.status(served))
@@ -78,15 +76,14 @@ class ModelQualityTest {
     @Test fun `a wrong-typed field drops to its default instead of failing the card`() {
         val v = parseModelQuality(TurmaJson.parseToJsonElement(
             """{"windowDays":90.5,"groups":[null,{"cls":"bug","model":"sonnet","sessions":1.5,"good":3000000000,
-              "promotion":{"x":1},"rework":{"qaPasses":"n/a","ciRounds":2},"reasons":{"x":null}}],
+              "promotion":{"x":1},"rework":{"qaRuns":{"median":"n/a","n":2},"qaFail":[1],"ciRounds":{"median":2,"n":3}},"reasons":{"x":null}}],
               "rows":[null,{"issue":"A-1","updatedAt":"x","prs":[null]}]}"""))
         assertEquals(90, v.windowDays)
         val g = v.groups.single()
         assertEquals(1, g.sessions)
         assertEquals(Int.MAX_VALUE, g.good)
         assertNull(g.promotion)
-        assertNull(g.rework?.qaPasses)
-        assertEquals(2.0, g.rework?.ciRounds!!, 0.0)
+        assertEquals(mapOf("ciRounds" to ModelQualityRework(2.0, 3)), g.rework)
         assertEquals(mapOf("x" to 0), g.reasons)
         assertNull(v.rows.single().updatedAt)
         assertTrue(v.rows.single().prs.isEmpty())
@@ -96,6 +93,8 @@ class ModelQualityTest {
     }
 
     @Test fun `rework with no figures adds no column, as on the web`() {
-        assertFalse(ModelQuality.hasRework(listOf(g("bug", "sonnet").copy(rework = ModelQualityRework()))))
+        val v = parseModelQuality(TurmaJson.parseToJsonElement(
+            """{"groups":[{"cls":"bug","model":"opus","rework":{"qaRuns":{"median":null,"n":0}}}]}"""))
+        assertTrue(ModelQuality.reworkStats(v.groups.single()).isEmpty())
     }
 }
