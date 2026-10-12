@@ -14603,6 +14603,82 @@ test("XERK-1860: the drain enforces the cap — children queued while blocked go
   resetEpicRuns();
 });
 
+// XERK-1862: pause/cancel must withdraw the children the DRIVER already put in the
+// hub queue — else a freed slot dispatches them all, breaking "a paused run
+// dispatches nothing". A human's own Start on a child is never withdrawn.
+const fullBeat = (free) => asBeat("edCapA", "e1860.atlassian.net",
+  { autoStart: false, capacity: { maxSessions: 20, running: 20 - free - 1, queued: 0, free },
+    tickets: capTickets() });
+
+test("XERK-1862: pausing a run withdraws its queued children; resume re-queues them", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  if (agents.edCapA) agents.edCapA.commands = [];
+  const site = "e1860.atlassian.net";
+  await fullBeat(0);
+  armEpicRun(site, "G-1");
+  armEpicRun(site, "K-1");
+  capRound();
+  const live = () => ticketQueue.filter((e) => !e.expiredAt).map((e) => e.issueKey).sort();
+  assert.deepEqual(live(), ["H-1", "H-2", "H-3", "L-1", "L-2", "L-3"]);
+  assert.deepEqual(spawnedKeys("edCapA"), []);
+  setEpicRunPaused(site, "G-1", true);
+  // Only the paused epic's entries leave; the other epic's stay in line.
+  assert.deepEqual(live(), ["L-1", "L-2", "L-3"]);
+  await fullBeat(19);
+  capRound();
+  assert.deepEqual(spawnedKeys("edCapA").sort(), ["L-1", "L-2", "L-3"]);
+  // Resume: the withdrawn children are re-queued at once (no backoff wait) and go.
+  setEpicRunPaused(site, "G-1", false);
+  capRound();
+  assert.deepEqual(spawnedKeys("edCapA").filter((k) => k[0] === "H").sort(),
+    ["H-1", "H-2", "H-3"]);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
+test("XERK-1862: cancelling a capped run releases none of its queued children", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  if (agents.edCapA) agents.edCapA.commands = [];
+  const site = "e1860.atlassian.net";
+  await fullBeat(0);
+  armEpicRun(site, "G-1", undefined, { maxConcurrent: 1 });
+  capRound();
+  assert.equal(ticketQueue.filter((e) => !e.expiredAt).length, 1);
+  assert.ok(clearEpicRun(site, "G-1"));
+  assert.equal(ticketQueue.length, 0);
+  await fullBeat(19);
+  capRound();
+  assert.deepEqual(spawnedKeys("edCapA"), []);
+  resetEpicRuns();
+});
+
+test("XERK-1862: a human's Start on a child survives its run's pause and cancel", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  if (agents.edCapA) agents.edCapA.commands = [];
+  const site = "e1860.atlassian.net";
+  await fullBeat(0);
+  // Clicked BEFORE the run queued it, and clicked AFTER (claims the driver's entry).
+  assert.ok(enqueueTicketStart(site, "H-1", "manual"));
+  armEpicRun(site, "G-1");
+  capRound();
+  assert.ok(enqueueTicketStart(site, "H-2", "manual"));
+  setEpicRunPaused(site, "G-1", true);
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey).sort(), ["H-1", "H-2"]);
+  clearEpicRun(site, "G-1");
+  assert.deepEqual(ticketQueue.map((e) => e.issueKey).sort(), ["H-1", "H-2"]);
+  await fullBeat(19);
+  capRound();
+  assert.deepEqual(spawnedKeys("edCapA").sort(), ["H-1", "H-2"]);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
 test("XERK-1860: cap-held siblings never hold each other through the launch grace", async () => {
   resetAutoStart();
   resetEpicRuns();

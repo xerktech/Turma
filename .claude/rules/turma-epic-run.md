@@ -88,6 +88,12 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   - `epicRunCompleteSweep` — `continue`s a paused run, so it never writes the epic Done while held.
   - `anyArmedEpicRun` EXCLUDES paused runs (`state !== "done" && !paused`) — a paused run is not a
     reason to run the XERK-550 sweeps, and its children are skipped anyway.
+- **Pause AND cancel withdraw the run's children from the hub queue** (XERK-1862,
+  `withdrawEpicRunQueue`): a driver-queued child is a MANUAL entry, so the drain would dispatch it.
+  - The driver tags its entry `epicRun: <runKey>` (hub-only, never on the payload); only tagged
+    entries are withdrawn, and their `epicChildAttempts` backoff is cleared so Resume re-queues at once.
+  - A human's Start clears the tag (`enqueueTicketStart`), so a deliberate click is never withdrawn.
+  - Tests: the `XERK-1862:` cases in `server.test.js`.
 - **A re-arm PRESERVES the hold** (like `startedAt`): arming is "rebuild the plan", not "resume it"
   — only `{resume:true}` lifts a pause. So a paused-then-re-armed run stays held.
 - This is the "already-running sessions are left alone, just don't start more" contract: pause stops

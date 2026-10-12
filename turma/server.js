@@ -3197,6 +3197,7 @@ function clearEpicRun(siteKey, epicKey) {
   const k = epicRunKey(siteKey, epicKey);
   if (!(k in epicRuns)) return false;
   delete epicRuns[k];
+  withdrawEpicRunQueue(k, "its epic run was cancelled");
   persistEpicRuns();
   invalidateAgentsCache();
   sseBroadcast("epicRuns", epicRuns);
@@ -3217,11 +3218,27 @@ function setEpicRunPaused(siteKey, epicKey, paused) {
   const want = !!paused;
   if (!!run.paused === want) return run;   // idempotent
   if (want) run.paused = true; else delete run.paused;
+  if (want) withdrawEpicRunQueue(epicRunKey(siteKey, epicKey), "its epic run was paused");
   run.updatedAt = Date.now();
   persistEpicRuns();
   invalidateAgentsCache();
   sseBroadcast("epicRuns", epicRuns);
   return run;
+}
+// Take the children the DRIVER put in the hub queue for this run back out
+// (XERK-1862). A queued child is a MANUAL entry, so drainTicketQueue would
+// otherwise dispatch every one of them on the next free slot — a paused run
+// would start work, and a cancelled capped run would release all its held
+// children at once. Only entries tagged `epicRun` go: a human's own Start on a
+// child is untagged (or had the tag cleared by the click), and stays. The
+// child's backoff is cleared too, so a Resume re-queues it on the next sweep.
+function withdrawEpicRunQueue(runKey, why) {
+  for (const e of ticketQueue.filter((q) => q.epicRun === runKey && !q.expiredAt)) {
+    dropQueuedTicket(e.siteKey, e.issueKey, why);
+    const k = ticketQueueKey(e.siteKey, e.issueKey);
+    epicChildAttempts.delete(k);
+    guardStoreDel("epicChildAttempts", k);
+  }
 }
 // Set or clear (null) an armed run's cap on concurrently-working children
 // (XERK-1860) without rebuilding its DAG. Null when no run is armed. Lowering the
@@ -3927,7 +3944,10 @@ function epicRunDriveSweep() {
         if (active === null) active = epicRunActiveCount(run, rows, now);
         if (active >= run.maxConcurrent) continue;
       }
-      if (!enqueueTicketStart(siteKey, childKey, "manual")) continue;
+      const queued = enqueueTicketStart(siteKey, childKey, "manual");
+      if (!queued) continue;
+      // Hub-only tag (never on the payload): pause/cancel withdraws it (XERK-1862).
+      queued.epicRun = runKey;
       if (active !== null) active++;
       const attempts = Math.min((prior ? prior.attempts : 0) + 1, AUTO_START_BACKOFF_STEPS);
       const rec = { attempts, nextAt: autoStartRetryAt(now, attempts), at: now };
@@ -13811,6 +13831,10 @@ function enqueueTicketStart(siteKey, issueKey, source, priority) {
       existing.source = "manual";
       publishTicketQueue();
     }
+    // A human's click on a child its epic run queued claims the entry, so the
+    // run's pause/cancel no longer withdraws it (XERK-1862). The driver only
+    // queues a child with no live entry, so it never reaches this line.
+    if (source === "manual") delete existing.epicRun;
     return existing;
   }
   // Asking again after it gave up REPLACES the note with a fresh place in line,
