@@ -226,7 +226,12 @@ test("XERK-1450: a late-landed file is repaired by the wired onLanded", async ()
     const realGet = store.getToFile;
     store.getToFile = async (k, dest) => { fs.copyFileSync(jsonl, dest); return true; };
     await mirror.retryBlocked();
-    await new Promise((r) => setImmediate(r));
+    // The repair is fire-and-forget on a later tick and does async file work, so one
+    // tick is not enough on a loaded box: poll for it, bounded.
+    const deadline = Date.now() + 5000;
+    while (fs.readFileSync(jsonl, "utf8") !== once && Date.now() < deadline) {
+      await new Promise((r) => setTimeout(r, 10));
+    }
     assert.equal(mirror.blockedCount(), 0);
     assert.equal(fs.readFileSync(jsonl, "utf8"), once);
     store.getToFile = realGet;
