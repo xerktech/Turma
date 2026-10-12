@@ -14914,12 +14914,14 @@ def _sent_count(cap, text):
     return split[0].count(want)
 
 
-def _composer_state(cap, text, sent_before=None):
+def _composer_state(cap, text, sent_before=None, held=False):
     """Where `text` is on the pane: "holds" when the composer still ends with
     it (its Enter read as a line break); "sent" when it shows above the
     composer more often than `sent_before` (None: no baseline, so never
-    "sent"); else None — can't tell, which includes a loaded TUI that has not
-    drawn the typed text yet. Whitespace is ignored: the composer wraps."""
+    "sent"), or when `held` (the composer showed it before Enter) and the box
+    now shows none of it; else None — can't tell, which includes a loaded TUI
+    that has not drawn the typed text yet. Whitespace is ignored: the composer
+    wraps."""
     split, want = _composer_split(cap), _composer_tail(text)
     if split is None or not want:
         return None
@@ -14928,6 +14930,13 @@ def _composer_state(cap, text, sent_before=None):
         return "holds"
     if sent_before is not None and above.count(want) > sent_before:
         return "sent"
+    if held:
+        # The text left a composer that drew it: submitted. The count above
+        # can miss it on a short pane, where the turn wraps or scrolls off
+        # (XERK-1853). A fragment of the text is a redraw: keep watching.
+        shown = box[1:] if box.startswith("\u276f") else box
+        if not shown or shown not in _composer_norm(text):
+            return "sent"
     return None
 
 
@@ -14953,11 +14962,13 @@ def _await_slice_drawn(tmux_name, typed, deadline):
 
 def _submit_typed(tmux_name, text, press_enter):
     """Submit TYPED text: settle, Enter, then watch the pane until the text is
-    a NEW submitted turn or a turn is running, pressing Enter again whenever the
-    composer still holds it (bounded by TYPED_SUBMIT_MAX_RETRIES and
+    a NEW submitted turn, gone from a composer that showed it, or a turn is
+    running, pressing Enter again whenever the composer still holds it (bounded by TYPED_SUBMIT_MAX_RETRIES and
     TYPED_SUBMIT_DEADLINE_SEC). A read that can't tell keeps watching."""
     time.sleep(TYPED_SUBMIT_SETTLE_SEC)
-    sent_before = _sent_count(_capture_pane(tmux_name), text)
+    before = _capture_pane(tmux_name)
+    sent_before = _sent_count(before, text)
+    held = _composer_state(before, text) == "holds"
     press_enter()
     deadline = time.monotonic() + TYPED_SUBMIT_DEADLINE_SEC
     presses = 0
@@ -14966,7 +14977,7 @@ def _submit_typed(tmux_name, text, press_enter):
         cap = _capture_pane(tmux_name)
         if cap is None or _busy_from_capture(cap):
             return
-        state = _composer_state(cap, text, sent_before)
+        state = _composer_state(cap, text, sent_before, held)
         if state == "sent":
             return
         if state == "holds":

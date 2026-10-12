@@ -240,6 +240,46 @@ test("XERK-1839: one host or org churning sessions cannot evict the rest of the 
   assert.ok(all.filter((r) => r.host === "evil").length <= Math.floor(L.MAX_ROWS / 4));
 });
 
+test("XERK-1853: a host reporting more sessions than its cap stops churning its rows", () => {
+  L._internals.reset();
+  const per = Math.floor(L.MAX_ROWS / 4);
+  const sweep = () => Array.from({ length: per + 10 }, (_, i) => obs({ host: "big", sid: `b${i}` }));
+  const first = L.observe(sweep(), T0);
+  assert.equal(first.length, per);
+  const held = new Map([...L._internals.rows().values()].map((r) => [r.key, r.firstSeen]));
+  // Nothing changed: no row is re-created, so none is upserted or deleted.
+  assert.equal(L.observe(sweep(), T0 + 15000).length, 0);
+  assert.equal(L.observe(sweep(), T0 + 30000).length, 0);
+  const rows = [...L._internals.rows().values()];
+  assert.equal(rows.length, per);
+  for (const r of rows) assert.equal(r.firstSeen, held.get(r.key));
+  // Just past the cap is over it too.
+  L._internals.reset();
+  const edge = () => Array.from({ length: per + 1 }, (_, i) => obs({ host: "edge", sid: `e${i}` }));
+  L.observe(edge(), T0);
+  assert.equal(L.observe(edge(), T0 + 15000).length, 0);
+});
+
+test("XERK-1853: a full host still records its current sessions over rows it stopped reporting", () => {
+  L._internals.reset();
+  const per = Math.floor(L.MAX_ROWS / 4);
+  const old = Array.from({ length: per }, (_, i) => obs({ host: "h", sid: `old${i}` }));
+  L.observe(old, T0);
+  // Under its cap: a new session evicts the oldest row.
+  L.observe([obs({ host: "h", sid: "fresh" })], T0 + 1);
+  let rows = [...L._internals.rows().values()];
+  assert.equal(rows.length, per);
+  assert.ok(rows.some((r) => r.sid === "fresh"));
+  assert.ok(!rows.some((r) => r.sid === "old0"));
+  // Over its cap with only stale rows held: it fills with what it reports now.
+  const now = Array.from({ length: per + 5 }, (_, i) => obs({ host: "h", sid: `new${i}` }));
+  L.observe(now, T0 + 2);
+  rows = [...L._internals.rows().values()];
+  assert.equal(rows.length, per);
+  assert.ok(rows.every((r) => r.sid.startsWith("new")));
+  assert.equal(L.observe(now, T0 + 3).length, 0);
+});
+
 test("XERK-1839: /metrics label sets stay bounded whatever models the agents report", () => {
   L._internals.reset();
   L.observe(Array.from({ length: 300 }, (_, i) => obs({ sid: `m${i}`, modelActual: `local-model-${i}`,

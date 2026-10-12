@@ -179,6 +179,8 @@ function observe(observations, now = Date.now()) {
   }
   const changed = new Map();
   const ticketDone = new Map();     // [site, issue] -> {cat, resolvedAt} seen this sweep
+  const seen = [];
+  const reported = new Map();       // host -> distinct sessions it reports this sweep
   for (const o of observations) {
     if (!o || typeof o !== "object") continue;
     const base = sanitizeRow({
@@ -186,7 +188,27 @@ function observe(observations, now = Date.now()) {
       cls: o.type, model: "x", firstSeen: now, updatedAt: now,
     });
     if (!base) continue;
+    seen.push([o, base]);
+    if (!reported.has(base.host)) reported.set(base.host, new Set());
+    reported.get(base.host).add(base.key);
+  }
+  // A host reporting more sessions than its cap only fills the rows it has
+  // room for: past it a new row evicts one the host still reports, which comes
+  // back next sweep — losing its firstSeen and rewriting the backend each sweep.
+  // Only rows it still reports take room; evicting the others churns nothing.
+  const room = new Map();           // over-cap host -> rows it may still add
+  for (const [host, keys] of reported) if (keys.size > HOST_MAX_ROWS) room.set(host, HOST_MAX_ROWS);
+  if (room.size) {
+    for (const r of rows.values()) {
+      if (room.has(r.host) && reported.get(r.host).has(r.key)) room.set(r.host, room.get(r.host) - 1);
+    }
+  }
+  for (const [o, base] of seen) {
     const prev = rows.get(base.key);
+    if (!prev && room.has(base.host)) {
+      if (room.get(base.host) <= 0) continue;
+      room.set(base.host, room.get(base.host) - 1);
+    }
     const next = prev ? { ...prev, prs: prev.prs ? prev.prs.map((p) => ({ ...p })) : undefined }
       : { ...base, model: "default" };
     if (!next.prs) delete next.prs;
