@@ -8277,11 +8277,14 @@ _REPLACEMENT_TILDE_RE = re.compile("~" + _TILDE_SUFFIX + "(?=[/}])")
 # lookahead: one rescanned the rest of a `cd >'cd >'cd …` chain per `cd`
 # (720s on 250 KB, past the hook timeout, which RUNS the command).
 _BARE_CD_HEAD_RE = re.compile(r"(?:^|(?<=[\s;&|(){`'\"]))cd(?:[ \t]+-(?:-|[LPe@]+))*")
-_BARE_CD_REDIRECT_RE = re.compile(
-    r"[ \t]*(?:\d+|\{\w+\})?(?:<<<|<<-?|<>|[<>]&?|&>>?|>>|>\|)[ \t]*[^\s;&|()<>`]{1,256}")
+_BARE_CD_REDIRECT_OP = r"[ \t]*(?:\d+|\{\w+\})?(?:<<<|<<-?|<>|[<>]&?|&>>?|>>|>\|)"
+_BARE_CD_REDIRECT_OP_RE = re.compile(_BARE_CD_REDIRECT_OP)
+_BARE_CD_REDIRECT_RE = re.compile(_BARE_CD_REDIRECT_OP + r"[ \t]*[^\s;&|()<>`]{1,256}")
 _BARE_CD_END_RE = re.compile(r"[ \t]*(?:[;&|)}\n`]|\Z)")
 # How many redirections, each target at most 256 characters, a bare `cd` is
-# read through; past either it is read as bare (an added home reading only).
+# read through; past either, or at a target it cannot read (quoted, expanded,
+# a substitution: `cd <<<'a b'`, `cd >$(f)`), it is read as bare (an added home
+# reading only).
 _BARE_CD_MAX_REDIRECTS = 8
 
 
@@ -8294,14 +8297,16 @@ def _bare_cds(text: str) -> str:
         for k in range(_BARE_CD_MAX_REDIRECTS + 1):
             r = _BARE_CD_REDIRECT_RE.match(text, j)
             if r is None:
-                bare = _BARE_CD_END_RE.match(text, j) is not None
+                # An operator whose target is no plain word (`<<<$(…)`, `< <(…)`).
+                bare = (_BARE_CD_REDIRECT_OP_RE.match(text, j) is not None
+                        or _BARE_CD_END_RE.match(text, j) is not None)
                 break
-            if k == _BARE_CD_MAX_REDIRECTS:
-                bare = True     # more redirections than are walked
+            if k == _BARE_CD_MAX_REDIRECTS or any(c in r.group(0) for c in "'\"$\\"):
+                bare = True     # more redirections than are walked, or an unreadable target
                 break
             j = r.end()
-            if j < len(text) and text[j] not in " \t\n;&|()<>`":
-                bare = True     # a target past 256 characters
+            if j < len(text) and text[j] not in " \t\n;&|)<>`":
+                bare = True     # a target past 256 characters, or one opening `(`
                 break
         if bare:
             pieces += [text[last:m.end()], " $HOME"]

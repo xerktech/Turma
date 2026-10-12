@@ -5805,7 +5805,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         t = time.process_time()
         for text in ("cd " + ">a1" * 20000 + " x", "cd" + " -P" * 10000 + " q",
                      "HOME=/; cd " + ">'cd " * 20000 + "x", "cd > cd " * 20000 + " x",
-                     "cd >{cd " * 20000, 'cd >"cd ' * 20000):
+                     "cd >{cd " * 20000, 'cd >"cd ' * 20000, "cd <<<'cd " * 20000,
+                     "cd >$(cd " * 20000, "cd < <(cd " * 20000):
             guard._bare_cds(text)
         self.assertLess(time.process_time() - t, 1)
         self.assertEqual(guard._bare_cds("cd >/dev/null /etc; cd -"), "cd >/dev/null /etc; cd -")
@@ -5821,6 +5822,12 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "HOME=/; cd <<-E\nx\nE\nrm -rf etc", "HOME=/; cd <>f; rm -rf etc",
                     "HOME=/; cd 0<>f; rm -rf etc", "HOME=/; cd >/dev/null <<<x; rm -rf etc",
                     "HOME=/; bash -c 'cd <<<x; rm -rf etc'",
+                    # A target it cannot read (quoted, expanded, substituted) is bare too.
+                    "HOME=/; cd <<<'a b'; rm -rf etc", "HOME=/; cd <<<\"$x y\"; rm -rf etc",
+                    "HOME=/; cd <<<$(echo a b); rm -rf etc", "HOME=/; cd <<<`echo a`; rm -rf etc",
+                    "HOME=/; cd < <(true); rm -rf etc", "HOME=/; cd >'a b'; rm -rf etc",
+                    "HOME=/; cd >$(echo f); rm -rf etc",
+                    "HOME=/; bash -c 'cd <<<\"a b\"; rm -rf etc'",
                     "HOME=/; cd >" + "a" * 100 + "; rm -rf etc"):
             with self.subTest(cmd=cmd[:40]):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
