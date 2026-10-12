@@ -249,7 +249,8 @@ paths:
       (`$(command -v gsed || echo sed) -i`, `"$(which node || echo node)" app.js`): the unread
       lookup may lead with the fallback's text as args — indistinguishable from
       `ls -d …/rm || echo -rf /`. Two unread branches (`$(command -v a || command -v b)`) allow.
-  - A `grep` that prints its lines is a rewriting filter too (`_greps_lines`); one with
+  - A `grep` (also `zgrep`, and `rg` with its own option table) that prints its lines is a
+    rewriting filter too (`_greps_lines`); one with
     `-q`/`-c`/`-l`/`-L` (or long forms) prints none of the text, so it stays unread. Options are
     PARSED, not pattern-matched: an option's value (`-e -q`, `-elib`) or a word after `--` is a
     pattern, and reading it as `-q` left a line-printing grep opaque.

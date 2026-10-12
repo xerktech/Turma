@@ -4538,6 +4538,23 @@ class TestCommentAndEvalReparse(unittest.TestCase):
 
 
 class TestClassification(unittest.TestCase):
+    def test_a_powershell_c_script_s_remove_targets_are_judged(self):
+        # Rollup XERK-1584: the quoted -c script was one token, so its paths
+        # were never judged.
+        for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Windows"',
+                    'powershell -c "Remove-Item -Recurse -Force C:/Windows"',
+                    'pwsh -Command "Remove-Item -Recurse -Force C:\\Windows\\System32"',
+                    "powershell -c \"Remove-Item -Recurse -Force 'C:\\Program Files'\"",
+                    'powershell -c "Remove-Item -Recurse -Force C:\\Windows; echo hi"',
+                    'powershell -c "rd /s /q C:\\Windows"'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(guard.is_destructive(cmd))
+        for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
+                    'powershell -c "Get-ChildItem C:\\Windows; Remove-Item -Recurse -Force .\\dist"',
+                    'powershell -c "Get-ChildItem C:\\Windows -Recurse"'):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(guard.is_destructive(cmd))
+
     def test_destructive_blocked(self):
         for cmd in DESTRUCTIVE:
             with self.subTest(cmd=cmd):
@@ -5344,6 +5361,17 @@ class TestExpansionBudget(unittest.TestCase):
             limit = 20 if "<<EOF" in cmd else 15
             self.assertIn(self.TOO_LARGE, self.check(cmd, limit) or "", cmd[:80])
 
+    def test_a_default_assignment_spending_the_budget_reads_too_large(self):
+        # Rollup XERK-1584: `_default_assignments` spent the budget outside
+        # `_expand_top`'s catch, so `decide` raised and the hook's reason was
+        # "could not classify" instead of this one.
+        cmd = "; ".join(f"eval x=1; chmod -R 755 ~/a{i} ${{HOME:=/q}}/c{i}" for i in range(200))
+        t = time.process_time()
+        decision, reason = guard.decide("Bash", {"command": cmd})[:2]
+        self.assertEqual(decision, "deny")
+        self.assertIn(self.TOO_LARGE, reason)
+        self.assertLess(time.process_time() - t, 30)
+
     def test_find_exec_and_xargs_runs_are_denied_fast(self):
         # Their emitted WORK grew faster than linearly, not their text: 5000
         # `-exec` runs took 30s and 4096 xargs segments 18s (XERK-1589).
@@ -5742,6 +5770,10 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # A grep that prints its lines filters like `sed`.
                     "$(false || echo rm -rf / | grep .)",
                     "$(ls /x || echo rm -rf /etc | grep rm)",
+                    # ...and so do ripgrep and zgrep (rollup XERK-1584).
+                    "$(false || echo rm -rf /etc | rg .)",
+                    "$(false || echo rm -rf /etc | zgrep .)",
+                    "$(false || echo rm -rf /etc | rg -e -q)",
                     # A quoted `$((` is not arithmetic around a later substitution.
                     "X=\"$((\" $(false || echo rm -rf /etc) \"))\"",
                     "echo '$((' ; $(ls -d /usr/bin/rm /nope || echo -rf /etc) ; echo '))'",
@@ -5777,6 +5809,8 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # A grep printing a count or nothing is not the text.
                     "$(ls /x || echo rm -rf /etc | grep -c rm)",
                     "$(ls /x || echo rm -rf /etc | grep -q rm)",
+                    "$(ls /x || echo rm -rf /etc | rg -c rm)",
+                    "$(ls /x || echo rm -rf /etc | rg --files-with-matches rm)",
                     # A backgrounded body's order is unknown: left opaque.
                     "$(sleep 1 & echo x | sed '')"):
             with self.subTest(cmd=cmd):
