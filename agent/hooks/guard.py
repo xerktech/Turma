@@ -8278,7 +8278,7 @@ _REPLACEMENT_TILDE_RE = re.compile("~" + _TILDE_SUFFIX + "(?=[/}])")
 # (720s on 250 KB, past the hook timeout, which RUNS the command).
 _BARE_CD_HEAD_RE = re.compile(r"(?:^|(?<=[\s;&|(){`'\"]))cd(?:[ \t]+-(?:-|[LPe@]+))*")
 _BARE_CD_REDIRECT_RE = re.compile(
-    r"[ \t]*(?:\d+|\{\w+\})?(?:[<>]&?|&>>?|>>|>\|)[ \t]*[^\s;&|()<>`]{1,256}")
+    r"[ \t]*(?:\d+|\{\w+\})?(?:<<<|<<-?|<>|[<>]&?|&>>?|>>|>\|)[ \t]*[^\s;&|()<>`]{1,256}")
 _BARE_CD_END_RE = re.compile(r"[ \t]*(?:[;&|)}\n`]|\Z)")
 # How many redirections, each target at most 256 characters, a bare `cd` is
 # read through; past either it is read as bare (an added home reading only).

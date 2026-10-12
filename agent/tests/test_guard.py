@@ -5816,6 +5816,18 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         self.assertEqual(guard._bare_cds("cd" + " >a" * 8 + " /tmp"), "cd" + " >a" * 8 + " /tmp")
         self.assertEqual(guard._bare_cds("cd" + " >a" * 8), "cd $HOME" + " >a" * 8)
+        # Input redirections leave it bare too: a here-string, heredoc or `<>`.
+        for cmd in ("HOME=/; cd <<<x; rm -rf etc", "HOME=/; cd <<E\nx\nE\nrm -rf etc",
+                    "HOME=/; cd <<-E\nx\nE\nrm -rf etc", "HOME=/; cd <>f; rm -rf etc",
+                    "HOME=/; cd 0<>f; rm -rf etc", "HOME=/; cd >/dev/null <<<x; rm -rf etc",
+                    "HOME=/; bash -c 'cd <<<x; rm -rf etc'",
+                    "HOME=/; cd >" + "a" * 100 + "; rm -rf etc"):
+            with self.subTest(cmd=cmd[:40]):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
+        for cmd in ("HOME=/; cd <<<x /tmp; rm -rf etc", "HOME=/; cd <>f /tmp; rm -rf etc",
+                    "HOME=/; cd >" + "a" * 100 + " /tmp; rm -rf etc"):
+            with self.subTest(cmd=cmd[:40]):
+                self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")
         # A spelled `cd` whose reading is too large denies, never raises.
         taken = "".join(chr(c) for c in range(0xE000, 0xF900))
         with self.assertRaises(guard._ExpansionTooLarge):
