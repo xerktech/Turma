@@ -8264,16 +8264,22 @@ def _defect_revert_targets(repo, sha, message, parents):
         return stands[r]
     found = [t for t in dict.fromkeys(t for _, t in pairs)
              if any(standing(r) for r in by_target[t])]
-    found = found[:DEFECT_INTRODUCERS_MAX * 2]
-    ancestors = [t for t in found
-                 if run_out(["git", "-C", repo, "merge-base", "--is-ancestor", t, parents[0]])[0] == 0]
+    checked = {}
+
+    def on_main(t):
+        if t not in checked:
+            checked[t] = run_out(["git", "-C", repo, "merge-base", "--is-ancestor",
+                                  t, parents[0]])[0] == 0
+        return checked[t]
     # A squash flattens a branch's whole chain into its one message: a line
     # naming a commit that never reached the default branch is a revert the
     # branch made and squashed away (revert, then re-apply), whose effect the
     # message cannot show. Ambiguous, so the squash names no revert target.
-    if any(t not in ancestors for r, t in pairs if r == sha):
+    # Checked over ALL its lines (bounded), before the introducer cap.
+    own = list(dict.fromkeys(t for r, t in pairs if r == sha))[:50]
+    if not all(on_main(t) for t in own):
         return []
-    return ancestors
+    return [t for t in found[:DEFECT_INTRODUCERS_MAX * 2] if on_main(t)]
 
 
 def _defect_landing(repo, sha, tip, first_parents):

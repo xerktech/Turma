@@ -44425,6 +44425,14 @@ class TestDefectAttribution(unittest.TestCase):
                     f"* Reapply\n\nThis reverts commit {r1}.\n\n* XERK-4: feature")
         self.assertEqual(self.scan()[1], [])
 
+    def test_a_squash_reverting_many_commits_still_reports(self):
+        shas = [self.commit({f"f{i}.py": f"{i}\n"}, f"XERK-1: add {i}") for i in range(12)]
+        body = "".join(f"* Revert\n\nThis reverts commit {x}.\n\n" for x in shas)
+        self.commit({f"f{i}.py": "" for i in range(12)}, f"XERK-4: revert many (#9)\n\n{body}")
+        reverts = [r for r in self.scan()[1] if r["kind"] == "revert"]
+        self.assertEqual(len(reverts), 1)
+        self.assertEqual(len(reverts[0]["introducers"]), ha.DEFECT_INTRODUCERS_MAX)
+
     def test_an_unplaceable_blamed_commit_stands_as_itself(self):
         self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"}, "XERK-2: fix b")
         with mock.patch.object(ha, "_defect_landing", return_value=None):
