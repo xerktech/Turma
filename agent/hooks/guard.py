@@ -12485,9 +12485,10 @@ def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
     placeholder, and pwsh runs it — reached through `xargs`, `find -exec`, a
     substitution or a shell's `-c`/`eval`/heredoc script too. Scanned from the
     first shell word in program position (which covers every later one);
-    `echo pwsh …` stays data. Heredoc bodies are data (`_split_heredocs`),
-    except one a shell reads, which is a script of its own, and one whose owner
-    line runs pwsh/cmd (`pwsh -c - <<E`), scanned with it."""
+    `echo pwsh …` stays data. A heredoc body is data only when its owner line
+    runs nothing but known data readers (`_ps_body_is_data`); any other body is
+    a script of its own, and one whose owner runs pwsh/cmd (`pwsh -c - <<E`)
+    is also scanned with it."""
     if depth > _PS_RAW_DEPTH:
         # Fail closed: allowing here let five nested `bash <<E` hide what main
         # denied (QA). Only text still naming a pwsh/cmd word is refused.
@@ -12499,14 +12500,12 @@ def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
     for owner, body, _quoted in heredocs:
         bodies.setdefault(owner, []).append(body)
     owner_pieces = []
-    memo: dict = {}
     for owner, owned in bodies.items():
         # One split per owner line, never per heredoc: a line of N `<<E` was
         # N splits of the whole line (quadratic, QA).
         joined = "\n".join(owned)
         owner_pieces += [(seg, joined) for seg in _split_on_operators(owner)]
-        # `ssh host <<E` runs the body in the remote login shell.
-        if _walk_owner_feeds_shell(text, owner, memo) or _names_ssh(owner):
+        if not _ps_body_is_data(owner):
             for body in owned:
                 reason = _ps_raw_reason(body, depth + 1)
                 if reason:
@@ -12527,20 +12526,45 @@ def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
 _PS_RAW_DEPTH = 4
 # pwsh, or cmd given a script (`cmd /c`): `./cmd/server` or `$cmd` is not one.
 _PS_INVOKED_RE = re.compile(r"\b(?:powershell|pwsh)\b|\bcmd(?:\.exe)?\s+/[ck]\b", re.IGNORECASE)
-_PS_SSH_PROGS = {"ssh", "autossh"}
+# Programs that only read a heredoc as data (text, a file, or another
+# language's source). Anything else on an owner line makes the body a script;
+# never add `sed`/`awk`, which run body lines (`sed e`, `system()`).
+_PS_DATA_OWNERS = {"cat", "tee", "git", "gh", "glab", "jira", "python", "python3", "node",
+                   "echo", "printf", "true", "mkdir", "cd", "cp", "mv", "touch", "jq",
+                   "grep", "rg", "wc", "sort", "head", "tail", "diff", "base64",
+                   "column", "tr", "cut", "uniq", "test", "["}
+_PS_LITERAL_PROG_RE = re.compile(r"[\w./~+-]+")
+_PS_ASSIGN_WORD_RE = re.compile(r"[A-Za-z_]\w*\+?=")
+_PS_REDIRECT_WORD_RE = re.compile(r"\d*[<>]")
 
 
-def _names_ssh(owner: str) -> bool:
-    """Whether a word of ``owner`` is an ssh program, however spelled
-    (`/usr/bin/ssh`, `\\ssh`, `"ssh"`), matched by basename after shlex
-    dequotes it: a raw-text match missed those (QA). `ssh-notes.md` or a
-    quoted "ssh fix" title is not one. Unreadable text fails closed."""
-    if "ssh" not in owner:
+def _ps_body_is_data(owner: str) -> bool:
+    """Whether a heredoc opened on ``owner`` is only data (XERK-1861): every
+    command on the line is a LITERAL known data reader (`cat > n.md <<E`,
+    `git commit -F - <<E`). A name list of shells and remotes lost to every
+    spelling bash still runs (`s\\sh`, `slogin`, `$S`, `/usr/bin/s[s]h`, QA),
+    so an unknown, non-literal or unreadable program makes it a script — as
+    main read every body line. A `<(`/`>(` may feed a reader: a script too."""
+    if "<(" in owner or ">(" in owner:
         return False
-    try:
-        return any(_basename(t) in _PS_SSH_PROGS for t in _tokenize(owner))
-    except ValueError:
-        return True
+    for seg in _split_on_operators(owner):
+        try:
+            tokens = _tokenize(seg)
+        except ValueError:
+            return False
+        words = [t for t in _strip_prefixes(tokens) if not _PS_ASSIGN_WORD_RE.match(t)]
+        while words and _PS_REDIRECT_WORD_RE.match(words[0]):
+            # A redirection before the program (`> f cat`): skip it and its target.
+            words = words[1:] if words[0].rstrip("<>&0123456789-") else words[2:]
+            words = words[1:] if words and words[0] == "" else words
+        if not words:
+            continue
+        prog = words[0]
+        if not _PS_LITERAL_PROG_RE.fullmatch(prog) or _basename(prog) not in _PS_DATA_OWNERS:
+            return False
+    return True
+
+
 # Programs that run a later word as a program: `xargs`, find's actions and
 # wrappers `_strip_prefixes` does not know (`parallel`, `fd -x`, `flock f`).
 _PS_RUNNERS = {"xargs", "parallel", "sem", "watch", "strace", "ltrace", "taskset",

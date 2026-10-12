@@ -4597,7 +4597,10 @@ class TestClassification(unittest.TestCase):
                     "bash <<'L'\n" * (guard._PS_RAW_DEPTH + 1) + f"pwsh -c '$(ri -r {W})'\n"
                     + "L\n" * (guard._PS_RAW_DEPTH + 1),
                     *(f"{s} -T h <<'E'\npwsh -c '$(ri -r {W})'\nE"
-                      for s in ("/usr/bin/ssh", "\\ssh", '"ssh"', "'ssh'", "autossh -M 0"))):
+                      for s in ("/usr/bin/ssh", "\\ssh", '"ssh"', "'ssh'", "autossh -M 0",
+                                "s\\sh", "s''sh", '"s"sh', "slogin", "S=ssh; $S", "/usr/bin/s[s]h")),
+                    "bash <<'L'\n" * (guard._PS_RAW_DEPTH + 1) + f"cmd /c rd /s /q {W}\n"
+                    + "L\n" * (guard._PS_RAW_DEPTH + 1)):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',

@@ -92,18 +92,22 @@ Each fires on a live construct next to a sink; the folded ticket is named.
     `xargs echo pwsh … <all three>` is refused.
   - A shell's/`eval`'s later words are scripts, each scanned as a command (`bash -c 'pwsh …'`).
   - It scans the heredoc-STRIPPED text: a note's body line naming all three was refused.
-  - A body a shell reads (`_walk_owner_feeds_shell`, or an ssh/autossh word, `_names_ssh`) is
-    scanned as a script. Match ssh by dequoted basename: a raw `\bssh\b`-style regex both
-    over-read `ssh-notes.md` and missed `/usr/bin/ssh`, `\ssh`, `"ssh"` (QA). Stripped,
-    `bash <<'E'` hid a pwsh `$(…)` main had denied (QA). A body whose owner line runs
-    pwsh/cmd is scanned with it (`pwsh -c - <<E`).
+  - A body is data only when its owner line runs nothing but LITERAL known data readers
+    (`_ps_body_is_data`, `_PS_DATA_OWNERS`: cat, tee, git, gh, python3…); else it is a script,
+    scanned recursively, as main scanned every body line. Never go back to a list of shells
+    and remotes: `ssh`, then its spellings (`s\sh`, `"s"sh`, `slogin`, `$S`, `/usr/bin/s[s]h`)
+    each let a body through that main denied (QA, 3 passes). A body whose owner runs pwsh/cmd
+    is also scanned with it (`pwsh -c - <<E`).
+  - Accepted over-read: ANY unlisted program on the owner line makes it a script, so
+    `sed -n 1p f && python3 - <<E` with pwsh test strings is refused (1 in 30k replayed, guard-dev).
   - Past `_PS_RAW_DEPTH` nested scripts, text invoking pwsh or `cmd /c` is REFUSED: returning
     nothing let five nested `bash <<E` through where main denied (QA). Never fail open there.
     Test at exactly `_PS_RAW_DEPTH + 1`: deeper nests are denied by another path anyway.
   - Owner lines are split once per OWNER, never per heredoc: per heredoc, N `<<E` on one line
     was quadratic (36s at 16 KB, QA). Each substitution opener looks ahead a bounded run.
   - Open (XERK-1863), all allowed on main too: `echo '…' | pwsh -c -`, `eval "$(cat <<E…)"`,
-    `p\wsh`, a `bash <<<` here-string, `eval pwsh -c \''$(…)'\'`, `bash -c '… "$1"' _ '$(…)'`.
+    `p\wsh`/`p''wsh`, `cmd /c"…"`, a here-string or pipe into `bash`/`ssh`,
+    `eval pwsh -c \''$(…)'\'`, `bash -c '… "$1"' _ '$(…)'`.
 - Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook;
   the trailing-glob cut in `_ps_targets` is `rfind`, never a regex (72s at 128 KB, XERK-1861).
 - Tests: `test_a_powershell_c_script_s_remove_targets_are_judged`,
