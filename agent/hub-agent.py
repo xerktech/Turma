@@ -15490,7 +15490,11 @@ COMPOSER_TAIL_CHARS = 60
 COMPOSER_MIN_SHOWN_CHARS = 20
 # One writer per pane at a time: the input worker and the beat (resend, qwen
 # peer) can type into the same pane, and slices from two messages must never
-# interleave. They share one tmux buffer name too.
+# interleave. They share one tmux buffer name too. Each entry is
+# [lock, users]: a writer counts itself in under the guard BEFORE it waits on
+# the lock, and the last one out drops the entry, so the map holds only panes
+# being typed into now (it kept every tmux name ever typed into) and a later
+# writer can never get a fresh lock while an earlier one still holds the old.
 _PANE_TYPE_LOCKS = {}
 # Long enough to outlast the other writer's WHOLE message -- its draw waits
 # plus its submit watch (and their settles) -- or the second writer types into
@@ -15793,14 +15797,19 @@ def _type_into_pane(tmux_name, text):
     if not tmux_name:
         return False
     with _PANE_TYPE_LOCKS_GUARD:
-        lock = _PANE_TYPE_LOCKS.setdefault(tmux_name, threading.Lock())
-    # Bounded: the beat may be the waiter, and a wedged tmux can hold the other
-    # writer for its full timeouts. Past the bound, delivering beats ordering.
-    locked = lock.acquire(timeout=PANE_TYPE_LOCK_WAIT_SEC)
-    if not locked:
-        log(f"typing into {tmux_name}: another writer still busy after "
-            f"{PANE_TYPE_LOCK_WAIT_SEC}s; typing unserialized")
+        entry = _PANE_TYPE_LOCKS.get(tmux_name)
+        if entry is None:
+            entry = _PANE_TYPE_LOCKS[tmux_name] = [threading.Lock(), 0]
+        entry[1] += 1
+    lock = entry[0]
+    locked = False
     try:
+        # Bounded: the beat may be the waiter, and a wedged tmux can hold the other
+        # writer for its full timeouts. Past the bound, delivering beats ordering.
+        locked = lock.acquire(timeout=PANE_TYPE_LOCK_WAIT_SEC)
+        if not locked:
+            log(f"typing into {tmux_name}: another writer still busy after "
+                f"{PANE_TYPE_LOCK_WAIT_SEC}s; typing unserialized")
         # A Windows message is N slice injects too, so it takes the same lock.
         if IS_WINDOWS:
             return _pty_inject(tmux_name, text)
@@ -15808,14 +15817,21 @@ def _type_into_pane(tmux_name, text):
     finally:
         if locked:
             lock.release()
+        with _PANE_TYPE_LOCKS_GUARD:
+            entry[1] -= 1
+            if entry[1] <= 0 and _PANE_TYPE_LOCKS.get(tmux_name) is entry:
+                del _PANE_TYPE_LOCKS[tmux_name]
 
 
 def _type_into_tmux_pane(tmux_name, text):
     """_type_into_pane's tmux half, run under that pane's lock."""
     buf = f"turma-input-{tmux_name}"      # per-pane, so two sessions can't race
-    sliced = len(text) <= PASTE_SLICED_MAX_CHARS and not _SLICE_UNSAFE_RE.search(text)
+    # The cap is judged on the text as TYPED (tabs as 4 spaces): judged before,
+    # 4000 tabs became 40 slices, each a tmux call, on the beat's resend path.
+    typed = text.replace("\t", "    ")
+    sliced = len(typed) <= PASTE_SLICED_MAX_CHARS and not _SLICE_UNSAFE_RE.search(typed)
     if sliced:
-        text = text.replace("\t", "    ")
+        text = typed
         slices = _input_slices(text)
         # -r keeps LF as LF (tmux would otherwise turn it into CR, a submit).
         flags = ["-d", "-r"]
@@ -16310,9 +16326,10 @@ def _pty_inject(tmux_name, text):
     if not tmux_name:
         return False
     clean = _clean_input_text(text)
-    sliced = len(clean) <= PASTE_SLICED_MAX_CHARS and not _SLICE_UNSAFE_RE.search(clean)
+    typed = clean.replace("\t", "    ")     # the cap is judged as typed (see tmux)
+    sliced = len(typed) <= PASTE_SLICED_MAX_CHARS and not _SLICE_UNSAFE_RE.search(typed)
     if sliced:
-        clean = clean.replace("\t", "    ")
+        clean = typed
         slices = _input_slices(clean)
     else:
         multiline = "\n" in clean
