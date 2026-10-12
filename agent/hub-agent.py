@@ -7455,7 +7455,7 @@ def repo_usage_report(ledger, fold_slug):
     # twice (worktree-keyed + projects-dir-keyed), and under two repo names its
     # usage counted twice in the host total. A named repo beats the root bucket.
     owner = {}
-    for path, meta in sorted((ledger or {}).items()):
+    for path, meta in (ledger or {}).items():
         meta = meta or {}
         if meta.get("internal"):
             continue  # the manager's own claude -p helper, not a repo (XERK-27)
@@ -10219,7 +10219,7 @@ SHELL_KIND_WORK = "work"
 # The hub keeps `startedAt`/`eta` only as JS-safe integers (Number.isSafeInteger).
 _MAX_SAFE_INT = 2 ** 53 - 1
 # Commands that neither do work nor wait: they may sit beside a sleep.
-_SHELL_NEUTRAL_CMDS = frozenset({"date", "echo", "printf", "true", ":", "cd", "seq"})
+_SHELL_NEUTRAL_CMDS = frozenset({"date", "echo", "printf", "true", ":", "cd"})
 # Pipeline stages that only filter a waiting command's output.
 _SHELL_FILTER_CMDS = frozenset({"grep", "egrep", "fgrep", "head", "tail", "sed", "awk",
                                 "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"})
@@ -10229,13 +10229,16 @@ _SHELL_FILTER_CMDS = frozenset({"grep", "egrep", "fgrep", "head", "tail", "sed",
 def _shell_filter_writes(words):
     """True for an in-place editing filter stage: GNU sed's `-i`/`--in-place`
     (any short cluster holding an `i`, erring toward work) or gawk's `-i`
-    include (`-i inplace`)."""
+    include (`-i inplace`). A long option may be any unambiguous prefix
+    (`sed --in`, `awk --inc`), as getopt_long takes it."""
     cmd = words[0].rsplit("/", 1)[-1] if words else ""
     if cmd not in ("sed", "awk"):
         return False
+    full = "--in-place" if cmd == "sed" else "--include"
     for w in words[1:]:
         if w.startswith("--"):
-            if w.startswith("--in-place" if cmd == "sed" else "--include"):
+            name = w.split("=", 1)[0]
+            if len(name) > 2 and full.startswith(name):
                 return True
         elif w.startswith("-") and "i" in w:
             return True
@@ -10521,18 +10524,30 @@ def _shell_subst_bodies(word):
     return out
 
 
-def _shell_runs_work(words, depth=0):
+def _shell_runs_work(words, depth=0, lists=False):
     """True when a substitution in these raw words runs WORK: `OUT=$(npm test)`
     is a stage with no command word, so it read `neutral`, and a loop around it
-    read as a wait. A probe's body (`s=$(gh pr view …)`) is not work."""
+    read as a wait. A probe's body (`s=$(gh pr view …)`) is not work. With
+    `lists`, a lone `$(seq …)` only generates a `for` list's words."""
     for w in words:
         for body in _shell_subst_bodies(w):
             if depth >= 3:
                 return True   # deep nesting must not recurse on the beat
-            for seg in _shell_segments(body):
+            segs = _shell_segments(body)
+            if lists and _shell_is_seq(segs) and not _shell_runs_work(segs[0][0], depth + 1):
+                continue
+            for seg in segs:
                 if _shell_pipeline_kind(seg, depth + 1)[0] == "work":
                     return True
     return False
+
+
+def _shell_is_seq(segs):
+    """One segment of one stage whose command is `seq`."""
+    if len(segs) != 1 or len(segs[0]) != 1:
+        return False
+    w = _shell_words(segs[0][0])
+    return bool(w) and w[0].rsplit("/", 1)[-1] == "seq"
 
 
 def _shell_pipeline_kind(stages, depth=0):
@@ -10555,8 +10570,8 @@ def _shell_loop(segs, i):
     if i + 1 >= len(segs) or _shell_pipeline_kind([["true"]] + segs[i][1:])[0] == "work":
         return "work", None
     # A `while`/`until` condition runs every lap: `while [ "$(make deploy)" … ]`
-    # is work; so is a `for` list's `$(npm test)`. `$(seq …)` is neutral.
-    if _shell_runs_work(segs[i][0]):
+    # is work; so is a `for` list's `$(npm test)`, though not its `$(seq …)`.
+    if _shell_runs_work(segs[i][0], lists=head[0] == "for"):
         return "work", None
     first = _shell_words(segs[i + 1][0])
     if not first or first[0] != "do":

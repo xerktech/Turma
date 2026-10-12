@@ -13279,7 +13279,7 @@ def attribution_reason(command: str) -> str | None:
 # template and its readability rules ride PR_SUMMARY_SYSTEM_PROMPT in
 # hub-agent.py; this is the hard check behind it. A repo's OWN template wins:
 # when the repo has one, its headings are what is required instead.
-_PR_SUMMARY_LINE = re.compile(r"^[ \t]*\*\*summary:?\*\*", re.IGNORECASE | re.MULTILINE)
+_PR_SUMMARY_LINE = re.compile(r"^[^\S\n]*\*\*summary:?\*\*", re.IGNORECASE | re.MULTILINE)
 _PR_SECTIONS = (
     ("Why", r"why"),
     ("What changed", r"what\s+changed"),
@@ -13297,16 +13297,28 @@ _REPO_PR_TEMPLATES = (
 )
 # A repo template heading worded as optional is not required of every PR.
 _OPTIONAL_HEADING = re.compile(r"optional|if applicable", re.IGNORECASE)
-# Blanks, never `\s`: a `\s*` at a line start runs over every newline after
-# it, so a body of N blank lines was quadratic (36 KB took 39s, rollup).
-_TEMPLATE_HEADING = re.compile(r"^[ \t]*#{1,6}[ \t]+(.+?)[ \t\r]*#*[ \t\r]*$", re.MULTILINE)
+# Whitespace but a newline (`[^\S\n]`), never `\s`: a `\s*` at a line start
+# ran over every newline after it, so N blank lines were quadratic (36 KB took
+# 39s). The heading's tail is trimmed in Python (`_template_headings`): a lazy
+# `(.+?)\s*#*\s*$` was cubic on `# x` + spaces + `y` (431s at 7000 spaces).
+_TEMPLATE_HEADING = re.compile(r"^[^\S\n]*#{1,6}[^\S\n]+(.*)$", re.MULTILINE)
 _PR_BODY_MAX_READ = 256 * 1024
+
+
+def _template_headings(text: str) -> list[str]:
+    """A template's heading texts, closing `#`s and blanks trimmed."""
+    out = []
+    for raw in _TEMPLATE_HEADING.findall(text):
+        h = raw.strip().rstrip("#").strip()
+        if h:
+            out.append(h)
+    return out
 
 
 def _heading_present(body: str, pattern: str) -> bool:
     # `(?!\w)`, not `\b`: a template heading may end in `?`/`:`/`)`, after
     # which there is no word boundary at the end of a line.
-    return re.search(rf"^[ \t]*#{{1,6}}[ \t]*{pattern}(?!\w)", body,
+    return re.search(rf"^[^\S\n]*#{{1,6}}[^\S\n]*{pattern}(?!\w)", body,
                      re.IGNORECASE | re.MULTILINE) is not None
 
 
@@ -13679,7 +13691,7 @@ def _repo_template_sections(root: str | None) -> list[tuple[str, str]] | None:
             # Unreadable, a FIFO, or empty: no template to follow, so the
             # standard applies rather than nothing at all.
             return None
-        heads = [h for h in _TEMPLATE_HEADING.findall(text)
+        heads = [h for h in _template_headings(text)
                  if not _OPTIONAL_HEADING.search(h)]
         return [(h, re.escape(h)) for h in heads]
     return None

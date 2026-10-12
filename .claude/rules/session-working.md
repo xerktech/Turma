@@ -70,7 +70,9 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
     A probe on its own line, or in a loop with no `break`, stays `work`. A loop condition may pipe
     into filters (`until gh pr view … | grep -q MERGED`).
 - A `$(…)`/backtick that runs work makes its stage work, in a loop's head too (`for x in
-  $(npm test)`; `seq` is neutral), and so does an in-place filter stage (`| sed -i`, `awk -i`).
+  $(npm test)`). Only a `for` list's lone `$(seq …)` is exempt (it generates the words); `seq`
+  anywhere else is work. An in-place filter stage is work too (`| sed -i`/`--in`, `awk --inc`:
+  getopt_long takes any unambiguous long-option prefix).
 - **Anything unrecognised is `work`** — that is the pre-XERK-1570 reading, so a classifier miss
   costs nothing new; the reverse miss (work read as waiting) would hide a busy session. Every rule
   errs toward `work`; nested timeouts/loops classify as work rather than recurse on the beat.

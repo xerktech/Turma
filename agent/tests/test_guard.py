@@ -7129,16 +7129,28 @@ class TestPrSummary(unittest.TestCase):
         ok = "## How Has This Been Tested?\nx\n## Checklist:\n- y\n## Related Issue(s)\nz\n"
         self.assertIsNone(self.reason("gh pr create --body " + __import__("shlex").quote(ok)))
 
-    def test_a_body_of_blank_lines_is_checked_in_linear_time(self):
+    def test_headings_are_read_in_linear_time(self):
         # Rollup XERK-1584: `^\s*#` ran each line start over every newline
-        # after it, so 36 KB of blank lines took 39s; a CRLF heading still counts.
+        # after it (36 KB of blank lines took 39s), and a template line of
+        # `# x` + spaces + `y` was cubic in `(.+?)\s*#*\s*$` (431s at 7000).
         body = "\n" * 200000 + "x"
         t = time.process_time()
         self.assertIsNotNone(guard._pr_body_reason(body, self.repo))
-        self.assertEqual(guard._TEMPLATE_HEADING.findall(" \n" * 100000), [])
+        self.assertEqual(guard._template_headings(" \n" * 100000), [])
+        self.assertEqual(guard._template_headings("# x" + " " * 20000 + "y"), ["x" + " " * 20000 + "y"])
         self.assertLess(time.process_time() - t, 2)
-        self.assertEqual(guard._TEMPLATE_HEADING.findall("## Why\r\n  ### What changed ##\n"),
-                         ["Why", "What changed"])
+
+    def test_heading_whitespace_is_any_but_a_newline(self):
+        # The fix must not change which headings count: CR, NBSP, a form feed
+        # or tab around the marks is still a heading; a newline never was.
+        self.assertEqual(guard._template_headings(
+            "## Why\r\n  ### What changed ##\n\u00a0## Risk\u00a0\n\f# Testing\f\n#\nNope\n"),
+            ["Why", "What changed", "Risk", "Testing"])
+        for body in ("\n\r## Why", "\u00a0## Why", "\f## Why", "\t##\tWhy"):
+            with self.subTest(body=body):
+                self.assertTrue(guard._heading_present(body, "why"))
+        self.assertFalse(guard._heading_present("##\nWhy", "why"))
+        self.assertTrue(guard._PR_SUMMARY_LINE.search("x\n\r**Summary:** y"))
 
     def test_a_fifo_body_file_or_template_never_hangs_the_hook(self):
         os.mkfifo(os.path.join(self.repo, "body.fifo"))

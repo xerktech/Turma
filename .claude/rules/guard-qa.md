@@ -40,3 +40,8 @@ paths:
   `_X_RE = …` silently replaces an earlier one for every caller. XERK-1769 reused
   `_SHELL_WORD_RE` and `_REDIRECT_WORD_RE`; heredoc data turned into scripts (15 suite failures).
   Check with a `^(_\w+)\s*=` / `^def ` duplicate count against main.
+- **The PR-summary heading reads stay linear** (rollup XERK-1584): `[^\S\n]` around the marks,
+  never `\s` (it ran each line start over every later newline: quadratic), and a template
+  heading's tail is trimmed in Python (`_template_headings`): `(.+?)\s*#*\s*$` was cubic, and
+  one `re` call holds the GIL past the hook's 45s deadline. Test:
+  `test_headings_are_read_in_linear_time`.

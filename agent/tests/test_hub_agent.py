@@ -1119,12 +1119,15 @@ class TestRepoUsageReport(unittest.TestCase):
                         "claude-opus-4-20250514", 1_000, 0),
         ])
         slug = ha._project_slug(wt)
-        for root_first in (True, False):
+        # Every insertion order and both path orders: a named repo beats the
+        # root bucket whichever entry sorts first.
+        for dup_path in (os.path.join(self.tmp, slug), "/zzz/" + slug, "/a/" + slug):
+          for root_first in (True, False):
             ledger = {wt: self._entry(wt, "Turma", "")}
-            dup = {os.path.join(self.tmp, slug): {"repo": None, "remote": "", "slug": slug}}
+            dup = {dup_path: {"repo": None, "remote": "", "slug": slug}}
             ledger = {**dup, **ledger} if root_first else {**ledger, **dup}
             repo_usage, host = ha.repo_usage_report(ledger, self._fold_full)
-            self.assertEqual([r["repo"] for r in repo_usage], ["Turma"])
+            self.assertEqual([r["repo"] for r in repo_usage], ["Turma"], dup_path)
             self.assertEqual(host["totals"]["input"], 1_000)
 
     def test_merges_worktrees_per_repo_and_host_total(self):
