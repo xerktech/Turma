@@ -5,6 +5,7 @@ import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.xerktech.turma.TurmaApplication
 import com.xerktech.turma.core.BoardView
+import com.xerktech.turma.core.epicLimitLabel
 import com.xerktech.turma.core.CreateMetaFetch
 import com.xerktech.turma.core.CreateResultFetch
 import com.xerktech.turma.core.IssueFetch
@@ -505,8 +506,15 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
      * nudge pulls the new record. Returns the hub's own words on a refusal
      * (XERK-264) so the panel can show it inline, or null on success.
      */
-    suspend fun setEpicRun(siteKey: String, epicKey: String, clear: Boolean): String? {
-        val body = buildJsonObject { if (clear) put("clear", JsonPrimitive(true)) }
+    suspend fun setEpicRun(siteKey: String, epicKey: String, clear: Boolean, maxConcurrent: Int? = null): String? {
+        // `maxConcurrent` (XERK-1860) arms with that cap; null keeps the run's own.
+        val body = buildJsonObject {
+            if (clear) put("clear", JsonPrimitive(true))
+            else if (maxConcurrent != null) {
+                put("arm", JsonPrimitive(true))
+                put("maxConcurrent", JsonPrimitive(maxConcurrent))
+            }
+        }
         return try {
             val r = container.client.api.setEpicRun(siteKey, epicKey, body)
             val b = r.body()
@@ -514,6 +522,28 @@ class BoardViewModel(app: Application) : AndroidViewModel(app) {
                 b?.error?.takeIf { it.isNotBlank() } ?: r.hubError() ?: "HTTP ${r.code()}"
             } else {
                 _messages.tryEmit(if (clear) "✓ epic run cancelled" else "✓ epic run started")
+                container.fleet.nudge()
+                null
+            }
+        } catch (_: Exception) {
+            "the hub is unreachable"
+        }
+    }
+
+    /**
+     * Set (1..50) or clear (null) an armed epic run's cap on concurrently-working
+     * children (XERK-1860) without re-arming it. Returns the hub's words on a
+     * refusal, null on success.
+     */
+    suspend fun setEpicRunLimit(siteKey: String, epicKey: String, limit: Int?): String? {
+        val body = buildJsonObject { put("maxConcurrent", limit?.let { JsonPrimitive(it) } ?: JsonNull) }
+        return try {
+            val r = container.client.api.setEpicRun(siteKey, epicKey, body)
+            val b = r.body()
+            if (!r.isSuccessful || b?.ok != true) {
+                b?.error?.takeIf { it.isNotBlank() } ?: r.hubError() ?: "HTTP ${r.code()}"
+            } else {
+                _messages.tryEmit("✓ max running at once: ${epicLimitLabel(limit)}")
                 container.fleet.nudge()
                 null
             }

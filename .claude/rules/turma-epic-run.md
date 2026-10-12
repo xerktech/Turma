@@ -109,13 +109,18 @@ Depends on XERK-634, which put `blocks`/`blockedBy`/`epicKey`/`isEpic` on every 
   `EPIC_CHILD_LAUNCH_GRACE_MS` (the `at` stamp on `epicChildAttempts`).
   - Never `startedTicketKeys` — it counts KILLED sessions, so a finished child would hold its slot.
   - A `blocked` queue entry (no host can run it) does NOT hold a slot: it cycles blocked → given up →
-    re-queued, so counting it stalled a capped run forever. Cost: if that block clears, the run can
-    briefly sit one over its cap. Liveness over strictness, deliberately.
-  - The grace closes the ack-before-session gap; without it a cap of 1 starts a second child there.
+    re-queued, so counting it stalled a capped run forever.
+- **The cap is ALSO enforced at dispatch** (`drainTicketQueue`, `cappedEpicRunOf`): a capped run's
+  child dispatches only while `epicRunActiveCount` (excluding itself) is under the cap, else it holds
+  as reason `"epic-cap"` (self-clearing, never aged out as blocked).
+  - Needed because the driver keeps queuing past uncounted `blocked` entries; without the gate they
+    ALL dispatched the moment the block cleared (QA: cap 1, three children on one host).
+  - `epic-cap` entries never count toward the cap — two held children counting each other deadlock.
+  - Clients label it "⏳ queued · epic limit" (`board.js` `queuedLabel`, `Board.kt` `Queued.epicCap`).
 - The driver checks the cap AFTER every other guard, so a held child spends no attempt. Lowering the
-  cap never kills a running child. Board: `epicLimitPickerHtml` in the epic panel; Android web-only
-  gap in `PARITY.md`.
-- Tests: the `XERK-1860:` cases in `server.test.js` and `board.test.js`.
+  cap never kills a running child. Board: `epicLimitPickerHtml` in the epic panel; Android
+  `EpicLimitPicker` in `EpicRunSection` (`epicLimitChoices`/`epicLimitLabel` in `core/Board.kt`).
+- Tests: the `XERK-1860:` cases in `server.test.js` and `board.test.js`; `BoardTest.kt`.
 
 ## The driver — `epicRunDriveSweep` (XERK-636)
 

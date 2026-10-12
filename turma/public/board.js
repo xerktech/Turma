@@ -1594,6 +1594,7 @@
     if (q.reason === "blocked") return "⏳ queued · blocked";
     if (q.reason === "paused") return "⏳ queued · usage paused";
     if (q.reason === "rate") return "⏳ queued · rate-limited";
+    if (q.reason === "epic-cap") return "⏳ queued · epic limit";
     return "⏳ queued" + (q.position > 1 ? " · #" + q.position : "");
   }
 
@@ -1610,6 +1611,9 @@
     }
     if (q.reason === "rate") {
       return `${issueKey} is waiting: the org's auto-start rate limit is full — it starts when the window frees a slot`;
+    }
+    if (q.reason === "epic-cap") {
+      return `${issueKey} is waiting: ${q.error || "its epic is at its max running at once"} — it starts when one of them finishes`;
     }
     // "the org's agents" was true before XERK-325 and is not now: only a host
     // that has triaged this ticket to this repo can take it, so a free host that

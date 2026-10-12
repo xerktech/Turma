@@ -201,9 +201,24 @@ data class EpicRunView(
     val waves: List<List<EpicChild>>,
     val cycleChildren: List<EpicChild>,
     val cycle: Boolean,
+    // The run's cap on concurrently-working children (XERK-1860); null = no limit.
+    val maxConcurrent: Int? = null,
 ) {
     fun count(s: EpicChildStatus): Int = counts[s] ?: 0
 }
+
+/**
+ * The "Max running at once" menu for an epic run (XERK-1860), board.js
+ * epicLimitPickerHtml: null (No limit) then 1..10, plus [current] when it is
+ * above that (the hub accepts up to 50) so a cap set elsewhere stays shown.
+ */
+fun epicLimitChoices(current: Int?): List<Int?> {
+    val nums = (1..10).toList()
+    val extra = if (current != null && current >= 1 && current !in nums) listOf(current) else emptyList()
+    return listOf<Int?>(null) + nums + extra
+}
+
+fun epicLimitLabel(limit: Int?): String = if (limit == null || limit < 1) "No limit" else limit.toString()
 
 fun epicRunView(
     run: EpicRun,
@@ -241,6 +256,7 @@ fun epicRunView(
         state = state, paused = run.paused, total = keys.size, done = counts[EpicChildStatus.DONE] ?: 0,
         counts = counts, waves = waves, cycleChildren = cycleChildren,
         cycle = cycleKeys.isNotEmpty(),
+        maxConcurrent = run.maxConcurrent?.takeIf { it >= 1 },
     )
 }
 
@@ -310,7 +326,7 @@ fun epicRunSig(view: EpicRunView?): String {
     if (view == null) return ""
     return "${view.state}|${if (view.paused) "p" else ""}|${view.done}/${view.total}" +
         "|${view.count(EpicChildStatus.RUNNING)},${view.count(EpicChildStatus.READY)}," +
-        "${view.count(EpicChildStatus.BLOCKED)}"
+        "${view.count(EpicChildStatus.BLOCKED)}|m${view.maxConcurrent ?: ""}"
 }
 
 // The epic-builder states, in order (board.js EPIC_BUILDER_STATES / hub
@@ -1316,6 +1332,11 @@ sealed interface StartControl {
          * own), so NOT [blocked] — it just carries its own label and message.
          */
         val paused: Boolean = false,
+        /**
+         * XERK-1860: an epic-run child held because its epic is at its "max
+         * running at once" cap. Self-clearing (it starts when a sibling finishes).
+         */
+        val epicCap: Boolean = false,
     ) : StartControl
     /**
      * A live start button. [clone] marks the repo as not cloned anywhere (the
@@ -1351,6 +1372,7 @@ fun ticketStartControl(
         error = start?.error,
         expired = queued.reason == "expired",
         paused = queued.reason == "paused",
+        epicCap = queued.reason == "epic-cap",
     )
     if (start?.pending == true) return StartControl.Busy
     return StartControl.Button(

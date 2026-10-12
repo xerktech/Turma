@@ -26,7 +26,7 @@ const {
   boardColumnOf, moveSweepVerdict,
   ticketSessionIndex, ticketSessionsOf, sessionChipHtml, ticketStartHtml,
   ticketOutcomeWords, ticketOutcomeLabel, ticketOutcomeOf, ticketOutcomeFieldHtml,
-  queuedTicketOf, queuedTip,
+  queuedTicketOf, queuedTip, queuedLabel,
   startSweepVerdict,
   createFormHtml, createOrgOptions, createProjectOptions, createTypeOptions, createLabelWord,
 } = require("../public/board.js");
@@ -3299,6 +3299,12 @@ test("epicLimitPickerHtml: No limit + 1..10, the current value selected, carried
   const big = epicLimitPickerHtml("E-1", 25, "data-epic-limit");
   assert.match(big, /<option value="25" selected>25<\/option>/, "a cap set past the menu stays selected");
   assert.match(epicLimitPickerHtml("E-1", 1, "data-epic-limit", true), /<select [^>]*disabled/);
+});
+
+test("queuedLabel/queuedTip: an epic-cap hold names the epic limit (XERK-1860)", () => {
+  const q = { reason: "epic-cap", error: "its epic is at its limit of 1 running at once", position: 2 };
+  assert.equal(queuedLabel(q), "⏳ queued · epic limit");
+  assert.match(queuedTip(q, "H-2"), /H-2 is waiting: its epic is at its limit of 1/);
 });
 
 test("epicRunPanelHtml: the cap picker on an armed run, a draft one on an un-armed epic, none once done (XERK-1860)", () => {

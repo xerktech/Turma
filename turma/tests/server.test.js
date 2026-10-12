@@ -14567,6 +14567,38 @@ test("XERK-1860: what holds a slot — live or paused-sleeper session yes; ended
   resetEpicRuns();
 });
 
+test("XERK-1860: the drain enforces the cap — children queued while blocked go out one at a time when it clears", async () => {
+  resetAutoStart();
+  resetEpicRuns();
+  ticketQueue.length = 0;
+  if (agents.edCapA) agents.edCapA.commands = [];
+  const site = "e1860.atlassian.net";
+  await capBeat();
+  armEpicRun(site, "G-1", undefined, { maxConcurrent: 1 });
+  // What the driver leaves behind after a long block: every ready child in line
+  // (a blocked entry holds no slot, so the driver kept queuing).
+  for (const k of ["H-1", "H-2", "H-3"]) assert.ok(enqueueTicketStart(site, k, "manual"));
+  // The block clears (a free host): only ONE goes, the rest hold on the cap.
+  for (let i = 0; i < 8; i++) drainTicketQueue();
+  const first = spawnedKeys("edCapA");
+  assert.equal(first.length, 1, `one child dispatched, got ${first}`);
+  const heldNow = () => ticketQueue.filter((e) => !e.expiredAt);
+  assert.equal(heldNow().length, 2);
+  assert.ok(heldNow().every((e) => e.reason === "epic-cap"));
+  // Held entries never count each other: the first finishing releases exactly one more.
+  await capBeat({ [first[0]]: "done" });
+  for (let i = 0; i < 8; i++) drainTicketQueue();
+  assert.equal(spawnedKeys("edCapA").length, 2);
+  assert.equal(heldNow().length, 1);
+  assert.equal(heldNow()[0].reason, "epic-cap");
+  // An uncapped run's children are never held by it.
+  setEpicRunLimit(site, "G-1", null);
+  for (let i = 0; i < 8; i++) drainTicketQueue();
+  assert.deepEqual(spawnedKeys("edCapA").sort(), ["H-1", "H-2", "H-3"]);
+  ticketQueue.length = 0;
+  resetEpicRuns();
+});
+
 test("XERK-1860: the epic-run route sets, keeps and clears the cap, and refuses bad values", async () => {
   resetEpicRuns();
   await epicBeat("edCapR", "e1860r.atlassian.net");
@@ -14608,8 +14640,11 @@ test("XERK-1860: the epic-run route sets, keeps and clears the cap, and refuses 
     assert.equal(r.status, 400, JSON.stringify(body));
   }
   // A non-object body is refused, never an arm.
-  r = await post("E-1", 5);
-  assert.equal(r.status, 400);
+  for (const body of [5, [1], "x"]) {
+    r = await post("E-1", body);
+    assert.equal(r.status, 400, JSON.stringify(body));
+    assert.match(r.body.error, /JSON object/);
+  }
   resetEpicRuns();
 });
 

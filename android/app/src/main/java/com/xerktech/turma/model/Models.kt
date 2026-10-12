@@ -222,6 +222,9 @@ data class EpicRun(
     // Operator hold (XERK-641): a paused run starts no new children and its running
     // children are left alone until Resume. Absent on an older hub → false.
     val paused: Boolean = false,
+    // Operator cap on how many of the run's children work at once (XERK-1860);
+    // absent = no limit. The hub only ever stores an int 1..50 (sanitizeEpicRunRecord).
+    val maxConcurrent: Int? = null,
     val startedAt: Long = 0,
     val updatedAt: Long = 0,
 )

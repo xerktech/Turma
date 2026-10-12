@@ -1374,9 +1374,10 @@ class BoardTest {
         waves: List<List<String>> = listOf(listOf("C-1"), listOf("C-2", "C-3")),
         cycle: List<String> = emptyList(),
         paused: Boolean = false,
+        maxConcurrent: Int? = null,
     ) = com.xerktech.turma.model.EpicRun(
         epicKey = "E-1", siteKey = "org", state = state, children = children, waves = waves,
-        cycle = cycle, paused = paused)
+        cycle = cycle, paused = paused, maxConcurrent = maxConcurrent)
 
     private fun epicSess(status: String) = TicketSession(
         host = "h", id = "s", transcriptId = "t", status = status, gitBranch = "", ticketBranch = "",
@@ -1522,6 +1523,30 @@ class BoardTest {
         val running = epicRunSig(epicRunView(mkRun(), site, emptyMap()))
         val held = epicRunSig(epicRunView(mkRun(paused = true), site, emptyMap()))
         assertTrue(running != held)
+    }
+
+    @Test fun `epicRunView surfaces the per-epic cap and the sig reflects it (XERK-1860)`() {
+        val site = epicSite(listOf(child("C-1"), child("C-2"), child("C-3")))
+        assertNull(epicRunView(mkRun(), site, emptyMap()).maxConcurrent)
+        assertEquals(2, epicRunView(mkRun(maxConcurrent = 2), site, emptyMap()).maxConcurrent)
+        assertNull(epicRunView(mkRun(maxConcurrent = 0), site, emptyMap()).maxConcurrent)
+        assertTrue(epicRunSig(epicRunView(mkRun(), site, emptyMap())) !=
+            epicRunSig(epicRunView(mkRun(maxConcurrent = 2), site, emptyMap())))
+    }
+
+    @Test fun `epicLimitChoices is No limit then 1 to 10, carrying a larger current value (XERK-1860)`() {
+        assertEquals(listOf<Int?>(null) + (1..10).toList(), epicLimitChoices(null))
+        assertEquals(listOf<Int?>(null) + (1..10).toList(), epicLimitChoices(4))
+        assertEquals(listOf<Int?>(null) + (1..10).toList() + 25, epicLimitChoices(25))
+        assertEquals("No limit", epicLimitLabel(null))
+        assertEquals("3", epicLimitLabel(3))
+    }
+
+    @Test fun `an epic-cap queue hold is its own self-clearing state (XERK-1860)`() {
+        val c = ticketStartControl(guessed(true), 0, null, queued(reason = "epic-cap")) as StartControl.Queued
+        assertTrue(c.epicCap)
+        assertFalse(c.blocked)
+        assertFalse(c.paused)
     }
 
     @Test fun `rateMaxError validates the policy-sheet rate field`() {

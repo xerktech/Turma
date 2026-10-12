@@ -3828,21 +3828,34 @@ function advanceEpicRunState(run, rows) {
 // startedTicketKeys: that counts KILLED sessions too, so a finished child would
 // hold its slot forever.
 const EPIC_CHILD_LAUNCH_GRACE_MS = 3 * 60_000;
-function epicRunActiveCount(run, rows, now) {
+// `exclude` (a queue key) leaves one child out — the drain asking "may THIS one
+// go?". Queue entries held by the cap itself (reason "epic-cap") never count:
+// two held children counting each other would deadlock once the slot frees.
+function epicRunActiveCount(run, rows, now, exclude) {
   const live = liveTicketSessionKeys();
   let n = 0;
   for (const childKey of run.children || []) {
     const k = ticketQueueKey(run.siteKey, childKey);
+    if (k === exclude) continue;
     const hit = rows.get(k);
     if (hit && hit.row && hit.row.statusCategory === "done") continue;
     const att = epicChildAttempts.get(k);
     const q = liveQueuedTicket(run.siteKey, childKey);
-    if (live.has(k) || (q && q.reason !== "blocked")
+    if (live.has(k) || (q && q.reason !== "blocked" && q.reason !== "epic-cap")
       || spawnTicketInFlight(run.siteKey, childKey)
       || committedTicketSpawn(run.siteKey, childKey)
       || (att && Number.isFinite(att.at) && now - att.at < EPIC_CHILD_LAUNCH_GRACE_MS)) n++;
   }
   return n;
+}
+// The armed, capped run a queued ticket is a child of, or null (XERK-1860). Hub-
+// owned membership (`run.children`), like epicRunChildSession.
+function cappedEpicRunOf(siteKey, issueKey) {
+  for (const run of Object.values(epicRuns)) {
+    if (run && run.maxConcurrent && run.state !== "done" && run.siteKey === siteKey
+      && (run.children || []).includes(issueKey)) return run;
+  }
+  return null;
 }
 function epicRunDriveSweep() {
   const runKeys = Object.keys(epicRuns);
@@ -14156,6 +14169,19 @@ function drainTicketQueue() {
     if (e.source === "auto" &&
         (triageAction === "hold" || triageAction === "reject")) {
       drop(`it was ${triageAction} by triage while it waited`);
+      continue;
+    }
+    // XERK-1860: an epic-run child dispatches only while its epic is under its
+    // "max running at once" cap. The driver stops QUEUING at the cap, but a child
+    // it queued while others were `blocked` (not counted, so a stuck child can't
+    // stall the run) would otherwise all dispatch the moment the block cleared.
+    // Held here as "epic-cap" — self-clearing, never aged out as blocked.
+    const capRun = cappedEpicRunOf(e.siteKey, e.issueKey);
+    if (capRun && epicRunActiveCount(capRun, rows, now, ticketQueueKey(e.siteKey, e.issueKey))
+      >= capRun.maxConcurrent) {
+      changed = holdQueued(e, "epic-cap",
+        `its epic is at its limit of ${capRun.maxConcurrent} running at once`) || changed;
+      if (e.blockedSince) { e.blockedSince = 0; changed = true; }
       continue;
     }
     const { host, error, full, paused } = findTicketHost(

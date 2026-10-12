@@ -951,10 +951,6 @@ those are marked `[MODEL]`.
   across SSE re-renders. Moot until Android grows a usage table view (see the Usage P1 above).
 
 ### Board (`board.js` → `BoardScreen`/`core/Board`)
-- **P2 — epic run "Max running at once" cap (XERK-1860) is WEB-ONLY.** The web epic panel offers a
-  per-epic cap on concurrently-working children (`epicLimitPickerHtml`, POST `{maxConcurrent}` /
-  `{arm:true, maxConcurrent}`). Android neither shows nor edits it; the hub still enforces a cap set
-  from the web. The run record's new `maxConcurrent` key is untyped there, so decode is unaffected.
 - Azure DevOps org support (XERK-43) is at parity for free: the agent reports Azure work items in the
   SAME `jira` heartbeat block, ticket shape and detail shape as Jira (with `source:"azure"`), so the
   board renders them unchanged. The only client-side change was `orgName` — now takes the last path
