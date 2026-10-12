@@ -176,9 +176,11 @@ jobs:
                     | select(.workflow_run.head_repository_id == .workflow_run.repository_id)
                     | .workflow_run.id') || runs=
             for id in $runs; do
-              if gh api "repos/$REPO/actions/runs/$id" \
-                  --jq 'select(.path == ".github/workflows/code-scan.yml" and .event == "pull_request") | .html_url' \
-                  | grep -q .; then
+              # Captured, not piped to grep -q: under pipefail an early-exiting
+              # grep can SIGPIPE gh and read a real match as a miss.
+              url=$(gh api "repos/$REPO/actions/runs/$id" \
+                --jq 'select(.path == ".github/workflows/code-scan.yml" and .event == "pull_request") | .html_url') || url=
+              if [ -n "$url" ]; then
                 tested=true
                 echo "Tree $tree already passed Unit tests in PR run $id; skipping the re-run."
                 break
