@@ -44433,6 +44433,16 @@ class TestDefectAttribution(unittest.TestCase):
         self.assertEqual(len(reverts), 1)
         self.assertEqual(len(reverts[0]["introducers"]), ha.DEFECT_INTRODUCERS_MAX)
 
+    def test_a_squash_past_the_revert_line_bound_names_nothing(self):
+        n = ha.DEFECT_SQUASH_REVERTS_MAX + 1
+        shas = [self.commit({f"f{i}.py": f"{i}\n"}, f"XERK-1: add {i}") for i in range(n)]
+        body = "".join(f"This reverts commit {x}.\n\n" for x in shas)
+        self.commit({f"f{i}.py": "" for i in range(n)}, f"XERK-4: revert many (#9)\n\n{body}")
+        self.assertEqual([r for r in self.scan()[1] if r["kind"] == "revert"], [])
+        # At the bound, every line is checked and the squash still reports.
+        with mock.patch.object(ha, "DEFECT_SQUASH_REVERTS_MAX", n):
+            self.assertEqual(len([r for r in self.scan()[1] if r["kind"] == "revert"]), 1)
+
     def test_an_unplaceable_blamed_commit_stands_as_itself(self):
         self.commit({"app.py": "a = 1\nb = 2\nc = 3\n"}, "XERK-2: fix b")
         with mock.patch.object(ha, "_defect_landing", return_value=None):

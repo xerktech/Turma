@@ -8049,6 +8049,7 @@ DEFECT_REPORTS_PER_BEAT = 25       # one rotating page a beat
 DEFECT_CLASSES_MAX = 5000
 DEFECT_BLAME_RANGES_MAX = 200      # -L ranges per file per fix
 DEFECT_GIT_TIMEOUT = 120           # one git call; off the beat
+DEFECT_SQUASH_REVERTS_MAX = 50     # revert lines one squash may name and still be read
 _DEFECT_SHA_RE = re.compile(r"^[0-9a-f]{40}$")
 # Anchored to a line start: git's own revert message, not a quote of one.
 _REVERT_RE = re.compile(r"(?m)^This reverts commit ([0-9a-f]{40})(?:\.|, reversing)?[ \t]*$")
@@ -8275,9 +8276,10 @@ def _defect_revert_targets(repo, sha, message, parents):
     # naming a commit that never reached the default branch is a revert the
     # branch made and squashed away (revert, then re-apply), whose effect the
     # message cannot show. Ambiguous, so the squash names no revert target.
-    # Checked over ALL its lines (bounded), before the introducer cap.
-    own = list(dict.fromkeys(t for r, t in pairs if r == sha))[:50]
-    if not all(on_main(t) for t in own):
+    # Checked over ALL its lines before the introducer cap; past
+    # DEFECT_SQUASH_REVERTS_MAX lines it is too long to check and names nothing.
+    own = list(dict.fromkeys(t for r, t in pairs if r == sha))
+    if len(own) > DEFECT_SQUASH_REVERTS_MAX or not all(on_main(t) for t in own):
         return []
     return [t for t in found[:DEFECT_INTRODUCERS_MAX * 2] if on_main(t)]
 
