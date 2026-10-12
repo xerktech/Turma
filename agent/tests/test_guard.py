@@ -5806,7 +5806,9 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         for text in ("cd " + ">a1" * 20000 + " x", "cd" + " -P" * 10000 + " q",
                      "HOME=/; cd " + ">'cd " * 20000 + "x", "cd > cd " * 20000 + " x",
                      "cd >{cd " * 20000, 'cd >"cd ' * 20000, "cd <<<'cd " * 20000,
-                     "cd >$(cd " * 20000, "cd < <(cd " * 20000):
+                     "cd >$(cd " * 20000, "cd < <(cd " * 20000,
+                     # Glued, every `cd` starts a walk: quadratic without the cap.
+                     "cd" + ">{cd" * 2500):
             guard._bare_cds(text)
         self.assertLess(time.process_time() - t, 3)
         self.assertEqual(guard._bare_cds("cd >/dev/null /etc; cd -"), "cd >/dev/null /etc; cd -")
@@ -5832,11 +5834,19 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "HOME=/; cd 2>/dev/null --; rm -rf etc", "HOME=/; cd >/dev/null -P; rm -rf etc",
                     "HOME=/; cd # home\nrm -rf etc", "HOME=/; cd >/dev/null # h\nrm -rf etc",
                     "HOME=/; cd \\\n>/dev/null; rm -rf etc",
+                    "HOME=/; cd <<<${x:-a b}; rm -rf etc", "HOME=/; cd -P\\\n; rm -rf etc",
+                    # An option bash dequotes is still an option.
+                    "HOME=/; cd '-P'; rm -rf etc", "HOME=/; cd -P''; rm -rf etc",
+                    "HOME=/; cd \\-P; rm -rf etc", "HOME=/; cd $'-P'; rm -rf etc",
+                    "HOME=/; cd >/dev/null '--'; rm -rf etc",
+                    # With no arguments (every top-level call) `cd "$@"` goes home.
+                    'cd "$@"; rm -rf *', "cd $*; rm -rf .ssh",
                     "HOME=/; bash -c 'cd <<<\"a b\"; rm -rf etc'",
                     "HOME=/; cd >" + "a" * 100 + "; rm -rf etc"):
             with self.subTest(cmd=cmd[:40]):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "deny")
         for cmd in ("HOME=/; cd <<<x /tmp; rm -rf etc", "HOME=/; cd <>f /tmp; rm -rf etc",
+                    "HOME=/; cd \\\n/tmp; rm -rf etc", 'f(){ cd "$@"; make; }; f /tmp',
                     "HOME=/; cd >" + "a" * 100 + " /tmp; rm -rf etc"):
             with self.subTest(cmd=cmd[:40]):
                 self.assertEqual(guard.decide("Bash", {"command": cmd}, cwd="/tmp")[0], "allow")

@@ -52,6 +52,9 @@ paths:
     - It walks 8 of them, targets up to 256 chars; a 9th, a longer target, or one it cannot read
       (quoted, `$`, `\`, `$(…)`, `<(…)`) reads as bare. Accepted over-read when an operand follows.
     - Positive evidence on purpose: each "this ends a bare cd" list missed a spelling (4 QA passes).
+    - A word bash dequotes to an option (`'-P'`, `-P''`, `\-P`, `$'-P'`) or to nothing (`""`,
+      `"$@"`/`$*`: a top-level call has no arguments) is walked past, not an operand.
+  - `_cd_targets` also reads `cd "$@"`/`$*` as going home: `cd "$@"; rm -rf *` wiped it (rollup).
   - Never a lookahead regex there: one rescanned a `cd >'cd >'cd …` chain per `cd`, 720s on
     250 KB through the hook, past its timeout (which RUNS the command).
   - `~-` reads as `$OLDPWD`, and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD` (XERK-1696);
