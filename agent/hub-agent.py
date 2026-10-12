@@ -5267,11 +5267,10 @@ def hook_integrity_failures(script_dir=None):
         present = os.listdir(os.path.join(script_dir, "hooks"))
     except OSError:
         present = []
-    # __pycache__ is legitimate: the manager imports permlog.py/guard.py as
-    # modules and writes their bytecode. A HOOK run as a script never imports
-    # from it (no sourceless import from __pycache__), so it cannot shadow the
-    # stdlib for guard.py; the manager's own loaders do read it, but that uid can
-    # already rewrite hub-agent.py itself.
+    # __pycache__ is tolerated: an older manager imported permlog.py/guard.py
+    # as modules and wrote bytecode there. Nothing reads it now — a HOOK run as
+    # a script never imports from it, and the manager compiles both from
+    # source (`_load_hook_source`).
     bad += [f"hooks/{name}" for name in present
             if f"hooks/{name}" not in expected and name != "__pycache__"]
     return sorted(bad)
@@ -13611,7 +13610,13 @@ def guard_xargs_value_opts():
     """guard.py's xargs options that take a separate value (its own list, so
     both readers agree where xargs' command word starts)."""
     guard = _guard_module()
-    return getattr(guard, "_XARGS_OPTS_WITH_VALUE", ()) if guard else ()
+    if not guard:
+        return ()
+    # Read the tables guard.py has now: the old `_XARGS_OPTS_WITH_VALUE` was
+    # dropped there, and this read () ever since (rollup XERK-1584).
+    shorts = getattr(guard, "_XARGS_SHORT_VALUE", ())
+    longs = getattr(guard, "_XARGS_LONG_OPTS", {})
+    return frozenset([f"-{c}" for c in shorts] + [o for o, needs in longs.items() if needs])
 
 
 def _judge_family_reason(guard, tokens):

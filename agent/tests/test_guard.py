@@ -4546,12 +4546,29 @@ class TestClassification(unittest.TestCase):
                     'pwsh -Command "Remove-Item -Recurse -Force C:\\Windows\\System32"',
                     "powershell -c \"Remove-Item -Recurse -Force 'C:\\Program Files'\"",
                     'powershell -c "Remove-Item -Recurse -Force C:\\Windows; echo hi"',
-                    'powershell -c "rd /s /q C:\\Windows"'):
+                    'powershell -c "rd /s /q C:\\Windows"',
+                    'cmd /c "rd /s /q C:\\Windows"',
+                    'powershell.exe -NoProfile -Command "Remove-Item -Recurse C:\\Windows"',
+                    # Backtick escapes, a bound value, a wildcard, lists, aliases
+                    # and switch abbreviations all reach the same path (QA).
+                    'powershell -c "Remove-Item -Recurse C:\\Win`dows"',
+                    'powershell -c "Remove-Item -Recurse -Path:C:\\Windows"',
+                    'powershell -c "Remove-Item -Recurse C:\\Windows\\*"',
+                    'powershell -c "Remove-Item -Recurse .\\a,C:\\Windows"',
+                    "powershell -c \"Remove-Item -Recurse @('.\\a','C:\\Windows')\"",
+                    'powershell -c "ri -r C:\\Windows"',
+                    'powershell -c "del -Rec C:\\Windows"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
                     'powershell -c "Get-ChildItem C:\\Windows; Remove-Item -Recurse -Force .\\dist"',
-                    'powershell -c "Get-ChildItem C:\\Windows -Recurse"'):
+                    'powershell -c "Get-ChildItem C:\\Windows -Recurse"',
+                    'powershell -c "Remove-Item -Recurse .\\dist\\*"',
+                    # Quoted text naming such a script is no script (QA).
+                    'git commit -m "guard: deny Remove-Item -Recurse C:\\Windows in powershell -c"',
+                    'rg -n "Remove-Item -Recurse -Force C:/Windows" agent/',
+                    'grep -rn "rd /s /q C:\\Windows" agent/tests',
+                    'echo "Remove-Item -Recurse C:\\Users is blocked"'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
@@ -5774,6 +5791,11 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     "$(false || echo rm -rf /etc | rg .)",
                     "$(false || echo rm -rf /etc | zgrep .)",
                     "$(false || echo rm -rf /etc | rg -e -q)",
+                    # rg's -L is --follow; these long options take a value (QA).
+                    "$(false || echo rm -rf /etc | rg -L .)",
+                    "$(false || echo rm -rf /etc | rg --context-separator -c .)",
+                    "$(false || echo rm -rf /etc | rg --ignore-file -c .)",
+                    "$(false || echo rm -rf /etc | xzgrep .)",
                     # A quoted `$((` is not arithmetic around a later substitution.
                     "X=\"$((\" $(false || echo rm -rf /etc) \"))\"",
                     "echo '$((' ; $(ls -d /usr/bin/rm /nope || echo -rf /etc) ; echo '))'",

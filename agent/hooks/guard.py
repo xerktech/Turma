@@ -1224,7 +1224,8 @@ _REWRITE_FILTERS = {"sed", "tr", "awk", "gawk", "mawk", "nawk", "cut", "rev",
 # A grep prints the lines it selects, so it filters like `sed` — unless a flag
 # makes it print nothing, a count or file names instead (XERK-1617 QA:
 # `$(false || echo rm -rf / | grep .)`).
-_GREP_PROGS = {"grep", "egrep", "fgrep", "zgrep", "zegrep", "zfgrep"}
+_GREP_PROGS = {"grep", "egrep", "fgrep", "zgrep", "zegrep", "zfgrep", "xzgrep",
+               "xzegrep", "xzfgrep", "lzgrep", "bzgrep", "zstdgrep"}
 # Short and long options that print no line text, and those taking a value
 # (the value is skipped, so `-e -q` is a pattern, not quiet).
 _GREP_NO_LINES = set("qclL")
@@ -1238,7 +1239,7 @@ _GREP_VALUE_LONG = {"--regexp", "--file", "--max-count", "--after-context",
 # ripgrep's own (rollup XERK-1584: `$(false || echo … | rg .)` stayed opaque).
 # `-r/--replace` rewrites the line, which the taint reading passes through
 # like `sed`.
-_RG_NO_LINES = set("qclL")
+_RG_NO_LINES = set("qcl")   # rg's -L is --follow, which prints lines
 _RG_NO_LINES_LONG = {"--quiet", "--count", "--count-matches", "--files-with-matches",
                      "--files-without-match", "--files", "--type-list"}
 _RG_VALUE_SHORT = set("efgtTmABCjMrEd")
@@ -1246,7 +1247,10 @@ _RG_VALUE_LONG = {"--regexp", "--file", "--glob", "--iglob", "--type", "--type-n
                   "--max-count", "--after-context", "--before-context", "--context",
                   "--threads", "--max-columns", "--replace", "--encoding",
                   "--max-depth", "--type-add", "--color", "--colors", "--sort",
-                  "--sortr", "--pre", "--pre-glob", "--path-separator"}
+                  "--sortr", "--pre", "--pre-glob", "--path-separator",
+                  "--context-separator", "--field-match-separator",
+                  "--field-context-separator", "--ignore-file", "--type-clear",
+                  "--hostname-bin"}
 _GREP_OPTION_TABLES = {
     **{p: (_GREP_NO_LINES, _GREP_NO_LINES_LONG, _GREP_VALUE_SHORT,
            _GREP_VALUE_LONG - {"--color", "--colour"}) for p in _GREP_PROGS},
@@ -12407,16 +12411,22 @@ def _destructive_rm(tokens: list[str]) -> str | None:
     return None
 
 
+_PS_SHELLS = {"powershell", "pwsh", "cmd"}
+_PS_SCRIPT_FLAGS = {"-c", "-command", "/c", "/k"}
+_PS_REMOVE_CMDS = {"remove-item", "ri", "rm", "del", "erase", "rd", "rmdir"}
+_PS_SHELL_RE = re.compile(r"\b(?:powershell|pwsh|cmd)(?:\.exe)?\b")
+
+
 def _ps_statements(script: str) -> list[list[str]]:
-    """A PowerShell script's statements (cut at `;`, `|`, `&`), each its words
-    with quotes removed and backslashes kept (`'C:\\Program Files'` is one
-    word). Unbalanced quotes fall back to blank-separated words."""
+    """A PowerShell/cmd script's statements (cut at `;`, `|`, `&`), each its
+    words with quotes and backtick escapes removed and backslashes kept
+    (`'C:\\Program Files'` is one word). Unbalanced quotes fall back to blanks."""
     try:
-        lex = shlex.shlex(script, posix=False, punctuation_chars=";|&")
+        lex = shlex.shlex(script.replace("`", ""), posix=False, punctuation_chars=";|&")
         lex.whitespace_split = True
         words = list(lex)
     except ValueError:
-        words = script.split()
+        words = script.replace("`", "").split()
     out: list[list[str]] = [[]]
     for w in words:
         if w and set(w) <= set(";|&"):
@@ -12424,6 +12434,56 @@ def _ps_statements(script: str) -> list[list[str]]:
         else:
             out[-1].append(w[1:-1] if len(w) > 1 and w[0] == w[-1] and w[0] in "'\"" else w)
     return [st for st in out if st]
+
+
+def _ps_targets(word: str) -> list[str]:
+    """The paths one PowerShell word may name: `-Path:C:\\x` binds its value,
+    `a,b` and `@('a','b')` are lists, and `x\\*` empties the directory x."""
+    if word.startswith("-") and ":" in word:
+        word = word.split(":", 1)[1]
+    out = []
+    for part in re.split(r"[,()@]", word):
+        part = part.strip().strip("'\"")
+        if part:
+            out.append(part)
+            if part.endswith(("\\*", "/*")):
+                out.append(part[:-2])
+    return out
+
+
+def _ps_recursive_remove_words(st: list[str]) -> bool:
+    """A statement that recursively deletes: a remove command or alias with an
+    abbreviation of `-Recurse` (or `/s` for rd/rmdir), or a `*` target."""
+    if not st or st[0].lower() not in _PS_REMOVE_CMDS:
+        return False
+    low = [w.lower() for w in st[1:]]
+    return any((len(w) >= 2 and "-recurse".startswith(w.split(":", 1)[0])) or w == "/s"
+               or w.endswith("*") for w in low)
+
+
+def _ps_script_reason(tokens: list[str]) -> str | None:
+    """Judge the script a `powershell -c "…"`, `pwsh -Command …` or
+    `cmd /c …` runs: each recursive-remove statement's targets (rollup
+    XERK-1584). Only a real script argument: quoted text in a commit message
+    or a grep pattern is not one."""
+    for i, tok in enumerate(tokens):
+        prog = re.sub(r"\.exe$", "", _basename(tok).lower())
+        if prog not in _PS_SHELLS:
+            continue
+        j = i + 1
+        while j < len(tokens) and tokens[j].lower() not in _PS_SCRIPT_FLAGS:
+            if not tokens[j].startswith(("-", "/")):
+                break
+            j += 1
+        if j >= len(tokens) or tokens[j].lower() not in _PS_SCRIPT_FLAGS:
+            continue
+        for st in _ps_statements(" ".join(tokens[j + 1:])):
+            if _ps_recursive_remove_words(st):
+                for word in st[1:]:
+                    for target in _ps_targets(word):
+                        if _is_dangerous_path(target):
+                            return f"refusing recursive delete of a protected path ({target!r})"
+    return None
 
 
 def _ps_recursive_remove(low: str) -> bool:
@@ -12435,19 +12495,15 @@ def _ps_recursive_remove(low: str) -> bool:
 
 def _destructive_powershell_remove(segment: str) -> str | None:
     low = segment.lower()
+    if _PS_SHELL_RE.search(low):
+        reason = _ps_script_reason(_tokenize(segment))
+        if reason:
+            return reason
     if not _ps_recursive_remove(low):
         return None
     for tok in _tokenize(segment):
         if _is_dangerous_path(tok):
             return f"refusing recursive delete of a protected path ({tok!r})"
-        # A `powershell -c "…"` script is one quoted token here: judge each of
-        # its recursive-remove statements' words (rollup XERK-1584).
-        if " " in tok:
-            for st in _ps_statements(tok):
-                if _ps_recursive_remove(" ".join(st).lower()):
-                    for word in st:
-                        if _is_dangerous_path(word):
-                            return f"refusing recursive delete of a protected path ({word!r})"
     # Bare drive/home targets without quotes.
     if re.search(r"(c:\\?|%userprofile%|\$home|~)\s*($|['\"])", low):
         return "refusing recursive delete of a protected path"

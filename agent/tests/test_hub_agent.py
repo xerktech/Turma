@@ -26470,10 +26470,11 @@ class TestPokeHeartbeat(unittest.TestCase):
         # manager, or RecursionError out of run_forever. Drive the real shape:
         # this (main) thread loops clear()/wait() like run_forever while another
         # process fires SIGUSR1 as fast as it can.
-        # XERK-1606: a Python-function handler still nested here (~15 deep
-        # unloaded, the full recursion limit under suite load), so the burst runs
-        # with the limit just above the current depth: nesting then fails it on
-        # some runs even unloaded; the handler-type test below is the sure gate.
+        # XERK-1606: a Python-function handler nests under a burst, so the burst
+        # runs with the limit just above the real current depth. That proves the
+        # INSTALLED handler neither wedges nor recurses; it does not reliably
+        # catch a nesting one (QA: a Python handler passed 26/27 runs here), so
+        # the handler-type test below is the gate for that.
         self._install()
         depth, f = 0, sys._getframe()
         while f:
