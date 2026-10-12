@@ -49,6 +49,9 @@ paths:
   - The strip lost busybox ITSELF as a `-c` shell (`busybox script -qc '…'`), so `_expand`
     adds a reading of the words from `busybox` on with it as `sh`. Keep both: an applet-only
     added reading (no strip) lost the pipe readers; the strip alone lost `-c` (3 QA passes).
+  - `toybox`, `busybox.static` and `busybox-static` are read as `busybox` (`_basename`'s
+    `_MULTICALL_ALIASES`), so every rule above reaches them; the raw-text shell regexes list
+    them too. Unmapped, `toybox rm -rf /etc` ran (rollup XERK-1701).
   - One reading, both ends: per-end readings let `"$x/etc$y"` through each one.
   - Scan per NAME, never per run: a run restarted after a blocking `${x:-a}` rescans.
 - That reading is judged with `trailing=False`: XERK-1623's trailing-name reading on top

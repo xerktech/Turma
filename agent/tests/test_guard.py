@@ -6193,14 +6193,20 @@ class TestGroupsHoldingOperators(unittest.TestCase):
                     # ...and a pipe still reaches the applet (QA).
                     "echo 'rm -rf /etc' | busybox env sh", "echo /etc | busybox xargs rm -rf",
                     "echo 'rm -rf /etc' | busybox xargs -0 busybox hush -c",
-                    'busybox find "$x/$y" | xargs rm -rf'):
+                    'busybox find "$x/$y" | xargs rm -rf',
+                    # Other names of a multi-call binary run the applet the same way.
+                    "toybox rm -rf /etc", "/bin/toybox rm -rf /etc", "busybox.static rm -rf /etc",
+                    "busybox-static rm -rf /etc", 'toybox rm -rf "$x/$y"',
+                    "toybox sh -c 'rm -rf /etc'", "echo 'rm -rf /etc' | toybox sh",
+                    "echo 'rm -rf /etc' | busybox-static hush"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('rm -rf "$x/$y"', 'rm -rf "$dir/$f"', 'chmod 644 "$x/$y"', 'find "$x/$y" -name a',
                     'find "$dir/$f" -exec grep -l x {} +', 'chmod -R 755 "$dir"/build',
                     'find "$d"/out -delete', 'busybox rm -rf "$dir"/build', "busybox ls /",
                     'find "$dir"/out -name "*.o" | xargs rm -f', "busybox tar -czf x.tgz dir",
-                    "echo hi | busybox hush"):
+                    "echo hi | busybox hush", "toybox ls -la", "busybox.static ls /",
+                    'toybox rm -rf "$dir"/build'):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 

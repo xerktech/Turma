@@ -7877,8 +7877,16 @@ def _herestrings(stage: str) -> list[str]:
 _FED_TEXT_CAP = 64
 
 
+# Other names a multi-call binary goes by, read as `busybox`: each runs the
+# applet its first argument names (`toybox rm -rf /etc`), so every busybox rule
+# (wrapper stripping, its shells, its `rm` with no preserve-root) applies.
+_MULTICALL_ALIASES = {"toybox": "busybox", "busybox.static": "busybox",
+                      "busybox-static": "busybox"}
+
+
 def _basename(prog: str) -> str:
-    return re.split(r"[\\/]", prog)[-1].lower()
+    name = re.split(r"[\\/]", prog)[-1].lower()
+    return _MULTICALL_ALIASES.get(name, name)
 
 
 # GNU xargs' long options, True where a value is REQUIRED (attached or the next
@@ -8900,7 +8908,7 @@ def _ungrouped(segment: str) -> tuple[str, ...]:
 
 # A shell named anywhere on a line, as a word: `/bin/sh`, `X=')' bash`.
 _SHELL_WORD_RE = re.compile(
-    r"(?<![\w.-])(?:bash|sh|zsh|ksh|dash|ash|hush|msh|busybox|su|eval|source)(?![\w.-])"
+    r"(?<![\w.-])(?:bash|sh|zsh|ksh|dash|ash|hush|msh|busybox(?:[.-]static)?|toybox|su|eval|source)(?![\w.-])"
     r"|(?:^|(?<=[\s;&|({]))\.(?=\s)")
 
 
@@ -10290,7 +10298,7 @@ _CMD_START = (r"(?:^|[;&|({`\n'\"]|\b(?:then|do|else|elif|if|while|until|exec|en
               r"nohup|command|builtin|time|timeout\s+\S+)\s)\s*"
               r"(?:[A-Za-z_][A-Za-z0-9_]*=\S*\s+)*")
 _RUNS_UNNAMED_RE = re.compile(
-    _CMD_START + r"(?:[^\s;&|'\"]*/)?(?:(?:(?:ba|da|z|k|a)?sh|busybox)"
+    _CMD_START + r"(?:[^\s;&|'\"]*/)?(?:(?:(?:ba|da|z|k|a)?sh|busybox(?:[.-]static)?|toybox)"
     r"(?=[ \t]*(?:$|[;&|)<'\"\n]|-[a-zA-Z]*s\b|-\s|/dev/|/proc/))"
     r"|(?:source|\.|eval|xargs|hash)(?=$|[\s;&|)<'\"]))"
     r"|\s-(?:exec|execdir|ok|okdir)\b|\bPATH\+?=")
@@ -14566,7 +14574,7 @@ _UNREADABLE_REASON = ("the guard can't read this command with confidence (it use
 # '…'` payloads from tripping.
 _UNREAD_LIVE = ("", '"', '{"')
 
-_UNREAD_SHELL = r"(?:bash|sh|zsh|ksh|dash|ash|busybox|su)"
+_UNREAD_SHELL = r"(?:bash|sh|zsh|ksh|dash|ash|busybox(?:[.-]static)?|toybox|su)"
 # A destructive file op named anywhere (quoting-blind: a verb hidden in a value,
 # here-string or heredoc body is still the sink the marker reaches).
 _UNREAD_SINK_DESTRUCTIVE_RE = re.compile(
