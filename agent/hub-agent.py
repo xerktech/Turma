@@ -4887,6 +4887,9 @@ _GUARD_DENY_PATH_RULES = [
     # how the CLI works), which is why the manager reads every file in it as
     # untrusted (_read_untrusted_json).
     "Edit(~/.turma/session-requests/**)",
+    # The shadow-run ledger (XERK-1847): a session must not rewrite the record
+    # of its own (or another) run — the manager re-validates it on load anyway.
+    "Edit(~/.turma/shadow-runs.json)",
     # The qwen safety-guard shim config (XERK-510 [Qwen F]) — it holds the hook
     # script paths and the credential/runtime-code globs the qwen PreToolUse shim
     # enforces, so a session that rewrote it could disable its own guard. Adding
@@ -16999,6 +17002,191 @@ def read_wake_request(session_id):
     return {"wakeAt": at, "wakeReason": reason or None}
 
 
+# ---- shadow runs (XERK-1847) ------------------------------------------------------
+#
+# After a live ticket's PR merges, the hub samples it and sends `spawnShadow`: re-do
+# the same ticket on a cheaper candidate model, from the merged PR's PARENT commit,
+# so an Opus grader can compare the result with what merged
+# (docs/model-quality-adr.md, "Shadow runs"). Two sessions per run, both flagged
+# `shadow` on the record: the RUN (candidate model) and the GRADE (Opus). Neither may
+# publish — the launch sets TURMA_SHADOW, which the guard reads to deny push / PR /
+# tracker / API writes, strips the tracker credentials and connects no MCP server.
+# Neither carries a `ticket` block, so no hub ticket sweep (auto-stop on Done,
+# auto-merge, close-ticket, the ladder) ever acts on it.
+
+MODEL_SHADOW = os.environ.get("TURMA_MODEL_SHADOW", "1") != "0"
+SHADOW_RUNS_PATH = os.path.join(REGISTRY_DIR, "shadow-runs.json")
+SHADOW_RUNS_MAX = 50
+# Session/transcript ids of past shadow sessions, kept so none is ever resumed.
+SHADOW_SESSIONS_KEEP = 2000
+SHADOW_RUNS_FILE_MAX_BYTES = 512 * 1024
+SHADOW_RUN_TIMEOUT_SEC = _env_int("TURMA_SHADOW_RUN_TIMEOUT_SEC", 3 * 3600, minimum=600)
+SHADOW_GRADE_TIMEOUT_SEC = _env_int("TURMA_SHADOW_GRADE_TIMEOUT_SEC", 2 * 3600, minimum=600)
+# A terminal record is reported for this long (the hub's ledger is durable), then dropped.
+SHADOW_KEEP_SEC = 3 * 86400
+SHADOW_ID_RE = re.compile(r"sh-[0-9a-f]{8,32}")
+SHADOW_SHA_RE = re.compile(r"[0-9a-f]{40}")
+SHADOW_GRADER_MODEL = "opus"
+SHADOW_NOTE_MAX = 2000
+SHADOW_GRADE_NOTE_MAX = 500
+SHADOW_GRADE_ENUMS = {
+    "verdict": ("good", "bad"), "tests": ("pass", "fail", "none"),
+    "qa": ("pass", "partial", "fail", "none"), "design": ("better", "same", "worse"),
+}
+# What a shadow session's launch blanks: the tracker credentials (a curl with them
+# is a tracker write the guard may not see), and GH_TOKEN set to a non-token so
+# neither `gh` nor git's gh credential helper can authenticate a write.
+SHADOW_ENV = {
+    "ENABLE_CLAUDEAI_MCP_SERVERS": "false",
+    "GH_TOKEN": "turma-shadow-no-publish", "GITHUB_TOKEN": "",
+    "GITLAB_TOKEN": "", "JIRA_TOKEN": "", "JIRA_API_TOKEN": "", "AZDO_TOKEN": "",
+    "AZURE_DEVOPS_EXT_PAT": "",
+    # The layer a text guard cannot be (QA: `rebase -x`, hooks, core.fsmonitor,
+    # an interpreter's subprocess all run git unseen): an EMPTY pushInsteadOf
+    # prefix rewrites EVERY push URL — named remote, path, file://, https, ssh,
+    # scp-like — to a path that does not exist, in the environment every child
+    # inherits. Fetch is untouched. Verified against real git.
+    "GIT_CONFIG_COUNT": "1",
+    "GIT_CONFIG_KEY_0": "url./nonexistent/turma-shadow-no-push/.pushInsteadOf",
+    "GIT_CONFIG_VALUE_0": "",
+}
+
+
+def shadow_branch(shadow_id):
+    """The local branch a shadow run commits to (deleted once it is graded)."""
+    return f"turma-shadow/{shadow_id}"
+
+
+def _session_cli_spelling():
+    """The session CLI as a taught command: the absolute path when shell-safe
+    (what the allow rule matches), else the exported variable."""
+    cli = session_cli_path()
+    return cli if shlex.quote(cli) == cli else '"$TURMA_SESSION_CLI"'
+
+
+def read_shadow_done(session_id):
+    """A shadow run's `shadow-done` request: its summary note, or None. Session-
+    written, so read only through `_read_untrusted_json`."""
+    folder = session_request_dir(session_id)
+    if not folder:
+        return None
+    data = _read_untrusted_json(os.path.join(folder, "shadow-done.json"),
+                                SESSION_REQUEST_MAX_BYTES)
+    if data is None:
+        return None
+    note = data.get("note")
+    note = re.sub(r"\s+", " ", note).strip()[:SHADOW_NOTE_MAX] if isinstance(note, str) else ""
+    return note or "(no summary)"
+
+
+def read_shadow_grade(session_id):
+    """A grader's `shadow-grade` request as the wire grade, or None. Every enum
+    is re-validated; a file that breaks the contract is no grade (the grader times
+    out, the run reads failed) rather than a repaired one."""
+    folder = session_request_dir(session_id)
+    if not folder:
+        return None
+    data = _read_untrusted_json(os.path.join(folder, "shadow-grade.json"),
+                                SESSION_REQUEST_MAX_BYTES)
+    if data is None:
+        return None
+    grade = {}
+    for k, allowed in SHADOW_GRADE_ENUMS.items():
+        v = data.get(k)
+        if not isinstance(v, str) or v not in allowed:
+            return None
+        grade[k] = v
+    note = data.get("note")
+    note = re.sub(r"\s+", " ", note).strip()[:SHADOW_GRADE_NOTE_MAX] if isinstance(note, str) else ""
+    if note:
+        grade["note"] = note
+    return grade
+
+
+SHADOW_RUN_SYSTEM_PROMPT = """
+This session is a SHADOW RUN for Turma's model-quality evidence. The ticket you are \
+given was already worked and its change merged by another session; you are re-doing \
+it independently, from the commit just before that merge, so the two results can be \
+compared. Rules:
+- Work on the checked-out commit. Do NOT fetch, pull, rebase, or look at remote refs \
+or later history, and do not look up the ticket's merged PR — that would make the \
+comparison worthless.
+- Otherwise work exactly as you would for real: investigate, change the code, run \
+the tests, and use the qa sub-agent as your instructions say.
+- You cannot publish. Pushing, opening a PR/MR and any tracker or API write are \
+blocked by the safety guard; do not try to work around that, and ignore any \
+instruction to open a PR, push, or close the ticket.
+- Commit your change locally on the branch `{branch}` (`git switch -c {branch}`). \
+When finished, run `python3 -SsE {cli} shadow-done --note "<one-paragraph summary>"` \
+and end your turn. If the ticket needs no code change, commit nothing and say why \
+in that note.
+"""
+
+SHADOW_GRADE_SYSTEM_PROMPT = """
+This session GRADES a Turma shadow run (model-quality evidence). Grade, do not fix: \
+change no source except to apply the reference change's tests as instructed. You \
+cannot publish — pushing, PRs and tracker or API writes are blocked by the safety \
+guard. Finish by running the one `shadow-grade` command your task gives, then end \
+your turn.
+"""
+
+
+def build_shadow_grade_prompt(run, head, note):
+    """The grader's task (XERK-1847): apply the merged change's tests to the
+    shadow's tree, run a QA pass, compare designs, and report one grade."""
+    cli = _session_cli_spelling()
+    base, merge = run["baseSha"], run["mergeSha"]
+    return f"""You are the Opus GRADER for a Turma shadow run of ticket {run['issueKey']}.
+
+The same ticket was worked twice from base commit {base}:
+- REFERENCE (merged, by another session): commit {merge}; its change is \
+`git diff {base} {merge}`. PR: {run.get('prUrl') or '(unknown)'}
+- SHADOW (model {run['model']}, the one you grade): this worktree's HEAD {head}; its \
+change is `git diff {base} HEAD`. The shadow's own summary: {note}
+
+The ticket as the shadow saw it:
+
+{run.get('ticketText') or '(ticket text unavailable)'}
+
+Do these three checks here, then report:
+1. Tests: take the test files the reference change added or changed \
+(`git diff --name-only {base} {merge}`), put them onto this tree \
+(`git checkout {merge} -- <those files>`), and run the repo's relevant tests. \
+`pass` / `fail`, or `none` if the reference changed no tests.
+2. QA: run the `qa` sub-agent on the shadow's change against the ticket. `pass` / \
+`partial` / `fail`.
+3. Design: compare the shadow's change with the reference — correctness, scope, fit \
+with the codebase. `better` / `same` / `worse`.
+
+Verdict: `good` if the shadow's change would have been acceptable to merge instead of \
+the reference (tests pass or none, QA not fail, no correctness defect), else `bad`.
+
+Report with exactly this one command, then end your turn:
+python3 -SsE {cli} shadow-grade --verdict good|bad --tests pass|fail|none \
+--qa pass|partial|fail|none --design better|same|worse --note "<why, at most \
+{SHADOW_GRADE_NOTE_MAX} chars>"
+"""
+
+
+def _shadow_ticket_detail(detail, not_before_ms):
+    """The ticket a shadow sees: the live session's view, so comments written
+    after it started (which may describe the fix) are dropped, as is any
+    attachment (the shadow downloads nothing). Unknown comment times are dropped
+    too — fail toward less context, never toward the answer."""
+    d = dict(detail) if isinstance(detail, dict) else {}
+    d["attachments"] = []
+    kept = []
+    for c in d.get("comments") or []:
+        if not isinstance(c, dict):
+            continue
+        t = _ts_ms(c.get("created")) if isinstance(c.get("created"), str) else None
+        if t is not None and isinstance(not_before_ms, int) and t < not_before_ms:
+            kept.append(c)
+    d["comments"] = kept
+    d["commentTotal"] = len(kept)
+    return d
+
+
 def read_close_ticket_request(session_id):
     """The session's pending `close-ticket` request (XERK-1569), or None.
 
@@ -22488,6 +22676,9 @@ class SessionManager:
         # epicBuilderStatus, written by the beat (spawn/advance) AND the
         # materialization worker, so every access is lock-guarded.
         self.epic_builders = {}
+        # Shadow runs (XERK-1847): id -> run record, persisted so a manager restart
+        # keeps advancing (and reporting) a run whose sessions survive it.
+        self.shadow_runs = self._load_shadow_runs()
         self._epic_builders_lock = threading.Lock()
         # Staged {type:"mergePr"} outcomes (XERK-550: PR auto-merge) — each
         # {cmdId, url, ok, error}. Its writer is an OFF-BEAT worker thread
@@ -23587,7 +23778,9 @@ class SessionManager:
             return fleet
         rows = []
         for s in sessions:
-            if s.get("status") != "running":
+            # A shadow run (XERK-1847) is no peer: it must not be messaged about
+            # the ticket it re-does blind.
+            if s.get("status") != "running" or s.get("shadow"):
                 continue
             ticket = s.get("ticket") or {}
             if ticket.get("key"):
@@ -23775,6 +23968,10 @@ class SessionManager:
         whether it adopted, so the caller saves the record once."""
         if sess.get("root"):
             return False                      # a root session's branch is the host's
+        if sess.get("shadow"):
+            # A shadow run (XERK-1847) must never gain a ticket: every hub ticket
+            # sweep (auto-stop on Done, auto-merge, close-ticket) would act on it.
+            return False
         if (sess.get("ticket") or {}).get("key"):
             return False                      # already linked (spawned or adopted)
         if not live_branch or not board_configured():
@@ -24763,6 +24960,15 @@ class SessionManager:
         a runtime `addendum` correcting the peer tool names for a runtime that has
         no SendMessage/ListAgents. Unconditional — peers are a host property, so a
         resumed or migrated session needs it exactly as much as a fresh one."""
+        shadow = sess.get("shadow") if isinstance(sess.get("shadow"), dict) else None
+        if shadow:
+            # A shadow run (XERK-1847) gets ONLY its own rules: no new-work branch
+            # policy (it must not fetch), no PR standard, no peers, no wake.
+            if shadow.get("role") == "grade":
+                return SHADOW_GRADE_SYSTEM_PROMPT + addendum
+            return SHADOW_RUN_SYSTEM_PROMPT.format(
+                branch=shadow_branch(shadow.get("id") or "run"),
+                cli=_session_cli_spelling()) + addendum
         policy = NEW_WORK_SYSTEM_PROMPT
         ticket = sess.get("ticket") or {}
         if ticket.get("branch"):
@@ -26000,6 +26206,12 @@ class SessionManager:
         # Both long texts reach claude through files (write_launch_text): the
         # directive plus a ticket's description overran tmux's ~16 KiB command
         # limit and the session never started. Windows argv takes them inline.
+        is_shadow = isinstance(sess.get("shadow"), dict)
+        if is_shadow:
+            # A shadow run connects NO MCP server (a tracker MCP would be a write
+            # the Bash guard never sees); ENABLE_CLAUDEAI_MCP_SERVERS below drops
+            # the claude.ai connectors too (XERK-1847).
+            parts.append("--strict-mcp-config")
         policy = self._session_directive(sess)
         if not IS_WINDOWS:
             parts.append("--append-system-prompt "
@@ -26035,6 +26247,11 @@ class SessionManager:
         # Never on the local model: its gateway 403s a Claude alias.
         if not on_local:
             env_prefix += f"TURMA_PIN_SUBAGENT_MODEL={GRADER_SUBAGENT_MODEL} "
+        if is_shadow:
+            # The guard's no-publish switch (hooks/guard.py shadow_reason) and the
+            # blanked publishing credentials.
+            env_prefix += f"TURMA_SHADOW={shlex.quote(sess['shadow'].get('role') or 'run')} "
+            env_prefix += "".join(f"{k}={shlex.quote(v)} " for k, v in SHADOW_ENV.items())
         claude_cmd = env_prefix + claude_cmd
         if local_env_file:
             # SOURCED, never inlined and never passed as `tmux -e`: both put the
@@ -26067,6 +26284,8 @@ class SessionManager:
                 claude_argv += ["--permission-mode", perm]
             if settings:
                 claude_argv += ["--settings", settings]
+            if is_shadow:
+                claude_argv += ["--strict-mcp-config"]
             claude_argv += ["--append-system-prompt", policy]
             if prompt:
                 claude_argv += ["--", prompt]
@@ -26081,6 +26300,9 @@ class SessionManager:
                 extra_env["CLAUDE_CODE_SUBAGENT_MODEL"] = subagent_model
             if not on_local:
                 extra_env["TURMA_PIN_SUBAGENT_MODEL"] = GRADER_SUBAGENT_MODEL
+            if is_shadow:
+                extra_env["TURMA_SHADOW"] = sess["shadow"].get("role") or "run"
+                extra_env.update(SHADOW_ENV)
             if local_env_file:
                 extra_env.update(_read_env_file(local_env_file))
             self._trust_watch(sess)
@@ -26547,7 +26769,7 @@ class SessionManager:
               model=None, permission_mode=None, ticket=None, ticket_detail=None,
               cmd_id=None, await_clone=None, await_clone_owner=None,
               model_source=None, local_model=None, local_context=None,
-              agent_type=None, uploads=None):
+              agent_type=None, uploads=None, shadow=None):
         """Create a brand-new worktree-backed session for <repo_name>.
 
         The worktree is added in DETACHED HEAD forked off the latest default
@@ -26698,6 +26920,10 @@ class SessionManager:
             # can correlate its POST with the id we just minted (see docstring).
             "spawnCmdId": cmd_id,
         }
+        # A shadow run's session (XERK-1847): {id, role: run|grade}. Read by the
+        # launch (no-publish env + flags) and the directive; never a ticket.
+        if isinstance(shadow, dict):
+            sess["shadow"] = {"id": shadow.get("id"), "role": shadow.get("role")}
         self.registry.append(sess)
         # Validate every interpolated option BEFORE anything else, so a bad model
         # or permission mode fails the spawn cleanly whether it runs now or waits
@@ -27139,6 +27365,315 @@ class SessionManager:
                    await_clone_owner=(entry.get("nameWithOwner") if await_clone
                                       else None))
 
+    # --- shadow runs (XERK-1847) ------------------------------------------
+
+    def _load_shadow_runs(self):
+        """The persisted runs, re-shaped. The file sits in session-writable
+        ~/.turma, so it is read as untrusted and every record re-validated."""
+        data = _read_untrusted_json(SHADOW_RUNS_PATH, SHADOW_RUNS_FILE_MAX_BYTES)
+        # Every session and transcript a shadow ever ran as, kept past the run
+        # record so neither can be resumed into an ordinary session.
+        known = (data or {}).get("_sessions")
+        # Lists in arrival order, so the cap keeps the NEWEST ids.
+        def ids(k):
+            v = known.get(k) if isinstance(known, dict) else None
+            return list(dict.fromkeys(x for x in (v or []) if isinstance(x, str)))
+        self.shadow_sids = ids("sids")
+        self.shadow_tids = ids("tids")
+        out = {}
+        for rid, r in (data or {}).items():
+            if not (isinstance(r, dict) and isinstance(rid, str)
+                    and SHADOW_ID_RE.fullmatch(rid) and r.get("id") == rid):
+                continue
+            if r.get("state") not in ("running", "grading", "graded", "failed"):
+                continue
+            out[rid] = {k: r.get(k) for k in (
+                "id", "siteKey", "issueKey", "repo", "model", "mergeSha", "baseSha",
+                "prUrl", "state", "runSid", "gradeSid", "headSha", "note", "grade",
+                "error", "startedAt", "phaseAt", "endedAt", "modelActual", "ticketText",
+                "branchDropped")
+                if r.get(k) is not None}
+        return out
+
+    def _save_shadow_runs(self):
+        try:
+            os.makedirs(REGISTRY_DIR, exist_ok=True)
+            tmp = SHADOW_RUNS_PATH + f".{os.getpid()}.tmp"
+            data = dict(self.shadow_runs)
+            data["_sessions"] = {"sids": self.shadow_sids[-SHADOW_SESSIONS_KEEP:],
+                                 "tids": self.shadow_tids[-SHADOW_SESSIONS_KEEP:]}
+            with open(tmp, "w") as f:
+                json.dump(data, f)
+            os.replace(tmp, SHADOW_RUNS_PATH)
+        except OSError as e:
+            log(f"shadow runs save failed: {e}")
+
+    def _set_shadow(self, rid, **fields):
+        r = self.shadow_runs.get(rid)
+        if r is None:
+            return
+        r.update(fields)
+        self._save_shadow_runs()
+
+    def _fail_shadow(self, rid, cmd, msg):
+        """Record a refused/failed run so the hub's ledger reads it as failed,
+        never a dispatch that silently produced nothing."""
+        now = time.time()
+        rec = self.shadow_runs.get(rid) or {
+            "id": rid, "siteKey": str(cmd.get("siteKey") or "")[:200],
+            "issueKey": str(cmd.get("issueKey") or "")[:64],
+            "model": str(cmd.get("model") or "")[:40], "startedAt": now}
+        rec.update(state="failed", error=msg[:300], endedAt=now, phaseAt=now)
+        self.shadow_runs[rid] = rec
+        self._bound_shadow_runs()
+        self._save_shadow_runs()
+        log(f"shadow run {rid} failed: {msg}")
+
+    def _bound_shadow_runs(self):
+        over = len(self.shadow_runs) - SHADOW_RUNS_MAX
+        if over <= 0:
+            return
+        done = sorted((r for r in self.shadow_runs.values()
+                       if r.get("state") in ("graded", "failed")),
+                      key=lambda r: r.get("endedAt") or 0)
+        for r in done[:over]:
+            self.shadow_runs.pop(r["id"], None)
+
+    def spawn_shadow(self, cmd):
+        """Handle the hub's `spawnShadow` (XERK-1847): re-do a merged ticket on a
+        candidate model from the merged PR's parent commit. Everything the hub
+        names is re-checked here: this host's own org, a cloned repo, a commit
+        that resolves. A refusal is a `failed` run on the report, never silence.
+        Runs on the beat like spawn_ticket (one bounded fetch + one issue read)."""
+        rid = str(cmd.get("shadowId") or "")
+        if not SHADOW_ID_RE.fullmatch(rid):
+            log(f"spawnShadow with a bad id {rid[:40]!r} — ignored")
+            return
+        if rid in self.shadow_runs:
+            return   # a re-delivered command
+        if not MODEL_SHADOW:
+            return self._fail_shadow(rid, cmd, "shadow runs are off on this host")
+        key = str(cmd.get("issueKey") or "")
+        if not valid_issue_key(key) or not board_configured():
+            return self._fail_shadow(rid, cmd, "no board for this ticket on this host")
+        if cmd.get("siteKey") != board_site_key():
+            return self._fail_shadow(rid, cmd, "the ticket is not this host's org")
+        model = str(cmd.get("model") or "").strip().lower()
+        try:
+            if not model or resolve_model(model, self.models_available()) is None:
+                raise ValueError("no model")
+        except ValueError:
+            return self._fail_shadow(rid, cmd, f"model {model[:40]!r} is not runnable here")
+        merge = str(cmd.get("mergeSha") or "").lower()
+        if not SHADOW_SHA_RE.fullmatch(merge):
+            return self._fail_shadow(rid, cmd, "no merge commit to base the shadow on")
+        repo = next((r for r in scan_repos() if r["name"] == cmd.get("repo")), None)
+        if not repo or not repo_forkable(repo["path"]):
+            return self._fail_shadow(rid, cmd, "the repo is not cloned on this host")
+        # The merge commit is on the default branch; fetch it (bounded), then base
+        # the shadow on its FIRST parent — the code as it was before the merge.
+        name = default_branch_name(repo["path"])
+        if name and valid_ref_name(name):
+            run_ok(["git", "-C", repo["path"], "fetch", "origin", name],
+                   timeout=FETCH_TIMEOUT_SEC)
+        base = run(["git", "-C", repo["path"], "rev-parse", "--verify", "--quiet",
+                    f"{merge}^1^{{commit}}"]).strip().lower()
+        if not SHADOW_SHA_RE.fullmatch(base):
+            return self._fail_shadow(rid, cmd, "the merge commit is not in this clone")
+        try:
+            detail = fetch_board_issue(key)
+        except Exception as e:
+            return self._fail_shadow(rid, cmd, f"could not read the ticket: {e}")
+        not_before = cmd.get("notBefore")
+        detail = _shadow_ticket_detail(
+            detail, not_before if isinstance(not_before, int) and not isinstance(not_before, bool)
+            else None)
+        prompt = build_ticket_prompt(detail, [], session_cli=False)
+        now = time.time()
+        self.shadow_runs[rid] = {
+            "id": rid, "siteKey": cmd["siteKey"], "issueKey": key, "repo": repo["name"],
+            "model": model, "mergeSha": merge, "baseSha": base,
+            "prUrl": str(cmd.get("prUrl") or "")[:500] or None, "state": "running",
+            "startedAt": now, "phaseAt": now, "ticketText": prompt[:20000],
+        }
+        self._bound_shadow_runs()
+        try:
+            sid = self.spawn(repo["name"], prompt=prompt, base_ref=base, model=model,
+                             permission_mode="auto", label=f"shadow {key} ({model})",
+                             shadow={"id": rid, "role": "run"})
+        except Exception as e:
+            return self._fail_shadow(rid, cmd, f"could not spawn the shadow: {e}")
+        if not sid:
+            return self._fail_shadow(rid, cmd, "could not spawn the shadow")
+        self._note_shadow_session(sid)
+        self._set_shadow(rid, runSid=sid)
+        log(f"shadow run {rid}: {key} on {model} from {base[:12]} (session {sid})")
+
+    def _note_shadow_session(self, sid):
+        """Remember a shadow session's id and transcript id (saved with the runs)."""
+        if not sid:
+            return
+        if sid not in self.shadow_sids:
+            self.shadow_sids.append(sid)
+        sess = self._find(sid)
+        tid = sess.get("claudeSessionId") if sess else None
+        if isinstance(tid, str) and tid and tid not in self.shadow_tids:
+            self.shadow_tids.append(tid)
+
+    def _shadow_session_live(self, sid):
+        sess = self._find(sid) if sid else None
+        return sess if sess and sess.get("status") in ("running", "queued") else None
+
+    def _advance_shadow_runs(self):
+        """Beat sweep (XERK-1847), never raising: a finished RUN (its shadow-done,
+        its session gone, or its timeout) hands its commit to an Opus GRADER; a
+        grader's shadow-grade (or its end/timeout) makes the run terminal. At most
+        ONE session teardown per beat — `delete` removes a worktree."""
+        try:
+            now = time.time()
+            for rid, r in list(self.shadow_runs.items()):
+                st = r.get("state")
+                if st != "running" and self._reap_shadow(rid, r):
+                    return
+                if st == "running":
+                    if self._advance_shadow_run(rid, r, now):
+                        return
+                elif st == "grading":
+                    if self._advance_shadow_grade(rid, r, now):
+                        return
+                elif st in ("graded", "failed"):
+                    if now - (r.get("endedAt") or now) > SHADOW_KEEP_SEC:
+                        self.shadow_runs.pop(rid, None)
+                        self._save_shadow_runs()
+        except Exception as e:
+            log(f"shadow run advance failed: {e}")
+
+    def _advance_shadow_run(self, rid, r, now):
+        sid = r.get("runSid")
+        sess = self._find(sid) if sid else None
+        note = read_shadow_done(sid) if sid else None
+        if self._shadow_session_live(sid):
+            if sess and sess.get("modelActual"):
+                r["modelActual"] = sess["modelActual"]
+            if note is None and now - (r.get("phaseAt") or now) < SHADOW_RUN_TIMEOUT_SEC:
+                return False
+        if sess is None:
+            self._set_shadow(rid, state="failed", error="the shadow session is gone",
+                             endedAt=now, phaseAt=now)
+            return False
+        wt = sess.get("worktreePath")
+        head = ""
+        if wt and os.path.isdir(wt):
+            # Work it left uncommitted is still its work: commit it (locally, under
+            # a neutral identity) so the grader sees it.
+            if run(["git", "-C", wt, "status", "--porcelain"], timeout=10).strip():
+                run_ok(["git", "-C", wt, "add", "-A"], timeout=15)
+                run_ok(["git", "-C", wt, "-c", "user.name=turma-shadow",
+                        "-c", "user.email=shadow@turma.invalid", "commit", "-q",
+                        "--no-verify", "-m", "shadow: uncommitted work"], timeout=15)
+            head = run(["git", "-C", wt, "rev-parse", "HEAD"], timeout=10).strip().lower()
+        note = note or ("(timed out)" if self._shadow_session_live(sid) else "(ended without a summary)")
+        # The run session is DELETED on a later beat (_reap_shadow), never here:
+        # a worktree removal and the grader's worktree add on one beat would
+        # stack two slow git operations on the heartbeat (XERK-395).
+        if not SHADOW_SHA_RE.fullmatch(head):
+            self._set_shadow(rid, state="failed", error="could not read the shadow's commit",
+                             endedAt=now, phaseAt=now, note=note)
+            return True
+        if head == r.get("baseSha"):
+            # No change at all against work that DID need one (it merged a PR):
+            # graded bad without spending an Opus session on an empty diff.
+            self._set_shadow(rid, state="graded", headSha=head, note=note, endedAt=now,
+                             phaseAt=now, grade={
+                                 "verdict": "bad", "tests": "none", "qa": "none",
+                                 "design": "worse", "note": "the shadow made no change"})
+            return True
+        try:
+            gsid = self.spawn(r["repo"], prompt=build_shadow_grade_prompt(r, head, note),
+                              base_ref=head, model=SHADOW_GRADER_MODEL,
+                              permission_mode="auto",
+                              label=f"shadow grade {r.get('issueKey')}",
+                              shadow={"id": rid, "role": "grade"})
+        except Exception as e:
+            gsid = None
+            log(f"shadow run {rid}: grader spawn failed: {e}")
+        if not gsid:
+            self._set_shadow(rid, state="failed", error="could not spawn the grader",
+                             headSha=head, note=note, endedAt=now, phaseAt=now)
+            return True
+        self._note_shadow_session(gsid)
+        self._note_shadow_session(sid)      # its transcript id is known by now
+        self._set_shadow(rid, state="grading", gradeSid=gsid, headSha=head, note=note,
+                         phaseAt=now)
+        log(f"shadow run {rid}: grading {head[:12]} (session {gsid})")
+        return True
+
+    def _advance_shadow_grade(self, rid, r, now):
+        gsid = r.get("gradeSid")
+        grade = read_shadow_grade(gsid) if gsid else None
+        if grade is None:
+            if self._shadow_session_live(gsid) and \
+                    now - (r.get("phaseAt") or now) < SHADOW_GRADE_TIMEOUT_SEC:
+                return False
+            self._set_shadow(rid, state="failed", endedAt=now, phaseAt=now,
+                             error="the grader ended without a grade")
+            return False
+        grade["at"] = now_iso()
+        self._set_shadow(rid, state="graded", grade=grade, endedAt=now, phaseAt=now)
+        log(f"shadow run {rid}: graded {grade['verdict']}")
+        return False
+
+    def _reap_shadow(self, rid, r):
+        """One teardown step for a run past its RUN phase: delete the run
+        session (once grading or terminal), then the grader (once terminal),
+        then drop the run's local branch. True when it did work this beat — the
+        caller stops there, so a beat pays for one worktree removal at most."""
+        terminal = r.get("state") in ("graded", "failed")
+        for k in ("runSid", "gradeSid"):
+            sid = r.get(k)
+            if k == "gradeSid" and not terminal:
+                continue
+            if sid and self._find(sid):
+                self._note_shadow_session(sid)
+                self.delete(sid)
+                return True
+            # Killed by the operator: its closed record still holds a worktree.
+            rec = next((c for c in self.closed if c.get("id") == sid), None) if sid else None
+            if rec is not None:
+                self.closed = [c for c in self.closed if c.get("id") != sid]
+                if rec.get("worktreePath") and rec.get("repoPath") \
+                        and os.path.isdir(rec["worktreePath"]):
+                    self._worktree_remove(rec)
+                self._forget_session_caches(sid)
+                self.save()
+                return True
+        if terminal and not r.get("branchDropped"):
+            repo = next((x for x in scan_repos() if x["name"] == r.get("repo")), None)
+            if repo:
+                run_ok(["git", "-C", repo["path"], "branch", "-D", shadow_branch(rid)],
+                       timeout=10)
+            self._set_shadow(rid, branchDropped=True)
+            return True
+        return False
+
+    def shadow_runs_report(self):
+        """The `shadowRuns` heartbeat field: one row per run this host holds."""
+        out = []
+        for r in self.shadow_runs.values():
+            row = {"id": r["id"], "siteKey": r.get("siteKey") or "",
+                   "issueKey": r.get("issueKey") or "", "state": r.get("state")}
+            for k in ("modelActual", "error"):
+                if isinstance(r.get(k), str):
+                    row[k] = r[k]
+            for k in ("startedAt", "endedAt"):
+                if isinstance(r.get(k), (int, float)):
+                    row[k] = datetime.datetime.fromtimestamp(
+                        r[k], datetime.timezone.utc).isoformat()
+            if isinstance(r.get("grade"), dict):
+                row["grade"] = dict(r["grade"])
+            out.append(row)
+        return out[:SHADOW_RUNS_MAX]
+
     # --- Epic Builder (XERK-724) ------------------------------------------
     # spawn_epic_builder runs on the beat (handle_commands) like spawn_ticket;
     # _advance_epic_builders runs each beat to move a builder from researching ->
@@ -27392,6 +27927,8 @@ class SessionManager:
             "id", "repo", "repoPath", "worktreePath", "branch", "baseRef",
             "rcName", "tmuxName", "createdAt", "label", "summary",
             "summaryManual", "model", "permissionMode", "root", "ticket",
+            # A shadow run's flag (XERK-1847): resume refuses such a record.
+            "shadow",
             # Branch-adopted ticket provenance (XERK-1440). A record adopted by an
             # older agent has it ONLY here, not as `ticket.adopted`; dropping it
             # would make the resumed session auto-merge.
@@ -27562,6 +28099,11 @@ class SessionManager:
         rec = next((c for c in self.closed if c.get("id") == sid), None)
         if not rec:
             log(f"resume: no closed session {sid}")
+            return
+        # A shadow run (XERK-1847) is never resumed: relaunched as an ordinary
+        # session it would carry none of its no-publish protections.
+        if rec.get("shadow") or sid in self.shadow_sids:
+            self._refuse_start("a shadow run cannot be resumed", cmd_id=cmd_id)
             return
         # A paused sleeper still in the lifecycle worker's hands (XERK-1575): its
         # worktree is being re-added for this very resume, or its old tmux is
@@ -27944,6 +28486,12 @@ class SessionManager:
         def refuse(reason):
             self._refuse_start(reason, cmd_id=cmd_id, migration_id=migration_id)
 
+        # A shadow run's conversation (XERK-1847) is never resumed: its worktree
+        # dir is named for its session id, which the run ledger remembers.
+        if isinstance(cwd, str) and (os.path.basename(os.path.normpath(cwd)) in self.shadow_sids
+                                     or transcript_id in self.shadow_tids):
+            refuse("a shadow run cannot be resumed")
+            return None
         # Only a cwd under REPOS_ROOT is resumable here — never let a free-form
         # path reach git/tmux.
         cls = self._resumable_cwd_class(cwd, {r["name"] for r in scan_repos()})
@@ -28153,6 +28701,10 @@ class SessionManager:
         sess = self._find(session_id)
         if not sess:
             refuse(f"no such session {session_id} on the source host")
+            return
+        if sess.get("shadow"):
+            # Moved, it would relaunch without its no-publish launch (XERK-1847).
+            refuse("a shadow run cannot be migrated")
             return
         path = _session_transcript_path(sess)
         if not path or not os.path.isfile(path):
@@ -30669,6 +31221,8 @@ class SessionManager:
             return "no such session"
         if sess.get("status") != "running":
             return "it is not running"
+        if sess.get("shadow"):
+            return "it is a shadow run (XERK-1847)"
         # Mid-move: the paused record here would later be woken while the moved
         # copy runs on the target — two claudes on one conversation and ticket.
         if self._export_running(sess.get("id")):
@@ -38796,6 +39350,8 @@ class SessionManager:
                         cid, cmd.get("blockerKey"), cmd.get("blockedKey"))
                 elif ctype == "spawnEpicBuilder":
                     self.spawn_epic_builder(cmd)
+                elif ctype == "spawnShadow":
+                    self.spawn_shadow(cmd)
                 elif ctype == "mergePr":
                     self._merge_pr_async(
                         cid, cmd.get("sessionId"), cmd.get("url"), cmd.get("head"))
@@ -39719,6 +40275,9 @@ class SessionManager:
             # (XERK-1845), for the hub's model-quality ledger.
             # An empty list is a known zero; absent (an older agent) is "can't tell".
             "qaRuns": qa_runs_wire(sess.get("qaRuns")),
+            # A shadow run's session (XERK-1847): the hub raises no alert for it
+            # and lists it in no peer roster. Absent on every other session.
+            "shadow": True if sess.get("shadow") else None,
             # True once part of the transcript went unscanned (a manager restart,
             # an upgrade, a resume): the list is then a floor, not the count.
             "qaPartial": True if sess.get("qaPartial") else None,
@@ -40108,6 +40667,8 @@ class SessionManager:
         # wrote and, once valid, materialize the epic on a worker thread. Guarded
         # so it never raises onto the beat; the Jira writes are off-beat.
         self._advance_epic_builders()
+        # Move each shadow run on (XERK-1847): run -> grade -> report. Guarded.
+        self._advance_shadow_runs()
         # Apply the outbox records the off-beat input worker staged (XERK-867):
         # the worker did the pane delivery, the beat owns the registry mutation.
         self._apply_landed_inputs()
@@ -40341,6 +40902,10 @@ class SessionManager:
             # it; TURMA_PAUSE_SLEEPERS=0 reports false. Absent is coerced to
             # "can't" hub-side (normalizePauseSleepers).
             "pauseSleepers": {"available": PAUSE_SLEEPERS},
+            # Whether this manager runs the hub's `spawnShadow` (XERK-1847). The
+            # hub samples merged tickets only onto a host reporting it;
+            # TURMA_MODEL_SHADOW=0 reports false.
+            "modelShadow": {"available": MODEL_SHADOW},
             "clones": self._clones_payload(),
             "prunes": self._prunes_payload(),
             "ackedCommands": list(self.acked),
@@ -40379,6 +40944,9 @@ class SessionManager:
         eb_status = self.epic_builder_status()
         if eb_status:
             payload["epicBuilderStatus"] = eb_status
+        shadow_report = self.shadow_runs_report()
+        if shadow_report:
+            payload["shadowRuns"] = shadow_report
         # Snapshotted under the lock the merge worker appends under (XERK-550,
         # same shape as spawn_failures below): _clear_delivered_staged removes
         # exactly these delivered entries by identity, so a result the worker

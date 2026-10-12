@@ -136,6 +136,34 @@ class SessionCliTest(unittest.TestCase):
 
     # -- environment -----------------------------------------------------------
 
+    # -- shadow runs (XERK-1847) -------------------------------------------------
+
+    def test_shadow_done_and_grade_round_trip_through_the_manager_readers(self):
+        rc, out, _ = self.run_main(["shadow-done", "--note", " fixed it\n twice "])
+        self.assertEqual(rc, 0)
+        self.assertEqual(out.count("\n"), 1)
+        rc, _, _ = self.run_main(["shadow-grade", "--verdict", "bad", "--tests", "fail",
+                                  "--qa", "partial", "--design", "worse", "--note", "breaks x"])
+        self.assertEqual(rc, 0)
+        with mock.patch.object(ha, "SESSION_REQUESTS_DIR", self.reqdir):
+            self.assertEqual(ha.read_shadow_done("abcde"), "fixed it twice")
+            self.assertEqual(ha.read_shadow_grade("abcde"), {
+                "verdict": "bad", "tests": "fail", "qa": "partial", "design": "worse",
+                "note": "breaks x"})
+
+    def test_shadow_bounds_refuse_and_write_nothing(self):
+        for argv in (["shadow-done"], ["shadow-done", "--note", " "],
+                     ["shadow-done", "--note", "n" * 2001],
+                     ["shadow-grade", "--verdict", "ok", "--tests", "pass", "--qa", "pass",
+                      "--design", "same", "--note", "n"],
+                     ["shadow-grade", "--verdict", "good", "--tests", "pass", "--qa", "pass",
+                      "--design", "same", "--note", "n" * 501]):
+            with self.subTest(argv=argv[:3]):
+                rc, out, _ = self.run_main(argv)
+                self.assertEqual(rc, 2)
+                self.assertEqual(out, "")
+        self.assertFalse(os.path.exists(self.reqdir))
+
     def test_without_a_session_id_it_says_why_and_exits_2(self):
         for sid in (None, ""):
             rc, out, err = self.run_main(["wake", "2h", "r"], sid=sid)

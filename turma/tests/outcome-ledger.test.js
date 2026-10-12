@@ -400,19 +400,19 @@ test("XERK-1845: a future merge time is junk too", () => {
 
 // ---- defect attribution (XERK-1846) ------------------------------------------------
 
-const SHA = (c) => c.repeat(40);
+const HEX = (c) => c.repeat(40);
 const PR1 = "https://github.com/o/r/pull/1";
 const FIXPR = "https://github.com/o/r/pull/9";
 function mergedRow(extra = {}) {
   L.observe([obs({
-    prs: [{ url: PR1, state: "MERGED", mergeCommit: SHA("a"), mergedAt: T0 + DAY }],
+    prs: [{ url: PR1, state: "MERGED", mergeCommit: HEX("a"), mergedAt: T0 + DAY }],
     ...extra,
   })], T0 + DAY);
 }
 function report(extra = {}) {
   return {
-    repo: "r", fix: SHA("f"), fixPrs: [FIXPR], kind: "bug", ticket: "ACME-9", at: T0 + 5 * DAY,
-    introducers: [{ sha: SHA("a"), prs: [] }], ...extra,
+    repo: "r", fix: HEX("f"), fixPrs: [FIXPR], kind: "bug", ticket: "ACME-9", at: T0 + 5 * DAY,
+    introducers: [{ sha: HEX("a"), prs: [] }], ...extra,
   };
 }
 
@@ -421,7 +421,7 @@ test("XERK-1846: a later bug fix blaming a row's merge commit marks it bad, once
   mergedRow();
   L.attributeDefects([{ site: "acme.atlassian.net", reports: [report()] }], T0 + 6 * DAY);
   const r = only();
-  assert.deepEqual(r.defects, [{ fix: SHA("f"), kind: "bug", at: T0 + 5 * DAY, prs: [FIXPR] }]);
+  assert.deepEqual(r.defects, [{ fix: HEX("f"), kind: "bug", at: T0 + 5 * DAY, prs: [FIXPR] }]);
   assert.deepEqual(L.outcomeOf(r, T0 + 6 * DAY), { outcome: "bad", reason: "defect" });
   // Re-sent every few minutes by the agent: idempotent.
   const changed = L.attributeDefects([{ site: "acme.atlassian.net", reports: [report()] }], T0 + 7 * DAY);
@@ -438,7 +438,7 @@ test("XERK-1846: the forge's PR url joins too, and a revert reads 'reverted'", (
   L._internals.reset();
   mergedRow({ prs: [{ url: PR1, state: "MERGED", mergedAt: T0 + DAY }] }); // no merge sha
   L.attributeDefects([{ site: "acme.atlassian.net", reports: [report({
-    kind: "revert", introducers: [{ sha: SHA("b"), prs: [PR1] }],
+    kind: "revert", introducers: [{ sha: HEX("b"), prs: [PR1] }],
   })] }], T0 + 6 * DAY);
   assert.equal(L.outcomeOf(only(), T0 + 6 * DAY).reason, "reverted");
 });
@@ -447,10 +447,10 @@ test("XERK-1846: another org's report, the fix's own PR, a pre-merge or out-of-w
   const cases = [
     { site: "rival.atlassian.net", rep: report() },
     { site: "acme.atlassian.net", rep: report({ fixPrs: [PR1] }) },
-    { site: "acme.atlassian.net", rep: report({ fix: SHA("a").replace(/a$/, "c"), at: T0 }) },
+    { site: "acme.atlassian.net", rep: report({ fix: HEX("a").replace(/a$/, "c"), at: T0 }) },
     { site: "acme.atlassian.net", rep: report({ at: T0 + DAY + (L.WINDOW_DAYS + 1) * DAY }) },
     // Unattributed: an introducer no row holds (human work, a direct push).
-    { site: "acme.atlassian.net", rep: report({ introducers: [{ sha: SHA("d"), prs: ["https://github.com/o/r/pull/77"] }] }) },
+    { site: "acme.atlassian.net", rep: report({ introducers: [{ sha: HEX("d"), prs: ["https://github.com/o/r/pull/77"] }] }) },
   ];
   for (const c of cases) {
     L._internals.reset();
@@ -464,7 +464,7 @@ test("XERK-1846: an open or closed-unmerged PR is never an introducer", () => {
   L._internals.reset();
   L.observe([obs({ prs: [{ url: PR1, state: "OPEN" }] })], T0 + DAY);
   L.attributeDefects([{ site: "acme.atlassian.net", reports: [report({
-    introducers: [{ sha: SHA("a"), prs: [PR1] }] })] }], T0 + 6 * DAY);
+    introducers: [{ sha: HEX("a"), prs: [PR1] }] })] }], T0 + 6 * DAY);
   assert.equal(only().defects, undefined);
 });
 
@@ -473,7 +473,7 @@ test("XERK-1846: reports are whitelisted and capped", () => {
     report(),
     report({ kind: "nope" }),
     report({ fix: "abc" }),
-    report({ introducers: [{ sha: SHA("f") }] }),            // the fix itself: dropped → no introducers
+    report({ introducers: [{ sha: HEX("f") }] }),            // the fix itself: dropped → no introducers
     report({ introducers: Array.from({ length: 9 }, (_, i) => ({ sha: String(i).repeat(40), prs: ["javascript:x", PR1] })) }),
     "junk",
   ]);
@@ -495,4 +495,92 @@ test("XERK-1846: nothing folds under HA until the table is loaded", () => {
     L._internals.setBackend(b);
   }
   assert.equal(only().defects, undefined);
+});
+
+// ---- shadow runs (XERK-1847) ----------------------------------------------------
+
+const SHA = "0123456789abcdef0123456789abcdef01234567";
+function mergedLive(extra = {}) {
+  L.observe([obs({ running: false, prs: [{ url: "https://x/pr/1", state: "MERGED",
+    mergedAt: "2026-10-02T00:00:00Z", mergeCommit: SHA }], ...extra })], T0 + 2 * DAY);
+}
+
+test("XERK-1847: a merged live row is a shadow candidate until decided, then never again", () => {
+  L._internals.reset();
+  mergedLive();
+  const [c] = L.shadowCandidates({ now: T0 + 2 * DAY });
+  assert.equal(c.mergeSha, SHA);
+  assert.equal(c.repo, "app");
+  assert.equal(c.cls, "bug");
+  assert.equal(L.shadowCandidates({ now: T0 + 30 * DAY, maxAgeMs: 7 * DAY }).length, 0, "too old");
+  assert.equal(L.decideShadow(c.key, { sampled: false, at: T0 + 2 * DAY }), true);
+  assert.equal(L.shadowCandidates({ now: T0 + 2 * DAY }).length, 0);
+  // A decision is final.
+  assert.equal(L.decideShadow(c.key, { sampled: true, at: T0, id: "sh-0123456789ab" }), false);
+  // A malformed decision is refused.
+  L._internals.reset();
+  mergedLive();
+  assert.equal(L.decideShadow(only().key, { sampled: true, at: T0 }), false, "no id");
+});
+
+test("XERK-1847: only a hub-dispatched shadow's report lands, paired with its live row", () => {
+  L._internals.reset();
+  mergedLive();
+  const live = only();
+  L.decideShadow(live.key, { sampled: true, at: T0 + 2 * DAY, id: "sh-00112233aabb",
+    model: "haiku", host: "h2" }, T0 + 2 * DAY);
+  assert.equal(L.shadowsDispatchedSince(T0), 1);
+  // Wrong host, wrong org, unknown id: all dropped.
+  L.observeShadows([
+    { site: "acme.atlassian.net", host: "h3", id: "sh-00112233aabb", state: "running" },
+    { site: "evil.atlassian.net", host: "h2", id: "sh-00112233aabb", state: "running" },
+    { site: "acme.atlassian.net", host: "h2", id: "sh-ffffffffffff", state: "running" },
+  ], T0 + 3 * DAY);
+  assert.equal(L._internals.rows().size, 1);
+  L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb",
+    state: "running", modelActual: "claude-haiku-5-5", startedAt: "2026-10-04T00:00:00Z" }], T0 + 3 * DAY);
+  const sh = [...L._internals.rows().values()].find((r) => r.kind === "shadow");
+  assert.equal(sh.pairOf, live.key);
+  assert.equal(sh.model, "haiku");
+  assert.equal(sh.shadowState, "running");
+  // Shadow rows never feed the live groups.
+  const agg = L.aggregate({ now: T0 + 3 * DAY });
+  assert.equal(agg.groups.reduce((n, g) => n + g.sessions, 0), 1);
+  assert.deepEqual(agg.pairs[0], { cls: "bug", model: "haiku", pairs: 1, graded: 0, shadowGood: 0,
+    shadowBad: 0, mOnlyFail: 0, failed: 0 });
+  // A bad grade against good-or-pending live work is an M-only failure, and final.
+  L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb",
+    grade: { verdict: "bad", tests: "FAIL", qa: "fail", design: "worse", note: "x\u0007y" } }], T0 + 4 * DAY);
+  L.observeShadows([{ site: "acme.atlassian.net", host: "h2", id: "sh-00112233aabb",
+    state: "running", grade: { verdict: "good" } }], T0 + 5 * DAY);
+  const graded = [...L._internals.rows().values()].find((r) => r.kind === "shadow");
+  assert.deepEqual(graded.grade, { verdict: "bad", tests: "fail", qa: "fail", design: "worse", note: "x y" });
+  assert.equal(graded.shadowState, "graded");
+  const p = L.aggregate({ now: T0 + 5 * DAY }).pairs[0];
+  assert.equal(p.shadowBad, 1);
+  assert.equal(p.mOnlyFail, 1);
+  // ...and per group, as the XERK-1849 card reads it (a zero-session candidate group).
+  const g = L.aggregate({ now: T0 + 5 * DAY }).groups.find((x) => x.model === "haiku");
+  assert.equal(g.sessions, 0);
+  assert.deepEqual([g.shadow.pairs, g.shadow.candidateOnlyBad], [1, 1]);
+  // A row-level read serves the shadow with its grade as the outcome.
+  const rows = L.aggregate({ site: "acme.atlassian.net", withRows: true, now: T0 + 5 * DAY }).rows;
+  assert.equal(rows.find((r) => r.kind === "shadow").outcome, "bad");
+  // Metrics carry live outcomes only.
+  assert.doesNotMatch(L.metricsText(T0 + 5 * DAY), /model="haiku"/);
+});
+
+test("XERK-1847: shadow fields survive the whitelist round-trip and junk is dropped", () => {
+  const live = L.sanitizeRow({ site: "a", issue: "A-1", host: "h", sid: "s", firstSeen: 1, updatedAt: 1,
+    shadow: { sampled: true, at: 5, id: "sh-0011223344", model: "claude-sonnet-5", host: "h2" } });
+  assert.deepEqual(live.shadow, { sampled: true, at: 5, id: "sh-0011223344", model: "sonnet", host: "h2" });
+  assert.equal(L.sanitizeRow({ site: "a", issue: "A-1", host: "h", sid: "s", firstSeen: 1, updatedAt: 1,
+    shadow: { sampled: "yes", at: 5 } }).shadow, undefined);
+  const sh = L.sanitizeRow({ site: "a", issue: "A-1", host: "h", sid: "sh-0011223344", firstSeen: 1,
+    updatedAt: 1, kind: "shadow", pairOf: "k", shadowState: "bogus", grade: { verdict: "meh" },
+    shadow: { sampled: false, at: 1 } });
+  assert.equal(sh.kind, "shadow");
+  assert.equal(sh.shadowState, undefined);
+  assert.equal(sh.grade, undefined);
+  assert.equal(sh.shadow, undefined, "a shadow row never carries a decision");
 });

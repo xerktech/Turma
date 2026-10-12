@@ -87,6 +87,9 @@ evidence from real work that it does not ship worse code.
 - Sampled (`MODEL_SHADOW_RATE`, default 0.25 of merged live tickets) and capped per day
   (`MODEL_SHADOW_DAILY_MAX`), so its cost is bounded and visible.
 - Shadow rows never feed the live defect rate (they never merge).
+- Shipped in XERK-1847; operative rules in `.claude/rules/model-quality.md`. The grader runs as a
+  second Turma session on Opus in its own worktree at the shadow's commit, and reports through the
+  session CLI (`shadow-grade`), so no model call is made by the hub.
 
 ## Routing policy
 

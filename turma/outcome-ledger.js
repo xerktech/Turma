@@ -76,6 +76,17 @@ const DEFECT_REPORTS_MAX = 50;
 const DEFECT_INTRODUCERS_MAX = 5;
 const DEFECT_PRS_MAX = 3;
 const ROW_DEFECTS_MAX = 10;
+// Shadow runs (XERK-1847): the hub mints the id, so a report naming any other
+// shape is not one of ours.
+const SHADOW_ID_RE = /^sh-[0-9a-f]{8,32}$/;
+const SHADOW_STATES = new Set(["running", "grading", "graded", "failed"]);
+const GRADE_ENUMS = {
+  verdict: new Set(["good", "bad"]),
+  tests: new Set(["pass", "fail", "none"]),
+  qa: new Set(["pass", "partial", "fail", "none"]),
+  design: new Set(["better", "same", "worse"]),
+};
+const GRADE_NOTE_MAX = 500;
 
 function capStr(v, max) {
   if (typeof v !== "string") return "";
@@ -170,6 +181,44 @@ function sanitizeQa(q) {
   return out;
 }
 
+/**
+ * An Opus grader's verdict on a shadow change (XERK-1847), or null. `verdict`
+ * is required; the other enums drop to absent when wrong ("can't tell").
+ */
+function sanitizeGrade(g) {
+  if (!g || typeof g !== "object" || !GRADE_ENUMS.verdict.has(g.verdict)) return null;
+  const out = { verdict: g.verdict };
+  for (const k of ["tests", "qa", "design"]) {
+    const v = typeof g[k] === "string" ? g[k].toLowerCase() : "";
+    if (GRADE_ENUMS[k].has(v)) out[k] = v;
+  }
+  const note = capStr(g.note, GRADE_NOTE_MAX);
+  if (note) out.note = note;
+  const at = timeOf(g.at);
+  if (at) out.at = at;
+  return out;
+}
+
+/**
+ * The hub's sampling decision on a LIVE row (XERK-1847): `sampled` false is
+ * "this merged ticket was not picked" and is final, so the sweep never asks
+ * again. A sampled one names the shadow it dispatched.
+ */
+function sanitizeShadowDecision(d) {
+  if (!d || typeof d !== "object" || typeof d.sampled !== "boolean") return null;
+  const at = posInt(d.at);
+  if (!at) return null;
+  const out = { sampled: d.sampled, at };
+  if (!d.sampled) return out;
+  if (typeof d.id !== "string" || !SHADOW_ID_RE.test(d.id)) return null;
+  out.id = d.id;
+  const model = modelFamily(d.model);
+  if (model) out.model = model;
+  const host = capStr(d.host, 200);
+  if (host) out.host = host;
+  return out;
+}
+
 /** A stored row → the stored shape, or null. The one whitelist: file load,
  * Postgres rescan and observe() all go through it. */
 function sanitizeRow(r) {
@@ -206,6 +255,19 @@ function sanitizeRow(r) {
   if (Array.isArray(r.defects)) {
     const defects = r.defects.map(sanitizeDefect).filter(Boolean).slice(0, ROW_DEFECTS_MAX);
     if (defects.length) out.defects = defects;
+  }
+  // A shadow row (XERK-1847) pairs with the live row it re-ran; a live row
+  // carries the sampling decision instead. Never both.
+  if (r.kind === "shadow") {
+    out.kind = "shadow";
+    const pairOf = capStr(r.pairOf, 700);
+    if (pairOf) out.pairOf = pairOf;
+    if (SHADOW_STATES.has(r.shadowState)) out.shadowState = r.shadowState;
+    const grade = sanitizeGrade(r.grade);
+    if (grade) out.grade = grade;
+  } else {
+    const shadow = sanitizeShadowDecision(r.shadow);
+    if (shadow) out.shadow = shadow;
   }
   return out;
 }
@@ -366,11 +428,11 @@ function observe(observations, now = Date.now()) {
       commit(r, next, now, changed);
     }
   }
-  return finish(changed, now);
+  return persistChanged(changed, now);
 }
 
-// Persist what a fold changed (and evict past the bounds). Returns the changed rows.
-function finish(changed, now) {
+// Evict, then hand the backend the rows that changed and survived.
+function persistChanged(changed, now) {
   if (changed.size) {
     const dropped = evict(now);
     const live = [...changed.values()].filter((r) => rows.get(r.key) === r);
@@ -432,7 +494,88 @@ function attributeDefects(entries, now = Date.now(), windowDays = WINDOW_DAYS) {
       }
     }
   }
-  return finish(changed, now);
+  return persistChanged(changed, now);
+}
+
+// ---- shadow runs (XERK-1847) -------------------------------------------------------
+
+/**
+ * Live rows a shadow could re-run: a claude session whose PR MERGED with a known
+ * merge commit, not yet decided on, merged within `maxAgeMs`. Oldest merge first.
+ */
+function shadowCandidates({ now = Date.now(), maxAgeMs = 0 } = {}) {
+  const out = [];
+  for (const r of rows.values()) {
+    if (r.kind === "shadow" || r.shadow || r.runtime || !r.repo) continue;
+    const merged = (r.prs || []).filter((p) => p.state === "MERGED" && p.mergeCommit);
+    if (!merged.length) continue;
+    const pr = merged.reduce((a, b) => ((a.mergedAt || 0) <= (b.mergedAt || 0) ? a : b));
+    const mergedAt = pr.mergedAt || r.updatedAt;
+    if (maxAgeMs && now - mergedAt > maxAgeMs) continue;
+    out.push({
+      key: r.key, site: r.site, issue: r.issue, host: r.host, repo: r.repo, cls: r.cls,
+      model: r.model, mergeSha: pr.mergeCommit, prUrl: pr.url, mergedAt,
+      startedAt: r.startedAt || r.firstSeen,
+    });
+  }
+  return out.sort((a, b) => a.mergedAt - b.mergedAt);
+}
+
+/** Record the sampling decision on a live row. False when the row is gone. */
+function decideShadow(key, decision, now = Date.now()) {
+  const prev = rows.get(key);
+  if (!prev || prev.kind === "shadow" || prev.shadow) return false;
+  const shadow = sanitizeShadowDecision(decision);
+  if (!shadow) return false;
+  const changed = new Map();
+  commit(prev, { ...prev, shadow }, now, changed);
+  persistChanged(changed, now);
+  return changed.size > 0;
+}
+
+/** Shadows dispatched at or after `since` (the daily cap's count). */
+function shadowsDispatchedSince(since) {
+  let n = 0;
+  for (const r of rows.values()) if (r.shadow && r.shadow.sampled && r.shadow.at >= since) n += 1;
+  return n;
+}
+
+/**
+ * Fold the agents' shadow reports: [{site, host, id, state, modelActual,
+ * startedAt, endedAt, grade}]. A report counts only for a shadow the hub
+ * dispatched to THAT host for THAT org (the id is hub-minted); anything else is
+ * dropped. A grade, once recorded, is final.
+ */
+function observeShadows(reports, now = Date.now()) {
+  if (!Array.isArray(reports) || backend.loaded === false) return [];
+  const byId = new Map();
+  for (const r of rows.values()) if (r.shadow && r.shadow.sampled) byId.set(r.shadow.id, r);
+  const changed = new Map();
+  for (const o of reports) {
+    if (!o || typeof o !== "object" || typeof o.id !== "string") continue;
+    const live = byId.get(o.id);
+    if (!live || live.site !== o.site || live.shadow.host !== o.host) continue;
+    const key = rowKey(live.site, live.issue, o.host, o.id);
+    const prev = rows.get(key);
+    const next = prev ? { ...prev } : {
+      site: live.site, issue: live.issue, host: o.host, sid: o.id, kind: "shadow",
+      pairOf: live.key, cls: live.cls, model: live.shadow.model || "default",
+      repo: live.repo, firstSeen: now, updatedAt: now,
+    };
+    const actual = modelFamily(o.modelActual);
+    if (actual) { next.model = actual; next.modelKnown = true; }
+    if (SHADOW_STATES.has(o.state) && next.shadowState !== "graded") next.shadowState = o.state;
+    const started = timeOf(o.startedAt);
+    if (started && !next.startedAt) next.startedAt = started;
+    const ended = timeOf(o.endedAt);
+    if (ended && !next.endedAt) next.endedAt = ended;
+    if (!next.grade) {
+      const grade = sanitizeGrade(o.grade);
+      if (grade) { next.grade = grade; next.shadowState = "graded"; }
+    }
+    commit(prev, next, now, changed);
+  }
+  return persistChanged(changed, now);
 }
 
 function mergePrs(row, prs, now) {
@@ -530,6 +673,12 @@ function evict(now = Date.now()) {
  * undelivered = ended with nothing (no PR, no close).
  */
 function outcomeOf(r, now = Date.now(), windowDays = WINDOW_DAYS) {
+  // A shadow never merges: its outcome is its grader's verdict (XERK-1847).
+  if (r.kind === "shadow") {
+    if (r.grade) return { outcome: r.grade.verdict, reason: "shadow graded" };
+    if (r.shadowState === "failed") return { outcome: "undelivered", reason: "shadow failed" };
+    return { outcome: "pending", reason: "shadow running" };
+  }
   if (r.reopenedAt) return { outcome: "bad", reason: "reopened" };
   // A later fix blamed this work (XERK-1846): a revert of it, or a bug fix.
   if (r.defects && r.defects.length) {
@@ -585,8 +734,12 @@ function median(vals) {
 function aggregate({ site = null, withRows = false, now = Date.now(), windowDays = WINDOW_DAYS } = {}) {
   const groups = new Map();
   const served = [];
+  const shadows = [];
   for (const r of rows.values()) {
     const { outcome, reason } = outcomeOf(r, now, windowDays);
+    if (withRows && site && r.site === site && r.kind === "shadow") served.push({ ...r, outcome, reason });
+    // Shadow rows never feed the live groups (ADR: they never merge).
+    if (r.kind === "shadow") { shadows.push(r); continue; }
     const gk = `${r.cls}\u0000${r.model}`;
     let g = groups.get(gk);
     if (!g) {
@@ -614,7 +767,20 @@ function aggregate({ site = null, withRows = false, now = Date.now(), windowDays
     windowDays,
     groups: [...groups.values()].sort((a, b) => b.sessions - a.sessions
       || a.cls.localeCompare(b.cls) || a.model.localeCompare(b.model)),
+    pairs: pairsOf(shadows, now, windowDays),
   };
+  // The XERK-1849 report reads the paired evidence per group, as `shadow`. A
+  // candidate that ran no live session still shows, as a zero-session group.
+  for (const p of out.pairs) {
+    let g = out.groups.find((x) => x.cls === p.cls && x.model === p.model);
+    if (!g) {
+      g = { cls: p.cls, model: p.model, sessions: 0, reasons: {}, rework: {} };
+      for (const o of OUTCOMES) g[o] = 0;
+      out.groups.push(g);
+    }
+    g.shadow = { pairs: p.pairs, candidateOnlyBad: p.mOnlyFail, graded: p.graded,
+      shadowGood: p.shadowGood, shadowBad: p.shadowBad, failed: p.failed };
+  }
   if (withRows && site) {
     served.sort((a, b) => b.updatedAt - a.updatedAt);
     out.rows = served.slice(0, ROWS_SERVED_MAX);
@@ -622,12 +788,44 @@ function aggregate({ site = null, withRows = false, now = Date.now(), windowDays
   return out;
 }
 
+/**
+ * Paired evidence per (class, candidate model), fleet-wide (XERK-1847): each
+ * shadow row against the live row it re-ran. `mOnlyFail` = the shadow graded
+ * bad while the live work is not bad — the promotion rule's numerator.
+ */
+function pairsOf(shadows, now, windowDays) {
+  const pairs = new Map();
+  for (const r of shadows) {
+    const live = r.pairOf ? rows.get(r.pairOf) : null;
+    if (!live) continue;
+    const gk = `${r.cls}\u0000${r.model}`;
+    let p = pairs.get(gk);
+    if (!p) {
+      p = { cls: r.cls, model: r.model, pairs: 0, graded: 0, shadowGood: 0, shadowBad: 0,
+        mOnlyFail: 0, failed: 0 };
+      pairs.set(gk, p);
+    }
+    p.pairs += 1;
+    if (r.grade) {
+      p.graded += 1;
+      if (r.grade.verdict === "good") p.shadowGood += 1;
+      else {
+        p.shadowBad += 1;
+        if (outcomeOf(live, now, windowDays).outcome !== "bad") p.mOnlyFail += 1;
+      }
+    } else if (r.shadowState === "failed") p.failed += 1;
+  }
+  return [...pairs.values()].sort((a, b) => b.pairs - a.pairs
+    || a.cls.localeCompare(b.cls) || a.model.localeCompare(b.model));
+}
+
 /** Per (class, model, outcome) counts for /metrics (no host, ticket or session). */
 function metricsText(now = Date.now()) {
   // Bounded label sets: models outside the known families read "other", and only
   // the largest METRIC_CLASSES_MAX classes keep their name.
   const merged = new Map();
-  const raw = aggregate({ now }).groups;
+  // Live sessions only: a candidate's zero-session shadow-evidence group has no outcome.
+  const raw = aggregate({ now }).groups.filter((g) => g.sessions > 0);
   const classTotals = new Map();
   for (const g of raw) classTotals.set(g.cls, (classTotals.get(g.cls) || 0) + g.sessions);
   const keep = new Set([...classTotals].sort((a, b) => b[1] - a[1]).slice(0, METRIC_CLASSES_MAX)
@@ -896,6 +1094,7 @@ load();
 
 module.exports = {
   observe, attributeDefects, sanitizeDefectReports, aggregate, outcomeOf, metricsText, workClass, modelFamily, sanitizeRow,
+  shadowCandidates, decideShadow, shadowsDispatchedSince, observeShadows, SHADOW_ID_RE,
   configure, rehydrate, flush,
   LEDGER_FILE, MAX_ROWS, WINDOW_DAYS, RETAIN_DAYS, T_ROW, OutcomeLedgerPgStore,
   _internals: {

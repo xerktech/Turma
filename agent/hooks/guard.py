@@ -12941,6 +12941,222 @@ def policy_reason(command: str) -> str | None:
     return None
 
 
+# --- shadow runs (XERK-1847) -------------------------------------------------
+#
+# A SHADOW session re-runs a merged ticket on a cheaper model so an Opus grader
+# can compare it with what merged (docs/model-quality-adr.md). It must never
+# publish: no push, no PR/MR, no tracker write. The manager launches it with
+# TURMA_SHADOW set, and this check denies the publishing commands outright. It is
+# a TIGHTENING read from the environment, so the protected guard honours it too
+# (a session stripping the variable from a nested claude only loses the extra
+# denies, the same-uid residual every ~/.turma control has). Fails CLOSED by
+# command family, like the permission judge's never-list: every gh/glab/hub verb
+# outside a read allowlist, any az repos/boards write, any tracker CLI, and any
+# HTTP client given a body or a non-GET method.
+
+_SHADOW_FORGE_READS = {
+    ("pr", "view"), ("pr", "diff"), ("pr", "list"), ("pr", "checks"), ("pr", "status"),
+    ("mr", "view"), ("mr", "diff"), ("mr", "list"),
+    ("issue", "view"), ("issue", "list"), ("repo", "view"), ("run", "view"),
+    ("run", "list"), ("auth", "status"),
+}
+# git verbs a shadow may run: everything local. Any other verb — push, subtree,
+# send-email, request-pull, an ALIAS (which may be any of those) — is denied, so
+# the check fails closed on a spelling it does not know (QA: `-c alias.p=push p`).
+_SHADOW_GIT_VERBS = {
+    "status", "diff", "log", "show", "add", "commit", "switch", "checkout", "restore",
+    "branch", "rev-parse", "rev-list", "stash", "reset", "merge", "rebase", "cherry-pick",
+    "revert", "grep", "ls-files", "ls-tree", "blame", "apply", "am", "mv", "rm", "tag",
+    "describe", "shortlog", "worktree", "clean", "cat-file", "merge-base", "format-patch",
+    "diff-tree", "diff-files", "diff-index", "show-ref", "symbolic-ref", "name-rev",
+    "notes", "bisect", "reflog", "for-each-ref", "check-ignore", "hash-object", "help",
+    "version", "init", "count-objects", "fsck", "gc", "range-diff", "whatchanged",
+    # Read-only network verbs: the launch's pushInsteadOf block never touches them.
+    "fetch", "pull", "ls-remote", "submodule", "sparse-checkout", "lfs",
+}
+# A config key that redirects a later git into a publish (an alias, a push/pull
+# URL or command).
+_SHADOW_GIT_CONFIG_RE = re.compile(
+    r"(?i)^(alias\.|remote\.|url\.|core\.|credential|diff\.|filter\.|merge\..*\.driver|gpg|"
+    r"sequence\.|include|.*\.(command|program|cmd|helper|tool|path|textconv)\b)")
+# Programs that run their first argument as a script: a tracker CLI named there
+# runs (`python3 ~/.claude/bin/jira …`); named anywhere else it is just a word.
+_SHADOW_INTERPRETERS = {"python", "python3", "node", "bash", "sh", "zsh", "dash", "perl",
+                        "ruby", "deno", "bun", "env", "sudo", "exec", "command", "xargs",
+                        "nohup", "timeout"}
+_SHADOW_TRACKER_CLIS = {"jira", "acli", "ado", "jira-cli", "tea", "glab", "hub", "lab"}
+_SHADOW_HTTP_CLIS = {"curl", "wget", "http", "https", "httpie", "xh", "xhs"}
+# Package / image registries: a publish there is a publish.
+_SHADOW_PUBLISH_VERBS = {
+    "npm": {"publish", "unpublish", "dist-tag", "deprecate", "owner", "access"},
+    "pnpm": {"publish"}, "yarn": {"publish", "npm"}, "bun": {"publish"},
+    "docker": {"push", "login"}, "podman": {"push", "login"}, "buildah": {"push"},
+    "twine": {"upload"}, "cargo": {"publish", "yank", "owner"}, "gem": {"push", "yank"},
+    "poetry": {"publish"}, "flit": {"publish"}, "hatch": {"publish"}, "uv": {"publish"},
+    "helm": {"push"}, "oras": {"push"}, "skopeo": {"copy"}, "crane": {"push", "copy"},
+    "dotnet": {"nuget"}, "nuget": {"push"}, "mvn": {"deploy"}, "gradle": {"publish"},
+}
+# Env vars that would undo the launch's push block or make git run a command.
+# Matched only where the shell SETS or UNSETS a variable — an assignment, or a
+# word after env/unset/export — so a `grep -rn GIT_SSH` or a commit message
+# naming one is ordinary text (QA over-deny).
+_SHADOW_GIT_ENV_RE = re.compile(
+    r"(?:(?:^|[\s;&|(`])(?:GIT_(?:CONFIG|SSH|EDITOR|SEQUENCE_EDITOR|EXEC_PATH|ASKPASS|PAGER|"
+    r"EXTERNAL_DIFF|DIR|WORK_TREE|PROXY_COMMAND|TEMPLATE_DIR)\w*)\+?=)|"
+    r"(?:\b(?:env|unset|export|declare|typeset|local)\b[^;&|\n]*\bGIT_(?:CONFIG|SSH|EDITOR|"
+    r"SEQUENCE_EDITOR|EXEC_PATH|ASKPASS|PAGER|EXTERNAL_DIFF|DIR|WORK_TREE|PROXY_COMMAND|"
+    r"TEMPLATE_DIR))")
+_SHADOW_REASON = (
+    "this is a shadow run: it may not publish — no push, no PR/MR, no tracker, "
+    "registry or API write. Commit locally and finish with `shadow-done`"
+)
+
+
+def _shadow_http_writes(prog: str, args: list[str]) -> bool:
+    """True when an HTTP client invocation may send a body, a non-GET method,
+    or read its options from a file (which could carry either)."""
+    i = 0
+    while i < len(args):
+        t = args[i]
+        low = t.lower()
+        if prog == "wget":
+            # wget takes any unambiguous PREFIX of a long option (`--post-d`).
+            opt = low.split("=", 1)[0]
+            if opt.startswith("--") and len(opt) >= 4 and any(
+                    w.startswith(opt) for w in ("--post-data", "--post-file", "--body-data",
+                                                "--body-file", "--method", "--config",
+                                                "--execute", "--input-file")):
+                return True
+            if t in ("-e", "-i") or (t.startswith("-") and not t.startswith("--")
+                                     and any(c in t[1:] for c in "ei")):
+                return True
+        elif prog in ("http", "https", "httpie", "xh", "xhs"):
+            # `http POST url k=v`: a method word, a request item or a file feed writes.
+            if t.upper() in ("POST", "PUT", "PATCH", "DELETE"):
+                return True
+            if low.startswith(("--form", "-f", "--raw", "--offline")):
+                return True
+            if not t.startswith("-") and "://" not in t and re.search(r"(?::=|=|@|:=@)", t):
+                return True
+        else:  # curl
+            if low.startswith(("--data", "--json", "--form", "--upload-file", "--config",
+                               "--request", "--url-query", "--variable")):
+                if low.startswith("--request"):
+                    m = t.split("=", 1)[1] if "=" in t else (args[i + 1] if i + 1 < len(args) else "")
+                    if m.upper() in ("GET", "HEAD"):
+                        i += 1
+                        continue
+                return True
+            if t.startswith("-") and not t.startswith("--") and len(t) > 1:
+                letters = t[1:]
+                # Letters after an X are its method (`-XGET`), not more options.
+                if any(c in letters.split("X", 1)[0] for c in "dFTK"):
+                    return True
+                if "X" in letters:
+                    rest = letters.split("X", 1)[1]
+                    m = rest or (args[i + 1] if i + 1 < len(args) else "")
+                    if m.upper() not in ("GET", "HEAD"):
+                        return True
+        i += 1
+    return False
+
+
+def _shadow_git_reason(tokens: list[str]) -> str | None:
+    # A `-c key=value` before the verb can define an alias or a push URL.
+    for i, t in enumerate(tokens[1:], 1):
+        if t == "-c" and i + 1 < len(tokens) and _SHADOW_GIT_CONFIG_RE.match(tokens[i + 1]):
+            return _SHADOW_REASON
+        if t.startswith("-c") and len(t) > 2 and _SHADOW_GIT_CONFIG_RE.match(t[2:]):
+            return _SHADOW_REASON
+        if t.startswith("--config-env"):
+            return _SHADOW_REASON
+    sub = _git_args(tokens)
+    if not sub:
+        return None
+    # Verbs that run a command of the session's choosing.
+    if sub[0] == "rebase" and any(w in ("-x", "--exec", "-i", "--interactive")
+                                  or w.startswith(("--exec", "-x")) for w in sub[1:]):
+        return _SHADOW_REASON
+    if sub[0] == "bisect" and "run" in sub[1:2]:
+        return _SHADOW_REASON
+    if sub[0] == "config":
+        if any(_SHADOW_GIT_CONFIG_RE.match(w) for w in sub[1:] if not w.startswith("-")):
+            return _SHADOW_REASON
+        return None
+    if sub[0] == "remote":
+        return _SHADOW_REASON if any(w in ("add", "set-url", "rename") for w in sub[1:]) else None
+    return None if sub[0] in _SHADOW_GIT_VERBS else _SHADOW_REASON
+
+
+def _shadow_gh_api_writes(rest: list[str]) -> bool:
+    words = [t for t in rest if not t.startswith("-")]
+    if any("graphql" in w.lower() for w in words):
+        return True
+    for t in rest:
+        if t in ("-X", "-f", "-F", "--input", "--field", "--raw-field", "--method"):
+            return True
+        if t.startswith(("--method", "--field", "--raw-field", "--input")):
+            return True
+        # An attached short option (`-fbody=x`, `-XPOST`), or one inside a cluster.
+        if t.startswith("-") and not t.startswith("--") and any(c in t[1:] for c in "XfF"):
+            return True
+    return False
+
+
+@_budgeted
+def shadow_reason(command: str) -> str | None:
+    """A reason when a SHADOW session's command could publish (XERK-1847).
+    Fails CLOSED per family: git outside its local verbs, gh outside its read
+    verbs, any tracker CLI named anywhere on the command, registries' publish
+    verbs, and HTTP clients that may write."""
+    for tokens, _segment, *_flags in _expand_both(command):
+        if not tokens:
+            continue
+        # The launch's push block lives in GIT_CONFIG_*: a command that names it
+        # (to unset or override it) is refused outright.
+        if _SHADOW_GIT_ENV_RE.search(" ".join(tokens)) or _SHADOW_GIT_ENV_RE.search(command):
+            return _SHADOW_REASON
+        words = [t for t in tokens if t and not t.startswith("-")]
+        name = lambda t: _basename(t).lower().removesuffix(".exe").removesuffix(".py")
+        # A tracker CLI as the program, or as an interpreter's script.
+        if name(tokens[0]) in _SHADOW_TRACKER_CLIS or (
+                name(tokens[0]) in _SHADOW_INTERPRETERS and len(words) > 1
+                and name(words[1]) in _SHADOW_TRACKER_CLIS):
+            return _SHADOW_REASON
+        prog = _basename(tokens[0]).lower().removesuffix(".exe")
+        rest = tokens[1:]
+        if prog == "git":
+            r = _shadow_git_reason(tokens)
+            if r:
+                return r
+            continue
+        if prog == "gh":
+            words = [t for t in rest if not t.startswith("-")]
+            if not words:
+                continue
+            if words[0] == "api":
+                if _shadow_gh_api_writes(rest[rest.index("api") + 1:] if "api" in rest else rest):
+                    return _SHADOW_REASON
+                continue
+            if tuple(words[:2]) in _SHADOW_FORGE_READS:
+                continue
+            return _SHADOW_REASON
+        if prog == "az":
+            words = [t for t in rest if not t.startswith("-")]
+            if words[:1] == ["rest"]:
+                return _SHADOW_REASON
+            if words[:1] and words[0] in ("repos", "boards", "devops", "pipelines", "artifacts") \
+                    and words[-1:] and words[-1] not in ("show", "list"):
+                return _SHADOW_REASON
+            continue
+        verbs = _SHADOW_PUBLISH_VERBS.get(prog)
+        if verbs and any(w in verbs for w in rest if not w.startswith("-")):
+            return _SHADOW_REASON
+        if prog in _SHADOW_HTTP_CLIS and _shadow_http_writes(prog, rest):
+            return _SHADOW_REASON
+    return None
+
+
 @_budgeted
 def attribution_reason(command: str) -> str | None:
     if not _ATTRIB_CONTEXT.search(command):
@@ -14184,6 +14400,7 @@ def decide(
     no_attribution: bool = True,
     pr_summary: bool = True,
     cwd: str | None = None,
+    shadow: bool = False,
 ) -> tuple[str, str | None, str | None]:
     """Return ``(decision, reason, category)``.
 
@@ -14204,13 +14421,13 @@ def decide(
     # one memoised expansion (seeded for one, the policy checks re-read the line).
     _SESSION_CWD[0] = _session_cwds(cwd)
     try:
-        return _decide_bash(command, overrides, no_attribution, pr_summary, cwd)
+        return _decide_bash(command, overrides, no_attribution, pr_summary, cwd, shadow)
     finally:
         _SESSION_CWD[0] = ()
 
 
 def _decide_bash(command: str, overrides: list[str], no_attribution: bool, pr_summary: bool,
-                 cwd: str | None) -> tuple[str, str | None, str | None]:
+                 cwd: str | None, shadow: bool = False) -> tuple[str, str | None, str | None]:
     reason = _is_destructive(command)
     # A line too large to read is never grantable: a spent budget, or a cap
     # on readings (`_expand_picks`). Past a cap the policy checks below see
@@ -14227,6 +14444,12 @@ def _decide_bash(command: str, overrides: list[str], no_attribution: bool, pr_su
     pol = policy_reason(command)
     if pol:
         return ("deny", pol, "policy")
+
+    # A shadow run never publishes (XERK-1847). Hard, like policy: no grant.
+    if shadow:
+        sh = shadow_reason(command)
+        if sh:
+            return ("deny", sh, "policy")
 
     if no_attribution:
         attrib = attribution_reason(command)
@@ -14440,6 +14663,8 @@ def main(argv: list[str] | None = None) -> int:
     no_attribution = settings.get("TURMA_NO_ATTRIBUTION", "1") != "0"
     pr_summary = settings.get("TURMA_PR_SUMMARY", "1") != "0"
     cwd = event.get("cwd") if isinstance(event.get("cwd"), str) else None
+    # Read from the ENVIRONMENT even under --protected: it only ever adds denies.
+    shadow = os.environ.get("TURMA_SHADOW", "") not in ("", "0")
 
     verdict: list = []
 
@@ -14453,6 +14678,7 @@ def main(argv: list[str] | None = None) -> int:
                 no_attribution=no_attribution,
                 pr_summary=pr_summary,
                 cwd=cwd,
+                shadow=shadow,
             )
             # A judge grant (XERK-1566) is consulted only once decide() ALLOWED the
             # command — every hard deny wins — and only for Bash, the one tool this

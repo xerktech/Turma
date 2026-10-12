@@ -4711,6 +4711,7 @@ function outcomeLedgerSweep(now = Date.now()) {
     const board = fleetTicketRows();
     const obs = [];
     const defects = [];
+    const shadows = [];
     for (const [host, a] of Object.entries(agents)) {
       const org = decidedOrgOf(a);
       if (!org) continue;
@@ -4736,11 +4737,125 @@ function outcomeLedgerSweep(now = Date.now()) {
         if (s && s.status !== "queued") add(s, s.status === "running" || s.status === "error");
       }
       for (const c of a.closedSessions || []) if (!(c && c.paused)) add(c, false);
+      for (const r of Array.isArray(a.shadowRuns) ? a.shadowRuns : []) {
+        if (r && r.siteKey === org) shadows.push({ ...r, site: org, host });
+      }
     }
     outcomeLedger.observe(obs, now);
     outcomeLedger.attributeDefects(defects, now);
+    // Shadow reports (XERK-1847) only from a host decided into the org the
+    // ledger dispatched them for; the ledger checks the id was sent to it.
+    outcomeLedger.observeShadows(shadows, now);
   } catch (e) {
     console.error(`outcome ledger sweep failed: ${(e && e.message) || e}`);
+  }
+}
+
+// ---- shadow runs (XERK-1847) ------------------------------------------------
+// After a live ticket's PR merges, the leader samples it and dispatches a SHADOW
+// session for the same ticket on a cheaper candidate model, based on the merged
+// PR's parent commit, to a host decided into the ticket's org. The shadow can
+// never publish (the agent's guard denies push/PR/tracker writes on its session
+// flag); an Opus grader then scores it and the agent reports the grade, which
+// the ledger records as a row PAIRED with the live one (docs/model-quality-adr.md).
+const MODEL_POLICY = (() => {
+  const v = String(process.env.MODEL_POLICY || "observe").trim().toLowerCase();
+  if (["off", "observe", "on"].includes(v)) return v;
+  console.error(`MODEL_POLICY=${JSON.stringify(process.env.MODEL_POLICY)} is not off|observe|on; using observe`);
+  return "observe";
+})();
+const MODEL_SHADOW_RATE = (() => {
+  const raw = process.env.MODEL_SHADOW_RATE;
+  if (raw === undefined || raw === "") return 0.25;
+  const n = Number(raw);
+  if (Number.isFinite(n) && n >= 0 && n <= 1) return n;
+  console.error(`MODEL_SHADOW_RATE=${JSON.stringify(raw)} is not a fraction 0..1; using 0.25`);
+  return 0.25;
+})();
+const MODEL_SHADOW_DAILY_MAX = positiveEnv("MODEL_SHADOW_DAILY_MAX", 10);
+// Merged work older than this is not back-filled into shadows.
+const MODEL_SHADOW_MAX_AGE_DAYS = positiveEnv("MODEL_SHADOW_MAX_AGE_DAYS", 7);
+const MODEL_SHADOW_MODELS = (process.env.MODEL_SHADOW_MODELS || "sonnet,haiku")
+  .split(",").map((m) => outcomeLedger.modelFamily(m)).filter((m) => /^[a-z0-9._-]{1,40}$/.test(m));
+
+// Deterministic sampling: the same merged row reads the same verdict on every
+// replica and across restarts (the decision is also persisted on the row).
+function shadowSampled(key, rate = MODEL_SHADOW_RATE) {
+  if (rate <= 0) return false;
+  if (rate >= 1) return true;
+  const h = crypto.createHash("sha1").update(key).digest();
+  return h.readUInt32BE(0) / 0x100000000 < rate;
+}
+
+// The candidate model with the fewest pairs so far for this class, excluding
+// the family the live session itself ran on (a pair of one model is no pair).
+function shadowModelFor(cls, liveModel, pairs) {
+  const count = (m) => {
+    const p = pairs.find((x) => x.cls === cls && x.model === m);
+    return p ? p.pairs : 0;
+  };
+  const pool = MODEL_SHADOW_MODELS.filter((m) => m !== liveModel);
+  if (!pool.length) return null;
+  return pool.reduce((best, m) => (count(m) < count(best) ? m : best), pool[0]);
+}
+
+// An online host DECIDED into the org, offering shadows, with the repo already
+// cloned (a shadow never clones on demand), a free slot, and a subscription not
+// paused; the most available wins.
+function shadowHostFor(site, repo, used, now) {
+  const paused = pausedSubscriptions(now);
+  let best = null, bestAvail = -Infinity;
+  for (const [key, a] of Object.entries(agents)) {
+    if (used.has(key) || decidedOrgOf(a) !== site) continue;
+    if (now - (a.lastSeen || 0) >= OFFLINE_AFTER_MS) continue;
+    if (!(a.modelShadow && a.modelShadow.available === true)) continue;
+    if ((a.defaultRuntime || "claude") !== "claude") continue;
+    if (!(a.repos || []).some((r) => r && r.name === repo)) continue;
+    if (!hostHasFreeSlot(a) || hostAutoPaused(key, a, paused)) continue;
+    const avail = hostAvailability(a);
+    if (avail > bestAvail) { best = key; bestAvail = avail; }
+  }
+  return best;
+}
+
+function modelShadowSweep(now = Date.now(),
+  { rate = MODEL_SHADOW_RATE, dailyMax = MODEL_SHADOW_DAILY_MAX } = {}) {
+  if (MODEL_POLICY === "off" || !MODEL_SHADOW_MODELS.length) return;
+  try {
+    const candidates = outcomeLedger.shadowCandidates({
+      now, maxAgeMs: MODEL_SHADOW_MAX_AGE_DAYS * 86400000,
+    });
+    if (!candidates.length) return;
+    let used = outcomeLedger.shadowsDispatchedSince(now - 86400000);
+    const pairs = outcomeLedger.aggregate({ now }).pairs;
+    const hostsUsed = new Set();
+    for (const c of candidates) {
+      if (!shadowSampled(c.key, rate)) {
+        outcomeLedger.decideShadow(c.key, { sampled: false, at: now }, now);
+        continue;
+      }
+      // Over the daily cap the rest stay undecided, for a later day.
+      if (used >= dailyMax) break;
+      const model = shadowModelFor(c.cls, c.model, pairs);
+      if (!model) {
+        outcomeLedger.decideShadow(c.key, { sampled: false, at: now }, now);
+        continue;
+      }
+      const host = shadowHostFor(c.site, c.repo, hostsUsed, now);
+      if (!host) continue;     // no free host now: retried next sweep
+      const id = `sh-${crypto.randomBytes(8).toString("hex")}`;
+      const cmdId = queueCommand(host, {
+        type: "spawnShadow", shadowId: id, siteKey: c.site, issueKey: c.issue, repo: c.repo,
+        model, mergeSha: c.mergeSha, prUrl: c.prUrl, notBefore: c.startedAt,
+      });
+      if (!cmdId) continue;
+      outcomeLedger.decideShadow(c.key, { sampled: true, at: now, id, model, host }, now);
+      hostsUsed.add(host);
+      used += 1;
+      console.log(`model shadow: ${logName(c.issue)} on ${model} -> ${logName(host)} (${id})`);
+    }
+  } catch (e) {
+    console.error(`model shadow sweep failed: ${(e && e.message) || e}`);
   }
 }
 
@@ -6439,7 +6554,8 @@ function peerBranch(git) {
 function pushPeerRows(rows, host, a) {
   for (const s of a.sessions || []) {
     if (rows.length >= PEERS_MAX_ROWS) return;
-    if (!s || s.status !== "running") continue;
+    // A shadow run (XERK-1847) is no peer: it re-does a merged ticket blind.
+    if (!s || s.status !== "running" || s.shadow === true) continue;
     const t = s.ticket || {};
     const task = t.key ? `${t.key} ${t.summary || ""}` : (s.summary || s.label || "");
     rows.push({
@@ -7643,6 +7759,46 @@ function normalizePauseSleepers(payload) {
     return;
   }
   payload.pauseSleepers = { available: t.available === true };
+}
+
+// The shadow-run (XERK-1847) capability block: whether this host's manager runs
+// a `spawnShadow` command. An older agent would ack the unknown command and run
+// nothing, so the sampler dispatches only to a host reporting it. Coerced like
+// normalizePauseSleepers: strictly boolean, unusable NULL, absent stays absent.
+function normalizeModelShadow(payload) {
+  if (!payload || typeof payload !== "object") return;
+  const t = payload.modelShadow;
+  if (!t || typeof t !== "object" || Array.isArray(t)) {
+    if ("modelShadow" in payload) payload.modelShadow = null;
+    return;
+  }
+  payload.modelShadow = { available: t.available === true };
+}
+
+// The host's shadow-run reports (XERK-1847): [{id, siteKey, issueKey, state,
+// modelActual?, startedAt?, endedAt?, grade?}], folded into the outcome ledger
+// by the leader's sweep. Shape-only here (the ledger whitelists the values and
+// takes only ids it dispatched to this host); untyped on every client. Inline
+// literals for the loadState-TDZ reason normalizeEpicBuilderStatus gives.
+function normalizeShadowRuns(a) {
+  if (!a || typeof a !== "object" || !("shadowRuns" in a)) return;
+  if (!Array.isArray(a.shadowRuns)) { delete a.shadowRuns; return; }
+  a.shadowRuns = a.shadowRuns.filter((r) => r && typeof r === "object" && !Array.isArray(r)).slice(0, 50);
+  for (const r of a.shadowRuns) {
+    for (const k of Object.keys(r)) {
+      if (!["id", "siteKey", "issueKey", "state", "modelActual", "startedAt", "endedAt", "error", "grade"]
+        .includes(k)) { delete r[k]; continue; }
+      if (k === "grade") {
+        if (!r.grade || typeof r.grade !== "object" || Array.isArray(r.grade)) { delete r.grade; continue; }
+        const g = {};
+        for (const gk of ["verdict", "tests", "qa", "design", "note", "at"]) {
+          if (typeof r.grade[gk] === "string") g[gk] = r.grade[gk].slice(0, gk === "note" ? 500 : 40);
+        }
+        r.grade = g;
+      } else if (typeof r[k] !== "string") delete r[k];
+      else r[k] = r[k].slice(0, k === "error" ? 300 : 200);
+    }
+  }
 }
 
 // This host's EFFECTIVE default runtime for an unpinned spawn (XERK-521), coerced
@@ -9021,7 +9177,7 @@ const HEARTBEAT_KNOWN_KEYS = new Set([
   "ticketStatusResults", "createMetaResults", "createTicketResults",
   "ticketPriorityResults", "ticketLinkResults", "ticketOutcomeResults",
   "spawnFailures", "epicBuilderStatus", "permissionEvents", "attentionHints",
-  "briefRender", "briefNarratives", "defectReports",
+  "briefRender", "briefNarratives", "modelShadow", "shadowRuns", "defectReports",
 ]);
 
 // How much an UNRECOGNISED heartbeat key may contribute to the persisted
@@ -9413,6 +9569,8 @@ function normalizeRecord(a, source = "heartbeat") {
   normalizeCloseTicket(a);
   normalizeBriefRender(a);
   normalizePauseSleepers(a);
+  normalizeModelShadow(a);
+  normalizeShadowRuns(a);
   normalizeDefaultRuntime(a);
   normalizeHostOs(a);
   normalizeTokenRoll(a);
@@ -10384,6 +10542,8 @@ function normalizeSessions(payload) {
     // and defence-in-depth coerce it the same way.
     { const prs = coerceObjectList(s, "prs"); if (prs) prs.forEach(coercePrElem); }
     coerceQaRuns(s);
+    // A shadow run's session (XERK-1847): strictly `true`, else absent.
+    if ("shadow" in s && s.shadow !== true) delete s.shadow;
     // root and newWorkSincePrs are non-null Boolean; ttydPort and restartCount
     // are Int. A wrong type drops to the client's default (false / 0).
     for (const k of ["root", "newWorkSincePrs"]) {
@@ -12702,6 +12862,9 @@ function heartbeatAlerts(key, prev, next, hints = []) {
     if (h && typeof h.sessionId === "string") hintFor.set(`${h.sessionId}\x00${h.edgeTs}`, h);
   }
   for (const session of next.sessions || []) {
+    // A shadow run (XERK-1847) is the hub's own evidence-gathering, never work
+    // waiting on the operator: no review, question or stalled alert for it.
+    if (session.shadow === true) continue;
     liveIds.add(session.id);
     const sa = (alerts.sessions[session.id] = alerts.sessions[session.id] || { prSeen: [] });
     // The session's own title (its `summary`) is what the operator recognises on
@@ -13990,7 +14153,8 @@ function pauseSleepersAvailable(a) {
 // live background agent or shell (absent = can't tell = no), no loop. The agent
 // re-checks all of it against its own beat before it kills anything.
 function sleeperPausable(s, now) {
-  if (!s || s.status !== "running") return false;
+  // A shadow run (XERK-1847) is never paused: its agent refuses to resume it.
+  if (!s || s.status !== "running" || s.shadow === true) return false;
   const live = s.session;
   if (!objectish(live) || !sessionSleeping(live, now)) return false;
   if (live.wakeAt - now < SLEEPER_PAUSE_MIN_AHEAD_MS) return false;
@@ -16359,6 +16523,8 @@ function masterOrchestrationTick() {
   briefTick();
   // Fold ticket sessions into the outcome ledger (XERK-1839). Observes only.
   outcomeLedgerSweep();
+  // Sample merged tickets into shadow runs on cheaper models (XERK-1847).
+  modelShadowSweep();
   // Resume paused sleepers whose wake has come (XERK-1575). The drain does it
   // too, but only runs with something queued.
   wakePausedSleepers();
@@ -22354,7 +22520,8 @@ if (process.env.TURMA_TEST) {
     permissionsView,
     permissionLedger,
     // The outcome ledger, its sweep and served view (XERK-1839).
-    outcomeLedger, outcomeLedgerSweep, modelQualityView,
+    outcomeLedger, outcomeLedgerSweep, modelQualityView, modelShadowSweep, shadowSampled,
+    normalizeShadowRuns, normalizeModelShadow,
     // The create single-flight's backstop, exported so a test can hold the
     // PRODUCTION default rather than the wound-down one the suite runs with —
     // its value relative to the client's give-up is the whole point (XERK-241).
