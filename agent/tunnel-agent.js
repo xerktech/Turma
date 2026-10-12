@@ -1001,6 +1001,21 @@ const SHELL_GH_PROBES = [["pr", "view"], ["pr", "checks"], ["pr", "status"],
                          ["run", "view"], ["run", "list"]];
 const SHELL_FILTER_CMDS = new Set(["grep", "egrep", "fgrep", "head", "tail", "sed", "awk",
   "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"]);
+// ...except one that edits a FILE in place (mirror of _shell_filter_writes).
+function shellFilterWrites(words) {
+  const cmd = words.length ? shellBase(words[0]) : "";
+  if (cmd !== "sed" && cmd !== "awk") return false;
+  const full = cmd === "sed" ? "--in-place" : "--include";
+  for (const w of words.slice(1)) {
+    if (w.startsWith("--")) {
+      const name = w.split("=")[0];
+      if (name.length > 2 && full.startsWith(name)) return true;
+    } else if (w.startsWith("-") && w.includes("i")) {
+      return true;
+    }
+  }
+  return false;
+}
 const SHELL_PREFIX_CMDS = new Set(["nohup", "exec", "command"]);
 const SHELL_DURATION_RE = /^(\d+(?:\.\d+)?|\.\d+)([smhd]?)$/;
 const SHELL_DURATION_UNIT = { "": 1, s: 1, m: 60, h: 3600, d: 86400 };
@@ -1202,11 +1217,14 @@ function shellSubstBodies(word) {
 // True when a substitution in these raw words runs WORK: `OUT=$(npm test)` is a
 // stage with no command word, so it read `neutral`, and a loop around it read as
 // a wait. A probe's body (`s=$(gh pr view …)`) is not work.
-function shellRunsWork(words, depth = 0) {
+// With `lists`, a lone `$(seq …)` only generates a `for` list's words.
+function shellRunsWork(words, depth = 0, lists = false) {
   for (const w of words) {
     for (const body of shellSubstBodies(w)) {
       if (depth >= 3) return true;   // deep nesting must not recurse on the beat
-      for (const seg of shellSegments(body)) {
+      const segs = shellSegments(body);
+      if (lists && shellIsSeq(segs) && !shellRunsWork(segs[0][0], depth + 1)) continue;
+      for (const seg of segs) {
         if (shellPipelineKind(seg, depth + 1)[0] === "work") return true;
       }
     }
@@ -1214,11 +1232,18 @@ function shellRunsWork(words, depth = 0) {
   return false;
 }
 
+// One segment of one stage whose command is `seq` (mirror of _shell_is_seq).
+function shellIsSeq(segs) {
+  if (segs.length !== 1 || segs[0].length !== 1) return false;
+  const w = shellWords(segs[0][0]);
+  return w.length > 0 && shellBase(w[0]) === "seq";
+}
+
 function shellPipelineKind(stages, depth = 0) {
   if (stages.some((st) => shellRunsWork(st, depth))) return ["work", null];
   for (const st of stages.slice(1)) {
     const w = shellWords(st);
-    if (w.length && !SHELL_FILTER_CMDS.has(shellBase(w[0]))) return ["work", null];
+    if (w.length && (!SHELL_FILTER_CMDS.has(shellBase(w[0])) || shellFilterWrites(w))) return ["work", null];
   }
   return shellCmdKind(shellWords(stages[0]));
 }
@@ -1233,8 +1258,8 @@ function shellLoop(segs, i) {
     return ["work", null];
   }
   // A `while`/`until` condition runs every lap: `while [ "$(make deploy)" … ]`
-  // is work. A `for` list's `$(seq …)` only generates the words.
-  if ((head[0] === "while" || head[0] === "until") && shellRunsWork(segs[i][0])) return ["work", null];
+  // is work; so is a `for` list's `$(npm test)`, though not its `$(seq …)`.
+  if (shellRunsWork(segs[i][0], 0, head[0] === "for")) return ["work", null];
   const first = shellWords(segs[i + 1][0]);
   if (!first.length || first[0] !== "do") return ["work", null];
   const body = [[first.slice(1), ...segs[i + 1].slice(1)]];

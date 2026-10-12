@@ -7454,12 +7454,26 @@ def repo_usage_report(ledger, fold_slug):
     never consumed anything are omitted); host_usage is the merged report, or
     None when no transcript exists at all."""
     by_repo = {}  # repo name -> {"remote": str, "slugs": set()}
+    # One slug is ONE repo's (rollup XERK-1584): an older build could persist it
+    # twice (worktree-keyed + projects-dir-keyed), and under two repo names its
+    # usage counted twice in the host total. A named repo beats the root bucket.
+    owner = {}
     for path, meta in (ledger or {}).items():
         meta = meta or {}
         if meta.get("internal"):
             continue  # the manager's own claude -p helper, not a repo (XERK-27)
         repo = meta.get("repo") or ROOT_REPO_NAME
         slug = meta.get("slug") or _project_slug(path)
+        if owner.get(slug, ROOT_REPO_NAME) == ROOT_REPO_NAME:
+            owner[slug] = repo
+    for path, meta in (ledger or {}).items():
+        meta = meta or {}
+        if meta.get("internal"):
+            continue
+        repo = meta.get("repo") or ROOT_REPO_NAME
+        slug = meta.get("slug") or _project_slug(path)
+        if owner.get(slug) != repo:
+            continue
         g = by_repo.setdefault(repo, {"remote": "", "slugs": set()})
         g["slugs"].add(slug)
         if not g["remote"] and meta.get("remote"):
@@ -10212,6 +10226,28 @@ _SHELL_NEUTRAL_CMDS = frozenset({"date", "echo", "printf", "true", ":", "cd"})
 # Pipeline stages that only filter a waiting command's output.
 _SHELL_FILTER_CMDS = frozenset({"grep", "egrep", "fgrep", "head", "tail", "sed", "awk",
                                 "tee", "cut", "cat", "jq", "tr", "wc", "sort", "uniq"})
+# ...except one that edits a FILE in place (`| sed -i x f`): that is work.
+
+
+def _shell_filter_writes(words):
+    """True for an in-place editing filter stage: GNU sed's `-i`/`--in-place`
+    (any short cluster holding an `i`, erring toward work) or gawk's `-i`
+    include (`-i inplace`). A long option may be any unambiguous prefix
+    (`sed --in`, `awk --inc`), as getopt_long takes it."""
+    cmd = words[0].rsplit("/", 1)[-1] if words else ""
+    if cmd not in ("sed", "awk"):
+        return False
+    full = "--in-place" if cmd == "sed" else "--include"
+    for w in words[1:]:
+        if w.startswith("--"):
+            name = w.split("=", 1)[0]
+            if len(name) > 2 and full.startswith(name):
+                return True
+        elif w.startswith("-") and "i" in w:
+            return True
+    return False
+
+
 # Wrappers that run the rest of the line unchanged.
 _SHELL_PREFIX_CMDS = frozenset({"nohup", "exec", "command"})
 # Read-only checks a poll loop runs between sleeps — the canonical one is a
@@ -10491,18 +10527,30 @@ def _shell_subst_bodies(word):
     return out
 
 
-def _shell_runs_work(words, depth=0):
+def _shell_runs_work(words, depth=0, lists=False):
     """True when a substitution in these raw words runs WORK: `OUT=$(npm test)`
     is a stage with no command word, so it read `neutral`, and a loop around it
-    read as a wait. A probe's body (`s=$(gh pr view …)`) is not work."""
+    read as a wait. A probe's body (`s=$(gh pr view …)`) is not work. With
+    `lists`, a lone `$(seq …)` only generates a `for` list's words."""
     for w in words:
         for body in _shell_subst_bodies(w):
             if depth >= 3:
                 return True   # deep nesting must not recurse on the beat
-            for seg in _shell_segments(body):
+            segs = _shell_segments(body)
+            if lists and _shell_is_seq(segs) and not _shell_runs_work(segs[0][0], depth + 1):
+                continue
+            for seg in segs:
                 if _shell_pipeline_kind(seg, depth + 1)[0] == "work":
                     return True
     return False
+
+
+def _shell_is_seq(segs):
+    """One segment of one stage whose command is `seq`."""
+    if len(segs) != 1 or len(segs[0]) != 1:
+        return False
+    w = _shell_words(segs[0][0])
+    return bool(w) and w[0].rsplit("/", 1)[-1] == "seq"
 
 
 def _shell_pipeline_kind(stages, depth=0):
@@ -10512,7 +10560,7 @@ def _shell_pipeline_kind(stages, depth=0):
         return "work", None
     for st in stages[1:]:
         w = _shell_words(st)
-        if w and w[0].rsplit("/", 1)[-1] not in _SHELL_FILTER_CMDS:
+        if w and (w[0].rsplit("/", 1)[-1] not in _SHELL_FILTER_CMDS or _shell_filter_writes(w)):
             return "work", None
     return _shell_cmd_kind(_shell_words(stages[0]))
 
@@ -10525,8 +10573,8 @@ def _shell_loop(segs, i):
     if i + 1 >= len(segs) or _shell_pipeline_kind([["true"]] + segs[i][1:])[0] == "work":
         return "work", None
     # A `while`/`until` condition runs every lap: `while [ "$(make deploy)" … ]`
-    # is work. A `for` list's `$(seq …)` only generates the words.
-    if head[0] in ("while", "until") and _shell_runs_work(segs[i][0]):
+    # is work; so is a `for` list's `$(npm test)`, though not its `$(seq …)`.
+    if _shell_runs_work(segs[i][0], lists=head[0] == "for"):
         return "work", None
     first = _shell_words(segs[i + 1][0])
     if not first or first[0] != "do":

@@ -8275,7 +8275,11 @@ test("XERK-1848: the tripwire demotes a promoted model whose live bad rate beats
     // Sticky: the old 40 pairs do not re-promote it.
     hub.modelPolicySweep();
     assert.equal(hub.__modelPolicyState()["bug/sonnet"].state, "demoted");
-    // 40 NEW clean pairs, graded after the demotion, do.
+    // 40 NEW clean pairs, graded after the demotion, do. The clock must move
+    // first: a re-promotion stamped in the same millisecond as the bad live
+    // rows above counts them "since" it and demotes again (rollup XERK-1584).
+    const seeded = Date.now();
+    while (Date.now() <= seeded) { /* spin to the next millisecond */ }
     seedPairs("bug", "sonnet", 40, { at: Date.now() + 1000 });
     hub.modelPolicySweep();
     const again = hub.__modelPolicyState()["bug/sonnet"];
@@ -19770,10 +19774,15 @@ test("term: the idle window is REAL on a tunnel channel, not just a number", () 
   // 2. Traffic in EITHER direction rearms it — inbound bytes go through `push`
   //    (never a 'data' listener, which would flip the duplex into flowing mode
   //    and steal bytes from the HTTP parser), outbound through `write`.
+  //    One channel per direction (rollup XERK-1584): a single channel doing
+  //    both kept passing with `push`'s rearm deleted, since `write` alone held it.
   const b = mk();
   b.on("timeout", () => fired.push("b"));
   b.setTimeout(WINDOW);
-  const busy = setInterval(() => { b.push(Buffer.from("x")); b.write("y"); }, 5);
+  const w = mk();
+  w.on("timeout", () => fired.push("w"));
+  w.setTimeout(WINDOW);
+  const busy = setInterval(() => { b.push(Buffer.from("x")); w.write("y"); }, 5);
   // 3. setTimeout(0) — what the Agent calls when it takes a socket back OUT of
   //    the free pool — disarms it, so an in-flight request is never killed.
   const c = mk();
@@ -19793,7 +19802,8 @@ test("term: the idle window is REAL on a tunnel channel, not just a number", () 
   return new Promise((resolve) => setTimeout(() => {
     clearInterval(busy);
     assert.ok(fired.includes("a"), "an idle pooled channel must time out");
-    assert.ok(!fired.includes("b"), "a channel carrying bytes must NOT time out");
+    assert.ok(!fired.includes("b"), "a channel receiving bytes must NOT time out");
+    assert.ok(!fired.includes("w"), "a channel sending bytes must NOT time out");
     assert.ok(!fired.includes("c"), "setTimeout(0) must disarm (socket back in use)");
     // The reader still works: wrapping `push` must not have eaten the bytes.
     assert.equal(b.read().length > 0, true, "pushed bytes must still be readable");

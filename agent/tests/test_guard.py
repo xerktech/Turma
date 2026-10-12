@@ -5413,6 +5413,20 @@ class TestExpansionBudget(unittest.TestCase):
         self.assertIn(self.TOO_LARGE, reason)
         self.assertLess(time.process_time() - t, 30)
 
+    def test_a_reading_leaves_an_outer_reading_s_flag_as_it_found_it(self):
+        # Rollup XERK-1584: each pass reset its flag to the default in its
+        # `finally`, so a pass run inside an outer one turned the outer
+        # reading's flag off for the rest of that reading.
+        line = 'q=/e; d=$q$c; c=x; y="${a:-' + "'b'" + '}"; for v in a b; do echo "$v" "$y" $d; done'
+        for cell, held in ((guard._BRACE_OTHER_SHELL, True), (guard._VALUES_CHAINED, 2),
+                           (guard._FOR_PICK, 0), (guard._PWD_UNASSIGNED, True)):
+            prev, cell[0] = cell[0], held
+            try:
+                guard._budgeted(guard._expand_both)(line)
+                self.assertEqual(cell[0], held)
+            finally:
+                cell[0] = prev
+
     def test_find_exec_and_xargs_runs_are_denied_fast(self):
         # Their emitted WORK grew faster than linearly, not their text: 5000
         # `-exec` runs took 30s and 4096 xargs segments 18s (XERK-1589).
@@ -7114,6 +7128,29 @@ class TestPrSummary(unittest.TestCase):
             fh.write("## How Has This Been Tested?\n\n## Checklist:\n\n## Related Issue(s)\n")
         ok = "## How Has This Been Tested?\nx\n## Checklist:\n- y\n## Related Issue(s)\nz\n"
         self.assertIsNone(self.reason("gh pr create --body " + __import__("shlex").quote(ok)))
+
+    def test_headings_are_read_in_linear_time(self):
+        # Rollup XERK-1584: `^\s*#` ran each line start over every newline
+        # after it (36 KB of blank lines took 39s), and a template line of
+        # `# x` + spaces + `y` was cubic in `(.+?)\s*#*\s*$` (431s at 7000).
+        body = "\n" * 200000 + "x"
+        t = time.process_time()
+        self.assertIsNotNone(guard._pr_body_reason(body, self.repo))
+        self.assertEqual(guard._template_headings(" \n" * 100000), [])
+        self.assertEqual(guard._template_headings("# x" + " " * 20000 + "y"), ["x" + " " * 20000 + "y"])
+        self.assertLess(time.process_time() - t, 2)
+
+    def test_heading_whitespace_is_any_but_a_newline(self):
+        # The fix must not change which headings count: CR, NBSP, a form feed
+        # or tab around the marks is still a heading; a newline never was.
+        self.assertEqual(guard._template_headings(
+            "## Why\r\n  ### What changed ##\n\u00a0## Risk\u00a0\n\f# Testing\f\n#\nNope\n"),
+            ["Why", "What changed", "Risk", "Testing"])
+        for body in ("\n\r## Why", "\u00a0## Why", "\f## Why", "\t##\tWhy"):
+            with self.subTest(body=body):
+                self.assertTrue(guard._heading_present(body, "why"))
+        self.assertFalse(guard._heading_present("##\nWhy", "why"))
+        self.assertTrue(guard._PR_SUMMARY_LINE.search("x\n\r**Summary:** y"))
 
     def test_a_fifo_body_file_or_template_never_hangs_the_hook(self):
         os.mkfifo(os.path.join(self.repo, "body.fifo"))
