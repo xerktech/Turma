@@ -17712,9 +17712,9 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
     newest, newest_mtime = None, 0.0
     found, found_mtime = None, 0.0
     if not primed:
-        # A transcript not written yet (or a project dir not made yet) is read
-        # from its first byte; one that exists is re-judged below (XERK-1857).
-        state["qaComplete"] = True
+        # False until judged: an exception before the judgement below must not
+        # leave a snapshot claiming the skipped history was scanned (XERK-1857).
+        state["qaComplete"] = False
     try:
         for fname in os.listdir(proj):
             if not fname.endswith(".jsonl"):
@@ -17731,6 +17731,8 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
             if st.st_mtime > newest_mtime:
                 newest, newest_mtime = path, st.st_mtime
     except OSError:
+        if not primed:
+            state["qaComplete"] = True  # nothing primed: read from byte 0 later
         state["primed"] = True
         return _finish()
     state["primed"] = True
@@ -17740,6 +17742,9 @@ def session_report(workdir, state, tmux_name=None, session_id=None,
         # in a shared project dir is its conversation.
         newest, newest_mtime = found, found_mtime
     if not newest:
+        if not primed:
+            # Not written yet: it will be scanned from its first byte.
+            state["qaComplete"] = True
         return _finish()
     report["transcriptAgeSec"] = max(0, int(time.time() - newest_mtime))
     report["tail"] = transcript_tail(newest)

@@ -44580,6 +44580,18 @@ class TestReworkSignalsReachTheWire(ManagerMixin, unittest.TestCase):
         rep = ha.session_report(self.tmp, {}, session_id="s1", claude_sid=sid)
         self.assertFalse(rep.get("qaPartial"))
 
+    def test_a_restore_that_raises_never_publishes_a_whole_scan(self):
+        # XERK-1857 delta QA: the flag is False until the judgement runs.
+        sid = "88888888-8888-4888-8888-888888888888"
+        self._pinned(sid, [_qa_call("t1")])
+        ha.session_report(self.tmp, {"primed": True, "qaComplete": True},
+                          session_id="s1", claude_sid=sid)
+        st = {}
+        with mock.patch.object(ha, "_restore_live_agents", side_effect=TypeError("x")):
+            with self.assertRaises(TypeError):
+                ha.session_report(self.tmp, st, session_id="s1", claude_sid=sid)
+        self.assertIs(st.get("qaComplete"), False)
+
     def test_a_forged_unhashable_qa_call_never_raises(self):
         # XERK-1857 QA D1: the snapshot is session-writable.
         sid = "77777777-7777-4777-8777-777777777777"
