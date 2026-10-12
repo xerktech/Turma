@@ -157,13 +157,16 @@ This file is the operative rules for what has shipped; the routing policy is `mo
       ones), so the run stays like-for-like. **Never `--restricted`**: it drops CLAUDE.md and
       every user agent, so the qa sub-agent both directives name does not exist (QA-found).
     - The repo's COMMITTED project config therefore loads, and its hooks would run OUTSIDE the
-      sandbox, calling scripts the shadow can rewrite (QA-reproduced). So `spawn_shadow`
-      refuses a base whose `.claude/settings*.json` holds any key but `permissions`/`$schema`
-      or whose `.claude/agents/*.md` define hooks/MCP servers (`shadow_project_reason`,
-      fail-closed). No `Skill` tool: skill hooks run outside the sandbox too, and fileguard
-      refuses `.claude` at any depth. `--agents` is capped (`SHADOW_AGENTS_MAX_BYTES`, E2BIG).
-    - `fileguard.py` keyed on `TURMA_SHADOW_ROOT` (the env, never the payload cwd a `cd` moves)
-      refuses a file-tool write outside the worktree or into `.git`/`.claude`, fail-CLOSED.
+      sandbox, calling scripts the shadow can rewrite (QA-reproduced). `shadow_tree_reason`
+      (one `ls-tree -r -z` of the base, fail-closed) refuses a base with: any gitlink; a
+      symlink at or under any `.claude`; a nested `.claude/settings*`/`agents`; project
+      settings keys beyond `permissions`/`$schema`/attribution, permission keys beyond
+      allow/deny/ask, or an Edit/Write/WebFetch allow (they merge into the sandbox); an agent
+      that is not a top-level `.md` or whose frontmatter MENTIONS hook/mcp at all.
+      **Judge bytes, never parse YAML**: a parser was beaten by quoted/complex keys, a BOM, a
+      nested dir, a non-ASCII (quoted) name and a symlinked dir. Today it refuses Veiller
+      (gitlink) and Tenir (Edit/WebFetch allows). No `Skill` tool (skill hooks run outside the
+      sandbox); fileguard refuses `.claude` at any depth; `--agents` is capped (E2BIG).
   - **So the shadow cannot commit**: the manager does (`_advance_shadow_run`), on
     `turma-shadow/<id>`, with git hardened against the tree (`core.fsmonitor=false`, no hooks,
     `--ignore-submodules=all`). A nested repo in the tree (`?? x/` under `-uall`) fails the run

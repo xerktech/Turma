@@ -44568,6 +44568,7 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
         self.dirty = ""
         self.gitlink = False
         self.claude_files = {}     # the base's committed .claude/*, path -> text
+        self.tree_extra = []       # other (mode, path) rows of the base tree
         for name, value in [("scan_repos", lambda: [self.repo]),
                             ("JIRA_SITE", self.SITE), ("JIRA_EMAIL", "a@b.c"),
                             ("JIRA_TOKEN", "t"), ("run", self.fake_git),
@@ -44590,11 +44591,11 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
 
     def fake_git_out(self, cmd, cwd=None, timeout=None):
         self.run_calls.append(cmd)
-        if "ls-tree" in cmd and "--name-only" in cmd:
-            return 0, "\n".join(sorted(self.claude_files))
-        if "ls-tree" in cmd:
-            return 0, (f"100644 blob {'d' * 40}\ta.py\n"
-                       + (f"160000 commit {'e' * 40}\tsub\n" if self.gitlink else ""))
+        if "ls-tree" in cmd:       # -z: NUL-separated "<mode> <type> <sha>\t<path>"
+            rows = [("100644", "a.py")] + [("100644", n) for n in sorted(self.claude_files)]
+            rows += self.tree_extra + ([("160000", "sub")] if self.gitlink else [])
+            return 0, "\0".join(f"{m} {'commit' if m == '160000' else 'blob'} "
+                                 f"{'d' * 40}\t{p}" for m, p in rows)
         if "show" in cmd:
             name = cmd[-1].split(":", 1)[1]
             return (0, self.claude_files[name]) if name in self.claude_files else (128, "")
@@ -44874,7 +44875,17 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
                  ({".claude/settings.local.json": '{"statusLine": {}}'}, "statusLine"),
                  ({".claude/settings.json": '{"sandbox": {}}'}, "sandbox"),
                  ({".claude/settings.json": "not json"}, "could not read"),
-                 ({".claude/agents/x.md": agent}, "hooks or MCP")]
+                 ({".claude/agents/x.md": agent}, "hooks or MCP"),
+                 # The shapes a frontmatter parser missed (QA, XERK-1859).
+                 ({".claude/agents/q.md": '---\n"hooks":\n  Stop: []\n---\nx'}, "hooks or MCP"),
+                 ({".claude/agents/b.md": "\ufeff---\nhooks: {}\n---\nx"}, "hooks or MCP"),
+                 ({".claude/agents/c.md": "---\n? hooks\n: {}\n---\nx"}, "hooks or MCP"),
+                 ({".claude/agents/sub/x.md": "---\nname: x\n---\n"}, "top-level"),
+                 ({"sub/.claude/settings.json": "{}"}, "nested"),
+                 ({".claude/settings.json": '{"permissions": {"additionalDirectories": ["/"]}}'},
+                  "permission options"),
+                 ({".claude/settings.json": '{"permissions": {"allow": ["Edit(//repos/**)"]}}'},
+                  "file writes")]
         sm = self.make_manager()
         sm._launch_ttyd = mock.Mock()
 
@@ -44895,15 +44906,20 @@ class TestShadowRuns(ManagerMixin, unittest.TestCase):
                              ".claude/agents/y.md": "---\nname: y\n---\nhi\n"}
         self.assertEqual(spawn(99)["state"], "running")
         self.assertEqual(len(sm.registry), 1)
+        # A symlinked .claude (or anything under it) is followed by Claude: refused.
+        for n, link in enumerate((".claude", ".claude/agents"), 100):
+            self.claude_files, self.tree_extra = {}, [("120000", link)]
+            r = spawn(n)
+            self.assertEqual(r["state"], "failed")
+            self.assertIn("symlink", r["error"])
 
     def test_an_unreadable_tree_is_refused(self):
         sm = self.make_manager()
-        with mock.patch.object(ha, "run_out", lambda *a, **k: (None, "")):
-            self.assertIn("could not read", ha.shadow_project_reason("/r", self.BASE))
-            with mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
-                sm.spawn_shadow(self.cmd())
+        with mock.patch.object(ha, "run_out", lambda *a, **k: (None, "")), \
+                mock.patch.object(ha, "fetch_jira_issue", lambda k: self.detail()):
+            sm.spawn_shadow(self.cmd())
         self.assertEqual(sm.registry, [])
-        self.assertIn("submodules", sm.shadow_runs[self.RID]["error"])
+        self.assertIn("could not read the base commit", sm.shadow_runs[self.RID]["error"])
 
     def test_a_nested_repository_fails_the_run_before_git_add(self):
         sm = self.spawned()

@@ -5737,7 +5737,9 @@ def build_guard_settings(python_exe=None, guard_path=None, ask_path=None,
 #     `.claude/skills` dir is one the sandboxed shell could write.
 SHADOW_TOOLS = ("Bash", "Read", "Edit", "Write", "Glob", "Grep", "NotebookEdit",
                 "Agent", "Task", "ToolSearch", "TaskStop", "TodoWrite")
-SHADOW_PROJECT_SETTINGS_KEYS = frozenset({"permissions", "$schema"})
+# Inert keys only: none of these runs a command or widens the sandbox.
+SHADOW_PROJECT_SETTINGS_KEYS = frozenset({"permissions", "$schema", "attribution",
+                                          "includeCoAuthoredBy"})
 # The `--agents` JSON is ONE argv string; past ~128 KiB exec fails (E2BIG).
 SHADOW_AGENTS_MAX_BYTES = 64 * 1024
 SHADOW_AGENTS_KEEP = ("qa", "qa-delta")
@@ -5897,39 +5899,70 @@ def shadow_agents(agents_dir=None):
     return out
 
 
-def _agent_frontmatter_keys(text):
-    m = re.match(r"---\n(.*?)\n---", text, re.S)
-    if not m:
-        return set()
-    return {line.partition(":")[0].strip() for line in m.group(1).splitlines()
-            if line.partition(":")[1] and not line[:1].isspace()}
+def shadow_tree_reason(repo, base):
+    """Why `base`'s tree rules out a shadow, or None (XERK-1859). Fails CLOSED.
 
-
-def shadow_project_reason(repo, base):
-    """Why the repo's committed Claude config at `base` rules out a shadow, or
-    None. A shadow loads project settings and agents (for CLAUDE.md and rules
-    parity); anything there that runs a command does so OUTSIDE the sandbox.
-    Fails closed: an unreadable listing is a reason."""
-    rc, names = run_out(["git", "-C", repo, "ls-tree", "-r", "--name-only", base,
-                         "--", ".claude"], timeout=15)
+    The manager's own git and the shadow's Claude both read this tree outside the
+    sandbox, so only shapes known to be inert pass: no gitlink anywhere (its
+    `.git` would sit in the writable worktree, and git status recurses into it),
+    no symlink named `.claude` or under one (Claude follows it), project settings
+    holding nothing but `permissions`/`$schema`, and project agents only as plain
+    top-level `.md` files whose frontmatter never mentions hooks or MCP. Judged
+    on the bytes, not a YAML parse: a quoted or complex key, a BOM or a nested
+    dir each slipped past a parser (QA-reproduced)."""
+    rc, out = run_out(["git", "-C", repo, "ls-tree", "-r", "-z", "--full-tree", base],
+                      timeout=30)
     if rc != 0:
-        return "could not read the repo's .claude config"
-    for name in names.splitlines():
-        if name in (".claude/settings.json", ".claude/settings.local.json"):
-            rc, text = run_out(["git", "-C", repo, "show", f"{base}:{name}"], timeout=15)
+        return "could not read the base commit's tree"
+    for entry in out.split("\0"):
+        meta, tab, path = entry.partition("\t")
+        if not tab:
+            continue
+        mode = meta.split(" ", 1)[0]
+        parts = path.split("/")
+        if mode == "160000":
+            return "shadow runs do not support submodules"
+        if ".claude" not in parts:
+            continue
+        i = parts.index(".claude")
+        if mode == "120000":
+            return f"{path} is a symlink in Claude's config"
+        sub = parts[i + 1:]
+        if i > 0 and sub and sub[0] in ("settings.json", "settings.local.json", "agents"):
+            return f"{path}: nested Claude config"
+        if sub and sub[0] in ("settings.json", "settings.local.json"):
+            rc, text = run_out(["git", "-C", repo, "show", f"{base}:{path}"], timeout=15)
             try:
                 data = json.loads(text) if rc == 0 else None
             except ValueError:
                 data = None
             if not isinstance(data, dict):
-                return f"could not read {name}"
+                return f"could not read {path}"
             extra = sorted(set(data) - SHADOW_PROJECT_SETTINGS_KEYS)
             if extra:
-                return f"{name} sets {', '.join(extra)[:120]}, which would run outside the sandbox"
-        elif re.fullmatch(r"\.claude/agents/[^/]+\.md", name):
-            rc, text = run_out(["git", "-C", repo, "show", f"{base}:{name}"], timeout=15)
-            if rc != 0 or {"hooks", "mcpServers"} & _agent_frontmatter_keys(text):
-                return f"{name} defines hooks or MCP servers"
+                return (f"{path} sets {', '.join(extra)[:120]}, which would run "
+                        "outside the sandbox")
+            perms = data.get("permissions", {})
+            if not isinstance(perms, dict) or set(perms) - {"allow", "deny", "ask"}:
+                return f"{path} sets permission options a shadow cannot take"
+            # An Edit/Write allow rule widens the sandbox's writable paths, a
+            # WebFetch one its network: both merge into the sandbox config.
+            allow = perms.get("allow", [])
+            if not isinstance(allow, list) or any(
+                    not isinstance(r, str)
+                    or re.match(r"\s*(Edit|Write|MultiEdit|NotebookEdit|WebFetch)\b", r)
+                    for r in allow):
+                return f"{path} allows file writes or fetches a shadow cannot take"
+        elif sub and sub[0] == "agents":
+            if len(sub) != 2 or not sub[1].endswith(".md"):
+                return f"{path}: only top-level .md agents are allowed"
+            rc, text = run_out(["git", "-C", repo, "show", f"{base}:{path}"], timeout=15)
+            if rc != 0:
+                return f"could not read {path}"
+            m = re.match(r"---\n(.*?)\n---(?:\n|\Z)", text, re.S)
+            head = (m.group(1) if m else text).lower()
+            if "hook" in head or "mcp" in head:
+                return f"{path} may define hooks or MCP servers"
     return None
 
 
@@ -27953,15 +27986,9 @@ class SessionManager:
                     f"{merge}^1^{{commit}}"]).strip().lower()
         if not SHADOW_SHA_RE.fullmatch(base):
             return self._fail_shadow(rid, cmd, "the merge commit is not in this clone")
-        rc, tree = run_out(["git", "-C", repo["path"], "ls-tree", "-r", base], timeout=30)
-        if rc != 0 or re.search(r"(?m)^160000 ", tree):
-            # A gitlink's `.git` sits inside the worktree the sandbox lets the
-            # shadow write, and the manager's own git status recurses into it —
-            # with or without a .gitmodules (XERK-1859).
-            return self._fail_shadow(rid, cmd, "shadow runs do not support submodules")
-        project = shadow_project_reason(repo["path"], base)
-        if project:
-            return self._fail_shadow(rid, cmd, f"shadow runs cannot sandbox this repo: {project}")
+        tree = shadow_tree_reason(repo["path"], base)
+        if tree:
+            return self._fail_shadow(rid, cmd, f"shadow runs cannot sandbox this repo: {tree}")
         try:
             detail = fetch_board_issue(key)
         except Exception as e:
