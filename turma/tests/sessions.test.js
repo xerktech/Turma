@@ -3764,6 +3764,26 @@ test("trajectory pane: a slow answer does not overwrite a refresh of the same se
   assert.equal(page.els.trajScroll.innerHTML, shown, "the stale 502 left the refreshed pane alone");
 });
 
+test("trajectory pane: a slow 200 for a session left behind paints nothing, nor over the no-transcript note", async () => {
+  const page = loadPage();
+  const c = host([{ ...running("s1", "A", { paneBusy: false, transcriptAgeSec: 5 }), transcriptId: "tidA" }]);
+  page.beat({ now: c.now, agents: [c.host] });
+  let releaseA;
+  page.setGet((url) => url.includes("/tidA/trajectory")
+    ? { json: () => null, then: (res) => { releaseA = () => res({ ok: true, status: 200, json: async () => ({ turns: [], runtime: "claude" }) }); } }
+    : null);
+  page.selectSession("s1");
+  page.chatToTrajectory();
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  page.loadTrajectory(null);          // a session with no transcript id opened meanwhile
+  const shown = page.els.trajScroll.innerHTML;
+  assert.match(shown, /no transcript id yet/);
+  releaseA();
+  for (let i = 0; i < 3; i++) await new Promise((r) => setImmediate(r));
+  assert.equal(page.els.trajScroll.innerHTML, shown);
+  assert.notEqual(page.els.trajScroll.dataset.loaded, "1");
+});
+
 // --- Trajectory on the read-only stage (XERK-718) ----------------------------
 // The ended/killed-session and archived-transcript views are archive-served, so
 // their Trajectory works for an offline host too. The toggle rides the SAME

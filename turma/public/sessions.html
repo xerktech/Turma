@@ -3899,7 +3899,9 @@ function trajectoryToTranscript() {
 async function loadTrajectory(transcriptId, force) {
   const scroll = document.getElementById("trajScroll");
   if (!scroll) return;
-  if (!transcriptId) { scroll.innerHTML = '<div class="traj-empty">This session has no transcript id yet.</div>'; return; }
+  // Counted as the newest request too, so a slow answer for the last session
+  // can't paint over this note.
+  if (!transcriptId) { trajLoadSeq++; currentTrajId = null; scroll.innerHTML = '<div class="traj-empty">This session has no transcript id yet.</div>'; return; }
   if (!force && currentTrajId === transcriptId && scroll.dataset.loaded === "1") return;
   currentTrajId = transcriptId;
   const seq = ++trajLoadSeq;
