@@ -92,9 +92,12 @@ jobs:
   # this job, and every later job needs plan, so a red main builds, deploys and
   # publishes nothing. Runs on a dry_run dispatch too: rehearsing a release of
   # an untested commit is not a rehearsal.
+  # Its Unit tests job is skipped when this exact tree already passed them on a
+  # PR (code-scan.yml's tested-tree job), which needs actions: read.
   code-scan:
     uses: ./.github/workflows/code-scan.yml
     permissions:
+      actions: read
       contents: read
 
   # ------------------------------------------------------------------ plan ----

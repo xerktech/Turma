@@ -140,8 +140,60 @@ jobs:
       # (the native launcher/updater/installer). Fails the job on any finding.
       - uses: ludeeus/action-shellcheck@2.0.0
 
+  # A release (workflow_call) re-runs this gate on the commit it ships, but when
+  # that commit's TREE is byte-identical to a PR merge result whose Unit tests
+  # already passed, the ~10-minute re-run proves nothing new: nothing landed
+  # between that PR's test and its merge. A squash merge's tree equals the
+  # refs/pull/<n>/merge tree the PR job checked out, so the tree hash is the key.
+  # The PR job records it as a `tested-tree-<tree>` artifact (last step below);
+  # this job looks it up. Only same-repo pull_request runs of THIS workflow count
+  # — this repo is public, and a fork's PR runs its own edited workflow, so a
+  # fork could upload any artifact name. Any lookup error falls back to running
+  # the tests. Never run on pull_request: the PR is what produces the record.
+  tested-tree:
+    name: Tree already tested
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      actions: read
+      contents: read
+    outputs:
+      tested: ${{ steps.lookup.outputs.tested }}
+    steps:
+      - id: lookup
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -uo pipefail
+          tested=false
+          tree=$(gh api "repos/$REPO/commits/$SHA" --jq .commit.tree.sha) || tree=
+          if [ -n "$tree" ]; then
+            runs=$(gh api "repos/$REPO/actions/artifacts?name=tested-tree-$tree&per_page=100" \
+              --jq '.artifacts[] | select(.expired | not)
+                    | select(.workflow_run.head_repository_id == .workflow_run.repository_id)
+                    | .workflow_run.id') || runs=
+            for id in $runs; do
+              if gh api "repos/$REPO/actions/runs/$id" \
+                  --jq 'select(.path == ".github/workflows/code-scan.yml" and .event == "pull_request") | .html_url' \
+                  | grep -q .; then
+                tested=true
+                echo "Tree $tree already passed Unit tests in PR run $id; skipping the re-run."
+                break
+              fi
+            done
+          fi
+          [ "$tested" = true ] || echo "Tree ${tree:-<lookup failed>} has no passing PR Unit tests record; running them."
+          echo "tested=$tested" >> "$GITHUB_OUTPUT"
+
   tests:
     name: Unit tests
+    needs: tested-tree
+    # !cancelled(): on pull_request tested-tree is skipped, and a plain needs
+    # would skip this required check with it. A failed lookup also runs the tests.
+    if: ${{ !cancelled() && needs.tested-tree.outputs.tested != 'true' }}
     runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
@@ -344,3 +396,18 @@ jobs:
       - name: Native Windows updater tests (agent/native/windows/turma-agent-update.ps1)
         shell: pwsh
         run: ./agent/tests/test_turma_agent_update_ps1.ps1
+      # The record tested-tree looks up: this exact tree passed every step above.
+      # Last step, so it uploads only when the whole job succeeded. PR runs only —
+      # a release's own run has nobody downstream to read it.
+      - name: Record tested tree
+        if: github.event_name == 'pull_request'
+        run: |
+          tree=$(git rev-parse 'HEAD^{tree}')
+          echo "$tree" > tested-tree.txt
+          echo "TESTED_TREE=$tree" >> "$GITHUB_ENV"
+      - if: github.event_name == 'pull_request'
+        uses: actions/upload-artifact@v4
+        with:
+          name: tested-tree-${{ env.TESTED_TREE }}
+          path: tested-tree.txt
+          retention-days: 3
