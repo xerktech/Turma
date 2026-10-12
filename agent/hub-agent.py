@@ -10627,6 +10627,7 @@ def _shell_segments(command):
     segs, stages, words = [], [], []
     word, in_word = [], False
     quote, depth, tick = "", 0, False
+    inner = ""   # a quote open inside a substitution: its parens are text
     s = str(command or "")
     n = len(s)
 
@@ -10665,7 +10666,12 @@ def _shell_segments(command):
             continue
         if depth or tick:
             word.append(c)
-            if c == "`" and not depth:
+            if inner:
+                if c == inner:
+                    inner = ""
+            elif c in ("'", '"'):
+                inner = c
+            elif c == "`" and not depth:
                 tick = False
             elif c == "(":
                 depth += 1
@@ -10916,7 +10922,10 @@ def _shell_loop(segs, i):
     first = _shell_words(segs[i + 1][0])
     if not first or first[0] != "do":
         return "work", None
-    body = [[first[1:]] + segs[i + 1][1:]]
+    # The raw words after `do`, not `first`: `_shell_words` drops a
+    # redirect-looking `<(make)`, whose body still runs.
+    raw = segs[i + 1][0]
+    body = [[raw[1:] if raw[:1] == ["do"] else first[1:]] + segs[i + 1][1:]]
     j = i + 2
     while j < len(segs) and _shell_words(segs[j][0]) != ["done"]:
         body.append(segs[j])

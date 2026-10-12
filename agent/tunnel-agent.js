@@ -1058,6 +1058,7 @@ function shellSegments(command) {
   const segs = [];
   let stages = [], words = [], word = [], inWord = false;
   let quote = "", depth = 0, tick = false;
+  let inner = "";   // a quote open inside a substitution: its parens are text
   const s = String(command == null ? "" : command);
   const n = s.length;
   const endWord = () => { if (inWord) words.push(word.join("")); word = []; inWord = false; };
@@ -1073,7 +1074,9 @@ function shellSegments(command) {
     }
     if (depth || tick) {
       word.push(c);
-      if (c === "`" && !depth) tick = false;
+      if (inner) { if (c === inner) inner = ""; }
+      else if (c === "'" || c === '"') inner = c;
+      else if (c === "`" && !depth) tick = false;
       else if (c === "(") depth++;
       else if (c === ")") depth--;
       continue;
@@ -1262,7 +1265,10 @@ function shellLoop(segs, i) {
   if (shellRunsWork(segs[i][0], 0, head[0] === "for")) return ["work", null];
   const first = shellWords(segs[i + 1][0]);
   if (!first.length || first[0] !== "do") return ["work", null];
-  const body = [[first.slice(1), ...segs[i + 1].slice(1)]];
+  // The raw words after `do`, not `first`: shellWords drops a redirect-looking
+  // `<(make)`, whose body still runs.
+  const raw = segs[i + 1][0];
+  const body = [[raw[0] === "do" ? raw.slice(1) : first.slice(1), ...segs[i + 1].slice(1)]];
   let j = i + 2;
   while (j < segs.length && !sameWords(shellWords(segs[j][0]), ["done"])) body.push(segs[j++]);
   if (j >= segs.length) return ["work", null];

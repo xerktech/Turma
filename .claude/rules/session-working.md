@@ -72,6 +72,7 @@ Moved out of `CLAUDE.md` (size ceiling). This read spans the agent (`hub-agent.p
 - A `$(…)`/backtick that runs work makes its stage work, in a loop's head too (`for x in
   $(npm test)`). Only a `for` list's lone `$(seq …)` is exempt (it generates the words); `seq`
   anywhere else is work. A process substitution `<(…)`/`>(…)` runs its body like `$(…)` (XERK-1584).
+  A quote inside a substitution is text: `$(echo ')')` does not close it early.
   An in-place filter stage is work too (`| sed -i`/`--in`, `awk --inc`:
   getopt_long takes any unambiguous long-option prefix).
 - **Anything unrecognised is `work`** — that is the pre-XERK-1570 reading, so a classifier miss
