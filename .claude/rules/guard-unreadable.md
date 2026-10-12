@@ -84,8 +84,32 @@ Each fires on a live construct next to a sink; the folded ticket is named.
   -Recurse .\dist`). Only a shell PROGRAM is scanned, so a commit message quoting one is data.
   Also any recursive delete in a script that names `/` or `~` elsewhere (`rm -r ./dist; ls ~`).
 - It runs on the RAW command's segments too, not only the expanded ones: the expansion swaps a
-  single-quoted subexpression for a placeholder, and pwsh runs it.
-- Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook.
+  single-quoted subexpression for a placeholder, and pwsh runs it (`_ps_raw_reason`).
+  - A shell word there counts as the program, right after a `$(`/backtick/`<(` (behind prefix
+    words), or after a runner (`_PS_RUNNERS`: xargs, parallel, flock…; find/fd `-exec`/`-x`)
+    (XERK-1861): segment-start only missed `xargs pwsh -c '$(…)'`. `echo pwsh …` stays data.
+  - Accepted over-read: after a runner any later word may be its program, so
+    `xargs echo pwsh … <all three>` is refused.
+  - A shell's/`eval`'s later words are scripts, each scanned as a command (`bash -c 'pwsh …'`).
+  - It scans the heredoc-STRIPPED text: a note's body line naming all three was refused.
+  - A body is data only when its owner line runs nothing but LITERAL known data readers
+    (`_ps_body_is_data`, `_PS_DATA_OWNERS`: cat, tee, git, gh, python3…); else it is a script,
+    scanned recursively, as main scanned every body line. Never go back to a list of shells
+    and remotes: `ssh`, then its spellings (`s\sh`, `"s"sh`, `slogin`, `$S`, `/usr/bin/s[s]h`)
+    each let a body through that main denied (QA, 3 passes). A body whose owner runs pwsh/cmd
+    is also scanned with it (`pwsh -c - <<E`).
+  - Accepted over-read: ANY unlisted program on the owner line makes it a script, so
+    `sed -n 1p f && python3 - <<E` with pwsh test strings is refused (1 in 30k replayed, guard-dev).
+  - Past `_PS_RAW_DEPTH` nested scripts, text invoking pwsh or `cmd /c` is REFUSED: returning
+    nothing let five nested `bash <<E` through where main denied (QA). Never fail open there.
+    Test at exactly `_PS_RAW_DEPTH + 1`: deeper nests are denied by another path anyway.
+  - Owner lines are split once per OWNER, never per heredoc: per heredoc, N `<<E` on one line
+    was quadratic (36s at 16 KB, QA). Each substitution opener looks ahead a bounded run.
+  - Open (XERK-1863), all allowed on main too: `echo '…' | pwsh -c -`, `eval "$(cat <<E…)"`,
+    `p\wsh`/`p''wsh`, `cmd /c"…"`, a here-string or pipe into `bash`/`ssh`,
+    `eval pwsh -c \''$(…)'\'`, `bash -c '… "$1"' _ '$(…)'`.
+- Keep it linear: a `/s` regex with an ambiguous repeat took 238s at 256 KB through the hook;
+  the trailing-glob cut in `_ps_targets` is `rfind`, never a regex (72s at 128 KB, XERK-1861).
 - Tests: `test_a_powershell_c_script_s_remove_targets_are_judged`,
   `test_a_long_cmd_switch_run_stays_linear`.
 

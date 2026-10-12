@@ -4572,7 +4572,37 @@ class TestClassification(unittest.TestCase):
                     f'cmd /c "r^d /s /q {W}"',
                     f"pwsh -c 'Remove-Item -Recurse:$true {W}'",
                     f"pwsh -c 'Remove-Item {W}\\* -Force'",
-                    f'cmd /c "del /f /s /q {W}\\*.*"'):
+                    f'cmd /c "del /f /s /q {W}\\*.*"',
+                    # XERK-1861: a single-quoted `$(…)` reached through a
+                    # runner or a substitution, and a heredoc a shell reads.
+                    f"echo x | xargs pwsh -c '$(Remove-Item -Recurse {W})'",
+                    f"echo x | xargs -n1 sudo pwsh -c '$(ri -r {W})'",
+                    f"find . -exec pwsh -c '$(Remove-Item -Recurse {W})' \\;",
+                    f"echo $(pwsh -c '$(Remove-Item -Recurse {W})')",
+                    f"pwsh -c - <<'E'\nRemove-Item -Recurse '{W}'\nE",
+                    f"cat > n.md <<E && pwsh -c - <<F\nhi\nE\nRemove-Item -Recurse '{W}'\nF",
+                    f"echo x | xargs pwsh.exe -c '$(ri -r {W})'",
+                    f"echo \"$(pwsh -c '$(ri -r {W})')\"", f"x=$( env pwsh -c '$(ri -r {W})')",
+                    f"cat <(pwsh -c '$(ri -r {W})')",
+                    f"bash -c 'pwsh -c '\"'\"'$(ri -r {W})'\"'\"",
+                    f"eval 'pwsh -c '\"'\"'$(ri -r {W})'\"'\"",
+                    f"parallel pwsh -c '$(ri -r {W})' ::: a", f"flock /tmp/l pwsh -c '$(ri -r {W})'",
+                    # A heredoc a shell reads is a script, not data (QA).
+                    f"bash <<'E'\npwsh -c '$(ri -r {W})'\nE",
+                    f"cat <<'E' | sh\nx=1\npwsh -c '$(ri -r {W})'\nE",
+                    f"ssh host <<'E'\npwsh -c '$(ri -r {W})'\nE",
+                    f"echo \"$( env pwsh -c '$(ri -r {W})')\"", f"x=\"$(timeout 5 pwsh -c '$(ri -r {W})')\"",
+                    # Past the nesting cap a pwsh script is refused, never let through (QA).
+                    # Exactly one past the cap: 6+ is denied by another path too.
+                    "bash <<'L'\n" * (guard._PS_RAW_DEPTH + 1) + f"pwsh -c '$(ri -r {W})'\n"
+                    + "L\n" * (guard._PS_RAW_DEPTH + 1),
+                    *(f"{s} -T h <<'E'\npwsh -c '$(ri -r {W})'\nE"
+                      for s in ("/usr/bin/ssh", "\\ssh", '"ssh"', "'ssh'", "autossh -M 0",
+                                "s\\sh", "s''sh", '"s"sh', "slogin", "S=ssh; $S", "/usr/bin/s[s]h")),
+                    # A `<(…)` on a data reader's owner line may run the body.
+                    f"cat <(echo x) <<'E'\npwsh -c '$(ri -r {W})'\nE",
+                    "bash <<'L'\n" * (guard._PS_RAW_DEPTH + 1) + f"cmd /c rd /s /q {W}\n"
+                    + "L\n" * (guard._PS_RAW_DEPTH + 1)):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(guard.is_destructive(cmd))
         for cmd in ('powershell -c "Remove-Item -Recurse -Force C:\\Users\\x\\proj\\build"',
@@ -4584,7 +4614,14 @@ class TestClassification(unittest.TestCase):
                     f'git commit -m "guard: deny Remove-Item -Recurse {W} in powershell -c"',
                     'rg -n "Remove-Item -Recurse -Force C:/Windows" agent/',
                     f'grep -rn "rd /s /q {W}" agent/tests',
-                    f'echo cmd -c "Remove-Item -Recurse {W}"'):
+                    f'echo cmd -c "Remove-Item -Recurse {W}"',
+                    # XERK-1861: a heredoc body nothing runs as a script is data.
+                    f"cat > n.md <<'E'\npwsh rm -Recurse '{W}'\nE",
+                    f"cat > n.md <<E\nnotes\npowershell Remove-Item -Recurse '{W}'\nE",
+                    f"cat > ssh-notes.md <<'E'\npwsh rm -Recurse '{W}'\nE",
+                    "bash <<'L'\n" * 6 + "echo hi\n" + "L\n" * 6,
+                    "bash <<'L'\n" * 6 + "go build ./cmd/server; echo $cmd\n" + "L\n" * 6,
+                    f"cat > docs/ssh-notes.md <<'E'\npwsh -c '$(ri -r {W})'\nE"):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(guard.is_destructive(cmd))
 
@@ -5401,6 +5438,18 @@ class TestExpansionBudget(unittest.TestCase):
         t = time.process_time()
         self.assertEqual(guard.decide("Bash", {"command": cmd})[0], "deny")
         self.assertLess(time.process_time() - t, 15)
+        # XERK-1861: the trailing-glob cut in `_ps_targets` was a regex that
+        # backtracked quadratically on one long word (72s at 128 KB).
+        t = time.process_time()
+        for word in ("/" + "*" * 128000 + "/", "\\" + "?" * 128000):
+            guard._ps_targets(word)
+        self.assertLess(time.process_time() - t, 1)
+        self.assertEqual(guard._ps_targets("C:\\Windows\\*.*"), ["C:\\Windows\\*.*", "C:\\Windows"])
+        self.assertEqual(guard._ps_targets("C:/x/*/y"), ["C:/x/*/y"])
+        # Each `$(` opener looks ahead a bounded run, never the rest of the line.
+        t = time.process_time()
+        guard._ps_raw_reason("echo " + "$(x " * 40000 + "pwsh")
+        self.assertLess(time.process_time() - t, 2)
 
     def test_a_default_assignment_spending_the_budget_reads_too_large(self):
         # Rollup XERK-1584: `_default_assignments` spent the budget outside

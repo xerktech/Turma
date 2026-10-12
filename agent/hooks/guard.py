@@ -12471,8 +12471,154 @@ def _ps_targets(word: str) -> list[str]:
     if not word:
         return []
     # A trailing glob component (`x\\*`, `x\\*.*`) empties the directory x.
-    parent = re.sub(r"[\\/][^\\/]*[*?][^\\/]*$", "", word)
-    return [word, parent] if parent != word else [word]
+    # Cut at the last separator, never a regex: `[\\/][^\\/]*[*?][^\\/]*$`
+    # backtracked quadratically on one long word (72s at 128 KB, XERK-1861).
+    cut = max(word.rfind("\\"), word.rfind("/"))
+    if cut >= 0 and ("*" in word[cut + 1:] or "?" in word[cut + 1:]):
+        return [word, word[:cut]]
+    return [word]
+
+
+def _ps_raw_reason(command: str, depth: int = 0) -> str | None:
+    """`_ps_script_reason` over the RAW command, wherever a pwsh/cmd word sits
+    (XERK-1861). The expansion swaps a single-quoted `$(…)` for an opaque
+    placeholder, and pwsh runs it — reached through `xargs`, `find -exec`, a
+    substitution or a shell's `-c`/`eval`/heredoc script too. Scanned from the
+    first shell word in program position (which covers every later one);
+    `echo pwsh …` stays data. A heredoc body is data only when its owner line
+    runs nothing but known data readers (`_ps_body_is_data`); any other body is
+    a script of its own, and one whose owner runs pwsh/cmd (`pwsh -c - <<E`)
+    is also scanned with it."""
+    if depth > _PS_RAW_DEPTH:
+        # Fail closed: allowing here let five nested `bash <<E` hide what main
+        # denied (QA). Only text still naming a pwsh/cmd word is refused.
+        if _PS_INVOKED_RE.search(command):
+            return "refusing a PowerShell/cmd script nested too deeply to classify — flatten it"
+        return None
+    text, heredocs = _split_heredocs(command)
+    bodies: dict[str, list[str]] = {}
+    for owner, body, _quoted in heredocs:
+        bodies.setdefault(owner, []).append(body)
+    owner_pieces = []
+    for owner, owned in bodies.items():
+        # One split per owner line, never per heredoc: a line of N `<<E` was
+        # N splits of the whole line (quadratic, QA).
+        joined = "\n".join(owned)
+        owner_pieces += [(seg, joined) for seg in _split_on_operators(owner)]
+        if not _ps_body_is_data(owner):
+            for body in owned:
+                reason = _ps_raw_reason(body, depth + 1)
+                if reason:
+                    return reason
+    # An owner's segments are scanned once, with their bodies: scanned again
+    # bare, each nest level doubled the cost (QA).
+    owned_segs = {seg for seg, _body in owner_pieces}
+    pieces = [(seg, "") for seg in _split_on_operators(text) if seg not in owned_segs]
+    for seg, body in pieces + owner_pieces:
+        if not _PS_SHELL_WORD_RE.search(seg):
+            continue
+        reason = _ps_segment_reason(seg, body, depth)
+        if reason:
+            return reason
+    return None
+
+
+_PS_RAW_DEPTH = 4
+# pwsh, or cmd given a script (`cmd /c`): `./cmd/server` or `$cmd` is not one.
+_PS_INVOKED_RE = re.compile(r"\b(?:powershell|pwsh)\b|\bcmd(?:\.exe)?\s+/[ck]\b", re.IGNORECASE)
+# Programs that only read a heredoc as data (text, a file, or another
+# language's source). Anything else on an owner line makes the body a script;
+# never add `sed`/`awk`, which run body lines (`sed e`, `system()`).
+_PS_DATA_OWNERS = {"cat", "tee", "git", "gh", "glab", "jira", "python", "python3", "node",
+                   "echo", "printf", "true", "mkdir", "cd", "cp", "mv", "touch", "jq",
+                   "grep", "rg", "wc", "sort", "head", "tail", "diff", "base64",
+                   "column", "tr", "cut", "uniq", "test", "["}
+_PS_LITERAL_PROG_RE = re.compile(r"[\w./~+-]+")
+_PS_ASSIGN_WORD_RE = re.compile(r"[A-Za-z_]\w*\+?=")
+_PS_REDIRECT_WORD_RE = re.compile(r"\d*[<>]")
+
+
+def _ps_body_is_data(owner: str) -> bool:
+    """Whether a heredoc opened on ``owner`` is only data (XERK-1861): every
+    command on the line is a LITERAL known data reader (`cat > n.md <<E`,
+    `git commit -F - <<E`). A name list of shells and remotes lost to every
+    spelling bash still runs (`s\\sh`, `slogin`, `$S`, `/usr/bin/s[s]h`, QA),
+    so an unknown, non-literal or unreadable program makes it a script — as
+    main read every body line. A `<(`/`>(` may feed a reader: a script too."""
+    if "<(" in owner or ">(" in owner:
+        return False
+    for seg in _split_on_operators(owner):
+        try:
+            tokens = _tokenize(seg)
+        except ValueError:
+            return False
+        words = [t for t in _strip_prefixes(tokens) if not _PS_ASSIGN_WORD_RE.match(t)]
+        while words and _PS_REDIRECT_WORD_RE.match(words[0]):
+            # A redirection before the program (`> f cat`): skip it and its target.
+            words = words[1:] if words[0].rstrip("<>&0123456789-") else words[2:]
+            words = words[1:] if words and words[0] == "" else words
+        if not words:
+            continue
+        prog = words[0]
+        if not _PS_LITERAL_PROG_RE.fullmatch(prog) or _basename(prog) not in _PS_DATA_OWNERS:
+            return False
+    return True
+
+
+# Programs that run a later word as a program: `xargs`, find's actions and
+# wrappers `_strip_prefixes` does not know (`parallel`, `fd -x`, `flock f`).
+_PS_RUNNERS = {"xargs", "parallel", "sem", "watch", "strace", "ltrace", "taskset",
+               "flock", "chrt", "ionice", "unbuffer", "firejail", "systemd-run"}
+_PS_RUNNER_FLAGS = {"-exec", "-execdir", "-ok", "-okdir", "-x", "-X", "--exec", "--exec-batch"}
+_PS_SHELL_WORD_RE = re.compile(r"\b(?:powershell|pwsh|cmd)\b", re.IGNORECASE)
+_PS_SUBST_OPEN_RE = re.compile(r"\$\(|`|[<>]\(")
+_PS_SCRIPT_RUNNERS = _SHELL_PROGS | {"eval", "source", "."}
+
+
+def _ps_prog(tok: str) -> str:
+    return re.sub(r"\.exe$", "", _basename(tok).lower())
+
+
+def _ps_segment_reason(seg: str, body: str, depth: int) -> str | None:
+    """One raw segment of `_ps_raw_reason`. A shell word counts as the
+    segment's program, after an `xargs`/`-exec` runner, or right after a
+    `$(`/backtick/`<(`/`>(` (behind prefix words: `$( env pwsh`). A shell's
+    or `eval`'s later words are scripts, each scanned as a command."""
+    # A substitution opener: scanned from the FIRST one leading a shell, by
+    # blank-split words (it may sit inside quotes shlex would merge).
+    for m in _PS_SUBST_OPEN_RE.finditer(seg):
+        # Only a bounded look-ahead per opener: the rest split per `$(` was
+        # quadratic.
+        near = seg[m.end():m.end() + 256].split()[:8]
+        head = _strip_prefixes(near)
+        if head and _ps_prog(head[0].strip("'\"")) in _PS_SHELLS:
+            words = seg[m.end():].split()
+            reason = _ps_script_reason(words[len(near) - len(head):] + [body])
+            if reason:
+                return reason
+            break
+    try:
+        tokens = _tokenize(seg)
+    except ValueError:
+        return None
+    prog = len(tokens) - len(_strip_prefixes(tokens))
+    runner = False
+    for i, tok in enumerate(tokens):
+        word = tok.lstrip("$(`{")
+        if i == prog or word != tok or runner:
+            name = _ps_prog(word)
+            if name in _PS_SHELLS:
+                return _ps_script_reason([word] + tokens[i + 1:] + [body])
+            if name in _PS_SCRIPT_RUNNERS:
+                for script in tokens[i + 1:]:
+                    reason = _ps_raw_reason(script, depth + 1)
+                    if reason:
+                        return reason
+                return None
+        # Accepted over-read: after a runner every later word may be its
+        # program (`xargs echo pwsh …` is refused when it names all three).
+        runner = runner or _basename(tok) in _PS_RUNNERS or tok in _PS_RUNNER_FLAGS
+    return None
 
 
 def _ps_recursive_remove(low: str) -> bool:
@@ -14202,13 +14348,9 @@ def _is_destructive(command: str) -> str | None:
     # single-quoted `$(…)` for an opaque placeholder, which hid
     # `pwsh -c '$(Remove-Item -Recurse C:\\Windows)'` (rollup XERK-1584 QA).
     if re.search(r"\b(?:powershell|pwsh|cmd)\b", command.lower()):
-        for seg in _split_on_operators(command):
-            try:
-                reason = _ps_script_reason(_tokenize(seg))
-            except ValueError:
-                reason = None
-            if reason:
-                return reason
+        reason = _ps_raw_reason(command)
+        if reason:
+            return reason
     for tokens, segment, *flags in _expand_both(command):
         if tokens[0] == _TOO_DEEP:
             return "refusing a command nested too deeply to classify — flatten it"
