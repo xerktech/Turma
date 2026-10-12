@@ -71,13 +71,14 @@ class TestSubagentModelPin(unittest.TestCase):
         self.assertTrue(upd["run_in_background"])      # other fields kept
 
     def test_reviewers_are_pinned(self):
-        for name in ("code-reviewer", "Review", "security-review", "pr_reviews"):
+        for name in ("code-reviewer", "Review", "security-review", "pr_reviews",
+                     "CodeReviewer", "prreview", "peer-reviewing"):
             _, out = run_main(agent_call(subagent_type=name))
             self.assertEqual(self.updated(out)["model"], "opus", name)
 
     def test_search_and_work_agents_stay_on_the_default(self):
         for name in ("Explore", "general-purpose", "Plan", "qa-helper", None, 3,
-                     "ui-preview", "previewer", "reviewing-tool-x"):
+                     "ui-preview", "previewer", "Preview"):
             rc, out = run_main(agent_call(subagent_type=name, model="haiku"))
             self.assertEqual((rc, out), (0, ""), name)
         rc, out = run_main(agent_call(prompt="no type"))

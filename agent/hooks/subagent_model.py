@@ -43,10 +43,10 @@ import re
 import sys
 
 # The sub-agents that grade work: the QA gate, its re-pass, and any reviewer
-# (a `code-reviewer`, `security-review`, …) an operator defines. A whole WORD,
-# so `ui-preview` stays on the cheap default.
+# (a `code-reviewer`, `CodeReviewer`, …) an operator defines — but not a
+# `ui-preview`, which stays on the cheap default.
 PINNED_NAMES = frozenset({"qa", "qa-delta"})
-REVIEW_WORD_RE = re.compile(r"(?:^|[^a-z0-9])review(?:er|ers|s)?(?:$|[^a-z0-9])")
+REVIEW_WORD_RE = re.compile(r"(?<!p)review")
 
 
 def is_grader(subagent_type) -> bool:

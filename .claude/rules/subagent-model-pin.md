@@ -9,7 +9,7 @@ paths:
 
 `hooks/subagent_model.py` — a `PreToolUse` hook over `Agent|Task` wired by `build_guard_settings`.
 It rewrites the call's `model` to `$TURMA_PIN_SUBAGENT_MODEL` (`GRADER_SUBAGENT_MODEL` = `opus`)
-for `qa`, `qa-delta` and any `subagent_type` with a `review`/`reviewer` WORD (`ui-preview` is not).
+for `qa`, `qa-delta` and any `subagent_type` containing `review` not after a `p` (`ui-preview` is not).
 `docs/model-quality-adr.md` decision 3: QA and review always run on Opus, whatever did the work.
 
 - **The CALL is the only lever that wins.** Measured on 2.1.296: call `model` > the definition's
