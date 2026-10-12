@@ -8108,7 +8108,11 @@ def _expand_both(command: str, home: bool = True) -> list[tuple[list[str], str]]
             out = out + _expand_readings(command)
         finally:
             _PWD_UNASSIGNED[0] = False
-    for reading in _home_tilde_readings(command) if home else ():
+    try:
+        tilde = _home_tilde_readings(command) if home else []
+    except _ExpansionTooLarge:
+        tilde, out = [], out + [([_TOO_LARGE], command)]
+    for reading in tilde:
         out = out + _expand_both(reading)
     # Only a target can read a directory spelling, as for the kept default.
     if (home and _DIR_SPELLING_RE.search(command)
@@ -8276,6 +8280,9 @@ _BARE_CD_RE = re.compile(
 # What a line that may bind HOME holds: the name (`HOM{E,}`, `H\OME`, `H$x`
 # with `x=OME`) or an `eval` that can build it.
 _HOME_HINT_RE = re.compile(r"HOM|OME|\beval\b")
+# A word that may spell `cd` with quotes, escapes or expansions (`c\d`, `"c"d`,
+# `c$@d`); bounded, so each `c` scans at most 64 characters.
+_CD_SPELLED_HINT_RE = re.compile(r"c[\\'\"$`][^\s;&|]{0,64}d")
 def _home_tilde_readings(command: str) -> list[str]:
     """``command`` with each `~` read as `$HOME`, `~+` as `$PWD`, `~-` as
     `$OLDPWD` and a `dirs` entry (`~1`, `~+1`, `~-1`) as `$PWD`, when
@@ -8292,7 +8299,10 @@ def _home_tilde_readings(command: str) -> list[str]:
     bare (`${y/$z/${HOME}/x}` is not resolved either). Elsewhere bare: a
     braced one is not resolved inside `{a,b}` (XERK-1694)."""
     home = bool(_HOME_HINT_RE.search(command))
-    if "~" not in command and not home:
+    if not home and "~" not in command:
+        return []
+    spelled = "cd" in command or _CD_SPELLED_HINT_RE.search(command)
+    if "~" not in command and not spelled:
         return []
     if not home and not _DIR_TILDE_RE.search(command):
         return []
@@ -8305,7 +8315,8 @@ def _home_tilde_readings(command: str) -> list[str]:
     if home:
         # ...and a bare `cd`, which goes to $HOME: `HOME=/; cd; rm -rf etc`.
         # A `cd` spelled with quotes or escapes (`"cd"`, `c\d`) is one too.
-        out = _BARE_CD_RE.sub(r"\1 $HOME", (_cd_spelled_readings(out) or [out])[0])
+        if spelled:
+            out = _BARE_CD_RE.sub(r"\1 $HOME", (_cd_spelled_readings(out) or [out])[0])
     readings = [out]
     if "${" in out:
         spots = [(m.end(1), m.group(2) or "") for m in _PARAM_TILDE_RE.finditer(out)]
