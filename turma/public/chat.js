@@ -1379,17 +1379,18 @@
   // which classifies a system turn by its leading tag. Keep in step with
   // ChatItems.kt `stripFraming`.
   // A tag line inside a ``` fence (as the bubble's renderer reads fences:
-  // FENCE_OPEN / fenceCloses, with ASCII blanks) is the operator's own text (rollup XERK-1701), so
+  // FENCE_OPEN / fenceCloses) is the operator's own text (rollup XERK-1701), so
   // only lines outside one go — except Claude Code's own paste framing: a
   // `<pasted_content id="X">` with its matching close is always dropped, since
   // Claude Code writes it wherever the paste landed, an operator's fence included.
   // The first and last non-blank lines always go when they are tags. "Blank" is
   // space/tab/CR only, the same on Android (ChatItems.kt `stripFraming`).
   const FRAMING_TAG_LINE = /^[ \t]*<(\/?)(pasted_content(?: id="([^"\n]*)")?|system-reminder)>[ \t]*\r?$/;
-  // The renderer's fence rule with ASCII blanks: JS `\s` and Kotlin's differ on
-  // Unicode spaces, and the two platforms must strip alike.
-  const FRAME_FENCE_OPEN = /^[ \t]*(`{3,})[ \t]*([^ \t\r`]*)[ \t]*\r?$/;
-  const FRAME_FENCE_CLOSE = /^[ \t]*(`{3,})[ \t]*\r?$/;
+  // The renderer's fence rule (FENCE_OPEN / fenceCloses), tolerating the raw text's
+  // CR. Android spells JS `\s` out (Prose.kt JS_WS): its own `\s` differs from JS's
+  // (ASCII-only on the JVM; ICU on a device, apart on U+FEFF and U+0085).
+  const FRAME_FENCE_OPEN = /^\s*(`{3,})[ \t]*([^\s`]*)[ \t]*\r?$/;
+  const FRAME_FENCE_CLOSE = /^\s*(`{3,})[ \t]*\r?$/;
   function stripFraming(text) {
     const t = String(text == null ? "" : text);
     if (t.indexOf("<") === -1) return t;
