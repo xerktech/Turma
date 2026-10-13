@@ -2006,6 +2006,9 @@ test("renderProse/stripFraming: a fence line full of blanks reads in linear time
   buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text: "<x>\n" + line + "\n<system-reminder>" }] }]);
   const used = process.cpuUsage(t);
   assert.ok((used.user + used.system) / 1000 < 500, "took too long");
+  // Only ONE CR and the blanks before it are cut: "```\r\t" closes nothing (QA).
+  const strip = (text) => buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text }] }])[0].text;
+  assert.equal(strip("a\n```\nx\n```\r\t\n<system-reminder>\nb"), "a\n```\nx\n```\r\t\n<system-reminder>\nb");
   // Trailing blanks (and a CR) still don't stop a fence.
   assert.match(renderProse("```js  \t\ncode\n```  "), /<code>code<\/code>/);
 });

@@ -172,6 +172,8 @@ class ProseTest {
         stripFraming("<x>\n$line\n<system-reminder>")
         assertTrue("took too long", (System.nanoTime() - t) / 1_000_000 < 10_000)
         assertEquals("code", codes("```js  \t\ncode\n```  ").single().body)
+        // Only space/tab are cut, never other whitespace: "```js\u00A0" opens nothing (QA).
+        assertTrue(codes("```js\u00A0\ncode\n```").none { it.body == "code" })
     }
 
     @Test fun `code body is not linkified`() {
