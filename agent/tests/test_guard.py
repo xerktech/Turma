@@ -6769,6 +6769,15 @@ class TestGroupsHoldingOperators(unittest.TestCase):
         self.assertEqual(budget["left"], -1)
         with mock.patch.object(guard, "_budget", None):
             self.assertFalse(guard._past_deadline())
+        # The unreadable-construct scan runs after the last checker loop: out of
+        # time there, the final verdict still refuses (QA).
+        def late(command):
+            guard._budget["until"] = 0
+            return None
+        with mock.patch.object(guard, "_unreadable_construct", late):
+            self.assertEqual(guard.decide("Bash", {"command": "ls"}, cwd="/tmp"),
+                             ("deny", guard._TOO_LARGE_REASON, "policy"))
+        self.assertEqual(guard.decide("Bash", {"command": "ls"}, cwd="/tmp")[0], "allow")
 
     def test_a_continuation_is_dropped_only_where_bash_drops_it(self):
         # Outside single quotes, a live `\\<newline>` is nothing; an escaped
