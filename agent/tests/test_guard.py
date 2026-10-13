@@ -3637,7 +3637,9 @@ class TestScriptChannels(unittest.TestCase):
                     f"bash -c 2>$${{ '{R}' }} y", f"bash -c 2>\\${{ '{R}' }} y",
                     f"bash -c 2>a$${{ '{R}' }} y", f"sh -c 2>$${{ '{R}' }} a b",
                     f"bash -c &>$${{ '{R}' }} y", f"bash -c {{fd}}>$${{ '{R}' }} y",
-                    f"bash -c 2>$[ y ] '{R}'", f"bash -c 2>$(echo {{a) '{R}'"):
+                    f"bash -c 2>$[ y ] '{R}'", f"bash -c 2>$(echo {{a) '{R}'",
+                    # Only the frame's own closer pops it (QA pass 3).
+                    f"bash -c 2>${{PWD#) y }}/q '{R}'", f"bash -c 2>$(echo }} y) '{R}'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("2>/dev/null ls /etc", "> out echo hi", "ls 2>&1 | tail",
@@ -6927,7 +6929,11 @@ class TestPrSummary(unittest.TestCase):
                     "gh pr edit --body-file 2>$${ bad.md -t } good.md",
                     "gh pr edit --body-file 2>\\${ bad.md -t } good.md",
                     "gh pr edit --body-file 2>$[ good.md ] bad.md",
-                    "gh pr edit --body-file 2>${PWD#) good.md }/q bad.md"):
+                    "gh pr edit --body-file 2>${PWD#) good.md }/q bad.md",
+                    # A target that is no plain word keeps the raw reading, so a
+                    # misjudged target end can't move the file gh reads (QA pass 3).
+                    "gh pr edit --body-file 2>$'a\\' bad.md -t ' good.md",
+                    "gh pr edit --body-file 2>\"a b\" good.md"):
             with self.subTest(cmd=cmd):
                 self.assertIsNotNone(self.reason(cmd))
 
