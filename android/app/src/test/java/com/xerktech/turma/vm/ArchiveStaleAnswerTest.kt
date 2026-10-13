@@ -6,6 +6,7 @@ import kotlinx.coroutines.ExperimentalCoroutinesApi
 import kotlinx.coroutines.test.StandardTestDispatcher
 import okhttp3.mockwebserver.MockResponse
 import okhttp3.mockwebserver.SocketPolicy
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Rule
@@ -55,5 +56,23 @@ class ArchiveStaleAnswerTest {
         assertTrue("B is still loading", s.openLoading)
         assertNull("A's refusal must not land on B", s.refusal)
         assertNull("A's 'not found' must not land on B", s.error)
+    }
+
+    @Test
+    fun `a superseded search answer never stamps the next query`() {
+        hub.route("/api/search") { r ->
+            if (r.path!!.contains("q=old&")) MockResponse().setResponseCode(500).setBody("{}")
+            else MockResponse().setSocketPolicy(SocketPolicy.NO_RESPONSE)
+        }
+        val vm = main.track(ArchiveViewModel(hub.app))
+        vm.onQuery("old")
+        dispatcher.scheduler.advanceUntilIdle()   // the debounce passes and the search goes out
+        hub.findRequest("q=old")
+        Thread.sleep(500)                          // old's 500 resumes, queued on Main
+        vm.onQuery("newer")
+        dispatcher.scheduler.runCurrent()          // old's queued resumption only; newer still debounces
+        val s = vm.state.value
+        assertEquals("a stale answer must not stamp", "", s.searchedQuery)
+        assertTrue("the spinner stays up until newer answers", s.searching)
     }
 }
