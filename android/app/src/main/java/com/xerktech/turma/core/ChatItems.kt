@@ -342,10 +342,10 @@ fun messageOrigin(text: String): String {
 
 private val FRAMING_TAG_LINE =
     Regex("^[ \\t]*<(/?)(pasted_content(?: id=\"([^\"\\n]*)\")?|system-reminder)>[ \\t]*\\r?$")
-// The renderer's fence rule with ASCII blanks, as chat.js FRAME_FENCE_OPEN/_CLOSE
-// (JS `\\s` and Kotlin's differ on Unicode spaces; both platforms must strip alike).
-private val FENCE_OPEN = Regex("^[ \\t]*(`{3,})[ \\t]*([^ \\t\\r`]*)[ \\t]*\\r?$")
-private val FENCE_CLOSE = Regex("^[ \\t]*(`{3,})[ \\t]*\\r?$")
+// The renderer's fence rule (Prose.kt FENCE_OPEN, JS `\\s` spelled out as JS_WS), as
+// chat.js FRAME_FENCE_OPEN/_CLOSE, tolerating the raw text's CR.
+private val FENCE_OPEN = Regex("^[$JS_WS]*(`{3,})[ \\t]*([^$JS_WS`]*)[ \\t]*\\r?$")
+private val FENCE_CLOSE = Regex("^[$JS_WS]*(`{3,})[ \\t]*\\r?$")
 
 /**
  * Claude Code's own framing tags on a user turn, each on a line of its own —

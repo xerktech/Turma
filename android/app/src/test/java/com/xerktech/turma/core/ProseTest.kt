@@ -151,6 +151,12 @@ class ProseTest {
         assertEquals("plain", codes("```\nplain\n```").single().body)
     }
 
+    @Test fun `a fence indented by a non-breaking space is a fence, as on the web`() {
+        // Rollup XERK-1701: the JVM's `\\s` is ASCII-only, JS's is not.
+        assertEquals("plain", codes("\u00A0```\nplain\n```").single().body)
+        assertEquals("a", codes("```\na\n\u3000```\nb").first().body)
+    }
+
     @Test fun `code body is not linkified`() {
         val c = codes("```js\nconst u = \"https://x.io\";\n```").single()
         assertEquals("const u = \"https://x.io\";", c.body)

@@ -447,8 +447,9 @@ class ChatItemsTest {
         assertEquals("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc", stripFraming("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc"))
         assertEquals("a\r\n```\r\nb\r\n```\r\nc", stripFraming("a\r\n```\r\nb\r\n```\r\n<system-reminder>\r\nc"))
         assertEquals("a\n```js x\n```\nb", stripFraming("a\n```js x\n<system-reminder>\n```\nb"))
-        // A fence line with a Unicode space before it opens nothing, on both platforms.
-        assertEquals("i\n\u00A0```\nb\n```\ne", stripFraming("i\n\u00A0```\n<system-reminder>\nb\n```\ne"))
+        // A fence indented by a non-breaking space is a fence, as on the web.
+        assertEquals("i\n\u00A0```\n<system-reminder>\nb\n```\ne",
+            stripFraming("i\n\u00A0```\n<system-reminder>\nb\n```\ne"))
         // Claude Code's matched paste framing goes even inside the operator's fence (QA).
         assertEquals("look at this log:\n```\n\n\nE1 boom\nE2 boom\n\n```\nwhy does it fail?",
             stripFraming("look at this log:\n```\n\n\n<pasted_content id=\"6550\">\nE1 boom\nE2 boom\n" +
