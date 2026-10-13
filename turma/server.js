@@ -1508,7 +1508,7 @@ function logName(key) {
   // C0, DEL **and C1** — JSON.stringify escapes none of the C1 block, and NEL
   // (U+0085) is a line break to some readers.
   return JSON.stringify(String(key).slice(0, 200))
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, "?");
 }
 
 const AGENTS_MAX = positiveEnv("AGENTS_MAX", 64);
@@ -10231,6 +10231,7 @@ function normalizeRepos(a) {
   if (!list) return;
   for (const r of list) {
     if ("root" in r && typeof r.root !== "boolean") delete r.root;
+    coerceGitProblem(r);
     const res = coerceObjectList(r, "resumable");
     if (res) {
       for (const t of res) {
@@ -10241,6 +10242,28 @@ function normalizeRepos(a) {
         if (prs) prs.forEach(coercePrElem);
       }
     }
+  }
+}
+
+// `gitProblem` (XERK-1887) on a session or a repos[] entry — why its git facts
+// are absent when that is NOT merely "not read yet": {missing:true} (the
+// worktree is gone) or {unreadable:"<git's reason>"} (a corrupt index, "dubious
+// ownership"). Android TYPES it (GitProblem?), so it is REBUILT from those two
+// shapes or deleted — absent reads as "not read yet", the old meaning. The
+// 200-code-point cap is an INLINE literal: this runs from loadState's restore at
+// module-init, where a const declared down here is in its TDZ.
+function coerceGitProblem(o) {
+  if (!("gitProblem" in o)) return;
+  const p = o.gitProblem;
+  if (objectish(p) && p.missing === true) {
+    o.gitProblem = { missing: true };
+  } else if (objectish(p) && typeof p.unreadable === "string"
+    // C0/DEL/C1 and bidi/format chars become spaces, as _git_error_reason does.
+    && p.unreadable.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, " ").trim()) {
+    const clean = p.unreadable.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, " ").trim();
+    o.gitProblem = { unreadable: [...clean].slice(0, 200).join("") };
+  } else {
+    delete o.gitProblem;
   }
 }
 
@@ -10732,6 +10755,7 @@ function normalizeSessions(payload) {
     if (objectish(s.git) && "dirtyFiles" in s.git && !wireInt32(s.git.dirtyFiles)) {
       delete s.git.dirtyFiles;
     }
+    coerceGitProblem(s);
     if (objectish(s.work)) {
       for (const k of ["aheadOfBase", "aheadOfRemote"]) {
         if (k in s.work && !wireInt32(s.work[k])) delete s.work[k];

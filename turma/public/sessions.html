@@ -2707,8 +2707,12 @@ function sessMeta(s) {
   // A session recovered from the transcript scan has no git block at all — we
   // don't know what it was on — so it says nothing rather than asserting a
   // detached HEAD it was never told about.
+  // A gitProblem (XERK-1887) is a reading too: the worktree is gone, or git
+  // could not read it — said rather than left blank forever.
   const b = s.git && s.git.branch;
-  const branch = s.git ? ((b && b !== "HEAD") ? b : "detached") : null;
+  const problem = s.gitProblem && (s.gitProblem.missing ? "worktree gone"
+    : s.gitProblem.unreadable ? "git unreadable" : null);
+  const branch = s.git ? ((b && b !== "HEAD") ? b : "detached") : problem || null;
   return [s.repo, branch].filter(Boolean).join(" · ");
 }
 

@@ -91,6 +91,7 @@
   .repo-head .r-name a:hover { text-decoration: underline; }
   .repo-head .r-meta { color: var(--ink-2); font-size: 12px; }
   .repo-head .r-meta b { color: var(--ink); font-weight: 600; }
+  .repo-head .r-meta .git-problem { color: var(--warning-text); cursor: help; }
   /* Keep the action buttons (incl. the blue "+ New session") right-aligned even
      when the head wraps on narrow screens — margin-left:auto pushes the whole
      group right whether it shares the top line or drops to its own row. */
@@ -1049,8 +1050,10 @@ function worktreeName(s) {
 // app itself creates none). "detached" while it's still on detached HEAD.
 // No git block means the agent hasn't read it yet (XERK-1262 serves git:null
 // until its cheap-git worker answers) — unknown, not detached (XERK-1538).
+// gitProblem (XERK-1887) says why when it is NOT merely unread: the worktree is
+// gone, or git could not read it — "…" alone meant both, forever.
 function sessBranch(s) {
-  if (!s.git) return "…";
+  if (!s.git) return gitProblemText(s.gitProblem) || "…";
   const b = s.git.branch;
   return (b && b !== "HEAD") ? b : "detached";
 }
@@ -1763,10 +1766,25 @@ function cloneBody(a, sources, hid) {
   </div>`;
 }
 
+// The agent's gitProblem (XERK-1887) in words: {missing:true} or
+// {unreadable:"<git's reason>"}. "" when there is none (fine, or not read yet).
+function gitProblemText(p) {
+  if (!p) return "";
+  return p.missing ? "worktree gone" : p.unreadable ? "git unreadable" : "";
+}
+// The reason behind it, for a hover title — git's own first error line.
+function gitProblemTitle(p) {
+  return p && p.unreadable ? ` title="${esc(p.unreadable)}"` : "";
+}
+
 // A repo the agent has not read yet reports dirtyFiles null (XERK-1547): say
-// nothing rather than "clean", which only a real read of 0 may claim.
-function repoDirtyText(dirty) {
-  if (dirty == null) return "";
+// nothing rather than "clean", which only a real read of 0 may claim. A repo git
+// cannot read says so, with git's reason on hover (XERK-1887).
+function repoDirtyText(dirty, problem) {
+  if (dirty == null) {
+    const t = gitProblemText(problem);
+    return t ? ` · <span class="git-problem"${gitProblemTitle(problem)}>${t}</span>` : "";
+  }
   return dirty ? ` · ${dirty} dirty` : " · clean";
 }
 
@@ -1777,7 +1795,7 @@ function repoBlock(a, repo, sessList, now, pausedList = []) {
     ? `<span class="r-meta">runs at the repos root · spans every repo · one at a time</span>`
     : repo.missing
     ? `<span class="r-meta">repo not currently found · usage retained</span>`
-    : `<span class="r-meta"><b>${esc(repo.branch || "–")}</b>${repoDirtyText(repo.dirtyFiles)}</span>`;
+    : `<span class="r-meta"><b>${esc(repo.branch || "–")}</b>${repoDirtyText(repo.dirtyFiles, repo.gitProblem)}</span>`;
   // Only one root session may run at a time (they share REPOS_ROOT), so once one
   // is live the root block stops offering "+ New session".
   const rootBusy = repo.isRoot && sessList.some(s => s.status === "running");
@@ -2007,7 +2025,10 @@ function sessCard(a, s, now) {
   // that changes may be lost. A repos-root session has no worktree to lose.
   const dirty = s.git ? (s.git.dirtyFiles || 0) : null;
   const work = workLine(s);
+  // A worktree the agent found gone has nothing left to lose (XERK-1887); one
+  // git cannot read is still unknown, so it keeps the warning.
   const delConfirm = dirty > 0 ? "Confirm delete — uncommitted changes will be lost"
+    : dirty == null && s.gitProblem?.missing ? "Confirm delete — worktree already gone"
     : dirty == null && !s.root ? "Confirm delete — may have uncommitted changes"
     : "Confirm delete";
   const killConfirm = "Confirm kill";
@@ -2075,7 +2096,7 @@ function sessCard(a, s, now) {
       ${s.root
         ? `<dt>Location</dt><dd><b>repos root (no worktree)</b></dd>`
         : `<dt>Worktree</dt><dd><b>${esc(worktreeName(s))}</b></dd>
-      <dt>Branch</dt><dd><b>${esc(sessBranch(s))}</b></dd>`}
+      <dt>Branch</dt><dd><b${s.git ? "" : gitProblemTitle(s.gitProblem)}>${esc(sessBranch(s))}</b></dd>`}
       ${work ? `<dt>Work</dt><dd>${work}</dd>` : ""}
       <dt>RC name</dt><dd>${esc(s.rcName || "–")}</dd>
       ${killing

@@ -1073,6 +1073,9 @@ data class SessionInfo(
     val worktreePath: String = "",
     val branch: String = "",
     val git: GitState? = null,
+    // Why `git` is null when it is NOT merely "not read yet" (XERK-1887): the
+    // worktree is gone, or git could not read it. Absent = the old meaning.
+    val gitProblem: GitProblem? = null,
     val summary: String = "",
     val label: String = "",
     val root: Boolean = false,
@@ -1183,6 +1186,16 @@ data class AttentionHint(
     val label: String = "",
     val why: String = "",
     val suggestedAnswer: String? = null,
+)
+
+/**
+ * The agent's `gitProblem` (XERK-1887), rebuilt hub-side (`coerceGitProblem`) to
+ * exactly `{missing:true}` or `{unreadable:"<git's reason>"}`.
+ */
+@Serializable
+data class GitProblem(
+    val missing: Boolean = false,
+    val unreadable: String? = null,
 )
 
 @Serializable

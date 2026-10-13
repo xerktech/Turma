@@ -699,7 +699,8 @@ class AgentDecodeTest {
                 "restartCount": 2,
                 "work": { "baseRef": "main", "aheadOfBase": 3, "pushed": false, "aheadOfRemote": null },
                 "git": { "repoName": "turma", "branch": "XERK-9", "dirtyFiles": 4 }
-              } ]
+              }, { "id": "s2", "git": null, "gitProblem": { "unreadable": "bad index" } },
+                 { "id": "s3", "git": null, "gitProblem": { "missing": true } } ]
             } ] }
         """.trimIndent()
         val s = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].sessions[0]
@@ -716,6 +717,11 @@ class AgentDecodeTest {
         assertEquals(false, s.work!!.pushed)
         assertNull(s.work!!.aheadOfRemote)
         assertEquals(4, s.git!!.dirtyFiles)
+        assertNull(s.gitProblem)
+        // XERK-1887: the hub-coerced gitProblem shapes decode.
+        val sessions = TurmaJson.decodeFromString<AgentsResponse>(body).agents[0].sessions
+        assertEquals("bad index", sessions[1].gitProblem!!.unreadable)
+        assertEquals(true, sessions[2].gitProblem!!.missing)
     }
 
     // The resumable scan's real wire shape ({transcriptId, cwd, repo, root,

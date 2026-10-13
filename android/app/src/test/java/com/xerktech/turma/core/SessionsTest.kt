@@ -2,6 +2,7 @@ package com.xerktech.turma.core
 
 import com.xerktech.turma.model.AgentInfo
 import com.xerktech.turma.model.GitState
+import com.xerktech.turma.model.GitProblem
 import com.xerktech.turma.model.LiveSignals
 import com.xerktech.turma.model.SessionInfo
 import org.junit.Assert.assertEquals
@@ -390,6 +391,11 @@ class SessionsTest {
     @Test fun `no git block is unknown, not detached`() {
         // XERK-1538: the agent serves git:null until its first read answers.
         assertEquals("", sessionBranch(SessionInfo(git = null)))
+        // XERK-1887: the agent says why when it knows.
+        assertEquals("worktree gone",
+            sessionBranch(SessionInfo(git = null, gitProblem = GitProblem(missing = true))))
+        assertEquals("git unreadable",
+            sessionBranch(SessionInfo(git = null, gitProblem = GitProblem(unreadable = "x"))))
         assertEquals("truenas · Turma", sessionHeaderMeta("truenas", SessionInfo(repo = "Turma")))
     }
 
@@ -400,6 +406,12 @@ class SessionsTest {
         assertEquals("Confirm delete — may have uncommitted changes",
             deleteConfirmText(SessionInfo(git = null)))
         assertEquals("Confirm delete", deleteConfirmText(SessionInfo(git = null, root = true)))
+        // XERK-1887: a worktree the agent found gone has nothing to lose; one git
+        // cannot read is still unknown.
+        assertEquals("Confirm delete — worktree already gone",
+            deleteConfirmText(SessionInfo(git = null, gitProblem = GitProblem(missing = true))))
+        assertEquals("Confirm delete — may have uncommitted changes",
+            deleteConfirmText(SessionInfo(git = null, gitProblem = GitProblem(unreadable = "bad index"))))
     }
 
     @Test fun `name prefers summary then label then worktree`() {

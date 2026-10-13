@@ -3719,6 +3719,41 @@ test("XERK-1564: a session's wake request is coerced by name, absent = none", ()
   assert.equal("wakeReason" in none, false);
 });
 
+test("XERK-1887: gitProblem is rebuilt from its two shapes or dropped, on sessions and repos", () => {
+  const rec = (gitProblem) => {
+    const r = {
+      device: "xerk1887-git",
+      sessions: [{ id: "s", git: null, gitProblem }],
+      repos: [{ name: "R", dirtyFiles: null, gitProblem }],
+    };
+    hub.normalizeRecord(r);
+    return [r.sessions[0], r.repos[0]];
+  };
+  for (const o of rec({ missing: true, extra: 1 })) {
+    assert.deepEqual(o.gitProblem, { missing: true });
+  }
+  for (const o of rec({ unreadable: `  ${"x".repeat(500)} `, missing: "yes" })) {
+    assert.deepEqual(o.gitProblem, { unreadable: "x".repeat(200) });
+  }
+  for (const o of rec({ unreadable: "\u0000\u001b[31mred\u0085" })) {
+    assert.deepEqual(o.gitProblem, { unreadable: "[31mred" });
+  }
+  for (const o of rec({ unreadable: "a\u202eb\u2028c" })) {
+    assert.deepEqual(o.gitProblem, { unreadable: "a b c" });
+  }
+  // Junk is dropped — absent reads as "not read yet", never a guessed problem.
+  for (const bad of [null, true, "gone", [], {}, { missing: 1 }, { unreadable: "" },
+    { unreadable: "  " }, { unreadable: "\u0000\u001b" }, { unreadable: 5 }]) {
+    for (const o of rec(bad)) {
+      assert.equal("gitProblem" in o, false, `kept ${JSON.stringify(bad)}`);
+    }
+  }
+  const [s, r] = rec(undefined);
+  delete s.gitProblem; delete r.gitProblem;
+  hub.normalizeRecord({ sessions: [s], repos: [r] });
+  assert.equal("gitProblem" in s, false);
+});
+
 test("XERK-1569: ticket.outcome is coerced by name on every ticket channel", () => {
   const rec = (outcome) => {
     const r = {

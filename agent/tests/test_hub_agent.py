@@ -26166,7 +26166,11 @@ def run_held_cheap_refreshes(sm, staged):
     jobs = list(staged)
     staged.clear()
     for attr, key, fn, path in jobs:
-        sm._cheap_store(attr, key, fn(path, strict=True), only_if_present=True)
+        try:
+            value = sm._cheap_job_value(attr, fn, path)
+        except ha.GitTimeout:
+            continue
+        sm._cheap_store(attr, key, value, only_if_present=True)
 
 
 class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
@@ -26286,15 +26290,133 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
 
     def test_a_failed_status_is_no_answer_not_clean(self):
         """XERK-1263: `status` exiting nonzero (a corrupt index, an EIO) is NO
-        answer — while a failed rev-parse still reads as gone."""
+        answer, never "clean" — and since XERK-1887 an unreadable one, carrying
+        git's own reason, so the card can say why."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+
         def fake(cmd, **kw):
             rc = 128 if "status" in cmd else 0
-            return mock.Mock(returncode=rc, stdout="" if rc else "main")
+            return mock.Mock(returncode=rc, stdout="" if rc else "main",
+                             stderr="fatal: index file smaller than expected\n"
+                             if rc else "")
         with mock.patch.object(ha.subprocess, "run", side_effect=fake):
+            for read in (ha.git_info_cheap, ha.repo_cheap_facts):
+                with self.assertRaises(ha.GitUnreadable) as caught:
+                    read(d, strict=True)
+                self.assertIsInstance(caught.exception, ha.GitTimeout)
+                self.assertEqual(caught.exception.reason,
+                                 "index file smaller than expected")
+
+    def test_git_error_reason_is_one_bounded_clean_line(self):
+        self.assertEqual(ha._git_error_reason(
+            "\nfatal: detected dubious ownership in repository at '/r'\nTo add…"),
+            "detected dubious ownership in repository at '/r'")
+        self.assertEqual(ha._git_error_reason("error: a\x1bb"), "a b")
+        self.assertEqual(ha._git_error_reason("a\u202eb\x9bc"), "a b c")
+        self.assertEqual(len(ha._git_error_reason("x" * 5000)),
+                         ha.GIT_PROBLEM_REASON_MAX)
+        self.assertEqual(ha._git_error_reason(""), "git exited with an error")
+
+    def test_a_corrupt_index_reports_unreadable_not_a_placeholder(self):
+        """XERK-1887 #24: a real repo whose index is corrupt used to keep the
+        first-sight placeholder forever ("–", no reason, no log line). The
+        worker now publishes the reason, and the repo row carries it."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        subprocess.run(["git", "init", "-q", d], check=True)
+        with open(os.path.join(d, ".git", "index"), "wb") as f:
+            f.write(b"DIRC garbage")
+        with self.assertRaises(ha.GitUnreadable):
+            ha.repo_cheap_facts(d, strict=True)
+        sm = self.make_manager()
+        staged = hold_cheap_refreshes(self, sm)
+        placeholder = sm._cheap_read("repo_cheap", d, ha.repo_cheap_facts, d,
+                                     default={"branch": "", "dirtyFiles": None})
+        self.assertNotIn("gitProblem", placeholder)
+        run_held_cheap_refreshes(sm, staged)
+        got = sm.repo_cheap[d]
+        self.assertIsNone(got["dirtyFiles"])         # never "clean"
+        self.assertIn("index", got["gitProblem"]["unreadable"])
+        entry = ha.repo_entry({"name": "r", "path": d}, {}, got)
+        self.assertEqual(entry["gitProblem"], got["gitProblem"])
+
+    def test_an_unreadable_session_worktree_is_reported(self):
+        """The same for a session: "dubious ownership" (or a .git link to a
+        pruned gitdir) fails rev-parse in a directory that still exists."""
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        sm = self.make_manager()
+        sm.session_cheap = {"s1": {"branch": "feat", "dirtyFiles": 0}}
+        staged = hold_cheap_refreshes(self, sm)
+        sm._cheap_read("session_cheap", "s1", ha.git_info_cheap, d)
+        with mock.patch.object(ha.subprocess, "run", return_value=mock.Mock(
+                returncode=128, stdout="",
+                stderr="fatal: detected dubious ownership in repository at 'x'")):
+            run_held_cheap_refreshes(sm, staged)
+        self.assertEqual(sm._session_git_problem("s1"),
+                         {"unreadable": "detected dubious ownership in repository at 'x'"})
+        sess = {"id": "s1", "repoPath": d, "worktreePath": d}
+        with mock.patch.object(sm, "_stage_cheap_refresh"):
+            gi, _work = sm._session_git(sess, refresh=False, light=True)
+        self.assertIsNone(gi)
+
+    def test_a_dir_removed_mid_status_is_no_answer_never_clean(self):
+        """QA (XERK-1887): a worktree/repo deleted between rev-parse and
+        `status` must keep the last answer, not read as 0 dirty files."""
+        d = tempfile.mkdtemp()
+
+        def fake(cmd, **kw):
+            if "status" in cmd:
+                shutil.rmtree(d, True)
+                return mock.Mock(returncode=128, stdout="", stderr="fatal: gone")
+            return mock.Mock(returncode=0, stdout="main", stderr="")
+        for read in (ha.git_info_cheap, ha.repo_cheap_facts):
+            os.makedirs(d, exist_ok=True)
+            with mock.patch.object(ha.subprocess, "run", side_effect=fake):
+                with self.assertRaises(ha.GitTimeout) as caught:
+                    read(d, strict=True)
+            self.assertNotIsInstance(caught.exception, ha.GitUnreadable)
+        # A status that cannot even launch in a vanished dir is no answer too.
+        with mock.patch.object(ha.subprocess, "run", side_effect=FileNotFoundError):
             with self.assertRaises(ha.GitTimeout):
-                ha.git_info_cheap("/w", strict=True)
-            with self.assertRaises(ha.GitTimeout):
-                ha.repo_cheap_facts("/w", strict=True)
+                ha._strict_git(["git", "status"], d, fail_is_unknown=True)
+            self.assertEqual(ha._strict_git(["git", "rev-parse"], d,
+                                            fail_is_unknown=True, missing_is_gone=True), "")
+
+    def test_a_root_session_never_reports_a_git_problem(self):
+        """QA (XERK-1887): REPOS_ROOT is normally no repo, so a root session's
+        rev-parse fails — that must not read "git unreadable"."""
+        sm = self.make_manager()
+        sm.session_cheap = {"r1": ha._git_unreadable("not a git repository")}
+        with mock.patch.object(sm, "_stage_cheap_refresh"):
+            payload = sm._session_payload(
+                {"id": "r1", "status": "stopped", "root": True,
+                 "repoPath": "/r", "worktreePath": "/r"}, refresh=False)
+            self.assertIsNone(payload["gitProblem"])
+            self.assertIsNone(payload["git"])
+            payload = sm._session_payload(
+                {"id": "r1", "status": "stopped",
+                 "repoPath": "/r", "worktreePath": "/r"}, refresh=False)
+        self.assertEqual(payload["gitProblem"], {"unreadable": "not a git repository"})
+
+    def test_the_open_pr_reader_publishes_a_gone_worktree_as_missing(self):
+        """QA (XERK-1887): the nudge reader also writes session_cheap; a None
+        there would read "not read yet" again."""
+        sm = self.make_manager()
+        sm.session_cheap = {"s1": {"branch": "feat", "dirtyFiles": 0}}
+        sm.session_facts = {"s1": {"liveBranch": "feat", "slow": {}, "work": None}}
+        sess = {"id": "s1", "repoPath": "/r", "worktreePath": "/w/s1"}
+        with mock.patch.object(ha, "git_info_cheap", return_value=None), \
+                mock.patch.object(ha, "_session_slow_facts", return_value={
+                    "liveBranch": None, "slow": {}, "work": None}):
+            sm._open_pr_nudge_reader(sess)("/w/s1")
+        self.assertEqual(sm.session_cheap["s1"], ha.GIT_MISSING)
+
+    def test_the_repos_root_not_being_a_repo_is_not_a_problem(self):
+        d = tempfile.mkdtemp()
+        self.addCleanup(shutil.rmtree, d, True)
+        self.assertEqual(ha._root_cheap_facts(d, strict=True), {})
 
     def test_branch_sync_reads_a_stalled_origin_lookup_as_unknown(self):
         """XERK-1263: a timed-out origin-ref lookup is pushed None, never the
@@ -26331,16 +26453,21 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
                 ha.repo_cheap_facts(d, strict=True)
 
     def test_a_fast_failure_still_reports_the_worktree_gone(self):
-        """Only a TIMEOUT is kept: a directory whose .git link broke answers
-        rev-parse at once, and that must still read as gone."""
+        """Only a TIMEOUT is kept: a worktree whose directory is gone answers at
+        once, and that must read as gone — a marker of its own since XERK-1887
+        #23, so it never shares the first-sight None ("not read yet")."""
         sm = self.make_manager()
         sm.session_cheap = {"s1": {"branch": "feat", "dirtyFiles": 0}}
         staged = hold_cheap_refreshes(self, sm)
         sm._cheap_read("session_cheap", "s1", ha.git_info_cheap, "/w/s1")
         with mock.patch.object(ha.subprocess, "run", return_value=mock.Mock(
-                returncode=128, stdout="")):
+                returncode=128, stdout="", stderr="")):
             run_held_cheap_refreshes(sm, staged)
-        self.assertIsNone(sm.session_cheap["s1"])
+        self.assertEqual(sm.session_cheap["s1"], ha.GIT_MISSING)
+        self.assertEqual(sm._session_git_problem("s1"), {"missing": True})
+        # First sight is still "not read yet", never "missing".
+        sm._cheap_read("session_cheap", "s2", ha.git_info_cheap, "/w/s2")
+        self.assertIsNone(sm._session_git_problem("s2"))
 
     def test_a_read_stuck_past_its_timeout_is_abandoned_not_waited_on(self):
         """XERK-1537: on a timeout subprocess.run kill()s and then waits
