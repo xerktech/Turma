@@ -344,8 +344,10 @@ private val FRAMING_TAG_LINE =
     Regex("^[ \\t]*<(/?)(pasted_content(?: id=\"([^\"\\n]*)\")?|system-reminder)>[ \\t]*\\r?$")
 // The renderer's fence rule (Prose.kt FENCE_OPEN, JS `\\s` spelled out as JS_WS), as
 // chat.js FRAME_FENCE_OPEN/_CLOSE, tolerating the raw text's CR.
-private val FENCE_OPEN = Regex("^[$JS_WS]*(`{3,})[ \\t]*([^$JS_WS`]*)[ \\t]*\\r?$")
-private val FENCE_CLOSE = Regex("^[$JS_WS]*(`{3,})[ \\t]*\\r?$")
+// Matched on frameLine(line) (one trailing CR, then trailing blanks, cut): linear.
+private val FENCE_OPEN = Regex("^[$JS_WS]*(`{3,})[ \\t]*([^$JS_WS`]*)$")
+private val FENCE_CLOSE = Regex("^[$JS_WS]*(`{3,})$")
+private fun frameLine(line: String): String = fenceLine(line.removeSuffix("\r"))
 
 /**
  * Claude Code's own framing tags on a user turn, each on a line of its own —
@@ -375,10 +377,10 @@ fun stripFraming(text: String): String {
     lines.forEachIndexed { i, line ->
         val f = fence
         if (f != null) {
-            val c = FENCE_CLOSE.matchEntire(line)
+            val c = FENCE_CLOSE.matchEntire(frameLine(line))
             if (c != null && c.groupValues[1].length >= f.length) fence = null
         } else {
-            FENCE_OPEN.matchEntire(line)?.let { fence = it.groupValues[1] }
+            FENCE_OPEN.matchEntire(frameLine(line))?.let { fence = it.groupValues[1] }
         }
         val m = tags[i]
         val id = m?.groups?.get(3)?.value
