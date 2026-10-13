@@ -10673,6 +10673,11 @@ def _shell_tick_end(s, i):
     return n, False
 
 
+def _shell_blank_body(body):
+    """True when a substitution body runs nothing: only blanks and `#` comments."""
+    return all(ln.lstrip(" \t\r")[:1] in ("", "#") for ln in body.split("\n"))
+
+
 def _shell_segments(command):
     """A command line as segments (split on `;` `&&` `||` `&` newline) of
     pipeline stages (split on `|`) of words — a deliberately small tokenizer:
@@ -10732,7 +10737,11 @@ def _shell_segments(command):
                 in_word = True
         elif c in "$<>" and i + 1 < n and s[i + 1] == "(":
             # `<(…)`/`>(…)` run their body like `$(…)`; the whole group is one word.
-            j, _ = _shell_group_end(s, i + 2)
+            j, closed = _shell_group_end(s, i + 2)
+            if closed and c != "$" and _shell_blank_body(s[i + 2:j - 1]):
+                # Bash drops an empty `<()`, so `<()make` is the word `make`.
+                i = j
+                continue
             word.append(s[i:j])
             in_word, i = True, j
             continue

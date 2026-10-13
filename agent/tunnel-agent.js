@@ -1093,6 +1093,12 @@ function shellTickEnd(s, i) {
   return [n, false];
 }
 
+// True when a substitution body runs nothing: only blanks and `#` comments.
+const shellBlankBody = (body) => body.split("\n").every((ln) => {
+  const t = ln.replace(/^[ \t\r]+/, "");
+  return t === "" || t.startsWith("#");
+});
+
 function shellSegments(command) {
   const segs = [];
   let stages = [], words = [], word = [], inWord = false;
@@ -1120,7 +1126,9 @@ function shellSegments(command) {
       if (s[i] !== "\n") { word.push(s[i]); inWord = true; }
     } else if ((c === "$" || c === "<" || c === ">") && i + 1 < n && s[i + 1] === "(") {
       // `<(…)`/`>(…)` run their body like `$(…)`; the whole group is one word.
-      const [j] = shellGroupEnd(s, i + 2);
+      const [j, closed] = shellGroupEnd(s, i + 2);
+      // Bash drops an empty `<()`, so `<()make` is the word `make`.
+      if (closed && c !== "$" && shellBlankBody(s.slice(i + 2, j - 1))) { i = j - 1; continue; }
       word.push(s.slice(i, j)); inWord = true; i = j - 1;
     } else if (c === "`") {
       const [j] = shellTickEnd(s, i + 1);
