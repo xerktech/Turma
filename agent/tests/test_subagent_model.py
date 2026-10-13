@@ -7,6 +7,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -137,6 +138,13 @@ def workflow_call(**tool_input):
             "tool_input": tool_input}
 
 
+def body_of(script):
+    """The body the runtime runs: what follows the meta literal, with its
+    `^[;\\s]*\\n` lead stripped (both read from 2.1.296)."""
+    assert script.startswith(META), script
+    return re.sub(r"^[;\s]*\n", "", script[len(META):], count=1)
+
+
 def run_body(body):
     """Run a script body as Claude Code's Workflow runtime does (2.1.296):
     `async () => {'use strict'; body}` in a vm context with `agent` a context
@@ -160,14 +168,17 @@ class TestWorkflowPin(unittest.TestCase):
         # The meta literal is untouched and the pin adds no line, so the
         # runtime's error line numbers stay the ones the model wrote.
         self.assertTrue(script.startswith(META), script)
-        self.assertEqual(script.count("\n"), source.count("\n"))
+        # The pin adds no line to the body the runtime runs, so its stack
+        # lines stay the ones the model wrote (XERK-1856 QA).
+        self.assertEqual(body_of(script).count("\n"), body_of(source).count("\n"))
+        self.assertEqual(body_of(script).split("\n")[1:], body_of(source).split("\n")[1:])
         return script
 
     def test_only_grader_agent_calls_are_pinned(self):
         rc, out = run_main(workflow_call(script=SCRIPT, args=[1]))
         self.assertEqual(rc, 0)
         self.assertEqual(json.loads(out)["hookSpecificOutput"]["updatedInput"]["args"], [1])
-        self.assertEqual(run_body(self.pinned(out)[len(META):]), EXPECTED)
+        self.assertEqual(run_body(body_of(self.pinned(out))), EXPECTED)
 
     def test_a_body_declaring_its_own_agent_still_runs(self):
         # Wrapping the body in a function with an `agent` parameter made this a
@@ -175,13 +186,21 @@ class TestWorkflowPin(unittest.TestCase):
         body = ("\nconst agent = (p, o) => globalThis.agent(p, o)\n"
                 "return [await agent('x', { agentType: 'qa' })]\n")
         _, out = run_main(workflow_call(script=META + body))
-        self.assertEqual(run_body(self.pinned(out, META + body)[len(META):]), ["x:opus"])
+        self.assertEqual(run_body(body_of(self.pinned(out, META + body))), ["x:opus"])
 
     def test_a_non_writable_agent_global_lapses_the_pin_not_the_run(self):
         _, out = run_main(workflow_call(script=SCRIPT))
         body = ("Object.defineProperty(globalThis, 'agent', {value: globalThis.agent, writable: false});"
-                + self.pinned(out)[len(META):])
+                + body_of(self.pinned(out)))
         self.assertEqual(run_body(body)[0], "check:haiku")
+
+    def test_same_line_and_blank_line_bodies_keep_their_lines(self):
+        for body in ("; const r = await agent('x', { agentType: 'qa' }); return [r]\n",
+                     "\n\n  \n;\nreturn [await agent('x', { agentType: 'qa' })]\n",
+                     "\n(await Promise.resolve(0))\nreturn [await agent('x', { agentType: 'qa' })]\n",
+                     "\n/x/.test('x')\nreturn [await agent('x', { agentType: 'qa' })]\n"):
+            _, out = run_main(workflow_call(script=META + body))
+            self.assertEqual(run_body(body_of(self.pinned(out, META + body))), ["x:opus"], body)
 
     def test_an_already_pinned_script_is_not_pinned_again(self):
         _, out = run_main(workflow_call(script=SCRIPT))
@@ -197,7 +216,7 @@ class TestWorkflowPin(unittest.TestCase):
         upd = json.loads(out)["hookSpecificOutput"]["updatedInput"]
         self.assertNotIn("scriptPath", upd)     # it would win over `script`
         self.assertEqual(upd["resumeFromRunId"], "wf_abc123")
-        self.assertEqual(run_body(self.pinned(out)[len(META):]), EXPECTED)
+        self.assertEqual(run_body(body_of(self.pinned(out))), EXPECTED)
 
     def test_unpinnable_input_passes_through(self):
         for ti in ({"name": "saved-flow"}, {"scriptPath": "/nonexistent.js"},
@@ -206,7 +225,9 @@ class TestWorkflowPin(unittest.TestCase):
                    {"script": "/* open comment export const meta = { name: 'x' }"},
                    {"script": "export const meta = { name: 'x' "}, {"script": 3},
                    # past the tool's size cap once pinned: left for the tool to judge
-                   {"script": SCRIPT + "//" + "x" * (hook.SCRIPT_MAX_BYTES - len(SCRIPT) - 10)}):
+                   {"script": SCRIPT + "//" + "x" * (hook.SCRIPT_MAX_BYTES - len(SCRIPT) - 10)},
+                   # the cap is BYTES: few characters, but over it in UTF-8
+                   {"script": SCRIPT + "//" + "é" * ((hook.SCRIPT_MAX_BYTES - len(SCRIPT) - 100) // 2)}):
             self.assertEqual(run_main(workflow_call(**ti)), (0, ""), str(ti)[:80])
         self.assertEqual(run_main(workflow_call(script=SCRIPT), pin=None), (0, ""))
 

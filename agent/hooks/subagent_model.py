@@ -67,10 +67,11 @@ def is_grader(subagent_type) -> bool:
 # the meta literal, then runs the rest as `async () => {'use strict'; body}` in a
 # vm context where `agent` is a context global (read from 2.1.296). Rebinding that
 # global needs no wrapper around the body, so a body that declares its own
-# `agent` still parses; and it rides the meta's closing line, so error line
-# numbers stay the model's own.
+# `agent` still parses; and it adds no line, so error line numbers stay the
+# model's own.
 PIN_MARKER = "/* turma:grader-model-pin (XERK-1856) */"
 META_RE = re.compile(r"export\s+const\s+meta\s*=\s*")
+BODY_LEAD_RE = re.compile(r"[;\s]*\n")
 SCRIPT_MAX_BYTES = 524288   # the Workflow tool's own cap on `script`
 
 
@@ -133,7 +134,14 @@ def pin_workflow_script(script: str, model: str):
     if not m or not script.startswith("{", m.end()):
         return None
     end = _literal_end(script, m.end())
-    if end is None or script.startswith(";" + PIN_MARKER, end):
+    if end is None:
+        return None
+    # The runtime strips `^[;\s]*\n` off the body before running it, so its
+    # stack lines count from the first line that survives; the pin goes at the
+    # START of that line (never a line of its own) to keep them the model's.
+    lead = BODY_LEAD_RE.match(script, end)
+    at = lead.end() if lead else end
+    if script.startswith(";" + PIN_MARKER, at):
         return None
     # One line, no newline. A non-writable global would throw in strict mode,
     # hence the try: the pin then lapses rather than the run failing.
@@ -145,7 +153,7 @@ def pin_workflow_script(script: str, model: str):
         f" || /(?<!p)review/.test(t)) ? {{...o, model: {json.dumps(model)}}} : o);"
         " })(globalThis.agent); } catch (e) {}"
     )
-    pinned = script[:end] + pin + script[end:]
+    pinned = script[:at] + pin + script[at:]
     if len(pinned.encode("utf-8")) > SCRIPT_MAX_BYTES:
         return None
     return pinned
