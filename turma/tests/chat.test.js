@@ -1985,6 +1985,19 @@ test("renderProse: a fence indented by a non-breaking space is a fence (Android 
   assert.match(renderProse("```\na\n\u3000```\nb"), /<code>a<\/code>/);
 });
 
+test("renderProse + stripFraming: every JS whitespace indents a fence; none sits in an info string", () => {
+  // Rollup XERK-1701: Android spells this set out (Prose.kt JS_WS); pin all of it here.
+  const strip = (text) => buildItems([{ id: "z", role: "user", blocks: [{ t: "text", text }] }])[0].text;
+  for (const w of ["\t", "\u000b", "\f", " ", "\u00a0", "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004", "\u2005", "\u2006", "\u2007", "\u2008", "\u2009", "\u200a", "\u2028", "\u2029", "\u202f", "\u205f", "\u3000", "\ufeff"]) {
+    assert.match(renderProse(w + "```\nplain\n```"), /<code>plain<\/code>/, JSON.stringify(w));
+    // ...a fence the strip reads the same way: the tag inside it is kept.
+    assert.equal(strip("a\n" + w + "```\n<system-reminder>\nb\n```\nc"),
+      "a\n" + w + "```\n<system-reminder>\nb\n```\nc", JSON.stringify(w));
+  }
+  // Whitespace after an info word ends the line's fence-ness, outside the blank class.
+  assert.equal(strip("a\n```js\u00a0x\n<system-reminder>\n```\nb"), "a\n```js\u00a0x\n```\nb");
+});
+
 test("renderProse: a fenced block carries a copy button in a positioning wrapper (XERK-183)", () => {
   const html = renderProse("```\nplain\n```");
   // The wrapper is the positioning context; the button sits OUTSIDE the <pre>

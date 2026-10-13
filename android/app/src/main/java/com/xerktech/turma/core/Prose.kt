@@ -510,8 +510,9 @@ private fun paragraphOf(text: String): ProseBlock.Paragraph? {
 // A ``` fence opens a block that runs to the next fence of at least the same
 // length, or (unterminated, mid-stream) to the end of the text. The opening line
 // must be the fence plus at most a one-word info string.
-// JS `\s`, spelled out (rollup XERK-1701): the JVM's `\s` is ASCII-only, so a fence
-// indented by a non-breaking space rendered as code on the web and as prose here.
+// JS `\s`, spelled out (rollup XERK-1701). `\s` is ASCII-only on the JVM (unit tests)
+// and ICU's set on a device, which differs from JS on U+FEFF and U+0085: a fence
+// indented by either rendered as code on one platform and as prose on the other.
 internal const val JS_WS = "\t\u000B\u000C\r \u00A0\u1680\u2000-\u200A\u2028\u2029\u202F\u205F\u3000\uFEFF"
 private val FENCE_OPEN = Regex("^[$JS_WS]*(`{3,})[ \t]*([^$JS_WS`]*)[ \t]*$")
 private val FENCE_CLOSE = Regex("^[$JS_WS]*(`{3,})[ \t]*$")

@@ -447,6 +447,12 @@ class ChatItemsTest {
         assertEquals("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc", stripFraming("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc"))
         assertEquals("a\r\n```\r\nb\r\n```\r\nc", stripFraming("a\r\n```\r\nb\r\n```\r\n<system-reminder>\r\nc"))
         assertEquals("a\n```js x\n```\nb", stripFraming("a\n```js x\n<system-reminder>\n```\nb"))
+        // Every JS whitespace indents a fence the strip reads as one; none sits in an info string.
+        for (w in listOf("\t", "\u000B", "\u000C", " ", "\u00A0", "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004", "\u2005", "\u2006", "\u2007", "\u2008", "\u2009", "\u200A", "\u2028", "\u2029", "\u202F", "\u205F", "\u3000", "\uFEFF")) {
+            assertEquals("a\n" + w + "```\n<system-reminder>\nb\n```\nc",
+                stripFraming("a\n" + w + "```\n<system-reminder>\nb\n```\nc"))
+        }
+        assertEquals("a\n```js\u00A0x\n```\nb", stripFraming("a\n```js\u00A0x\n<system-reminder>\n```\nb"))
         // A fence indented by a non-breaking space is a fence, as on the web.
         assertEquals("i\n\u00A0```\n<system-reminder>\nb\n```\ne",
             stripFraming("i\n\u00A0```\n<system-reminder>\nb\n```\ne"))

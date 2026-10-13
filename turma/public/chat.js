@@ -1387,7 +1387,8 @@
   // space/tab/CR only, the same on Android (ChatItems.kt `stripFraming`).
   const FRAMING_TAG_LINE = /^[ \t]*<(\/?)(pasted_content(?: id="([^"\n]*)")?|system-reminder)>[ \t]*\r?$/;
   // The renderer's fence rule (FENCE_OPEN / fenceCloses), tolerating the raw text's
-  // CR. Android spells JS `\s` out (Prose.kt JS_WS) so both strip alike.
+  // CR. Android spells JS `\s` out (Prose.kt JS_WS): its own `\s` differs from JS's
+  // (ASCII-only on the JVM; ICU on a device, apart on U+FEFF and U+0085).
   const FRAME_FENCE_OPEN = /^\s*(`{3,})[ \t]*([^\s`]*)[ \t]*\r?$/;
   const FRAME_FENCE_CLOSE = /^\s*(`{3,})[ \t]*\r?$/;
   function stripFraming(text) {

@@ -157,6 +157,12 @@ class ProseTest {
         assertEquals("a", codes("```\na\n\u3000```\nb").first().body)
     }
 
+    @Test fun `every JS whitespace indents a fence, as on the web`() {
+        for (w in listOf("\t", "\u000B", "\u000C", " ", "\u00A0", "\u1680", "\u2000", "\u2001", "\u2002", "\u2003", "\u2004", "\u2005", "\u2006", "\u2007", "\u2008", "\u2009", "\u200A", "\u2028", "\u2029", "\u202F", "\u205F", "\u3000", "\uFEFF")) {
+            assertEquals("plain", codes(w + "```\nplain\n```").single().body)
+        }
+    }
+
     @Test fun `code body is not linkified`() {
         val c = codes("```js\nconst u = \"https://x.io\";\n```").single()
         assertEquals("const u = \"https://x.io\";", c.body)
