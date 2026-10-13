@@ -73,8 +73,10 @@ sealed interface ProseBlock {
 // is plain Text. Only http/https is linkified. For a bare URL, trailing sentence
 // punctuation / emphasis markers / typographic quotes are peeled back out, and a
 // trailing ')' is kept only when it balances an opening one (…/Foo_(bar)).
-private val LINK_RE = Regex("""\[([^\]]+)]\((https?://[^)\s]+)\)|(https?://[^\s<]+)""")
-private val TRAIL_RE = Regex("""[.,;:!?'"*_‘’“”]+$""")
+// A label never holds a `[`, as chat.js: `[^\]]` re-scanned the rest of a "[[[[…" run.
+private val LINK_RE = Regex("""\[([^\[\]]+)]\((https?://[^)\s]+)\)|(https?://[^\s<]+)""")
+// Peeled by a backward scan (as chat.js): `[…]+$` was quadratic on a long dot run.
+private const val TRAIL_CHARS = ".,;:!?'\"*_‘’“”"
 
 private fun linkify(text: String): List<Span> {
     if (text.isEmpty()) return emptyList()
@@ -89,7 +91,9 @@ private fun linkify(text: String): List<Span> {
         } else {
             var url = m.groupValues[3]
             var trail = ""
-            TRAIL_RE.find(url)?.let { trail = it.value; url = url.dropLast(it.value.length) }
+            var e = url.length
+            while (e > 0 && url[e - 1] in TRAIL_CHARS) e--
+            if (e < url.length) { trail = url.substring(e); url = url.substring(0, e) }
             if (url.endsWith(")") && !url.contains("(")) { trail = ")$trail"; url = url.dropLast(1) }
             out.add(Span.Link(url, url))
             pushText(trail)
@@ -235,9 +239,11 @@ private fun parseInline(text: String): List<Span> {
         val n = runLen(text, open)
         var j = open + n
         var close = -1
+        // The line's end, found once: substring-per-backtick was quadratic (as chat.js).
+        val eol = text.indexOf('\n', open + n)
         while (j < text.length) {
             val c = text.indexOf('`', j)
-            if (c < 0 || text.substring(open + n, c).contains('\n')) break
+            if (c < 0 || (eol >= 0 && eol < c)) break
             val m = runLen(text, c)
             if (m == n) { close = c; break }
             j = c + m

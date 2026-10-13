@@ -176,6 +176,16 @@ class ProseTest {
         assertTrue(codes("```js\u00A0\ncode\n```").none { it.body == "code" })
     }
 
+    @Test fun `a URL's dot run, a bracket run and a backtick run parse in linear time`() {
+        // Rollup XERK-1701: each was quadratic (a URL + 64k dots took ~46 s here).
+        // The old code took minutes at this size: a 10 s wall bound can't flake.
+        val t = System.nanoTime()
+        parseProse("http://" + ".".repeat(200_000) + "x")
+        parseProse("[".repeat(200_000) + "x")
+        parseProse("x``" + " `".repeat(100_000))
+        assertTrue("took too long", (System.nanoTime() - t) / 1_000_000 < 10_000)
+    }
+
     @Test fun `code body is not linkified`() {
         val c = codes("```js\nconst u = \"https://x.io\";\n```").single()
         assertEquals("const u = \"https://x.io\";", c.body)
