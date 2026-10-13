@@ -1281,13 +1281,16 @@ test("a CRLF copy torn before a \\r still de-dups to a prefix of the repaired fi
   assert.equal(archive.dedupLines(nbsp).dropped, 0);
   // Whitespace trim() drops is blank as whole UTF-8 sequences, NBSP and U+3000 too:
   // a copy torn before one keys as the repaired file's line does (rollup XERK-1701).
-  for (const ws of ["\u00a0", "\u3000", "\ufeff", "\v"]) {
+  for (const ws of ["\u00a0", "\u1680", "\u200a", "\u2028", "\u2029", "\u202f", "\u205f",
+    "\u3000", "\ufeff", "\v"]) {
     const wide = Buffer.from(`{"a":1}${ws}\n{"a":1}${ws}\n`, "utf8");
     const cut = wide.subarray(0, wide.length - Buffer.byteLength(ws) - 1);
     assert.equal(archive.dedupLines(cut).dropped, 1, JSON.stringify(ws));
     assert.ok(archive.dedupLines(wide).out.toString("latin1")
       .startsWith(archive.dedupLines(cut).out.toString("latin1")), JSON.stringify(ws));
   }
+  // ...and only those: U+200B (zero-width space) is no blank to trim(), so its line stays.
+  assert.equal(archive.dedupLines(Buffer.from('{"a":1}\u200b\n{"a":1}\n', "utf8")).dropped, 0);
 });
 
 test("XERK-1450 pg mode: a lost Postgres repair stays pending and the next leader redoes it", async () => {
