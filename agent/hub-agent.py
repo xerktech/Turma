@@ -10623,8 +10623,12 @@ def _shell_group_end(s, i):
     """For a substitution whose `(` ends just before i, (index past its `)`,
     closed). Quotes, backslash escapes and `#` comments inside it are text,
     so `$(echo ')'; make)` and `$(echo \\'); make` close where bash does.
+    A `$(` inside "…" is its own substitution with its own quotes
+    (`"$(echo ")"; make)"`), kept on an explicit stack: recursion blew the
+    Python stack on ~1000 nested `"$(`, on the beat.
     An unclosed one runs to the end (its rest is read as the body: work)."""
     depth, quote, n = 1, "", len(s)
+    outer = []   # (depth, quote) of each enclosing substitution
     while i < n:
         c = s[i]
         if quote == "'":
@@ -10636,12 +10640,9 @@ def _shell_group_end(s, i):
             if c == '"':
                 quote = ""
             elif c == "$" and s[i + 1:i + 2] == "(":
-                # A `$(` inside "…" is its own substitution, with its own quotes:
-                # `"$(echo ")"; make)"` closes at the last `)`, not the quoted one.
-                i, closed = _shell_group_end(s, i + 2)
-                if not closed:
-                    return n, False
-                continue
+                outer.append((depth, quote))
+                depth, quote = 1, ""
+                i += 1
         elif c in ("'", '"'):
             quote = c
         elif c == "#" and (i == 0 or s[i - 1] in " \t\n;&|("):
@@ -10652,7 +10653,9 @@ def _shell_group_end(s, i):
         elif c == ")":
             depth -= 1
             if not depth:
-                return i + 1, True
+                if not outer:
+                    return i + 1, True
+                depth, quote = outer.pop()
         i += 1
     return n, False
 
