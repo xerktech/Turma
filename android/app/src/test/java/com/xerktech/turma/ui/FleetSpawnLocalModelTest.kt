@@ -72,7 +72,7 @@ class FleetSpawnLocalModelTest {
 
     private fun render() {
         compose.setContent {
-            FleetScreen(onOpenChat = { _, _ -> }, vm = FleetViewModel(hub.app))
+            FleetScreen(onOpenChat = { _, _ -> }, vm = main.track(FleetViewModel(hub.app)))
         }
         compose.waitForIdle()
     }

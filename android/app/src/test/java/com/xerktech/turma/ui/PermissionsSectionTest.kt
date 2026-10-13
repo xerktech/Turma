@@ -234,7 +234,7 @@ class PermissionsSectionTest {
     fun `a refused read shows the hub's words, never a blank section`() {
         // The real refusal, through the real stack and view model.
         hub.route("/api/permissions") { HubHarness.refusal("permission ledger unavailable", code = 503) }
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         runBlocking { vm.refreshPermissions(listOf("acme")).join() }
         show(vm.permissions.value)
         compose.onNodeWithText("Could not load permission prompts (permission ledger unavailable).")

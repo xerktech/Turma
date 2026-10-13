@@ -129,6 +129,9 @@ Mirrors the glasses pure-core/adapter-shell split:
   runs eagerly, no `advanceUntilIdle()` needed (a forgotten one passes against unwritten state). Does
   NOT make the network synchronous — join the `Job` a VM action returns, or use
   `awaitValue`/`collectMessages`.
+- **Wrap every ViewModel a test builds in `main.track(…)`** (rollup XERK-1584 #6): the rule
+  cancels the tracked scopes before `resetMain`. A late OkHttp answer otherwise resumes on
+  `Dispatchers.Main` mid `setMain`/`resetMain` and throws "used concurrently with setting it".
 - **Assert a model-switch memo on the STORE (`container.modelSwitches`), never `ChatUiState`** — the
   state copy is a VM-rebuilt mirror; asserting it passes on a change that dropped the real thing.
 - **The in-app updater is silenced in tests (XERK-281)** — Robolectric rebuilds the Application per

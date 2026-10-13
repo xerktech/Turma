@@ -73,7 +73,7 @@ class UsagePermissionsViewModelTest {
         routeByOrg(delayFor = "rival")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         startWatching(vm)
 
         hub.awaitFlow(vm.permissions) { it.view != null }
@@ -98,7 +98,7 @@ class UsagePermissionsViewModelTest {
         routeByOrg(delayFor = "acme")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         startWatching(vm)               // acme's read is now in flight, slow
         hub.container.org.set(setOf("rival"))
         hub.awaitFlow(vm.permissions) { it.view != null }
@@ -111,7 +111,7 @@ class UsagePermissionsViewModelTest {
     fun `nothing is fetched until a fleet snapshot says which orgs exist`() {
         routeByOrg()
         hub.container.org.set(setOf("acme"))
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         startWatching(vm)
         // Before a snapshot no org is known: an unscoped fetch would show every
         // org's prompts under a scoped header.
@@ -124,7 +124,7 @@ class UsagePermissionsViewModelTest {
     fun `an SSE upsert before the first poll is not a fleet snapshot`() {
         routeByOrg()
         hub.container.org.set(setOf("acme"))
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         startWatching(vm)
         // One rival host arrives over SSE before any poll: the state reads loaded
         // with no error, but scoping "acme" against it would drop the org and
@@ -141,7 +141,7 @@ class UsagePermissionsViewModelTest {
     @Test
     fun `a refusal shows the hub's own words, never a blank section`() {
         hub.route("/api/permissions") { HubHarness.refusal("permission ledger unavailable", code = 503) }
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         runBlocking { vm.refreshPermissions(listOf("acme")).join() }
         assertEquals("permission ledger unavailable", vm.permissions.value.error)
         assertNull(vm.permissions.value.view)
@@ -156,7 +156,7 @@ class UsagePermissionsViewModelTest {
     fun `a wrong-typed answer fails this section alone, and a failed refresh keeps the last view`() {
         hub.seedFleet(fleet)
         hub.json("/api/permissions", """{"days":7,"top":"not a list"}""")
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         runBlocking { vm.refreshPermissions(emptyList()).join() }
         assertEquals("no readable answer from the hub", vm.permissions.value.error)
         // The fleet decode is a different call: both hosts are still there.
@@ -184,7 +184,7 @@ class UsagePermissionsViewModelTest {
         runBlocking { hub.container.fleet.refresh() }
         val fleetError = hub.container.fleet.state.value.error
         assertNotNull(fleetError)
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         startWatching(vm)
         hub.awaitFlow(vm.permissions) { it.error != null }
         assertEquals(fleetError, vm.permissions.value.error)
@@ -201,7 +201,7 @@ class UsagePermissionsViewModelTest {
     @Test
     fun `an unchanged ledger still re-emits on refresh, so the ages keep moving`() {
         hub.json("/api/permissions", summary("git status"))
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         runBlocking { vm.refreshPermissions(emptyList()).join() }
         val first = vm.permissions.value
         assertTrue("the view carries the time it landed", first.at > 0)

@@ -46,7 +46,7 @@ class TrajectoryViewModelTest {
     @Test
     fun `a 200 populates the parsed trajectory`() {
         hub.json("/api/dsh/$tid/trajectory", trajectoryJson)
-        val vm = TrajectoryViewModel(hub.app)
+        val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load(tid)
         val d = hub.awaitFlow(vm.state) { it.data != null }.data!!
         assertEquals("my dsh session", d.title)
@@ -63,7 +63,7 @@ class TrajectoryViewModelTest {
     @Test
     fun `a 404 is the not-synced-yet state, not an error`() {
         hub.json("/api/dsh/$tid/trajectory", """{"error":"no dsh trajectory for this session"}""", code = 404)
-        val vm = TrajectoryViewModel(hub.app)
+        val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load(tid)
         hub.awaitFlow(vm.state) { !it.loading }
         assertTrue("a 404 must read as not-synced-yet", vm.state.value.notSynced)
@@ -80,7 +80,7 @@ class TrajectoryViewModelTest {
             """{"error":"no dsh trajectory for this session","ingestClosed":{"since":$since}}""",
             code = 404,
         )
-        val vm = TrajectoryViewModel(hub.app)
+        val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load(tid)
         val err = hub.awaitFlow(vm.state) { it.error != null }.error!!
         assertTrue(err, err.contains("has not been accepting archive pushes"))
@@ -94,7 +94,7 @@ class TrajectoryViewModelTest {
             """{"error":"no dsh trajectory for this session","refused":{"host":"nas","at":1,"error":"too big"}}""",
             code = 404,
         )
-        val vm = TrajectoryViewModel(hub.app)
+        val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load(tid)
         val err = hub.awaitFlow(vm.state) { it.error != null }.error!!
         assertTrue(err, err.contains("nas\u2019s last push") && err.contains("too big"))
@@ -103,7 +103,7 @@ class TrajectoryViewModelTest {
     @Test
     fun `a non-404 status is an error`() {
         hub.json("/api/dsh/$tid/trajectory", """{"error":"boom"}""", code = 500)
-        val vm = TrajectoryViewModel(hub.app)
+        val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load(tid)
         val err = hub.awaitFlow(vm.state) { it.error != null }.error!!
         assertTrue("the HTTP status should be surfaced", err.contains("500"))
@@ -117,7 +117,7 @@ class TrajectoryViewModelTest {
         // settled state: its LaunchedEffect(transcriptId) re-issues load(tid) on
         // every re-entry, and a re-fetch there would un-settle the paint.
         hub.json("/api/dsh/$tid/trajectory", """{"error":"not yet"}""", code = 404)
-        val vm = TrajectoryViewModel(hub.app)
+        val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load(tid)
         hub.awaitFlow(vm.state) { !it.loading }
         assertTrue(vm.state.value.notSynced)
@@ -140,7 +140,7 @@ class TrajectoryViewModelTest {
     fun `a blank transcript id never hits the network`() {
         // No route registered — if it fetched, the harness would 404 (→ notSynced),
         // so an error state with no fetch is the proof it short-circuited.
-        val vm = TrajectoryViewModel(hub.app)
+        val vm = main.track(TrajectoryViewModel(hub.app))
         vm.load("")
         assertNotNull(vm.state.value.error)
         assertTrue(!vm.state.value.notSynced)

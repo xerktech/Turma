@@ -43,7 +43,7 @@ class ChatModelSourceTest {
     private val host = "nas01"
     private val session = "s1"
 
-    private fun vm() = ChatViewModel(hub.app, host, session)
+    private fun vm() = main.track(ChatViewModel(hub.app, host, session))
 
     private fun memo() = hub.container.modelSwitches.of(host, session).value
 

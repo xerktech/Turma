@@ -45,7 +45,7 @@ class FleetSpawnAttachTest {
             """{"ok":true,"uploadId":"u1","name":"diagram.png","size":5}""")
         hub.json("/api/agents/$host/sessions", """{"ok":true,"cmdId":"c1"}""")
 
-        val vm = FleetViewModel(hub.app)
+        val vm = main.track(FleetViewModel(hub.app))
         val uri = Uri.parse("content://test/diagram.png")
         shadowOf(hub.app.contentResolver)
             .registerInputStream(uri, ByteArrayInputStream("hello".toByteArray()))
@@ -72,7 +72,7 @@ class FleetSpawnAttachTest {
     fun `a bare spawn with no attachment carries no uploadIds`() {
         hub.seedFleet(fleetWithUpload())
         hub.json("/api/agents/$host/sessions", """{"ok":true,"cmdId":"c1"}""")
-        val vm = FleetViewModel(hub.app)
+        val vm = main.track(FleetViewModel(hub.app))
         vm.spawn(host, "Turma")
         val body = hub.findRequest("/api/agents/$host/sessions").body.readUtf8()
         assertTrue("bare spawn should omit uploadIds: $body", !body.contains("uploadIds"))

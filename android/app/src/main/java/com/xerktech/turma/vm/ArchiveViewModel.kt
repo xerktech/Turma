@@ -10,6 +10,7 @@ import com.xerktech.turma.model.SearchGroup
 import com.xerktech.turma.net.archiveMissingMessage
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.update
@@ -54,6 +55,11 @@ class ArchiveViewModel(app: Application) : AndroidViewModel(app) {
     val state: StateFlow<Ui> = _state
     private var searchJob: Job? = null
 
+    // The transcript load in flight: a new open or a close cancels it, so a slow
+    // failure for one transcript never lands its refusal on the next (rollup
+    // XERK-1584 #14, the web's `currentTranscriptId` check).
+    private var openJob: Job? = null
+
     fun onQuery(q: String) {
         val trimmed = q.trim()
         if (_state.value.query == q) return
@@ -76,9 +82,11 @@ class ArchiveViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun openTranscript(transcriptId: String) {
+        openJob?.cancel()
         _state.update { it.copy(openLoading = true, refusal = null) }
-        viewModelScope.launch {
+        openJob = viewModelScope.launch {
             val res = runCatching { container.client.api.archiveTranscript(transcriptId) }
+            ensureActive() // runCatching swallows the cancel: a superseded load writes nothing
             val t = res.getOrNull()
             // Anything but the plain 404 is a reason "it syncs within a few
             // minutes" is untrue: a refused push, closed ingest, a failed load.
@@ -94,5 +102,8 @@ class ArchiveViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    fun closeTranscript() = _state.update { it.copy(open = null, refusal = null) }
+    fun closeTranscript() {
+        openJob?.cancel()
+        _state.update { it.copy(open = null, openLoading = false, refusal = null) }
+    }
 }

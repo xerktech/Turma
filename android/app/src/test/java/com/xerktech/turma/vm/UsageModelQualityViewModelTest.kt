@@ -64,7 +64,7 @@ class UsageModelQualityViewModelTest {
         routeByOrg(delayFor = "all")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         start(vm)
         hub.awaitFlow(vm.modelQuality) { it.view != null }
         val req = hub.findRequest("/api/model-quality")
@@ -83,7 +83,7 @@ class UsageModelQualityViewModelTest {
         routeByOrg(delayFor = "acme")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         start(vm)
         hub.container.org.set(setOf("rival"))
         hub.awaitFlow(vm.modelQuality) { it.view != null }
@@ -97,7 +97,7 @@ class UsageModelQualityViewModelTest {
         routeByOrg(failFor = "acme", delayFor = "rival")
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         start(vm)
         hub.awaitFlow(vm.modelQuality) { it.error != null }
         assertEquals("ledger down", vm.modelQuality.value.error)
@@ -116,7 +116,7 @@ class UsageModelQualityViewModelTest {
         }
         hub.container.org.set(setOf("acme"))
         hub.seedFleet(fleet)
-        val vm = UsageViewModel(hub.app)
+        val vm = main.track(UsageViewModel(hub.app))
         start(vm)
         hub.awaitFlow(vm.modelQuality) { it.view != null }
         fail = true
