@@ -149,7 +149,6 @@ gate is BEHAVIORALLY testable (a follower does nothing). The individual sub-swee
   - Only a status >= 400, and the follower's own 502 (leader reset mid-body). An early 2xx may be
     a long-lived stream that `drainLingerMs` would truncate.
   - A request pipelined behind the lingered answer is dropped, not forwarded (XERK-1885).
-    Residual: one whose handler STARTED before the leader's answer arrived is already forwarded.
   - Test clients must read NOTHING until their write completes (`writeThenRead`): an in-process
     client that reads as it writes wins the race and passes against the broken code.
 - **Asymmetric store partition — a store-less leader STEPS DOWN, a store-less replica REFUSES if the

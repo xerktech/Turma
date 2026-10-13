@@ -427,6 +427,44 @@ test("XERK-1885: a request pipelined behind a close refusal is never dispatched"
   }
 });
 
+// An upgrade pipelined behind a close refusal is refused with the connection — run, a
+// second /agent/control for a host replaces (tears down) its live control channel.
+test("XERK-1885: an upgrade pipelined behind a close refusal never reaches its handler", async () => {
+  const net = require("net");
+  const host = "upg1885";
+  const port = server.address().port;
+  const upgrade = `GET /agent/control?name=${host}&token=agenttok HTTP/1.1\r\nhost: x\r\n` +
+    "upgrade: websocket\r\nconnection: Upgrade\r\nsec-websocket-key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+    "sec-websocket-version: 13\r\n\r\n";
+  const live = net.connect({ port, host: "127.0.0.1" });
+  let liveClosed = false;
+  live.on("error", () => {});
+  live.on("data", () => {});
+  live.on("close", () => { liveClosed = true; });
+  live.write(upgrade);
+  try {
+    for (let i = 0; i < 40 && !hub.controlChannels[host]; i++) await sleep(25);
+    assert.ok(hub.controlChannels[host], "the live control channel is up");
+    const big = 256 << 10;
+    const got = await new Promise((resolve) => {
+      const s = net.connect({ port, host: "127.0.0.1", allowHalfOpen: true });
+      let buf = "";
+      s.on("error", () => {});
+      s.on("data", (c) => (buf += c));
+      s.on("end", () => s.end());
+      s.on("close", () => resolve(buf));
+      s.write(`POST /api/agents/${host}/uploads?name=a.bin HTTP/1.1\r\nhost: x\r\n` +
+        `content-length: ${big}\r\n\r\n` + "x".repeat(big) + upgrade);
+    });
+    assert.match(got, /^HTTP\/1\.1 401 /);
+    assert.doesNotMatch(got, / 101 /, "the pipelined upgrade was never answered");
+    await sleep(200);
+    assert.equal(liveClosed, false, "the live control channel survived");
+  } finally {
+    live.destroy();
+  }
+});
+
 test("XERK-1598: a refusal of a SMALL unread body keeps the connection", async () => {
   const { port } = server.address();
   const got = await new Promise((resolve) => {
