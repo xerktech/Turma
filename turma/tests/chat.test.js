@@ -2979,6 +2979,12 @@ test("buildItems: a framing tag inside an operator's code fence is their text (r
   assert.equal(strip("a\n```\n<system-reminder>\n\ufeff"), "a\n```\n<system-reminder>\n\ufeff");
   // The last non-blank line goes when it is a tag, even inside an unclosed fence.
   assert.equal(strip("a\n```\nb\n<system-reminder>\n"), "a\n```\nb");
+  // U+001C is not blank; ```js does not close; CRLF fences count; a spaced info string opens nothing (QA).
+  assert.equal(strip("a\n```\n<system-reminder>\n\u001c"), "a\n```\n<system-reminder>\n\u001c");
+  assert.equal(strip("a\n```\n<system-reminder>\n```js\n<system-reminder>\n```\nb"), "a\n```\n<system-reminder>\n```js\n<system-reminder>\n```\nb");
+  assert.equal(strip("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc"), "a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc");
+  assert.equal(strip("a\r\n```\r\nb\r\n```\r\n<system-reminder>\r\nc"), "a\r\n```\r\nb\r\n```\r\nc");
+  assert.equal(strip("a\n```js x\n<system-reminder>\n```\nb"), "a\n```js x\n```\nb");
   // A fence line with a Unicode space before it opens nothing, as on Android.
   assert.equal(strip("i\n\u00a0```\n<system-reminder>\nb\n```\ne"), "i\n\u00a0```\nb\n```\ne");
   // Claude Code's own matched paste framing goes even inside the operator's fence.

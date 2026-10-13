@@ -441,6 +441,12 @@ class ChatItemsTest {
         assertEquals("a\n~~~\n~~~\nc", stripFraming("a\n~~~\n<system-reminder>\n~~~\nc"))
         assertEquals("a\n```\n<system-reminder>\n\uFEFF", stripFraming("a\n```\n<system-reminder>\n\uFEFF"))
         assertEquals("a\n```\nb", stripFraming("a\n```\nb\n<system-reminder>\n"))
+        // U+001C is not blank; ```js does not close; CRLF fences count; a spaced info string opens nothing (QA).
+        assertEquals("a\n```\n<system-reminder>\n\u001C", stripFraming("a\n```\n<system-reminder>\n\u001C"))
+        assertEquals("a\n```\n<system-reminder>\n```js\n<system-reminder>\n```\nb", stripFraming("a\n```\n<system-reminder>\n```js\n<system-reminder>\n```\nb"))
+        assertEquals("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc", stripFraming("a\r\n```\r\n<system-reminder>\r\nb\r\n```\r\nc"))
+        assertEquals("a\r\n```\r\nb\r\n```\r\nc", stripFraming("a\r\n```\r\nb\r\n```\r\n<system-reminder>\r\nc"))
+        assertEquals("a\n```js x\n```\nb", stripFraming("a\n```js x\n<system-reminder>\n```\nb"))
         // A fence line with a Unicode space before it opens nothing, on both platforms.
         assertEquals("i\n\u00A0```\nb\n```\ne", stripFraming("i\n\u00A0```\n<system-reminder>\nb\n```\ne"))
         // Claude Code's matched paste framing goes even inside the operator's fence (QA).
