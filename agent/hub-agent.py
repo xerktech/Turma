@@ -6684,7 +6684,8 @@ def _git_error_reason(stderr):
     """git's first non-empty stderr line, `fatal: `/`error: ` dropped, control
     characters removed and capped — what the card says after "git unreadable"."""
     for line in (stderr or "").splitlines():
-        line = re.sub(r"[\x00-\x1f\x7f]", " ", line).strip()
+        line = re.sub(r"[\x00-\x1f\x7f-\x9f\u200b-\u200f\u2028-\u202e\u2066-\u2069]",
+                      " ", line).strip()
         line = re.sub(r"^(fatal|error):\s*", "", line, flags=re.I)
         if line:
             return line[:GIT_PROBLEM_REASON_MAX]

@@ -1508,7 +1508,7 @@ function logName(key) {
   // C0, DEL **and C1** — JSON.stringify escapes none of the C1 block, and NEL
   // (U+0085) is a line break to some readers.
   return JSON.stringify(String(key).slice(0, 200))
-    .replace(/[\u0000-\u001f\u007f-\u009f]/g, "?");
+    .replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, "?");
 }
 
 const AGENTS_MAX = positiveEnv("AGENTS_MAX", 64);
@@ -10258,9 +10258,9 @@ function coerceGitProblem(o) {
   if (objectish(p) && p.missing === true) {
     o.gitProblem = { missing: true };
   } else if (objectish(p) && typeof p.unreadable === "string"
-    // C0/DEL/C1 become spaces, as the agent's own _git_error_reason does.
-    && p.unreadable.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim()) {
-    const clean = p.unreadable.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ").trim();
+    // C0/DEL/C1 and bidi/format chars become spaces, as _git_error_reason does.
+    && p.unreadable.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, " ").trim()) {
+    const clean = p.unreadable.replace(/[\u0000-\u001f\u007f-\u009f\u200b-\u200f\u2028-\u202e\u2066-\u2069]/g, " ").trim();
     o.gitProblem = { unreadable: [...clean].slice(0, 200).join("") };
   } else {
     delete o.gitProblem;

@@ -26313,6 +26313,7 @@ class TestCheapGitWorker(ManagerMixin, unittest.TestCase):
             "\nfatal: detected dubious ownership in repository at '/r'\nTo add…"),
             "detected dubious ownership in repository at '/r'")
         self.assertEqual(ha._git_error_reason("error: a\x1bb"), "a b")
+        self.assertEqual(ha._git_error_reason("a\u202eb\x9bc"), "a b c")
         self.assertEqual(len(ha._git_error_reason("x" * 5000)),
                          ha.GIT_PROBLEM_REASON_MAX)
         self.assertEqual(ha._git_error_reason(""), "git exited with an error")
