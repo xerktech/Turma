@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { App, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, newSessionState } from "./app.ts";
+import { App, FLASH_HUB_UNREACHABLE, FLASH_QUEUED, HEARD_NOTHING, newSessionState } from "./app.ts";
 import type { HubClient } from "./hub-client.ts";
 import type { GlassesDisplay } from "./display/index.ts";
 import type { Dictation, DictationResult } from "./dictation.ts";
@@ -284,6 +284,30 @@ describe("App", () => {
     expect(client.spawnSession).toHaveBeenCalledWith("host-a", { repo: "myrepo" });
     expect(app.getState().screen).toBe("home");
     expect(app.getState().pending["spawn:host-a:myrepo"]).toBeDefined();
+  });
+
+  it("a blank prompt dictation offers Redo/Cancel, never Send on an empty preview", async () => {
+    // Rollup XERK-1701: silence (or filtered non-speech) came back as "" and the
+    // preview read "0 chars" with Send enabled.
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent()] })),
+    });
+    const app = makeApp(client);
+    await app.start();
+    await vi.advanceTimersByTimeAsync(0);
+    display.emit({ type: "tap" }); // newSession -> newHost
+    display.emit({ type: "tap" }); // host-a -> newRepo
+    display.emit({ type: "tap" }); // myrepo -> newPrompt
+    display.emit({ type: "tap" }); // "Dictate prompt" -> reply/listening
+    expect(app.getState().screen).toBe("reply");
+    dictation.resolve({ text: "  \n " });
+    expect(app.getState().reply?.phase).toBe("unavailable");
+    expect(app.getState().reply?.reason).toBe(HEARD_NOTHING);
+    display.emit({ type: "tap" }); // cursor 0 = Redo, not Send
+    expect(client.spawnSession).not.toHaveBeenCalled();
+    expect(app.getState().reply?.phase).toBe("listening");
+    dictation.resolve({ text: " fix the build " });
+    expect(app.getState().reply?.text).toBe("fix the build");
   });
 
   // ---- post-mutation refresh: immediate poll + grace window -------------
@@ -664,6 +688,23 @@ describe("App", () => {
     expect(app.getState().session?.mic).toBe("idle");
     expect(app.getState().flash).toBe("mic permission denied");
     expect(app.getState().session?.draft).toBe(""); // nothing appended
+  });
+
+  it("input mode: a blank dictation leaves the draft untouched and says it heard nothing", async () => {
+    const client = fakeClient({
+      listAgents: vi.fn(async () => ({ now: Date.now(), agents: [agent({ sessions: [session()] })] })),
+    });
+    const app = makeApp(client);
+    await toSessionBottom(app);
+
+    display.emit({ type: "tap" }); // idle -> recording
+    dictation.resolve({ text: "deploy the fix " });
+    expect(app.getState().session?.draft).toBe("deploy the fix");
+    display.emit({ type: "tap" });
+    dictation.resolve({ text: " " }); // silence: no stray trailing space (rollup XERK-1701)
+    expect(app.getState().session?.draft).toBe("deploy the fix");
+    expect(app.getState().session?.mic).toBe("idle");
+    expect(app.getState().flash).toBe(HEARD_NOTHING);
   });
 
   it("input mode: doubleTap opens the actions menu; Send/Clear only appear once there's a draft", async () => {

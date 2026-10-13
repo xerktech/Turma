@@ -53,6 +53,9 @@ export const POLL_GRACE_MS = 60 * 1000;
 export const FLASH_DURATION_MS = 4000;
 export const FLASH_QUEUED = "√ queued — agent picks up in ~20s";
 export const FLASH_HUB_UNREACHABLE = "hub unreachable";
+// Dictation that came back blank (silence, or Whisper's filtered non-speech):
+// nothing to send, so it never reaches a Send button or the draft (rollup XERK-1701).
+export const HEARD_NOTHING = "heard nothing — try again";
 // What a failed hub call flashes (XERK-270). The flash is the ONLY feedback a
 // wearer gets, so a refusal must arrive in the hub's own words — the client
 // puts them on the HttpError (see hub-client's `refusal`), and every catch used
@@ -1054,7 +1057,13 @@ export class App {
       this.setState({ session: { ...s, mic: "idle" } });
       return;
     }
-    const draft = s.draft ? `${s.draft} ${result.text}` : result.text;
+    const text = result.text.trim();
+    if (!text) {
+      this.setState({ session: { ...s, mic: "idle" } });
+      this.flash(HEARD_NOTHING);
+      return;
+    }
+    const draft = s.draft ? `${s.draft} ${text}` : text;
     this.setState({ session: { ...s, draft, mic: "idle", viewOffset: 0 } });
   }
 
@@ -1274,7 +1283,13 @@ export class App {
       this.setState({ reply: { ...r, phase: "unavailable", reason: result.reason, cursor: 0 } });
       return;
     }
-    this.setState({ reply: { ...r, phase: "preview", text: result.text, cursor: 0 } });
+    const text = result.text.trim();
+    if (!text) {
+      // Redo / Cancel only: a blank preview offered Send on "0 chars".
+      this.setState({ reply: { ...r, phase: "unavailable", reason: HEARD_NOTHING, cursor: 0 } });
+      return;
+    }
+    this.setState({ reply: { ...r, phase: "preview", text, cursor: 0 } });
   }
 
   private onReply(e: InputEvent): void {
