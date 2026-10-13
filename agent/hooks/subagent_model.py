@@ -28,12 +28,11 @@ Read-only search sub-agents (Explore, general-purpose, …) are deliberately NOT
 pinned, so they stay on the cheap default.
 
 A Workflow script's ``agent(prompt, {agentType: 'qa'})`` is no Agent tool call
-(XERK-1856), so the hook also matches ``Workflow`` and rewrites the SCRIPT: the
-body after the ``meta`` literal runs inside an async arrow whose ``agent``
-parameter is a wrapper adding ``model`` to a grader's opts — the same per-call
-lever, which beats the definition's frontmatter there too (measured, 2.1.296).
-Wrapping the body leaves every ``agent(...)`` call site untouched, so nothing
-parses the JS beyond finding where the meta literal ends.
+(XERK-1856), so the hook also matches ``Workflow`` and rewrites the SCRIPT:
+right after the ``meta`` literal it rebinds the ``agent`` global to one adding
+``model`` to a grader's opts — the same per-call lever, which beats the
+definition's frontmatter there too (measured, 2.1.296). Call sites are left
+untouched, so nothing parses the JS beyond finding where the meta literal ends.
 
 Contract: stdin is the PreToolUse JSON. To pin, print ``updatedInput`` with no
 ``permissionDecision`` (the call then goes through the normal permission flow);
@@ -64,10 +63,35 @@ def is_grader(subagent_type) -> bool:
     return name in PINNED_NAMES or bool(REVIEW_WORD_RE.search(name))
 
 
-# Marks a script this hook already wrapped: a resumed run re-reads the persisted
-# (wrapped) script, which must not be wrapped twice.
-WRAP_MARKER = "/* turma:grader-model-pin (XERK-1856) */"
+# Claude Code parses a Workflow script as an ES module whose FIRST statement is
+# the meta literal, then runs the rest as `async () => {'use strict'; body}` in a
+# vm context where `agent` is a context global (read from 2.1.296). Rebinding that
+# global needs no wrapper around the body, so a body that declares its own
+# `agent` still parses; and it rides the meta's closing line, so error line
+# numbers stay the model's own.
+PIN_MARKER = "/* turma:grader-model-pin (XERK-1856) */"
 META_RE = re.compile(r"export\s+const\s+meta\s*=\s*")
+SCRIPT_MAX_BYTES = 524288   # the Workflow tool's own cap on `script`
+
+
+def _skip_comments(src: str, i: int = 0):
+    """Index of the first token at or after ``i`` that is not whitespace, a
+    comment or a hashbang; None on an unterminated block comment."""
+    if i == 0 and src.startswith("#!"):
+        i = src.find("\n") if "\n" in src else len(src)
+    while True:
+        while i < len(src) and src[i].isspace():
+            i += 1
+        if src.startswith("//", i):
+            j = src.find("\n", i)
+            i = len(src) if j < 0 else j
+        elif src.startswith("/*", i):
+            j = src.find("*/", i + 2)
+            if j < 0:
+                return None
+            i = j + 2
+        else:
+            return i
 
 
 def _literal_end(src: str, start: int):
@@ -99,34 +123,36 @@ def _literal_end(src: str, start: int):
     return None
 
 
-def wrap_workflow_script(script: str, model: str):
+def pin_workflow_script(script: str, model: str):
     """The script with grader ``agent()`` calls pinned to ``model``, or None
-    when it is already wrapped or its ``meta`` literal cannot be found."""
-    if WRAP_MARKER in script:
-        return None
-    m = META_RE.search(script)
+    when it is already pinned, its leading meta literal is not found, or the
+    pin would push it past the tool's size cap. Any doubt passes the script
+    through unchanged: a broken workflow is worse than an unpinned one."""
+    start = _skip_comments(script)
+    m = META_RE.match(script, start) if start is not None else None
     if not m or not script.startswith("{", m.end()):
         return None
     end = _literal_end(script, m.end())
-    if end is None:
+    if end is None or script.startswith(";" + PIN_MARKER, end):
         return None
-    names = json.dumps(sorted(PINNED_NAMES))
+    # One line, no newline. A non-writable global would throw in strict mode,
+    # hence the try: the pin then lapses rather than the run failing.
     pin = (
-        f"\n;{WRAP_MARKER}\n"
-        "return await (async (agent) => {\n"
-        f"{script[end:]}\n"
-        "})(((a) => (p, o) => {\n"
-        "  const t = o && typeof o === 'object' ? (o.agentType ?? o.subagent_type) : undefined;\n"
-        "  const n = typeof t === 'string' ? t.trim().toLowerCase() : '';\n"
-        f"  return a(p, n && ({names}.includes(n) || /(?<!p)review/.test(n))\n"
-        f"    ? {{...o, model: {json.dumps(model)}}} : o);\n"
-        "})(agent));\n"
+        f";{PIN_MARKER} try {{ globalThis.agent = ((a) => (p, o) => {{"
+        " const t = o && typeof o === 'object' && typeof o.agentType === 'string'"
+        " ? o.agentType.trim().toLowerCase() : '';"
+        f" return a(p, t && ({json.dumps(sorted(PINNED_NAMES))}.includes(t)"
+        f" || /(?<!p)review/.test(t)) ? {{...o, model: {json.dumps(model)}}} : o);"
+        " })(globalThis.agent); } catch (e) {}"
     )
-    return script[:end] + pin
+    pinned = script[:end] + pin + script[end:]
+    if len(pinned.encode("utf-8")) > SCRIPT_MAX_BYTES:
+        return None
+    return pinned
 
 
 def pin_workflow(tool_input: dict, model: str):
-    """The Workflow input with its script wrapped, or None to pass through.
+    """The Workflow input with its script pinned, or None to pass through.
     A ``scriptPath`` is inlined (it takes precedence over ``script``, so it is
     dropped); a saved workflow run by ``name`` cannot be read here and passes."""
     script = tool_input.get("script")
@@ -141,10 +167,10 @@ def pin_workflow(tool_input: dict, model: str):
         rest.pop("scriptPath")
     if not isinstance(script, str):
         return None
-    wrapped = wrap_workflow_script(script, model)
-    if wrapped is None:
+    pinned = pin_workflow_script(script, model)
+    if pinned is None:
         return None
-    return dict(rest, script=wrapped)
+    return dict(rest, script=pinned)
 
 
 def main() -> int:

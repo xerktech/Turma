@@ -115,10 +115,12 @@ class TestSubagentModelPin(unittest.TestCase):
         self.assertEqual(self.updated(r.stdout)["model"], "opus")
 
 
-SCRIPT = """export const meta = {
-  name: 'qa-run', description: 'a } and a \\' in a string // not a comment',
+META = """// a header: export const meta = { name: 'decoy' }
+export const meta = {
+  name: 'qa-run', description: 'it\\'s a } and "}" // not a comment',
   phases: [{ title: 'QA' }], /* } */
-}
+}"""
+BODY = """
 const a = await agent('check', { agentType: 'qa', model: 'haiku', label: 'qa' })
 const b = await agent('find', { agentType: 'general-purpose' })
 const c = await agent('rev', { agentType: 'Code-Reviewer' })
@@ -126,6 +128,8 @@ const d = await agent('prev', { agentType: 'ui-preview' })
 const e = await agent('plain')
 return [a, b, c, d, e]
 """
+SCRIPT = META + BODY
+EXPECTED = ["check:opus", "find:-", "rev:opus", "prev:-", "plain:-"]
 
 
 def workflow_call(**tool_input):
@@ -133,40 +137,55 @@ def workflow_call(**tool_input):
             "tool_input": tool_input}
 
 
-def run_script(script):
-    """Evaluate a wrapped script the way the Workflow runtime does — its body as
-    an async function given `agent` — with `agent` echoing the model it got.
-    The meta literal is stripped first, as an export cannot sit in a function."""
-    m = hook.META_RE.search(script)
-    body = script[hook._literal_end(script, m.end()):]
-    js = ("const agent = async (p, o) => `${p}:${o && o.model || '-'}`;"
-          "(async () => { " + body + " })().then(r => console.log(JSON.stringify(r)))")
-    r = subprocess.run(["node", "-e", js], capture_output=True, text=True, timeout=30)
+def run_body(body):
+    """Run a script body as Claude Code's Workflow runtime does (2.1.296):
+    `async () => {'use strict'; body}` in a vm context with `agent` a context
+    global, here one echoing the model it was handed."""
+    js = ("const vm = require('vm');"
+          "const ctx = vm.createContext({agent: async (p, o) => `${p}:${o && o.model || '-'}`});"
+          "vm.runInContext(\"(async () => {'use strict';\" + process.argv[1] + \"\\n})()\", ctx)"
+          ".then(r => console.log(JSON.stringify(r)), e => { console.error(String(e)); process.exit(1) })")
+    r = subprocess.run(["node", "-e", js, body], capture_output=True, text=True, timeout=30)
     if r.returncode:
         raise AssertionError(r.stderr)
     return json.loads(r.stdout)
 
 
 class TestWorkflowPin(unittest.TestCase):
-    """A Workflow script's agent() is no Agent call (XERK-1856): the hook wraps
-    the script so grader agent() calls carry the pinned model."""
+    """A Workflow script's agent() is no Agent call (XERK-1856): the hook rebinds
+    the script's `agent` global so grader calls carry the pinned model."""
 
-    def wrapped(self, out):
-        return json.loads(out)["hookSpecificOutput"]["updatedInput"]
+    def pinned(self, out, source=SCRIPT):
+        script = json.loads(out)["hookSpecificOutput"]["updatedInput"]["script"]
+        # The meta literal is untouched and the pin adds no line, so the
+        # runtime's error line numbers stay the ones the model wrote.
+        self.assertTrue(script.startswith(META), script)
+        self.assertEqual(script.count("\n"), source.count("\n"))
+        return script
 
     def test_only_grader_agent_calls_are_pinned(self):
         rc, out = run_main(workflow_call(script=SCRIPT, args=[1]))
         self.assertEqual(rc, 0)
-        upd = self.wrapped(out)
-        self.assertEqual(upd["args"], [1])                    # other fields kept
-        self.assertTrue(upd["script"].startswith(SCRIPT[:SCRIPT.index("}\nconst")]))
-        self.assertEqual(run_script(upd["script"]),
-                         ["check:opus", "find:-", "rev:opus", "prev:-", "plain:-"])
+        self.assertEqual(json.loads(out)["hookSpecificOutput"]["updatedInput"]["args"], [1])
+        self.assertEqual(run_body(self.pinned(out)[len(META):]), EXPECTED)
 
-    def test_an_already_wrapped_script_is_not_wrapped_again(self):
+    def test_a_body_declaring_its_own_agent_still_runs(self):
+        # Wrapping the body in a function with an `agent` parameter made this a
+        # SyntaxError (XERK-1856 QA); rebinding the global keeps it legal.
+        body = ("\nconst agent = (p, o) => globalThis.agent(p, o)\n"
+                "return [await agent('x', { agentType: 'qa' })]\n")
+        _, out = run_main(workflow_call(script=META + body))
+        self.assertEqual(run_body(self.pinned(out, META + body)[len(META):]), ["x:opus"])
+
+    def test_a_non_writable_agent_global_lapses_the_pin_not_the_run(self):
         _, out = run_main(workflow_call(script=SCRIPT))
-        once = self.wrapped(out)["script"]
-        self.assertEqual(run_main(workflow_call(script=once)), (0, ""))
+        body = ("Object.defineProperty(globalThis, 'agent', {value: globalThis.agent, writable: false});"
+                + self.pinned(out)[len(META):])
+        self.assertEqual(run_body(body)[0], "check:haiku")
+
+    def test_an_already_pinned_script_is_not_pinned_again(self):
+        _, out = run_main(workflow_call(script=SCRIPT))
+        self.assertEqual(run_main(workflow_call(script=self.pinned(out))), (0, ""))
 
     def test_script_path_is_inlined(self):
         import tempfile
@@ -175,16 +194,20 @@ class TestWorkflowPin(unittest.TestCase):
             f.write(SCRIPT)
         self.addCleanup(os.unlink, f.name)
         _, out = run_main(workflow_call(scriptPath=f.name, resumeFromRunId="wf_abc123"))
-        upd = self.wrapped(out)
+        upd = json.loads(out)["hookSpecificOutput"]["updatedInput"]
         self.assertNotIn("scriptPath", upd)     # it would win over `script`
         self.assertEqual(upd["resumeFromRunId"], "wf_abc123")
-        self.assertEqual(run_script(upd["script"])[0], "check:opus")
+        self.assertEqual(run_body(self.pinned(out)[len(META):]), EXPECTED)
 
-    def test_unwrappable_input_passes_through(self):
+    def test_unpinnable_input_passes_through(self):
         for ti in ({"name": "saved-flow"}, {"scriptPath": "/nonexistent.js"},
                    {"script": "phase('x')\nawait agent('p')"},
-                   {"script": "export const meta = { name: 'x' "}, {"script": 3}):
-            self.assertEqual(run_main(workflow_call(**ti)), (0, ""), ti)
+                   {"script": "const x = 1\nexport const meta = { name: 'x' }"},
+                   {"script": "/* open comment export const meta = { name: 'x' }"},
+                   {"script": "export const meta = { name: 'x' "}, {"script": 3},
+                   # past the tool's size cap once pinned: left for the tool to judge
+                   {"script": SCRIPT + "//" + "x" * (hook.SCRIPT_MAX_BYTES - len(SCRIPT) - 10)}):
+            self.assertEqual(run_main(workflow_call(**ti)), (0, ""), str(ti)[:80])
         self.assertEqual(run_main(workflow_call(script=SCRIPT), pin=None), (0, ""))
 
 
