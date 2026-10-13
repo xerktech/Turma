@@ -3628,7 +3628,18 @@ class TestScriptChannels(unittest.TestCase):
                     f"sh -c 'true &>/dev/null {R}'", f"<&- {R}", f"{{fd}}>/dev/null {R}",
                     # ...and a producer's own `2>&1` still feeds the shell after it.
                     f"echo '{R} #' 2>&1 | sh", f"echo '{R} #' {B16}>&1 | sh", f"echo '{R}' 2>&1 | tee /dev/null | sh",
-                    f"bash <(echo '{R}' 2>&1)"):
+                    f"bash <(echo '{R}' 2>&1)",
+                    # A bare `{` in a target is text: the word ends at the blank.
+                    f"bash -c 2>x{{ '{R}' }} y", f"sh -c 2>x{{ '{R}' }} a b",
+                    f"bash -c 2>x( '{R}' ) y",
+                    # ...nor one after the PID `$$`, an escaped `\$`, or inside a
+                    # frame of another kind (QA pass 2).
+                    f"bash -c 2>$${{ '{R}' }} y", f"bash -c 2>\\${{ '{R}' }} y",
+                    f"bash -c 2>a$${{ '{R}' }} y", f"sh -c 2>$${{ '{R}' }} a b",
+                    f"bash -c &>$${{ '{R}' }} y", f"bash -c {{fd}}>$${{ '{R}' }} y",
+                    f"bash -c 2>$[ y ] '{R}'", f"bash -c 2>$(echo {{a) '{R}'",
+                    # Only the frame's own closer pops it (QA pass 3).
+                    f"bash -c 2>${{PWD#) y }}/q '{R}'", f"bash -c 2>$(echo }} y) '{R}'"):
             with self.subTest(cmd=cmd):
                 self.assertDenied(cmd)
         for cmd in ("2>/dev/null ls /etc", "> out echo hi", "ls 2>&1 | tail",
@@ -6895,6 +6906,36 @@ class TestPrSummary(unittest.TestCase):
             with self.subTest(cmd=cmd):
                 self.assertIsNone(self.reason(cmd))
         self.assertIsNotNone(self.reason("env -u 2>/dev/null X gh pr create -t x --body nope"))
+
+    def test_a_redirection_after_a_description_flag_is_not_its_value(self):
+        # Rollup XERK-1701: `--body-file 2>/dev/null good.md` hands gh good.md,
+        # but the flag walk took `2>/dev/null` as the file and refused it.
+        with open(os.path.join(self.repo, "good.md"), "w") as fh:
+            fh.write(GOOD_BODY)
+        with open(os.path.join(self.repo, "bad.md"), "w") as fh:
+            fh.write("no sections\n")
+        for cmd in ("gh pr create -t x --body-file 2>/dev/null good.md",
+                    "gh pr create -t x -F >/dev/null good.md",
+                    "gh pr create -t x --body-file 2>&1 good.md"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNone(self.reason(cmd))
+        # The file gh reads is still the one checked, and a quoted name stays a name.
+        for cmd in ("gh pr create -t x --body-file 2>/dev/null bad.md",
+                    "gh pr create -t x --body-file '2>x' good.md",
+                    "gh pr create -t x -F 2>/dev/null good.md -F bad.md",
+                    # A bare `{` does not stretch the target over the file gh reads.
+                    "gh pr edit --body-file 2>x{ bad.md -t } good.md",
+                    "gh pr edit --body-file >{ bad.md --add-label } good.md",
+                    "gh pr edit --body-file 2>$${ bad.md -t } good.md",
+                    "gh pr edit --body-file 2>\\${ bad.md -t } good.md",
+                    "gh pr edit --body-file 2>$[ good.md ] bad.md",
+                    "gh pr edit --body-file 2>${PWD#) good.md }/q bad.md",
+                    # A target that is no plain word keeps the raw reading, so a
+                    # misjudged target end can't move the file gh reads (QA pass 3).
+                    "gh pr edit --body-file 2>$'a\\' bad.md -t ' good.md",
+                    "gh pr edit --body-file 2>\"a b\" good.md"):
+            with self.subTest(cmd=cmd):
+                self.assertIsNotNone(self.reason(cmd))
 
     def test_more_than_one_description_flag_is_refused(self):
         # XERK-1565: the check read the UNION of every source while gh sends

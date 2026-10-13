@@ -7060,16 +7060,7 @@ def _redirects_last(segment: str) -> str:
             j += 1
         while j < n and segment[j] in " \t":
             j += 1
-        # The target: one word, its own `$(…)`/`<(…)`/`${…}` held whole.
-        first, inner = j, 0
-        while j < n and (states[j] or inner or segment[j] not in _WORD_BREAK + "&<>"
-                         or j == first and segment[j + 1:j + 2] == "("):
-            if not states[j]:
-                if segment[j] in "({":
-                    inner += 1
-                elif segment[j] in ")}" and inner:
-                    inner -= 1
-            j += 1
+        j = _redirect_target_end(segment, states, j)
         words.append(segment[at:start])
         redirs.append(segment[start:j])
         at = j
@@ -7081,6 +7072,80 @@ def _redirects_last(segment: str) -> str:
         return segment
     body = " ".join(w.strip() for w in (*words, tail) if w.strip())
     return body + " " + " ".join(r.strip() for r in redirs)
+
+
+# A redirection target that is one literal word: no expansion, quote or glob.
+_PLAIN_REDIRECT_TARGET_RE = re.compile(r"[\w./:@%+,=-]+\Z")
+
+
+def _redirect_targets_plain(segment: str) -> bool:
+    """Whether every live redirection in ``segment`` has a literal target."""
+    states = _quote_states(segment)
+    n = len(segment)
+    for _start, op, _word in _redirect_ops(segment):
+        j = op
+        while j < n and segment[j] in "<>&|" and not states[j]:
+            j += 1
+        while j < n and segment[j] in " \t":
+            j += 1
+        if not _PLAIN_REDIRECT_TARGET_RE.match(segment[j:_redirect_target_end(segment, states, j)]):
+            return False
+    return True
+
+_TARGET_CLOSERS = {"(": ")", "{": "}", "[": "]"}
+
+
+def _redirect_target_end(segment: str, states: list, j: int) -> int:
+    """Where the redirection target starting at ``j`` ends: one word, with
+    its own `$(…)`/`${…}`/`$[…]`/`<(…)` held whole.
+
+    A frame opens only where bash opens one, typed by its closer: an
+    unescaped `$(`, `${`, `$[` (never the PID `$$` then a bracket), and a
+    leading `<(`/`>(`. Inside one, only its own bracket kind nests and only
+    its closer pops (`${PWD#) x }` holds the `)`; `$(echo {a)` closes at the
+    `)`); a backtick pair is a frame too. A bare `x{` or `x(` ends at the blank. Counting every bracket let
+    `bash -c 2>x{ '<cmd>' } y` hide the script and the pr-summary check
+    read a different file from the one gh reads (rollup XERK-1701, 2 QA passes)."""
+    n = len(segment)
+    first = j
+    stack: list[str] = []
+    while j < n:
+        ch = segment[j]
+        if states[j]:
+            j += 1
+            continue
+        nxt = segment[j + 1] if j + 1 < n and not states[j + 1] else ""
+        if ch == "`":
+            if stack and stack[-1] == "`":
+                stack.pop()
+            else:
+                stack.append("`")
+            j += 1
+            continue
+        if ch == "$" and nxt == "$":
+            j += 2  # the PID: the next character starts afresh
+            continue
+        if ch == "$" and nxt in _TARGET_CLOSERS:
+            stack.append(_TARGET_CLOSERS[nxt])
+            j += 2
+            continue
+        if not stack:
+            if j == first and ch in "<>" and nxt == "(":
+                stack.append(")")
+                j += 2
+                continue
+            if j == first and ch == "(" and j and segment[j - 1] in "<>":
+                stack.append(")")  # `2>>(…)`: the operator took the `>`
+                j += 1
+                continue
+            if ch in _WORD_BREAK + "&<>":
+                break
+        elif ch == stack[-1]:
+            stack.pop()
+        elif _TARGET_CLOSERS.get(ch) == stack[-1]:
+            stack.append(stack[-1])
+        j += 1
+    return j
 
 
 @functools.lru_cache(maxsize=512)
@@ -14041,11 +14106,20 @@ def pr_summary_reason(command: str, cwd: str | None = None) -> str | None:
             continue
         command_tokens = _drop_leading_redirects(tokens)
         hit = _pr_body_command(command_tokens) if command_tokens else None
+        moved = _redirects_last(segment)
+        if hit and moved != segment and _redirect_targets_plain(segment):
+            # A redirection is no flag value: `--body-file 2>/dev/null f.md`
+            # hands gh f.md, but the walk read `2>/dev/null` as the file
+            # (rollup XERK-1701). Only a LIVE one moves; a quoted `'2>x'` stays.
+            # Only plain targets (`/dev/null`, `&1`): the moved reading decides
+            # which file is checked, so a target the scan could misread
+            # (`2>$${ creds -t }`) keeps the raw reading, which refuses it.
+            moved_tokens = _drop_leading_redirects(_strip_prefixes(_tokenize(moved)))
+            hit = (_pr_body_command(moved_tokens) if moved_tokens else None) or hit
         if not hit:
             # A PR command a redirection mis-split (`env -u 2>x X gh pr …`):
             # its moved reading is checked below, and noted here its own
             # `-F f` read as another part naming f (XERK-1754 QA).
-            moved = _redirects_last(segment)
             if moved != segment and _pr_body_command(
                     _drop_leading_redirects(_strip_prefixes(_tokenize(moved))) or ["_"]):
                 continue

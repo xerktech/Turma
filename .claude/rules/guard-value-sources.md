@@ -24,6 +24,13 @@ paths:
     words (`_redirects_last`): every option walker took one as an argument
     (`bash -c>/dev/null '…' 2>&1`, `bash -c 2>f '…'`, `env -u >f X cmd`, `eval>f -- '…'`).
     - Moved, never cut: cut, `bash -o 2>x errexit <<< '…'` lost its stdin feed (QA).
+    - A target holds a bracket only inside an expansion (`$(`, `${`, `$[`, backticks, `<(`/`>(`):
+      a bare `x{` ends at the blank, as in bash. Counted as nesting, `bash -c 2>x{ '<cmd>' } y`
+      hid the script and `gh pr edit -F 2>x{ creds -t } ok.md` checked ok.md (rollup XERK-1701).
+    - `_redirect_target_end` is a TYPED frame stack: only the open bracket's own kind nests and
+      only its closer pops; `$$` is the PID and `\$` a literal, so neither opens a frame. Each
+      shortcut (one-char lookback, any-closer pop) let `2>$${ … }`, `$(echo {a)`, `${x#) … }` hide
+      a word (QA).
     - Added, never swapped. Already-trailing redirections add no copy: a copy of every
       `cmd 2>&1` doubled real cost (replay). Gate on ALL words after the first move, never
       on the tail alone: that let any trailing `2>&1` switch the reading off (QA).
