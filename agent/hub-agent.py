@@ -10675,7 +10675,7 @@ def _shell_tick_end(s, i):
 
 def _shell_blank_body(body):
     """True when a substitution body runs nothing: only blanks and `#` comments."""
-    return all(ln.lstrip(" \t\r")[:1] in ("", "#") for ln in body.split("\n"))
+    return all(ln.lstrip(" \t")[:1] in ("", "#") for ln in body.split("\n"))
 
 
 def _shell_segments(command):
@@ -10685,15 +10685,16 @@ def _shell_segments(command):
     Anything it cannot model just yields words no rule matches, i.e. `work`."""
     segs, stages, words = [], [], []
     word, in_word = [], False
+    glued = False   # a dropped empty `<()` started a word: a `#` after it is text
     quote = ""
     s = str(command or "")
     n = len(s)
 
     def end_word():
-        nonlocal word, in_word
+        nonlocal word, in_word, glued
         if in_word:
             words.append("".join(word))
-        word, in_word = [], False
+        word, in_word, glued = [], False, False
 
     def end_stage():
         nonlocal words
@@ -10740,7 +10741,7 @@ def _shell_segments(command):
             j, closed = _shell_group_end(s, i + 2)
             if closed and c != "$" and _shell_blank_body(s[i + 2:j - 1]):
                 # Bash drops an empty `<()`, so `<()make` is the word `make`.
-                i = j
+                glued, i = True, j
                 continue
             word.append(s[i:j])
             in_word, i = True, j
@@ -10750,7 +10751,7 @@ def _shell_segments(command):
             word.append(s[i:j])
             in_word, i = True, j
             continue
-        elif c == "#" and not in_word:
+        elif c == "#" and not in_word and not glued:
             while i + 1 < n and s[i + 1] != "\n":
                 i += 1
         elif c in (";", "\n"):
