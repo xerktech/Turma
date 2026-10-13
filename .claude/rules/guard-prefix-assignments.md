@@ -90,7 +90,11 @@ paths:
     bare `{` read it as unclosed and glued nothing (QA).
   - Read twice: with only live `${` openers, and with `$''{`/`$'"{`/`\${` too. A re-parse may
     join those into openers, but to this parse they are text, and one before a span's `}`
-    took it (`${v:-a b$"{"}`). Either alone left a shape open (QA).
+    took it (`${v:-a b$"{"}`).
+  - No test pins the spelled reading (rollup XERK-1584): over 450 wrapper × spelling shapes
+    run in real bash, every one bash runs is denied without it too, `${v:-a b$"{"}` included.
+    Kept as defence in depth; its only measured effect is denying shapes bash rejects
+    (`eval "X=\$''{v:-a b} cmd"`).
   - A nested span recurses on its text, so past `_MAX_NESTED_VARS` levels it is too large.
   - Added like the cut line: only differing segments, pipelines and `<(…)` texts. A whole-line
     `_expand` of the glued text covered the same cases at 2-6x on real nested scripts.

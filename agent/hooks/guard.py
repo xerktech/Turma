@@ -2183,7 +2183,10 @@ def _brace_items(word: str, start: int) -> tuple[int, list[str]] | None:
 # A `for` list word: an assignment's, plus `$'…'` with its `\'` and a
 # backslash-escaped character (`x\;y` is one word). Read as an assignment's,
 # `for v in $'it\'s' 'x;y' 'rm …'` paired the quotes wrong and cut the list.
-_FOR_WORD_RE = re.compile(r"(?:\$'(?:[^'\\]|\\.)*'|" + _ASSIGN_SUBST
+# A `$` run pairs left to right (`_ansi_c_dollar`): `$$'a\'` is the PID and a
+# plain `'a\'`, so an even run is text and a `'` after it a plain quote. A
+# run is read whole (at its first `$`, or the next one), so it stays linear.
+_FOR_WORD_RE = re.compile(r"(?:(?:\$\$)*\$'(?:[^'\\]|\\.)*'|(?:\$\$)+(?!\$)|" + _ASSIGN_SUBST
                           + r"|'[^']*'|\"(?:[^\"\\]|\\.)*\"|\\.|[^\s;|&\n'\"`\\])*", re.S)
 # What may sit between a shell `for` list and its `do` (or `{`): blanks,
 # `;`, newlines, comments.
@@ -5120,7 +5123,7 @@ def _brace_end(command: str, i: int, quoted: bool | None = None) -> int:
             if _BRACE_OTHER_SHELL[0]:
                 j += 1
                 continue
-        if ch == "'" or command.startswith("$'", j):
+        if ch == "'" or (command.startswith("$'", j) and _ansi_c_dollar(command, j)):
             ansi = ch == "$"
             j += 2 if ansi else 1
             while j < n and command[j] != "'":
@@ -6326,7 +6329,7 @@ def _word_end(s: str, i: int, stop: str | None = None) -> int:
                 j = _word_end(s, *key)
                 if known is not None:
                     known[key] = j
-        elif ch == "'" or s.startswith("$'", i):
+        elif ch == "'" or (s.startswith("$'", i) and _ansi_c_dollar(s, i)):
             j = i + 1 if ch == "'" else i + 2
             while j < n and s[j] != "'":
                 j += 2 if ch == "$" and s[j] == "\\" else 1
@@ -6731,7 +6734,7 @@ def _unquoted_text(word: str) -> str:
         if ch == "\\":
             i += 2
             continue
-        if ch == "'" or word.startswith("$'", i):
+        if ch == "'" or (word.startswith("$'", i) and _ansi_c_dollar(word, i)):
             j = i + 1 if ch == "'" else i + 2
             while j < n and word[j] != "'":
                 j += 2 if ch == "$" and word[j] == "\\" else 1
@@ -8331,7 +8334,7 @@ def _replacement_tildes(text: str) -> list[tuple[int, str]]:
             q = next_sq[i + 1]
         elif ch == '"':
             q = next_dq[i + 1]
-        elif ch == "$" and text.startswith("$'", i):
+        elif ch == "$" and text.startswith("$'", i) and _ansi_c_dollar(text, i):
             q = next_ansi[i + 2]
         elif ch == "$" and text.startswith("${", i):
             q = next_brace[i + 2]
